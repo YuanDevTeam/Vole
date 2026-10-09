@@ -27,7 +27,7 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
 `type: http` 提供 TCP CONNECT；`tls: true` 在代理链路使用共享 TLS 与证书策略。
 支持 `username/password`、`headers`、`sni`、`skip-cert-verify`、`name-cert-verify`、
 `fingerprint` 及成对的内联 `certificate/private-key`。用户名和密码均非空时发送 Basic 认证。
-HTTP CONNECT 不提供 UDP，`udp: true` 在校验时拒绝。握手沿用原期限，失败关闭，
+HTTP CONNECT 不提供 UDP，也不接受 `udp` 字段。握手沿用原期限，失败关闭，
 成功后保留响应头后的业务字节。启用此协议需要 `outbound-http` feature。
 
 ## SOCKS5

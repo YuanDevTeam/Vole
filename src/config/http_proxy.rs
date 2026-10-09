@@ -28,8 +28,6 @@ pub(super) struct RawHttp {
     #[serde(default)]
     tls: bool,
     #[serde(default)]
-    udp: bool,
-    #[serde(default)]
     sni: Option<String>,
     #[serde(default)]
     skip_cert_verify: bool,
@@ -55,9 +53,6 @@ impl RawHttp {
     pub(super) fn normalize(self) -> Result<(String, Option<String>, bool, ProxyProtocol)> {
         if !cfg!(feature = "outbound-http") {
             return invalid("HTTP outbound support is disabled at build time");
-        }
-        if self.udp {
-            return invalid("HTTP CONNECT outbound does not support UDP");
         }
         validate_host(&self.server, "HTTP server")?;
         validate_port(self.port, "HTTP")?;

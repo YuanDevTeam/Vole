@@ -20,6 +20,7 @@ mod balance;
 mod selection;
 pub(crate) use selection::GroupSelection;
 
+pub(crate) mod diagnostics;
 mod dispatcher;
 mod proxy_group;
 
@@ -353,6 +354,7 @@ impl std::error::Error for RuleSetError {}
 pub struct RuleSet {
     rules: Box<[RuleSpec]>,
     uses_domain_routing: bool,
+    filter_udp: bool,
 }
 
 impl RuleSet {
@@ -374,7 +376,15 @@ impl RuleSet {
         Ok(Self {
             rules: rules.into_boxed_slice(),
             uses_domain_routing,
+            filter_udp: true,
         })
+    }
+
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn compile_config(config: &mut crate::config::Config) -> Result<Self, RuleSetError> {
+        let mut rules = Self::compile(config.take_runtime_rules())?;
+        rules.filter_udp = config.mode == crate::config::Mode::Rule;
+        Ok(rules)
     }
 
     #[must_use]
@@ -416,13 +426,22 @@ impl RuleSet {
         context: &RoutingContext,
         geo_matcher: &dyn GeoMatcher,
     ) -> RuleEvaluation {
+        self.evaluate_with_egress(context, geo_matcher, |_| true)
+    }
+
+    pub(crate) fn evaluate_with_egress(
+        &self,
+        context: &RoutingContext,
+        geo_matcher: &dyn GeoMatcher,
+        supports_udp: impl Fn(RuleAction) -> bool,
+    ) -> RuleEvaluation {
         for (index, rule) in self.rules.iter().enumerate() {
             let matched = match matches_rule(rule, context, geo_matcher) {
                 Ok(matched) => matched,
                 Err(()) => return RuleEvaluation::NeedsIpResolution { rule_index: index },
             };
 
-            if matched {
+            if matched && self.accepts_egress(context, rule.action, &supports_udp) {
                 return RuleEvaluation::Matched(RuleMatch {
                     action: rule.action,
                     rule_index: index,
@@ -458,6 +477,23 @@ impl RuleSet {
         resolution_rule_index: usize,
         addresses: &[IpAddr],
     ) -> RuleEvaluation {
+        self.evaluate_with_resolved_egress(
+            context,
+            geo_matcher,
+            resolution_rule_index,
+            addresses,
+            |_| true,
+        )
+    }
+
+    pub(crate) fn evaluate_with_resolved_egress(
+        &self,
+        context: &mut RoutingContext,
+        geo_matcher: &dyn GeoMatcher,
+        resolution_rule_index: usize,
+        addresses: &[IpAddr],
+        supports_udp: impl Fn(RuleAction) -> bool,
+    ) -> RuleEvaluation {
         for (index, rule) in self.rules.iter().enumerate().skip(resolution_rule_index) {
             let mut selected_address = None;
             let matched = if context.effective_ip().is_none()
@@ -476,7 +512,7 @@ impl RuleSet {
                 matches_rule(rule, &candidate, geo_matcher).unwrap_or(false)
             };
 
-            if matched {
+            if matched && self.accepts_egress(context, rule.action, &supports_udp) {
                 if let Some(address) = selected_address {
                     context.pin_ip(address);
                 }
@@ -490,6 +526,15 @@ impl RuleSet {
             action: RuleAction::Direct,
             rule_index: self.rules.len(),
         })
+    }
+
+    fn accepts_egress(
+        &self,
+        context: &RoutingContext,
+        action: RuleAction,
+        supports_udp: &impl Fn(RuleAction) -> bool,
+    ) -> bool {
+        !self.filter_udp || context.network != Network::Udp || supports_udp(action)
     }
 }
 
@@ -806,6 +851,37 @@ mod tests {
                 spec(RuleKind::Match, proxy_action(0)),
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn udp_capability_filter_continues_after_ip_resolution() {
+        let rules = RuleSet::compile(vec![
+            spec(
+                RuleKind::IpCidr(IpCidr {
+                    network: "192.0.2.0".parse().unwrap(),
+                    prefix_len: 24,
+                }),
+                proxy_action(0),
+            ),
+            spec(RuleKind::Match, RuleAction::Reject),
+        ])
+        .unwrap();
+        let mut context = domain_context(Network::Udp, "example.com", 53);
+        let available = |action| action != proxy_action(0);
+        assert!(matches!(
+            rules.evaluate_with_egress(&context, &EmptyGeoMatcher, available),
+            RuleEvaluation::NeedsIpResolution { rule_index: 0 }
+        ));
+        assert_eq!(
+            action(rules.evaluate_with_resolved_egress(
+                &mut context,
+                &EmptyGeoMatcher,
+                0,
+                &["192.0.2.1".parse().unwrap()],
+                available
+            )),
+            RuleAction::Reject
         );
     }
 

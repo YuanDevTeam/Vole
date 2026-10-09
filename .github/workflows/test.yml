@@ -184,7 +184,7 @@ jobs:
           # Keep this explicit allowlist: unfiltered legacy tests may open host listeners.
           filters=(
             geodata:: routing:: security:: outbound::vless::encryption config::
-            connections::tests:: runtime::diagnostics::tests:: dialer::connections::tests::
+            connections::tests:: routing::diagnostics::tests:: dialer::connections::tests::
             resource::http::tests:: fake_ip_ sniffing::tests:: tcp_sniffer::tests::
             dns::fallback::tests:: dns::runtime::tests::dns_fallback_
             dns::runtime::encrypted_tests::
@@ -217,6 +217,7 @@ jobs:
             dns::runtime::tests::domain_policies_use_specificity_and_preserve_geosite_order
             dns::runtime::tests::dns_policy_selection_is_consistent_across_snapshot_swaps
             runtime::tests::prepares_builtin_routes_without_static_nodes_or_bootstrap
+            runtime::tests::prepares_udp_capabilities_through_runtime_wrappers
             invoke::tests::null_invalid_utf8_and_oversized_input_return_json_failures
             invoke::tests::same_instance_command_is_fail_fast
             invoke::tests::android_protector_is_required_only_for_tun

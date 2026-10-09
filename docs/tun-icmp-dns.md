@@ -115,6 +115,7 @@ dns:
 - 无 fragment 时默认 DIRECT；`respect-rules: true` 改为 RULES，要求非空 `proxy-server-nameserver`。
 - Fragment 只接受 `DIRECT`、`RULES`、实际代理节点名或支持的代理组名。
 - `#RULES` 只按 nameserver endpoint 和传输执行业务规则，不把 DNS question 当作选路域名。
+- 规则模式下，UDP 跳过不支持 UDP 的节点或组，继续匹配后续规则；显式出口和 global 模式不做此跳过。
 - 规则结果为 `REJECT` 时，当前尝试失败并继续当前组下一项。
 
 代理组成员可以是具体节点、嵌套组、`DIRECT` 或 `REJECT`。DNS exchange 需要新建物理 transport 时解析当时的当前叶节点；选中成员失败不会使代理组自动改选，但 nameserver 列表仍按本节已有故障转移语义继续下一项。

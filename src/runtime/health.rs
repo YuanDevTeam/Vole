@@ -29,6 +29,10 @@ pub(super) struct ActiveDispatcher {
 }
 #[async_trait::async_trait]
 impl Dispatcher for ActiveDispatcher {
+    fn supports_udp(&self) -> bool {
+        self.dispatcher.supports_udp()
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         if session.inbound != crate::session::InboundKind::InternalMeasure {
             self.activity.touch();

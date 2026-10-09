@@ -620,6 +620,7 @@ fn apply_overrides(node: &mut Value, overrides: &BTreeMap<String, Value>) -> Res
         }
         let kind = map.get("type").and_then(Value::as_str).unwrap_or_default();
         let applicable = match key.as_str() {
+            "udp" => kind != "http",
             "up" | "down" => kind == "hysteria2",
             "udp-over-tcp" => kind == "ss",
             "skip-cert-verify" => matches!(

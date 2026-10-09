@@ -1109,7 +1109,9 @@ impl RuntimeDns {
                     )))
                 })?;
                 context.pin_ip(nameserver.endpoint.ip());
-                match rules.evaluate_with_geo(&context, self.geo_matcher.as_ref()) {
+                match rules.evaluate_with_egress(&context, self.geo_matcher.as_ref(), |action| {
+                    proxies.supports_udp(action)
+                }) {
                     RuleEvaluation::Matched(rule_match) => match rule_match.action {
                         RuleAction::Route(id) => proxies
                             .get_route(id)
@@ -5089,7 +5091,7 @@ dns:
                 .unwrap();
             let answer = parse_response(&wire).unwrap();
             assert!(answer.authoritative);
-            assert!(answer.answers.iter().all(|record| record.ttl == 0));
+            assert!(answer.answers.iter().all(|record| record.ttl == 1));
             let address = matching_answer_set(&answer).unwrap().addresses[0];
             assert_eq!(address, "198.18.0.4".parse::<IpAddr>().unwrap());
             assert_eq!(

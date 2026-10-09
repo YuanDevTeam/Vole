@@ -497,6 +497,10 @@ impl RuntimeResources for ProviderRuntime {
 }
 #[async_trait]
 impl Dispatcher for ProviderRuntime {
+    fn supports_udp(&self) -> bool {
+        self.current.load().dispatcher.supports_udp()
+    }
+
     async fn sniff_plan(
         &self,
         source: SocketAddr,
@@ -544,6 +548,10 @@ struct PinnedDispatcher {
 }
 #[async_trait]
 impl Dispatcher for PinnedDispatcher {
+    fn supports_udp(&self) -> bool {
+        self.dispatcher.supports_udp()
+    }
+
     async fn sniff_plan(
         &self,
         source: SocketAddr,

@@ -110,6 +110,11 @@ pub trait DatagramTransport: Send {
 
 #[async_trait]
 pub trait Dispatcher: Send + Sync {
+    /// Configured datagram capability, independent of reachability or health.
+    fn supports_udp(&self) -> bool {
+        true
+    }
+
     async fn sniff_plan(
         &self,
         _source: std::net::SocketAddr,
@@ -146,6 +151,10 @@ impl SessionObservedDispatcher {
 
 #[async_trait]
 impl Dispatcher for SessionObservedDispatcher {
+    fn supports_udp(&self) -> bool {
+        self.inner.supports_udp()
+    }
+
     async fn sniff_plan(
         &self,
         source: std::net::SocketAddr,
@@ -194,6 +203,10 @@ impl HandshakeObservedDispatcher {
 
 #[async_trait]
 impl Dispatcher for HandshakeObservedDispatcher {
+    fn supports_udp(&self) -> bool {
+        self.inner.supports_udp()
+    }
+
     async fn sniff_plan(
         &self,
         source: std::net::SocketAddr,

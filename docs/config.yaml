@@ -444,7 +444,8 @@ proxies:
 # 正则支持 Rust regex 子集，区分大小写；反引号分隔的多表达式按匹配顺序排列。
 # lookaround/backreference 明确拒绝。静态成员保留顺序与重复项。
 # 动态组为空时使用 empty-fallback（缺省 COMPATIBLE，即 DIRECT），可指定节点或内置目标。
-# disable-udp 缺省 false；true 拒绝通过该组的业务 UDP。hidden/icon 为 Controller 元数据。
+# disable-udp 缺省 false；true 禁用该组的业务 UDP。规则模式跳过不支持 UDP 的目标，
+# 继续匹配后续规则；global 模式及显式 DNS 出口仍会拒绝。hidden/icon 为 Controller 元数据。
 # 节点与组的完整混合图必须无环。资源更新后保留仍存在的当前选择，否则使用默认/首成员。
 # 未显式定义 GLOBAL 时，自动追加一个 select 组；成员依次为 DIRECT、REJECT、
 # 所有节点和声明的组，默认 DIRECT。可显式声明 GLOBAL 覆盖其成员及初始选择。
@@ -563,7 +564,7 @@ dns:
   enhanced-mode: redir-host # 或 fake-ip；内部节点/直连解析始终取得真实地址
   fake-ip-range: 198.18.0.1/16
   fake-ip-range6: "" # 设置 IPv6 CIDR 且启用 IPv6 后分配 AAAA
-  fake-ip-ttl: 1 # 秒，0 表示不缓存 DNS 答案；不决定映射寿命
+  fake-ip-ttl: 1 # 秒；运行时最小为 1，不决定映射寿命
   fake-ip-filter-mode: blacklist # blacklist / whitelist / rule
   fake-ip-filter: [dns.msftnsci.com, www.msftnsci.com, www.msftconnecttest.com]
   # blacklist：命中返回真实地址；whitelist：只有命中才分配 fake-IP。

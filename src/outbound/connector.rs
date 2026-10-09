@@ -810,6 +810,10 @@ impl ConnectorDispatcher {
 
 #[async_trait]
 impl Dispatcher for ConnectorDispatcher {
+    fn supports_udp(&self) -> bool {
+        self.allow_udp
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         let context = self.context();
         let result = self.inner.connect_stream(session, &context).await;

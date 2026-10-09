@@ -107,6 +107,13 @@ impl std::fmt::Debug for ProxyDispatchers {
 }
 
 impl ProxyDispatchers {
+    pub(crate) fn supports_udp(&self, action: RuleAction) -> bool {
+        match action {
+            RuleAction::Route(id) => self.get_route(id).is_ok_and(|d| d.supports_udp()),
+            RuleAction::Direct | RuleAction::Reject => true,
+        }
+    }
+
     pub fn new(proxies: Vec<Arc<dyn Dispatcher>>) -> Result<Self, DispatchError> {
         Ok(Self {
             proxies,
@@ -212,13 +219,13 @@ pub struct RoutingDispatcher {
     tun_config: TunConfig,
     sniffer: Option<Arc<crate::sniffing::Policy>>,
     tcp_concurrent: bool,
-    diagnostics: Option<Arc<crate::runtime::diagnostics::Diagnostics>>,
+    diagnostics: Option<Arc<crate::routing::diagnostics::Diagnostics>>,
 }
 
 impl RoutingDispatcher {
     pub(crate) fn with_diagnostics(
         mut self,
-        diagnostics: Arc<crate::runtime::diagnostics::Diagnostics>,
+        diagnostics: Arc<crate::routing::diagnostics::Diagnostics>,
     ) -> Self {
         self.diagnostics = Some(diagnostics);
         self
@@ -386,7 +393,11 @@ impl RoutingDispatcher {
         let geo_matcher = snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref());
 
         let mut resolved = None;
-        let evaluation = match self.rules.evaluate_with_geo(&context, geo_matcher) {
+        let supports_udp = |action| self.route_targets.supports_udp(action);
+        let evaluation = match self
+            .rules
+            .evaluate_with_egress(&context, geo_matcher, supports_udp)
+        {
             RuleEvaluation::NeedsIpResolution { rule_index } => {
                 let addresses = match (destination, &self.dns) {
                     (Destination::Domain { host, .. }, Some(dns)) => {
@@ -395,11 +406,12 @@ impl RoutingDispatcher {
                     _ => Vec::new(),
                 };
                 resolved = Some(addresses);
-                self.rules.evaluate_with_resolved_ips(
+                self.rules.evaluate_with_resolved_egress(
                     &mut context,
                     geo_matcher,
                     rule_index,
                     resolved.as_deref().unwrap_or_default(),
+                    supports_udp,
                 )
             }
             evaluation => evaluation,
@@ -1620,6 +1632,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingDispatcher {
+        tcp_only: bool,
         tcp_sessions: Mutex<Vec<StreamSession>>,
         datagrams: Arc<Mutex<Vec<Datagram>>>,
         udp_opens: AtomicUsize,
@@ -1627,6 +1640,10 @@ mod tests {
 
     #[async_trait]
     impl Dispatcher for RecordingDispatcher {
+        fn supports_udp(&self) -> bool {
+            !self.tcp_only
+        }
+
         async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
             self.tcp_sessions.lock().unwrap().push(session);
             let (client, _server) = tokio::io::duplex(64);
@@ -1894,7 +1911,7 @@ rules: ["MATCH,pool"]
         let groups = ProxyGroups::new(&config.proxy_groups, nodes.clone(), direct.clone()).unwrap();
         let rules = RuleSet::compile(config.rules.clone()).unwrap();
         let registry = Arc::new(crate::connections::Registry::default());
-        let diagnostics = Arc::new(crate::runtime::diagnostics::Diagnostics::new(
+        let diagnostics = Arc::new(crate::routing::diagnostics::Diagnostics::new(
             &config,
             &rules,
             registry.clone(),
@@ -1942,6 +1959,65 @@ rules: ["MATCH,pool"]
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn udp_rules_skip_incapable_targets_without_changing_explicit_modes() {
+        for target in ["edge", "outer", "disabled"] {
+            for mode in ["rule", "global"] {
+                let mut config = crate::config::Config::parse_yaml(
+                    format!(
+                        r#"
+mixed-port: 1080
+mode: {mode}
+proxies: [{{name: edge, type: socks5, server: 192.0.2.1, port: 1080}}]
+proxy-groups:
+  - {{name: inner, type: select, proxies: [edge]}}
+  - {{name: outer, type: select, proxies: [inner]}}
+  - {{name: disabled, type: select, proxies: [DIRECT], disable-udp: true}}
+  - {{name: GLOBAL, type: select, proxies: [{target}]}}
+rules: ["DST-PORT,443,{target}", "MATCH,DIRECT"]
+"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+                let nodes: Vec<Arc<dyn Dispatcher>> =
+                    vec![crate::dispatch::observe_handshakes_with_stats(
+                        Arc::new(RecordingDispatcher {
+                            tcp_only: true,
+                            ..Default::default()
+                        }),
+                        crate::resources::RuntimeResourceStats::new("udp-capability"),
+                    )];
+                let direct = Arc::new(RecordingDispatcher::default());
+                let groups =
+                    ProxyGroups::new(&config.proxy_groups, nodes.clone(), direct.clone()).unwrap();
+                let router = RoutingDispatcher::new(
+                    ProxyDispatchers::with_proxy_groups(nodes, &groups).unwrap(),
+                    direct,
+                    None,
+                    RuleSet::compile_config(&mut config).unwrap(),
+                    Arc::new(EmptyGeoMatcher),
+                );
+                for network in [Network::Tcp, Network::Udp] {
+                    let decision = router
+                        .route(
+                            network,
+                            InboundKind::Socks5,
+                            "192.0.2.2:1234".parse().unwrap(),
+                            &Destination::Ip("203.0.113.1:443".parse().unwrap()),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        decision.action == RuleAction::Direct,
+                        mode == "rule" && network == Network::Udp
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

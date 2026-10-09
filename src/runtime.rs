@@ -1,6 +1,6 @@
 #![cfg_attr(not(any(feature = "invoke", feature = "cli")), allow(dead_code))]
 
-pub(crate) mod diagnostics;
+use crate::routing::diagnostics;
 
 use tracing::instrument::WithSubscriber;
 
@@ -322,7 +322,7 @@ impl PreparedCore {
     pub(crate) fn validate_config(mut config: Config) -> io::Result<()> {
         GeoRequirements::for_config(&config)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        RuleSet::compile(config.take_runtime_rules())
+        RuleSet::compile_config(&mut config)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         Ok(())
     }
@@ -1412,7 +1412,7 @@ fn prepare_routing(
     // GeoData must inspect the normalized rule specifications first. Once that
     // borrowing load is complete, move the rules directly into the compiled
     // set so PreparedCore does not retain a second owned rule graph.
-    let rules = RuleSet::compile(config.take_runtime_rules())
+    let rules = RuleSet::compile_config(config)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     Ok((rules, geodata_registration))
 }
@@ -1747,6 +1747,7 @@ mod socks_tests;
 
 #[cfg(test)]
 mod tests {
+    use crate::config::ProxyGroupId;
     use std::net::{IpAddr, SocketAddr};
     use std::sync::{
         Mutex,
@@ -1955,6 +1956,52 @@ rules:
             "      mode: packet-up\n",
             &format!("      mode: packet-up\n      download-settings:\n{fields}\n"),
         )
+    }
+
+    #[tokio::test]
+    async fn prepares_udp_capabilities_through_runtime_wrappers() {
+        let prepared = PreparedCore::prepare(
+            br#"
+mixed-port: 1080
+proxies: [{name: tcp-only, type: socks5, server: 192.0.2.1, port: 1080}]
+proxy-groups:
+  - {name: selected, type: select, proxies: [tcp-only, DIRECT]}
+  - {name: disabled, type: select, proxies: [DIRECT], disable-udp: true}
+  - {name: balanced, type: load-balance, proxies: [tcp-only]}
+"#,
+            &FixedResolver,
+            ResourceLimits::default(),
+        )
+        .await
+        .unwrap();
+        let parts = prepared.build_dispatcher(Dialer::default()).unwrap();
+        assert!(
+            !parts
+                .resource_targets
+                .get(ProxyId::new(0).unwrap())
+                .unwrap()
+                .supports_udp()
+        );
+        for (index, expected) in [false, false, true].into_iter().enumerate() {
+            let route = RouteTargetId::Group(ProxyGroupId::new(index).unwrap());
+            assert_eq!(
+                parts
+                    .resource_targets
+                    .get_route(route)
+                    .unwrap()
+                    .supports_udp(),
+                expected
+            );
+        }
+        parts.proxy_groups.select("selected", "DIRECT").unwrap();
+        assert!(
+            parts
+                .resource_targets
+                .get_route(RouteTargetId::Group(ProxyGroupId::new(0).unwrap()))
+                .unwrap()
+                .supports_udp()
+        );
+        parts.proxy_graph.shutdown().await;
     }
 
     #[tokio::test]

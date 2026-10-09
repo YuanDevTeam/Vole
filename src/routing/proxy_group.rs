@@ -428,6 +428,38 @@ struct SelectProxyGroupDispatcher {
 
 #[async_trait]
 impl Dispatcher for SelectProxyGroupDispatcher {
+    fn supports_udp(&self) -> bool {
+        let mut id = self.id;
+        for _ in 0..=self.groups.groups.len() {
+            let Some(group) = self.groups.groups.get(id.index()) else {
+                return false;
+            };
+            if group.disable_udp {
+                return false;
+            }
+            // Mihomo advertises balance-group UDP independently of the next
+            // selected leaf. Capability queries must not advance round-robin.
+            if group.config.kind == crate::config::GroupKind::LoadBalance {
+                return true;
+            }
+            let Some(member) = group.members.get(group.selected.load(Ordering::Acquire)) else {
+                return false;
+            };
+            match member.target {
+                ProxyGroupMemberTarget::Route(RouteTargetId::Proxy(id)) => {
+                    return self
+                        .groups
+                        .proxies
+                        .get(id.index())
+                        .is_some_and(|d| d.supports_udp());
+                }
+                ProxyGroupMemberTarget::Route(RouteTargetId::Group(nested)) => id = nested,
+                ProxyGroupMemberTarget::Direct | ProxyGroupMemberTarget::Reject => return true,
+            }
+        }
+        false
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         let leaf = self.groups.resolve_leaf_for(
             self.id,
