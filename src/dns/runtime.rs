@@ -1133,6 +1133,7 @@ impl RuntimeDns {
     /// Resolves a canonical domain through A followed by AAAA. AAAA is skipped
     /// completely when `dns.ipv6` is false.
     pub async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, RuntimeDnsError> {
+        super::trace::record("resolve");
         let host = canonicalize_name(host).map_err(RuntimeDnsError::InvalidQuery)?;
         let host =
             match self
@@ -1190,6 +1191,7 @@ impl RuntimeDns {
     }
 
     pub async fn resolve_proxy(&self, host: &str) -> Result<Vec<IpAddr>, RuntimeDnsError> {
+        super::trace::record("proxy-role");
         self.proxy_resolver
             .as_deref()
             .unwrap_or(self)
@@ -1197,6 +1199,7 @@ impl RuntimeDns {
             .await
     }
     pub async fn resolve_direct(&self, host: &str) -> Result<Vec<IpAddr>, RuntimeDnsError> {
+        super::trace::record("direct-role");
         self.direct_resolver
             .as_deref()
             .unwrap_or(self)
@@ -1210,6 +1213,7 @@ impl RuntimeDns {
         let address = match &nameserver.address {
             DnsAddress::Ip(ip) => *ip,
             DnsAddress::Domain(host) => {
+                super::trace::record("bootstrap");
                 let resolver = self
                     .bootstrap
                     .as_ref()
@@ -1334,6 +1338,7 @@ impl RuntimeDns {
     }
 
     fn synthetic_answer(&self, query: &DnsMessage, host: &str) -> Result<Vec<u8>, RuntimeDnsError> {
+        super::trace::record("fake-ip");
         match self
             .fake_pools
             .as_ref()
@@ -1382,6 +1387,7 @@ impl RuntimeDns {
             _ => None,
         };
         if let Some(addresses) = addresses {
+            super::trace::record("hosts");
             let addresses: Vec<_> = addresses
                 .into_iter()
                 .filter(|ip| match parsed_query.question.query_type {
@@ -1411,6 +1417,7 @@ impl RuntimeDns {
                     parsed_query.question.query_type,
                     Instant::now(),
                 ) {
+                    super::trace::record("cache");
                     self.resource_stats.dns_cache_hit();
                     return synthesize_response(&parsed_query, &cached, remaining_ttl);
                 }
@@ -1433,6 +1440,7 @@ impl RuntimeDns {
                     return finish_shared_result(result, classified, failure_mode);
                 }
                 FlightRole::Follower(updates) => {
+                    super::trace::record("shared-query");
                     let Some(result) = wait_for_flight(updates).await else {
                         continue;
                     };
@@ -1452,9 +1460,11 @@ impl RuntimeDns {
         let upstream_parsed_query =
             parse_query(&upstream_query).map_err(RuntimeDnsError::InvalidQuery)?;
         let (mut response, parsed_response) = if let Some(policy) = self.policy_for(classified) {
+            super::trace::record("nameserver-policy");
             self.exchange_upstreams(policy, &upstream_query, &upstream_parsed_query, deadline)
                 .await?
         } else if self.fallback.nameservers.is_empty() {
+            super::trace::record("nameserver");
             self.exchange_upstreams(
                 &self.nameservers,
                 &upstream_query,
@@ -1463,6 +1473,7 @@ impl RuntimeDns {
             )
             .await?
         } else if self.fallback_domain(&classified.question.name) {
+            super::trace::record("fallback-domain");
             self.exchange_upstreams(
                 &self.fallback.nameservers,
                 &upstream_query,
@@ -1506,6 +1517,7 @@ impl RuntimeDns {
             let role = {
                 let mut cache = self.opaque_cache.lock().await;
                 if let Some(response) = cache.get(classified, Instant::now()) {
+                    super::trace::record("cache");
                     self.resource_stats.dns_cache_hit();
                     return Ok(response);
                 }
@@ -1528,6 +1540,7 @@ impl RuntimeDns {
                     return finish_shared_result(result, classified, failure_mode);
                 }
                 FlightRole::Follower(updates) => {
+                    super::trace::record("shared-query");
                     let Some(result) = wait_for_flight(updates).await else {
                         continue;
                     };
@@ -1693,6 +1706,13 @@ impl RuntimeDns {
         M: Fn(&[u8]) -> Result<bool, AttemptError>,
         V: Fn(&[u8]) -> Result<R, AttemptError>,
     {
+        super::trace::record(match nameserver.transport {
+            DnsTransport::Udp => "udp",
+            DnsTransport::Tcp => "tcp",
+            DnsTransport::Tls => "tls",
+            DnsTransport::Https => "https",
+            DnsTransport::Http => "http",
+        });
         let mut server = self.resolve_nameserver(&nameserver).await?;
         if server.transport == DnsTransport::Udp {
             let (_, egress) = self.egress_for(&server, Network::Udp)?;

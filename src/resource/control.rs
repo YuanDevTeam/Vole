@@ -12,6 +12,9 @@ pub(crate) struct DnsSnapshot {
 }
 #[async_trait]
 pub(crate) trait RuntimeResources: Send + Sync {
+    fn connections(&self) -> Arc<crate::connections::Registry>;
+    fn configs(&self) -> serde_json::Value;
+    fn rules(&self) -> serde_json::Value;
     fn groups(&self) -> Arc<ProxyGroups>;
     fn select(&self, group: &str, member: &str) -> Result<(), ProxyGroupError>;
     fn health(&self) -> serde_json::Value;

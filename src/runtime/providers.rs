@@ -25,6 +25,7 @@ use tokio::{
 };
 
 struct Generation {
+    diagnostics: Arc<diagnostics::Diagnostics>,
     health: Arc<health::HealthRuntime>,
     requirements: GeoRequirements,
     config: Config,
@@ -42,6 +43,7 @@ impl Generation {
         requirements: GeoRequirements,
     ) -> Self {
         Self {
+            diagnostics: parts.diagnostics.clone(),
             health: parts.health.clone(),
             requirements,
             config,
@@ -129,6 +131,7 @@ impl ProviderRuntime {
     }
     pub(super) fn begin_shutdown(&self) {
         self.cancellation.cancel();
+        self.current.load().diagnostics.connections.shutdown();
         self.current.load().graph.begin_shutdown();
         for generation in self.retired.lock().unwrap().iter() {
             generation.graph.begin_shutdown();
@@ -267,6 +270,7 @@ impl ProviderRuntime {
         let dialer = self.dialer.clone();
         let geo = self.geo.clone();
         let previous_dns = generation.dns.clone();
+        let connections = generation.diagnostics.connections.clone();
         let data_dir = self
             .manager
             .store_dir()
@@ -281,6 +285,7 @@ impl ProviderRuntime {
                     RuleSet::compile(config.take_runtime_rules()).map_err(io::Error::other)?;
                 let endpoints = vec![PreparedProxyEndpoints::default(); config.proxies.len()];
                 let parts = GraphBuilder {
+                    connections,
                     config: config.clone(),
                     endpoints,
                     limits,
@@ -420,6 +425,16 @@ impl ProviderRuntime {
 }
 #[async_trait]
 impl RuntimeResources for ProviderRuntime {
+    fn connections(&self) -> Arc<crate::connections::Registry> {
+        self.current.load().diagnostics.connections.clone()
+    }
+    fn configs(&self) -> serde_json::Value {
+        self.current.load().diagnostics.config()
+    }
+    fn rules(&self) -> serde_json::Value {
+        self.current.load().diagnostics.rules()
+    }
+
     fn groups(&self) -> Arc<ProxyGroups> {
         self.current.load().groups.clone()
     }
@@ -630,6 +645,11 @@ proxy-providers:
   remote: {type: file, path: nodes.yaml}
 proxy-groups:
   - {name: choice, type: select, use: [remote]}
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver: [192.0.2.53]
+profile: {store-fake-ip: true}
 rules: ['MATCH,choice']
 "#,
         )
@@ -647,6 +667,21 @@ rules: ['MATCH,choice']
         let parts = prepared.build_dispatcher(Dialer::default()).unwrap();
         let live = parts.resources.clone().unwrap();
         let generation = live.current.load_full();
+        let query = crate::dns::build_query(1, "example.com", crate::dns::QueryType::A).unwrap();
+        let wire = generation
+            .dns
+            .as_ref()
+            .unwrap()
+            .exchange(&query)
+            .await
+            .unwrap();
+        assert!(
+            !crate::dns::parse_response(&wire)
+                .unwrap()
+                .answers
+                .is_empty()
+        );
+        let registry = live.connections();
         let weak = Arc::downgrade(&generation);
         let (io, mut peer) = tokio::io::duplex(32);
         let mut old_session = GenerationStream {
@@ -657,6 +692,7 @@ rules: ['MATCH,choice']
         std::fs::write(&file, payload("new-node")).unwrap();
         live.update(0).await.unwrap();
         assert_eq!(live.groups().state("choice").unwrap().now, "new-node");
+        assert!(Arc::ptr_eq(&registry, &live.connections()));
         peer.write_all(b"active").await.unwrap();
         let mut buffer = [0; 6];
         old_session.read_exact(&mut buffer).await.unwrap();

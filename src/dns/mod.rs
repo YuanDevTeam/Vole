@@ -10,6 +10,7 @@ mod fallback;
 pub(crate) mod hosts;
 mod https;
 pub(crate) mod policy;
+pub(crate) mod trace;
 
 pub mod resolution;
 pub mod runtime;

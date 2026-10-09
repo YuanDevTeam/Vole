@@ -1,5 +1,7 @@
 #![cfg_attr(not(any(feature = "invoke", feature = "cli")), allow(dead_code))]
 
+pub(crate) mod diagnostics;
+
 use tracing::instrument::WithSubscriber;
 
 #[cfg(all(
@@ -164,6 +166,7 @@ impl Drop for MeasurementRuntime {
 }
 
 struct BuiltRuntimeParts {
+    diagnostics: Arc<diagnostics::Diagnostics>,
     dispatcher: Arc<dyn Dispatcher>,
     // Local dispatch owns its DNS reference; this copy feeds shared TUN startup.
     #[cfg_attr(
@@ -388,6 +391,7 @@ impl PreparedCore {
 
     fn build_dispatcher(&self, dialer: Dialer) -> io::Result<BuiltRuntimeParts> {
         let mut parts = GraphBuilder {
+            connections: Arc::default(),
             config: self.config.clone(),
             endpoints: self.endpoints.clone(),
             limits: self.limits,
@@ -622,6 +626,7 @@ impl PreparedCore {
 }
 
 struct GraphBuilder {
+    connections: Arc<crate::connections::Registry>,
     config: Config,
     endpoints: Vec<PreparedProxyEndpoints>,
     limits: ResourceLimits,
@@ -710,6 +715,11 @@ impl GraphBuilder {
             activities,
             dns.clone(),
         );
+        let diagnostics = Arc::new(diagnostics::Diagnostics::new(
+            &self.config,
+            &rules,
+            self.connections.clone(),
+        ));
         let router: Arc<dyn Dispatcher> = Arc::new(
             RoutingDispatcher::new_with_ipv6(
                 route_targets.clone(),
@@ -721,10 +731,12 @@ impl GraphBuilder {
             )
             .with_tun_config(&self.config.tun)
             .with_sniffer(&self.config.sniffer)
-            .with_tcp_concurrent(self.config.connections.tcp_concurrent),
+            .with_tcp_concurrent(self.config.connections.tcp_concurrent)
+            .with_diagnostics(diagnostics.clone()),
         );
         let session_stats = RuntimeResourceStats::new("runtime_session_observation");
         Ok(BuiltRuntimeParts {
+            diagnostics,
             dispatcher: observe_sessions_with_stats(router, session_stats),
             dns,
             geodata_updater: None,

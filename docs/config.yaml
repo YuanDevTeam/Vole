@@ -75,7 +75,8 @@ authentication:
 # 只要 Controller 管理 proxy-groups，secret 就必填；仅有 TUN 流量接口时可省略。
 # secret 出现时必须为 1–255 UTF-8 字节，并作为全部 Controller 路由的 Bearer token。
 # Controller 提供 GET /traffic、GET /group、GET /group/{name}、
-# GET /proxies/{name} 和 PUT /proxies/{name}，不属于 Invoke API。
+# GET /proxies/{name} 和 PUT /proxies/{name}；另含连接查询/关闭、有效配置、规则
+# 与 A/AAAA DNS 查询，完整接口见 controller-api.md；不属于 Invoke API。
 external-controller: 127.0.0.1:9090
 secret: "vole-runtime-secret"
 

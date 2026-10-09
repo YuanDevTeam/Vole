@@ -60,6 +60,7 @@ struct ProxyGroupMember {
 }
 
 pub(crate) struct ResolvedProxyGroupLeaf {
+    pub(crate) chain: Vec<String>,
     pub(crate) dispatcher: Arc<dyn Dispatcher>,
     pub(crate) direct: bool,
 }
@@ -247,10 +248,12 @@ impl ProxyGroups {
         source: Option<std::net::SocketAddr>,
         destination: Option<&crate::session::Destination>,
     ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
+        let mut chain = Vec::new();
         for _ in 0..=self.groups.len() {
             let group = self.groups.get(group_id.index()).ok_or_else(|| {
                 DispatchError::Other(format!("unknown proxy group id {}", group_id.index()))
             })?;
+            chain.push(group.name.clone());
             if udp && group.disable_udp {
                 return Err(DispatchError::NotAllowed);
             }
@@ -263,11 +266,14 @@ impl ProxyGroups {
             })?;
             match member.target {
                 ProxyGroupMemberTarget::Route(RouteTargetId::Proxy(id)) => {
+                    chain.push(member.name.clone());
+                    chain.reverse();
                     return self
                         .proxies
                         .get(id.index())
                         .cloned()
                         .map(|dispatcher| ResolvedProxyGroupLeaf {
+                            chain,
                             dispatcher,
                             direct: false,
                         })
@@ -277,13 +283,19 @@ impl ProxyGroups {
                 }
                 ProxyGroupMemberTarget::Route(RouteTargetId::Group(id)) => group_id = id,
                 ProxyGroupMemberTarget::Direct => {
+                    chain.push("DIRECT".into());
+                    chain.reverse();
                     return Ok(ResolvedProxyGroupLeaf {
+                        chain,
                         dispatcher: self.direct.clone(),
                         direct: true,
                     });
                 }
                 ProxyGroupMemberTarget::Reject => {
+                    chain.push("REJECT".into());
+                    chain.reverse();
                     return Ok(ResolvedProxyGroupLeaf {
+                        chain,
                         dispatcher: self.reject.clone(),
                         direct: false,
                     });
@@ -295,6 +307,11 @@ impl ProxyGroups {
         ))
     }
 
+    pub(crate) fn has_balance(&self) -> bool {
+        self.groups
+            .iter()
+            .any(|g| g.config.kind == crate::config::GroupKind::LoadBalance)
+    }
     pub(crate) fn contains_balance(&self, id: ProxyGroupId) -> bool {
         let mut pending = vec![id];
         let mut seen = std::collections::HashSet::new();

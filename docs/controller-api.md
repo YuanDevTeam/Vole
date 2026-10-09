@@ -1,6 +1,6 @@
 # 运行时 Controller API
 
-Controller 是当前 Running Session 的回环 HTTP 接口。它提供一次性 TUN 流量快照，以及静态与动态 `select`、`url-test`、`fallback`、`load-balance` 代理组的状态查询和实时选择；它不是 Invoke API，也不承诺完整 Mihomo Dashboard 兼容。
+Controller 是当前 Running Session 的回环 HTTP 接口。它提供业务连接管理、有效设置与规则查询、一次性 TUN 流量快照，以及静态与动态 `select`、`url-test`、`fallback`、`load-balance` 代理组的状态查询和实时选择；它不是 Invoke API，也不承诺完整 Mihomo Dashboard 兼容。
 
 ## 配置与生命周期
 
@@ -132,7 +132,7 @@ Content-Length: 26
 静态成员来自配置，动态成员随 provider 成功更新；Controller 读取当前可用的成员和选择：
 
 - 新建的物理 TCP 连接使用切换后的当前叶节点；既有 TCP 连接保持原路径；
-- 新建的 UDP association/物理 transport 使用切换后的当前叶节点；既有 association 不迁移；
+- 新建 UDP 目标会话使用切换后的当前叶节点；既有目标会话不迁移；
 - 新建的 DNS transport 使用切换后的当前叶节点；DNS cache、singleflight 状态和已在池中的 TCP transport 不清空、不迁移；
 - 切换不主动断开连接、不刷新缓存、不重启运行时，也不修改 YAML；可按 profile 配置保存选择；
 - 选中节点、`DIRECT` 或 `REJECT` 时按原样执行；选中嵌套组时继续解析其当前成员。select 的失败按原样返回；自动组根据探测结果选择后续连接的成员。
@@ -156,6 +156,45 @@ Hysteria2 已认证 QUIC 会话也保留其 `dialer-proxy` 上游组快照，包
 不等待候选资源。空动态组使用配置的 `empty-fallback`，默认 COMPATIBLE（直连）。
 组响应另含 `hidden` 与 `icon`，`disable-udp` 会拒绝该组的业务 UDP。
 
+## 业务连接和诊断
+
+`GET /connections` 返回 Mihomo 对应字段 `uploadTotal`、`downloadTotal`、`connections`、
+`memory`。业务连接包含 `id`、`metadata`、`upload`、`download`、`start`、`chains`、
+`providerChains`、`rule`、`rulePayload`。时间使用 RFC 3339；端口为字符串。
+
+- 只统计 TUN、HTTP、SOCKS5 的业务 TCP/UDP 负载，排除 TUN DNS 拦截、ICMP、Controller、
+  Core 资源下载和健康探测。累计值在本次 Running Session 内保留，provider 更新不会重置。
+- TCP 为一条业务流，UDP 为同一来源与目标的会话；每个 UDP 目标有独立 transport，
+  会话超时、关闭或新的 QUIC flow-id 后重新选择出口。资源代际不会迁移既有会话。
+- `chains` 按叶节点到业务路由组排列；当前不展开节点内部的 `dialer-proxy` 协议链。
+  `providerChains` 给出这些节点关联的 provider 名称，可与 provider 状态中的脱敏 `error` 对照。
+- `metadata` 提供来源、目标、入口、协议、嗅探域名与 `dnsMode`，不查询进程或 ASN。
+  扩展字段 `dnsPath` 是当前建链任务实际经过的有界 DNS 阶段标签，例如缓存、policy、
+  fallback、fake-IP 与解析角色；不包含上游地址、URL 或认证头。
+- 扩展字段 `errors` 最多保留最近 32 次建链/数据报失败的连接信息与固定错误码，
+  不返回底层错误原文。`memory` 当前为 0，表示未采集进程 RSS。
+
+`DELETE /connections/{id}` 取消指定连接，`DELETE /connections` 取消当前全部连接。
+均返回 204，未知 ID 同样返回 204；取消唤醒正在等待的 I/O 并释放对应流资源。
+这不禁止用户重新建连，也不重置累计流量。正常 stop 会取消全部连接并沿既有停止屏障回收。
+
+`GET /rules` 返回 `rules` 数组，包括规则索引、类型、payload、目标及命中次数和最后命中时间。
+计数属于当前资源代际，只记录业务的新选路，不将每个 UDP 包重复计为一次选路。
+没有采集未命中次数、GeoData 记录大小；`size` 为 -1。规则列表反映当前有效路由模式。
+
+`GET /configs` 返回归一化后的运行设置：mixed 入口、mode、log-level、IPv6、sniffing、
+连接选项、profile 和 TUN 字段。它使用字段白名单，不提供完整 YAML、节点凭据、订阅位置、
+认证头、Controller secret 或认证用户列表；不支持 PUT/PATCH 配置修改。
+
+`GET /dns/query?name=example.com&type=A` 使用当前 DNS 与相同缓存查询；支持 A/AAAA，
+省略 type 使用 A。响应包含 `Status/Question/Answer/TC/RD/RA/AD/CD` 和扩展 `QueryPath`。
+fake-IP 模式仍返回合成地址；DNS 关闭或查询失败返回 500。这里只输出地址/CNAME 答案，
+不提供其他 qtype、Authority/Additional 展开或后台 DNS 查询日志。
+
+这些接口复用 Controller 的回环限制和 Bearer 鉴权。目标与 DNS 路径只通过显式查询返回，
+不会写入普通日志。`/connections` 是业务负载统计，`/traffic` 继续表示 TUN 原始 IP 包流量，
+`/proxies` 的节点健康数据继续表示探测结果，三者不可相互替代。
+
 ## HTTP 状态与协议边界
 
 | 状态 | 含义 |
@@ -172,7 +211,7 @@ Hysteria2 已认证 QUIC 会话也保留其 `dialer-proxy` 上游组快照，包
 | `413 Payload Too Large` | PUT 正文超过 1 KiB |
 | `415 Unsupported Media Type` | PUT 不是严格 `application/json` |
 
-当前不提供 Controller 主动 delay 测试、连接管理、配置修改、WebSocket 推送、Controller 版本协商或完整 Dashboard response。除本文列出的 provider 路由、`GET /proxies`、`GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}` 外，其他路径和方法均不属于公共协议。
+当前不提供 Controller 主动 delay 测试、配置修改、WebSocket 推送、Controller 版本协商或完整 Dashboard response。除本文列出的连接、规则、配置、DNS 和 provider 路由、`GET /proxies`、`GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}` 外，其他路径和方法均不属于公共协议。
 
 Windows WinRT VPN 的完整运行时和 Controller 位于独立 Session Host；桌面 Wintun 的
 Controller 位于普通业务运行时。宿主通过回环 HTTP 直接访问实际 Running Session；

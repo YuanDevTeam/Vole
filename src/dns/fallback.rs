@@ -55,10 +55,13 @@ pub(super) async fn choose<T>(
         }
     };
     if acceptable(&first) {
+        super::trace::record("primary-answer");
         first
     } else if let Some(answer) = ready {
+        super::trace::record("fallback-answer");
         answer
     } else {
+        super::trace::record("fallback-answer");
         fallback.await
     }
 }

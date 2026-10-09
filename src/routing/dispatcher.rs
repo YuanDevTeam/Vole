@@ -176,6 +176,7 @@ impl ProxyDispatchers {
                 .get(id.index())
                 .cloned()
                 .map(|dispatcher| ResolvedProxyGroupLeaf {
+                    chain: Vec::new(),
                     dispatcher,
                     direct: false,
                 })
@@ -210,9 +211,17 @@ pub struct RoutingDispatcher {
     tun_config: TunConfig,
     sniffer: Option<Arc<crate::sniffing::Policy>>,
     tcp_concurrent: bool,
+    diagnostics: Option<Arc<crate::runtime::diagnostics::Diagnostics>>,
 }
 
 impl RoutingDispatcher {
+    pub(crate) fn with_diagnostics(
+        mut self,
+        diagnostics: Arc<crate::runtime::diagnostics::Diagnostics>,
+    ) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
     pub(crate) fn with_tcp_concurrent(mut self, enabled: bool) -> Self {
         self.tcp_concurrent = enabled;
         self
@@ -253,6 +262,7 @@ impl RoutingDispatcher {
             tun_config: TunConfig::default(),
             sniffer: None,
             tcp_concurrent: false,
+            diagnostics: None,
         }
     }
 
@@ -275,6 +285,7 @@ impl RoutingDispatcher {
             geo_matcher,
             sniffer: None,
             tcp_concurrent: false,
+            diagnostics: None,
             tun_config: TunConfig {
                 udp_timeout: Duration::from_secs(30),
                 ..TunConfig::default()
@@ -345,10 +356,14 @@ impl RoutingDispatcher {
             .as_ref()
             .or(recovered.as_ref())
             .unwrap_or(destination);
-        let accepts_domain_hint = matches!(
-            inbound,
-            InboundKind::Tun | InboundKind::Http | InboundKind::Socks5
-        );
+        let accepts_domain_hint = business(inbound)
+            && (self.rules.uses_domain_routing()
+                || self.diagnostics.is_some()
+                || self
+                    .route_targets
+                    .proxy_groups
+                    .as_ref()
+                    .is_some_and(|groups| groups.has_balance()));
         let sniffed_domain = accepts_domain_hint.then_some(sniffed_domain).flatten();
         let dns_domain_hint = match (accepts_domain_hint, destination, &self.dns, sniffed_domain) {
             (true, Destination::Ip(address), Some(dns), None) => {
@@ -395,6 +410,14 @@ impl RoutingDispatcher {
             ));
         };
 
+        if business(inbound)
+            && let Some(diagnostics) = &self.diagnostics
+        {
+            diagnostics.hit(rule_match.rule_index);
+        }
+        if recovered.is_some() {
+            crate::dns::trace::record("fake-ip-recovery");
+        }
         let routed_destination = match destination {
             Destination::Domain { host, port } => Destination::Domain {
                 host: super::normalize_domain_name(host)
@@ -404,6 +427,14 @@ impl RoutingDispatcher {
             Destination::Ip(_) => destination.clone(),
         };
         let mut decision = RouteDecision {
+            rule_index: rule_match.rule_index,
+            dns_mode: if recovered.is_some() {
+                "fake-ip"
+            } else if dns_domain_hint.is_some() {
+                "mapping"
+            } else {
+                "normal"
+            },
             metadata: context.domain().map_or_else(
                 || destination.clone(),
                 |host| Destination::Domain {
@@ -536,6 +567,8 @@ impl Drop for DnsTcpStream {
 }
 
 struct RouteDecision {
+    rule_index: usize,
+    dns_mode: &'static str,
     metadata: Destination,
     action: RuleAction,
     destination: Destination,
@@ -613,7 +646,39 @@ impl Dispatcher for RoutingDispatcher {
         Some(policy.plan(source, destination, host.as_deref(), mapped))
     }
 
-    async fn connect_tcp(&self, mut session: StreamSession) -> Result<BoxStream, DispatchError> {
+    async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
+        if self.diagnostics.is_some() && business(session.inbound) {
+            crate::dns::trace::capture(self.connect_tcp_inner(session))
+                .await
+                .0
+        } else {
+            self.connect_tcp_inner(session).await
+        }
+    }
+
+    async fn open_datagram(
+        &self,
+        session: DatagramSession,
+    ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        Ok(Box::new(RoutedDatagramTransport {
+            router: self.clone_parts(),
+            session,
+            route_transports: HashMap::new(),
+            fake_flows: HashMap::new(),
+            managed_flows: HashMap::new(),
+            direct_transport: None,
+            flows: DatagramRoutes::new(self.tun_config.udp_timeout),
+            logged_route_actions: HashSet::new(),
+            receive_wakeup: Arc::new(Notify::new()),
+        }))
+    }
+}
+
+impl RoutingDispatcher {
+    async fn connect_tcp_inner(
+        &self,
+        mut session: StreamSession,
+    ) -> Result<BoxStream, DispatchError> {
         self.ensure_destination_allowed(&session.destination)?;
         if session.inbound == InboundKind::Tun
             && matches!(&session.destination, Destination::Ip(address) if self.tun_config.hijacks_dns(*address))
@@ -644,61 +709,118 @@ impl Dispatcher for RoutingDispatcher {
             self.resolve_direct_destination(&mut decision).await?;
         }
         log_route_decision(Network::Tcp, &decision);
-        let direct = decision.action == RuleAction::Direct
-            || resolved_target.as_ref().is_some_and(|target| target.direct);
-        if direct
-            && self.tcp_concurrent
-            && let Some(addresses) = &decision.resolved_addresses
-            && addresses.len() > 1
-        {
-            let dispatcher = resolved_target
-                .as_ref()
-                .map_or(&self.direct, |target| &target.dispatcher);
-            let addresses = addresses
-                .iter()
-                .map(|&ip| SocketAddr::new(ip, decision.destination.port()))
-                .collect::<Vec<_>>();
-            return crate::dialer::race_connections(&addresses, None, |address| {
-                let mut attempt = session.clone();
-                attempt.destination = Destination::Ip(address);
-                attempt.sniffed_domain = None;
-                dispatcher.connect_tcp(attempt)
-            })
-            .await;
-        }
-        session.destination = decision.destination;
-        session.sniffed_domain = None;
-        match decision.action {
-            RuleAction::Route(_) => {
-                resolved_target
-                    .expect("route target was resolved before dispatch")
-                    .dispatcher
-                    .connect_tcp(session)
-                    .await
+        let chain = resolved_target
+            .as_ref()
+            .map_or_else(Vec::new, |target| target.chain.clone());
+        let connection = self.connection(
+            Network::Tcp,
+            session.inbound,
+            session.source,
+            &session.destination,
+            session.sniffed_domain.as_deref(),
+            &decision,
+            chain,
+        );
+        let setup = async {
+            let direct = decision.action == RuleAction::Direct
+                || resolved_target.as_ref().is_some_and(|target| target.direct);
+            if direct
+                && self.tcp_concurrent
+                && let Some(addresses) = &decision.resolved_addresses
+                && addresses.len() > 1
+            {
+                let dispatcher = resolved_target
+                    .as_ref()
+                    .map_or(&self.direct, |target| &target.dispatcher);
+                let addresses = addresses
+                    .iter()
+                    .map(|&ip| SocketAddr::new(ip, decision.destination.port()))
+                    .collect::<Vec<_>>();
+                return crate::dialer::race_connections(&addresses, None, |address| {
+                    let mut attempt = session.clone();
+                    attempt.destination = Destination::Ip(address);
+                    attempt.sniffed_domain = None;
+                    dispatcher.connect_tcp(attempt)
+                })
+                .await;
             }
-            RuleAction::Direct => self.direct.connect_tcp(session).await,
-            RuleAction::Reject => Err(DispatchError::NotAllowed),
+            session.destination = decision.destination;
+            session.sniffed_domain = None;
+            match decision.action {
+                RuleAction::Route(_) => {
+                    resolved_target
+                        .expect("route target was resolved before dispatch")
+                        .dispatcher
+                        .connect_tcp(session)
+                        .await
+                }
+                RuleAction::Direct => self.direct.connect_tcp(session).await,
+                RuleAction::Reject => Err(DispatchError::NotAllowed),
+            }
+        };
+        if let Some(connection) = connection {
+            let token = connection.token();
+            let result = tokio::select! { biased; () = token.cancelled() => Err(DispatchError::NotAllowed), result = setup => result };
+            connection.dns_path(crate::dns::trace::snapshot());
+            match result {
+                Ok(stream) => Ok(connection.stream(stream)),
+                Err(error) => {
+                    if !connection.cancelled() {
+                        connection.failed(&error);
+                    }
+                    Err(error)
+                }
+            }
+        } else {
+            setup.await
         }
     }
 
-    async fn open_datagram(
+    #[allow(clippy::too_many_arguments)]
+    fn connection(
         &self,
-        session: DatagramSession,
-    ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
-        Ok(Box::new(RoutedDatagramTransport {
-            router: self.clone_parts(),
-            session,
-            route_transports: HashMap::new(),
-            fake_flows: HashMap::new(),
-            direct_transport: None,
-            flows: DatagramRoutes::new(self.tun_config.udp_timeout),
-            logged_route_actions: HashSet::new(),
-            receive_wakeup: Arc::new(Notify::new()),
-        }))
+        network: Network,
+        inbound: InboundKind,
+        source: SocketAddr,
+        original: &Destination,
+        sniffed: Option<&str>,
+        decision: &RouteDecision,
+        mut chain: Vec<String>,
+    ) -> Option<crate::connections::Connection> {
+        if !business(inbound) {
+            return None;
+        }
+        let diagnostics = self.diagnostics.as_ref()?;
+        if chain.is_empty() {
+            chain.push(match decision.action {
+                RuleAction::Direct => "DIRECT".into(),
+                RuleAction::Reject => "REJECT".into(),
+                RuleAction::Route(RouteTargetId::Proxy(id)) => {
+                    diagnostics.proxy_names[id.index()].clone()
+                }
+                RuleAction::Route(RouteTargetId::Group(_)) => {
+                    unreachable!("group leaf supplies chain")
+                }
+            });
+        }
+        let (rule, payload) = diagnostics.matched(decision.rule_index);
+        let host = match &decision.metadata {
+            Destination::Domain { host, .. } => host.as_str(),
+            _ => "",
+        };
+        let destination_ip = match &decision.destination {
+            Destination::Ip(addr) => Some(addr.ip().to_string()),
+            _ => None,
+        };
+        let providers = diagnostics.providers(&chain);
+        Some(diagnostics.connections.open(serde_json::json!({
+            "metadata":{"network":if network == Network::Tcp { "tcp" } else { "udp" }, "type":match inbound { InboundKind::Tun=>"Tun", InboundKind::Http=>"HTTP", _=>"Socks5" },
+            "sourceIP":source.ip().to_string(),"sourcePort":source.port().to_string(),"destinationIP":destination_ip,
+            "destinationPort":original.port().to_string(),"host":host,"dnsMode":decision.dns_mode,"sniffHost":sniffed.unwrap_or_default()},
+            "chains":chain,"providerChains":providers,"rule":rule,"rulePayload":payload,"dnsPath":crate::dns::trace::snapshot()
+        })))
     }
-}
 
-impl RoutingDispatcher {
     fn clone_parts(&self) -> Self {
         Self {
             route_targets: self.route_targets.clone(),
@@ -710,6 +832,7 @@ impl RoutingDispatcher {
             tun_config: self.tun_config.clone(),
             sniffer: self.sniffer.clone(),
             tcp_concurrent: self.tcp_concurrent,
+            diagnostics: self.diagnostics.clone(),
         }
     }
 }
@@ -719,6 +842,7 @@ struct RoutedDatagramTransport {
     session: DatagramSession,
     route_transports: HashMap<(RouteTargetId, Option<Destination>), CachedRouteTransport>,
     fake_flows: HashMap<SocketAddr, FakeDatagramFlow>,
+    managed_flows: HashMap<Destination, ManagedDatagramFlow>,
     direct_transport: Option<Box<dyn DatagramTransport>>,
     flows: DatagramRoutes,
     logged_route_actions: HashSet<LoggedRouteAction>,
@@ -730,6 +854,15 @@ struct RoutedDatagramTransport {
 struct FakeDatagramFlow {
     transport: Box<dyn DatagramTransport>,
     remote: SocketAddr,
+    last_used: Instant,
+    flow_id: Option<Box<[u8]>>,
+}
+
+struct ManagedDatagramFlow {
+    transport: Box<dyn DatagramTransport>,
+    connection: crate::connections::Connection,
+    destination: Destination,
+    restore: bool,
     last_used: Instant,
     flow_id: Option<Box<[u8]>>,
 }
@@ -819,6 +952,175 @@ impl From<RuleAction> for LoggedRouteAction {
 }
 
 impl RoutedDatagramTransport {
+    fn tracked(&self) -> bool {
+        self.router.diagnostics.is_some() && business(self.session.inbound)
+    }
+    async fn clean_managed(&mut self) {
+        let expired = self
+            .managed_flows
+            .iter()
+            .filter(|(_, flow)| {
+                flow.connection.cancelled()
+                    || flow.last_used.elapsed() >= self.router.tun_config.udp_timeout
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in expired {
+            if let Some(mut flow) = self.managed_flows.remove(&key) {
+                let _ = flow.transport.close().await;
+            }
+        }
+    }
+    async fn send_managed(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
+        self.clean_managed().await;
+        let key = datagram.remote.clone();
+        if !self.managed_flows.contains_key(&key) {
+            let mut decision = self
+                .router
+                .route(
+                    Network::Udp,
+                    self.session.inbound,
+                    self.session.source,
+                    &key,
+                    datagram.sniffed_domain.as_deref(),
+                )
+                .await?;
+            if decision.action == RuleAction::Reject {
+                return Ok(());
+            }
+            let (dispatcher, direct, chain) = match decision.action {
+                RuleAction::Direct => (self.router.direct.clone(), true, Vec::new()),
+                RuleAction::Route(id) => {
+                    let leaf = self.router.route_targets.resolve_for(
+                        id,
+                        true,
+                        Some(self.session.source),
+                        Some(&decision.metadata),
+                    )?;
+                    (leaf.dispatcher, leaf.direct, leaf.chain)
+                }
+                RuleAction::Reject => unreachable!(),
+            };
+            if direct {
+                self.router
+                    .resolve_direct_destination(&mut decision)
+                    .await?;
+            }
+            let restore = matches!(key, Destination::Ip(_))
+                && (decision.dns_mode == "fake-ip"
+                    || (datagram.sniffed_domain.is_some()
+                        && self
+                            .router
+                            .sniffer
+                            .as_ref()
+                            .is_some_and(|p| p.config.quic_override)));
+            if restore && let Destination::Domain { host, port } = &decision.destination {
+                let dns = self
+                    .router
+                    .dns
+                    .as_ref()
+                    .ok_or(DispatchError::HostUnreachable)?;
+                let addresses = self.router.resolve_addresses(dns, host).await;
+                decision.destination = Destination::Ip(SocketAddr::new(
+                    preferred_address(&addresses).ok_or(DispatchError::HostUnreachable)?,
+                    *port,
+                ));
+            }
+            let connection = self
+                .router
+                .connection(
+                    Network::Udp,
+                    self.session.inbound,
+                    self.session.source,
+                    &key,
+                    datagram.sniffed_domain.as_deref(),
+                    &decision,
+                    chain,
+                )
+                .expect("tracked business flow");
+            let token = connection.token();
+            let result = tokio::select! { biased; () = token.cancelled() => Err(DispatchError::NotAllowed), result = dispatcher.open_datagram(self.session.clone()) => result };
+            connection.dns_path(crate::dns::trace::snapshot());
+            let transport = match result {
+                Ok(transport) => transport,
+                Err(error) => {
+                    if !connection.cancelled() {
+                        connection.failed(&error);
+                    }
+                    return Err(error);
+                }
+            };
+            self.managed_flows.insert(
+                key.clone(),
+                ManagedDatagramFlow {
+                    transport,
+                    connection,
+                    destination: decision.destination,
+                    restore,
+                    last_used: Instant::now(),
+                    flow_id: None,
+                },
+            );
+        }
+        let flow = self.managed_flows.get_mut(&key).expect("flow created");
+        flow.last_used = Instant::now();
+        let size = datagram.payload.len();
+        datagram.remote = flow.destination.clone();
+        datagram.sniffed_domain = None;
+        let token = flow.connection.token();
+        let result = tokio::select! { biased; () = token.cancelled() => Err(DispatchError::NotAllowed), result = flow.transport.send(datagram) => result };
+        match &result {
+            Ok(()) => flow.connection.upload(size),
+            Err(error) => {
+                if !flow.connection.cancelled() {
+                    flow.connection.failed(error);
+                }
+                if let Some(mut flow) = self.managed_flows.remove(&key) {
+                    let _ = flow.transport.close().await;
+                }
+            }
+        }
+        result
+    }
+    async fn receive_managed(&mut self) -> Result<Datagram, DispatchError> {
+        loop {
+            self.clean_managed().await;
+            if self.managed_flows.is_empty() {
+                std::future::pending::<()>().await;
+            }
+            let result = {
+                let receives = self.managed_flows.iter_mut().map(|(key, flow)| Box::pin(async move {
+                    let token = flow.connection.token();
+                    loop {
+                        let result = tokio::select! { biased; () = token.cancelled() => None, result = flow.transport.receive() => Some(result) };
+                        if let Some(Ok(mut datagram)) = result {
+                            if flow.restore {
+                                if datagram.remote != flow.destination { continue; }
+                                datagram.remote = key.clone();
+                            }
+                            flow.connection.download(datagram.payload.len());
+                            flow.last_used = Instant::now();
+                            return (key.clone(), Some(Ok(datagram)));
+                        }
+                        return (key.clone(), result);
+                    }
+                }) as futures_util::future::BoxFuture<'_, _>).collect::<Vec<_>>();
+                tokio::select! { (result, _, _) = select_all(receives) => Some(result), () = tokio::time::sleep(UDP_FLOW_CLEANUP_INTERVAL) => None }
+            };
+            if let Some((key, result)) = result {
+                if let Some(Ok(datagram)) = result {
+                    return Ok(datagram);
+                }
+                if let Some(mut flow) = self.managed_flows.remove(&key) {
+                    if let Some(Err(error)) = result {
+                        flow.connection.failed(&error);
+                    }
+                    let _ = flow.transport.close().await;
+                }
+            }
+        }
+    }
+
     async fn expire_fake_flows(&mut self) {
         let expired = self
             .route_transports
@@ -1073,6 +1375,11 @@ impl RoutedDatagramTransport {
 #[async_trait]
 impl DatagramTransport for RoutedDatagramTransport {
     async fn send(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
+        if self.tracked() {
+            return crate::dns::trace::capture(self.send_managed(datagram))
+                .await
+                .0;
+        }
         self.expire_fake_flows().await;
         if matches!(self.session.inbound, InboundKind::Tun | InboundKind::Socks5)
             && let Destination::Ip(original) = datagram.remote
@@ -1105,6 +1412,8 @@ impl DatagramTransport for RoutedDatagramTransport {
         let action = flow.and_then(|destination| self.flows.action(destination, now));
         let decision = if let Some(action) = action {
             RouteDecision {
+                rule_index: self.router.rules.len(),
+                dns_mode: "normal",
                 metadata: datagram.remote.clone(),
                 action,
                 destination: datagram.remote.clone(),
@@ -1157,6 +1466,22 @@ impl DatagramTransport for RoutedDatagramTransport {
         if flow_id.is_empty() || flow_id.len() > 25 {
             return Err(DispatchError::NotAllowed);
         }
+        if self.tracked() {
+            let key = datagram.remote.clone();
+            if self
+                .managed_flows
+                .get(&key)
+                .is_some_and(|flow| flow.flow_id.as_deref() != Some(flow_id))
+                && let Some(mut old) = self.managed_flows.remove(&key)
+            {
+                old.transport.close().await?;
+            }
+            self.send(datagram).await?;
+            if let Some(flow) = self.managed_flows.get_mut(&key) {
+                flow.flow_id = Some(flow_id.into());
+            }
+            return Ok(());
+        }
         let flow = match (self.session.inbound, &datagram.remote) {
             (InboundKind::Tun, Destination::Ip(address)) => Some(*address),
             _ => None,
@@ -1208,6 +1533,9 @@ impl DatagramTransport for RoutedDatagramTransport {
     }
 
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+        if self.tracked() {
+            return self.receive_managed().await;
+        }
         let datagram = loop {
             self.expire_fake_flows().await;
             tokio::select! {
@@ -1227,6 +1555,13 @@ impl DatagramTransport for RoutedDatagramTransport {
 
     async fn close(&mut self) -> Result<(), DispatchError> {
         let mut first_error = None;
+        for (_, mut flow) in self.managed_flows.drain() {
+            if let Err(error) = flow.transport.close().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
         for flow in self.fake_flows.values_mut() {
             if let Err(error) = flow.transport.close().await
                 && first_error.is_none()
@@ -1541,6 +1876,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_udp_connections_close_one_flow_and_preserve_others() {
+        let config = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxies: [{name: edge, type: socks5, server: 192.0.2.1, port: 1080, udp: true}]
+proxy-groups: [{name: pool, type: select, proxies: [edge]}]
+rules: ["MATCH,pool"]
+"#,
+        )
+        .unwrap();
+        let proxy = Arc::new(RecordingDispatcher::default());
+        let direct = Arc::new(RecordingDispatcher::default());
+        let nodes = vec![proxy.clone() as Arc<dyn Dispatcher>];
+        let groups = ProxyGroups::new(&config.proxy_groups, nodes.clone(), direct.clone()).unwrap();
+        let rules = RuleSet::compile(config.rules.clone()).unwrap();
+        let registry = Arc::new(crate::connections::Registry::default());
+        let diagnostics = Arc::new(crate::runtime::diagnostics::Diagnostics::new(
+            &config,
+            &rules,
+            registry.clone(),
+        ));
+        let router = RoutingDispatcher::new(
+            ProxyDispatchers::with_proxy_groups(nodes, &groups).unwrap(),
+            direct,
+            None,
+            rules,
+            Arc::new(EmptyGeoMatcher),
+        )
+        .with_diagnostics(diagnostics);
+        let mut transport = router
+            .open_datagram(association(InboundKind::Socks5))
+            .await
+            .unwrap();
+        let first = "198.51.100.1:443".parse().unwrap();
+        let second = "198.51.100.2:443".parse().unwrap();
+        transport.send(datagram(first, b"one")).await.unwrap();
+        transport.send(datagram(second, b"two")).await.unwrap();
+        let snapshot = registry.snapshot();
+        let entries = snapshot["connections"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let entry = entries
+            .iter()
+            .find(|e| e["metadata"]["destinationIP"] == "198.51.100.1")
+            .unwrap();
+        assert_eq!(entry["chains"], serde_json::json!(["edge", "pool"]));
+        assert_eq!(entry["rule"], "Match");
+        registry.close(entry["id"].as_str().unwrap());
+        assert_eq!(
+            transport.receive().await.unwrap().remote,
+            Destination::Ip(second)
+        );
+        assert_eq!(
+            registry.snapshot()["connections"].as_array().unwrap().len(),
+            1
+        );
+        transport.send(datagram(first, b"new")).await.unwrap();
+        assert_eq!(proxy.udp_opens.load(Ordering::Relaxed), 3);
+        transport.close().await.unwrap();
+        assert!(
+            registry.snapshot()["connections"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn load_balance_routes_tcp_and_pins_udp_flows() {
         let config = crate::config::Config::parse_yaml(
             br#"
@@ -1648,6 +2050,7 @@ rules: ["MATCH,balance"]
             tun_config: TunConfig::default(),
             sniffer: None,
             tcp_concurrent: false,
+            diagnostics: None,
         };
 
         router
@@ -3399,4 +3802,11 @@ rules: ["MATCH,balance"]
         assert_eq!(*dns.resolved_hosts.lock().unwrap(), ["sniffed.example"]);
         transport.close().await.unwrap();
     }
+}
+
+fn business(inbound: InboundKind) -> bool {
+    matches!(
+        inbound,
+        InboundKind::Tun | InboundKind::Http | InboundKind::Socks5
+    )
 }
