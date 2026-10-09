@@ -1,10 +1,12 @@
-use std::{future::Future, io, net::SocketAddr, pin::Pin};
+use std::{
+    io,
+    net::SocketAddr,
+    task::{Context, Poll},
+};
 
 use crate::dialer::PhysicalDatagram as UdpSocket;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::future::select_all;
-use tokio::io::ReadBuf;
 
 use crate::{
     dialer::Dialer,
@@ -89,6 +91,7 @@ struct DirectDatagramTransport {
     sockets: Vec<(UdpSocketClass, UdpSocket)>,
     max_response_payload_size: usize,
     receive_buffer: Vec<u8>,
+    receive_cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,18 +102,12 @@ struct UdpSocketClass {
 
 impl DirectDatagramTransport {
     fn new(dialer: Dialer, max_response_payload_size: usize) -> Self {
-        // `recv_from` is allowed to truncate a datagram to the supplied
-        // buffer without reporting the original length. One sentinel byte is
-        // enough to distinguish an allowed maximum-size payload from every
-        // oversized payload while preserving a hard allocation ceiling.
-        let receive_buffer_size = max_response_payload_size
-            .checked_add(1)
-            .expect("direct UDP response ceiling fits usize");
         Self {
             dialer,
             sockets: Vec::with_capacity(4),
             max_response_payload_size,
-            receive_buffer: vec![0; receive_buffer_size],
+            receive_buffer: Vec::new(),
+            receive_cursor: 0,
         }
     }
 
@@ -135,60 +132,55 @@ impl DirectDatagramTransport {
             .1)
     }
 
-    async fn receive_from_ready_socket(&mut self) -> Result<Datagram, DispatchError> {
-        loop {
-            if self.sockets.is_empty() {
-                return Err(DispatchError::Other(
-                    "direct UDP receive requested before the first datagram".to_owned(),
-                ));
-            }
-            // A single physical socket has only this reader. Poll it directly
-            // instead of rebuilding boxed readiness waiters after cancellation.
-            if self.sockets.len() == 1 {
-                let socket = &self.sockets[0].1;
-                let mut receive_buffer = ReadBuf::new(&mut self.receive_buffer);
-                let remote = std::future::poll_fn(|context| {
-                    socket.poll_recv_from(context, &mut receive_buffer)
-                })
-                .await
-                .map_err(DispatchError::from)?;
-                if receive_buffer.filled().len() > self.max_response_payload_size {
-                    continue;
+    fn poll_sockets(
+        sockets: &[(UdpSocketClass, UdpSocket)],
+        max_payload: usize,
+        cursor: &mut usize,
+        context: &mut Context<'_>,
+        scratch: &mut Vec<u8>,
+    ) -> Poll<Result<Datagram, DispatchError>> {
+        if sockets.is_empty() {
+            return Poll::Ready(Err(DispatchError::Other(
+                "direct UDP receive requested before the first datagram".to_owned(),
+            )));
+        }
+        for _ in 0..crate::limits::IO_POLL_BUDGET {
+            let mut retry = false;
+            for offset in 0..sockets.len() {
+                let index = (*cursor + offset) % sockets.len();
+                let socket = &sockets[index].1;
+                match socket.poll_recv_ready(context) {
+                    Poll::Pending => continue,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+                    Poll::Ready(Ok(())) => {}
                 }
-                return Ok(Datagram {
-                    remote: Destination::Ip(remote),
-                    payload: Bytes::copy_from_slice(receive_buffer.filled()),
-                    sniffed_domain: None,
-                });
-            }
-            let readiness: Vec<Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>>> = self
-                .sockets
-                .iter()
-                .enumerate()
-                .map(|(index, (_, socket))| {
-                    Box::pin(async move { socket.readable().await.map(|()| index) })
-                        as Pin<Box<dyn Future<Output = io::Result<usize>> + Send + '_>>
-                })
-                .collect();
-            let (selected, _, _) = select_all(readiness).await;
-            let selected = selected.map_err(DispatchError::from)?;
-            let socket = &self.sockets[selected].1;
-            match socket.try_recv_from(&mut self.receive_buffer) {
-                // A UDP datagram is indivisible. Never turn an oversized
-                // response into a shorter, apparently valid datagram for the
-                // SOCKS5 client or TUN netstack.
-                Ok((length, _)) if length > self.max_response_payload_size => continue,
-                Ok((length, remote)) => {
-                    return Ok(Datagram {
-                        remote: Destination::Ip(remote),
-                        payload: Bytes::copy_from_slice(&self.receive_buffer[..length]),
-                        sniffed_domain: None,
-                    });
+                // Allocate only once a socket is readable. The extra byte
+                // detects oversized datagrams rather than delivering a prefix.
+                let required = max_payload + 1;
+                if scratch.len() < required {
+                    scratch.reserve_exact(required - scratch.len());
+                    scratch.resize(required, 0);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(error) => return Err(DispatchError::from(error)),
+                match socket.try_recv_from(&mut scratch[..required]) {
+                    Ok((length, remote)) if length <= max_payload => {
+                        *cursor = (index + 1) % sockets.len();
+                        return Poll::Ready(Ok(Datagram {
+                            remote: Destination::Ip(remote),
+                            payload: Bytes::copy_from_slice(&scratch[..length]),
+                            sniffed_domain: None,
+                        }));
+                    }
+                    Ok(_) => retry = true,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => retry = true,
+                    Err(error) => return Poll::Ready(Err(error.into())),
+                }
+            }
+            if !retry {
+                return Poll::Pending;
             }
         }
+        context.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -223,8 +215,35 @@ impl DatagramTransport for DirectDatagramTransport {
         Ok(())
     }
 
+    fn supports_poll_receive(&self) -> bool {
+        true
+    }
+
+    fn poll_receive(
+        &mut self,
+        context: &mut Context<'_>,
+        scratch: &mut Vec<u8>,
+    ) -> Poll<Result<Datagram, DispatchError>> {
+        Self::poll_sockets(
+            &self.sockets,
+            self.max_response_payload_size,
+            &mut self.receive_cursor,
+            context,
+            scratch,
+        )
+    }
+
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
-        self.receive_from_ready_socket().await
+        std::future::poll_fn(|context| {
+            Self::poll_sockets(
+                &self.sockets,
+                self.max_response_payload_size,
+                &mut self.receive_cursor,
+                context,
+                &mut self.receive_buffer,
+            )
+        })
+        .await
     }
 
     async fn close(&mut self) -> Result<(), DispatchError> {

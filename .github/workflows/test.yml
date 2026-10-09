@@ -185,6 +185,7 @@ jobs:
           filters=(
             geodata:: routing:: security:: outbound::vless::encryption config::
             connections::tests:: routing::diagnostics::tests:: dialer::connections::tests::
+            polled_datagram_
             resource::http::tests:: fake_ip_ sniffing::tests:: tcp_sniffer::tests::
             dns::fallback::tests:: dns::runtime::tests::dns_fallback_
             dns::runtime::encrypted_tests::

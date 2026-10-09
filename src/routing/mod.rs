@@ -17,6 +17,7 @@ use crate::{
 };
 
 mod balance;
+pub(super) mod datagram_ready;
 mod selection;
 pub(crate) use selection::GroupSelection;
 

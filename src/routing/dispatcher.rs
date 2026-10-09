@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -29,6 +30,7 @@ use crate::{
 
 use super::{
     GeoMatcher, ProxyGroups, ResolvedProxyGroupLeaf, RoutingContext, RuleEvaluation, RuleSet,
+    datagram_ready::{ReadyFlow, ReadyQueue},
 };
 
 const TCP_DNS_DUPLEX_CAPACITY: usize = 8 * 1024;
@@ -673,21 +675,30 @@ impl Dispatcher for RoutingDispatcher {
         &self,
         session: DatagramSession,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
-        Ok(Box::new(RoutedDatagramTransport {
-            router: self.clone_parts(),
-            session,
-            route_transports: HashMap::new(),
-            fake_flows: HashMap::new(),
-            managed_flows: HashMap::new(),
-            direct_transport: None,
-            flows: DatagramRoutes::new(self.tun_config.udp_timeout),
-            logged_route_actions: HashSet::new(),
-            receive_wakeup: Arc::new(Notify::new()),
-        }))
+        Ok(Box::new(self.routed_datagrams(session)))
     }
 }
 
 impl RoutingDispatcher {
+    fn routed_datagrams(&self, session: DatagramSession) -> RoutedDatagramTransport {
+        let managed_ready = (self.diagnostics.is_some() && business(session.inbound))
+            .then(|| Arc::new(ReadyQueue::default()));
+        RoutedDatagramTransport {
+            router: self.clone_parts(),
+            session,
+            route_transports: HashMap::new(),
+            fake_flows: HashMap::new(),
+            managed_flows: ManagedDatagramFlows::default(),
+            managed_ready,
+            managed_receive_buffer: Vec::new(),
+            managed_next_cleanup: Instant::now() + UDP_FLOW_CLEANUP_INTERVAL,
+            direct_transport: None,
+            flows: DatagramRoutes::new(self.tun_config.udp_timeout),
+            logged_route_actions: HashSet::new(),
+            receive_wakeup: Arc::new(Notify::new()),
+        }
+    }
+
     async fn connect_tcp_inner(
         &self,
         mut session: StreamSession,
@@ -883,7 +894,10 @@ struct RoutedDatagramTransport {
     session: DatagramSession,
     route_transports: HashMap<(RouteTargetId, Option<Destination>), CachedRouteTransport>,
     fake_flows: HashMap<SocketAddr, FakeDatagramFlow>,
-    managed_flows: HashMap<Destination, ManagedDatagramFlow>,
+    managed_flows: ManagedDatagramFlows,
+    managed_ready: Option<Arc<ReadyQueue>>,
+    managed_receive_buffer: Vec<u8>,
+    managed_next_cleanup: Instant,
     direct_transport: Option<Box<dyn DatagramTransport>>,
     flows: DatagramRoutes,
     logged_route_actions: HashSet<LoggedRouteAction>,
@@ -899,13 +913,71 @@ struct FakeDatagramFlow {
     flow_id: Option<Box<[u8]>>,
 }
 
+struct ManagedReceive {
+    wake: Arc<ReadyFlow>,
+    cancelled: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+}
+
+#[derive(Default)]
+struct ManagedDatagramFlows {
+    polled: HashMap<Destination, ManagedDatagramFlow>,
+    asynchronous: HashMap<Destination, ManagedDatagramFlow>,
+}
+impl ManagedDatagramFlows {
+    fn get(&self, key: &Destination) -> Option<&ManagedDatagramFlow> {
+        self.polled.get(key).or_else(|| self.asynchronous.get(key))
+    }
+    fn get_mut(&mut self, key: &Destination) -> Option<&mut ManagedDatagramFlow> {
+        self.polled
+            .get_mut(key)
+            .or_else(|| self.asynchronous.get_mut(key))
+    }
+    fn contains_key(&self, key: &Destination) -> bool {
+        self.polled.contains_key(key) || self.asynchronous.contains_key(key)
+    }
+    fn insert(&mut self, key: Destination, flow: ManagedDatagramFlow) {
+        if flow.receiver.is_some() {
+            self.polled.insert(key, flow);
+        } else {
+            self.asynchronous.insert(key, flow);
+        }
+    }
+    fn remove(&mut self, key: &Destination) -> Option<ManagedDatagramFlow> {
+        self.polled
+            .remove(key)
+            .or_else(|| self.asynchronous.remove(key))
+    }
+    fn iter(&self) -> impl Iterator<Item = (&Destination, &ManagedDatagramFlow)> {
+        self.polled.iter().chain(self.asynchronous.iter())
+    }
+    fn drain(&mut self) -> impl Iterator<Item = (Destination, ManagedDatagramFlow)> {
+        self.polled.drain().chain(self.asynchronous.drain())
+    }
+    fn shrink(&mut self) {
+        for map in [&mut self.polled, &mut self.asynchronous] {
+            if map.capacity() > map.len().saturating_mul(4).max(8) {
+                map.shrink_to(map.len().saturating_mul(2));
+            }
+        }
+    }
+}
+
 struct ManagedDatagramFlow {
+    receiver: Option<ManagedReceive>,
     transport: Box<dyn DatagramTransport>,
     connection: crate::connections::Connection,
     destination: Destination,
     restore: bool,
     last_used: Instant,
     flow_id: Option<Box<[u8]>>,
+}
+
+impl Drop for ManagedDatagramFlow {
+    fn drop(&mut self) {
+        if let Some(receiver) = &self.receiver {
+            receiver.wake.deactivate();
+        }
+    }
 }
 
 struct CachedRouteTransport {
@@ -997,6 +1069,11 @@ impl RoutedDatagramTransport {
         self.router.diagnostics.is_some() && business(self.session.inbound)
     }
     async fn clean_managed(&mut self) {
+        let now = Instant::now();
+        if now < self.managed_next_cleanup {
+            return;
+        }
+        self.managed_next_cleanup = now + UDP_FLOW_CLEANUP_INTERVAL;
         let expired = self
             .managed_flows
             .iter()
@@ -1008,13 +1085,31 @@ impl RoutedDatagramTransport {
             .collect::<Vec<_>>();
         for key in expired {
             if let Some(mut flow) = self.managed_flows.remove(&key) {
+                if let Some(receiver) = &flow.receiver {
+                    receiver.wake.deactivate();
+                }
                 let _ = flow.transport.close().await;
             }
         }
+        self.managed_flows.shrink();
+        self.managed_ready
+            .as_ref()
+            .expect("tracked receive queue")
+            .shrink();
     }
     async fn send_managed(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
         self.clean_managed().await;
         let key = datagram.remote.clone();
+        if self.managed_flows.get(&key).is_some_and(|flow| {
+            flow.connection.cancelled()
+                || flow.last_used.elapsed() >= self.router.tun_config.udp_timeout
+        }) && let Some(mut flow) = self.managed_flows.remove(&key)
+        {
+            if let Some(receiver) = &flow.receiver {
+                receiver.wake.deactivate();
+            }
+            let _ = flow.transport.close().await;
+        }
         if !self.managed_flows.contains_key(&key) {
             let mut decision = self
                 .router
@@ -1091,9 +1186,22 @@ impl RoutedDatagramTransport {
                     return Err(error);
                 }
             };
+            let receiver = transport.supports_poll_receive().then(|| {
+                let wake = self
+                    .managed_ready
+                    .as_ref()
+                    .expect("tracked receive queue")
+                    .registration(key.clone());
+                wake.enqueue();
+                ManagedReceive {
+                    wake,
+                    cancelled: Box::pin(connection.token().cancelled_owned()),
+                }
+            });
             self.managed_flows.insert(
                 key.clone(),
                 ManagedDatagramFlow {
+                    receiver,
                     transport,
                     connection,
                     destination: decision.destination,
@@ -1123,36 +1231,117 @@ impl RoutedDatagramTransport {
         }
         result
     }
+    fn poll_managed(
+        flows: &mut HashMap<Destination, ManagedDatagramFlow>,
+        ready: &ReadyQueue,
+        scratch: &mut Vec<u8>,
+        idle_timeout: Duration,
+        context: &mut Context<'_>,
+    ) -> Poll<(Destination, Option<Result<Datagram, DispatchError>>)> {
+        ready.register(context.waker());
+        for _ in 0..crate::limits::IO_POLL_BUDGET {
+            let Some(wake) = ready.pop() else {
+                return Poll::Pending;
+            };
+            let Some(flow) = flows.get_mut(wake.key()) else {
+                continue;
+            };
+            let receiver = flow.receiver.as_mut().expect("polled receiver");
+            if !Arc::ptr_eq(&receiver.wake, &wake) {
+                continue;
+            }
+            let waker = futures_util::task::waker_ref(&wake);
+            let mut flow_context = Context::from_waker(&waker);
+            if receiver
+                .cancelled
+                .as_mut()
+                .poll(&mut flow_context)
+                .is_ready()
+                || flow.last_used.elapsed() >= idle_timeout
+            {
+                return Poll::Ready((wake.key().clone(), None));
+            }
+            match flow.transport.poll_receive(&mut flow_context, scratch) {
+                Poll::Pending => {}
+                Poll::Ready(Ok(mut datagram)) => {
+                    wake.enqueue();
+                    if flow.restore {
+                        if datagram.remote != flow.destination {
+                            continue;
+                        }
+                        datagram.remote = wake.key().clone();
+                    }
+                    flow.connection.download(datagram.payload.len());
+                    flow.last_used = Instant::now();
+                    return Poll::Ready((wake.key().clone(), Some(Ok(datagram))));
+                }
+                Poll::Ready(Err(error)) => {
+                    return Poll::Ready((wake.key().clone(), Some(Err(error))));
+                }
+            }
+        }
+        if !ready.is_empty() {
+            context.waker().wake_by_ref();
+        }
+        Poll::Pending
+    }
+
     async fn receive_managed(&mut self) -> Result<Datagram, DispatchError> {
         loop {
             self.clean_managed().await;
-            if self.managed_flows.is_empty() {
-                std::future::pending::<()>().await;
-            }
+            let idle_timeout = self.router.tun_config.udp_timeout;
             let result = {
-                let receives = self.managed_flows.iter_mut().map(|(key, flow)| Box::pin(async move {
-                    let token = flow.connection.token();
-                    loop {
-                        let result = tokio::select! { biased; () = token.cancelled() => None, result = flow.transport.receive() => Some(result) };
-                        if let Some(Ok(mut datagram)) = result {
-                            if flow.restore {
-                                if datagram.remote != flow.destination { continue; }
-                                datagram.remote = key.clone();
-                            }
-                            flow.connection.download(datagram.payload.len());
-                            flow.last_used = Instant::now();
-                            return (key.clone(), Some(Ok(datagram)));
-                        }
-                        return (key.clone(), result);
+                let polled = std::future::poll_fn(|context| {
+                    Self::poll_managed(
+                        &mut self.managed_flows.polled,
+                        self.managed_ready.as_ref().expect("tracked receive queue"),
+                        &mut self.managed_receive_buffer,
+                        idle_timeout,
+                        context,
+                    )
+                });
+                let asynchronous = async {
+                    if self.managed_flows.asynchronous.is_empty() {
+                        std::future::pending::<()>().await;
                     }
-                }) as futures_util::future::BoxFuture<'_, _>).collect::<Vec<_>>();
-                tokio::select! { (result, _, _) = select_all(receives) => Some(result), () = tokio::time::sleep(UDP_FLOW_CLEANUP_INTERVAL) => None }
+                    let receives = self.managed_flows.asynchronous.iter_mut().map(|(key, flow)| Box::pin(async move {
+                        let token = flow.connection.token();
+                        loop {
+                            if flow.last_used.elapsed() >= idle_timeout {
+                                return (key.clone(), None);
+                            }
+                            let result = tokio::select! { biased; () = token.cancelled() => None, result = flow.transport.receive() => Some(result) };
+                            if let Some(Ok(mut datagram)) = result {
+                                if flow.last_used.elapsed() >= idle_timeout {
+                                    return (key.clone(), None);
+                                }
+                                if flow.restore {
+                                    if datagram.remote != flow.destination { continue; }
+                                    datagram.remote = key.clone();
+                                }
+                                flow.connection.download(datagram.payload.len());
+                                flow.last_used = Instant::now();
+                                return (key.clone(), Some(Ok(datagram)));
+                            }
+                            return (key.clone(), result);
+                        }
+                    }) as futures_util::future::BoxFuture<'_, _>).collect::<Vec<_>>();
+                    select_all(receives).await.0
+                };
+                tokio::select! {
+                    result = polled => Some(result),
+                    result = asynchronous => Some(result),
+                    () = tokio::time::sleep_until(self.managed_next_cleanup) => None,
+                }
             };
             if let Some((key, result)) = result {
                 if let Some(Ok(datagram)) = result {
                     return Ok(datagram);
                 }
                 if let Some(mut flow) = self.managed_flows.remove(&key) {
+                    if let Some(receiver) = &flow.receiver {
+                        receiver.wake.deactivate();
+                    }
                     if let Some(Err(error)) = result {
                         flow.connection.failed(&error);
                     }
@@ -1660,6 +1849,9 @@ mod tests {
     #[derive(Default)]
     struct RecordingDispatcher {
         tcp_only: bool,
+        pollable: bool,
+        receive_polls: Arc<AtomicUsize>,
+        udp_closes: Arc<AtomicUsize>,
         tcp_sessions: Mutex<Vec<StreamSession>>,
         datagrams: Arc<Mutex<Vec<Datagram>>>,
         udp_opens: AtomicUsize,
@@ -1685,6 +1877,10 @@ mod tests {
             Ok(Box::new(RecordingDatagrams {
                 sent: self.datagrams.clone(),
                 responses: VecDeque::new(),
+                pollable: self.pollable,
+                receive_polls: self.receive_polls.clone(),
+                closes: self.udp_closes.clone(),
+                receive_waker: None,
             }))
         }
     }
@@ -1692,13 +1888,40 @@ mod tests {
     struct RecordingDatagrams {
         sent: Arc<Mutex<Vec<Datagram>>>,
         responses: VecDeque<Datagram>,
+        pollable: bool,
+        receive_polls: Arc<AtomicUsize>,
+        closes: Arc<AtomicUsize>,
+        receive_waker: Option<std::task::Waker>,
     }
 
     #[async_trait]
     impl DatagramTransport for RecordingDatagrams {
+        fn supports_poll_receive(&self) -> bool {
+            self.pollable
+        }
+        fn poll_receive(
+            &mut self,
+            context: &mut Context<'_>,
+            _scratch: &mut Vec<u8>,
+        ) -> Poll<Result<Datagram, DispatchError>> {
+            self.receive_polls.fetch_add(1, Ordering::Relaxed);
+            self.receive_waker = Some(context.waker().clone());
+            match self.responses.pop_front() {
+                Some(response) => Poll::Ready(Ok(response)),
+                None => Poll::Pending,
+            }
+        }
+        async fn close(&mut self) -> Result<(), DispatchError> {
+            self.closes.fetch_add(1, Ordering::Relaxed);
+            self.receive_waker = None;
+            Ok(())
+        }
         async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
             self.sent.lock().unwrap().push(datagram.clone());
             self.responses.push_back(datagram);
+            if let Some(waker) = &self.receive_waker {
+                waker.wake_by_ref();
+            }
             Ok(())
         }
 
@@ -1983,6 +2206,85 @@ rules: ["MATCH,pool"]
         transport.send(datagram(first, b"new")).await.unwrap();
         assert_eq!(proxy.udp_opens.load(Ordering::Relaxed), 3);
         transport.close().await.unwrap();
+        assert!(
+            serde_json::to_value(registry.snapshot()).unwrap()["connections"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn managed_udp_connections_poll_only_ready_targets_and_close_pending_flow() {
+        let config =
+            crate::config::Config::parse_yaml(b"mixed-port: 1080\nrules: [\"MATCH,DIRECT\"]\n")
+                .unwrap();
+        let direct = Arc::new(RecordingDispatcher {
+            pollable: true,
+            ..Default::default()
+        });
+        let rules = RuleSet::compile(config.rules.clone()).unwrap();
+        let registry = Arc::new(crate::connections::Registry::default());
+        let diagnostics = Arc::new(crate::routing::diagnostics::Diagnostics::new(
+            &config,
+            &rules,
+            registry.clone(),
+        ));
+        let router = RoutingDispatcher::new(
+            ProxyDispatchers::new(Vec::new()).unwrap(),
+            direct.clone(),
+            None,
+            rules,
+            Arc::new(EmptyGeoMatcher),
+        )
+        .with_diagnostics(diagnostics);
+        let mut transport = router.routed_datagrams(association(InboundKind::Socks5));
+        let addresses = (0..256)
+            .map(|port| SocketAddr::new("198.51.100.1".parse().unwrap(), 10000 + port))
+            .collect::<Vec<_>>();
+        for address in &addresses {
+            transport.send(datagram(*address, b"first")).await.unwrap();
+        }
+        for _ in &addresses {
+            transport.receive().await.unwrap();
+        }
+        // Register all idle readers without retaining futures across calls.
+        while !transport.managed_ready.as_ref().unwrap().is_empty() {
+            assert!(futures_util::poll!(transport.receive()).is_pending());
+        }
+        direct.receive_polls.store(0, Ordering::Relaxed);
+        let deadline = transport.managed_next_cleanup;
+        transport
+            .send(datagram(addresses[0], b"ready"))
+            .await
+            .unwrap();
+        assert_eq!(
+            transport.receive().await.unwrap().remote,
+            Destination::Ip(addresses[0])
+        );
+        assert_eq!(direct.receive_polls.load(Ordering::Relaxed), 1);
+        assert_eq!(transport.managed_next_cleanup, deadline);
+        let snapshot = serde_json::to_value(registry.snapshot()).unwrap();
+        let entry = snapshot["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["metadata"]["destinationPort"] == addresses[1].port().to_string())
+            .unwrap();
+        registry.close(entry["id"].as_str().unwrap());
+        // Cancellation wakes an idle reader immediately; no timer advance is needed.
+        assert!(futures_util::poll!(transport.receive()).is_pending());
+        assert!(
+            transport
+                .managed_flows
+                .get(&Destination::Ip(addresses[1]))
+                .is_none()
+        );
+        assert_eq!(direct.udp_closes.load(Ordering::Relaxed), 1);
+        assert_eq!(Instant::now() + UDP_FLOW_CLEANUP_INTERVAL, deadline);
+        transport.close().await.unwrap();
+        assert_eq!(direct.udp_closes.load(Ordering::Relaxed), 256);
+        assert!(transport.managed_ready.as_ref().unwrap().is_empty());
         assert!(
             serde_json::to_value(registry.snapshot()).unwrap()["connections"]
                 .as_array()

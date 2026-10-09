@@ -103,6 +103,21 @@ pub trait DatagramTransport: Send {
     /// when another datagram path becomes ready.
     async fn receive(&mut self) -> Result<Datagram, DispatchError>;
 
+    /// Optional cancellation-safe receive seam for readiness multiplexers.
+    /// The caller owns one reusable scratch buffer; it must never be retained
+    /// across polls. Returned datagrams own only their complete payload.
+    fn supports_poll_receive(&self) -> bool {
+        false
+    }
+
+    fn poll_receive(
+        &mut self,
+        _context: &mut Context<'_>,
+        _scratch: &mut Vec<u8>,
+    ) -> Poll<Result<Datagram, DispatchError>> {
+        Poll::Ready(Err(DispatchError::NotAllowed))
+    }
+
     async fn close(&mut self) -> Result<(), DispatchError> {
         Ok(())
     }
@@ -288,6 +303,18 @@ struct ObservedDatagramTransport {
 
 #[async_trait]
 impl DatagramTransport for ObservedDatagramTransport {
+    fn supports_poll_receive(&self) -> bool {
+        self.inner.supports_poll_receive()
+    }
+
+    fn poll_receive(
+        &mut self,
+        context: &mut Context<'_>,
+        scratch: &mut Vec<u8>,
+    ) -> Poll<Result<Datagram, DispatchError>> {
+        self.inner.poll_receive(context, scratch)
+    }
+
     fn payload_budget(&self, peer: &crate::session::Destination) -> DatagramBudget {
         self.inner.payload_budget(peer)
     }
@@ -442,6 +469,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sends.load(Ordering::Relaxed), 1);
+        drop(observed);
+        assert_eq!(stats.snapshot().udp_current, 0);
+    }
+
+    #[test]
+    fn polled_datagram_observer_forwards_scratch_readiness_and_retains_activity() {
+        struct PolledTransport {
+            scratch_pointer: usize,
+            parent: std::task::Waker,
+            polls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl DatagramTransport for PolledTransport {
+            fn supports_poll_receive(&self) -> bool {
+                true
+            }
+            fn poll_receive(
+                &mut self,
+                context: &mut Context<'_>,
+                scratch: &mut Vec<u8>,
+            ) -> Poll<Result<Datagram, DispatchError>> {
+                assert!(context.waker().will_wake(&self.parent));
+                assert_eq!(scratch.as_ptr() as usize, self.scratch_pointer);
+                assert_eq!(scratch.as_slice(), b"supplied");
+                scratch.clear();
+                scratch.extend_from_slice(b"used");
+                self.polls.fetch_add(1, Ordering::Relaxed);
+                Poll::Ready(Ok(Datagram {
+                    remote: Destination::Ip("198.51.100.1:443".parse().unwrap()),
+                    payload: bytes::Bytes::from_static(b"ready"),
+                    sniffed_domain: None,
+                }))
+            }
+            async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
+                Ok(())
+            }
+            async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+                panic!("polled observer must not use asynchronous receive")
+            }
+        }
+        let polls = Arc::new(AtomicUsize::new(0));
+        let stats = RuntimeResourceStats::new("polled_observer_test");
+        let parent = futures_util::task::noop_waker();
+        let mut scratch = b"supplied".to_vec();
+        let mut observed = ObservedDatagramTransport {
+            inner: Box::new(PolledTransport {
+                scratch_pointer: scratch.as_ptr() as usize,
+                parent: parent.clone(),
+                polls: polls.clone(),
+            }),
+            _activity: stats.begin(ResourceActivity::UdpAssociation),
+        };
+        assert_eq!(stats.snapshot().udp_current, 1);
+        assert!(observed.supports_poll_receive());
+        let mut context = Context::from_waker(&parent);
+        let Poll::Ready(Ok(datagram)) = observed.poll_receive(&mut context, &mut scratch) else {
+            panic!("observer must forward the ready datagram")
+        };
+        assert_eq!(datagram.payload, bytes::Bytes::from_static(b"ready"));
+        assert_eq!(scratch.as_slice(), b"used");
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.snapshot().udp_current, 1);
         drop(observed);
         assert_eq!(stats.snapshot().udp_current, 0);
     }

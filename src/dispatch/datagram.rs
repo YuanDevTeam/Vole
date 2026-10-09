@@ -93,6 +93,36 @@ struct Bounded {
 
 #[async_trait::async_trait]
 impl DatagramTransport for Bounded {
+    fn supports_poll_receive(&self) -> bool {
+        self.inner.supports_poll_receive()
+    }
+
+    fn poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+        scratch: &mut Vec<u8>,
+    ) -> std::task::Poll<Result<Datagram, DispatchError>> {
+        if self.closing {
+            return std::task::Poll::Ready(Err(DispatchError::NotAllowed));
+        }
+        for _ in 0..crate::limits::IO_POLL_BUDGET {
+            let datagram = match self.inner.poll_receive(context, scratch) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(result) => match result {
+                    Ok(datagram) => datagram,
+                    Err(error) => return std::task::Poll::Ready(Err(error)),
+                },
+            };
+            if datagram.payload.len()
+                <= usize::from(self.payload_budget(&datagram.remote).receive())
+            {
+                return std::task::Poll::Ready(Ok(datagram));
+            }
+        }
+        context.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         self.budget.intersect(self.inner.payload_budget(peer))
     }
@@ -130,5 +160,143 @@ impl DatagramTransport for Bounded {
         self.closed = true;
         self.observation.take();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures_util::task::{ArcWake, waker};
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+
+    struct PolledPackets {
+        packets: VecDeque<Datagram>,
+        polls: Arc<AtomicUsize>,
+        closes: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl DatagramTransport for PolledPackets {
+        fn payload_budget(&self, _peer: &Destination) -> DatagramBudget {
+            DatagramBudget::new(2, 3)
+        }
+        fn supports_poll_receive(&self) -> bool {
+            true
+        }
+        fn poll_receive(
+            &mut self,
+            _context: &mut Context<'_>,
+            _scratch: &mut Vec<u8>,
+        ) -> Poll<Result<Datagram, DispatchError>> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            match self.packets.pop_front() {
+                Some(datagram) => Poll::Ready(Ok(datagram)),
+                None => Poll::Pending,
+            }
+        }
+        async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            panic!("polled test must not use asynchronous receive")
+        }
+        async fn close(&mut self) -> Result<(), DispatchError> {
+            self.closes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+    impl ArcWake for WakeCount {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn packet(payload: &'static [u8]) -> Datagram {
+        Datagram {
+            remote: Destination::Ip("198.51.100.1:443".parse().unwrap()),
+            payload: Bytes::from_static(payload),
+            sniffed_domain: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn polled_datagram_bounded_filters_complete_packets_and_blocks_after_close() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let mut transport = bounded(
+            Box::new(PolledPackets {
+                packets: [packet(b"oversized"), packet(b"four"), packet(b"ok!")].into(),
+                polls: polls.clone(),
+                closes: closes.clone(),
+            }),
+            DatagramBudget::new(10, 4),
+        );
+        assert!(transport.supports_poll_receive());
+        assert_eq!(
+            transport.payload_budget(&packet(b"").remote),
+            DatagramBudget::new(2, 3)
+        );
+        let parent = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&parent);
+        let mut scratch = Vec::new();
+        let Poll::Ready(Ok(datagram)) = transport.poll_receive(&mut context, &mut scratch) else {
+            panic!("valid packet must follow dropped oversized packets")
+        };
+        assert_eq!(datagram.payload, Bytes::from_static(b"ok!"));
+        assert_eq!(polls.load(Ordering::Relaxed), 3);
+        transport.close().await.unwrap();
+        transport.close().await.unwrap();
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            transport.poll_receive(&mut context, &mut scratch),
+            Poll::Ready(Err(DispatchError::NotAllowed))
+        ));
+        assert_eq!(polls.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn polled_datagram_bounded_yields_and_wakes_after_oversized_packet_budget() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut packets = VecDeque::new();
+        for _ in 0..=crate::limits::IO_POLL_BUDGET {
+            packets.push_back(packet(b"four"));
+        }
+        packets.push_back(packet(b"ok!"));
+        let mut transport = bounded(
+            Box::new(PolledPackets {
+                packets,
+                polls: polls.clone(),
+                closes: Arc::default(),
+            }),
+            DatagramBudget::new(10, 4),
+        );
+        let wakes = Arc::new(WakeCount::default());
+        let parent = waker(wakes.clone());
+        let mut context = Context::from_waker(&parent);
+        let mut scratch = Vec::new();
+        assert!(
+            transport
+                .poll_receive(&mut context, &mut scratch)
+                .is_pending()
+        );
+        assert_eq!(polls.load(Ordering::Relaxed), crate::limits::IO_POLL_BUDGET);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        let Poll::Ready(Ok(datagram)) = transport.poll_receive(&mut context, &mut scratch) else {
+            panic!("next poll must consume the remaining oversized packet and valid packet")
+        };
+        assert_eq!(datagram.payload, Bytes::from_static(b"ok!"));
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            crate::limits::IO_POLL_BUDGET + 2
+        );
     }
 }
