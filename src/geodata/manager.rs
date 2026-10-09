@@ -39,7 +39,7 @@ struct SnapshotReleaseState {
 
 impl SnapshotReleaseState {
     fn wait(&self, cancellation: &CancellationToken) -> Result<(), GeoDataManagerError> {
-        let deadline = Instant::now() + super::updater::DEFAULT_DOWNLOAD_TIMEOUT;
+        let deadline = Instant::now() + crate::resource::http::DEFAULT_DOWNLOAD_TIMEOUT;
         let mut released = lock(&self.released);
         while !*released {
             check_cancellation(cancellation)?;
@@ -383,7 +383,7 @@ fn check_cancellation(cancellation: &CancellationToken) -> Result<(), GeoDataMan
 #[derive(Debug)]
 pub struct GeoDataManager {
     store_dir: PathBuf,
-    update_interval: Duration,
+    update_interval: AtomicU64,
     state: Mutex<PersistentState>,
     registration: Mutex<Option<RegistrationEntry>>,
 }
@@ -404,7 +404,7 @@ impl GeoDataManager {
         let state = read_initial_state(&store_dir)?;
         let manager = Arc::new(Self {
             store_dir,
-            update_interval,
+            update_interval: AtomicU64::new(update_interval.as_secs()),
             state: Mutex::new(state),
             registration: Mutex::new(None),
         });
@@ -427,10 +427,23 @@ impl GeoDataManager {
         self: &Arc<Self>,
         requirements: GeoRequirements,
     ) -> Result<GeoDataRegistration, GeoDataManagerError> {
+        self.register_with_interval(
+            requirements,
+            Duration::from_secs(self.update_interval.load(Ordering::Relaxed)),
+        )
+    }
+
+    pub(crate) fn register_with_interval(
+        self: &Arc<Self>,
+        requirements: GeoRequirements,
+        interval: Duration,
+    ) -> Result<GeoDataRegistration, GeoDataManagerError> {
         let mut registration = lock(&self.registration);
         if registration.is_some() {
             return Err(GeoDataManagerError::RegistrationActive);
         }
+        self.update_interval
+            .store(interval.as_secs(), Ordering::Relaxed);
         let (snapshot, report) = load_snapshot(&self.store_dir, &requirements);
         let matcher = Arc::new(DynamicGeoData::new(snapshot));
         let lease = Arc::new(());
@@ -523,7 +536,7 @@ impl GeoDataManager {
 
     /// Returns the durable scheduling state for the active registration.
     /// `None` means the supplied lease is stale or already dropped.
-    fn status_for_active_registration(
+    pub(super) fn status_for_active_registration(
         &self,
         lease: &GeoDataRegistrationLease,
         cancellation: &CancellationToken,
@@ -586,7 +599,13 @@ impl GeoDataManager {
         Ok(sources
             .into_iter()
             .filter_map(|(kind, source_url)| {
-                resource_due(status.resource(kind), source_url, now).then_some(kind)
+                resource_due(
+                    status.resource(kind),
+                    source_url,
+                    now,
+                    self.update_interval.load(Ordering::Relaxed),
+                )
+                .then_some(kind)
             })
             .collect())
     }
@@ -650,7 +669,12 @@ impl GeoDataManager {
         let Some(status) = status else {
             return Ok(None);
         };
-        if !resource_due(status.resource(kind), source_url, unix_seconds(now)) {
+        if !resource_due(
+            status.resource(kind),
+            source_url,
+            unix_seconds(now),
+            self.update_interval.load(Ordering::Relaxed),
+        ) {
             return Ok(None);
         }
         let resource = status.resource(kind);
@@ -776,7 +800,7 @@ impl GeoDataManager {
         hash: String,
     ) -> Result<(), GeoDataManagerError> {
         let now = unix_seconds(SystemTime::now());
-        let interval = self.update_interval.as_secs();
+        let interval = self.update_interval.load(Ordering::Relaxed);
         let mut state = read_state(&self.store_dir)?;
         let resource = state.resource_mut(kind);
         resource.available = true;
@@ -802,7 +826,9 @@ impl GeoDataManager {
         let mut state = read_state(&self.store_dir)?;
         let resource = state.resource_mut(kind);
         resource.updating = false;
-        resource.next_check = Some(now.saturating_add(self.update_interval.as_secs()));
+        resource.last_success = Some(now);
+        resource.next_check =
+            Some(now.saturating_add(self.update_interval.load(Ordering::Relaxed)));
         resource.last_error = None;
         if etag.is_some() {
             resource.etag = etag;
@@ -1260,14 +1286,14 @@ fn report_error(report: &GeoDataResourceReport) -> Option<&str> {
         .flatten()
 }
 
-fn resource_due(resource: &GeoResourceState, source_url: &str, now: u64) -> bool {
+fn resource_due(resource: &GeoResourceState, source_url: &str, now: u64, interval: u64) -> bool {
     resource.required
         && !resource.updating
         && (!resource.available
             || resource.source_url.as_deref() != Some(source_url)
             || resource
-                .next_check
-                .is_none_or(|next_check| next_check <= now))
+                .last_success
+                .is_none_or(|last| last.saturating_add(interval) <= now))
 }
 
 fn asset_matches_hash(path: &Path, expected: &str) -> bool {
@@ -1884,7 +1910,10 @@ mod tests {
         let manager = GeoDataManager::open(root.path(), Duration::from_secs(3_600)).unwrap();
         let peer = GeoDataManager::open(root.path(), Duration::from_secs(3_600)).unwrap();
         let registration = manager
-            .register(requirements(&[rule(RuleKind::GeoSite("cn".to_owned()))]))
+            .register_with_interval(
+                requirements(&[rule(RuleKind::GeoSite("cn".to_owned()))]),
+                Duration::from_secs(6 * 3600),
+            )
             .unwrap();
         let matcher = registration.matcher();
 
@@ -1909,7 +1938,10 @@ mod tests {
         assert_eq!(status.geosite.etag.as_deref(), Some("\"v1\""));
         assert_eq!(status.geosite.hash.as_deref().map(str::len), Some(64));
         assert!(status.geosite.last_success.is_some());
-        assert!(status.geosite.next_check > status.geosite.last_success);
+        assert_eq!(
+            status.geosite.next_check.unwrap() - status.geosite.last_success.unwrap(),
+            6 * 3600
+        );
         assert!(manager.due_resources(SystemTime::now()).unwrap().is_empty());
         let peer_status = peer.status().unwrap();
         assert!(peer_status.geosite.available);

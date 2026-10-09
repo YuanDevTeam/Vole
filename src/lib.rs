@@ -30,6 +30,7 @@ pub mod packet;
 pub mod platform;
 #[cfg(any(feature = "tun", test))]
 mod quic_sniffer;
+pub(crate) mod resource;
 pub mod resources;
 pub mod routing;
 #[cfg(all(

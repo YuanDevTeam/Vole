@@ -68,6 +68,8 @@ pub struct Config {
     pub proxy_groups: Vec<SelectProxyGroupConfig>,
     pub mode: Mode,
     pub log_level: LogLevel,
+    pub global_ua: String,
+    pub etag_support: bool,
     pub geodata_update: Option<GeoDataUpdateConfig>,
     pub external_controller: Option<ExternalControllerConfig>,
     pub inbounds: Vec<InboundConfig>,
@@ -848,6 +850,10 @@ struct RawVoleConfig {
     mode: Mode,
     #[serde(rename = "log-level", default)]
     log_level: LogLevel,
+    #[serde(rename = "global-ua", default = "default_global_ua")]
+    global_ua: String,
+    #[serde(rename = "etag-support", default = "default_true")]
+    etag_support: bool,
     #[serde(default)]
     hosts: std::collections::BTreeMap<String, RawPolicyNameservers>,
     #[serde(default = "default_true")]
@@ -924,8 +930,27 @@ struct RawProxyGroup {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawGeoDataUrls {
+    #[serde(default = "default_geoip_url")]
     geoip: String,
+    #[serde(default = "default_geosite_url")]
     geosite: String,
+}
+fn default_global_ua() -> String {
+    concat!("Vole/", env!("CARGO_PKG_VERSION")).into()
+}
+fn default_geoip_url() -> String {
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat".into()
+}
+fn default_geosite_url() -> String {
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat".into()
+}
+impl Default for RawGeoDataUrls {
+    fn default() -> Self {
+        Self {
+            geoip: default_geoip_url(),
+            geosite: default_geosite_url(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1624,6 +1649,14 @@ impl Config {
 
 impl RawVoleConfig {
     fn normalize(self) -> Result<Config> {
+        if self.global_ua.len() > 1024
+            || !self
+                .global_ua
+                .bytes()
+                .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
+        {
+            return invalid("global-ua must be a bounded HTTP header value");
+        }
         let geodata_update = normalize_geodata_update(
             self.geox_url,
             self.geo_auto_update,
@@ -1715,6 +1748,8 @@ impl RawVoleConfig {
             proxy_groups,
             mode: self.mode,
             log_level: self.log_level,
+            global_ua: self.global_ua,
+            etag_support: self.etag_support,
             geodata_update,
             external_controller,
             inbounds,
@@ -1771,27 +1806,19 @@ fn normalize_geodata_update(
     auto_update: Option<bool>,
     interval_hours: Option<u64>,
 ) -> Result<Option<GeoDataUpdateConfig>> {
-    match (urls, auto_update, interval_hours) {
-        (None, None, None) => Ok(None),
-        (Some(urls), Some(auto_update), Some(interval_hours)) => {
-            if interval_hours != GEO_UPDATE_INTERVAL_HOURS {
-                return invalid(format!(
-                    "geo-update-interval must be {GEO_UPDATE_INTERVAL_HOURS}"
-                ));
-            }
-            Ok(Some(GeoDataUpdateConfig {
-                urls: GeoDataUrls {
-                    geoip: normalize_geox_url(urls.geoip, "geox-url.geoip")?,
-                    geosite: normalize_geox_url(urls.geosite, "geox-url.geosite")?,
-                },
-                auto_update,
-                interval_hours,
-            }))
-        }
-        _ => invalid(
-            "geox-url, geo-auto-update, and geo-update-interval must be configured together",
-        ),
+    let urls = urls.unwrap_or_default();
+    let interval_hours = interval_hours.unwrap_or(GEO_UPDATE_INTERVAL_HOURS);
+    if interval_hours.checked_mul(3600).is_none() {
+        return invalid("geo-update-interval is too large");
     }
+    Ok(Some(GeoDataUpdateConfig {
+        urls: GeoDataUrls {
+            geoip: normalize_geox_url(urls.geoip, "geox-url.geoip")?,
+            geosite: normalize_geox_url(urls.geosite, "geox-url.geosite")?,
+        },
+        auto_update: auto_update.unwrap_or(false),
+        interval_hours,
+    }))
 }
 
 fn normalize_geox_url(raw: String, field: &str) -> Result<String> {
@@ -3412,31 +3439,29 @@ geo-update-interval: 24"#,
                 .expect("disabled updater remains explicit configuration")
                 .auto_update
         );
-        assert!(
-            Config::parse_yaml(CURRENT_TLS.as_bytes())
-                .unwrap()
-                .geodata_update
-                .is_none()
-        );
+        let defaults = Config::parse_yaml(CURRENT_TLS.as_bytes()).unwrap();
+        assert!(!defaults.geodata_update.unwrap().auto_update);
+        assert!(defaults.etag_support);
     }
 
     #[test]
-    fn geodata_update_fields_are_all_present_or_all_absent() {
-        let urls = "geox-url:\n  geoip: https://geo.example.test/geoip.dat\n  geosite: https://geo.example.test/geosite.dat";
-        for fields in [
-            urls.to_owned(),
-            "geo-auto-update: true".to_owned(),
-            "geo-update-interval: 24".to_owned(),
-            format!("{urls}\ngeo-auto-update: true"),
-            format!("{urls}\ngeo-update-interval: 24"),
-            "geo-auto-update: true\ngeo-update-interval: 24".to_owned(),
-        ] {
-            let error = Config::parse_yaml(with_geodata(&fields).as_bytes()).unwrap_err();
-            assert!(
-                error.to_string().contains("must be configured together"),
-                "{fields}: {error}"
-            );
-        }
+    fn geodata_fields_have_independent_defaults_and_configurable_intervals() {
+        let config = Config::parse_yaml(with_geodata("geo-auto-update: true\ngeo-update-interval: 6\netag-support: false\nglobal-ua: custom-agent\ngeox-url:\n  geosite: https://rules.example.test/site.dat").as_bytes()).unwrap();
+        assert!(!config.etag_support);
+        assert_eq!(config.global_ua, "custom-agent");
+        let update = config.geodata_update.unwrap();
+        assert!(update.auto_update);
+        assert_eq!(update.interval_hours, 6);
+        assert_eq!(update.urls.geoip, default_geoip_url());
+        assert_eq!(update.urls.geosite, "https://rules.example.test/site.dat");
+        assert_eq!(
+            Config::parse_yaml(with_geodata("geo-update-interval: 0").as_bytes())
+                .unwrap()
+                .geodata_update
+                .unwrap()
+                .interval_hours,
+            0
+        );
     }
 
     #[test]
@@ -3447,11 +3472,6 @@ geo-update-interval: 24"#,
             ))
         };
         for yaml in [
-            complete(
-                "https://geo.example.test/geoip.dat",
-                "https://geo.example.test/geosite.dat",
-                "23",
-            ),
             complete(
                 "https://geo.example.test/geoip.dat",
                 "https://geo.example.test/geosite.dat",

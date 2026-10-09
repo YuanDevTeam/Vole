@@ -2,7 +2,7 @@
 //!
 //! The service is attached to a running instance, but the manager and its
 //! cross-process lock own the shared resource state. Network traffic is sent
-//! only through the final MATCH route dispatcher supplied by the runtime.
+//! through the shared runtime route dispatcher.
 
 use std::{
     io,
@@ -12,15 +12,14 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    GeoDataKind, GeoDataManager, GeoDataManagerError,
-    manager::GeoDataRegistrationLease,
-    updater::{
-        DEFAULT_DOWNLOAD_TIMEOUT, GeoDataDownloadOutcome, GeoDataDownloadRequest,
-        download_geodata_via_proxy,
+use super::{GeoDataKind, GeoDataManager, GeoDataManagerError, manager::GeoDataRegistrationLease};
+use crate::{
+    config::GeoDataUrls,
+    dispatch::Dispatcher,
+    resource::http::{
+        DEFAULT_DOWNLOAD_TIMEOUT, DownloadOutcome, DownloadRequest, HttpOptions, download,
     },
 };
-use crate::{config::GeoDataUrls, dispatch::Dispatcher};
 
 const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const MIN_LOOP_DELAY: Duration = Duration::from_secs(1);
@@ -37,6 +36,9 @@ pub(crate) struct GeoDataUpdateService {
     dispatcher: Arc<dyn Dispatcher>,
     registration: GeoDataRegistrationLease,
     urls: GeoDataUrls,
+    options: HttpOptions,
+    etag_support: bool,
+    auto_update: bool,
 }
 
 impl GeoDataUpdateService {
@@ -46,12 +48,21 @@ impl GeoDataUpdateService {
         dispatcher: Arc<dyn Dispatcher>,
         registration: GeoDataRegistrationLease,
         urls: GeoDataUrls,
+        user_agent: String,
+        etag_support: bool,
+        auto_update: bool,
     ) -> Self {
         Self {
             manager,
             dispatcher,
             registration,
             urls,
+            options: HttpOptions {
+                user_agent,
+                ..HttpOptions::default()
+            },
+            etag_support,
+            auto_update,
         }
     }
 
@@ -125,8 +136,9 @@ impl GeoDataUpdateService {
         let manager = self.manager.clone();
         let registration = self.registration.clone();
         let urls = self.urls.clone();
+        let auto_update = self.auto_update;
         blocking_operation(move || {
-            manager.due_resources_for_active_registration_with_cancellation(
+            let due = manager.due_resources_for_active_registration_with_cancellation(
                 &registration,
                 [
                     (GeoDataKind::GeoSite, urls.geosite.as_str()),
@@ -134,10 +146,22 @@ impl GeoDataUpdateService {
                 ],
                 SystemTime::now(),
                 &cancellation,
-            )
+            )?;
+            if auto_update {
+                return Ok(due);
+            }
+            let status = manager.status_for_active_registration(&registration, &cancellation)?;
+            Ok(due
+                .into_iter()
+                .filter(|kind| {
+                    status
+                        .as_ref()
+                        .is_some_and(|status| !status.resource(*kind).available)
+                })
+                .collect())
         })
         .await?
-        .map_err(|error| error.to_string())
+        .map_err(|error: GeoDataManagerError| error.to_string())
     }
 
     async fn update_one(
@@ -166,17 +190,21 @@ impl GeoDataUpdateService {
             Err(GeoDataManagerError::UpdateBusy) => return Ok(UpdateAttempt::Busy),
             Err(error) => return Err(error.to_string()),
         };
-        let etag = session.request_etag().map(ToOwned::to_owned);
-        let request = GeoDataDownloadRequest {
+        let etag = self
+            .etag_support
+            .then(|| session.request_etag().map(ToOwned::to_owned))
+            .flatten();
+        let request = DownloadRequest {
             dispatcher: self.dispatcher.clone(),
             url: source_url,
             etag: etag.clone(),
             temporary_path: session.temporary_path().to_path_buf(),
             timeout: DEFAULT_DOWNLOAD_TIMEOUT,
             cancellation: cancellation.clone(),
+            options: self.options.clone(),
         };
-        match download_geodata_via_proxy(request).await {
-            Ok(GeoDataDownloadOutcome::NotModified) => {
+        match download(request).await {
+            Ok(DownloadOutcome::NotModified) => {
                 blocking_operation(move || {
                     session.not_modified_with_cancellation(etag, &cancellation)
                 })
@@ -185,7 +213,7 @@ impl GeoDataUpdateService {
                 tracing::info!(geodata_kind = %kind, "Vole GeoData is current");
                 Ok(UpdateAttempt::Completed)
             }
-            Ok(GeoDataDownloadOutcome::Downloaded {
+            Ok(DownloadOutcome::Downloaded {
                 etag, sha256, size, ..
             }) => {
                 let report = blocking_operation(move || {
@@ -391,6 +419,9 @@ mod tests {
                 geoip: "https://rules.example.test/geoip.dat".to_owned(),
                 geosite: "https://rules.example.test/geosite.dat".to_owned(),
             },
+            "fixture".into(),
+            true,
+            true,
         );
         let run = tokio::spawn(service.run(cancellation.clone()));
         tokio::time::timeout(Duration::from_secs(1), async {

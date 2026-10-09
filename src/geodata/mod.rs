@@ -26,7 +26,6 @@ use crate::{
 mod manager;
 mod selectors;
 pub(crate) mod service;
-pub(crate) mod updater;
 
 pub(crate) use selectors::normalize_selector;
 use selectors::{fold_attribute, selector_attributes, selector_code};

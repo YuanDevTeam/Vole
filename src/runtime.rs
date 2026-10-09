@@ -422,13 +422,16 @@ impl PreparedCore {
                 self.config
                     .geodata_update
                     .as_ref()
-                    .filter(|update| update.auto_update && required)
+                    .filter(|_| required)
                     .map(|update| {
                         GeoDataUpdateService::new(
                             self.geodata_manager.clone(),
                             geodata_dispatcher,
                             self.geodata_registration.updater_lease(),
                             update.urls.clone(),
+                            self.config.global_ua.clone(),
+                            self.config.etag_support,
+                            update.auto_update && update.interval_hours > 0,
                         )
                     })
             },
@@ -1191,7 +1194,18 @@ fn prepare_routing(
     let requirements = GeoRequirements::for_config(config)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let geodata_registration = geodata_manager
-        .register(requirements)
+        .register_with_interval(
+            requirements,
+            Duration::from_secs(
+                config
+                    .geodata_update
+                    .as_ref()
+                    .map_or(crate::config::GEO_UPDATE_INTERVAL_HOURS, |update| {
+                        update.interval_hours
+                    })
+                    * 3600,
+            ),
+        )
         .map_err(io::Error::other)?;
     // GeoData must inspect the normalized rule specifications first. Once that
     // borrowing load is complete, move the rules directly into the compiled
@@ -1954,7 +1968,7 @@ dns:
 
     #[cfg(feature = "outbound-vless")]
     #[tokio::test]
-    async fn geodata_updater_requires_enabled_config_and_actual_demand() {
+    async fn geodata_updater_fetches_missing_assets_and_requires_actual_demand() {
         fn configured(auto_update: bool, geodata_rule: bool) -> String {
             let fields = format!(
                 r#"geox-url:
@@ -1990,8 +2004,8 @@ geo-update-interval: 24
 
         let missing_config_with_demand =
             config_with_rules("rules:\n  - GEOIP,cn,proxy\n  - MATCH,proxy\n");
-        assert!(updater_for(&missing_config_with_demand).await.is_none());
-        assert!(updater_for(&configured(false, true)).await.is_none());
+        assert!(updater_for(&missing_config_with_demand).await.is_some());
+        assert!(updater_for(&configured(false, true)).await.is_some());
         assert!(updater_for(&configured(true, false)).await.is_none());
 
         let updater = updater_for(&configured(true, true))

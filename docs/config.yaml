@@ -20,11 +20,12 @@ ipv6: true
 mode: rule
 log-level: info
 
-# GeoData 下载配置可省略；出现时三项必须齐全。URL 必须是以域名为主机、无
-# userinfo/fragment 的绝对 HTTPS URL，更新周期固定为 24 小时。validateConfig 和
-# measureDelay 不下载。公共实例启动后，只有实际规则需要资产且自动更新已启用时
-# 才后台检查。下载按当前 mode 和业务规则选路，未命中 DIRECT；代理组在
-# 创建新物理 transport 时解析当前成员，不自动故障转移，也不隐式回退 DIRECT。
+# 资源下载使用 global-ua（缺省 Vole/ 加 Core 版本）；etag-support 缺省 true。
+# GeoData 字段独立可选；URL 缺省 MetaCubeX meta-rules-dat latest DAT。
+# URL 以域名为主机、无 userinfo/fragment，生产构建使用 HTTPS。
+# 自动更新默认 false；启动后仍获取缺失的必需资产。周期单位小时，默认 24，0 关闭周期检查。
+global-ua: "Vole/0.1.0"
+etag-support: true
 geox-url:
   geoip: https://assets.example.com/geoip.dat
   geosite: https://assets.example.com/geosite.dat
