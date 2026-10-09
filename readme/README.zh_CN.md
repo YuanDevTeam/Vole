@@ -11,16 +11,16 @@ Vole 是用于 VPN 客户端和本地代理的 Rust 代理内核，提供原生�
 ## 内核能做什么
 
 - **接入应用与 VPN 流量：**HTTP 转发、CONNECT 和 Upgrade；SOCKS5 CONNECT 和 UDP ASSOCIATE；宿主提供的 IPv4/IPv6 TUN 数据包。
-- **按目标路由：**支持域名、域名后缀/关键字、IP CIDR、目标端口、TCP/UDP、GeoSite 和 GeoIP 规则，以及明确的 DIRECT 和 REJECT 动作。
-- **选择和串联代理：**支持嵌套 `select` 组、实时切换组选择，以及引用节点或组的 `dialer-proxy` 代理链。选择变化只影响新建的物理传输连接，不迁移既有连接。
-- **处理 DNS：**支持指定出口的 UDP/TCP 上游、基于 GeoSite 的上游策略、顺序故障转移、缓存与重复查询合并；按配置拦截 TUN TCP/UDP DNS 目标，默认 53 端口。
-- **识别流量用于路由：**通过 HTTP、TLS、QUIC 域名嗅探与 TUN DNS 提示辅助路由，不改写实际目标地址。ICMPv4/ICMPv6 Echo 在本地应答。
-- **管理路由数据：**按需从 `geosite.dat` / `geoip.dat` 加载被引用的类别，并通过配置的路由更新文件。GeoSite 支持 Domain、Full、Plain 和 Regex、属性交集及反选；GeoIP 支持反选。所有平台完整保留所选记录，不设条数硬上限或截断，也不设 GeoData 总内存预算。详见 [GeoData 边界](../docs/geodata.md#内存与安全边界)。
-- **提供客户端控制：**回环 Controller 支持代理组选择及 TUN 流量速率/累计量查询；Invoke API 提供隔离的节点/代理链延迟测量。
+- **路由流量：**支持 rule/global/direct 模式，域名、来源/目标 IP 与端口、TCP/UDP、GeoSite/GeoIP、规则集合及逻辑规则，提供 DIRECT 和 REJECT 动作。
+- **选择和串联代理：**嵌套 select/url-test/fallback/load-balance 组、健康检查与选择持久化；`dialer-proxy` 可引用节点或组。既有连接保留原路径。
+- **处理 DNS：**hosts、独立 bootstrap/节点/直连解析角色，UDP/TCP/DoH/DoT、域名/GeoSite/rule-set policy、fallback、有界缓存、redir-host 和持久 fake-IP；按配置接管 TUN DNS。
+- **识别流量用于路由：**TUN/mixed TCP 的 HTTP/TLS 嗅探与 TUN UDP 的 QUIC 嗅探，支持强制/排除条件和目标覆盖开关；本地应答 ICMPv4/ICMPv6 Echo。
+- **管理路由数据：**HTTP/file/inline 节点与规则 providers、动态组、筛选和覆盖；YAML/Text 及 domain/ipcidr MRS。GeoData 完整加载引用类别，支持指定出口下载和周期更新，坏更新保留旧状态。详见 [GeoData 边界](../docs/geodata.md#内存与安全边界)。
+- **提供客户端控制：**组与资源状态、连接快照与关闭、规则命中、有效配置和受限 DNS 诊断，以及 TUN 流量和隔离的节点/代理链延迟测量。
 
 ## 代理协议
 
-默认构建启用下列全部八种协议。UDP 支持按节点配置。
+默认构建启用下列全部九种协议。HTTP CONNECT 仅支持 TCP；其他协议的 UDP 能力按节点配置。
 
 | 协议 | 能力 |
 | --- | --- |
@@ -29,6 +29,7 @@ Vole 是用于 VPN 客户端和本地代理的 Rust 代理内核，提供原生�
 | [Trojan](../docs/outbounds.md#trojan) | 通过 TLS TCP、WebSocket / HTTPUpgrade 或 gRPC 传输 TCP/UDP |
 | [Shadowsocks 2022](../docs/outbounds.md#shadowsocks-2022) | TCP/UDP；AES-128-GCM、AES-256-GCM 和 ChaCha20-Poly1305；AES 身份链；可选 strict ShadowTLS v3 TCP 包装和 UoT v2 |
 | [AnyTLS](../docs/outbounds.md#anytls) | TLS 会话与 UDP over TCP v2 |
+| [HTTP / HTTPS CONNECT](../docs/outbounds.md#http--https-connect) | TCP CONNECT、可选代理认证与 TLS |
 | [SOCKS5](../docs/outbounds.md#socks5) | CONNECT 和 UDP ASSOCIATE，可选用户名/密码认证 |
 | [Hysteria2](../docs/outbounds.md#hysteria2) | QUIC TCP/UDP、带宽控制、Salamander、端口跳跃和 mTLS |
 | [TUIC v5](../docs/outbounds.md#tuic-v5) | QUIC TCP/UDP、native/quic UDP 转发模式，以及可选的拥塞控制算法 |
@@ -70,13 +71,13 @@ rules:
   - MATCH,Proxy
 ```
 
-请替换示例中的服务器地址与凭据。GeoSite/GeoIP 规则需要 `<dataDir>/geodata` 下的对应数据文件；缺失文件时，相应规则类型不可用。详见[完整配置参考](../docs/config.yaml)与 [GeoData 行为](../docs/geodata.md)。
+请替换示例中的服务器地址与凭据。GeoSite/GeoIP 使用 `<dataDir>/geodata` 下的数据文件；缺失的必需资产通过配置出口下载，加载成功前对应规则不可用。详见[配置参考](../docs/config.yaml)与 [GeoData 行为](../docs/geodata.md)。
 
 `mixed-port` 在同一 TCP 端口接入 HTTP 与 SOCKS5，并在同端口启用 SOCKS5 UDP。`allow-lan` 控制绑定地址，与 `authentication` 独立：`authentication` 省略或为 `[]` 时，回环与通配绑定均免认证；配置凭据后 HTTP 与 SOCKS5 均校验。顶层 `port`、`socks-port`、`udp` 和 `listeners` 都会拒绝；代理节点的 `port` 与 `udp` 保留出站含义。
 
-兼容范围限于文档列出的字段和行为，不覆盖任意 Mihomo 配置。代理组目前支持静态 `select`；DNS 上游使用固定 IP，通过 UDP/TCP 查询。Providers、自动代理组选择、加密 DNS 和 fake-IP 不在当前功能范围内。未知字段与无效组合会被拒绝，不会静默忽略；Vole 特有的语义会在相应契约中说明。
+兼容范围限于文档列出的 Mihomo 配置子集。未知字段与不支持的组合明确拒绝；当前平台和协议边界见 [Mihomo 兼容范围](../docs/mihomo-compatibility.md)与各项契约。
 
-库接口由宿主使用内联 `configYaml` 启动实例；TUN 设备、描述符、MTU、DNS 拦截和 UDP 超时归属于 `tun` 配置，平台回调仍在运行时本地注册。CLI 通过同一 Invoke API 传递参数，由其前台操作读取 `-f` 指定的配置。接口地址、DNS 与系统路由由宿主配置。
+库接口由宿主使用内联 `configYaml` 启动实例；TUN 设备、描述符、MTU、DNS 拦截和 UDP 超时归属于 `tun` 配置，平台回调仍在运行时本地注册。CLI 通过同一 Invoke API 传递参数，由其前台操作读取 `-f` 指定的配置。Linux 自建 TUN 可配置自动路由与 systemd-resolved DNS；借用 fd 和 App 平台的网络仍由宿主管理。
 
 ## CLI
 
@@ -97,10 +98,10 @@ vole -t -f ./config.yaml
 | iOS / macOS | 宿主提供 utun 文件描述符；macOS 也可打开或创建原生 utun |
 | tvOS 17+ | 宿主提供 utun 文件描述符；支持 ARM64 真机和模拟器目标 |
 | Android | `VpnService` 文件描述符与出站 socket 保护 |
-| Linux | 借用 fd 或由内核打开设备的真实单队列 raw-IP TUN；宿主负责系统网络配置 |
+| Linux | 借用 fd 或由内核打开设备的真实单队列 raw-IP TUN；Linux 自建设备支持自动路由与系统 DNS |
 | Windows | 编译时互斥的 `windows-wintun` 桌面后端与 `windows-uwp` 安装包 Provider/Session Host；共用内核 |
 
-Vole 提供原生库和前台 CLI；系统网络配置仍由平台宿主负责。Unix 宿主持有原始 TUN 描述符；Vole 使用并关闭自己复制的描述符。Apple 公开的 packetFlow API 不保证可获取 raw fd，因此实际 Network Extension 集成和设备验证仍由宿主负责。详见 [TUN 集成](../docs/tun-platform.md)与[平台验收边界](../docs/acceptance.md)。
+Vole 提供原生库和前台 CLI。Apple、Android、Windows 的系统网络与 App 生命周期由宿主负责；Linux 自建 TUN 另外支持自动路由和系统 DNS。Unix 宿主持有原始 TUN 描述符；Vole 使用并关闭自己复制的描述符。Apple 公开的 packetFlow API 不保证可获取 raw fd，因此实际 Network Extension 集成和设备验证仍由宿主负责。详见 [TUN 集成](../docs/tun-platform.md)与[平台验收边界](../docs/acceptance.md)。
 
 桌面 Wintun 从进程可执行文件所在目录加载宿主提供的 `wintun.dll`。接口地址、DNS、路由与物理出口由宿主配置；Wintun 设备验收独立于已有安装包 VPN 结果。命令行使用与交付见 [CLI 与 tag 发布](../docs/cli.md)。
 
@@ -121,12 +122,13 @@ benchmark 工程同时负责协议互通（`interop`）与内存压力（`stress
 
 测试使用 **1 / 1.5 / 2 Gbps** 混合 TCP/UDP 流量、**每秒 1,000 次 DNS 查询**和增强的 `geosite:cn` / `geoip:cn` 规则，报告实际吞吐量、CPU、观察到的 Linux 峰值 RSS、UDP 丢包与成功的 DNS 查询数。它使用 DIRECT 出口评估 TUN/DNS/路由路径，不衡量加密代理吞吐量；Linux RSS 不等同于 Apple Network Extension 内存占用。
 
-独立 `stress` 命令使用同样的完整增强 `geosite:cn` / `geoip:cn`，叠加 2 Gbps / 60 秒 / 1,000 QPS DNS。原始 DAT 不裁剪，但只加载 CN 分类；可选 `--geodata-update` 在流量期间执行真实下载与重载。实际输入类型、测量和失败见 benchmark README。任何单次观测都不是任意输入低于 50,000,000 字节的保证，也不替代 Apple 真机验收。
+独立 `stress` 使用相同的完整增强 CN 分类。CLI 压力入口验证启动时 DAT 加载，不提供 `--geodata-update` 运行时采样。实际输入、指标和失败以 benchmark 运行记录为准。
 
 ## 文档
 
 - [文档索引](../docs/README.md)
 - [配置参考](../docs/config.yaml)
+- [Mihomo 兼容范围](../docs/mihomo-compatibility.md)
 - [核心与平台构建](../scripts/README.md)
 - [CLI 与 tag 发布](../docs/cli.md)
 - [核心回归测试](../tests/README.md)
