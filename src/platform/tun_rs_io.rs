@@ -58,6 +58,44 @@ impl TunRsIo {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn linux_device(&self) -> &tun_rs::SyncDevice {
+        self.device.get_ref()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_exclusive(name: &str, mtu: u16) -> Result<Self> {
+        use std::{ffi::CString, os::fd::AsRawFd};
+        let name = CString::new(if name.is_empty() { "Vole" } else { name })
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid TUN name"))?;
+        if name.as_bytes().len() >= libc::IFNAMSIZ {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "TUN name is too long").into());
+        }
+        let fd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")?;
+        // SAFETY: ifreq starts zeroed; copied name includes its terminator.
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (slot, byte) in request.ifr_name.iter_mut().zip(name.as_bytes_with_nul()) {
+            *slot = *byte as libc::c_char;
+        }
+        request.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI | 0x8000) as libc::c_short; // IFF_TUN_EXCL
+        // SAFETY: fd points to /dev/net/tun and request is a complete initialized ifreq.
+        if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &request) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        // SAFETY: ownership moves to SyncDevice only after the exclusive ioctl succeeded.
+        let device = unsafe { tun_rs::SyncDevice::from_fd(fd.into_raw_fd()) }?;
+        device.set_mtu(mtu)?;
+        device.set_nonblocking(true)?;
+        Ok(Self {
+            device: AsyncFd::new(device)?,
+            framing: TunFraming::RawIp,
+            mtu: usize::from(mtu),
+        })
+    }
+
     /// Open a core-owned local TUN without configuring addresses or routes.
     /// Owned descriptors may be made nonblocking; borrowed ones are never changed.
     pub fn open(name: &str, mtu: u16) -> Result<Self> {

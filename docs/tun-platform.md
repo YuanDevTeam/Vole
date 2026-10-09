@@ -11,12 +11,13 @@ TunRuntime -> TunRsIo -> 宿主持有的 TUN fd 副本
 - iOS/tvOS/macOS：宿主提供 utun 文件描述符，适配器处理四字节 packet-information 头。
 - Android：`VpnService` 提供 raw-IP 文件描述符。
 - Linux：真实单队列 TUN，使用 `IFF_TUN | IFF_NO_PI`、无 VNET header；接口实际 MTU
-  必须与 `tun.mtu` 一致。宿主负责地址、网络命名空间和路由，Vole 不自动接管系统网络。
+  必须与 `tun.mtu` 一致。借用 fd 的地址、网络命名空间和路由由宿主负责。
 
 `tun.file-descriptor` 缺省或 0 时，Linux / macOS 由 core 打开本机 TUN，Android / iOS /
 tvOS 仍需宿主提供 fd。`tun.device` 控制原生打开的接口名：空值在 Linux 使用 `Vole`，
-macOS 自动选择 utun。core 只设置自有接口的 MTU 和自有 fd 的 nonblocking，不配置地址、
-DNS 或路由；Stop 关闭自有句柄，不承诺删除宿主已有接口。创建失败没有备用数据面。
+macOS 自动选择 utun。macOS 只设置自有接口的 MTU 和 nonblocking，网络配置仍由宿主负责。
+Linux 自建接口的自动网络配置见下节；关闭自动路由时只设置 MTU/nonblocking。
+Stop 关闭自有句柄，不承诺删除宿主已有接口。创建失败没有备用数据面。
 正数 file-descriptor 选择下述借用路径；fd 数字必须对当前进程有效，CLI 不增加专用 fd 参数。
 
 宿主始终拥有原始文件描述符。Vole 启动时：
@@ -115,6 +116,36 @@ Linux 目前不启用 GRO/GSO：`tun-rs` 的 Linux offload 示例通过 builder 
 设备调用 `recv_multiple` 不会自动合并读取或启用 offload。Vole 保留宿主
 MTU/格式与 fd 标志，原生 builder 只打开 raw-IP TUN，不暗中启用 offload 或改变借用接口。
 
+## Linux 自建 TUN 的系统网络
+
+`tun.file-descriptor: 0` 的 Linux 路径支持 `auto-route` 和 `auto-detect-interface`，
+两者缺省 true。其他平台缺省 false；借用 fd 路径不修改宿主网络，无论这两个字段的值。
+
+- `auto-detect-interface` 从主路由表检测每个地址族的默认物理出口，最多缓存一秒。
+  新建 TCP/UDP socket 绑定该接口，所有协议、DNS、资源下载共用 Dialer；没有出口时失败。
+  已有 socket 不迁移，下一次建链重新检测。回环目标保持本机访问。
+- `auto-route` 独占创建配置命名的 raw-IP TUN，已有同名接口失败。IPv4 使用
+  `198.18.0.1/30`，启用 IPv6 时使用 `fdfe:dcba:9876::1/126`。
+  内部路由表 2022、规则优先级 9000/9001 必须空闲；保留主表的非默认路由，
+  本机未标记流量经 TUN，转发流量不在本功能范围。Core socket 使用内部 mark 绕过捕获，
+  不依靠 source IP 避免递归。配置接口与路由直接通过内核接口完成，不调用 ip 子进程。
+- 自动路由启用，且 `dns.enable: true`、`dns-hijack` 匹配 `198.18.0.2:53` 时，
+  通过 systemd-resolved 给新接口设置 DNS `198.18.0.2`、路由域 `~.` 和 default-route。
+  系统须使用 systemd-resolved；调用 `/usr/bin/resolvectl --no-ask-password`，
+  每次最多五秒并收回子进程。未启用 DNS 或关闭匹配劫持时保留系统 DNS 行为。
+  不覆盖 `/etc/resolv.conf` 或其他接口设置，也不新增 DNS 配置字段。
+- 启动失败逆序撤销已应用的操作；正常 Stop 先停止业务，再恢复 DNS、规则与路由，
+  最后释放自建接口。清理期间额外持有接口 fd，避免接口索引被提前复用。
+  已被外部移除的自有路由视为完成，其他清理错误作为停止错误返回。
+
+安装包负责权限：`packaging/linux/post-install` 为 `/usr/bin/vole` 设置
+`CAP_NET_ADMIN`，并把执行权限限制给 `vole` 组。安装器为获授权用户添加组成员关系，
+将 `50-vole-resolved.rules` 安装到 `/usr/share/polkit-1/rules.d/`，并依赖 systemd-resolved、
+polkit 与提供 setcap 的包。deb postinst / rpm %post 每次更新二进制后执行该脚本。
+运行时不弹出提权请求，不使用 sudo，也不把 capability 传给 resolvectl 子进程；
+后者使用已安装的 [resolve1 授权](https://github.com/systemd/systemd/blob/main/src/resolve/org.freedesktop.resolve1.policy)。
+CLI 的进程启动、后台管理及用户授权仍由调用方负责。
+
 ## Windows Wintun
 
 桌面 Wintun 使用宿主提供的动态库与原始 IP 适配器，通过同一 `TunIo` 边界进入
@@ -196,8 +227,8 @@ netstack 端点及纯 UDP codec，独立 crate 的通用 UDP endpoint 不在生�
 
 ## 物理出口
 
-- Linux：宿主负责网络命名空间或等效路由隔离，确保被捕获的客户端流量进入 TUN，
-  Vole 出站绕过 TUN；不能把仅绑定 source IP 当作绕路保证。没有自动路由配置或降级路径。
+- Linux：自建接口使用上述自动出口与内部路由隔离；借用 fd 继续由宿主负责命名空间
+  或等效路由隔离。仅绑定 source IP 不能作为绕路保证。
 - Android：每个出站 TCP/UDP socket 在 connect 前调用宿主 protect；失败则当前连接失败关闭。
 - Windows WinRT：Provider 为当前会话选择不可变的物理网络绑定；每个地址族只从非 link-local 地址中选择一个源 IP 和接口索引交给 Session Host，同时独立保留物理适配器全部去重的 on-link prefixes（包括 link-local）用于 VPN 路由。普通出站 socket 必须同时绑定源地址和 WinSock 接口索引。
 - Windows WinRT 只有配置中显式使用 `127.0.0.0/8` 范围内的 IPv4 字面量或 `::1` 的本地出站可以跳过物理绑定；物理代理服务器的域名解析到任何回环地址都会失败关闭。

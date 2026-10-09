@@ -223,8 +223,9 @@ Apple 使用 utun 包头，Android 与 Linux 使用 raw-IP。Linux 要求真实�
 PI/VNET header，并验证实际 MTU 与 `tun.mtu` 相同；跨网络命名空间的校验需要宿主提供权限。
 
 `tun.file-descriptor` 省略或为 0 时，Linux 与 macOS 根据 `tun.device` 创建或打开原生
-TUN；移动平台仍需要宿主描述符。接口地址、DNS、路由和物理出口隔离由宿主配置，Vole
-不自动管理系统路由。`tun.mtu` 省略或为 0 使用 9000；完整六字段契约及借用 fd 边界见
+TUN；移动平台仍需要宿主描述符。Linux 自建 TUN 支持 `auto-route`、
+`auto-detect-interface` 与 systemd-resolved 接管；其他平台和借用 fd 的系统网络由宿主配置。
+`tun.mtu` 省略或为 0 使用 9000；字段契约及借用 fd 边界见
 [配置参考](config.yaml)与 [TUN 平台层](tun-platform.md)。
 
 Windows 编译时选择互斥的 `windows-wintun` 或 `windows-uwp`：

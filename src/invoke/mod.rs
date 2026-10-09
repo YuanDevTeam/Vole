@@ -1312,10 +1312,24 @@ fn run_engine_inner(
                 Err(error) => Err(io::Error::other(error)),
             },
             None if has_tun => {
-                let config = prepared.tun_config().expect("validated TUN configuration");
-                match TunIo::open(&config.device, config.mtu) {
-                    Ok(tun) => prepared.start_tun(tun, dialer).await,
-                    Err(error) => Err(io::Error::other(error)),
+                #[cfg(target_os = "linux")]
+                {
+                    prepared.start_native_tun(dialer).await
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let config = prepared.tun_config().expect("validated TUN configuration");
+                    if config.auto_route || config.auto_detect_interface {
+                        Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "automatic TUN networking is only available on Linux",
+                        ))
+                    } else {
+                        match TunIo::open(&config.device, config.mtu) {
+                            Ok(tun) => prepared.start_tun(tun, dialer).await,
+                            Err(error) => Err(io::Error::other(error)),
+                        }
+                    }
                 }
             }
             None => prepared.start_local(dialer).await,

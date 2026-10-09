@@ -1,0 +1,7 @@
+#!/bin/sh
+# Run from deb postinst or rpm %post after placing the root-owned binary/rule.
+set -eu
+getent group vole >/dev/null || groupadd --system vole
+chown root:vole /usr/bin/vole
+chmod 0750 /usr/bin/vole
+setcap cap_net_admin=ep /usr/bin/vole

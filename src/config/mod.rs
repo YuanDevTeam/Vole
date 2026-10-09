@@ -172,6 +172,8 @@ pub struct GeoDataUrls {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunConfig {
+    pub auto_route: bool,
+    pub auto_detect_interface: bool,
     pub enable: bool,
     pub mtu: u16,
     pub file_descriptor: i32,
@@ -183,6 +185,8 @@ pub struct TunConfig {
 impl Default for TunConfig {
     fn default() -> Self {
         Self {
+            auto_route: cfg!(target_os = "linux"),
+            auto_detect_interface: cfg!(target_os = "linux"),
             enable: false,
             mtu: default_mtu(),
             file_descriptor: 0,
@@ -1043,6 +1047,10 @@ impl Default for RawGeoDataUrls {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTunConfig {
+    #[serde(rename = "auto-route", default)]
+    auto_route: Option<bool>,
+    #[serde(rename = "auto-detect-interface", default)]
+    auto_detect_interface: Option<bool>,
     #[serde(default)]
     enable: bool,
     #[serde(default)]
@@ -1098,6 +1106,10 @@ impl RawTunConfig {
             self.udp_timeout
         });
         Ok(TunConfig {
+            auto_route: self.auto_route.unwrap_or(cfg!(target_os = "linux")),
+            auto_detect_interface: self
+                .auto_detect_interface
+                .unwrap_or(cfg!(target_os = "linux")),
             enable: self.enable,
             mtu,
             file_descriptor: self.file_descriptor,
@@ -5023,6 +5035,14 @@ authentication:
     }
 
     #[test]
+    fn linux_network_options_keep_borrowed_descriptor_ownership() {
+        let config = Config::parse_yaml(b"tun:\n  enable: true\n  file-descriptor: 9\n  auto-route: false\n  auto-detect-interface: false\n").unwrap();
+        assert_eq!(config.tun.file_descriptor, 9);
+        assert!(!config.tun.auto_route);
+        assert!(!config.tun.auto_detect_interface);
+    }
+
+    #[test]
     fn tun_config_uses_mihomo_defaults_and_zero_sentinels() {
         for fields in ["", "  mtu: 0\n  udp-timeout: 0"] {
             let yaml = current_yaml(&format!("tun:\n  enable: true\n{fields}"));
@@ -5072,9 +5092,7 @@ authentication:
             "dns-hijack: [name.example:53]",
             "dns-hijack: null",
             "framing: rawIp",
-            "auto-route: false",
             "auto-redirect: false",
-            "auto-detect-interface: false",
             "stack: mips",
             "inet4-address: [198.18.0.1/30]",
             "inet6-address: ['fd00::1/126']",

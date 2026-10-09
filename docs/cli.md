@@ -39,7 +39,8 @@ Unix 用户目录取 `HOME`，Windows 取 `USERPROFILE`，缺失时使用工作�
 TUN 完全由 YAML 配置。Unix 的 `tun.file-descriptor > 0` 借用宿主 fd，内核只关闭自己的副本；
 省略或为 0 时 Linux/macOS 可根据 `tun.device` 创建或打开原生 TUN。
 Windows CLI 固定使用 Wintun，DLL 由宿主提供；Windows FFI 编译时可选择 Wintun 或 UWP。
-接口地址、DNS、系统路由及物理出口隔离由宿主管理，CLI 直接把配置交给内核。
+Linux 自建 TUN 的自动路由与 DNS 接管由 Core 执行，CLI 直接把配置交给内核。
+其他平台和借用 fd 的接口地址、DNS、系统路由及物理出口隔离仍由宿主管理。
 平台接入见 [TUN](tun-platform.md) 和 [Windows VPN](windows-vpn.md)。
 
 构建命令、tag 发布矩阵和归档内容统一见 [编译与发布](../scripts/README.md)。

@@ -535,6 +535,28 @@ impl PreparedCore {
             .await
     }
 
+    #[cfg(all(feature = "tun", target_os = "linux"))]
+    pub(crate) async fn start_native_tun(self, dialer: Dialer) -> io::Result<RunningCore> {
+        let (tun, dialer, mut network) = crate::platform::linux_network::open(
+            &self.config.tun,
+            self.config.dns.enable,
+            self.config.ipv6,
+            dialer,
+        )?;
+        match self.start_tun(tun, dialer).await {
+            Ok(mut running) => {
+                running.system_network = network;
+                Ok(running)
+            }
+            Err(error) => {
+                if let Some(network) = &mut network {
+                    network.restore()?;
+                }
+                Err(error)
+            }
+        }
+    }
+
     #[cfg(all(
         feature = "tun",
         any(
@@ -1364,6 +1386,8 @@ fn prepare_routing(
 }
 
 pub(crate) struct RunningCore {
+    #[cfg(all(feature = "tun", target_os = "linux"))]
+    system_network: Option<crate::platform::linux_network::NetworkLease>,
     cancellation: CancellationToken,
     tasks: Vec<JoinHandle<io::Result<()>>>,
     traffic_stats: Option<Arc<TunTrafficStats>>,
@@ -1482,6 +1506,8 @@ impl RunningCore {
             ));
         }
         Ok(Self {
+            #[cfg(all(feature = "tun", target_os = "linux"))]
+            system_network: None,
             resources,
             cancellation,
             tasks,
@@ -1522,6 +1548,12 @@ impl RunningCore {
         if let Some(resources) = &self.resources {
             resources.shutdown().await;
         }
+        #[cfg(all(feature = "tun", target_os = "linux"))]
+        let result = if let Some(mut network) = self.system_network.take() {
+            result.and(network.restore())
+        } else {
+            result
+        };
         result
     }
 }

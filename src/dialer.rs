@@ -365,6 +365,8 @@ struct InterfaceBinding {
 
 #[derive(Clone)]
 pub struct Dialer {
+    #[cfg(all(target_os = "linux", feature = "tun"))]
+    linux_policy: Option<Arc<crate::platform::linux_network::SocketPolicy>>,
     ip_version: crate::config::IpVersion,
     initialization: Arc<SocketInitialization>,
     protector: Option<Arc<dyn SocketProtector>>,
@@ -393,6 +395,8 @@ impl std::fmt::Debug for Dialer {
 impl Default for Dialer {
     fn default() -> Self {
         Self {
+            #[cfg(all(target_os = "linux", feature = "tun"))]
+            linux_policy: None,
             ip_version: crate::config::IpVersion::Dual,
             initialization: Arc::new(SocketInitialization::default()),
             protector: None,
@@ -406,6 +410,15 @@ impl Default for Dialer {
 }
 
 impl Dialer {
+    #[cfg(all(target_os = "linux", feature = "tun"))]
+    pub(crate) fn with_linux_policy(
+        mut self,
+        policy: Arc<crate::platform::linux_network::SocketPolicy>,
+    ) -> Self {
+        self.linux_policy = Some(policy);
+        self
+    }
+
     pub(crate) fn with_ip_version(mut self, version: crate::config::IpVersion) -> Self {
         self.ip_version = version;
         self
@@ -538,6 +551,10 @@ impl Dialer {
                 socket.set_nonblocking(true)?;
                 check()?;
                 dialer.protect_socket(&socket)?;
+                #[cfg(all(target_os = "linux", feature = "tun"))]
+                if let Some(policy) = &dialer.linux_policy {
+                    policy.apply(&socket, destination)?;
+                }
                 check()?;
                 Ok((std::net::UdpSocket::from(socket), guard))
             })
@@ -646,6 +663,10 @@ impl Dialer {
                 let guard = track(ResourceKind::Socket);
                 check()?;
                 dialer.protect_socket(&socket)?;
+                #[cfg(all(target_os = "linux", feature = "tun"))]
+                if let Some(policy) = &dialer.linux_policy {
+                    policy.apply(&socket, address)?;
+                }
                 check()?;
                 #[cfg(all(windows, feature = "windows-uwp"))]
                 dialer.apply_interface_binding(socket.as_raw_socket(), address)?;
