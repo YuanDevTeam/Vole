@@ -116,8 +116,10 @@ async fn handshake(
             continue;
         }
         if status != 200 {
+            // A remote rejection is a failed proxy connection. PermissionDenied
+            // becomes NotAllowed, which group health excludes as a local policy.
             return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
+                io::ErrorKind::ConnectionRefused,
                 "HTTP CONNECT was rejected",
             ));
         }
@@ -192,7 +194,7 @@ mod tests {
     }
     #[tokio::test]
     async fn connect_auth_and_prebuffer_are_preserved() {
-        for status in [200, 407] {
+        for status in [200, 407, 503] {
             let (client, mut peer) = tokio::io::duplex(4096);
             let remote = tokio::spawn(async move {
                 let mut request = Vec::new();
@@ -224,7 +226,7 @@ mod tests {
             } else {
                 assert_eq!(
                     result.err().unwrap().kind(),
-                    io::ErrorKind::PermissionDenied
+                    io::ErrorKind::ConnectionRefused
                 );
             }
             remote.await.unwrap();
