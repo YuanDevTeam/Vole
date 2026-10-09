@@ -505,7 +505,7 @@ mod tests {
         close_control: bool,
         fragment_response: bool,
         opened_limit: Arc<AtomicU16>,
-        switch_after_handshake: Option<Arc<AtomicUsize>>,
+        switch_after_handshake: Option<Arc<crate::routing::GroupSelection>>,
     }
 
     impl MockUpstream {
@@ -851,7 +851,7 @@ mod tests {
     async fn group_switch_during_udp_handshake_keeps_control_and_relay_on_one_upstream() {
         use crate::outbound::{SelectUpstream, SelectUpstreamMember};
 
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(crate::routing::GroupSelection::new(0));
         let mut first = MockUpstream::new(COMMAND_UDP_ASSOCIATE);
         first.switch_after_handshake = Some(selection.clone());
         let first_budget = first.opened_limit.clone();
@@ -866,7 +866,7 @@ mod tests {
             ],
         ));
         let group = Arc::new(SelectUpstream::new(
-            Arc::new(AtomicUsize::new(0)),
+            Arc::new(crate::routing::GroupSelection::new(0)),
             vec![SelectUpstreamMember::Group(child)],
         ));
         let outbound = Socks5Outbound::new_with_path(

@@ -68,3 +68,5 @@ container-benchmark compare --source vole=/path/to/Vole
 维护，结果记录在对应运行或 PR 中；[验收边界](../docs/acceptance.md) 区分编译、互通与设备验证。
 
 `runtime::providers::tests::` 使用临时文件与内存流验证候选发布、坏更新保留、旧会话资源和停止清理；`config::` 同时覆盖 provider、规则集合和 MRS 格式。
+
+`routing::proxy_group::tests::` 覆盖自动选择、容差、恢复与选择缓存；`resource::probe::tests::` 和 `invoke::measure_delay::tests::` 使用内存流验证共享健康探测、HTTP 状态和取消。

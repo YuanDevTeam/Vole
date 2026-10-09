@@ -1,10 +1,10 @@
+use super::GroupSelection;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::HashMap,
     fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
 };
 
 use async_trait::async_trait;
@@ -17,6 +17,7 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProxyGroupState {
+    pub kind: crate::config::GroupKind,
     pub(crate) name: String,
     pub(crate) all: Vec<String>,
     pub(crate) now: String,
@@ -42,9 +43,10 @@ impl fmt::Display for ProxyGroupError {
 impl std::error::Error for ProxyGroupError {}
 
 struct SelectProxyGroup {
+    config: SelectProxyGroupConfig,
     name: String,
     members: Box<[ProxyGroupMember]>,
-    selected: Arc<AtomicUsize>,
+    selected: Arc<GroupSelection>,
     disable_udp: bool,
     hidden: bool,
     icon: String,
@@ -90,7 +92,7 @@ impl ProxyGroups {
     ) -> Result<Arc<Self>, DispatchError> {
         let selections = configs
             .iter()
-            .map(|config| Arc::new(AtomicUsize::new(config.initial_member)))
+            .map(|config| Arc::new(GroupSelection::new(config.initial_member)))
             .collect::<Vec<_>>();
         Self::with_selections(configs, proxies, direct, &selections)
     }
@@ -99,7 +101,7 @@ impl ProxyGroups {
         configs: &[SelectProxyGroupConfig],
         proxies: Vec<Arc<dyn Dispatcher>>,
         direct: Arc<dyn Dispatcher>,
-        selections: &[Arc<AtomicUsize>],
+        selections: &[Arc<GroupSelection>],
     ) -> Result<Arc<Self>, DispatchError> {
         if selections.len() != configs.len() {
             return Err(DispatchError::Other(
@@ -154,20 +156,24 @@ impl ProxyGroups {
             groups: configs
                 .iter()
                 .zip(selections)
-                .map(|(config, selection)| SelectProxyGroup {
-                    name: config.name.clone(),
-                    members: config
-                        .members
-                        .iter()
-                        .map(|member| ProxyGroupMember {
-                            name: member.name.clone(),
-                            target: member.target,
-                        })
-                        .collect(),
-                    selected: selection.clone(),
-                    disable_udp: config.disable_udp,
-                    hidden: config.hidden,
-                    icon: config.icon.clone(),
+                .map(|(config, selection)| {
+                    selection.configure(config.max_failed_times, config.health.timeout);
+                    SelectProxyGroup {
+                        config: config.clone(),
+                        name: config.name.clone(),
+                        members: config
+                            .members
+                            .iter()
+                            .map(|member| ProxyGroupMember {
+                                name: member.name.clone(),
+                                target: member.target,
+                            })
+                            .collect(),
+                        selected: selection.clone(),
+                        disable_udp: config.disable_udp,
+                        hidden: config.hidden,
+                        icon: config.icon.clone(),
+                    }
                 })
                 .collect(),
             ids_by_name,
@@ -193,6 +199,14 @@ impl ProxyGroups {
     }
 
     pub(crate) fn select(&self, group: &str, member: &str) -> Result<(), ProxyGroupError> {
+        self.inherit_selection(group, member, true)
+    }
+    pub(crate) fn inherit_selection(
+        &self,
+        group: &str,
+        member: &str,
+        forced: bool,
+    ) -> Result<(), ProxyGroupError> {
         let id = self
             .ids_by_name
             .get(group)
@@ -204,7 +218,11 @@ impl ProxyGroups {
             .iter()
             .position(|candidate| candidate.name == member)
             .ok_or(ProxyGroupError::UnknownMember)?;
-        group.selected.store(selected, Ordering::Release);
+        if forced {
+            group.selected.force(selected);
+        } else {
+            group.selected.store(selected, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -227,6 +245,7 @@ impl ProxyGroups {
             if udp && group.disable_udp {
                 return Err(DispatchError::NotAllowed);
             }
+            group.selected.touch();
             let selected = group.selected.load(Ordering::Acquire);
             let member = group.members.get(selected).ok_or_else(|| {
                 DispatchError::Other(format!(
@@ -268,6 +287,46 @@ impl ProxyGroups {
         ))
     }
 
+    pub(crate) fn selection(&self, index: usize) -> Arc<GroupSelection> {
+        self.groups[index].selected.clone()
+    }
+    pub(crate) fn apply_health(&self, index: usize, samples: &[Option<u64>]) {
+        let group = &self.groups[index];
+        if group.config.kind == crate::config::GroupKind::Select
+            || samples.len() != group.members.len()
+        {
+            return;
+        }
+        if let Some(forced) = group.selected.forced() {
+            if samples[forced].is_some() {
+                group.selected.store(forced, Ordering::Release);
+                return;
+            }
+            group.selected.clear_forced();
+        }
+        let old = group.selected.load(Ordering::Acquire);
+        let next = if group.config.kind == crate::config::GroupKind::Fallback {
+            samples.iter().position(Option::is_some).unwrap_or(0)
+        } else {
+            let fastest = samples
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| d.map(|d| (i, d)))
+                .min_by_key(|(_, d)| *d)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            if samples[old]
+                .zip(samples[fastest])
+                .is_some_and(|(a, b)| a <= b.saturating_add(u64::from(group.config.tolerance)))
+            {
+                old
+            } else {
+                fastest
+            }
+        };
+        group.selected.store(next, Ordering::Release);
+    }
+
     pub(super) fn dispatcher(self: &Arc<Self>, id: ProxyGroupId) -> Arc<dyn Dispatcher> {
         Arc::new(SelectProxyGroupDispatcher {
             groups: self.clone(),
@@ -280,6 +339,7 @@ impl SelectProxyGroup {
     fn state(&self) -> ProxyGroupState {
         let selected = self.selected.load(Ordering::Acquire);
         ProxyGroupState {
+            kind: self.config.kind,
             name: self.name.clone(),
             all: self
                 .members
@@ -301,11 +361,14 @@ struct SelectProxyGroupDispatcher {
 #[async_trait]
 impl Dispatcher for SelectProxyGroupDispatcher {
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
-        self.groups
-            .resolve_leaf(self.id)?
-            .dispatcher
-            .connect_tcp(session)
-            .await
+        let leaf = self.groups.resolve_leaf(self.id)?;
+        let result = leaf.dispatcher.connect_tcp(session).await;
+        if !leaf.direct && !matches!(result, Err(DispatchError::NotAllowed)) {
+            self.groups.groups[self.id.index()]
+                .selected
+                .outcome(result.is_ok());
+        }
+        result
     }
 
     async fn open_datagram(
@@ -351,11 +414,7 @@ impl DatagramTransport for RejectDatagramTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::SocketAddr,
-        sync::atomic::{AtomicUsize, Ordering},
-        time::Duration,
-    };
+    use std::{net::SocketAddr, sync::atomic::Ordering, time::Duration};
 
     use bytes::Bytes;
     use tokio::sync::Semaphore;
@@ -471,6 +530,10 @@ mod tests {
         initial_member: usize,
     ) -> SelectProxyGroupConfig {
         SelectProxyGroupConfig {
+            kind: crate::config::GroupKind::Select,
+            health: crate::config::HealthCheckConfig::default(),
+            tolerance: 0,
+            max_failed_times: 5,
             disable_udp: false,
             hidden: false,
             icon: String::new(),
@@ -499,6 +562,55 @@ mod tests {
             payload: Bytes::from_static(b"payload"),
             sniffed_domain: None,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_groups_apply_tolerance_recover_and_restore_selection() {
+        let config = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxies:
+  - {name: a, type: socks5, server: 192.0.2.1, port: 1080}
+  - {name: b, type: socks5, server: 192.0.2.2, port: 1080}
+proxy-groups:
+  - {name: fastest, type: url-test, proxies: [a,b], tolerance: 20, max-failed-times: 2}
+  - {name: backup, type: fallback, proxies: [a,b]}
+  - {name: manual, type: select, proxies: [a,b], default-selected: a}
+"#,
+        )
+        .unwrap();
+        let node = Arc::new(FailingDispatcher);
+        let groups = ProxyGroups::new(
+            &config.proxy_groups,
+            vec![node.clone(), node.clone()],
+            node.clone(),
+        )
+        .unwrap();
+        groups.apply_health(0, &[Some(100), Some(90)]);
+        assert_eq!(groups.state("fastest").unwrap().now, "a");
+        groups.apply_health(0, &[Some(100), Some(60)]);
+        assert_eq!(groups.state("fastest").unwrap().now, "b");
+        groups.apply_health(1, &[None, Some(60)]);
+        assert_eq!(groups.state("backup").unwrap().now, "b");
+        groups.apply_health(1, &[Some(100), Some(60)]);
+        assert_eq!(groups.state("backup").unwrap().now, "a");
+        groups.select("fastest", "a").unwrap();
+        groups.apply_health(0, &[None, Some(60)]);
+        assert_eq!(groups.state("fastest").unwrap().now, "b");
+        let selection = groups.selection(0);
+        selection.outcome(false);
+        selection.outcome(false);
+        assert!(selection.take_urgent());
+        tokio::time::advance(std::time::Duration::from_secs(301)).await;
+        assert!(!selection.active(std::time::Duration::from_secs(300)));
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::resource::profile::SelectionStore::open(root.path(), true);
+        groups.select("manual", "b").unwrap();
+        store.save("manual", "b").unwrap();
+        let restarted =
+            ProxyGroups::new(&config.proxy_groups, vec![node.clone(), node.clone()], node).unwrap();
+        crate::resource::profile::SelectionStore::open(root.path(), true).restore(&restarted);
+        assert_eq!(restarted.state("manual").unwrap().now, "b");
     }
 
     #[tokio::test]
@@ -558,6 +670,7 @@ mod tests {
             groups.list_states(),
             vec![
                 ProxyGroupState {
+                    kind: crate::config::GroupKind::Select,
                     name: "child".to_owned(),
                     all: vec!["first".to_owned(), "first".to_owned(), "second".to_owned()],
                     now: "second".to_owned(),
@@ -565,6 +678,7 @@ mod tests {
                     icon: String::new(),
                 },
                 ProxyGroupState {
+                    kind: crate::config::GroupKind::Select,
                     name: "parent".to_owned(),
                     all: vec!["child".to_owned(), "DIRECT".to_owned(), "REJECT".to_owned()],
                     now: "child".to_owned(),

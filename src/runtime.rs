@@ -12,13 +12,9 @@ use tracing::instrument::WithSubscriber;
 #[path = "runtime_lifecycle_tests.rs"]
 mod lifecycle_tests;
 
-use std::{
-    future::Future,
-    io,
-    net::SocketAddr,
-    sync::{Arc, atomic::AtomicUsize},
-    time::Duration,
-};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::{future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures_util::future::{join_all, select_all};
 use tokio::task::JoinHandle;
@@ -96,6 +92,7 @@ use crate::security::StandardTlsClient;
 ))]
 use crate::security::{SecurityContext, TLS_RESUMPTION_SESSION_BUDGET};
 
+mod health;
 mod providers;
 use providers::ProviderRuntime;
 
@@ -177,6 +174,7 @@ struct BuiltRuntimeParts {
     proxy_groups: Arc<ProxyGroups>,
     proxy_graph: Arc<BuiltProxyGraph>,
     resources: Option<Arc<ProviderRuntime>>,
+    health: Arc<health::HealthRuntime>,
     resource_targets: RouteTargetDispatchers,
     direct: Arc<dyn Dispatcher>,
 }
@@ -186,7 +184,7 @@ struct BuiltProxyGraph {
     resolution: ResolutionContext,
     nodes: Vec<Arc<dyn OutboundConnector>>,
     lifecycle_order: Vec<BuiltRouteTarget>,
-    selections: Vec<Arc<AtomicUsize>>,
+    selections: Vec<Arc<crate::routing::GroupSelection>>,
 }
 
 enum BuiltRouteTarget {
@@ -256,8 +254,11 @@ impl PreparedCore {
         let config = Config::parse_yaml(yaml)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let directory = tempfile::tempdir()?;
-        let manager = GeoDataManager::open(directory.path(), Duration::from_secs(24 * 60 * 60))
-            .map_err(io::Error::other)?;
+        let manager = GeoDataManager::open(
+            &directory.path().join("geodata"),
+            Duration::from_secs(24 * 60 * 60),
+        )
+        .map_err(io::Error::other)?;
         Self::prepare_config(config, manager, resolver, limits).await
     }
 
@@ -621,6 +622,20 @@ impl GraphBuilder {
             &handshake_stats,
             &proxy_graph.resolution,
         )?;
+        let activities = proxy_dispatchers
+            .iter()
+            .map(|_| health::Activity::new())
+            .collect::<Vec<_>>();
+        let proxy_dispatchers = proxy_dispatchers
+            .into_iter()
+            .zip(&activities)
+            .map(|(dispatcher, activity)| {
+                Arc::new(health::ActiveDispatcher {
+                    dispatcher,
+                    activity: activity.clone(),
+                }) as Arc<dyn Dispatcher>
+            })
+            .collect::<Vec<_>>();
         let direct_raw: Arc<dyn Dispatcher> = Arc::new(DirectOutbound::new(dialer));
         let direct = observe_handshakes_with_stats(direct_raw, handshake_stats.clone());
         let proxy_groups = ProxyGroups::with_selections(
@@ -657,6 +672,14 @@ impl GraphBuilder {
             .with_mapping_from(self.previous_dns.as_deref()),
         ));
         proxy_graph.resolution.bind_runtime(dns.as_ref())?;
+        let health = health::HealthRuntime::new(
+            &self.config,
+            proxy_groups.clone(),
+            route_targets.clone(),
+            direct.clone(),
+            activities,
+            dns.clone(),
+        );
         let router: Arc<dyn Dispatcher> = Arc::new(
             RoutingDispatcher::new_with_ipv6(
                 route_targets.clone(),
@@ -676,6 +699,7 @@ impl GraphBuilder {
             proxy_groups,
             proxy_graph: Arc::new(proxy_graph),
             resources: None,
+            health,
             resource_targets: route_targets,
             direct,
         })
@@ -826,7 +850,7 @@ fn build_proxy_graph(
         lifecycle_order: Vec::with_capacity(order.len()),
         selections: groups
             .iter()
-            .map(|group| Arc::new(AtomicUsize::new(group.initial_member)))
+            .map(|group| Arc::new(crate::routing::GroupSelection::new(group.initial_member)))
             .collect(),
     };
     let mut nodes: Vec<Option<Arc<dyn OutboundConnector>>> = vec![None; proxies.len()];

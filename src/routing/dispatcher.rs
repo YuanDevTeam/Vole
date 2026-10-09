@@ -1120,6 +1120,10 @@ mod tests {
         members: Vec<(&str, ProxyGroupMemberTarget)>,
     ) -> SelectProxyGroupConfig {
         SelectProxyGroupConfig {
+            kind: crate::config::GroupKind::Select,
+            health: crate::config::HealthCheckConfig::default(),
+            tolerance: 0,
+            max_failed_times: 5,
             disable_udp: false,
             hidden: false,
             icon: String::new(),

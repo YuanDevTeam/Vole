@@ -49,6 +49,8 @@ pub struct ProviderSpec {
     pub size_limit: u64,
     #[serde(default)]
     pub payload: Vec<Value>,
+    #[serde(default)]
+    pub health_check: HealthCheckConfig,
     pub behavior: Option<RuleBehavior>,
     #[serde(default)]
     pub format: RuleFormat,
@@ -107,6 +109,10 @@ impl ProviderSpec {
                 return invalid("file provider requires path");
             }
             _ => {}
+        }
+        self.health_check.validate()?;
+        if is_rule && self.health_check != HealthCheckConfig::default() {
+            return invalid("rule providers do not support health-check");
         }
         Filter::new(&self.filter, &self.exclude_filter, &self.exclude_type)?;
         for key in self.overrides.keys() {
@@ -206,9 +212,6 @@ impl ProviderTemplate {
             proxies,
             rules,
         })
-    }
-    pub fn has_resources(&self) -> bool {
-        !self.proxies.is_empty() || !self.rules.is_empty()
     }
     pub(crate) fn key(is_rule: bool, name: &str) -> String {
         format!("{}/{name}", if is_rule { "rules" } else { "proxies" })
@@ -313,6 +316,18 @@ impl ProviderTemplate {
                 if all_providers {
                     used = self.proxies.iter().map(|(name, _)| name.clone()).collect();
                 }
+                if map
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                    && let Some(url) = used
+                        .iter()
+                        .filter_map(|name| self.proxies.iter().find(|(n, _)| n == name))
+                        .map(|(_, spec)| &spec.health_check.url)
+                        .find(|url| !url.is_empty())
+                {
+                    map.insert("url".into(), url.clone().into());
+                }
                 let dynamic = !used.is_empty() || all_proxies || all_providers;
                 let mut names = declared;
                 if all_proxies {
@@ -398,9 +413,8 @@ impl ProviderTemplate {
                 }
             }
         }
-        if self.has_resources() {
-            config.providers = Some(self.clone());
-        }
+        config.provider_members = providers;
+        config.providers = Some(self.clone());
         Ok(config)
     }
 }

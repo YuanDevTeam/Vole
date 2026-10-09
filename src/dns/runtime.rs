@@ -3050,6 +3050,10 @@ dns:
         let proxy_dispatchers: Vec<Arc<dyn Dispatcher>> = vec![old.clone(), new.clone()];
         let groups = ProxyGroups::new(
             &[SelectProxyGroupConfig {
+                kind: crate::config::GroupKind::Select,
+                health: crate::config::HealthCheckConfig::default(),
+                tolerance: 0,
+                max_failed_times: 5,
                 disable_udp: false,
                 hidden: false,
                 icon: String::new(),

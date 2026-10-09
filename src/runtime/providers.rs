@@ -25,6 +25,7 @@ use tokio::{
 };
 
 struct Generation {
+    health: Arc<health::HealthRuntime>,
     requirements: GeoRequirements,
     config: Config,
     dispatcher: Arc<dyn Dispatcher>,
@@ -41,6 +42,7 @@ impl Generation {
         requirements: GeoRequirements,
     ) -> Self {
         Self {
+            health: parts.health.clone(),
             requirements,
             config,
             dispatcher: parts.dispatcher.clone(),
@@ -58,6 +60,8 @@ struct Refresh {
     reply: oneshot::Sender<Result<(), &'static str>>,
 }
 pub(super) struct ProviderRuntime {
+    store: crate::resource::profile::SelectionStore,
+    persistence_error: RwLock<Option<&'static str>>,
     current: ArcSwap<Generation>,
     retired: Mutex<Vec<Arc<Generation>>>,
     publication: Mutex<()>,
@@ -85,7 +89,19 @@ impl ProviderRuntime {
             .filter_map(|i| prepared.rules.rule(i).cloned())
             .collect();
         let requirements = GeoRequirements::for_config(&configured).expect("prepared requirements");
+        let root = prepared
+            .geodata_manager
+            .store_dir()
+            .parent()
+            .expect("dataDir");
+        let store = crate::resource::profile::SelectionStore::open(
+            root,
+            prepared.config.profile.store_selected,
+        );
+        store.restore(&parts.proxy_groups);
         Arc::new(Self {
+            store,
+            persistence_error: RwLock::new(None),
             current: ArcSwap::from_pointee(Generation::from_parts(
                 prepared.config.clone(),
                 parts,
@@ -175,6 +191,21 @@ impl ProviderRuntime {
         Ok(requirements)
     }
     pub(super) async fn run(self: Arc<Self>, parent: CancellationToken) -> io::Result<()> {
+        let health = async {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {biased;
+                    ()=parent.cancelled()=>{self.begin_shutdown();break;},
+                    ()=self.cancellation.cancelled()=>break,
+                    _=tick.tick()=>{let current=self.current.load_full(); current.health.tick(&self.cancellation).await;}
+                }
+            }
+        };
+        let worker = self.provider_loop(parent.clone());
+        let (result, ()) = tokio::join!(worker, health);
+        result
+    }
+    async fn provider_loop(self: &Arc<Self>, parent: CancellationToken) -> io::Result<()> {
         let mut receiver = self
             .receiver
             .lock()
@@ -288,8 +319,24 @@ impl ProviderRuntime {
                 cache
                     .commit(index, candidate, &self.cancellation)
                     .map(|()| {
-                        for state in self.current.load().groups.list_states() {
-                            let _ = next.groups.select(&state.name, &state.now);
+                        for (index, state) in self
+                            .current
+                            .load()
+                            .groups
+                            .list_states()
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let forced = self
+                                .current
+                                .load()
+                                .groups
+                                .selection(index)
+                                .forced()
+                                .is_some();
+                            let _ = next
+                                .groups
+                                .inherit_selection(&state.name, &state.now, forced);
                         }
                         let old = self.current.swap(next.clone());
                         self.retired.lock().unwrap().push(old);
@@ -372,7 +419,16 @@ impl RuntimeResources for ProviderRuntime {
     }
     fn select(&self, group: &str, member: &str) -> Result<(), ProxyGroupError> {
         let _publication = self.publication.lock().unwrap();
-        self.current.load().groups.select(group, member)
+        self.current.load().groups.select(group, member)?;
+        *self.persistence_error.write().unwrap() = self
+            .store
+            .save(group, member)
+            .err()
+            .map(|_| "selection cache write failed");
+        Ok(())
+    }
+    fn health(&self) -> serde_json::Value {
+        serde_json::json!({"proxies":self.current.load().health.states(),"selectionError":*self.persistence_error.read().unwrap()})
     }
     fn providers(&self, rules: bool) -> serde_json::Value {
         let providers = self
@@ -384,6 +440,20 @@ impl RuntimeResources for ProviderRuntime {
             .map(|state| {
                 let mut value = serde_json::to_value(state).expect("provider status");
                 value["type"] = serde_json::json!(if rules { "Rule" } else { "Proxy" });
+                if !rules {
+                    let current = self.current.load_full();
+                    let health = current.health.states();
+                    value["proxies"] = serde_json::json!(
+                        current
+                            .config
+                            .provider_members
+                            .get(&state.name)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|name| health.get(name))
+                            .collect::<Vec<_>>()
+                    );
+                }
                 (state.name.clone(), value)
             })
             .collect::<BTreeMap<_, _>>();

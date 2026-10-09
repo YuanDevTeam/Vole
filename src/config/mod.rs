@@ -1,4 +1,7 @@
 //! Strict parsing for the current Vole YAML configuration.
+mod groups;
+pub(crate) use groups::status_ranges;
+pub use groups::{GroupKind, HealthCheckConfig, ProfileConfig};
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -73,6 +76,8 @@ pub struct Config {
     pub log_level: LogLevel,
     pub global_ua: String,
     pub etag_support: bool,
+    pub unified_delay: bool,
+    pub profile: ProfileConfig,
     pub geodata_update: Option<GeoDataUpdateConfig>,
     pub external_controller: Option<ExternalControllerConfig>,
     pub inbounds: Vec<InboundConfig>,
@@ -81,6 +86,7 @@ pub struct Config {
     pub sniffer: SnifferConfig,
     pub dns: DnsConfig,
     pub rules: Vec<RuleSpec>,
+    pub provider_members: HashMap<String, Vec<String>>,
     pub providers: Option<std::sync::Arc<providers::ProviderTemplate>>,
 }
 
@@ -449,6 +455,10 @@ pub struct ProxyGroupMemberConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectProxyGroupConfig {
+    pub kind: GroupKind,
+    pub health: HealthCheckConfig,
+    pub tolerance: u16,
+    pub max_failed_times: u32,
     pub name: String,
     pub members: Vec<ProxyGroupMemberConfig>,
     pub initial_member: usize,
@@ -861,6 +871,10 @@ impl std::fmt::Debug for HttpInboundConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVoleConfig {
+    #[serde(rename = "unified-delay", default)]
+    unified_delay: bool,
+    #[serde(default)]
+    profile: ProfileConfig,
     #[serde(default)]
     mode: Mode,
     #[serde(rename = "log-level", default)]
@@ -930,6 +944,21 @@ struct RawVoleConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProxyGroup {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    interval: u64,
+    #[serde(default)]
+    timeout: u64,
+    #[serde(default = "default_true")]
+    lazy: bool,
+    #[serde(rename = "expected-status", default)]
+    expected_status: String,
+    #[serde(default)]
+    tolerance: u16,
+    #[serde(rename = "max-failed-times", default)]
+    max_failed_times: u32,
+
     #[serde(rename = "disable-udp", default)]
     disable_udp: bool,
     #[serde(default)]
@@ -938,7 +967,7 @@ struct RawProxyGroup {
     icon: String,
     name: String,
     #[serde(rename = "type")]
-    kind: String,
+    kind: GroupKind,
     proxies: Vec<String>,
     #[serde(
         rename = "default-selected",
@@ -1703,7 +1732,14 @@ impl RawVoleConfig {
                 hidden: false,
                 icon: String::new(),
                 name: "GLOBAL".into(),
-                kind: "select".into(),
+                kind: GroupKind::Select,
+                url: String::new(),
+                interval: 0,
+                timeout: 0,
+                lazy: true,
+                expected_status: String::new(),
+                tolerance: 0,
+                max_failed_times: 0,
                 proxies: vec!["DIRECT".into(), "REJECT".into()],
                 default_selected: None,
             });
@@ -1770,6 +1806,8 @@ impl RawVoleConfig {
             log_level: self.log_level,
             global_ua: self.global_ua,
             etag_support: self.etag_support,
+            unified_delay: self.unified_delay,
+            profile: self.profile,
             geodata_update,
             external_controller,
             inbounds,
@@ -1779,6 +1817,7 @@ impl RawVoleConfig {
             dns,
             rules,
             providers: None,
+            provider_members: HashMap::new(),
         })
     }
 }
@@ -2127,12 +2166,6 @@ fn normalize_proxy_group_declarations(
 ) -> Result<(Vec<RawProxyGroup>, HashMap<String, ProxyGroupId>)> {
     let mut group_ids = HashMap::with_capacity(raw_groups.len());
     for (index, group) in raw_groups.iter().enumerate() {
-        if group.kind != "select" {
-            return invalid(format!(
-                "proxy group `{}` type must be exactly `select`",
-                group.name
-            ));
-        }
         validate_route_target_definition_name(&group.name, "proxy group name")?;
         if group.proxies.is_empty() {
             return invalid(format!(
@@ -2209,7 +2242,18 @@ fn normalize_proxy_groups(
                     })?,
                 None => 0,
             };
+            let health = HealthCheckConfig {
+                enable: true,
+                url: if group.url.is_empty() { "https://www.gstatic.com/generate_204".into() } else { group.url },
+                interval: if group.interval == 0 && group.kind != GroupKind::Select { 300 } else { group.interval },
+                timeout: if group.timeout == 0 { 5000 } else { group.timeout },
+                lazy: group.lazy,
+                expected_status: group.expected_status,
+            };
+            health.validate()?;
             Ok(SelectProxyGroupConfig {
+                kind: group.kind, health, tolerance: group.tolerance,
+                max_failed_times: if group.max_failed_times == 0 { 5 } else { group.max_failed_times },
                 name: group.name,
                 members,
                 initial_member,
@@ -5327,9 +5371,6 @@ rules:
             "mixed-port: 1080\nauthentication:\n  - measure:secret\nrules:\n  - MATCH,主线路";
         for groups in [
             r#"  - name: 主线路
-    type: url-test
-    proxies: [proxy]"#,
-            r#"  - name: 主线路
     type: select
     proxies: []"#,
             r#"  - name: 主线路
@@ -5342,10 +5383,6 @@ rules:
             r#"  - name: 主线路
     type: select
     proxies: [RULES]"#,
-            r#"  - name: 主线路
-    type: select
-    proxies: [proxy]
-    url: https://example.com"#,
             r#"  - name: 主线路
     type: select
     proxies: [proxy]

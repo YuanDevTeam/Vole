@@ -191,7 +191,7 @@ jobs:
             transport::sing_mux::smux_driver::tests:: transport::sing_mux::tests::
             platform::tun_rs_io::tests:: platform::windows_tun_io::tests::
             platform::windows_wintun_io::tests:: tun_runtime::tests::
-            invoke::foreground::tests:: runtime::shutdown_tests:: runtime::providers::tests::
+            invoke::foreground::tests:: runtime::shutdown_tests:: runtime::providers::tests:: resource::probe::tests:: invoke::measure_delay::tests::
           )
           for filter in "${filters[@]}"; do run_test 1 --lib "$filter"; done
           run_test 1 --bin vole cli::tests::

@@ -1,13 +1,13 @@
+use crate::routing::GroupSelection;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::HashMap,
     fmt::{self, Write as _},
     future::Future,
     io,
     net::IpAddr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 
@@ -212,7 +212,7 @@ pub struct EstablishContext {
     selections: Arc<Mutex<SelectionSnapshot>>,
 }
 
-type SelectionSnapshot = HashMap<usize, (Arc<AtomicUsize>, usize)>;
+type SelectionSnapshot = HashMap<usize, (Arc<GroupSelection>, usize)>;
 
 impl EstablishContext {
     #[must_use]
@@ -265,7 +265,8 @@ impl EstablishContext {
     /// One read per group for the entire setup, including both legs of a
     /// SOCKS5 UDP association. Retaining the atomic prevents address reuse;
     /// unrelated groups are not an atomic cross-group snapshot.
-    fn selected_member(&self, selection: &Arc<AtomicUsize>) -> usize {
+    fn selected_member(&self, selection: &Arc<GroupSelection>) -> usize {
+        selection.touch();
         let key = Arc::as_ptr(selection) as usize;
         let mut selections = self
             .selections
@@ -275,6 +276,12 @@ impl EstablishContext {
             .entry(key)
             .or_insert_with(|| (selection.clone(), selection.load(Ordering::Acquire)))
             .1
+    }
+
+    fn report_group_outcome(&self, success: bool) {
+        for (selection, _) in self.selections.lock().unwrap().values() {
+            selection.outcome(success);
+        }
     }
 
     pub async fn run<T, F>(&self, operation: &'static str, future: F) -> Result<T, DispatchError>
@@ -438,7 +445,7 @@ pub trait OutboundConnector: Send + Sync {
 /// never a registry of all nodes, so a validated DAG cannot form an Arc cycle.
 /// The atomic is shared with the route/Controller view of the same group.
 pub struct SelectUpstream {
-    selection: Arc<AtomicUsize>,
+    selection: Arc<GroupSelection>,
     members: Box<[SelectUpstreamMember]>,
     disable_udp: bool,
 }
@@ -451,7 +458,7 @@ pub(crate) enum SelectUpstreamMember {
 }
 
 impl SelectUpstream {
-    pub(crate) fn new(selection: Arc<AtomicUsize>, members: Vec<SelectUpstreamMember>) -> Self {
+    pub(crate) fn new(selection: Arc<GroupSelection>, members: Vec<SelectUpstreamMember>) -> Self {
         Self {
             selection,
             members: members.into_boxed_slice(),
@@ -755,10 +762,12 @@ impl ConnectorDispatcher {
 #[async_trait]
 impl Dispatcher for ConnectorDispatcher {
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
-        self.inner
-            .connect_stream(session, &self.context())
-            .await
-            .map(|connected| connected.io)
+        let context = self.context();
+        let result = self.inner.connect_stream(session, &context).await;
+        if !matches!(result, Err(DispatchError::NotAllowed)) {
+            context.report_group_outcome(result.is_ok());
+        }
+        result.map(|connected| connected.io)
     }
 
     async fn open_datagram(
@@ -794,7 +803,7 @@ mod tests {
             "HYSTERIA2-UNIT",
             "authenticated_continuation_keeps_group_choice_but_has_a_new_io_deadline",
         );
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(GroupSelection::new(0));
         let path = selected_path(
             selection.clone(),
             vec![
@@ -928,7 +937,7 @@ mod tests {
     }
 
     fn selected_path(
-        selection: Arc<AtomicUsize>,
+        selection: Arc<GroupSelection>,
         members: Vec<SelectUpstreamMember>,
     ) -> UpstreamPath {
         UpstreamPath::Group {
@@ -948,7 +957,7 @@ mod tests {
             marker: 2,
             ..Default::default()
         });
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(GroupSelection::new(0));
         let nested = Arc::new(SelectUpstream::new(
             selection.clone(),
             vec![
@@ -956,7 +965,7 @@ mod tests {
                 SelectUpstreamMember::Proxy(second.clone()),
             ],
         ));
-        let outer_selection = Arc::new(AtomicUsize::new(0));
+        let outer_selection = Arc::new(GroupSelection::new(0));
         let path = selected_path(
             outer_selection.clone(),
             vec![
@@ -1016,7 +1025,7 @@ mod tests {
             marker: 2,
             ..Default::default()
         });
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(GroupSelection::new(0));
         let path = selected_path(
             selection.clone(),
             vec![
@@ -1065,7 +1074,7 @@ mod tests {
             gate: Some(Arc::new(Semaphore::new(0))),
             ..Default::default()
         });
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(GroupSelection::new(0));
         let connector_weak = Arc::downgrade(&connector);
         let selection_weak = Arc::downgrade(&selection);
         let path = selected_path(selection, vec![SelectUpstreamMember::Proxy(connector)]);
@@ -1085,7 +1094,7 @@ mod tests {
     async fn upstream_direct_connects_prepared_node_server_and_reject_never_falls_back() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(GroupSelection::new(0));
         let path = UpstreamPath::Group {
             group: Arc::new(SelectUpstream::new(
                 selection.clone(),
@@ -1153,7 +1162,7 @@ mod tests {
         let protector = Arc::new(RejectProtector(AtomicUsize::new(0)));
         let path = UpstreamPath::Group {
             group: Arc::new(SelectUpstream::new(
-                Arc::new(AtomicUsize::new(0)),
+                Arc::new(GroupSelection::new(0)),
                 vec![SelectUpstreamMember::Direct],
             )),
             endpoint: Some(ResolvedEndpoint {
@@ -1190,7 +1199,7 @@ mod tests {
             reject_udp: true,
             ..Default::default()
         });
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(GroupSelection::new(0));
         let path = selected_path(
             selection.clone(),
             vec![

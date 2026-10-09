@@ -1,6 +1,6 @@
 # 运行时 Controller API
 
-Controller 是当前 Running Session 的回环 HTTP 接口。它提供一次性 TUN 流量快照，以及静态与动态 `select` 代理组的状态查询和实时选择；它不是 Invoke API，也不承诺完整 Mihomo Dashboard 兼容。
+Controller 是当前 Running Session 的回环 HTTP 接口。它提供一次性 TUN 流量快照，以及静态与动态 `select`、`url-test`、`fallback` 代理组的状态查询和实时选择；它不是 Invoke API，也不承诺完整 Mihomo Dashboard 兼容。
 
 ## 配置与生命周期
 
@@ -15,7 +15,7 @@ secret: "vole-runtime-secret"
 - `measureDelay` 的 node-only 配置不能包含 Controller 或代理组字段。
 - `validateConfig` 只校验字段；`prepare` 不监听端口；`start` 绑定端口，绑定失败则启动失败。`stop` 和 `destroyInstance` 关闭监听器。
 
-Controller 与公共运行时 session 同生共灭。代理组选择只保存在 Vole 当前 session 的内存中；Vole 不写回配置。宿主如需跨 session 保留选择，必须自行持久化，并在下次 `configYaml` 中提供对应的 `default-selected`。
+Controller 与公共运行时 session 同生共灭。`profile.store-selected` 默认 true，Core 将显式选择保存到 dataDir/selected.json，在下次启动时恢复有效成员；不写回 YAML。关闭该选项后只保留会话内选择。写入失败不回滚已生效的选择，`GET /proxies` 的 `selectionError` 给出脱敏原因。
 
 ## Bearer 鉴权
 
@@ -83,10 +83,16 @@ GET /group/{name}
 GET /proxies/{name}
 ```
 
-- `name` 是组定义名，`type` 固定为 `Selector`；
+- `name` 是组定义名，`type` 分别为 `Selector`、`URLTest` 或 `Fallback`；
 - `all` 是配置中的直接成员，严格保留顺序和重复项；
 - `now` 是当前选中的直接成员名。若该成员是嵌套组，`now` 仍返回组名，不展开为最终叶节点；
 - 名称和值大小写敏感并精确匹配，不做大小写折叠或 Unicode normalization。
+
+`GET /proxies` 返回以名称为键的 `proxies` 对象，包含组状态及节点的 `alive/history`。
+`GET /proxies/{name}` 也可查询节点。history 当前保留最近一次探测，delay 单位毫秒，
+time 为 Unix 秒；未探测节点初始 alive 为 true、history 为空。HTTP 健康状态不声明 UDP 可用性。
+
+自动组的手动选择在该成员健康时保持固定，失败后恢复自动选择。url-test 使用 tolerance 抑制小幅切换，fallback 按成员顺序选择与恢复。
 
 ## `PUT /proxies/{name}`
 
@@ -126,8 +132,8 @@ Content-Length: 26
 - 新建的物理 TCP 连接使用切换后的当前叶节点；既有 TCP 连接保持原路径；
 - 新建的 UDP association/物理 transport 使用切换后的当前叶节点；既有 association 不迁移；
 - 新建的 DNS transport 使用切换后的当前叶节点；DNS cache、singleflight 状态和已在池中的 TCP transport 不清空、不迁移；
-- 切换不主动断开连接、不刷新缓存、不重启运行时，也不修改 YAML 或下一次 session 的默认值；
-- 选中节点、`DIRECT` 或 `REJECT` 时按原样执行；选中嵌套组时继续解析其当前成员。失败按原样返回，不自动选择其他成员。
+- 切换不主动断开连接、不刷新缓存、不重启运行时，也不修改 YAML；可按 profile 配置保存选择；
+- 选中节点、`DIRECT` 或 `REJECT` 时按原样执行；选中嵌套组时继续解析其当前成员。select 的失败按原样返回；自动组根据探测结果选择后续连接的成员。
 
 `dialer-proxy` 与规则、DNS 共享同一组选择，但经共享连接器直接建链，不重新执行业务规则。上游组的 `DIRECT` 连接当前节点按需解析的服务器，`REJECT` 使建链失败。单次建链对同一组只读取一次选择，SOCKS5 UDP 的控制连接和 relay 路径共享该快照；不同组之间不提供原子快照。已经读取旧选择的在途握手继续原路径。复用旧 AnyTLS 会话的新业务流也保留原路径，只有真正新建底层 transport 才读取新选择。
 
@@ -164,7 +170,7 @@ Hysteria2 已认证 QUIC 会话也保留其 `dialer-proxy` 上游组快照，包
 | `413 Payload Too Large` | PUT 正文超过 1 KiB |
 | `415 Unsupported Media Type` | PUT 不是严格 `application/json` |
 
-当前不提供 health check、自动 failover、`url-test`/`fallback`/`load-balance`、delay 测试、连接管理、配置修改、WebSocket 推送、Controller 版本协商或完整 Dashboard response。除本文列出的 provider 路由、`GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}` 外，其他路径和方法均不属于公共协议。
+当前不提供 `load-balance`、Controller 主动 delay 测试、连接管理、配置修改、WebSocket 推送、Controller 版本协商或完整 Dashboard response。除本文列出的 provider 路由、`GET /proxies`、`GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}` 外，其他路径和方法均不属于公共协议。
 
 Windows WinRT VPN 的完整运行时和 Controller 位于独立 Session Host；桌面 Wintun 的
 Controller 位于普通业务运行时。宿主通过回环 HTTP 直接访问实际 Running Session；

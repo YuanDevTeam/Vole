@@ -16,6 +16,9 @@ use crate::{
     session::Destination,
 };
 
+mod selection;
+pub(crate) use selection::GroupSelection;
+
 mod dispatcher;
 mod proxy_group;
 

@@ -231,6 +231,22 @@ async fn handle_connection(
         .as_ref()
         .map_or(proxy_groups, |resources| resources.groups());
 
+    if request.target == "/proxies" {
+        if request.method != "GET" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
+        }
+        let mut health = resources.as_ref().map_or_else(
+            || serde_json::json!({"proxies":{}}),
+            |resources| resources.health(),
+        );
+        for state in proxy_groups.list_states() {
+            let name = state.name.clone();
+            health["proxies"][name] =
+                serde_json::to_value(GroupResponse::from(state)).expect("group status");
+        }
+        return write_json(&mut stream, 200, &health, &[]).await;
+    }
+
     if request.target == "/group" {
         if request.method != "GET" {
             return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
@@ -268,7 +284,16 @@ async fn handle_connection(
         return match request.method.as_str() {
             "GET" => match proxy_groups.state(&name) {
                 Ok(state) => write_json(&mut stream, 200, &GroupResponse::from(state), &[]).await,
-                Err(_) => write_error(&mut stream, 404, "Resource not found", &[]).await,
+                Err(_) => {
+                    let health = resources.as_ref().map(|resources| resources.health());
+                    match health
+                        .as_ref()
+                        .and_then(|state| state["proxies"].get(&name))
+                    {
+                        Some(node) => write_json(&mut stream, 200, node, &[]).await,
+                        None => write_error(&mut stream, 404, "Resource not found", &[]).await,
+                    }
+                }
             },
             "PUT" => {
                 handle_select(
@@ -492,7 +517,7 @@ impl From<ProxyGroupState> for GroupResponse {
     fn from(state: ProxyGroupState) -> Self {
         Self {
             name: state.name,
-            kind: "Selector",
+            kind: state.kind.controller_type(),
             all: state.all,
             now: state.now,
             hidden: state.hidden,
@@ -599,6 +624,10 @@ mod tests {
         let dispatcher: Arc<dyn Dispatcher> = Arc::new(UnusedDispatcher);
         ProxyGroups::new(
             &[SelectProxyGroupConfig {
+                kind: crate::config::GroupKind::Select,
+                health: crate::config::HealthCheckConfig::default(),
+                tolerance: 0,
+                max_failed_times: 5,
                 disable_udp: false,
                 hidden: false,
                 icon: String::new(),

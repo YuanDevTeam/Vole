@@ -1,0 +1,77 @@
+//! Selection and probe activity shared by route and upstream groups.
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+};
+use std::time::Duration;
+use tokio::time::Instant;
+#[derive(Debug)]
+pub(crate) struct GroupSelection {
+    index: AtomicUsize,
+    forced: Mutex<Option<usize>>,
+    touched: Mutex<Instant>,
+    failures: Mutex<(Instant, u32)>,
+    urgent: AtomicBool,
+    maximum: AtomicU32,
+    window_ms: AtomicU64,
+}
+impl GroupSelection {
+    pub fn new(index: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            index: AtomicUsize::new(index),
+            forced: Mutex::new(None),
+            touched: Mutex::new(now),
+            failures: Mutex::new((now, 0)),
+            urgent: AtomicBool::new(false),
+            maximum: AtomicU32::new(5),
+            window_ms: AtomicU64::new(5000),
+        }
+    }
+    pub fn load(&self, order: Ordering) -> usize {
+        self.index.load(order)
+    }
+    pub fn store(&self, index: usize, order: Ordering) {
+        self.index.store(index, order);
+    }
+    pub fn touch(&self) {
+        *self.touched.lock().unwrap() = Instant::now();
+    }
+    pub fn active(&self, interval: Duration) -> bool {
+        self.touched.lock().unwrap().elapsed() < interval
+    }
+    pub fn configure(&self, maximum: u32, window: u64) {
+        self.maximum.store(maximum, Ordering::Relaxed);
+        self.window_ms.store(window, Ordering::Relaxed);
+    }
+    pub fn force(&self, index: usize) {
+        *self.forced.lock().unwrap() = Some(index);
+        self.store(index, Ordering::Release);
+    }
+    pub fn forced(&self) -> Option<usize> {
+        *self.forced.lock().unwrap()
+    }
+    pub fn clear_forced(&self) {
+        *self.forced.lock().unwrap() = None;
+    }
+    pub fn take_urgent(&self) -> bool {
+        self.urgent.swap(false, Ordering::Relaxed)
+    }
+    pub fn outcome(&self, success: bool) {
+        let mut failures = self.failures.lock().unwrap();
+        if success {
+            failures.1 = 0;
+            return;
+        }
+        if failures.0.elapsed() > Duration::from_millis(self.window_ms.load(Ordering::Relaxed))
+            || failures.1 == 0
+        {
+            *failures = (Instant::now(), 0);
+        }
+        failures.1 = failures.1.saturating_add(1);
+        if failures.1 >= self.maximum.load(Ordering::Relaxed) {
+            self.urgent.store(true, Ordering::Relaxed);
+            failures.1 = 0;
+        }
+    }
+}

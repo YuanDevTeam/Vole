@@ -645,7 +645,7 @@ mod tests {
         }
         let first = DuplexDialer::new(ServerMode::V2);
         let second = DuplexDialer::new(ServerMode::V2);
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(crate::routing::GroupSelection::new(0));
         let group = Arc::new(SelectUpstream::new(
             selection.clone(),
             vec![

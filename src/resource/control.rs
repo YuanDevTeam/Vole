@@ -14,6 +14,7 @@ pub(crate) struct DnsSnapshot {
 pub(crate) trait RuntimeResources: Send + Sync {
     fn groups(&self) -> Arc<ProxyGroups>;
     fn select(&self, group: &str, member: &str) -> Result<(), ProxyGroupError>;
+    fn health(&self) -> serde_json::Value;
     fn providers(&self, rules: bool) -> serde_json::Value;
     fn dns(&self) -> Option<DnsSnapshot>;
     async fn refresh(&self, rules: bool, name: &str) -> Result<(), &'static str>;
