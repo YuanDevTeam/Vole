@@ -117,6 +117,7 @@ impl ProviderSpec {
         Filter::new(&self.filter, &self.exclude_filter, &self.exclude_type)?;
         for key in self.overrides.keys() {
             if ![
+                "ip-version",
                 "udp",
                 "udp-over-tcp",
                 "up",

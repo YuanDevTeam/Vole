@@ -74,6 +74,7 @@ impl Fixture {
         let mut config = HttpServerConfig::proxy(
             0,
             ProxyAccess {
+                bind_address: None,
                 allow_lan: false,
                 ipv6: false,
             },
@@ -187,6 +188,7 @@ async fn local_no_auth_and_shared_auth_work_on_both_loopback_families() {
             *config = HttpServerConfig::proxy(
                 0,
                 ProxyAccess {
+                    bind_address: None,
                     allow_lan: shared,
                     ipv6: true,
                 },
@@ -341,6 +343,7 @@ async fn keep_alive_requests_reenter_the_real_rule_dispatcher() {
     let config = HttpServerConfig::proxy(
         0,
         ProxyAccess {
+            bind_address: None,
             allow_lan: false,
             ipv6: false,
         },

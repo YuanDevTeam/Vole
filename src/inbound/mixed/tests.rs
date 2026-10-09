@@ -39,6 +39,7 @@ impl Dispatcher for Peers {
 
 fn connection(peers: Arc<Peers>, auth: Option<ProxyCredentials>) -> MixedConnection {
     let access = ProxyAccess {
+        bind_address: None,
         allow_lan: true,
         ipv6: false,
     };
@@ -53,6 +54,7 @@ fn connection(peers: Arc<Peers>, auth: Option<ProxyCredentials>) -> MixedConnect
         peers.clone(),
     );
     MixedConnection {
+        access_rules: Default::default(),
         peer: "192.0.2.1:20000".parse().unwrap(),
         relay: "192.0.2.2:1080".parse().unwrap(),
         udp: None,
@@ -250,5 +252,73 @@ async fn memory_mixed_eof_and_cancellation_release_pending_protocol_reads() {
             }
         }
         assert!(peers.sessions.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn memory_mixed_acl_multiple_users_and_auth_bypass() {
+    for (skip, denied) in [(false, false), (true, false), (true, true)] {
+        let yaml = format!(
+            r#"mixed-port: 1080
+allow-lan: true
+bind-address: 192.0.2.2
+authentication: [first:old, second:pass, first:new]
+lan-allowed-ips: [192.0.2.0/24]
+lan-disallowed-ips: [{}]
+skip-auth-prefixes: [{}]
+"#,
+            if denied {
+                "192.0.2.1/32"
+            } else {
+                "192.0.2.9/32"
+            },
+            if skip {
+                "192.0.2.0/24"
+            } else {
+                "198.51.100.0/24"
+            }
+        );
+        let config = crate::config::Config::parse_yaml(yaml.as_bytes()).unwrap();
+        let crate::config::InboundConfig::Mixed(mixed) = &config.inbounds[0] else {
+            panic!()
+        };
+        assert_eq!(
+            mixed.access.bind_address,
+            Some("192.0.2.2".parse().unwrap())
+        );
+        assert!(mixed.auth.as_ref().unwrap().matches(b"first", b"new"));
+        assert!(!mixed.auth.as_ref().unwrap().matches(b"first", b"old"));
+        let peers = Arc::new(Peers::default());
+        let (upstream, mut remote) = tokio::io::duplex(1024);
+        peers.streams.lock().unwrap().push_back(upstream);
+        let mut connection = connection(peers.clone(), mixed.auth.clone());
+        connection.access_rules = mixed.access_rules.clone();
+        let cancellation = connection.cancellation.clone();
+        let (mut client, inbound) = tokio::io::duplex(1024);
+        let request = format!(
+            "CONNECT 192.0.2.3:80 HTTP/1.1\r\nHost: 192.0.2.3:80\r\n{}\r\n",
+            if skip {
+                String::new()
+            } else {
+                format!(
+                    "Proxy-Authorization: {}\r\n",
+                    ProxyCredentials::new("second", "pass")
+                        .unwrap()
+                        .authorization_header_value()
+                )
+            }
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let task = tokio::spawn(connection.serve(inbound));
+        if denied {
+            assert!(task.await.unwrap().is_err());
+            assert!(peers.sessions.lock().unwrap().is_empty());
+        } else {
+            exact(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+            client.write_all(b"body").await.unwrap();
+            exact(&mut remote, b"body").await;
+            cancellation.cancel();
+            task.await.unwrap().unwrap();
+        }
     }
 }

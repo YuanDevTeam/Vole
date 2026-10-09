@@ -82,6 +82,7 @@ use crate::outbound::{VlessOutbound, VlessResourceLimits};
 #[cfg(feature = "outbound-anytls")]
 use crate::security::StandardTlsClient;
 #[cfg(any(
+    feature = "outbound-http",
     feature = "outbound-anytls",
     feature = "outbound-vless",
     feature = "outbound-trojan",
@@ -810,6 +811,7 @@ fn build_proxy_graph(
     let order = proxy_graph_order(proxies, groups)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     #[cfg(any(
+        feature = "outbound-http",
         feature = "outbound-anytls",
         feature = "outbound-vless",
         feature = "outbound-trojan",
@@ -820,6 +822,7 @@ fn build_proxy_graph(
     ))]
     let (security_client_count, standard_tls_count) = security_counts(proxies);
     #[cfg(any(
+        feature = "outbound-http",
         feature = "outbound-anytls",
         feature = "outbound-vless",
         feature = "outbound-trojan",
@@ -830,6 +833,7 @@ fn build_proxy_graph(
     ))]
     let security_context = (security_client_count != 0).then(SecurityContext::new);
     #[cfg(any(
+        feature = "outbound-http",
         feature = "outbound-anytls",
         feature = "outbound-vless",
         feature = "outbound-trojan",
@@ -894,14 +898,35 @@ fn build_proxy_graph(
             RouteTargetId::Proxy(id) => id.index(),
         };
         let proxy = &proxies[index];
+        let node_dialer = dialer.clone().with_ip_version(proxy.ip_version);
         let upstream = build_upstream_path(
             proxy.dialer_proxy,
             endpoints[index].upload.clone(),
             &nodes,
             &group_nodes,
-            &dialer,
+            &node_dialer,
         )?;
         let connector: Arc<dyn OutboundConnector> = match &proxy.protocol {
+            ProxyProtocol::Http(config) => {
+                #[cfg(feature = "outbound-http")]
+                {
+                    Arc::new(crate::outbound::http::HttpOutbound::with_shared_security(
+                        config,
+                        upstream,
+                        security_context.as_ref().expect("HTTP security context"),
+                        resumption_sessions,
+                        limits.tls_buffer_limit,
+                    )?)
+                }
+                #[cfg(not(feature = "outbound-http"))]
+                {
+                    let _ = (config, upstream);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "HTTP outbound support is disabled",
+                    ));
+                }
+            }
             ProxyProtocol::Tuic(config) => {
                 #[cfg(feature = "outbound-tuic")]
                 {
@@ -1017,7 +1042,7 @@ fn build_proxy_graph(
                                 endpoints[index].download.clone(),
                                 &nodes,
                                 &group_nodes,
-                                &dialer,
+                                &node_dialer,
                             )
                         })
                         .transpose()?;
@@ -1090,6 +1115,10 @@ fn build_proxy_graph(
             }
         };
 
+        let connector: Arc<dyn OutboundConnector> = Arc::new(crate::outbound::IpVersionConnector {
+            inner: connector,
+            version: proxy.ip_version,
+        });
         graph
             .lifecycle_order
             .push(BuiltRouteTarget::Proxy(connector.clone()));
@@ -1170,7 +1199,8 @@ async fn prepare_proxy_endpoints(
             let upload_port = proxy.port();
             let download = match &proxy.protocol {
                 ProxyProtocol::Vless(config) => config.download(),
-                ProxyProtocol::Socks5(_)
+                ProxyProtocol::Http(_)
+                | ProxyProtocol::Socks5(_)
                 | ProxyProtocol::Trojan(_)
                 | ProxyProtocol::Vmess(_)
                 | ProxyProtocol::AnyTls(_)
@@ -1236,6 +1266,7 @@ fn restrict_endpoint_addresses(
 }
 
 #[cfg(any(
+    feature = "outbound-http",
     feature = "outbound-anytls",
     feature = "outbound-vless",
     feature = "outbound-trojan",
@@ -1276,6 +1307,10 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
                 client_count + usize::from(config.shadow_tls.is_some()),
                 standard_count,
             ),
+            ProxyProtocol::Http(config) => (
+                client_count + 1,
+                standard_count + usize::from(config.tls.is_some()),
+            ),
             ProxyProtocol::Socks5(_) => (client_count, standard_count),
             ProxyProtocol::Tuic(_) => (client_count + 1, standard_count),
         },
@@ -1283,6 +1318,7 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
 }
 
 #[cfg(any(
+    feature = "outbound-http",
     feature = "outbound-anytls",
     feature = "outbound-vless",
     feature = "outbound-trojan",
@@ -1949,7 +1985,11 @@ rules:
     }
 
     #[test]
-    #[cfg(any(feature = "outbound-anytls", feature = "outbound-vless"))]
+    #[cfg(any(
+        feature = "outbound-http",
+        feature = "outbound-anytls",
+        feature = "outbound-vless"
+    ))]
     fn security_budget_counts_every_vless_transport_leg() {
         let yaml = config_with_download("        server: download.test\n        port: 8443");
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
@@ -2308,6 +2348,7 @@ rules:
     }
 
     #[cfg(all(
+        feature = "outbound-http",
         feature = "outbound-anytls",
         feature = "outbound-socks5",
         feature = "outbound-vless"
@@ -2334,6 +2375,7 @@ rules:
 
         fn socks5(tag: &str) -> ProxyConfig {
             ProxyConfig {
+                ip_version: crate::config::IpVersion::Dual,
                 tag: tag.to_owned(),
                 dialer_proxy: None,
                 udp: false,
@@ -2348,6 +2390,7 @@ rules:
 
         fn anytls(tag: &str) -> ProxyConfig {
             ProxyConfig {
+                ip_version: crate::config::IpVersion::Dual,
                 tag: tag.to_owned(),
                 dialer_proxy: None,
                 udp: true,

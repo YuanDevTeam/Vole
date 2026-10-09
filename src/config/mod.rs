@@ -1,4 +1,9 @@
 //! Strict parsing for the current Vole YAML configuration.
+mod http_proxy;
+mod ip_version;
+pub use http_proxy::HttpOutboundConfig;
+pub use ip_version::IpVersion;
+
 mod groups;
 pub(crate) use groups::status_ranges;
 pub use groups::{GroupKind, HealthCheckConfig, ProfileConfig};
@@ -30,7 +35,7 @@ pub use rules::DomainRegex;
 use rules::parse_rule;
 
 mod credentials;
-pub use credentials::{ProxyAccess, ProxyCredentials};
+pub use credentials::{ProxyAccess, ProxyAccessRules, ProxyCredentials};
 mod ech;
 pub use ech::StaticEchConfig;
 mod hysteria2;
@@ -473,6 +478,24 @@ pub struct IpCidr {
     pub prefix_len: u8,
 }
 
+impl IpCidr {
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.network, ip) {
+            (IpAddr::V4(a), IpAddr::V4(b)) => {
+                self.prefix_len == 0
+                    || u32::from(a) >> (32 - self.prefix_len)
+                        == u32::from(b) >> (32 - self.prefix_len)
+            }
+            (IpAddr::V6(a), IpAddr::V6(b)) => {
+                self.prefix_len == 0
+                    || u128::from(a) >> (128 - self.prefix_len)
+                        == u128::from(b) >> (128 - self.prefix_len)
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortRange {
     pub start: u16,
@@ -487,6 +510,7 @@ pub enum Network {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyConfig {
+    pub ip_version: IpVersion,
     pub tag: String,
     pub dialer_proxy: Option<RouteTargetId>,
     pub udp: bool,
@@ -495,6 +519,7 @@ pub struct ProxyConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyProtocol {
+    Http(HttpOutboundConfig),
     Tuic(TuicOutboundConfig),
     Hysteria2(Hysteria2OutboundConfig),
     Vmess(VmessOutboundConfig),
@@ -509,6 +534,7 @@ impl ProxyConfig {
     #[must_use]
     pub fn address(&self) -> &str {
         match &self.protocol {
+            ProxyProtocol::Http(config) => &config.address,
             ProxyProtocol::Tuic(config) => &config.address,
             ProxyProtocol::Hysteria2(config) => &config.address,
             ProxyProtocol::Vmess(config) => &config.address,
@@ -523,6 +549,7 @@ impl ProxyConfig {
     #[must_use]
     pub const fn port(&self) -> u16 {
         match &self.protocol {
+            ProxyProtocol::Http(config) => config.port,
             ProxyProtocol::Tuic(config) => config.port,
             ProxyProtocol::Hysteria2(config) => config.port,
             ProxyProtocol::Vmess(config) => config.port,
@@ -834,6 +861,7 @@ pub struct TunInboundConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixedInboundConfig {
+    pub access_rules: std::sync::Arc<ProxyAccessRules>,
     pub tag: String,
     pub port: u16,
     pub access: ProxyAccess,
@@ -871,6 +899,15 @@ impl std::fmt::Debug for HttpInboundConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVoleConfig {
+    #[serde(rename = "bind-address", default)]
+    bind_address: Option<String>,
+    #[serde(rename = "lan-allowed-ips", default)]
+    lan_allowed_ips: Option<Vec<String>>,
+    #[serde(rename = "lan-disallowed-ips", default)]
+    lan_disallowed_ips: Vec<String>,
+    #[serde(rename = "skip-auth-prefixes", default)]
+    skip_auth_prefixes: Vec<String>,
+
     #[serde(rename = "unified-delay", default)]
     unified_delay: bool,
     #[serde(default)]
@@ -1209,12 +1246,40 @@ where
     deserializer.deserialize_map(OrderedPoliciesVisitor)
 }
 
+#[derive(Debug)]
+struct RawOutbound {
+    ip_version: IpVersion,
+    protocol: RawProtocol,
+}
+impl<'de> Deserialize<'de> for RawOutbound {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let mut value = serde_yaml_ng::Value::deserialize(deserializer)?;
+        let ip_version = value
+            .as_mapping_mut()
+            .ok_or_else(|| serde::de::Error::custom("proxy requires a mapping"))?
+            .remove("ip-version")
+            .map(serde_yaml_ng::from_value)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_default();
+        let protocol = serde_yaml_ng::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            ip_version,
+            protocol,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 // This enum exists only while deserializing a configuration. Keeping the
 // protocol fields inline avoids extra heap allocations in the startup path.
 #[allow(clippy::large_enum_variant)]
-enum RawOutbound {
+enum RawProtocol {
+    #[serde(rename = "http")]
+    Http(http_proxy::RawHttp),
     #[serde(rename = "tuic")]
     Tuic(#[serde(deserialize_with = "tuic::deserialize")] tuic::RawTuic),
     #[serde(rename = "hysteria2")]
@@ -1578,6 +1643,7 @@ struct RawRealitySettings {
 
 #[derive(Debug)]
 struct PendingProxyConfig {
+    ip_version: IpVersion,
     tag: String,
     dialer_proxy: Option<String>,
     udp: bool,
@@ -1710,6 +1776,27 @@ impl RawVoleConfig {
         )?;
 
         let mixed_port = self.mixed_port.filter(|port| *port != 0);
+        let bind_address = match self.bind_address.as_deref() {
+            None | Some("" | "*") => None,
+            Some(value) => Some(value.trim_matches(['[', ']']).parse::<IpAddr>().map_err(
+                |_| VoleError::InvalidConfig("bind-address must be an IP address or *".into()),
+            )?),
+        };
+        let cidrs = |values: Vec<String>| {
+            values
+                .into_iter()
+                .map(|value| parse_ip_cidr(&value, value.contains(':')))
+                .collect::<Result<Vec<_>>>()
+        };
+        let access_rules = std::sync::Arc::new(ProxyAccessRules {
+            allowed: self
+                .lan_allowed_ips
+                .map(cidrs)
+                .transpose()?
+                .unwrap_or_else(|| ProxyAccessRules::default().allowed),
+            denied: cidrs(self.lan_disallowed_ips)?,
+            skip_auth: cidrs(self.skip_auth_prefixes)?,
+        });
         let authentication = normalize_proxy_authentication(self.authentication)?;
 
         let tun = self
@@ -1782,9 +1869,11 @@ impl RawVoleConfig {
         let mut inbounds = Vec::with_capacity(2);
         if let Some(port) = mixed_port {
             inbounds.push(InboundConfig::Mixed(MixedInboundConfig {
+                access_rules,
                 tag: "mixed-in".to_owned(),
                 port,
                 access: ProxyAccess {
+                    bind_address,
                     allow_lan: self.allow_lan,
                     ipv6: self.ipv6,
                 },
@@ -2082,17 +2171,17 @@ fn normalize_proxy_authentication(
     match authentication {
         None => Ok(None),
         Some(entries) if entries.is_empty() => Ok(None),
-        Some(entries) => {
-            let [credential] = entries.as_slice() else {
-                return invalid("authentication must contain exactly one user:password entry");
-            };
-            let (username, password) = credential.split_once(':').ok_or_else(|| {
-                VoleError::InvalidConfig("authentication entry must use user:password".to_owned())
-            })?;
-            ProxyCredentials::new(username, password)
-                .map(Some)
-                .map_err(|error| VoleError::InvalidConfig(error.to_string()))
-        }
+        Some(entries) => entries
+            .into_iter()
+            .map(|credential| {
+                let (username, password) = credential.split_once(':').ok_or_else(|| {
+                    VoleError::InvalidConfig("authentication entry must use user:password".into())
+                })?;
+                ProxyCredentials::new(username, password)
+                    .map_err(|error| VoleError::InvalidConfig(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|values| Some(ProxyCredentials::multiple(values))),
     }
 }
 
@@ -2152,6 +2241,7 @@ fn normalize_proxy_graph_with_groups(
         .into_iter()
         .zip(dialer_proxies)
         .map(|(proxy, dialer_proxy)| ProxyConfig {
+            ip_version: proxy.ip_version,
             tag: proxy.tag,
             dialer_proxy,
             udp: proxy.udp,
@@ -2328,12 +2418,13 @@ pub(crate) fn proxy_graph_order(
 
 impl RawOutbound {
     fn normalize(self) -> Result<PendingProxyConfig> {
-        let (tag, dialer_proxy, udp, protocol) = match self {
-            Self::Hysteria2(raw) => raw.normalize()?,
-            Self::Tuic(raw) => raw.normalize()?,
-            Self::Vmess(raw) => raw.normalize()?,
-            Self::Trojan(raw) => raw.normalize()?,
-            Self::Shadowsocks {
+        let (tag, dialer_proxy, udp, protocol) = match self.protocol {
+            RawProtocol::Http(raw) => raw.normalize()?,
+            RawProtocol::Hysteria2(raw) => raw.normalize()?,
+            RawProtocol::Tuic(raw) => raw.normalize()?,
+            RawProtocol::Vmess(raw) => raw.normalize()?,
+            RawProtocol::Trojan(raw) => raw.normalize()?,
+            RawProtocol::Shadowsocks {
                 name,
                 server,
                 port,
@@ -2361,8 +2452,8 @@ impl RawOutbound {
                 config.udp_over_tcp = udp_over_tcp;
                 (name, dialer_proxy, udp, ProxyProtocol::Shadowsocks(config))
             }
-            Self::Vless(raw) => raw.normalize()?,
-            Self::Socks5 {
+            RawProtocol::Vless(raw) => raw.normalize()?,
+            RawProtocol::Socks5 {
                 name,
                 server,
                 port,
@@ -2377,7 +2468,7 @@ impl RawOutbound {
                 udp,
                 ProxyProtocol::Socks5(normalize_socks5(server, port, tls, username, password)?),
             ),
-            Self::AnyTls {
+            RawProtocol::AnyTls {
                 name,
                 server,
                 port,
@@ -2409,6 +2500,7 @@ impl RawOutbound {
             validate_route_target_name(dialer_proxy, "dialer-proxy")?;
         }
         Ok(PendingProxyConfig {
+            ip_version: self.ip_version,
             tag,
             dialer_proxy,
             udp,
@@ -4293,10 +4385,6 @@ authentication:
 
         for (fields, expected) in [
             (
-                "mixed-port: 1080\nauthentication:\n  - one:secret\n  - two:secret",
-                "authentication must contain exactly one",
-            ),
-            (
                 "mixed-port: 1080\nauthentication:\n  - missing-separator",
                 "authentication entry must use user:password",
             ),
@@ -4424,6 +4512,7 @@ authentication:
         assert_eq!(
             mixed.access,
             ProxyAccess {
+                bind_address: None,
                 allow_lan: true,
                 ipv6: false
             }
@@ -4461,9 +4550,11 @@ authentication:
     #[test]
     fn mixed_inbound_debug_redacts_credentials() {
         let inbound = MixedInboundConfig {
+            access_rules: Default::default(),
             tag: "mixed-in".to_owned(),
             port: 1080,
             access: ProxyAccess {
+                bind_address: None,
                 allow_lan: false,
                 ipv6: true,
             },
@@ -4800,6 +4891,7 @@ rules:
             [
                 InboundConfig::Mixed(MixedInboundConfig {
                     access: ProxyAccess {
+                        bind_address: None,
                         allow_lan: false,
                         ipv6: true
                     },

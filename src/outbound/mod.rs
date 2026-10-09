@@ -1,6 +1,8 @@
 //! Composable proxy connectors and the built-in DIRECT dispatcher.
 
 pub mod address;
+#[cfg(feature = "outbound-http")]
+pub mod http;
 #[cfg(feature = "outbound-trojan")]
 pub mod trojan;
 #[cfg(feature = "outbound-vmess")]
@@ -30,7 +32,8 @@ pub use connector::{
     EstablishContext, OutboundConnector, SelectUpstream, UpstreamPath, server_destination,
 };
 pub(crate) use connector::{
-    MAX_OUTBOUND_DIAGNOSTIC_MESSAGE_BYTES, OutboundDiagnostic, capture_outbound_diagnostic,
+    IpVersionConnector, MAX_OUTBOUND_DIAGNOSTIC_MESSAGE_BYTES, OutboundDiagnostic,
+    capture_outbound_diagnostic,
 };
 pub use direct::DirectOutbound;
 #[cfg(feature = "outbound-socks5")]

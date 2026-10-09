@@ -35,6 +35,7 @@ pub mod resources;
 pub mod routing;
 #[cfg(all(
     any(
+        feature = "outbound-http",
         feature = "outbound-anytls",
         feature = "outbound-socks5",
         feature = "outbound-shadowsocks",
@@ -51,6 +52,7 @@ pub mod security;
 pub mod session;
 #[cfg(any(
     feature = "inbound-socks5",
+    feature = "outbound-http",
     feature = "outbound-anytls",
     feature = "outbound-shadowsocks",
     feature = "outbound-socks5",

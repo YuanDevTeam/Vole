@@ -62,6 +62,7 @@ impl HttpServerConfig {
         let mut config = Self::proxy(
             listen.port(),
             ProxyAccess {
+                bind_address: None,
                 allow_lan: false,
                 ipv6: false,
             },
@@ -114,6 +115,7 @@ impl HttpServer {
             bind_proxy_tcp(
                 config.listen.port(),
                 ProxyAccess {
+                    bind_address: None,
                     allow_lan: config.listen.ip().is_unspecified(),
                     ipv6: true,
                 },
@@ -880,6 +882,7 @@ mod tests {
             let config = HttpServerConfig::proxy(
                 0,
                 ProxyAccess {
+                    bind_address: None,
                     allow_lan: shared,
                     ipv6: false,
                 },

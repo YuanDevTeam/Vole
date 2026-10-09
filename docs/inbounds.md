@@ -1,6 +1,6 @@
 # HTTP 与 SOCKS5 混合入站
 
-HTTP 与 SOCKS5 共用一个混合入口，并和 TUN 共用 Dispatcher、规则、DNS、静态 select 组及出站图。
+HTTP 与 SOCKS5 共用一个混合入口，并和 TUN 共用 Dispatcher、规则、DNS、动态策略组及出站图。
 字段全集见[配置协议](config.yaml)，Controller 另见[接口](controller-api.md)。
 
 ## 监听与认证
@@ -15,9 +15,13 @@ HTTP 与 SOCKS5 共用一个混合入口，并和 TUN 共用 Dispatcher、规则
 - `allow-lan: false` 绑定 IPv4 回环，true 绑定通配地址。`ipv6: true` 增加独立
   IPv6-only 回环/通配 socket。仅系统明确不支持地址族时可省略 IPv6，其余绑定错误
   整体回滚。取得 Controller 和全部业务 socket 后才启动接收任务。
+- `bind-address` 默认为 `*`；`allow-lan: true` 时可指定单个 IPv4/IPv6 地址，false 仍绑定回环。
+  `lan-allowed-ips` 默认允许全部 IPv4/IPv6，`lan-disallowed-ips` 的拒绝规则优先。
+  两者作用于 TCP 来源；SOCKS5 UDP 必须属于已获准的 TCP 关联。
+  `skip-auth-prefixes` 只跳过匹配来源的认证，不跳过来源访问控制。
 - `allow-lan` 与 `authentication` 独立；通配绑定不强制认证。
   `authentication` 省略或空列表时，HTTP/SOCKS5 在任何绑定地址均免认证；
-  非空必须恰好一项 `user:password`，
+  非空接受多个 `user:password`，相同用户名以最后一项为准，
   按第一个冒号拆分，两项各 1–255 UTF-8 字节，不 trim。null 不视为省略。
   配置凭据后 HTTP/SOCKS5 均校验凭据；混合入口关闭时允许保留合法的共享和认证配置。
 - Basic / SOCKS 用户密码没有链路加密，只适合可信网络。Controller 仍独立回环监听，

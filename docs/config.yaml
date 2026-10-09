@@ -46,7 +46,7 @@ geo-update-interval: 24
 # 构建必须同时包含 inbound-http 和 inbound-socks5；缺少任一 feature 则拒绝启用入口。
 # allow-lan 默认 false，绑定回环；true 时绑定通配地址，与 authentication 独立。
 # ipv6: true 时同时绑定同端口 IPv6（v6-only）；false 时只监听 IPv4。
-# authentication 省略或 [] 表示任何绑定地址均免认证；非空时必须恰好包含一项 user:password，
+# authentication 省略或 [] 表示任何绑定地址均免认证；非空支持多个 user:password，
 # 按首个冒号分隔，用户名 / 密码各 1–255 UTF-8 字节，HTTP/SOCKS5 共用。
 # mixed-port 关闭时可以保留合法的 allow-lan 和 authentication，供之后启用入口使用。
 # HTTP 逐请求认证、选路，支持流式正文 / 分块、Keep-Alive、CONNECT 与 Upgrade。
@@ -54,6 +54,10 @@ geo-update-interval: 24
 # UDP 必须属于有效的 TCP 控制连接，源 IP/端口校验和资源上限见 inbounds.md#socks5。
 mixed-port: 1080
 allow-lan: false
+bind-address: "*" # allow-lan=true 时可指定单个 IP
+lan-allowed-ips: [0.0.0.0/0, "::/0"]
+lan-disallowed-ips: [] # 拒绝优先
+skip-auth-prefixes: [] # 仅跳过认证，仍执行来源访问控制
 authentication:
   - "probe-user:probe-password"
 
@@ -168,6 +172,11 @@ sniffer:
 #
 # 下方 vless-edge 通过 upstream-select 当前选择的 socks-hop 建链：
 # 客户端 -> socks-hop -> vless-edge -> 目标。
+# 所有节点支持 ip-version: dual/ipv4/ipv6/ipv4-prefer/ipv6-prefer；默认 dual。
+# HTTP(S) CONNECT 示例：type: http，必填 name/server/port，tls 默认 false。
+# username/password 均非空才认证；headers 为字符串映射；仅 TCP，不支持 udp: true。
+# tls: true 时支持 sni/skip-cert-verify/name-cert-verify/fingerprint，
+# 以及成对的内联 certificate/private-key。支持 dialer-proxy；详见 outbounds.md。
 proxies:
   # TUIC v5：固定 QUIC/TLS1.3；必填 UUID 和原样 password（可空，最多 65535 UTF-8 字节）。
   # 不接受 v4、token、0-RTT、client-fingerprint、mTLS、ECH 或其他 TLS 后端选项。

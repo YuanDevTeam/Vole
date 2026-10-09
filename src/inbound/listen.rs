@@ -31,6 +31,11 @@ pub(crate) fn bind_tcp(address: SocketAddr) -> io::Result<TcpListener> {
 }
 
 pub(crate) fn bind_proxy_tcp(port: u16, access: ProxyAccess) -> io::Result<Vec<TcpListener>> {
+    if access.allow_lan
+        && let Some(address) = access.bind_address
+    {
+        return Ok(vec![bind_tcp(SocketAddr::new(address, port))?]);
+    }
     let ipv4 = if access.allow_lan {
         Ipv4Addr::UNSPECIFIED
     } else {
@@ -109,7 +114,15 @@ mod tests {
     async fn policy_binds_loopback_or_wildcard_and_respects_ipv6() {
         for allow_lan in [false, true] {
             for ipv6 in [false, true] {
-                let listeners = bind_proxy_tcp(0, ProxyAccess { allow_lan, ipv6 }).unwrap();
+                let listeners = bind_proxy_tcp(
+                    0,
+                    ProxyAccess {
+                        bind_address: None,
+                        allow_lan,
+                        ipv6,
+                    },
+                )
+                .unwrap();
                 let port = listeners[0].local_addr().unwrap().port();
                 if !ipv6 {
                     assert_eq!(listeners.len(), 1);
@@ -138,6 +151,7 @@ mod tests {
         let error = bind_proxy_tcp(
             port,
             ProxyAccess {
+                bind_address: None,
                 allow_lan: false,
                 ipv6: true,
             },

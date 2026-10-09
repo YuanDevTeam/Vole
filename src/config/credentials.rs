@@ -1,12 +1,11 @@
-use std::io;
+use std::{io, net::IpAddr};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-/// One client-proxy credential shared by the HTTP and SOCKS5 frontends.
+/// Client-proxy credentials shared by the HTTP and SOCKS5 frontends.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProxyCredentials {
-    username: String,
-    password: String,
+    entries: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for ProxyCredentials {
@@ -35,33 +34,50 @@ impl ProxyCredentials {
                 "authentication user must not contain `:`",
             ));
         }
-        Ok(Self { username, password })
+        Ok(Self {
+            entries: vec![(username, password)],
+        })
     }
 
     #[must_use]
     pub fn matches(&self, username: &[u8], password: &[u8]) -> bool {
-        // Always compare both fixed-size credential slots; never expose the
-        // matching prefix or short-circuit after a successful username check.
-        let mut difference = username.len() ^ self.username.len();
-        difference |= password.len() ^ self.password.len();
-        for index in 0..255 {
-            difference |= usize::from(
-                username.get(index).copied().unwrap_or(0)
-                    ^ self.username.as_bytes().get(index).copied().unwrap_or(0),
-            );
-            difference |= usize::from(
-                password.get(index).copied().unwrap_or(0)
-                    ^ self.password.as_bytes().get(index).copied().unwrap_or(0),
-            );
+        let mut matched = false;
+        for (expected_user, expected_password) in &self.entries {
+            let mut difference = username.len() ^ expected_user.len();
+            difference |= password.len() ^ expected_password.len();
+            for index in 0..255 {
+                difference |= usize::from(
+                    username.get(index).copied().unwrap_or(0)
+                        ^ expected_user.as_bytes().get(index).copied().unwrap_or(0),
+                );
+                difference |= usize::from(
+                    password.get(index).copied().unwrap_or(0)
+                        ^ expected_password
+                            .as_bytes()
+                            .get(index)
+                            .copied()
+                            .unwrap_or(0),
+                );
+            }
+            matched |= difference == 0;
         }
-        difference == 0
+        matched
+    }
+    pub(crate) fn multiple(values: Vec<Self>) -> Self {
+        let mut entries = std::collections::BTreeMap::new();
+        for (username, password) in values.into_iter().flat_map(|value| value.entries) {
+            entries.insert(username, password);
+        }
+        Self {
+            entries: entries.into_iter().collect(),
+        }
     }
 
     #[must_use]
     pub fn authorization_header_value(&self) -> String {
         format!(
             "Basic {}",
-            STANDARD.encode(format!("{}:{}", self.username, self.password))
+            STANDARD.encode(format!("{}:{}", self.entries[0].0, self.entries[0].1))
         )
     }
 
@@ -93,6 +109,41 @@ impl ProxyCredentials {
 /// A fixed client-oriented listener policy, not an arbitrary address list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProxyAccess {
+    pub bind_address: Option<IpAddr>,
     pub allow_lan: bool,
     pub ipv6: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyAccessRules {
+    pub allowed: Vec<super::IpCidr>,
+    pub denied: Vec<super::IpCidr>,
+    pub skip_auth: Vec<super::IpCidr>,
+}
+impl Default for ProxyAccessRules {
+    fn default() -> Self {
+        Self {
+            allowed: vec![
+                super::IpCidr {
+                    network: "0.0.0.0".parse().unwrap(),
+                    prefix_len: 0,
+                },
+                super::IpCidr {
+                    network: "::".parse().unwrap(),
+                    prefix_len: 0,
+                },
+            ],
+            denied: Vec::new(),
+            skip_auth: Vec::new(),
+        }
+    }
+}
+impl ProxyAccessRules {
+    pub fn permits(&self, address: IpAddr) -> bool {
+        self.allowed.iter().any(|cidr| cidr.contains(address))
+            && !self.denied.iter().any(|cidr| cidr.contains(address))
+    }
+    pub fn skips_auth(&self, address: IpAddr) -> bool {
+        self.skip_auth.iter().any(|cidr| cidr.contains(address))
+    }
 }

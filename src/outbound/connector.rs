@@ -608,6 +608,8 @@ impl UpstreamPath {
             ResolvedUpstream::LazyDirect(dialer) => {
                 let endpoint = context
                     .resolution
+                    .clone()
+                    .with_ip_version(dialer.ip_version())
                     .resolve_proxy(server, context.deadline)
                     .await?;
                 let stream = context
@@ -655,17 +657,19 @@ impl UpstreamPath {
         context: &EstablishContext,
     ) -> Result<Destination, DispatchError> {
         match self.resolve(context)? {
-            ResolvedUpstream::Direct(endpoint, _) => {
+            ResolvedUpstream::Direct(endpoint, dialer) => {
                 validate_prepared_endpoint(server, endpoint)?;
-                endpoint
-                    .addresses
+                dialer
+                    .ordered_addresses(&endpoint.addresses)
                     .first()
                     .copied()
                     .map(Destination::Ip)
                     .ok_or(DispatchError::HostUnreachable)
             }
-            ResolvedUpstream::LazyDirect(_) => context
+            ResolvedUpstream::LazyDirect(dialer) => context
                 .resolution
+                .clone()
+                .with_ip_version(dialer.ip_version())
                 .resolve_proxy(server, context.deadline)
                 .await?
                 .addresses
@@ -675,6 +679,38 @@ impl UpstreamPath {
                 .ok_or(DispatchError::HostUnreachable),
             ResolvedUpstream::Proxy(_) => Ok(server.clone()),
         }
+    }
+}
+
+pub(crate) struct IpVersionConnector {
+    pub inner: Arc<dyn OutboundConnector>,
+    pub version: crate::config::IpVersion,
+}
+#[async_trait]
+impl OutboundConnector for IpVersionConnector {
+    async fn connect_stream(
+        &self,
+        session: StreamSession,
+        context: &EstablishContext,
+    ) -> Result<ConnectedStream, DispatchError> {
+        let mut context = context.clone();
+        context.resolution = context.resolution.with_ip_version(self.version);
+        self.inner.connect_stream(session, &context).await
+    }
+    async fn open_datagram(
+        &self,
+        request: DatagramRequest,
+        context: &EstablishContext,
+    ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        let mut context = context.clone();
+        context.resolution = context.resolution.with_ip_version(self.version);
+        self.inner.open_datagram(request, &context).await
+    }
+    fn begin_shutdown(&self) {
+        self.inner.begin_shutdown();
+    }
+    async fn shutdown(&self) {
+        self.inner.shutdown().await;
     }
 }
 

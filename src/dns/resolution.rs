@@ -30,6 +30,7 @@ struct State {
 /// Default contexts permit literal IPs but have no domain resolver.
 #[derive(Clone, Default)]
 pub struct ResolutionContext {
+    ip_version: crate::config::IpVersion,
     inner: Option<Arc<State>>,
 }
 
@@ -56,8 +57,14 @@ pub(crate) fn inherited_deadline(deadline: Instant) -> Instant {
 }
 
 impl ResolutionContext {
+    pub(crate) fn with_ip_version(mut self, version: crate::config::IpVersion) -> Self {
+        self.ip_version = version;
+        self
+    }
+
     pub fn runtime(ipv6: bool) -> Self {
         Self {
+            ip_version: crate::config::IpVersion::Dual,
             inner: Some(Arc::new(State {
                 source: OnceLock::new(),
                 ipv6,
@@ -143,7 +150,8 @@ impl ResolutionContext {
             return Err(DispatchError::NotAllowed);
         }
         if let Destination::Ip(address) = target {
-            if address.port() == 0
+            if !self.ip_version.permits(address.ip())
+                || address.port() == 0
                 || (address.is_ipv6() && self.inner.as_ref().is_some_and(|inner| !inner.ipv6))
             {
                 return Err(DispatchError::HostUnreachable);
@@ -206,10 +214,11 @@ impl ResolutionContext {
                     resolved.addresses
                 }
             };
-            let addresses: Vec<_> = addresses
+            let mut addresses: Vec<_> = addresses
                 .into_iter()
                 .filter(|address| inner.ipv6 || address.is_ipv4())
                 .collect();
+            self.ip_version.order(&mut addresses);
             if addresses.is_empty() {
                 Err(DispatchError::HostUnreachable)
             } else {

@@ -23,6 +23,7 @@ use super::{
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct MixedServer {
+    access_rules: Arc<crate::config::ProxyAccessRules>,
     listeners: Vec<TcpListener>,
     sockets: Vec<Arc<UdpSocket>>,
     http: HttpServerConfig,
@@ -50,6 +51,7 @@ impl MixedServer {
             dispatcher.clone(),
         );
         Ok(Self {
+            access_rules: config.access_rules,
             listeners,
             sockets,
             http,
@@ -106,6 +108,7 @@ impl MixedServer {
                         Err(error) => break Err(error),
                     };
                     let connection = MixedConnection {
+                        access_rules:self.access_rules.clone(),
                         peer,
                         relay,
                         udp: Some(self.sockets[index].clone()),
@@ -129,6 +132,7 @@ impl MixedServer {
 }
 
 struct MixedConnection {
+    access_rules: Arc<crate::config::ProxyAccessRules>,
     peer: SocketAddr,
     relay: SocketAddr,
     udp: Option<Arc<UdpSocket>>,
@@ -152,10 +156,17 @@ impl MixedConnection {
         }
     }
 
-    async fn serve_inner<S>(self, stream: S) -> io::Result<()>
+    async fn serve_inner<S>(mut self, stream: S) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        if !self.access_rules.permits(self.peer.ip()) {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        if self.access_rules.skips_auth(self.peer.ip()) {
+            self.http.auth = None;
+            self.socks = self.socks.without_auth();
+        }
         // Keep the probed byte in the reader. Both real protocol handlers
         // consume this same reader, so fragmented and pipelined bytes survive.
         let mut stream = BufReader::with_capacity(1, stream);

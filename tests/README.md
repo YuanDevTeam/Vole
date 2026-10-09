@@ -14,6 +14,7 @@ cargo test --locked --no-default-features --features cli --lib invoke::foregroun
 cargo test --locked --lib config::tests::
 cargo test --locked --lib geodata::tests::
 cargo test --locked --all-features --lib resource::http::tests::
+cargo test --locked --all-features --lib outbound::http::tests::
 cargo test --manifest-path crates/vole-netstack/Cargo.toml --all-targets
 uv run --project scripts --locked python -m unittest discover -s scripts/tests
 uv run --project scripts --locked ruff check scripts

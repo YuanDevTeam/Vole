@@ -32,6 +32,7 @@ required-features = ["ffi", "windows-uwp"]
 default = [
     "inbound-http",
     "inbound-socks5",
+    "outbound-http",
     "outbound-anytls",
     "outbound-socks5",
     "outbound-shadowsocks",
@@ -46,6 +47,7 @@ inbound-http = []
 inbound-socks5 = []
 outbound-anytls = ["dep:md-5", "tls-fingerprint"]
 outbound-socks5 = []
+outbound-http = []
 outbound-shadowsocks = ["dep:shadowsocks", "dep:log"]
 outbound-vless = ["tls-fingerprint", "boring/reality", "boring/jls", "boring/mlkem", "dep:blake3", "dep:hpke", "dep:zeroize", "dep:vole-blake3-raw", "stream-transport", "quic-transport", "dep:hyper", "dep:hyper-util", "dep:h3", "dep:h3-quinn", "dep:yamux", "tokio-util/compat"]
 outbound-trojan = ["stream-transport", "tls-fingerprint"]
@@ -71,6 +73,7 @@ tun = [
     "inbound-http",
     "inbound-socks5",
     "outbound-anytls",
+    "outbound-http",
     "outbound-socks5",
     "outbound-shadowsocks",
     "outbound-trojan",

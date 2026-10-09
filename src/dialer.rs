@@ -365,6 +365,7 @@ struct InterfaceBinding {
 
 #[derive(Clone)]
 pub struct Dialer {
+    ip_version: crate::config::IpVersion,
     initialization: Arc<SocketInitialization>,
     protector: Option<Arc<dyn SocketProtector>>,
     source_binding: Option<SourceBinding>,
@@ -392,6 +393,7 @@ impl std::fmt::Debug for Dialer {
 impl Default for Dialer {
     fn default() -> Self {
         Self {
+            ip_version: crate::config::IpVersion::Dual,
             initialization: Arc::new(SocketInitialization::default()),
             protector: None,
             source_binding: None,
@@ -404,6 +406,23 @@ impl Default for Dialer {
 }
 
 impl Dialer {
+    pub(crate) fn with_ip_version(mut self, version: crate::config::IpVersion) -> Self {
+        self.ip_version = version;
+        self
+    }
+    pub(crate) fn ip_version(&self) -> crate::config::IpVersion {
+        self.ip_version
+    }
+    pub(crate) fn ordered_addresses(&self, addresses: &[SocketAddr]) -> Vec<SocketAddr> {
+        let mut addresses = addresses
+            .iter()
+            .copied()
+            .filter(|address| self.ipv6 || address.is_ipv4())
+            .collect();
+        self.ip_version.order(&mut addresses);
+        addresses
+    }
+
     /// Start a new owner for a Running Session or private measurement. Policy
     /// is retained, but stopping one graph must not close another session.
     pub(crate) fn with_fresh_initialization(mut self) -> Self {
@@ -470,11 +489,8 @@ impl Dialer {
 
     pub async fn connect(&self, endpoint: &ResolvedEndpoint) -> io::Result<PhysicalStream> {
         let mut last_error = None;
-        for address in &endpoint.addresses {
-            if !self.ipv6 && address.is_ipv6() {
-                continue;
-            }
-            match self.connect_one(*address).await {
+        for address in self.ordered_addresses(&endpoint.addresses) {
+            match self.connect_one(address).await {
                 Ok(stream) => return Ok(stream),
                 Err(error) => last_error = Some(error),
             }
@@ -667,10 +683,10 @@ impl Dialer {
     }
 
     fn require_permitted(&self, address: SocketAddr) -> io::Result<()> {
-        if !self.ipv6 && address.is_ipv6() {
+        if (!self.ipv6 && address.is_ipv6()) || !self.ip_version.permits(address.ip()) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "IPv6 is disabled",
+                "address family is disabled",
             ));
         }
         Ok(())

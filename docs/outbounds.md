@@ -7,8 +7,11 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
 
 - 物理 TCP/UDP 只能由共享 Dialer 创建，保留 Android protect、Windows 物理绑定和受控解析。
   传输包装器只消费 IO，不另建 socket 或系统 resolver。
-- `dialer-proxy` 可引用节点或静态 select 组；与业务路由共享选择，完整 DAG 在配置期验证。
+- `dialer-proxy` 可引用节点或策略组；与业务路由共享选择，完整 DAG 在配置期验证。
   一次建链使用组快照和同一绝对期限；已有连接不随切组迁移，无自动 failover 或 DIRECT 回落。
+- 节点 `ip-version` 为 `dual`（默认）、`ipv4`、`ipv6`、`ipv4-prefer` 或 `ipv6-prefer`。
+  限制或排序该节点的物理服务器地址与本地解析结果，仍受全局 IPv6 开关约束。
+  不要求远端代理按相同地址族解析业务域名。
 - gRPC/legacy H2 首次读取延迟响应头时先检查原建链期限，即使响应已就绪也不能绕过
   超时；响应头已确认后的业务读取不再受该期限限制。
 - HTTP、SOCKS5、TUN、DNS 选路及 node-only `measureDelay` 使用同一连接器。
@@ -18,6 +21,14 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   字段及模板详见 [TLS 证书与指纹](tls-client-fingerprint.md)。
 - 未知字段、null、错型、非法枚举或不适用的传输选项在网络 IO 前拒绝。
   凭据、UUID、业务目标和完整请求不进入 Debug/错误；资源与 Stop 见[公共策略](runtime-resource-policy.md)。
+
+## HTTP / HTTPS CONNECT
+
+`type: http` 提供 TCP CONNECT；`tls: true` 在代理链路使用共享 TLS 与证书策略。
+支持 `username/password`、`headers`、`sni`、`skip-cert-verify`、`name-cert-verify`、
+`fingerprint` 及成对的内联 `certificate/private-key`。用户名和密码均非空时发送 Basic 认证。
+HTTP CONNECT 不提供 UDP，`udp: true` 在校验时拒绝。握手沿用原期限，失败关闭，
+成功后保留响应头后的业务字节。启用此协议需要 `outbound-http` feature。
 
 ## SOCKS5
 

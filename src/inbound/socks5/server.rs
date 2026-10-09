@@ -135,6 +135,11 @@ pub(crate) struct Socks5Handler {
 pub(crate) const UDP_CLEANUP_INTERVAL: Duration = CLEANUP_INTERVAL;
 
 impl Socks5Handler {
+    pub(crate) fn without_auth(mut self) -> Self {
+        self.config.auth = None;
+        self
+    }
+
     pub(crate) fn new(config: Socks5InboundConfig, dispatcher: Arc<dyn Dispatcher>) -> Self {
         Self {
             config,
