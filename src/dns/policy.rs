@@ -66,14 +66,14 @@ struct DomainNode {
 /// A flat arena keeps construction and destruction independent of pattern
 /// depth; lookup depth is bounded by the validated DNS question.
 #[derive(Debug)]
-struct DomainIndex(Vec<DomainNode>);
+pub(super) struct DomainIndex(Vec<DomainNode>);
 
 impl DomainIndex {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self(vec![DomainNode::default()])
     }
 
-    fn insert(&mut self, pattern: &str, policy: usize) {
+    pub(super) fn insert(&mut self, pattern: &str, policy: usize) {
         let (domain, exact, suffix) = if let Some(domain) = pattern.strip_prefix("+.") {
             (domain, true, true)
         } else if let Some(domain) = pattern.strip_prefix('.') {
@@ -107,7 +107,7 @@ impl DomainIndex {
         }
     }
 
-    fn find(&self, current: usize, name: &str) -> Option<usize> {
+    pub(super) fn find(&self, current: usize, name: &str) -> Option<usize> {
         let node = &self.0[current];
         if name.is_empty() {
             return node.exact;

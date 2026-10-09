@@ -476,12 +476,15 @@ impl SelectUpstream {
 
 enum ResolvedUpstream<'a> {
     Direct(&'a ResolvedEndpoint, &'a Dialer),
+    LazyDirect(&'a Dialer),
     Proxy(&'a Arc<dyn OutboundConnector>),
 }
 
 /// The path used by one configured proxy to reach its own server.
 #[derive(Clone)]
 pub enum UpstreamPath {
+    /// Physical endpoint resolution belongs to the current runtime DNS role.
+    LazyDirect { dialer: Dialer },
     /// The physical first hop. Its endpoint was resolved during prepare.
     Direct {
         endpoint: ResolvedEndpoint,
@@ -507,6 +510,7 @@ impl std::fmt::Debug for UpstreamPath {
                 .field("endpoint", endpoint)
                 .field("dialer", dialer)
                 .finish(),
+            Self::LazyDirect { .. } => formatter.write_str("LazyDirectUpstream(..)"),
             Self::Proxy(_) => formatter.write_str("ProxyUpstream(..)"),
             Self::Group { .. } => formatter.write_str("GroupUpstream(..)"),
         }
@@ -527,13 +531,14 @@ impl UpstreamPath {
     pub(crate) fn is_direct(&self, context: &EstablishContext) -> Result<bool, DispatchError> {
         Ok(matches!(
             self.resolve(context)?,
-            ResolvedUpstream::Direct(..)
+            ResolvedUpstream::Direct(..) | ResolvedUpstream::LazyDirect(..)
         ))
     }
 
     fn resolve(&self, context: &EstablishContext) -> Result<ResolvedUpstream<'_>, DispatchError> {
         match self {
             Self::Direct { endpoint, dialer } => Ok(ResolvedUpstream::Direct(endpoint, dialer)),
+            Self::LazyDirect { dialer } => Ok(ResolvedUpstream::LazyDirect(dialer)),
             Self::Proxy(connector) => Ok(ResolvedUpstream::Proxy(connector)),
             Self::Group {
                 group,
@@ -544,9 +549,7 @@ impl UpstreamPath {
                 SelectUpstreamMember::Direct => endpoint
                     .as_ref()
                     .map(|endpoint| ResolvedUpstream::Direct(endpoint, dialer))
-                    .ok_or_else(|| {
-                        DispatchError::Other("DIRECT upstream has no prepared endpoint".to_owned())
-                    }),
+                    .map_or_else(|| Ok(ResolvedUpstream::LazyDirect(dialer)), Ok),
                 SelectUpstreamMember::Reject => Err(DispatchError::NotAllowed),
                 SelectUpstreamMember::Group(_) => {
                     unreachable!("upstream resolution returns a leaf")
@@ -575,6 +578,21 @@ impl UpstreamPath {
                     effective_peer,
                 })
             }
+            ResolvedUpstream::LazyDirect(dialer) => {
+                let endpoint = context
+                    .resolution
+                    .resolve_proxy(server, context.deadline)
+                    .await?;
+                let stream = context
+                    .run_io("physical proxy-server connect", dialer.connect(&endpoint))
+                    .await?;
+                let effective_peer =
+                    Destination::Ip(stream.peer_addr().map_err(DispatchError::from)?);
+                Ok(ConnectedStream {
+                    io: Box::new(stream),
+                    effective_peer,
+                })
+            }
             ResolvedUpstream::Proxy(connector) => connector.connect_stream(session, context).await,
         }
     }
@@ -585,7 +603,7 @@ impl UpstreamPath {
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         match self.resolve(context)? {
-            ResolvedUpstream::Direct(_, dialer) => {
+            ResolvedUpstream::Direct(_, dialer) | ResolvedUpstream::LazyDirect(dialer) => {
                 let direct = DirectOutbound::new(dialer.clone());
                 OutboundConnector::open_datagram(&direct, request, context).await
             }
@@ -593,7 +611,7 @@ impl UpstreamPath {
         }
     }
 
-    /// Pins a native UDP proxy server without performing DNS after prepare.
+    /// Pins a native UDP server using the node resolver when first needed.
     /// Resolving here and opening IO below share the context's group snapshot.
     #[cfg(any(
         feature = "outbound-shadowsocks",
@@ -601,7 +619,7 @@ impl UpstreamPath {
         feature = "outbound-hysteria2",
         feature = "outbound-tuic"
     ))]
-    pub(crate) fn datagram_server(
+    pub(crate) async fn datagram_server(
         &self,
         server: &Destination,
         context: &EstablishContext,
@@ -616,6 +634,15 @@ impl UpstreamPath {
                     .map(Destination::Ip)
                     .ok_or(DispatchError::HostUnreachable)
             }
+            ResolvedUpstream::LazyDirect(_) => context
+                .resolution
+                .resolve_proxy(server, context.deadline)
+                .await?
+                .addresses
+                .first()
+                .copied()
+                .map(Destination::Ip)
+                .ok_or(DispatchError::HostUnreachable),
             ResolvedUpstream::Proxy(_) => Ok(server.clone()),
         }
     }

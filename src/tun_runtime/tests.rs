@@ -2244,12 +2244,14 @@ fn test_runtime_dns(dispatcher: Arc<dyn Dispatcher>) -> Arc<RuntimeDns> {
         enable: true,
         ipv6: true,
         nameservers: vec![DnsNameserver {
+            path: None,
             transport: DnsTransport::Udp,
             address: Ipv4Addr::new(198, 51, 100, 53).into(),
             port: 53,
             route: DnsRoute::Direct,
         }],
         nameserver_policies: Vec::new(),
+        ..DnsConfig::default()
     };
     let proxies = ProxyDispatchers::new(vec![dispatcher.clone()]).unwrap();
     let rules = RuleSet::compile(vec![RuleSpec {

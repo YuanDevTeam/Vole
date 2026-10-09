@@ -1,5 +1,5 @@
 //! IP-only protocol boundaries use a runtime-owned resolver, never an implicit
-//! system lookup. Endpoint/ECH bootstrap remains a separate prepare operation.
+//! system lookup. Proxy servers use their separate runtime DNS role.
 
 use super::{canonicalize_name, runtime::RuntimeDns};
 use crate::{dialer::Resolver, dispatch::DispatchError, session::Destination};
@@ -42,7 +42,7 @@ impl std::fmt::Debug for ResolutionContext {
 #[derive(Clone)]
 struct ActiveResolution {
     deadline: Instant,
-    names: Vec<(usize, String)>,
+    names: Vec<(usize, bool, String)>,
 }
 
 tokio::task_local! {
@@ -102,6 +102,35 @@ impl ResolutionContext {
         target: &Destination,
         deadline: Instant,
     ) -> Result<SocketAddr, DispatchError> {
+        self.resolve_addresses(target, deadline, false)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(DispatchError::HostUnreachable)
+    }
+
+    pub async fn resolve_proxy(
+        &self,
+        target: &Destination,
+        deadline: Instant,
+    ) -> Result<crate::dialer::ResolvedEndpoint, DispatchError> {
+        let addresses = self.resolve_addresses(target, deadline, true).await?;
+        Ok(crate::dialer::ResolvedEndpoint {
+            logical_host: match target {
+                Destination::Domain { host, .. } => host.clone(),
+                Destination::Ip(address) => address.ip().to_string(),
+            },
+            port: target.port(),
+            addresses,
+        })
+    }
+
+    async fn resolve_addresses(
+        &self,
+        target: &Destination,
+        deadline: Instant,
+        proxy: bool,
+    ) -> Result<Vec<SocketAddr>, DispatchError> {
         let deadline = inherited_deadline(deadline);
         if deadline <= Instant::now() {
             return Err(DispatchError::TimedOut);
@@ -119,7 +148,7 @@ impl ResolutionContext {
             {
                 return Err(DispatchError::HostUnreachable);
             }
-            return Ok(*address);
+            return Ok(vec![*address]);
         }
         let Destination::Domain { host, port } = target else {
             unreachable!()
@@ -127,7 +156,7 @@ impl ResolutionContext {
         let host = canonicalize_name(host).map_err(|_| DispatchError::HostUnreachable)?;
         let inner = self.inner.as_ref().ok_or_else(unavailable)?;
         let source = inner.source.get().ok_or_else(unavailable)?;
-        let key = (Arc::as_ptr(inner) as usize, host.clone());
+        let key = (Arc::as_ptr(inner) as usize, proxy, host.clone());
         let mut active = ACTIVE.try_with(Clone::clone).unwrap_or(ActiveResolution {
             deadline,
             names: Vec::new(),
@@ -150,12 +179,15 @@ impl ResolutionContext {
                         .as_ref()
                         .and_then(Weak::upgrade)
                         .ok_or_else(unavailable)?;
-                    dns.resolve(&host)
-                        .await
-                        .map_err(|_| DispatchError::HostUnreachable)?
-                        .into_iter()
-                        .map(|ip| SocketAddr::new(ip, *port))
-                        .collect::<Vec<_>>()
+                    if proxy {
+                        dns.resolve_proxy(&host).await
+                    } else {
+                        dns.resolve(&host).await
+                    }
+                    .map_err(|_| DispatchError::HostUnreachable)?
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, *port))
+                    .collect::<Vec<_>>()
                 }
                 Source::Measurement(bootstrap) => {
                     let resolved = bootstrap
@@ -174,10 +206,15 @@ impl ResolutionContext {
                     resolved.addresses
                 }
             };
-            addresses
+            let addresses: Vec<_> = addresses
                 .into_iter()
-                .find(|address| inner.ipv6 || address.is_ipv4())
-                .ok_or(DispatchError::HostUnreachable)
+                .filter(|address| inner.ipv6 || address.is_ipv4())
+                .collect();
+            if addresses.is_empty() {
+                Err(DispatchError::HostUnreachable)
+            } else {
+                Ok(addresses)
+            }
         };
         tokio::select! {
             biased;

@@ -46,14 +46,6 @@ pub mod routing;
     any(feature = "invoke", test)
 ))]
 mod runtime;
-#[cfg(any(
-    feature = "outbound-anytls",
-    feature = "outbound-vless",
-    feature = "stream-transport",
-    feature = "outbound-hysteria2",
-    feature = "outbound-tuic",
-    feature = "shadow-tls-v3"
-))]
 pub mod security;
 pub mod session;
 #[cfg(any(

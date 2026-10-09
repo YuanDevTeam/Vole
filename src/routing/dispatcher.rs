@@ -37,6 +37,12 @@ const UDP_FLOW_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 
 #[async_trait]
 trait RoutingDns: Send + Sync {
+    fn is_enabled(&self) -> bool {
+        true
+    }
+    async fn resolve_direct(&self, host: &str) -> Result<Vec<IpAddr>, DispatchError> {
+        self.resolve(host).await
+    }
     async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, DispatchError>;
     async fn exchange(&self, query: &[u8]) -> Result<DnsWireResponse, DispatchError>;
     async fn domain_hint(&self, address: IpAddr) -> Option<String>;
@@ -44,6 +50,14 @@ trait RoutingDns: Send + Sync {
 
 #[async_trait]
 impl RoutingDns for RuntimeDns {
+    fn is_enabled(&self) -> bool {
+        RuntimeDns::is_enabled(self)
+    }
+    async fn resolve_direct(&self, host: &str) -> Result<Vec<IpAddr>, DispatchError> {
+        RuntimeDns::resolve_direct(self, host)
+            .await
+            .map_err(runtime_dns_error)
+    }
     async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, DispatchError> {
         RuntimeDns::resolve(self, host)
             .await
@@ -349,7 +363,13 @@ impl RoutingDispatcher {
             preferred_address(addresses)
         } else {
             let addresses = match &self.dns {
-                Some(dns) => self.resolve_addresses(dns, &host).await,
+                Some(dns) => dns
+                    .resolve_direct(&host)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|ip| self.ipv6 || ip.is_ipv4())
+                    .collect(),
                 None => Vec::new(),
             };
             let address = preferred_address(&addresses);
@@ -495,7 +515,7 @@ impl Dispatcher for RoutingDispatcher {
         self.ensure_destination_allowed(&session.destination)?;
         if session.inbound == InboundKind::Tun
             && matches!(&session.destination, Destination::Ip(address) if self.tun_config.hijacks_dns(*address))
-            && let Some(dns) = &self.dns
+            && let Some(dns) = self.dns.as_ref().filter(|dns| dns.is_enabled())
         {
             return Ok(self.dns_tcp_stream(dns.clone()));
         }

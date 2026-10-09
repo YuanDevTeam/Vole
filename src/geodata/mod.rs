@@ -431,6 +431,20 @@ pub struct GeoRequirements {
 }
 
 impl GeoRequirements {
+    pub(crate) fn for_config(config: &crate::config::Config) -> Result<Self, GeoDataError> {
+        let policies: Vec<_> = config
+            .dns
+            .nameserver_policies
+            .iter()
+            .chain(&config.dns.proxy_policies)
+            .map(|policy| DnsNameserverPolicy {
+                selector: policy.selector.clone(),
+                nameservers: Box::new([]),
+            })
+            .collect();
+        Self::collect(&config.rules, &policies)
+    }
+
     /// Collects all GeoSite and GeoIP selectors used by business rules and DNS
     /// nameserver policies. Each underlying category is decoded only once.
     pub fn collect(

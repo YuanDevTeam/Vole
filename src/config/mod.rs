@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::{Result, VoleError};
 
+mod dns;
 mod rules;
 mod yaml;
 pub use rules::DomainRegex;
@@ -54,7 +55,6 @@ pub const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RULES: usize = 65_536;
 pub const MAX_RULE_BYTES: usize = 16 * 1024;
 pub const MAX_RULES_TOTAL_BYTES: usize = MAX_CONFIG_BYTES;
-pub const MAX_DNS_NAMESERVERS: usize = 4;
 pub const MAX_SNIFFER_PORT_ITEMS: usize = 64;
 pub const MAX_GEOX_URL_BYTES: usize = 4_096;
 pub const MAX_CONTROLLER_SECRET_BYTES: usize = 255;
@@ -228,14 +228,77 @@ pub struct DnsConfig {
     pub ipv6: bool,
     pub nameservers: Vec<DnsNameserver>,
     pub nameserver_policies: Vec<DnsNameserverPolicy>,
+    pub default_nameservers: Vec<DnsNameserver>,
+    pub proxy_nameservers: Vec<DnsNameserver>,
+    pub proxy_policies: Vec<DnsNameserverPolicy>,
+    pub direct_nameservers: Vec<DnsNameserver>,
+    pub direct_follow_policy: bool,
+    pub use_hosts: bool,
+    pub use_system_hosts: bool,
+    pub hosts: Vec<HostEntry>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEntry {
+    pub pattern: String,
+    pub value: HostValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostValue {
+    Addresses(Vec<IpAddr>),
+    Alias(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DnsAddress {
+    Ip(IpAddr),
+    Domain(String),
+}
+
+impl std::str::FromStr for DnsAddress {
+    type Err = std::convert::Infallible;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(value
+            .parse()
+            .map(Self::Ip)
+            .unwrap_or_else(|_| Self::Domain(value.to_owned())))
+    }
+}
+
+impl From<IpAddr> for DnsAddress {
+    fn from(value: IpAddr) -> Self {
+        Self::Ip(value)
+    }
+}
+
+impl From<Ipv4Addr> for DnsAddress {
+    fn from(ip: Ipv4Addr) -> Self {
+        Self::Ip(ip.into())
+    }
+}
+impl From<Ipv6Addr> for DnsAddress {
+    fn from(ip: Ipv6Addr) -> Self {
+        Self::Ip(ip.into())
+    }
+}
+
+impl std::fmt::Display for DnsAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ip(ip) => ip.fmt(f),
+            Self::Domain(host) => host.fmt(f),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DnsNameserver {
     pub transport: DnsTransport,
-    pub address: IpAddr,
+    pub address: DnsAddress,
     pub port: u16,
     pub route: DnsRoute,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,13 +322,16 @@ impl DnsNameserverPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DnsTransport {
     Udp,
     Tcp,
+    Tls,
+    Https,
+    Http,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DnsRoute {
     Direct,
     Rules,
@@ -782,6 +848,8 @@ struct RawVoleConfig {
     mode: Mode,
     #[serde(rename = "log-level", default)]
     log_level: LogLevel,
+    #[serde(default)]
+    hosts: std::collections::BTreeMap<String, RawPolicyNameservers>,
     #[serde(default = "default_true")]
     ipv6: bool,
     #[serde(
@@ -976,17 +1044,40 @@ enum RawSnifferPort {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDnsConfig {
-    enable: bool,
-    #[serde(default = "default_true")]
-    ipv6: bool,
     #[serde(default)]
+    enable: bool,
+    #[serde(default)]
+    ipv6: bool,
+    #[serde(default = "dns::default_nameservers")]
     nameserver: Vec<String>,
+    #[serde(rename = "default-nameserver", default = "dns::default_bootstrap")]
+    default_nameserver: Vec<String>,
+    #[serde(rename = "proxy-server-nameserver", default)]
+    proxy_nameserver: Vec<String>,
+    #[serde(rename = "direct-nameserver", default)]
+    direct_nameserver: Vec<String>,
+    #[serde(rename = "direct-nameserver-follow-policy", default)]
+    direct_follow_policy: bool,
+    #[serde(rename = "use-hosts", default = "default_true")]
+    use_hosts: bool,
+    #[serde(rename = "use-system-hosts", default = "default_true")]
+    use_system_hosts: bool,
+    #[serde(rename = "respect-rules", default)]
+    respect_rules: bool,
+    #[serde(rename = "enhanced-mode", default = "dns::redir_host")]
+    enhanced_mode: String,
     #[serde(
         rename = "nameserver-policy",
         default,
         deserialize_with = "deserialize_dns_nameserver_policies"
     )]
     nameserver_policies: Vec<RawDnsNameserverPolicy>,
+    #[serde(
+        rename = "proxy-server-nameserver-policy",
+        default,
+        deserialize_with = "deserialize_dns_nameserver_policies"
+    )]
+    proxy_policies: Vec<RawDnsNameserverPolicy>,
 }
 
 #[derive(Debug)]
@@ -995,7 +1086,7 @@ struct RawDnsNameserverPolicy {
     nameservers: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawPolicyNameservers {
     One(String),
@@ -1594,6 +1685,7 @@ impl RawVoleConfig {
             .dns
             .map_or_else(DnsConfig::disabled, |dns| dns.normalize(&route_targets))?;
         dns.ipv6 &= self.ipv6;
+        dns.hosts = dns::normalize_hosts(self.hosts)?;
         let rules = normalize_rules(self.rules, &route_targets)?;
         drop(proxy_ids);
         drop(route_targets);
@@ -2714,59 +2806,6 @@ impl RawXHttpDownloadSettings {
     }
 }
 
-impl DnsConfig {
-    fn disabled() -> Result<Self> {
-        Ok(Self {
-            enable: false,
-            ipv6: true,
-            nameservers: Vec::new(),
-            nameserver_policies: Vec::new(),
-        })
-    }
-}
-
-impl RawDnsConfig {
-    fn normalize(self, route_targets: &RouteTargetsByName) -> Result<DnsConfig> {
-        if !self.enable {
-            if !self.nameserver.is_empty() || !self.nameserver_policies.is_empty() {
-                return invalid(
-                    "dns.nameserver and dns.nameserver-policy must be empty when dns.enable is false",
-                );
-            }
-            return Ok(DnsConfig {
-                enable: false,
-                ipv6: self.ipv6,
-                nameservers: Vec::new(),
-                nameserver_policies: Vec::new(),
-            });
-        }
-
-        if self.nameserver.is_empty() || self.nameserver.len() > MAX_DNS_NAMESERVERS {
-            return invalid(format!(
-                "dns.nameserver must contain between 1 and {MAX_DNS_NAMESERVERS} entries when enabled"
-            ));
-        }
-        let default_route = DnsRoute::Direct;
-        let nameservers = self
-            .nameserver
-            .iter()
-            .map(|nameserver| parse_dns_nameserver(nameserver, route_targets, default_route))
-            .collect::<Result<Vec<_>>>()?;
-        let nameserver_policies = normalize_dns_nameserver_policies(
-            self.nameserver_policies,
-            route_targets,
-            default_route,
-        )?;
-
-        Ok(DnsConfig {
-            enable: true,
-            ipv6: self.ipv6,
-            nameservers,
-            nameserver_policies,
-        })
-    }
-}
-
 fn normalize_dns_nameserver_policies(
     raw_policies: Vec<RawDnsNameserverPolicy>,
     route_targets: &RouteTargetsByName,
@@ -2776,9 +2815,9 @@ fn normalize_dns_nameserver_policies(
     for raw_policy in raw_policies {
         let selector = normalize_dns_policy_selector(&raw_policy.selector)?;
 
-        if raw_policy.nameservers.is_empty() || raw_policy.nameservers.len() > MAX_DNS_NAMESERVERS {
+        if raw_policy.nameservers.is_empty() {
             return invalid(format!(
-                "dns.nameserver-policy `{}` must contain between 1 and {MAX_DNS_NAMESERVERS} nameservers",
+                "dns.nameserver-policy `{}` must contain at least one nameserver",
                 raw_policy.selector
             ));
         }
@@ -2832,106 +2871,7 @@ fn normalize_dns_policy_selector(input: &str) -> Result<DnsPolicySelector> {
     Ok(DnsPolicySelector::Domains(domains.into_boxed_slice()))
 }
 
-fn parse_dns_nameserver(
-    input: &str,
-    route_targets: &RouteTargetsByName,
-    default_route: DnsRoute,
-) -> Result<DnsNameserver> {
-    let (endpoint, route) = match input.split_once('#') {
-        Some((endpoint, fragment)) => (
-            endpoint,
-            parse_dns_route_fragment(input, fragment, route_targets)?,
-        ),
-        None => (input, default_route),
-    };
-
-    if let Ok(address) = endpoint.parse::<IpAddr>() {
-        return Ok(DnsNameserver {
-            transport: DnsTransport::Udp,
-            address,
-            port: 53,
-            route,
-        });
-    }
-
-    let (transport, endpoint) = if let Some(endpoint) = endpoint.strip_prefix("udp://") {
-        (DnsTransport::Udp, endpoint)
-    } else if let Some(endpoint) = endpoint.strip_prefix("tcp://") {
-        (DnsTransport::Tcp, endpoint)
-    } else {
-        return invalid(format!(
-            "invalid DNS nameserver `{input}`; expected IP, udp://IP[:port], or tcp://IP[:port], optionally followed by a route fragment"
-        ));
-    };
-
-    let (address, port) = parse_dns_endpoint(endpoint).ok_or_else(|| {
-        VoleError::InvalidConfig(format!(
-            "invalid DNS nameserver `{input}`; hostnames and URL paths are not supported"
-        ))
-    })?;
-    validate_port(port, "DNS nameserver")?;
-    Ok(DnsNameserver {
-        transport,
-        address,
-        port,
-        route,
-    })
-}
-
-fn parse_dns_route_fragment(
-    input: &str,
-    fragment: &str,
-    route_targets: &RouteTargetsByName,
-) -> Result<DnsRoute> {
-    if fragment.is_empty() {
-        return invalid(format!(
-            "invalid DNS nameserver `{input}`; route fragment must not be empty"
-        ));
-    }
-    if fragment.contains(['=', '&']) {
-        return invalid(format!(
-            "invalid DNS nameserver `{input}`; route fragment parameters and multiple tokens are not supported"
-        ));
-    }
-    match fragment {
-        "DIRECT" => Ok(DnsRoute::Direct),
-        "RULES" => Ok(DnsRoute::Rules),
-        fragment => route_targets
-            .get(fragment)
-            .copied()
-            .map(DnsRoute::Route)
-            .ok_or_else(|| {
-                VoleError::InvalidConfig(format!(
-                    "invalid DNS nameserver `{input}`; route fragment must be exactly DIRECT, RULES, or a configured proxy or proxy group name"
-                ))
-            }),
-    }
-}
-
-fn parse_dns_endpoint(endpoint: &str) -> Option<(IpAddr, u16)> {
-    if endpoint.is_empty()
-        || endpoint.contains(['/', '?', '#', '@'])
-        || endpoint.as_bytes().contains(&b'%')
-    {
-        return None;
-    }
-    if let Ok(address) = endpoint.parse::<IpAddr>() {
-        return Some((address, 53));
-    }
-    if endpoint.starts_with('[') {
-        let close = endpoint.find(']')?;
-        let address = endpoint.get(1..close)?.parse::<Ipv6Addr>().ok()?;
-        let suffix = endpoint.get(close + 1..)?;
-        let port = if suffix.is_empty() {
-            53
-        } else {
-            suffix.strip_prefix(':')?.parse::<u16>().ok()?
-        };
-        return Some((IpAddr::V6(address), port));
-    }
-    let endpoint = endpoint.parse::<SocketAddr>().ok()?;
-    Some((endpoint.ip(), endpoint.port()))
-}
+use dns::parse_dns_nameserver;
 
 fn normalize_rules(
     rules: Vec<String>,
@@ -4802,24 +4742,28 @@ rules:
             config.dns.nameservers,
             [
                 DnsNameserver {
+                    path: None,
                     transport: DnsTransport::Udp,
                     address: "1.1.1.1".parse().unwrap(),
                     port: 53,
                     route: DnsRoute::Direct,
                 },
                 DnsNameserver {
+                    path: None,
                     transport: DnsTransport::Udp,
                     address: "2001:db8::1".parse().unwrap(),
                     port: 5353,
                     route: DnsRoute::Direct,
                 },
                 DnsNameserver {
+                    path: None,
                     transport: DnsTransport::Tcp,
                     address: "8.8.8.8".parse().unwrap(),
                     port: 53,
                     route: DnsRoute::Direct,
                 },
                 DnsNameserver {
+                    path: None,
                     transport: DnsTransport::Tcp,
                     address: "::1".parse().unwrap(),
                     port: 53,
@@ -5686,49 +5630,26 @@ authentication:
     }
 
     #[test]
-    fn current_config_validates_dns_schema_and_fixed_ip_nameservers() {
-        let valid = current_yaml(
-            r#"mixed-port: 1080
-authentication:
-  - measure:secret
-dns:
-  enable: true
-  nameserver: [udp://1.1.1.1:53]"#,
+    fn current_config_validates_dns_upstreams_and_roles() {
+        let config = Config::parse_yaml(b"mixed-port: 1080\ndns: {enable: true}\n").unwrap();
+        assert!(!config.dns.ipv6);
+        assert_eq!(config.dns.nameservers[0].transport, DnsTransport::Https);
+        assert_eq!(
+            config.dns.nameservers[1].address,
+            DnsAddress::Ip("223.5.5.5".parse().unwrap())
         );
-        let config = Config::parse_yaml(valid.as_bytes()).unwrap();
-        let dns = &config.dns;
-        assert!(dns.ipv6);
-        assert_eq!(dns.nameservers[0].route, DnsRoute::Direct);
-
-        for fields in [
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  nameserver: []",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  nameserver: []",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: false\n  nameserver: [1.1.1.1]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  nameserver: [udp://dns.example:53]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  nameserver: [https://1.1.1.1/dns-query]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  nameserver: [tcp://1.1.1.1:0]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  nameserver: [1.1.1.1, 8.8.8.8, 9.9.9.9, 4.4.4.4, 208.67.222.222]",
+        for dns in [
+            "{enable: true, nameserver: []}",
+            "{default-nameserver: [dns.example]}",
+            "{nameserver: ['tls://1.1.1.1:0']}",
+            "{respect-rules: true}",
         ] {
-            let yaml = current_yaml(fields);
-            assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");
+            assert!(
+                Config::parse_yaml(format!("mixed-port: 1080\ndns: {dns}\n").as_bytes()).is_err()
+            );
         }
+        let config = Config::parse_yaml(b"mixed-port: 1080\ndns: {enable: false, nameserver: ['udp://dns.example', 'https://dns.example/query'], enhanced-mode: redir-host}\n").unwrap();
+        assert!(!config.dns.enable);
     }
 
     #[test]
@@ -5850,6 +5771,7 @@ dns:
         assert_eq!(
             dns.nameserver_policies[0].nameservers.as_ref(),
             [DnsNameserver {
+                path: None,
                 transport: DnsTransport::Tcp,
                 address: "223.5.5.5".parse().unwrap(),
                 port: 53,
@@ -5920,8 +5842,6 @@ rules:
             r#"    "geosite:cn,": ["tcp://223.5.5.5"]"#,
             r#"    "geosite:cn, apple": ["tcp://223.5.5.5"]"#,
             r#"    "geosite:cn": []"#,
-            r#"    "geosite:cn": [1.1.1.1, 8.8.8.8, 9.9.9.9, 4.4.4.4, 223.5.5.5]"#,
-            r#"    "geosite:cn": ["tcp://dns.example"]"#,
         ] {
             let yaml = current_yaml(&format!(
                 "mixed-port: 1080
@@ -5997,7 +5917,7 @@ dns:
   nameserver-policy:
     "geosite:cn": ["tcp://223.5.5.5"]"#,
         );
-        assert!(Config::parse_yaml(disabled.as_bytes()).is_err());
+        assert!(Config::parse_yaml(disabled.as_bytes()).is_ok());
 
         let missing_main = current_yaml(
             r#"mixed-port: 1080
@@ -6008,7 +5928,7 @@ dns:
   nameserver-policy:
     "geosite:cn": ["tcp://223.5.5.5"]"#,
         );
-        assert!(Config::parse_yaml(missing_main.as_bytes()).is_err());
+        assert!(Config::parse_yaml(missing_main.as_bytes()).is_ok());
     }
 
     #[test]
@@ -6046,12 +5966,6 @@ authentication:
             "mixed-port: 1080
 authentication:
   - measure:secret\ndns:\n  enable: true\n  enhanced-mode: normal\n  nameserver: [1.1.1.1]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  enhanced-mode: redir-host\n  nameserver: [1.1.1.1]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  respect-rules: false\n  nameserver: [1.1.1.1]",
             "mixed-port: 1080
 authentication:
   - measure:secret\ndns:\n  enable: true\n  respect-rules: true\n  nameserver: [1.1.1.1]",

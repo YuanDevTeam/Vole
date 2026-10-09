@@ -34,7 +34,7 @@ impl Paths {
         context: EstablishContext,
         bandwidth: Arc<Bandwidth>,
     ) -> Result<(Self, Arc<WindowSocket>), DispatchError> {
-        let destination = upstream.datagram_server(server, &context)?;
+        let destination = upstream.datagram_server(server, &context).await?;
         let peer = context.resolve_ip(&destination).await?;
         let mut paths = Self {
             config,

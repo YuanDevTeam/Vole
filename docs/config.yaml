@@ -104,10 +104,10 @@ sniffer:
 # 路径与 URL 中的保留字符由调用方按相应协议编码，不限制节点本身的名称。
 # dialer-proxy 可引用具体节点或 select 组。全部上游和组成员（包括未选成员）须无环。
 # 代理数量和链深没有独立上限，仍受 YAML 大小与名称唯一约束。
-# 节点没有上游，或上游组经纯组成员链能到达 DIRECT 时，prepare 预解析该节点及其
-# 独立下载端点，即使 DIRECT 尚未选中；纯代理路径保留逻辑域名。候选首跳 DNS 失败
-# 则 prepare 失败，切换 DIRECT 不临时调用系统 DNS。物理首跳连接本机服务时，server 必须使用 127.0.0.0/8
-# 范围内的 IPv4 字面量或 ::1；域名解析到回环地址会失败关闭。
+# 实际建立物理首跳时才通过节点 resolver 解析主端点和独立下载端点。
+# 未选节点的 DNS 失败不阻塞准备；DNS 关闭时才使用系统 resolver。
+# DNS 开启时可通过 hosts 配置本机端点；关闭 DNS 或独立测速的系统 resolver
+# 仍拒绝解析到回环的服务器域名，本机服务器可使用 IP 字面量。
 #
 # VLESS 子集：
 # - type 固定 vless，network 默认 tcp，支持 tcp/ws/grpc/http/h2/xhttp，tls 默认 false；
@@ -438,22 +438,43 @@ proxy-groups:
     proxies: [vless-edge, fallback-select, DIRECT, REJECT, vless-edge]
     default-selected: vless-edge
 
-# 运行时 DNS 可省略；enable: true 时主 nameserver 必须有 1–4 项。ipv6 省略时
-# 默认为 true；false 时直接 AAAA 查询返回空结果，域名解析不查询 AAAA。nameserver
-# 只接受裸 IP、udp://IP[:port] 或 tcp://IP[:port]。没有 fragment 时固定 DIRECT；
-# fragment 只接受 DIRECT、RULES、实际节点名或代理组名。`PROXY`/`#PROXY` 没有
-# 默认出口含义，只有存在同名 route target 时才有效。DNS route 选中代理组后，
-# 仅新建物理 transport 解析当前成员；cache 与既有 TCP pool 不随切换清空。
+# hosts 支持单 IP、IP 数组、域名别名与 Clash 域名通配；不支持动态 lan 展开。
+hosts:
+  "internal.example": [192.0.2.10]
+  "alias.example": internal.example
+
+# DNS 的 enable、ipv6 默认 false，use-hosts/use-system-hosts 默认 true。
+# enable 关闭时不接管 TUN DNS，内部解析使用系统 resolver；配置中的 hosts 仍可用于内部解析。
+# enable 开启时使用配置的 resolver，不因上游失败回退到系统 DNS。
+# nameserver 默认 [https://doh.pub/dns-query, tls://223.5.5.5:853]，不能显式留空。
+# 支持裸 IP、UDP/TCP、tls://、http(s)://，允许上游域名；DoH 使用 HTTP/1.1 POST，
+# DoT 与 HTTPS 校验证书与名称。default-nameserver 只接受 IP 上游，用于 bootstrap。
+# 无 fragment 时默认 DIRECT；respect-rules: true 时默认 RULES，且必须配置
+# proxy-server-nameserver。显式 fragment 可选 DIRECT、RULES 或已配置的节点/组名；
+# 名称支持百分号编码。proxy-server-nameserver 专门解析节点，direct-nameserver
+# 专门解析 DIRECT 业务目标；未配置时复用 nameserver。两者不隐式开启 respect-rules。
+# direct-nameserver-follow-policy 默认 false；true 让直连解析遵循 nameserver-policy。
+# 新建 DNS 连接采用当前组选择，cache 和已有连接不随选择改变而清空。
 # nameserver-policy 接受域名、Clash 通配域名和 geosite；值为单个 nameserver 字符串
-# 或 1–4 项数组。域名可用逗号连接；* 匹配一层，.example.com 仅匹配子域，
+# 或非空数组。域名可用逗号连接；* 匹配一层，.example.com 仅匹配子域，
 # +.example.com 匹配本域及所有子域。连续域名项优先匹配字面标签，其次 *，最后 .；
 # 相同归一域名模式以后项为准。GeoSite 项隔开域名区块，区块与 GeoSite 按声明顺序匹配。
 # `geosite:<selector>[,<selector>...]` 的逗号项为 OR，selector 可为 cn、cn@ads@cn、
 # !cn@ads；多个属性为 key 存在性 AND（忽略 bool/int 值），前置 ! 取反整个匹配结果，
-# @!cn 是字面 key。资产不可用不因反选变成全匹配。命中后只在当前组内故障转移。
+# @!cn 是字面 key。资产不可用不因反选变成全匹配。命中后仅使用当前策略的上游。
 dns:
   enable: true
   ipv6: true
+  enhanced-mode: redir-host
+  use-hosts: true
+  use-system-hosts: true
+  respect-rules: false
+  default-nameserver: [114.114.114.114, 223.5.5.5, 8.8.8.8, 1.0.0.1]
+  proxy-server-nameserver: [223.5.5.5]
+  proxy-server-nameserver-policy:
+    "+.internal.example": 192.0.2.53
+  direct-nameserver: [223.5.5.5]
+  direct-nameserver-follow-policy: true
   nameserver:
     - "tcp://1.1.1.1:53#main-select"
   nameserver-policy:

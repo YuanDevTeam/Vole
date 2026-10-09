@@ -245,7 +245,7 @@ async fn drive(
     let activity = Arc::new(Activity::default());
     let operation = async {
         let handshake = observation::track(ResourceKind::Handshake);
-        let destination = upstream.datagram_server(&server, &context)?;
+        let destination = upstream.datagram_server(&server, &context).await?;
         let peer = context.resolve_ip(&destination).await?;
         let budget = DatagramBudget::new(
             crate::limits::TUIC_QUIC_PAYLOAD as u16,

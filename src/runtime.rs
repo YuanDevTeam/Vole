@@ -96,7 +96,7 @@ use crate::security::StandardTlsClient;
 ))]
 use crate::security::{SecurityContext, TLS_RESUMPTION_SESSION_BUDGET};
 
-/// Parsed configuration plus the bootstrap-resolved physical proxy roots.
+/// Validated configuration; physical server names resolve on first use.
 #[derive(Debug)]
 pub(crate) struct PreparedCore {
     config: Config,
@@ -126,12 +126,9 @@ pub(crate) struct PreparedMeasurement {
     limits: ResourceLimits,
 }
 
-/// Bootstrap-resolved physical destinations for one proxy graph node.
-///
-/// Proxy-only upstreams keep both entries empty. Nodes with a possible DIRECT
-/// group path are also physical roots, regardless of initial selection. They retain a
-/// primary endpoint and, when XHTTP download settings are present, a second
-/// endpoint for the independent download leg.
+/// Pre-resolved physical destinations used by standalone measurements.
+/// Running sessions leave these empty and resolve node endpoints on demand.
+/// XHTTP measurements can retain a separate endpoint for the download leg.
 #[derive(Debug, Clone, Default)]
 struct PreparedProxyEndpoints {
     upload: Option<ResolvedEndpoint>,
@@ -271,9 +268,8 @@ impl PreparedCore {
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let (rules, geodata_registration) = prepare_routing(&mut config, &geodata_manager)?;
-        let endpoints =
-            prepare_proxy_endpoints(&config.proxies, &config.proxy_groups, resolver, config.ipv6)
-                .await?;
+        let _ = resolver;
+        let endpoints = vec![PreparedProxyEndpoints::default(); config.proxies.len()];
         let traffic_stats = config
             .tun
             .enable
@@ -292,7 +288,7 @@ impl PreparedCore {
     /// Performs every configuration-owned validation step without resolving
     /// the proxy, opening GeoData files, or retaining a matcher.
     pub(crate) fn validate_config(mut config: Config) -> io::Result<()> {
-        GeoRequirements::collect(&config.rules, &config.dns.nameserver_policies)
+        GeoRequirements::for_config(&config)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         RuleSet::compile(config.take_runtime_rules())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -383,17 +379,19 @@ impl PreparedCore {
         let rules = self.rules.clone();
         let redir_host_entries = self.dns_redir_host_entries();
         let geo_matcher: Arc<dyn GeoMatcher> = self.geodata_registration.matcher();
-        let dns = self.config.dns.enable.then(|| {
-            Arc::new(RuntimeDns::new_routed_proxies_with_cache_limits(
-                &self.config.dns,
-                route_targets.clone(),
-                direct.clone(),
-                rules.clone(),
-                geo_matcher.clone(),
-                self.limits.dns_address_cache_entries,
-                redir_host_entries,
-            ))
-        });
+        let mut dns_config = self.config.dns.clone();
+        if !dns_config.enable {
+            dns_config.ipv6 = self.config.ipv6;
+        }
+        let dns = Some(Arc::new(RuntimeDns::new_routed_proxies_with_cache_limits(
+            &dns_config,
+            route_targets.clone(),
+            direct.clone(),
+            rules.clone(),
+            geo_matcher.clone(),
+            self.limits.dns_address_cache_entries,
+            redir_host_entries,
+        )));
         proxy_graph.resolution.bind_runtime(dns.as_ref())?;
         let geodata_dispatcher: Arc<dyn Dispatcher> = Arc::new(RoutingDispatcher::new_with_ipv6(
             route_targets.clone(),
@@ -1011,14 +1009,12 @@ fn build_upstream_path(
             endpoint,
             dialer: dialer.clone(),
         }),
-        None => endpoint
-            .map(|endpoint| UpstreamPath::direct(endpoint, dialer.clone()))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "physical proxy root has no prepared endpoint",
-                )
-            }),
+        None => Ok(endpoint.map_or_else(
+            || UpstreamPath::LazyDirect {
+                dialer: dialer.clone(),
+            },
+            |endpoint| UpstreamPath::direct(endpoint, dialer.clone()),
+        )),
     }
 }
 
@@ -1192,7 +1188,7 @@ fn prepare_routing(
     config: &mut Config,
     geodata_manager: &Arc<GeoDataManager>,
 ) -> io::Result<(RuleSet, GeoDataRegistration)> {
-    let requirements = GeoRequirements::collect(&config.rules, &config.dns.nameserver_policies)
+    let requirements = GeoRequirements::for_config(config)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let geodata_registration = geodata_manager
         .register(requirements)
@@ -1743,7 +1739,7 @@ rules:
     }
 
     #[tokio::test]
-    async fn prepare_resolves_the_sole_outbound() {
+    async fn prepare_defers_proxy_endpoint_resolution() {
         let prepared =
             PreparedCore::prepare(CONFIG.as_bytes(), &FixedResolver, ResourceLimits::default())
                 .await
@@ -1754,7 +1750,7 @@ rules:
             prepared.proxy(id).protocol,
             ProxyProtocol::Vless(_)
         ));
-        assert_eq!(prepared.endpoint(id).unwrap().logical_host, "server.test");
+        assert!(prepared.endpoint(id).is_none());
         assert!(!prepared.has_tun());
         assert!(
             prepared.config.rules.is_empty(),
@@ -1771,7 +1767,7 @@ rules:
     }
 
     #[tokio::test]
-    async fn prepare_reuses_one_resolution_for_an_identical_download_server() {
+    async fn prepare_defers_identical_download_endpoints() {
         let resolver = RecordingResolver::default();
         let yaml = CONFIG.replace(
             "      mode: packet-up\n",
@@ -1780,12 +1776,11 @@ rules:
         let prepared = PreparedCore::prepare(yaml.as_bytes(), &resolver, ResourceLimits::default())
             .await
             .unwrap();
-        assert_eq!(*resolver.hosts.lock().unwrap(), ["server.test".to_owned()]);
+        assert!(resolver.hosts.lock().unwrap().is_empty());
 
         let id = ProxyId::new(0).unwrap();
-        let upload = prepared.endpoint(id).unwrap();
-        let download = prepared.download_endpoint(id).unwrap();
-        assert_eq!(upload, download);
+        assert!(prepared.endpoint(id).is_none());
+        assert!(prepared.download_endpoint(id).is_none());
         assert_eq!(
             prepared.build_proxy_graph(Dialer::default()).unwrap().len(),
             1
@@ -1793,19 +1788,17 @@ rules:
     }
 
     #[tokio::test]
-    async fn prepare_resolves_distinct_download_server_concurrently() {
+    async fn prepare_defers_distinct_download_endpoints() {
         let resolver = ConcurrentResolver::default();
         let yaml = config_with_download("        server: download.test\n        port: 8443");
         let prepared = PreparedCore::prepare(yaml.as_bytes(), &resolver, ResourceLimits::default())
             .await
             .unwrap();
-        assert_eq!(resolver.peak.load(Ordering::Acquire), 2);
+        assert_eq!(resolver.peak.load(Ordering::Acquire), 0);
 
         let id = ProxyId::new(0).unwrap();
-        assert_eq!(prepared.endpoint(id).unwrap().logical_host, "server.test");
-        let download = prepared.download_endpoint(id).unwrap();
-        assert_eq!(download.logical_host, "download.test");
-        assert_eq!(download.port, 8443);
+        assert!(prepared.endpoint(id).is_none());
+        assert!(prepared.download_endpoint(id).is_none());
         assert_eq!(
             prepared.build_proxy_graph(Dialer::default()).unwrap().len(),
             1
@@ -2088,7 +2081,7 @@ rules:
     }
 
     #[tokio::test]
-    async fn prepare_resolves_both_independent_proxy_roots() {
+    async fn prepare_defers_independent_proxy_roots() {
         let resolver = RecordingResolver::default();
         let prepared = PreparedCore::prepare(
             two_socks_config(false).as_bytes(),
@@ -2099,14 +2092,14 @@ rules:
         .unwrap();
         let mut hosts = resolver.hosts.lock().unwrap().clone();
         hosts.sort();
-        assert_eq!(hosts, ["a.test".to_owned(), "b.test".to_owned()]);
-        assert!(prepared.endpoint(ProxyId::new(0).unwrap()).is_some());
-        assert!(prepared.endpoint(ProxyId::new(1).unwrap()).is_some());
+        assert!(hosts.is_empty());
+        assert!(prepared.endpoint(ProxyId::new(0).unwrap()).is_none());
+        assert!(prepared.endpoint(ProxyId::new(1).unwrap()).is_none());
     }
 
     #[cfg(feature = "outbound-socks5")]
     #[tokio::test]
-    async fn prepare_resolves_only_the_physical_chain_root() {
+    async fn prepare_defers_the_physical_chain_root() {
         let resolver = RecordingResolver::default();
         let prepared = PreparedCore::prepare(
             two_socks_config(true).as_bytes(),
@@ -2115,9 +2108,9 @@ rules:
         )
         .await
         .unwrap();
-        assert_eq!(*resolver.hosts.lock().unwrap(), ["b.test".to_owned()]);
+        assert!(resolver.hosts.lock().unwrap().is_empty());
         assert!(prepared.endpoint(ProxyId::new(0).unwrap()).is_none());
-        assert!(prepared.endpoint(ProxyId::new(1).unwrap()).is_some());
+        assert!(prepared.endpoint(ProxyId::new(1).unwrap()).is_none());
         assert_eq!(
             prepared.build_proxy_graph(Dialer::default()).unwrap().len(),
             2
@@ -2161,10 +2154,7 @@ rules:
         let prepared = PreparedCore::prepare(yaml.as_bytes(), &resolver, ResourceLimits::default())
             .await
             .unwrap();
-        assert_eq!(
-            *resolver.hosts.lock().unwrap(),
-            ["socks-root.test".to_owned()]
-        );
+        assert!(resolver.hosts.lock().unwrap().is_empty());
         let child = ProxyId::new(0).unwrap();
         assert!(prepared.endpoint(child).is_none());
         assert!(prepared.download_endpoint(child).is_none());

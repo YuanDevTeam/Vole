@@ -30,8 +30,8 @@ impl SecurityContext {
         }
     }
 
-    #[cfg(feature = "interop-test")]
-    pub(super) fn with_tls_roots(tls_roots: RootCertStore) -> Self {
+    #[cfg(any(test, feature = "interop-test"))]
+    pub(crate) fn with_tls_roots(tls_roots: RootCertStore) -> Self {
         Self {
             provider: Arc::new(rustls::crypto::ring::default_provider()),
             tls_roots: Arc::new(tls_roots),

@@ -180,12 +180,14 @@ async fn runtime_uses_configured_dns_and_weak_binding_releases_owner() {
         enable: true,
         ipv6: false,
         nameservers: vec![DnsNameserver {
+            path: None,
             transport: DnsTransport::Udp,
-            address: address.ip(),
+            address: address.ip().into(),
             port: address.port(),
             route: DnsRoute::Direct,
         }],
         nameserver_policies: vec![],
+        ..DnsConfig::default()
     };
     let dns = Arc::new(RuntimeDns::new(
         &config,
@@ -263,12 +265,14 @@ async fn recursive_dns_dependency_fails_before_connecting_or_joining_its_own_fli
         enable: true,
         ipv6: false,
         nameservers: vec![DnsNameserver {
+            path: None,
             transport: DnsTransport::Udp,
             address: "192.0.2.1".parse().unwrap(),
             port: 53,
             route: DnsRoute::Direct,
         }],
         nameserver_policies: vec![],
+        ..DnsConfig::default()
     };
     let dns = Arc::new(RuntimeDns::new(&config, egress));
     resolution.bind_runtime(Some(&dns)).unwrap();

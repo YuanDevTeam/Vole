@@ -151,7 +151,7 @@ impl TunRuntime {
             limits,
             config: config.clone(),
             dispatcher,
-            dns,
+            dns: dns.filter(|dns| dns.is_enabled()),
             ipv6,
             fake_icmp_echo,
             sniffer,

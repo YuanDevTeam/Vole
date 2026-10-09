@@ -1,9 +1,11 @@
 //! Bounded runtime DNS service with Mihomo-compatible nameserver egress.
 //!
-//! Upstream endpoints are literal IP addresses. Explicit nameserver fragments
-//! select DIRECT, a named route target, or the ordered rules using only that
-//! endpoint as routing context; a DNS question name is never injected into
-//! business routing.
+//! Upstream domains use a separate bootstrap resolver. DNS questions never
+//! become upstream routing targets; fragments select the upstream connection.
+
+#[cfg(test)]
+#[path = "tests_encrypted.rs"]
+mod encrypted_tests;
 
 use std::{
     collections::HashMap,
@@ -36,8 +38,8 @@ use super::{
 };
 use crate::{
     config::{
-        DnsConfig, DnsNameserver, DnsNameserverPolicy, DnsRoute, DnsTransport, Network,
-        RouteTargetId, RuleAction,
+        DnsAddress, DnsConfig, DnsNameserver, DnsNameserverPolicy, DnsRoute, DnsTransport,
+        HostValue, Network, RouteTargetId, RuleAction,
     },
     dispatch::{BoxStream, DispatchError, Dispatcher},
     resources::{ResourceActivity, ResourceActivityGuard, RuntimeResourceStats},
@@ -89,6 +91,10 @@ pub struct RuntimeDns {
     enabled: bool,
     ipv6: bool,
     nameservers: Box<[DnsNameserver]>,
+    hosts: super::hosts::Hosts,
+    bootstrap: Option<Arc<RuntimeDns>>,
+    proxy_resolver: Option<Arc<RuntimeDns>>,
+    direct_resolver: Option<Arc<RuntimeDns>>,
     nameserver_policies: Box<[DnsNameserverPolicy]>,
     policy_index: NameserverPolicies,
     geo_matcher: Arc<dyn GeoMatcher>,
@@ -111,13 +117,15 @@ enum DnsEgressKey {
     Route(RouteTargetId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TcpPoolKey {
+    upstream: DnsNameserver,
     endpoint: SocketAddr,
     egress: DnsEgressKey,
 }
 
 struct TcpConnectionPool {
+    security: crate::security::SecurityContext,
     state: Mutex<TcpPoolState>,
     max_idle: usize,
     max_idle_per_key: usize,
@@ -210,6 +218,7 @@ impl TcpConnectionPool {
         stats.idle_limit = max_idle;
         stats.idle_per_key_limit = max_idle_per_key;
         Arc::new(Self {
+            security: crate::security::SecurityContext::new(),
             state: Mutex::new(TcpPoolState::default()),
             max_idle,
             max_idle_per_key,
@@ -222,7 +231,7 @@ impl TcpConnectionPool {
     async fn checkout(
         self: &Arc<Self>,
         key: TcpPoolKey,
-        nameserver: DnsNameserver,
+        nameserver: &ResolvedNameserver,
         egress: &Arc<dyn Dispatcher>,
     ) -> Result<TcpLease, AttemptError> {
         let (connection, expired) = {
@@ -264,7 +273,7 @@ impl TcpConnectionPool {
 
     async fn open_connection(
         &self,
-        nameserver: DnsNameserver,
+        nameserver: &ResolvedNameserver,
         egress: &Arc<dyn Dispatcher>,
     ) -> Result<PooledTcpConnection, AttemptError> {
         let slot = TcpPhysicalSlot::new(Arc::clone(&self.stats));
@@ -272,11 +281,35 @@ impl TcpConnectionPool {
         let stream = egress
             .connect_tcp(StreamSession {
                 inbound: InboundKind::InternalDns,
-                source: internal_source(nameserver.address),
+                source: internal_source(nameserver.endpoint.ip()),
                 destination: Destination::Ip(nameserver.endpoint()),
                 sniffed_domain: None,
             })
             .await?;
+        let stream = if matches!(
+            nameserver.transport,
+            DnsTransport::Tls | DnsTransport::Https
+        ) {
+            let options = crate::security::TlsClientOptions {
+                alpn: if nameserver.transport == DnsTransport::Https {
+                    vec![b"http/1.1".to_vec()]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+            crate::security::StandardTlsClient::with_options(
+                &self.security,
+                nameserver.address.to_string(),
+                options,
+                0,
+                64 * 1024,
+            )?
+            .connect(stream)
+            .await?
+        } else {
+            stream
+        };
         drop(connecting);
         self.stats.physical_opens.fetch_add(1, Ordering::Relaxed);
         Ok(PooledTcpConnection {
@@ -291,7 +324,7 @@ impl TcpConnectionPool {
     async fn replace_stale(
         &self,
         lease: &mut TcpLease,
-        nameserver: DnsNameserver,
+        nameserver: &ResolvedNameserver,
         egress: &Arc<dyn Dispatcher>,
     ) -> Result<(), AttemptError> {
         if lease.connection.take().is_some() {
@@ -327,7 +360,7 @@ impl TcpConnectionPool {
             .count()
             >= self.max_idle_per_key
         {
-            let Some(index) = oldest_idle_index_for_key(&state.idle, lease.key) else {
+            let Some(index) = oldest_idle_index_for_key(&state.idle, lease.key.clone()) else {
                 break;
             };
             discarded.push(state.idle.swap_remove(index).connection);
@@ -342,7 +375,7 @@ impl TcpConnectionPool {
         }
 
         state.idle.push(IdleTcpConnection {
-            key: lease.key,
+            key: lease.key.clone(),
             connection,
             idle_since: now,
         });
@@ -741,6 +774,7 @@ enum FailureMode {
     BoundedError,
 }
 
+#[derive(Clone)]
 enum DnsEgress {
     /// Kept for focused unit tests and embedders that deliberately provide one
     /// already-selected dispatcher.
@@ -861,6 +895,51 @@ impl RuntimeDns {
     fn assemble(
         config: &DnsConfig,
         egress: DnsEgress,
+        geo: Arc<dyn GeoMatcher>,
+        cache: usize,
+        hints: usize,
+    ) -> Self {
+        let mut bootstrap_config = config.clone();
+        bootstrap_config.enable = true;
+        bootstrap_config.nameservers = config.default_nameservers.clone();
+        bootstrap_config.nameserver_policies.clear();
+        let bootstrap = Arc::new(Self::assemble_leaf(
+            &bootstrap_config,
+            egress.clone(),
+            geo.clone(),
+            cache,
+            0,
+        ));
+        let mut root = Self::assemble_leaf(config, egress.clone(), geo.clone(), cache, hints);
+        root.bootstrap = Some(bootstrap.clone());
+        let role = |nameservers: &[DnsNameserver], policies: &[DnsNameserverPolicy]| {
+            let mut role_config = config.clone();
+            role_config.nameservers = nameservers.to_vec();
+            role_config.nameserver_policies = policies.to_vec();
+            let mut resolver =
+                Self::assemble_leaf(&role_config, egress.clone(), geo.clone(), cache, 0);
+            resolver.bootstrap = Some(bootstrap.clone());
+            Arc::new(resolver)
+        };
+        if !config.proxy_nameservers.is_empty() {
+            root.proxy_resolver = Some(role(&config.proxy_nameservers, &config.proxy_policies));
+        }
+        if !config.direct_nameservers.is_empty() {
+            root.direct_resolver = Some(role(
+                &config.direct_nameservers,
+                if config.direct_follow_policy {
+                    &config.nameserver_policies
+                } else {
+                    &[]
+                },
+            ));
+        }
+        root
+    }
+
+    fn assemble_leaf(
+        config: &DnsConfig,
+        egress: DnsEgress,
         geo_matcher: Arc<dyn GeoMatcher>,
         address_cache_entries: usize,
         redir_host_entries: usize,
@@ -869,6 +948,14 @@ impl RuntimeDns {
         Self {
             enabled: config.enable,
             ipv6: config.ipv6,
+            hosts: super::hosts::Hosts::new(
+                &config.hosts,
+                config.use_hosts,
+                config.use_system_hosts,
+            ),
+            bootstrap: None,
+            proxy_resolver: None,
+            direct_resolver: None,
             nameservers: config.nameservers.clone().into_boxed_slice(),
             nameserver_policies: config.nameserver_policies.clone().into_boxed_slice(),
             policy_index: NameserverPolicies::new(&config.nameserver_policies),
@@ -908,7 +995,7 @@ impl RuntimeDns {
 
     fn egress_for(
         &self,
-        nameserver: DnsNameserver,
+        nameserver: &ResolvedNameserver,
         network: Network,
     ) -> Result<(DnsEgressKey, &Arc<dyn Dispatcher>), AttemptError> {
         let DnsEgress::Routed {
@@ -930,12 +1017,18 @@ impl RuntimeDns {
                 .map(|dispatcher| (DnsEgressKey::Route(id), dispatcher))
                 .map_err(AttemptError::Dispatch),
             DnsRoute::Rules => {
-                let destination = Destination::Ip(nameserver.endpoint());
-                let context = RoutingContext::new(network, &destination).map_err(|error| {
+                let destination = match &nameserver.address {
+                    DnsAddress::Ip(_) => Destination::Ip(nameserver.endpoint()),
+                    DnsAddress::Domain(host) => {
+                        Destination::domain(host, nameserver.port).map_err(AttemptError::Io)?
+                    }
+                };
+                let mut context = RoutingContext::new(network, &destination).map_err(|error| {
                     AttemptError::Dispatch(DispatchError::Other(format!(
                         "DNS nameserver routing context is invalid: {error}"
                     )))
                 })?;
+                context.pin_ip(nameserver.endpoint.ip());
                 match rules.evaluate_with_geo(&context, self.geo_matcher.as_ref()) {
                     RuleEvaluation::Matched(rule_match) => match rule_match.action {
                         RuleAction::Route(id) => proxies
@@ -960,10 +1053,40 @@ impl RuntimeDns {
     /// Resolves a canonical domain through A followed by AAAA. AAAA is skipped
     /// completely when `dns.ipv6` is false.
     pub async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, RuntimeDnsError> {
-        if !self.enabled {
-            return Err(RuntimeDnsError::Disabled);
-        }
         let host = canonicalize_name(host).map_err(RuntimeDnsError::InvalidQuery)?;
+        let host =
+            match self
+                .hosts
+                .lookup(&host)
+                .map_err(|_| RuntimeDnsError::UpstreamsExhausted {
+                    last_error: "hosts alias cycle".into(),
+                })? {
+                HostValue::Addresses(mut addresses) => {
+                    addresses.retain(|ip| self.ipv6 || ip.is_ipv4());
+                    return Ok(addresses);
+                }
+                HostValue::Alias(host) => host,
+            };
+        if !self.enabled {
+            use crate::dialer::Resolver;
+            let endpoint = tokio::time::timeout(
+                QUERY_TIMEOUT,
+                crate::dialer::SystemResolver.resolve(&host, 53),
+            )
+            .await
+            .map_err(|_| RuntimeDnsError::UpstreamsExhausted {
+                last_error: "system resolver timed out".into(),
+            })?
+            .map_err(|_| RuntimeDnsError::UpstreamsExhausted {
+                last_error: "system resolver failed".into(),
+            })?;
+            return Ok(endpoint
+                .addresses
+                .into_iter()
+                .map(|address| address.ip())
+                .filter(|ip| self.ipv6 || ip.is_ipv4())
+                .collect());
+        }
         let mut addresses = Vec::new();
 
         match self.resolve_type(&host, QueryType::A).await? {
@@ -980,6 +1103,49 @@ impl RuntimeDns {
         }
 
         Ok(addresses)
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub async fn resolve_proxy(&self, host: &str) -> Result<Vec<IpAddr>, RuntimeDnsError> {
+        self.proxy_resolver
+            .as_deref()
+            .unwrap_or(self)
+            .resolve(host)
+            .await
+    }
+    pub async fn resolve_direct(&self, host: &str) -> Result<Vec<IpAddr>, RuntimeDnsError> {
+        self.direct_resolver
+            .as_deref()
+            .unwrap_or(self)
+            .resolve(host)
+            .await
+    }
+    async fn resolve_nameserver(
+        &self,
+        nameserver: &DnsNameserver,
+    ) -> Result<ResolvedNameserver, AttemptError> {
+        let address = match &nameserver.address {
+            DnsAddress::Ip(ip) => *ip,
+            DnsAddress::Domain(host) => {
+                let resolver = self
+                    .bootstrap
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("DNS bootstrap is unavailable"))?;
+                Box::pin(resolver.resolve(host))
+                    .await
+                    .map_err(|_| io::Error::other("DNS bootstrap failed"))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| io::Error::other("DNS bootstrap returned no address"))?
+            }
+        };
+        Ok(ResolvedNameserver {
+            config: nameserver.clone(),
+            endpoint: SocketAddr::new(address, nameserver.port),
+        })
     }
 
     /// Exchanges one structurally valid single-question IN query. A/AAAA keep
@@ -1091,6 +1257,29 @@ impl RuntimeDns {
 
         if parsed_query.question.query_type == QueryType::Aaaa && !self.ipv6 {
             return synthesize_response(&parsed_query, &CacheValue::Negative { rcode: 0 }, 0);
+        }
+
+        let addresses = match self
+            .hosts
+            .lookup(&parsed_query.question.name)
+            .map_err(|_| RuntimeDnsError::UpstreamsExhausted {
+                last_error: "hosts alias cycle".into(),
+            })? {
+            HostValue::Addresses(addresses) => Some(addresses),
+            HostValue::Alias(alias) if alias != parsed_query.question.name => {
+                Some(Box::pin(self.resolve(&alias)).await?)
+            }
+            _ => None,
+        };
+        if let Some(addresses) = addresses {
+            let addresses: Vec<_> = addresses
+                .into_iter()
+                .filter(|ip| match parsed_query.question.query_type {
+                    QueryType::A => ip.is_ipv4(),
+                    QueryType::Aaaa => ip.is_ipv6(),
+                })
+                .collect();
+            return synthesize_response(&parsed_query, &CacheValue::Positive(addresses), 600);
         }
 
         loop {
@@ -1321,69 +1510,63 @@ impl RuntimeDns {
         &self,
         nameserver: DnsNameserver,
         query: &[u8],
-        parsed_query: &DnsMessage,
+        parsed: &DnsMessage,
     ) -> Result<(Vec<u8>, DnsMessage), AttemptError> {
-        let route_network = match nameserver.transport {
-            DnsTransport::Udp => Network::Udp,
-            DnsTransport::Tcp => Network::Tcp,
-        };
-        let (egress_key, egress) = self.egress_for(nameserver, route_network)?;
-        let egress = Arc::clone(egress);
-        match nameserver.transport {
-            DnsTransport::Udp => {
-                let response = self
-                    .exchange_udp(nameserver, &egress, query, |response| {
-                        udp_response_matches_query(parsed_query, response)
-                    })
-                    .await?;
-                let parsed_response = validate_complete_response(parsed_query, &response)?;
-                Ok((response, parsed_response))
-            }
-            DnsTransport::Tcp => {
-                self.exchange_tcp(nameserver, egress_key, &egress, query, |response| {
-                    validate_complete_response(parsed_query, response)
-                })
-                .await
-            }
-        }
+        self.exchange_validated(
+            nameserver,
+            query,
+            |wire| udp_response_matches_query(parsed, wire),
+            |wire| validate_complete_response(parsed, wire),
+        )
+        .await
     }
 
     async fn exchange_opaque_nameserver(
         &self,
         nameserver: DnsNameserver,
         query: &[u8],
-        classified: &ClassifiedDnsQuery,
+        parsed: &ClassifiedDnsQuery,
     ) -> Result<ValidatedOpaqueResponse, AttemptError> {
-        let route_network = match nameserver.transport {
-            DnsTransport::Udp => Network::Udp,
-            DnsTransport::Tcp => Network::Tcp,
-        };
-        let (egress_key, egress) = self.egress_for(nameserver, route_network)?;
-        let egress = Arc::clone(egress);
-        match nameserver.transport {
-            DnsTransport::Udp => {
-                let response = self
-                    .exchange_udp(nameserver, &egress, query, |response| {
-                        udp_response_matches_classified_query(classified, response)
-                    })
-                    .await?;
-                validate_opaque_response(classified, &response).map_err(AttemptError::from)
+        self.exchange_validated(
+            nameserver,
+            query,
+            |wire| udp_response_matches_classified_query(parsed, wire),
+            |wire| validate_opaque_response(parsed, wire).map_err(AttemptError::from),
+        )
+        .await
+        .map(|(_, parsed)| parsed)
+    }
+
+    async fn exchange_validated<R, M, V>(
+        &self,
+        nameserver: DnsNameserver,
+        query: &[u8],
+        matches: M,
+        validate: V,
+    ) -> Result<(Vec<u8>, R), AttemptError>
+    where
+        M: Fn(&[u8]) -> Result<bool, AttemptError>,
+        V: Fn(&[u8]) -> Result<R, AttemptError>,
+    {
+        let mut server = self.resolve_nameserver(&nameserver).await?;
+        if server.transport == DnsTransport::Udp {
+            let (_, egress) = self.egress_for(&server, Network::Udp)?;
+            let response = self.exchange_udp(&server, egress, query, matches).await?;
+            if response.get(2).is_some_and(|flags| flags & 0x02 != 0) {
+                server.config.transport = DnsTransport::Tcp;
+            } else {
+                let parsed = validate(&response)?;
+                return Ok((response, parsed));
             }
-            DnsTransport::Tcp => self
-                .exchange_tcp(nameserver, egress_key, &egress, query, |response| {
-                    validate_opaque_response(classified, response).map_err(|error| match error {
-                        DnsError::ResponseMismatch => AttemptError::ResponseMismatch,
-                        error => AttemptError::InvalidResponse(error),
-                    })
-                })
-                .await
-                .map(|(_, response)| response),
         }
+        let (key, egress) = self.egress_for(&server, Network::Tcp)?;
+        self.exchange_tcp(&server, key, egress, query, validate)
+            .await
     }
 
     async fn exchange_udp<F>(
         &self,
-        nameserver: DnsNameserver,
+        nameserver: &ResolvedNameserver,
         egress: &Arc<dyn Dispatcher>,
         query: &[u8],
         response_matches: F,
@@ -1395,7 +1578,7 @@ impl RuntimeDns {
         let mut transport = egress
             .open_datagram(DatagramSession::new(
                 InboundKind::InternalDns,
-                internal_source(nameserver.address),
+                internal_source(nameserver.endpoint.ip()),
             ))
             .await?;
         let payload = Bytes::copy_from_slice(query);
@@ -1462,7 +1645,7 @@ impl RuntimeDns {
 
     async fn exchange_tcp<R, F>(
         &self,
-        nameserver: DnsNameserver,
+        nameserver: &ResolvedNameserver,
         egress_key: DnsEgressKey,
         egress: &Arc<dyn Dispatcher>,
         query: &[u8],
@@ -1472,18 +1655,20 @@ impl RuntimeDns {
         F: Fn(&[u8]) -> Result<R, AttemptError>,
     {
         let key = TcpPoolKey {
+            upstream: nameserver.config.clone(),
             endpoint: nameserver.endpoint(),
             egress: egress_key,
         };
         let mut lease = self.tcp_pool.checkout(key, nameserver, egress).await?;
         let first_was_reused = lease.reused;
 
-        let mut result = exchange_tcp_validated(
+        let mut result = exchange_stream_validated(
             &mut lease
                 .connection
                 .as_mut()
                 .expect("TCP lease always owns a connection")
                 .stream,
+            nameserver,
             query,
             &validate,
         )
@@ -1496,20 +1681,23 @@ impl RuntimeDns {
             self.tcp_pool
                 .replace_stale(&mut lease, nameserver, egress)
                 .await?;
-            result = exchange_tcp_validated(
+            result = exchange_stream_validated(
                 &mut lease
                     .connection
                     .as_mut()
                     .expect("replacement TCP lease owns a connection")
                     .stream,
+                nameserver,
                 query,
                 &validate,
             )
             .await;
         }
 
-        let (response, validated) = result?;
-        self.tcp_pool.check_in(lease).await;
+        let (response, validated, reusable) = result?;
+        if reusable {
+            self.tcp_pool.check_in(lease).await;
+        }
         Ok((response, validated))
     }
 
@@ -1577,6 +1765,26 @@ async fn exchange_tcp_framed(
     Ok(response)
 }
 
+async fn exchange_stream_validated<R, F>(
+    stream: &mut BoxStream,
+    server: &ResolvedNameserver,
+    query: &[u8],
+    validate: &F,
+) -> Result<(Vec<u8>, R, bool), AttemptError>
+where
+    F: Fn(&[u8]) -> Result<R, AttemptError>,
+{
+    if matches!(server.transport, DnsTransport::Http | DnsTransport::Https) {
+        let (wire, reusable) = super::https::exchange(stream, server, query).await?;
+        let response = validate(&wire)?;
+        Ok((wire, response, reusable))
+    } else {
+        exchange_tcp_validated(stream, query, validate)
+            .await
+            .map(|(wire, response)| (wire, response, true))
+    }
+}
+
 async fn exchange_tcp_validated<R, F>(
     stream: &mut BoxStream,
     query: &[u8],
@@ -1626,75 +1834,63 @@ where
     AttemptFuture: Future<Output = Result<T, AttemptError>>,
     RetryableResponse: Fn(&T) -> Option<u16>,
 {
+    use futures_util::{StreamExt, stream};
     let mut last_error: Box<str> = "no nameserver attempted".into();
-    for (nameserver_index, nameserver) in nameservers.iter().copied().enumerate() {
-        let now = TokioInstant::now();
-        if now >= deadline {
-            tracing::warn!(
-                nameserver_index,
-                event = "runtime_dns_total_deadline",
-                "runtime DNS deadline expired before nameserver attempt"
-            );
-            last_error = "runtime DNS total query deadline expired".into();
-            break;
-        }
-        let attempt_deadline = std::cmp::min(deadline, now + UPSTREAM_TIMEOUT);
-        match timeout_at(attempt_deadline, attempt(nameserver)).await {
-            Err(_) => {
-                tracing::warn!(
-                    nameserver_index,
-                    event = "runtime_dns_attempt_timeout",
-                    "runtime DNS nameserver attempt timed out"
-                );
-                last_error = format!("nameserver {nameserver_index} attempt timed out").into();
-            }
-            Ok(Err(error)) => {
-                tracing::debug!(
-                    nameserver_index,
-                    error_kind = error.category(),
-                    "runtime DNS nameserver attempt failed"
-                );
-                last_error = error.summary(nameserver_index);
-            }
-            Ok(Ok(response)) => {
-                let Some(rcode) = retryable_response(&response) else {
-                    return Ok(response);
-                };
-                tracing::debug!(
-                    nameserver_index,
-                    rcode,
-                    "runtime DNS nameserver returned a retryable response"
-                );
-                last_error = format!(
-                    "nameserver {nameserver_index} returned retryable response code {rcode}"
+    let mut attempts = stream::iter(nameservers.iter().cloned().enumerate())
+        .map(|(index, server)| {
+            let future = attempt(server);
+            async move {
+                (
+                    index,
+                    timeout_at(deadline.min(TokioInstant::now() + UPSTREAM_TIMEOUT), future).await,
                 )
-                .into();
             }
-        }
-        if nameserver_index + 1 < nameservers.len() {
-            tracing::debug!(
-                nameserver_index,
-                event = "runtime_dns_nameserver_failover",
-                "runtime DNS is trying the next nameserver"
-            );
+        })
+        .buffer_unordered(4);
+    while let Some((index, result)) = attempts.next().await {
+        match result {
+            Ok(Ok(response)) if retryable_response(&response).is_none() => return Ok(response),
+            Ok(Ok(_)) => {
+                last_error = format!("nameserver {index} returned a retryable response").into()
+            }
+            Ok(Err(error)) => last_error = error.summary(index),
+            Err(_) => last_error = format!("nameserver {index} timed out").into(),
         }
     }
     Err(RuntimeDnsError::UpstreamsExhausted { last_error })
 }
 
-impl DnsNameserver {
-    fn endpoint(self) -> SocketAddr {
-        SocketAddr::new(self.address, self.port)
+struct ResolvedNameserver {
+    config: DnsNameserver,
+    endpoint: SocketAddr,
+}
+impl std::ops::Deref for ResolvedNameserver {
+    type Target = DnsNameserver;
+    fn deref(&self) -> &Self::Target {
+        &self.config
     }
 }
-
+impl ResolvedNameserver {
+    fn endpoint(&self) -> SocketAddr {
+        self.endpoint
+    }
+}
+#[cfg(test)]
+impl DnsNameserver {
+    fn endpoint(&self) -> SocketAddr {
+        match self.address {
+            DnsAddress::Ip(ip) => SocketAddr::new(ip, self.port),
+            _ => panic!("test requires literal DNS endpoint"),
+        }
+    }
+}
 impl fmt::Display for DnsNameserver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let transport = match self.transport {
-            DnsTransport::Udp => "udp",
-            DnsTransport::Tcp => "tcp",
-        };
-        write!(formatter, "{transport}://{}", self.endpoint())
+        write!(
+            formatter,
+            "{:?}://{}:{}",
+            self.transport, self.address, self.port
+        )
     }
 }
 
@@ -1740,7 +1936,7 @@ impl AttemptError {
 
 fn udp_response_matches_query(query: &DnsMessage, response: &[u8]) -> Result<bool, AttemptError> {
     match validate_response_identity(query, response) {
-        Ok(_) => Ok(true),
+        Ok(_) | Err(DnsError::TruncatedResponse) => Ok(true),
         Err(DnsError::ResponseMismatch | DnsError::NotAResponse | DnsError::UnsupportedOpcode) => {
             Ok(false)
         }
@@ -1757,6 +1953,7 @@ fn udp_response_matches_classified_query(
         Err(DnsError::ResponseMismatch | DnsError::NotAResponse | DnsError::UnsupportedOpcode) => {
             Ok(false)
         }
+        Err(DnsError::TruncatedResponse) => Ok(true),
         Err(error) => Err(AttemptError::InvalidResponse(error)),
     }
 }
@@ -2315,8 +2512,9 @@ mod tests {
 
     fn nameserver(index: u8, transport: DnsTransport) -> DnsNameserver {
         DnsNameserver {
+            path: None,
             transport,
-            address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, index)),
+            address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, index)).into(),
             port: 53,
             route: crate::config::DnsRoute::Route(crate::config::RouteTargetId::Proxy(
                 crate::config::ProxyId::new(0).unwrap(),
@@ -2358,6 +2556,7 @@ mod tests {
             ipv6,
             nameservers,
             nameserver_policies: Vec::new(),
+            ..DnsConfig::default()
         }
     }
 
@@ -2416,6 +2615,103 @@ mod tests {
             answers,
             answer_count,
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_dns_separates_bootstrap_proxy_direct_and_hosts() {
+        let config = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+hosts:
+  '+.local.example': [192.0.2.99]
+  alias.example: target.local.example
+dns:
+  enable: true
+  use-system-hosts: false
+  default-nameserver: [192.0.2.10]
+  nameserver: [udp://dns.example]
+  proxy-server-nameserver: [192.0.2.20]
+  direct-nameserver: [192.0.2.30]
+"#,
+        )
+        .unwrap();
+        let answers: Vec<IpAddr> = ["192.0.2.1", "203.0.113.1", "203.0.113.2", "203.0.113.3"]
+            .map(|ip| ip.parse().unwrap())
+            .to_vec();
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            answers
+                .iter()
+                .copied()
+                .map(|ip| MockReply::Response(ResponseSpec::answer(ip)))
+                .collect(),
+            vec![],
+        ));
+        let dns = Arc::new(RuntimeDns::new(&config.dns, dispatcher.clone()));
+        assert_eq!(dns.resolve("business.example").await.unwrap(), [answers[1]]);
+        let resolution = crate::dns::resolution::ResolutionContext::runtime(false);
+        resolution.bind_runtime(Some(&dns)).unwrap();
+        let node = Destination::domain("proxy.example", 443).unwrap();
+        assert_eq!(
+            resolution
+                .resolve_proxy(&node, TokioInstant::now() + QUERY_TIMEOUT)
+                .await
+                .unwrap()
+                .addresses[0]
+                .ip(),
+            answers[2]
+        );
+        assert_eq!(
+            dns.resolve_direct("direct.example").await.unwrap(),
+            [answers[3]]
+        );
+        assert_eq!(
+            dns.resolve("alias.example").await.unwrap(),
+            ["192.0.2.99".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            *dispatcher.udp_destinations.lock().unwrap(),
+            [
+                "192.0.2.10:53",
+                "192.0.2.1:53",
+                "192.0.2.20:53",
+                "192.0.2.30:53"
+            ]
+            .map(|address| Destination::Ip(address.parse().unwrap()))
+        );
+        resolution.close();
+        assert!(
+            resolution
+                .resolve_proxy(&node, TokioInstant::now() + QUERY_TIMEOUT)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_upstreams_drop_the_losing_attempt() {
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            vec![
+                MockReply::Pending,
+                MockReply::Response(ResponseSpec::rcode(RCODE_NOERROR)),
+            ],
+            vec![],
+        ));
+        let dns = RuntimeDns::new(
+            &config(
+                false,
+                vec![
+                    nameserver(1, DnsTransport::Udp),
+                    nameserver(2, DnsTransport::Udp),
+                ],
+            ),
+            dispatcher.clone(),
+        );
+        tokio::time::timeout(Duration::from_millis(100), dns.resolve("race.example"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 2);
+        assert_eq!(dns.singleflight.len(), 0);
     }
 
     #[tokio::test]
@@ -2544,7 +2840,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_udp_ignores_a_mismatched_tc_response_before_rejecting_matching_tc() {
+    fn typed_udp_ignores_a_mismatched_tc_response_before_retrying_matching_tc() {
         let query = build_query(88, "mismatch.example", QueryType::A).unwrap();
         let parsed_query = parse_query(&query).unwrap();
         let mut response = response_for_query(&query, &ResponseSpec::truncated());
@@ -2552,10 +2848,7 @@ mod tests {
         assert!(!udp_response_matches_query(&parsed_query, &response).unwrap());
 
         response[..2].copy_from_slice(&88_u16.to_be_bytes());
-        assert!(matches!(
-            udp_response_matches_query(&parsed_query, &response),
-            Err(AttemptError::InvalidResponse(DnsError::TruncatedResponse))
-        ));
+        assert!(udp_response_matches_query(&parsed_query, &response).unwrap());
     }
 
     #[tokio::test]
@@ -2668,21 +2961,18 @@ mod tests {
             vec![TcpScriptReply::Response(ResponseSpec::answer(address))],
         ]));
         let truncated_resolver = RuntimeDns::new(
-            &config(
-                false,
-                vec![
-                    nameserver(1, DnsTransport::Tcp),
-                    nameserver(2, DnsTransport::Tcp),
-                ],
-            ),
+            &config(false, vec![nameserver(1, DnsTransport::Tcp)]),
             truncated_dispatcher.clone(),
         );
         truncated_resolver.resolve("warm.example").await.unwrap();
-        assert_eq!(
+        assert!(
             truncated_resolver
                 .resolve("truncated.example")
                 .await
-                .unwrap(),
+                .is_err()
+        );
+        assert_eq!(
+            truncated_resolver.resolve("fresh.example").await.unwrap(),
             [address]
         );
         let snapshot = truncated_resolver.tcp_pool.snapshot();
@@ -2702,12 +2992,12 @@ mod tests {
         ]]));
         let mut direct_nameserver = nameserver(1, DnsTransport::Tcp);
         direct_nameserver.route = DnsRoute::Direct;
-        let mut proxy_nameserver = direct_nameserver;
+        let mut proxy_nameserver = direct_nameserver.clone();
         proxy_nameserver.route = DnsRoute::Route(crate::config::RouteTargetId::Proxy(
             crate::config::ProxyId::new(0).expect("proxy zero is valid"),
         ));
         let resolver = RuntimeDns::new_routed(
-            &config(false, vec![direct_nameserver]),
+            &config(false, vec![direct_nameserver.clone()]),
             proxy.clone(),
             direct.clone(),
             RuleSet::compile(vec![rule(RuleKind::Match, RuleAction::Direct)]).unwrap(),
@@ -2827,6 +3117,7 @@ mod tests {
         let mut tasks = Vec::new();
         for index in 0..ACTIVE {
             let resolver = Arc::clone(&resolver);
+            let nameserver = nameserver.clone();
             tasks.push(tokio::spawn(async move {
                 let query = build_query(
                     u16::try_from(index + 1).unwrap(),
@@ -2956,7 +3247,7 @@ mod tests {
         let mut direct_nameserver = nameserver(1, DnsTransport::Udp);
         direct_nameserver.route = DnsRoute::Direct;
         let resolver = RuntimeDns::new_routed(
-            &config(true, vec![direct_nameserver]),
+            &config(true, vec![direct_nameserver.clone()]),
             proxy.clone(),
             direct.clone(),
             RuleSet::compile(vec![rule(
@@ -2981,7 +3272,7 @@ mod tests {
         let mut rules_nameserver = nameserver(2, DnsTransport::Udp);
         rules_nameserver.route = DnsRoute::Rules;
         let resolver = RuntimeDns::new_routed(
-            &config(false, vec![rules_nameserver]),
+            &config(false, vec![rules_nameserver.clone()]),
             proxy.clone(),
             direct.clone(),
             RuleSet::compile(vec![
@@ -3010,7 +3301,7 @@ mod tests {
         ));
         let proxy = Arc::new(MockDispatcher::default());
         let resolver = RuntimeDns::new_routed(
-            &config(false, vec![rules_nameserver]),
+            &config(false, vec![rules_nameserver.clone()]),
             proxy.clone(),
             direct.clone(),
             RuleSet::compile(vec![
@@ -3115,14 +3406,14 @@ dns:
                 for query_type in [1, 65] {
                     let main = nameserver(1, DnsTransport::Udp);
                     let policy = nameserver(2, DnsTransport::Udp);
-                    let mut dns_config = config(false, vec![main]);
+                    let mut dns_config = config(false, vec![main.clone()]);
                     dns_config.nameserver_policies = if separate_policies {
                         vec![
                             dns_policy(&["cn@ads"], vec![nameserver(3, DnsTransport::Udp)]),
-                            dns_policy(&["cn"], vec![policy]),
+                            dns_policy(&["cn"], vec![policy.clone()]),
                         ]
                     } else {
-                        vec![dns_policy(&["cn@ads", "cn"], vec![policy])]
+                        vec![dns_policy(&["cn@ads", "cn"], vec![policy.clone()])]
                     };
                     let root = tempfile::tempdir().unwrap();
                     // One CN Domain record: example.cn, with no attributes.
@@ -3182,13 +3473,10 @@ dns:
                     assert_eq!(response[3] & 0x0f, RCODE_NOERROR);
                     assert!(released_before_upstream_reply);
 
-                    let expected = if starts_empty { main } else { policy };
+                    let expected = if starts_empty { &main } else { &policy };
                     assert_eq!(
                         *dispatcher.udp_destinations.lock().unwrap(),
-                        vec![Destination::Ip(SocketAddr::new(
-                            expected.address,
-                            expected.port
-                        ))],
+                        vec![Destination::Ip(expected.endpoint())],
                         "starts_empty={starts_empty}, separate_policies={separate_policies}, query_type={query_type}",
                     );
 
@@ -3198,15 +3486,12 @@ dns:
                         .exchange(&opaque_query(61, "next.example.cn", query_type))
                         .await
                         .unwrap();
-                    let next_expected = if starts_empty { policy } else { main };
+                    let next_expected = if starts_empty { &policy } else { &main };
                     assert_eq!(
                         *dispatcher.udp_destinations.lock().unwrap(),
                         vec![
-                            Destination::Ip(SocketAddr::new(expected.address, expected.port)),
-                            Destination::Ip(SocketAddr::new(
-                                next_expected.address,
-                                next_expected.port
-                            )),
+                            Destination::Ip(expected.endpoint()),
+                            Destination::Ip(next_expected.endpoint()),
                         ],
                     );
                 }
@@ -3233,6 +3518,7 @@ dns:
             vec![MockReply::Response(ResponseSpec::answer(v4_answer))],
         ));
         let main = DnsNameserver {
+            path: None,
             transport: DnsTransport::Tcp,
             address: "1.1.1.1".parse().unwrap(),
             port: 53,
@@ -3241,12 +3527,13 @@ dns:
             )),
         };
         let policy_nameserver = DnsNameserver {
+            path: None,
             transport: DnsTransport::Tcp,
             address: "223.5.5.5".parse().unwrap(),
             port: 53,
             route: DnsRoute::Direct,
         };
-        let mut dns_config = config(true, vec![main]);
+        let mut dns_config = config(true, vec![main.clone()]);
         dns_config.nameserver_policies = vec![dns_policy(
             &["private", "cn", "apple"],
             vec![policy_nameserver],
@@ -3479,7 +3766,7 @@ dns:
         let mut rules_nameserver = nameserver(2, DnsTransport::Udp);
         rules_nameserver.route = DnsRoute::Rules;
         let resolver = RuntimeDns::new_routed(
-            &config(false, vec![rules_nameserver]),
+            &config(false, vec![rules_nameserver.clone()]),
             proxy.clone(),
             direct.clone(),
             RuleSet::compile(vec![
@@ -3522,8 +3809,9 @@ dns:
         let proxy = Arc::new(MockDispatcher::default());
         let direct: Arc<dyn Dispatcher> = Arc::new(DirectOutbound::new(Dialer::default()));
         let udp_nameserver = DnsNameserver {
+            path: None,
             transport: DnsTransport::Udp,
-            address: udp_address.ip(),
+            address: udp_address.ip().into(),
             port: udp_address.port(),
             route: DnsRoute::Direct,
         };
@@ -3564,8 +3852,9 @@ dns:
             stream.write_all(&response).await.unwrap();
         });
         let tcp_nameserver = DnsNameserver {
+            path: None,
             transport: DnsTransport::Tcp,
-            address: tcp_address.ip(),
+            address: tcp_address.ip().into(),
             port: tcp_address.port(),
             route: DnsRoute::Direct,
         };
@@ -3666,74 +3955,26 @@ dns:
     }
 
     #[tokio::test]
-    async fn opaque_udp_tc_fails_over_without_opening_tcp() {
-        let dispatcher = Arc::new(MockDispatcher::with_replies(
-            vec![
-                MockReply::Response(ResponseSpec::truncated()),
-                MockReply::Response(ResponseSpec::rcode(RCODE_NOERROR)),
-            ],
-            vec![],
-        ));
-        let resolver = RuntimeDns::new(
-            &config(
-                false,
-                vec![
-                    nameserver(7, DnsTransport::Udp),
-                    nameserver(8, DnsTransport::Udp),
-                ],
-            ),
-            dispatcher.clone(),
-        );
-        let query = opaque_query(20, "txt.example", 16);
-        let classified = classify_query(&query).unwrap();
-        let response = resolver.exchange(&query).await.unwrap();
-        assert_eq!(
-            validate_opaque_response(&classified, &response)
-                .unwrap()
-                .rcode(),
-            u16::from(RCODE_NOERROR)
-        );
-        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 2);
-        assert_eq!(dispatcher.tcp_calls.load(Ordering::Acquire), 0);
-        assert_eq!(
-            *dispatcher.udp_destinations.lock().unwrap(),
-            vec![
-                Destination::Ip("192.0.2.7:53".parse().unwrap()),
-                Destination::Ip("192.0.2.8:53".parse().unwrap()),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn all_opaque_udp_tc_responses_converge_to_servfail_without_tcp() {
-        let dispatcher = Arc::new(MockDispatcher::with_replies(
-            vec![
-                MockReply::Response(ResponseSpec::truncated()),
-                MockReply::Response(ResponseSpec::truncated()),
-            ],
-            vec![],
-        ));
-        let resolver = RuntimeDns::new(
-            &config(
-                false,
-                vec![
-                    nameserver(7, DnsTransport::Udp),
-                    nameserver(8, DnsTransport::Udp),
-                ],
-            ),
-            dispatcher.clone(),
-        );
-        let query = opaque_query(21, "txt.example", 16);
-        let classified = classify_query(&query).unwrap();
-        let response = resolver.exchange(&query).await.unwrap();
-        assert_eq!(
-            validate_opaque_response(&classified, &response)
-                .unwrap()
-                .rcode(),
-            u16::from(RCODE_SERVFAIL)
-        );
-        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 2);
-        assert_eq!(dispatcher.tcp_calls.load(Ordering::Acquire), 0);
+    async fn udp_truncation_retries_the_same_upstream_over_tcp() {
+        for query_type in [1, 16] {
+            let dispatcher = Arc::new(MockDispatcher::with_replies(
+                vec![MockReply::Response(ResponseSpec::truncated())],
+                vec![MockReply::Response(ResponseSpec::rcode(RCODE_NOERROR))],
+            ));
+            let resolver = RuntimeDns::new(
+                &config(false, vec![nameserver(7, DnsTransport::Udp)]),
+                dispatcher.clone(),
+            );
+            let query = opaque_query(20, "answer.example", query_type);
+            let response = resolver.exchange(&query).await.unwrap();
+            assert_eq!(response[3] & 0xf, 0);
+            assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 1);
+            assert_eq!(dispatcher.tcp_calls.load(Ordering::Acquire), 1);
+            assert_eq!(
+                *dispatcher.udp_destinations.lock().unwrap(),
+                *dispatcher.tcp_destinations.lock().unwrap()
+            );
+        }
     }
 
     #[tokio::test]
@@ -4052,66 +4293,6 @@ dns:
             *dispatcher.udp_queries.lock().unwrap(),
             vec![QueryType::A as u16, QueryType::Aaaa as u16]
         );
-    }
-
-    #[tokio::test]
-    async fn udp_tc_fails_over_without_opening_tcp() {
-        let address = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 16));
-        let dispatcher = Arc::new(MockDispatcher::with_replies(
-            vec![
-                MockReply::Response(ResponseSpec::truncated()),
-                MockReply::Response(ResponseSpec::answer(address)),
-            ],
-            vec![],
-        ));
-        let resolver = RuntimeDns::new(
-            &config(
-                false,
-                vec![
-                    nameserver(7, DnsTransport::Udp),
-                    nameserver(8, DnsTransport::Udp),
-                ],
-            ),
-            dispatcher.clone(),
-        );
-
-        assert_eq!(resolver.resolve("example.com").await.unwrap(), [address]);
-        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 2);
-        assert_eq!(dispatcher.tcp_calls.load(Ordering::Acquire), 0);
-        assert_eq!(
-            *dispatcher.udp_destinations.lock().unwrap(),
-            vec![
-                Destination::Ip("192.0.2.7:53".parse().unwrap()),
-                Destination::Ip("192.0.2.8:53".parse().unwrap()),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn all_udp_tc_responses_converge_to_servfail_without_tcp() {
-        let dispatcher = Arc::new(MockDispatcher::with_replies(
-            vec![
-                MockReply::Response(ResponseSpec::truncated()),
-                MockReply::Response(ResponseSpec::truncated()),
-            ],
-            vec![],
-        ));
-        let resolver = RuntimeDns::new(
-            &config(
-                false,
-                vec![
-                    nameserver(7, DnsTransport::Udp),
-                    nameserver(8, DnsTransport::Udp),
-                ],
-            ),
-            dispatcher.clone(),
-        );
-
-        let query = build_query(7, "example.com", QueryType::A).unwrap();
-        let response = resolver.exchange(&query).await.unwrap();
-        assert_eq!(parse_response(&response).unwrap().rcode, RCODE_SERVFAIL);
-        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 2);
-        assert_eq!(dispatcher.tcp_calls.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

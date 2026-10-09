@@ -360,7 +360,7 @@ impl VlessOutbound {
             return Ok(None);
         };
         match primary {
-            UpstreamPath::Proxy(_) => Ok(Some(primary.clone())),
+            UpstreamPath::Proxy(_) | UpstreamPath::LazyDirect { .. } => Ok(Some(primary.clone())),
             UpstreamPath::Direct { endpoint, .. }
             | UpstreamPath::Group {
                 endpoint: Some(endpoint),
@@ -661,7 +661,7 @@ impl VlessOutbound {
                     .map(TransportIo::Stream);
             }
             let (tls, server_name) = leg.security.quic_config()?;
-            let server = leg.upstream.datagram_server(&leg.server, context)?;
+            let server = leg.upstream.datagram_server(&leg.server, context).await?;
             let peer = context.resolve_ip(&server).await?;
             let budget = DatagramBudget::new(1400, 1400);
             let request =

@@ -68,11 +68,11 @@ dns:
 
 ### Endpoint
 
-- 主 nameserver 必须有 1–4 项。
-- 只接受裸 IPv4/IPv6、`udp://IP[:port]` 和 `tcp://IP[:port]`。
+- `dns.enable`、`dns.ipv6` 默认 false。主 nameserver 默认使用 DoH/DoT，可显式替换为非空列表。
+- 接受裸 IPv4/IPv6、`udp://`、`tcp://`、`tls://`、`https://` 和 `http://`。加密连接复用共享 TLS 证书验证。DoH 采用 HTTP/1.1 POST。
 - `dns.ipv6: false` 不限制 IPv6 nameserver；顶层 `ipv6: false` 会阻止通过 DIRECT（含 `RULES` 选中 DIRECT）的 IPv6 nameserver 在本机物理建链，并继续当前组的故障转移。
-- Endpoint 必须是 IP 字面量，不支持 hostname、system 或 DHCP resolver。
-- 无 fragment 时固定使用 DIRECT。
+- 上游域名由 `default-nameserver` 引导解析，后者只允许 IP 上游。未启用 DNS 时，内部解析使用系统 resolver；启用后不因查询失败回退系统解析。显式 system/DHCP nameserver 尚未实现。
+- 无 fragment 时默认 DIRECT；`respect-rules: true` 改为 RULES，要求非空 `proxy-server-nameserver`。
 - Fragment 只接受 `DIRECT`、`RULES`、实际代理节点名或静态 `select` 组名。
 - `#RULES` 只按 nameserver endpoint 和传输执行业务规则，不把 DNS question 当作选路域名。
 - 规则结果为 `REJECT` 时，当前尝试失败并继续当前组下一项。
@@ -91,8 +91,8 @@ dns:
   `code`、`code@attr@attr` 或前置 `!` 的反选，属性为 key 存在性 AND。与业务规则共享分类和记录，
   `@!cn` 是字面属性 key，不是属性排除；
 - GeoSite 项隔开域名区块，区块与 GeoSite 项按声明顺序匹配；重复 GeoSite selector 也按此顺序处理；
-- value 接受单个 nameserver 字符串或 1–4 项数组；`rule-set:` 依赖尚未支持的 rule-providers；
-- 命中后只在所选列表内顺序故障转移，列表耗尽不查询其他 policy 或主组；
+- value 接受单个 nameserver 字符串或非空数组；`rule-set:` 依赖尚未支持的 rule-providers；
+- 命中后只在所选列表内并发查询，列表耗尽不查询其他 policy 或主组；
 - GeoSite 资产或分类不可用时该 policy 不命中，不能因反选变成全匹配；
 - 存在分类但属性筛选为空时仍可用，正选不命中、反选匹配合法非空名称。
 
@@ -142,19 +142,25 @@ A/AAAA 缓存最多 256 项，从空容量按需增长。TUN 域名提示存储�
 - 每个调用方恢复自己的 transaction ID 和 endpoint，并独立应用失败策略；
 - 不同 key 可以并行。
 
+## Hosts 与解析职责
+
+`hosts` 支持 IP、IP 数组和域名别名，匹配规则沿用 Clash 域名通配；默认包含 localhost，别名循环在配置阶段拒绝。`use-hosts`、`use-system-hosts` 独立控制配置与系统 hosts，默认均为 true；系统 hosts 在运行时创建时读取。TCP、UDP 节点的 TLS SNI 和逻辑目的名称不因解析为 IP 而改变。
+
+`default-nameserver` 仅引导上游域名。`proxy-server-nameserver` 与其 policy 用于节点解析；`direct-nameserver` 用于直连，`direct-nameserver-follow-policy` 决定是否使用业务 policy。各角色拥有独立 cache/singleflight，未配置节点或直连 resolver 时复用主 resolver。有限并发、取消与连接池适用于各角色，依赖循环不会等待自身的 singleflight。
+
 ## 查询、故障转移与连接复用
 
 - 查询总期限 5 秒；单 nameserver 尝试最多 3 秒，并受剩余时间限制。
 - UDP 尝试只打开一个传输；首次发送后 1 秒无合法响应时，在同一传输和 ID 上最多重发一次。
 - 前两次 peer/ID/question 不匹配只丢当前响应，第三次使当前尝试失败。
-- 超时、I/O、格式错误、SERVFAIL、REFUSED、TC 或规则 REJECT 会继续当前组下一项。
+- 当前策略最多同时发起 4 个上游尝试；优先返回有效响应并取消其余尝试。超时、I/O、格式错误、SERVFAIL、REFUSED 或 REJECT 不作为成功结果。
 - NXDOMAIN 和 NODATA 是终态。
-- UDP TC 不自动切换 TCP；只有显式 `tcp://` endpoint 使用 TCP。
+- 验证来源、ID 和 question 后，UDP TC 在原期限内改用同一 endpoint 的 TCP。TCP TC 仍是失败响应。
 - 全部上游失败时生成 SERVFAIL；非法 UDP 查询只丢当前数据报。
 
-显式 TCP nameserver 使用每运行时独立连接池：
+TCP、DoT 和 DoH 使用解析器所属的连接池：
 
-- Key 为 endpoint 和配置的 route target；
+- Key 包含上游地址、认证名称、传输、HTTP 路径、endpoint 与最终 route target；
 - 一条连接同时只处理一个查询，不做 pipeline；
 - 活动连接不设固定业务数量上限；空闲连接总数最多 4、同 key 最多 2、超时 30 秒；
 - 完成帧和响应校验后才能归还连接；
@@ -188,17 +194,17 @@ DNS 提示或 GeoData 更新改路；新流使用当前数据。每目标按同�
 
 ## IP-only协议与独立测速接点
 
-公共`ResolutionContext`仅在协议必须取得IP地址的边界解析业务目标或逻辑上游；原始`Destination`保持不变，HTTP Host、TLS SNI和路由仍使用逻辑名称。代理endpoint的prepare bootstrap与该运行期解析分离，不递归使用尚未建立的同一出口。当前静态ECH不查询DNS；动态ECH及其可选宿主bootstrap入口尚未实现，不属于当前Invoke接口。
+公共`ResolutionContext`仅在协议必须取得IP地址的边界解析业务目标或逻辑上游；原始`Destination`保持不变，HTTP Host、TLS SNI和路由仍使用逻辑名称。代理服务器在实际建链时通过节点 resolver 解析，准备阶段不解析备用节点。当前静态ECH不查询DNS；动态ECH及其可选宿主bootstrap入口尚未实现，不属于当前Invoke接口。
 
-Running Session上下文仅弱引用本session的RuntimeDns，使用上文nameserver/policy与出口；未绑定、DNS关闭、上游不可达或session已停止时明确失败，不调用系统resolver兜底。IP字面量仍执行端口/地址族政策。解析共享同一次建链期限，Stop取消当前及后续查询；在进入可能等待自身的singleflight之前拒绝同名递归依赖，嵌套依赖深度最多32层。不会因为DNS经代理出口就无条件禁止整个图。
+Running Session上下文仅弱引用本 session 的 RuntimeDns；业务 IP-only 解析使用 nameserver/policy，代理服务器使用 proxy-server-nameserver/policy，DIRECT 目标使用 direct-nameserver。未绑定、上游不可达或 session 已停止时失败；只有配置关闭 DNS 时才使用系统解析。IP字面量仍执行端口/地址族政策。解析共享同一次建链期限，Stop取消当前及后续查询；在进入可能等待自身的singleflight之前拒绝同名递归依赖，嵌套依赖深度最多32层。不会因为DNS经代理出口就无条件禁止整个图。
 
 独立`measureDelay`使用测量生命周期的受控bootstrap resolver，仅在IP-only边界解析域名；不创建Running Session、RuntimeDns或DNS监听服务，也不改变现有endpoint准备流程。通用 IP-only connector 覆盖最终节点和 `dialer-proxy` 上游的受控解析、期限与取消。该公共接点继续供 packetaddr 等必须 IP 的消费者使用；通用机制测试不替代各协议的实际数据闭环。
 
 ## 不支持
 
 - 真实 ICMP 转发、ICMP error、Traceroute、ICMP 选路规则或 ICMP 测速；
-- DoH、DoT、DoQ、hostname/system/DHCP nameserver；
-- 代理组 provider/health check/自动 failover、并行 nameserver 竞速、DNS fallback group、fake IP 和 hosts；
+- DoQ、DoH HTTP/2/3、显式 system/DHCP nameserver；
+- 代理组 provider/health check/自动 failover、DNS fallback group、fake IP、动态 hosts: lan；
 - 用户可配置的缓存容量、超时、重试或并发度；
 - 使用 DNS question 执行业务规则，或用 DNS 出口改写后续业务动作。
 
