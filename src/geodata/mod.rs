@@ -449,7 +449,7 @@ pub struct GeoRequirements {
 
 impl GeoRequirements {
     pub(crate) fn for_config(config: &crate::config::Config) -> Result<Self, GeoDataError> {
-        let policies: Vec<_> = config
+        let mut policies: Vec<_> = config
             .dns
             .nameserver_policies
             .iter()
@@ -459,7 +459,19 @@ impl GeoRequirements {
                 nameservers: Box::new([]),
             })
             .collect();
-        Self::collect(&config.rules, &policies)
+        if config.dns.enable && config.dns.fake_ip.enabled {
+            policies.extend(config.dns.fake_ip.filter.iter().cloned().map(|selector| {
+                DnsNameserverPolicy {
+                    selector,
+                    nameservers: Box::new([]),
+                }
+            }));
+        }
+        let mut result = Self::collect(&config.rules, &policies)?;
+        if config.dns.enable && config.dns.fake_ip.enabled {
+            result.extend(&Self::collect(&config.dns.fake_ip.rules, &[])?)?;
+        }
+        Ok(result)
     }
 
     pub(crate) fn extend(&mut self, other: &Self) -> Result<(), GeoDataError> {

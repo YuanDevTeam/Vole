@@ -1,4 +1,6 @@
 //! Strict parsing for the current Vole YAML configuration.
+mod fake_ip;
+pub use fake_ip::{FakeIpConfig, FakeIpFilterMode, FakeIpRange};
 mod http_proxy;
 mod ip_version;
 pub use http_proxy::HttpOutboundConfig;
@@ -245,6 +247,7 @@ impl SnifferConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsConfig {
+    pub fake_ip: FakeIpConfig,
     pub enable: bool,
     pub ipv6: bool,
     pub nameservers: Vec<DnsNameserver>,
@@ -1168,6 +1171,16 @@ enum RawSnifferPort {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDnsConfig {
+    #[serde(rename = "fake-ip-range", default = "fake_ip::default_fake_range")]
+    fake_ip_range: String,
+    #[serde(rename = "fake-ip-range6", default)]
+    fake_ip_range6: String,
+    #[serde(rename = "fake-ip-filter", default = "fake_ip::default_fake_filter")]
+    fake_ip_filter: Vec<String>,
+    #[serde(rename = "fake-ip-filter-mode", default)]
+    fake_ip_filter_mode: FakeIpFilterMode,
+    #[serde(rename = "fake-ip-ttl", default = "fake_ip::default_fake_ttl")]
+    fake_ip_ttl: i64,
     #[serde(default)]
     enable: bool,
     #[serde(default)]

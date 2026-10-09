@@ -403,6 +403,11 @@ impl PreparedCore {
             rules: self.rules.clone(),
             geo_matcher: self.geodata_registration.matcher(),
             previous_dns: None,
+            data_dir: self
+                .geodata_manager
+                .store_dir()
+                .parent()
+                .map(std::path::Path::to_path_buf),
         }
         .build(dialer.clone())?;
         if let Some(cache) = self.provider_cache.lock().unwrap().take() {
@@ -539,7 +544,7 @@ impl PreparedCore {
     pub(crate) async fn start_native_tun(self, dialer: Dialer) -> io::Result<RunningCore> {
         let (tun, dialer, mut network) = crate::platform::linux_network::open(
             &self.config.tun,
-            self.config.dns.enable,
+            &self.config.dns,
             self.config.ipv6,
             dialer,
         )?;
@@ -632,6 +637,7 @@ struct GraphBuilder {
     rules: RuleSet,
     geo_matcher: Arc<dyn GeoMatcher>,
     previous_dns: Option<Arc<RuntimeDns>>,
+    data_dir: Option<std::path::PathBuf>,
 }
 impl GraphBuilder {
     fn build(&self, dialer: Dialer) -> io::Result<BuiltRuntimeParts> {
@@ -692,7 +698,14 @@ impl GraphBuilder {
                 self.limits.dns_address_cache_entries,
                 redir_host_entries,
             )
-            .with_mapping_from(self.previous_dns.as_deref()),
+            .with_mapping_from(self.previous_dns.as_deref())
+            .with_fake_ip_store(
+                if self.config.profile.store_fake_ip && self.previous_dns.is_none() {
+                    self.data_dir.as_deref()
+                } else {
+                    None
+                },
+            )?,
         ));
         proxy_graph.resolution.bind_runtime(dns.as_ref())?;
         let health = health::HealthRuntime::new(

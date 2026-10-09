@@ -27,6 +27,7 @@ log-level: info
 unified-delay: false
 profile:
   store-selected: true
+  store-fake-ip: false # true：dataDir/fake-ip.redb 持久化双向映射与分配位置
 
 # 资源下载使用 global-ua（缺省 Vole/ 加 Core 版本）；etag-support 缺省 true。
 # GeoData 字段独立可选；URL 缺省 MetaCubeX meta-rules-dat latest DAT。
@@ -531,7 +532,16 @@ hosts:
 dns:
   enable: true
   ipv6: true
-  enhanced-mode: redir-host
+  enhanced-mode: redir-host # 或 fake-ip；内部节点/直连解析始终取得真实地址
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-range6: "" # 设置 IPv6 CIDR 且启用 IPv6 后分配 AAAA
+  fake-ip-ttl: 1 # 秒，最小 1；不决定映射寿命
+  fake-ip-filter-mode: blacklist # blacklist / whitelist / rule
+  fake-ip-filter: [dns.msftnsci.com, www.msftnsci.com, www.msftconnecttest.com]
+  # blacklist：命中返回真实地址；whitelist：只有命中才分配 fake-IP。
+  # 普通过滤项支持 Clash 域名通配、geosite: 和 rule-set:。
+  # rule：使用 DOMAIN-SUFFIX,example.com,real-ip 等域名规则；动作 real-ip/fake-ip。
+  # rule 未命中分配 fake-IP；两种地址池均保留网络地址后的前三个地址及广播地址。
   use-hosts: true
   use-system-hosts: true
   respect-rules: false

@@ -92,6 +92,9 @@ pub struct RuntimeDns {
     ipv6: bool,
     nameservers: Box<[DnsNameserver]>,
     hosts: super::hosts::Hosts,
+    fake_config: crate::config::FakeIpConfig,
+    fake_filter: super::fake_ip::Filter,
+    fake_pools: Option<Arc<super::fake_ip::FakePools>>,
     bootstrap: Option<Arc<RuntimeDns>>,
     proxy_resolver: Option<Arc<RuntimeDns>>,
     direct_resolver: Option<Arc<RuntimeDns>>,
@@ -803,9 +806,47 @@ impl RuntimeDns {
     pub(crate) fn with_mapping_from(mut self, previous: Option<&Self>) -> Self {
         if let Some(previous) = previous {
             self.hints = previous.hints.clone();
+            if self.fake_config.enabled == previous.fake_config.enabled
+                && self.fake_config.range == previous.fake_config.range
+                && self.fake_config.range6 == previous.fake_config.range6
+                && self.ipv6 == previous.ipv6
+            {
+                self.fake_pools = previous.fake_pools.clone();
+            }
         }
         self
     }
+    pub(crate) fn with_fake_ip_store(mut self, root: Option<&std::path::Path>) -> io::Result<Self> {
+        if self.enabled
+            && self.fake_config.enabled
+            && let Some(root) = root
+        {
+            self.fake_pools = Some(Arc::new(super::fake_ip::FakePools::open(
+                &self.fake_config,
+                self.ipv6,
+                Some(&root.join("fake-ip.redb")),
+            )?));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn recover_fake_ip(&self, address: IpAddr) -> io::Result<Option<String>> {
+        self.fake_pools
+            .as_ref()
+            .map_or(Ok(None), |pool| pool.recover(address))
+    }
+
+    fn use_fake_ip(&self, host: &str) -> bool {
+        if self.fake_pools.is_none() {
+            return false;
+        }
+        let snapshot = self.geo_matcher.routing_snapshot();
+        !self.fake_filter.skips(
+            host,
+            snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref()),
+        )
+    }
+
     /// Creates a resolver whose upstream traffic uses one preselected
     /// dispatcher and no GeoData matcher. Production runtimes use
     /// [`Self::new_routed`].
@@ -918,6 +959,12 @@ impl RuntimeDns {
         ));
         let mut root = Self::assemble_leaf(config, egress.clone(), geo.clone(), cache, hints);
         root.bootstrap = Some(bootstrap.clone());
+        if config.enable && config.fake_ip.enabled {
+            root.fake_pools = Some(Arc::new(
+                super::fake_ip::FakePools::open(&config.fake_ip, config.ipv6, None)
+                    .expect("validated fake-IP ranges"),
+            ));
+        }
         let role = |nameservers: &[DnsNameserver], policies: &[DnsNameserverPolicy]| {
             let mut role_config = config.clone();
             role_config.nameservers = nameservers.to_vec();
@@ -959,6 +1006,9 @@ impl RuntimeDns {
                 config.use_hosts,
                 config.use_system_hosts,
             ),
+            fake_config: config.fake_ip.clone(),
+            fake_filter: super::fake_ip::Filter::new(&config.fake_ip),
+            fake_pools: None,
             bootstrap: None,
             proxy_resolver: None,
             direct_resolver: None,
@@ -1232,6 +1282,13 @@ impl RuntimeDns {
                         .await
                 }
                 DnsQueryKind::Opaque => {
+                    if matches!(failure_mode, FailureMode::WireServfail)
+                        && matches!(classified.question.query_type, 64 | 65)
+                        && self.use_fake_ip(&classified.question.name)
+                    {
+                        return super::synthesize_empty_response(classified, 0)
+                            .map_err(RuntimeDnsError::InvalidResponse);
+                    }
                     self.exchange_opaque(query, classified, deadline, failure_mode)
                         .await
                 }
@@ -1252,6 +1309,26 @@ impl RuntimeDns {
                     }),
                 }
             }
+        }
+    }
+
+    fn synthetic_answer(&self, query: &DnsMessage, host: &str) -> Result<Vec<u8>, RuntimeDnsError> {
+        match self
+            .fake_pools
+            .as_ref()
+            .expect("enabled fake-IP pool")
+            .lookup(host, query.question.query_type == QueryType::Aaaa)
+        {
+            Ok(address) => {
+                let mut wire = synthesize_response(
+                    query,
+                    &CacheValue::Positive(address.into_iter().collect()),
+                    self.fake_config.ttl,
+                )?;
+                wire[2] |= 0x04;
+                Ok(wire)
+            }
+            Err(_) => synthesize_response(query, &CacheValue::Negative { rcode: 2 }, 0),
         }
     }
 
@@ -1276,6 +1353,9 @@ impl RuntimeDns {
             })? {
             HostValue::Addresses(addresses) => Some(addresses),
             HostValue::Alias(alias) if alias != parsed_query.question.name => {
+                if matches!(failure_mode, FailureMode::WireServfail) && self.use_fake_ip(&alias) {
+                    return self.synthetic_answer(&parsed_query, &alias);
+                }
                 Some(Box::pin(self.resolve(&alias)).await?)
             }
             _ => None,
@@ -1289,6 +1369,12 @@ impl RuntimeDns {
                 })
                 .collect();
             return synthesize_response(&parsed_query, &CacheValue::Positive(addresses), 600);
+        }
+
+        if matches!(failure_mode, FailureMode::WireServfail)
+            && self.use_fake_ip(&parsed_query.question.name)
+        {
+            return self.synthetic_answer(&parsed_query, &parsed_query.question.name);
         }
 
         loop {
@@ -4860,5 +4946,70 @@ dns:
 
         drop(response);
         assert_eq!(resolver.resource_stats.snapshot().dns_current, 0);
+    }
+    #[tokio::test]
+    async fn fake_ip_answers_recover_names_and_keep_internal_resolution_real() {
+        let config = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+hosts:
+  alias.example: synthetic.example
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-filter: [real.example]
+  nameserver: [192.0.2.1]
+  use-system-hosts: false
+"#,
+        )
+        .unwrap();
+        let real: IpAddr = "203.0.113.7".parse().unwrap();
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            vec![
+                MockReply::Response(ResponseSpec::answer(real)),
+                MockReply::Response(ResponseSpec::answer(real)),
+            ],
+            vec![],
+        ));
+        let resolver = RuntimeDns::new(&config.dns, dispatcher.clone());
+        for name in ["synthetic.example", "alias.example"] {
+            let wire = resolver
+                .exchange(&build_query(10, name, QueryType::A).unwrap())
+                .await
+                .unwrap();
+            let answer = parse_response(&wire).unwrap();
+            assert!(answer.authoritative);
+            let address = matching_answer_set(&answer).unwrap().addresses[0];
+            assert_eq!(address, "198.18.0.4".parse::<IpAddr>().unwrap());
+            assert_eq!(
+                resolver.recover_fake_ip(address).unwrap().as_deref(),
+                Some("synthetic.example")
+            );
+        }
+        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 0);
+        assert_eq!(resolver.resolve("synthetic.example").await.unwrap(), [real]);
+        let wire = resolver
+            .exchange(&build_query(11, "real.example", QueryType::A).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            matching_answer_set(&parse_response(&wire).unwrap())
+                .unwrap()
+                .addresses,
+            [real]
+        );
+        let updated = RuntimeDns::new(&config.dns, dispatcher).with_mapping_from(Some(&resolver));
+        assert_eq!(
+            updated
+                .recover_fake_ip("198.18.0.4".parse().unwrap())
+                .unwrap()
+                .as_deref(),
+            Some("synthetic.example")
+        );
+        assert!(
+            updated
+                .recover_fake_ip("198.18.0.9".parse().unwrap())
+                .is_err()
+        );
     }
 }

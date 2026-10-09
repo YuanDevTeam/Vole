@@ -5,6 +5,7 @@
 //! redir-host table is bounded by the constants below, while concurrent query
 //! activity is observed rather than rejected by a fixed local admission cap.
 
+pub(crate) mod fake_ip;
 pub(crate) mod hosts;
 mod https;
 pub(crate) mod policy;

@@ -30,9 +30,7 @@ impl DnsConfig {
 
 impl RawDnsConfig {
     pub(super) fn normalize(self, targets: &RouteTargetsByName) -> Result<DnsConfig> {
-        if self.enhanced_mode != "redir-host" {
-            return invalid("dns.enhanced-mode currently supports redir-host");
-        }
+        let fake_ip = self.fake_ip()?;
         if self.enable && self.nameserver.is_empty() {
             return invalid("enabled DNS requires nameserver");
         }
@@ -65,6 +63,7 @@ impl RawDnsConfig {
             return invalid("default-nameserver requires literal IP addresses");
         }
         Ok(DnsConfig {
+            fake_ip,
             enable: self.enable,
             ipv6: self.ipv6,
             nameservers: parse(self.nameserver, main_route)?,

@@ -40,6 +40,9 @@ trait RoutingDns: Send + Sync {
     fn is_enabled(&self) -> bool {
         true
     }
+    fn recover_fake_ip(&self, _address: IpAddr) -> Result<Option<String>, DispatchError> {
+        Ok(None)
+    }
     async fn resolve_direct(&self, host: &str) -> Result<Vec<IpAddr>, DispatchError> {
         self.resolve(host).await
     }
@@ -50,6 +53,10 @@ trait RoutingDns: Send + Sync {
 
 #[async_trait]
 impl RoutingDns for RuntimeDns {
+    fn recover_fake_ip(&self, address: IpAddr) -> Result<Option<String>, DispatchError> {
+        RuntimeDns::recover_fake_ip(self, address).map_err(|_| DispatchError::HostUnreachable)
+    }
+
     fn is_enabled(&self) -> bool {
         RuntimeDns::is_enabled(self)
     }
@@ -283,6 +290,24 @@ impl RoutingDispatcher {
         sniffed_domain: Option<&str>,
     ) -> Result<RouteDecision, DispatchError> {
         self.ensure_destination_allowed(destination)?;
+        let recovered = if matches!(
+            inbound,
+            InboundKind::Tun | InboundKind::Http | InboundKind::Socks5
+        ) {
+            match (destination, &self.dns) {
+                (Destination::Ip(address), Some(dns)) => {
+                    dns.recover_fake_ip(address.ip())?
+                        .map(|host| Destination::Domain {
+                            host,
+                            port: address.port(),
+                        })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let destination = recovered.as_ref().unwrap_or(destination);
         let accepts_domain_hint = inbound == InboundKind::Tun && self.rules.uses_domain_routing();
         let sniffed_domain = accepts_domain_hint.then_some(sniffed_domain).flatten();
         let dns_domain_hint = match (accepts_domain_hint, destination, &self.dns, sniffed_domain) {
@@ -560,6 +585,7 @@ impl Dispatcher for RoutingDispatcher {
             router: self.clone_parts(),
             session,
             route_transports: HashMap::new(),
+            fake_flows: HashMap::new(),
             direct_transport: None,
             flows: DatagramRoutes::new(self.tun_config.udp_timeout),
             logged_route_actions: HashSet::new(),
@@ -586,10 +612,20 @@ struct RoutedDatagramTransport {
     router: RoutingDispatcher,
     session: DatagramSession,
     route_transports: HashMap<RouteTargetId, CachedRouteTransport>,
+    fake_flows: HashMap<SocketAddr, FakeDatagramFlow>,
     direct_transport: Option<Box<dyn DatagramTransport>>,
     flows: DatagramRoutes,
     logged_route_actions: HashSet<LoggedRouteAction>,
     receive_wakeup: Arc<Notify>,
+}
+
+// Each synthetic target owns an association: two names may resolve to the same
+// real endpoint, and replies must still retain their original synthetic address.
+struct FakeDatagramFlow {
+    transport: Box<dyn DatagramTransport>,
+    remote: SocketAddr,
+    last_used: Instant,
+    flow_id: Option<Box<[u8]>>,
 }
 
 struct CachedRouteTransport {
@@ -676,6 +712,89 @@ impl From<RuleAction> for LoggedRouteAction {
 }
 
 impl RoutedDatagramTransport {
+    async fn expire_fake_flows(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<_> = self
+            .fake_flows
+            .iter()
+            .filter_map(|(key, flow)| {
+                (now.duration_since(flow.last_used) >= self.router.tun_config.udp_timeout)
+                    .then_some(*key)
+            })
+            .collect();
+        for key in expired {
+            if let Some(mut flow) = self.fake_flows.remove(&key) {
+                let _ = flow.transport.close().await;
+            }
+        }
+    }
+
+    async fn send_fake(
+        &mut self,
+        original: SocketAddr,
+        mut datagram: Datagram,
+    ) -> Result<(), DispatchError> {
+        if !self.fake_flows.contains_key(&original) {
+            let mut decision = self
+                .router
+                .route(
+                    Network::Udp,
+                    self.session.inbound,
+                    self.session.source,
+                    &datagram.remote,
+                    datagram.sniffed_domain.as_deref(),
+                )
+                .await?;
+            let (dispatcher, direct) = match decision.action {
+                RuleAction::Reject => return Ok(()),
+                RuleAction::Direct => (self.router.direct.clone(), true),
+                RuleAction::Route(id) => {
+                    let target = self.router.route_targets.resolve(id)?;
+                    (target.dispatcher, target.direct)
+                }
+            };
+            if direct {
+                self.router
+                    .resolve_direct_destination(&mut decision)
+                    .await?;
+            }
+            let remote = match decision.destination {
+                Destination::Ip(address) => address,
+                Destination::Domain { host, port } => {
+                    let dns = self
+                        .router
+                        .dns
+                        .as_ref()
+                        .ok_or(DispatchError::HostUnreachable)?;
+                    let addresses = self.router.resolve_addresses(dns, &host).await;
+                    SocketAddr::new(
+                        preferred_address(&addresses).ok_or(DispatchError::HostUnreachable)?,
+                        port,
+                    )
+                }
+            };
+            let transport = dispatcher.open_datagram(self.session.clone()).await?;
+            self.fake_flows.insert(
+                original,
+                FakeDatagramFlow {
+                    transport,
+                    remote,
+                    last_used: Instant::now(),
+                    flow_id: None,
+                },
+            );
+            self.receive_wakeup.notify_one();
+        }
+        let flow = self
+            .fake_flows
+            .get_mut(&original)
+            .expect("fake-IP flow inserted");
+        datagram.remote = Destination::Ip(flow.remote);
+        datagram.sniffed_domain = None;
+        flow.last_used = Instant::now();
+        flow.transport.send(datagram).await
+    }
+
     fn should_log_route_action(&mut self, action: RuleAction) -> bool {
         self.logged_route_actions.insert(action.into())
     }
@@ -744,11 +863,14 @@ impl RoutedDatagramTransport {
             // Only send/close can change these caches, and they also require
             // &mut self. The sole backend cannot change during this receive;
             // cancellation releases the borrow before another route is opened.
-            if self.route_transports.is_empty() {
+            if self.fake_flows.is_empty() && self.route_transports.is_empty() {
                 if let Some(direct) = self.direct_transport.as_mut() {
                     return direct.receive().await;
                 }
-            } else if self.route_transports.len() == 1 && self.direct_transport.is_none() {
+            } else if self.fake_flows.is_empty()
+                && self.route_transports.len() == 1
+                && self.direct_transport.is_none()
+            {
                 return self
                     .route_transports
                     .values_mut()
@@ -758,13 +880,28 @@ impl RoutedDatagramTransport {
                     .receive()
                     .await;
             }
-            let mut receives = self
+            let mut receives: Vec<
+                futures_util::future::BoxFuture<'_, Result<Datagram, DispatchError>>,
+            > = self
                 .route_transports
                 .values_mut()
                 .map(|cached| cached.transport.receive())
                 .collect::<Vec<_>>();
             if let Some(direct) = self.direct_transport.as_mut() {
                 receives.push(direct.receive());
+            }
+            for (original, flow) in &mut self.fake_flows {
+                receives.push(Box::pin(async move {
+                    loop {
+                        let mut response = flow.transport.receive().await?;
+                        if response.remote != Destination::Ip(flow.remote) {
+                            continue;
+                        }
+                        response.remote = Destination::Ip(*original);
+                        flow.last_used = Instant::now();
+                        return Ok(response);
+                    }
+                }));
             }
             if receives.is_empty() {
                 self.receive_wakeup.notified().await;
@@ -781,6 +918,21 @@ impl RoutedDatagramTransport {
 #[async_trait]
 impl DatagramTransport for RoutedDatagramTransport {
     async fn send(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
+        self.expire_fake_flows().await;
+        if matches!(self.session.inbound, InboundKind::Tun | InboundKind::Socks5)
+            && let Destination::Ip(original) = datagram.remote
+            && (self.fake_flows.contains_key(&original)
+                || self
+                    .router
+                    .dns
+                    .as_ref()
+                    .map(|dns| dns.recover_fake_ip(original.ip()))
+                    .transpose()?
+                    .flatten()
+                    .is_some())
+        {
+            return self.send_fake(original, datagram).await;
+        }
         let now = Instant::now();
         if self.session.inbound == InboundKind::Tun {
             self.flows.expire(now);
@@ -858,7 +1010,21 @@ impl DatagramTransport for RoutedDatagramTransport {
                 self.flows.entries.remove(&destination);
             }
         }
+        if let Some(destination) = flow
+            && self
+                .fake_flows
+                .get(&destination)
+                .is_some_and(|flow| flow.flow_id.as_deref() != Some(flow_id))
+            && let Some(mut old) = self.fake_flows.remove(&destination)
+        {
+            old.transport.close().await?;
+        }
         self.send(datagram).await?;
+        if let Some(destination) = flow
+            && let Some(flow) = self.fake_flows.get_mut(&destination)
+        {
+            flow.flow_id = Some(flow_id.into());
+        }
         if let Some(destination) = flow
             && let Some(route) = self.flows.entries.get_mut(&destination)
             && route.flow_id.as_deref() != Some(flow_id)
@@ -869,6 +1035,7 @@ impl DatagramTransport for RoutedDatagramTransport {
     }
 
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+        self.expire_fake_flows().await;
         let datagram = self.receive_inner().await?;
         if self.session.inbound == InboundKind::Tun {
             let now = Instant::now();
@@ -882,6 +1049,14 @@ impl DatagramTransport for RoutedDatagramTransport {
 
     async fn close(&mut self) -> Result<(), DispatchError> {
         let mut first_error = None;
+        for flow in self.fake_flows.values_mut() {
+            if let Err(error) = flow.transport.close().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        self.fake_flows.clear();
         for route in self.route_transports.values_mut() {
             if let Err(error) = route.transport.close().await
                 && first_error.is_none()
@@ -2901,5 +3076,75 @@ mod tests {
             direct.tcp_sessions.lock().unwrap()[0].destination,
             Destination::Ip(SocketAddr::new(selected, 443))
         );
+    }
+    #[tokio::test]
+    async fn fake_ip_routing_preserves_tcp_names_and_distinct_udp_reply_addresses() {
+        struct FakeDns;
+        #[async_trait]
+        impl RoutingDns for FakeDns {
+            fn recover_fake_ip(&self, address: IpAddr) -> Result<Option<String>, DispatchError> {
+                Ok(match address.to_string().as_str() {
+                    "198.18.0.4" => Some("one.example".into()),
+                    "198.18.0.5" => Some("two.example".into()),
+                    _ => None,
+                })
+            }
+            async fn resolve(&self, _: &str) -> Result<Vec<IpAddr>, DispatchError> {
+                Ok(vec!["203.0.113.10".parse().unwrap()])
+            }
+            async fn exchange(&self, _: &[u8]) -> Result<DnsWireResponse, DispatchError> {
+                Err(DispatchError::HostUnreachable)
+            }
+            async fn domain_hint(&self, _: IpAddr) -> Option<String> {
+                None
+            }
+        }
+        let proxy = Arc::new(RecordingDispatcher::default());
+        let direct = Arc::new(RecordingDispatcher::default());
+        let router = dispatcher(
+            proxy.clone(),
+            direct,
+            Some(Arc::new(FakeDns)),
+            vec![rule(RuleKind::Match, proxy_action(0))],
+        );
+        let first: SocketAddr = "198.18.0.4:443".parse().unwrap();
+        let second: SocketAddr = "198.18.0.5:443".parse().unwrap();
+        let _stream = router
+            .connect_tcp(stream(first, InboundKind::Tun))
+            .await
+            .unwrap();
+        assert_eq!(
+            proxy.tcp_sessions.lock().unwrap()[0].destination,
+            Destination::Domain {
+                host: "one.example".into(),
+                port: 443
+            }
+        );
+        let mut udp = router
+            .open_datagram(DatagramSession::new(
+                InboundKind::Tun,
+                "192.0.2.2:9000".parse().unwrap(),
+            ))
+            .await
+            .unwrap();
+        for (address, payload) in [(first, "one"), (second, "two")] {
+            udp.send(Datagram {
+                remote: Destination::Ip(address),
+                payload: Bytes::from(payload),
+                sniffed_domain: None,
+            })
+            .await
+            .unwrap();
+        }
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let packet = udp.receive().await.unwrap();
+            received.push((packet.remote, packet.payload));
+        }
+        assert!(received.contains(&(Destination::Ip(first), Bytes::from("one"))));
+        assert!(received.contains(&(Destination::Ip(second), Bytes::from("two"))));
+        assert_eq!(proxy.udp_opens.load(Ordering::Relaxed), 2);
+        assert!(proxy.datagrams.lock().unwrap().iter().all(|packet| packet.remote == Destination::Ip("203.0.113.10:443".parse().unwrap())));
+        udp.close().await.unwrap();
     }
 }

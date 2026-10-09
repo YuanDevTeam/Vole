@@ -267,6 +267,11 @@ impl ProviderRuntime {
         let dialer = self.dialer.clone();
         let geo = self.geo.clone();
         let previous_dns = generation.dns.clone();
+        let data_dir = self
+            .manager
+            .store_dir()
+            .parent()
+            .map(std::path::Path::to_path_buf);
         let prepared = tokio::task::spawn_blocking(
             move || -> io::Result<(Config, BuiltRuntimeParts, GeoRequirements)> {
                 let mut config = template.materialize(&contents).map_err(io::Error::other)?;
@@ -282,6 +287,7 @@ impl ProviderRuntime {
                     rules,
                     geo_matcher: geo,
                     previous_dns,
+                    data_dir,
                 }
                 .build(dialer)?;
                 Ok((config, parts, requirements))

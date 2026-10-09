@@ -396,28 +396,48 @@ impl ProviderTemplate {
             sets.insert(name.clone(), rules.clone());
         }
         bind_rules(&mut config.rules, &sets)?;
+        bind_rules(&mut config.dns.fake_ip.rules, &sets)?;
+        for rule in &config.dns.fake_ip.rules {
+            if let RuleKind::RuleSet {
+                content: Some(set), ..
+            } = &rule.kind
+                && set.behavior() == RuleBehavior::Ipcidr
+            {
+                return invalid("fake-IP filter requires a domain or classical rule provider");
+            }
+        }
+        for selector in &mut config.dns.fake_ip.filter {
+            bind_domain_selector(selector, &sets)?;
+        }
         for policy in config
             .dns
             .nameserver_policies
             .iter_mut()
             .chain(&mut config.dns.proxy_policies)
         {
-            if let DnsPolicySelector::RuleSets { names, sets: bound } = &mut policy.selector {
-                for name in names.iter() {
-                    let set = sets.get(name).ok_or_else(|| {
-                        VoleError::InvalidConfig(format!("unknown rule provider `{name}`"))
-                    })?;
-                    if set.behavior() == RuleBehavior::Ipcidr {
-                        return invalid("DNS policy requires a domain or classical rule provider");
-                    }
-                    bound.push(set.clone());
-                }
-            }
+            bind_domain_selector(&mut policy.selector, &sets)?;
         }
         config.provider_members = providers;
         config.providers = Some(self.clone());
         Ok(config)
     }
+}
+fn bind_domain_selector(
+    selector: &mut DnsPolicySelector,
+    sets: &HashMap<String, Arc<RuleCollection>>,
+) -> Result<()> {
+    if let DnsPolicySelector::RuleSets { names, sets: bound } = selector {
+        for name in names.iter() {
+            let set = sets.get(name).ok_or_else(|| {
+                VoleError::InvalidConfig(format!("unknown rule provider `{name}`"))
+            })?;
+            if set.behavior() == RuleBehavior::Ipcidr {
+                return invalid("domain selector requires a domain or classical rule provider");
+            }
+            bound.push(set.clone());
+        }
+    }
+    Ok(())
 }
 fn bind_rules(rules: &mut [RuleSpec], sets: &HashMap<String, Arc<RuleCollection>>) -> Result<()> {
     for rule in rules {

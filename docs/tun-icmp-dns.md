@@ -50,7 +50,29 @@ UDP 读取器只做有界 wire 分类和任务提交，不同步等待上游。�
 
 SVCB、HTTPS、TXT、PTR、MX、SRV、NS、SOA、DNSSEC 和未知 16 位 qtype 都可按原始查询转发。A/AAAA 响应中的可达 CNAME 链继续执行严格地址和 TTL 校验。
 
-TUN 域名提示存储只在启用 TUN 且业务规则包含域名类规则时创建。嗅探域名优先于 DNS 提示，两者都不改写实际目标。
+redir-host 模式的 TUN 域名提示存储只在启用 TUN 且业务规则包含域名类规则时创建。嗅探域名优先于 DNS 提示，两者都不改写实际目标。
+
+## Fake-IP
+
+`enhanced-mode: fake-ip` 在 TUN DNS 回答 A/AAAA 时分配合成地址；hosts 优先。
+TCP 和 UDP 的 TUN / mixed 入口恢复域名后选路，节点、DIRECT 与必须 IP 的出站通过内部解析器取得真实地址。
+SVCB/HTTPS 在选择 fake-IP 时返回空回答；过滤到真实地址的查询仍转发。
+
+IPv4 池默认 `198.18.0.1/16`，IPv6 池默认关闭。每个池从网络地址 +4 开始分配，
+排除广播地址并循环复用；没有配置相应地址池时返回 NODATA。
+`fake-ip-ttl` 最小为一秒，只控制 DNS 回答 TTL。内存模式每个地址族最多保留 1,000 项，
+按使用情况淘汰。未知或已淘汰的合成地址不能作为真实目标拨号。
+
+`fake-ip-filter-mode` 支持 blacklist、whitelist 和 rule。前两种使用域名通配、GeoSite 或
+域名规则集合；rule 按声明顺序匹配域名规则并使用 `real-ip` / `fake-ip` 动作，未匹配时分配。
+默认 blacklist 只包含三个 Microsoft 连通性探测域名，详见配置示例。
+
+`profile.store-fake-ip: true` 将双向映射和分配位置写入 `dataDir/fake-ip.redb`，
+写入完成后才返回地址。磁盘存储的缓存有界，映射不受内存模式的 1,000 项限制。
+相同地址池在重启后保留系统 DNS 缓存中的旧地址；修改池范围时清除对应地址族映射。
+资源更新共享当前地址池，过滤器可独立更新。关闭持久化后重启不保证旧映射有效。
+活动 UDP 流保留首包选择和真实目标，并使用独立传输区分解析到相同真实端点的不同名称；
+回复恢复原合成地址，空闲和停止时释放。
 
 ## Nameserver 与出口
 
@@ -73,7 +95,7 @@ dns:
 - `dns.ipv6: false` 不限制 IPv6 nameserver；顶层 `ipv6: false` 会阻止通过 DIRECT（含 `RULES` 选中 DIRECT）的 IPv6 nameserver 在本机物理建链，并继续当前组的故障转移。
 - 上游域名由 `default-nameserver` 引导解析，后者只允许 IP 上游。未启用 DNS 时，内部解析使用系统 resolver；启用后不因查询失败回退系统解析。显式 system/DHCP nameserver 尚未实现。
 - 无 fragment 时默认 DIRECT；`respect-rules: true` 改为 RULES，要求非空 `proxy-server-nameserver`。
-- Fragment 只接受 `DIRECT`、`RULES`、实际代理节点名或静态 `select` 组名。
+- Fragment 只接受 `DIRECT`、`RULES`、实际代理节点名或支持的代理组名。
 - `#RULES` 只按 nameserver endpoint 和传输执行业务规则，不把 DNS question 当作选路域名。
 - 规则结果为 `REJECT` 时，当前尝试失败并继续当前组下一项。
 
@@ -91,7 +113,7 @@ dns:
   `code`、`code@attr@attr` 或前置 `!` 的反选，属性为 key 存在性 AND。与业务规则共享分类和记录，
   `@!cn` 是字面属性 key，不是属性排除；
 - GeoSite 项隔开域名区块，区块与 GeoSite 项按声明顺序匹配；重复 GeoSite selector 也按此顺序处理；
-- value 接受单个 nameserver 字符串或非空数组；`rule-set:` 依赖尚未支持的 rule-providers；
+- value 接受单个 nameserver 字符串或非空数组；`rule-set:` 引用 domain/classical 集合，classical 仅使用域名条件；
 - 命中后只在所选列表内并发查询，列表耗尽不查询其他 policy 或主组；
 - GeoSite 资产或分类不可用时该 policy 不命中，不能因反选变成全匹配；
 - 存在分类但属性筛选为空时仍可用，正选不命中、反选匹配合法非空名称。
@@ -204,7 +226,7 @@ Running Session上下文仅弱引用本 session 的 RuntimeDns；业务 IP-only 
 
 - 真实 ICMP 转发、ICMP error、Traceroute、ICMP 选路规则或 ICMP 测速；
 - DoQ、DoH HTTP/2/3、显式 system/DHCP nameserver；
-- 代理组 provider/health check/自动 failover、DNS fallback group、fake IP、动态 hosts: lan；
+- DNS fallback group、动态 hosts: lan；
 - 用户可配置的缓存容量、超时、重试或并发度；
 - 使用 DNS question 执行业务规则，或用 DNS 出口改写后续业务动作。
 

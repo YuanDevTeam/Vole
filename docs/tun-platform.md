@@ -125,12 +125,12 @@ MTU/格式与 fd 标志，原生 builder 只打开 raw-IP TUN，不暗中启用 
   新建 TCP/UDP socket 绑定该接口，所有协议、DNS、资源下载共用 Dialer；没有出口时失败。
   已有 socket 不迁移，下一次建链重新检测。回环目标保持本机访问。
 - `auto-route` 独占创建配置命名的 raw-IP TUN，已有同名接口失败。IPv4 使用
-  `198.18.0.1/30`，启用 IPv6 时使用 `fdfe:dcba:9876::1/126`。
+  `dns.fake-ip-range` 的原始 IPv4 地址（默认 `198.18.0.1`），前缀固定 /30；启用 IPv6 时使用 `fdfe:dcba:9876::1/126`。
   内部路由表 2022、规则优先级 9000/9001 必须空闲；保留主表的非默认路由，
   本机未标记流量经 TUN，转发流量不在本功能范围。Core socket 使用内部 mark 绕过捕获，
   不依靠 source IP 避免递归。配置接口与路由直接通过内核接口完成，不调用 ip 子进程。
-- 自动路由启用，且 `dns.enable: true`、`dns-hijack` 匹配 `198.18.0.2:53` 时，
-  通过 systemd-resolved 给新接口设置 DNS `198.18.0.2`、路由域 `~.` 和 default-route。
+- 自动路由启用，且 `dns.enable: true`、`dns-hijack` 匹配接口 IPv4 下一地址的 53 端口时，
+  通过 systemd-resolved 给新接口设置 DNS（默认 `198.18.0.2`）、路由域 `~.` 和 default-route。
   系统须使用 systemd-resolved；调用 `/usr/bin/resolvectl --no-ask-password`，
   每次最多五秒并收回子进程。未启用 DNS 或关闭匹配劫持时保留系统 DNS 行为。
   不覆盖 `/etc/resolv.conf` 或其他接口设置，也不新增 DNS 配置字段。

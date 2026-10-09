@@ -20,12 +20,14 @@ impl GroupKind {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ProfileConfig {
+    pub store_fake_ip: bool,
     pub store_selected: bool,
 }
 impl Default for ProfileConfig {
     fn default() -> Self {
         Self {
             store_selected: true,
+            store_fake_ip: false,
         }
     }
 }

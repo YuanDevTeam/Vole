@@ -1,5 +1,9 @@
 use super::{Backend, Change, Lease, NetworkLease, netlink};
-use crate::{config::TunConfig, dialer::Dialer, platform::TunIo};
+use crate::{
+    config::{DnsConfig, TunConfig},
+    dialer::Dialer,
+    platform::TunIo,
+};
 use std::{
     ffi::CString,
     io,
@@ -102,6 +106,7 @@ pub(crate) struct LinuxBackend {
     // Keep the newly created interface alive until DNS and routing cleanup ends.
     _tun_owner: OwnedFd,
     dns_reverted: bool,
+    dns_server: String,
 }
 impl LinuxBackend {
     fn resolved(&self, operation: &str, values: &[&str]) -> io::Result<()> {
@@ -150,7 +155,7 @@ impl LinuxBackend {
 impl Backend for LinuxBackend {
     fn apply(&mut self, change: &Change) -> io::Result<()> {
         match change {
-            Change::DnsServers => self.resolved("dns", &["198.18.0.2"]),
+            Change::DnsServers => self.resolved("dns", &[&self.dns_server]),
             Change::DnsDomains => self.resolved("domain", &["~."]),
             Change::DnsDefaultRoute => self.resolved("default-route", &["yes"]),
             other => netlink::change(other, true),
@@ -183,7 +188,7 @@ impl Backend for LinuxBackend {
 
 pub(crate) fn open(
     config: &TunConfig,
-    dns_enabled: bool,
+    dns: &DnsConfig,
     ipv6: bool,
     dialer: Dialer,
 ) -> io::Result<(TunIo, Dialer, Option<NetworkLease>)> {
@@ -224,12 +229,26 @@ pub(crate) fn open(
         return Err(io::Error::last_os_error());
     }
     let owner = unsafe { OwnedFd::from_raw_fd(owner) };
+    let address = dns
+        .fake_ip
+        .range
+        .map(|range| range.interface_address)
+        .unwrap_or("198.18.0.1".parse().unwrap());
+    let std::net::IpAddr::V4(address) = address else {
+        unreachable!("validated IPv4 range")
+    };
+    let dns_address = std::net::Ipv4Addr::from(
+        u32::from(address)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("TUN DNS address is outside IPv4"))?,
+    );
     let mut lease = Lease::new(LinuxBackend {
         name,
         _tun_owner: owner,
         dns_reverted: false,
+        dns_server: dns_address.to_string(),
     });
-    device.set_network_address("198.18.0.1", 30, None::<&str>)?;
+    device.set_network_address(address, 30, None::<std::net::Ipv4Addr>)?;
     if ipv6 {
         device.add_address_v6("fdfe:dcba:9876::1", 126)?;
     }
@@ -248,7 +267,7 @@ pub(crate) fn open(
             preserve_local: false,
         })?;
     }
-    if dns_enabled && config.hijacks_dns("198.18.0.2:53".parse().unwrap()) {
+    if dns.enable && config.hijacks_dns(SocketAddr::new(dns_address.into(), 53)) {
         lease.apply(Change::DnsServers)?;
         lease.apply(Change::DnsDomains)?;
         lease.apply(Change::DnsDefaultRoute)?;
