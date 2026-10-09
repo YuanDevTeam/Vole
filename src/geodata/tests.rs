@@ -110,11 +110,13 @@ fn rule(kind: RuleKind) -> RuleSpec {
 
 fn dns_policy(codes: &[&str]) -> DnsNameserverPolicy {
     DnsNameserverPolicy {
-        geosite_codes: codes
-            .iter()
-            .map(|code| (*code).to_owned())
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
+        selector: crate::config::DnsPolicySelector::GeoSite(
+            codes
+                .iter()
+                .map(|code| (*code).to_owned())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
         nameservers: Vec::new().into_boxed_slice(),
     }
 }

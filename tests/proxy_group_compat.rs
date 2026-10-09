@@ -56,7 +56,10 @@ rules:
         config.proxy_groups[1].members[1].target,
         ProxyGroupMemberTarget::Route(RouteTargetId::Group(backup))
     );
-    assert_eq!(config.default_route_target, RouteTargetId::Group(primary));
+    assert_eq!(
+        config.default_action,
+        RuleAction::Route(RouteTargetId::Group(primary))
+    );
     assert_eq!(
         config.rules[0].action,
         RuleAction::Route(RouteTargetId::Group(backup))

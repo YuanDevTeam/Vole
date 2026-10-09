@@ -61,6 +61,7 @@ dns:
   nameserver:
     - "tcp://1.1.1.1:53#main-select"
   nameserver-policy:
+    "+.example.com": "223.5.5.5"
     "geosite:private,cn":
       - "tcp://223.5.5.5:53#DIRECT"
 ```
@@ -83,19 +84,23 @@ dns:
 `nameserver-policy` 是有序映射：
 
 - 项数与 GeoSite 唯一引用数不设独立上限，仍受整个 YAML 输入大小约束；
-- selector 只接受 `geosite:<selector>[,<selector>...]`，同一项内为 OR；每个 selector 可为
-  `code`、`code@attr@attr` 或前置 `!` 的反选，属性为 key 存在性 AND；
-- 归一后的相同 selector 不能跨项重复；相同基础 code 的不同属性交集或正反选可并存，
-  与业务规则共享分类和记录；`@!cn` 是字面属性 key，不是属性排除；
-- value 必须是 1–4 个 nameserver；
-- 首项命中后只在该组内顺序故障转移，组内耗尽不查询主组；
+- 接受普通域名和 Clash 通配域名，也可以用逗号连接多个模式；域名不区分大小写。
+  `*.example.com` 匹配一层子域，`.example.com` 匹配所有子域，`+.example.com` 包含本域和所有子域；
+- 连续域名项合为一个区块，按字面标签、`*`、前导 `.` 的优先级匹配；同一区块内重复的归一模式以后项为准；
+- `geosite:<selector>[,<selector>...]` 同一项内为 OR，前缀不区分大小写；每个 selector 可为
+  `code`、`code@attr@attr` 或前置 `!` 的反选，属性为 key 存在性 AND。与业务规则共享分类和记录，
+  `@!cn` 是字面属性 key，不是属性排除；
+- GeoSite 项隔开域名区块，区块与 GeoSite 项按声明顺序匹配；重复 GeoSite selector 也按此顺序处理；
+- value 接受单个 nameserver 字符串或 1–4 项数组；`rule-set:` 依赖尚未支持的 rule-providers；
+- 命中后只在所选列表内顺序故障转移，列表耗尽不查询其他 policy 或主组；
 - GeoSite 资产或分类不可用时该 policy 不命中，不能因反选变成全匹配；
 - 存在分类但属性筛选为空时仍可用，正选不命中、反选匹配合法非空名称。
 
 Policy 只决定当前 DNS exchange，不改写后续业务动作。分类、属性归一和语义边界见
 [GeoData 规则](geodata.md#规则)；所有平台均不按 GeoData 条数截断记录。
 每次同步 policy 选择捕获一份不可变 GeoData 快照，所有 selector 与 policy 项共用，
-不在一次求值中混用旧代、空快照和新代。捕获空快照时沿用资产缺失的主组回落语义。
+不在一次求值中混用旧代、空快照和新代。捕获空快照时跳过 GeoSite 项，继续其余 policy；
+均未命中时使用主组。普通域名 policy 不依赖 GeoData。
 快照在选择函数返回时释放，不复制规则，也不跨后续上游 I/O 的 `await` 持有。
 Regex selector 记录与业务规则共用 `regex::bytes::Regex`；其搜索缓存由正则库管理，
 可能分配 scratch 或发生缓存竞争，不承诺 DNS policy 正则搜索零分配。

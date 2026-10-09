@@ -87,11 +87,6 @@ impl std::fmt::Debug for ProxyDispatchers {
 
 impl ProxyDispatchers {
     pub fn new(proxies: Vec<Arc<dyn Dispatcher>>) -> Result<Self, DispatchError> {
-        if proxies.is_empty() {
-            return Err(DispatchError::Other(
-                "proxy registry must contain at least one entry".to_owned(),
-            ));
-        }
         Ok(Self {
             proxies,
             groups: Vec::new(),
@@ -1173,18 +1168,17 @@ mod tests {
 
     #[tokio::test]
     async fn group_route_snapshots_direct_dns_for_tcp() {
-        let proxy = Arc::new(RecordingDispatcher::default());
         let direct = Arc::new(RecordingDispatcher::default());
         let groups = ProxyGroups::new(
             &[select_group(
                 "route",
                 vec![("DIRECT", ProxyGroupMemberTarget::Direct)],
             )],
-            vec![proxy.clone()],
+            Vec::new(),
             direct.clone(),
         )
         .unwrap();
-        let targets = RouteTargetDispatchers::with_proxy_groups(vec![proxy], &groups).unwrap();
+        let targets = RouteTargetDispatchers::with_proxy_groups(Vec::new(), &groups).unwrap();
         let dns = Arc::new(MockDns::new(vec![IpAddr::V4(Ipv4Addr::new(
             203, 0, 113, 9,
         ))]));
@@ -1313,6 +1307,40 @@ mod tests {
         let query_type_offset = query.len() - 4;
         query[query_type_offset..query_type_offset + 2].copy_from_slice(&query_type.to_be_bytes());
         query
+    }
+
+    #[tokio::test]
+    async fn builtin_final_actions_route_tcp_and_udp_without_proxies() {
+        let destination = "192.0.2.1:443".parse().unwrap();
+        for action in [RuleAction::Direct, RuleAction::Reject] {
+            let direct = Arc::new(RecordingDispatcher::default());
+            let router = dispatcher_with_proxies(
+                Vec::new(),
+                direct.clone(),
+                vec![rule(RuleKind::Match, action)],
+            );
+            let result = router
+                .connect_tcp(stream(destination, InboundKind::Http))
+                .await;
+            if action == RuleAction::Direct {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(DispatchError::NotAllowed)));
+            }
+            let mut transport = router
+                .open_datagram(association(InboundKind::Socks5))
+                .await
+                .unwrap();
+            transport
+                .send(datagram(destination, b"payload"))
+                .await
+                .unwrap();
+            let expected = usize::from(action == RuleAction::Direct);
+            assert_eq!(direct.tcp_sessions.lock().unwrap().len(), expected);
+            assert_eq!(direct.datagrams.lock().unwrap().len(), expected);
+            assert_eq!(direct.udp_opens.load(Ordering::Relaxed), expected);
+            transport.close().await.unwrap();
+        }
     }
 
     #[tokio::test]

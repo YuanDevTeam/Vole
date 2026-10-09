@@ -26,6 +26,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use super::policy::NameserverPolicies;
 use super::{
     CacheValue, ClassifiedDnsQuery, DnsCache, DnsError, DnsMessage, DnsQueryKind, MAX_ANSWERS,
     MAX_CACHE_ENTRIES, MAX_MESSAGE_SIZE, MAX_REDIR_HOST_ENTRIES, MAX_RESPONSE_RECORDS,
@@ -89,6 +90,7 @@ pub struct RuntimeDns {
     ipv6: bool,
     nameservers: Box<[DnsNameserver]>,
     nameserver_policies: Box<[DnsNameserverPolicy]>,
+    policy_index: NameserverPolicies,
     geo_matcher: Arc<dyn GeoMatcher>,
     egress: DnsEgress,
     cache: Mutex<DnsCache>,
@@ -869,6 +871,7 @@ impl RuntimeDns {
             ipv6: config.ipv6,
             nameservers: config.nameservers.clone().into_boxed_slice(),
             nameserver_policies: config.nameserver_policies.clone().into_boxed_slice(),
+            policy_index: NameserverPolicies::new(&config.nameserver_policies),
             geo_matcher,
             egress,
             cache: Mutex::new(DnsCache::with_max_entries(address_cache_entries)),
@@ -888,20 +891,17 @@ impl RuntimeDns {
         }
         let snapshot = self.geo_matcher.routing_snapshot();
         let geo_matcher = snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref());
-        for (policy_index, policy) in self.nameserver_policies.iter().enumerate() {
-            if policy
-                .geosite_codes
-                .iter()
-                .any(|code| geo_matcher.matches_geosite(code, &query.question.name))
-            {
-                tracing::debug!(
-                    policy_index,
-                    query_type = query.question.query_type,
-                    event = "runtime_dns_nameserver_policy_match",
-                    "runtime DNS selected a nameserver policy"
-                );
-                return &policy.nameservers;
-            }
+        if let Some(policy_index) =
+            self.policy_index
+                .select(&query.question.name, &self.nameserver_policies, geo_matcher)
+        {
+            tracing::debug!(
+                policy_index,
+                query_type = query.question.query_type,
+                event = "runtime_dns_nameserver_policy_match",
+                "runtime DNS selected a nameserver policy"
+            );
+            return &self.nameserver_policies[policy_index].nameservers;
         }
         &self.nameservers
     }
@@ -2326,11 +2326,13 @@ mod tests {
 
     fn dns_policy(codes: &[&str], nameservers: Vec<DnsNameserver>) -> DnsNameserverPolicy {
         DnsNameserverPolicy {
-            geosite_codes: codes
-                .iter()
-                .map(|code| (*code).to_owned())
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            selector: crate::config::DnsPolicySelector::GeoSite(
+                codes
+                    .iter()
+                    .map(|code| (*code).to_owned())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
             nameservers: nameservers.into_boxed_slice(),
         }
     }
@@ -3033,6 +3035,77 @@ mod tests {
         resolver.exchange(&query).await.unwrap();
         assert_eq!(direct.udp_calls.load(Ordering::Acquire), 1);
         assert_eq!(proxy.udp_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn domain_policies_use_specificity_and_preserve_geosite_order() {
+        let parsed = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+rules: ['MATCH,DIRECT']
+dns:
+  enable: true
+  ipv6: true
+  nameserver: [192.0.2.1]
+  nameserver-policy:
+    '+.example.test': 192.0.2.2
+    '*.example.test': [192.0.2.3]
+    'pin.example.test': 192.0.2.4
+    'api.*.example.test': 192.0.2.5
+    '.only.test': 192.0.2.6
+    '*.TLD': 192.0.2.7
+    'same.test': 192.0.2.8
+    'SAME.TEST': 192.0.2.9
+    'one.test,two.test': 192.0.2.10
+    '+.override.cn': 192.0.2.11
+    'GEOSITE:cn': 192.0.2.12
+    'blocked.cn': 192.0.2.13
+    'late.test': [192.0.2.14]
+"#,
+        )
+        .unwrap();
+        for query_type in [1, 28, 65] {
+            for (domain, upstream) in [
+                ("example.test", 2),
+                ("one.example.test", 3),
+                ("pin.example.test", 4),
+                ("deep.pin.example.test", 2),
+                ("api.region.example.test", 5),
+                ("only.test", 1),
+                ("deep.child.only.test", 6),
+                ("host.tld", 7),
+                ("deep.host.tld", 1),
+                ("same.test", 9),
+                ("one.test", 10),
+                ("two.test", 10),
+                ("override.cn", 11),
+                ("blocked.cn", 12),
+                ("late.test", 14),
+                ("other.test", 1),
+            ] {
+                let dispatcher = Arc::new(MockDispatcher::with_replies(
+                    vec![MockReply::Response(ResponseSpec::rcode(RCODE_NXDOMAIN))],
+                    vec![],
+                ));
+                let resolver = RuntimeDns::new_with_geo_matcher(
+                    &parsed.dns,
+                    dispatcher.clone(),
+                    Arc::new(PolicyGeoMatcher),
+                );
+                resolver
+                    .exchange(&opaque_query(1, domain, query_type))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    *dispatcher.udp_destinations.lock().unwrap(),
+                    [Destination::Ip(SocketAddr::from((
+                        [192, 0, 2, upstream],
+                        53
+                    )))],
+                    "{domain} type {query_type}",
+                );
+            }
+        }
     }
 
     #[tokio::test]

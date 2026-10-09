@@ -62,7 +62,7 @@ pub struct Config {
     pub ipv6: bool,
     pub proxies: Vec<ProxyConfig>,
     pub proxy_groups: Vec<SelectProxyGroupConfig>,
-    pub default_route_target: RouteTargetId,
+    pub default_action: RuleAction,
     pub geodata_update: Option<GeoDataUpdateConfig>,
     pub external_controller: Option<ExternalControllerConfig>,
     pub inbounds: Vec<InboundConfig>,
@@ -189,8 +189,23 @@ pub struct DnsNameserver {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsNameserverPolicy {
-    pub geosite_codes: Box<[String]>,
+    pub selector: DnsPolicySelector,
     pub nameservers: Box<[DnsNameserver]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsPolicySelector {
+    GeoSite(Box<[String]>),
+    Domains(Box<[String]>),
+}
+
+impl DnsNameserverPolicy {
+    pub fn geosite_codes(&self) -> &[String] {
+        match &self.selector {
+            DnsPolicySelector::GeoSite(codes) => codes,
+            DnsPolicySelector::Domains(_) => &[],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -747,6 +762,7 @@ struct RawVoleConfig {
     tun: Option<RawTunConfig>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     sniffer: Option<RawSnifferConfig>,
+    #[serde(default, deserialize_with = "deserialize_non_null_vec")]
     proxies: Vec<RawOutbound>,
     #[serde(
         rename = "proxy-groups",
@@ -916,6 +932,13 @@ struct RawDnsNameserverPolicy {
     nameservers: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawPolicyNameservers {
+    One(String),
+    Many(Vec<String>),
+}
+
 fn deserialize_dns_nameserver_policies<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<RawDnsNameserverPolicy>, D::Error>
@@ -939,10 +962,15 @@ where
             A: MapAccess<'de>,
         {
             let mut policies = Vec::with_capacity(mapping.size_hint().unwrap_or(0));
-            while let Some((selector, nameservers)) = mapping.next_entry::<String, Vec<String>>()? {
+            while let Some((selector, nameservers)) =
+                mapping.next_entry::<String, RawPolicyNameservers>()?
+            {
                 policies.push(RawDnsNameserverPolicy {
                     selector,
-                    nameservers,
+                    nameservers: match nameservers {
+                        RawPolicyNameservers::One(nameserver) => vec![nameserver],
+                        RawPolicyNameservers::Many(nameservers) => nameservers,
+                    },
                 });
             }
             Ok(policies)
@@ -1453,9 +1481,6 @@ impl RawVoleConfig {
             RawSnifferConfig::normalize,
         )?;
 
-        if self.proxies.is_empty() {
-            return invalid("proxies must contain at least 1 entry");
-        }
         let (raw_proxy_groups, proxy_group_ids) =
             normalize_proxy_group_declarations(self.proxy_groups)?;
         let (proxies, proxy_ids) =
@@ -1463,8 +1488,6 @@ impl RawVoleConfig {
         let route_targets = collect_route_targets(&proxy_ids, &proxy_group_ids);
         let proxy_groups = normalize_proxy_groups(raw_proxy_groups, &route_targets)?;
         proxy_graph_order(&proxies, &proxy_groups)?;
-        let default_route_target =
-            derive_default_route_target_from_rules(&self.rules, &route_targets)?;
         let external_controller = normalize_external_controller(
             self.external_controller,
             self.secret,
@@ -1477,6 +1500,7 @@ impl RawVoleConfig {
             .map_or_else(DnsConfig::disabled, |dns| dns.normalize(&route_targets))?;
         dns.ipv6 &= self.ipv6;
         let rules = normalize_rules(self.rules, &route_targets)?;
+        let default_action = rules.last().expect("validated final MATCH").action;
         drop(proxy_ids);
         drop(route_targets);
 
@@ -1503,7 +1527,7 @@ impl RawVoleConfig {
             ipv6: self.ipv6,
             proxies,
             proxy_groups,
-            default_route_target,
+            default_action,
             geodata_update,
             external_controller,
             inbounds,
@@ -1811,9 +1835,6 @@ fn normalize_proxy_graph_with_groups(
     raw_proxies: Vec<RawOutbound>,
     proxy_group_ids: &HashMap<String, ProxyGroupId>,
 ) -> Result<(Vec<ProxyConfig>, ProxyIdsByTag)> {
-    if raw_proxies.is_empty() {
-        return invalid("proxies must contain at least 1 entry");
-    }
     let pending = raw_proxies
         .into_iter()
         .map(RawOutbound::normalize)
@@ -2663,38 +2684,8 @@ fn normalize_dns_nameserver_policies(
     default_route: DnsRoute,
 ) -> Result<Vec<DnsNameserverPolicy>> {
     let mut normalized = Vec::with_capacity(raw_policies.len());
-    let mut seen_codes = Vec::<String>::new();
     for raw_policy in raw_policies {
-        let selector = raw_policy
-            .selector
-            .strip_prefix("geosite:")
-            .ok_or_else(|| {
-                VoleError::InvalidConfig(format!(
-                    "invalid dns.nameserver-policy selector `{}`; expected geosite:<code>[,<code>...]",
-                    raw_policy.selector
-                ))
-            })?;
-        if selector.is_empty() {
-            return invalid("dns.nameserver-policy geosite selector must not be empty");
-        }
-
-        let mut geosite_codes = Vec::new();
-        for raw_code in selector.split(',') {
-            if raw_code.is_empty() || trim_ascii_whitespace(raw_code) != raw_code {
-                return invalid(format!(
-                    "invalid dns.nameserver-policy selector `{}`; GeoSite codes must be non-empty and contain no surrounding whitespace",
-                    raw_policy.selector
-                ));
-            }
-            let code = normalize_geo_code(raw_code, "dns.nameserver-policy GeoSite")?;
-            if seen_codes.contains(&code) {
-                return invalid(format!(
-                    "dns.nameserver-policy contains duplicate GeoSite code `{code}`"
-                ));
-            }
-            seen_codes.push(code.clone());
-            geosite_codes.push(code);
-        }
+        let selector = normalize_dns_policy_selector(&raw_policy.selector)?;
 
         if raw_policy.nameservers.is_empty() || raw_policy.nameservers.len() > MAX_DNS_NAMESERVERS {
             return invalid(format!(
@@ -2708,11 +2699,48 @@ fn normalize_dns_nameserver_policies(
             .map(|nameserver| parse_dns_nameserver(nameserver, route_targets, default_route))
             .collect::<Result<Vec<_>>>()?;
         normalized.push(DnsNameserverPolicy {
-            geosite_codes: geosite_codes.into_boxed_slice(),
+            selector,
             nameservers: nameservers.into_boxed_slice(),
         });
     }
     Ok(normalized)
+}
+
+fn normalize_dns_policy_selector(input: &str) -> Result<DnsPolicySelector> {
+    let lower = input.to_lowercase();
+    if let Some(selector) = lower.strip_prefix("geosite:") {
+        let codes = selector
+            .split(',')
+            .map(|code| {
+                if code.is_empty() || trim_ascii_whitespace(code) != code {
+                    return invalid("DNS policy GeoSite selectors must be non-empty without surrounding whitespace");
+                }
+                normalize_geo_code(code, "dns.nameserver-policy GeoSite")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(DnsPolicySelector::GeoSite(codes.into_boxed_slice()));
+    }
+    if lower.starts_with("rule-set:") {
+        return invalid("dns.nameserver-policy rule-set requires unsupported rule-providers");
+    }
+    let domains = lower
+        .split(',')
+        .map(|domain| {
+            if domain.is_empty() || domain.ends_with('.') || domain.trim() != domain {
+                return invalid("invalid DNS policy domain pattern");
+            }
+            for (index, label) in domain.split('.').enumerate() {
+                if (label.is_empty() && index != 0)
+                    || (label.contains('+') && (index != 0 || label != "+" || domain == "+"))
+                    || (label.contains('*') && label != "*")
+                {
+                    return invalid("invalid DNS policy domain pattern");
+                }
+            }
+            Ok(domain.to_owned())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(DnsPolicySelector::Domains(domains.into_boxed_slice()))
 }
 
 fn parse_dns_nameserver(
@@ -2814,30 +2842,6 @@ fn parse_dns_endpoint(endpoint: &str) -> Option<(IpAddr, u16)> {
     }
     let endpoint = endpoint.parse::<SocketAddr>().ok()?;
     Some((endpoint.ip(), endpoint.port()))
-}
-
-fn derive_default_route_target_from_rules(
-    rules: &[String],
-    route_targets: &RouteTargetsByName,
-) -> Result<RouteTargetId> {
-    let final_rule = rules.last().ok_or_else(|| {
-        VoleError::InvalidConfig(
-            "rules must end with MATCH targeting an exact proxy or proxy group name".to_owned(),
-        )
-    })?;
-    let fields = final_rule
-        .split(',')
-        .map(trim_ascii_whitespace)
-        .collect::<Vec<_>>();
-    if fields.len() != 2 || !fields[0].eq_ignore_ascii_case("MATCH") {
-        return invalid("rules must end with MATCH targeting an exact proxy or proxy group name");
-    }
-    route_targets.get(fields[1]).copied().ok_or_else(|| {
-        VoleError::InvalidConfig(format!(
-            "final MATCH target must be an exact configured proxy or proxy group name; found `{}`",
-            fields[1]
-        ))
-    })
 }
 
 fn normalize_rules(
@@ -3456,8 +3460,8 @@ proxies:
         assert_eq!(config.proxies[0].tag, "proxy");
         assert!(config.proxies[0].udp);
         assert_eq!(
-            config.default_route_target,
-            RouteTargetId::Proxy(ProxyId::new(0).unwrap())
+            config.default_action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(0).unwrap()))
         );
         assert_eq!(first_vless(&config).address, "203.0.113.1");
         assert!(matches!(
@@ -4528,8 +4532,8 @@ authentication:
     fn parses_the_strict_anytls_subset() {
         let config = Config::parse_yaml(CURRENT_ANYTLS.as_bytes()).unwrap();
         assert_eq!(
-            config.default_route_target,
-            RouteTargetId::Proxy(ProxyId::new(0).unwrap())
+            config.default_action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(0).unwrap()))
         );
         let proxy = &config.proxies[0];
         assert_eq!(proxy.tag, "anytls-node");
@@ -4568,8 +4572,8 @@ authentication:
             );
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         assert_eq!(
-            config.default_route_target,
-            RouteTargetId::Proxy(ProxyId::new(1).unwrap())
+            config.default_action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(1).unwrap()))
         );
         assert_eq!(
             config.proxies[1].dialer_proxy,
@@ -5086,7 +5090,7 @@ authentication:
     }
 
     #[test]
-    fn current_config_requires_listener_rules_and_nonempty_proxies() {
+    fn current_config_requires_listener_rules_and_valid_references() {
         for yaml in [
             current_yaml("mixed-port: 0\nauthentication:\n  - measure:secret"),
             current_yaml("tun:\n  enable: false"),
@@ -5144,8 +5148,8 @@ authentication:
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         assert_eq!(config.proxies.len(), 2);
         assert_eq!(
-            config.default_route_target,
-            RouteTargetId::Proxy(ProxyId::new(1).unwrap())
+            config.default_action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(1).unwrap()))
         );
         let ProxyProtocol::Socks5(socks5) = &config.proxies[1].protocol else {
             panic!("expected SOCKS5 proxy");
@@ -5290,7 +5294,10 @@ authentication:
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         let first = ProxyId::new(0).unwrap();
         let second = ProxyId::new(1).unwrap();
-        assert_eq!(config.default_route_target, RouteTargetId::Proxy(second));
+        assert_eq!(
+            config.default_action,
+            RuleAction::Route(RouteTargetId::Proxy(second))
+        );
         assert_eq!(
             config.proxies[0].dialer_proxy,
             Some(RouteTargetId::Proxy(second))
@@ -5382,7 +5389,10 @@ rules:
                 .collect::<Vec<_>>(),
             ["proxy", "proxy", "DIRECT"]
         );
-        assert_eq!(config.default_route_target, RouteTargetId::Group(main));
+        assert_eq!(
+            config.default_action,
+            RuleAction::Route(RouteTargetId::Group(main))
+        );
         assert_eq!(
             config.rules[0].action,
             RuleAction::Route(RouteTargetId::Group(backup))
@@ -5530,8 +5540,8 @@ proxies:
 
         assert_eq!(config.proxies.len(), 4);
         assert_eq!(
-            config.default_route_target,
-            RouteTargetId::Proxy(ProxyId::from_index(3))
+            config.default_action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::from_index(3)))
         );
         assert_eq!(
             config
@@ -5572,8 +5582,8 @@ proxies:
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         assert_eq!(config.proxies.len(), 300);
         assert_eq!(
-            config.default_route_target,
-            RouteTargetId::Proxy(ProxyId::from_index(299))
+            config.default_action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::from_index(299)))
         );
         assert_eq!(
             config.proxies[299].dialer_proxy,
@@ -5864,6 +5874,28 @@ authentication:
     }
 
     #[test]
+    fn accepts_builtin_final_actions_without_static_proxies() {
+        for proxies in ["", "proxies: []\n"] {
+            for (target, action) in [
+                ("DIRECT", RuleAction::Direct),
+                ("REJECT", RuleAction::Reject),
+            ] {
+                let yaml = format!("mixed-port: 1080\n{proxies}rules: ['MATCH,{target}']\n");
+                let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+                assert!(config.proxies.is_empty());
+                assert_eq!(config.default_action, action);
+                assert_eq!(config.rules[0].action, action);
+            }
+        }
+        let config = Config::parse_yaml(b"mixed-port: 1080\nproxy-groups:\n  - name: local\n    type: select\n    proxies: [DIRECT, REJECT]\nrules: ['MATCH,local']\n").unwrap();
+        assert!(config.proxies.is_empty());
+        assert_eq!(
+            config.proxy_groups[0].members[0].target,
+            ProxyGroupMemberTarget::Direct
+        );
+    }
+
+    #[test]
     fn current_config_parses_ordered_geosite_nameserver_policies() {
         let yaml = current_yaml(
             r#"mixed-port: 1080
@@ -5883,10 +5915,10 @@ dns:
         let dns = config.dns;
         assert_eq!(
             dns.nameservers[0].route,
-            DnsRoute::Route(config.default_route_target)
+            DnsRoute::Route(RouteTargetId::Proxy(ProxyId::new(0).unwrap()))
         );
         assert_eq!(dns.nameserver_policies.len(), 2);
-        assert_eq!(&*dns.nameserver_policies[0].geosite_codes, ["apple", "cn"]);
+        assert_eq!(dns.nameserver_policies[0].geosite_codes(), ["apple", "cn"]);
         assert_eq!(
             dns.nameserver_policies[0].nameservers.as_ref(),
             [DnsNameserver {
@@ -5896,7 +5928,7 @@ dns:
                 route: DnsRoute::Direct,
             }]
         );
-        assert_eq!(&*dns.nameserver_policies[1].geosite_codes, ["private"]);
+        assert_eq!(dns.nameserver_policies[1].geosite_codes(), ["private"]);
         assert_eq!(
             dns.nameserver_policies[1]
                 .nameservers
@@ -5939,7 +5971,7 @@ rules:
         assert_eq!(config.rules[2].kind, RuleKind::GeoIp("!cn".to_owned()));
         assert!(config.rules[2].no_resolve);
         assert_eq!(
-            &*config.dns.nameserver_policies[0].geosite_codes,
+            config.dns.nameserver_policies[0].geosite_codes(),
             ["google@ads@cn", "!google@ads"]
         );
     }
@@ -5947,9 +5979,15 @@ rules:
     #[test]
     fn current_config_strictly_validates_nameserver_policy_schema_and_limits() {
         for policy in [
-            r#"    "geosite:cn": "tcp://223.5.5.5""#,
-            r#"    "geoip:cn": ["tcp://223.5.5.5"]"#,
-            r#"    "GEOSITE:cn": ["tcp://223.5.5.5"]"#,
+            r#"    "rule-set:cn": ["tcp://223.5.5.5"]"#,
+            r#"    "example.com": null"#,
+            r#"    "example.com": {server: 1.1.1.1}"#,
+            r#"    "example.com": [false]"#,
+            r#"    "foo..example": "1.1.1.1""#,
+            r#"    "foo.*bar.example": "1.1.1.1""#,
+            r#"    "foo.+.example": "1.1.1.1""#,
+            r#"    "example.com.": "1.1.1.1""#,
+            r#"    "example.com,": "1.1.1.1""#,
             r#"    "geosite:": ["tcp://223.5.5.5"]"#,
             r#"    "geosite:cn,": ["tcp://223.5.5.5"]"#,
             r#"    "geosite:cn, apple": ["tcp://223.5.5.5"]"#,
@@ -5976,7 +6014,14 @@ dns:
     "geosite:CN": ["tcp://223.5.5.5"]
     "geosite:cn": ["tcp://8.8.8.8"]"#,
         );
-        assert!(Config::parse_yaml(duplicate.as_bytes()).is_err());
+        assert_eq!(
+            Config::parse_yaml(duplicate.as_bytes())
+                .unwrap()
+                .dns
+                .nameserver_policies
+                .len(),
+            2
+        );
 
         let many_codes = (0..=16)
             .map(|index| format!("code{index}"))
@@ -5992,7 +6037,7 @@ authentication:
                 .unwrap()
                 .dns
                 .nameserver_policies[0]
-                .geosite_codes
+                .geosite_codes()
                 .len(),
             17
         );

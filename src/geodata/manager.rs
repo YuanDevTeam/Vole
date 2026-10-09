@@ -1579,7 +1579,9 @@ mod tests {
     #[test]
     fn requirements_validate_and_deduplicate_across_dns_and_rules() {
         let policy = DnsNameserverPolicy {
-            geosite_codes: vec!["CN".to_owned(), "private".to_owned()].into_boxed_slice(),
+            selector: crate::config::DnsPolicySelector::GeoSite(
+                vec!["CN".to_owned(), "private".to_owned()].into_boxed_slice(),
+            ),
             nameservers: Vec::new().into_boxed_slice(),
         };
         let requirements = GeoRequirements::collect(

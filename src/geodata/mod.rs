@@ -402,7 +402,7 @@ impl RequestedCodes {
             }
         }
         for policy in dns_policies {
-            for code in &policy.geosite_codes {
+            for code in policy.geosite_codes() {
                 requested.sites.insert(GeoDataKind::GeoSite, code)?;
             }
         }

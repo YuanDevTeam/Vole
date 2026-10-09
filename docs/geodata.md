@@ -35,11 +35,12 @@ GEOIP,[!]<code>,<target>[,no-resolve]
 - 前置 `!` 对整个正向匹配结果取反：`!cn@ads` 是 NOT(匹配 `cn@ads`)，不是“没有 ads 的记录”。
   `cn@!ads` 查找字面 key `!ads`；`geolocation-!cn` 是字面分类名。
 - GeoIP 支持前置 `!`，不支持属性。业务规则不支持单条多个 code、源地址 GeoIP 或隐式局域网分类。
-- 规则按顺序首条命中，最终 `MATCH` 必须指向实际代理节点或代理组。
+- 规则按顺序首条命中，最终 `MATCH` 可使用 `DIRECT`、`REJECT`、实际代理节点或代理组。
 
 DNS `nameserver-policy` 中的 `geosite:<selector>[,<selector>...]` 接受相同的属性与反选语义，
 逗号连接的 selector 为 OR。业务规则与 DNS policy 共享基础分类、value arena 与正则，
 每个基础分类只解码一次；不同属性交集保留各自匹配索引，正反选不复制记录。
+普通域名与通配域名 policy 不加载 GeoData，其匹配顺序见 [DNS Policy](tun-icmp-dns.md#policy)。
 
 存在分类但属性筛选为空时，该 selector 仍可用：正选不匹配，反选匹配所有合法非空域名。
 分类缺失、资产不可用或未声明的 selector 不能通过反选变成全匹配；没有域名时所有 GeoSite
@@ -78,7 +79,7 @@ geo-update-interval: 24
 - `geox-url` 只能包含 `geoip` 和 `geosite`；URL 必须是以域名为主机、无 userinfo/fragment 的绝对 HTTPS URL。
 - `geo-update-interval` 只接受整数 `24`。
 - `validateConfig` 和 `prepare` 不下载。实例启动后，只有自动更新已开启且规则实际需要资产时才运行更新任务。
-- 下载固定使用最终 `MATCH` route target。若它是代理组，每次新建下载物理 transport 时沿嵌套组解析到当时选中的具体节点、`DIRECT` 或 `REJECT`；失败不自动换成员，也不隐式回退 DIRECT 或系统代理。
+- 下载固定使用最终 `MATCH` 动作，包括 `DIRECT`、`REJECT`、具体节点和代理组。若它是代理组，每次新建下载物理 transport 时沿嵌套组解析到当时选中的叶节点；失败不自动换成员，也不隐式回退 DIRECT 或系统代理。
 - 缺失资产立即检查；失败后按 1 分钟、5 分钟、15 分钟、1 小时退避，之后保持 1 小时上限。成功后恢复 24 小时周期。
 - ETag、SHA-256、源 URL 和下次检查时间保存在 Vole 管理的状态中。合法 304 在匹配器
   已可用时只推进调度；有必需种类不可用时，先按相同重载流程从本地资产恢复匹配器。

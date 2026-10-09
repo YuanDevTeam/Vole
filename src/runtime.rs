@@ -391,7 +391,7 @@ impl PreparedCore {
         proxy_graph.resolution.bind_runtime(dns.as_ref())?;
         let geodata_rules = RuleSet::compile(vec![crate::config::RuleSpec {
             kind: crate::config::RuleKind::Match,
-            action: crate::config::RuleAction::Route(self.config.default_route_target),
+            action: self.config.default_action,
             no_resolve: false,
         }])
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -1692,6 +1692,33 @@ rules:
             "      mode: packet-up\n",
             &format!("      mode: packet-up\n      download-settings:\n{fields}\n"),
         )
+    }
+
+    #[tokio::test]
+    async fn prepares_builtin_routes_without_static_nodes_or_bootstrap() {
+        let resolver = RecordingResolver::default();
+        for (groups, target) in [
+            ("", "DIRECT"),
+            ("", "REJECT"),
+            (
+                "proxy-groups:\n  - name: local\n    type: select\n    proxies: [DIRECT, REJECT]\n",
+                "local",
+            ),
+        ] {
+            let yaml = format!(
+                "mixed-port: 1080\n{groups}dns:\n  enable: true\n  nameserver: [1.1.1.1]\n  nameserver-policy:\n    '+.example.com': 223.5.5.5\nrules: ['MATCH,{target}']\n"
+            );
+            let prepared =
+                PreparedCore::prepare(yaml.as_bytes(), &resolver, ResourceLimits::default())
+                    .await
+                    .unwrap();
+            assert!(prepared.endpoints.is_empty());
+            let parts = prepared.build_dispatcher(Dialer::default()).unwrap();
+            assert_eq!(parts.proxy_graph.len(), 0);
+            assert!(parts.dns.is_some());
+            parts.proxy_graph.shutdown().await;
+        }
+        assert!(resolver.hosts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
