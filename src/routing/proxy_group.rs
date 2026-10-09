@@ -29,6 +29,7 @@ pub(crate) struct ProxyGroupState {
 pub(crate) enum ProxyGroupError {
     UnknownGroup,
     UnknownMember,
+    NotSelectable,
 }
 
 impl fmt::Display for ProxyGroupError {
@@ -36,6 +37,7 @@ impl fmt::Display for ProxyGroupError {
         formatter.write_str(match self {
             Self::UnknownGroup => "unknown proxy group",
             Self::UnknownMember => "unknown proxy group member",
+            Self::NotSelectable => "load-balance does not support manual selection",
         })
     }
 }
@@ -158,6 +160,7 @@ impl ProxyGroups {
                 .zip(selections)
                 .map(|(config, selection)| {
                     selection.configure(config.max_failed_times, config.health.timeout);
+                    selection.configure_balance(config);
                     SelectProxyGroup {
                         config: config.clone(),
                         name: config.name.clone(),
@@ -213,6 +216,9 @@ impl ProxyGroups {
             .copied()
             .ok_or(ProxyGroupError::UnknownGroup)?;
         let group = &self.groups[id.index()];
+        if group.config.kind == crate::config::GroupKind::LoadBalance {
+            return Err(ProxyGroupError::NotSelectable);
+        }
         let selected = group
             .members
             .iter()
@@ -226,17 +232,20 @@ impl ProxyGroups {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_leaf(
         &self,
         group_id: ProxyGroupId,
     ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
-        self.resolve_leaf_for(group_id, false)
+        self.resolve_leaf_for(group_id, false, None, None)
     }
 
-    fn resolve_leaf_for(
+    pub(crate) fn resolve_leaf_for(
         &self,
         mut group_id: ProxyGroupId,
         udp: bool,
+        source: Option<std::net::SocketAddr>,
+        destination: Option<&crate::session::Destination>,
     ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
         for _ in 0..=self.groups.len() {
             let group = self.groups.get(group_id.index()).ok_or_else(|| {
@@ -245,8 +254,7 @@ impl ProxyGroups {
             if udp && group.disable_udp {
                 return Err(DispatchError::NotAllowed);
             }
-            group.selected.touch();
-            let selected = group.selected.load(Ordering::Acquire);
+            let selected = group.selected.choose(source, destination);
             let member = group.members.get(selected).ok_or_else(|| {
                 DispatchError::Other(format!(
                     "proxy group {} has invalid selected index {selected}",
@@ -287,6 +295,25 @@ impl ProxyGroups {
         ))
     }
 
+    pub(crate) fn contains_balance(&self, id: ProxyGroupId) -> bool {
+        let mut pending = vec![id];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let group = &self.groups[id.index()];
+            if group.config.kind == crate::config::GroupKind::LoadBalance {
+                return true;
+            }
+            pending.extend(group.members.iter().filter_map(|m| match m.target {
+                ProxyGroupMemberTarget::Route(RouteTargetId::Group(id)) => Some(id),
+                _ => None,
+            }));
+        }
+        false
+    }
+
     pub(crate) fn selection(&self, index: usize) -> Arc<GroupSelection> {
         self.groups[index].selected.clone()
     }
@@ -295,6 +322,10 @@ impl ProxyGroups {
         if group.config.kind == crate::config::GroupKind::Select
             || samples.len() != group.members.len()
         {
+            return;
+        }
+        if group.config.kind == crate::config::GroupKind::LoadBalance {
+            group.selected.balance_health(samples);
             return;
         }
         if let Some(forced) = group.selected.forced() {
@@ -346,7 +377,11 @@ impl SelectProxyGroup {
                 .iter()
                 .map(|member| member.name.clone())
                 .collect(),
-            now: self.members[selected].name.clone(),
+            now: if self.config.kind == crate::config::GroupKind::LoadBalance {
+                String::new()
+            } else {
+                self.members[selected].name.clone()
+            },
             hidden: self.hidden,
             icon: self.icon.clone(),
         }
@@ -361,7 +396,12 @@ struct SelectProxyGroupDispatcher {
 #[async_trait]
 impl Dispatcher for SelectProxyGroupDispatcher {
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
-        let leaf = self.groups.resolve_leaf(self.id)?;
+        let leaf = self.groups.resolve_leaf_for(
+            self.id,
+            false,
+            Some(session.source),
+            Some(&session.destination),
+        )?;
         let result = leaf.dispatcher.connect_tcp(session).await;
         if !leaf.direct && !matches!(result, Err(DispatchError::NotAllowed)) {
             self.groups.groups[self.id.index()]
@@ -375,11 +415,59 @@ impl Dispatcher for SelectProxyGroupDispatcher {
         &self,
         session: DatagramSession,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        if self.groups.contains_balance(self.id) {
+            return Ok(Box::new(BalancedDatagrams {
+                groups: self.groups.clone(),
+                id: self.id,
+                session,
+                transport: None,
+            }));
+        }
         self.groups
-            .resolve_leaf_for(self.id, true)?
+            .resolve_leaf_for(self.id, true, Some(session.source), None)?
             .dispatcher
             .open_datagram(session)
             .await
+    }
+}
+
+// Core-originated DNS/probes also enter groups without a first destination.
+// Resolve their leaf on first send and retain it through the association.
+struct BalancedDatagrams {
+    groups: Arc<ProxyGroups>,
+    id: ProxyGroupId,
+    session: DatagramSession,
+    transport: Option<Box<dyn DatagramTransport>>,
+}
+#[async_trait]
+impl DatagramTransport for BalancedDatagrams {
+    async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
+        if self.transport.is_none() {
+            let leaf = self.groups.resolve_leaf_for(
+                self.id,
+                true,
+                Some(self.session.source),
+                Some(&datagram.remote),
+            )?;
+            self.transport = Some(leaf.dispatcher.open_datagram(self.session.clone()).await?);
+        }
+        self.transport
+            .as_mut()
+            .expect("group association opened")
+            .send(datagram)
+            .await
+    }
+    async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+        match &mut self.transport {
+            Some(transport) => transport.receive().await,
+            None => std::future::pending().await,
+        }
+    }
+    async fn close(&mut self) -> Result<(), DispatchError> {
+        match self.transport.take() {
+            Some(mut transport) => transport.close().await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -531,6 +619,7 @@ mod tests {
     ) -> SelectProxyGroupConfig {
         SelectProxyGroupConfig {
             kind: crate::config::GroupKind::Select,
+            strategy: crate::config::BalanceStrategy::default(),
             health: crate::config::HealthCheckConfig::default(),
             tolerance: 0,
             max_failed_times: 5,

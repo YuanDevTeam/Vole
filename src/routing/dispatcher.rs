@@ -160,9 +160,15 @@ impl ProxyDispatchers {
         }
     }
 
-    pub(crate) fn resolve(
+    fn per_flow(&self, id: RouteTargetId) -> bool {
+        matches!(id, RouteTargetId::Group(id) if self.proxy_groups.as_ref().is_some_and(|groups| groups.contains_balance(id)))
+    }
+    fn resolve_for(
         &self,
         id: RouteTargetId,
+        udp: bool,
+        source: Option<SocketAddr>,
+        destination: Option<&Destination>,
     ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
         match id {
             RouteTargetId::Proxy(id) => self
@@ -180,7 +186,7 @@ impl ProxyDispatchers {
                 .ok_or_else(|| {
                     DispatchError::Other(format!("unknown proxy group id {}", id.index()))
                 })?
-                .resolve_leaf(id),
+                .resolve_leaf_for(id, udp, source, destination),
         }
     }
 }
@@ -203,9 +209,14 @@ pub struct RoutingDispatcher {
     geo_matcher: Arc<dyn GeoMatcher>,
     tun_config: TunConfig,
     sniffer: Option<Arc<crate::sniffing::Policy>>,
+    tcp_concurrent: bool,
 }
 
 impl RoutingDispatcher {
+    pub(crate) fn with_tcp_concurrent(mut self, enabled: bool) -> Self {
+        self.tcp_concurrent = enabled;
+        self
+    }
     pub(crate) fn with_sniffer(mut self, config: &crate::config::SnifferConfig) -> Self {
         self.sniffer = config.enable.then(|| {
             crate::sniffing::Policy::new(Arc::new(config.clone()), self.geo_matcher.clone())
@@ -241,6 +252,7 @@ impl RoutingDispatcher {
             geo_matcher,
             tun_config: TunConfig::default(),
             sniffer: None,
+            tcp_concurrent: false,
         }
     }
 
@@ -262,6 +274,7 @@ impl RoutingDispatcher {
             rules: Arc::new(rules),
             geo_matcher,
             sniffer: None,
+            tcp_concurrent: false,
             tun_config: TunConfig {
                 udp_timeout: Duration::from_secs(30),
                 ..TunConfig::default()
@@ -335,7 +348,7 @@ impl RoutingDispatcher {
         let accepts_domain_hint = matches!(
             inbound,
             InboundKind::Tun | InboundKind::Http | InboundKind::Socks5
-        ) && self.rules.uses_domain_routing();
+        );
         let sniffed_domain = accepts_domain_hint.then_some(sniffed_domain).flatten();
         let dns_domain_hint = match (accepts_domain_hint, destination, &self.dns, sniffed_domain) {
             (true, Destination::Ip(address), Some(dns), None) => {
@@ -391,6 +404,13 @@ impl RoutingDispatcher {
             Destination::Ip(_) => destination.clone(),
         };
         let mut decision = RouteDecision {
+            metadata: context.domain().map_or_else(
+                || destination.clone(),
+                |host| Destination::Domain {
+                    host: host.to_owned(),
+                    port: destination.port(),
+                },
+            ),
             action: rule_match.action,
             destination: context.pinned_ip().map_or(routed_destination, |address| {
                 Destination::Ip(std::net::SocketAddr::new(address, destination.port()))
@@ -516,6 +536,7 @@ impl Drop for DnsTcpStream {
 }
 
 struct RouteDecision {
+    metadata: Destination,
     action: RuleAction,
     destination: Destination,
     resolved_addresses: Option<Vec<IpAddr>>,
@@ -611,13 +632,40 @@ impl Dispatcher for RoutingDispatcher {
             )
             .await?;
         let resolved_target = match decision.action {
-            RuleAction::Route(id) => Some(self.route_targets.resolve(id)?),
+            RuleAction::Route(id) => Some(self.route_targets.resolve_for(
+                id,
+                false,
+                Some(session.source),
+                Some(&decision.metadata),
+            )?),
             RuleAction::Direct | RuleAction::Reject => None,
         };
         if resolved_target.as_ref().is_some_and(|target| target.direct) {
             self.resolve_direct_destination(&mut decision).await?;
         }
         log_route_decision(Network::Tcp, &decision);
+        let direct = decision.action == RuleAction::Direct
+            || resolved_target.as_ref().is_some_and(|target| target.direct);
+        if direct
+            && self.tcp_concurrent
+            && let Some(addresses) = &decision.resolved_addresses
+            && addresses.len() > 1
+        {
+            let dispatcher = resolved_target
+                .as_ref()
+                .map_or(&self.direct, |target| &target.dispatcher);
+            let addresses = addresses
+                .iter()
+                .map(|&ip| SocketAddr::new(ip, decision.destination.port()))
+                .collect::<Vec<_>>();
+            return crate::dialer::race_connections(&addresses, None, |address| {
+                let mut attempt = session.clone();
+                attempt.destination = Destination::Ip(address);
+                attempt.sniffed_domain = None;
+                dispatcher.connect_tcp(attempt)
+            })
+            .await;
+        }
         session.destination = decision.destination;
         session.sniffed_domain = None;
         match decision.action {
@@ -661,6 +709,7 @@ impl RoutingDispatcher {
             geo_matcher: self.geo_matcher.clone(),
             tun_config: self.tun_config.clone(),
             sniffer: self.sniffer.clone(),
+            tcp_concurrent: self.tcp_concurrent,
         }
     }
 }
@@ -668,7 +717,7 @@ impl RoutingDispatcher {
 struct RoutedDatagramTransport {
     router: RoutingDispatcher,
     session: DatagramSession,
-    route_transports: HashMap<RouteTargetId, CachedRouteTransport>,
+    route_transports: HashMap<(RouteTargetId, Option<Destination>), CachedRouteTransport>,
     fake_flows: HashMap<SocketAddr, FakeDatagramFlow>,
     direct_transport: Option<Box<dyn DatagramTransport>>,
     flows: DatagramRoutes,
@@ -686,6 +735,7 @@ struct FakeDatagramFlow {
 }
 
 struct CachedRouteTransport {
+    last_used: Instant,
     transport: Box<dyn DatagramTransport>,
     direct: bool,
 }
@@ -770,6 +820,21 @@ impl From<RuleAction> for LoggedRouteAction {
 
 impl RoutedDatagramTransport {
     async fn expire_fake_flows(&mut self) {
+        let expired = self
+            .route_transports
+            .iter()
+            .filter(|((_, destination), cached)| {
+                destination.is_some()
+                    && cached.last_used.elapsed() >= self.router.tun_config.udp_timeout
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in expired {
+            if let Some(mut cached) = self.route_transports.remove(&key) {
+                let _ = cached.transport.close().await;
+            }
+        }
+
         let now = Instant::now();
         let expired: Vec<_> = self
             .fake_flows
@@ -806,7 +871,12 @@ impl RoutedDatagramTransport {
                 RuleAction::Reject => return Ok(()),
                 RuleAction::Direct => (self.router.direct.clone(), true),
                 RuleAction::Route(id) => {
-                    let target = self.router.route_targets.resolve(id)?;
+                    let target = self.router.route_targets.resolve_for(
+                        id,
+                        true,
+                        Some(self.session.source),
+                        Some(&decision.metadata),
+                    )?;
                     (target.dispatcher, target.direct)
                 }
             };
@@ -862,11 +932,23 @@ impl RoutedDatagramTransport {
         mut decision: RouteDecision,
         mut datagram: Datagram,
     ) -> Result<(), DispatchError> {
-        let direct = self.route_transports.get(&id).map(|cached| cached.direct);
+        let key = (
+            id,
+            self.router
+                .route_targets
+                .per_flow(id)
+                .then(|| datagram.remote.clone()),
+        );
+        let direct = self.route_transports.get(&key).map(|cached| cached.direct);
         let direct = match direct {
             Some(direct) => direct,
             None => {
-                let target = self.router.route_targets.resolve(id)?;
+                let target = self.router.route_targets.resolve_for(
+                    id,
+                    true,
+                    Some(self.session.source),
+                    Some(&decision.metadata),
+                )?;
                 let direct = target.direct;
                 if direct {
                     self.router
@@ -877,8 +959,14 @@ impl RoutedDatagramTransport {
                     .dispatcher
                     .open_datagram(self.session.clone())
                     .await?;
-                self.route_transports
-                    .insert(id, CachedRouteTransport { transport, direct });
+                self.route_transports.insert(
+                    key.clone(),
+                    CachedRouteTransport {
+                        transport,
+                        direct,
+                        last_used: Instant::now(),
+                    },
+                );
                 self.receive_wakeup.notify_one();
                 direct
             }
@@ -890,12 +978,12 @@ impl RoutedDatagramTransport {
         }
         datagram.remote = decision.destination;
         datagram.sniffed_domain = None;
-        self.route_transports
-            .get_mut(&id)
-            .expect("route transport was inserted")
-            .transport
-            .send(datagram)
-            .await
+        let cached = self
+            .route_transports
+            .get_mut(&key)
+            .expect("route transport was inserted");
+        cached.last_used = Instant::now();
+        cached.transport.send(datagram).await
     }
 
     async fn send_direct(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
@@ -928,21 +1016,31 @@ impl RoutedDatagramTransport {
                 && self.route_transports.len() == 1
                 && self.direct_transport.is_none()
             {
-                return self
+                let cached = self
                     .route_transports
                     .values_mut()
                     .next()
-                    .expect("the only route transport exists")
-                    .transport
-                    .receive()
-                    .await;
+                    .expect("the only route transport exists");
+                let result = cached.transport.receive().await;
+                if result.is_ok() {
+                    cached.last_used = Instant::now();
+                }
+                return result;
             }
             let mut receives: Vec<
                 futures_util::future::BoxFuture<'_, Result<Datagram, DispatchError>>,
             > = self
                 .route_transports
                 .values_mut()
-                .map(|cached| cached.transport.receive())
+                .map(|cached| {
+                    Box::pin(async move {
+                        let result = cached.transport.receive().await;
+                        if result.is_ok() {
+                            cached.last_used = Instant::now();
+                        }
+                        result
+                    }) as futures_util::future::BoxFuture<'_, _>
+                })
                 .collect::<Vec<_>>();
             if let Some(direct) = self.direct_transport.as_mut() {
                 receives.push(direct.receive());
@@ -1007,6 +1105,7 @@ impl DatagramTransport for RoutedDatagramTransport {
         let action = flow.and_then(|destination| self.flows.action(destination, now));
         let decision = if let Some(action) = action {
             RouteDecision {
+                metadata: datagram.remote.clone(),
                 action,
                 destination: datagram.remote.clone(),
                 resolved_addresses: None,
@@ -1071,6 +1170,17 @@ impl DatagramTransport for RoutedDatagramTransport {
                 .is_some_and(|route| route.flow_id.as_deref() != Some(flow_id))
             {
                 self.flows.entries.remove(&destination);
+                let keys = self
+                    .route_transports
+                    .keys()
+                    .filter(|(_, target)| target.as_ref() == Some(&Destination::Ip(destination)))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in keys {
+                    if let Some(mut cached) = self.route_transports.remove(&key) {
+                        cached.transport.close().await?;
+                    }
+                }
             }
         }
         if let Some(destination) = flow
@@ -1098,8 +1208,13 @@ impl DatagramTransport for RoutedDatagramTransport {
     }
 
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
-        self.expire_fake_flows().await;
-        let datagram = self.receive_inner().await?;
+        let datagram = loop {
+            self.expire_fake_flows().await;
+            tokio::select! {
+                result = self.receive_inner() => break result?,
+                () = tokio::time::sleep(UDP_FLOW_CLEANUP_INTERVAL) => {},
+            }
+        };
         if self.session.inbound == InboundKind::Tun {
             let now = Instant::now();
             self.flows.expire(now);
@@ -1359,6 +1474,7 @@ mod tests {
     ) -> SelectProxyGroupConfig {
         SelectProxyGroupConfig {
             kind: crate::config::GroupKind::Select,
+            strategy: crate::config::BalanceStrategy::default(),
             health: crate::config::HealthCheckConfig::default(),
             tolerance: 0,
             max_failed_times: 5,
@@ -1424,6 +1540,74 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn load_balance_routes_tcp_and_pins_udp_flows() {
+        let config = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxies:
+  - {name: a, type: socks5, server: 192.0.2.10, port: 1080}
+  - {name: b, type: socks5, server: 192.0.2.11, port: 1080}
+proxy-groups:
+  - {name: balance, type: load-balance, proxies: [a,b], strategy: round-robin}
+rules: ["MATCH,balance"]
+"#,
+        )
+        .unwrap();
+        let a = Arc::new(RecordingDispatcher::default());
+        let b = Arc::new(RecordingDispatcher::default());
+        let direct = Arc::new(RecordingDispatcher::default());
+        let nodes: Vec<Arc<dyn Dispatcher>> = vec![a.clone(), b.clone()];
+        let groups = ProxyGroups::new(&config.proxy_groups, nodes.clone(), direct.clone()).unwrap();
+        let router = RoutingDispatcher::new(
+            ProxyDispatchers::with_proxy_groups(nodes, &groups).unwrap(),
+            direct,
+            None,
+            RuleSet::compile(vec![rule(RuleKind::Match, group_action(0))]).unwrap(),
+            Arc::new(EmptyGeoMatcher),
+        );
+        let source = "192.0.2.1:5555".parse().unwrap();
+        let dest = Destination::Ip("198.51.100.1:443".parse().unwrap());
+        for _ in 0..2 {
+            router
+                .connect_tcp(StreamSession {
+                    inbound: InboundKind::Socks5,
+                    source,
+                    destination: dest.clone(),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(a.tcp_sessions.lock().unwrap().len(), 1);
+        assert_eq!(b.tcp_sessions.lock().unwrap().len(), 1);
+        let mut transport = router
+            .open_datagram(DatagramSession::new(InboundKind::Socks5, source))
+            .await
+            .unwrap();
+        let first = Datagram {
+            remote: dest,
+            payload: Bytes::from_static(b"x"),
+            sniffed_domain: None,
+        };
+        transport.send(first.clone()).await.unwrap();
+        groups.apply_health(0, &[None, Some(50)]);
+        transport.send(first).await.unwrap();
+        transport
+            .send(Datagram {
+                remote: Destination::Ip("198.51.100.2:443".parse().unwrap()),
+                payload: Bytes::from_static(b"y"),
+                sniffed_domain: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(a.datagrams.lock().unwrap().len(), 2);
+        assert_eq!(b.datagrams.lock().unwrap().len(), 1);
+        assert_eq!(a.udp_opens.load(Ordering::Relaxed), 1);
+        assert!(groups.select("balance", "a").is_err());
+        transport.close().await.unwrap();
+    }
+
     #[test]
     fn proxy_registry_accepts_ids_beyond_u8() {
         let proxies = (0..300)
@@ -1463,6 +1647,7 @@ mod tests {
             geo_matcher: Arc::new(EmptyGeoMatcher),
             tun_config: TunConfig::default(),
             sniffer: None,
+            tcp_concurrent: false,
         };
 
         router

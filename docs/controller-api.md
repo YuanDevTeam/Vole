@@ -1,6 +1,6 @@
 # 运行时 Controller API
 
-Controller 是当前 Running Session 的回环 HTTP 接口。它提供一次性 TUN 流量快照，以及静态与动态 `select`、`url-test`、`fallback` 代理组的状态查询和实时选择；它不是 Invoke API，也不承诺完整 Mihomo Dashboard 兼容。
+Controller 是当前 Running Session 的回环 HTTP 接口。它提供一次性 TUN 流量快照，以及静态与动态 `select`、`url-test`、`fallback`、`load-balance` 代理组的状态查询和实时选择；它不是 Invoke API，也不承诺完整 Mihomo Dashboard 兼容。
 
 ## 配置与生命周期
 
@@ -83,7 +83,7 @@ GET /group/{name}
 GET /proxies/{name}
 ```
 
-- `name` 是组定义名，`type` 分别为 `Selector`、`URLTest` 或 `Fallback`；
+- `name` 是组定义名，`type` 分别为 `Selector`、`URLTest`、`Fallback` 或 `LoadBalance`；
 - `all` 是配置中的直接成员，严格保留顺序和重复项；
 - `now` 是当前选中的直接成员名。若该成员是嵌套组，`now` 仍返回组名，不展开为最终叶节点；
 - 名称和值大小写敏感并精确匹配，不做大小写折叠或 Unicode normalization。
@@ -92,7 +92,9 @@ GET /proxies/{name}
 `GET /proxies/{name}` 也可查询节点。history 当前保留最近一次探测，delay 单位毫秒，
 time 为 Unix 秒；未探测节点初始 alive 为 true、history 为空。HTTP 健康状态不声明 UDP 可用性。
 
-自动组的手动选择在该成员健康时保持固定，失败后恢复自动选择。url-test 使用 tolerance 抑制小幅切换，fallback 按成员顺序选择与恢复。
+load-balance 根据每条新连接的元数据选择成员，响应不含 `now`，不接受手动选择。业务 UDP 按目标会话固定出口。
+
+url-test/fallback 的手动选择在该成员健康时保持固定，失败后恢复自动选择。url-test 使用 tolerance 抑制小幅切换，fallback 按成员顺序选择与恢复。
 
 ## `PUT /proxies/{name}`
 
@@ -170,7 +172,7 @@ Hysteria2 已认证 QUIC 会话也保留其 `dialer-proxy` 上游组快照，包
 | `413 Payload Too Large` | PUT 正文超过 1 KiB |
 | `415 Unsupported Media Type` | PUT 不是严格 `application/json` |
 
-当前不提供 `load-balance`、Controller 主动 delay 测试、连接管理、配置修改、WebSocket 推送、Controller 版本协商或完整 Dashboard response。除本文列出的 provider 路由、`GET /proxies`、`GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}` 外，其他路径和方法均不属于公共协议。
+当前不提供 Controller 主动 delay 测试、连接管理、配置修改、WebSocket 推送、Controller 版本协商或完整 Dashboard response。除本文列出的 provider 路由、`GET /proxies`、`GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}` 外，其他路径和方法均不属于公共协议。
 
 Windows WinRT VPN 的完整运行时和 Controller 位于独立 Session Host；桌面 Wintun 的
 Controller 位于普通业务运行时。宿主通过回环 HTTP 直接访问实际 Running Session；

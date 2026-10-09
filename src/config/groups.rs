@@ -7,6 +7,7 @@ pub enum GroupKind {
     Select,
     UrlTest,
     Fallback,
+    LoadBalance,
 }
 impl GroupKind {
     pub fn controller_type(self) -> &'static str {
@@ -14,6 +15,7 @@ impl GroupKind {
             Self::Select => "Selector",
             Self::UrlTest => "URLTest",
             Self::Fallback => "Fallback",
+            Self::LoadBalance => "LoadBalance",
         }
     }
 }
@@ -85,4 +87,14 @@ pub(crate) fn status_ranges(value: &str) -> Result<Vec<(u16, u16)>> {
             Ok((start, end))
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BalanceStrategy {
+    #[default]
+    #[serde(alias = "")]
+    ConsistentHashing,
+    RoundRobin,
+    StickySessions,
 }

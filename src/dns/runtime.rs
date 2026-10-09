@@ -3187,6 +3187,7 @@ dns:
         let groups = ProxyGroups::new(
             &[SelectProxyGroupConfig {
                 kind: crate::config::GroupKind::Select,
+                strategy: crate::config::BalanceStrategy::default(),
                 health: crate::config::HealthCheckConfig::default(),
                 tolerance: 0,
                 max_failed_times: 5,

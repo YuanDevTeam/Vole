@@ -872,6 +872,7 @@ mod tests {
         let outbound = Socks5Outbound::new_with_path(
             &config(None),
             UpstreamPath::Group {
+                server: crate::session::Destination::domain("server.example", 443).unwrap(),
                 group,
                 endpoint: None,
                 dialer: Dialer::default(),

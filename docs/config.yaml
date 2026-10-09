@@ -25,6 +25,14 @@ log-level: info
 # 启动时缓存中的有效选择优先于 default-selected；成员已删除时使用配置默认/首成员。
 # 文件损坏时使用配置；写入失败保留已生效选择，并在 Controller 状态中报告。
 unified-delay: false
+# 物理 TCP 与 mixed 接入连接的探活。单位秒；0 使用 15 秒，负数保留对应 OS 值。
+# Android 始终禁用 TCP keep-alive；Windows 保留系统探测次数，其余平台为 9 次。
+# tcp-concurrent=true 同时尝试解析结果，首次成功取消其余尝试；ip-version 的偏好
+# 给首选地址族最多 300ms 优先窗口。已建立的复用连接保留创建时的设置。
+tcp-concurrent: false
+keep-alive-idle: 0
+keep-alive-interval: 0
+disable-keep-alive: false
 profile:
   store-selected: true
   store-fake-ip: false # true：dataDir/fake-ip.redb 持久化双向映射与分配位置
@@ -429,7 +437,7 @@ proxies:
     #   name-cert-verify: verified.example.com # 可选独立证书验证名
     # client-fingerprint: chrome # 仅有插件时允许；共享七值，缺省/none/空串关闭命名模板
 
-# select/url-test/fallback 组支持静态 proxies 与动态 use；include-all 同时包含静态节点和所有 providers，
+# select/url-test/fallback/load-balance 组支持静态 proxies 与动态 use；include-all 同时包含静态节点和所有 providers，
 # 也可分别使用 include-all-proxies / include-all-providers。后者启用时忽略 use。
 # filter 筛选动态成员；exclude-filter / exclude-type 同时排除显式成员。
 # 正则支持 Rust regex 子集，区分大小写；反引号分隔的多表达式按匹配顺序排列。
@@ -443,14 +451,18 @@ proxies:
 # select 的 default-selected 省略时选中第一项；有效缓存选择优先。名称精确匹配。
 # url-test 按 URL 探测延迟选择，tolerance（毫秒，默认 0）抑制小幅切换；fallback
 # 按声明顺序选择首个健康成员，恢复后可回到前面的成员。全部失败时返回首成员。
-# 三种组均接受 url/interval/timeout/lazy/expected-status/max-failed-times。
+# 四种组均接受 url/interval/timeout/lazy/expected-status/max-failed-times。
 # url 缺省使用首个 provider 的健康 URL，否则 https://www.gstatic.com/generate_204。
 # interval 单位秒，自动组缺省/0 为 300；select 缺省 0，不主动周期探测。
 # timeout 单位毫秒，缺省/0 为 5000；lazy 默认 true，无近期使用时跳过周期探测。
 # expected-status 省略/空/* 接受所有最终 HTTP 状态，可用 200/204 或 200-299。
 # max-failed-times 缺省/0 为 5，建链失败达到阈值后触发探测，不重试同一次业务连接。
 # HTTP 探测结果不代表 UDP 可用性，业务 UDP 仍检查节点能力与 disable-udp。
-# Controller 可手动固定自动组成员，成员不可用时恢复自动选择。
+# Controller 可手动固定 url-test/fallback 成员，成员不可用时恢复自动选择。
+# load-balance 的 strategy 为 consistent-hashing（缺省）、round-robin、sticky-sessions。
+# 一致性哈希按目标可注册主域名或 IP 分桶；轮询跳过不健康成员；粘滞会话按来源 IP
+# 与目标主域名/IP 缓存 10 分钟，最多 1000 项。哈希种子属于当前进程，不承诺重启后相同。
+# load-balance 没有 now/手动选择；UDP 按目标会话固定叶节点，健康变化不迁移旧会话。
 # 自动或手动切换只影响新连接；既有连接、认证会话及其中复用的流仍保留原路径。
 # 组作为 dialer-proxy 时，与路由共用当前选择，但不重新执行业务规则；DIRECT 连接
 # 当前节点的服务器而不是业务目标，REJECT 在建链时失败且不回退。单次建链对每个组

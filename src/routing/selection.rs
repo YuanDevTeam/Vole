@@ -8,6 +8,7 @@ use tokio::time::Instant;
 #[derive(Debug)]
 pub(crate) struct GroupSelection {
     index: AtomicUsize,
+    balance: Mutex<Option<super::balance::Balance>>,
     forced: Mutex<Option<usize>>,
     touched: Mutex<Instant>,
     failures: Mutex<(Instant, u32)>,
@@ -20,12 +21,40 @@ impl GroupSelection {
         let now = Instant::now();
         Self {
             index: AtomicUsize::new(index),
+            balance: Mutex::new(None),
             forced: Mutex::new(None),
             touched: Mutex::new(now),
             failures: Mutex::new((now, 0)),
             urgent: AtomicBool::new(false),
             maximum: AtomicU32::new(5),
             window_ms: AtomicU64::new(5000),
+        }
+    }
+    pub fn configure_balance(&self, config: &crate::config::SelectProxyGroupConfig) {
+        if config.kind == crate::config::GroupKind::LoadBalance {
+            let mut state = self.balance.lock().unwrap();
+            if state.is_none() {
+                *state = Some(super::balance::Balance::new(
+                    config.strategy,
+                    config.members.len(),
+                ));
+            }
+        }
+    }
+    pub fn choose(
+        &self,
+        source: Option<std::net::SocketAddr>,
+        destination: Option<&crate::session::Destination>,
+    ) -> usize {
+        self.touch();
+        self.balance.lock().unwrap().as_mut().map_or_else(
+            || self.load(Ordering::Acquire),
+            |s| s.choose(source, destination),
+        )
+    }
+    pub fn balance_health(&self, samples: &[Option<u64>]) {
+        if let Some(balance) = self.balance.lock().unwrap().as_mut() {
+            balance.health(samples);
         }
     }
     pub fn load(&self, order: Ordering) -> usize {

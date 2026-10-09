@@ -655,6 +655,7 @@ mod tests {
         ));
         let client = AnyTlsClient::new(
             Arc::new(GroupDialer(UpstreamPath::Group {
+                server: crate::session::Destination::domain("server.example", 443).unwrap(),
                 group,
                 endpoint: None,
                 dialer: Dialer::default(),

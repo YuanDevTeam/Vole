@@ -11,7 +11,7 @@ pub use ip_version::IpVersion;
 
 mod groups;
 pub(crate) use groups::status_ranges;
-pub use groups::{GroupKind, HealthCheckConfig, ProfileConfig};
+pub use groups::{BalanceStrategy, GroupKind, HealthCheckConfig, ProfileConfig};
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -87,6 +87,7 @@ pub struct Config {
     pub global_ua: String,
     pub etag_support: bool,
     pub unified_delay: bool,
+    pub connections: ConnectionSettings,
     pub profile: ProfileConfig,
     pub geodata_update: Option<GeoDataUpdateConfig>,
     pub external_controller: Option<ExternalControllerConfig>,
@@ -490,6 +491,7 @@ pub struct ProxyGroupMemberConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectProxyGroupConfig {
     pub kind: GroupKind,
+    pub strategy: BalanceStrategy,
     pub health: HealthCheckConfig,
     pub tolerance: u16,
     pub max_failed_times: u32,
@@ -937,6 +939,15 @@ struct RawVoleConfig {
     #[serde(rename = "skip-auth-prefixes", default)]
     skip_auth_prefixes: Vec<String>,
 
+    #[serde(rename = "tcp-concurrent", default)]
+    tcp_concurrent: bool,
+    #[serde(rename = "keep-alive-idle", default)]
+    keep_alive_idle: i32,
+    #[serde(rename = "keep-alive-interval", default)]
+    keep_alive_interval: i32,
+    #[serde(rename = "disable-keep-alive", default)]
+    disable_keep_alive: bool,
+
     #[serde(rename = "unified-delay", default)]
     unified_delay: bool,
     #[serde(default)]
@@ -1010,6 +1021,8 @@ struct RawVoleConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProxyGroup {
+    #[serde(default)]
+    strategy: BalanceStrategy,
     #[serde(default)]
     url: String,
     #[serde(default)]
@@ -1888,6 +1901,7 @@ impl RawVoleConfig {
         let generated_global = !raw_groups.iter().any(|group| group.name == "GLOBAL");
         if generated_global {
             raw_groups.push(RawProxyGroup {
+                strategy: BalanceStrategy::default(),
                 disable_udp: false,
                 hidden: false,
                 icon: String::new(),
@@ -1969,6 +1983,12 @@ impl RawVoleConfig {
             global_ua: self.global_ua,
             etag_support: self.etag_support,
             unified_delay: self.unified_delay,
+            connections: ConnectionSettings {
+                tcp_concurrent: self.tcp_concurrent,
+                keep_alive_idle: self.keep_alive_idle,
+                keep_alive_interval: self.keep_alive_interval,
+                disable_keep_alive: self.disable_keep_alive,
+            },
             profile: self.profile,
             geodata_update,
             external_controller,
@@ -2404,7 +2424,7 @@ fn normalize_proxy_groups(
             };
             health.validate()?;
             Ok(SelectProxyGroupConfig {
-                kind: group.kind, health, tolerance: group.tolerance,
+                kind: group.kind, strategy: group.strategy, health, tolerance: group.tolerance,
                 max_failed_times: if group.max_failed_times == 0 { 5 } else { group.max_failed_times },
                 name: group.name,
                 members,
@@ -6266,4 +6286,13 @@ authentication:
         ));
         assert!(Config::parse_yaml(yaml.as_bytes()).is_ok());
     }
+}
+
+/// Global physical TCP policy. YAML keeps Mihomo's top-level field names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectionSettings {
+    pub tcp_concurrent: bool,
+    pub keep_alive_idle: i32,
+    pub keep_alive_interval: i32,
+    pub disable_keep_alive: bool,
 }

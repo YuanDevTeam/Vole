@@ -272,7 +272,9 @@ async fn handle_connection(
             Err(ProxyGroupError::UnknownGroup) => {
                 write_error(&mut stream, 404, "Resource not found", &[]).await
             }
-            Err(ProxyGroupError::UnknownMember) => unreachable!("state does not select a member"),
+            Err(ProxyGroupError::UnknownMember | ProxyGroupError::NotSelectable) => {
+                unreachable!("state does not select a member")
+            }
         };
     }
 
@@ -403,7 +405,7 @@ async fn handle_select(
         Err(ProxyGroupError::UnknownGroup) => {
             write_error(stream, 404, "Resource not found", &[]).await
         }
-        Err(ProxyGroupError::UnknownMember) => {
+        Err(ProxyGroupError::UnknownMember | ProxyGroupError::NotSelectable) => {
             write_error(
                 stream,
                 400,
@@ -508,6 +510,7 @@ struct GroupResponse {
     #[serde(rename = "type")]
     kind: &'static str,
     all: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
     now: String,
     hidden: bool,
     icon: String,
@@ -625,6 +628,7 @@ mod tests {
         ProxyGroups::new(
             &[SelectProxyGroupConfig {
                 kind: crate::config::GroupKind::Select,
+                strategy: crate::config::BalanceStrategy::default(),
                 health: crate::config::HealthCheckConfig::default(),
                 tolerance: 0,
                 max_failed_times: 5,

@@ -1,3 +1,6 @@
+#[path = "dialer_connections.rs"]
+mod connections;
+pub(crate) use connections::race_connections;
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs as _},
@@ -368,6 +371,7 @@ pub struct Dialer {
     #[cfg(all(target_os = "linux", feature = "tun"))]
     linux_policy: Option<Arc<crate::platform::linux_network::SocketPolicy>>,
     ip_version: crate::config::IpVersion,
+    connections: crate::config::ConnectionSettings,
     initialization: Arc<SocketInitialization>,
     protector: Option<Arc<dyn SocketProtector>>,
     source_binding: Option<SourceBinding>,
@@ -398,6 +402,7 @@ impl Default for Dialer {
             #[cfg(all(target_os = "linux", feature = "tun"))]
             linux_policy: None,
             ip_version: crate::config::IpVersion::Dual,
+            connections: crate::config::ConnectionSettings::default(),
             initialization: Arc::new(SocketInitialization::default()),
             protector: None,
             source_binding: None,
@@ -410,6 +415,13 @@ impl Default for Dialer {
 }
 
 impl Dialer {
+    pub(crate) fn with_connections(mut self, settings: crate::config::ConnectionSettings) -> Self {
+        self.connections = settings;
+        self
+    }
+    pub(crate) fn connections(&self) -> crate::config::ConnectionSettings {
+        self.connections
+    }
     #[cfg(all(target_os = "linux", feature = "tun"))]
     pub(crate) fn with_linux_policy(
         mut self,
@@ -501,8 +513,18 @@ impl Dialer {
     }
 
     pub async fn connect(&self, endpoint: &ResolvedEndpoint) -> io::Result<PhysicalStream> {
+        let addresses = self.ordered_addresses(&endpoint.addresses);
+        if self.connections.tcp_concurrent && !addresses.is_empty() {
+            let preferred = match self.ip_version {
+                crate::config::IpVersion::Ipv4Prefer => Some(false),
+                crate::config::IpVersion::Ipv6Prefer => Some(true),
+                _ => None,
+            };
+            return race_connections(&addresses, preferred, |address| self.connect_one(address))
+                .await;
+        }
         let mut last_error = None;
-        for address in self.ordered_addresses(&endpoint.addresses) {
+        for address in addresses {
             match self.connect_one(address).await {
                 Ok(stream) => return Ok(stream),
                 Err(error) => last_error = Some(error),
@@ -662,6 +684,7 @@ impl Dialer {
                 };
                 let guard = track(ResourceKind::Socket);
                 check()?;
+                dialer.connections.apply(&socket2::SockRef::from(&socket))?;
                 dialer.protect_socket(&socket)?;
                 #[cfg(all(target_os = "linux", feature = "tun"))]
                 if let Some(policy) = &dialer.linux_policy {

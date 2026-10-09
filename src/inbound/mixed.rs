@@ -23,6 +23,7 @@ use super::{
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct MixedServer {
+    connections: crate::config::ConnectionSettings,
     access_rules: Arc<crate::config::ProxyAccessRules>,
     listeners: Vec<TcpListener>,
     sockets: Vec<Arc<UdpSocket>>,
@@ -32,6 +33,10 @@ pub struct MixedServer {
 }
 
 impl MixedServer {
+    pub(crate) fn with_connections(mut self, settings: crate::config::ConnectionSettings) -> Self {
+        self.connections = settings;
+        self
+    }
     pub fn bind(config: MixedInboundConfig, dispatcher: Arc<dyn Dispatcher>) -> io::Result<Self> {
         let http = HttpServerConfig::proxy(config.port, config.access, config.auth.clone())?;
         let listeners = bind_proxy_tcp(config.port, config.access)?;
@@ -51,6 +56,7 @@ impl MixedServer {
             dispatcher.clone(),
         );
         Ok(Self {
+            connections: crate::config::ConnectionSettings::default(),
             access_rules: config.access_rules,
             listeners,
             sockets,
@@ -103,6 +109,7 @@ impl MixedServer {
                         Ok(value) => value,
                         Err(error) => break Err(error),
                     };
+                    if self.connections.apply(&socket2::SockRef::from(&stream)).is_err() { continue; }
                     let relay = match stream.local_addr() {
                         Ok(address) => address,
                         Err(error) => break Err(error),

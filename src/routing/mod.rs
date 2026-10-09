@@ -16,6 +16,7 @@ use crate::{
     session::Destination,
 };
 
+mod balance;
 mod selection;
 pub(crate) use selection::GroupSelection;
 

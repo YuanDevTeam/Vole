@@ -16,6 +16,9 @@ cargo test --locked --lib geodata::tests::
 cargo test --locked --all-features --lib resource::http::tests::
 cargo test --locked --all-features --lib outbound::http::tests::
 cargo test --locked --all-features --lib platform::linux_network::tests::
+cargo test --locked --all-features --lib routing::balance::tests::
+cargo test --locked --all-features --lib load_balance_routes_
+cargo test --locked --all-features --lib dialer::connections::tests::
 cargo test --locked --all-features --lib fake_ip_
 cargo test --locked --all-features --lib sniffing::tests::
 cargo test --locked --all-features --lib tcp_sniffer::tests::

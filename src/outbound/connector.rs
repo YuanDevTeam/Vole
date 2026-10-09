@@ -1,13 +1,13 @@
 use crate::routing::GroupSelection;
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::HashMap,
     fmt::{self, Write as _},
     future::Future,
     io,
     net::IpAddr,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -265,7 +265,7 @@ impl EstablishContext {
     /// One read per group for the entire setup, including both legs of a
     /// SOCKS5 UDP association. Retaining the atomic prevents address reuse;
     /// unrelated groups are not an atomic cross-group snapshot.
-    fn selected_member(&self, selection: &Arc<GroupSelection>) -> usize {
+    fn selected_member(&self, selection: &Arc<GroupSelection>, destination: &Destination) -> usize {
         selection.touch();
         let key = Arc::as_ptr(selection) as usize;
         let mut selections = self
@@ -274,7 +274,7 @@ impl EstablishContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         selections
             .entry(key)
-            .or_insert_with(|| (selection.clone(), selection.load(Ordering::Acquire)))
+            .or_insert_with(|| (selection.clone(), selection.choose(None, Some(destination))))
             .1
     }
 
@@ -470,13 +470,20 @@ impl SelectUpstream {
         self.disable_udp = disabled;
         self
     }
-    fn check_udp(&self, context: &EstablishContext) -> Result<(), DispatchError> {
+    fn check_udp(
+        &self,
+        context: &EstablishContext,
+        destination: &Destination,
+    ) -> Result<(), DispatchError> {
         let mut group = self;
         loop {
             if group.disable_udp {
                 return Err(DispatchError::NotAllowed);
             }
-            match group.members.get(context.selected_member(&group.selection)) {
+            match group
+                .members
+                .get(context.selected_member(&group.selection, destination))
+            {
                 Some(SelectUpstreamMember::Group(next)) => group = next,
                 Some(_) => return Ok(()),
                 None => return Err(DispatchError::NotAllowed),
@@ -484,10 +491,14 @@ impl SelectUpstream {
         }
     }
 
-    fn resolve(&self, context: &EstablishContext) -> Result<&SelectUpstreamMember, DispatchError> {
+    fn resolve(
+        &self,
+        context: &EstablishContext,
+        destination: &Destination,
+    ) -> Result<&SelectUpstreamMember, DispatchError> {
         let mut group = self;
         loop {
-            let selected = context.selected_member(&group.selection);
+            let selected = context.selected_member(&group.selection, destination);
             match group.members.get(selected) {
                 Some(SelectUpstreamMember::Group(next)) => group = next,
                 Some(leaf) => return Ok(leaf),
@@ -523,6 +534,7 @@ pub enum UpstreamPath {
     /// A runtime select group. DIRECT is relative to this node's prepared
     /// server, not the business destination or the ordinary routing engine.
     Group {
+        server: Destination,
         group: Arc<SelectUpstream>,
         endpoint: Option<ResolvedEndpoint>,
         dialer: Dialer,
@@ -571,7 +583,8 @@ impl UpstreamPath {
                 group,
                 endpoint,
                 dialer,
-            } => match group.resolve(context)? {
+                server,
+            } => match group.resolve(context, server)? {
                 SelectUpstreamMember::Proxy(connector) => Ok(ResolvedUpstream::Proxy(connector)),
                 SelectUpstreamMember::Direct => endpoint
                     .as_ref()
@@ -631,8 +644,8 @@ impl UpstreamPath {
         request: DatagramRequest,
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
-        if let Self::Group { group, .. } = self {
-            group.check_udp(context)?;
+        if let Self::Group { group, server, .. } = self {
+            group.check_udp(context, server)?;
         }
         match self.resolve(context)? {
             ResolvedUpstream::Direct(_, dialer) | ResolvedUpstream::LazyDirect(dialer) => {
@@ -977,6 +990,7 @@ mod tests {
         members: Vec<SelectUpstreamMember>,
     ) -> UpstreamPath {
         UpstreamPath::Group {
+            server: Destination::domain("server.example", 443).unwrap(),
             group: Arc::new(SelectUpstream::new(selection, members)),
             endpoint: None,
             dialer: Dialer::default(),
@@ -1132,6 +1146,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let selection = Arc::new(GroupSelection::new(0));
         let path = UpstreamPath::Group {
+            server: Destination::domain("server.example", 443).unwrap(),
             group: Arc::new(SelectUpstream::new(
                 selection.clone(),
                 vec![SelectUpstreamMember::Direct, SelectUpstreamMember::Reject],
@@ -1197,6 +1212,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let protector = Arc::new(RejectProtector(AtomicUsize::new(0)));
         let path = UpstreamPath::Group {
+            server: Destination::domain("server.example", 443).unwrap(),
             group: Arc::new(SelectUpstream::new(
                 Arc::new(GroupSelection::new(0)),
                 vec![SelectUpstreamMember::Direct],

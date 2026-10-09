@@ -114,6 +114,7 @@ quinn-proto = { version = "=0.11.18", default-features = false, features = ["rus
 rand = "0.10"
 ring = { version = "0.17.14", optional = true }
 redb = "=4.3.0"
+psl = "=2.1.241"
 regex = "1.13"
 regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode-case"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }

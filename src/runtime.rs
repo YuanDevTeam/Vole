@@ -634,6 +634,7 @@ impl GraphBuilder {
     fn build(&self, dialer: Dialer) -> io::Result<BuiltRuntimeParts> {
         let dialer = dialer
             .with_ipv6(self.config.ipv6)
+            .with_connections(self.config.connections)
             .with_fresh_initialization();
         let handshake_stats = RuntimeResourceStats::new("runtime_handshake_observation");
         let proxy_graph = self.build_proxy_graph(dialer.clone())?;
@@ -719,7 +720,8 @@ impl GraphBuilder {
                 geo_matcher,
             )
             .with_tun_config(&self.config.tun)
-            .with_sniffer(&self.config.sniffer),
+            .with_sniffer(&self.config.sniffer)
+            .with_tcp_concurrent(self.config.connections.tcp_concurrent),
         );
         let session_stats = RuntimeResourceStats::new("runtime_session_observation");
         Ok(BuiltRuntimeParts {
@@ -883,7 +885,11 @@ fn build_proxy_graph(
         lifecycle_order: Vec::with_capacity(order.len()),
         selections: groups
             .iter()
-            .map(|group| Arc::new(crate::routing::GroupSelection::new(group.initial_member)))
+            .map(|group| {
+                let selection = Arc::new(crate::routing::GroupSelection::new(group.initial_member));
+                selection.configure_balance(group);
+                selection
+            })
             .collect(),
     };
     let mut nodes: Vec<Option<Arc<dyn OutboundConnector>>> = vec![None; proxies.len()];
@@ -929,6 +935,7 @@ fn build_proxy_graph(
         let proxy = &proxies[index];
         let node_dialer = dialer.clone().with_ip_version(proxy.ip_version);
         let upstream = build_upstream_path(
+            crate::outbound::server_destination(proxy.address(), proxy.port())?,
             proxy.dialer_proxy,
             endpoints[index].upload.clone(),
             &nodes,
@@ -1065,8 +1072,12 @@ fn build_proxy_graph(
                 {
                     let download_upstream = config
                         .download()
-                        .map(|_| {
+                        .map(|download| {
                             build_upstream_path(
+                                crate::outbound::server_destination(
+                                    &download.address,
+                                    download.port,
+                                )?,
                                 proxy.dialer_proxy,
                                 endpoints[index].download.clone(),
                                 &nodes,
@@ -1161,6 +1172,7 @@ fn build_proxy_graph(
 }
 
 fn build_upstream_path(
+    server: crate::session::Destination,
     parent: Option<RouteTargetId>,
     endpoint: Option<ResolvedEndpoint>,
     nodes: &[Option<Arc<dyn OutboundConnector>>],
@@ -1175,6 +1187,7 @@ fn build_upstream_path(
                 .clone(),
         )),
         Some(RouteTargetId::Group(id)) => Ok(UpstreamPath::Group {
+            server,
             group: groups[id.index()]
                 .as_ref()
                 .expect("dependency built")
@@ -1456,7 +1469,10 @@ impl RunningCore {
                         ));
                     }
                     #[cfg(all(feature = "inbound-http", feature = "inbound-socks5"))]
-                    mixed_servers.push(MixedServer::bind(config.clone(), dispatcher.clone())?);
+                    mixed_servers.push(
+                        MixedServer::bind(config.clone(), dispatcher.clone())?
+                            .with_connections(proxy_graph.dialer.connections()),
+                    );
                 }
                 InboundConfig::Tun(_) => {
                     if tun_runtime.is_none() {
