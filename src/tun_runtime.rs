@@ -41,12 +41,13 @@ use crate::{
         ResourceActivity, ResourceActivityGuard, ResourceQueue, RuntimeResourceStats, observation,
     },
     session::{Datagram, DatagramSession, Destination, InboundKind, StreamSession},
-    tcp_sniffer::{SniffOutcome, SniffProtocol, TcpSniffer},
     traffic::TunTrafficStats,
 };
 
 #[cfg(test)]
 use crate::dns::{ClassifiedDnsQuery, synthesize_servfail_response};
+#[cfg(test)]
+use crate::tcp_sniffer::SniffProtocol;
 
 #[cfg(test)]
 const TUN_MTU: usize = 1_500;
@@ -723,55 +724,23 @@ async fn relay_tcp(
     let destination = inbound.destination_addr();
     let destination_port = destination.port();
     let ip_version = if destination.is_ipv4() { 4 } else { 6 };
-    let protocol = sniffer
-        .as_deref()
-        .and_then(|config| configured_sniff_protocol(config, destination_port));
-    let (sniffed_domain, prefetched) = if let Some(protocol) = protocol {
-        let mut sniffer = TcpSniffer::new(protocol);
-        let outcome = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return,
-            outcome = sniffer.sniff(&mut inbound) => outcome,
-        };
-        let sniffed_domain = match outcome {
-            Ok(SniffOutcome::Matched { protocol, domain }) => {
-                tracing::debug!(
-                    session_id,
-                    ?protocol,
-                    destination_port,
-                    buffered_bytes = sniffer.buffered_len(),
-                    "TUN TCP domain sniffed"
-                );
-                Some(domain)
-            }
-            Ok(outcome) => {
-                tracing::debug!(
-                    session_id,
-                    ?outcome,
-                    destination_port,
-                    "TUN TCP domain sniffing completed without a domain"
-                );
-                None
-            }
-            Err(error) => {
-                tracing::debug!(
-                    session_id,
-                    error_kind = ?error.kind(),
-                    destination_port,
-                    "TUN TCP domain sniffing failed open"
-                );
-                None
-            }
-        };
-        (sniffed_domain, sniffer.into_buffered())
-    } else {
-        (None, Vec::new())
-    };
-    let session = StreamSession {
+    let mut session = StreamSession {
         inbound: InboundKind::Tun,
         source: inbound.source_addr(),
-        destination: Destination::Ip(inbound.destination_addr()),
-        sniffed_domain,
+        destination: Destination::Ip(destination),
+        sniffed_domain: None,
+    };
+    let plan = dispatcher
+        .sniff_plan(session.source, &session.destination)
+        .await
+        .or_else(|| {
+            sniffer.map(|config| crate::sniffing::Plan::standalone(config, destination_port))
+        });
+    let prefetched = if let Some(plan) = plan {
+        tokio::select! { biased; () = cancellation.cancelled() => return,
+        bytes = plan.sniff(&mut inbound, &mut session) => bytes }
+    } else {
+        Vec::new()
     };
     let connected = tokio::select! {
         biased;
@@ -864,6 +833,7 @@ async fn relay_tcp(
     }
 }
 
+#[cfg(test)]
 fn configured_sniff_protocol(config: &SnifferConfig, port: u16) -> Option<SniffProtocol> {
     if config.matches_http_port(port) {
         Some(SniffProtocol::Http)
@@ -1925,9 +1895,24 @@ async fn send_tun_udp_datagram(
 ) -> io::Result<bool> {
     let PreparedTunUdpDatagram {
         datagram,
-        sniffed_domain,
+        mut sniffed_domain,
         flow_id,
     } = prepared;
+    if let Some(plan) = context
+        .dispatcher
+        .sniff_plan(context.source, &Destination::Ip(datagram.destination))
+        .await
+        .or_else(|| {
+            context.sniffer.clone().map(|config| {
+                crate::sniffing::Plan::standalone(config, datagram.destination.port())
+            })
+        })
+        && sniffed_domain
+            .as_ref()
+            .is_some_and(|host| !plan.accepts(host))
+    {
+        sniffed_domain = None;
+    }
     let datagram = Datagram {
         remote: Destination::Ip(datagram.destination),
         payload: datagram.payload,
@@ -2045,10 +2030,18 @@ where
                 }
             }
             AssociationEvent::Inbound(Some(datagram)) => {
-                let sniff_quic = configured_quic_sniffing(
-                    context.sniffer.as_deref(),
-                    datagram.destination.port(),
-                );
+                let sniff_quic = if let Some(plan) = context
+                    .dispatcher
+                    .sniff_plan(context.source, &Destination::Ip(datagram.destination))
+                    .await
+                {
+                    plan.quic_enabled()
+                } else {
+                    configured_quic_sniffing(
+                        context.sniffer.as_deref(),
+                        datagram.destination.port(),
+                    )
+                };
                 let result = if sniff_quic {
                     quic_sniff.ingest_datagram(datagram, TokioInstant::now())
                 } else {

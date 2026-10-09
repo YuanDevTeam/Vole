@@ -1,7 +1,6 @@
 //! Bounded TCP first-payload sniffing for the TUN inbound.
 //!
-//! Sniffing is deliberately advisory: the extracted domain is routing
-//! metadata and never replaces the original IP destination. All bytes read
+//! The inbound applies the configured destination-override policy. All bytes read
 //! here remain available to the caller for replay after the outbound has been
 //! selected.
 
@@ -14,8 +13,8 @@ use tokio::{
 
 use crate::routing::normalize_domain_name;
 
-pub(crate) const TCP_SNIFF_MAX_BYTES: usize = 32 * 1024;
-pub(crate) const TCP_SNIFF_TIMEOUT: Duration = Duration::from_millis(200);
+pub(crate) const TCP_SNIFF_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const TCP_SNIFF_TIMEOUT: Duration = Duration::from_secs(1);
 
 const READ_CHUNK_BYTES: usize = 2 * 1024;
 const TLS_HANDSHAKE_CONTENT_TYPE: u8 = 0x16;
@@ -58,7 +57,7 @@ pub(crate) enum ParseOutcome {
 /// Stateful bounded sniffer which retains every byte consumed from the
 /// intercepted stream until the caller takes the prefix for replay.
 pub(crate) struct TcpSniffer {
-    protocol: SniffProtocol,
+    protocols: Vec<SniffProtocol>,
     buffered: Vec<u8>,
 }
 
@@ -67,9 +66,13 @@ impl TcpSniffer {
     /// configuration. Port selection remains outside the parser so the same
     /// HTTP/TLS implementation can serve every configured TCP port.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn new(protocol: SniffProtocol) -> Self {
+        Self::with_protocols(vec![protocol])
+    }
+    pub(crate) fn with_protocols(protocols: Vec<SniffProtocol>) -> Self {
         Self {
-            protocol,
+            protocols,
             buffered: Vec::with_capacity(READ_CHUNK_BYTES),
         }
     }
@@ -83,20 +86,30 @@ impl TcpSniffer {
     where
         R: AsyncRead + Unpin,
     {
-        let deadline = Instant::now() + TCP_SNIFF_TIMEOUT;
+        let mut deadline = Instant::now() + TCP_SNIFF_TIMEOUT;
         loop {
-            match parse(self.protocol, &self.buffered) {
-                ParseOutcome::Matched(domain) => {
-                    return Ok(SniffOutcome::Matched {
-                        protocol: self.protocol,
-                        domain,
-                    });
+            let mut active = Vec::with_capacity(self.protocols.len());
+            let mut ech = false;
+            for protocol in &self.protocols {
+                match parse(*protocol, &self.buffered) {
+                    ParseOutcome::Matched(domain) => {
+                        return Ok(SniffOutcome::Matched {
+                            protocol: *protocol,
+                            domain,
+                        });
+                    }
+                    ParseOutcome::NeedMoreData => active.push(*protocol),
+                    ParseOutcome::EchExtensionPresent => ech = true,
+                    ParseOutcome::NotMatched => {}
                 }
-                ParseOutcome::EchExtensionPresent => {
-                    return Ok(SniffOutcome::EchExtensionPresent);
-                }
-                ParseOutcome::NotMatched => return Ok(SniffOutcome::NotMatched),
-                ParseOutcome::NeedMoreData => {}
+            }
+            self.protocols = active;
+            if self.protocols.is_empty() {
+                return Ok(if ech {
+                    SniffOutcome::EchExtensionPresent
+                } else {
+                    SniffOutcome::NotMatched
+                });
             }
 
             let remaining = TCP_SNIFF_MAX_BYTES.saturating_sub(self.buffered.len());
@@ -113,13 +126,11 @@ impl TcpSniffer {
                 Ok(Ok(count)) => count,
                 Ok(Err(error)) => return Err(error),
             };
+            if self.buffered.is_empty() {
+                deadline = Instant::now() + TCP_SNIFF_TIMEOUT;
+            }
             self.buffered.extend_from_slice(&chunk[..count]);
         }
-    }
-
-    #[must_use]
-    pub(crate) fn buffered_len(&self) -> usize {
-        self.buffered.len()
     }
 
     #[must_use]
@@ -546,7 +557,7 @@ fn advance(cursor: &mut usize, count: usize, length: usize) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use tokio::io::{AsyncWriteExt as _, duplex};
 
     use super::*;
@@ -555,7 +566,7 @@ mod tests {
         format!("GET / HTTP/1.1\r\nUser-Agent: test\r\nHost: {host}\r\n\r\n").into_bytes()
     }
 
-    fn tls_client_hello(host: &str) -> Vec<u8> {
+    pub(crate) fn tls_client_hello(host: &str) -> Vec<u8> {
         tls_client_hello_with_extensions(&tls_server_name_extension(host))
     }
 
@@ -603,18 +614,6 @@ mod tests {
         record.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
         record.extend_from_slice(payload);
         record
-    }
-
-    #[test]
-    fn constructor_preserves_the_configured_protocol() {
-        assert!(matches!(
-            TcpSniffer::new(SniffProtocol::Http).protocol,
-            SniffProtocol::Http
-        ));
-        assert!(matches!(
-            TcpSniffer::new(SniffProtocol::Tls).protocol,
-            SniffProtocol::Tls
-        ));
     }
 
     #[test]

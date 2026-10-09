@@ -50,6 +50,8 @@ pub mod routing;
 mod runtime;
 pub mod security;
 pub mod session;
+#[doc(hidden)]
+pub mod sniffing;
 #[cfg(any(
     feature = "inbound-socks5",
     feature = "outbound-http",
@@ -60,7 +62,6 @@ pub mod session;
     feature = "outbound-vless"
 ))]
 mod socks5;
-#[cfg(any(feature = "tun", test))]
 mod tcp_sniffer;
 #[cfg(any(
     feature = "inbound-http",

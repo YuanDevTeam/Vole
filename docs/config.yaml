@@ -100,15 +100,22 @@ tun:
     - any:53
   udp-timeout: 300
 
-# 可选的 TUN TCP/UDP 嗅探器。省略或 enable: false 表示关闭。启用时至少配置
-# HTTP、TLS、QUIC 之一；协议值为空或省略 ports 时分别使用 80/443/443。每种协议
-# 最多 64 个单端口或升序闭区间；HTTP 与 TLS 的 TCP 端口不能重叠，QUIC 使用
-# UDP，可与二者使用相同端口。嗅探结果只参与选路，不改写实际目标。
+# TCP 嗅探用于 TUN 和 mixed；QUIC 多包嗅探用于 TUN UDP。
+# 省略或 enable: false 关闭；未列出协议时不嗅探。协议 ports 省略/为空表示全部端口。
+# HTTP/TLS 重叠端口共享有界预读，按 TLS、HTTP 顺序识别；每协议最多 64 个端口/区间。
 sniffer:
   enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  force-domain: [] # Clash 通配、geosite:、rule-set:；可强制嗅探已知域名/fake-IP
+  skip-domain: [] # 对识别出的域名生效
+  skip-src-address: [] # CIDR、geoip:、rule-set:
+  skip-dst-address: []
+  override-destination: true # false 只提供选路域名；true 同时替换实际目标
   sniff:
     HTTP:
       ports: [80, 8080-8380]
+      override-destination: false # 协议项覆盖全局值
     TLS:
       ports: [443, 8443]
     QUIC:

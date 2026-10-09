@@ -1,7 +1,7 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, copy_bidirectional_with_sizes},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::mpsc,
     task::JoinSet,
@@ -199,18 +199,34 @@ impl Socks5Handler {
             return Ok(());
         }
         if command == COMMAND_CONNECT {
-            let session = StreamSession {
+            let mut session = StreamSession {
                 inbound: InboundKind::Socks5,
                 source: peer,
                 destination,
                 sniffed_domain: None,
+            };
+            let sniff = dispatcher
+                .sniff_plan(peer, &session.destination)
+                .await
+                .filter(|plan| plan.tcp_enabled());
+            let acknowledged = sniff.is_some();
+            let prefix = if let Some(plan) = sniff {
+                timed(handshake::reply(&mut stream, 0, None)).await?;
+                plan.sniff(&mut stream, &mut session).await
+            } else {
+                Vec::new()
             };
             let connected = timeout(IO_TIMEOUT, dispatcher.connect_tcp(session))
                 .await
                 .unwrap_or(Err(DispatchError::TimedOut));
             match connected {
                 Ok(mut upstream) => {
-                    timed(handshake::reply(&mut stream, 0, None)).await?;
+                    if !acknowledged {
+                        timed(handshake::reply(&mut stream, 0, None)).await?;
+                    }
+                    if !prefix.is_empty() {
+                        timed(upstream.write_all(&prefix)).await?;
+                    }
                     copy_bidirectional_with_sizes(
                         &mut stream,
                         &mut upstream,
@@ -220,6 +236,9 @@ impl Socks5Handler {
                     .await?;
                 }
                 Err(error) => {
+                    if acknowledged {
+                        return Err(io::Error::other(error));
+                    }
                     timed(handshake::reply(
                         &mut stream,
                         handshake::status(&error),

@@ -110,6 +110,14 @@ pub trait DatagramTransport: Send {
 
 #[async_trait]
 pub trait Dispatcher: Send + Sync {
+    async fn sniff_plan(
+        &self,
+        _source: std::net::SocketAddr,
+        _destination: &crate::session::Destination,
+    ) -> Option<crate::sniffing::Plan> {
+        None
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError>;
 
     async fn open_datagram(
@@ -138,6 +146,14 @@ impl SessionObservedDispatcher {
 
 #[async_trait]
 impl Dispatcher for SessionObservedDispatcher {
+    async fn sniff_plan(
+        &self,
+        source: std::net::SocketAddr,
+        destination: &crate::session::Destination,
+    ) -> Option<crate::sniffing::Plan> {
+        self.inner.sniff_plan(source, destination).await
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         let stream = self.inner.connect_tcp(session).await?;
         Ok(Box::new(ObservedStream {
@@ -178,6 +194,14 @@ impl HandshakeObservedDispatcher {
 
 #[async_trait]
 impl Dispatcher for HandshakeObservedDispatcher {
+    async fn sniff_plan(
+        &self,
+        source: std::net::SocketAddr,
+        destination: &crate::session::Destination,
+    ) -> Option<crate::sniffing::Plan> {
+        self.inner.sniff_plan(source, destination).await
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         let _activity = self.resource_stats.begin(ResourceActivity::Handshake);
         self.inner.connect_tcp(session).await

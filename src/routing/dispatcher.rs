@@ -202,9 +202,16 @@ pub struct RoutingDispatcher {
     rules: Arc<RuleSet>,
     geo_matcher: Arc<dyn GeoMatcher>,
     tun_config: TunConfig,
+    sniffer: Option<Arc<crate::sniffing::Policy>>,
 }
 
 impl RoutingDispatcher {
+    pub(crate) fn with_sniffer(mut self, config: &crate::config::SnifferConfig) -> Self {
+        self.sniffer = config.enable.then(|| {
+            crate::sniffing::Policy::new(Arc::new(config.clone()), self.geo_matcher.clone())
+        });
+        self
+    }
     #[must_use]
     pub fn new(
         route_targets: ProxyDispatchers,
@@ -233,6 +240,7 @@ impl RoutingDispatcher {
             rules: Arc::new(rules),
             geo_matcher,
             tun_config: TunConfig::default(),
+            sniffer: None,
         }
     }
 
@@ -253,6 +261,7 @@ impl RoutingDispatcher {
             ipv6,
             rules: Arc::new(rules),
             geo_matcher,
+            sniffer: None,
             tun_config: TunConfig {
                 udp_timeout: Duration::from_secs(30),
                 ..TunConfig::default()
@@ -307,8 +316,26 @@ impl RoutingDispatcher {
         } else {
             None
         };
-        let destination = recovered.as_ref().unwrap_or(destination);
-        let accepts_domain_hint = inbound == InboundKind::Tun && self.rules.uses_domain_routing();
+        let overridden = (network == Network::Udp
+            && self
+                .sniffer
+                .as_ref()
+                .is_some_and(|policy| policy.config.quic_override))
+        .then(|| {
+            sniffed_domain.map(|host| Destination::Domain {
+                host: host.to_owned(),
+                port: destination.port(),
+            })
+        })
+        .flatten();
+        let destination = overridden
+            .as_ref()
+            .or(recovered.as_ref())
+            .unwrap_or(destination);
+        let accepts_domain_hint = matches!(
+            inbound,
+            InboundKind::Tun | InboundKind::Http | InboundKind::Socks5
+        ) && self.rules.uses_domain_routing();
         let sniffed_domain = accepts_domain_hint.then_some(sniffed_domain).flatten();
         let dns_domain_hint = match (accepts_domain_hint, destination, &self.dns, sniffed_domain) {
             (true, Destination::Ip(address), Some(dns), None) => {
@@ -319,6 +346,9 @@ impl RoutingDispatcher {
         let domain_hint = sniffed_domain.or(dns_domain_hint.as_deref());
         let mut context = RoutingContext::with_domain_hint(network, destination, domain_hint)
             .map_err(|_| DispatchError::HostUnreachable)?;
+        if let Some(host) = sniffed_domain {
+            context.set_sniffed_domain(host);
+        }
 
         context.set_source(source);
 
@@ -331,8 +361,7 @@ impl RoutingDispatcher {
             RuleEvaluation::NeedsIpResolution { rule_index } => {
                 let addresses = match (destination, &self.dns) {
                     (Destination::Domain { host, .. }, Some(dns)) => {
-                        self.resolve_addresses(dns, context.domain().unwrap_or(host))
-                            .await
+                        self.resolve_addresses(dns, host).await
                     }
                     _ => Vec::new(),
                 };
@@ -354,11 +383,9 @@ impl RoutingDispatcher {
         };
 
         let routed_destination = match destination {
-            Destination::Domain { port, .. } => Destination::Domain {
-                host: context
-                    .domain()
-                    .expect("domain destination has a normalized routing domain")
-                    .to_owned(),
+            Destination::Domain { host, port } => Destination::Domain {
+                host: super::normalize_domain_name(host)
+                    .map_err(|_| DispatchError::HostUnreachable)?,
                 port: *port,
             },
             Destination::Ip(_) => destination.clone(),
@@ -536,6 +563,35 @@ fn preferred_address(addresses: &[IpAddr]) -> Option<IpAddr> {
 
 #[async_trait]
 impl Dispatcher for RoutingDispatcher {
+    async fn sniff_plan(
+        &self,
+        source: SocketAddr,
+        destination: &Destination,
+    ) -> Option<crate::sniffing::Plan> {
+        let policy = self.sniffer.as_ref()?;
+        let (host, mapped) = match destination {
+            Destination::Domain { host, .. } => (Some(host.clone()), false),
+            Destination::Ip(address) => {
+                let fake = self
+                    .dns
+                    .as_ref()
+                    .and_then(|dns| dns.recover_fake_ip(address.ip()).ok().flatten());
+                if fake.is_some() {
+                    (fake, false)
+                } else {
+                    let hint = if let Some(dns) = &self.dns {
+                        dns.domain_hint(address.ip()).await
+                    } else {
+                        None
+                    };
+                    let mapped = hint.is_some();
+                    (hint, mapped)
+                }
+            }
+        };
+        Some(policy.plan(source, destination, host.as_deref(), mapped))
+    }
+
     async fn connect_tcp(&self, mut session: StreamSession) -> Result<BoxStream, DispatchError> {
         self.ensure_destination_allowed(&session.destination)?;
         if session.inbound == InboundKind::Tun
@@ -604,6 +660,7 @@ impl RoutingDispatcher {
             rules: self.rules.clone(),
             geo_matcher: self.geo_matcher.clone(),
             tun_config: self.tun_config.clone(),
+            sniffer: self.sniffer.clone(),
         }
     }
 }
@@ -929,7 +986,13 @@ impl DatagramTransport for RoutedDatagramTransport {
                     .map(|dns| dns.recover_fake_ip(original.ip()))
                     .transpose()?
                     .flatten()
-                    .is_some())
+                    .is_some()
+                || (datagram.sniffed_domain.is_some()
+                    && self
+                        .router
+                        .sniffer
+                        .as_ref()
+                        .is_some_and(|policy| policy.config.quic_override)))
         {
             return self.send_fake(original, datagram).await;
         }
@@ -1399,6 +1462,7 @@ mod tests {
             ),
             geo_matcher: Arc::new(EmptyGeoMatcher),
             tun_config: TunConfig::default(),
+            sniffer: None,
         };
 
         router
@@ -1805,61 +1869,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dns_and_sniffed_domain_hints_are_consumed_only_by_tun() {
+    async fn business_inbounds_use_sniffed_domains_without_exposing_them_to_outbounds() {
         let destination: SocketAddr = "198.51.100.8:443".parse().unwrap();
         let proxy = Arc::new(RecordingDispatcher::default());
         let direct = Arc::new(RecordingDispatcher::default());
-        let mut dns = MockDns::new(Vec::new());
-        dns.hint = Some((destination.ip(), "hint.example".to_owned()));
-        let dns = Arc::new(dns);
         let router = dispatcher(
             proxy.clone(),
             direct.clone(),
-            Some(dns.clone()),
+            None,
             vec![
-                rule(
-                    RuleKind::Domain("hint.example".to_owned()),
-                    RuleAction::Direct,
-                ),
+                rule(RuleKind::Domain("hint.example".into()), RuleAction::Direct),
                 rule(RuleKind::Match, proxy_action(0)),
             ],
         );
-
-        router
-            .connect_tcp(StreamSession {
-                inbound: InboundKind::Http,
-                source: "127.0.0.1:10000".parse().unwrap(),
-                destination: Destination::Ip(destination),
-                sniffed_domain: Some("hint.example".to_owned()),
-            })
-            .await
-            .unwrap();
-        assert_eq!(dns.hint_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(proxy.tcp_sessions.lock().unwrap().len(), 1);
-        assert!(direct.tcp_sessions.lock().unwrap().is_empty());
-
-        router
-            .connect_tcp(stream(destination, InboundKind::Tun))
-            .await
-            .unwrap();
-        assert_eq!(dns.hint_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(direct.tcp_sessions.lock().unwrap().len(), 1);
-
-        let mut http_udp = router
-            .open_datagram(association(InboundKind::Http))
-            .await
-            .unwrap();
-        http_udp.send(datagram(destination, b"http")).await.unwrap();
-        assert_eq!(dns.hint_calls.load(Ordering::Relaxed), 1);
-
-        let mut tun_udp = router
-            .open_datagram(association(InboundKind::Tun))
-            .await
-            .unwrap();
-        tun_udp.send(datagram(destination, b"tun")).await.unwrap();
-        assert_eq!(dns.hint_calls.load(Ordering::Relaxed), 2);
-        assert_eq!(proxy.datagrams.lock().unwrap().len(), 1);
-        assert_eq!(direct.datagrams.lock().unwrap().len(), 1);
+        for inbound in [InboundKind::Http, InboundKind::Socks5, InboundKind::Tun] {
+            let mut session = stream(destination, inbound);
+            session.sniffed_domain = Some("hint.example".into());
+            router.connect_tcp(session).await.unwrap();
+        }
+        assert!(proxy.tcp_sessions.lock().unwrap().is_empty());
+        let sessions = direct.tcp_sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 3);
+        assert!(sessions.iter().all(
+            |session| session.destination == Destination::Ip(destination)
+                && session.sniffed_domain.is_none()
+        ));
     }
 
     #[tokio::test]
@@ -3146,5 +3180,38 @@ mod tests {
         assert_eq!(proxy.udp_opens.load(Ordering::Relaxed), 2);
         assert!(proxy.datagrams.lock().unwrap().iter().all(|packet| packet.remote == Destination::Ip("203.0.113.10:443".parse().unwrap())));
         udp.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn quic_override_resolves_new_domain_and_restores_udp_response_target() {
+        let mut config = crate::config::SnifferConfig::disabled();
+        config.enable = true;
+        let proxy = Arc::new(RecordingDispatcher::default());
+        let direct = Arc::new(RecordingDispatcher::default());
+        let dns = Arc::new(MockDns::new(vec!["203.0.113.8".parse().unwrap()]));
+        let router = dispatcher(
+            proxy.clone(),
+            direct,
+            Some(dns.clone()),
+            vec![rule(RuleKind::Match, proxy_action(0))],
+        )
+        .with_sniffer(&config);
+        let original = "198.51.100.4:443".parse().unwrap();
+        let mut transport = router
+            .open_datagram(association(InboundKind::Tun))
+            .await
+            .unwrap();
+        let mut packet = datagram(original, b"quic");
+        packet.sniffed_domain = Some("sniffed.example".into());
+        transport.send(packet).await.unwrap();
+        assert_eq!(
+            proxy.datagrams.lock().unwrap()[0].remote,
+            Destination::Ip("203.0.113.8:443".parse().unwrap())
+        );
+        assert_eq!(
+            transport.receive().await.unwrap().remote,
+            Destination::Ip(original)
+        );
+        assert_eq!(*dns.resolved_hosts.lock().unwrap(), ["sniffed.example"]);
+        transport.close().await.unwrap();
     }
 }

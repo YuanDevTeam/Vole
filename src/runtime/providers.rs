@@ -482,6 +482,21 @@ impl RuntimeResources for ProviderRuntime {
 }
 #[async_trait]
 impl Dispatcher for ProviderRuntime {
+    async fn sniff_plan(
+        &self,
+        source: SocketAddr,
+        destination: &Destination,
+    ) -> Option<crate::sniffing::Plan> {
+        if self.cancellation.is_cancelled() {
+            return None;
+        }
+        self.current
+            .load_full()
+            .dispatcher
+            .sniff_plan(source, destination)
+            .await
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         if self.cancellation.is_cancelled() {
             return Err(DispatchError::NotAllowed);
@@ -514,6 +529,14 @@ struct PinnedDispatcher {
 }
 #[async_trait]
 impl Dispatcher for PinnedDispatcher {
+    async fn sniff_plan(
+        &self,
+        source: SocketAddr,
+        destination: &Destination,
+    ) -> Option<crate::sniffing::Plan> {
+        self.dispatcher.sniff_plan(source, destination).await
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         let io = self.dispatcher.connect_tcp(session).await?;
         Ok(Box::new(GenerationStream {

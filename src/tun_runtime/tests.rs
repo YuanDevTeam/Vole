@@ -46,6 +46,10 @@ fn test_sniffer(
         http_ports: http_ports.into(),
         tls_ports: tls_ports.into(),
         quic_ports: quic_ports.into(),
+        http_override: false,
+        tls_override: false,
+        quic_override: false,
+        ..SnifferConfig::disabled()
     })
 }
 

@@ -475,7 +475,25 @@ impl GeoRequirements {
                 }
             }));
         }
+        if config.sniffer.enable {
+            policies.extend(
+                config
+                    .sniffer
+                    .force_domain
+                    .iter()
+                    .chain(&config.sniffer.skip_domain)
+                    .cloned()
+                    .map(|selector| DnsNameserverPolicy {
+                        selector,
+                        nameservers: Box::new([]),
+                    }),
+            );
+        }
         let mut result = Self::collect(&config.rules, &policies)?;
+        if config.sniffer.enable {
+            result.extend(&Self::collect(&config.sniffer.skip_src_address, &[])?)?;
+            result.extend(&Self::collect(&config.sniffer.skip_dst_address, &[])?)?;
+        }
         if config.dns.enable
             && !config.dns.fallback.nameservers.is_empty()
             && let Some(code) = &config.dns.fallback.geoip

@@ -188,6 +188,18 @@ impl RuleCollection {
             }
         }
     }
+    pub(crate) fn matches_ip(&self, address: std::net::IpAddr, geo: &dyn GeoMatcher) -> bool {
+        let destination = crate::session::Destination::Ip(std::net::SocketAddr::new(address, 1));
+        let context = RoutingContext::new(Network::Tcp, &destination).expect("literal address");
+        if self.behavior == RuleBehavior::Classical {
+            self.classical.iter().any(|rule| {
+                matches!(rule.kind, RuleKind::IpCidr(_) | RuleKind::GeoIp(_))
+                    && crate::routing::matches_rule(rule, &context, geo).unwrap_or(false)
+            })
+        } else {
+            self.matches(&context, geo, true).unwrap_or(false)
+        }
+    }
     pub(crate) fn matches_domain(&self, domain: &str, geo: &dyn GeoMatcher) -> bool {
         let Ok(destination) = crate::session::Destination::domain(domain, 53) else {
             return false;

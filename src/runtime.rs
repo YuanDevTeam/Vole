@@ -364,22 +364,13 @@ impl PreparedCore {
         self.traffic_stats.clone()
     }
 
-    #[cfg(test)]
-    fn dns_redir_host_entries(&self) -> usize {
-        if self.has_tun() && self.rules.uses_domain_routing() {
-            self.limits.dns_redir_host_entries
-        } else {
-            0
-        }
-    }
-
     // Sniffing remains a shared TUN capability, including Windows CLI.
     #[cfg_attr(
         all(feature = "cli", not(feature = "invoke"), unix, not(test)),
         allow(dead_code)
     )]
     fn domain_sniffer_config(&self) -> Option<Arc<crate::config::SnifferConfig>> {
-        (self.has_tun() && self.config.sniffer.enable && self.rules.uses_domain_routing())
+        (self.has_tun() && self.config.sniffer.enable)
             .then(|| Arc::new(self.config.sniffer.clone()))
     }
 
@@ -678,7 +669,9 @@ impl GraphBuilder {
             RouteTargetDispatchers::with_proxy_groups(proxy_dispatchers, &proxy_groups)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let rules = self.rules.clone();
-        let redir_host_entries = if self.config.tun.enable && self.rules.uses_domain_routing() {
+        let redir_host_entries = if self.config.dns.enable
+            && (self.rules.uses_domain_routing() || self.config.sniffer.enable)
+        {
             self.limits.dns_redir_host_entries
         } else {
             0
@@ -725,7 +718,8 @@ impl GraphBuilder {
                 rules,
                 geo_matcher,
             )
-            .with_tun_config(&self.config.tun),
+            .with_tun_config(&self.config.tun)
+            .with_sniffer(&self.config.sniffer),
         );
         let session_stats = RuntimeResourceStats::new("runtime_session_observation");
         Ok(BuiltRuntimeParts {
@@ -2043,55 +2037,7 @@ rules:
     }
 
     #[tokio::test]
-    async fn production_redir_host_store_requires_tun_and_domain_rules() {
-        let domain_rules = r#"
-rules:
-  - DOMAIN-SUFFIX,example.com,DIRECT
-  - MATCH,proxy
-"#;
-        let tun = r#"
-tun:
-  enable: true
-  mtu: 1500
-"#;
-
-        let no_tun = PreparedCore::prepare(
-            config_with_rules(domain_rules).as_bytes(),
-            &FixedResolver,
-            ResourceLimits::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(no_tun.dns_redir_host_entries(), 0);
-
-        let no_domain_rules = PreparedCore::prepare(
-            format!("{CONFIG}{tun}").as_bytes(),
-            &FixedResolver,
-            ResourceLimits::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(no_domain_rules.dns_redir_host_entries(), 0);
-
-        let enabled = PreparedCore::prepare(
-            format!("{}{tun}", config_with_rules(domain_rules)).as_bytes(),
-            &FixedResolver,
-            ResourceLimits::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            enabled.dns_redir_host_entries(),
-            ResourceLimits::default().dns_redir_host_entries
-        );
-        assert!(
-            enabled.domain_sniffer_config().is_none(),
-            "redir-host remains available when the optional sniffer is omitted"
-        );
-    }
-
-    #[tokio::test]
-    async fn production_domain_sniffer_requires_tun_enable_and_domain_rules() {
+    async fn production_tun_sniffer_is_independent_of_domain_rules() {
         let domain_rules = r#"
 rules:
   - DOMAIN-SUFFIX,example.com,DIRECT
@@ -2128,7 +2074,7 @@ sniffer:
         )
         .await
         .unwrap();
-        assert!(no_domain_rules.domain_sniffer_config().is_none());
+        assert!(no_domain_rules.domain_sniffer_config().is_some());
 
         let disabled = PreparedCore::prepare(
             format!(
@@ -2142,11 +2088,6 @@ sniffer:
         .await
         .unwrap();
         assert!(disabled.domain_sniffer_config().is_none());
-        assert_eq!(
-            disabled.dns_redir_host_entries(),
-            ResourceLimits::default().dns_redir_host_entries,
-            "sniffer disablement must not remove DNS routing hints"
-        );
 
         let enabled = PreparedCore::prepare(
             format!("{}{tun}{sniffer}", config_with_rules(domain_rules)).as_bytes(),
@@ -2157,7 +2098,7 @@ sniffer:
         .unwrap();
         let normalized = enabled
             .domain_sniffer_config()
-            .expect("all three production sniffer gates are enabled");
+            .expect("the TUN sniffer is enabled");
         assert!(normalized.matches_http_port(8080));
         assert!(!normalized.matches_http_port(80));
         assert!(normalized.matches_tls_port(8444));

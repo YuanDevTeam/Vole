@@ -1,6 +1,7 @@
 //! Strict parsing for the current Vole YAML configuration.
 mod fake_ip;
 mod fallback;
+mod sniffer;
 pub use fake_ip::{FakeIpConfig, FakeIpFilterMode, FakeIpRange};
 pub use fallback::DnsFallbackConfig;
 mod http_proxy;
@@ -215,6 +216,15 @@ impl TunConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnifferConfig {
     pub enable: bool,
+    pub force_dns_mapping: bool,
+    pub parse_pure_ip: bool,
+    pub force_domain: Vec<DnsPolicySelector>,
+    pub skip_domain: Vec<DnsPolicySelector>,
+    pub skip_src_address: Vec<RuleSpec>,
+    pub skip_dst_address: Vec<RuleSpec>,
+    pub http_override: bool,
+    pub tls_override: bool,
+    pub quic_override: bool,
     pub http_ports: Box<[PortRange]>,
     pub tls_ports: Box<[PortRange]>,
     pub quic_ports: Box<[PortRange]>,
@@ -225,6 +235,15 @@ impl SnifferConfig {
     pub fn disabled() -> Self {
         Self {
             enable: false,
+            force_dns_mapping: true,
+            parse_pure_ip: true,
+            force_domain: Vec::new(),
+            skip_domain: Vec::new(),
+            skip_src_address: Vec::new(),
+            skip_dst_address: Vec::new(),
+            http_override: true,
+            tls_override: true,
+            quic_override: true,
             http_ports: Box::new([]),
             tls_ports: Box::new([]),
             quic_ports: Box::new([]),
@@ -1129,37 +1148,57 @@ impl RawTunConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSnifferConfig {
+    #[serde(default)]
     enable: bool,
+    #[serde(rename = "force-dns-mapping", default = "default_true")]
+    force_dns_mapping: bool,
+    #[serde(rename = "parse-pure-ip", default = "default_true")]
+    parse_pure_ip: bool,
+    #[serde(rename = "force-domain", default)]
+    force_domain: Vec<String>,
+    #[serde(rename = "skip-domain", default)]
+    skip_domain: Vec<String>,
+    #[serde(rename = "skip-src-address", default)]
+    skip_src_address: Vec<String>,
+    #[serde(rename = "skip-dst-address", default)]
+    skip_dst_address: Vec<String>,
+    #[serde(rename = "override-destination", default = "default_true")]
+    override_destination: bool,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     sniff: Option<RawSniffConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default)]
 struct RawSniffConfig {
-    #[serde(
-        rename = "HTTP",
-        default,
-        deserialize_with = "deserialize_present_option"
-    )]
     http: Option<Option<RawSniffProtocolConfig>>,
-    #[serde(
-        rename = "TLS",
-        default,
-        deserialize_with = "deserialize_present_option"
-    )]
     tls: Option<Option<RawSniffProtocolConfig>>,
-    #[serde(
-        rename = "QUIC",
-        default,
-        deserialize_with = "deserialize_present_option"
-    )]
     quic: Option<Option<RawSniffProtocolConfig>>,
+}
+impl<'de> Deserialize<'de> for RawSniffConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let entries = serde_yaml_ng::Mapping::deserialize(deserializer)?;
+        let mut result = Self::default();
+        for (name, value) in entries {
+            let name = name.as_str().ok_or_else(|| {
+                serde::de::Error::custom("sniffer protocol name must be a string")
+            })?;
+            let field = match name.to_ascii_uppercase().as_str() {
+                "HTTP" => &mut result.http,
+                "TLS" => &mut result.tls,
+                "QUIC" => &mut result.quic,
+                _ => return Err(serde::de::Error::custom("unsupported sniffer protocol")),
+            };
+            *field = Some(serde_yaml_ng::from_value(value).map_err(serde::de::Error::custom)?);
+        }
+        Ok(result)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSniffProtocolConfig {
+    #[serde(rename = "override-destination", default)]
+    override_destination: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     ports: Option<Vec<RawSnifferPort>>,
 }
@@ -2038,35 +2077,35 @@ fn normalize_geox_url(raw: String, field: &str) -> Result<String> {
 impl RawSnifferConfig {
     fn normalize(self) -> Result<SnifferConfig> {
         let sniff = self.sniff.unwrap_or_default();
-        let http = normalize_sniffer_protocol(sniff.http, 80, "HTTP")?;
-        let tls = normalize_sniffer_protocol(sniff.tls, 443, "TLS")?;
-        let quic = normalize_sniffer_protocol(sniff.quic, 443, "QUIC")?;
-
-        if self.enable && http.is_none() && tls.is_none() && quic.is_none() {
-            return invalid(
-                "sniffer.enable: true requires at least one HTTP, TLS, or QUIC sniffer",
-            );
-        }
-
-        let http_ports = http.unwrap_or_default();
-        let tls_ports = tls.unwrap_or_default();
-        let quic_ports = quic.unwrap_or_default();
-        if port_ranges_overlap(&http_ports, &tls_ports) {
-            return invalid("sniffer HTTP and TLS port ranges must not overlap");
-        }
-
+        let override_for = |raw: &Option<Option<RawSniffProtocolConfig>>| {
+            raw.as_ref()
+                .and_then(Option::as_ref)
+                .and_then(|raw| raw.override_destination)
+                .unwrap_or(self.override_destination)
+        };
+        let http_override = override_for(&sniff.http);
+        let tls_override = override_for(&sniff.tls);
+        let quic_override = override_for(&sniff.quic);
         Ok(SnifferConfig {
             enable: self.enable,
-            http_ports,
-            tls_ports,
-            quic_ports,
+            force_dns_mapping: self.force_dns_mapping,
+            parse_pure_ip: self.parse_pure_ip,
+            force_domain: sniffer::domains(self.force_domain)?,
+            skip_domain: sniffer::domains(self.skip_domain)?,
+            skip_src_address: sniffer::addresses(self.skip_src_address)?,
+            skip_dst_address: sniffer::addresses(self.skip_dst_address)?,
+            http_override,
+            tls_override,
+            quic_override,
+            http_ports: normalize_sniffer_protocol(sniff.http, "HTTP")?.unwrap_or_default(),
+            tls_ports: normalize_sniffer_protocol(sniff.tls, "TLS")?.unwrap_or_default(),
+            quic_ports: normalize_sniffer_protocol(sniff.quic, "QUIC")?.unwrap_or_default(),
         })
     }
 }
 
 fn normalize_sniffer_protocol(
     raw: Option<Option<RawSniffProtocolConfig>>,
-    default_port: u16,
     protocol: &str,
 ) -> Result<Option<Box<[PortRange]>>> {
     let Some(raw) = raw else {
@@ -2075,12 +2114,18 @@ fn normalize_sniffer_protocol(
     let raw = raw.unwrap_or_default();
     let ranges = match raw.ports {
         None => vec![PortRange {
-            start: default_port,
-            end: default_port,
+            start: 0,
+            end: u16::MAX,
         }],
         Some(items) => {
             if items.is_empty() {
-                return invalid(format!("sniffer.sniff.{protocol}.ports must not be empty"));
+                return Ok(Some(
+                    vec![PortRange {
+                        start: 0,
+                        end: u16::MAX,
+                    }]
+                    .into_boxed_slice(),
+                ));
             }
             if items.len() > MAX_SNIFFER_PORT_ITEMS {
                 return invalid(format!(
@@ -2146,14 +2191,11 @@ fn parse_sniffer_port_string(value: &str, protocol: &str) -> Result<u16> {
 }
 
 fn parse_sniffer_port_number(value: u64, protocol: &str) -> Result<u16> {
-    u16::try_from(value)
-        .ok()
-        .filter(|port| *port != 0)
-        .ok_or_else(|| {
-            VoleError::InvalidConfig(format!(
-                "sniffer.sniff.{protocol}.ports values must be between 1 and 65535"
-            ))
-        })
+    u16::try_from(value).ok().ok_or_else(|| {
+        VoleError::InvalidConfig(format!(
+            "sniffer.sniff.{protocol}.ports values must be between 1 and 65535"
+        ))
+    })
 }
 
 fn merge_port_ranges(mut ranges: Vec<PortRange>) -> Vec<PortRange> {
@@ -2169,20 +2211,6 @@ fn merge_port_ranges(mut ranges: Vec<PortRange>) -> Vec<PortRange> {
         merged.push(range);
     }
     merged
-}
-
-fn port_ranges_overlap(left: &[PortRange], right: &[PortRange]) -> bool {
-    let (mut left_index, mut right_index) = (0, 0);
-    while let (Some(left), Some(right)) = (left.get(left_index), right.get(right_index)) {
-        if left.end < right.start {
-            left_index += 1;
-        } else if right.end < left.start {
-            right_index += 1;
-        } else {
-            return true;
-        }
-    }
-    false
 }
 
 fn port_ranges_contain(ranges: &[PortRange], port: u16) -> bool {
@@ -3809,7 +3837,10 @@ geo-update-interval: 24"#]
         assert!(config.sniffer.enable);
         assert_eq!(
             config.sniffer.http_ports.as_ref(),
-            &[PortRange { start: 80, end: 80 }]
+            &[PortRange {
+                start: 0,
+                end: u16::MAX
+            }]
         );
         assert_eq!(
             config.sniffer.tls_ports.as_ref(),
@@ -3825,18 +3856,18 @@ geo-update-interval: 24"#]
             ]
         );
         assert!(config.sniffer.matches_http_port(80));
-        assert!(!config.sniffer.matches_http_port(8080));
+        assert!(config.sniffer.matches_http_port(8080));
         assert!(config.sniffer.matches_tls_port(8445));
         assert!(!config.sniffer.matches_tls_port(8448));
         assert_eq!(
             config.sniffer.quic_ports.as_ref(),
             &[PortRange {
-                start: 443,
-                end: 443
+                start: 0,
+                end: u16::MAX
             }]
         );
         assert!(config.sniffer.matches_quic_port(443));
-        assert!(!config.sniffer.matches_quic_port(8443));
+        assert!(config.sniffer.matches_quic_port(8443));
 
         let http_only =
             Config::parse_yaml(with_sniffer("  enable: true\n  sniff:\n    HTTP: {}").as_bytes())
@@ -3902,21 +3933,13 @@ geo-update-interval: 24"#]
     }
 
     #[test]
-    fn rejects_invalid_sniffer_shapes_ports_and_overlap() {
+    fn rejects_invalid_sniffer_shapes_and_ports() {
         let too_many_ports = (1..=MAX_SNIFFER_PORT_ITEMS + 1)
             .map(|port| port.to_string())
             .collect::<Vec<_>>()
             .join(", ");
         for yaml in [
-            with_sniffer("  enable: true"),
-            with_sniffer("  enable: true\n  sniff: {}"),
-            with_sniffer("  sniff:\n    HTTP: {}"),
             with_sniffer("  enable: \"true\"\n  sniff:\n    HTTP: {}"),
-            CURRENT_TLS.replacen("tun:\n", "sniffer:\ntun:\n", 1),
-            with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: []"),
-            with_sniffer("  enable: true\n  sniff:\n    QUIC:\n      ports: []"),
-            with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: [0]"),
-            with_sniffer("  enable: true\n  sniff:\n    QUIC:\n      ports: [0]"),
             with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: [65536]"),
             with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: [\"\"]"),
             with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: [\"+80\"]"),
@@ -3926,9 +3949,6 @@ geo-update-interval: 24"#]
             with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: [\"443-\"]"),
             with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: [\"444-443\"]"),
             with_sniffer("  enable: true\n  sniff:\n    QUIC:\n      ports: [\"444-443\"]"),
-            with_sniffer(
-                "  enable: true\n  sniff:\n    HTTP:\n      ports: [\"80-90\"]\n    TLS:\n      ports: [90]",
-            ),
             with_sniffer(&format!(
                 "  enable: true\n  sniff:\n    HTTP:\n      ports: [{too_many_ports}]"
             )),
@@ -4223,22 +4243,6 @@ geo-update-interval: 24"#]
             ),
             CURRENT_TLS.replace("tun:\n", "tun:\n  typo: true\n"),
             with_sniffer("  enable: true\n  typo: true\n  sniff:\n    HTTP: {}"),
-            with_sniffer("  enable: true\n  override-destination: false\n  sniff:\n    HTTP: {}"),
-            with_sniffer("  enable: true\n  force-dns-mapping: true\n  sniff:\n    HTTP: {}"),
-            with_sniffer("  enable: true\n  parse-pure-ip: true\n  sniff:\n    HTTP: {}"),
-            with_sniffer("  enable: true\n  force-domain: [example.com]\n  sniff:\n    HTTP: {}"),
-            with_sniffer(
-                "  enable: true\n  skip-src-address: [192.0.2.1/32]\n  sniff:\n    HTTP: {}",
-            ),
-            with_sniffer(
-                "  enable: true\n  skip-dst-address: [192.0.2.1/32]\n  sniff:\n    HTTP: {}",
-            ),
-            with_sniffer("  enable: true\n  skip-domain: [example.com]\n  sniff:\n    HTTP: {}"),
-            with_sniffer("  enable: true\n  sniffing: [http]"),
-            with_sniffer("  enable: true\n  port-whitelist: [80]"),
-            with_sniffer("  enable: true\n  sniff:\n    http: {}"),
-            with_sniffer("  enable: true\n  sniff:\n    quic: {}"),
-            with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      override-destination: false"),
             CURRENT_TLS.replace("  - name: proxy\n", "  - typo: true\n    name: proxy\n"),
             CURRENT_TLS.replace("    server: ", "    vnext: []\n    server: "),
             CURRENT_TLS.replace("    network: xhttp", "    typo: true\n    network: xhttp"),

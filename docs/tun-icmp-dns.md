@@ -50,7 +50,25 @@ UDP 读取器只做有界 wire 分类和任务提交，不同步等待上游。�
 
 SVCB、HTTPS、TXT、PTR、MX、SRV、NS、SOA、DNSSEC 和未知 16 位 qtype 都可按原始查询转发。A/AAAA 响应中的可达 CNAME 链继续执行严格地址和 TTL 校验。
 
-redir-host 模式的 TUN 域名提示存储只在启用 TUN 且业务规则包含域名类规则时创建。嗅探域名优先于 DNS 提示，两者都不改写实际目标。
+redir-host 域名提示在 DNS 开启且规则需要域名或已启用嗅探时创建，供业务入口共用。DNS 提示本身不改写目标；嗅探是否覆盖目标由 override-destination 控制。
+
+## 嗅探
+
+HTTP/TLS 用于 TUN 与 mixed TCP；QUIC v1/v2 多包识别用于 TUN UDP。
+`parse-pure-ip` 控制无域名目标，`force-dns-mapping` 控制 redir-host 提示，均默认 true。
+fake-IP 恢复后的域名与显式域名只在 `force-domain` 匹配时强制嗅探。
+`skip-src-address` / `skip-dst-address` 在读取前排除地址；`skip-domain` 排除识别结果。
+域名项支持通配、GeoSite 和 domain/classical 规则集合；地址项支持 CIDR、GeoIP 与
+ipcidr/classical 集合，classical 只使用对应的域名或目标 IP 条件。
+
+全局 `override-destination` 默认 true，协议级值优先。false 只将识别域名提供给规则，
+保留实际目标；true 替换为识别域名，DIRECT 或必须 IP 的传输再解析。
+UDP 覆盖保留原始目标供回包使用，活动流不随后续查询变更。
+
+HTTP/TLS 端口可重叠。每连接共享最多 64 KiB 预读，首字节最多一秒，随后解析最多一秒；
+优先识别 TLS，再识别 HTTP。失败、超时或跳过均保留已读数据供业务转发。
+HTTP 识别 HTTP/1.x Host；TLS/QUIC 识别 ClientHello，检测到 ECH 时不使用外层 SNI。
+不嗅探劫持的 DNS。没有列出任何协议时不读取业务数据。
 
 ## Fake-IP
 

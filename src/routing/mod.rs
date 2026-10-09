@@ -47,6 +47,12 @@ pub struct RoutingContext {
 }
 
 impl RoutingContext {
+    pub(crate) fn set_sniffed_domain(&mut self, host: &str) {
+        if let Ok(host) = normalize_domain_name(host) {
+            self.normalized_domain = Some(host.into_boxed_str());
+        }
+    }
+
     /// Builds a context from the original destination without a redir-host
     /// domain hint.
     pub fn new(network: Network, destination: &Destination) -> Result<Self, DomainNameError> {

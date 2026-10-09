@@ -396,6 +396,32 @@ impl ProviderTemplate {
             sets.insert(name.clone(), rules.clone());
         }
         bind_rules(&mut config.rules, &sets)?;
+        bind_rules(&mut config.sniffer.skip_src_address, &sets)?;
+        bind_rules(&mut config.sniffer.skip_dst_address, &sets)?;
+        for rule in config
+            .sniffer
+            .skip_src_address
+            .iter()
+            .chain(&config.sniffer.skip_dst_address)
+        {
+            if let RuleKind::RuleSet {
+                content: Some(set), ..
+            } = &rule.kind
+                && set.behavior() == RuleBehavior::Domain
+            {
+                return invalid(
+                    "sniffer address filter requires an ipcidr or classical rule provider",
+                );
+            }
+        }
+        for selector in config
+            .sniffer
+            .force_domain
+            .iter_mut()
+            .chain(&mut config.sniffer.skip_domain)
+        {
+            bind_domain_selector(selector, &sets)?;
+        }
         bind_rules(&mut config.dns.fake_ip.rules, &sets)?;
         for rule in &config.dns.fake_ip.rules {
             if let RuleKind::RuleSet {

@@ -270,12 +270,43 @@ where
                 return Err(error);
             }
         };
-        let session = StreamSession {
+        let mut session = StreamSession {
             inbound: InboundKind::Http,
             source: peer,
             destination,
             sniffed_domain: None,
         };
+        let sniff = dispatcher
+            .sniff_plan(peer, &session.destination)
+            .await
+            .filter(|plan| plan.tcp_enabled());
+        if let (Some(forward), Some(sniff)) = (&plan, &sniff) {
+            let _prefix = sniff
+                .sniff(&mut forward.head.as_slice(), &mut session)
+                .await;
+        }
+        if plan.is_none()
+            && let Some(sniff) = sniff
+        {
+            write_timed(
+                writer,
+                b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                config.header_timeout,
+            )
+            .await?;
+            let prefix = sniff.sniff(reader, &mut session).await;
+            let mut outbound = timeout(config.connect_timeout, dispatcher.connect_tcp(session))
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "HTTP outbound connect timed out")
+                })?
+                .map_err(dispatch_to_io)?;
+            if !prefix.is_empty() {
+                write_timed(&mut outbound, &prefix, config.connect_timeout).await?;
+            }
+            let (mut remote_read, mut remote_write) = tokio::io::split(outbound);
+            return relay(reader, writer, &mut remote_read, &mut remote_write).await;
+        }
         let outbound = connect(dispatcher, session, config, writer, diagnostic).await?;
         if let Some(plan) = plan {
             if !forward_request(reader, writer, outbound, &request, plan, config).await? {
