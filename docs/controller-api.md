@@ -186,9 +186,10 @@ Hysteria2 已认证 QUIC 会话也保留其 `dialer-proxy` 上游组快照，包
 连接选项、profile 和 TUN 字段。它使用字段白名单，不提供完整 YAML、节点凭据、订阅位置、
 认证头、Controller secret 或认证用户列表；不支持 PUT/PATCH 配置修改。
 
-`GET /dns/query?name=example.com&type=A` 使用当前 DNS 与相同缓存查询；支持 A/AAAA，
+`GET /dns/query?name=example.com&type=A` 使用当前上游 resolver 与相同缓存查询；支持 A/AAAA，
 省略 type 使用 A。响应包含 `Status/Question/Answer/TC/RD/RA/AD/CD` 和扩展 `QueryPath`。
-fake-IP 模式仍返回合成地址；DNS 关闭或查询失败返回 500。这里只输出地址/CNAME 答案，
+与 Mihomo 一样，此诊断接口跳过入口的 hosts、fake-IP 与 IPv6 响应过滤，返回上游真实答案；
+policy 与 fallback 仍生效。DNS 关闭或查询失败返回 500。这里只输出地址/CNAME 答案，
 不提供其他 qtype、Authority/Additional 展开或后台 DNS 查询日志。
 
 这些接口复用 Controller 的回环限制和 Bearer 鉴权。目标与 DNS 路径只通过显式查询返回，

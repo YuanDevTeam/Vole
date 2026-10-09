@@ -627,7 +627,7 @@ async fn dns_query(
     else {
         return write_error(stream, 400, "Bad request", &[]).await;
     };
-    let (result, path) = tokio::select! { biased; () = cancellation.cancelled() => return Ok(()), result = crate::dns::trace::capture(snapshot.dns.exchange(&query)) => result };
+    let (result, path) = tokio::select! { biased; () = cancellation.cancelled() => return Ok(()), result = crate::dns::trace::capture(snapshot.dns.query_upstream(&query)) => result };
     let Ok(wire) = result else {
         return write_error(stream, 500, "DNS query failed", &[]).await;
     };

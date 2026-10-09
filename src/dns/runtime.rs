@@ -1241,6 +1241,29 @@ impl RuntimeDns {
             .map(DnsWireResponse::into_wire)
     }
 
+    /// Controller queries inspect the upstream resolver, as in Mihomo, without
+    /// the DNS listener's hosts, fake-IP or IPv6 response middleware.
+    pub(crate) async fn query_upstream(&self, query: &[u8]) -> Result<Vec<u8>, RuntimeDnsError> {
+        if !self.enabled {
+            return Err(RuntimeDnsError::Disabled);
+        }
+        let classified = classify_query(query).map_err(RuntimeDnsError::InvalidQuery)?;
+        let permit = self.begin_query();
+        timeout_at(
+            permit.deadline,
+            self.exchange_address_upstream(
+                query,
+                &classified,
+                permit.deadline,
+                FailureMode::BoundedError,
+            ),
+        )
+        .await
+        .map_err(|_| RuntimeDnsError::UpstreamsExhausted {
+            last_error: "runtime DNS total query deadline expired".into(),
+        })?
+    }
+
     /// Keeps an observed query attached to the returned wire response. TUN TCP
     /// uses this until the framed response write completes.
     pub(crate) async fn exchange_retained(
@@ -1403,6 +1426,19 @@ impl RuntimeDns {
         {
             return self.synthetic_answer(&parsed_query, &parsed_query.question.name);
         }
+
+        self.exchange_address_upstream(query, classified, deadline, failure_mode)
+            .await
+    }
+
+    async fn exchange_address_upstream(
+        &self,
+        query: &[u8],
+        classified: &ClassifiedDnsQuery,
+        deadline: TokioInstant,
+        failure_mode: FailureMode,
+    ) -> Result<Vec<u8>, RuntimeDnsError> {
+        let parsed_query = parse_query(query).map_err(RuntimeDnsError::InvalidQuery)?;
 
         loop {
             let key = SingleflightKey::from(classified);
@@ -5025,6 +5061,7 @@ dns:
 mixed-port: 1080
 hosts:
   alias.example: synthetic.example
+  fixed.example: 192.0.2.9
 dns:
   enable: true
   enhanced-mode: fake-ip
@@ -5037,6 +5074,7 @@ dns:
         let real: IpAddr = "203.0.113.7".parse().unwrap();
         let dispatcher = Arc::new(MockDispatcher::with_replies(
             vec![
+                MockReply::Response(ResponseSpec::answer(real)),
                 MockReply::Response(ResponseSpec::answer(real)),
                 MockReply::Response(ResponseSpec::answer(real)),
             ],
@@ -5059,6 +5097,18 @@ dns:
         }
         assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 0);
         assert_eq!(resolver.resolve("synthetic.example").await.unwrap(), [real]);
+        for name in ["synthetic.example", "fixed.example"] {
+            let wire = resolver
+                .query_upstream(&build_query(10, name, QueryType::A).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                matching_answer_set(&parse_response(&wire).unwrap())
+                    .unwrap()
+                    .addresses,
+                [real]
+            );
+        }
         let wire = resolver
             .exchange(&build_query(11, "real.example", QueryType::A).unwrap())
             .await
