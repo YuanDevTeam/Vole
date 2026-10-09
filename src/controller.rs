@@ -201,7 +201,8 @@ async fn handle_connection(
         };
         let registry = resources.connections();
         if request.method == "GET" && request.target == "/connections" {
-            return write_json(&mut stream, 200, &registry.snapshot(), &[]).await;
+            let snapshot = registry.snapshot();
+            return write_json(&mut stream, 200, &snapshot, &[]).await;
         }
         if request.method == "DELETE" {
             if let Some(raw_id) = request.target.strip_prefix("/connections/") {

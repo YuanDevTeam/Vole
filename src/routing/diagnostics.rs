@@ -4,69 +4,107 @@ use crate::{
     routing::RuleSet,
 };
 use serde_json::{Value, json};
-use std::sync::{
-    Mutex,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 pub(crate) struct Diagnostics {
-    pub connections: std::sync::Arc<crate::connections::Registry>,
-    pub proxy_names: Vec<String>,
-    providers: std::collections::BTreeMap<String, Vec<String>>,
+    pub connections: Arc<crate::connections::Registry>,
+    pub proxy_names: Vec<Arc<str>>,
+    providers: BTreeMap<Arc<str>, Vec<Arc<str>>>,
+    names: BTreeSet<Arc<str>>,
     config: Value,
     rules: Vec<Rule>,
 }
 struct Rule {
     kind: &'static str,
-    payload: String,
-    target: String,
+    payload: Arc<str>,
+    target: Arc<str>,
     hits: AtomicU64,
-    hit_at: Mutex<Option<String>>,
+    // A numeric UTC value; formatting belongs to the Controller query path.
+    hit_at: Mutex<Option<time::OffsetDateTime>>,
 }
 impl Diagnostics {
     pub fn new(
         config: &Config,
         rules: &RuleSet,
-        connections: std::sync::Arc<crate::connections::Registry>,
+        connections: Arc<crate::connections::Registry>,
     ) -> Self {
+        // Intern only display text. Connections can retain these small strings without
+        // pinning a Config or an entire retired resource generation.
+        let mut texts = BTreeSet::new();
+        let mut names = BTreeSet::new();
+        for name in ["", "DIRECT", "REJECT"]
+            .into_iter()
+            .chain(config.proxies.iter().map(|p| p.tag.as_str()))
+            .chain(config.proxy_groups.iter().map(|g| g.name.as_str()))
+            .chain(config.provider_members.keys().map(String::as_str))
+        {
+            names.insert(intern(&mut texts, name));
+        }
+        let proxy_names = config
+            .proxies
+            .iter()
+            .map(|p| intern(&mut texts, &p.tag))
+            .collect();
+        let providers = config
+            .provider_members
+            .iter()
+            .map(|(name, members)| {
+                let mut members = members
+                    .iter()
+                    .map(|member| intern(&mut texts, member))
+                    .collect::<Vec<_>>();
+                members.sort_unstable();
+                members.dedup();
+                (intern(&mut texts, name), members)
+            })
+            .collect();
+        let rules = (0..rules.len())
+            .filter_map(|i| rules.rule(i))
+            .map(|spec| {
+                let (kind, payload) = rule_description(&spec.kind);
+                let target = match spec.action {
+                    RuleAction::Direct => "DIRECT",
+                    RuleAction::Reject => "REJECT",
+                    RuleAction::Route(RouteTargetId::Proxy(id)) => &config.proxies[id.index()].tag,
+                    RuleAction::Route(RouteTargetId::Group(id)) => {
+                        &config.proxy_groups[id.index()].name
+                    }
+                };
+                Rule {
+                    kind,
+                    payload: intern(&mut texts, &payload),
+                    target: intern(&mut texts, target),
+                    hits: AtomicU64::new(0),
+                    hit_at: Mutex::new(None),
+                }
+            })
+            .collect();
         Self {
             connections,
-            providers: config
-                .provider_members
-                .iter()
-                .map(|(name, members)| (name.clone(), members.clone()))
-                .collect(),
-            proxy_names: config.proxies.iter().map(|p| p.tag.clone()).collect(),
+            proxy_names,
+            providers,
+            names,
             config: effective_config(config),
-            rules: (0..rules.len())
-                .filter_map(|i| rules.rule(i))
-                .map(|spec| {
-                    let (kind, payload) = rule_description(&spec.kind);
-                    let target = match spec.action {
-                        RuleAction::Direct => "DIRECT".into(),
-                        RuleAction::Reject => "REJECT".into(),
-                        RuleAction::Route(RouteTargetId::Proxy(id)) => {
-                            config.proxies[id.index()].tag.clone()
-                        }
-                        RuleAction::Route(RouteTargetId::Group(id)) => {
-                            config.proxy_groups[id.index()].name.clone()
-                        }
-                    };
-                    Rule {
-                        kind,
-                        payload,
-                        target,
-                        hits: AtomicU64::new(0),
-                        hit_at: Mutex::new(None),
-                    }
-                })
-                .collect(),
+            rules,
         }
     }
-    pub fn providers(&self, chain: &[String]) -> Vec<String> {
+    /// Reuse known route/provider names, without retaining dynamic destinations.
+    pub fn text(&self, text: &str) -> Arc<str> {
+        self.names
+            .get(text)
+            .cloned()
+            .unwrap_or_else(|| Arc::from(text))
+    }
+    pub fn providers(&self, chain: &[Arc<str>]) -> Vec<Arc<str>> {
         self.providers
             .iter()
-            .filter(|(_, members)| chain.iter().any(|node| members.contains(node)))
+            .filter(|(_, members)| chain.iter().any(|node| members.binary_search(node).is_ok()))
             .map(|(name, _)| name.clone())
             .collect()
     }
@@ -75,18 +113,41 @@ impl Diagnostics {
     }
     pub fn hit(&self, index: usize) {
         if let Some(rule) = self.rules.get(index) {
-            rule.hits.fetch_add(1, Ordering::Relaxed);
-            *rule.hit_at.lock().unwrap() = Some(crate::connections::timestamp());
+            let mut old = rule.hits.load(Ordering::Relaxed);
+            while let Err(current) = rule.hits.compare_exchange_weak(
+                old,
+                old.saturating_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                old = current;
+            }
+            *rule.hit_at.lock().unwrap() = Some(time::OffsetDateTime::now_utc());
         }
     }
-    pub fn matched(&self, index: usize) -> (&'static str, &str) {
+    pub fn matched(&self, index: usize) -> (&'static str, Arc<str>) {
         self.rules
             .get(index)
-            .map_or(("", ""), |r| (r.kind, r.payload.as_str()))
+            .map_or_else(|| ("", self.text("")), |r| (r.kind, r.payload.clone()))
     }
     pub fn rules(&self) -> Value {
-        json!({"rules": self.rules.iter().enumerate().map(|(index, r)| json!({"index":index,"type":r.kind,"payload":r.payload,"proxy":r.target,"size":-1,"extra":{"disabled":false,"hitCount":r.hits.load(Ordering::Relaxed),"hitAt":*r.hit_at.lock().unwrap()}})).collect::<Vec<_>>()})
+        json!({"rules": self.rules.iter().enumerate().map(|(index, r)| {
+            let hit_at = *r.hit_at.lock().unwrap();
+            let hit_at = hit_at.map(|time| {
+                time.format(&time::format_description::well_known::Rfc3339)
+                    .expect("recorded UTC date")
+            });
+            json!({"index":index,"type":r.kind,"payload":r.payload.as_ref(),"proxy":r.target.as_ref(),"size":-1,"extra":{"disabled":false,"hitCount":r.hits.load(Ordering::Relaxed),"hitAt":hit_at}})
+        }).collect::<Vec<_>>()})
     }
+}
+fn intern(texts: &mut BTreeSet<Arc<str>>, text: &str) -> Arc<str> {
+    if let Some(shared) = texts.get(text) {
+        return shared.clone();
+    }
+    let shared: Arc<str> = text.into();
+    texts.insert(shared.clone());
+    shared
 }
 fn effective_config(config: &Config) -> Value {
     use crate::config::{InboundConfig, LogLevel, Mode};
@@ -170,6 +231,70 @@ fn logical<'a>(rules: impl Iterator<Item = &'a RuleKind>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_diagnostic_text_outlives_only_its_small_value() {
+        let mut config = Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxies: [{name: edge, type: socks5, server: 192.0.2.1, port: 1080}]
+proxy-groups: [{name: pool, type: select, proxies: [edge]}]
+rules: ["DOMAIN-SUFFIX,example.com,pool", "DOMAIN-SUFFIX,example.com,pool", "MATCH,edge"]
+"#,
+        )
+        .unwrap();
+        config
+            .provider_members
+            .insert("z-provider".into(), vec!["edge".into()]);
+        config
+            .provider_members
+            .insert("a-provider".into(), vec!["edge".into(), "edge".into()]);
+        let rules = RuleSet::compile(config.rules.clone()).unwrap();
+        let diagnostics = Arc::new(Diagnostics::new(&config, &rules, Default::default()));
+        let (_, payload) = diagnostics.matched(0);
+        assert!(Arc::ptr_eq(&payload, &diagnostics.matched(1).1));
+        assert!(Arc::ptr_eq(
+            &diagnostics.proxy_names[0],
+            &diagnostics.text("edge")
+        ));
+        assert!(Arc::ptr_eq(
+            &diagnostics.rules[0].target,
+            &diagnostics.text("pool")
+        ));
+        assert!(Arc::ptr_eq(
+            &diagnostics.rules[2].target,
+            &diagnostics.proxy_names[0]
+        ));
+        let providers =
+            diagnostics.providers(&[diagnostics.text("edge"), diagnostics.text("pool")]);
+        assert_eq!(
+            providers.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+            ["a-provider", "z-provider"]
+        );
+        assert!(Arc::ptr_eq(&providers[0], &diagnostics.text("a-provider")));
+        assert!(diagnostics.rules()["rules"][0]["extra"]["hitAt"].is_null());
+        diagnostics.hit(0);
+        let view = diagnostics.rules();
+        let recorded = diagnostics.rules[0].hit_at.lock().unwrap().unwrap();
+        assert_eq!(
+            view["rules"][0]["extra"]["hitAt"],
+            recorded
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        );
+        assert_eq!(view["rules"][0]["extra"]["hitCount"], 1);
+        diagnostics.rules[0].hits.store(u64::MAX, Ordering::Relaxed);
+        diagnostics.hit(0);
+        assert_eq!(
+            diagnostics.rules()["rules"][0]["extra"]["hitCount"],
+            u64::MAX
+        );
+        let owner = Arc::downgrade(&diagnostics);
+        drop(diagnostics);
+        assert!(owner.upgrade().is_none());
+        assert_eq!(payload.as_ref(), "example.com");
+        assert_eq!(providers[0].as_ref(), "a-provider");
+    }
+
     #[test]
     fn effective_configuration_excludes_credentials_and_resource_locations() {
         let config = Config::parse_yaml(br#"

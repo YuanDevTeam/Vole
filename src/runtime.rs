@@ -166,7 +166,8 @@ impl Drop for MeasurementRuntime {
 }
 
 struct BuiltRuntimeParts {
-    diagnostics: Arc<diagnostics::Diagnostics>,
+    connections: Arc<crate::connections::Registry>,
+    diagnostics: Option<Arc<diagnostics::Diagnostics>>,
     dispatcher: Arc<dyn Dispatcher>,
     // Local dispatch owns its DNS reference; this copy feeds shared TUN startup.
     #[cfg_attr(
@@ -715,11 +716,13 @@ impl GraphBuilder {
             activities,
             dns.clone(),
         );
-        let diagnostics = Arc::new(diagnostics::Diagnostics::new(
-            &self.config,
-            &rules,
-            self.connections.clone(),
-        ));
+        let diagnostics = self.config.external_controller.as_ref().map(|_| {
+            Arc::new(diagnostics::Diagnostics::new(
+                &self.config,
+                &rules,
+                self.connections.clone(),
+            ))
+        });
         let mut router = RoutingDispatcher::new_with_ipv6(
             route_targets.clone(),
             direct.clone(),
@@ -731,12 +734,13 @@ impl GraphBuilder {
         .with_tun_config(&self.config.tun)
         .with_sniffer(&self.config.sniffer)
         .with_tcp_concurrent(self.config.connections.tcp_concurrent);
-        if self.config.external_controller.is_some() {
+        if let Some(diagnostics) = &diagnostics {
             router = router.with_diagnostics(diagnostics.clone());
         }
         let router: Arc<dyn Dispatcher> = Arc::new(router);
         let session_stats = RuntimeResourceStats::new("runtime_session_observation");
         Ok(BuiltRuntimeParts {
+            connections: self.connections.clone(),
             diagnostics,
             dispatcher: observe_sessions_with_stats(router, session_stats),
             dns,
@@ -1987,15 +1991,15 @@ rules:
                 Err(crate::dispatch::DispatchError::NotAllowed)
             ));
             // REJECT exercises the assembled business path without opening a socket.
-            let snapshot = parts.diagnostics.connections.snapshot();
+            assert_eq!(parts.diagnostics.is_some(), controller);
+            let snapshot = serde_json::to_value(parts.connections.snapshot()).unwrap();
             assert_eq!(
                 snapshot["errors"].as_array().unwrap().len(),
                 usize::from(controller)
             );
-            assert_eq!(
-                parts.diagnostics.rules()["rules"][0]["extra"]["hitCount"],
-                usize::from(controller)
-            );
+            if let Some(diagnostics) = &parts.diagnostics {
+                assert_eq!(diagnostics.rules()["rules"][0]["extra"]["hitCount"], 1);
+            }
             parts.proxy_graph.shutdown().await;
         }
     }

@@ -799,16 +799,20 @@ impl RoutingDispatcher {
         original: &Destination,
         sniffed: Option<&str>,
         decision: &RouteDecision,
-        mut chain: Vec<String>,
+        chain: Vec<String>,
     ) -> Option<crate::connections::Connection> {
         if !business(inbound) {
             return None;
         }
         let diagnostics = self.diagnostics.as_ref()?;
+        let mut chain = chain
+            .iter()
+            .map(|name| diagnostics.text(name))
+            .collect::<Vec<_>>();
         if chain.is_empty() {
             chain.push(match decision.action {
-                RuleAction::Direct => "DIRECT".into(),
-                RuleAction::Reject => "REJECT".into(),
+                RuleAction::Direct => diagnostics.text("DIRECT"),
+                RuleAction::Reject => diagnostics.text("REJECT"),
                 RuleAction::Route(RouteTargetId::Proxy(id)) => {
                     diagnostics.proxy_names[id.index()].clone()
                 }
@@ -817,22 +821,45 @@ impl RoutingDispatcher {
                 }
             });
         }
-        let (rule, payload) = diagnostics.matched(decision.rule_index);
+        let (rule, rule_payload) = diagnostics.matched(decision.rule_index);
         let host = match &decision.metadata {
-            Destination::Domain { host, .. } => host.as_str(),
-            _ => "",
+            Destination::Domain { host, .. } => diagnostics.text(host),
+            _ => diagnostics.text(""),
         };
         let destination_ip = match &decision.destination {
-            Destination::Ip(addr) => Some(addr.ip().to_string()),
+            Destination::Ip(addr) => Some(addr.ip()),
             _ => None,
         };
-        let providers = diagnostics.providers(&chain);
-        Some(diagnostics.connections.open(serde_json::json!({
-            "metadata":{"network":if network == Network::Tcp { "tcp" } else { "udp" }, "type":match inbound { InboundKind::Tun=>"Tun", InboundKind::Http=>"HTTP", _=>"Socks5" },
-            "sourceIP":source.ip().to_string(),"sourcePort":source.port().to_string(),"destinationIP":destination_ip,
-            "destinationPort":original.port().to_string(),"host":host,"dnsMode":decision.dns_mode,"sniffHost":sniffed.unwrap_or_default()},
-            "chains":chain,"providerChains":providers,"rule":rule,"rulePayload":payload,"dnsPath":crate::dns::trace::snapshot()
-        })))
+        let provider_chains = diagnostics.providers(&chain);
+        Some(
+            diagnostics
+                .connections
+                .open(crate::connections::ConnectionInfo {
+                    metadata: crate::connections::ConnectionMetadata {
+                        network: if network == Network::Tcp {
+                            "tcp"
+                        } else {
+                            "udp"
+                        },
+                        inbound_type: match inbound {
+                            InboundKind::Tun => "Tun",
+                            InboundKind::Http => "HTTP",
+                            _ => "Socks5",
+                        },
+                        source,
+                        destination_ip,
+                        destination_port: original.port(),
+                        host,
+                        dns_mode: decision.dns_mode,
+                        sniff_host: diagnostics.text(sniffed.unwrap_or_default()),
+                    },
+                    chains: chain,
+                    provider_chains,
+                    rule,
+                    rule_payload,
+                    dns_path: crate::dns::trace::snapshot(),
+                }),
+        )
     }
 
     fn clone_parts(&self) -> Self {
@@ -1932,7 +1959,7 @@ rules: ["MATCH,pool"]
         let second = "198.51.100.2:443".parse().unwrap();
         transport.send(datagram(first, b"one")).await.unwrap();
         transport.send(datagram(second, b"two")).await.unwrap();
-        let snapshot = registry.snapshot();
+        let snapshot = serde_json::to_value(registry.snapshot()).unwrap();
         let entries = snapshot["connections"].as_array().unwrap();
         assert_eq!(entries.len(), 2);
         let entry = entries
@@ -1947,14 +1974,17 @@ rules: ["MATCH,pool"]
             Destination::Ip(second)
         );
         assert_eq!(
-            registry.snapshot()["connections"].as_array().unwrap().len(),
+            serde_json::to_value(registry.snapshot()).unwrap()["connections"]
+                .as_array()
+                .unwrap()
+                .len(),
             1
         );
         transport.send(datagram(first, b"new")).await.unwrap();
         assert_eq!(proxy.udp_opens.load(Ordering::Relaxed), 3);
         transport.close().await.unwrap();
         assert!(
-            registry.snapshot()["connections"]
+            serde_json::to_value(registry.snapshot()).unwrap()["connections"]
                 .as_array()
                 .unwrap()
                 .is_empty()

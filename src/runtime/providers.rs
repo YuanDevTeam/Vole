@@ -25,7 +25,8 @@ use tokio::{
 };
 
 struct Generation {
-    diagnostics: Arc<diagnostics::Diagnostics>,
+    connections: Arc<crate::connections::Registry>,
+    diagnostics: Option<Arc<diagnostics::Diagnostics>>,
     health: Arc<health::HealthRuntime>,
     requirements: GeoRequirements,
     config: Config,
@@ -43,6 +44,7 @@ impl Generation {
         requirements: GeoRequirements,
     ) -> Self {
         Self {
+            connections: parts.connections.clone(),
             diagnostics: parts.diagnostics.clone(),
             health: parts.health.clone(),
             requirements,
@@ -131,7 +133,7 @@ impl ProviderRuntime {
     }
     pub(super) fn begin_shutdown(&self) {
         self.cancellation.cancel();
-        self.current.load().diagnostics.connections.shutdown();
+        self.current.load().connections.shutdown();
         self.current.load().graph.begin_shutdown();
         for generation in self.retired.lock().unwrap().iter() {
             generation.graph.begin_shutdown();
@@ -270,7 +272,7 @@ impl ProviderRuntime {
         let dialer = self.dialer.clone();
         let geo = self.geo.clone();
         let previous_dns = generation.dns.clone();
-        let connections = generation.diagnostics.connections.clone();
+        let connections = generation.connections.clone();
         let data_dir = self
             .manager
             .store_dir()
@@ -426,13 +428,20 @@ impl ProviderRuntime {
 #[async_trait]
 impl RuntimeResources for ProviderRuntime {
     fn connections(&self) -> Arc<crate::connections::Registry> {
-        self.current.load().diagnostics.connections.clone()
+        self.current.load().connections.clone()
     }
     fn configs(&self) -> serde_json::Value {
-        self.current.load().diagnostics.config()
+        self.current
+            .load()
+            .diagnostics
+            .as_ref()
+            .map_or(serde_json::Value::Null, |diagnostics| diagnostics.config())
     }
     fn rules(&self) -> serde_json::Value {
-        self.current.load().diagnostics.rules()
+        self.current.load().diagnostics.as_ref().map_or_else(
+            || serde_json::json!({"rules": []}),
+            |diagnostics| diagnostics.rules(),
+        )
     }
 
     fn groups(&self) -> Arc<ProxyGroups> {
