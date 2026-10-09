@@ -64,10 +64,8 @@ mod foreground;
 mod measure_delay;
 pub use foreground::InvokePath;
 
-// A measureDelay request may inline five independently valid 256 KiB YAML
-// documents. JSON escaping can double common YAML bytes such as backslashes,
-// quotes, and newlines, so the wire envelope needs a larger aggregate bound.
-pub(crate) const MAX_INVOKE_BYTES: usize = 3 * 1024 * 1024;
+// Five YAML documents, worst-case JSON escaping, and a bounded envelope.
+pub(crate) const MAX_INVOKE_BYTES: usize = 30 * crate::config::MAX_CONFIG_BYTES + 64 * 1024;
 const MAX_ERROR_BYTES: usize = 4096;
 static REGISTRY: OnceLock<RuntimeRegistry> = OnceLock::new();
 
@@ -814,6 +812,8 @@ impl CoreController {
         // non-TUN configurations do not depend on controller registration.
         let _data_directory = registry().data_directory()?;
         let config = parse_config_yaml(&config_yaml)?;
+        let dispatch = crate::logging::dispatch(config.log_level);
+        let _logging = tracing::dispatcher::set_default(&dispatch);
         drop(config_yaml);
         let has_tun = config
             .inbounds
@@ -940,7 +940,7 @@ impl CoreController {
             has_tun,
             allocator_relief,
         };
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let dispatch = crate::logging::dispatch(prepared.core.log_level());
         let spawned = thread::Builder::new()
             .name(format!("vole-runtime-{instance_id}"))
             .spawn(crate::resources::observation::inherit_thread(move || {

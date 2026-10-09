@@ -107,8 +107,7 @@ pub enum InboundKind {
     /// Core-originated DNS traffic sent through the raw proxy dispatcher.
     /// This context must never be passed back through the routing dispatcher.
     InternalDns,
-    /// Core-owned GeoData HTTPS traffic sent through the raw default proxy.
-    /// This context must never be passed through routing or fall back to direct.
+    /// Core-owned GeoData HTTPS traffic routed by the current mode and rules.
     InternalGeoData,
     /// Core-owned latency probe sent through a node-only default proxy graph.
     /// This context never enters the public inbound or routing pipeline.

@@ -19,7 +19,7 @@ HTTP 与 SOCKS5 共用一个混合入口，并和 TUN 共用 Dispatcher、规则
   `authentication` 省略或空列表时，HTTP/SOCKS5 在任何绑定地址均免认证；
   非空必须恰好一项 `user:password`，
   按第一个冒号拆分，两项各 1–255 UTF-8 字节，不 trim。null 不视为省略。
-  配置凭据后 HTTP/SOCKS5 均校验凭据；共享或非空凭据须有启用的混合入口消费。
+  配置凭据后 HTTP/SOCKS5 均校验凭据；混合入口关闭时允许保留合法的共享和认证配置。
 - Basic / SOCKS 用户密码没有链路加密，只适合可信网络。Controller 仍独立回环监听，
   使用自己的 Bearer 认证，不随共享开关开放。
 - 不设置全局业务连接/关联准入数。Stop 取消并等待全部连接、relay 和接收任务，

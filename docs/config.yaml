@@ -1,6 +1,7 @@
 # Vole 配置的完整示例。
 #
-# 配置只接受本文列出的结构；未知或已移除的字段、anchor、alias 和自定义 tag 都会失败。
+# 配置只接受本文列出的结构；未知或已移除的字段和自定义 tag 都会失败。支持 anchor、alias 和 YAML merge。
+# 原始配置上限 8 MiB，展开预算 32 MiB，嵌套最多 64 层；递归 alias 失败。
 # 顶层 port、socks-port、udp 和 listeners 都不接受；代理节点的 port / udp 仍有效。
 #
 # 库宿主先通过 Invoke API 调用 initialize({dataDir})，再通过 configYaml 内联
@@ -14,10 +15,15 @@
 # IPv6 包。dns.ipv6 只有与本项同时为 true 时才生效。
 ipv6: true
 
+# mode 缺省 rule：顺序规则首条命中，未命中 DIRECT；global 使用 GLOBAL 组，direct 直连。
+# log-level 缺省 info，还支持 debug、warning、error、silent；两字段值不区分大小写。
+mode: rule
+log-level: info
+
 # GeoData 下载配置可省略；出现时三项必须齐全。URL 必须是以域名为主机、无
 # userinfo/fragment 的绝对 HTTPS URL，更新周期固定为 24 小时。validateConfig 和
 # measureDelay 不下载。公共实例启动后，只有实际规则需要资产且自动更新已启用时
-# 才后台检查。下载使用最终 MATCH 动作：DIRECT、REJECT、节点或代理组；代理组在
+# 才后台检查。下载按当前 mode 和业务规则选路，未命中 DIRECT；代理组在
 # 创建新物理 transport 时解析当前成员，不自动故障转移，也不隐式回退 DIRECT。
 geox-url:
   geoip: https://assets.example.com/geoip.dat
@@ -33,7 +39,7 @@ geo-update-interval: 24
 # ipv6: true 时同时绑定同端口 IPv6（v6-only）；false 时只监听 IPv4。
 # authentication 省略或 [] 表示任何绑定地址均免认证；非空时必须恰好包含一项 user:password，
 # 按首个冒号分隔，用户名 / 密码各 1–255 UTF-8 字节，HTTP/SOCKS5 共用。
-# 共享或非空认证要求 mixed-port 启用。
+# mixed-port 关闭时可以保留合法的 allow-lan 和 authentication，供之后启用入口使用。
 # HTTP 逐请求认证、选路，支持流式正文 / 分块、Keep-Alive、CONNECT 与 Upgrade。
 # 共享只适合可信网络，Basic 不加密链路；详细边界见 docs/inbounds.md#http。
 # UDP 必须属于有效的 TCP 控制连接，源 IP/端口校验和资源上限见 inbounds.md#socks5。
@@ -93,12 +99,11 @@ sniffer:
 
 # proxies 可省略或设为 []，允许仅使用 DIRECT、REJECT 或只包含内置动作的代理组。
 # 引用的节点和代理组必须存在。节点和代理组定义名共享同一大小写敏感的命名空间，
-# 引用精确匹配且不做 Unicode normalization 或大小写折叠。名称必须为 1–64 UTF-8
-# 字节，首尾不能是任何 Unicode 空白字符，不能含控制字符，也不能包含逗号、井号、
-# 斜杠、问号、`&`、`=`、`%`、反斜杠，或使用 `.`、`..`、`DIRECT`、`REJECT`、
-# `RULES`；内部普通空格、CJK 和 emoji 可用。dialer-proxy 可引用具体节点或 select
-# 组。所有节点上游和全部组成员（包括未选成员）组成同一张无环图；未知引用、自引用
-# 和混合环均失败。代理数量和链深没有独立上限，仍受 YAML 256 KiB 和名称唯一约束。
+# 引用精确匹配且不做 Unicode normalization 或大小写折叠。名称必须为非空字符串；
+# DIRECT、REJECT、REJECT-DROP、COMPATIBLE、PASS、PASS-RULE 为保留定义名。
+# 路径与 URL 中的保留字符由调用方按相应协议编码，不限制节点本身的名称。
+# dialer-proxy 可引用具体节点或 select 组。全部上游和组成员（包括未选成员）须无环。
+# 代理数量和链深没有独立上限，仍受 YAML 大小与名称唯一约束。
 # 节点没有上游，或上游组经纯组成员链能到达 DIRECT 时，prepare 预解析该节点及其
 # 独立下载端点，即使 DIRECT 尚未选中；纯代理路径保留逻辑域名。候选首跳 DNS 失败
 # 则 prepare 失败，切换 DIRECT 不临时调用系统 DNS。物理首跳连接本机服务时，server 必须使用 127.0.0.0/8
@@ -397,9 +402,12 @@ proxies:
 
 # 可选的静态 `select` 代理组。字段外形是严格 Mihomo 子集：每组只接受 name、
 # type、proxies 和可选 default-selected，type 只能是 select，proxies 至少一项。
-# 成员可精确引用具体节点、另一个 select 组、DIRECT 或 REJECT；RULES 不是成员。
+# 成员可精确引用具体节点、另一个 select 组、DIRECT 或 REJECT。
+# RULES 仅在 DNS fragment 中具有特殊含义；在成员列表中按已配置名称解析。
 # 组声明顺序、成员顺序和重复成员全部保留，节点与组的完整混合图必须无环；组数、成员数和嵌套
-# 深度没有独立上限，仍受 256 KiB 配置总大小和 O(V+E) 无环校验约束。
+# 深度没有独立上限，仍受配置总大小和 O(V+E) 无环校验约束。
+# 未显式定义 GLOBAL 时，自动追加一个 select 组；成员依次为 DIRECT、REJECT、
+# 所有节点和声明的组，默认 DIRECT。可显式声明 GLOBAL 覆盖其成员及初始选择。
 #
 # default-selected 省略时选中第一项；显式值必须是当前组的直接成员。重复名称按
 # 第一项命中。没有 Controller 时，该初始选择在本次 session 内固定；有 Controller
@@ -455,11 +463,15 @@ dns:
       - "tcp://223.5.5.5:53#DIRECT"
       - "tcp://1.1.1.1:53#main-select"
 
-# rules 是运行配置必填项，按顺序首条命中。DIRECT 与 REJECT 是内置动作，其他
-# 动作必须精确使用实际节点名或代理组名。`PROXY` 没有特殊别名。rules 不能为空，
-# 必须恰好以一个 MATCH 结束；MATCH 可使用 DIRECT、REJECT、实际节点或代理组。
-# 不存在隐式 MATCH 或 DIRECT 回退。选中组时使用当前成员，组本身不做 health check、
-# 测速或自动 failover。
+# rules 可省略或为空；rule 模式按顺序首条命中，未命中 DIRECT。MATCH 可放在任意
+# 位置，命中后其后规则不再执行。DIRECT、REJECT 是内置动作，其他动作精确引用节点或组。
+# 支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、DOMAIN-WILDCARD、DOMAIN-REGEX、
+# GEOSITE、GEOIP、IP-CIDR、IP-CIDR6、SRC-IP-CIDR、DST-PORT、SRC-PORT、NETWORK、
+# AND/OR/NOT 和 MATCH。SRC-IP-CIDR 支持 IPv4/IPv6，来源信息来自实际入站会话。
+# 通配符 * 匹配任意长度、? 匹配一个字符；DOMAIN-REGEX 忽略大小写，支持 regex crate
+# 子集，不支持 lookaround/backreference，无法编译的模式明确报错。
+# 逻辑规则例如 AND,((DOMAIN-SUFFIX,example.com),(SRC-PORT,1000-2000)),DIRECT；
+# NOT 恰好一个子规则，最多嵌套 32 层。规则上限 65536 条、单条 16 KiB、合计 8 MiB。
 # GEOSITE 支持 [!]<code>[@<attr>...]，GEOIP 支持 [!]<code> 和可选 no-resolve。
 # 例如 GEOSITE,google@ads,REJECT / GEOSITE,!cn@ads,main-select / GEOIP,!CN,DIRECT。
 # geolocation-!cn 为字面分类名；GeoIP DAT reverse_match 接受但忽略，取反由 ! 控制。

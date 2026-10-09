@@ -57,7 +57,7 @@ rules:
         ProxyGroupMemberTarget::Route(RouteTargetId::Group(backup))
     );
     assert_eq!(
-        config.default_action,
+        config.rules.last().unwrap().action,
         RuleAction::Route(RouteTargetId::Group(primary))
     );
     assert_eq!(

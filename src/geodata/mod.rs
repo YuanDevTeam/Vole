@@ -394,8 +394,11 @@ impl RequestedCodes {
             sites: CodeSet::EMPTY,
             ips: CodeSet::EMPTY,
         };
-        for rule in rules {
+        let mut pending: Vec<_> = rules.iter().collect();
+        while let Some(rule) = pending.pop() {
             match &rule.kind {
+                RuleKind::And(children) | RuleKind::Or(children) => pending.extend(children),
+                RuleKind::Not(child) => pending.push(child),
                 RuleKind::GeoSite(code) => requested.sites.insert(GeoDataKind::GeoSite, code)?,
                 RuleKind::GeoIp(code) => requested.ips.insert(GeoDataKind::GeoIp, code)?,
                 _ => (),

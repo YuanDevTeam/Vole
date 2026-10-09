@@ -12,11 +12,15 @@ use serde::{
     Deserialize, Deserializer,
     de::{MapAccess, Visitor},
 };
-use serde_yaml_ng::Value as YamlValue;
 use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::{Result, VoleError};
+
+mod rules;
+mod yaml;
+pub use rules::DomainRegex;
+use rules::parse_rule;
 
 mod credentials;
 pub use credentials::{ProxyAccess, ProxyCredentials};
@@ -46,10 +50,10 @@ mod measure;
 #[cfg(feature = "invoke")]
 pub(crate) use measure::MeasureConfig;
 
-pub const MAX_CONFIG_BYTES: usize = 256 * 1024;
-pub const MAX_RULES: usize = 1_024;
-pub const MAX_RULE_BYTES: usize = 1_024;
-pub const MAX_RULES_TOTAL_BYTES: usize = 128 * 1024;
+pub const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_RULES: usize = 65_536;
+pub const MAX_RULE_BYTES: usize = 16 * 1024;
+pub const MAX_RULES_TOTAL_BYTES: usize = MAX_CONFIG_BYTES;
 pub const MAX_DNS_NAMESERVERS: usize = 4;
 pub const MAX_SNIFFER_PORT_ITEMS: usize = 64;
 pub const MAX_GEOX_URL_BYTES: usize = 4_096;
@@ -62,7 +66,8 @@ pub struct Config {
     pub ipv6: bool,
     pub proxies: Vec<ProxyConfig>,
     pub proxy_groups: Vec<SelectProxyGroupConfig>,
-    pub default_action: RuleAction,
+    pub mode: Mode,
+    pub log_level: LogLevel,
     pub geodata_update: Option<GeoDataUpdateConfig>,
     pub external_controller: Option<ExternalControllerConfig>,
     pub inbounds: Vec<InboundConfig>,
@@ -71,6 +76,52 @@ pub struct Config {
     pub sniffer: SnifferConfig,
     pub dns: DnsConfig,
     pub rules: Vec<RuleSpec>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum Mode {
+    #[default]
+    Rule,
+    Global,
+    Direct,
+}
+
+impl TryFrom<String> for Mode {
+    type Error = &'static str;
+    fn try_from(value: String) -> std::result::Result<Self, &'static str> {
+        match value.to_ascii_lowercase().as_str() {
+            "rule" => Ok(Self::Rule),
+            "global" => Ok(Self::Global),
+            "direct" => Ok(Self::Direct),
+            _ => Err("mode must be rule, global, or direct"),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum LogLevel {
+    Silent,
+    Error,
+    Warning,
+    #[default]
+    Info,
+    Debug,
+}
+
+impl TryFrom<String> for LogLevel {
+    type Error = &'static str;
+    fn try_from(value: String) -> std::result::Result<Self, &'static str> {
+        match value.to_ascii_lowercase().as_str() {
+            "silent" => Ok(Self::Silent),
+            "error" => Ok(Self::Error),
+            "warning" => Ok(Self::Warning),
+            "info" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            _ => Err("log-level must be silent, error, warning, info, or debug"),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -233,6 +284,13 @@ pub enum RuleKind {
     Domain(String),
     DomainSuffix(String),
     DomainKeyword(String),
+    DomainWildcard(String),
+    DomainRegex(DomainRegex),
+    And(Vec<RuleSpec>),
+    Or(Vec<RuleSpec>),
+    Not(Box<RuleSpec>),
+    SrcIpCidr(IpCidr),
+    SrcPorts(Vec<PortRange>),
     GeoSite(String),
     GeoIp(String),
     IpCidr(IpCidr),
@@ -720,6 +778,10 @@ impl std::fmt::Debug for HttpInboundConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVoleConfig {
+    #[serde(default)]
+    mode: Mode,
+    #[serde(rename = "log-level", default)]
+    log_level: LogLevel,
     #[serde(default = "default_true")]
     ipv6: bool,
     #[serde(
@@ -772,6 +834,7 @@ struct RawVoleConfig {
     proxy_groups: Vec<RawProxyGroup>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     dns: Option<RawDnsConfig>,
+    #[serde(default)]
     rules: Vec<String>,
 }
 
@@ -1435,24 +1498,36 @@ where
 
 impl Config {
     pub fn parse_yaml(input: &[u8]) -> Result<Self> {
-        if input.len() > MAX_CONFIG_BYTES {
-            return invalid(format!(
-                "configuration exceeds the {MAX_CONFIG_BYTES}-byte limit"
-            ));
-        }
-        let input = std::str::from_utf8(input)
-            .map_err(|_| VoleError::InvalidConfig("configuration is not UTF-8".to_owned()))?;
-
-        reject_yaml_anchors_and_aliases(input)?;
-        let yaml: YamlValue = serde_yaml_ng::from_str(input)
-            .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
-        validate_json_compatible_yaml(&yaml)?;
+        let yaml = yaml::parse(input)?;
         // Deserialize from the YAML value directly. Mapping order is part of
         // nameserver-policy semantics and would be lost by the intermediate
         // serde_json map representation.
         let raw: RawVoleConfig = serde_yaml_ng::from_value(yaml)
             .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
         raw.normalize()
+    }
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn take_runtime_rules(&mut self) -> Vec<RuleSpec> {
+        match self.mode {
+            Mode::Rule => std::mem::take(&mut self.rules),
+            Mode::Direct | Mode::Global => {
+                let action = if self.mode == Mode::Direct {
+                    RuleAction::Direct
+                } else {
+                    RuleAction::Route(RouteTargetId::Group(ProxyGroupId::from_index(
+                        self.proxy_groups
+                            .iter()
+                            .position(|group| group.name == "GLOBAL")
+                            .expect("GLOBAL group exists"),
+                    )))
+                };
+                vec![RuleSpec {
+                    kind: RuleKind::Match,
+                    action,
+                    no_resolve: false,
+                }]
+            }
+        }
     }
 }
 
@@ -1466,9 +1541,6 @@ impl RawVoleConfig {
 
         let mixed_port = self.mixed_port.filter(|port| *port != 0);
         let authentication = normalize_proxy_authentication(self.authentication)?;
-        if mixed_port.is_none() && (authentication.is_some() || self.allow_lan) {
-            return invalid("authentication or allow-lan requires an enabled mixed-port");
-        }
 
         let tun = self
             .tun
@@ -1481,10 +1553,33 @@ impl RawVoleConfig {
             RawSnifferConfig::normalize,
         )?;
 
-        let (raw_proxy_groups, proxy_group_ids) =
-            normalize_proxy_group_declarations(self.proxy_groups)?;
+        let has_explicit_groups = !self.proxy_groups.is_empty();
+        let mut raw_groups = self.proxy_groups;
+        let generated_global = !raw_groups.iter().any(|group| group.name == "GLOBAL");
+        if generated_global {
+            raw_groups.push(RawProxyGroup {
+                name: "GLOBAL".into(),
+                kind: "select".into(),
+                proxies: vec!["DIRECT".into(), "REJECT".into()],
+                default_selected: None,
+            });
+        }
+        let (mut raw_proxy_groups, proxy_group_ids) =
+            normalize_proxy_group_declarations(raw_groups)?;
         let (proxies, proxy_ids) =
             normalize_proxy_graph_with_groups(self.proxies, &proxy_group_ids)?;
+        // The generated GLOBAL selector lists built-ins, nodes, then declared groups.
+        if generated_global {
+            let last = raw_proxy_groups.len() - 1;
+            let mut members = vec!["DIRECT".into(), "REJECT".into()];
+            members.extend(proxies.iter().map(|proxy| proxy.tag.clone()));
+            members.extend(
+                raw_proxy_groups[..last]
+                    .iter()
+                    .map(|group| group.name.clone()),
+            );
+            raw_proxy_groups[last].proxies = members;
+        }
         let route_targets = collect_route_targets(&proxy_ids, &proxy_group_ids);
         let proxy_groups = normalize_proxy_groups(raw_proxy_groups, &route_targets)?;
         proxy_graph_order(&proxies, &proxy_groups)?;
@@ -1492,7 +1587,7 @@ impl RawVoleConfig {
             self.external_controller,
             self.secret,
             tun.enable,
-            !proxy_groups.is_empty(),
+            has_explicit_groups,
         )?;
 
         let mut dns = self
@@ -1500,7 +1595,6 @@ impl RawVoleConfig {
             .map_or_else(DnsConfig::disabled, |dns| dns.normalize(&route_targets))?;
         dns.ipv6 &= self.ipv6;
         let rules = normalize_rules(self.rules, &route_targets)?;
-        let default_action = rules.last().expect("validated final MATCH").action;
         drop(proxy_ids);
         drop(route_targets);
 
@@ -1527,7 +1621,8 @@ impl RawVoleConfig {
             ipv6: self.ipv6,
             proxies,
             proxy_groups,
-            default_action,
+            mode: self.mode,
+            log_level: self.log_level,
             geodata_update,
             external_controller,
             inbounds,
@@ -1948,12 +2043,6 @@ fn normalize_proxy_groups(
                     let target = match name.as_str() {
                         "DIRECT" => ProxyGroupMemberTarget::Direct,
                         "REJECT" => ProxyGroupMemberTarget::Reject,
-                        "RULES" => {
-                            return invalid(format!(
-                                "proxy group `{}` cannot use reserved DNS target `RULES` as a member",
-                                group.name
-                            ));
-                        }
                         _ => route_targets
                             .get(&name)
                             .copied()
@@ -2848,9 +2937,6 @@ fn normalize_rules(
     rules: Vec<String>,
     route_targets: &RouteTargetsByName,
 ) -> Result<Vec<RuleSpec>> {
-    if rules.is_empty() {
-        return invalid("rules must not be empty");
-    }
     if rules.len() > MAX_RULES {
         return invalid(format!("rules exceeds the {MAX_RULES}-entry limit"));
     }
@@ -2874,106 +2960,11 @@ fn normalize_rules(
         normalized.push(parse_rule(&rule, route_targets)?);
     }
 
-    let match_count = normalized
-        .iter()
-        .filter(|rule| matches!(rule.kind, RuleKind::Match))
-        .count();
-    if match_count != 1
-        || !matches!(
-            normalized.last().map(|rule| &rule.kind),
-            Some(RuleKind::Match)
-        )
-    {
-        return invalid("explicit rules must contain exactly one MATCH as the final rule");
-    }
     Ok(normalized)
-}
-
-fn parse_rule(input: &str, route_targets: &RouteTargetsByName) -> Result<RuleSpec> {
-    if input.is_empty() {
-        return invalid("rule must not be empty");
-    }
-    let fields = input
-        .split(',')
-        .map(trim_ascii_whitespace)
-        .collect::<Vec<_>>();
-    let rule_type = fields
-        .first()
-        .filter(|field| !field.is_empty())
-        .ok_or_else(|| VoleError::InvalidConfig("rule type must not be empty".to_owned()))?
-        .to_ascii_uppercase();
-
-    match rule_type.as_str() {
-        "MATCH" => {
-            require_rule_field_count(&fields, 2, "MATCH")?;
-            Ok(RuleSpec {
-                kind: RuleKind::Match,
-                action: parse_rule_action(fields[1], route_targets)?,
-                no_resolve: false,
-            })
-        }
-        "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" | "GEOSITE" | "DST-PORT" | "NETWORK" => {
-            require_rule_field_count(&fields, 3, &rule_type)?;
-            let kind = match rule_type.as_str() {
-                "DOMAIN" => RuleKind::Domain(normalize_rule_domain(fields[1], "DOMAIN")?),
-                "DOMAIN-SUFFIX" => {
-                    RuleKind::DomainSuffix(normalize_rule_domain(fields[1], "DOMAIN-SUFFIX")?)
-                }
-                "DOMAIN-KEYWORD" => RuleKind::DomainKeyword(normalize_rule_keyword(fields[1])?),
-                "GEOSITE" => RuleKind::GeoSite(normalize_geo_code(fields[1], "GEOSITE")?),
-                "DST-PORT" => RuleKind::DstPorts(parse_port_ranges(fields[1])?),
-                "NETWORK" => RuleKind::Network(parse_network(fields[1])?),
-                _ => unreachable!("matched rule type"),
-            };
-            Ok(RuleSpec {
-                kind,
-                action: parse_rule_action(fields[2], route_targets)?,
-                no_resolve: false,
-            })
-        }
-        "GEOIP" | "IP-CIDR" | "IP-CIDR6" => {
-            if fields.len() != 3 && fields.len() != 4 {
-                return invalid(format!(
-                    "{rule_type} rule must contain 3 fields, or 4 fields with no-resolve"
-                ));
-            }
-            let kind = match rule_type.as_str() {
-                "GEOIP" => RuleKind::GeoIp(normalize_geo_code(fields[1], "GEOIP")?),
-                "IP-CIDR" => RuleKind::IpCidr(parse_ip_cidr(fields[1], false)?),
-                "IP-CIDR6" => RuleKind::IpCidr(parse_ip_cidr(fields[1], true)?),
-                _ => unreachable!("matched rule type"),
-            };
-            let no_resolve = if fields.len() == 4 {
-                if fields[3] != "no-resolve" {
-                    return invalid(format!(
-                        "{rule_type} fourth field must be exactly `no-resolve`"
-                    ));
-                }
-                true
-            } else {
-                false
-            };
-            Ok(RuleSpec {
-                kind,
-                action: parse_rule_action(fields[2], route_targets)?,
-                no_resolve,
-            })
-        }
-        _ => invalid(format!("unsupported rule type `{}`", fields[0])),
-    }
 }
 
 fn trim_ascii_whitespace(input: &str) -> &str {
     input.trim_matches(|character: char| character.is_ascii_whitespace())
-}
-
-fn require_rule_field_count(fields: &[&str], expected: usize, rule_type: &str) -> Result<()> {
-    if fields.len() != expected {
-        return invalid(format!(
-            "{rule_type} rule must contain exactly {expected} fields"
-        ));
-    }
-    Ok(())
 }
 
 fn parse_rule_action(action: &str, route_targets: &RouteTargetsByName) -> Result<RuleAction> {
@@ -3106,29 +3097,18 @@ fn parse_network(input: &str) -> Result<Network> {
 }
 
 pub(crate) fn validate_route_target_name(name: &str, field: &str) -> Result<()> {
-    let mut characters = name.chars();
-    let first = characters.next();
-    let last = characters.next_back().or(first);
-    if name.is_empty()
-        || name.len() > 64
-        || first.is_some_and(char::is_whitespace)
-        || last.is_some_and(char::is_whitespace)
-        || name.chars().any(|character| {
-            character.is_control()
-                || matches!(character, ',' | '#' | '/' | '?' | '&' | '=' | '%' | '\\')
-        })
-        || matches!(name, "." | "..")
-    {
-        return invalid(format!(
-            "{field} must be 1-64 UTF-8 bytes without surrounding whitespace, control characters, path separators, or reserved delimiters"
-        ));
+    if name.is_empty() {
+        return invalid(format!("{field} must not be empty"));
     }
     Ok(())
 }
 
 fn validate_route_target_definition_name(name: &str, field: &str) -> Result<()> {
     validate_route_target_name(name, field)?;
-    if matches!(name, "DIRECT" | "REJECT" | "RULES") {
+    if matches!(
+        name,
+        "DIRECT" | "REJECT" | "REJECT-DROP" | "COMPATIBLE" | "PASS" | "PASS-RULE"
+    ) {
         return invalid(format!("{field} `{name}` is reserved"));
     }
     Ok(())
@@ -3173,102 +3153,6 @@ fn parse_standard_uuid(input: &str) -> Result<Uuid> {
     Ok(id)
 }
 
-fn validate_json_compatible_yaml(value: &YamlValue) -> Result<()> {
-    match value {
-        YamlValue::Null | YamlValue::Bool(_) | YamlValue::Number(_) | YamlValue::String(_) => {
-            Ok(())
-        }
-        YamlValue::Sequence(values) => {
-            for value in values {
-                validate_json_compatible_yaml(value)?;
-            }
-            Ok(())
-        }
-        YamlValue::Mapping(mapping) => {
-            for (key, value) in mapping {
-                let YamlValue::String(key) = key else {
-                    return invalid("YAML map keys must be strings");
-                };
-                if key == "<<" {
-                    return invalid("YAML merge keys are not supported");
-                }
-                validate_json_compatible_yaml(value)?;
-            }
-            Ok(())
-        }
-        YamlValue::Tagged(_) => invalid("custom YAML tags are not supported"),
-    }
-}
-
-/// Anchors and aliases disappear when `serde_yaml_ng` materializes a value, so
-/// reject their node-property syntax before parsing. Quoted text and comments
-/// are intentionally ignored by this small lexical pass.
-fn reject_yaml_anchors_and_aliases(input: &str) -> Result<()> {
-    let bytes = input.as_bytes();
-    let mut index = 0;
-    let mut single_quoted = false;
-    let mut double_quoted = false;
-    let mut comment = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if comment {
-            if byte == b'\n' {
-                comment = false;
-            }
-            index += 1;
-            continue;
-        }
-        if single_quoted {
-            if byte == b'\'' {
-                if bytes.get(index + 1) == Some(&b'\'') {
-                    index += 2;
-                    continue;
-                }
-                single_quoted = false;
-            }
-            index += 1;
-            continue;
-        }
-        if double_quoted {
-            if byte == b'\\' {
-                index = (index + 2).min(bytes.len());
-                continue;
-            }
-            if byte == b'"' {
-                double_quoted = false;
-            }
-            index += 1;
-            continue;
-        }
-
-        match byte {
-            b'#' if index == 0 || bytes[index - 1].is_ascii_whitespace() => comment = true,
-            b'\'' => single_quoted = true,
-            b'"' => double_quoted = true,
-            b'&' | b'*' if is_yaml_node_boundary(bytes, index) => {
-                return invalid("YAML anchors and aliases are not supported");
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    Ok(())
-}
-
-fn is_yaml_node_boundary(bytes: &[u8], index: usize) -> bool {
-    let previous_is_boundary = index == 0
-        || bytes[index - 1].is_ascii_whitespace()
-        || b"[{,:?-".contains(&bytes[index - 1]);
-    let Some(next) = bytes.get(index + 1) else {
-        return false;
-    };
-    previous_is_boundary
-        && !next.is_ascii_whitespace()
-        && !b"[]{}:,#".contains(next)
-        && *next != b'\n'
-        && *next != b'\r'
-}
-
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(VoleError::InvalidConfig(message.into()))
 }
@@ -3276,6 +3160,75 @@ fn invalid<T>(message: impl Into<String>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modes_and_global_group_work_without_a_final_match() {
+        use crate::routing::{RoutingContext, RuleEvaluation, RuleSet};
+        let destination = crate::session::Destination::Ip("192.0.2.1:443".parse().unwrap());
+        let context = RoutingContext::new(Network::Tcp, &destination).unwrap();
+        for mode in ["rule", "DIRECT", "global"] {
+            let mut config = Config::parse_yaml(
+                format!("mixed-port: 1080\nmode: {mode}\nlog-level: Warning\n").as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(config.log_level, LogLevel::Warning);
+            assert_eq!(config.proxy_groups[0].name, "GLOBAL");
+            assert_eq!(config.proxy_groups[0].members[0].name, "DIRECT");
+            let expected = if config.mode == Mode::Global {
+                RuleAction::Route(RouteTargetId::Group(ProxyGroupId::from_index(0)))
+            } else {
+                RuleAction::Direct
+            };
+            let RuleEvaluation::Matched(result) = RuleSet::compile(config.take_runtime_rules())
+                .unwrap()
+                .evaluate(&context)
+            else {
+                panic!("mode must select an action")
+            };
+            assert_eq!(result.action, expected);
+        }
+        let config = Config::parse_yaml(b"mixed-port: 1080\nproxy-groups: [{name: GLOBAL, type: select, proxies: [REJECT, DIRECT]}]\n").unwrap();
+        assert_eq!(config.proxy_groups.len(), 1);
+        assert_eq!(config.proxy_groups[0].members[0].name, "REJECT");
+    }
+
+    #[test]
+    fn yaml_templates_feed_logical_domain_and_source_rules() {
+        use crate::routing::{RoutingContext, RuleEvaluation, RuleSet};
+        let yaml = r#"
+mixed-port: 0
+allow-lan: true
+authentication: [user:password]
+tun: {enable: true}
+proxies:
+  - &base {name: "first/#%", type: socks5, server: 192.0.2.1, port: 1080}
+  - {<<: *base, name: second, port: 1081}
+rules:
+  - AND,((DOMAIN-WILDCARD,*.example.com),(SRC-IP-CIDR,10.0.0.0/8),(SRC-PORT,1000-2000),(NOT,((NETWORK,UDP)))),REJECT
+  - 'DOMAIN-REGEX,^a{1,2}\.example\.com$,second'
+"#;
+        let mut config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        assert_eq!(config.proxies[1].port(), 1081);
+        let rules = RuleSet::compile(config.take_runtime_rules()).unwrap();
+        let destination = crate::session::Destination::domain("AA.example.com", 443).unwrap();
+        let mut context = RoutingContext::new(Network::Tcp, &destination).unwrap();
+        context.set_source("10.1.2.3:1500".parse().unwrap());
+        let RuleEvaluation::Matched(result) = rules.evaluate(&context) else {
+            panic!("rule match")
+        };
+        assert_eq!(result.action, RuleAction::Reject);
+        context.set_source("192.0.2.2:1500".parse().unwrap());
+        let RuleEvaluation::Matched(result) = rules.evaluate(&context) else {
+            panic!("regex match")
+        };
+        assert_eq!(
+            result.action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::from_index(1)))
+        );
+        assert!(
+            Config::parse_yaml(b"mixed-port: 1080\nproxies: &recursive [*recursive]\n").is_err()
+        );
+    }
 
     const CURRENT_TLS: &str = r#"mixed-port: 1080
 authentication:
@@ -3349,7 +3302,7 @@ proxies:
     fn current_yaml(fields: &str) -> String {
         let default_rules = if fields
             .lines()
-            .any(|line| line.trim_ascii_start() == "rules:")
+            .any(|line| line.trim_ascii_start().starts_with("rules:"))
         {
             ""
         } else {
@@ -3460,7 +3413,7 @@ proxies:
         assert_eq!(config.proxies[0].tag, "proxy");
         assert!(config.proxies[0].udp);
         assert_eq!(
-            config.default_action,
+            config.rules.last().unwrap().action,
             RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(0).unwrap()))
         );
         assert_eq!(first_vless(&config).address, "203.0.113.1");
@@ -4181,14 +4134,6 @@ outbounds: []
     fn validates_listener_and_tun_constraints() {
         for yaml in [
             CURRENT_TLS.replace("mtu: 1500", "mtu: 1279"),
-            CURRENT_TLS.replace(
-                "mixed-port: 1080
-authentication:
-  - measure:secret",
-                "mixed-port: 0
-authentication:
-  - measure:secret",
-            ),
             CURRENT_TLS
                 .replace("enable: true", "enable: false")
                 .replace(
@@ -4321,10 +4266,6 @@ authentication:
         assert!(Config::parse_yaml(max.as_bytes()).is_ok());
 
         for (fields, expected) in [
-            (
-                "authentication:\n  - measure:secret\ntun:\n  enable: true",
-                "authentication or allow-lan requires an enabled mixed-port",
-            ),
             (
                 "mixed-port: 1080\nauthentication:\n  - one:secret\n  - two:secret",
                 "authentication must contain exactly one",
@@ -4474,8 +4415,6 @@ authentication:
             "mixed-port: 65536",
             "mixed-port: 1.0",
             "mixed-port: null",
-            "allow-lan: true\ntun: {enable: true}",
-            "mixed-port: 0\nauthentication: [u:p]\ntun: {enable: true}",
             "mixed-port: 1080\nallow-lan: null",
         ] {
             assert!(
@@ -4532,7 +4471,7 @@ authentication:
     fn parses_the_strict_anytls_subset() {
         let config = Config::parse_yaml(CURRENT_ANYTLS.as_bytes()).unwrap();
         assert_eq!(
-            config.default_action,
+            config.rules.last().unwrap().action,
             RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(0).unwrap()))
         );
         let proxy = &config.proxies[0];
@@ -4572,7 +4511,7 @@ authentication:
             );
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         assert_eq!(
-            config.default_action,
+            config.rules.last().unwrap().action,
             RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(1).unwrap()))
         );
         assert_eq!(
@@ -4780,9 +4719,7 @@ authentication:
         for yaml in [
             CURRENT_TLS.replacen("proxies:\n", "1: value\nproxies:\n", 1),
             CURRENT_TLS.replace("name: proxy", "name: !custom proxy"),
-            CURRENT_TLS.replace("    xhttp-opts:\n", "    xhttp-opts: &defaults\n"),
             CURRENT_TLS.replace("    xhttp-opts:\n", "    xhttp-opts: *defaults\n"),
-            CURRENT_TLS.replacen("proxies:\n", "<<: {}\nproxies:\n", 1),
             CURRENT_TLS.replacen("proxies:\n", "proxies: []\nproxies:\n", 1),
             format!("{CURRENT_TLS}\n---\n{CURRENT_TLS}"),
         ] {
@@ -5090,16 +5027,11 @@ authentication:
     }
 
     #[test]
-    fn current_config_requires_listener_rules_and_valid_references() {
+    fn current_config_requires_listener_and_valid_references() {
         for yaml in [
             current_yaml("mixed-port: 0\nauthentication:\n  - measure:secret"),
             current_yaml("tun:\n  enable: false"),
             current_yaml("tun:\n  enable: true\n  mtu: 1279"),
-            current_yaml(
-                "mixed-port: 1080
-authentication:
-  - measure:secret\nrules: []",
-            ),
             current_yaml(
                 "mixed-port: 1080
 authentication:
@@ -5148,7 +5080,7 @@ authentication:
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         assert_eq!(config.proxies.len(), 2);
         assert_eq!(
-            config.default_action,
+            config.rules.last().unwrap().action,
             RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(1).unwrap()))
         );
         let ProxyProtocol::Socks5(socks5) = &config.proxies[1].protocol else {
@@ -5295,7 +5227,7 @@ authentication:
         let first = ProxyId::new(0).unwrap();
         let second = ProxyId::new(1).unwrap();
         assert_eq!(
-            config.default_action,
+            config.rules.last().unwrap().action,
             RuleAction::Route(RouteTargetId::Proxy(second))
         );
         assert_eq!(
@@ -5357,7 +5289,7 @@ rules:
         let main = ProxyGroupId::new(0).unwrap();
         let backup = ProxyGroupId::new(1).unwrap();
 
-        assert_eq!(config.proxy_groups.len(), 2);
+        assert_eq!(config.proxy_groups.len(), 3);
         assert_eq!(config.proxy_groups[0].name, "主线路");
         assert_eq!(config.proxy_groups[0].initial_member, 1);
         assert_eq!(
@@ -5390,7 +5322,7 @@ rules:
             ["proxy", "proxy", "DIRECT"]
         );
         assert_eq!(
-            config.default_action,
+            config.rules.last().unwrap().action,
             RuleAction::Route(RouteTargetId::Group(main))
         );
         assert_eq!(
@@ -5540,7 +5472,7 @@ proxies:
 
         assert_eq!(config.proxies.len(), 4);
         assert_eq!(
-            config.default_action,
+            config.rules.last().unwrap().action,
             RuleAction::Route(RouteTargetId::Proxy(ProxyId::from_index(3)))
         );
         assert_eq!(
@@ -5582,7 +5514,7 @@ proxies:
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         assert_eq!(config.proxies.len(), 300);
         assert_eq!(
-            config.default_action,
+            config.rules.last().unwrap().action,
             RuleAction::Route(RouteTargetId::Proxy(ProxyId::from_index(299)))
         );
         assert_eq!(
@@ -5611,32 +5543,28 @@ proxies:
         for tag in [
             "DIRECT",
             "REJECT",
-            "RULES",
-            "edge,one",
-            "edge#one",
-            "edge/one",
-            "edge?one",
-            "edge&one",
-            "edge=one",
-            "edge%one",
-            "edge\\one",
-            ".",
-            "..",
-            " edge",
-            "edge ",
+            "REJECT-DROP",
+            "COMPATIBLE",
+            "PASS",
+            "PASS-RULE",
         ] {
             let yaml = CURRENT_TLS.replace("name: proxy", &format!("name: '{tag}'"));
-            assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");
+            assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
         }
-        for tag in ["PROXY", "-edge", "节点", "♻️ 自动选择", "+"] {
+        for tag in [
+            "RULES", "edge,one", "edge#one", "edge/one", "edge?one", "edge%one", ".", "..",
+            " edge", "edge ",
+        ] {
             let yaml = CURRENT_TLS
                 .replace("name: proxy", &format!("name: '{tag}'"))
-                .replace("MATCH,proxy", &format!("MATCH,{tag}"));
-            assert!(Config::parse_yaml(yaml.as_bytes()).is_ok(), "{yaml}");
+                .replace("MATCH,proxy", "MATCH,DIRECT");
+            assert!(Config::parse_yaml(yaml.as_bytes()).is_ok(), "{tag}");
         }
-        let long_tag = "a".repeat(65);
-        let yaml = CURRENT_TLS.replace("name: proxy", &format!("name: {long_tag}"));
-        assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
+        let tag = "a".repeat(256);
+        let yaml = CURRENT_TLS
+            .replace("name: proxy", &format!("name: '{tag}'"))
+            .replace("MATCH,proxy", &format!("MATCH,{tag}"));
+        assert!(Config::parse_yaml(yaml.as_bytes()).is_ok());
 
         let duplicate = two_proxy_yaml(
             "mixed-port: 1080
@@ -5883,7 +5811,7 @@ authentication:
                 let yaml = format!("mixed-port: 1080\n{proxies}rules: ['MATCH,{target}']\n");
                 let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
                 assert!(config.proxies.is_empty());
-                assert_eq!(config.default_action, action);
+                assert_eq!(config.rules.last().unwrap().action, action);
                 assert_eq!(config.rules[0].action, action);
             }
         }
@@ -6154,7 +6082,6 @@ authentication:
             "  - NETWORK,ICMP,REJECT\n  - MATCH,proxy",
             "  - MATCH,PROXY\n  - DOMAIN,example.com,DIRECT",
             "  - MATCH,PROXY\n  - MATCH,DIRECT",
-            "  - DOMAIN,example.com,DIRECT",
         ] {
             let yaml = current_yaml(&format!(
                 "mixed-port: 1080
@@ -6169,7 +6096,7 @@ authentication:
 authentication:
   - measure:secret\nrules: []",
         );
-        assert!(Config::parse_yaml(explicit_empty.as_bytes()).is_err());
+        assert!(Config::parse_yaml(explicit_empty.as_bytes()).is_ok());
 
         let non_ascii_whitespace = current_yaml(
             "mixed-port: 1080
@@ -6208,7 +6135,6 @@ authentication:
 authentication:
   - measure:secret\nrules:\n{many_rules}  - MATCH,proxy"
         ));
-        let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
-        assert!(error.to_string().contains("cumulative limit"), "{error}");
+        assert!(Config::parse_yaml(yaml.as_bytes()).is_ok());
     }
 }

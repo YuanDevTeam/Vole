@@ -1,12 +1,8 @@
 use serde::Deserialize;
-use serde_yaml_ng::Value as YamlValue;
 
 use crate::{Result, VoleError};
 
-use super::{
-    MAX_CONFIG_BYTES, ProxyConfig, ProxyId, RawOutbound, RouteTargetId, normalize_proxy_graph,
-    reject_yaml_anchors_and_aliases, validate_json_compatible_yaml,
-};
+use super::{ProxyConfig, ProxyId, RawOutbound, RouteTargetId, normalize_proxy_graph};
 
 /// Strict node-only configuration accepted by the built-in latency runner.
 ///
@@ -27,18 +23,7 @@ struct RawMeasureConfig {
 
 impl MeasureConfig {
     pub(crate) fn parse_yaml(input: &[u8]) -> Result<Self> {
-        if input.len() > MAX_CONFIG_BYTES {
-            return Err(VoleError::InvalidConfig(format!(
-                "configuration exceeds the {MAX_CONFIG_BYTES}-byte limit"
-            )));
-        }
-        let input = std::str::from_utf8(input)
-            .map_err(|_| VoleError::InvalidConfig("configuration is not UTF-8".to_owned()))?;
-
-        reject_yaml_anchors_and_aliases(input)?;
-        let yaml: YamlValue = serde_yaml_ng::from_str(input)
-            .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
-        validate_json_compatible_yaml(&yaml)?;
+        let yaml = super::yaml::parse(input)?;
         let raw: RawMeasureConfig = serde_yaml_ng::from_value(yaml)
             .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
         raw.normalize()
@@ -111,7 +96,8 @@ mod tests {
             b"proxies:\n  - name: node\n    type: wireguard\n    server: example.com\n    port: 443\n";
         assert!(super::MeasureConfig::parse_yaml(yaml).is_err());
         assert!(
-            super::MeasureConfig::parse_yaml(&vec![b'x'; super::MAX_CONFIG_BYTES + 1]).is_err()
+            super::MeasureConfig::parse_yaml(&vec![b'x'; super::super::MAX_CONFIG_BYTES + 1])
+                .is_err()
         );
     }
 

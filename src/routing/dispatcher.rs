@@ -264,6 +264,7 @@ impl RoutingDispatcher {
         &self,
         network: Network,
         inbound: InboundKind,
+        source: SocketAddr,
         destination: &Destination,
         sniffed_domain: Option<&str>,
     ) -> Result<RouteDecision, DispatchError> {
@@ -279,6 +280,8 @@ impl RoutingDispatcher {
         let domain_hint = sniffed_domain.or(dns_domain_hint.as_deref());
         let mut context = RoutingContext::with_domain_hint(network, destination, domain_hint)
             .map_err(|_| DispatchError::HostUnreachable)?;
+
+        context.set_source(source);
 
         // All GeoData rules in this decision see the same immutable view.
         let snapshot = self.geo_matcher.routing_snapshot();
@@ -501,6 +504,7 @@ impl Dispatcher for RoutingDispatcher {
             .route(
                 Network::Tcp,
                 session.inbound,
+                session.source,
                 &session.destination,
                 session.sniffed_domain.as_deref(),
             )
@@ -778,6 +782,7 @@ impl DatagramTransport for RoutedDatagramTransport {
                 .route(
                     Network::Udp,
                     self.session.inbound,
+                    self.session.source,
                     &datagram.remote,
                     datagram.sniffed_domain.as_deref(),
                 )

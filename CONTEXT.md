@@ -77,7 +77,7 @@ A named route or upstream target whose current-session selection identifies one 
 _Avoid_: Folder, provider, subscription
 
 **Route target**:
-A proxy node, proxy group, or reserved built-in target that routing rules, the final `MATCH`, and DNS routes can select.
+A proxy node, proxy group, or reserved built-in target that routing rules, modes, and DNS routes can select.
 _Avoid_: Proxy when the distinction between a node and group matters, dialer
 
 **Group selection**:

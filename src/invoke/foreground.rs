@@ -524,7 +524,7 @@ impl StderrSubscriber {
     fn accepts(metadata: &Metadata<'_>) -> bool {
         let target = metadata.target();
         metadata.is_event()
-            && *metadata.level() <= Level::INFO
+            && *metadata.level() <= Level::DEBUG
             && (target == "vole"
                 || target.starts_with("vole::")
                 || target == "vole_netstack"
@@ -560,7 +560,7 @@ impl Subscriber for StderrSubscriber {
     }
 
     fn max_level_hint(&self) -> Option<LevelFilter> {
-        Some(LevelFilter::INFO)
+        Some(LevelFilter::DEBUG)
     }
 
     fn new_span(&self, _attributes: &Attributes<'_>) -> Id {

@@ -23,6 +23,8 @@ pub mod inbound;
 pub mod invoke;
 pub mod lifecycle;
 pub mod limits;
+#[cfg(any(feature = "invoke", test))]
+mod logging;
 pub mod outbound;
 pub mod packet;
 pub mod platform;

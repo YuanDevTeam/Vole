@@ -53,7 +53,7 @@ void VoleFree(char *response);
 - 运行时级方法必须省略 `instanceId`；实例级方法必须携带 Vole 返回的非空 ID。
 - 未知或已移除的 envelope 字段和 payload 字段都会失败，不静默忽略。
 - 无业务数据的方法成功时返回空对象，不返回 `null`。
-- Invoke envelope 最大 3 MiB，单份 YAML 最大 256 KiB。
+- Invoke envelope 上限为 240 MiB + 64 KiB（五份 YAML 的 JSON 最坏转义及 envelope），单份 YAML 最大 8 MiB。
 
 ## 初始化与生命周期
 
@@ -270,7 +270,7 @@ Stop 关闭本次持有的 fd、session 和原生句柄；Wintun 不承诺移除
 若定义 `XDG_CONFIG_HOME`，使用 `<XDG_CONFIG_HOME>/vole`。相对数据目录和显式
 配置路径分别从启动工作目录解析并折叠 `.`/`..`，绝对路径原样保留；
 配置默认 `<dataDir>/config.yaml`。
-`configPath: "-"` 从标准输入读取。文件必须是普通文件，文件和标准输入均最多 256 KiB；
+`configPath: "-"` 从标准输入读取。文件必须是普通文件，文件和标准输入均最多 8 MiB；
 不会下载、创建模板或改写配置。详细命令行映射见 [CLI](cli.md)。
 
 普通 Unicode 路径使用 JSON 字符串。需要保留平台原生编码时，Unix 可使用
@@ -476,7 +476,7 @@ ProtectFd(fd) -> bool
 - 配置、错误和日志按 UTF-8 字节计数并受固定上限约束。
 - TUN 原始数据包按 `tun.mtu` 限制；最终代理 UDP 响应最多为该 MTU 减去 48 字节。默认 9000 对应 8952 字节；显式 1500 对应 1452 字节，Windows UWP 的最高 1400 对应 1352 字节。
 - 嵌套 UDP 协议可以增加有界帧头，但解封装后的最终负载仍受该平台响应上限限制。
-- 节点和代理组定义名共享大小写敏感的严格 UTF-8 命名空间；`DIRECT`、`REJECT` 和 `RULES` 不能用作定义名。
+- 节点和代理组定义名共享大小写敏感的严格 UTF-8 命名空间；内置动作名称保留，具体名称与编码规则见 [Controller](controller-api.md#名称与路径)。
 - Secret、password、UUID、REALITY key、short ID、目标地址和完整配置不得进入日志。
 - Apple Unified Logging 的 subsystem 固定为 `io.github.yuandevteam.vole`，category 为
   `vole`，不继承宿主应用的 bundle identifier；Console 或 `log stream` 应按该标识筛选。

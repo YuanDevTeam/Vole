@@ -1,5 +1,7 @@
 #![cfg_attr(not(any(feature = "invoke", feature = "cli")), allow(dead_code))]
 
+use tracing::instrument::WithSubscriber;
+
 #[cfg(all(
     test,
     unix,
@@ -237,6 +239,10 @@ impl Drop for BuiltProxyGraph {
 }
 
 impl PreparedCore {
+    pub(crate) fn log_level(&self) -> crate::config::LogLevel {
+        self.config.log_level
+    }
+
     #[cfg(test)]
     async fn prepare(
         yaml: &[u8],
@@ -288,7 +294,7 @@ impl PreparedCore {
     pub(crate) fn validate_config(mut config: Config) -> io::Result<()> {
         GeoRequirements::collect(&config.rules, &config.dns.nameserver_policies)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        RuleSet::compile(std::mem::take(&mut config.rules))
+        RuleSet::compile(config.take_runtime_rules())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         Ok(())
     }
@@ -389,18 +395,12 @@ impl PreparedCore {
             ))
         });
         proxy_graph.resolution.bind_runtime(dns.as_ref())?;
-        let geodata_rules = RuleSet::compile(vec![crate::config::RuleSpec {
-            kind: crate::config::RuleKind::Match,
-            action: self.config.default_action,
-            no_resolve: false,
-        }])
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let geodata_dispatcher: Arc<dyn Dispatcher> = Arc::new(RoutingDispatcher::new_with_ipv6(
             route_targets.clone(),
             direct.clone(),
             dns.clone(),
             self.config.ipv6,
-            geodata_rules,
+            rules.clone(),
             geo_matcher.clone(),
         ));
         let router: Arc<dyn Dispatcher> = Arc::new(
@@ -495,6 +495,13 @@ impl PreparedCore {
     /// Starts configured local proxy listeners. TUN is started separately once
     /// a platform descriptor and netstack are available.
     pub(crate) async fn start_local(self, dialer: Dialer) -> io::Result<RunningCore> {
+        let dispatch = crate::logging::dispatch(self.config.log_level);
+        self.start_local_inner(dialer)
+            .with_subscriber(dispatch)
+            .await
+    }
+
+    async fn start_local_inner(self, dialer: Dialer) -> io::Result<RunningCore> {
         let BuiltRuntimeParts {
             dispatcher,
             geodata_updater,
@@ -548,7 +555,21 @@ impl PreparedCore {
         all(feature = "cli", not(feature = "invoke"), unix, not(test)),
         allow(dead_code)
     )]
-    pub(crate) async fn start_tun(mut self, tun: TunIo, dialer: Dialer) -> io::Result<RunningCore> {
+    pub(crate) async fn start_tun(self, tun: TunIo, dialer: Dialer) -> io::Result<RunningCore> {
+        let dispatch = crate::logging::dispatch(self.config.log_level);
+        self.start_tun_inner(tun, dialer)
+            .with_subscriber(dispatch)
+            .await
+    }
+
+    #[cfg(all(
+        feature = "tun",
+        any(
+            unix,
+            all(windows, any(feature = "windows-wintun", feature = "windows-uwp"))
+        )
+    ))]
+    async fn start_tun_inner(mut self, tun: TunIo, dialer: Dialer) -> io::Result<RunningCore> {
         self.limits.tun_max_datagram_size = usize::from(self.config.tun.mtu);
         let tun_count = self
             .config
@@ -1179,7 +1200,7 @@ fn prepare_routing(
     // GeoData must inspect the normalized rule specifications first. Once that
     // borrowing load is complete, move the rules directly into the compiled
     // set so PreparedCore does not retain a second owned rule graph.
-    let rules = RuleSet::compile(std::mem::take(&mut config.rules))
+    let rules = RuleSet::compile(config.take_runtime_rules())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     Ok((rules, geodata_registration))
 }

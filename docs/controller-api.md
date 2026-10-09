@@ -10,8 +10,8 @@ secret: "vole-runtime-secret"
 ```
 
 - 省略 `external-controller` 表示不启动 Controller，此时不能单独配置 `secret`。含代理组但没有 Controller 的配置合法，组在本次 session 内保持初始选择。
-- `external-controller` 只接受带显式非零端口的回环 IP 地址。它要求启用 TUN 或至少定义一个 `proxy-groups`；非 TUN 配置须通过 `mixed-port` 满足运行配置的入站要求。
-- 只要同时配置代理组与 Controller，`secret` 就必填；仅有 TUN 流量接口时可省略。`secret` 出现时必须为 1–255 UTF-8 字节，并保护本文定义的全部路由。
+- `external-controller` 只接受带显式非零端口的回环 IP 地址。它要求启用 TUN 或至少显式定义一个 `proxy-groups`；非 TUN 配置须通过 `mixed-port` 满足运行配置的入站要求。
+- 只要同时显式配置代理组与 Controller，`secret` 就必填；仅有 TUN 流量接口时可省略。`secret` 出现时必须为 1–255 UTF-8 字节，并保护本文定义的全部路由。
 - `measureDelay` 的 node-only 配置不能包含 Controller 或代理组字段。
 - `validateConfig` 只校验字段；`prepare` 不监听端口；`start` 绑定端口，绑定失败则启动失败。`stop` 和 `destroyInstance` 关闭监听器。
 
@@ -61,7 +61,7 @@ TUN 按最多 8 包中有效消费／平台报告成功的包合并记账，取�
 
 ## 代理组查询
 
-`GET /group` 按 YAML 声明顺序返回全部代理组：
+`GET /group` 按 YAML 声明顺序返回代理组，并在末尾包含自动生成的 `GLOBAL`（如未显式声明）：
 
 ```json
 {
@@ -115,9 +115,9 @@ Content-Length: 26
 
 ## 名称与路径
 
-节点和代理组定义名共享一个命名空间。名称必须为 1–64 UTF-8 字节，首尾不能是任何 Unicode 空白字符，不能含控制字符或 `, # / ? & = % \\`，也不能是 `.` 或 `..`。定义名额外保留 `DIRECT`、`REJECT` 和 `RULES`；前两者仍可作为组成员，`RULES` 只作为 DNS sentinel。内部普通空格、CJK 和 emoji 可以使用。
+节点和代理组定义名共享一个大小写敏感的命名空间，名称为非空 UTF-8 字符串。保留定义名为 `DIRECT`、`REJECT`、`REJECT-DROP`、`COMPATIBLE`、`PASS` 和 `PASS-RULE`；其中当前可用的内置动作是 DIRECT 与 REJECT。
 
-路径中的 `{name}` 必须是单个 segment。Controller 对 percent-encoding 严格解码一次，再执行相同的 UTF-8 和名称校验；无效 `%`、无效 UTF-8、解码后的 `/`、二次编码形式、query 和 fragment 都会失败。客户端应对非 ASCII 或路径保留字节执行一次标准 percent-encoding；`+` 不会被当作空格。
+路径中的 `{name}` 对 percent-encoding 严格解码一次；原始路径分隔符、无效 `%` 和无效 UTF-8 会失败。名称中的 `/`、`?`、`#`、`%` 等字符应 percent-encode；`%252F` 表示字面名称 `%2F`，不会再次解码。`+` 保留为 `+`。请求总大小仍受 HTTP 边界约束。
 
 ## 选择生效边界
 

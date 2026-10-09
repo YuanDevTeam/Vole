@@ -27,11 +27,11 @@ cat config.yaml | vole -f -
 `VOLE_HOME_DIR`、`VOLE_CONFIG_FILE` 提供环境默认值，显式参数优先。
 Unix 用户目录取 `HOME`，Windows 取 `USERPROFILE`，缺失时使用工作目录。
 默认 `.config/vole` 不存在或不可访问时，若设置 `XDG_CONFIG_HOME`，使用其中的 `vole` 目录。
-配置文件必须是普通文件，文件和标准输入上限均为 256 KiB，CLI 不写回配置。
+配置文件必须是普通文件，文件和标准输入上限均为 8 MiB，CLI 不写回配置。
 
 正常运行执行 `initialize → createInstance → start(configYaml)`，等待退出后
 `stop → destroyInstance`。Unix 支持 SIGINT/SIGTERM，Windows 支持 Ctrl+C/Ctrl+Break；
-退出等待内核清理完成。诊断写入有界 stderr，不包含配置正文或凭据。
+退出等待内核清理完成。诊断写入有界 stderr，遵循配置的 `log-level`，不包含配置正文或凭据。
 具体请求格式见 [Invoke API](invoke-api.md)。
 
 ## TUN 与发布

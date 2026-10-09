@@ -76,7 +76,7 @@ ech-opts:
 - `enable` 默认 false。启用必须同时提供非空 `config`；不查询 HTTPS RR，
   不接收 `query-server-name`，没有公共 DNS 后备或自动更新配置。
 - `config` 是标准带填充 Base64，不是 URL、文件路径或 PEM。解码后的完整
-  ECHConfigList 最多 65,537 字节，仍受整份配置 256 KiB 上限限制。
+  ECHConfigList 最多 65,537 字节，仍受整份配置 8 MiB 上限限制。
 - 支持 ECH 版本 `0xfe0d`、X25519/HKDF-SHA256，以及 AES-128-GCM、
   AES-256-GCM、ChaCha20-Poly1305。预检选取第一个双方后端均支持的条目，
   保留其原始编码；未知版本或不兼容条目可跳过，无兼容条目、畸形长度、非法

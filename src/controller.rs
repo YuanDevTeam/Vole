@@ -589,12 +589,12 @@ mod tests {
             "主线路"
         );
         assert_eq!(decode_group_name("a+b").unwrap(), "a+b");
-        assert!(decode_group_name("%252F").is_err());
-        assert!(decode_group_name("%2F").is_err());
+        assert_eq!(decode_group_name("%252F").unwrap(), "%2F");
+        assert_eq!(decode_group_name("%2F").unwrap(), "/");
         assert!(decode_group_name("%GG").is_err());
         assert!(decode_group_name("%A").is_err());
         assert!(decode_group_name("%FF").is_err());
-        assert!(decode_group_name("..").is_err());
+        assert_eq!(decode_group_name("..").unwrap(), "..");
     }
 
     #[tokio::test]
