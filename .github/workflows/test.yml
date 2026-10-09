@@ -218,6 +218,7 @@ jobs:
             dns::runtime::tests::dns_policy_selection_is_consistent_across_snapshot_swaps
             runtime::tests::prepares_builtin_routes_without_static_nodes_or_bootstrap
             runtime::tests::prepares_udp_capabilities_through_runtime_wrappers
+            runtime::tests::controller_diagnostics_are_opt_in_for_business_routes
             invoke::tests::null_invalid_utf8_and_oversized_input_return_json_failures
             invoke::tests::same_instance_command_is_fail_fast
             invoke::tests::android_protector_is_required_only_for_tun

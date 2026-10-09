@@ -19,6 +19,7 @@ cargo test --locked --all-features --lib platform::linux_network::tests::
 cargo test --locked --all-features --lib connections::tests::
 cargo test --locked --all-features --lib routing::diagnostics::tests::
 cargo test --locked --all-features --lib managed_udp_connections_
+cargo test --locked --all-features --lib runtime::tests::controller_diagnostics_are_opt_in_for_business_routes
 cargo test --locked --all-features --lib routing::balance::tests::
 cargo test --locked --all-features --lib load_balance_routes_
 cargo test --locked --all-features --lib dialer::connections::tests::

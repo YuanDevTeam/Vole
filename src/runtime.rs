@@ -720,20 +720,21 @@ impl GraphBuilder {
             &rules,
             self.connections.clone(),
         ));
-        let router: Arc<dyn Dispatcher> = Arc::new(
-            RoutingDispatcher::new_with_ipv6(
-                route_targets.clone(),
-                direct.clone(),
-                dns.clone(),
-                self.config.ipv6,
-                rules,
-                geo_matcher,
-            )
-            .with_tun_config(&self.config.tun)
-            .with_sniffer(&self.config.sniffer)
-            .with_tcp_concurrent(self.config.connections.tcp_concurrent)
-            .with_diagnostics(diagnostics.clone()),
-        );
+        let mut router = RoutingDispatcher::new_with_ipv6(
+            route_targets.clone(),
+            direct.clone(),
+            dns.clone(),
+            self.config.ipv6,
+            rules,
+            geo_matcher,
+        )
+        .with_tun_config(&self.config.tun)
+        .with_sniffer(&self.config.sniffer)
+        .with_tcp_concurrent(self.config.connections.tcp_concurrent);
+        if self.config.external_controller.is_some() {
+            router = router.with_diagnostics(diagnostics.clone());
+        }
+        let router: Arc<dyn Dispatcher> = Arc::new(router);
         let session_stats = RuntimeResourceStats::new("runtime_session_observation");
         Ok(BuiltRuntimeParts {
             diagnostics,
@@ -1956,6 +1957,47 @@ rules:
             "      mode: packet-up\n",
             &format!("      mode: packet-up\n      download-settings:\n{fields}\n"),
         )
+    }
+
+    #[tokio::test]
+    async fn controller_diagnostics_are_opt_in_for_business_routes() {
+        for controller in [false, true] {
+            let mut yaml = String::from(
+                "mixed-port: 1080\nproxy-groups: [{name: local, type: select, proxies: [REJECT]}]\nrules: ['MATCH,REJECT']\n",
+            );
+            if controller {
+                yaml.push_str("external-controller: 127.0.0.1:9090\nsecret: test-token\n");
+            }
+            let prepared =
+                PreparedCore::prepare(yaml.as_bytes(), &FixedResolver, ResourceLimits::default())
+                    .await
+                    .unwrap();
+            let parts = prepared.build_dispatcher(Dialer::default()).unwrap();
+            let result = parts
+                .dispatcher
+                .connect_tcp(crate::session::StreamSession {
+                    inbound: crate::session::InboundKind::Socks5,
+                    source: "127.0.0.1:12345".parse().unwrap(),
+                    destination: crate::session::Destination::Ip("192.0.2.1:443".parse().unwrap()),
+                    sniffed_domain: None,
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(crate::dispatch::DispatchError::NotAllowed)
+            ));
+            // REJECT exercises the assembled business path without opening a socket.
+            let snapshot = parts.diagnostics.connections.snapshot();
+            assert_eq!(
+                snapshot["errors"].as_array().unwrap().len(),
+                usize::from(controller)
+            );
+            assert_eq!(
+                parts.diagnostics.rules()["rules"][0]["extra"]["hitCount"],
+                usize::from(controller)
+            );
+            parts.proxy_graph.shutdown().await;
+        }
     }
 
     #[tokio::test]
