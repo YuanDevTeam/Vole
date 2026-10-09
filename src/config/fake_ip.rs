@@ -129,7 +129,7 @@ impl RawDnsConfig {
             enabled,
             range,
             range6,
-            ttl: self.fake_ip_ttl.clamp(1, u32::MAX.into()) as u32,
+            ttl: self.fake_ip_ttl.clamp(0, u32::MAX.into()) as u32,
             mode: self.fake_ip_filter_mode,
             filter,
             rules,

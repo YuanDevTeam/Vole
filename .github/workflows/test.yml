@@ -184,6 +184,10 @@ jobs:
           # Keep this explicit allowlist: unfiltered legacy tests may open host listeners.
           filters=(
             geodata:: routing:: security:: outbound::vless::encryption config::
+            connections::tests:: runtime::diagnostics::tests:: dialer::connections::tests::
+            resource::http::tests:: fake_ip_ sniffing::tests:: tcp_sniffer::tests::
+            dns::fallback::tests:: dns::runtime::tests::dns_fallback_
+            dns::runtime::encrypted_tests::
             outbound::http::tests:: inbound::mixed::tests:: inbound::socks5::association::tests::
             inbound::http::parser::tests:: inbound::http::framing::tests::
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
@@ -207,6 +211,8 @@ jobs:
             invoke::tests::runtime_thread_cannot_reenter_invoke
             invoke::tests::engine_workers_preserve_invoke_admission_and_shutdown
             invoke::tests::engine_completion_notifies_after_panic_and_join_reports_failure
+            dns::runtime::tests::runtime_dns_separates_bootstrap_proxy_direct_and_hosts
+            dns::runtime::tests::udp_truncation_retries_the_same_upstream_over_tcp
             dns::runtime::tests::concurrent_redir_host_hint_reads_and_dns_updates_complete
             dns::runtime::tests::domain_policies_use_specificity_and_preserve_geosite_order
             dns::runtime::tests::dns_policy_selection_is_consistent_across_snapshot_swaps

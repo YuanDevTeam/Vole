@@ -5066,6 +5066,7 @@ dns:
   enable: true
   enhanced-mode: fake-ip
   fake-ip-filter: [real.example]
+  fake-ip-ttl: 0
   nameserver: [192.0.2.1]
   use-system-hosts: false
 "#,
@@ -5088,6 +5089,7 @@ dns:
                 .unwrap();
             let answer = parse_response(&wire).unwrap();
             assert!(answer.authoritative);
+            assert!(answer.answers.iter().all(|record| record.ttl == 0));
             let address = matching_answer_set(&answer).unwrap().addresses[0];
             assert_eq!(address, "198.18.0.4".parse::<IpAddr>().unwrap());
             assert_eq!(

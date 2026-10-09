@@ -563,7 +563,7 @@ dns:
   enhanced-mode: redir-host # 或 fake-ip；内部节点/直连解析始终取得真实地址
   fake-ip-range: 198.18.0.1/16
   fake-ip-range6: "" # 设置 IPv6 CIDR 且启用 IPv6 后分配 AAAA
-  fake-ip-ttl: 1 # 秒，最小 1；不决定映射寿命
+  fake-ip-ttl: 1 # 秒，0 表示不缓存 DNS 答案；不决定映射寿命
   fake-ip-filter-mode: blacklist # blacklist / whitelist / rule
   fake-ip-filter: [dns.msftnsci.com, www.msftnsci.com, www.msftconnecttest.com]
   # blacklist：命中返回真实地址；whitelist：只有命中才分配 fake-IP。
