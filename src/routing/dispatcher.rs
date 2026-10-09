@@ -1120,6 +1120,9 @@ mod tests {
         members: Vec<(&str, ProxyGroupMemberTarget)>,
     ) -> SelectProxyGroupConfig {
         SelectProxyGroupConfig {
+            disable_udp: false,
+            hidden: false,
+            icon: String::new(),
             name: name.to_owned(),
             members: members
                 .into_iter()

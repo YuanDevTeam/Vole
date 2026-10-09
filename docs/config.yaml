@@ -401,12 +401,14 @@ proxies:
     #   name-cert-verify: verified.example.com # 可选独立证书验证名
     # client-fingerprint: chrome # 仅有插件时允许；共享七值，缺省/none/空串关闭命名模板
 
-# 可选的静态 `select` 代理组。字段外形是严格 Mihomo 子集：每组只接受 name、
-# type、proxies 和可选 default-selected，type 只能是 select，proxies 至少一项。
-# 成员可精确引用具体节点、另一个 select 组、DIRECT 或 REJECT。
-# RULES 仅在 DNS fragment 中具有特殊含义；在成员列表中按已配置名称解析。
-# 组声明顺序、成员顺序和重复成员全部保留，节点与组的完整混合图必须无环；组数、成员数和嵌套
-# 深度没有独立上限，仍受配置总大小和 O(V+E) 无环校验约束。
+# select 组支持静态 proxies 与动态 use；include-all 同时包含静态节点和所有 providers，
+# 也可分别使用 include-all-proxies / include-all-providers。后者启用时忽略 use。
+# filter 筛选动态成员；exclude-filter / exclude-type 同时排除显式成员。
+# 正则支持 Rust regex 子集，区分大小写；反引号分隔的多表达式按匹配顺序排列。
+# lookaround/backreference 明确拒绝。静态成员保留顺序与重复项。
+# 动态组为空时使用 empty-fallback（缺省 COMPATIBLE，即 DIRECT），可指定节点或内置目标。
+# disable-udp 缺省 false；true 拒绝通过该组的业务 UDP。hidden/icon 为 Controller 元数据。
+# 节点与组的完整混合图必须无环。资源更新后保留仍存在的当前选择，否则使用默认/首成员。
 # 未显式定义 GLOBAL 时，自动追加一个 select 组；成员依次为 DIRECT、REJECT、
 # 所有节点和声明的组，默认 DIRECT。可显式声明 GLOBAL 覆盖其成员及初始选择。
 #
@@ -438,6 +440,35 @@ proxy-groups:
     type: select
     proxies: [vless-edge, fallback-select, DIRECT, REJECT, vless-edge]
     default-selected: vless-edge
+
+# 资源声明及使用示例。http 支持 HTTP(S)，file 读取本地文件，inline 使用 payload。
+# path 必须位于 dataDir 内；HTTP 缺省路径在 proxies/ 或 rules/ 下按 URL 分配。
+# HTTP interval 单位秒，0 只获取一次；file 监测文件变化。下载失败退避重试。
+# proxy 指定当前运行配置中的出口；缺省按规则选路。不会等待新资源才能建立下载连接。
+# header 值为字符串数组；size-limit 单位字节，0 不设下载上限，解析仍有容量边界。
+# proxy provider 文件为 {proxies: [...]}；可用 filter/exclude-filter/exclude-type。
+# override 支持 udp、udp-over-tcp、up/down、dialer-proxy、skip-cert-verify、
+# additional-prefix/suffix、proxy-name: [{pattern: '表达式', target: '替换文本'}]；
+# 协议专属覆盖只用于支持该字段的节点。未实现的覆盖字段严格拒绝。
+# 更新先解析并校验整个依赖图，成功才替换；失败保留旧配置与 HTTP 缓存。
+# 新连接使用新资源，旧 TCP/UDP 会话保留原资源；停止等待下载、解析和资源释放。
+# rule providers 支持 domain/ipcidr/classical，format 为 yaml/text/mrs；MRS 仅 domain/ipcidr。
+# YAML 规则文件为 {payload: [...]}，text 每行一条，支持空行和 # 注释。
+# classical 接受已支持的无动作规则，不接受 MATCH、RULE-SET、SUB-RULE。
+# 文本/MRS 解压上限 64 MiB；YAML 沿用 8 MiB 输入和 32 MiB 展开预算。
+proxy-providers:
+  local-nodes:
+    type: inline
+    payload: []
+rule-providers:
+  local-domains:
+    type: inline
+    behavior: domain
+    payload: ["+.internal.example"]
+# 动态组写法：{name: automatic-members, type: select, use: [local-nodes]}
+# 规则写法：RULE-SET,local-domains,DIRECT；ipcidr/classical 可追加 no-resolve。
+# DNS policy 支持 rule-set:local-domains（逗号分隔多个集合）；只接受 domain/classical，
+# classical 在 DNS 场景仅使用域名与 GeoSite 条件。
 
 # hosts 支持单 IP、IP 数组、域名别名与 Clash 域名通配；不支持动态 lan 展开。
 hosts:
@@ -489,7 +520,7 @@ dns:
 # 位置，命中后其后规则不再执行。DIRECT、REJECT 是内置动作，其他动作精确引用节点或组。
 # 支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、DOMAIN-WILDCARD、DOMAIN-REGEX、
 # GEOSITE、GEOIP、IP-CIDR、IP-CIDR6、SRC-IP-CIDR、DST-PORT、SRC-PORT、NETWORK、
-# AND/OR/NOT 和 MATCH。SRC-IP-CIDR 支持 IPv4/IPv6，来源信息来自实际入站会话。
+# RULE-SET、AND/OR/NOT 和 MATCH。SRC-IP-CIDR 支持 IPv4/IPv6，来源信息来自实际入站会话。
 # 通配符 * 匹配任意长度、? 匹配一个字符；DOMAIN-REGEX 忽略大小写，支持 regex crate
 # 子集，不支持 lookaround/backreference，无法编译的模式明确报错。
 # 逻辑规则例如 AND,((DOMAIN-SUFFIX,example.com),(SRC-PORT,1000-2000)),DIRECT；

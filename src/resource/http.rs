@@ -449,7 +449,7 @@ fn validate_etag(etag: Option<&str>) -> Result<(), DownloadError> {
     Ok(())
 }
 
-fn validate_options(options: &HttpOptions) -> Result<(), DownloadError> {
+pub(crate) fn validate_options(options: &HttpOptions) -> Result<(), DownloadError> {
     if options.user_agent.len() > 1024 || !is_header_value(options.user_agent.as_bytes()) {
         return Err(DownloadError::Protocol("invalid User-Agent".into()));
     }

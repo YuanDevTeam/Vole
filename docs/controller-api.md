@@ -1,6 +1,6 @@
 # 运行时 Controller API
 
-Controller 是当前 Running Session 的回环 HTTP 接口。它提供一次性 TUN 流量快照，以及静态 `select` 代理组的状态查询和实时选择；它不是 Invoke API，也不承诺完整 Mihomo Dashboard 兼容。
+Controller 是当前 Running Session 的回环 HTTP 接口。它提供一次性 TUN 流量快照，以及静态与动态 `select` 代理组的状态查询和实时选择；它不是 Invoke API，也不承诺完整 Mihomo Dashboard 兼容。
 
 ## 配置与生命周期
 
@@ -121,7 +121,7 @@ Content-Length: 26
 
 ## 选择生效边界
 
-代理组成员列表在配置期固定，只有当前选择可在 Running Session 内改变：
+静态成员来自配置，动态成员随 provider 成功更新；Controller 读取当前可用的成员和选择：
 
 - 新建的物理 TCP 连接使用切换后的当前叶节点；既有 TCP 连接保持原路径；
 - 新建的 UDP association/物理 transport 使用切换后的当前叶节点；既有 association 不迁移；
@@ -129,9 +129,24 @@ Content-Length: 26
 - 切换不主动断开连接、不刷新缓存、不重启运行时，也不修改 YAML 或下一次 session 的默认值；
 - 选中节点、`DIRECT` 或 `REJECT` 时按原样执行；选中嵌套组时继续解析其当前成员。失败按原样返回，不自动选择其他成员。
 
-`dialer-proxy` 与规则、DNS 共享同一组选择，但经共享连接器直接建链，不重新执行业务规则。上游组的 `DIRECT` 连接当前节点预解析的服务器，`REJECT` 使建链失败。单次建链对同一组只读取一次选择，SOCKS5 UDP 的控制连接和 relay 路径共享该快照；不同组之间不提供原子快照。已经读取旧选择的在途握手继续原路径。复用旧 AnyTLS 会话的新业务流也保留原路径，只有真正新建底层 transport 才读取新选择。
+`dialer-proxy` 与规则、DNS 共享同一组选择，但经共享连接器直接建链，不重新执行业务规则。上游组的 `DIRECT` 连接当前节点按需解析的服务器，`REJECT` 使建链失败。单次建链对同一组只读取一次选择，SOCKS5 UDP 的控制连接和 relay 路径共享该快照；不同组之间不提供原子快照。已经读取旧选择的在途握手继续原路径。复用旧 AnyTLS 会话的新业务流也保留原路径，只有真正新建底层 transport 才读取新选择。
 
 Hysteria2 已认证 QUIC 会话也保留其 `dialer-proxy` 上游组快照，包括复用该会话的新业务流和端口跳跃所需的新物理 socket；这些不是新的认证会话，不能因切组而迁移原路径。只有重新建立的认证会话才读取新的上游组选择。节点本身作为路由组成员时，后续业务的路由选节点仍按当前组选择执行。
+
+## Provider 资源
+
+`GET /providers/proxies` 与 `GET /providers/rules` 返回 `{"providers":{"name":{...}}}`；
+`GET /providers/{proxies|rules}/{name}` 查询单个资源，`PUT` 同一路径主动刷新，成功返回 204。
+配置缺失返回 404，下载、解析或候选校验失败返回 503，旧资源继续服务。
+
+状态包含 `name/type/vehicleType`、`available`、`downloaded`、`updating`、`updatedAt`、
+`count` 与脱敏的 `error`。`updatedAt` 为 Unix 秒，未成功获取时为空；inline 或 bundled payload
+可以在未下载时可用。响应不包含订阅 URL、认证头或节点凭据。
+
+更新将节点、组和规则作为完整候选检查，发布时保留仍存在的当前选择。
+既有会话持有旧资源，最后一个使用者释放后回收；下载通过当前可用的运行配置建立出口，
+不等待候选资源。空动态组使用配置的 `empty-fallback`，默认 COMPATIBLE（直连）。
+组响应另含 `hidden` 与 `icon`，`disable-udp` 会拒绝该组的业务 UDP。
 
 ## HTTP 状态与协议边界
 
@@ -149,7 +164,7 @@ Hysteria2 已认证 QUIC 会话也保留其 `dialer-proxy` 上游组快照，包
 | `413 Payload Too Large` | PUT 正文超过 1 KiB |
 | `415 Unsupported Media Type` | PUT 不是严格 `application/json` |
 
-第一版不提供 provider/`use`、health check、自动 failover、`url-test`/`fallback`/`load-balance`、delay 测试、连接管理、配置修改、WebSocket 推送、Controller 版本协商或完整 Dashboard response。除 `GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}` 外，其他路径和方法均不属于公共协议。
+当前不提供 health check、自动 failover、`url-test`/`fallback`/`load-balance`、delay 测试、连接管理、配置修改、WebSocket 推送、Controller 版本协商或完整 Dashboard response。除本文列出的 provider 路由、`GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}` 外，其他路径和方法均不属于公共协议。
 
 Windows WinRT VPN 的完整运行时和 Controller 位于独立 Session Host；桌面 Wintun 的
 Controller 位于普通业务运行时。宿主通过回环 HTTP 直接访问实际 Running Session；

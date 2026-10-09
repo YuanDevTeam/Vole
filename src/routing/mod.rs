@@ -86,6 +86,10 @@ impl RoutingContext {
         })
     }
 
+    pub(crate) fn disable_ip_resolution(&mut self) {
+        self.ip_resolution_unavailable = true;
+    }
+
     pub fn set_source(&mut self, source: SocketAddr) {
         self.source = Some(source);
     }
@@ -130,7 +134,7 @@ impl RoutingContext {
     }
 
     #[must_use]
-    fn should_request_ip_resolution(&self) -> bool {
+    pub(crate) fn should_request_ip_resolution(&self) -> bool {
         self.destination_ip.is_none() && self.pinned_ip.is_none() && !self.ip_resolution_unavailable
     }
 }
@@ -493,6 +497,9 @@ fn normalize_rule(
         });
     }
     match &mut rule.kind {
+        RuleKind::RuleSet { content, .. } => {
+            *domain |= content.as_ref().is_some_and(|set| set.uses_domain());
+        }
         RuleKind::Domain(value) | RuleKind::DomainSuffix(value) => {
             *value =
                 normalize_domain_name(value).map_err(|source| RuleSetError::InvalidDomain {
@@ -547,8 +554,9 @@ fn normalize_rule(
     Ok(())
 }
 
-fn uses_destination_ip(rule: &RuleSpec) -> bool {
+pub(crate) fn uses_destination_ip(rule: &RuleSpec) -> bool {
     match &rule.kind {
+        RuleKind::RuleSet { content, .. } => content.as_ref().is_some_and(|set| set.uses_ip()),
         RuleKind::IpCidr(_) | RuleKind::GeoIp(_) => true,
         RuleKind::And(children) | RuleKind::Or(children) => {
             children.iter().any(uses_destination_ip)
@@ -560,7 +568,7 @@ fn uses_destination_ip(rule: &RuleSpec) -> bool {
 
 // Err means this exact traversal requires one lazy DNS resolution. Short
 // circuiting keeps later IP predicates from triggering unnecessary queries.
-fn matches_rule(
+pub(crate) fn matches_rule(
     rule: &RuleSpec,
     context: &RoutingContext,
     geo: &dyn GeoMatcher,
@@ -571,6 +579,10 @@ fn matches_rule(
             .any(|range| range.start <= port && port <= range.end)
     };
     Ok(match &rule.kind {
+        RuleKind::RuleSet { content, .. } => match content {
+            Some(set) => set.matches(context, geo, rule.no_resolve)?,
+            None => false,
+        },
         RuleKind::Domain(value) => context.domain() == Some(value.as_str()),
         RuleKind::DomainSuffix(value) => context
             .domain()

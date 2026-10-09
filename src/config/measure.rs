@@ -200,10 +200,10 @@ proxies:
     }
 
     #[test]
-    fn rejects_non_json_yaml() {
+    fn accepts_bounded_yaml_templates() {
         assert!(
             MeasureConfig::parse_yaml(NODE.replace("name: proxy", "name: &tag proxy").as_bytes())
-                .is_err()
+                .is_ok()
         );
     }
 

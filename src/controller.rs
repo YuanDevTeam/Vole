@@ -25,6 +25,7 @@ pub(crate) struct RuntimeController {
     secret: Option<Arc<str>>,
     traffic: Option<Arc<TunTrafficStats>>,
     proxy_groups: Arc<ProxyGroups>,
+    resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
 }
 
 impl std::fmt::Debug for RuntimeController {
@@ -49,7 +50,16 @@ impl RuntimeController {
             secret: config.secret.as_deref().map(Arc::from),
             traffic,
             proxy_groups,
+            resources: None,
         })
+    }
+
+    pub(crate) fn with_resources(
+        mut self,
+        resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
+    ) -> Self {
+        self.resources = resources;
+        self
     }
 
     #[cfg(test)]
@@ -77,6 +87,7 @@ impl RuntimeController {
                     let secret = self.secret.clone();
                     let traffic = self.traffic.clone();
                     let proxy_groups = self.proxy_groups.clone();
+                    let resources = self.resources.clone();
                     let child = cancellation.clone();
                     tasks.spawn(crate::resources::observation::task(async move {
                         if let Err(error) = handle_connection(
@@ -85,6 +96,7 @@ impl RuntimeController {
                             secret,
                             traffic,
                             proxy_groups,
+                            resources,
                             child,
                         )
                         .await
@@ -110,6 +122,7 @@ async fn handle_connection(
     secret: Option<Arc<str>>,
     traffic: Option<Arc<TunTrafficStats>>,
     proxy_groups: Arc<ProxyGroups>,
+    resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
     cancellation: CancellationToken,
 ) -> io::Result<()> {
     if !peer.ip().is_loopback() {
@@ -165,6 +178,59 @@ async fn handle_connection(
         };
     }
 
+    if let Some(tail) = request.target.strip_prefix("/providers/") {
+        let (kind, raw_name) = tail
+            .split_once('/')
+            .map_or((tail, None), |(kind, name)| (kind, Some(name)));
+        let rules = match kind {
+            "rules" => true,
+            "proxies" => false,
+            _ => return write_error(&mut stream, 404, "Resource not found", &[]).await,
+        };
+        let name = match raw_name {
+            Some(raw) => match decode_group_name(raw) {
+                Ok(name) => Some(name),
+                Err(()) => return write_error(&mut stream, 400, "Bad request", &[]).await,
+            },
+            None => None,
+        };
+        let state = resources.as_ref().map_or_else(
+            || serde_json::json!({"providers":{}}),
+            |resources| resources.providers(rules),
+        );
+        if request.method == "GET" {
+            if let Some(name) = name {
+                return match state["providers"].get(&name) {
+                    Some(value) => write_json(&mut stream, 200, value, &[]).await,
+                    None => write_error(&mut stream, 404, "Resource not found", &[]).await,
+                };
+            }
+            return write_json(&mut stream, 200, &state, &[]).await;
+        }
+        if request.method == "PUT"
+            && let (Some(resources), Some(name)) = (&resources, name)
+        {
+            if state["providers"].get(&name).is_none() {
+                return write_error(&mut stream, 404, "Resource not found", &[]).await;
+            }
+            let result = tokio::select! { biased; ()=cancellation.cancelled()=>return Ok(()), result=resources.refresh(rules,&name)=>result };
+            return match result {
+                Ok(()) => write_response(&mut stream, 204, &[], &[]).await,
+                Err(_) => write_error(&mut stream, 503, "Provider update failed", &[]).await,
+            };
+        }
+        return write_error(
+            &mut stream,
+            405,
+            "Method not allowed",
+            &[("Allow", "GET, PUT")],
+        )
+        .await;
+    }
+    let proxy_groups = resources
+        .as_ref()
+        .map_or(proxy_groups, |resources| resources.groups());
+
     if request.target == "/group" {
         if request.method != "GET" {
             return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
@@ -211,6 +277,7 @@ async fn handle_connection(
                     request.buffered,
                     &name,
                     &proxy_groups,
+                    resources.as_deref(),
                     cancellation,
                 )
                 .await
@@ -236,6 +303,7 @@ async fn handle_select(
     mut body: Vec<u8>,
     group: &str,
     proxy_groups: &ProxyGroups,
+    resources: Option<&dyn crate::resource::control::RuntimeResources>,
     cancellation: CancellationToken,
 ) -> io::Result<()> {
     if header_values(headers, "transfer-encoding").next().is_some() {
@@ -302,7 +370,10 @@ async fn handle_select(
         Ok(request) => request,
         Err(_) => return write_error(stream, 400, "Body invalid", &[]).await,
     };
-    match proxy_groups.select(group, &request.name) {
+    match resources.map_or_else(
+        || proxy_groups.select(group, &request.name),
+        |resources| resources.select(group, &request.name),
+    ) {
         Ok(()) => write_response(stream, 204, &[], b"").await,
         Err(ProxyGroupError::UnknownGroup) => {
             write_error(stream, 404, "Resource not found", &[]).await
@@ -413,6 +484,8 @@ struct GroupResponse {
     kind: &'static str,
     all: Vec<String>,
     now: String,
+    hidden: bool,
+    icon: String,
 }
 
 impl From<ProxyGroupState> for GroupResponse {
@@ -422,6 +495,8 @@ impl From<ProxyGroupState> for GroupResponse {
             kind: "Selector",
             all: state.all,
             now: state.now,
+            hidden: state.hidden,
+            icon: state.icon,
         }
     }
 }
@@ -524,6 +599,9 @@ mod tests {
         let dispatcher: Arc<dyn Dispatcher> = Arc::new(UnusedDispatcher);
         ProxyGroups::new(
             &[SelectProxyGroupConfig {
+                disable_udp: false,
+                hidden: false,
+                icon: String::new(),
                 name: "主线路".to_owned(),
                 members: vec![
                     ProxyGroupMemberConfig {

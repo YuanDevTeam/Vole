@@ -1676,6 +1676,7 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
     let cancellation = CancellationToken::new();
     let (mut ingress, mut ordinary, mut dns) = UdpIngress::new(
         UdpIngressContext {
+            resources: None,
             config: test_tun_config(),
             dispatcher: Arc::new(MockDispatcher::default()),
             dns: None,
@@ -3253,6 +3254,7 @@ async fn full_tcp_ingress_drops_only_that_packet_and_keeps_udp_and_dns_responsiv
     let cancellation = CancellationToken::new();
     let (udp, mut ordinary_rx, mut dns_rx) = UdpIngress::new(
         UdpIngressContext {
+            resources: None,
             config: test_tun_config(),
             dispatcher: dispatcher.clone(),
             dns: Some(test_runtime_dns(dns_dispatcher.clone())),
@@ -3630,6 +3632,7 @@ async fn udp_ingress_stop_releases_associations_without_cancelling_caller() {
     let probe = observation::ResourceProbe::default();
     let (mut udp, ordinary, dns) = UdpIngress::new(
         UdpIngressContext {
+            resources: None,
             config: test_tun_config(),
             dispatcher,
             dns: None,
@@ -3903,6 +3906,7 @@ async fn configured_udp_idle_timeout_controls_real_association_cleanup() {
         let cancellation = CancellationToken::new();
         let (mut ingress, _ordinary, _dns) = UdpIngress::new(
             UdpIngressContext {
+                resources: None,
                 dispatcher: Arc::new(MockDispatcher::default()),
                 dns: None,
                 sniffer: None,
@@ -3938,6 +3942,7 @@ async fn configured_udp_dns_targets_match_exact_endpoints_and_empty_disables_hij
     let target = "192.0.2.53:5353".parse().unwrap();
     let (mut ingress, _ordinary, _dns) = UdpIngress::new(
         UdpIngressContext {
+            resources: None,
             dispatcher,
             dns: Some(dns),
             sniffer: None,

@@ -7,7 +7,7 @@
 
 pub(crate) mod hosts;
 mod https;
-mod policy;
+pub(crate) mod policy;
 
 pub mod resolution;
 pub mod runtime;

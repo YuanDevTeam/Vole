@@ -14,6 +14,7 @@ pub(super) struct NameserverPolicies(Vec<PolicyStep>);
 enum PolicyStep {
     Domains(DomainIndex),
     GeoSite(usize),
+    RuleSet(usize),
 }
 
 impl NameserverPolicies {
@@ -21,6 +22,7 @@ impl NameserverPolicies {
         let mut steps = Vec::new();
         for (index, policy) in policies.iter().enumerate() {
             match &policy.selector {
+                DnsPolicySelector::RuleSets { .. } => steps.push(PolicyStep::RuleSet(index)),
                 DnsPolicySelector::GeoSite(_) => steps.push(PolicyStep::GeoSite(index)),
                 DnsPolicySelector::Domains(patterns) => {
                     if !matches!(steps.last(), Some(PolicyStep::Domains(_))) {
@@ -46,6 +48,14 @@ impl NameserverPolicies {
     ) -> Option<usize> {
         self.0.iter().find_map(|step| match step {
             PolicyStep::Domains(domains) => domains.find(0, name),
+            PolicyStep::RuleSet(index) => {
+                let DnsPolicySelector::RuleSets { sets, .. } = &policies[*index].selector else {
+                    unreachable!()
+                };
+                sets.iter()
+                    .any(|set| set.matches_domain(name, geo))
+                    .then_some(*index)
+            }
             PolicyStep::GeoSite(index) => policies[*index]
                 .geosite_codes()
                 .iter()
@@ -55,7 +65,7 @@ impl NameserverPolicies {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct DomainNode {
     labels: HashMap<String, usize>,
     wildcard: Option<usize>,
@@ -65,15 +75,15 @@ struct DomainNode {
 
 /// A flat arena keeps construction and destruction independent of pattern
 /// depth; lookup depth is bounded by the validated DNS question.
-#[derive(Debug)]
-pub(super) struct DomainIndex(Vec<DomainNode>);
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DomainIndex(Vec<DomainNode>);
 
 impl DomainIndex {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(vec![DomainNode::default()])
     }
 
-    pub(super) fn insert(&mut self, pattern: &str, policy: usize) {
+    pub(crate) fn insert(&mut self, pattern: &str, policy: usize) {
         let (domain, exact, suffix) = if let Some(domain) = pattern.strip_prefix("+.") {
             (domain, true, true)
         } else if let Some(domain) = pattern.strip_prefix('.') {
@@ -107,7 +117,7 @@ impl DomainIndex {
         }
     }
 
-    pub(super) fn find(&self, current: usize, name: &str) -> Option<usize> {
+    pub(crate) fn find(&self, current: usize, name: &str) -> Option<usize> {
         let node = &self.0[current];
         if name.is_empty() {
             return node.exact;

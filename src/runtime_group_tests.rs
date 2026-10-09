@@ -48,116 +48,37 @@ rules: ['MATCH,child']
 }
 
 #[tokio::test]
-async fn prepare_includes_unselected_direct_candidates_and_excludes_proxy_only_hosts() {
-    for (members, expected) in [
-        ("root, DIRECT", vec!["child.invalid", "root.invalid"]),
-        ("root, REJECT", vec!["root.invalid"]),
-    ] {
-        let resolver = RecordingResolver::default();
-        let prepared = PreparedCore::prepare(
-            grouped_config(members).as_bytes(),
-            &resolver,
-            ResourceLimits::default(),
-        )
-        .await
-        .unwrap();
-        let mut actual = resolver
-            .hosts
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(host, _)| host.clone())
-            .collect::<Vec<_>>();
-        actual.sort();
-        assert_eq!(actual, expected);
-        for endpoints in &prepared.endpoints {
-            if let Some(endpoint) = &endpoints.upload {
-                assert!(endpoint.addresses.iter().all(SocketAddr::is_ipv4));
-            }
-        }
-        assert_eq!(
-            prepared.endpoints[0].upload.is_some(),
-            members.contains("DIRECT")
-        );
-    }
-}
-
-#[tokio::test]
-async fn candidate_dns_failure_rolls_back_geodata_registration_and_loopback_domains_fail_closed() {
+async fn group_preparation_is_lazy_and_releases_registration_on_drop() {
     let directory = tempfile::tempdir().unwrap();
     let manager = GeoDataManager::open(directory.path(), Duration::from_secs(86400)).unwrap();
     let resolver = RecordingResolver {
         fail_host: Some("child.invalid"),
         ..Default::default()
     };
-    let config = Config::parse_yaml(grouped_config("root, DIRECT").as_bytes()).unwrap();
-    let error = PreparedCore::prepare_config(
-        config,
-        manager.clone(),
-        &resolver,
-        ResourceLimits::default(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::NotFound);
-    // The failed prepare must release its exclusive GeoData registration.
-    let config = Config::parse_yaml(grouped_config("root, REJECT").as_bytes()).unwrap();
-    drop(
-        PreparedCore::prepare_config(config, manager, &resolver, ResourceLimits::default())
-            .await
-            .unwrap(),
-    );
-
-    let yaml = grouped_config("root, DIRECT")
-        .replace("child.invalid", "localhost")
-        .replace("root.invalid", "127.0.0.1");
-    let error = PreparedCore::prepare(yaml.as_bytes(), &SystemResolver, ResourceLimits::default())
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-}
-
-#[tokio::test]
-async fn cancelling_group_prepare_releases_its_geodata_registration() {
-    struct PendingResolver(AtomicUsize);
-    #[async_trait]
-    impl Resolver for PendingResolver {
-        async fn resolve(&self, _host: &str, _port: u16) -> io::Result<ResolvedEndpoint> {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            std::future::pending().await
-        }
-    }
-    let directory = tempfile::tempdir().unwrap();
-    let manager = GeoDataManager::open(directory.path(), Duration::from_secs(86400)).unwrap();
-    let resolver = PendingResolver(AtomicUsize::new(0));
-    let yaml = grouped_config("root, DIRECT");
-    let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
-    let mut preparing = Box::pin(PreparedCore::prepare_config(
-        config,
-        manager.clone(),
-        &resolver,
-        ResourceLimits::default(),
-    ));
-    assert!(futures_util::poll!(&mut preparing).is_pending());
-    assert!(resolver.0.load(Ordering::Relaxed) > 0);
-    drop(preparing);
-    // Cancellation during candidate DNS must not retain the exclusive registration.
-    let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
-    drop(
-        PreparedCore::prepare_config(
+    for members in ["root, DIRECT", "root, REJECT"] {
+        let config = Config::parse_yaml(grouped_config(members).as_bytes()).unwrap();
+        let prepared = PreparedCore::prepare_config(
             config,
-            manager,
-            &RecordingResolver::default(),
+            manager.clone(),
+            &resolver,
             ResourceLimits::default(),
         )
         .await
-        .unwrap(),
-    );
+        .unwrap();
+        assert!(resolver.hosts.lock().unwrap().is_empty());
+        assert!(
+            prepared
+                .endpoints
+                .iter()
+                .all(|entry| entry.upload.is_none())
+        );
+        drop(prepared);
+    }
 }
 
 #[cfg(all(feature = "outbound-vless", feature = "outbound-socks5"))]
 #[tokio::test]
-async fn possible_direct_vless_prepares_both_independent_legs() {
+async fn possible_direct_vless_defers_both_independent_legs() {
     let yaml = grouped_config("root, DIRECT").replace(
         "{name: child, type: socks5, server: child.invalid, port: 1080, udp: true, dialer-proxy: outer}",
         r#"name: child
@@ -184,16 +105,9 @@ async fn possible_direct_vless_prepares_both_independent_legs() {
             .await
             .unwrap();
         let child = ProxyId::new(0).unwrap();
-        assert_eq!(prepared.endpoint(child).is_some(), direct);
-        assert_eq!(prepared.download_endpoint(child).is_some(), direct);
-        if direct {
-            let download = prepared.download_endpoint(child).unwrap();
-            assert_eq!(download.logical_host, "download.invalid");
-            assert_eq!(download.port, 8443);
-            assert_eq!(resolver.hosts.lock().unwrap().len(), 3);
-        } else {
-            assert_eq!(resolver.hosts.lock().unwrap().len(), 1);
-        }
+        assert!(prepared.endpoint(child).is_none());
+        assert!(prepared.download_endpoint(child).is_none());
+        assert!(resolver.hosts.lock().unwrap().is_empty());
         let graph = prepared.build_proxy_graph(Dialer::default()).unwrap();
         assert_eq!(graph.len(), 2);
     }

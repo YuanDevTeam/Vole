@@ -20,6 +20,8 @@ pub(crate) struct ProxyGroupState {
     pub(crate) name: String,
     pub(crate) all: Vec<String>,
     pub(crate) now: String,
+    pub(crate) hidden: bool,
+    pub(crate) icon: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +45,9 @@ struct SelectProxyGroup {
     name: String,
     members: Box<[ProxyGroupMember]>,
     selected: Arc<AtomicUsize>,
+    disable_udp: bool,
+    hidden: bool,
+    icon: String,
 }
 
 struct ProxyGroupMember {
@@ -160,6 +165,9 @@ impl ProxyGroups {
                         })
                         .collect(),
                     selected: selection.clone(),
+                    disable_udp: config.disable_udp,
+                    hidden: config.hidden,
+                    icon: config.icon.clone(),
                 })
                 .collect(),
             ids_by_name,
@@ -202,12 +210,23 @@ impl ProxyGroups {
 
     pub(crate) fn resolve_leaf(
         &self,
+        group_id: ProxyGroupId,
+    ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
+        self.resolve_leaf_for(group_id, false)
+    }
+
+    fn resolve_leaf_for(
+        &self,
         mut group_id: ProxyGroupId,
+        udp: bool,
     ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
         for _ in 0..=self.groups.len() {
             let group = self.groups.get(group_id.index()).ok_or_else(|| {
                 DispatchError::Other(format!("unknown proxy group id {}", group_id.index()))
             })?;
+            if udp && group.disable_udp {
+                return Err(DispatchError::NotAllowed);
+            }
             let selected = group.selected.load(Ordering::Acquire);
             let member = group.members.get(selected).ok_or_else(|| {
                 DispatchError::Other(format!(
@@ -268,6 +287,8 @@ impl SelectProxyGroup {
                 .map(|member| member.name.clone())
                 .collect(),
             now: self.members[selected].name.clone(),
+            hidden: self.hidden,
+            icon: self.icon.clone(),
         }
     }
 }
@@ -292,7 +313,7 @@ impl Dispatcher for SelectProxyGroupDispatcher {
         session: DatagramSession,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         self.groups
-            .resolve_leaf(self.id)?
+            .resolve_leaf_for(self.id, true)?
             .dispatcher
             .open_datagram(session)
             .await
@@ -450,6 +471,9 @@ mod tests {
         initial_member: usize,
     ) -> SelectProxyGroupConfig {
         SelectProxyGroupConfig {
+            disable_udp: false,
+            hidden: false,
+            icon: String::new(),
             name: name.to_owned(),
             members,
             initial_member,
@@ -537,11 +561,15 @@ mod tests {
                     name: "child".to_owned(),
                     all: vec!["first".to_owned(), "first".to_owned(), "second".to_owned()],
                     now: "second".to_owned(),
+                    hidden: false,
+                    icon: String::new(),
                 },
                 ProxyGroupState {
                     name: "parent".to_owned(),
                     all: vec!["child".to_owned(), "DIRECT".to_owned(), "REJECT".to_owned()],
                     now: "child".to_owned(),
+                    hidden: false,
+                    icon: String::new(),
                 },
             ]
         );

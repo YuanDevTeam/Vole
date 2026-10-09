@@ -30,6 +30,7 @@ pub(crate) mod service;
 pub(crate) use selectors::normalize_selector;
 use selectors::{fold_attribute, selector_attributes, selector_code};
 
+pub(crate) use manager::GeoDataRegistrationLease;
 pub use manager::{
     DynamicGeoData, GeoDataLoadReport, GeoDataManager, GeoDataManagerError, GeoDataRegistration,
     GeoDataReloadReport, GeoDataResourceReport, GeoDataStatus, GeoResourceState, GeoUpdateSession,
@@ -397,6 +398,10 @@ impl RequestedCodes {
         while let Some(rule) = pending.pop() {
             match &rule.kind {
                 RuleKind::And(children) | RuleKind::Or(children) => pending.extend(children),
+                RuleKind::RuleSet {
+                    content: Some(content),
+                    ..
+                } => pending.extend(&content.classical),
                 RuleKind::Not(child) => pending.push(child),
                 RuleKind::GeoSite(code) => requested.sites.insert(GeoDataKind::GeoSite, code)?,
                 RuleKind::GeoIp(code) => requested.ips.insert(GeoDataKind::GeoIp, code)?,
@@ -404,6 +409,19 @@ impl RequestedCodes {
             }
         }
         for policy in dns_policies {
+            if let crate::config::DnsPolicySelector::RuleSets { sets, .. } = &policy.selector {
+                let rules = sets
+                    .iter()
+                    .flat_map(|set| set.classical.iter().cloned())
+                    .collect::<Vec<_>>();
+                let nested = Self::collect(&rules, &[])?;
+                for code in nested.sites.selectors {
+                    requested.sites.insert(GeoDataKind::GeoSite, &code)?;
+                }
+                for code in nested.ips.selectors {
+                    requested.ips.insert(GeoDataKind::GeoIp, &code)?;
+                }
+            }
             for code in policy.geosite_codes() {
                 requested.sites.insert(GeoDataKind::GeoSite, code)?;
             }
@@ -442,6 +460,16 @@ impl GeoRequirements {
             })
             .collect();
         Self::collect(&config.rules, &policies)
+    }
+
+    pub(crate) fn extend(&mut self, other: &Self) -> Result<(), GeoDataError> {
+        for selector in &other.sites.selectors {
+            self.sites.insert(GeoDataKind::GeoSite, selector)?;
+        }
+        for selector in &other.ips.selectors {
+            self.ips.insert(GeoDataKind::GeoIp, selector)?;
+        }
+        Ok(())
     }
 
     /// Collects all GeoSite and GeoIP selectors used by business rules and DNS

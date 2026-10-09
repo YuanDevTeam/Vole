@@ -90,6 +90,7 @@ pub(crate) struct TunRuntime {
     config: TunConfig,
     dispatcher: Arc<dyn Dispatcher>,
     dns: Option<Arc<RuntimeDns>>,
+    resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
     ipv6: bool,
     fake_icmp_echo: bool,
     sniffer: Option<Arc<SnifferConfig>>,
@@ -152,11 +153,20 @@ impl TunRuntime {
             config: config.clone(),
             dispatcher,
             dns: dns.filter(|dns| dns.is_enabled()),
+            resources: None,
             ipv6,
             fake_icmp_echo,
             sniffer,
             traffic_stats,
         })
+    }
+
+    pub(crate) fn with_resources(
+        mut self,
+        resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
+    ) -> Self {
+        self.resources = resources;
+        self
     }
 
     pub(crate) async fn run(self, cancellation: CancellationToken) -> io::Result<()> {
@@ -182,6 +192,7 @@ impl TunRuntime {
             UdpIngressContext {
                 dispatcher: self.dispatcher.clone(),
                 dns: self.dns,
+                resources: self.resources,
                 sniffer: self.sniffer.clone(),
                 limits: self.limits,
                 config: self.config.clone(),
@@ -1001,6 +1012,7 @@ fn try_queue_association_input(
 struct UdpIngressContext {
     dispatcher: Arc<dyn Dispatcher>,
     dns: Option<Arc<RuntimeDns>>,
+    resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
     sniffer: Option<Arc<SnifferConfig>>,
     limits: ResourceLimits,
     config: TunConfig,
@@ -1054,8 +1066,23 @@ impl UdpIngress {
             return;
         }
         if self.context.config.hijacks_dns(datagram.destination)
-            && let Some(dns) = &self.context.dns
+            && let Some(snapshot) = self
+                .context
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.dns())
+                .or_else(|| {
+                    self.context
+                        .dns
+                        .clone()
+                        .map(|dns| crate::resource::control::DnsSnapshot {
+                            dns,
+                            _generation: None,
+                        })
+                })
+            && snapshot.dns.is_enabled()
         {
+            let dns = snapshot.dns.clone();
             if let Err(error) = classify_query(datagram.payload) {
                 tracing::debug!(%error, "dropping invalid TUN DNS datagram");
                 return;
@@ -1066,8 +1093,8 @@ impl UdpIngress {
                 datagram.destination,
                 Bytes::copy_from_slice(datagram.payload),
             );
-            self.dns_tasks.spawn(observation::task(run_tun_dns_query(
-                dns.clone(),
+            self.dns_tasks.spawn(observation::task(run_tun_dns_snapshot(
+                snapshot,
                 permit,
                 request,
                 self.dns_responses.clone(),
@@ -1215,6 +1242,28 @@ impl Deref for QueuedUdpResponse {
     fn deref(&self) -> &Self::Target {
         &self.datagram
     }
+}
+
+async fn run_tun_dns_snapshot(
+    snapshot: crate::resource::control::DnsSnapshot,
+    permit: DnsQueryPermit,
+    request: UdpDatagram,
+    responses: mpsc::Sender<QueuedUdpResponse>,
+    tun_mtu: usize,
+    resource_stats: RuntimeResourceStats,
+    cancellation: CancellationToken,
+) {
+    let _generation = snapshot._generation;
+    run_tun_dns_query(
+        snapshot.dns,
+        permit,
+        request,
+        responses,
+        tun_mtu,
+        resource_stats,
+        cancellation,
+    )
+    .await;
 }
 
 async fn run_tun_dns_query(

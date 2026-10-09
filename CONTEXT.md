@@ -73,7 +73,7 @@ A named, concrete outbound protocol path that can be selected as a route target 
 _Avoid_: Proxy when a proxy group or route target is intended, server profile
 
 **Proxy group**:
-A named route or upstream target whose current-session selection identifies one direct member. Routing and `dialer-proxy` share the same selection; an upstream group's DIRECT member connects the current node's prepared server.
+A named route or upstream target whose current-session selection identifies one direct member. Routing and `dialer-proxy` share the same selection; an upstream group's DIRECT member connects the current node's server resolved on demand.
 _Avoid_: Folder, provider, subscription
 
 **Route target**:
@@ -83,3 +83,6 @@ _Avoid_: Proxy when the distinction between a node and group matters, dialer
 **Group selection**:
 The running-session state identifying the direct member route target currently chosen by a proxy group.
 _Avoid_: Variant, configuration switch, active profile
+
+**Resource generation**:
+A validated combination of provider content, proxy nodes, groups, rules and DNS policies. New sessions use the published generation; existing sessions retain their dependencies until completion. Failed candidates preserve the usable generation and its HTTP cache.

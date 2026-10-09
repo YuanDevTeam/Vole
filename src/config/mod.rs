@@ -18,7 +18,10 @@ use uuid::Uuid;
 use crate::{Result, VoleError};
 
 mod dns;
+pub mod providers;
+mod rule_provider;
 mod rules;
+pub use rule_provider::RuleCollection;
 mod yaml;
 pub use rules::DomainRegex;
 use rules::parse_rule;
@@ -78,6 +81,7 @@ pub struct Config {
     pub sniffer: SnifferConfig,
     pub dns: DnsConfig,
     pub rules: Vec<RuleSpec>,
+    pub providers: Option<std::sync::Arc<providers::ProviderTemplate>>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -313,13 +317,17 @@ pub struct DnsNameserverPolicy {
 pub enum DnsPolicySelector {
     GeoSite(Box<[String]>),
     Domains(Box<[String]>),
+    RuleSets {
+        names: Box<[String]>,
+        sets: Vec<std::sync::Arc<RuleCollection>>,
+    },
 }
 
 impl DnsNameserverPolicy {
     pub fn geosite_codes(&self) -> &[String] {
         match &self.selector {
             DnsPolicySelector::GeoSite(codes) => codes,
-            DnsPolicySelector::Domains(_) => &[],
+            DnsPolicySelector::Domains(_) | DnsPolicySelector::RuleSets { .. } => &[],
         }
     }
 }
@@ -349,6 +357,10 @@ pub struct RuleSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleKind {
+    RuleSet {
+        name: String,
+        content: Option<std::sync::Arc<RuleCollection>>,
+    },
     Domain(String),
     DomainSuffix(String),
     DomainKeyword(String),
@@ -440,6 +452,9 @@ pub struct SelectProxyGroupConfig {
     pub name: String,
     pub members: Vec<ProxyGroupMemberConfig>,
     pub initial_member: usize,
+    pub disable_udp: bool,
+    pub hidden: bool,
+    pub icon: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -915,6 +930,12 @@ struct RawVoleConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProxyGroup {
+    #[serde(rename = "disable-udp", default)]
+    disable_udp: bool,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    icon: String,
     name: String,
     #[serde(rename = "type")]
     kind: String,
@@ -1615,12 +1636,8 @@ where
 impl Config {
     pub fn parse_yaml(input: &[u8]) -> Result<Self> {
         let yaml = yaml::parse(input)?;
-        // Deserialize from the YAML value directly. Mapping order is part of
-        // nameserver-policy semantics and would be lost by the intermediate
-        // serde_json map representation.
-        let raw: RawVoleConfig = serde_yaml_ng::from_value(yaml)
-            .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
-        raw.normalize()
+        let template = std::sync::Arc::new(providers::ProviderTemplate::extract(yaml)?);
+        template.materialize(&providers::ProviderContents::new())
     }
     #[cfg(any(feature = "invoke", test))]
     pub(crate) fn take_runtime_rules(&mut self) -> Vec<RuleSpec> {
@@ -1682,6 +1699,9 @@ impl RawVoleConfig {
         let generated_global = !raw_groups.iter().any(|group| group.name == "GLOBAL");
         if generated_global {
             raw_groups.push(RawProxyGroup {
+                disable_udp: false,
+                hidden: false,
+                icon: String::new(),
                 name: "GLOBAL".into(),
                 kind: "select".into(),
                 proxies: vec!["DIRECT".into(), "REJECT".into()],
@@ -1758,6 +1778,7 @@ impl RawVoleConfig {
             sniffer,
             dns,
             rules,
+            providers: None,
         })
     }
 }
@@ -2160,7 +2181,7 @@ fn normalize_proxy_groups(
                 .map(|name| {
                     validate_route_target_name(&name, "proxy group member")?;
                     let target = match name.as_str() {
-                        "DIRECT" => ProxyGroupMemberTarget::Direct,
+                        "DIRECT" | "COMPATIBLE" => ProxyGroupMemberTarget::Direct,
                         "REJECT" => ProxyGroupMemberTarget::Reject,
                         _ => route_targets
                             .get(&name)
@@ -2192,6 +2213,9 @@ fn normalize_proxy_groups(
                 name: group.name,
                 members,
                 initial_member,
+                disable_udp: group.disable_udp,
+                hidden: group.hidden,
+                icon: group.icon,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2875,8 +2899,15 @@ fn normalize_dns_policy_selector(input: &str) -> Result<DnsPolicySelector> {
             .collect::<Result<Vec<_>>>()?;
         return Ok(DnsPolicySelector::GeoSite(codes.into_boxed_slice()));
     }
-    if lower.starts_with("rule-set:") {
-        return invalid("dns.nameserver-policy rule-set requires unsupported rule-providers");
+    if let Some(selector) = input.strip_prefix("rule-set:") {
+        let names = selector.split(',').map(str::to_owned).collect::<Vec<_>>();
+        if names.iter().any(|name| name.is_empty()) {
+            return invalid("DNS policy rule-set requires provider names");
+        }
+        return Ok(DnsPolicySelector::RuleSets {
+            names: names.into_boxed_slice(),
+            sets: Vec::new(),
+        });
     }
     let domains = lower
         .split(',')
@@ -3551,23 +3582,14 @@ geo-update-interval: 24"#,
     }
 
     #[test]
-    fn rejects_incomplete_or_extended_geox_url_maps() {
-        for fields in [
-            r#"geox-url:
-  geoip: https://geo.example.test/geoip.dat
-geo-auto-update: true
-geo-update-interval: 24"#,
-            r#"geox-url:
-  geosite: https://geo.example.test/geosite.dat
-geo-auto-update: true
-geo-update-interval: 24"#,
-            r#"geox-url:
+    fn rejects_extended_geox_url_maps() {
+        for fields in [r#"geox-url:
   geoip: https://geo.example.test/geoip.dat
   geosite: https://geo.example.test/geosite.dat
   mmdb: https://geo.example.test/country.mmdb
 geo-auto-update: true
-geo-update-interval: 24"#,
-        ] {
+geo-update-interval: 24"#]
+        {
             assert!(
                 Config::parse_yaml(with_geodata(fields).as_bytes()).is_err(),
                 "{fields}"

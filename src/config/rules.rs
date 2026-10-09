@@ -32,6 +32,10 @@ pub(super) fn parse_rule(input: &str, targets: &RouteTargetsByName) -> Result<Ru
     parse(input, Some(targets), 0)
 }
 
+pub(super) fn parse_predicate(input: &str) -> Result<RuleSpec> {
+    parse(input, None, 0)
+}
+
 fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Result<RuleSpec> {
     if depth > 32 {
         return invalid("logical rules exceed 32 nesting levels");
@@ -80,7 +84,7 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
                 if option == "no-resolve"
                     && matches!(
                         kind.as_str(),
-                        "GEOIP" | "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR"
+                        "RULE-SET" | "GEOIP" | "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR"
                     )
                 {
                     no_resolve = true;
@@ -91,6 +95,10 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
             (payload, action, no_resolve)
         };
     let rule_kind = match kind.as_str() {
+        "RULE-SET" => RuleKind::RuleSet {
+            name: payload.to_owned(),
+            content: None,
+        },
         "DOMAIN" => RuleKind::Domain(normalize_rule_domain(payload, "DOMAIN")?),
         "DOMAIN-SUFFIX" => RuleKind::DomainSuffix(normalize_rule_domain(payload, "DOMAIN-SUFFIX")?),
         "DOMAIN-KEYWORD" => RuleKind::DomainKeyword(normalize_rule_keyword(payload)?),

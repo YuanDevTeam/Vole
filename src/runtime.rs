@@ -96,10 +96,14 @@ use crate::security::StandardTlsClient;
 ))]
 use crate::security::{SecurityContext, TLS_RESUMPTION_SESSION_BUDGET};
 
+mod providers;
+use providers::ProviderRuntime;
+
 /// Validated configuration; physical server names resolve on first use.
 #[derive(Debug)]
 pub(crate) struct PreparedCore {
     config: Config,
+    provider_cache: std::sync::Mutex<Option<crate::resource::cache::ProviderCache>>,
     endpoints: Vec<PreparedProxyEndpoints>,
     limits: ResourceLimits,
     rules: RuleSet,
@@ -138,7 +142,7 @@ struct PreparedProxyEndpoints {
 #[cfg(feature = "invoke")]
 pub(crate) struct MeasurementRuntime {
     dispatcher: Arc<dyn Dispatcher>,
-    proxy_graph: BuiltProxyGraph,
+    proxy_graph: Arc<BuiltProxyGraph>,
 }
 
 #[cfg(feature = "invoke")]
@@ -171,7 +175,10 @@ struct BuiltRuntimeParts {
     dns: Option<Arc<RuntimeDns>>,
     geodata_updater: Option<GeoDataUpdateService>,
     proxy_groups: Arc<ProxyGroups>,
-    proxy_graph: BuiltProxyGraph,
+    proxy_graph: Arc<BuiltProxyGraph>,
+    resources: Option<Arc<ProviderRuntime>>,
+    resource_targets: RouteTargetDispatchers,
+    direct: Arc<dyn Dispatcher>,
 }
 
 struct BuiltProxyGraph {
@@ -267,6 +274,25 @@ impl PreparedCore {
         limits
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let provider_cache = if let Some(template) = config.providers.clone() {
+            let root = geodata_manager
+                .store_dir()
+                .parent()
+                .ok_or_else(|| io::Error::other("dataDir is missing"))?
+                .to_path_buf();
+            let cache = tokio::task::spawn_blocking(move || {
+                crate::resource::cache::ProviderCache::open(&root, template)
+            })
+            .await
+            .map_err(io::Error::other)??;
+            config = cache
+                .template
+                .materialize(&cache.contents)
+                .map_err(io::Error::other)?;
+            Some(cache)
+        } else {
+            None
+        };
         let (rules, geodata_registration) = prepare_routing(&mut config, &geodata_manager)?;
         let _ = resolver;
         let endpoints = vec![PreparedProxyEndpoints::default(); config.proxies.len()];
@@ -276,6 +302,7 @@ impl PreparedCore {
             .then(|| Arc::new(TunTrafficStats::default()));
         Ok(Self {
             config,
+            provider_cache: std::sync::Mutex::new(provider_cache),
             endpoints,
             limits,
             rules,
@@ -335,6 +362,7 @@ impl PreparedCore {
         self.traffic_stats.clone()
     }
 
+    #[cfg(test)]
     fn dns_redir_host_entries(&self) -> usize {
         if self.has_tun() && self.rules.uses_domain_routing() {
             self.limits.dns_redir_host_entries
@@ -353,93 +381,7 @@ impl PreparedCore {
             .then(|| Arc::new(self.config.sniffer.clone()))
     }
 
-    fn build_dispatcher(&self, dialer: Dialer) -> io::Result<BuiltRuntimeParts> {
-        let dialer = dialer
-            .with_ipv6(self.config.ipv6)
-            .with_fresh_initialization();
-        let handshake_stats = RuntimeResourceStats::new("runtime_handshake_observation");
-        let proxy_graph = self.build_proxy_graph(dialer.clone())?;
-        let proxy_dispatchers = self.wrap_proxy_dispatchers(
-            proxy_graph.connectors(),
-            &handshake_stats,
-            &proxy_graph.resolution,
-        )?;
-        let direct_raw: Arc<dyn Dispatcher> = Arc::new(DirectOutbound::new(dialer));
-        let direct = observe_handshakes_with_stats(direct_raw, handshake_stats.clone());
-        let proxy_groups = ProxyGroups::with_selections(
-            &self.config.proxy_groups,
-            proxy_dispatchers.clone(),
-            direct.clone(),
-            &proxy_graph.selections,
-        )
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let route_targets =
-            RouteTargetDispatchers::with_proxy_groups(proxy_dispatchers, &proxy_groups)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let rules = self.rules.clone();
-        let redir_host_entries = self.dns_redir_host_entries();
-        let geo_matcher: Arc<dyn GeoMatcher> = self.geodata_registration.matcher();
-        let mut dns_config = self.config.dns.clone();
-        if !dns_config.enable {
-            dns_config.ipv6 = self.config.ipv6;
-        }
-        let dns = Some(Arc::new(RuntimeDns::new_routed_proxies_with_cache_limits(
-            &dns_config,
-            route_targets.clone(),
-            direct.clone(),
-            rules.clone(),
-            geo_matcher.clone(),
-            self.limits.dns_address_cache_entries,
-            redir_host_entries,
-        )));
-        proxy_graph.resolution.bind_runtime(dns.as_ref())?;
-        let geodata_dispatcher: Arc<dyn Dispatcher> = Arc::new(RoutingDispatcher::new_with_ipv6(
-            route_targets.clone(),
-            direct.clone(),
-            dns.clone(),
-            self.config.ipv6,
-            rules.clone(),
-            geo_matcher.clone(),
-        ));
-        let router: Arc<dyn Dispatcher> = Arc::new(
-            RoutingDispatcher::new_with_ipv6(
-                route_targets,
-                direct,
-                dns.clone(),
-                self.config.ipv6,
-                rules,
-                geo_matcher,
-            )
-            .with_tun_config(&self.config.tun),
-        );
-        let session_stats = RuntimeResourceStats::new("runtime_session_observation");
-        Ok(BuiltRuntimeParts {
-            dispatcher: observe_sessions_with_stats(router, session_stats),
-            dns,
-            geodata_updater: {
-                let report = self.geodata_registration.initial_report();
-                let required = report.geosite.required || report.geoip.required;
-                self.config
-                    .geodata_update
-                    .as_ref()
-                    .filter(|_| required)
-                    .map(|update| {
-                        GeoDataUpdateService::new(
-                            self.geodata_manager.clone(),
-                            geodata_dispatcher,
-                            self.geodata_registration.updater_lease(),
-                            update.urls.clone(),
-                            self.config.global_ua.clone(),
-                            self.config.etag_support,
-                            update.auto_update && update.interval_hours > 0,
-                        )
-                    })
-            },
-            proxy_groups,
-            proxy_graph,
-        })
-    }
-
+    #[cfg(test)]
     fn build_proxy_graph(&self, dialer: Dialer) -> io::Result<BuiltProxyGraph> {
         build_proxy_graph(
             &self.config.proxies,
@@ -451,22 +393,42 @@ impl PreparedCore {
         )
     }
 
-    fn wrap_proxy_dispatchers(
-        &self,
-        connectors: &[Arc<dyn OutboundConnector>],
-        handshake_stats: &RuntimeResourceStats,
-        resolution: &ResolutionContext,
-    ) -> io::Result<Vec<Arc<dyn Dispatcher>>> {
-        let mut dispatchers = Vec::with_capacity(connectors.len());
-        for (proxy, connector) in self.config.proxies.iter().zip(connectors) {
-            let mut dispatcher: Arc<dyn Dispatcher> = Arc::new(
-                ConnectorDispatcher::with_udp_capability(connector.clone(), proxy.udp)
-                    .with_resolution(resolution.clone()),
-            );
-            dispatcher = observe_handshakes_with_stats(dispatcher, handshake_stats.clone());
-            dispatchers.push(dispatcher);
+    fn build_dispatcher(&self, dialer: Dialer) -> io::Result<BuiltRuntimeParts> {
+        let mut parts = GraphBuilder {
+            config: self.config.clone(),
+            endpoints: self.endpoints.clone(),
+            limits: self.limits,
+            rules: self.rules.clone(),
+            geo_matcher: self.geodata_registration.matcher(),
+            previous_dns: None,
         }
-        Ok(dispatchers)
+        .build(dialer.clone())?;
+        if let Some(cache) = self.provider_cache.lock().unwrap().take() {
+            let resources = ProviderRuntime::new(cache, self, &parts, dialer);
+            parts.dispatcher = resources.clone();
+            parts.resources = Some(resources);
+        }
+        let report = self.geodata_registration.initial_report();
+        if let Some(update) = self.config.geodata_update.as_ref().filter(|_| {
+            report.geosite.required
+                || report.geoip.required
+                || self
+                    .config
+                    .providers
+                    .as_ref()
+                    .is_some_and(|providers| !providers.rules.is_empty())
+        }) {
+            parts.geodata_updater = Some(GeoDataUpdateService::new(
+                self.geodata_manager.clone(),
+                parts.dispatcher.clone(),
+                self.geodata_registration.updater_lease(),
+                update.urls.clone(),
+                self.config.global_ua.clone(),
+                self.config.etag_support,
+                update.auto_update && update.interval_hours > 0,
+            ));
+        }
+        Ok(parts)
     }
 
     async fn bind_controller(
@@ -508,9 +470,16 @@ impl PreparedCore {
             geodata_updater,
             proxy_groups,
             proxy_graph,
+            resources,
             ..
         } = self.build_dispatcher(dialer)?;
-        let controller = self.bind_controller(None, proxy_groups).await?;
+        let control = resources.as_ref().map(|resources| {
+            resources.clone() as Arc<dyn crate::resource::control::RuntimeResources>
+        });
+        let controller = self
+            .bind_controller(None, proxy_groups)
+            .await?
+            .map(|controller| controller.with_resources(control));
         RunningCore::start_components(
             &self.config.inbounds,
             dispatcher,
@@ -520,6 +489,7 @@ impl PreparedCore {
             geodata_updater,
             self.geodata_registration,
             proxy_graph,
+            resources,
         )
         .await
     }
@@ -590,14 +560,20 @@ impl PreparedCore {
             geodata_updater,
             proxy_groups,
             proxy_graph,
+            resources,
+            ..
         } = self.build_dispatcher(dialer)?;
         let sniffer = self.domain_sniffer_config();
         let traffic_stats = self
             .traffic_stats()
             .unwrap_or_else(|| Arc::new(TunTrafficStats::default()));
+        let control = resources.as_ref().map(|resources| {
+            resources.clone() as Arc<dyn crate::resource::control::RuntimeResources>
+        });
         let controller = self
             .bind_controller(Some(traffic_stats.clone()), proxy_groups)
-            .await?;
+            .await?
+            .map(|controller| controller.with_resources(control.clone()));
         let tun_runtime = TunRuntime::new_with_stats(
             tun,
             self.limits,
@@ -608,7 +584,8 @@ impl PreparedCore {
             true,
             sniffer,
             traffic_stats.clone(),
-        )?;
+        )?
+        .with_resources(control);
         RunningCore::start_components(
             &self.config.inbounds,
             dispatcher,
@@ -618,8 +595,119 @@ impl PreparedCore {
             geodata_updater,
             self.geodata_registration,
             proxy_graph,
+            resources,
         )
         .await
+    }
+}
+
+struct GraphBuilder {
+    config: Config,
+    endpoints: Vec<PreparedProxyEndpoints>,
+    limits: ResourceLimits,
+    rules: RuleSet,
+    geo_matcher: Arc<dyn GeoMatcher>,
+    previous_dns: Option<Arc<RuntimeDns>>,
+}
+impl GraphBuilder {
+    fn build(&self, dialer: Dialer) -> io::Result<BuiltRuntimeParts> {
+        let dialer = dialer
+            .with_ipv6(self.config.ipv6)
+            .with_fresh_initialization();
+        let handshake_stats = RuntimeResourceStats::new("runtime_handshake_observation");
+        let proxy_graph = self.build_proxy_graph(dialer.clone())?;
+        let proxy_dispatchers = self.wrap_proxy_dispatchers(
+            proxy_graph.connectors(),
+            &handshake_stats,
+            &proxy_graph.resolution,
+        )?;
+        let direct_raw: Arc<dyn Dispatcher> = Arc::new(DirectOutbound::new(dialer));
+        let direct = observe_handshakes_with_stats(direct_raw, handshake_stats.clone());
+        let proxy_groups = ProxyGroups::with_selections(
+            &self.config.proxy_groups,
+            proxy_dispatchers.clone(),
+            direct.clone(),
+            &proxy_graph.selections,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let route_targets =
+            RouteTargetDispatchers::with_proxy_groups(proxy_dispatchers, &proxy_groups)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let rules = self.rules.clone();
+        let redir_host_entries = if self.config.tun.enable && self.rules.uses_domain_routing() {
+            self.limits.dns_redir_host_entries
+        } else {
+            0
+        };
+        let geo_matcher = self.geo_matcher.clone();
+        let mut dns_config = self.config.dns.clone();
+        if !dns_config.enable {
+            dns_config.ipv6 = self.config.ipv6;
+        }
+        let dns = Some(Arc::new(
+            RuntimeDns::new_routed_proxies_with_cache_limits(
+                &dns_config,
+                route_targets.clone(),
+                direct.clone(),
+                rules.clone(),
+                geo_matcher.clone(),
+                self.limits.dns_address_cache_entries,
+                redir_host_entries,
+            )
+            .with_mapping_from(self.previous_dns.as_deref()),
+        ));
+        proxy_graph.resolution.bind_runtime(dns.as_ref())?;
+        let router: Arc<dyn Dispatcher> = Arc::new(
+            RoutingDispatcher::new_with_ipv6(
+                route_targets.clone(),
+                direct.clone(),
+                dns.clone(),
+                self.config.ipv6,
+                rules,
+                geo_matcher,
+            )
+            .with_tun_config(&self.config.tun),
+        );
+        let session_stats = RuntimeResourceStats::new("runtime_session_observation");
+        Ok(BuiltRuntimeParts {
+            dispatcher: observe_sessions_with_stats(router, session_stats),
+            dns,
+            geodata_updater: None,
+            proxy_groups,
+            proxy_graph: Arc::new(proxy_graph),
+            resources: None,
+            resource_targets: route_targets,
+            direct,
+        })
+    }
+
+    fn build_proxy_graph(&self, dialer: Dialer) -> io::Result<BuiltProxyGraph> {
+        build_proxy_graph(
+            &self.config.proxies,
+            &self.config.proxy_groups,
+            &self.endpoints,
+            self.limits,
+            dialer,
+            ResolutionContext::runtime(self.config.ipv6),
+        )
+    }
+
+    fn wrap_proxy_dispatchers(
+        &self,
+        connectors: &[Arc<dyn OutboundConnector>],
+        handshake_stats: &RuntimeResourceStats,
+        resolution: &ResolutionContext,
+    ) -> io::Result<Vec<Arc<dyn Dispatcher>>> {
+        let mut dispatchers = Vec::with_capacity(connectors.len());
+        for (proxy, connector) in self.config.proxies.iter().zip(connectors) {
+            let mut dispatcher: Arc<dyn Dispatcher> = Arc::new(
+                ConnectorDispatcher::with_udp_capability(connector.clone(), proxy.udp)
+                    .with_resolution(resolution.clone()),
+            );
+            dispatcher = observe_handshakes_with_stats(dispatcher, handshake_stats.clone());
+            dispatchers.push(dispatcher);
+        }
+        Ok(dispatchers)
     }
 }
 
@@ -676,7 +764,7 @@ impl PreparedMeasurement {
         let session_stats = RuntimeResourceStats::new("measurement_session_observation");
         Ok(MeasurementRuntime {
             dispatcher: observe_sessions_with_stats(dispatcher, session_stats),
-            proxy_graph,
+            proxy_graph: Arc::new(proxy_graph),
         })
     }
 }
@@ -771,10 +859,10 @@ fn build_proxy_graph(
                         ProxyGroupMemberTarget::Reject => SelectUpstreamMember::Reject,
                     })
                     .collect();
-                let group = Arc::new(SelectUpstream::new(
-                    graph.selections[id.index()].clone(),
-                    members,
-                ));
+                let group = Arc::new(
+                    SelectUpstream::new(graph.selections[id.index()].clone(), members)
+                        .with_udp_disabled(config.disable_udp),
+                );
                 group_nodes[id.index()] = Some(group.clone());
                 graph.lifecycle_order.push(BuiltRouteTarget::Group(group));
                 continue;
@@ -1219,7 +1307,8 @@ pub(crate) struct RunningCore {
     cancellation: CancellationToken,
     tasks: Vec<JoinHandle<io::Result<()>>>,
     traffic_stats: Option<Arc<TunTrafficStats>>,
-    proxy_graph: BuiltProxyGraph,
+    proxy_graph: Arc<BuiltProxyGraph>,
+    resources: Option<Arc<ProviderRuntime>>,
     _geodata_registration: GeoDataRegistration,
 }
 
@@ -1246,7 +1335,8 @@ impl RunningCore {
         controller: Option<RuntimeController>,
         geodata_updater: Option<GeoDataUpdateService>,
         geodata_registration: GeoDataRegistration,
-        proxy_graph: BuiltProxyGraph,
+        proxy_graph: Arc<BuiltProxyGraph>,
+        resources: Option<Arc<ProviderRuntime>>,
     ) -> io::Result<Self> {
         let cancellation = CancellationToken::new();
         let mut tasks = Vec::with_capacity(
@@ -1326,7 +1416,13 @@ impl RunningCore {
             ));
         }
 
+        if let Some(resources) = &resources {
+            tasks.push(crate::resources::observation::spawn(
+                resources.clone().run(cancellation.clone()),
+            ));
+        }
         Ok(Self {
+            resources,
             cancellation,
             tasks,
             traffic_stats,
@@ -1353,6 +1449,9 @@ impl RunningCore {
             completed = wait_first_task(&mut self.tasks), if !self.tasks.is_empty() => (completed, None),
         };
         self.proxy_graph.begin_shutdown();
+        if let Some(resources) = &self.resources {
+            resources.begin_shutdown();
+        }
         let result = stop_components(
             &self.cancellation,
             &mut self.tasks,
@@ -1360,6 +1459,9 @@ impl RunningCore {
         )
         .await;
         self.proxy_graph.shutdown().await;
+        if let Some(resources) = &self.resources {
+            resources.shutdown().await;
+        }
         result
     }
 }
@@ -1407,6 +1509,9 @@ fn component_completion_error(result: Result<io::Result<()>, tokio::task::JoinEr
 impl Drop for RunningCore {
     fn drop(&mut self) {
         self.proxy_graph.begin_shutdown();
+        if let Some(resources) = &self.resources {
+            resources.begin_shutdown();
+        }
         self.cancellation.cancel();
         for task in &self.tasks {
             task.abort();

@@ -495,6 +495,30 @@ impl GeoDataManager {
         Ok(reload_report(registration.as_ref()))
     }
 
+    pub(crate) fn replace_requirements(
+        &self,
+        lease: &GeoDataRegistrationLease,
+        requirements: GeoRequirements,
+        cancellation: &CancellationToken,
+    ) -> Result<(), GeoDataManagerError> {
+        let mut registration = lock(&self.registration);
+        let entry = registration
+            .as_mut()
+            .filter(|entry| lease.matches(entry))
+            .ok_or(GeoDataManagerError::RegistrationActive)?;
+        if entry.requirements == requirements {
+            return Ok(());
+        }
+        check_cancellation(cancellation)?;
+        entry.unload();
+        entry.drain(cancellation)?;
+        entry.requirements = requirements;
+        let (snapshot, report) = load_snapshot(&self.store_dir, &entry.requirements);
+        check_cancellation(cancellation)?;
+        entry.publish(snapshot, report);
+        Ok(())
+    }
+
     fn refresh_durable_state(
         &self,
         cancellation: &CancellationToken,

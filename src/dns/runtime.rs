@@ -103,7 +103,7 @@ pub struct RuntimeDns {
     opaque_cache: Mutex<OpaqueDnsCache>,
     // Hint lookup and insertion are bounded synchronous work. Keep this
     // shared TUN hot path free of asynchronous mutex scheduling.
-    hints: Option<StdMutex<RedirHostHints>>,
+    hints: Option<Arc<StdMutex<RedirHostHints>>>,
     singleflight: Arc<SingleflightRegistry>,
     tcp_pool: Arc<TcpConnectionPool>,
     next_id: AtomicU16,
@@ -800,6 +800,12 @@ impl fmt::Debug for RuntimeDns {
 }
 
 impl RuntimeDns {
+    pub(crate) fn with_mapping_from(mut self, previous: Option<&Self>) -> Self {
+        if let Some(previous) = previous {
+            self.hints = previous.hints.clone();
+        }
+        self
+    }
     /// Creates a resolver whose upstream traffic uses one preselected
     /// dispatcher and no GeoData matcher. Production runtimes use
     /// [`Self::new_routed`].
@@ -963,8 +969,11 @@ impl RuntimeDns {
             egress,
             cache: Mutex::new(DnsCache::with_max_entries(address_cache_entries)),
             opaque_cache: Mutex::new(OpaqueDnsCache::new()),
-            hints: (redir_host_entries != 0)
-                .then(|| StdMutex::new(RedirHostHints::with_max_entries(redir_host_entries))),
+            hints: (redir_host_entries != 0).then(|| {
+                Arc::new(StdMutex::new(RedirHostHints::with_max_entries(
+                    redir_host_entries,
+                )))
+            }),
             singleflight: SingleflightRegistry::new(resource_stats.clone()),
             tcp_pool: TcpConnectionPool::new(),
             next_id: AtomicU16::new(1),
@@ -3041,6 +3050,9 @@ dns:
         let proxy_dispatchers: Vec<Arc<dyn Dispatcher>> = vec![old.clone(), new.clone()];
         let groups = ProxyGroups::new(
             &[SelectProxyGroupConfig {
+                disable_udp: false,
+                hidden: false,
+                icon: String::new(),
                 name: "group".to_owned(),
                 members: vec![
                     ProxyGroupMemberConfig {

@@ -440,6 +440,7 @@ pub trait OutboundConnector: Send + Sync {
 pub struct SelectUpstream {
     selection: Arc<AtomicUsize>,
     members: Box<[SelectUpstreamMember]>,
+    disable_udp: bool,
 }
 
 pub(crate) enum SelectUpstreamMember {
@@ -454,6 +455,25 @@ impl SelectUpstream {
         Self {
             selection,
             members: members.into_boxed_slice(),
+            disable_udp: false,
+        }
+    }
+
+    pub(crate) fn with_udp_disabled(mut self, disabled: bool) -> Self {
+        self.disable_udp = disabled;
+        self
+    }
+    fn check_udp(&self, context: &EstablishContext) -> Result<(), DispatchError> {
+        let mut group = self;
+        loop {
+            if group.disable_udp {
+                return Err(DispatchError::NotAllowed);
+            }
+            match group.members.get(context.selected_member(&group.selection)) {
+                Some(SelectUpstreamMember::Group(next)) => group = next,
+                Some(_) => return Ok(()),
+                None => return Err(DispatchError::NotAllowed),
+            }
         }
     }
 
@@ -602,6 +622,9 @@ impl UpstreamPath {
         request: DatagramRequest,
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        if let Self::Group { group, .. } = self {
+            group.check_udp(context)?;
+        }
         match self.resolve(context)? {
             ResolvedUpstream::Direct(_, dialer) | ResolvedUpstream::LazyDirect(dialer) => {
                 let direct = DirectOutbound::new(dialer.clone());
