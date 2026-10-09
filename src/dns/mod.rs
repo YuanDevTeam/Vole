@@ -6,6 +6,7 @@
 //! activity is observed rather than rejected by a fixed local admission cap.
 
 pub(crate) mod fake_ip;
+mod fallback;
 pub(crate) mod hosts;
 mod https;
 pub(crate) mod policy;

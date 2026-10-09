@@ -1,6 +1,8 @@
 //! Strict parsing for the current Vole YAML configuration.
 mod fake_ip;
+mod fallback;
 pub use fake_ip::{FakeIpConfig, FakeIpFilterMode, FakeIpRange};
+pub use fallback::DnsFallbackConfig;
 mod http_proxy;
 mod ip_version;
 pub use http_proxy::HttpOutboundConfig;
@@ -248,6 +250,7 @@ impl SnifferConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsConfig {
     pub fake_ip: FakeIpConfig,
+    pub fallback: DnsFallbackConfig,
     pub enable: bool,
     pub ipv6: bool,
     pub nameservers: Vec<DnsNameserver>,
@@ -1171,6 +1174,12 @@ enum RawSnifferPort {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDnsConfig {
+    #[serde(default)]
+    fallback: Vec<String>,
+    #[serde(rename = "fallback-filter", default)]
+    fallback_filter: fallback::RawFallbackFilter,
+    #[serde(rename = "fallback-lazy-query", default)]
+    fallback_lazy_query: bool,
     #[serde(rename = "fake-ip-range", default = "fake_ip::default_fake_range")]
     fake_ip_range: String,
     #[serde(rename = "fake-ip-range6", default)]

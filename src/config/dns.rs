@@ -62,7 +62,11 @@ impl RawDnsConfig {
         {
             return invalid("default-nameserver requires literal IP addresses");
         }
+        let fallback = self
+            .fallback_filter
+            .normalize(parse(self.fallback, main_route)?, self.fallback_lazy_query)?;
         Ok(DnsConfig {
+            fallback,
             fake_ip,
             enable: self.enable,
             ipv6: self.ipv6,

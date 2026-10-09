@@ -17,6 +17,8 @@ cargo test --locked --all-features --lib resource::http::tests::
 cargo test --locked --all-features --lib outbound::http::tests::
 cargo test --locked --all-features --lib platform::linux_network::tests::
 cargo test --locked --all-features --lib fake_ip_
+cargo test --locked --all-features --lib dns::fallback::tests::
+cargo test --locked --all-features --lib dns::runtime::tests::dns_fallback_
 cargo test --manifest-path crates/vole-netstack/Cargo.toml --all-targets
 uv run --project scripts --locked python -m unittest discover -s scripts/tests
 uv run --project scripts --locked ruff check scripts

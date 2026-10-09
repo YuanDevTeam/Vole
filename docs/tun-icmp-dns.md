@@ -127,6 +127,22 @@ Policy 只决定当前 DNS exchange，不改写后续业务动作。分类、属
 Regex selector 记录与业务规则共用 `regex::bytes::Regex`；其搜索缓存由正则库管理，
 可能分配 scratch 或发生缓存竞争，不承诺 DNS policy 正则搜索零分配。
 
+## Fallback
+
+`fallback` 只作用于主 resolver 的 A/AAAA。先应用 nameserver-policy；命中的 policy
+独立查询自己的上游，不再进入 fallback。否则，`fallback-filter.domain` 的 Clash 通配或
+`geosite` 命中时直接查询 fallback，不启动主组。
+
+其余查询先取主组结果。主组失败、没有地址，或任一地址命中 `ipcidr` / GeoIP 条件时
+使用 fallback 的结果。`geoip` 默认 true、`geoip-code` 默认 CN：非本地且不属于该分类的
+地址触发 fallback；私有、回环、链路本地、多播和未指定地址不触发 GeoIP 条件，
+但仍可被显式 `ipcidr` 匹配。GeoData 与业务规则共用快照；缺失分类不当作反选全匹配。
+
+`fallback-lazy-query` 默认 false，两组并发查询，主组结果可接受时立即返回并取消剩余尝试；
+true 只在确定需要时发起 fallback。fallback 返回后不再次套用过滤条件。
+选定的最终结果进入主 resolver 缓存，fake-IP 回答和 hosts 不触发上游查询。
+bootstrap、单独配置的节点/直连 resolver，以及非地址 qtype 不使用这组 fallback。
+
 ## Wire 校验
 
 - DNS message 最大 4,096 字节。
@@ -176,7 +192,7 @@ A/AAAA 缓存最多 256 项，从空容量按需增长。TUN 域名提示存储�
 - UDP 尝试只打开一个传输；首次发送后 1 秒无合法响应时，在同一传输和 ID 上最多重发一次。
 - 前两次 peer/ID/question 不匹配只丢当前响应，第三次使当前尝试失败。
 - 当前策略最多同时发起 4 个上游尝试；优先返回有效响应并取消其余尝试。超时、I/O、格式错误、SERVFAIL、REFUSED 或 REJECT 不作为成功结果。
-- NXDOMAIN 和 NODATA 是终态。
+- 未启用 fallback 或命中 nameserver-policy 时，NXDOMAIN 和 NODATA 是终态。
 - 验证来源、ID 和 question 后，UDP TC 在原期限内改用同一 endpoint 的 TCP。TCP TC 仍是失败响应。
 - 全部上游失败时生成 SERVFAIL；非法 UDP 查询只丢当前数据报。
 
@@ -226,7 +242,7 @@ Running Session上下文仅弱引用本 session 的 RuntimeDns；业务 IP-only 
 
 - 真实 ICMP 转发、ICMP error、Traceroute、ICMP 选路规则或 ICMP 测速；
 - DoQ、DoH HTTP/2/3、显式 system/DHCP nameserver；
-- DNS fallback group、动态 hosts: lan；
+- 动态 hosts: lan；
 - 用户可配置的缓存容量、超时、重试或并发度；
 - 使用 DNS question 执行业务规则，或用 DNS 出口改写后续业务动作。
 

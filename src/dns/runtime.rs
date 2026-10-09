@@ -92,6 +92,8 @@ pub struct RuntimeDns {
     ipv6: bool,
     nameservers: Box<[DnsNameserver]>,
     hosts: super::hosts::Hosts,
+    fallback: crate::config::DnsFallbackConfig,
+    fallback_filter: super::fallback::Filter,
     fake_config: crate::config::FakeIpConfig,
     fake_filter: super::fake_ip::Filter,
     fake_pools: Option<Arc<super::fake_ip::FakePools>>,
@@ -948,6 +950,7 @@ impl RuntimeDns {
     ) -> Self {
         let mut bootstrap_config = config.clone();
         bootstrap_config.enable = true;
+        bootstrap_config.fallback = crate::config::DnsFallbackConfig::default();
         bootstrap_config.nameservers = config.default_nameservers.clone();
         bootstrap_config.nameserver_policies.clear();
         let bootstrap = Arc::new(Self::assemble_leaf(
@@ -968,6 +971,7 @@ impl RuntimeDns {
         let role = |nameservers: &[DnsNameserver], policies: &[DnsNameserverPolicy]| {
             let mut role_config = config.clone();
             role_config.nameservers = nameservers.to_vec();
+            role_config.fallback = crate::config::DnsFallbackConfig::default();
             role_config.nameserver_policies = policies.to_vec();
             let mut resolver =
                 Self::assemble_leaf(&role_config, egress.clone(), geo.clone(), cache, 0);
@@ -1006,6 +1010,8 @@ impl RuntimeDns {
                 config.use_hosts,
                 config.use_system_hosts,
             ),
+            fallback: config.fallback.clone(),
+            fallback_filter: super::fallback::Filter::new(&config.fallback),
             fake_config: config.fake_ip.clone(),
             fake_filter: super::fake_ip::Filter::new(&config.fake_ip),
             fake_pools: None,
@@ -1031,25 +1037,40 @@ impl RuntimeDns {
         }
     }
 
-    fn nameservers_for(&self, query: &ClassifiedDnsQuery) -> &[DnsNameserver] {
-        if self.nameserver_policies.is_empty() {
-            return &self.nameservers;
-        }
+    fn policy_for(&self, query: &ClassifiedDnsQuery) -> Option<&[DnsNameserver]> {
         let snapshot = self.geo_matcher.routing_snapshot();
-        let geo_matcher = snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref());
-        if let Some(policy_index) =
-            self.policy_index
-                .select(&query.question.name, &self.nameserver_policies, geo_matcher)
-        {
-            tracing::debug!(
-                policy_index,
-                query_type = query.question.query_type,
-                event = "runtime_dns_nameserver_policy_match",
-                "runtime DNS selected a nameserver policy"
-            );
-            return &self.nameserver_policies[policy_index].nameservers;
-        }
-        &self.nameservers
+        let geo = snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref());
+        self.policy_index
+            .select(&query.question.name, &self.nameserver_policies, geo)
+            .map(|index| self.nameserver_policies[index].nameservers.as_ref())
+    }
+
+    fn nameservers_for(&self, query: &ClassifiedDnsQuery) -> &[DnsNameserver] {
+        self.policy_for(query).unwrap_or(&self.nameservers)
+    }
+
+    fn fallback_domain(&self, host: &str) -> bool {
+        let snapshot = self.geo_matcher.routing_snapshot();
+        self.fallback_filter.domain(
+            host,
+            snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref()),
+        )
+    }
+
+    fn accepts_primary(&self, result: &Result<(Vec<u8>, DnsMessage), RuntimeDnsError>) -> bool {
+        let Ok((_, response)) = result else {
+            return false;
+        };
+        let Ok(answers) = matching_answer_set(response) else {
+            return false;
+        };
+        let snapshot = self.geo_matcher.routing_snapshot();
+        let geo = snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref());
+        !answers.addresses.is_empty()
+            && answers
+                .addresses
+                .iter()
+                .all(|ip| !self.fallback_filter.address(*ip, geo))
     }
 
     fn egress_for(
@@ -1430,15 +1451,44 @@ impl RuntimeDns {
         let upstream_query = rewrite_query_id(query, self.next_upstream_id());
         let upstream_parsed_query =
             parse_query(&upstream_query).map_err(RuntimeDnsError::InvalidQuery)?;
-        let nameservers = self.nameservers_for(classified);
-        let (mut response, parsed_response) = self
-            .exchange_upstreams(
-                nameservers,
+        let (mut response, parsed_response) = if let Some(policy) = self.policy_for(classified) {
+            self.exchange_upstreams(policy, &upstream_query, &upstream_parsed_query, deadline)
+                .await?
+        } else if self.fallback.nameservers.is_empty() {
+            self.exchange_upstreams(
+                &self.nameservers,
                 &upstream_query,
                 &upstream_parsed_query,
                 deadline,
             )
-            .await?;
+            .await?
+        } else if self.fallback_domain(&classified.question.name) {
+            self.exchange_upstreams(
+                &self.fallback.nameservers,
+                &upstream_query,
+                &upstream_parsed_query,
+                deadline,
+            )
+            .await?
+        } else {
+            super::fallback::choose(
+                self.exchange_upstreams(
+                    &self.nameservers,
+                    &upstream_query,
+                    &upstream_parsed_query,
+                    deadline,
+                ),
+                self.exchange_upstreams(
+                    &self.fallback.nameservers,
+                    &upstream_query,
+                    &upstream_parsed_query,
+                    deadline,
+                ),
+                self.fallback.lazy,
+                |answer| self.accepts_primary(answer),
+            )
+            .await?
+        };
         self.cache_response(&parsed_response).await?;
         restore_response_id(&mut response, 0);
         Ok(response)
@@ -5011,5 +5061,66 @@ dns:
                 .recover_fake_ip("198.18.0.9".parse().unwrap())
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn dns_fallback_obeys_policy_domains_and_answer_filters() {
+        let config = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+dns:
+  enable: true
+  use-system-hosts: false
+  nameserver: [192.0.2.1]
+  fallback: [192.0.2.2]
+  fallback-lazy-query: true
+  fallback-filter:
+    geoip: false
+    ipcidr: [203.0.113.0/24]
+    domain: ['+.fallback.example']
+  nameserver-policy:
+    policy.fallback.example: 192.0.2.3
+"#,
+        )
+        .unwrap();
+        let filtered: IpAddr = "203.0.113.10".parse().unwrap();
+        let accepted: IpAddr = "192.0.2.30".parse().unwrap();
+        for (host, answers, endpoints, expected) in [
+            (
+                "ordinary.example",
+                vec![filtered, accepted],
+                vec![1, 2],
+                accepted,
+            ),
+            ("only.fallback.example", vec![accepted], vec![2], accepted),
+            ("policy.fallback.example", vec![filtered], vec![3], filtered),
+            ("accepted.example", vec![accepted], vec![1], accepted),
+        ] {
+            let dispatcher = Arc::new(MockDispatcher::with_replies(
+                answers
+                    .into_iter()
+                    .map(|ip| MockReply::Response(ResponseSpec::answer(ip)))
+                    .collect(),
+                vec![],
+            ));
+            let resolver = RuntimeDns::new(&config.dns, dispatcher.clone());
+            assert_eq!(resolver.resolve(host).await.unwrap(), [expected]);
+            assert_eq!(
+                *dispatcher.udp_destinations.lock().unwrap(),
+                endpoints
+                    .into_iter()
+                    .map(|last| Destination::Ip(SocketAddr::from(([192, 0, 2, last], 53))))
+                    .collect::<Vec<_>>()
+            );
+        }
+        // Empty successful answers also trigger fallback.
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            vec![
+                MockReply::Response(ResponseSpec::rcode(RCODE_NXDOMAIN)),
+                MockReply::Response(ResponseSpec::answer(accepted)),
+            ],
+            vec![],
+        ));
+        let resolver = RuntimeDns::new(&config.dns, dispatcher);
+        assert_eq!(resolver.resolve("empty.example").await.unwrap(), [accepted]);
     }
 }

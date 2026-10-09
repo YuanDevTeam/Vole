@@ -467,7 +467,22 @@ impl GeoRequirements {
                 }
             }));
         }
+        if config.dns.enable && !config.dns.fallback.nameservers.is_empty() {
+            policies.extend(config.dns.fallback.domains.iter().cloned().map(|selector| {
+                DnsNameserverPolicy {
+                    selector,
+                    nameservers: Box::new([]),
+                }
+            }));
+        }
         let mut result = Self::collect(&config.rules, &policies)?;
+        if config.dns.enable
+            && !config.dns.fallback.nameservers.is_empty()
+            && let Some(code) = &config.dns.fallback.geoip
+            && code != "lan"
+        {
+            result.ips.insert(GeoDataKind::GeoIp, code)?;
+        }
         if config.dns.enable && config.dns.fake_ip.enabled {
             result.extend(&Self::collect(&config.dns.fake_ip.rules, &[])?)?;
         }
