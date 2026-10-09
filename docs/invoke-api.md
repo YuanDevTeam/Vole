@@ -90,7 +90,7 @@ stopped -> preparing -> prepared -> starting -> running
 - `validateConfig` 是可并发的纯校验方法，不要求或执行 `initialize`。
 - `measureDelay` 使用独立批次和私有工作器，不进入公共实例表。
 - 公开生命周期为 `initialize -> createInstance -> start(configYaml) -> stop -> destroyInstance`。`preparing`、`prepared` 和 `starting` 是 `start` 内部阶段，没有公共 `prepare` 方法。
-- 不支持配置热重载；切换配置需要 `stop -> start(新 configYaml)`。唯一的运行期路由变更是通过 Controller 修改静态 `select` 组的当前选择，它不修改启动配置。
+- 不支持配置整体热重载；切换配置需要 `stop -> start(新 configYaml)`。运行期间可更新 providers、自动选择健康成员或通过 Controller 切组；这些操作不修改启动 YAML，既有连接保留原资源和路径。
 - `stop` 在 stopped 状态幂等；`destroyInstance` 是最终同步清理屏障。
 
 ## 方法
@@ -212,7 +212,7 @@ TUN 资源参数来自 YAML 的 `tun`，平台包格式由内核选择。
 
 - 读取当时可用的本地 GeoData，不启动或等待下载。
 - 准备阶段只构建并校验代理图；实际建立物理首跳时，通过运行时节点 resolver 解析服务器及独立 VLESS 下载端点。未选中的备用节点不会因 DNS 故障阻塞启动。仅经代理访问的域名交给下一跳；系统解析仅用于 DNS 关闭的配置。
-- 校验每个静态 `select` 组的初始选择；省略 `default-selected` 时使用第一项，显式值必须是直接成员。启动时创建本次 session 的可变选择状态。
+- 按当前资源构建代理组。`profile.store-selected` 开启时优先恢复仍有效的缓存选择，否则使用有效的 `default-selected` 或首成员；动态空组使用 `empty-fallback`。自动组随后依据健康探测选择成员。
 - 含 TUN 的配置从内部 preparing 阶段起持有运行时本地的 TUN/protect 租约，直到停止或销毁。Android 必须在 `start` 前注册 protect controller。
 - 所有监听器和关键数据面成功后才进入 running。准备、资源获取或启动失败均清理本次临时资源并回到 stopped；重试需要再次提交完整 `configYaml`。
 - GeoData 更新只在启动后按需后台运行，不属于启动关键路径。
@@ -391,7 +391,7 @@ ProtectFd(fd) -> bool
 
 配置 `external-controller` 后，运行时可提供回环 `GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}`。代理组 Controller 可以在非 TUN 的 `mixed-port` 配置中运行；此时 `/traffic` 不存在。只要 Controller 管理代理组，`secret` 就必填并保护全部路由。
 
-组成员列表是配置期固定的，选择只存于当前 Running Session。成功切换只影响之后新建的物理 TCP、UDP 和 DNS transport，不迁移既有连接、UDP association、DNS 状态或 TCP pool，也不触发 failover。已认证 Hysteria2 会话的后续逻辑流和跳端口 socket 保留初始上游选择；新的认证会话才读取新选择。Controller 查询不携带 `instanceId`，不进入 Invoke 命令锁；完整语义见 [Controller API](controller-api.md)。
+静态成员来自配置，动态成员随 provider 成功更新；显式选择按 `profile.store-selected` 保存。成功切换只影响之后新建的物理 TCP、UDP 和 DNS transport，不迁移既有连接、UDP association、DNS 状态或 TCP pool。自动组根据健康状态处理后续连接的选择与恢复；select 的连接失败按原样返回。已认证 Hysteria2 会话的后续逻辑流和跳端口 socket 保留初始上游选择；新的认证会话才读取新选择。Controller 查询不携带 `instanceId`，不进入 Invoke 命令锁；完整语义见 [Controller API](controller-api.md)。
 
 ## Windows 安装包桥接
 

@@ -25,7 +25,7 @@ GEOIP,[!]<code>,<target>[,no-resolve]
 ```
 
 - 规则类型和 `code` 不区分 ASCII 大小写，route target 名称大小写敏感并精确匹配。
-- `target` 只能是 `DIRECT`、`REJECT`、实际代理节点名或静态 `select` 组名。
+- `target` 可以是 `DIRECT`、`REJECT`、当前资源中的代理节点或已支持的代理组。
 - 基础 `code` 必须匹配 `[A-Za-z0-9][A-Za-z0-9._+!-]{0,63}`，按 ASCII 大小写折叠后定位。
 - `GEOSITE` 恰好三段；`GEOIP` 只允许可选且大小写敏感的 `no-resolve`。
 - `GEOSITE,cn@ads@cn,DIRECT` 只保留同时存在 `ads` 和 `cn` 属性 key 的记录，多个属性为 AND。
