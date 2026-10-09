@@ -177,6 +177,7 @@ impl ProxyDispatchers {
                 .cloned()
                 .map(|dispatcher| ResolvedProxyGroupLeaf {
                     chain: Vec::new(),
+                    selections: Vec::new(),
                     dispatcher,
                     direct: false,
                 })
@@ -748,11 +749,12 @@ impl RoutingDispatcher {
             session.sniffed_domain = None;
             match decision.action {
                 RuleAction::Route(_) => {
-                    resolved_target
-                        .expect("route target was resolved before dispatch")
-                        .dispatcher
-                        .connect_tcp(session)
-                        .await
+                    let target = resolved_target
+                        .as_ref()
+                        .expect("route target was resolved before dispatch");
+                    let result = target.dispatcher.connect_tcp(session).await;
+                    target.report(&result);
+                    result
                 }
                 RuleAction::Direct => self.direct.connect_tcp(session).await,
                 RuleAction::Reject => Err(DispatchError::NotAllowed),
@@ -1940,6 +1942,58 @@ rules: ["MATCH,pool"]
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn routed_group_failures_notify_each_selected_group() {
+        struct Failed;
+        #[async_trait]
+        impl Dispatcher for Failed {
+            async fn connect_tcp(&self, _: StreamSession) -> Result<BoxStream, DispatchError> {
+                Err(DispatchError::HostUnreachable)
+            }
+            async fn open_datagram(
+                &self,
+                _: DatagramSession,
+            ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+                Err(DispatchError::NetworkUnreachable)
+            }
+        }
+        let config = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxies: [{name: edge, type: socks5, server: 192.0.2.1, port: 1080}]
+proxy-groups:
+  - {name: inner, type: fallback, proxies: [edge], max-failed-times: 2}
+  - {name: outer, type: fallback, proxies: [inner], max-failed-times: 2}
+rules: ["MATCH,outer"]
+"#,
+        )
+        .unwrap();
+        let nodes: Vec<Arc<dyn Dispatcher>> = vec![Arc::new(Failed)];
+        let direct = Arc::new(RecordingDispatcher::default());
+        let groups = ProxyGroups::new(&config.proxy_groups, nodes.clone(), direct.clone()).unwrap();
+        let router = RoutingDispatcher::new(
+            ProxyDispatchers::with_proxy_groups(nodes, &groups).unwrap(),
+            direct,
+            None,
+            RuleSet::compile(config.rules).unwrap(),
+            Arc::new(EmptyGeoMatcher),
+        );
+        for attempt in 0..2 {
+            let result = router
+                .connect_tcp(StreamSession {
+                    inbound: InboundKind::Socks5,
+                    source: "192.0.2.2:5555".parse().unwrap(),
+                    destination: Destination::Ip("198.51.100.1:443".parse().unwrap()),
+                    sniffed_domain: None,
+                })
+                .await;
+            assert!(matches!(result, Err(DispatchError::HostUnreachable)));
+            for index in 0..2 {
+                assert_eq!(groups.selection(index).take_urgent(), attempt == 1);
+            }
+        }
     }
 
     #[tokio::test]

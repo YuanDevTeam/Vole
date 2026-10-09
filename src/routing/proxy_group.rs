@@ -61,8 +61,19 @@ struct ProxyGroupMember {
 
 pub(crate) struct ResolvedProxyGroupLeaf {
     pub(crate) chain: Vec<String>,
+    pub(crate) selections: Vec<Arc<GroupSelection>>,
     pub(crate) dispatcher: Arc<dyn Dispatcher>,
     pub(crate) direct: bool,
+}
+
+impl ResolvedProxyGroupLeaf {
+    pub(crate) fn report(&self, result: &Result<BoxStream, DispatchError>) {
+        if !self.direct && !matches!(result, Err(DispatchError::NotAllowed)) {
+            for selection in &self.selections {
+                selection.outcome(result.is_ok());
+            }
+        }
+    }
 }
 
 /// Immutable select-group graph with one atomically replaceable member index
@@ -249,11 +260,13 @@ impl ProxyGroups {
         destination: Option<&crate::session::Destination>,
     ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
         let mut chain = Vec::new();
+        let mut selections = Vec::new();
         for _ in 0..=self.groups.len() {
             let group = self.groups.get(group_id.index()).ok_or_else(|| {
                 DispatchError::Other(format!("unknown proxy group id {}", group_id.index()))
             })?;
             chain.push(group.name.clone());
+            selections.push(group.selected.clone());
             if udp && group.disable_udp {
                 return Err(DispatchError::NotAllowed);
             }
@@ -274,6 +287,7 @@ impl ProxyGroups {
                         .cloned()
                         .map(|dispatcher| ResolvedProxyGroupLeaf {
                             chain,
+                            selections,
                             dispatcher,
                             direct: false,
                         })
@@ -287,6 +301,7 @@ impl ProxyGroups {
                     chain.reverse();
                     return Ok(ResolvedProxyGroupLeaf {
                         chain,
+                        selections,
                         dispatcher: self.direct.clone(),
                         direct: true,
                     });
@@ -296,6 +311,7 @@ impl ProxyGroups {
                     chain.reverse();
                     return Ok(ResolvedProxyGroupLeaf {
                         chain,
+                        selections,
                         dispatcher: self.reject.clone(),
                         direct: false,
                     });
@@ -420,11 +436,7 @@ impl Dispatcher for SelectProxyGroupDispatcher {
             Some(&session.destination),
         )?;
         let result = leaf.dispatcher.connect_tcp(session).await;
-        if !leaf.direct && !matches!(result, Err(DispatchError::NotAllowed)) {
-            self.groups.groups[self.id.index()]
-                .selected
-                .outcome(result.is_ok());
-        }
+        leaf.report(&result);
         result
     }
 

@@ -367,7 +367,7 @@
     },
     {
       "id": "config-bytes",
-      "value": 262144,
+      "value": 8388608,
       "unit": "bytes",
       "owner": "config::MAX_CONFIG_BYTES",
       "saturation": "reject oversized YAML",
