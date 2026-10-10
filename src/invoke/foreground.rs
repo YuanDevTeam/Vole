@@ -634,6 +634,7 @@ fn public_numeric_field(name: &str) -> bool {
             "_peak",
             "_count",
             "_dropped",
+            "_drops",
             "_bytes",
             "_capacity",
             "_limit",
@@ -945,5 +946,58 @@ mod tests {
         fmt::Write::write_str(&mut line, &"😀".repeat(200)).unwrap();
         assert!(line.len <= LOG_BYTES);
         assert!(!line.as_str().is_empty());
+    }
+
+    #[test]
+    fn stderr_events_preserve_drop_counts_and_filter_private_values() {
+        struct Capture(Arc<Mutex<String>>);
+        impl Subscriber for Capture {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut line = LogLine::new();
+                event.record(&mut NumericFields(&mut line));
+                self.0.lock().unwrap().push_str(line.as_str());
+            }
+        }
+        let rendered = Arc::new(Mutex::new(String::new()));
+        tracing::subscriber::with_default(Capture(rendered.clone()), || {
+            tracing::info!(
+                packet_queue_drops = 1_u64,
+                udp_queue_drops = 2_u64,
+                udp_association_queue_drops = 3_u64,
+                udp_response_queue_drops = 4_u64,
+                dns_queue_drops = 5_u64,
+                udp_drops = 6_u64,
+                mtu = 1500_u64,
+                destination = "private destination",
+                uuid = 123_u64,
+                password_bytes = "private credential",
+                "private message"
+            );
+        });
+        let rendered = rendered.lock().unwrap();
+        for (field, count) in [
+            ("packet_queue_drops", 1),
+            ("udp_queue_drops", 2),
+            ("udp_association_queue_drops", 3),
+            ("udp_response_queue_drops", 4),
+            ("dns_queue_drops", 5),
+            ("udp_drops", 6),
+        ] {
+            assert!(rendered.contains(&format!(" {field}={count}")));
+        }
+        assert!(rendered.contains(" mtu=1500"));
+        for private in ["private", "destination", "uuid", "password", "message"] {
+            assert!(!rendered.contains(private));
+        }
     }
 }
