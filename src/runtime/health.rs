@@ -68,6 +68,7 @@ struct Job {
     provider: Option<String>,
 }
 pub(super) struct HealthRuntime {
+    security: SecurityContext,
     jobs: Mutex<Vec<Job>>,
     samples: Mutex<BTreeMap<(String, String), Sample>>,
     manual_samples: Mutex<BTreeMap<String, Sample>>,
@@ -90,6 +91,7 @@ impl HealthRuntime {
         direct: Arc<dyn Dispatcher>,
         activity: Vec<Arc<Activity>>,
         dns: Option<Arc<RuntimeDns>>,
+        security: SecurityContext,
     ) -> Arc<Self> {
         let mut jobs = Vec::new();
         for (i, group) in config.proxy_groups.iter().enumerate() {
@@ -144,6 +146,7 @@ impl HealthRuntime {
             .zip(activity)
             .collect();
         Arc::new(Self {
+            security,
             jobs: Mutex::new(jobs),
             samples: Mutex::new(BTreeMap::new()),
             manual_samples: Mutex::new(BTreeMap::new()),
@@ -264,6 +267,7 @@ impl HealthRuntime {
                 self.unified,
                 &request.expected,
                 cancel,
+                &self.security,
             )
             .await
             .map_err(|error| match error.kind() {
@@ -556,7 +560,15 @@ mod tests {
         });
         let groups = ProxyGroups::new(&config.proxy_groups, vec![], direct.clone()).unwrap();
         let targets = RouteTargetDispatchers::with_proxy_groups(vec![], &groups).unwrap();
-        let runtime = HealthRuntime::new(&config, groups, targets, direct.clone(), vec![], None);
+        let runtime = HealthRuntime::new(
+            &config,
+            groups,
+            targets,
+            direct.clone(),
+            vec![],
+            None,
+            SecurityContext::new(),
+        );
         let cancel = CancellationToken::new();
         for index in 0..8 {
             let request = DelayRequest {

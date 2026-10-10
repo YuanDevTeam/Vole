@@ -224,14 +224,14 @@ struct TcpPoolSnapshot {
 }
 
 impl TcpConnectionPool {
-    fn new() -> Arc<Self> {
+    fn new(security: crate::security::SecurityContext) -> Arc<Self> {
         let max_idle = TCP_POOL_MAX_IDLE;
         let max_idle_per_key = TCP_POOL_MAX_IDLE_PER_KEY;
         let mut stats = TcpPoolStats::default();
         stats.idle_limit = max_idle;
         stats.idle_per_key_limit = max_idle_per_key;
         Arc::new(Self {
-            security: crate::security::SecurityContext::new(),
+            security,
             state: Mutex::new(TcpPoolState::default()),
             max_idle,
             max_idle_per_key,
@@ -970,6 +970,7 @@ impl RuntimeDns {
         config: &DnsConfig,
         dispatcher: Arc<dyn Dispatcher>,
         bootstrap: super::resolution::ResolutionContext,
+        security: crate::security::SecurityContext,
     ) -> Self {
         let mut resolver = Self::assemble_leaf(
             config,
@@ -978,6 +979,7 @@ impl RuntimeDns {
             config.cache_max_size,
             0,
             Arc::new(RwLock::new(0)),
+            security,
         );
         resolver.node_bootstrap = Some(bootstrap);
         // No idle background reaper belongs to this private node resolver.
@@ -1006,6 +1008,7 @@ impl RuntimeDns {
             geo_matcher,
             config.cache_max_size,
             MAX_REDIR_HOST_ENTRIES,
+            crate::security::SecurityContext::new(),
         )
     }
 
@@ -1061,6 +1064,29 @@ impl RuntimeDns {
         address_cache_entries: usize,
         redir_host_entries: usize,
     ) -> Self {
+        Self::new_routed_proxies_with_cache_limits_and_security(
+            config,
+            proxies,
+            direct,
+            rules,
+            geo_matcher,
+            address_cache_entries,
+            redir_host_entries,
+            crate::security::SecurityContext::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_routed_proxies_with_cache_limits_and_security(
+        config: &DnsConfig,
+        proxies: ProxyDispatchers,
+        direct: Arc<dyn Dispatcher>,
+        rules: RuleSet,
+        geo_matcher: Arc<dyn GeoMatcher>,
+        address_cache_entries: usize,
+        redir_host_entries: usize,
+        security: crate::security::SecurityContext,
+    ) -> Self {
         debug_assert!(address_cache_entries != 0);
         Self::assemble(
             config,
@@ -1072,6 +1098,7 @@ impl RuntimeDns {
             geo_matcher,
             address_cache_entries,
             redir_host_entries,
+            security,
         )
     }
 
@@ -1081,6 +1108,7 @@ impl RuntimeDns {
         geo: Arc<dyn GeoMatcher>,
         cache: usize,
         hints: usize,
+        security: crate::security::SecurityContext,
     ) -> Self {
         let sources = Arc::new(super::source::NetworkSources::default());
         let cache_epoch = sources.epoch();
@@ -1096,6 +1124,7 @@ impl RuntimeDns {
             cache,
             0,
             cache_epoch.clone(),
+            security.clone(),
         ));
         let mut root = Self::assemble_leaf(
             config,
@@ -1104,6 +1133,7 @@ impl RuntimeDns {
             cache,
             hints,
             cache_epoch.clone(),
+            security.clone(),
         );
         root.bootstrap = Some(bootstrap.clone());
         if config.enable && config.fake_ip.enabled {
@@ -1124,6 +1154,7 @@ impl RuntimeDns {
                 cache,
                 0,
                 cache_epoch.clone(),
+                security.clone(),
             );
             resolver.bootstrap = Some(bootstrap.clone());
             Arc::new(resolver)
@@ -1154,6 +1185,7 @@ impl RuntimeDns {
         address_cache_entries: usize,
         redir_host_entries: usize,
         cache_epoch: Arc<RwLock<u64>>,
+        security: crate::security::SecurityContext,
     ) -> Self {
         let resource_stats = RuntimeResourceStats::new("runtime_dns");
         Self {
@@ -1193,7 +1225,7 @@ impl RuntimeDns {
                 )))
             }),
             singleflight: SingleflightRegistry::new(resource_stats.clone()),
-            tcp_pool: TcpConnectionPool::new(),
+            tcp_pool: TcpConnectionPool::new(security),
             next_id: AtomicU16::new(1),
             resource_stats,
         }
@@ -3199,6 +3231,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn all_dns_roles_share_the_session_trust_store() {
+        let mut config = config(false, vec![nameserver(1, DnsTransport::Tls)]);
+        config.default_nameservers = vec![nameserver(2, DnsTransport::Tls)];
+        config.proxy_nameservers = vec![nameserver(3, DnsTransport::Https)];
+        config.direct_nameservers = vec![nameserver(4, DnsTransport::Https)];
+        let security = crate::security::SecurityContext::new();
+        let resolver = RuntimeDns::assemble(
+            &config,
+            DnsEgress::Single(Arc::new(MockDispatcher::default())),
+            Arc::new(EmptyGeoMatcher),
+            config.cache_max_size,
+            0,
+            security.clone(),
+        );
+        for role in [
+            &resolver,
+            resolver.bootstrap.as_deref().unwrap(),
+            resolver.proxy_resolver.as_deref().unwrap(),
+            resolver.direct_resolver.as_deref().unwrap(),
+        ] {
+            assert!(security.shares_roots_with(&role.tcp_pool.security));
+        }
+    }
+
     fn response_for_query(query: &[u8], spec: &ResponseSpec) -> Vec<u8> {
         classify_query(query).unwrap();
         let mut response = query.to_vec();
@@ -4899,6 +4956,7 @@ dns:
             Arc::new(EmptyGeoMatcher),
             MAX_CACHE_ENTRIES,
             0,
+            crate::security::SecurityContext::new(),
         );
 
         assert!(resolver.hints.is_none());
@@ -5338,6 +5396,7 @@ dns:
             Arc::new(EmptyGeoMatcher),
             MAX_CACHE_ENTRIES,
             MAX_REDIR_HOST_ENTRIES,
+            crate::security::SecurityContext::new(),
         ));
 
         let mut tasks = Vec::with_capacity(CLIENTS);
@@ -6332,6 +6391,7 @@ dns:
             Arc::new(EmptyGeoMatcher),
             MAX_CACHE_ENTRIES,
             MAX_REDIR_HOST_ENTRIES,
+            crate::security::SecurityContext::new(),
         ));
         let observed_at = TokioInstant::now();
         let permit = resolver.begin_query();
@@ -6361,6 +6421,7 @@ dns:
             Arc::new(EmptyGeoMatcher),
             MAX_CACHE_ENTRIES,
             MAX_REDIR_HOST_ENTRIES,
+            crate::security::SecurityContext::new(),
         ));
         let query = build_query(92, "retained.example", QueryType::A).unwrap();
 

@@ -4,13 +4,14 @@ use crate::{Result, VoleError};
 
 use super::{ProxyConfig, ProxyId, RawOutbound, RouteTargetId, normalize_proxy_graph};
 
-/// Strict node-only configuration accepted by the built-in latency runner.
+/// Strict node graph and client trust accepted by the built-in latency runner.
 ///
 /// A measurement never owns an inbound, routing rules, DNS, sniffer state, or
 /// GeoData. Keeping a separate deserializer makes those fields unknown rather
 /// than silently ignoring runtime-only behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MeasureConfig {
+    pub(crate) tls: super::TlsTrustConfig,
     pub(crate) proxies: Vec<ProxyConfig>,
     pub(crate) default_proxy: ProxyId,
 }
@@ -18,6 +19,8 @@ pub(crate) struct MeasureConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMeasureConfig {
+    #[serde(default)]
+    tls: super::TlsTrustConfig,
     proxies: Vec<RawOutbound>,
 }
 
@@ -94,6 +97,7 @@ impl RawMeasureConfig {
         }
 
         Ok(MeasureConfig {
+            tls: self.tls,
             proxies,
             default_proxy,
         })
@@ -176,6 +180,27 @@ proxies:
                 "{extra} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn measurement_accepts_client_trust_without_accepting_tls_server_settings() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let certificate = rcgen::generate_simple_self_signed(vec!["measure.example".into()])
+            .unwrap()
+            .cert;
+        let yaml = format!(
+            "tls:\n  custom-certifactes:\n    - |\n      -----BEGIN CERTIFICATE-----\n      {}\n      -----END CERTIFICATE-----\n{NODE}",
+            STANDARD.encode(certificate.der())
+        );
+        let config = MeasureConfig::parse_yaml(yaml.as_bytes()).unwrap();
+        assert_eq!(config.tls.certificates.len(), 1);
+        assert_eq!(config.proxies.len(), 1);
+        assert!(
+            MeasureConfig::parse_yaml(
+                format!("tls: {{ certificate: cert.pem }}\n{NODE}").as_bytes()
+            )
+            .is_err()
+        );
     }
 
     #[test]

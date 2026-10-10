@@ -109,7 +109,7 @@ dns:
 ### Endpoint
 
 - `dns.enable`、`dns.ipv6` 默认 false。主 nameserver 默认使用 DoH/DoT，可显式替换为非空列表。
-- 接受裸 IPv4/IPv6、`udp://`、`tcp://`、`tls://`、`https://` 和 `http://`。加密连接复用共享 TLS 证书验证。DoH 采用 HTTP/1.1 POST。
+- 接受裸 IPv4/IPv6、`udp://`、`tcp://`、`tls://`、`https://` 和 `http://`。加密连接复用会话的内置、可读系统与 `tls.custom-certifactes` 信任根；各解析角色及 WireGuard 私有 DNS 同样适用，平台边界见 [TLS 契约](tls-client-fingerprint.md)。DoH 采用 HTTP/1.1 POST。
 - `rcode://success`、`rcode://format_error`、`rcode://server_failure`、`rcode://name_error`、`rcode://not_implemented`、`rcode://refused` 分别返回本地 RCODE 0–5；可用于 nameserver、policy、fallback、节点和直连 resolver，不能用于 default-nameserver。
 - 同一个上游列表中存在本地 RCODE 时使用第一项本地响应，不建立网络连接，也不把 SERVFAIL/REFUSED 当作上游故障重试。响应保留原查询的 flags 和 additional，仅设置 QR 与 RCODE；不额外开启 RA，不写入结果缓存。
 - `dns.ipv6: false` 不限制 IPv6 nameserver；顶层 `ipv6: false` 会阻止通过 DIRECT（含 `RULES` 选中 DIRECT）的 IPv6 nameserver 在本机物理建链，并继续当前组的故障转移。

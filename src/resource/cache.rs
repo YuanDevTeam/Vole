@@ -200,6 +200,7 @@ impl ProviderCache {
         dispatcher: Arc<dyn Dispatcher>,
         user_agent: String,
         etag_support: bool,
+        security: crate::security::SecurityContext,
         cancellation: CancellationToken,
     ) -> io::Result<Option<Candidate>> {
         let entry = &mut self.entries[index];
@@ -236,6 +237,7 @@ impl ProviderCache {
             }
             let temporary = temporary_path(&path);
             let outcome = http::download(DownloadRequest {
+                security,
                 dispatcher,
                 url: entry.spec.url.clone(),
                 etag: etag_support.then(|| entry.metadata.etag.clone()).flatten(),

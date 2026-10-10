@@ -64,6 +64,7 @@ struct Refresh {
     reply: oneshot::Sender<Result<(), &'static str>>,
 }
 pub(super) struct ProviderRuntime {
+    security: SecurityContext,
     store: crate::resource::profile::SelectionStore,
     persistence_error: RwLock<Option<&'static str>>,
     current: ArcSwap<Generation>,
@@ -101,6 +102,7 @@ impl ProviderRuntime {
         );
         store.restore(&parts.proxy_groups);
         Arc::new(Self {
+            security: prepared.security.clone(),
             store,
             persistence_error: RwLock::new(None),
             current: ArcSwap::from_pointee(Generation::from_parts(
@@ -277,6 +279,7 @@ impl ProviderRuntime {
                 dispatcher,
                 user_agent,
                 etag,
+                self.security.clone(),
                 self.cancellation.clone(),
             )
             .await;
@@ -298,6 +301,7 @@ impl ProviderRuntime {
             .store_dir()
             .parent()
             .map(std::path::Path::to_path_buf);
+        let security = self.security.clone();
         let expression_cancellation = self.cancellation.clone();
         let prepared = tokio::task::spawn_blocking(
             move || -> io::Result<(Config, BuiltRuntimeParts, GeoRequirements)> {
@@ -311,6 +315,7 @@ impl ProviderRuntime {
                 let rules = RuleSet::compile_config(&mut config).map_err(io::Error::other)?;
                 let endpoints = vec![PreparedProxyEndpoints::default(); config.proxies.len()];
                 let parts = GraphBuilder {
+                    security,
                     connections,
                     config: config.clone(),
                     endpoints,

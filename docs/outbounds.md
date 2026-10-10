@@ -202,7 +202,7 @@ pacer；这是混淆不是认证，错误密钥由 QUIC 拒绝，短包有界丢
 固定 QUIC/TLS 1.3，复用官方 Quinn、rustls/ring 与共享受控数据报适配器。
 仅 v5；必填标准 UUID。password 为原样 UTF-8，省略/空串为空密码，最长 65,535 字节。
 SNI 缺省 server，ALPN 缺省 h3；显式空列表拒绝，非空有序列表必须实际协商命中。
-使用共享 pin/skip/独立验证名；无命名 TCP 指纹、mTLS、ECH、0-RTT 或跨节点恢复。
+使用共享 pin/skip/独立验证名，支持配对内联 PEM 或文件路径的 certificate/private-key 客户端身份；无命名 TCP 指纹、ECH、0-RTT 或跨节点恢复。
 拥塞使用官方 Quinn cubic（默认）、new_reno 或 bbr，不承诺与其他实现的吞吐相同。
 `log-level: debug` 在物理会话建立后记录实际 controller 的固定算法标签；
 标签不包含节点、凭据或业务目标，配置验证和复用同一会话不重复记录。

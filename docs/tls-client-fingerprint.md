@@ -46,7 +46,7 @@ client-fingerprint: chrome
 - 命名指纹的标准 TLS，以及所有 REALITY/JLS，使用自有 boring fork；开发及 PR/发布的来源规则见 [TLS 依赖](tls-dependencies.md)。
 - 普通 TLS 两条路径共用同一个 WebPKI 证书验证器和发布信任根；叶 pin、非叶信任锚、
   独立验证名、skip 优先级不变。TLS 握手签名仍由各自后端强制验证。
-- HTTP、SOCKS5、AnyTLS、Trojan、VMess、VLESS 与 Hysteria2 的 mTLS 使用配对内联 PEM 或文件路径，
+- HTTP、SOCKS5、AnyTLS、Trojan、VMess、VLESS、Hysteria2 与 TUIC v5 的 mTLS 使用配对内联 PEM 或文件路径，
   配置校验与资源生成时读取文件并检查密钥匹配；客户端证书不增加服务端信任根，profile 不修改身份。
 - REALITY 仅允许自身临时证书认证，不能混用 pin/skip/mTLS 或降级到普通站点证书。
 - [JLS](vless.md#jls) 使用共享凭据身份和完整原生 TLS1.3，不启用恢复或 PKI 回退；profile 不改变身份。
@@ -56,6 +56,27 @@ client-fingerprint: chrome
 未初始化的普通 `validateConfig` 和直接 Rust `Config::parse_yaml` 使用当前工作目录，绝对路径原样使用。
 每个资源生成过程读取的身份文件合计最多 8 MiB，只接受普通 UTF-8 PEM 文件；错误不回显路径或内容。
 载入后的身份不可变，不在 TLS 连接时读取或自动监测文件变化。
+
+## 客户端信任根
+
+`tls.custom-certifactes` 使用 Mihomo 的真实字段拼写，接受证书内容字符串数组，
+不读取路径，也不增加 `custom-certificates` 别名。内容在配置校验时解码，非法证书
+使 Vole 校验失败；与 Mihomo 对非法条目发警告后继续的行为不同。未知 TLS 字段
+继续拒绝，服务端证书与认证不属于此客户端信任对象。
+
+启动时读取可用系统根，合并内置 WebPKI 和自定义根，构造一份会话共享的不可变根库。
+普通/指纹 TLS、QUIC、DNS 各角色、WireGuard 私有 DNS、Provider/GeoData 下载及
+健康探测都使用该根库。资源更新复用它，不重读系统根；新启动才能取得新的系统信任。
+独立 `measureDelay` 配置也接受该客户端对象，节点与最终 HTTPS 探测共享其工作器根库。
+纯校验只解析显式证书内容，不读取系统证书存储。客户端身份不增加服务端根。
+
+系统读取使用官方 rustls-native-certs：macOS 读取可导出的信任设置，Windows 读取
+Current User ROOT，Linux 发现 CA 文件/目录。SSL_CERT_FILE/SSL_CERT_DIR 可按该库
+规则覆盖来源，读取失败保留基础根和有效自定义根，不关闭验证或转为明文。
+导出根后的证书验证仍为 WebPKI，不承诺 native verifier 的全部信任、撤销与策略行为。
+Android、iOS 和 tvOS 在此库的 Unix 发现分支中，不能完整读取平台系统/用户信任；
+这些平台保留内置与自定义根，实际可读文件仅补充来源，不宣称完整系统信任等价。
+Windows UWP/AppContainer 的真实根读取仍需独立设备验证；交叉编译不构成签收。
 
 ## 四模板边界
 

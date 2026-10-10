@@ -204,7 +204,7 @@ async fn measure_one(
     let runtime = prepared
         .into_runtime(Dialer::default())
         .map_err(InvokeFailure::from)?;
-    let result = run_probe(target, runtime.dispatcher(), timeout).await;
+    let result = run_probe(target, runtime.dispatcher(), timeout, runtime.security()).await;
     runtime.shutdown().await;
     result
 }
@@ -213,6 +213,7 @@ async fn run_probe(
     target: &Target,
     dispatcher: Arc<dyn Dispatcher>,
     timeout: Duration,
+    security: &crate::security::SecurityContext,
 ) -> Result<u64, InvokeFailure> {
     crate::resource::probe::probe(
         target,
@@ -221,6 +222,7 @@ async fn run_probe(
         false,
         &[],
         &tokio_util::sync::CancellationToken::new(),
+        security,
     )
     .await
     .map_err(InvokeFailure::from)
@@ -439,7 +441,7 @@ mod tests {
         probe_once(
             &Target::parse("http://example.test/path?q=1").unwrap(),
             dispatcher.clone(),
-            None,
+            &crate::security::SecurityContext::new(),
         )
         .await
         .unwrap();

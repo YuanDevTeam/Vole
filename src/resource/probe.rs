@@ -1,11 +1,11 @@
 //! Shared, bounded HTTP(S) health probes through the runtime dispatcher.
+use crate::security::{SecurityContext, StandardTlsClient, TlsClientOptions};
 use crate::{
     dispatch::{BoxStream, DispatchError, Dispatcher},
     inbound::DEFAULT_HEADER_LIMIT,
     outbound::{OutboundDiagnostic, capture_outbound_diagnostic},
     session::{Destination, InboundKind, StreamSession},
 };
-use rustls::{ClientConfig, RootCertStore, client::Resumption, pki_types::ServerName};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -13,7 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,23 +102,10 @@ fn authority(host: &TargetHost, port: u16) -> String {
     }
 }
 
-fn build_tls_connector() -> io::Result<TlsConnector> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let roots: RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
-    let mut config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(io::Error::other)?
-        .with_root_certificates(Arc::new(roots))
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    config.resumption = Resumption::disabled();
-    Ok(TlsConnector::from(Arc::new(config)))
-}
-
 async fn connect(
     target: &Target,
     dispatcher: Arc<dyn Dispatcher>,
-    tls_connector: Option<&TlsConnector>,
+    security: &SecurityContext,
 ) -> io::Result<BoxStream> {
     let session = StreamSession {
         metadata: Default::default(),
@@ -131,9 +117,17 @@ async fn connect(
     let (stream, diagnostic) = capture_outbound_diagnostic(dispatcher.connect_tcp(session)).await;
     let stream = stream.map_err(|error| outbound_connect_error(error, diagnostic.as_ref()))?;
     let stream = if target.scheme == TargetScheme::Https {
-        let connector = tls_connector
-            .ok_or_else(|| io::Error::other("HTTPS probe is missing its TLS connector"))?;
-        connect_target_tls(connector, stream, &target.tls_server_name).await?
+        let client = StandardTlsClient::with_options(
+            security,
+            &target.tls_server_name,
+            TlsClientOptions {
+                alpn: vec![b"http/1.1".to_vec()],
+                ..Default::default()
+            },
+            0,
+            64 * 1024,
+        )?;
+        connect_target_tls(&client, stream).await?
     } else {
         stream
     };
@@ -156,17 +150,13 @@ fn outbound_connect_error(
 }
 
 async fn connect_target_tls(
-    connector: &TlsConnector,
+    connector: &StandardTlsClient,
     stream: BoxStream,
-    server_name: &str,
 ) -> io::Result<BoxStream> {
-    let server_name = ServerName::try_from(server_name.to_owned())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     connector
-        .connect(server_name, stream)
+        .connect(stream)
         .await
-        .map(|stream| Box::new(stream) as BoxStream)
-        .map_err(io::Error::other)
+        .map_err(|_| io::Error::other("probe TLS handshake failed"))
 }
 
 async fn head(stream: &mut BoxStream, target: &Target, keep_alive: bool) -> io::Result<u16> {
@@ -179,9 +169,9 @@ async fn head(stream: &mut BoxStream, target: &Target, keep_alive: bool) -> io::
 pub(crate) async fn probe_once(
     target: &Target,
     dispatcher: Arc<dyn Dispatcher>,
-    tls: Option<&TlsConnector>,
+    security: &SecurityContext,
 ) -> io::Result<()> {
-    let mut stream = connect(target, dispatcher, tls).await?;
+    let mut stream = connect(target, dispatcher, security).await?;
     head(&mut stream, target, false).await.map(drop)
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,8 +187,12 @@ pub(crate) async fn probe(
     unified: bool,
     expected: &[(u16, u16)],
     cancel: &CancellationToken,
+    security: &SecurityContext,
 ) -> io::Result<u64> {
-    let observation = observe(target, dispatcher, timeout, unified, expected, cancel).await?;
+    let observation = observe(
+        target, dispatcher, timeout, unified, expected, cancel, security,
+    )
+    .await?;
     if observation.expected_matches {
         Ok(observation.delay)
     } else {
@@ -213,13 +207,11 @@ pub(crate) async fn observe(
     unified: bool,
     expected: &[(u16, u16)],
     cancel: &CancellationToken,
+    security: &SecurityContext,
 ) -> io::Result<Observation> {
     let operation = async {
-        let tls = (target.scheme == TargetScheme::Https)
-            .then(build_tls_connector)
-            .transpose()?;
         let mut started = Instant::now();
-        let mut stream = connect(target, dispatcher, tls.as_ref()).await?;
+        let mut stream = connect(target, dispatcher, security).await?;
         let mut status = head(&mut stream, target, unified).await?;
         if unified {
             let second = Instant::now();
@@ -353,6 +345,7 @@ mod tests {
             true,
             &[(204, 204)],
             &cancel,
+            &SecurityContext::new(),
         )
         .await
         .unwrap();
@@ -365,7 +358,8 @@ mod tests {
                 Duration::from_secs(1),
                 false,
                 &[],
-                &cancel
+                &cancel,
+                &SecurityContext::new(),
             )
             .await
             .unwrap_err()

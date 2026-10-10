@@ -28,6 +28,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub struct WireGuardOutbound {
+    security: crate::security::SecurityContext,
     config: Arc<WireGuardOutboundConfig>,
     upstream: UpstreamPath,
     current: AsyncMutex<Option<Arc<Engine>>>,
@@ -45,6 +46,13 @@ impl WireGuardOutbound {
         config: &WireGuardOutboundConfig,
         upstream: UpstreamPath,
     ) -> io::Result<Self> {
+        Self::with_shared_security(config, upstream, &crate::security::SecurityContext::new())
+    }
+    pub(crate) fn with_shared_security(
+        config: &WireGuardOutboundConfig,
+        upstream: UpstreamPath,
+        security: &crate::security::SecurityContext,
+    ) -> io::Result<Self> {
         config.validate().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -52,6 +60,7 @@ impl WireGuardOutbound {
             )
         })?;
         Ok(Self {
+            security: security.clone(),
             config: Arc::new(config.clone()),
             upstream,
             current: AsyncMutex::new(None),
@@ -69,7 +78,7 @@ impl WireGuardOutbound {
                 let _admission=self.admission.lock().unwrap();
                 if self.cancel.is_cancelled() {return Err(DispatchError::NotAllowed);}
                 if let Some(old)=current.take() {self.retired.spawn(observation::task(async move {old.stop().await;}));}
-                let engine=Engine::start(self.config.clone(),self.upstream.clone(),context.clone(),self.cancel.child_token())?;
+                let engine=Engine::start(self.config.clone(),self.upstream.clone(),context.clone(),self.cancel.child_token(),self.security.clone())?;
                 // Publish ownership before waiting for network setup or authentication.
                 *current=Some(engine.clone());
                 Ok(engine)

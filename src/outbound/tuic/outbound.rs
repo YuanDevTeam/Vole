@@ -121,6 +121,17 @@ impl TuicOutbound {
                 versions: TlsVersions::Tls13,
                 alpn: config.tls.alpn.clone(),
                 certificate: config.tls.certificate.clone(),
+                identity: config
+                    .tls
+                    .identity
+                    .as_ref()
+                    .map(|identity| {
+                        crate::security::TlsClientIdentity::from_pem(
+                            &identity.certificate,
+                            &identity.private_key,
+                        )
+                    })
+                    .transpose()?,
                 ..Default::default()
             },
             0,

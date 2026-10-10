@@ -12,11 +12,9 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::BytesMut;
-use rustls::{ClientConfig, RootCertStore, client::Resumption, pki_types::ServerName};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
@@ -40,6 +38,7 @@ const MAX_TRAILER_HEADERS: usize = 32;
 const IO_BUFFER_BYTES: usize = 16 * 1024;
 
 pub(crate) struct DownloadRequest {
+    pub security: crate::security::SecurityContext,
     pub dispatcher: Arc<dyn Dispatcher>,
     pub url: String,
     pub etag: Option<String>,
@@ -129,7 +128,9 @@ pub(crate) enum DownloadError {
 /// The successful `Downloaded` result leaves a fully flushed temporary file at
 /// `request.temporary_path`. All other outcomes remove the temporary file.
 pub(crate) async fn download(request: DownloadRequest) -> Result<DownloadOutcome, DownloadError> {
-    let connector = WebPkiHttpsConnector::new()?;
+    let connector = WebPkiHttpsConnector {
+        security: request.security.clone(),
+    };
     download_with_connector(request, &connector).await
 }
 
@@ -143,24 +144,7 @@ trait HttpsConnector: Send + Sync {
 }
 
 struct WebPkiHttpsConnector {
-    connector: TlsConnector,
-}
-
-impl WebPkiHttpsConnector {
-    fn new() -> Result<Self, DownloadError> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let roots: RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
-        let mut config = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|error| DownloadError::TlsSetup(error.to_string()))?
-            .with_root_certificates(Arc::new(roots))
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        config.resumption = Resumption::disabled();
-        Ok(Self {
-            connector: TlsConnector::from(Arc::new(config)),
-        })
-    }
+    security: crate::security::SecurityContext,
 }
 
 #[async_trait]
@@ -170,13 +154,20 @@ impl HttpsConnector for WebPkiHttpsConnector {
         server_name: &str,
         stream: BoxStream,
     ) -> Result<BoxStream, DownloadError> {
-        let server_name = ServerName::try_from(server_name.to_owned())
-            .map_err(|error| DownloadError::TlsSetup(error.to_string()))?;
-        self.connector
-            .connect(server_name, stream)
-            .await
-            .map(|stream| Box::new(stream) as BoxStream)
-            .map_err(|error| DownloadError::TlsHandshake(error.to_string()))
+        crate::security::StandardTlsClient::with_options(
+            &self.security,
+            server_name,
+            crate::security::TlsClientOptions {
+                alpn: vec![b"http/1.1".to_vec()],
+                ..Default::default()
+            },
+            0,
+            64 * 1024,
+        )
+        .map_err(|_| DownloadError::TlsSetup("invalid TLS policy".into()))?
+        .connect(stream)
+        .await
+        .map_err(|_| DownloadError::TlsHandshake("TLS handshake failed".into()))
     }
 }
 
@@ -1203,6 +1194,7 @@ mod tests {
         temporary_path: PathBuf,
     ) -> DownloadRequest {
         DownloadRequest {
+            security: crate::security::SecurityContext::new(),
             dispatcher,
             url: url.to_owned(),
             etag: Some("\"old\"".to_owned()),

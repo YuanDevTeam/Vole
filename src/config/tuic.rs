@@ -65,6 +65,10 @@ pub(super) struct RawTuic {
     fingerprint: Option<String>,
     #[serde(default, deserialize_with = "super::deserialize_present_option")]
     name_cert_verify: Option<String>,
+    #[serde(default, deserialize_with = "super::deserialize_present_option")]
+    certificate: Option<String>,
+    #[serde(default, deserialize_with = "super::deserialize_present_option")]
+    private_key: Option<String>,
     #[serde(default)]
     congestion_controller: TuicCongestion,
     #[serde(default)]
@@ -112,7 +116,7 @@ impl RawTuic {
                     .collect(),
                 tls13_only: true,
                 required_alpn: None,
-                identity: None,
+                identity: super::normalize_client_identity(self.certificate, self.private_key)?,
                 ech: None,
                 client_fingerprint: None,
                 certificate: TlsCertificatePolicy {
@@ -153,11 +157,19 @@ impl TuicOutboundConfig {
         }
         if !self.tls.tls13_only
             || self.tls.ech.is_some()
-            || self.tls.identity.is_some()
             || self.tls.client_fingerprint.is_some()
             || self.tls.required_alpn.is_some()
         {
             return invalid("TUIC requires standard QUIC TLS 1.3");
+        }
+        if let Some(identity) = &self.tls.identity {
+            crate::security::TlsClientIdentity::from_pem(
+                &identity.certificate,
+                &identity.private_key,
+            )
+            .map_err(|_| {
+                crate::VoleError::InvalidConfig("invalid TUIC TLS client identity".into())
+            })?;
         }
         Ok(())
     }

@@ -74,6 +74,7 @@ async fn fetch(cache: &mut ProviderCache, response: Vec<u8>) -> io::Result<Optio
             Arc::new(Responses(Mutex::new([response].into()))),
             "fixture".into(),
             true,
+            crate::security::SecurityContext::new(),
             CancellationToken::new(),
         )
         .await

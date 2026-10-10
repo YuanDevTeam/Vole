@@ -114,6 +114,7 @@ jobs:
           require(not any("watfaq" in (item.get("source") or "").lower() for item in packages), "retired dependency source is forbidden")
           rustls = package("rustls", "0.23.45")
           package("tokio-rustls", "0.26.5")
+          package("rustls-native-certs", "0.8.4")
           package("ring")
           wireguard = package("boringtun", "0.7.1")
           require(wireguard.get("license") == "BSD-3-Clause", "unapproved WireGuard license")

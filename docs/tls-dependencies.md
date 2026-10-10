@@ -6,7 +6,7 @@
 
 | 用途 | 来源与约束 |
 | --- | --- |
-| 普通 TLS、QUIC、WebPKI | 官方 rustls/tokio-rustls，ring provider |
+| 普通 TLS、QUIC、WebPKI | 官方 rustls/tokio-rustls，ring provider；rustls-native-certs 只读取可用平台根，不替换验证器 |
 | 命名 ClientHello、REALITY、JLS、ShadowTLS v3 | YuanDevTeam/boring，release 分支及锁定 revision |
 | SS 2022 | 官方 shadowsocks，仅 `aead-cipher-2022` |
 | Encryption | 同一 boring 的 X25519、ML-KEM、AEAD、AES-CTR；官方 blake3 |

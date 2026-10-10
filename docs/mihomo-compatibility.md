@@ -12,6 +12,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 | DNS | hosts（含启动 LAN 地址快照）、bootstrap/节点/直连解析角色、policy、respect-rules；UDP/TCP/DoH/DoT；fallback；redir-host/fake-IP 与映射持久化 |
 | mixed-port | HTTP/SOCKS5 TCP 与 SOCKS5 UDP；LAN 地址限制、多用户认证、认证跳过网段；allow-lan 不强制认证 |
 | 出站 | HTTP(S) CONNECT、SOCKS5、AnyTLS、Trojan、VMess AEAD、VLESS、Hysteria2、TUIC v5、Shadowsocks 2022、标准 WireGuard 单/多 peer；依赖启用的 Cargo feature |
+| 客户端 TLS | tls.custom-certifactes 证书内容；启动时合并可读系统根、WebPKI 与显式根并跨组件共享；TUIC v5 与其它 TLS 节点复用 cert/private-key 身份加载 |
 | 嗅探 | TUN/mixed TCP 的 HTTP/TLS；TUN UDP 的 QUIC；域名/地址排除、强制条件和目标覆盖 |
 | Linux 自建设备 | auto-detect-interface、auto-route、systemd-resolved DNS 接管；失败和停止时恢复本次修改 |
 | 运行状态 | 连接快照、流量计数和关闭；组与资源状态；规则命中、有效配置、受限 DNS 诊断 |
@@ -19,6 +20,9 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 ## 必须保留的边界
 
 - 业务入口只有 mixed-port 与 TUN；不支持 port、socks-port、listeners、redir/tproxy 或服务端协议配置。
+- tls 仅接受客户端信任根；无效显式证书拒绝配置，Mihomo 会跳过无效项。iOS/tvOS、Android 不保证取得完整系统信任库；
+  所有后端仍使用 WebPKI 校验，未复制 Go 的原生系统验证器。详细范围见 [TLS 契约](tls-client-fingerprint.md)。
+  独立测量 YAML 只接受 proxies 与同名客户端 tls 子集，不接受 TLS 服务端配置。
 - Shadowsocks 只支持三个 2022 cipher；插件仅 strict ShadowTLS v3，UoT 仅 v2。
 - DNS 不提供独立 listen、DoQ、DoH/H3 或 ECS。LRU/ARC 与显式 system/DHCP 上游已支持，
   来源发现和物理绑定的可用平台及参考差异以 DNS 契约为准。

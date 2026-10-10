@@ -58,6 +58,8 @@ mod tuic;
 pub use tuic::{TuicCongestion, TuicOutboundConfig, TuicUdpMode};
 mod jls;
 pub use jls::JlsConfig;
+mod tls_trust;
+pub use tls_trust::TlsTrustConfig;
 mod shadowsocks;
 pub use shadowsocks::{ShadowTlsConfig, ShadowsocksCipher, ShadowsocksOutboundConfig};
 mod trojan;
@@ -97,6 +99,7 @@ pub const GEO_UPDATE_INTERVAL_HOURS: u64 = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    pub tls: TlsTrustConfig,
     pub ipv6: bool,
     pub proxies: Vec<ProxyConfig>,
     pub proxy_groups: Vec<SelectProxyGroupConfig>,
@@ -1040,6 +1043,8 @@ impl std::fmt::Debug for HttpInboundConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVoleConfig {
+    #[serde(default)]
+    tls: TlsTrustConfig,
     #[serde(rename = "bind-address", default)]
     bind_address: Option<String>,
     #[serde(rename = "lan-allowed-ips", default)]
@@ -2161,6 +2166,7 @@ impl RawVoleConfig {
         }
 
         Ok(Config {
+            tls: self.tls,
             ipv6: self.ipv6,
             proxies,
             proxy_groups,

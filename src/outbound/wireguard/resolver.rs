@@ -24,7 +24,7 @@ pub(super) async fn resolve(
         let dns=engine.remote.get_or_init(||{
             let mut config=DnsConfig{enable:true,ipv6:engine.ipv6.is_some()&&resolution.ipv6_allowed(),nameservers:engine.config.dns.clone(),use_hosts:false,use_system_hosts:false,..Default::default()};
             config.hosts.clear();config.default_nameservers.clear();
-            RuntimeDns::new_for_node(&config,Arc::new(NodeDns{engine:Arc::downgrade(engine)}),engine.resolution.clone())
+            RuntimeDns::new_for_node(&config,Arc::new(NodeDns{engine:Arc::downgrade(engine)}),engine.resolution.clone(),engine.security.clone())
         });
         resolution.resolve_node_local(target,deadline,dns,engine.ipv4.is_some(),engine.ipv6.is_some()).await
     }=>result}

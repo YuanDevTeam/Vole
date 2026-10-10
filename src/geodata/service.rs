@@ -32,6 +32,7 @@ const RETRY_BACKOFF: [Duration; 4] = [
 ];
 
 pub(crate) struct GeoDataUpdateService {
+    security: crate::security::SecurityContext,
     manager: Arc<GeoDataManager>,
     dispatcher: Arc<dyn Dispatcher>,
     registration: GeoDataRegistrationLease,
@@ -43,6 +44,7 @@ pub(crate) struct GeoDataUpdateService {
 
 impl GeoDataUpdateService {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         manager: Arc<GeoDataManager>,
         dispatcher: Arc<dyn Dispatcher>,
@@ -51,8 +53,10 @@ impl GeoDataUpdateService {
         user_agent: String,
         etag_support: bool,
         auto_update: bool,
+        security: crate::security::SecurityContext,
     ) -> Self {
         Self {
+            security,
             manager,
             dispatcher,
             registration,
@@ -196,6 +200,7 @@ impl GeoDataUpdateService {
             .then(|| session.request_etag().map(ToOwned::to_owned))
             .flatten();
         let request = DownloadRequest {
+            security: self.security.clone(),
             dispatcher: self.dispatcher.clone(),
             url: source_url,
             etag: etag.clone(),
@@ -432,6 +437,7 @@ mod tests {
             "fixture".into(),
             true,
             true,
+            crate::security::SecurityContext::new(),
         );
         let run = tokio::spawn(service.run(cancellation.clone()));
         tokio::time::timeout(Duration::from_secs(1), async {

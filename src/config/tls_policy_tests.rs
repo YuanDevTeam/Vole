@@ -20,6 +20,7 @@ fn node(protocol: &str) -> serde_json::Value {
             node["tls"] = true.into();
         }
         "socks5" | "http" => node["tls"] = true.into(),
+        "tuic" => node["uuid"] = "00000000-0000-4000-8000-000000000001".into(),
         _ => unreachable!(),
     }
     node
@@ -51,6 +52,7 @@ fn client_identity(config: &Config) -> &TlsIdentityPem {
         ProxyProtocol::Socks5(config) => &config.tls.as_ref().unwrap().identity,
         ProxyProtocol::Http(config) => &config.tls.as_ref().unwrap().identity,
         ProxyProtocol::Hysteria2(config) => &config.tls.identity,
+        ProxyProtocol::Tuic(config) => &config.tls.identity,
         ProxyProtocol::Vless(config) => match &config.security {
             SecurityConfig::Tls(tls) => &tls.identity,
             _ => unreachable!(),
@@ -80,6 +82,8 @@ fn common_tls_identity_files_use_the_configuration_directory_and_inline_validati
         "vless",
         #[cfg(feature = "outbound-hysteria2")]
         "hysteria2",
+        #[cfg(feature = "outbound-tuic")]
+        "tuic",
     ] {
         let mut node = node(protocol);
         node["certificate"] = "./client.crt".into();

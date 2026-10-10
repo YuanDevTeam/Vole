@@ -81,6 +81,7 @@ use crate::outbound::trojan::TrojanOutbound;
 use crate::outbound::{AnyTlsOutbound, server_destination};
 #[cfg(feature = "outbound-vless")]
 use crate::outbound::{VlessOutbound, VlessResourceLimits};
+use crate::security::SecurityContext;
 #[cfg(feature = "outbound-anytls")]
 use crate::security::StandardTlsClient;
 #[cfg(any(
@@ -94,7 +95,7 @@ use crate::security::StandardTlsClient;
     feature = "outbound-tuic",
     feature = "shadow-tls-v3"
 ))]
-use crate::security::{SecurityContext, TLS_RESUMPTION_SESSION_BUDGET};
+use crate::security::TLS_RESUMPTION_SESSION_BUDGET;
 
 mod health;
 mod providers;
@@ -104,6 +105,7 @@ use providers::ProviderRuntime;
 #[derive(Debug)]
 pub(crate) struct PreparedCore {
     config: Config,
+    security: SecurityContext,
     provider_cache: std::sync::Mutex<Option<crate::resource::cache::ProviderCache>>,
     endpoints: Vec<PreparedProxyEndpoints>,
     limits: ResourceLimits,
@@ -127,6 +129,7 @@ pub(crate) struct PreparedCore {
 #[cfg(feature = "invoke")]
 pub(crate) struct PreparedMeasurement {
     config: MeasureConfig,
+    security: SecurityContext,
     endpoints: Vec<PreparedProxyEndpoints>,
     limits: ResourceLimits,
 }
@@ -142,12 +145,16 @@ struct PreparedProxyEndpoints {
 
 #[cfg(feature = "invoke")]
 pub(crate) struct MeasurementRuntime {
+    security: SecurityContext,
     dispatcher: Arc<dyn Dispatcher>,
     proxy_graph: Arc<BuiltProxyGraph>,
 }
 
 #[cfg(feature = "invoke")]
 impl MeasurementRuntime {
+    pub(crate) fn security(&self) -> &SecurityContext {
+        &self.security
+    }
     #[must_use]
     pub(crate) fn dispatcher(&self) -> Arc<dyn Dispatcher> {
         self.dispatcher.clone()
@@ -308,8 +315,13 @@ impl PreparedCore {
             .tun
             .enable
             .then(|| Arc::new(TunTrafficStats::default()));
+        let trust = config.tls.clone();
+        let security = tokio::task::spawn_blocking(move || SecurityContext::load(&trust))
+            .await
+            .map_err(io::Error::other)?;
         Ok(Self {
             config,
+            security,
             provider_cache: std::sync::Mutex::new(provider_cache),
             endpoints,
             limits,
@@ -389,11 +401,13 @@ impl PreparedCore {
             self.limits,
             dialer,
             ResolutionContext::runtime(self.config.ipv6),
+            &self.security,
         )
     }
 
     fn build_dispatcher(&self, dialer: Dialer) -> io::Result<BuiltRuntimeParts> {
         let mut parts = GraphBuilder {
+            security: self.security.clone(),
             connections: Arc::default(),
             config: self.config.clone(),
             endpoints: self.endpoints.clone(),
@@ -432,6 +446,7 @@ impl PreparedCore {
                 self.config.global_ua.clone(),
                 self.config.etag_support,
                 update.auto_update && update.interval_hours > 0,
+                self.security.clone(),
             ));
         }
         Ok(parts)
@@ -633,6 +648,7 @@ impl PreparedCore {
 }
 
 struct GraphBuilder {
+    security: SecurityContext,
     connections: Arc<crate::connections::Registry>,
     config: Config,
     endpoints: Vec<PreparedProxyEndpoints>,
@@ -695,7 +711,7 @@ impl GraphBuilder {
             dns_config.ipv6 = self.config.ipv6;
         }
         let dns = Some(Arc::new(
-            RuntimeDns::new_routed_proxies_with_cache_limits(
+            RuntimeDns::new_routed_proxies_with_cache_limits_and_security(
                 &dns_config,
                 route_targets.clone(),
                 direct.clone(),
@@ -703,6 +719,7 @@ impl GraphBuilder {
                 geo_matcher.clone(),
                 dns_config.cache_max_size,
                 redir_host_entries,
+                self.security.clone(),
             )
             .with_network_sources(
                 dialer.clone(),
@@ -758,6 +775,7 @@ impl GraphBuilder {
             direct.clone(),
             activities,
             dns.clone(),
+            self.security.clone(),
         );
         let diagnostics = self.config.external_controller.as_ref().map(|_| {
             Arc::new(diagnostics::Diagnostics::new(
@@ -805,6 +823,7 @@ impl GraphBuilder {
             self.limits,
             dialer,
             ResolutionContext::runtime(self.config.ipv6),
+            &self.security,
         )
     }
 
@@ -838,8 +857,13 @@ impl PreparedMeasurement {
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let endpoints = prepare_proxy_endpoints(&config.proxies, &[], resolver, true).await?;
+        let trust = config.tls.clone();
+        let security = tokio::task::spawn_blocking(move || SecurityContext::load(&trust))
+            .await
+            .map_err(io::Error::other)?;
         Ok(Self {
             config,
+            security,
             endpoints,
             limits,
         })
@@ -862,6 +886,7 @@ impl PreparedMeasurement {
             self.limits,
             dialer,
             ResolutionContext::measurement(resolver, true),
+            &self.security,
         )?;
         let connector = proxy_graph
             .get(self.config.default_proxy.index())
@@ -879,6 +904,7 @@ impl PreparedMeasurement {
         let dispatcher = observe_handshakes_with_stats(dispatcher, handshake_stats);
         let session_stats = RuntimeResourceStats::new("measurement_session_observation");
         Ok(MeasurementRuntime {
+            security: self.security,
             dispatcher: observe_sessions_with_stats(dispatcher, session_stats),
             proxy_graph: Arc::new(proxy_graph),
         })
@@ -892,6 +918,7 @@ fn build_proxy_graph(
     limits: ResourceLimits,
     dialer: Dialer,
     resolution: ResolutionContext,
+    security: &SecurityContext,
 ) -> io::Result<BuiltProxyGraph> {
     if endpoints.len() != proxies.len() {
         return Err(io::Error::new(
@@ -912,7 +939,7 @@ fn build_proxy_graph(
         feature = "outbound-tuic",
         feature = "shadow-tls-v3"
     ))]
-    let (security_client_count, standard_tls_count) = security_counts(proxies);
+    let (_, standard_tls_count) = security_counts(proxies);
     #[cfg(any(
         feature = "outbound-http",
         feature = "outbound-socks5",
@@ -924,7 +951,7 @@ fn build_proxy_graph(
         feature = "outbound-tuic",
         feature = "shadow-tls-v3"
     ))]
-    let security_context = (security_client_count != 0).then(SecurityContext::new);
+    let security_context = Some(security.clone());
     #[cfg(any(
         feature = "outbound-http",
         feature = "outbound-socks5",
@@ -1011,8 +1038,8 @@ fn build_proxy_graph(
                 #[cfg(feature = "outbound-wireguard")]
                 {
                     Arc::new(
-                        crate::outbound::wireguard::WireGuardOutbound::new_with_path(
-                            config, upstream,
+                        crate::outbound::wireguard::WireGuardOutbound::with_shared_security(
+                            config, upstream, security,
                         )?,
                     )
                 }

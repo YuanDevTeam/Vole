@@ -16,6 +16,8 @@ cargo test --locked --lib config::credentials::tests::
 cargo test --locked --lib dns::hosts::tests::
 cargo test --locked --lib config::name_regex::tests::
 cargo test --locked --lib config::tls_policy_tests::
+cargo test --locked --lib config::tls_trust::tests::
+cargo test --locked --lib security::context::tests::
 cargo test --locked --no-default-features --features cli --test grpc_config --test grpc_pool --test grpc_protocol_pool
 cargo test --locked --no-default-features --features cli --lib grpc_duplex_pool_keeps_response
 cargo test --locked --no-default-features --features cli --test sing_mux_config --test sing_mux

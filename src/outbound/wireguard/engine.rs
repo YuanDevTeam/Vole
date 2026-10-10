@@ -23,6 +23,7 @@ struct PeerSlot {
     current: Mutex<Option<Arc<Channel>>>,
 }
 pub(super) struct Engine {
+    pub security: crate::security::SecurityContext,
     pub cancel: CancellationToken,
     pub tcp: TcpConnector,
     pub registry: Arc<Registry>,
@@ -48,6 +49,7 @@ impl Engine {
         upstream: UpstreamPath,
         context: EstablishContext,
         cancel: CancellationToken,
+        security: crate::security::SecurityContext,
     ) -> Result<Arc<Self>, DispatchError> {
         let ClientNetStackParts {
             packet_sink,
@@ -72,6 +74,7 @@ impl Engine {
             .map(|_| PeerSlot::default())
             .collect();
         let engine = Arc::new(Self {
+            security,
             cancel: cancel.clone(),
             tcp: tcp_connector,
             registry: Arc::new(Registry::default()),

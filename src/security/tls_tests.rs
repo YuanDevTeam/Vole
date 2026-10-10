@@ -237,6 +237,41 @@ async fn named_fingerprint_uses_the_shared_webpki_policy_and_transport_alpn() {
     }
 }
 
+#[tokio::test]
+async fn configured_roots_authenticate_standard_and_named_tls_without_relaxing_names() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let chain = chain(false);
+    let pem = format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        STANDARD.encode(&chain.certificates[2])
+    );
+    let config = crate::config::Config::parse_yaml(
+        &serde_json::to_vec(&serde_json::json!({
+            "tls": {"custom-certifactes": [pem]},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let context = SecurityContext::with_certificates(&config.tls, Vec::new());
+    let server = server(&chain, &TLS13, false);
+    for profile in crate::security::test_profiles() {
+        for (name, expected) in [("fixture.invalid", true), ("different.invalid", false)] {
+            let client = StandardTlsClient::with_options(
+                &context,
+                name,
+                TlsClientOptions {
+                    client_fingerprint: *profile,
+                    ..Default::default()
+                },
+                0,
+                DEFAULT_TLS_BUFFER_LIMIT,
+            )
+            .unwrap();
+            assert_eq!(handshake(&client, server.clone()).await.0, expected);
+        }
+    }
+}
+
 #[cfg(feature = "tls-fingerprint")]
 #[tokio::test]
 async fn named_fingerprint_resumption_is_node_owned_and_disabled_at_zero_budget() {
