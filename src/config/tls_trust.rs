@@ -8,10 +8,11 @@ use serde::Deserialize;
 
 use crate::{Result, VoleError};
 
-/// Client trust only. Certificates are decoded once; resource generations share them.
+/// Top-level TLS options. Decoded client roots and controller identity remain separate.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct TlsTrustConfig {
     pub(crate) certificates: Arc<[CertificateDer<'static>]>,
+    pub(crate) server: super::ControllerTls,
 }
 
 impl std::fmt::Debug for TlsTrustConfig {
@@ -27,6 +28,32 @@ impl std::fmt::Debug for TlsTrustConfig {
 struct RawTrust {
     #[serde(rename = "custom-certifactes", default)]
     certificates: Vec<String>,
+    #[serde(default)]
+    certificate: Arc<str>,
+    #[serde(rename = "private-key", default)]
+    private_key: Arc<str>,
+    #[serde(rename = "client-auth-type", default)]
+    client_auth_type: Arc<str>,
+    #[serde(rename = "client-auth-cert", default)]
+    client_auth_cert: Arc<str>,
+}
+
+#[cfg(feature = "invoke")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientTrust {
+    #[serde(rename = "custom-certifactes", default)]
+    certificates: Vec<String>,
+}
+
+#[cfg(feature = "invoke")]
+pub(super) fn deserialize_client_only<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<TlsTrustConfig, D::Error> {
+    let raw = ClientTrust::deserialize(deserializer)
+        .map_err(|_| serde::de::Error::custom("invalid TLS client trust fields"))?;
+    TlsTrustConfig::parse(raw.certificates)
+        .map_err(|_| serde::de::Error::custom("invalid TLS trust certificate"))
 }
 
 impl<'de> Deserialize<'de> for TlsTrustConfig {
@@ -35,8 +62,15 @@ impl<'de> Deserialize<'de> for TlsTrustConfig {
     ) -> std::result::Result<Self, D::Error> {
         let raw = RawTrust::deserialize(deserializer)
             .map_err(|_| serde::de::Error::custom("invalid TLS trust fields"))?;
-        Self::parse(raw.certificates)
-            .map_err(|_| serde::de::Error::custom("invalid TLS trust certificate"))
+        let mut trust = Self::parse(raw.certificates)
+            .map_err(|_| serde::de::Error::custom("invalid TLS trust certificate"))?;
+        trust.server = super::ControllerTls {
+            certificate: raw.certificate,
+            private_key: raw.private_key,
+            client_auth_type: raw.client_auth_type,
+            client_auth_cert: raw.client_auth_cert,
+        };
+        Ok(trust)
     }
 }
 
@@ -64,6 +98,7 @@ impl TlsTrustConfig {
         certificates.dedup_by(|a, b| a.as_ref() == b.as_ref());
         Ok(Self {
             certificates: certificates.into(),
+            server: super::ControllerTls::default(),
         })
     }
 }
@@ -96,7 +131,6 @@ mod tests {
         for value in [
             "custom-certificates: []",
             "custom-certifactes: [./ca.pem]",
-            "certificate: ca",
             "custom-certifactes: [null]",
         ] {
             assert!(serde_yaml_ng::from_str::<TlsTrustConfig>(value).is_err());

@@ -1,14 +1,21 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
+mod cors;
+mod tls;
+mod transport;
+use transport::{ControllerIo, H1Io};
+
+#[cfg(test)]
+#[path = "controller/tests_secure.rs"]
+mod secure_tests;
+
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    task::JoinSet,
-    time::timeout,
-};
+use tokio::{io::AsyncReadExt, net::TcpListener, task::JoinSet, time::timeout};
 use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+use tokio::{io::AsyncWriteExt, net::TcpStream};
 
 use crate::{
     config::{ExternalControllerConfig, validate_route_target_name},
@@ -21,37 +28,80 @@ const CONTROLLER_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONTROLLER_CONNECTIONS: usize = 8;
 const MAX_CONTROLLER_BODY_BYTES: usize = 1024;
 
-pub(crate) struct RuntimeController {
-    listener: TcpListener,
+#[derive(Clone)]
+struct RequestContext {
     secret: Option<Arc<str>>,
     traffic: Option<Arc<TunTrafficStats>>,
     proxy_groups: Arc<ProxyGroups>,
     resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
+    cors: Arc<cors::Policy>,
+    requests: tokio_util::task::TaskTracker,
+}
+
+pub(crate) struct RuntimeController {
+    listener: Option<TcpListener>,
+    tls_listener: Option<TcpListener>,
+    tls: Option<Arc<tls::ServerTls>>,
+    context: RequestContext,
 }
 
 impl std::fmt::Debug for RuntimeController {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RuntimeController")
-            .field("local_addr", &self.listener.local_addr().ok())
-            .field("authenticated", &self.secret.is_some())
-            .field("has_traffic", &self.traffic.is_some())
+            .field("authenticated", &self.context.secret.is_some())
+            .field("https", &self.tls.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl RuntimeController {
+    #[cfg(test)]
     pub(crate) async fn bind(
         config: &ExternalControllerConfig,
         traffic: Option<Arc<TunTrafficStats>>,
         proxy_groups: Arc<ProxyGroups>,
     ) -> io::Result<Self> {
+        Self::bind_at(config, traffic, proxy_groups, std::path::Path::new(".")).await
+    }
+
+    pub(crate) async fn bind_at(
+        config: &ExternalControllerConfig,
+        traffic: Option<Arc<TunTrafficStats>>,
+        proxy_groups: Arc<ProxyGroups>,
+        root: &std::path::Path,
+    ) -> io::Result<Self> {
+        let listener = config
+            .http_enabled
+            .then(|| bind_controller(config))
+            .transpose()?;
+        let (tls_listener, tls) = if let Some(listen) = config.tls_listen {
+            let tls_options = config.server_tls.clone();
+            let root = root.to_owned();
+            let tls =
+                tokio::task::spawn_blocking(move || tls::ServerTls::load(&tls_options, &root))
+                    .await
+                    .map_err(io::Error::other)??;
+            let listener = bind_controller(&ExternalControllerConfig {
+                listen,
+                ..ExternalControllerConfig::default()
+            })?;
+            (Some(listener), Some(Arc::new(tls)))
+        } else {
+            (None, None)
+        };
         Ok(Self {
-            listener: bind_controller(config)?,
-            secret: config.secret.as_deref().map(Arc::from),
-            traffic,
-            proxy_groups,
-            resources: None,
+            listener,
+            tls_listener,
+            tls,
+            context: RequestContext {
+                secret: config.secret.as_deref().map(Arc::from),
+                traffic,
+                proxy_groups,
+                resources: None,
+                cors: Arc::new(cors::Policy::new(&config.cors)),
+                requests: tokio_util::task::TaskTracker::new(),
+            },
         })
     }
 
@@ -59,60 +109,59 @@ impl RuntimeController {
         mut self,
         resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
     ) -> Self {
-        self.resources = resources;
+        self.context.resources = resources;
         self
     }
 
     #[cfg(test)]
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        self.listener
+            .as_ref()
+            .or(self.tls_listener.as_ref())
+            .expect("controller listener")
+            .local_addr()
     }
 
     pub(crate) async fn serve(self, cancellation: CancellationToken) -> io::Result<()> {
+        let watcher = self
+            .tls
+            .as_ref()
+            .filter(|tls| tls.watches_files())
+            .map(|tls| {
+                let tls = tls.clone();
+                let child = cancellation.clone();
+                tokio::spawn(crate::resources::observation::task(tls.watch(child)))
+            });
         let mut tasks = JoinSet::new();
-        loop {
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => break,
+        let result = loop {
+            tokio::select! { biased;
+                () = cancellation.cancelled() => break Ok(()),
                 joined = tasks.join_next(), if !tasks.is_empty() => {
-                    if let Some(Err(error)) = joined {
-                        tracing::warn!(
-                            cancelled = error.is_cancelled(),
-                            panicked = error.is_panic(),
-                            "controller connection task failed"
-                        );
-                    }
+                    if let Some(Err(error)) = joined { break Err(io::Error::other(error)); }
                 }
-                accepted = self.listener.accept(), if tasks.len() < MAX_CONTROLLER_CONNECTIONS => {
-                    let (stream, _) = accepted?;
-                    let secret = self.secret.clone();
-                    let traffic = self.traffic.clone();
-                    let proxy_groups = self.proxy_groups.clone();
-                    let resources = self.resources.clone();
-                    let child = cancellation.clone();
+                accepted = async { self.listener.as_ref().unwrap().accept().await }, if self.listener.is_some() && tasks.len() < MAX_CONTROLLER_CONNECTIONS => {
+                    let (stream, _) = match accepted { Ok(value) => value, Err(error) => break Err(error) };
+                    let context = self.context.clone(); let child = cancellation.clone();
+                    tasks.spawn(crate::resources::observation::task(async move { let _ = handle_connection(H1Io(stream), context, child).await; }));
+                }
+                accepted = async { self.tls_listener.as_ref().unwrap().accept().await }, if self.tls_listener.is_some() && tasks.len() < MAX_CONTROLLER_CONNECTIONS => {
+                    let (stream, _) = match accepted { Ok(value) => value, Err(error) => break Err(error) };
+                    let tls = self.tls.as_ref().unwrap().clone(); let context = self.context.clone(); let child = cancellation.clone();
                     tasks.spawn(crate::resources::observation::task(async move {
-                        if let Err(error) = handle_connection(
-                            stream,
-                            secret,
-                            traffic,
-                            proxy_groups,
-                            resources,
-                            child,
-                        )
-                        .await
-                        {
-                            tracing::debug!(
-                                error_kind = ?error.kind(),
-                                "controller request failed"
-                            );
-                        }
+                        let _ = transport::serve_tls(stream, tls, context, child).await;
                     }));
                 }
             }
-        }
+        };
+        cancellation.cancel();
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
-        Ok(())
+        self.context.requests.close();
+        self.context.requests.wait().await;
+        if let Some(watcher) = watcher {
+            watcher.await.map_err(io::Error::other)?;
+        }
+        result
     }
 }
 
@@ -151,12 +200,9 @@ fn bind_controller_tcp(address: SocketAddr) -> io::Result<TcpListener> {
     TcpListener::from_std(socket.into())
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
-    secret: Option<Arc<str>>,
-    traffic: Option<Arc<TunTrafficStats>>,
-    proxy_groups: Arc<ProxyGroups>,
-    resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
+async fn handle_connection<S: ControllerIo>(
+    mut stream: S,
+    context: RequestContext,
     cancellation: CancellationToken,
 ) -> io::Result<()> {
     let request = tokio::select! {
@@ -184,6 +230,28 @@ async fn handle_connection(
         },
     };
 
+    handle_request(stream, request, context, cancellation).await
+}
+
+async fn handle_request<S: ControllerIo>(
+    stream: S,
+    request: crate::inbound::http::RequestHead,
+    context: RequestContext,
+    cancellation: CancellationToken,
+) -> io::Result<()> {
+    let RequestContext {
+        secret,
+        traffic,
+        proxy_groups,
+        resources,
+        cors,
+        ..
+    } = context;
+    let outcome = cors.evaluate(&request.method, &request.headers);
+    let mut stream = transport::CorsIo::new(stream, outcome.headers);
+    if outcome.preflight {
+        return write_response(&mut stream, 200, &[], &[]).await;
+    }
     if !authorized(&request.headers, secret.as_deref()) {
         return write_error(
             &mut stream,
@@ -512,8 +580,8 @@ fn parse_delay(target: &str, group: bool) -> Result<crate::resource::control::De
     })
 }
 
-async fn probe_error(
-    stream: &mut TcpStream,
+async fn probe_error<S: ControllerIo>(
+    stream: &mut S,
     error: crate::resource::control::ProbeError,
 ) -> io::Result<()> {
     use crate::resource::control::ProbeError;
@@ -525,8 +593,8 @@ async fn probe_error(
     }
 }
 
-async fn delay_query(
-    stream: &mut TcpStream,
+async fn delay_query<S: ControllerIo>(
+    stream: &mut S,
     group: bool,
     raw_name: &str,
     target: &str,
@@ -564,8 +632,8 @@ async fn delay_query(
     }
 }
 
-async fn handle_select(
-    stream: &mut TcpStream,
+async fn handle_select<S: ControllerIo>(
+    stream: &mut S,
     headers: &[(String, String)],
     mut body: Vec<u8>,
     group: &str,
@@ -773,8 +841,8 @@ impl From<ProxyGroupState> for GroupResponse {
     }
 }
 
-async fn dns_query(
-    stream: &mut TcpStream,
+async fn dns_query<S: ControllerIo>(
+    stream: &mut S,
     target: &str,
     resources: Option<&dyn crate::resource::control::RuntimeResources>,
     cancellation: CancellationToken,
@@ -832,8 +900,8 @@ async fn dns_query(
     write_json(stream, 200, &value, &[]).await
 }
 
-async fn write_json<T: Serialize>(
-    stream: &mut TcpStream,
+async fn write_json<T: Serialize, S: ControllerIo>(
+    stream: &mut S,
     status: u16,
     value: &T,
     headers: &[(&str, &str)],
@@ -845,8 +913,8 @@ async fn write_json<T: Serialize>(
     write_response(stream, status, &response_headers, &body).await
 }
 
-async fn write_error(
-    stream: &mut TcpStream,
+async fn write_error<S: ControllerIo>(
+    stream: &mut S,
     status: u16,
     message: &'static str,
     headers: &[(&str, &str)],
@@ -858,42 +926,13 @@ async fn write_error(
     write_json(stream, status, &ErrorResponse { message }, headers).await
 }
 
-async fn write_response(
-    stream: &mut TcpStream,
+async fn write_response<S: ControllerIo>(
+    stream: &mut S,
     status: u16,
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        411 => "Length Required",
-        413 => "Payload Too Large",
-        415 => "Unsupported Media Type",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "Error",
-    };
-    let mut response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n",
-        body.len()
-    );
-    for (name, value) in headers {
-        response.push_str(name);
-        response.push_str(": ");
-        response.push_str(value);
-        response.push_str("\r\n");
-    }
-    response.push_str("\r\n");
-    stream.write_all(response.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.shutdown().await
+    stream.respond(status, headers, body).await
 }
 
 #[cfg(test)]
@@ -927,7 +966,7 @@ mod tests {
         }
     }
 
-    fn test_groups() -> Arc<ProxyGroups> {
+    pub(super) fn test_groups() -> Arc<ProxyGroups> {
         let dispatcher: Arc<dyn Dispatcher> = Arc::new(UnusedDispatcher);
         ProxyGroups::new(
             &[SelectProxyGroupConfig {
@@ -1045,6 +1084,7 @@ mod tests {
             &ExternalControllerConfig {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 secret: Some("secret".to_owned()),
+                ..ExternalControllerConfig::default()
             },
             None,
             groups.clone(),
@@ -1104,6 +1144,7 @@ mod tests {
             &ExternalControllerConfig {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 secret: Some("secret".to_owned()),
+                ..ExternalControllerConfig::default()
             },
             None,
             groups.clone(),

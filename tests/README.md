@@ -77,6 +77,7 @@ cargo test --locked --features cli --lib dns::runtime::tests::upstream_
 cargo test --locked --features cli --lib dns::runtime::encrypted_tests::upstream_tls_options_
 cargo test --locked --features cli --lib doh_
 cargo test --locked --features cli --lib dns_quic_
+cargo test --locked --features cli --lib controller_secure_
 cargo test --locked --features cli --lib dns::runtime::encrypted_tests::encrypted_dns_
 cargo test --locked --features cli --lib invoke::tests::update_dns_network_
 cargo test --manifest-path crates/vole-netstack/Cargo.toml --all-targets
@@ -86,6 +87,7 @@ uv run --project scripts --locked ruff format --check scripts
 ```
 
 DNS URL 参数、DoH GET/Basic、H2 并发与取消、ALPN/H1 回退只使用内存报文、显式来源快照和 duplex TLS 对端。DoQ/H3 与版本竞争使用有界 memory DatagramTransport 和抽象 Quinn socket；不读取宿主 DNS 或启动监听服务。
+`controller_secure_` 使用 duplex HTTP/TLS/H2、内存证书与临时文件，验证 CORS、共享鉴权/路由、客户端认证与握手签名、RSA 2048、候选更新及 Stop；不绑定宿主监听器。
 
 Windows UWP bridge 的名称准入与匹配使用独立过滤器；下列测试仅处理 JSON、匹配策略
 和未注册的内存 `VpnPlugInProfile` 对象，不创建系统 VPN profile 或启动连接：

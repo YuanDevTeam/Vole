@@ -6,21 +6,62 @@ Controller 是当前 Running Session 的 HTTP 接口。它提供业务连接管�
 
 ```yaml
 external-controller: 127.0.0.1:9090
+external-controller-tls: 127.0.0.1:9443 # 可单独启用或与 HTTP 同时启用
+external-controller-cors:
+  allow-origins: ["https://ui.example"]
+  allow-private-network: false
 secret: "vole-runtime-secret"
 ```
 
-- 省略或空串 `external-controller` 表示不启动 Controller，也不采集业务连接、规则命中和建链诊断；配置中的 `secret` 可保留。代理组选择、健康检查、资源更新与 TUN 原始流量统计独立运行。
+- 两个 Controller 地址均省略或空串时不启动 Controller，也不采集业务连接、规则命中和建链诊断；配置中的 `secret` 可保留。代理组选择、健康检查、资源更新与 TUN 原始流量统计独立运行。
 - `external-controller` 接受 IP、`localhost` 或空 host 与数值端口组成的地址，如 `127.0.0.1:9090`、`0.0.0.0:9090`、`[::]:9090`、`localhost:9090`、`:9090`。端口范围为 0–65535，0 由系统选择端口；`localhost` 使用 IPv4 回环。其他域名和命名服务端口不在当前范围内。静态节点、纯 DIRECT 及关闭业务入口的配置均可使用。
 - 空 host、`0.0.0.0` 和 `[::]` 均优先使用允许 IPv4 映射连接的双栈通配监听，仅地址族不可用时改用 IPv4。Controller 的地址族选择独立于顶层 `ipv6`。
-- `secret` 始终可选，省略或空串表示不要求认证；配置非空值时保护本文定义的全部路由。配置仅受整体 YAML 大小预算约束，HTTP 请求头仍限 32 KiB。
+- `external-controller-tls` 使用相同地址格式、绑定与端口范围。HTTP/HTTPS 共享当前会话、API handler、选择状态和 Bearer 认证；HTTPS 按实际 ALPN 提供 H2/H1，无 ALPN 使用 H1；明文 HTTP 仅 H1。
+- `secret` 始终可选，省略或空串表示不要求认证；配置非空值时保护本文定义的业务路由，CORS 预检在认证之前处理。配置仅受整体 YAML 大小预算约束，HTTP 请求头仍限 32 KiB。
 - `measureDelay` 的 node-only 配置不能包含 Controller 或代理组字段。
-- `validateConfig` 只校验字段；`start` 绑定端口，绑定失败则启动失败。`stop` 和 `destroyInstance` 关闭监听器。
+- `validateConfig` 只校验 Controller 字段；`start` 加载服务端证书并绑定端口，任一失败则启动失败。`stop` 和 `destroyInstance` 关闭两种监听器并等待请求与证书 watcher 回收。
 
 Controller 与公共运行时 session 同生共灭。`profile.store-selected` 默认 true，Core 将显式选择保存到 dataDir/selected.json，在下次启动时恢复有效成员；不写回 YAML。关闭该选项后只保留会话内选择。写入失败不回滚已生效的选择，`GET /proxies` 的 `selectionError` 给出脱敏原因。
 
+## HTTPS 证书与客户端认证
+
+```yaml
+tls:
+  certificate: controller.pem
+  private-key: controller.key
+  client-auth-type: require-and-verify
+  client-auth-cert: controller-client-ca.pem
+```
+
+`certificate/private-key` 接受配对 PEM 内容或 dataDir 内的文件路径。两者均空时生成随机 RSA 2048 密钥与自签证书，没有配置域名或公共信任；没有 HTTPS 地址时不加载服务端材料。内联证书在本会话中固定，文件证书对每秒检查一次：匹配且有效的完整候选原子替换，坏候选保留旧证书；在途 TLS 使用已选择的证书，新握手取得新候选。只读取普通文件，证书对合计最多 8 MiB；错误不输出内容、私钥或路径。
+
+`client-auth-type` 对客户端证书的要求如下；TLS 始终校验客户端 CertificateVerify 握手签名。
+
+| 值 | 无客户端证书 | 提供客户端证书 |
+| --- | --- | --- |
+| 省略、空串或其他字符串 | 允许，不请求证书 | 不要求证书 |
+| `request` | 允许 | 校验结构与握手签名，不校验信任链 |
+| `require-any` | 拒绝 | 校验结构与握手签名，不校验信任链 |
+| `verify-if-given` | 允许 | 必须通过配置 CA 的证书验证 |
+| `require-and-verify` | 拒绝 | 必须通过配置 CA 的证书验证 |
+
+默认模式携带非空 `client-auth-cert` 时自动提升为 `require-and-verify`；显式 `request/require-any` 保留原要求。CA 接受 PEM 内容或 dataDir 内普通文件，最多 8 MiB，只在启动读取；不随服务端证书 watcher 自动更新。客户端认证与 API Bearer 分别执行，成功的 TLS 握手不会跳过非空 secret。服务端证书、客户端 CA 与 `tls.custom-certifactes` 的出站信任根分别消费。
+
+## CORS
+
+`external-controller-cors.allow-origins` 缺省、空数组或含 `*` 时允许全部来源，响应为 `Access-Control-Allow-Origin: *`；其它列表按忽略大小写的精确匹配或单个 `*` 通配匹配，成功时回显请求来源。无 Origin 或来源不匹配时不返回允许来源头，普通 API 请求仍走原路由与 Bearer。
+
+OPTIONS 携带 Origin 和非空 `Access-Control-Request-Method` 时为预检，在 Bearer 前返回 200。允许 GET/POST/PUT/PATCH/DELETE，OPTIONS 同样有效；请求头仅允许 Content-Type、Authorization 与参考自动加入的 Origin，缓存 300 秒，不返回 Allow-Credentials。拒绝的预检仍为 200，但不返回允许头。普通响应含 `Vary: Origin`，预检另含请求 method/headers 的 Vary。
+
+`allow-private-network` 缺省 true；只对成功预检且请求 `Access-Control-Request-Private-Network: true` 返回相应允许头，显式 false 禁止返回该头。CORS 不改变 Controller 地址、secret 或 API 支持范围。
+
+## 请求预算与停止
+
+HTTP/HTTPS 合计最多 8 条活动连接。H1 每连接处理一个请求后关闭；H2 每连接最多 8 条并发请求，超出准入复位 stream，接收窗口每流 1 KiB、连接 8 KiB，发送缓冲每流 16 KiB。头部上限 32 KiB/100 字段，H2 target 上限 8 KiB，PUT body 上限 1 KiB；握手、H1 读头、body 与写响应各有 5 秒期限。停止取消活动请求、关闭协议 driver，并等待所有 H2 请求和文件候选读取完成。
+
 ## Bearer 鉴权
 
-配置非空 `secret` 后，每个请求都必须携带：
+配置非空 `secret` 后，除上述 CORS 预检外每个请求都必须携带：
 
 ```http
 Authorization: Bearer vole-runtime-secret

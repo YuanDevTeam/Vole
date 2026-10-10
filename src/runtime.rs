@@ -465,9 +465,17 @@ impl PreparedCore {
         };
         #[cfg(any(feature = "inbound-http", feature = "inbound-socks5"))]
         {
-            RuntimeController::bind(config, traffic, proxy_groups)
-                .await
-                .map(Some)
+            RuntimeController::bind_at(
+                config,
+                traffic,
+                proxy_groups,
+                self.geodata_manager
+                    .store_dir()
+                    .parent()
+                    .unwrap_or(self.geodata_manager.store_dir()),
+            )
+            .await
+            .map(Some)
         }
         #[cfg(not(any(feature = "inbound-http", feature = "inbound-socks5")))]
         {

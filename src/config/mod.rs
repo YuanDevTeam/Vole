@@ -55,6 +55,8 @@ use rules::parse_rule;
 
 mod credentials;
 pub use credentials::{ProxyAccess, ProxyAccessRules, ProxyCredentials};
+mod controller;
+pub use controller::{ControllerCors, ControllerTls};
 mod ech;
 pub use ech::StaticEchConfig;
 mod quic;
@@ -182,6 +184,23 @@ impl TryFrom<String> for LogLevel {
 pub struct ExternalControllerConfig {
     pub listen: SocketAddr,
     pub secret: Option<String>,
+    pub http_enabled: bool,
+    pub tls_listen: Option<SocketAddr>,
+    pub cors: ControllerCors,
+    pub server_tls: ControllerTls,
+}
+
+impl Default for ExternalControllerConfig {
+    fn default() -> Self {
+        Self {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            secret: None,
+            http_enabled: true,
+            tls_listen: None,
+            cors: ControllerCors::default(),
+            server_tls: ControllerTls::default(),
+        }
+    }
 }
 
 impl std::fmt::Debug for ExternalControllerConfig {
@@ -1163,6 +1182,14 @@ struct RawVoleConfig {
         deserialize_with = "deserialize_present_option"
     )]
     external_controller: Option<String>,
+    #[serde(
+        rename = "external-controller-tls",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    external_controller_tls: Option<String>,
+    #[serde(rename = "external-controller-cors", default)]
+    external_controller_cors: ControllerCors,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     secret: Option<String>,
     #[serde(
@@ -2210,8 +2237,21 @@ impl RawVoleConfig {
         let route_targets = collect_route_targets(&proxy_ids, &proxy_group_ids);
         let proxy_groups = normalize_proxy_groups(raw_proxy_groups, &route_targets)?;
         proxy_graph_order(&proxies, &proxy_groups)?;
-        let external_controller =
-            normalize_external_controller(self.external_controller, self.secret)?;
+        let mut external_controller =
+            normalize_external_controller(self.external_controller, self.secret.clone())?;
+        let tls_controller =
+            normalize_external_controller(self.external_controller_tls, self.secret)?;
+        if let Some(tls) = tls_controller {
+            let controller = external_controller.get_or_insert_with(|| ExternalControllerConfig {
+                http_enabled: false,
+                ..tls.clone()
+            });
+            controller.tls_listen = Some(tls.listen);
+        }
+        if let Some(controller) = &mut external_controller {
+            controller.cors = self.external_controller_cors;
+            controller.server_tls = self.tls.server.clone();
+        }
 
         let mut dns = self
             .dns
@@ -2309,6 +2349,7 @@ fn normalize_external_controller(
     Ok(Some(ExternalControllerConfig {
         listen,
         secret: secret.filter(|secret| !secret.is_empty()),
+        ..ExternalControllerConfig::default()
     }))
 }
 
@@ -4844,6 +4885,7 @@ tun:
             ExternalControllerConfig {
                 listen: "127.0.0.1:19090".parse().unwrap(),
                 secret: Some("private-token".to_owned()),
+                ..ExternalControllerConfig::default()
             }
         );
         assert!(debug.contains("authenticated: true"));

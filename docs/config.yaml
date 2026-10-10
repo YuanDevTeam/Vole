@@ -64,6 +64,11 @@ geo-update-interval: 24
 #       -----BEGIN CERTIFICATE-----
 #       <CA certificate content>
 #       -----END CERTIFICATE-----
+# 同一 tls 对象的 certificate/private-key 仅用于 HTTPS Controller，可用配对 PEM 或 dataDir 文件；
+# 均空时生成随机 RSA 2048 自签证书。内联固定，文件证书对热更新失败保留旧值。
+# client-auth-type: request/require-any/verify-if-given/require-and-verify，其它字符串为默认不请求证书；
+# 非空 client-auth-cert 在默认模式时提升为 require-and-verify，CA 内容/文件仅启动加载。
+# 上述服务端字段不改变 custom-certifactes 的客户端根库，也不用于独立 measureDelay 配置。
 
 # 可选的 HTTP/SOCKS5 混合入口；mixed-port 省略或 0 时关闭，1–65535 时启用。
 # TCP 在同端口接入 HTTP 转发 / CONNECT / Upgrade 和 SOCKS5 CONNECT / UDP ASSOCIATE。
@@ -88,12 +93,20 @@ authentication:
 
 # 可选的运行时 Controller，接受 IP:port、localhost:port 或 :port；端口 0 由系统分配。
 # 静态节点、纯 DIRECT 及未启用代理入口的配置也可使用。
-# secret 省略或空串时免认证；非空时保护全部 Controller 路由，不因代理组强制要求。
+# secret 省略或空串时免认证；非空时保护 Controller 业务路由，CORS 预检先于认证。
+# external-controller-tls 可单独启用，或与 HTTP 同时启用；HTTPS 实际提供 H2/H1，明文仅 H1。
+# CORS origins 缺省/[]/含 * 时允许所有来源；精确/单 * 匹配忽略大小写，无匹配不返回允许头。
+# 允许 GET/POST/PUT/PATCH/DELETE 与 OPTIONS；Content-Type/Authorization/Origin，max-age 300，
+# 不允许 credentials；allow-private-network 缺省 true，只在成功预检且请求 true 时返回允许头。
 # Controller 提供 GET /traffic、GET /group、GET /group/{name}、
 # GET /proxies/{name} 和 PUT /proxies/{name}；另含连接查询/关闭、有效配置、规则
 # 与 A/AAAA DNS 查询、节点/组 delay、Provider healthcheck、实际进程内存；
 # 完整接口见 controller-api.md；不属于 Invoke API。
 external-controller: 127.0.0.1:9090
+# external-controller-tls: 127.0.0.1:9443
+external-controller-cors:
+  allow-origins: ["*"]
+  allow-private-network: true
 secret: "vole-runtime-secret"
 
 # TUN 使用 Mihomo 同名字段；auto-route/auto-detect-interface 仅供 Linux 自建 TUN。

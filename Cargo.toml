@@ -47,8 +47,8 @@ default = [
     "shadow-tls-v3",
     "sing-mux",
 ]
-inbound-http = []
-inbound-socks5 = []
+inbound-http = ["dep:rcgen", "dep:rsa"]
+inbound-socks5 = ["dep:rcgen", "dep:rsa"]
 outbound-anytls = ["dep:md-5", "tls-fingerprint"]
 outbound-socks5 = []
 outbound-http = []
@@ -129,6 +129,8 @@ maxminddb = { version = "=0.32.0", default-features = false }
 quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 quinn-proto = { version = "=0.11.19", default-features = false, features = ["rustls-ring"], optional = true }
 rand = "0.10"
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"], optional = true }
+rsa = { version = "=0.9.10", default-features = false, features = ["std"], optional = true }
 ring = { version = "0.17.14", optional = true }
 redb = "=4.3.0"
 psl = "=2.1.241"
@@ -136,7 +138,7 @@ regex = "1.13"
 regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode-case"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "=0.8.4"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml_ng = "0.10"
 sevenz-rust2 = { version = "=0.23.0", default-features = false }

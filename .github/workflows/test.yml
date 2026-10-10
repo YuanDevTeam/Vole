@@ -115,7 +115,7 @@ jobs:
           rustls = package("rustls", "0.23.45")
           package("tokio-rustls", "0.26.5")
           package("rustls-native-certs", "0.8.4")
-          package("ring")
+          ring = package("ring")
           quinn = package("quinn", "0.11.12")
           proto = package("quinn-proto", "0.11.19", {None})
           proto_root = (Path(metadata["workspace_root"]) / "vendor" / "quinn-proto").resolve()
@@ -125,6 +125,15 @@ jobs:
           require("rustls-ring" in features(quinn), "Quinn wrapper must use rustls/ring")
           require(not (features(proto) | features(quinn)) & {"aws-lc-rs", "aws-lc-rs-fips", "rustls-aws-lc-rs", "rustls-aws-lc-rs-fips"}, "QUIC may not enable a second TLS provider")
           require(proto["id"] in {dependency["pkg"] for dependency in nodes[quinn["id"]]["deps"]}, "Quinn wrapper must resolve the reviewed protocol source")
+          rsa = package("rsa", "0.9.10")
+          rcgen = package("rcgen", "0.14.10")
+          require(features(rsa) == {"std"}, "RSA is restricted to controller key generation")
+          require(features(rcgen) == {"crypto", "ring"}, "controller certificate generation must use ring")
+          for item in (rsa, rcgen):
+              require(item.get("license") == "MIT OR Apache-2.0", f"unapproved {item['name']} license")
+              parents = {node["id"] for node in nodes.values() if any(dependency["pkg"] == item["id"] for dependency in node.get("deps", []))}
+              require(parents == {metadata["resolve"]["root"]}, f"{item['name']} must be consumed only by Vole")
+          require(ring["id"] in {dependency["pkg"] for dependency in nodes[rcgen["id"]]["deps"]}, "rcgen must use the approved ring package")
           wireguard = package("boringtun", "0.7.1")
           require(wireguard.get("license") == "BSD-3-Clause", "unapproved WireGuard license")
           require(not features(wireguard) & {"device", "ffi-bindings", "jni-bindings"}, "WireGuard must use only the userspace protocol")
@@ -158,7 +167,7 @@ jobs:
               for name, required in (("shadowsocks", {"aead-cipher-2022"}), ("shadowsocks-crypto", {"v2", "aws-lc"})):
                   require(required <= features(chain[name]), f"{name} must enable SS 2022")
               require(not any(features(item) & {"fips", "aead-cipher-2022-extra", "v2-extra"} for item in chain.values()), "unapproved SS 2022 or AWS-LC mode")
-          print("Locked TLS sources, HPKE/AGE algorithms and SS 2022 dependency chain passed")
+          print("Locked TLS sources, controller generation, HPKE/AGE algorithms and SS 2022 dependency chain passed")
           PY
       - name: QUIC native memory fixtures
         if: matrix.profile == 'features'
@@ -215,6 +224,7 @@ jobs:
             dns::runtime::tests::resolve_ipv6_
             dns::source::tests:: dns::runtime::tests::dns_source_
             dns::runtime::encrypted_tests::
+            controller_secure_
             outbound::http::tests:: outbound::wireguard::tests:: inbound::mixed::tests:: inbound::socks5::association::tests::
             inbound::http::parser::tests:: inbound::http::framing::tests::
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_

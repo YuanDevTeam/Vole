@@ -43,6 +43,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - 节点 UDP 能力按 [出站契约](outbounds.md) 声明；rule 模式跳过不支持 UDP 的目标，继续匹配后续规则。
   global 模式和显式 DNS 出口不执行此跳过。负载均衡组按其声明能力参与规则匹配，实际选中成员仍须支持 UDP。
 - 未启用 mixed-port 或 TUN 时仍可运行 Controller 和资源任务。Controller 接受通配 IP、localhost 和空 host；secret 可选，见 [Controller API](controller-api.md)。
+  CORS 按 origins/预检/私网字段处理；HTTP 与 HTTPS H2/H1 共用 handler 与 Bearer，支持服务端证书文件更新和五种客户端认证模式。
   /dns/query 查询真实上游；连接表按 UDP 目标流管理，memory 返回当前进程 resident bytes，平台口径不同。
 - fake-IP TTL 最小一秒；映射生命周期独立于 TTL。本地选择和映射存储不保证与 Mihomo 数据库互读。
 - Apple、Android、Windows UWP 的网络设置、权限和 App 生命周期仍归宿主；Windows Wintun 使用外置 DLL。

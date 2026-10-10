@@ -62,7 +62,9 @@ client-fingerprint: chrome
 `tls.custom-certifactes` 使用 Mihomo 的真实字段拼写，接受证书内容字符串数组，
 不读取路径，也不增加 `custom-certificates` 别名。内容在配置校验时解码，非法证书
 使 Vole 校验失败；与 Mihomo 对非法条目发警告后继续的行为不同。未知 TLS 字段
-继续拒绝，服务端证书与认证不属于此客户端信任对象。
+继续拒绝。同一个顶层 `tls` 对象也接受 HTTPS Controller 的服务端证书与客户端认证字段，
+由独立的服务端加载器消费，不加入出站信任根；契约见 [Controller](controller-api.md)。
+独立测量配置仅接受客户端 `custom-certifactes` 子集。
 
 启动时读取可用系统根，合并内置 WebPKI 和自定义根，构造一份会话共享的不可变根库。
 普通/指纹 TLS、QUIC、DNS 各角色、WireGuard 私有 DNS、Provider/GeoData 下载及

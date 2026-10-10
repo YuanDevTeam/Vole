@@ -8,6 +8,7 @@
 | --- | --- |
 | 普通 TLS、QUIC、WebPKI | 官方 rustls/tokio-rustls，ring provider；rustls-native-certs 只读取可用平台根，不替换验证器 |
 | QUIC 状态机 | registry Quinn 0.11.12 + 仓库内 quinn-proto 0.11.19；初始/最大窗口与独立 DATAGRAM frame 限额补丁，保留官方许可证/来源 |
+| Controller 随机服务端身份 | 官方 rsa 仅生成 RSA 2048 密钥；rcgen + ring 签发自签证书，实际 TLS 和握手签名仍由 rustls + ring 处理；随 Controller 入站 feature 启用 |
 | 命名 ClientHello、REALITY、JLS、ShadowTLS v3 | YuanDevTeam/boring，release 分支及锁定 revision |
 | SS 2022 | 官方 shadowsocks，仅 `aead-cipher-2022` |
 | Encryption | 同一 boring 的 X25519、ML-KEM、AEAD、AES-CTR；官方 blake3 |

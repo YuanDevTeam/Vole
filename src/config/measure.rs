@@ -19,7 +19,10 @@ pub(crate) struct MeasureConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMeasureConfig {
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::tls_trust::deserialize_client_only"
+    )]
     tls: super::TlsTrustConfig,
     proxies: Vec<RawOutbound>,
 }
