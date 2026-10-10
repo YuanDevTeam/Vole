@@ -2,9 +2,11 @@
 //!
 //! This module deliberately contains no network transport. Callers own query
 //! scheduling and cancellation. Every allocation retained by the cache and
-//! redir-host table is bounded by the constants below, while concurrent query
+//! redir-host table is bounded by the configured count and wire/record limits,
+//! while concurrent query
 //! activity is observed rather than rejected by a fixed local admission cap.
 
+mod cache;
 pub(crate) mod fake_ip;
 mod fallback;
 pub(crate) mod hosts;
@@ -30,7 +32,8 @@ pub const MAX_RESPONSE_RECORDS: usize = 64;
 pub const MAX_ANSWERS: usize = 16;
 pub const MAX_NAME_LEN: usize = 253;
 pub const MAX_COMPRESSION_JUMPS: usize = 16;
-pub const MAX_CACHE_ENTRIES: usize = 256;
+/// Default result count per DNS role; configuration may choose another count.
+pub const MAX_CACHE_ENTRIES: usize = 4_096;
 pub const MAX_REDIR_HOST_ENTRIES: usize = 256;
 pub const MAX_OPAQUE_RECORDS: usize = 64;
 pub const MAX_OPAQUE_CACHE_ENTRIES: usize = 64;
@@ -942,23 +945,12 @@ pub enum CacheValue {
     },
 }
 
-#[derive(Debug)]
-struct CacheEntry {
-    name: String,
-    query_type: QueryType,
-    value: CacheValue,
-    expires_at: Instant,
-    sequence: u64,
-}
-
-/// Fixed-capacity, single-owner DNS cache. It can be placed behind the
-/// runtime's existing lock when shared; mutation requires `&mut self` so no
-/// internal task or allocation can grow independently.
+/// Single-owner result cache with a shared count for typed and opaque questions.
+/// Lookups, recency updates and capacity eviction use a hash index and linked
+/// slots; payloads remain bounded by their respective address/wire budgets.
 #[derive(Debug)]
 pub struct DnsCache {
-    entries: Vec<CacheEntry>,
-    max_entries: usize,
-    next_sequence: u64,
+    store: cache::Store,
 }
 
 impl Default for DnsCache {
@@ -975,26 +967,23 @@ impl DnsCache {
 
     #[must_use]
     pub(crate) fn with_max_entries(max_entries: usize) -> Self {
-        assert!(max_entries != 0, "DNS cache capacity must be non-zero");
         Self {
-            entries: Vec::new(),
-            max_entries,
-            next_sequence: 0,
+            store: cache::Store::new(max_entries),
         }
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.store.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.store.clear();
     }
 
     pub fn get(&mut self, name: &str, query_type: QueryType, now: Instant) -> Option<CacheValue> {
@@ -1002,28 +991,18 @@ impl DnsCache {
             .map(|(value, _remaining_ttl)| value)
     }
 
-    /// Returns a cached value together with its remaining wire TTL. Keeping
-    /// the remaining TTL prevents a synthesized cache response from extending
-    /// an upstream record beyond this cache entry's own expiry.
+    /// Hits refresh recency without extending the entry's own expiry.
     pub fn get_with_ttl(
         &mut self,
         name: &str,
         query_type: QueryType,
         now: Instant,
     ) -> Option<(CacheValue, u32)> {
-        self.remove_expired(now);
-        let name = canonicalize_name(name).ok()?;
-        self.entries
-            .iter()
-            .find(|entry| entry.name == name && entry.query_type == query_type)
-            .map(|entry| {
-                let remaining_ttl = entry
-                    .expires_at
-                    .saturating_duration_since(now)
-                    .as_secs()
-                    .min(u64::from(u32::MAX)) as u32;
-                (entry.value.clone(), remaining_ttl)
-            })
+        let key = cache::Key::Address(canonicalize_name(name).ok()?, query_type);
+        let (cache::Value::Address(value), expires_at) = self.store.get(&key, now)? else {
+            return None;
+        };
+        Some((value.clone(), remaining_ttl(expires_at, now)))
     }
 
     pub fn insert_positive(
@@ -1048,12 +1027,10 @@ impl DnsCache {
         }) {
             return Err(DnsError::AddressFamilyMismatch);
         }
-        let mut retained = Vec::with_capacity(addresses.len());
-        retained.extend_from_slice(addresses);
         self.insert(
             name,
             query_type,
-            CacheValue::Positive(retained),
+            CacheValue::Positive(addresses.to_vec()),
             clamp_ttl(ttl),
             now,
         )
@@ -1086,62 +1063,87 @@ impl DnsCache {
         ttl: u32,
         now: Instant,
     ) -> Result<()> {
-        let name = canonicalize_name(name)?;
-        self.remove_expired(now);
-        let expires_at = expiry(now, ttl);
-        let sequence = self.take_sequence();
+        self.store.insert(
+            cache::Key::Address(canonicalize_name(name)?, query_type),
+            cache::Value::Address(value),
+            expiry(now, ttl),
+        )
+    }
 
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == name && entry.query_type == query_type)
-        {
-            *entry = CacheEntry {
-                name,
-                query_type,
-                value,
-                expires_at,
-                sequence,
-            };
-            return Ok(());
+    /// An opaque hit restores the caller's ID/RD and remaining record TTLs.
+    pub(crate) fn get_opaque(
+        &mut self,
+        query: &ClassifiedDnsQuery,
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        if !query.is_opaque() {
+            return None;
         }
-
-        if self.entries.len() >= self.max_entries {
-            let index = eviction_index(&self.entries, |entry| (entry.expires_at, entry.sequence));
-            self.entries.swap_remove(index);
-        }
-        reserve_entry_slot(&mut self.entries, self.max_entries)?;
-        self.entries.push(CacheEntry {
-            name,
-            query_type,
-            value,
+        let key = cache::Key::Opaque(query.question.clone(), query.semantics_digest);
+        let (
+            cache::Value::Opaque {
+                wire, ttl_offsets, ..
+            },
             expires_at,
-            sequence,
-        });
-        debug_assert!(self.entries.len() <= self.max_entries);
-        Ok(())
+        ) = self.store.get(&key, now)?
+        else {
+            return None;
+        };
+        let mut wire = wire.to_vec();
+        wire[..2].copy_from_slice(&query.id.to_be_bytes());
+        let mut flags = u16::from_be_bytes([wire[2], wire[3]]);
+        if query.recursion_desired {
+            flags |= 0x0100;
+        } else {
+            flags &= !0x0100;
+        }
+        wire[2..4].copy_from_slice(&flags.to_be_bytes());
+        let ttl = remaining_ttl(expires_at, now).to_be_bytes();
+        for offset in ttl_offsets {
+            let offset = usize::from(*offset);
+            wire[offset..offset + 4].copy_from_slice(&ttl);
+        }
+        Some(wire)
     }
 
-    fn remove_expired(&mut self, now: Instant) {
-        self.entries.retain(|entry| entry.expires_at > now);
-    }
-
-    fn take_sequence(&mut self) -> u64 {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        sequence
+    /// Opaque payloads share the role's LRU count while retaining their own
+    /// 64-response, 256 KiB, 4096-byte and 64-record safety boundaries.
+    pub(crate) fn insert_opaque(
+        &mut self,
+        response: &ValidatedOpaqueResponse,
+        now: Instant,
+    ) -> bool {
+        let Some(lifetime_secs) = response.cache_policy.lifetime_secs() else {
+            return false;
+        };
+        let Some(accounted_bytes) = opaque_entry_accounted_bytes(response) else {
+            return false;
+        };
+        if response.wire.len() > MAX_OPAQUE_CACHE_ENTRY_BYTES
+            || accounted_bytes > MAX_OPAQUE_CACHE_BYTES
+            || response.ttl_offsets.len() > MAX_OPAQUE_RECORDS
+        {
+            return false;
+        }
+        self.store
+            .insert(
+                cache::Key::Opaque(response.question.clone(), response.semantics_digest),
+                cache::Value::Opaque {
+                    wire: response.wire.clone(),
+                    ttl_offsets: response.ttl_offsets.clone(),
+                    accounted_bytes,
+                },
+                expiry(now, lifetime_secs),
+            )
+            .is_ok()
     }
 }
 
-#[derive(Debug)]
-struct OpaqueCacheEntry {
-    question: WireQuestion,
-    semantics_digest: [u8; 32],
-    wire: Box<[u8]>,
-    ttl_offsets: Box<[u16]>,
-    accounted_bytes: usize,
-    expires_at: Instant,
-    sequence: u64,
+fn remaining_ttl(expires_at: Instant, now: Instant) -> u32 {
+    expires_at
+        .saturating_duration_since(now)
+        .as_secs()
+        .min(u64::from(u32::MAX)) as u32
 }
 
 fn opaque_entry_accounted_bytes(response: &ValidatedOpaqueResponse) -> Option<usize> {
@@ -1156,21 +1158,15 @@ fn opaque_entry_accounted_bytes(response: &ValidatedOpaqueResponse) -> Option<us
                 .ttl_offsets
                 .len()
                 .checked_mul(std::mem::size_of::<u16>())?,
-        )
+        )?
+        .checked_add(cache::opaque_metadata_bytes())
 }
 
-/// Hard-bounded cache for non-A/AAAA response wire payloads.
-///
-/// The cache stores at most [`MAX_OPAQUE_CACHE_ENTRIES`] responses and at most
-/// [`MAX_OPAQUE_CACHE_BYTES`] bytes of response wire, normalized question key,
-/// full-query semantics digest and TTL-offset metadata in total. A hit clones
-/// at most one 4096-byte response, rewrites its transaction ID and reduces
-/// every cacheable RR TTL to the entry's remaining lifetime.
+/// Standalone opaque-only view of the same bounded result store.
+/// Runtime roles use DnsCache directly so all question types share capacity.
 #[derive(Debug)]
 pub struct OpaqueDnsCache {
-    entries: Vec<OpaqueCacheEntry>,
-    retained_bytes: usize,
-    next_sequence: u64,
+    cache: DnsCache,
 }
 
 impl Default for OpaqueDnsCache {
@@ -1183,142 +1179,35 @@ impl OpaqueDnsCache {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            retained_bytes: 0,
-            next_sequence: 0,
+            cache: DnsCache::with_max_entries(MAX_OPAQUE_CACHE_ENTRIES),
         }
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.cache.store.opaque_len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
     #[must_use]
     pub const fn retained_bytes(&self) -> usize {
-        self.retained_bytes
+        self.cache.store.opaque_bytes()
     }
 
     pub fn clear(&mut self) {
-        self.entries.clear();
-        self.retained_bytes = 0;
+        self.cache.clear();
     }
 
-    /// Returns a rewritten wire response for an opaque query, or `None` for an
-    /// address query, cache miss or expired entry.
     pub fn get(&mut self, query: &ClassifiedDnsQuery, now: Instant) -> Option<Vec<u8>> {
-        if !query.is_opaque() {
-            return None;
-        }
-        self.remove_expired(now);
-        let entry = self.entries.iter().find(|entry| {
-            entry.question == query.question && entry.semantics_digest == query.semantics_digest
-        })?;
-        let remaining_ttl = entry
-            .expires_at
-            .saturating_duration_since(now)
-            .as_secs()
-            .min(u64::from(u32::MAX)) as u32;
-        let mut wire = entry.wire.to_vec();
-        wire[..2].copy_from_slice(&query.id.to_be_bytes());
-        let mut flags = u16::from_be_bytes([wire[2], wire[3]]);
-        if query.recursion_desired {
-            flags |= 0x0100;
-        } else {
-            flags &= !0x0100;
-        }
-        wire[2..4].copy_from_slice(&flags.to_be_bytes());
-        let ttl = remaining_ttl.to_be_bytes();
-        for offset in &entry.ttl_offsets {
-            let offset = usize::from(*offset);
-            wire[offset..offset + 4].copy_from_slice(&ttl);
-        }
-        Some(wire)
+        self.cache.get_opaque(query, now)
     }
 
-    /// Inserts a validated response when its cache policy permits it. Returns
-    /// `false` for retryable/error responses and positive responses with a zero
-    /// or absent cacheable TTL.
     pub fn insert(&mut self, response: &ValidatedOpaqueResponse, now: Instant) -> bool {
-        let Some(lifetime_secs) = response.cache_policy.lifetime_secs() else {
-            return false;
-        };
-        let wire_bytes = response.wire.len();
-        let Some(entry_bytes) = opaque_entry_accounted_bytes(response) else {
-            return false;
-        };
-        if wire_bytes > MAX_OPAQUE_CACHE_ENTRY_BYTES
-            || entry_bytes > MAX_OPAQUE_CACHE_BYTES
-            || response.ttl_offsets.len() > MAX_OPAQUE_RECORDS
-        {
-            return false;
-        }
-
-        self.remove_expired(now);
-        if let Some(index) = self.entries.iter().position(|entry| {
-            entry.question == response.question
-                && entry.semantics_digest == response.semantics_digest
-        }) {
-            self.remove_index(index);
-        }
-
-        while !self.entries.is_empty()
-            && (self.entries.len() >= MAX_OPAQUE_CACHE_ENTRIES
-                || self.retained_bytes.saturating_add(entry_bytes) > MAX_OPAQUE_CACHE_BYTES)
-        {
-            let index = eviction_index(&self.entries, |entry| (entry.expires_at, entry.sequence));
-            self.remove_index(index);
-        }
-        if self.entries.len() >= MAX_OPAQUE_CACHE_ENTRIES
-            || self.retained_bytes.saturating_add(entry_bytes) > MAX_OPAQUE_CACHE_BYTES
-        {
-            return false;
-        }
-
-        let sequence = self.take_sequence();
-        if reserve_entry_slot(&mut self.entries, MAX_OPAQUE_CACHE_ENTRIES).is_err() {
-            return false;
-        }
-        self.entries.push(OpaqueCacheEntry {
-            question: response.question.clone(),
-            semantics_digest: response.semantics_digest,
-            wire: response.wire.clone(),
-            ttl_offsets: response.ttl_offsets.clone(),
-            accounted_bytes: entry_bytes,
-            expires_at: expiry(now, lifetime_secs),
-            sequence,
-        });
-        self.retained_bytes += entry_bytes;
-        debug_assert!(self.entries.len() <= MAX_OPAQUE_CACHE_ENTRIES);
-        debug_assert!(self.retained_bytes <= MAX_OPAQUE_CACHE_BYTES);
-        true
-    }
-
-    fn remove_expired(&mut self, now: Instant) {
-        let mut index = 0;
-        while index < self.entries.len() {
-            if self.entries[index].expires_at <= now {
-                self.remove_index(index);
-            } else {
-                index += 1;
-            }
-        }
-    }
-
-    fn remove_index(&mut self, index: usize) {
-        let removed = self.entries.swap_remove(index);
-        self.retained_bytes -= removed.accounted_bytes;
-    }
-
-    fn take_sequence(&mut self) -> u64 {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        sequence
+        self.cache.insert_opaque(response, now)
     }
 }
 
@@ -1738,7 +1627,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_is_fixed_capacity_and_evicts_the_oldest_expiry() {
+    fn cache_is_fixed_capacity_and_evicts_the_least_recent_entry() {
         let now = Instant::now();
         let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let mut cache = DnsCache::new();
@@ -1767,7 +1656,7 @@ mod tests {
         let now = Instant::now();
         let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let mut cache = DnsCache::with_max_entries(2);
-        assert_eq!(cache.entries.capacity(), 0);
+        assert_eq!(cache.store.allocated_slots(), 0);
 
         for name in ["first.example", "second.example", "third.example"] {
             cache
@@ -1778,6 +1667,88 @@ mod tests {
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.get("first.example", QueryType::A, now), None);
         assert!(cache.get("third.example", QueryType::A, now).is_some());
+    }
+
+    #[test]
+    fn cache_lru_hits_and_replacements_preserve_ttl_and_promote_entries() {
+        let now = Instant::now();
+        let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut cache = DnsCache::with_max_entries(2);
+        cache
+            .insert_positive("short.example", QueryType::A, &[address], 30, now)
+            .unwrap();
+        cache
+            .insert_negative("negative.example", QueryType::Aaaa, 3, now)
+            .unwrap();
+        assert_eq!(
+            cache.get_with_ttl(
+                "SHORT.example.",
+                QueryType::A,
+                now + Duration::from_secs(10)
+            ),
+            Some((CacheValue::Positive(vec![address]), 20))
+        );
+        cache
+            .insert_positive("long.example", QueryType::A, &[address], 3600, now)
+            .unwrap();
+        assert_eq!(cache.get("negative.example", QueryType::Aaaa, now), None);
+        // Updating the short entry is also a use, independent of its expiry.
+        cache
+            .insert_negative("short.example", QueryType::A, 0, now)
+            .unwrap();
+        cache
+            .insert_negative("other.example", QueryType::A, 3, now)
+            .unwrap();
+        assert_eq!(cache.get("long.example", QueryType::A, now), None);
+        assert_eq!(
+            cache.get("short.example", QueryType::A, now),
+            Some(CacheValue::Negative { rcode: 0 })
+        );
+        assert_eq!(
+            cache.get("short.example", QueryType::A, now + Duration::from_secs(30)),
+            None
+        );
+        // Freed slots are reused, and clear releases all retained allocation.
+        for index in 0..100 {
+            cache
+                .insert_negative(&format!("cycle{index}.example"), QueryType::A, 3, now)
+                .unwrap();
+        }
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.store.allocated_slots(), 2);
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.store.allocated_slots(), 0);
+    }
+
+    #[test]
+    fn cache_shares_typed_and_opaque_capacity_and_reclaims_opaque_bytes() {
+        let now = Instant::now();
+        let mut cache = DnsCache::with_max_entries(2);
+        let query_wire = wire_query(1, "opaque.example", 16);
+        let query = classify_query(&query_wire).unwrap();
+        let mut response = opaque_response(&query_wire, RCODE_NOERROR, false);
+        set_counts(&mut response, 1, 0, 0);
+        append_wire_record(&mut response, &[0xc0, 0x0c], 16, CLASS_IN, 60, &[]);
+        let response = validate_opaque_response(&query, &response).unwrap();
+        cache
+            .insert_negative("typed.example", QueryType::A, 3, now)
+            .unwrap();
+        assert!(cache.insert_opaque(&response, now));
+        assert!(cache.store.opaque_bytes() > 0);
+        assert!(cache.get("typed.example", QueryType::A, now).is_some());
+        cache
+            .insert_negative("next.example", QueryType::A, 3, now)
+            .unwrap();
+        assert_eq!(cache.get_opaque(&query, now), None);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.store.opaque_bytes(), 0);
+        assert!(cache.insert_opaque(&response, now));
+        assert_eq!(
+            cache.get_opaque(&query, now + Duration::from_secs(60)),
+            None
+        );
+        assert_eq!(cache.store.opaque_bytes(), 0);
     }
 
     #[test]
@@ -2220,7 +2191,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_cache_is_bounded_and_evicts_earliest_expiry() {
+    fn opaque_cache_is_bounded_and_evicts_the_least_recent_entry() {
         let now = Instant::now();
         let mut cache = OpaqueDnsCache::new();
         for index in 0..MAX_OPAQUE_CACHE_ENTRIES {
@@ -2239,6 +2210,8 @@ mod tests {
             let response = validate_opaque_response(&query, &response).unwrap();
             assert!(cache.insert(&response, now));
         }
+        let first_query = classify_query(&wire_query(0, "host0.example", 16)).unwrap();
+        assert!(cache.get(&first_query, now).is_some());
         let new_wire = wire_query(999, "new.example", 16);
         let new_query = classify_query(&new_wire).unwrap();
         let mut new_response = opaque_response(&new_wire, RCODE_NOERROR, false);
@@ -2249,8 +2222,9 @@ mod tests {
 
         assert_eq!(cache.len(), MAX_OPAQUE_CACHE_ENTRIES);
         assert!(cache.retained_bytes() <= MAX_OPAQUE_CACHE_BYTES);
-        let first_query = classify_query(&wire_query(0, "host0.example", 16)).unwrap();
-        assert_eq!(cache.get(&first_query, now), None);
+        assert!(cache.get(&first_query, now).is_some());
+        let second_query = classify_query(&wire_query(1, "host1.example", 16)).unwrap();
+        assert_eq!(cache.get(&second_query, now), None);
         assert!(cache.get(&new_query, now).is_some());
     }
 

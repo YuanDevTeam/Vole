@@ -100,7 +100,8 @@ pub struct ResourceLimits {
     /// Maximum raw IP packet accepted by a TUN netstack.
     pub tun_max_datagram_size: usize,
     pub tcp_buffer_per_direction: usize,
-    /// Retained A/AAAA cache entries. A and AAAA share this one capacity.
+    /// Explicit low-level DNS constructor override. Production sessions use
+    /// dns.cache-max-size for the shared typed/opaque result capacity instead.
     pub dns_address_cache_entries: usize,
     /// Retained address-to-domain hints used by redir-host routing.
     pub dns_redir_host_entries: usize,

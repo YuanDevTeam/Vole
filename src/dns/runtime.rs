@@ -31,10 +31,10 @@ use tokio_util::sync::CancellationToken;
 use super::policy::NameserverPolicies;
 use super::{
     CacheValue, ClassifiedDnsQuery, DnsCache, DnsError, DnsMessage, DnsQueryKind, MAX_ANSWERS,
-    MAX_CACHE_ENTRIES, MAX_MESSAGE_SIZE, MAX_REDIR_HOST_ENTRIES, MAX_RESPONSE_RECORDS,
-    MIN_TTL_SECS, OpaqueDnsCache, QueryType, RecordData, RedirHostHints, ValidatedOpaqueResponse,
-    WireQuestion, build_query, canonicalize_name, classify_query, parse_query, parse_response,
-    synthesize_servfail_response, validate_opaque_response, validate_response_identity,
+    MAX_MESSAGE_SIZE, MAX_REDIR_HOST_ENTRIES, MAX_RESPONSE_RECORDS, MIN_TTL_SECS, QueryType,
+    RecordData, RedirHostHints, ValidatedOpaqueResponse, WireQuestion, build_query,
+    canonicalize_name, classify_query, parse_query, parse_response, synthesize_servfail_response,
+    validate_opaque_response, validate_response_identity,
 };
 use crate::{
     config::{
@@ -106,7 +106,6 @@ pub struct RuntimeDns {
     geo_matcher: Arc<dyn GeoMatcher>,
     egress: DnsEgress,
     cache: Mutex<DnsCache>,
-    opaque_cache: Mutex<OpaqueDnsCache>,
     // Hint lookup and insertion are bounded synchronous work. Keep this
     // shared TUN hot path free of asynchronous mutex scheduling.
     hints: Option<Arc<StdMutex<RedirHostHints>>>,
@@ -871,7 +870,7 @@ impl RuntimeDns {
             config,
             DnsEgress::Single(dispatcher),
             geo_matcher,
-            MAX_CACHE_ENTRIES,
+            config.cache_max_size,
             MAX_REDIR_HOST_ENTRIES,
         )
     }
@@ -912,7 +911,7 @@ impl RuntimeDns {
             direct,
             rules,
             geo_matcher,
-            MAX_CACHE_ENTRIES,
+            config.cache_max_size,
             MAX_REDIR_HOST_ENTRIES,
         )
     }
@@ -1026,7 +1025,6 @@ impl RuntimeDns {
             geo_matcher,
             egress,
             cache: Mutex::new(DnsCache::with_max_entries(address_cache_entries)),
-            opaque_cache: Mutex::new(OpaqueDnsCache::new()),
             hints: (redir_host_entries != 0).then(|| {
                 Arc::new(StdMutex::new(RedirHostHints::with_max_entries(
                     redir_host_entries,
@@ -1582,8 +1580,8 @@ impl RuntimeDns {
         loop {
             let key = SingleflightKey::from(classified);
             let role = {
-                let mut cache = self.opaque_cache.lock().await;
-                if let Some(response) = cache.get(classified, Instant::now()) {
+                let mut cache = self.cache.lock().await;
+                if let Some(response) = cache.get_opaque(classified, Instant::now()) {
                     super::trace::record("cache");
                     self.resource_stats.dns_cache_hit();
                     return Ok(response);
@@ -1630,10 +1628,10 @@ impl RuntimeDns {
         let response = self
             .exchange_opaque_upstreams(nameservers, &upstream_query, &upstream_classified, deadline)
             .await?;
-        self.opaque_cache
+        self.cache
             .lock()
             .await
-            .insert(&response, Instant::now());
+            .insert_opaque(&response, Instant::now());
         let mut response = response.into_wire();
         restore_response_id(&mut response, 0);
         Ok(response)
@@ -2366,7 +2364,7 @@ mod tests {
         config::{DnsNameserverPolicy, DnsRoute, IpCidr, RuleAction, RuleKind, RuleSpec},
         dialer::Dialer,
         dispatch::{BoxStream, DatagramTransport},
-        dns::{DnsQuestion, DnsRecord},
+        dns::{DnsQuestion, DnsRecord, MAX_CACHE_ENTRIES},
         geodata::{DynamicGeoData, GEOSITE_FILE_NAME, GeoData},
         outbound::DirectOutbound,
         routing::{EmptyGeoMatcher, RuleSet},
@@ -5129,6 +5127,74 @@ dns:
         assert_eq!(stats.singleflight_peak, 1);
         assert_eq!(stats.singleflight_current, 0);
         assert_eq!(stats.dns_cache_hits, 1);
+    }
+
+    #[tokio::test]
+    async fn dns_cache_configured_capacity_is_shared_by_address_and_opaque_questions() {
+        let address = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 103));
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            (0..5)
+                .map(|_| MockReply::Response(ResponseSpec::answer(address)))
+                .collect(),
+            vec![],
+        ));
+        let mut configuration = config(false, vec![nameserver(1, DnsTransport::Udp)]);
+        configuration.cache_max_size = 2;
+        let resolver = RuntimeDns::new(&configuration, dispatcher.clone());
+        for (index, name, qtype) in [
+            (0, "first.example", 1),
+            (1, "opaque.example", 16),
+            (2, "first.example", 1),
+            (3, "second.example", 1),
+            (4, "opaque.example", 16),
+            (5, "first.example", 1),
+        ] {
+            let query = opaque_query(index, name, qtype);
+            resolver.exchange(&query).await.unwrap();
+        }
+        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 5);
+        assert_eq!(resolver.cache.lock().await.len(), 2);
+        assert_eq!(resolver.singleflight.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_cache_roles_keep_independent_results_and_eviction() {
+        let addresses = (1..=5)
+            .map(|last| IpAddr::V4(Ipv4Addr::new(203, 0, 113, last)))
+            .collect::<Vec<_>>();
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            addresses
+                .iter()
+                .map(|address| MockReply::Response(ResponseSpec::answer(*address)))
+                .collect(),
+            vec![],
+        ));
+        let mut configuration = config(false, vec![nameserver(1, DnsTransport::Udp)]);
+        configuration.cache_max_size = 1;
+        configuration.default_nameservers = configuration.nameservers.clone();
+        configuration.proxy_nameservers = configuration.nameservers.clone();
+        configuration.direct_nameservers = configuration.nameservers.clone();
+        let resolver = RuntimeDns::new(&configuration, dispatcher.clone());
+        let roles = [
+            &resolver,
+            resolver.bootstrap.as_deref().unwrap(),
+            resolver.proxy_resolver.as_deref().unwrap(),
+            resolver.direct_resolver.as_deref().unwrap(),
+        ];
+        for _ in 0..2 {
+            for (role, address) in roles.iter().zip(&addresses) {
+                assert_eq!(role.resolve("same.example").await.unwrap(), vec![*address]);
+            }
+        }
+        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 4);
+        assert_eq!(
+            resolver.resolve("new.example").await.unwrap(),
+            vec![addresses[4]]
+        );
+        for (role, address) in roles.iter().zip(&addresses).skip(1) {
+            assert_eq!(role.resolve("same.example").await.unwrap(), vec![*address]);
+        }
+        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 5);
     }
 
     #[tokio::test]

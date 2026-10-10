@@ -78,6 +78,11 @@ impl RawDnsConfig {
             } else {
                 self.ipv6_timeout
             }),
+            cache_max_size: if self.cache_max_size == 0 {
+                crate::dns::MAX_CACHE_ENTRIES
+            } else {
+                self.cache_max_size
+            },
             nameservers: parse(self.nameserver, main_route)?,
             nameserver_policies: normalize_dns_nameserver_policies(
                 self.nameserver_policies,

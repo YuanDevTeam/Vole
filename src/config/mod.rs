@@ -274,6 +274,7 @@ pub struct DnsConfig {
     pub enable: bool,
     pub ipv6: bool,
     pub ipv6_timeout: Duration,
+    pub cache_max_size: usize,
     pub nameservers: Vec<DnsNameserver>,
     pub nameserver_policies: Vec<DnsNameserverPolicy>,
     pub default_nameservers: Vec<DnsNameserver>,
@@ -1249,6 +1250,8 @@ struct RawDnsConfig {
     ipv6: bool,
     #[serde(rename = "ipv6-timeout", default = "dns::default_ipv6_timeout")]
     ipv6_timeout: u64,
+    #[serde(rename = "cache-max-size", default)]
+    cache_max_size: usize,
     #[serde(default = "dns::default_nameservers")]
     nameserver: Vec<String>,
     #[serde(rename = "default-nameserver", default = "dns::default_bootstrap")]
@@ -5229,6 +5232,23 @@ authentication:
             assert_eq!(config.dns.ipv6_timeout, Duration::from_millis(milliseconds));
         }
         assert!(Config::parse_yaml(b"mixed-port: 1080\ndns:\n  ipv6-timeout: -1\n").is_err());
+    }
+
+    #[test]
+    fn dns_cache_max_size_uses_entries_and_zero_retains_the_default() {
+        for (field, entries) in [
+            ("", 4096),
+            ("  cache-max-size: 0\n", 4096),
+            ("  cache-max-size: 2\n", 2),
+            ("  cache-max-size: 8192\n", 8192),
+        ] {
+            let config =
+                Config::parse_yaml(format!("mixed-port: 1080\ndns:\n{field}").as_bytes()).unwrap();
+            assert_eq!(config.dns.cache_max_size, entries);
+        }
+        assert!(Config::parse_yaml(b"mixed-port: 1080\ndns:\n  cache-max-size: -1\n").is_err());
+        // ARC is not accepted until its actual replacement policy exists.
+        assert!(Config::parse_yaml(b"mixed-port: 1080\ndns:\n  cache-algorithm: arc\n").is_err());
     }
 
     #[test]

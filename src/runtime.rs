@@ -695,7 +695,7 @@ impl GraphBuilder {
                 direct.clone(),
                 rules.clone(),
                 geo_matcher.clone(),
-                self.limits.dns_address_cache_entries,
+                dns_config.cache_max_size,
                 redir_host_entries,
             )
             .with_mapping_from(self.previous_dns.as_deref())
