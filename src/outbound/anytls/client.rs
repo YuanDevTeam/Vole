@@ -785,6 +785,54 @@ mod tests {
         assert!(client.tasks.is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn configured_idle_check_interval_drives_actual_session_reaping() {
+        for seconds in [11_u64, 17] {
+            let config = crate::config::Config::parse_yaml(
+                format!(
+                    "mixed-port: 1080\nproxies: [{{name: node, type: anytls, server: tls.example, port: 443, password: fixture, idle-session-check-interval: {seconds}, idle-session-timeout: 6}}]"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let crate::config::ProxyProtocol::AnyTls(node) = &config.proxies[0].protocol else {
+                panic!("expected AnyTLS");
+            };
+            let dialer = DuplexDialer::new(ServerMode::V2);
+            let client = AnyTlsClient::with_options(
+                dialer.clone(),
+                &node.password,
+                1024,
+                node.session.clone(),
+            )
+            .unwrap();
+            let mut stream = open_stream(&client).await.unwrap();
+            wait_until_ready(&mut stream).await;
+            stream.shutdown().await.unwrap();
+            let session = client.state.lock().unwrap().sessions[&1].clone();
+            tokio::time::advance(Duration::from_secs(seconds - 1)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !session.is_closed(),
+                "the expired idle session must wait for the configured check"
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                session.is_closed(),
+                "the scheduled worker closes the session"
+            );
+            let mut fresh = open_stream(&client).await.unwrap();
+            wait_until_ready(&mut fresh).await;
+            assert_eq!(dialer.connection_count(), 2);
+            fresh.shutdown().await.unwrap();
+            client.shutdown().await;
+            assert!(client.tasks.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn disabled_reuse_closes_sessions_and_never_starts_idle_worker() {
         let dialer = DuplexDialer::new(ServerMode::V2);
