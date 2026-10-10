@@ -177,13 +177,22 @@ impl ProviderCache {
         })
     }
     pub fn next_due(&self) -> Option<usize> {
-        self.entries.iter().position(|entry| {
-            entry.spec.kind != ProviderType::Inline
-                && !(entry.spec.kind == ProviderType::Http
-                    && entry.spec.interval == 0
-                    && entry.state.downloaded)
-                && entry.next <= tokio::time::Instant::now()
-        })
+        self.next_refresh()
+            .filter(|(_, deadline)| *deadline <= tokio::time::Instant::now())
+            .map(|(index, _)| index)
+    }
+    pub fn next_refresh(&self) -> Option<(usize, tokio::time::Instant)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.spec.kind != ProviderType::Inline
+                    && !(entry.spec.kind == ProviderType::Http
+                        && entry.spec.interval == 0
+                        && entry.state.downloaded)
+            })
+            .min_by_key(|(_, entry)| entry.next)
+            .map(|(index, entry)| (index, entry.next))
     }
     pub async fn fetch(
         &mut self,
@@ -366,11 +375,14 @@ impl ProviderCache {
     }
     fn schedule(entry: &mut ResourceEntry) {
         entry.failures = 0;
-        entry.next = if entry.spec.kind == ProviderType::File {
-            tokio::time::Instant::now() + Duration::from_secs(1)
+        let seconds = if entry.spec.kind == ProviderType::File {
+            1
+        } else if entry.spec.interval == 0 {
+            365 * 24 * 3600
         } else {
-            next_update(entry.spec.interval, unix_time(SystemTime::now()))
+            entry.spec.interval.min(i64::MAX as u64 / 1_000_000_000)
         };
+        entry.next = tokio::time::Instant::now() + Duration::from_secs(seconds);
     }
 }
 fn content_len(content: &ProviderContent) -> usize {

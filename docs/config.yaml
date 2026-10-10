@@ -233,7 +233,7 @@ proxies:
     udp: true
     # dialer-proxy: upstream-select # 上游必须提供足够的双向 UDP 预算
 
-  # TUIC v5：固定 QUIC/TLS1.3；必填 UUID 和原样 password（可空，最多 65535 UTF-8 字节）。
+  # TUIC v5：固定 QUIC/TLS1.3；UUID 必填，password 缺省为空，原样使用（最多 65535 UTF-8 字节）。
   # 不接受 v4、token、0-RTT、client-fingerprint、mTLS、ECH 或其他 TLS 后端选项。
   - name: tuic-edge
     type: tuic
@@ -308,7 +308,7 @@ proxies:
     # 每次握手各选一个路径与每个头的一个值；禁止 Content-Length/Transfer-Encoding。
     # network: h2
     # h2-opts: # 省略/host: [] 使用 www.example.com；path 省略/空为 /
-    #   host: [cover.example:443] # 必填、非空；每流选一个，不改变 TLS 认证名
+    #   host: [cover.example:443] # 每流选一个；缺省/空列表用 www.example.com，不改变 TLS 认证名
     #   path: /cover              # 默认 /；普通 PUT body，不使用 gRPC framing
 
   # Trojan（outbound-trojan feature）：固定 TLS，不接受 tls 开关。
@@ -437,7 +437,7 @@ proxies:
     password: password
     udp: true
 
-  # AnyTLS 只提供客户端出站，配置只接受以下字段和可选 dialer-proxy。
+  # AnyTLS 只提供客户端出站，接受以下协议字段和节点通用字段。
   # sni 省略时使用 server。TLS 1.3/1.2 默认 WebPKI，alpn 省略/[] 时不发送。
   # skip-cert-verify 不能覆盖 fingerprint；pin 是证书 SHA-256，不是客户端伪造指纹。
   # 叶 pin 直接决定信任；非叶 pin 作为根继续验证链和名称。所有策略均验证握手签名。
@@ -493,7 +493,7 @@ proxies:
 # 反引号分隔的多表达式按匹配顺序排列。节点改名使用 $1 / ${name} / $$ 等 .NET replacement。
 # 复杂表达式有内部编译/执行预算；失败候选保留旧资源，不静默当不匹配。
 # 静态成员保留顺序与重复项。
-# 动态组为空时使用 empty-fallback（缺省 COMPATIBLE，即 DIRECT），可指定节点或内置目标。
+# 过滤后组成员为空时使用 empty-fallback（缺省 COMPATIBLE，即 DIRECT），可指定节点或内置目标。
 # disable-udp 缺省 false；true 禁用该组的业务 UDP。规则模式跳过不支持 UDP 的目标，
 # 继续匹配后续规则；global 模式及显式 DNS 出口仍会拒绝。hidden/icon 为 Controller 元数据。
 # 节点与组的完整混合图必须无环。资源更新后保留仍存在的当前选择，否则使用默认/首成员。
@@ -549,7 +549,7 @@ proxy-groups:
 # proxy provider 文件为 {proxies: [...]}；可用 filter/exclude-filter/exclude-type。
 # provider 的 dialer-proxy 覆盖每个节点的同名字段，override 最后应用；
 # 它只控制节点上游，资源下载仍使用独立的 proxy 字段。
-# override 支持 udp、udp-over-tcp、up/down、dialer-proxy、skip-cert-verify、name-cert-verify、
+# override 支持 udp、udp-over-tcp、up/down、dialer-proxy、ip-version、skip-cert-verify、name-cert-verify、
 # additional-prefix/suffix、proxy-name: [{pattern: '表达式', target: '替换文本'}]；
 # 协议专属覆盖只用于支持该字段的节点。未实现的覆盖字段严格拒绝。
 # proxy providers 的 health-check 接受 enable/url/interval/timeout/lazy/expected-status；

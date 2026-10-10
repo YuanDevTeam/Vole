@@ -88,6 +88,87 @@ fn commit_valid(cache: &mut ProviderCache, candidate: Candidate) {
         .unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn refresh_deadline_preserves_fetch_completion_phase_and_zero_disables_polling() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cache = ProviderCache::open(root.path(), template()).unwrap();
+    cache.entries[0].spec.interval = 1;
+    let started = tokio::time::Instant::now();
+    let candidate = fetch(
+        &mut cache,
+        response(
+            200,
+            "",
+            "proxies: [{name: edge, type: socks5, server: 192.0.2.1, port: 1080}]",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // Publication completes just after a fixed one-second poll boundary.
+    tokio::time::advance(Duration::from_millis(20)).await;
+    commit_valid(&mut cache, candidate);
+    let deadline = started + Duration::from_millis(1020);
+    assert_eq!(cache.next_refresh(), Some((0, deadline)));
+    tokio::time::advance(Duration::from_millis(980)).await;
+    assert_eq!(cache.next_due(), None);
+    tokio::time::sleep_until(cache.next_refresh().unwrap().1).await;
+    assert_eq!(tokio::time::Instant::now(), deadline);
+    assert_eq!(cache.next_due(), Some(0));
+    assert!(
+        fetch(&mut cache, response(304, "", ""))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        cache.next_refresh(),
+        Some((0, deadline + Duration::from_secs(1)))
+    );
+    cache.entries[0].spec.interval = 0;
+    assert_eq!(cache.next_refresh(), None);
+    assert_eq!(cache.next_due(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn refresh_deadline_selects_oldest_due_provider_and_keeps_failure_backoff() {
+    let root = tempfile::tempdir().unwrap();
+    let template = Config::parse_yaml(
+        br#"
+mixed-port: 1080
+proxy-providers:
+  a: {type: http, url: 'http://subscription.invalid/a', interval: 1}
+  b: {type: http, url: 'http://subscription.invalid/b', interval: 1}
+proxy-groups:
+  - {name: choice, type: select, use: [a, b]}
+"#,
+    )
+    .unwrap()
+    .providers
+    .unwrap();
+    let mut cache = ProviderCache::open(root.path(), template).unwrap();
+    let started = tokio::time::Instant::now();
+    cache.entries[0].next = started + Duration::from_secs(2);
+    cache.entries[1].next = started + Duration::from_secs(1);
+    assert_eq!(
+        cache.next_refresh(),
+        Some((1, started + Duration::from_secs(1)))
+    );
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(cache.next_due(), Some(1));
+    cache.reject(1);
+    assert_eq!(cache.next_due(), Some(0));
+    cache.entries[0].state.downloaded = true;
+    cache.entries[0].spec.interval = 0;
+    assert_eq!(cache.next_due(), None);
+    assert_eq!(
+        cache.next_refresh(),
+        Some((1, started + Duration::from_secs(12)))
+    );
+    cache.entries[1].spec.kind = ProviderType::Inline;
+    assert_eq!(cache.next_refresh(), None);
+}
+
 #[tokio::test]
 async fn subscription_metadata_follows_successful_candidates_304_and_verified_disk_cache() {
     let root = tempfile::tempdir().unwrap();

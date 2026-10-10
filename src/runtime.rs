@@ -416,6 +416,7 @@ impl PreparedCore {
         if let Some(update) = self.config.geodata_update.as_ref().filter(|_| {
             report.geosite.required
                 || report.geoip.required
+                || report.asn.required
                 || self
                     .config
                     .providers
@@ -2439,6 +2440,8 @@ geo-update-interval: 24
         let missing_config_with_demand =
             config_with_rules("rules:\n  - GEOIP,cn,proxy\n  - MATCH,proxy\n");
         assert!(updater_for(&missing_config_with_demand).await.is_some());
+        let asn_only = config_with_rules("rules:\n  - IP-ASN,0,proxy\n  - MATCH,proxy\n");
+        assert!(updater_for(&asn_only).await.is_some());
         assert!(updater_for(&configured(false, true)).await.is_some());
         assert!(updater_for(&configured(true, false)).await.is_none());
 

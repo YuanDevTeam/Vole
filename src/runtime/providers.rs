@@ -214,8 +214,16 @@ impl ProviderRuntime {
             .await
             .take()
             .ok_or_else(|| io::Error::other("provider worker already running"))?;
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut maintenance = tokio::time::interval(Duration::from_secs(1));
         loop {
+            let deadline = self.cache.lock().await.next_refresh().map(|(_, at)| at);
+            let refresh = async {
+                if let Some(deadline) = deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
             tokio::select! {
                 biased;
                 ()=parent.cancelled()=>{self.begin_shutdown();return Ok(());}
@@ -225,15 +233,29 @@ impl ProviderRuntime {
                     let result=match index {Some(index)=>self.update(index).await,None=>Err("unknown provider")};
                     let _=request.reply.send(result);
                 },
-                _=tick.tick()=>{
+                ()=refresh=>{
                     let due=self.cache.lock().await.next_due();
                     if let Some(index)=due { let _=self.update(index).await; }
-                    self.reap().await;
-                }
+                },
+                _=maintenance.tick()=>self.reap().await,
             }
         }
     }
     async fn update(self: &Arc<Self>, index: usize) -> Result<(), &'static str> {
+        let result = self.update_inner(index).await;
+        if result.is_err() && !self.cancellation.is_cancelled() {
+            let mut cache = self.cache.lock().await;
+            // Fetch/parse and ordinary candidate failures already schedule
+            // backoff. Cover later preparation/publication errors that left an
+            // expired deadline so the exact timer cannot spin immediately.
+            if cache.entries[index].next <= tokio::time::Instant::now() {
+                cache.reject(index);
+                self.record_states(&cache);
+            }
+        }
+        result
+    }
+    async fn update_inner(self: &Arc<Self>, index: usize) -> Result<(), &'static str> {
         let mut cache = self.cache.lock().await;
         let proxy = cache.entries[index].spec.proxy.clone();
         let generation = self.current.load_full();
