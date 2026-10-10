@@ -11,7 +11,7 @@
 | FINGERPRINT-INTEROP | protocol_fingerprint | 命名指纹在真实容器协议链路中的行为 |
 
 上述专用运行器可从 Git 历史查阅，未随当前精简 Mihomo 互通入口恢复；不得把它们
-当作现存命令。协议验证归 Vole，container-benchmark 只做性能评估；当前入口和
+当作现存命令。当前容器互通和压力测试由 container-benchmark 运行；入口和
 范围见 [构建与验证](../../scripts/README.md)。golden 中的 `case_id` 是用例标签；原始 TLS
 字节、解析结果、来源版本及原报告 hash 保持独立采集时的值，不表示重新抓包。
 历史运行报告不改写，按其记录的 Git revision 复核；各层结果不能互相代替。

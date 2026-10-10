@@ -1,6 +1,6 @@
 # REALITY V1 客户端协议
 
-本文定义 Vole 的 REALITY V1 客户端线上行为。它不是通用 REALITY 规范。经典模式为默认，可显式要求混合密钥交换。可选的四套 ClientHello 模板及混合兼容边界见 [TLS 指纹](tls-client-fingerprint.md)。
+本文定义 Vole 的 REALITY V1 客户端线上行为。它不是通用 REALITY 规范。经典模式为默认，可显式要求混合密钥交换。可选的五套 ClientHello 模板及混合兼容边界见 [TLS 指纹](tls-client-fingerprint.md)。
 
 ## 版本边界
 

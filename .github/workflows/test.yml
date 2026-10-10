@@ -262,6 +262,8 @@ jobs:
             dns::runtime::tests::concurrent_redir_host_hint_reads_and_dns_updates_complete
             dns::runtime::tests::domain_policies_use_specificity_and_preserve_geosite_order
             dns::runtime::tests::dns_policy_selection_is_consistent_across_snapshot_swaps
+            dns::runtime::tests::classical_logical_selectors_drive_dns_policy_and_sniffing_without_egress
+            dns::runtime::tests::rule_budget_propagates_through_fake_ip_policy_and_sniffer_without_egress
             runtime::tests::prepares_builtin_routes_without_static_nodes_or_bootstrap
             runtime::tests::prepares_udp_capabilities_through_runtime_wrappers
             runtime::tests::prepares_shared_mux_capabilities_and_registers_only_final_graph_nodes
