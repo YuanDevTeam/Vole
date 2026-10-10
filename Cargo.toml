@@ -49,16 +49,17 @@ default = [
 ]
 inbound-http = ["dep:rcgen", "dep:rsa"]
 inbound-socks5 = ["dep:rcgen", "dep:rsa"]
-outbound-anytls = ["dep:md-5", "tls-fingerprint"]
+outbound-anytls = ["dep:md-5", "tls-fingerprint", "ech"]
 outbound-socks5 = []
 outbound-http = []
 outbound-shadowsocks = ["dep:shadowsocks", "dep:log"]
-outbound-vless = ["tls-fingerprint", "boring/reality", "boring/jls", "boring/mlkem", "dep:blake3", "dep:vole-blake3-raw", "stream-transport", "quic-transport", "dep:hyper", "dep:hyper-util", "dep:h3", "dep:h3-quinn"]
-outbound-trojan = ["stream-transport", "tls-fingerprint"]
-outbound-vmess = ["stream-transport", "tls-fingerprint", "dep:aes", "dep:md-5", "dep:ring", "dep:shake"]
+outbound-vless = ["ech", "tls-fingerprint", "boring/reality", "boring/jls", "boring/mlkem", "dep:blake3", "dep:vole-blake3-raw", "stream-transport", "quic-transport", "dep:hyper", "dep:hyper-util", "dep:h3", "dep:h3-quinn"]
+outbound-trojan = ["stream-transport", "tls-fingerprint", "ech"]
+outbound-vmess = ["stream-transport", "tls-fingerprint", "ech", "dep:aes", "dep:md-5", "dep:ring", "dep:shake"]
 tls-fingerprint = ["dep:boring", "dep:tokio-boring"]
+ech = []
 shadow-tls-v3 = ["tls-fingerprint", "boring/shadow-tls-v3", "dep:ring"]
-outbound-hysteria2 = ["quic-transport", "dep:quinn-proto", "dep:h3", "dep:h3-quinn", "dep:blake2"]
+outbound-hysteria2 = ["ech", "quic-transport", "dep:quinn-proto", "dep:h3", "dep:h3-quinn", "dep:blake2"]
 outbound-tuic = ["quic-transport"]
 sing-mux = ["stream-transport", "dep:yamux", "tokio-util/compat"]
 outbound-wireguard = ["dep:boringtun", "dep:vole-netstack"]
@@ -104,7 +105,7 @@ bech32 = "=0.12.0"
 blake2 = { version = "=0.11.0", optional = true }
 blake3 = { version = "=1.8.7", optional = true }
 boringtun = { version = "=0.7.1", default-features = false, optional = true }
-boring = { git = "https://github.com/YuanDevTeam/boring", branch = "release", version = "=5.2.0", features = ["client-fingerprint"], optional = true }
+boring = { path = "../boring/boring", version = "=5.2.0", features = ["client-fingerprint"], optional = true }
 bytes = "1"
 crc32fast = "=1.5.2"
 domain = { version = "=0.12.3", default-features = false, features = ["std"] }
@@ -114,7 +115,7 @@ getifaddrs = "=0.6.2"
 h2 = "0.4.19"
 h3 = { version = "=0.0.8", default-features = false, optional = true }
 h3-quinn = { version = "=0.0.10", default-features = false, optional = true }
-hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "aes", "chacha", "x25519", "mlkem"] }
+hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "aes", "chacha", "x25519", "nistp", "mlkem", "shake"] }
 http = "1"
 hyper = { version = "=1.11.1", default-features = false, features = ["client", "http1"], optional = true }
 hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio"], optional = true }
@@ -149,7 +150,7 @@ socket2 = { version = "0.6", features = ["all"] }
 thiserror = "2"
 time = { version = "=0.3.55", features = ["formatting"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
-tokio-boring = { git = "https://github.com/YuanDevTeam/boring", branch = "release", version = "=5.2.0", optional = true }
+tokio-boring = { path = "../boring/tokio-boring", version = "=5.2.0", optional = true }
 tokio-rustls = { version = "=0.26.5", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"], optional = true }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -208,7 +209,7 @@ windows-core = { version = "=0.62.2", optional = true }
 [dev-dependencies]
 sevenz-rust2 = { version = "=0.23.0", default-features = false, features = ["compress"] }
 # Native peer controls for bounded in-memory ALPS tests; same source as boring.
-boring-sys = { git = "https://github.com/YuanDevTeam/boring", branch = "release", version = "=5.2.0" }
+boring-sys = { path = "../boring/boring-sys", version = "=5.2.0" }
 foreign-types = "=0.5.0"
 tokio = { version = "1", features = ["test-util"] }
 # Independent EIH relay fixture only; production crypto remains the official SS crate.

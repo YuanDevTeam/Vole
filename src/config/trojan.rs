@@ -249,6 +249,12 @@ pub(super) struct RawTrojan {
     )]
     client_fingerprint: Option<String>,
     #[serde(
+        rename = "ech-opts",
+        default,
+        deserialize_with = "super::ech::deserialize"
+    )]
+    ech_opts: Option<super::ech::RawEch>,
+    #[serde(
         rename = "dialer-proxy",
         default,
         deserialize_with = "deserialize_present_option"
@@ -353,6 +359,16 @@ impl RawTrojan {
             return invalid("Trojan ALPN does not include the selected transport");
         }
         let fingerprint = super::normalize_certificate_fingerprint(self.fingerprint.as_deref())?;
+        let client_fingerprint =
+            super::parse_client_fingerprint(self.client_fingerprint.as_deref())?;
+        let ech = self
+            .ech_opts
+            .map(|raw| raw.normalize(client_fingerprint.is_some()))
+            .transpose()?
+            .flatten();
+        if ech.is_some() && server_name.parse::<std::net::IpAddr>().is_ok() {
+            return invalid("Trojan ECH requires DNS sni");
+        }
         Ok((
             self.name,
             self.dialer_proxy,
@@ -364,9 +380,8 @@ impl RawTrojan {
                 server_name,
                 transport,
                 tls: TlsClientPolicy {
-                    client_fingerprint: super::parse_client_fingerprint(
-                        self.client_fingerprint.as_deref(),
-                    )?,
+                    ech,
+                    client_fingerprint,
                     alpn,
                     certificate: super::TlsCertificatePolicy {
                         skip_cert_verify: self.skip_cert_verify,

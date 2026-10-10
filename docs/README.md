@@ -10,7 +10,7 @@
 - [Controller](controller-api.md)：认证、组与资源、连接管理、规则/配置/DNS 诊断和 TUN 流量。
 - [混合入站](inbounds.md)：同端口 HTTP 转发/隧道、SOCKS5 TCP/授权 UDP、监听及认证。
 - [出站](outbounds.md)：HTTP(S) CONNECT、SOCKS5、AnyTLS、Trojan、VMess AEAD、Hysteria2、TUIC v5、SS 2022。
-- [VLESS](vless.md)：传输、Vision、Encryption、REALITY、JLS、静态 ECH。
+- [VLESS](vless.md)：传输、Vision、Encryption、REALITY、JLS、ECH。
 - [XHTTP 与 sing-mux](xhttp.md)：双腿、H1/H2/H3、连接池及复用。
 - [TLS 证书与指纹](tls-client-fingerprint.md)：证书 pin、ClientHello 模板、身份与缓存。
 - [REALITY 线协议](reality-wire-protocol.md)：认证、密钥与失败边界。

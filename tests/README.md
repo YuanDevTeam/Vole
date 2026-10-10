@@ -21,6 +21,8 @@ cargo test --locked --lib dns::hosts::tests::
 cargo test --locked --lib config::name_regex::tests::
 cargo test --locked --lib config::override_expr::tests::
 cargo test --locked --lib override_expr_materializes_after_filters_and_structured_names
+cargo test --locked --no-default-features --features cli --lib dns::runtime::ech_tests::
+cargo test --locked --no-default-features --features cli --test ech_config
 cargo test --locked --lib config::tls_policy_tests::
 cargo test --locked --lib config::tls_trust::tests::
 cargo test --locked --lib security::context::tests::
@@ -87,6 +89,7 @@ uv run --project scripts --locked ruff format --check scripts
 ```
 
 DNS URL 参数、DoH GET/Basic、H2 并发与取消、ALPN/H1 回退只使用内存报文、显式来源快照和 duplex TLS 对端。DoQ/H3 与版本竞争使用有界 memory DatagramTransport 和抽象 Quinn socket；不读取宿主 DNS 或启动监听服务。
+`dns::runtime::ech_tests::` 与 `security::ech_dynamic_tests::` 使用内存 DNS 报文、显式来源快照和 duplex TLS，验证 HTTPS65 ECH 来源、节点角色、内层名称、取消和 Stop。`security::ech::tests::` 用真实 rustls Outer/Inner 加解密验证各 KEM/KDF/AEAD 家族，命名模板保留独立准入。
 `controller_secure_` 使用 duplex HTTP/TLS/H2、内存证书与临时文件，验证 CORS、共享鉴权/路由、客户端认证与握手签名、RSA 2048、候选更新及 Stop；不绑定宿主监听器。
 
 Windows UWP bridge 的名称准入与匹配使用独立过滤器；下列测试仅处理 JSON、匹配策略

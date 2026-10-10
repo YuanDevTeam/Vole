@@ -31,6 +31,10 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   HTTP 出站已有的可选 TLS 字段保留 null 等同省略的行为。
   凭据、UUID、业务目标和完整请求不进入 Debug/错误；资源与 Stop 见[公共策略](runtime-resource-policy.md)。
 
+VMess + TLS、Trojan、AnyTLS、VLESS 和 Hysteria2 支持 `ech-opts.enable/config/query-server-name`，
+静态优先和动态节点 DNS 来源、后端算法及失败边界见 [ECH](vless.md#ech)。
+TUIC 的固定参考未消费 ECH，因此不接受该字段。
+
 ## HTTP / HTTPS CONNECT
 
 `type: http` 提供 TCP CONNECT；`tls: true` 在代理链路使用共享 TLS 与证书策略。
@@ -55,7 +59,8 @@ TCP 保留域名交由上游解析；UDP 由控制连接拥有，校验 relay �
 支持 v2、兼容 v1 的会话、内置填充与 UoT v2。password 为 1–1024 UTF-8 字节；
 SNI 默认 server；ALPN 省略/空列表不发送，非空保持顺序，不强制选中某协议。
 支持独立的 `name-cert-verify` 和成对内联 PEM 或文件路径 `certificate/private-key` 客户端身份；
-不开放 TLS 版本、ECH、REALITY 和填充参数。命名指纹沿用共享 TLS。
+支持共享静态/动态 `ech-opts`，强制真实 TLS1.3 接受后才能发送认证与业务；
+不开放 TLS 版本、REALITY和填充参数。命名指纹沿用共享 TLS。
 
 连接先发送 SHA-256 密码摘要、认证填充和首个会话批次。Settings 固定声明 v=2 和
 填充方案 MD5，`client-metadata` 原样写入 client 值，缺省为空，不自行填产品/版本标识；

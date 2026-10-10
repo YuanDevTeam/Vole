@@ -32,7 +32,7 @@ pub struct Hysteria2Outbound {
     config: Arc<Hysteria2OutboundConfig>,
     server: Destination,
     upstream: UpstreamPath,
-    tls: Arc<rustls::ClientConfig>,
+    tls: StandardTlsClient,
     current: AsyncMutex<Option<Arc<Session>>>,
     cancel: CancellationToken,
     admission: Mutex<()>,
@@ -92,6 +92,7 @@ impl Hysteria2Outbound {
             security,
             &config.tls.server_name,
             TlsClientOptions {
+                ech: config.tls.ech.clone(),
                 versions: TlsVersions::Tls13,
                 alpn: config.tls.alpn.clone(),
                 certificate: config.tls.certificate.clone(),
@@ -107,9 +108,7 @@ impl Hysteria2Outbound {
             },
             resumption_sessions,
             buffer_limit,
-        )?
-        .quic_config()?
-        .0;
+        )?;
         Ok(Self {
             config: Arc::new(config.clone()),
             server: server_destination(&config.address, config.port)?,
@@ -239,7 +238,7 @@ async fn drive(
     config: Arc<Hysteria2OutboundConfig>,
     upstream: UpstreamPath,
     server: Destination,
-    tls: Arc<rustls::ClientConfig>,
+    tls: StandardTlsClient,
     datagram: DatagramSession,
     context: EstablishContext,
     cancel: CancellationToken,
@@ -256,6 +255,10 @@ async fn drive(
     let deadline = context.deadline();
     let operation = async {
         let _handshake = observation::track(ResourceKind::Handshake);
+        let (tls, _) = tls
+            .quic_config_with_context(&context)
+            .await
+            .map_err(failure)?;
         let (path, socket) = super::paths::Paths::open(
             config.clone(),
             upstream,

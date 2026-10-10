@@ -101,7 +101,10 @@ impl TrojanOutbound {
             .connect_server(session, &self.server, context)
             .await?;
         context
-            .run_io("Trojan TLS handshake", self.tls.connect(raw.io))
+            .run_io(
+                "Trojan TLS handshake",
+                self.tls.connect_with_context(raw.io, context),
+            )
             .await
     }
 

@@ -21,6 +21,7 @@ enum Source {
 
 struct State {
     source: OnceLock<Source>,
+    measurement_ech: OnceLock<Weak<RuntimeDns>>,
     ipv6: bool,
     cancel: CancellationToken,
 }
@@ -43,7 +44,7 @@ impl std::fmt::Debug for ResolutionContext {
 #[derive(Clone)]
 struct ActiveResolution {
     deadline: Instant,
-    names: Vec<(usize, bool, String)>,
+    names: Vec<(usize, bool, u16, String)>,
 }
 
 tokio::task_local! {
@@ -67,6 +68,7 @@ impl ResolutionContext {
             ip_version: crate::config::IpVersion::Dual,
             inner: Some(Arc::new(State {
                 source: OnceLock::new(),
+                measurement_ech: OnceLock::new(),
                 ipv6,
                 cancel: CancellationToken::new(),
             })),
@@ -83,8 +85,8 @@ impl ResolutionContext {
             .map_err(|_| io::ErrorKind::AlreadyExists.into())
     }
 
-    /// Private measurement lifetime: no Running Session, RuntimeDns, listener,
-    /// or system-fallback path is constructed by this context.
+    /// Private measurement lifetime. Address lookup uses only the original
+    /// resolver; raw ECH records use a separately owned weak DNS leaf.
     pub fn measurement(bootstrap: Arc<dyn Resolver>, ipv6: bool) -> Self {
         let context = Self::runtime(ipv6);
         let _ = context
@@ -94,6 +96,66 @@ impl ResolutionContext {
             .source
             .set(Source::Measurement(bootstrap));
         context
+    }
+
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn bind_measurement_ech(&self, dns: &Arc<RuntimeDns>) -> io::Result<()> {
+        self.inner
+            .as_ref()
+            .ok_or(io::ErrorKind::InvalidInput)?
+            .measurement_ech
+            .set(Arc::downgrade(dns))
+            .map_err(|_| io::ErrorKind::AlreadyExists.into())
+    }
+
+    pub(crate) fn resolve_ech<'a>(
+        &'a self,
+        name: &'a str,
+        deadline: Instant,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Vec<u8>>> + Send + 'a>> {
+        // DNS transports can establish a TLS node whose ECH query returns to
+        // this boundary; erase the recursive future without spawning a task.
+        Box::pin(async move {
+            let name =
+                canonicalize_name(name).map_err(|_| io::Error::other("invalid ECH query name"))?;
+            let state = self
+                .inner
+                .as_ref()
+                .ok_or_else(|| io::Error::other("ECH DNS source unavailable"))?;
+            let dns = match state.source.get() {
+                Some(Source::Runtime(dns)) => dns.as_ref().and_then(Weak::upgrade),
+                Some(Source::Measurement(_)) => state.measurement_ech.get().and_then(Weak::upgrade),
+                None => None,
+            }
+            .ok_or_else(|| io::Error::other("ECH DNS source unavailable"))?;
+            let deadline = inherited_deadline(deadline);
+            let key = (Arc::as_ptr(state) as usize, true, 65, name.clone());
+            let mut active = ACTIVE.try_with(Clone::clone).unwrap_or(ActiveResolution {
+                deadline,
+                names: Vec::new(),
+            });
+            if deadline <= Instant::now() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            if active.names.contains(&key) || active.names.len() >= MAX_RESOLUTION_DEPTH {
+                return Err(io::Error::other("recursive ECH DNS dependency"));
+            }
+            active.deadline = deadline;
+            active.names.push(key);
+            let _waiter = crate::resources::observation::track(
+                crate::resources::observation::ResourceKind::Waiter,
+            );
+            tokio::select! { biased;
+                () = state.cancel.cancelled() => Err(io::ErrorKind::Interrupted.into()),
+                result = timeout_at(deadline, ACTIVE.scope(active, dns.query_proxy_ech(&name, deadline))) => {
+                    if Instant::now() >= deadline {
+                        Err(io::ErrorKind::TimedOut.into())
+                    } else {
+                        result.map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+                    }
+                },
+            }
+        })
     }
 
     pub fn close(&self) {
@@ -242,7 +304,7 @@ impl ResolutionContext {
                 || Arc::as_ptr(inner.unwrap()) as usize,
                 |dns| dns as *const RuntimeDns as usize,
             );
-            let key = (identity, proxy, host.clone());
+            let key = (identity, proxy, 0, host.clone());
             let mut active = ACTIVE.try_with(Clone::clone).unwrap_or(ActiveResolution {
                 deadline,
                 names: Vec::new(),

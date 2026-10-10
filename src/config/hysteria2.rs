@@ -63,6 +63,12 @@ pub(super) struct RawHysteria2 {
     #[serde(default, deserialize_with = "deserialize_present_option")]
     fingerprint: Option<String>,
     #[serde(
+        rename = "ech-opts",
+        default,
+        deserialize_with = "super::ech::deserialize"
+    )]
+    ech_opts: Option<super::ech::RawEch>,
+    #[serde(
         rename = "certificate",
         default,
         deserialize_with = "deserialize_present_option"
@@ -187,6 +193,14 @@ impl RawHysteria2 {
         {
             return invalid("invalid Hysteria2 ALPN list");
         }
+        let ech = self
+            .ech_opts
+            .map(|raw| raw.normalize(false))
+            .transpose()?
+            .flatten();
+        if ech.is_some() && server_name.parse::<std::net::IpAddr>().is_ok() {
+            return invalid("Hysteria2 ECH requires DNS sni");
+        }
         let identity = normalize_client_identity(self.certificate, self.private_key)?;
         let fingerprint = normalize_certificate_fingerprint(self.fingerprint.as_deref())?;
         let udp_mtu = if self.udp_mtu == 0 {
@@ -206,7 +220,7 @@ impl RawHysteria2 {
                 port,
                 password: self.password,
                 tls: TlsConfig {
-                    ech: None,
+                    ech,
                     client_fingerprint: None,
                     server_name,
                     alpn: alpn.into_iter().map(String::into_bytes).collect(),

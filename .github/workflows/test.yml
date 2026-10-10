@@ -139,7 +139,7 @@ jobs:
           require(not features(wireguard) & {"device", "ffi-bindings", "jni-bindings"}, "WireGuard must use only the userspace protocol")
           require("ring" in features(rustls) and not features(rustls) & {"reality", "aws_lc_rs", "fips"}, "rustls must use only the ring TLS provider")
           hpke = package("hpke", "0.14.1")
-          require(features(hpke) == {"alloc", "aes", "chacha", "x25519", "hkdfsha2", "mlkem", "shake"}, "unapproved HPKE algorithms")
+          require(features(hpke) == {"alloc", "aes", "chacha", "x25519", "hkdfsha2", "nistp", "mlkem", "shake"}, "unapproved HPKE algorithms")
           age = package("age", "0.11.5")
           require(features(age) == {"armor"}, "AGE must use only native armored-file decoding")
           package("age-core", "0.11.0")
@@ -226,7 +226,7 @@ jobs:
             dns::runtime::tests::resolve_ipv6_
             dns::source::tests:: dns::runtime::tests::dns_source_
             dns::runtime::encrypted_tests::
-            dns::options::tests:: dns::runtime::quic_tests::
+            dns::options::tests:: dns::runtime::quic_tests:: dns::runtime::ech_tests::
             controller_secure_
             outbound::http::tests:: outbound::wireguard::tests:: inbound::mixed::tests:: inbound::socks5::association::tests::
             inbound::http::parser::tests:: inbound::http::framing::tests::

@@ -632,7 +632,10 @@ impl VlessOutbound {
             .await?;
         tracing::debug!(stage = "upstream", "VLESS transport stage completed");
         let secured = context
-            .run_io("VLESS TLS/REALITY handshake", leg.security.connect(raw.io))
+            .run_io(
+                "VLESS TLS/REALITY handshake",
+                leg.security.connect_with_context(raw.io, context),
+            )
             .await?;
         tracing::debug!(stage = "security", "VLESS transport stage completed");
         Ok(secured)
@@ -660,7 +663,7 @@ impl VlessOutbound {
                     .await
                     .map(TransportIo::Stream);
             }
-            let (tls, server_name) = leg.security.quic_config()?;
+            let (tls, server_name) = leg.security.quic_config_with_context(context).await?;
             let server = leg.upstream.datagram_server(&leg.server, context).await?;
             let peer = context.resolve_ip(&server).await?;
             let budget = DatagramBudget::new(1400, 1400);

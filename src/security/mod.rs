@@ -9,8 +9,8 @@ mod boring_stream;
 #[cfg(feature = "outbound-vless")]
 mod client;
 mod context;
-#[cfg(feature = "outbound-vless")]
-mod ech;
+#[cfg(feature = "ech")]
+pub(crate) mod ech;
 mod resumption;
 #[cfg(feature = "shadow-tls-v3")]
 mod shadow_tls;
@@ -44,6 +44,7 @@ fn test_profiles() -> &'static [Option<crate::config::ClientFingerprint>] {
             Some(Chrome133),
             Some(Firefox120),
             Some(Safari16),
+            Some(Ios14),
         ]
     }
     #[cfg(not(feature = "tls-fingerprint"))]
@@ -51,3 +52,7 @@ fn test_profiles() -> &'static [Option<crate::config::ClientFingerprint>] {
         &[None]
     }
 }
+
+#[cfg(all(test, feature = "outbound-vless", feature = "tls-fingerprint"))]
+#[path = "ech_dynamic_tests.rs"]
+mod ech_dynamic_tests;
