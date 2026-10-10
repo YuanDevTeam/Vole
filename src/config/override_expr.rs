@@ -9,6 +9,9 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "override_expr_case.rs"]
+mod unicode_case;
+
 const SOURCE_LIMIT: usize = 16 * 1024;
 const NODE_LIMIT: usize = 4096;
 const COMPILE_NODES: usize = 64 * 1024;
@@ -578,7 +581,14 @@ impl Parser<'_> {
             Token::Number(number) => Node::Literal(number_value(&number, false)?),
             Token::String(raw) => Node::String(interpolation(&raw, self.limits, depth + 1)?),
             Token::Symbol("~") => Node::Literal(Value::Null),
-            Token::Symbol("-") => Node::Neg(Box::new(self.expression(10, depth + 1)?)),
+            Token::Symbol("-") => match self.peek() {
+                Token::Number(number) if !number.starts_with("0x") && !number.starts_with("0X") => {
+                    let number = format!("-{number}");
+                    self.next();
+                    Node::Literal(number_value(&number, false)?)
+                }
+                _ => Node::Neg(Box::new(self.expression(10, depth + 1)?)),
+            },
             Token::Symbol("(") => {
                 let node = self.expression(0, depth + 1)?;
                 self.expect(")")?;
@@ -1156,6 +1166,30 @@ fn single(node: &Node, input: &Value, budget: &mut Budget<'_>, depth: usize) -> 
             evaluate(node, vec![input], budget, depth + 1)
         }
     }
+}
+fn simple_case_map(input: &str, upper: bool, budget: &mut Budget<'_>) -> Result<String> {
+    let mut chars = input.chars();
+    let mut output = String::new();
+    budget.reserve(0)?;
+    loop {
+        let mut batch = ['\0'; 128];
+        let mut count = 0;
+        let mut bytes = 0;
+        for (index, character) in chars.by_ref().take(batch.len()).enumerate() {
+            let mapped = unicode_case::map(character, upper);
+            batch[index] = mapped;
+            count = index + 1;
+            bytes += mapped.len_utf8();
+        }
+        if count == 0 {
+            break;
+        }
+        budget.reserve(bytes)?;
+        for character in &batch[..count] {
+            output.push(*character);
+        }
+    }
+    Ok(output)
 }
 fn append(output: &mut String, text: &str, budget: &mut Budget<'_>) -> Result<()> {
     budget.reserve(text.len())?;
@@ -2019,18 +2053,9 @@ fn binary(
         && matches!(b, Value::Number(number) if !number.is_f64())
         && operator != Op::Div
     {
-        // The reference dialect computes signed platform integers after a
-        // float64 projection. Preserve its 64-bit arithmetic and wrap behavior.
-        let integer = |value: &Value| -> Result<i64> {
-            let value = numeric(value)?;
-            Ok(
-                if value >= 9_223_372_036_854_775_808.0 || value < -9_223_372_036_854_775_808.0 {
-                    i64::MIN
-                } else {
-                    value as i64
-                },
-            )
-        };
+        // The reference projects integer operands through float64, saturates
+        // the signed conversion, then performs wrapping integer arithmetic.
+        let integer = |value: &Value| -> Result<i64> { Ok(numeric(value)? as i64) };
         let (a, b) = (integer(a)?, integer(b)?);
         let result = match operator {
             Op::Add => a.wrapping_add(b),
@@ -2469,11 +2494,13 @@ fn call(
             let value = input
                 .as_str()
                 .ok_or_else(|| error("provider override string transform requires a string"))?;
-            budget.reserve(value.len().saturating_mul(3))?;
             Value::String(match name {
-                "upcase" => value.to_uppercase(),
-                "downcase" => value.to_lowercase(),
-                _ => value.trim().to_owned(),
+                "upcase" => simple_case_map(value, true, budget)?,
+                "downcase" => simple_case_map(value, false, budget)?,
+                _ => {
+                    budget.reserve(value.len().saturating_mul(3))?;
+                    value.trim().to_owned()
+                }
             })
         }
         "tostring" => {
@@ -2635,6 +2662,73 @@ mod tests {
             .apply(&mut value, &mut Budget::new(None))
             .unwrap();
         value
+    }
+    #[test]
+    fn case_transforms_use_simple_unicode_mapping() {
+        let result = run(
+            "name: fixture\n",
+            r#".upper = ("straße ﬁ ᾀ ας 𐐨" | upcase) | .lower = ("İΣ ΟΣ ᾈ 𐐀 中" | downcase)"#,
+        );
+        assert_eq!(result["upper"], Value::String("STRAßE ﬁ ᾈ ΑΣ 𐐀".into()));
+        assert_eq!(result["lower"], Value::String("iσ οσ ᾀ 𐐨 中".into()));
+        // Later Unicode case pairs retain identity under the fixed Go15 data.
+        let later = "\u{019b}\u{0264}\u{1c89}\u{10d50}\u{16ea0}";
+        for upper in [true, false] {
+            assert_eq!(
+                simple_case_map(later, upper, &mut Budget::new(None)).unwrap(),
+                later
+            );
+        }
+    }
+    #[test]
+    fn simple_case_mapping_checks_cancel_and_actual_utf8_output_budget() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(simple_case_map("input", true, &mut Budget::new(Some(&cancel))).is_err());
+        let mut budget = Budget::new(None);
+        budget.bytes = BYTE_LIMIT - 2;
+        // U+023F has a two-byte UTF-8 input and maps to three-byte U+2C7E.
+        assert!(simple_case_map("ȿ", true, &mut budget).is_err());
+    }
+    #[test]
+    fn simple_case_mapping_charges_bounded_batches() {
+        let input = "a".repeat(16 * 1024);
+        let mut budget = Budget::new(None);
+        assert_eq!(
+            simple_case_map(&input, true, &mut budget).unwrap(),
+            "A".repeat(input.len())
+        );
+        assert_eq!(budget.bytes, input.len());
+        assert!(budget.steps < 200);
+    }
+    #[test]
+    fn signed_minimum_literal_is_parsed_with_its_sign() {
+        let result = run(
+            "name: fixture\n",
+            r#".minimum = -9223372036854775808 | .maximum = 9223372036854775807 | .hex = [-0x10, -0X10] | .large = [9223372036854775807, 9223372036854775807 + 1, -9223372036854775808, ("9223372036854775807" | tonumber)]"#,
+        );
+        assert_eq!(result["minimum"].as_i64(), Some(i64::MIN));
+        assert_eq!(result["maximum"].as_i64(), Some(i64::MAX));
+        assert_eq!(
+            result["hex"],
+            serde_yaml_ng::from_str::<Value>("[-16, -16]").unwrap()
+        );
+        assert_eq!(
+            result["large"],
+            Value::Sequence(vec![
+                Value::Number(i64::MAX.into()),
+                Value::Number(i64::MIN.into()),
+                Value::Number(i64::MIN.into()),
+                Value::Number(i64::MAX.into()),
+            ])
+        );
+        for expression in [
+            ".x = 9223372036854775808",
+            ".x = 18446744073709551615",
+            ".x = -9223372036854775809",
+        ] {
+            assert!(Expr::parse(expression).is_err());
+        }
     }
     #[test]
     fn transforms_preserve_stream_order_and_update_context() {

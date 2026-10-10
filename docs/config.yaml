@@ -614,6 +614,8 @@ proxy-groups:
 # map/map_values/filter/to_entries/from_entries/with_entries/any_c/all_c；
 # test/sub/split/join/upcase/downcase/trim/tostring/tonumber/type/not。
 # transform 函数允许分号分隔的独立参数流；any_c/all_c 按成员短路，from_entries 要求 key/value。
+# upcase/downcase 使用 Unicode 15 单字符映射，不扩展字符或按单词上下文改变 sigma；trim 独立处理空白。
+# 整数 literal 为有符号 64 位，含 -9223372036854775808；超出该范围的整数 literal 拒绝。
 # = 右侧读取根，|= 读取旧目标；赋值右侧的 pipeline/and/or 须带括号，多结果须收集。
 # mapping 值取最后结果，无结果省略；插值取首结果。sub 全局替换，使用 Go 的 $capture。
 # 每项最多 16 KiB/4096 tokens 与节点、深度 32；整份配置编译最多 512 KiB/65536 tokens
