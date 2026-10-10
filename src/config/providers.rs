@@ -34,6 +34,8 @@ pub enum RuleFormat {
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ProviderSpec {
+    #[serde(skip)]
+    pub(crate) age_identities: Option<crate::resource::age_provider::Identities>,
     #[serde(rename = "type")]
     pub kind: ProviderType,
     #[serde(default)]
@@ -193,12 +195,12 @@ impl ProviderTemplate {
             let Some(value) = map.remove(key) else {
                 return Ok(Vec::new());
             };
-            let entries = value
-                .as_mapping()
-                .ok_or_else(|| VoleError::InvalidConfig("providers must be a mapping".into()))?;
+            let Value::Mapping(entries) = value else {
+                return invalid("providers must be a mapping");
+            };
             entries
-                .iter()
-                .map(|(name, spec)| {
+                .into_iter()
+                .map(|(name, mut spec)| {
                     let name = name
                         .as_str()
                         .filter(|name| !name.is_empty())
@@ -208,8 +210,22 @@ impl ProviderTemplate {
                             )
                         })?
                         .to_owned();
-                    let spec: ProviderSpec = serde_yaml_ng::from_value(spec.clone())
+                    let age = spec
+                        .as_mapping_mut()
+                        .and_then(|map| map.remove("age-secret-key"));
+                    if is_rule && age.is_some() {
+                        if let Some(Value::String(secret)) = age {
+                            let _ = zeroize::Zeroizing::new(secret);
+                        }
+                        return invalid("rule providers do not accept age-secret-key");
+                    }
+                    let identities = age
+                        .map(crate::resource::age_provider::Identities::from_value)
+                        .transpose()?
+                        .flatten();
+                    let mut spec: ProviderSpec = serde_yaml_ng::from_value(spec)
                         .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
+                    spec.age_identities = identities;
                     spec.validate(is_rule)?;
                     Ok((name, spec))
                 })
@@ -227,11 +243,28 @@ impl ProviderTemplate {
     pub(crate) fn key(is_rule: bool, name: &str) -> String {
         format!("{}/{name}", if is_rule { "rules" } else { "proxies" })
     }
+    #[cfg(test)]
     pub(crate) fn parse_content(
         &self,
         spec: &ProviderSpec,
         bytes: &[u8],
     ) -> Result<ProviderContent> {
+        self.parse_content_with_control(
+            spec,
+            bytes,
+            &crate::resource::age_provider::DecodeControl::new(
+                None,
+                std::time::Instant::now() + crate::resource::http::DEFAULT_DOWNLOAD_TIMEOUT,
+            ),
+        )
+    }
+    pub(crate) fn parse_content_with_control(
+        &self,
+        spec: &ProviderSpec,
+        bytes: &[u8],
+        control: &crate::resource::age_provider::DecodeControl<'_>,
+    ) -> Result<ProviderContent> {
+        control.check()?;
         if let Some(behavior) = spec.behavior {
             return RuleCollection::parse(bytes, behavior, spec.format)
                 .map(|data| ProviderContent::Rules(Arc::new(data)));
@@ -240,9 +273,17 @@ impl ProviderTemplate {
         struct Payload {
             proxies: Vec<Value>,
         }
-        let raw = yaml::parse(bytes)?;
+        let decoded = crate::resource::age_provider::decode(
+            bytes,
+            spec.age_identities.as_ref(),
+            control,
+            MAX_CONFIG_BYTES,
+        )?;
+        let raw = yaml::parse(decoded.as_ref())
+            .map_err(|_| VoleError::InvalidConfig("invalid proxy provider YAML".into()))?;
         let parsed: Payload = serde_yaml_ng::from_value(raw)
-            .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
+            .map_err(|_| VoleError::InvalidConfig("invalid proxy provider YAML".into()))?;
+        control.check()?;
         Ok(ProviderContent::Proxies(parsed.proxies))
     }
     fn bundled(&self, spec: &ProviderSpec) -> Result<ProviderContent> {
@@ -739,6 +780,39 @@ fn apply_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn age_provider_identities_are_validated_before_content_read() {
+        let key = include_str!("../../tests/fixtures/provider-age/x25519.key").trim_end();
+        let yaml =
+            format!("proxy-providers:\n  nodes: {{type: inline, age-secret-key: '{key}'}}\n");
+        let template = ProviderTemplate::extract(serde_yaml_ng::from_str(&yaml).unwrap()).unwrap();
+        let spec = &template.proxies[0].1;
+        assert!(spec.age_identities.is_some());
+        for bytes in [
+            include_bytes!("../../tests/fixtures/provider-age/x25519.age").as_slice(),
+            include_bytes!("../../tests/fixtures/provider-age/provider.yaml").as_slice(),
+        ] {
+            let ProviderContent::Proxies(nodes) = template.parse_content(spec, bytes).unwrap()
+            else {
+                panic!("proxy provider content");
+            };
+            assert_eq!(nodes[0]["name"].as_str(), Some("age-node"));
+        }
+        for value in ["null", "''"] {
+            let yaml =
+                format!("proxy-providers:\n  nodes: {{type: inline, age-secret-key: {value}}}\n");
+            ProviderTemplate::extract(serde_yaml_ng::from_str(&yaml).unwrap()).unwrap();
+        }
+        for yaml in [
+            "proxy-providers:\n  nodes: {type: inline, age-secret-key: invalid-private-fixture}\n",
+            "rule-providers:\n  nodes: {type: inline, behavior: domain, age-secret-key: null}\n",
+        ] {
+            let error =
+                ProviderTemplate::extract(serde_yaml_ng::from_str(yaml).unwrap()).unwrap_err();
+            assert!(!error.to_string().contains("invalid-private-fixture"));
+        }
+    }
     #[test]
     fn static_members_filtered_to_empty_use_the_declared_fallback() {
         for (fallback, expected) in [

@@ -371,3 +371,66 @@ async fn failed_304_sidecar_write_does_not_publish_subscription_metadata() {
         body
     );
 }
+
+#[tokio::test]
+async fn age_provider_cache_and_file_refresh_preserve_candidate_contract() {
+    let root = tempfile::tempdir().unwrap();
+    let mut template = template();
+    Arc::make_mut(&mut template).proxies[0].1.age_identities =
+        super::super::age_provider::Identities::from_value(serde_yaml_ng::Value::String(
+            include_str!("../../tests/fixtures/provider-age/x25519.key").into(),
+        ))
+        .unwrap();
+    let ciphertext = include_str!("../../tests/fixtures/provider-age/x25519.age");
+    let mut cache = ProviderCache::open(root.path(), template.clone()).unwrap();
+    let candidate = fetch(&mut cache, response(200, "", ciphertext))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        candidate.metadata.hash,
+        hex(&Sha256::digest(ciphertext.as_bytes()))
+    );
+    commit_valid(&mut cache, candidate);
+    let old = cache.contents.clone();
+    let cache_path = cache.entries[0].path.as_ref().unwrap().clone();
+    assert_eq!(fs::read(&cache_path).unwrap(), ciphertext.as_bytes());
+    let recovered = ProviderCache::open(root.path(), template).unwrap();
+    assert_eq!(recovered.contents, old);
+    assert_eq!(
+        recovered.entries[0].metadata.etag.as_deref(),
+        Some("\"fixture\"")
+    );
+    let wrong_recipient = include_str!("../../tests/fixtures/provider-age/hybrid.age");
+    assert!(
+        fetch(&mut cache, response(200, "", wrong_recipient))
+            .await
+            .is_err()
+    );
+    assert_eq!(cache.contents, old);
+    assert_eq!(fs::read(&cache_path).unwrap(), ciphertext.as_bytes());
+    assert!(cache.entries[0].state.available);
+    assert_eq!(
+        cache.entries[0].metadata.etag.as_deref(),
+        Some("\"fixture\"")
+    );
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let stopped =
+        ProviderCache::open_with_cancel(root.path(), cache.template.clone(), Some(&cancellation));
+    assert_eq!(stopped.err().unwrap().kind(), io::ErrorKind::Interrupted);
+    let mut file_template = cache.template.as_ref().clone();
+    file_template.proxies[0].1.kind = ProviderType::File;
+    file_template.proxies[0].1.url.clear();
+    let mut file_cache = ProviderCache::open(root.path(), Arc::new(file_template)).unwrap();
+    assert_eq!(file_cache.contents, old);
+    file_cache.entries[0].modified = None;
+    let candidate = fetch(&mut file_cache, Vec::new()).await.unwrap().unwrap();
+    commit_valid(&mut file_cache, candidate);
+    assert_eq!(file_cache.contents, old);
+    fs::write(&cache_path, wrong_recipient).unwrap();
+    file_cache.entries[0].modified = None;
+    assert!(fetch(&mut file_cache, Vec::new()).await.is_err());
+    assert_eq!(file_cache.contents, old);
+    assert!(file_cache.entries[0].state.available);
+}

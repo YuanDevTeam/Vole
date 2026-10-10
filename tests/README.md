@@ -13,6 +13,7 @@ cargo test --locked --no-default-features --features cli --bin vole cli::tests::
 cargo test --locked --no-default-features --features cli --lib invoke::foreground::tests::
 cargo test --locked --lib config::tests::
 cargo test --locked --lib config::credentials::tests::
+cargo test --locked --features cli --lib age_
 cargo test --locked --lib dns::hosts::tests::
 cargo test --locked --lib config::name_regex::tests::
 cargo test --locked --lib config::tls_policy_tests::
@@ -124,6 +125,8 @@ container-benchmark compare --source vole=/path/to/Vole
 维护，结果记录在对应运行或 PR 中；[验收边界](../docs/acceptance.md) 区分编译、互通与设备验证。
 
 `runtime::providers::tests::` 使用临时文件与内存流验证候选发布、坏更新保留、旧会话资源和停止清理；`config::` 同时覆盖 provider、规则集合和 MRS 格式。
+`age_` 使用官方 Go AGE 生成的公开 X25519/Hybrid fixture、内存流和临时文件验证解密、
+私钥准入、认证/取消/大小预算、密文缓存与失败更新保留；不运行外部进程或打开网络 socket。
 `resource::cache::tests::` 使用内存 HTTP 流和临时缓存验证订阅元信息的候选提交、304、失败保留与磁盘恢复；`resource::subscription::tests::` 验证有界数值解析。
 
 `routing::proxy_group::tests::` 覆盖自动选择、容差、恢复与选择缓存；`resource::probe::tests::` 和 `invoke::measure_delay::tests::` 使用内存流验证共享健康探测、HTTP 状态和取消。

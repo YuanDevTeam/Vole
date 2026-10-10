@@ -121,7 +121,12 @@ jobs:
           require(not features(wireguard) & {"device", "ffi-bindings", "jni-bindings"}, "WireGuard must use only the userspace protocol")
           require("ring" in features(rustls) and not features(rustls) & {"reality", "aws_lc_rs", "fips"}, "rustls must use only the ring TLS provider")
           hpke = package("hpke", "0.14.1")
-          require(features(hpke) == {"alloc", "aes", "chacha", "x25519", "hkdfsha2"}, "unapproved ECH algorithms")
+          require(features(hpke) == {"alloc", "aes", "chacha", "x25519", "hkdfsha2", "mlkem", "shake"}, "unapproved HPKE algorithms")
+          age = package("age", "0.11.5")
+          require(features(age) == {"armor"}, "AGE must use only native armored-file decoding")
+          package("age-core", "0.11.0")
+          package("x-wing", "0.1.1")
+          package("ml-kem", "0.3.2")
           native = {}
           for name, required in (("boring", {"reality", "client-fingerprint", "shadow-tls-v3", "jls"}), ("boring-sys", {"reality", "shadow-tls-v3", "jls"}), ("tokio-boring", set())):
               item = package(name, "5.2.0", {boring_source})
@@ -144,7 +149,7 @@ jobs:
               for name, required in (("shadowsocks", {"aead-cipher-2022"}), ("shadowsocks-crypto", {"v2", "aws-lc"})):
                   require(required <= features(chain[name]), f"{name} must enable SS 2022")
               require(not any(features(item) & {"fips", "aead-cipher-2022-extra", "v2-extra"} for item in chain.values()), "unapproved SS 2022 or AWS-LC mode")
-          print("Locked TLS sources, providers, ECH algorithms and SS 2022 dependency chain passed")
+          print("Locked TLS sources, HPKE/AGE algorithms and SS 2022 dependency chain passed")
           PY
       - name: Production and netstack clippy
         if: matrix.profile == 'features'

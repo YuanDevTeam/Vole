@@ -76,6 +76,13 @@ impl Drop for Candidate {
 }
 impl ProviderCache {
     pub fn open(root: &Path, template: Arc<ProviderTemplate>) -> io::Result<Self> {
+        Self::open_with_cancel(root, template, None)
+    }
+    pub fn open_with_cancel(
+        root: &Path,
+        template: Arc<ProviderTemplate>,
+        cancellation: Option<&CancellationToken>,
+    ) -> io::Result<Self> {
         let mut entries = Vec::new();
         let mut contents = ProviderContents::new();
         for (rule, (name, spec)) in template
@@ -84,6 +91,9 @@ impl ProviderCache {
             .map(|item| (false, item))
             .chain(template.rules.iter().map(|item| (true, item)))
         {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             let key = ProviderTemplate::key(rule, name);
             let mut entry = ResourceEntry {
                 key: key.clone(),
@@ -129,8 +139,12 @@ impl ProviderCache {
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<Metadata>(&bytes).ok())
                     .unwrap_or_default();
-                if let Ok(bytes) = read_bounded(&path, spec.size_limit) {
-                    match template.parse_content(spec, &bytes) {
+                let control = super::age_provider::DecodeControl::new(
+                    cancellation,
+                    std::time::Instant::now() + http::DEFAULT_DOWNLOAD_TIMEOUT,
+                );
+                if let Ok(bytes) = read_bounded(&path, spec.size_limit, &control) {
+                    match template.parse_content_with_control(spec, &bytes, &control) {
                         Ok(content) => {
                             entry.state.available = true;
                             entry.state.downloaded = spec.kind == ProviderType::Http;
@@ -170,6 +184,9 @@ impl ProviderCache {
             }
             entries.push(entry);
         }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         Ok(Self {
             template,
             entries,
@@ -203,6 +220,7 @@ impl ProviderCache {
         security: crate::security::SecurityContext,
         cancellation: CancellationToken,
     ) -> io::Result<Option<Candidate>> {
+        let deadline = std::time::Instant::now() + http::DEFAULT_DOWNLOAD_TIMEOUT;
         let entry = &mut self.entries[index];
         if cancellation.is_cancelled() {
             return Err(io::ErrorKind::Interrupted.into());
@@ -221,11 +239,18 @@ impl ProviderCache {
                 let spec = entry.spec.clone();
                 let template = self.template.clone();
                 let path = path.clone();
+                let parse_cancellation = cancellation.clone();
                 let content = tokio::task::spawn_blocking(move || {
-                    let bytes = read_bounded(&path, spec.size_limit)?;
-                    template.parse_content(&spec, &bytes).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "invalid provider content")
-                    })
+                    let control = super::age_provider::DecodeControl::new(
+                        Some(&parse_cancellation),
+                        deadline,
+                    );
+                    let bytes = read_bounded(&path, spec.size_limit, &control)?;
+                    template
+                        .parse_content_with_control(&spec, &bytes, &control)
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "invalid provider content")
+                        })
                 })
                 .await
                 .map_err(io::Error::other)??;
@@ -242,7 +267,7 @@ impl ProviderCache {
                 url: entry.spec.url.clone(),
                 etag: etag_support.then(|| entry.metadata.etag.clone()).flatten(),
                 temporary_path: temporary.clone(),
-                timeout: http::DEFAULT_DOWNLOAD_TIMEOUT,
+                timeout: deadline.saturating_duration_since(std::time::Instant::now()),
                 cancellation: cancellation.clone(),
                 options: HttpOptions {
                     user_agent,
@@ -282,11 +307,21 @@ impl ProviderCache {
                     let spec = entry.spec.clone();
                     let template = self.template.clone();
                     let input = temporary.clone();
+                    let parse_cancellation = cancellation.clone();
                     let parsed = tokio::task::spawn_blocking(move || {
-                        let bytes = read_bounded(&input, spec.size_limit)?;
-                        template.parse_content(&spec, &bytes).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "invalid provider content")
-                        })
+                        let control = super::age_provider::DecodeControl::new(
+                            Some(&parse_cancellation),
+                            deadline,
+                        );
+                        let bytes = read_bounded(&input, spec.size_limit, &control)?;
+                        template
+                            .parse_content_with_control(&spec, &bytes, &control)
+                            .map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "invalid provider content",
+                                )
+                            })
                     })
                     .await
                     .map_err(io::Error::other)?;
@@ -409,21 +444,53 @@ fn unix_time(time: SystemTime) -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+fn read_bounded(
+    path: &Path,
+    limit: u64,
+    control: &super::age_provider::DecodeControl<'_>,
+) -> io::Result<Vec<u8>> {
     let limit = if limit == 0 {
         MAX_PARSE_BYTES
     } else {
         limit.min(MAX_PARSE_BYTES)
     };
-    let file = fs::File::open(path)?;
+    control
+        .check()
+        .map_err(|_| io::Error::other("provider read stopped"))?;
+    let mut file = fs::File::open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("provider path must be a regular file"));
     }
     let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(io::Error::other("provider exceeds parser byte limit"));
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        control
+            .check()
+            .map_err(|_| io::Error::other("provider read stopped"))?;
+        let available = (limit + 1 - bytes.len() as u64).min(buffer.len() as u64) as usize;
+        let count = file.read(&mut buffer[..available])?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len() as u64 + count as u64 > limit {
+            return Err(io::Error::other("provider exceeds parser byte limit"));
+        }
+        let required = bytes.len() + count;
+        if required > bytes.capacity() {
+            let capacity = bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .min(limit as usize);
+            bytes
+                .try_reserve_exact(capacity - bytes.len())
+                .map_err(|_| io::Error::other("provider input allocation failed"))?;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
     }
+    control
+        .check()
+        .map_err(|_| io::Error::other("provider read stopped"))?;
     Ok(bytes)
 }
 fn metadata_path(path: &Path) -> PathBuf {

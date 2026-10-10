@@ -745,7 +745,7 @@ mod tests {
             format!("proxies: [{{name: {name}, type: socks5, server: 192.0.2.1, port: 1080}}]\n")
         };
         std::fs::write(&file, payload("old")).unwrap();
-        let config = Config::parse_yaml(
+        let mut config = Config::parse_yaml(
             br#"
 mixed-port: 1080
 proxy-providers:
@@ -761,6 +761,13 @@ rules: ['MATCH,choice']
 "#,
         )
         .unwrap();
+        Arc::make_mut(config.providers.as_mut().unwrap()).proxies[0]
+            .1
+            .age_identities =
+            crate::resource::age_provider::Identities::from_value(serde_yaml_ng::Value::String(
+                include_str!("../../tests/fixtures/provider-age/x25519.key").into(),
+            ))
+            .unwrap();
         let manager =
             GeoDataManager::open(&root.path().join("geodata"), Duration::from_secs(86400)).unwrap();
         let prepared = PreparedCore::prepare_config(
@@ -806,17 +813,29 @@ rules: ['MATCH,choice']
         assert_eq!(&buffer, b"active");
         live.reap().await;
         assert!(weak.upgrade().is_some());
+        let encrypted = include_bytes!("../../tests/fixtures/provider-age/x25519.age");
+        std::fs::write(&file, encrypted).unwrap();
+        live.update(0).await.unwrap();
+        assert_eq!(live.groups().state("choice").unwrap().now, "age-node");
+        for bad_encrypted in [
+            include_bytes!("../../tests/fixtures/provider-age/hybrid.age").as_slice(),
+            &encrypted[..encrypted.len() - 40],
+        ] {
+            std::fs::write(&file, bad_encrypted).unwrap();
+            assert!(live.update(0).await.is_err());
+            assert_eq!(live.groups().state("choice").unwrap().now, "age-node");
+        }
         std::fs::write(
             &file,
             b"proxies: [{name: bad, type: socks5, server: missing}]\n",
         )
         .unwrap();
         assert!(live.update(0).await.is_err());
-        assert_eq!(live.groups().state("choice").unwrap().now, "new-node");
+        assert_eq!(live.groups().state("choice").unwrap().now, "age-node");
         assert!(live.providers(false)["providers"]["remote"]["error"].is_string());
         std::fs::write(&file, payload(&"x".repeat(4097))).unwrap();
         assert!(live.update(0).await.is_err());
-        assert_eq!(live.groups().state("choice").unwrap().now, "new-node");
+        assert_eq!(live.groups().state("choice").unwrap().now, "age-node");
         drop(old_session);
         live.reap().await;
         assert!(weak.upgrade().is_none());

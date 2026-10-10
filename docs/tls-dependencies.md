@@ -11,10 +11,15 @@
 | SS 2022 | 官方 shadowsocks，仅 `aead-cipher-2022` |
 | Encryption | 同一 boring 的 X25519、ML-KEM、AEAD、AES-CTR；官方 blake3 |
 | 静态 ECH | 官方 hpke + rustls HPKE trait，命名模板使用 boring ECH 接口 |
+| Provider AGE | 官方 age/age-core 的 armor、MAC 和 STREAM；Hybrid 身份用官方 hpke XWing，关闭插件与 CLI |
 
 AWS-LC 只用于 `shadowsocks → shadowsocks-crypto → aws-lc-rs → aws-lc-sys`，
 不用于 TLS/REALITY。禁止 FIPS、2022-extra 和第二套 REALITY 后端。
 BoringSSL 子模块保持原样，fork 补丁通过 feature 控制。
+
+AGE 使用获准的官方兼容稳定版本 `age 0.11.5` 与 `age-core 0.11.0`。
+其 0.12 系列强制依赖的旧 ML-KEM 与当前 `hpke 0.14.1` 的正式 KEM 依赖不兼容；
+此版本例外仅限上述两项，Hybrid 保持最新稳定 HPKE/RustCrypto 路径。
 
 ## 开发与升级
 
