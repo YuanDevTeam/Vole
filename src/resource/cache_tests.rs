@@ -89,6 +89,68 @@ fn commit_valid(cache: &mut ProviderCache, candidate: Candidate) {
         .unwrap();
 }
 
+#[tokio::test]
+async fn bundle_cache_precedes_archive_and_bad_cache_falls_back_before_http() {
+    let root = tempfile::tempdir().unwrap();
+    let template = Config::parse_yaml(br#"
+mixed-port: 1080
+rule-providers:
+  offline: {type: http, url: 'http://rules.invalid/current.mrs', path: rules.mrs, behavior: ipcidr, format: mrs, path-in-bundle: rules/cn.mrs}
+rules: ['RULE-SET,offline,DIRECT']
+"#).unwrap().providers.unwrap();
+    let member = crate::resource::bundle::tests::mrs();
+    let bundle = crate::resource::bundle::tests::archive(&member, true);
+    let archive_path = root.path().join("BundleMRS.7z");
+    let cache_path = root.path().join("rules.mrs");
+    fs::write(&archive_path, &bundle).unwrap();
+    fs::write(&cache_path, b"invalid cached MRS").unwrap();
+    let mut cache = ProviderCache::open(root.path(), template.clone()).unwrap();
+    assert!(cache.entries[0].state.available);
+    assert!(!cache.entries[0].state.downloaded);
+    assert!(cache.entries[0].metadata.bundled);
+    assert_eq!(cache.entries[0].metadata.etag, None);
+    assert_eq!(cache.next_due(), Some(0));
+    assert_eq!(fs::read(&cache_path).unwrap(), member);
+    assert_eq!(cache.entries[0].state.error, None);
+    cache.template.materialize(&cache.contents).unwrap();
+
+    // A valid local cache avoids archive parsing and still owes its first real
+    // HTTP fetch when the cached bytes were extracted from the bundle.
+    fs::write(&archive_path, b"broken archive").unwrap();
+    cache = ProviderCache::open(root.path(), template.clone()).unwrap();
+    assert!(!cache.entries[0].state.downloaded);
+    assert_eq!(cache.next_due(), Some(0));
+
+    // Bad cache and invalid bundled MRS leave the HTTP vehicle available.
+    fs::write(&cache_path, b"bad cache").unwrap();
+    fs::write(
+        &archive_path,
+        crate::resource::bundle::tests::archive(b"bad MRS", false),
+    )
+    .unwrap();
+    cache = ProviderCache::open(root.path(), template.clone()).unwrap();
+    assert!(!cache.entries[0].state.available);
+    assert_eq!(cache.next_due(), Some(0));
+    let mut reply = format!(
+        "HTTP/1.1 200 fixture\r\nETag: \"remote\"\r\nContent-Length: {}\r\n\r\n",
+        member.len()
+    )
+    .into_bytes();
+    reply.extend_from_slice(&member);
+    let candidate = fetch(&mut cache, reply).await.unwrap().unwrap();
+    commit_valid(&mut cache, candidate);
+    assert!(cache.entries[0].state.downloaded);
+    assert!(!cache.entries[0].metadata.bundled);
+    assert_eq!(
+        cache.entries[0].metadata.etag.as_deref(),
+        Some("\"remote\"")
+    );
+    assert_eq!(cache.next_refresh(), None);
+    let cache = ProviderCache::open(root.path(), template).unwrap();
+    assert!(cache.entries[0].state.downloaded);
+    assert!(!cache.entries[0].metadata.bundled);
+}
+
 #[tokio::test(start_paused = true)]
 async fn refresh_deadline_preserves_fetch_completion_phase_and_zero_disables_polling() {
     let root = tempfile::tempdir().unwrap();

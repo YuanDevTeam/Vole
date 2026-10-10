@@ -132,3 +132,5 @@ container-benchmark compare --source vole=/path/to/Vole
 `routing::proxy_group::tests::` 覆盖自动选择、容差、恢复与选择缓存；`resource::probe::tests::` 和 `invoke::measure_delay::tests::` 使用内存流验证共享健康探测、HTTP 状态和取消。
 
 Controller 主动探测与内存使用纯内存过滤：`manual_probes_keep_one_history`、`delay_query_preserves_reference`、`admits_mixed_only_direct_controller`、`current_process_has_resident_memory`。真实 HTTP 对端由 benchmark 隔离运行。
+
+规则bundle的定向内存/临时文件验证使用 `resource::bundle` 与 `resource::cache::tests::bundle_`，覆盖真实MRS成员、解码预算/取消、缓存优先及原HTTP来源回退，不启动宿主服务。

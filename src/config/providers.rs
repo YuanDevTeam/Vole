@@ -43,6 +43,8 @@ pub struct ProviderSpec {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
+    pub path_in_bundle: String,
+    #[serde(default)]
     pub interval: u64,
     #[serde(default)]
     pub proxy: String,
@@ -85,6 +87,16 @@ impl ProviderSpec {
         }
         if self.behavior == Some(RuleBehavior::Classical) && self.format == RuleFormat::Mrs {
             return invalid("classical providers do not support mrs");
+        }
+        if !is_rule && !self.path_in_bundle.is_empty() {
+            return invalid("path-in-bundle is only supported by rule providers");
+        }
+        if is_rule
+            && self.kind != ProviderType::Inline
+            && !self.path_in_bundle.is_empty()
+            && !crate::resource::bundle::valid_member(&self.path_in_bundle)
+        {
+            return invalid("invalid rule provider bundle member");
         }
         if !is_rule && self.format != RuleFormat::Yaml {
             return invalid("proxy providers use YAML");

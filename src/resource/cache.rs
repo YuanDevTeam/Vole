@@ -29,6 +29,8 @@ struct Metadata {
     etag: Option<String>,
     hash: String,
     checked: u64,
+    #[serde(default)]
+    bundled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subscription_info: Option<SubscriptionInfo>,
 }
@@ -158,6 +160,7 @@ impl ProviderCache {
                             if metadata.url == spec.url
                                 && metadata.hash == hex(&Sha256::digest(&bytes))
                             {
+                                entry.state.downloaded &= !metadata.bundled;
                                 entry.metadata = metadata;
                                 if !rule && spec.kind == ProviderType::Http {
                                     entry.state.subscription_info =
@@ -166,8 +169,8 @@ impl ProviderCache {
                                     entry.metadata.subscription_info = None;
                                 }
                             }
-                            contents.insert(key, content);
-                            if spec.kind == ProviderType::Http {
+                            contents.insert(key.clone(), content);
+                            if spec.kind == ProviderType::Http && entry.state.downloaded {
                                 entry.next = next_update(
                                     spec.interval,
                                     entry
@@ -179,6 +182,68 @@ impl ProviderCache {
                         }
                         Err(_) => entry.state.error = Some("invalid cached content"),
                     }
+                }
+                if rule && !spec.path_in_bundle.is_empty() && !contents.contains_key(&key) {
+                    let fallback_cancellation = CancellationToken::new();
+                    let cancellation = cancellation.unwrap_or(&fallback_cancellation);
+                    if let Ok((bytes, content)) = super::bundle::read_member(
+                        root,
+                        &spec.path_in_bundle,
+                        spec.size_limit,
+                        cancellation,
+                    )
+                    .and_then(|bytes| {
+                        template
+                            .parse_content_with_control(spec, &bytes, &control)
+                            .map(|content| (bytes, content))
+                            .map_err(|_| io::Error::other("invalid bundled rule content"))
+                    }) {
+                        if cancellation.is_cancelled() {
+                            return Err(io::ErrorKind::Interrupted.into());
+                        }
+                        let write_path = resource_path(
+                            root,
+                            if spec.path.is_empty() {
+                                &fallback
+                            } else {
+                                &spec.path
+                            },
+                            true,
+                        )?;
+                        let metadata = Metadata {
+                            url: spec.url.clone(),
+                            etag: None,
+                            hash: hex(&Sha256::digest(&bytes)),
+                            checked: 0,
+                            bundled: true,
+                            subscription_info: None,
+                        };
+                        let temporary = TemporaryFile(Some(temporary_path(&write_path)));
+                        fs::write(temporary.0.as_ref().unwrap(), &bytes)?;
+                        if cancellation.is_cancelled() {
+                            return Err(io::ErrorKind::Interrupted.into());
+                        }
+                        commit_download(&write_path, temporary.0.as_ref().unwrap(), &metadata)?;
+                        entry.state.available = true;
+                        entry.state.downloaded = false;
+                        entry.state.count = content_len(&content);
+                        entry.state.updated_at = fs::metadata(&write_path)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .map(unix_time);
+                        entry.modified = fs::metadata(&write_path)
+                            .ok()
+                            .and_then(|m| m.modified().ok());
+                        entry.state.error = None;
+                        entry.metadata = metadata;
+                        contents.insert(key.clone(), content);
+                        // A bundle is an initial local source, never an ETag or
+                        // proof that the HTTP vehicle has already been fetched.
+                        entry.next = tokio::time::Instant::now();
+                    }
+                }
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return Err(io::ErrorKind::Interrupted.into());
                 }
                 entry.path = Some(path);
             }
@@ -336,6 +401,7 @@ impl ProviderCache {
                                     etag,
                                     hash: sha256.iter().map(|byte| format!("{byte:02x}")).collect(),
                                     checked: unix_time(SystemTime::now()),
+                                    bundled: false,
                                     subscription_info: if entry.state.rule {
                                         None
                                     } else {

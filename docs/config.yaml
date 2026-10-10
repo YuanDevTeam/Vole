@@ -584,6 +584,10 @@ proxy-groups:
 # YAML 规则文件为 {payload: [...]}，text 每行一条，支持空行和 # 注释。
 # classical 接受已支持的无动作规则，不接受 MATCH、RULE-SET、SUB-RULE。
 # 文本/MRS 解压上限 64 MiB；YAML 沿用 8 MiB 输入和 32 MiB 展开预算。
+# 非inline规则provider可设置path-in-bundle（例如rules/cn.mrs），从dataDir/BundleMRS.7z读取成员。
+# 有效缓存优先，其次bundle，再用原file/http来源；坏缓存同样可以回退bundle。
+# bundle只读取指定压缩块，支持COPY/LZMA1/LZMA2及已列入资源契约的filter；超预算/坏成员回退原来源。
+# inline忽略path-in-bundle；proxy-providers不接受此字段。
 proxy-providers:
   local-nodes:
     type: inline

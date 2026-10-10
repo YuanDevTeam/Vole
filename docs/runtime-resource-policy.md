@@ -170,6 +170,26 @@ IP-only协议接点持有`ResolutionContext`，runtime DNS通过Weak绑定，不
 
 完整接口见 [运行时 Controller](controller-api.md)。
 
+## 离线规则 bundle
+
+`rule-providers.*.path-in-bundle` 使用 `dataDir/BundleMRS.7z` 中的精确成员名；
+不展开到目录、不预置资产、不对其他 Provider 生效。初始化依次尝试有效缓存、bundle、
+原 file/http 来源；缺失或无效 bundle 沿用原来源。有效成员按原格式解析，原始字节与
+无 ETag 的本地来源标识原子写入缓存；本地来源不算已完成 HTTP 获取，重启也保留这一语义。
+
+单次初始化按顺序读取各资源，同一读取只有一个单线程解码器。先检查签名与 CRC、
+128 KiB header/decoded header、单 encoded-header packed stream（16 MiB）及至多8个 coder，
+再让官方 `sevenz-rust2` 读取 metadata。拒绝加密、外置 metadata 与未审核 codec；
+支持 COPY、LZMA1/2、Delta 及 x86/ARM/ARM Thumb BCJ。随后检查所选压缩块的单输入链、
+4096项文件表、128 MiB压缩输入和256 MiB解码总量；仅保留目标成员，最多64 MiB，
+并受 size-limit 进一步约束。solid前置成员流式丢弃，目标读至EOF后才接受校验结果。
+
+字典、输出和保守metadata计费共享96 MiB准入估计；该估计不包括allocator、解析后的规则
+及整个进程其他资源，不能当RSS上界。检查在官方 decoder分配之前执行，metadata中的
+计数由受限header长度约束。超过局部边界的bundle使用原来源，不静默截断成员。
+读取与解码检查取消、30秒局部期限、累计256 MiB来源读取和65536次I/O操作。
+使用同一个打开的文件句柄，异步调用者等待阻塞任务完成，不以丢弃JoinHandle替代停止。
+
 ## Provider 名称表达式
 
 普通筛选表达式继续使用线性时间的 `regex`。必要的 lookaround/backreference 使用

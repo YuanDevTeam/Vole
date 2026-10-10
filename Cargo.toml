@@ -54,7 +54,7 @@ outbound-http = []
 outbound-shadowsocks = ["dep:shadowsocks", "dep:log"]
 outbound-vless = ["tls-fingerprint", "boring/reality", "boring/jls", "boring/mlkem", "dep:blake3", "dep:vole-blake3-raw", "stream-transport", "quic-transport", "dep:hyper", "dep:hyper-util", "dep:h3", "dep:h3-quinn"]
 outbound-trojan = ["stream-transport", "tls-fingerprint"]
-outbound-vmess = ["stream-transport", "tls-fingerprint", "dep:aes", "dep:crc32fast", "dep:md-5", "dep:ring", "dep:shake"]
+outbound-vmess = ["stream-transport", "tls-fingerprint", "dep:aes", "dep:md-5", "dep:ring", "dep:shake"]
 tls-fingerprint = ["dep:boring", "dep:tokio-boring"]
 shadow-tls-v3 = ["tls-fingerprint", "boring/shadow-tls-v3", "dep:ring"]
 outbound-hysteria2 = ["quic-transport", "dep:quinn-proto", "dep:h3", "dep:h3-quinn", "dep:blake2"]
@@ -105,7 +105,7 @@ blake3 = { version = "=1.8.7", optional = true }
 boringtun = { version = "=0.7.1", default-features = false, optional = true }
 boring = { git = "https://github.com/YuanDevTeam/boring", branch = "release", version = "=5.2.0", features = ["client-fingerprint"], optional = true }
 bytes = "1"
-crc32fast = { version = "1.5.2", optional = true }
+crc32fast = "=1.5.2"
 domain = { version = "=0.12.3", default-features = false, features = ["std"] }
 fancy-regex = { version = "=0.19.2", default-features = false, features = ["std", "unicode"] }
 futures-util = { version = "0.3", features = ["sink"] }
@@ -138,6 +138,7 @@ rustls-native-certs = "=0.8.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml_ng = "0.10"
+sevenz-rust2 = { version = "=0.23.0", default-features = false }
 sha2 = "0.11"
 shake = { version = "0.1.0", optional = true }
 shadowsocks = { version = "=1.25.0", optional = true, default-features = false, features = ["aead-cipher-2022"] }
@@ -202,6 +203,7 @@ windows-collections = { version = "=0.3.2", optional = true }
 windows-core = { version = "=0.62.2", optional = true }
 
 [dev-dependencies]
+sevenz-rust2 = { version = "=0.23.0", default-features = false, features = ["compress"] }
 # Native peer controls for bounded in-memory ALPS tests; same source as boring.
 boring-sys = { git = "https://github.com/YuanDevTeam/boring", branch = "release", version = "=5.2.0" }
 foreign-types = "=0.5.0"
