@@ -1814,12 +1814,9 @@ fn numeric(value: &Value) -> Result<f64> {
 }
 fn scalar_order(a: &Value, b: &Value) -> Result<Ordering> {
     match (a, b) {
-        (Value::Null, Value::Null) => Ok(Ordering::Equal),
-        (Value::Null, _) => Ok(Ordering::Greater),
-        (_, Value::Null) => Ok(Ordering::Less),
-        (Value::Number(_), Value::Number(_)) => numeric(a)?
+        (Value::Number(_), Value::Number(_)) => Ok(numeric(a)?
             .partial_cmp(&numeric(b)?)
-            .ok_or_else(|| error("provider override cannot order nonfinite numbers")),
+            .unwrap_or(Ordering::Equal)),
         (Value::String(a), Value::String(b)) => Ok(a.cmp(b)),
         _ => Err(error(
             "provider override ordered comparison requires compatible scalars",
@@ -1841,7 +1838,8 @@ fn sort_order(a: &Value, b: &Value) -> Ordering {
         (Value::Number(_), Value::Number(_)) => a
             .as_f64()
             .unwrap_or(0.0)
-            .total_cmp(&b.as_f64().unwrap_or(0.0)),
+            .partial_cmp(&b.as_f64().unwrap_or(0.0))
+            .unwrap_or(Ordering::Equal),
         (Value::String(a), Value::String(b)) => a.cmp(b),
         _ => Ordering::Equal,
     })
@@ -1863,6 +1861,17 @@ fn binary(
         Op::And => return Ok(Value::Bool(truthy(a) && truthy(b))),
         Op::Or => return Ok(Value::Bool(truthy(a) || truthy(b))),
         Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+            if !matches!(
+                a,
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+            ) || !matches!(
+                b,
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+            ) {
+                return Err(error(
+                    "provider override ordered comparison requires scalars",
+                ));
+            }
             if a.is_null() || b.is_null() {
                 return Ok(Value::Bool(
                     a.is_null() && b.is_null() && matches!(operator, Op::Le | Op::Ge),
@@ -2666,13 +2675,17 @@ mod tests {
     fn collection_predicates_short_circuit_and_preserve_yaml_values() {
         let result = run(
             "name: fixture\n",
-            r#".any = (["yes", {}] | any_c(contains("yes"))) | .all = (["no", {}] | all_c(contains("yes"))) | .nested = ([["a"]] | contains(["a"])) | .empty = (("" / ",") | length) | .split = ("" | split(",") | length) | .unique = (["a: b", {"a": "b"}] | unique | length) | .mapped = (["a", "b"] | map(.; upcase)) | .nan = ("NaN" | tonumber | tostring)"#,
+            r#".any = (["yes", {}] | any_c(contains("yes"))) | .all = (["no", {}] | all_c(contains("yes"))) | .nested = ([["a"]] | contains(["a"])) | .empty = (("" / ",") | length) | .split = ("" | split(",") | length) | .unique = (["a: b", {"a": "b"}] | unique | length) | .mapped = (["a", "b"] | map(.; upcase)) | .nan = ("NaN" | tonumber | tostring) | .nan_gt = (("NaN" | tonumber) > 1) | .nan_le = (("NaN" | tonumber) <= 1) | .nan_sort = ([("NaN" | tonumber),1] | sort | .[0] | tostring) | .null_gt = null > 1"#,
         );
         assert_eq!(result["any"], Value::Bool(true));
         assert_eq!(result["all"], Value::Bool(false));
         assert_eq!(result["nested"], Value::Bool(true));
         assert_eq!(result["empty"], Value::Number(0.into()));
         assert_eq!(result["nan"], Value::String(".nan".into()));
+        assert_eq!(result["nan_gt"], Value::Bool(false));
+        assert_eq!(result["nan_le"], Value::Bool(true));
+        assert_eq!(result["nan_sort"], Value::String(".nan".into()));
+        assert_eq!(result["null_gt"], Value::Bool(false));
         assert_eq!(result["split"], Value::Number(1.into()));
         assert_eq!(result["unique"], Value::Number(2.into()));
         assert_eq!(
@@ -2682,6 +2695,7 @@ mod tests {
         for source in [
             r#".x = ([{"Key": "name", "value": 1}] | from_entries)"#,
             r#".x = ([{"key": "name"}] | from_entries)"#,
+            ".x = null > []",
         ] {
             let mut value: Value = serde_yaml_ng::from_str("name: fixture").unwrap();
             let original = value.clone();
