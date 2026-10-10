@@ -2250,6 +2250,7 @@ fn test_runtime_dns(dispatcher: Arc<dyn Dispatcher>) -> Arc<RuntimeDns> {
         ipv6: true,
         nameservers: vec![DnsNameserver {
             path: None,
+            http_auth: None,
             options: Default::default(),
             transport: DnsTransport::Udp,
             address: Ipv4Addr::new(198, 51, 100, 53).into(),

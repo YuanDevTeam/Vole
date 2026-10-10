@@ -109,7 +109,7 @@ dns:
 ### Endpoint
 
 - `dns.enable`、`dns.ipv6` 默认 false。主 nameserver 默认使用 DoH/DoT，可显式替换为非空列表。
-- 接受裸 IPv4/IPv6、`udp://`、`tcp://`、`tls://`、`https://` 和 `http://`。加密连接复用会话的内置、可读系统与 `tls.custom-certifactes` 信任根；各解析角色及 WireGuard 私有 DNS 同样适用，平台边界见 [TLS 契约](tls-client-fingerprint.md)。DoH 采用 HTTP/1.1 POST。
+- 接受裸 IPv4/IPv6、`udp://`、`tcp://`、`tls://`、`https://` 和 `http://`。加密连接复用会话的内置、可读系统与 `tls.custom-certifactes` 信任根；各解析角色及 WireGuard 私有 DNS 同样适用，平台边界见 [TLS 契约](tls-client-fingerprint.md)。HTTPS 根据实际 ALPN 使用 HTTP/2 或 HTTP/1.1；没有 ALPN 时使用 HTTP/1.1。明文 HTTP 仅支持 HTTP/1.1，不启用 h2c。
 - `rcode://success`、`rcode://format_error`、`rcode://server_failure`、`rcode://name_error`、`rcode://not_implemented`、`rcode://refused` 分别返回本地 RCODE 0–5；可用于 nameserver、policy、fallback、节点和直连 resolver，不能用于 default-nameserver。
 - 同一个上游列表中存在本地 RCODE 时使用第一项本地响应，不建立网络连接，也不把 SERVFAIL/REFUSED 当作上游故障重试。响应保留原查询的 flags 和 additional，仅设置 QR 与 RCODE；不额外开启 RA，不写入结果缓存。
 - `dns.ipv6: false` 不限制 IPv6 nameserver；顶层 `ipv6: false` 会阻止通过 DIRECT（含 `RULES` 选中 DIRECT）的 IPv6 nameserver 在本机物理建链，并继续当前组的故障转移。
@@ -143,6 +143,18 @@ DHCP 接口名只取 URL endpoint，fragment 不参与接口查找。
 DoT/HTTPS 的 `skip-cert-verify=true` 和 `name-cert-verify` 接共享 TLS 安全层，显式名称验证
 先于跳过验证且不改变 SNI。`disable-reuse=true` 仅使指定 DoT 上游每次新建并关闭连接，
 不改变 HTTPS 或其他上游的复用。不同参数的上游保持池身份隔离。
+
+### DoH 请求
+
+URL 只保留协议、带默认端口的主机、路径和 userinfo；丢弃原 query/fragment。
+路径按解码后的值重新编码，userinfo 百分号解码后生成 `Basic base64(用户名:密码)`，
+省略密码视为空串。认证值不出现在 Host、请求路径或 Debug/日志中，也不会跨池身份复用。
+请求使用 GET、`Accept: application/dns-message`，没有 body 和默认 User-Agent；
+`dns=` 为完整 DNS wire 的无 padding Base64URL。传输前 ID 改为 0，响应 ID 必须为 0，
+之后恢复原 ID 并执行原有 question、完整报文及缓存校验。
+
+H1/H2 的请求及响应头各限 16 KiB，DNS body 仍限 4,096 字节。
+仅接受 HTTP 200 与 `application/dns-message`，响应长度声明、分帧及完整 DNS 校验必须通过。
 
 ### Policy
 
@@ -287,13 +299,16 @@ wire/RCODE 语义，不使用这段地址合并等待。
 
 TCP、DoT 和 DoH 使用解析器所属的连接池：
 
-- Key 包含上游地址、TLS 验证策略、查询包装、传输、HTTP 路径、endpoint、最终 route target、
+- Key 包含上游地址、TLS 验证策略、查询包装、传输、HTTP 路径与 Basic 身份、endpoint、最终 route target、
   来源 generation 和物理接口绑定；
-- 一条连接同时只处理一个查询，不做 pipeline；
-- 活动连接不设固定业务数量上限；空闲连接总数最多 4、同 key 最多 2、超时 30 秒；
-- 完成帧和响应校验后才能归还连接；
-- 复用连接遇到 EOF、I/O、reset 或响应不匹配时，在原尝试期限内最多新建一次连接；
+- TCP、DoT、HTTP/1.1 一条连接只处理一个查询，不做 pipeline；这部分空闲连接总数最多 4、同 key 最多 2、超时 30 秒；
+- HTTP/2 同 key 首次建连串行发布，之后共享 sender；每连接最多 32 个并发 stream，超出时在查询原期限内等待。流接收窗口 4 KiB、连接接收窗口 128 KiB，禁用 server push；H2 空闲连接另限 4、超时 30 秒；
+- 活动物理连接不设固定业务数量上限；完整响应校验后才能归还 H1 连接或继续复用 H2；
+- TCP/DoT/H1 复用连接遇到 EOF、I/O、reset 或响应不匹配时，在原尝试期限内最多新建一次连接；
 - 非法、截断或超限响应不重试、不归还连接。
+
+HTTP/2 单流取消发送 RST，其他流可继续使用原连接；响应错误使该连接不再接受新查询。
+解析器拥有连接 driver 与有界空闲回收任务，Session Stop 和资源代际退役关闭全部解析角色并等待 driver 结束；WireGuard 私有 DNS 同样由节点 Stop 关闭且不保留空闲连接。
 
 Controller 切换代理组后，只在后续需要创建新 DNS transport 时使用新选择。类型化/原始响应 cache、singleflight 状态和已经位于 TCP pool 中的 transport 不清空、不迁移；因此命中 cache 或复用既有 TCP transport 时，不会为切换单独建链。停止 session 才统一释放这些状态。
 
@@ -331,7 +346,7 @@ Running Session上下文仅弱引用本 session 的 RuntimeDns；业务 IP-only 
 ## 不支持
 
 - 真实 ICMP 转发、ICMP error、Traceroute、ICMP 选路规则或 ICMP 测速；
-- DoQ、DoH HTTP/2/3；
+- DoQ、DoH HTTP/3；
 - 运行中随接口变化自动刷新 hosts: lan；
 - 用户可配置的查询总超时、重试或并发度；
 - 使用 DNS question 执行业务规则，或用 DNS 出口改写后续业务动作。

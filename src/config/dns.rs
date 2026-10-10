@@ -159,6 +159,7 @@ pub(super) fn parse_dns_nameserver(
             port: 53,
             route: DnsRoute::Direct,
             path: None,
+            http_auth: None,
             options,
         });
     }
@@ -169,6 +170,7 @@ pub(super) fn parse_dns_nameserver(
             port: 53,
             route,
             path: None,
+            http_auth: None,
             options,
         });
     }
@@ -200,6 +202,7 @@ pub(super) fn parse_dns_nameserver(
             port: 0,
             route,
             path: None,
+            http_auth: None,
             options,
         });
     }
@@ -211,9 +214,34 @@ pub(super) fn parse_dns_nameserver(
         "http" => (DnsTransport::Http, 80),
         _ => return Err(bad()),
     };
-    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+    let http = matches!(transport, DnsTransport::Http | DnsTransport::Https);
+    let has_userinfo = endpoint.split_once("://").is_some_and(|(_, rest)| {
+        rest.split(['/', '?'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    });
+    if (!http && has_userinfo) || url.fragment().is_some() {
         return Err(bad());
     }
+    let http_auth = if http && has_userinfo {
+        use base64::Engine as _;
+        let mut value = percent_decode_bytes(url.username())?;
+        value.push(b':');
+        value.extend_from_slice(&percent_decode_bytes(url.password().unwrap_or_default())?);
+        let encoded_len = value.len().div_ceil(3).saturating_mul(4);
+        if encoded_len + 6 > crate::dns::MAX_HTTP_HEADER_BYTES {
+            return invalid("DNS HTTP authentication exceeds the header budget");
+        }
+        Some(DnsHttpAuth(
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(value)
+            )
+            .into(),
+        ))
+    } else {
+        None
+    };
     let address = match url.host().ok_or_else(bad)? {
         Host::Ipv4(ip) => DnsAddress::Ip(ip.into()),
         Host::Ipv6(ip) => DnsAddress::Ip(ip.into()),
@@ -222,18 +250,19 @@ pub(super) fn parse_dns_nameserver(
             Err(_) => DnsAddress::Domain(crate::dns::canonicalize_name(host).map_err(|_| bad())?),
         },
     };
-    let path = if matches!(transport, DnsTransport::Http | DnsTransport::Https) {
-        Some(format!(
-            "{}{}",
-            if url.path().is_empty() {
-                "/"
+    let path = if http {
+        // URL's browser-style parser resolves dot segments; Mihomo's URL.Path
+        // keeps them. Decode the original path before rebuilding its escapes.
+        let rest = endpoint.split_once("://").expect("DNS URL has a scheme").1;
+        let path = rest.find(['/', '?']).map_or("/", |index| {
+            let tail = &rest[index..];
+            if tail.starts_with('/') {
+                tail.split('?').next().unwrap_or("/")
             } else {
-                url.path()
-            },
-            url.query()
-                .map(|value| format!("?{value}"))
-                .unwrap_or_default()
-        ))
+                "/"
+            }
+        });
+        Some(normalize_http_path(path)?)
     } else {
         if !matches!(url.path(), "" | "/") || url.query().is_some() {
             return Err(bad());
@@ -248,6 +277,7 @@ pub(super) fn parse_dns_nameserver(
         port,
         route,
         path,
+        http_auth,
         options,
     })
 }
@@ -330,6 +360,53 @@ mod upstream_options_tests {
     use super::*;
 
     #[test]
+    fn doh_url_clears_query_and_preserves_only_decoded_basic_identity() {
+        use base64::Engine as _;
+        let server = parse_dns_nameserver(
+            "https://a%3Alice:p%40ss@dns.example/a%2Fb%20c?discard=secret#DIRECT&ecs=192.0.2.1",
+            &RouteTargetsByName::new(),
+            DnsRoute::Direct,
+        )
+        .unwrap();
+        assert_eq!(server.path.as_deref(), Some("/a/b%20c"));
+        assert_eq!(server.port, 443);
+        let auth = server.http_auth.as_ref().unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(auth.0.strip_prefix("Basic ").unwrap())
+                .unwrap(),
+            b"a:lice:p@ss"
+        );
+        assert_eq!(format!("{auth:?}"), "DnsHttpAuth([redacted])");
+        let dot_path = parse_dns_nameserver(
+            "https://dns.example/a/%2e%2e/b",
+            &RouteTargetsByName::new(),
+            DnsRoute::Direct,
+        )
+        .unwrap();
+        assert_eq!(dot_path.path.as_deref(), Some("/a/../b"));
+        for (userinfo, decoded) in [
+            ("alice", &b"alice:"[..]),
+            ("", &b":"[..]),
+            ("%FF:%00", &b"\xff:\0"[..]),
+        ] {
+            let server = parse_dns_nameserver(
+                &format!("http://{userinfo}@192.0.2.1?discard"),
+                &RouteTargetsByName::new(),
+                DnsRoute::Direct,
+            )
+            .unwrap();
+            assert_eq!(server.path.as_deref(), Some("/"));
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(server.http_auth.unwrap().0.strip_prefix("Basic ").unwrap())
+                    .unwrap(),
+                decoded
+            );
+        }
+    }
+
+    #[test]
     fn upstream_options_decode_fragments_and_use_last_values() {
         let server = parse_dns_nameserver(
             "tls://192.0.2.1#DIRECT%26RULES%26ecs=2001:db8::7/57%26ecs-override=true%26disable-ipv4=true%26disable-ipv6=True%26disable-qtype-16=true%26disable-qtype-65280=true%26skip-cert-verify=false%26skip-cert-verify=true%26name-cert-verify=dns.example%26disable-reuse=true",
@@ -383,6 +460,11 @@ mod upstream_options_tests {
 }
 
 fn percent_decode(input: &str) -> Result<String> {
+    String::from_utf8(percent_decode_bytes(input)?)
+        .map_err(|_| VoleError::InvalidConfig("invalid DNS route encoding".into()))
+}
+
+fn percent_decode_bytes(input: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(input.len());
     let mut iter = input.bytes();
     while let Some(byte) = iter.next() {
@@ -397,8 +479,28 @@ fn percent_decode(input: &str) -> Result<String> {
             bytes.push(byte);
         }
     }
-    String::from_utf8(bytes)
-        .map_err(|_| VoleError::InvalidConfig("invalid DNS route encoding".into()))
+    Ok(bytes)
+}
+
+fn normalize_http_path(path: &str) -> Result<String> {
+    let mut result = String::new();
+    for byte in percent_decode_bytes(path)? {
+        // Mihomo rebuilds URL.Path without RawPath. Go encodePath retains
+        // whole-path reserved separators except '?', with uppercase escapes.
+        if byte.is_ascii_alphanumeric() || b"-_.~$&+,/:;=@".contains(&byte) {
+            result.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(result, "%{byte:02X}").expect("writing a String cannot fail");
+        }
+        if result.len() > crate::dns::MAX_HTTP_HEADER_BYTES {
+            return invalid("DNS HTTP path exceeds the header budget");
+        }
+    }
+    if result.is_empty() {
+        result.push('/');
+    }
+    Ok(result)
 }
 
 pub(super) fn normalize_hosts(

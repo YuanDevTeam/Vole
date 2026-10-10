@@ -231,6 +231,7 @@ impl BuiltProxyGraph {
     }
 
     async fn shutdown(&self) {
+        self.resolution.shutdown().await;
         for target in self.lifecycle_order.iter().rev() {
             if let BuiltRouteTarget::Proxy(connector) = target {
                 connector.shutdown().await;
@@ -1688,6 +1689,9 @@ impl RunningCore {
             result = &mut shutdown => (None, result.err()),
             completed = wait_first_task(&mut self.tasks), if !self.tasks.is_empty() => (completed, None),
         };
+        // Keep weakly bound DNS alive through listener teardown and its driver
+        // join barrier. Resource generations retain their own resolver owners.
+        let dns = self.proxy_graph.resolution.runtime_dns();
         self.proxy_graph.begin_shutdown();
         if let Some(resources) = &self.resources {
             resources.begin_shutdown();
@@ -1701,6 +1705,9 @@ impl RunningCore {
         self.proxy_graph.shutdown().await;
         if let Some(resources) = &self.resources {
             resources.shutdown().await;
+        }
+        if let Some(dns) = dns {
+            dns.shutdown().await;
         }
         #[cfg(all(feature = "tun", target_os = "linux"))]
         let result = if let Some(mut network) = self.system_network.take() {

@@ -182,6 +182,7 @@ async fn runtime_uses_configured_dns_and_weak_binding_releases_owner() {
         ipv6: false,
         nameservers: vec![DnsNameserver {
             path: None,
+            http_auth: None,
             options: Default::default(),
             transport: DnsTransport::Udp,
             address: address.ip().into(),
@@ -268,6 +269,7 @@ async fn recursive_dns_dependency_fails_before_connecting_or_joining_its_own_fli
         ipv6: false,
         nameservers: vec![DnsNameserver {
             path: None,
+            http_auth: None,
             options: Default::default(),
             transport: DnsTransport::Udp,
             address: "192.0.2.1".parse().unwrap(),

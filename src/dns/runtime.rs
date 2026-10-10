@@ -143,6 +143,7 @@ struct TcpPoolKey {
 
 struct TcpConnectionPool {
     security: crate::security::SecurityContext,
+    http2: Arc<super::http2::Pool<TcpPoolKey>>,
     state: Mutex<TcpPoolState>,
     max_idle: usize,
     max_idle_per_key: usize,
@@ -164,6 +165,7 @@ struct IdleTcpConnection {
 
 struct PooledTcpConnection {
     stream: BoxStream,
+    negotiated_alpn: Option<Vec<u8>>,
     _slot: TcpPhysicalSlot,
     _observation: crate::resources::observation::Guard,
 }
@@ -236,6 +238,7 @@ impl TcpConnectionPool {
         stats.idle_per_key_limit = max_idle_per_key;
         Arc::new(Self {
             security,
+            http2: super::http2::Pool::new(),
             state: Mutex::new(TcpPoolState::default()),
             max_idle,
             max_idle_per_key,
@@ -250,6 +253,9 @@ impl TcpConnectionPool {
         nameserver: &ResolvedNameserver,
         resolve: impl FnOnce(&TcpPoolState) -> Result<(DnsEgressKey, Arc<dyn Dispatcher>), AttemptError>,
     ) -> Result<TcpLease, AttemptError> {
+        if self.http2.is_closed() {
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe).into());
+        }
         let (key, egress, connection, expired) = {
             let mut state = self.state.lock().await;
             let expired = self.take_expired_locked(&mut state, TokioInstant::now());
@@ -306,6 +312,9 @@ impl TcpConnectionPool {
         nameserver: &ResolvedNameserver,
         egress: &Arc<dyn Dispatcher>,
     ) -> Result<PooledTcpConnection, AttemptError> {
+        if self.http2.is_closed() {
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe).into());
+        }
         let slot = TcpPhysicalSlot::new(Arc::clone(&self.stats));
         let connecting = TcpConnectingGuard::new(Arc::clone(&self.stats));
         let stream = egress
@@ -317,7 +326,7 @@ impl TcpConnectionPool {
                 sniffed_domain: None,
             })
             .await?;
-        let stream = if matches!(
+        let (stream, negotiated_alpn) = if matches!(
             nameserver.transport,
             DnsTransport::Tls | DnsTransport::Https
         ) {
@@ -328,7 +337,7 @@ impl TcpConnectionPool {
                     fingerprint: None,
                 },
                 alpn: if nameserver.transport == DnsTransport::Https {
-                    vec![b"http/1.1".to_vec()]
+                    vec![b"h2".to_vec(), b"http/1.1".to_vec()]
                 } else {
                     Vec::new()
                 },
@@ -341,15 +350,16 @@ impl TcpConnectionPool {
                 0,
                 64 * 1024,
             )?
-            .connect(stream)
+            .connect_negotiated(stream)
             .await?
         } else {
-            stream
+            (stream, None)
         };
         drop(connecting);
         self.stats.physical_opens.fetch_add(1, Ordering::Relaxed);
         Ok(PooledTcpConnection {
             stream,
+            negotiated_alpn,
             _slot: slot,
             _observation: crate::resources::observation::track(
                 crate::resources::observation::ResourceKind::Pool,
@@ -379,7 +389,7 @@ impl TcpConnectionPool {
             return;
         };
         lease.busy.take();
-        if self.max_idle == 0 || dot_reuse_disabled(&lease.key.upstream) {
+        if self.http2.is_closed() || self.max_idle == 0 || dot_reuse_disabled(&lease.key.upstream) {
             drop(connection);
             return;
         }
@@ -519,6 +529,7 @@ impl TcpConnectionPool {
 
 impl Drop for TcpConnectionPool {
     fn drop(&mut self) {
+        self.http2.close();
         self.reaper_cancel.cancel();
         let idle = std::mem::take(&mut self.state.get_mut().idle);
         self.stats.current_idle.store(0, Ordering::Release);
@@ -933,6 +944,56 @@ impl RuntimeDns {
         }
     }
 
+    /// Retires multiplexed transports before outbound shutdown begins.
+    pub(crate) fn begin_shutdown(&self) {
+        let mut pending = vec![self];
+        let mut seen = HashSet::new();
+        while let Some(resolver) = pending.pop() {
+            if !seen.insert(std::ptr::from_ref(resolver) as usize) {
+                continue;
+            }
+            resolver.tcp_pool.http2.close();
+            resolver.tcp_pool.reaper_cancel.cancel();
+            pending.extend(
+                [
+                    resolver.bootstrap.as_deref(),
+                    resolver.proxy_resolver.as_deref(),
+                    resolver.direct_resolver.as_deref(),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.begin_shutdown();
+        let mut pending = vec![self];
+        let mut seen = HashSet::new();
+        while let Some(resolver) = pending.pop() {
+            if !seen.insert(std::ptr::from_ref(resolver) as usize) {
+                continue;
+            }
+            resolver.tcp_pool.http2.shutdown().await;
+            let idle = {
+                let mut state = resolver.tcp_pool.state.lock().await;
+                let idle = std::mem::take(&mut state.idle);
+                resolver.tcp_pool.record_idle_locked(&state);
+                idle
+            };
+            drop(idle);
+            pending.extend(
+                [
+                    resolver.bootstrap.as_deref(),
+                    resolver.proxy_resolver.as_deref(),
+                    resolver.direct_resolver.as_deref(),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
+    }
+
     pub(crate) fn with_fake_ip_store(mut self, root: Option<&std::path::Path>) -> io::Result<Self> {
         if self.enabled
             && self.fake_config.enabled
@@ -996,6 +1057,7 @@ impl RuntimeDns {
         let pool = Arc::get_mut(&mut resolver.tcp_pool).expect("fresh node DNS pool");
         pool.max_idle = 0;
         pool.max_idle_per_key = 0;
+        pool.http2.disable_idle();
         let stats = Arc::get_mut(&mut pool.stats).expect("fresh node DNS counters");
         stats.idle_limit = 0;
         stats.idle_per_key_limit = 0;
@@ -2352,6 +2414,9 @@ impl RuntimeDns {
     where
         F: Fn(&[u8]) -> Result<R, AttemptError>,
     {
+        if nameserver.transport == DnsTransport::Https {
+            return self.exchange_https(nameserver, query, validate).await;
+        }
         let mut lease = self
             .tcp_pool
             .checkout_for(nameserver, |state| {
@@ -2408,6 +2473,136 @@ impl RuntimeDns {
             self.tcp_pool.check_in(lease).await;
         }
         Ok((response, validated))
+    }
+
+    async fn exchange_https<R, F>(
+        &self,
+        nameserver: &ResolvedNameserver,
+        query: &[u8],
+        validate: F,
+    ) -> Result<(Vec<u8>, R), AttemptError>
+    where
+        F: Fn(&[u8]) -> Result<R, AttemptError>,
+    {
+        let resolve = |state: &TcpPoolState| {
+            self.egress_for(nameserver, Network::Tcp, |egress| {
+                let key = TcpPoolKey {
+                    upstream: nameserver.config.clone(),
+                    endpoint: nameserver.endpoint(),
+                    egress,
+                    source_generation: nameserver.source_generation,
+                    source_binding: nameserver.source_binding.clone(),
+                };
+                self.tcp_pool.http2.has(&key) || state.idle.iter().any(|idle| idle.key == key)
+            })
+        };
+        // Only a stale reused HTTP/1 connection gets one retry. Each fresh
+        // handshake branches on actual ALPN, including a changed server choice.
+        for attempt in 0..2 {
+            let key = {
+                let state = self.tcp_pool.state.lock().await;
+                let (egress, _) = resolve(&state)?;
+                TcpPoolKey {
+                    upstream: nameserver.config.clone(),
+                    endpoint: nameserver.endpoint(),
+                    egress,
+                    source_generation: nameserver.source_generation,
+                    source_binding: nameserver.source_binding.clone(),
+                }
+            };
+            if let Some(lease) = self.tcp_pool.http2.get(&key) {
+                self.tcp_pool
+                    .stats
+                    .reuse_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return lease
+                    .exchange(&nameserver.config, query, |wire| {
+                        validate(wire)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                    })
+                    .await
+                    .map_err(AttemptError::Io);
+            }
+            let initialization = self.tcp_pool.http2.initialization(key.clone());
+            let gate = initialization.lock().await;
+            if let Some(lease) = self.tcp_pool.http2.get(&key) {
+                drop(gate);
+                self.tcp_pool
+                    .stats
+                    .reuse_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return lease
+                    .exchange(&nameserver.config, query, |wire| {
+                        validate(wire)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                    })
+                    .await
+                    .map_err(AttemptError::Io);
+            }
+            let mut lease = self.tcp_pool.checkout_for(nameserver, &resolve).await?;
+            let alpn = lease
+                .connection
+                .as_ref()
+                .expect("TCP lease owns a connection")
+                .negotiated_alpn
+                .as_deref();
+            if alpn == Some(b"h2") {
+                let connection = lease
+                    .connection
+                    .take()
+                    .expect("TCP lease owns a connection");
+                lease.busy.take();
+                let PooledTcpConnection {
+                    stream,
+                    _slot,
+                    _observation,
+                    ..
+                } = connection;
+                let h2 = self
+                    .tcp_pool
+                    .http2
+                    .connect(lease.key.clone(), stream, (_slot, _observation))
+                    .await?;
+                drop(gate);
+                return h2
+                    .exchange(&nameserver.config, query, |wire| {
+                        validate(wire)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                    })
+                    .await
+                    .map_err(AttemptError::Io);
+            }
+            if alpn.is_some_and(|protocol| protocol != b"http/1.1") {
+                return Err(io::Error::from(io::ErrorKind::InvalidData).into());
+            }
+            drop(gate);
+            let result = exchange_stream_validated(
+                &mut lease
+                    .connection
+                    .as_mut()
+                    .expect("TCP lease owns a connection")
+                    .stream,
+                nameserver,
+                query,
+                &validate,
+            )
+            .await;
+            if attempt == 0 && lease.reused && result.as_ref().is_err_and(stale_reuse_is_retryable)
+            {
+                self.tcp_pool
+                    .stats
+                    .stale_retries
+                    .fetch_add(1, Ordering::Relaxed);
+                drop(lease);
+                continue;
+            }
+            let (response, validated, reusable) = result?;
+            if reusable {
+                self.tcp_pool.check_in(lease).await;
+            }
+            return Ok((response, validated));
+        }
+        unreachable!("stale HTTP/1 reuse retries once")
     }
 
     async fn cache_response(
@@ -3262,6 +3457,7 @@ mod tests {
     fn nameserver(index: u8, transport: DnsTransport) -> DnsNameserver {
         DnsNameserver {
             path: None,
+            http_auth: None,
             options: Default::default(),
             transport,
             address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, index)).into(),
@@ -4474,6 +4670,7 @@ dns:
         ));
         let main = DnsNameserver {
             path: None,
+            http_auth: None,
             options: Default::default(),
             transport: DnsTransport::Tcp,
             address: "1.1.1.1".parse().unwrap(),
@@ -4484,6 +4681,7 @@ dns:
         };
         let policy_nameserver = DnsNameserver {
             path: None,
+            http_auth: None,
             options: Default::default(),
             transport: DnsTransport::Tcp,
             address: "223.5.5.5".parse().unwrap(),
@@ -4767,6 +4965,7 @@ dns:
         let direct: Arc<dyn Dispatcher> = Arc::new(DirectOutbound::new(Dialer::default()));
         let udp_nameserver = DnsNameserver {
             path: None,
+            http_auth: None,
             options: Default::default(),
             transport: DnsTransport::Udp,
             address: udp_address.ip().into(),
@@ -4811,6 +5010,7 @@ dns:
         });
         let tcp_nameserver = DnsNameserver {
             path: None,
+            http_auth: None,
             options: Default::default(),
             transport: DnsTransport::Tcp,
             address: tcp_address.ip().into(),

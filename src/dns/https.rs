@@ -1,11 +1,103 @@
-//! DNS-over-HTTP/1.1 on a caller-owned authenticated stream. No socket factory
-//! or detached connection driver; cancellation discards the current lease.
-use super::MAX_MESSAGE_SIZE;
+//! Shared DoH GET construction and HTTP/1.1 framing over caller-owned IO.
+use super::{MAX_HTTP_HEADER_BYTES, MAX_MESSAGE_SIZE};
 use crate::{config::DnsNameserver, dispatch::BoxStream};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const HEADER_LIMIT: usize = 16 * 1024;
+pub(super) fn request(server: &DnsNameserver, query: &[u8]) -> io::Result<http::Request<()>> {
+    if query.len() < 12 || query.len() > MAX_MESSAGE_SIZE {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let mut wire = query.to_vec();
+    wire[..2].fill(0);
+    let host = match &server.address {
+        crate::config::DnsAddress::Ip(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
+        other => other.to_string(),
+    };
+    let authority = format!("{host}:{}", server.port);
+    let target = format!(
+        "{}?dns={}",
+        server.path.as_deref().unwrap_or("/dns-query"),
+        URL_SAFE_NO_PAD.encode(wire)
+    );
+    let size = authority.len()
+        + target.len()
+        + server.http_auth.as_ref().map_or(0, |auth| auth.0.len())
+        // Covers HTTP/1 framing and the HTTP/2 pseudo/header names with
+        // RFC 7540's 32-byte accounting per field.
+        + 512;
+    if size > MAX_HTTP_HEADER_BYTES {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let uri = http::Uri::builder()
+        .scheme(if server.transport == crate::config::DnsTransport::Http {
+            "http"
+        } else {
+            "https"
+        })
+        .authority(authority)
+        .path_and_query(target)
+        .build()
+        .map_err(|_| io::ErrorKind::InvalidInput)?;
+    let mut builder = http::Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("accept", "application/dns-message");
+    if let Some(auth) = &server.http_auth {
+        let mut value =
+            http::HeaderValue::from_str(&auth.0).map_err(|_| io::ErrorKind::InvalidInput)?;
+        value.set_sensitive(true);
+        builder = builder.header("authorization", value);
+    }
+    builder
+        .body(())
+        .map_err(|_| io::ErrorKind::InvalidInput.into())
+}
+
+pub(super) fn restore_id(query: &[u8], response: &mut [u8]) -> io::Result<()> {
+    if response.len() < 12 || response[..2] != [0, 0] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS HTTP response ID is not zero",
+        ));
+    }
+    response[..2].copy_from_slice(&query[..2]);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doh_get_uses_id_zero_unpadded_dns_and_sensitive_basic() {
+        let config = crate::config::Config::parse_yaml(b"mixed-port: 1080\ndns:\n  enable: true\n  nameserver: ['http://alice:password@[2001:db8::1]:8080/dns%2Fquery?old=value#ecs=192.0.2.1']\n").unwrap();
+        let query =
+            crate::dns::build_query(0x1234, "example.com", crate::dns::QueryType::A).unwrap();
+        let request = request(&config.dns.nameservers[0], &query).unwrap();
+        assert_eq!(request.method(), http::Method::GET);
+        assert_eq!(request.uri().authority().unwrap(), "[2001:db8::1]:8080");
+        assert_eq!(request.uri().path(), "/dns/query");
+        let encoded = request.uri().query().unwrap().strip_prefix("dns=").unwrap();
+        assert!(!encoded.contains('='));
+        let mut decoded = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+        assert_eq!(&decoded[..2], &[0, 0]);
+        assert_eq!(&decoded[2..], &query[2..]);
+        assert_eq!(
+            request.headers()["authorization"],
+            "Basic YWxpY2U6cGFzc3dvcmQ="
+        );
+        assert!(request.headers()["authorization"].is_sensitive());
+        assert_eq!(request.headers()["accept"], "application/dns-message");
+        for name in ["content-type", "content-length", "user-agent"] {
+            assert!(!request.headers().contains_key(name));
+        }
+        restore_id(&query, &mut decoded).unwrap();
+        assert_eq!(decoded, query);
+        assert!(restore_id(&query, &mut decoded).is_err());
+    }
+}
 
 async fn line(stream: &mut BoxStream, remaining: &mut usize) -> io::Result<String> {
     let mut bytes = Vec::new();
@@ -26,20 +118,22 @@ pub(super) async fn exchange(
     server: &DnsNameserver,
     query: &[u8],
 ) -> io::Result<(Vec<u8>, bool)> {
-    let host = match &server.address {
-        crate::config::DnsAddress::Ip(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
-        other => other.to_string(),
-    };
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {host}:{}\r\nAccept: application/dns-message\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
-        server.path.as_deref().unwrap_or("/dns-query"),
-        server.port,
-        query.len()
+    let request = request(server, query)?;
+    let mut head = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\n",
+        request.uri().path_and_query().expect("DoH has a path"),
+        request.uri().authority().expect("DoH has an authority")
     );
-    stream.write_all(request.as_bytes()).await?;
-    stream.write_all(query).await?;
+    for (name, value) in request.headers() {
+        head.push_str(name.as_str());
+        head.push_str(": ");
+        head.push_str(value.to_str().map_err(|_| io::ErrorKind::InvalidInput)?);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await?;
     stream.flush().await?;
-    let mut budget = HEADER_LIMIT;
+    let mut budget = MAX_HTTP_HEADER_BYTES;
     let status = line(stream, &mut budget).await?;
     let mut parts = status.split_ascii_whitespace();
     let version = parts.next().unwrap_or_default();
@@ -130,5 +224,6 @@ pub(super) async fn exchange(
             return Err(io::ErrorKind::InvalidData.into());
         }
     }
+    restore_id(query, &mut body)?;
     Ok((body, reusable))
 }

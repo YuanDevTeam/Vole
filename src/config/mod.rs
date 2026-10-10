@@ -390,7 +390,17 @@ pub struct DnsNameserver {
     pub port: u16,
     pub route: DnsRoute,
     pub path: Option<String>,
+    pub http_auth: Option<DnsHttpAuth>,
     pub options: DnsNameserverOptions,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct DnsHttpAuth(pub(crate) Box<str>);
+
+impl std::fmt::Debug for DnsHttpAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DnsHttpAuth([redacted])")
+    }
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
@@ -5396,6 +5406,7 @@ rules:
             [
                 DnsNameserver {
                     path: None,
+                    http_auth: None,
                     options: Default::default(),
                     transport: DnsTransport::Udp,
                     address: "1.1.1.1".parse().unwrap(),
@@ -5404,6 +5415,7 @@ rules:
                 },
                 DnsNameserver {
                     path: None,
+                    http_auth: None,
                     options: Default::default(),
                     transport: DnsTransport::Udp,
                     address: "2001:db8::1".parse().unwrap(),
@@ -5412,6 +5424,7 @@ rules:
                 },
                 DnsNameserver {
                     path: None,
+                    http_auth: None,
                     options: Default::default(),
                     transport: DnsTransport::Tcp,
                     address: "8.8.8.8".parse().unwrap(),
@@ -5420,6 +5433,7 @@ rules:
                 },
                 DnsNameserver {
                     path: None,
+                    http_auth: None,
                     options: Default::default(),
                     transport: DnsTransport::Tcp,
                     address: "::1".parse().unwrap(),
@@ -6557,6 +6571,7 @@ dns:
             dns.nameserver_policies[0].nameservers.as_ref(),
             [DnsNameserver {
                 path: None,
+                http_auth: None,
                 options: Default::default(),
                 transport: DnsTransport::Tcp,
                 address: "223.5.5.5".parse().unwrap(),

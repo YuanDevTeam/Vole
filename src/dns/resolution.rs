@@ -100,6 +100,23 @@ impl ResolutionContext {
         if let Some(inner) = &self.inner {
             inner.cancel.cancel();
         }
+        if let Some(dns) = self.runtime_dns() {
+            dns.begin_shutdown();
+        }
+    }
+
+    pub(crate) fn runtime_dns(&self) -> Option<Arc<RuntimeDns>> {
+        match self.inner.as_ref()?.source.get()? {
+            Source::Runtime(Some(dns)) => dns.upgrade(),
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.close();
+        if let Some(dns) = self.runtime_dns() {
+            dns.shutdown().await;
+        }
     }
 
     /// Resolve only when the consuming protocol requires an IP. This does not

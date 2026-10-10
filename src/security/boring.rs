@@ -261,10 +261,19 @@ impl BoringTlsClient {
         stream: BoxStream,
         buffer_limit: usize,
     ) -> io::Result<BoxStream> {
-        Ok(Box::new(BoringStream::new(
-            self.handshake(stream).await?,
-            buffer_limit,
-        )))
+        self.connect_negotiated(stream, buffer_limit)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    pub(super) async fn connect_negotiated(
+        &self,
+        stream: BoxStream,
+        buffer_limit: usize,
+    ) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
+        let tls = self.handshake(stream).await?;
+        let alpn = tls.ssl().selected_alpn_protocol().map(<[u8]>::to_vec);
+        Ok((Box::new(BoringStream::new(tls, buffer_limit)), alpn))
     }
 
     #[cfg(feature = "outbound-vless")]

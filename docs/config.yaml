@@ -606,16 +606,26 @@ hosts:
 # enable 关闭时不接管 TUN DNS，内部解析使用系统 resolver；配置中的 hosts 仍可用于内部解析。
 # enable 开启时使用配置的 resolver，不因上游失败回退到系统 DNS。
 # nameserver 默认 [https://doh.pub/dns-query, tls://223.5.5.5:853]，不能显式留空。
-# 支持裸 IP、UDP/TCP、tls://、http(s)://，允许上游域名；DoH 使用 HTTP/1.1 POST，
-# DoT 与 HTTPS 校验证书与名称。default-nameserver 接受 IP 上游或显式 system，用于 bootstrap。
+# 支持裸 IP、UDP/TCP、tls://、http(s)://，允许上游域名；DoH GET 使用 ID 0 与无 padding
+# Base64URL dns=；清除原 query/fragment，URL userinfo 转 Basic，不进入 Host/path 或日志。
+# HTTPS 实际 ALPN 协商 H2/H1，无 ALPN 回退 H1；明文 HTTP 仅 H1，无 h2c。
+# DoT 与 HTTPS 使用共享 TLS 信任根，校验证书与名称。
+# default-nameserver 接受 IP 上游或显式 system，用于 bootstrap。
 # system、system://、dhcp://system 使用物理系统 DNS；dhcp://<精确接口名> 使用该接口的 DHCP DNS。
 # 各角色、policy、fallback 均支持；DHCP 接口不能用于 default-nameserver。来源始终物理直连，
-# 不应用 fragment/代理规则。只读现有网络来源；缺失、加密要求无法满足或物理绑定失败时不可用。
+# fragment/代理规则不改变物理出口，但 ECS/类型过滤包装仍适用。
+# 只读现有网络来源；缺失、加密要求无法满足或物理绑定失败时不可用。
 # rcode://success/format_error/server_failure/name_error/not_implemented/refused 返回本地 RCODE 0–5，
 # 可用于各 nameserver 列表与 policy（default-nameserver 除外）；不建立网络连接或额外设置 RA。
 # 无 fragment 时默认 DIRECT；respect-rules: true 时默认 RULES，且必须配置
 # proxy-server-nameserver。显式 fragment 可选 DIRECT、RULES 或已配置的节点/组名；
-# 名称支持百分号编码。proxy-server-nameserver 专门解析节点，direct-nameserver
+# fragment 使用 #出口&参数=值，整个 fragment 先百分号解码，再拆分；重复项以后者为准。
+# ecs=IP/CIDR 与 ecs-override=true 控制 ECS，保留其他 EDNS 参数。
+# disable-ipv4=true、disable-ipv6=true、disable-qtype-N=true 抑制相应 question 并过滤全部响应 sections；
+# ECS/过滤适用于 system、DHCP、RCODE 及各 resolver 角色，DHCP 接口名不含 fragment。
+# skip-cert-verify=true、name-cert-verify 用于 DoT/HTTPS；显式名称验证优先且不改变 SNI。
+# disable-reuse=true 仅禁用指定 DoT 复用；HTTPS 仍可复用，未知参数/出口拒绝。
+# proxy-server-nameserver 专门解析节点，direct-nameserver
 # 专门解析 DIRECT 业务目标；未配置时复用 nameserver。两者不隐式开启 respect-rules。
 # direct-nameserver-follow-policy 默认 false；true 让直连解析遵循 nameserver-policy。
 # 新建 DNS 连接采用当前组选择，cache 和已有连接不随选择改变而清空。

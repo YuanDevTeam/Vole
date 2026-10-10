@@ -10,6 +10,7 @@ mod cache;
 pub(crate) mod fake_ip;
 mod fallback;
 pub(crate) mod hosts;
+mod http2;
 mod https;
 mod options;
 pub(crate) mod policy;
@@ -28,6 +29,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 pub const MAX_MESSAGE_SIZE: usize = 4_096;
+pub(crate) const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 /// Maximum number of resource records scanned across all response sections.
 pub const MAX_RESPONSE_RECORDS: usize = 64;
 /// Maximum number of unique addresses retained in the typed cache and hints.

@@ -27,7 +27,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - DNS 不提供独立 listen、DoQ 或 DoH/H3。ECS、上游类型过滤、TLS 验证参数、
   DoT 独立禁用复用、LRU/ARC 与显式 system/DHCP 上游已支持，
   来源发现和物理绑定的可用平台及参考差异以 DNS 契约为准。
-  DoH 使用 H1 POST；详细解析角色、缓存与过滤行为见 [DNS 契约](tun-icmp-dns.md)。
+  DoH 使用 GET、URL Basic 与实际 ALPN H2/H1；详细解析角色、缓存、预算与过滤行为见 [DNS 契约](tun-icmp-dns.md)。
 - Provider/group 名称筛选和改名支持 lookahead、定长 lookbehind、数字/命名 backreference；
   普通表达式保留 Rust regex 快速路径。复杂表达式和改名有内部预算，超限使候选失败。
   不支持递归/条件式或完整 .NET 方言；DOMAIN-REGEX 与 GeoSite regex 不扩展。

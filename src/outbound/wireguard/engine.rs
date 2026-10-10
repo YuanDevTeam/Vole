@@ -168,6 +168,9 @@ impl Engine {
             self.cancel.cancel();
             self.retired.close();
         }
+        if let Some(remote) = self.remote.get() {
+            remote.shutdown().await;
+        }
         let channels = self
             .slots
             .iter()
@@ -186,6 +189,9 @@ impl Engine {
 }
 impl Drop for Engine {
     fn drop(&mut self) {
+        if let Some(remote) = self.remote.get() {
+            remote.begin_shutdown();
+        }
         self.cancel.cancel();
         self.control.cancel();
         if let Some(router) = self.router.get_mut().unwrap().take() {

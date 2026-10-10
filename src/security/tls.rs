@@ -369,11 +369,22 @@ impl StandardTlsClient {
     }
 
     pub async fn connect(&self, stream: BoxStream) -> io::Result<BoxStream> {
+        self.connect_negotiated(stream)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    /// Returns the authenticated stream and the server's actual ALPN choice.
+    /// Existing required-ALPN/ECH checks apply before either becomes visible.
+    pub async fn connect_negotiated(
+        &self,
+        stream: BoxStream,
+    ) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
         let connector = match &self.connector {
             StandardConnector::Rustls(connector) => connector,
             #[cfg(feature = "tls-fingerprint")]
             StandardConnector::Boring(client) => {
-                return client.connect(stream, self.buffer_limit).await;
+                return client.connect_negotiated(stream, self.buffer_limit).await;
             }
         };
         let server_name = ServerName::try_from(self.server_name.clone())
@@ -398,7 +409,8 @@ impl StandardTlsClient {
             ));
         }
 
-        Ok(Box::new(super::stream::TlsStream::new(tls)))
+        let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        Ok((Box::new(super::stream::TlsStream::new(tls)), alpn))
     }
 
     #[cfg(feature = "outbound-vless")]
