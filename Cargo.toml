@@ -41,6 +41,7 @@ default = [
     "outbound-vless",
     "outbound-hysteria2",
     "outbound-tuic",
+    "outbound-wireguard",
     "shadow-tls-v3",
     "sing-mux",
 ]
@@ -50,14 +51,15 @@ outbound-anytls = ["dep:md-5", "tls-fingerprint"]
 outbound-socks5 = []
 outbound-http = []
 outbound-shadowsocks = ["dep:shadowsocks", "dep:log"]
-outbound-vless = ["tls-fingerprint", "boring/reality", "boring/jls", "boring/mlkem", "dep:blake3", "dep:hpke", "dep:zeroize", "dep:vole-blake3-raw", "stream-transport", "quic-transport", "dep:hyper", "dep:hyper-util", "dep:h3", "dep:h3-quinn"]
+outbound-vless = ["tls-fingerprint", "boring/reality", "boring/jls", "boring/mlkem", "dep:blake3", "dep:hpke", "dep:vole-blake3-raw", "stream-transport", "quic-transport", "dep:hyper", "dep:hyper-util", "dep:h3", "dep:h3-quinn"]
 outbound-trojan = ["stream-transport", "tls-fingerprint"]
 outbound-vmess = ["stream-transport", "tls-fingerprint", "dep:aes", "dep:crc32fast", "dep:md-5", "dep:ring", "dep:shake"]
 tls-fingerprint = ["dep:boring", "dep:tokio-boring"]
-shadow-tls-v3 = ["tls-fingerprint", "boring/shadow-tls-v3", "dep:ring", "dep:zeroize"]
+shadow-tls-v3 = ["tls-fingerprint", "boring/shadow-tls-v3", "dep:ring"]
 outbound-hysteria2 = ["quic-transport", "dep:quinn-proto", "dep:h3", "dep:h3-quinn", "dep:blake2"]
 outbound-tuic = ["quic-transport"]
 sing-mux = ["stream-transport", "dep:yamux", "tokio-util/compat"]
+outbound-wireguard = ["dep:boringtun", "dep:vole-netstack"]
 stream-transport = ["dep:tokio-tungstenite", "dep:httparse", "dep:log"]
 quic-transport = ["dep:quinn"]
 # Enables local interoperability-only trust-root injection. Release build
@@ -83,6 +85,7 @@ tun = [
     "outbound-vless",
     "outbound-hysteria2",
     "outbound-tuic",
+    "outbound-wireguard",
     "shadow-tls-v3",
     "sing-mux",
 ]
@@ -94,6 +97,7 @@ async-trait = "0.1"
 base64 = "0.23"
 blake2 = { version = "=0.11.0", optional = true }
 blake3 = { version = "=1.8.7", optional = true }
+boringtun = { version = "=0.7.1", default-features = false, optional = true }
 boring = { git = "https://github.com/YuanDevTeam/boring", branch = "release", version = "=5.2.0", features = ["client-fingerprint"], optional = true }
 bytes = "1"
 crc32fast = { version = "1.5.2", optional = true }
@@ -145,7 +149,7 @@ vole-netstack = { path = "crates/vole-netstack", optional = true }
 vole-blake3-raw = { path = "crates/vole-blake3-raw", optional = true }
 webpki-roots = "1"
 yamux = { version = "=0.14.1", optional = true }
-zeroize = { version = "=1.9.0", optional = true }
+zeroize = { version = "=1.9.0" }
 zstd = { version = "0.14.0", default-features = false }
 
 [target.'cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))'.dependencies]

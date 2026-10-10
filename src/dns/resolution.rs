@@ -116,6 +116,23 @@ impl ResolutionContext {
             .ok_or(DispatchError::HostUnreachable)
     }
 
+    /// A raw-IP node cannot originate a family without a configured local IP.
+    /// Keep the same business DNS role, policy ordering and absolute deadline.
+    #[cfg(feature = "outbound-wireguard")]
+    pub(crate) async fn resolve_local_family(
+        &self,
+        target: &Destination,
+        deadline: Instant,
+        ipv4: bool,
+        ipv6: bool,
+    ) -> Result<SocketAddr, DispatchError> {
+        self.resolve_addresses(target, deadline, false)
+            .await?
+            .into_iter()
+            .find(|address| if address.is_ipv4() { ipv4 } else { ipv6 })
+            .ok_or(DispatchError::HostUnreachable)
+    }
+
     pub async fn resolve_proxy(
         &self,
         target: &Destination,

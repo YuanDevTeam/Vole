@@ -43,7 +43,8 @@ pub mod routing;
         feature = "outbound-trojan",
         feature = "outbound-vmess",
         feature = "outbound-hysteria2",
-        feature = "outbound-tuic"
+        feature = "outbound-tuic",
+        feature = "outbound-wireguard"
     ),
     any(feature = "invoke", test)
 ))]

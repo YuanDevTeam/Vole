@@ -115,6 +115,9 @@ jobs:
           rustls = package("rustls", "0.23.45")
           package("tokio-rustls", "0.26.5")
           package("ring")
+          wireguard = package("boringtun", "0.7.1")
+          require(wireguard.get("license") == "BSD-3-Clause", "unapproved WireGuard license")
+          require(not features(wireguard) & {"device", "ffi-bindings", "jni-bindings"}, "WireGuard must use only the userspace protocol")
           require("ring" in features(rustls) and not features(rustls) & {"reality", "aws_lc_rs", "fips"}, "rustls must use only the ring TLS provider")
           hpke = package("hpke", "0.14.1")
           require(features(hpke) == {"alloc", "aes", "chacha", "x25519", "hkdfsha2"}, "unapproved ECH algorithms")
@@ -193,7 +196,7 @@ jobs:
             dns::runtime::tests::resolve_ipv6_
             dns::source::tests:: dns::runtime::tests::dns_source_
             dns::runtime::encrypted_tests::
-            outbound::http::tests:: inbound::mixed::tests:: inbound::socks5::association::tests::
+            outbound::http::tests:: outbound::wireguard::tests:: inbound::mixed::tests:: inbound::socks5::association::tests::
             inbound::http::parser::tests:: inbound::http::framing::tests::
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
@@ -254,7 +257,7 @@ jobs:
             test "$(grep -Ec '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$test_log")" -eq "$expected_summaries"
             rm -f "$test_log"
           }
-          protocols=(socks5 anytls shadowsocks trojan vmess vless hysteria2 tuic)
+          protocols=(socks5 anytls shadowsocks trojan vmess vless hysteria2 tuic wireguard)
           cargo check --locked --no-default-features --lib
           for protocol in "${protocols[@]}"; do
             cargo check --locked --no-default-features --features "outbound-$protocol" --lib

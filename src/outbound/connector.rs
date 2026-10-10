@@ -250,7 +250,7 @@ impl EstablishContext {
     /// Only for a new physical path of an already authenticated session, never
     /// for extending an in-progress setup. Freeze its group choices and give
     /// this socket's complete upstream establishment a new absolute deadline.
-    #[cfg(feature = "outbound-hysteria2")]
+    #[cfg(any(test, feature = "outbound-hysteria2"))]
     pub(crate) fn authenticated_continuation(&self) -> Self {
         Self {
             deadline: Instant::now() + DEFAULT_ESTABLISH_TIMEOUT,
@@ -673,7 +673,8 @@ impl UpstreamPath {
         feature = "outbound-shadowsocks",
         feature = "outbound-vless",
         feature = "outbound-hysteria2",
-        feature = "outbound-tuic"
+        feature = "outbound-tuic",
+        feature = "outbound-wireguard"
     ))]
     pub(crate) async fn datagram_server(
         &self,

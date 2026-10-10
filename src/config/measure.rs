@@ -87,14 +87,11 @@ impl RawMeasureConfig {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn measurement_rejects_future_protocols_and_oversized_documents() {
+    fn measurement_rejects_oversized_documents() {
         let _case = crate::resources::case_events::Case::new(
             "FOUNDATIONS-SCHEMA",
-            "measurement_rejects_future_protocols_and_oversized_documents",
+            "measurement_rejects_oversized_documents",
         );
-        let yaml =
-            b"proxies:\n  - name: node\n    type: wireguard\n    server: example.com\n    port: 443\n";
-        assert!(super::MeasureConfig::parse_yaml(yaml).is_err());
         assert!(
             super::MeasureConfig::parse_yaml(&vec![b'x'; super::super::MAX_CONFIG_BYTES + 1])
                 .is_err()

@@ -11,7 +11,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 | 策略组 | select/url-test/fallback/load-balance；默认和持久选择；延迟容差、恢复、三种负载均衡策略；旧连接保持原路径 |
 | DNS | hosts、bootstrap/节点/直连解析角色、policy、respect-rules；UDP/TCP/DoH/DoT；fallback；redir-host/fake-IP 与映射持久化 |
 | mixed-port | HTTP/SOCKS5 TCP 与 SOCKS5 UDP；LAN 地址限制、多用户认证、认证跳过网段；allow-lan 不强制认证 |
-| 出站 | HTTP(S) CONNECT、SOCKS5、AnyTLS、Trojan、VMess AEAD、VLESS、Hysteria2、TUIC v5、Shadowsocks 2022；依赖启用的 Cargo feature |
+| 出站 | HTTP(S) CONNECT、SOCKS5、AnyTLS、Trojan、VMess AEAD、VLESS、Hysteria2、TUIC v5、Shadowsocks 2022、标准 WireGuard 单 peer；依赖启用的 Cargo feature |
 | 嗅探 | TUN/mixed TCP 的 HTTP/TLS；TUN UDP 的 QUIC；域名/地址排除、强制条件和目标覆盖 |
 | Linux 自建设备 | auto-detect-interface、auto-route、systemd-resolved DNS 接管；失败和停止时恢复本次修改 |
 | 运行状态 | 连接快照、流量计数和关闭；组与资源状态；规则命中、有效配置、受限 DNS 诊断 |
@@ -31,6 +31,8 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - 订阅元信息只在成功候选或合法 304 后发布，失败响应或坏候选保留旧值；
   与 Mihomo 在读取响应头时更新的时点不同。数值仅接受有限且可表示的十进制数，
   不保留非有限/溢出浮点转换的参考行为。
+- WireGuard 使用用户态标准单 peer；每个本地地址族最多一个地址，MTU 至少1280。
+  顶层 allowed-ips 在单 peer 模式与参考一致地忽略，扩展 peers/remote DNS 尚不接受。
 - 节点 UDP 能力按 [出站契约](outbounds.md) 声明；rule 模式跳过不支持 UDP 的目标，继续匹配后续规则。
   global 模式和显式 DNS 出口不执行此跳过。负载均衡组按其声明能力参与规则匹配，实际选中成员仍须支持 UDP。
 - 未配置入站的配置不能启动。Controller 沿用回环地址、secret 及运行配置准入，见 [Controller API](controller-api.md)。

@@ -20,7 +20,7 @@ Vole — прокси-ядро на Rust для VPN-клиентов и лока
 
 ## Прокси-протоколы
 
-Все девять протоколов ниже включены по умолчанию. HTTP CONNECT поддерживает только TCP; UDP для остальных протоколов настраивается на уровне узла.
+Все десять протоколов ниже включены по умолчанию. HTTP CONNECT поддерживает только TCP; UDP для остальных протоколов настраивается на уровне узла.
 
 | Протокол | Возможности |
 | --- | --- |
@@ -33,6 +33,7 @@ Vole — прокси-ядро на Rust для VPN-клиентов и лока
 | [SOCKS5](../docs/outbounds.md#socks5) | CONNECT и UDP ASSOCIATE, с опциональной аутентификацией по имени пользователя и паролю |
 | [Hysteria2](../docs/outbounds.md#hysteria2) | TCP/UDP через QUIC, управление пропускной способностью, Salamander, смена портов и mTLS |
 | [TUIC v5](../docs/outbounds.md#tuic-v5) | TCP/UDP через QUIC, режимы передачи UDP native/quic и выбор алгоритма управления перегрузкой |
+| [WireGuard](../docs/outbounds.md#wireguard) | TCP/UDP через стандартный WireGuard с пользовательским IP-стеком |
 
 Стандартные TLS-соединения поддерживают проверку сертификатов и закрепление сертификата по SHA-256. Поддерживаемые TCP-пути с TLS могут использовать шаблоны ClientHello Chrome, Firefox или Safari; `client-fingerprint` не зависит от `fingerprint` сертификата. Точные имена и сочетания описаны в [профилях TLS и политике сертификатов](../docs/tls-client-fingerprint.md). Эти функции не гарантируют неотличимость от браузера или произвольные сочетания протоколов.
 
@@ -140,6 +141,7 @@ void VoleFree(char *response);
 Vole использует публичные зависимости и опирается на реализации протоколов и примеры платформенной интеграции:
 
 - Зависимости TUN: локальный [`vole-netstack`](../crates/vole-netstack/README.md) использует [smoltcp](https://github.com/smoltcp-rs/smoltcp), а пакетный I/O на Unix и Windows Wintun — [tun-rs](https://github.com/tun-rs/tun-rs) (Apache-2.0).
+- WireGuard: [boringtun](https://github.com/cloudflare/boringtun) (BSD-3-Clause), без host-device, FFI и JNI.
 - [Wintun](https://www.wintun.net/): DLL предоставляет хост; Vole её не включает. Исходный [заголовок API](https://github.com/tun-rs/tun-rs/blob/2.8.11/src/platform/windows/tun/wintun.h) в tun-rs имеет copyright 2018–2021 WireGuard LLC и лицензию `GPL-2.0 OR MIT`; при распространении связанных API bindings необходимо сохранить copyright и уведомление об альтернативной лицензии MIT.
 - Архитектурные ориентиры для сети и маршрутизации: [clash-rs](https://github.com/Watfaq/clash-rs), [netstack-smoltcp](https://github.com/cavivie/netstack-smoltcp), [Mihomo](https://github.com/MetaCubeX/mihomo), [Xray-core](https://github.com/XTLS/Xray-core) и [Leaf](https://github.com/eycorsican/leaf). Эти проекты не являются зависимостями netstack.
 - TLS и Shadowsocks: [rustls](https://github.com/rustls/rustls), [boring](https://github.com/cloudflare/boring), [BoringSSL](https://boringssl.googlesource.com/boringssl/) и [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust). Заимствованный код replay-window сохраняет [уведомления MIT](../src/outbound/shadowsocks/packet_window.rs).

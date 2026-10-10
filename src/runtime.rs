@@ -477,13 +477,14 @@ impl PreparedCore {
             resources,
             ..
         } = self.build_dispatcher(dialer)?;
-        let control = resources.as_ref().map(|resources| {
-            resources.clone() as Arc<dyn crate::resource::control::RuntimeResources>
-        });
-        let controller = self
-            .bind_controller(None, proxy_groups)
-            .await?
-            .map(|controller| controller.with_resources(control));
+        let controller = self.bind_controller(None, proxy_groups).await?;
+        #[cfg(any(feature = "inbound-http", feature = "inbound-socks5"))]
+        let controller = {
+            let control = resources.as_ref().map(|resources| {
+                resources.clone() as Arc<dyn crate::resource::control::RuntimeResources>
+            });
+            controller.map(|controller| controller.with_resources(control))
+        };
         RunningCore::start_components(
             &self.config.inbounds,
             dispatcher,
@@ -1004,6 +1005,24 @@ fn build_proxy_graph(
             &node_dialer,
         )?;
         let connector: Arc<dyn OutboundConnector> = match &proxy.protocol {
+            ProxyProtocol::WireGuard(config) => {
+                #[cfg(feature = "outbound-wireguard")]
+                {
+                    Arc::new(
+                        crate::outbound::wireguard::WireGuardOutbound::new_with_path(
+                            config, upstream,
+                        )?,
+                    )
+                }
+                #[cfg(not(feature = "outbound-wireguard"))]
+                {
+                    let _ = (config, upstream);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "WireGuard support is disabled",
+                    ));
+                }
+            }
             ProxyProtocol::Http(config) => {
                 #[cfg(feature = "outbound-http")]
                 {
@@ -1317,7 +1336,8 @@ async fn prepare_proxy_endpoints(
             let upload_port = proxy.port();
             let download = match &proxy.protocol {
                 ProxyProtocol::Vless(config) => config.download(),
-                ProxyProtocol::Http(_)
+                ProxyProtocol::WireGuard(_)
+                | ProxyProtocol::Http(_)
                 | ProxyProtocol::Socks5(_)
                 | ProxyProtocol::Trojan(_)
                 | ProxyProtocol::Vmess(_)
@@ -1435,6 +1455,7 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
                 standard_count + usize::from(config.tls.is_some()),
             ),
             ProxyProtocol::Tuic(_) => (client_count + 1, standard_count),
+            ProxyProtocol::WireGuard(_) => (client_count, standard_count),
         },
     )
 }
@@ -1887,6 +1908,11 @@ mod tests {
                 "tuic",
                 ", uuid: 08080808-0808-0808-0808-080808080808, password: fixture",
                 cfg!(feature = "outbound-tuic"),
+            ),
+            (
+                "wireguard",
+                ", ip: 10.84.0.2, private-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=, public-key: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+                cfg!(feature = "outbound-wireguard"),
             ),
         ];
         for (protocol, fields, enabled) in variants {

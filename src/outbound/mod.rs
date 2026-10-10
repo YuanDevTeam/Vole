@@ -7,6 +7,8 @@ pub mod http;
 pub mod trojan;
 #[cfg(feature = "outbound-vmess")]
 pub mod vmess;
+#[cfg(feature = "outbound-wireguard")]
+pub mod wireguard;
 
 #[cfg(feature = "outbound-anytls")]
 mod anytls;
@@ -61,7 +63,8 @@ pub mod hysteria2;
     feature = "outbound-vmess",
     feature = "outbound-vless",
     feature = "outbound-hysteria2",
-    feature = "outbound-tuic"
+    feature = "outbound-tuic",
+    feature = "outbound-wireguard"
 ))]
 mod owned_stream;
 #[cfg(feature = "outbound-tuic")]

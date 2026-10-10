@@ -314,3 +314,35 @@ client-first 路径，server-first/空首包列为已知限制，不计成功；
 Mihomo 仅提供单 PSK；原样 ssserver 验证 AES 单层 EIH 多用户 TCP/UDP 终结及错误身份。
 MTU1500 大包夹具显式启用官方双向 IP 分片。自有 1/2 层身份中继不是原生任意多层证明。
 所有结果与平台/发布签收分开，见[验收边界](acceptance.md)。
+
+
+## WireGuard
+
+`type: wireguard` 使用官方 boringtun 的标准 Noise 协议和用户态 IP 栈。
+`outbound-wireguard` 可独立启用，不依赖 TUN；不创建系统接口、路由或 NAT。
+单 peer 必填 server/port、private-key/public-key，ip/ipv6 至少提供一个本地地址；
+地址接受 IP 或 CIDR，保留主机地址，每族最多一个。pre-shared-key 可选。
+密钥必须是解码后 32 字节的标准 Base64，保存时清零回收且 Debug/错误不暴露密钥。
+
+MTU 省略/0 为 1408，范围 1280–65503；外层实际双向 UDP 预算必须至少为 MTU+32，
+不足时关闭上游，不静默缩小 MTU。udp 缺省 false，只控制业务 UDP，外层始终需要
+双向数据报能力。persistent-keepalive 为 uint16 秒，0 关闭定期保活。
+与固定 Mihomo 参考一致，无 peers 时顶层 allowed-ips 接受但不参与选择：
+本地配置的地址族使用全地址路由。当前不接受 peers、reserved、remote-dns-resolve、
+dns、refresh-server-ip-interval、Amnezia 或系统接口模式字段。
+
+每节点、资源代际按需拥有一套 TCP 栈与 peer 驱动，内层 UDP 使用真实临时端口。
+外层经过共享 Dialer/UpstreamPath，节点端点由代理 DNS 角色解析并固定在物理会话；
+旧会话保留建链组快照与已认证入站身份。业务域名用受控本地 DNS，并在配置的本地
+地址族中选择；遵循节点 ip-version、全局 IPv6 开关与原建链期限，不在失败时回落 DIRECT。
+真实握手完成才交付业务流；握手重试和后续保活使用官方协议定时器。
+
+每节点 raw 包队列和 peer 发送队列各 32 项；每 UDP 关联响应队列 64 项。
+UDP 负载上限为 MTU 减本地 IP/UDP 头，再与调用方收发预算分别取交集；
+双栈节点保守按 48 字节扣除，只有 IPv4 时扣 28 字节。满队列丢当前包，
+TCP 依赖重传。解密后校验本地目的地址、来源地址族和关联端口，不交付陌生数据。
+这些是局部结构边界，不是业务连接总数限制。
+
+握手、收发与重试均可取消；peer/栈任务由节点持有，调用方 future 丢弃不会丢失
+任务所有权。Stop 关闭新准入、取消并等待驱动、关闭上游（最多一秒），随后等待
+用户态栈退出。失败物理会话只由新业务重建，不重放已发送的业务。

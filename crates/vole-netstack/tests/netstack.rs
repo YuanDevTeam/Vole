@@ -1,13 +1,333 @@
 use std::{
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use vole_netstack::{NetStack, NetStackConfig, NetStackError, Packet, UdpDatagram};
+use vole_netstack::{
+    ClientAddresses, NetStack, NetStackConfig, NetStackError, Packet, UdpDatagram,
+};
 
 const WAIT: Duration = Duration::from_secs(2);
+
+fn client_addresses() -> ClientAddresses {
+    ClientAddresses {
+        ipv4: Some("10.23.0.2".parse().unwrap()),
+        ipv6: Some("fd23::2".parse().unwrap()),
+    }
+}
+
+fn tcp_flow(packet: &Packet) -> Flow {
+    let bytes = packet.data();
+    let offset = ip_header_len(bytes);
+    let (source, destination) = match bytes[0] >> 4 {
+        4 => (
+            Ipv4Addr::from(<[u8; 4]>::try_from(&bytes[12..16]).unwrap()).into(),
+            Ipv4Addr::from(<[u8; 4]>::try_from(&bytes[16..20]).unwrap()).into(),
+        ),
+        6 => (
+            Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[8..24]).unwrap()).into(),
+            Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[24..40]).unwrap()).into(),
+        ),
+        _ => unreachable!(),
+    };
+    Flow {
+        source: SocketAddr::new(
+            source,
+            u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()),
+        ),
+        destination: SocketAddr::new(
+            destination,
+            u16::from_be_bytes(bytes[offset + 2..offset + 4].try_into().unwrap()),
+        ),
+    }
+}
+
+async fn wait_no_tcp(stats: &vole_netstack::NetStackStats) {
+    tokio::time::timeout(WAIT, async {
+        while stats.snapshot().active_tcp != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("TCP state was not reclaimed");
+    assert_eq!(stats.snapshot().half_open_tcp, 0);
+}
+
+async fn timeout_tcp_flag(stream: &mut vole_netstack::PacketStream, flag: u8) -> Packet {
+    loop {
+        let packet = timeout_packet(stream).await;
+        let offset = ip_header_len(packet.data());
+        if packet.data()[offset + 13] & flag != 0 {
+            return packet;
+        }
+    }
+}
+
+#[tokio::test]
+async fn active_tcp_uses_configured_sources_and_delivers_established_duplex_streams() {
+    let mut parts = NetStack::start_client(NetStackConfig::default(), client_addresses()).unwrap();
+    for destination in ["198.51.100.20:443", "[2001:db8:2::20]:443"] {
+        let destination: SocketAddr = destination.parse().unwrap();
+        let mut connect = Box::pin(
+            parts
+                .tcp_connector
+                .connect(destination, tokio::time::Instant::now() + WAIT),
+        );
+        assert!(futures_util::poll!(connect.as_mut()).is_pending());
+        let syn = timeout_packet(&mut parts.packet_stream).await;
+        let flow = tcp_flow(&syn);
+        assert_eq!(flow.destination, destination);
+        assert_eq!(
+            flow.source.ip(),
+            if destination.is_ipv4() {
+                IpAddr::V4(client_addresses().ipv4.unwrap())
+            } else {
+                IpAddr::V6(client_addresses().ipv6.unwrap())
+            }
+        );
+        let offset = ip_header_len(syn.data());
+        assert_eq!(
+            syn.data()[offset + 13] & (TcpFlags::SYN | TcpFlags::ACK),
+            TcpFlags::SYN
+        );
+        assert!(
+            futures_util::poll!(connect.as_mut()).is_pending(),
+            "connect returned before the handshake"
+        );
+        let peer = Flow {
+            source: flow.destination,
+            destination: flow.source,
+        };
+        let local_sequence = tcp_sequence(&syn).wrapping_add(1);
+        parts
+            .packet_sink
+            .send(build_tcp(
+                &peer,
+                800,
+                local_sequence,
+                TcpFlags::SYN | TcpFlags::ACK,
+                &[],
+            ))
+            .await
+            .unwrap();
+        let mut stream = tokio::time::timeout(WAIT, connect).await.unwrap().unwrap();
+        assert_eq!(stream.source_addr(), flow.source);
+        assert_eq!(stream.destination_addr(), destination);
+        assert_eq!(parts.stats.snapshot().half_open_tcp, 0);
+        stream.write_all(b"hello").await.unwrap();
+        loop {
+            let packet = timeout_packet(&mut parts.packet_stream).await;
+            let offset = ip_header_len(packet.data());
+            let start = offset + usize::from(packet.data()[offset + 12] >> 4) * 4;
+            if start != packet.len() {
+                assert_eq!(&packet.data()[start..], b"hello");
+                assert_eq!(tcp_flow(&packet).source, flow.source);
+                break;
+            }
+        }
+        parts
+            .packet_sink
+            .send(build_tcp(
+                &peer,
+                801,
+                local_sequence.wrapping_add(5),
+                TcpFlags::ACK,
+                b"world",
+            ))
+            .await
+            .unwrap();
+        let mut payload = [0; 5];
+        tokio::time::timeout(WAIT, stream.read_exact(&mut payload))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&payload, b"world");
+        stream.shutdown().await.unwrap();
+        timeout_tcp_flag(&mut parts.packet_stream, 1).await;
+        parts
+            .packet_sink
+            .send(build_tcp(
+                &peer,
+                806,
+                local_sequence.wrapping_add(6),
+                TcpFlags::ACK | 1,
+                b"tail",
+            ))
+            .await
+            .unwrap();
+        let mut tail = Vec::new();
+        tokio::time::timeout(WAIT, stream.read_to_end(&mut tail))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tail, b"tail");
+    }
+    parts.control.stop().await;
+    assert_eq!(parts.stats.snapshot().active_tcp, 0);
+}
+
+#[tokio::test]
+async fn active_tcp_refused_handshake_reclaims_its_socket() {
+    let mut parts = NetStack::start_client(NetStackConfig::default(), client_addresses()).unwrap();
+    let mut connect = Box::pin(parts.tcp_connector.connect(
+        "198.51.100.20:443".parse().unwrap(),
+        tokio::time::Instant::now() + WAIT,
+    ));
+    assert!(futures_util::poll!(connect.as_mut()).is_pending());
+    let syn = timeout_packet(&mut parts.packet_stream).await;
+    let flow = tcp_flow(&syn);
+    let peer = Flow {
+        source: flow.destination,
+        destination: flow.source,
+    };
+    parts
+        .packet_sink
+        .send(build_tcp(
+            &peer,
+            0,
+            tcp_sequence(&syn).wrapping_add(1),
+            TcpFlags::ACK | 4,
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(WAIT, connect)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::ConnectionRefused
+    );
+    wait_no_tcp(&parts.stats).await;
+    parts.control.stop().await;
+}
+
+#[tokio::test]
+async fn active_tcp_cancel_and_deadline_emit_reset_and_reclaim_state() {
+    for (drop_future, establish) in [(true, false), (false, false), (true, true)] {
+        let mut parts = NetStack::start_client(
+            NetStackConfig {
+                max_poll_interval: Duration::from_secs(5),
+                ..NetStackConfig::default()
+            },
+            client_addresses(),
+        )
+        .unwrap();
+        let mut connect = Box::pin(parts.tcp_connector.connect(
+            "198.51.100.20:443".parse().unwrap(),
+            tokio::time::Instant::now() + Duration::from_millis(150),
+        ));
+        assert!(futures_util::poll!(connect.as_mut()).is_pending());
+        let syn = timeout_packet(&mut parts.packet_stream).await;
+        if establish {
+            let flow = tcp_flow(&syn);
+            let peer = Flow {
+                source: flow.destination,
+                destination: flow.source,
+            };
+            parts
+                .packet_sink
+                .send(build_tcp(
+                    &peer,
+                    800,
+                    tcp_sequence(&syn).wrapping_add(1),
+                    TcpFlags::SYN | TcpFlags::ACK,
+                    &[],
+                ))
+                .await
+                .unwrap();
+            timeout_tcp_flag(&mut parts.packet_stream, TcpFlags::ACK).await;
+            tokio::time::timeout(WAIT, async {
+                while parts.stats.snapshot().half_open_tcp != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // The caller has not polled the queued Established result. Drop
+            // must still abort, rather than leaving an unclaimed live socket.
+        }
+        if drop_future {
+            drop(connect);
+        } else {
+            assert_eq!(
+                connect.await.unwrap_err().kind(),
+                std::io::ErrorKind::TimedOut
+            );
+        }
+        let reset = timeout_packet(&mut parts.packet_stream).await;
+        let offset = ip_header_len(reset.data());
+        assert_ne!(reset.data()[offset + 13] & 4, 0);
+        assert_eq!(tcp_flow(&reset).source, tcp_flow(&syn).source);
+        wait_no_tcp(&parts.stats).await;
+        parts.control.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn active_tcp_stop_releases_full_output_pending_connects_and_rejects_unsolicited_syn() {
+    let mut parts = NetStack::start_client(
+        NetStackConfig {
+            packet_queue: 1,
+            max_poll_interval: Duration::from_secs(5),
+            ..NetStackConfig::default()
+        },
+        client_addresses(),
+    )
+    .unwrap();
+    let destination = "198.51.100.20:443".parse().unwrap();
+    let mut first = Box::pin(
+        parts
+            .tcp_connector
+            .connect(destination, tokio::time::Instant::now() + WAIT),
+    );
+    let mut second = Box::pin(
+        parts
+            .tcp_connector
+            .connect(destination, tokio::time::Instant::now() + WAIT),
+    );
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    assert!(futures_util::poll!(second.as_mut()).is_pending());
+    let stranger = Flow {
+        source: destination,
+        destination: "10.23.0.2:8000".parse().unwrap(),
+    };
+    parts
+        .packet_sink
+        .send(build_tcp(&stranger, 100, 0, TcpFlags::SYN, &[]))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, async {
+        while parts.stats.snapshot().active_tcp != 2 || parts.stats.snapshot().rejected_tcp != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The sole output slot still contains a SYN; stop must not await draining.
+    tokio::time::timeout(Duration::from_millis(500), parts.control.stop())
+        .await
+        .unwrap();
+    assert_eq!(
+        first.await.unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionAborted
+    );
+    assert_eq!(
+        second.await.unwrap_err().kind(),
+        std::io::ErrorKind::ConnectionAborted
+    );
+    wait_no_tcp(&parts.stats).await;
+    assert!(parts.packet_stream.recv().await.is_none());
+    assert!(matches!(
+        parts
+            .packet_sink
+            .try_send(build_tcp(&stranger, 100, 0, TcpFlags::SYN, &[])),
+        Err(NetStackError::Stopped)
+    ));
+}
 
 #[tokio::test]
 async fn ready_tcp_burst_preserves_flow_binding_and_neighboring_icmp() {

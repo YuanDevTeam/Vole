@@ -50,6 +50,8 @@ mod ech;
 pub use ech::StaticEchConfig;
 mod hysteria2;
 pub use hysteria2::{Hysteria2Hopping, Hysteria2OutboundConfig};
+mod wireguard;
+pub use wireguard::{WireGuardKey, WireGuardOutboundConfig};
 mod tuic;
 pub use tuic::{TuicCongestion, TuicOutboundConfig, TuicUdpMode};
 mod jls;
@@ -652,6 +654,7 @@ pub struct ProxyConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyProtocol {
     Http(HttpOutboundConfig),
+    WireGuard(WireGuardOutboundConfig),
     Tuic(TuicOutboundConfig),
     Hysteria2(Hysteria2OutboundConfig),
     Vmess(VmessOutboundConfig),
@@ -666,6 +669,7 @@ impl ProxyConfig {
     #[must_use]
     pub fn address(&self) -> &str {
         match &self.protocol {
+            ProxyProtocol::WireGuard(config) => &config.address,
             ProxyProtocol::Http(config) => &config.address,
             ProxyProtocol::Tuic(config) => &config.address,
             ProxyProtocol::Hysteria2(config) => &config.address,
@@ -681,6 +685,7 @@ impl ProxyConfig {
     #[must_use]
     pub const fn port(&self) -> u16 {
         match &self.protocol {
+            ProxyProtocol::WireGuard(config) => config.port,
             ProxyProtocol::Http(config) => config.port,
             ProxyProtocol::Tuic(config) => config.port,
             ProxyProtocol::Hysteria2(config) => config.port,
@@ -1496,6 +1501,8 @@ impl<'de> Deserialize<'de> for RawOutbound {
 // protocol fields inline avoids extra heap allocations in the startup path.
 #[allow(clippy::large_enum_variant)]
 enum RawProtocol {
+    #[serde(rename = "wireguard")]
+    WireGuard(#[serde(deserialize_with = "wireguard::deserialize")] wireguard::RawWireGuard),
     #[serde(rename = "http")]
     Http(http_proxy::RawHttp),
     #[serde(rename = "tuic")]
@@ -2680,6 +2687,7 @@ pub(crate) fn proxy_graph_order(
 impl RawOutbound {
     fn normalize(self) -> Result<PendingProxyConfig> {
         let (tag, dialer_proxy, udp, protocol) = match self.protocol {
+            RawProtocol::WireGuard(raw) => raw.normalize()?,
             RawProtocol::Http(raw) => raw.normalize()?,
             RawProtocol::Hysteria2(raw) => raw.normalize()?,
             RawProtocol::Tuic(raw) => raw.normalize()?,

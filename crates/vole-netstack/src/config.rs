@@ -1,6 +1,39 @@
-use std::time::Duration;
+use std::{
+    net::{Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 use thiserror::Error;
+
+/// Configured source addresses for an active raw-IP client stack.
+///
+/// An omitted family is unavailable; the driver never invents a source address.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClientAddresses {
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+}
+
+impl ClientAddresses {
+    pub(crate) fn validate(self) -> Result<(), ConfigError> {
+        if self.ipv4.is_none() && self.ipv6.is_none() {
+            return Err(ConfigError::NoClientAddress);
+        }
+        if self
+            .ipv4
+            .is_some_and(|ip| ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast())
+        {
+            return Err(ConfigError::ClientAddress("IPv4"));
+        }
+        if self
+            .ipv6
+            .is_some_and(|ip| ip.is_unspecified() || ip.is_multicast())
+        {
+            return Err(ConfigError::ClientAddress("IPv6"));
+        }
+        Ok(())
+    }
+}
 
 /// Finite buffering and timing configuration for one netstack instance.
 ///
@@ -96,6 +129,10 @@ impl NetStackConfig {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ConfigError {
+    #[error("active netstack requires at least one configured source address")]
+    NoClientAddress,
+    #[error("active netstack {0} source address must be unicast")]
+    ClientAddress(&'static str),
     #[error("MTU must be between 1280 and 65535 bytes, got {0}")]
     Mtu(usize),
     #[error("resource limit `{0}` must be greater than zero")]

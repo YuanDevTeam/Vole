@@ -13,9 +13,126 @@ use std::{
 use futures_util::task::AtomicWaker;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::{Notify, mpsc},
+    sync::{Notify, mpsc, oneshot},
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
+
+use crate::ClientAddresses;
+
+pub(crate) struct ConnectRequest {
+    pub(crate) destination: SocketAddr,
+    pub(crate) deadline: Instant,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) response: oneshot::Sender<std::io::Result<TcpStream>>,
+}
+
+struct ConnectGuard {
+    cancellation: CancellationToken,
+    notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl Drop for ConnectGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+            self.notify.notify_one();
+        }
+    }
+}
+
+/// Active TCP connections driven entirely by the stack's raw-IP endpoints.
+#[derive(Clone)]
+pub struct TcpConnector {
+    pub(crate) sender: mpsc::Sender<ConnectRequest>,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) notify: Arc<Notify>,
+    pub(crate) addresses: ClientAddresses,
+}
+
+impl TcpConnector {
+    /// Connects to an IP endpoint and returns only after TCP is established.
+    ///
+    /// Queue admission and handshake share the supplied absolute deadline.
+    /// Dropping this future cancels its pending request and socket; no background
+    /// connect task survives the caller. The stack performs no DNS or host I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AddrNotAvailable` for an unconfigured address family,
+    /// `InvalidInput` for a non-unicast/zero-port peer, `TimedOut` at the
+    /// deadline, or an I/O error when TCP fails or the stack stops.
+    pub async fn connect(
+        &self,
+        destination: SocketAddr,
+        deadline: Instant,
+    ) -> std::io::Result<TcpStream> {
+        let invalid_ip = match destination.ip() {
+            std::net::IpAddr::V4(ip) => {
+                ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast()
+            }
+            std::net::IpAddr::V6(ip) => ip.is_unspecified() || ip.is_multicast(),
+        };
+        if invalid_ip || destination.port() == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid active TCP peer",
+            ));
+        }
+        if (destination.is_ipv4() && self.addresses.ipv4.is_none())
+            || (destination.is_ipv6() && self.addresses.ipv6.is_none())
+        {
+            return Err(Error::new(
+                ErrorKind::AddrNotAvailable,
+                "active TCP source family is unavailable",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(connect_timeout());
+        }
+        let cancellation = CancellationToken::new();
+        let mut guard = ConnectGuard {
+            cancellation: cancellation.clone(),
+            notify: self.notify.clone(),
+            armed: true,
+        };
+        let (response, received) = oneshot::channel();
+        let request = ConnectRequest {
+            destination,
+            deadline,
+            cancellation,
+            response,
+        };
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => return Err(connect_stopped()),
+            () = tokio::time::sleep_until(deadline) => return Err(connect_timeout()),
+            result = self.sender.send(request) => result.map_err(|_| connect_stopped())?,
+        }
+        let result = tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => Err(connect_stopped()),
+            () = tokio::time::sleep_until(deadline) => Err(connect_timeout()),
+            result = received => result.unwrap_or_else(|_| Err(connect_stopped())),
+        };
+        if result.is_ok() {
+            guard.armed = false;
+        }
+        result
+    }
+}
+
+pub(crate) fn connect_stopped() -> Error {
+    Error::new(
+        ErrorKind::ConnectionAborted,
+        "netstack is stopping or stopped",
+    )
+}
+
+pub(crate) fn connect_timeout() -> Error {
+    Error::new(ErrorKind::TimedOut, "netstack TCP connect deadline elapsed")
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct FlowKey {
@@ -119,7 +236,7 @@ impl TcpStreamHandle {
     }
 }
 
-/// One TCP flow intercepted from the raw-IP side.
+/// One intercepted or actively established userspace TCP flow.
 pub struct TcpStream {
     flow: FlowKey,
     pub(crate) handle: Arc<TcpStreamHandle>,
@@ -130,13 +247,13 @@ impl TcpStream {
         Self { flow, handle }
     }
 
-    /// Address of the application that wrote the original TUN packet.
+    /// Intercepted application address, or local source of an active connection.
     #[must_use]
     pub const fn source_addr(&self) -> SocketAddr {
         self.flow.source
     }
 
-    /// Original destination that the outbound dispatcher must dial.
+    /// Original intercepted destination, or remote peer of an active connection.
     #[must_use]
     pub const fn destination_addr(&self) -> SocketAddr {
         self.flow.destination

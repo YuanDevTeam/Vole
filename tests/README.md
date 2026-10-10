@@ -25,6 +25,7 @@ cargo test --locked --lib geodata::tests::
 cargo test --locked --features cli --lib asn_
 cargo test --locked --all-features --lib resource::http::tests::
 cargo test --locked --all-features --lib outbound::http::tests::
+cargo test --locked --all-features --lib outbound::wireguard::tests::
 cargo test --locked --all-features --lib platform::linux_network::tests::
 cargo test --locked --all-features --lib connections::tests::
 cargo test --locked --all-features --lib routing::diagnostics::tests::
@@ -84,6 +85,8 @@ Python，直接运行此检查，仅验证各自构建的产物。
 
 在 Windows 上，`windows-uwp` 与 `windows-wintun` 互斥，编译与 Clippy 应明确选择
 所测后端而非 `--all-features`。名称选择仍需已安装包验证，不以对象级测试代替。
+
+`outbound::wireguard::tests::` 在内存中交换真实 Noise 与 raw-IP 包，覆盖主动 TCP、双栈 UDP、真实握手重试、取消与 Stop；不打开 socket 或系统接口。
 
 宿主只执行明确的纯内存过滤器；全目标使用 `--no-run`。
 `invoke::tests::` 含监听器用例，不可整体在宿主执行；可执行过滤器以

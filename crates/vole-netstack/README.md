@@ -81,6 +81,39 @@ control.stop().await;
 smoltcp sockets and woken pending TCP operations. Dropping the sole
 `PacketStream` also stops the driver and releases all endpoints.
 
+## Active TCP client
+
+`NetStack::start_client(config, addresses)` returns `ClientNetStackParts` with
+the same raw packet endpoints, control and statistics, plus a cloneable
+`TcpConnector`. `ClientAddresses` supplies optional IPv4/IPv6 source addresses;
+at least one must be unicast. An omitted family fails with `AddrNotAvailable`.
+The client mode does not create a passive accept or UDP datagram queue, and
+discards incoming TCP packets that do not belong to a requested connection.
+
+```rust,ignore
+let parts = vole_netstack::NetStack::start_client(config, addresses)?;
+// The owner must concurrently pump packet_sink and packet_stream.
+let stream = parts.tcp_connector.connect(peer, deadline).await?;
+assert_eq!(stream.destination_addr(), peer);
+parts.control.stop().await;
+```
+
+`connect` takes an IP `SocketAddr` and an absolute Tokio `Instant`; bounded
+command admission and the handshake use that one deadline. It returns only
+after the socket reaches Established, with `source_addr` representing the
+configured local IP and allocated ephemeral port. `destination_addr` is the
+remote peer. The driver alone owns socket state and allocates source ports;
+there is no host socket, DNS resolver, system interface, route or NAT setup.
+
+The command queue holds at most 32 requests, independently of active socket
+count. Waiting for queue space remains cancellable and deadline-bound. Future
+Drop, deadline or handshake failure aborts the pending socket and reclaims its
+flow after any reset reaches the existing output queue; a full output never
+blocks Stop. Successful streams retain the existing direction buffers and TCP
+half-close behavior. Stop closes admission, wakes queued/in-flight connects
+and releases every socket before returning. Passive `start`/`start_tcp` TUN
+behavior and their configured bounds remain unchanged.
+
 ## Driver buffering and scheduling
 
 Device ingress holds at most one pending packet, not another packet queue.

@@ -20,7 +20,7 @@ Vole 是用于 VPN 客户端和本地代理的 Rust 代理内核，提供原生�
 
 ## 代理协议
 
-默认构建启用下列全部九种协议。HTTP CONNECT 仅支持 TCP；其他协议的 UDP 能力按节点配置。
+默认构建启用下列全部十种协议。HTTP CONNECT 仅支持 TCP；其他协议的 UDP 能力按节点配置。
 
 | 协议 | 能力 |
 | --- | --- |
@@ -33,6 +33,7 @@ Vole 是用于 VPN 客户端和本地代理的 Rust 代理内核，提供原生�
 | [SOCKS5](../docs/outbounds.md#socks5) | CONNECT 和 UDP ASSOCIATE，可选用户名/密码认证 |
 | [Hysteria2](../docs/outbounds.md#hysteria2) | QUIC TCP/UDP、带宽控制、Salamander、端口跳跃和 mTLS |
 | [TUIC v5](../docs/outbounds.md#tuic-v5) | QUIC TCP/UDP、native/quic UDP 转发模式，以及可选的拥塞控制算法 |
+| [WireGuard](../docs/outbounds.md#wireguard) | 标准 WireGuard TCP/UDP，使用用户态 IP 栈 |
 
 标准 TLS 连接支持证书验证与 SHA-256 证书固定。适用的 TCP TLS 路径可使用 Chrome、Firefox 或 Safari ClientHello 模板；`client-fingerprint` 与证书 `fingerprint` 相互独立。准确的名称和支持组合见 [TLS 配置与证书策略](../docs/tls-client-fingerprint.md)。这些功能不保证与浏览器不可区分，也不支持任意协议组合。
 
@@ -140,6 +141,7 @@ benchmark 工程同时负责协议互通（`interop`）与内存压力（`stress
 Vole 使用并参考以下公开依赖、协议实现和平台资料：
 
 - TUN 依赖：自有 [`vole-netstack`](../crates/vole-netstack/README.md) 使用 [smoltcp](https://github.com/smoltcp-rs/smoltcp)，Unix 与 Windows Wintun 包 I/O 使用 [tun-rs](https://github.com/tun-rs/tun-rs)（Apache-2.0）。
+- WireGuard：[boringtun](https://github.com/cloudflare/boringtun)（BSD-3-Clause），不启用 host-device、FFI 或 JNI。
 - [Wintun](https://www.wintun.net/)：运行时 DLL 由宿主提供，不随 Vole 捆绑。tun-rs 中的上游 [API 头文件](https://github.com/tun-rs/tun-rs/blob/2.8.11/src/platform/windows/tun/wintun.h) 版权为 2018–2021 WireGuard LLC，许可证为 `GPL-2.0 OR MIT`；分发链接的 API bindings 时须保留其版权和 MIT 可选许可证声明。
 - 网络与路由参考：[clash-rs](https://github.com/Watfaq/clash-rs)、[netstack-smoltcp](https://github.com/cavivie/netstack-smoltcp)、[Mihomo](https://github.com/MetaCubeX/mihomo)、[Xray-core](https://github.com/XTLS/Xray-core) 和 [Leaf](https://github.com/eycorsican/leaf)。这些参考项目并非 netstack 依赖。
 - TLS 与 Shadowsocks：[rustls](https://github.com/rustls/rustls)、[boring](https://github.com/cloudflare/boring)、[BoringSSL](https://boringssl.googlesource.com/boringssl/) 和 [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust)。衍生的重放窗口代码保留了 [MIT 声明](../src/outbound/shadowsocks/packet_window.rs)。

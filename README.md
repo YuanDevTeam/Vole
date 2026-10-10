@@ -20,7 +20,7 @@ Configuration uses **Mihomo-compatible YAML for the supported feature set**. Vol
 
 ## Proxy protocols
 
-All nine protocols below are enabled in the default build. HTTP CONNECT itself is TCP-only; native UDP support for other protocols is configured per node.
+All ten protocols below are enabled in the default build. HTTP CONNECT itself is TCP-only; native UDP support for other protocols is configured per node.
 
 | Protocol | Capabilities |
 | --- | --- |
@@ -33,6 +33,7 @@ All nine protocols below are enabled in the default build. HTTP CONNECT itself i
 | [SOCKS5](docs/outbounds.md#socks5) | CONNECT and UDP ASSOCIATE, with optional username/password authentication |
 | [Hysteria2](docs/outbounds.md#hysteria2) | QUIC TCP/UDP, bandwidth control, Salamander, port hopping and mTLS |
 | [TUIC v5](docs/outbounds.md#tuic-v5) | QUIC TCP/UDP, native/quic UDP relay modes and selectable congestion control |
+| [WireGuard](docs/outbounds.md#wireguard) | TCP/UDP over standard WireGuard, with a user-space IP stack |
 
 The shared [sing-mux wrapper](docs/xhttp.md#通用-sing-mux) supports all enabled node protocols. It provides TCP and, with `only-tcp: false`, UDP over the node's ordinary TCP path. The peer must provide sing-mux decoding; a normal HTTP/SOCKS5 listener does not automatically decode it.
 
@@ -141,6 +142,7 @@ See [acceptance boundaries](docs/acceptance.md) for the scope of build, network 
 Vole builds on and learns from public dependencies, protocol implementations and platform references:
 
 - TUN dependencies: the local [`vole-netstack`](crates/vole-netstack/README.md) uses [smoltcp](https://github.com/smoltcp-rs/smoltcp); Unix and Windows Wintun packet I/O use [tun-rs](https://github.com/tun-rs/tun-rs) (Apache-2.0).
+- WireGuard: [boringtun](https://github.com/cloudflare/boringtun) (BSD-3-Clause), without host-device, FFI or JNI features.
 - [Wintun](https://www.wintun.net/): the runtime DLL is supplied by the host, not bundled. The upstream [API header](https://github.com/tun-rs/tun-rs/blob/2.8.11/src/platform/windows/tun/wintun.h) included by tun-rs is copyright 2018–2021 WireGuard LLC, licensed `GPL-2.0 OR MIT`; distribution of the linked API bindings must retain its copyright and MIT alternative license notice.
 - Name expressions: [fancy-regex](https://github.com/fancy-regex/fancy-regex) (MIT), used only for bounded provider/group lookaround and backreferences.
 - Networking and routing references: [clash-rs](https://github.com/Watfaq/clash-rs), [netstack-smoltcp](https://github.com/cavivie/netstack-smoltcp), [Mihomo](https://github.com/MetaCubeX/mihomo), [Xray-core](https://github.com/XTLS/Xray-core) and [Leaf](https://github.com/eycorsican/leaf). These reference projects are not netstack dependencies.

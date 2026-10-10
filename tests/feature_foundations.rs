@@ -1,15 +1,12 @@
 use vole::config::Config;
 
 #[test]
-fn feature_skeletons_do_not_open_unimplemented_yaml_or_measurement_protocols() {
-    // Keep the stable FOUNDATIONS assertion ID as a regression for the retired protocol.
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-SCHEMA",
-        "feature_skeletons_do_not_open_unimplemented_yaml_or_measurement_protocols",
+fn wireguard_yaml_follows_its_own_feature() {
+    let yaml = b"mixed-port: 1080\nproxies: [{name: wg, type: wireguard, server: 192.0.2.1, port: 51820, ip: 10.84.0.2, private-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=, public-key: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=}]\nrules: ['MATCH,wg']\n";
+    assert_eq!(
+        Config::parse_yaml(yaml).is_ok(),
+        cfg!(feature = "outbound-wireguard")
     );
-    let yaml = "proxies:\n  - name: node\n    type: wireguard\n    server: example.com\n    port: 443\nrules:\n  - MATCH,node\n";
-    assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
 }
 
 #[test]

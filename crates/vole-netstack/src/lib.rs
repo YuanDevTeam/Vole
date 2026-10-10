@@ -13,13 +13,13 @@ mod stack;
 mod tcp;
 mod udp;
 
-pub use config::{ConfigError, NetStackConfig};
+pub use config::{ClientAddresses, ConfigError, NetStackConfig};
 pub use packet::Packet;
 pub use stack::{
-    NetStack, NetStackControl, NetStackError, NetStackParts, NetStackStats, PacketSink,
-    PacketStream, ResourceSnapshot, TcpNetStackParts,
+    ClientNetStackParts, NetStack, NetStackControl, NetStackError, NetStackParts, NetStackStats,
+    PacketSink, PacketStream, ResourceSnapshot, TcpNetStackParts,
 };
-pub use tcp::{TcpListener, TcpStream};
+pub use tcp::{TcpConnector, TcpListener, TcpStream};
 pub use udp::{
     UdpDatagram, UdpError, UdpPacketView, UdpSender, UdpSocket, encode_udp_packet_into,
     parse_udp_packet_view,
