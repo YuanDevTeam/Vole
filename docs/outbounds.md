@@ -181,7 +181,14 @@ port 为 1–65535，仅提供 ports 时可省略；显式非法 port 仍拒绝�
 认证/上游/请求共用绝对 10 秒预算。旧会话失败后新流可新建会话，已有业务不重放。
 写 EOF 关闭当前逻辑 TCP 双向通道，与 Mihomo 一致，不影响兄弟流。
 
-每流接收窗口 256 KiB、连接收发各 1 MiB、DATAGRAM 收发各 256 KiB；最多 8 条单向
+四个 initial/max 接收窗口按字节配置；0 独立使用默认：stream 8 MiB，connection 20 MiB。
+首次数据到达后按实际应用消费量与 smoothed RTT 增长当前窗口，最多倍增到指定最大值；
+stream 增长可将 connection 当前窗口提升到其 1.5 倍，但仍受独立 connection 最大值约束。
+initial 大于 max 时保留初始值，不缩小或额外拒绝；max 限制到 QUIC VarInt，无法编码的
+initial 拒绝。窗口是信用额度，不预分配整个缓冲。handshake-timeout 为整数秒，正值与
+原建链绝对期限取较早值，<=0 保留原期限；成功后的业务/端口跳跃不重新应用此期限。
+
+连接未确认发送缓冲 1 MiB、DATAGRAM 收发各 256 KiB；最多 8 条单向
 控制流，拒绝主动双向流。PMTUD 关闭，最大 QUIC payload 1400 并取上游预算交集；
 空闲 30 秒/保活 10 秒。认证头 16 KiB，TCP 响应消息 2048/padding 4096 字节。
 业务 UDP 原生 DATAGRAM，payload 最多 4096，最多 255 分片；未知关联不创建状态。
@@ -235,11 +242,31 @@ TCP shutdown 立即完成逻辑关闭，发送所有权保留到 FIN/数据确�
 退役池提前丢弃已接受的末尾上传；该等待归节点所有，Stop 直接取消并 join。
 切组不迁移已有池；故障后只有新业务可创建新池，已发送业务不自动重放。
 
-每流接收窗口 256 KiB，连接收发各 1 MiB，DATAGRAM 收发各 256 KiB；最多 32 条
-入站单向控制流，半条控制流最长 5 秒；拒绝服务端主动双向流。QUIC payload 最大
-1400 并取路径预算交集，PMTUD 关闭。保活/Heartbeat 每 10 秒，空闲 30 秒；两种
-UDP 模式的 Heartbeat 均用 DATAGRAM。Stop 等待认证、收发、重组、心跳及上游释放，
-关闭交换最多一秒；这些都是局部结构限制，不是全局业务会话额度。
+`ip` 覆盖物理拨号地址，逻辑 server/SNI 保留。heartbeat-interval 单位毫秒，<=0 回落
+10000，同时控制 QUIC keepalive 与实际 v5 HEARTBEAT，两种 UDP relay 模式均用 DATAGRAM。
+recv-window-conn 实际为 stream，recv-window 实际为 connection；正值同时设 initial/max，
+零值分别从 15 MiB/10、64 MiB/10 开始，上限15 MiB、64 MiB；增长采用上述真实消费/RTT路径。
+
+max-open-streams 控制客户端 TCP/UDP 所有者池和远端可开启 stream credit（后者取1.1倍
+向上取整）。0 使用100；参考客户端100阈值转换90，入池计数必须严格小于阈值，所以
+默认89个同时所有者，其它正N为N-1；1和负值可解析但无法开启业务。饱和新建物理
+会话，退役会话继续服务已有所有者，最后所有者退出回收，不重放已发送业务。
+
+max-datagram-frame-size 是含 type/length varint 的完整 frame 上限，最多1400；缺省以
+max-udp-relay-packet-size（0使用1252）+IPv6最坏TUIC头29计算。native relay 的业务
+fragment 上限取 frame-29 与实际路径扣头容量交集；能在实际容量内发送的包不分片。
+quic relay 按参考在一条单向流发送完整 u16 packet，不使用 native fragment 限额。
+DATAGRAM 累计收发缓冲仍各256 KiB，独立于 frame 上限。disable-mtu-discovery 缺省
+false，PMTUD 探测始终限制在受控双向路径预算内，QUIC payload 最多1400。
+
+udp-over-stream 使用 TUIC Connect 到版本 magic domain 的真正 UoT，0/省略version为1，
+支持1/2；v1直接 packet，v2首包含 Datagram-mode request。仍需要 QUIC 数据报物理入口；
+首包保留原绝对建链期限，取消半帧使关联失效。响应队列1项、任务归节点Stop同步回收。
+UoT在可靠流中传输，有丢包导致的队头阻塞成本，不应用原生TUIC分片额度。
+
+连接未确认发送缓冲1 MiB；最多32个并行入站控制解码器，半条控制流最长5秒，
+拒绝服务端主动双向业务流。空闲30秒。Stop等待认证、收发、重组、心跳及上游释放，
+关闭交换最多一秒；这些是局部结构限制，不是全局业务会话额度。
 
 ## Shadowsocks 2022
 

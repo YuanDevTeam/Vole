@@ -141,6 +141,9 @@ impl Hysteria2Outbound {
                 }
                 current.take();
                 let (ready, reply) = oneshot::channel();
+                let context = if self.config.handshake_timeout.is_zero() { context.clone() } else {
+                    context.clone().capped_by(tokio::time::Instant::now().checked_add(self.config.handshake_timeout).ok_or(DispatchError::TimedOut)?)
+                };
                 let cancel = self.cancel.child_token();
                 let guard = cancel.clone().drop_guard();
                 {
@@ -249,6 +252,8 @@ async fn drive(
     let datagrams = Arc::new(super::datagram::Registry::default());
     let bandwidth = Arc::new(super::bandwidth::Bandwidth::default());
     let _pool = observation::track(ResourceKind::Pool);
+    let established = CancellationToken::new();
+    let deadline = context.deadline();
     let operation = async {
         let _handshake = observation::track(ResourceKind::Handshake);
         let (path, socket) = super::paths::Paths::open(
@@ -270,9 +275,15 @@ async fn drive(
             .mtu_discovery_config(None)
             .max_concurrent_bidi_streams(0_u8.into())
             .max_concurrent_uni_streams((crate::limits::HY2_UNI_STREAMS as u32).into())
-            .stream_receive_window((crate::limits::HY2_STREAM_WINDOW as u32).into())
-            .receive_window((crate::limits::HY2_CONNECTION_WINDOW as u32).into())
-            .send_window(crate::limits::HY2_CONNECTION_WINDOW as u64)
+            .adaptive_stream_receive_window(
+                quinn::VarInt::from_u64(config.stream_window.initial).map_err(failure)?,
+                quinn::VarInt::from_u64(config.stream_window.maximum).map_err(failure)?,
+            )
+            .adaptive_receive_window(
+                quinn::VarInt::from_u64(config.connection_window.initial).map_err(failure)?,
+                quinn::VarInt::from_u64(config.connection_window.maximum).map_err(failure)?,
+            )
+            .send_window(crate::limits::HY2_SEND_WINDOW as u64)
             .datagram_receive_buffer_size(Some(crate::limits::HY2_DATAGRAM_BUFFER))
             .datagram_send_buffer_size(crate::limits::HY2_DATAGRAM_BUFFER)
             .max_idle_timeout(Some(Duration::from_secs(30).try_into().map_err(failure)?))
@@ -346,6 +357,10 @@ async fn drive(
             #[cfg(feature = "interop-test")]
             bandwidth: bandwidth.clone(),
         });
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DispatchError::TimedOut);
+        }
+        established.cancel();
         ready
             .take()
             .unwrap()
@@ -362,6 +377,7 @@ async fn drive(
     };
     let result = tokio::select! {biased;
         () = cancel.cancelled() => Err(DispatchError::NotAllowed),
+        () = async { tokio::select! { biased; () = established.cancelled() => std::future::pending::<()>().await, () = tokio::time::sleep_until(deadline) => {} } } => Err(DispatchError::TimedOut),
         result = operation => result,
     };
     cancel.cancel();

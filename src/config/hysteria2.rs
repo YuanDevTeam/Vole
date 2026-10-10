@@ -18,6 +18,9 @@ pub struct Hysteria2OutboundConfig {
     pub udp_mtu: u16,
     pub obfs_password: Option<String>,
     pub hopping: Option<Hysteria2Hopping>,
+    pub stream_window: super::QuicReceiveWindow,
+    pub connection_window: super::QuicReceiveWindow,
+    pub handshake_timeout: std::time::Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +94,16 @@ pub(super) struct RawHysteria2 {
         deserialize_with = "deserialize_present_option"
     )]
     obfs_password: Option<String>,
+    #[serde(rename = "initial-stream-receive-window", default)]
+    initial_stream_receive_window: u64,
+    #[serde(rename = "max-stream-receive-window", default)]
+    max_stream_receive_window: u64,
+    #[serde(rename = "initial-connection-receive-window", default)]
+    initial_connection_receive_window: u64,
+    #[serde(rename = "max-connection-receive-window", default)]
+    max_connection_receive_window: u64,
+    #[serde(rename = "handshake-timeout", default)]
+    handshake_timeout: i64,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     ports: Option<String>,
     #[serde(
@@ -211,6 +224,25 @@ impl RawHysteria2 {
                 udp_mtu,
                 obfs_password,
                 hopping,
+                stream_window: super::QuicReceiveWindow::normalize(
+                    self.initial_stream_receive_window,
+                    self.max_stream_receive_window,
+                    super::QuicReceiveWindow {
+                        initial: 8 * 1024 * 1024,
+                        maximum: 8 * 1024 * 1024,
+                    },
+                )?,
+                connection_window: super::QuicReceiveWindow::normalize(
+                    self.initial_connection_receive_window,
+                    self.max_connection_receive_window,
+                    super::QuicReceiveWindow {
+                        initial: 20 * 1024 * 1024,
+                        maximum: 20 * 1024 * 1024,
+                    },
+                )?,
+                handshake_timeout: std::time::Duration::from_secs(
+                    self.handshake_timeout.max(0) as u64
+                ),
             }),
         ))
     }

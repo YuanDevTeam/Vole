@@ -5,7 +5,9 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub(super) fn address(peer: &Destination, out: &mut Vec<u8>) -> io::Result<()> {
-    if peer.port() == 0 {
+    if peer.port() == 0
+        && !matches!(peer, Destination::Domain { host, .. } if matches!(host.as_str(), "sp.udp-over-tcp.arpa" | "sp.v2.udp-over-tcp.arpa"))
+    {
         return Err(io::ErrorKind::InvalidInput.into());
     }
     match peer {
@@ -37,12 +39,24 @@ pub(super) fn connect(peer: &Destination) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 pub(super) fn packets(
     association: u16,
     packet: u16,
     peer: &Destination,
     payload: &[u8],
     limit: usize,
+) -> io::Result<Vec<Bytes>> {
+    packets_with_payload_limit(association, packet, peer, payload, limit, usize::MAX)
+}
+
+pub(super) fn packets_with_payload_limit(
+    association: u16,
+    packet: u16,
+    peer: &Destination,
+    payload: &[u8],
+    limit: usize,
+    payload_limit: usize,
 ) -> io::Result<Vec<Bytes>> {
     if payload.len() > u16::MAX as usize {
         return Err(io::ErrorKind::InvalidInput.into());
@@ -51,8 +65,9 @@ pub(super) fn packets(
     address(peer, &mut target)?;
     let space = limit
         .checked_sub(10 + target.len())
-        .ok_or(io::ErrorKind::InvalidInput)?;
-    if space == 0 && !payload.is_empty() {
+        .ok_or(io::ErrorKind::InvalidInput)?
+        .min(payload_limit);
+    if space == 0 {
         return Err(io::ErrorKind::InvalidInput.into());
     }
     let count = payload.len().max(1).div_ceil(space.max(1));
@@ -269,6 +284,37 @@ mod tests {
                 })
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn configured_native_fragment_payload_and_quic_unfragmented_packet() {
+        let peer = Destination::Ip("[::1]:53".parse().unwrap());
+        for message_limit in [1200, 65535 + 512] {
+            let packets =
+                packets_with_payload_limit(1, 2, &peer, b"abcdefgh", message_limit, 3).unwrap();
+            assert_eq!(packets.len(), 3);
+            let pieces: Vec<_> = packets
+                .into_iter()
+                .map(|packet| decode(packet).unwrap())
+                .collect();
+            assert_eq!(
+                pieces
+                    .iter()
+                    .map(|piece| piece.payload.as_ref())
+                    .collect::<Vec<_>>(),
+                vec![&b"abc"[..], &b"def"[..], &b"gh"[..]]
+            );
+            assert!(pieces.iter().all(|piece| piece.count == 3));
+            assert_eq!(pieces[0].peer, Some(peer.clone()));
+            assert!(pieces[1].peer.is_none());
+            let quic =
+                packets_with_payload_limit(1, 2, &peer, b"abcdefgh", 65535 + 512, usize::MAX)
+                    .unwrap();
+            assert_eq!(quic.len(), 1);
+            let packet = decode(quic.into_iter().next().unwrap()).unwrap();
+            assert_eq!(packet.payload.as_ref(), b"abcdefgh");
+            assert_eq!(packet.count, 1);
         }
     }
 

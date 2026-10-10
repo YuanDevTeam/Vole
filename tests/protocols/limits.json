@@ -10,7 +10,9 @@
       "owner": "limits::TUIC_FIN_GRACE_SECONDS",
       "saturation": "retain TCP send ownership until FIN acknowledgement or bounded grace before retiring the physical connection",
       "cancellation": "node Stop cancels and joins the owned FIN waiter without waiting out the grace",
-      "boundary_cases": ["TUIC-MEMORY"]
+      "boundary_cases": [
+        "TUIC-MEMORY"
+      ]
     },
     {
       "id": "tuic-quic-payload",
@@ -24,33 +26,22 @@
       ]
     },
     {
-      "id": "tuic-uni-streams",
+      "id": "tuic-control-readers",
       "value": 32,
       "unit": "streams",
-      "owner": "limits::TUIC_UNI_STREAMS",
-      "saturation": "withhold incoming credit and expire partial parsers after five seconds",
+      "owner": "limits::TUIC_CONTROL_READERS",
+      "saturation": "limit active control decoders; incoming QUIC credit follows max-open-streams; expire partial parsers after five seconds",
       "cancellation": "node Stop cancels and joins all owned QUIC, parser, heartbeat and upstream tasks",
       "boundary_cases": [
         "TUIC-MEMORY"
       ]
     },
     {
-      "id": "tuic-stream-window",
-      "value": 262144,
-      "unit": "bytes",
-      "owner": "limits::TUIC_STREAM_WINDOW",
-      "saturation": "QUIC receive flow control applies backpressure to unread logical streams",
-      "cancellation": "node Stop cancels and joins all owned QUIC, parser, heartbeat and upstream tasks",
-      "boundary_cases": [
-        "TUIC-MEMORY"
-      ]
-    },
-    {
-      "id": "tuic-connection-window",
+      "id": "tuic-send-window",
       "value": 1048576,
-      "unit": "bytes-per-direction",
-      "owner": "limits::TUIC_CONNECTION_WINDOW",
-      "saturation": "bound QUIC receive credit and unacknowledged send buffering per connection",
+      "unit": "bytes",
+      "owner": "limits::TUIC_SEND_WINDOW",
+      "saturation": "bound retained unacknowledged send bytes per physical connection; receive credit follows configured initial/max",
       "cancellation": "node Stop cancels and joins all owned QUIC, parser, heartbeat and upstream tasks",
       "boundary_cases": [
         "TUIC-MEMORY"
@@ -118,7 +109,10 @@
       "owner": "limits::SHADOWSOCKS_WRITE_CHUNK",
       "saturation": "partial write then backpressure while the bounded owned chunk drains",
       "cancellation": "stream drop releases plaintext and codec; flush and shutdown drain the exact accepted chunk",
-      "boundary_cases": ["INTEGRATION-DEBUG", "INTEGRATION-RELEASE"]
+      "boundary_cases": [
+        "INTEGRATION-DEBUG",
+        "INTEGRATION-RELEASE"
+      ]
     },
     {
       "id": "xhttp-custom-header-bytes",
@@ -875,23 +869,11 @@
       ]
     },
     {
-      "id": "hy2-stream-window",
-      "value": 262144,
-      "unit": "bytes",
-      "owner": "limits::HY2_STREAM_WINDOW",
-      "saturation": "QUIC receive flow control",
-      "cancellation": "owned logical close or physical session Stop releases retained state and joins drivers",
-      "boundary_cases": [
-        "HYSTERIA2-UNIT",
-        "HYSTERIA2-OWNED"
-      ]
-    },
-    {
-      "id": "hy2-connection-window",
+      "id": "hy2-send-window",
       "value": 1048576,
       "unit": "bytes",
-      "owner": "limits::HY2_CONNECTION_WINDOW",
-      "saturation": "QUIC aggregate send and receive flow control",
+      "owner": "limits::HY2_SEND_WINDOW",
+      "saturation": "bound retained unacknowledged send bytes per physical connection; receive credit follows configured initial/max",
       "cancellation": "owned logical close or physical session Stop releases retained state and joins drivers",
       "boundary_cases": [
         "HYSTERIA2-UNIT",

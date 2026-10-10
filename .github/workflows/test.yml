@@ -116,6 +116,15 @@ jobs:
           package("tokio-rustls", "0.26.5")
           package("rustls-native-certs", "0.8.4")
           package("ring")
+          quinn = package("quinn", "0.11.12")
+          proto = package("quinn-proto", "0.11.19", {None})
+          proto_root = (Path(metadata["workspace_root"]) / "vendor" / "quinn-proto").resolve()
+          require(Path(proto["manifest_path"]).resolve() == proto_root / "Cargo.toml", "QUIC protocol must use the reviewed in-repository source")
+          require(proto.get("license") == "MIT OR Apache-2.0" and all((proto_root / name).is_file() for name in ("LICENSE-MIT", "LICENSE-APACHE", "README.vole.md")), "QUIC protocol provenance or licenses are missing")
+          require({"rustls-ring", "ring"} <= features(proto), "QUIC protocol must use rustls/ring")
+          require("rustls-ring" in features(quinn), "Quinn wrapper must use rustls/ring")
+          require(not (features(proto) | features(quinn)) & {"aws-lc-rs", "aws-lc-rs-fips", "rustls-aws-lc-rs", "rustls-aws-lc-rs-fips"}, "QUIC may not enable a second TLS provider")
+          require(proto["id"] in {dependency["pkg"] for dependency in nodes[quinn["id"]]["deps"]}, "Quinn wrapper must resolve the reviewed protocol source")
           wireguard = package("boringtun", "0.7.1")
           require(wireguard.get("license") == "BSD-3-Clause", "unapproved WireGuard license")
           require(not features(wireguard) & {"device", "ffi-bindings", "jni-bindings"}, "WireGuard must use only the userspace protocol")
@@ -151,6 +160,10 @@ jobs:
               require(not any(features(item) & {"fips", "aead-cipher-2022-extra", "v2-extra"} for item in chain.values()), "unapproved SS 2022 or AWS-LC mode")
           print("Locked TLS sources, HPKE/AGE algorithms and SS 2022 dependency chain passed")
           PY
+      - name: QUIC native memory fixtures
+        if: matrix.profile == 'features'
+        run: |
+          cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --no-default-features --features rustls-ring --lib vole_
       - name: Production and netstack clippy
         if: matrix.profile == 'features'
         run: |

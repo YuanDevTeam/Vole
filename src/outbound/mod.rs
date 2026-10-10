@@ -19,7 +19,11 @@ mod sing_mux;
 pub use sing_mux::SingMuxConnector;
 #[cfg(feature = "outbound-shadowsocks")]
 mod shadowsocks;
-#[cfg(any(feature = "outbound-anytls", feature = "outbound-shadowsocks"))]
+#[cfg(any(
+    feature = "outbound-anytls",
+    feature = "outbound-shadowsocks",
+    feature = "outbound-tuic"
+))]
 mod uot;
 #[cfg(feature = "outbound-shadowsocks")]
 pub use shadowsocks::ShadowsocksOutbound;

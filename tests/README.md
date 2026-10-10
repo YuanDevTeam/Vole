@@ -11,6 +11,9 @@ cargo clippy --locked --all-features --lib --bins -- -D warnings
 cargo test --locked --all-features --all-targets --no-run
 cargo test --locked --no-default-features --features cli --bin vole cli::tests::
 cargo test --locked --no-default-features --features cli --lib invoke::foreground::tests::
+cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --no-default-features --features rustls-ring --lib vole_
+cargo test --locked --features cli,interop-test --test tuic_memory configured_ip_sni_millisecond_heartbeat_and_uot_versions_are_consumed
+cargo test --locked --features cli --lib tuic_uot_
 cargo test --locked --lib config::tests::
 cargo test --locked --lib config::credentials::tests::
 cargo test --locked --features cli --lib age_
@@ -143,3 +146,8 @@ container-benchmark compare --source vole=/path/to/Vole
 Controller 主动探测与内存使用纯内存过滤：`manual_probes_keep_one_history`、`delay_query_preserves_reference`、`admits_mixed_only_direct_controller`、`current_process_has_resident_memory`。真实 HTTP 对端由 benchmark 隔离运行。
 
 规则bundle的定向内存/临时文件验证使用 `resource::bundle` 与 `resource::cache::tests::bundle_`，覆盖真实MRS成员、解码预算/取消、缓存优先及原HTTP来源回退，不启动宿主服务。
+
+QUIC 的 `vole_` native fixtures 使用官方 vendored crate 的 standalone lock，不启用默认
+provider/features；只检查消费/RTT驱动的真实MAX信用帧、初始transport parameters和
+含头部DATAGRAM帧限额。TUIC额外内存对端消费入口ip、SNI、毫秒Heartbeat和UoT v1/v2
+字节；不创建宿主监听服务。它们不替代最终参考互通、吞吐和RSS测量。

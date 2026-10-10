@@ -12,6 +12,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 | DNS | hosts（含启动 LAN 地址快照）、bootstrap/节点/直连解析角色、policy、respect-rules；UDP/TCP/DoH/DoT；fallback；redir-host/fake-IP 与映射持久化 |
 | mixed-port | HTTP/SOCKS5 TCP 与 SOCKS5 UDP；LAN 地址限制、多用户认证、认证跳过网段；allow-lan 不强制认证 |
 | 出站 | HTTP(S) CONNECT、SOCKS5、AnyTLS、Trojan、VMess AEAD、VLESS、Hysteria2、TUIC v5、Shadowsocks 2022、标准 WireGuard 单/多 peer；依赖启用的 Cargo feature |
+| QUIC 配置 | HY2 独立 initial/max 接收窗口、秒 handshake-timeout；TUIC v5 入口ip、毫秒heartbeat、反向命名的stream/connection窗口、所有者池阈值、frame/fragment限制、PMTUD与UoT v1/v2 |
 | 客户端 TLS | tls.custom-certifactes 证书内容；启动时合并可读系统根、WebPKI 与显式根并跨组件共享；TUIC v5 与其它 TLS 节点复用 cert/private-key 身份加载 |
 | 嗅探 | TUN/mixed TCP 的 HTTP/TLS；TUN UDP 的 QUIC；域名/地址排除、强制条件和目标覆盖 |
 | Linux 自建设备 | auto-detect-interface、auto-route、systemd-resolved DNS 接管；失败和停止时恢复本次修改 |
@@ -49,3 +50,11 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 
 平台编译、内存回归、双 CLI 行为比较、官方协议互通和压力测试是不同的验证层次，见
 [验收边界](acceptance.md)。任一层通过都不代表所有字段取值、组合、平台或真机行为已验证。
+
+QUIC 窗口由本仓库 quinn-proto 补丁实际消费并发出 MAX_STREAM_DATA/MAX_DATA；不是
+将四个字段折成固定窗口。initial>max 保留初值，max 大于 VarInt clamp，无法编码的
+initial 明确拒绝。Quinn 的 credit 通告节奏仍沿其实现，与 quic-go 的通告阈值不完全相同。
+HY2 正 handshake-timeout 与 Core 原期限合并；参考正值后台 offer 的生命周期可能超出
+单次调用期限，该差异保留。TUIC max-open-streams=1 接受但实际不能取得业务所有权；
+frame 无法容纳 TUIC 头时可解析，业务 UDP 发送失败，不额外拒绝TCP配置。全字段互通与窗口增大后的 RSS/吞吐/UDP loss 不由
+这些内存 fixture 证明，由最终 CLI/container 对照分别记录。

@@ -60,7 +60,20 @@ fn fixture_mode(
     congestion: &str,
     mode: &str,
 ) -> (Arc<TuicOutbound>, quinn::Endpoint) {
-    let (config, packets, endpoint) = fixture_parts(budget, datagrams, credit, congestion, mode);
+    let (mut config, packets, endpoint) =
+        fixture_parts(budget, datagrams, credit, congestion, mode);
+    // These existing pressure/credit fixtures intentionally use small fixed
+    // receive credit. New default/adaptive behavior has separate native cases.
+    config.stream_window = vole::config::QuicReceiveWindow {
+        initial: 256 * 1024,
+        maximum: 256 * 1024,
+    };
+    config.connection_window = vole::config::QuicReceiveWindow {
+        initial: 1024 * 1024,
+        maximum: 1024 * 1024,
+    };
+    config.incoming_streams = 32;
+    config.disable_mtu_discovery = true;
     let outbound = TuicOutbound::new_with_path(
         &config,
         UpstreamPath::proxy(Arc::new(MemoryUpstream(Mutex::new(Some(packets))))),
@@ -1118,4 +1131,87 @@ async fn blocked_outer_path_bounds_stream_and_datagram_send_buffers_and_stop() {
         })
         .await;
     finish(endpoint, peer).await;
+}
+
+#[tokio::test]
+async fn configured_ip_sni_millisecond_heartbeat_and_uot_versions_are_consumed() {
+    let _case = Case::new("TUIC-UNIT", "configured_uot");
+    for version in [1, 2] {
+        let (mut config, packets, endpoint) = fixture_parts(1400, true, 8, "cubic", "native");
+        config.address = "logical.invalid".into();
+        config.ip = Some("192.0.2.1".into());
+        config.heartbeat_interval = Duration::from_millis(12);
+        config.udp_over_stream = Some(version);
+        config.disable_mtu_discovery = true;
+        let outbound = Arc::new(
+            TuicOutbound::new_with_path(
+                &config,
+                UpstreamPath::proxy(Arc::new(MemoryUpstream(Mutex::new(Some(packets))))),
+            )
+            .unwrap(),
+        );
+        let ep = endpoint.clone();
+        let peer = tokio::spawn(async move {
+            let connection = authenticated(&ep).await;
+            let handshake = connection
+                .handshake_data()
+                .unwrap()
+                .downcast::<quinn::crypto::rustls::HandshakeData>()
+                .unwrap();
+            assert_eq!(handshake.server_name.as_deref(), Some("fixture.invalid"));
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let magic = if version == 1 {
+                "sp.udp-over-tcp.arpa"
+            } else {
+                "sp.v2.udp-over-tcp.arpa"
+            };
+            let mut header = vec![0; 4 + magic.len() + 2];
+            recv.read_exact(&mut header).await.unwrap();
+            assert_eq!(&header[..4], &[5, 1, 0, magic.len() as u8]);
+            assert_eq!(&header[4..4 + magic.len()], magic.as_bytes());
+            assert_eq!(&header[4 + magic.len()..], &[0, 0]);
+            let expected: &[u8] = if version == 1 {
+                &[0, 1, 2, 3, 4, 0, 53, 0, 1, b'q']
+            } else {
+                &[0, 1, 1, 2, 3, 4, 0, 53, 0, 1, 2, 3, 4, 0, 53, 0, 1, b'q']
+            };
+            let mut packet = vec![0; expected.len()];
+            recv.read_exact(&mut packet).await.unwrap();
+            assert_eq!(packet, expected);
+            send.write_all(&[0, 8, 8, 8, 8, 0, 53, 0, 1, b'a'])
+                .await
+                .unwrap();
+            let heartbeat =
+                tokio::time::timeout(Duration::from_millis(250), connection.read_datagram())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(heartbeat.as_ref(), &[5, 4]);
+            connection.closed().await;
+        });
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let mut transport = outbound
+                    .open_datagram(udp_request(), &EstablishContext::default())
+                    .await
+                    .unwrap();
+                transport
+                    .send(Datagram {
+                        remote: Destination::Ip("1.2.3.4:53".parse().unwrap()),
+                        payload: bytes::Bytes::from_static(b"q"),
+                        sniffed_domain: None,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(transport.receive().await.unwrap().payload.as_ref(), b"a");
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                outbound.shutdown().await;
+                assert!(transport.receive().await.is_err());
+                drop(transport);
+            })
+            .await;
+        assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+        finish(endpoint, peer).await;
+    }
 }

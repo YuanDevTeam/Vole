@@ -57,6 +57,8 @@ mod credentials;
 pub use credentials::{ProxyAccess, ProxyAccessRules, ProxyCredentials};
 mod ech;
 pub use ech::StaticEchConfig;
+mod quic;
+pub use quic::QuicReceiveWindow;
 mod hysteria2;
 pub use hysteria2::{Hysteria2Hopping, Hysteria2OutboundConfig};
 mod wireguard;

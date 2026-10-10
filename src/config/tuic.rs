@@ -32,6 +32,16 @@ pub struct TuicOutboundConfig {
     pub tls: TlsConfig,
     pub congestion: TuicCongestion,
     pub udp_mode: TuicUdpMode,
+    pub ip: Option<String>,
+    pub heartbeat_interval: std::time::Duration,
+    pub stream_window: super::QuicReceiveWindow,
+    pub connection_window: super::QuicReceiveWindow,
+    pub max_open_streams: usize,
+    pub incoming_streams: u64,
+    pub max_udp_relay_packet_size: u16,
+    pub max_datagram_frame_size: u16,
+    pub disable_mtu_discovery: bool,
+    pub udp_over_stream: Option<u8>,
 }
 
 impl std::fmt::Debug for TuicOutboundConfig {
@@ -69,6 +79,26 @@ pub(super) struct RawTuic {
     certificate: Option<String>,
     #[serde(default, deserialize_with = "super::deserialize_present_option")]
     private_key: Option<String>,
+    #[serde(default, deserialize_with = "super::deserialize_present_option")]
+    ip: Option<String>,
+    #[serde(default)]
+    heartbeat_interval: i64,
+    #[serde(default)]
+    recv_window_conn: u64,
+    #[serde(default)]
+    recv_window: u64,
+    #[serde(default)]
+    max_open_streams: i64,
+    #[serde(default)]
+    max_udp_relay_packet_size: i64,
+    #[serde(default)]
+    max_datagram_frame_size: i64,
+    #[serde(default)]
+    disable_mtu_discovery: bool,
+    #[serde(default)]
+    udp_over_stream: bool,
+    #[serde(default)]
+    udp_over_stream_version: i64,
     #[serde(default)]
     congestion_controller: TuicCongestion,
     #[serde(default)]
@@ -96,6 +126,47 @@ impl RawTuic {
         let uuid = super::parse_standard_uuid(&self.uuid).map_err(|_| {
             crate::VoleError::InvalidConfig("TUIC requires a standard hyphenated UUID".into())
         })?;
+        let open_streams = if self.max_open_streams == 0 {
+            100
+        } else {
+            self.max_open_streams
+        };
+        let incoming_streams = if open_streams < 0 {
+            0
+        } else {
+            (open_streams as u64)
+                .saturating_add((open_streams as u64).div_ceil(10))
+                .min(1 << 60)
+        };
+        let client_threshold = if open_streams == 100 {
+            90
+        } else {
+            open_streams.max(1)
+        };
+        let max_open_streams = client_threshold.saturating_sub(1) as usize;
+        // The fixed reference computes TUIC v5's overhead with an IPv6 address (29 bytes).
+        let relay = if self.max_udp_relay_packet_size == 0 {
+            1252
+        } else {
+            self.max_udp_relay_packet_size
+        };
+        let frame = if self.max_datagram_frame_size == 0 {
+            relay.checked_add(29).ok_or_else(|| {
+                crate::VoleError::InvalidConfig("TUIC datagram limit overflows".into())
+            })?
+        } else {
+            self.max_datagram_frame_size
+        }
+        .min(1400);
+        if frame < 0 {
+            return invalid("TUIC DATAGRAM frame limit cannot be negative");
+        }
+        let version = match self.udp_over_stream_version {
+            0 | 1 => 1,
+            2 => 2,
+            _ => return invalid("TUIC UDP-over-stream version must be 1 or 2"),
+        };
+        let udp_over_stream = self.udp_over_stream.then_some(version);
         let config = TuicOutboundConfig {
             address: self.server.clone(),
             port: self.port,
@@ -103,6 +174,34 @@ impl RawTuic {
             password: self.password,
             congestion: self.congestion_controller,
             udp_mode: self.udp_relay_mode,
+            ip: self.ip.filter(|value| !value.is_empty()),
+            heartbeat_interval: std::time::Duration::from_millis(if self.heartbeat_interval <= 0 {
+                10000
+            } else {
+                self.heartbeat_interval as u64
+            }),
+            stream_window: super::QuicReceiveWindow::normalize(
+                self.recv_window_conn,
+                self.recv_window_conn,
+                super::QuicReceiveWindow {
+                    initial: 15 * 1024 * 1024 / 10,
+                    maximum: 15 * 1024 * 1024,
+                },
+            )?,
+            connection_window: super::QuicReceiveWindow::normalize(
+                self.recv_window,
+                self.recv_window,
+                super::QuicReceiveWindow {
+                    initial: 64 * 1024 * 1024 / 10,
+                    maximum: 64 * 1024 * 1024,
+                },
+            )?,
+            max_open_streams,
+            incoming_streams,
+            max_udp_relay_packet_size: frame.saturating_sub(29).max(0) as u16,
+            max_datagram_frame_size: frame as u16,
+            disable_mtu_discovery: self.disable_mtu_discovery,
+            udp_over_stream,
             tls: TlsConfig {
                 server_name: self
                     .sni
@@ -142,6 +241,9 @@ impl TuicOutboundConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         validate_host(&self.address, "TUIC server")?;
         validate_port(self.port, "TUIC")?;
+        if let Some(ip) = &self.ip {
+            validate_host(ip, "TUIC ip")?;
+        }
         validate_host(&self.tls.server_name, "TUIC sni")?;
         if let Some(name) = &self.tls.certificate.verification_name {
             validate_host(name, "TUIC verification name")?;

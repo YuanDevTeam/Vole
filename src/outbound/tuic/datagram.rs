@@ -28,6 +28,7 @@ const TTL: Duration = Duration::from_secs(crate::limits::TUIC_FRAGMENT_TTL_SECON
 pub(super) struct Registry {
     state: Mutex<State>,
     mode: TuicUdpMode,
+    native_payload_limit: u16,
 }
 #[derive(Default)]
 struct State {
@@ -43,10 +44,15 @@ struct Registration {
     _observation: observation::Guard,
 }
 impl Registry {
+    #[cfg(test)]
     pub fn new(mode: TuicUdpMode) -> Self {
+        Self::with_limit(mode, 1252)
+    }
+    pub fn with_limit(mode: TuicUdpMode, native_payload_limit: u16) -> Self {
         Self {
             state: Mutex::new(State::default()),
             mode,
+            native_payload_limit,
         }
     }
     pub fn open(
@@ -179,6 +185,25 @@ impl Transport {
             });
         }
     }
+    fn payload_limit(&self, peer: &Destination, payload_size: usize) -> usize {
+        if self.registry.mode == TuicUdpMode::Quic {
+            return usize::MAX;
+        }
+        let configured = self.registry.native_payload_limit as usize;
+        let mut address = Vec::new();
+        if wire::address(peer, &mut address).is_err() {
+            return 0;
+        }
+        let capacity = self.message_limit();
+        if payload_size <= configured && payload_size.saturating_add(10 + address.len()) <= capacity
+        {
+            configured
+        } else {
+            // A path-limited native retry reserves the IPv6 worst-case header,
+            // independently of the actual first packet destination family.
+            configured.min(capacity.saturating_sub(29))
+        }
+    }
     fn message_limit(&self) -> usize {
         match self.registry.mode {
             TuicUdpMode::Native => self.connection.max_datagram_size().unwrap_or(0),
@@ -202,7 +227,14 @@ impl DatagramTransport for Transport {
             0
         };
         DatagramBudget::new(
-            space.saturating_mul(255).min(u16::MAX as usize) as u16,
+            space
+                .min(if self.registry.mode == TuicUdpMode::Quic {
+                    usize::MAX
+                } else {
+                    self.registry.native_payload_limit as usize
+                })
+                .saturating_mul(255)
+                .min(u16::MAX as usize) as u16,
             u16::MAX,
         )
         .intersect(self.budget)
@@ -214,12 +246,13 @@ impl DatagramTransport for Transport {
         if datagram.payload.len() > self.payload_budget(&datagram.remote).transmit() as usize {
             return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
         }
-        let packets = wire::packets(
+        let packets = wire::packets_with_payload_limit(
             self.id,
             self.packet,
             &datagram.remote,
             &datagram.payload,
             self.message_limit(),
+            self.payload_limit(&datagram.remote, datagram.payload.len()),
         )?;
         // Consume the ID before the first await: cancelling a partial send
         // never reuses that unfinished packet or replays its business bytes.
@@ -388,7 +421,7 @@ pub(super) async fn receive(
                 let raw=result.map_err(|_|DispatchError::ConnectionRefused)?;
                 if registry.mode==TuicUdpMode::Native && let Ok(fragment)=wire::decode(raw) { registry.deliver(fragment); }
             },
-            stream=connection.accept_uni(),if streams.len()<crate::limits::TUIC_UNI_STREAMS=>{
+            stream=connection.accept_uni(),if streams.len()<crate::limits::TUIC_CONTROL_READERS=>{
                 let stream=stream.map_err(|_|DispatchError::ConnectionRefused)?;
                 if registry.mode==TuicUdpMode::Quic {
                     streams.push(tokio::time::timeout(TTL,wire::read_packet(stream,|id|registry.budget(id))));

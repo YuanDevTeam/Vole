@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/vole-blake3-raw", "crates/vole-netstack"]
+exclude = ["vendor/quinn-proto"]
 resolver = "3"
 
 [package]
@@ -126,7 +127,7 @@ log = { version = "0.4", optional = true, features = ["max_level_off", "release_
 md-5 = { version = "0.11", optional = true }
 maxminddb = { version = "=0.32.0", default-features = false }
 quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
-quinn-proto = { version = "=0.11.18", default-features = false, features = ["rustls-ring"], optional = true }
+quinn-proto = { version = "=0.11.19", default-features = false, features = ["rustls-ring"], optional = true }
 rand = "0.10"
 ring = { version = "0.17.14", optional = true }
 redb = "=4.3.0"
@@ -235,3 +236,6 @@ unsafe_op_in_unsafe_fn = "deny"
 [lints.clippy]
 all = "warn"
 pedantic = "allow"
+
+[patch.crates-io]
+quinn-proto = { path = "vendor/quinn-proto" }

@@ -7,11 +7,17 @@
 | 用途 | 来源与约束 |
 | --- | --- |
 | 普通 TLS、QUIC、WebPKI | 官方 rustls/tokio-rustls，ring provider；rustls-native-certs 只读取可用平台根，不替换验证器 |
+| QUIC 状态机 | registry Quinn 0.11.12 + 仓库内 quinn-proto 0.11.19；初始/最大窗口与独立 DATAGRAM frame 限额补丁，保留官方许可证/来源 |
 | 命名 ClientHello、REALITY、JLS、ShadowTLS v3 | YuanDevTeam/boring，release 分支及锁定 revision |
 | SS 2022 | 官方 shadowsocks，仅 `aead-cipher-2022` |
 | Encryption | 同一 boring 的 X25519、ML-KEM、AEAD、AES-CTR；官方 blake3 |
 | 静态 ECH | 官方 hpke + rustls HPKE trait，命名模板使用 boring ECH 接口 |
 | Provider AGE | 官方 age/age-core 的 armor、MAC 和 STREAM；Hybrid 身份用官方 hpke XWing，关闭插件与 CLI |
+
+QUIC 的受影响 protocol crate 通过 root `[patch.crates-io]` 指向
+[vendor/quinn-proto](../vendor/quinn-proto/README.vole.md)。完整官方源、MIT/Apache 许可证和来源记录
+保留；CI 核对版本、仓库内路径、wrapper 依赖边及 rustls/ring provider。升级须重新核查官方
+稳定版本/校验值并审查本地 credit/frame 补丁；不修改 registry 缓存或 Quinn wrapper。
 
 AWS-LC 只用于 `shadowsocks → shadowsocks-crypto → aws-lc-rs → aws-lc-sys`，
 不用于 TLS/REALITY。禁止 FIPS、2022-extra 和第二套 REALITY 后端。

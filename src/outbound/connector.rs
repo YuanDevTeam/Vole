@@ -237,7 +237,7 @@ impl EstablishContext {
         self
     }
 
-    #[cfg(feature = "outbound-wireguard")]
+    #[cfg(any(feature = "outbound-wireguard", feature = "outbound-hysteria2"))]
     pub(crate) fn capped_by(mut self, deadline: Instant) -> Self {
         self.deadline = self.deadline.min(inherited_deadline(deadline));
         self

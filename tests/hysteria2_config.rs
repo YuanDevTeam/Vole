@@ -245,3 +245,57 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         assert!(parse(raw).is_err());
     }
 }
+
+#[cfg(feature = "outbound-hysteria2")]
+#[test]
+fn receive_windows_are_independent_and_preserve_initial_above_maximum() {
+    use vole::config::{ProxyProtocol, QuicReceiveWindow};
+    let parse = |fields: &str| {
+        let yaml = format!(
+            "mixed-port: 1080\nproxies:\n  - name: edge\n    type: hysteria2\n    server: localhost\n    port: 443\n{fields}rules: ['MATCH,edge']\n"
+        );
+        let c = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        let ProxyProtocol::Hysteria2(config) = c.proxies.into_iter().next().unwrap().protocol
+        else {
+            panic!("HY2")
+        };
+        config
+    };
+    let defaults = parse("");
+    assert_eq!(
+        defaults.stream_window,
+        QuicReceiveWindow {
+            initial: 8 * 1024 * 1024,
+            maximum: 8 * 1024 * 1024
+        }
+    );
+    assert_eq!(
+        defaults.connection_window,
+        QuicReceiveWindow {
+            initial: 20 * 1024 * 1024,
+            maximum: 20 * 1024 * 1024
+        }
+    );
+    let config = parse(
+        "    initial-stream-receive-window: 400\n    max-stream-receive-window: 200\n    initial-connection-receive-window: 600\n    max-connection-receive-window: 1200\n    handshake-timeout: 2\n",
+    );
+    assert_eq!(
+        config.stream_window,
+        QuicReceiveWindow {
+            initial: 400,
+            maximum: 200
+        }
+    );
+    assert_eq!(
+        config.connection_window,
+        QuicReceiveWindow {
+            initial: 600,
+            maximum: 1200
+        }
+    );
+    assert_eq!(config.handshake_timeout, std::time::Duration::from_secs(2));
+    let config =
+        parse("    max-stream-receive-window: 18446744073709551615\n    handshake-timeout: -1\n");
+    assert_eq!(config.stream_window.maximum, (1_u64 << 62) - 1);
+    assert!(config.handshake_timeout.is_zero());
+}

@@ -179,3 +179,90 @@ fn strict_v5_tls_and_identity_bounds_preserve_values() {
         assert!(parse(n).is_err(), "{field}");
     }
 }
+
+#[cfg(feature = "outbound-tuic")]
+#[test]
+fn quic_fields_consume_defaults_and_reversed_fixed_windows() {
+    use vole::config::{ProxyProtocol, QuicReceiveWindow};
+    let extract = |n| {
+        let c = parse(n).unwrap();
+        let ProxyProtocol::Tuic(config) = c.proxies.into_iter().next().unwrap().protocol else {
+            panic!("TUIC")
+        };
+        config
+    };
+    let defaults = extract(node());
+    assert_eq!(
+        defaults.stream_window,
+        QuicReceiveWindow {
+            initial: 15 * 1024 * 1024 / 10,
+            maximum: 15 * 1024 * 1024
+        }
+    );
+    assert_eq!(
+        defaults.connection_window,
+        QuicReceiveWindow {
+            initial: 64 * 1024 * 1024 / 10,
+            maximum: 64 * 1024 * 1024
+        }
+    );
+    assert_eq!(defaults.max_open_streams, 89);
+    assert_eq!(defaults.incoming_streams, 110);
+    assert_eq!(
+        defaults.heartbeat_interval,
+        std::time::Duration::from_secs(10)
+    );
+    assert_eq!(defaults.max_datagram_frame_size, 1281);
+    assert_eq!(defaults.max_udp_relay_packet_size, 1252);
+    let mut n = node();
+    n["ip"] = json!("192.0.2.1");
+    n["heartbeat-interval"] = json!(12);
+    n["recv-window-conn"] = json!(17);
+    n["recv-window"] = json!(29);
+    n["max-open-streams"] = json!(3);
+    n["max-datagram-frame-size"] = json!(80);
+    n["max-udp-relay-packet-size"] = json!(999);
+    n["disable-mtu-discovery"] = json!(true);
+    n["udp-over-stream"] = json!(true);
+    n["udp-over-stream-version"] = json!(2);
+    let t = extract(n.clone());
+    assert_eq!(t.address, "peer.invalid");
+    assert_eq!(t.tls.server_name, "peer.invalid");
+    assert_eq!(t.ip.as_deref(), Some("192.0.2.1"));
+    assert_eq!(t.heartbeat_interval, std::time::Duration::from_millis(12));
+    assert_eq!(
+        t.stream_window,
+        QuicReceiveWindow {
+            initial: 17,
+            maximum: 17
+        }
+    );
+    assert_eq!(
+        t.connection_window,
+        QuicReceiveWindow {
+            initial: 29,
+            maximum: 29
+        }
+    );
+    assert_eq!(t.max_open_streams, 2);
+    assert_eq!(t.incoming_streams, 4);
+    assert_eq!(t.max_datagram_frame_size, 80);
+    assert_eq!(t.max_udp_relay_packet_size, 51);
+    assert!(t.disable_mtu_discovery);
+    assert_eq!(t.udp_over_stream, Some(2));
+    for (version, expected) in [(0, 1), (1, 1), (2, 2)] {
+        n["udp-over-stream-version"] = json!(version);
+        assert_eq!(extract(n.clone()).udp_over_stream, Some(expected));
+    }
+    n["max-datagram-frame-size"] = json!(1);
+    let tiny = extract(n.clone());
+    assert_eq!(tiny.max_datagram_frame_size, 1);
+    assert_eq!(tiny.max_udp_relay_packet_size, 0);
+    n["max-open-streams"] = json!(1);
+    assert_eq!(extract(n.clone()).max_open_streams, 0);
+    n["max-open-streams"] = json!(-1);
+    assert_eq!(extract(n.clone()).max_open_streams, 0);
+    n["udp-over-stream"] = json!(false);
+    n["udp-over-stream-version"] = json!(3);
+    assert!(parse(n).is_err());
+}

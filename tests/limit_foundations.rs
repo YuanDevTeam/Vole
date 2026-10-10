@@ -18,12 +18,8 @@ fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
     let defaults = ResourceLimits::default();
     let expected = BTreeMap::from([
         ("tuic-quic-payload", vole::limits::TUIC_QUIC_PAYLOAD),
-        ("tuic-uni-streams", vole::limits::TUIC_UNI_STREAMS),
-        ("tuic-stream-window", vole::limits::TUIC_STREAM_WINDOW),
-        (
-            "tuic-connection-window",
-            vole::limits::TUIC_CONNECTION_WINDOW,
-        ),
+        ("tuic-control-readers", vole::limits::TUIC_CONTROL_READERS),
+        ("tuic-send-window", vole::limits::TUIC_SEND_WINDOW),
         ("tuic-datagram-buffer", vole::limits::TUIC_DATAGRAM_BUFFER),
         ("tuic-udp-queue", vole::limits::TUIC_UDP_QUEUE),
         ("tuic-pending-packets", vole::limits::TUIC_PENDING_PACKETS),
@@ -42,8 +38,7 @@ fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
         ("hy2-path-retire", vole::limits::HY2_PATH_RETIRE_SECONDS),
         ("hy2-quic-payload", vole::limits::HY2_QUIC_PAYLOAD),
         ("hy2-uni-streams", vole::limits::HY2_UNI_STREAMS),
-        ("hy2-stream-window", vole::limits::HY2_STREAM_WINDOW),
-        ("hy2-connection-window", vole::limits::HY2_CONNECTION_WINDOW),
+        ("hy2-send-window", vole::limits::HY2_SEND_WINDOW),
         ("hy2-datagram-buffer", vole::limits::HY2_DATAGRAM_BUFFER),
         ("hy2-auth-headers", vole::limits::HY2_AUTH_HEADERS),
         ("hy2-response-message", vole::limits::HY2_RESPONSE_MESSAGE),

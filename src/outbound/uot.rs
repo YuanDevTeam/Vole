@@ -78,6 +78,7 @@ pub(crate) struct UotTransport {
     cancellation: CancellationToken,
     reader_task: Option<JoinHandle<()>>,
     first_write: bool,
+    initial_deadline: Option<tokio::time::Instant>,
     closed: bool,
 }
 
@@ -103,6 +104,28 @@ impl UotTransport {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        Self::new_version(
+            reader,
+            writer,
+            max_response_payload_size,
+            parent_cancellation,
+            tracker,
+            2,
+        )
+    }
+
+    pub(crate) fn new_version<R, W>(
+        reader: R,
+        writer: W,
+        max_response_payload_size: u16,
+        parent_cancellation: CancellationToken,
+        tracker: &TaskTracker,
+        version: u8,
+    ) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let cancellation = parent_cancellation.child_token();
         let (responses, receiver) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
         let reader_cancellation = cancellation.clone();
@@ -117,9 +140,15 @@ impl UotTransport {
             responses: receiver,
             cancellation,
             reader_task: Some(reader_task),
-            first_write: true,
+            first_write: version == 2,
+            initial_deadline: None,
             closed: false,
         }
+    }
+    #[cfg(feature = "outbound-tuic")]
+    pub(crate) fn with_initial_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.initial_deadline = Some(deadline);
+        self
     }
 }
 
@@ -128,6 +157,13 @@ impl DatagramTransport for UotTransport {
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         if self.closed || self.cancellation.is_cancelled() {
             return Err(DispatchError::Other("UoT association is closed".to_owned()));
+        }
+        if self
+            .initial_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            self.cancellation.cancel();
+            return Err(DispatchError::TimedOut);
         }
         let packet = if self.first_write {
             encode_first_packet(&datagram).map_err(DispatchError::from)?
@@ -139,11 +175,18 @@ impl DatagramTransport for UotTransport {
             biased;
             () = self.cancellation.cancelled() => return Err(DispatchError::NotAllowed),
             result = async {
-                self.writer.write_all(&packet).await?;
-                self.writer.flush().await
-            } => result.map_err(DispatchError::from)?,
+                let writing = async {
+                    self.writer.write_all(&packet).await?;
+                    self.writer.flush().await
+                };
+                if let Some(deadline) = self.initial_deadline {
+                    tokio::time::timeout_at(deadline, writing).await.map_err(|_| DispatchError::TimedOut)?
+                        .map_err(DispatchError::from)
+                } else { writing.await.map_err(DispatchError::from) }
+            } => result?,
         }
         self.first_write = false;
+        self.initial_deadline = None;
         send_guard.commit();
         Ok(())
     }
@@ -231,8 +274,17 @@ async fn read_loop<R>(
 }
 
 pub(crate) fn magic_destination() -> Destination {
+    magic_destination_version(2)
+}
+
+pub(crate) fn magic_destination_version(version: u8) -> Destination {
     Destination::Domain {
-        host: MAGIC_DESTINATION.to_owned(),
+        host: if version == 1 {
+            "sp.udp-over-tcp.arpa"
+        } else {
+            MAGIC_DESTINATION
+        }
+        .to_owned(),
         port: 0,
     }
 }
@@ -480,6 +532,89 @@ mod tests {
         assert!(encode_first_packet(&packet).is_ok());
         packet.payload = Bytes::from(vec![7; 65_536]);
         assert!(encode_first_packet(&packet).is_err());
+    }
+
+    #[cfg(feature = "outbound-tuic")]
+    #[tokio::test]
+    async fn tuic_uot_versions_write_independent_vectors_and_join_after_stop() {
+        for version in [1, 2] {
+            let tracker = TaskTracker::new();
+            let cancellation = CancellationToken::new();
+            let (io, mut peer) = tokio::io::duplex(128);
+            let (reader, writer) = tokio::io::split(io);
+            let mut transport = UotTransport::new_version(
+                reader,
+                writer,
+                8,
+                cancellation.clone(),
+                &tracker,
+                version,
+            )
+            .with_initial_deadline(tokio::time::Instant::now() + Duration::from_secs(1));
+            let packet = datagram(
+                Destination::Ip((Ipv4Addr::new(1, 2, 3, 4), 53).into()),
+                b"q",
+            );
+            transport.send(packet).await.unwrap();
+            let expected: &[u8] = if version == 1 {
+                &[0, 1, 2, 3, 4, 0, 53, 0, 1, b'q']
+            } else {
+                &[0, 1, 1, 2, 3, 4, 0, 53, 0, 1, 2, 3, 4, 0, 53, 0, 1, b'q']
+            };
+            let mut actual = vec![0; expected.len()];
+            peer.read_exact(&mut actual).await.unwrap();
+            assert_eq!(actual, expected);
+            // Both versions have the same response codec, supplied independently.
+            peer.write_all(&[0, 8, 8, 8, 8, 0, 53, 0, 1, b'a'])
+                .await
+                .unwrap();
+            let reply = transport.receive().await.unwrap();
+            assert_eq!(
+                reply.remote,
+                Destination::Ip((Ipv4Addr::new(8, 8, 8, 8), 53).into())
+            );
+            assert_eq!(reply.payload.as_ref(), b"a");
+            cancellation.cancel();
+            tracker.close();
+            tokio::time::timeout(Duration::from_secs(1), transport.close())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), tracker.wait())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[cfg(feature = "outbound-tuic")]
+    #[tokio::test]
+    async fn tuic_uot_expired_original_first_packet_deadline_sends_no_bytes() {
+        for version in [1, 2] {
+            let tracker = TaskTracker::new();
+            let (io, mut peer) = tokio::io::duplex(128);
+            let (reader, writer) = tokio::io::split(io);
+            let mut transport = UotTransport::new_version(
+                reader,
+                writer,
+                8,
+                CancellationToken::new(),
+                &tracker,
+                version,
+            )
+            .with_initial_deadline(tokio::time::Instant::now());
+            assert!(matches!(
+                transport
+                    .send(datagram(Destination::domain("dns.test", 53).unwrap(), b"q"))
+                    .await,
+                Err(DispatchError::TimedOut)
+            ));
+            tracker.close();
+            transport.close().await.unwrap();
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).await.unwrap();
+            assert!(received.is_empty());
+            tracker.wait().await;
+        }
     }
 
     #[tokio::test]

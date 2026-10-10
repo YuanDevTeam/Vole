@@ -141,7 +141,10 @@ impl TuicOutbound {
         .0;
         Ok(Self {
             config: Arc::new(config.clone()),
-            server: server_destination(&config.address, config.port)?,
+            server: server_destination(
+                config.ip.as_deref().unwrap_or(&config.address),
+                config.port,
+            )?,
             upstream,
             tls,
             current: AsyncMutex::new(None),
@@ -159,14 +162,18 @@ impl TuicOutbound {
         if tokio::time::Instant::now() >= context.deadline() {
             return Err(DispatchError::TimedOut);
         }
+        // The reference admits only counters strictly below its threshold.
+        // A configured threshold of one is valid, but permits no logical owner.
+        if self.config.max_open_streams == 0 {
+            return Err(DispatchError::NotAllowed);
+        }
         let _waiter = observation::track(ResourceKind::Waiter);
         tokio::select! { biased;
             () = self.cancel.cancelled() => Err(DispatchError::NotAllowed),
             result = context.run("TUIC session", async {
                 let mut current = self.current.lock().await;
-                if let Some(session) = current.as_ref().filter(|s| !s.cancel.is_cancelled() && s.connection.close_reason().is_none() && !s.datagrams.exhausted()) {
-                    return Ok((session.clone(),session.activity.acquire()));
-                }
+                if let Some(session) = current.as_ref().filter(|s| !s.cancel.is_cancelled() && s.connection.close_reason().is_none() && !s.datagrams.exhausted())
+                    && let Some(lease) = session.activity.try_acquire(self.config.max_open_streams) { return Ok((session.clone(),lease)); }
                 if let Some(previous)=current.take() { previous.activity.retire(); }
                 let cancel = self.cancel.child_token();
                 let guard = cancel.clone().drop_guard();
@@ -226,6 +233,39 @@ impl OutboundConnector for TuicOutbound {
         request: DatagramRequest,
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        if let Some(version) = self.config.udp_over_stream {
+            let connected = self
+                .connect_stream(
+                    StreamSession {
+                        metadata: request.session.metadata.clone(),
+                        inbound: request.session.inbound,
+                        source: request.session.source,
+                        destination: crate::outbound::uot::magic_destination_version(version),
+                        sniffed_domain: None,
+                    },
+                    context,
+                )
+                .await?;
+            let _admission = self.admission.lock().unwrap();
+            if self.cancel.is_cancelled() {
+                return Err(DispatchError::NotAllowed);
+            }
+            let (reader, writer) = tokio::io::split(connected.io);
+            return Ok(crate::dispatch::bound_datagram(
+                Box::new(
+                    crate::outbound::uot::UotTransport::new_version(
+                        reader,
+                        writer,
+                        request.max_response_payload_size(),
+                        self.cancel.clone(),
+                        &self.tasks,
+                        version,
+                    )
+                    .with_initial_deadline(context.deadline()),
+                ),
+                request.budget(),
+            ));
+        }
         loop {
             let (shared, lease) = self.session(request.session.clone(), context).await?;
             if let Some(transport) = shared.datagrams.open(
@@ -275,7 +315,10 @@ async fn drive(
     let mut endpoint = None;
     let mut driver = None;
     let _pool = observation::track(ResourceKind::Pool);
-    let datagrams = Arc::new(super::datagram::Registry::new(config.udp_mode));
+    let datagrams = Arc::new(super::datagram::Registry::with_limit(
+        config.udp_mode,
+        config.max_udp_relay_packet_size,
+    ));
     let activity = Arc::new(Activity::default());
     let operation = async {
         let handshake = observation::track(ResourceKind::Handshake);
@@ -292,19 +335,38 @@ async fn drive(
         driver = Some(owned);
         let mtu = socket.budget().quic_payload_limit()?;
         let mut limits = quinn::TransportConfig::default();
+        let discovery = if config.disable_mtu_discovery {
+            None
+        } else {
+            let mut discovery = quinn::MtuDiscoveryConfig::default();
+            discovery.upper_bound(mtu);
+            Some(discovery)
+        };
+        let initial_mtu = if discovery.is_some() { 1200 } else { mtu };
         limits
-            .initial_mtu(mtu)
-            .min_mtu(mtu)
-            .mtu_discovery_config(None)
-            .max_concurrent_bidi_streams(0_u8.into())
-            .max_concurrent_uni_streams((crate::limits::TUIC_UNI_STREAMS as u32).into())
-            .stream_receive_window((crate::limits::TUIC_STREAM_WINDOW as u32).into())
-            .receive_window((crate::limits::TUIC_CONNECTION_WINDOW as u32).into())
-            .send_window(crate::limits::TUIC_CONNECTION_WINDOW as u64)
+            .initial_mtu(initial_mtu)
+            .min_mtu(1200)
+            .mtu_discovery_config(discovery)
+            .max_concurrent_bidi_streams(
+                quinn::VarInt::from_u64(config.incoming_streams).map_err(failure)?,
+            )
+            .max_concurrent_uni_streams(
+                quinn::VarInt::from_u64(config.incoming_streams).map_err(failure)?,
+            )
+            .adaptive_stream_receive_window(
+                quinn::VarInt::from_u64(config.stream_window.initial).map_err(failure)?,
+                quinn::VarInt::from_u64(config.stream_window.maximum).map_err(failure)?,
+            )
+            .adaptive_receive_window(
+                quinn::VarInt::from_u64(config.connection_window.initial).map_err(failure)?,
+                quinn::VarInt::from_u64(config.connection_window.maximum).map_err(failure)?,
+            )
+            .max_datagram_frame_size(Some(config.max_datagram_frame_size.into()))
+            .send_window(crate::limits::TUIC_SEND_WINDOW as u64)
             .datagram_receive_buffer_size(Some(crate::limits::TUIC_DATAGRAM_BUFFER))
             .datagram_send_buffer_size(crate::limits::TUIC_DATAGRAM_BUFFER)
             .max_idle_timeout(Some(Duration::from_secs(30).try_into().map_err(failure)?))
-            .keep_alive_interval(Some(Duration::from_secs(10)))
+            .keep_alive_interval(Some(config.heartbeat_interval))
             .congestion_controller_factory(match config.congestion {
                 TuicCongestion::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
                 TuicCongestion::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
@@ -366,7 +428,8 @@ async fn drive(
             .unwrap()
             .send(Ok(session))
             .map_err(|_| DispatchError::ConnectionRefused)?;
-        let mut beat = tokio::time::interval(Duration::from_secs(10));
+        let mut beat = tokio::time::interval(config.heartbeat_interval);
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         beat.tick().await;
         tokio::select! {
             _=connection.closed()=>{},
