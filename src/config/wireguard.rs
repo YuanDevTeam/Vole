@@ -4,9 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, de::Visitor};
 use zeroize::Zeroizing;
 
-use super::{
-    DnsNameserver, DnsRoute, IpCidr, ProxyProtocol, invalid, validate_host, validate_port,
-};
+use super::{DnsNameserver, IpCidr, ProxyProtocol, invalid, validate_host, validate_port};
 use crate::Result;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -339,12 +337,7 @@ impl RawWireGuard {
                     // The reference replaces every parsed DNS route with this
                     // WireGuard adapter; a named fragment cannot select an
                     // external group or bypass the node's raw-IP data plane.
-                    let endpoint = v.split_once('#').map_or(v.as_str(), |(v, _)| v);
-                    let nameserver = super::parse_dns_nameserver(
-                        endpoint,
-                        &super::RouteTargetsByName::new(),
-                        DnsRoute::Direct,
-                    )?;
+                    let nameserver = super::dns::parse_node_dns_nameserver(v)?;
                     if !supported_node_dns(&nameserver) {
                         return invalid(
                             "WireGuard node DNS requires an explicit network or RCODE upstream",
@@ -494,5 +487,59 @@ mod tests {
             assert!(Config::parse_yaml(&document(value.clone(), None)).is_err());
             assert!(Config::parse_yaml(&document(json!([0, 0, 0]), Some(value))).is_err());
         }
+    }
+
+    #[test]
+    fn private_dns_preserves_keyed_fragments_and_ignores_route_tokens() {
+        let mut document: Value = serde_json::from_slice(&document(json!([]), None)).unwrap();
+        let node = &mut document["proxies"][0];
+        node["remote-dns-resolve"] = json!(true);
+        let tls = "tls://192.0.2.53#undeclared%2526route%26ecs=2001:db8::7/57%26ecs-override=true%26disable-ipv4=true%26disable-qtype-16=true%26skip-cert-verify=true%26name-cert-verify=dns.example%26disable-reuse=true";
+        node["dns"] = json!([
+            tls,
+            "https://dns.example/dns-query#RULES&h3=true%2526disable-ipv6=true"
+        ]);
+        let parsed = Config::parse_yaml(&serde_json::to_vec(&document).unwrap()).unwrap();
+        let ProxyProtocol::WireGuard(config) = &parsed.proxies[0].protocol else {
+            panic!("expected WireGuard");
+        };
+        assert!(
+            config
+                .dns
+                .iter()
+                .all(|server| server.route == super::super::DnsRoute::Direct)
+        );
+        let options = &config.dns[0].options;
+        assert_eq!(options.ecs.unwrap().prefix_len, 57);
+        assert!(options.ecs_override);
+        assert_eq!(&*options.disabled_types, &[1, 16]);
+        assert!(options.skip_cert_verify);
+        assert_eq!(options.verification_name.as_deref(), Some("dns.example"));
+        assert!(options.disable_reuse);
+        // A second percent decode would introduce another keyed parameter and
+        // accidentally force H3. The value after one decode is not "true".
+        assert!(!config.dns[1].options.force_h3);
+        assert!(config.dns[1].options.disabled_types.is_empty());
+
+        document["proxies"][0]["dns"] = json!(["https://dns.example#undeclared&h3=true"]);
+        let parsed = Config::parse_yaml(&serde_json::to_vec(&document).unwrap());
+        if cfg!(feature = "dns-quic") {
+            let parsed = parsed.unwrap();
+            let ProxyProtocol::WireGuard(config) = &parsed.proxies[0].protocol else {
+                panic!("expected WireGuard")
+            };
+            assert!(config.dns[0].options.force_h3);
+        } else {
+            assert!(parsed.is_err());
+        }
+
+        // Shared DNS keeps its route validation, while the private parser still
+        // rejects invalid keyed options instead of discarding the fragment.
+        document["proxies"][0]["dns"] = json!([tls]);
+        document["dns"] = json!({"nameserver": ["tls://192.0.2.53#undeclared"]});
+        assert!(Config::parse_yaml(&serde_json::to_vec(&document).unwrap()).is_err());
+        document["dns"] = json!({});
+        document["proxies"][0]["dns"] = json!(["tls://192.0.2.53#undeclared&ecs=not-an-ip"]);
+        assert!(Config::parse_yaml(&serde_json::to_vec(&document).unwrap()).is_err());
     }
 }

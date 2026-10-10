@@ -1804,7 +1804,10 @@ impl RuntimeDns {
         failure_mode: FailureMode,
     ) -> Result<Vec<u8>, RuntimeDnsError> {
         let deadline = permit.deadline;
-        let exchange = async {
+        // Transport variants make this future large. Keep it out of nested
+        // decision/deadline and node-resolution stack frames without spawning
+        // a task or changing caller-owned cancellation.
+        let exchange = Box::pin(async {
             permit.decision.check()?;
             match classified.kind {
                 DnsQueryKind::Address(_) => {
@@ -1823,7 +1826,7 @@ impl RuntimeDns {
                         .await
                 }
             }
-        };
+        });
         match timeout_at(deadline, permit.decision.scope(exchange)).await {
             Ok(Err(RuntimeDnsError::RuleEvaluation(_)))
                 if matches!(failure_mode, FailureMode::WireServfail) =>

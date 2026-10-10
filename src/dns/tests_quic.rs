@@ -374,6 +374,49 @@ async fn dns_quic_doq_and_forced_h3_exchange_real_frames_reuse_and_stop() {
     }
 }
 
+#[cfg(feature = "outbound-wireguard")]
+#[tokio::test]
+async fn dns_quic_private_node_preserves_forced_h3_wrappers_and_stop() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let config = crate::config::Config::parse_yaml(format!(
+        "mixed-port: 1080\ndns: {{prefer-h3: true}}\nproxies: [{{name: wg, type: wireguard, server: 198.51.100.1, port: 51820, ip: 10.0.0.2, private-key: '{}', public-key: '{}', remote-dns-resolve: true, dns: ['https://alice:pw@192.0.2.1:853/dns-query#undeclared%26h3=true%26name-cert-verify=dns.example%26ecs=192.0.2.1%26disable-ipv6=true']}}]",
+        STANDARD.encode([1; 32]), STANDARD.encode([2; 32])
+    ).as_bytes()).unwrap();
+    assert!(config.dns.prefer_h3);
+    let crate::config::ProxyProtocol::WireGuard(node) = &config.proxies[0].protocol else {
+        panic!("expected WireGuard")
+    };
+    // Match the production private-resolver construction; global DNS options
+    // are not copied into this node's independently owned configuration.
+    let private = crate::config::DnsConfig {
+        enable: true,
+        ipv6: true,
+        nameservers: node.dns.clone(),
+        use_hosts: false,
+        use_system_hosts: false,
+        ..Default::default()
+    };
+    let (peer, roots) = Peer::new(super::super::quic::Kind::H3, Tcp::Pending, Udp::Ready);
+    let dns = RuntimeDns::new_for_node(
+        &private,
+        peer.clone(),
+        super::super::resolution::ResolutionContext::default(),
+        crate::security::SecurityContext::with_tls_roots(roots),
+    );
+    assert!(!dns.prefer_h3);
+    let blocked = build_query(9, "blocked.example", QueryType::Aaaa).unwrap();
+    let blocked = dns.exchange(&blocked).await.unwrap();
+    assert_eq!(&blocked[6..12], &[0; 6]);
+    assert_eq!(peer.udp_calls.load(Ordering::Acquire), 0);
+    two_queries(&dns).await;
+    assert_eq!(peer.requests.load(Ordering::Acquire), 2);
+    assert_eq!(peer.tcp_calls.load(Ordering::Acquire), 0);
+    dns.shutdown().await;
+    assert_eq!(dns.tcp_pool.quic.task_count(), 0);
+    assert_eq!(peer.live.load(Ordering::Acquire), 0);
+    peer.stop().await;
+}
+
 #[tokio::test]
 async fn dns_quic_prefer_h3_races_success_and_cleans_losers_without_reprobing() {
     for (tcp, udp, expects_h3) in [

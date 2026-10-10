@@ -124,6 +124,20 @@ pub(super) fn parse_dns_nameserver(
     targets: &RouteTargetsByName,
     default_route: DnsRoute,
 ) -> Result<DnsNameserver> {
+    parse_dns_nameserver_with_route(input, Some(targets), default_route)
+}
+
+/// A node's private DNS fixes its dispatcher independently of the URL route
+/// token. Keep the original URL so every keyed option is decoded once.
+pub(super) fn parse_node_dns_nameserver(input: &str) -> Result<DnsNameserver> {
+    parse_dns_nameserver_with_route(input, None, DnsRoute::Direct)
+}
+
+fn parse_dns_nameserver_with_route(
+    input: &str,
+    targets: Option<&RouteTargetsByName>,
+    default_route: DnsRoute,
+) -> Result<DnsNameserver> {
     let bad = || {
         VoleError::InvalidConfig(
             "invalid DNS upstream; supported transports are UDP, TCP, TLS, HTTP(S), QUIC, RCODE, system and DHCP"
@@ -133,10 +147,8 @@ pub(super) fn parse_dns_nameserver(
     let (endpoint, fragment) = input.split_once('#').unwrap_or((input, ""));
     let (route_name, options) =
         parse_nameserver_options(fragment, !endpoint.starts_with("https://"))?;
-    let route = if route_name.is_empty() {
-        default_route
-    } else {
-        match route_name.as_str() {
+    let route = match targets {
+        Some(targets) if !route_name.is_empty() => match route_name.as_str() {
             "DIRECT" => DnsRoute::Direct,
             "RULES" => DnsRoute::Rules,
             _ => targets
@@ -144,7 +156,8 @@ pub(super) fn parse_dns_nameserver(
                 .copied()
                 .map(DnsRoute::Route)
                 .ok_or_else(bad)?,
-        }
+        },
+        _ => default_route,
     };
     // Special sources remain physical, but use the same query wrappers.
     let source = match endpoint {

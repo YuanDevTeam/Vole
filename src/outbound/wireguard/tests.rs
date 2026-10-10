@@ -173,8 +173,13 @@ impl MemoryPeer {
                     self.dns_queries.fetch_add(1, Ordering::Relaxed);
                     let query = crate::dns::parse_query(udp.payload).unwrap();
                     assert_eq!(query.question.name, "remote.example");
-                    let mut wire = udp.payload.to_vec();
-                    wire[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+                    assert_eq!(
+                        &udp.payload[udp.payload.len() - 12..],
+                        &[0, 8, 0, 8, 0, 1, 25, 0, 192, 0, 2, 128],
+                        "private DNS ECS reaches the real encrypted raw-IP data plane"
+                    );
+                    let classified = crate::dns::classify_query(udp.payload).unwrap();
+                    let mut wire = crate::dns::synthesize_empty_response(&classified, 0).unwrap();
                     wire[6..8].copy_from_slice(&1u16.to_be_bytes());
                     wire.extend_from_slice(&[
                         0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 10, 1, 0, 1,
@@ -518,13 +523,12 @@ async fn wireguard_peers_longest_prefix_reserved_and_remote_dns_have_owned_io() 
         }];
         config.routes.push((peer.allowed_ips[0], 1));
         config.peers.push(peer);
-        config.dns = vec![crate::config::DnsNameserver {
-            transport: crate::config::DnsTransport::Udp,
-            address: crate::config::DnsAddress::Domain("dns.example".into()),
-            port: 53, route: crate::config::DnsRoute::Direct, path: None,
-            http_auth: None,
-            options: Default::default(),
-        }];
+        let parsed_dns = crate::config::Config::parse_yaml(format!(
+            "mixed-port: 1080\ndns: {{prefer-h3: {}}}\nproxies: [{{name: wg, type: wireguard, server: 198.51.100.1, port: 51820, ip: 10.0.0.2, private-key: '{private}', public-key: '{}', remote-dns-resolve: true, dns: ['dns.example#undeclared%26ecs=192.0.2.255/25%26disable-qtype-16=true']}}]",
+            cfg!(feature = "dns-quic"), STANDARD.encode(x25519::PublicKey::from(&x25519::StaticSecret::from([2; 32])).as_bytes())
+        ).as_bytes()).unwrap();
+        let crate::config::ProxyProtocol::WireGuard(node) = &parsed_dns.proxies[0].protocol else { panic!() };
+        config.dns = node.dns.clone();
         let records = Arc::<Mutex<Vec<Destination>>>::default();
         let closes = Arc::<AtomicUsize>::default();
         let queries = Arc::<AtomicUsize>::default();
@@ -548,10 +552,19 @@ async fn wireguard_peers_longest_prefix_reserved_and_remote_dns_have_owned_io() 
         assert_eq!(&echoed, b"peer");
         assert_eq!(connected.effective_peer, Destination::Ip("10.1.0.1:80".parse().unwrap()));
         assert_eq!(queries.load(Ordering::Relaxed), 1);
+        let engine = outbound.current.lock().await.as_ref().unwrap().clone();
+        let mut blocked = crate::dns::build_query(77, "blocked.example", crate::dns::QueryType::A).unwrap();
+        let qtype = blocked.len() - 4;
+        blocked[qtype..qtype + 2].copy_from_slice(&16_u16.to_be_bytes());
+        let blocked = engine.remote.get().unwrap().exchange(&blocked).await.unwrap();
+        assert_eq!(&blocked[6..12], &[0; 6]);
+        assert_eq!(blocked[2] & 0x04, 0x04);
+        assert_eq!(queries.load(Ordering::Relaxed), 1, "disabled TXT does not enter WireGuard");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert!(records.lock().unwrap().contains(&Destination::Ip(ENDPOINT.parse().unwrap())));
         assert!(records.lock().unwrap().contains(&Destination::Ip(SECOND.parse().unwrap())));
         drop(connected);
+        drop(engine);
         outbound.shutdown().await;
         assert_eq!(closes.load(Ordering::Relaxed), 2);
         assert!(probe.snapshot().is_idle());

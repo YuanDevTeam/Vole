@@ -248,7 +248,9 @@ proxies:
     allowed-ips: [] # 无 peers 时忽略；各本地地址族使用全地址路由
     reserved: [] # 空、三字节数组或标准 Base64 字符串（如 "U4An"）；peer 缺省继承顶层值
     remote-dns-resolve: false # true 且 dns 非空时，业务域名通过本节点查询
-    dns: [] # 支持 Core DNS 上游；上游域名仍由 Core 代理 DNS bootstrap
+    # 支持 Core DNS 上游；fragment 出口 token 忽略，键值参数保留且只解码一次。
+    # 不继承全局 prefer-h3，HTTPS h3=true 仍生效；上游域名仍由 Core 代理 DNS bootstrap。
+    dns: []
     refresh-server-ip-interval: 0 # 秒；0 不更新，新业务触发到期检查
     # peers 非空时忽略顶层 server/port/public-key；每项 allowed-ips 必须非空。
     # peers:

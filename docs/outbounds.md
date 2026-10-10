@@ -379,8 +379,10 @@ Dialer/UpstreamPath，节点端点由 Core 代理 DNS 角色解析；旧会话�
 失败不会关闭其他 peer 或整个共享栈，后续新业务可重建失败会话，不重放旧业务。
 
 remote-dns-resolve 默认 false；只有 true 且 dns 非空时，业务域名使用节点私有 DNS，
-查询经过该 WireGuard 节点的内层 TCP/UDP。dns 支持 Core 的 UDP/TCP/DoT/DoH/RCODE
-上游；`#route` 不改变这个固定出口。DNS 上游域名仍由 Core 的代理 DNS 角色 bootstrap，
+查询经过该 WireGuard 节点的内层 TCP/UDP。dns 支持 Core 的 UDP/TCP/DoT/DoH/DoQ/RCODE
+上游；fragment 中的出口 token（包括未定义的名称）不改变这个固定出口，键值参数仍按
+通用 DNS 契约解码一次并消费 ECS、类型过滤、证书策略和 DoT 复用设置。私有解析器
+不继承全局 prefer-h3，HTTPS 的显式 h3=true 仍强制使用 H3。DNS 上游域名仍由 Core 的代理 DNS 角色 bootstrap，
 不通过节点私有解析器解析自身端点。私有缓存有界，查询由调用方持有，不保留空闲 TCP
 连接或独立后台清理任务。关闭该开关或 dns 为空时使用受控本地 DNS；两种路径都遵循
 节点 ip-version、全局 IPv6 开关、本地地址族与原建链期限，失败不回落 DIRECT。
