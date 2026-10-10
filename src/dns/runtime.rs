@@ -79,6 +79,8 @@ fn dot_reuse_disabled(nameserver: &DnsNameserver) -> bool {
 pub enum RuntimeDnsError {
     #[error("runtime DNS is disabled")]
     Disabled,
+    #[error("DNS rule evaluation failed: {0}")]
+    RuleEvaluation(#[from] crate::config::MatchFailure),
     #[error("runtime DNS has no nameserver")]
     NoNameserver,
     #[error("invalid DNS query: {0}")]
@@ -827,6 +829,15 @@ async fn wait_for_flight(mut updates: watch::Receiver<FlightUpdate>) -> Option<S
 pub(crate) struct DnsQueryPermit {
     _activity: ResourceActivityGuard,
     deadline: TokioInstant,
+    decision: crate::config::RuleDecision,
+}
+
+impl DnsQueryPermit {
+    #[cfg(feature = "tun")]
+    pub(crate) fn with_cancellation(self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.decision.set_cancellation(token);
+        self
+    }
 }
 
 /// One DNS wire response that can retain its query observation until the caller
@@ -1065,15 +1076,16 @@ impl RuntimeDns {
             .map_or(Ok(None), |pool| pool.recover(address))
     }
 
-    fn use_fake_ip(&self, host: &str) -> bool {
+    fn use_fake_ip(&self, host: &str) -> Result<bool, RuntimeDnsError> {
         if self.fake_pools.is_none() {
-            return false;
+            return Ok(false);
         }
         let snapshot = self.geo_matcher.routing_snapshot();
-        !self.fake_filter.skips(
+        Ok(!self.fake_filter.skips(
             host,
             snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref()),
-        )
+            &crate::config::RuleDecision::default(),
+        )?)
     }
 
     /// Creates a resolver whose upstream traffic uses one preselected
@@ -1356,30 +1368,47 @@ impl RuntimeDns {
         }
     }
 
-    fn policy_for(&self, query: &ClassifiedDnsQuery) -> Option<&[DnsNameserver]> {
+    fn policy_for(
+        &self,
+        query: &ClassifiedDnsQuery,
+    ) -> Result<Option<&[DnsNameserver]>, RuntimeDnsError> {
         let snapshot = self.geo_matcher.routing_snapshot();
         let geo = snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref());
-        self.policy_index
-            .select(&query.question.name, &self.nameserver_policies, geo)
-            .map(|index| self.nameserver_policies[index].nameservers.as_ref())
+        Ok(self
+            .policy_index
+            .select(
+                &query.question.name,
+                &self.nameserver_policies,
+                geo,
+                &crate::config::RuleDecision::default(),
+            )?
+            .map(|index| self.nameserver_policies[index].nameservers.as_ref()))
     }
 
-    fn nameservers_for(&self, query: &ClassifiedDnsQuery) -> &[DnsNameserver] {
-        self.policy_for(query).unwrap_or(&self.nameservers)
+    fn nameservers_for(
+        &self,
+        query: &ClassifiedDnsQuery,
+    ) -> Result<&[DnsNameserver], RuntimeDnsError> {
+        Ok(self.policy_for(query)?.unwrap_or(&self.nameservers))
     }
 
-    fn fallback_domain(&self, host: &str) -> bool {
+    fn fallback_domain(&self, host: &str) -> Result<bool, RuntimeDnsError> {
         let snapshot = self.geo_matcher.routing_snapshot();
-        self.fallback_filter.domain(
+        Ok(self.fallback_filter.domain(
             host,
             snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref()),
-        )
+            &crate::config::RuleDecision::default(),
+        )?)
     }
 
     fn accepts_primary(
         &self,
         result: &Result<(Vec<u8>, DnsMessage, bool), RuntimeDnsError>,
     ) -> bool {
+        // Rule evaluation failures are terminal; selecting a fallback would hide them.
+        if matches!(result, Err(RuntimeDnsError::RuleEvaluation(_))) {
+            return true;
+        }
         let Ok((_, response, _)) = result else {
             return false;
         };
@@ -1486,6 +1515,9 @@ impl RuntimeDns {
                     return Err(AttemptError::Dispatch(error));
                 }
                 match evaluation {
+                    ProgramEvaluation::Failed(failure) => {
+                        Err(AttemptError::RuleEvaluation(failure))
+                    }
                     ProgramEvaluation::Matched(rule_match) => match rule_match.action {
                         RuleAction::Route(_) => {
                             Ok(selected.expect("accepted DNS route owns a leaf"))
@@ -1507,6 +1539,14 @@ impl RuntimeDns {
     /// most `dns.ipv6-timeout` for IPv6 after A completes. Dropping this future
     /// cancels both lookups; no detached query outlives its caller.
     pub async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, RuntimeDnsError> {
+        let decision = crate::config::RuleDecision::default();
+        decision.check()?;
+        let result = decision.scope(self.resolve_inner(host)).await;
+        decision.check()?;
+        result
+    }
+
+    async fn resolve_inner(&self, host: &str) -> Result<Vec<IpAddr>, RuntimeDnsError> {
         super::trace::record("resolve");
         let host = canonicalize_name(host).map_err(RuntimeDnsError::InvalidQuery)?;
         let host =
@@ -1572,6 +1612,12 @@ impl RuntimeDns {
                 .unwrap_or(deadline)
                 .min(deadline);
             ipv6_result = timeout_at(wait_until, &mut ipv6).await.ok();
+        }
+        if let Err(RuntimeDnsError::RuleEvaluation(failure)) = &ipv4_result {
+            return Err(RuntimeDnsError::RuleEvaluation(*failure));
+        }
+        if let Some(Err(RuntimeDnsError::RuleEvaluation(failure))) = &ipv6_result {
+            return Err(RuntimeDnsError::RuleEvaluation(*failure));
         }
         let mut addresses = match ipv4_result {
             Ok(LookupResult::Positive(addresses)) => addresses,
@@ -1675,18 +1721,23 @@ impl RuntimeDns {
         }
         let classified = classify_query(query).map_err(RuntimeDnsError::InvalidQuery)?;
         let permit = self.begin_query();
-        timeout_at(
-            permit.deadline,
+        // Keep the nested resolver future type bounded at the Controller boundary.
+        let exchange: std::pin::Pin<
+            Box<dyn Future<Output = Result<Vec<u8>, RuntimeDnsError>> + Send + '_>,
+        > = Box::pin(permit.decision.scope(async {
+            permit.decision.check()?;
             self.exchange_address_upstream(
                 query,
                 &classified,
                 permit.deadline,
                 FailureMode::BoundedError,
-            ),
-        )
-        .await
-        .map_err(|_| RuntimeDnsError::UpstreamsExhausted {
-            last_error: "runtime DNS total query deadline expired".into(),
+            )
+            .await
+        }));
+        timeout_at(permit.deadline, exchange).await.map_err(|_| {
+            RuntimeDnsError::UpstreamsExhausted {
+                last_error: "runtime DNS total query deadline expired".into(),
+            }
         })?
     }
 
@@ -1710,9 +1761,13 @@ impl RuntimeDns {
     /// Begins observing a query before the caller creates its task. This is the
     /// entry point used by the TUN DNS fast path.
     pub(crate) fn begin_query(&self) -> DnsQueryPermit {
+        let deadline = TokioInstant::now() + QUERY_TIMEOUT;
+        let decision = crate::config::RuleDecision::default();
+        decision.set_deadline(deadline.into_std());
         DnsQueryPermit {
             _activity: self.resource_stats.begin(ResourceActivity::DnsRequest),
-            deadline: TokioInstant::now() + QUERY_TIMEOUT,
+            deadline,
+            decision,
         }
     }
 
@@ -1750,6 +1805,7 @@ impl RuntimeDns {
     ) -> Result<Vec<u8>, RuntimeDnsError> {
         let deadline = permit.deadline;
         let exchange = async {
+            permit.decision.check()?;
             match classified.kind {
                 DnsQueryKind::Address(_) => {
                     self.exchange_address(query, classified, deadline, failure_mode)
@@ -1758,7 +1814,7 @@ impl RuntimeDns {
                 DnsQueryKind::Opaque => {
                     if matches!(failure_mode, FailureMode::WireServfail)
                         && matches!(classified.question.query_type, 64 | 65)
-                        && self.use_fake_ip(&classified.question.name)
+                        && self.use_fake_ip(&classified.question.name)?
                     {
                         return super::synthesize_empty_response(classified, 0)
                             .map_err(RuntimeDnsError::InvalidResponse);
@@ -1768,7 +1824,12 @@ impl RuntimeDns {
                 }
             }
         };
-        match timeout_at(deadline, exchange).await {
+        match timeout_at(deadline, permit.decision.scope(exchange)).await {
+            Ok(Err(RuntimeDnsError::RuleEvaluation(_)))
+                if matches!(failure_mode, FailureMode::WireServfail) =>
+            {
+                Ok(synthesize_servfail_response(classified))
+            }
             Ok(result) => result,
             Err(_) => {
                 tracing::warn!(
@@ -1828,7 +1889,7 @@ impl RuntimeDns {
             })? {
             HostValue::Addresses(addresses) => Some(addresses),
             HostValue::Alias(alias) if alias != parsed_query.question.name => {
-                if matches!(failure_mode, FailureMode::WireServfail) && self.use_fake_ip(&alias) {
+                if matches!(failure_mode, FailureMode::WireServfail) && self.use_fake_ip(&alias)? {
                     return self.synthetic_answer(&parsed_query, &alias);
                 }
                 Some(Box::pin(self.resolve(&alias)).await?)
@@ -1848,7 +1909,7 @@ impl RuntimeDns {
         }
 
         if matches!(failure_mode, FailureMode::WireServfail)
-            && self.use_fake_ip(&parsed_query.question.name)
+            && self.use_fake_ip(&parsed_query.question.name)?
         {
             return self.synthetic_answer(&parsed_query, &parsed_query.question.name);
         }
@@ -1933,7 +1994,7 @@ impl RuntimeDns {
         let upstream_parsed_query =
             parse_query(&upstream_query).map_err(RuntimeDnsError::InvalidQuery)?;
         let (mut response, parsed_response, cacheable) =
-            if let Some(policy) = self.policy_for(classified) {
+            if let Some(policy) = self.policy_for(classified)? {
                 super::trace::record("nameserver-policy");
                 self.exchange_upstreams(policy, &upstream_query, &upstream_parsed_query, deadline)
                     .await?
@@ -1946,7 +2007,7 @@ impl RuntimeDns {
                     deadline,
                 )
                 .await?
-            } else if self.fallback_domain(&classified.question.name) {
+            } else if self.fallback_domain(&classified.question.name)? {
                 super::trace::record("fallback-domain");
                 self.exchange_upstreams(
                     &self.fallback.nameservers,
@@ -2041,7 +2102,7 @@ impl RuntimeDns {
         let upstream_query = rewrite_query_id(query, self.next_upstream_id());
         let upstream_classified =
             classify_query(&upstream_query).map_err(RuntimeDnsError::InvalidQuery)?;
-        let nameservers = self.nameservers_for(classified);
+        let nameservers = self.nameservers_for(classified)?;
         let response = self
             .exchange_opaque_upstreams(nameservers, &upstream_query, &upstream_classified, deadline)
             .await?;
@@ -3068,8 +3129,16 @@ where
         .iter()
         .find(|server| matches!(server.transport, DnsTransport::Rcode(_)))
     {
-        return match timeout_at(deadline, Box::pin(attempt(server.clone()))).await {
-            Ok(Ok(response)) => Ok(response),
+        let result = timeout_at(deadline, Box::pin(attempt(server.clone()))).await;
+        crate::config::RuleDecision::default().check()?;
+        return match result {
+            Ok(Ok(response)) => {
+                crate::config::RuleDecision::default().check()?;
+                Ok(response)
+            }
+            Ok(Err(AttemptError::RuleEvaluation(failure))) => {
+                Err(RuntimeDnsError::RuleEvaluation(failure))
+            }
             Ok(Err(error)) => Err(RuntimeDnsError::UpstreamsExhausted {
                 last_error: error.summary(0),
             }),
@@ -3091,10 +3160,17 @@ where
         })
         .buffer_unordered(4);
     while let Some((index, result)) = attempts.next().await {
+        crate::config::RuleDecision::default().check()?;
         match result {
-            Ok(Ok(response)) if retryable_response(&response).is_none() => return Ok(response),
+            Ok(Ok(response)) if retryable_response(&response).is_none() => {
+                crate::config::RuleDecision::default().check()?;
+                return Ok(response);
+            }
             Ok(Ok(_)) => {
                 last_error = format!("nameserver {index} returned a retryable response").into()
+            }
+            Ok(Err(AttemptError::RuleEvaluation(failure))) => {
+                return Err(RuntimeDnsError::RuleEvaluation(failure));
             }
             Ok(Err(error)) => last_error = error.summary(index),
             Err(_) => last_error = format!("nameserver {index} timed out").into(),
@@ -3150,8 +3226,10 @@ enum LookupResult {
 
 #[derive(Debug, thiserror::Error)]
 enum AttemptError {
+    #[error("DNS rule evaluation failed: {0}")]
+    RuleEvaluation(crate::config::MatchFailure),
     #[error("dispatcher failed: {0}")]
-    Dispatch(#[from] DispatchError),
+    Dispatch(DispatchError),
     #[error("stream I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("invalid response: {0}")]
@@ -3164,9 +3242,19 @@ enum AttemptError {
     MessageTooLarge,
 }
 
+impl From<DispatchError> for AttemptError {
+    fn from(error: DispatchError) -> Self {
+        match error {
+            DispatchError::RuleEvaluation(failure) => Self::RuleEvaluation(failure),
+            error => Self::Dispatch(error),
+        }
+    }
+}
+
 impl AttemptError {
     fn category(&self) -> &'static str {
         match self {
+            Self::RuleEvaluation(_) => "rule evaluation",
             Self::Dispatch(_) => "dispatcher",
             Self::Io(_) => "I/O",
             Self::InvalidResponse(_) => "invalid response",
@@ -3814,6 +3902,78 @@ mod tests {
             nameserver_policies: Vec::new(),
             ..DnsConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn rule_budget_propagates_through_fake_ip_policy_and_sniffer_without_egress() {
+        let payload = serde_json::to_string(&vec!["DOMAIN-REGEX,(?=never)never"; 16]).unwrap();
+        let configuration = crate::config::Config::parse_yaml(
+            format!(
+                r#"
+mixed-port: 1080
+rule-providers:
+  left: {{type: inline, behavior: classical, payload: {payload}}}
+  right: {{type: inline, behavior: classical, payload: {payload}}}
+dns:
+  enable: true
+  use-system-hosts: false
+  enhanced-mode: fake-ip
+  fake-ip-filter-mode: whitelist
+  fake-ip-filter: ['rule-set:left']
+  nameserver: [192.0.2.1]
+  nameserver-policy:
+    'rule-set:left': [192.0.2.2]
+    'rule-set:right': [192.0.2.3]
+sniffer:
+  enable: true
+  force-domain: ['+.example']
+  skip-domain: ['rule-set:left,right']
+  sniff: {{TLS: {{ports: [443]}}}}
+"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let dispatcher = Arc::new(MockDispatcher::with_replies(vec![], vec![]));
+        let resolver = RuntimeDns::new(&configuration.dns, dispatcher.clone());
+        let query = build_query(9, "api.example", QueryType::A).unwrap();
+        let response = resolver.exchange(&query).await.unwrap();
+        assert_eq!(parse_response(&response).unwrap().rcode, RCODE_SERVFAIL);
+        assert!(matches!(
+            resolver.resolve("api.example").await,
+            Err(RuntimeDnsError::RuleEvaluation(
+                crate::config::MatchFailure::Budget
+            ))
+        ));
+        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 0);
+        assert_eq!(dispatcher.tcp_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            resolver
+                .recover_fake_ip("198.18.0.2".parse().unwrap())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let policy = crate::sniffing::Policy::new(
+            Arc::new(configuration.sniffer),
+            Arc::new(EmptyGeoMatcher),
+        );
+        let plan = policy
+            .plan(
+                "198.51.100.1:9000".parse().unwrap(),
+                &Destination::Ip("203.0.113.1:443".parse().unwrap()),
+                Some("api.example"),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            plan.accepts("api.example"),
+            Err(crate::config::MatchFailure::Budget)
+        );
+        assert_eq!(
+            plan.clone().accepts("api.example"),
+            Err(crate::config::MatchFailure::Budget)
+        );
     }
 
     #[tokio::test]

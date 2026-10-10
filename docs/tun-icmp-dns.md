@@ -203,6 +203,13 @@ Policy 只决定当前 DNS exchange，不改写后续业务动作。分类、属
 Regex selector 记录与业务规则共用 `regex::bytes::Regex`；其搜索缓存由正则库管理，
 可能分配 scratch 或发生缓存竞争，不承诺 DNS policy 正则搜索零分配。
 
+业务规则中的 DOMAIN-REGEX 与 classical rule-set 使用有界的独立复杂正则入口；GeoSite
+保留大小写敏感的线性入口。DNS 请求的 fake-IP filter、nameserver-policy、fallback domain
+及 respect-rules 出口共用执行预算，并跨 A/AAAA、别名、引导和并发上游候选保留。规则
+执行错误不选择默认上游、fallback、系统 DNS 或 synthetic IP，不写入缓存/域名提示；
+wire 查询返回 SERVFAIL，内部解析返回脱敏规则错误。嗅探计划的地址/force/skip 选择同样
+共享预算，错误关闭当前会话/数据报，不忽略该失败继续连接。
+
 ### 显式系统与 DHCP 来源
 
 App 通过运行时级 [`updateDnsNetwork`](invoke-api.md#updatednsnetwork) 提供完整网络快照，地址必须是字面 IP，接口必须精确。快照优先于 OS 发现，空数组明确撤销来源。替换时原子推进 DNS epoch 并清理全部角色的类型化/wire 缓存及 redir-host 提示；保留 fake-IP 映射和活跃流。旧查询可返回原调用者，但不能回填新网络缓存，新查询不加入旧 singleflight。DNS TCP 连接池按来源代次、接口和地址区分复用。

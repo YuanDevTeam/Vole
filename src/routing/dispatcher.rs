@@ -86,8 +86,13 @@ impl RoutingDns for RuntimeDns {
     }
 }
 
-fn runtime_dns_error(error: impl std::fmt::Display) -> DispatchError {
-    DispatchError::Other(format!("runtime DNS: {error}"))
+fn runtime_dns_error(error: crate::dns::runtime::RuntimeDnsError) -> DispatchError {
+    match error {
+        crate::dns::runtime::RuntimeDnsError::RuleEvaluation(failure) => {
+            DispatchError::RuleEvaluation(failure)
+        }
+        error => DispatchError::Other(format!("runtime DNS: {error}")),
+    }
 }
 
 /// Runtime registry for concrete proxy nodes.
@@ -343,12 +348,20 @@ impl RoutingDispatcher {
         Ok(())
     }
 
-    async fn resolve_addresses(&self, dns: &Arc<dyn RoutingDns>, host: &str) -> Vec<IpAddr> {
-        let mut addresses = dns.resolve(host).await.unwrap_or_default();
+    async fn resolve_addresses(
+        &self,
+        dns: &Arc<dyn RoutingDns>,
+        host: &str,
+    ) -> Result<Vec<IpAddr>, DispatchError> {
+        let mut addresses = match dns.resolve(host).await {
+            Ok(addresses) => addresses,
+            Err(error @ DispatchError::RuleEvaluation(_)) => return Err(error),
+            Err(_) => Vec::new(),
+        };
         if !self.ipv6 {
             addresses.retain(IpAddr::is_ipv4);
         }
-        addresses
+        Ok(addresses)
     }
 
     async fn route(
@@ -486,7 +499,10 @@ impl RoutingDispatcher {
                 ProgramEvaluation::NeedsIpResolution(cursor) => {
                     let addresses = match (destination, &self.dns) {
                         (Destination::Domain { host, .. }, Some(dns)) => {
-                            self.resolve_addresses(dns, host).await
+                            context
+                                .decision()
+                                .scope(self.resolve_addresses(dns, host))
+                                .await?
                         }
                         _ => Vec::new(),
                     };
@@ -503,6 +519,9 @@ impl RoutingDispatcher {
             };
         if let Some(error) = selection_error {
             return Err(error);
+        }
+        if let ProgramEvaluation::Failed(failure) = evaluation {
+            return Err(DispatchError::RuleEvaluation(failure));
         }
         let ProgramEvaluation::Matched(rule_match) = evaluation else {
             return Err(DispatchError::Other(
@@ -723,8 +742,10 @@ impl Dispatcher for RoutingDispatcher {
         &self,
         source: SocketAddr,
         destination: &Destination,
-    ) -> Option<crate::sniffing::Plan> {
-        let policy = self.sniffer.as_ref()?;
+    ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
+        let Some(policy) = self.sniffer.as_ref() else {
+            return Ok(None);
+        };
         let (host, mapped) = match destination {
             Destination::Domain { host, .. } => (Some(host.clone()), false),
             Destination::Ip(address) => {
@@ -745,7 +766,12 @@ impl Dispatcher for RoutingDispatcher {
                 }
             }
         };
-        Some(policy.plan(source, destination, host.as_deref(), mapped))
+        Ok(Some(policy.plan(
+            source,
+            destination,
+            host.as_deref(),
+            mapped,
+        )?))
     }
 
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
@@ -1237,7 +1263,7 @@ impl RoutedDatagramTransport {
                     .dns
                     .as_ref()
                     .ok_or(DispatchError::HostUnreachable)?;
-                let addresses = self.router.resolve_addresses(dns, host).await;
+                let addresses = self.router.resolve_addresses(dns, host).await?;
                 decision.destination = Destination::Ip(SocketAddr::new(
                     preferred_address(&addresses).ok_or(DispatchError::HostUnreachable)?,
                     *port,
@@ -1505,7 +1531,7 @@ impl RoutedDatagramTransport {
                         .dns
                         .as_ref()
                         .ok_or(DispatchError::HostUnreachable)?;
-                    let addresses = self.router.resolve_addresses(dns, &host).await;
+                    let addresses = self.router.resolve_addresses(dns, &host).await?;
                     SocketAddr::new(
                         preferred_address(&addresses).ok_or(DispatchError::HostUnreachable)?,
                         port,

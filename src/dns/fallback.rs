@@ -12,8 +12,13 @@ impl Filter {
             domains: super::fake_ip::DomainFilter::new(&config.domains),
         }
     }
-    pub(crate) fn domain(&self, host: &str, geo: &dyn GeoMatcher) -> bool {
-        self.domains.matches(host, geo)
+    pub(crate) fn domain(
+        &self,
+        host: &str,
+        geo: &dyn GeoMatcher,
+        decision: &crate::config::RuleDecision,
+    ) -> Result<bool, crate::config::MatchFailure> {
+        self.domains.matches(host, geo, decision)
     }
     pub(crate) fn address(&self, address: IpAddr, geo: &dyn GeoMatcher) -> bool {
         if self.config.ipcidr.iter().any(|cidr| cidr.contains(address)) {

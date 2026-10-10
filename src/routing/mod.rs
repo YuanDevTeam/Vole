@@ -1,4 +1,4 @@
-//! Allocation-free runtime matching for Vole routing rules.
+//! Bounded runtime matching for Vole routing rules.
 //!
 //! Rule parsing and structural validation belong to [`crate::config`]. This
 //! module performs a second, deliberately small compilation step: textual
@@ -40,7 +40,7 @@ pub const MAX_ROUTING_RULES: usize = crate::config::MAX_RULES;
 pub const MAX_RULE_TEXT_BYTES: usize = crate::config::MAX_RULES_TOTAL_BYTES;
 
 /// A prepared routing context. Domain normalization happens only while this
-/// value is built; matching the context does not allocate.
+/// value is built; clones and lazy-DNS continuations share its execution budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingContext {
     network: Network,
@@ -53,9 +53,17 @@ pub struct RoutingContext {
     destination_ip: Option<IpAddr>,
     pinned_ip: Option<IpAddr>,
     ip_resolution_unavailable: bool,
+    decision: crate::config::RuleDecision,
 }
 
 impl RoutingContext {
+    pub(crate) fn with_decision(mut self, decision: &crate::config::RuleDecision) -> Self {
+        self.decision = decision.clone();
+        self
+    }
+    pub(crate) fn decision(&self) -> &crate::config::RuleDecision {
+        &self.decision
+    }
     pub(crate) fn set_sniffed_domain(&mut self, host: &str) {
         if let Ok(host) = normalize_domain_name(host) {
             self.normalized_domain = Some(Arc::from(host));
@@ -104,6 +112,7 @@ impl RoutingContext {
             destination_ip,
             pinned_ip: None,
             ip_resolution_unavailable: false,
+            decision: Default::default(),
         })
     }
 
@@ -275,6 +284,15 @@ pub trait GeoMatcher: Send + Sync {
     }
 
     fn matches_geosite(&self, code: &str, domain: &str) -> bool;
+    fn matches_geosite_bounded(
+        &self,
+        code: &str,
+        domain: &str,
+        decision: &crate::config::RuleDecision,
+    ) -> Result<bool, crate::config::MatchFailure> {
+        decision.visit()?;
+        Ok(self.matches_geosite(code, domain))
+    }
     fn matches_geoip(&self, code: &str, address: IpAddr) -> bool;
 }
 
@@ -312,6 +330,7 @@ pub enum RuleEvaluation {
     Matched(RuleMatch),
     NeedsIpResolution { rule_index: usize },
     NoMatch,
+    Failed(crate::config::MatchFailure),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,8 +506,8 @@ impl RuleSet {
         self.evaluate_with_geo(context, &EmptyGeoMatcher)
     }
 
-    /// Evaluates from top to bottom and stops at the first match. Rule traversal
-    /// does not allocate; GeoSite regexes may allocate internal search caches.
+    /// Evaluates from top to bottom and stops at the first match. Regular-expression
+    /// engines may allocate internal search state; execution failure is explicit.
     #[must_use]
     pub fn evaluate_with_geo(
         &self,
@@ -532,7 +551,8 @@ impl RuleSet {
 
     /// Continues evaluation at the IP rule which requested a bounded
     /// runtime-DNS result. Rules before `resolution_rule_index` have already
-    /// failed and are not revisited. This matches Mihomo's `no-resolve`
+    /// failed and are not revisited. Retain the original context to share the
+    /// remaining execution budget across this continuation. This matches Mihomo's `no-resolve`
     /// semantics: the flag prevents a rule from initiating DNS, while later
     /// `no-resolve` rules may still consume an address resolved by an earlier
     /// rule.
@@ -642,6 +662,9 @@ fn normalize_rule(
         RuleKind::IpAsn(value) | RuleKind::SrcIpAsn(value) => {
             *bytes = checked_text_bytes(*bytes, value.len())?;
         }
+        RuleKind::IpSuffix(value) | RuleKind::SrcIpSuffix(value) => {
+            *bytes = checked_text_bytes(*bytes, value.as_str().len())?;
+        }
         RuleKind::IpCidr(cidr) | RuleKind::SrcIpCidr(cidr) => {
             if !valid_cidr(cidr) {
                 return Err(RuleSetError::InvalidCidr { rule_index: index });
@@ -690,7 +713,9 @@ pub(crate) fn uses_destination_ip(rule: &RuleSpec) -> bool {
         RuleKind::RuleSet {
             content, source, ..
         } => !source && content.as_ref().is_some_and(|set| set.uses_ip()),
-        RuleKind::IpCidr(_) | RuleKind::GeoIp(_) | RuleKind::IpAsn(_) => true,
+        RuleKind::IpCidr(_) | RuleKind::IpSuffix(_) | RuleKind::GeoIp(_) | RuleKind::IpAsn(_) => {
+            true
+        }
         RuleKind::And(children) | RuleKind::Or(children) => {
             children.iter().any(uses_destination_ip)
         }
@@ -705,13 +730,25 @@ pub(crate) fn uses_destination_ip(rule: &RuleSpec) -> bool {
     }
 }
 
-// Err means this exact traversal requires one lazy DNS resolution. Short
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PredicateFailure {
+    NeedsIpResolution,
+    Evaluation(crate::config::MatchFailure),
+}
+impl From<crate::config::MatchFailure> for PredicateFailure {
+    fn from(error: crate::config::MatchFailure) -> Self {
+        Self::Evaluation(error)
+    }
+}
+
+// NeedsIpResolution means this exact traversal requires one lazy DNS resolution. Short
 // circuiting keeps later IP predicates from triggering unnecessary queries.
 pub(crate) fn matches_rule(
     rule: &RuleSpec,
     context: &RoutingContext,
     geo: &dyn GeoMatcher,
-) -> Result<bool, ()> {
+) -> Result<bool, PredicateFailure> {
+    context.decision.visit()?;
     let port_matches = |ranges: &[crate::config::PortRange], port| {
         ranges
             .iter()
@@ -734,14 +771,18 @@ pub(crate) fn matches_rule(
         RuleKind::DomainWildcard(value) => context
             .domain()
             .is_some_and(|domain| wildcard_matches(value, domain)),
-        RuleKind::DomainRegex(value) => context
-            .domain()
-            .is_some_and(|domain| value.is_match(domain)),
+        RuleKind::DomainRegex(value) => match context.domain() {
+            Some(domain) => value.is_match(domain, &context.decision)?,
+            None => false,
+        },
         RuleKind::GeoSite(code) => {
-            geo.geosite_available(code)
-                && context
-                    .domain()
-                    .is_some_and(|domain| geo.matches_geosite(code, domain))
+            if geo.geosite_available(code)
+                && let Some(domain) = context.domain()
+            {
+                geo.matches_geosite_bounded(code, domain, &context.decision)?
+            } else {
+                false
+            }
         }
         RuleKind::GeoIp(code) => {
             if !geoip_available(geo, code) {
@@ -749,7 +790,7 @@ pub(crate) fn matches_rule(
             } else if let Some(address) = context.effective_ip() {
                 matches_geoip(geo, code, address)
             } else if !rule.no_resolve && context.should_request_ip_resolution() {
-                return Err(());
+                return Err(PredicateFailure::NeedsIpResolution);
             } else {
                 false
             }
@@ -760,7 +801,7 @@ pub(crate) fn matches_rule(
             } else if let Some(address) = context.effective_ip() {
                 geo.matches_asn(payload, address)
             } else if !rule.no_resolve && context.should_request_ip_resolution() {
-                return Err(());
+                return Err(PredicateFailure::NeedsIpResolution);
             } else {
                 false
             }
@@ -775,11 +816,23 @@ pub(crate) fn matches_rule(
             if let Some(address) = context.effective_ip() {
                 cidr_contains(cidr, address)
             } else if !rule.no_resolve && context.should_request_ip_resolution() {
-                return Err(());
+                return Err(PredicateFailure::NeedsIpResolution);
             } else {
                 false
             }
         }
+        RuleKind::IpSuffix(value) => {
+            if let Some(address) = context.effective_ip() {
+                value.matches(address)
+            } else if !rule.no_resolve && context.should_request_ip_resolution() {
+                return Err(PredicateFailure::NeedsIpResolution);
+            } else {
+                false
+            }
+        }
+        RuleKind::SrcIpSuffix(value) => context
+            .source_ip
+            .is_some_and(|address| value.matches(address)),
         RuleKind::SrcGeoIp(code) => {
             geoip_available(geo, code)
                 && context

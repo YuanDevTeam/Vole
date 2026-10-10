@@ -30,36 +30,62 @@ impl Policy {
         destination: &Destination,
         host: Option<&str>,
         mapped: bool,
-    ) -> Plan {
+    ) -> Result<Plan, crate::config::MatchFailure> {
+        let decision = crate::config::RuleDecision::default();
         let snapshot = self.geo.routing_snapshot();
         let geo = snapshot.as_deref().unwrap_or(self.geo.as_ref());
-        let blocked = address_matches(&self.config.skip_src_address, source.ip(), geo)
-            || matches!(destination, Destination::Ip(address) if address_matches(&self.config.skip_dst_address, address.ip(), geo));
+        let blocked = address_matches(&self.config.skip_src_address, source.ip(), geo, &decision)?
+            || match destination {
+                Destination::Ip(address) => {
+                    address_matches(&self.config.skip_dst_address, address.ip(), geo, &decision)?
+                }
+                _ => false,
+            };
         let active = self.config.enable
             && !blocked
             && ((host.is_none() && self.config.parse_pure_ip)
                 || (mapped && self.config.force_dns_mapping)
-                || host.is_some_and(|host| self.force.matches(host, geo)));
-        Plan {
+                || match host {
+                    Some(host) => self.force.matches(host, geo, &decision)?,
+                    None => false,
+                });
+        Ok(Plan {
             policy: self.clone(),
             port: destination.port(),
             active,
-        }
+            decision,
+        })
     }
 }
-fn address_matches(rules: &[RuleSpec], ip: IpAddr, geo: &dyn GeoMatcher) -> bool {
+fn address_matches(
+    rules: &[RuleSpec],
+    ip: IpAddr,
+    geo: &dyn GeoMatcher,
+    decision: &crate::config::RuleDecision,
+) -> Result<bool, crate::config::MatchFailure> {
+    decision.visit()?;
     let destination = Destination::Ip(SocketAddr::new(ip, 1));
-    let context = RoutingContext::new(Network::Tcp, &destination).expect("literal destination");
-    rules.iter().any(|rule| {
-        if let RuleKind::RuleSet {
+    let context = RoutingContext::new(Network::Tcp, &destination)
+        .expect("literal destination")
+        .with_decision(decision);
+    for rule in rules {
+        let matched = if let RuleKind::RuleSet {
             content: Some(set), ..
         } = &rule.kind
         {
-            set.matches_ip(ip, geo)
+            set.matches_ip(ip, geo, decision)?
         } else {
-            crate::routing::matches_rule(rule, &context, geo).unwrap_or(false)
+            match crate::routing::matches_rule(rule, &context, geo) {
+                Ok(matched) => matched,
+                Err(crate::routing::PredicateFailure::NeedsIpResolution) => false,
+                Err(crate::routing::PredicateFailure::Evaluation(failure)) => return Err(failure),
+            }
+        };
+        if matched {
+            return Ok(true);
         }
-    })
+    }
+    Ok(false)
 }
 
 /// Per-request decision shared by the inbound adapters. A disabled plan performs no reads.
@@ -68,22 +94,33 @@ pub struct Plan {
     policy: Arc<Policy>,
     port: u16,
     active: bool,
+    decision: crate::config::RuleDecision,
 }
 impl Plan {
+    #[cfg(feature = "tun")]
+    pub(crate) fn with_cancellation(
+        self,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        self.decision.set_cancellation(cancellation);
+        self
+    }
     #[cfg(any(feature = "tun", test))]
     pub(crate) fn standalone(config: Arc<SnifferConfig>, port: u16) -> Self {
         Self {
             active: config.enable,
+            decision: Default::default(),
             port,
             policy: Policy::new(config, Arc::new(crate::routing::EmptyGeoMatcher)),
         }
     }
-    pub(crate) fn accepts(&self, host: &str) -> bool {
+    pub(crate) fn accepts(&self, host: &str) -> Result<bool, crate::config::MatchFailure> {
         let snapshot = self.policy.geo.routing_snapshot();
-        !self.policy.skip.matches(
+        Ok(!self.policy.skip.matches(
             host,
             snapshot.as_deref().unwrap_or(self.policy.geo.as_ref()),
-        )
+            &self.decision,
+        )?)
     }
     pub(crate) fn tcp_enabled(&self) -> bool {
         self.active
@@ -97,9 +134,10 @@ impl Plan {
         &self,
         reader: &mut R,
         session: &mut crate::session::StreamSession,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, crate::config::MatchFailure> {
+        self.decision.check()?;
         if !self.tcp_enabled() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         use crate::tcp_sniffer::{SniffOutcome, SniffProtocol, TcpSniffer};
         let protocols = [
@@ -117,7 +155,7 @@ impl Plan {
         .collect();
         let mut sniffer = TcpSniffer::with_protocols(protocols);
         if let Ok(SniffOutcome::Matched { protocol, domain }) = sniffer.sniff(reader).await
-            && self.accepts(&domain)
+            && self.accepts(&domain)?
         {
             let override_destination = match protocol {
                 SniffProtocol::Http => self.policy.config.http_override,
@@ -131,7 +169,7 @@ impl Plan {
             }
             session.sniffed_domain = Some(domain);
         }
-        sniffer.into_buffered()
+        Ok(sniffer.into_buffered())
     }
 }
 
@@ -174,20 +212,28 @@ sniffer:
         let policy = policy();
         let source = "198.51.100.1:8000".parse().unwrap();
         let destination = Destination::Ip("198.51.100.2:443".parse().unwrap());
-        assert!(!policy.plan(source, &destination, None, false).tcp_enabled());
+        assert!(
+            !policy
+                .plan(source, &destination, None, false)
+                .unwrap()
+                .tcp_enabled()
+        );
         assert!(
             policy
                 .plan(source, &destination, Some("mapped.example"), true)
+                .unwrap()
                 .tcp_enabled()
         );
         assert!(
             !policy
                 .plan(source, &destination, Some("fake.example"), false)
+                .unwrap()
                 .tcp_enabled()
         );
         assert!(
             policy
                 .plan(source, &destination, Some("api.force.example"), false)
+                .unwrap()
                 .tcp_enabled()
         );
         assert!(
@@ -198,6 +244,7 @@ sniffer:
                     Some("api.force.example"),
                     true
                 )
+                .unwrap()
                 .tcp_enabled()
         );
         assert!(
@@ -208,6 +255,7 @@ sniffer:
                     Some("api.force.example"),
                     true
                 )
+                .unwrap()
                 .tcp_enabled()
         );
     }
@@ -216,7 +264,9 @@ sniffer:
         let policy = policy();
         let destination = Destination::Ip("198.51.100.2:443".parse().unwrap());
         let source = "198.51.100.1:8000".parse().unwrap();
-        let plan = policy.plan(source, &destination, Some("api.force.example"), false);
+        let plan = policy
+            .plan(source, &destination, Some("api.force.example"), false)
+            .unwrap();
         for (mut input, host, overridden) in [
             (
                 b"GET / HTTP/1.1\r\nHost: http.example\r\n\r\n".to_vec(),
@@ -243,7 +293,7 @@ sniffer:
                 destination: destination.clone(),
                 sniffed_domain: None,
             };
-            let prefix = plan.sniff(&mut reader, &mut session).await;
+            let prefix = plan.sniff(&mut reader, &mut session).await.unwrap();
             assert_eq!([prefix.as_slice(), reader].concat(), input);
             assert_eq!(session.sniffed_domain.as_deref(), host);
             if overridden {

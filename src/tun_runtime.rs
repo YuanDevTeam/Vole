@@ -731,15 +731,18 @@ async fn relay_tcp(
         destination: Destination::Ip(destination),
         sniffed_domain: None,
     };
-    let plan = dispatcher
+    let plan = match dispatcher
         .sniff_plan(session.source, &session.destination)
         .await
-        .or_else(|| {
-            sniffer.map(|config| crate::sniffing::Plan::standalone(config, destination_port))
-        });
+    {
+        Ok(plan) => plan,
+        Err(_) => return,
+    }
+    .or_else(|| sniffer.map(|config| crate::sniffing::Plan::standalone(config, destination_port)));
     let prefetched = if let Some(plan) = plan {
+        let plan = plan.with_cancellation(cancellation.clone());
         tokio::select! { biased; () = cancellation.cancelled() => return,
-        bytes = plan.sniff(&mut inbound, &mut session) => bytes }
+        bytes = plan.sniff(&mut inbound, &mut session) => match bytes { Ok(bytes) => bytes, Err(_) => return } }
     } else {
         Vec::new()
     };
@@ -1058,7 +1061,9 @@ impl UdpIngress {
                 tracing::debug!(%error, "dropping invalid TUN DNS datagram");
                 return;
             }
-            let permit = dns.begin_query();
+            let permit = dns
+                .begin_query()
+                .with_cancellation(self.cancellation.clone());
             let request = UdpDatagram::new(
                 datagram.source,
                 datagram.destination,
@@ -1903,14 +1908,14 @@ async fn send_tun_udp_datagram(
         .dispatcher
         .sniff_plan(context.source, &Destination::Ip(datagram.destination))
         .await
+        .map_err(dispatch_to_io)?
         .or_else(|| {
             context.sniffer.clone().map(|config| {
                 crate::sniffing::Plan::standalone(config, datagram.destination.port())
             })
         })
-        && sniffed_domain
-            .as_ref()
-            .is_some_and(|host| !plan.accepts(host))
+        && let Some(host) = sniffed_domain.as_ref()
+        && !plan.accepts(host).map_err(io::Error::other)?
     {
         sniffed_domain = None;
     }
@@ -2035,6 +2040,7 @@ where
                     .dispatcher
                     .sniff_plan(context.source, &Destination::Ip(datagram.destination))
                     .await
+                    .map_err(dispatch_to_io)?
                 {
                     plan.quic_enabled()
                 } else {
@@ -2134,6 +2140,7 @@ fn dispatch_to_io(error: DispatchError) -> io::Error {
         DispatchError::ConnectionRefused => io::Error::from(io::ErrorKind::ConnectionRefused),
         DispatchError::TimedOut => io::Error::from(io::ErrorKind::TimedOut),
         DispatchError::Other(message) => io::Error::other(message),
+        DispatchError::RuleEvaluation(failure) => io::Error::other(failure),
     }
 }
 

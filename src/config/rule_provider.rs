@@ -157,7 +157,7 @@ impl RuleCollection {
         geo: &dyn GeoMatcher,
         no_resolve: bool,
         source: bool,
-    ) -> std::result::Result<bool, ()> {
+    ) -> std::result::Result<bool, crate::routing::PredicateFailure> {
         match self.behavior {
             RuleBehavior::Domain => Ok(context
                 .domain()
@@ -170,7 +170,7 @@ impl RuleCollection {
                 };
                 let Some(ip) = ip else {
                     return if !source && !no_resolve && context.should_request_ip_resolution() {
-                        Err(())
+                        Err(crate::routing::PredicateFailure::NeedsIpResolution)
                     } else {
                         Ok(false)
                     };
@@ -197,42 +197,76 @@ impl RuleCollection {
             }
         }
     }
-    pub(crate) fn matches_ip(&self, address: std::net::IpAddr, geo: &dyn GeoMatcher) -> bool {
+    pub(crate) fn matches_ip(
+        &self,
+        address: std::net::IpAddr,
+        geo: &dyn GeoMatcher,
+        decision: &super::RuleDecision,
+    ) -> std::result::Result<bool, super::MatchFailure> {
+        decision.visit()?;
         let destination = crate::session::Destination::Ip(std::net::SocketAddr::new(address, 1));
-        let context = RoutingContext::new(Network::Tcp, &destination).expect("literal address");
-        if self.behavior == RuleBehavior::Classical {
-            self.classical.iter().any(|rule| {
-                matches!(
-                    rule.kind,
-                    RuleKind::IpCidr(_) | RuleKind::GeoIp(_) | RuleKind::IpAsn(_)
-                ) && crate::routing::matches_rule(rule, &context, geo).unwrap_or(false)
-            })
-        } else {
-            self.matches(&context, geo, true, false).unwrap_or(false)
-        }
+        let context = RoutingContext::new(Network::Tcp, &destination)
+            .expect("literal address")
+            .with_decision(decision);
+        self.matches_selected(&context, geo, |kind| {
+            matches!(
+                kind,
+                RuleKind::IpCidr(_)
+                    | RuleKind::IpSuffix(_)
+                    | RuleKind::GeoIp(_)
+                    | RuleKind::IpAsn(_)
+            )
+        })
     }
-    pub(crate) fn matches_domain(&self, domain: &str, geo: &dyn GeoMatcher) -> bool {
+    pub(crate) fn matches_domain(
+        &self,
+        domain: &str,
+        geo: &dyn GeoMatcher,
+        decision: &super::RuleDecision,
+    ) -> std::result::Result<bool, super::MatchFailure> {
+        decision.visit()?;
         let Ok(destination) = crate::session::Destination::domain(domain, 53) else {
-            return false;
+            return Ok(false);
         };
         let Ok(context) = RoutingContext::new(Network::Tcp, &destination) else {
-            return false;
+            return Ok(false);
         };
-        // DNS policy uses domain predicates only, never port/IP/source criteria.
+        let context = context.with_decision(decision);
+        // DNS selectors consume domain predicates only, never port/IP/source criteria.
+        self.matches_selected(&context, geo, |kind| {
+            matches!(
+                kind,
+                RuleKind::Domain(_)
+                    | RuleKind::DomainSuffix(_)
+                    | RuleKind::DomainKeyword(_)
+                    | RuleKind::DomainWildcard(_)
+                    | RuleKind::DomainRegex(_)
+                    | RuleKind::GeoSite(_)
+            )
+        })
+    }
+    fn matches_selected(
+        &self,
+        context: &RoutingContext,
+        geo: &dyn GeoMatcher,
+        selects: impl Fn(&RuleKind) -> bool,
+    ) -> std::result::Result<bool, super::MatchFailure> {
+        use crate::routing::PredicateFailure;
         if self.behavior == RuleBehavior::Classical {
-            self.classical.iter().any(|rule| {
-                matches!(
-                    rule.kind,
-                    RuleKind::Domain(_)
-                        | RuleKind::DomainSuffix(_)
-                        | RuleKind::DomainKeyword(_)
-                        | RuleKind::DomainWildcard(_)
-                        | RuleKind::DomainRegex(_)
-                        | RuleKind::GeoSite(_)
-                ) && crate::routing::matches_rule(rule, &context, geo).unwrap_or(false)
-            })
+            for rule in self.classical.iter().filter(|rule| selects(&rule.kind)) {
+                match crate::routing::matches_rule(rule, context, geo) {
+                    Ok(true) => return Ok(true),
+                    Ok(false) | Err(PredicateFailure::NeedsIpResolution) => {}
+                    Err(PredicateFailure::Evaluation(failure)) => return Err(failure),
+                }
+            }
+            Ok(false)
         } else {
-            self.matches(&context, geo, true, false).unwrap_or(false)
+            match self.matches(context, geo, true, false) {
+                Ok(matched) => Ok(matched),
+                Err(PredicateFailure::NeedsIpResolution) => Ok(false),
+                Err(PredicateFailure::Evaluation(failure)) => Err(failure),
+            }
         }
     }
 }
@@ -447,8 +481,16 @@ mod tests {
         .unwrap();
         for domain in ["abc.test", "no.test", "www.abc.test"] {
             assert_eq!(
-                mrs.matches_domain(domain, &crate::routing::EmptyGeoMatcher),
-                yaml.matches_domain(domain, &crate::routing::EmptyGeoMatcher)
+                mrs.matches_domain(
+                    domain,
+                    &crate::routing::EmptyGeoMatcher,
+                    &Default::default()
+                ),
+                yaml.matches_domain(
+                    domain,
+                    &crate::routing::EmptyGeoMatcher,
+                    &Default::default()
+                )
             );
         }
         let mut bytes = header(1);

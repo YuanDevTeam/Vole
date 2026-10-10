@@ -40,17 +40,38 @@ impl DomainFilter {
             selectors: selectors.to_vec(),
         }
     }
-    pub(crate) fn matches(&self, host: &str, geo: &dyn GeoMatcher) -> bool {
-        self.index.find(0, host).is_some()
-            || self.selectors.iter().any(|selector| match selector {
-                DnsPolicySelector::GeoSite(codes) => codes
-                    .iter()
-                    .any(|code| geo.geosite_available(code) && geo.matches_geosite(code, host)),
-                DnsPolicySelector::RuleSets { sets, .. } => {
-                    sets.iter().any(|set| set.matches_domain(host, geo))
+    pub(crate) fn matches(
+        &self,
+        host: &str,
+        geo: &dyn GeoMatcher,
+        decision: &crate::config::RuleDecision,
+    ) -> Result<bool, crate::config::MatchFailure> {
+        decision.visit()?;
+        if self.index.find(0, host).is_some() {
+            return Ok(true);
+        }
+        for selector in &self.selectors {
+            match selector {
+                DnsPolicySelector::GeoSite(codes) => {
+                    for code in codes {
+                        if geo.geosite_available(code)
+                            && geo.matches_geosite_bounded(code, host, decision)?
+                        {
+                            return Ok(true);
+                        }
+                    }
                 }
-                _ => false,
-            })
+                DnsPolicySelector::RuleSets { sets, .. } => {
+                    for set in sets {
+                        if set.matches_domain(host, geo, decision)? {
+                            return Ok(true);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
     }
 }
 pub(crate) struct Filter {
@@ -64,36 +85,50 @@ impl Filter {
             domains: DomainFilter::new(&config.filter),
         }
     }
-    pub(crate) fn skips(&self, host: &str, geo: &dyn GeoMatcher) -> bool {
+    pub(crate) fn skips(
+        &self,
+        host: &str,
+        geo: &dyn GeoMatcher,
+        decision: &crate::config::RuleDecision,
+    ) -> Result<bool, crate::config::MatchFailure> {
+        decision.visit()?;
         if self.config.mode == FakeIpFilterMode::Rule {
             let destination = Destination::Domain {
                 host: host.to_owned(),
                 port: 53,
             };
             let Ok(context) = RoutingContext::new(Network::Tcp, &destination) else {
-                return true;
+                return Ok(true);
             };
-            return self
-                .config
-                .rules
-                .iter()
-                .find(|rule| {
-                    if let RuleKind::RuleSet {
-                        content: Some(set), ..
-                    } = &rule.kind
-                    {
-                        return set.matches_domain(host, geo);
+            let mut context = context.with_decision(decision);
+            context.disable_ip_resolution();
+            for rule in &self.config.rules {
+                let matched = if let RuleKind::RuleSet {
+                    content: Some(set), ..
+                } = &rule.kind
+                {
+                    set.matches_domain(host, geo, decision)?
+                } else {
+                    match crate::routing::matches_rule(rule, &context, geo) {
+                        Ok(matched) => matched,
+                        Err(crate::routing::PredicateFailure::NeedsIpResolution) => false,
+                        Err(crate::routing::PredicateFailure::Evaluation(failure)) => {
+                            return Err(failure);
+                        }
                     }
-                    crate::routing::matches_rule(rule, &context, geo).unwrap_or(false)
-                })
-                .is_some_and(|rule| rule.action == RuleAction::Direct);
+                };
+                if matched {
+                    return Ok(rule.action == RuleAction::Direct);
+                }
+            }
+            return Ok(false);
         }
-        let matched = self.domains.matches(host, geo);
-        if self.config.mode == FakeIpFilterMode::Whitelist {
+        let matched = self.domains.matches(host, geo, decision)?;
+        Ok(if self.config.mode == FakeIpFilterMode::Whitelist {
             !matched
         } else {
             matched
-        }
+        })
     }
 }
 

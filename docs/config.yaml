@@ -714,16 +714,27 @@ dns:
 # rules 可省略或为空；rule 模式按顺序首条命中，未命中 DIRECT。MATCH 可放在任意
 # 位置，普通目标命中后其后规则不再执行。DIRECT、REJECT 是内置出口，其他出口精确引用节点或组。
 # 支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、DOMAIN-WILDCARD、DOMAIN-REGEX、
-# GEOSITE、GEOIP、SRC-GEOIP、IP-ASN、SRC-IP-ASN、IP-CIDR、IP-CIDR6、SRC-IP-CIDR、DST-PORT、SRC-PORT、NETWORK、
+# GEOSITE、GEOIP、SRC-GEOIP、IP-ASN、SRC-IP-ASN、IP-CIDR、IP-CIDR6、SRC-IP-CIDR、
+# IP-SUFFIX、SRC-IP-SUFFIX、DST-PORT、SRC-PORT、NETWORK、
 # IN-TYPE、IN-USER、IN-PORT、RULE-SET、SUB-RULE、AND/OR/NOT 和 MATCH。来源信息来自实际入站会话。
-# CIDR 两种别名都按 payload 实际地址族解析；GEOIP/IP-ASN/CIDR/RULE-SET 可追加 src，自动禁止 DNS。
+# CIDR 两种别名都按 payload 实际地址族解析；GEOIP/IP-ASN/CIDR/IP-SUFFIX/RULE-SET 可追加 src，自动禁止 DNS。
+# IP-SUFFIX 的 address/bits 比较低 bits 位，保留原地址，按 IPv4/IPv6 分族；0 位匹配同族全部。
+# SRC-IP-SUFFIX 只使用真实来源地址；目的后缀支持 no-resolve，并复用既有惰性 DNS 结果。
 # RULE-SET 的 src 在局部视图交换源/目标 IP 与端口，保留域名、入口类型和身份。
 # IN-TYPE 为 / 分隔的 Mihomo 类型名，大小写无关，SOCKS 展开为 SOCKS4/SOCKS5；
 # IN-USER 为 / 分隔、区分大小写的已认证用户名。两种列表逐项 trim，空项报错。
 # IN-PORT/DST-PORT/SRC-PORT 为 uint16 端口或范围，/ 分隔，含 0，逆序范围归一，
 # 最多 28 段；分隔中的空段跳过。真实入口和服务器端口仍须非零。
-# 通配符 * 匹配任意长度、? 匹配一个字符；DOMAIN-REGEX 忽略大小写，支持 regex crate
-# 子集，不支持 lookaround/backreference，无法编译的模式明确报错。
+# 通配符 * 匹配任意长度、? 匹配一个字符；DOMAIN-REGEX 默认忽略大小写，普通表达式走线性引擎。
+# 有限复杂语法支持前向正/负断言、固定宽度后向断言、数字及 ASCII 命名 backreference、原子组，
+# 命名捕获支持 (?<name>...) 与 (?'name'...)；引用支持 \k<name> 与 \k'name'。
+# 不支持递归、条件/平衡组、possessive quantifier、变长后向断言或混合捕获的数字引用；
+# 此有限方言不保证全部 regexp2/.NET Unicode、锚点或捕获语义等价。无法编译或越界明确报错。
+# 每模式限制 4 KiB、512 AST 节点/32 层、有限重复 1024，委托编译/搜索缓存有近似大小边界。
+# 一次决策跨逻辑/子规则、classical provider、候选地址和 DNS 续跑共享 sticky 执行预算：
+# 每次复杂匹配预留 2049 回溯额度，总共 65536；所有谓词及正则共同消费 64 Mi work units；
+# 累计实际正则调用耗时上限 2 ms，DNS 等待不计入。时间/取消仅在同步引擎调用前后检查，
+# 不能中途抢占或保证严格 2 ms/Stop 上界。执行失败终止当前决策，不视作未匹配或 DIRECT。
 # 逻辑规则例如 AND,((DOMAIN-SUFFIX,example.com),(SRC-PORT,1000-2000)),DIRECT；
 # NOT 恰好一个子规则，逻辑最多嵌套 32 层。主列表与所有 sub-rules 共用 65536 条、
 # 单条 16 KiB、文本合计 8 MiB 的预算；子规则名计入文本。子规则调用最多 32 层，

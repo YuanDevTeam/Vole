@@ -216,11 +216,14 @@ impl Socks5Handler {
             let sniff = dispatcher
                 .sniff_plan(peer, &session.destination)
                 .await
+                .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?
                 .filter(|plan| plan.tcp_enabled());
             let acknowledged = sniff.is_some();
             let prefix = if let Some(plan) = sniff {
                 timed(handshake::reply(&mut stream, 0, None)).await?;
-                plan.sniff(&mut stream, &mut session).await
+                plan.sniff(&mut stream, &mut session)
+                    .await
+                    .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?
             } else {
                 Vec::new()
             };

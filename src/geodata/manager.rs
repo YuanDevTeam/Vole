@@ -141,6 +141,17 @@ impl GeoMatcher for DynamicGeoData {
         self.current.load().matches_geosite(code, domain)
     }
 
+    fn matches_geosite_bounded(
+        &self,
+        code: &str,
+        domain: &str,
+        decision: &crate::config::RuleDecision,
+    ) -> Result<bool, crate::config::MatchFailure> {
+        self.current
+            .load()
+            .matches_geosite_bounded(code, domain, decision)
+    }
+
     fn matches_geoip(&self, code: &str, address: IpAddr) -> bool {
         self.current.load().matches_geoip(code, address)
     }

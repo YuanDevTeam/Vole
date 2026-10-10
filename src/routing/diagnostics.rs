@@ -194,6 +194,8 @@ fn rule_description(rule: &RuleKind) -> (&'static str, String) {
         ),
         RuleKind::InUsers(users) => ("InUser", users.join("/")),
         RuleKind::RuleSet { name, .. } => ("RuleSet", name.clone()),
+        RuleKind::IpSuffix(value) => ("IPSuffix", value.as_str().into()),
+        RuleKind::SrcIpSuffix(value) => ("SrcIPSuffix", value.as_str().into()),
         RuleKind::IpCidr(cidr) => ("IPCIDR", format!("{}/{}", cidr.network, cidr.prefix_len)),
         RuleKind::SrcIpCidr(cidr) => ("SrcIPCIDR", format!("{}/{}", cidr.network, cidr.prefix_len)),
         RuleKind::SrcPorts(ports) | RuleKind::DstPorts(ports) | RuleKind::InPorts(ports) => (

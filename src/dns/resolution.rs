@@ -197,121 +197,142 @@ impl ResolutionContext {
             .await
     }
 
-    async fn resolve_addresses_via(
-        &self,
-        target: &Destination,
+    fn resolve_addresses_via<'a>(
+        &'a self,
+        target: &'a Destination,
         deadline: Instant,
         proxy: bool,
-        node_dns: Option<&RuntimeDns>,
-    ) -> Result<Vec<SocketAddr>, DispatchError> {
-        let deadline = inherited_deadline(deadline);
-        if deadline <= Instant::now() {
-            return Err(DispatchError::TimedOut);
-        }
-        if self
-            .inner
-            .as_ref()
-            .is_some_and(|inner| inner.cancel.is_cancelled())
-        {
-            return Err(DispatchError::NotAllowed);
-        }
-        if let Destination::Ip(address) = target {
-            if !self.ip_version.permits(address.ip())
-                || address.port() == 0
-                || (address.is_ipv6() && self.inner.as_ref().is_some_and(|inner| !inner.ipv6))
-            {
-                return Err(DispatchError::HostUnreachable);
+        node_dns: Option<&'a RuntimeDns>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<SocketAddr>, DispatchError>> + Send + 'a>,
+    > {
+        // Erase this future at the resolver boundary: DNS transports may resolve
+        // their own endpoints through the same context.
+        Box::pin(async move {
+            let deadline = inherited_deadline(deadline);
+            if deadline <= Instant::now() {
+                return Err(DispatchError::TimedOut);
             }
-            return Ok(vec![*address]);
-        }
-        let Destination::Domain { host, port } = target else {
-            unreachable!()
-        };
-        let host = canonicalize_name(host).map_err(|_| DispatchError::HostUnreachable)?;
-        let inner = self.inner.as_ref();
-        let source = inner.and_then(|inner| inner.source.get());
-        if node_dns.is_none() && source.is_none() {
-            return Err(unavailable());
-        }
-        let identity = node_dns.map_or_else(
-            || Arc::as_ptr(inner.unwrap()) as usize,
-            |dns| dns as *const RuntimeDns as usize,
-        );
-        let key = (identity, proxy, host.clone());
-        let mut active = ACTIVE.try_with(Clone::clone).unwrap_or(ActiveResolution {
-            deadline,
-            names: Vec::new(),
-        });
-        if active.names.contains(&key) {
-            return Err(DispatchError::Other("recursive DNS dependency".into()));
-        }
-        if active.names.len() >= MAX_RESOLUTION_DEPTH {
-            return Err(DispatchError::Other("DNS dependency depth exceeded".into()));
-        }
-        active.deadline = deadline;
-        active.names.push(key);
-        let _waiter = crate::resources::observation::track(
-            crate::resources::observation::ResourceKind::Waiter,
-        );
-        let lookup = async {
-            let addresses = if let Some(dns) = node_dns {
-                dns.resolve(&host)
-                    .await
-                    .map_err(|_| DispatchError::HostUnreachable)?
-                    .into_iter()
-                    .map(|ip| SocketAddr::new(ip, *port))
-                    .collect::<Vec<_>>()
-            } else {
-                match source.expect("checked resolver source") {
-                    Source::Runtime(dns) => {
-                        let dns = dns
-                            .as_ref()
-                            .and_then(Weak::upgrade)
-                            .ok_or_else(unavailable)?;
-                        if proxy {
-                            dns.resolve_proxy(&host).await
-                        } else {
-                            dns.resolve(&host).await
-                        }
-                        .map_err(|_| DispatchError::HostUnreachable)?
+            if self
+                .inner
+                .as_ref()
+                .is_some_and(|inner| inner.cancel.is_cancelled())
+            {
+                return Err(DispatchError::NotAllowed);
+            }
+            if let Destination::Ip(address) = target {
+                if !self.ip_version.permits(address.ip())
+                    || address.port() == 0
+                    || (address.is_ipv6() && self.inner.as_ref().is_some_and(|inner| !inner.ipv6))
+                {
+                    return Err(DispatchError::HostUnreachable);
+                }
+                return Ok(vec![*address]);
+            }
+            let Destination::Domain { host, port } = target else {
+                unreachable!()
+            };
+            let host = canonicalize_name(host).map_err(|_| DispatchError::HostUnreachable)?;
+            let inner = self.inner.as_ref();
+            let source = inner.and_then(|inner| inner.source.get());
+            if node_dns.is_none() && source.is_none() {
+                return Err(unavailable());
+            }
+            let identity = node_dns.map_or_else(
+                || Arc::as_ptr(inner.unwrap()) as usize,
+                |dns| dns as *const RuntimeDns as usize,
+            );
+            let key = (identity, proxy, host.clone());
+            let mut active = ACTIVE.try_with(Clone::clone).unwrap_or(ActiveResolution {
+                deadline,
+                names: Vec::new(),
+            });
+            if active.names.contains(&key) {
+                return Err(DispatchError::Other("recursive DNS dependency".into()));
+            }
+            if active.names.len() >= MAX_RESOLUTION_DEPTH {
+                return Err(DispatchError::Other("DNS dependency depth exceeded".into()));
+            }
+            active.deadline = deadline;
+            active.names.push(key);
+            let _waiter = crate::resources::observation::track(
+                crate::resources::observation::ResourceKind::Waiter,
+            );
+            let decision = crate::config::RuleDecision::default();
+            if let Some(inner) = inner {
+                decision.set_cancellation(inner.cancel.clone());
+            }
+            decision.set_deadline(deadline.into_std());
+            let lookup = async {
+                decision.check()?;
+                let addresses = if let Some(dns) = node_dns {
+                    dns.resolve(&host)
+                        .await
+                        .map_err(runtime_error)?
                         .into_iter()
                         .map(|ip| SocketAddr::new(ip, *port))
                         .collect::<Vec<_>>()
-                    }
-                    Source::Measurement(bootstrap) => {
-                        let resolved = bootstrap
-                            .resolve(&host, *port)
-                            .await
-                            .map_err(|_| DispatchError::HostUnreachable)?;
-                        if resolved.logical_host != host
-                            || resolved.port != *port
-                            || resolved
-                                .addresses
-                                .iter()
-                                .any(|address| address.port() != *port)
-                        {
-                            return Err(DispatchError::HostUnreachable);
+                } else {
+                    match source.expect("checked resolver source") {
+                        Source::Runtime(dns) => {
+                            let dns = dns
+                                .as_ref()
+                                .and_then(Weak::upgrade)
+                                .ok_or_else(unavailable)?;
+                            if proxy {
+                                dns.resolve_proxy(&host).await
+                            } else {
+                                dns.resolve(&host).await
+                            }
+                            .map_err(runtime_error)?
+                            .into_iter()
+                            .map(|ip| SocketAddr::new(ip, *port))
+                            .collect::<Vec<_>>()
                         }
-                        resolved.addresses
+                        Source::Measurement(bootstrap) => {
+                            let resolved = bootstrap
+                                .resolve(&host, *port)
+                                .await
+                                .map_err(|_| DispatchError::HostUnreachable)?;
+                            if resolved.logical_host != host
+                                || resolved.port != *port
+                                || resolved
+                                    .addresses
+                                    .iter()
+                                    .any(|address| address.port() != *port)
+                            {
+                                return Err(DispatchError::HostUnreachable);
+                            }
+                            resolved.addresses
+                        }
                     }
+                };
+                let mut addresses: Vec<_> = addresses
+                    .into_iter()
+                    .filter(|address| inner.is_none_or(|inner| inner.ipv6) || address.is_ipv4())
+                    .collect();
+                self.ip_version.order(&mut addresses);
+                if addresses.is_empty() {
+                    Err(DispatchError::HostUnreachable)
+                } else {
+                    Ok(addresses)
                 }
             };
-            let mut addresses: Vec<_> = addresses
-                .into_iter()
-                .filter(|address| inner.is_none_or(|inner| inner.ipv6) || address.is_ipv4())
-                .collect();
-            self.ip_version.order(&mut addresses);
-            if addresses.is_empty() {
-                Err(DispatchError::HostUnreachable)
-            } else {
-                Ok(addresses)
+            tokio::select! {
+                biased;
+                _ = async { if let Some(inner)=inner { inner.cancel.cancelled().await } else { std::future::pending::<()>().await } } => Err(DispatchError::NotAllowed),
+                result = timeout_at(deadline, decision.scope(ACTIVE.scope(active, lookup))) => result.unwrap_or(Err(DispatchError::TimedOut)),
             }
-        };
-        tokio::select! {
-            biased;
-            _ = async { if let Some(inner)=inner { inner.cancel.cancelled().await } else { std::future::pending::<()>().await } } => Err(DispatchError::NotAllowed),
-            result = timeout_at(deadline, ACTIVE.scope(active, lookup)) => result.unwrap_or(Err(DispatchError::TimedOut)),
+        })
+    }
+}
+
+fn runtime_error(error: super::runtime::RuntimeDnsError) -> DispatchError {
+    match error {
+        super::runtime::RuntimeDnsError::RuleEvaluation(failure) => {
+            DispatchError::RuleEvaluation(failure)
         }
+        _ => DispatchError::HostUnreachable,
     }
 }
 

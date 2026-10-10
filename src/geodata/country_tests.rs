@@ -90,7 +90,15 @@ fn country_mmdb_schemas_share_route_source_collection_and_fallback() {
                 crate::config::providers::RuleBehavior::Classical,
             )
             .unwrap();
-            assert!(collection.matches_ip(ip, snapshot.as_ref()));
+            assert!(
+                collection
+                    .matches_ip(
+                        ip,
+                        snapshot.as_ref(),
+                        &crate::config::RuleDecision::default()
+                    )
+                    .unwrap()
+            );
         }
         let other = "8000::1".parse().unwrap();
         assert!(snapshot.matches_geoip("us", other));

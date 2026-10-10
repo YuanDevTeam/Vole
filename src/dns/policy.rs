@@ -45,23 +45,37 @@ impl NameserverPolicies {
         name: &str,
         policies: &[DnsNameserverPolicy],
         geo: &dyn GeoMatcher,
-    ) -> Option<usize> {
-        self.0.iter().find_map(|step| match step {
-            PolicyStep::Domains(domains) => domains.find(0, name),
-            PolicyStep::RuleSet(index) => {
-                let DnsPolicySelector::RuleSets { sets, .. } = &policies[*index].selector else {
-                    unreachable!()
-                };
-                sets.iter()
-                    .any(|set| set.matches_domain(name, geo))
-                    .then_some(*index)
+        decision: &crate::config::RuleDecision,
+    ) -> Result<Option<usize>, crate::config::MatchFailure> {
+        decision.visit()?;
+        for step in &self.0 {
+            match step {
+                PolicyStep::Domains(domains) => {
+                    if let Some(index) = domains.find(0, name) {
+                        return Ok(Some(index));
+                    }
+                }
+                PolicyStep::RuleSet(index) => {
+                    let DnsPolicySelector::RuleSets { sets, .. } = &policies[*index].selector
+                    else {
+                        unreachable!()
+                    };
+                    for set in sets {
+                        if set.matches_domain(name, geo, decision)? {
+                            return Ok(Some(*index));
+                        }
+                    }
+                }
+                PolicyStep::GeoSite(index) => {
+                    for code in policies[*index].geosite_codes() {
+                        if geo.matches_geosite_bounded(code, name, decision)? {
+                            return Ok(Some(*index));
+                        }
+                    }
+                }
             }
-            PolicyStep::GeoSite(index) => policies[*index]
-                .geosite_codes()
-                .iter()
-                .any(|code| geo.matches_geosite(code, name))
-                .then_some(*index),
-        })
+        }
+        Ok(None)
     }
 }
 

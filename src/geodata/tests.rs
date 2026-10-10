@@ -1054,6 +1054,7 @@ fn geosite_byte_regex_preserves_search_classes_and_supported_flags() {
         (r"^\w+\.test$", "abc_42.test", "a-b.test"),
         (r"^\w+\.test$", "abc.test", "é.test"),
         (r"needle", "has-needle.example", "absent.example"),
+        (r"UPPER", "UPPER.example", "upper.example"),
         (r"(?i:FLAG)", "flag.example", "quiet.example"),
         (r"(?m:^line$)", "first\nline\nlast", "first\nnot-line\nlast"),
         (r"(?s:^a.b$)", "a\nb", "ab"),
@@ -1067,6 +1068,17 @@ fn geosite_byte_regex_preserves_search_classes_and_supported_flags() {
         let data =
             GeoData::load(dir.path(), &[rule(RuleKind::GeoSite("byte-regex".into()))]).unwrap();
         assert!(data.matches_geosite("byte-regex", matched), "{pattern}");
+        assert!(
+            data.matches_geosite_bounded("byte-regex", matched, &Default::default())
+                .unwrap(),
+            "{pattern}"
+        );
+        assert!(
+            !data
+                .matches_geosite_bounded("byte-regex", not_matched, &Default::default())
+                .unwrap(),
+            "{pattern}"
+        );
         assert!(
             !data.matches_geosite("byte-regex", not_matched),
             "{pattern}"

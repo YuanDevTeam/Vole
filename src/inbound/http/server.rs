@@ -298,11 +298,13 @@ where
         let sniff = dispatcher
             .sniff_plan(peer, &session.destination)
             .await
+            .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?
             .filter(|plan| plan.tcp_enabled());
         if let (Some(forward), Some(sniff)) = (&plan, &sniff) {
             let _prefix = sniff
                 .sniff(&mut forward.head.as_slice(), &mut session)
-                .await;
+                .await
+                .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?;
         }
         if plan.is_none()
             && let Some(sniff) = sniff
@@ -313,7 +315,10 @@ where
                 config.header_timeout,
             )
             .await?;
-            let prefix = sniff.sniff(reader, &mut session).await;
+            let prefix = sniff
+                .sniff(reader, &mut session)
+                .await
+                .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?;
             let mut outbound = timeout(config.connect_timeout, dispatcher.connect_tcp(session))
                 .await
                 .map_err(|_| {
@@ -593,7 +598,7 @@ fn dispatch_to_io(error: DispatchError) -> io::Error {
         DispatchError::HostUnreachable => io::ErrorKind::HostUnreachable,
         DispatchError::ConnectionRefused => io::ErrorKind::ConnectionRefused,
         DispatchError::TimedOut => io::ErrorKind::TimedOut,
-        DispatchError::Other(_) => io::ErrorKind::Other,
+        DispatchError::Other(_) | DispatchError::RuleEvaluation(_) => io::ErrorKind::Other,
     };
     io::Error::new(kind, error)
 }

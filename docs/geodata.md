@@ -206,6 +206,11 @@ Domain/Full 在加载时原地排序紧凑记录，运行时对完整名称及�
 不再承诺 Regex 热路径无分配。Domain/Full 的紧凑无分配查找保持不变。
 库的局部保护不是全部正则合计内存或整进程峰值的上界。
 
+GeoSite 正则保持上述大小写敏感的 Go/RE2 类行为，不使用 `DOMAIN-REGEX` 的默认 IgnoreCase
+或复杂引擎。业务规则、DNS selector、fake-IP filter 与嗅探决策把其线性搜索计入同一
+sticky 执行预算；预算失败向调用者传播，不能通过反选变为命中或默认直连。此预算限制
+单次决策的执行工作，不限制 GeoData 记录数量、加载量或资产总内存。
+
 ## GeoIP 与 `no-resolve`
 
 - 目标已经是 IP 时直接匹配同地址族 CIDR，`no-resolve` 不改变结果。
@@ -213,7 +218,8 @@ Domain/Full 在加载时原地排序紧凑记录，运行时对完整名称及�
 - 之后首条不带 `no-resolve` 的 IP 类规则最多触发一次运行时 DNS，结果只供当前和后续规则复用。
 - A 结果先于 AAAA；第一个命中 CIDR 的有效地址成为当前会话或数据报的固定目标。
 - `dns.ipv6: false` 时不请求或采用 AAAA。
-- 运行时 DNS 不可用或失败时继续下一条规则，不使用引导解析器替代。
+- 运行时 DNS 不可用或上游失败时继续下一条规则，不使用引导解析器替代；
+  规则执行预算、取消或引擎错误终止本次决策。
 - `GEOIP,!cn,...` 对同一次 CIDR 匹配结果取反，不执行反向 DNS。DAT 的 `reverse_match`
   字段按 Mihomo loader 行为接受但忽略；是否取反只由 selector 的前置 `!` 决定。
 

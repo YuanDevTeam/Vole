@@ -35,17 +35,21 @@ use uuid::Uuid;
 use crate::{Result, VoleError};
 
 mod dns;
+mod domain_regex;
 mod identity_files;
+mod ip_suffix;
 mod name_regex;
 mod override_expr;
 pub mod providers;
 mod rule_provider;
 pub(crate) mod rules;
+pub use domain_regex::{DomainRegex, MatchFailure, RuleDecision};
+pub use ip_suffix::IpSuffix;
 mod scalar;
 pub use rule_provider::RuleCollection;
 mod yaml;
+pub use rules::RuleInboundType;
 use rules::parse_rule;
-pub use rules::{DomainRegex, RuleInboundType};
 
 mod credentials;
 pub use credentials::{ProxyAccess, ProxyAccessRules, ProxyCredentials};
@@ -558,6 +562,7 @@ pub enum RuleKind {
     Or(Vec<RuleSpec>),
     Not(Box<RuleSpec>),
     SrcIpCidr(IpCidr),
+    SrcIpSuffix(IpSuffix),
     SrcPorts(Vec<PortRange>),
     GeoSite(String),
     GeoIp(String),
@@ -568,6 +573,7 @@ pub enum RuleKind {
     InUsers(Vec<String>),
     InPorts(Vec<PortRange>),
     IpCidr(IpCidr),
+    IpSuffix(IpSuffix),
     DstPorts(Vec<PortRange>),
     Network(Network),
     Match,

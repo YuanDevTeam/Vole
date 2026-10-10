@@ -604,9 +604,9 @@ impl Dispatcher for ProviderRuntime {
         &self,
         source: SocketAddr,
         destination: &Destination,
-    ) -> Option<crate::sniffing::Plan> {
+    ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
         if self.cancellation.is_cancelled() {
-            return None;
+            return Err(DispatchError::NotAllowed);
         }
         self.current
             .load_full()
@@ -655,7 +655,7 @@ impl Dispatcher for PinnedDispatcher {
         &self,
         source: SocketAddr,
         destination: &Destination,
-    ) -> Option<crate::sniffing::Plan> {
+    ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
         self.dispatcher.sniff_plan(source, destination).await
     }
 

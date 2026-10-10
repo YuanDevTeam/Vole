@@ -372,6 +372,21 @@ impl GeoMatcher for GeoData {
             .is_some_and(|category| !domain.is_empty() && category.matches_selector(code, domain))
     }
 
+    fn matches_geosite_bounded(
+        &self,
+        code: &str,
+        domain: &str,
+        decision: &crate::config::RuleDecision,
+    ) -> Result<bool, crate::config::MatchFailure> {
+        decision.visit()?;
+        match self.site_category(code) {
+            Some(category) if !domain.is_empty() => {
+                category.matches_selector_bounded(code, domain, Some(decision))
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn matches_geoip(&self, code: &str, address: IpAddr) -> bool {
         matches_lan(code, address).unwrap_or_else(|| {
             self.country.as_ref().map_or_else(
@@ -1065,23 +1080,38 @@ impl SiteCategory {
     }
 
     fn matches_selector(&self, selector: &str, domain: &str) -> bool {
+        self.matches_selector_bounded(selector, domain, None)
+            .expect("unbounded linear matching")
+    }
+
+    fn matches_selector_bounded(
+        &self,
+        selector: &str,
+        domain: &str,
+        decision: Option<&crate::config::RuleDecision>,
+    ) -> Result<bool, crate::config::MatchFailure> {
         let attributes = selector_attributes(selector);
         let filter = self
             .filters
             .iter()
             .find(|filter| filter.attributes.eq_ignore_ascii_case(attributes));
         let matched = if attributes.is_empty() {
-            self.matches(domain, &self.patterns, None)
+            self.matches(domain, &self.patterns, None, decision)?
         } else if let Some(filter) = filter {
             if filter.all_records {
-                self.matches(domain, &self.patterns, None)
+                self.matches(domain, &self.patterns, None, decision)?
             } else {
-                self.matches(domain, &filter.patterns, Some(&filter.regex_indices))
+                self.matches(
+                    domain,
+                    &filter.patterns,
+                    Some(&filter.regex_indices),
+                    decision,
+                )?
             }
         } else {
-            return false;
+            return Ok(false);
         };
-        matched != selector.starts_with('!')
+        Ok(matched != selector.starts_with('!'))
     }
 
     fn matches(
@@ -1089,18 +1119,22 @@ impl SiteCategory {
         domain: &str,
         patterns: &[SitePattern],
         regex_indices: Option<&[usize]>,
-    ) -> bool {
+        decision: Option<&crate::config::RuleDecision>,
+    ) -> Result<bool, crate::config::MatchFailure> {
         // The loader validates/normalizes each value once. Reuse the compact
         // ranges as a sorted index; a miss must not scan all Domain/Full records
         // for every UDP packet. Category membership is a union, not rule order.
+        if let Some(decision) = decision {
+            decision.visit()?;
+        }
         let bytes = domain.as_bytes();
         if self.contains(patterns, SitePatternKind::Full, bytes) {
-            return true;
+            return Ok(true);
         }
         let mut suffix = bytes;
         loop {
             if self.contains(patterns, SitePatternKind::Domain, suffix) {
-                return true;
+                return Ok(true);
             }
             let Some(dot) = suffix.iter().position(|byte| *byte == b'.') else {
                 break;
@@ -1111,20 +1145,36 @@ impl SiteCategory {
             .iter()
             .take_while(|pattern| pattern.kind == SitePatternKind::Substr)
         {
+            if let Some(decision) = decision {
+                decision.visit()?;
+            }
             let value = pattern.value(&self.values);
             if bytes.windows(value.len()).any(|window| window == value) {
-                return true;
+                return Ok(true);
             }
         }
         // The regex library owns its compiled representation and search cache;
         // matching is not guaranteed to be allocation-free on first use.
-        let matches_regex = |regex: &Regex| regex.is_match(domain.as_bytes());
-        match regex_indices {
-            Some(indices) => indices
-                .iter()
-                .any(|&index| matches_regex(&self.regexes[index])),
-            None => self.regexes.iter().any(matches_regex),
+        let matches_regex = |regex: &Regex| match decision {
+            Some(decision) => decision.linear(regex.as_str().len(), domain.len(), || {
+                regex.is_match(domain.as_bytes())
+            }),
+            None => Ok(regex.is_match(domain.as_bytes())),
+        };
+        if let Some(indices) = regex_indices {
+            for &index in indices {
+                if matches_regex(&self.regexes[index])? {
+                    return Ok(true);
+                }
+            }
+        } else {
+            for regex in &self.regexes {
+                if matches_regex(regex)? {
+                    return Ok(true);
+                }
+            }
         }
+        Ok(false)
     }
 }
 

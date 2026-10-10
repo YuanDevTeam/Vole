@@ -49,11 +49,13 @@ impl RuleCursor {
 pub(crate) enum ProgramEvaluation {
     Matched(RuleMatch),
     NeedsIpResolution(RuleCursor),
+    Failed(crate::config::MatchFailure),
 }
 
 impl ProgramEvaluation {
     pub(crate) fn into_public(self) -> RuleEvaluation {
         match self {
+            Self::Failed(failure) => RuleEvaluation::Failed(failure),
             Self::Matched(matched) => RuleEvaluation::Matched(matched),
             Self::NeedsIpResolution(cursor) => RuleEvaluation::NeedsIpResolution {
                 rule_index: cursor.root_index(),
@@ -79,6 +81,9 @@ impl RuleSet {
     ) -> ProgramEvaluation {
         let mut cursor = cursor.unwrap_or_else(|| RuleCursor::new(0));
         loop {
+            if let Err(failure) = context.decision().check() {
+                return ProgramEvaluation::Failed(failure);
+            }
             let frame = cursor.frames[cursor.depth];
             let rules = if frame.program == 0 {
                 &self.graph.main[..]
@@ -109,10 +114,20 @@ impl RuleSet {
                 && let Some(addresses) = addresses
                 && !addresses.is_empty()
             {
-                let found = preferred_addresses(addresses).find(|address| {
-                    candidate.pin_ip(*address);
-                    matches_rule(predicate, &candidate, geo).unwrap_or(false)
-                });
+                let mut found = None;
+                for address in preferred_addresses(addresses) {
+                    candidate.pin_ip(address);
+                    match matches_rule(predicate, &candidate, geo) {
+                        Ok(true) => {
+                            found = Some(address);
+                            break;
+                        }
+                        Ok(false) | Err(super::PredicateFailure::NeedsIpResolution) => {}
+                        Err(super::PredicateFailure::Evaluation(failure)) => {
+                            return ProgramEvaluation::Failed(failure);
+                        }
+                    }
+                }
                 if let Some(address) = found {
                     candidate.pin_ip(address);
                     true
@@ -125,7 +140,12 @@ impl RuleSet {
                 }
                 match matches_rule(predicate, &candidate, geo) {
                     Ok(matched) => matched,
-                    Err(()) => return ProgramEvaluation::NeedsIpResolution(cursor),
+                    Err(super::PredicateFailure::NeedsIpResolution) => {
+                        return ProgramEvaluation::NeedsIpResolution(cursor);
+                    }
+                    Err(super::PredicateFailure::Evaluation(failure)) => {
+                        return ProgramEvaluation::Failed(failure);
+                    }
                 }
             };
             if !matched {
@@ -342,5 +362,63 @@ mod tests {
             })
         );
         assert_eq!(context.pinned_ip(), None);
+    }
+    #[test]
+    fn suffix_rules_use_source_low_bits_and_resume_with_shared_provider_budget() {
+        let rules = compile(
+            "rules: ['SUB-RULE,(NETWORK,TCP),child', 'MATCH,REJECT']\nsub-rules: {child: ['AND,((SRC-IP-SUFFIX,192.0.2.19/5),(IP-SUFFIX,198.51.100.7/9)),DIRECT']}\n",
+        );
+        let mut context = self::context();
+        context.set_source("203.0.113.51:9000".parse().unwrap());
+        let cursor =
+            match rules.evaluate_program(&mut context, &EmptyGeoMatcher, None, None, |_, _| {
+                RuleTargetEffect::Accept
+            }) {
+                ProgramEvaluation::NeedsIpResolution(cursor) => cursor,
+                _ => panic!("destination suffix must request lazy DNS"),
+            };
+        let addresses = [
+            "203.0.113.8".parse().unwrap(),
+            "203.0.112.7".parse().unwrap(),
+        ];
+        assert!(matches!(
+            rules.evaluate_program(
+                &mut context,
+                &EmptyGeoMatcher,
+                Some(cursor),
+                Some(&addresses),
+                |_, _| RuleTargetEffect::Accept
+            ),
+            ProgramEvaluation::Matched(RuleMatch {
+                action: RuleAction::Direct,
+                ..
+            })
+        ));
+        assert_eq!(context.pinned_ip(), Some(addresses[1]));
+
+        // A classical provider spends most of the decision's complex quota before DNS.
+        let payload = vec!["DOMAIN-REGEX,(?=never)never"; 31];
+        let payload = serde_json::to_string(&payload).unwrap();
+        let rules = compile(&format!(
+            "rule-providers: {{patterns: {{type: inline, behavior: classical, payload: {payload}}}}}\nrules: ['RULE-SET,patterns,REJECT', 'IP-SUFFIX,192.0.2.19/5,REJECT', 'DOMAIN-REGEX,(?=never)never,REJECT', 'MATCH,DIRECT']\n"
+        ));
+        let mut context = self::context();
+        assert!(matches!(
+            rules.evaluate(&context),
+            RuleEvaluation::NeedsIpResolution { rule_index: 1 }
+        ));
+        assert_eq!(
+            rules.evaluate_with_resolved_ips(
+                &mut context,
+                &EmptyGeoMatcher,
+                1,
+                &["203.0.113.20".parse().unwrap()]
+            ),
+            RuleEvaluation::Failed(crate::config::MatchFailure::Budget)
+        );
+        assert_eq!(
+            rules.evaluate(&context),
+            RuleEvaluation::Failed(crate::config::MatchFailure::Budget)
+        );
     }
 }

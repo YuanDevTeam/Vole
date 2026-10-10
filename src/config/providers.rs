@@ -1206,7 +1206,14 @@ rules: ['RULE-SET,domains,choose', 'RULE-SET,custom,DIRECT,no-resolve']
         else {
             panic!("unbound set")
         };
-        assert!(set.matches_domain("sub.example.com", &crate::routing::EmptyGeoMatcher));
+        assert!(
+            set.matches_domain(
+                "sub.example.com",
+                &crate::routing::EmptyGeoMatcher,
+                &Default::default()
+            )
+            .unwrap()
+        );
         let DnsPolicySelector::RuleSets { sets, .. } = &config.dns.nameserver_policies[0].selector
         else {
             panic!("unbound policy")

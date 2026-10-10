@@ -1,32 +1,4 @@
-use regex::{Regex, RegexBuilder};
-
 use super::*;
-
-/// Compile once; equality continues to describe the configuration pattern.
-#[derive(Debug, Clone)]
-pub struct DomainRegex(Regex);
-
-impl PartialEq for DomainRegex {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.as_str() == other.0.as_str()
-    }
-}
-impl Eq for DomainRegex {}
-
-impl DomainRegex {
-    pub fn new(pattern: &str) -> Result<Self> {
-        RegexBuilder::new(pattern).case_insensitive(true).size_limit(MAX_CONFIG_BYTES)
-            .build().map(Self).map_err(|_| VoleError::InvalidConfig(
-                "DOMAIN-REGEX requires a valid supported regular expression; lookaround and backreferences are not supported".into()
-            ))
-    }
-    pub fn is_match(&self, domain: &str) -> bool {
-        self.0.is_match(domain)
-    }
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleInboundType {
@@ -359,7 +331,10 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
                 None => RuleAction::Direct,
             };
             let mut no_resolve = false;
-            let mut source = matches!(kind.as_str(), "SRC-GEOIP" | "SRC-IP-CIDR" | "SRC-IP-ASN");
+            let mut source = matches!(
+                kind.as_str(),
+                "SRC-GEOIP" | "SRC-IP-CIDR" | "SRC-IP-ASN" | "SRC-IP-SUFFIX"
+            );
             for option in fields {
                 if option == "no-resolve"
                     && matches!(
@@ -372,13 +347,15 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
                             | "SRC-IP-CIDR"
                             | "IP-ASN"
                             | "SRC-IP-ASN"
+                            | "IP-SUFFIX"
+                            | "SRC-IP-SUFFIX"
                     )
                 {
                     no_resolve = true;
                 } else if option == "src"
                     && matches!(
                         kind.as_str(),
-                        "RULE-SET" | "GEOIP" | "IP-CIDR" | "IP-CIDR6" | "IP-ASN"
+                        "RULE-SET" | "GEOIP" | "IP-CIDR" | "IP-CIDR6" | "IP-ASN" | "IP-SUFFIX"
                     )
                 {
                     source = true;
@@ -421,6 +398,14 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
                 RuleKind::SrcIpCidr(cidr)
             } else {
                 RuleKind::IpCidr(cidr)
+            }
+        }
+        "IP-SUFFIX" | "SRC-IP-SUFFIX" => {
+            let suffix = IpSuffix::parse(payload)?;
+            if source {
+                RuleKind::SrcIpSuffix(suffix)
+            } else {
+                RuleKind::IpSuffix(suffix)
             }
         }
         "DST-PORT" => RuleKind::DstPorts(parse_port_ranges(payload)?),

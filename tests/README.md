@@ -41,6 +41,10 @@ cargo test --locked --all-features --lib polled_datagram_
 cargo test --locked --all-features --lib managed_udp_connections_
 cargo test --locked --all-features --lib runtime::tests::controller_diagnostics_are_opt_in_for_business_routes
 cargo test --locked --all-features --lib subrule_
+cargo test --locked --lib config::domain_regex::tests::
+cargo test --locked --lib address_suffix_preserves_low_bits_and_address_family
+cargo test --locked --lib suffix_rules_use_source_low_bits_and_resume_with_shared_provider_budget
+cargo test --locked --lib rule_budget_propagates_through_fake_ip_policy_and_sniffer_without_egress
 cargo test --locked --all-features --lib ingress_
 cargo test --locked --all-features --lib routing::balance::tests::
 cargo test --locked --all-features --lib load_balance_routes_

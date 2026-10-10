@@ -187,14 +187,24 @@ pub(super) mod tests {
             assert_eq!(data, member);
             let rules =
                 RuleCollection::parse(&data, RuleBehavior::Ipcidr, RuleFormat::Mrs).unwrap();
-            assert!(rules.matches_ip(
-                "192.0.2.1".parse().unwrap(),
-                &crate::routing::EmptyGeoMatcher
-            ));
-            assert!(!rules.matches_ip(
-                "198.51.100.1".parse().unwrap(),
-                &crate::routing::EmptyGeoMatcher
-            ));
+            assert!(
+                rules
+                    .matches_ip(
+                        "192.0.2.1".parse().unwrap(),
+                        &crate::routing::EmptyGeoMatcher,
+                        &crate::config::RuleDecision::default(),
+                    )
+                    .unwrap()
+            );
+            assert!(
+                !rules
+                    .matches_ip(
+                        "198.51.100.1".parse().unwrap(),
+                        &crate::routing::EmptyGeoMatcher,
+                        &crate::config::RuleDecision::default(),
+                    )
+                    .unwrap()
+            );
             assert!(
                 decode_member(
                     Cursor::new(&wire),

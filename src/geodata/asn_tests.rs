@@ -116,7 +116,11 @@ rules:
         crate::config::providers::RuleBehavior::Classical,
     )
     .unwrap();
-    assert!(collection.matches_ip("1.0.0.1".parse().unwrap(), &data));
+    assert!(
+        collection
+            .matches_ip("1.0.0.1".parse().unwrap(), &data, &Default::default())
+            .unwrap()
+    );
     let nested = rule(RuleKind::Not(Box::new(rule(RuleKind::RuleSet {
         name: "local".into(),
         content: Some(Arc::new(collection)),

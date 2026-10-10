@@ -23,6 +23,8 @@ pub type BoxStream = Box<dyn AsyncStream>;
 pub enum DispatchError {
     #[error("connection is not allowed")]
     NotAllowed,
+    #[error("rule evaluation failed: {0}")]
+    RuleEvaluation(#[from] crate::config::MatchFailure),
     #[error("network is unreachable")]
     NetworkUnreachable,
     #[error("host is unreachable")]
@@ -40,6 +42,7 @@ impl DispatchError {
     pub const fn diagnostic_code(&self) -> &'static str {
         match self {
             Self::NotAllowed => "not_allowed",
+            Self::RuleEvaluation(_) => "rule_evaluation",
             Self::NetworkUnreachable => "network_unreachable",
             Self::HostUnreachable => "host_unreachable",
             Self::ConnectionRefused => "connection_refused",
@@ -134,8 +137,8 @@ pub trait Dispatcher: Send + Sync {
         &self,
         _source: std::net::SocketAddr,
         _destination: &crate::session::Destination,
-    ) -> Option<crate::sniffing::Plan> {
-        None
+    ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
+        Ok(None)
     }
 
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError>;
@@ -174,7 +177,7 @@ impl Dispatcher for SessionObservedDispatcher {
         &self,
         source: std::net::SocketAddr,
         destination: &crate::session::Destination,
-    ) -> Option<crate::sniffing::Plan> {
+    ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
         self.inner.sniff_plan(source, destination).await
     }
 
@@ -226,7 +229,7 @@ impl Dispatcher for HandshakeObservedDispatcher {
         &self,
         source: std::net::SocketAddr,
         destination: &crate::session::Destination,
-    ) -> Option<crate::sniffing::Plan> {
+    ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
         self.inner.sniff_plan(source, destination).await
     }
 

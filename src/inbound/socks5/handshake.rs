@@ -103,6 +103,6 @@ pub(super) fn status(error: &DispatchError) -> u8 {
         DispatchError::HostUnreachable => 4,
         DispatchError::ConnectionRefused => 5,
         DispatchError::TimedOut => 6,
-        DispatchError::Other(_) => 1,
+        DispatchError::Other(_) | DispatchError::RuleEvaluation(_) => 1,
     }
 }
