@@ -22,6 +22,7 @@ pub struct SingMuxConfig {
     pub max_streams: usize,
     pub padding: bool,
     pub only_tcp: bool,
+    pub statistic: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -41,6 +42,8 @@ pub(super) struct RawSingMux {
     padding: bool,
     #[serde(default)]
     only_tcp: bool,
+    #[serde(default)]
+    statistic: bool,
 }
 impl RawSingMux {
     pub(super) fn normalize(self) -> Result<Option<SingMuxConfig>> {
@@ -65,6 +68,7 @@ impl RawSingMux {
             max_streams: self.max_streams.max(0) as usize,
             padding: self.padding,
             only_tcp: self.only_tcp,
+            statistic: self.statistic,
         }))
     }
 }

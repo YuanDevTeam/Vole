@@ -101,6 +101,24 @@ impl AnyTlsOutbound {
         tls: Arc<dyn AnyTlsTlsConnector>,
         stream_buffer_capacity: usize,
     ) -> io::Result<Self> {
+        Self::with_session_options(
+            server,
+            upstream,
+            password,
+            tls,
+            stream_buffer_capacity,
+            crate::config::AnyTlsSessionOptions::default(),
+        )
+    }
+
+    pub fn with_session_options(
+        server: Destination,
+        upstream: UpstreamPath,
+        password: impl Into<String>,
+        tls: Arc<dyn AnyTlsTlsConnector>,
+        stream_buffer_capacity: usize,
+        options: crate::config::AnyTlsSessionOptions,
+    ) -> io::Result<Self> {
         if server.port() == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -114,7 +132,7 @@ impl AnyTlsOutbound {
         });
         let password = password.into();
         Ok(Self {
-            client: AnyTlsClient::new(dialer, &password, stream_buffer_capacity)?,
+            client: AnyTlsClient::with_options(dialer, &password, stream_buffer_capacity, options)?,
         })
     }
 

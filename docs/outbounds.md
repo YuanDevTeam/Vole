@@ -55,10 +55,11 @@ TCP 保留域名交由上游解析；UDP 由控制连接拥有，校验 relay �
 支持 v2、兼容 v1 的会话、内置填充与 UoT v2。password 为 1–1024 UTF-8 字节；
 SNI 默认 server；ALPN 省略/空列表不发送，非空保持顺序，不强制选中某协议。
 支持独立的 `name-cert-verify` 和成对内联 PEM 或文件路径 `certificate/private-key` 客户端身份；
-不开放 TLS 版本、ECH、REALITY、填充和会话参数。命名指纹沿用共享 TLS。
+不开放 TLS 版本、ECH、REALITY 和填充参数。命名指纹沿用共享 TLS。
 
 连接先发送 SHA-256 密码摘要、认证填充和首个会话批次。Settings 固定声明 v=2 和
-填充方案 MD5，不附产品/版本标识；合法 ServerSettings v>=2 启用 v2，否则兼容 v1。
+填充方案 MD5，`client-metadata` 原样写入 client 值，缺省为空，不自行填产品/版本标识；
+metadata 不含换行且须适合 u16 Settings 帧。合法 ServerSettings v>=2 启用 v2，否则兼容 v1。
 首个流与认证批次一起发送。复用空闲会话时，v2 写 SYN 和目标后即返回流，再监视
 最长 3 秒 SYNACK；v1 不等待。非空 SYNACK、超时、协议/读写器错误销毁整个会话，
 已返回流在后续 IO 报错。仅 open 返回前发现空闲会话失效时可新建一次；不重放业务。
@@ -66,7 +67,11 @@ SNI 默认 server；ALPN 省略/空列表不发送，非空保持顺序，不强
 未知流、控制 ID/方向错误、越界负载或非法设置是会话级错误；Alert/非空 SYNACK
 仅返回固定诊断，不向日志或调用方回显远端内容。
 一个物理会话同时仅一个活动流，完整结束后入空闲列表；优先复用序号最大者。
-检查/空闲超时均 30 秒，不预热；首次使用才启动清理 worker。ID/序号耗尽关闭会话。
+`idle-session-check-interval` / `idle-session-timeout` 使用整数秒，缺省或 <=5 回到30秒；
+`min-idle-session` 缺省/负值为0，只保留现有空闲会话，不预热。回收从最新会话开始，
+未过期项计入保留数，必要时刷新已过期项的空闲时间。首次使用才启动清理 worker。
+`disable-reuse: true` 不启动回收 worker、不领取/归还空闲会话，逻辑流结束即关闭该会话。
+ID/序号耗尽关闭会话。
 
 写命令队列 2 项，流接收容量按运行时预算推导且至少 1；活动会话不设全局数量上限。
 UoT v2 使用 `sp.v2.udp-over-tcp.arpa:0` 数据报模式，首包含请求，之后每包携带

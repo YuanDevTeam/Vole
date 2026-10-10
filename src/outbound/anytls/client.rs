@@ -26,9 +26,6 @@ use super::{
 };
 use crate::outbound::uot::UotTransport;
 
-const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[async_trait]
 pub(crate) trait SessionDialer: Send + Sync {
     async fn connect(
@@ -56,6 +53,7 @@ pub(crate) struct AnyTlsClient {
     state: Mutex<ClientState>,
     cancellation: CancellationToken,
     tasks: TaskTracker,
+    options: crate::config::AnyTlsSessionOptions,
 }
 
 impl std::fmt::Debug for AnyTlsClient {
@@ -75,11 +73,33 @@ impl std::fmt::Debug for AnyTlsClient {
 }
 
 impl AnyTlsClient {
+    #[cfg(test)]
     pub(crate) fn new(
         dialer: Arc<dyn SessionDialer>,
         password: &str,
         stream_buffer_capacity: usize,
     ) -> io::Result<Arc<Self>> {
+        Self::with_options(dialer, password, stream_buffer_capacity, Default::default())
+    }
+
+    pub(crate) fn with_options(
+        dialer: Arc<dyn SessionDialer>,
+        password: &str,
+        stream_buffer_capacity: usize,
+        options: crate::config::AnyTlsSessionOptions,
+    ) -> io::Result<Arc<Self>> {
+        if options.check_interval.is_zero()
+            || std::time::Instant::now()
+                .checked_add(options.check_interval)
+                .is_none()
+            || options.client_metadata.contains('\n')
+            || options.client_metadata.len() > usize::from(u16::MAX) - 80
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid AnyTLS session options",
+            ));
+        }
         if password.is_empty() || password.len() > 1_024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -105,6 +125,7 @@ impl AnyTlsClient {
             state: Mutex::new(ClientState::default()),
             cancellation: CancellationToken::new(),
             tasks: TaskTracker::new(),
+            options,
         });
         Ok(client)
     }
@@ -153,6 +174,7 @@ impl AnyTlsClient {
                     padding_snapshot,
                     self.padding.clone(),
                     target,
+                    &self.options.client_metadata,
                     self.max_stream_chunk,
                     self.incoming_capacity,
                     &self.cancellation,
@@ -212,6 +234,9 @@ impl AnyTlsClient {
     }
 
     fn take_idle(&self) -> Option<Arc<Session>> {
+        if self.options.disable_reuse {
+            return None;
+        }
         let mut state = self
             .state
             .lock()
@@ -234,7 +259,7 @@ impl AnyTlsClient {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.closed || session.is_closed() {
+            if state.closed || session.is_closed() || self.options.disable_reuse {
                 close = true;
             } else if state.sessions.contains_key(&session.sequence()) {
                 state
@@ -292,7 +317,7 @@ impl AnyTlsClient {
         if state.closed {
             return Err(DispatchError::Other("AnyTLS client is closed".to_owned()));
         }
-        if !state.cleanup_started {
+        if !self.options.disable_reuse && !state.cleanup_started {
             // Graph construction must not leave a task behind on a later
             // constructor/bind failure. Start only when traffic first uses
             // this node, under the same lock as the shutdown admission gate.
@@ -301,6 +326,7 @@ impl AnyTlsClient {
                 .spawn(crate::resources::observation::task(cleanup_idle(
                     Arc::downgrade(self),
                     self.cancellation.clone(),
+                    self.options.check_interval,
                 )));
         }
         Ok(())
@@ -312,8 +338,16 @@ impl AnyTlsClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut expired_sequences = Vec::new();
-        for (&sequence, &idle_since) in &state.idle {
-            if now.duration_since(idle_since) >= IDLE_TIMEOUT {
+        let mut retained = 0_usize;
+        for (&sequence, idle_since) in state.idle.iter_mut().rev() {
+            // The newest sessions are considered first. Only already idle
+            // sessions count toward the minimum; this never opens a socket.
+            if now.saturating_duration_since(*idle_since) <= self.options.idle_timeout {
+                retained += 1;
+            } else if retained < self.options.min_idle {
+                *idle_since = now;
+                retained += 1;
+            } else {
                 expired_sequences.push(sequence);
             }
         }
@@ -341,8 +375,12 @@ impl Drop for AnyTlsClient {
     }
 }
 
-async fn cleanup_idle(client: Weak<AnyTlsClient>, cancellation: CancellationToken) {
-    let mut interval = tokio::time::interval(IDLE_CHECK_INTERVAL);
+async fn cleanup_idle(
+    client: Weak<AnyTlsClient>,
+    cancellation: CancellationToken,
+    period: Duration,
+) {
+    let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await;
     loop {
@@ -703,6 +741,77 @@ mod tests {
         client.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn idle_minimum_keeps_newest_existing_sessions_without_dialing() {
+        let dialer = DuplexDialer::new(ServerMode::V2);
+        let client = AnyTlsClient::with_options(
+            dialer.clone(),
+            "password",
+            1024,
+            crate::config::AnyTlsSessionOptions {
+                min_idle: 1,
+                idle_timeout: Duration::from_secs(6),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut streams = Vec::new();
+        for _ in 0..3 {
+            let mut stream = open_stream(&client).await.unwrap();
+            wait_until_ready(&mut stream).await;
+            streams.push(stream);
+        }
+        for stream in &mut streams {
+            stream.shutdown().await.unwrap();
+        }
+        let now = tokio::time::Instant::now() + Duration::from_secs(7);
+        let expired = client.expire_idle(now);
+        assert_eq!(
+            expired.iter().map(|s| s.sequence()).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        {
+            let state = client.state.lock().unwrap();
+            assert_eq!(state.idle.keys().copied().collect::<Vec<_>>(), [3]);
+            assert_eq!(state.idle[&3], now);
+        }
+        for session in expired {
+            session.begin_shutdown();
+        }
+        let mut reused = open_stream(&client).await.unwrap();
+        assert_eq!(dialer.connection_count(), 3);
+        reused.shutdown().await.unwrap();
+        client.shutdown().await;
+        assert!(client.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_reuse_closes_sessions_and_never_starts_idle_worker() {
+        let dialer = DuplexDialer::new(ServerMode::V2);
+        let client = AnyTlsClient::with_options(
+            dialer.clone(),
+            "password",
+            1024,
+            crate::config::AnyTlsSessionOptions {
+                disable_reuse: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let mut stream = open_stream(&client).await.unwrap();
+            wait_until_ready(&mut stream).await;
+            stream.shutdown().await.unwrap();
+            let state = client.state.lock().unwrap();
+            assert!(state.idle.is_empty());
+            assert!(!state.cleanup_started);
+        }
+        assert_eq!(dialer.connection_count(), 2);
+        client.shutdown().await;
+        assert!(client.tasks.is_empty());
+        assert!(client.state.lock().unwrap().sessions.is_empty());
+    }
+
     #[test]
     fn unused_client_needs_no_runtime_and_leaves_no_background_task() {
         let client =
@@ -728,7 +837,12 @@ mod tests {
                 .expire_idle(idle_since + Duration::from_secs(29))
                 .is_empty()
         );
-        let expired = client.expire_idle(idle_since + Duration::from_secs(30));
+        assert!(
+            client
+                .expire_idle(idle_since + Duration::from_secs(30))
+                .is_empty()
+        );
+        let expired = client.expire_idle(idle_since + Duration::from_secs(31));
         assert_eq!(expired.len(), 1);
         for session in expired {
             session.begin_shutdown();
@@ -738,7 +852,7 @@ mod tests {
         fresh.shutdown().await.unwrap();
         client.shutdown().await;
         assert!(client.tasks.is_empty());
-        assert_eq!(IDLE_CHECK_INTERVAL, Duration::from_secs(30));
+        assert_eq!(client.options.check_interval, Duration::from_secs(30));
     }
 
     #[tokio::test]

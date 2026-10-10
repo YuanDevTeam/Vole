@@ -183,9 +183,17 @@ pub(crate) struct Connection {
     entry: Arc<Entry>,
     totals: Arc<SessionCounters>,
     registry: Weak<Registry>,
+    business_totals: bool,
 }
 impl Registry {
     pub fn open(self: &Arc<Self>, info: ConnectionInfo) -> Connection {
+        self.open_counted(info, true)
+    }
+    #[cfg(feature = "sing-mux")]
+    pub(crate) fn open_inner(self: &Arc<Self>, info: ConnectionInfo) -> Connection {
+        self.open_counted(info, false)
+    }
+    fn open_counted(self: &Arc<Self>, info: ConnectionInfo, business_totals: bool) -> Connection {
         let entry = Arc::new(Entry {
             id: uuid::Builder::from_random_bytes(rand::random()).into_uuid(),
             details: Arc::new(Details {
@@ -211,6 +219,7 @@ impl Registry {
             entry,
             totals: self.totals.clone(),
             registry: Arc::downgrade(self),
+            business_totals,
         }
     }
     pub fn snapshot(&self) -> Snapshot {
@@ -277,14 +286,18 @@ impl Connection {
             return;
         }
         saturating_add(&self.entry.upload, bytes);
-        saturating_add(&self.totals.upload, bytes);
+        if self.business_totals {
+            saturating_add(&self.totals.upload, bytes);
+        }
     }
     pub fn download(&self, bytes: usize) {
         if bytes == 0 {
             return;
         }
         saturating_add(&self.entry.download, bytes);
-        saturating_add(&self.totals.download, bytes);
+        if self.business_totals {
+            saturating_add(&self.totals.download, bytes);
+        }
     }
     pub fn failed(&self, error: &DispatchError) {
         let Some(registry) = self.registry.upgrade() else {

@@ -165,6 +165,7 @@ impl Session {
         padding_snapshot: Arc<PaddingScheme>,
         client_padding: Arc<ArcSwap<PaddingScheme>>,
         target: &Destination,
+        client_metadata: &str,
         max_stream_chunk: usize,
         incoming_capacity: usize,
         parent_cancellation: &CancellationToken,
@@ -177,7 +178,7 @@ impl Session {
         transport.write_all(&authentication).await?;
         transport.flush().await?;
 
-        let first_batch = first_stream_batch(&padding_snapshot, target)?;
+        let first_batch = first_stream_batch(&padding_snapshot, target, client_metadata)?;
         write_packet(&mut transport, &padding_snapshot, 1, &first_batch).await?;
 
         let (writer, writer_receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
@@ -814,8 +815,15 @@ fn make_active_stream(
     )
 }
 
-fn first_stream_batch(padding: &PaddingScheme, target: &Destination) -> io::Result<Bytes> {
-    let settings = format!("v=2\npadding-md5={}", padding.md5_hex());
+fn first_stream_batch(
+    padding: &PaddingScheme,
+    target: &Destination,
+    client_metadata: &str,
+) -> io::Result<Bytes> {
+    let settings = format!(
+        "v=2\nclient={client_metadata}\npadding-md5={}",
+        padding.md5_hex()
+    );
     let target = encoded_target(target)?;
     encode_batch(&[
         Frame::with_payload(Command::Settings, 0, Bytes::from(settings))?,
@@ -939,6 +947,7 @@ mod tests {
                 padding.clone(),
                 Arc::new(ArcSwap::new(padding)),
                 &Destination::domain("target.example", 443).unwrap(),
+                "",
                 1024,
                 1,
                 &CancellationToken::new(),
@@ -999,7 +1008,7 @@ mod tests {
     async fn initial_batches_keep_settings_before_stream_open_and_target() {
         let target = Destination::domain("target.example", 443).unwrap();
         let padding = PaddingScheme::default_scheme();
-        let batch = first_stream_batch(&padding, &target).unwrap();
+        let batch = first_stream_batch(&padding, &target, "test=metadata").unwrap();
         let mut input = std::io::Cursor::new(batch);
         let settings = read_frame(&mut input).await.unwrap();
         let syn = read_frame(&mut input).await.unwrap();
@@ -1008,7 +1017,11 @@ mod tests {
         assert_eq!(settings.stream_id, 0);
         assert_eq!(
             settings.payload.as_ref(),
-            format!("v=2\npadding-md5={}", padding.md5_hex()).as_bytes()
+            format!(
+                "v=2\nclient=test=metadata\npadding-md5={}",
+                padding.md5_hex()
+            )
+            .as_bytes()
         );
         assert_eq!(syn, Frame::empty(Command::Syn, 1));
         assert_eq!(target_frame.command, Command::Push);

@@ -403,6 +403,7 @@ impl PreparedCore {
             dialer,
             ResolutionContext::runtime(self.config.ipv6),
             &self.security,
+            None,
         )
     }
 
@@ -667,7 +668,20 @@ impl GraphBuilder {
             .with_connections(self.config.connections)
             .with_fresh_initialization();
         let handshake_stats = RuntimeResourceStats::new("runtime_handshake_observation");
-        let proxy_graph = self.build_proxy_graph(dialer.clone())?;
+        let diagnostics = (self.config.external_controller.is_some()
+            || self
+                .config
+                .proxies
+                .iter()
+                .any(|p| p.smux.as_ref().is_some_and(|s| s.statistic)))
+        .then(|| {
+            Arc::new(diagnostics::Diagnostics::new(
+                &self.config,
+                &self.rules,
+                self.connections.clone(),
+            ))
+        });
+        let proxy_graph = self.build_proxy_graph(dialer.clone(), diagnostics.as_ref())?;
         let proxy_dispatchers = self.wrap_proxy_dispatchers(
             proxy_graph.connectors(),
             &handshake_stats,
@@ -779,13 +793,6 @@ impl GraphBuilder {
             dns.clone(),
             self.security.clone(),
         );
-        let diagnostics = self.config.external_controller.as_ref().map(|_| {
-            Arc::new(diagnostics::Diagnostics::new(
-                &self.config,
-                &rules,
-                self.connections.clone(),
-            ))
-        });
         let mut router = RoutingDispatcher::new_with_ipv6(
             route_targets.clone(),
             direct.clone(),
@@ -817,7 +824,11 @@ impl GraphBuilder {
         })
     }
 
-    fn build_proxy_graph(&self, dialer: Dialer) -> io::Result<BuiltProxyGraph> {
+    fn build_proxy_graph(
+        &self,
+        dialer: Dialer,
+        diagnostics: Option<&Arc<diagnostics::Diagnostics>>,
+    ) -> io::Result<BuiltProxyGraph> {
         build_proxy_graph(
             &self.config.proxies,
             &self.config.proxy_groups,
@@ -826,6 +837,7 @@ impl GraphBuilder {
             dialer,
             ResolutionContext::runtime(self.config.ipv6),
             &self.security,
+            diagnostics,
         )
     }
 
@@ -889,6 +901,7 @@ impl PreparedMeasurement {
             dialer,
             ResolutionContext::measurement(resolver, true),
             &self.security,
+            None,
         )?;
         let connector = proxy_graph
             .get(self.config.default_proxy.index())
@@ -913,6 +926,7 @@ impl PreparedMeasurement {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_proxy_graph(
     proxies: &[ProxyConfig],
     groups: &[SelectProxyGroupConfig],
@@ -921,6 +935,7 @@ fn build_proxy_graph(
     dialer: Dialer,
     resolution: ResolutionContext,
     security: &SecurityContext,
+    diagnostics: Option<&Arc<diagnostics::Diagnostics>>,
 ) -> io::Result<BuiltProxyGraph> {
     if endpoints.len() != proxies.len() {
         return Err(io::Error::new(
@@ -1253,12 +1268,13 @@ fn build_proxy_graph(
                         resumption_sessions,
                         limits.tls_buffer_limit,
                     )?;
-                    Arc::new(AnyTlsOutbound::new(
+                    Arc::new(AnyTlsOutbound::with_session_options(
                         server_destination(&config.address, config.port)?,
                         upstream,
                         &config.password,
                         Arc::new(tls),
                         limits.tcp_buffer_per_direction,
+                        config.session.clone(),
                     )?)
                 }
                 #[cfg(not(feature = "outbound-anytls"))]
@@ -1274,10 +1290,13 @@ fn build_proxy_graph(
 
         #[cfg(feature = "sing-mux")]
         let connector: Arc<dyn OutboundConnector> = if let Some(options) = &proxy.smux {
-            Arc::new(crate::outbound::SingMuxConnector::new(
-                connector,
-                options.clone(),
-            ))
+            let mut mux = crate::outbound::SingMuxConnector::new(connector, options.clone());
+            if options.statistic
+                && let Some(diagnostics) = diagnostics
+            {
+                mux = mux.with_tracking(diagnostics, &proxy.tag);
+            }
+            Arc::new(mux)
         } else {
             connector
         };
@@ -2709,6 +2728,7 @@ rules:
                     password: "secret".to_owned(),
                     server_name: "example.com".to_owned(),
                     tls: Default::default(),
+                    session: Default::default(),
                 }),
             }
         }

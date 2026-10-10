@@ -1,5 +1,7 @@
 //! Strict parsing for the current Vole YAML configuration.
+mod anytls;
 mod fake_ip;
+pub use anytls::AnyTlsSessionOptions;
 mod fallback;
 mod grpc;
 mod sing_mux;
@@ -823,6 +825,7 @@ pub struct AnyTlsOutboundConfig {
     pub password: String,
     pub server_name: String,
     pub tls: TlsClientPolicy,
+    pub session: AnyTlsSessionOptions,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1672,6 +1675,16 @@ enum RawProtocol {
         server: String,
         port: u16,
         password: String,
+        #[serde(rename = "idle-session-check-interval", default)]
+        idle_session_check_interval: i64,
+        #[serde(rename = "idle-session-timeout", default)]
+        idle_session_timeout: i64,
+        #[serde(rename = "min-idle-session", default)]
+        min_idle_session: i64,
+        #[serde(rename = "disable-reuse", default)]
+        disable_reuse: bool,
+        #[serde(rename = "client-metadata", default)]
+        client_metadata: String,
         #[serde(default)]
         udp: bool,
         #[serde(default, deserialize_with = "deserialize_present_option")]
@@ -2838,6 +2851,11 @@ impl RawOutbound {
                 server,
                 port,
                 password,
+                idle_session_check_interval,
+                idle_session_timeout,
+                min_idle_session,
+                disable_reuse,
+                client_metadata,
                 udp,
                 sni,
                 alpn,
@@ -2863,6 +2881,13 @@ impl RawOutbound {
                 config.tls.identity = normalize_client_identity(certificate, private_key)?;
                 config.tls.client_fingerprint =
                     parse_client_fingerprint(client_fingerprint.as_deref())?;
+                config.session = AnyTlsSessionOptions::normalize(
+                    idle_session_check_interval,
+                    idle_session_timeout,
+                    min_idle_session,
+                    disable_reuse,
+                    client_metadata,
+                )?;
                 (name, dialer_proxy, udp, ProxyProtocol::AnyTls(config))
             }
         };
@@ -3003,6 +3028,7 @@ fn normalize_anytls(
         port,
         password,
         server_name,
+        session: AnyTlsSessionOptions::default(),
         tls: TlsClientPolicy {
             client_fingerprint: None,
             alpn,
@@ -5196,14 +5222,7 @@ authentication:
 
     #[test]
     fn rejects_anytls_fields_outside_the_locked_subset() {
-        for field in [
-            "tls: true",
-            "ech-opts: {}",
-            "idle-session-check-interval: 30",
-            "idle-session-timeout: 30",
-            "min-idle-session: 1",
-            "disable-reuse: false",
-        ] {
+        for field in ["tls: true", "ech-opts: {}"] {
             let yaml = CURRENT_ANYTLS.replace(
                 "    password: private-anytls-password",
                 &format!("    password: private-anytls-password\n    {field}"),

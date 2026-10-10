@@ -423,6 +423,7 @@ proxies:
       max-streams: 0
       padding: false
       only-tcp: false # true 委托底层 UDP；false 提供 sing-mux UDP
+      statistic: false # true 记录真实 Inner 连接，可由 Controller 关闭，不重复计入业务总字节
     dialer-proxy: upstream-select
 
   # REALITY 写法示意：在 VLESS 节点中保留 tls: true，并增加以下 mapping；不要与
@@ -457,13 +458,19 @@ proxies:
   # skip-cert-verify 不能覆盖 fingerprint；pin 是证书 SHA-256，不是客户端伪造指纹。
   # 叶 pin 直接决定信任；非叶 pin 作为根继续验证链和名称。所有策略均验证握手签名。
   # name-cert-verify 只改变证书验证名；certificate/private-key 为成对内联 PEM 或文件路径 客户端身份。
-  # 支持共享 client-fingerprint；不支持 REALITY、ECH 或 session/padding 调参字段，详见 outbounds.md#anytls。
+  # 支持共享 client-fingerprint；不支持 REALITY、ECH 或 padding 调参，详见 outbounds.md#anytls。
+  # 两个 idle 时间字段为整数秒，<=5 回落30秒；min-idle-session 只保留现有空闲会话。
   # TCP 使用 AnyTLS session；udp: true 使用 UoT v2 datagram mode。
   - name: anytls-edge
     type: anytls
     server: anytls.example.com
     port: 443
     password: "private-anytls-password"
+    idle-session-check-interval: 30
+    idle-session-timeout: 30
+    min-idle-session: 0
+    disable-reuse: false
+    client-metadata: "" # 原样进入 Settings.client，不自动生成设备或产品标识
     sni: anytls.example.com
     # alpn: [h2, http/1.1]
     skip-cert-verify: false

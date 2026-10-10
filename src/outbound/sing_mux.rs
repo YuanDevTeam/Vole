@@ -14,6 +14,12 @@ pub struct SingMuxConnector {
     inner: Arc<dyn OutboundConnector>,
     pool: Pool,
     cancellation: CancellationToken,
+    tracking: Option<Tracking>,
+}
+struct Tracking {
+    registry: Arc<crate::connections::Registry>,
+    chain: Arc<str>,
+    providers: Vec<Arc<str>>,
 }
 impl std::fmt::Debug for SingMuxConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -27,7 +33,21 @@ impl SingMuxConnector {
             inner,
             pool: Pool::new(options),
             cancellation: CancellationToken::new(),
+            tracking: None,
         }
+    }
+    pub(crate) fn with_tracking(
+        mut self,
+        diagnostics: &crate::routing::diagnostics::Diagnostics,
+        name: &str,
+    ) -> Self {
+        let chain = diagnostics.text(name);
+        self.tracking = Some(Tracking {
+            registry: diagnostics.connections.clone(),
+            providers: diagnostics.providers(std::slice::from_ref(&chain)),
+            chain,
+        });
+        self
     }
     async fn connect(
         &self,
@@ -36,11 +56,36 @@ impl SingMuxConnector {
     ) -> io::Result<BoxStream> {
         session.destination = Destination::domain("sp.mux.sing-box.arpa", 444)?;
         session.sniffed_domain = None;
-        self.inner
+        let source = session.source;
+        let raw = self
+            .inner
             .connect_stream(session, context)
             .await
             .map(|connected| connected.io)
-            .map_err(io::Error::other)
+            .map_err(io::Error::other)?;
+        Ok(match &self.tracking {
+            None => raw,
+            Some(tracking) => tracking
+                .registry
+                .open_inner(crate::connections::ConnectionInfo {
+                    metadata: crate::connections::ConnectionMetadata {
+                        network: "tcp",
+                        inbound_type: "Inner",
+                        source,
+                        destination_ip: None,
+                        destination_port: 444,
+                        host: Arc::from("sp.mux.sing-box.arpa"),
+                        dns_mode: "normal",
+                        sniff_host: Arc::from(""),
+                    },
+                    chains: vec![tracking.chain.clone()],
+                    provider_chains: tracking.providers.clone(),
+                    rule: "",
+                    rule_payload: Arc::from(""),
+                    dns_path: Vec::new(),
+                })
+                .stream(raw),
+        })
     }
 }
 #[async_trait]
@@ -107,7 +152,7 @@ mod tests {
         session::{DatagramSession, InboundKind},
     };
     use std::sync::Mutex;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     use tokio::{sync::Notify, time::Instant};
 
     struct MuxPeer {
@@ -174,14 +219,19 @@ mod tests {
                     tasks: Mutex::default(),
                     probe: probe.clone(),
                 });
+                let registry = Arc::new(crate::connections::Registry::default());
+                let config = crate::config::Config::parse_yaml(b"mixed-port: 1080\nproxies: [{name: edge, type: socks5, server: 192.0.2.1, port: 1080}]\nrules: ['MATCH,DIRECT']\n").unwrap();
+                let rules = crate::routing::RuleSet::compile(config.rules.clone()).unwrap();
+                let diagnostics = crate::routing::diagnostics::Diagnostics::new(&config, &rules, registry.clone());
                 let node = SingMuxConnector::new(
                     inner.clone(),
                     SingMuxConfig {
                         enabled: true,
                         max_connections: 1,
+                        statistic: true,
                         ..Default::default()
                     },
-                );
+                ).with_tracking(&diagnostics, "edge");
                 let session = StreamSession {
                     metadata: crate::session::InboundMetadata {
                         local_port: 1080,
@@ -215,7 +265,17 @@ mod tests {
                 assert_eq!(calls[0].1, context.deadline());
                 assert_eq!(probe.snapshot().current(ResourceKind::Pool), 1);
                 assert_eq!(probe.snapshot().current(ResourceKind::Task), 1);
-                first.io.shutdown().await.unwrap();
+                let snapshot = serde_json::to_value(registry.snapshot()).unwrap();
+                assert_eq!(snapshot["connections"].as_array().unwrap().len(), 1);
+                assert_eq!(snapshot["connections"][0]["metadata"]["type"], "Inner");
+                assert_eq!(snapshot["connections"][0]["chains"], serde_json::json!(["edge"]));
+                assert!(snapshot["connections"][0]["upload"].as_u64().unwrap() > 0);
+                assert_eq!(snapshot["uploadTotal"], 0);
+                assert_eq!(snapshot["downloadTotal"], 0);
+                registry.close(snapshot["connections"][0]["id"].as_str().unwrap());
+                for stream in [&mut first.io, &mut sibling.io] {
+                    assert!(tokio::time::timeout(std::time::Duration::from_secs(1), stream.read_u8()).await.unwrap().is_err());
+                }
                 node.shutdown().await;
                 drop((first, sibling, node));
                 assert!(probe.snapshot().is_idle());

@@ -77,7 +77,12 @@ packet-up 在发送间隔内聚合小块写入，而不是把每个 write 变成
 
 ## 通用 sing-mux
 
-所有已启用的普通节点协议都接受 `smux`，字段为 enabled、protocol、max-connections、min-streams、max-streams、padding、only-tcp。enabled 默认 false；protocol 缺省/空为 h2mux，也支持 smux v1/yamux。计数为带符号平台整数；负阈值禁用，两个正 max 字段同时配置时采用 max-connections 分支。padding、only-tcp 默认 false。Vision 与启用的 sing-mux 互斥。精简构建可独立启用 `sing-mux`，不要求 VLESS；未启用此 feature 时拒绝 enabled=true。
+所有已启用的普通节点协议都接受 `smux`，字段为 enabled、protocol、max-connections、min-streams、max-streams、padding、only-tcp、statistic。enabled 默认 false；protocol 缺省/空为 h2mux，也支持 smux v1/yamux。计数为带符号平台整数；负阈值禁用，两个正 max 字段同时配置时采用 max-connections 分支。padding、only-tcp、statistic 默认 false。Vision 与启用的 sing-mux 互斥。精简构建可独立启用 `sing-mux`，不要求 VLESS；未启用此 feature 时拒绝 enabled=true。
+
+`statistic: true` 在 Running Session 的连接注册表记录每条真实底层认证流，类型 Inner、
+目标 sp.mux.sing-box.arpa:444，节点和 provider 名称共享不可变文本。复用流共用一条
+Inner 记录。它的字节单独可见，不重复计入业务 uploadTotal/downloadTotal；Controller
+关闭此记录会终止底层 I/O 和所有兄弟复用流。退出/Stop 同步回收 driver 与记录。
 
 空闲物理会话优先复用；max-connections>0 分支按连接数量与 min-streams 扩容，否则按 max-streams 阈值复用。两个 max 字段字面值均为零时 min-streams 归一为 8；归一在负阈值禁用之前执行，不把该值解释为所有调度分支的硬额度。每节点和资源代际的池独立，单流关闭不关闭兄弟流，节点 Stop 才取消和等待所有自有驱动。
 
