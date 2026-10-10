@@ -44,6 +44,8 @@ pub struct ProviderSpec {
     #[serde(default)]
     pub proxy: String,
     #[serde(default)]
+    pub dialer_proxy: String,
+    #[serde(default)]
     pub header: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub size_limit: u64,
@@ -88,9 +90,13 @@ impl ProviderSpec {
             && (!self.filter.is_empty()
                 || !self.exclude_filter.is_empty()
                 || !self.exclude_type.is_empty()
+                || !self.dialer_proxy.is_empty()
                 || !self.overrides.is_empty())
         {
             return invalid("rule providers do not accept proxy filters or overrides");
+        }
+        if !self.dialer_proxy.is_empty() {
+            validate_route_target_name(&self.dialer_proxy, "provider dialer-proxy")?;
         }
         match self.kind {
             ProviderType::Http => {
@@ -124,6 +130,7 @@ impl ProviderSpec {
                 "down",
                 "dialer-proxy",
                 "skip-cert-verify",
+                "name-cert-verify",
                 "additional-prefix",
                 "additional-suffix",
                 "proxy-name",
@@ -277,6 +284,13 @@ impl ProviderTemplate {
             let nodes = filter.select(nodes.clone(), false)?;
             let mut names = Vec::new();
             for mut node in nodes {
+                if !spec.dialer_proxy.is_empty() {
+                    node.as_mapping_mut()
+                        .ok_or_else(|| {
+                            VoleError::InvalidConfig("provider node must be a mapping".into())
+                        })?
+                        .insert("dialer-proxy".into(), spec.dialer_proxy.clone().into());
+                }
                 apply_overrides(&mut node, &spec.overrides)?;
                 names.push(node_name(&node)?);
                 proxies.push(node);
@@ -623,10 +637,18 @@ fn apply_overrides(node: &mut Value, overrides: &BTreeMap<String, Value>) -> Res
             "udp" => kind != "http",
             "up" | "down" => kind == "hysteria2",
             "udp-over-tcp" => kind == "ss",
-            "skip-cert-verify" => matches!(
-                kind,
-                "vless" | "vmess" | "trojan" | "anytls" | "hysteria2" | "tuic" | "http"
-            ),
+            "skip-cert-verify" | "name-cert-verify" => match kind {
+                "trojan" | "anytls" | "hysteria2" | "tuic" => true,
+                "http" | "socks5" | "vmess" => {
+                    map.get("tls").and_then(Value::as_bool) == Some(true)
+                }
+                "vless" => {
+                    map.get("tls").and_then(Value::as_bool) == Some(true)
+                        && !map.contains_key("reality-opts")
+                        && !map.contains_key("jls-opts")
+                }
+                _ => false,
+            },
             _ => true,
         };
         if applicable {
@@ -671,6 +693,101 @@ fn apply_overrides(node: &mut Value, overrides: &BTreeMap<String, Value>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_dialer_and_certificate_overrides_materialize_in_reference_order() {
+        for (kind, source) in [
+            ("inline", ""),
+            ("file", "path: nodes.yaml"),
+            ("http", "url: https://subscription.invalid/nodes.yaml"),
+        ] {
+            for (provider, override_dialer, expected) in [
+                ("", "", "node-path"),
+                ("provider-path", "", "provider-path"),
+                ("provider-path", "override-path", "override-path"),
+            ] {
+                let yaml = format!(
+                    r#"
+mixed-port: 1080
+proxy-providers:
+  remote:
+    type: {kind}
+    {source}
+    proxy: node-path
+    dialer-proxy: '{provider}'
+    override:
+      name-cert-verify: verified.invalid
+      skip-cert-verify: true
+      {override_entry}
+    payload:
+      - {{name: edge, type: socks5, tls: true, server: cover.invalid, port: 443, dialer-proxy: node-path}}
+      - {{name: plain-socks, type: socks5, server: 192.0.2.1, port: 1080}}
+      - {{name: plain-http, type: http, server: 192.0.2.2, port: 8080}}
+      - {{name: plain-vmess, type: vmess, server: 192.0.2.3, port: 1080, uuid: 00000000-0000-4000-8000-000000000001}}
+      - {{name: plain-vless, type: vless, server: 192.0.2.4, port: 1080, uuid: 00000000-0000-4000-8000-000000000001}}
+proxy-groups:
+  - {{name: node-path, type: select, proxies: [DIRECT]}}
+  - {{name: provider-path, type: select, proxies: [DIRECT]}}
+  - {{name: override-path, type: select, proxies: [DIRECT]}}
+"#,
+                    override_entry = if override_dialer.is_empty() {
+                        String::new()
+                    } else {
+                        format!("dialer-proxy: {override_dialer}")
+                    },
+                );
+                let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+                let group = config
+                    .proxy_groups
+                    .iter()
+                    .position(|group| group.name == expected)
+                    .unwrap();
+                assert_eq!(
+                    config.proxies[0].dialer_proxy,
+                    Some(RouteTargetId::Group(ProxyGroupId::from_index(group)))
+                );
+                let ProxyProtocol::Socks5(node) = &config.proxies[0].protocol else {
+                    panic!("SOCKS provider node")
+                };
+                let certificate = &node.tls.as_ref().unwrap().certificate;
+                assert_eq!(
+                    certificate.verification_name.as_deref(),
+                    Some("verified.invalid")
+                );
+                assert!(certificate.skip_cert_verify);
+                assert_eq!(node.address, "cover.invalid");
+                assert_eq!(
+                    config.providers.as_ref().unwrap().proxies[0].1.proxy,
+                    "node-path"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quic_provider_certificate_name_override_uses_existing_certificate_policy() {
+        for (kind, credentials) in [
+            ("hysteria2", "password: fixture"),
+            (
+                "tuic",
+                "uuid: 00000000-0000-4000-8000-000000000001, password: fixture",
+            ),
+        ] {
+            let config = Config::parse_yaml(format!(
+                "mixed-port: 1080\nproxy-providers:\n  nodes:\n    type: inline\n    override: {{name-cert-verify: verified.invalid}}\n    payload:\n      - {{name: edge, type: {kind}, server: cover.invalid, port: 443, {credentials}}}\n"
+            ).as_bytes()).unwrap();
+            let tls = match &config.proxies[0].protocol {
+                ProxyProtocol::Hysteria2(node) => &node.tls,
+                ProxyProtocol::Tuic(node) => &node.tls,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                tls.certificate.verification_name.as_deref(),
+                Some("verified.invalid")
+            );
+            assert_eq!(tls.server_name, "cover.invalid");
+        }
+    }
+
     #[test]
     fn inline_provider_groups_and_rule_policies_share_materialized_content() {
         let config = Config::parse_yaml(

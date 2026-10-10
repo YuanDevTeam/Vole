@@ -151,6 +151,13 @@ Hysteria2 已认证 QUIC 会话也保留其 `dialer-proxy` 上游组快照，包
 `count` 与脱敏的 `error`。`updatedAt` 为 Unix 秒，未成功获取时为空；inline 或 bundled payload
 可以在未下载时可用。响应不包含订阅 URL、认证头或节点凭据。
 
+HTTP proxy provider 收到 `Subscription-Userinfo` 后另含 `subscriptionInfo` 对象，
+字段为 `Upload`、`Download`、`Total`、`Expire`，均为有符号整数；前三项为订阅字节数，
+Expire 为 Unix 秒。未知时省略该对象，缺失子项为 0；不以本地业务流量代替订阅信息。
+数值接受十进制整数、有限小数和科学计数法，小数向零截断；非法或超范围子项忽略。
+成功候选或合法 304 才更新元信息；未带该头时保留旧值，失败更新保留已发布对象。
+缓存恢复只接受与配置 URL 和内容 hash 一致的元信息。
+
 更新将节点、组和规则作为完整候选检查，发布时保留仍存在的当前选择。
 既有会话持有旧资源，最后一个使用者释放后回收；下载通过当前可用的运行配置建立出口，
 不等待候选资源。空动态组使用配置的 `empty-fallback`，默认 COMPATIBLE（直连）。

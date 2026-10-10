@@ -226,6 +226,7 @@ proxies:
     sni: hysteria2.example.com
     alpn: [h3] # 缺省或 [] 都归一为 h3
     skip-cert-verify: false
+    # name-cert-verify: verified.example.com # 独立证书验证名，不改变 SNI
     # fingerprint: "<SHA-256 certificate pin, 64 hex digits>"
     # certificate/private-key: 成对内联 PEM 客户端身份
     udp: true
@@ -499,13 +500,17 @@ proxy-groups:
 # proxy 指定当前运行配置中的出口；缺省按规则选路。不会等待新资源才能建立下载连接。
 # header 值为字符串数组；size-limit 单位字节，0 不设下载上限，解析仍有容量边界。
 # proxy provider 文件为 {proxies: [...]}；可用 filter/exclude-filter/exclude-type。
-# override 支持 udp、udp-over-tcp、up/down、dialer-proxy、skip-cert-verify、
+# provider 的 dialer-proxy 覆盖每个节点的同名字段，override 最后应用；
+# 它只控制节点上游，资源下载仍使用独立的 proxy 字段。
+# override 支持 udp、udp-over-tcp、up/down、dialer-proxy、skip-cert-verify、name-cert-verify、
 # additional-prefix/suffix、proxy-name: [{pattern: '表达式', target: '替换文本'}]；
 # 协议专属覆盖只用于支持该字段的节点。未实现的覆盖字段严格拒绝。
 # proxy providers 的 health-check 接受 enable/url/interval/timeout/lazy/expected-status；
 # enable 默认 false，开启后 interval 缺省/0 为 300 秒。空 URL 不发起探测。
 # 相同节点/URL 的检查共享结果，每批最多 10 个并发，超时与停止均取消 I/O。
 # 更新先解析并校验整个依赖图，成功才替换；失败保留旧配置与 HTTP 缓存。
+# HTTP proxy provider 的订阅用量来自 Subscription-Userinfo 响应头，成功更新和 304 后
+# 随缓存保存；缺少该头保留旧值，失败候选不更新。Controller 不用本地流量填充订阅用量。
 # 新连接使用新资源，旧 TCP/UDP 会话保留原资源；停止等待下载、解析和资源释放。
 # rule providers 支持 domain/ipcidr/classical，format 为 yaml/text/mrs；MRS 仅 domain/ipcidr。
 # YAML 规则文件为 {payload: [...]}，text 每行一条，支持空行和 # 注释。

@@ -7,7 +7,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 | 范围 | 当前支持 |
 | --- | --- |
 | 配置与选路 | YAML anchor/merge；rule/global/direct；内置 DIRECT/REJECT；域名、地址、端口、网络、GeoData、RULE-SET 和 AND/OR/NOT |
-| 资源 | HTTP/file/inline proxy/rule providers；动态成员、筛选、覆盖、健康检查；YAML/Text 与 domain/ipcidr MRS；失败保留旧代 |
+| 资源 | HTTP/file/inline proxy/rule providers；动态成员、筛选、覆盖、健康检查；Provider dialer-proxy 与 HTTP 订阅信息；YAML/Text 与 domain/ipcidr MRS；失败保留旧代 |
 | 策略组 | select/url-test/fallback/load-balance；默认和持久选择；延迟容差、恢复、三种负载均衡策略；旧连接保持原路径 |
 | DNS | hosts、bootstrap/节点/直连解析角色、policy、respect-rules；UDP/TCP/DoH/DoT；fallback；redir-host/fake-IP 与映射持久化 |
 | mixed-port | HTTP/SOCKS5 TCP 与 SOCKS5 UDP；LAN 地址限制、多用户认证、认证跳过网段；allow-lan 不强制认证 |
@@ -23,6 +23,9 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - DNS 不提供独立 listen、DoQ、DoH/H3、ECS、system/DHCP nameserver 或可配置 ARC 缓存。
   DoH 使用 H1 POST；详细解析角色、缓存与过滤行为见 [DNS 契约](tun-icmp-dns.md)。
 - 正则使用 Rust regex 子集，明确拒绝 lookaround/backreference。规则与 provider 的协议覆盖仅限已实现字段。
+- 订阅元信息只在成功候选或合法 304 后发布，失败响应或坏候选保留旧值；
+  与 Mihomo 在读取响应头时更新的时点不同。数值仅接受有限且可表示的十进制数，
+  不保留非有限/溢出浮点转换的参考行为。
 - 节点 UDP 能力按 [出站契约](outbounds.md) 声明；rule 模式跳过不支持 UDP 的目标，继续匹配后续规则。
   global 模式和显式 DNS 出口不执行此跳过。负载均衡组按其声明能力参与规则匹配，实际选中成员仍须支持 UDP。
 - 未配置入站的配置不能启动。Controller 沿用回环地址、secret 及运行配置准入，见 [Controller API](controller-api.md)。

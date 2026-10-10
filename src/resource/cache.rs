@@ -1,5 +1,6 @@
 //! Provider files and candidate updates. Publication belongs to the runtime graph owner.
 use super::http::{self, DownloadOutcome, DownloadRequest, HttpOptions};
+use super::subscription::SubscriptionInfo;
 use crate::{
     config::providers::{
         ProviderContent, ProviderContents, ProviderSpec, ProviderTemplate, ProviderType,
@@ -28,6 +29,8 @@ struct Metadata {
     etag: Option<String>,
     hash: String,
     checked: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subscription_info: Option<SubscriptionInfo>,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +44,8 @@ pub(crate) struct ProviderState {
     pub updated_at: Option<u64>,
     pub error: Option<&'static str>,
     pub count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_info: Option<SubscriptionInfo>,
 }
 pub(crate) struct ResourceEntry {
     pub key: String,
@@ -97,6 +102,7 @@ impl ProviderCache {
                     updated_at: None,
                     error: None,
                     count: spec.payload.len(),
+                    subscription_info: None,
                 },
                 path: None,
                 metadata: Metadata::default(),
@@ -139,6 +145,12 @@ impl ProviderCache {
                                 && metadata.hash == hex(&Sha256::digest(&bytes))
                             {
                                 entry.metadata = metadata;
+                                if !rule && spec.kind == ProviderType::Http {
+                                    entry.state.subscription_info =
+                                        entry.metadata.subscription_info;
+                                } else {
+                                    entry.metadata.subscription_info = None;
+                                }
                             }
                             contents.insert(key, content);
                             if spec.kind == ProviderType::Http {
@@ -232,12 +244,29 @@ impl ProviderCache {
             .await
             .map_err(|_| io::Error::other("provider download failed"))?;
             match outcome {
-                DownloadOutcome::NotModified => {
-                    entry.metadata.checked = unix_time(SystemTime::now());
-                    write_metadata(&path, &entry.metadata)?;
+                DownloadOutcome::NotModified { subscription_info } => {
+                    if cancellation.is_cancelled() {
+                        return Err(io::ErrorKind::Interrupted.into());
+                    }
+                    let mut metadata = entry.metadata.clone();
+                    metadata.checked = unix_time(SystemTime::now());
+                    if !entry.state.rule {
+                        metadata.subscription_info =
+                            subscription_info.or(metadata.subscription_info);
+                    } else {
+                        metadata.subscription_info = None;
+                    }
+                    write_metadata(&path, &metadata)?;
+                    entry.state.subscription_info = metadata.subscription_info;
+                    entry.metadata = metadata;
                     Ok(None)
                 }
-                DownloadOutcome::Downloaded { etag, sha256, .. } => {
+                DownloadOutcome::Downloaded {
+                    etag,
+                    sha256,
+                    subscription_info,
+                    ..
+                } => {
                     let mut cleanup = TemporaryFile(Some(temporary.clone()));
                     let spec = entry.spec.clone();
                     let template = self.template.clone();
@@ -261,6 +290,11 @@ impl ProviderCache {
                                     etag,
                                     hash: sha256.iter().map(|byte| format!("{byte:02x}")).collect(),
                                     checked: unix_time(SystemTime::now()),
+                                    subscription_info: if entry.state.rule {
+                                        None
+                                    } else {
+                                        subscription_info.or(entry.metadata.subscription_info)
+                                    },
                                 },
                             }))
                         }
@@ -301,11 +335,11 @@ impl ProviderCache {
         let entry = &mut self.entries[index];
         if let Some(temporary) = &candidate.temporary {
             let path = entry.path.as_ref().expect("cache path");
-            write_metadata(path, &candidate.metadata)?;
-            fs::rename(temporary, path)?;
+            commit_download(path, temporary, &candidate.metadata)?;
             candidate.temporary = None;
             entry.metadata = candidate.metadata.clone();
             entry.state.downloaded = true;
+            entry.state.subscription_info = entry.metadata.subscription_info;
         }
         entry.modified = entry
             .path
@@ -393,19 +427,49 @@ fn temporary_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 fn write_metadata(path: &Path, metadata: &Metadata) -> io::Result<()> {
-    let path = metadata_path(path);
-    let temporary = temporary_path(&path);
-    let result = (|| {
-        fs::write(
-            &temporary,
-            serde_json::to_vec(metadata).map_err(io::Error::other)?,
-        )?;
-        fs::rename(&temporary, &path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
+    let staged = stage_metadata(path, metadata)?;
+    fs::rename(staged.0.as_ref().unwrap(), metadata_path(path))
+}
+
+fn stage_metadata(path: &Path, metadata: &Metadata) -> io::Result<TemporaryFile> {
+    let staged = TemporaryFile(Some(temporary_path(&metadata_path(path))));
+    fs::write(
+        staged.0.as_ref().unwrap(),
+        serde_json::to_vec(metadata).map_err(io::Error::other)?,
+    )?;
+    Ok(staged)
+}
+
+fn commit_download(path: &Path, temporary: &Path, metadata: &Metadata) -> io::Result<()> {
+    let staged = stage_metadata(path, metadata)?;
+    let mut previous = TemporaryFile(None);
+    match fs::metadata(path) {
+        Ok(file) if file.is_file() => {
+            let backup = temporary_path(path);
+            fs::rename(path, &backup)?;
+            previous.0 = Some(backup);
+        }
+        Ok(_) => return Err(io::Error::other("provider cache must be a regular file")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
-    result
+    let mut installed = false;
+    let result = fs::rename(temporary, path).and_then(|()| {
+        installed = true;
+        fs::rename(staged.0.as_ref().unwrap(), metadata_path(path))
+    });
+    if let Err(error) = result {
+        // Keep the old body and sidecar paired if either publication fails.
+        // A rollback failure retains its backup for recovery instead of deleting it.
+        if let Some(backup) = previous.0.take() {
+            fs::rename(backup, path)
+                .map_err(|_| io::Error::other("provider cache rollback failed"))?;
+        } else if installed {
+            fs::remove_file(path)?;
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 pub(crate) fn resource_path(root: &Path, path: &str, create: bool) -> io::Result<PathBuf> {
     let root = fs::canonicalize(root)?;
@@ -474,3 +538,7 @@ impl Drop for TemporaryFile {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cache_tests.rs"]
+mod tests;

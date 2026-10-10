@@ -146,7 +146,8 @@ gRPC/H2 driver 由节点跟踪并同步退出，无全局会话额度或历史�
 始终 QUIC/TLS 1.3，使用官方 rustls；不接受 tls/network/client-fingerprint/REALITY。
 port 为 1–65535，仅提供 ports 时可省略；显式非法 port 仍拒绝。password 默认空、
 保留原值，须为最长 8192 字节的合法 HTTP 头值。SNI 默认 server；ALPN 省略/空为 h3。
-支持共享证书 pin/skip 和成对内联 PEM mTLS；udp 只控制业务 UDP，不关闭 QUIC 载体。
+支持共享证书 pin/skip、独立 `name-cert-verify` 和成对内联 PEM mTLS；
+验证名不改变 SNI。udp 只控制业务 UDP，不关闭 QUIC 载体。
 
 - up/down 独立非负整数或十进制整数字符串，裸值 Mbit/s；单位 [KMGT]?[bB]ps 使用
   十进制倍率，bit 向下取整为 byte/s。省略/归一零为自动；拒绝小数、符号、溢出。

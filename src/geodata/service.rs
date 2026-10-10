@@ -204,7 +204,7 @@ impl GeoDataUpdateService {
             options: self.options.clone(),
         };
         match download(request).await {
-            Ok(DownloadOutcome::NotModified) => {
+            Ok(DownloadOutcome::NotModified { .. }) => {
                 blocking_operation(move || {
                     session.not_modified_with_cancellation(etag, &cancellation)
                 })

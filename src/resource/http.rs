@@ -20,6 +20,7 @@ use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
+use super::subscription::SubscriptionInfo;
 use crate::{
     dispatch::{BoxStream, DispatchError, Dispatcher},
     session::{Destination, InboundKind, StreamSession},
@@ -72,12 +73,15 @@ impl Default for HttpOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DownloadOutcome {
-    NotModified,
+    NotModified {
+        subscription_info: Option<SubscriptionInfo>,
+    },
     Downloaded {
         etag: Option<String>,
         sha256: [u8; 32],
         size: u64,
         final_url: String,
+        subscription_info: Option<SubscriptionInfo>,
     },
 }
 
@@ -281,7 +285,11 @@ async fn download_inner(
         }
 
         match head.status {
-            304 if request.etag.is_some() => return Ok(DownloadOutcome::NotModified),
+            304 if request.etag.is_some() => {
+                return Ok(DownloadOutcome::NotModified {
+                    subscription_info: head.subscription_info,
+                });
+            }
             304 => {
                 return Err(DownloadError::Protocol(
                     "received 304 without sending If-None-Match".to_owned(),
@@ -323,6 +331,7 @@ async fn download_inner(
             sha256,
             size,
             final_url: current_url.to_string(),
+            subscription_info: head.subscription_info,
         });
     }
 
@@ -535,6 +544,7 @@ struct ResponseHead {
     content_encoding: Option<String>,
     etag: Option<String>,
     location: Option<String>,
+    subscription_info: Option<SubscriptionInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -840,6 +850,8 @@ fn parse_response_head(block: &[u8]) -> Result<ResponseHead, DownloadError> {
     let mut content_encoding = None;
     let mut etag = None;
     let mut location = None;
+    let mut subscription_info = None;
+    let mut subscription_seen = false;
     let mut header_count = 0_usize;
 
     for line in lines {
@@ -883,6 +895,9 @@ fn parse_response_head(block: &[u8]) -> Result<ResponseHead, DownloadError> {
             set_string_once(&mut etag, value, "ETag")?;
         } else if name.eq_ignore_ascii_case("location") {
             set_string_once(&mut location, value, "Location")?;
+        } else if name.eq_ignore_ascii_case("subscription-userinfo") && !subscription_seen {
+            subscription_seen = true;
+            subscription_info = SubscriptionInfo::parse(value);
         }
     }
 
@@ -893,6 +908,7 @@ fn parse_response_head(block: &[u8]) -> Result<ResponseHead, DownloadError> {
         content_encoding,
         etag,
         location,
+        subscription_info,
     })
 }
 
@@ -1055,6 +1071,20 @@ mod tests {
         dispatch::{DatagramTransport, DispatchError},
         session::{DatagramSession, Destination},
     };
+
+    #[test]
+    fn subscription_header_uses_first_value_including_an_empty_one() {
+        let head = parse_response_head(
+            b"HTTP/1.1 200 OK\r\nSubscription-Userinfo: upload=7\r\nsubscription-userinfo: upload=99",
+        )
+        .unwrap();
+        assert_eq!(head.subscription_info.unwrap().upload, 7);
+        let head = parse_response_head(
+            b"HTTP/1.1 304 Not Modified\r\nSubscription-Userinfo: \r\nsubscription-userinfo: upload=99",
+        )
+        .unwrap();
+        assert_eq!(head.subscription_info, None);
+    }
 
     struct PlainHttpsConnector;
 
@@ -1220,7 +1250,12 @@ mod tests {
                     assert_eq!(fs::read(&path).unwrap(), b"data");
                 }
                 "not-modified" => {
-                    assert_eq!(outcome.unwrap(), DownloadOutcome::NotModified);
+                    assert_eq!(
+                        outcome.unwrap(),
+                        DownloadOutcome::NotModified {
+                            subscription_info: None
+                        }
+                    );
                     assert!(!path.exists());
                 }
                 "truncated" => {
@@ -1334,6 +1369,7 @@ mod tests {
                 sha256: expected_sha256,
                 size: 8,
                 final_url: "https://cdn.example.test/final.dat?version=2".to_owned(),
+                subscription_info: None,
             }
         );
         assert_eq!(
@@ -1390,7 +1426,12 @@ mod tests {
         .await
         .expect("conditional request succeeds");
 
-        assert_eq!(outcome, DownloadOutcome::NotModified);
+        assert_eq!(
+            outcome,
+            DownloadOutcome::NotModified {
+                subscription_info: None
+            }
+        );
         assert!(!temporary_path.exists());
     }
 

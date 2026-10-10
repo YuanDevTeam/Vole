@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 use super::{
     ProxyProtocol, TlsCertificatePolicy, TlsConfig, TlsIdentityPem, deserialize_present_option,
-    invalid, validate_host, validate_port,
+    invalid, normalize_verification_name, validate_host, validate_port,
 };
 use crate::Result;
 
@@ -50,6 +50,12 @@ pub(super) struct RawHysteria2 {
     alpn: Option<Vec<String>>,
     #[serde(rename = "skip-cert-verify", default)]
     skip_cert_verify: bool,
+    #[serde(
+        rename = "name-cert-verify",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    name_cert_verify: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     fingerprint: Option<String>,
     #[serde(
@@ -210,7 +216,7 @@ impl RawHysteria2 {
                     certificate: TlsCertificatePolicy {
                         skip_cert_verify: self.skip_cert_verify,
                         fingerprint,
-                        verification_name: None,
+                        verification_name: normalize_verification_name(self.name_cert_verify)?,
                     },
                     identity,
                 },
