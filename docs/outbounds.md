@@ -7,7 +7,7 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
 
 - 物理 TCP/UDP 只能由共享 Dialer 创建，保留 Android protect、Windows 物理绑定和受控解析。
   传输包装器只消费 IO，不另建 socket 或系统 resolver。
-- `dialer-proxy` 可引用节点或策略组；与业务路由共享选择，完整 DAG 在配置期验证。
+- `dialer-proxy` 省略/空串使用物理 Dialer，也可指定 DIRECT 或引用节点、策略组；与业务路由共享选择，完整 DAG 在配置期验证。
   一次建链使用组快照和同一绝对期限；已有连接不随切组迁移，无自动 failover 或 DIRECT 回落。
 - 节点 `ip-version` 为 `dual`（默认）、`ipv4`、`ipv6`、`ipv4-prefer` 或 `ipv6-prefer`。
   限制或排序该节点的物理服务器地址与本地解析结果，仍受全局 IPv6 开关约束。
@@ -25,7 +25,10 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
 - TLS 使用共享 WebPKI、叶证书 pin/非叶信任锚与 skip 策略。pin 不匹配不能被 skip 绕过，
   TLS 握手签名始终验证。节点策略与恢复缓存不可变、互相隔离，标准 TLS 总票据预算为 4。
   字段及模板详见 [TLS 证书与指纹](tls-client-fingerprint.md)。
-- 未知字段、null、错型、非法枚举或不适用的传输选项在网络 IO 前拒绝。
+  SNI/servername 空串使用协议默认名称；pin/name-cert-verify 空串关闭对应覆盖。
+  certificate/private-key 均省略或为空时不启用客户端身份；非空身份仍须成对且有效。
+- 未知字段、错型、非法枚举或不适用的传输选项在网络 IO 前拒绝；显式 null 通常也拒绝，
+  HTTP 出站已有的可选 TLS 字段保留 null 等同省略的行为。
   凭据、UUID、业务目标和完整请求不进入 Debug/错误；资源与 Stop 见[公共策略](runtime-resource-policy.md)。
 
 ## HTTP / HTTPS CONNECT
@@ -98,6 +101,7 @@ fast-open 需要 upgrade。
 Upgrade 的 ED 仅允许默认 Sec-WebSocket-Protocol 头（大小写不敏感），不支持
 自定义头或路径 ED。101/头限额/截断失败不重放前缀，响应头后的字节保留给协议。
 这些选项同样适用于 VMess 的明文和标准 TLS；不改变各协议认证、UDP 编码或关闭责任。
+gRPC 的 HTTP authority 使用非空 SNI，否则使用 server，不包含端口；不改变物理拨号地址。
 gRPC 选项与 VMess/VLESS 共用：省略或空 service-name 默认 GunService，普通名映射 /name/Tun，以 / 开头使用完整路径；省略或空 user-agent 默认 grpc-go/1.36.0。
 ping-interval 为秒，0 不主动 PING，负值明确拒绝；max-connections/min-streams/max-streams 接受带符号整数，负阈值禁用相应分支。三项字面全零归一 max-connections=1；正 max-connections 优先于 max-streams。
 每个节点独立拥有连接池，空闲连接总是复用；复用保留原上游选择、TLS 身份和认证策略，每条逻辑流仍单独发送 Trojan 认证头。
@@ -118,17 +122,18 @@ aes-128-gcm、chacha20-poly1305、none；zero 归一 none。auto 按实际 AES �
 none 只关闭 body 加密，仍验证响应身份；不能启用 global-padding/authenticated-length，
 两开关默认 false。
 
-network 默认 tcp，另支持 ws/grpc/http/h2；均可明文或标准 TLS。tls 默认 false，
+network 省略/空串为 tcp，另支持 ws/grpc/http/h2；均可明文或标准 TLS。tls 默认 false，
 关闭时禁止 TLS 字段，即便空串、空列表或 false。认证名依次为 servername、WS Host
 去端口、server；HTTP 伪装 Host/H2 authority 不替代认证名。WS 需 http/1.1，gRPC/H2 需 h2。
 TLS 支持独立的 `name-cert-verify` 和成对内联 PEM `certificate/private-key` 客户端身份。
 
 - WS ED/路径/头及 HTTPUpgrade 普通/fast-open 约束同 Trojan。
 - gRPC 选项、默认值和节点连接池与 Trojan/VLESS 共用，每条逻辑流独立生成 VMess AEAD 认证；关闭逻辑流不关闭物理连接或兄弟流。
+  authority 使用非空 servername，否则使用 server:port；name-cert-verify 不参与 authority。
 - http 是 TCP 首包伪装：method 默认 GET，path 列表省略/空为 /，按 URL.Path 转义；
   头为字符串列表，每次握手独立选择路径/头值，Host 默认物理 server authority。
   仅首包封装一次，之后恢复原流；禁止 Content-Length/Transfer-Encoding。
-- h2 需要非空 authority 列表，path 默认 /，每流选一个 authority，通过 HTTP/2 PUT body
+- h2 的 authority 列表省略/空时使用 www.example.com，path 省略/空时为 /，每流选一个 authority，通过 HTTP/2 PUT body
   双向传输；明文 prior knowledge、TLS h2，无 gRPC 帧。
 
 关闭对齐 Mihomo：TCP/WS 可保留上传 EOF 后的读取；gRPC/HTTP/H2 关闭整条逻辑流，
@@ -195,7 +200,7 @@ pacer；这是混淆不是认证，错误密钥由 QUIC 拒绝，短包有界丢
 ## TUIC v5
 
 固定 QUIC/TLS 1.3，复用官方 Quinn、rustls/ring 与共享受控数据报适配器。
-仅 v5；必填标准 UUID 与原样 UTF-8 password，后者可空、最长 65,535 字节。
+仅 v5；必填标准 UUID。password 为原样 UTF-8，省略/空串为空密码，最长 65,535 字节。
 SNI 缺省 server，ALPN 缺省 h3；显式空列表拒绝，非空有序列表必须实际协商命中。
 使用共享 pin/skip/独立验证名；无命名 TCP 指纹、mTLS、ECH、0-RTT 或跨节点恢复。
 拥塞使用官方 Quinn cubic（默认）、new_reno 或 bbr，不承诺与其他实现的吞吐相同。

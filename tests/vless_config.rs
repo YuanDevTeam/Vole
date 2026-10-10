@@ -174,16 +174,73 @@ fn stream_transports_and_explicit_tls_policy_have_strict_public_fields() {
     }
     for fields in [
         json!({"skip-cert-verify":false}),
+        json!({"tls":false,"servername":"","fingerprint":"","certificate":"","private-key":""}),
+        json!({"tls":true,"reality-opts":{},"client-fingerprint":""}),
         json!({"tls":true,"fingerprint":"invalid"}),
-        json!({"tls":true,"name-cert-verify":""}),
+        json!({"tls":true,"name-cert-verify":"bad\nname"}),
         json!({"tls":true,"certificate":"bad"}),
         json!({"tls":true,"certificate":"bad","private-key":"bad"}),
         json!({"network":"tcp","ws-opts":{}}),
-        json!({"network":"h2","h2-opts":{"host":[]}}),
         json!({"network":"grpc","grpc-opts":{"grpc-service-name":"vless","future":1}}),
     ] {
         assert!(Config::parse_yaml(&document(fields)).is_err());
     }
+}
+
+#[test]
+fn empty_network_and_servername_keep_transport_fallbacks_and_grpc_authority() {
+    use vole::config::{ProxyProtocol, SecurityConfig, StreamTransport, VlessTransport};
+    let config =
+        Config::parse_yaml(&document(json!({"network":"","tls":true,"servername":""}))).unwrap();
+    let ProxyProtocol::Vless(node) = &config.proxies[0].protocol else {
+        unreachable!()
+    };
+    assert!(matches!(
+        node.transport,
+        VlessTransport::Stream(StreamTransport::Tcp)
+    ));
+    for (server, servername, authority) in [
+        ("127.0.0.1", "", "127.0.0.1:443"),
+        ("::1", "", "[::1]:443"),
+        ("127.0.0.1", "cover.invalid", "cover.invalid"),
+        ("127.0.0.1", "2001:db8::1", "[2001:db8::1]"),
+    ] {
+        let config = Config::parse_yaml(&document(json!({
+            "server":server, "servername":servername, "tls":true, "network":"grpc",
+            "name-cert-verify":"verify.invalid", "grpc-opts":{"grpc-service-name":"edge"}
+        })))
+        .unwrap();
+        let ProxyProtocol::Vless(node) = &config.proxies[0].protocol else {
+            unreachable!()
+        };
+        let VlessTransport::Stream(StreamTransport::Grpc { uri, .. }) = &node.transport else {
+            unreachable!()
+        };
+        let SecurityConfig::Tls(tls) = &node.security else {
+            unreachable!()
+        };
+        assert_eq!(uri, &format!("https://{authority}/edge/Tun"));
+        assert_eq!(
+            tls.server_name,
+            if servername.is_empty() {
+                server
+            } else {
+                servername
+            }
+        );
+        assert_eq!((node.address.as_str(), node.port), (server, 443));
+    }
+    let config = Config::parse_yaml(&document(json!({
+        "tls":true,"servername":"","network":"ws","ws-opts":{"headers":{"Host":"cover.invalid:443"}}
+    })))
+    .unwrap();
+    let ProxyProtocol::Vless(node) = &config.proxies[0].protocol else {
+        unreachable!()
+    };
+    let SecurityConfig::Tls(tls) = &node.security else {
+        unreachable!()
+    };
+    assert_eq!(tls.server_name, "cover.invalid");
 }
 
 #[test]
@@ -207,5 +264,35 @@ fn extended_ws_and_grpc_fields_are_scoped_and_bounded() {
         json!({"network":"grpc","grpc-opts":{"grpc-service-name":"test","grpc-user-agent":"bad\r\nvalue"}}),
     ] {
         assert!(Config::parse_yaml(&document(fields)).is_err());
+    }
+}
+
+#[test]
+fn h2_omitted_and_empty_options_use_the_reference_authority() {
+    use vole::config::{ProxyProtocol, StreamTransport, VlessTransport};
+    for tls in [false, true] {
+        for options in [
+            json!({}),
+            json!({"h2-opts":{}}),
+            json!({"h2-opts":{"host":[],"path":""}}),
+        ] {
+            let mut fields = options;
+            fields["network"] = json!("h2");
+            fields["tls"] = json!(tls);
+            let config = Config::parse_yaml(&document(fields)).unwrap();
+            let ProxyProtocol::Vless(node) = &config.proxies[0].protocol else {
+                unreachable!()
+            };
+            let VlessTransport::Stream(StreamTransport::H2 { uris }) = &node.transport else {
+                unreachable!()
+            };
+            assert_eq!(
+                uris,
+                &[format!(
+                    "{}://www.example.com/",
+                    if tls { "https" } else { "http" }
+                )]
+            );
+        }
     }
 }

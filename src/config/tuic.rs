@@ -49,6 +49,7 @@ pub(super) struct RawTuic {
     server: String,
     port: u16,
     uuid: String,
+    #[serde(default)]
     password: String,
     #[serde(default)]
     udp: bool,
@@ -99,7 +100,10 @@ impl RawTuic {
             congestion: self.congestion_controller,
             udp_mode: self.udp_relay_mode,
             tls: TlsConfig {
-                server_name: self.sni.unwrap_or(self.server),
+                server_name: self
+                    .sni
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(self.server),
                 alpn: self
                     .alpn
                     .unwrap_or_else(|| vec!["h3".into()])
@@ -113,15 +117,10 @@ impl RawTuic {
                 client_fingerprint: None,
                 certificate: TlsCertificatePolicy {
                     skip_cert_verify: self.skip_cert_verify,
-                    verification_name: self.name_cert_verify,
-                    fingerprint: self
-                        .fingerprint
-                        .as_deref()
-                        .map(super::vless::parse_pin)
-                        .transpose()
-                        .map_err(|_| {
-                            crate::VoleError::InvalidConfig("invalid TUIC certificate pin".into())
-                        })?,
+                    verification_name: super::normalize_verification_name(self.name_cert_verify)?,
+                    fingerprint: super::normalize_certificate_fingerprint(
+                        self.fingerprint.as_deref(),
+                    )?,
                 },
             },
         };

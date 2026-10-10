@@ -36,8 +36,8 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
   peer 仅在实际使用时解析/建链；Mihomo 在节点初始化时解析所有 peer。
 - 节点 UDP 能力按 [出站契约](outbounds.md) 声明；rule 模式跳过不支持 UDP 的目标，继续匹配后续规则。
   global 模式和显式 DNS 出口不执行此跳过。负载均衡组按其声明能力参与规则匹配，实际选中成员仍须支持 UDP。
-- 未配置入站的配置不能启动。Controller 沿用回环地址、secret 及运行配置准入，见 [Controller API](controller-api.md)。
-  /dns/query 查询真实上游；连接表按 UDP 目标流管理，memory 不代表进程 RSS。
+- 未启用 mixed-port 或 TUN 时仍可运行 Controller 和资源任务。Controller 沿用回环地址、secret 准入，见 [Controller API](controller-api.md)。
+  /dns/query 查询真实上游；连接表按 UDP 目标流管理，memory 返回当前进程 resident bytes，平台口径不同。
 - fake-IP TTL 最小一秒；映射生命周期独立于 TTL。本地选择和映射存储不保证与 Mihomo 数据库互读。
 - Apple、Android、Windows UWP 的网络设置、权限和 App 生命周期仍归宿主；Windows Wintun 使用外置 DLL。
   借用 Unix fd 只复制并保留原描述符。Linux 扩展路由、旁路由、防火墙/NAT、进程/UID 规则不在当前范围。

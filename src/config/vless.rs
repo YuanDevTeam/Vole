@@ -160,7 +160,11 @@ impl RawVless {
             })?;
             VlessEncryption::MlKem768X25519Plus(self.encryption)
         };
-        let network = self.network.as_deref().unwrap_or("tcp");
+        let network = self
+            .network
+            .as_deref()
+            .filter(|network| !network.is_empty())
+            .unwrap_or("tcp");
         let vision = self.flow == "xtls-rprx-vision";
         if self.jls_opts.is_some() && (vision || self.reality_opts.is_some()) {
             return invalid("JLS cannot be combined with REALITY or Vision");
@@ -218,6 +222,7 @@ impl RawVless {
                 grpc,
                 self.http,
                 self.h2,
+                self.servername.as_deref().filter(|name| !name.is_empty()),
             )?
         };
         let standard_options = self.skip_cert_verify.is_some()
@@ -280,26 +285,15 @@ impl RawVless {
         {
             return invalid("invalid VLESS ALPN");
         }
-        let explicit_name = self.servername.is_some();
-        let server_name = self.servername.unwrap_or(fallback_name);
+        let servername = self.servername.filter(|name| !name.is_empty());
+        let explicit_name = servername.is_some();
+        let server_name = servername.unwrap_or(fallback_name);
         validate_host(&server_name, "VLESS servername")?;
         if ech.is_some() && server_name.parse::<std::net::IpAddr>().is_ok() {
             return invalid("ECH requires a DNS servername");
         }
-        if let Some(name) = &self.name_cert_verify {
-            validate_host(name, "VLESS certificate verification name")?;
-        }
-        let identity = match (self.certificate, self.private_key) {
-            (None, None) => None,
-            (Some(certificate), Some(private_key)) => {
-                validate_client_identity(&certificate, &private_key)?;
-                Some(TlsIdentityPem {
-                    certificate,
-                    private_key,
-                })
-            }
-            _ => return invalid("VLESS certificate and private-key must be provided together"),
-        };
+        let verification_name = normalize_verification_name(self.name_cert_verify)?;
+        let identity = normalize_client_identity(self.certificate, self.private_key)?;
         let security = match (self.reality_opts, self.jls_opts) {
             (Some(raw), None) => {
                 let mut config = raw.normalize(server_name)?;
@@ -328,12 +322,9 @@ impl RawVless {
                 alpn,
                 required_alpn: default_alpn.map(<[u8]>::to_vec),
                 certificate: TlsCertificatePolicy {
-                    verification_name: self.name_cert_verify,
+                    verification_name,
                     skip_cert_verify: self.skip_cert_verify.unwrap_or(false),
-                    fingerprint: self
-                        .fingerprint
-                        .map(|value| parse_pin(&value))
-                        .transpose()?,
+                    fingerprint: normalize_certificate_fingerprint(self.fingerprint.as_deref())?,
                 },
                 identity,
             }),

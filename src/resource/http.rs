@@ -831,9 +831,9 @@ fn parse_response_head(block: &[u8]) -> Result<ResponseHead, DownloadError> {
         .next()
         .ok_or_else(|| DownloadError::Protocol("missing HTTP status line".to_owned()))?;
     let mut status_parts = status_line.splitn(3, ' ');
-    if status_parts.next() != Some("HTTP/1.1") {
+    if !matches!(status_parts.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
         return Err(DownloadError::Protocol(
-            "server did not respond with HTTP/1.1".to_owned(),
+            "server did not respond with HTTP/1.0 or HTTP/1.1".to_owned(),
         ));
     }
     let status_text = status_parts
@@ -1412,72 +1412,79 @@ mod tests {
     #[tokio::test]
     async fn not_modified_removes_the_unused_temporary_file() {
         let directory = tempdir().expect("tempdir");
-        let temporary_path = directory.path().join("geoip.dat.new");
-        let dispatcher = Arc::new(ScriptedDispatcher::new([
-            b"HTTP/1.1 304 Not Modified\r\nETag: \"old\"\r\n\r\n".to_vec(),
-        ]));
-        let outcome = download_with_connector(
-            request(
-                dispatcher,
-                "https://rules.example.test/geoip.dat",
-                temporary_path.clone(),
-            ),
-            &PlainHttpsConnector,
-        )
-        .await
-        .expect("conditional request succeeds");
-
-        assert_eq!(
-            outcome,
-            DownloadOutcome::NotModified {
-                subscription_info: None
-            }
-        );
-        assert!(!temporary_path.exists());
+        for version in ["HTTP/1.0", "HTTP/1.1"] {
+            let temporary_path = directory.path().join("geoip.dat.new");
+            let dispatcher = Arc::new(ScriptedDispatcher::new([
+                format!("{version} 304 Not Modified\r\nETag: \"old\"\r\nSubscription-Userinfo: upload=7\r\n\r\n").into_bytes(),
+            ]));
+            let outcome = download_with_connector(
+                request(
+                    dispatcher,
+                    "https://rules.example.test/geoip.dat",
+                    temporary_path.clone(),
+                ),
+                &PlainHttpsConnector,
+            )
+            .await
+            .expect("conditional request succeeds");
+            assert_eq!(
+                outcome,
+                DownloadOutcome::NotModified {
+                    subscription_info: Some(SubscriptionInfo {
+                        upload: 7,
+                        ..Default::default()
+                    })
+                }
+            );
+            assert!(!temporary_path.exists());
+        }
     }
 
     #[tokio::test]
     async fn supports_content_length_and_eof_delimited_bodies() {
         let directory = tempdir().expect("tempdir");
-        let content_length_path = directory.path().join("content-length.new");
-        let content_length_dispatcher = Arc::new(ScriptedDispatcher::new([
-            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345ignored".to_vec(),
-        ]));
-        let content_length = download_with_connector(
-            request(
-                content_length_dispatcher,
-                "https://rules.example.test/content-length",
-                content_length_path.clone(),
-            ),
-            &PlainHttpsConnector,
-        )
-        .await
-        .expect("content-length body");
-        assert!(matches!(
-            content_length,
-            DownloadOutcome::Downloaded { size: 5, .. }
-        ));
-        assert_eq!(
-            fs::read(content_length_path).expect("length file"),
-            b"12345"
-        );
-
-        let eof_path = directory.path().join("eof.new");
-        let eof_dispatcher = Arc::new(ScriptedDispatcher::new([
-            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\neof-body".to_vec(),
-        ]));
-        let eof = download_with_connector(
-            request(
-                eof_dispatcher,
-                "https://rules.example.test/eof",
-                eof_path.clone(),
-            ),
-            &PlainHttpsConnector,
-        )
-        .await
-        .expect("EOF body");
-        assert!(matches!(eof, DownloadOutcome::Downloaded { size: 8, .. }));
-        assert_eq!(fs::read(eof_path).expect("EOF file"), b"eof-body");
+        for (version, suffix) in [("HTTP/1.0", "1.0"), ("HTTP/1.1", "1.1")] {
+            for (name, headers, body, expected) in [
+                (
+                    "length",
+                    "Content-Length: 5\r\n",
+                    "12345ignored",
+                    b"12345".as_slice(),
+                ),
+                (
+                    "eof",
+                    "Connection: close\r\n",
+                    "eof-body",
+                    b"eof-body".as_slice(),
+                ),
+            ] {
+                let path = directory.path().join(format!("{name}-{suffix}.new"));
+                let dispatcher = Arc::new(ScriptedDispatcher::new([
+                    format!("{version} 200 OK\r\n{headers}ETag: \"new\"\r\nSubscription-Userinfo: download=19\r\n\r\n{body}").into_bytes(),
+                ]));
+                let outcome = download_with_connector(
+                    request(dispatcher, "https://rules.example.test/file", path.clone()),
+                    &PlainHttpsConnector,
+                )
+                .await
+                .expect("download body");
+                let DownloadOutcome::Downloaded {
+                    size,
+                    sha256,
+                    etag,
+                    subscription_info,
+                    ..
+                } = outcome
+                else {
+                    panic!("download outcome")
+                };
+                assert_eq!(size, expected.len() as u64);
+                assert_eq!(sha256.as_slice(), Sha256::digest(expected).as_slice());
+                assert_eq!(etag.as_deref(), Some("\"new\""));
+                assert_eq!(subscription_info.unwrap().download, 19);
+                assert_eq!(fs::read(path).expect("downloaded file"), expected);
+            }
+        }
     }
 
     #[tokio::test]

@@ -354,6 +354,9 @@ impl ProviderTemplate {
                     map.insert("url".into(), url.clone().into());
                 }
                 let dynamic = !used.is_empty() || all_proxies || all_providers;
+                if declared.is_empty() && !dynamic {
+                    return invalid("proxy group requires proxies or use");
+                }
                 let mut names = declared;
                 if all_proxies {
                     for name in &static_names {
@@ -387,9 +390,6 @@ impl ProviderTemplate {
                 }
                 let mut names = selected;
                 if names.is_empty() {
-                    if !dynamic {
-                        return invalid("proxy group requires proxies or use");
-                    }
                     names.push(fallback.clone());
                 }
                 if let Some(default) = map.get("default-selected").and_then(Value::as_str)
@@ -731,6 +731,26 @@ fn apply_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn static_members_filtered_to_empty_use_the_declared_fallback() {
+        for (fallback, expected) in [
+            ("", "COMPATIBLE"),
+            (", empty-fallback: DIRECT", "DIRECT"),
+            (", empty-fallback: edge", "edge"),
+        ] {
+            let yaml = format!(
+                "mixed-port: 1080\nproxies: [{{name: edge, type: socks5, server: 192.0.2.1, port: 1080}}]\nproxy-groups: [{{name: filtered, type: select, proxies: [edge], exclude-filter: '^edge'{fallback}}}]\nrules: ['MATCH,filtered']\n"
+            );
+            let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            assert_eq!(config.proxy_groups[0].members.len(), 1);
+            assert_eq!(config.proxy_groups[0].members[0].name, expected);
+            assert!(
+                Config::parse_yaml(yaml.replace("proxies: [edge]", "proxies: []").as_bytes())
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn provider_and_group_name_expressions_materialize_real_templates() {
         let config = Config::parse_yaml(

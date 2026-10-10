@@ -2389,7 +2389,7 @@ async fn synthetic_fd_with_dns_disabled_dispatches_tcp_and_reuses_udp_associatio
     assert_eq!(
         dispatcher.tcp_sessions.lock().unwrap()[0],
         StreamSession {
-            metadata: Default::default(),
+            metadata: crate::session::InboundMetadata::new(tcp_destination.port()),
             inbound: InboundKind::Tun,
             source: tcp_source,
             destination: Destination::Ip(tcp_destination),
@@ -2498,7 +2498,7 @@ async fn unconfigured_tls_port_dispatches_without_reading_a_prefix() {
     assert_eq!(
         dispatcher.tcp_sessions.lock().unwrap()[0],
         StreamSession {
-            metadata: Default::default(),
+            metadata: crate::session::InboundMetadata::new(destination.port()),
             inbound: InboundKind::Tun,
             source,
             destination: Destination::Ip(destination),

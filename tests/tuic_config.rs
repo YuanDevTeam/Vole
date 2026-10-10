@@ -15,7 +15,7 @@ fn parse(node: Value) -> vole::Result<Config> {
 }
 
 #[test]
-fn explicit_v5_identity_accepts_empty_password_without_enabling_business_udp() {
+fn v5_identity_defaults_password_without_enabling_business_udp() {
     #[cfg(feature = "interop-test")]
     let _case = vole::resources::case_events::Case::new("TUIC-CFG", "identity");
     if !cfg!(feature = "outbound-tuic") {
@@ -25,11 +25,17 @@ fn explicit_v5_identity_accepts_empty_password_without_enabling_business_udp() {
     let c = parse(node()).unwrap();
     assert!(!c.proxies[0].udp);
     assert_eq!(c.proxies[0].address(), "peer.invalid");
-    for field in ["uuid", "password"] {
-        let mut n = node();
-        n.as_object_mut().unwrap().remove(field);
-        assert!(parse(n).is_err());
-    }
+    let mut n = node();
+    n.as_object_mut().unwrap().remove("password");
+    let c = parse(n).unwrap();
+    let vole::config::ProxyProtocol::Tuic(t) = &c.proxies[0].protocol else {
+        panic!("protocol");
+    };
+    assert_eq!(t.password, "");
+    assert!(!c.proxies[0].udp);
+    let mut n = node();
+    n.as_object_mut().unwrap().remove("uuid");
+    assert!(parse(n).is_err());
 }
 
 #[test]
@@ -87,6 +93,14 @@ fn strict_v5_tls_and_identity_bounds_preserve_values() {
     assert_eq!(t.tls.alpn, [b"h3".to_vec()]);
     assert!(t.tls.tls13_only);
     assert_eq!(t.congestion, TuicCongestion::Cubic);
+    let mut n = node();
+    n["sni"] = json!("");
+    n["name-cert-verify"] = json!("");
+    n["fingerprint"] = json!("");
+    let t = extract(n);
+    assert_eq!(t.tls.server_name, "peer.invalid");
+    assert_eq!(t.tls.certificate.verification_name, None);
+    assert_eq!(t.tls.certificate.fingerprint, None);
     for password in [String::new(), " 原样\t\0 ".to_string(), "x".repeat(65535)] {
         let mut n = node();
         n["password"] = json!(password);
@@ -129,7 +143,6 @@ fn strict_v5_tls_and_identity_bounds_preserve_values() {
         ("port", json!(0)),
         ("port", json!(65536)),
         ("server", json!("")),
-        ("sni", json!("")),
         ("name-cert-verify", json!("bad\nname")),
         ("alpn", json!([])),
         ("alpn", json!([""])),

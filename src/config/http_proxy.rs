@@ -85,25 +85,13 @@ impl RawHttp {
             return invalid("HTTP CONNECT does not carry a request body");
         }
         let tls = if self.tls {
-            let name = self.sni.unwrap_or_else(|| self.server.clone());
+            let name = self
+                .sni
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| self.server.clone());
             validate_host(&name, "HTTP sni")?;
-            if let Some(verify) = &self.name_cert_verify {
-                validate_host(verify, "HTTP verification name")?;
-            }
-            let identity = match (self.certificate, self.private_key) {
-                (Some(certificate), Some(private_key)) => {
-                    crate::security::TlsClientIdentity::from_pem(&certificate, &private_key)
-                        .map_err(|_| {
-                            VoleError::InvalidConfig("invalid HTTP client identity".into())
-                        })?;
-                    Some(TlsIdentityPem {
-                        certificate,
-                        private_key,
-                    })
-                }
-                (None, None) => None,
-                _ => return invalid("HTTP certificate and private-key must be paired"),
-            };
+            let verification_name = normalize_verification_name(self.name_cert_verify)?;
+            let identity = normalize_client_identity(self.certificate, self.private_key)?;
             Some(TlsConfig {
                 server_name: name,
                 alpn: vec![b"http/1.1".to_vec()],
@@ -114,12 +102,8 @@ impl RawHttp {
                 identity,
                 certificate: TlsCertificatePolicy {
                     skip_cert_verify: self.skip_cert_verify,
-                    verification_name: self.name_cert_verify,
-                    fingerprint: self
-                        .fingerprint
-                        .as_deref()
-                        .map(vless::parse_pin)
-                        .transpose()?,
+                    verification_name,
+                    fingerprint: normalize_certificate_fingerprint(self.fingerprint.as_deref())?,
                 },
             })
         } else {

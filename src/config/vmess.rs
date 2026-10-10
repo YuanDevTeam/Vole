@@ -151,9 +151,10 @@ pub(super) struct RawHttp {
     #[serde(default)]
     headers: BTreeMap<String, Vec<String>>,
 }
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawH2 {
+    #[serde(default)]
     host: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     path: Option<String>,
@@ -343,13 +344,20 @@ impl RawVmess {
             &self.server,
             self.port,
             self.tls,
-            self.network.as_deref().unwrap_or("tcp"),
+            self.network
+                .as_deref()
+                .filter(|network| !network.is_empty())
+                .unwrap_or("tcp"),
             self.ws,
             self.grpc,
             self.http,
             self.h2,
+            self.servername.as_deref().filter(|name| !name.is_empty()),
         )?;
-        let server_name = self.servername.unwrap_or(fallback_name);
+        let server_name = self
+            .servername
+            .filter(|name| !name.is_empty())
+            .unwrap_or(fallback_name);
         validate_host(&server_name, "VMess servername")?;
         let tls = if self.tls {
             let alpn: Vec<Vec<u8>> = self
@@ -371,22 +379,8 @@ impl RawVmess {
             {
                 return invalid("invalid VMess ALPN");
             }
-            let fingerprint = self
-                .fingerprint
-                .map(|value| {
-                    let hex: Vec<_> = value.trim().bytes().filter(|b| *b != b':').collect();
-                    if hex.len() != 64 || !hex.iter().all(u8::is_ascii_hexdigit) {
-                        return invalid("invalid VMess certificate fingerprint");
-                    }
-                    let mut pin = [0; 32];
-                    for (byte, pair) in pin.iter_mut().zip(hex.as_chunks::<2>().0) {
-                        *byte = ((pair[0] as char).to_digit(16).unwrap() * 16
-                            + (pair[1] as char).to_digit(16).unwrap())
-                            as u8;
-                    }
-                    Ok(pin)
-                })
-                .transpose()?;
+            let fingerprint =
+                super::normalize_certificate_fingerprint(self.fingerprint.as_deref())?;
             Some(super::TlsClientPolicy {
                 client_fingerprint: super::parse_client_fingerprint(
                     self.client_fingerprint.as_deref(),
@@ -432,6 +426,7 @@ pub(super) fn normalize_transport(
     grpc: Option<RawGrpc>,
     http: Option<RawHttp>,
     h2: Option<RawH2>,
+    grpc_authority: Option<&str>,
 ) -> Result<(StreamTransport, String)> {
     let authority = if server.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{}]:{}", server, port)
@@ -463,7 +458,10 @@ pub(super) fn normalize_transport(
                 uri: uri(
                     if tls { "wss" } else { "ws" },
                     &authority,
-                    ws.path.as_deref().unwrap_or("/"),
+                    ws.path
+                        .as_deref()
+                        .filter(|path| !path.is_empty())
+                        .unwrap_or("/"),
                 )?,
                 headers: ws.headers,
                 max_early_data: ws.max_early_data,
@@ -479,8 +477,19 @@ pub(super) fn normalize_transport(
         }
         ("grpc", None, grpc, None, None) => {
             let (path, options) = grpc.unwrap_or_default().normalize()?;
+            let grpc_authority = grpc_authority.map(|name| {
+                if name.parse::<std::net::Ipv6Addr>().is_ok() {
+                    format!("[{name}]")
+                } else {
+                    name.to_owned()
+                }
+            });
             StreamTransport::Grpc {
-                uri: uri(scheme, &authority, &path)?,
+                uri: uri(
+                    scheme,
+                    grpc_authority.as_deref().unwrap_or(&authority),
+                    &path,
+                )?,
                 options,
             }
         }
@@ -489,7 +498,10 @@ pub(super) fn normalize_transport(
             if http.path.is_empty() {
                 http.path.push("/".into());
             }
-            let method = http.method.unwrap_or_else(|| "GET".into());
+            let method = http
+                .method
+                .filter(|method| !method.is_empty())
+                .unwrap_or_else(|| "GET".into());
             if method.parse::<http::Method>().is_err() || http.headers.values().any(Vec::is_empty) {
                 return invalid("invalid HTTP transport options");
             }
@@ -510,7 +522,7 @@ pub(super) fn normalize_transport(
                 .path
                 .iter()
                 .map(|path| {
-                    if !path.starts_with('/') || path.contains(['\r', '\n']) {
+                    if (!path.is_empty() && !path.starts_with('/')) || path.contains(['\r', '\n']) {
                         return invalid("invalid HTTP transport path");
                     }
                     let mut url =
@@ -541,11 +553,22 @@ pub(super) fn normalize_transport(
                 headers: http.headers,
             }
         }
-        ("h2", None, None, None, Some(h2)) if !h2.host.is_empty() => {
+        ("h2", None, None, None, h2) => {
+            let mut h2 = h2.unwrap_or_default();
+            if h2.host.is_empty() {
+                h2.host.push("www.example.com".into());
+            }
             let mut uris = Vec::new();
             for host in h2.host {
                 authority_host(&host)?;
-                uris.push(uri(scheme, &host, h2.path.as_deref().unwrap_or("/"))?);
+                uris.push(uri(
+                    scheme,
+                    &host,
+                    h2.path
+                        .as_deref()
+                        .filter(|path| !path.is_empty())
+                        .unwrap_or("/"),
+                )?);
             }
             StreamTransport::H2 { uris }
         }

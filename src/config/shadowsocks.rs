@@ -87,7 +87,7 @@ pub(super) fn plugin(
     options: Option<RawShadowTls>,
     fingerprint: Option<String>,
 ) -> Result<Option<ShadowTlsConfig>> {
-    let (name, raw) = match (name, options) {
+    let (name, raw) = match (name.filter(|name| !name.is_empty()), options) {
         (None, None) if fingerprint.is_none() => return Ok(None),
         (Some(name), Some(raw)) => (name, raw),
         _ => return invalid("ShadowTLS plugin and plugin-opts must be provided together"),
@@ -105,13 +105,9 @@ pub(super) fn plugin(
             .map(String::into_bytes)
             .collect(),
         certificate: super::TlsCertificatePolicy {
-            verification_name: raw.name_cert_verify,
+            verification_name: super::normalize_verification_name(raw.name_cert_verify)?,
             skip_cert_verify: raw.skip_cert_verify,
-            fingerprint: raw
-                .fingerprint
-                .as_deref()
-                .map(super::vless::parse_pin)
-                .transpose()
+            fingerprint: super::normalize_certificate_fingerprint(raw.fingerprint.as_deref())
                 .map_err(|_| {
                     crate::VoleError::InvalidConfig("invalid ShadowTLS certificate pin".into())
                 })?,

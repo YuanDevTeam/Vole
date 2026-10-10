@@ -1,7 +1,7 @@
 #![cfg(feature = "outbound-vless")]
 
 use serde_json::{Value, json};
-use vole::config::{Config, ProxyProtocol};
+use vole::config::{Config, ProxyProtocol, XHttpMode};
 
 fn document(options: Value) -> Vec<u8> {
     serde_json::to_vec(&json!({
@@ -131,7 +131,13 @@ fn xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io() {
         ),
         ("session-length", 10, 128, json!({"session-table":"number"})),
     ] {
-        for value in [low.to_string(), high.to_string(), format!("{low}-{high}")] {
+        for value in [
+            low.to_string(),
+            high.to_string(),
+            format!("{low}-{high}"),
+            format!(" +{low} "),
+            format!(" +{low} - +{high} "),
+        ] {
             let mut options = extra.clone();
             options[field] = json!(value);
             assert!(
@@ -144,9 +150,7 @@ fn xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io() {
             "-1".into(),
             "1-0".into(),
             "1.0".into(),
-            " 1".into(),
             "1-2-3".into(),
-            String::new(),
         ] {
             let mut options = extra.clone();
             options[field] = json!(value);
@@ -197,6 +201,91 @@ fn xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io() {
             }
             assert!(Config::parse_yaml(&document(options)).is_ok());
         }
+    }
+}
+
+#[test]
+fn xhttp_empty_mode_path_and_download_name_use_each_legs_defaults() {
+    let config = Config::parse_yaml(&document(json!({"mode":"", "path":""}))).unwrap();
+    let ProxyProtocol::Vless(node) = &config.proxies[0].protocol else {
+        unreachable!()
+    };
+    assert_eq!(node.xhttp().unwrap().mode, XHttpMode::PacketUp);
+    assert_eq!(node.xhttp().unwrap().path, "/");
+
+    let mut input: Value = serde_json::from_slice(&document(json!({
+        "path":"/upload",
+        "download-settings":{"server":"download.example.com", "path":"", "servername":""}
+    })))
+    .unwrap();
+    input["proxies"][0]["servername"] = json!("parent.invalid");
+    let config = Config::parse_yaml(&serde_json::to_vec(&input).unwrap()).unwrap();
+    let ProxyProtocol::Vless(node) = &config.proxies[0].protocol else {
+        unreachable!()
+    };
+    assert_eq!(node.xhttp().unwrap().path, "/upload");
+    assert_eq!(node.xhttp().unwrap().host, "parent.invalid");
+    let download = node.download().unwrap();
+    assert_eq!(download.path, "/");
+    assert_eq!(download.security.server_name(), "download.example.com");
+    assert_eq!(download.host, "download.example.com");
+}
+
+#[test]
+fn xhttp_empty_request_and_pool_fields_restore_their_defaults() {
+    let expected = Config::parse_yaml(&document(json!({}))).unwrap();
+    let ProxyProtocol::Vless(expected_node) = &expected.proxies[0].protocol else {
+        unreachable!()
+    };
+    let actual = Config::parse_yaml(&document(json!({
+        "uplink-http-method":"",
+        "session-placement":"", "session-key":"", "session-length":" \t ",
+        "seq-placement":"", "seq-key":"",
+        "uplink-data-placement":"", "uplink-data-key":"", "uplink-chunk-size":" \t ",
+        "x-padding-bytes":" \t ", "x-padding-key":"", "x-padding-header":"",
+        "x-padding-placement":"", "x-padding-method":"",
+        "sc-max-each-post-bytes":" \t ", "sc-min-posts-interval-ms":""
+    })))
+    .unwrap();
+    let ProxyProtocol::Vless(actual_node) = &actual.proxies[0].protocol else {
+        unreachable!()
+    };
+    assert_eq!(
+        expected_node.xhttp().unwrap().request,
+        actual_node.xhttp().unwrap().request
+    );
+    for download in [false, true] {
+        let expected_options = if download {
+            json!({"download-settings":{"reuse-settings":{}}})
+        } else {
+            json!({"reuse-settings":{}})
+        };
+        let mut options = json!({"reuse-settings":{
+            "max-concurrency":"", "max-connections":" \t ", "c-max-reuse-times":"",
+            "h-max-request-times":"", "h-max-reusable-secs":" \t "
+        }});
+        if download {
+            options = json!({"download-settings":options});
+        }
+        let expected = Config::parse_yaml(&document(expected_options)).unwrap();
+        let actual = Config::parse_yaml(&document(options)).unwrap();
+        let (ProxyProtocol::Vless(expected), ProxyProtocol::Vless(actual)) =
+            (&expected.proxies[0].protocol, &actual.proxies[0].protocol)
+        else {
+            unreachable!()
+        };
+        let (expected, actual) = if download {
+            (
+                &expected.download().unwrap().reuse,
+                &actual.download().unwrap().reuse,
+            )
+        } else {
+            (
+                &expected.xhttp().unwrap().reuse,
+                &actual.xhttp().unwrap().reuse,
+            )
+        };
+        assert_eq!(expected, actual);
     }
 }
 

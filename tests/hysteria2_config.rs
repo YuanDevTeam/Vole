@@ -61,6 +61,11 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         node
     };
     let defaults = normalized(base.clone());
+    for field in ["obfs", "ports"] {
+        let mut raw = base.clone();
+        raw[field] = json!("");
+        assert_eq!(normalized(raw), defaults, "empty {field} uses defaults");
+    }
     for field in [
         "name",
         "server",
@@ -70,6 +75,7 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         "sni",
         "alpn",
         "skip-cert-verify",
+        "name-cert-verify",
         "fingerprint",
         "certificate",
         "private-key",
@@ -96,6 +102,17 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
     assert_eq!(defaults.tls.server_name, "localhost");
     assert_eq!(defaults.tls.alpn, vec![b"h3".to_vec()]);
     assert!(defaults.tls.tls13_only);
+    let mut raw = base.clone();
+    raw["sni"] = json!("public.example.com");
+    raw["name-cert-verify"] = json!("verified.example.com");
+    let node = normalized(raw.clone());
+    assert_eq!(node.tls.server_name, "public.example.com");
+    assert_eq!(
+        node.tls.certificate.verification_name.as_deref(),
+        Some("verified.example.com")
+    );
+    raw["name-cert-verify"] = json!("bad\nname");
+    assert!(parse(raw).is_err());
     for (value, expected) in [
         (json!(2), 250000),
         (json!("2"), 250000),
@@ -158,7 +175,6 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         (
             "ports",
             vec![
-                json!(""),
                 json!("1,,2"),
                 json!("2-1"),
                 json!("0"),
@@ -199,7 +215,6 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         ("tls", json!(false)),
         ("network", json!("tcp")),
         ("client-fingerprint", json!("chrome")),
-        ("name-cert-verify", json!("localhost")),
         ("certificate", json!("bad")),
         ("private-key", json!("bad")),
         ("obfs", json!("salamander")),

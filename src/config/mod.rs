@@ -2067,9 +2067,6 @@ impl RawVoleConfig {
         let tun = self
             .tun
             .map_or_else(|| Ok(TunConfig::default()), RawTunConfig::normalize)?;
-        if mixed_port.is_none() && !tun.enable {
-            return invalid("configuration requires mixed-port or tun.enable: true");
-        }
         let sniffer = self.sniffer.map_or_else(
             || Ok(SnifferConfig::disabled()),
             RawSnifferConfig::normalize,
@@ -2190,7 +2187,7 @@ fn normalize_external_controller(
     secret: Option<String>,
     has_proxy_groups: bool,
 ) -> Result<Option<ExternalControllerConfig>> {
-    let Some(listen) = listen else {
+    let Some(listen) = listen.filter(|listen| !listen.is_empty()) else {
         if secret.is_some() {
             return invalid("secret requires external-controller");
         }
@@ -2483,13 +2480,14 @@ fn normalize_proxy_graph_with_groups(
             proxy
                 .dialer_proxy
                 .as_deref()
+                .filter(|tag| *tag != "DIRECT")
                 .map(|tag| {
                     if let Some(id) = proxy_group_ids.get(tag) {
                         return Ok(RouteTargetId::Group(*id));
                     }
                     proxy_ids.get(tag).copied().map(RouteTargetId::Proxy).ok_or_else(|| {
                         VoleError::InvalidConfig(format!(
-                            "proxy `{}` dialer-proxy `{tag}` does not reference a configured proxy or group name",
+                            "proxy `{}` dialer-proxy `{tag}` does not reference DIRECT or a configured proxy or group name",
                             proxy.tag
                         ))
                     })
@@ -2751,10 +2749,7 @@ impl RawOutbound {
                     config.tls = Some(TlsClientPolicy {
                         certificate: TlsCertificatePolicy {
                             skip_cert_verify: skip_cert_verify.unwrap_or(false),
-                            fingerprint: fingerprint
-                                .as_deref()
-                                .map(vless::parse_pin)
-                                .transpose()?,
+                            fingerprint: normalize_certificate_fingerprint(fingerprint.as_deref())?,
                             verification_name: normalize_verification_name(name_cert_verify)?,
                         },
                         identity: normalize_client_identity(certificate, private_key)?,
@@ -2808,6 +2803,7 @@ impl RawOutbound {
         }
         let udp = udp || smux.as_ref().is_some_and(|options| !options.only_tcp);
         validate_route_target_definition_name(&tag, "proxy name")?;
+        let dialer_proxy = dialer_proxy.filter(|tag| !tag.is_empty());
         if let Some(dialer_proxy) = &dialer_proxy {
             validate_route_target_name(dialer_proxy, "dialer-proxy")?;
         }
@@ -2904,7 +2900,9 @@ fn normalize_anytls(
             "AnyTLS password must contain between 1 and {MAX_ANYTLS_PASSWORD_BYTES} UTF-8 bytes"
         ));
     }
-    let server_name = sni.unwrap_or_else(|| server.clone());
+    let server_name = sni
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| server.clone());
     validate_host(&server_name, "AnyTLS sni")?;
     let alpn = alpn
         .unwrap_or_default()
@@ -2924,17 +2922,7 @@ fn normalize_anytls(
             "AnyTLS alpn names must be 1..255 bytes and the encoded list at most 65533 bytes",
         );
     }
-    let fingerprint = fingerprint.map(|value| {
-        let hex = value.trim().bytes().filter(|byte| *byte != b':').collect::<Vec<_>>();
-        let mut pin = [0; 32];
-        if hex.len() != 64 || hex.iter().any(|byte| !byte.is_ascii_hexdigit()) {
-            return invalid("AnyTLS fingerprint must be a SHA-256 certificate digest in hex or colon-separated hex");
-        }
-        for (index, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
-            pin[index] = ((pair[0] as char).to_digit(16).unwrap() * 16 + (pair[1] as char).to_digit(16).unwrap()) as u8;
-        }
-        Ok(pin)
-    }).transpose()?;
+    let fingerprint = normalize_certificate_fingerprint(fingerprint.as_deref())?;
     Ok(AnyTlsOutboundConfig {
         address: server,
         port,
@@ -2953,6 +2941,13 @@ fn normalize_anytls(
     })
 }
 
+fn normalize_certificate_fingerprint(fingerprint: Option<&str>) -> Result<Option<[u8; 32]>> {
+    fingerprint
+        .filter(|value| !value.is_empty())
+        .map(vless::parse_pin)
+        .transpose()
+}
+
 fn normalize_verification_name(name: Option<String>) -> Result<Option<String>> {
     let name = name.filter(|name| !name.is_empty());
     if let Some(name) = &name {
@@ -2965,13 +2960,11 @@ fn normalize_client_identity(
     certificate: Option<String>,
     private_key: Option<String>,
 ) -> Result<Option<TlsIdentityPem>> {
-    match (certificate, private_key) {
+    match (
+        certificate.filter(|pem| !pem.is_empty()),
+        private_key.filter(|pem| !pem.is_empty()),
+    ) {
         (None, None) => Ok(None),
-        (Some(certificate), Some(private_key))
-            if certificate.is_empty() && private_key.is_empty() =>
-        {
-            Ok(None)
-        }
         (Some(certificate), Some(private_key)) => {
             crate::security::TlsClientIdentity::from_pem(&certificate, &private_key)
                 .map_err(|_| VoleError::InvalidConfig("invalid TLS client identity".into()))?;
@@ -3000,11 +2993,11 @@ impl RawXHttpSettings {
         let headers = XHttpHeaders::normalize(self.headers.clone())?;
         let has_download = self.download_settings.is_some();
         let mode = match self.mode.as_str() {
-            "auto" if matches!(security, SecurityConfig::Reality(_)) && has_download => {
+            "" | "auto" if matches!(security, SecurityConfig::Reality(_)) && has_download => {
                 XHttpMode::StreamUp
             }
-            "auto" if matches!(security, SecurityConfig::Reality(_)) => XHttpMode::StreamOne,
-            "auto" | "packet-up" => XHttpMode::PacketUp,
+            "" | "auto" if matches!(security, SecurityConfig::Reality(_)) => XHttpMode::StreamOne,
+            "" | "auto" | "packet-up" => XHttpMode::PacketUp,
             "stream-one" if !has_download => XHttpMode::StreamOne,
             "stream-one" => {
                 return invalid("xhttp mode `stream-one` cannot be used with download-settings");
@@ -3025,8 +3018,8 @@ impl RawXHttpSettings {
             ..
         } = self;
         let host = host.filter(|value| !value.is_empty());
-        if path.is_empty()
-            || path.len() > 2_048
+        let path = if path.is_empty() { "/".into() } else { path };
+        if path.len() > 2_048
             || !path.starts_with('/')
             || path.parse::<http::uri::PathAndQuery>().is_err()
         {
@@ -3165,6 +3158,7 @@ impl RawXHttpDownloadSettings {
 
         let server_name = servername
             .or_else(|| default_explicit_server_name.map(str::to_owned))
+            .filter(|name| !name.is_empty())
             .unwrap_or_else(|| address.clone());
         validate_host(&server_name, "XHTTP download servername")?;
         let host = host
@@ -3314,9 +3308,10 @@ impl RawXHttpDownloadSettings {
             return invalid("XHTTP HTTP/3 download requires standard TLS");
         }
 
-        let path = path.unwrap_or_else(|| default_path.to_owned());
-        if path.is_empty()
-            || path.len() > 2_048
+        let path = path
+            .map(|path| if path.is_empty() { "/".into() } else { path })
+            .unwrap_or_else(|| default_path.to_owned());
+        if path.len() > 2_048
             || !path.starts_with('/')
             || path.parse::<http::uri::PathAndQuery>().is_err()
         {
@@ -4659,19 +4654,18 @@ outbounds: []
 
     #[test]
     fn validates_listener_and_tun_constraints() {
-        for yaml in [
-            CURRENT_TLS.replace("mtu: 1500", "mtu: 1279"),
-            CURRENT_TLS
-                .replace("enable: true", "enable: false")
-                .replace(
-                    "mixed-port: 1080
-authentication:
-  - measure:secret\n",
-                    "",
-                ),
-        ] {
-            assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");
-        }
+        assert!(
+            Config::parse_yaml(CURRENT_TLS.replace("mtu: 1500", "mtu: 1279").as_bytes()).is_err()
+        );
+        let disabled = CURRENT_TLS
+            .replace("enable: true", "enable: false")
+            .replace(
+                "mixed-port: 1080\nauthentication:\n  - measure:secret\n",
+                "",
+            );
+        let config = Config::parse_yaml(disabled.as_bytes()).unwrap();
+        assert!(config.inbounds.is_empty());
+        assert!(!config.tun.enable);
     }
 
     #[test]
@@ -4726,6 +4720,9 @@ tun:
         .unwrap();
         assert!(config.external_controller.is_some());
         assert!(config.proxies.is_empty());
+        let disabled =
+            Config::parse_yaml(b"external-controller: \"\"\nrules: [\"MATCH,DIRECT\"]\n").unwrap();
+        assert!(disabled.external_controller.is_none());
     }
 
     #[test]
@@ -4907,7 +4904,13 @@ authentication:
             assert!(!mixed.access.allow_lan);
             assert!(mixed.access.ipv6);
         }
-        for fields in ["tun: {enable: true}", "mixed-port: 0\ntun: {enable: true}"] {
+        for fields in [
+            "",
+            "mixed-port: 0",
+            "tun: {enable: false}",
+            "tun: {enable: true}",
+            "mixed-port: 0\ntun: {enable: true}",
+        ] {
             let config = Config::parse_yaml(current_yaml(fields).as_bytes()).unwrap();
             assert_eq!(config.mixed_port, None);
             assert!(
@@ -4940,7 +4943,6 @@ authentication:
                 .matches("用户".as_bytes(), "密:码".as_bytes())
         );
         for fields in [
-            "mixed-port: 0",
             "mixed-port: -1",
             "mixed-port: 65536",
             "mixed-port: 1.0",
@@ -5111,7 +5113,7 @@ authentication:
                 &format!("    password: private-anytls-password\n    {fields}"),
             )
         };
-        for fields in ["alpn: []", "skip-cert-verify: false"] {
+        for fields in ["alpn: []", "skip-cert-verify: false", "fingerprint: ''"] {
             let config = Config::parse_yaml(configured(fields).as_bytes()).unwrap();
             let ProxyProtocol::AnyTls(anytls) = &config.proxies[0].protocol else {
                 panic!()
@@ -5145,7 +5147,6 @@ authentication:
             "skip-cert-verify: null",
             "skip-cert-verify: 'true'",
             "fingerprint: null",
-            "fingerprint: ''",
             "fingerprint: chrome",
             "fingerprint: aa:bb",
         ] {
@@ -5614,10 +5615,8 @@ authentication:
     }
 
     #[test]
-    fn current_config_requires_listener_and_valid_references() {
+    fn current_config_requires_valid_references() {
         for yaml in [
-            current_yaml("mixed-port: 0\nauthentication:\n  - measure:secret"),
-            current_yaml("tun:\n  enable: false"),
             current_yaml("tun:\n  enable: true\n  mtu: 1279"),
             current_yaml(
                 "mixed-port: 1080
@@ -5816,6 +5815,18 @@ authentication:
             Some(RouteTargetId::Proxy(second))
         );
         assert_eq!(config.proxies[1].dialer_proxy, None);
+        let direct = Config::parse_yaml(
+            yaml.replace("dialer-proxy: socks-hop", "dialer-proxy: DIRECT")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(direct.proxies[0].dialer_proxy, None);
+        let default = Config::parse_yaml(
+            yaml.replace("dialer-proxy: socks-hop", "dialer-proxy: \"\"")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(default.proxies[0].dialer_proxy, None);
         assert_eq!(
             config.rules[0].action,
             RuleAction::Route(RouteTargetId::Proxy(first))
@@ -6160,7 +6171,7 @@ authentication:
         );
         assert!(Config::parse_yaml(unknown.as_bytes()).is_err());
 
-        for invalid_reference in ["''", "null", "'bad#name'"] {
+        for invalid_reference in ["null", "'bad#name'"] {
             let yaml = two_proxy_yaml(
                 "mixed-port: 1080
 authentication:

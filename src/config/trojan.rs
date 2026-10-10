@@ -168,14 +168,14 @@ struct RawWebSocket {
     early_data_header_name: Option<String>,
 }
 
-fn uri(scheme: &str, server: &str, port: u16, path: &str) -> Result<String> {
+fn uri(scheme: &str, server: &str, path: &str) -> Result<String> {
     if !path.starts_with('/') || path.contains(['\r', '\n', '#']) {
         return invalid("invalid Trojan transport path");
     }
     let authority = if server.parse::<std::net::Ipv6Addr>().is_ok() {
-        format!("[{server}]:{port}")
+        format!("[{server}]")
     } else {
-        format!("{server}:{port}")
+        server.to_owned()
     };
     let uri = http::Uri::builder()
         .scheme(scheme)
@@ -272,7 +272,19 @@ impl RawTrojan {
         if self.password.is_empty() {
             return invalid("Trojan password must not be empty");
         }
-        let transport = match (self.network.as_deref().unwrap_or("tcp"), self.ws, self.grpc) {
+        let server_name = self
+            .sni
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.server.clone());
+        validate_host(&server_name, "Trojan sni")?;
+        let transport = match (
+            self.network
+                .as_deref()
+                .filter(|network| !network.is_empty())
+                .unwrap_or("tcp"),
+            self.ws,
+            self.grpc,
+        ) {
             ("tcp", None, None) => TrojanTransport::Tcp,
             ("ws", ws, None) => {
                 let ws = ws.unwrap_or_default();
@@ -289,9 +301,11 @@ impl RawTrojan {
                     )?,
                     uri: uri(
                         "wss",
-                        &self.server,
-                        self.port,
-                        ws.path.as_deref().unwrap_or("/"),
+                        &server_name,
+                        ws.path
+                            .as_deref()
+                            .filter(|path| !path.is_empty())
+                            .unwrap_or("/"),
                     )?,
                     headers: ws.headers,
                     max_early_data: ws.max_early_data,
@@ -308,14 +322,12 @@ impl RawTrojan {
             ("grpc", None, grpc) => {
                 let (path, options) = grpc.unwrap_or_default().normalize()?;
                 TrojanTransport::Grpc {
-                    uri: uri("https", &self.server, self.port, &path)?,
+                    uri: uri("https", &server_name, &path)?,
                     options,
                 }
             }
             _ => return invalid("Trojan requires tcp, ws with ws-opts, or grpc with grpc-opts"),
         };
-        let server_name = self.sni.unwrap_or_else(|| self.server.clone());
-        validate_host(&server_name, "Trojan sni")?;
         let alpn: Vec<Vec<u8>> = self
             .alpn
             .unwrap_or_else(|| {
@@ -340,22 +352,7 @@ impl RawTrojan {
         {
             return invalid("Trojan ALPN does not include the selected transport");
         }
-        let fingerprint = self
-            .fingerprint
-            .map(|value| {
-                let hex: Vec<u8> = value.trim().bytes().filter(|byte| *byte != b':').collect();
-                if hex.len() != 64 || !hex.iter().all(u8::is_ascii_hexdigit) {
-                    return invalid("Trojan fingerprint must be a SHA-256 certificate digest");
-                }
-                let mut pin = [0; 32];
-                for (byte, pair) in pin.iter_mut().zip(hex.as_chunks::<2>().0) {
-                    *byte = ((pair[0] as char).to_digit(16).unwrap() * 16
-                        + (pair[1] as char).to_digit(16).unwrap())
-                        as u8;
-                }
-                Ok(pin)
-            })
-            .transpose()?;
+        let fingerprint = super::normalize_certificate_fingerprint(self.fingerprint.as_deref())?;
         Ok((
             self.name,
             self.dialer_proxy,

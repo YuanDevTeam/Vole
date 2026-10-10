@@ -1,8 +1,9 @@
 use serde::Deserialize;
 
 use super::{
-    ProxyProtocol, TlsCertificatePolicy, TlsConfig, TlsIdentityPem, deserialize_present_option,
-    invalid, normalize_verification_name, validate_host, validate_port,
+    ProxyProtocol, TlsCertificatePolicy, TlsConfig, deserialize_present_option, invalid,
+    normalize_certificate_fingerprint, normalize_client_identity, normalize_verification_name,
+    validate_host, validate_port,
 };
 use crate::Result;
 
@@ -124,6 +125,7 @@ impl RawHysteria2 {
         }
         let hopping = self
             .ports
+            .filter(|ports| !ports.is_empty())
             .map(|ports| {
                 let ports = parse_ports(&ports)?;
                 let (min_seconds, max_seconds) = parse_interval(self.hop_interval.as_ref())?;
@@ -150,12 +152,18 @@ impl RawHysteria2 {
         {
             return invalid("invalid or over-limit Hysteria2 authentication header");
         }
-        let obfs_password = match (self.obfs.as_deref(), self.obfs_password) {
+        let obfs_password = match (
+            self.obfs.as_deref().filter(|obfs| !obfs.is_empty()),
+            self.obfs_password,
+        ) {
             (None, None) => None,
             (Some("salamander"), Some(password)) if !password.is_empty() => Some(password),
             _ => return invalid("Hysteria2 Salamander requires obfs and a nonempty obfs-password"),
         };
-        let server_name = self.sni.unwrap_or_else(|| self.server.clone());
+        let server_name = self
+            .sni
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.server.clone());
         validate_host(&server_name, "Hysteria2 sni")?;
         let mut alpn = self.alpn.unwrap_or_default();
         if alpn.is_empty() {
@@ -166,30 +174,8 @@ impl RawHysteria2 {
         {
             return invalid("invalid Hysteria2 ALPN list");
         }
-        let identity = match (self.certificate, self.private_key) {
-            (None, None) => None,
-            (Some(certificate), Some(private_key)) => {
-                #[cfg(feature = "outbound-hysteria2")]
-                crate::security::TlsClientIdentity::from_pem(&certificate, &private_key).map_err(
-                    |_| crate::VoleError::InvalidConfig("invalid Hysteria2 client identity".into()),
-                )?;
-                Some(TlsIdentityPem {
-                    certificate,
-                    private_key,
-                })
-            }
-            _ => return invalid("Hysteria2 certificate and private-key must be paired"),
-        };
-        let fingerprint = self
-            .fingerprint
-            .map(|pin| {
-                super::vless::parse_pin(&pin).map_err(|_| {
-                    crate::VoleError::InvalidConfig(
-                        "invalid Hysteria2 certificate fingerprint".into(),
-                    )
-                })
-            })
-            .transpose()?;
+        let identity = normalize_client_identity(self.certificate, self.private_key)?;
+        let fingerprint = normalize_certificate_fingerprint(self.fingerprint.as_deref())?;
         let udp_mtu = if self.udp_mtu == 0 {
             1197
         } else {

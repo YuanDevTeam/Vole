@@ -71,31 +71,24 @@ rules:
 }
 
 #[test]
-fn keeps_vole_stricter_than_mihomo_at_the_documented_boundaries() {
-    for groups in [
-        r#"
-proxy-groups:
-  - name: primary
-    type: select
-    proxies: [node-a]
-    default-selected: missing
-"#,
-        r#"
-proxy-groups:
-  - name: primary
-    type: select
-    proxies: [node-a]
-    url: https://example.com/generate_204
-"#,
-        r#"
-proxy-groups:
-  - name: primary
-    type: url-test
-    proxies: [node-a]
-"#,
+fn validates_group_selection_and_health_defaults() {
+    let yaml = format!(
+        "{COMMON_PREFIX}proxy-groups:\n  - name: primary\n    type: select\n    proxies: [node-a]\n    default-selected: missing\nrules: ['MATCH,primary']\n"
+    );
+    assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
+    for (kind, url, expected) in [
+        (
+            "select",
+            "    url: https://example.com/generate_204\n",
+            "https://example.com/generate_204",
+        ),
+        ("url-test", "", "https://www.gstatic.com/generate_204"),
     ] {
-        let yaml = format!("{COMMON_PREFIX}{groups}rules:\n  - MATCH,primary\n");
-        assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");
+        let yaml = format!(
+            "{COMMON_PREFIX}proxy-groups:\n  - name: primary\n    type: {kind}\n    proxies: [node-a]\n{url}rules: ['MATCH,primary']\n"
+        );
+        let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        assert_eq!(config.proxy_groups[0].health.url, expected);
     }
 }
 

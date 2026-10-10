@@ -5,7 +5,7 @@ HTTP 与 SOCKS5 共用一个混合入口，并和 TUN 共用 Dispatcher、规则
 
 ## 监听与认证
 
-- `mixed-port` 省略或 0 关闭，启用时为 1–65535；混合入口和 TUN 至少启用一个。
+- `mixed-port` 省略或 0 关闭，启用时为 1–65535；关闭混合入口和 TUN 的配置仍可启动。
   同一 TCP 端口接入 HTTP 转发、CONNECT、Upgrade 和 SOCKS5 CONNECT、UDP ASSOCIATE。
   SOCKS5 UDP 随入口启用并绑定同地址、同端口，不提供独立入站 UDP 开关。
 - 顶层 `port`、`socks-port`、`udp` 和 `listeners` 均拒绝，不迁移或忽略旧字段。

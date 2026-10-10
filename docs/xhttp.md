@@ -9,11 +9,11 @@ REALITY、JLS、静态 ECH 的身份规则见 [VLESS](vless.md)，实际验证�
 
 H1/H2 可使用明文、标准 TLS 1.3、REALITY（经典默认、显式混合模式）或 JLS。H3 必须使用标准 TLS 1.3，不允许同腿明文、REALITY 或 JLS。QUIC 收发走受控数据报，上游有效预算小于 1200 字节即拒绝，不绕开代理、protect 或接口绑定；路径 MTU 探测关闭。
 
-`xhttp-opts.mode` 接受 `auto`（默认）、`packet-up`、`stream-up`、`stream-one`。auto 在 REALITY 无下载配置时选择 stream-one，有下载配置时选择 stream-up，其余选择 packet-up。stream-one 是一条双工 POST，不允许 `download-settings`；其余模式以同一会话 ID 关联上传与下载。`path` 默认 `/`，`host` 显式非空优先，否则使用该腿 servername/server；IPv6 authority 使用方括号。主腿与下载腿的 host 均禁止 userinfo（`@`）。
+`xhttp-opts.mode` 接受 `auto`（省略或空串默认）、`packet-up`、`stream-up`、`stream-one`。auto 在 REALITY 无下载配置时选择 stream-one，有下载配置时选择 stream-up，其余选择 packet-up。stream-one 是一条双工 POST，不允许 `download-settings`；其余模式以同一会话 ID 关联上传与下载。`path` 省略或空串默认 `/`，`host` 显式非空优先，否则使用该腿 servername/server；IPv6 authority 使用方括号。主腿与下载腿的 host 均禁止 userinfo（`@`）。
 
 ## 请求字段
 
-区间字段均为字符串 `"N"` 或 `"N-M"`，不接受数字、负数、倒置区间、空串或溢出。每次采样保持在闭区间内。
+区间字段均为字符串 `"N"` 或 `"N-M"`；空串或纯空白使用字段默认，数字及区间两端允许外围空白和正号。不接受数字类型、负数、倒置区间或溢出。每次采样保持在闭区间内。
 
 | 字段 | 默认及约束 |
 | --- | --- |

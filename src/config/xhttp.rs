@@ -90,32 +90,35 @@ impl XHttpRequestOptions {
             return invalid("XHTTP generated content type conflicts with custom headers");
         }
         if mode != super::XHttpMode::PacketUp
-            && (raw.seq_key.is_some() || raw.seq_placement.is_some())
+            && (nonempty(raw.seq_key.as_deref()).is_some()
+                || nonempty(raw.seq_placement.as_deref()).is_some())
         {
             return invalid("XHTTP sequence overrides require packet-up");
         }
         let data = DataPlacement::normalize(raw)?;
         if mode != super::XHttpMode::PacketUp
             && (data != DataPlacement::Body
-                || raw.sc_max_each_post_bytes.is_some()
-                || raw.sc_min_posts_interval_ms.is_some())
+                || range_value(raw.sc_max_each_post_bytes.as_deref()).is_some()
+                || range_value(raw.sc_min_posts_interval_ms.as_deref()).is_some())
         {
             return invalid("XHTTP packet upload fields require packet-up");
         }
-        let post_bytes = IntegerRange::parse(
-            raw.sc_max_each_post_bytes.as_deref().unwrap_or("1000000"),
+        let post_bytes = IntegerRange::parse_with_default(
+            raw.sc_max_each_post_bytes.as_deref(),
+            "1000000",
             1,
             crate::limits::XHTTP_POST_BYTES,
         )?;
-        let post_interval_ms = IntegerRange::parse(
-            raw.sc_min_posts_interval_ms.as_deref().unwrap_or("30"),
+        let post_interval_ms = IntegerRange::parse_with_default(
+            raw.sc_min_posts_interval_ms.as_deref(),
+            "30",
             0,
             60_000,
         )?;
         if post_interval_ms.max == 0 {
             return invalid("XHTTP post interval must have a positive maximum");
         }
-        let uplink_method = match raw.uplink_http_method.as_deref().unwrap_or("POST") {
+        let uplink_method = match nonempty(raw.uplink_http_method.as_deref()).unwrap_or("POST") {
             "POST" => http::Method::POST,
             "PUT" => http::Method::PUT,
             "PATCH" => http::Method::PATCH,
@@ -252,9 +255,11 @@ pub(crate) enum DataPlacement {
 
 impl DataPlacement {
     fn normalize(raw: &super::RawXHttpSettings) -> Result<Self> {
-        let placement = raw.uplink_data_placement.as_deref().unwrap_or("body");
+        let placement = nonempty(raw.uplink_data_placement.as_deref()).unwrap_or("body");
         if matches!(placement, "body" | "auto") {
-            if raw.uplink_data_key.is_some() || raw.uplink_chunk_size.is_some() {
+            if nonempty(raw.uplink_data_key.as_deref()).is_some()
+                || range_value(raw.uplink_chunk_size.as_deref()).is_some()
+            {
                 return invalid(
                     "XHTTP body upload does not use payload keys or header chunk sizes",
                 );
@@ -269,7 +274,7 @@ impl DataPlacement {
         };
         validate_key(key)?;
         let mut size =
-            IntegerRange::parse(raw.uplink_chunk_size.as_deref().unwrap_or("0"), 0, 8192)?;
+            IntegerRange::parse_with_default(raw.uplink_chunk_size.as_deref(), "0", 0, 8192)?;
         if size.max == 0 {
             size = if placement == "cookie" {
                 IntegerRange {
@@ -309,6 +314,8 @@ impl MetaPlacement {
         header_default: &str,
         other_default: &str,
     ) -> Result<Self> {
+        let placement = nonempty(placement);
+        let key = nonempty(key);
         match placement.unwrap_or("path") {
             "path" if key.is_none() => Ok(Self::Path),
             "query" | "cookie" => {
@@ -348,6 +355,7 @@ pub(crate) enum SessionId {
 
 impl SessionId {
     fn normalize(table: &str, length: Option<&str>) -> Result<Self> {
+        let length = range_value(length);
         if table.is_empty() || table == "uuid" {
             if length.is_some() {
                 return invalid("XHTTP session-length requires a character table");
@@ -377,7 +385,7 @@ impl SessionId {
                 bytes.push(byte);
             }
         }
-        let length = IntegerRange::parse(length.unwrap_or("16-32"), 1, 128)?;
+        let length = IntegerRange::parse_with_default(length, "16-32", 1, 128)?;
         let mut possibilities = 0u64;
         for n in length.min..=length.max {
             possibilities =
@@ -447,7 +455,7 @@ pub(super) struct RawReuseConfig {
 impl RawReuseConfig {
     pub(super) fn normalize(self, version: XHttpVersion) -> Result<XHttpReuseConfig> {
         let range = |value: Option<String>| {
-            IntegerRange::parse(value.as_deref().unwrap_or("0"), 0, i32::MAX as usize)
+            IntegerRange::parse_with_default(value.as_deref(), "0", 0, i32::MAX as usize)
         };
         if version == XHttpVersion::Http1 && self.h_keep_alive_period != 0 {
             return invalid("XHTTP HTTP/1 does not support a keepalive period override");
@@ -464,12 +472,23 @@ impl RawReuseConfig {
 }
 
 impl IntegerRange {
+    fn parse_with_default(
+        value: Option<&str>,
+        fallback: &str,
+        minimum: usize,
+        maximum: usize,
+    ) -> Result<Self> {
+        Self::parse(range_value(value).unwrap_or(fallback), minimum, maximum)
+    }
+
     pub(super) fn parse(value: &str, minimum: usize, maximum: usize) -> Result<Self> {
+        let value = value.trim();
         let (left, right) = value.split_once('-').unwrap_or((value, value));
-        if [left, right]
-            .iter()
-            .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
-        {
+        let (left, right) = (left.trim(), right.trim());
+        if [left, right].iter().any(|part| {
+            let decimal = part.strip_prefix('+').unwrap_or(part);
+            decimal.is_empty() || !decimal.bytes().all(|b| b.is_ascii_digit())
+        }) {
             return invalid("XHTTP range must be decimal N or N-M");
         }
         let (Ok(min), Ok(max)) = (left.parse::<usize>(), right.parse::<usize>()) else {
@@ -484,6 +503,14 @@ impl IntegerRange {
         use rand::RngExt as _;
         rand::rng().random_range(self.min..=self.max)
     }
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
+}
+
+fn range_value(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -520,26 +547,22 @@ impl Default for XHttpPadding {
 
 impl XHttpPadding {
     pub(super) fn normalize(raw: &super::RawXHttpSettings, headers: &XHttpHeaders) -> Result<Self> {
-        let mut padding = Self::default();
-        if let Some(bytes) = &raw.x_padding_bytes {
-            padding.bytes = IntegerRange::parse(bytes, 1, MAX_PADDING_BYTES)?;
-        }
+        let mut padding = Self {
+            bytes: IntegerRange::parse_with_default(
+                raw.x_padding_bytes.as_deref(),
+                "100-1000",
+                1,
+                MAX_PADDING_BYTES,
+            )?,
+            ..Self::default()
+        };
         if !raw.x_padding_obfs_mode {
-            if raw
-                .x_padding_key
-                .as_deref()
-                .is_some_and(|value| value != "x_padding")
-                || raw
-                    .x_padding_header
-                    .as_deref()
+            if nonempty(raw.x_padding_key.as_deref()).is_some_and(|value| value != "x_padding")
+                || nonempty(raw.x_padding_header.as_deref())
                     .is_some_and(|value| !value.eq_ignore_ascii_case("referer"))
-                || raw
-                    .x_padding_placement
-                    .as_deref()
+                || nonempty(raw.x_padding_placement.as_deref())
                     .is_some_and(|value| value != "queryInHeader")
-                || raw
-                    .x_padding_method
-                    .as_deref()
+                || nonempty(raw.x_padding_method.as_deref())
                     .is_some_and(|value| value != "repeat-x")
             {
                 return invalid(
@@ -555,7 +578,7 @@ impl XHttpPadding {
             Some("cookie") => PaddingPlacement::Cookie,
             _ => return invalid("XHTTP obfuscated padding requires a supported placement"),
         };
-        padding.tokenish = match raw.x_padding_method.as_deref().unwrap_or("repeat-x") {
+        padding.tokenish = match nonempty(raw.x_padding_method.as_deref()).unwrap_or("repeat-x") {
             "repeat-x" => false,
             "tokenish" => true,
             _ => return invalid("unsupported XHTTP padding method"),

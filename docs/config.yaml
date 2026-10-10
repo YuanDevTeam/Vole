@@ -72,7 +72,7 @@ authentication:
   - "probe-user:probe-password"
 
 # 可选的运行时 Controller，地址必须是回环 IP 和显式非零端口；合法 mixed-only
-# 静态节点与纯 DIRECT 配置也可使用，运行配置仍需开启 mixed-port 或 TUN。
+# 静态节点、纯 DIRECT 及未启用代理入口的配置也可使用。
 # 同时显式配置 proxy-groups 时 secret 必填；没有显式代理组时可省略。
 # secret 出现时必须为 1–255 UTF-8 字节，并作为全部 Controller 路由的 Bearer token。
 # Controller 提供 GET /traffic、GET /group、GET /group/{name}、
@@ -99,7 +99,7 @@ secret: "vole-runtime-secret"
 # dns-hijack 缺省 [0.0.0.0:53]；[] 关闭。只在 dns.enable:true 的 TUN TCP/UDP 上生效。
 # 精确 IP:port 匹配指定目标；any/未指定地址匹配任何地址族的 53 端口。
 # udp-timeout 单位秒，缺省或 0 为 300；控制源关联及各目的流的空闲失效。
-# 配置必须启用 mixed-port 或 TUN。
+# mixed-port 与 TUN 均关闭时仍可运行 Controller 和资源任务。
 tun:
   # auto-route: true # Linux：自动路由；DNS 启用且劫持网关时接管 systemd-resolved
   # auto-detect-interface: true # Linux：出站自动绑定物理接口
@@ -137,7 +137,7 @@ sniffer:
 # 引用精确匹配且不做 Unicode normalization 或大小写折叠。名称必须为非空字符串；
 # DIRECT、REJECT、REJECT-DROP、COMPATIBLE、PASS、PASS-RULE 为保留定义名。
 # 路径与 URL 中的保留字符由调用方按相应协议编码，不限制节点本身的名称。
-# dialer-proxy 可引用具体节点或 select 组。全部上游和组成员（包括未选成员）须无环。
+# dialer-proxy 可指定 DIRECT 或引用具体节点、策略组。全部上游和组成员（包括未选成员）须无环。
 # 代理数量和链深没有独立上限，仍受 YAML 大小与名称唯一约束。
 # 实际建立物理首跳时才通过节点 resolver 解析主端点和独立下载端点。
 # 未选节点的 DNS 失败不阻塞准备；DNS 关闭时才使用系统 resolver。
@@ -307,7 +307,7 @@ proxies:
     #   headers: {Host: [cover.example:443], X-Custom: [one, two]}
     # 每次握手各选一个路径与每个头的一个值；禁止 Content-Length/Transfer-Encoding。
     # network: h2
-    # h2-opts:
+    # h2-opts: # 省略/host: [] 使用 www.example.com；path 省略/空为 /
     #   host: [cover.example:443] # 必填、非空；每流选一个，不改变 TLS 认证名
     #   path: /cover              # 默认 /；普通 PUT body，不使用 gRPC framing
 
@@ -442,7 +442,7 @@ proxies:
   # skip-cert-verify 不能覆盖 fingerprint；pin 是证书 SHA-256，不是客户端伪造指纹。
   # 叶 pin 直接决定信任；非叶 pin 作为根继续验证链和名称。所有策略均验证握手签名。
   # name-cert-verify 只改变证书验证名；certificate/private-key 为成对内联 PEM 客户端身份。
-  # 不支持 REALITY、fp、ECH 或 session/padding 调参字段，详见 outbounds.md#anytls。
+  # 支持共享 client-fingerprint；不支持 REALITY、ECH 或 session/padding 调参字段，详见 outbounds.md#anytls。
   # TCP 使用 AnyTLS session；udp: true 使用 UoT v2 datagram mode。
   - name: anytls-edge
     type: anytls
@@ -462,7 +462,7 @@ proxies:
   # AES password 可用 iPSK1:...:iPSKn:uPSK 身份链，其他算法仅单一 Base64 PSK。
   # 以下仅为公开测试 key，不可用于真实服务。UDP 默认 false。
   # 上游 padding 风险和验收边界见 outbounds.md#shadowsocks-2022；
-  # 完整互通尚未签收。dialer-proxy 可引用具体节点或 select 组。
+  # dialer-proxy 可指定 DIRECT 或引用具体节点、策略组。互通范围见 acceptance.md。
   - name: ss-edge
     type: ss
     server: ss.example.com
@@ -492,7 +492,7 @@ proxies:
 # 名称正则区分大小写；支持 lookahead、定长 lookbehind、数字/命名 backreference。
 # 反引号分隔的多表达式按匹配顺序排列。节点改名使用 $1 / ${name} / $$ 等 .NET replacement。
 # 复杂表达式有内部编译/执行预算；失败候选保留旧资源，不静默当不匹配。
-# lookaround/backreference 明确拒绝。静态成员保留顺序与重复项。
+# 静态成员保留顺序与重复项。
 # 动态组为空时使用 empty-fallback（缺省 COMPATIBLE，即 DIRECT），可指定节点或内置目标。
 # disable-udp 缺省 false；true 禁用该组的业务 UDP。规则模式跳过不支持 UDP 的目标，
 # 继续匹配后续规则；global 模式及显式 DNS 出口仍会拒绝。hidden/icon 为 Controller 元数据。
@@ -699,7 +699,7 @@ sub-rules:
 
 # measureDelay 使用独立的 node-only 配置：顶层只能包含 proxies，不能包含
 # proxy-groups。节点字段和代理图校验与上文一致，但不能出现 mixed-port/authentication、
-# tun、sniffer、Controller、DNS、rules 或 GeoData；此接口的 dialer-proxy 只能引用具体
+# tun、sniffer、Controller、DNS、rules 或 GeoData；此接口的 dialer-proxy 可指定 DIRECT 或具体
 # 节点。Vole 从“未被任何 dialer-proxy 引用”的节点推导唯一链头，且该链必须覆盖
 # 全部节点。测速不创建监听器、公共实例、TUN/protect 租约、DNS、规则引擎、代理组
 # 或 GeoData 注册。

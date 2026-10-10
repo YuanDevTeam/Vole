@@ -81,7 +81,6 @@ fn trojan_invalid_configuration_is_rejected_without_exposing_credentials() {
         json!({"server":null}),
         json!({"network":"invalid"}),
         json!({"network":null}),
-        json!({"sni":""}),
         json!({"sni":"https://localhost"}),
         json!({"sni":null}),
         json!({"alpn":null}),
@@ -140,6 +139,10 @@ fn trojan_ws_and_grpc_configuration_applies_transport_specific_defaults() {
     };
     assert_eq!(node.tls.alpn, [b"http/1.1".to_vec()]);
     assert_eq!(node.server_name, "localhost");
+    let vole::config::TrojanTransport::WebSocket { uri, .. } = &node.transport else {
+        unreachable!()
+    };
+    assert_eq!(uri, "wss://localhost/");
     let config = Config::parse_yaml(&document(json!({"network":"ws","ws-opts":{"path":"/edge?q=1","headers":{"Host":"cover.example:443","X-Fixture":"yes"},"max-early-data":2048}}))).unwrap();
     let ProxyProtocol::Trojan(node) = &config.proxies[0].protocol else {
         unreachable!()
@@ -156,6 +159,10 @@ fn trojan_ws_and_grpc_configuration_applies_transport_specific_defaults() {
         unreachable!()
     };
     assert_eq!(node.tls.alpn, [b"h2".to_vec()]);
+    let vole::config::TrojanTransport::Grpc { uri, .. } = &node.transport else {
+        unreachable!()
+    };
+    assert_eq!(uri, "https://localhost/edge/Tun");
     for service in ["Edge", "/custom/Tun"] {
         assert!(
             Config::parse_yaml(&document(
@@ -164,6 +171,65 @@ fn trojan_ws_and_grpc_configuration_applies_transport_specific_defaults() {
             .is_ok()
         );
     }
+}
+
+#[test]
+fn trojan_empty_defaults_and_grpc_authority_match_the_reference() {
+    use vole::config::TrojanTransport;
+    let config = Config::parse_yaml(&document(json!({"network":"","sni":""}))).unwrap();
+    let ProxyProtocol::Trojan(node) = &config.proxies[0].protocol else {
+        unreachable!()
+    };
+    assert!(matches!(node.transport, TrojanTransport::Tcp));
+    assert_eq!(node.server_name, "localhost");
+    let config =
+        Config::parse_yaml(&document(json!({"network":"ws","ws-opts":{"path":""}}))).unwrap();
+    let ProxyProtocol::Trojan(node) = &config.proxies[0].protocol else {
+        unreachable!()
+    };
+    let TrojanTransport::WebSocket { uri, .. } = &node.transport else {
+        unreachable!()
+    };
+    assert_eq!(uri, "wss://localhost/");
+    for (server, sni, authority) in [
+        ("127.0.0.1", "", "127.0.0.1"),
+        ("::1", "", "[::1]"),
+        ("127.0.0.1", "cover.invalid", "cover.invalid"),
+        ("127.0.0.1", "2001:db8::1", "[2001:db8::1]"),
+    ] {
+        let config = Config::parse_yaml(&document(json!({
+            "server":server, "sni":sni, "network":"grpc",
+            "name-cert-verify":"verify.invalid", "grpc-opts":{"grpc-service-name":"edge"}
+        })))
+        .unwrap();
+        let ProxyProtocol::Trojan(node) = &config.proxies[0].protocol else {
+            unreachable!()
+        };
+        let TrojanTransport::Grpc { uri, .. } = &node.transport else {
+            unreachable!()
+        };
+        assert_eq!(uri, &format!("https://{authority}/edge/Tun"));
+        assert_eq!(node.server_name, if sni.is_empty() { server } else { sni });
+        assert_eq!((node.address.as_str(), node.port), (server, 443));
+    }
+    let config = Config::parse_yaml(&document(json!({
+        "server":"127.0.0.1", "port":8443, "sni":"cover.invalid", "network":"ws",
+        "ws-opts":{"headers":{"Host":"request.invalid:7443"}}
+    })))
+    .unwrap();
+    let ProxyProtocol::Trojan(node) = &config.proxies[0].protocol else {
+        unreachable!()
+    };
+    let TrojanTransport::WebSocket { uri, headers, .. } = &node.transport else {
+        unreachable!()
+    };
+    assert_eq!(uri, "wss://cover.invalid/");
+    assert_eq!(
+        headers.get("Host").map(String::as_str),
+        Some("request.invalid:7443")
+    );
+    assert_eq!(node.server_name, "cover.invalid");
+    assert_eq!((node.address.as_str(), node.port), ("127.0.0.1", 8443));
 }
 
 #[test]

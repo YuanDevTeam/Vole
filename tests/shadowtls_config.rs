@@ -44,12 +44,29 @@ fn shadowtls_preserves_policy_values_and_shared_profile_aliases() {
     #[cfg(feature = "interop-test")]
     let _case = vole::resources::case_events::Case::new("SHADOWTLS-CFG", "policy");
     let config = policy(node());
+    let mut disabled = node();
+    disabled.as_object_mut().unwrap().remove("plugin-opts");
+    disabled["plugin"] = json!("");
+    let disabled = parse(disabled).unwrap();
+    let ProxyProtocol::Shadowsocks(plain) = &disabled.proxies[0].protocol else {
+        panic!()
+    };
+    assert!(plain.shadow_tls.is_none());
+    assert_eq!(plain.address, "fixture.invalid");
+    assert_eq!(plain.port, 443);
     assert_eq!(config.password, " synthetic-private-marker ");
     assert_eq!(config.alpn, [b"h2".to_vec(), b"http/1.1".to_vec()]);
     assert!(!config.certificate.skip_cert_verify);
     assert!(config.certificate.fingerprint.is_none());
     assert!(config.certificate.verification_name.is_none());
     assert_eq!(config.client_fingerprint, None);
+    let mut empty_overrides = node();
+    empty_overrides["plugin-opts"]["fingerprint"] = json!("");
+    empty_overrides["plugin-opts"]["name-cert-verify"] = json!("");
+    let defaults = policy(empty_overrides);
+    assert_eq!(defaults.certificate, config.certificate);
+    assert_eq!(defaults.server_name, config.server_name);
+    assert_eq!(defaults.password, config.password);
     for (name, expected) in [
         ("", None),
         ("none", None),
@@ -166,12 +183,9 @@ fn shadowtls_rejects_invalid_types_bounds_unknown_fields_and_nulls_without_secre
         ("skip-cert-verify", vec![json!(1), json!("true")]),
         (
             "fingerprint",
-            vec![json!(""), json!("ff"), json!("z".repeat(64)), json!(true)],
+            vec![json!("ff"), json!("z".repeat(64)), json!(true)],
         ),
-        (
-            "name-cert-verify",
-            vec![json!(""), json!("bad name"), json!(false)],
-        ),
+        ("name-cert-verify", vec![json!("bad name"), json!(false)]),
         ("strict-mode", vec![json!(true), json!(false)]),
         ("unknown", vec![json!("synthetic-private-marker")]),
     ] {

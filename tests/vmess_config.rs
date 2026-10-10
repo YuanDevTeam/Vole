@@ -70,14 +70,12 @@ fn vmess_transport_and_security_combinations_are_strict() {
         json!({"cipher":"none","global-padding":true}),
         json!({"cipher":"zero","authenticated-length":true}),
         json!({"network":"bogus"}),
-        json!({"network":"h2"}),
         json!({"tls":false,"servername":"secret.invalid"}),
         json!({"tls":false,"skip-cert-verify":false}),
         json!({"tls":false,"alpn":[]}),
         json!({"packet-encoding":"packet"}),
         json!({"ws-opts":{}}),
         json!({"http-opts":{}}),
-        json!({"network":"h2","h2-opts":{"host":[]}}),
         json!({"network":"http","http-opts":{"method":"GET\r\n"}}),
         json!({"network":"http","http-opts":{"headers":{"Content-Length":["1"]}}}),
         json!({"network":"http","http-opts":{"headers":{"X-Test":[]}}}),
@@ -307,5 +305,68 @@ async fn vmess_normalized_websocket_fields_preserve_headers_and_early_data_order
         stream.write_all(b"continuation").await.unwrap();
         stream.flush().await.unwrap();
         reader.await.unwrap();
+    }
+}
+
+#[test]
+fn stream_defaults_and_grpc_authority_match_the_reference() {
+    use vole::config::{ProxyProtocol, StreamTransport};
+    for tls in [false, true] {
+        for options in [
+            json!({}),
+            json!({"h2-opts":{}}),
+            json!({"h2-opts":{"host":[],"path":""}}),
+        ] {
+            let mut fields = options;
+            fields["network"] = json!("h2");
+            fields["tls"] = json!(tls);
+            let config = Config::parse_yaml(&document(fields)).unwrap();
+            let ProxyProtocol::Vmess(node) = &config.proxies[0].protocol else {
+                unreachable!()
+            };
+            let StreamTransport::H2 { uris } = &node.transport else {
+                unreachable!()
+            };
+            assert_eq!(
+                uris,
+                &[format!(
+                    "{}://www.example.com/",
+                    if tls { "https" } else { "http" }
+                )]
+            );
+        }
+    }
+    for (name, authority) in [
+        (None, "example.com:443"),
+        (Some(""), "example.com:443"),
+        (Some("cover.example"), "cover.example"),
+        (Some("2001:db8::1"), "[2001:db8::1]"),
+    ] {
+        let mut fields = json!({"network":"grpc","tls":true,"name-cert-verify":"verified.example"});
+        if let Some(name) = name {
+            fields["servername"] = json!(name);
+        }
+        let config = Config::parse_yaml(&document(fields)).unwrap();
+        let ProxyProtocol::Vmess(node) = &config.proxies[0].protocol else {
+            unreachable!()
+        };
+        let StreamTransport::Grpc { uri, .. } = &node.transport else {
+            unreachable!()
+        };
+        assert_eq!(
+            uri.parse::<http::Uri>()
+                .unwrap()
+                .authority()
+                .unwrap()
+                .as_str(),
+            authority
+        );
+    }
+    for fields in [
+        json!({"network":""}),
+        json!({"network":"ws","ws-opts":{"path":""}}),
+        json!({"network":"http","http-opts":{"method":""}}),
+    ] {
+        Config::parse_yaml(&document(fields)).unwrap();
     }
 }

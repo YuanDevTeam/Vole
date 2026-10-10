@@ -9,8 +9,8 @@ external-controller: 127.0.0.1:9090
 secret: "vole-runtime-secret"
 ```
 
-- 省略 `external-controller` 表示不启动 Controller，也不采集业务连接、规则命中和建链诊断，此时不能单独配置 `secret`。代理组选择、健康检查、资源更新与 TUN 原始流量统计独立运行。
-- `external-controller` 只接受带显式非零端口的回环 IP 地址。合法的 mixed-only 静态节点和纯 DIRECT 配置均可使用；非 TUN 配置仍通过 `mixed-port` 满足入站要求。
+- 省略或空串 `external-controller` 表示不启动 Controller，也不采集业务连接、规则命中和建链诊断，此时不能单独配置 `secret`。代理组选择、健康检查、资源更新与 TUN 原始流量统计独立运行。
+- `external-controller` 只接受带显式非零端口的回环 IP 地址。静态节点、纯 DIRECT 及关闭业务入口的配置均可使用。
 - 只要同时显式配置代理组与 Controller，`secret` 就必填；没有显式代理组时可省略。`secret` 出现时必须为 1–255 UTF-8 字节，并保护本文定义的全部路由。
 - `measureDelay` 的 node-only 配置不能包含 Controller 或代理组字段。
 - `validateConfig` 只校验字段；`start` 绑定端口，绑定失败则启动失败。`stop` 和 `destroyInstance` 关闭监听器。

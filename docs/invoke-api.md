@@ -226,7 +226,7 @@ stopped -> preparing -> prepared -> starting -> running
 }
 ```
 
-无需 `initialize`，完成大小、YAML、结构、共享 route-target 命名空间、引用和字段组合校验。节点的 `dialer-proxy` 可引用节点或组；全部上游和组成员边（包括未选成员）统一做无环校验。不创建实例、不解析远端域名、不联网，也不读取 GeoData。资产缺失不影响纯配置校验。
+无需 `initialize`，完成大小、YAML、结构、共享 route-target 命名空间、引用和字段组合校验。节点的 `dialer-proxy` 可指定 DIRECT 或引用节点、组；全部上游和组成员边（包括未选成员）统一做无环校验。不创建实例、不解析远端域名、不联网，也不读取 GeoData。资产缺失不影响纯配置校验。
 
 ### `start`
 
@@ -372,7 +372,7 @@ Unix 等待 SIGINT/SIGTERM，Windows 等待 Ctrl+C/Ctrl+Break；标准输入先�
 
 - `configYamls` 接受 1–5 份非空节点配置，`timeout` 为 1–30 秒。
 - 同一运行时一次只允许一个测速批次，最多并发五个私有工作器。
-- 节点配置顶层只允许 `proxies`，不接受 `proxy-groups`；`dialer-proxy` 也只能引用具体节点。Vole 推导唯一链头，且该链必须覆盖全部节点。
+- 节点配置顶层只允许 `proxies`，不接受 `proxy-groups`；`dialer-proxy` 可指定 DIRECT 或引用具体节点。Vole 推导唯一链头，且该链必须覆盖全部节点。
 - 工作器只准备出站图并执行 TCP、可选 TLS 和 HTTP/1.1 HEAD；不创建公共实例、监听器、TUN、DNS、规则、嗅探器或 GeoData。
 - 宿主测量组成员时，按当前选择快照展开具体链后提交；上游选到 DIRECT 时移除相应 `dialer-proxy`，选到 REJECT 时不发起该项测量。该快照不改变运行中的组选择。
 - URL 必须是无 userinfo 和 fragment 的绝对 HTTP/HTTPS URL；HTTPS 使用发布信任根。
