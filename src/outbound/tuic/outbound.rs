@@ -103,6 +103,13 @@ impl TuicOutbound {
         active_congestion(&current.as_ref()?.connection)
     }
 
+    /// Actual native path state for memory acceptance; not configured defaults.
+    #[cfg(feature = "interop-test")]
+    pub async fn path_observation(&self) -> Option<quinn::PathStats> {
+        let current = self.current.lock().await;
+        Some(current.as_ref()?.connection.stats().path)
+    }
+
     pub fn new_with_path(config: &TuicOutboundConfig, upstream: UpstreamPath) -> io::Result<Self> {
         Self::with_shared_security(config, upstream, &SecurityContext::new(), 64 * 1024)
     }

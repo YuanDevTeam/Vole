@@ -1215,3 +1215,75 @@ async fn configured_ip_sni_millisecond_heartbeat_and_uot_versions_are_consumed()
         finish(endpoint, peer).await;
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn configured_mtu_discovery_changes_native_probes_and_path_mtu() {
+    let _case = Case::new("TUIC-UNIT", "native_mtu_discovery");
+    for disabled in [false, true] {
+        let (mut config, packets, endpoint) = fixture_parts(1400, true, 8, "cubic", "native");
+        config.disable_mtu_discovery = disabled;
+        let outbound = TuicOutbound::new_with_path(
+            &config,
+            UpstreamPath::proxy(Arc::new(MemoryUpstream(Mutex::new(Some(packets))))),
+        )
+        .unwrap();
+        let ep = endpoint.clone();
+        let peer = tokio::spawn(async move {
+            let connection = authenticated(&ep).await;
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut header = [0; 7];
+            recv.read_exact(&mut header).await.unwrap();
+            assert_eq!(&header, b"\x05\x01\x00\x01x\x00\x50");
+            send.write_all(b"ready").await.unwrap();
+            let payload = recv.read_u8().await.unwrap();
+            send.write_all(&[payload]).await.unwrap();
+            connection.closed().await;
+        });
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let mut stream = outbound
+                    .connect_stream(request(), &EstablishContext::default())
+                    .await
+                    .unwrap()
+                    .io;
+                let mut ready = [0; 5];
+                stream.read_exact(&mut ready).await.unwrap();
+                if disabled {
+                    // Same observation interval as enabled, long before the
+                    // default ten-second keepalive or discovery re-run.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                } else {
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        loop {
+                            let path = outbound.path_observation().await.unwrap();
+                            if path.sent_plpmtud_probes > 0 && path.current_mtu > 1200 {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("real native probe ACK must increase the current path MTU");
+                }
+                let path = outbound.path_observation().await.unwrap();
+                if disabled {
+                    assert_eq!(path.sent_plpmtud_probes, 0);
+                    assert_eq!(path.current_mtu, 1400);
+                } else {
+                    assert!(path.sent_plpmtud_probes > 0);
+                    assert_eq!(path.lost_plpmtud_probes, 0);
+                    assert!(1200 < path.current_mtu && path.current_mtu <= 1400);
+                }
+                // Real business still traverses the measured path after its
+                // probe result, rather than only inspecting construction.
+                stream.write_all(b"a").await.unwrap();
+                assert_eq!(stream.read_u8().await.unwrap(), b'a');
+                outbound.shutdown().await;
+                drop(stream);
+            })
+            .await;
+        assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+        finish(endpoint, peer).await;
+    }
+}
