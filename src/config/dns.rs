@@ -147,18 +147,6 @@ fn parse_dns_nameserver_with_route(
     let (endpoint, fragment) = input.split_once('#').unwrap_or((input, ""));
     let (route_name, options) =
         parse_nameserver_options(fragment, !endpoint.starts_with("https://"))?;
-    let route = match targets {
-        Some(targets) if !route_name.is_empty() => match route_name.as_str() {
-            "DIRECT" => DnsRoute::Direct,
-            "RULES" => DnsRoute::Rules,
-            _ => targets
-                .get(&route_name)
-                .copied()
-                .map(DnsRoute::Route)
-                .ok_or_else(bad)?,
-        },
-        _ => default_route,
-    };
     // Special sources remain physical, but use the same query wrappers.
     let source = match endpoint {
         "system" | "system://" | "dhcp://system" => Some(DnsSource::System),
@@ -180,6 +168,18 @@ fn parse_dns_nameserver_with_route(
             options,
         });
     }
+    let route = match targets {
+        Some(targets) if !route_name.is_empty() => match route_name.as_str() {
+            "DIRECT" => DnsRoute::Direct,
+            "RULES" => DnsRoute::Rules,
+            _ => targets
+                .get(&route_name)
+                .copied()
+                .map(DnsRoute::Route)
+                .ok_or_else(bad)?,
+        },
+        _ => default_route,
+    };
     if let Ok(address) = endpoint.parse::<IpAddr>() {
         return Ok(DnsNameserver {
             address: address.into(),

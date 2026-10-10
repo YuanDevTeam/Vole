@@ -21,7 +21,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 ## 必须保留的边界
 
 - 业务入口只有 mixed-port 与 TUN；不支持 port、socks-port、listeners、redir/tproxy 或服务端协议配置。
-- tls 仅接受客户端信任根；无效显式证书拒绝配置，Mihomo 会跳过无效项。iOS/tvOS、Android 不保证取得完整系统信任库；
+- tls 同时接受客户端信任根及 Controller 服务端 TLS 配置；无效显式客户端信任根拒绝配置，Mihomo 会跳过无效项。iOS/tvOS、Android 不保证取得完整系统信任库；
   所有后端仍使用 WebPKI 校验，未复制 Go 的原生系统验证器。详细范围见 [TLS 契约](tls-client-fingerprint.md)。
   独立测量 YAML 只接受 proxies 与同名客户端 tls 子集，不接受 TLS 服务端配置。
 - Shadowsocks 只支持三个 2022 cipher；插件仅 strict ShadowTLS v3，UoT 仅 v2。

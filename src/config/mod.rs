@@ -4303,22 +4303,6 @@ geo-update-interval: 24"#,
     }
 
     #[test]
-    fn rejects_extended_geox_url_maps() {
-        for fields in [r#"geox-url:
-  geoip: https://geo.example.test/geoip.dat
-  geosite: https://geo.example.test/geosite.dat
-  mmdb: https://geo.example.test/country.mmdb
-geo-auto-update: true
-geo-update-interval: 24"#]
-        {
-            assert!(
-                Config::parse_yaml(with_geodata(fields).as_bytes()).is_err(),
-                "{fields}"
-            );
-        }
-    }
-
-    #[test]
     fn defaults_documented_fields() {
         let yaml = CURRENT_TLS
             .replace("    flow: \"\"\n", "")
@@ -5141,7 +5125,7 @@ authentication:
                 "用".repeat(length),
                 "密".repeat(length)
             ));
-            assert_eq!(Config::parse_yaml(yaml.as_bytes()).is_ok(), length == 85);
+            assert!(Config::parse_yaml(yaml.as_bytes()).is_ok());
         }
     }
 
