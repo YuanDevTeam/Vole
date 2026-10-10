@@ -13,6 +13,9 @@ pub(super) fn default_bootstrap() -> Vec<String> {
 pub(super) fn redir_host() -> String {
     "redir-host".into()
 }
+pub(super) fn default_ipv6_timeout() -> u64 {
+    100
+}
 
 impl Default for DnsConfig {
     fn default() -> Self {
@@ -70,6 +73,11 @@ impl RawDnsConfig {
             fake_ip,
             enable: self.enable,
             ipv6: self.ipv6,
+            ipv6_timeout: Duration::from_millis(if self.ipv6_timeout == 0 {
+                default_ipv6_timeout()
+            } else {
+                self.ipv6_timeout
+            }),
             nameservers: parse(self.nameserver, main_route)?,
             nameserver_policies: normalize_dns_nameserver_policies(
                 self.nameserver_policies,

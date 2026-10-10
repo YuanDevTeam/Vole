@@ -553,6 +553,7 @@ hosts:
 dns:
   enable: true
   ipv6: true
+  ipv6-timeout: 100 # 毫秒；内部 A/AAAA 并发，A 完成后最多等待 AAAA；0 同缺省 100
   fallback: [] # A/AAAA 的备用解析组；不是 nameserver 内部的故障转移
   fallback-lazy-query: false # false：与主组同时查询；true：确定需要时才查询
   fallback-filter:

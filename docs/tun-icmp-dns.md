@@ -205,6 +205,12 @@ A/AAAA 缓存最多 256 项，从空容量按需增长。TUN 域名提示存储�
 
 `default-nameserver` 仅引导上游域名。`proxy-server-nameserver` 与其 policy 用于节点解析；`direct-nameserver` 用于直连，`direct-nameserver-follow-policy` 决定是否使用业务 policy。各角色拥有独立 cache/singleflight，未配置节点或直连 resolver 时复用主 resolver。有限并发、取消与连接池适用于各角色，依赖循环不会等待自身的 singleflight。
 
+启用有效 IPv6 时，内部地址解析并发请求 A/AAAA，结果按 IPv4、IPv6 排列。
+`dns.ipv6-timeout` 单位为毫秒，缺省或 0 使用 100；从 A 完成后开始等待 AAAA，
+不改变整个解析的五秒期限。任一地址族失败不丢弃另一族的有效地址；等待到期或调用方
+取消时释放未完成查询。IPv6 关闭时只查询 A。TUN 客户端直接 A/AAAA 查询仍保留原有
+wire/RCODE 语义，不使用这段地址合并等待。
+
 ## 查询、故障转移与连接复用
 
 - 查询总期限 5 秒；单 nameserver 尝试最多 3 秒，并受剩余时间限制。
@@ -262,7 +268,7 @@ Running Session上下文仅弱引用本 session 的 RuntimeDns；业务 IP-only 
 - 真实 ICMP 转发、ICMP error、Traceroute、ICMP 选路规则或 ICMP 测速；
 - DoQ、DoH HTTP/2/3、显式 system/DHCP nameserver；
 - 动态 hosts: lan；
-- 用户可配置的缓存容量、超时、重试或并发度；
+- 用户可配置的缓存容量、查询总超时、重试或并发度；
 - 使用 DNS question 执行业务规则，或用 DNS 出口改写后续业务动作。
 
 自动化和物理 TUN 覆盖范围见 [验收矩阵](acceptance.md)。

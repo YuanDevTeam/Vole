@@ -273,6 +273,7 @@ pub struct DnsConfig {
     pub fallback: DnsFallbackConfig,
     pub enable: bool,
     pub ipv6: bool,
+    pub ipv6_timeout: Duration,
     pub nameservers: Vec<DnsNameserver>,
     pub nameserver_policies: Vec<DnsNameserverPolicy>,
     pub default_nameservers: Vec<DnsNameserver>,
@@ -1246,6 +1247,8 @@ struct RawDnsConfig {
     enable: bool,
     #[serde(default)]
     ipv6: bool,
+    #[serde(rename = "ipv6-timeout", default = "dns::default_ipv6_timeout")]
+    ipv6_timeout: u64,
     #[serde(default = "dns::default_nameservers")]
     nameserver: Vec<String>,
     #[serde(rename = "default-nameserver", default = "dns::default_bootstrap")]
@@ -5210,6 +5213,22 @@ authentication:
         .unwrap();
         assert!(dns_disabled.ipv6);
         assert!(!dns_disabled.dns.ipv6);
+    }
+
+    #[test]
+    fn dns_ipv6_timeout_uses_milliseconds_and_zero_retains_the_default() {
+        for (field, milliseconds) in [
+            ("", 100),
+            ("  ipv6-timeout: 0\n", 100),
+            ("  ipv6-timeout: 37\n", 37),
+        ] {
+            let config = Config::parse_yaml(
+                format!("mixed-port: 1080\ndns:\n  ipv6: true\n{field}").as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(config.dns.ipv6_timeout, Duration::from_millis(milliseconds));
+        }
+        assert!(Config::parse_yaml(b"mixed-port: 1080\ndns:\n  ipv6-timeout: -1\n").is_err());
     }
 
     #[test]

@@ -90,6 +90,7 @@ pub enum RuntimeDnsError {
 pub struct RuntimeDns {
     enabled: bool,
     ipv6: bool,
+    ipv6_timeout: Duration,
     nameservers: Box<[DnsNameserver]>,
     hosts: super::hosts::Hosts,
     fallback: crate::config::DnsFallbackConfig,
@@ -1005,6 +1006,7 @@ impl RuntimeDns {
         Self {
             enabled: config.enable,
             ipv6: config.ipv6,
+            ipv6_timeout: config.ipv6_timeout,
             hosts: super::hosts::Hosts::new(
                 &config.hosts,
                 config.use_hosts,
@@ -1132,8 +1134,9 @@ impl RuntimeDns {
         }
     }
 
-    /// Resolves a canonical domain through A followed by AAAA. AAAA is skipped
-    /// completely when `dns.ipv6` is false.
+    /// Resolves A and AAAA concurrently, retaining IPv4 first and waiting at
+    /// most `dns.ipv6-timeout` for IPv6 after A completes. Dropping this future
+    /// cancels both lookups; no detached query outlives its caller.
     pub async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, RuntimeDnsError> {
         super::trace::record("resolve");
         let host = canonicalize_name(host).map_err(RuntimeDnsError::InvalidQuery)?;
@@ -1170,21 +1173,47 @@ impl RuntimeDns {
                 .filter(|ip| self.ipv6 || ip.is_ipv4())
                 .collect());
         }
-        let mut addresses = Vec::new();
-
-        match self.resolve_type(&host, QueryType::A).await? {
-            LookupResult::Positive(mut values) => addresses.append(&mut values),
-            LookupResult::NoData => {}
-            LookupResult::NxDomain => return Ok(addresses),
+        let deadline = super::resolution::inherited_deadline(TokioInstant::now() + QUERY_TIMEOUT);
+        let ipv4 = self.resolve_type(&host, QueryType::A, deadline);
+        if !self.ipv6 {
+            return match ipv4.await? {
+                LookupResult::Positive(addresses) => Ok(addresses),
+                LookupResult::NoData | LookupResult::NxDomain => Ok(Vec::new()),
+            };
         }
-
-        if self.ipv6 {
-            match self.resolve_type(&host, QueryType::Aaaa).await? {
-                LookupResult::Positive(mut values) => addresses.append(&mut values),
-                LookupResult::NoData | LookupResult::NxDomain => {}
+        let ipv6 = self.resolve_type(&host, QueryType::Aaaa, deadline);
+        tokio::pin!(ipv4, ipv6);
+        let mut ipv6_result = None;
+        let ipv4_result = tokio::select! {
+            biased;
+            result = &mut ipv4 => result,
+            result = &mut ipv6 => {
+                ipv6_result = Some(result);
+                ipv4.await
             }
+        };
+        if ipv6_result.is_none() {
+            let wait_until = TokioInstant::now()
+                .checked_add(self.ipv6_timeout)
+                .unwrap_or(deadline)
+                .min(deadline);
+            ipv6_result = timeout_at(wait_until, &mut ipv6).await.ok();
         }
-
+        let mut addresses = match ipv4_result {
+            Ok(LookupResult::Positive(addresses)) => addresses,
+            Ok(LookupResult::NoData | LookupResult::NxDomain) => Vec::new(),
+            Err(error) => {
+                return match ipv6_result {
+                    Some(Ok(LookupResult::Positive(addresses))) => Ok(addresses),
+                    _ => Err(error),
+                };
+            }
+        };
+        match ipv6_result {
+            Some(Ok(LookupResult::Positive(mut values))) => addresses.append(&mut values),
+            Some(Err(error)) if addresses.is_empty() => return Err(error),
+            _ => {}
+        }
         Ok(addresses)
     }
 
@@ -1627,11 +1656,15 @@ impl RuntimeDns {
         &self,
         host: &str,
         query_type: QueryType,
+        deadline: TokioInstant,
     ) -> Result<LookupResult, RuntimeDnsError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let query = build_query(id, host, query_type).map_err(RuntimeDnsError::InvalidQuery)?;
         let classified = classify_query(&query).map_err(RuntimeDnsError::InvalidQuery)?;
-        let permit = self.begin_query();
+        let permit = DnsQueryPermit {
+            deadline,
+            ..self.begin_query()
+        };
         let response = self
             .exchange_classified_admitted(&query, &classified, &permit, FailureMode::BoundedError)
             .await?;
@@ -4456,7 +4489,7 @@ dns:
     }
 
     #[tokio::test]
-    async fn ipv6_false_returns_local_nodata_and_resolve_never_queries_aaaa() {
+    async fn resolve_ipv6_disabled_returns_local_nodata_and_skips_aaaa() {
         let address = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 14));
         let dispatcher = Arc::new(MockDispatcher::with_replies(
             vec![MockReply::Response(ResponseSpec::answer(address))],
@@ -4484,7 +4517,7 @@ dns:
     }
 
     #[tokio::test]
-    async fn ipv6_true_resolves_a_before_aaaa() {
+    async fn resolve_ipv6_merges_answers_with_ipv4_first() {
         let ipv4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 15));
         let ipv6 = IpAddr::V6("2001:db8::15".parse().unwrap());
         let dispatcher = Arc::new(MockDispatcher::with_replies(
@@ -4504,6 +4537,150 @@ dns:
             *dispatcher.udp_queries.lock().unwrap(),
             vec![QueryType::A as u16, QueryType::Aaaa as u16]
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_ipv6_keeps_successful_answers_when_the_other_stack_fails() {
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 15));
+        let ipv6 = IpAddr::V6("2001:db8::15".parse().unwrap());
+        for (replies, expected) in [
+            (
+                vec![
+                    MockReply::Response(ResponseSpec::answer(ipv4)),
+                    MockReply::TransportError,
+                ],
+                Some(ipv4),
+            ),
+            (
+                vec![
+                    MockReply::TransportError,
+                    MockReply::Response(ResponseSpec::answer(ipv6)),
+                ],
+                Some(ipv6),
+            ),
+            (
+                vec![MockReply::TransportError, MockReply::TransportError],
+                None,
+            ),
+        ] {
+            let dispatcher = Arc::new(MockDispatcher::with_replies(replies, vec![]));
+            let resolver = RuntimeDns::new(
+                &config(true, vec![nameserver(1, DnsTransport::Udp)]),
+                dispatcher,
+            );
+            let result = resolver.resolve("example.com").await;
+            if let Some(address) = expected {
+                assert_eq!(result.unwrap(), [address]);
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(resolver.resource_stats.snapshot().dns_current, 0);
+            assert_eq!(resolver.resource_stats.snapshot().singleflight_current, 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_ipv6_queries_concurrently_and_waits_from_ipv4_completion() {
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 15));
+        let ipv6 = IpAddr::V6("2001:db8::15".parse().unwrap());
+        let release_a = Arc::new(Notify::new());
+        let release_aaaa = Arc::new(Notify::new());
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            vec![
+                MockReply::Gated {
+                    response: ResponseSpec::answer(ipv4),
+                    release: release_a.clone(),
+                },
+                MockReply::Gated {
+                    response: ResponseSpec::answer(ipv6),
+                    release: release_aaaa.clone(),
+                },
+            ],
+            vec![],
+        ));
+        let mut dns_config = config(true, vec![nameserver(1, DnsTransport::Udp)]);
+        dns_config.ipv6_timeout = Duration::from_millis(50);
+        let resolver = Arc::new(RuntimeDns::new(&dns_config, dispatcher.clone()));
+        let lookup = tokio::spawn({
+            let resolver = resolver.clone();
+            async move { resolver.resolve("example.com").await }
+        });
+        for _ in 0..10 {
+            if dispatcher.udp_queries.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *dispatcher.udp_queries.lock().unwrap(),
+            [QueryType::A as u16, QueryType::Aaaa as u16]
+        );
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(!lookup.is_finished());
+        release_a.notify_one();
+        for _ in 0..10 {
+            if resolver.resource_stats.snapshot().dns_current == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(resolver.resource_stats.snapshot().dns_current, 1);
+        tokio::time::advance(Duration::from_millis(49)).await;
+        assert!(!lookup.is_finished());
+        release_aaaa.notify_one();
+        assert_eq!(lookup.await.unwrap().unwrap(), [ipv4, ipv6]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_ipv6_timeout_releases_the_pending_query() {
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 15));
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            vec![
+                MockReply::Response(ResponseSpec::answer(ipv4)),
+                MockReply::Pending,
+            ],
+            vec![],
+        ));
+        let resolver = RuntimeDns::new(
+            &config(true, vec![nameserver(1, DnsTransport::Udp)]),
+            dispatcher.clone(),
+        );
+        let started = TokioInstant::now();
+        assert_eq!(resolver.resolve("example.com").await.unwrap(), [ipv4]);
+        assert_eq!(TokioInstant::now() - started, Duration::from_millis(100));
+        assert_eq!(
+            *dispatcher.udp_queries.lock().unwrap(),
+            [QueryType::A as u16, QueryType::Aaaa as u16]
+        );
+        assert_eq!(resolver.resource_stats.snapshot().dns_current, 0);
+        assert_eq!(resolver.resource_stats.snapshot().singleflight_current, 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_ipv6_cancellation_releases_both_queries() {
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            vec![MockReply::Pending, MockReply::Pending],
+            vec![],
+        ));
+        let resolver = Arc::new(RuntimeDns::new(
+            &config(true, vec![nameserver(1, DnsTransport::Udp)]),
+            dispatcher.clone(),
+        ));
+        let lookup = tokio::spawn({
+            let resolver = resolver.clone();
+            async move { resolver.resolve("example.com").await }
+        });
+        for _ in 0..10 {
+            if dispatcher.udp_queries.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(resolver.resource_stats.snapshot().dns_current, 2);
+        lookup.abort();
+        assert!(lookup.await.unwrap_err().is_cancelled());
+        assert_eq!(resolver.resource_stats.snapshot().dns_current, 0);
+        assert_eq!(resolver.resource_stats.snapshot().singleflight_current, 0);
     }
 
     #[tokio::test]
