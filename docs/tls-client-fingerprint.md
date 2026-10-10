@@ -46,7 +46,8 @@ client-fingerprint: chrome
 - 命名指纹的标准 TLS，以及所有 REALITY/JLS，使用自有 boring fork；开发及 PR/发布的来源规则见 [TLS 依赖](tls-dependencies.md)。
 - 普通 TLS 两条路径共用同一个 WebPKI 证书验证器和发布信任根；叶 pin、非叶信任锚、
   独立验证名、skip 优先级不变。TLS 握手签名仍由各自后端强制验证。
-- VLESS mTLS 继续使用配对的内联 PEM，密钥匹配在使用 IO 前检查；profile 不修改身份。
+- HTTP、SOCKS5、AnyTLS、Trojan、VMess、VLESS 与 Hysteria2 的 mTLS 使用配对内联 PEM，
+  密钥匹配在使用 IO 前检查；客户端证书不增加服务端信任根，profile 不修改身份。
 - REALITY 仅允许自身临时证书认证，不能混用 pin/skip/mTLS 或降级到普通站点证书。
 - [JLS](vless.md#jls) 使用共享凭据身份和完整原生 TLS1.3，不启用恢复或 PKI 回退；profile 不改变身份。
 - 连接器只包装 Dialer/上游交付的 IO，不解析 DNS、不创建 socket、不绕过平台 protect。

@@ -35,13 +35,17 @@ HTTP CONNECT 不提供 UDP，也不接受 `udp` 字段。握手沿用原期限�
 仅 SOCKS5 CONNECT / UDP ASSOCIATE；用户名密码成对配置，不支持 SOCKS4。
 TCP 保留域名交由上游解析；UDP 由控制连接拥有，校验 relay 来源并保留实际回包目标。
 上游为 select 组时，控制连接和后续 UDP 数据报使用同次建链快照。
-SOCKS5 不提供 TLS、证书 pin 或 ClientHello 模板；它的预算独立于 TUN MTU。
+`tls: true` 使用共享 TLS、`skip-cert-verify`、`name-cert-verify`、`fingerprint` 和
+成对的内联 `certificate/private-key`。TLS 名称固定使用 server；不接受 sni、alpn
+或 ClientHello 模板。TLS 保护 CONNECT / UDP ASSOCIATE 控制连接，普通 UDP relay
+数据不经过 TLS；预算独立于 TUN MTU。TLS 关闭时不能配置证书字段。
 
 ## AnyTLS
 
 支持 v2、兼容 v1 的会话、内置填充与 UoT v2。password 为 1–1024 UTF-8 字节；
 SNI 默认 server；ALPN 省略/空列表不发送，非空保持顺序，不强制选中某协议。
-不开放 TLS 版本、ECH、mTLS、REALITY、填充和会话参数；命名指纹沿用共享 TLS。
+支持独立的 `name-cert-verify` 和成对内联 PEM `certificate/private-key` 客户端身份；
+不开放 TLS 版本、ECH、REALITY、填充和会话参数。命名指纹沿用共享 TLS。
 
 连接先发送 SHA-256 密码摘要、认证填充和首个会话批次。Settings 固定声明 v=2 和
 填充方案 MD5，不附产品/版本标识；合法 ServerSettings v>=2 启用 v2，否则兼容 v1。
@@ -73,6 +77,8 @@ begin_shutdown 同步禁止新流、清空空闲并取消所有会话；shutdown
 
 SNI 默认 server；WS Host 只覆盖 HTTP authority，不作为 SNI 回退。ALPN 默认 TCP 空、
 WS http/1.1、gRPC h2，显式列表及实际协商均须满足传输，不能静默降级。
+`name-cert-verify` 只覆盖证书验证名；成对的内联 PEM `certificate/private-key`
+用于客户端 mTLS 身份，共用标准 TLS 的验证、指纹与恢复策略。
 
 WS path 默认 /，可带 query；头字段不得覆盖握手保留头或大小写重复。early-data
 0–2048 字节，启用时默认 Sec-WebSocket-Protocol，可自定义；空头名表示路径后缀，
@@ -106,6 +112,7 @@ none 只关闭 body 加密，仍验证响应身份；不能启用 global-padding
 network 默认 tcp，另支持 ws/grpc/http/h2；均可明文或标准 TLS。tls 默认 false，
 关闭时禁止 TLS 字段，即便空串、空列表或 false。认证名依次为 servername、WS Host
 去端口、server；HTTP 伪装 Host/H2 authority 不替代认证名。WS 需 http/1.1，gRPC/H2 需 h2。
+TLS 支持独立的 `name-cert-verify` 和成对内联 PEM `certificate/private-key` 客户端身份。
 
 - WS ED/路径/头及 HTTPUpgrade 普通/fast-open 约束同 Trojan。
 - gRPC service-name 必填，普通名/完整路径规则同 Trojan，无额外池调度器。

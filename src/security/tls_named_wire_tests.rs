@@ -175,7 +175,7 @@ async fn named_reality_retains_browser_offer_but_rejects_tls12_server_hello() {
         let ordinary = client(
             &trusted(&chain),
             "fixture.invalid",
-            AnyTlsCertificatePolicy {
+            TlsClientPolicy {
                 client_fingerprint: profile,
                 ..Default::default()
             },

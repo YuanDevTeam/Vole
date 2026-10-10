@@ -11,8 +11,7 @@ use crate::{
     },
     resources::observation::{self, ResourceKind},
     security::{
-        SecurityContext, StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsCertificatePolicy,
-        TlsClientOptions,
+        SecurityContext, StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsClientOptions,
     },
     session::{Datagram, Destination, StreamSession},
     transport::{connect_websocket, grpc, http_obfs, legacy_h2},
@@ -74,17 +73,7 @@ impl VmessOutbound {
                 StandardTlsClient::with_options(
                     security,
                     &config.server_name,
-                    TlsClientOptions {
-                        client_fingerprint: tls.client_fingerprint,
-                        alpn: tls.alpn.clone(),
-                        required_alpn: config.transport.required_alpn().map(<[u8]>::to_vec),
-                        certificate: TlsCertificatePolicy {
-                            skip_cert_verify: tls.skip_cert_verify,
-                            fingerprint: tls.fingerprint,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
+                    TlsClientOptions::from_policy(tls, config.transport.required_alpn())?,
                     sessions,
                     buffer,
                 )

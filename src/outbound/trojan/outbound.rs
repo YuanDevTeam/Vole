@@ -14,8 +14,7 @@ use crate::{
     },
     resources::observation::{self, ResourceKind},
     security::{
-        SecurityContext, StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsCertificatePolicy,
-        TlsClientOptions,
+        SecurityContext, StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsClientOptions,
     },
     session::{Destination, StreamSession},
     transport::{WebSocketOptions, connect_websocket, grpc_duplex},
@@ -84,17 +83,7 @@ impl TrojanOutbound {
             tls: StandardTlsClient::with_options(
                 security,
                 &config.server_name,
-                TlsClientOptions {
-                    client_fingerprint: config.tls.client_fingerprint,
-                    alpn: config.tls.alpn.clone(),
-                    required_alpn: config.transport.required_alpn().map(<[u8]>::to_vec),
-                    certificate: TlsCertificatePolicy {
-                        skip_cert_verify: config.tls.skip_cert_verify,
-                        fingerprint: config.tls.fingerprint,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
+                TlsClientOptions::from_policy(&config.tls, config.transport.required_alpn())?,
                 resumption_sessions,
                 buffer_limit,
             )?,

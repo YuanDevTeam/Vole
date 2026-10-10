@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use super::{
-    AnyTlsCertificatePolicy, ProxyProtocol, deserialize_present_option, invalid, validate_host,
+    ProxyProtocol, TlsClientPolicy, deserialize_present_option, invalid, validate_host,
     validate_port,
 };
 use crate::Result;
@@ -13,7 +13,7 @@ pub struct TrojanOutboundConfig {
     pub port: u16,
     pub password: String,
     pub server_name: String,
-    pub tls: AnyTlsCertificatePolicy,
+    pub tls: TlsClientPolicy,
     pub transport: TrojanTransport,
 }
 
@@ -234,6 +234,20 @@ pub(super) struct RawTrojan {
     #[serde(default, deserialize_with = "deserialize_present_option")]
     fingerprint: Option<String>,
     #[serde(
+        rename = "name-cert-verify",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    name_cert_verify: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    certificate: Option<String>,
+    #[serde(
+        rename = "private-key",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    private_key: Option<String>,
+    #[serde(
         rename = "client-fingerprint",
         default,
         deserialize_with = "deserialize_present_option"
@@ -363,13 +377,19 @@ impl RawTrojan {
                 password: self.password,
                 server_name,
                 transport,
-                tls: AnyTlsCertificatePolicy {
+                tls: TlsClientPolicy {
                     client_fingerprint: super::parse_client_fingerprint(
                         self.client_fingerprint.as_deref(),
                     )?,
                     alpn,
-                    skip_cert_verify: self.skip_cert_verify,
-                    fingerprint,
+                    certificate: super::TlsCertificatePolicy {
+                        skip_cert_verify: self.skip_cert_verify,
+                        fingerprint,
+                        verification_name: super::normalize_verification_name(
+                            self.name_cert_verify,
+                        )?,
+                    },
+                    identity: super::normalize_client_identity(self.certificate, self.private_key)?,
                 },
             }),
         ))

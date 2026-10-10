@@ -514,7 +514,7 @@ pub(super) fn parse_pin(value: &str) -> Result<[u8; 32]> {
         .filter(|byte| *byte != b':')
         .collect::<Vec<_>>();
     if hex.len() != 64 || hex.iter().any(|byte| !byte.is_ascii_hexdigit()) {
-        return invalid("VLESS fingerprint must be a SHA-256 certificate digest");
+        return invalid("fingerprint must be a SHA-256 certificate digest");
     }
     let mut pin = [0; 32];
     for (index, pair) in hex.as_chunks::<2>().0.iter().enumerate() {

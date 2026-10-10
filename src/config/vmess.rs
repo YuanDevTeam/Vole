@@ -217,7 +217,7 @@ pub struct VmessOutboundConfig {
     pub authenticated_length: bool,
     pub packet_encoding: VmessPacketEncoding,
     pub server_name: String,
-    pub tls: Option<super::AnyTlsCertificatePolicy>,
+    pub tls: Option<super::TlsClientPolicy>,
     pub transport: StreamTransport,
 }
 impl std::fmt::Debug for VmessOutboundConfig {
@@ -256,6 +256,20 @@ pub(super) struct RawVmess {
     skip_cert_verify: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     fingerprint: Option<String>,
+    #[serde(
+        rename = "name-cert-verify",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    name_cert_verify: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    certificate: Option<String>,
+    #[serde(
+        rename = "private-key",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    private_key: Option<String>,
     #[serde(
         rename = "client-fingerprint",
         default,
@@ -322,6 +336,9 @@ impl RawVmess {
                 || self.alpn.is_some()
                 || self.skip_cert_verify.is_some()
                 || self.fingerprint.is_some()
+                || self.name_cert_verify.is_some()
+                || self.certificate.is_some()
+                || self.private_key.is_some()
                 || self.client_fingerprint.is_some())
         {
             return invalid("VMess TLS options require tls=true");
@@ -374,13 +391,17 @@ impl RawVmess {
                     Ok(pin)
                 })
                 .transpose()?;
-            Some(super::AnyTlsCertificatePolicy {
+            Some(super::TlsClientPolicy {
                 client_fingerprint: super::parse_client_fingerprint(
                     self.client_fingerprint.as_deref(),
                 )?,
                 alpn,
-                fingerprint,
-                skip_cert_verify: self.skip_cert_verify.unwrap_or(false),
+                certificate: super::TlsCertificatePolicy {
+                    fingerprint,
+                    skip_cert_verify: self.skip_cert_verify.unwrap_or(false),
+                    verification_name: super::normalize_verification_name(self.name_cert_verify)?,
+                },
+                identity: super::normalize_client_identity(self.certificate, self.private_key)?,
             })
         } else {
             None

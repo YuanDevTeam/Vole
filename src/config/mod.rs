@@ -60,6 +60,16 @@ pub use xhttp::{XHttpHeaders, XHttpRequestOptions, XHttpReuseConfig, XHttpVersio
 mod vmess;
 pub use vmess::StreamTransport as VmessTransport;
 pub use vmess::{StreamTransport, VmessCipher, VmessOutboundConfig, VmessPacketEncoding};
+#[cfg(all(
+    test,
+    feature = "outbound-anytls",
+    feature = "outbound-trojan",
+    feature = "outbound-vmess",
+    feature = "outbound-socks5",
+    feature = "inbound-http",
+    feature = "inbound-socks5"
+))]
+mod tls_policy_tests;
 
 #[cfg(feature = "invoke")]
 mod measure;
@@ -660,6 +670,7 @@ pub struct Socks5OutboundConfig {
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub tls: Option<TlsClientPolicy>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -668,15 +679,15 @@ pub struct AnyTlsOutboundConfig {
     pub port: u16,
     pub password: String,
     pub server_name: String,
-    pub tls: AnyTlsCertificatePolicy,
+    pub tls: TlsClientPolicy,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AnyTlsCertificatePolicy {
+pub struct TlsClientPolicy {
     pub client_fingerprint: Option<ClientFingerprint>,
     pub alpn: Vec<Vec<u8>>,
-    pub skip_cert_verify: bool,
-    pub fingerprint: Option<[u8; 32]>,
+    pub certificate: TlsCertificatePolicy,
+    pub identity: Option<TlsIdentityPem>,
 }
 
 /// A version-pinned ClientHello profile, independent of certificate pins.
@@ -1441,6 +1452,28 @@ enum RawProtocol {
         udp: bool,
         #[serde(default)]
         tls: bool,
+        #[serde(
+            rename = "skip-cert-verify",
+            default,
+            deserialize_with = "deserialize_present_option"
+        )]
+        skip_cert_verify: Option<bool>,
+        #[serde(
+            rename = "name-cert-verify",
+            default,
+            deserialize_with = "deserialize_present_option"
+        )]
+        name_cert_verify: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_present_option")]
+        fingerprint: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_present_option")]
+        certificate: Option<String>,
+        #[serde(
+            rename = "private-key",
+            default,
+            deserialize_with = "deserialize_present_option"
+        )]
+        private_key: Option<String>,
         #[serde(default, deserialize_with = "deserialize_present_option")]
         username: Option<String>,
         #[serde(default, deserialize_with = "deserialize_present_option")]
@@ -1468,6 +1501,20 @@ enum RawProtocol {
         skip_cert_verify: bool,
         #[serde(default, deserialize_with = "deserialize_present_option")]
         fingerprint: Option<String>,
+        #[serde(
+            rename = "name-cert-verify",
+            default,
+            deserialize_with = "deserialize_present_option"
+        )]
+        name_cert_verify: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_present_option")]
+        certificate: Option<String>,
+        #[serde(
+            rename = "private-key",
+            default,
+            deserialize_with = "deserialize_present_option"
+        )]
+        private_key: Option<String>,
         #[serde(
             rename = "client-fingerprint",
             default,
@@ -2559,15 +2606,41 @@ impl RawOutbound {
                 port,
                 udp,
                 tls,
+                skip_cert_verify,
+                name_cert_verify,
+                fingerprint,
+                certificate,
+                private_key,
                 username,
                 password,
                 dialer_proxy,
-            } => (
-                name,
-                dialer_proxy,
-                udp,
-                ProxyProtocol::Socks5(normalize_socks5(server, port, tls, username, password)?),
-            ),
+            } => {
+                let mut config = normalize_socks5(server, port, username, password)?;
+                if !tls
+                    && (skip_cert_verify.is_some()
+                        || name_cert_verify.is_some()
+                        || fingerprint.is_some()
+                        || certificate.is_some()
+                        || private_key.is_some())
+                {
+                    return invalid("SOCKS5 TLS options require tls: true");
+                }
+                if tls {
+                    config.tls = Some(TlsClientPolicy {
+                        certificate: TlsCertificatePolicy {
+                            skip_cert_verify: skip_cert_verify.unwrap_or(false),
+                            fingerprint: fingerprint
+                                .as_deref()
+                                .map(vless::parse_pin)
+                                .transpose()?,
+                            verification_name: normalize_verification_name(name_cert_verify)?,
+                        },
+                        identity: normalize_client_identity(certificate, private_key)?,
+                        ..Default::default()
+                    });
+                }
+                (name, dialer_proxy, udp, ProxyProtocol::Socks5(config))
+            }
             RawProtocol::AnyTls {
                 name,
                 server,
@@ -2578,6 +2651,9 @@ impl RawOutbound {
                 alpn,
                 skip_cert_verify,
                 fingerprint,
+                name_cert_verify,
+                certificate,
+                private_key,
                 client_fingerprint,
                 dialer_proxy,
             } => {
@@ -2590,6 +2666,9 @@ impl RawOutbound {
                     skip_cert_verify,
                     fingerprint,
                 )?;
+                config.tls.certificate.verification_name =
+                    normalize_verification_name(name_cert_verify)?;
+                config.tls.identity = normalize_client_identity(certificate, private_key)?;
                 config.tls.client_fingerprint =
                     parse_client_fingerprint(client_fingerprint.as_deref())?;
                 (name, dialer_proxy, udp, ProxyProtocol::AnyTls(config))
@@ -2646,15 +2725,11 @@ impl RawRealitySettings {
 fn normalize_socks5(
     server: String,
     port: u16,
-    tls: bool,
     username: Option<String>,
     password: Option<String>,
 ) -> Result<Socks5OutboundConfig> {
     validate_host(&server, "SOCKS5 server")?;
     validate_port(port, "SOCKS5")?;
-    if tls {
-        return invalid("SOCKS5 tls must be false");
-    }
     match (&username, &password) {
         (None, None) => {}
         (Some(username), Some(password)) => {
@@ -2675,6 +2750,7 @@ fn normalize_socks5(
         port,
         username,
         password,
+        tls: None,
     })
 }
 
@@ -2730,13 +2806,48 @@ fn normalize_anytls(
         port,
         password,
         server_name,
-        tls: AnyTlsCertificatePolicy {
+        tls: TlsClientPolicy {
             client_fingerprint: None,
             alpn,
-            skip_cert_verify,
-            fingerprint,
+            certificate: TlsCertificatePolicy {
+                skip_cert_verify,
+                fingerprint,
+                ..Default::default()
+            },
+            ..Default::default()
         },
     })
+}
+
+fn normalize_verification_name(name: Option<String>) -> Result<Option<String>> {
+    let name = name.filter(|name| !name.is_empty());
+    if let Some(name) = &name {
+        validate_host(name, "TLS certificate verification name")?;
+    }
+    Ok(name)
+}
+
+fn normalize_client_identity(
+    certificate: Option<String>,
+    private_key: Option<String>,
+) -> Result<Option<TlsIdentityPem>> {
+    match (certificate, private_key) {
+        (None, None) => Ok(None),
+        (Some(certificate), Some(private_key))
+            if certificate.is_empty() && private_key.is_empty() =>
+        {
+            Ok(None)
+        }
+        (Some(certificate), Some(private_key)) => {
+            crate::security::TlsClientIdentity::from_pem(&certificate, &private_key)
+                .map_err(|_| VoleError::InvalidConfig("invalid TLS client identity".into()))?;
+            Ok(Some(TlsIdentityPem {
+                certificate,
+                private_key,
+            }))
+        }
+        _ => invalid("TLS certificate and private-key must be provided together"),
+    }
 }
 
 impl RawXHttpSettings {
@@ -4747,8 +4858,6 @@ authentication:
         for field in [
             "tls: true",
             "ech-opts: {}",
-            "certificate: client.crt",
-            "private-key: client.key",
             "idle-session-check-interval: 30",
             "idle-session-timeout: 30",
             "min-idle-session: 1",
@@ -4779,7 +4888,7 @@ authentication:
             let ProxyProtocol::AnyTls(anytls) = &config.proxies[0].protocol else {
                 panic!()
             };
-            assert_eq!(anytls.tls, AnyTlsCertificatePolicy::default());
+            assert_eq!(anytls.tls, TlsClientPolicy::default());
         }
         let plain = "aB".repeat(32);
         let colon = std::iter::repeat_n("AB", 32).collect::<Vec<_>>().join(":");
@@ -4798,8 +4907,8 @@ authentication:
                 anytls.tls.alpn,
                 [b"h2".to_vec(), b"http/1.1".to_vec(), b"h2".to_vec()]
             );
-            assert!(anytls.tls.skip_cert_verify);
-            assert_eq!(anytls.tls.fingerprint, Some([0xab; 32]));
+            assert!(anytls.tls.certificate.skip_cert_verify);
+            assert_eq!(anytls.tls.certificate.fingerprint, Some([0xab; 32]));
         }
         for fields in [
             "alpn: null",
@@ -5450,12 +5559,6 @@ authentication:
                 "    server: socks.example.com",
                 "    streamSettings: {}\n    server: socks.example.com",
             ),
-            two_proxy_yaml(
-                "mixed-port: 1080
-authentication:
-  - measure:secret",
-            )
-            .replace("    type: socks5", "    type: socks5\n    tls: true"),
         ] {
             assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");
         }

@@ -244,6 +244,8 @@ proxies:
   # network 默认 tcp，支持 tcp/ws/grpc/http/h2。tls 默认 false；关闭时
   # 禁止 servername/alpn/fingerprint/skip-cert-verify 等 TLS 专属字段。
   # servername 优先显式值，其次 WS Host 去端口，否则 server。
+  # TLS 支持 name-cert-verify 和成对的内联 PEM certificate/private-key；
+  # 验证名不改变 servername，客户端身份不增加服务端信任根。
   # ws-opts/grpc-opts 与下面 Trojan 的结构相同；HTTP/H2 选项见示例注释。
   # UDP 默认 false；packet-encoding 默认为空（raw），或 xudp/packetaddr。
   # raw transport 固定首包目标；packetaddr 域名由受控 Vole DNS 解析为 IP。
@@ -281,6 +283,7 @@ proxies:
   # Stop / 取消仍关闭全部会话及自有 driver，不更改 XHTTP 的全关闭约定。
   # skip-cert-verify 默认 false；fingerprint 沿用 AnyTLS 的证书 SHA-256
   # pin 语义，pin 与 skip 同时存在仍必须匹配 pin。udp 默认 false。
+  # name-cert-verify 只改变证书验证名；certificate/private-key 为成对内联 PEM 客户端身份。
   # UDP 在 TLS 流内传输；单包负载最多 8192 字节并与入口预算取较小值，
   # 不拆包或截断。域名地址保持域名交由服务端处理；Mihomo v1.19.31 的
   # Trojan listener 不接收域名 UDP 帧，使用该对端时需要 IP 业务目标。
@@ -381,7 +384,9 @@ proxies:
   #   config: "<server-provided Base64 ECHConfigList>"
 
   # SOCKS5 出站支持 CONNECT 和 UDP ASSOCIATE。username/password 必须同时省略
-  # 或同时出现；tls 只能省略或为 false。udp 控制 UDP ASSOCIATE。
+  # 或同时出现；tls 默认 false，true 使用 server 作为 TLS 名称，不接受 sni/alpn/client-fingerprint。
+  # TLS 支持 skip-cert-verify/name-cert-verify/fingerprint 和成对内联 PEM certificate/private-key。
+  # TLS 只保护 TCP 控制连接，UDP relay 数据不经 TLS；udp 控制 UDP ASSOCIATE。
   - name: socks-hop
     type: socks5
     server: socks.example.com
@@ -394,7 +399,8 @@ proxies:
   # sni 省略时使用 server。TLS 1.3/1.2 默认 WebPKI，alpn 省略/[] 时不发送。
   # skip-cert-verify 不能覆盖 fingerprint；pin 是证书 SHA-256，不是客户端伪造指纹。
   # 叶 pin 直接决定信任；非叶 pin 作为根继续验证链和名称。所有策略均验证握手签名。
-  # 不支持 REALITY、fp、ECH、mTLS 或 session/padding 调参字段，详见 outbounds.md#anytls。
+  # name-cert-verify 只改变证书验证名；certificate/private-key 为成对内联 PEM 客户端身份。
+  # 不支持 REALITY、fp、ECH 或 session/padding 调参字段，详见 outbounds.md#anytls。
   # TCP 使用 AnyTLS session；udp: true 使用 UoT v2 datagram mode。
   - name: anytls-edge
     type: anytls

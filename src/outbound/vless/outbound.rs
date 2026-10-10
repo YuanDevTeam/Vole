@@ -1016,6 +1016,7 @@ mod connector_composition_tests {
 
     fn socks_config(address: &str) -> Socks5OutboundConfig {
         Socks5OutboundConfig {
+            tls: None,
             address: address.to_owned(),
             port: 1080,
             username: None,

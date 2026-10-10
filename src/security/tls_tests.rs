@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::AnyTlsCertificatePolicy;
+use crate::config::TlsClientPolicy;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, date_time_ymd,
@@ -25,6 +25,28 @@ mod named_wire;
 struct Chain {
     certificates: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+}
+
+impl Chain {
+    fn identity_pem(&self) -> crate::config::TlsIdentityPem {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        crate::config::TlsIdentityPem {
+            certificate: self
+                .certificates
+                .iter()
+                .map(|cert| {
+                    format!(
+                        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                        STANDARD.encode(cert.as_ref())
+                    )
+                })
+                .collect(),
+            private_key: format!(
+                "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+                STANDARD.encode(self.key.secret_der())
+            ),
+        }
+    }
 }
 
 fn ca(name: &str) -> CertificateParams {
@@ -81,24 +103,11 @@ fn trusted(chain: &Chain) -> SecurityContext {
     }
 }
 
-fn client(
-    context: &SecurityContext,
-    name: &str,
-    policy: AnyTlsCertificatePolicy,
-) -> StandardTlsClient {
+fn client(context: &SecurityContext, name: &str, policy: TlsClientPolicy) -> StandardTlsClient {
     StandardTlsClient::with_options(
         context,
         name,
-        TlsClientOptions {
-            client_fingerprint: policy.client_fingerprint,
-            certificate: TlsCertificatePolicy {
-                verification_name: None,
-                skip_cert_verify: policy.skip_cert_verify,
-                fingerprint: policy.fingerprint,
-            },
-            alpn: policy.alpn,
-            ..Default::default()
-        },
+        TlsClientOptions::from_policy(&policy, None).unwrap(),
         4,
         DEFAULT_TLS_BUFFER_LIMIT,
     )
@@ -370,7 +379,7 @@ async fn named_fingerprint_close_notify_has_a_five_second_bound() {
         let client = client(
             &trusted(&chain),
             "fixture.invalid",
-            AnyTlsCertificatePolicy {
+            TlsClientPolicy {
                 client_fingerprint: Some(profile),
                 ..Default::default()
             },
@@ -414,7 +423,7 @@ async fn webpki_rejects_untrusted_wrong_name_and_expired_unless_explicitly_skipp
                         &client(
                             &context,
                             name,
-                            AnyTlsCertificatePolicy {
+                            TlsClientPolicy {
                                 client_fingerprint: profile,
                                 ..Default::default()
                             }
@@ -425,9 +434,12 @@ async fn webpki_rejects_untrusted_wrong_name_and_expired_unless_explicitly_skipp
                     .0,
                     expected
                 );
-                let insecure = AnyTlsCertificatePolicy {
+                let insecure = TlsClientPolicy {
+                    certificate: TlsCertificatePolicy {
+                        skip_cert_verify: true,
+                        ..Default::default()
+                    },
                     client_fingerprint: profile,
-                    skip_cert_verify: true,
                     ..Default::default()
                 };
                 assert!(
@@ -454,10 +466,13 @@ async fn leaf_pin_is_trust_but_nonleaf_pin_checks_chain_name_and_expiry() {
             for index in 0..3 {
                 for name in ["fixture.invalid", "wrong.invalid"] {
                     for skip in [false, true] {
-                        let policy = AnyTlsCertificatePolicy {
+                        let policy = TlsClientPolicy {
+                            certificate: TlsCertificatePolicy {
+                                fingerprint: Some(pin(&chain, index)),
+                                skip_cert_verify: skip,
+                                ..Default::default()
+                            },
                             client_fingerprint: profile,
-                            fingerprint: Some(pin(&chain, index)),
-                            skip_cert_verify: skip,
                             ..Default::default()
                         };
                         let expected = index == 0 || (!expired && name == "fixture.invalid");
@@ -474,10 +489,13 @@ async fn leaf_pin_is_trust_but_nonleaf_pin_checks_chain_name_and_expiry() {
                     }
                 }
             }
-            let policy = AnyTlsCertificatePolicy {
+            let policy = TlsClientPolicy {
+                certificate: TlsCertificatePolicy {
+                    fingerprint: Some([0; 32]),
+                    skip_cert_verify: true,
+                    ..Default::default()
+                },
                 client_fingerprint: profile,
-                fingerprint: Some([0; 32]),
-                skip_cert_verify: true,
                 ..Default::default()
             };
             assert!(
@@ -496,10 +514,13 @@ async fn leaf_pin_is_trust_but_nonleaf_pin_checks_chain_name_and_expiry() {
                 key: chain.key.clone_key(),
             };
             unrelated.certificates.push(other.certificates[2].clone());
-            let policy = AnyTlsCertificatePolicy {
+            let policy = TlsClientPolicy {
+                certificate: TlsCertificatePolicy {
+                    fingerprint: Some(pin(&other, 2)),
+                    skip_cert_verify: true,
+                    ..Default::default()
+                },
                 client_fingerprint: profile,
-                fingerprint: Some(pin(&other, 2)),
-                skip_cert_verify: true,
                 ..Default::default()
             };
             assert!(
@@ -584,10 +605,13 @@ async fn every_certificate_policy_verifies_tls12_and_tls13_handshake_signatures(
         let chain = chain(false);
         for version in [&TLS12, &TLS13] {
             for fingerprint in [None, Some(pin(&chain, 0)), Some(pin(&chain, 1))] {
-                let policy = AnyTlsCertificatePolicy {
+                let policy = TlsClientPolicy {
+                    certificate: TlsCertificatePolicy {
+                        skip_cert_verify: true,
+                        fingerprint,
+                        ..Default::default()
+                    },
                     client_fingerprint: profile,
-                    skip_cert_verify: true,
-                    fingerprint,
                     ..Default::default()
                 };
                 let client = client(&SecurityContext::new(), "fixture.invalid", policy);
@@ -611,8 +635,11 @@ async fn vless_keeps_webpki_tls13_and_required_h2_after_anytls_connections() {
     let insecure = client(
         &SecurityContext::new(),
         "fixture.invalid",
-        AnyTlsCertificatePolicy {
-            skip_cert_verify: true,
+        TlsClientPolicy {
+            certificate: TlsCertificatePolicy {
+                skip_cert_verify: true,
+                ..Default::default()
+            },
             alpn: vec![b"h2".to_vec()],
             ..Default::default()
         },
@@ -652,9 +679,12 @@ async fn alpn_and_tls_resumption_are_isolated_between_node_policies() {
     let server = server(&chain, &TLS13, false);
     let context = trusted(&chain);
     let alpn = vec![b"custom".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
-    let policy = AnyTlsCertificatePolicy {
+    let policy = TlsClientPolicy {
+        certificate: TlsCertificatePolicy {
+            fingerprint: Some(pin(&chain, 2)),
+            ..Default::default()
+        },
         alpn: alpn.clone(),
-        fingerprint: Some(pin(&chain, 2)),
         ..Default::default()
     };
     let first = client(&context, "fixture.invalid", policy.clone());
@@ -682,9 +712,12 @@ async fn alpn_and_tls_resumption_are_isolated_between_node_policies() {
         .await
         .0
     );
-    let wrong = AnyTlsCertificatePolicy {
-        fingerprint: Some([0; 32]),
-        skip_cert_verify: true,
+    let wrong = TlsClientPolicy {
+        certificate: TlsCertificatePolicy {
+            fingerprint: Some([0; 32]),
+            skip_cert_verify: true,
+            ..Default::default()
+        },
         ..policy
     };
     assert!(
@@ -724,7 +757,7 @@ async fn explicit_verification_name_does_not_change_sni_or_allow_skip_to_overrid
             ("wrong.invalid", true, Some(pin(&chain, 1)), false),
             ("fixture.invalid", true, Some([0; 32]), false),
         ] {
-            let options = TlsClientOptions {
+            let policy = TlsClientPolicy {
                 client_fingerprint: profile,
                 certificate: TlsCertificatePolicy {
                     verification_name: Some(name.into()),
@@ -736,7 +769,7 @@ async fn explicit_verification_name_does_not_change_sni_or_allow_skip_to_overrid
             let client = StandardTlsClient::with_options(
                 &context,
                 "sni.invalid",
-                options,
+                TlsClientOptions::from_policy(&policy, None).unwrap(),
                 1,
                 DEFAULT_TLS_BUFFER_LIMIT,
             )
@@ -782,17 +815,15 @@ async fn mutual_tls_identity_is_required_verified_and_not_shared_between_clients
                 (Some(&unknown), false),
                 (Some(&identity), true),
             ] {
-                let options = TlsClientOptions {
+                let policy = TlsClientPolicy {
                     client_fingerprint: profile,
-                    identity: cert.map(|cert| {
-                        TlsClientIdentity::from_der(cert.certificates.clone(), cert.key.clone_key())
-                    }),
+                    identity: cert.map(Chain::identity_pem),
                     ..Default::default()
                 };
                 let client = StandardTlsClient::with_options(
                     &trusted(&chain),
                     "fixture.invalid",
-                    options,
+                    TlsClientOptions::from_policy(&policy, None).unwrap(),
                     1,
                     DEFAULT_TLS_BUFFER_LIMIT,
                 )
@@ -1029,7 +1060,7 @@ async fn cancelling_tls_handshake_releases_the_caller_supplied_stream() {
         let client = client(
             &trusted(&chain),
             "fixture.invalid",
-            AnyTlsCertificatePolicy {
+            TlsClientPolicy {
                 client_fingerprint: profile,
                 ..Default::default()
             },

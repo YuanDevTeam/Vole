@@ -54,6 +54,35 @@ impl std::fmt::Debug for TlsClientOptions {
     }
 }
 
+impl TlsClientOptions {
+    #[cfg(any(
+        test,
+        feature = "outbound-anytls",
+        feature = "outbound-trojan",
+        feature = "outbound-vmess",
+        feature = "outbound-socks5"
+    ))]
+    pub(crate) fn from_policy(
+        policy: &crate::config::TlsClientPolicy,
+        required_alpn: Option<&[u8]>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            client_fingerprint: policy.client_fingerprint,
+            alpn: policy.alpn.clone(),
+            required_alpn: required_alpn.map(<[u8]>::to_vec),
+            certificate: policy.certificate.clone(),
+            identity: policy
+                .identity
+                .as_ref()
+                .map(|identity| {
+                    TlsClientIdentity::from_pem(&identity.certificate, &identity.private_key)
+                })
+                .transpose()?,
+            ..Default::default()
+        })
+    }
+}
+
 /// A node-owned certificate chain and matching key. The provider validates the
 /// key pair while constructing the client, before any supplied stream is used.
 /// No file loading, environment key logging or dynamic identity reload occurs.
@@ -185,32 +214,6 @@ impl StandardTlsClient {
             context,
             server_name,
             options,
-            resumption_sessions,
-            buffer_limit,
-        )
-    }
-
-    #[cfg(feature = "outbound-anytls")]
-    pub(crate) fn for_anytls(
-        context: &SecurityContext,
-        server_name: impl Into<String>,
-        policy: &crate::config::AnyTlsCertificatePolicy,
-        resumption_sessions: usize,
-        buffer_limit: usize,
-    ) -> io::Result<Self> {
-        Self::with_options(
-            context,
-            server_name,
-            TlsClientOptions {
-                alpn: policy.alpn.clone(),
-                client_fingerprint: policy.client_fingerprint,
-                certificate: TlsCertificatePolicy {
-                    verification_name: None,
-                    skip_cert_verify: policy.skip_cert_verify,
-                    fingerprint: policy.fingerprint,
-                },
-                ..Default::default()
-            },
             resumption_sessions,
             buffer_limit,
         )

@@ -126,6 +126,7 @@ async fn socks5_budget_retains_distinct_payload_and_envelope_limits() {
         });
         let outbound = Socks5Outbound::new(
             &Socks5OutboundConfig {
+                tls: None,
                 address: "127.0.0.1".into(),
                 port: endpoint.port(),
                 username: None,

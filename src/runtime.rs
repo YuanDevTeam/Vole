@@ -85,6 +85,7 @@ use crate::outbound::{VlessOutbound, VlessResourceLimits};
 use crate::security::StandardTlsClient;
 #[cfg(any(
     feature = "outbound-http",
+    feature = "outbound-socks5",
     feature = "outbound-anytls",
     feature = "outbound-vless",
     feature = "outbound-trojan",
@@ -860,6 +861,7 @@ fn build_proxy_graph(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     #[cfg(any(
         feature = "outbound-http",
+        feature = "outbound-socks5",
         feature = "outbound-anytls",
         feature = "outbound-vless",
         feature = "outbound-trojan",
@@ -871,6 +873,7 @@ fn build_proxy_graph(
     let (security_client_count, standard_tls_count) = security_counts(proxies);
     #[cfg(any(
         feature = "outbound-http",
+        feature = "outbound-socks5",
         feature = "outbound-anytls",
         feature = "outbound-vless",
         feature = "outbound-trojan",
@@ -882,6 +885,7 @@ fn build_proxy_graph(
     let security_context = (security_client_count != 0).then(SecurityContext::new);
     #[cfg(any(
         feature = "outbound-http",
+        feature = "outbound-socks5",
         feature = "outbound-anytls",
         feature = "outbound-vless",
         feature = "outbound-trojan",
@@ -1130,7 +1134,13 @@ fn build_proxy_graph(
             ProxyProtocol::Socks5(config) => {
                 #[cfg(feature = "outbound-socks5")]
                 {
-                    Arc::new(Socks5Outbound::new_with_path(config, upstream)?)
+                    Arc::new(Socks5Outbound::with_shared_security(
+                        config,
+                        upstream,
+                        security_context.as_ref(),
+                        resumption_sessions,
+                        limits.tls_buffer_limit,
+                    )?)
                 }
                 #[cfg(not(feature = "outbound-socks5"))]
                 {
@@ -1144,12 +1154,12 @@ fn build_proxy_graph(
             ProxyProtocol::AnyTls(config) => {
                 #[cfg(feature = "outbound-anytls")]
                 {
-                    let tls = StandardTlsClient::for_anytls(
+                    let tls = StandardTlsClient::with_options(
                         security_context
                             .as_ref()
                             .expect("AnyTLS graph has shared security material"),
                         &config.server_name,
-                        &config.tls,
+                        crate::security::TlsClientOptions::from_policy(&config.tls, None)?,
                         resumption_sessions,
                         limits.tls_buffer_limit,
                     )?;
@@ -1326,6 +1336,7 @@ fn restrict_endpoint_addresses(
 
 #[cfg(any(
     feature = "outbound-http",
+    feature = "outbound-socks5",
     feature = "outbound-anytls",
     feature = "outbound-vless",
     feature = "outbound-trojan",
@@ -1370,7 +1381,10 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
                 client_count + 1,
                 standard_count + usize::from(config.tls.is_some()),
             ),
-            ProxyProtocol::Socks5(_) => (client_count, standard_count),
+            ProxyProtocol::Socks5(config) => (
+                client_count + usize::from(config.tls.is_some()),
+                standard_count + usize::from(config.tls.is_some()),
+            ),
             ProxyProtocol::Tuic(_) => (client_count + 1, standard_count),
         },
     )
@@ -1378,6 +1392,7 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
 
 #[cfg(any(
     feature = "outbound-http",
+    feature = "outbound-socks5",
     feature = "outbound-anytls",
     feature = "outbound-vless",
     feature = "outbound-trojan",
@@ -2147,6 +2162,7 @@ proxy-groups:
     #[test]
     #[cfg(any(
         feature = "outbound-http",
+        feature = "outbound-socks5",
         feature = "outbound-anytls",
         feature = "outbound-vless"
     ))]
@@ -2487,6 +2503,7 @@ rules:
                 dialer_proxy: None,
                 udp: false,
                 protocol: ProxyProtocol::Socks5(crate::config::Socks5OutboundConfig {
+                    tls: None,
                     address: "127.0.0.1".to_owned(),
                     port: 1080,
                     username: None,

@@ -41,8 +41,8 @@ fn trojan_tcp_defaults_preserve_credentials_and_address_policy() {
     assert_eq!(node.server_name, "localhost");
     assert!(!parsed.proxies[0].udp);
     assert!(node.tls.alpn.is_empty());
-    assert!(!node.tls.skip_cert_verify);
-    assert_eq!(node.tls.fingerprint, None);
+    assert!(!node.tls.certificate.skip_cert_verify);
+    assert_eq!(node.tls.certificate.fingerprint, None);
     for server in ["127.0.0.1", "::1", "example.com"] {
         assert!(Config::parse_yaml(&document(json!({"server":server, "network":"tcp"}))).is_ok());
     }
@@ -51,8 +51,8 @@ fn trojan_tcp_defaults_preserve_credentials_and_address_policy() {
         unreachable!()
     };
     assert_eq!(node.tls.alpn, [b"second".to_vec(), b"first".to_vec()]);
-    assert!(node.tls.skip_cert_verify);
-    assert_eq!(node.tls.fingerprint, Some([0xab; 32]));
+    assert!(node.tls.certificate.skip_cert_verify);
+    assert_eq!(node.tls.certificate.fingerprint, Some([0xab; 32]));
 }
 
 #[test]

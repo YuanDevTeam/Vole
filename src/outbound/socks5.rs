@@ -8,6 +8,9 @@ use crate::{
     config::Socks5OutboundConfig,
     dialer::{Dialer, ResolvedEndpoint},
     dispatch::{BoxStream, DatagramTransport, DispatchError, Dispatcher},
+    security::{
+        SecurityContext, StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsClientOptions,
+    },
     session::{Datagram, DatagramSession, Destination, StreamSession},
     socks5::{
         COMMAND_CONNECT, COMMAND_UDP_ASSOCIATE, MAX_UDP_HEADER_SIZE, VERSION, decode_udp_packet,
@@ -62,6 +65,7 @@ pub struct Socks5Outbound {
     server: Destination,
     auth: Option<Socks5Auth>,
     upstream: UpstreamPath,
+    tls: Option<StandardTlsClient>,
 }
 
 impl std::fmt::Debug for Socks5Outbound {
@@ -70,6 +74,7 @@ impl std::fmt::Debug for Socks5Outbound {
             .debug_struct("Socks5Outbound")
             .field("server", &self.server)
             .field("has_auth", &self.auth.is_some())
+            .field("tls", &self.tls.is_some())
             .field("upstream", &self.upstream)
             .finish()
     }
@@ -96,6 +101,23 @@ impl Socks5Outbound {
         config: &Socks5OutboundConfig,
         upstream: UpstreamPath,
     ) -> io::Result<Self> {
+        let security = config.tls.as_ref().map(|_| SecurityContext::new());
+        Self::with_shared_security(
+            config,
+            upstream,
+            security.as_ref(),
+            TLS_RESUMPTION_SESSION_BUDGET,
+            64 * 1024,
+        )
+    }
+
+    pub(crate) fn with_shared_security(
+        config: &Socks5OutboundConfig,
+        upstream: UpstreamPath,
+        security: Option<&SecurityContext>,
+        sessions: usize,
+        buffer_limit: usize,
+    ) -> io::Result<Self> {
         let auth = match (&config.username, &config.password) {
             (None, None) => None,
             (Some(username), Some(password)) => {
@@ -112,6 +134,24 @@ impl Socks5Outbound {
             server: server_destination(&config.address, config.port)?,
             auth,
             upstream,
+            tls: config
+                .tls
+                .as_ref()
+                .map(|policy| {
+                    StandardTlsClient::with_options(
+                        security.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "SOCKS5 TLS requires security context",
+                            )
+                        })?,
+                        &config.address,
+                        TlsClientOptions::from_policy(policy, None)?,
+                        sessions,
+                        buffer_limit,
+                    )
+                })
+                .transpose()?,
         })
     }
 
@@ -120,9 +160,16 @@ impl Socks5Outbound {
         session: StreamSession,
         context: &EstablishContext,
     ) -> Result<ConnectedStream, DispatchError> {
-        self.upstream
+        let mut control = self
+            .upstream
             .connect_server(session, &self.server, context)
-            .await
+            .await?;
+        if let Some(tls) = &self.tls {
+            control.io = context
+                .run_io("SOCKS5 TLS handshake", tls.connect(control.io))
+                .await?;
+        }
+        Ok(control)
     }
 
     async fn establish_tcp(
@@ -754,6 +801,7 @@ mod tests {
 
     fn config(auth: Option<(&str, &str)>) -> Socks5OutboundConfig {
         Socks5OutboundConfig {
+            tls: None,
             address: "socks.example".to_owned(),
             port: 1080,
             username: auth.map(|(username, _)| username.to_owned()),
@@ -1000,6 +1048,7 @@ mod tests {
     async fn socks_over_socks_udp_nests_control_relay_and_wire_budgets() {
         let physical = Arc::new(NestedSocksUpstream::new());
         let outer_config = Socks5OutboundConfig {
+            tls: None,
             address: "outer.example".to_owned(),
             port: 1080,
             username: None,
@@ -1008,6 +1057,7 @@ mod tests {
         let outer =
             Arc::new(Socks5Outbound::new_with_upstream(&outer_config, physical.clone()).unwrap());
         let inner_config = Socks5OutboundConfig {
+            tls: None,
             address: "inner.example".to_owned(),
             port: 1080,
             username: None,
