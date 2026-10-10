@@ -199,6 +199,7 @@ impl Socks5Outbound {
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         let control_session = StreamSession {
+            metadata: request_parameters.session.metadata.clone(),
             inbound: request_parameters.session.inbound,
             source: request_parameters.session.source,
             destination: self.server.clone(),
@@ -811,6 +812,7 @@ mod tests {
 
     fn stream_session() -> StreamSession {
         StreamSession {
+            metadata: Default::default(),
             inbound: crate::session::InboundKind::Http,
             source: "127.0.0.1:10000".parse().unwrap(),
             destination: Destination::domain("target.example", 443).unwrap(),

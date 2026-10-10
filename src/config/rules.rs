@@ -28,6 +28,117 @@ impl DomainRegex {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleInboundType {
+    Http,
+    Https,
+    Socks4,
+    Socks5,
+    Shadowsocks,
+    Snell,
+    Vmess,
+    Vless,
+    Redir,
+    Tproxy,
+    Trojan,
+    Tunnel,
+    Tun,
+    Tuic,
+    Hysteria2,
+    Anytls,
+    Mieru,
+    Sudoku,
+    Trusttunnel,
+    Shadowquic,
+    Inner,
+}
+impl RuleInboundType {
+    pub(crate) fn for_inbound(kind: crate::session::InboundKind) -> Self {
+        use crate::session::InboundKind;
+        match kind {
+            InboundKind::Http => Self::Http,
+            InboundKind::Https => Self::Https,
+            InboundKind::Socks5 => Self::Socks5,
+            InboundKind::Tun => Self::Tun,
+            InboundKind::InternalDns
+            | InboundKind::InternalGeoData
+            | InboundKind::InternalMeasure => Self::Inner,
+        }
+    }
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Http => "HTTP",
+            Self::Https => "HTTPS",
+            Self::Socks4 => "SOCKS4",
+            Self::Socks5 => "SOCKS5",
+            Self::Shadowsocks => "SHADOWSOCKS",
+            Self::Snell => "SNELL",
+            Self::Vmess => "VMESS",
+            Self::Vless => "VLESS",
+            Self::Redir => "REDIR",
+            Self::Tproxy => "TPROXY",
+            Self::Trojan => "TROJAN",
+            Self::Tunnel => "TUNNEL",
+            Self::Tun => "TUN",
+            Self::Tuic => "TUIC",
+            Self::Hysteria2 => "HYSTERIA2",
+            Self::Anytls => "ANYTLS",
+            Self::Mieru => "MIERU",
+            Self::Sudoku => "SUDOKU",
+            Self::Trusttunnel => "TRUSTTUNNEL",
+            Self::Shadowquic => "SHADOWQUIC",
+            Self::Inner => "INNER",
+        }
+    }
+}
+fn parse_in_types(payload: &str) -> Result<Vec<RuleInboundType>> {
+    let mut types = Vec::new();
+    for value in payload.split('/') {
+        let value = value.trim().to_ascii_uppercase();
+        if value == "SOCKS" {
+            types.extend([RuleInboundType::Socks4, RuleInboundType::Socks5]);
+            continue;
+        }
+        types.push(match value.as_str() {
+            "HTTP" => RuleInboundType::Http,
+            "HTTPS" => RuleInboundType::Https,
+            "SOCKS4" => RuleInboundType::Socks4,
+            "SOCKS5" => RuleInboundType::Socks5,
+            "SHADOWSOCKS" => RuleInboundType::Shadowsocks,
+            "SNELL" => RuleInboundType::Snell,
+            "VMESS" => RuleInboundType::Vmess,
+            "VLESS" => RuleInboundType::Vless,
+            "REDIR" => RuleInboundType::Redir,
+            "TPROXY" => RuleInboundType::Tproxy,
+            "TROJAN" => RuleInboundType::Trojan,
+            "TUNNEL" => RuleInboundType::Tunnel,
+            "TUN" => RuleInboundType::Tun,
+            "TUIC" => RuleInboundType::Tuic,
+            "HYSTERIA2" => RuleInboundType::Hysteria2,
+            "ANYTLS" => RuleInboundType::Anytls,
+            "MIERU" => RuleInboundType::Mieru,
+            "SUDOKU" => RuleInboundType::Sudoku,
+            "TRUSTTUNNEL" => RuleInboundType::Trusttunnel,
+            "SHADOWQUIC" => RuleInboundType::Shadowquic,
+            "INNER" => RuleInboundType::Inner,
+            _ => return invalid("IN-TYPE requires a known Mihomo inbound type"),
+        });
+    }
+    Ok(types)
+}
+fn parse_in_users(payload: &str) -> Result<Vec<String>> {
+    payload
+        .split('/')
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                return invalid("IN-USER requires nonempty users");
+            }
+            Ok(value.to_owned())
+        })
+        .collect()
+}
+
 pub(super) fn parse_rule(input: &str, targets: &RouteTargetsByName) -> Result<RuleSpec> {
     parse(input, Some(targets), 0)
 }
@@ -219,7 +330,7 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
             no_resolve: false,
         });
     }
-    let (payload, action, no_resolve) =
+    let (payload, action, no_resolve, source) =
         if matches!(kind.as_str(), "AND" | "OR" | "NOT" | "DOMAIN-REGEX") {
             match targets {
                 Some(targets) => {
@@ -230,9 +341,15 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
                         trim_ascii_whitespace(payload),
                         parse_rule_action(trim_ascii_whitespace(action), targets)?,
                         false,
+                        false,
                     )
                 }
-                None => (trim_ascii_whitespace(rest), RuleAction::Direct, false),
+                None => (
+                    trim_ascii_whitespace(rest),
+                    RuleAction::Direct,
+                    false,
+                    false,
+                ),
             }
         } else {
             let mut fields = rest.split(',').map(trim_ascii_whitespace);
@@ -242,24 +359,30 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
                 None => RuleAction::Direct,
             };
             let mut no_resolve = false;
+            let mut source = kind == "SRC-GEOIP" || kind == "SRC-IP-CIDR";
             for option in fields {
                 if option == "no-resolve"
                     && matches!(
                         kind.as_str(),
-                        "RULE-SET" | "GEOIP" | "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR"
+                        "RULE-SET" | "GEOIP" | "SRC-GEOIP" | "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR"
                     )
                 {
                     no_resolve = true;
+                } else if option == "src"
+                    && matches!(kind.as_str(), "RULE-SET" | "GEOIP" | "IP-CIDR" | "IP-CIDR6")
+                {
+                    source = true;
                 } else {
                     return invalid("unsupported rule parameter");
                 }
             }
-            (payload, action, no_resolve)
+            (payload, action, no_resolve || source, source)
         };
     let rule_kind = match kind.as_str() {
         "RULE-SET" => RuleKind::RuleSet {
             name: payload.to_owned(),
             content: None,
+            source,
         },
         "DOMAIN" => RuleKind::Domain(normalize_rule_domain(payload, "DOMAIN")?),
         "DOMAIN-SUFFIX" => RuleKind::DomainSuffix(normalize_rule_domain(payload, "DOMAIN-SUFFIX")?),
@@ -267,13 +390,28 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
         "DOMAIN-WILDCARD" => RuleKind::DomainWildcard(payload.to_lowercase()),
         "DOMAIN-REGEX" => RuleKind::DomainRegex(DomainRegex::new(payload)?),
         "GEOSITE" => RuleKind::GeoSite(normalize_geo_code(payload, "GEOSITE")?),
-        "GEOIP" => RuleKind::GeoIp(normalize_geo_code(payload, "GEOIP")?),
-        "IP-CIDR" => RuleKind::IpCidr(parse_ip_cidr(payload, false)?),
-        "IP-CIDR6" => RuleKind::IpCidr(parse_ip_cidr(payload, true)?),
-        "SRC-IP-CIDR" => RuleKind::SrcIpCidr(parse_ip_cidr(payload, payload.contains(':'))?),
+        "GEOIP" | "SRC-GEOIP" => {
+            let code = normalize_geo_code(payload, "GEOIP")?;
+            if source {
+                RuleKind::SrcGeoIp(code)
+            } else {
+                RuleKind::GeoIp(code)
+            }
+        }
+        "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR" => {
+            let cidr = parse_ip_cidr(payload, payload.contains(':'))?;
+            if source {
+                RuleKind::SrcIpCidr(cidr)
+            } else {
+                RuleKind::IpCidr(cidr)
+            }
+        }
         "DST-PORT" => RuleKind::DstPorts(parse_port_ranges(payload)?),
         "SRC-PORT" => RuleKind::SrcPorts(parse_port_ranges(payload)?),
         "NETWORK" => RuleKind::Network(parse_network(payload)?),
+        "IN-TYPE" => RuleKind::InTypes(parse_in_types(payload)?),
+        "IN-USER" => RuleKind::InUsers(parse_in_users(payload)?),
+        "IN-PORT" => RuleKind::InPorts(parse_port_ranges(payload)?),
         "AND" | "OR" | "NOT" => {
             let children = logical_children(payload)?
                 .into_iter()

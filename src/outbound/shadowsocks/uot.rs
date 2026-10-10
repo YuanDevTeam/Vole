@@ -43,6 +43,7 @@ impl Owner {
             biased;
             () = self.cancellation.cancelled() => return Err(DispatchError::NotAllowed),
             result = outbound.connect_stream(StreamSession {
+                metadata: request.session.metadata.clone(),
                 inbound: request.session.inbound,
                 source: request.session.source,
                 destination: magic_destination(),

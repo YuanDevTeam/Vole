@@ -29,6 +29,21 @@ HTTP 与 SOCKS5 共用一个混合入口，并和 TUN 共用 Dispatcher、规则
 - 不设置全局业务连接/关联准入数。Stop 取消并等待全部连接、relay 和接收任务，
   返回后端口可重新绑定。
 
+## 选路元数据
+
+`IN-TYPE` 使用实际入口类型：普通 HTTP/Upgrade 为 HTTP，CONNECT 为 HTTPS，
+SOCKS5 为 SOCKS5；HTTPS 类型只表示 CONNECT，不检查目标 TLS。`IN-PORT` 读取
+接收连接或授权 UDP socket 的真实本地端口。
+
+`IN-USER` 与 load-balance 的 `hash-key: in-user` 只使用验证成功的配置用户名。
+HTTP 每个请求重新验证，SOCKS TCP 和 UDP 授权关联保留握手身份。无认证或
+`skip-auth-prefixes` 旁路时身份为空，即使请求声称一个 Proxy-Authorization 用户。
+身份随请求/关联保存，只持有用户名，不保存密码、请求头或完整配置代际；Debug 不输出用户名。
+业务路由和 dialer-proxy 共用该身份，内部 DNS、资源下载及主动测速没有入口用户。
+
+Mihomo 当前实现不把 SOCKS TCP 身份传给独立 UDP 接收；Vole 的授权 UDP 保留
+真实握手身份。Mihomo HTTP 在无认证时也可能记录请求声称的用户，Vole 保持为空。
+
 ## HTTP
 
 每个请求独立认证，缺失、错误、重复或非法 Proxy-Authorization 返回 407 并关闭，

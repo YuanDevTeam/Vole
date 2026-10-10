@@ -14,7 +14,7 @@ use crate::{
     dispatch::{DispatchError, Dispatcher},
     inbound::listen::{bind_proxy_tcp, bind_udp},
     session::{
-        Datagram, DatagramSession, Destination, InboundKind, SOCKS5_UDP_PACKET_LIMIT, StreamSession,
+        Datagram, Destination, InboundKind, InboundMetadata, SOCKS5_UDP_PACKET_LIMIT, StreamSession,
     },
     socks5::{COMMAND_CONNECT, encode_udp_packet},
 };
@@ -186,7 +186,11 @@ impl Socks5Handler {
         let config = &self.config;
         let dispatcher = self.dispatcher.clone();
         let registry = self.registry.clone();
-        let (command, destination) = timeout_at(
+        let handshake::Negotiated {
+            command,
+            destination,
+            user,
+        } = timeout_at(
             deadline,
             handshake::negotiate(&mut stream, config.auth.as_ref()),
         )
@@ -200,6 +204,10 @@ impl Socks5Handler {
         }
         if command == COMMAND_CONNECT {
             let mut session = StreamSession {
+                metadata: InboundMetadata {
+                    local_port: relay.port(),
+                    user,
+                },
                 inbound: InboundKind::Socks5,
                 source: peer,
                 destination,
@@ -264,12 +272,16 @@ impl Socks5Handler {
                 return Ok(());
             }
         };
-        let (lease, receiver) = match registry.register(peer, requested.port(), &cancellation) {
+        let (mut lease, receiver) = match registry.register(peer, requested.port(), &cancellation) {
             Ok(value) => value,
             Err(_) => {
                 timed(handshake::reply(&mut stream, 2, None)).await?;
                 return Ok(());
             }
+        };
+        lease.metadata = InboundMetadata {
+            local_port: socket.local_addr()?.port(),
+            user,
         };
         // The accepted socket's concrete local IP is reachable even when the
         // listener was bound to a wildcard. TCP and UDP share this exact port.
@@ -301,8 +313,7 @@ async fn relay_datagrams(
     let Some(first) = receiver.recv().await else {
         return Ok(());
     };
-    let source = *lease.source.lock().unwrap();
-    let session = DatagramSession::new(InboundKind::Socks5, source);
+    let session = lease.session();
     let response_limit = usize::from(session.max_response_payload_size());
     let mut transport = timeout(IO_TIMEOUT, dispatcher.open_datagram(session))
         .await

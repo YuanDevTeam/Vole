@@ -133,6 +133,7 @@ fn fixture_parts(
 
 fn request() -> StreamSession {
     StreamSession {
+        metadata: Default::default(),
         inbound: InboundKind::Socks5,
         source: "127.0.0.1:1".parse().unwrap(),
         destination: Destination::domain("x", 80).unwrap(),

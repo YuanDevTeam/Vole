@@ -256,7 +256,7 @@ impl ProxyGroups {
         &self,
         group_id: ProxyGroupId,
     ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
-        self.resolve_leaf_for(group_id, false, None, None)
+        self.resolve_leaf_for(group_id, false, None, None, None)
     }
 
     pub(crate) fn resolve_leaf_for(
@@ -265,6 +265,7 @@ impl ProxyGroups {
         udp: bool,
         source: Option<std::net::SocketAddr>,
         destination: Option<&crate::session::Destination>,
+        user: Option<&str>,
     ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
         let mut chain = Vec::new();
         let mut selections = Vec::new();
@@ -277,7 +278,7 @@ impl ProxyGroups {
             if udp && group.disable_udp {
                 return Err(DispatchError::NotAllowed);
             }
-            let selected = group.selected.choose(source, destination);
+            let selected = group.selected.choose_for(source, destination, user);
             let member = group.members.get(selected).ok_or_else(|| {
                 DispatchError::Other(format!(
                     "proxy group {} has invalid selected index {selected}",
@@ -340,6 +341,7 @@ impl ProxyGroups {
         commit: bool,
         source: Option<std::net::SocketAddr>,
         destination: Option<&crate::session::Destination>,
+        user: Option<&str>,
     ) -> Result<InspectedRuleTarget, DispatchError> {
         let mut inspected = Vec::new();
         let mut chain = Vec::new();
@@ -357,7 +359,7 @@ impl ProxyGroups {
             {
                 return Err(DispatchError::NotAllowed);
             }
-            let selected = group.selected.inspect(source, destination);
+            let selected = group.selected.inspect(source, destination, user);
             let member = group
                 .members
                 .get(selected.index)
@@ -548,6 +550,7 @@ impl Dispatcher for SelectProxyGroupDispatcher {
             false,
             Some(session.source),
             Some(&session.destination),
+            session.metadata.user.as_deref(),
         )?;
         let result = leaf.dispatcher.connect_tcp(session).await;
         leaf.report(&result);
@@ -567,7 +570,13 @@ impl Dispatcher for SelectProxyGroupDispatcher {
             }));
         }
         self.groups
-            .resolve_leaf_for(self.id, true, Some(session.source), None)?
+            .resolve_leaf_for(
+                self.id,
+                true,
+                Some(session.source),
+                None,
+                session.metadata.user.as_deref(),
+            )?
             .dispatcher
             .open_datagram(session)
             .await
@@ -591,6 +600,7 @@ impl DatagramTransport for BalancedDatagrams {
                 true,
                 Some(self.session.source),
                 Some(&datagram.remote),
+                self.session.metadata.user.as_deref(),
             )?;
             self.transport = Some(leaf.dispatcher.open_datagram(self.session.clone()).await?);
         }
@@ -763,6 +773,7 @@ mod tests {
         SelectProxyGroupConfig {
             kind: crate::config::GroupKind::Select,
             strategy: crate::config::BalanceStrategy::default(),
+            hash_key: crate::config::BalanceHashKey::default(),
             health: crate::config::HealthCheckConfig::default(),
             tolerance: 0,
             max_failed_times: 5,
@@ -777,6 +788,7 @@ mod tests {
 
     fn stream_session() -> StreamSession {
         StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::Http,
             source: "127.0.0.1:10000".parse().unwrap(),
             destination: Destination::Ip("192.0.2.1:443".parse().unwrap()),

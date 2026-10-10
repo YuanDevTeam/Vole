@@ -21,7 +21,7 @@ use crate::{
     outbound::{
         MAX_OUTBOUND_DIAGNOSTIC_MESSAGE_BYTES, OutboundDiagnostic, capture_outbound_diagnostic,
     },
-    session::{InboundKind, StreamSession},
+    session::{InboundKind, InboundMetadata, StreamSession},
 };
 
 use super::super::{
@@ -180,12 +180,23 @@ pub(crate) async fn handle_connection(
     cancellation: CancellationToken,
 ) -> io::Result<()> {
     let deadline = Instant::now() + config.header_timeout;
-    handle_connection_with_deadline(inbound, peer, dispatcher, config, cancellation, deadline).await
+    let local_port = inbound.local_addr()?.port();
+    handle_connection_with_deadline(
+        inbound,
+        peer,
+        local_port,
+        dispatcher,
+        config,
+        cancellation,
+        deadline,
+    )
+    .await
 }
 
 pub(crate) async fn handle_connection_with_deadline<S>(
     inbound: S,
     peer: SocketAddr,
+    local_port: u16,
     dispatcher: Arc<dyn Dispatcher>,
     config: HttpServerConfig,
     cancellation: CancellationToken,
@@ -202,7 +213,7 @@ where
         result = async {
             let (read, mut write) = tokio::io::split(inbound);
             let mut reader = BufReader::with_capacity(framing::COPY_BUFFER, read);
-            serve_requests(&mut reader, &mut write, peer, &dispatcher, &config, deadline).await
+            serve_requests(&mut reader, &mut write, peer, local_port, &dispatcher, &config, deadline).await
         } => result,
     }
 }
@@ -211,6 +222,7 @@ async fn serve_requests<R, W>(
     reader: &mut R,
     writer: &mut W,
     peer: SocketAddr,
+    local_port: u16,
     dispatcher: &Arc<dyn Dispatcher>,
     config: &HttpServerConfig,
     first_deadline: Instant,
@@ -244,14 +256,16 @@ where
                 return Err(error);
             }
         };
-        if config
-            .auth
-            .as_ref()
-            .is_some_and(|auth| !auth.verifies(&request.headers))
-        {
-            write_auth_required(writer).await?;
-            return Ok(());
-        }
+        let user = match &config.auth {
+            Some(auth) => match auth.authenticate_headers(&request.headers) {
+                Some(user) => Some(user),
+                None => {
+                    write_auth_required(writer).await?;
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
         let diagnostic = request.is_connect()
             && config.auth.is_some()
             && config.listen.ip().is_loopback()
@@ -271,7 +285,12 @@ where
             }
         };
         let mut session = StreamSession {
-            inbound: InboundKind::Http,
+            metadata: InboundMetadata { local_port, user },
+            inbound: if request.is_connect() {
+                InboundKind::Https
+            } else {
+                InboundKind::Http
+            },
             source: peer,
             destination,
             sniffed_domain: None,

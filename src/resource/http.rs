@@ -235,6 +235,7 @@ async fn download_inner(
     for redirects_followed in 0..=MAX_REDIRECTS {
         let endpoint = DownloadEndpoint::from_url(&current_url)?;
         let session = StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::InternalGeoData,
             source: SocketAddr::from(([0, 0, 0, 0], 0)),
             destination: match endpoint.host.parse() {

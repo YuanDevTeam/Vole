@@ -414,6 +414,7 @@ mod wire {
 
     fn session(host: &str) -> StreamSession {
         StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::Http,
             source: "127.0.0.1:18081".parse().unwrap(),
             destination: Destination::domain(host, 443).unwrap(),

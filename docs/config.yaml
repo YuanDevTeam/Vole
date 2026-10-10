@@ -471,6 +471,8 @@ proxies:
 # load-balance 的 strategy 为 consistent-hashing（缺省）、round-robin、sticky-sessions。
 # 一致性哈希按目标可注册主域名或 IP 分桶；轮询跳过不健康成员；粘滞会话按来源 IP
 # 与目标主域名/IP 缓存 10 分钟，最多 1000 项。哈希种子属于当前进程，不承诺重启后相同。
+# hash-key 仅接受空字符串（缺省）或 in-user；in-user 仅用于一致性哈希/粘滞策略，
+# 使用已认证用户名单独分桶，无用户名时回退地址策略。业务路由和 dialer-proxy 都保留此身份。
 # load-balance 没有 now/手动选择；UDP 按目标会话固定叶节点，健康变化不迁移旧会话。
 # 自动或手动切换只影响新连接；既有连接、认证会话及其中复用的流仍保留原路径。
 # 组作为 dialer-proxy 时，与路由共用当前选择，但不重新执行业务规则；DIRECT 连接
@@ -611,8 +613,14 @@ dns:
 # rules 可省略或为空；rule 模式按顺序首条命中，未命中 DIRECT。MATCH 可放在任意
 # 位置，普通目标命中后其后规则不再执行。DIRECT、REJECT 是内置出口，其他出口精确引用节点或组。
 # 支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、DOMAIN-WILDCARD、DOMAIN-REGEX、
-# GEOSITE、GEOIP、IP-CIDR、IP-CIDR6、SRC-IP-CIDR、DST-PORT、SRC-PORT、NETWORK、
-# RULE-SET、SUB-RULE、AND/OR/NOT 和 MATCH。SRC-IP-CIDR 支持 IPv4/IPv6，来源信息来自实际入站会话。
+# GEOSITE、GEOIP、SRC-GEOIP、IP-CIDR、IP-CIDR6、SRC-IP-CIDR、DST-PORT、SRC-PORT、NETWORK、
+# IN-TYPE、IN-USER、IN-PORT、RULE-SET、SUB-RULE、AND/OR/NOT 和 MATCH。来源信息来自实际入站会话。
+# CIDR 两种别名都按 payload 实际地址族解析；GEOIP/CIDR/RULE-SET 可追加 src，自动禁止 DNS。
+# RULE-SET 的 src 在局部视图交换源/目标 IP 与端口，保留域名、入口类型和身份。
+# IN-TYPE 为 / 分隔的 Mihomo 类型名，大小写无关，SOCKS 展开为 SOCKS4/SOCKS5；
+# IN-USER 为 / 分隔、区分大小写的已认证用户名。两种列表逐项 trim，空项报错。
+# IN-PORT/DST-PORT/SRC-PORT 为 uint16 端口或范围，/ 分隔，含 0，逆序范围归一，
+# 最多 28 段；分隔中的空段跳过。真实入口和服务器端口仍须非零。
 # 通配符 * 匹配任意长度、? 匹配一个字符；DOMAIN-REGEX 忽略大小写，支持 regex crate
 # 子集，不支持 lookaround/backreference，无法编译的模式明确报错。
 # 逻辑规则例如 AND,((DOMAIN-SUFFIX,example.com),(SRC-PORT,1000-2000)),DIRECT；
@@ -624,6 +632,7 @@ dns:
 # 当前子列表，出现在主列表时为 REJECT。两者不能出现在逻辑谓词或 classical 集合中。
 # 组的控制目标先于 disable-udp/节点 UDP 检查；跳过不推进轮询。实际出口只选择一次。
 # GEOSITE 支持 [!]<code>[@<attr>...]，GEOIP 支持 [!]<code> 和可选 no-resolve。
+# SRC-GEOIP 与 GEOIP,...,src 等价，来源规则不触发 DNS；lan 为无需资产的内置 GeoIP。
 # 例如 GEOSITE,google@ads,REJECT / GEOSITE,!cn@ads,main-select / GEOIP,!CN,DIRECT。
 # geolocation-!cn 为字面分类名；GeoIP DAT reverse_match 接受但忽略，取反由 ! 控制。
 # GEOSITE 没有域名不匹配；分类缺失不匹配，而有效空属性交集的反选匹配非空域名。

@@ -765,6 +765,7 @@ mod tests {
             &[SelectProxyGroupConfig {
                 kind: crate::config::GroupKind::Select,
                 strategy: crate::config::BalanceStrategy::default(),
+                hash_key: crate::config::BalanceHashKey::default(),
                 health: crate::config::HealthCheckConfig::default(),
                 tolerance: 0,
                 max_failed_times: 5,

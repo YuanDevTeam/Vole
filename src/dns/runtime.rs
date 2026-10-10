@@ -298,6 +298,7 @@ impl TcpConnectionPool {
         let connecting = TcpConnectingGuard::new(Arc::clone(&self.stats));
         let stream = egress
             .connect_tcp(StreamSession {
+                metadata: Default::default(),
                 inbound: InboundKind::InternalDns,
                 source: internal_source(nameserver.endpoint.ip()),
                 destination: Destination::Ip(nameserver.endpoint()),
@@ -1199,6 +1200,7 @@ impl RuntimeDns {
                 !reuse(DnsEgressKey::Route(id)),
                 Some(internal_source(nameserver.endpoint.ip())),
                 Some(&destination),
+                None,
             )
         };
         match nameserver.route {
@@ -1213,6 +1215,7 @@ impl RuntimeDns {
                 let mut context = RoutingContext::new(network, &destination)
                     .map_err(|_| AttemptError::Dispatch(DispatchError::HostUnreachable))?;
                 context.pin_ip(nameserver.endpoint.ip());
+                context.set_source(internal_source(nameserver.endpoint.ip()));
                 let snapshot = self.geo_matcher.routing_snapshot();
                 let geo = snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref());
                 let mut selected = None;
@@ -3532,6 +3535,7 @@ sub-rules: {child: ['MATCH,gate', 'MATCH,pool']}
             &[SelectProxyGroupConfig {
                 kind: crate::config::GroupKind::Select,
                 strategy: crate::config::BalanceStrategy::default(),
+                hash_key: crate::config::BalanceHashKey::default(),
                 health: crate::config::HealthCheckConfig::default(),
                 tolerance: 0,
                 max_failed_times: 5,

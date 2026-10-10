@@ -843,6 +843,7 @@ impl OutboundConnector for VlessOutbound {
         {
             let target = crate::session::Destination::domain("sp.mux.sing-box.arpa", 444)?;
             let session = StreamSession {
+                metadata: request.session.metadata.clone(),
                 inbound: request.session.inbound,
                 source: request.session.source,
                 destination: target.clone(),
@@ -874,6 +875,7 @@ impl OutboundConnector for VlessOutbound {
         let prepared = self
             .prepare(
                 StreamSession {
+                    metadata: request.session.metadata.clone(),
                     inbound: request.session.inbound,
                     source: request.session.source,
                     destination: self.upload.server.clone(),

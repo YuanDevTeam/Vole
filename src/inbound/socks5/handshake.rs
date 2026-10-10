@@ -1,4 +1,4 @@
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, sync::Arc};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -13,11 +13,17 @@ fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid SOCKS5 handshake")
 }
 
+pub(super) struct Negotiated {
+    pub command: u8,
+    pub destination: Destination,
+    pub user: Option<Arc<str>>,
+}
+
 /// Fixed-size, exact reads leave pipelined application bytes in the socket.
 pub(super) async fn negotiate<S>(
     stream: &mut S,
     auth: Option<&ProxyCredentials>,
-) -> io::Result<(u8, Destination)>
+) -> io::Result<Negotiated>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -33,6 +39,7 @@ where
         return Err(invalid());
     }
     stream.write_all(&[VERSION, method]).await?;
+    let mut authenticated_user = None;
     if let Some(auth) = auth {
         let version = stream.read_u8().await?;
         let user_length = stream.read_u8().await? as usize;
@@ -41,8 +48,10 @@ where
         let password_length = stream.read_u8().await? as usize;
         let mut password = [0_u8; 255];
         stream.read_exact(&mut password[..password_length]).await?;
-        let valid =
-            version == 1 && auth.matches(&user[..user_length], &password[..password_length]);
+        authenticated_user = (version == 1)
+            .then(|| auth.authenticate(&user[..user_length], &password[..password_length]))
+            .flatten();
+        let valid = authenticated_user.is_some();
         stream.write_all(&[1, u8::from(!valid)]).await?;
         if !valid {
             return Err(io::Error::new(
@@ -62,7 +71,11 @@ where
         return Err(invalid());
     }
     match socks5::read_destination(stream, header[1] == COMMAND_UDP_ASSOCIATE).await {
-        Ok(destination) => Ok((header[1], destination)),
+        Ok(destination) => Ok(Negotiated {
+            command: header[1],
+            destination,
+            user: authenticated_user,
+        }),
         Err(error) => {
             reply(stream, 8, None).await?;
             Err(error)

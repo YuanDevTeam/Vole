@@ -567,6 +567,7 @@ mod tests {
 
     fn stream_session() -> StreamSession {
         StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::Http,
             source: "127.0.0.1:12000".parse().unwrap(),
             destination: Destination::domain("target.example", 443).unwrap(),

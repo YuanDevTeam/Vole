@@ -210,6 +210,7 @@ pub struct EstablishContext {
     deadline: Instant,
     resolution: ResolutionContext,
     selections: Arc<Mutex<SelectionSnapshot>>,
+    inbound: crate::session::InboundMetadata,
 }
 
 type SelectionSnapshot = HashMap<usize, (Arc<GroupSelection>, usize)>;
@@ -226,6 +227,7 @@ impl EstablishContext {
             deadline: inherited_deadline(Instant::now() + duration),
             resolution,
             selections: Arc::new(Mutex::new(HashMap::new())),
+            inbound: Default::default(),
         }
     }
 
@@ -253,6 +255,7 @@ impl EstablishContext {
         Self {
             deadline: Instant::now() + DEFAULT_ESTABLISH_TIMEOUT,
             resolution: self.resolution.clone(),
+            inbound: self.inbound.clone(),
             selections: Arc::new(Mutex::new(
                 self.selections
                     .lock()
@@ -274,7 +277,12 @@ impl EstablishContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         selections
             .entry(key)
-            .or_insert_with(|| (selection.clone(), selection.choose(None, Some(destination))))
+            .or_insert_with(|| {
+                (
+                    selection.clone(),
+                    selection.choose_for(None, Some(destination), self.inbound.user.as_deref()),
+                )
+            })
             .1
     }
 
@@ -806,8 +814,11 @@ impl ConnectorDispatcher {
         self
     }
 
-    fn context(&self) -> EstablishContext {
-        EstablishContext::with_resolution(DEFAULT_ESTABLISH_TIMEOUT, self.resolution.clone())
+    fn context(&self, metadata: &crate::session::InboundMetadata) -> EstablishContext {
+        let mut context =
+            EstablishContext::with_resolution(DEFAULT_ESTABLISH_TIMEOUT, self.resolution.clone());
+        context.inbound = metadata.clone();
+        context
     }
 }
 
@@ -818,7 +829,7 @@ impl Dispatcher for ConnectorDispatcher {
     }
 
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
-        let context = self.context();
+        let context = self.context(&session.metadata);
         let result = self.inner.connect_stream(session, &context).await;
         if !matches!(result, Err(DispatchError::NotAllowed)) {
             context.report_group_outcome(result.is_ok());
@@ -833,8 +844,9 @@ impl Dispatcher for ConnectorDispatcher {
         if !self.allow_udp {
             return Err(DispatchError::NotAllowed);
         }
+        let context = self.context(&session.metadata);
         self.inner
-            .open_datagram(DatagramRequest::new(session), &self.context())
+            .open_datagram(DatagramRequest::new(session), &context)
             .await
     }
 }
@@ -977,6 +989,7 @@ mod tests {
 
     fn test_session() -> StreamSession {
         StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::Http,
             source: "127.0.0.1:10000".parse().unwrap(),
             destination: Destination::domain("business.invalid", 443).unwrap(),
@@ -1002,6 +1015,97 @@ mod tests {
             endpoint: None,
             dialer: Dialer::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn ingress_connector_dispatcher_preserves_user_for_dialer_proxy_and_continuations() {
+        struct Carrier {
+            path: UpstreamPath,
+            user: Arc<str>,
+        }
+        #[async_trait]
+        impl OutboundConnector for Carrier {
+            async fn connect_stream(
+                &self,
+                session: StreamSession,
+                context: &EstablishContext,
+            ) -> Result<ConnectedStream, DispatchError> {
+                assert_eq!(context.inbound.user.as_deref(), Some(self.user.as_ref()));
+                assert_eq!(session.metadata, context.inbound);
+                self.path
+                    .connect_server(
+                        session,
+                        &Destination::domain("server.example", 443).unwrap(),
+                        context,
+                    )
+                    .await
+            }
+            async fn open_datagram(
+                &self,
+                request: DatagramRequest,
+                context: &EstablishContext,
+            ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+                assert_eq!(context.inbound, request.session.metadata);
+                let continuation = context.authenticated_continuation();
+                assert_eq!(continuation.inbound, context.inbound);
+                self.path.open_datagram(request, &continuation).await
+            }
+        }
+        let config = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxies:
+  - {name: a, type: socks5, server: 192.0.2.10, port: 1080, udp: true}
+  - {name: b, type: socks5, server: 192.0.2.11, port: 1080, udp: true}
+proxy-groups:
+  - {name: balance, type: load-balance, proxies: [a,b], hash-key: in-user}
+"#,
+        )
+        .unwrap();
+        let selection = Arc::new(GroupSelection::new(0));
+        selection.configure_balance(&config.proxy_groups[0]);
+        let server = Destination::domain("server.example", 443).unwrap();
+        let fallback = selection.choose_for(None, Some(&server), None);
+        let user: Arc<str> = Arc::from(
+            (0..256)
+                .map(|i| format!("verified-{i}"))
+                .find(|user| selection.choose_for(None, Some(&server), Some(user)) != fallback)
+                .unwrap(),
+        );
+        let expected = selection.choose_for(None, Some(&server), Some(&user)) as u8 + 1;
+        let path = selected_path(
+            selection,
+            vec![
+                SelectUpstreamMember::Proxy(Arc::new(MarkedConnector {
+                    marker: 1,
+                    ..Default::default()
+                })),
+                SelectUpstreamMember::Proxy(Arc::new(MarkedConnector {
+                    marker: 2,
+                    ..Default::default()
+                })),
+            ],
+        );
+        let dispatcher = ConnectorDispatcher::new(Arc::new(Carrier {
+            path,
+            user: user.clone(),
+        }));
+        let metadata = crate::session::InboundMetadata {
+            local_port: 1080,
+            user: Some(user),
+        };
+        let mut session = test_session();
+        session.metadata = metadata.clone();
+        let mut stream = dispatcher.connect_tcp(session).await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), expected);
+        let mut udp = dispatcher
+            .open_datagram(
+                DatagramSession::new(InboundKind::Socks5, test_session().source)
+                    .with_metadata(metadata),
+            )
+            .await
+            .unwrap();
+        assert_eq!(udp.receive().await.unwrap().payload[0], expected);
     }
 
     #[tokio::test]

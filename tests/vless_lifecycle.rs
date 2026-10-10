@@ -78,6 +78,7 @@ async fn vless_all_handshakes_keep_the_original_deadline_and_join_cancelled_io()
         )
         .unwrap();
         let session = StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::InternalMeasure,
             source: "127.0.0.1:1".parse().unwrap(),
             destination: "192.0.2.2:80"
@@ -133,7 +134,7 @@ fn split_xhttp_construction_uses_default_stack_and_protect_failure_has_no_fallba
                 let protect=Arc::new(RejectProtect(AtomicUsize::new(0)));
                 let endpoint=ResolvedEndpoint {logical_host:"192.0.2.1".into(),port:443,addresses:vec!["192.0.2.1:443".parse().unwrap()]};
                 let outbound=VlessOutbound::new(config, endpoint, Dialer::default().with_protector(protect.clone())).unwrap();
-                let session=StreamSession {inbound:InboundKind::InternalMeasure,source:"127.0.0.1:1".parse().unwrap(),destination:"192.0.2.2:80".parse::<std::net::SocketAddr>().unwrap().into(),sniffed_domain:None};
+                let session=StreamSession {metadata: Default::default(),inbound:InboundKind::InternalMeasure,source:"127.0.0.1:1".parse().unwrap(),destination:"192.0.2.2:80".parse::<std::net::SocketAddr>().unwrap().into(),sniffed_domain:None};
                 assert!(outbound.connect_stream(session, &EstablishContext::default()).await.is_err());
                 assert!((1..=2).contains(&protect.0.load(Ordering::SeqCst)));
                 outbound.shutdown().await;
@@ -165,6 +166,7 @@ async fn vless_expired_deadline_and_protect_failure_never_fall_back() {
     )
     .unwrap();
     let session = StreamSession {
+        metadata: Default::default(),
         inbound: InboundKind::InternalMeasure,
         source: "127.0.0.1:1".parse().unwrap(),
         destination: "192.0.2.2:80"

@@ -98,3 +98,12 @@ pub enum BalanceStrategy {
     RoundRobin,
     StickySessions,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum BalanceHashKey {
+    #[default]
+    #[serde(rename = "")]
+    Default,
+    #[serde(rename = "in-user")]
+    InUser,
+}

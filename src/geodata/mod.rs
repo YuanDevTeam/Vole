@@ -254,7 +254,7 @@ impl GeoData {
 
     #[must_use]
     pub fn geoip_available(&self, code: &str) -> bool {
-        self.ip_category(code).is_some()
+        lan_selector(code) || self.ip_category(code).is_some()
     }
 
     fn site_category(&self, code: &str) -> Option<&SiteCategory> {
@@ -274,6 +274,33 @@ impl GeoData {
     }
 }
 
+pub(crate) fn lan_selector(code: &str) -> bool {
+    code.strip_prefix('!')
+        .unwrap_or(code)
+        .eq_ignore_ascii_case("lan")
+}
+pub(crate) fn matches_lan(code: &str, ip: IpAddr) -> Option<bool> {
+    if !lan_selector(code) {
+        return None;
+    }
+    // netip's LAN predicates unmap IPv4 except IsUnspecified.
+    let canonical = match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        IpAddr::V4(_) => ip,
+    };
+    let local = ip.is_unspecified()
+        || canonical.is_loopback()
+        || canonical.is_multicast()
+        || match canonical {
+            IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+            IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
+        };
+    Some(local != code.starts_with('!'))
+}
+
 impl GeoMatcher for GeoData {
     fn geosite_available(&self, code: &str) -> bool {
         GeoData::geosite_available(self, code)
@@ -289,8 +316,10 @@ impl GeoMatcher for GeoData {
     }
 
     fn matches_geoip(&self, code: &str, address: IpAddr) -> bool {
-        self.ip_category(code)
-            .is_some_and(|category| category.matches(address) != code.starts_with('!'))
+        matches_lan(code, address).unwrap_or_else(|| {
+            self.ip_category(code)
+                .is_some_and(|category| category.matches(address) != code.starts_with('!'))
+        })
     }
 }
 
@@ -352,6 +381,9 @@ impl CodeSet {
 
     fn insert(&mut self, kind: GeoDataKind, raw: &str) -> Result<(), GeoDataError> {
         let selector = normalize_selector(kind, raw)?;
+        if kind == GeoDataKind::GeoIp && lan_selector(&selector) {
+            return Ok(());
+        }
         if self.selectors.contains(&selector) {
             return Ok(());
         }
@@ -410,7 +442,9 @@ impl RequestedCodes {
                     predicate: child, ..
                 } => pending.push(child),
                 RuleKind::GeoSite(code) => requested.sites.insert(GeoDataKind::GeoSite, code)?,
-                RuleKind::GeoIp(code) => requested.ips.insert(GeoDataKind::GeoIp, code)?,
+                RuleKind::GeoIp(code) | RuleKind::SrcGeoIp(code) => {
+                    requested.ips.insert(GeoDataKind::GeoIp, code)?
+                }
                 _ => (),
             }
         }

@@ -725,6 +725,7 @@ async fn relay_tcp(
     let destination_port = destination.port();
     let ip_version = if destination.is_ipv4() { 4 } else { 6 };
     let mut session = StreamSession {
+        metadata: crate::session::InboundMetadata::new(destination_port),
         inbound: InboundKind::Tun,
         source: inbound.source_addr(),
         destination: Destination::Ip(destination),

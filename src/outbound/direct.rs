@@ -284,6 +284,7 @@ mod tests {
         let destination = listener.local_addr().unwrap();
         let outbound = DirectOutbound::new(Dialer::default());
         let session = StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::Http,
             source: "127.0.0.1:10000".parse().unwrap(),
             destination: Destination::Ip(destination),

@@ -172,6 +172,7 @@ impl ProxyDispatchers {
         commit: bool,
         source: Option<SocketAddr>,
         destination: Option<&Destination>,
+        user: Option<&str>,
     ) -> Result<InspectedRuleTarget, DispatchError> {
         match id {
             RouteTargetId::Proxy(id) => {
@@ -190,7 +191,7 @@ impl ProxyDispatchers {
                 .proxy_groups
                 .as_ref()
                 .ok_or(DispatchError::NotAllowed)?
-                .inspect_rule_target(id, udp, commit, source, destination),
+                .inspect_rule_target(id, udp, commit, source, destination, user),
         }
     }
 
@@ -203,6 +204,7 @@ impl ProxyDispatchers {
         udp: bool,
         source: Option<SocketAddr>,
         destination: Option<&Destination>,
+        user: Option<&str>,
     ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
         match id {
             RouteTargetId::Proxy(id) => self
@@ -222,7 +224,7 @@ impl ProxyDispatchers {
                 .ok_or_else(|| {
                     DispatchError::Other(format!("unknown proxy group id {}", id.index()))
                 })?
-                .resolve_leaf_for(id, udp, source, destination),
+                .resolve_leaf_for(id, udp, source, destination, user),
         }
     }
 }
@@ -352,7 +354,7 @@ impl RoutingDispatcher {
     async fn route(
         &self,
         network: Network,
-        inbound: InboundKind,
+        inbound: (InboundKind, &crate::session::InboundMetadata),
         source: SocketAddr,
         destination: &Destination,
         sniffed_domain: Option<&str>,
@@ -360,10 +362,11 @@ impl RoutingDispatcher {
             &mut HashMap<(RouteTargetId, Option<Destination>), CachedRouteTransport>,
         >,
     ) -> Result<RouteDecision, DispatchError> {
+        let (inbound, inbound_metadata) = inbound;
         self.ensure_destination_allowed(destination)?;
         let recovered = if matches!(
             inbound,
-            InboundKind::Tun | InboundKind::Http | InboundKind::Socks5
+            InboundKind::Tun | InboundKind::Http | InboundKind::Https | InboundKind::Socks5
         ) {
             match (destination, &self.dns) {
                 (Destination::Ip(address), Some(dns)) => {
@@ -417,6 +420,7 @@ impl RoutingDispatcher {
         }
 
         context.set_source(source);
+        context.set_inbound(inbound, inbound_metadata);
 
         // All GeoData rules in this decision see the same immutable view.
         let snapshot = self.geo_matcher.routing_snapshot();
@@ -450,6 +454,7 @@ impl RoutingDispatcher {
                 cached.is_none(),
                 Some(source),
                 Some(&metadata),
+                candidate.authenticated_user(),
             ) {
                 Ok(InspectedRuleTarget::Control(_)) if !self.rules.filters_udp() => {
                     selected = Some(Err(DispatchError::NotAllowed));
@@ -796,7 +801,7 @@ impl RoutingDispatcher {
         let mut decision = self
             .route(
                 Network::Tcp,
-                session.inbound,
+                (session.inbound, &session.metadata),
                 session.source,
                 &session.destination,
                 session.sniffed_domain.as_deref(),
@@ -930,6 +935,7 @@ impl RoutingDispatcher {
                         inbound_type: match inbound {
                             InboundKind::Tun => "Tun",
                             InboundKind::Http => "HTTP",
+                            InboundKind::Https => "HTTPS",
                             _ => "Socks5",
                         },
                         source,
@@ -1191,7 +1197,7 @@ impl RoutedDatagramTransport {
                 .router
                 .route(
                     Network::Udp,
-                    self.session.inbound,
+                    (self.session.inbound, &self.session.metadata),
                     self.session.source,
                     &key,
                     datagram.sniffed_domain.as_deref(),
@@ -1468,7 +1474,7 @@ impl RoutedDatagramTransport {
                 .router
                 .route(
                     Network::Udp,
-                    self.session.inbound,
+                    (self.session.inbound, &self.session.metadata),
                     self.session.source,
                     &datagram.remote,
                     datagram.sniffed_domain.as_deref(),
@@ -1556,6 +1562,7 @@ impl RoutedDatagramTransport {
                         true,
                         Some(self.session.source),
                         Some(&decision.metadata),
+                        self.session.metadata.user.as_deref(),
                     )?,
                 };
                 let direct = target.direct;
@@ -1733,7 +1740,7 @@ impl DatagramTransport for RoutedDatagramTransport {
                 .router
                 .route(
                     Network::Udp,
-                    self.session.inbound,
+                    (self.session.inbound, &self.session.metadata),
                     self.session.source,
                     &datagram.remote,
                     datagram.sniffed_domain.as_deref(),
@@ -2159,6 +2166,7 @@ mod tests {
         SelectProxyGroupConfig {
             kind: crate::config::GroupKind::Select,
             strategy: crate::config::BalanceStrategy::default(),
+            hash_key: crate::config::BalanceHashKey::default(),
             health: crate::config::HealthCheckConfig::default(),
             tolerance: 0,
             max_failed_times: 5,
@@ -2416,7 +2424,7 @@ rules: ["DST-PORT,443,{target}", "MATCH,DIRECT"]
                     let decision = router
                         .route(
                             network,
-                            InboundKind::Socks5,
+                            (InboundKind::Socks5, &Default::default()),
                             "192.0.2.2:1234".parse().unwrap(),
                             &Destination::Ip("203.0.113.1:443".parse().unwrap()),
                             None,
@@ -2472,6 +2480,7 @@ rules: ["MATCH,outer"]
         for attempt in 0..2 {
             let result = router
                 .connect_tcp(StreamSession {
+                    metadata: Default::default(),
                     inbound: InboundKind::Socks5,
                     source: "192.0.2.2:5555".parse().unwrap(),
                     destination: Destination::Ip("198.51.100.1:443".parse().unwrap()),
@@ -2516,6 +2525,7 @@ rules: ["MATCH,balance"]
         for _ in 0..2 {
             router
                 .connect_tcp(StreamSession {
+                    metadata: Default::default(),
                     inbound: InboundKind::Socks5,
                     source,
                     destination: dest.clone(),
@@ -2554,6 +2564,87 @@ rules: ["MATCH,balance"]
     }
 
     #[tokio::test]
+    async fn ingress_rules_and_user_hash_reach_tcp_udp_with_one_leaf() {
+        let mut config = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxies:
+  - {name: a, type: socks5, server: 192.0.2.10, port: 1080, udp: true}
+  - {name: b, type: socks5, server: 192.0.2.11, port: 1080, udp: true}
+proxy-groups:
+  - {name: balance, type: load-balance, proxies: [a,b], hash-key: in-user}
+rules:
+  - 'AND,((IN-TYPE,HTTPS/SOCKS5),(IN-USER,Alice),(IN-PORT,1080),(SRC-IP-CIDR,192.0.2.0/24)),balance'
+  - 'MATCH,REJECT'
+"#,
+        )
+        .unwrap();
+        let a = Arc::new(RecordingDispatcher::default());
+        let b = Arc::new(RecordingDispatcher::default());
+        let direct = Arc::new(RecordingDispatcher::default());
+        let nodes: Vec<Arc<dyn Dispatcher>> = vec![a.clone(), b.clone()];
+        let groups = ProxyGroups::new(&config.proxy_groups, nodes.clone(), direct.clone()).unwrap();
+        let router = RoutingDispatcher::new(
+            ProxyDispatchers::with_proxy_groups(nodes, &groups).unwrap(),
+            direct,
+            None,
+            RuleSet::compile(config.take_runtime_rules()).unwrap(),
+            Arc::new(EmptyGeoMatcher),
+        );
+        let metadata = crate::session::InboundMetadata {
+            local_port: 1080,
+            user: Some(Arc::from("Alice")),
+        };
+        for (source, remote) in [
+            ("192.0.2.1:5555", "198.51.100.1:443"),
+            ("192.0.2.2:6666", "203.0.113.2:80"),
+        ] {
+            router
+                .connect_tcp(StreamSession {
+                    metadata: metadata.clone(),
+                    inbound: InboundKind::Https,
+                    source: source.parse().unwrap(),
+                    destination: Destination::Ip(remote.parse().unwrap()),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+        }
+        let counts = [
+            a.tcp_sessions.lock().unwrap().len(),
+            b.tcp_sessions.lock().unwrap().len(),
+        ];
+        assert!(counts == [2, 0] || counts == [0, 2]);
+        let selected = usize::from(counts[0] == 0);
+        let nodes = [a, b];
+        let mut udp = router
+            .open_datagram(
+                DatagramSession::new(InboundKind::Socks5, "192.0.2.3:7777".parse().unwrap())
+                    .with_metadata(metadata),
+            )
+            .await
+            .unwrap();
+        let datagram = Datagram {
+            remote: Destination::Ip("198.51.100.3:53".parse().unwrap()),
+            payload: Bytes::from_static(b"x"),
+            sniffed_domain: None,
+        };
+        udp.send(datagram.clone()).await.unwrap();
+        groups.apply_health(
+            0,
+            if selected == 0 {
+                &[None, Some(10)]
+            } else {
+                &[Some(10), None]
+            },
+        );
+        udp.send(datagram).await.unwrap();
+        assert_eq!(nodes[selected].datagrams.lock().unwrap().len(), 2);
+        assert_eq!(nodes[1 - selected].datagrams.lock().unwrap().len(), 0);
+        udp.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn subrule_routes_resume_dns_and_commit_one_tcp_udp_leaf() {
         let mut config = crate::config::Config::parse_yaml(br#"
 mixed-port: 1080
@@ -2588,6 +2679,7 @@ sub-rules:
         for _ in 0..2 {
             router
                 .connect_tcp(StreamSession {
+                    metadata: Default::default(),
                     inbound: InboundKind::Socks5,
                     source,
                     destination: Destination::domain("example.com", 443).unwrap(),
@@ -2624,6 +2716,7 @@ sub-rules:
         assert!(matches!(
             global
                 .connect_tcp(StreamSession {
+                    metadata: Default::default(),
                     inbound: InboundKind::Socks5,
                     source,
                     destination: Destination::Ip("198.51.100.1:443".parse().unwrap()),
@@ -2679,6 +2772,7 @@ sub-rules:
 
         router
             .connect_tcp(StreamSession {
+                metadata: Default::default(),
                 inbound: InboundKind::Http,
                 source: "127.0.0.1:10000".parse().unwrap(),
                 destination: Destination::domain("example.com", 443).unwrap(),
@@ -2765,6 +2859,7 @@ sub-rules:
 
     fn stream(destination: SocketAddr, inbound: InboundKind) -> StreamSession {
         StreamSession {
+            metadata: Default::default(),
             inbound,
             source: "127.0.0.1:10000".parse().unwrap(),
             destination: Destination::Ip(destination),
@@ -2938,6 +3033,7 @@ sub-rules:
         assert!(matches!(
             router
                 .connect_tcp(StreamSession {
+                    metadata: Default::default(),
                     inbound: InboundKind::Http,
                     source: "127.0.0.1:10000".parse().unwrap(),
                     destination: Destination::domain("example.com", 443).unwrap(),
@@ -2977,6 +3073,7 @@ sub-rules:
 
         router
             .connect_tcp(StreamSession {
+                metadata: Default::default(),
                 inbound: InboundKind::Http,
                 source: "127.0.0.1:10000".parse().unwrap(),
                 destination: Destination::domain("example.com", 443).unwrap(),
@@ -3016,6 +3113,7 @@ sub-rules:
 
         router
             .connect_tcp(StreamSession {
+                metadata: Default::default(),
                 inbound: InboundKind::Tun,
                 source: "192.0.2.10:10000".parse().unwrap(),
                 destination: Destination::Ip(destination),
@@ -3286,6 +3384,7 @@ sub-rules:
         );
         router
             .connect_tcp(StreamSession {
+                metadata: Default::default(),
                 inbound: InboundKind::Http,
                 source: "127.0.0.1:10000".parse().unwrap(),
                 destination: Destination::domain("例子.中国", 443).unwrap(),
@@ -3312,6 +3411,7 @@ sub-rules:
         );
         router
             .connect_tcp(StreamSession {
+                metadata: Default::default(),
                 inbound: InboundKind::Http,
                 source: "127.0.0.1:10001".parse().unwrap(),
                 destination: Destination::domain("例子.中国", 443).unwrap(),
@@ -4247,6 +4347,7 @@ sub-rules:
 
         router
             .connect_tcp(StreamSession {
+                metadata: Default::default(),
                 inbound: InboundKind::Http,
                 source: "127.0.0.1:10000".parse().unwrap(),
                 destination: Destination::domain("example.com", 443).unwrap(),
@@ -4308,6 +4409,7 @@ sub-rules:
 
         router
             .connect_tcp(StreamSession {
+                metadata: Default::default(),
                 inbound: InboundKind::Http,
                 source: "127.0.0.1:10001".parse().unwrap(),
                 destination: Destination::domain("example.com", 443).unwrap(),
@@ -4431,6 +4533,6 @@ sub-rules:
 fn business(inbound: InboundKind) -> bool {
     matches!(
         inbound,
-        InboundKind::Tun | InboundKind::Http | InboundKind::Socks5
+        InboundKind::Tun | InboundKind::Http | InboundKind::Https | InboundKind::Socks5
     )
 }

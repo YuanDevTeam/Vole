@@ -67,6 +67,7 @@ async fn measurement_domain_resolution_reaches_both_final_and_upstream_ip_bounda
         ConnectorDispatcher::new(connector.clone()).with_resolution(resolution.clone());
     let target = Destination::domain("controlled.example", 443).unwrap();
     let session = StreamSession {
+        metadata: Default::default(),
         inbound: InboundKind::InternalMeasure,
         source: "127.0.0.1:0".parse().unwrap(),
         destination: target.clone(),

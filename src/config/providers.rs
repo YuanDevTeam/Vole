@@ -485,7 +485,7 @@ fn bind_domain_selector(
 fn bind_rules(rules: &mut [RuleSpec], sets: &HashMap<String, Arc<RuleCollection>>) -> Result<()> {
     for rule in rules {
         match &mut rule.kind {
-            RuleKind::RuleSet { name, content } => {
+            RuleKind::RuleSet { name, content, .. } => {
                 *content = Some(
                     sets.get(name)
                         .ok_or_else(|| {

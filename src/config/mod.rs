@@ -11,7 +11,7 @@ pub use ip_version::IpVersion;
 
 mod groups;
 pub(crate) use groups::status_ranges;
-pub use groups::{BalanceStrategy, GroupKind, HealthCheckConfig, ProfileConfig};
+pub use groups::{BalanceHashKey, BalanceStrategy, GroupKind, HealthCheckConfig, ProfileConfig};
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -36,8 +36,8 @@ mod rule_provider;
 pub(crate) mod rules;
 pub use rule_provider::RuleCollection;
 mod yaml;
-pub use rules::DomainRegex;
 use rules::parse_rule;
+pub use rules::{DomainRegex, RuleInboundType};
 
 mod credentials;
 pub use credentials::{ProxyAccess, ProxyAccessRules, ProxyCredentials};
@@ -477,6 +477,7 @@ pub enum RuleKind {
     RuleSet {
         name: String,
         content: Option<std::sync::Arc<RuleCollection>>,
+        source: bool,
     },
     Domain(String),
     DomainSuffix(String),
@@ -490,6 +491,10 @@ pub enum RuleKind {
     SrcPorts(Vec<PortRange>),
     GeoSite(String),
     GeoIp(String),
+    SrcGeoIp(String),
+    InTypes(Vec<RuleInboundType>),
+    InUsers(Vec<String>),
+    InPorts(Vec<PortRange>),
     IpCidr(IpCidr),
     DstPorts(Vec<PortRange>),
     Network(Network),
@@ -569,6 +574,7 @@ pub struct ProxyGroupMemberConfig {
 pub struct SelectProxyGroupConfig {
     pub kind: GroupKind,
     pub strategy: BalanceStrategy,
+    pub hash_key: BalanceHashKey,
     pub health: HealthCheckConfig,
     pub tolerance: u16,
     pub max_failed_times: u32,
@@ -1103,6 +1109,8 @@ struct RawVoleConfig {
 struct RawProxyGroup {
     #[serde(default)]
     strategy: BalanceStrategy,
+    #[serde(rename = "hash-key", default)]
+    hash_key: BalanceHashKey,
     #[serde(default)]
     url: String,
     #[serde(default)]
@@ -2027,6 +2035,7 @@ impl RawVoleConfig {
         if generated_global {
             raw_groups.push(RawProxyGroup {
                 strategy: BalanceStrategy::default(),
+                hash_key: BalanceHashKey::default(),
                 disable_udp: false,
                 hidden: false,
                 icon: String::new(),
@@ -2507,6 +2516,11 @@ fn normalize_proxy_groups(
     let groups = raw_groups
         .into_iter()
         .map(|group| {
+            if group.hash_key != BalanceHashKey::Default
+                && (group.kind != GroupKind::LoadBalance || group.strategy == BalanceStrategy::RoundRobin)
+            {
+                return invalid("hash-key requires consistent-hashing or sticky-sessions load-balance");
+            }
             let members = group
                 .proxies
                 .into_iter()
@@ -2553,7 +2567,7 @@ fn normalize_proxy_groups(
             };
             health.validate()?;
             Ok(SelectProxyGroupConfig {
-                kind: group.kind, strategy: group.strategy, health, tolerance: group.tolerance,
+                kind: group.kind, strategy: group.strategy, hash_key: group.hash_key, health, tolerance: group.tolerance,
                 max_failed_times: if group.max_failed_times == 0 { 5 } else { group.max_failed_times },
                 name: group.name,
                 members,
@@ -3495,37 +3509,37 @@ fn parse_ip_cidr(input: &str, require_v6: bool) -> Result<IpCidr> {
 }
 
 fn parse_port_ranges(input: &str) -> Result<Vec<PortRange>> {
-    if input.is_empty() {
-        return invalid("DST-PORT value must not be empty");
+    let input = input.trim();
+    if input.split('/').count() > 28 {
+        return invalid("port rule exceeds 28 ranges");
     }
-    input
-        .split('/')
-        .map(|item| {
-            if item.is_empty() {
-                return invalid("DST-PORT contains an empty port range");
+    let mut ranges = Vec::new();
+    for item in input.split('/').filter(|item| !item.is_empty()) {
+        let item = item.trim();
+        if item.is_empty() {
+            ranges.push(PortRange { start: 0, end: 0 });
+            continue;
+        }
+        let (start, end) = item.split_once('-').unwrap_or((item, item));
+        let parse = |value: &str| -> Result<u16> {
+            let value = value.trim_matches(['[', ']', ' ']);
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return invalid("invalid rule port");
             }
-            let (start, end) = item.split_once('-').unwrap_or((item, item));
-            if end.contains('-') {
-                return invalid("DST-PORT range must contain at most one `-`");
-            }
-            let start = parse_destination_port(start)?;
-            let end = parse_destination_port(end)?;
-            if start > end {
-                return invalid("DST-PORT range start must not exceed its end");
-            }
-            Ok(PortRange { start, end })
-        })
-        .collect()
-}
-
-fn parse_destination_port(input: &str) -> Result<u16> {
-    let port = input
-        .parse::<u16>()
-        .map_err(|_| VoleError::InvalidConfig(format!("invalid destination port `{input}`")))?;
-    if port == 0 {
-        return invalid("destination port must be between 1 and 65535");
+            value
+                .parse()
+                .map_err(|_| VoleError::InvalidConfig("invalid rule port".into()))
+        };
+        let (start, end) = (parse(start)?, parse(end)?);
+        ranges.push(PortRange {
+            start: start.min(end),
+            end: start.max(end),
+        });
     }
-    Ok(port)
+    if ranges.is_empty() {
+        return invalid("port rule requires at least one range");
+    }
+    Ok(ranges)
 }
 
 fn parse_network(input: &str) -> Result<Network> {
@@ -3632,6 +3646,61 @@ mod tests {
         let config = Config::parse_yaml(b"mixed-port: 1080\nproxy-groups: [{name: GLOBAL, type: select, proxies: [REJECT, DIRECT]}]\n").unwrap();
         assert_eq!(config.proxy_groups.len(), 1);
         assert_eq!(config.proxy_groups[0].members[0].name, "REJECT");
+    }
+
+    #[test]
+    fn ingress_source_params_types_users_ports_and_hash_schema() {
+        let mut config = Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxy-groups: [{name: pool, type: load-balance, proxies: [DIRECT], hash-key: in-user}]
+rules:
+  - SRC-GEOIP,CN,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve,src
+  - GEOIP,CN,DIRECT,src,no-resolve
+  - IP-CIDR,2001:db8::/32,DIRECT,src
+  - IP-CIDR6,192.0.2.0/24,DIRECT,src
+  - IN-TYPE,HTTP / https / SOCKS / TUN / INNER,DIRECT
+  - IN-USER, Alice / Bob ,DIRECT
+  - IN-PORT,0/1081-1080//65535,DIRECT
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.proxy_groups[0].hash_key, BalanceHashKey::InUser);
+        assert!(config.rules[..5].iter().all(|rule| rule.no_resolve));
+        assert_eq!(config.rules[0].kind, RuleKind::SrcGeoIp("cn".into()));
+        assert_eq!(config.rules[1], config.rules[2]);
+        assert!(matches!(
+            config.rules[3].kind,
+            RuleKind::SrcIpCidr(IpCidr {
+                network: IpAddr::V6(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            config.rules[4].kind,
+            RuleKind::SrcIpCidr(IpCidr {
+                network: IpAddr::V4(_),
+                ..
+            })
+        ));
+        assert_eq!(
+            config.rules[7].kind,
+            RuleKind::InPorts(vec![
+                PortRange { start: 0, end: 0 },
+                PortRange {
+                    start: 1080,
+                    end: 1081
+                },
+                PortRange {
+                    start: 65535,
+                    end: 65535
+                }
+            ])
+        );
+        crate::routing::RuleSet::compile(config.take_runtime_rules()).unwrap();
+        // Authentication hashing has no meaning for round robin.
+        assert!(Config::parse_yaml(b"mixed-port: 1080\nproxy-groups: [{name: pool, type: load-balance, strategy: round-robin, hash-key: in-user, proxies: [DIRECT]}]").is_err());
     }
 
     #[test]
@@ -6522,11 +6591,7 @@ authentication:
             "  - GEOIP,CN@ads,DIRECT\n  - MATCH,proxy",
             "  - GEOSITE,!,DIRECT\n  - MATCH,proxy",
             "  - GEOSITE,@ads,DIRECT\n  - MATCH,proxy",
-            "  - IP-CIDR,2001:db8::/32,DIRECT\n  - MATCH,proxy",
-            "  - IP-CIDR6,192.0.2.0/24,DIRECT\n  - MATCH,proxy",
             "  - IP-CIDR,192.0.2.0/33,DIRECT\n  - MATCH,proxy",
-            "  - DST-PORT,0,REJECT\n  - MATCH,proxy",
-            "  - DST-PORT,100-10,REJECT\n  - MATCH,proxy",
             "  - NETWORK,ICMP,REJECT\n  - MATCH,proxy",
             "  - MATCH,PROXY\n  - DOMAIN,example.com,DIRECT",
             "  - MATCH,PROXY\n  - MATCH,DIRECT",

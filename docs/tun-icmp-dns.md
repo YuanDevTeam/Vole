@@ -300,3 +300,12 @@ Running Session上下文仅弱引用本 session 的 RuntimeDns；业务 IP-only 
 - 使用 DNS question 执行业务规则，或用 DNS 出口改写后续业务动作。
 
 自动化和物理 TUN 覆盖范围见 [验收矩阵](acceptance.md)。
+
+## 入站规则元数据
+
+TUN TCP 的 `IN-TYPE` 为 TUN，`IN-PORT` 为虚拟连接的原始目标端口；TUN UDP
+没有本地监听端口，`IN-PORT` 为 0。两者没有认证用户，来源规则读取原始来源 IP/端口。
+这与 Mihomo 默认 MIPS 栈一致；其他栈的内部 TCP listener 端口可能不同。
+
+Core 的 DNS、GeoData 下载及测速入口均映射为 INNER，端口为 0、用户为空。
+DNS `respect-rules` 使用同一个规则求值器，但不继承触发解析的业务用户。

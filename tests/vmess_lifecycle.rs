@@ -94,6 +94,7 @@ async fn vmess_all_handshakes_keep_the_original_deadline_and_join_cancelled_io()
         )
         .unwrap();
         let session = StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::InternalMeasure,
             source: "127.0.0.1:1".parse().unwrap(),
             destination: "192.0.2.2:80"
@@ -159,6 +160,7 @@ async fn vmess_expired_deadline_and_protect_failure_never_fall_back() {
     )
     .unwrap();
     let session = StreamSession {
+        metadata: Default::default(),
         inbound: InboundKind::InternalMeasure,
         source: "127.0.0.1:1".parse().unwrap(),
         destination: "192.0.2.2:80"

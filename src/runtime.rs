@@ -1996,6 +1996,7 @@ rules:
             let result = parts
                 .dispatcher
                 .connect_tcp(crate::session::StreamSession {
+                    metadata: Default::default(),
                     inbound: crate::session::InboundKind::Socks5,
                     source: "127.0.0.1:12345".parse().unwrap(),
                     destination: crate::session::Destination::Ip("192.0.2.1:443".parse().unwrap()),

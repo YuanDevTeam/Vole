@@ -1,11 +1,11 @@
-use std::{io, net::IpAddr};
+use std::{io, net::IpAddr, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 /// Client-proxy credentials shared by the HTTP and SOCKS5 frontends.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProxyCredentials {
-    entries: Vec<(String, String)>,
+    entries: Vec<(Arc<str>, String)>,
 }
 
 impl std::fmt::Debug for ProxyCredentials {
@@ -35,13 +35,17 @@ impl ProxyCredentials {
             ));
         }
         Ok(Self {
-            entries: vec![(username, password)],
+            entries: vec![(Arc::from(username), password)],
         })
     }
 
     #[must_use]
     pub fn matches(&self, username: &[u8], password: &[u8]) -> bool {
-        let mut matched = false;
+        self.authenticate(username, password).is_some()
+    }
+
+    pub(crate) fn authenticate(&self, username: &[u8], password: &[u8]) -> Option<Arc<str>> {
+        let mut matched = None;
         for (expected_user, expected_password) in &self.entries {
             let mut difference = username.len() ^ expected_user.len();
             difference |= password.len() ^ expected_password.len();
@@ -59,7 +63,9 @@ impl ProxyCredentials {
                             .unwrap_or(0),
                 );
             }
-            matched |= difference == 0;
+            if difference == 0 {
+                matched = Some(expected_user.clone());
+            }
         }
         matched
     }
@@ -81,28 +87,31 @@ impl ProxyCredentials {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn verifies(&self, headers: &[(String, String)]) -> bool {
+        self.authenticate_headers(headers).is_some()
+    }
+
+    pub(crate) fn authenticate_headers(&self, headers: &[(String, String)]) -> Option<Arc<str>> {
         let mut values = headers
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("proxy-authorization"))
             .map(|(_, value)| value.as_str());
         let (Some(value), None) = (values.next(), values.next()) else {
-            return false;
+            return None;
         };
         let mut parts = value.split_ascii_whitespace();
         let (Some(scheme), Some(encoded), None) = (parts.next(), parts.next(), parts.next()) else {
-            return false;
+            return None;
         };
         if !scheme.eq_ignore_ascii_case("basic") || encoded.len() > 684 {
-            return false;
+            return None;
         }
         let Ok(decoded) = STANDARD.decode(encoded) else {
-            return false;
+            return None;
         };
-        let Some(separator) = decoded.iter().position(|&byte| byte == b':') else {
-            return false;
-        };
-        self.matches(&decoded[..separator], &decoded[separator + 1..])
+        let separator = decoded.iter().position(|&byte| byte == b':')?;
+        self.authenticate(&decoded[..separator], &decoded[separator + 1..])
     }
 }
 

@@ -1,5 +1,8 @@
 //! Per-group selection; transports retain the selected leaf, not this cursor.
-use crate::{config::BalanceStrategy, session::Destination};
+use crate::{
+    config::{BalanceHashKey, BalanceStrategy},
+    session::Destination,
+};
 use std::{
     collections::{HashMap, hash_map::RandomState},
     hash::BuildHasher,
@@ -12,6 +15,7 @@ use tokio::time::Instant;
 #[derive(Debug)]
 pub(super) struct Balance {
     strategy: BalanceStrategy,
+    hash_key: BalanceHashKey,
     healthy: Vec<bool>,
     cursor: usize,
     sticky: HashMap<u64, Entry>,
@@ -28,11 +32,16 @@ impl Balance {
     pub fn new(strategy: BalanceStrategy, members: usize) -> Self {
         Self {
             strategy,
+            hash_key: BalanceHashKey::Default,
             healthy: vec![true; members],
             cursor: 0,
             sticky: HashMap::new(),
             clock: 0,
         }
+    }
+    pub fn with_hash_key(mut self, hash_key: BalanceHashKey) -> Self {
+        self.hash_key = hash_key;
+        self
     }
     pub fn health(&mut self, samples: &[Option<u64>]) {
         if samples.len() == self.healthy.len() {
@@ -45,13 +54,15 @@ impl Balance {
         &mut self,
         source: Option<SocketAddr>,
         destination: Option<&Destination>,
+        user: Option<&str>,
     ) -> usize {
-        self.inspect(source, destination, true)
+        self.inspect(source, destination, user, true)
     }
     pub fn inspect(
         &mut self,
         source: Option<SocketAddr>,
         destination: Option<&Destination>,
+        user: Option<&str>,
         commit: bool,
     ) -> usize {
         let count = self.healthy.len();
@@ -70,15 +81,24 @@ impl Balance {
             }
             return 0;
         }
-        let mut key = destination_key(destination);
-        if self.strategy == BalanceStrategy::StickySessions {
-            key.insert_str(
-                0,
-                &source.map_or_else(|| "invalid IP".into(), |s| s.ip().to_string()),
-            );
-        }
+        let user = (self.hash_key == BalanceHashKey::InUser)
+            .then_some(user)
+            .flatten()
+            .filter(|user| !user.is_empty());
+        let fallback = user.is_none().then(|| {
+            let mut key = destination_key(destination);
+            if self.strategy == BalanceStrategy::StickySessions {
+                key.insert_str(
+                    0,
+                    &source.map_or_else(|| "invalid IP".into(), |s| s.ip().to_string()),
+                );
+            }
+            key
+        });
         static HASH: OnceLock<RandomState> = OnceLock::new();
-        let key = HASH.get_or_init(RandomState::new).hash_one(key);
+        let key = HASH
+            .get_or_init(RandomState::new)
+            .hash_one(user.unwrap_or_else(|| fallback.as_deref().unwrap()));
         if self.strategy == BalanceStrategy::ConsistentHashing {
             return (0..5)
                 .map(|offset| jump(key.wrapping_add(offset), count))
@@ -151,6 +171,41 @@ fn jump(mut key: u64, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ingress_hash_uses_only_authenticated_user_and_keeps_address_fallback() {
+        let a = Destination::domain("first.example.com", 443).unwrap();
+        let b = Destination::domain("other.example.org", 80).unwrap();
+        let first = Some("192.0.2.1:1234".parse().unwrap());
+        let second = Some("203.0.113.2:4321".parse().unwrap());
+        for strategy in [
+            BalanceStrategy::ConsistentHashing,
+            BalanceStrategy::StickySessions,
+        ] {
+            let mut balance = Balance::new(strategy, 7).with_hash_key(BalanceHashKey::InUser);
+            let selected = balance.choose(first, Some(&a), Some("Alice"));
+            assert_eq!(balance.choose(second, Some(&b), Some("Alice")), selected);
+            assert_eq!(balance.choose(None, None, Some("Alice")), selected);
+            if strategy == BalanceStrategy::StickySessions {
+                assert_eq!(balance.sticky.len(), 1);
+                balance.choose(first, Some(&a), None);
+                assert_eq!(balance.sticky.len(), 2);
+                // An empty identity falls back to exactly the same address key.
+                balance.choose(first, Some(&a), Some(""));
+                assert_eq!(balance.sticky.len(), 2);
+            } else {
+                let mut fallback = Balance::new(strategy, 7);
+                assert_eq!(
+                    balance.choose(first, Some(&a), None),
+                    fallback.choose(first, Some(&a), None)
+                );
+                assert_eq!(
+                    balance.choose(second, Some(&b), Some("")),
+                    fallback.choose(second, Some(&b), None)
+                );
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn balance_strategies_health_stickiness_and_membership() {
         let source = Some("192.0.2.1:1234".parse().unwrap());
@@ -159,31 +214,34 @@ mod tests {
         let mut round = Balance::new(BalanceStrategy::RoundRobin, 3);
         assert_eq!(
             (0..4)
-                .map(|_| round.choose(source, Some(&a)))
+                .map(|_| round.choose(source, Some(&a), None))
                 .collect::<Vec<_>>(),
             [0, 1, 2, 0]
         );
         round.health(&[None, Some(20), None]);
-        assert_eq!(round.choose(source, Some(&a)), 1);
+        assert_eq!(round.choose(source, Some(&a), None), 1);
         let mut hash = Balance::new(BalanceStrategy::ConsistentHashing, 3);
-        assert_eq!(hash.choose(source, Some(&a)), hash.choose(source, Some(&b)));
+        assert_eq!(
+            hash.choose(source, Some(&a), None),
+            hash.choose(source, Some(&b), None)
+        );
         let mut sticky = Balance::new(BalanceStrategy::StickySessions, 3);
-        let index = sticky.choose(source, Some(&a));
+        let index = sticky.choose(source, Some(&a), None);
         for _ in 0..20 {
-            assert_eq!(sticky.choose(source, Some(&b)), index);
+            assert_eq!(sticky.choose(source, Some(&b), None), index);
         }
         tokio::time::advance(Duration::from_secs(601)).await;
-        sticky.choose(source, Some(&a));
+        sticky.choose(source, Some(&a), None);
         assert!(sticky.sticky.values().all(|e| e.expires > Instant::now()));
         // A new provider generation owns its own state; an old transport keeps its leaf.
         let mut updated = Balance::new(BalanceStrategy::RoundRobin, 2);
         assert_eq!(
             (
-                updated.choose(source, Some(&a)),
-                updated.choose(source, Some(&b))
+                updated.choose(source, Some(&a), None),
+                updated.choose(source, Some(&b), None)
             ),
             (0, 1)
         );
-        assert_eq!(round.choose(source, Some(&a)), 1);
+        assert_eq!(round.choose(source, Some(&a), None), 1);
     }
 }

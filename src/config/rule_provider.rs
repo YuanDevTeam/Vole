@@ -156,14 +156,20 @@ impl RuleCollection {
         context: &RoutingContext,
         geo: &dyn GeoMatcher,
         no_resolve: bool,
+        source: bool,
     ) -> std::result::Result<bool, ()> {
         match self.behavior {
             RuleBehavior::Domain => Ok(context
                 .domain()
                 .is_some_and(|name| self.domains.find(0, name).is_some())),
             RuleBehavior::Ipcidr => {
-                let Some(ip) = context.effective_ip() else {
-                    return if !no_resolve && context.should_request_ip_resolution() {
+                let ip = if source {
+                    context.source_ip()
+                } else {
+                    context.effective_ip()
+                };
+                let Some(ip) = ip else {
+                    return if !source && !no_resolve && context.should_request_ip_resolution() {
                         Err(())
                     } else {
                         Ok(false)
@@ -176,6 +182,9 @@ impl RuleCollection {
             }
             RuleBehavior::Classical => {
                 let mut context = context.clone();
+                if source {
+                    context.swap_source_destination();
+                }
                 if no_resolve {
                     context.disable_ip_resolution();
                 }
@@ -197,7 +206,7 @@ impl RuleCollection {
                     && crate::routing::matches_rule(rule, &context, geo).unwrap_or(false)
             })
         } else {
-            self.matches(&context, geo, true).unwrap_or(false)
+            self.matches(&context, geo, true, false).unwrap_or(false)
         }
     }
     pub(crate) fn matches_domain(&self, domain: &str, geo: &dyn GeoMatcher) -> bool {
@@ -221,7 +230,7 @@ impl RuleCollection {
                 ) && crate::routing::matches_rule(rule, &context, geo).unwrap_or(false)
             })
         } else {
-            self.matches(&context, geo, true).unwrap_or(false)
+            self.matches(&context, geo, true, false).unwrap_or(false)
         }
     }
 }
@@ -365,6 +374,46 @@ fn parse_mrs(bytes: &[u8], behavior: RuleBehavior) -> Result<RuleCollection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ingress_source_rule_set_swaps_address_ports_but_keeps_host_and_identity() {
+        use crate::session::{InboundKind, InboundMetadata};
+        let destination = crate::session::Destination::domain("host.example", 443).unwrap();
+        let mut context = RoutingContext::new(Network::Tcp, &destination).unwrap();
+        context.set_source("192.0.2.1:1234".parse().unwrap());
+        context.set_inbound(
+            InboundKind::Https,
+            &InboundMetadata {
+                local_port: 1080,
+                user: Some("Alice".into()),
+            },
+        );
+        let before = context.clone();
+        let geo = crate::routing::EmptyGeoMatcher;
+        let classical = RuleCollection::from_payload(vec![
+            "AND,((IP-CIDR,192.0.2.0/24),(DST-PORT,1234),(SRC-PORT,443),(DOMAIN,host.example),(IN-TYPE,HTTPS),(IN-PORT,1080),(IN-USER,Alice))".into()
+        ], RuleBehavior::Classical).unwrap();
+        assert_eq!(classical.matches(&context, &geo, true, true), Ok(true));
+        assert_eq!(classical.matches(&context, &geo, true, false), Ok(false));
+        // Source port remains available while the domain target has no resolved IP.
+        let source_ip = RuleCollection::from_payload(
+            vec!["SRC-IP-CIDR,203.0.113.0/24".into()],
+            RuleBehavior::Classical,
+        )
+        .unwrap();
+        assert_eq!(source_ip.matches(&context, &geo, true, true), Ok(false));
+        context.pin_ip("203.0.113.1".parse().unwrap());
+        assert_eq!(source_ip.matches(&context, &geo, true, true), Ok(true));
+        context = before.clone();
+        for (behavior, payload) in [
+            (RuleBehavior::Domain, "host.example"),
+            (RuleBehavior::Ipcidr, "192.0.2.0/24"),
+        ] {
+            let set = RuleCollection::from_payload(vec![payload.into()], behavior).unwrap();
+            assert_eq!(set.matches(&context, &geo, true, true), Ok(true));
+        }
+        assert_eq!(context, before);
+    }
+
     #[test]
     fn mrs_domain_and_ip_ranges_match_yaml_and_text() {
         fn header(behavior: u8) -> Vec<u8> {

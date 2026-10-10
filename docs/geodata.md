@@ -22,20 +22,23 @@ rules:
 
 ```text
 GEOSITE,[!]<code>[@<attribute>...],<target>
-GEOIP,[!]<code>,<target>[,no-resolve]
+GEOIP,[!]<code>,<target>[,no-resolve][,src]
+SRC-GEOIP,[!]<code>,<target>
 ```
 
 - 规则类型和 `code` 不区分 ASCII 大小写，route target 名称大小写敏感并精确匹配。
 - `target` 可以是 `DIRECT`、`REJECT`、当前资源中的代理节点或已支持的代理组。
 - 基础 `code` 必须匹配 `[A-Za-z0-9][A-Za-z0-9._+!-]{0,63}`，按 ASCII 大小写折叠后定位。
-- `GEOSITE` 恰好三段；`GEOIP` 只允许可选且大小写敏感的 `no-resolve`。
+- `GEOSITE` 恰好三段；`GEOIP` 接受大小写敏感的 `no-resolve`、`src`，顺序无关。
+  `src` 和 `SRC-GEOIP` 使用真实来源 IP，不触发 DNS。
 - `GEOSITE,cn@ads@cn,DIRECT` 只保留同时存在 `ads` 和 `cn` 属性 key 的记录，多个属性为 AND。
   属性只检查 key 存在，不解释 bool/int 值；`false`、`0` 或无 typed value 均不代表 key 缺失。
 - 属性名按 Mihomo 的先小写、后 Unicode simple-fold 比较语义归一；交集顺序与重复 key 不改变
   结果。空 `@` 项忽略，非空属性首尾空白移除，但内部空白、控制字符和逗号不允许。
 - 前置 `!` 对整个正向匹配结果取反：`!cn@ads` 是 NOT(匹配 `cn@ads`)，不是“没有 ads 的记录”。
   `cn@!ads` 查找字面 key `!ads`；`geolocation-!cn` 是字面分类名。
-- GeoIP 支持前置 `!`，不支持属性。业务规则不支持单条多个 code、源地址 GeoIP 或隐式局域网分类。
+- GeoIP 支持前置 `!`，不支持属性或单条多个 code。`lan` 是内置分类：私有、未指定、
+  回环、多播与链路本地单播地址；来源与目标均可使用，不读取 GeoIP 资产。
 - rule 模式按顺序首条命中，未命中 DIRECT；可选的 `MATCH` 使用 `DIRECT`、`REJECT`、实际代理节点或代理组。
 
 DNS `nameserver-policy` 中的 `geosite:<selector>[,<selector>...]` 接受相同的属性与反选语义，

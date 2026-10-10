@@ -179,6 +179,7 @@ fn outbound(peer: Arc<MemoryPeer>, options: &str) -> VlessOutbound {
 async fn open(node: &VlessOutbound) -> BoxStream {
     node.connect_stream(
         StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::InternalMeasure,
             source: "127.0.0.1:1".parse().unwrap(),
             destination: Destination::Ip("192.0.2.1:443".parse().unwrap()),

@@ -206,6 +206,7 @@ jobs:
             dialer::tests::socket_initialization_cancellation_joins_started_and_queued_work
             dialer::tests::socket_initialization_shared_pool_contention_reclaims_cancelled_work
             outbound::connector::tests::authenticated_continuation_keeps_group_choice_but_has_a_new_io_deadline
+            outbound::connector::tests::ingress_connector_dispatcher_preserves_user_for_dialer_proxy_and_continuations
             runtime::tests::integration_feature_admission_is_explicit_without_opening_sockets
             invoke::tests::version_and_state_use_the_fixed_response_envelope
             invoke::tests::initialize_is_idempotent_only_for_the_same_data_directory

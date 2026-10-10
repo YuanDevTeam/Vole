@@ -157,6 +157,7 @@ impl OutboundConnector for AnyTlsOutbound {
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         let stream_session = StreamSession {
+            metadata: request.session.metadata.clone(),
             inbound: request.session.inbound,
             source: request.session.source,
             destination: magic_destination(),

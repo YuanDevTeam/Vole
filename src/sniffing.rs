@@ -237,6 +237,7 @@ sniffer:
             input.extend_from_slice(b"business-bytes");
             let mut reader = input.as_slice();
             let mut session = StreamSession {
+                metadata: Default::default(),
                 inbound: InboundKind::Tun,
                 source,
                 destination: destination.clone(),

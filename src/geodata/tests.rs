@@ -1287,3 +1287,70 @@ fn real_xray_geodata_loads_common_codes_without_memory_quotas() {
     assert!(data.matches_geoip("private", "10.0.0.1".parse().unwrap()));
     assert!(data.matches_geoip("cn", "1.0.1.1".parse().unwrap()));
 }
+
+#[test]
+fn ingress_source_geoip_and_builtin_lan_avoid_destination_resolution() {
+    use crate::{
+        config::Network,
+        routing::{RoutingContext, RuleEvaluation, RuleSet},
+    };
+    let dir = tempdir().unwrap();
+    write_asset(
+        dir.path(),
+        GEOIP_FILE_NAME,
+        &geoip_list(&[geoip("CN", &[cidr(&[192, 0, 2, 0], 24)], false)]),
+    );
+    let mut config = crate::config::Config::parse_yaml(
+        b"mixed-port: 1080\nrules: ['SRC-GEOIP,CN,REJECT', 'GEOIP,lan,DIRECT,src', 'MATCH,DIRECT']",
+    )
+    .unwrap();
+    let requirements = GeoRequirements::for_config(&config).unwrap();
+    assert_eq!(
+        requirements.codes(GeoDataKind::GeoIp).collect::<Vec<_>>(),
+        ["cn"]
+    );
+    let data = GeoData::load(dir.path(), &config.rules).unwrap();
+    let rules = RuleSet::compile(config.take_runtime_rules()).unwrap();
+    let mut context = RoutingContext::new(
+        Network::Tcp,
+        &crate::session::Destination::domain("unresolved.example", 443).unwrap(),
+    )
+    .unwrap();
+    context.set_source("192.0.2.1:1234".parse().unwrap());
+    assert!(
+        matches!(rules.evaluate_with_geo(&context, &data), RuleEvaluation::Matched(result) if result.rule_index == 0)
+    );
+    context.set_source(
+        "fe80::1"
+            .parse::<IpAddr>()
+            .map(|ip| std::net::SocketAddr::new(ip, 1234))
+            .unwrap(),
+    );
+    assert!(
+        matches!(rules.evaluate(&context), RuleEvaluation::Matched(result) if result.rule_index == 1)
+    );
+    assert!(context.effective_ip().is_none());
+    for ip in [
+        "127.0.0.1",
+        "10.0.0.1",
+        "0.0.0.0",
+        "224.0.0.1",
+        "::1",
+        "fc00::1",
+        "fe80::1",
+        "ff02::1",
+        "::ffff:10.0.0.1",
+        "::ffff:127.0.0.1",
+    ] {
+        assert_eq!(matches_lan("lan", ip.parse().unwrap()), Some(true));
+    }
+    assert_eq!(
+        matches_lan("!lan", "203.0.113.1".parse().unwrap()),
+        Some(true)
+    );
+    let only_lan = crate::config::Config::parse_yaml(
+        b"mixed-port: 1080\nrules: ['SRC-GEOIP,lan,DIRECT', 'GEOIP,!LAN,REJECT']",
+    )
+    .unwrap();
+    assert!(GeoRequirements::for_config(&only_lan).unwrap().is_empty());
+}

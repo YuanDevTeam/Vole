@@ -161,6 +161,7 @@ impl OutboundConnector for TrojanOutbound {
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         // UDP destinations live in individual frames, not this request header.
         let session = StreamSession {
+            metadata: request.session.metadata.clone(),
             inbound: request.session.inbound,
             source: request.session.source,
             destination: Destination::Ip(std::net::SocketAddr::from(([0, 0, 0, 0], 1))),

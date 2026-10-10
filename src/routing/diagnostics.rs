@@ -181,12 +181,24 @@ fn rule_description(rule: &RuleKind) -> (&'static str, String) {
         RuleKind::DomainRegex(r) => ("DomainRegex", r.as_str().into()),
         RuleKind::GeoSite(s) => ("GeoSite", s.clone()),
         RuleKind::GeoIp(s) => ("GeoIP", s.clone()),
+        RuleKind::SrcGeoIp(s) => ("SrcGeoIP", s.clone()),
+        RuleKind::InTypes(types) => (
+            "InType",
+            types
+                .iter()
+                .map(|kind| kind.name())
+                .collect::<Vec<_>>()
+                .join("/"),
+        ),
+        RuleKind::InUsers(users) => ("InUser", users.join("/")),
         RuleKind::RuleSet { name, .. } => ("RuleSet", name.clone()),
         RuleKind::IpCidr(cidr) => ("IPCIDR", format!("{}/{}", cidr.network, cidr.prefix_len)),
         RuleKind::SrcIpCidr(cidr) => ("SrcIPCIDR", format!("{}/{}", cidr.network, cidr.prefix_len)),
-        RuleKind::SrcPorts(ports) | RuleKind::DstPorts(ports) => (
+        RuleKind::SrcPorts(ports) | RuleKind::DstPorts(ports) | RuleKind::InPorts(ports) => (
             if matches!(rule, RuleKind::SrcPorts(_)) {
                 "SrcPort"
+            } else if matches!(rule, RuleKind::InPorts(_)) {
+                "InPort"
             } else {
                 "DstPort"
             },

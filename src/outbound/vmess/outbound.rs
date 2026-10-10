@@ -233,6 +233,7 @@ impl OutboundConnector for VmessOutbound {
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         let session = StreamSession {
+            metadata: request.session.metadata.clone(),
             inbound: request.session.inbound,
             source: request.session.source,
             destination: self.server.clone(),

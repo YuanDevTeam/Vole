@@ -57,6 +57,7 @@ fn node(io: BoxStream, extra: serde_json::Value) -> VlessOutbound {
 }
 fn session() -> StreamSession {
     StreamSession {
+        metadata: Default::default(),
         inbound: InboundKind::InternalMeasure,
         source: "127.0.0.1:1".parse().unwrap(),
         destination: Destination::Ip("192.0.2.1:80".parse().unwrap()),

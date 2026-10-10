@@ -122,6 +122,7 @@ async fn connect(
     tls_connector: Option<&TlsConnector>,
 ) -> io::Result<BoxStream> {
     let session = StreamSession {
+        metadata: Default::default(),
         inbound: InboundKind::InternalMeasure,
         source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         destination: target.destination.clone(),

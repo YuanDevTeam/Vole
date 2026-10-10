@@ -86,6 +86,7 @@ async fn h3_rejects_incapable_or_small_budget_upstreams_before_any_datagram() {
         let result = outbound
             .connect_stream(
                 StreamSession {
+                    metadata: Default::default(),
                     inbound: InboundKind::InternalMeasure,
                     source: "127.0.0.1:1".parse().unwrap(),
                     destination: "192.0.2.2:80"

@@ -47,33 +47,43 @@ impl GroupSelection {
         if config.kind == crate::config::GroupKind::LoadBalance {
             let mut state = self.balance.lock().unwrap();
             if state.is_none() {
-                *state = Some(super::balance::Balance::new(
-                    config.strategy,
-                    config.members.len(),
-                ));
+                *state = Some(
+                    super::balance::Balance::new(config.strategy, config.members.len())
+                        .with_hash_key(config.hash_key),
+                );
             }
         }
     }
+    #[cfg(test)]
     pub fn choose(
         &self,
         source: Option<std::net::SocketAddr>,
         destination: Option<&crate::session::Destination>,
     ) -> usize {
+        self.choose_for(source, destination, None)
+    }
+    pub fn choose_for(
+        &self,
+        source: Option<std::net::SocketAddr>,
+        destination: Option<&crate::session::Destination>,
+        user: Option<&str>,
+    ) -> usize {
         self.touch();
         self.balance.lock().unwrap().as_mut().map_or_else(
             || self.load(Ordering::Acquire),
-            |s| s.choose(source, destination),
+            |s| s.choose(source, destination, user),
         )
     }
     pub(super) fn inspect(
         &self,
         source: Option<std::net::SocketAddr>,
         destination: Option<&crate::session::Destination>,
+        user: Option<&str>,
     ) -> InspectedSelection<'_> {
         let mut balance = self.balance.lock().unwrap();
         let index = balance.as_mut().map_or_else(
             || self.load(Ordering::Acquire),
-            |state| state.inspect(source, destination, false),
+            |state| state.inspect(source, destination, user, false),
         );
         InspectedSelection {
             owner: self,

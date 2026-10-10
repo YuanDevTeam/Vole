@@ -80,6 +80,7 @@ async fn growing_caller_buffer_after_backpressure_never_loses_plaintext() {
         .unwrap();
         let target = Destination::domain("target.invalid", 80).unwrap();
         let session = StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::Socks5,
             source: "127.0.0.1:1234".parse().unwrap(),
             destination: target,
@@ -168,6 +169,7 @@ async fn read_first_flushes_the_official_header_over_a_buffered_upstream() {
         let mut stream = outbound
             .connect_stream(
                 StreamSession {
+                    metadata: Default::default(),
                     inbound: InboundKind::Socks5,
                     source: "127.0.0.1:1234".parse().unwrap(),
                     destination: Destination::domain("target.invalid", 80).unwrap(),

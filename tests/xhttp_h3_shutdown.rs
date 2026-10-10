@@ -249,6 +249,7 @@ async fn run(mode: &str, closing: Closing, handshake_delay: Option<Duration>) {
     )
     .unwrap();
     let session = StreamSession {
+        metadata: Default::default(),
         inbound: InboundKind::InternalMeasure,
         source: client_address,
         destination: Destination::domain("target.invalid", 443).unwrap(),

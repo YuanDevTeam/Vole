@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     config::{IpCidr, Network, RuleAction, RuleKind, RuleSpec, RuntimeRuleProgram},
-    session::Destination,
+    session::{Destination, InboundKind, InboundMetadata},
 };
 
 mod program;
@@ -45,7 +45,10 @@ pub const MAX_RULE_TEXT_BYTES: usize = crate::config::MAX_RULES_TOTAL_BYTES;
 pub struct RoutingContext {
     network: Network,
     destination_port: u16,
-    source: Option<SocketAddr>,
+    source_ip: Option<IpAddr>,
+    source_port: u16,
+    inbound: InboundKind,
+    metadata: InboundMetadata,
     normalized_domain: Option<Arc<str>>,
     destination_ip: Option<IpAddr>,
     pinned_ip: Option<IpAddr>,
@@ -93,7 +96,10 @@ impl RoutingContext {
         Ok(Self {
             network,
             destination_port: destination.port(),
-            source: None,
+            source_ip: None,
+            source_port: 0,
+            inbound: InboundKind::InternalDns,
+            metadata: InboundMetadata::new(0),
             normalized_domain,
             destination_ip,
             pinned_ip: None,
@@ -106,7 +112,28 @@ impl RoutingContext {
     }
 
     pub fn set_source(&mut self, source: SocketAddr) {
-        self.source = Some(source);
+        self.source_ip = Some(source.ip());
+        self.source_port = source.port();
+    }
+
+    pub(crate) fn set_inbound(&mut self, kind: InboundKind, metadata: &InboundMetadata) {
+        self.inbound = kind;
+        self.metadata = metadata.clone();
+    }
+    pub(crate) fn source_ip(&self) -> Option<IpAddr> {
+        self.source_ip
+    }
+    pub(crate) fn authenticated_user(&self) -> Option<&str> {
+        self.metadata.user.as_deref()
+    }
+    /// A local rule-provider view only. Host and ingress identity are unchanged.
+    pub(crate) fn swap_source_destination(&mut self) {
+        let source = self.source_ip;
+        self.source_ip = self.effective_ip();
+        self.destination_ip = source;
+        self.pinned_ip = None;
+        std::mem::swap(&mut self.source_port, &mut self.destination_port);
+        self.disable_ip_resolution();
     }
 
     #[must_use]
@@ -283,6 +310,9 @@ pub enum RuleEvaluation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleSetError {
     InvalidProgram,
+    InvalidInboundRule {
+        rule_index: usize,
+    },
     TooManyRules {
         count: usize,
         maximum: usize,
@@ -313,6 +343,10 @@ impl fmt::Display for RuleSetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidProgram => formatter.write_str("invalid sub-rule program graph"),
+            Self::InvalidInboundRule { rule_index } => write!(
+                formatter,
+                "routing rule {rule_index} has an invalid inbound predicate"
+            ),
             Self::TooManyRules { count, maximum } => {
                 write!(formatter, "routing rule count {count} exceeds {maximum}")
             }
@@ -593,7 +627,7 @@ fn normalize_rule(
             *bytes = checked_text_bytes(*bytes, value.len())?;
             *domain = true;
         }
-        RuleKind::GeoIp(value) => {
+        RuleKind::GeoIp(value) | RuleKind::SrcGeoIp(value) => {
             *value = crate::geodata::normalize_selector(crate::geodata::GeoDataKind::GeoIp, value)
                 .map_err(|_| RuleSetError::InvalidGeoCode { rule_index: index })?;
             *bytes = checked_text_bytes(*bytes, value.len())?;
@@ -603,9 +637,28 @@ fn normalize_rule(
                 return Err(RuleSetError::InvalidCidr { rule_index: index });
             }
         }
-        RuleKind::DstPorts(ranges) | RuleKind::SrcPorts(ranges) => {
-            if ranges.is_empty() || ranges.iter().any(|range| range.start > range.end) {
+        RuleKind::DstPorts(ranges) | RuleKind::SrcPorts(ranges) | RuleKind::InPorts(ranges) => {
+            if ranges.is_empty()
+                || ranges.len() > 28
+                || ranges.iter().any(|range| range.start > range.end)
+            {
                 return Err(RuleSetError::InvalidPortRange { rule_index: index });
+            }
+        }
+        RuleKind::InUsers(users) => {
+            if users.is_empty() || users.iter().any(|user| user.is_empty()) {
+                return Err(RuleSetError::InvalidInboundRule { rule_index: index });
+            }
+            for user in users {
+                *bytes = checked_text_bytes(*bytes, user.len())?;
+            }
+        }
+        RuleKind::InTypes(types) => {
+            if types.is_empty() {
+                return Err(RuleSetError::InvalidInboundRule { rule_index: index });
+            }
+            for kind in types {
+                *bytes = checked_text_bytes(*bytes, kind.name().len())?;
             }
         }
         RuleKind::And(children) | RuleKind::Or(children) => {
@@ -624,7 +677,9 @@ fn normalize_rule(
 
 pub(crate) fn uses_destination_ip(rule: &RuleSpec) -> bool {
     match &rule.kind {
-        RuleKind::RuleSet { content, .. } => content.as_ref().is_some_and(|set| set.uses_ip()),
+        RuleKind::RuleSet {
+            content, source, ..
+        } => !source && content.as_ref().is_some_and(|set| set.uses_ip()),
         RuleKind::IpCidr(_) | RuleKind::GeoIp(_) => true,
         RuleKind::And(children) | RuleKind::Or(children) => {
             children.iter().any(uses_destination_ip)
@@ -653,8 +708,10 @@ pub(crate) fn matches_rule(
             .any(|range| range.start <= port && port <= range.end)
     };
     Ok(match &rule.kind {
-        RuleKind::RuleSet { content, .. } => match content {
-            Some(set) => set.matches(context, geo, rule.no_resolve)?,
+        RuleKind::RuleSet {
+            content, source, ..
+        } => match content {
+            Some(set) => set.matches(context, geo, rule.no_resolve, *source)?,
             None => false,
         },
         RuleKind::Domain(value) => context.domain() == Some(value.as_str()),
@@ -677,10 +734,10 @@ pub(crate) fn matches_rule(
                     .is_some_and(|domain| geo.matches_geosite(code, domain))
         }
         RuleKind::GeoIp(code) => {
-            if !geo.geoip_available(code) {
+            if !geoip_available(geo, code) {
                 false
             } else if let Some(address) = context.effective_ip() {
-                geo.matches_geoip(code, address)
+                matches_geoip(geo, code, address)
             } else if !rule.no_resolve && context.should_request_ip_resolution() {
                 return Err(());
             } else {
@@ -696,12 +753,21 @@ pub(crate) fn matches_rule(
                 false
             }
         }
-        RuleKind::SrcIpCidr(cidr) => context
-            .source
-            .is_some_and(|source| cidr_contains(cidr, source.ip())),
-        RuleKind::SrcPorts(ranges) => context
-            .source
-            .is_some_and(|source| port_matches(ranges, source.port())),
+        RuleKind::SrcGeoIp(code) => {
+            geoip_available(geo, code)
+                && context
+                    .source_ip
+                    .is_some_and(|address| matches_geoip(geo, code, address))
+        }
+        RuleKind::SrcIpCidr(cidr) => context.source_ip.is_some_and(|ip| cidr_contains(cidr, ip)),
+        RuleKind::SrcPorts(ranges) => port_matches(ranges, context.source_port),
+        RuleKind::InTypes(types) => types.contains(&crate::config::RuleInboundType::for_inbound(
+            context.inbound,
+        )),
+        RuleKind::InUsers(users) => context
+            .authenticated_user()
+            .is_some_and(|user| users.iter().any(|expected| expected == user)),
+        RuleKind::InPorts(ranges) => port_matches(ranges, context.metadata.local_port),
         RuleKind::DstPorts(ranges) => port_matches(ranges, context.destination_port),
         RuleKind::Network(network) => *network == context.network,
         RuleKind::And(children) => {
@@ -726,6 +792,13 @@ pub(crate) fn matches_rule(
             matches_rule(predicate, context, geo)?
         }
     })
+}
+
+fn geoip_available(geo: &dyn GeoMatcher, code: &str) -> bool {
+    crate::geodata::lan_selector(code) || geo.geoip_available(code)
+}
+fn matches_geoip(geo: &dyn GeoMatcher, code: &str, ip: IpAddr) -> bool {
+    crate::geodata::matches_lan(code, ip).unwrap_or_else(|| geo.matches_geoip(code, ip))
 }
 
 fn wildcard_matches(pattern: &str, value: &str) -> bool {

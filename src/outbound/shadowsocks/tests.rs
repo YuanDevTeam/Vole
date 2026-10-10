@@ -242,6 +242,7 @@ async fn ss_physical_tcp_uses_shared_dialer_and_logical_target() {
     .unwrap();
     let target = Destination::domain("fixture.invalid", 443).unwrap();
     let session = StreamSession {
+        metadata: Default::default(),
         inbound: InboundKind::Http,
         source: "127.0.0.1:10000".parse().unwrap(),
         destination: target.clone(),
@@ -446,6 +447,7 @@ async fn physical_tcp_udp_protection_is_shared_and_fails_closed() {
         )
         .unwrap();
         let session = StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::Socks5,
             source: "127.0.0.1:10000".parse().unwrap(),
             destination: Destination::domain("private-target.invalid", 443).unwrap(),

@@ -416,6 +416,7 @@ mod tests {
 
     fn stream_session(port: u16) -> StreamSession {
         StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::Tun,
             source: "127.0.0.1:10000".parse().unwrap(),
             destination: Destination::Ip(format!("192.0.2.1:{port}").parse().unwrap()),

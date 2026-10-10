@@ -224,6 +224,7 @@ async fn tcp_bad_response_header_poisoning_and_absolute_response_deadline() {
         let mut connected = outbound
             .connect_stream(
                 StreamSession {
+                    metadata: Default::default(),
                     inbound: session().inbound,
                     source: session().source,
                     destination: packet().remote,

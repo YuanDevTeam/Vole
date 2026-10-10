@@ -26,6 +26,7 @@ cargo test --locked --all-features --lib polled_datagram_
 cargo test --locked --all-features --lib managed_udp_connections_
 cargo test --locked --all-features --lib runtime::tests::controller_diagnostics_are_opt_in_for_business_routes
 cargo test --locked --all-features --lib subrule_
+cargo test --locked --all-features --lib ingress_
 cargo test --locked --all-features --lib routing::balance::tests::
 cargo test --locked --all-features --lib load_balance_routes_
 cargo test --locked --all-features --lib dialer::connections::tests::
