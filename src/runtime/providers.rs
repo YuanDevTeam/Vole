@@ -749,7 +749,14 @@ mod tests {
             br#"
 mixed-port: 1080
 proxy-providers:
-  remote: {type: file, path: nodes.yaml, filter: '(?=.)'}
+  remote:
+    type: file
+    path: nodes.yaml
+    filter: '(?=.)'
+    override:
+      override-expr:
+        - '.name |= sub("^old$", "old-renamed")'
+        - '(select(.name == "bad-expr") | .port) = ("private-expression-value" | tonumber)'
 proxy-groups:
   - {name: choice, type: select, use: [remote]}
 dns:
@@ -802,11 +809,20 @@ rules: ['MATCH,choice']
             io: Box::new(io),
             _generation: generation,
         };
-        assert_eq!(live.groups().state("choice").unwrap().now, "old");
+        assert_eq!(live.groups().state("choice").unwrap().now, "old-renamed");
         std::fs::write(&file, payload("new-node")).unwrap();
         live.update(0).await.unwrap();
         assert_eq!(live.groups().state("choice").unwrap().now, "new-node");
         assert!(Arc::ptr_eq(&registry, &live.connections()));
+        std::fs::write(&file, payload("bad-expr")).unwrap();
+        assert!(live.update(0).await.is_err());
+        assert_eq!(live.groups().state("choice").unwrap().now, "new-node");
+        assert!(
+            !live
+                .providers(false)
+                .to_string()
+                .contains("private-expression-value")
+        );
         peer.write_all(b"active").await.unwrap();
         let mut buffer = [0; 6];
         old_session.read_exact(&mut buffer).await.unwrap();

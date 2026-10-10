@@ -16,6 +16,8 @@ cargo test --locked --lib config::credentials::tests::
 cargo test --locked --features cli --lib age_
 cargo test --locked --lib dns::hosts::tests::
 cargo test --locked --lib config::name_regex::tests::
+cargo test --locked --lib config::override_expr::tests::
+cargo test --locked --lib override_expr_materializes_after_filters_and_structured_names
 cargo test --locked --lib config::tls_policy_tests::
 cargo test --locked --lib config::tls_trust::tests::
 cargo test --locked --lib security::context::tests::

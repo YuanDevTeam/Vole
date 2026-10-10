@@ -37,6 +37,7 @@ use crate::{Result, VoleError};
 mod dns;
 mod identity_files;
 mod name_regex;
+mod override_expr;
 pub mod providers;
 mod rule_provider;
 pub(crate) mod rules;

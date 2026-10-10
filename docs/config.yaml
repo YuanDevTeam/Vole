@@ -565,8 +565,21 @@ proxy-groups:
 # provider 的 dialer-proxy 覆盖每个节点的同名字段，override 最后应用；
 # 它只控制节点上游，资源下载仍使用独立的 proxy 字段。
 # override 支持 udp、udp-over-tcp、up/down、dialer-proxy、ip-version、skip-cert-verify、name-cert-verify、
-# additional-prefix/suffix、proxy-name: [{pattern: '表达式', target: '替换文本'}]；
+# additional-prefix/suffix、proxy-name: [{pattern: '表达式', target: '替换文本'}]、override-expr 字符串数组；
 # 协议专属覆盖只用于支持该字段的节点。未实现的覆盖字段严格拒绝。
+# override-expr 为原生有限 yq 方言，校验时预编译：原名称过滤 → 结构化 override / 改名 / 前后缀
+# → 表达式按列表顺序执行 → 严格节点及引用图校验。每项须产出一个 mapping，失败保留旧资源。
+# 支持根/字段/引号字段、正负数组索引、[] 通配、select 目标、= / |= / += / -= / *=、del、
+# pipeline / 逗号流 / 数组收集 / mapping / 插值、标量、算术/比较/and/or/默认值 //。
+# 函数：length/keys/has/contains/select；reverse/sort/unique/flatten/any/all；
+# map/map_values/filter/to_entries/from_entries/with_entries/any_c/all_c；
+# test/sub/split/join/upcase/downcase/trim/tostring/tonumber/type/not。
+# = 右侧读取根，|= 读取旧目标；赋值右侧的 pipeline/and/or 须带括号，多结果须收集。
+# mapping 值取最后结果，无结果省略；插值取首结果。sub 全局替换，使用 Go 的 $capture。
+# 每项最多 16 KiB/4096 tokens 与节点、深度 32；整份配置编译最多 512 KiB/65536 tokens
+# 与节点/1 秒。整份候选共享取消、20 万步、100ms、32 MiB 累积值分配估算、值深度 64
+# 与 32 个有界线性正则预算。无 shell/yq、变量、reduce、动态路径、递归下降、文件/环境或文档流。
+# 最终节点仍须符合本文协议范围；表达式不提供任意脚本或额外配置字段。
 # proxy providers 的 health-check 接受 enable/url/interval/timeout/lazy/expected-status；
 # enable 默认 false，开启后 interval 缺省/0 为 300 秒。空 URL 不发起探测。
 # 相同节点/URL 的检查共享结果，每批最多 10 个并发，超时与停止均取消 I/O。
@@ -591,6 +604,8 @@ proxy-groups:
 proxy-providers:
   local-nodes:
     type: inline
+    # override:
+    #   override-expr: ['.name |= (trim | upcase)', '.udp = true']
     payload: []
     health-check:
       enable: false

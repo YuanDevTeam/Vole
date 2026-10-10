@@ -36,6 +36,8 @@ pub enum RuleFormat {
 pub struct ProviderSpec {
     #[serde(skip)]
     pub(crate) age_identities: Option<crate::resource::age_provider::Identities>,
+    #[serde(skip)]
+    pub(super) compiled_override_exprs: Arc<[super::override_expr::Expr]>,
     #[serde(rename = "type")]
     pub kind: ProviderType,
     #[serde(default)]
@@ -149,6 +151,7 @@ impl ProviderSpec {
                 "additional-prefix",
                 "additional-suffix",
                 "proxy-name",
+                "override-expr",
             ]
             .contains(&key.as_str())
             {
@@ -203,6 +206,7 @@ impl ProviderTemplate {
         let map = base
             .as_mapping_mut()
             .ok_or_else(|| VoleError::InvalidConfig("configuration must be a mapping".into()))?;
+        let mut expression_compilation = super::override_expr::CompileBudget::default();
         let mut take = |key: &str, is_rule| -> Result<Vec<(String, ProviderSpec)>> {
             let Some(value) = map.remove(key) else {
                 return Ok(Vec::new());
@@ -239,6 +243,22 @@ impl ProviderTemplate {
                         .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
                     spec.age_identities = identities;
                     spec.validate(is_rule)?;
+                    if let Some(expressions) = spec
+                        .overrides
+                        .get("override-expr")
+                        .and_then(Value::as_sequence)
+                    {
+                        spec.compiled_override_exprs = expressions
+                            .iter()
+                            .map(|source| {
+                                super::override_expr::Expr::parse_with_budget(
+                                    source.as_str().expect("validated expression string"),
+                                    &mut expression_compilation,
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?
+                            .into();
+                    }
                     Ok((name, spec))
                 })
                 .collect()
@@ -327,6 +347,11 @@ impl ProviderTemplate {
         cancellation: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<Config> {
         let mut budget = Budget::new(cancellation);
+        let mut expression_budget = super::override_expr::Budget::new(cancellation);
+        let has_expressions = self
+            .proxies
+            .iter()
+            .any(|(_, spec)| !spec.compiled_override_exprs.is_empty());
         budget.check()?;
         let mut value = self.base.clone();
         let base = value.as_mapping_mut().expect("validated mapping");
@@ -357,6 +382,9 @@ impl ProviderTemplate {
                         .insert("dialer-proxy".into(), spec.dialer_proxy.clone().into());
                 }
                 apply_overrides(&mut node, &spec.overrides, &mut budget)?;
+                for expression in spec.compiled_override_exprs.iter() {
+                    expression.apply(&mut node, &mut expression_budget)?;
+                }
                 names.push(node_name(&node)?);
                 proxies.push(node);
             }
@@ -474,9 +502,20 @@ impl ProviderTemplate {
             identities.inline_node(node)?;
         }
         base.insert("proxies".into(), Value::Sequence(proxies));
-        let raw: RawVoleConfig = serde_yaml_ng::from_value(value)
-            .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
-        let mut config = raw.normalize()?;
+        let raw: RawVoleConfig = serde_yaml_ng::from_value(value).map_err(|error| {
+            if has_expressions {
+                VoleError::InvalidConfig("invalid provider override candidate schema".into())
+            } else {
+                VoleError::InvalidConfig(error.to_string())
+            }
+        })?;
+        let mut config = raw.normalize().map_err(|error| {
+            if has_expressions {
+                VoleError::InvalidConfig("invalid provider override candidate graph".into())
+            } else {
+                error
+            }
+        })?;
         let mut sets = HashMap::new();
         for (name, spec) in &self.rules {
             let fallback = self.bundled(spec)?;
@@ -703,6 +742,9 @@ fn validate_overrides(overrides: &BTreeMap<String, Value>) -> Result<()> {
     for (key, value) in overrides {
         let valid = match key.as_str() {
             "udp" | "udp-over-tcp" | "skip-cert-verify" => value.is_bool(),
+            "override-expr" => value
+                .as_sequence()
+                .is_some_and(|values| values.iter().all(Value::is_string)),
             "proxy-name" => {
                 let replacements: Vec<Replacement> = serde_yaml_ng::from_value(value.clone())
                     .map_err(|_| {
@@ -732,7 +774,14 @@ fn apply_overrides(
         .ok_or_else(|| VoleError::InvalidConfig("provider node must be a mapping".into()))?;
     let mut name = original_name;
     for (key, value) in overrides {
-        if ["additional-prefix", "additional-suffix", "proxy-name"].contains(&key.as_str()) {
+        if [
+            "additional-prefix",
+            "additional-suffix",
+            "proxy-name",
+            "override-expr",
+        ]
+        .contains(&key.as_str())
+        {
             continue;
         }
         let kind = map.get("type").and_then(Value::as_str).unwrap_or_default();
@@ -825,6 +874,62 @@ mod tests {
             assert!(!error.to_string().contains("invalid-private-fixture"));
         }
     }
+    #[test]
+    fn override_expr_materializes_after_filters_and_structured_names() {
+        let yaml = br#"
+mixed-port: 1080
+proxy-providers:
+  nodes:
+    type: inline
+    filter: '^keep'
+    override:
+      udp: true
+      proxy-name: [{pattern: '^keep-', target: ''}]
+      additional-prefix: 'PRE-'
+      additional-suffix: '-END'
+      override-expr:
+        - '.name = ([.name, (.udp | tostring)] | join("/"))'
+        - '.name |= (split("-") | map(downcase) | join("_"))'
+        - '.port += ([1, [2, 3]] | flatten | length)'
+    payload:
+      - {name: keep-east, type: socks5, server: 192.0.2.1, port: 1080}
+      - {name: omit-west, type: socks5, server: 192.0.2.1, port: 1080}
+proxy-groups: [{name: choice, type: select, use: [nodes]}]
+"#;
+        let config = Config::parse_yaml(yaml).unwrap();
+        assert_eq!(config.proxies.len(), 1);
+        assert_eq!(config.proxies[0].tag, "pre_east_end/true");
+        assert_eq!(config.proxy_groups[0].members[0].name, "pre_east_end/true");
+        let template = config.providers.as_ref().unwrap();
+        let expressions = &template.proxies[0].1.compiled_override_exprs;
+        assert_eq!(expressions.len(), 3);
+        let cloned = template.proxies[0].1.clone();
+        assert!(Arc::ptr_eq(expressions, &cloned.compiled_override_exprs));
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            template
+                .materialize_with_cancel(&ProviderContents::new(), Some(&cancelled))
+                .is_err()
+        );
+
+        for expression in [
+            ".port = .password",
+            ".dialer-proxy = .name",
+            ".type = .password",
+        ] {
+            let source = format!(
+                "proxy-providers:\n  nodes:\n    type: inline\n    override:\n      override-expr: ['{expression}']\n    payload: [{{name: original, type: socks5, server: 192.0.2.1, port: 1080, username: account, password: private-node-value}}]\n"
+            );
+            let error = Config::parse_yaml(source.as_bytes())
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("private-node-value"));
+            assert!(!error.contains(expression));
+        }
+        assert!(Config::parse_yaml(b"proxy-providers: {nodes: {type: inline, payload: [], override: {override-expr: ['.port = (']}}}").is_err());
+    }
+
     #[test]
     fn static_members_filtered_to_empty_use_the_declared_fallback() {
         for (fallback, expected) in [
