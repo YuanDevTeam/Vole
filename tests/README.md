@@ -53,6 +53,8 @@ cargo test --locked --lib config::domain_regex::tests::
 cargo test --locked --lib address_suffix_preserves_low_bits_and_address_family
 cargo test --locked --lib suffix_rules_use_source_low_bits_and_resume_with_shared_provider_budget
 cargo test --locked --lib rule_budget_propagates_through_fake_ip_policy_and_sniffer_without_egress
+cargo test --locked --lib classical_selectors_keep_complete_logical_domain_and_ip_predicates
+cargo test --locked --lib classical_logical_selectors_drive_dns_policy_and_sniffing_without_egress
 cargo test --locked --all-features --lib ingress_
 cargo test --locked --all-features --lib routing::balance::tests::
 cargo test --locked --all-features --lib load_balance_routes_

@@ -664,7 +664,8 @@ rule-providers:
 # 动态组写法：{name: automatic-members, type: select, use: [local-nodes]}
 # 规则写法：RULE-SET,local-domains,DIRECT；ipcidr/classical 可追加 no-resolve。
 # DNS policy 支持 rule-set:local-domains（逗号分隔多个集合）；只接受 domain/classical，
-# classical 在 DNS 场景仅使用域名与 GeoSite 条件。
+# classical 在 DNS 场景使用域名与 GeoSite 条件，支持仅由这些条件组成的 AND/OR/NOT。
+# 混合 IP、端口、来源或网络条件的逻辑项不参与域名 selector。
 
 # hosts 支持单 IP、IP 数组、域名别名与 Clash 域名通配。
 # 值恰好为 lan 或 [lan] 时，启动准备捕获接口 IP，排除回环和 link-local；空快照使启动失败。
