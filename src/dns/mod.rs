@@ -313,6 +313,11 @@ struct ScannedRecord {
 
 /// Builds a recursive A or AAAA query containing exactly one question.
 pub fn build_query(id: u16, name: &str, query_type: QueryType) -> Result<Vec<u8>> {
+    build_wire_query(id, name, query_type as u16)
+}
+
+/// Builds one bounded IN query without narrowing the resource-record type.
+pub(crate) fn build_wire_query(id: u16, name: &str, query_type: u16) -> Result<Vec<u8>> {
     let name = canonicalize_name(name)?;
     let mut message = Vec::with_capacity(DNS_HEADER_LEN + name.len() + 6);
     message.extend_from_slice(&id.to_be_bytes());
@@ -322,10 +327,75 @@ pub fn build_query(id: u16, name: &str, query_type: QueryType) -> Result<Vec<u8>
     message.extend_from_slice(&0_u16.to_be_bytes()); // NSCOUNT
     message.extend_from_slice(&0_u16.to_be_bytes()); // ARCOUNT
     encode_name(&name, &mut message);
-    message.extend_from_slice(&(query_type as u16).to_be_bytes());
+    message.extend_from_slice(&query_type.to_be_bytes());
     message.extend_from_slice(&CLASS_IN.to_be_bytes());
     debug_assert!(message.len() <= MAX_MESSAGE_SIZE);
     Ok(message)
+}
+
+/// HTTPS ECH is the binary key 5 parameter of the first applicable answer in
+/// wire order. Other SVCB fields never change the proxy's dial/SNI/ALPN policy.
+pub(crate) fn https_ech_config(query: &[u8], response: &[u8]) -> Result<Vec<u8>> {
+    let query = classify_query(query)?;
+    let validated = validate_opaque_response(&query, response)?;
+    if validated.rcode != u16::from(RCODE_NOERROR) || response[2] & 0x02 != 0 {
+        return Err(DnsError::InvalidRecord);
+    }
+    let header = parse_wire_question_header(response)?;
+    let mut cursor = header.records_offset;
+    for _ in 0..header.answer_count {
+        let record = scan_record(response, &mut cursor)?;
+        if record.record_type != 65 || record.record_class != CLASS_IN {
+            continue;
+        }
+        let rdata = &response[usize::from(record.data_start)..usize::from(record.data_end)];
+        if let Some(ech) = svcb_ech_parameter(rdata)? {
+            return Ok(ech.to_vec());
+        }
+    }
+    Err(DnsError::InvalidRecord)
+}
+
+fn svcb_ech_parameter(mut data: &[u8]) -> Result<Option<&[u8]>> {
+    // RFC 9460: priority and an uncompressed TargetName. Bound every label and
+    // the full name before examining strictly increasing unique SvcParam keys.
+    data = data.get(2..).ok_or(DnsError::InvalidRecord)?;
+    let mut total = 0usize;
+    loop {
+        let (&length, rest) = data.split_first().ok_or(DnsError::InvalidRecord)?;
+        if length > 63 {
+            return Err(DnsError::InvalidRecord);
+        }
+        total += 1 + usize::from(length);
+        if total > 255 {
+            return Err(DnsError::InvalidRecord);
+        }
+        data = rest
+            .get(usize::from(length)..)
+            .ok_or(DnsError::InvalidRecord)?;
+        if length == 0 {
+            break;
+        }
+    }
+    let mut previous = None;
+    let mut ech = None;
+    while !data.is_empty() {
+        let header = data.get(..4).ok_or(DnsError::InvalidRecord)?;
+        let key = u16::from_be_bytes([header[0], header[1]]);
+        let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+        if previous.is_some_and(|old| key <= old) {
+            return Err(DnsError::InvalidRecord);
+        }
+        previous = Some(key);
+        let (value, rest) = data[4..]
+            .split_at_checked(length)
+            .ok_or(DnsError::InvalidRecord)?;
+        if key == 5 {
+            ech = Some(value);
+        }
+        data = rest;
+    }
+    Ok(ech)
 }
 
 /// Classifies a bounded single-question IN query without narrowing its qtype.

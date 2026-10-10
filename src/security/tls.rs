@@ -29,7 +29,7 @@ pub enum TlsVersions {
 
 /// Immutable per-node, per-transport TLS options. Constructing another client
 /// always creates an independent resumption store, even for the same SNI.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TlsClientOptions {
     pub ech: Option<crate::config::StaticEchConfig>,
     pub client_fingerprint: Option<crate::config::ClientFingerprint>,
@@ -67,6 +67,7 @@ impl TlsClientOptions {
         required_alpn: Option<&[u8]>,
     ) -> io::Result<Self> {
         Ok(Self {
+            ech: policy.ech.clone(),
             client_fingerprint: policy.client_fingerprint,
             alpn: policy.alpn.clone(),
             required_alpn: required_alpn.map(<[u8]>::to_vec),
@@ -89,6 +90,15 @@ impl TlsClientOptions {
 pub struct TlsClientIdentity {
     pub(super) certificates: Vec<CertificateDer<'static>>,
     pub(super) key: PrivateKeyDer<'static>,
+}
+
+impl Clone for TlsClientIdentity {
+    fn clone(&self) -> Self {
+        Self {
+            certificates: self.certificates.clone(),
+            key: self.key.clone_key(),
+        }
+    }
 }
 
 impl TlsClientIdentity {
@@ -148,13 +158,19 @@ pub struct StandardTlsClient {
     required_alpn: Option<Vec<u8>>,
     buffer_limit: usize,
     require_ech: bool,
+    dynamic_ech: Option<Arc<DynamicEchTls>>,
+}
+
+struct DynamicEchTls {
+    context: SecurityContext,
+    options: TlsClientOptions,
 }
 
 #[derive(Clone)]
 enum StandardConnector {
     Rustls(TlsConnector),
     #[cfg(feature = "tls-fingerprint")]
-    Boring(super::boring::BoringTlsClient),
+    Boring(Arc<super::boring::BoringTlsClient>),
 }
 
 impl std::fmt::Debug for StandardTlsClient {
@@ -170,6 +186,11 @@ impl std::fmt::Debug for StandardTlsClient {
 impl StandardTlsClient {
     #[cfg(feature = "quic-transport")]
     pub(crate) fn quic_config(&self) -> io::Result<(Arc<ClientConfig>, String)> {
+        if self.dynamic_ech.is_some() {
+            return Err(io::Error::other(
+                "dynamic ECH requires a node resolution context",
+            ));
+        }
         match &self.connector {
             StandardConnector::Rustls(connector) => {
                 // XHTTP validates its exclusive h3 policy before construction.
@@ -228,6 +249,13 @@ impl StandardTlsClient {
         let server_name = server_name.into();
         let name = ServerName::try_from(server_name.clone())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid TLS server name"))?;
+        let mut options = options;
+        options.ech = options
+            .ech
+            .as_ref()
+            .map(|ech| ech.for_backend(options.client_fingerprint.is_some()))
+            .transpose()
+            .map_err(|_| io::Error::other("ECH has no compatible configuration"))?;
         let require_ech = options.ech.is_some();
         if require_ech && !matches!(name, ServerName::DnsName(_)) {
             return Err(io::Error::new(
@@ -235,12 +263,28 @@ impl StandardTlsClient {
                 "ECH requires a DNS server name",
             ));
         }
-        #[cfg(not(feature = "outbound-vless"))]
+        #[cfg(not(feature = "ech"))]
         if require_ech {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "ECH is not compiled in",
             ));
+        }
+        if options
+            .ech
+            .as_ref()
+            .is_some_and(crate::config::StaticEchConfig::is_dynamic)
+        {
+            let mut plain = options.clone();
+            plain.ech = None;
+            plain.versions = TlsVersions::Tls13;
+            let mut client = Self::with_options(context, server_name, plain, 0, buffer_limit)?;
+            client.require_ech = true;
+            client.dynamic_ech = Some(Arc::new(DynamicEchTls {
+                context: context.clone(),
+                options,
+            }));
+            return Ok(client);
         }
         if buffer_limit == 0 {
             return Err(io::Error::new(
@@ -288,11 +332,12 @@ impl StandardTlsClient {
                     resumption_sessions,
                 )?;
                 return Ok(Self {
-                    connector: StandardConnector::Boring(client),
+                    connector: StandardConnector::Boring(Arc::new(client)),
                     server_name,
                     required_alpn: options.required_alpn,
                     buffer_limit,
                     require_ech,
+                    dynamic_ech: None,
                 });
             }
         }
@@ -303,7 +348,7 @@ impl StandardTlsClient {
             TlsVersions::Tls12And13 => &[&TLS13, &TLS12],
         };
         let builder = ClientConfig::builder_with_provider(context.provider.clone());
-        #[cfg(feature = "outbound-vless")]
+        #[cfg(feature = "ech")]
         let builder = if let Some(ech) = &options.ech {
             let ech = rustls::client::EchConfig::new(ech.as_bytes().into(), super::ech::SUITES)
                 .map_err(|_| {
@@ -315,7 +360,7 @@ impl StandardTlsClient {
                 .with_protocol_versions(protocol_versions)
                 .map_err(io_other)?
         };
-        #[cfg(not(feature = "outbound-vless"))]
+        #[cfg(not(feature = "ech"))]
         let builder = builder
             .with_protocol_versions(protocol_versions)
             .map_err(io_other)?;
@@ -361,7 +406,50 @@ impl StandardTlsClient {
             required_alpn: options.required_alpn,
             buffer_limit,
             require_ech,
+            dynamic_ech: None,
         })
+    }
+
+    async fn resolved(&self, context: &crate::outbound::EstablishContext) -> io::Result<Self> {
+        let Some(dynamic) = &self.dynamic_ech else {
+            return Ok(self.clone());
+        };
+        let mut options = dynamic.options.clone();
+        options.ech = Some(
+            options
+                .ech
+                .as_ref()
+                .expect("dynamic ECH source")
+                .resolve(&self.server_name, context)
+                .await?,
+        );
+        Self::with_options(
+            &dynamic.context,
+            &self.server_name,
+            options,
+            0,
+            self.buffer_limit,
+        )
+    }
+
+    pub(crate) async fn connect_with_context(
+        &self,
+        stream: BoxStream,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<BoxStream> {
+        self.resolved(context).await?.connect(stream).await
+    }
+
+    #[cfg(any(
+        feature = "outbound-vless",
+        feature = "outbound-hysteria2",
+        feature = "outbound-tuic"
+    ))]
+    pub(crate) async fn quic_config_with_context(
+        &self,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<(Arc<ClientConfig>, String)> {
+        self.resolved(context).await?.quic_config()
     }
 
     pub async fn connect(&self, stream: BoxStream) -> io::Result<BoxStream> {
@@ -376,6 +464,11 @@ impl StandardTlsClient {
         &self,
         stream: BoxStream,
     ) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
+        if self.dynamic_ech.is_some() {
+            return Err(io::Error::other(
+                "dynamic ECH requires a node resolution context",
+            ));
+        }
         let connector = match &self.connector {
             StandardConnector::Rustls(connector) => connector,
             #[cfg(feature = "tls-fingerprint")]

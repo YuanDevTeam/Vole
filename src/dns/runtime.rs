@@ -10,6 +10,10 @@ mod encrypted_tests;
 #[path = "tests_quic.rs"]
 mod quic_tests;
 
+#[cfg(test)]
+#[path = "tests_ech.rs"]
+mod ech_tests;
+
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -52,6 +56,25 @@ use crate::{
     },
     session::{Datagram, DatagramSession, Destination, InboundKind, StreamSession},
 };
+
+fn system_ech_config() -> DnsConfig {
+    let server = DnsNameserver {
+        transport: DnsTransport::Udp,
+        address: DnsAddress::Source(crate::config::DnsSource::System),
+        port: 53,
+        route: DnsRoute::Direct,
+        path: None,
+        http_auth: None,
+        options: Default::default(),
+    };
+    DnsConfig {
+        enable: true,
+        nameservers: vec![server.clone()],
+        default_nameservers: vec![server],
+        cache_max_size: 64,
+        ..Default::default()
+    }
+}
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -113,6 +136,7 @@ pub struct RuntimeDns {
     node_bootstrap: Option<super::resolution::ResolutionContext>,
     proxy_resolver: Option<Arc<RuntimeDns>>,
     direct_resolver: Option<Arc<RuntimeDns>>,
+    ech_system_resolver: Option<Arc<RuntimeDns>>,
     nameserver_policies: Box<[DnsNameserverPolicy]>,
     policy_index: NameserverPolicies,
     geo_matcher: Arc<dyn GeoMatcher>,
@@ -937,7 +961,11 @@ impl RuntimeDns {
     // Resource replacement consumes a freshly assembled tree. Release the
     // leaves' shared bootstrap references before mutating that owned node.
     fn share_cache_epoch(&mut self, epoch: Arc<RwLock<u64>>) {
-        let mut roles = [self.proxy_resolver.take(), self.direct_resolver.take()];
+        let mut roles = [
+            self.proxy_resolver.take(),
+            self.direct_resolver.take(),
+            self.ech_system_resolver.take(),
+        ];
         for role in roles.iter_mut().flatten() {
             Arc::get_mut(role)
                 .expect("fresh DNS role is exclusively owned")
@@ -959,7 +987,11 @@ impl RuntimeDns {
             role.source_exclusions = self.source_exclusions.clone();
             role.bootstrap = self.bootstrap.clone();
         }
-        [self.proxy_resolver, self.direct_resolver] = roles;
+        [
+            self.proxy_resolver,
+            self.direct_resolver,
+            self.ech_system_resolver,
+        ] = roles;
         self.cache_epoch = epoch;
     }
 
@@ -993,6 +1025,7 @@ impl RuntimeDns {
                     resolver.bootstrap.as_deref(),
                     resolver.proxy_resolver.as_deref(),
                     resolver.direct_resolver.as_deref(),
+                    resolver.ech_system_resolver.as_deref(),
                 ]
                 .into_iter()
                 .flatten(),
@@ -1019,6 +1052,7 @@ impl RuntimeDns {
                     resolver.bootstrap.as_deref(),
                     resolver.proxy_resolver.as_deref(),
                     resolver.direct_resolver.as_deref(),
+                    resolver.ech_system_resolver.as_deref(),
                 ]
                 .into_iter()
                 .flatten(),
@@ -1049,6 +1083,7 @@ impl RuntimeDns {
                     resolver.bootstrap.as_deref(),
                     resolver.proxy_resolver.as_deref(),
                     resolver.direct_resolver.as_deref(),
+                    resolver.ech_system_resolver.as_deref(),
                 ]
                 .into_iter()
                 .flatten(),
@@ -1295,6 +1330,30 @@ impl RuntimeDns {
             resolver.bootstrap = Some(bootstrap.clone());
             Arc::new(resolver)
         };
+        // A disabled address resolver still needs actual HTTPS records for
+        // dynamic ECH. Use physical system metadata, never the default public
+        // nameservers of an otherwise disabled DNS configuration.
+        if !config.enable {
+            let mut system = Self::assemble_leaf(
+                &system_ech_config(),
+                egress.clone(),
+                Arc::new(EmptyGeoMatcher),
+                64,
+                0,
+                cache_epoch.clone(),
+                security.clone(),
+            );
+            let pool = Arc::get_mut(&mut system.tcp_pool).expect("fresh system ECH pool");
+            pool.max_idle = 0;
+            pool.max_idle_per_key = 0;
+            pool.http2.disable_idle();
+            #[cfg(feature = "dns-quic")]
+            pool.quic.disable_idle();
+            let stats = Arc::get_mut(&mut pool.stats).expect("fresh system ECH counters");
+            stats.idle_limit = 0;
+            stats.idle_per_key_limit = 0;
+            root.ech_system_resolver = Some(Arc::new(system));
+        }
         if !config.proxy_nameservers.is_empty() {
             root.proxy_resolver = Some(role(&config.proxy_nameservers, &config.proxy_policies));
         }
@@ -1343,6 +1402,7 @@ impl RuntimeDns {
             node_bootstrap: None,
             proxy_resolver: None,
             direct_resolver: None,
+            ech_system_resolver: None,
             nameservers: config.nameservers.clone().into_boxed_slice(),
             nameserver_policies: config.nameserver_policies.clone().into_boxed_slice(),
             policy_index: NameserverPolicies::new(&config.nameserver_policies),
@@ -1711,6 +1771,69 @@ impl RuntimeDns {
         self.exchange_retained(query)
             .await
             .map(DnsWireResponse::into_wire)
+    }
+
+    /// Node-role HTTPS query, bypassing fake-IP/hosts address middleware. The
+    /// caller owns cancellation and the original absolute setup deadline.
+    pub(crate) async fn query_proxy_ech(
+        &self,
+        name: &str,
+        deadline: TokioInstant,
+    ) -> io::Result<Vec<u8>> {
+        let resolver = if self.enabled {
+            self.proxy_resolver.as_deref().unwrap_or(self)
+        } else {
+            self.ech_system_resolver.as_deref().unwrap_or(self)
+        };
+        let query = super::build_wire_query(resolver.next_upstream_id(), name, 65)
+            .map_err(|_| io::Error::other("invalid ECH DNS query"))?;
+        let classified =
+            classify_query(&query).map_err(|_| io::Error::other("invalid ECH DNS query"))?;
+        let permit = resolver.begin_query();
+        let deadline = deadline.min(permit.deadline);
+        permit.decision.set_deadline(deadline.into_std());
+        let exchange: std::pin::Pin<
+            Box<dyn Future<Output = Result<Vec<u8>, RuntimeDnsError>> + Send + '_>,
+        > = Box::pin(permit.decision.scope(async {
+            permit.decision.check()?;
+            resolver
+                .exchange_opaque(&query, &classified, deadline, FailureMode::BoundedError)
+                .await
+        }));
+        let response = timeout_at(deadline, exchange)
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+            .map_err(|_| io::Error::other("ECH DNS query failed"))?;
+        super::https_ech_config(&query, &response)
+            .map_err(|_| io::Error::other("invalid ECH DNS response"))
+    }
+
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn measurement_ech(
+        dialer: crate::dialer::Dialer,
+        security: crate::security::SecurityContext,
+    ) -> Self {
+        let mut dns = Self::assemble_leaf(
+            &system_ech_config(),
+            DnsEgress::Single(Arc::new(crate::outbound::DirectOutbound::new(
+                dialer.clone(),
+            ))),
+            Arc::new(EmptyGeoMatcher),
+            64,
+            0,
+            dialer.dns_sources().epoch(),
+            security,
+        );
+        let pool = Arc::get_mut(&mut dns.tcp_pool).expect("fresh measurement ECH pool");
+        pool.max_idle = 0;
+        pool.max_idle_per_key = 0;
+        pool.http2.disable_idle();
+        #[cfg(feature = "dns-quic")]
+        pool.quic.disable_idle();
+        let stats = Arc::get_mut(&mut pool.stats).expect("fresh measurement ECH counters");
+        stats.idle_limit = 0;
+        stats.idle_per_key_limit = 0;
+        dns.with_network_sources(dialer, Default::default())
     }
 
     /// Controller queries inspect the upstream resolver, as in Mihomo, without

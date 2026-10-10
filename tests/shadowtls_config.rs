@@ -76,11 +76,25 @@ fn shadowtls_preserves_policy_values_and_shared_profile_aliases() {
         ("firefox120", Some(ClientFingerprint::Firefox120)),
         ("safari", Some(ClientFingerprint::Safari16)),
         ("safari16", Some(ClientFingerprint::Safari16)),
+        ("ios", Some(ClientFingerprint::Ios14)),
     ] {
         let mut n = node();
         n["client-fingerprint"] = json!(name);
         assert_eq!(policy(n).client_fingerprint, expected);
     }
+    let mut random = node();
+    random["client-fingerprint"] = json!("random");
+    let selected = policy(random.clone()).client_fingerprint;
+    assert!(matches!(
+        selected,
+        Some(
+            ClientFingerprint::Chrome133
+                | ClientFingerprint::Safari16
+                | ClientFingerprint::Ios14
+                | ClientFingerprint::Firefox120
+        )
+    ));
+    assert_eq!(policy(random).client_fingerprint, selected);
     for alpn in [
         vec![],
         vec!["custom".to_owned(), "h2".to_owned()],
@@ -195,7 +209,12 @@ fn shadowtls_rejects_invalid_types_bounds_unknown_fields_and_nulls_without_secre
             assert_rejected(n);
         }
     }
-    for value in [json!("chrome133"), json!("random"), json!(true), json!([])] {
+    for value in [
+        json!("chrome133"),
+        json!("randomized"),
+        json!(true),
+        json!([]),
+    ] {
         let mut n = node();
         n["client-fingerprint"] = value;
         assert_rejected(n);

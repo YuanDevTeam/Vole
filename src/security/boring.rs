@@ -362,6 +362,7 @@ fn profile(value: crate::config::ClientFingerprint) -> ClientFingerprint {
         crate::config::ClientFingerprint::Chrome133 => ClientFingerprint::Chrome133,
         crate::config::ClientFingerprint::Firefox120 => ClientFingerprint::Firefox120,
         crate::config::ClientFingerprint::Safari16 => ClientFingerprint::Safari16,
+        crate::config::ClientFingerprint::Ios14 => ClientFingerprint::Ios14,
     }
 }
 

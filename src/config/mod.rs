@@ -851,6 +851,7 @@ pub struct AnyTlsOutboundConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TlsClientPolicy {
+    pub ech: Option<StaticEchConfig>,
     pub client_fingerprint: Option<ClientFingerprint>,
     pub alpn: Vec<Vec<u8>>,
     pub certificate: TlsCertificatePolicy,
@@ -864,6 +865,24 @@ pub enum ClientFingerprint {
     Chrome133,
     Firefox120,
     Safari16,
+    Ios14,
+}
+
+// Only the immutable template value is process-shared. Selection precedes all
+// node/REALITY/download-leg compatibility checks; Stop does not redraw it.
+fn process_random_fingerprint() -> ClientFingerprint {
+    static SELECTED: std::sync::OnceLock<ClientFingerprint> = std::sync::OnceLock::new();
+    *SELECTED.get_or_init(|| weighted_fingerprint(rand::random_range(0..12)))
+}
+
+fn weighted_fingerprint(value: u8) -> ClientFingerprint {
+    match value {
+        0..=5 => ClientFingerprint::Chrome133,
+        6..=8 => ClientFingerprint::Safari16,
+        9..=10 => ClientFingerprint::Ios14,
+        11 => ClientFingerprint::Firefox120,
+        _ => unreachable!("fingerprint weight outside its bounded random range"),
+    }
 }
 
 fn parse_client_fingerprint(value: Option<&str>) -> Result<Option<ClientFingerprint>> {
@@ -876,6 +895,8 @@ fn parse_client_fingerprint(value: Option<&str>) -> Result<Option<ClientFingerpr
         Some("chrome120") => Ok(Some(ClientFingerprint::Chrome120)),
         Some("firefox" | "firefox120") => Ok(Some(ClientFingerprint::Firefox120)),
         Some("safari" | "safari16") => Ok(Some(ClientFingerprint::Safari16)),
+        Some("ios") => Ok(Some(ClientFingerprint::Ios14)),
+        Some("random") => Ok(Some(process_random_fingerprint())),
         Some(_) => invalid("unsupported client-fingerprint"),
     }
 }
@@ -1744,6 +1765,8 @@ enum RawProtocol {
             deserialize_with = "deserialize_present_option"
         )]
         client_fingerprint: Option<String>,
+        #[serde(rename = "ech-opts", default, deserialize_with = "ech::deserialize")]
+        ech_opts: Option<ech::RawEch>,
         #[serde(
             rename = "dialer-proxy",
             default,
@@ -2908,6 +2931,7 @@ impl RawOutbound {
                 certificate,
                 private_key,
                 client_fingerprint,
+                ech_opts,
                 dialer_proxy,
             } => {
                 let mut config = normalize_anytls(
@@ -2931,6 +2955,14 @@ impl RawOutbound {
                     disable_reuse,
                     client_metadata,
                 )?;
+                config.tls.ech = ech_opts
+                    .map(|raw| raw.normalize(config.tls.client_fingerprint.is_some()))
+                    .transpose()?
+                    .flatten();
+                if config.tls.ech.is_some() && config.server_name.parse::<IpAddr>().is_ok() {
+                    return invalid("AnyTLS ECH requires DNS sni");
+                }
+
                 (name, dialer_proxy, udp, ProxyProtocol::AnyTls(config))
             }
         };
@@ -3360,8 +3392,13 @@ impl RawXHttpDownloadSettings {
         config.alpn = vec![http_version.alpn().to_vec()];
         config.required_alpn = Some(http_version.alpn().to_vec());
         if let Some(raw) = ech_opts {
-            config.ech = raw.normalize()?;
+            config.ech = raw.normalize(config.client_fingerprint.is_some())?;
         }
+        config.ech = config
+            .ech
+            .as_ref()
+            .map(|ech| ech.for_backend(config.client_fingerprint.is_some()))
+            .transpose()?;
         if config.ech.is_some() && config.server_name.parse::<IpAddr>().is_ok() {
             return invalid("XHTTP download ECH requires a DNS servername");
         }

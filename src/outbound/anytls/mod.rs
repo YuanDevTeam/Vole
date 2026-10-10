@@ -24,12 +24,26 @@ pub use stream::AnyTlsStream;
 #[async_trait]
 pub trait AnyTlsTlsConnector: Send + Sync {
     async fn connect(&self, stream: BoxStream) -> io::Result<BoxStream>;
+    async fn connect_with_context(
+        &self,
+        stream: BoxStream,
+        _context: &EstablishContext,
+    ) -> io::Result<BoxStream> {
+        self.connect(stream).await
+    }
 }
 
 #[async_trait]
 impl AnyTlsTlsConnector for crate::security::StandardTlsClient {
     async fn connect(&self, stream: BoxStream) -> io::Result<BoxStream> {
         crate::security::StandardTlsClient::connect(self, stream).await
+    }
+    async fn connect_with_context(
+        &self,
+        stream: BoxStream,
+        context: &EstablishContext,
+    ) -> io::Result<BoxStream> {
+        crate::security::StandardTlsClient::connect_with_context(self, stream, context).await
     }
 }
 
@@ -51,7 +65,10 @@ impl SessionDialer for OutboundSessionDialer {
             .connect_server(session, &self.server, context)
             .await?;
         context
-            .run_io("AnyTLS TLS handshake", self.tls.connect(raw.io))
+            .run_io(
+                "AnyTLS TLS handshake",
+                self.tls.connect_with_context(raw.io, context),
+            )
             .await
     }
 }

@@ -148,6 +148,7 @@ pub(crate) struct MeasurementRuntime {
     security: SecurityContext,
     dispatcher: Arc<dyn Dispatcher>,
     proxy_graph: Arc<BuiltProxyGraph>,
+    _ech_dns: Arc<RuntimeDns>,
 }
 
 #[cfg(feature = "invoke")]
@@ -161,14 +162,17 @@ impl MeasurementRuntime {
     }
 
     pub(crate) async fn shutdown(self) {
+        self._ech_dns.begin_shutdown();
         self.proxy_graph.begin_shutdown();
         self.proxy_graph.shutdown().await;
+        self._ech_dns.shutdown().await;
     }
 }
 
 #[cfg(feature = "invoke")]
 impl Drop for MeasurementRuntime {
     fn drop(&mut self) {
+        self._ech_dns.begin_shutdown();
         self.proxy_graph.begin_shutdown();
     }
 }
@@ -901,13 +905,19 @@ impl PreparedMeasurement {
         resolver: Arc<dyn Resolver>,
     ) -> io::Result<MeasurementRuntime> {
         let dialer = dialer.with_fresh_initialization();
+        let ech_dns = Arc::new(RuntimeDns::measurement_ech(
+            dialer.clone(),
+            self.security.clone(),
+        ));
+        let resolution = ResolutionContext::measurement(resolver, true);
+        resolution.bind_measurement_ech(&ech_dns)?;
         let proxy_graph = build_proxy_graph(
             &self.config.proxies,
             &[],
             &self.endpoints,
             self.limits,
             dialer,
-            ResolutionContext::measurement(resolver, true),
+            resolution,
             &self.security,
             None,
         )?;
@@ -930,6 +940,7 @@ impl PreparedMeasurement {
             security: self.security,
             dispatcher: observe_sessions_with_stats(dispatcher, session_stats),
             proxy_graph: Arc::new(proxy_graph),
+            _ech_dns: ech_dns,
         })
     }
 }

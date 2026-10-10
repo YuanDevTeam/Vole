@@ -248,9 +248,10 @@ impl RawVless {
         if self.jls_opts.is_some() && standard_options {
             return invalid("standard certificate options cannot be used with JLS");
         }
+        let client_fingerprint = parse_client_fingerprint(self.client_fingerprint.as_deref())?;
         let ech = self
             .ech_opts
-            .map(super::ech::RawEch::normalize)
+            .map(|raw| raw.normalize(client_fingerprint.is_some()))
             .transpose()?
             .flatten();
         if ech.is_some() && (self.reality_opts.is_some() || self.jls_opts.is_some() || vision) {
@@ -266,7 +267,6 @@ impl RawVless {
         } else {
             stream.required_alpn()
         };
-        let client_fingerprint = parse_client_fingerprint(self.client_fingerprint.as_deref())?;
         if network == "xhttp"
             && xhttp_version == super::XHttpVersion::Http3
             && client_fingerprint.is_some()

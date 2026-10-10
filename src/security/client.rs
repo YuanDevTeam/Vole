@@ -63,13 +63,24 @@ impl std::fmt::Debug for SecurityClient {
 }
 
 impl SecurityClient {
-    pub(crate) fn quic_config(&self) -> io::Result<(Arc<ClientConfig>, String)> {
+    pub(crate) async fn quic_config_with_context(
+        &self,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<(Arc<ClientConfig>, String)> {
         match &self.backend {
-            SecurityBackend::Standard(client) => client.quic_config(),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "HTTP/3 requires standard TLS",
-            )),
+            SecurityBackend::Standard(client) => client.quic_config_with_context(context).await,
+            _ => Err(io::Error::other("HTTP/3 requires standard TLS")),
+        }
+    }
+
+    pub(crate) async fn connect_with_context(
+        &self,
+        stream: BoxStream,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<BoxStream> {
+        match &self.backend {
+            SecurityBackend::Standard(client) => client.connect_with_context(stream, context).await,
+            _ => self.connect(stream).await,
         }
     }
 

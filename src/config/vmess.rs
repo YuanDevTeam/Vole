@@ -273,6 +273,12 @@ pub(super) struct RawVmess {
         deserialize_with = "deserialize_present_option"
     )]
     client_fingerprint: Option<String>,
+    #[serde(
+        rename = "ech-opts",
+        default,
+        deserialize_with = "super::ech::deserialize"
+    )]
+    ech_opts: Option<super::ech::RawEch>,
     #[serde(rename = "global-padding", default)]
     global_padding: bool,
     #[serde(rename = "authenticated-length", default)]
@@ -336,7 +342,7 @@ impl RawVmess {
                 || self.name_cert_verify.is_some()
                 || self.certificate.is_some()
                 || self.private_key.is_some()
-                || self.client_fingerprint.is_some())
+                || (self.client_fingerprint.is_some() || self.ech_opts.is_some()))
         {
             return invalid("VMess TLS options require tls=true");
         }
@@ -381,10 +387,19 @@ impl RawVmess {
             }
             let fingerprint =
                 super::normalize_certificate_fingerprint(self.fingerprint.as_deref())?;
+            let client_fingerprint =
+                super::parse_client_fingerprint(self.client_fingerprint.as_deref())?;
+            let ech = self
+                .ech_opts
+                .map(|raw| raw.normalize(client_fingerprint.is_some()))
+                .transpose()?
+                .flatten();
+            if ech.is_some() && server_name.parse::<std::net::IpAddr>().is_ok() {
+                return invalid("VMess ECH requires DNS servername");
+            }
             Some(super::TlsClientPolicy {
-                client_fingerprint: super::parse_client_fingerprint(
-                    self.client_fingerprint.as_deref(),
-                )?,
+                ech,
+                client_fingerprint,
                 alpn,
                 certificate: super::TlsCertificatePolicy {
                     fingerprint,

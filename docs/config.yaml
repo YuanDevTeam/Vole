@@ -208,7 +208,8 @@ sniffer:
 # - WS/gRPC/HTTP/H2 复用共享传输。WS 可 v2ray-http-upgrade 及其 fast-open；
 #   gRPC 与 Trojan/VMess 共用 UA、空闲 PING、max-connections/min-streams/max-streams 池阈值。
 # - 公共节点 smux 支持 h2mux/smux/yamux、padding/only-tcp 与池阈值；与 Vision 互斥。
-# - client-fingerprint 接受 none/chrome/chrome120/firefox/firefox120/safari/safari16；
+# - random 在进程首次按 Chrome/Safari/iOS/Firefox = 6:3:2:1 选定后稳定复用。
+# - client-fingerprint 接受 none/chrome/chrome120/firefox/firefox120/safari/safari16/ios/random；
 #   chrome=Chrome133，firefox=Firefox120，safari=Safari16.0；节点缺省关闭。
 #   适用于标准 TCP TLS/REALITY，不改变证书 fingerprint；下载腿缺省继承、
 #   显式名称覆盖、none/空串清除，转 H3/明文必须清除指纹。
@@ -216,7 +217,7 @@ sniffer:
 # - jls-opts.username/password 必须成对非空，各 1–65535 UTF-8 字节，要求 tls: true；
 #   与同腿 REALITY/证书策略/mTLS、Vision/H3 互斥。下载对象缺省继承、整体替换、
 #   {} 清除，主腿空对象拒绝。保持完整 TLS1.3 认证，无恢复；详见 vless.md#jls。
-# - 静态 ech-opts 只用于标准 TLS，详见下方示意与 docs/vless.md#静态-ech。
+# - ech-opts 的静态/动态来源只用于标准 TLS，详见下方示意与 docs/vless.md#ech。
 #   不接受动态 query-server-name、shadow-tls-opts 或已移除的 restls-opts。
 #
 # 下方 vless-edge 通过 upstream-select 当前选择的 socks-hop 建链：
@@ -465,12 +466,13 @@ proxies:
   #   short-id: "0123"
   #   support-x25519mlkem768: false # 主腿/下载腿均可配置，必须为非 null 布尔值
 
-  # 标准 TLS 的可选静态 ECH；主腿与 download-settings 使用相同字段。
-  # 启用时 config 必填标准 Base64 ECHConfigList，不能只填写 enable。
+  # 标准 TLS 的可选静态/动态 ECH；主腿与 download-settings 使用相同字段。
+  # 非空 config 是标准 Base64 ECHConfigList；省略/空串时通过节点 DNS 查询 HTTPS key 5。
   # 实际只协商 TLS1.3，servername 必须是 DNS 名；不查询 DNS 或自动明文回落。
-  # {} 清除；不能与同腿 REALITY/JLS、Vision 混用，详细契约见 docs/vless.md#静态-ech。
+  # {} 清除；不能与同腿 REALITY/JLS、Vision 混用，详细契约见 docs/vless.md#ech。
   # ech-opts:
   #   enable: true
+  #   query-server-name: query.example # 省略则查询 servername，静态 config 优先
   #   config: "<server-provided Base64 ECHConfigList>"
 
   # SOCKS5 出站支持 CONNECT 和 UDP ASSOCIATE。username/password 必须同时省略
@@ -490,7 +492,7 @@ proxies:
   # skip-cert-verify 不能覆盖 fingerprint；pin 是证书 SHA-256，不是客户端伪造指纹。
   # 叶 pin 直接决定信任；非叶 pin 作为根继续验证链和名称。所有策略均验证握手签名。
   # name-cert-verify 只改变证书验证名；certificate/private-key 为成对内联 PEM 或文件路径 客户端身份。
-  # 支持共享 client-fingerprint；不支持 REALITY、ECH 或 padding 调参，详见 outbounds.md#anytls。
+  # 支持共享 client-fingerprint；支持静态/动态 ech-opts；不支持 REALITY 或 padding 调参，详见 outbounds.md#anytls。
   # 两个 idle 时间字段为整数秒，<=5 回落30秒；min-idle-session 只保留现有空闲会话。
   # TCP 使用 AnyTLS session；udp: true 使用 UoT v2 datagram mode。
   - name: anytls-edge
@@ -538,7 +540,7 @@ proxies:
     #   skip-cert-verify: false
     #   fingerprint: "<SHA-256 certificate pin, 64 hex digits>"
     #   name-cert-verify: verified.example.com # 可选独立证书验证名
-    # client-fingerprint: chrome # 仅有插件时允许；共享七值，缺省/none/空串关闭命名模板
+    # client-fingerprint: chrome # 仅有插件时允许；共享九值，缺省/none/空串关闭命名模板
 
 # select/url-test/fallback/load-balance 组支持静态 proxies 与动态 use；include-all 同时包含静态节点和所有 providers，
 # 也可分别使用 include-all-proxies / include-all-providers。后者启用时忽略 use。

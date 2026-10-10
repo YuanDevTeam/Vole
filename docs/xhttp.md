@@ -1,7 +1,7 @@
 # XHTTP 与通用 sing-mux
 
 XHTTP/sing-mux 使用严格字段与类型；未知、null、无效或被忽略的组合在 IO 前拒绝。
-REALITY、JLS、静态 ECH 的身份规则见 [VLESS](vless.md)，实际验证边界见[验收说明](acceptance.md)。
+REALITY、JLS、ECH 的身份规则见 [VLESS](vless.md)，实际验证边界见[验收说明](acceptance.md)。
 
 ## HTTP 版本和连接模式
 
@@ -52,11 +52,11 @@ packet-up 在发送间隔内聚合小块写入，而不是把每个 write 变成
 
 - 缺省叶字段继承主腿。headers 是整体替换，`{}` 清空；显式空 host 恢复下载认证名/server 推导。
 - `skip-cert-verify: false` 必须覆盖主腿 true；空 name-cert-verify/fingerprint 清除对应 override/pin。
-- `client-fingerprint` 缺省继承，显式名称覆盖，`none` / 空串清除。下载腿切到明文或 H3 前必须清除继承的已启用 profile；它不属于证书策略，不因切换 TLS/REALITY 自动清除。七值/四模板见 [TLS 指纹](tls-client-fingerprint.md)。
+- `client-fingerprint` 缺省继承，显式名称覆盖，`none` / 空串清除。下载腿切到明文或 H3 前必须清除继承的已启用 profile；它不属于证书策略，不因切换 TLS/REALITY 自动清除。九值/五模板见 [TLS 指纹](tls-client-fingerprint.md)。
 - certificate/private-key 必须配对替换或同时空串清除；PEM 与密钥匹配在 IO 前检查。
 - reality-opts 缺省继承整个对象，`{}` 清除；非空对象必须提供 public-key，short-id 缺省空、support-x25519mlkem768 缺省 false，不按叶合并旧对象。仅提供混合开关不等同空对象，仍须提供 public-key。null 拒绝。
 - jls-opts 缺省继承整个身份，非空对象必须完整替换 username/password，`{}` 清除；同腿与 REALITY 和证书策略互斥，切换时须显式清除旧对象。JLS 仅 H1/H2，实际 TLS1.3，无恢复；完整约束见 [JLS](vless.md#jls)。
-- ech-opts 缺省继承、非空对象整体替换，启用必须同时提供 enable=true 和静态 config；`{}` 清除。仅标准 TLS，可用于 H1/H2/H3。没有动态查询或自动重试；切换到 REALITY/JLS/明文前必须显式清除继承的 ECH。
+- ech-opts 缺省继承、对象整体替换，`{}` 清除。`enable: true` 使用非空静态 config 或节点 DNS 的 HTTPS key 5，静态优先；query-server-name 只覆盖查询名。按下载腿实际 TLS backend 从完整来源重选配置。仅标准 TLS，可用于 H1/H2/H3；切换到 REALITY/JLS/明文前必须显式清除继承的 ECH。失败不重拨或重放。
 - 切换到明文或 REALITY 不会悄悄丢弃继承的证书策略；须显式清除冲突字段。每条腿独立重新校验最终安全配置。
 - 独立地址/端口在实际建立物理连接时通过节点 resolver 分别解析；两腿共享原绝对期限和每个上游组的选择快照，下载失败不会另起超时预算或绕过原图。
 

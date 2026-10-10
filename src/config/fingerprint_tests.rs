@@ -57,10 +57,8 @@ fn named_fingerprint_is_strict_and_independent_of_certificate_pins() {
             "NONE",
             "chrome133",
             "safari16.0",
-            "ios",
             "android",
             "edge",
-            "random",
             "randomized",
             "chrome_psk",
             "chrome_pq",
@@ -233,4 +231,30 @@ fn reality_accepts_named_profile_without_admitting_certificate_policy() {
             .is_err()
         );
     }
+}
+
+#[test]
+fn ios_and_process_random_fingerprint_use_the_shared_entries() {
+    let selected = process_random_fingerprint();
+    for protocol in ["anytls", "trojan", "vmess", "vless"] {
+        for (value, expected) in [("ios", ClientFingerprint::Ios14), ("random", selected)] {
+            let config = Config::parse_yaml(
+                yaml(protocol, &format!("client-fingerprint: {value}")).as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(profile(&config), Some(expected));
+        }
+    }
+    assert_eq!(process_random_fingerprint(), selected);
+    let mut counts = [0; 4];
+    for value in 0..12 {
+        counts[match weighted_fingerprint(value) {
+            ClientFingerprint::Chrome133 => 0,
+            ClientFingerprint::Safari16 => 1,
+            ClientFingerprint::Ios14 => 2,
+            ClientFingerprint::Firefox120 => 3,
+            ClientFingerprint::Chrome120 => panic!("random selected a fixed old Chrome"),
+        }] += 1;
+    }
+    assert_eq!(counts, [6, 3, 2, 1]);
 }

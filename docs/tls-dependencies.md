@@ -9,10 +9,10 @@
 | 普通 TLS、QUIC、WebPKI | 官方 rustls/tokio-rustls，ring provider；rustls-native-certs 只读取可用平台根，不替换验证器 |
 | QUIC 状态机 | registry Quinn 0.11.12 + 仓库内 quinn-proto 0.11.19；初始/最大窗口与独立 DATAGRAM frame 限额补丁，保留官方许可证/来源 |
 | Controller 随机服务端身份 | 官方 rsa 仅生成 RSA 2048 密钥；rcgen + ring 签发自签证书，实际 TLS 和握手签名仍由 rustls + ring 处理；随 Controller 入站 feature 启用 |
-| 命名 ClientHello、REALITY、JLS、ShadowTLS v3 | YuanDevTeam/boring，release 分支及锁定 revision |
+| 命名 ClientHello、REALITY、JLS、ShadowTLS v3 | YuanDevTeam/boring，同一 fork 的本地 development path；发布门禁仍要求 release 分支及批准 revision |
 | SS 2022 | 官方 shadowsocks，仅 `aead-cipher-2022` |
 | Encryption | 同一 boring 的 X25519、ML-KEM、AEAD、AES-CTR；官方 blake3 |
-| 静态 ECH | 官方 hpke + rustls HPKE trait，命名模板使用 boring ECH 接口 |
+| 静态/动态 ECH | 官方 hpke + rustls HPKE trait；指纹模板使用 boring ECH selector |
 | Provider AGE | 官方 age/age-core 的 armor、MAC 和 STREAM；Hybrid 身份用官方 hpke XWing，关闭插件与 CLI |
 
 QUIC 的受影响 protocol crate 通过 root `[patch.crates-io]` 指向
@@ -42,9 +42,21 @@ AGE 使用获准的官方兼容稳定版本 `age 0.11.5` 与 `age-core 0.11.0`�
 Encryption 的二进制 context 使用 [薄 FFI](../crates/vole-blake3-raw/README.md) 中未修改的
 官方 BLAKE3 C 源码，保留其来源、许可证和符号隔离。
 
+本地开发统一使用 `../boring/{boring,tokio-boring,boring-sys}`，当前原生实现为本地提交
+`4bac76121f259adcdb829f56ba52e864d10eaef5`。此来源需要配套 fork checkout，不是独立可移植
+Git 构建；未发布该提交。CI 的公开 Git 来源及批准 revision 门禁保持原样，本地 path 验证
+不代表发布门禁通过。发布前仍须按上述流程恢复三个 crate 的统一 Git 来源。
+
 ## 原生构建
 
 构建需要 C/C++、CMake、Perl 和 libclang。Apple 最终链接 libc++；Android 随库打包
 同 ABI、同 NDK 的 `libc++_shared.so`。
 
 构建与发布入口见 [编译与发布](../scripts/README.md)。
+
+ECH 接收算法按实际后端区分。rustls HPKE adapter 支持 X25519、P-256/P-384/P-521、
+ML-KEM-768/1024、X-Wing、ML-KEM-768+P-256 和 ML-KEM-1024+P-384；
+KDF 为 HKDF-SHA256/384/512、SHAKE128/256，AEAD 为 AES128/256-GCM 或 ChaCha20-Poly1305。
+使用官方 hpke 的 `nistp/mlkem/shake` feature 和公开 HPKE trait，不增加 TLS fork。
+命名模板的原生 ECH selector 仍只接收 X25519/HKDF-SHA256 和上述三种 AEAD；
+不能以原生通用 HPKE API 的值域推断 ECH selector 支持。

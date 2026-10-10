@@ -110,7 +110,10 @@ impl VmessOutbound {
             .io;
         if let Some(tls) = &self.tls {
             context
-                .run_io("VMess TLS handshake", tls.connect(raw))
+                .run_io(
+                    "VMess TLS handshake",
+                    tls.connect_with_context(raw, context),
+                )
                 .await
         } else {
             Ok(raw)
