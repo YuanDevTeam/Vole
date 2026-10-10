@@ -74,7 +74,7 @@ rules:
   - MATCH,Proxy
 ```
 
-Replace the example endpoint and credentials. GeoSite/GeoIP rules use assets under `<dataDir>/geodata`; missing required assets are downloaded through the configured route, and affected rules remain unavailable until loading succeeds. See the [complete configuration reference](docs/config.yaml) and [GeoData behavior](docs/geodata.md).
+Replace the example endpoint and credentials. GeoSite/DAT/ASN assets use `<dataDir>/geodata`; the default GeoIP mode uses a country MMDB in `<dataDir>` (`geodata-mode: true` selects DAT); missing required assets are downloaded through the configured route, and affected rules remain unavailable until loading succeeds. See the [complete configuration reference](docs/config.yaml) and [GeoData behavior](docs/geodata.md).
 
 `mixed-port` shares one TCP port between HTTP and SOCKS5 and enables SOCKS5 UDP on the same port. `allow-lan` controls binding independently of `authentication`: omitting `authentication` or using `[]` allows unauthenticated access on either loopback or wildcard addresses; configured credentials are checked by both HTTP and SOCKS5. Top-level `port`, `socks-port`, `udp` and `listeners` are rejected; proxy-node `port` and `udp` keep their outbound meanings.
 

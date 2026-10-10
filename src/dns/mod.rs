@@ -8,7 +8,7 @@
 
 mod cache;
 pub(crate) mod fake_ip;
-mod fallback;
+pub(crate) mod fallback;
 pub(crate) mod hosts;
 mod http2;
 mod https;

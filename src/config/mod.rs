@@ -187,6 +187,7 @@ impl std::fmt::Debug for ExternalControllerConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeoDataUpdateConfig {
+    pub geodata_mode: bool,
     pub urls: GeoDataUrls,
     pub auto_update: bool,
     pub interval_hours: u64,
@@ -195,6 +196,7 @@ pub struct GeoDataUpdateConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeoDataUrls {
     pub geoip: String,
+    pub mmdb: String,
     pub geosite: String,
     pub asn: String,
 }
@@ -1129,6 +1131,8 @@ struct RawVoleConfig {
         deserialize_with = "deserialize_present_option"
     )]
     geox_url: Option<RawGeoDataUrls>,
+    #[serde(rename = "geodata-mode", default)]
+    geodata_mode: bool,
     #[serde(
         rename = "geo-auto-update",
         default,
@@ -1224,6 +1228,8 @@ struct RawProxyGroup {
 struct RawGeoDataUrls {
     #[serde(default = "default_geoip_url")]
     geoip: String,
+    #[serde(default = "default_mmdb_url")]
+    mmdb: String,
     #[serde(default = "default_geosite_url")]
     geosite: String,
     #[serde(default = "default_asn_url")]
@@ -1235,6 +1241,9 @@ fn default_global_ua() -> String {
 fn default_geoip_url() -> String {
     "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat".into()
 }
+fn default_mmdb_url() -> String {
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb".into()
+}
 fn default_geosite_url() -> String {
     "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat".into()
 }
@@ -1245,6 +1254,7 @@ impl Default for RawGeoDataUrls {
     fn default() -> Self {
         Self {
             geoip: default_geoip_url(),
+            mmdb: default_mmdb_url(),
             geosite: default_geosite_url(),
             asn: default_asn_url(),
         }
@@ -2094,6 +2104,7 @@ impl RawVoleConfig {
             return invalid("global-ua must be a bounded HTTP header value");
         }
         let geodata_update = normalize_geodata_update(
+            self.geodata_mode,
             self.geox_url,
             self.geo_auto_update,
             self.geo_update_interval,
@@ -2280,6 +2291,7 @@ fn normalize_external_controller(
 }
 
 fn normalize_geodata_update(
+    geodata_mode: bool,
     urls: Option<RawGeoDataUrls>,
     auto_update: Option<bool>,
     interval_hours: Option<u64>,
@@ -2290,8 +2302,10 @@ fn normalize_geodata_update(
         return invalid("geo-update-interval is too large");
     }
     Ok(Some(GeoDataUpdateConfig {
+        geodata_mode,
         urls: GeoDataUrls {
             geoip: normalize_geox_url(urls.geoip, "geox-url.geoip")?,
+            mmdb: normalize_geox_url(urls.mmdb, "geox-url.mmdb")?,
             geosite: normalize_geox_url(urls.geosite, "geox-url.geosite")?,
             asn: normalize_geox_url(urls.asn, "geox-url.asn")?,
         },
@@ -3933,7 +3947,7 @@ proxies:
 
     fn with_geodata(fields: &str) -> String {
         current_yaml(&format!(
-            "{fields}\nmixed-port: 1080\nauthentication:\n  - measure:secret"
+            "geodata-mode: true\n{fields}\nmixed-port: 1080\nauthentication:\n  - measure:secret"
         ))
     }
 
@@ -4091,6 +4105,19 @@ geo-update-interval: 24"#,
         let defaults = Config::parse_yaml(CURRENT_TLS.as_bytes()).unwrap();
         assert!(!defaults.geodata_update.unwrap().auto_update);
         assert!(defaults.etag_support);
+    }
+
+    #[test]
+    fn geodata_mode_defaults_to_mmdb_and_urls_remain_independent() {
+        let default = Config::parse_yaml(b"rules: ['GEOIP,CN,DIRECT']").unwrap();
+        let update = default.geodata_update.unwrap();
+        assert!(!update.geodata_mode);
+        assert_eq!(update.urls.mmdb, default_mmdb_url());
+        let explicit = Config::parse_yaml(b"geodata-mode: true\ngeox-url: {mmdb: https://assets.example.test/country}\nrules: ['GEOIP,CN,DIRECT']").unwrap();
+        let update = explicit.geodata_update.unwrap();
+        assert!(update.geodata_mode);
+        assert_eq!(update.urls.mmdb, "https://assets.example.test/country");
+        assert_eq!(update.urls.geoip, default_geoip_url());
     }
 
     #[test]

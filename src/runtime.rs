@@ -444,6 +444,7 @@ impl PreparedCore {
                 parts.dispatcher.clone(),
                 self.geodata_registration.updater_lease(),
                 update.urls.clone(),
+                update.geodata_mode,
                 self.config.global_ua.clone(),
                 self.config.etag_support,
                 update.auto_update && update.interval_hours > 0,
@@ -2441,7 +2442,8 @@ dns:
     async fn geodata_updater_fetches_missing_assets_and_requires_actual_demand() {
         fn configured(auto_update: bool, geodata_rule: bool) -> String {
             let fields = format!(
-                r#"geox-url:
+                r#"geodata-mode: true
+geox-url:
   geoip: https://downloads.example.test/custom-geoip.dat
   geosite: https://downloads.example.test/custom-geosite.dat
 geo-auto-update: {auto_update}
@@ -2498,7 +2500,8 @@ geo-update-interval: 24
     async fn a_manager_rejects_a_second_prepared_configuration() {
         fn configured(auto_update: bool, rule: &str, source: &str) -> String {
             let fields = format!(
-                r#"geox-url:
+                r#"geodata-mode: true
+geox-url:
   geoip: https://{source}/geoip.dat
   geosite: https://{source}/geosite.dat
 geo-auto-update: {auto_update}

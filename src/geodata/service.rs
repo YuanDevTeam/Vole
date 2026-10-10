@@ -37,6 +37,7 @@ pub(crate) struct GeoDataUpdateService {
     dispatcher: Arc<dyn Dispatcher>,
     registration: GeoDataRegistrationLease,
     urls: GeoDataUrls,
+    geodata_mode: bool,
     options: HttpOptions,
     etag_support: bool,
     auto_update: bool,
@@ -50,6 +51,7 @@ impl GeoDataUpdateService {
         dispatcher: Arc<dyn Dispatcher>,
         registration: GeoDataRegistrationLease,
         urls: GeoDataUrls,
+        geodata_mode: bool,
         user_agent: String,
         etag_support: bool,
         auto_update: bool,
@@ -61,6 +63,7 @@ impl GeoDataUpdateService {
             dispatcher,
             registration,
             urls,
+            geodata_mode,
             options: HttpOptions {
                 user_agent,
                 ..HttpOptions::default()
@@ -141,12 +144,16 @@ impl GeoDataUpdateService {
         let registration = self.registration.clone();
         let urls = self.urls.clone();
         let auto_update = self.auto_update;
+        let geodata_mode = self.geodata_mode;
         blocking_operation(move || {
             let due = manager.due_resources_for_active_registration_with_cancellation(
                 &registration,
                 [
                     (GeoDataKind::GeoSite, urls.geosite.as_str()),
-                    (GeoDataKind::GeoIp, urls.geoip.as_str()),
+                    (
+                        GeoDataKind::GeoIp,
+                        resource_url(&urls, GeoDataKind::GeoIp, geodata_mode),
+                    ),
                     (GeoDataKind::Asn, urls.asn.as_str()),
                 ],
                 SystemTime::now(),
@@ -174,7 +181,7 @@ impl GeoDataUpdateService {
         kind: GeoDataKind,
         cancellation: CancellationToken,
     ) -> Result<UpdateAttempt, String> {
-        let source_url = resource_url(&self.urls, kind).to_owned();
+        let source_url = resource_url(&self.urls, kind, self.geodata_mode).to_owned();
         let manager = self.manager.clone();
         let registration = self.registration.clone();
         let begin_source = source_url.clone();
@@ -344,10 +351,16 @@ impl RetryState {
     }
 }
 
-fn resource_url(urls: &GeoDataUrls, kind: GeoDataKind) -> &str {
+fn resource_url(urls: &GeoDataUrls, kind: GeoDataKind, geodata_mode: bool) -> &str {
     match kind {
         GeoDataKind::GeoSite => &urls.geosite,
-        GeoDataKind::GeoIp => &urls.geoip,
+        GeoDataKind::GeoIp => {
+            if geodata_mode {
+                &urls.geoip
+            } else {
+                &urls.mmdb
+            }
+        }
         GeoDataKind::Asn => &urls.asn,
     }
 }
@@ -430,10 +443,12 @@ mod tests {
             Arc::new(NoNetworkDispatcher),
             registration.updater_lease(),
             GeoDataUrls {
+                mmdb: "https://assets.example.test/geoip.metadb".into(),
                 geoip: "https://rules.example.test/geoip.dat".to_owned(),
                 geosite: "https://rules.example.test/geosite.dat".to_owned(),
                 asn: "https://rules.example.test/ASN.mmdb".to_owned(),
             },
+            true,
             "fixture".into(),
             true,
             true,
@@ -486,17 +501,22 @@ mod tests {
     #[test]
     fn resources_use_configured_urls() {
         let urls = GeoDataUrls {
+            mmdb: "https://assets.example.test/geoip.metadb".into(),
             geoip: "https://rules.example.test/custom-geoip".to_owned(),
             geosite: "https://rules.example.test/custom-geosite".to_owned(),
             asn: "https://rules.example.test/custom-asn".to_owned(),
         };
         assert_eq!(
-            resource_url(&urls, GeoDataKind::GeoSite),
+            resource_url(&urls, GeoDataKind::GeoSite, true),
             "https://rules.example.test/custom-geosite"
         );
         assert_eq!(
-            resource_url(&urls, GeoDataKind::GeoIp),
+            resource_url(&urls, GeoDataKind::GeoIp, true),
             "https://rules.example.test/custom-geoip"
+        );
+        assert_eq!(
+            resource_url(&urls, GeoDataKind::GeoIp, false),
+            "https://assets.example.test/geoip.metadb"
         );
     }
 

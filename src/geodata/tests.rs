@@ -462,7 +462,11 @@ fn category_lookup_preserves_independent_codes_through_load_and_reload() {
     let data = GeoData::load(dir.path(), &rules).unwrap();
     let manager = GeoDataManager::open(dir.path(), std::time::Duration::from_secs(60)).unwrap();
     let registration = manager
-        .register(GeoRequirements::collect(&rules, &[]).unwrap())
+        .register(
+            GeoRequirements::collect(&rules, &[])
+                .unwrap()
+                .with_geodata_mode(true),
+        )
         .unwrap();
     assert!(registration.initial_report().geosite.available);
     assert!(registration.initial_report().geoip.available);

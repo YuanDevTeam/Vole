@@ -1,4 +1,4 @@
-//! Selective Xray GeoData loading with compact, shared category matchers.
+//! Selective DAT matchers and shared country/ASN MMDB readers.
 //!
 //! The loader deliberately scans protobuf wire framing itself. It indexes only
 //! category ranges during the first pass and decodes records only for codes
@@ -26,6 +26,9 @@ use crate::{
 mod asn;
 #[cfg(test)]
 mod asn_tests;
+mod country;
+#[cfg(test)]
+mod country_tests;
 mod manager;
 mod selectors;
 pub(crate) mod service;
@@ -45,7 +48,7 @@ pub const ASN_FILE_NAME: &str = "ASN.mmdb";
 
 const MAX_CODE_BYTES: usize = 64;
 
-/// Supported DAT category assets and the independent ASN MMDB.
+/// Logical assets; GeoIP selects a DAT or country MMDB per registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeoDataKind {
     GeoSite,
@@ -101,6 +104,8 @@ pub enum GeoDataError {
     InvalidCidr { code: String, detail: String },
     #[error("invalid ASN MMDB: {0}")]
     InvalidAsn(String),
+    #[error("invalid country MMDB: {0}")]
+    InvalidCountry(String),
     #[error("GeoData resource `{resource}` is {actual}; limit is {maximum}")]
     ResourceLimit {
         resource: &'static str,
@@ -152,6 +157,7 @@ impl AllocationLedger {
 pub struct GeoData {
     sites: Vec<SiteCategory>,
     ips: Vec<IpCategory>,
+    country: Option<country::CountryDb>,
     asn: Option<asn::AsnDb>,
     allocation_capacity: usize,
     peak_allocation_capacity: usize,
@@ -166,6 +172,7 @@ impl std::fmt::Debug for GeoData {
             .debug_struct("GeoData")
             .field("site_categories", &self.sites.len())
             .field("ip_categories", &self.ips.len())
+            .field("country_available", &self.country.is_some())
             .field("asn_available", &self.asn.is_some())
             .field("allocation_capacity", &self.allocation_capacity)
             .field("peak_allocation_capacity", &self.peak_allocation_capacity)
@@ -183,6 +190,7 @@ impl GeoData {
     pub const EMPTY: Self = Self {
         sites: Vec::new(),
         ips: Vec::new(),
+        country: None,
         asn: None,
         allocation_capacity: 0,
         peak_allocation_capacity: 0,
@@ -227,12 +235,20 @@ impl GeoData {
         } else {
             None
         };
-        Ok(Self::from_loaded(sites, ips, asn, ledger.used, ledger.peak))
+        Ok(Self::from_loaded(
+            sites,
+            ips,
+            None,
+            asn,
+            ledger.used,
+            ledger.peak,
+        ))
     }
 
     fn from_loaded(
         mut sites: Vec<SiteCategory>,
         mut ips: Vec<IpCategory>,
+        country: Option<country::CountryDb>,
         asn: Option<asn::AsnDb>,
         allocation_capacity: usize,
         peak_allocation_capacity: usize,
@@ -241,11 +257,12 @@ impl GeoData {
         // manager reloads share this allocation-free indexing step.
         sites.sort_unstable_by_key(|category| category.code);
         ips.sort_unstable_by_key(|category| category.code);
-        let release = (!sites.is_empty() || !ips.is_empty() || asn.is_some())
+        let release = (!sites.is_empty() || !ips.is_empty() || country.is_some() || asn.is_some())
             .then(manager::SnapshotRelease::new);
         Self {
             sites,
             ips,
+            country,
             asn,
             allocation_capacity,
             peak_allocation_capacity,
@@ -269,7 +286,7 @@ impl GeoData {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.sites.is_empty() && self.ips.is_empty() && self.asn.is_none()
+        self.sites.is_empty() && self.ips.is_empty() && self.country.is_none() && self.asn.is_none()
     }
 
     #[must_use]
@@ -279,7 +296,9 @@ impl GeoData {
 
     #[must_use]
     pub fn geoip_available(&self, code: &str) -> bool {
-        lan_selector(code) || self.ip_category(code).is_some()
+        lan_selector(code)
+            || self.country.as_ref().is_some_and(|db| db.available(code))
+            || self.ip_category(code).is_some()
     }
 
     #[must_use]
@@ -355,8 +374,13 @@ impl GeoMatcher for GeoData {
 
     fn matches_geoip(&self, code: &str, address: IpAddr) -> bool {
         matches_lan(code, address).unwrap_or_else(|| {
-            self.ip_category(code)
-                .is_some_and(|category| category.matches(address) != code.starts_with('!'))
+            self.country.as_ref().map_or_else(
+                || {
+                    self.ip_category(code)
+                        .is_some_and(|category| category.matches(address) != code.starts_with('!'))
+                },
+                |db| db.matches(code, address),
+            )
         })
     }
 }
@@ -530,6 +554,7 @@ pub struct GeoRequirements {
     sites: CodeSet,
     ips: CodeSet,
     asn: bool,
+    geodata_mode: bool,
 }
 
 impl GeoRequirements {
@@ -592,6 +617,10 @@ impl GeoRequirements {
             sites: requested.sites,
             ips: requested.ips,
             asn: requested.asn,
+            geodata_mode: config
+                .geodata_update
+                .as_ref()
+                .is_some_and(|update| update.geodata_mode),
         };
         if config.sniffer.enable {
             result.extend(&Self::collect(&config.sniffer.skip_src_address, &[])?)?;
@@ -632,7 +661,15 @@ impl GeoRequirements {
             sites: requested.sites,
             ips: requested.ips,
             asn: requested.asn,
+            geodata_mode: false,
         })
+    }
+
+    /// Selects DAT (true) or country MMDB (false, the YAML default).
+    #[must_use]
+    pub fn with_geodata_mode(mut self, enabled: bool) -> Self {
+        self.geodata_mode = enabled;
+        self
     }
 
     #[must_use]
@@ -809,6 +846,11 @@ fn load_selected_file<T>(
 
 fn open_asset(config_dir: &Path, kind: GeoDataKind) -> Result<(File, u64), GeoDataError> {
     let path = config_dir.join(kind.file_name());
+    open_asset_path(&path)
+}
+
+fn open_asset_path(path: &Path) -> Result<(File, u64), GeoDataError> {
+    let path = path.to_path_buf();
     let symlink_metadata = fs::symlink_metadata(&path).map_err(|source| GeoDataError::Io {
         path: path.clone(),
         source,

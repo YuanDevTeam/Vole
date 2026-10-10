@@ -6,7 +6,8 @@
 #
 # 库宿主先通过 Invoke API 调用 initialize({dataDir})，再通过 configYaml 内联
 # 传入配置；CLI 使用 -f 指定文件，-d 指定数据目录，省略时读取数据目录下的 config.yaml。
-# GeoData 固定由 Vole 管理在 dataDir/geodata 中；CLI 的 -t 只校验，不创建目录或联网。
+# GeoSite/DAT/ASN 由 Vole 管理在 dataDir/geodata 中；国家 MMDB 位于 dataDir 根目录。
+# CLI 的 -t 只校验，不创建目录或联网。
 # certificate/private-key 可为成对 PEM 或文件路径；相对路径从 dataDir 解析，校验时读取并验证。
 # 所有平台均不设 GeoData 条数上限，不按数量截断，也不设总内存预算；
 # 仅加载当前业务规则和 DNS policy 引用的分类/属性交集，详见 docs/geodata.md。
@@ -39,13 +40,16 @@ profile:
   store-fake-ip: false # true：dataDir/fake-ip.redb 持久化双向映射与分配位置
 
 # 资源下载使用 global-ua（缺省 Vole/ 加 Core 版本）；etag-support 缺省 true。
-# GeoData 字段独立可选；URL 缺省 MetaCubeX meta-rules-dat latest DAT / ASN MMDB。
+# geodata-mode 默认 false，使用国家 MMDB；true 使用 GeoIP DAT。此示例显式选择 DAT。
+# URL 缺省 MetaCubeX meta-rules-dat latest DAT / 国家 MMDB / ASN MMDB。
 # URL 以域名为主机、无 userinfo/fragment，生产构建使用 HTTPS。
 # 自动更新默认 false；启动后仍获取缺失的必需资产。周期单位小时，默认 24，0 关闭周期检查。
 global-ua: "Vole/0.1.0"
 etag-support: true
+geodata-mode: true
 geox-url:
   geoip: https://assets.example.com/geoip.dat
+  mmdb: https://assets.example.com/geoip.metadb
   geosite: https://assets.example.com/geosite.dat
   asn: https://assets.example.com/ASN.mmdb
 geo-auto-update: true
