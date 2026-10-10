@@ -58,6 +58,9 @@ where
 
 impl crate::config::ConnectionSettings {
     pub(crate) fn apply(self, socket: &socket2::SockRef<'_>) -> std::io::Result<()> {
+        // Apply to accepted mixed connections as well as physical dials:
+        // small proxy writes must not wait on Nagle and delayed ACKs.
+        socket.set_tcp_nodelay(true)?;
         // Mihomo deliberately disables TCP probes on Android.
         if self.disable_keep_alive || cfg!(target_os = "android") {
             return socket.set_keepalive(false);
@@ -137,6 +140,7 @@ mod tests {
             ..Default::default()
         };
         options.apply(&socket2::SockRef::from(&socket)).unwrap();
+        assert!(socket.tcp_nodelay().unwrap());
         assert_eq!(socket.keepalive().unwrap(), !cfg!(target_os = "android"));
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -155,6 +159,7 @@ mod tests {
         }
         .apply(&socket2::SockRef::from(&socket))
         .unwrap();
+        assert!(socket.tcp_nodelay().unwrap());
         assert!(!socket.keepalive().unwrap());
     }
 }

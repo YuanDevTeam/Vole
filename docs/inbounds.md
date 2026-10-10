@@ -28,6 +28,7 @@ HTTP 与 SOCKS5 共用一个混合入口，并和 TUN 共用 Dispatcher、规则
   使用自己的 Bearer 认证，不随共享开关开放。
 - 不设置全局业务连接/关联准入数。Stop 取消并等待全部连接、relay 和接收任务，
   返回后端口可重新绑定。
+- 接收的 TCP 连接启用 `TCP_NODELAY`，小包应答不等待 Nagle 聚合。
 
 ## 选路元数据
 
