@@ -182,6 +182,8 @@ pacer；这是混淆不是认证，错误密钥由 QUIC 拒绝，短包有界丢
 SNI 缺省 server，ALPN 缺省 h3；显式空列表拒绝，非空有序列表必须实际协商命中。
 使用共享 pin/skip/独立验证名；无命名 TCP 指纹、mTLS、ECH、0-RTT 或跨节点恢复。
 拥塞使用官方 Quinn cubic（默认）、new_reno 或 bbr，不承诺与其他实现的吞吐相同。
+`log-level: debug` 在物理会话建立后记录实际 controller 的固定算法标签；
+标签不包含节点、凭据或业务目标，配置验证和复用同一会话不重复记录。
 
 认证使用当前真实 TLS 会话 exporter，UUID 为 label，原样 password 为 context。
 Authenticate 与 Connect 没有成功 ACK；本地 open 成功不是密码通过证明，错误身份

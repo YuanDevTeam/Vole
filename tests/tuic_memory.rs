@@ -183,6 +183,7 @@ async fn authenticates_current_session_without_ack_and_preserves_stream_isolatio
     ] {
         let probe = ResourceProbe::default();
         let (outbound, endpoint) = fixture(1200, true, 8, algorithm);
+        assert_eq!(outbound.congestion_observation().await, None);
         let ep = endpoint.clone();
         let peer = tokio::spawn(async move {
             let connection = authenticated(&ep).await;

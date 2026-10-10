@@ -47,6 +47,38 @@ struct Session {
     activity: Arc<Activity>,
 }
 
+fn active_congestion(connection: &quinn::Connection) -> Option<TuicCongestion> {
+    let controller = connection.congestion_state().into_any();
+    if controller.is::<quinn::congestion::Cubic>() {
+        Some(TuicCongestion::Cubic)
+    } else if controller.is::<quinn::congestion::NewReno>() {
+        Some(TuicCongestion::NewReno)
+    } else if controller.is::<quinn::congestion::Bbr>() {
+        Some(TuicCongestion::Bbr)
+    } else {
+        None
+    }
+}
+
+fn log_active_congestion(connection: &quinn::Connection) {
+    // Fixed targets survive the CLI's restricted field renderer without
+    // exposing peer, credential or traffic metadata.
+    match active_congestion(connection) {
+        Some(TuicCongestion::Cubic) => {
+            tracing::debug!(target: "vole::outbound::tuic::congestion::cubic", "TUIC controller ready");
+        }
+        Some(TuicCongestion::NewReno) => {
+            tracing::debug!(target: "vole::outbound::tuic::congestion::new_reno", "TUIC controller ready");
+        }
+        Some(TuicCongestion::Bbr) => {
+            tracing::debug!(target: "vole::outbound::tuic::congestion::bbr", "TUIC controller ready");
+        }
+        None => {
+            tracing::debug!(target: "vole::outbound::tuic::congestion::unknown", "TUIC controller ready");
+        }
+    }
+}
+
 impl std::fmt::Debug for TuicOutbound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TuicOutbound").finish_non_exhaustive()
@@ -68,16 +100,7 @@ impl TuicOutbound {
     #[cfg(feature = "interop-test")]
     pub async fn congestion_observation(&self) -> Option<TuicCongestion> {
         let current = self.current.lock().await;
-        let controller = current.as_ref()?.connection.congestion_state().into_any();
-        if controller.is::<quinn::congestion::Cubic>() {
-            Some(TuicCongestion::Cubic)
-        } else if controller.is::<quinn::congestion::NewReno>() {
-            Some(TuicCongestion::NewReno)
-        } else if controller.is::<quinn::congestion::Bbr>() {
-            Some(TuicCongestion::Bbr)
-        } else {
-            None
-        }
+        active_congestion(&current.as_ref()?.connection)
     }
 
     pub fn new_with_path(config: &TuicOutboundConfig, upstream: UpstreamPath) -> io::Result<Self> {
@@ -318,6 +341,7 @@ async fn drive(
             .map_err(failure)?;
         send.finish().map_err(failure)?;
         auth.fill(0);
+        log_active_congestion(&connection);
         drop(handshake);
         let session = Arc::new(Session {
             connection: connection.clone(),
