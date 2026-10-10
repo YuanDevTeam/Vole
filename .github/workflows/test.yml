@@ -220,10 +220,13 @@ jobs:
             connections::tests:: routing::diagnostics::tests:: dialer::connections::tests::
             polled_datagram_
             resource::http::tests:: fake_ip_ sniffing::tests:: tcp_sniffer::tests::
+            resource::age_provider::tests:: resource::bundle::tests:: resource::bundle_limits::tests::
+            resource::cache::tests:: resource::subscription::tests::
             dns::fallback::tests:: dns::runtime::tests::dns_fallback_
             dns::runtime::tests::resolve_ipv6_
             dns::source::tests:: dns::runtime::tests::dns_source_
             dns::runtime::encrypted_tests::
+            dns::options::tests:: dns::runtime::quic_tests::
             controller_secure_
             outbound::http::tests:: outbound::wireguard::tests:: inbound::mixed::tests:: inbound::socks5::association::tests::
             inbound::http::parser::tests:: inbound::http::framing::tests::
