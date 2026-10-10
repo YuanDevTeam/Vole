@@ -16,6 +16,7 @@ pub(crate) mod trace;
 
 pub mod resolution;
 pub mod runtime;
+pub(crate) mod source;
 
 use std::{
     fmt,

@@ -33,6 +33,14 @@ impl SocketPolicy {
         }
     }
     pub(crate) fn apply(&self, socket: &impl AsRawFd, destination: SocketAddr) -> io::Result<()> {
+        self.apply_with_interface(socket, destination, None)
+    }
+    pub(crate) fn apply_with_interface(
+        &self,
+        socket: &impl AsRawFd,
+        destination: SocketAddr,
+        interface: Option<&str>,
+    ) -> io::Result<()> {
         if self.mark {
             let value = netlink::MARK;
             // SAFETY: socket is live and the option points to a u32 mark.
@@ -48,6 +56,34 @@ impl SocketPolicy {
             {
                 return Err(io::Error::last_os_error());
             }
+        }
+        if let Some(interface) = interface {
+            let name = CString::new(interface).map_err(|_| io::ErrorKind::InvalidInput)?;
+            // SAFETY: live socket, terminated interface name and a u32 index.
+            let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+            if index == 0 {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+            if let SocketAddr::V6(address) = destination
+                && address.scope_id() != 0
+                && address.scope_id() != index
+            {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            // SAFETY: name remains live and socket is owned by its initializer.
+            if unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    name.as_ptr().cast(),
+                    name.as_bytes_with_nul().len() as libc::socklen_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(());
         }
         if !self.detect || destination.ip().is_loopback() {
             return Ok(());

@@ -58,6 +58,11 @@ impl TunRsIo {
         })
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn interface_name(&self) -> io::Result<String> {
+        self.device.get_ref().name()
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn linux_device(&self) -> &tun_rs::SyncDevice {
         self.device.get_ref()

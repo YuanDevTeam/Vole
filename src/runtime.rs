@@ -567,6 +567,8 @@ impl PreparedCore {
         )
     ))]
     async fn start_tun_inner(mut self, tun: TunIo, dialer: Dialer) -> io::Result<RunningCore> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let dialer = dialer.with_dns_tun_interface(tun.interface_name().ok().map(Into::into));
         self.limits.tun_max_datagram_size = usize::from(self.config.tun.mtu);
         let tun_count = self
             .config
@@ -664,7 +666,7 @@ impl GraphBuilder {
                 }) as Arc<dyn Dispatcher>
             })
             .collect::<Vec<_>>();
-        let direct_raw: Arc<dyn Dispatcher> = Arc::new(DirectOutbound::new(dialer));
+        let direct_raw: Arc<dyn Dispatcher> = Arc::new(DirectOutbound::new(dialer.clone()));
         let direct = observe_handshakes_with_stats(direct_raw, handshake_stats.clone());
         let proxy_groups = ProxyGroups::with_selections(
             &self.config.proxy_groups,
@@ -699,6 +701,40 @@ impl GraphBuilder {
                 dns_config.cache_max_size,
                 redir_host_entries,
             )
+            .with_network_sources(
+                dialer.clone(),
+                crate::dns::source::SourceExclusions {
+                    interface: dialer.dns_tun_interface().or_else(|| {
+                        (self.config.tun.enable && !self.config.tun.device.is_empty())
+                            .then(|| self.config.tun.device.as_str().into())
+                    }),
+                    addresses: if self.config.tun.enable {
+                        vec![
+                            self.config
+                                .dns
+                                .fake_ip
+                                .range
+                                .map(|range| range.interface_address)
+                                .unwrap_or_else(|| "198.18.0.1".parse().unwrap()),
+                            self.config
+                                .dns
+                                .fake_ip
+                                .range
+                                .map(|range| match range.interface_address {
+                                    std::net::IpAddr::V4(ip) => std::net::IpAddr::V4(
+                                        std::net::Ipv4Addr::from(u32::from(ip).saturating_add(1)),
+                                    ),
+                                    ip => ip,
+                                })
+                                .unwrap_or_else(|| "198.18.0.2".parse().unwrap()),
+                            "fdfe:dcba:9876::1".parse().unwrap(),
+                            "fdfe:dcba:9876::2".parse().unwrap(),
+                        ]
+                    } else {
+                        Vec::new()
+                    },
+                },
+            )
             .with_mapping_from(self.previous_dns.as_deref())
             .with_fake_ip_store(
                 if self.config.profile.store_fake_ip && self.previous_dns.is_none() {
@@ -708,6 +744,9 @@ impl GraphBuilder {
                 },
             )?,
         ));
+        if let Some(dns) = &dns {
+            dns.network_sources().register(dns);
+        }
         proxy_graph.resolution.bind_runtime(dns.as_ref())?;
         let health = health::HealthRuntime::new(
             &self.config,

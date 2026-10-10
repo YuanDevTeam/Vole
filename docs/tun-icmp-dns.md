@@ -113,7 +113,8 @@ dns:
 - `rcode://success`、`rcode://format_error`、`rcode://server_failure`、`rcode://name_error`、`rcode://not_implemented`、`rcode://refused` 分别返回本地 RCODE 0–5；可用于 nameserver、policy、fallback、节点和直连 resolver，不能用于 default-nameserver。
 - 同一个上游列表中存在本地 RCODE 时使用第一项本地响应，不建立网络连接，也不把 SERVFAIL/REFUSED 当作上游故障重试。响应保留原查询的 flags 和 additional，仅设置 QR 与 RCODE；不额外开启 RA，不写入结果缓存。
 - `dns.ipv6: false` 不限制 IPv6 nameserver；顶层 `ipv6: false` 会阻止通过 DIRECT（含 `RULES` 选中 DIRECT）的 IPv6 nameserver 在本机物理建链，并继续当前组的故障转移。
-- 上游域名由 `default-nameserver` 引导解析，后者只允许 IP 上游。未启用 DNS 时，内部解析使用系统 resolver；启用后不因查询失败回退系统解析。显式 system/DHCP nameserver 尚未实现。
+- 上游域名由 `default-nameserver` 引导解析，后者允许 IP 上游和显式 system。未启用 DNS 时，内部解析使用系统 resolver；启用后不因查询失败回退系统解析。
+- `system`、`system://`、`dhcp://system` 使用物理系统 DNS；`dhcp://<精确接口名>` 仅使用该接口的 DHCP DNS，不匹配其他接口。各 nameserver 角色、policy 和 fallback 均支持；DHCP 接口不能用于 default-nameserver。来源始终直连物理接口，fragment 与 respect-rules 不改其出口。
 - 无 fragment 时默认 DIRECT；`respect-rules: true` 改为 RULES，要求非空 `proxy-server-nameserver`。
 - Fragment 只接受 `DIRECT`、`RULES`、实际代理节点名或支持的代理组名。
 - `#RULES` 只按 nameserver endpoint 和传输执行业务规则，不把 DNS question 当作选路域名。
@@ -152,6 +153,15 @@ Policy 只决定当前 DNS exchange，不改写后续业务动作。分类、属
 快照在选择函数返回时释放，不复制规则，也不跨后续上游 I/O 的 `await` 持有。
 Regex selector 记录与业务规则共用 `regex::bytes::Regex`；其搜索缓存由正则库管理，
 可能分配 scratch 或发生缓存竞争，不承诺 DNS policy 正则搜索零分配。
+
+### 显式系统与 DHCP 来源
+
+App 通过运行时级 [`updateDnsNetwork`](invoke-api.md#updatednsnetwork) 提供完整网络快照，地址必须是字面 IP，接口必须精确。快照优先于 OS 发现，空数组明确撤销来源。替换时原子推进 DNS epoch 并清理全部角色的类型化/wire 缓存及 redir-host 提示；保留 fake-IP 映射和活跃流。旧查询可返回原调用者，但不能回填新网络缓存，新查询不加入旧 singleflight。DNS TCP 连接池按来源代次、接口和地址区分复用。
+
+Linux CLI 无宿主快照时仅调用已有 `/usr/bin/busctl`，读取 systemd-resolved 的物理 link DNS 或 NetworkManager 已激活接口的 DHCP4 `domain_name_servers`；原生 DHCP 还需现有 resolved link 的加密策略，无法确认策略时不可用。不启动服务、不读 VPN stub、不发送 DHCP DISCOVER，也不读取其他接口的租约。发现仅在后续 DNS miss 按需刷新，元数据缓存 20 秒；到期本身不主动清结果缓存。重新发现的 endpoint、加密要求或绑定变化时，原子推进共享 epoch/source generation 并清 cache/hints，连接池不能复用旧来源 key。整体发现期限 3 秒，stdout/stderr 各限 64 KiB；取消会关闭并等待子进程。缺服务、无可靠租约或加密要求无法满足时来源不可用。被接管的 TUN 接口、回环/stub 地址和自身网关被排除。与 Mihomo 主动 DISCOVER/DHCPOFFER 的 DHCP 来源机制不同。
+
+Apple 使用宿主快照和 `IP_BOUND_IF`/`IPV6_BOUND_IF`；App 负责取得真实物理 DNS 数据。Android 和 Wintun 当前没有可证明的精确物理接口绑定，显式 system/DHCP 来源不可用，不改变现有 protect 与宿主网络隔离合约。UWP 仅在实际 Session Host 的既有物理 GUID 绑定内发现系统 DNS；前台 Invoke registry 不是 IPC，不能通过它更新另一个进程的 VPN 会话。DHCP 租约 metadata 不可靠时保持不可用。来源要求加密但当前 UDP/TCP 路径无法满足时失败关闭，不降级为明文，也不补充公共 DNS。
+
 
 ## Fallback
 
@@ -244,7 +254,7 @@ wire/RCODE 语义，不使用这段地址合并等待。
 - 查询总期限 5 秒；单 nameserver 尝试最多 3 秒，并受剩余时间限制。
 - UDP 尝试只打开一个传输；首次发送后 1 秒无合法响应时，在同一传输和 ID 上最多重发一次。
 - 前两次 peer/ID/question 不匹配只丢当前响应，第三次使当前尝试失败。
-- 当前策略最多同时发起 4 个上游尝试；优先返回有效响应并取消其余尝试。超时、I/O、格式错误、SERVFAIL、REFUSED 或 REJECT 不作为成功结果。
+- 同一上游策略最多同时发起 4 个实际 endpoint 尝试，字面上游和显式来源展开的 endpoint 共用许可；bootstrap/fallback 是独立子查询，不是全链或全局 socket 额度。优先返回有效响应并取消其余尝试。超时、I/O、格式错误、SERVFAIL、REFUSED 或 REJECT 不作为成功结果。
 - 未启用 fallback 或命中 nameserver-policy 时，NXDOMAIN 和 NODATA 是终态。
 - 验证来源、ID 和 question 后，UDP TC 在原期限内改用同一 endpoint 的 TCP。TCP TC 仍是失败响应。
 - 全部上游失败时生成 SERVFAIL；非法 UDP 查询只丢当前数据报。
@@ -294,7 +304,7 @@ Running Session上下文仅弱引用本 session 的 RuntimeDns；业务 IP-only 
 ## 不支持
 
 - 真实 ICMP 转发、ICMP error、Traceroute、ICMP 选路规则或 ICMP 测速；
-- DoQ、DoH HTTP/2/3、显式 system/DHCP nameserver；
+- DoQ、DoH HTTP/2/3；
 - 动态 hosts: lan；
 - 用户可配置的缓存容量、查询总超时、重试或并发度；
 - 使用 DNS question 执行业务规则，或用 DNS 出口改写后续业务动作。

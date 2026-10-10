@@ -119,6 +119,29 @@ stopped -> preparing -> prepared -> starting -> running
 
 参数和幂等语义见“初始化与生命周期”。成功时返回规范化后的 `dataDir`。
 
+### `updateDnsNetwork`
+
+初始化后的运行时级方法，不带 `instanceId`。宿主提供完整、只读的物理网络 DNS 快照；不改变 `start(configYaml)`，不配置接口、路由、DNS 或 App 生命周期。
+
+```json
+{
+  "method": "updateDnsNetwork",
+  "payload": {
+    "generation": 1,
+    "system": [
+      {"address": "192.0.2.53", "interface": "en0", "scopeId": 0, "requiresEncryption": false}
+    ],
+    "dhcp": [
+      {"interface": "en0", "servers": [{"address": "192.0.2.54", "scopeId": 0}], "requiresEncryption": false}
+    ]
+  }
+}
+```
+
+`generation` 必须是正整数并单调增加；相同代次的相同内容幂等，不同内容或较旧代次失败。system/dhcp 必填，空数组撤销来源；一个 DHCP 接口只能出现一次。所有层级拒绝未知字段，metadata 原始 JSON（含内部空白）及规范化快照各限 64 KiB；在完整 JSON Value 解析前通过借用 RawValue 准入，额外 envelope 字节（含外部空白）独立限 64 KiB。这与其他方法沿用的全 envelope 上限不同。地址只接受非回环的单播字面 IP；IPv6 link-local 必须提供匹配物理接口的非零 scopeId，IPv4 scopeId 必须为 0。interface 是 1–256 字节的精确名称或 UWP 的绑定 GUID，不允许控制字符、路径分隔符或首尾空白。scopeId 默认 0，requiresEncryption 默认 false，宿主必须如实标记加密要求，不能将无法确认的数据描述为明文来源。
+
+成功返回 `{}`。快照在同一运行时内共享，优先于 OS 发现，并与全部仍活跃资源代次的 DNS cache/hints 清理共用 epoch 屏障；旧查询不能回填，fake-IP 和活跃流保留。Windows 前台进程和 Session Host 的 runtime registry 各自独立，本方法不提供 IPC。平台可用性和物理绑定见 [DNS 来源](tun-icmp-dns.md#显式系统与-dhcp-来源)。
+
 ### `getGeoDataState`
 
 运行时级只读方法，要求已经初始化：

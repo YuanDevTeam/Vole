@@ -553,7 +553,10 @@ hosts:
 # enable 开启时使用配置的 resolver，不因上游失败回退到系统 DNS。
 # nameserver 默认 [https://doh.pub/dns-query, tls://223.5.5.5:853]，不能显式留空。
 # 支持裸 IP、UDP/TCP、tls://、http(s)://，允许上游域名；DoH 使用 HTTP/1.1 POST，
-# DoT 与 HTTPS 校验证书与名称。default-nameserver 只接受 IP 上游，用于 bootstrap。
+# DoT 与 HTTPS 校验证书与名称。default-nameserver 接受 IP 上游或显式 system，用于 bootstrap。
+# system、system://、dhcp://system 使用物理系统 DNS；dhcp://<精确接口名> 使用该接口的 DHCP DNS。
+# 各角色、policy、fallback 均支持；DHCP 接口不能用于 default-nameserver。来源始终物理直连，
+# 不应用 fragment/代理规则。只读现有网络来源；缺失、加密要求无法满足或物理绑定失败时不可用。
 # rcode://success/format_error/server_failure/name_error/not_implemented/refused 返回本地 RCODE 0–5，
 # 可用于各 nameserver 列表与 policy（default-nameserver 除外）；不建立网络连接或额外设置 RA。
 # 无 fragment 时默认 DIRECT；respect-rules: true 时默认 RULES，且必须配置

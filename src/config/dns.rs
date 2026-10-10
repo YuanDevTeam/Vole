@@ -59,10 +59,12 @@ impl RawDnsConfig {
             DnsRoute::Direct
         };
         let default_nameservers = parse(self.default_nameserver, DnsRoute::Direct)?;
-        if default_nameservers
-            .iter()
-            .any(|server| matches!(server.address, DnsAddress::Domain(_)))
-        {
+        if default_nameservers.iter().any(|server| {
+            matches!(
+                server.address,
+                DnsAddress::Domain(_) | DnsAddress::Source(DnsSource::Dhcp(_))
+            )
+        }) {
             return invalid("default-nameserver requires literal IP addresses");
         }
         let fallback = self
@@ -120,10 +122,32 @@ pub(super) fn parse_dns_nameserver(
 ) -> Result<DnsNameserver> {
     let bad = || {
         VoleError::InvalidConfig(
-            "invalid DNS upstream; supported transports are UDP, TCP, TLS, HTTP(S) and RCODE"
+            "invalid DNS upstream; supported transports are UDP, TCP, TLS, HTTP(S), RCODE, system and DHCP"
                 .into(),
         )
     };
+    // Mihomo's special clients use physical DNS and ignore proxy fragments.
+    let special = input
+        .split_once('#')
+        .map_or(input, |(endpoint, _)| endpoint);
+    let source = match special {
+        "system" | "system://" | "dhcp://system" => Some(DnsSource::System),
+        endpoint if endpoint.starts_with("dhcp://") => {
+            let interface = &endpoint[7..];
+            crate::dns::source::validate_interface(interface).map_err(|_| bad())?;
+            Some(DnsSource::Dhcp(interface.into()))
+        }
+        _ => None,
+    };
+    if let Some(source) = source {
+        return Ok(DnsNameserver {
+            address: DnsAddress::Source(source),
+            transport: DnsTransport::Udp,
+            port: 53,
+            route: DnsRoute::Direct,
+            path: None,
+        });
+    }
     let (endpoint, route) = match input.split_once('#') {
         Some((endpoint, fragment)) => {
             let name = percent_decode(fragment)?;

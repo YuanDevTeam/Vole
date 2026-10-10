@@ -323,6 +323,13 @@ pub enum HostValue {
 pub enum DnsAddress {
     Ip(IpAddr),
     Domain(String),
+    Source(DnsSource),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DnsSource {
+    System,
+    Dhcp(Box<str>),
 }
 
 impl std::str::FromStr for DnsAddress {
@@ -357,6 +364,8 @@ impl std::fmt::Display for DnsAddress {
         match self {
             Self::Ip(ip) => ip.fmt(f),
             Self::Domain(host) => host.fmt(f),
+            Self::Source(DnsSource::System) => f.write_str("system"),
+            Self::Source(DnsSource::Dhcp(_)) => f.write_str("dhcp"),
         }
     }
 }
@@ -6229,6 +6238,47 @@ authentication:
         }
         let config = Config::parse_yaml(b"mixed-port: 1080\ndns: {enable: false, nameserver: ['udp://dns.example', 'https://dns.example/query'], enhanced-mode: redir-host}\n").unwrap();
         assert!(!config.dns.enable);
+    }
+
+    #[test]
+    fn dns_source_aliases_preserve_mihomo_roles_and_bootstrap_rules() {
+        for alias in ["system", "system://", "dhcp://system"] {
+            let yaml = format!(
+                "mixed-port: 1080\ndns:\n  enable: true\n  default-nameserver: ['{alias}']\n  nameserver: ['{alias}#unknown']\n  fallback: ['{alias}']\n  proxy-server-nameserver: ['{alias}']\n  direct-nameserver: ['{alias}']\n  nameserver-policy: {{example.com: '{alias}'}}\n"
+            );
+            let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            for server in config
+                .dns
+                .default_nameservers
+                .iter()
+                .chain(&config.dns.nameservers)
+                .chain(&config.dns.fallback.nameservers)
+                .chain(&config.dns.proxy_nameservers)
+                .chain(&config.dns.direct_nameservers)
+                .chain(config.dns.nameserver_policies[0].nameservers.iter())
+            {
+                assert_eq!(server.address, DnsAddress::Source(DnsSource::System));
+                assert_eq!(server.route, DnsRoute::Direct);
+            }
+        }
+        let parsed = Config::parse_yaml(
+            b"mixed-port: 1080\ndns: {nameserver: ['dhcp://physical0#unknown']}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.dns.nameservers[0].address,
+            DnsAddress::Source(DnsSource::Dhcp("physical0".into()))
+        );
+        for invalid in ["dhcp://", "dhcp://physical0/", "system://physical0"] {
+            let yaml = format!("mixed-port: 1080\ndns: {{nameserver: ['{invalid}']}}\n");
+            assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
+        }
+        assert!(
+            Config::parse_yaml(
+                b"mixed-port: 1080\ndns: {default-nameserver: ['dhcp://physical0']}\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]

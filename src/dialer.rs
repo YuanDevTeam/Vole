@@ -368,6 +368,11 @@ struct InterfaceBinding {
 
 #[derive(Clone)]
 pub struct Dialer {
+    dns_sources: Arc<crate::dns::source::NetworkSources>,
+    dns_binding: Option<crate::dns::source::DnsBinding>,
+    dns_tun_interface: Option<Arc<str>>,
+    #[cfg(all(windows, feature = "windows-uwp"))]
+    physical_adapter: Option<Arc<str>>,
     #[cfg(all(target_os = "linux", feature = "tun"))]
     linux_policy: Option<Arc<crate::platform::linux_network::SocketPolicy>>,
     ip_version: crate::config::IpVersion,
@@ -385,6 +390,7 @@ impl std::fmt::Debug for Dialer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = formatter.debug_struct("Dialer");
         debug
+            .field("has_dns_binding", &self.dns_binding.is_some())
             .field("has_protector", &self.protector.is_some())
             .field("source_binding", &self.source_binding);
         #[cfg(all(windows, feature = "windows-uwp"))]
@@ -399,6 +405,11 @@ impl std::fmt::Debug for Dialer {
 impl Default for Dialer {
     fn default() -> Self {
         Self {
+            dns_sources: Arc::new(crate::dns::source::NetworkSources::default()),
+            dns_binding: None,
+            dns_tun_interface: None,
+            #[cfg(all(windows, feature = "windows-uwp"))]
+            physical_adapter: None,
             #[cfg(all(target_os = "linux", feature = "tun"))]
             linux_policy: None,
             ip_version: crate::config::IpVersion::Dual,
@@ -415,6 +426,176 @@ impl Default for Dialer {
 }
 
 impl Dialer {
+    pub(crate) fn with_dns_sources(
+        mut self,
+        sources: Arc<crate::dns::source::NetworkSources>,
+    ) -> Self {
+        self.dns_sources = sources;
+        self
+    }
+    pub(crate) fn dns_sources(&self) -> Arc<crate::dns::source::NetworkSources> {
+        self.dns_sources.clone()
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn with_dns_tun_interface(mut self, interface: Option<Arc<str>>) -> Self {
+        self.dns_tun_interface = interface;
+        self
+    }
+    pub(crate) fn dns_tun_interface(&self) -> Option<Arc<str>> {
+        self.dns_tun_interface.clone()
+    }
+    pub(crate) fn for_dns_source(
+        &self,
+        binding: crate::dns::source::DnsBinding,
+        endpoint: SocketAddr,
+    ) -> io::Result<Self> {
+        #[cfg(all(windows, feature = "windows-uwp"))]
+        if self.physical_adapter.as_deref() != Some(binding.interface.as_ref())
+            || self.interface_binding.is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "DNS source is outside the physical network binding",
+            ));
+        }
+        #[cfg(all(windows, feature = "windows-uwp"))]
+        if let SocketAddr::V6(endpoint) = endpoint
+            && endpoint.scope_id() != 0
+            && self
+                .interface_binding
+                .and_then(|binding| binding.ipv6.map(|(_, index)| index.get()))
+                != Some(endpoint.scope_id())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DNS source scope does not match its binding",
+            ));
+        }
+        let _ = endpoint;
+        #[cfg(any(target_os = "android", all(windows, not(feature = "windows-uwp"))))]
+        let _ = binding;
+        #[cfg(any(target_os = "android", all(windows, not(feature = "windows-uwp"))))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "exact physical DNS interface binding is unavailable",
+        ));
+        #[cfg(not(any(target_os = "android", all(windows, not(feature = "windows-uwp")))))]
+        {
+            let mut dialer = self.clone();
+            dialer.dns_binding = Some(binding);
+            Ok(dialer)
+        }
+    }
+    #[cfg(all(windows, feature = "windows-uwp"))]
+    pub(crate) fn with_physical_adapter(mut self, adapter: Arc<str>) -> Self {
+        self.physical_adapter = Some(adapter);
+        self
+    }
+    #[cfg(all(windows, feature = "windows-uwp"))]
+    pub(crate) fn physical_dns_adapter(&self) -> Option<Arc<str>> {
+        self.physical_adapter.clone()
+    }
+    #[cfg(any(target_os = "linux", all(windows, feature = "windows-uwp")))]
+    pub(crate) async fn run_dns_discovery<T, F>(&self, operation: F) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn Fn() -> io::Result<()>) -> io::Result<T> + Send + 'static,
+    {
+        self.initialization.run(operation).await
+    }
+    #[cfg(unix)]
+    fn apply_dns_binding(&self, socket: &impl AsRawFd, destination: SocketAddr) -> io::Result<()> {
+        let _ = socket;
+        let Some(binding) = &self.dns_binding else {
+            #[cfg(all(target_os = "linux", feature = "tun"))]
+            if let Some(policy) = &self.linux_policy {
+                return policy.apply(socket, destination);
+            }
+            return Ok(());
+        };
+        let name = std::ffi::CString::new(binding.interface.as_ref())
+            .map_err(|_| io::ErrorKind::InvalidInput)?;
+        // SAFETY: `name` is terminated and only inspected by the kernel.
+        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        if index == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "DNS source interface disappeared",
+            ));
+        }
+        if binding
+            .interface_index
+            .is_some_and(|expected| expected.get() != index)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "DNS source interface generation changed",
+            ));
+        }
+        if let SocketAddr::V6(address) = destination
+            && address.scope_id() != 0
+            && address.scope_id() != index
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DNS source scope does not match its interface",
+            ));
+        }
+        #[cfg(all(target_os = "linux", feature = "tun"))]
+        if let Some(policy) = &self.linux_policy {
+            return policy.apply_with_interface(
+                socket,
+                destination,
+                Some(binding.interface.as_ref()),
+            );
+        }
+        #[cfg(target_os = "linux")]
+        let status = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                name.as_ptr().cast(),
+                name.as_bytes_with_nul().len() as libc::socklen_t,
+            )
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        let status = {
+            let (level, option) = if destination.is_ipv6() {
+                (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
+            } else {
+                (libc::IPPROTO_IP, libc::IP_BOUND_IF)
+            };
+            // SAFETY: the option is a live u32 and socket is initialized here.
+            unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    level,
+                    option,
+                    (&raw const index).cast(),
+                    std::mem::size_of_val(&index) as libc::socklen_t,
+                )
+            }
+        };
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos"
+        )))]
+        return Err(io::ErrorKind::Unsupported.into());
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos"
+        ))]
+        if status < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
     pub(crate) fn with_connections(mut self, settings: crate::config::ConnectionSettings) -> Self {
         self.connections = settings;
         self
@@ -573,10 +754,8 @@ impl Dialer {
                 socket.set_nonblocking(true)?;
                 check()?;
                 dialer.protect_socket(&socket)?;
-                #[cfg(all(target_os = "linux", feature = "tun"))]
-                if let Some(policy) = &dialer.linux_policy {
-                    policy.apply(&socket, destination)?;
-                }
+                #[cfg(unix)]
+                dialer.apply_dns_binding(&socket, destination)?;
                 check()?;
                 Ok((std::net::UdpSocket::from(socket), guard))
             })
@@ -686,10 +865,8 @@ impl Dialer {
                 check()?;
                 dialer.connections.apply(&socket2::SockRef::from(&socket))?;
                 dialer.protect_socket(&socket)?;
-                #[cfg(all(target_os = "linux", feature = "tun"))]
-                if let Some(policy) = &dialer.linux_policy {
-                    policy.apply(&socket, address)?;
-                }
+                #[cfg(unix)]
+                dialer.apply_dns_binding(&socket, address)?;
                 check()?;
                 #[cfg(all(windows, feature = "windows-uwp"))]
                 dialer.apply_interface_binding(socket.as_raw_socket(), address)?;

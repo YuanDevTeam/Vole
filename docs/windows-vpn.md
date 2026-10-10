@@ -153,6 +153,8 @@ Session Host 的每个非回环出站 socket 必须同时应用：
 
 `AssociateTransport` 只用于 Provider 的受管理唤醒传输，不用于普通代理流。Session Host 不持有 `VpnChannel`，不能给逐流 socket 获取同类豁免。
 
+显式 `system` DNS 仅由实际 Session Host 在显式查询按需读取既有物理适配器 GUID 的 DNS 数据（metadata 缓存 20 秒），继续执行同一 `(源 IP, 接口索引)` 绑定；不读取前台 Invoke registry，也不改变控制协议。`GetInterfaceDnsSettings` v3 不可用或存在无法满足的加密要求时来源不可用。原生 IPv6 DNS 的加密策略无法通过该只读查询确认，也保持不可用。无法确认 DHCP option 6 来源时 `dhcp://<接口>` 不可用。系统 DNS 发现不配置或恢复系统网络，App 仍负责原有网络设置和生命周期。
+
 ## 网络变化
 
 Provider 是物理网络状态的唯一权威，并订阅 `NetworkStatusChanged`。事件到达后等待 2 秒，再复验适配器 GUID、选定源地址、全部去重 on-link prefixes 和 network identity；任一项变化就停止当前 VPN。

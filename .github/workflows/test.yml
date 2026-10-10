@@ -189,6 +189,7 @@ jobs:
             resource::http::tests:: fake_ip_ sniffing::tests:: tcp_sniffer::tests::
             dns::fallback::tests:: dns::runtime::tests::dns_fallback_
             dns::runtime::tests::resolve_ipv6_
+            dns::source::tests:: dns::runtime::tests::dns_source_
             dns::runtime::encrypted_tests::
             outbound::http::tests:: inbound::mixed::tests:: inbound::socks5::association::tests::
             inbound::http::parser::tests:: inbound::http::framing::tests::
@@ -213,6 +214,8 @@ jobs:
             invoke::tests::envelope_and_payload_are_strict
             invoke::tests::runtime_thread_cannot_reenter_invoke
             invoke::tests::engine_workers_preserve_invoke_admission_and_shutdown
+            invoke::tests::update_dns_network_raw_admission_is_bounded_before_value_or_registry_work
+            invoke::tests::update_dns_network_is_runtime_local_strict_and_monotonic
             invoke::tests::engine_completion_notifies_after_panic_and_join_reports_failure
             dns::runtime::tests::subrule_dns_rules_keep_round_robin_for_new_physical_connections
             dns::runtime::tests::runtime_dns_separates_bootstrap_proxy_direct_and_hosts

@@ -95,6 +95,7 @@ struct RuntimeRegistry {
 struct RuntimeData {
     directory: Arc<DataDirectory>,
     geodata: Arc<GeoDataManager>,
+    dns_sources: Arc<crate::dns::source::NetworkSources>,
 }
 
 impl Default for RuntimeRegistry {
@@ -444,6 +445,7 @@ impl RuntimeRegistry {
         *current = Some(RuntimeData {
             directory: initialized.clone(),
             geodata,
+            dns_sources: Arc::new(crate::dns::source::NetworkSources::default()),
         });
         Ok(initialized)
     }
@@ -470,6 +472,12 @@ impl RuntimeRegistry {
             })
     }
 
+    fn dns_sources(&self) -> Result<Arc<crate::dns::source::NetworkSources>, InvokeFailure> {
+        lock(&self.runtime_data)
+            .as_ref()
+            .map(|data| data.dns_sources.clone())
+            .ok_or_else(|| InvokeFailure::invalid_state("Vole dataDir is not initialized"))
+    }
     fn create_instance(&self) -> Result<Arc<CoreController>, InvokeFailure> {
         let mut inner = lock(&self.inner);
         if inner.instance.is_some() {
@@ -651,6 +659,47 @@ fn invoke_instance_guarded<T>(
     }
 }
 
+// Borrow the envelope to enforce the small network-metadata admission bound
+// before materializing its JSON Value. Other methods retain their own schema.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRequestEnvelope<'a> {
+    #[serde(borrow)]
+    method: &'a serde_json::value::RawValue,
+    #[serde(borrow)]
+    payload: &'a serde_json::value::RawValue,
+    #[serde(rename = "instanceId", default, borrow)]
+    _instance_id: Option<&'a serde_json::value::RawValue>,
+}
+
+fn check_dns_network_envelope(request: &str) -> Result<(), InvokeFailure> {
+    let raw: RawRequestEnvelope<'_> =
+        serde_json::from_str(request).map_err(InvokeFailure::invalid_request)?;
+    // An ASCII method's JSON spelling can use at most six bytes per letter.
+    // Decode only that bounded scalar; never search request/config contents.
+    if raw.method.get().len() > 6 * "updateDnsNetwork".len() + 2 {
+        return Ok(());
+    }
+    let is_update = serde_json::from_str::<String>(raw.method.get())
+        .is_ok_and(|method| method == "updateDnsNetwork");
+    if !is_update {
+        return Ok(());
+    }
+    let bytes = raw.payload.get().len();
+    if bytes > crate::dns::source::MAX_METADATA_BYTES {
+        return Err(InvokeFailure::invalid_request(
+            "DNS network metadata exceeds 64 KiB",
+        ));
+    }
+    const MAX_DNS_ENVELOPE_OVERHEAD: usize = 64 * 1024;
+    if request.len() - bytes > MAX_DNS_ENVELOPE_OVERHEAD {
+        return Err(InvokeFailure::invalid_request(
+            "DNS network envelope overhead exceeds 64 KiB",
+        ));
+    }
+    Ok(())
+}
+
 fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
     if request.len() > MAX_INVOKE_BYTES {
         return Err(InvokeFailure::invalid_request(format!(
@@ -659,6 +708,7 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
     }
     let request = str::from_utf8(request)
         .map_err(|_| InvokeFailure::invalid_request("request is not valid UTF-8"))?;
+    check_dns_network_envelope(request)?;
     let envelope: RequestEnvelope =
         serde_json::from_str(request).map_err(InvokeFailure::invalid_request)?;
     if !envelope.payload.is_object() {
@@ -671,6 +721,20 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
             let payload: InitializePayload = decode_payload(envelope.payload)?;
             let directory = registry().initialize_data_directory(&payload.data_dir)?;
             json!({"dataDir": directory.root().to_string_lossy()})
+        }
+        "updateDnsNetwork" => {
+            require_instance_omitted(&envelope)?;
+            crate::dns::source::check_metadata_size(&envelope.payload)
+                .map_err(InvokeFailure::from)?;
+            let update: crate::dns::source::DnsNetworkUpdate = decode_payload(envelope.payload)?;
+            let sources = registry().dns_sources()?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .map_err(InvokeFailure::from)?;
+            runtime
+                .block_on(sources.replace(update))
+                .map_err(InvokeFailure::from)?;
+            json!({})
         }
         "createInstance" => {
             require_instance_omitted(&envelope)?;
@@ -930,7 +994,8 @@ impl CoreController {
             .clone()
             .map_or_else(Dialer::default, |protector| {
                 Dialer::default().with_protector(protector)
-            });
+            })
+            .with_dns_sources(registry().dns_sources()?);
         let (stop_tx, stop_rx) = oneshot::channel();
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
         let (completed_tx, completed_rx) = tokio::sync::watch::channel(false);
@@ -1993,6 +2058,72 @@ rules:
         .unwrap();
         unsafe { VoleFree(oversized_response) };
         assert_failure(&oversized_json);
+    }
+
+    #[test]
+    fn update_dns_network_raw_admission_is_bounded_before_value_or_registry_work() {
+        let padded = format!(
+            "{{{}\"generation\":1,\"system\":[],\"dhcp\":[]}}",
+            " ".repeat(crate::dns::source::MAX_METADATA_BYTES)
+        );
+        for method in ["updateDnsNetwork", r"\u0075pdateDnsNetwork"] {
+            let envelope = format!(r#"{{"payload":{padded},"method":"{method}"}}"#);
+            let response = invoke(&envelope);
+            assert_failure(&response);
+            assert_eq!(
+                response["error"],
+                "invalid request: DNS network metadata exceeds 64 KiB"
+            );
+        }
+        let overhead = format!(
+            r#"{{"method":"updateDnsNetwork","payload":{{}},"instanceId":"{}"}}"#,
+            "x".repeat(64 * 1024)
+        );
+        assert!(check_dns_network_envelope(&overhead).is_err());
+        let unrelated = json!({"method":"validateConfig","payload":{"configYaml":"updateDnsNetwork".repeat(8192)}}).to_string();
+        assert!(check_dns_network_envelope(&unrelated).is_ok());
+    }
+
+    #[test]
+    fn update_dns_network_is_runtime_local_strict_and_monotonic() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_registry();
+        let payload = json!({"generation":1,"system":[{"address":"203.0.113.53","interface":"physical0"}],"dhcp":[]});
+        assert_failure(&request("updateDnsNetwork", None, payload.clone()));
+        let _data = initialize_test_data_directory();
+        assert_eq!(
+            request("updateDnsNetwork", None, payload.clone())["success"],
+            true
+        );
+        assert_eq!(
+            request("updateDnsNetwork", None, payload.clone())["success"],
+            true
+        );
+        assert_failure(&request("updateDnsNetwork", Some("1"), payload));
+        assert_failure(&request(
+            "updateDnsNetwork",
+            None,
+            json!({"generation":1,"system":[],"dhcp":[]}),
+        ));
+        assert_eq!(
+            request(
+                "updateDnsNetwork",
+                None,
+                json!({"generation":2,"system":[],"dhcp":[]})
+            )["success"],
+            true
+        );
+        assert_failure(&request(
+            "updateDnsNetwork",
+            None,
+            json!({"generation":1,"system":[],"dhcp":[]}),
+        ));
+        assert_failure(&request(
+            "updateDnsNetwork",
+            None,
+            json!({"generation":3,"system":[],"dhcp":[],"extra":true}),
+        ));
+        reset_registry();
     }
 
     #[test]

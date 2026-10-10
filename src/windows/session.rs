@@ -324,9 +324,9 @@ async fn start_vole(
         }
     });
 
-    let running = prepared
-        .start_tun(tun, dialer_from_binding(&binding)?)
-        .await?;
+    let dialer =
+        dialer_from_binding(&binding)?.with_physical_adapter(binding.adapter_id.as_str().into());
+    let running = prepared.start_tun(tun, dialer).await?;
     Ok((running, tasks))
 }
 
