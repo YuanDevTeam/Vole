@@ -275,9 +275,12 @@ impl ProviderRuntime {
             .store_dir()
             .parent()
             .map(std::path::Path::to_path_buf);
+        let expression_cancellation = self.cancellation.clone();
         let prepared = tokio::task::spawn_blocking(
             move || -> io::Result<(Config, BuiltRuntimeParts, GeoRequirements)> {
-                let mut config = template.materialize(&contents).map_err(io::Error::other)?;
+                let mut config = template
+                    .materialize_with_cancel(&contents, Some(&expression_cancellation))
+                    .map_err(io::Error::other)?;
                 let requirements =
                     GeoRequirements::for_config(&config).map_err(io::Error::other)?;
                 let rules = RuleSet::compile_config(&mut config).map_err(io::Error::other)?;
@@ -716,7 +719,7 @@ mod tests {
             br#"
 mixed-port: 1080
 proxy-providers:
-  remote: {type: file, path: nodes.yaml}
+  remote: {type: file, path: nodes.yaml, filter: '(?=.)'}
 proxy-groups:
   - {name: choice, type: select, use: [remote]}
 dns:
@@ -781,6 +784,9 @@ rules: ['MATCH,choice']
         assert!(live.update(0).await.is_err());
         assert_eq!(live.groups().state("choice").unwrap().now, "new-node");
         assert!(live.providers(false)["providers"]["remote"]["error"].is_string());
+        std::fs::write(&file, payload(&"x".repeat(4097))).unwrap();
+        assert!(live.update(0).await.is_err());
+        assert_eq!(live.groups().state("choice").unwrap().now, "new-node");
         drop(old_session);
         live.reap().await;
         assert!(weak.upgrade().is_none());

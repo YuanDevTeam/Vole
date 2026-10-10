@@ -458,7 +458,9 @@ proxies:
 # select/url-test/fallback/load-balance 组支持静态 proxies 与动态 use；include-all 同时包含静态节点和所有 providers，
 # 也可分别使用 include-all-proxies / include-all-providers。后者启用时忽略 use。
 # filter 筛选动态成员；exclude-filter / exclude-type 同时排除显式成员。
-# 正则支持 Rust regex 子集，区分大小写；反引号分隔的多表达式按匹配顺序排列。
+# 名称正则区分大小写；支持 lookahead、定长 lookbehind、数字/命名 backreference。
+# 反引号分隔的多表达式按匹配顺序排列。节点改名使用 $1 / ${name} / $$ 等 .NET replacement。
+# 复杂表达式有内部编译/执行预算；失败候选保留旧资源，不静默当不匹配。
 # lookaround/backreference 明确拒绝。静态成员保留顺序与重复项。
 # 动态组为空时使用 empty-fallback（缺省 COMPATIBLE，即 DIRECT），可指定节点或内置目标。
 # disable-udp 缺省 false；true 禁用该组的业务 UDP。规则模式跳过不支持 UDP 的目标，

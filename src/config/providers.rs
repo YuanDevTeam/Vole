@@ -1,4 +1,5 @@
 //! Provider declarations and deterministic materialization of one resource generation.
+use super::name_regex::{Budget, NameRegex};
 use super::*;
 use serde::Deserialize;
 use serde_yaml_ng::{Mapping, Value};
@@ -263,6 +264,15 @@ impl ProviderTemplate {
         }
     }
     pub fn materialize(self: &Arc<Self>, contents: &ProviderContents) -> Result<Config> {
+        self.materialize_with_cancel(contents, None)
+    }
+    pub(crate) fn materialize_with_cancel(
+        self: &Arc<Self>,
+        contents: &ProviderContents,
+        cancellation: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Config> {
+        let mut budget = Budget::new(cancellation);
+        budget.check()?;
         let mut value = self.base.clone();
         let base = value.as_mapping_mut().expect("validated mapping");
         let mut proxies: Vec<Value> = base
@@ -281,7 +291,7 @@ impl ProviderTemplate {
                 return invalid("provider content kind mismatch");
             };
             let filter = Filter::new(&spec.filter, &spec.exclude_filter, &spec.exclude_type)?;
-            let nodes = filter.select(nodes.clone(), false)?;
+            let nodes = filter.select(nodes.clone(), &mut budget)?;
             let mut names = Vec::new();
             for mut node in nodes {
                 if !spec.dialer_proxy.is_empty() {
@@ -291,7 +301,7 @@ impl ProviderTemplate {
                         })?
                         .insert("dialer-proxy".into(), spec.dialer_proxy.clone().into());
                 }
-                apply_overrides(&mut node, &spec.overrides)?;
+                apply_overrides(&mut node, &spec.overrides, &mut budget)?;
                 names.push(node_name(&node)?);
                 proxies.push(node);
             }
@@ -346,29 +356,36 @@ impl ProviderTemplate {
                 let dynamic = !used.is_empty() || all_proxies || all_providers;
                 let mut names = declared;
                 if all_proxies {
-                    names.extend(
-                        static_names
-                            .iter()
-                            .filter(|name| filter.includes(name))
-                            .cloned(),
-                    );
+                    for name in &static_names {
+                        if filter.includes(name, &mut budget)? {
+                            names.push(name.clone());
+                        }
+                    }
                 }
                 let mut dynamic_names = Vec::new();
                 for provider in &used {
                     let members = providers.get(provider).ok_or_else(|| {
                         VoleError::InvalidConfig(format!("unknown proxy provider `{provider}`"))
                     })?;
-                    dynamic_names
-                        .extend(members.iter().filter(|name| filter.includes(name)).cloned());
+                    for name in members {
+                        if filter.includes(name, &mut budget)? {
+                            dynamic_names.push(name.clone());
+                        }
+                    }
                 }
-                filter.sort_matches(&mut dynamic_names);
+                filter.sort_matches(&mut dynamic_names, &mut budget)?;
                 names.extend(dynamic_names);
-                names.retain(|name| {
-                    !filter.excludes(
-                        name,
-                        types.get(name).map(String::as_str).unwrap_or("Selector"),
-                    )
-                });
+                let mut selected = Vec::with_capacity(names.len());
+                for name in names {
+                    if !filter.excludes(
+                        &name,
+                        types.get(&name).map(String::as_str).unwrap_or("Selector"),
+                        &mut budget,
+                    )? {
+                        selected.push(name);
+                    }
+                }
+                let mut names = selected;
                 if names.is_empty() {
                     if !dynamic {
                         return invalid("proxy group requires proxies or use");
@@ -525,17 +542,17 @@ fn node_name(value: &Value) -> Result<String> {
 }
 
 struct Filter {
-    include: Vec<regex::Regex>,
-    exclude: Vec<regex::Regex>,
+    include: Vec<NameRegex>,
+    exclude: Vec<NameRegex>,
     types: Vec<String>,
 }
 impl Filter {
     fn new(include: &str, exclude: &str, types: &str) -> Result<Self> {
-        let compile = |s: &str| -> Result<Vec<regex::Regex>> {
+        let compile = |s: &str| -> Result<Vec<NameRegex>> {
             if s.is_empty() {
                 return Ok(Vec::new());
             }
-            s.split('`').map(|pattern| regex::Regex::new(pattern).map_err(|_| VoleError::InvalidConfig("unsupported provider/group regular expression (lookaround and backreferences are not supported)".into()))).collect()
+            s.split('`').map(NameRegex::new).collect()
         };
         Ok(Self {
             include: compile(include)?,
@@ -547,48 +564,64 @@ impl Filter {
                 .collect(),
         })
     }
-    fn includes(&self, name: &str) -> bool {
-        self.include.is_empty() || self.include.iter().any(|r| r.is_match(name))
-    }
-    fn excludes(&self, name: &str, kind: &str) -> bool {
-        self.exclude.iter().any(|r| r.is_match(name))
-            || self
-                .types
-                .iter()
-                .any(|ty| ty.eq_ignore_ascii_case(protocol_type(kind)))
-    }
-    fn sort_matches(&self, names: &mut Vec<String>) {
-        if self.include.len() > 1 {
-            names.sort_by_key(|name| {
-                self.include
-                    .iter()
-                    .position(|r| r.is_match(name))
-                    .unwrap_or(usize::MAX)
-            });
-            let mut seen = HashSet::new();
-            names.retain(|name| seen.insert(name.clone()));
+    fn match_index(&self, name: &str, budget: &mut Budget<'_>) -> Result<Option<usize>> {
+        if self.include.is_empty() {
+            return Ok(Some(0));
         }
+        for (index, regex) in self.include.iter().enumerate() {
+            if regex.is_match(name, budget)? {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
     }
-    fn select(&self, nodes: Vec<Value>, _group: bool) -> Result<Vec<Value>> {
+    fn includes(&self, name: &str, budget: &mut Budget<'_>) -> Result<bool> {
+        Ok(self.match_index(name, budget)?.is_some())
+    }
+    fn excludes(&self, name: &str, kind: &str, budget: &mut Budget<'_>) -> Result<bool> {
+        for regex in &self.exclude {
+            if regex.is_match(name, budget)? {
+                return Ok(true);
+            }
+        }
+        Ok(self
+            .types
+            .iter()
+            .any(|ty| ty.eq_ignore_ascii_case(protocol_type(kind))))
+    }
+    fn sort_matches(&self, names: &mut Vec<String>, budget: &mut Budget<'_>) -> Result<()> {
+        if self.include.len() > 1 {
+            let mut keyed = names
+                .drain(..)
+                .map(|name| Ok((self.match_index(&name, budget)?.unwrap_or(usize::MAX), name)))
+                .collect::<Result<Vec<_>>>()?;
+            keyed.sort_by_key(|(index, _)| *index);
+            let mut seen = HashSet::new();
+            names.extend(
+                keyed
+                    .into_iter()
+                    .map(|(_, name)| name)
+                    .filter(|name| seen.insert(name.clone())),
+            );
+        }
+        Ok(())
+    }
+    fn select(&self, nodes: Vec<Value>, budget: &mut Budget<'_>) -> Result<Vec<Value>> {
         let mut result = Vec::new();
         for node in nodes {
+            budget.check()?;
             let name = node_name(&node)?;
             let kind = node.get("type").and_then(Value::as_str).unwrap_or_default();
-            if self.includes(&name) && !self.excludes(&name, kind) {
-                result.push(node);
+            if !self.excludes(&name, kind, budget)?
+                && let Some(index) = self.match_index(&name, budget)?
+            {
+                result.push((index, node));
             }
         }
         if self.include.len() > 1 {
-            result.sort_by_key(|node| {
-                self.include
-                    .iter()
-                    .position(|r| {
-                        r.is_match(node.get("name").and_then(Value::as_str).unwrap_or_default())
-                    })
-                    .unwrap_or(usize::MAX)
-            });
+            result.sort_by_key(|(index, _)| *index);
         }
-        Ok(result)
+        Ok(result.into_iter().map(|(_, node)| node).collect())
     }
 }
 fn protocol_type(kind: &str) -> &str {
@@ -615,11 +648,7 @@ fn validate_overrides(overrides: &BTreeMap<String, Value>) -> Result<()> {
                         VoleError::InvalidConfig("invalid provider name replacements".into())
                     })?;
                 for replacement in replacements {
-                    regex::Regex::new(&replacement.pattern).map_err(|_| {
-                        VoleError::InvalidConfig(
-                            "unsupported provider name replacement expression".into(),
-                        )
-                    })?;
+                    NameRegex::new(&replacement.pattern)?;
                 }
                 true
             }
@@ -631,7 +660,11 @@ fn validate_overrides(overrides: &BTreeMap<String, Value>) -> Result<()> {
     }
     Ok(())
 }
-fn apply_overrides(node: &mut Value, overrides: &BTreeMap<String, Value>) -> Result<()> {
+fn apply_overrides(
+    node: &mut Value,
+    overrides: &BTreeMap<String, Value>,
+    budget: &mut Budget<'_>,
+) -> Result<()> {
     let original_name = node_name(node)?;
     let map = node
         .as_mapping_mut()
@@ -668,12 +701,8 @@ fn apply_overrides(node: &mut Value, overrides: &BTreeMap<String, Value>) -> Res
         let replacements: Vec<Replacement> = serde_yaml_ng::from_value(replacements.clone())
             .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
         for replacement in replacements {
-            let regex = regex::Regex::new(&replacement.pattern).map_err(|_| {
-                VoleError::InvalidConfig("unsupported provider name replacement expression".into())
-            })?;
-            name = regex
-                .replace_all(&name, replacement.target.as_str())
-                .into_owned();
+            let regex = NameRegex::new(&replacement.pattern)?;
+            name = regex.replace(&name, &replacement.target, budget)?;
         }
     }
     let text = |key| -> Result<&str> {
@@ -702,6 +731,56 @@ fn apply_overrides(node: &mut Value, overrides: &BTreeMap<String, Value>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_and_group_name_expressions_materialize_real_templates() {
+        let config = Config::parse_yaml(
+            r#"
+mixed-port: 1080
+proxy-providers:
+  nodes:
+    type: inline
+    filter: '^(?!.*(流量|到期)).*(HK|SG)'
+    exclude-filter: '(?<=HK-)99$'
+    override:
+      proxy-name:
+        - {pattern: '(?<=HK-)(\d+)', target: '${1}x'}
+    payload:
+      - {name: HK-01, type: socks5, server: 192.0.2.1, port: 1080}
+      - {name: HK-99, type: socks5, server: 192.0.2.1, port: 1080}
+      - {name: SG-SG, type: socks5, server: 192.0.2.1, port: 1080}
+      - {name: SG-SG到期, type: socks5, server: 192.0.2.1, port: 1080}
+proxy-groups:
+  - {name: choose, type: select, use: [nodes], filter: '^(SG)-\1$`HK', exclude-filter: '(?<=HK-)02'}
+"#
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .proxies
+                .iter()
+                .map(|p| p.tag.as_str())
+                .collect::<Vec<_>>(),
+            ["HK-01x", "SG-SG"]
+        );
+        assert_eq!(
+            config.proxy_groups[0]
+                .members
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            ["SG-SG", "HK-01x"]
+        );
+        let template = config.providers.unwrap();
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            template
+                .materialize_with_cancel(&ProviderContents::new(), Some(&cancelled))
+                .is_err()
+        );
+    }
+
     #[test]
     fn provider_dialer_and_certificate_overrides_materialize_in_reference_order() {
         for (kind, source) in [

@@ -97,6 +97,7 @@ blake3 = { version = "=1.8.7", optional = true }
 boring = { git = "https://github.com/YuanDevTeam/boring", branch = "release", version = "=5.2.0", features = ["client-fingerprint"], optional = true }
 bytes = "1"
 crc32fast = { version = "1.5.2", optional = true }
+fancy-regex = { version = "=0.19.2", default-features = false, features = ["std", "unicode"] }
 futures-util = { version = "0.3", features = ["sink"] }
 h2 = "0.4.19"
 h3 = { version = "=0.0.8", default-features = false, optional = true }

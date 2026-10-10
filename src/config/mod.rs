@@ -35,6 +35,7 @@ use uuid::Uuid;
 use crate::{Result, VoleError};
 
 mod dns;
+mod name_regex;
 pub mod providers;
 mod rule_provider;
 pub(crate) mod rules;

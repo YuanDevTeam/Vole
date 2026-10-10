@@ -20,9 +20,12 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 
 - 业务入口只有 mixed-port 与 TUN；不支持 port、socks-port、listeners、redir/tproxy 或服务端协议配置。
 - Shadowsocks 只支持三个 2022 cipher；插件仅 strict ShadowTLS v3，UoT 仅 v2。
-- DNS 不提供独立 listen、DoQ、DoH/H3、ECS、system/DHCP nameserver 或可配置 ARC 缓存。
+- DNS 不提供独立 listen、DoQ、DoH/H3 或 ECS。LRU/ARC 与显式 system/DHCP 上游已支持，
+  来源发现和物理绑定的可用平台及参考差异以 DNS 契约为准。
   DoH 使用 H1 POST；详细解析角色、缓存与过滤行为见 [DNS 契约](tun-icmp-dns.md)。
-- 正则使用 Rust regex 子集，明确拒绝 lookaround/backreference。规则与 provider 的协议覆盖仅限已实现字段。
+- Provider/group 名称筛选和改名支持 lookahead、定长 lookbehind、数字/命名 backreference；
+  普通表达式保留 Rust regex 快速路径。复杂表达式和改名有内部预算，超限使候选失败。
+  不支持递归/条件式或完整 .NET 方言；DOMAIN-REGEX 与 GeoSite regex 不扩展。
 - gRPC 三协议共用选项和节点连接池。负 ping-interval 明确拒绝，不复制固定参考
   HTTP/2 客户端的立即重复 PING；超出本机可表示期限的正秒数也明确拒绝，不复制 Duration 溢出。
 - 订阅元信息只在成功候选或合法 304 后发布，失败响应或坏候选保留旧值；

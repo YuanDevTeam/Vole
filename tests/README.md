@@ -12,6 +12,7 @@ cargo test --locked --all-features --all-targets --no-run
 cargo test --locked --no-default-features --features cli --bin vole cli::tests::
 cargo test --locked --no-default-features --features cli --lib invoke::foreground::tests::
 cargo test --locked --lib config::tests::
+cargo test --locked --lib config::name_regex::tests::
 cargo test --locked --lib config::tls_policy_tests::
 cargo test --locked --no-default-features --features cli --test grpc_config --test grpc_pool --test grpc_protocol_pool
 cargo test --locked --no-default-features --features cli --lib grpc_duplex_pool_keeps_response

@@ -170,6 +170,16 @@ IP-only协议接点持有`ResolutionContext`，runtime DNS通过Weak绑定，不
 
 完整接口见 [运行时 Controller](controller-api.md)。
 
+## Provider 名称表达式
+
+普通筛选表达式继续使用线性时间的 `regex`。必要的 lookaround/backreference 使用
+`fancy-regex`，限制复杂源码 4 KiB、AST 512 节点/32 层、有限重复数 4096、委托编译和
+DFA 缓存各 512 KiB；不接受递归、条件式和控制动词。每次复杂匹配最多 10,000 回溯，
+输入名称最多 4 KiB。一次候选共享最多 10,000 次复杂匹配/改名匹配和 100 ms 执行窗口；
+改名输出最多 64 KiB，后续表达式继续计费。单次库调用不能中途抢占，调用间检查取消。
+编译、预算、运行错误与取消均使候选失败，保留当前资源和 HTTP 缓存，不静默漏选节点。
+这些边界仅用于名称表达式，不改变 GeoData/DOMAIN-REGEX 或业务连接准入。
+
 ## GeoData
 
 - 所有平台完整加载被引用分类的所选记录，不设记录条数硬上限或截断；GeoIP 与 GeoSite 没有优先额度分配。
