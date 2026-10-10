@@ -2,11 +2,11 @@ use super::*;
 use crate::dispatch::DatagramTransport;
 use async_trait::async_trait;
 
-struct Peer {
-    tls: Arc<rustls::ServerConfig>,
-    https: bool,
-    opens: AtomicUsize,
-    tasks: StdMutex<Vec<tokio::task::JoinHandle<()>>>,
+pub(super) struct Peer {
+    pub(super) tls: Arc<rustls::ServerConfig>,
+    pub(super) https: bool,
+    pub(super) opens: AtomicUsize,
+    pub(super) tasks: StdMutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 #[async_trait]
 impl Dispatcher for Peer {
@@ -61,7 +61,7 @@ impl Dispatcher for Peer {
     }
 }
 impl Peer {
-    async fn join(&self) {
+    pub(super) async fn join(&self) {
         let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
         for task in tasks {
             task.await.unwrap();

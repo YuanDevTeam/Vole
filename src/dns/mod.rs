@@ -14,6 +14,8 @@ mod http2;
 mod https;
 mod options;
 pub(crate) mod policy;
+#[cfg(feature = "dns-quic")]
+mod quic;
 pub(crate) mod trace;
 
 pub mod resolution;

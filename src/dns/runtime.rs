@@ -6,6 +6,9 @@
 #[cfg(test)]
 #[path = "tests_encrypted.rs"]
 mod encrypted_tests;
+#[cfg(all(test, feature = "dns-quic"))]
+#[path = "tests_quic.rs"]
+mod quic_tests;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -95,6 +98,7 @@ pub enum RuntimeDnsError {
 pub struct RuntimeDns {
     enabled: bool,
     ipv6: bool,
+    prefer_h3: bool,
     ipv6_timeout: Duration,
     nameservers: Box<[DnsNameserver]>,
     hosts: super::hosts::Hosts,
@@ -144,6 +148,10 @@ struct TcpPoolKey {
 struct TcpConnectionPool {
     security: crate::security::SecurityContext,
     http2: Arc<super::http2::Pool<TcpPoolKey>>,
+    #[cfg(feature = "dns-quic")]
+    quic: Arc<super::quic::Pool<TcpPoolKey>>,
+    #[cfg(feature = "dns-quic")]
+    http_tcp_choices: StdMutex<Vec<(TcpPoolKey, TokioInstant)>>,
     state: Mutex<TcpPoolState>,
     max_idle: usize,
     max_idle_per_key: usize,
@@ -239,6 +247,10 @@ impl TcpConnectionPool {
         Arc::new(Self {
             security,
             http2: super::http2::Pool::new(),
+            #[cfg(feature = "dns-quic")]
+            quic: super::quic::Pool::new(),
+            #[cfg(feature = "dns-quic")]
+            http_tcp_choices: StdMutex::new(Vec::new()),
             state: Mutex::new(TcpPoolState::default()),
             max_idle,
             max_idle_per_key,
@@ -305,6 +317,37 @@ impl TcpConnectionPool {
             busy: Some(TcpBusyGuard::new(Arc::clone(&self.stats))),
             stats: Arc::clone(&self.stats),
         })
+    }
+
+    #[cfg(feature = "dns-quic")]
+    fn tcp_selected(&self, key: &TcpPoolKey) -> bool {
+        let mut choices = self.http_tcp_choices.lock().unwrap();
+        let now = TokioInstant::now();
+        choices.retain(|(_, used)| now.duration_since(*used) < TCP_POOL_IDLE_TIMEOUT);
+        if let Some((_, used)) = choices.iter_mut().find(|(candidate, _)| candidate == key) {
+            *used = now;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "dns-quic")]
+    fn select_tcp(&self, key: TcpPoolKey) {
+        let mut choices = self.http_tcp_choices.lock().unwrap();
+        choices.retain(|(candidate, _)| *candidate != key);
+        if choices.len() == TCP_POOL_MAX_IDLE {
+            choices.remove(0);
+        }
+        choices.push((key, TokioInstant::now()));
+    }
+
+    #[cfg(feature = "dns-quic")]
+    fn forget_tcp(&self, key: &TcpPoolKey) {
+        self.http_tcp_choices
+            .lock()
+            .unwrap()
+            .retain(|(candidate, _)| candidate != key);
     }
 
     async fn open_connection(
@@ -530,6 +573,8 @@ impl TcpConnectionPool {
 impl Drop for TcpConnectionPool {
     fn drop(&mut self) {
         self.http2.close();
+        #[cfg(feature = "dns-quic")]
+        self.quic.close();
         self.reaper_cancel.cancel();
         let idle = std::mem::take(&mut self.state.get_mut().idle);
         self.stats.current_idle.store(0, Ordering::Release);
@@ -953,6 +998,10 @@ impl RuntimeDns {
                 continue;
             }
             resolver.tcp_pool.http2.close();
+            #[cfg(feature = "dns-quic")]
+            resolver.tcp_pool.quic.close();
+            #[cfg(feature = "dns-quic")]
+            resolver.tcp_pool.http_tcp_choices.lock().unwrap().clear();
             resolver.tcp_pool.reaper_cancel.cancel();
             pending.extend(
                 [
@@ -975,6 +1024,8 @@ impl RuntimeDns {
                 continue;
             }
             resolver.tcp_pool.http2.shutdown().await;
+            #[cfg(feature = "dns-quic")]
+            resolver.tcp_pool.quic.shutdown().await;
             let idle = {
                 let mut state = resolver.tcp_pool.state.lock().await;
                 let idle = std::mem::take(&mut state.idle);
@@ -1058,6 +1109,8 @@ impl RuntimeDns {
         pool.max_idle = 0;
         pool.max_idle_per_key = 0;
         pool.http2.disable_idle();
+        #[cfg(feature = "dns-quic")]
+        pool.quic.disable_idle();
         let stats = Arc::get_mut(&mut pool.stats).expect("fresh node DNS counters");
         stats.idle_limit = 0;
         stats.idle_per_key_limit = 0;
@@ -1262,6 +1315,7 @@ impl RuntimeDns {
         Self {
             enabled: config.enable,
             ipv6: config.ipv6,
+            prefer_h3: config.prefer_h3,
             ipv6_timeout: config.ipv6_timeout,
             hosts: super::hosts::Hosts::new(
                 &config.hosts,
@@ -2292,6 +2346,7 @@ impl RuntimeDns {
             DnsTransport::Tls => "tls",
             DnsTransport::Https => "https",
             DnsTransport::Http => "http",
+            DnsTransport::Quic => "quic",
         });
         let server = self.resolve_nameserver(&nameserver).await?;
         let _attempt = permits
@@ -2313,6 +2368,14 @@ impl RuntimeDns {
         M: Fn(&[u8]) -> Result<bool, AttemptError>,
         V: Fn(&[u8]) -> Result<R, AttemptError>,
     {
+        if server.transport == DnsTransport::Quic {
+            #[cfg(feature = "dns-quic")]
+            return self
+                .exchange_quic(&server, query, validate, super::quic::Kind::Doq)
+                .await;
+            #[cfg(not(feature = "dns-quic"))]
+            return Err(io::Error::from(io::ErrorKind::Unsupported).into());
+        }
         if server.transport == DnsTransport::Udp {
             let (_, egress) = self.egress_for(&server, Network::Udp, |_| false)?;
             let response = self.exchange_udp(&server, &egress, query, matches).await?;
@@ -2484,6 +2547,16 @@ impl RuntimeDns {
     where
         F: Fn(&[u8]) -> Result<R, AttemptError>,
     {
+        #[cfg(feature = "dns-quic")]
+        if nameserver.options.force_h3 {
+            return self
+                .exchange_quic(nameserver, query, validate, super::quic::Kind::H3)
+                .await;
+        }
+        #[cfg(not(feature = "dns-quic"))]
+        if nameserver.options.force_h3 || self.prefer_h3 {
+            return Err(io::Error::from(io::ErrorKind::Unsupported).into());
+        }
         let resolve = |state: &TcpPoolState| {
             self.egress_for(nameserver, Network::Tcp, |egress| {
                 let key = TcpPoolKey {
@@ -2499,6 +2572,19 @@ impl RuntimeDns {
         // Only a stale reused HTTP/1 connection gets one retry. Each fresh
         // handshake branches on actual ALPN, including a changed server choice.
         for attempt in 0..2 {
+            #[cfg(feature = "dns-quic")]
+            if self.prefer_h3
+                && let Some(lease) = self.cached_quic(nameserver)?
+            {
+                let result = lease
+                    .exchange(&nameserver.config, query, |wire| {
+                        validate(wire)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                    })
+                    .await
+                    .map_err(AttemptError::Io);
+                return result;
+            }
             let key = {
                 let state = self.tcp_pool.state.lock().await;
                 let (egress, _) = resolve(&state)?;
@@ -2515,6 +2601,26 @@ impl RuntimeDns {
                     .stats
                     .reuse_hits
                     .fetch_add(1, Ordering::Relaxed);
+                let result = lease
+                    .exchange(&nameserver.config, query, |wire| {
+                        validate(wire)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                    })
+                    .await
+                    .map_err(AttemptError::Io);
+                #[cfg(feature = "dns-quic")]
+                if result.is_err() {
+                    self.tcp_pool.forget_tcp(&key);
+                }
+                return result;
+            }
+            let initialization = self.tcp_pool.http2.initialization(key.clone());
+            let gate = initialization.lock().await;
+            #[cfg(feature = "dns-quic")]
+            if self.prefer_h3
+                && let Some(lease) = self.cached_quic(nameserver)?
+            {
+                drop(gate);
                 return lease
                     .exchange(&nameserver.config, query, |wire| {
                         validate(wire)
@@ -2523,22 +2629,82 @@ impl RuntimeDns {
                     .await
                     .map_err(AttemptError::Io);
             }
-            let initialization = self.tcp_pool.http2.initialization(key.clone());
-            let gate = initialization.lock().await;
             if let Some(lease) = self.tcp_pool.http2.get(&key) {
                 drop(gate);
                 self.tcp_pool
                     .stats
                     .reuse_hits
                     .fetch_add(1, Ordering::Relaxed);
-                return lease
+                let result = lease
                     .exchange(&nameserver.config, query, |wire| {
                         validate(wire)
                             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
                     })
                     .await
                     .map_err(AttemptError::Io);
+                #[cfg(feature = "dns-quic")]
+                if result.is_err() {
+                    self.tcp_pool.forget_tcp(&key);
+                }
+                return result;
             }
+            #[cfg(feature = "dns-quic")]
+            let mut lease = if self.prefer_h3 && !self.tcp_pool.tcp_selected(&key) {
+                let mut quic = self.start_quic(nameserver, super::quic::Kind::H3)?;
+                let mut tcp = Box::pin(self.tcp_pool.checkout_for(nameserver, &resolve));
+                tokio::select! {
+                    result = &mut tcp => match result {
+                    Ok(lease) => {
+                        drop(tcp);
+                        quic.cancel().await;
+                        self.tcp_pool.select_tcp(lease.key.clone());
+                        lease
+                    }
+                    Err(_) => {
+                        drop(tcp);
+                        if let Err(error) = quic.wait_ready().await {
+                            quic.cancel().await;
+                            return Err(error.into());
+                        }
+                        let lease = quic.publish()?;
+                        drop(gate);
+                        return lease
+                            .exchange(&nameserver.config, query, |wire| {
+                                validate(wire).map_err(|error| {
+                                    io::Error::new(io::ErrorKind::InvalidData, error)
+                                })
+                            })
+                            .await
+                            .map_err(AttemptError::Io);
+                    }
+                    },
+                    result = quic.wait_ready() => match result {
+                    Ok(()) => {
+                        drop(tcp);
+                        let lease = quic.publish()?;
+                        drop(gate);
+                        return lease
+                            .exchange(&nameserver.config, query, |wire| {
+                                validate(wire).map_err(|error| {
+                                    io::Error::new(io::ErrorKind::InvalidData, error)
+                                })
+                            })
+                            .await
+                            .map_err(AttemptError::Io);
+                    }
+                    Err(_) => {
+                        let tcp = tcp.await;
+                        quic.cancel().await;
+                        let lease = tcp?;
+                        self.tcp_pool.select_tcp(lease.key.clone());
+                        lease
+                    }
+                }
+                }
+            } else {
+                self.tcp_pool.checkout_for(nameserver, &resolve).await?
+            };
+            #[cfg(not(feature = "dns-quic"))]
             let mut lease = self.tcp_pool.checkout_for(nameserver, &resolve).await?;
             let alpn = lease
                 .connection
@@ -2564,13 +2730,18 @@ impl RuntimeDns {
                     .connect(lease.key.clone(), stream, (_slot, _observation))
                     .await?;
                 drop(gate);
-                return h2
+                let result = h2
                     .exchange(&nameserver.config, query, |wire| {
                         validate(wire)
                             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
                     })
                     .await
                     .map_err(AttemptError::Io);
+                #[cfg(feature = "dns-quic")]
+                if result.is_err() {
+                    self.tcp_pool.forget_tcp(&key);
+                }
+                return result;
             }
             if alpn.is_some_and(|protocol| protocol != b"http/1.1") {
                 return Err(io::Error::from(io::ErrorKind::InvalidData).into());
@@ -2589,12 +2760,18 @@ impl RuntimeDns {
             .await;
             if attempt == 0 && lease.reused && result.as_ref().is_err_and(stale_reuse_is_retryable)
             {
+                #[cfg(feature = "dns-quic")]
+                self.tcp_pool.forget_tcp(&key);
                 self.tcp_pool
                     .stats
                     .stale_retries
                     .fetch_add(1, Ordering::Relaxed);
                 drop(lease);
                 continue;
+            }
+            #[cfg(feature = "dns-quic")]
+            if result.is_err() {
+                self.tcp_pool.forget_tcp(&key);
             }
             let (response, validated, reusable) = result?;
             if reusable {
@@ -2603,6 +2780,138 @@ impl RuntimeDns {
             return Ok((response, validated));
         }
         unreachable!("stale HTTP/1 reuse retries once")
+    }
+
+    #[cfg(feature = "dns-quic")]
+    fn quic_route(
+        &self,
+        nameserver: &ResolvedNameserver,
+    ) -> Result<(TcpPoolKey, Arc<dyn Dispatcher>), AttemptError> {
+        let (egress, dispatcher) = self.egress_for(nameserver, Network::Udp, |egress| {
+            self.tcp_pool.quic.has(&TcpPoolKey {
+                upstream: nameserver.config.clone(),
+                endpoint: nameserver.endpoint(),
+                egress,
+                source_generation: nameserver.source_generation,
+                source_binding: nameserver.source_binding.clone(),
+            })
+        })?;
+        Ok((
+            TcpPoolKey {
+                upstream: nameserver.config.clone(),
+                endpoint: nameserver.endpoint(),
+                egress,
+                source_generation: nameserver.source_generation,
+                source_binding: nameserver.source_binding.clone(),
+            },
+            dispatcher,
+        ))
+    }
+
+    #[cfg(feature = "dns-quic")]
+    fn cached_quic(
+        &self,
+        nameserver: &ResolvedNameserver,
+    ) -> Result<Option<super::quic::Lease<TcpPoolKey>>, AttemptError> {
+        // UDP-disabled rules must not prevent an otherwise valid H1/H2 path.
+        let Ok((key, _)) = self.quic_route(nameserver) else {
+            return Ok(None);
+        };
+        Ok(self.tcp_pool.quic.get(&key))
+    }
+
+    #[cfg(feature = "dns-quic")]
+    fn start_quic(
+        &self,
+        nameserver: &ResolvedNameserver,
+        kind: super::quic::Kind,
+    ) -> Result<super::quic::Pending<TcpPoolKey>, AttemptError> {
+        let route = self.quic_route(nameserver);
+        let key = route.as_ref().map_or_else(
+            |_| TcpPoolKey {
+                upstream: nameserver.config.clone(),
+                endpoint: nameserver.endpoint(),
+                egress: DnsEgressKey::Single,
+                source_generation: nameserver.source_generation,
+                source_binding: nameserver.source_binding.clone(),
+            },
+            |(key, _)| key.clone(),
+        );
+        let nameserver = nameserver.clone();
+        let security = self.tcp_pool.security.clone();
+        let open = async move {
+            let (_, dispatcher) =
+                route.map_err(|error| io::Error::new(io::ErrorKind::ConnectionAborted, error))?;
+            let alpn = match kind {
+                super::quic::Kind::Doq => b"doq".to_vec(),
+                super::quic::Kind::H3 => b"h3".to_vec(),
+            };
+            let (tls, server_name) = crate::security::StandardTlsClient::with_options(
+                &security,
+                nameserver.address.to_string(),
+                crate::security::TlsClientOptions {
+                    certificate: crate::config::TlsCertificatePolicy {
+                        verification_name: nameserver.options.verification_name.clone(),
+                        skip_cert_verify: nameserver.options.skip_cert_verify,
+                        fingerprint: None,
+                    },
+                    alpn: vec![alpn.clone()],
+                    required_alpn: Some(alpn),
+                    versions: crate::security::TlsVersions::Tls13,
+                    ..Default::default()
+                },
+                0,
+                64 * 1024,
+            )?
+            .quic_config()?;
+            let transport = dispatcher
+                .open_datagram(DatagramSession::new(
+                    InboundKind::InternalDns,
+                    internal_source(nameserver.endpoint.ip()),
+                ))
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::ConnectionAborted, error))?;
+            let budget = transport.payload_budget(&Destination::Ip(nameserver.endpoint()));
+            Ok(super::quic::Raw {
+                transport,
+                peer: nameserver.endpoint(),
+                budget,
+                tls,
+                server_name,
+            })
+        };
+        self.tcp_pool
+            .quic
+            .start(key, kind, open)
+            .map_err(AttemptError::Io)
+    }
+
+    #[cfg(feature = "dns-quic")]
+    async fn exchange_quic<R>(
+        &self,
+        nameserver: &ResolvedNameserver,
+        query: &[u8],
+        validate: impl Fn(&[u8]) -> Result<R, AttemptError>,
+        kind: super::quic::Kind,
+    ) -> Result<(Vec<u8>, R), AttemptError> {
+        let (key, _) = self.quic_route(nameserver)?;
+        let lease = if let Some(lease) = self.tcp_pool.quic.get(&key) {
+            lease
+        } else {
+            let initialization = self.tcp_pool.quic.initialization(key.clone());
+            let _gate = initialization.lock().await;
+            if let Some(lease) = self.tcp_pool.quic.get(&key) {
+                lease
+            } else {
+                self.start_quic(nameserver, kind)?.finish().await?
+            }
+        };
+        lease
+            .exchange(&nameserver.config, query, |wire| {
+                validate(wire).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            })
+            .await
+            .map_err(AttemptError::Io)
     }
 
     async fn cache_response(
@@ -2794,6 +3103,7 @@ where
     Err(RuntimeDnsError::UpstreamsExhausted { last_error })
 }
 
+#[derive(Clone)]
 struct ResolvedNameserver {
     config: DnsNameserver,
     endpoint: SocketAddr,

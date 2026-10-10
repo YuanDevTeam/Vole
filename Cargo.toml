@@ -30,6 +30,7 @@ required-features = ["ffi", "windows-uwp"]
 
 [features]
 default = [
+    "dns-quic",
     "inbound-http",
     "inbound-socks5",
     "outbound-http",
@@ -62,12 +63,13 @@ sing-mux = ["stream-transport", "dep:yamux", "tokio-util/compat"]
 outbound-wireguard = ["dep:boringtun", "dep:vole-netstack"]
 stream-transport = ["dep:tokio-tungstenite", "dep:httparse", "dep:log"]
 quic-transport = ["dep:quinn"]
+dns-quic = ["quic-transport", "dep:h3", "dep:h3-quinn"]
 # Enables local interoperability-only trust-root injection. Release build
 # scripts must not enable this feature.
 interop-test = ["outbound-anytls", "outbound-vless"]
 # Allows plaintext GeoData fixtures for isolated benchmarks, never production.
 benchmark-geodata-http = []
-invoke = ["tun", "tokio/rt-multi-thread", "tokio/signal"]
+invoke = ["tun", "dns-quic", "tokio/rt-multi-thread", "tokio/signal"]
 ffi = ["invoke"]
 cli = ["invoke"]
 windows-wintun = ["tun", "dep:tun-rs"]

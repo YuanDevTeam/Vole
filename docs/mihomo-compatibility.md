@@ -24,10 +24,10 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
   所有后端仍使用 WebPKI 校验，未复制 Go 的原生系统验证器。详细范围见 [TLS 契约](tls-client-fingerprint.md)。
   独立测量 YAML 只接受 proxies 与同名客户端 tls 子集，不接受 TLS 服务端配置。
 - Shadowsocks 只支持三个 2022 cipher；插件仅 strict ShadowTLS v3，UoT 仅 v2。
-- DNS 不提供独立 listen、DoQ 或 DoH/H3。ECS、上游类型过滤、TLS 验证参数、
+- DNS 不提供独立 listen。DoQ、DoH/H3、prefer-h3、ECS、上游类型过滤、TLS 验证参数、
   DoT 独立禁用复用、LRU/ARC 与显式 system/DHCP 上游已支持，
   来源发现和物理绑定的可用平台及参考差异以 DNS 契约为准。
-  DoH 使用 GET、URL Basic 与实际 ALPN H2/H1；详细解析角色、缓存、预算与过滤行为见 [DNS 契约](tun-icmp-dns.md)。
+  DoH 使用 GET、URL Basic 与实际 H3/H2/H1；详细解析角色、缓存、预算与过滤行为见 [DNS 契约](tun-icmp-dns.md)。
 - Provider/group 名称筛选和改名支持 lookahead、定长 lookbehind、数字/命名 backreference；
   普通表达式保留 Rust regex 快速路径。复杂表达式和改名有内部预算，超限使候选失败。
   不支持递归/条件式或完整 .NET 方言；DOMAIN-REGEX 与 GeoSite regex 不扩展。

@@ -216,6 +216,7 @@ fn supported_node_dns(nameserver: &DnsNameserver) -> bool {
             | super::DnsTransport::Tls
             | super::DnsTransport::Http
             | super::DnsTransport::Https
+            | super::DnsTransport::Quic
             | super::DnsTransport::Rcode(_)
     )
 }

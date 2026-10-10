@@ -59,11 +59,41 @@ pub(super) fn restore_id(query: &[u8], response: &mut [u8]) -> io::Result<()> {
     if response.len() < 12 || response[..2] != [0, 0] {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "DNS HTTP response ID is not zero",
+            "DNS response ID is not zero",
         ));
     }
     response[..2].copy_from_slice(&query[..2]);
     Ok(())
+}
+
+#[cfg(feature = "dns-quic")]
+pub(super) fn validate_headers(
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+) -> io::Result<Option<usize>> {
+    if status != http::StatusCode::OK
+        || !headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.split(';').next().is_some_and(|value| {
+                    value.trim().eq_ignore_ascii_case("application/dns-message")
+                })
+            })
+    {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    headers
+        .get(http::header::CONTENT_LENGTH)
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|length| *length <= MAX_MESSAGE_SIZE)
+                .ok_or_else(|| io::ErrorKind::InvalidData.into())
+        })
+        .transpose()
 }
 
 #[cfg(test)]

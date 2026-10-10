@@ -606,10 +606,13 @@ hosts:
 # enable 关闭时不接管 TUN DNS，内部解析使用系统 resolver；配置中的 hosts 仍可用于内部解析。
 # enable 开启时使用配置的 resolver，不因上游失败回退到系统 DNS。
 # nameserver 默认 [https://doh.pub/dns-query, tls://223.5.5.5:853]，不能显式留空。
-# 支持裸 IP、UDP/TCP、tls://、http(s)://，允许上游域名；DoH GET 使用 ID 0 与无 padding
+# 支持裸 IP、UDP/TCP、tls://、http(s)://、quic://（DoQ 默认 853），允许上游域名。
+# DoH GET 使用 ID 0 与无 padding
 # Base64URL dns=；清除原 query/fragment，URL userinfo 转 Basic，不进入 Host/path 或日志。
 # HTTPS 实际 ALPN 协商 H2/H1，无 ALPN 回退 H1；明文 HTTP 仅 H1，无 h2c。
-# DoT 与 HTTPS 使用共享 TLS 信任根，校验证书与名称。
+# prefer-h3: true 让 HTTPS 首次建连竞争已认证 H3 与 TCP TLS，第一条成功胜出；失败允许另一条继续。
+# HTTPS #h3=true 强制实际 H3，不降级 H2/H1；明文 HTTP 的 h3/prefer-h3 不改变 H1 行为。
+# DoT、DoH、DoQ 使用共享 TLS 信任根，校验证书与名称；QUIC 使用受控 UDP，不绕过 DNS 出口/平台绑定。
 # default-nameserver 接受 IP 上游或显式 system，用于 bootstrap。
 # system、system://、dhcp://system 使用物理系统 DNS；dhcp://<精确接口名> 使用该接口的 DHCP DNS。
 # 各角色、policy、fallback 均支持；DHCP 接口不能用于 default-nameserver。来源始终物理直连，
@@ -623,7 +626,7 @@ hosts:
 # ecs=IP/CIDR 与 ecs-override=true 控制 ECS，保留其他 EDNS 参数。
 # disable-ipv4=true、disable-ipv6=true、disable-qtype-N=true 抑制相应 question 并过滤全部响应 sections；
 # ECS/过滤适用于 system、DHCP、RCODE 及各 resolver 角色，DHCP 接口名不含 fragment。
-# skip-cert-verify=true、name-cert-verify 用于 DoT/HTTPS；显式名称验证优先且不改变 SNI。
+# skip-cert-verify=true、name-cert-verify 用于 DoT/DoH/DoQ；显式名称验证优先且不改变 SNI。
 # disable-reuse=true 仅禁用指定 DoT 复用；HTTPS 仍可复用，未知参数/出口拒绝。
 # proxy-server-nameserver 专门解析节点，direct-nameserver
 # 专门解析 DIRECT 业务目标；未配置时复用 nameserver。两者不隐式开启 respect-rules。
@@ -639,6 +642,7 @@ hosts:
 dns:
   enable: true
   ipv6: true
+  prefer-h3: false
   ipv6-timeout: 100 # 毫秒；内部 A/AAAA 并发，A 完成后最多等待 AAAA；0 同缺省 100
   cache-max-size: 4096 # 每个 DNS 角色的结果总条目数；0 同缺省 4096，A/AAAA 和 wire 共用
   cache-algorithm: lru # 精确 arc 使用 ARC；缺省与其他字符串使用 LRU，与 Mihomo 一致

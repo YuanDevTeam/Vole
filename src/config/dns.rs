@@ -33,6 +33,9 @@ impl DnsConfig {
 
 impl RawDnsConfig {
     pub(super) fn normalize(self, targets: &RouteTargetsByName) -> Result<DnsConfig> {
+        if self.prefer_h3 && !cfg!(feature = "dns-quic") {
+            return invalid("DNS HTTP/3 support is disabled at build time");
+        }
         let fake_ip = self.fake_ip()?;
         if self.enable && self.nameserver.is_empty() {
             return invalid("enabled DNS requires nameserver");
@@ -75,6 +78,7 @@ impl RawDnsConfig {
             fake_ip,
             enable: self.enable,
             ipv6: self.ipv6,
+            prefer_h3: self.prefer_h3,
             ipv6_timeout: Duration::from_millis(if self.ipv6_timeout == 0 {
                 default_ipv6_timeout()
             } else {
@@ -122,7 +126,7 @@ pub(super) fn parse_dns_nameserver(
 ) -> Result<DnsNameserver> {
     let bad = || {
         VoleError::InvalidConfig(
-            "invalid DNS upstream; supported transports are UDP, TCP, TLS, HTTP(S), RCODE, system and DHCP"
+            "invalid DNS upstream; supported transports are UDP, TCP, TLS, HTTP(S), QUIC, RCODE, system and DHCP"
                 .into(),
         )
     };
@@ -212,6 +216,8 @@ pub(super) fn parse_dns_nameserver(
         "tls" => (DnsTransport::Tls, 853),
         "https" => (DnsTransport::Https, 443),
         "http" => (DnsTransport::Http, 80),
+        "quic" if cfg!(feature = "dns-quic") => (DnsTransport::Quic, 853),
+        "quic" => return invalid("DNS QUIC support is disabled at build time"),
         _ => return Err(bad()),
     };
     let http = matches!(transport, DnsTransport::Http | DnsTransport::Https);
@@ -342,6 +348,7 @@ fn parse_nameserver_options(
             }
             "disable-reuse" => options.disable_reuse = value == "true",
             "h3" if value != "true" || ignore_h3 => {}
+            "h3" if cfg!(feature = "dns-quic") => options.force_h3 = true,
             _ => return invalid("unsupported DNS upstream parameter"),
         }
     }
@@ -358,6 +365,38 @@ fn valid_disabled_type(kind: u16) -> bool {
 #[cfg(test)]
 mod upstream_options_tests {
     use super::*;
+
+    #[test]
+    fn dns_quic_feature_gates_and_plain_http_fragment() {
+        let targets = RouteTargetsByName::new();
+        let quic = parse_dns_nameserver("quic://dns.example", &targets, DnsRoute::Direct);
+        let h3 = parse_dns_nameserver(
+            "https://dns.example/dns-query#h3=true",
+            &targets,
+            DnsRoute::Direct,
+        );
+        let raw: RawDnsConfig = serde_yaml_ng::from_str("prefer-h3: true").unwrap();
+        let preferred = raw.normalize(&targets);
+        if cfg!(feature = "dns-quic") {
+            let quic = quic.unwrap();
+            assert_eq!(quic.port, 853);
+            assert_eq!(quic.transport, DnsTransport::Quic);
+            assert!(h3.unwrap().options.force_h3);
+            assert!(preferred.unwrap().prefer_h3);
+        } else {
+            assert!(quic.is_err());
+            assert!(h3.is_err());
+            assert!(preferred.is_err());
+        }
+        let http = parse_dns_nameserver(
+            "http://dns.example/dns-query#h3=true",
+            &targets,
+            DnsRoute::Direct,
+        )
+        .unwrap();
+        assert_eq!(http.transport, DnsTransport::Http);
+        assert!(!http.options.force_h3);
+    }
 
     #[test]
     fn doh_url_clears_query_and_preserves_only_decoded_basic_identity() {

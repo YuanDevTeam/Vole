@@ -296,6 +296,7 @@ pub struct DnsConfig {
     pub fallback: DnsFallbackConfig,
     pub enable: bool,
     pub ipv6: bool,
+    pub prefer_h3: bool,
     pub ipv6_timeout: Duration,
     pub cache_max_size: usize,
     pub cache_algorithm: DnsCacheAlgorithm,
@@ -411,6 +412,7 @@ pub struct DnsNameserverOptions {
     pub skip_cert_verify: bool,
     pub verification_name: Option<String>,
     pub disable_reuse: bool,
+    pub force_h3: bool,
 }
 
 impl std::fmt::Debug for DnsNameserverOptions {
@@ -422,6 +424,7 @@ impl std::fmt::Debug for DnsNameserverOptions {
             .field("skip_cert_verify", &self.skip_cert_verify)
             .field("explicit_name", &self.verification_name.is_some())
             .field("disable_reuse", &self.disable_reuse)
+            .field("force_h3", &self.force_h3)
             .finish()
     }
 }
@@ -466,6 +469,7 @@ pub enum DnsTransport {
     Tls,
     Https,
     Http,
+    Quic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1411,6 +1415,8 @@ struct RawDnsConfig {
     enable: bool,
     #[serde(default)]
     ipv6: bool,
+    #[serde(rename = "prefer-h3", default)]
+    prefer_h3: bool,
     #[serde(rename = "ipv6-timeout", default = "dns::default_ipv6_timeout")]
     ipv6_timeout: u64,
     #[serde(rename = "cache-max-size", default)]
@@ -6737,7 +6743,6 @@ dns:
         for nameserver in [
             "udp://1.1.1.1:53#direct",
             "udp://1.1.1.1:53#unknown",
-            "https://1.1.1.1/dns-query#h3=true",
             "udp://1.1.1.1:53#DIRECT#RULES",
         ] {
             let yaml = current_yaml(&format!(
