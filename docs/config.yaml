@@ -179,7 +179,7 @@ sniffer:
 # - 标准 TLS 支持 skip-cert-verify/fingerprint/name-cert-verify，以及配对的
 #   内联 PEM certificate/private-key；不能混用 REALITY。完整策略见 vless.md。
 # - WS/gRPC/HTTP/H2 复用共享传输。WS 可 v2ray-http-upgrade 及其 fast-open；
-#   gRPC 可 UA、空闲 PING、max-connections/min-streams/max-streams 池阈值。
+#   gRPC 与 Trojan/VMess 共用 UA、空闲 PING、max-connections/min-streams/max-streams 池阈值。
 # - smux 支持 h2mux/smux/yamux、padding/only-tcp 与池阈值；与 Vision 互斥。
 # - client-fingerprint 接受 none/chrome/chrome120/firefox/firefox120/safari/safari16；
 #   chrome=Chrome133，firefox=Firefox120，safari=Safari16.0；节点缺省关闭。
@@ -312,8 +312,14 @@ proxies:
     # 不接受保留握手头、重复大小写头、CR/LF、userinfo 或超限 HTTP 头。
     # network: grpc
     # grpc-opts:
-    #   grpc-service-name: edge # 必填；普通名映射 /edge/Tun；/ 开头使用完整路径
-    # ws-opts / grpc-opts 仅可用于对应 network；不提供 gRPC 连接池。
+    #   grpc-service-name: edge # 省略/空默认 GunService；普通名映射 /edge/Tun；/ 开头使用完整路径
+    #   grpc-user-agent: grpc-go/1.36.0 # 省略/空使用此默认值
+    #   ping-interval: 0       # 秒数；0 不主动 PING；负值明确拒绝
+    #   max-connections: 1     # 正值时优先按连接上限/min-streams 扩容
+    #   min-streams: 0
+    #   max-streams: 0         # max-connections 非正时按此复用阈值扩容
+    # 三阈值字面全零归一 max-connections=1；负阈值禁用分支。
+    # ws-opts / grpc-opts 仅可用于对应 network；grpc-opts 可省略。
 
   - name: vless-edge
     type: vless

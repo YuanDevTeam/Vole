@@ -1,9 +1,11 @@
 //! Strict parsing for the current Vole YAML configuration.
 mod fake_ip;
 mod fallback;
+mod grpc;
 mod sniffer;
 pub use fake_ip::{FakeIpConfig, FakeIpFilterMode, FakeIpRange};
 pub use fallback::DnsFallbackConfig;
+pub use grpc::GrpcOptions;
 mod http_proxy;
 mod ip_version;
 pub use http_proxy::HttpOutboundConfig;
@@ -54,7 +56,7 @@ pub use shadowsocks::{ShadowTlsConfig, ShadowsocksCipher, ShadowsocksOutboundCon
 mod trojan;
 pub use trojan::{TrojanOutboundConfig, TrojanTransport, WebSocketHandshake};
 mod vless;
-pub use vless::{GrpcOptions, SingMuxConfig, SingMuxProtocol, VlessStreamOptions};
+pub use vless::{SingMuxConfig, SingMuxProtocol, VlessStreamOptions};
 pub(crate) mod xhttp;
 pub use xhttp::{XHttpHeaders, XHttpRequestOptions, XHttpReuseConfig, XHttpVersion};
 mod vmess;

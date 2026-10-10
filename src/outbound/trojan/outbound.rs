@@ -3,7 +3,7 @@ use std::io;
 use crate::outbound::owned_stream::OwnedStream;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::{TrojanOutboundConfig, TrojanTransport},
@@ -12,12 +12,11 @@ use crate::{
         ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector, UpstreamPath,
         server_destination,
     },
-    resources::observation::{self, ResourceKind},
     security::{
         SecurityContext, StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsClientOptions,
     },
     session::{Destination, StreamSession},
-    transport::{WebSocketOptions, connect_websocket, grpc_duplex},
+    transport::{GrpcPool, WebSocketOptions, connect_websocket},
 };
 
 use super::{TrojanAuth, TrojanCommand, TrojanDatagram};
@@ -29,13 +28,12 @@ pub struct TrojanOutbound {
     tls: StandardTlsClient,
     cancellation: CancellationToken,
     transport: Transport,
-    tasks: TaskTracker,
 }
 
 enum Transport {
     Tcp,
     WebSocket(Box<WebSocketOptions>),
-    Grpc(String),
+    Grpc { uri: String, pool: GrpcPool },
 }
 
 impl std::fmt::Debug for TrojanOutbound {
@@ -74,9 +72,11 @@ impl TrojanOutbound {
                         .websocket_options()?
                         .expect("WebSocket config"),
                 )),
-                TrojanTransport::Grpc { uri } => Transport::Grpc(uri.clone()),
+                TrojanTransport::Grpc { uri, options } => Transport::Grpc {
+                    uri: uri.clone(),
+                    pool: GrpcPool::duplex(options.clone()),
+                },
             },
-            tasks: TaskTracker::new(),
             server: server_destination(&config.address, config.port)?,
             upstream,
             auth: TrojanAuth::new(&config.password)?,
@@ -89,6 +89,20 @@ impl TrojanOutbound {
             )?,
             cancellation: CancellationToken::new(),
         })
+    }
+
+    async fn connect_tls(
+        &self,
+        session: StreamSession,
+        context: &EstablishContext,
+    ) -> Result<BoxStream, DispatchError> {
+        let raw = self
+            .upstream
+            .connect_server(session, &self.server, context)
+            .await?;
+        context
+            .run_io("Trojan TLS handshake", self.tls.connect(raw.io))
+            .await
     }
 
     async fn connect(
@@ -107,24 +121,17 @@ impl TrojanOutbound {
             biased;
             () = self.cancellation.cancelled() => Err(DispatchError::NotAllowed),
             connected = async {
-                let raw = self.upstream.connect_server(session, &self.server, context).await?;
-                let stream = context.run_io("Trojan TLS handshake", self.tls.connect(raw.io)).await?;
                 let token = self.cancellation.child_token();
                 let setup_guard = token.clone().drop_guard();
-                let stream = match &self.transport {
-                    Transport::Tcp => stream,
-                    Transport::WebSocket(options) => context.run_io("Trojan WebSocket upgrade",connect_websocket(stream,options,&request,context.deadline())).await?,
-                    Transport::Grpc(uri) => {
-                        let (stream, driver) = context.run_io("Trojan gRPC handshake",grpc_duplex(stream,uri,context.deadline())).await?;
-                        let token = token.clone();
-                        let observation = observation::track(ResourceKind::Task);
-                        self.tasks.spawn(observation::bind(async move {
-                            let _observation = observation;
-                            token.cancelled().await;
-                            let _ = driver.stop().await;
-                        }));
-                        stream
-                    },
+                let stream = if let Transport::Grpc { uri, pool } = &self.transport {
+                    pool.open(uri, context.deadline(), || async {
+                        self.connect_tls(session, context).await.map_err(io::Error::other)
+                    }).await?
+                } else {
+                    let stream = self.connect_tls(session, context).await?;
+                    if let Transport::WebSocket(options) = &self.transport {
+                        context.run_io("Trojan WebSocket upgrade",connect_websocket(stream,options,&request,context.deadline())).await?
+                    } else { stream }
                 };
                 let mut stream = OwnedStream::new(stream, token);
                 setup_guard.disarm();
@@ -176,11 +183,15 @@ impl OutboundConnector for TrojanOutbound {
 
     fn begin_shutdown(&self) {
         self.cancellation.cancel();
+        if let Transport::Grpc { pool, .. } = &self.transport {
+            pool.begin_shutdown();
+        }
     }
     async fn shutdown(&self) {
         self.begin_shutdown();
-        self.tasks.close();
-        self.tasks.wait().await;
+        if let Transport::Grpc { pool, .. } = &self.transport {
+            pool.shutdown().await;
+        }
     }
 }
 

@@ -221,6 +221,7 @@ pub(super) async fn pooled_stream(
     sender: Sender,
     uri: &str,
     user_agent: &str,
+    half_close: bool,
     deadline: Instant,
     lease: super::grpc_pool::Lease,
 ) -> io::Result<BoxStream> {
@@ -244,7 +245,7 @@ pub(super) async fn pooled_stream(
         response,
         send,
         Framing::Gun,
-        false,
+        half_close,
         deadline,
         Arc::default(),
         None,

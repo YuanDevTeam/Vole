@@ -1,6 +1,7 @@
+use super::grpc::RawGrpc;
 use super::{
-    ProxyProtocol, deserialize_present_option, invalid, parse_standard_uuid, validate_host,
-    validate_port,
+    GrpcOptions, ProxyProtocol, deserialize_present_option, invalid, parse_standard_uuid,
+    validate_host, validate_port,
 };
 use crate::Result;
 use serde::Deserialize;
@@ -29,6 +30,7 @@ pub enum StreamTransport {
     },
     Grpc {
         uri: String,
+        options: GrpcOptions,
     },
     Http {
         method: String,
@@ -138,12 +140,6 @@ pub(super) struct RawWs {
         deserialize_with = "deserialize_present_option"
     )]
     pub(super) early_data_header_name: Option<String>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct RawGrpc {
-    #[serde(rename = "grpc-service-name")]
-    pub(super) service: String,
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -481,17 +477,11 @@ pub(super) fn normalize_transport(
             }
             transport
         }
-        ("grpc", None, Some(grpc), None, None) if !grpc.service.is_empty() => {
-            let path = if grpc.service.starts_with('/') {
-                grpc.service
-            } else {
-                format!("/{}/Tun", grpc.service)
-            };
-            if path.contains('?') {
-                return invalid("invalid VMess gRPC path");
-            }
+        ("grpc", None, grpc, None, None) => {
+            let (path, options) = grpc.unwrap_or_default().normalize()?;
             StreamTransport::Grpc {
                 uri: uri(scheme, &authority, &path)?,
+                options,
             }
         }
         ("http", None, None, http, None) => {

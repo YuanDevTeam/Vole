@@ -176,11 +176,8 @@ fn trojan_transport_boundaries_fail_before_runtime_io() {
     for fields in [
         json!({"ws-opts":null}),
         json!({"grpc-opts":null}),
-        json!({"network":"grpc"}),
-        json!({"network":"grpc","grpc-opts":{"grpc-service-name":""}}),
         json!({"network":"grpc","grpc-opts":{"grpc-service-name":"edge?query=1"}}),
         json!({"network":"grpc","grpc-opts":{"grpc-service-name":null}}),
-        json!({"network":"grpc","grpc-opts":{"grpc-service-name":"edge","max-connections":1}}),
         json!({"network":"ws","grpc-opts":{"grpc-service-name":"edge"}}),
         json!({"network":"grpc","ws-opts":{},"grpc-opts":{"grpc-service-name":"edge"}}),
         json!({"network":"ws","alpn":[]}),

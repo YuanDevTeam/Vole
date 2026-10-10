@@ -160,6 +160,7 @@ async fn grpc_pool_matches_both_threshold_policies_and_keeps_other_streams_alive
         for (max, min, streams, expected) in [
             (1, 0, 0, vec![1, 1, 1, 1]),
             (2, 2, 0, vec![1, 1, 2, 2]),
+            (2, 2, 1, vec![1, 1, 2, 2]),
             (2, 0, 0, vec![1, 2, 2, 2]),
             (0, 0, 2, vec![1, 1, 2, 2, 3]),
             (0, 2, 0, vec![1, 2, 3, 4]),

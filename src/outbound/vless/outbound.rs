@@ -96,7 +96,7 @@ pub struct VlessOutbound {
     stream_options: crate::config::VlessStreamOptions,
     cancellation: CancellationToken,
     tasks: TaskTracker,
-    grpc_pool: crate::transport::GrpcPool,
+    grpc_pool: Option<crate::transport::GrpcPool>,
     sing_mux: Option<crate::transport::sing_mux::Pool>,
     vision: bool,
     vision_stats: Arc<crate::security::vision::SpliceStats>,
@@ -477,6 +477,10 @@ impl VlessOutbound {
                 ));
             }
         };
+        let transport = match &config.transport {
+            VlessTransport::Stream(transport) => transport.clone(),
+            VlessTransport::Xhttp(_) => StreamTransport::Tcp,
+        };
         Ok(Self {
             uuid: config.id,
             encryption,
@@ -488,14 +492,16 @@ impl VlessOutbound {
             xhttp,
             download,
             encoding: config.packet_encoding,
-            transport: match &config.transport {
-                VlessTransport::Stream(transport) => transport.clone(),
-                VlessTransport::Xhttp(_) => StreamTransport::Tcp,
-            },
             cancellation: CancellationToken::new(),
             stream_options: config.stream_options.clone(),
             tasks: TaskTracker::new(),
-            grpc_pool: crate::transport::GrpcPool::new(config.stream_options.grpc.clone()),
+            grpc_pool: match &transport {
+                StreamTransport::Grpc { options, .. } => {
+                    Some(crate::transport::GrpcPool::new(options.clone()))
+                }
+                _ => None,
+            },
+            transport,
             sing_mux: config
                 .stream_options
                 .sing_mux
@@ -580,8 +586,8 @@ impl VlessOutbound {
                     let (raw,control)=context.run_io("Vision TLS handshake",self.upload.security.connect_vision(raw,self.vision_stats.clone())).await?;
                     vision_control=Some(control);
                     (raw,StreamTransport::Tcp)
-                } else if let StreamTransport::Grpc{uri}=&self.transport {
-                    let io=self.grpc_pool.open(uri,context.deadline(),||async {
+                } else if let StreamTransport::Grpc{uri,..}=&self.transport {
+                    let io=self.grpc_pool.as_ref().expect("gRPC pool").open(uri,context.deadline(),||async {
                         self.connect_transport(session,context).await.map_err(io::Error::other)
                     }).await?;
                     (io,StreamTransport::Tcp)
@@ -750,11 +756,7 @@ impl PreparedStream {
                         header = bytes::Bytes::new();
                     }
                 }
-                StreamTransport::Grpc { uri } => {
-                    let connected = crate::transport::grpc(raw, uri, deadline).await?;
-                    raw = connected.0;
-                    driver = Some(connected.1);
-                }
+                StreamTransport::Grpc { .. } => unreachable!("gRPC opened during prepare"),
                 StreamTransport::H2 { uris } => {
                     let connected = crate::transport::legacy_h2(
                         raw,
@@ -903,7 +905,9 @@ impl OutboundConnector for VlessOutbound {
         if let Some(encryption) = &self.encryption {
             encryption.close();
         }
-        self.grpc_pool.begin_shutdown();
+        if let Some(pool) = &self.grpc_pool {
+            pool.begin_shutdown();
+        }
         if let Some(mux) = &self.sing_mux {
             mux.begin_stop();
         }
@@ -918,7 +922,9 @@ impl OutboundConnector for VlessOutbound {
         self.begin_shutdown();
         self.tasks.close();
         self.tasks.wait().await;
-        self.grpc_pool.shutdown().await;
+        if let Some(pool) = &self.grpc_pool {
+            pool.shutdown().await;
+        }
         if let Some(mux) = &self.sing_mux {
             mux.stop().await;
         }

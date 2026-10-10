@@ -71,7 +71,6 @@ fn vmess_transport_and_security_combinations_are_strict() {
         json!({"cipher":"zero","authenticated-length":true}),
         json!({"network":"bogus"}),
         json!({"network":"h2"}),
-        json!({"network":"grpc"}),
         json!({"tls":false,"servername":"secret.invalid"}),
         json!({"tls":false,"skip-cert-verify":false}),
         json!({"tls":false,"alpn":[]}),
@@ -84,7 +83,6 @@ fn vmess_transport_and_security_combinations_are_strict() {
         json!({"network":"http","http-opts":{"headers":{"X-Test":[]}}}),
         json!({"network":"ws","ws-opts":{"max-early-data":2049}}),
         json!({"network":"ws","tls":true,"alpn":["h2"]}),
-        json!({"network":"grpc","grpc-opts":{"grpc-service-name":""}}),
     ] {
         assert!(
             Config::parse_yaml(&document(fields.clone())).is_err(),

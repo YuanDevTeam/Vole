@@ -1,9 +1,10 @@
+use super::grpc::RawGrpc;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use super::{
-    ProxyProtocol, TlsClientPolicy, deserialize_present_option, invalid, validate_host,
-    validate_port,
+    GrpcOptions, ProxyProtocol, TlsClientPolicy, deserialize_present_option, invalid,
+    validate_host, validate_port,
 };
 use crate::Result;
 
@@ -29,6 +30,7 @@ pub enum TrojanTransport {
     },
     Grpc {
         uri: String,
+        options: GrpcOptions,
     },
 }
 
@@ -164,13 +166,6 @@ struct RawWebSocket {
         deserialize_with = "deserialize_present_option"
     )]
     early_data_header_name: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawGrpc {
-    #[serde(rename = "grpc-service-name")]
-    service: String,
 }
 
 fn uri(scheme: &str, server: &str, port: u16, path: &str) -> Result<String> {
@@ -310,17 +305,11 @@ impl RawTrojan {
                 }
                 transport
             }
-            ("grpc", None, Some(grpc)) if !grpc.service.is_empty() => {
-                let path = if grpc.service.starts_with('/') {
-                    grpc.service
-                } else {
-                    format!("/{}/Tun", grpc.service)
-                };
-                if path.contains('?') {
-                    return invalid("invalid Trojan gRPC service path");
-                }
+            ("grpc", None, grpc) => {
+                let (path, options) = grpc.unwrap_or_default().normalize()?;
                 TrojanTransport::Grpc {
                     uri: uri("https", &self.server, self.port, &path)?,
+                    options,
                 }
             }
             _ => return invalid("Trojan requires tcp, ws with ws-opts, or grpc with grpc-opts"),

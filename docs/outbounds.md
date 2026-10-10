@@ -91,7 +91,9 @@ fast-open 需要 upgrade。
 Upgrade 的 ED 仅允许默认 Sec-WebSocket-Protocol 头（大小写不敏感），不支持
 自定义头或路径 ED。101/头限额/截断失败不重放前缀，响应头后的字节保留给协议。
 这些选项同样适用于 VMess 的明文和标准 TLS；不改变各协议认证、UDP 编码或关闭责任。
-gRPC service-name 必填，普通名映射 /name/Tun，以 / 开头则为完整路径；不开放池参数。
+gRPC 选项与 VMess/VLESS 共用：省略或空 service-name 默认 GunService，普通名映射 /name/Tun，以 / 开头使用完整路径；省略或空 user-agent 默认 grpc-go/1.36.0。
+ping-interval 为秒，0 不主动 PING，负值明确拒绝；max-connections/min-streams/max-streams 接受带符号整数，负阈值禁用相应分支。三项字面全零归一 max-connections=1；正 max-connections 优先于 max-streams。
+每个节点独立拥有连接池，空闲连接总是复用；复用保留原上游选择、TLS 身份和认证策略，每条逻辑流仍单独发送 Trojan 认证头。
 
 TCP 保留半关闭；gRPC duplex 发送 END_STREAM，不用 RST_STREAM 提前结束读侧。
 UDP 使用同一已认证流上的地址/长度/CRLF 帧，无额外 socket/读取泵/池。
@@ -115,7 +117,7 @@ network 默认 tcp，另支持 ws/grpc/http/h2；均可明文或标准 TLS。tls
 TLS 支持独立的 `name-cert-verify` 和成对内联 PEM `certificate/private-key` 客户端身份。
 
 - WS ED/路径/头及 HTTPUpgrade 普通/fast-open 约束同 Trojan。
-- gRPC service-name 必填，普通名/完整路径规则同 Trojan，无额外池调度器。
+- gRPC 选项、默认值和节点连接池与 Trojan/VLESS 共用，每条逻辑流独立生成 VMess AEAD 认证；关闭逻辑流不关闭物理连接或兄弟流。
 - http 是 TCP 首包伪装：method 默认 GET，path 列表省略/空为 /，按 URL.Path 转义；
   头为字符串列表，每次握手独立选择路径/头值，Host 默认物理 server authority。
   仅首包封装一次，之后恢复原流；禁止 Content-Length/Transfer-Encoding。
@@ -139,7 +141,7 @@ UDP body 最多 15,000 字节；packetaddr 另扣 IPv4 7 / IPv6 19 字节，未�
 三种 UDP 编码均不接受零长度业务包；HTTPUpgrade 不改变这个边界。
 TCP 写块最多 4 KiB 以适配 Mihomo 拷贝边界；UDP 不按此切块。16 位帧计数耗尽前关闭，
 不重复 nonce。半帧发送取消关闭，接收取消保留进度；认证/地址/标签错误使关联失效。
-gRPC/H2 driver 由节点跟踪并同步退出，无全局会话额度或历史表。
+gRPC 池与 legacy H2 driver 由节点拥有并同步退出，无全局会话额度或历史表。
 
 ## Hysteria2
 

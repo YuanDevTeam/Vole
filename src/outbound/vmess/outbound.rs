@@ -14,7 +14,7 @@ use crate::{
         SecurityContext, StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsClientOptions,
     },
     session::{Datagram, Destination, StreamSession},
-    transport::{connect_websocket, grpc, http_obfs, legacy_h2},
+    transport::{GrpcPool, connect_websocket, http_obfs, legacy_h2},
 };
 use async_trait::async_trait;
 use std::{io, sync::Arc};
@@ -33,6 +33,7 @@ pub struct VmessOutbound {
     tls: Option<StandardTlsClient>,
     options: Arc<SessionOptions>,
     encoding: VmessPacketEncoding,
+    grpc_pool: Option<GrpcPool>,
     cancellation: CancellationToken,
     tasks: TaskTracker,
 }
@@ -89,9 +90,31 @@ impl VmessOutbound {
                 transport: config.transport.clone(),
             }),
             encoding: config.packet_encoding,
+            grpc_pool: match &config.transport {
+                VmessTransport::Grpc { options, .. } => Some(GrpcPool::new(options.clone())),
+                _ => None,
+            },
             cancellation: CancellationToken::new(),
             tasks: TaskTracker::new(),
         })
+    }
+    async fn connect_transport(
+        &self,
+        session: StreamSession,
+        context: &EstablishContext,
+    ) -> Result<BoxStream, DispatchError> {
+        let raw = self
+            .upstream
+            .connect_server(session, &self.server, context)
+            .await?
+            .io;
+        if let Some(tls) = &self.tls {
+            context
+                .run_io("VMess TLS handshake", tls.connect(raw))
+                .await
+        } else {
+            Ok(raw)
+        }
     }
     async fn prepare(
         &self,
@@ -104,8 +127,11 @@ impl VmessOutbound {
         tokio::select! { biased;
             ()=self.cancellation.cancelled()=>Err(DispatchError::NotAllowed),
             result=async {
-                let raw=self.upstream.connect_server(session,&self.server,context).await?.io;
-                let raw=if let Some(tls)=&self.tls { context.run_io("VMess TLS handshake",tls.connect(raw)).await? } else {raw};
+                let raw=if let VmessTransport::Grpc { uri, .. }=&self.options.transport {
+                    self.grpc_pool.as_ref().expect("gRPC pool").open(uri,context.deadline(),||async {
+                        self.connect_transport(session,context).await.map_err(io::Error::other)
+                    }).await?
+                } else { self.connect_transport(session,context).await? };
                 let token=self.cancellation.child_token();
                 Ok(PreparedStream { raw:Box::new(OwnedStream::new(raw,token.clone())),options:self.options.clone(),deadline:context.deadline(),tasks:self.tasks.clone(),token })
             }=>result,
@@ -170,11 +196,9 @@ impl PreparedStream {
                     .await?;
                     sent = true;
                 }
-                VmessTransport::Grpc { uri } => {
-                    let connected = grpc(raw, uri, deadline).await?;
-                    raw = connected.0;
-                    driver = Some(connected.1);
-                }
+                // prepare already opened this logical gRPC stream. Authentication
+                // is fresh here, without wrapping or dialing the transport again.
+                VmessTransport::Grpc { .. } => {}
                 VmessTransport::H2 { uris } => {
                     let uri = &uris[rand::random_range(0..uris.len())];
                     let connected = legacy_h2(raw, uri, deadline).await?;
@@ -285,11 +309,17 @@ impl OutboundConnector for VmessOutbound {
     }
     fn begin_shutdown(&self) {
         self.cancellation.cancel();
+        if let Some(pool) = &self.grpc_pool {
+            pool.begin_shutdown();
+        }
     }
     async fn shutdown(&self) {
         self.begin_shutdown();
         self.tasks.close();
         self.tasks.wait().await;
+        if let Some(pool) = &self.grpc_pool {
+            pool.shutdown().await;
+        }
     }
 }
 impl Drop for VmessOutbound {

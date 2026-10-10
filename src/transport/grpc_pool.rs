@@ -25,6 +25,7 @@ const PING_TIMEOUT: Duration = Duration::from_secs(crate::limits::GRPC_PING_TIME
 
 pub struct GrpcPool {
     options: GrpcOptions,
+    half_close: bool,
     connections: Arc<SyncMutex<Vec<Connection>>>,
     opening: Mutex<()>,
     cancellation: CancellationToken,
@@ -34,11 +35,19 @@ impl GrpcPool {
     pub fn new(options: GrpcOptions) -> Self {
         Self {
             options,
+            half_close: false,
             connections: Arc::default(),
             opening: Mutex::default(),
             cancellation: CancellationToken::new(),
             tasks: TaskTracker::new(),
         }
+    }
+    /// Trojan keeps its response and lease after upload END_STREAM.
+    #[cfg(any(test, feature = "outbound-trojan"))]
+    pub(crate) fn duplex(options: GrpcOptions) -> Self {
+        let mut pool = Self::new(options);
+        pool.half_close = true;
+        pool
     }
     /// The factory is invoked only for a new physical connection. A reused
     /// transport keeps its original upstream selection and TLS identity.
@@ -88,7 +97,15 @@ impl GrpcPool {
                     }
                 }
             };
-            super::grpc::pooled_stream(sender, uri, &self.options.user_agent, deadline, lease).await
+            super::grpc::pooled_stream(
+                sender,
+                uri,
+                &self.options.user_agent,
+                self.half_close,
+                deadline,
+                lease,
+            )
+            .await
         };
         tokio::select! {biased;
             ()=self.cancellation.cancelled()=>Err(io::ErrorKind::ConnectionAborted.into()),
@@ -174,6 +191,114 @@ impl GrpcPool {
 impl Drop for GrpcPool {
     fn drop(&mut self) {
         self.cancellation.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resources::observation::{ResourceKind, ResourceProbe};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn grpc_duplex_pool_keeps_response_and_sibling_after_end_stream_and_joins_stop() {
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    let tasks = TaskTracker::new();
+                    let count = Arc::new(AtomicUsize::new(0));
+                    let pool = GrpcPool::duplex(GrpcOptions::default());
+                    let factory = || async {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let (io, peer) = tokio::io::duplex(65536);
+                        let sessions = tasks.clone();
+                        tasks.spawn(async move {
+                            let mut connection = h2::server::handshake(peer).await.unwrap();
+                            while let Some(Ok((request, mut response))) = connection.accept().await
+                            {
+                                assert_eq!(request.headers()["user-agent"], "grpc-go/1.36.0");
+                                let mut send = response
+                                    .send_response(
+                                        http::Response::builder()
+                                            .status(200)
+                                            .header("content-type", "application/grpc")
+                                            .body(())
+                                            .unwrap(),
+                                        false,
+                                    )
+                                    .unwrap();
+                                let mut receive = request.into_body();
+                                sessions.spawn(async move {
+                                    while let Some(data) = receive.data().await {
+                                        let Ok(data) = data else {
+                                            return;
+                                        };
+                                        receive
+                                            .flow_control()
+                                            .release_capacity(data.len())
+                                            .unwrap();
+                                        if send.send_data(data, false).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    send.send_data(
+                                        bytes::Bytes::from_static(b"\0\0\0\0\x06\x0a\x04tail"),
+                                        false,
+                                    )
+                                    .unwrap();
+                                    let mut trailers = http::HeaderMap::new();
+                                    trailers.insert("grpc-status", "0".parse().unwrap());
+                                    send.send_trailers(trailers).unwrap();
+                                });
+                            }
+                        });
+                        Ok(Box::new(io) as BoxStream)
+                    };
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let mut first = pool
+                        .open("http://example.com/GunService/Tun", deadline, factory)
+                        .await
+                        .unwrap();
+                    let mut sibling = pool
+                        .open("http://example.com/GunService/Tun", deadline, factory)
+                        .await
+                        .unwrap();
+                    assert_eq!(count.load(Ordering::SeqCst), 1);
+                    first.write_all(b"first").await.unwrap();
+                    first.shutdown().await.unwrap();
+                    first.shutdown().await.unwrap();
+                    // Upload is closed, but its response and physical lease survive.
+                    assert!(first.write_all(b"closed").await.is_err());
+                    assert_eq!(
+                        pool.connections.lock().unwrap()[0]
+                            .active
+                            .load(Ordering::Acquire),
+                        2
+                    );
+                    let mut response = Vec::new();
+                    first.read_to_end(&mut response).await.unwrap();
+                    assert_eq!(response, b"firsttail");
+                    sibling.write_all(b"alive").await.unwrap();
+                    sibling.flush().await.unwrap();
+                    let mut echo = [0; 5];
+                    sibling.read_exact(&mut echo).await.unwrap();
+                    assert_eq!(&echo, b"alive");
+                    assert_eq!(probe.snapshot().current(ResourceKind::Task), 1);
+                    pool.shutdown().await;
+                    assert_eq!(probe.snapshot().current(ResourceKind::Task), 0);
+                    assert_eq!(probe.snapshot().current(ResourceKind::Pool), 0);
+                    assert!(sibling.write_all(b"stopped").await.is_err());
+                    drop(first);
+                    drop(sibling);
+                    tasks.close();
+                    tasks.wait().await;
+                })
+                .await
+                .unwrap();
+            })
+            .await;
+        assert!(probe.snapshot().is_idle());
     }
 }
 struct Connection {

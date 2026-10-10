@@ -204,8 +204,6 @@ fn extended_ws_and_grpc_fields_are_scoped_and_bounded() {
         json!({"network":"ws","ws-opts":{"v2ray-http-upgrade-fast-open":true}}),
         json!({"network":"ws","ws-opts":{"v2ray-http-upgrade":true,"max-early-data":1,"early-data-header-name":"x-ed"}}),
         json!({"network":"ws","ws-opts":{"v2ray-http-upgrade":null}}),
-        json!({"network":"grpc","grpc-opts":{"grpc-service-name":"test","max-connections":1,"max-streams":2}}),
-        json!({"network":"grpc","grpc-opts":{"grpc-service-name":"test","ping-interval":-1}}),
         json!({"network":"grpc","grpc-opts":{"grpc-service-name":"test","grpc-user-agent":"bad\r\nvalue"}}),
     ] {
         assert!(Config::parse_yaml(&document(fields)).is_err());

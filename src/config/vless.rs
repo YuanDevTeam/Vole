@@ -1,13 +1,13 @@
 //! VLESS public normalization. Transport options share the common stream adapters;
 //! security and VLESS-specific behavior remain independent of VMess.
-use super::vmess::{RawGrpc, RawH2, RawHttp, RawWs};
+use super::grpc::RawGrpc;
+use super::vmess::{RawH2, RawHttp, RawWs};
 use super::*;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VlessStreamOptions {
     pub http_upgrade: bool,
     pub fast_open: bool,
-    pub grpc: GrpcOptions,
     pub sing_mux: Option<SingMuxConfig>,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -37,30 +37,6 @@ pub struct SingMuxConfig {
     #[serde(default)]
     pub only_tcp: bool,
 }
-#[derive(Clone, PartialEq, Eq)]
-pub struct GrpcOptions {
-    pub user_agent: String,
-    pub ping_interval: u64,
-    pub max_connections: usize,
-    pub min_streams: usize,
-    pub max_streams: usize,
-}
-impl std::fmt::Debug for GrpcOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GrpcOptions").finish_non_exhaustive()
-    }
-}
-impl Default for GrpcOptions {
-    fn default() -> Self {
-        Self {
-            user_agent: "grpc-go/1.36.0".into(),
-            ping_interval: 0,
-            max_connections: 1,
-            min_streams: 0,
-            max_streams: 0,
-        }
-    }
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVlessWs {
@@ -81,27 +57,6 @@ struct RawVlessWs {
     #[serde(rename = "v2ray-http-upgrade-fast-open", default)]
     fast_open: bool,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawVlessGrpc {
-    #[serde(rename = "grpc-service-name")]
-    service: String,
-    #[serde(
-        rename = "grpc-user-agent",
-        default,
-        deserialize_with = "deserialize_present_option"
-    )]
-    user_agent: Option<String>,
-    #[serde(rename = "ping-interval", default)]
-    ping_interval: u64,
-    #[serde(rename = "max-connections", default)]
-    max_connections: usize,
-    #[serde(rename = "min-streams", default)]
-    min_streams: usize,
-    #[serde(rename = "max-streams", default)]
-    max_streams: usize,
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawVless {
@@ -170,7 +125,7 @@ pub(super) struct RawVless {
         default,
         deserialize_with = "deserialize_present_option"
     )]
-    grpc: Option<RawVlessGrpc>,
+    grpc: Option<RawGrpc>,
     #[serde(
         rename = "http-opts",
         default,
@@ -289,38 +244,7 @@ impl RawVless {
                 })
             })
             .transpose()?;
-        let grpc = self
-            .grpc
-            .map(|grpc| {
-                let user_agent = grpc.user_agent.unwrap_or_else(|| "grpc-go/1.36.0".into());
-                if user_agent.len() > 8192
-                    || user_agent.parse::<http::HeaderValue>().is_err()
-                    || (grpc.max_connections > 0 && grpc.max_streams > 0)
-                    || std::time::Instant::now()
-                        .checked_add(std::time::Duration::from_secs(grpc.ping_interval))
-                        .is_none()
-                {
-                    return invalid("invalid VLESS gRPC options");
-                }
-                stream_options.grpc = GrpcOptions {
-                    user_agent,
-                    ping_interval: grpc.ping_interval,
-                    max_connections: if grpc.max_connections == 0
-                        && grpc.min_streams == 0
-                        && grpc.max_streams == 0
-                    {
-                        1
-                    } else {
-                        grpc.max_connections
-                    },
-                    min_streams: grpc.min_streams,
-                    max_streams: grpc.max_streams,
-                };
-                Ok(RawGrpc {
-                    service: grpc.service,
-                })
-            })
-            .transpose()?;
+        let grpc = self.grpc;
         if (network != "xhttp" && self.xhttp_opts.is_some())
             || (network == "xhttp"
                 && (ws.is_some() || grpc.is_some() || self.http.is_some() || self.h2.is_some()))

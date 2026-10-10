@@ -23,6 +23,8 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - DNS 不提供独立 listen、DoQ、DoH/H3、ECS、system/DHCP nameserver 或可配置 ARC 缓存。
   DoH 使用 H1 POST；详细解析角色、缓存与过滤行为见 [DNS 契约](tun-icmp-dns.md)。
 - 正则使用 Rust regex 子集，明确拒绝 lookaround/backreference。规则与 provider 的协议覆盖仅限已实现字段。
+- gRPC 三协议共用选项和节点连接池。负 ping-interval 明确拒绝，不复制固定参考
+  HTTP/2 客户端的立即重复 PING；超出本机可表示期限的正秒数也明确拒绝，不复制 Duration 溢出。
 - 订阅元信息只在成功候选或合法 304 后发布，失败响应或坏候选保留旧值；
   与 Mihomo 在读取响应头时更新的时点不同。数值仅接受有限且可表示的十进制数，
   不保留非有限/溢出浮点转换的参考行为。
