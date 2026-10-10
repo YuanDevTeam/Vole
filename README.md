@@ -20,11 +20,11 @@ Configuration uses **Mihomo-compatible YAML for the supported feature set**. Vol
 
 ## Proxy protocols
 
-All nine protocols below are enabled in the default build. HTTP CONNECT is TCP-only; UDP support for other protocols is configured per node.
+All nine protocols below are enabled in the default build. HTTP CONNECT itself is TCP-only; native UDP support for other protocols is configured per node.
 
 | Protocol | Capabilities |
 | --- | --- |
-| [VLESS](docs/vless.md) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP first-packet camouflage, legacy H2, [XHTTP H1/H2/H3](docs/xhttp.md); Vision, Encryption, REALITY, JLS, static ECH and sing-mux in supported combinations |
+| [VLESS](docs/vless.md) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP first-packet camouflage, legacy H2, [XHTTP H1/H2/H3](docs/xhttp.md); Vision, Encryption, REALITY, JLS and static ECH in supported combinations |
 | [VMess AEAD](docs/outbounds.md#vmess-aead) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP first-packet camouflage and legacy H2; TCP/UDP, plaintext or standard TLS |
 | [Trojan](docs/outbounds.md#trojan) | TCP/UDP over TLS TCP, WebSocket / HTTPUpgrade or gRPC |
 | [Shadowsocks 2022](docs/outbounds.md#shadowsocks-2022) | TCP/UDP; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305; AES identity chains; optional strict ShadowTLS v3 TCP wrapping and UoT v2 |
@@ -33,6 +33,8 @@ All nine protocols below are enabled in the default build. HTTP CONNECT is TCP-o
 | [SOCKS5](docs/outbounds.md#socks5) | CONNECT and UDP ASSOCIATE, with optional username/password authentication |
 | [Hysteria2](docs/outbounds.md#hysteria2) | QUIC TCP/UDP, bandwidth control, Salamander, port hopping and mTLS |
 | [TUIC v5](docs/outbounds.md#tuic-v5) | QUIC TCP/UDP, native/quic UDP relay modes and selectable congestion control |
+
+The shared [sing-mux wrapper](docs/xhttp.md#通用-sing-mux) supports all enabled node protocols. It provides TCP and, with `only-tcp: false`, UDP over the node's ordinary TCP path. The peer must provide sing-mux decoding; a normal HTTP/SOCKS5 listener does not automatically decode it.
 
 Standard TLS connections support certificate verification and SHA-256 certificate pins. Applicable TCP TLS paths can use Chrome, Firefox or Safari ClientHello templates; `client-fingerprint` is independent of the certificate `fingerprint`. See [TLS profiles and certificate policy](docs/tls-client-fingerprint.md) for the exact names and combinations. These features do not promise indistinguishability from a browser or unrestricted protocol combinations.
 

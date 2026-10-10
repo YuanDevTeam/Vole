@@ -88,6 +88,13 @@ CPU 数判断、业务数量配额、FD 预热或 DNS socket 复用。
 
 XUDP现在只拥有已认证流上的帧编码；VLESS响应头由VLESS包装层处理。元数据仍最多512字节，单payload仍受调用方预算和u16 wire上限约束，不新增全局会话额度。
 
+公共 sing-mux 包装器按节点拥有独立池，只消费底层协议到约定目标的 TCP IO。
+每池最多保留16条闲连接；命令/物理写队列16项、写块16 KiB，smux每流接收队列4项。
+yamux单连接累计接纳64流后退役，连接接收窗口16 MiB；活动兄弟流继续。
+h2mux/yamux上传半关闭保留读取与lease，smux v1关闭整条逻辑流。
+图只登记最终包装器；begin_shutdown同时关闭mux和底层准入，shutdown先join全部
+mux驱动，再等待底层协议。provider代际与node-only测速复用此屏障，没有全局池。
+
 ## 协议局部预算
 
 协议专用上限与关闭语义只维护在[入站](inbounds.md)、[出站](outbounds.md)、

@@ -1,6 +1,6 @@
 //! Outbound wire transports.
 
-#[cfg(feature = "outbound-vless")]
+#[cfg(feature = "sing-mux")]
 pub(crate) mod sing_mux;
 #[cfg(feature = "outbound-vless")]
 pub mod xhttp;

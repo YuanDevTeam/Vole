@@ -180,7 +180,7 @@ sniffer:
 #   内联 PEM certificate/private-key；不能混用 REALITY。完整策略见 vless.md。
 # - WS/gRPC/HTTP/H2 复用共享传输。WS 可 v2ray-http-upgrade 及其 fast-open；
 #   gRPC 与 Trojan/VMess 共用 UA、空闲 PING、max-connections/min-streams/max-streams 池阈值。
-# - smux 支持 h2mux/smux/yamux、padding/only-tcp 与池阈值；与 Vision 互斥。
+# - 公共节点 smux 支持 h2mux/smux/yamux、padding/only-tcp 与池阈值；与 Vision 互斥。
 # - client-fingerprint 接受 none/chrome/chrome120/firefox/firefox120/safari/safari16；
 #   chrome=Chrome133，firefox=Firefox120，safari=Safari16.0；节点缺省关闭。
 #   适用于标准 TCP TLS/REALITY，不改变证书 fingerprint；下载腿缺省继承、
@@ -195,6 +195,8 @@ sniffer:
 # 下方 vless-edge 通过 upstream-select 当前选择的 socks-hop 建链：
 # 客户端 -> socks-hop -> vless-edge -> 目标。
 # 所有节点支持 ip-version: dual/ipv4/ipv6/ipv4-prefer/ipv6-prefer；默认 dual。
+# 所有节点支持 smux 包装，要求对端提供 sing-mux 解码；普通 HTTP/SOCKS listener 不自动解码。
+# only-tcp: false 提供 mux UDP，即使底层 udp 为 false；true 保留底层 UDP 能力与编码。
 # HTTP(S) CONNECT 示例：type: http，必填 name/server/port，tls 默认 false。
 # username/password 均非空才认证；headers 为字符串映射；仅 TCP，不支持 udp: true。
 # tls: true 时支持 sni/skip-cert-verify/name-cert-verify/fingerprint，
@@ -369,12 +371,12 @@ proxies:
         # jls-opts: {} # 清除继承的 JLS；非空对象必须提供 username/password
     smux:
       enabled: false
-      protocol: h2mux # h2mux/smux/yamux
-      max-connections: 1 # 0–i32::MAX；正值与正 max-streams 互斥
+      protocol: h2mux # 缺省/空为 h2mux，另支持 smux/yamux
+      max-connections: 1 # 带符号平台整数；负阈值禁用；正值优先于 max-streams
       min-streams: 0
       max-streams: 0
       padding: false
-      only-tcp: false # true 保留 packet-encoding；false 使用 sing-mux UDP
+      only-tcp: false # true 委托底层 UDP；false 提供 sing-mux UDP
     dialer-proxy: upstream-select
 
   # REALITY 写法示意：在 VLESS 节点中保留 tls: true，并增加以下 mapping；不要与

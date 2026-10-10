@@ -8,34 +8,6 @@ use super::*;
 pub struct VlessStreamOptions {
     pub http_upgrade: bool,
     pub fast_open: bool,
-    pub sing_mux: Option<SingMuxConfig>,
-}
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SingMuxProtocol {
-    #[default]
-    H2Mux,
-    Smux,
-    Yamux,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct SingMuxConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub protocol: SingMuxProtocol,
-    #[serde(default)]
-    pub max_connections: u32,
-    #[serde(default)]
-    pub min_streams: u32,
-    #[serde(default)]
-    pub max_streams: u32,
-    #[serde(default)]
-    pub padding: bool,
-    #[serde(default)]
-    pub only_tcp: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,9 +82,6 @@ pub(super) struct RawVless {
         deserialize_with = "deserialize_present_map"
     )]
     xhttp_opts: Option<RawXHttpSettings>,
-
-    #[serde(default, deserialize_with = "deserialize_present_map")]
-    smux: Option<SingMuxConfig>,
 
     #[serde(
         rename = "ws-opts",
@@ -205,20 +174,6 @@ impl RawVless {
             return invalid("VLESS Vision requires TCP, TLS or Encryption, and XUDP");
         }
         let mut stream_options = VlessStreamOptions::default();
-        if let Some(mut mux) = self.smux {
-            if (mux.max_connections > 0 && mux.max_streams > 0)
-                || [mux.max_connections, mux.min_streams, mux.max_streams]
-                    .iter()
-                    .any(|value| *value > i32::MAX as u32)
-                || (mux.enabled && vision)
-            {
-                return invalid("invalid VLESS sing-mux options");
-            }
-            if mux.max_connections == 0 && mux.max_streams == 0 {
-                mux.min_streams = 8;
-            }
-            stream_options.sing_mux = mux.enabled.then_some(mux);
-        }
         let ws = self
             .ws
             .map(|ws| {

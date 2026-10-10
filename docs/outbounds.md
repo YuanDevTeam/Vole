@@ -15,7 +15,13 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
 - gRPC/legacy H2 首次读取延迟响应头时先检查原建链期限，即使响应已就绪也不能绕过
   超时；响应头已确认后的业务读取不再受该期限限制。
 - HTTP、SOCKS5、TUN、DNS 选路及 node-only `measureDelay` 使用同一连接器。
-  UDP 默认为 false；收发预算分别逐层扣封装开销，超限不截断交付。
+  底层业务 UDP 默认为 false；收发预算分别逐层扣封装开销，超限不截断交付。
+- 所有普通节点都可启用公共 `smux` 包装，使用节点自己的正常 TCP 传输与独立 mux 池，
+  业务路由、`dialer-proxy`、provider 代际与测速都使用最终包装器。
+  `only-tcp: false` 提供 mux UDP，包括底层 `udp: false` 或仅支持 TCP 的节点；
+  true 则原样委托底层 UDP，继承其能力。组 `disable-udp` 仍生效。
+  对端必须解码 sing-mux；普通 HTTP/SOCKS5 listener 不因此自动提供解码。
+  字段、半关闭及池边界见 [通用 sing-mux](xhttp.md#通用-sing-mux)。
 - TLS 使用共享 WebPKI、叶证书 pin/非叶信任锚与 skip 策略。pin 不匹配不能被 skip 绕过，
   TLS 握手签名始终验证。节点策略与恢复缓存不可变、互相隔离，标准 TLS 总票据预算为 4。
   字段及模板详见 [TLS 证书与指纹](tls-client-fingerprint.md)。
@@ -27,7 +33,8 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
 `type: http` 提供 TCP CONNECT；`tls: true` 在代理链路使用共享 TLS 与证书策略。
 支持 `username/password`、`headers`、`sni`、`skip-cert-verify`、`name-cert-verify`、
 `fingerprint` 及成对的内联 `certificate/private-key`。用户名和密码均非空时发送 Basic 认证。
-HTTP CONNECT 不提供 UDP，也不接受 `udp` 字段。握手沿用原期限，失败关闭，
+HTTP CONNECT 本身不提供 UDP，也不接受 `udp` 字段。公共 smux 可承载 UDP。
+握手沿用原期限，失败关闭，
 成功后保留响应头后的业务字节。启用此协议需要 `outbound-http` feature。
 
 ## SOCKS5

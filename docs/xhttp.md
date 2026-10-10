@@ -1,4 +1,4 @@
-# XHTTP 与 VLESS sing-mux
+# XHTTP 与通用 sing-mux
 
 XHTTP/sing-mux 使用严格字段与类型；未知、null、无效或被忽略的组合在 IO 前拒绝。
 REALITY、JLS、静态 ECH 的身份规则见 [VLESS](vless.md)，实际验证边界见[验收说明](acceptance.md)。
@@ -75,21 +75,23 @@ packet-up 在发送间隔内聚合小块写入，而不是把每个 write 变成
 
 前五项接受 0–i32::MAX 的字符串区间。h-max-request-times 和 h-max-reusable-secs 只有最大值为零才禁用；例如 `"0-1"` 采样到零仍按零预算或立即到期处理。c-max-reuse-times 则与 Mihomo 一样，采样值为零即不启用该项限制。两腿池与计数独立。已建物理连接保持原上游选择；创建新连接时才使用当前选择。H1 仅复用完整结束的上传请求连接，不复用取消的下载 GET。节点空闲缓存有界；它不构成业务流数量额度。
 
-## VLESS sing-mux
+## 通用 sing-mux
 
-节点级 `smux` 接受 enabled、protocol、max-connections、min-streams、max-streams、padding、only-tcp。enabled 默认 false；protocol 默认 h2mux，也支持 smux v1/yamux。计数是 0–i32::MAX 整数；正 max-connections 与正 max-streams 互斥。padding、only-tcp 默认 false。Vision 与启用的 sing-mux 互斥。
+所有已启用的普通节点协议都接受 `smux`，字段为 enabled、protocol、max-connections、min-streams、max-streams、padding、only-tcp。enabled 默认 false；protocol 缺省/空为 h2mux，也支持 smux v1/yamux。计数为带符号平台整数；负阈值禁用，两个正 max 字段同时配置时采用 max-connections 分支。padding、only-tcp 默认 false。Vision 与启用的 sing-mux 互斥。精简构建可独立启用 `sing-mux`，不要求 VLESS；未启用此 feature 时拒绝 enabled=true。
 
-空闲物理会话优先复用；max-connections>0 分支按连接数量与 min-streams 扩容，否则按 max-streams 阈值复用。max-connections=max-streams=0 时 min-streams 归一为 8，但不会将其解释为所有调度分支的硬额度。单流关闭不关闭兄弟流，节点 Stop 才取消和等待所有自有驱动。
+空闲物理会话优先复用；max-connections>0 分支按连接数量与 min-streams 扩容，否则按 max-streams 阈值复用。两个 max 字段字面值均为零时 min-streams 归一为 8；归一在负阈值禁用之前执行，不把该值解释为所有调度分支的硬额度。每节点和资源代际的池独立，单流关闭不关闭兄弟流，节点 Stop 才取消和等待所有自有驱动。
 
 每条逻辑流的状态字节沿用该次建链的绝对期限；读取前先检查超时，状态已缓冲也不例外。
 物理连接复用不重置期限；状态已确认后的业务读取不受原建链期限限制。
 
-smux 单流 shutdown 先等待已接受帧写入并 flush，再安排 FIN；h2mux 同样等待数据
-到达上游 IO 的 flush 边界再 reset。节点 Stop 或 Drop 可取消待写，不承诺异常终止交付。
+smux v1 单流 shutdown 先等待已接受帧写入并 flush，再安排 FIN 并结束整条逻辑流。
+h2mux 和 yamux 关闭上传后保留读取与租约，允许对端继续发送尾部；h2mux 的上传
+数据须到达上游 IO 的 flush 边界再发送 END_STREAM。节点 Stop 或 Drop 可取消待写，
+不承诺异常终止交付。
 
 yamux 的内部资源边界是单物理连接累计分配 64 个流后退役；旧流继续，新请求另建连接，空闲即回收。该边界避免逻辑取消与库内 reset 回收不同步时误关兄弟流，不是全节点额度，详见 [资源策略](runtime-resource-policy.md)。
 
-sing-mux 的外层是普通 VLESS TCP 到约定目标，**不是 VLESS CommandMux/XUDP**。only-tcp=false 时 UDP 使用 mux 的逐包地址格式，经受控解析处理域名；true 时保留所选 raw/XUDP/packetaddr 编码。`udp: false` 始终禁止业务 UDP。padding 覆盖握手及最初 16 个物理写入帧；接收增量解析和丢弃 padding，不按声明长度无限分配。
+sing-mux 的外层是底层协议的普通 TCP 到 `sp.mux.sing-box.arpa:444`，VLESS 使用 CommandTCP。对端必须提供 sing-mux 解码；普通 HTTP/SOCKS5 服务器不会自动解码，接受包装配置不等于默认服务器互通。only-tcp=false 时 UDP 使用 mux 的逐包地址格式，经受控解析处理域名，并提供有效 UDP 能力，即使底层 `udp: false`；true 时原样委托底层 UDP，保留其能力、编码、会话和预算。组 disable-udp 仍限制业务。padding 覆盖握手及最初 16 个物理写入帧；接收增量解析和丢弃 padding，不按声明长度无限分配。
 
 ## 关闭、安全与验收边界
 

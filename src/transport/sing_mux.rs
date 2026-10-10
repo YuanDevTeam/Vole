@@ -1,4 +1,4 @@
-//! Node-owned sing-mux sessions over supplied authenticated VLESS byte streams.
+//! Node-owned sing-mux sessions over supplied authenticated protocol streams.
 //! No sockets, resolver, global pool, or detached protocol tasks live here.
 use crate::{
     config::{SingMuxConfig, SingMuxProtocol},
@@ -104,11 +104,11 @@ impl Pool {
                             let active = c.active.load(Ordering::Acquire);
                             active == 0
                                 || if self.options.max_connections > 0 {
-                                    state.connections.len() >= self.options.max_connections as usize
-                                        || active < self.options.min_streams as usize
+                                    state.connections.len() >= self.options.max_connections
+                                        || active < self.options.min_streams
                                 } else {
                                     self.options.max_streams > 0
-                                        && active < self.options.max_streams as usize
+                                        && active < self.options.max_streams
                                 }
                         })
                         .map(|c| c.reserve(&self.state))
@@ -159,6 +159,8 @@ impl Pool {
                 raw: Some(raw),
                 lease: Some(lease),
                 response: false,
+                half_close: self.options.protocol != SingMuxProtocol::Smux,
+                upload_closed: false,
                 deadline: Box::pin(tokio::time::sleep_until(deadline)),
             }) as BoxStream)
         };
@@ -271,6 +273,8 @@ struct ResponseStream {
     raw: Option<BoxStream>,
     lease: Option<Lease>,
     response: bool,
+    half_close: bool,
+    upload_closed: bool,
     deadline: Pin<Box<tokio::time::Sleep>>,
 }
 impl AsyncRead for ResponseStream {
@@ -310,17 +314,26 @@ impl AsyncWrite for ResponseStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.upload_closed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
         Pin::new(self.raw.as_mut().ok_or(io::ErrorKind::BrokenPipe)?).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(self.raw.as_mut().ok_or(io::ErrorKind::BrokenPipe)?).poll_flush(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.upload_closed {
+            return Poll::Ready(Ok(()));
+        }
         if let Some(raw) = &mut self.raw {
             ready!(Pin::new(raw).poll_shutdown(cx))?;
         }
-        self.raw.take();
-        self.lease.take();
+        self.upload_closed = true;
+        if !self.half_close {
+            self.raw.take();
+            self.lease.take();
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -330,6 +343,44 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
 
+    #[tokio::test]
+    async fn half_close_keeps_the_read_side_and_lease_until_drop() {
+        for half_close in [false, true] {
+            let (raw, mut peer) = tokio::io::duplex(16);
+            let active = Arc::new(AtomicUsize::new(1));
+            let mut stream = ResponseStream {
+                raw: Some(Box::new(raw)),
+                lease: Some(Lease {
+                    active: active.clone(),
+                    pool: Weak::new(),
+                }),
+                response: true,
+                half_close,
+                upload_closed: false,
+                deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(1))),
+            };
+            stream.write_all(b"upload").await.unwrap();
+            stream.shutdown().await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut uploaded = Vec::new();
+            peer.read_to_end(&mut uploaded).await.unwrap();
+            assert_eq!(uploaded, b"upload");
+            assert_eq!(active.load(Ordering::Acquire), usize::from(half_close));
+            if half_close {
+                peer.write_all(b"tail").await.unwrap();
+                peer.shutdown().await.unwrap();
+                let mut tail = Vec::new();
+                stream.read_to_end(&mut tail).await.unwrap();
+                assert_eq!(tail, b"tail");
+                assert_eq!(active.load(Ordering::Acquire), 1);
+            } else {
+                assert_eq!(stream.read(&mut [0; 4]).await.unwrap(), 0);
+            }
+            drop(stream);
+            assert_eq!(active.load(Ordering::Acquire), 0);
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn lazy_status_obeys_setup_deadline_but_established_reads_do_not() {
         for timing in ["late-first-poll", "late-after-pending", "established"] {
@@ -338,6 +389,8 @@ mod tests {
                 raw: Some(Box::new(raw)),
                 lease: None,
                 response: false,
+                half_close: true,
+                upload_closed: false,
                 deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(1))),
             };
             if timing == "late-after-pending" {

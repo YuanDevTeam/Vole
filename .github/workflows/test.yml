@@ -178,6 +178,7 @@ jobs:
             shadowtls_config shadowtls_stream uot_config shadowsocks_uot hysteria2_packet_ids
             tuic_config tuic_memory httpupgrade_config httpupgrade_memory vmess_lifecycle
             grpc_config grpc_pool grpc_protocol_pool
+            sing_mux_config sing_mux
           )
           target_flags=()
           for target in "${targets[@]}"; do target_flags+=(--test "$target"); done
@@ -198,6 +199,7 @@ jobs:
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
             transport::sing_mux::smux_driver::tests:: transport::sing_mux::tests::
             grpc_duplex_pool_keeps_response
+            outbound::sing_mux::tests::
             platform::linux_network::tests:: platform::tun_rs_io::tests:: platform::windows_tun_io::tests::
             platform::windows_wintun_io::tests:: tun_runtime::tests::
             invoke::foreground::tests:: runtime::shutdown_tests:: runtime::providers::tests:: resource::probe::tests:: invoke::measure_delay::tests::
@@ -227,6 +229,7 @@ jobs:
             dns::runtime::tests::dns_policy_selection_is_consistent_across_snapshot_swaps
             runtime::tests::prepares_builtin_routes_without_static_nodes_or_bootstrap
             runtime::tests::prepares_udp_capabilities_through_runtime_wrappers
+            runtime::tests::prepares_shared_mux_capabilities_and_registers_only_final_graph_nodes
             runtime::tests::controller_diagnostics_are_opt_in_for_business_routes
             invoke::tests::null_invalid_utf8_and_oversized_input_return_json_failures
             invoke::tests::same_instance_command_is_fail_fast
@@ -257,7 +260,7 @@ jobs:
             cargo check --locked --no-default-features --features "outbound-$protocol" --lib
             run_test 1 --features "outbound-$protocol" --lib runtime::tests::integration_feature_admission_is_explicit_without_opening_sockets -- --exact
           done
-          for feature in outbound-http inbound-http inbound-socks5 stream-transport quic-transport shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
+          for feature in outbound-http inbound-http inbound-socks5 stream-transport quic-transport sing-mux shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
             cargo check --locked --no-default-features --features "$feature" --lib
           done
           cargo check --locked --no-default-features --features cli --bin vole

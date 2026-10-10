@@ -11,6 +11,10 @@ pub mod vmess;
 #[cfg(feature = "outbound-anytls")]
 mod anytls;
 mod connector;
+#[cfg(feature = "sing-mux")]
+mod sing_mux;
+#[cfg(feature = "sing-mux")]
+pub use sing_mux::SingMuxConnector;
 #[cfg(feature = "outbound-shadowsocks")]
 mod shadowsocks;
 #[cfg(any(feature = "outbound-anytls", feature = "outbound-shadowsocks"))]

@@ -1222,6 +1222,15 @@ fn build_proxy_graph(
             }
         };
 
+        #[cfg(feature = "sing-mux")]
+        let connector: Arc<dyn OutboundConnector> = if let Some(options) = &proxy.smux {
+            Arc::new(crate::outbound::SingMuxConnector::new(
+                connector,
+                options.clone(),
+            ))
+        } else {
+            connector
+        };
         let connector: Arc<dyn OutboundConnector> = Arc::new(crate::outbound::IpVersionConnector {
             inner: connector,
             version: proxy.ip_version,
@@ -2106,6 +2115,72 @@ proxy-groups:
         parts.proxy_graph.shutdown().await;
     }
 
+    #[cfg(all(
+        feature = "sing-mux",
+        feature = "outbound-http",
+        feature = "outbound-socks5"
+    ))]
+    #[tokio::test]
+    async fn prepares_shared_mux_capabilities_and_registers_only_final_graph_nodes() {
+        let prepared = PreparedCore::prepare(
+            br#"
+mixed-port: 1080
+proxies:
+  - {name: mux-http, type: http, server: 192.0.2.1, port: 1080, smux: {enabled: true}}
+  - {name: native-udp, type: socks5, server: 192.0.2.2, port: 1080, udp: false, smux: {enabled: true, only-tcp: true}}
+proxy-groups:
+  - {name: selected, type: select, proxies: [mux-http, native-udp]}
+  - {name: disabled, type: select, proxies: [mux-http], disable-udp: true}
+"#,
+            &FixedResolver,
+            ResourceLimits::default(),
+        ).await.unwrap();
+        let parts = prepared.build_dispatcher(Dialer::default()).unwrap();
+        for (index, expected) in [true, false].into_iter().enumerate() {
+            assert_eq!(
+                parts
+                    .resource_targets
+                    .get(ProxyId::new(index).unwrap())
+                    .unwrap()
+                    .supports_udp(),
+                expected
+            );
+            let node = &parts.proxy_graph.nodes[index];
+            assert_eq!(parts.proxy_graph.lifecycle_order.iter().filter(|target| {
+                matches!(target, BuiltRouteTarget::Proxy(registered) if Arc::ptr_eq(node, registered))
+            }).count(), 1);
+        }
+        assert_eq!(
+            parts
+                .proxy_graph
+                .lifecycle_order
+                .iter()
+                .filter(|target| matches!(target, BuiltRouteTarget::Proxy(_)))
+                .count(),
+            2
+        );
+        for (index, expected) in [true, false].into_iter().enumerate() {
+            assert_eq!(
+                parts
+                    .resource_targets
+                    .get_route(RouteTargetId::Group(ProxyGroupId::new(index).unwrap()))
+                    .unwrap()
+                    .supports_udp(),
+                expected
+            );
+        }
+        parts.proxy_groups.select("selected", "native-udp").unwrap();
+        assert!(
+            !parts
+                .resource_targets
+                .get_route(RouteTargetId::Group(ProxyGroupId::new(0).unwrap()))
+                .unwrap()
+                .supports_udp()
+        );
+        parts.proxy_graph.begin_shutdown();
+        parts.proxy_graph.shutdown().await;
+    }
+
     #[tokio::test]
     async fn prepares_builtin_routes_without_static_nodes_or_bootstrap() {
         let resolver = RecordingResolver::default();
@@ -2539,6 +2614,7 @@ rules:
 
         fn socks5(tag: &str) -> ProxyConfig {
             ProxyConfig {
+                smux: None,
                 ip_version: crate::config::IpVersion::Dual,
                 tag: tag.to_owned(),
                 dialer_proxy: None,
@@ -2555,6 +2631,7 @@ rules:
 
         fn anytls(tag: &str) -> ProxyConfig {
             ProxyConfig {
+                smux: None,
                 ip_version: crate::config::IpVersion::Dual,
                 tag: tag.to_owned(),
                 dialer_proxy: None,

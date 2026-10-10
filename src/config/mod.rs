@@ -2,10 +2,12 @@
 mod fake_ip;
 mod fallback;
 mod grpc;
+mod sing_mux;
 mod sniffer;
 pub use fake_ip::{FakeIpConfig, FakeIpFilterMode, FakeIpRange};
 pub use fallback::DnsFallbackConfig;
 pub use grpc::GrpcOptions;
+pub use sing_mux::{SingMuxConfig, SingMuxProtocol};
 mod http_proxy;
 mod ip_version;
 pub use http_proxy::HttpOutboundConfig;
@@ -56,7 +58,7 @@ pub use shadowsocks::{ShadowTlsConfig, ShadowsocksCipher, ShadowsocksOutboundCon
 mod trojan;
 pub use trojan::{TrojanOutboundConfig, TrojanTransport, WebSocketHandshake};
 mod vless;
-pub use vless::{SingMuxConfig, SingMuxProtocol, VlessStreamOptions};
+pub use vless::VlessStreamOptions;
 pub(crate) mod xhttp;
 pub use xhttp::{XHttpHeaders, XHttpRequestOptions, XHttpReuseConfig, XHttpVersion};
 mod vmess;
@@ -639,6 +641,7 @@ pub enum Network {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyConfig {
     pub ip_version: IpVersion,
+    pub smux: Option<SingMuxConfig>,
     pub tag: String,
     pub dialer_proxy: Option<RouteTargetId>,
     pub udp: bool,
@@ -1449,6 +1452,7 @@ where
 #[derive(Debug)]
 struct RawOutbound {
     ip_version: IpVersion,
+    smux: Option<sing_mux::RawSingMux>,
     protocol: RawProtocol,
 }
 impl<'de> Deserialize<'de> for RawOutbound {
@@ -1464,9 +1468,22 @@ impl<'de> Deserialize<'de> for RawOutbound {
             .transpose()
             .map_err(serde::de::Error::custom)?
             .unwrap_or_default();
+        let smux = value
+            .as_mapping_mut()
+            .expect("mapping checked")
+            .remove("smux")
+            .map(|value| {
+                if !value.is_mapping() {
+                    return Err("smux requires a mapping".to_owned());
+                }
+                serde_yaml_ng::from_value(value).map_err(|error| error.to_string())
+            })
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
         let protocol = serde_yaml_ng::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(Self {
             ip_version,
+            smux,
             protocol,
         })
     }
@@ -1880,6 +1897,7 @@ struct RawRealitySettings {
 #[derive(Debug)]
 struct PendingProxyConfig {
     ip_version: IpVersion,
+    smux: Option<SingMuxConfig>,
     tag: String,
     dialer_proxy: Option<String>,
     udp: bool,
@@ -2476,6 +2494,7 @@ fn normalize_proxy_graph_with_groups(
         .zip(dialer_proxies)
         .map(|(proxy, dialer_proxy)| ProxyConfig {
             ip_version: proxy.ip_version,
+            smux: proxy.smux,
             tag: proxy.tag,
             dialer_proxy,
             udp: proxy.udp,
@@ -2768,12 +2787,24 @@ impl RawOutbound {
                 (name, dialer_proxy, udp, ProxyProtocol::AnyTls(config))
             }
         };
+        let smux = self
+            .smux
+            .map(sing_mux::RawSingMux::normalize)
+            .transpose()?
+            .flatten();
+        if smux.is_some()
+            && matches!(&protocol, ProxyProtocol::Vless(node) if node.flow == "xtls-rprx-vision")
+        {
+            return invalid("VLESS Vision cannot use sing-mux");
+        }
+        let udp = udp || smux.as_ref().is_some_and(|options| !options.only_tcp);
         validate_route_target_definition_name(&tag, "proxy name")?;
         if let Some(dialer_proxy) = &dialer_proxy {
             validate_route_target_name(dialer_proxy, "dialer-proxy")?;
         }
         Ok(PendingProxyConfig {
             ip_version: self.ip_version,
+            smux,
             tag,
             dialer_proxy,
             udp,

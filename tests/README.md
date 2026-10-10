@@ -15,6 +15,9 @@ cargo test --locked --lib config::tests::
 cargo test --locked --lib config::tls_policy_tests::
 cargo test --locked --no-default-features --features cli --test grpc_config --test grpc_pool --test grpc_protocol_pool
 cargo test --locked --no-default-features --features cli --lib grpc_duplex_pool_keeps_response
+cargo test --locked --no-default-features --features cli --test sing_mux_config --test sing_mux
+cargo test --locked --no-default-features --features cli --lib sing_mux
+cargo test --locked --no-default-features --features cli --lib prepares_shared_mux_capabilities
 cargo test --locked --lib explicit_verification_name_does_not_change_sni_or_allow_skip_to_override_it
 cargo test --locked --lib mutual_tls_identity_is_required_verified_and_not_shared_between_clients
 cargo test --locked --lib geodata::tests::

@@ -97,7 +97,6 @@ pub struct VlessOutbound {
     cancellation: CancellationToken,
     tasks: TaskTracker,
     grpc_pool: Option<crate::transport::GrpcPool>,
-    sing_mux: Option<crate::transport::sing_mux::Pool>,
     vision: bool,
     vision_stats: Arc<crate::security::vision::SpliceStats>,
 }
@@ -502,11 +501,6 @@ impl VlessOutbound {
                 _ => None,
             },
             transport,
-            sing_mux: config
-                .stream_options
-                .sing_mux
-                .clone()
-                .map(crate::transport::sing_mux::Pool::new),
             vision: config.flow == "xtls-rprx-vision",
             vision_stats: Arc::default(),
         })
@@ -813,22 +807,6 @@ impl OutboundConnector for VlessOutbound {
         context: &EstablishContext,
     ) -> Result<ConnectedStream, DispatchError> {
         let effective_peer = session.destination.clone();
-        if let Some(mux) = &self.sing_mux {
-            let io = mux
-                .open(&effective_peer, false, context.deadline(), || async {
-                    let target = crate::session::Destination::domain("sp.mux.sing-box.arpa", 444)?;
-                    let prepared = self
-                        .prepare(session, context)
-                        .await
-                        .map_err(io::Error::other)?;
-                    prepared
-                        .finish(VlessCommand::Tcp, Some(&target))
-                        .await
-                        .map_err(io::Error::other)
-                })
-                .await?;
-            return Ok(ConnectedStream { io, effective_peer });
-        }
         let prepared = self.prepare(session, context).await?;
         let io = prepared
             .finish(VlessCommand::Tcp, Some(&effective_peer))
@@ -840,40 +818,6 @@ impl OutboundConnector for VlessOutbound {
         request: DatagramRequest,
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
-        if let Some(mux) = &self.sing_mux
-            && !mux.only_tcp()
-        {
-            let target = crate::session::Destination::domain("sp.mux.sing-box.arpa", 444)?;
-            let session = StreamSession {
-                metadata: request.session.metadata.clone(),
-                inbound: request.session.inbound,
-                source: request.session.source,
-                destination: target.clone(),
-                sniffed_domain: None,
-            };
-            let io = mux
-                .open(&target, true, context.deadline(), || async {
-                    let prepared = self
-                        .prepare(session, context)
-                        .await
-                        .map_err(io::Error::other)?;
-                    prepared
-                        .finish(VlessCommand::Tcp, Some(&target))
-                        .await
-                        .map_err(io::Error::other)
-                })
-                .await?;
-            return Ok(crate::dispatch::bound_datagram(
-                Box::new(crate::transport::sing_mux::datagram::DatagramIo::new(
-                    io,
-                    request.budget(),
-                    context.resolution(),
-                    context.deadline(),
-                    self.cancellation.clone(),
-                )),
-                request.budget(),
-            ));
-        }
         let prepared = self
             .prepare(
                 StreamSession {
@@ -908,9 +852,6 @@ impl OutboundConnector for VlessOutbound {
         if let Some(pool) = &self.grpc_pool {
             pool.begin_shutdown();
         }
-        if let Some(mux) = &self.sing_mux {
-            mux.begin_stop();
-        }
         if let Some(xhttp) = &self.xhttp {
             xhttp.begin_stop();
         }
@@ -924,9 +865,6 @@ impl OutboundConnector for VlessOutbound {
         self.tasks.wait().await;
         if let Some(pool) = &self.grpc_pool {
             pool.shutdown().await;
-        }
-        if let Some(mux) = &self.sing_mux {
-            mux.stop().await;
         }
         if let Some(xhttp) = &self.xhttp {
             xhttp.stop().await;

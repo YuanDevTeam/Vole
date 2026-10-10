@@ -42,6 +42,7 @@ default = [
     "outbound-hysteria2",
     "outbound-tuic",
     "shadow-tls-v3",
+    "sing-mux",
 ]
 inbound-http = []
 inbound-socks5 = []
@@ -49,13 +50,14 @@ outbound-anytls = ["dep:md-5", "tls-fingerprint"]
 outbound-socks5 = []
 outbound-http = []
 outbound-shadowsocks = ["dep:shadowsocks", "dep:log"]
-outbound-vless = ["tls-fingerprint", "boring/reality", "boring/jls", "boring/mlkem", "dep:blake3", "dep:hpke", "dep:zeroize", "dep:vole-blake3-raw", "stream-transport", "quic-transport", "dep:hyper", "dep:hyper-util", "dep:h3", "dep:h3-quinn", "dep:yamux", "tokio-util/compat"]
+outbound-vless = ["tls-fingerprint", "boring/reality", "boring/jls", "boring/mlkem", "dep:blake3", "dep:hpke", "dep:zeroize", "dep:vole-blake3-raw", "stream-transport", "quic-transport", "dep:hyper", "dep:hyper-util", "dep:h3", "dep:h3-quinn"]
 outbound-trojan = ["stream-transport", "tls-fingerprint"]
 outbound-vmess = ["stream-transport", "tls-fingerprint", "dep:aes", "dep:crc32fast", "dep:md-5", "dep:ring", "dep:shake"]
 tls-fingerprint = ["dep:boring", "dep:tokio-boring"]
 shadow-tls-v3 = ["tls-fingerprint", "boring/shadow-tls-v3", "dep:ring", "dep:zeroize"]
 outbound-hysteria2 = ["quic-transport", "dep:quinn-proto", "dep:h3", "dep:h3-quinn", "dep:blake2"]
 outbound-tuic = ["quic-transport"]
+sing-mux = ["stream-transport", "dep:yamux", "tokio-util/compat"]
 stream-transport = ["dep:tokio-tungstenite", "dep:httparse", "dep:log"]
 quic-transport = ["dep:quinn"]
 # Enables local interoperability-only trust-root injection. Release build
@@ -82,6 +84,7 @@ tun = [
     "outbound-hysteria2",
     "outbound-tuic",
     "shadow-tls-v3",
+    "sing-mux",
 ]
 
 [dependencies]

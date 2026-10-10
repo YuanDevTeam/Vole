@@ -1,4 +1,4 @@
-#![cfg(feature = "outbound-vless")]
+#![cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::{
@@ -14,7 +14,8 @@ use vole::{
     config::{Config, ProxyProtocol},
     dispatch::{BoxStream, DatagramTransport, DispatchError},
     outbound::{
-        ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector, VlessOutbound,
+        ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector, SingMuxConnector,
+        VlessOutbound,
     },
     session::{Destination, InboundKind, StreamSession},
 };
@@ -108,6 +109,8 @@ impl OutboundConnector for MemoryPeer {
                         let mut scratch = [0; 1024];
                         while let Ok(n) = io.read(&mut scratch).await {
                             if n == 0 {
+                                let _ = io.write_all(b"tail").await;
+                                let _ = io.shutdown().await;
                                 break;
                             }
                             io.write_all(&scratch[..n]).await.unwrap();
@@ -142,9 +145,20 @@ impl OutboundConnector for MemoryPeer {
                             false,
                         )
                         .unwrap();
-                    while let Some(Ok(data)) = input.data().await {
-                        input.flow_control().release_capacity(data.len()).unwrap();
-                        output.send_data(data, false).unwrap();
+                    loop {
+                        match input.data().await {
+                            Some(Ok(data)) => {
+                                input.flow_control().release_capacity(data.len()).unwrap();
+                                if output.send_data(data, false).is_err() {
+                                    break;
+                                }
+                            }
+                            None => {
+                                let _ = output.send_data(Bytes::from_static(b"tail"), true);
+                                break;
+                            }
+                            Some(Err(_)) => break,
+                        }
                     }
                 });
             }
@@ -165,18 +179,22 @@ impl OutboundConnector for MemoryPeer {
         Err(DispatchError::NotAllowed)
     }
 }
-fn outbound(peer: Arc<MemoryPeer>, options: &str) -> VlessOutbound {
+fn outbound(peer: Arc<MemoryPeer>, options: &str) -> SingMuxConnector {
     let raw = format!(
         "mixed-port: 1080\nproxies:\n- name: edge\n  type: vless\n  server: example.com\n  port: 443\n  uuid: 07070707-0707-0707-0707-070707070707\n  smux: {{enabled: true, {options}}}\nrules: [MATCH,edge]\n"
     );
     let raw = raw.replace("rules: [MATCH,edge]", "rules: ['MATCH,edge']");
     let config = Config::parse_yaml(raw.as_bytes()).unwrap();
+    let options = config.proxies[0].smux.clone().unwrap();
     let ProxyProtocol::Vless(config) = &config.proxies[0].protocol else {
         unreachable!()
     };
-    VlessOutbound::new_with_upstream(config, peer).unwrap()
+    SingMuxConnector::new(
+        Arc::new(VlessOutbound::new_with_upstream(config, peer).unwrap()),
+        options,
+    )
 }
-async fn open(node: &VlessOutbound) -> BoxStream {
+async fn open(node: &SingMuxConnector) -> BoxStream {
     node.connect_stream(
         StreamSession {
             metadata: Default::default(),
@@ -195,6 +213,56 @@ async fn hello(io: &mut BoxStream) {
     let mut greeting = [0; 5];
     io.read_exact(&mut greeting).await.unwrap();
     assert_eq!(&greeting, b"hello");
+}
+#[tokio::test]
+async fn shared_mux_preserves_h2mux_yamux_tail_and_smux_whole_close() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        for (protocol, wire) in [("h2mux", 2), ("yamux", 1), ("smux", 0)] {
+            let peer = Arc::new(MemoryPeer {
+                count: AtomicUsize::new(0),
+                tasks: Mutex::new(vec![]),
+                udp: false,
+                protocol: wire,
+            });
+            let node = outbound(
+                peer.clone(),
+                &format!("protocol: {protocol}, max-connections: 1"),
+            );
+            let mut first = open(&node).await;
+            let mut sibling = open(&node).await;
+            hello(&mut first).await;
+            hello(&mut sibling).await;
+            assert_eq!(peer.count.load(Ordering::SeqCst), 1);
+            first.write_all(b"upload").await.unwrap();
+            first.shutdown().await.unwrap();
+            first.shutdown().await.unwrap();
+            assert!(first.write_all(b"closed").await.is_err());
+            let mut tail = Vec::new();
+            first.read_to_end(&mut tail).await.unwrap();
+            assert_eq!(
+                tail,
+                if protocol == "smux" {
+                    &b""[..]
+                } else {
+                    &b"uploadtail"[..]
+                },
+                "{protocol}"
+            );
+            sibling.write_all(b"alive").await.unwrap();
+            sibling.flush().await.unwrap();
+            let mut response = [0; 5];
+            sibling.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"alive");
+            node.shutdown().await;
+            drop((first, sibling));
+            let tasks = std::mem::take(&mut *peer.tasks.lock().unwrap());
+            for task in tasks {
+                task.await.unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
 }
 #[tokio::test]
 async fn yamux_replacing_dropped_streams_at_capacity_keeps_the_sibling_alive() {
@@ -321,13 +389,18 @@ async fn h2mux_sends_idle_ping_and_retires_a_peer_that_never_acknowledges() {
     );
     let raw = serde_json::json!({"mixed-port":1080,"proxies":[{"name":"edge","type":"vless","server":"example.com","port":443,"uuid":"07070707-0707-0707-0707-070707070707","smux":{"enabled":true,"max-connections":1}}],"rules":["MATCH,edge"]});
     let config = Config::parse_yaml(raw.to_string().as_bytes()).unwrap();
+    let options = config.proxies[0].smux.clone().unwrap();
     let ProxyProtocol::Vless(config) = &config.proxies[0].protocol else {
         unreachable!()
     };
     let (io, mut peer) = tokio::io::duplex(4096);
-    let node =
-        VlessOutbound::new_with_upstream(config, Arc::new(CapturePeer(Mutex::new(Some(io)))))
-            .unwrap();
+    let node = SingMuxConnector::new(
+        Arc::new(
+            VlessOutbound::new_with_upstream(config, Arc::new(CapturePeer(Mutex::new(Some(io)))))
+                .unwrap(),
+        ),
+        options,
+    );
     let (ping, mut received) = tokio::sync::oneshot::channel();
     let peer = tokio::spawn(async move {
         let mut preface = [0; 45];
@@ -391,9 +464,10 @@ async fn only_tcp_preserves_all_three_vless_udp_wire_commands() {
             for (codec, command) in [("xudp", 3), ("none", 2), ("packetaddr", 2)] {
                 let raw = serde_json::json!({"mixed-port":1080,"proxies":[{"name":"edge","type":"vless","server":"example.com","port":443,"uuid":"07070707-0707-0707-0707-070707070707","udp":true,"packet-encoding":codec,"smux":{"enabled":true,"protocol":protocol,"padding":true,"only-tcp":true}}],"rules":["MATCH,edge"]});
                 let config = Config::parse_yaml(raw.to_string().as_bytes()).unwrap();
-                let ProxyProtocol::Vless(config) = &config.proxies[0].protocol else { unreachable!() };
+                let options=config.proxies[0].smux.clone().unwrap();
+    let ProxyProtocol::Vless(config) = &config.proxies[0].protocol else { unreachable!() };
                 let (io, mut peer) = tokio::io::duplex(4096);
-                let node = VlessOutbound::new_with_upstream(config, Arc::new(CapturePeer(Mutex::new(Some(io))))).unwrap();
+                let node = SingMuxConnector::new(Arc::new(VlessOutbound::new_with_upstream(config, Arc::new(CapturePeer(Mutex::new(Some(io))))).unwrap()),options);
                 let mut association = node.open_datagram(
                     DatagramRequest::new(DatagramSession::new(InboundKind::InternalMeasure, "127.0.0.1:1".parse().unwrap())),
                     &EstablishContext::default(),
