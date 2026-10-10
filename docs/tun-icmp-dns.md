@@ -59,7 +59,8 @@ HTTP/TLS 用于 TUN 与 mixed TCP；QUIC v1/v2 多包识别用于 TUN UDP。
 fake-IP 恢复后的域名与显式域名只在 `force-domain` 匹配时强制嗅探。
 `skip-src-address` / `skip-dst-address` 在读取前排除地址；`skip-domain` 排除识别结果。
 域名项支持通配、GeoSite 和 domain/classical 规则集合；地址项支持 CIDR、GeoIP 与
-ipcidr/classical 集合，classical 只使用对应的域名或目标 IP 条件。
+ipcidr/classical 集合，classical 使用对应的域名或目标 IP 条件及完全由其组成的
+AND/OR/NOT。混合其他类型叶子的整个逻辑项不参与 selector，不做部分求值。
 
 全局 `override-destination` 默认 true，协议级值优先。false 只将识别域名提供给规则，
 保留实际目标；true 替换为识别域名，DIRECT 或必须 IP 的传输再解析。
@@ -185,7 +186,7 @@ DoQ/H3 都沿用原 DNS 路由、bootstrap、证书政策与查询包装，不�
   `code`、`code@attr@attr` 或前置 `!` 的反选，属性为 key 存在性 AND。与业务规则共享分类和记录，
   `@!cn` 是字面属性 key，不是属性排除；
 - GeoSite 项隔开域名区块，区块与 GeoSite 项按声明顺序匹配；重复 GeoSite selector 也按此顺序处理；
-- value 接受单个 nameserver 字符串或非空数组；`rule-set:` 引用 domain/classical 集合，classical 仅使用域名条件；
+- value 接受单个 nameserver 字符串或非空数组；`rule-set:` 引用 domain/classical 集合，classical 使用域名条件及纯域名 AND/OR/NOT，不使用混合其他叶子的逻辑项；
 - 命中后只在所选列表内并发查询，列表耗尽不查询其他 policy 或主组；
 - GeoSite 资产或分类不可用时该 policy 不命中，不能因反选变成全匹配；
 - 存在分类但属性筛选为空时仍可用，正选不命中、反选匹配合法非空名称。

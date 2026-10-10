@@ -3908,8 +3908,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classical_logical_selectors_drive_dns_policy_and_sniffing_without_egress() {
+        let configuration = crate::config::Config::parse_yaml(
+            br#"
+rule-providers:
+  domains:
+    type: inline
+    behavior: classical
+    payload: ['AND,((DOMAIN-SUFFIX,example),(DOMAIN-KEYWORD,api))']
+  blocked:
+    type: inline
+    behavior: classical
+    payload: ['OR,((DOMAIN,skip.example),(DOMAIN,other.example))']
+  addresses:
+    type: inline
+    behavior: classical
+    payload: ['AND,((IP-CIDR,192.0.2.0/24),(NOT,((IP-CIDR,192.0.2.7/32))))']
+dns:
+  enable: true
+  use-system-hosts: false
+  nameserver: ['rcode://success']
+  nameserver-policy:
+    'rule-set:domains': ['rcode://refused']
+sniffer:
+  enable: true
+  parse-pure-ip: false
+  force-dns-mapping: false
+  force-domain: ['rule-set:domains']
+  skip-domain: ['rule-set:blocked']
+  skip-src-address: ['rule-set:addresses']
+  skip-dst-address: ['rule-set:addresses']
+  sniff: {TLS: {ports: [443]}}
+"#,
+        )
+        .unwrap();
+        let dispatcher = Arc::new(MockDispatcher::with_replies(vec![], vec![]));
+        let resolver = RuntimeDns::new(&configuration.dns, dispatcher.clone());
+        for (name, expected) in [
+            ("api.example", RCODE_REFUSED),
+            ("www.example", RCODE_NOERROR),
+        ] {
+            let response = resolver
+                .exchange(&build_query(9, name, QueryType::A).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(parse_response(&response).unwrap().rcode, expected);
+        }
+        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 0);
+        assert_eq!(dispatcher.tcp_calls.load(Ordering::Acquire), 0);
+        let policy = crate::sniffing::Policy::new(
+            Arc::new(configuration.sniffer),
+            Arc::new(EmptyGeoMatcher),
+        );
+        let destination = Destination::Ip("203.0.113.1:443".parse().unwrap());
+        let plan = policy
+            .plan(
+                "198.51.100.1:9000".parse().unwrap(),
+                &destination,
+                Some("api.example"),
+                false,
+            )
+            .unwrap();
+        assert!(plan.tcp_enabled());
+        assert_eq!(plan.accepts("skip.example"), Ok(false));
+        assert_eq!(plan.accepts("api.example"), Ok(true));
+        for (source, destination, expected) in [
+            ("192.0.2.1:9000", "203.0.113.1:443", false),
+            ("192.0.2.7:9000", "203.0.113.1:443", true),
+            ("198.51.100.1:9000", "192.0.2.1:443", false),
+        ] {
+            let plan = policy
+                .plan(
+                    source.parse().unwrap(),
+                    &Destination::Ip(destination.parse().unwrap()),
+                    Some("api.example"),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(plan.tcp_enabled(), expected);
+        }
+    }
+
+    #[tokio::test]
     async fn rule_budget_propagates_through_fake_ip_policy_and_sniffer_without_egress() {
-        let payload = serde_json::to_string(&vec!["DOMAIN-REGEX,(?=never)never"; 16]).unwrap();
+        let payload = serde_json::to_string(&vec![
+            "AND,((DOMAIN-REGEX,(?=never)never),(DOMAIN-SUFFIX,example))";
+            16
+        ])
+        .unwrap();
         let configuration = crate::config::Config::parse_yaml(
             format!(
                 r#"

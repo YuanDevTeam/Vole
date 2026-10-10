@@ -253,7 +253,10 @@ impl RuleCollection {
     ) -> std::result::Result<bool, super::MatchFailure> {
         use crate::routing::PredicateFailure;
         if self.behavior == RuleBehavior::Classical {
-            for rule in self.classical.iter().filter(|rule| selects(&rule.kind)) {
+            for rule in &self.classical {
+                if !selects_predicate(&rule.kind, &selects, context.decision())? {
+                    continue;
+                }
                 match crate::routing::matches_rule(rule, context, geo) {
                     Ok(true) => return Ok(true),
                     Ok(false) | Err(PredicateFailure::NeedsIpResolution) => {}
@@ -268,6 +271,29 @@ impl RuleCollection {
                 Err(PredicateFailure::Evaluation(failure)) => Err(failure),
             }
         }
+    }
+}
+
+// Selector contexts carry only a domain or destination IP. Admit complete
+// logical predicates whose leaves consume that value, rather than evaluating
+// a partial expression or exposing synthetic port/ingress metadata.
+fn selects_predicate(
+    kind: &RuleKind,
+    selects: &impl Fn(&RuleKind) -> bool,
+    decision: &RuleDecision,
+) -> std::result::Result<bool, MatchFailure> {
+    decision.visit()?;
+    match kind {
+        RuleKind::And(children) | RuleKind::Or(children) => {
+            for child in children {
+                if !selects_predicate(&child.kind, selects, decision)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        RuleKind::Not(child) => selects_predicate(&child.kind, selects, decision),
+        _ => Ok(selects(kind)),
     }
 }
 
@@ -410,6 +436,100 @@ fn parse_mrs(bytes: &[u8], behavior: RuleBehavior) -> Result<RuleCollection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn classical_selectors_keep_complete_logical_domain_and_ip_predicates() {
+        let geo = crate::routing::EmptyGeoMatcher;
+        for (payload, matched, unmatched) in [
+            (
+                "AND,((DOMAIN-SUFFIX,example),(DOMAIN-KEYWORD,api))",
+                "api.example",
+                "www.example",
+            ),
+            (
+                "OR,((DOMAIN,api.example),(AND,((DOMAIN-SUFFIX,example),(NOT,((DOMAIN,skip.example))))))",
+                "www.example",
+                "skip.example",
+            ),
+            ("NOT,((DOMAIN,skip.example))", "api.example", "skip.example"),
+        ] {
+            let set = RuleCollection::from_payload(vec![payload.into()], RuleBehavior::Classical)
+                .unwrap();
+            assert_eq!(
+                set.matches_domain(matched, &geo, &Default::default()),
+                Ok(true)
+            );
+            assert_eq!(
+                set.matches_domain(unmatched, &geo, &Default::default()),
+                Ok(false)
+            );
+        }
+        for (payload, matched, unmatched) in [
+            (
+                "AND,((IP-CIDR,192.0.2.0/24),(NOT,((IP-CIDR,192.0.2.7/32))))",
+                "192.0.2.1",
+                "192.0.2.7",
+            ),
+            (
+                "OR,((IP-CIDR,192.0.2.0/24),(IP-SUFFIX,198.51.100.1/8))",
+                "198.51.100.1",
+                "198.51.100.2",
+            ),
+            ("NOT,((IP-CIDR,192.0.2.0/24))", "198.51.100.1", "192.0.2.1"),
+            (
+                "AND,((IP-CIDR6,2001:db8::/32),(NOT,((IP-SUFFIX,::7/8))))",
+                "2001:db8::1",
+                "2001:db8::7",
+            ),
+            (
+                "OR,((IP-CIDR6,2001:db8::/32),(IP-SUFFIX,::1/8))",
+                "2001:db9::1",
+                "2001:db9::2",
+            ),
+            (
+                "NOT,((IP-CIDR6,2001:db8::/32))",
+                "2001:db9::1",
+                "2001:db8::1",
+            ),
+        ] {
+            let set = RuleCollection::from_payload(vec![payload.into()], RuleBehavior::Classical)
+                .unwrap();
+            assert_eq!(
+                set.matches_ip(matched.parse().unwrap(), &geo, &Default::default()),
+                Ok(true)
+            );
+            assert_eq!(
+                set.matches_ip(unmatched.parse().unwrap(), &geo, &Default::default()),
+                Ok(false)
+            );
+        }
+        // A true supported leaf must not turn a mixed OR into a partial match;
+        // NOT must not invert a foreign predicate into a selector-wide match.
+        for payload in [
+            "AND,((DOMAIN,api.example),(NETWORK,TCP))",
+            "OR,((DOMAIN,api.example),(DST-PORT,53))",
+            "NOT,((SRC-IP-CIDR,192.0.2.0/24))",
+        ] {
+            let set = RuleCollection::from_payload(vec![payload.into()], RuleBehavior::Classical)
+                .unwrap();
+            assert_eq!(
+                set.matches_domain("api.example", &geo, &Default::default()),
+                Ok(false)
+            );
+        }
+        for payload in [
+            "AND,((IP-CIDR,192.0.2.0/24),(NETWORK,TCP))",
+            "OR,((IP-CIDR,192.0.2.0/24),(DOMAIN,api.example))",
+            "NOT,((SRC-IP-CIDR,198.51.100.0/24))",
+        ] {
+            let set = RuleCollection::from_payload(vec![payload.into()], RuleBehavior::Classical)
+                .unwrap();
+            assert_eq!(
+                set.matches_ip("192.0.2.1".parse().unwrap(), &geo, &Default::default()),
+                Ok(false)
+            );
+        }
+    }
+
     #[test]
     fn ingress_source_rule_set_swaps_address_ports_but_keeps_host_and_identity() {
         use crate::session::{InboundKind, InboundMetadata};
