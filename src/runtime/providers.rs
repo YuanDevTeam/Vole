@@ -6,7 +6,7 @@ use crate::{
     dispatch::{BoxStream, DatagramBudget, DatagramTransport, DispatchError},
     resource::{
         cache::{ProviderCache, ProviderState},
-        control::{DnsSnapshot, RuntimeResources},
+        control::{DelayRequest, DnsSnapshot, ProbeError, RuntimeResources},
     },
     routing::ProxyGroupError,
     session::{Datagram, DatagramSession, Destination, StreamSession},
@@ -491,6 +491,67 @@ impl RuntimeResources for ProviderRuntime {
             dns,
             _generation: Some(generation),
         })
+    }
+    async fn node_delay(
+        &self,
+        name: &str,
+        request: &DelayRequest,
+        cancel: &CancellationToken,
+    ) -> Result<u64, ProbeError> {
+        let generation = self.current.load_full();
+        tokio::select! { biased;
+            () = self.cancellation.cancelled() => Err(ProbeError::Stopped),
+            result = generation.health.node_delay(name, request, cancel) => result,
+        }
+    }
+    async fn group_delay(
+        &self,
+        name: &str,
+        request: &DelayRequest,
+        cancel: &CancellationToken,
+    ) -> Result<BTreeMap<String, u64>, ProbeError> {
+        let generation = {
+            // Reset and persist under the same publication lock as manual selection.
+            // Release it before any probe waits or network I/O.
+            let _publication = self.publication.lock().unwrap();
+            let generation = self.current.load_full();
+            if let Ok(state) = generation.groups.state(name)
+                && matches!(
+                    state.kind,
+                    crate::config::GroupKind::UrlTest | crate::config::GroupKind::Fallback
+                )
+            {
+                if let Some(index) = generation
+                    .config
+                    .proxy_groups
+                    .iter()
+                    .position(|group| group.name == name)
+                {
+                    generation.groups.selection(index).clear_forced();
+                }
+                *self.persistence_error.write().unwrap() = self
+                    .store
+                    .save(name, "")
+                    .err()
+                    .map(|_| "selection cache write failed");
+            }
+            generation
+        };
+        tokio::select! { biased;
+            () = self.cancellation.cancelled() => Err(ProbeError::Stopped),
+            result = generation.health.group_delay(name, request, cancel) => result,
+        }
+    }
+    async fn provider_healthcheck(
+        &self,
+        name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), ProbeError> {
+        let generation = self.current.load_full();
+        tokio::select! { biased;
+            () = self.cancellation.cancelled() => Err(ProbeError::Stopped),
+            result = generation.health.provider_healthcheck(name, cancel) => result,
+        }
     }
     async fn refresh(&self, rules: bool, name: &str) -> Result<(), &'static str> {
         if self.cancellation.is_cancelled() {

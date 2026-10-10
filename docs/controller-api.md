@@ -10,10 +10,10 @@ secret: "vole-runtime-secret"
 ```
 
 - 省略 `external-controller` 表示不启动 Controller，也不采集业务连接、规则命中和建链诊断，此时不能单独配置 `secret`。代理组选择、健康检查、资源更新与 TUN 原始流量统计独立运行。
-- `external-controller` 只接受带显式非零端口的回环 IP 地址。它要求启用 TUN 或至少显式定义一个 `proxy-groups`；非 TUN 配置须通过 `mixed-port` 满足运行配置的入站要求。
-- 只要同时显式配置代理组与 Controller，`secret` 就必填；仅有 TUN 流量接口时可省略。`secret` 出现时必须为 1–255 UTF-8 字节，并保护本文定义的全部路由。
+- `external-controller` 只接受带显式非零端口的回环 IP 地址。合法的 mixed-only 静态节点和纯 DIRECT 配置均可使用；非 TUN 配置仍通过 `mixed-port` 满足入站要求。
+- 只要同时显式配置代理组与 Controller，`secret` 就必填；没有显式代理组时可省略。`secret` 出现时必须为 1–255 UTF-8 字节，并保护本文定义的全部路由。
 - `measureDelay` 的 node-only 配置不能包含 Controller 或代理组字段。
-- `validateConfig` 只校验字段；`prepare` 不监听端口；`start` 绑定端口，绑定失败则启动失败。`stop` 和 `destroyInstance` 关闭监听器。
+- `validateConfig` 只校验字段；`start` 绑定端口，绑定失败则启动失败。`stop` 和 `destroyInstance` 关闭监听器。
 
 Controller 与公共运行时 session 同生共灭。`profile.store-selected` 默认 true，Core 将显式选择保存到 dataDir/selected.json，在下次启动时恢复有效成员；不写回 YAML。关闭该选项后只保留会话内选择。写入失败不回滚已生效的选择，`GET /proxies` 的 `selectionError` 给出脱敏原因。
 
@@ -95,6 +95,26 @@ time 为 Unix 秒；未探测节点初始 alive 为 true、history 为空。HTTP
 load-balance 根据每条新连接的元数据选择成员，响应不含 `now`，不接受手动选择。业务 UDP 按目标会话固定出口。
 
 url-test/fallback 的手动选择在该成员健康时保持固定，失败后恢复自动选择。url-test 使用 tolerance 抑制小幅切换，fallback 按成员顺序选择与恢复。
+
+## 主动探测与内存
+
+`GET /proxies/{name}/delay?url=https%3A%2F%2Fexample.com%2F&timeout=5000&expected=200-299`
+通过当前节点或代理组探测 URL，成功返回 `{"delay":12}`，单位毫秒。
+`GET /group/{name}/delay` 使用相同 query，返回成功成员的名称到毫秒映射，并清除自动组的手动固定选择。
+url-test 组采用配置中的测试 URL，其他组采用请求 URL。
+`timeout` 必须传入：节点路由为有符号 16 位毫秒，组路由为有符号 32 位毫秒；非正数立即到期。
+`expected` 可省略，或使用现有状态范围语法。未知目标返回 404，无效请求 400，探测超时 504，节点失败或零 delay 503。
+HTTP 响应完成时即返回延迟，即使状态不符合 `expected`；该 URL 的健康记录会记为失败。
+节点的一般存活状态记录传输是否完成，与配置 URL 的健康状态分开。
+
+`GET /providers/proxies/{name}/healthcheck` 使用 Provider 已配置的健康 URL、timeout 和 expected-status，
+完成后返回 204；单个成员失败写入共享健康状态，不使整个响应失败。探测使用当前资源代际、DNS 和出口，
+排除业务连接和流量统计，不触碰 lazy 活动时间。主动与自动探测共用每代际 10 个并发槽，停止取消所有等待。
+每个节点只保留一份最近手动结果；任意 URL 不增加无界历史。同 URL 的配置探测状态同步更新，供自动组选路使用。
+
+`GET /memory` 返回一次 `{"inuse":123456,"oslimit":null}` 快照：Linux/Android 读取自身 `/proc/self/status` 的 VmRSS，
+Apple 使用自身 Mach task resident size，Windows 使用当前进程 working set。单位均为字节；读取失败为 null。
+未获取进程内存上限，oslimit 为 null。该路由不提供 Mihomo 的周期流式响应，不启动后台采样；不同平台口径不能直接横比。
 
 ## `PUT /proxies/{name}`
 
@@ -179,7 +199,7 @@ Expire 为 Unix 秒。未知时省略该对象，缺失子项为 0；不以本�
   扩展字段 `dnsPath` 是当前建链任务实际经过的有界 DNS 阶段标签，例如缓存、policy、
   fallback、fake-IP 与解析角色；不包含上游地址、URL 或认证头。
 - 扩展字段 `errors` 最多保留最近 32 次建链/数据报失败的连接信息与固定错误码，
-  不返回底层错误原文。`memory` 当前为 0，表示未采集进程 RSS。
+  不返回底层错误原文。`memory` 是本次请求采集的当前进程 resident bytes，不可用时为 null。
 
 连接元数据保存原生地址、端口和时间，重复的节点、组及规则文本共享存储。
 查询只在短锁内取得连接引用，再固定计数和 DNS 路径并直接序列化；快照不保活
@@ -226,8 +246,10 @@ policy 与 fallback 仍生效。DNS 关闭或查询失败返回 500。这里只�
 | `411 Length Required` | PUT 缺少 `Content-Length` |
 | `413 Payload Too Large` | PUT 正文超过 1 KiB |
 | `415 Unsupported Media Type` | PUT 不是严格 `application/json` |
+| `503 Service Unavailable` | 探测或资源更新失败 |
+| `504 Gateway Timeout` | 主动探测超时 |
 
-当前不提供 Controller 主动 delay 测试、配置修改、WebSocket 推送、Controller 版本协商或完整 Dashboard response。除本文列出的连接、规则、配置、DNS 和 provider 路由、`GET /proxies`、`GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}` 外，其他路径和方法均不属于公共协议。
+当前不提供配置修改、WebSocket 推送、Controller 版本协商或完整 Dashboard response。除本文列出的连接、规则、配置、DNS、主动探测、内存和 provider 路由、`GET /proxies`、`GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}` 外，其他路径和方法均不属于公共协议。
 
 Windows WinRT VPN 的完整运行时和 Controller 位于独立 Session Host；桌面 Wintun 的
 Controller 位于普通业务运行时。宿主通过回环 HTTP 直接访问实际 Running Session；

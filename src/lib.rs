@@ -103,3 +103,4 @@ pub const BUILD_IDENTITY: &str =
     concat!("Vole;engine=rust;coreVersion=", env!("CARGO_PKG_VERSION"));
 
 mod connections;
+mod memory;

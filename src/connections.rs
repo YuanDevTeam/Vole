@@ -154,6 +154,7 @@ impl Serialize for Failure {
 pub(crate) struct Snapshot {
     connections: Vec<ConnectionSnapshot>,
     failures: Vec<Arc<Failure>>,
+    memory: Option<u64>,
     upload: u64,
     download: u64,
 }
@@ -163,7 +164,7 @@ impl Serialize for Snapshot {
         state.serialize_field("uploadTotal", &self.upload)?;
         state.serialize_field("downloadTotal", &self.download)?;
         state.serialize_field("connections", &self.connections)?;
-        state.serialize_field("memory", &0u8)?;
+        state.serialize_field("memory", &self.memory)?;
         state.serialize_field("errors", &SharedSlice(&self.failures))?;
         state.end()
     }
@@ -228,6 +229,7 @@ impl Registry {
         Snapshot {
             connections,
             failures,
+            memory: crate::memory::resident_bytes(),
             upload: self.totals.upload.load(Ordering::Relaxed),
             download: self.totals.download.load(Ordering::Relaxed),
         }

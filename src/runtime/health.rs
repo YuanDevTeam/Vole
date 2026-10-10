@@ -3,7 +3,10 @@ use super::*;
 use crate::{
     config::{HealthCheckConfig, status_ranges},
     dispatch::{BoxStream, DatagramTransport, DispatchError},
-    resource::probe::{self, Target},
+    resource::{
+        control::{DelayRequest, ProbeError},
+        probe::{self, Target},
+    },
     session::{DatagramSession, StreamSession},
 };
 use futures_util::{StreamExt, stream};
@@ -52,16 +55,24 @@ pub(super) struct Sample {
     pub alive: bool,
     pub delay: u64,
     pub time: u64,
+    #[serde(skip)]
+    order: u64,
+    #[serde(skip)]
+    expected_matches: bool,
 }
 struct Job {
     spec: HealthCheckConfig,
     members: Vec<String>,
     group: Option<usize>,
     last: Option<Instant>,
+    provider: Option<String>,
 }
 pub(super) struct HealthRuntime {
     jobs: Mutex<Vec<Job>>,
     samples: Mutex<BTreeMap<(String, String), Sample>>,
+    manual_samples: Mutex<BTreeMap<String, Sample>>,
+    sequence: std::sync::atomic::AtomicU64,
+    probe_slots: tokio::sync::Semaphore,
     groups: Arc<ProxyGroups>,
     targets: RouteTargetDispatchers,
     direct: Arc<dyn Dispatcher>,
@@ -91,6 +102,7 @@ impl HealthRuntime {
                     .collect(),
                 group: Some(i),
                 last: None,
+                provider: None,
             });
         }
         if let Some(template) = &config.providers {
@@ -108,6 +120,7 @@ impl HealthRuntime {
                         .unwrap_or_default(),
                     group: None,
                     last: None,
+                    provider: Some(name.clone()),
                 });
             }
         }
@@ -133,6 +146,9 @@ impl HealthRuntime {
         Arc::new(Self {
             jobs: Mutex::new(jobs),
             samples: Mutex::new(BTreeMap::new()),
+            manual_samples: Mutex::new(BTreeMap::new()),
+            sequence: std::sync::atomic::AtomicU64::new(0),
+            probe_slots: tokio::sync::Semaphore::new(10),
             groups,
             targets,
             direct,
@@ -156,11 +172,271 @@ impl HealthRuntime {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        for ((name, _), sample) in samples.iter() {
-            nodes.insert(name.clone(),serde_json::json!({"name":name,"alive":sample.alive,"history":[{"time":sample.time,"delay":sample.delay}]}));
+        for (name, kind) in [
+            ("DIRECT", "Direct"),
+            ("COMPATIBLE", "Compatible"),
+            ("REJECT", "Reject"),
+            ("REJECT-DROP", "RejectDrop"),
+            ("PASS", "Pass"),
+            ("PASS-RULE", "PassRule"),
+        ] {
+            nodes.insert(
+                name.to_owned(),
+                serde_json::json!({"name":name,"type":kind,"alive":true,"history":[]}),
+            );
+        }
+        let manual = self.manual_samples.lock().unwrap();
+        let mut latest = BTreeMap::<&str, &Sample>::new();
+        for (name, sample) in samples
+            .iter()
+            .map(|((name, _), s)| (name.as_str(), s))
+            .chain(manual.iter().map(|(name, s)| (name.as_str(), s)))
+        {
+            if latest.get(name).is_none_or(|old| old.order < sample.order) {
+                latest.insert(name, sample);
+            }
+        }
+        for (name, sample) in latest {
+            let node = nodes
+                .entry(name.to_owned())
+                .or_insert_with(|| serde_json::json!({"name":name}));
+            node["alive"] = serde_json::json!(sample.alive);
+            node["history"] = serde_json::json!([{"time":sample.time,"delay":sample.delay}]);
         }
         serde_json::json!(nodes)
     }
+    fn sample(&self, result: &Result<probe::Observation, ProbeError>) -> Sample {
+        Sample {
+            alive: result.is_ok(),
+            delay: result.as_ref().map_or(0, |sample| sample.delay),
+            expected_matches: result.as_ref().is_ok_and(|sample| sample.expected_matches),
+            time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            order: self
+                .sequence
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    async fn run_probe(
+        &self,
+        name: &str,
+        request: &DelayRequest,
+        cancel: &CancellationToken,
+    ) -> Result<probe::Observation, ProbeError> {
+        let action = match name {
+            "DIRECT" | "COMPATIBLE" => crate::config::RuleAction::Direct,
+            "REJECT" | "REJECT-DROP" | "PASS" | "PASS-RULE" => crate::config::RuleAction::Reject,
+            _ => {
+                crate::config::RuleAction::Route(*self.names.get(name).ok_or(ProbeError::NotFound)?)
+            }
+        };
+        if request.timeout.is_zero() {
+            return Err(ProbeError::Timeout);
+        }
+        let operation = async {
+            let _slot = self
+                .probe_slots
+                .acquire()
+                .await
+                .map_err(|_| ProbeError::Stopped)?;
+            let target = Target::parse(&request.url).map_err(|_| ProbeError::Failed)?;
+            let rules = RuleSet::compile(vec![crate::config::RuleSpec {
+                kind: crate::config::RuleKind::Match,
+                action,
+                no_resolve: false,
+            }])
+            .expect("health route");
+            let dispatcher = Arc::new(RoutingDispatcher::new_with_ipv6(
+                self.targets.clone(),
+                self.direct.clone(),
+                self.dns.clone(),
+                self.ipv6,
+                rules,
+                Arc::new(crate::routing::EmptyGeoMatcher),
+            ));
+            probe::observe(
+                &target,
+                dispatcher,
+                request.timeout,
+                self.unified,
+                &request.expected,
+                cancel,
+            )
+            .await
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::TimedOut => ProbeError::Timeout,
+                io::ErrorKind::Interrupted => ProbeError::Stopped,
+                _ => ProbeError::Failed,
+            })
+        };
+        tokio::select! { biased;
+            () = cancel.cancelled() => Err(ProbeError::Stopped),
+            result = tokio::time::timeout(request.timeout, operation) => result.map_err(|_| ProbeError::Timeout)?,
+        }
+    }
+
+    fn record_manual(
+        &self,
+        name: &str,
+        url: &str,
+        result: &Result<probe::Observation, ProbeError>,
+    ) {
+        let sample = self.sample(result);
+        self.manual_samples
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), sample.clone());
+        let configured = self
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|job| job.spec.url == url && job.members.iter().any(|member| member == name));
+        if configured {
+            self.samples
+                .lock()
+                .unwrap()
+                .insert((name.to_owned(), url.to_owned()), sample);
+        }
+    }
+
+    pub async fn node_delay(
+        &self,
+        name: &str,
+        request: &DelayRequest,
+        cancel: &CancellationToken,
+    ) -> Result<u64, ProbeError> {
+        let result = self.run_probe(name, request, cancel).await;
+        if !cancel.is_cancelled() && result != Err(ProbeError::NotFound) {
+            self.record_manual(name, &request.url, &result);
+            self.apply_group_health();
+        }
+        result.map(|sample| sample.delay)
+    }
+
+    pub async fn group_delay(
+        &self,
+        name: &str,
+        request: &DelayRequest,
+        cancel: &CancellationToken,
+    ) -> Result<BTreeMap<String, u64>, ProbeError> {
+        let state = self.groups.state(name).map_err(|_| ProbeError::NotFound)?;
+        let configured_url = if state.kind == crate::config::GroupKind::UrlTest {
+            self.names.get(name).and_then(|target| {
+                let RouteTargetId::Group(id) = target else {
+                    return None;
+                };
+                self.jobs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|job| job.group == Some(id.index()))
+                    .map(|job| job.spec.url.clone())
+            })
+        } else {
+            None
+        };
+        let request = DelayRequest {
+            url: configured_url.unwrap_or_else(|| request.url.clone()),
+            timeout: request.timeout,
+            expected: request.expected.clone(),
+        };
+        let request = &request;
+        let work = state.all.into_iter().map(|name| async move {
+            let result = self.run_probe(&name, request, cancel).await;
+            if !cancel.is_cancelled() {
+                self.record_manual(&name, &request.url, &result);
+            }
+            (name, result)
+        });
+        let operation = async {
+            let mut results = stream::iter(work).buffer_unordered(10);
+            let mut delays = BTreeMap::new();
+            while let Some((name, result)) = results.next().await {
+                if let Ok(delay) = result {
+                    delays.insert(name, delay.delay);
+                }
+            }
+            self.apply_group_health();
+            if delays.is_empty() {
+                Err(ProbeError::Timeout)
+            } else {
+                Ok(delays)
+            }
+        };
+        tokio::select! { biased;
+            () = cancel.cancelled() => Err(ProbeError::Stopped),
+            result = tokio::time::timeout(request.timeout, operation) => result.map_err(|_| ProbeError::Timeout)?,
+        }
+    }
+
+    pub async fn provider_healthcheck(
+        &self,
+        name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), ProbeError> {
+        let (spec, members) = self
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|job| job.provider.as_deref() == Some(name))
+            .map(|job| (job.spec.clone(), job.members.clone()))
+            .ok_or(ProbeError::NotFound)?;
+        if spec.url.is_empty() {
+            return Ok(());
+        }
+        let request = DelayRequest {
+            url: spec.url,
+            timeout: Duration::from_millis(if spec.timeout == 0 {
+                5000
+            } else {
+                spec.timeout
+            }),
+            expected: status_ranges(&spec.expected_status).expect("validated provider health"),
+        };
+        let work = members.into_iter().map(|name| async {
+            let result = self.run_probe(&name, &request, cancel).await;
+            if !cancel.is_cancelled() {
+                self.samples
+                    .lock()
+                    .unwrap()
+                    .insert((name, request.url.clone()), self.sample(&result));
+            }
+        });
+        let mut results = stream::iter(work).buffer_unordered(10);
+        while results.next().await.is_some() {
+            if cancel.is_cancelled() {
+                return Err(ProbeError::Stopped);
+            }
+        }
+        self.apply_group_health();
+        Ok(())
+    }
+
+    fn apply_group_health(&self) {
+        let samples = self.samples.lock().unwrap();
+        for job in self.jobs.lock().unwrap().iter() {
+            if let Some(index) = job.group {
+                let values = job
+                    .members
+                    .iter()
+                    .map(|name| {
+                        samples
+                            .get(&(name.clone(), job.spec.url.clone()))
+                            .map_or(Some(u16::MAX.into()), |s| {
+                                (s.alive && s.expected_matches).then_some(s.delay)
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                self.groups.apply_health(index, &values);
+            }
+        }
+    }
+
     pub async fn tick(&self, cancel: &CancellationToken) {
         let mut work = BTreeMap::new();
         {
@@ -209,49 +485,16 @@ impl HealthRuntime {
             }
         }
         let jobs = work.into_iter().map(|((name, url), spec)| async move {
-            let action = match name.as_str() {
-                "DIRECT" | "COMPATIBLE" => Some(crate::config::RuleAction::Direct),
-                "REJECT" => Some(crate::config::RuleAction::Reject),
-                _ => self
-                    .names
-                    .get(&name)
-                    .copied()
-                    .map(crate::config::RuleAction::Route),
+            let request = DelayRequest {
+                url: url.clone(),
+                timeout: Duration::from_millis(if spec.timeout == 0 {
+                    5000
+                } else {
+                    spec.timeout
+                }),
+                expected: status_ranges(&spec.expected_status).expect("validated health status"),
             };
-            let dispatcher = action.map(|action| {
-                let rules = RuleSet::compile(vec![crate::config::RuleSpec {
-                    kind: crate::config::RuleKind::Match,
-                    action,
-                    no_resolve: false,
-                }])
-                .expect("health route");
-                Arc::new(RoutingDispatcher::new_with_ipv6(
-                    self.targets.clone(),
-                    self.direct.clone(),
-                    self.dns.clone(),
-                    self.ipv6,
-                    rules,
-                    Arc::new(crate::routing::EmptyGeoMatcher),
-                )) as Arc<dyn Dispatcher>
-            });
-            let result = async {
-                let target = Target::parse(&url)?;
-                let expected = status_ranges(&spec.expected_status).map_err(io::Error::other)?;
-                probe::probe(
-                    &target,
-                    dispatcher.ok_or_else(|| io::Error::other("unavailable health target"))?,
-                    Duration::from_millis(if spec.timeout == 0 {
-                        5000
-                    } else {
-                        spec.timeout
-                    }),
-                    self.unified,
-                    &expected,
-                    cancel,
-                )
-                .await
-            }
-            .await;
+            let result = self.run_probe(&name, &request, cancel).await;
             (name, url, result)
         });
         let mut results = stream::iter(jobs).buffer_unordered(10);
@@ -259,32 +502,120 @@ impl HealthRuntime {
             if cancel.is_cancelled() {
                 return;
             }
-            self.samples.lock().unwrap().insert(
-                (name, url),
-                Sample {
-                    alive: result.is_ok(),
-                    delay: result.unwrap_or(0),
-                    time: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                },
+            self.samples
+                .lock()
+                .unwrap()
+                .insert((name, url), self.sample(&result));
+        }
+        self.apply_group_health();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct MemoryProbe {
+        peers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    }
+    #[async_trait::async_trait]
+    impl Dispatcher for MemoryProbe {
+        async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
+            assert_eq!(
+                session.inbound,
+                crate::session::InboundKind::InternalMeasure
+            );
+            let (client, mut peer) = tokio::io::duplex(1024);
+            let task = tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    bytes.push(peer.read_u8().await.unwrap());
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            });
+            self.peers.lock().unwrap().push(task);
+            Ok(Box::new(client))
+        }
+        async fn open_datagram(
+            &self,
+            _: DatagramSession,
+        ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+            Err(DispatchError::NotAllowed)
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_probes_keep_one_history_per_node_and_cancel_queued_work() {
+        let config = Config::parse_yaml(b"mixed-port: 1080\nrules:\n  - MATCH,DIRECT\n").unwrap();
+        let direct = Arc::new(MemoryProbe {
+            peers: Mutex::new(Vec::new()),
+        });
+        let groups = ProxyGroups::new(&config.proxy_groups, vec![], direct.clone()).unwrap();
+        let targets = RouteTargetDispatchers::with_proxy_groups(vec![], &groups).unwrap();
+        let runtime = HealthRuntime::new(&config, groups, targets, direct.clone(), vec![], None);
+        let cancel = CancellationToken::new();
+        for index in 0..8 {
+            let request = DelayRequest {
+                url: format!("http://192.0.2.1/{index}"),
+                timeout: Duration::from_secs(1),
+                expected: vec![(204, 204)],
+            };
+            assert!(
+                runtime
+                    .node_delay("DIRECT", &request, &cancel)
+                    .await
+                    .unwrap()
+                    > 0
             );
         }
-        let samples = self.samples.lock().unwrap();
-        for job in self.jobs.lock().unwrap().iter() {
-            if let Some(index) = job.group {
-                let values = job
-                    .members
-                    .iter()
-                    .map(|name| {
-                        samples
-                            .get(&(name.clone(), job.spec.url.clone()))
-                            .map_or(Some(u16::MAX.into()), |s| s.alive.then_some(s.delay))
-                    })
-                    .collect::<Vec<_>>();
-                self.groups.apply_health(index, &values);
-            }
+        assert_eq!(runtime.manual_samples.lock().unwrap().len(), 1);
+        assert!(runtime.samples.lock().unwrap().is_empty());
+        let mismatch = DelayRequest {
+            url: "http://192.0.2.1/unexpected".into(),
+            timeout: Duration::from_secs(1),
+            expected: vec![(200, 200)],
+        };
+        assert!(
+            runtime
+                .node_delay("DIRECT", &mismatch, &cancel)
+                .await
+                .unwrap()
+                > 0
+        );
+        {
+            let samples = runtime.manual_samples.lock().unwrap();
+            assert!(samples["DIRECT"].alive);
+            assert!(!samples["DIRECT"].expected_matches);
+        }
+        assert_eq!(
+            runtime.states()["DIRECT"]["history"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut slots = Vec::new();
+        for _ in 0..10 {
+            slots.push(runtime.probe_slots.acquire().await.unwrap());
+        }
+        cancel.cancel();
+        let request = DelayRequest {
+            url: "http://192.0.2.1/".into(),
+            timeout: Duration::from_secs(60),
+            expected: vec![],
+        };
+        assert_eq!(
+            runtime.node_delay("DIRECT", &request, &cancel).await,
+            Err(ProbeError::Stopped)
+        );
+        drop(slots);
+        let tasks = std::mem::take(&mut *direct.peers.lock().unwrap());
+        for task in tasks {
+            task.await.unwrap();
         }
     }
 }

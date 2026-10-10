@@ -164,6 +164,59 @@ async fn handle_connection(
         .await;
     }
 
+    if request.target == "/memory" {
+        if request.method != "GET" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
+        }
+        let value = serde_json::json!({"inuse":crate::memory::resident_bytes(),"oslimit":null});
+        return write_json(&mut stream, 200, &value, &[]).await;
+    }
+    let route_path = request
+        .target
+        .split_once('?')
+        .map_or(request.target.as_str(), |(path, _)| path);
+    let probe_route = route_path.strip_suffix("/delay").and_then(|base| {
+        base.strip_prefix("/proxies/")
+            .map(|name| (false, name))
+            .or_else(|| base.strip_prefix("/group/").map(|name| (true, name)))
+    });
+    if let Some((group, raw_name)) = probe_route {
+        if request.method != "GET" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
+        }
+        return delay_query(
+            &mut stream,
+            group,
+            raw_name,
+            &request.target,
+            resources.as_deref(),
+            &cancellation,
+        )
+        .await;
+    }
+    if let Some(raw_name) = route_path
+        .strip_prefix("/providers/proxies/")
+        .and_then(|tail| tail.strip_suffix("/healthcheck"))
+    {
+        if request.method != "GET" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
+        }
+        let Ok(name) = decode_group_name(raw_name) else {
+            return write_error(&mut stream, 400, "Bad request", &[]).await;
+        };
+        let Some(resources) = resources.as_deref() else {
+            return write_error(&mut stream, 404, "Resource not found", &[]).await;
+        };
+        let result = tokio::select! { biased;
+            () = cancellation.cancelled() => return Ok(()),
+            result = resources.provider_healthcheck(&name, &cancellation) => result,
+        };
+        return match result {
+            Ok(()) => write_response(&mut stream, 204, &[], &[]).await,
+            Err(error) => probe_error(&mut stream, error).await,
+        };
+    }
+
     if request.target == "/dns/query" || request.target.starts_with("/dns/query?") {
         if request.method != "GET" {
             return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
@@ -399,6 +452,86 @@ async fn handle_connection(
     }
 
     write_error(&mut stream, 404, "Resource not found", &[]).await
+}
+
+fn parse_delay(target: &str, group: bool) -> Result<crate::resource::control::DelayRequest, ()> {
+    if target.contains('#') {
+        return Err(());
+    }
+    let (_, raw) = target.split_once('?').ok_or(())?;
+    let mut values = std::collections::BTreeMap::new();
+    for (key, value) in url::form_urlencoded::parse(raw.as_bytes()) {
+        values.entry(key).or_insert(value);
+    }
+    let url = values.get("url").ok_or(())?.to_string();
+    crate::resource::probe::Target::parse(&url).map_err(|_| ())?;
+    let raw_timeout = values.get("timeout").ok_or(())?;
+    let millis = if group {
+        raw_timeout.parse::<i32>().map(i64::from)
+    } else {
+        raw_timeout.parse::<i16>().map(i64::from)
+    }
+    .map_err(|_| ())?;
+    let expected =
+        crate::config::status_ranges(values.get("expected").map_or("", |value| value.as_ref()))
+            .map_err(|_| ())?;
+    Ok(crate::resource::control::DelayRequest {
+        url,
+        timeout: Duration::from_millis(millis.max(0) as u64),
+        expected,
+    })
+}
+
+async fn probe_error(
+    stream: &mut TcpStream,
+    error: crate::resource::control::ProbeError,
+) -> io::Result<()> {
+    use crate::resource::control::ProbeError;
+    match error {
+        ProbeError::NotFound => write_error(stream, 404, "Resource not found", &[]).await,
+        ProbeError::Timeout => write_error(stream, 504, "Delay test timed out", &[]).await,
+        ProbeError::Failed => write_error(stream, 503, "Delay test failed", &[]).await,
+        ProbeError::Stopped => Ok(()),
+    }
+}
+
+async fn delay_query(
+    stream: &mut TcpStream,
+    group: bool,
+    raw_name: &str,
+    target: &str,
+    resources: Option<&dyn crate::resource::control::RuntimeResources>,
+    cancellation: &CancellationToken,
+) -> io::Result<()> {
+    let (Ok(name), Ok(request)) = (decode_group_name(raw_name), parse_delay(target, group)) else {
+        return write_error(stream, 400, "Bad request", &[]).await;
+    };
+    let Some(resources) = resources else {
+        return write_error(stream, 404, "Resource not found", &[]).await;
+    };
+    let operation = async {
+        if group {
+            resources
+                .group_delay(&name, &request, cancellation)
+                .await
+                .map(|value| serde_json::json!(value))
+        } else {
+            let delay = resources.node_delay(&name, &request, cancellation).await?;
+            if delay == 0 {
+                Err(crate::resource::control::ProbeError::Failed)
+            } else {
+                Ok(serde_json::json!({"delay":delay}))
+            }
+        }
+    };
+    let result = tokio::select! { biased;
+        () = cancellation.cancelled() => return Ok(()),
+        result = operation => result,
+    };
+    match result {
+        Ok(value) => write_json(stream, 200, &value, &[]).await,
+        Err(error) => probe_error(stream, error).await,
+    }
 }
 
 async fn handle_select(
@@ -710,6 +843,8 @@ async fn write_response(
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Error",
     };
     let mut response = format!(
@@ -805,6 +940,23 @@ mod tests {
 
     fn response_body(response: &str) -> &str {
         response.split_once("\r\n\r\n").unwrap().1
+    }
+
+    #[test]
+    fn delay_query_preserves_reference_timeout_width_and_expected_ranges() {
+        let base = "/proxies/edge/delay?url=http%3A%2F%2Fexample.test%2F&timeout=30000&expected=200-204%2F302";
+        let request = parse_delay(base, false).unwrap();
+        assert_eq!(request.timeout, Duration::from_secs(30));
+        assert_eq!(request.expected, [(200, 204), (302, 302)]);
+        assert!(parse_delay(&base.replace("30000", "40000"), false).is_err());
+        assert!(parse_delay(&base.replace("30000", "40000"), true).is_ok());
+        assert_eq!(
+            parse_delay(&base.replace("30000", "-1"), false)
+                .unwrap()
+                .timeout,
+            Duration::ZERO
+        );
+        assert!(parse_delay("/proxies/edge/delay?timeout=1", false).is_err());
     }
 
     #[test]

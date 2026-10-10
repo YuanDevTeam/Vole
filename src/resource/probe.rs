@@ -184,6 +184,12 @@ pub(crate) async fn probe_once(
     let mut stream = connect(target, dispatcher, tls).await?;
     head(&mut stream, target, false).await.map(drop)
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Observation {
+    pub delay: u64,
+    pub expected_matches: bool,
+}
+
 pub(crate) async fn probe(
     target: &Target,
     dispatcher: Arc<dyn Dispatcher>,
@@ -192,6 +198,22 @@ pub(crate) async fn probe(
     expected: &[(u16, u16)],
     cancel: &CancellationToken,
 ) -> io::Result<u64> {
+    let observation = observe(target, dispatcher, timeout, unified, expected, cancel).await?;
+    if observation.expected_matches {
+        Ok(observation.delay)
+    } else {
+        Err(io::Error::other("unexpected health check status"))
+    }
+}
+
+pub(crate) async fn observe(
+    target: &Target,
+    dispatcher: Arc<dyn Dispatcher>,
+    timeout: Duration,
+    unified: bool,
+    expected: &[(u16, u16)],
+    cancel: &CancellationToken,
+) -> io::Result<Observation> {
     let operation = async {
         let tls = (target.scheme == TargetScheme::Https)
             .then(build_tls_connector)
@@ -206,14 +228,13 @@ pub(crate) async fn probe(
                 status = next;
             }
         }
-        if !expected.is_empty()
-            && !expected
-                .iter()
-                .any(|(start, end)| (*start..=*end).contains(&status))
-        {
-            return Err(io::Error::other("unexpected health check status"));
-        }
-        Ok(started.elapsed().as_millis().min(u64::MAX as u128) as u64)
+        Ok(Observation {
+            delay: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            expected_matches: expected.is_empty()
+                || expected
+                    .iter()
+                    .any(|(start, end)| (*start..=*end).contains(&status)),
+        })
     };
     tokio::select! {biased;
         ()=cancel.cancelled()=>Err(io::ErrorKind::Interrupted.into()),

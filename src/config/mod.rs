@@ -2074,7 +2074,6 @@ impl RawVoleConfig {
         let external_controller = normalize_external_controller(
             self.external_controller,
             self.secret,
-            tun.enable,
             has_explicit_groups,
         )?;
 
@@ -2143,7 +2142,6 @@ impl RawVoleConfig {
 fn normalize_external_controller(
     listen: Option<String>,
     secret: Option<String>,
-    tun_enabled: bool,
     has_proxy_groups: bool,
 ) -> Result<Option<ExternalControllerConfig>> {
     let Some(listen) = listen else {
@@ -2152,9 +2150,6 @@ fn normalize_external_controller(
         }
         return Ok(None);
     };
-    if !tun_enabled && !has_proxy_groups {
-        return invalid("external-controller requires tun.enable: true or proxy-groups");
-    }
     if has_proxy_groups && secret.is_none() {
         return invalid("secret is required when external-controller manages proxy-groups");
     }
@@ -4663,15 +4658,21 @@ tun:
     }
 
     #[test]
+    fn admits_mixed_only_direct_controller() {
+        let config = Config::parse_yaml(
+            b"mixed-port: 1080\nexternal-controller: 127.0.0.1:19090\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        assert!(config.external_controller.is_some());
+        assert!(config.proxies.is_empty());
+    }
+
+    #[test]
     fn rejects_unsafe_or_misplaced_traffic_controller_config() {
         for (fields, expected) in [
             (
                 "mixed-port: 1080\nauthentication:\n  - measure:secret\nsecret: token",
                 "secret requires external-controller",
-            ),
-            (
-                "mixed-port: 1080\nauthentication:\n  - measure:secret\nexternal-controller: \"127.0.0.1:19090\"",
-                "external-controller requires tun.enable",
             ),
             (
                 "external-controller: \"0.0.0.0:19090\"\ntun:\n  enable: true",
