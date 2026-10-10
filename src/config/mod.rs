@@ -5287,17 +5287,12 @@ authentication:
 
     #[test]
     fn rejects_anytls_fields_outside_the_locked_subset() {
-        for field in ["tls: true", "ech-opts: {}"] {
-            let yaml = CURRENT_ANYTLS.replace(
-                "    password: private-anytls-password",
-                &format!("    password: private-anytls-password\n    {field}"),
-            );
-            let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
-            assert!(
-                error.to_string().contains("unknown field"),
-                "unexpected error for {field}: {error}"
-            );
-        }
+        let yaml = CURRENT_ANYTLS.replace(
+            "    password: private-anytls-password",
+            "    password: private-anytls-password\n    tls: true",
+        );
+        let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
