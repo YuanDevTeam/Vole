@@ -67,7 +67,7 @@ pub(super) fn packets_with_payload_limit(
         .checked_sub(10 + target.len())
         .ok_or(io::ErrorKind::InvalidInput)?
         .min(payload_limit);
-    if space == 0 {
+    if space == 0 && !payload.is_empty() {
         return Err(io::ErrorKind::InvalidInput.into());
     }
     let count = payload.len().max(1).div_ceil(space.max(1));
