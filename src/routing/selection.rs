@@ -1,6 +1,6 @@
 //! Selection and probe activity shared by route and upstream groups.
 use std::sync::{
-    Mutex,
+    Mutex, MutexGuard,
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -15,6 +15,19 @@ pub(crate) struct GroupSelection {
     urgent: AtomicBool,
     maximum: AtomicU32,
     window_ms: AtomicU64,
+}
+pub(super) struct InspectedSelection<'a> {
+    owner: &'a GroupSelection,
+    balance: MutexGuard<'a, Option<super::balance::Balance>>,
+    pub index: usize,
+}
+impl InspectedSelection<'_> {
+    pub fn commit(mut self) {
+        if let Some(balance) = self.balance.as_mut() {
+            balance.commit(self.index);
+        }
+        self.owner.touch();
+    }
 }
 impl GroupSelection {
     pub fn new(index: usize) -> Self {
@@ -51,6 +64,22 @@ impl GroupSelection {
             || self.load(Ordering::Acquire),
             |s| s.choose(source, destination),
         )
+    }
+    pub(super) fn inspect(
+        &self,
+        source: Option<std::net::SocketAddr>,
+        destination: Option<&crate::session::Destination>,
+    ) -> InspectedSelection<'_> {
+        let mut balance = self.balance.lock().unwrap();
+        let index = balance.as_mut().map_or_else(
+            || self.load(Ordering::Acquire),
+            |state| state.inspect(source, destination, false),
+        );
+        InspectedSelection {
+            owner: self,
+            balance,
+            index,
+        }
     }
     pub fn balance_health(&self, samples: &[Option<u64>]) {
         if let Some(balance) = self.balance.lock().unwrap().as_mut() {

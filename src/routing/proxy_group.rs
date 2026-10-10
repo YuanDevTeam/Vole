@@ -59,11 +59,18 @@ struct ProxyGroupMember {
     target: ProxyGroupMemberTarget,
 }
 
+#[derive(Clone)]
 pub(crate) struct ResolvedProxyGroupLeaf {
     pub(crate) chain: Vec<String>,
     pub(crate) selections: Vec<Arc<GroupSelection>>,
     pub(crate) dispatcher: Arc<dyn Dispatcher>,
     pub(crate) direct: bool,
+}
+
+pub(crate) enum InspectedRuleTarget {
+    Control(crate::config::RuleControl),
+    Egress(ResolvedProxyGroupLeaf),
+    Unavailable,
 }
 
 impl ResolvedProxyGroupLeaf {
@@ -306,6 +313,7 @@ impl ProxyGroups {
                         direct: true,
                     });
                 }
+                ProxyGroupMemberTarget::Control(_) => return Err(DispatchError::NotAllowed),
                 ProxyGroupMemberTarget::Reject => {
                     chain.push("REJECT".into());
                     chain.reverse();
@@ -321,6 +329,79 @@ impl ProxyGroups {
         Err(DispatchError::Other(
             "proxy group nesting exceeded the runtime hop ceiling".to_owned(),
         ))
+    }
+
+    /// The validated DAG gives group locks one traversal order. No lock is held
+    /// across IO; controls and ineligible UDP leaves never advance round robin.
+    pub(crate) fn inspect_rule_target(
+        &self,
+        mut group_id: ProxyGroupId,
+        udp: bool,
+        commit: bool,
+        source: Option<std::net::SocketAddr>,
+        destination: Option<&crate::session::Destination>,
+    ) -> Result<InspectedRuleTarget, DispatchError> {
+        let mut inspected = Vec::new();
+        let mut chain = Vec::new();
+        let mut selections = Vec::new();
+        let mut disabled = false;
+        for _ in 0..=self.groups.len() {
+            let group = self
+                .groups
+                .get(group_id.index())
+                .ok_or(DispatchError::NotAllowed)?;
+            // Defend the public constructor as well as the validated config path.
+            if selections
+                .iter()
+                .any(|selection| Arc::ptr_eq(selection, &group.selected))
+            {
+                return Err(DispatchError::NotAllowed);
+            }
+            let selected = group.selected.inspect(source, destination);
+            let member = group
+                .members
+                .get(selected.index)
+                .ok_or(DispatchError::NotAllowed)?;
+            inspected.push(selected);
+            selections.push(group.selected.clone());
+            chain.push(group.name.clone());
+            disabled |= group.disable_udp;
+            let (dispatcher, direct) = match member.target {
+                ProxyGroupMemberTarget::Control(control) => {
+                    return Ok(InspectedRuleTarget::Control(control));
+                }
+                ProxyGroupMemberTarget::Route(RouteTargetId::Group(id)) => {
+                    group_id = id;
+                    continue;
+                }
+                ProxyGroupMemberTarget::Route(RouteTargetId::Proxy(id)) => (
+                    self.proxies
+                        .get(id.index())
+                        .ok_or(DispatchError::NotAllowed)?
+                        .clone(),
+                    false,
+                ),
+                ProxyGroupMemberTarget::Direct => (self.direct.clone(), true),
+                ProxyGroupMemberTarget::Reject => (self.reject.clone(), false),
+            };
+            if udp && (disabled || !dispatcher.supports_udp()) {
+                return Ok(InspectedRuleTarget::Unavailable);
+            }
+            if commit {
+                for selected in inspected {
+                    selected.commit();
+                }
+            }
+            chain.push(member.name.clone());
+            chain.reverse();
+            return Ok(InspectedRuleTarget::Egress(ResolvedProxyGroupLeaf {
+                chain,
+                selections,
+                dispatcher,
+                direct,
+            }));
+        }
+        Err(DispatchError::NotAllowed)
     }
 
     pub(crate) fn has_balance(&self) -> bool {
@@ -455,6 +536,7 @@ impl Dispatcher for SelectProxyGroupDispatcher {
                 }
                 ProxyGroupMemberTarget::Route(RouteTargetId::Group(nested)) => id = nested,
                 ProxyGroupMemberTarget::Direct | ProxyGroupMemberTarget::Reject => return true,
+                ProxyGroupMemberTarget::Control(_) => return false,
             }
         }
         false

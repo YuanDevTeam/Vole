@@ -386,15 +386,15 @@ struct RequestedCodes {
 }
 
 impl RequestedCodes {
-    fn collect(
-        rules: &[RuleSpec],
+    fn collect<'a>(
+        rules: impl IntoIterator<Item = &'a RuleSpec>,
         dns_policies: &[DnsNameserverPolicy],
     ) -> Result<Self, GeoDataError> {
         let mut requested = Self {
             sites: CodeSet::EMPTY,
             ips: CodeSet::EMPTY,
         };
-        let mut pending: Vec<_> = rules.iter().collect();
+        let mut pending: Vec<_> = rules.into_iter().collect();
         while let Some(rule) = pending.pop() {
             match &rule.kind {
                 RuleKind::And(children) | RuleKind::Or(children) => pending.extend(children),
@@ -402,7 +402,13 @@ impl RequestedCodes {
                     content: Some(content),
                     ..
                 } => pending.extend(&content.classical),
-                RuleKind::Not(child) => pending.push(child),
+                RuleKind::Not(child)
+                | RuleKind::Flow {
+                    predicate: child, ..
+                }
+                | RuleKind::SubRule {
+                    predicate: child, ..
+                } => pending.push(child),
                 RuleKind::GeoSite(code) => requested.sites.insert(GeoDataKind::GeoSite, code)?,
                 RuleKind::GeoIp(code) => requested.ips.insert(GeoDataKind::GeoIp, code)?,
                 _ => (),
@@ -449,6 +455,19 @@ pub struct GeoRequirements {
 
 impl GeoRequirements {
     pub(crate) fn for_config(config: &crate::config::Config) -> Result<Self, GeoDataError> {
+        Self::for_rules(
+            config,
+            config
+                .rules
+                .iter()
+                .chain(config.sub_rules.iter().flat_map(|sub| &sub.rules)),
+        )
+    }
+
+    pub(crate) fn for_rules<'a>(
+        config: &crate::config::Config,
+        rules: impl IntoIterator<Item = &'a RuleSpec>,
+    ) -> Result<Self, GeoDataError> {
         let mut policies: Vec<_> = config
             .dns
             .nameserver_policies
@@ -489,7 +508,11 @@ impl GeoRequirements {
                     }),
             );
         }
-        let mut result = Self::collect(&config.rules, &policies)?;
+        let requested = RequestedCodes::collect(rules, &policies)?;
+        let mut result = Self {
+            sites: requested.sites,
+            ips: requested.ips,
+        };
         if config.sniffer.enable {
             result.extend(&Self::collect(&config.sniffer.skip_src_address, &[])?)?;
             result.extend(&Self::collect(&config.sniffer.skip_dst_address, &[])?)?;

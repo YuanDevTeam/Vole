@@ -455,6 +455,7 @@ pub(crate) enum SelectUpstreamMember {
     Group(Arc<SelectUpstream>),
     Direct,
     Reject,
+    Control,
 }
 
 impl SelectUpstream {
@@ -590,7 +591,9 @@ impl UpstreamPath {
                     .as_ref()
                     .map(|endpoint| ResolvedUpstream::Direct(endpoint, dialer))
                     .map_or_else(|| Ok(ResolvedUpstream::LazyDirect(dialer)), Ok),
-                SelectUpstreamMember::Reject => Err(DispatchError::NotAllowed),
+                SelectUpstreamMember::Reject | SelectUpstreamMember::Control => {
+                    Err(DispatchError::NotAllowed)
+                }
                 SelectUpstreamMember::Group(_) => {
                     unreachable!("upstream resolution returns a leaf")
                 }

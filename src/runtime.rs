@@ -941,6 +941,7 @@ fn build_proxy_graph(
                         }
                         ProxyGroupMemberTarget::Direct => SelectUpstreamMember::Direct,
                         ProxyGroupMemberTarget::Reject => SelectUpstreamMember::Reject,
+                        ProxyGroupMemberTarget::Control(_) => SelectUpstreamMember::Control,
                     })
                     .collect();
                 let group = Arc::new(

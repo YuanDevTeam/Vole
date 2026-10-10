@@ -12,10 +12,13 @@ use std::{
 };
 
 use crate::{
-    config::{IpCidr, Network, RuleAction, RuleKind, RuleSpec},
+    config::{IpCidr, Network, RuleAction, RuleKind, RuleSpec, RuntimeRuleProgram},
     session::Destination,
 };
 
+mod program;
+use program::CompiledProgram;
+pub(crate) use program::{ProgramEvaluation, RuleTargetEffect};
 mod balance;
 pub(super) mod datagram_ready;
 mod selection;
@@ -23,7 +26,7 @@ pub(crate) use selection::GroupSelection;
 
 pub(crate) mod diagnostics;
 mod dispatcher;
-mod proxy_group;
+pub(crate) mod proxy_group;
 
 pub(crate) use dispatcher::RouteTargetDispatchers;
 pub use dispatcher::{ProxyDispatchers, RoutingDispatcher};
@@ -43,7 +46,7 @@ pub struct RoutingContext {
     network: Network,
     destination_port: u16,
     source: Option<SocketAddr>,
-    normalized_domain: Option<Box<str>>,
+    normalized_domain: Option<Arc<str>>,
     destination_ip: Option<IpAddr>,
     pinned_ip: Option<IpAddr>,
     ip_resolution_unavailable: bool,
@@ -52,7 +55,7 @@ pub struct RoutingContext {
 impl RoutingContext {
     pub(crate) fn set_sniffed_domain(&mut self, host: &str) {
         if let Ok(host) = normalize_domain_name(host) {
-            self.normalized_domain = Some(host.into_boxed_str());
+            self.normalized_domain = Some(Arc::from(host));
         }
     }
 
@@ -72,7 +75,7 @@ impl RoutingContext {
     ) -> Result<Self, DomainNameError> {
         let (normalized_domain, destination_ip) = match destination {
             Destination::Domain { host, .. } => {
-                (Some(normalize_domain_name(host)?.into_boxed_str()), None)
+                (Some(Arc::from(normalize_domain_name(host)?)), None)
             }
             Destination::Ip(address) => (
                 domain_hint
@@ -82,7 +85,7 @@ impl RoutingContext {
                     // contain `_`), so an unusable hint must not turn the
                     // literal IP itself into an unreachable destination.
                     .and_then(|hint| normalize_domain_name(hint).ok())
-                    .map(String::into_boxed_str),
+                    .map(Arc::from),
                 Some(address.ip()),
             ),
         };
@@ -279,6 +282,7 @@ pub enum RuleEvaluation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleSetError {
+    InvalidProgram,
     TooManyRules {
         count: usize,
         maximum: usize,
@@ -308,6 +312,7 @@ pub enum RuleSetError {
 impl fmt::Display for RuleSetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidProgram => formatter.write_str("invalid sub-rule program graph"),
             Self::TooManyRules { count, maximum } => {
                 write!(formatter, "routing rule count {count} exceeds {maximum}")
             }
@@ -353,30 +358,48 @@ impl std::error::Error for RuleSetError {}
 /// An immutable ordered rule set.
 #[derive(Debug, Clone)]
 pub struct RuleSet {
-    rules: Box<[RuleSpec]>,
-    uses_domain_routing: bool,
+    graph: Arc<CompiledProgram>,
     filter_udp: bool,
 }
 
 impl RuleSet {
     /// Validates and normalizes the ordered rules. This is the only rule-set
     /// construction path that allocates.
-    pub fn compile(mut rules: Vec<RuleSpec>) -> Result<Self, RuleSetError> {
-        if rules.len() > MAX_ROUTING_RULES {
+    pub fn compile(program: impl Into<RuntimeRuleProgram>) -> Result<Self, RuleSetError> {
+        let mut program = program.into();
+        let count = program
+            .sub_rules
+            .iter()
+            .fold(program.main.len(), |count, sub| {
+                count.saturating_add(sub.rules.len())
+            });
+        if count > MAX_ROUTING_RULES {
             return Err(RuleSetError::TooManyRules {
-                count: rules.len(),
+                count,
                 maximum: MAX_ROUTING_RULES,
             });
         }
         let mut text_bytes = 0;
         let mut uses_domain_routing = false;
-        for (index, rule) in rules.iter_mut().enumerate() {
+        for sub in &program.sub_rules {
+            text_bytes = checked_text_bytes(text_bytes, sub.name.len())?;
+        }
+        for (index, rule) in program
+            .main
+            .iter_mut()
+            .chain(program.sub_rules.iter_mut().flat_map(|sub| &mut sub.rules))
+            .enumerate()
+        {
             normalize_rule(rule, index, 0, &mut text_bytes, &mut uses_domain_routing)?;
         }
-
+        crate::config::rules::validate_subrule_calls(&program.main, &program.sub_rules)
+            .map_err(|_| RuleSetError::InvalidProgram)?;
         Ok(Self {
-            rules: rules.into_boxed_slice(),
-            uses_domain_routing,
+            graph: Arc::new(CompiledProgram {
+                main: program.main.into_boxed_slice(),
+                sub_rules: program.sub_rules.into_boxed_slice(),
+                uses_domain_routing,
+            }),
             filter_udp: true,
         })
     }
@@ -390,19 +413,23 @@ impl RuleSet {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.rules.len()
+        self.graph.main.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+        self.graph.main.is_empty()
+    }
+
+    pub(crate) const fn filters_udp(&self) -> bool {
+        self.filter_udp
     }
 
     /// Whether an IP-based TUN flow can benefit from a sniffed or DNS-derived
     /// domain routing hint.
     #[must_use]
-    pub const fn uses_domain_routing(&self) -> bool {
-        self.uses_domain_routing
+    pub fn uses_domain_routing(&self) -> bool {
+        self.graph.uses_domain_routing
     }
 
     /// Exposes one immutable compiled rule so the asynchronous router can
@@ -410,7 +437,7 @@ impl RuleSet {
     /// [`RuleEvaluation::NeedsIpResolution`].
     #[must_use]
     pub fn rule(&self, index: usize) -> Option<&RuleSpec> {
-        self.rules.get(index)
+        self.graph.main.get(index)
     }
 
     /// Evaluates with no loaded GeoData. GEOSITE and GEOIP never match.
@@ -433,26 +460,33 @@ impl RuleSet {
     pub(crate) fn evaluate_with_egress(
         &self,
         context: &RoutingContext,
-        geo_matcher: &dyn GeoMatcher,
+        geo: &dyn GeoMatcher,
         supports_udp: impl Fn(RuleAction) -> bool,
     ) -> RuleEvaluation {
-        for (index, rule) in self.rules.iter().enumerate() {
-            let matched = match matches_rule(rule, context, geo_matcher) {
-                Ok(matched) => matched,
-                Err(()) => return RuleEvaluation::NeedsIpResolution { rule_index: index },
-            };
+        self.evaluate_program(
+            &mut context.clone(),
+            geo,
+            None,
+            None,
+            |action, candidate| {
+                if self.accepts_egress(candidate, action, &supports_udp) {
+                    RuleTargetEffect::Accept
+                } else {
+                    RuleTargetEffect::Skip
+                }
+            },
+        )
+        .into_public()
+    }
 
-            if matched && self.accepts_egress(context, rule.action, &supports_udp) {
-                return RuleEvaluation::Matched(RuleMatch {
-                    action: rule.action,
-                    rule_index: index,
-                });
-            }
-        }
-        RuleEvaluation::Matched(RuleMatch {
-            action: RuleAction::Direct,
-            rule_index: self.rules.len(),
-        })
+    pub(crate) fn all_rules(&self) -> impl Iterator<Item = &RuleSpec> {
+        self.graph
+            .main
+            .iter()
+            .chain(self.graph.sub_rules.iter().flat_map(|sub| &sub.rules))
+    }
+    pub(crate) fn subrule_name(&self, id: crate::config::SubRuleId) -> &str {
+        &self.graph.sub_rules[id.index()].name
     }
 
     /// Continues evaluation at the IP rule which requested a bounded
@@ -490,42 +524,17 @@ impl RuleSet {
     pub(crate) fn evaluate_with_resolved_egress(
         &self,
         context: &mut RoutingContext,
-        geo_matcher: &dyn GeoMatcher,
-        resolution_rule_index: usize,
+        geo: &dyn GeoMatcher,
+        index: usize,
         addresses: &[IpAddr],
         supports_udp: impl Fn(RuleAction) -> bool,
     ) -> RuleEvaluation {
-        for (index, rule) in self.rules.iter().enumerate().skip(resolution_rule_index) {
-            let mut selected_address = None;
-            let matched = if context.effective_ip().is_none()
-                && uses_destination_ip(rule)
-                && !addresses.is_empty()
-            {
-                selected_address = preferred_addresses(addresses).find(|address| {
-                    let mut candidate = context.clone();
-                    candidate.pin_ip(*address);
-                    matches_rule(rule, &candidate, geo_matcher).unwrap_or(false)
-                });
-                selected_address.is_some()
+        self.flat_resolved(context, geo, index, addresses, |action, candidate| {
+            if self.accepts_egress(candidate, action, &supports_udp) {
+                RuleTargetEffect::Accept
             } else {
-                let mut candidate = context.clone();
-                candidate.mark_ip_resolution_unavailable();
-                matches_rule(rule, &candidate, geo_matcher).unwrap_or(false)
-            };
-
-            if matched && self.accepts_egress(context, rule.action, &supports_udp) {
-                if let Some(address) = selected_address {
-                    context.pin_ip(address);
-                }
-                return RuleEvaluation::Matched(RuleMatch {
-                    action: rule.action,
-                    rule_index: index,
-                });
+                RuleTargetEffect::Skip
             }
-        }
-        RuleEvaluation::Matched(RuleMatch {
-            action: RuleAction::Direct,
-            rule_index: self.rules.len(),
         })
     }
 
@@ -605,6 +614,9 @@ fn normalize_rule(
             }
         }
         RuleKind::Not(child) => normalize_rule(child, index, depth + 1, bytes, domain)?,
+        RuleKind::Flow { predicate, .. } | RuleKind::SubRule { predicate, .. } => {
+            normalize_rule(predicate, index, depth, bytes, domain)?
+        }
         RuleKind::Network(_) | RuleKind::Match => {}
     }
     Ok(())
@@ -617,7 +629,13 @@ pub(crate) fn uses_destination_ip(rule: &RuleSpec) -> bool {
         RuleKind::And(children) | RuleKind::Or(children) => {
             children.iter().any(uses_destination_ip)
         }
-        RuleKind::Not(child) => uses_destination_ip(child),
+        RuleKind::Not(child)
+        | RuleKind::Flow {
+            predicate: child, ..
+        }
+        | RuleKind::SubRule {
+            predicate: child, ..
+        } => uses_destination_ip(child),
         _ => false,
     }
 }
@@ -704,6 +722,9 @@ pub(crate) fn matches_rule(
         }
         RuleKind::Not(child) => !matches_rule(child, context, geo)?,
         RuleKind::Match => true,
+        RuleKind::Flow { predicate, .. } | RuleKind::SubRule { predicate, .. } => {
+            matches_rule(predicate, context, geo)?
+        }
     })
 }
 
@@ -842,10 +863,10 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            rules.rules[0].kind,
+            rules.graph.main[0].kind,
             RuleKind::GeoSite("!google@ads@cn".to_owned())
         );
-        assert_eq!(rules.rules[1].kind, RuleKind::GeoIp("!cn".to_owned()));
+        assert_eq!(rules.graph.main[1].kind, RuleKind::GeoIp("!cn".to_owned()));
         assert!(
             RuleSet::compile(vec![
                 spec(RuleKind::GeoIp("cn@ads".to_owned()), RuleAction::Direct),

@@ -33,7 +33,7 @@ use crate::{Result, VoleError};
 mod dns;
 pub mod providers;
 mod rule_provider;
-mod rules;
+pub(crate) mod rules;
 pub use rule_provider::RuleCollection;
 mod yaml;
 pub use rules::DomainRegex;
@@ -107,6 +107,7 @@ pub struct Config {
     pub sniffer: SnifferConfig,
     pub dns: DnsConfig,
     pub rules: Vec<RuleSpec>,
+    pub sub_rules: Vec<NamedRuleProgram>,
     pub provider_members: HashMap<String, Vec<String>>,
     pub providers: Option<std::sync::Arc<providers::ProviderTemplate>>,
 }
@@ -418,8 +419,61 @@ pub struct RuleSpec {
     pub no_resolve: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleControl {
+    Pass,
+    PassRule,
+}
+
+impl RuleControl {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::PassRule => "PASS-RULE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubRuleId(usize);
+
+impl SubRuleId {
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedRuleProgram {
+    pub name: String,
+    pub rules: Vec<RuleSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRuleProgram {
+    pub main: Vec<RuleSpec>,
+    pub sub_rules: Vec<NamedRuleProgram>,
+}
+
+impl From<Vec<RuleSpec>> for RuntimeRuleProgram {
+    fn from(main: Vec<RuleSpec>) -> Self {
+        Self {
+            main,
+            sub_rules: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleKind {
+    Flow {
+        predicate: Box<RuleSpec>,
+        control: RuleControl,
+    },
+    SubRule {
+        predicate: Box<RuleSpec>,
+        target: SubRuleId,
+    },
     RuleSet {
         name: String,
         content: Option<std::sync::Arc<RuleCollection>>,
@@ -502,6 +556,7 @@ pub enum ProxyGroupMemberTarget {
     Route(RouteTargetId),
     Direct,
     Reject,
+    Control(RuleControl),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1039,6 +1094,8 @@ struct RawVoleConfig {
     dns: Option<RawDnsConfig>,
     #[serde(default)]
     rules: Vec<String>,
+    #[serde(rename = "sub-rules", default)]
+    sub_rules: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1886,9 +1943,12 @@ impl Config {
         template.materialize(&providers::ProviderContents::new())
     }
     #[cfg(any(feature = "invoke", test))]
-    pub(crate) fn take_runtime_rules(&mut self) -> Vec<RuleSpec> {
+    pub(crate) fn take_runtime_rules(&mut self) -> RuntimeRuleProgram {
         match self.mode {
-            Mode::Rule => std::mem::take(&mut self.rules),
+            Mode::Rule => RuntimeRuleProgram {
+                main: std::mem::take(&mut self.rules),
+                sub_rules: std::mem::take(&mut self.sub_rules),
+            },
             Mode::Direct | Mode::Global => {
                 let action = if self.mode == Mode::Direct {
                     RuleAction::Direct
@@ -1900,11 +1960,11 @@ impl Config {
                             .expect("GLOBAL group exists"),
                     )))
                 };
-                vec![RuleSpec {
+                RuntimeRuleProgram::from(vec![RuleSpec {
                     kind: RuleKind::Match,
                     action,
                     no_resolve: false,
-                }]
+                }])
             }
         }
     }
@@ -2014,7 +2074,8 @@ impl RawVoleConfig {
             .map_or_else(DnsConfig::disabled, |dns| dns.normalize(&route_targets))?;
         dns.ipv6 &= self.ipv6;
         dns.hosts = dns::normalize_hosts(self.hosts)?;
-        let rules = normalize_rules(self.rules, &route_targets)?;
+        let (rules, sub_rules) =
+            normalize_rule_program(self.rules, self.sub_rules, &route_targets)?;
         drop(proxy_ids);
         drop(route_targets);
 
@@ -2063,6 +2124,7 @@ impl RawVoleConfig {
             sniffer,
             dns,
             rules,
+            sub_rules,
             providers: None,
             provider_members: HashMap::new(),
         })
@@ -2453,13 +2515,15 @@ fn normalize_proxy_groups(
                     let target = match name.as_str() {
                         "DIRECT" | "COMPATIBLE" => ProxyGroupMemberTarget::Direct,
                         "REJECT" => ProxyGroupMemberTarget::Reject,
+                        "PASS" => ProxyGroupMemberTarget::Control(RuleControl::Pass),
+                        "PASS-RULE" => ProxyGroupMemberTarget::Control(RuleControl::PassRule),
                         _ => route_targets
                             .get(&name)
                             .copied()
                             .map(ProxyGroupMemberTarget::Route)
                             .ok_or_else(|| {
                                 VoleError::InvalidConfig(format!(
-                                    "proxy group `{}` member `{name}` does not reference a configured proxy, proxy group, DIRECT, or REJECT",
+                                    "proxy group `{}` member `{name}` does not reference a configured proxy, proxy group, DIRECT, REJECT, PASS, or PASS-RULE",
                                     group.name
                                 ))
                             })?,
@@ -3278,34 +3342,67 @@ fn normalize_dns_policy_selector(input: &str) -> Result<DnsPolicySelector> {
 
 use dns::parse_dns_nameserver;
 
-fn normalize_rules(
-    rules: Vec<String>,
+fn normalize_rule_program(
+    main: Vec<String>,
+    definitions: std::collections::BTreeMap<String, Vec<String>>,
     route_targets: &RouteTargetsByName,
-) -> Result<Vec<RuleSpec>> {
-    if rules.len() > MAX_RULES {
+) -> Result<(Vec<RuleSpec>, Vec<NamedRuleProgram>)> {
+    let mut count = main.len();
+    let mut bytes = 0_usize;
+    let mut ids = HashMap::with_capacity(definitions.len());
+    for (index, (name, rules)) in definitions.iter().enumerate() {
+        if name.is_empty() {
+            return invalid("sub-rule name must not be empty");
+        }
+        count = count
+            .checked_add(rules.len())
+            .ok_or_else(|| VoleError::InvalidConfig("rules count overflowed".into()))?;
+        bytes = bytes
+            .checked_add(name.len())
+            .ok_or_else(|| VoleError::InvalidConfig("rules byte length overflowed".into()))?;
+        ids.insert(name.clone(), SubRuleId(index));
+    }
+    if count > MAX_RULES {
         return invalid(format!("rules exceeds the {MAX_RULES}-entry limit"));
     }
-
-    let mut total_bytes = 0_usize;
-    let mut normalized = Vec::with_capacity(rules.len());
-    for rule in rules {
-        if rule.len() > MAX_RULE_BYTES {
-            return invalid(format!(
-                "rule exceeds the {MAX_RULE_BYTES}-byte per-entry limit"
-            ));
-        }
-        total_bytes = total_bytes
-            .checked_add(rule.len())
-            .ok_or_else(|| VoleError::InvalidConfig("rules byte length overflowed".to_owned()))?;
-        if total_bytes > MAX_RULES_TOTAL_BYTES {
-            return invalid(format!(
-                "rules exceeds the {MAX_RULES_TOTAL_BYTES}-byte cumulative limit"
-            ));
-        }
-        normalized.push(parse_rule(&rule, route_targets)?);
+    if bytes > MAX_RULES_TOTAL_BYTES {
+        return invalid(format!(
+            "rules exceeds the {MAX_RULES_TOTAL_BYTES}-byte cumulative limit"
+        ));
     }
-
-    Ok(normalized)
+    let mut normalize = |rules: Vec<String>| -> Result<Vec<RuleSpec>> {
+        rules
+            .into_iter()
+            .map(|rule| {
+                if rule.len() > MAX_RULE_BYTES {
+                    return invalid(format!(
+                        "rule exceeds the {MAX_RULE_BYTES}-byte per-entry limit"
+                    ));
+                }
+                bytes = bytes.checked_add(rule.len()).ok_or_else(|| {
+                    VoleError::InvalidConfig("rules byte length overflowed".into())
+                })?;
+                if bytes > MAX_RULES_TOTAL_BYTES {
+                    return invalid(format!(
+                        "rules exceeds the {MAX_RULES_TOTAL_BYTES}-byte cumulative limit"
+                    ));
+                }
+                rules::parse_program_rule(&rule, route_targets, &ids)
+            })
+            .collect()
+    };
+    let main = normalize(main)?;
+    let sub_rules = definitions
+        .into_iter()
+        .map(|(name, rules)| {
+            Ok(NamedRuleProgram {
+                name,
+                rules: normalize(rules)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    rules::validate_subrule_calls(&main, &sub_rules)?;
+    Ok((main, sub_rules))
 }
 
 fn trim_ascii_whitespace(input: &str) -> &str {

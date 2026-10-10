@@ -410,6 +410,9 @@ impl ProviderTemplate {
             sets.insert(name.clone(), rules.clone());
         }
         bind_rules(&mut config.rules, &sets)?;
+        for sub in &mut config.sub_rules {
+            bind_rules(&mut sub.rules, &sets)?;
+        }
         bind_rules(&mut config.sniffer.skip_src_address, &sets)?;
         bind_rules(&mut config.sniffer.skip_dst_address, &sets)?;
         for rule in config
@@ -492,7 +495,13 @@ fn bind_rules(rules: &mut [RuleSpec], sets: &HashMap<String, Arc<RuleCollection>
                 )
             }
             RuleKind::And(children) | RuleKind::Or(children) => bind_rules(children, sets)?,
-            RuleKind::Not(child) => bind_rules(std::slice::from_mut(child), sets)?,
+            RuleKind::Not(child)
+            | RuleKind::Flow {
+                predicate: child, ..
+            }
+            | RuleKind::SubRule {
+                predicate: child, ..
+            } => bind_rules(std::slice::from_mut(child), sets)?,
             _ => {}
         }
     }
@@ -786,6 +795,78 @@ proxy-groups:
             );
             assert_eq!(tls.server_name, "cover.invalid");
         }
+    }
+
+    #[test]
+    fn subrule_provider_candidate_rebinds_without_replacing_old_snapshot() {
+        use crate::{
+            routing::{EmptyGeoMatcher, RoutingContext, RuleEvaluation, RuleMatch, RuleSet},
+            session::Destination,
+        };
+        let mut config = Config::parse_yaml(
+            br#"
+mixed-port: 1080
+rule-providers:
+  domains: {type: inline, behavior: classical, payload: ['DOMAIN,old.example','GEOSITE,cn']}
+rules: ['SUB-RULE,(NETWORK,TCP),child', 'MATCH,DIRECT']
+sub-rules:
+  child: ['RULE-SET,domains,REJECT']
+  unused: ['GEOSITE,us,DIRECT']
+"#,
+        )
+        .unwrap();
+        let template = config.providers.clone().unwrap();
+        let requirements = crate::geodata::GeoRequirements::for_config(&config).unwrap();
+        assert_eq!(requirements.total_codes(), 2);
+        let RuleKind::RuleSet {
+            content: Some(set), ..
+        } = &config
+            .sub_rules
+            .iter()
+            .find(|program| program.name == "child")
+            .unwrap()
+            .rules[0]
+            .kind
+        else {
+            panic!("unbound child provider");
+        };
+        let old_set = Arc::downgrade(set);
+        let old = RuleSet::compile_config(&mut config).unwrap();
+        drop(config);
+        let mut contents = ProviderContents::new();
+        contents.insert(
+            ProviderTemplate::key(true, "domains"),
+            template
+                .parse_content(
+                    &template.rules[0].1,
+                    b"payload: ['DOMAIN,new.example','GEOSITE,cn']\n",
+                )
+                .unwrap(),
+        );
+        let mut candidate = template.materialize(&contents).unwrap();
+        let new = RuleSet::compile_config(&mut candidate).unwrap();
+        let action = |rules: &RuleSet, host| {
+            let context =
+                RoutingContext::new(Network::Tcp, &Destination::domain(host, 443).unwrap())
+                    .unwrap();
+            rules.evaluate_with_geo(&context, &EmptyGeoMatcher)
+        };
+        let rejected = RuleEvaluation::Matched(RuleMatch {
+            action: RuleAction::Reject,
+            rule_index: 0,
+        });
+        assert_eq!(action(&old, "old.example"), rejected);
+        assert_eq!(action(&new, "new.example"), rejected);
+        assert_eq!(
+            action(&new, "old.example"),
+            RuleEvaluation::Matched(RuleMatch {
+                action: RuleAction::Direct,
+                rule_index: 1
+            })
+        );
+        assert!(old_set.upgrade().is_some());
+        drop(old);
+        assert!(old_set.upgrade().is_none());
     }
 
     #[test]

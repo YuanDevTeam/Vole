@@ -29,8 +29,10 @@ use crate::{
 };
 
 use super::{
-    GeoMatcher, ProxyGroups, ResolvedProxyGroupLeaf, RoutingContext, RuleEvaluation, RuleSet,
+    GeoMatcher, ProgramEvaluation, ProxyGroups, ResolvedProxyGroupLeaf, RoutingContext, RuleSet,
+    RuleTargetEffect,
     datagram_ready::{ReadyFlow, ReadyQueue},
+    proxy_group::InspectedRuleTarget,
 };
 
 const TCP_DNS_DUPLEX_CAPACITY: usize = 8 * 1024;
@@ -109,13 +111,6 @@ impl std::fmt::Debug for ProxyDispatchers {
 }
 
 impl ProxyDispatchers {
-    pub(crate) fn supports_udp(&self, action: RuleAction) -> bool {
-        match action {
-            RuleAction::Route(id) => self.get_route(id).is_ok_and(|d| d.supports_udp()),
-            RuleAction::Direct | RuleAction::Reject => true,
-        }
-    }
-
     pub fn new(proxies: Vec<Arc<dyn Dispatcher>>) -> Result<Self, DispatchError> {
         Ok(Self {
             proxies,
@@ -157,6 +152,7 @@ impl ProxyDispatchers {
             .ok_or_else(|| DispatchError::Other(format!("unknown proxy id {}", id.index())))
     }
 
+    #[cfg(test)]
     pub(crate) fn get_route(
         &self,
         id: RouteTargetId,
@@ -166,6 +162,35 @@ impl ProxyDispatchers {
             RouteTargetId::Group(id) => self.groups.get(id.index()).ok_or_else(|| {
                 DispatchError::Other(format!("unknown proxy group id {}", id.index()))
             }),
+        }
+    }
+
+    pub(crate) fn inspect_rule_target(
+        &self,
+        id: RouteTargetId,
+        udp: bool,
+        commit: bool,
+        source: Option<SocketAddr>,
+        destination: Option<&Destination>,
+    ) -> Result<InspectedRuleTarget, DispatchError> {
+        match id {
+            RouteTargetId::Proxy(id) => {
+                let dispatcher = self.get(id)?.clone();
+                if udp && !dispatcher.supports_udp() {
+                    return Ok(InspectedRuleTarget::Unavailable);
+                }
+                Ok(InspectedRuleTarget::Egress(ResolvedProxyGroupLeaf {
+                    chain: Vec::new(),
+                    selections: Vec::new(),
+                    dispatcher,
+                    direct: false,
+                }))
+            }
+            RouteTargetId::Group(id) => self
+                .proxy_groups
+                .as_ref()
+                .ok_or(DispatchError::NotAllowed)?
+                .inspect_rule_target(id, udp, commit, source, destination),
         }
     }
 
@@ -331,6 +356,9 @@ impl RoutingDispatcher {
         source: SocketAddr,
         destination: &Destination,
         sniffed_domain: Option<&str>,
+        mut cached: Option<
+            &mut HashMap<(RouteTargetId, Option<Destination>), CachedRouteTransport>,
+        >,
     ) -> Result<RouteDecision, DispatchError> {
         self.ensure_destination_allowed(destination)?;
         let recovered = if matches!(
@@ -395,31 +423,83 @@ impl RoutingDispatcher {
         let geo_matcher = snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref());
 
         let mut resolved = None;
-        let supports_udp = |action| self.route_targets.supports_udp(action);
-        let evaluation = match self
-            .rules
-            .evaluate_with_egress(&context, geo_matcher, supports_udp)
-        {
-            RuleEvaluation::NeedsIpResolution { rule_index } => {
-                let addresses = match (destination, &self.dns) {
-                    (Destination::Domain { host, .. }, Some(dns)) => {
-                        self.resolve_addresses(dns, host).await
-                    }
-                    _ => Vec::new(),
-                };
-                resolved = Some(addresses);
-                self.rules.evaluate_with_resolved_egress(
-                    &mut context,
-                    geo_matcher,
-                    rule_index,
-                    resolved.as_deref().unwrap_or_default(),
-                    supports_udp,
-                )
+        let mut selected = None;
+        let mut selection_error = None;
+        let mut select = |action, candidate: &RoutingContext| {
+            let RuleAction::Route(id) = action else {
+                return RuleTargetEffect::Accept;
+            };
+            let metadata = candidate.domain().map_or_else(
+                || destination.clone(),
+                |host| Destination::Domain {
+                    host: host.to_owned(),
+                    port: destination.port(),
+                },
+            );
+            let key = (
+                id,
+                self.route_targets.per_flow(id).then(|| destination.clone()),
+            );
+            let cached = cached
+                .as_deref_mut()
+                .and_then(|cached| cached.get(&key))
+                .map(|cached| cached.leaf.clone());
+            match self.route_targets.inspect_rule_target(
+                id,
+                network == Network::Udp,
+                cached.is_none(),
+                Some(source),
+                Some(&metadata),
+            ) {
+                Ok(InspectedRuleTarget::Control(_)) if !self.rules.filters_udp() => {
+                    selected = Some(Err(DispatchError::NotAllowed));
+                    RuleTargetEffect::Accept
+                }
+                Ok(InspectedRuleTarget::Control(control)) => RuleTargetEffect::Control(control),
+                Ok(InspectedRuleTarget::Egress(leaf)) => {
+                    selected = Some(Ok(cached.unwrap_or(leaf)));
+                    RuleTargetEffect::Accept
+                }
+                Ok(InspectedRuleTarget::Unavailable) if self.rules.filters_udp() => {
+                    RuleTargetEffect::Skip
+                }
+                Ok(InspectedRuleTarget::Unavailable) => {
+                    selected = Some(Err(DispatchError::NotAllowed));
+                    RuleTargetEffect::Accept
+                }
+                Err(error) => {
+                    selection_error = Some(error);
+                    RuleTargetEffect::Accept
+                }
             }
-            evaluation => evaluation,
         };
-
-        let RuleEvaluation::Matched(rule_match) = evaluation else {
+        let evaluation =
+            match self
+                .rules
+                .evaluate_program(&mut context, geo_matcher, None, None, &mut select)
+            {
+                ProgramEvaluation::NeedsIpResolution(cursor) => {
+                    let addresses = match (destination, &self.dns) {
+                        (Destination::Domain { host, .. }, Some(dns)) => {
+                            self.resolve_addresses(dns, host).await
+                        }
+                        _ => Vec::new(),
+                    };
+                    resolved = Some(addresses);
+                    self.rules.evaluate_program(
+                        &mut context,
+                        geo_matcher,
+                        Some(cursor),
+                        resolved.as_deref(),
+                        &mut select,
+                    )
+                }
+                evaluation => evaluation,
+            };
+        if let Some(error) = selection_error {
+            return Err(error);
+        }
+        let ProgramEvaluation::Matched(rule_match) = evaluation else {
             return Err(DispatchError::Other(
                 "routing rules produced no final action".to_owned(),
             ));
@@ -462,6 +542,7 @@ impl RoutingDispatcher {
                 Destination::Ip(std::net::SocketAddr::new(address, destination.port()))
             }),
             resolved_addresses: resolved,
+            selected,
         };
         if decision.action == RuleAction::Direct {
             self.resolve_direct_destination(&mut decision).await?;
@@ -588,6 +669,7 @@ struct RouteDecision {
     action: RuleAction,
     destination: Destination,
     resolved_addresses: Option<Vec<IpAddr>>,
+    selected: Option<Result<ResolvedProxyGroupLeaf, DispatchError>>,
 }
 
 fn log_route_decision(network: Network, decision: &RouteDecision) {
@@ -718,17 +800,10 @@ impl RoutingDispatcher {
                 session.source,
                 &session.destination,
                 session.sniffed_domain.as_deref(),
+                None,
             )
             .await?;
-        let resolved_target = match decision.action {
-            RuleAction::Route(id) => Some(self.route_targets.resolve_for(
-                id,
-                false,
-                Some(session.source),
-                Some(&decision.metadata),
-            )?),
-            RuleAction::Direct | RuleAction::Reject => None,
-        };
+        let resolved_target = decision.selected.take().transpose()?;
         if resolved_target.as_ref().is_some_and(|target| target.direct) {
             self.resolve_direct_destination(&mut decision).await?;
         }
@@ -981,6 +1056,7 @@ impl Drop for ManagedDatagramFlow {
 }
 
 struct CachedRouteTransport {
+    leaf: ResolvedProxyGroupLeaf,
     last_used: Instant,
     transport: Box<dyn DatagramTransport>,
     direct: bool,
@@ -1119,6 +1195,7 @@ impl RoutedDatagramTransport {
                     self.session.source,
                     &key,
                     datagram.sniffed_domain.as_deref(),
+                    None,
                 )
                 .await?;
             if decision.action == RuleAction::Reject {
@@ -1126,13 +1203,11 @@ impl RoutedDatagramTransport {
             }
             let (dispatcher, direct, chain) = match decision.action {
                 RuleAction::Direct => (self.router.direct.clone(), true, Vec::new()),
-                RuleAction::Route(id) => {
-                    let leaf = self.router.route_targets.resolve_for(
-                        id,
-                        true,
-                        Some(self.session.source),
-                        Some(&decision.metadata),
-                    )?;
+                RuleAction::Route(_) => {
+                    let leaf = decision
+                        .selected
+                        .take()
+                        .expect("accepted route owns its selected leaf")?;
                     (leaf.dispatcher, leaf.direct, leaf.chain)
                 }
                 RuleAction::Reject => unreachable!(),
@@ -1397,18 +1472,17 @@ impl RoutedDatagramTransport {
                     self.session.source,
                     &datagram.remote,
                     datagram.sniffed_domain.as_deref(),
+                    None,
                 )
                 .await?;
             let (dispatcher, direct) = match decision.action {
                 RuleAction::Reject => return Ok(()),
                 RuleAction::Direct => (self.router.direct.clone(), true),
-                RuleAction::Route(id) => {
-                    let target = self.router.route_targets.resolve_for(
-                        id,
-                        true,
-                        Some(self.session.source),
-                        Some(&decision.metadata),
-                    )?;
+                RuleAction::Route(_) => {
+                    let target = decision
+                        .selected
+                        .take()
+                        .expect("accepted route owns its selected leaf")?;
                     (target.dispatcher, target.direct)
                 }
             };
@@ -1475,12 +1549,15 @@ impl RoutedDatagramTransport {
         let direct = match direct {
             Some(direct) => direct,
             None => {
-                let target = self.router.route_targets.resolve_for(
-                    id,
-                    true,
-                    Some(self.session.source),
-                    Some(&decision.metadata),
-                )?;
+                let target = match decision.selected.take() {
+                    Some(target) => target?,
+                    None => self.router.route_targets.resolve_for(
+                        id,
+                        true,
+                        Some(self.session.source),
+                        Some(&decision.metadata),
+                    )?,
+                };
                 let direct = target.direct;
                 if direct {
                     self.router
@@ -1496,6 +1573,7 @@ impl RoutedDatagramTransport {
                     CachedRouteTransport {
                         transport,
                         direct,
+                        leaf: target,
                         last_used: Instant::now(),
                     },
                 );
@@ -1648,6 +1726,7 @@ impl DatagramTransport for RoutedDatagramTransport {
                 action,
                 destination: datagram.remote.clone(),
                 resolved_addresses: None,
+                selected: None,
             }
         } else {
             let decision = self
@@ -1658,6 +1737,7 @@ impl DatagramTransport for RoutedDatagramTransport {
                     self.session.source,
                     &datagram.remote,
                     datagram.sniffed_domain.as_deref(),
+                    Some(&mut self.route_transports),
                 )
                 .await?;
             if let Some(destination) = flow {
@@ -2340,6 +2420,7 @@ rules: ["DST-PORT,443,{target}", "MATCH,DIRECT"]
                             "192.0.2.2:1234".parse().unwrap(),
                             &Destination::Ip("203.0.113.1:443".parse().unwrap()),
                             None,
+                            None,
                         )
                         .await
                         .unwrap();
@@ -2470,6 +2551,87 @@ rules: ["MATCH,balance"]
         assert_eq!(a.udp_opens.load(Ordering::Relaxed), 1);
         assert!(groups.select("balance", "a").is_err());
         transport.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subrule_routes_resume_dns_and_commit_one_tcp_udp_leaf() {
+        let mut config = crate::config::Config::parse_yaml(br#"
+mixed-port: 1080
+proxies:
+  - {name: a, type: socks5, server: 192.0.2.10, port: 1080}
+  - {name: b, type: socks5, server: 192.0.2.11, port: 1080}
+proxy-groups:
+  - {name: gate, type: load-balance, proxies: [PASS-RULE,a], strategy: round-robin, disable-udp: true}
+  - {name: pool, type: load-balance, proxies: [a,b], strategy: round-robin}
+  - {name: GLOBAL, type: select, proxies: [PASS,pool]}
+rules: ['SUB-RULE,(DST-PORT,443),child', 'MATCH,REJECT']
+sub-rules:
+  child: ['DST-PORT,443,gate', 'IP-CIDR,192.0.2.0/24,pool', 'MATCH,pool']
+"#).unwrap();
+        let mut global_config = config.clone();
+        global_config.mode = crate::config::Mode::Global;
+        let a = Arc::new(RecordingDispatcher::default());
+        let b = Arc::new(RecordingDispatcher::default());
+        let nodes: Vec<Arc<dyn Dispatcher>> = vec![a.clone(), b.clone()];
+        let direct = Arc::new(RecordingDispatcher::default());
+        let groups = ProxyGroups::new(&config.proxy_groups, nodes.clone(), direct.clone()).unwrap();
+        let dns = Arc::new(MockDns::new(vec!["192.0.2.7".parse().unwrap()]));
+        let mut router = RoutingDispatcher::new(
+            ProxyDispatchers::with_proxy_groups(nodes, &groups).unwrap(),
+            direct,
+            None,
+            RuleSet::compile_config(&mut config).unwrap(),
+            Arc::new(EmptyGeoMatcher),
+        );
+        router.dns = Some(dns.clone());
+        let source = "192.0.2.1:5555".parse().unwrap();
+        for _ in 0..2 {
+            router
+                .connect_tcp(StreamSession {
+                    inbound: InboundKind::Socks5,
+                    source,
+                    destination: Destination::domain("example.com", 443).unwrap(),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(dns.resolve_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(a.tcp_sessions.lock().unwrap().len(), 1);
+        assert_eq!(b.tcp_sessions.lock().unwrap().len(), 1);
+        let mut transport = router
+            .open_datagram(DatagramSession::new(InboundKind::Socks5, source))
+            .await
+            .unwrap();
+        let first = datagram("198.51.100.1:443".parse().unwrap(), b"first");
+        transport.send(first.clone()).await.unwrap();
+        transport.send(first).await.unwrap();
+        transport
+            .send(datagram("198.51.100.2:443".parse().unwrap(), b"next"))
+            .await
+            .unwrap();
+        assert_eq!(a.datagrams.lock().unwrap().len(), 2);
+        assert_eq!(b.datagrams.lock().unwrap().len(), 1);
+        assert_eq!(groups.selection(0).choose(None, None), 0);
+        transport.close().await.unwrap();
+        let global = RoutingDispatcher::new(
+            router.route_targets.clone(),
+            router.direct.clone(),
+            None,
+            RuleSet::compile_config(&mut global_config).unwrap(),
+            Arc::new(EmptyGeoMatcher),
+        );
+        assert!(matches!(
+            global
+                .connect_tcp(StreamSession {
+                    inbound: InboundKind::Socks5,
+                    source,
+                    destination: Destination::Ip("198.51.100.1:443".parse().unwrap()),
+                    sniffed_domain: None
+                })
+                .await,
+            Err(DispatchError::NotAllowed)
+        ));
     }
 
     #[test]

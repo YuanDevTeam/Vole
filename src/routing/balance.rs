@@ -46,6 +46,14 @@ impl Balance {
         source: Option<SocketAddr>,
         destination: Option<&Destination>,
     ) -> usize {
+        self.inspect(source, destination, true)
+    }
+    pub fn inspect(
+        &mut self,
+        source: Option<SocketAddr>,
+        destination: Option<&Destination>,
+        commit: bool,
+    ) -> usize {
         let count = self.healthy.len();
         if count == 0 {
             return 0;
@@ -55,7 +63,9 @@ impl Balance {
                 .map(|offset| (self.cursor + offset) % count)
                 .find(|&i| self.healthy[i]);
             if let Some(index) = selected {
-                self.cursor = (index + 1) % count;
+                if commit {
+                    self.cursor = (index + 1) % count;
+                }
                 return index;
             }
             return 0;
@@ -109,6 +119,11 @@ impl Balance {
             },
         );
         index
+    }
+    pub fn commit(&mut self, index: usize) {
+        if self.strategy == BalanceStrategy::RoundRobin && !self.healthy.is_empty() {
+            self.cursor = (index + 1) % self.healthy.len();
+        }
     }
 }
 fn destination_key(destination: Option<&Destination>) -> String {

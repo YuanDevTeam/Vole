@@ -32,6 +32,168 @@ pub(super) fn parse_rule(input: &str, targets: &RouteTargetsByName) -> Result<Ru
     parse(input, Some(targets), 0)
 }
 
+pub(super) fn parse_program_rule(
+    input: &str,
+    targets: &RouteTargetsByName,
+    sub_rules: &HashMap<String, SubRuleId>,
+) -> Result<RuleSpec> {
+    let (kind, rest) = input
+        .split_once(',')
+        .ok_or_else(|| VoleError::InvalidConfig("rule requires a type and payload".into()))?;
+    if trim_ascii_whitespace(kind).eq_ignore_ascii_case("SUB-RULE") {
+        let (condition, name) = rest.rsplit_once(',').ok_or_else(|| {
+            VoleError::InvalidConfig("SUB-RULE requires a condition and named program".into())
+        })?;
+        let condition = trim_ascii_whitespace(condition)
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(')'))
+            .ok_or_else(|| {
+                VoleError::InvalidConfig("SUB-RULE condition requires parentheses".into())
+            })?;
+        let target = sub_rules
+            .get(trim_ascii_whitespace(name))
+            .copied()
+            .ok_or_else(|| {
+                VoleError::InvalidConfig("SUB-RULE references an unknown program".into())
+            })?;
+        return Ok(RuleSpec {
+            kind: RuleKind::SubRule {
+                predicate: Box::new(parse_predicate(condition)?),
+                target,
+            },
+            action: RuleAction::Direct,
+            no_resolve: false,
+        });
+    }
+    let logical = matches!(
+        trim_ascii_whitespace(kind).to_ascii_uppercase().as_str(),
+        "AND" | "OR" | "NOT" | "DOMAIN-REGEX"
+    );
+    let target_range = if logical {
+        input.rfind(',').map(|start| start + 1..input.len())
+    } else {
+        let start = input.find(',').unwrap() + 1;
+        if trim_ascii_whitespace(kind).eq_ignore_ascii_case("MATCH") {
+            Some(start..input.len())
+        } else {
+            input[start..].find(',').map(|offset| {
+                let start = start + offset + 1;
+                let end = input[start..]
+                    .find(',')
+                    .map_or(input.len(), |offset| start + offset);
+                start..end
+            })
+        }
+    };
+    if let Some(range) = target_range {
+        let control = match trim_ascii_whitespace(&input[range.clone()]) {
+            "PASS" => Some(RuleControl::Pass),
+            "PASS-RULE" => Some(RuleControl::PassRule),
+            _ => None,
+        };
+        if let Some(control) = control {
+            let mut terminal = input.to_owned();
+            terminal.replace_range(range, "DIRECT");
+            let predicate = parse(&terminal, Some(targets), 0)?;
+            return Ok(RuleSpec {
+                kind: RuleKind::Flow {
+                    predicate: Box::new(predicate),
+                    control,
+                },
+                action: RuleAction::Direct,
+                no_resolve: false,
+            });
+        }
+    }
+    parse(input, Some(targets), 0)
+}
+
+pub(crate) fn validate_subrule_calls(
+    main: &[RuleSpec],
+    sub_rules: &[NamedRuleProgram],
+) -> Result<()> {
+    fn visit(
+        id: usize,
+        depth: usize,
+        sub_rules: &[NamedRuleProgram],
+        states: &mut [u8],
+        lengths: &mut [usize],
+    ) -> Result<usize> {
+        if depth > 32 {
+            return invalid("sub-rules exceed 32 call levels");
+        }
+        let Some(program) = sub_rules.get(id) else {
+            return invalid("SUB-RULE references an unknown program");
+        };
+        if states[id] == 1 {
+            return invalid("sub-rules contain a reference cycle");
+        }
+        if states[id] == 2 {
+            return Ok(lengths[id]);
+        }
+        states[id] = 1;
+        let mut length = 1;
+        for rule in &program.rules {
+            if let RuleKind::SubRule { target, .. } = &rule.kind {
+                length =
+                    length.max(1 + visit(target.index(), depth + 1, sub_rules, states, lengths)?);
+            }
+        }
+        if length > 32 {
+            return invalid("sub-rules exceed 32 call levels");
+        }
+        states[id] = 2;
+        lengths[id] = length;
+        Ok(length)
+    }
+    fn pure(rule: &RuleSpec, depth: usize) -> Result<()> {
+        if depth > 32 {
+            return invalid("logical rules exceed 32 nesting levels");
+        }
+        match &rule.kind {
+            RuleKind::Flow { .. } | RuleKind::SubRule { .. } => {
+                invalid("flow controls are not predicates")
+            }
+            RuleKind::And(children) | RuleKind::Or(children) => {
+                for child in children {
+                    pure(child, depth + 1)?;
+                }
+                Ok(())
+            }
+            RuleKind::Not(child) => pure(child, depth + 1),
+            _ => Ok(()),
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    for program in sub_rules {
+        if program.name.is_empty() || !names.insert(&program.name) {
+            return invalid("sub-rules require unique nonempty names");
+        }
+    }
+    for rule in main
+        .iter()
+        .chain(sub_rules.iter().flat_map(|program| &program.rules))
+    {
+        match &rule.kind {
+            RuleKind::Flow { predicate, .. } | RuleKind::SubRule { predicate, .. } => {
+                pure(predicate, 0)?
+            }
+            _ => pure(rule, 0)?,
+        }
+    }
+    let mut states = vec![0; sub_rules.len()];
+    let mut lengths = vec![0; sub_rules.len()];
+    for id in 0..sub_rules.len() {
+        visit(id, 1, sub_rules, &mut states, &mut lengths)?;
+    }
+    for rule in main {
+        if let RuleKind::SubRule { target, .. } = &rule.kind {
+            visit(target.index(), 1, sub_rules, &mut states, &mut lengths)?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn parse_predicate(input: &str) -> Result<RuleSpec> {
     parse(input, None, 0)
 }

@@ -474,7 +474,9 @@ proxies:
 # load-balance 没有 now/手动选择；UDP 按目标会话固定叶节点，健康变化不迁移旧会话。
 # 自动或手动切换只影响新连接；既有连接、认证会话及其中复用的流仍保留原路径。
 # 组作为 dialer-proxy 时，与路由共用当前选择，但不重新执行业务规则；DIRECT 连接
-# 当前节点的服务器而不是业务目标，REJECT 在建链时失败且不回退。单次建链对每个组
+# 当前节点的服务器而不是业务目标，REJECT 在建链时失败且不回退。成员也可为 PASS/
+# PASS-RULE；仅 rule 模式消费控制，global、dialer-proxy 或显式 DNS 出口选中时拒绝。
+# 单次建链对每个组
 # 只读一次选择，SOCKS5 UDP 控制流与 relay 路径共用该快照和期限；不同组没有原子
 # 快照保证。复用旧 AnyTLS 会话的新业务流仍沿用该会话路径，只有新建底层 transport
 # 才读取新选择。Hysteria2/TUIC 已建立会话的新逻辑流、Hysteria2 跳端口 socket
@@ -607,14 +609,20 @@ dns:
       - "tcp://1.1.1.1:53#main-select"
 
 # rules 可省略或为空；rule 模式按顺序首条命中，未命中 DIRECT。MATCH 可放在任意
-# 位置，命中后其后规则不再执行。DIRECT、REJECT 是内置动作，其他动作精确引用节点或组。
+# 位置，普通目标命中后其后规则不再执行。DIRECT、REJECT 是内置出口，其他出口精确引用节点或组。
 # 支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、DOMAIN-WILDCARD、DOMAIN-REGEX、
 # GEOSITE、GEOIP、IP-CIDR、IP-CIDR6、SRC-IP-CIDR、DST-PORT、SRC-PORT、NETWORK、
-# RULE-SET、AND/OR/NOT 和 MATCH。SRC-IP-CIDR 支持 IPv4/IPv6，来源信息来自实际入站会话。
+# RULE-SET、SUB-RULE、AND/OR/NOT 和 MATCH。SRC-IP-CIDR 支持 IPv4/IPv6，来源信息来自实际入站会话。
 # 通配符 * 匹配任意长度、? 匹配一个字符；DOMAIN-REGEX 忽略大小写，支持 regex crate
 # 子集，不支持 lookaround/backreference，无法编译的模式明确报错。
 # 逻辑规则例如 AND,((DOMAIN-SUFFIX,example.com),(SRC-PORT,1000-2000)),DIRECT；
-# NOT 恰好一个子规则，最多嵌套 32 层。规则上限 65536 条、单条 16 KiB、合计 8 MiB。
+# NOT 恰好一个子规则，逻辑最多嵌套 32 层。主列表与所有 sub-rules 共用 65536 条、
+# 单条 16 KiB、文本合计 8 MiB 的预算；子规则名计入文本。子规则调用最多 32 层，
+# 名称必须存在且全图无环；定义共享存储，不按调用次数复制。
+# SUB-RULE,(纯条件),名称 在条件匹配时进入指定列表；子列表耗尽则继续调用者。
+# PASS（含组选择为 PASS）退出所有子调用并继续主列表下一条；PASS-RULE 仅继续
+# 当前子列表，出现在主列表时为 REJECT。两者不能出现在逻辑谓词或 classical 集合中。
+# 组的控制目标先于 disable-udp/节点 UDP 检查；跳过不推进轮询。实际出口只选择一次。
 # GEOSITE 支持 [!]<code>[@<attr>...]，GEOIP 支持 [!]<code> 和可选 no-resolve。
 # 例如 GEOSITE,google@ads,REJECT / GEOSITE,!cn@ads,main-select / GEOIP,!CN,DIRECT。
 # geolocation-!cn 为字面分类名；GeoIP DAT reverse_match 接受但忽略，取反由 ! 控制。
@@ -624,8 +632,13 @@ rules:
   - GEOSITE,cn,DIRECT
   - GEOIP,CN,DIRECT,no-resolve
   - DOMAIN-SUFFIX,anytls.example,anytls-edge
-  - NETWORK,UDP,anytls-edge
+  - SUB-RULE,(NETWORK,UDP),udp-policy
   - MATCH,main-select
+
+sub-rules:
+  udp-policy:
+    - DOMAIN-SUFFIX,example.com,PASS-RULE
+    - NETWORK,UDP,anytls-edge
 
 # measureDelay 使用独立的 node-only 配置：顶层只能包含 proxies，不能包含
 # proxy-groups。节点字段和代理图校验与上文一致，但不能出现 mixed-port/authentication、

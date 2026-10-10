@@ -38,7 +38,7 @@ impl Diagnostics {
         // pinning a Config or an entire retired resource generation.
         let mut texts = BTreeSet::new();
         let mut names = BTreeSet::new();
-        for name in ["", "DIRECT", "REJECT"]
+        for name in ["", "DIRECT", "REJECT", "PASS", "PASS-RULE"]
             .into_iter()
             .chain(config.proxies.iter().map(|p| p.tag.as_str()))
             .chain(config.proxy_groups.iter().map(|g| g.name.as_str()))
@@ -68,13 +68,19 @@ impl Diagnostics {
             .filter_map(|i| rules.rule(i))
             .map(|spec| {
                 let (kind, payload) = rule_description(&spec.kind);
-                let target = match spec.action {
-                    RuleAction::Direct => "DIRECT",
-                    RuleAction::Reject => "REJECT",
-                    RuleAction::Route(RouteTargetId::Proxy(id)) => &config.proxies[id.index()].tag,
-                    RuleAction::Route(RouteTargetId::Group(id)) => {
-                        &config.proxy_groups[id.index()].name
-                    }
+                let target = match &spec.kind {
+                    RuleKind::Flow { control, .. } => control.name(),
+                    RuleKind::SubRule { target, .. } => rules.subrule_name(*target),
+                    _ => match spec.action {
+                        RuleAction::Direct => "DIRECT",
+                        RuleAction::Reject => "REJECT",
+                        RuleAction::Route(RouteTargetId::Proxy(id)) => {
+                            &config.proxies[id.index()].tag
+                        }
+                        RuleAction::Route(RouteTargetId::Group(id)) => {
+                            &config.proxy_groups[id.index()].name
+                        }
+                    },
                 };
                 Rule {
                     kind,
@@ -214,6 +220,10 @@ fn rule_description(rule: &RuleKind) -> (&'static str, String) {
             logical(rules.iter().map(|r| &r.kind)),
         ),
         RuleKind::Not(rule) => ("NOT", logical(std::iter::once(&rule.kind))),
+        RuleKind::Flow { predicate, .. } => rule_description(&predicate.kind),
+        RuleKind::SubRule { predicate, .. } => {
+            ("SubRule", logical(std::iter::once(&predicate.kind)))
+        }
     }
 }
 fn logical<'a>(rules: impl Iterator<Item = &'a RuleKind>) -> String {

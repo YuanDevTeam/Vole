@@ -213,6 +213,7 @@ jobs:
             invoke::tests::runtime_thread_cannot_reenter_invoke
             invoke::tests::engine_workers_preserve_invoke_admission_and_shutdown
             invoke::tests::engine_completion_notifies_after_panic_and_join_reports_failure
+            dns::runtime::tests::subrule_dns_rules_keep_round_robin_for_new_physical_connections
             dns::runtime::tests::runtime_dns_separates_bootstrap_proxy_direct_and_hosts
             dns::runtime::tests::udp_truncation_retries_the_same_upstream_over_tcp
             dns::runtime::tests::concurrent_redir_host_hint_reads_and_dns_updates_complete

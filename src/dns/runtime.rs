@@ -44,7 +44,8 @@ use crate::{
     dispatch::{BoxStream, DispatchError, Dispatcher},
     resources::{ResourceActivity, ResourceActivityGuard, RuntimeResourceStats},
     routing::{
-        EmptyGeoMatcher, GeoMatcher, ProxyDispatchers, RoutingContext, RuleEvaluation, RuleSet,
+        EmptyGeoMatcher, GeoMatcher, ProgramEvaluation, ProxyDispatchers, RoutingContext, RuleSet,
+        RuleTargetEffect,
     },
     session::{Datagram, DatagramSession, Destination, InboundKind, StreamSession},
 };
@@ -234,15 +235,28 @@ impl TcpConnectionPool {
         })
     }
 
-    async fn checkout(
+    async fn checkout_for(
         self: &Arc<Self>,
-        key: TcpPoolKey,
         nameserver: &ResolvedNameserver,
-        egress: &Arc<dyn Dispatcher>,
+        resolve: impl FnOnce(&TcpPoolState) -> Result<(DnsEgressKey, Arc<dyn Dispatcher>), AttemptError>,
     ) -> Result<TcpLease, AttemptError> {
-        let (connection, expired) = {
+        let (key, egress, connection, expired) = {
             let mut state = self.state.lock().await;
             let expired = self.take_expired_locked(&mut state, TokioInstant::now());
+            // Resolve and remove an idle connection in one transaction. The
+            // callback commits a group only when this stable route key is absent.
+            let (egress_key, egress) = match resolve(&state) {
+                Ok(route) => route,
+                Err(error) => {
+                    self.record_idle_locked(&state);
+                    return Err(error);
+                }
+            };
+            let key = TcpPoolKey {
+                upstream: nameserver.config.clone(),
+                endpoint: nameserver.endpoint(),
+                egress: egress_key,
+            };
             let index = state
                 .idle
                 .iter()
@@ -252,10 +266,9 @@ impl TcpConnectionPool {
                 .map(|(index, _)| index);
             let connection = index.map(|index| state.idle.swap_remove(index).connection);
             self.record_idle_locked(&state);
-            (connection, expired)
+            (key, egress, connection, expired)
         };
         drop(expired);
-
         if let Some(connection) = connection {
             self.stats.reuse_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(TcpLease {
@@ -266,8 +279,7 @@ impl TcpConnectionPool {
                 stats: Arc::clone(&self.stats),
             });
         }
-
-        let connection = self.open_connection(nameserver, egress).await?;
+        let connection = self.open_connection(nameserver, &egress).await?;
         Ok(TcpLease {
             key,
             connection: Some(connection),
@@ -1160,7 +1172,9 @@ impl RuntimeDns {
         &self,
         nameserver: &ResolvedNameserver,
         network: Network,
-    ) -> Result<(DnsEgressKey, &Arc<dyn Dispatcher>), AttemptError> {
+        reuse: impl Fn(DnsEgressKey) -> bool,
+    ) -> Result<(DnsEgressKey, Arc<dyn Dispatcher>), AttemptError> {
+        use crate::routing::proxy_group::InspectedRuleTarget;
         let DnsEgress::Routed {
             proxies,
             direct,
@@ -1170,45 +1184,84 @@ impl RuntimeDns {
             let DnsEgress::Single(dispatcher) = &self.egress else {
                 unreachable!()
             };
-            return Ok((DnsEgressKey::Single, dispatcher));
+            return Ok((DnsEgressKey::Single, dispatcher.clone()));
         };
-
+        let destination = match &nameserver.address {
+            DnsAddress::Ip(_) => Destination::Ip(nameserver.endpoint()),
+            DnsAddress::Domain(host) => {
+                Destination::domain(host, nameserver.port).map_err(AttemptError::Io)?
+            }
+        };
+        let inspect = |id| {
+            proxies.inspect_rule_target(
+                id,
+                network == Network::Udp,
+                !reuse(DnsEgressKey::Route(id)),
+                Some(internal_source(nameserver.endpoint.ip())),
+                Some(&destination),
+            )
+        };
         match nameserver.route {
-            DnsRoute::Direct => Ok((DnsEgressKey::Direct, direct)),
-            DnsRoute::Route(id) => proxies
-                .get_route(id)
-                .map(|dispatcher| (DnsEgressKey::Route(id), dispatcher))
-                .map_err(AttemptError::Dispatch),
+            DnsRoute::Direct => Ok((DnsEgressKey::Direct, direct.clone())),
+            DnsRoute::Route(id) => match inspect(id).map_err(AttemptError::Dispatch)? {
+                InspectedRuleTarget::Egress(leaf) => Ok((DnsEgressKey::Route(id), leaf.dispatcher)),
+                InspectedRuleTarget::Control(_) | InspectedRuleTarget::Unavailable => {
+                    Err(AttemptError::Dispatch(DispatchError::NotAllowed))
+                }
+            },
             DnsRoute::Rules => {
-                let destination = match &nameserver.address {
-                    DnsAddress::Ip(_) => Destination::Ip(nameserver.endpoint()),
-                    DnsAddress::Domain(host) => {
-                        Destination::domain(host, nameserver.port).map_err(AttemptError::Io)?
-                    }
-                };
-                let mut context = RoutingContext::new(network, &destination).map_err(|error| {
-                    AttemptError::Dispatch(DispatchError::Other(format!(
-                        "DNS nameserver routing context is invalid: {error}"
-                    )))
-                })?;
+                let mut context = RoutingContext::new(network, &destination)
+                    .map_err(|_| AttemptError::Dispatch(DispatchError::HostUnreachable))?;
                 context.pin_ip(nameserver.endpoint.ip());
-                match rules.evaluate_with_egress(&context, self.geo_matcher.as_ref(), |action| {
-                    proxies.supports_udp(action)
-                }) {
-                    RuleEvaluation::Matched(rule_match) => match rule_match.action {
-                        RuleAction::Route(id) => proxies
-                            .get_route(id)
-                            .map(|dispatcher| (DnsEgressKey::Route(id), dispatcher))
-                            .map_err(AttemptError::Dispatch),
-                        RuleAction::Direct => Ok((DnsEgressKey::Direct, direct)),
+                let snapshot = self.geo_matcher.routing_snapshot();
+                let geo = snapshot.as_deref().unwrap_or(self.geo_matcher.as_ref());
+                let mut selected = None;
+                let mut error = None;
+                let evaluation =
+                    rules.evaluate_program(&mut context, geo, None, None, |action, _| {
+                        let RuleAction::Route(id) = action else {
+                            return RuleTargetEffect::Accept;
+                        };
+                        match inspect(id) {
+                            Ok(InspectedRuleTarget::Control(_)) if !rules.filters_udp() => {
+                                error = Some(DispatchError::NotAllowed);
+                                RuleTargetEffect::Accept
+                            }
+                            Ok(InspectedRuleTarget::Control(control)) => {
+                                RuleTargetEffect::Control(control)
+                            }
+                            Ok(InspectedRuleTarget::Egress(leaf)) => {
+                                selected = Some((DnsEgressKey::Route(id), leaf.dispatcher));
+                                RuleTargetEffect::Accept
+                            }
+                            Ok(InspectedRuleTarget::Unavailable) if rules.filters_udp() => {
+                                RuleTargetEffect::Skip
+                            }
+                            Ok(InspectedRuleTarget::Unavailable) => {
+                                error = Some(DispatchError::NotAllowed);
+                                RuleTargetEffect::Accept
+                            }
+                            Err(failure) => {
+                                error = Some(failure);
+                                RuleTargetEffect::Accept
+                            }
+                        }
+                    });
+                if let Some(error) = error {
+                    return Err(AttemptError::Dispatch(error));
+                }
+                match evaluation {
+                    ProgramEvaluation::Matched(rule_match) => match rule_match.action {
+                        RuleAction::Route(_) => {
+                            Ok(selected.expect("accepted DNS route owns a leaf"))
+                        }
+                        RuleAction::Direct => Ok((DnsEgressKey::Direct, direct.clone())),
                         RuleAction::Reject => {
                             Err(AttemptError::Dispatch(DispatchError::NotAllowed))
                         }
                     },
-                    RuleEvaluation::NeedsIpResolution { .. } | RuleEvaluation::NoMatch => {
-                        Err(AttemptError::Dispatch(DispatchError::Other(
-                            "DNS nameserver rules produced no final action".to_owned(),
-                        )))
+                    ProgramEvaluation::NeedsIpResolution(_) => {
+                        Err(AttemptError::Dispatch(DispatchError::HostUnreachable))
                     }
                 }
             }
@@ -1905,8 +1958,8 @@ impl RuntimeDns {
         });
         let mut server = self.resolve_nameserver(&nameserver).await?;
         if server.transport == DnsTransport::Udp {
-            let (_, egress) = self.egress_for(&server, Network::Udp)?;
-            let response = self.exchange_udp(&server, egress, query, matches).await?;
+            let (_, egress) = self.egress_for(&server, Network::Udp, |_| false)?;
+            let response = self.exchange_udp(&server, &egress, query, matches).await?;
             if response.get(2).is_some_and(|flags| flags & 0x02 != 0) {
                 server.config.transport = DnsTransport::Tcp;
             } else {
@@ -1914,9 +1967,7 @@ impl RuntimeDns {
                 return Ok((response, parsed));
             }
         }
-        let (key, egress) = self.egress_for(&server, Network::Tcp)?;
-        self.exchange_tcp(&server, key, egress, query, validate)
-            .await
+        self.exchange_tcp(&server, query, validate).await
     }
 
     async fn exchange_udp<F>(
@@ -2001,20 +2052,24 @@ impl RuntimeDns {
     async fn exchange_tcp<R, F>(
         &self,
         nameserver: &ResolvedNameserver,
-        egress_key: DnsEgressKey,
-        egress: &Arc<dyn Dispatcher>,
         query: &[u8],
         validate: F,
     ) -> Result<(Vec<u8>, R), AttemptError>
     where
         F: Fn(&[u8]) -> Result<R, AttemptError>,
     {
-        let key = TcpPoolKey {
-            upstream: nameserver.config.clone(),
-            endpoint: nameserver.endpoint(),
-            egress: egress_key,
-        };
-        let mut lease = self.tcp_pool.checkout(key, nameserver, egress).await?;
+        let mut lease = self
+            .tcp_pool
+            .checkout_for(nameserver, |state| {
+                self.egress_for(nameserver, Network::Tcp, |egress| {
+                    state.idle.iter().any(|idle| {
+                        idle.key.upstream == nameserver.config
+                            && idle.key.endpoint == nameserver.endpoint()
+                            && idle.key.egress == egress
+                    })
+                })
+            })
+            .await?;
         let first_was_reused = lease.reused;
 
         let mut result = exchange_stream_validated(
@@ -2033,8 +2088,10 @@ impl RuntimeDns {
                 event = "runtime_dns_tcp_pool_stale_retry",
                 "runtime DNS is rebuilding one stale reused TCP connection"
             );
+            let (key, egress) = self.egress_for(nameserver, Network::Tcp, |_| false)?;
+            lease.key.egress = key;
             self.tcp_pool
-                .replace_stale(&mut lease, nameserver, egress)
+                .replace_stale(&mut lease, nameserver, &egress)
                 .await?;
             result = exchange_stream_validated(
                 &mut lease
@@ -3391,6 +3448,66 @@ dns:
         assert_eq!(direct.tcp_calls.load(Ordering::Acquire), 1);
         assert_eq!(proxy.tcp_calls.load(Ordering::Acquire), 1);
         assert_eq!(resolver.tcp_pool.snapshot().current_idle, 2);
+    }
+
+    #[tokio::test]
+    async fn subrule_dns_rules_keep_round_robin_for_new_physical_connections() {
+        use crate::{
+            config::Config,
+            routing::{ProxyGroups, RouteTargetDispatchers},
+        };
+        let mut configured = Config::parse_yaml(br#"
+mixed-port: 1080
+proxies:
+  - {name: a, type: socks5, server: 192.0.2.10, port: 1080}
+  - {name: b, type: socks5, server: 192.0.2.11, port: 1080}
+proxy-groups:
+  - {name: gate, type: load-balance, proxies: [PASS-RULE,a], strategy: round-robin, disable-udp: true}
+  - {name: pool, type: load-balance, proxies: [a,b], strategy: round-robin}
+rules: ['SUB-RULE,(DST-PORT,53),child', 'MATCH,REJECT']
+sub-rules: {child: ['MATCH,gate', 'MATCH,pool']}
+"#).unwrap();
+        let address = "203.0.113.65".parse().unwrap();
+        let a = Arc::new(ScriptedTcpDispatcher::new(vec![vec![
+            TcpScriptReply::Response(ResponseSpec::answer(address)),
+            TcpScriptReply::Response(ResponseSpec::answer(address)),
+        ]]));
+        let b = Arc::new(ScriptedTcpDispatcher::new(vec![vec![
+            TcpScriptReply::Response(ResponseSpec::answer(address)),
+        ]]));
+        let direct: Arc<dyn Dispatcher> = Arc::new(MockDispatcher::default());
+        let nodes: Vec<Arc<dyn Dispatcher>> = vec![a.clone(), b.clone()];
+        let groups =
+            ProxyGroups::new(&configured.proxy_groups, nodes.clone(), direct.clone()).unwrap();
+        let targets = RouteTargetDispatchers::with_proxy_groups(nodes, &groups).unwrap();
+        let mut upstream = nameserver(1, DnsTransport::Tcp);
+        upstream.route = DnsRoute::Rules;
+        let resolver = RuntimeDns::new_routed_proxies(
+            &config(false, vec![upstream.clone()]),
+            targets,
+            direct,
+            RuleSet::compile_config(&mut configured).unwrap(),
+            Arc::new(EmptyGeoMatcher),
+        );
+        assert_eq!(resolver.resolve("first.example").await.unwrap(), [address]);
+        assert_eq!(resolver.resolve("pooled.example").await.unwrap(), [address]);
+        assert_eq!(a.tcp_calls.load(Ordering::Acquire), 1);
+        assert_eq!(b.tcp_calls.load(Ordering::Acquire), 0);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            resolver.resolve("rebuilt.example").await.unwrap(),
+            [address]
+        );
+        assert_eq!(b.tcp_calls.load(Ordering::Acquire), 1);
+        upstream.route = DnsRoute::Route(crate::config::RouteTargetId::Group(
+            crate::config::ProxyGroupId::new(0).unwrap(),
+        ));
+        let server = resolver.resolve_nameserver(&upstream).await.unwrap();
+        assert!(matches!(
+            resolver.egress_for(&server, Network::Tcp, |_| false),
+            Err(AttemptError::Dispatch(DispatchError::NotAllowed))
+        ));
+        assert_eq!(groups.selection(0).choose(None, None), 0);
     }
 
     #[tokio::test]

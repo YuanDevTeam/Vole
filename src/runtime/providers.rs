@@ -88,11 +88,8 @@ impl ProviderRuntime {
         dialer: Dialer,
     ) -> Arc<Self> {
         let (requests, receiver) = mpsc::channel(16);
-        let mut configured = prepared.config.clone();
-        configured.rules = (0..prepared.rules.len())
-            .filter_map(|i| prepared.rules.rule(i).cloned())
-            .collect();
-        let requirements = GeoRequirements::for_config(&configured).expect("prepared requirements");
+        let requirements = GeoRequirements::for_rules(&prepared.config, prepared.rules.all_rules())
+            .expect("prepared requirements");
         let root = prepared
             .geodata_manager
             .store_dir()
@@ -283,8 +280,7 @@ impl ProviderRuntime {
                 let mut config = template.materialize(&contents).map_err(io::Error::other)?;
                 let requirements =
                     GeoRequirements::for_config(&config).map_err(io::Error::other)?;
-                let rules =
-                    RuleSet::compile(config.take_runtime_rules()).map_err(io::Error::other)?;
+                let rules = RuleSet::compile_config(&mut config).map_err(io::Error::other)?;
                 let endpoints = vec![PreparedProxyEndpoints::default(); config.proxies.len()];
                 let parts = GraphBuilder {
                     connections,
