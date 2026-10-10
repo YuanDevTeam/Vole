@@ -275,6 +275,7 @@ pub struct DnsConfig {
     pub ipv6: bool,
     pub ipv6_timeout: Duration,
     pub cache_max_size: usize,
+    pub cache_algorithm: DnsCacheAlgorithm,
     pub nameservers: Vec<DnsNameserver>,
     pub nameserver_policies: Vec<DnsNameserverPolicy>,
     pub default_nameservers: Vec<DnsNameserver>,
@@ -285,6 +286,13 @@ pub struct DnsConfig {
     pub use_hosts: bool,
     pub use_system_hosts: bool,
     pub hosts: Vec<HostEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DnsCacheAlgorithm {
+    #[default]
+    Lru,
+    Arc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1252,6 +1260,8 @@ struct RawDnsConfig {
     ipv6_timeout: u64,
     #[serde(rename = "cache-max-size", default)]
     cache_max_size: usize,
+    #[serde(rename = "cache-algorithm", default)]
+    cache_algorithm: String,
     #[serde(default = "dns::default_nameservers")]
     nameserver: Vec<String>,
     #[serde(rename = "default-nameserver", default = "dns::default_bootstrap")]
@@ -5247,8 +5257,21 @@ authentication:
             assert_eq!(config.dns.cache_max_size, entries);
         }
         assert!(Config::parse_yaml(b"mixed-port: 1080\ndns:\n  cache-max-size: -1\n").is_err());
-        // ARC is not accepted until its actual replacement policy exists.
-        assert!(Config::parse_yaml(b"mixed-port: 1080\ndns:\n  cache-algorithm: arc\n").is_err());
+    }
+
+    #[test]
+    fn dns_cache_algorithm_activates_arc_only_for_the_exact_name() {
+        for (field, algorithm) in [
+            ("", DnsCacheAlgorithm::Lru),
+            ("  cache-algorithm: lru\n", DnsCacheAlgorithm::Lru),
+            ("  cache-algorithm: arc\n", DnsCacheAlgorithm::Arc),
+            ("  cache-algorithm: ARC\n", DnsCacheAlgorithm::Lru),
+            ("  cache-algorithm: other\n", DnsCacheAlgorithm::Lru),
+        ] {
+            let config =
+                Config::parse_yaml(format!("mixed-port: 1080\ndns:\n{field}").as_bytes()).unwrap();
+            assert_eq!(config.dns.cache_algorithm, algorithm);
+        }
     }
 
     #[test]

@@ -1024,7 +1024,10 @@ impl RuntimeDns {
             policy_index: NameserverPolicies::new(&config.nameserver_policies),
             geo_matcher,
             egress,
-            cache: Mutex::new(DnsCache::with_max_entries(address_cache_entries)),
+            cache: Mutex::new(DnsCache::with_algorithm(
+                address_cache_entries,
+                config.cache_algorithm,
+            )),
             hints: (redir_host_entries != 0).then(|| {
                 Arc::new(StdMutex::new(RedirHostHints::with_max_entries(
                     redir_host_entries,
@@ -5195,6 +5198,36 @@ dns:
             assert_eq!(role.resolve("same.example").await.unwrap(), vec![*address]);
         }
         assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 5);
+    }
+
+    #[tokio::test]
+    async fn dns_cache_arc_configuration_changes_actual_upstream_reuse() {
+        for (algorithm, expected_calls) in [
+            (crate::config::DnsCacheAlgorithm::Lru, 4),
+            (crate::config::DnsCacheAlgorithm::Arc, 3),
+        ] {
+            let address = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 104));
+            let dispatcher = Arc::new(MockDispatcher::with_replies(
+                (0..expected_calls)
+                    .map(|_| MockReply::Response(ResponseSpec::answer(address)))
+                    .collect(),
+                vec![],
+            ));
+            let mut configuration = config(false, vec![nameserver(1, DnsTransport::Udp)]);
+            configuration.cache_max_size = 2;
+            configuration.cache_algorithm = algorithm;
+            let resolver = RuntimeDns::new(&configuration, dispatcher.clone());
+            for name in [
+                "a.example",
+                "a.example",
+                "b.example",
+                "c.example",
+                "a.example",
+            ] {
+                assert_eq!(resolver.resolve(name).await.unwrap(), vec![address]);
+            }
+            assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), expected_calls);
+        }
     }
 
     #[tokio::test]

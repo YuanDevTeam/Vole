@@ -973,6 +973,16 @@ impl DnsCache {
     }
 
     #[must_use]
+    pub(crate) fn with_algorithm(
+        max_entries: usize,
+        algorithm: crate::config::DnsCacheAlgorithm,
+    ) -> Self {
+        Self {
+            store: cache::Store::with_algorithm(max_entries, algorithm),
+        }
+    }
+
+    #[must_use]
     pub fn len(&self) -> usize {
         self.store.len()
     }
@@ -1067,6 +1077,7 @@ impl DnsCache {
             cache::Key::Address(canonicalize_name(name)?, query_type),
             cache::Value::Address(value),
             expiry(now, ttl),
+            now,
         )
     }
 
@@ -1106,7 +1117,7 @@ impl DnsCache {
         Some(wire)
     }
 
-    /// Opaque payloads share the role's LRU count while retaining their own
+    /// Opaque payloads share the role's result count while retaining their own
     /// 64-response, 256 KiB, 4096-byte and 64-record safety boundaries.
     pub(crate) fn insert_opaque(
         &mut self,
@@ -1134,6 +1145,7 @@ impl DnsCache {
                     accounted_bytes,
                 },
                 expiry(now, lifetime_secs),
+                now,
             )
             .is_ok()
     }

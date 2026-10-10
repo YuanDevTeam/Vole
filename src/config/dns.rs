@@ -83,6 +83,11 @@ impl RawDnsConfig {
             } else {
                 self.cache_max_size
             },
+            cache_algorithm: if self.cache_algorithm == "arc" {
+                DnsCacheAlgorithm::Arc
+            } else {
+                DnsCacheAlgorithm::Lru
+            },
             nameservers: parse(self.nameserver, main_route)?,
             nameserver_policies: normalize_dns_nameserver_policies(
                 self.nameserver_policies,
