@@ -390,6 +390,36 @@ pub struct DnsNameserver {
     pub port: u16,
     pub route: DnsRoute,
     pub path: Option<String>,
+    pub options: DnsNameserverOptions,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct DnsNameserverOptions {
+    pub ecs: Option<DnsEcs>,
+    pub ecs_override: bool,
+    pub disabled_types: Box<[u16]>,
+    pub skip_cert_verify: bool,
+    pub verification_name: Option<String>,
+    pub disable_reuse: bool,
+}
+
+impl std::fmt::Debug for DnsNameserverOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsNameserverOptions")
+            .field("ecs", &self.ecs.is_some())
+            .field("ecs_override", &self.ecs_override)
+            .field("disabled_type_count", &self.disabled_types.len())
+            .field("skip_cert_verify", &self.skip_cert_verify)
+            .field("explicit_name", &self.verification_name.is_some())
+            .field("disable_reuse", &self.disable_reuse)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DnsEcs {
+    pub address: IpAddr,
+    pub prefix_len: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5366,6 +5396,7 @@ rules:
             [
                 DnsNameserver {
                     path: None,
+                    options: Default::default(),
                     transport: DnsTransport::Udp,
                     address: "1.1.1.1".parse().unwrap(),
                     port: 53,
@@ -5373,6 +5404,7 @@ rules:
                 },
                 DnsNameserver {
                     path: None,
+                    options: Default::default(),
                     transport: DnsTransport::Udp,
                     address: "2001:db8::1".parse().unwrap(),
                     port: 5353,
@@ -5380,6 +5412,7 @@ rules:
                 },
                 DnsNameserver {
                     path: None,
+                    options: Default::default(),
                     transport: DnsTransport::Tcp,
                     address: "8.8.8.8".parse().unwrap(),
                     port: 53,
@@ -5387,6 +5420,7 @@ rules:
                 },
                 DnsNameserver {
                     path: None,
+                    options: Default::default(),
                     transport: DnsTransport::Tcp,
                     address: "::1".parse().unwrap(),
                     port: 53,
@@ -6523,6 +6557,7 @@ dns:
             dns.nameserver_policies[0].nameservers.as_ref(),
             [DnsNameserver {
                 path: None,
+                options: Default::default(),
                 transport: DnsTransport::Tcp,
                 address: "223.5.5.5".parse().unwrap(),
                 port: 53,
@@ -6685,11 +6720,9 @@ dns:
     #[test]
     fn current_config_strictly_rejects_invalid_dns_route_fragments() {
         for nameserver in [
-            "udp://1.1.1.1:53#",
             "udp://1.1.1.1:53#direct",
             "udp://1.1.1.1:53#unknown",
-            "udp://1.1.1.1:53#DIRECT&RULES",
-            "udp://1.1.1.1:53#h3=true",
+            "https://1.1.1.1/dns-query#h3=true",
             "udp://1.1.1.1:53#DIRECT#RULES",
         ] {
             let yaml = current_yaml(&format!(

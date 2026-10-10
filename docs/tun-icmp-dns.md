@@ -116,13 +116,33 @@ dns:
 - 上游域名由 `default-nameserver` 引导解析，后者允许 IP 上游和显式 system。未启用 DNS 时，内部解析使用系统 resolver；启用后不因查询失败回退系统解析。
 - `system`、`system://`、`dhcp://system` 使用物理系统 DNS；`dhcp://<精确接口名>` 仅使用该接口的 DHCP DNS，不匹配其他接口。各 nameserver 角色、policy 和 fallback 均支持；DHCP 接口不能用于 default-nameserver。来源始终直连物理接口，fragment 与 respect-rules 不改其出口。
 - 无 fragment 时默认 DIRECT；`respect-rules: true` 改为 RULES，要求非空 `proxy-server-nameserver`。
-- Fragment 只接受 `DIRECT`、`RULES`、实际代理节点名或支持的代理组名。
+- Fragment 使用 `#出口&参数=值`；出口接受 `DIRECT`、`RULES`、实际代理节点名或支持的代理组名。
+  仅提供参数时沿用默认出口；整个 fragment 先百分号解码，再按 `&` 和首个 `=` 拆分，
+  同名参数和出口 token 以后项为准。未知出口、参数及物理网卡 token 不支持。
 - `#RULES` 只按 nameserver endpoint 和传输执行业务规则，不把 DNS question 当作选路域名。
 - 规则模式下，UDP 跳过不支持 UDP 的节点或组，继续匹配后续规则；显式出口和 global 模式不做此跳过。
 - `RULES` 与业务 TCP/UDP 使用同一子规则求值器：`SUB-RULE`、`PASS`、`PASS-RULE` 的作用域一致；规则控制和组控制先于 UDP 能力检查。
 - 规则结果为 `REJECT` 时，当前尝试失败并继续当前组下一项。
 
 代理组成员可以是具体节点、嵌套组、`DIRECT`、`REJECT`、`PASS` 或 `PASS-RULE`。后两者仅在 rule 模式的 `RULES` 中参与规则流程，global 模式、显式命名组或 dialer-proxy 选中控制目标时拒绝连接。DNS exchange 需要新建物理 transport 时解析当时的当前叶节点；选中成员失败不会使代理组自动改选，但 nameserver 列表仍按本节已有故障转移语义继续下一项。
+
+### 上游参数
+
+`ecs` 接受 IPv4/IPv6 IP 或 CIDR，裸 IP 使用完整位数。已有 EDNS ECS 默认原样保留；
+`ecs-override=true` 只替换首个 ECS，保留其 scope、OPT flags 和其他 option，编码时掩去前缀外的位。
+缺少 OPT 时添加 UDP size 为零的新 OPT。包装作用于所有解析角色和 system、DHCP、RCODE，
+DHCP 接口名只取 URL endpoint，fragment 不参与接口查找。
+
+`disable-ipv4=true`、`disable-ipv6=true` 和 `disable-qtype-<编号>=true` 抑制对应 question，
+直接返回 NOERROR 空响应并设置 AA、RA，不读取来源或建链；编号限固定 Mihomo 参考已有 RR constructor。
+其他请求先验证上游响应，再过滤 Answer、Authority、Additional 中对应 RR。
+全报文通过官方 `domain` codec 重编码，保持所有存留名称引用有效；RFC 3597 未知 RDATA 保持原始字节。
+报文大小、记录数和名称压缩跳数仍受本节预算约束，不能通过过滤移除错误记录来绕过验证。
+类型参数和 `ecs-override` 仅在字面 `true` 时启用，与顶层及 DNS 的 IPv6 门禁独立。
+
+DoT/HTTPS 的 `skip-cert-verify=true` 和 `name-cert-verify` 接共享 TLS 安全层，显式名称验证
+先于跳过验证且不改变 SNI。`disable-reuse=true` 仅使指定 DoT 上游每次新建并关闭连接，
+不改变 HTTPS 或其他上游的复用。不同参数的上游保持池身份隔离。
 
 ### Policy
 
@@ -197,6 +217,8 @@ bootstrap、单独配置的节点/直连 resolver，以及非地址 qtype 不使
 
 `dns.cache-max-size` 控制每个 DNS 角色的结果总条目数，缺省或零值为 4,096。
 A/AAAA 的类型化结果和其他 qtype 的原始响应共享这份容量与替换策略。
+客户端携带 EDNS 或额外语义 flags 的 A/AAAA 使用同一有界原始响应缓存，以完整查询摘要区分
+ECS、DO、CD 等上下文并保留响应 additional/flags；普通 A/AAAA 仍使用小型地址缓存。
 `dns.cache-algorithm` 精确为 `arc` 时使用 ARC，缺省和其他字符串使用 LRU。
 LRU 命中和替换将条目移到最近使用端；满容量时淘汰最久未使用的结果，命中不延长 TTL。
 哈希索引和安全槽位链表按需分配，查询时只检查命中条目的寿命，过期结果重新查询。
@@ -218,7 +240,7 @@ ARC 分别保留近期与常用结果，命中提升到常用组，使用两组�
 - 正缓存寿命取可缓存记录的最小 TTL，并限制在 30–3,600 秒。
 - NXDOMAIN 固定负缓存 30 秒；NOERROR 空 answer 只有在 authority 含 IN/SOA 时才缓存为 NODATA。
 - Referral、TTL 0、无可缓存记录和扩展错误码不缓存。
-- 原始响应缓存不生成 TUN 域名提示。
+- 非地址 qtype 的原始响应不生成 TUN 域名提示；A/AAAA 仍按既有地址校验生成提示。
 
 ### Singleflight
 
@@ -265,7 +287,8 @@ wire/RCODE 语义，不使用这段地址合并等待。
 
 TCP、DoT 和 DoH 使用解析器所属的连接池：
 
-- Key 包含上游地址、认证名称、传输、HTTP 路径、endpoint 与最终 route target；
+- Key 包含上游地址、TLS 验证策略、查询包装、传输、HTTP 路径、endpoint、最终 route target、
+  来源 generation 和物理接口绑定；
 - 一条连接同时只处理一个查询，不做 pipeline；
 - 活动连接不设固定业务数量上限；空闲连接总数最多 4、同 key 最多 2、超时 30 秒；
 - 完成帧和响应校验后才能归还连接；
@@ -310,7 +333,7 @@ Running Session上下文仅弱引用本 session 的 RuntimeDns；业务 IP-only 
 - 真实 ICMP 转发、ICMP error、Traceroute、ICMP 选路规则或 ICMP 测速；
 - DoQ、DoH HTTP/2/3；
 - 运行中随接口变化自动刷新 hosts: lan；
-- 用户可配置的缓存容量、查询总超时、重试或并发度；
+- 用户可配置的查询总超时、重试或并发度；
 - 使用 DNS question 执行业务规则，或用 DNS 出口改写后续业务动作。
 
 自动化和物理 TUN 覆盖范围见 [验收矩阵](acceptance.md)。

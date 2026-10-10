@@ -21,13 +21,14 @@ impl Dispatcher for Peer {
                 let length = if https {
                     let mut head = Vec::new();
                     while !head.ends_with(b"\r\n\r\n") {
-                        head.push(stream.read_u8().await.unwrap());
+                        let Ok(byte) = stream.read_u8().await else { return; };
+                        head.push(byte);
                         assert!(head.len() < 4096);
                     }
                     let head = String::from_utf8(head).unwrap();
                     assert!(head.starts_with("POST /dns-query HTTP/1.1\r\n"));
                     head.lines().find_map(|line| line.strip_prefix("Content-Length: ")).unwrap().parse::<usize>().unwrap()
-                } else { stream.read_u16().await.unwrap() as usize };
+                } else { let Ok(length) = stream.read_u16().await else { return; }; length as usize };
                 let mut query = vec![0; length];
                 stream.read_exact(&mut query).await.unwrap();
                 let question = classify_query(&query).unwrap();
@@ -97,6 +98,68 @@ async fn encrypted_dns_authenticates_and_reuses_tls_and_https_streams() {
         // The same peer's untrusted certificate cannot reach a DNS exchange.
         let untrusted = RuntimeDns::new(&config.dns, peer.clone());
         assert!(untrusted.resolve("untrusted.example").await.is_err());
+        peer.join().await;
+    }
+}
+
+#[tokio::test]
+async fn upstream_tls_options_verify_names_skip_roots_and_disable_only_dot_reuse() {
+    let certificate = rcgen::generate_simple_self_signed(vec!["dns.example".into()]).unwrap();
+    let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![certificate.cert.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(certificate.signing_key.serialize_der().into()),
+    )
+    .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certificate.cert.der().clone()).unwrap();
+    for (upstream, trusted, succeeds, opens) in [
+        (
+            "tls://192.0.2.1#name-cert-verify=dns.example&disable-reuse=true",
+            true,
+            true,
+            2,
+        ),
+        (
+            "https://192.0.2.1/dns-query#name-cert-verify=dns.example&disable-reuse=true",
+            true,
+            true,
+            1,
+        ),
+        ("tls://192.0.2.1#skip-cert-verify=true", false, true, 1),
+        (
+            "tls://192.0.2.1#name-cert-verify=wrong.example&skip-cert-verify=true",
+            true,
+            false,
+            2,
+        ),
+    ] {
+        let config = crate::config::Config::parse_yaml(format!("mixed-port: 1080\ndns:\n  enable: true\n  use-system-hosts: false\n  nameserver: ['{upstream}']\n").as_bytes()).unwrap();
+        let peer = Arc::new(Peer {
+            tls: Arc::new(server.clone()),
+            https: upstream.starts_with("https"),
+            opens: AtomicUsize::new(0),
+            tasks: StdMutex::new(Vec::new()),
+        });
+        let mut dns = RuntimeDns::new(&config.dns, peer.clone());
+        if trusted {
+            Arc::get_mut(&mut dns.tcp_pool).unwrap().security =
+                crate::security::SecurityContext::with_tls_roots(roots.clone());
+        }
+        for name in ["first.example", "second.example"] {
+            assert_eq!(dns.resolve(name).await.is_ok(), succeeds, "{upstream}");
+        }
+        assert_eq!(peer.opens.load(Ordering::Relaxed), opens, "{upstream}");
+        assert_eq!(
+            dns.tcp_pool.snapshot().current_idle,
+            usize::from(succeeds && opens == 1),
+            "{upstream}"
+        );
         peer.join().await;
     }
 }

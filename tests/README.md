@@ -58,12 +58,18 @@ cargo test --locked --lib dns::runtime::tests::dns_flush_
 cargo test --locked --features cli --lib dns::source::tests::
 cargo test --locked --features cli --lib dns::runtime::tests::dns_source_
 cargo test --locked --features cli --lib config::tests::dns_source_
+cargo test --locked --features cli --lib config::dns::upstream_options_tests
+cargo test --locked --features cli --lib dns::options::tests::
+cargo test --locked --features cli --lib dns::runtime::tests::upstream_
+cargo test --locked --features cli --lib dns::runtime::encrypted_tests::upstream_tls_options_
 cargo test --locked --features cli --lib invoke::tests::update_dns_network_
 cargo test --manifest-path crates/vole-netstack/Cargo.toml --all-targets
 uv run --project scripts --locked python -m unittest discover -s scripts/tests
 uv run --project scripts --locked ruff check scripts
 uv run --project scripts --locked ruff format --check scripts
 ```
+
+DNS URL 参数过滤器只使用内存报文、显式来源快照和 duplex TLS 对端，不读取宿主 DNS 或启动监听服务。
 
 Windows UWP bridge 的名称准入与匹配使用独立过滤器；下列测试仅处理 JSON、匹配策略
 和未注册的内存 `VpnPlugInProfile` 对象，不创建系统 VPN profile 或启动连接：

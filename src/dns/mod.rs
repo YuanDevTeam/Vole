@@ -11,6 +11,7 @@ pub(crate) mod fake_ip;
 mod fallback;
 pub(crate) mod hosts;
 mod https;
+mod options;
 pub(crate) mod policy;
 pub(crate) mod trace;
 
@@ -168,6 +169,9 @@ pub struct ClassifiedDnsQuery {
     pub kind: DnsQueryKind,
     question_wire: Box<[u8]>,
     semantics_digest: [u8; 32],
+    // Plain address lookups use the small address cache. Client EDNS or
+    // semantic flags require retaining the validated wire response instead.
+    needs_wire_cache: bool,
 }
 
 impl ClassifiedDnsQuery {
@@ -368,6 +372,7 @@ pub fn classify_query(message: &[u8]) -> Result<ClassifiedDnsQuery> {
         kind,
         question_wire,
         semantics_digest,
+        needs_wire_cache: parsed.additional_count != 0 || parsed.flags & !0x0100 != 0,
     })
 }
 
@@ -409,6 +414,13 @@ pub fn validate_opaque_response(
     if !query.is_opaque() {
         return Err(DnsError::ExpectedOpaqueQuestion);
     }
+    validate_wire_response(query, response)
+}
+
+fn validate_wire_response(
+    query: &ClassifiedDnsQuery,
+    response: &[u8],
+) -> Result<ValidatedOpaqueResponse> {
     let parsed = parse_wire_question_header(response)?;
     if parsed.flags & 0x8000 == 0 {
         return Err(DnsError::NotAResponse);
@@ -1091,6 +1103,10 @@ impl DnsCache {
         if !query.is_opaque() {
             return None;
         }
+        self.get_wire(query, now)
+    }
+
+    pub(crate) fn get_wire(&mut self, query: &ClassifiedDnsQuery, now: Instant) -> Option<Vec<u8>> {
         let key = cache::Key::Opaque(query.question.clone(), query.semantics_digest);
         let (
             cache::Value::Opaque {

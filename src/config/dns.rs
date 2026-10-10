@@ -126,11 +126,24 @@ pub(super) fn parse_dns_nameserver(
                 .into(),
         )
     };
-    // Mihomo's special clients use physical DNS and ignore proxy fragments.
-    let special = input
-        .split_once('#')
-        .map_or(input, |(endpoint, _)| endpoint);
-    let source = match special {
+    let (endpoint, fragment) = input.split_once('#').unwrap_or((input, ""));
+    let (route_name, options) =
+        parse_nameserver_options(fragment, !endpoint.starts_with("https://"))?;
+    let route = if route_name.is_empty() {
+        default_route
+    } else {
+        match route_name.as_str() {
+            "DIRECT" => DnsRoute::Direct,
+            "RULES" => DnsRoute::Rules,
+            _ => targets
+                .get(&route_name)
+                .copied()
+                .map(DnsRoute::Route)
+                .ok_or_else(bad)?,
+        }
+    };
+    // Special sources remain physical, but use the same query wrappers.
+    let source = match endpoint {
         "system" | "system://" | "dhcp://system" => Some(DnsSource::System),
         endpoint if endpoint.starts_with("dhcp://") => {
             let interface = &endpoint[7..];
@@ -146,24 +159,9 @@ pub(super) fn parse_dns_nameserver(
             port: 53,
             route: DnsRoute::Direct,
             path: None,
+            options,
         });
     }
-    let (endpoint, route) = match input.split_once('#') {
-        Some((endpoint, fragment)) => {
-            let name = percent_decode(fragment)?;
-            let route = match name.as_str() {
-                "DIRECT" => DnsRoute::Direct,
-                "RULES" => DnsRoute::Rules,
-                _ => targets
-                    .get(&name)
-                    .copied()
-                    .map(DnsRoute::Route)
-                    .ok_or_else(bad)?,
-            };
-            (endpoint, route)
-        }
-        None => (input, default_route),
-    };
     if let Ok(address) = endpoint.parse::<IpAddr>() {
         return Ok(DnsNameserver {
             address: address.into(),
@@ -171,6 +169,7 @@ pub(super) fn parse_dns_nameserver(
             port: 53,
             route,
             path: None,
+            options,
         });
     }
     let endpoint = if endpoint.contains("://") {
@@ -201,6 +200,7 @@ pub(super) fn parse_dns_nameserver(
             port: 0,
             route,
             path: None,
+            options,
         });
     }
     let (transport, default_port) = match url.scheme() {
@@ -248,7 +248,138 @@ pub(super) fn parse_dns_nameserver(
         port,
         route,
         path,
+        options,
     })
+}
+
+fn parse_nameserver_options(
+    fragment: &str,
+    ignore_h3: bool,
+) -> Result<(String, DnsNameserverOptions)> {
+    let fragment = percent_decode(fragment)?;
+    let mut route = String::new();
+    let mut params = std::collections::BTreeMap::new();
+    for part in fragment.split('&') {
+        if let Some((key, value)) = part.split_once('=') {
+            params.insert(key, value);
+        } else {
+            route = part.to_owned();
+        }
+    }
+    let mut options = DnsNameserverOptions::default();
+    let mut disabled = std::collections::BTreeSet::new();
+    for (key, value) in params {
+        match key {
+            "ecs" if !value.is_empty() => {
+                let (address, prefix) = value
+                    .split_once('/')
+                    .map_or((value, None), |(a, p)| (a, Some(p)));
+                let address = address
+                    .parse::<IpAddr>()
+                    .map_err(|_| VoleError::InvalidConfig("invalid DNS ECS address".into()))?;
+                let bits = if address.is_ipv4() { 32 } else { 128 };
+                let prefix_len = prefix
+                    .map_or(Ok(bits), |p| p.parse::<u8>())
+                    .map_err(|_| VoleError::InvalidConfig("invalid DNS ECS prefix".into()))?;
+                if prefix_len > bits {
+                    return invalid("invalid DNS ECS prefix");
+                }
+                options.ecs = Some(DnsEcs {
+                    address,
+                    prefix_len,
+                });
+            }
+            "ecs" => {}
+            "ecs-override" => options.ecs_override = value == "true",
+            "disable-ipv4" if value == "true" => {
+                disabled.insert(1);
+            }
+            "disable-ipv6" if value == "true" => {
+                disabled.insert(28);
+            }
+            "disable-ipv4" | "disable-ipv6" => {}
+            key if key.starts_with("disable-qtype-") => {
+                if value == "true"
+                    && let Ok(kind) = key[14..].parse::<u16>()
+                    && valid_disabled_type(kind)
+                {
+                    disabled.insert(kind);
+                }
+            }
+            "skip-cert-verify" => options.skip_cert_verify = value == "true",
+            "name-cert-verify" => {
+                options.verification_name = normalize_verification_name(Some(value.to_owned()))?
+            }
+            "disable-reuse" => options.disable_reuse = value == "true",
+            "h3" if value != "true" || ignore_h3 => {}
+            _ => return invalid("unsupported DNS upstream parameter"),
+        }
+    }
+    options.disabled_types = disabled.into_iter().collect();
+    Ok((route, options))
+}
+
+fn valid_disabled_type(kind: u16) -> bool {
+    // Registered RR constructors in the fixed Mihomo miekg/dns v1.1.63
+    // reference. Unknown 16-bit questions remain forwardable, not filters.
+    matches!(kind, 1..=10 | 12..=21 | 23..=33 | 35..=37 | 39 | 41..=53 | 55..=65 | 99..=102 | 104..=109 | 128 | 249 | 250 | 255..=258 | 260 | 32768 | 32769)
+}
+
+#[cfg(test)]
+mod upstream_options_tests {
+    use super::*;
+
+    #[test]
+    fn upstream_options_decode_fragments_and_use_last_values() {
+        let server = parse_dns_nameserver(
+            "tls://192.0.2.1#DIRECT%26RULES%26ecs=2001:db8::7/57%26ecs-override=true%26disable-ipv4=true%26disable-ipv6=True%26disable-qtype-16=true%26disable-qtype-65280=true%26skip-cert-verify=false%26skip-cert-verify=true%26name-cert-verify=dns.example%26disable-reuse=true",
+            &RouteTargetsByName::new(),
+            DnsRoute::Direct,
+        ).unwrap();
+        assert_eq!(server.route, DnsRoute::Rules);
+        assert_eq!(server.options.ecs.unwrap().prefix_len, 57);
+        assert!(server.options.ecs_override);
+        assert_eq!(&*server.options.disabled_types, &[1, 16]);
+        assert!(server.options.skip_cert_verify);
+        assert_eq!(
+            server.options.verification_name.as_deref(),
+            Some("dns.example")
+        );
+        assert!(server.options.disable_reuse);
+        let parameter_only = parse_dns_nameserver(
+            "192.0.2.1#disable-ipv6=true",
+            &RouteTargetsByName::new(),
+            DnsRoute::Rules,
+        )
+        .unwrap();
+        assert_eq!(parameter_only.route, DnsRoute::Rules);
+        assert_eq!(&*parameter_only.options.disabled_types, &[28]);
+    }
+
+    #[test]
+    fn upstream_options_survive_system_dhcp_and_rcode_parsing() {
+        for endpoint in [
+            "system",
+            "system://",
+            "dhcp://system",
+            "dhcp://en0",
+            "rcode://refused",
+        ] {
+            let server = parse_dns_nameserver(
+                &format!("{endpoint}#ecs=192.0.2.9&disable-ipv6=true"),
+                &RouteTargetsByName::new(),
+                DnsRoute::Direct,
+            )
+            .unwrap();
+            assert_eq!(server.options.ecs.unwrap().prefix_len, 32);
+            assert_eq!(&*server.options.disabled_types, &[28]);
+            if endpoint == "dhcp://en0" {
+                assert!(
+                    matches!(server.address, DnsAddress::Source(DnsSource::Dhcp(ref interface)) if interface.as_ref() == "en0")
+                );
+            }
+        }
+    }
 }
 
 fn percent_decode(input: &str) -> Result<String> {

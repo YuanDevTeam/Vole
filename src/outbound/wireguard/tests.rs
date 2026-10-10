@@ -522,6 +522,7 @@ async fn wireguard_peers_longest_prefix_reserved_and_remote_dns_have_owned_io() 
             transport: crate::config::DnsTransport::Udp,
             address: crate::config::DnsAddress::Domain("dns.example".into()),
             port: 53, route: crate::config::DnsRoute::Direct, path: None,
+            options: Default::default(),
         }];
         let records = Arc::<Mutex<Vec<Destination>>>::default();
         let closes = Arc::<AtomicUsize>::default();

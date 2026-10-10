@@ -67,6 +67,10 @@ const RCODE_SERVFAIL: u8 = 2;
 const RCODE_NXDOMAIN: u8 = 3;
 const RCODE_REFUSED: u8 = 5;
 
+fn dot_reuse_disabled(nameserver: &DnsNameserver) -> bool {
+    nameserver.transport == DnsTransport::Tls && nameserver.options.disable_reuse
+}
+
 /// Errors returned by the runtime DNS service.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RuntimeDnsError {
@@ -269,7 +273,7 @@ impl TcpConnectionPool {
                 .idle
                 .iter()
                 .enumerate()
-                .filter(|(_, idle)| idle.key == key)
+                .filter(|(_, idle)| !dot_reuse_disabled(&nameserver.config) && idle.key == key)
                 .max_by_key(|(_, idle)| idle.idle_since)
                 .map(|(index, _)| index);
             let connection = index.map(|index| state.idle.swap_remove(index).connection);
@@ -318,6 +322,11 @@ impl TcpConnectionPool {
             DnsTransport::Tls | DnsTransport::Https
         ) {
             let options = crate::security::TlsClientOptions {
+                certificate: crate::config::TlsCertificatePolicy {
+                    verification_name: nameserver.options.verification_name.clone(),
+                    skip_cert_verify: nameserver.options.skip_cert_verify,
+                    fingerprint: None,
+                },
                 alpn: if nameserver.transport == DnsTransport::Https {
                     vec![b"http/1.1".to_vec()]
                 } else {
@@ -370,7 +379,7 @@ impl TcpConnectionPool {
             return;
         };
         lease.busy.take();
-        if self.max_idle == 0 {
+        if self.max_idle == 0 || dot_reuse_disabled(&lease.key.upstream) {
             drop(connection);
             return;
         }
@@ -1749,7 +1758,13 @@ impl RuntimeDns {
                 // entry, so a caller cannot observe a miss and then create a
                 // duplicate flight after that leader has disappeared.
                 let mut cache = self.cache.lock().await;
-                if let Some((cached, remaining_ttl)) = cache.get_with_ttl(
+                if classified.needs_wire_cache {
+                    if let Some(wire) = cache.get_wire(classified, Instant::now()) {
+                        super::trace::record("cache");
+                        self.resource_stats.dns_cache_hit();
+                        return Ok(wire);
+                    }
+                } else if let Some((cached, remaining_ttl)) = cache.get_with_ttl(
                     &parsed_query.question.name,
                     parsed_query.question.query_type,
                     Instant::now(),
@@ -1844,7 +1859,8 @@ impl RuntimeDns {
                 .await?
             };
         if cacheable {
-            self.cache_response(&parsed_response, epoch).await?;
+            self.cache_response(&parsed_response, classified, &response, epoch)
+                .await?;
         }
         restore_response_id(&mut response, 0);
         Ok(response)
@@ -2095,6 +2111,47 @@ impl RuntimeDns {
         M: Fn(&[u8]) -> Result<bool, AttemptError>,
         V: Fn(&[u8]) -> Result<R, AttemptError>,
     {
+        if nameserver.options.disabled_types.is_empty() {
+            let wrapped = super::options::with_ecs(query, &nameserver.options)?;
+            return self
+                .exchange_raw_validated(nameserver, &wrapped, matches, validate, permits)
+                .await;
+        }
+        let classified = classify_query(query)?;
+        if super::options::question_disabled(&nameserver.options, classified.question.query_type) {
+            let mut response = super::synthesize_empty_response(&classified, RCODE_NOERROR)?;
+            response[2] |= 0x04; // AA, matching Mihomo's disable-type wrapper.
+            let parsed = validate(&response)?;
+            return Ok((response, parsed));
+        }
+        let wrapped = super::options::with_ecs(query, &nameserver.options)?;
+        let disabled = nameserver.options.disabled_types.clone();
+        let (wire, ()) = self
+            .exchange_raw_validated(
+                nameserver,
+                &wrapped,
+                matches,
+                |wire| validate(wire).map(|_| ()),
+                permits,
+            )
+            .await?;
+        let wire = super::options::filter_response(&wire, &disabled)?;
+        let parsed = validate(&wire)?;
+        Ok((wire, parsed))
+    }
+
+    async fn exchange_raw_validated<R, M, V>(
+        &self,
+        nameserver: DnsNameserver,
+        query: &[u8],
+        matches: M,
+        validate: V,
+        permits: &Semaphore,
+    ) -> Result<(Vec<u8>, R), AttemptError>
+    where
+        M: Fn(&[u8]) -> Result<bool, AttemptError>,
+        V: Fn(&[u8]) -> Result<R, AttemptError>,
+    {
         if let DnsTransport::Rcode(rcode) = nameserver.transport {
             super::trace::record("rcode");
             let mut response = query.to_vec();
@@ -2299,13 +2356,14 @@ impl RuntimeDns {
             .tcp_pool
             .checkout_for(nameserver, |state| {
                 self.egress_for(nameserver, Network::Tcp, |egress| {
-                    state.idle.iter().any(|idle| {
-                        idle.key.upstream == nameserver.config
-                            && idle.key.endpoint == nameserver.endpoint()
-                            && idle.key.egress == egress
-                            && idle.key.source_generation == nameserver.source_generation
-                            && idle.key.source_binding == nameserver.source_binding
-                    })
+                    !dot_reuse_disabled(&nameserver.config)
+                        && state.idle.iter().any(|idle| {
+                            idle.key.upstream == nameserver.config
+                                && idle.key.endpoint == nameserver.endpoint()
+                                && idle.key.egress == egress
+                                && idle.key.source_generation == nameserver.source_generation
+                                && idle.key.source_binding == nameserver.source_binding
+                        })
                 })
             })
             .await?;
@@ -2355,6 +2413,8 @@ impl RuntimeDns {
     async fn cache_response(
         &self,
         response: &DnsMessage,
+        query: &ClassifiedDnsQuery,
+        wire: &[u8],
         epoch: u64,
     ) -> Result<(), RuntimeDnsError> {
         let current_epoch = self.cache_epoch.read().await;
@@ -2363,9 +2423,16 @@ impl RuntimeDns {
         }
         let mut cache = self.cache.lock().await;
         let now = Instant::now();
+        if query.needs_wire_cache {
+            let mut upstream_query = query.clone();
+            upstream_query.id = response.id;
+            let validated = super::validate_wire_response(&upstream_query, wire)
+                .map_err(RuntimeDnsError::InvalidResponse)?;
+            cache.insert_opaque(&validated, now);
+        }
         let name = &response.question.name;
         let query_type = response.question.query_type;
-        if response.rcode == RCODE_NXDOMAIN {
+        if response.rcode == RCODE_NXDOMAIN && !query.needs_wire_cache {
             cache
                 .insert_negative(name, query_type, RCODE_NXDOMAIN, now)
                 .map_err(RuntimeDnsError::Cache)?;
@@ -2377,16 +2444,20 @@ impl RuntimeDns {
 
         let answers = matching_answer_set(response).map_err(RuntimeDnsError::InvalidResponse)?;
         if answers.addresses.is_empty() {
-            cache
-                .insert_negative(name, query_type, RCODE_NOERROR, now)
-                .map_err(RuntimeDnsError::Cache)?;
+            if !query.needs_wire_cache {
+                cache
+                    .insert_negative(name, query_type, RCODE_NOERROR, now)
+                    .map_err(RuntimeDnsError::Cache)?;
+            }
             return Ok(());
         }
 
         let ttl = answers.ttl.unwrap_or(MIN_TTL_SECS);
-        cache
-            .insert_positive(name, query_type, &answers.addresses, ttl, now)
-            .map_err(RuntimeDnsError::Cache)?;
+        if !query.needs_wire_cache {
+            cache
+                .insert_positive(name, query_type, &answers.addresses, ttl, now)
+                .map_err(RuntimeDnsError::Cache)?;
+        }
         if let Some(hints) = &self.hints {
             let mut hints = hints
                 .lock()
@@ -2919,6 +2990,7 @@ mod tests {
         udp_queries: Arc<StdMutex<Vec<u16>>>,
         tcp_queries: Arc<StdMutex<Vec<u16>>>,
         udp_ids: Arc<StdMutex<Vec<u16>>>,
+        udp_payloads: Arc<StdMutex<Vec<Vec<u8>>>>,
         tcp_ids: Arc<StdMutex<Vec<u16>>>,
         udp_destinations: Arc<StdMutex<Vec<Destination>>>,
         tcp_destinations: Arc<StdMutex<Vec<Destination>>>,
@@ -3078,6 +3150,7 @@ mod tests {
                 remote: None,
                 queries: self.udp_queries.clone(),
                 ids: self.udp_ids.clone(),
+                payloads: self.udp_payloads.clone(),
                 destinations: self.udp_destinations.clone(),
                 send_count: 0,
             }))
@@ -3090,6 +3163,7 @@ mod tests {
         remote: Option<Destination>,
         queries: Arc<StdMutex<Vec<u16>>>,
         ids: Arc<StdMutex<Vec<u16>>>,
+        payloads: Arc<StdMutex<Vec<Vec<u8>>>>,
         destinations: Arc<StdMutex<Vec<Destination>>>,
         send_count: usize,
     }
@@ -3098,6 +3172,10 @@ mod tests {
     impl DatagramTransport for MockDatagrams {
         async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
             self.send_count += 1;
+            self.payloads
+                .lock()
+                .unwrap()
+                .push(datagram.payload.to_vec());
             let parsed = classify_query(&datagram.payload)
                 .map_err(|error| DispatchError::Other(error.to_string()))?;
             self.queries
@@ -3184,6 +3262,7 @@ mod tests {
     fn nameserver(index: u8, transport: DnsTransport) -> DnsNameserver {
         DnsNameserver {
             path: None,
+            options: Default::default(),
             transport,
             address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, index)).into(),
             port: 53,
@@ -3231,6 +3310,115 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn upstream_wrappers_cover_system_dhcp_and_rcode_before_source_io() {
+        for endpoint in ["system", "dhcp://physical1", "rcode://refused"] {
+            let configuration = crate::config::Config::parse_yaml(format!("mixed-port: 1080\ndns:\n  enable: true\n  ipv6: true\n  use-system-hosts: false\n  nameserver: ['{endpoint}#ecs=192.0.2.255/25&disable-ipv6=true']\n").as_bytes()).unwrap();
+            let dispatcher = Arc::new(MockDispatcher::with_replies(
+                vec![MockReply::Response(ResponseSpec::answer(
+                    "203.0.113.10".parse().unwrap(),
+                ))],
+                vec![],
+            ));
+            let resolver = Arc::new(RuntimeDns::new(&configuration.dns, dispatcher.clone()));
+            resolver.sources.register(&resolver);
+            resolver
+                .sources
+                .replace(dns_source_snapshot(1, "203.0.113.53"))
+                .await
+                .unwrap();
+            let blocked = build_query(79, "blocked.example", QueryType::Aaaa).unwrap();
+            let response = resolver.exchange(&blocked).await.unwrap();
+            assert_eq!(response[3] & 0x0f, RCODE_NOERROR);
+            assert_eq!(response[2] & 0x04, 0x04);
+            assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 0);
+            let query = build_query(80, "allowed.example", QueryType::A).unwrap();
+            let response = resolver.exchange(&query).await.unwrap();
+            if endpoint.starts_with("rcode") {
+                assert_eq!(response[3] & 0x0f, RCODE_REFUSED);
+                assert_eq!(response[10..12], [0, 1]);
+                assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 0);
+            } else {
+                assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 1);
+                let payloads = dispatcher.udp_payloads.lock().unwrap();
+                assert_eq!(
+                    &payloads[0][payloads[0].len() - 12..],
+                    &[0, 8, 0, 8, 0, 1, 25, 0, 192, 0, 2, 128]
+                );
+                let expected = if endpoint == "system" {
+                    "203.0.113.53:53"
+                } else {
+                    "192.0.2.53:53"
+                };
+                assert_eq!(
+                    *dispatcher.udp_destinations.lock().unwrap(),
+                    vec![Destination::Ip(expected.parse().unwrap())]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_typed_cache_separates_client_ecs_and_preserves_edns_wire() {
+        let first: IpAddr = "203.0.113.1".parse().unwrap();
+        let second: IpAddr = "203.0.113.2".parse().unwrap();
+        let plain: IpAddr = "203.0.113.3".parse().unwrap();
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            [first, second, plain]
+                .into_iter()
+                .map(|address| MockReply::Response(ResponseSpec::answer(address)))
+                .collect(),
+            vec![],
+        ));
+        let resolver = RuntimeDns::new(
+            &config(false, vec![nameserver(1, DnsTransport::Udp)]),
+            dispatcher.clone(),
+        );
+        let plain_query = build_query(91, "cache.example", QueryType::A).unwrap();
+        for (index, (address, expected)) in [
+            ("192.0.2.1", first),
+            ("192.0.2.2", second),
+            ("192.0.2.1", first),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let options = crate::config::DnsNameserverOptions {
+                ecs: Some(crate::config::DnsEcs {
+                    address: address.parse().unwrap(),
+                    prefix_len: 32,
+                }),
+                ..Default::default()
+            };
+            let mut query = super::super::options::with_ecs(&plain_query, &options)
+                .unwrap()
+                .into_owned();
+            let id = 92 + index as u16;
+            query[..2].copy_from_slice(&id.to_be_bytes());
+            let response = resolver.exchange(&query).await.unwrap();
+            assert_eq!(parse_response(&response).unwrap().id, id);
+            assert_eq!(
+                matching_answer_set(&parse_response(&response).unwrap())
+                    .unwrap()
+                    .addresses,
+                vec![expected]
+            );
+            assert_eq!(response[10..12], [0, 1]);
+            assert_eq!(&response[response.len() - 12..], &query[query.len() - 12..]);
+        }
+        for _ in 0..2 {
+            let response = resolver.exchange(&plain_query).await.unwrap();
+            assert_eq!(
+                matching_answer_set(&parse_response(&response).unwrap())
+                    .unwrap()
+                    .addresses,
+                vec![plain]
+            );
+        }
+        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 3);
+        assert_eq!(resolver.cache.lock().await.len(), 3);
+    }
+
     #[test]
     fn all_dns_roles_share_the_session_trust_store() {
         let mut config = config(false, vec![nameserver(1, DnsTransport::Tls)]);
@@ -3258,7 +3446,8 @@ mod tests {
 
     fn response_for_query(query: &[u8], spec: &ResponseSpec) -> Vec<u8> {
         classify_query(query).unwrap();
-        let mut response = query.to_vec();
+        let header = super::super::parse_wire_question_header(query).unwrap();
+        let mut response = query[..header.records_offset].to_vec();
         let mut flags = DNS_FLAG_RESPONSE
             | DNS_FLAG_RECURSION_DESIRED
             | DNS_FLAG_RECURSION_AVAILABLE
@@ -3288,6 +3477,7 @@ mod tests {
                 }
             }
         }
+        response.extend_from_slice(&query[header.records_offset..]);
         response
     }
 
@@ -4284,6 +4474,7 @@ dns:
         ));
         let main = DnsNameserver {
             path: None,
+            options: Default::default(),
             transport: DnsTransport::Tcp,
             address: "1.1.1.1".parse().unwrap(),
             port: 53,
@@ -4293,6 +4484,7 @@ dns:
         };
         let policy_nameserver = DnsNameserver {
             path: None,
+            options: Default::default(),
             transport: DnsTransport::Tcp,
             address: "223.5.5.5".parse().unwrap(),
             port: 53,
@@ -4575,6 +4767,7 @@ dns:
         let direct: Arc<dyn Dispatcher> = Arc::new(DirectOutbound::new(Dialer::default()));
         let udp_nameserver = DnsNameserver {
             path: None,
+            options: Default::default(),
             transport: DnsTransport::Udp,
             address: udp_address.ip().into(),
             port: udp_address.port(),
@@ -4618,6 +4811,7 @@ dns:
         });
         let tcp_nameserver = DnsNameserver {
             path: None,
+            options: Default::default(),
             transport: DnsTransport::Tcp,
             address: tcp_address.ip().into(),
             port: tcp_address.port(),
