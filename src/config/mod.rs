@@ -385,6 +385,8 @@ impl DnsNameserverPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DnsTransport {
+    /// A local response with a Mihomo RCODE name, without network I/O.
+    Rcode(u8),
     Udp,
     Tcp,
     Tls,
@@ -5947,6 +5949,41 @@ authentication:
         }
         let config = Config::parse_yaml(b"mixed-port: 1080\ndns: {enable: false, nameserver: ['udp://dns.example', 'https://dns.example/query'], enhanced-mode: redir-host}\n").unwrap();
         assert!(!config.dns.enable);
+    }
+
+    #[test]
+    fn dns_rcode_nameserver_uses_the_mihomo_names_and_existing_policy_schema() {
+        for (name, rcode) in [
+            ("success", 0),
+            ("format_error", 1),
+            ("server_failure", 2),
+            ("name_error", 3),
+            ("not_implemented", 4),
+            ("refused", 5),
+        ] {
+            let yaml = format!(
+                "mixed-port: 1080\ndns:\n  enable: true\n  nameserver: [rcode://{name}]\n  nameserver-policy:\n    example.com: rcode://{name}\n"
+            );
+            let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            assert_eq!(
+                config.dns.nameservers[0].transport,
+                DnsTransport::Rcode(rcode)
+            );
+            assert_eq!(
+                config.dns.nameserver_policies[0].nameservers[0].transport,
+                DnsTransport::Rcode(rcode)
+            );
+        }
+        for endpoint in ["rcode://NXDOMAIN", "rcode://6", "rcode://success:53"] {
+            let yaml = format!("mixed-port: 1080\ndns:\n  nameserver: [{endpoint}]\n");
+            assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
+        }
+        assert!(
+            Config::parse_yaml(
+                b"mixed-port: 1080\ndns:\n  default-nameserver: [rcode://success]\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]

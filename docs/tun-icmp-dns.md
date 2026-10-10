@@ -110,6 +110,8 @@ dns:
 
 - `dns.enable`、`dns.ipv6` 默认 false。主 nameserver 默认使用 DoH/DoT，可显式替换为非空列表。
 - 接受裸 IPv4/IPv6、`udp://`、`tcp://`、`tls://`、`https://` 和 `http://`。加密连接复用共享 TLS 证书验证。DoH 采用 HTTP/1.1 POST。
+- `rcode://success`、`rcode://format_error`、`rcode://server_failure`、`rcode://name_error`、`rcode://not_implemented`、`rcode://refused` 分别返回本地 RCODE 0–5；可用于 nameserver、policy、fallback、节点和直连 resolver，不能用于 default-nameserver。
+- 同一个上游列表中存在本地 RCODE 时使用第一项本地响应，不建立网络连接，也不把 SERVFAIL/REFUSED 当作上游故障重试。响应保留原查询的 flags 和 additional，仅设置 QR 与 RCODE；不额外开启 RA，不写入结果缓存。
 - `dns.ipv6: false` 不限制 IPv6 nameserver；顶层 `ipv6: false` 会阻止通过 DIRECT（含 `RULES` 选中 DIRECT）的 IPv6 nameserver 在本机物理建链，并继续当前组的故障转移。
 - 上游域名由 `default-nameserver` 引导解析，后者只允许 IP 上游。未启用 DNS 时，内部解析使用系统 resolver；启用后不因查询失败回退系统解析。显式 system/DHCP nameserver 尚未实现。
 - 无 fragment 时默认 DIRECT；`respect-rules: true` 改为 RULES，要求非空 `proxy-server-nameserver`。
@@ -136,6 +138,10 @@ dns:
 - 命中后只在所选列表内并发查询，列表耗尽不查询其他 policy 或主组；
 - GeoSite 资产或分类不可用时该 policy 不命中，不能因反选变成全匹配；
 - 存在分类但属性筛选为空时仍可用，正选不命中、反选匹配合法非空名称。
+
+hosts 和 fake-IP 分配先于 policy；命中 fake-IP 过滤器、需要真实响应时才应用 policy 中的 RCODE。
+policy 的本地响应不进入 fallback；主 nameserver 的本地响应没有地址，已配置 fallback 时沿用
+本节的 fallback 选择规则。未配置 fallback 时直接返回本地响应。
 
 Policy 只决定当前 DNS exchange，不改写后续业务动作。分类、属性归一和语义边界见
 [GeoData 规则](geodata.md#规则)；所有平台均不按 GeoData 条数截断记录。
@@ -205,12 +211,20 @@ ARC 分别保留近期与常用结果，命中提升到常用组，使用两组�
 
 ### Singleflight
 
-未命中缓存时，以规范化 question 和 wire 语义摘要作为 key：
+未命中缓存时，以规范化 question、wire 语义摘要和缓存 epoch 作为 key：
 
 - Leader 在发起方任务内运行；
 - Leader 被取消或释放时，RAII 通知 follower 重新选举；
 - 每个调用方恢复自己的 transaction ID 和 endpoint，并独立应用失败策略；
 - 不同 key 可以并行。
+
+### 清理
+
+Controller `POST /cache/dns/flush` 清理主 resolver、bootstrap、节点和直连角色的类型化与
+原始响应缓存、ARC 历史项和 redir-host hints。所有角色共享一次 epoch 边界；清理完成后
+的新查询不能加入旧 singleflight，旧在途查询仍可向原调用方返回结果，但不能回填缓存或 hints。
+资源替换保留这份 epoch，旧资源 generation 也不能回填共享 hints。
+fake-IP 映射、活动业务会话、在途查询和上游连接池继续保留。
 
 ## Hosts 与解析职责
 

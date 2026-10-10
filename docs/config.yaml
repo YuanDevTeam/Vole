@@ -537,6 +537,8 @@ hosts:
 # nameserver 默认 [https://doh.pub/dns-query, tls://223.5.5.5:853]，不能显式留空。
 # 支持裸 IP、UDP/TCP、tls://、http(s)://，允许上游域名；DoH 使用 HTTP/1.1 POST，
 # DoT 与 HTTPS 校验证书与名称。default-nameserver 只接受 IP 上游，用于 bootstrap。
+# rcode://success/format_error/server_failure/name_error/not_implemented/refused 返回本地 RCODE 0–5，
+# 可用于各 nameserver 列表与 policy（default-nameserver 除外）；不建立网络连接或额外设置 RA。
 # 无 fragment 时默认 DIRECT；respect-rules: true 时默认 RULES，且必须配置
 # proxy-server-nameserver。显式 fragment 可选 DIRECT、RULES 或已配置的节点/组名；
 # 名称支持百分号编码。proxy-server-nameserver 专门解析节点，direct-nameserver
@@ -586,6 +588,7 @@ dns:
   nameserver:
     - "tcp://1.1.1.1:53#main-select"
   nameserver-policy:
+    "blocked.example": "rcode://refused"
     "internal.example": "223.5.5.5"
     "+.example.com": ["tcp://1.1.1.1:53#DIRECT"]
     "geosite:private,cn,apple":

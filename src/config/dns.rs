@@ -120,7 +120,8 @@ pub(super) fn parse_dns_nameserver(
 ) -> Result<DnsNameserver> {
     let bad = || {
         VoleError::InvalidConfig(
-            "invalid DNS upstream; supported transports are UDP, TCP, TLS and HTTP(S)".into(),
+            "invalid DNS upstream; supported transports are UDP, TCP, TLS, HTTP(S) and RCODE"
+                .into(),
         )
     };
     let (endpoint, route) = match input.split_once('#') {
@@ -154,6 +155,30 @@ pub(super) fn parse_dns_nameserver(
         format!("udp://{endpoint}")
     };
     let url = Url::parse(&endpoint).map_err(|_| bad())?;
+    if url.scheme() == "rcode" {
+        let host = url.host_str().ok_or_else(bad)?;
+        let rcode = match host {
+            "success" => 0,
+            "format_error" => 1,
+            "server_failure" => 2,
+            "name_error" => 3,
+            "not_implemented" => 4,
+            "refused" => 5,
+            _ => return Err(bad()),
+        };
+        // Mihomo selects the local client by URL host. Paths and query
+        // parameters do not modify its behavior; a port changes the host.
+        if url.port().is_some() {
+            return Err(bad());
+        }
+        return Ok(DnsNameserver {
+            transport: DnsTransport::Rcode(rcode),
+            address: DnsAddress::Domain(host.to_owned()),
+            port: 0,
+            route,
+            path: None,
+        });
+    }
     let (transport, default_port) = match url.scheme() {
         "udp" => (DnsTransport::Udp, 53),
         "tcp" => (DnsTransport::Tcp, 53),

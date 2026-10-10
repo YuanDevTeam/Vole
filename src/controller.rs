@@ -181,6 +181,20 @@ async fn handle_connection(
         return write_error(&mut stream, 400, "Bad request", &[]).await;
     }
 
+    if request.target == "/cache/dns/flush" {
+        if request.method != "POST" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "POST")]).await;
+        }
+        if let Some(snapshot) = resources.as_ref().and_then(|resources| resources.dns()) {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Ok(()),
+                () = snapshot.dns.flush_cache() => {}
+            }
+        }
+        return write_response(&mut stream, 204, &[], &[]).await;
+    }
+
     if matches!(request.target.as_str(), "/configs" | "/rules") {
         if request.method != "GET" {
             return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;

@@ -35,6 +35,9 @@ cargo test --locked --lib dns::tests::cache_
 cargo test --locked --lib dns::cache::tests::
 cargo test --locked --lib dns::tests::opaque_cache_
 cargo test --locked --lib dns::runtime::tests::dns_cache_
+cargo test --locked --lib config::tests::dns_rcode_
+cargo test --locked --lib dns::runtime::tests::dns_rcode_
+cargo test --locked --lib dns::runtime::tests::dns_flush_
 cargo test --manifest-path crates/vole-netstack/Cargo.toml --all-targets
 uv run --project scripts --locked python -m unittest discover -s scripts/tests
 uv run --project scripts --locked ruff check scripts

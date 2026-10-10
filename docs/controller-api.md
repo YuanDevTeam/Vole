@@ -200,12 +200,16 @@ policy 与 fallback 仍生效。DNS 关闭或查询失败返回 500。这里只�
 不会写入普通日志。`/connections` 是业务负载统计，`/traffic` 继续表示 TUN 原始 IP 包流量，
 `/proxies` 的节点健康数据继续表示探测结果，三者不可相互替代。
 
+`POST /cache/dns/flush` 清除当前资源代际所有 DNS 角色的普通地址、负响应、原始响应缓存和
+域名提示，成功返回 204；DNS 未启用时同样返回 204。旧在途查询可以完成，但不能回填
+清理后的缓存，新查询不会复用这些旧查询。fake-IP 映射和活动业务会话保留。
+
 ## HTTP 状态与协议边界
 
 | 状态 | 含义 |
 | --- | --- |
 | `200 OK` | 查询成功，返回 `application/json` |
-| `204 No Content` | 选择成功，正文为空 |
+| `204 No Content` | 选择、刷新或清理成功，正文为空 |
 | `400 Bad Request` | 路径、JSON、长度格式或成员无效 |
 | `401 Unauthorized` | Bearer 鉴权失败 |
 | `403 Forbidden` | 请求来源不是回环地址 |
