@@ -848,8 +848,10 @@ fn validate(node: &Node, depth: usize) -> Result<()> {
         }
         Node::Call(name, arguments) => {
             let expected = match name.as_str() {
-                "has" | "contains" | "select" | "map" | "map_values" | "filter"
-                | "with_entries" | "any_c" | "all_c" | "split" | "join" => 1..=1,
+                "has" | "contains" | "select" | "split" | "join" => 1..=1,
+                "map" | "map_values" | "filter" | "with_entries" | "any_c" | "all_c" => {
+                    1..=usize::MAX
+                }
                 "sub" => 2..=2,
                 "test" => 1..=2,
                 "flatten" => 0..=1,
@@ -1488,6 +1490,13 @@ fn text(value: &Value, budget: &mut Budget<'_>) -> Result<String> {
         budget.reserve(value.len())?;
         return Ok(value.clone());
     }
+    if let Value::Number(number) = value
+        && number.as_f64().is_some_and(|value| !value.is_finite())
+    {
+        let text = yaml_scalar(value, budget)?;
+        budget.reserve(text.len())?;
+        return Ok(text);
+    }
     if let Some(text) = scalar_text(value) {
         budget.reserve(text.len())?;
         return Ok(text);
@@ -1986,7 +1995,11 @@ fn binary(
     if operator == Op::Div
         && let (Value::String(text), Value::String(separator)) = (a, b)
     {
-        return split(text, separator, budget);
+        return if text.is_empty() {
+            Ok(Value::Sequence(Vec::new()))
+        } else {
+            split(text, separator, budget)
+        };
     }
     if !a.is_number() || !b.is_number() {
         return Err(error(
@@ -2088,9 +2101,43 @@ fn contains(
             }
             Ok(true)
         }
+        (Value::Sequence(container), wanted) => {
+            for value in container {
+                if contains(value, wanted, budget, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
         (Value::Number(_), Value::Number(_)) => Ok(equality(container, wanted)),
         _ => Ok(container == wanted),
     }
+}
+
+fn transform(
+    args: &[Node],
+    inputs: Vec<Value>,
+    budget: &mut Budget<'_>,
+    depth: usize,
+) -> Result<Vec<Value>> {
+    let mut inputs = Some(inputs);
+    let mut output = Vec::new();
+    for (index, node) in args.iter().enumerate() {
+        let batch = if index + 1 == args.len() {
+            inputs.take().expect("last transform owns inputs")
+        } else {
+            inputs
+                .as_ref()
+                .expect("unconsumed inputs")
+                .iter()
+                .map(|value| budget.clone_value(value))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let values = evaluate(node, batch, budget, depth + 1)?;
+        budget.reserve(values.len().saturating_mul(std::mem::size_of::<Value>()))?;
+        output.extend(values);
+    }
+    Ok(output)
 }
 
 fn call(
@@ -2128,7 +2175,7 @@ fn call(
             let entries = entries(input, budget)?;
             let mut result = Vec::new();
             for entry in entries {
-                result.extend(evaluate(&args[0], vec![entry], budget, depth + 1)?);
+                result.extend(transform(args, vec![entry], budget, depth + 1)?);
             }
             return Ok(vec![from_entries(&Value::Sequence(result), budget)?]);
         }
@@ -2143,26 +2190,24 @@ fn call(
                 .iter()
                 .map(|(_, value)| budget.clone_value(value))
                 .collect::<Result<Vec<_>>>()?;
-            return Ok(vec![Value::Sequence(evaluate(
-                &args[0],
+            return Ok(vec![Value::Sequence(transform(
+                args,
                 inputs,
                 budget,
                 depth + 1,
             )?)]);
         }
         if matches!(name, "any_c" | "all_c") {
-            let mut result = name == "all_c";
+            let result = name == "all_c";
             for (_, value) in members {
                 let value = budget.clone_value(value)?;
-                let outputs = evaluate(&args[0], vec![value], budget, depth + 1)?;
+                let outputs = transform(args, vec![value], budget, depth + 1)?;
                 let Some(first) = outputs.first() else {
                     continue;
                 };
                 let matched = truthy(first);
-                if name == "any_c" && matched {
-                    result = true;
-                } else if name == "all_c" && !matched {
-                    result = false;
+                if name == "any_c" && matched || name == "all_c" && !matched {
+                    return Ok(vec![Value::Bool(matched)]);
                 }
             }
             return Ok(vec![Value::Bool(result)]);
@@ -2171,7 +2216,7 @@ fn call(
             let mut output = Vec::new();
             for (_, value) in members {
                 let copy = budget.clone_value(value)?;
-                if evaluate(&args[0], vec![copy], budget, depth + 1)?
+                if transform(args, vec![copy], budget, depth + 1)?
                     .iter()
                     .any(truthy)
                 {
@@ -2183,7 +2228,7 @@ fn call(
         let mut output = budget.clone_value(input)?;
         for (key, value) in members {
             let copy = budget.clone_value(value)?;
-            if let Some(result) = evaluate(&args[0], vec![copy], budget, depth + 1)?
+            if let Some(result) = transform(args, vec![copy], budget, depth + 1)?
                 .into_iter()
                 .next()
             {
@@ -2287,7 +2332,14 @@ fn call(
             let mut seen = std::collections::BTreeSet::new();
             let mut output = Vec::new();
             for value in values {
-                let key = text(value, budget)?;
+                let key = if let Some(key) = scalar_text(value) {
+                    budget.reserve(key.len())?;
+                    key
+                } else {
+                    let mut key = text(value, budget)?;
+                    append(&mut key, "\n", budget)?;
+                    key
+                };
                 if seen.insert(key) {
                     output.push(budget.clone_value(value)?);
                 }
@@ -2482,15 +2534,13 @@ fn from_entries(input: &Value, budget: &mut Budget<'_>) -> Result<Value> {
         let entry = entry
             .as_mapping()
             .ok_or_else(|| error("provider override entries must be mappings"))?;
-        let key = ["key", "Key", "name", "Name"]
-            .into_iter()
-            .find_map(|key| entry.get(key))
+        let key = entry
+            .get("key")
             .and_then(Value::as_str)
             .ok_or_else(|| error("provider override entry key must be a string"))?;
         let value = entry
             .get("value")
-            .or_else(|| entry.get("Value"))
-            .unwrap_or(&Value::Null);
+            .ok_or_else(|| error("provider override entry requires a value"))?;
         budget.reserve(key.len() + std::mem::size_of::<Value>() * 2)?;
         map.insert(key.into(), budget.clone_value(value)?);
     }
@@ -2612,6 +2662,39 @@ mod tests {
         );
         assert_eq!(result["has"], Value::Bool(true));
     }
+    #[test]
+    fn collection_predicates_short_circuit_and_preserve_yaml_values() {
+        let result = run(
+            "name: fixture\n",
+            r#".any = (["yes", {}] | any_c(contains("yes"))) | .all = (["no", {}] | all_c(contains("yes"))) | .nested = ([["a"]] | contains(["a"])) | .empty = (("" / ",") | length) | .split = ("" | split(",") | length) | .unique = (["a: b", {"a": "b"}] | unique | length) | .mapped = (["a", "b"] | map(.; upcase)) | .nan = ("NaN" | tonumber | tostring)"#,
+        );
+        assert_eq!(result["any"], Value::Bool(true));
+        assert_eq!(result["all"], Value::Bool(false));
+        assert_eq!(result["nested"], Value::Bool(true));
+        assert_eq!(result["empty"], Value::Number(0.into()));
+        assert_eq!(result["nan"], Value::String(".nan".into()));
+        assert_eq!(result["split"], Value::Number(1.into()));
+        assert_eq!(result["unique"], Value::Number(2.into()));
+        assert_eq!(
+            result["mapped"],
+            serde_yaml_ng::from_str::<Value>("[a,b,A,B]").unwrap()
+        );
+        for source in [
+            r#".x = ([{"Key": "name", "value": 1}] | from_entries)"#,
+            r#".x = ([{"key": "name"}] | from_entries)"#,
+        ] {
+            let mut value: Value = serde_yaml_ng::from_str("name: fixture").unwrap();
+            let original = value.clone();
+            assert!(
+                Expr::parse(source)
+                    .unwrap()
+                    .apply(&mut value, &mut Budget::new(None))
+                    .is_err()
+            );
+            assert_eq!(value, original);
+        }
+    }
+
     #[test]
     fn budgets_are_checked_before_growth_and_candidates_are_atomic() {
         let mut value: Value = serde_yaml_ng::from_str("name: keeper").unwrap();
