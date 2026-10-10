@@ -85,7 +85,7 @@ fn xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io() {
         "download-settings",
     ];
     for field in fields {
-        for value in [Value::Null, json!([]), json!(42)] {
+        for value in [Value::Null, json!([]), json!(42.5)] {
             assert!(
                 Config::parse_yaml(&document(json!({field:value}))).is_err(),
                 "accepted invalid type for {field}: {value}"
@@ -202,6 +202,57 @@ fn xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io() {
             assert!(Config::parse_yaml(&document(options)).is_ok());
         }
     }
+}
+
+#[test]
+fn xhttp_numeric_upload_fields_match_strings_and_retain_bounds() {
+    let numeric = json!({
+        "uplink-data-placement": "header", "uplink-data-key": "data",
+        "uplink-chunk-size": 1024,
+        "sc-max-each-post-bytes": 4096,
+        "sc-min-posts-interval-ms": 1
+    });
+    let fields = [
+        "uplink-chunk-size",
+        "sc-max-each-post-bytes",
+        "sc-min-posts-interval-ms",
+    ];
+    let mut quoted = numeric.clone();
+    for field in fields {
+        quoted[field] = json!(quoted[field].as_u64().unwrap().to_string());
+    }
+    let numeric_config = Config::parse_yaml(&document(numeric.clone())).unwrap();
+    let quoted_config = Config::parse_yaml(&document(quoted)).unwrap();
+    assert_eq!(
+        numeric_config.proxies[0].protocol,
+        quoted_config.proxies[0].protocol
+    );
+
+    for (field, low, high) in [
+        ("uplink-chunk-size", 64, 8192),
+        ("sc-max-each-post-bytes", 1, 16 * 1024 * 1024),
+        ("sc-min-posts-interval-ms", 1, 60000),
+    ] {
+        for value in [low, high] {
+            let mut options = numeric.clone();
+            options[field] = json!(value);
+            assert!(Config::parse_yaml(&document(options)).is_ok());
+        }
+        for value in [
+            json!(low - 1),
+            json!(high + 1),
+            json!(-1),
+            json!(u64::MAX),
+            json!(true),
+        ] {
+            let mut options = numeric.clone();
+            options[field] = value;
+            assert!(Config::parse_yaml(&document(options)).is_err());
+        }
+    }
+    let mut adaptive = numeric;
+    adaptive["uplink-chunk-size"] = json!(0);
+    assert!(Config::parse_yaml(&document(adaptive)).is_ok());
 }
 
 #[test]

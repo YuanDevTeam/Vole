@@ -188,7 +188,14 @@ async fn measure_one(
     target: &Target,
     timeout: Duration,
 ) -> Result<u64, InvokeFailure> {
-    let config = MeasureConfig::parse_yaml(config_yaml.as_bytes()).map_err(InvokeFailure::from)?;
+    let directory = super::registry().data_directory().ok();
+    let config = match directory {
+        Some(directory) => {
+            MeasureConfig::parse_yaml_with_directory(config_yaml.as_bytes(), Some(directory.root()))
+        }
+        None => MeasureConfig::parse_yaml(config_yaml.as_bytes()),
+    }
+    .map_err(InvokeFailure::from)?;
     drop(config_yaml);
     let prepared =
         PreparedMeasurement::prepare_config(config, &SystemResolver, ResourceLimits::default())

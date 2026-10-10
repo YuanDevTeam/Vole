@@ -4,7 +4,7 @@ status: accepted
 
 # ADR 0005：将 select 代理组建模为会话路由与上游目标
 
-`select` 是普通规则、`MATCH`、DNS 与 `dialer-proxy` 共享的命名目标。组拥有一个有序、非空的直接成员列表，成员可以是代理节点、嵌套 `select` 组、`DIRECT` 或 `REJECT`；省略 `default-selected` 时选择第一项，显式值必须精确命中一个直接成员。节点上游和全部组成员边统一为无环图，包括未选成员；独立 `measureDelay` 仍只接受具体节点链。
+`select` 是普通规则、`MATCH`、DNS 与 `dialer-proxy` 共享的命名目标。组拥有一个有序、非空的直接成员列表，成员可以是代理节点、嵌套 `select` 组、`DIRECT` 或 `REJECT`；`default-selected` 精确匹配直接成员，省略、空串或未命中时选择第一项。节点上游和全部组成员边统一为无环图，包括未选成员；独立 `measureDelay` 仍只接受具体节点链。
 
 `mode` 支持 rule、global、direct；rule 模式允许空规则和任意位置的 MATCH，未命中直连。global 使用 GLOBAL 组；未显式声明时自动生成，成员顺序为 DIRECT、REJECT、全部节点、全部声明组，默认 DIRECT。该组与普通 select 共用运行时选择和 Controller 接口。
 

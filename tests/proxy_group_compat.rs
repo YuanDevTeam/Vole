@@ -72,10 +72,42 @@ rules:
 
 #[test]
 fn validates_group_selection_and_health_defaults() {
-    let yaml = format!(
-        "{COMMON_PREFIX}proxy-groups:\n  - name: primary\n    type: select\n    proxies: [node-a]\n    default-selected: missing\nrules: ['MATCH,primary']\n"
-    );
-    assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
+    let providers = r#"
+proxy-providers:
+  nodes:
+    type: inline
+    payload:
+      - {name: provider-a, type: socks5, server: 192.0.2.3, port: 1080}
+      - {name: provider-b, type: socks5, server: 192.0.2.4, port: 1080}
+"#;
+    for (members, first, second, provider_config) in [
+        ("proxies: [node-a, node-b]", "node-a", "node-b", ""),
+        ("use: [nodes]", "provider-a", "provider-b", providers),
+    ] {
+        for (selection, expected) in [
+            (String::new(), 0),
+            ("    default-selected: \"\"\n".to_owned(), 0),
+            ("    default-selected: missing\n".to_owned(), 0),
+            (format!("    default-selected: {second}\n"), 1),
+        ] {
+            let yaml = format!(
+                "{COMMON_PREFIX}{provider_config}proxy-groups:\n  - name: primary\n    type: select\n    {members}\n{selection}rules: ['MATCH,primary']\n"
+            );
+            let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            let group = &config.proxy_groups[0];
+            assert_eq!(group.initial_member, expected, "{yaml}");
+            assert_eq!(
+                group.members[expected].name,
+                if expected == 0 { first } else { second }
+            );
+        }
+        let yaml = format!(
+            "{COMMON_PREFIX}{provider_config}proxy-groups:\n  - name: primary\n    type: select\n    {members}\n    default-selected: {first}\n    exclude-filter: '^{first}$'\nrules: ['MATCH,primary']\n"
+        );
+        let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        assert_eq!(config.proxy_groups[0].initial_member, 0);
+        assert_eq!(config.proxy_groups[0].members[0].name, second);
+    }
     for (kind, url, expected) in [
         (
             "select",

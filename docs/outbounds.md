@@ -35,7 +35,7 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
 
 `type: http` 提供 TCP CONNECT；`tls: true` 在代理链路使用共享 TLS 与证书策略。
 支持 `username/password`、`headers`、`sni`、`skip-cert-verify`、`name-cert-verify`、
-`fingerprint` 及成对的内联 `certificate/private-key`。用户名和密码均非空时发送 Basic 认证。
+`fingerprint` 及成对的 `certificate/private-key`（PEM 或文件路径）。用户名和密码均非空时发送 Basic 认证。
 HTTP CONNECT 本身不提供 UDP，也不接受 `udp` 字段。公共 smux 可承载 UDP。
 握手沿用原期限，失败关闭，
 成功后保留响应头后的业务字节。启用此协议需要 `outbound-http` feature。
@@ -46,7 +46,7 @@ HTTP CONNECT 本身不提供 UDP，也不接受 `udp` 字段。公共 smux 可�
 TCP 保留域名交由上游解析；UDP 由控制连接拥有，校验 relay 来源并保留实际回包目标。
 上游为 select 组时，控制连接和后续 UDP 数据报使用同次建链快照。
 `tls: true` 使用共享 TLS、`skip-cert-verify`、`name-cert-verify`、`fingerprint` 和
-成对的内联 `certificate/private-key`。TLS 名称固定使用 server；不接受 sni、alpn
+成对的 `certificate/private-key`（PEM 或文件路径）。TLS 名称固定使用 server；不接受 sni、alpn
 或 ClientHello 模板。TLS 保护 CONNECT / UDP ASSOCIATE 控制连接，普通 UDP relay
 数据不经过 TLS；预算独立于 TUN MTU。TLS 关闭时不能配置证书字段。
 
@@ -54,7 +54,7 @@ TCP 保留域名交由上游解析；UDP 由控制连接拥有，校验 relay �
 
 支持 v2、兼容 v1 的会话、内置填充与 UoT v2。password 为 1–1024 UTF-8 字节；
 SNI 默认 server；ALPN 省略/空列表不发送，非空保持顺序，不强制选中某协议。
-支持独立的 `name-cert-verify` 和成对内联 PEM `certificate/private-key` 客户端身份；
+支持独立的 `name-cert-verify` 和成对内联 PEM 或文件路径 `certificate/private-key` 客户端身份；
 不开放 TLS 版本、ECH、REALITY、填充和会话参数。命名指纹沿用共享 TLS。
 
 连接先发送 SHA-256 密码摘要、认证填充和首个会话批次。Settings 固定声明 v=2 和
@@ -87,7 +87,7 @@ begin_shutdown 同步禁止新流、清空空闲并取消所有会话；shutdown
 
 SNI 默认 server；WS Host 只覆盖 HTTP authority，不作为 SNI 回退。ALPN 默认 TCP 空、
 WS http/1.1、gRPC h2，显式列表及实际协商均须满足传输，不能静默降级。
-`name-cert-verify` 只覆盖证书验证名；成对的内联 PEM `certificate/private-key`
+`name-cert-verify` 只覆盖证书验证名；成对的内联 PEM 或文件路径 `certificate/private-key`
 用于客户端 mTLS 身份，共用标准 TLS 的验证、指纹与恢复策略。
 
 WS path 默认 /，可带 query；头字段不得覆盖握手保留头或大小写重复。early-data
@@ -125,7 +125,7 @@ none 只关闭 body 加密，仍验证响应身份；不能启用 global-padding
 network 省略/空串为 tcp，另支持 ws/grpc/http/h2；均可明文或标准 TLS。tls 默认 false，
 关闭时禁止 TLS 字段，即便空串、空列表或 false。认证名依次为 servername、WS Host
 去端口、server；HTTP 伪装 Host/H2 authority 不替代认证名。WS 需 http/1.1，gRPC/H2 需 h2。
-TLS 支持独立的 `name-cert-verify` 和成对内联 PEM `certificate/private-key` 客户端身份。
+TLS 支持独立的 `name-cert-verify` 和成对内联 PEM 或文件路径 `certificate/private-key` 客户端身份。
 
 - WS ED/路径/头及 HTTPUpgrade 普通/fast-open 约束同 Trojan。
 - gRPC 选项、默认值和节点连接池与 Trojan/VLESS 共用，每条逻辑流独立生成 VMess AEAD 认证；关闭逻辑流不关闭物理连接或兄弟流。
@@ -160,7 +160,7 @@ gRPC 池与 legacy H2 driver 由节点拥有并同步退出，无全局会话额
 始终 QUIC/TLS 1.3，使用官方 rustls；不接受 tls/network/client-fingerprint/REALITY。
 port 为 1–65535，仅提供 ports 时可省略；显式非法 port 仍拒绝。password 默认空、
 保留原值，须为最长 8192 字节的合法 HTTP 头值。SNI 默认 server；ALPN 省略/空为 h3。
-支持共享证书 pin/skip、独立 `name-cert-verify` 和成对内联 PEM mTLS；
+支持共享证书 pin/skip、独立 `name-cert-verify` 和成对内联 PEM 或文件路径 mTLS；
 验证名不改变 SNI。udp 只控制业务 UDP，不关闭 QUIC 载体。
 
 - up/down 独立非负整数或十进制整数字符串，裸值 Mbit/s；单位 [KMGT]?[bB]ps 使用
@@ -334,7 +334,7 @@ private-key 必填，ip/ipv6 至少提供一个本地地址；地址接受 IP �
 发送目的地址与解密包的来源地址使用同一不可变最长前缀表；相同前缀最后声明的 peer
 优先。同一公钥的重复声明更新端点，保留未覆盖的 PSK，并追加允许前缀。
 
-reserved 缺省为空（全零），否则必须为三个字节。peer 缺省继承顶层值；发送时写入
+reserved 缺省为空（全零），否则接受三字节数组或解码后恰好三字节的标准 Base64 字符串。peer 缺省继承顶层值；发送时写入
 WireGuard 消息头的保留字节，接收时清零后验证 Noise。MTU 省略/0 为 1408，范围
 1280–65503；外层实际双向 UDP 预算必须至少为 MTU+32，不足时关闭上游，不静默缩小。
 udp 缺省 false，只控制业务 UDP；外层始终需要双向数据报。persistent-keepalive 为

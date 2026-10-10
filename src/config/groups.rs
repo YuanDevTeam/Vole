@@ -41,6 +41,7 @@ pub struct HealthCheckConfig {
     pub interval: u64,
     pub timeout: u64,
     pub lazy: bool,
+    #[serde(deserialize_with = "super::scalar::string_or_integer")]
     pub expected_status: String,
 }
 impl Default for HealthCheckConfig {

@@ -35,10 +35,12 @@ use uuid::Uuid;
 use crate::{Result, VoleError};
 
 mod dns;
+mod identity_files;
 mod name_regex;
 pub mod providers;
 mod rule_provider;
 pub(crate) mod rules;
+mod scalar;
 pub use rule_provider::RuleCollection;
 mod yaml;
 use rules::parse_rule;
@@ -90,7 +92,6 @@ pub const MAX_RULE_BYTES: usize = 16 * 1024;
 pub const MAX_RULES_TOTAL_BYTES: usize = MAX_CONFIG_BYTES;
 pub const MAX_SNIFFER_PORT_ITEMS: usize = 64;
 pub const MAX_GEOX_URL_BYTES: usize = 4_096;
-pub const MAX_CONTROLLER_SECRET_BYTES: usize = 255;
 pub const MAX_ANYTLS_PASSWORD_BYTES: usize = 1_024;
 pub const GEO_UPDATE_INTERVAL_HOURS: u64 = 24;
 
@@ -1142,7 +1143,11 @@ struct RawProxyGroup {
     timeout: u64,
     #[serde(default = "default_true")]
     lazy: bool,
-    #[serde(rename = "expected-status", default)]
+    #[serde(
+        rename = "expected-status",
+        default,
+        deserialize_with = "scalar::string_or_integer"
+    )]
     expected_status: String,
     #[serde(default)]
     tolerance: u16,
@@ -1748,19 +1753,19 @@ struct RawXHttpSettings {
     #[serde(
         rename = "uplink-chunk-size",
         default,
-        deserialize_with = "deserialize_present_option"
+        deserialize_with = "scalar::optional_string_or_integer"
     )]
     uplink_chunk_size: Option<String>,
     #[serde(
         rename = "sc-max-each-post-bytes",
         default,
-        deserialize_with = "deserialize_present_option"
+        deserialize_with = "scalar::optional_string_or_integer"
     )]
     sc_max_each_post_bytes: Option<String>,
     #[serde(
         rename = "sc-min-posts-interval-ms",
         default,
-        deserialize_with = "deserialize_present_option"
+        deserialize_with = "scalar::optional_string_or_integer"
     )]
     sc_min_posts_interval_ms: Option<String>,
     #[serde(
@@ -1992,8 +1997,17 @@ where
 
 impl Config {
     pub fn parse_yaml(input: &[u8]) -> Result<Self> {
+        Self::parse_yaml_with_directory(input, None)
+    }
+
+    pub(crate) fn parse_yaml_with_directory(
+        input: &[u8],
+        directory: Option<&std::path::Path>,
+    ) -> Result<Self> {
         let yaml = yaml::parse(input)?;
-        let template = std::sync::Arc::new(providers::ProviderTemplate::extract(yaml)?);
+        let mut template = providers::ProviderTemplate::extract(yaml)?;
+        template.identity_directory = directory.map(std::path::Path::to_path_buf);
+        let template = std::sync::Arc::new(template);
         template.materialize(&providers::ProviderContents::new())
     }
     #[cfg(any(feature = "invoke", test))]
@@ -2072,7 +2086,6 @@ impl RawVoleConfig {
             RawSnifferConfig::normalize,
         )?;
 
-        let has_explicit_groups = !self.proxy_groups.is_empty();
         let mut raw_groups = self.proxy_groups;
         let generated_global = !raw_groups.iter().any(|group| group.name == "GLOBAL");
         if generated_global {
@@ -2114,11 +2127,8 @@ impl RawVoleConfig {
         let route_targets = collect_route_targets(&proxy_ids, &proxy_group_ids);
         let proxy_groups = normalize_proxy_groups(raw_proxy_groups, &route_targets)?;
         proxy_graph_order(&proxies, &proxy_groups)?;
-        let external_controller = normalize_external_controller(
-            self.external_controller,
-            self.secret,
-            has_explicit_groups,
-        )?;
+        let external_controller =
+            normalize_external_controller(self.external_controller, self.secret)?;
 
         let mut dns = self
             .dns
@@ -2185,36 +2195,37 @@ impl RawVoleConfig {
 fn normalize_external_controller(
     listen: Option<String>,
     secret: Option<String>,
-    has_proxy_groups: bool,
 ) -> Result<Option<ExternalControllerConfig>> {
     let Some(listen) = listen.filter(|listen| !listen.is_empty()) else {
-        if secret.is_some() {
-            return invalid("secret requires external-controller");
-        }
         return Ok(None);
     };
-    if has_proxy_groups && secret.is_none() {
-        return invalid("secret is required when external-controller manages proxy-groups");
-    }
-    let listen = listen.parse::<SocketAddr>().map_err(|_| {
-        VoleError::InvalidConfig(
-            "external-controller must be an IP socket address with an explicit port".to_owned(),
-        )
-    })?;
-    if !listen.ip().is_loopback() {
-        return invalid("external-controller must listen on a loopback address");
-    }
-    if listen.port() == 0 {
-        return invalid("external-controller port must be between 1 and 65535");
-    }
-    if let Some(secret) = &secret
-        && !(1..=MAX_CONTROLLER_SECRET_BYTES).contains(&secret.len())
-    {
-        return invalid(format!(
-            "secret must contain between 1 and {MAX_CONTROLLER_SECRET_BYTES} UTF-8 bytes"
-        ));
-    }
-    Ok(Some(ExternalControllerConfig { listen, secret }))
+    // Mihomo's tcp preResolve accepts literal IPs, localhost and an empty host
+    // without consulting DNS.
+    let listen = if let Ok(address) = listen.parse::<SocketAddr>() {
+        address
+    } else {
+        let address = listen
+            .strip_prefix("localhost:")
+            .map(|port| (IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+            .or_else(|| {
+                listen
+                    .strip_prefix(':')
+                    .map(|port| (IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))
+            });
+        let Some((host, port)) = address else {
+            return invalid(
+                "external-controller requires an IP, localhost or empty host and a numeric port",
+            );
+        };
+        let port = port.parse::<u16>().map_err(|_| {
+            VoleError::InvalidConfig("external-controller port must be between 0 and 65535".into())
+        })?;
+        SocketAddr::new(host, port)
+    };
+    Ok(Some(ExternalControllerConfig {
+        listen,
+        secret: secret.filter(|secret| !secret.is_empty()),
+    }))
 }
 
 fn normalize_geodata_update(
@@ -2586,18 +2597,10 @@ fn normalize_proxy_groups(
                     Ok(ProxyGroupMemberConfig { name, target })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let initial_member = match group.default_selected {
-                Some(default) => members
-                    .iter()
-                    .position(|member| member.name == default)
-                    .ok_or_else(|| {
-                        VoleError::InvalidConfig(format!(
-                            "proxy group `{}` default-selected `{default}` must name a direct member",
-                            group.name
-                        ))
-                    })?,
-                None => 0,
-            };
+            let initial_member = group
+                .default_selected
+                .and_then(|default| members.iter().position(|member| member.name == default))
+                .unwrap_or(0);
             let health = HealthCheckConfig {
                 enable: true,
                 url: if group.url.is_empty() { "https://www.gstatic.com/generate_204".into() } else { group.url },
@@ -4701,6 +4704,28 @@ tun:
         assert_eq!(controller.listen, "[::1]:19091".parse().unwrap());
         assert!(controller.secret.is_none());
 
+        for (address, expected) in [
+            ("0.0.0.0:9090", "0.0.0.0:9090"),
+            ("[::]:9090", "[::]:9090"),
+            ("192.0.2.1:9090", "192.0.2.1:9090"),
+            ("127.0.0.1:0", "127.0.0.1:0"),
+            ("localhost:0", "127.0.0.1:0"),
+            (":0", "[::]:0"),
+        ] {
+            let fields = format!("external-controller: '{address}'\nsecret: ''");
+            let config = Config::parse_yaml(current_yaml(&fields).as_bytes()).unwrap();
+            let controller = config.external_controller.unwrap();
+            assert_eq!(controller.listen, expected.parse().unwrap());
+            assert!(controller.secret.is_none());
+        }
+        let secret = "s".repeat(crate::inbound::DEFAULT_HEADER_LIMIT + 1);
+        let fields = format!("external-controller: '127.0.0.1:0'\nsecret: '{secret}'");
+        let config = Config::parse_yaml(current_yaml(&fields).as_bytes()).unwrap();
+        assert_eq!(
+            config.external_controller.unwrap().secret.as_deref(),
+            Some(secret.as_str())
+        );
+
         let debug = format!(
             "{:?}",
             ExternalControllerConfig {
@@ -4720,47 +4745,30 @@ tun:
         .unwrap();
         assert!(config.external_controller.is_some());
         assert!(config.proxies.is_empty());
-        let disabled =
-            Config::parse_yaml(b"external-controller: \"\"\nrules: [\"MATCH,DIRECT\"]\n").unwrap();
-        assert!(disabled.external_controller.is_none());
+        for controller in ["", "external-controller: \"\"\n"] {
+            let yaml = format!("{controller}secret: token\nrules: ['MATCH,DIRECT']\n");
+            let disabled = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            assert!(disabled.external_controller.is_none());
+        }
     }
 
     #[test]
-    fn rejects_unsafe_or_misplaced_traffic_controller_config() {
-        for (fields, expected) in [
-            (
-                "mixed-port: 1080\nauthentication:\n  - measure:secret\nsecret: token",
-                "secret requires external-controller",
-            ),
-            (
-                "external-controller: \"0.0.0.0:19090\"\ntun:\n  enable: true",
-                "loopback",
-            ),
-            (
-                "external-controller: \"127.0.0.1:0\"\ntun:\n  enable: true",
-                "between 1 and 65535",
-            ),
-            (
-                "external-controller: localhost:19090\ntun:\n  enable: true",
-                "IP socket address",
-            ),
-            (
-                "external-controller: \"127.0.0.1:19090\"\nsecret: \"\"\ntun:\n  enable: true",
-                "between 1 and 255",
-            ),
+    fn rejects_malformed_traffic_controller_addresses() {
+        for address in [
+            "127.0.0.1",
+            "127.0.0.1:65536",
+            "localhost:not-a-port",
+            "controller.example:9090",
+            "::1:9090",
         ] {
-            let error = Config::parse_yaml(current_yaml(fields).as_bytes()).unwrap_err();
+            let fields = format!("external-controller: '{address}'");
+            let error = Config::parse_yaml(current_yaml(&fields).as_bytes()).unwrap_err();
             assert!(
-                error.to_string().contains(expected),
-                "unexpected error for {fields:?}: {error}"
+                error.to_string().contains("external-controller"),
+                "unexpected error for {address:?}: {error}"
             );
         }
 
-        let oversized = current_yaml(&format!(
-            "external-controller: \"127.0.0.1:19090\"\nsecret: \"{}\"\ntun:\n  enable: true",
-            "s".repeat(MAX_CONTROLLER_SECRET_BYTES + 1)
-        ));
-        assert!(Config::parse_yaml(oversized.as_bytes()).is_err());
         assert!(
             Config::parse_yaml(
                 current_yaml("external-controller: null\ntun:\n  enable: true").as_bytes()
@@ -5937,10 +5945,6 @@ rules:
     proxies: []"#,
             r#"  - name: 主线路
     type: select
-    proxies: [proxy]
-    default-selected: missing"#,
-            r#"  - name: 主线路
-    type: select
     proxies: [missing]"#,
             r#"  - name: 主线路
     type: select
@@ -6028,8 +6032,8 @@ rules:
         assert!(Config::parse_yaml(controller.as_bytes()).is_ok());
 
         let missing_secret = controller.replace("secret: token\n", "");
-        let error = Config::parse_yaml(missing_secret.as_bytes()).unwrap_err();
-        assert!(error.to_string().contains("secret is required"), "{error}");
+        let config = Config::parse_yaml(missing_secret.as_bytes()).unwrap();
+        assert!(config.external_controller.unwrap().secret.is_none());
     }
 
     #[test]
@@ -6459,6 +6463,17 @@ authentication:
             config.proxy_groups[0].members[0].target,
             ProxyGroupMemberTarget::Direct
         );
+    }
+
+    #[test]
+    fn rejects_deprecated_fallback_filter_geosite() {
+        for enable in [false, true] {
+            let yaml = format!(
+                "rules: ['MATCH,DIRECT']\ndns:\n  enable: {enable}\n  fallback-filter:\n    geosite: []\n"
+            );
+            let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("geosite"), "{error}");
+        }
     }
 
     #[test]

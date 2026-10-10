@@ -28,6 +28,7 @@ cat config.yaml | vole -f -
 Unix 用户目录取 `HOME`，Windows 取 `USERPROFILE`，缺失时使用工作目录。
 默认 `.config/vole` 不存在或不可访问时，若设置 `XDG_CONFIG_HOME`，使用其中的 `vole` 目录。
 配置文件必须是普通文件，文件和标准输入上限均为 8 MiB，CLI 不写回配置。
+客户端 certificate/private-key 可引用 PEM 文件，相对路径从 -d 的数据目录解析；-t 同样读取并校验身份，仍不初始化目录。
 
 正常运行执行 `initialize → createInstance → start(configYaml)`，等待退出后
 `stop → destroyInstance`。Unix 支持 SIGINT/SIGTERM，Windows 支持 Ctrl+C/Ctrl+Break；

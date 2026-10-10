@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::Deserialize;
+use serde::{Deserialize, de::Visitor};
 use zeroize::Zeroizing;
 
 use super::{
@@ -78,7 +78,7 @@ struct RawPeer {
     public_key: String,
     #[serde(default)]
     pre_shared_key: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_reserved")]
     reserved: Vec<u8>,
     #[serde(default)]
     allowed_ips: Vec<String>,
@@ -100,7 +100,7 @@ pub(super) struct RawWireGuard {
     public_key: String,
     #[serde(default)]
     pre_shared_key: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_reserved")]
     reserved: Vec<u8>,
     #[serde(default)]
     allowed_ips: Vec<String>,
@@ -132,6 +132,70 @@ pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
     RawWireGuard::deserialize(d)
         .map_err(|_| serde::de::Error::custom("invalid WireGuard configuration fields"))
 }
+
+fn deserialize_reserved<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<u8>, D::Error> {
+    struct Reserved;
+
+    impl<'de> Visitor<'de> for Reserved {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("three bytes as a byte array or standard Base64")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Vec<u8>, E> {
+            let error = || E::custom("WireGuard reserved requires three bytes");
+            let mut encoded = [0; 4];
+            let mut length = 0;
+            // Go's standard Base64 decoder ignores CR and LF.
+            for byte in value.bytes().filter(|byte| !matches!(*byte, b'\r' | b'\n')) {
+                if length == encoded.len() {
+                    return Err(error());
+                }
+                encoded[length] = byte;
+                length += 1;
+            }
+            if length == 0 {
+                return Ok(Vec::new());
+            }
+            let mut decoded = [0; 3];
+            if STANDARD
+                .decode_slice(&encoded[..length], &mut decoded)
+                .map_err(|_| error())?
+                != decoded.len()
+            {
+                return Err(error());
+            }
+            Ok(decoded.to_vec())
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<Vec<u8>, A::Error> {
+            let mut bytes = Vec::with_capacity(3);
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                if bytes.len() == 3 {
+                    return Err(serde::de::Error::custom(
+                        "WireGuard reserved requires three bytes",
+                    ));
+                }
+                bytes.push(byte);
+            }
+            if !bytes.is_empty() && bytes.len() != 3 {
+                return Err(serde::de::Error::custom(
+                    "WireGuard reserved requires three bytes",
+                ));
+            }
+            Ok(bytes)
+        }
+    }
+
+    deserializer.deserialize_any(Reserved)
+}
+
 fn reserved(value: Vec<u8>, default: [u8; 3]) -> Result<[u8; 3]> {
     if value.is_empty() {
         Ok(default)
@@ -354,5 +418,80 @@ impl WireGuardOutboundConfig {
             return invalid("WireGuard MTU must be between 1280 and 65503");
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "outbound-wireguard"))]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::config::Config;
+
+    fn document(global: Value, peer: Option<Value>) -> Vec<u8> {
+        let mut node = json!({
+            "name": "wg", "type": "wireguard", "server": "192.0.2.1", "port": 51820,
+            "ip": "10.0.0.2", "private-key": STANDARD.encode([1; 32]),
+            "public-key": STANDARD.encode([2; 32]), "reserved": global
+        });
+        if let Some(reserved) = peer {
+            node["peers"] = json!([{
+                "server": "192.0.2.1", "port": 51820, "public-key": STANDARD.encode([2; 32]),
+                "allowed-ips": ["0.0.0.0/0"], "reserved": reserved
+            }]);
+        }
+        serde_json::to_vec(&json!({"mixed-port": 1080, "proxies": [node]})).unwrap()
+    }
+
+    #[test]
+    fn reserved_base64_and_bytes_match_and_empty_peer_inherits() {
+        for peer in [None, Some(json!([])), Some(json!([0, 1, 255]))] {
+            let base64_peer = peer.as_ref().map(|value| {
+                if value.as_array().unwrap().is_empty() {
+                    json!("")
+                } else {
+                    json!("AAH/")
+                }
+            });
+            let bytes = Config::parse_yaml(&document(json!([83, 128, 39]), peer)).unwrap();
+            let encoded = Config::parse_yaml(&document(json!("U4An"), base64_peer)).unwrap();
+            assert_eq!(bytes.proxies[0].protocol, encoded.proxies[0].protocol);
+        }
+        let inherited = Config::parse_yaml(&document(json!("U4An"), Some(json!("")))).unwrap();
+        let ProxyProtocol::WireGuard(config) = &inherited.proxies[0].protocol else {
+            panic!("expected WireGuard");
+        };
+        assert_eq!(config.peers[0].reserved, [83, 128, 39]);
+        let zeros = Config::parse_yaml(&document(json!("U4An"), Some(json!("AAAA")))).unwrap();
+        let ProxyProtocol::WireGuard(config) = &zeros.proxies[0].protocol else {
+            panic!("expected WireGuard");
+        };
+        assert_eq!(config.peers[0].reserved, [0; 3]);
+        let default = Config::parse_yaml(&document(json!(""), None)).unwrap();
+        let bytes = Config::parse_yaml(&document(json!([]), None)).unwrap();
+        assert_eq!(default.proxies[0].protocol, bytes.proxies[0].protocol);
+        assert!(Config::parse_yaml(&document(json!("U4\r\nAn"), None)).is_ok());
+    }
+
+    #[test]
+    fn reserved_rejects_invalid_base64_lengths_and_byte_values_at_both_levels() {
+        for value in [
+            json!("AA=="),
+            json!("AAE="),
+            json!("AAECAw=="),
+            json!("%%%"),
+            json!("____"),
+            json!([1]),
+            json!([1, 2, 3, 4]),
+            json!([0, 1, 256]),
+            json!([-1, 1, 2]),
+            json!([0, 1, 2.0]),
+            json!(null),
+            json!(true),
+            json!(42),
+        ] {
+            assert!(Config::parse_yaml(&document(value.clone(), None)).is_err());
+            assert!(Config::parse_yaml(&document(json!([0, 0, 0]), Some(value))).is_err());
+        }
     }
 }

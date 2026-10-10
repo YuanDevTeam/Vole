@@ -1,6 +1,6 @@
 # 运行时 Controller API
 
-Controller 是当前 Running Session 的回环 HTTP 接口。它提供业务连接管理、有效设置与规则查询、一次性 TUN 流量快照，以及静态与动态 `select`、`url-test`、`fallback`、`load-balance` 代理组的状态查询和实时选择；它不是 Invoke API，也不承诺完整 Mihomo Dashboard 兼容。
+Controller 是当前 Running Session 的 HTTP 接口。它提供业务连接管理、有效设置与规则查询、一次性 TUN 流量快照，以及静态与动态 `select`、`url-test`、`fallback`、`load-balance` 代理组的状态查询和实时选择；它不是 Invoke API，也不承诺完整 Mihomo Dashboard 兼容。
 
 ## 配置与生命周期
 
@@ -9,9 +9,10 @@ external-controller: 127.0.0.1:9090
 secret: "vole-runtime-secret"
 ```
 
-- 省略或空串 `external-controller` 表示不启动 Controller，也不采集业务连接、规则命中和建链诊断，此时不能单独配置 `secret`。代理组选择、健康检查、资源更新与 TUN 原始流量统计独立运行。
-- `external-controller` 只接受带显式非零端口的回环 IP 地址。静态节点、纯 DIRECT 及关闭业务入口的配置均可使用。
-- 只要同时显式配置代理组与 Controller，`secret` 就必填；没有显式代理组时可省略。`secret` 出现时必须为 1–255 UTF-8 字节，并保护本文定义的全部路由。
+- 省略或空串 `external-controller` 表示不启动 Controller，也不采集业务连接、规则命中和建链诊断；配置中的 `secret` 可保留。代理组选择、健康检查、资源更新与 TUN 原始流量统计独立运行。
+- `external-controller` 接受 IP、`localhost` 或空 host 与数值端口组成的地址，如 `127.0.0.1:9090`、`0.0.0.0:9090`、`[::]:9090`、`localhost:9090`、`:9090`。端口范围为 0–65535，0 由系统选择端口；`localhost` 使用 IPv4 回环。其他域名和命名服务端口不在当前范围内。静态节点、纯 DIRECT 及关闭业务入口的配置均可使用。
+- 空 host、`0.0.0.0` 和 `[::]` 均优先使用允许 IPv4 映射连接的双栈通配监听，仅地址族不可用时改用 IPv4。Controller 的地址族选择独立于顶层 `ipv6`。
+- `secret` 始终可选，省略或空串表示不要求认证；配置非空值时保护本文定义的全部路由。配置仅受整体 YAML 大小预算约束，HTTP 请求头仍限 32 KiB。
 - `measureDelay` 的 node-only 配置不能包含 Controller 或代理组字段。
 - `validateConfig` 只校验字段；`start` 绑定端口，绑定失败则启动失败。`stop` 和 `destroyInstance` 关闭监听器。
 
@@ -19,7 +20,7 @@ Controller 与公共运行时 session 同生共灭。`profile.store-selected` �
 
 ## Bearer 鉴权
 
-配置 `secret` 后，每个请求都必须携带：
+配置非空 `secret` 后，每个请求都必须携带：
 
 ```http
 Authorization: Bearer vole-runtime-secret
@@ -30,8 +31,8 @@ Authorization: Bearer vole-runtime-secret
 - scheme 必须精确为 `Bearer`，token 必须与当前 session 配置完全一致；
 - 缺失、重复、格式错误或不匹配都返回 `401 Unauthorized`；
 - 比较过程不能通过日志、响应或明显的提前返回时序泄漏 token；
-- 未配置 `secret` 时不要求 `Authorization`；Controller 不使用 HTTP Basic，顶层 `authentication` 只属于 HTTP/SOCKS5 业务代理。
-- `allow-lan` 只控制业务代理监听，不改变 Controller 的回环限制或 Bearer 鉴权。
+- 省略或空串 `secret` 时不要求 `Authorization`；Controller 不使用 HTTP Basic，顶层 `authentication` 只属于 HTTP/SOCKS5 业务代理。
+- `allow-lan` 只控制业务代理监听，不改变 Controller 的监听地址或 Bearer 鉴权。
 
 ## `GET /traffic`
 
@@ -223,7 +224,7 @@ Expire 为 Unix 秒。未知时省略该对象，缺失子项为 0；不以本�
 policy 与 fallback 仍生效。DNS 关闭或查询失败返回 500。这里只输出地址/CNAME 答案，
 不提供其他 qtype、Authority/Additional 展开或后台 DNS 查询日志。
 
-这些接口复用 Controller 的回环限制和 Bearer 鉴权。目标与 DNS 路径只通过显式查询返回，
+这些接口复用 Controller 的 Bearer 鉴权。目标与 DNS 路径只通过显式查询返回，
 不会写入普通日志。`/connections` 是业务负载统计，`/traffic` 继续表示 TUN 原始 IP 包流量，
 `/proxies` 的节点健康数据继续表示探测结果，三者不可相互替代。
 
@@ -239,7 +240,6 @@ policy 与 fallback 仍生效。DNS 关闭或查询失败返回 500。这里只�
 | `204 No Content` | 选择、刷新或清理成功，正文为空 |
 | `400 Bad Request` | 路径、JSON、长度格式或成员无效 |
 | `401 Unauthorized` | Bearer 鉴权失败 |
-| `403 Forbidden` | 请求来源不是回环地址 |
 | `404 Not Found` | 路由、组或当前 session 中的 TUN 流量资源不存在 |
 | `405 Method Not Allowed` | 路由存在但方法不允许 |
 | `408 Request Timeout` | header 或 body 读取超时 |
@@ -252,6 +252,6 @@ policy 与 fallback 仍生效。DNS 关闭或查询失败返回 500。这里只�
 当前不提供配置修改、WebSocket 推送、Controller 版本协商或完整 Dashboard response。除本文列出的连接、规则、配置、DNS、主动探测、内存和 provider 路由、`GET /proxies`、`GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}` 外，其他路径和方法均不属于公共协议。
 
 Windows WinRT VPN 的完整运行时和 Controller 位于独立 Session Host；桌面 Wintun 的
-Controller 位于普通业务运行时。宿主通过回环 HTTP 直接访问实际 Running Session；
+Controller 位于普通业务运行时。宿主通过配置的 HTTP 地址直接访问实际 Running Session；
 组查询和切换不经过 `VoleInvoke`、Windows bridge 或 Provider 控制管道，
 不携带 `instanceId`，也不占用 Invoke 命令锁。

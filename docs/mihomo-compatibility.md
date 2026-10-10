@@ -2,7 +2,7 @@
 
 配置名称以 [Mihomo v1.19.32](https://github.com/MetaCubeX/mihomo/tree/88dcbf7f1614a67c3b36b848ee3592dfa92ada36) 为参考。
 Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配置子集不等于完整替代 Mihomo。
-未知字段和不支持的组合明确拒绝，不静默修改输入。
+未知字段和不支持的组合明确拒绝，不静默修改输入。已废弃的 dns.fallback-filter.geosite 不接受，使用 nameserver-policy 的 geosite 选择器。
 
 | 范围 | 当前支持 |
 | --- | --- |
@@ -31,12 +31,12 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - 订阅元信息只在成功候选或合法 304 后发布，失败响应或坏候选保留旧值；
   与 Mihomo 在读取响应头时更新的时点不同。数值仅接受有限且可表示的十进制数，
   不保留非有限/溢出浮点转换的参考行为。
-- WireGuard 使用标准用户态单/多 peer、最长前缀选择、reserved、节点远端 DNS 与按需端点更新；
+- WireGuard 使用标准用户态单/多 peer、最长前缀选择、reserved（数组或 Base64）、节点远端 DNS 与按需端点更新；
   每个本地地址族最多一个地址，MTU 至少1280。无 peers 时顶层 allowed-ips 与参考一致地忽略。
   peer 仅在实际使用时解析/建链；Mihomo 在节点初始化时解析所有 peer。
 - 节点 UDP 能力按 [出站契约](outbounds.md) 声明；rule 模式跳过不支持 UDP 的目标，继续匹配后续规则。
   global 模式和显式 DNS 出口不执行此跳过。负载均衡组按其声明能力参与规则匹配，实际选中成员仍须支持 UDP。
-- 未启用 mixed-port 或 TUN 时仍可运行 Controller 和资源任务。Controller 沿用回环地址、secret 准入，见 [Controller API](controller-api.md)。
+- 未启用 mixed-port 或 TUN 时仍可运行 Controller 和资源任务。Controller 接受通配 IP、localhost 和空 host；secret 可选，见 [Controller API](controller-api.md)。
   /dns/query 查询真实上游；连接表按 UDP 目标流管理，memory 返回当前进程 resident bytes，平台口径不同。
 - fake-IP TTL 最小一秒；映射生命周期独立于 TTL。本地选择和映射存储不保证与 Mihomo 数据库互读。
 - Apple、Android、Windows UWP 的网络设置、权限和 App 生命周期仍归宿主；Windows Wintun 使用外置 DLL。

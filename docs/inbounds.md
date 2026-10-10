@@ -24,8 +24,8 @@ HTTP 与 SOCKS5 共用一个混合入口，并和 TUN 共用 Dispatcher、规则
   非空接受多个 `user:password`，相同用户名以最后一项为准，
   按第一个冒号拆分，两项各 1–255 UTF-8 字节，不 trim。null 不视为省略。
   配置凭据后 HTTP/SOCKS5 均校验凭据；混合入口关闭时允许保留合法的共享和认证配置。
-- Basic / SOCKS 用户密码没有链路加密，只适合可信网络。Controller 仍独立回环监听，
-  使用自己的 Bearer 认证，不随共享开关开放。
+- Basic / SOCKS 用户密码没有链路加密，只适合可信网络。Controller 按 external-controller 独立监听，
+  使用自己的可选 Bearer 认证，不随共享开关改变地址或认证。
 - 不设置全局业务连接/关联准入数。Stop 取消并等待全部连接、relay 和接收任务，
   返回后端口可重新绑定。
 - 接收的 TCP 连接启用 `TCP_NODELAY`，小包应答不等待 Nagle 聚合。

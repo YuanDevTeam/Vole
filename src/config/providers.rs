@@ -165,6 +165,7 @@ impl ProviderSpec {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderTemplate {
     base: Value,
+    pub(super) identity_directory: Option<std::path::PathBuf>,
     pub proxies: Vec<(String, ProviderSpec)>,
     pub rules: Vec<(String, ProviderSpec)>,
 }
@@ -218,6 +219,7 @@ impl ProviderTemplate {
         let rules = take("rule-providers", true)?;
         Ok(Self {
             base,
+            identity_directory: None,
             proxies,
             rules,
         })
@@ -411,6 +413,12 @@ impl ProviderTemplate {
                     return invalid("empty-fallback must be a proxy node or built-in target");
                 }
             }
+        }
+        let mut identities =
+            super::identity_files::IdentityFiles::new(self.identity_directory.as_deref());
+        for node in &mut proxies {
+            budget.check()?;
+            identities.inline_node(node)?;
         }
         base.insert("proxies".into(), Value::Sequence(proxies));
         let raw: RawVoleConfig = serde_yaml_ng::from_value(value)

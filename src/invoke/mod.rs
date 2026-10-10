@@ -1240,10 +1240,19 @@ fn validate_config(config_yaml: String) -> Result<(), InvokeFailure> {
 }
 
 fn parse_config_yaml(config_yaml: &str) -> Result<Config, InvokeFailure> {
+    let directory = registry().data_directory().ok();
+    parse_config_yaml_with_directory(config_yaml, directory.as_ref().map(|dir| dir.root()))
+}
+
+fn parse_config_yaml_with_directory(
+    config_yaml: &str,
+    directory: Option<&Path>,
+) -> Result<Config, InvokeFailure> {
     if config_yaml.is_empty() {
         return Err(InvokeFailure::invalid_request("configYaml is empty"));
     }
-    Config::parse_yaml(config_yaml.as_bytes()).map_err(InvokeFailure::from)
+    Config::parse_yaml_with_directory(config_yaml.as_bytes(), directory)
+        .map_err(InvokeFailure::from)
 }
 
 fn geodata_status_data(status: GeoDataStatus) -> Value {

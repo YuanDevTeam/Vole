@@ -226,7 +226,7 @@ stopped -> preparing -> prepared -> starting -> running
 }
 ```
 
-无需 `initialize`，完成大小、YAML、结构、共享 route-target 命名空间、引用和字段组合校验。节点的 `dialer-proxy` 可指定 DIRECT 或引用节点、组；全部上游和组成员边（包括未选成员）统一做无环校验。不创建实例、不解析远端域名、不联网，也不读取 GeoData。资产缺失不影响纯配置校验。
+无需 `initialize`，完成大小、YAML、结构、共享 route-target 命名空间、引用和字段组合校验。节点的 `dialer-proxy` 可指定 DIRECT 或引用节点、组；全部上游和组成员边（包括未选成员）统一做无环校验。不创建实例、不解析远端域名、不联网，也不读取 GeoData。资产缺失不影响纯配置校验。显式引用的客户端证书与密钥文件在校验时读取；相对路径使用已初始化的 dataDir，未初始化时使用当前工作目录。
 
 ### `start`
 
@@ -307,6 +307,7 @@ Stop 关闭本次持有的 fd、session 和原生句柄；Wintun 不承诺移除
 配置路径分别从启动工作目录解析并折叠 `.`/`..`，绝对路径原样保留；
 配置默认 `<dataDir>/config.yaml`。
 `configPath: "-"` 从标准输入读取。文件必须是普通文件，文件和标准输入均最多 8 MiB；
+证书/密钥相对路径从选定 dataDir 解析，validate 也读取身份文件但不初始化目录。
 不会下载、创建模板或改写配置。详细命令行映射见 [CLI](cli.md)。
 
 普通 Unicode 路径使用 JSON 字符串。需要保留平台原生编码时，Unix 可使用
@@ -424,7 +425,7 @@ ProtectFd(fd) -> bool
 
 ## Controller
 
-配置 `external-controller` 后，运行时可提供回环 `GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}`。代理组 Controller 可以在非 TUN 的 `mixed-port` 配置中运行；此时 `/traffic` 不存在。只要 Controller 管理代理组，`secret` 就必填并保护全部路由。
+配置 `external-controller` 后，运行时可提供 HTTP `GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}`。代理组 Controller 可以在非 TUN 的 `mixed-port` 配置中运行；此时 `/traffic` 不存在。`secret` 省略或空串时免认证；非空时保护全部路由，监听地址由配置决定。
 
 静态成员来自配置，动态成员随 provider 成功更新；显式选择按 `profile.store-selected` 保存。成功切换只影响之后新建的物理 TCP、UDP 和 DNS transport，不迁移既有连接、UDP association、DNS 状态或 TCP pool。自动组根据健康状态处理后续连接的选择与恢复；select 的连接失败按原样返回。已认证 Hysteria2 会话的后续逻辑流和跳端口 socket 保留初始上游选择；新的认证会话才读取新选择。Controller 查询不携带 `instanceId`，不进入 Invoke 命令锁；完整语义见 [Controller API](controller-api.md)。
 

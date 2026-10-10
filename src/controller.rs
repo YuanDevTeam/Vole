@@ -1,6 +1,7 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -10,7 +11,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::{ExternalControllerConfig, MAX_CONTROLLER_SECRET_BYTES, validate_route_target_name},
+    config::{ExternalControllerConfig, validate_route_target_name},
     routing::{ProxyGroupError, ProxyGroupState, ProxyGroups},
     traffic::TunTrafficStats,
 };
@@ -46,7 +47,7 @@ impl RuntimeController {
         proxy_groups: Arc<ProxyGroups>,
     ) -> io::Result<Self> {
         Ok(Self {
-            listener: TcpListener::bind(config.listen).await?,
+            listener: bind_controller(config)?,
             secret: config.secret.as_deref().map(Arc::from),
             traffic,
             proxy_groups,
@@ -83,7 +84,7 @@ impl RuntimeController {
                     }
                 }
                 accepted = self.listener.accept(), if tasks.len() < MAX_CONTROLLER_CONNECTIONS => {
-                    let (stream, peer) = accepted?;
+                    let (stream, _) = accepted?;
                     let secret = self.secret.clone();
                     let traffic = self.traffic.clone();
                     let proxy_groups = self.proxy_groups.clone();
@@ -92,7 +93,6 @@ impl RuntimeController {
                     tasks.spawn(crate::resources::observation::task(async move {
                         if let Err(error) = handle_connection(
                             stream,
-                            peer,
                             secret,
                             traffic,
                             proxy_groups,
@@ -116,19 +116,49 @@ impl RuntimeController {
     }
 }
 
+fn bind_controller(config: &ExternalControllerConfig) -> io::Result<TcpListener> {
+    let listen = if config.listen.ip().is_unspecified() {
+        SocketAddr::from(([0u16; 8], config.listen.port()))
+    } else {
+        config.listen
+    };
+    match bind_controller_tcp(listen) {
+        Err(error)
+            if config.listen.ip().is_unspecified()
+                && crate::inbound::listen::address_family_unavailable(&error) =>
+        {
+            bind_controller_tcp(SocketAddr::from(([0, 0, 0, 0], config.listen.port())))
+        }
+        result => result,
+    }
+}
+
+fn bind_controller_tcp(address: SocketAddr) -> io::Result<TcpListener> {
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    if address.is_ipv6() {
+        // Go's tcp listener allows IPv4-mapped peers on an IPv6 wildcard.
+        socket.set_only_v6(false)?;
+    }
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(128)?;
+    TcpListener::from_std(socket.into())
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
-    peer: SocketAddr,
     secret: Option<Arc<str>>,
     traffic: Option<Arc<TunTrafficStats>>,
     proxy_groups: Arc<ProxyGroups>,
     resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
     cancellation: CancellationToken,
 ) -> io::Result<()> {
-    if !peer.ip().is_loopback() {
-        return write_error(&mut stream, 403, "Forbidden", &[]).await;
-    }
-
     let request = tokio::select! {
         biased;
         () = cancellation.cancelled() => return Ok(()),
@@ -654,8 +684,12 @@ fn authorized(headers: &[(String, String)], secret: Option<&str>) -> bool {
 }
 
 fn controller_token_eq(candidate: &[u8], secret: &[u8]) -> bool {
+    let limit = crate::inbound::DEFAULT_HEADER_LIMIT;
+    if candidate.len() > limit || secret.len() > limit {
+        return false;
+    }
     let mut difference = candidate.len() ^ secret.len();
-    for index in 0..MAX_CONTROLLER_SECRET_BYTES {
+    for index in 0..limit {
         let candidate = candidate.get(index).copied().unwrap_or_default();
         let secret = secret.get(index).copied().unwrap_or_default();
         difference |= usize::from(candidate ^ secret);
@@ -835,7 +869,6 @@ async fn write_response(
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
-        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
@@ -978,8 +1011,16 @@ mod tests {
         ));
         assert!(!controller_token_eq(b"toke", b"token"));
         assert!(!controller_token_eq(b"token-longer", b"token"));
-        let longest = vec![b'x'; MAX_CONTROLLER_SECRET_BYTES];
-        assert!(controller_token_eq(&longest, &longest));
+        let long_secret = "x".repeat(512);
+        assert!(authorized(
+            &[("Authorization".to_owned(), format!("Bearer {long_secret}"))],
+            Some(&long_secret),
+        ));
+        let mut different = long_secret.as_bytes().to_vec();
+        *different.last_mut().unwrap() = b'y';
+        assert!(!controller_token_eq(&different, long_secret.as_bytes()));
+        let oversized = vec![b'x'; crate::inbound::DEFAULT_HEADER_LIMIT + 1];
+        assert!(!controller_token_eq(&oversized, &oversized));
     }
 
     #[test]

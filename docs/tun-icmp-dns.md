@@ -166,8 +166,8 @@ Apple 使用宿主快照和 `IP_BOUND_IF`/`IPV6_BOUND_IF`；App 负责取得真�
 ## Fallback
 
 `fallback` 只作用于主 resolver 的 A/AAAA。先应用 nameserver-policy；命中的 policy
-独立查询自己的上游，不再进入 fallback。否则，`fallback-filter.domain` 的 Clash 通配或
-`geosite` 命中时直接查询 fallback，不启动主组。
+独立查询自己的上游，不再进入 fallback。否则，`fallback-filter.domain` 的 Clash 通配
+命中时直接查询 fallback，不启动主组。GeoSite 分流使用 `nameserver-policy` 配置。
 
 其余查询先取主组结果。主组失败、没有地址，或任一地址命中 `ipcidr` / GeoIP 条件时
 使用 fallback 的结果。`geoip` 默认 true、`geoip-code` 默认 CN：非本地且不属于该分类的

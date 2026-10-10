@@ -173,7 +173,7 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
         let config = stdin
             .map_or_else(|| read_config(&paths.config_file), Ok)
             .map_err(|e| io_failure("read configuration file", e))?;
-        validate_bytes(config)?;
+        validate_bytes(config, &paths.data_dir)?;
         return Ok(json!({"output":"configuration valid\n","diagnostics":""}));
     }
     let dispatch = tracing::Dispatch::new(StderrSubscriber::new());
@@ -200,9 +200,12 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
     })?;
     Ok(json!({"output":"","diagnostics":""}))
 }
-fn validate_bytes(bytes: Vec<u8>) -> Result<(), InvokeFailure> {
+fn validate_bytes(bytes: Vec<u8>, directory: &Path) -> Result<(), InvokeFailure> {
     let yaml = String::from_utf8(bytes).map_err(|_| failure("configuration is not UTF-8"))?;
-    super::validate_config(yaml).map_err(|_| failure("invalid configuration"))
+    let config = super::parse_config_yaml_with_directory(&yaml, Some(directory))
+        .map_err(|_| failure("invalid configuration"))?;
+    crate::runtime::PreparedCore::validate_config(config)
+        .map_err(|_| failure("invalid configuration"))
 }
 struct ForegroundInstance(Option<Arc<CoreController>>);
 impl ForegroundInstance {
@@ -804,6 +807,42 @@ mod tests {
         assert_eq!(execute(payload).unwrap()["output"], "configuration valid\n");
         assert!(!data.exists());
     }
+    #[test]
+    #[cfg(feature = "outbound-http")]
+    fn validation_resolves_identity_files_from_data_dir_without_initializing_it() {
+        use base64::Engine as _;
+        let pem = |kind: &str, der: &[u8]| {
+            format!(
+                "-----BEGIN {kind}-----\n{}\n-----END {kind}-----\n",
+                base64::engine::general_purpose::STANDARD.encode(der)
+            )
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("state");
+        fs::create_dir(&data).unwrap();
+        let identity = rcgen::generate_simple_self_signed(vec!["client.invalid".into()]).unwrap();
+        fs::write(
+            data.join("client.crt"),
+            pem("CERTIFICATE", identity.cert.der()),
+        )
+        .unwrap();
+        fs::write(
+            data.join("client.key"),
+            pem("PRIVATE KEY", &identity.signing_key.serialize_der()),
+        )
+        .unwrap();
+        let config = directory.path().join("config.yaml");
+        fs::write(&config, "proxies:\n  - name: edge\n    type: http\n    server: proxy.invalid\n    port: 443\n    tls: true\n    certificate: client.crt\n    private-key: client.key\n").unwrap();
+        let result = execute(ForegroundPayload {
+            action: ForegroundAction::Validate,
+            data_dir: Some(data.clone().into()),
+            config_path: Some(config.into()),
+        })
+        .unwrap();
+        assert_eq!(result["output"], "configuration valid\n");
+        assert!(!data.join("geodata").exists() && !data.join("configs").exists());
+    }
+
     #[test]
     fn validation_failures_do_not_echo_config_or_initialize_data() {
         let dir = tempfile::tempdir().unwrap();

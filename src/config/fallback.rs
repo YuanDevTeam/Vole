@@ -16,7 +16,6 @@ pub(super) struct RawFallbackFilter {
     geoip_code: String,
     ipcidr: Vec<String>,
     domain: Vec<String>,
-    geosite: Vec<String>,
 }
 impl Default for RawFallbackFilter {
     fn default() -> Self {
@@ -25,7 +24,6 @@ impl Default for RawFallbackFilter {
             geoip_code: "CN".into(),
             ipcidr: Vec::new(),
             domain: Vec::new(),
-            geosite: Vec::new(),
         }
     }
 }
@@ -42,11 +40,6 @@ impl RawFallbackFilter {
                 return invalid("fallback-filter.domain requires domain patterns");
             }
             domains.push(selector);
-        }
-        for code in self.geosite {
-            domains.push(DnsPolicySelector::GeoSite(
-                vec![normalize_geo_code(&code, "fallback-filter.geosite")?].into_boxed_slice(),
-            ));
         }
         Ok(DnsFallbackConfig {
             nameservers,

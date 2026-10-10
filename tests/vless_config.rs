@@ -88,6 +88,45 @@ fn default_tcp_and_three_udp_encodings_are_accepted_without_io() {
 }
 
 #[test]
+fn omitted_null_and_empty_flow_use_plain_grpc() {
+    use vole::config::{ProxyProtocol, StreamTransport, VlessTransport};
+    let mut documents = [json!({}), json!({"flow": null}), json!({"flow": ""})]
+        .into_iter()
+        .map(|mut fields| {
+            fields["network"] = json!("grpc");
+            fields["grpc-opts"] = json!({"grpc-service-name": "edge"});
+            document(fields)
+        })
+        .collect::<Vec<_>>();
+    documents.push(
+        br#"mixed-port: 1080
+proxies:
+  - name: edge
+    type: vless
+    server: example.com
+    port: 443
+    uuid: 07070707-0707-0707-0707-070707070707
+    flow:
+    network: grpc
+    grpc-opts: {grpc-service-name: edge}
+rules: ['MATCH,edge']
+"#
+        .to_vec(),
+    );
+    for yaml in documents {
+        let config = Config::parse_yaml(&yaml).unwrap();
+        let ProxyProtocol::Vless(node) = &config.proxies[0].protocol else {
+            unreachable!()
+        };
+        assert!(node.flow.is_empty());
+        assert!(matches!(
+            node.transport,
+            VlessTransport::Stream(StreamTransport::Grpc { .. })
+        ));
+    }
+}
+
+#[test]
 fn tcp_and_existing_xhttp_reject_mismatched_and_future_options() {
     #[cfg(feature = "interop-test")]
     let _case = vole::resources::case_events::Case::new(
@@ -102,6 +141,7 @@ fn tcp_and_existing_xhttp_reject_mismatched_and_future_options() {
         json!({"packet-encoding":""}),
         json!({"packet-encoding":"raw"}),
         json!({"flow":"invalid-flow"}),
+        json!({"flow":false}),
         json!({"encryption":"auto"}),
         json!({"future":true}),
     ] {
@@ -115,7 +155,6 @@ fn tcp_and_existing_xhttp_reject_mismatched_and_future_options() {
         "network",
         "tls",
         "udp",
-        "flow",
         "encryption",
         "packet-encoding",
         "servername",

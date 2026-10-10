@@ -23,7 +23,23 @@ struct RawMeasureConfig {
 
 impl MeasureConfig {
     pub(crate) fn parse_yaml(input: &[u8]) -> Result<Self> {
-        let yaml = super::yaml::parse(input)?;
+        Self::parse_yaml_with_directory(input, None)
+    }
+
+    pub(crate) fn parse_yaml_with_directory(
+        input: &[u8],
+        directory: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        let mut yaml = super::yaml::parse(input)?;
+        if let Some(nodes) = yaml
+            .get_mut("proxies")
+            .and_then(serde_yaml_ng::Value::as_sequence_mut)
+        {
+            let mut identities = super::identity_files::IdentityFiles::new(directory);
+            for node in nodes {
+                identities.inline_node(node)?;
+            }
+        }
         let raw: RawMeasureConfig = serde_yaml_ng::from_value(yaml)
             .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
         raw.normalize()

@@ -47,7 +47,7 @@ pub(super) struct RawVless {
     #[serde(default)]
     encryption: String,
     #[serde(default)]
-    flow: String,
+    flow: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     servername: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
@@ -165,11 +165,12 @@ impl RawVless {
             .as_deref()
             .filter(|network| !network.is_empty())
             .unwrap_or("tcp");
-        let vision = self.flow == "xtls-rprx-vision";
+        let flow = self.flow.unwrap_or_default();
+        let vision = flow == "xtls-rprx-vision";
         if self.jls_opts.is_some() && (vision || self.reality_opts.is_some()) {
             return invalid("JLS cannot be combined with REALITY or Vision");
         }
-        if (!self.flow.is_empty() && !vision)
+        if (!flow.is_empty() && !vision)
             || (vision
                 && (network != "tcp"
                     || (!self.tls && matches!(&encryption, VlessEncryption::None))
@@ -356,7 +357,7 @@ impl RawVless {
                 port: self.port,
                 id,
                 encryption,
-                flow: self.flow,
+                flow,
                 security,
                 transport,
                 packet_encoding: self.packet_encoding,

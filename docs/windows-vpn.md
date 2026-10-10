@@ -339,10 +339,10 @@ Stopped { version, packetCounters }
 
 ## Controller 与本地 SOCKS
 
-- Controller 由 Session Host 监听完全信任的回环地址；
+- Controller 由 Session Host 按 YAML 的 `external-controller` 地址监听；
 - `RuntimeReady` 前必须完成绑定，失败则连接失败；
 - 前台宿主持有配置中的端口和 secret，并调用 `GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 或 `PUT /proxies/{name}`；
-- 配置代理组与 Controller 时 secret 必填并保护全部路由；仅有 TUN 流量 Controller 时 secret 仍可省略；
+- `secret` 可省略或为空；配置非空 `secret` 时保护全部路由，与是否配置代理组无关；
 - 代理组选择属于 Session Host 中实际 Running Session 的内存状态，不经过 Windows bridge、Provider 控制管道或 Session Snapshot 写回；
 - 成功切换只影响之后新建的物理 TCP、UDP 和 DNS transport，不迁移既有连接、UDP association、DNS 状态或 TCP pool，也不执行自动 failover；
 - 宿主如需跨 VPN session 保留选择，必须自行持久化，并在下次 `startVpn` 的 YAML 中注入对应 `default-selected`；

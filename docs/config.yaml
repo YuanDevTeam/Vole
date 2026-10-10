@@ -7,6 +7,7 @@
 # 库宿主先通过 Invoke API 调用 initialize({dataDir})，再通过 configYaml 内联
 # 传入配置；CLI 使用 -f 指定文件，-d 指定数据目录，省略时读取数据目录下的 config.yaml。
 # GeoData 固定由 Vole 管理在 dataDir/geodata 中；CLI 的 -t 只校验，不创建目录或联网。
+# certificate/private-key 可为成对 PEM 或文件路径；相对路径从 dataDir 解析，校验时读取并验证。
 # 所有平台均不设 GeoData 条数上限，不按数量截断，也不设总内存预算；
 # 仅加载当前业务规则和 DNS policy 引用的分类/属性交集，详见 docs/geodata.md。
 
@@ -71,10 +72,9 @@ skip-auth-prefixes: [] # 仅跳过认证，仍执行来源访问控制
 authentication:
   - "probe-user:probe-password"
 
-# 可选的运行时 Controller，地址必须是回环 IP 和显式非零端口；合法 mixed-only
+# 可选的运行时 Controller，接受 IP:port、localhost:port 或 :port；端口 0 由系统分配。
 # 静态节点、纯 DIRECT 及未启用代理入口的配置也可使用。
-# 同时显式配置 proxy-groups 时 secret 必填；没有显式代理组时可省略。
-# secret 出现时必须为 1–255 UTF-8 字节，并作为全部 Controller 路由的 Bearer token。
+# secret 省略或空串时免认证；非空时保护全部 Controller 路由，不因代理组强制要求。
 # Controller 提供 GET /traffic、GET /group、GET /group/{name}、
 # GET /proxies/{name} 和 PUT /proxies/{name}；另含连接查询/关闭、有效配置、规则
 # 与 A/AAAA DNS 查询、节点/组 delay、Provider healthcheck、实际进程内存；
@@ -149,7 +149,7 @@ sniffer:
 #   TCP 支持明文或 TLS 1.2/1.3；XHTTP H1/H2 支持明文、TLS1.3 或 REALITY。
 # - encryption 省略/空/none，或 mlkem768x25519plus.{native,xorpub,random}.{1rtt,0rtt}.<key>…；
 #   key/padding 链、上限和恢复规则见 vless.md；该层独立于外层 TLS/传输。
-#   flow 省略/空/xtls-rprx-vision；Vision 仅 TCP + TLS1.3/REALITY 或 Encryption，
+#   flow 省略/null/空串/xtls-rprx-vision；Vision 仅 TCP + TLS1.3/REALITY 或 Encryption，
 #   packet-encoding 必须 xudp（即使 udp=false）；
 # - servername 可省略（WS Host 去端口后优先于 server）；TCP alpn 默认空，
 #   WS 默认 [http/1.1]，gRPC/H2 默认 [h2]；XHTTP [http/1.1] 选择 H1，
@@ -177,7 +177,7 @@ sniffer:
 #   同时关闭下载腿，不提供 TCP 半关闭后继续读取尾包的保证；packet-up 的待完成
 #   上传最多等待 1 秒。需要完整响应的应用须在关闭前读完响应。
 # - 标准 TLS 支持 skip-cert-verify/fingerprint/name-cert-verify，以及配对的
-#   内联 PEM certificate/private-key；不能混用 REALITY。完整策略见 vless.md。
+#   内联 PEM 或文件路径 certificate/private-key；不能混用 REALITY。完整策略见 vless.md。
 # - WS/gRPC/HTTP/H2 复用共享传输。WS 可 v2ray-http-upgrade 及其 fast-open；
 #   gRPC 与 Trojan/VMess 共用 UA、空闲 PING、max-connections/min-streams/max-streams 池阈值。
 # - 公共节点 smux 支持 h2mux/smux/yamux、padding/only-tcp 与池阈值；与 Vision 互斥。
@@ -200,7 +200,7 @@ sniffer:
 # HTTP(S) CONNECT 示例：type: http，必填 name/server/port，tls 默认 false。
 # username/password 均非空才认证；headers 为字符串映射；仅 TCP，不支持 udp: true。
 # tls: true 时支持 sni/skip-cert-verify/name-cert-verify/fingerprint，
-# 以及成对的内联 certificate/private-key。支持 dialer-proxy；详见 outbounds.md。
+# 以及成对的 certificate/private-key（PEM 或文件路径）。支持 dialer-proxy；详见 outbounds.md。
 proxies:
   # 标准 WireGuard：用户态内层 TCP/UDP，不创建系统接口/路由/NAT。
   # 密钥为公开测试值，不可用于真实连接。外层始终需要双向 UDP；业务 udp 默认 false。
@@ -219,7 +219,7 @@ proxies:
     mtu: 1408
     persistent-keepalive: 0 # uint16 秒；0 不定期保活
     allowed-ips: [] # 无 peers 时忽略；各本地地址族使用全地址路由
-    reserved: [] # 空或三个字节；peer 缺省继承顶层值
+    reserved: [] # 空、三字节数组或标准 Base64 字符串（如 "U4An"）；peer 缺省继承顶层值
     remote-dns-resolve: false # true 且 dns 非空时，业务域名通过本节点查询
     dns: [] # 支持 Core DNS 上游；上游域名仍由 Core 代理 DNS bootstrap
     refresh-server-ip-interval: 0 # 秒；0 不更新，新业务触发到期检查
@@ -263,7 +263,7 @@ proxies:
     skip-cert-verify: false
     # name-cert-verify: verified.example.com # 独立证书验证名，不改变 SNI
     # fingerprint: "<SHA-256 certificate pin, 64 hex digits>"
-    # certificate/private-key: 成对内联 PEM 客户端身份
+    # certificate/private-key: 成对内联 PEM 或文件路径 客户端身份
     udp: true
     up: 0 # 裸数单位 Mbps；0 自动，也可 "125 KBps"，b=bit/B=byte
     down: 0
@@ -280,7 +280,7 @@ proxies:
   # network 默认 tcp，支持 tcp/ws/grpc/http/h2。tls 默认 false；关闭时
   # 禁止 servername/alpn/fingerprint/skip-cert-verify 等 TLS 专属字段。
   # servername 优先显式值，其次 WS Host 去端口，否则 server。
-  # TLS 支持 name-cert-verify 和成对的内联 PEM certificate/private-key；
+  # TLS 支持 name-cert-verify 和成对的内联 PEM 或文件路径 certificate/private-key；
   # 验证名不改变 servername，客户端身份不增加服务端信任根。
   # ws-opts/grpc-opts 与下面 Trojan 的结构相同；HTTP/H2 选项见示例注释。
   # UDP 默认 false；packet-encoding 默认为空（raw），或 xudp/packetaddr。
@@ -319,7 +319,7 @@ proxies:
   # Stop / 取消仍关闭全部会话及自有 driver，不更改 XHTTP 的全关闭约定。
   # skip-cert-verify 默认 false；fingerprint 沿用 AnyTLS 的证书 SHA-256
   # pin 语义，pin 与 skip 同时存在仍必须匹配 pin。udp 默认 false。
-  # name-cert-verify 只改变证书验证名；certificate/private-key 为成对内联 PEM 客户端身份。
+  # name-cert-verify 只改变证书验证名；certificate/private-key 为成对内联 PEM 或文件路径 客户端身份。
   # UDP 在 TLS 流内传输；单包负载最多 8192 字节并与入口预算取较小值，
   # 不拆包或截断。域名地址保持域名交由服务端处理；Mihomo v1.19.31 的
   # Trojan listener 不接收域名 UDP 帧，使用该对端时需要 IP 业务目标。
@@ -370,7 +370,7 @@ proxies:
       path: /onev
       mode: auto
       headers: {X-Transport: edge}
-      # 以下范围均为字符串 N 或 N-M。所有请求字段与合法配套见 docs/xhttp.md。
+      # 范围用字符串 N 或 N-M；uplink-chunk-size/sc-max-each-post-bytes/sc-min-posts-interval-ms 也接受整数。
       x-padding-bytes: "100-1000"
       sc-max-each-post-bytes: "1000000" # packet-up，最多16MiB，非预分配大小
       sc-min-posts-interval-ms: "30"    # packet-up，0–60000且最大值为正
@@ -396,8 +396,8 @@ proxies:
         fingerprint: ""     # 清除继承的 pin
         client-fingerprint: "" # 清除继承的 ClientHello profile
         name-cert-verify: "" # 恢复下载认证名
-        # certificate: <inline PEM> # 与 private-key 成对；禁止文件路径
-        # private-key: <inline PEM>
+        # certificate: ./client.crt # 与 private-key 成对，或两者都使用内联 PEM
+        # private-key: ./client.key
         # reality-opts: {} # 清除继承的 REALITY；非空对象必须提供 public-key
         # jls-opts: {} # 清除继承的 JLS；非空对象必须提供 username/password
     smux:
@@ -427,7 +427,7 @@ proxies:
 
   # SOCKS5 出站支持 CONNECT 和 UDP ASSOCIATE。username/password 必须同时省略
   # 或同时出现；tls 默认 false，true 使用 server 作为 TLS 名称，不接受 sni/alpn/client-fingerprint。
-  # TLS 支持 skip-cert-verify/name-cert-verify/fingerprint 和成对内联 PEM certificate/private-key。
+  # TLS 支持 skip-cert-verify/name-cert-verify/fingerprint 和成对内联 PEM 或文件路径 certificate/private-key。
   # TLS 只保护 TCP 控制连接，UDP relay 数据不经 TLS；udp 控制 UDP ASSOCIATE。
   - name: socks-hop
     type: socks5
@@ -441,7 +441,7 @@ proxies:
   # sni 省略时使用 server。TLS 1.3/1.2 默认 WebPKI，alpn 省略/[] 时不发送。
   # skip-cert-verify 不能覆盖 fingerprint；pin 是证书 SHA-256，不是客户端伪造指纹。
   # 叶 pin 直接决定信任；非叶 pin 作为根继续验证链和名称。所有策略均验证握手签名。
-  # name-cert-verify 只改变证书验证名；certificate/private-key 为成对内联 PEM 客户端身份。
+  # name-cert-verify 只改变证书验证名；certificate/private-key 为成对内联 PEM 或文件路径 客户端身份。
   # 支持共享 client-fingerprint；不支持 REALITY、ECH 或 session/padding 调参字段，详见 outbounds.md#anytls。
   # TCP 使用 AnyTLS session；udp: true 使用 UoT v2 datagram mode。
   - name: anytls-edge
@@ -500,14 +500,14 @@ proxies:
 # 未显式定义 GLOBAL 时，自动追加一个 select 组；成员依次为 DIRECT、REJECT、
 # 所有节点和声明的组，默认 DIRECT。可显式声明 GLOBAL 覆盖其成员及初始选择。
 #
-# select 的 default-selected 省略时选中第一项；有效缓存选择优先。名称精确匹配。
+# select 的 default-selected 省略、空串或未命中时选中第一项；有效缓存选择优先。名称精确匹配。
 # url-test 按 URL 探测延迟选择，tolerance（毫秒，默认 0）抑制小幅切换；fallback
 # 按声明顺序选择首个健康成员，恢复后可回到前面的成员。全部失败时返回首成员。
 # 四种组均接受 url/interval/timeout/lazy/expected-status/max-failed-times。
 # url 缺省使用首个 provider 的健康 URL，否则 https://www.gstatic.com/generate_204。
 # interval 单位秒，自动组缺省/0 为 300；select 缺省 0，不主动周期探测。
 # timeout 单位毫秒，缺省/0 为 5000；lazy 默认 true，无近期使用时跳过周期探测。
-# expected-status 省略/空/* 接受所有最终 HTTP 状态，可用 200/204 或 200-299。
+# expected-status 省略/空/* 接受所有最终 HTTP 状态；单值可写整数 204 或字符串 "204"，区间用 "200-299"。
 # max-failed-times 缺省/0 为 5，建链失败达到阈值后触发探测，不重试同一次业务连接。
 # HTTP 探测结果不代表 UDP 可用性，业务 UDP 仍检查节点能力与 disable-udp。
 # Controller 可手动固定 url-test/fallback 成员，成员不可用时恢复自动选择。
@@ -626,7 +626,6 @@ dns:
     geoip-code: CN
     ipcidr: [] # 任意返回地址命中时使用 fallback
     domain: [] # Clash 域名通配，匹配后只查询 fallback
-    geosite: [] # 共用 GeoData，匹配后只查询 fallback
   enhanced-mode: redir-host # 或 fake-ip；内部节点/直连解析始终取得真实地址
   fake-ip-range: 198.18.0.1/16
   fake-ip-range6: "" # 设置 IPv6 CIDR 且启用 IPv6 后分配 AAAA
