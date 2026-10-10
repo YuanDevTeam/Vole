@@ -10,11 +10,14 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use frame::StreamMetaVec;
 
-use rand::{rngs::StdRng, RngExt, SeedableRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
+    Dir, Duration, EndpointConfig, Frame, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
+    MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
+    TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
@@ -32,9 +35,6 @@ use crate::{
     },
     token::{ResetToken, Token, TokenPayload},
     transport_parameters::TransportParameters,
-    Dir, Duration, EndpointConfig, Frame, Instant, Side, StreamId, TokenStore, Transmit,
-    TransportError, TransportErrorCode, VarInt, MAX_CID_SIZE, MAX_STREAM_COUNT, MIN_INITIAL_SIZE,
-    TIMER_GRANULARITY,
 };
 
 mod ack_frequency;
@@ -447,6 +447,7 @@ impl Connection {
     pub fn recv_stream_at(&mut self, id: StreamId, now: Instant) -> RecvStream<'_> {
         self.streams.receive_clock = (now, self.path.rtt.receive_credit_rtt());
         assert!(id.dir() == Dir::Bi || id.initiator() != self.side.side());
+        self.streams.materialize_remote(id);
         RecvStream {
             id,
             state: &mut self.streams,
@@ -458,6 +459,7 @@ impl Connection {
     #[must_use]
     pub fn send_stream(&mut self, id: StreamId) -> SendStream<'_> {
         assert!(id.dir() == Dir::Bi || id.initiator() == self.side.side());
+        self.streams.materialize_remote(id);
         SendStream {
             id,
             state: &mut self.streams,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map, BinaryHeap},
+    collections::{BinaryHeap, hash_map},
     io,
 };
 
@@ -9,8 +9,9 @@ use tracing::trace;
 
 use super::spaces::{Retransmits, ThinRetransmits};
 use crate::{
+    Dir, StreamId, VarInt,
     connection::streams::state::{get_or_insert_recv, get_or_insert_send},
-    frame, Dir, StreamId, VarInt,
+    frame,
 };
 
 mod recv;
@@ -69,12 +70,14 @@ impl<'a> Streams<'a> {
         }
 
         let x = self.state.next_reported_remote[dir as usize];
+        let id = StreamId::new(!self.state.side, dir, x);
+        self.state.materialize_remote(id);
         self.state.next_reported_remote[dir as usize] = x + 1;
         if dir == Dir::Bi {
             self.state.send_streams += 1;
         }
 
-        Some(StreamId::new(!self.state.side, dir, x))
+        Some(id)
     }
 
     #[cfg(fuzzing)]
@@ -208,6 +211,7 @@ impl<'a> SendStream<'a> {
         pending: &'a mut Retransmits,
         conn_state: &'a super::State,
     ) -> Self {
+        state.materialize_remote(id);
         Self {
             id,
             state,

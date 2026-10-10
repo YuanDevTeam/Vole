@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map, VecDeque},
+    collections::{VecDeque, hash_map},
     convert::TryFrom,
     mem,
 };
@@ -13,11 +13,12 @@ use super::{
     StreamHalf, ThinRetransmits,
 };
 use crate::{
+    Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     coding::BufMutExt,
     connection::stats::FrameStats,
     frame::{self, FrameStruct, StreamMetaVec},
+    range_set::RangeSet,
     transport_parameters::TransportParameters,
-    Dir, Side, StreamId, TransportError, VarInt, MAX_STREAM_COUNT,
 };
 
 /// Wrapper around `Recv` that facilitates reusing `Recv` instances
@@ -68,10 +69,13 @@ impl StreamRecv {
 #[allow(unreachable_pub)] // fuzzing only
 pub struct StreamsState {
     pub(super) side: Side,
-    // Set of streams that are currently open, or could be immediately opened by the peer
+    // Materialized streams, including permitted remote streams first accessed by the application
     pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
     pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
     pub(super) free_recv: Vec<StreamRecv>,
+    /// Permitted remote IDs whose two halves have never been materialized.
+    /// A removed ID is never restored here, so absent closed halves stay closed.
+    unmaterialized_remote: [RangeSet; 2],
     pub(super) next: [u64; 2],
     /// Maximum number of locally-initiated streams that may be opened over the lifetime of the
     /// connection so far, per direction
@@ -161,6 +165,7 @@ impl StreamsState {
             send: FxHashMap::default(),
             recv: FxHashMap::default(),
             free_recv: Vec::new(),
+            unmaterialized_remote: [RangeSet::new(), RangeSet::new()],
             next: [0, 0],
             max: [0, 0],
             max_remote: [max_remote_bi.into(), max_remote_uni.into()],
@@ -198,9 +203,7 @@ impl StreamsState {
         };
 
         for dir in Dir::iter() {
-            for i in 0..this.max_remote[dir as usize] {
-                this.insert(true, StreamId::new(!side, dir, i));
-            }
+            this.unmaterialized_remote[dir as usize].insert(0..this.max_remote[dir as usize]);
         }
 
         this
@@ -213,25 +216,27 @@ impl StreamsState {
         self.max[Dir::Bi as usize] = params.initial_max_streams_bidi.into();
         self.max[Dir::Uni as usize] = params.initial_max_streams_uni.into();
         self.received_max_data(params.initial_max_data);
-        for i in 0..self.max_remote[Dir::Bi as usize] {
-            let id = StreamId::new(!self.side, Dir::Bi, i);
-            if let Some(s) = self.send.get_mut(&id).and_then(|s| s.as_mut()) {
-                s.max_data = params.initial_max_stream_data_bidi_local.into();
-            }
+        for send in self
+            .send
+            .iter_mut()
+            .filter(|(id, _)| id.initiator() != self.side && id.dir() == Dir::Bi)
+            .filter_map(|(_, send)| send.as_mut())
+        {
+            send.max_data = params.initial_max_stream_data_bidi_local.into();
         }
     }
 
     /// Ensure we have space for at least a full flow control window of remotely-initiated streams
     /// to be open, and notify the peer if the window has moved
     fn ensure_remote_streams(&mut self, dir: Dir) {
-        let new_count = self.max_concurrent_remote_count[dir as usize]
-            .saturating_sub(self.allocated_remote_count[dir as usize]);
-        for i in 0..new_count {
-            let id = StreamId::new(!self.side, dir, self.max_remote[dir as usize] + i);
-            self.insert(true, id);
-        }
-        self.allocated_remote_count[dir as usize] += new_count;
-        self.max_remote[dir as usize] += new_count;
+        let index = dir as usize;
+        let old_limit = self.max_remote[index];
+        let new_count = self.max_concurrent_remote_count[index]
+            .saturating_sub(self.allocated_remote_count[index])
+            .min(MAX_STREAM_COUNT.saturating_sub(old_limit));
+        self.unmaterialized_remote[index].insert(old_limit..old_limit + new_count);
+        self.allocated_remote_count[index] += new_count;
+        self.max_remote[index] += new_count;
     }
 
     pub(crate) fn zero_rtt_rejected(&mut self) {
@@ -275,6 +280,7 @@ impl StreamsState {
         self.validate_receive_id(id).inspect_err(|_e| {
             debug!("received illegal STREAM frame");
         })?;
+        self.materialize_remote(id);
 
         let rs = match self
             .recv
@@ -338,6 +344,7 @@ impl StreamsState {
         self.validate_receive_id(id).inspect_err(|_e| {
             debug!("received illegal RESET_STREAM frame");
         })?;
+        self.materialize_remote(id);
 
         let rs = match self
             .recv
@@ -388,6 +395,9 @@ impl StreamsState {
     /// Process incoming `STOP_SENDING` frame
     #[allow(unreachable_pub)] // fuzzing only
     pub fn received_stop_sending(&mut self, id: StreamId, error_code: VarInt) {
+        if id.dir() == Dir::Bi {
+            self.materialize_remote(id);
+        }
         let max_send_data = self.max_send_data(id);
         let stream = match self
             .send
@@ -828,6 +838,7 @@ impl StreamsState {
             })?;
         }
 
+        self.materialize_remote(id);
         let write_limit = self.write_limit();
         let max_send_data = self.max_send_data(id);
         if let Some(ss) = self
@@ -973,6 +984,19 @@ impl StreamsState {
         expanded
     }
 
+    /// Materialize just this permitted remote stream, never an intervening range.
+    /// Creating both halves together lets map absence retain its closed-half meaning.
+    pub(crate) fn materialize_remote(&mut self, id: StreamId) {
+        if id.initiator() == self.side || self.recv.contains_key(&id) || self.send.contains_key(&id)
+        {
+            return;
+        }
+        let index = id.index();
+        if self.unmaterialized_remote[id.dir() as usize].remove(index..index + 1) {
+            self.insert(true, id);
+        }
+    }
+
     pub(super) fn insert(&mut self, remote: bool, id: StreamId) {
         let bi = id.dir() == Dir::Bi;
         // bidirectional OR (unidirectional AND NOT remote)
@@ -1101,8 +1125,8 @@ pub(super) fn get_or_insert_recv(
 mod tests {
     use super::*;
     use crate::{
-        connection::State as ConnState, connection::Streams, ReadableError, RecvStream, SendStream,
-        TransportErrorCode, WriteError,
+        ReadableError, RecvStream, SendStream, TransportErrorCode, WriteError,
+        connection::State as ConnState, connection::Streams,
     };
     use bytes::Bytes;
 
@@ -2295,9 +2319,12 @@ mod tests {
         for _ in 0..2 {
             client.set_max_concurrent(Dir::Uni, 200u32.into());
             client.set_max_concurrent(Dir::Bi, 201u32.into());
-            assert_eq!(client.recv.len(), 200 + 201);
+            assert!(client.recv.is_empty());
+            assert!(client.send.is_empty());
             assert_eq!(client.max_remote[Dir::Uni as usize], 200);
             assert_eq!(client.max_remote[Dir::Bi as usize], 201);
+            assert_eq!(client.max_concurrent(Dir::Uni), 200);
+            assert_eq!(client.max_concurrent(Dir::Bi), 201);
         }
     }
 
@@ -2538,3 +2565,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "lazy_tests.rs"]
+mod lazy_tests;

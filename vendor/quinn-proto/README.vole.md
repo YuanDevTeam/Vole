@@ -18,10 +18,18 @@ This does not select its default TLS provider/features for production.
 
 Local changes are limited to `src/config/transport.rs`, `src/transport_parameters.rs`,
 `src/connection/{mod.rs,datagrams.rs,paths.rs,stats.rs}`, `src/connection/streams/{mod.rs,state.rs,recv.rs}`,
-`src/frame.rs`, and new `src/connection/streams/receive_window.rs`. They add optional initial/max
+`src/frame.rs`, and new `src/connection/streams/{receive_window.rs,lazy_tests.rs}`. They add optional initial/max
 receive-credit policies, application-consumption and smoothed-RTT driven growth, real credit frames,
 and an independent complete DATAGRAM frame limit. Existing fixed-window methods preserve their
-behavior. Tests marked `vole_` are deterministic native state/wire fixtures, not host network tests.
+behavior. Permitted remote stream IDs are stored as compact ranges until first
+frame/application access; implicitly opened gaps are materialized one stream at
+a time when accepted. Both halves of a bidirectional stream are created together,
+so late frames cannot reopen a discarded half. Initial permission and credit
+growth do not preallocate per-stream map entries, and parameter updates visit
+only materialized send halves. Stream credit never exceeds the QUIC lifetime
+representation of 2^60 streams. Actual active streams and sparse permission gaps
+still require memory; this does not impose a new user configuration cap.
+Tests marked `vole_` are deterministic native state/wire fixtures, not host network tests.
 No Mihomo or quic-go function implementation is copied or translated into this source.
 
 Protocol/consumer behavior was independently checked against RFC 9000/RFC 9221 and the fixed
