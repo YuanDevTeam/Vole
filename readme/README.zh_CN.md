@@ -33,7 +33,7 @@ Vole 是用于 VPN 客户端和本地代理的 Rust 代理内核，提供原生�
 | [SOCKS5](../docs/outbounds.md#socks5) | CONNECT 和 UDP ASSOCIATE，可选用户名/密码认证 |
 | [Hysteria2](../docs/outbounds.md#hysteria2) | QUIC TCP/UDP、带宽控制、Salamander、端口跳跃和 mTLS |
 | [TUIC v5](../docs/outbounds.md#tuic-v5) | QUIC TCP/UDP、native/quic UDP 转发模式，以及可选的拥塞控制算法 |
-| [WireGuard](../docs/outbounds.md#wireguard) | 标准 WireGuard TCP/UDP，使用用户态 IP 栈 |
+| [WireGuard](../docs/outbounds.md#wireguard) | 标准 WireGuard TCP/UDP、多 peer 与节点 DNS，使用用户态 IP 栈 |
 
 标准 TLS 连接支持证书验证与 SHA-256 证书固定。适用的 TCP TLS 路径可使用 Chrome、Firefox 或 Safari ClientHello 模板；`client-fingerprint` 与证书 `fingerprint` 相互独立。准确的名称和支持组合见 [TLS 配置与证书策略](../docs/tls-client-fingerprint.md)。这些功能不保证与浏览器不可区分，也不支持任意协议组合。
 

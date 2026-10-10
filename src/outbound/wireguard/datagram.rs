@@ -4,7 +4,7 @@ use crate::{
     dns::resolution::ResolutionContext,
     outbound::DEFAULT_ESTABLISH_TIMEOUT,
     resources::observation::{self, ResourceKind},
-    session::{Datagram, Destination},
+    session::{Datagram, DatagramSession, Destination},
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -130,6 +130,7 @@ pub(super) struct Datagrams {
     slot: Option<Arc<Slot>>,
     receiver: mpsc::Receiver<Datagram>,
     resolution: ResolutionContext,
+    session: DatagramSession,
     budget: DatagramBudget,
     frame: Vec<u8>,
 }
@@ -138,6 +139,7 @@ impl Datagrams {
         engine: Arc<Engine>,
         request: DatagramBudget,
         resolution: ResolutionContext,
+        session: DatagramSession,
     ) -> Result<Self, DispatchError> {
         let overhead = if engine.ipv6.is_some() { 48 } else { 28 };
         let maximum = (engine.mtu - overhead) as u16;
@@ -152,6 +154,7 @@ impl Datagrams {
             slot: Some(slot),
             receiver,
             resolution,
+            session,
             budget,
             frame: Vec::with_capacity(mtu),
         })
@@ -176,7 +179,19 @@ impl DatagramTransport for Datagrams {
             ));
         }
         let deadline = Instant::now() + DEFAULT_ESTABLISH_TIMEOUT;
-        let destination = tokio::select! {biased;()=self.engine.cancel.cancelled()=>return Err(DispatchError::ConnectionRefused),result=self.resolution.resolve_local_family(&datagram.remote,deadline,self.engine.ipv4.is_some(),self.engine.ipv6.is_some())=>result?};
+        let destination =
+            super::resolver::resolve(&self.engine, &datagram.remote, &self.resolution, deadline)
+                .await?;
+        let context = crate::outbound::EstablishContext::with_resolution(
+            DEFAULT_ESTABLISH_TIMEOUT,
+            self.resolution.clone(),
+        )
+        .with_metadata(&self.session.metadata)
+        .capped_by(deadline);
+        let channel = self
+            .engine
+            .peer(destination.ip(), self.session.clone(), &context)
+            .await?;
         let source = SocketAddr::new(self.engine.local(destination.ip())?, port);
         encode_udp_packet_into(
             &UdpDatagram::new(source, destination, datagram.payload),
@@ -187,7 +202,7 @@ impl DatagramTransport for Datagrams {
         let packet = Packet::new(Bytes::copy_from_slice(&self.frame));
         tokio::select! {biased;
             ()=self.engine.cancel.cancelled()=>Err(DispatchError::ConnectionRefused),
-            result=tokio::time::timeout_at(deadline,self.engine.tx.send(packet))=>result.map_err(|_|DispatchError::TimedOut)?.map_err(|_|DispatchError::ConnectionRefused),
+            result=tokio::time::timeout_at(deadline,channel.tx.send(packet))=>result.map_err(|_|DispatchError::TimedOut)?.map_err(|_|DispatchError::ConnectionRefused),
         }
     }
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {

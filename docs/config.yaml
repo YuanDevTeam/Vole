@@ -202,7 +202,7 @@ sniffer:
 # tls: true 时支持 sni/skip-cert-verify/name-cert-verify/fingerprint，
 # 以及成对的内联 certificate/private-key。支持 dialer-proxy；详见 outbounds.md。
 proxies:
-  # 标准 WireGuard 单 peer：用户态内层 TCP/UDP，不创建系统接口/路由/NAT。
+  # 标准 WireGuard：用户态内层 TCP/UDP，不创建系统接口/路由/NAT。
   # 密钥为公开测试值，不可用于真实连接。外层始终需要双向 UDP；业务 udp 默认 false。
   # ip/ipv6 接受 IP 或 CIDR，按实际地址族选择，每族最多一个；至少配置一个。
   # MTU 缺省/0 为 1408，范围 1280–65503；实际上游双向预算须至少 MTU+32。
@@ -218,7 +218,18 @@ proxies:
     # pre-shared-key: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM="
     mtu: 1408
     persistent-keepalive: 0 # uint16 秒；0 不定期保活
-    allowed-ips: [] # 单 peer 忽略；当前不接受 peers 等扩展字段
+    allowed-ips: [] # 无 peers 时忽略；各本地地址族使用全地址路由
+    reserved: [] # 空或三个字节；peer 缺省继承顶层值
+    remote-dns-resolve: false # true 且 dns 非空时，业务域名通过本节点查询
+    dns: [] # 支持 Core DNS 上游；上游域名仍由 Core 代理 DNS bootstrap
+    refresh-server-ip-interval: 0 # 秒；0 不更新，新业务触发到期检查
+    # peers 非空时忽略顶层 server/port/public-key；每项 allowed-ips 必须非空。
+    # peers:
+    #   - server: wireguard.example.com
+    #     port: 51820
+    #     public-key: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+    #     allowed-ips: ["0.0.0.0/0"]
+    #     reserved: [0, 0, 0]
     udp: true
     # dialer-proxy: upstream-select # 上游必须提供足够的双向 UDP 预算
 

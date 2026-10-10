@@ -100,6 +100,7 @@ pub struct RuntimeDns {
     fake_filter: super::fake_ip::Filter,
     fake_pools: Option<Arc<super::fake_ip::FakePools>>,
     bootstrap: Option<Arc<RuntimeDns>>,
+    node_bootstrap: Option<super::resolution::ResolutionContext>,
     proxy_resolver: Option<Arc<RuntimeDns>>,
     direct_resolver: Option<Arc<RuntimeDns>>,
     nameserver_policies: Box<[DnsNameserverPolicy]>,
@@ -962,6 +963,34 @@ impl RuntimeDns {
         Self::new_with_geo_matcher(config, dispatcher, Arc::new(EmptyGeoMatcher))
     }
 
+    /// A raw-IP node's private resolver uses its own data plane, while DNS
+    /// server domains bootstrap through the Core's original proxy DNS role.
+    #[cfg(feature = "outbound-wireguard")]
+    pub(crate) fn new_for_node(
+        config: &DnsConfig,
+        dispatcher: Arc<dyn Dispatcher>,
+        bootstrap: super::resolution::ResolutionContext,
+    ) -> Self {
+        let mut resolver = Self::assemble_leaf(
+            config,
+            DnsEgress::Single(dispatcher),
+            Arc::new(EmptyGeoMatcher),
+            config.cache_max_size,
+            0,
+            Arc::new(RwLock::new(0)),
+        );
+        resolver.node_bootstrap = Some(bootstrap);
+        // No idle background reaper belongs to this private node resolver.
+        // Queries remain caller-owned; the raw-IP engine owns transport stop.
+        let pool = Arc::get_mut(&mut resolver.tcp_pool).expect("fresh node DNS pool");
+        pool.max_idle = 0;
+        pool.max_idle_per_key = 0;
+        let stats = Arc::get_mut(&mut pool.stats).expect("fresh node DNS counters");
+        stats.idle_limit = 0;
+        stats.idle_per_key_limit = 0;
+        resolver
+    }
+
     /// Creates a single-egress resolver with an explicit GeoData matcher.
     /// This is useful to embedders that need nameserver-policy without the
     /// built-in DIRECT/proxy dispatcher registry.
@@ -1142,6 +1171,7 @@ impl RuntimeDns {
             fake_filter: super::fake_ip::Filter::new(&config.fake_ip),
             fake_pools: None,
             bootstrap: None,
+            node_bootstrap: None,
             proxy_resolver: None,
             direct_resolver: None,
             nameservers: config.nameservers.clone().into_boxed_slice(),
@@ -1428,16 +1458,33 @@ impl RuntimeDns {
             DnsAddress::Source(_) => return Err(AttemptError::Io(super::source::unavailable())),
             DnsAddress::Domain(host) => {
                 super::trace::record("bootstrap");
-                let resolver = self
-                    .bootstrap
-                    .as_ref()
-                    .ok_or_else(|| io::Error::other("DNS bootstrap is unavailable"))?;
-                Box::pin(resolver.resolve(host))
-                    .await
-                    .map_err(|_| io::Error::other("DNS bootstrap failed"))?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| io::Error::other("DNS bootstrap returned no address"))?
+                if let Some(context) = &self.node_bootstrap {
+                    let destination = Destination::domain(host.clone(), nameserver.port)?;
+                    context
+                        .resolve_proxy(
+                            &destination,
+                            super::resolution::inherited_deadline(
+                                TokioInstant::now() + QUERY_TIMEOUT,
+                            ),
+                        )
+                        .await?
+                        .addresses
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| io::Error::other("DNS bootstrap returned no address"))?
+                        .ip()
+                } else {
+                    let resolver = self
+                        .bootstrap
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("DNS bootstrap is unavailable"))?;
+                    Box::pin(resolver.resolve(host))
+                        .await
+                        .map_err(|_| io::Error::other("DNS bootstrap failed"))?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| io::Error::other("DNS bootstrap returned no address"))?
+                }
             }
         };
         Ok(ResolvedNameserver {

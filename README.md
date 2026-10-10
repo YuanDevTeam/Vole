@@ -33,7 +33,7 @@ All ten protocols below are enabled in the default build. HTTP CONNECT itself is
 | [SOCKS5](docs/outbounds.md#socks5) | CONNECT and UDP ASSOCIATE, with optional username/password authentication |
 | [Hysteria2](docs/outbounds.md#hysteria2) | QUIC TCP/UDP, bandwidth control, Salamander, port hopping and mTLS |
 | [TUIC v5](docs/outbounds.md#tuic-v5) | QUIC TCP/UDP, native/quic UDP relay modes and selectable congestion control |
-| [WireGuard](docs/outbounds.md#wireguard) | TCP/UDP over standard WireGuard, with a user-space IP stack |
+| [WireGuard](docs/outbounds.md#wireguard) | TCP/UDP over standard WireGuard, multiple peers and node DNS, with a user-space IP stack |
 
 The shared [sing-mux wrapper](docs/xhttp.md#通用-sing-mux) supports all enabled node protocols. It provides TCP and, with `only-tcp: false`, UDP over the node's ordinary TCP path. The peer must provide sing-mux decoding; a normal HTTP/SOCKS5 listener does not automatically decode it.
 

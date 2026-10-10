@@ -320,29 +320,44 @@ MTU1500 大包夹具显式启用官方双向 IP 分片。自有 1/2 层身份中
 
 `type: wireguard` 使用官方 boringtun 的标准 Noise 协议和用户态 IP 栈。
 `outbound-wireguard` 可独立启用，不依赖 TUN；不创建系统接口、路由或 NAT。
-单 peer 必填 server/port、private-key/public-key，ip/ipv6 至少提供一个本地地址；
-地址接受 IP 或 CIDR，保留主机地址，每族最多一个。pre-shared-key 可选。
-密钥必须是解码后 32 字节的标准 Base64，保存时清零回收且 Debug/错误不暴露密钥。
+private-key 必填，ip/ipv6 至少提供一个本地地址；地址接受 IP 或 CIDR，保留主机地址，
+每族最多一个。密钥必须是解码后 32 字节的标准 Base64，保存时清零回收，Debug/错误不暴露密钥。
 
-MTU 省略/0 为 1408，范围 1280–65503；外层实际双向 UDP 预算必须至少为 MTU+32，
-不足时关闭上游，不静默缩小 MTU。udp 缺省 false，只控制业务 UDP，外层始终需要
-双向数据报能力。persistent-keepalive 为 uint16 秒，0 关闭定期保活。
-与固定 Mihomo 参考一致，无 peers 时顶层 allowed-ips 接受但不参与选择：
-本地配置的地址族使用全地址路由。当前不接受 peers、reserved、remote-dns-resolve、
-dns、refresh-server-ip-interval、Amnezia 或系统接口模式字段。
+未配置 peers 时，server/port/public-key 必填，pre-shared-key 可选；顶层 allowed-ips
+与 Mihomo 一致地忽略，每个本地地址族使用全地址路由。有 peers 时，顶层端点与公钥
+不参与选择，每个 peer 必须提供 server/port/public-key 与非空 allowed-ips CIDR 列表。
+发送目的地址与解密包的来源地址使用同一不可变最长前缀表；相同前缀最后声明的 peer
+优先。同一公钥的重复声明更新端点，保留未覆盖的 PSK，并追加允许前缀。
 
-每节点、资源代际按需拥有一套 TCP 栈与 peer 驱动，内层 UDP 使用真实临时端口。
-外层经过共享 Dialer/UpstreamPath，节点端点由代理 DNS 角色解析并固定在物理会话；
-旧会话保留建链组快照与已认证入站身份。业务域名用受控本地 DNS，并在配置的本地
-地址族中选择；遵循节点 ip-version、全局 IPv6 开关与原建链期限，不在失败时回落 DIRECT。
-真实握手完成才交付业务流；握手重试和后续保活使用官方协议定时器。
+reserved 缺省为空（全零），否则必须为三个字节。peer 缺省继承顶层值；发送时写入
+WireGuard 消息头的保留字节，接收时清零后验证 Noise。MTU 省略/0 为 1408，范围
+1280–65503；外层实际双向 UDP 预算必须至少为 MTU+32，不足时关闭上游，不静默缩小。
+udp 缺省 false，只控制业务 UDP；外层始终需要双向数据报。persistent-keepalive 为
+uint16 秒，0 关闭定期保活。当前不接受 Amnezia、workers、ip-stack 或系统接口模式字段。
 
-每节点 raw 包队列和 peer 发送队列各 32 项；每 UDP 关联响应队列 64 项。
-UDP 负载上限为 MTU 减本地 IP/UDP 头，再与调用方收发预算分别取交集；
-双栈节点保守按 48 字节扣除，只有 IPv4 时扣 28 字节。满队列丢当前包，
-TCP 依赖重传。解密后校验本地目的地址、来源地址族和关联端口，不交付陌生数据。
-这些是局部结构边界，不是业务连接总数限制。
+每节点、资源代际按需拥有一套 TCP 栈；每个实际使用的 peer 独立拥有 Noise、外层会话
+和驱动，未使用的 peer 不启动网络任务。内层 UDP 使用真实临时端口。外层经过共享
+Dialer/UpstreamPath，节点端点由 Core 代理 DNS 角色解析；旧会话保留建链组快照与已认证
+入站身份。真实握手完成才交付业务流，握手重试与保活使用官方定时器；一个 peer
+失败不会关闭其他 peer 或整个共享栈，后续新业务可重建失败会话，不重放旧业务。
 
-握手、收发与重试均可取消；peer/栈任务由节点持有，调用方 future 丢弃不会丢失
-任务所有权。Stop 关闭新准入、取消并等待驱动、关闭上游（最多一秒），随后等待
-用户态栈退出。失败物理会话只由新业务重建，不重放已发送的业务。
+remote-dns-resolve 默认 false；只有 true 且 dns 非空时，业务域名使用节点私有 DNS，
+查询经过该 WireGuard 节点的内层 TCP/UDP。dns 支持 Core 的 UDP/TCP/DoT/DoH/RCODE
+上游；`#route` 不改变这个固定出口。DNS 上游域名仍由 Core 的代理 DNS 角色 bootstrap，
+不通过节点私有解析器解析自身端点。私有缓存有界，查询由调用方持有，不保留空闲 TCP
+连接或独立后台清理任务。关闭该开关或 dns 为空时使用受控本地 DNS；两种路径都遵循
+节点 ip-version、全局 IPv6 开关、本地地址族与原建链期限，失败不回落 DIRECT。
+
+refresh-server-ip-interval 默认 0，关闭更新；非零值以秒计，新业务在间隔到期后触发
+所有已建立 peer 的端点重新解析，负值每次检查均到期。不创建额外周期任务。IP 不变时保留物理会话；
+变化时保留共享栈、TCP 状态和 UDP 端口，替换外层会话并重新握手。解析或新上游配置失败
+保留原端点，下次业务重试。
+
+节点 raw 包队列和各 peer 发送队列各 32 项；每 UDP 关联响应队列 64 项。UDP 负载上限
+为 MTU 减本地 IP/UDP 头，再与调用方收发预算分别取交集；双栈保守扣 48 字节，IPv4
+扣 28 字节。满队列丢当前包，TCP 依赖重传。解密后校验本地目的地址、来源地址族、
+最长前缀所属 peer 和关联端口；这些是局部结构边界，不是业务连接总数限制。
+
+握手、收发、更新与重试均可取消；驱动由节点持有，调用方 future 丢弃不会丢失任务
+所有权。Stop 关闭新准入，取消并等待所有 peer 与退役驱动，关闭各上游（分别最多一秒），
+随后等待用户态栈退出；私有 DNS 使用弱节点引用，不延长节点生命周期。

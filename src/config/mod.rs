@@ -51,7 +51,7 @@ pub use ech::StaticEchConfig;
 mod hysteria2;
 pub use hysteria2::{Hysteria2Hopping, Hysteria2OutboundConfig};
 mod wireguard;
-pub use wireguard::{WireGuardKey, WireGuardOutboundConfig};
+pub use wireguard::{WireGuardKey, WireGuardOutboundConfig, WireGuardPeerConfig};
 mod tuic;
 pub use tuic::{TuicCongestion, TuicOutboundConfig, TuicUdpMode};
 mod jls;

@@ -1,58 +1,54 @@
-use super::{datagram::Registry, peer};
+use super::{channel::Channel, datagram::Registry, peer, routes::Routes};
 use crate::{
     config::WireGuardOutboundConfig,
     dispatch::DispatchError,
+    dns::resolution::ResolutionContext,
     outbound::{EstablishContext, UpstreamPath},
     resources::observation,
-    session::{DatagramSession, Destination},
+    session::DatagramSession,
 };
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
-use tokio::{
-    sync::{Mutex as AsyncMutex, mpsc, watch},
-    task::JoinHandle,
-};
-use tokio_util::sync::CancellationToken;
+use tokio::{sync::Mutex as AsyncMutex, task::JoinHandle};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use vole_netstack::{
-    ClientAddresses, ClientNetStackParts, NetStack, NetStackConfig, NetStackControl, Packet,
+    ClientAddresses, ClientNetStackParts, NetStack, NetStackConfig, NetStackControl, PacketSink,
     PacketStream, TcpConnector,
 };
-
-#[derive(Clone, Copy)]
-pub(super) enum Ready {
-    Waiting,
-    Established,
-    Failed,
+#[derive(Default)]
+struct PeerSlot {
+    gate: AsyncMutex<()>,
+    current: Mutex<Option<Arc<Channel>>>,
 }
-
 pub(super) struct Engine {
     pub cancel: CancellationToken,
     pub tcp: TcpConnector,
     pub registry: Arc<Registry>,
-    pub tx: mpsc::Sender<Packet>,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
     pub mtu: usize,
-    ready: watch::Receiver<Ready>,
+    pub resolution: ResolutionContext,
+    pub remote: OnceLock<crate::dns::runtime::RuntimeDns>,
+    pub config: Arc<WireGuardOutboundConfig>,
+    routes: Arc<Routes>,
+    upstream: UpstreamPath,
+    slots: Arc<[PeerSlot]>,
+    sink: PacketSink,
     control: NetStackControl,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    router: Mutex<Option<JoinHandle<()>>>,
+    retired: TaskTracker,
+    admission: Mutex<()>,
     stop: AsyncMutex<()>,
 }
 impl Engine {
     pub fn start(
         config: Arc<WireGuardOutboundConfig>,
-        server: Destination,
         upstream: UpstreamPath,
-        session: DatagramSession,
         context: EstablishContext,
         cancel: CancellationToken,
     ) -> Result<Arc<Self>, DispatchError> {
-        let addresses = ClientAddresses {
-            ipv4: config.ipv4,
-            ipv6: config.ipv6,
-        };
         let ClientNetStackParts {
             packet_sink,
             packet_stream,
@@ -65,39 +61,42 @@ impl Engine {
                 packet_queue: 32,
                 ..Default::default()
             },
-            addresses,
+            ClientAddresses {
+                ipv4: config.ipv4,
+                ipv6: config.ipv6,
+            },
         )
         .map_err(|_| DispatchError::Other("WireGuard stack initialization failed".into()))?;
-        let (tx, rx) = mpsc::channel(32);
-        let (ready, state) = watch::channel(Ready::Waiting);
-        let registry = Arc::new(Registry::default());
+        let routes = Arc::new(Routes::new(&config));
+        let slots: Arc<[PeerSlot]> = (0..config.peers.len())
+            .map(|_| PeerSlot::default())
+            .collect();
         let engine = Arc::new(Self {
             cancel: cancel.clone(),
             tcp: tcp_connector,
-            registry: registry.clone(),
-            tx: tx.clone(),
+            registry: Arc::new(Registry::default()),
             ipv4: config.ipv4,
             ipv6: config.ipv6,
             mtu: usize::from(config.mtu),
-            ready: state,
+            resolution: context.resolution(),
+            remote: OnceLock::new(),
+            config,
+            routes: routes.clone(),
+            upstream,
+            slots: slots.clone(),
+            sink: packet_sink,
             control,
-            tasks: Mutex::new(Vec::new()),
+            router: Mutex::new(None),
+            retired: TaskTracker::new(),
+            admission: Mutex::new(()),
             stop: AsyncMutex::new(()),
         });
-        let router = observation::spawn(pump_output(packet_stream, tx, cancel.clone()));
-        let peer = observation::spawn(peer::drive(
-            config,
-            server,
-            upstream,
-            session,
-            context,
+        *engine.router.lock().unwrap() = Some(observation::spawn(pump_output(
+            packet_stream,
+            slots,
+            routes,
             cancel,
-            rx,
-            ready,
-            packet_sink,
-            registry,
-        ));
-        *engine.tasks.lock().unwrap() = vec![router, peer];
+        )));
         Ok(engine)
     }
     pub fn local(&self, ip: IpAddr) -> Result<IpAddr, DispatchError> {
@@ -107,21 +106,77 @@ impl Engine {
         }
         .ok_or(DispatchError::HostUnreachable)
     }
-    pub async fn wait_ready(&self, context: &EstablishContext) -> Result<(), DispatchError> {
-        let mut ready = self.ready.clone();
-        context.run("WireGuard handshake",async {
-            loop {
-                match *ready.borrow_and_update() {Ready::Established=>return Ok(()),Ready::Failed=>return Err(DispatchError::ConnectionRefused),Ready::Waiting=>{}}
-                tokio::select! {biased;()=self.cancel.cancelled()=>return Err(DispatchError::ConnectionRefused),result=ready.changed()=>if result.is_err(){return Err(DispatchError::ConnectionRefused);}}
-            }
-        }).await
+    pub async fn peer(
+        &self,
+        ip: IpAddr,
+        session: DatagramSession,
+        context: &EstablishContext,
+    ) -> Result<Arc<Channel>, DispatchError> {
+        self.local(ip)?;
+        let index = self
+            .routes
+            .select(ip)
+            .ok_or(DispatchError::HostUnreachable)?;
+        let slot = &self.slots[index];
+        let channel = tokio::select! {biased;()=self.cancel.cancelled()=>return Err(DispatchError::NotAllowed),result=context.run("WireGuard peer initialize",async{
+            let _gate=slot.gate.lock().await;let mut current=slot.current.lock().unwrap();
+            if let Some(channel)=current.as_ref().filter(|c|!c.cancel.is_cancelled()){return Ok(channel.clone());}
+            let _admission=self.admission.lock().unwrap();if self.cancel.is_cancelled(){return Err(DispatchError::NotAllowed);}
+            if let Some(old)=current.take(){self.retired.spawn(observation::task(async move{old.stop().await;}));}
+            let channel=Channel::start(self.config.clone(),index,self.upstream.clone(),session,context.clone(),self.cancel.child_token(),self.sink.clone(),self.registry.clone(),self.routes.clone());
+            *current=Some(channel.clone());Ok(channel)
+        })=>result?};
+        channel.wait_ready(context).await?;
+        self.refresh_active(context).await;
+        channel.wait_ready(context).await?;
+        Ok(channel)
     }
+    async fn refresh_active(&self, context: &EstablishContext) {
+        let interval = self.config.refresh_server_ip_interval;
+        if interval == 0 {
+            return;
+        }
+        // A business call can refresh every live peer, including one whose
+        // route has not recently carried traffic. Unused peers stay lazy.
+        let channels = self
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                slot.current
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|channel| channel.is_ready())
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        futures_util::future::join_all(
+            channels
+                .iter()
+                .map(|channel| channel.refresh_if_due(interval, context)),
+        )
+        .await;
+    }
+
     pub async fn stop(&self) {
         let _stop = self.stop.lock().await;
-        self.cancel.cancel();
-        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
-        for task in tasks {
-            let _ = task.await;
+        {
+            let _admission = self.admission.lock().unwrap();
+            self.cancel.cancel();
+            self.retired.close();
+        }
+        let channels = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.current.lock().unwrap().take())
+            .collect::<Vec<_>>();
+        for channel in channels {
+            channel.stop().await;
+        }
+        self.retired.wait().await;
+        let router = self.router.lock().unwrap().take();
+        if let Some(router) = router {
+            let _ = router.await;
         }
         self.control.stop().await;
     }
@@ -130,22 +185,34 @@ impl Drop for Engine {
     fn drop(&mut self) {
         self.cancel.cancel();
         self.control.cancel();
-        for task in self.tasks.get_mut().unwrap().drain(..) {
-            task.abort();
+        if let Some(router) = self.router.get_mut().unwrap().take() {
+            router.abort();
         }
     }
 }
-
 async fn pump_output(
     mut packets: PacketStream,
-    tx: mpsc::Sender<Packet>,
+    slots: Arc<[PeerSlot]>,
+    routes: Arc<Routes>,
     cancel: CancellationToken,
 ) {
     loop {
-        let packet = tokio::select! {biased;()=cancel.cancelled()=>break,packet=packets.recv()=>match packet {Some(packet)=>packet,None=>break}};
-        // This single-peer route seam becomes longest-prefix peer selection in
-        // the multi-peer extension. All flows share the same active stack.
-        tokio::select! {biased;()=cancel.cancelled()=>break,result=tx.send(packet)=>if result.is_err(){break;}}
+        let packet = tokio::select! {biased;()=cancel.cancelled()=>break,packet=packets.recv()=>match packet{Some(p)=>p,None=>break}};
+        let Some((_, dst)) = peer::addresses(packet.data()) else {
+            continue;
+        };
+        let Some(index) = routes.select(dst) else {
+            continue;
+        };
+        if let Some(channel) = slots[index]
+            .current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|c| c.is_ready())
+        {
+            let _ = channel.tx.try_send(packet);
+        }
     }
     cancel.cancel();
 }

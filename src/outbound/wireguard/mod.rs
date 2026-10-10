@@ -1,7 +1,10 @@
 //! Standard WireGuard over shared controlled UDP and the active raw-IP stack.
+mod channel;
 mod datagram;
 mod engine;
 mod peer;
+mod resolver;
+mod routes;
 #[cfg(test)]
 mod tests;
 
@@ -10,7 +13,7 @@ use crate::{
     dispatch::{DatagramTransport, DispatchError},
     outbound::{
         ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector, UpstreamPath,
-        owned_stream::OwnedStream, server_destination,
+        owned_stream::OwnedStream,
     },
     resources::observation,
     session::{DatagramSession, Destination, StreamSession},
@@ -26,7 +29,6 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub struct WireGuardOutbound {
     config: Arc<WireGuardOutboundConfig>,
-    server: Destination,
     upstream: UpstreamPath,
     current: AsyncMutex<Option<Arc<Engine>>>,
     cancel: CancellationToken,
@@ -51,7 +53,6 @@ impl WireGuardOutbound {
         })?;
         Ok(Self {
             config: Arc::new(config.clone()),
-            server: server_destination(&config.address, config.port)?,
             upstream,
             current: AsyncMutex::new(None),
             cancel: CancellationToken::new(),
@@ -59,11 +60,7 @@ impl WireGuardOutbound {
             retired: TaskTracker::new(),
         })
     }
-    async fn engine(
-        &self,
-        session: DatagramSession,
-        context: &EstablishContext,
-    ) -> Result<Arc<Engine>, DispatchError> {
+    async fn engine(&self, context: &EstablishContext) -> Result<Arc<Engine>, DispatchError> {
         let engine = tokio::select! { biased;
             ()=self.cancel.cancelled()=>return Err(DispatchError::NotAllowed),
             result=context.run("WireGuard initialize",async {
@@ -72,13 +69,12 @@ impl WireGuardOutbound {
                 let _admission=self.admission.lock().unwrap();
                 if self.cancel.is_cancelled() {return Err(DispatchError::NotAllowed);}
                 if let Some(old)=current.take() {self.retired.spawn(observation::task(async move {old.stop().await;}));}
-                let engine=Engine::start(self.config.clone(),self.server.clone(),self.upstream.clone(),session,context.clone(),self.cancel.child_token())?;
+                let engine=Engine::start(self.config.clone(),self.upstream.clone(),context.clone(),self.cancel.child_token())?;
                 // Publish ownership before waiting for network setup or authentication.
                 *current=Some(engine.clone());
                 Ok(engine)
             })=>result?,
         };
-        engine.wait_ready(context).await?;
         Ok(engine)
     }
 }
@@ -91,18 +87,24 @@ impl OutboundConnector for WireGuardOutbound {
     ) -> Result<ConnectedStream, DispatchError> {
         let datagram =
             DatagramSession::new(session.inbound, session.source).with_metadata(session.metadata);
-        let engine = self.engine(datagram, context).await?;
-        let resolution = context.resolution();
-        let remote = tokio::select! {biased; ()=engine.cancel.cancelled()=>return Err(DispatchError::ConnectionRefused),result=resolution.resolve_local_family(&session.destination, context.deadline(), engine.ipv4.is_some(), engine.ipv6.is_some())=>result?};
+        let engine = self.engine(context).await?;
+        let remote = resolver::resolve(
+            &engine,
+            &session.destination,
+            &context.resolution(),
+            context.deadline(),
+        )
+        .await?;
+        let channel = engine.peer(remote.ip(), datagram, context).await?;
         engine.local(remote.ip())?;
         let stream = tokio::select! {biased;
-            ()=engine.cancel.cancelled()=>return Err(DispatchError::ConnectionRefused),
+            ()=channel.cancel.cancelled()=>return Err(DispatchError::ConnectionRefused),
             result=context.run_io("WireGuard TCP",engine.tcp.connect(remote,context.deadline()))=>result?,
         };
         Ok(ConnectedStream {
             io: Box::new(OwnedStream::new(
                 Box::new(stream),
-                engine.cancel.child_token(),
+                channel.cancel.child_token(),
             )),
             effective_peer: Destination::Ip(remote),
         })
@@ -112,11 +114,12 @@ impl OutboundConnector for WireGuardOutbound {
         request: DatagramRequest,
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
-        let engine = self.engine(request.session.clone(), context).await?;
+        let engine = self.engine(context).await?;
         Ok(Box::new(datagram::Datagrams::new(
             engine,
             request.budget(),
             context.resolution(),
+            request.session,
         )?))
     }
     fn begin_shutdown(&self) {

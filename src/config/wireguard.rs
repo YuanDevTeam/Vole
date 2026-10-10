@@ -4,7 +4,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use super::{ProxyProtocol, invalid, validate_host, validate_port};
+use super::{
+    DnsNameserver, DnsRoute, IpCidr, ProxyProtocol, invalid, validate_host, validate_port,
+};
 use crate::Result;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -30,20 +32,36 @@ impl WireGuardKey {
         *self.0
     }
 }
-
+#[derive(Clone, PartialEq, Eq)]
+pub struct WireGuardPeerConfig {
+    pub address: String,
+    pub port: u16,
+    pub public_key: WireGuardKey,
+    pub pre_shared_key: Option<WireGuardKey>,
+    pub reserved: [u8; 3],
+    pub allowed_ips: Vec<IpCidr>,
+}
+impl std::fmt::Debug for WireGuardPeerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireGuardPeerConfig")
+            .finish_non_exhaustive()
+    }
+}
 #[derive(Clone, PartialEq, Eq)]
 pub struct WireGuardOutboundConfig {
+    /// Representative first endpoint for the existing graph/measurement visitor.
     pub address: String,
     pub port: u16,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
     pub private_key: WireGuardKey,
-    pub public_key: WireGuardKey,
-    pub pre_shared_key: Option<WireGuardKey>,
     pub mtu: u16,
     pub persistent_keepalive: u16,
-    /// Mihomo ignores this top-level option without `peers`.
-    pub allowed_ips: Vec<String>,
+    pub peers: Vec<WireGuardPeerConfig>,
+    pub routes: Vec<(IpCidr, usize)>,
+    /// Active node resolver; absent when the switch is false or DNS list empty.
+    pub dns: Vec<DnsNameserver>,
+    pub refresh_server_ip_interval: i64,
 }
 impl std::fmt::Debug for WireGuardOutboundConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,27 +70,52 @@ impl std::fmt::Debug for WireGuardOutboundConfig {
             .finish_non_exhaustive()
     }
 }
-
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct RawPeer {
+    server: String,
+    port: u16,
+    public_key: String,
+    #[serde(default)]
+    pre_shared_key: String,
+    #[serde(default)]
+    reserved: Vec<u8>,
+    #[serde(default)]
+    allowed_ips: Vec<String>,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub(super) struct RawWireGuard {
     name: String,
+    #[serde(default)]
     server: String,
+    #[serde(default)]
     port: u16,
     #[serde(default)]
     ip: String,
     #[serde(default)]
     ipv6: String,
     private_key: String,
+    #[serde(default)]
     public_key: String,
     #[serde(default)]
     pre_shared_key: String,
+    #[serde(default)]
+    reserved: Vec<u8>,
+    #[serde(default)]
+    allowed_ips: Vec<String>,
+    #[serde(default)]
+    peers: Vec<RawPeer>,
     #[serde(default)]
     mtu: u16,
     #[serde(default)]
     persistent_keepalive: u16,
     #[serde(default)]
-    allowed_ips: Vec<String>,
+    remote_dns_resolve: bool,
+    #[serde(default)]
+    dns: Vec<String>,
+    #[serde(default)]
+    refresh_server_ip_interval: i64,
     #[serde(default)]
     udp: bool,
     #[serde(default, deserialize_with = "super::deserialize_present_option")]
@@ -89,6 +132,64 @@ pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
     RawWireGuard::deserialize(d)
         .map_err(|_| serde::de::Error::custom("invalid WireGuard configuration fields"))
 }
+fn reserved(value: Vec<u8>, default: [u8; 3]) -> Result<[u8; 3]> {
+    if value.is_empty() {
+        Ok(default)
+    } else {
+        value.try_into().map_err(|_| {
+            crate::VoleError::InvalidConfig("WireGuard reserved requires three bytes".into())
+        })
+    }
+}
+fn supported_node_dns(nameserver: &DnsNameserver) -> bool {
+    matches!(
+        nameserver.address,
+        super::DnsAddress::Ip(_) | super::DnsAddress::Domain(_)
+    ) && matches!(
+        nameserver.transport,
+        super::DnsTransport::Udp
+            | super::DnsTransport::Tcp
+            | super::DnsTransport::Tls
+            | super::DnsTransport::Http
+            | super::DnsTransport::Https
+            | super::DnsTransport::Rcode(_)
+    )
+}
+
+impl RawPeer {
+    fn normalize(self, default: [u8; 3]) -> Result<WireGuardPeerConfig> {
+        validate_host(&self.server, "WireGuard server")?;
+        validate_port(self.port, "WireGuard")?;
+        if self.allowed_ips.is_empty() {
+            return invalid("WireGuard peer requires allowed-ips");
+        }
+        let ips = self
+            .allowed_ips
+            .iter()
+            .map(|v| {
+                super::parse_ip_cidr(
+                    v,
+                    v.split_once('/')
+                        .and_then(|(ip, _)| ip.parse::<IpAddr>().ok())
+                        .is_some_and(|ip| ip.is_ipv6()),
+                )
+                .map_err(|_| {
+                    crate::VoleError::InvalidConfig("invalid WireGuard allowed prefix".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(WireGuardPeerConfig {
+            address: self.server,
+            port: self.port,
+            public_key: WireGuardKey::parse(self.public_key)?,
+            pre_shared_key: (!self.pre_shared_key.is_empty())
+                .then(|| WireGuardKey::parse(self.pre_shared_key))
+                .transpose()?,
+            reserved: reserved(self.reserved, default)?,
+            allowed_ips: ips,
+        })
+    }
+}
 impl RawWireGuard {
     pub(super) fn normalize(self) -> Result<(String, Option<String>, bool, ProxyProtocol)> {
         if !cfg!(feature = "outbound-wireguard") {
@@ -104,10 +205,10 @@ impl RawWireGuard {
                 crate::VoleError::InvalidConfig("invalid WireGuard local address".into())
             })?;
             if let Some(prefix) = prefix {
-                let prefix = prefix.parse::<u8>().map_err(|_| {
+                let p = prefix.parse::<u8>().map_err(|_| {
                     crate::VoleError::InvalidConfig("invalid WireGuard local prefix".into())
                 })?;
-                if prefix > if ip.is_ipv4() { 32 } else { 128 } {
+                if p > if ip.is_ipv4() { 32 } else { 128 } {
                     return invalid("invalid WireGuard local prefix");
                 }
             }
@@ -117,19 +218,91 @@ impl RawWireGuard {
                 _ => return invalid("WireGuard requires at most one local address per family"),
             }
         }
+        let global = reserved(self.reserved, [0; 3])?;
+        let mut peers = Vec::<WireGuardPeerConfig>::new();
+        let mut routes = Vec::new();
+        if self.peers.is_empty() {
+            // Fixed reference ignores top-level allowed-ips in single-peer mode.
+            let _ = self.allowed_ips;
+            let mut allowed_ips = Vec::new();
+            if ipv4.is_some() {
+                allowed_ips.push("0.0.0.0/0".into());
+            }
+            if ipv6.is_some() {
+                allowed_ips.push("::/0".into());
+            }
+            peers.push(
+                RawPeer {
+                    server: self.server,
+                    port: self.port,
+                    public_key: self.public_key,
+                    pre_shared_key: self.pre_shared_key,
+                    reserved: Vec::new(),
+                    allowed_ips,
+                }
+                .normalize(global)?,
+            );
+            routes.extend(peers[0].allowed_ips.iter().map(|cidr| (*cidr, 0)));
+        } else {
+            for raw in self.peers {
+                let peer = raw.normalize(global)?;
+                // WireGuard's device identifies peers by key. Repeated declarations
+                // update that peer rather than inventing a second crypto identity.
+                if let Some(index) = peers
+                    .iter()
+                    .position(|old| old.public_key == peer.public_key)
+                {
+                    routes.extend(peer.allowed_ips.iter().map(|cidr| (*cidr, index)));
+                    let old = &mut peers[index];
+                    old.address = peer.address;
+                    old.port = peer.port;
+                    old.reserved = peer.reserved;
+                    if peer.pre_shared_key.is_some() {
+                        old.pre_shared_key = peer.pre_shared_key;
+                    }
+                    old.allowed_ips.extend(peer.allowed_ips);
+                } else {
+                    routes.extend(peer.allowed_ips.iter().map(|cidr| (*cidr, peers.len())));
+                    peers.push(peer);
+                }
+            }
+        }
+        let dns = if self.remote_dns_resolve && !self.dns.is_empty() {
+            self.dns
+                .iter()
+                .map(|v| {
+                    // The reference replaces every parsed DNS route with this
+                    // WireGuard adapter; a named fragment cannot select an
+                    // external group or bypass the node's raw-IP data plane.
+                    let endpoint = v.split_once('#').map_or(v.as_str(), |(v, _)| v);
+                    let nameserver = super::parse_dns_nameserver(
+                        endpoint,
+                        &super::RouteTargetsByName::new(),
+                        DnsRoute::Direct,
+                    )?;
+                    if !supported_node_dns(&nameserver) {
+                        return invalid(
+                            "WireGuard node DNS requires an explicit network or RCODE upstream",
+                        );
+                    }
+                    Ok(nameserver)
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let config = WireGuardOutboundConfig {
-            address: self.server,
-            port: self.port,
+            address: peers[0].address.clone(),
+            port: peers[0].port,
             ipv4,
             ipv6,
             private_key: WireGuardKey::parse(self.private_key)?,
-            public_key: WireGuardKey::parse(self.public_key)?,
-            pre_shared_key: (!self.pre_shared_key.is_empty())
-                .then(|| WireGuardKey::parse(self.pre_shared_key))
-                .transpose()?,
             mtu: if self.mtu == 0 { 1408 } else { self.mtu },
             persistent_keepalive: self.persistent_keepalive,
-            allowed_ips: self.allowed_ips,
+            peers,
+            routes,
+            dns,
+            refresh_server_ip_interval: self.refresh_server_ip_interval,
         };
         config.validate()?;
         Ok((
@@ -142,8 +315,29 @@ impl RawWireGuard {
 }
 impl WireGuardOutboundConfig {
     pub(crate) fn validate(&self) -> Result<()> {
-        validate_host(&self.address, "WireGuard server")?;
-        validate_port(self.port, "WireGuard")?;
+        if self.peers.is_empty() {
+            return invalid("WireGuard requires a peer");
+        }
+        if self
+            .dns
+            .iter()
+            .any(|nameserver| !supported_node_dns(nameserver))
+        {
+            return invalid("WireGuard node DNS requires an explicit network or RCODE upstream");
+        }
+        for peer in &self.peers {
+            validate_host(&peer.address, "WireGuard server")?;
+            validate_port(peer.port, "WireGuard")?;
+            if peer.allowed_ips.is_empty() {
+                return invalid("WireGuard peer requires allowed-ips");
+            }
+        }
+        if self.routes.iter().any(|(prefix, index)| {
+            *index >= self.peers.len()
+                || prefix.prefix_len > if prefix.network.is_ipv4() { 32 } else { 128 }
+        }) {
+            return invalid("invalid WireGuard peer route");
+        }
         if self.ipv4.is_none() && self.ipv6.is_none() {
             return invalid("WireGuard requires a local address");
         }

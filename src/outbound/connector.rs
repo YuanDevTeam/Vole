@@ -231,6 +231,18 @@ impl EstablishContext {
         }
     }
 
+    #[cfg(feature = "outbound-wireguard")]
+    pub(crate) fn with_metadata(mut self, metadata: &crate::session::InboundMetadata) -> Self {
+        self.inbound = metadata.clone();
+        self
+    }
+
+    #[cfg(feature = "outbound-wireguard")]
+    pub(crate) fn capped_by(mut self, deadline: Instant) -> Self {
+        self.deadline = self.deadline.min(inherited_deadline(deadline));
+        self
+    }
+
     #[must_use]
     pub const fn deadline(&self) -> Instant {
         self.deadline
@@ -250,7 +262,7 @@ impl EstablishContext {
     /// Only for a new physical path of an already authenticated session, never
     /// for extending an in-progress setup. Freeze its group choices and give
     /// this socket's complete upstream establishment a new absolute deadline.
-    #[cfg(any(test, feature = "outbound-hysteria2"))]
+    #[cfg(any(test, feature = "outbound-hysteria2", feature = "outbound-wireguard"))]
     pub(crate) fn authenticated_continuation(&self) -> Self {
         Self {
             deadline: Instant::now() + DEFAULT_ESTABLISH_TIMEOUT,
@@ -566,6 +578,37 @@ impl std::fmt::Debug for UpstreamPath {
 }
 
 impl UpstreamPath {
+    /// A multi-endpoint raw-IP node shares the declared graph, while each
+    /// physical peer has its own server and may refresh a previously pinned IP.
+    #[cfg(feature = "outbound-wireguard")]
+    pub(crate) fn for_server(&self, server: &Destination, refresh: bool) -> Self {
+        match self {
+            Self::Direct { endpoint, dialer }
+                if refresh || validate_prepared_endpoint(server, endpoint).is_err() =>
+            {
+                Self::LazyDirect {
+                    dialer: dialer.clone(),
+                }
+            }
+            Self::Group {
+                server: original,
+                group,
+                endpoint,
+                dialer,
+            } => Self::Group {
+                server: server.clone(),
+                group: group.clone(),
+                endpoint: if refresh || original != server {
+                    None
+                } else {
+                    endpoint.clone()
+                },
+                dialer: dialer.clone(),
+            },
+            _ => self.clone(),
+        }
+    }
+
     #[must_use]
     pub const fn direct(endpoint: ResolvedEndpoint, dialer: Dialer) -> Self {
         Self::Direct { endpoint, dialer }

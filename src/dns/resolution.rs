@@ -133,6 +133,27 @@ impl ResolutionContext {
             .ok_or(DispatchError::HostUnreachable)
     }
 
+    #[cfg(feature = "outbound-wireguard")]
+    pub(crate) fn ipv6_allowed(&self) -> bool {
+        self.inner.as_ref().is_none_or(|state| state.ipv6)
+    }
+
+    #[cfg(feature = "outbound-wireguard")]
+    pub(crate) async fn resolve_node_local(
+        &self,
+        target: &Destination,
+        deadline: Instant,
+        dns: &RuntimeDns,
+        ipv4: bool,
+        ipv6: bool,
+    ) -> Result<SocketAddr, DispatchError> {
+        self.resolve_addresses_via(target, deadline, false, Some(dns))
+            .await?
+            .into_iter()
+            .find(|address| if address.is_ipv4() { ipv4 } else { ipv6 })
+            .ok_or(DispatchError::HostUnreachable)
+    }
+
     pub async fn resolve_proxy(
         &self,
         target: &Destination,
@@ -154,6 +175,17 @@ impl ResolutionContext {
         target: &Destination,
         deadline: Instant,
         proxy: bool,
+    ) -> Result<Vec<SocketAddr>, DispatchError> {
+        self.resolve_addresses_via(target, deadline, proxy, None)
+            .await
+    }
+
+    async fn resolve_addresses_via(
+        &self,
+        target: &Destination,
+        deadline: Instant,
+        proxy: bool,
+        node_dns: Option<&RuntimeDns>,
     ) -> Result<Vec<SocketAddr>, DispatchError> {
         let deadline = inherited_deadline(deadline);
         if deadline <= Instant::now() {
@@ -179,9 +211,16 @@ impl ResolutionContext {
             unreachable!()
         };
         let host = canonicalize_name(host).map_err(|_| DispatchError::HostUnreachable)?;
-        let inner = self.inner.as_ref().ok_or_else(unavailable)?;
-        let source = inner.source.get().ok_or_else(unavailable)?;
-        let key = (Arc::as_ptr(inner) as usize, proxy, host.clone());
+        let inner = self.inner.as_ref();
+        let source = inner.and_then(|inner| inner.source.get());
+        if node_dns.is_none() && source.is_none() {
+            return Err(unavailable());
+        }
+        let identity = node_dns.map_or_else(
+            || Arc::as_ptr(inner.unwrap()) as usize,
+            |dns| dns as *const RuntimeDns as usize,
+        );
+        let key = (identity, proxy, host.clone());
         let mut active = ACTIVE.try_with(Clone::clone).unwrap_or(ActiveResolution {
             deadline,
             names: Vec::new(),
@@ -198,42 +237,51 @@ impl ResolutionContext {
             crate::resources::observation::ResourceKind::Waiter,
         );
         let lookup = async {
-            let addresses = match source {
-                Source::Runtime(dns) => {
-                    let dns = dns
-                        .as_ref()
-                        .and_then(Weak::upgrade)
-                        .ok_or_else(unavailable)?;
-                    if proxy {
-                        dns.resolve_proxy(&host).await
-                    } else {
-                        dns.resolve(&host).await
-                    }
+            let addresses = if let Some(dns) = node_dns {
+                dns.resolve(&host)
+                    .await
                     .map_err(|_| DispatchError::HostUnreachable)?
                     .into_iter()
                     .map(|ip| SocketAddr::new(ip, *port))
                     .collect::<Vec<_>>()
-                }
-                Source::Measurement(bootstrap) => {
-                    let resolved = bootstrap
-                        .resolve(&host, *port)
-                        .await
-                        .map_err(|_| DispatchError::HostUnreachable)?;
-                    if resolved.logical_host != host
-                        || resolved.port != *port
-                        || resolved
-                            .addresses
-                            .iter()
-                            .any(|address| address.port() != *port)
-                    {
-                        return Err(DispatchError::HostUnreachable);
+            } else {
+                match source.expect("checked resolver source") {
+                    Source::Runtime(dns) => {
+                        let dns = dns
+                            .as_ref()
+                            .and_then(Weak::upgrade)
+                            .ok_or_else(unavailable)?;
+                        if proxy {
+                            dns.resolve_proxy(&host).await
+                        } else {
+                            dns.resolve(&host).await
+                        }
+                        .map_err(|_| DispatchError::HostUnreachable)?
+                        .into_iter()
+                        .map(|ip| SocketAddr::new(ip, *port))
+                        .collect::<Vec<_>>()
                     }
-                    resolved.addresses
+                    Source::Measurement(bootstrap) => {
+                        let resolved = bootstrap
+                            .resolve(&host, *port)
+                            .await
+                            .map_err(|_| DispatchError::HostUnreachable)?;
+                        if resolved.logical_host != host
+                            || resolved.port != *port
+                            || resolved
+                                .addresses
+                                .iter()
+                                .any(|address| address.port() != *port)
+                        {
+                            return Err(DispatchError::HostUnreachable);
+                        }
+                        resolved.addresses
+                    }
                 }
             };
             let mut addresses: Vec<_> = addresses
                 .into_iter()
-                .filter(|address| inner.ipv6 || address.is_ipv4())
+                .filter(|address| inner.is_none_or(|inner| inner.ipv6) || address.is_ipv4())
                 .collect();
             self.ip_version.order(&mut addresses);
             if addresses.is_empty() {
@@ -244,7 +292,7 @@ impl ResolutionContext {
         };
         tokio::select! {
             biased;
-            _ = inner.cancel.cancelled() => Err(DispatchError::NotAllowed),
+            _ = async { if let Some(inner)=inner { inner.cancel.cancelled().await } else { std::future::pending::<()>().await } } => Err(DispatchError::NotAllowed),
             result = timeout_at(deadline, ACTIVE.scope(active, lookup)) => result.unwrap_or(Err(DispatchError::TimedOut)),
         }
     }

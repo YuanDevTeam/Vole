@@ -33,7 +33,7 @@ Vole — прокси-ядро на Rust для VPN-клиентов и лока
 | [SOCKS5](../docs/outbounds.md#socks5) | CONNECT и UDP ASSOCIATE, с опциональной аутентификацией по имени пользователя и паролю |
 | [Hysteria2](../docs/outbounds.md#hysteria2) | TCP/UDP через QUIC, управление пропускной способностью, Salamander, смена портов и mTLS |
 | [TUIC v5](../docs/outbounds.md#tuic-v5) | TCP/UDP через QUIC, режимы передачи UDP native/quic и выбор алгоритма управления перегрузкой |
-| [WireGuard](../docs/outbounds.md#wireguard) | TCP/UDP через стандартный WireGuard с пользовательским IP-стеком |
+| [WireGuard](../docs/outbounds.md#wireguard) | TCP/UDP через стандартный WireGuard, несколько пиров и DNS узла, с пользовательским IP-стеком |
 
 Стандартные TLS-соединения поддерживают проверку сертификатов и закрепление сертификата по SHA-256. Поддерживаемые TCP-пути с TLS могут использовать шаблоны ClientHello Chrome, Firefox или Safari; `client-fingerprint` не зависит от `fingerprint` сертификата. Точные имена и сочетания описаны в [профилях TLS и политике сертификатов](../docs/tls-client-fingerprint.md). Эти функции не гарантируют неотличимость от браузера или произвольные сочетания протоколов.
 
