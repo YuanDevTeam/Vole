@@ -118,7 +118,8 @@ dns:
 - 无 fragment 时默认 DIRECT；`respect-rules: true` 改为 RULES，要求非空 `proxy-server-nameserver`。
 - Fragment 使用 `#出口&参数=值`；出口接受 `DIRECT`、`RULES`、实际代理节点名或支持的代理组名。
   仅提供参数时沿用默认出口；整个 fragment 先百分号解码，再按 `&` 和首个 `=` 拆分，
-  同名参数和出口 token 以后项为准。未知出口、参数及物理网卡 token 不支持。
+  同名参数和出口 token 以后项为准。未知参数、普通上游的未知出口及物理网卡 token 不支持。
+  system/DHCP 来源始终使用物理出口，忽略出口 token；节点私有 DNS 也忽略出口 token。
 - `#RULES` 只按 nameserver endpoint 和传输执行业务规则，不把 DNS question 当作选路域名。
 - 规则模式下，UDP 跳过不支持 UDP 的节点或组，继续匹配后续规则；显式出口和 global 模式不做此跳过。
 - `RULES` 与业务 TCP/UDP 使用同一子规则求值器：`SUB-RULE`、`PASS`、`PASS-RULE` 的作用域一致；规则控制和组控制先于 UDP 能力检查。
@@ -127,6 +128,9 @@ dns:
 代理组成员可以是具体节点、嵌套组、`DIRECT`、`REJECT`、`PASS` 或 `PASS-RULE`。后两者仅在 rule 模式的 `RULES` 中参与规则流程，global 模式、显式命名组或 dialer-proxy 选中控制目标时拒绝连接。DNS exchange 需要新建物理 transport 时解析当时的当前叶节点；选中成员失败不会使代理组自动改选，但 nameserver 列表仍按本节已有故障转移语义继续下一项。
 
 ### 上游参数
+
+UDP/TCP/DoT/DoQ URL 只消费主机与端口；userinfo、路径和 query 与 Mihomo 一样忽略，
+不形成认证或请求路径。fragment 的上游参数仍按下述规则消费。
 
 `ecs` 接受 IPv4/IPv6 IP 或 CIDR，裸 IP 使用完整位数。已有 EDNS ECS 默认原样保留；
 `ecs-override=true` 只替换首个 ECS，保留其 scope、OPT flags 和其他 option，编码时掩去前缀外的位。

@@ -239,7 +239,7 @@ fn parse_dns_nameserver_with_route(
             .next()
             .is_some_and(|authority| authority.contains('@'))
     });
-    if (!http && has_userinfo) || url.fragment().is_some() {
+    if url.fragment().is_some() {
         return Err(bad());
     }
     let http_auth = if http && has_userinfo {
@@ -283,9 +283,6 @@ fn parse_dns_nameserver_with_route(
         });
         Some(normalize_http_path(path)?)
     } else {
-        if !matches!(url.path(), "" | "/") || url.query().is_some() {
-            return Err(bad());
-        }
         None
     };
     let port = url.port().unwrap_or(default_port);
@@ -455,6 +452,26 @@ mod upstream_options_tests {
                     .unwrap(),
                 decoded
             );
+        }
+    }
+
+    #[test]
+    fn non_http_nameservers_ignore_http_only_url_components() {
+        for scheme in ["udp", "tcp", "tls", "quic"] {
+            if scheme == "quic" && !cfg!(feature = "dns-quic") {
+                continue;
+            }
+            let bare = format!("{scheme}://192.0.2.53#DIRECT&ecs=192.0.2.7/24");
+            let decorated = format!(
+                "{scheme}://user:password@192.0.2.53/ignored?unused=value#DIRECT&ecs=192.0.2.7/24"
+            );
+            let targets = RouteTargetsByName::new();
+            let expected = parse_dns_nameserver(&bare, &targets, DnsRoute::Direct).unwrap();
+            let actual = parse_dns_nameserver(&decorated, &targets, DnsRoute::Direct).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(parse_node_dns_nameserver(&decorated).unwrap(), expected);
+            assert!(actual.path.is_none());
+            assert!(actual.http_auth.is_none());
         }
     }
 
