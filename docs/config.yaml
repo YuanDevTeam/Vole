@@ -57,15 +57,15 @@ geo-update-interval: 24
 # 构建必须同时包含 inbound-http 和 inbound-socks5；缺少任一 feature 则拒绝启用入口。
 # allow-lan 默认 false，绑定回环；true 时绑定通配地址，与 authentication 独立。
 # ipv6: true 时同时绑定同端口 IPv6（v6-only）；false 时只监听 IPv4。
-# authentication 省略或 [] 表示任何绑定地址均免认证；非空支持多个 user:password，
-# 按首个冒号分隔，用户名 / 密码各 1–255 UTF-8 字节，HTTP/SOCKS5 共用。
+# authentication 省略、null 或 [] 表示任何绑定地址均免认证；非空支持多个 user:password，
+# 按首个冒号分隔，不 trim，允许空用户名或密码。HTTP 受 32 KiB 总头预算约束；SOCKS5 各字段最多 255 字节。
 # mixed-port 关闭时可以保留合法的 allow-lan 和 authentication，供之后启用入口使用。
 # HTTP 逐请求认证、选路，支持流式正文 / 分块、Keep-Alive、CONNECT 与 Upgrade。
 # 共享只适合可信网络，Basic 不加密链路；详细边界见 docs/inbounds.md#http。
 # UDP 必须属于有效的 TCP 控制连接，源 IP/端口校验和资源上限见 inbounds.md#socks5。
 mixed-port: 1080
 allow-lan: false
-bind-address: "*" # allow-lan=true 时可指定单个 IP
+bind-address: "*" # allow-lan=true 时可指定单个 IP；localhost 始终绑定回环
 lan-allowed-ips: [0.0.0.0/0, "::/0"]
 lan-disallowed-ips: [] # 拒绝优先
 skip-auth-prefixes: [] # 仅跳过认证，仍执行来源访问控制
@@ -500,7 +500,7 @@ proxies:
 # 未显式定义 GLOBAL 时，自动追加一个 select 组；成员依次为 DIRECT、REJECT、
 # 所有节点和声明的组，默认 DIRECT。可显式声明 GLOBAL 覆盖其成员及初始选择。
 #
-# select 的 default-selected 省略、空串或未命中时选中第一项；有效缓存选择优先。名称精确匹配。
+# select 的 default-selected 省略、null、空串或未命中时选中第一项；有效缓存选择优先。名称精确匹配。
 # url-test 按 URL 探测延迟选择，tolerance（毫秒，默认 0）抑制小幅切换；fallback
 # 按声明顺序选择首个健康成员，恢复后可回到前面的成员。全部失败时返回首成员。
 # 四种组均接受 url/interval/timeout/lazy/expected-status/max-failed-times。
@@ -584,7 +584,9 @@ rule-providers:
 # DNS policy 支持 rule-set:local-domains（逗号分隔多个集合）；只接受 domain/classical，
 # classical 在 DNS 场景仅使用域名与 GeoSite 条件。
 
-# hosts 支持单 IP、IP 数组、域名别名与 Clash 域名通配；不支持动态 lan 展开。
+# hosts 支持单 IP、IP 数组、域名别名与 Clash 域名通配。
+# 值恰好为 lan 或 [lan] 时，启动准备捕获接口 IP，排除回环和 link-local；空快照使启动失败。
+# 校验不读取网卡；快照不随地址变化或 Provider 更新刷新，不限于私有网段。
 hosts:
   "internal.example": [192.0.2.10]
   "alias.example": internal.example

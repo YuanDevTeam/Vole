@@ -740,12 +740,12 @@ mod tests {
         assert!(!auth.verifies(&[("Proxy-Authorization".to_owned(), "Basic !!!".to_owned(),)]));
         assert_eq!(format!("{auth:?}"), "ProxyCredentials { .. }");
 
-        assert!(HttpBasicAuth::new("", "password").is_err());
-        assert!(HttpBasicAuth::new("user", "").is_err());
+        assert!(HttpBasicAuth::new("", "password").is_ok());
+        assert!(HttpBasicAuth::new("user", "").is_ok());
         assert!(HttpBasicAuth::new("user:name", "password").is_err());
         assert!(HttpBasicAuth::new("u".repeat(255), "p".repeat(255)).is_ok());
-        assert!(HttpBasicAuth::new("u".repeat(256), "password").is_err());
-        assert!(HttpBasicAuth::new("user", "p".repeat(256)).is_err());
+        assert!(HttpBasicAuth::new("u".repeat(256), "password").is_ok());
+        assert!(HttpBasicAuth::new("user", "p".repeat(256)).is_ok());
     }
 
     #[tokio::test]

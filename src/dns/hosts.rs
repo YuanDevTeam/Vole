@@ -54,7 +54,19 @@ impl Hosts {
             }
         }
         if configured {
-            for entry in entries {
+            // PreparedCore has already captured LAN entries. Standalone resolver
+            // constructors capture their own snapshot and fail closed if unavailable.
+            let materialized = entries
+                .iter()
+                .any(|entry| matches!(entry.value, HostValue::Lan))
+                .then(|| {
+                    let mut entries = entries.to_vec();
+                    if materialize_lan(&mut entries).is_err() {
+                        clear_lan_markers(&mut entries);
+                    }
+                    entries
+                });
+            for entry in materialized.as_deref().unwrap_or(entries) {
                 hosts.insert(&entry.pattern, entry.value.clone());
             }
         }
@@ -81,6 +93,7 @@ impl Hosts {
                     return Ok(HostValue::Addresses(addresses.clone()));
                 }
                 HostValue::Alias(alias) => name.clone_from(alias),
+                HostValue::Lan => return Err(io::ErrorKind::InvalidInput.into()),
             }
         }
         Ok(HostValue::Alias(name))
@@ -88,9 +101,127 @@ impl Hosts {
 }
 
 pub(crate) fn validate(entries: &[HostEntry]) -> io::Result<()> {
-    let hosts = Hosts::new(entries, true, false);
+    let mut entries = entries.to_vec();
+    clear_lan_markers(&mut entries);
+    let hosts = Hosts::new(&entries, true, false);
     for entry in entries {
         hosts.lookup(&entry.pattern)?;
     }
     Ok(())
+}
+
+pub(crate) fn materialize_lan(entries: &mut [HostEntry]) -> io::Result<()> {
+    if !entries
+        .iter()
+        .any(|entry| matches!(entry.value, HostValue::Lan))
+    {
+        return Ok(());
+    }
+    let addresses = getifaddrs::getifaddrs()
+        .map_err(|_| io::Error::other("hosts LAN interface snapshot unavailable"))?
+        .filter_map(|interface| interface.address.ip_addr())
+        .collect::<Vec<_>>();
+    apply_lan_snapshot(entries, &addresses)
+}
+
+fn clear_lan_markers(entries: &mut [HostEntry]) {
+    for entry in entries {
+        if matches!(entry.value, HostValue::Lan) {
+            entry.value = HostValue::Addresses(Vec::new());
+        }
+    }
+}
+
+fn apply_lan_snapshot(entries: &mut [HostEntry], addresses: &[IpAddr]) -> io::Result<()> {
+    if !entries
+        .iter()
+        .any(|entry| matches!(entry.value, HostValue::Lan))
+    {
+        return Ok(());
+    }
+    let addresses = addresses
+        .iter()
+        .copied()
+        .map(|address| match address {
+            IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(address)),
+            address => address,
+        })
+        .filter(|address| {
+            !address.is_loopback()
+                && match address {
+                    IpAddr::V4(address) => !address.is_link_local(),
+                    IpAddr::V6(address) => !address.is_unicast_link_local(),
+                }
+        })
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "hosts LAN snapshot has no usable interface addresses",
+        ));
+    }
+    for entry in entries {
+        if matches!(entry.value, HostValue::Lan) {
+            entry.value = HostValue::Addresses(addresses.clone());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lan_hosts_use_a_fixed_injected_snapshot_without_interface_access() {
+        let config = crate::config::Config::parse_yaml(
+            b"hosts: {home.lan: lan, alias.lan: home.lan, public.lan: [lan]}\nrules: ['MATCH,DIRECT']",
+        )
+        .unwrap();
+        assert!(matches!(config.dns.hosts[1].value, HostValue::Alias(_)));
+        assert!(
+            config
+                .dns
+                .hosts
+                .iter()
+                .any(|entry| matches!(entry.value, HostValue::Lan))
+        );
+        let mut entries = config.dns.hosts;
+        let addresses = [
+            "127.0.0.1",
+            "::1",
+            "169.254.1.2",
+            "fe80::1",
+            "192.168.1.2",
+            "2001:db8::2",
+            "203.0.113.4",
+        ]
+        .map(|address| address.parse().unwrap());
+        apply_lan_snapshot(&mut entries, &addresses).unwrap();
+        let hosts = Hosts::new(&entries, true, false);
+        let expected = HostValue::Addresses(addresses[4..].to_vec());
+        assert_eq!(hosts.lookup("home.lan").unwrap(), expected);
+        assert_eq!(hosts.lookup("alias.lan").unwrap(), expected);
+        assert_eq!(hosts.lookup("public.lan").unwrap(), expected);
+        apply_lan_snapshot(&mut entries, &["192.168.2.2".parse().unwrap()]).unwrap();
+        assert_eq!(
+            Hosts::new(&entries, true, false)
+                .lookup("home.lan")
+                .unwrap(),
+            expected
+        );
+        let mut empty = vec![HostEntry {
+            pattern: "empty.lan".into(),
+            value: HostValue::Lan,
+        }];
+        assert_eq!(
+            apply_lan_snapshot(&mut empty, &addresses[..4])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrNotAvailable
+        );
+    }
 }

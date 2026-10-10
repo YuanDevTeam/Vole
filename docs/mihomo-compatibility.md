@@ -9,7 +9,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 | 配置与选路 | YAML anchor/merge；rule/global/direct；内置 DIRECT/REJECT；域名、地址、端口、网络、GeoData、RULE-SET 和 AND/OR/NOT |
 | 资源 | HTTP/file/inline proxy/rule providers；动态成员、筛选、覆盖、健康检查；Provider dialer-proxy 与 HTTP 订阅信息；YAML/Text 与 domain/ipcidr MRS；失败保留旧代 |
 | 策略组 | select/url-test/fallback/load-balance；默认和持久选择；延迟容差、恢复、三种负载均衡策略；旧连接保持原路径 |
-| DNS | hosts、bootstrap/节点/直连解析角色、policy、respect-rules；UDP/TCP/DoH/DoT；fallback；redir-host/fake-IP 与映射持久化 |
+| DNS | hosts（含启动 LAN 地址快照）、bootstrap/节点/直连解析角色、policy、respect-rules；UDP/TCP/DoH/DoT；fallback；redir-host/fake-IP 与映射持久化 |
 | mixed-port | HTTP/SOCKS5 TCP 与 SOCKS5 UDP；LAN 地址限制、多用户认证、认证跳过网段；allow-lan 不强制认证 |
 | 出站 | HTTP(S) CONNECT、SOCKS5、AnyTLS、Trojan、VMess AEAD、VLESS、Hysteria2、TUIC v5、Shadowsocks 2022、标准 WireGuard 单/多 peer；依赖启用的 Cargo feature |
 | 嗅探 | TUN/mixed TCP 的 HTTP/TLS；TUN UDP 的 QUIC；域名/地址排除、强制条件和目标覆盖 |

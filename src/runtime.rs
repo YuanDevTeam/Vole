@@ -300,6 +300,7 @@ impl PreparedCore {
         } else {
             None
         };
+        crate::dns::hosts::materialize_lan(&mut config.dns.hosts)?;
         let (rules, geodata_registration) = prepare_routing(&mut config, &geodata_manager)?;
         let _ = resolver;
         let endpoints = vec![PreparedProxyEndpoints::default(); config.proxies.len()];

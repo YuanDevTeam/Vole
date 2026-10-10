@@ -285,10 +285,9 @@ pub(super) fn normalize_hosts(
             RawPolicyNameservers::One(value) => vec![value],
             RawPolicyNameservers::Many(values) => values,
         };
-        let value = if values.len() == 1 && values[0].parse::<IpAddr>().is_err() {
-            if values[0] == "lan" {
-                return invalid("hosts dynamic lan expansion is not supported");
-            }
+        let value = if values.as_slice() == ["lan"] {
+            HostValue::Lan
+        } else if values.len() == 1 && values[0].parse::<IpAddr>().is_err() {
             HostValue::Alias(
                 crate::dns::canonicalize_name(&values[0])
                     .map_err(|_| VoleError::InvalidConfig("invalid hosts alias".into()))?,

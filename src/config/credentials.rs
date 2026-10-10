@@ -20,14 +20,6 @@ impl ProxyCredentials {
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> io::Result<Self> {
         let username = username.into();
         let password = password.into();
-        for (kind, value) in [("user", &username), ("password", &password)] {
-            if !(1..=255).contains(&value.len()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("authentication {kind} must contain between 1 and 255 UTF-8 bytes"),
-                ));
-            }
-        }
         if username.contains(':') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -49,7 +41,14 @@ impl ProxyCredentials {
         for (expected_user, expected_password) in &self.entries {
             let mut difference = username.len() ^ expected_user.len();
             difference |= password.len() ^ expected_password.len();
-            for index in 0..255 {
+            // Cover both complete fields without an early exit on content.
+            // HTTP credentials are not limited by SOCKS5's one-byte lengths.
+            let length = username
+                .len()
+                .max(expected_user.len())
+                .max(password.len())
+                .max(expected_password.len());
+            for index in 0..length {
                 difference |= usize::from(
                     username.get(index).copied().unwrap_or(0)
                         ^ expected_user.as_bytes().get(index).copied().unwrap_or(0),
@@ -104,7 +103,9 @@ impl ProxyCredentials {
         let (Some(scheme), Some(encoded), None) = (parts.next(), parts.next(), parts.next()) else {
             return None;
         };
-        if !scheme.eq_ignore_ascii_case("basic") || encoded.len() > 684 {
+        if !scheme.eq_ignore_ascii_case("basic")
+            || encoded.len() > crate::inbound::DEFAULT_HEADER_LIMIT
+        {
             return None;
         }
         let Ok(decoded) = STANDARD.decode(encoded) else {
@@ -112,6 +113,47 @@ impl ProxyCredentials {
         };
         let separator = decoded.iter().position(|&byte| byte == b':')?;
         self.authenticate(&decoded[..separator], &decoded[separator + 1..])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_credentials_cover_empty_values_and_complete_long_fields() {
+        for (user, password) in [("", ""), ("", "secret"), ("user", "")] {
+            let auth = ProxyCredentials::new(user, password).unwrap();
+            assert!(auth.verifies(&[(
+                "Proxy-Authorization".into(),
+                auth.authorization_header_value(),
+            )]));
+        }
+        let user = "u".repeat(600);
+        let password = "p".repeat(600);
+        let auth = ProxyCredentials::new(&user, &password).unwrap();
+        assert!(auth.verifies(&[(
+            "Proxy-Authorization".into(),
+            auth.authorization_header_value(),
+        )]));
+        let mut wrong_user = user.into_bytes();
+        let mut wrong_password = password.into_bytes();
+        wrong_user[599] = b'x';
+        assert!(!auth.matches(&wrong_user, &wrong_password));
+        wrong_user[599] = b'u';
+        wrong_password[599] = b'x';
+        assert!(!auth.matches(&wrong_user, &wrong_password));
+        assert!(!auth.matches(&wrong_user, &wrong_password[..599]));
+    }
+
+    #[test]
+    fn http_authentication_keeps_the_shared_header_budget() {
+        let auth = ProxyCredentials::new("user", "p".repeat(crate::inbound::DEFAULT_HEADER_LIMIT))
+            .unwrap();
+        assert!(!auth.verifies(&[(
+            "Proxy-Authorization".into(),
+            auth.authorization_header_value(),
+        )]));
     }
 }
 

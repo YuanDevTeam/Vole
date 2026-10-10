@@ -291,6 +291,7 @@ impl ProviderRuntime {
         let dialer = self.dialer.clone();
         let geo = self.geo.clone();
         let previous_dns = generation.dns.clone();
+        let hosts = generation.config.dns.hosts.clone();
         let connections = generation.connections.clone();
         let data_dir = self
             .manager
@@ -303,6 +304,8 @@ impl ProviderRuntime {
                 let mut config = template
                     .materialize_with_cancel(&contents, Some(&expression_cancellation))
                     .map_err(io::Error::other)?;
+                // Provider refreshes do not refresh the session's startup LAN snapshot.
+                config.dns.hosts = hosts;
                 let requirements =
                     GeoRequirements::for_config(&config).map_err(io::Error::other)?;
                 let rules = RuleSet::compile_config(&mut config).map_err(io::Error::other)?;

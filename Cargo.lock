@@ -2965,6 +2965,7 @@ dependencies = [
  "fancy-regex",
  "foreign-types",
  "futures-util",
+ "getifaddrs",
  "h2",
  "h3",
  "h3-quinn",

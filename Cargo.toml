@@ -103,6 +103,7 @@ bytes = "1"
 crc32fast = { version = "1.5.2", optional = true }
 fancy-regex = { version = "=0.19.2", default-features = false, features = ["std", "unicode"] }
 futures-util = { version = "0.3", features = ["sink"] }
+getifaddrs = "=0.6.2"
 h2 = "0.4.19"
 h3 = { version = "=0.0.8", default-features = false, optional = true }
 h3-quinn = { version = "=0.0.10", default-features = false, optional = true }

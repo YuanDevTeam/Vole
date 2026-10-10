@@ -325,6 +325,8 @@ pub struct HostEntry {
 pub enum HostValue {
     Addresses(Vec<IpAddr>),
     Alias(String),
+    /// Interface addresses are captured during runtime preparation, never validation.
+    Lan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1164,11 +1166,7 @@ struct RawProxyGroup {
     #[serde(rename = "type")]
     kind: GroupKind,
     proxies: Vec<String>,
-    #[serde(
-        rename = "default-selected",
-        default,
-        deserialize_with = "deserialize_present_option"
-    )]
+    #[serde(rename = "default-selected", default)]
     default_selected: Option<String>,
 }
 
@@ -1986,13 +1984,9 @@ fn deserialize_present_credentials<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    deserialize_non_null_vec(deserializer)
-        .map(Some)
-        .map_err(|_| {
-            serde::de::Error::custom(
-                "authentication must be a non-null sequence of credential strings",
-            )
-        })
+    Option::<Vec<String>>::deserialize(deserializer).map_err(|_| {
+        serde::de::Error::custom("authentication must be a sequence of credential strings or null")
+    })
 }
 
 impl Config {
@@ -2055,10 +2049,15 @@ impl RawVoleConfig {
         )?;
 
         let mixed_port = self.mixed_port.filter(|port| *port != 0);
+        let allow_lan = self.allow_lan && self.bind_address.as_deref() != Some("localhost");
         let bind_address = match self.bind_address.as_deref() {
-            None | Some("" | "*") => None,
+            None | Some("" | "*" | "localhost") => None,
             Some(value) => Some(value.trim_matches(['[', ']']).parse::<IpAddr>().map_err(
-                |_| VoleError::InvalidConfig("bind-address must be an IP address or *".into()),
+                |_| {
+                    VoleError::InvalidConfig(
+                        "bind-address must be an IP address, localhost or *".into(),
+                    )
+                },
             )?),
         };
         let cidrs = |values: Vec<String>| {
@@ -2148,7 +2147,7 @@ impl RawVoleConfig {
                 port,
                 access: ProxyAccess {
                     bind_address,
-                    allow_lan: self.allow_lan,
+                    allow_lan,
                     ipv6: self.ipv6,
                 },
                 auth: authentication,
@@ -4796,48 +4795,66 @@ authentication:
                 .matches("用户".as_bytes(), "密:码".as_bytes())
         );
 
-        let max_user = "u".repeat(usize::from(u8::MAX));
-        let max_password = "p".repeat(usize::from(u8::MAX));
-        let max = current_yaml(&format!(
-            "mixed-port: 1080\nauthentication:\n  - \"{max_user}:{max_password}\""
-        ));
-        assert!(Config::parse_yaml(max.as_bytes()).is_ok());
-
-        for (fields, expected) in [
-            (
-                "mixed-port: 1080\nauthentication:\n  - missing-separator",
-                "authentication entry must use user:password",
-            ),
-            (
-                "mixed-port: 1080\nauthentication:\n  - \":secret\"",
-                "authentication user must contain between 1 and 255",
-            ),
-            (
-                "mixed-port: 1080\nauthentication:\n  - \"measure:\"",
-                "authentication password must contain between 1 and 255",
-            ),
+        for (user, password) in [
+            ("", ""),
+            ("", "secret"),
+            ("user", ""),
+            (&"u".repeat(600), &"p".repeat(600)),
         ] {
-            let error = Config::parse_yaml(current_yaml(fields).as_bytes()).unwrap_err();
+            let config = Config::parse_yaml(
+                current_yaml(&format!(
+                    "mixed-port: 1080\nauthentication: ['{user}:{password}']"
+                ))
+                .as_bytes(),
+            )
+            .unwrap();
+            let [InboundConfig::Mixed(mixed)] = config.inbounds.as_slice() else {
+                panic!("missing mixed inbound");
+            };
             assert!(
-                error.to_string().contains(expected),
-                "unexpected error for {fields:?}: {error}"
+                mixed
+                    .auth
+                    .as_ref()
+                    .unwrap()
+                    .matches(user.as_bytes(), password.as_bytes())
             );
         }
+        let error = Config::parse_yaml(
+            current_yaml("mixed-port: 1080\nauthentication: [missing-separator]").as_bytes(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("authentication entry must use user:password")
+        );
+        assert!(
+            Config::parse_yaml(
+                current_yaml("mixed-port: 1080\nauthentication: measure:secret").as_bytes()
+            )
+            .is_err()
+        );
+    }
 
-        for yaml in [
-            current_yaml("mixed-port: 1080\nauthentication: null"),
-            current_yaml("mixed-port: 1080\nauthentication: measure:secret"),
-            current_yaml(&format!(
-                "mixed-port: 1080\nauthentication:\n  - \"{}:secret\"",
-                "u".repeat(usize::from(u8::MAX) + 1)
-            )),
-            current_yaml(&format!(
-                "mixed-port: 1080\nauthentication:\n  - \"measure:{}\"",
-                "p".repeat(usize::from(u8::MAX) + 1)
-            )),
-        ] {
-            assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");
+    #[test]
+    fn mixed_localhost_and_null_inputs_keep_reference_defaults() {
+        for authentication in ["null", "[]"] {
+            let config = Config::parse_yaml(current_yaml(&format!(
+                "mixed-port: 1080\nallow-lan: true\nbind-address: localhost\nauthentication: {authentication}"
+            )).as_bytes()).unwrap();
+            let [InboundConfig::Mixed(mixed)] = config.inbounds.as_slice() else {
+                panic!("missing mixed inbound");
+            };
+            assert!(!mixed.access.allow_lan);
+            assert!(mixed.access.bind_address.is_none());
+            assert!(mixed.auth.is_none());
         }
+        let yaml = with_proxy_groups(
+            "  - name: choice\n    type: select\n    proxies: [DIRECT, proxy]\n    default-selected: null",
+            "rules: ['MATCH,choice']",
+        );
+        let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        assert_eq!(config.proxy_groups[0].initial_member, 0);
     }
 
     #[test]
@@ -5949,10 +5966,6 @@ rules:
             r#"  - name: 主线路
     type: select
     proxies: [RULES]"#,
-            r#"  - name: 主线路
-    type: select
-    proxies: [proxy]
-    default-selected: null"#,
         ] {
             let yaml = with_proxy_groups(groups, fields);
             assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");

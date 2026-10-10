@@ -241,6 +241,10 @@ fake-IP 映射、活动业务会话、在途查询和上游连接池继续保留
 
 `hosts` 支持 IP、IP 数组和域名别名，匹配规则沿用 Clash 域名通配；默认包含 localhost，别名循环在配置阶段拒绝。`use-hosts`、`use-system-hosts` 独立控制配置与系统 hosts，默认均为 true；系统 hosts 在运行时创建时读取。TCP、UDP 节点的 TLS SNI 和逻辑目的名称不因解析为 IP 而改变。
 
+值恰好为 `lan` 或 `[lan]` 时，启动准备捕获全部接口 IP，排除回环和 link-local，
+包含可用的公网与 TUN 接口地址，不仅限私有网段。校验只保留内部标记，不读取网卡。
+无可用地址或枚举失败使启动失败；运行期间及 Provider 更新均保留启动快照。
+
 `default-nameserver` 仅引导上游域名。`proxy-server-nameserver` 与其 policy 用于节点解析；`direct-nameserver` 用于直连，`direct-nameserver-follow-policy` 决定是否使用业务 policy。各角色拥有独立 cache/singleflight，未配置节点或直连 resolver 时复用主 resolver。有限并发、取消与连接池适用于各角色，依赖循环不会等待自身的 singleflight。
 
 启用有效 IPv6 时，内部地址解析并发请求 A/AAAA，结果按 IPv4、IPv6 排列。
@@ -305,7 +309,7 @@ Running Session上下文仅弱引用本 session 的 RuntimeDns；业务 IP-only 
 
 - 真实 ICMP 转发、ICMP error、Traceroute、ICMP 选路规则或 ICMP 测速；
 - DoQ、DoH HTTP/2/3；
-- 动态 hosts: lan；
+- 运行中随接口变化自动刷新 hosts: lan；
 - 用户可配置的缓存容量、查询总超时、重试或并发度；
 - 使用 DNS question 执行业务规则，或用 DNS 出口改写后续业务动作。
 

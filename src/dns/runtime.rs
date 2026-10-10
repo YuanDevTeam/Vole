@@ -1364,6 +1364,11 @@ impl RuntimeDns {
                     return Ok(addresses);
                 }
                 HostValue::Alias(host) => host,
+                HostValue::Lan => {
+                    return Err(RuntimeDnsError::UpstreamsExhausted {
+                        last_error: "hosts snapshot unavailable".into(),
+                    });
+                }
             };
         if !self.enabled {
             use crate::dialer::Resolver;
