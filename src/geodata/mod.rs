@@ -23,6 +23,9 @@ use crate::{
     routing::GeoMatcher,
 };
 
+mod asn;
+#[cfg(test)]
+mod asn_tests;
 mod manager;
 mod selectors;
 pub(crate) mod service;
@@ -38,22 +41,26 @@ pub use manager::{
 
 pub const GEOSITE_FILE_NAME: &str = "geosite.dat";
 pub const GEOIP_FILE_NAME: &str = "geoip.dat";
+pub const ASN_FILE_NAME: &str = "ASN.mmdb";
 
 const MAX_CODE_BYTES: usize = 64;
 
-/// The two supported Xray GeoData assets.
+/// Supported DAT category assets and the independent ASN MMDB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeoDataKind {
     GeoSite,
     GeoIp,
+    Asn,
 }
 
 impl GeoDataKind {
+    pub const ALL: [Self; 3] = [Self::GeoSite, Self::GeoIp, Self::Asn];
     #[must_use]
     pub const fn file_name(self) -> &'static str {
         match self {
             Self::GeoSite => GEOSITE_FILE_NAME,
             Self::GeoIp => GEOIP_FILE_NAME,
+            Self::Asn => ASN_FILE_NAME,
         }
     }
 }
@@ -63,6 +70,7 @@ impl std::fmt::Display for GeoDataKind {
         formatter.write_str(match self {
             Self::GeoSite => "GeoSite",
             Self::GeoIp => "GeoIP",
+            Self::Asn => "ASN",
         })
     }
 }
@@ -91,6 +99,8 @@ pub enum GeoDataError {
     InvalidRegex { code: String, detail: String },
     #[error("invalid GeoIP CIDR in `{code}`: {detail}")]
     InvalidCidr { code: String, detail: String },
+    #[error("invalid ASN MMDB: {0}")]
+    InvalidAsn(String),
     #[error("GeoData resource `{resource}` is {actual}; limit is {maximum}")]
     ResourceLimit {
         resource: &'static str,
@@ -110,9 +120,11 @@ impl From<GeoDataError> for VoleError {
 /// Diagnostic capacity accounting, never a memory admission policy.
 ///
 /// Includes Vole-owned matcher/index vectors and arenas, with old/new buffer
-/// overlap during growth. Compiled regex programs and search caches are opaque
-/// third-party allocations and are not counted, nor are allocator overhead or
-/// the process peak; those require independent measurements.
+/// overlap during growth. Owned MMDB file bytes are included, but candidate
+/// validation overlap and MMDB metadata/verification allocations are excluded.
+/// Compiled regex programs and search caches are opaque third-party allocations
+/// and are not counted, nor are allocator overhead or the process peak; those
+/// require independent measurements.
 #[derive(Debug, Default)]
 struct AllocationLedger {
     used: usize,
@@ -140,6 +152,7 @@ impl AllocationLedger {
 pub struct GeoData {
     sites: Vec<SiteCategory>,
     ips: Vec<IpCategory>,
+    asn: Option<asn::AsnDb>,
     allocation_capacity: usize,
     peak_allocation_capacity: usize,
     // Fields drop in declaration order: signal only after matcher storage is
@@ -153,6 +166,7 @@ impl std::fmt::Debug for GeoData {
             .debug_struct("GeoData")
             .field("site_categories", &self.sites.len())
             .field("ip_categories", &self.ips.len())
+            .field("asn_available", &self.asn.is_some())
             .field("allocation_capacity", &self.allocation_capacity)
             .field("peak_allocation_capacity", &self.peak_allocation_capacity)
             .finish()
@@ -169,12 +183,13 @@ impl GeoData {
     pub const EMPTY: Self = Self {
         sites: Vec::new(),
         ips: Vec::new(),
+        asn: None,
         allocation_capacity: 0,
         peak_allocation_capacity: 0,
         release: None,
     };
 
-    /// Loads only categories referenced by `rules` from the two fixed sibling
+    /// Loads referenced DAT categories and the ASN MMDB from fixed sibling
     /// assets in `config_dir`.
     pub fn load(config_dir: &Path, rules: &[RuleSpec]) -> Result<Self, GeoDataError> {
         Self::load_with_dns_policies(config_dir, rules, &[])
@@ -205,12 +220,20 @@ impl GeoData {
         if !requested.sites.values.is_empty() {
             load_site_file(config_dir, &requested.sites, &mut sites, &mut ledger)?;
         }
-        Ok(Self::from_loaded(sites, ips, ledger.used, ledger.peak))
+        let asn = if requested.asn {
+            let database = asn::AsnDb::load(config_dir)?;
+            ledger.reserve(database.capacity())?;
+            Some(database)
+        } else {
+            None
+        };
+        Ok(Self::from_loaded(sites, ips, asn, ledger.used, ledger.peak))
     }
 
     fn from_loaded(
         mut sites: Vec<SiteCategory>,
         mut ips: Vec<IpCategory>,
+        asn: Option<asn::AsnDb>,
         allocation_capacity: usize,
         peak_allocation_capacity: usize,
     ) -> Self {
@@ -218,10 +241,12 @@ impl GeoData {
         // manager reloads share this allocation-free indexing step.
         sites.sort_unstable_by_key(|category| category.code);
         ips.sort_unstable_by_key(|category| category.code);
-        let release = (!sites.is_empty() || !ips.is_empty()).then(manager::SnapshotRelease::new);
+        let release = (!sites.is_empty() || !ips.is_empty() || asn.is_some())
+            .then(manager::SnapshotRelease::new);
         Self {
             sites,
             ips,
+            asn,
             allocation_capacity,
             peak_allocation_capacity,
             release,
@@ -244,7 +269,7 @@ impl GeoData {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.sites.is_empty() && self.ips.is_empty()
+        self.sites.is_empty() && self.ips.is_empty() && self.asn.is_none()
     }
 
     #[must_use]
@@ -255,6 +280,11 @@ impl GeoData {
     #[must_use]
     pub fn geoip_available(&self, code: &str) -> bool {
         lan_selector(code) || self.ip_category(code).is_some()
+    }
+
+    #[must_use]
+    pub fn asn_available(&self) -> bool {
+        self.asn.is_some()
     }
 
     fn site_category(&self, code: &str) -> Option<&SiteCategory> {
@@ -302,6 +332,14 @@ pub(crate) fn matches_lan(code: &str, ip: IpAddr) -> Option<bool> {
 }
 
 impl GeoMatcher for GeoData {
+    fn asn_available(&self) -> bool {
+        GeoData::asn_available(self)
+    }
+    fn matches_asn(&self, payload: &str, address: IpAddr) -> bool {
+        self.asn
+            .as_ref()
+            .is_some_and(|database| database.matches(payload, address))
+    }
     fn geosite_available(&self, code: &str) -> bool {
         GeoData::geosite_available(self, code)
     }
@@ -411,10 +449,13 @@ impl CodeSet {
     }
 }
 
+static EMPTY_CODE_SET: CodeSet = CodeSet::EMPTY;
+
 #[derive(Debug)]
 struct RequestedCodes {
     sites: CodeSet,
     ips: CodeSet,
+    asn: bool,
 }
 
 impl RequestedCodes {
@@ -425,6 +466,7 @@ impl RequestedCodes {
         let mut requested = Self {
             sites: CodeSet::EMPTY,
             ips: CodeSet::EMPTY,
+            asn: false,
         };
         let mut pending: Vec<_> = rules.into_iter().collect();
         while let Some(rule) = pending.pop() {
@@ -441,6 +483,7 @@ impl RequestedCodes {
                 | RuleKind::SubRule {
                     predicate: child, ..
                 } => pending.push(child),
+                RuleKind::IpAsn(_) | RuleKind::SrcIpAsn(_) => requested.asn = true,
                 RuleKind::GeoSite(code) => requested.sites.insert(GeoDataKind::GeoSite, code)?,
                 RuleKind::GeoIp(code) | RuleKind::SrcGeoIp(code) => {
                     requested.ips.insert(GeoDataKind::GeoIp, code)?
@@ -455,6 +498,7 @@ impl RequestedCodes {
                     .flat_map(|set| set.classical.iter().cloned())
                     .collect::<Vec<_>>();
                 let nested = Self::collect(&rules, &[])?;
+                requested.asn |= nested.asn;
                 for code in nested.sites.selectors {
                     requested.sites.insert(GeoDataKind::GeoSite, &code)?;
                 }
@@ -470,7 +514,7 @@ impl RequestedCodes {
     }
 
     const fn total(&self) -> usize {
-        self.sites.selectors.len() + self.ips.selectors.len()
+        self.sites.selectors.len() + self.ips.selectors.len() + self.asn as usize
     }
 }
 
@@ -485,6 +529,7 @@ impl RequestedCodes {
 pub struct GeoRequirements {
     sites: CodeSet,
     ips: CodeSet,
+    asn: bool,
 }
 
 impl GeoRequirements {
@@ -546,6 +591,7 @@ impl GeoRequirements {
         let mut result = Self {
             sites: requested.sites,
             ips: requested.ips,
+            asn: requested.asn,
         };
         if config.sniffer.enable {
             result.extend(&Self::collect(&config.sniffer.skip_src_address, &[])?)?;
@@ -565,6 +611,7 @@ impl GeoRequirements {
     }
 
     pub(crate) fn extend(&mut self, other: &Self) -> Result<(), GeoDataError> {
+        self.asn |= other.asn;
         for selector in &other.sites.selectors {
             self.sites.insert(GeoDataKind::GeoSite, selector)?;
         }
@@ -584,12 +631,13 @@ impl GeoRequirements {
         Ok(Self {
             sites: requested.sites,
             ips: requested.ips,
+            asn: requested.asn,
         })
     }
 
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.sites.values.is_empty() && self.ips.values.is_empty()
+        self.sites.values.is_empty() && self.ips.values.is_empty() && !self.asn
     }
 
     #[must_use]
@@ -597,6 +645,7 @@ impl GeoRequirements {
         match kind {
             GeoDataKind::GeoSite => !self.sites.values.is_empty(),
             GeoDataKind::GeoIp => !self.ips.values.is_empty(),
+            GeoDataKind::Asn => self.asn,
         }
     }
 
@@ -610,6 +659,7 @@ impl GeoRequirements {
         let set = match kind {
             GeoDataKind::GeoSite => &self.sites,
             GeoDataKind::GeoIp => &self.ips,
+            GeoDataKind::Asn => &EMPTY_CODE_SET,
         };
         set.selectors.iter().map(String::as_str)
     }
@@ -618,6 +668,7 @@ impl GeoRequirements {
         match kind {
             GeoDataKind::GeoSite => &self.sites,
             GeoDataKind::GeoIp => &self.ips,
+            GeoDataKind::Asn => &EMPTY_CODE_SET,
         }
     }
 }
@@ -663,6 +714,9 @@ fn load_ips_for_requirements(
 }
 
 fn validate_asset_structure(asset_dir: &Path, kind: GeoDataKind) -> Result<(), GeoDataError> {
+    if kind == GeoDataKind::Asn {
+        return asn::AsnCandidate::load(asset_dir).map(drop);
+    }
     let (mut file, len) = open_asset(asset_dir, kind)?;
     let mut ledger = AllocationLedger::default();
     let _ = index_selected(&mut file, len, kind, &CodeSet::EMPTY, &mut ledger)?;

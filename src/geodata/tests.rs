@@ -1172,6 +1172,7 @@ fn large_assets_skip_unselected_payloads_without_file_size_quotas() {
         file.write_all(&category).unwrap();
         file.seek(SeekFrom::Current(padding as i64)).unwrap();
         let (selected, rule_kind) = match kind {
+            GeoDataKind::Asn => unreachable!("this case tests DAT framing"),
             GeoDataKind::GeoSite => (
                 site("selected", &[domain(3, "last.test")]),
                 RuleKind::GeoSite("selected".into()),
@@ -1184,6 +1185,7 @@ fn large_assets_skip_unselected_payloads_without_file_size_quotas() {
         file.write_all(&field_bytes(1, &selected)).unwrap();
         let data = GeoData::load(dir.path(), &[rule(rule_kind)]).unwrap();
         match kind {
+            GeoDataKind::Asn => unreachable!("this case tests DAT framing"),
             GeoDataKind::GeoSite => assert!(data.matches_geosite("selected", "last.test")),
             GeoDataKind::GeoIp => {
                 assert!(data.matches_geoip("selected", "10.0.0.1".parse().unwrap()))

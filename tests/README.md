@@ -16,6 +16,7 @@ cargo test --locked --lib config::tls_policy_tests::
 cargo test --locked --lib explicit_verification_name_does_not_change_sni_or_allow_skip_to_override_it
 cargo test --locked --lib mutual_tls_identity_is_required_verified_and_not_shared_between_clients
 cargo test --locked --lib geodata::tests::
+cargo test --locked --features cli --lib asn_
 cargo test --locked --all-features --lib resource::http::tests::
 cargo test --locked --all-features --lib outbound::http::tests::
 cargo test --locked --all-features --lib platform::linux_network::tests::

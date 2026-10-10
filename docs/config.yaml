@@ -38,7 +38,7 @@ profile:
   store-fake-ip: false # true：dataDir/fake-ip.redb 持久化双向映射与分配位置
 
 # 资源下载使用 global-ua（缺省 Vole/ 加 Core 版本）；etag-support 缺省 true。
-# GeoData 字段独立可选；URL 缺省 MetaCubeX meta-rules-dat latest DAT。
+# GeoData 字段独立可选；URL 缺省 MetaCubeX meta-rules-dat latest DAT / ASN MMDB。
 # URL 以域名为主机、无 userinfo/fragment，生产构建使用 HTTPS。
 # 自动更新默认 false；启动后仍获取缺失的必需资产。周期单位小时，默认 24，0 关闭周期检查。
 global-ua: "Vole/0.1.0"
@@ -46,6 +46,7 @@ etag-support: true
 geox-url:
   geoip: https://assets.example.com/geoip.dat
   geosite: https://assets.example.com/geosite.dat
+  asn: https://assets.example.com/ASN.mmdb
 geo-auto-update: true
 geo-update-interval: 24
 
@@ -614,9 +615,9 @@ dns:
 # rules 可省略或为空；rule 模式按顺序首条命中，未命中 DIRECT。MATCH 可放在任意
 # 位置，普通目标命中后其后规则不再执行。DIRECT、REJECT 是内置出口，其他出口精确引用节点或组。
 # 支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、DOMAIN-WILDCARD、DOMAIN-REGEX、
-# GEOSITE、GEOIP、SRC-GEOIP、IP-CIDR、IP-CIDR6、SRC-IP-CIDR、DST-PORT、SRC-PORT、NETWORK、
+# GEOSITE、GEOIP、SRC-GEOIP、IP-ASN、SRC-IP-ASN、IP-CIDR、IP-CIDR6、SRC-IP-CIDR、DST-PORT、SRC-PORT、NETWORK、
 # IN-TYPE、IN-USER、IN-PORT、RULE-SET、SUB-RULE、AND/OR/NOT 和 MATCH。来源信息来自实际入站会话。
-# CIDR 两种别名都按 payload 实际地址族解析；GEOIP/CIDR/RULE-SET 可追加 src，自动禁止 DNS。
+# CIDR 两种别名都按 payload 实际地址族解析；GEOIP/IP-ASN/CIDR/RULE-SET 可追加 src，自动禁止 DNS。
 # RULE-SET 的 src 在局部视图交换源/目标 IP 与端口，保留域名、入口类型和身份。
 # IN-TYPE 为 / 分隔的 Mihomo 类型名，大小写无关，SOCKS 展开为 SOCKS4/SOCKS5；
 # IN-USER 为 / 分隔、区分大小写的已认证用户名。两种列表逐项 trim，空项报错。
@@ -634,6 +635,8 @@ dns:
 # 组的控制目标先于 disable-udp/节点 UDP 检查；跳过不推进轮询。实际出口只选择一次。
 # GEOSITE 支持 [!]<code>[@<attr>...]，GEOIP 支持 [!]<code> 和可选 no-resolve。
 # SRC-GEOIP 与 GEOIP,...,src 等价，来源规则不触发 DNS；lan 为无需资产的内置 GeoIP。
+# IP-ASN 按实际目标 IP 查询 ASN.mmdb，可带 no-resolve；SRC-IP-ASN 使用实际来源 IP。
+# ASN payload 逐字匹配，不转换 AS 前缀或补零；仅引用时加载，数值型数据库无记录匹配 0。
 # 例如 GEOSITE,google@ads,REJECT / GEOSITE,!cn@ads,main-select / GEOIP,!CN,DIRECT。
 # geolocation-!cn 为字面分类名；GeoIP DAT reverse_match 接受但忽略，取反由 ! 控制。
 # GEOSITE 没有域名不匹配；分类缺失不匹配，而有效空属性交集的反选匹配非空域名。

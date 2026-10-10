@@ -127,7 +127,7 @@ stopped -> preparing -> prepared -> starting -> running
 {"method":"getGeoDataState","payload":{}}
 ```
 
-返回 `geosite` 和 `geoip` 两项：
+返回 `geosite`、`geoip` 和 `asn` 三项；三种资产分别报告需求与可用性：
 
 ```json
 {
@@ -150,10 +150,22 @@ stopped -> preparing -> prepared -> starting -> running
     "lastError": null,
     "etag": null,
     "hash": null
+  },
+  "asn": {
+    "required": false,
+    "available": false,
+    "updating": false,
+    "lastSuccess": null,
+    "nextCheck": null,
+    "lastError": null,
+    "etag": null,
+    "hash": null
   }
 }
 ```
 
+`asn` 使用相同的 `required`、`available`、`updating`、`lastSuccess`、`nextCheck`、
+`lastError`、`etag` 和 `hash` 字段。
 时间使用 Unix 秒，hash 为小写 SHA-256。调用不会创建实例、联网或改变更新调度。
 
 ### `createInstance`

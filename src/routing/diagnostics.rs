@@ -182,6 +182,8 @@ fn rule_description(rule: &RuleKind) -> (&'static str, String) {
         RuleKind::GeoSite(s) => ("GeoSite", s.clone()),
         RuleKind::GeoIp(s) => ("GeoIP", s.clone()),
         RuleKind::SrcGeoIp(s) => ("SrcGeoIP", s.clone()),
+        RuleKind::IpAsn(s) => ("IPASN", s.clone()),
+        RuleKind::SrcIpAsn(s) => ("SrcIPASN", s.clone()),
         RuleKind::InTypes(types) => (
             "InType",
             types

@@ -359,17 +359,27 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
                 None => RuleAction::Direct,
             };
             let mut no_resolve = false;
-            let mut source = kind == "SRC-GEOIP" || kind == "SRC-IP-CIDR";
+            let mut source = matches!(kind.as_str(), "SRC-GEOIP" | "SRC-IP-CIDR" | "SRC-IP-ASN");
             for option in fields {
                 if option == "no-resolve"
                     && matches!(
                         kind.as_str(),
-                        "RULE-SET" | "GEOIP" | "SRC-GEOIP" | "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR"
+                        "RULE-SET"
+                            | "GEOIP"
+                            | "SRC-GEOIP"
+                            | "IP-CIDR"
+                            | "IP-CIDR6"
+                            | "SRC-IP-CIDR"
+                            | "IP-ASN"
+                            | "SRC-IP-ASN"
                     )
                 {
                     no_resolve = true;
                 } else if option == "src"
-                    && matches!(kind.as_str(), "RULE-SET" | "GEOIP" | "IP-CIDR" | "IP-CIDR6")
+                    && matches!(
+                        kind.as_str(),
+                        "RULE-SET" | "GEOIP" | "IP-CIDR" | "IP-CIDR6" | "IP-ASN"
+                    )
                 {
                     source = true;
                 } else {
@@ -396,6 +406,13 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
                 RuleKind::SrcGeoIp(code)
             } else {
                 RuleKind::GeoIp(code)
+            }
+        }
+        "IP-ASN" | "SRC-IP-ASN" => {
+            if source {
+                RuleKind::SrcIpAsn(payload.to_owned())
+            } else {
+                RuleKind::IpAsn(payload.to_owned())
             }
         }
         "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR" => {

@@ -185,6 +185,7 @@ pub struct GeoDataUpdateConfig {
 pub struct GeoDataUrls {
     pub geoip: String,
     pub geosite: String,
+    pub asn: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,6 +493,8 @@ pub enum RuleKind {
     GeoSite(String),
     GeoIp(String),
     SrcGeoIp(String),
+    IpAsn(String),
+    SrcIpAsn(String),
     InTypes(Vec<RuleInboundType>),
     InUsers(Vec<String>),
     InPorts(Vec<PortRange>),
@@ -1151,6 +1154,8 @@ struct RawGeoDataUrls {
     geoip: String,
     #[serde(default = "default_geosite_url")]
     geosite: String,
+    #[serde(default = "default_asn_url")]
+    asn: String,
 }
 fn default_global_ua() -> String {
     concat!("Vole/", env!("CARGO_PKG_VERSION")).into()
@@ -1161,11 +1166,15 @@ fn default_geoip_url() -> String {
 fn default_geosite_url() -> String {
     "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat".into()
 }
+fn default_asn_url() -> String {
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb".into()
+}
 impl Default for RawGeoDataUrls {
     fn default() -> Self {
         Self {
             geoip: default_geoip_url(),
             geosite: default_geosite_url(),
+            asn: default_asn_url(),
         }
     }
 }
@@ -2188,6 +2197,7 @@ fn normalize_geodata_update(
         urls: GeoDataUrls {
             geoip: normalize_geox_url(urls.geoip, "geox-url.geoip")?,
             geosite: normalize_geox_url(urls.geosite, "geox-url.geosite")?,
+            asn: normalize_geox_url(urls.asn, "geox-url.asn")?,
         },
         auto_update: auto_update.unwrap_or(false),
         interval_hours,

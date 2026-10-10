@@ -1185,6 +1185,7 @@ fn geodata_status_data(status: GeoDataStatus) -> Value {
     json!({
         "geosite": geodata_resource_data(status.geosite),
         "geoip": geodata_resource_data(status.geoip),
+        "asn": geodata_resource_data(status.asn),
     })
 }
 

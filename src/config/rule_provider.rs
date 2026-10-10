@@ -202,8 +202,10 @@ impl RuleCollection {
         let context = RoutingContext::new(Network::Tcp, &destination).expect("literal address");
         if self.behavior == RuleBehavior::Classical {
             self.classical.iter().any(|rule| {
-                matches!(rule.kind, RuleKind::IpCidr(_) | RuleKind::GeoIp(_))
-                    && crate::routing::matches_rule(rule, &context, geo).unwrap_or(false)
+                matches!(
+                    rule.kind,
+                    RuleKind::IpCidr(_) | RuleKind::GeoIp(_) | RuleKind::IpAsn(_)
+                ) && crate::routing::matches_rule(rule, &context, geo).unwrap_or(false)
             })
         } else {
             self.matches(&context, geo, true, false).unwrap_or(false)

@@ -1,6 +1,6 @@
 # GeoData 规则与资产
 
-Vole 管理 `dataDir/geodata` 下的 `geosite.dat` 和 `geoip.dat`，只为当前配置实际引用的
+Vole 管理 `dataDir/geodata` 下的 `geosite.dat`、`geoip.dat` 和 `ASN.mmdb`，只为当前配置实际引用的
 分类与属性交集构建匹配器。主规则和所有 `sub-rules` 定义中的谓词、逻辑子项及
 classical provider 内容共同收集引用；每个定义只遍历一次，不沿调用边展开。所有平台均不设 GeoData 条数上限，不按数量截断记录，
 也不设总内存预算。资产缺失或加载失败时，对应种类不可用，跳过相应 Geo 规则并继续
@@ -24,6 +24,8 @@ rules:
 GEOSITE,[!]<code>[@<attribute>...],<target>
 GEOIP,[!]<code>,<target>[,no-resolve][,src]
 SRC-GEOIP,[!]<code>,<target>
+IP-ASN,<asn>,<target>[,no-resolve][,src]
+SRC-IP-ASN,<asn>,<target>
 ```
 
 - 规则类型和 `code` 不区分 ASCII 大小写，route target 名称大小写敏感并精确匹配。
@@ -39,6 +41,8 @@ SRC-GEOIP,[!]<code>,<target>
   `cn@!ads` 查找字面 key `!ads`；`geolocation-!cn` 是字面分类名。
 - GeoIP 支持前置 `!`，不支持属性或单条多个 code。`lan` 是内置分类：私有、未指定、
   回环、多播与链路本地单播地址；来源与目标均可使用，不读取 GeoIP 资产。
+- `IP-ASN` 的 payload 逐字匹配 ASN 十进制值，不转换 `AS` 前缀或补零；
+  `src` 和 `SRC-IP-ASN` 使用实际来源 IP，不触发 DNS。不可用的 ASN 不触发惰性 DNS。
 - rule 模式按顺序首条命中，未命中 DIRECT；可选的 `MATCH` 使用 `DIRECT`、`REJECT`、实际代理节点或代理组。
 
 DNS `nameserver-policy` 中的 `geosite:<selector>[,<selector>...]` 接受相同的属性与反选语义，
@@ -57,6 +61,7 @@ Unicode 版本的 Mihomo 在所有新字符上完全等价。
 | --- | --- | --- | --- |
 | `GEOSITE` | `geosite.dat` | `GeoSiteList` | code 与 Domain 记录 |
 | `GEOIP` | `geoip.dat` | `GeoIPList` | code 与 IPv4/IPv6 CIDR |
+| `IP-ASN` / `SRC-IP-ASN` | `ASN.mmdb` | MaxMind DB | IPv4/IPv6 ASN 索引 |
 
 - 文件路径固定，YAML 不能指定本地路径或环境变量。
 - 文件必须是普通文件；校验外层帧、code、分类引用、实际选中的 CIDR / Domain 记录。
@@ -64,25 +69,50 @@ Unicode 版本的 Mihomo 在所有新字符上完全等价。
 - 只引用属性交集时，先流式检查属性；未命中任何交集的记录按 wire/length 边界跳过，
   不校验 value 或编译 Regex。引用无属性 selector 时则包含该分类的全部记录。
 - 目标 code 缺失、重复或损坏时，整份对应种类的快照不可用，不能当作空分类。
-- GeoSite 和 GeoIP 分别校验和报告可用性，一类不可用不影响基础规则。
+- GeoSite、GeoIP 和 ASN 分别校验和报告可用性，一类不可用不影响其他种类或基础规则。
+
+## ASN MMDB
+
+仅在规则或 classical 内容引用 ASN 时读取 `ASN.mmdb`。支持数据库类型
+`GeoLite2-ASN`、`DBIP-ASN-Lite (compat=GeoLite2-ASN)` 和
+`ipinfo generic_asn_free.mmdb`；前两者读取 `autonomous_system_number`，后者读取
+`asn` 并移除其 `AS` 前缀。合法的数值型数据库无记录时按 ASN `0` 匹配；数据库
+不可用、索引错误或记录字段无效不会被当作 ASN `0`。IPinfo 无记录不匹配。
+
+使用一个拥有文件字节的 MMDB Reader，直接查询 IPv4/IPv6 索引，不展开 CIDR，也不
+建立按地址增长的缓存。查询只解码所需字段，不复制完整记录。ASN 与目标 GEOIP 共用
+既有惰性 DNS 路径；`no-resolve` 不主动解析，但可使用先前规则已解析的地址。
+
+更新先以唯一候选字节缓冲构造借用 Reader，完整校验 metadata、树、separator 和
+数据图；校验失败时保留当前内存与磁盘代次。校验期间旧文件字节与候选字节必然重叠，
+验证还会临时分配第三方 metadata 和图检查状态。借用 Reader 释放后，暂停新快照读取、
+等待旧读者结束；超时或取消时恢复旧快照。旧存储析构后才将同一候选缓冲移入 owned
+Reader，重建 metadata，避免另一份全量候选复制。
+
+ASN 提交保留旧磁盘文件的 hard link（不可用时复制）；提交失败先丢弃候选内存，再
+恢复旧稳定文件和调度状态并重新加载旧匹配器。恢复磁盘或状态遇真实 I/O 错误时报告
+该错误；不能恢复旧文件时 ASN 降级，其他健康种类继续可用。停止仍等待管理任务完成。
+普通 DAT 更新与外部重载保留后文的独立降级契约。
 
 ## 自动更新
 
 HTTP 传输由共享资源模块维护，所有跳转经过当前 Core dispatcher。下载、管理阻塞任务和解析均在停止屏障内；取消及下载 future 被丢弃时清理未发布的暂存文件。
 
-三个字段独立可选。缺省使用 MetaCubeX meta-rules-dat 的 latest GeoIP/GeoSite DAT URL；自动更新默认关闭，周期默认 24 小时：
+三个字段独立可选。缺省使用 MetaCubeX meta-rules-dat 的 latest GeoIP/GeoSite DAT 与
+`GeoLite2-ASN.mmdb` URL；自动更新默认关闭，周期默认 24 小时：
 
 ```yaml
 geox-url:
   geoip: https://assets.example.com/geoip.dat
   geosite: https://assets.example.com/geosite.dat
+  asn: https://assets.example.com/ASN.mmdb
 geo-auto-update: true
 geo-update-interval: 24
 ```
 
 约束：
 
-- `geox-url` 只能包含 `geoip` 和 `geosite`；URL 必须是以域名为主机、无 userinfo/fragment 的绝对 HTTPS URL。
+- `geox-url` 只能包含 `geoip`、`geosite` 和 `asn`；URL 必须是以域名为主机、无 userinfo/fragment 的绝对 HTTPS URL。
 - `geo-update-interval` 单位为小时，支持非负整数；0 停用周期更新。
 - `validateConfig` 和准备阶段不下载。运行后仅为当前引用的资产启动资源任务；缺失或不可用时获取默认或配置的 URL，自动更新控制可用资产的周期检查。
 - 下载按当前 mode 与业务规则选路，未命中使用 DIRECT；可选目标包含内置动作、节点和代理组。选中代理组时，每次新建下载物理 transport 时沿嵌套组解析到当时选中的叶节点；失败不自动换成员，也不隐式回退 DIRECT 或系统代理。
@@ -174,6 +204,7 @@ Domain/Full 在加载时原地排序紧凑记录，运行时对完整名称及�
 - 更新在下载和 staging 检查期间继续使用当前快照。构建新匹配器前，原子发布空匹配器、
   释放 Manager 的旧快照引用，并等待最后一位旧选路读者完成、旧匹配器存储析构结束。
   此后只构建一次候选；磁盘与调度状态提交成功后直接原子发布，不从最终文件重复加载。
+  ASN 使用前文的完整预校验与失败恢复流程。
 - 注册、重载与更新提交通过 Manager 管理锁串行，避免旧重载覆盖新发布；业务和 DNS
   的 ArcSwap 读取不获取该锁，也不等待排空。旧读者继续完成本次求值；排空、加载期间
   新请求复用首次资产缺失的语义，仅跳过不可用的 Geo 规则，继续普通规则与既有 DNS
@@ -182,7 +213,7 @@ Domain/Full 在加载时原地排序紧凑记录，运行时对完整名称及�
   取消不构建或发布新候选。后台状态观测、开始更新、提交和 304 恢复均移出业务 worker，
   Stop 取消后仍等待管理任务结束，不遗留后台发布。已开始的 CPU 加载不能中途强制
   中断；结束后检查取消并丢弃候选，因此 25 ms 不是完整 Stop 的耗时保证。
-- 重载按已注册的 selector 重建属性索引与匹配器，两类可用性独立。卸载后的所选记录
+- 重载按已注册的 selector 与 ASN 需求重建匹配器，三类可用性独立。卸载后的所选记录
   加载失败使对应种类保持不可用，仍发布另一类健康数据；不重新安装旧整体快照。
   更新候选无效时保留旧磁盘文件并记录失败，后续继续按现有调度重试。
 - 重载首次取消检查前先记录待重载状态。卸载前取消保留旧匹配器；即使新磁盘代次
@@ -190,7 +221,8 @@ Domain/Full 在加载时原地排序紧凑记录，运行时对完整名称及�
   排空超时或卸载后取消保持空匹配器及待重载状态，自动更新关闭时亦可恢复。
   已发布的独立降级结果不标记为待重载，失败种类保持不可用，直到下一次明确重载或更新。
 - 新流使用当时的可用快照；已经完成的 TCP 选路和 TUN UDP 固定 action 不回溯。
-  当前完整重建所需两类数据，不跨代复用分类存储；排空防止两代 matcher 存储同时存活，
+  当前完整重建所需的各类数据，不跨代复用分类存储；排空防止两代 owned matcher 同时存活，
+  ASN 校验期的字节重叠见上文，
   不保证 allocator 立即归还 RSS，也不限制单代加载峰值。
 - 分类表在加载时按 code 排序，运行时大小写无关二分定位；规则仍按配置顺序首命中。
   每次业务选路捕获一份当前不可变快照，整次求值复用，不在每条 Geo 规则上重复读取 ArcSwap。
@@ -228,7 +260,8 @@ fallible Vec 扩容、合法 protobuf 帧/长度、code、选中匹配值的 UTF
 
 容量账本仅作诊断：统计 Vole 自有 matcher/index/value/临时 Vec 的可见容量，扩容时
 记录新旧缓冲可能重叠的容量；没有最大值、不控制准入。`regex::bytes::Regex` 不提供
-完整内部状态的准确 `memory_usage`，所以账本**不包含正则内部编译状态、搜索缓存、
+完整内部状态的准确 `memory_usage`；ASN 文件缓冲容量计入快照容量，借用候选
+验证期的新旧字节重叠与 MMDB metadata/图校验状态未计入。因此账本**不包含正则内部编译状态、搜索缓存、
 动态 scratch、配置需求集合、allocator 开销或整个进程 footprint**。这些未计入的
 内存并不是零；accounted peak 不能作为加载或运行期峰值上界。
 50,000,000 bytes 是限定输入与联合负载下的进程实测验收目标，不是加载器保证。
@@ -249,8 +282,8 @@ Vole 自有脚本仅负责编译。压力与横向比较固定只引用完整 `g
   wire 结构或 staging 检查失败发生在卸载之前，当前快照继续可用。
 - 首次加载、外部资产重载或卸载后的所选记录加载失败，使对应种类不可用；健康种类
   独立发布。排空超时或卸载后取消也保持已卸载状态，不能通过反选绕过不可用语义。
-  失败更新保留旧磁盘资产，但不恢复旧内存快照；后续成功加载再恢复分流。
-- 不可用的 GeoIP 规则不得触发惰性 DNS。
+  DAT 失败更新保留旧磁盘资产，不恢复旧内存快照；ASN 更新按前文恢复旧代。
+- 不可用的 GeoIP 或 ASN 规则不得触发惰性 DNS。
 - 调度状态损坏时在更新锁内重置；异常退出留下的更新状态在锁释放后恢复。
 
 自动化与实机覆盖范围见 [验收矩阵](acceptance.md)。

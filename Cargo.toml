@@ -109,6 +109,7 @@ libc = "0.2"
 # Keep the log facade compiled out when SS is linked; Vole uses tracing.
 log = { version = "0.4", optional = true, features = ["max_level_off", "release_max_level_off"] }
 md-5 = { version = "0.11", optional = true }
+maxminddb = { version = "=0.32.0", default-features = false }
 quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 quinn-proto = { version = "=0.11.18", default-features = false, features = ["rustls-ring"], optional = true }
 rand = "0.10"

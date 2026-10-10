@@ -143,6 +143,7 @@ impl GeoDataUpdateService {
                 [
                     (GeoDataKind::GeoSite, urls.geosite.as_str()),
                     (GeoDataKind::GeoIp, urls.geoip.as_str()),
+                    (GeoDataKind::Asn, urls.asn.as_str()),
                 ],
                 SystemTime::now(),
                 &cancellation,
@@ -270,6 +271,7 @@ struct RetrySlot {
 struct RetryState {
     geosite: RetrySlot,
     geoip: RetrySlot,
+    asn: RetrySlot,
 }
 
 impl RetryState {
@@ -277,6 +279,7 @@ impl RetryState {
         match kind {
             GeoDataKind::GeoSite => &self.geosite,
             GeoDataKind::GeoIp => &self.geoip,
+            GeoDataKind::Asn => &self.asn,
         }
     }
 
@@ -284,6 +287,7 @@ impl RetryState {
         match kind {
             GeoDataKind::GeoSite => &mut self.geosite,
             GeoDataKind::GeoIp => &mut self.geoip,
+            GeoDataKind::Asn => &mut self.asn,
         }
     }
 
@@ -310,15 +314,19 @@ impl RetryState {
     }
 
     fn next_delay(&self, now: Instant) -> Option<Duration> {
-        [self.geosite.retry_at, self.geoip.retry_at]
-            .into_iter()
-            .flatten()
-            .map(|retry_at| retry_at.saturating_duration_since(now))
-            .min()
+        [
+            self.geosite.retry_at,
+            self.geoip.retry_at,
+            self.asn.retry_at,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|retry_at| retry_at.saturating_duration_since(now))
+        .min()
     }
 
     fn clear_expired_not_due(&mut self, due: &[GeoDataKind], now: Instant) {
-        for kind in [GeoDataKind::GeoSite, GeoDataKind::GeoIp] {
+        for kind in GeoDataKind::ALL {
             if !due.contains(&kind)
                 && self
                     .slot(kind)
@@ -335,6 +343,7 @@ fn resource_url(urls: &GeoDataUrls, kind: GeoDataKind) -> &str {
     match kind {
         GeoDataKind::GeoSite => &urls.geosite,
         GeoDataKind::GeoIp => &urls.geoip,
+        GeoDataKind::Asn => &urls.asn,
     }
 }
 
@@ -418,6 +427,7 @@ mod tests {
             GeoDataUrls {
                 geoip: "https://rules.example.test/geoip.dat".to_owned(),
                 geosite: "https://rules.example.test/geosite.dat".to_owned(),
+                asn: "https://rules.example.test/ASN.mmdb".to_owned(),
             },
             "fixture".into(),
             true,
@@ -472,6 +482,7 @@ mod tests {
         let urls = GeoDataUrls {
             geoip: "https://rules.example.test/custom-geoip".to_owned(),
             geosite: "https://rules.example.test/custom-geosite".to_owned(),
+            asn: "https://rules.example.test/custom-asn".to_owned(),
         };
         assert_eq!(
             resource_url(&urls, GeoDataKind::GeoSite),

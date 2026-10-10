@@ -267,6 +267,13 @@ pub trait GeoMatcher: Send + Sync {
         true
     }
 
+    fn asn_available(&self) -> bool {
+        false
+    }
+    fn matches_asn(&self, _payload: &str, _address: IpAddr) -> bool {
+        false
+    }
+
     fn matches_geosite(&self, code: &str, domain: &str) -> bool;
     fn matches_geoip(&self, code: &str, address: IpAddr) -> bool;
 }
@@ -632,6 +639,9 @@ fn normalize_rule(
                 .map_err(|_| RuleSetError::InvalidGeoCode { rule_index: index })?;
             *bytes = checked_text_bytes(*bytes, value.len())?;
         }
+        RuleKind::IpAsn(value) | RuleKind::SrcIpAsn(value) => {
+            *bytes = checked_text_bytes(*bytes, value.len())?;
+        }
         RuleKind::IpCidr(cidr) | RuleKind::SrcIpCidr(cidr) => {
             if !valid_cidr(cidr) {
                 return Err(RuleSetError::InvalidCidr { rule_index: index });
@@ -680,7 +690,7 @@ pub(crate) fn uses_destination_ip(rule: &RuleSpec) -> bool {
         RuleKind::RuleSet {
             content, source, ..
         } => !source && content.as_ref().is_some_and(|set| set.uses_ip()),
-        RuleKind::IpCidr(_) | RuleKind::GeoIp(_) => true,
+        RuleKind::IpCidr(_) | RuleKind::GeoIp(_) | RuleKind::IpAsn(_) => true,
         RuleKind::And(children) | RuleKind::Or(children) => {
             children.iter().any(uses_destination_ip)
         }
@@ -743,6 +753,23 @@ pub(crate) fn matches_rule(
             } else {
                 false
             }
+        }
+        RuleKind::IpAsn(payload) => {
+            if !geo.asn_available() {
+                false
+            } else if let Some(address) = context.effective_ip() {
+                geo.matches_asn(payload, address)
+            } else if !rule.no_resolve && context.should_request_ip_resolution() {
+                return Err(());
+            } else {
+                false
+            }
+        }
+        RuleKind::SrcIpAsn(payload) => {
+            geo.asn_available()
+                && context
+                    .source_ip
+                    .is_some_and(|address| geo.matches_asn(payload, address))
         }
         RuleKind::IpCidr(cidr) => {
             if let Some(address) = context.effective_ip() {
