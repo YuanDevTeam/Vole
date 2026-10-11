@@ -2,11 +2,13 @@
 mod crypto;
 mod defaults;
 mod packet;
+mod reliability;
 mod stream;
 mod tcp;
+mod udp;
 mod wire;
 use crate::{
-    config::{MieruHandshake, MieruOutboundConfig, MieruTransport},
+    config::{MieruHandshake, MieruOutboundConfig},
     dispatch::{BoxStream, DatagramTransport, DispatchError},
     outbound::{
         ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector, UpstreamPath,
@@ -38,12 +40,6 @@ impl MieruOutbound {
         upstream: UpstreamPath,
         stream_buffer_capacity: usize,
     ) -> io::Result<Self> {
-        if config.transport != MieruTransport::Tcp {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Mieru UDP carrier is not implemented",
-            ));
-        }
         if config
             .traffic_pattern
             .as_ref()

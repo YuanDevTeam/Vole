@@ -718,6 +718,7 @@ impl UpstreamPath {
         feature = "outbound-hysteria2",
         feature = "outbound-tuic",
         feature = "outbound-trusttunnel",
+        feature = "outbound-mieru",
         feature = "outbound-wireguard"
     ))]
     pub(crate) async fn datagram_server(

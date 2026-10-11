@@ -255,12 +255,13 @@ proxies:
     udp: true
     health-check: true
 
-  # Mieru：transport 必填 TCP；同时承载 TCP 和 udp: true 的 UDP Associate。
+  # Mieru：transport 必填 TCP 或 UDP；二者均承载 TCP 和 udp: true 的 UDP Associate。
   # username/password 各为 1–64 UTF-8 字节，保留原值。port 与非空 port-range 互斥，
   # 范围如 "24810-24812"，每次新物理连接随机选择包含两端的端口。
   # multiplexing 为 MULTIPLEXING_DEFAULT/OFF/LOW/MIDDLE/HIGH，默认 LOW；
   # handshake-mode 为 HANDSHAKE_DEFAULT/STANDARD/NO_WAIT，默认 STANDARD。
-  # 枚举须携带上述完整前缀。UDP 底层与非空 traffic-pattern 尚未提供。
+  # 枚举须携带上述完整前缀。UDP 底层提供 ACK/重传/排序/窗口，不是裸 UDP 转发。
+  # 非空 traffic-pattern 尚未提供。
   - name: mieru-edge
     type: mieru
     server: mieru.example.com

@@ -20,7 +20,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    sync::{Notify, oneshot},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot},
     time::{Instant, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
@@ -30,10 +30,13 @@ pub(super) fn closed() -> io::Error {
 }
 #[derive(Default)]
 struct Input {
-    queue: VecDeque<Bytes>,
-    bytes: usize,
+    queue: VecDeque<ReceivedChunk>,
     failure: bool,
     finished: bool,
+}
+pub(super) struct ReceivedChunk {
+    pub bytes: Bytes,
+    pub permit: OwnedSemaphorePermit,
 }
 pub(super) struct State {
     pub id: u32,
@@ -50,6 +53,7 @@ pub(super) struct State {
     space: Notify,
     pub activity: Arc<Notify>,
     capacity: usize,
+    pub receive_bytes: Arc<Semaphore>,
     _observation: observation::Guard,
 }
 impl State {
@@ -74,6 +78,7 @@ impl State {
             space: Notify::new(),
             activity,
             capacity,
+            receive_bytes: Arc::new(Semaphore::new(capacity)),
             _observation: observation::track(ResourceKind::Session),
         })
     }
@@ -82,7 +87,6 @@ impl State {
         self.cancel.cancel();
         let mut input = self.input.lock().unwrap();
         input.queue.clear();
-        input.bytes = 0;
         drop(input);
         self.read.wake();
         self.write.wake();
@@ -101,47 +105,56 @@ impl State {
         self.space.notify_one();
         self.activity.notify_one();
     }
+    pub fn unread_segments(&self) -> usize {
+        self.input.lock().unwrap().queue.len()
+    }
+    pub(super) fn receive_capacity(&self) -> usize {
+        self.capacity
+    }
+    pub fn deliver_reserved(&self, chunk: ReceivedChunk) {
+        if chunk.bytes.is_empty() {
+            return;
+        }
+        let mut input = self.input.lock().unwrap();
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        input.queue.push_back(chunk);
+        drop(input);
+        self.read.wake();
+    }
     pub async fn deliver(&self, mut data: Bytes) -> io::Result<()> {
         while !data.is_empty() {
-            let space = self.space.notified();
-            tokio::pin!(space);
-            space.as_mut().enable();
-            if self.cancel.is_cancelled() {
-                return Err(closed());
-            }
-            let delivered = {
-                let mut input = self.input.lock().unwrap();
-                let available = self.capacity - input.bytes;
-                if available > 0 {
-                    let count = available.min(data.len());
-                    input.bytes += count;
-                    input.queue.push_back(data.split_to(count));
-                    true
-                } else {
-                    false
-                }
+            let count = data.len().min(self.capacity);
+            let permit = tokio::select! { biased;
+                ()=self.cancel.cancelled()=>return Err(closed()),
+                result=self.receive_bytes.clone().acquire_many_owned(count as u32)=>result.map_err(|_|closed())?,
             };
-            if delivered {
-                self.read.wake();
-            } else {
-                tokio::select! {biased;()=self.cancel.cancelled()=>return Err(closed()),()=space=>{}}
-            }
+            self.deliver_reserved(ReceivedChunk {
+                bytes: data.split_to(count),
+                permit,
+            });
         }
         Ok(())
     }
-    fn poll_read(&self, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    pub(super) fn poll_read(
+        &self,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         self.read.register(cx.waker());
         let mut input = self.input.lock().unwrap();
         if let Some(mut chunk) = input.queue.pop_front() {
-            let count = chunk.len().min(buffer.remaining());
-            buffer.put_slice(&chunk[..count]);
-            input.bytes -= count;
-            if count < chunk.len() {
-                chunk = chunk.slice(count..);
+            let count = chunk.bytes.len().min(buffer.remaining());
+            buffer.put_slice(&chunk.bytes[..count]);
+            drop(chunk.permit.split(count).unwrap());
+            if count < chunk.bytes.len() {
+                chunk.bytes = chunk.bytes.slice(count..);
                 input.queue.push_front(chunk);
             }
             drop(input);
             self.space.notify_one();
+            self.activity.notify_one();
             return Poll::Ready(Ok(()));
         }
         if input.failure {
@@ -162,11 +175,12 @@ pub(super) struct RawStream {
 }
 impl RawStream {
     pub fn new(carrier: Arc<Carrier>, state: Arc<State>, capacity: usize) -> Self {
+        let chunk = capacity.min(32768).min(carrier.maximum_write());
         Self {
             state,
             carrier,
             pending: None,
-            chunk: capacity.min(32768),
+            chunk,
             ended: false,
         }
     }
@@ -358,6 +372,9 @@ impl AsyncRead for Stream {
         cx: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         self.wake.read.register(cx.waker());
         self.state.read.register(cx.waker());
         if self.state.cancel.is_cancelled() && self.request.is_some() {

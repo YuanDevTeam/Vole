@@ -13,6 +13,21 @@ pub(crate) const TAG_LEN: usize = 16;
 /// The dependency's zeroize feature erases its key when the final owner is dropped.
 pub(crate) struct Key(XChaCha20Poly1305);
 
+impl Key {
+    fn seal(&self, nonce: &XNonce, plaintext: &mut [u8]) -> io::Result<[u8; TAG_LEN]> {
+        self.0
+            .encrypt_inout_detached(nonce, b"", plaintext.into())
+            .map(Into::into)
+            .map_err(|_| io::Error::other("Mieru encryption failed"))
+    }
+
+    fn open(&self, nonce: &XNonce, ciphertext: &mut [u8], tag: [u8; TAG_LEN]) -> io::Result<()> {
+        self.0
+            .decrypt_inout_detached(nonce, b"", ciphertext.into(), &Tag::from(tag))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Mieru authentication failed"))
+    }
+}
+
 impl fmt::Debug for Key {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("MieruKey(..)")
@@ -59,6 +74,36 @@ pub(crate) fn make_client_nonce(username: &str, mut random: [u8; NONCE_LEN]) -> 
     random
 }
 
+/// Stateless UDP encryption under a fixed physical-carrier key. Every datagram has an
+/// explicit nonce; its metadata and nonempty payload use that same nonce separately.
+/// The carrier generates a fresh nonce for every send, including retransmissions.
+pub(super) struct PacketCipher {
+    key: Arc<Key>,
+}
+
+impl PacketCipher {
+    pub(super) fn new(key: Arc<Key>) -> Self {
+        Self { key }
+    }
+
+    pub(super) fn seal(
+        &self,
+        nonce: [u8; NONCE_LEN],
+        plaintext: &mut [u8],
+    ) -> io::Result<[u8; TAG_LEN]> {
+        self.key.seal(&nonce.into(), plaintext)
+    }
+
+    pub(super) fn open(
+        &self,
+        nonce: [u8; NONCE_LEN],
+        ciphertext: &mut [u8],
+        tag: [u8; TAG_LEN],
+    ) -> io::Result<()> {
+        self.key.open(&nonce.into(), ciphertext, tag)
+    }
+}
+
 /// A single TCP direction; deliberately not Clone so a used nonce cursor cannot be forked.
 pub(super) struct ImplicitCipher {
     key: Arc<Key>,
@@ -102,19 +147,12 @@ impl ImplicitCipher {
 
     pub(super) fn seal(&mut self, plaintext: &mut [u8]) -> io::Result<[u8; TAG_LEN]> {
         let nonce = self.next_nonce()?;
-        self.key
-            .0
-            .encrypt_inout_detached(&nonce, b"", plaintext.into())
-            .map(Into::into)
-            .map_err(|_| io::Error::other("Mieru encryption failed"))
+        self.key.seal(&nonce, plaintext)
     }
 
     pub(super) fn open(&mut self, ciphertext: &mut [u8], tag: [u8; TAG_LEN]) -> io::Result<()> {
         let nonce = self.next_nonce()?;
-        self.key
-            .0
-            .decrypt_inout_detached(&nonce, b"", ciphertext.into(), &Tag::from(tag))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Mieru authentication failed"))
+        self.key.open(&nonce, ciphertext, tag)
     }
 }
 

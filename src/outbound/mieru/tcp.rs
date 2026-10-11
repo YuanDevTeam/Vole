@@ -9,7 +9,7 @@ use super::{
     },
 };
 use crate::{
-    config::{MieruMultiplexing, MieruOutboundConfig},
+    config::{MieruMultiplexing, MieruOutboundConfig, MieruTransport},
     dispatch::BoxStream,
     outbound::{EstablishContext, UpstreamPath, server_destination},
     resources::observation::{self, ResourceKind},
@@ -21,7 +21,10 @@ use std::{
     collections::HashMap,
     io,
     pin::Pin,
-    sync::{Arc, Mutex, Weak, atomic::Ordering},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -42,7 +45,7 @@ pub(super) struct WriterCommand {
     pub done: oneshot::Sender<io::Result<()>>,
     pub _bytes: OwnedSemaphorePermit,
 }
-struct Schedule {
+pub(super) struct Schedule {
     pending: usize,
     last_schedule: Instant,
     disabled: Option<Instant>,
@@ -50,16 +53,35 @@ struct Schedule {
     in_bytes: u64,
     out_bytes: u64,
 }
-struct Shared {
-    sessions: Mutex<HashMap<u32, Arc<State>>>,
+pub(super) struct Shared {
+    pub(super) sessions: Mutex<HashMap<u32, Arc<State>>>,
     control: mpsc::Sender<Metadata>,
-    schedule: Mutex<Schedule>,
-    cancel: CancellationToken,
-    activity: Arc<Notify>,
+    pub(super) schedule: Mutex<Schedule>,
+    pub(super) cancel: CancellationToken,
+    pub(super) activity: Arc<Notify>,
     idle: Duration,
-    volume: u64,
+    pub(super) volume: u64,
+    created: Instant,
+    udp: bool,
+    maximum_write: AtomicUsize,
 }
 impl Shared {
+    pub(super) fn reap_unopened(&self) {
+        self.sessions.lock().unwrap().retain(|_, state| {
+            !(state.cancel.is_cancelled() && !state.opened.load(Ordering::Acquire))
+        });
+    }
+
+    pub(super) fn set_maximum_write(&self, value: usize) {
+        self.maximum_write.store(value, Ordering::Release);
+    }
+    pub(super) fn count_input(&self, count: usize) {
+        self.schedule.lock().unwrap().in_bytes += count as u64;
+    }
+    pub(super) fn count_output(&self, count: usize) {
+        self.schedule.lock().unwrap().out_bytes += count as u64;
+    }
+
     fn reserve(&self) -> bool {
         let mut schedule = self.schedule.lock().unwrap();
         if schedule.closed || schedule.disabled.is_some() || self.cancel.is_cancelled() {
@@ -85,10 +107,14 @@ impl Shared {
             })
             .count()
     }
-    fn clean(&self) -> bool {
+    pub(super) fn clean(&self) -> bool {
         let active = self.count();
         let mut schedule = self.schedule.lock().unwrap();
         let now = Instant::now();
+        if self.udp && now >= self.created + Duration::from_secs(60) && schedule.disabled.is_none()
+        {
+            schedule.disabled = Some(now);
+        }
         if active == 0
             && schedule.pending == 0
             && now >= schedule.last_schedule + self.idle
@@ -112,7 +138,7 @@ impl Shared {
         }
         false
     }
-    fn fail(&self) {
+    pub(super) fn fail(&self) {
         self.cancel.cancel();
         self.schedule.lock().unwrap().closed = true;
         for state in self.sessions.lock().unwrap().values() {
@@ -161,6 +187,11 @@ pub(super) struct Carrier {
     shared: Arc<Shared>,
     pub writer: mpsc::Sender<WriterCommand>,
     pub bytes: Arc<Semaphore>,
+}
+impl Carrier {
+    pub fn maximum_write(&self) -> usize {
+        self.shared.maximum_write.load(Ordering::Acquire)
+    }
 }
 impl Drop for Carrier {
     fn drop(&mut self) {
@@ -325,6 +356,9 @@ impl Client {
             activity: Arc::new(Notify::new()),
             idle: self.idle,
             volume: 512 * 1024 * 1024_u64 << self.factor,
+            created: Instant::now(),
+            udp: self.factory.config.transport == MieruTransport::Udp,
+            maximum_write: AtomicUsize::new(32768),
         });
         let (writer, commands) = mpsc::channel(WRITER_COMMANDS);
         let carrier = Arc::new(Carrier {
@@ -395,7 +429,7 @@ impl Drop for SetupCancel {
         }
     }
 }
-fn now() -> io::Result<u64> {
+pub(super) fn now() -> io::Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|time| time.as_secs())
@@ -420,6 +454,24 @@ async fn drive(
     id: u64,
 ) {
     let _pool = observation::track(ResourceKind::Pool);
+    if factory.config.transport == MieruTransport::Udp {
+        super::udp::drive(
+            &factory.config,
+            &factory.upstream,
+            session,
+            context,
+            &shared,
+            commands,
+            ready,
+        )
+        .await;
+        shared.fail();
+        shared.sessions.lock().unwrap().clear();
+        if let Some(registry) = registry.upgrade() {
+            registry.lock().unwrap().carriers.remove(&id);
+        }
+        return;
+    }
     let setup = async {
         let _handshake = observation::track(ResourceKind::Handshake);
         let port = rand::random_range(factory.config.port..=factory.config.port_end);
@@ -734,5 +786,50 @@ mod tests {
             })
             .await;
         assert!(probe.snapshot().is_idle());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn mieru_udp_carrier_age_disables_new_reservations_and_drains() {
+        let cancellation = CancellationToken::new();
+        let activity = Arc::new(Notify::new());
+        let state = State::new(1, 32768, &cancellation, activity.clone());
+        let (control, _) = mpsc::channel(1);
+        let shared = Shared {
+            sessions: Mutex::new(HashMap::from([(1, state.clone())])),
+            control,
+            schedule: Mutex::new(Schedule {
+                pending: 0,
+                last_schedule: Instant::now(),
+                disabled: None,
+                closed: false,
+                in_bytes: 0,
+                out_bytes: 0,
+            }),
+            cancel: cancellation,
+            activity,
+            idle: Duration::from_secs(150),
+            volume: 512 * 1024 * 1024,
+            created: Instant::now(),
+            udp: true,
+            maximum_write: AtomicUsize::new(32768),
+        };
+        // A lazy NO_WAIT connection may be dropped without ever submitting a write.
+        let unopened = State::new(2, 32768, &shared.cancel, shared.activity.clone());
+        shared.sessions.lock().unwrap().insert(2, unopened.clone());
+        unopened.close();
+        shared.reap_unopened();
+        assert_eq!(shared.sessions.lock().unwrap().len(), 1);
+        assert!(shared.sessions.lock().unwrap().contains_key(&1));
+        drop(unopened);
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(!shared.clean());
+        assert!(shared.reserve());
+        shared.release();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!shared.clean());
+        assert!(!shared.reserve());
+        assert!(!state.cancel.is_cancelled());
+        state.close();
+        tokio::time::advance(Duration::from_secs(150)).await;
+        assert!(shared.clean());
     }
 }

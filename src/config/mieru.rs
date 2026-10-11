@@ -109,7 +109,7 @@ impl RawMieru {
         }
         let transport = match self.transport.as_str() {
             "TCP" => MieruTransport::Tcp,
-            "UDP" => return invalid("Mieru UDP carrier is not implemented"),
+            "UDP" => MieruTransport::Udp,
             _ => return invalid("Mieru transport must be TCP or UDP"),
         };
         let multiplexing = match self.multiplexing.as_str() {
@@ -173,9 +173,9 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    fn parse(fields: &str) -> MieruOutboundConfig {
+    fn parse(transport: &str, fields: &str) -> MieruOutboundConfig {
         let yaml = format!(
-            "proxies:\n  - name: edge\n    type: mieru\n    server: edge.invalid\n    username: ' user '\n    password: ' password '\n    transport: TCP\n{fields}"
+            "proxies:\n  - name: edge\n    type: mieru\n    server: edge.invalid\n    username: ' user '\n    password: ' password '\n    transport: {transport}\n{fields}"
         );
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         let ProxyProtocol::Mieru(node) = &config.proxies[0].protocol else {
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn defaults_preserve_credentials_and_tcp_carrier_udp_business() {
-        let node = parse("    port: 443\n    udp: true\n");
+        let node = parse("TCP", "    port: 443\n    udp: true\n");
         assert_eq!((node.port, node.port_end), (443, 443));
         assert_eq!(node.transport, MieruTransport::Tcp);
         assert!(node.udp);
@@ -201,6 +201,7 @@ mod tests {
     #[test]
     fn range_equal_endpoints_and_explicit_default_enums_are_valid() {
         let node = parse(
+            "TCP",
             "    port-range: 443-443\n    multiplexing: MULTIPLEXING_DEFAULT\n    handshake-mode: HANDSHAKE_DEFAULT\n",
         );
         assert_eq!((node.port, node.port_end), (443, 443));
@@ -211,10 +212,19 @@ mod tests {
     #[test]
     fn port_range_and_no_wait_keep_their_effective_settings() {
         let node = parse(
+            "TCP",
             "    port: 0\n    port-range: 4000-4002\n    multiplexing: MULTIPLEXING_OFF\n    handshake-mode: HANDSHAKE_NO_WAIT\n",
         );
         assert_eq!((node.port, node.port_end), (4000, 4002));
         assert_eq!(node.multiplexing, MieruMultiplexing::Off);
         assert_eq!(node.handshake_mode, MieruHandshake::NoWait);
+    }
+
+    #[test]
+    fn udp_carrier_does_not_enable_udp_business_by_itself() {
+        let node = parse("UDP", "    port-range: 4000-4002\n");
+        assert_eq!(node.transport, MieruTransport::Udp);
+        assert!(!node.udp);
+        assert_eq!((node.port, node.port_end), (4000, 4002));
     }
 }

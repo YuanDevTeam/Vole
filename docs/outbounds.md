@@ -79,8 +79,8 @@ aggressive，未知profile使用standard；负窗口参数按原带符号语义�
 
 ## Mieru
 
-`type: mieru` 使用 `outbound-mieru`，当前底层为必填的 `transport: TCP`，
-同时承载 TCP 和 `udp: true` 的多目标 UDP Associate。用户名、密码各为1–64 UTF-8字节，
+`type: mieru` 使用 `outbound-mieru`，底层 transport 必填 TCP 或 UDP，
+两者均承载 TCP 和 `udp: true` 的多目标 UDP Associate。用户名、密码各为1–64 UTF-8字节，
 不 trim；XChaCha20-Poly1305 分段认证使用物理连接建立时的时间派生密钥。
 业务目标通过协议内 SOCKS 请求传递，不进行 SOCKS 认证方法协商。
 
@@ -94,7 +94,12 @@ HANDSHAKE_DEFAULT/STANDARD 发送请求并等待 SOCKS 回复；HANDSHAKE_NO_WAI
 首个业务写入发送请求和数据，再确认回复。枚举必须使用完整前缀。
 关闭单个流仅释放其会话；节点 Stop 取消并 join 物理读写、清理及 UDP 读取任务。
 写队列、接收字节及 UDP 单包受运行时预算约束；取消不会重放加密帧。
-UDP 底层和非空 traffic-pattern 尚未提供。
+UDP 底层使用可靠会话，提供累计 ACK、重传、有序交付、分片和窗口。
+密钥固定于物理载体，每包使用显式 nonce；重传保留明文，重新生成 nonce 和时间戳。
+收发分别取1400字节 MTU 与真实上游预算的交集；乱序和未读数据共用接收字节预算，
+待确认明文持有发送预算，慢会话不阻塞其他会话的 ACK。
+创建60秒后的 UDP 载体停止接纳新会话，已有会话继续。
+非空 traffic-pattern 尚未提供。
 
 ## SOCKS5
 

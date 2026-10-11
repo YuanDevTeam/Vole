@@ -1,14 +1,16 @@
-//! Bounded TCP framing for the public Mieru v3 protocol.
+//! Bounded TCP and UDP framing for the public Mieru v3 protocol.
 //! https://github.com/enfein/mieru/blob/v3.38.1/docs/protocol.md
 //! Session state, SOCKS business bytes, carrier I/O ownership and padding policy live above it.
-use super::crypto::{ImplicitCipher, Key, NONCE_LEN, TAG_LEN};
-use bytes::Bytes;
+use super::crypto::{ImplicitCipher, Key, NONCE_LEN, PacketCipher, TAG_LEN};
+use bytes::{Bytes, BytesMut};
 use std::{fmt, io, sync::Arc};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub(crate) const METADATA_LEN: usize = 32;
 pub(crate) const MAX_CONTROL_PAYLOAD: usize = 1024;
 pub(crate) const MAX_DATA_PAYLOAD: usize = 32_768;
+pub(crate) const PACKET_HEADER_LEN: usize = NONCE_LEN + METADATA_LEN + TAG_LEN;
+pub(crate) const PACKET_OVERHEAD: usize = PACKET_HEADER_LEN + TAG_LEN;
 const ENCRYPTED_METADATA_LEN: usize = METADATA_LEN + TAG_LEN;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +188,124 @@ fn decode_metadata(header: [u8; METADATA_LEN], unix_secs: u64) -> io::Result<Hea
         prefix_len: usize::from(header[21]),
         suffix_len: usize::from(header[24]),
     })
+}
+
+/// Encodes one UDP datagram without retaining any packet or nonce state. The caller owns
+/// the physical payload budget, padding policy and fresh explicit nonce for every attempt.
+pub(crate) struct PacketEncoder {
+    cipher: PacketCipher,
+}
+
+impl PacketEncoder {
+    pub(crate) fn new(key: Arc<Key>) -> Self {
+        Self {
+            cipher: PacketCipher::new(key),
+        }
+    }
+
+    pub(crate) fn encode_frame(
+        &self,
+        metadata: Metadata,
+        payload: &[u8],
+        padding: Padding<'_>,
+        nonce: [u8; NONCE_LEN],
+        unix_secs: u64,
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        let header = encode_metadata(metadata, payload.len(), padding, unix_secs)?;
+        let payload_start = PACKET_HEADER_LEN + padding.prefix.len();
+        let payload_end = payload_start + payload.len();
+        let suffix_start = payload_end + if payload.is_empty() { 0 } else { TAG_LEN };
+        out.clear();
+        out.resize(suffix_start + padding.suffix.len(), 0);
+        out[..NONCE_LEN].copy_from_slice(&nonce);
+        out[NONCE_LEN..NONCE_LEN + METADATA_LEN].copy_from_slice(&header);
+        out[PACKET_HEADER_LEN..payload_start].copy_from_slice(padding.prefix);
+        out[payload_start..payload_end].copy_from_slice(payload);
+        out[suffix_start..].copy_from_slice(padding.suffix);
+        let tag = self
+            .cipher
+            .seal(nonce, &mut out[NONCE_LEN..NONCE_LEN + METADATA_LEN])?;
+        out[NONCE_LEN + METADATA_LEN..PACKET_HEADER_LEN].copy_from_slice(&tag);
+        if !payload.is_empty() {
+            let tag = self
+                .cipher
+                .seal(nonce, &mut out[payload_start..payload_end])?;
+            out[payload_end..suffix_start].copy_from_slice(&tag);
+        }
+        Ok(())
+    }
+}
+
+/// Authenticates one complete UDP datagram. Malformed input discards only that packet;
+/// there is no implicit cursor to retire and no replay or logical session state here.
+pub(crate) struct PacketDecoder {
+    cipher: PacketCipher,
+}
+
+impl PacketDecoder {
+    pub(crate) fn new(key: Arc<Key>) -> Self {
+        Self {
+            cipher: PacketCipher::new(key),
+        }
+    }
+
+    pub(crate) fn decode_frame(&self, packet: Bytes, unix_secs: u64) -> io::Result<Frame> {
+        if packet.len() < PACKET_HEADER_LEN {
+            return Err(invalid_frame());
+        }
+        // An owned datagram can be decrypted in its existing allocation. A shared/static
+        // buffer needs one copy; the caller already bounds the physical packet length.
+        let mut packet = match packet.try_into_mut() {
+            Ok(packet) => packet,
+            Err(packet) => BytesMut::from(packet.as_ref()),
+        };
+        let nonce = packet[..NONCE_LEN].try_into().expect("fixed packet nonce");
+        let tag = packet[NONCE_LEN + METADATA_LEN..PACKET_HEADER_LEN]
+            .try_into()
+            .expect("fixed metadata tag");
+        self.cipher
+            .open(nonce, &mut packet[NONCE_LEN..NONCE_LEN + METADATA_LEN], tag)?;
+        let header = decode_metadata(
+            packet[NONCE_LEN..NONCE_LEN + METADATA_LEN]
+                .try_into()
+                .expect("fixed metadata"),
+            unix_secs,
+        )?;
+        let payload_start = PACKET_HEADER_LEN + header.prefix_len;
+        let payload_end = payload_start + header.payload_len;
+        let suffix_start = payload_end + if header.payload_len == 0 { 0 } else { TAG_LEN };
+        if packet.len() != suffix_start + header.suffix_len {
+            return Err(invalid_frame());
+        }
+        let payload = if header.payload_len == 0 {
+            Bytes::new()
+        } else {
+            let tag = packet[payload_end..suffix_start]
+                .try_into()
+                .expect("fixed payload tag");
+            self.cipher
+                .open(nonce, &mut packet[payload_start..payload_end], tag)?;
+            packet.truncate(payload_end);
+            packet.freeze().slice(payload_start..)
+        };
+        Ok(Frame {
+            metadata: header.metadata,
+            payload,
+        })
+    }
+}
+
+impl fmt::Debug for PacketEncoder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MieruPacketEncoder(..)")
+    }
+}
+
+impl fmt::Debug for PacketDecoder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MieruPacketDecoder(..)")
+    }
 }
 
 /// Serial encoder for one physical TCP write direction. The owner must finish writing an
@@ -395,6 +515,21 @@ mod tests {
         "70d580cdbabb0289ea3df4e5402fd904",
         "ccddeeff"
     );
+    // Same key and explicit nonce for metadata and payload, independently generated
+    // using the validated RFC/HChaCha oracle used for the TCP vectors above.
+    const UDP_OPEN_HEX: &str = concat!(
+        "000102030405060708090a0b0c0d0e0f101112135b65f257",
+        "2289a2f66e5cf623a3b69e0fb82a6dfb7d7ae09f5c0ad82e8e5b8c7d42961eb2",
+        "ef09b588a8a6c70b7e206a7acf8a6b06",
+        "2588a3474449f720a0e29c11650495d90e67718616c00b0673ed",
+        "aabb"
+    );
+    const UDP_ACK_HEX: &str = concat!(
+        "202122232425262728292a2b2c2d2e2f3031323343da3786",
+        "8fd41edb4d29643a018643ca73b9ad828da1c861ecc893ef66e677f6c287f65c",
+        "98bae79d403d0a3012d1d438209943ea",
+        "ccddeeff"
+    );
 
     fn hex(input: &str) -> Vec<u8> {
         assert_eq!(input.len() % 2, 0, "fixture contains a partial byte");
@@ -438,6 +573,129 @@ mod tests {
             window: 16,
             fragment: 0,
         })
+    }
+
+    #[test]
+    fn fixed_udp_vectors_reorder_and_repeated_datagrams() {
+        let payload = hex("050100017f0000010050");
+        let encoder = PacketEncoder::new(key());
+        let mut encoded = Vec::new();
+        encoder
+            .encode_frame(
+                open(),
+                &payload,
+                Padding {
+                    prefix: &[],
+                    suffix: &[0xaa, 0xbb],
+                },
+                nonce(),
+                TIME,
+                &mut encoded,
+            )
+            .unwrap();
+        assert_eq!(encoded, hex(UDP_OPEN_HEX));
+        encoder
+            .encode_frame(
+                ack(),
+                &[],
+                Padding {
+                    prefix: &[0xcc],
+                    suffix: &[0xdd, 0xee, 0xff],
+                },
+                make_client_nonce("vole", std::array::from_fn(|index| index as u8 + 32)),
+                TIME,
+                &mut encoded,
+            )
+            .unwrap();
+        assert_eq!(encoded, hex(UDP_ACK_HEX));
+        let decoder = PacketDecoder::new(key());
+        let received = decoder.decode_frame(Bytes::from(encoded), TIME).unwrap();
+        assert_eq!(received.metadata, ack());
+        assert!(received.payload.is_empty());
+        for _ in 0..2 {
+            let packet = Bytes::from(hex(UDP_OPEN_HEX));
+            let payload_address = packet.as_ptr().wrapping_add(PACKET_HEADER_LEN);
+            let received = decoder.decode_frame(packet, TIME).unwrap();
+            assert_eq!(received.metadata, open());
+            assert_eq!(received.payload.as_ref(), payload.as_slice());
+            assert_eq!(received.payload.as_ptr(), payload_address);
+        }
+    }
+
+    #[test]
+    fn packet_errors_leave_decoder_available() {
+        let decoder = PacketDecoder::new(key());
+        let valid = hex(UDP_OPEN_HEX);
+        let mut bad_metadata_tag = valid.clone();
+        bad_metadata_tag[PACKET_HEADER_LEN - 1] ^= 1;
+        let mut bad_payload_tag = valid.clone();
+        bad_payload_tag[PACKET_HEADER_LEN + 10] ^= 1;
+        let mut short_padding = valid.clone();
+        short_padding.pop();
+        for packet in [bad_metadata_tag, bad_payload_tag, short_padding] {
+            assert_eq!(
+                decoder
+                    .decode_frame(Bytes::from(packet), TIME)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                decoder
+                    .decode_frame(Bytes::from(valid.clone()), TIME)
+                    .unwrap()
+                    .metadata,
+                open()
+            );
+        }
+        assert!(
+            decoder
+                .decode_frame(Bytes::from(valid.clone()), TIME + 180)
+                .is_err()
+        );
+        // Shared received storage takes the copy branch and remains intact for its owner.
+        let packet = Bytes::from(valid);
+        let original = packet.clone();
+        let received = decoder.decode_frame(packet, TIME).unwrap();
+        assert_eq!(received.metadata, open());
+        assert_eq!(original.as_ref(), hex(UDP_OPEN_HEX).as_slice());
+    }
+
+    #[test]
+    fn packet_key_survives_epoch_and_receiver_preserves_u16_bound() {
+        let creation_time = 1_700_000_039;
+        let reply_time = 1_700_000_160;
+        let key = Arc::new(derive_key("vole", "fixture-password", creation_time));
+        let nonce = [0x5a; NONCE_LEN];
+        let mut header = encode_metadata(ack(), 0, Padding::default(), reply_time).unwrap();
+        header[0] = 7;
+        header[1] = 0xfe;
+        header[22..24].copy_from_slice(&u16::MAX.to_be_bytes());
+        header[25..].fill(0xff);
+        let mut payload = vec![0x5a; usize::from(u16::MAX)];
+        let cipher = PacketCipher::new(key.clone());
+        let tag = cipher.seal(nonce, &mut header).unwrap();
+        let mut packet = nonce.to_vec();
+        packet.extend_from_slice(&header);
+        packet.extend_from_slice(&tag);
+        let tag = cipher.seal(nonce, &mut payload).unwrap();
+        packet.extend_from_slice(&payload);
+        packet.extend_from_slice(&tag);
+        let packet = Bytes::from(packet);
+        let received = PacketDecoder::new(key)
+            .decode_frame(packet.clone(), reply_time)
+            .unwrap();
+        assert_eq!(received.payload.len(), usize::from(u16::MAX));
+        assert!(received.payload.iter().all(|byte| *byte == 0x5a));
+        let new_carrier =
+            PacketDecoder::new(Arc::new(derive_key("vole", "fixture-password", reply_time)));
+        assert_eq!(
+            new_carrier
+                .decode_frame(packet, reply_time)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     struct Chunks {
