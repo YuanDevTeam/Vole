@@ -90,6 +90,14 @@ at least one must be unicast. An omitted family fails with `AddrNotAvailable`.
 The client mode does not create a passive accept or UDP datagram queue, and
 discards incoming TCP packets that do not belong to a requested connection.
 
+An optional `ClientConfig` retains up to two real `ClientPrefix` candidates,
+including two addresses in one family, and selects the source for each peer.
+It separates the bounded receive packet size from the TX MTU and can opt into
+per-socket ICMP PMTU feedback. Mapped IPv4 and duplicate candidates normalize
+before startup. IPv4-only clients permit MTU 68..65535; a real IPv6 candidate
+requires at least 1280. Passive TUN validation still requires 1280.
+`ClientAddresses` converts with the former receive bound and PMTU disabled.
+
 ```rust,ignore
 let parts = vole_netstack::NetStack::start_client(config, addresses)?;
 // The owner must concurrently pump packet_sink and packet_stream.

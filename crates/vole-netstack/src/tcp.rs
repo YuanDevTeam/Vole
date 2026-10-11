@@ -18,7 +18,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::ClientAddresses;
+use crate::ClientConfig;
 
 pub(crate) struct ConnectRequest {
     pub(crate) destination: SocketAddr,
@@ -48,7 +48,7 @@ pub struct TcpConnector {
     pub(crate) sender: mpsc::Sender<ConnectRequest>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) notify: Arc<Notify>,
-    pub(crate) addresses: ClientAddresses,
+    pub(crate) addresses: ClientConfig,
 }
 
 impl TcpConnector {
@@ -65,9 +65,14 @@ impl TcpConnector {
     /// deadline, or an I/O error when TCP fails or the stack stops.
     pub async fn connect(
         &self,
-        destination: SocketAddr,
+        mut destination: SocketAddr,
         deadline: Instant,
     ) -> std::io::Result<TcpStream> {
+        if let std::net::IpAddr::V6(ip) = destination.ip()
+            && let Some(ip) = ip.to_ipv4_mapped()
+        {
+            destination = SocketAddr::new(ip.into(), destination.port());
+        }
         let invalid_ip = match destination.ip() {
             std::net::IpAddr::V4(ip) => {
                 ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast()
@@ -80,14 +85,7 @@ impl TcpConnector {
                 "invalid active TCP peer",
             ));
         }
-        if (destination.is_ipv4() && self.addresses.ipv4.is_none())
-            || (destination.is_ipv6() && self.addresses.ipv6.is_none())
-        {
-            return Err(Error::new(
-                ErrorKind::AddrNotAvailable,
-                "active TCP source family is unavailable",
-            ));
-        }
+        self.addresses.source_for(destination.ip())?;
         if Instant::now() >= deadline {
             return Err(connect_timeout());
         }

@@ -282,6 +282,8 @@ proxies:
   #   server: masque.example.com
   #   port: 443
   #   network: h3-l4proxy
+  #   # IP tunnel: network: quic, ip: 192.0.2.2, ipv6: 2001:db8::2, udp: true
+  #   # IP mode MTU defaults to 1280; IPv4-only permits 68..65535.
   #   private-key: "<Base64 SEC1 DER>"
   #   public-key: "<Base64 ECDSA SPKI DER>"
   #   congestion-controller: bbr # 同TrustTunnel H3；cwnd与bbr-profile消费规则相同

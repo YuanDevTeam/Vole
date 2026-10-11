@@ -131,6 +131,10 @@ jobs:
           require(h3.get("license") == "MIT" and all((h3_root / name).is_file() for name in ("LICENSE", "README.vole.md")), "HTTP/3 provenance or license is missing")
           h3_quinn = package("h3-quinn", "0.0.10")
           require(h3["id"] in {dependency["pkg"] for dependency in nodes[h3_quinn["id"]]["deps"]}, "HTTP/3 adapter must resolve the reviewed source")
+          stack = package("smoltcp", "0.14.0", {None})
+          stack_root = Path("vendor/smoltcp").resolve()
+          require(Path(stack["manifest_path"]).resolve() == stack_root / "Cargo.toml", "raw IP stack must use the reviewed in-repository source")
+          require(stack.get("license") == "0BSD" and all((stack_root / name).is_file() for name in ("LICENSE-0BSD.txt", "README.vole.md")), "raw IP stack provenance or license is missing")
           rsa = package("rsa", "0.9.10")
           rcgen = package("rcgen", "0.14.10")
           require(features(rsa) == {"std"}, "RSA is restricted to controller key generation")
@@ -254,7 +258,8 @@ jobs:
             inbound::http::parser::tests:: inbound::http::framing::tests::
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
-            outbound::trusttunnel:: outbound::mieru:: transport::quic:: transport::masque_codec:: transport::h3_connect::
+            outbound::trusttunnel:: outbound::mieru:: outbound::masque:: security::masque:: config::masque::
+            transport::quic:: transport::masque_codec:: transport::h3_connect::
             transport::sing_mux::smux_driver::tests:: transport::sing_mux::tests::
             grpc_duplex_pool_keeps_response
             outbound::sing_mux::tests::

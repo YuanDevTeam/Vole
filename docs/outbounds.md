@@ -107,8 +107,21 @@ UDP 底层使用可靠会话，提供累计 ACK、重传、有序交付、分片
 
 ## MASQUE
 
-`type: masque` 的 `network: h3-l4proxy` 使用 Cloudflare L4 HTTP/3 CONNECT，
-由 `outbound-masque` 提供。每个 TCP 目标独占请求流，共享受控 QUIC 连接；
+`type: masque` 由 `outbound-masque` 提供。缺省、空串及非 `h2`/`h3-l4proxy`
+的 network 使用 H3 `cf-connect-ip`；每个节点按需建立一条共享 IP 隧道，TCP/UDP
+经同一个内部 `vole-netstack`，不创建系统 TUN。H3 等待实际 peer SETTINGS 中的
+现代 DATAGRAM 支持，同时发送现代与旧 DATAGRAM setting；原始 IP 使用请求流关联及
+context ID 0。控制 capsule 有界解析，发送 IPv4/IPv6 完整 route advertisement。
+IP 模式在所有受控抽象 socket 平台启用有界 QUIC PMTUD；具有 IPv6 本地地址时，
+就绪前确认真实 DATAGRAM 预算可承载 1280 字节 IP 包，未满足时按建链期限失败。
+`ip`/`ipv6` 最多提供两条本地 prefix，标签不强制地址族；未带前缀分别补 /32 与 /128。
+mapped IPv4 归一，重复地址取较长前缀，同族两地址按目标选择源地址。
+MTU 缺省/零值为 1280；只有 IPv4 时允许 68..65535，存在实际 IPv6 时至少 1280。
+收包预算与发包 MTU 分离；TCP 的有效 MSS 和经过活动 tuple/已发送序号验证的 ICMP
+PMTU 反馈按连接生效。内部队列、capsule 和 packet 均有界，停止等待其工作任务回收。
+发送期间预算缩小只反馈当前过大包；不因此关闭其它业务流。
+
+`network: h3-l4proxy` 使用 Cloudflare L4 HTTP/3 CONNECT，每个 TCP 目标独占请求流，共享受控 QUIC 连接；
 等待 2xx 响应后才交付业务流，拒绝响应不取消其它流，节点 Stop 等待所有驱动退出。
 业务域名使用受控本地解析；基础 UDP 始终关闭，`udp: true` 也不启用它。
 
@@ -118,12 +131,14 @@ private-key 是标准 Base64 SEC1 ECDSA 私钥，public-key 是标准 Base64 ECD
 name-cert-verify 是 Mihomo 保留的占位字段，不消费。每个物理连接使用独立 TLS 配置，
 关闭恢复与 0-RTT，TLS/QUIC 仍由 rustls/ring 执行。
 
-SNI 缺省或空串使用 consumer-masque-proxy.cloudflareclient.com。
+SNI 缺省或空串在 IP 模式使用 consumer-masque.cloudflareclient.com，
+L4 使用 consumer-masque-proxy.cloudflareclient.com。IP URI 缺省为
+https://cloudflareaccess.com，不支持含变量的 IP flow URI template。
 L4 不解析 ip/ipv6/uri，不消费 mtu 或正 handshake-timeout；负超时拒绝。
 QUIC 使用 20 字节 CID、初始 payload 1242 与受控预算交集、30 秒 keepalive；
 拥塞字段使用 TrustTunnel H3 的五种控制器及其参数语义。
 `ip-stack` 支持省略/auto 与省略/cubic，不把其它栈或算法映射为现有栈。
-当前 CONNECT-IP 模式和有效的节点私有 DNS 配置明确拒绝。
+当前 H2 模式和有效的节点私有 DNS 配置明确拒绝。
 
 ## SOCKS5
 

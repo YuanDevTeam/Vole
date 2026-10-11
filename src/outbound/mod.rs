@@ -74,7 +74,8 @@ pub mod hysteria2;
     feature = "outbound-vless",
     feature = "outbound-hysteria2",
     feature = "outbound-tuic",
-    feature = "outbound-wireguard"
+    feature = "outbound-wireguard",
+    feature = "outbound-masque"
 ))]
 mod owned_stream;
 #[cfg(feature = "outbound-tuic")]

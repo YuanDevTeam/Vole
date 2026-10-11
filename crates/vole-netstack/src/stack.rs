@@ -22,10 +22,11 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ClientAddresses, NetStackConfig, Packet,
+    ClientConfig, NetStackConfig, Packet,
     config::ConfigError,
     device::RawIpDevice,
     icmp::{IcmpIngress, classify as classify_icmp},
+    pmtu::parse_path_mtu_hint,
     tcp::{
         ConnectRequest, FlowKey, TcpConnector, TcpListener, TcpStream, TcpStreamHandle,
         connect_stopped, connect_timeout,
@@ -146,18 +147,22 @@ impl NetStack {
     /// no local address is supplied or a supplied address is not unicast.
     pub fn start_client(
         config: NetStackConfig,
-        addresses: ClientAddresses,
+        addresses: impl Into<ClientConfig>,
     ) -> Result<ClientNetStackParts, NetStackError> {
-        addresses.validate()?;
+        let addresses = addresses.into().validate(config.mtu)?;
         Self::start_parts(config, false, Some(addresses)).map(DriverParts::into_client)
     }
 
     fn start_parts(
         config: NetStackConfig,
         with_udp: bool,
-        addresses: Option<ClientAddresses>,
+        addresses: Option<ClientConfig>,
     ) -> Result<DriverParts, NetStackError> {
-        config.validate()?;
+        if let Some(client) = &addresses {
+            config.validate_client(client)?;
+        } else {
+            config.validate()?;
+        }
         tokio::runtime::Handle::try_current().map_err(|_| NetStackError::NoRuntime)?;
 
         let cancellation = CancellationToken::new();
@@ -211,7 +216,8 @@ impl NetStack {
         };
         let (stopped_tx, stopped_rx) = watch::channel(false);
 
-        let mtu = config.mtu;
+        let receive_packet_limit =
+            addresses.map_or(config.mtu, |client| client.receive_packet_limit);
         let mut driver = Driver::new(
             config,
             raw_inbound_rx,
@@ -233,7 +239,7 @@ impl NetStack {
             packet_sink: PacketSink {
                 sender: raw_inbound_tx,
                 cancellation: cancellation.clone(),
-                mtu,
+                mtu: receive_packet_limit,
             },
             packet_stream: PacketStream {
                 receiver: raw_outbound_rx,
@@ -498,7 +504,7 @@ struct TcpEntry {
 }
 
 struct ClientDriver {
-    addresses: ClientAddresses,
+    addresses: ClientConfig,
     requests: mpsc::Receiver<ConnectRequest>,
     next_port: u16,
 }
@@ -578,32 +584,39 @@ impl Driver {
         }
     }
 
-    fn configure_client(&mut self, addresses: &ClientAddresses) {
+    fn configure_client(&mut self, addresses: &ClientConfig) {
         self.interface.set_any_ip(false);
         self.interface.update_ip_addrs(|configured| {
             configured.clear();
-            if let Some(ip) = addresses.ipv4 {
+            for prefix in addresses.prefixes() {
                 configured
-                    .push(IpCidr::new(ip.into(), 32))
-                    .expect("IPv4 address capacity");
-            }
-            if let Some(ip) = addresses.ipv6 {
-                configured
-                    .push(IpCidr::new(ip.into(), 128))
-                    .expect("IPv6 address capacity");
+                    .push(IpCidr::new(prefix.address.into(), prefix.prefix_len))
+                    .expect("client IP address capacity");
             }
         });
         self.interface.routes_mut().remove_default_ipv4_route();
         self.interface.routes_mut().remove_default_ipv6_route();
         // The IP-medium device emits every destination into the caller's
         // packet path; these routes never configure a system interface.
-        if let Some(ip) = addresses.ipv4 {
+        if let Some(ip) = addresses
+            .prefixes()
+            .find_map(|prefix| match prefix.address {
+                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V6(_) => None,
+            })
+        {
             self.interface
                 .routes_mut()
                 .add_default_ipv4_route(ip)
                 .expect("IPv4 route capacity");
         }
-        if let Some(ip) = addresses.ipv6 {
+        if let Some(ip) = addresses
+            .prefixes()
+            .find_map(|prefix| match prefix.address {
+                IpAddr::V6(ip) => Some(ip),
+                IpAddr::V4(_) => None,
+            })
+        {
             self.interface
                 .routes_mut()
                 .add_default_ipv6_route(ip)
@@ -697,6 +710,29 @@ impl Driver {
     }
 
     fn handle_packet(&mut self, packet: Packet) {
+        if self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.addresses.path_mtu_discovery)
+            && let Some(hint) = parse_path_mtu_hint(packet.data())
+        {
+            let client = self.client.as_ref().unwrap();
+            if hint.outer_destination == hint.local.ip()
+                && client.addresses.contains_address(hint.local.ip())
+                && let Some(entry) = self.tcp_entries.get(&FlowKey {
+                    source: hint.remote,
+                    destination: hint.local,
+                })
+            {
+                // Only the matching active socket can validate a quote against
+                // bytes it actually sent. No host route or global PMTU cache
+                // participates in this userspace connection's update.
+                self.sockets
+                    .get_mut::<tcp::Socket>(entry.socket)
+                    .apply_icmp_path_mtu(hint.sequence, hint.mtu);
+            }
+            return;
+        }
         if self.config.fake_icmp_echo {
             match classify_icmp(&packet) {
                 IcmpIngress::NotIcmp => {}
@@ -732,7 +768,8 @@ impl Driver {
     }
 
     fn handle_icmp_packet(&mut self, packet: Packet) {
-        if !self.device.rx_is_empty() || self.device.tx_is_full() {
+        if packet.len() > self.config.mtu || !self.device.rx_is_empty() || self.device.tx_is_full()
+        {
             self.stats.0.icmp_dropped.fetch_add(1, Ordering::AcqRel);
             return;
         }
@@ -846,11 +883,14 @@ impl Driver {
             return;
         }
         let client = self.client.as_mut().expect("active request has a driver");
-        let source = match request.destination {
-            SocketAddr::V4(_) => client.addresses.ipv4.map(IpAddr::V4),
-            SocketAddr::V6(_) => client.addresses.ipv6.map(IpAddr::V6),
-        }
-        .expect("connector checked configured source family");
+        let source = match client.addresses.source_for(request.destination.ip()) {
+            Ok(source) => source,
+            Err(error) => {
+                let _ = request.response.send(Err(error));
+                return;
+            }
+        };
+        let path_mtu_discovery = client.addresses.path_mtu_discovery;
         let mut selected = None;
         for _ in EPHEMERAL_PORT_START..=u16::MAX {
             let port = client.next_port;
@@ -885,6 +925,9 @@ impl Driver {
                 "active TCP endpoint is unavailable",
             )));
             return;
+        }
+        if path_mtu_discovery {
+            socket.configure_path_mtu(self.config.mtu);
         }
         let handle = Arc::new(TcpStreamHandle::new(
             self.config.recv_layer_buffer_size(),

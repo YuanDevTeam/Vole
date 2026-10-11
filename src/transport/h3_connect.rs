@@ -46,6 +46,124 @@ pub(crate) struct QuicTransport {
     pub server_name: String,
 }
 
+#[cfg(feature = "outbound-masque")]
+pub(crate) struct IpConnect {
+    pub capsules: BoxStream,
+    pub datagrams: IpDatagrams,
+}
+
+/// The associated request owns its lease. The IP engine owns this handle
+/// together with that request, and is the physical connection's sole reader.
+pub(crate) struct IpDatagrams {
+    connection: quinn::Connection,
+    physical: Arc<Physical>,
+    request_id: u64,
+}
+
+#[cfg(feature = "outbound-masque")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IpDatagramSendError {
+    TooLarge { packet_budget: usize },
+    Closed,
+}
+
+#[cfg(feature = "outbound-masque")]
+impl IpDatagrams {
+    pub fn packet_budget(&self) -> usize {
+        self.connection
+            .max_datagram_size()
+            .map_or(0, |maximum| self.packet_budget_from(maximum))
+    }
+    fn packet_budget_from(&self, maximum: usize) -> usize {
+        maximum.saturating_sub(
+            crate::transport::masque_codec::varint_len(self.request_id / 4).unwrap_or(8) + 1,
+        )
+    }
+    /// Waits for actual path discovery without allocating another packet or
+    /// task. The owner supplies its existing setup or packet deadline; an
+    /// insufficient peer/path limit never becomes a fabricated usable MTU.
+    pub async fn wait_packet_budget(&self, minimum: usize, deadline: Instant) -> io::Result<usize> {
+        wait_for_packet_budget(&self.physical.cancel, minimum, deadline, || {
+            self.connection
+                .max_datagram_size()
+                .map(|maximum| self.packet_budget_from(maximum))
+        })
+        .await
+    }
+    pub async fn send(&self, packet: &[u8]) -> Result<(), IpDatagramSendError> {
+        if self.physical.cancel.is_cancelled() {
+            return Err(IpDatagramSendError::Closed);
+        }
+        let maximum = self
+            .connection
+            .max_datagram_size()
+            .ok_or(IpDatagramSendError::Closed)?;
+        let packet_budget = self.packet_budget_from(maximum);
+        if packet.len() > packet_budget {
+            return Err(IpDatagramSendError::TooLarge { packet_budget });
+        }
+        let frame =
+            crate::transport::masque_codec::encode_h3_datagram(self.request_id, packet, maximum)
+                .map_err(|_| IpDatagramSendError::Closed)?;
+        tokio::select! { biased;
+            ()=self.physical.cancel.cancelled()=>Err(IpDatagramSendError::Closed),
+            result=self.connection.send_datagram_wait(frame)=>match result {
+                Ok(())=>Ok(()),
+                Err(quinn::SendDatagramError::TooLarge)=>Err(IpDatagramSendError::TooLarge {
+                    packet_budget:self.packet_budget(),
+                }),
+                Err(_)=>Err(IpDatagramSendError::Closed),
+            },
+        }
+    }
+    pub async fn receive(&self) -> io::Result<Bytes> {
+        loop {
+            let frame = tokio::select! { biased;
+                ()=self.physical.cancel.cancelled()=>return Err(closed()),
+                result=self.connection.read_datagram()=>result.map_err(|_|closed())?,
+            };
+            let Ok(packet) = crate::transport::masque_codec::decode_h3_datagram(
+                &frame,
+                self.request_id,
+                frame.len(),
+            ) else {
+                continue;
+            };
+            let offset = frame.len() - packet.len();
+            return Ok(frame.slice(offset..));
+        }
+    }
+}
+
+#[cfg(feature = "outbound-masque")]
+async fn wait_for_packet_budget(
+    cancel: &CancellationToken,
+    minimum: usize,
+    deadline: Instant,
+    budget: impl Fn() -> Option<usize>,
+) -> io::Result<usize> {
+    let wait = async {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(closed());
+            }
+            let maximum = budget().ok_or_else(closed)?;
+            if maximum >= minimum {
+                return Ok(maximum);
+            }
+            // Quinn has no public MTU-change notification. This bounded poll
+            // reads its discovery result without assuming a probe succeeded.
+            tokio::select! { biased;
+                ()=cancel.cancelled()=>return Err(closed()),
+                ()=tokio::time::sleep(Duration::from_millis(20))=>{},
+            }
+        }
+    };
+    timeout_at(deadline, wait)
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+}
+
 #[derive(Default)]
 struct Usage {
     active: usize,
@@ -134,16 +252,28 @@ enum Flavor {
     TrustTunnel,
     #[cfg(feature = "outbound-masque")]
     MasqueL4,
+    #[cfg(feature = "outbound-masque")]
+    MasqueIp,
 }
 impl Flavor {
     fn deferred(self) -> bool {
         self == Self::TrustTunnel
     }
     fn accepts(self, status: http::StatusCode) -> bool {
-        if self.deferred() {
+        if self.deferred() || self.ip() {
             status == 200
         } else {
             status.is_success()
+        }
+    }
+    fn ip(self) -> bool {
+        #[cfg(feature = "outbound-masque")]
+        {
+            self == Self::MasqueIp
+        }
+        #[cfg(not(feature = "outbound-masque"))]
+        {
+            false
         }
     }
 }
@@ -179,6 +309,14 @@ impl Pool {
         pool.flavor = Flavor::MasqueL4;
         pool
     }
+    #[cfg(feature = "outbound-masque")]
+    pub fn masque_ip(
+        congestion: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
+    ) -> Self {
+        let mut pool = Self::new(congestion);
+        pool.flavor = Flavor::MasqueIp;
+        pool
+    }
     // Managed tasks observe cancellation themselves, so their cleanup is
     // awaited rather than dropped by an outer cancellation select.
     fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) -> io::Result<()> {
@@ -200,6 +338,38 @@ impl Pool {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = io::Result<QuicTransport>> + Send + 'static,
     {
+        self.open(request, deadline, observer, connect)
+            .await
+            .map(|(stream, _)| stream)
+    }
+    #[cfg(feature = "outbound-masque")]
+    pub async fn open_ip_connect<F, Fut>(
+        &self,
+        request: http::Request<()>,
+        deadline: Instant,
+        connect: F,
+    ) -> io::Result<IpConnect>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = io::Result<QuicTransport>> + Send + 'static,
+    {
+        let (capsules, datagrams) = self.open(request, deadline, None, connect).await?;
+        Ok(IpConnect {
+            capsules,
+            datagrams: datagrams.ok_or_else(closed)?,
+        })
+    }
+    async fn open<F, Fut>(
+        &self,
+        request: http::Request<()>,
+        deadline: Instant,
+        observer: Option<Observer>,
+        connect: F,
+    ) -> io::Result<(BoxStream, Option<IpDatagrams>)>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = io::Result<QuicTransport>> + Send + 'static,
+    {
         let operation = async {
             let _waiter = observation::track(ResourceKind::Waiter);
             let (mut sender, lease) = self.acquire(deadline, connect).await?;
@@ -207,6 +377,22 @@ impl Pool {
                 retire_on_connection_error(&lease, &error);
                 closed()
             })?;
+            let datagrams = if self.flavor.ip() {
+                Some(IpDatagrams {
+                    connection: lease
+                        .0
+                        .connection
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .cloned()
+                        .ok_or_else(closed)?,
+                    physical: lease.0.clone(),
+                    request_id: request.id().into_inner(),
+                })
+            } else {
+                None
+            };
             let (send, receive) = request.split();
             let close = Arc::new(Close::default());
             let (ready, response) = oneshot::channel();
@@ -254,7 +440,7 @@ impl Pool {
                     .map_err(|_| closed())??;
                 stream.receive = Some(receive);
             }
-            Ok(Box::new(stream) as BoxStream)
+            Ok((Box::new(stream) as BoxStream, datagrams))
         };
         tokio::select! {biased;
             ()=self.cancellation.cancelled()=>Err(closed()),
@@ -409,12 +595,16 @@ async fn drive<F, Fut>(
         datagram = Some(driver);
         let mtu = socket.budget().quic_payload_limit()?;
         let mut transport = quinn::TransportConfig::default();
-        let discovery = if cfg!(any(
-            target_os = "windows",
-            target_os = "linux",
-            target_os = "android",
-            target_os = "macos"
-        )) {
+        // The controlled adapter advertises may_fragment=false to Quinn, so
+        // MASQUE IP can discover its real raw-IP budget on every target. Keep
+        // the established TrustTunnel and L4 discovery policy unchanged.
+        let discovery = if flavor.ip()
+            || cfg!(any(
+                target_os = "windows",
+                target_os = "linux",
+                target_os = "android",
+                target_os = "macos"
+            )) {
             let mut discovery = quinn::MtuDiscoveryConfig::default();
             discovery.upper_bound(mtu);
             Some(discovery)
@@ -478,11 +668,25 @@ async fn drive<F, Fut>(
             return Err(closed());
         }
         *physical.connection.lock().unwrap() = Some(connected.clone());
-        let (driver, sender) = h3::client::builder()
-            .max_field_section_size(CHUNK as u64)
+        let mut builder = h3::client::builder();
+        builder.max_field_section_size(CHUNK as u64);
+        if flavor.ip() {
+            builder.enable_datagram(true).legacy_datagram_setting(true);
+        }
+        let (mut driver, sender) = builder
             .build(h3_stream::Connection::new(connected))
             .await
             .map_err(|_| closed())?;
+        if flavor.ip() {
+            // The reference checks modern DATAGRAM support after actual
+            // SETTINGS, and deliberately does not require Extended CONNECT.
+            let settings = futures_util::future::poll_fn(|cx| driver.poll_peer_settings(cx))
+                .await
+                .map_err(|_| closed())?;
+            if !settings.enable_datagram() {
+                return Err(closed());
+            }
+        }
         control = Some(driver);
         keep_sender = Some(sender.clone());
         pool_observation = Some(observation::track(ResourceKind::Pool));
@@ -794,6 +998,41 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         sync::mpsc,
     };
+
+    #[cfg(feature = "outbound-masque")]
+    #[tokio::test(start_paused = true)]
+    async fn masque_ip_budget_wait_observes_growth_and_enforces_stop_and_deadline() {
+        let cancel = CancellationToken::new();
+        let maximum = AtomicUsize::new(1198);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let wait = wait_for_packet_budget(&cancel, 1280, deadline, || {
+            Some(maximum.load(Ordering::Acquire))
+        });
+        tokio::pin!(wait);
+        tokio::select! { biased;
+            result=&mut wait=>panic!("insufficient budget became ready: {result:?}"),
+            ()=tokio::time::sleep(Duration::from_millis(40))=>{},
+        }
+        maximum.store(1300, Ordering::Release);
+        assert_eq!(wait.await.unwrap(), 1300);
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let error = wait_for_packet_budget(&cancel, 1280, deadline, || Some(1198))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        cancel.cancel();
+        let error = wait_for_packet_budget(
+            &cancel,
+            1280,
+            Instant::now() + Duration::from_secs(2),
+            || Some(1400),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    }
 
     struct Packets {
         send: mpsc::Sender<Bytes>,

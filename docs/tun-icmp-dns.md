@@ -24,6 +24,11 @@ Vole 在 TUN netstack 内回答受支持的 ICMP Echo Request。启用运行时 
 
 smoltcp 负责生成 Echo Reply，Vole 负责更严格的输入分类和运行时门禁。响应直接尝试进入现有原始包出站队列；队列满时只丢当前低优先级响应并更新统计，不创建等待任务或积压队列。
 
+MASQUE 的内部主动客户端另行支持 ICMP PMTU 反馈：验证外层校验和、本地地址、
+被引用的活动 TCP tuple 及实际发送且尚未确认的序号，只降低对应连接的 MTU并重新分段。
+IPv6 宣告 MTU 小于 1280 时忽略，IPv4 小于 68 时取 68。
+这不启用宿主 TUN 的 ICMP error 转发，也不改变其 MTU 门禁或 Echo 配置。
+
 ## TUN DNS 入口
 
 当 `dns.enable: true`：

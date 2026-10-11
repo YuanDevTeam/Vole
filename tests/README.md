@@ -17,6 +17,7 @@ cargo test --locked --features cli --lib tuic_uot_
 cargo test --locked --lib config::tests::
 cargo test --locked --features cli --lib trusttunnel
 cargo test --locked --features cli --lib mieru
+cargo test --locked --features cli --lib masque_
 cargo test --locked --lib config::credentials::tests::
 cargo test --locked --features cli --lib age_
 cargo test --locked --lib dns::hosts::tests::
@@ -122,6 +123,9 @@ Python，直接运行此检查，仅验证各自构建的产物。
 所测后端而非 `--all-features`。名称选择仍需已安装包验证，不以对象级测试代替。
 
 `outbound::wireguard::tests::` 在内存中交换真实 Noise 与 raw-IP 包，覆盖主动 TCP、双栈 UDP、真实握手重试、多 peer 最长前缀与 reserved、节点远端 DNS、端点更新、取消与 Stop；不打开 socket 或系统接口。
+
+`masque_` 使用内存密钥、IP/UDP 包和受控 QUIC 对端，验证模式准入、CONNECT、
+capsule、流关联、包预算及 Stop；主动栈的原始 TCP/PMTU 回归位于 `vole-netstack`。
 
 宿主只执行明确的纯内存过滤器；全目标使用 `--no-run`。
 `invoke::tests::` 含监听器用例，不可整体在宿主执行；可执行过滤器以

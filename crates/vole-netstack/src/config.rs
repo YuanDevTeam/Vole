@@ -14,27 +14,6 @@ pub struct ClientAddresses {
     pub ipv6: Option<Ipv6Addr>,
 }
 
-impl ClientAddresses {
-    pub(crate) fn validate(self) -> Result<(), ConfigError> {
-        if self.ipv4.is_none() && self.ipv6.is_none() {
-            return Err(ConfigError::NoClientAddress);
-        }
-        if self
-            .ipv4
-            .is_some_and(|ip| ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast())
-        {
-            return Err(ConfigError::ClientAddress("IPv4"));
-        }
-        if self
-            .ipv6
-            .is_some_and(|ip| ip.is_unspecified() || ip.is_multicast())
-        {
-            return Err(ConfigError::ClientAddress("IPv6"));
-        }
-        Ok(())
-    }
-}
-
 /// Finite buffering and timing configuration for one netstack instance.
 ///
 /// Queue counts are hard limits. Each TCP buffer includes both the smoltcp
@@ -92,6 +71,24 @@ impl NetStackConfig {
         if !(1_280..=65_535).contains(&self.mtu) {
             return Err(ConfigError::Mtu(self.mtu));
         }
+        self.validate_resources()
+    }
+
+    pub(crate) fn validate_client(
+        &self,
+        client: &crate::client::ClientConfig,
+    ) -> Result<(), ConfigError> {
+        let minimum = if client.has_ipv6() { 1_280 } else { 68 };
+        if !(minimum..=65_535).contains(&self.mtu) {
+            return Err(ConfigError::ClientMtu {
+                value: self.mtu,
+                minimum,
+            });
+        }
+        self.validate_resources()
+    }
+
+    fn validate_resources(&self) -> Result<(), ConfigError> {
         for (name, value) in [
             ("packet_queue", self.packet_queue),
             ("tcp_accept_queue", self.tcp_accept_queue),
@@ -133,6 +130,14 @@ pub enum ConfigError {
     NoClientAddress,
     #[error("active netstack {0} source address must be unicast")]
     ClientAddress(&'static str),
+    #[error("active netstack source prefix is invalid")]
+    ClientPrefix,
+    #[error("active netstack source address is a subnet broadcast")]
+    ClientBroadcast,
+    #[error("active netstack MTU must be between {minimum} and 65535 bytes, got {value}")]
+    ClientMtu { value: usize, minimum: usize },
+    #[error("active netstack receive packet limit must be between 1 and 65575 bytes, got {0}")]
+    ReceivePacketLimit(usize),
     #[error("MTU must be between 1280 and 65535 bytes, got {0}")]
     Mtu(usize),
     #[error("resource limit `{0}` must be greater than zero")]

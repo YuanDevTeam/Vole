@@ -42,6 +42,7 @@ pub struct MasqueOutboundConfig {
     pub ip_stack: MasqueIpStackOptions,
     pub remote_dns_resolve: bool,
     pub dns: Vec<String>,
+    pub local_prefixes: [Option<(std::net::IpAddr, u8)>; 2],
 }
 
 impl std::fmt::Debug for MasqueOutboundConfig {
@@ -159,8 +160,8 @@ impl RawMasque {
             "h3-l4proxy" => MasqueNetwork::H3L4Proxy,
             _ => MasqueNetwork::Quic,
         };
-        if network != MasqueNetwork::H3L4Proxy {
-            return invalid("MASQUE CONNECT-IP mode is not supported yet");
+        if network == MasqueNetwork::H2 {
+            return invalid("MASQUE H2 CONNECT-IP mode is not supported yet");
         }
         if self.remote_dns_resolve && !self.dns.is_empty() {
             return invalid("MASQUE node DNS is not supported yet");
@@ -175,6 +176,68 @@ impl RawMasque {
             self.sni
         };
         validate_host(&server_name, "MASQUE sni")?;
+        let mtu = if self.mtu == 0 { 1280 } else { self.mtu };
+        let uri = if self.uri.is_empty() {
+            CONNECT_URI.into()
+        } else {
+            self.uri
+        };
+        let mut local_prefixes = [None; 2];
+        if network != MasqueNetwork::H3L4Proxy {
+            for (index, (value, default_bits)) in
+                [(&self.ip, 32), (&self.ipv6, 128)].into_iter().enumerate()
+            {
+                if !value.is_empty() {
+                    let (address, bits) = value
+                        .rsplit_once('/')
+                        .map_or((value.as_str(), None), |(address, bits)| {
+                            (address, Some(bits))
+                        });
+                    let address = address.parse::<std::net::IpAddr>().map_err(|_| {
+                        crate::VoleError::InvalidConfig("invalid MASQUE local address".into())
+                    })?;
+                    let bits = match bits {
+                        Some(bits) => bits.parse::<u8>().map_err(|_| {
+                            crate::VoleError::InvalidConfig("invalid MASQUE address prefix".into())
+                        })?,
+                        None => default_bits,
+                    };
+                    if bits > if address.is_ipv4() { 32 } else { 128 } {
+                        return invalid("invalid MASQUE address prefix");
+                    }
+                    local_prefixes[index] = Some((address, bits));
+                }
+            }
+            let mtu = usize::try_from(mtu)
+                .map_err(|_| crate::VoleError::InvalidConfig("invalid MASQUE MTU".into()))?;
+            #[cfg(feature = "outbound-masque")]
+            {
+                let client = vole_netstack::ClientConfig {
+                    prefixes: local_prefixes.map(|prefix| {
+                        prefix.map(|(address, prefix_len)| vole_netstack::ClientPrefix {
+                            address,
+                            prefix_len,
+                        })
+                    }),
+                    receive_packet_limit: vole_netstack::MAX_RECEIVE_PACKET_SIZE,
+                    path_mtu_discovery: true,
+                }
+                .validate(mtu)
+                .map_err(|_| {
+                    crate::VoleError::InvalidConfig("invalid MASQUE client addresses or MTU".into())
+                })?;
+                local_prefixes = client
+                    .prefixes
+                    .map(|prefix| prefix.map(|prefix| (prefix.address, prefix.prefix_len)));
+            }
+            if uri.contains(['{', '}'])
+                || url::Url::parse(&uri)
+                    .ok()
+                    .is_none_or(|url| url.host_str().is_none())
+            {
+                return invalid("invalid MASQUE CONNECT-IP URI");
+            }
+        }
         // L4 never parses the local addresses or URI and never applies MTU
         // or a positive handshake timeout. Retain their signed/raw values.
         let udp = self.udp && network != MasqueNetwork::H3L4Proxy;
@@ -191,12 +254,8 @@ impl RawMasque {
                 network,
                 ip: self.ip,
                 ipv6: self.ipv6,
-                uri: if self.uri.is_empty() {
-                    CONNECT_URI.into()
-                } else {
-                    self.uri
-                },
-                mtu: if self.mtu == 0 { 1280 } else { self.mtu },
+                uri,
+                mtu,
                 udp,
                 handshake_timeout: self.handshake_timeout,
                 skip_cert_verify: self.skip_cert_verify,
@@ -207,6 +266,7 @@ impl RawMasque {
                 ip_stack,
                 remote_dns_resolve: self.remote_dns_resolve,
                 dns: self.dns,
+                local_prefixes,
             }),
         ))
     }
@@ -289,16 +349,43 @@ mod tests {
     }
 
     #[test]
-    fn masque_modes_and_active_dns_fail_before_unimplemented_consumers() {
-        for network in [None, Some(""), Some("quic"), Some("unknown"), Some("h2")] {
+    fn masque_ip_defaults_and_mode_consumers_are_explicit() {
+        for network in [None, Some(""), Some("quic"), Some("unknown")] {
             let mut raw = node();
+            raw["ip"] = json!("192.0.2.10");
+            raw["udp"] = json!(true);
             if let Some(network) = network {
                 raw["network"] = json!(network);
             } else {
                 raw.as_object_mut().unwrap().remove("network");
             }
-            assert!(parse(raw).unwrap_err().to_string().contains("CONNECT-IP"));
+            let config = parse(raw).unwrap();
+            let options = options(&config);
+            assert_eq!(options.network, MasqueNetwork::Quic);
+            assert_eq!(options.mtu, 1280);
+            assert_eq!(options.server_name, CONNECT_SNI);
+            assert_eq!(
+                options.local_prefixes[0],
+                Some((std::net::IpAddr::from([192, 0, 2, 10]), 32))
+            );
+            assert!(options.udp && config.proxies[0].udp);
         }
+        let mut raw = node();
+        raw["network"] = json!("h2");
+        assert!(parse(raw).unwrap_err().to_string().contains("H2"));
+        let mut raw = node();
+        raw["network"] = json!("quic");
+        raw["ip"] = json!("192.0.2.10/24");
+        raw["ipv6"] = json!("192.0.2.11/32");
+        raw["mtu"] = json!(68);
+        let config = parse(raw.clone()).unwrap();
+        assert_eq!(options(&config).local_prefixes.iter().flatten().count(), 2);
+        raw["ipv6"] = json!("2001:db8::1");
+        assert!(parse(raw.clone()).is_err());
+        raw["mtu"] = json!(1280);
+        assert!(parse(raw.clone()).is_ok());
+        raw["uri"] = json!("https://example.invalid/{target}");
+        assert!(parse(raw).is_err());
         let mut raw = node();
         raw["remote-dns-resolve"] = json!(true);
         raw["dns"] = json!([]);
