@@ -3,6 +3,11 @@
 mod runtime;
 pub(crate) use runtime::OwnedRuntime;
 
+/// Congestion algorithms used by the TrustTunnel and MASQUE consumers.
+pub mod congestion;
+mod congestion_factory;
+pub use congestion_factory::congestion_controller;
+
 use std::{
     collections::VecDeque,
     io::{self, IoSliceMut},

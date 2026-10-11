@@ -16,9 +16,10 @@ rustls/ring TLS provider are unchanged. The vendor crate is excluded from the ro
 so its explicitly filtered native memory fixtures use the original standalone upstream lockfile.
 This does not select its default TLS provider/features for production.
 
-Local changes are limited to `src/config/transport.rs`, `src/transport_parameters.rs`,
+Local changes are limited to `src/config/transport.rs`, `src/transport_parameters.rs`, `src/congestion.rs`,
 `src/connection/{mod.rs,datagrams.rs,paths.rs,stats.rs}`, `src/connection/streams/{mod.rs,state.rs,recv.rs}`,
-`src/frame.rs`, and new `src/connection/streams/{receive_window.rs,lazy_tests.rs}`. They add optional initial/max
+`src/connection/{pacing.rs,packet_builder.rs,spaces.rs}`, `src/packet.rs`, `src/frame.rs`,
+and native test fixtures. They add optional initial/max
 receive-credit policies, application-consumption and smoothed-RTT driven growth, real credit frames,
 and an independent complete DATAGRAM frame limit. Existing fixed-window methods preserve their
 behavior. Permitted remote stream IDs are stored as compact ranges until first
@@ -30,6 +31,16 @@ only materialized send halves. Stream credit never exceeds the QUIC lifetime
 representation of 2^60 streams. Actual active streams and sparse permission gaps
 still require memory; this does not impose a new user configuration cap.
 Tests marked `vole_` are deterministic native state/wire fixtures, not host network tests.
+Optional congestion hooks expose connection-wide packet sample IDs, real ACK/loss feedback,
+and explicit discard notifications for key retirement, Retry, 0-RTT rejection and path changes.
+Feedback batches complete after RTT, loss and ECN processing. Controllers cloning their model
+for another path must clear cloned outstanding samples; old-path feedback never samples the new path.
+The tracked-packet memory bound increases by one 64-bit sample ID, from 128 to 136 bytes.
+An optional byte-rate/burst/minimum-delay pacing policy consumes real packet wire bytes,
+including ACK-only packets. `None` retains the original Quinn pacer, and controllers leaving
+packet feedback disabled retain the original callbacks. `RttEstimator::latest()` exposes the
+existing raw RTT measurement without changing recovery. These hooks do not select or replace
+existing Vole HY2/TUIC congestion controllers.
 No Mihomo or quic-go function implementation is copied or translated into this source.
 
 Protocol/consumer behavior was independently checked against RFC 9000/RFC 9221 and the fixed

@@ -72,6 +72,7 @@ impl PacketBuilder {
             } else if sent_with_keys > confidentiality_limit {
                 // Confidentiality limited violated and there's nothing we can do
                 conn.kill(
+                    now,
                     TransportError::AEAD_LIMIT_REACHED("confidentiality limit reached").into(),
                 );
                 return None;
@@ -167,6 +168,7 @@ impl PacketBuilder {
             buffer.truncate(partial_encode.start);
             // Both Retry and cached address validation tokens originate from the peer.
             conn.kill(
+                now,
                 TransportError::PROTOCOL_VIOLATION(
                     "Initial token leaves insufficient packet space",
                 )
@@ -218,12 +220,14 @@ impl PacketBuilder {
             None => return,
         };
 
+        let wire_size = size as u16;
         let size = match padded || ack_eliciting {
             true => size as u16,
             false => 0,
         };
 
         let packet = SentPacket {
+            sample_id: conn.next_sample_id,
             path_generation: conn.path.generation(),
             largest_acked: sent.largest_acked,
             time_sent: now,
@@ -232,9 +236,34 @@ impl PacketBuilder {
             retransmits: sent.retransmits,
             stream_frames: sent.stream_frames,
         };
+        conn.next_sample_id = conn
+            .next_sample_id
+            .checked_add(1)
+            .expect("QUIC packet lifetime fits in u64");
+        if conn.path.feedback_enabled {
+            conn.path.congestion.on_packet_sent(
+                packet.info(space_id, exact_number),
+                conn.path.in_flight.bytes,
+                conn.app_limited,
+            );
+        }
 
-        conn.path
-            .sent(exact_number, packet, &mut conn.spaces[space_id]);
+        if let Some((number, forgotten)) =
+            conn.path
+                .sent(exact_number, packet, &mut conn.spaces[space_id])
+        {
+            let owned = conn.begin_feedback();
+            conn.packet_feedback(
+                now,
+                space_id,
+                number,
+                &forgotten,
+                crate::congestion::PacketFeedback::Discarded,
+            );
+            if owned {
+                conn.end_feedback(now);
+            }
+        }
         conn.stats.path.sent_packets += 1;
         conn.reset_keep_alive(now);
         if size != 0 {
@@ -246,6 +275,12 @@ impl PacketBuilder {
                 conn.permit_idle_reset = false;
             }
             conn.set_loss_detection_timer(now);
+        }
+        if let Some(policy) = conn.path.congestion.pacing_policy() {
+            conn.path
+                .pacing
+                .on_transmit_policy(now, wire_size, conn.path.current_mtu(), policy);
+        } else if size != 0 {
             conn.path.pacing.on_transmit(size);
         }
     }

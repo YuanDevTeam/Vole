@@ -156,6 +156,8 @@ Controller 主动探测与内存使用纯内存过滤：`manual_probes_keep_one_
 规则bundle的定向内存/临时文件验证使用 `resource::bundle` 与 `resource::cache::tests::bundle_`，覆盖真实MRS成员、解码预算/取消、缓存优先及原HTTP来源回退，不启动宿主服务。
 
 QUIC 的 `vole_` native fixtures 使用官方 vendored crate 的 standalone lock，不启用默认
-provider/features；只检查消费/RTT驱动的真实MAX信用帧、初始transport parameters和
-含头部DATAGRAM帧限额。TUIC额外内存对端消费入口ip、SNI、毫秒Heartbeat和UoT v1/v2
+provider/features；检查消费/RTT驱动的真实MAX信用帧、初始transport parameters、
+含头部DATAGRAM帧限额，以及 ACK/loss/discard、路径切换和实际 pacing。
+`transport::quic::` 是 Core 的纯内存拥塞控制过滤器，覆盖窗口、profile、采样、恢复和内存边界。
+TUIC额外内存对端消费入口ip、SNI、毫秒Heartbeat和UoT v1/v2
 字节；不创建宿主监听服务。它们不替代最终参考互通、吞吐和RSS测量。

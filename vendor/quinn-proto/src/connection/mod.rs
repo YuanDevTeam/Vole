@@ -147,6 +147,8 @@ pub struct Connection {
     ///
     /// Stored separately from `path.generation` to account for aborted migrations
     path_counter: u64,
+    /// Monotonic packet sample identifier across spaces, retries and paths.
+    next_sample_id: u64,
     /// Whether MTU detection is supported in this environment
     allow_mtud: bool,
     prev_path: Option<(ConnectionId, PathData)>,
@@ -291,6 +293,7 @@ impl Connection {
             ),
             path: PathData::new(remote, allow_mtud, None, 0, now, &config),
             path_counter: 0,
+            next_sample_id: 0,
             allow_mtud,
             local_ip,
             prev_path: None,
@@ -624,7 +627,9 @@ impl Connection {
 
                 // Congestion control and pacing checks
                 // Tail loss probes must not be blocked by congestion, or a deadlock could arise
-                if ack_eliciting && self.spaces[space_id].loss_probes == 0 {
+                if ack_eliciting {
+                    let policy = self.path.congestion.pacing_policy();
+                    let probe = self.spaces[space_id].loss_probes != 0;
                     // Assume the current packet will get padded to fill the segment
                     let untracked_bytes = if let Some(builder) = &builder_storage {
                         buf_capacity - builder.partial_encode.start
@@ -634,7 +639,19 @@ impl Connection {
                     debug_assert!(untracked_bytes <= segment_size as u64);
 
                     let bytes_to_send = segment_size as u64 + untracked_bytes;
-                    if self.path.in_flight.bytes + bytes_to_send >= self.path.congestion.window() {
+                    // A small explicit burst can finish an already-admitted
+                    // packet without admitting another coalesced/GSO packet.
+                    if builder_storage.is_some()
+                        && policy.is_some_and(|policy| {
+                            bytes_to_send > policy.burst_bytes.max(self.path.current_mtu().into())
+                        })
+                    {
+                        break;
+                    }
+                    if !probe
+                        && self.path.in_flight.bytes + bytes_to_send
+                            >= self.path.congestion.window()
+                    {
                         space_idx += 1;
                         congestion_blocked = true;
                         // We continue instead of breaking here in order to avoid
@@ -645,13 +662,23 @@ impl Connection {
 
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
-                    if let Some(delay) = self.path.pacing.delay(
-                        smoothed_rtt,
-                        bytes_to_send,
-                        self.path.current_mtu(),
-                        self.path.congestion.window(),
-                        now,
-                    ) {
+                    let delay = match policy {
+                        Some(policy) => self.path.pacing.delay_policy(
+                            bytes_to_send,
+                            self.path.current_mtu(),
+                            now,
+                            policy,
+                        ),
+                        None if !probe => self.path.pacing.delay(
+                            smoothed_rtt,
+                            bytes_to_send,
+                            self.path.current_mtu(),
+                            self.path.congestion.window(),
+                            now,
+                        ),
+                        None => None,
+                    };
+                    if let Some(delay) = delay {
                         self.timers.set(Timer::Pacing, delay);
                         congestion_blocked = true;
                         // Loss probes should be subject to pacing, even though
@@ -1221,7 +1248,7 @@ impl Connection {
                     self.endpoint_events.push_back(EndpointEventInner::Drained);
                 }
                 Timer::Idle => {
-                    self.kill(ConnectionError::TimedOut);
+                    self.kill(now, ConnectionError::TimedOut);
                 }
                 Timer::KeepAlive => {
                     trace!("sending keep-alive");
@@ -1243,6 +1270,9 @@ impl Connection {
                 }
                 Timer::PathValidation => {
                     debug!("path validation failed");
+                    if self.prev_path.is_some() {
+                        self.discard_path_samples(now, self.path.generation());
+                    }
                     if let Some((_, prev)) = self.prev_path.take() {
                         self.path = prev;
                     }
@@ -1294,7 +1324,7 @@ impl Connection {
     fn close_inner(&mut self, now: Instant, reason: Close) {
         let was_closed = self.state.is_closed();
         if !was_closed {
-            self.close_common();
+            self.close_common(now);
             self.set_close_timer(now);
             self.close = true;
             self.state = State::Closed(state::Closed { reason });
@@ -1446,7 +1476,9 @@ impl Connection {
     /// faster or reduce loss to settle on optimal values by restarting from the initial
     /// configuration in the [`TransportConfig`].
     pub fn path_changed(&mut self, now: Instant) {
+        self.discard_path_samples(now, self.path.generation());
         self.path.reset(now, &self.config);
+        self.path.feedback_sample_floor = self.next_sample_id;
         self.datagrams().drop_oversized();
     }
 
@@ -1492,6 +1524,14 @@ impl Connection {
         if ack.largest >= self.spaces[space].next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }
+        let current_path_rtt = self.spaces[space]
+            .sent_packets
+            .get(&ack.largest)
+            .is_some_and(|packet| {
+                packet.path_generation == self.path.generation()
+                    && packet.sample_id >= self.path.feedback_sample_floor
+                    && self.path.challenge.is_none()
+            });
         let new_largest = {
             let space = &mut self.spaces[space];
             if space.largest_acked_packet.is_none_or(|pn| ack.largest > pn) {
@@ -1520,6 +1560,7 @@ impl Connection {
         if newly_acked.is_empty() {
             return Ok(());
         }
+        self.begin_feedback();
 
         let mut ack_eliciting_acked = false;
         for packet in newly_acked.elts() {
@@ -1545,7 +1586,7 @@ impl Connection {
                 // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
                 self.ack_frequency.on_acked(packet);
 
-                self.on_packet_acked(now, info);
+                self.on_packet_acked(now, space, packet, info, true);
             }
         }
 
@@ -1556,7 +1597,7 @@ impl Connection {
             self.spaces[space].largest_acked_packet,
         );
 
-        if new_largest && ack_eliciting_acked {
+        if new_largest && ack_eliciting_acked && (!self.path.feedback_enabled || current_path_rtt) {
             let ack_delay = if space != SpaceId::Data {
                 Duration::from_micros(0)
             } else {
@@ -1567,6 +1608,9 @@ impl Connection {
             };
             let rtt = now.saturating_duration_since(self.spaces[space].largest_acked_packet_sent);
             self.path.rtt.update(ack_delay, rtt);
+            if let Some(batch) = &mut self.path.feedback_batch {
+                batch.rtt_updated = true;
+            }
             if self.path.first_packet_after_rtt_sample.is_none() {
                 self.path.first_packet_after_rtt_sample =
                     Some((space, self.spaces[space].next_packet_number));
@@ -1599,6 +1643,7 @@ impl Connection {
         }
 
         self.set_loss_detection_timer(now);
+        self.end_feedback(now);
         Ok(())
     }
 
@@ -1621,6 +1666,9 @@ impl Connection {
             }
             Ok(false) => {}
             Ok(true) => {
+                if let Some(batch) = &mut self.path.feedback_batch {
+                    batch.ecn_congestion = true;
+                }
                 self.stats.path.congestion_events += 1;
                 self.path
                     .congestion
@@ -1631,8 +1679,26 @@ impl Connection {
 
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
-    fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
+    fn on_packet_acked(
+        &mut self,
+        now: Instant,
+        space: SpaceId,
+        number: u64,
+        info: SentPacket,
+        actual_ack: bool,
+    ) {
         self.remove_in_flight(&info);
+        self.packet_feedback(
+            now,
+            space,
+            number,
+            &info,
+            if actual_ack {
+                crate::congestion::PacketFeedback::Acked
+            } else {
+                crate::congestion::PacketFeedback::Discarded
+            },
+        );
         if info.ack_eliciting && self.path.challenge.is_none() {
             // Only pass ACKs to the congestion controller if we are not validating the current
             // path, so as to ignore any ACKs from older paths still coming in.
@@ -1711,6 +1777,7 @@ impl Connection {
     }
 
     fn detect_lost_packets(&mut self, now: Instant, pn_space: SpaceId, due_to_ack: bool) {
+        let owned_feedback = self.begin_feedback();
         let mut lost_packets = Vec::<u64>::new();
         let mut lost_mtu_probe = None;
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
@@ -1791,7 +1858,8 @@ impl Connection {
             self.stats.path.lost_bytes += size_of_lost_packets;
             trace!(
                 "packets lost: {:?}, bytes lost: {}",
-                lost_packets, size_of_lost_packets
+                lost_packets,
+                size_of_lost_packets
             );
 
             for &packet in &lost_packets {
@@ -1805,6 +1873,13 @@ impl Connection {
                     self.orig_rem_cid,
                 );
                 self.remove_in_flight(&info);
+                self.packet_feedback(
+                    now,
+                    pn_space,
+                    packet,
+                    &info,
+                    crate::congestion::PacketFeedback::Lost,
+                );
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
                 }
@@ -1824,6 +1899,9 @@ impl Connection {
             let lost_ack_eliciting = old_bytes_in_flight != self.path.in_flight.bytes;
 
             if lost_ack_eliciting {
+                if let Some(batch) = &mut self.path.feedback_batch {
+                    batch.persistent_congestion |= in_persistent_congestion;
+                }
                 self.stats.path.congestion_events += 1;
                 self.path.congestion.on_congestion_event(
                     now,
@@ -1838,8 +1916,18 @@ impl Connection {
         if let Some(packet) = lost_mtu_probe {
             let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
             self.remove_in_flight(&info);
+            self.packet_feedback(
+                now,
+                SpaceId::Data,
+                packet,
+                &info,
+                crate::congestion::PacketFeedback::Discarded,
+            );
             self.path.mtud.on_probe_lost();
             self.stats.path.lost_plpmtud_probes += 1;
+        }
+        if owned_feedback {
+            self.end_feedback(now);
         }
     }
 
@@ -2229,6 +2317,7 @@ impl Connection {
     }
 
     fn discard_space(&mut self, now: Instant, space_id: SpaceId) {
+        let owned_feedback = self.begin_feedback();
         debug_assert!(space_id != SpaceId::Data);
         trace!("discarding {:?} keys", space_id);
         if space_id == SpaceId::Initial {
@@ -2242,8 +2331,18 @@ impl Connection {
         space.time_of_last_ack_eliciting_packet = None;
         space.loss_time = None;
         let sent_packets = mem::take(&mut space.sent_packets);
-        for packet in sent_packets.into_values() {
+        for (number, packet) in sent_packets {
             self.remove_in_flight(&packet);
+            self.packet_feedback(
+                now,
+                space_id,
+                number,
+                &packet,
+                crate::congestion::PacketFeedback::Discarded,
+            );
+        }
+        if owned_feedback {
+            self.end_feedback(now);
         }
         self.set_loss_detection_timer(now)
     }
@@ -2428,7 +2527,7 @@ impl Connection {
         }
 
         if !was_closed && self.state.is_closed() {
-            self.close_common();
+            self.close_common(now);
             if !self.state.is_drained() {
                 self.set_close_timer(now);
             }
@@ -2524,10 +2623,11 @@ impl Connection {
                 self.retry_src_cid = Some(rem_cid);
                 self.rem_cids.update_initial_cid(rem_cid);
                 self.rem_handshake_cid = rem_cid;
+                let owned_feedback = self.begin_feedback();
 
                 let space = &mut self.spaces[SpaceId::Initial];
                 if let Some(info) = space.take(0) {
-                    self.on_packet_acked(now, info);
+                    self.on_packet_acked(now, SpaceId::Initial, 0, info, false);
                 };
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
@@ -2547,9 +2647,19 @@ impl Connection {
 
                 // Retransmit all 0-RTT data
                 let zero_rtt = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
-                for info in zero_rtt.into_values() {
+                for (number, info) in zero_rtt {
                     self.remove_in_flight(&info);
+                    self.packet_feedback(
+                        now,
+                        SpaceId::Data,
+                        number,
+                        &info,
+                        crate::congestion::PacketFeedback::Discarded,
+                    );
                     self.spaces[SpaceId::Data].pending |= info.retransmits;
+                }
+                if owned_feedback {
+                    self.end_feedback(now);
                 }
                 self.streams.retransmit_all_for_0rtt();
 
@@ -2613,8 +2723,19 @@ impl Connection {
                             // Discard 0-RTT packets
                             let sent_packets =
                                 mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
-                            for packet in sent_packets.into_values() {
+                            let owned_feedback = self.begin_feedback();
+                            for (number, packet) in sent_packets {
                                 self.remove_in_flight(&packet);
+                                self.packet_feedback(
+                                    now,
+                                    SpaceId::Data,
+                                    number,
+                                    &packet,
+                                    crate::congestion::PacketFeedback::Discarded,
+                                );
+                            }
+                            if owned_feedback {
+                                self.end_feedback(now);
                             }
                         } else {
                             self.accepted_0rtt = true;
@@ -3086,6 +3207,11 @@ impl Connection {
 
     fn migrate(&mut self, now: Instant, remote: SocketAddr) {
         trace!(%remote, "migration initiated");
+        if self.path.challenge.is_some() {
+            self.discard_path_samples(now, self.path.generation());
+        } else if let Some((_, path)) = &self.prev_path {
+            self.discard_path_samples(now, path.generation());
+        }
         self.path_counter = self.path_counter.wrapping_add(1);
         // Reset rtt/congestion state for new path unless it looks like a NAT rebinding.
         // Note that the congestion window will not grow until validation terminates. Helps mitigate
@@ -3508,8 +3634,12 @@ impl Connection {
         stats.frame_tx.acks += 1;
     }
 
-    fn close_common(&mut self) {
+    fn close_common(&mut self, now: Instant) {
         trace!("connection closed");
+        self.discard_path_samples(now, self.path.generation());
+        if let Some((_, path)) = &self.prev_path {
+            self.discard_path_samples(now, path.generation());
+        }
         for &timer in &Timer::VALUES {
             self.timers.stop(timer);
         }
@@ -3763,9 +3893,90 @@ impl Connection {
         }
     }
 
+    fn begin_feedback(&mut self) -> bool {
+        let current = self.path.begin_feedback(self.app_limited);
+        let previous = self
+            .prev_path
+            .as_mut()
+            .is_some_and(|(_, path)| path.begin_feedback(self.app_limited));
+        current || previous
+    }
+
+    fn end_feedback(&mut self, now: Instant) {
+        self.path.end_feedback(now);
+        if let Some((_, path)) = &mut self.prev_path {
+            path.end_feedback(now);
+        }
+    }
+
+    fn packet_feedback(
+        &mut self,
+        now: Instant,
+        space: SpaceId,
+        number: u64,
+        packet: &SentPacket,
+        feedback: crate::congestion::PacketFeedback,
+    ) {
+        use crate::congestion::PacketFeedback;
+        let current = self.path.generation();
+        for path in [&mut self.path]
+            .into_iter()
+            .chain(self.prev_path.as_mut().map(|(_, path)| path))
+        {
+            if path.generation() != packet.path_generation {
+                continue;
+            }
+            let feedback = if path.generation() != current
+                || path.challenge.is_some()
+                || packet.sample_id < path.feedback_sample_floor
+            {
+                PacketFeedback::Discarded
+            } else {
+                feedback
+            };
+            path.feedback(now, packet.info(space, number), feedback);
+            return;
+        }
+    }
+
+    /// Retire sampler entries without changing QUIC's frame/in-flight tracking.
+    fn discard_path_samples(&mut self, now: Instant, generation: u64) {
+        if ![&self.path]
+            .into_iter()
+            .chain(self.prev_path.as_ref().map(|(_, path)| path))
+            .any(|path| path.generation() == generation && path.feedback_enabled)
+        {
+            return;
+        }
+        let owned = self.begin_feedback();
+        for space in SpaceId::iter() {
+            for (&number, packet) in &self.spaces[space].sent_packets {
+                if packet.path_generation != generation {
+                    continue;
+                }
+                for path in [&mut self.path]
+                    .into_iter()
+                    .chain(self.prev_path.as_mut().map(|(_, path)| path))
+                {
+                    if path.generation() == generation {
+                        path.feedback(
+                            now,
+                            packet.info(space, number),
+                            crate::congestion::PacketFeedback::Discarded,
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        if owned {
+            self.end_feedback(now);
+        }
+    }
+
     /// Terminate the connection instantly, without sending a close packet
-    fn kill(&mut self, reason: ConnectionError) {
-        self.close_common();
+    fn kill(&mut self, now: Instant, reason: ConnectionError) {
+        self.close_common(now);
         self.error = Some(reason);
         self.state = State::Drained;
         self.endpoint_events.push_back(EndpointEventInner::Drained);

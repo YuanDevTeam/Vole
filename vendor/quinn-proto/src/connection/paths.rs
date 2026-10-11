@@ -20,6 +20,11 @@ pub(super) struct PathData {
     pub(super) sending_ecn: bool,
     /// Congestion controller state
     pub(super) congestion: Box<dyn congestion::Controller>,
+    /// Cached optional packet-feedback capability; legacy controllers do no extra dispatch.
+    pub(super) feedback_enabled: bool,
+    /// Samples older than this belong to a controller replaced by path_changed.
+    pub(super) feedback_sample_floor: u64,
+    pub(super) feedback_batch: Option<congestion::FeedbackBatch>,
     /// Pacing state
     pub(super) pacing: Pacer,
     pub(super) challenge: Option<u64>,
@@ -67,6 +72,7 @@ impl PathData {
             .congestion_controller_factory
             .clone()
             .build(now, config.get_initial_mtu());
+        let feedback_enabled = congestion.packet_feedback_enabled();
         Self {
             remote,
             rtt: RttEstimator::new(config.initial_rtt),
@@ -78,6 +84,9 @@ impl PathData {
                 now,
             ),
             congestion,
+            feedback_enabled,
+            feedback_sample_floor: 0,
+            feedback_batch: None,
             challenge: None,
             challenge_pending: false,
             validated: false,
@@ -114,6 +123,7 @@ impl PathData {
         now: Instant,
     ) -> Self {
         let congestion = prev.congestion.clone_box();
+        let feedback_enabled = congestion.packet_feedback_enabled();
         let smoothed_rtt = prev.rtt.get();
         Self {
             remote,
@@ -121,6 +131,9 @@ impl PathData {
             pacing: Pacer::new(smoothed_rtt, congestion.window(), prev.current_mtu(), now),
             sending_ecn: true,
             congestion,
+            feedback_enabled,
+            feedback_sample_floor: prev.feedback_sample_floor,
+            feedback_batch: None,
             challenge: None,
             challenge_pending: false,
             validated: false,
@@ -145,6 +158,8 @@ impl PathData {
             .congestion_controller_factory
             .clone()
             .build(now, config.get_initial_mtu());
+        self.feedback_enabled = self.congestion.packet_feedback_enabled();
+        self.feedback_batch = None;
         self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
         self.pacing = Pacer::new(
             self.rtt.get(),
@@ -166,13 +181,67 @@ impl PathData {
     }
 
     /// Account for transmission of `packet` with number `pn` in `space`
-    pub(super) fn sent(&mut self, pn: u64, packet: SentPacket, space: &mut PacketSpace) {
+    pub(super) fn sent(
+        &mut self,
+        pn: u64,
+        packet: SentPacket,
+        space: &mut PacketSpace,
+    ) -> Option<(u64, SentPacket)> {
         self.in_flight.insert(&packet);
         if self.first_packet.is_none() {
             self.first_packet = Some(pn);
         }
-        if let Some(forgotten) = space.sent(pn, packet) {
-            self.remove_in_flight(&forgotten);
+        let forgotten = space.sent(pn, packet);
+        if let Some((_, forgotten)) = &forgotten {
+            self.remove_in_flight(forgotten);
+        }
+        forgotten
+    }
+
+    pub(super) fn begin_feedback(&mut self, app_limited: bool) -> bool {
+        if !self.feedback_enabled || self.feedback_batch.is_some() {
+            return false;
+        }
+        self.feedback_batch = Some(congestion::FeedbackBatch {
+            prior_in_flight: self.in_flight.bytes,
+            app_limited,
+            ..Default::default()
+        });
+        true
+    }
+
+    pub(super) fn feedback(
+        &mut self,
+        now: Instant,
+        packet: congestion::PacketInfo,
+        feedback: congestion::PacketFeedback,
+    ) {
+        if !self.feedback_enabled {
+            return;
+        }
+        self.congestion.on_packet_feedback(now, packet, feedback);
+        if let Some(batch) = &mut self.feedback_batch {
+            match feedback {
+                congestion::PacketFeedback::Acked => {
+                    batch.acked_bytes += packet.congestion_bytes;
+                    batch.largest_acked_sample_id = Some(
+                        batch
+                            .largest_acked_sample_id
+                            .map_or(packet.sample_id, |previous| previous.max(packet.sample_id)),
+                    );
+                }
+                congestion::PacketFeedback::Lost => batch.lost_bytes += packet.congestion_bytes,
+                congestion::PacketFeedback::Discarded => {
+                    batch.discarded_bytes += packet.congestion_bytes
+                }
+            }
+        }
+    }
+
+    pub(super) fn end_feedback(&mut self, now: Instant) {
+        if let Some(mut batch) = self.feedback_batch.take() {
+            batch.in_flight = self.in_flight.bytes;
+            self.congestion.on_feedback_end(now, batch, &self.rtt);
         }
     }
 
@@ -312,6 +381,11 @@ impl RttEstimator {
     /// The current best RTT estimation.
     pub fn get(&self) -> Duration {
         self.smoothed.unwrap_or(self.latest)
+    }
+
+    /// Latest unadjusted RTT measurement (or the initial estimate before any ACK).
+    pub fn latest(&self) -> Duration {
+        self.latest
     }
 
     /// Vole receive-credit growth requires a measured smoothed RTT, not the
@@ -497,11 +571,10 @@ mod tests {
             }
             path.pacing.on_transmit(mtu);
         }
-        assert!(
-            path.pacing
-                .delay(path.rtt.get(), mtu.into(), mtu, window, now)
-                .is_some()
-        );
+        assert!(path
+            .pacing
+            .delay(path.rtt.get(), mtu.into(), mtu, window, now)
+            .is_some());
 
         path.reset(now, &config);
 

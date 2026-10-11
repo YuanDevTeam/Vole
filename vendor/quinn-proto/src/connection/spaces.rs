@@ -215,7 +215,7 @@ impl PacketSpace {
     }
 
     /// May return a packet that should be forgotten
-    pub(super) fn sent(&mut self, number: u64, packet: SentPacket) -> Option<SentPacket> {
+    pub(super) fn sent(&mut self, number: u64, packet: SentPacket) -> Option<(u64, SentPacket)> {
         // Retain state for at most this many non-ACK-eliciting packets sent after the most recently
         // sent ACK-eliciting packet. We're never guaranteed to receive an ACK for those, and we
         // can't judge them as lost without an ACK, so to limit memory in applications which receive
@@ -247,7 +247,7 @@ impl PacketSpace {
                 .remove(&oldest_after_ack_eliciting)
                 .unwrap();
             debug_assert!(!packet.ack_eliciting);
-            forgotten = Some(packet);
+            forgotten = Some((oldest_after_ack_eliciting, packet));
         } else {
             self.unacked_non_ack_eliciting_tail += 1;
         }
@@ -281,6 +281,8 @@ impl IndexMut<SpaceId> for [PacketSpace; 3] {
 /// Represents one or more packets subject to retransmission
 #[derive(Debug, Clone)]
 pub(super) struct SentPacket {
+    /// Connection-wide sample identifier, independent of wire packet spaces.
+    pub(super) sample_id: u64,
     /// [`PathData::generation`](super::PathData::generation) of the path on which this packet was sent
     pub(super) path_generation: u64,
     /// The time the packet was sent.
@@ -301,6 +303,20 @@ pub(super) struct SentPacket {
     ///
     /// The actual application data is stored with the stream state.
     pub(super) stream_frames: frame::StreamMetaVec,
+}
+
+impl SentPacket {
+    pub(super) fn info(&self, space: SpaceId, packet_number: u64) -> crate::congestion::PacketInfo {
+        crate::congestion::PacketInfo {
+            sample_id: self.sample_id,
+            packet_number,
+            space,
+            path_generation: self.path_generation,
+            time_sent: self.time_sent,
+            congestion_bytes: self.size.into(),
+            ack_eliciting: self.ack_eliciting,
+        }
+    }
 }
 
 /// Retransmittable data queue
@@ -1116,6 +1132,6 @@ mod test {
     fn sent_packet_size() {
         // The tracking state of sent packets should be minimal, and not grow
         // over time.
-        assert!(std::mem::size_of::<SentPacket>() <= 128);
+        assert!(std::mem::size_of::<SentPacket>() <= 136);
     }
 }

@@ -7,7 +7,8 @@
 | 用途 | 来源与约束 |
 | --- | --- |
 | 普通 TLS、QUIC、WebPKI | 官方 rustls/tokio-rustls，ring provider；rustls-native-certs 只读取可用平台根，不替换验证器 |
-| QUIC 状态机 | registry Quinn 0.11.12 + 仓库内 quinn-proto 0.11.19；初始/最大窗口与独立 DATAGRAM frame 限额补丁，保留官方许可证/来源 |
+| QUIC 状态机 | registry Quinn 0.11.12 + 仓库内 quinn-proto 0.11.19；窗口、DATAGRAM frame 限额及可选逐包拥塞反馈/pacing 补丁，保留官方许可证/来源 |
+| 新协议 QUIC 拥塞控制 | [Google QUIC 原生算法移植](../src/transport/quic/congestion/README.md)，保留 BSD-3-Clause；Meta v1/v2 参数适配独立实现，现有 HY2/TUIC 控制器保持原样 |
 | Controller 随机服务端身份 | 官方 rsa 仅生成 RSA 2048 密钥；rcgen + ring 签发自签证书，实际 TLS 和握手签名仍由 rustls + ring 处理；随 Controller 入站 feature 启用 |
 | 命名 ClientHello、REALITY、JLS、ShadowTLS v3 | YuanDevTeam/boring，同一 fork 的本地 development path；发布门禁仍要求 release 分支及批准 revision |
 | SS 2022 | 官方 shadowsocks，仅 `aead-cipher-2022` |
@@ -18,7 +19,7 @@
 QUIC 的受影响 protocol crate 通过 root `[patch.crates-io]` 指向
 [vendor/quinn-proto](../vendor/quinn-proto/README.vole.md)。完整官方源、MIT/Apache 许可证和来源记录
 保留；CI 核对版本、仓库内路径、wrapper 依赖边及 rustls/ring provider。升级须重新核查官方
-稳定版本/校验值并审查本地 credit/frame 补丁；不修改 registry 缓存或 Quinn wrapper。
+稳定版本/校验值并审查本地补丁；不修改 registry 缓存或 Quinn wrapper。
 
 AWS-LC 只用于 `shadowsocks → shadowsocks-crypto → aws-lc-rs → aws-lc-sys`，
 不用于 TLS/REALITY。禁止 FIPS、2022-extra 和第二套 REALITY 后端。
