@@ -13,6 +13,7 @@ pub struct TrustTunnelOutboundConfig {
     pub username: String,
     pub password: String,
     pub tls: TlsConfig,
+    pub udp: bool,
     pub quic: bool,
     pub health_check: bool,
     pub pool: TrustTunnelPoolOptions,
@@ -25,6 +26,7 @@ impl std::fmt::Debug for TrustTunnelOutboundConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("TrustTunnelOutboundConfig")
+            .field("udp", &self.udp)
             .field("quic", &self.quic)
             .field("health_check", &self.health_check)
             .field("pool", &self.pool)
@@ -126,12 +128,6 @@ impl RawTrustTunnel {
         if self.quic {
             return invalid("TrustTunnel QUIC support is not implemented");
         }
-        if self.udp {
-            return invalid("TrustTunnel UDP support is not implemented");
-        }
-        if self.health_check {
-            return invalid("TrustTunnel protocol health checks are not implemented");
-        }
         let server_name = self
             .sni
             .filter(|value| !value.is_empty())
@@ -206,6 +202,7 @@ impl RawTrustTunnel {
                     },
                     identity: super::normalize_client_identity(self.certificate, self.private_key)?,
                 },
+                udp: self.udp,
                 quic: self.quic,
                 health_check: self.health_check,
                 pool,
@@ -251,7 +248,7 @@ mod tests {
             assert_eq!(node.tls.required_alpn.as_deref(), Some(b"h2".as_slice()));
             assert_eq!(node.pool, TrustTunnelPoolOptions::default());
             assert!(node.username.is_empty() && node.password.is_empty());
-            assert!(!config.proxies[0].udp && !node.quic && !node.health_check);
+            assert!(!config.proxies[0].udp && !node.udp && !node.quic && !node.health_check);
         }
     }
 
@@ -295,14 +292,11 @@ mod tests {
     }
 
     #[test]
-    fn h2_requires_its_alpn_and_reports_unimplemented_modes() {
-        for options in [
-            "    alpn: [http/1.1]\n",
-            "    udp: true\n",
-            "    quic: true\n",
-            "    health-check: true\n",
-        ] {
+    fn h2_requires_its_alpn_and_forwards_udp_and_health_check() {
+        for options in ["    alpn: [http/1.1]\n", "    quic: true\n"] {
             assert!(parse(options).is_err());
         }
+        let config = parse("    udp: true\n    health-check: true\n").unwrap();
+        assert!(config.proxies[0].udp && node(&config).udp && node(&config).health_check);
     }
 }

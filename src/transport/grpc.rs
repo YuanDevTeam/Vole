@@ -12,6 +12,8 @@ use std::{
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::task::AtomicWaker;
 use h2::{RecvStream, SendStream, client::ResponseFuture};
+#[cfg(feature = "outbound-trusttunnel")]
+use tokio::sync::oneshot;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     task::{AbortHandle, JoinHandle},
@@ -22,16 +24,45 @@ use super::h2_write::{Payload, Receipt, Sender, Writes};
 use super::{STREAM_BUFFER_BYTES as LIMIT, STREAM_CHUNK_BYTES as CHUNK};
 use crate::dispatch::BoxStream;
 
+enum PendingResponse {
+    Direct(ResponseFuture),
+    #[cfg(feature = "outbound-trusttunnel")]
+    Observed(oneshot::Receiver<io::Result<http::Response<RecvStream>>>),
+}
+impl Future for PendingResponse {
+    type Output = io::Result<http::Response<RecvStream>>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            Self::Direct(response) => Pin::new(response)
+                .poll(cx)
+                .map(|result| result.map_err(|_| invalid())),
+            #[cfg(feature = "outbound-trusttunnel")]
+            Self::Observed(response) => Pin::new(response).poll(cx).map(|result| {
+                result.unwrap_or_else(|_| Err(io::ErrorKind::ConnectionAborted.into()))
+            }),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Close {
     stopped: AtomicBool,
+    failed: AtomicBool,
     reader: AtomicWaker,
+    writer: AtomicWaker,
+    #[cfg(feature = "outbound-trusttunnel")]
+    response_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl Close {
     fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.reader.wake();
+        self.writer.wake();
+        #[cfg(feature = "outbound-trusttunnel")]
+        if let Some(cancel) = &self.response_cancel {
+            cancel.cancel();
+        }
     }
 }
 
@@ -200,7 +231,8 @@ struct Grpc {
     framing: Framing,
     half_close: bool,
     upload_closed: bool,
-    response: Option<ResponseFuture>,
+    response: Option<PendingResponse>,
+    response_deadline: bool,
     receive: Option<RecvStream>,
     send: SendStream<Payload>,
     writes: Writes,
@@ -270,26 +302,81 @@ pub(super) async fn pooled_connect(
     request: http::Request<()>,
     deadline: Instant,
     lease: super::grpc_pool::Lease,
-) -> io::Result<BoxStream> {
+    observer: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> io::Result<(BoxStream, impl Future<Output = ()> + Send + 'static)> {
     let writes = sender.writes;
     let mut sender = timeout_at(deadline, sender.request.ready())
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
         .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
     let (response, send) = sender.send_request(request, false).map_err(|_| invalid())?;
-    // TrustTunnel, like gRPC, returns once the connection/request exists.
-    // Headers remain deferred so a peer may wait for client-first payload.
-    Ok(Box::new(Grpc::new(
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let close = Arc::new(Close {
+        response_cancel: Some(cancel.clone()),
+        ..Default::default()
+    });
+    let (ready, receiver) = oneshot::channel();
+    let mut stream = Grpc::new(
         response,
         send,
         Framing::Plain,
         false,
         deadline,
-        Arc::default(),
+        close.clone(),
         None,
         Some(lease),
         writes,
-    )))
+    );
+    let response = match stream.response.take().unwrap() {
+        PendingResponse::Direct(response) => response,
+        _ => unreachable!(),
+    };
+    stream.response = Some(PendingResponse::Observed(receiver));
+    // Physical establishment ends setup, as in Mihomo. A CONNECT peer may
+    // defer headers until client-first data; no expired setup timer is applied
+    // to an already established logical stream's later first read.
+    stream.response_deadline = false;
+    let headers = async move {
+        let result = tokio::select! {biased;
+            ()=cancel.cancelled()=>return,
+            result=response=>result.map_err(|_| invalid()).and_then(|response| {
+                if response.status() == 200 { Ok(response) } else { Err(invalid()) }
+            }),
+        };
+        if result.is_ok() {
+            if let Some(observer) = observer {
+                observer();
+            }
+        } else {
+            close.failed.store(true, Ordering::SeqCst);
+            close.stop();
+        }
+        let _ = ready.send(result);
+    };
+    Ok((Box::new(stream), headers))
+}
+
+#[cfg(feature = "outbound-trusttunnel")]
+pub(super) async fn connect_probe(
+    sender: Sender,
+    request: http::Request<()>,
+    deadline: Instant,
+    _lease: super::grpc_pool::Lease,
+) -> io::Result<()> {
+    let mut sender = timeout_at(deadline, sender.request.ready())
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+        .map_err(|_| invalid())?;
+    let (response, _send) = sender.send_request(request, true).map_err(|_| invalid())?;
+    let response = timeout_at(deadline, response)
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+        .map_err(|_| invalid())?;
+    if response.status() == 200 {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
 }
 
 /// sing-mux uses plain HTTP/2 CONNECT streams, not gRPC records.
@@ -344,7 +431,8 @@ impl Grpc {
             framing,
             half_close,
             upload_closed: false,
-            response: Some(response),
+            response: Some(PendingResponse::Direct(response)),
+            response_deadline: true,
             receive: None,
             send,
             deadline: Box::pin(tokio::time::sleep_until(deadline)),
@@ -362,6 +450,7 @@ impl Grpc {
         }
     }
     fn drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.close.writer.register(cx.waker());
         if self.stopped() {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
@@ -441,18 +530,21 @@ impl AsyncRead for Grpc {
             return Poll::Ready(Ok(()));
         }
         this.close.reader.register(cx.waker());
+        if this.close.failed.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(invalid()));
+        }
         if this.stopped() || this.eof {
             return Poll::Ready(Ok(()));
         }
         if let Some(response) = &mut this.response {
             // Lazy setup still uses the original deadline, even when headers
             // are already queued. Established reads are not setup operations.
-            if this.deadline.as_mut().poll(cx).is_ready() {
+            if this.response_deadline && this.deadline.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
             }
             match Pin::new(response).poll(cx) {
                 Poll::Ready(result) => {
-                    let response = result.map_err(|_| invalid())?;
+                    let response = result?;
                     if response.status() != 200
                         || (this.framing == Framing::Gun
                             && !response.headers().get("content-type").is_some_and(|value| {
@@ -560,6 +652,7 @@ impl AsyncWrite for Grpc {
         cx: &mut Context<'_>,
         input: &[u8],
     ) -> Poll<io::Result<usize>> {
+        self.close.writer.register(cx.waker());
         if self.stopped() || self.upload_closed {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }

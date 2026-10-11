@@ -46,19 +46,26 @@ HTTP CONNECT 本身不提供 UDP，也不接受 `udp` 字段。公共 smux 可�
 
 ## TrustTunnel
 
-`type: trusttunnel` 当前提供 TLS + HTTP/2 CONNECT TCP，使用 `outbound-trusttunnel`。
+`type: trusttunnel` 当前提供 TLS + HTTP/2 CONNECT TCP/UDP，使用 `outbound-trusttunnel`。
 username/password 默认空字符串，始终发送 Basic 认证；不增加非空限制。
 SNI 缺省/空串使用 server，ALPN 缺省/空列表使用 h2，自定义列表必须包含 h2，
 实际握手必须协商 h2，不回退 HTTP/1.1。共享证书策略、mTLS、命名指纹与 ECH。
 
-三项 max-connections/min-streams/max-streams 全为0才应用8/5/0；
-max-connections>0优先采用连接数/最小流分支，否则按max-streams分配。
+三项 max-connections/min-streams/max-streams 全为 0 才应用 8/5/0。
+逻辑客户端池先选择活跃流最少的客户端，零活跃流始终复用。
+max-connections > 0 时，达到客户端数上限或该客户端流数 < min-streams 即复用；
+max-connections <= 0 时，只在 max-streams > 0 且流数 < max-streams 时复用。
+各分支未满足复用条件时增加客户端。
 混合配置和负阈值不额外拒绝；池参数是分配阈值，不是业务流总量上限。
-逻辑流使用原始字节，无gRPC帧；响应头延迟到读取，允许服务端等待client-first业务。
-关闭只结束当前逻辑流；节点Stop取消并join全部H2驱动，不影响其他节点。
+每个逻辑客户端复用自己的物理 H2 连接，物理连接空闲 30 秒后关闭。
 
-quic、udp、health-check目前仅接受关闭；H2中的congestion-controller/cwnd/bbr-profile
-与Mihomo一样不消费，不据此声明H3或拥塞算法支持。
+TCP 流使用原始字节，无 gRPC 帧；响应头延迟到读取，允许服务端等待 client-first 业务。
+udp 缺省 false，开启后使用 `_udp2` CONNECT 承载多目标数据报。
+health-check 缺省 false，开启后使用 `_check` CONNECT；读取活动重置 7 秒计时，
+单次探测期限为 7 秒。关闭只结束当前逻辑流；节点 Stop 取消并 join 池、探测和 H2 驱动。
+
+quic: true 目前尚未支持；H2 中的 congestion-controller/cwnd/bbr-profile
+与 Mihomo 一样不消费，不据此声明 H3 或拥塞算法支持。
 
 ## SOCKS5
 

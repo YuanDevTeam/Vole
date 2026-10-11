@@ -26,7 +26,7 @@ const PING_TIMEOUT: Duration = Duration::from_secs(crate::limits::GRPC_PING_TIME
 enum RequestKind<'a> {
     Grpc(&'a str),
     #[cfg(feature = "outbound-trusttunnel")]
-    Connect(http::Request<()>),
+    Connect(http::Request<()>, Option<Arc<dyn Fn() + Send + Sync>>),
 }
 
 pub struct GrpcPool {
@@ -34,6 +34,8 @@ pub struct GrpcPool {
     half_close: bool,
     connections: Arc<SyncMutex<Vec<Connection>>>,
     opening: Mutex<()>,
+    admission: SyncMutex<()>,
+    idle_timeout: Option<Duration>,
     cancellation: CancellationToken,
     tasks: TaskTracker,
 }
@@ -44,9 +46,21 @@ impl GrpcPool {
             half_close: false,
             connections: Arc::default(),
             opening: Mutex::default(),
+            admission: SyncMutex::default(),
+            idle_timeout: None,
             cancellation: CancellationToken::new(),
             tasks: TaskTracker::new(),
         }
+    }
+    #[cfg(feature = "outbound-trusttunnel")]
+    pub(crate) fn connect_client() -> Self {
+        let mut pool = Self::new(GrpcOptions {
+            max_connections: 1,
+            min_streams: 0,
+            ..Default::default()
+        });
+        pool.idle_timeout = Some(Duration::from_secs(30));
+        pool
     }
     /// Trojan keeps its response and lease after upload END_STREAM.
     #[cfg(any(test, feature = "outbound-trojan"))]
@@ -83,8 +97,47 @@ impl GrpcPool {
         F: FnOnce() -> Fut,
         Fut: Future<Output = io::Result<BoxStream>>,
     {
-        self.open_request(RequestKind::Connect(request), deadline, connect)
+        self.open_request(RequestKind::Connect(request, None), deadline, connect)
             .await
+    }
+    #[cfg(feature = "outbound-trusttunnel")]
+    pub(crate) async fn open_connect_observed<F, Fut>(
+        &self,
+        request: http::Request<()>,
+        deadline: Instant,
+        observer: Arc<dyn Fn() + Send + Sync>,
+        connect: F,
+    ) -> io::Result<BoxStream>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<BoxStream>>,
+    {
+        self.open_request(
+            RequestKind::Connect(request, Some(observer)),
+            deadline,
+            connect,
+        )
+        .await
+    }
+    #[cfg(feature = "outbound-trusttunnel")]
+    pub(crate) async fn probe<F, Fut>(
+        &self,
+        request: http::Request<()>,
+        deadline: Instant,
+        connect: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<BoxStream>>,
+    {
+        let operation = async {
+            let (sender, lease) = self.acquire(connect).await?;
+            super::grpc::connect_probe(sender, request, deadline, lease).await
+        };
+        tokio::select! {biased;
+            ()=self.cancellation.cancelled()=>Err(io::ErrorKind::ConnectionAborted.into()),
+            result=timeout_at(deadline,operation)=>result.map_err(|_|io::Error::from(io::ErrorKind::TimedOut))?,
+        }
     }
     async fn open_request<F, Fut>(
         &self,
@@ -99,39 +152,7 @@ impl GrpcPool {
         let operation = async {
             // Only physical creation is serialized; waiting callers own their
             // deadline/cancellation and no detached queue or worker is created.
-            let (sender, lease) = {
-                let _opening = self.opening.lock().await;
-                let existing = {
-                    let mut connections = self.connections.lock().unwrap();
-                    connections.retain(|connection| !connection.closed.load(Ordering::Acquire));
-                    connections
-                        .iter()
-                        .min_by_key(|connection| connection.active.load(Ordering::Acquire))
-                        .filter(|connection| {
-                            let active = connection.active.load(Ordering::Acquire);
-                            active == 0
-                                || if self.options.max_connections > 0 {
-                                    connections.len() >= self.options.max_connections
-                                        || active < self.options.min_streams
-                                } else {
-                                    self.options.max_streams > 0
-                                        && active < self.options.max_streams
-                                }
-                        })
-                        .map(|connection| connection.reserve(&self.connections))
-                        .transpose()?
-                };
-                match existing {
-                    Some(pair) => pair,
-                    None => {
-                        let raw = connect().await?;
-                        let connection = self.establish(raw).await?;
-                        let pair = connection.reserve(&self.connections)?;
-                        self.connections.lock().unwrap().push(connection);
-                        pair
-                    }
-                }
-            };
+            let (sender, lease) = self.acquire(connect).await?;
             match request {
                 RequestKind::Grpc(uri) => {
                     super::grpc::pooled_stream(
@@ -145,14 +166,65 @@ impl GrpcPool {
                     .await
                 }
                 #[cfg(feature = "outbound-trusttunnel")]
-                RequestKind::Connect(request) => {
-                    super::grpc::pooled_connect(sender, request, deadline, lease).await
+                RequestKind::Connect(request, observer) => {
+                    let (stream, response) =
+                        super::grpc::pooled_connect(sender, request, deadline, lease, observer)
+                            .await?;
+                    let _admission = self.admission.lock().unwrap();
+                    if self.cancellation.is_cancelled() {
+                        return Err(io::ErrorKind::ConnectionAborted.into());
+                    }
+                    let cancellation = self.cancellation.clone();
+                    self.tasks.spawn(crate::resources::observation::task(async move {
+                        tokio::select! {biased; ()=cancellation.cancelled()=>{}, ()=response=>{}}
+                    }));
+                    Ok(stream)
                 }
             }
         };
         tokio::select! {biased;
             ()=self.cancellation.cancelled()=>Err(io::ErrorKind::ConnectionAborted.into()),
             result=timeout_at(deadline,operation)=>result.map_err(|_|io::Error::from(io::ErrorKind::TimedOut))?,
+        }
+    }
+    async fn acquire<F, Fut>(&self, connect: F) -> io::Result<(Sender, Lease)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<BoxStream>>,
+    {
+        let _opening = self.opening.lock().await;
+        let existing = {
+            let mut connections = self.connections.lock().unwrap();
+            connections.retain(|connection| !connection.closed.load(Ordering::Acquire));
+            connections
+                .iter()
+                .min_by_key(|connection| connection.active.load(Ordering::Acquire))
+                .filter(|connection| {
+                    let active = connection.active.load(Ordering::Acquire);
+                    active == 0
+                        || if self.options.max_connections > 0 {
+                            connections.len() >= self.options.max_connections
+                                || active < self.options.min_streams
+                        } else {
+                            self.options.max_streams > 0 && active < self.options.max_streams
+                        }
+                })
+                .map(|connection| connection.reserve(&self.connections))
+                .transpose()?
+        };
+        match existing {
+            Some(pair) => Ok(pair),
+            None => {
+                let raw = connect().await?;
+                let connection = self.establish(raw).await?;
+                let pair = connection.reserve(&self.connections)?;
+                let _admission = self.admission.lock().unwrap();
+                if self.cancellation.is_cancelled() {
+                    return Err(io::ErrorKind::ConnectionAborted.into());
+                }
+                self.connections.lock().unwrap().push(connection);
+                Ok(pair)
+            }
         }
     }
     async fn establish(&self, raw: BoxStream) -> io::Result<Connection> {
@@ -178,15 +250,44 @@ impl GrpcPool {
         let token = self.cancellation.child_token();
         let cancellation = token.clone();
         let interval = self.options.ping_interval;
+        let active = Arc::new(AtomicUsize::new(0));
+        let idle_since = Arc::new(SyncMutex::new(Some(Instant::now())));
+        let activity = Arc::new(tokio::sync::Notify::new());
+        let idle = idle_since.clone();
+        let idle_timeout = self.idle_timeout;
+        let registry = Arc::downgrade(&self.connections);
+        let driver_closed = closed.clone();
+        let driver_active = active.clone();
         let observation =
             crate::resources::observation::track(crate::resources::observation::ResourceKind::Task);
+        let _admission = self.admission.lock().unwrap();
+        if self.cancellation.is_cancelled() {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        let driver_activity = activity.clone();
         self.tasks.spawn(crate::resources::observation::bind(async move {
             let _observation=observation;
             let _lifetime=lifetime;
             if interval==0 {
-                tokio::select! {biased;
-                    ()=cancellation.cancelled()=>{},
-                    _=&mut connection=>{},
+                loop {
+                    let notified = driver_activity.notified();
+                    let expires = idle_timeout.and_then(|timeout| idle.lock().unwrap().map(|since| since + timeout));
+                    tokio::select! {biased;
+                        ()=cancellation.cancelled()=>break,
+                        _=&mut connection=>break,
+                        ()=notified=>{},
+                        ()=async { match expires { Some(deadline)=>tokio::time::sleep_until(deadline).await, None=>std::future::pending().await } }=>{
+                            // Reserve and retire share the registry barrier.
+                            // Publish retirement before a caller can reserve
+                            // this connection after the idle decision.
+                            let Some(registry) = registry.upgrade() else { break; };
+                            let _connections = registry.lock().unwrap();
+                            if driver_active.load(Ordering::Acquire)==0 && idle_timeout.zip(*idle.lock().unwrap()).is_some_and(|(timeout,since)|Instant::now()>=since+timeout) {
+                                driver_closed.store(true, Ordering::Release);
+                                break;
+                            }
+                        }
+                    }
                 }
                 return;
             }
@@ -214,7 +315,9 @@ impl GrpcPool {
                 writes,
             },
             closed,
-            active: Arc::default(),
+            active,
+            idle_since,
+            activity,
             token,
             _observation: crate::resources::observation::track(
                 crate::resources::observation::ResourceKind::Pool,
@@ -222,11 +325,12 @@ impl GrpcPool {
         })
     }
     pub fn begin_shutdown(&self) {
+        let _admission = self.admission.lock().unwrap();
         self.cancellation.cancel();
+        self.tasks.close();
     }
     pub async fn shutdown(&self) {
         self.begin_shutdown();
-        self.tasks.close();
         self.tasks.wait().await;
         self.connections.lock().unwrap().clear();
     }
@@ -242,6 +346,205 @@ mod tests {
     use super::*;
     use crate::resources::observation::{ResourceKind, ResourceProbe};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(feature = "outbound-trusttunnel")]
+    #[tokio::test]
+    async fn trusttunnel_rejected_headers_wake_a_flow_control_blocked_writer() {
+        let pool = GrpcPool::connect_client();
+        let peers = TaskTracker::new();
+        let reject = Arc::new(tokio::sync::Notify::new());
+        let (accepted, ready) = tokio::sync::oneshot::channel();
+        let (raw, peer) = tokio::io::duplex(65536);
+        let signal = reject.clone();
+        let streams = peers.clone();
+        peers.spawn(async move {
+            let mut connection = h2::server::Builder::new()
+                .initial_window_size(0)
+                .handshake::<_, bytes::Bytes>(peer)
+                .await
+                .unwrap();
+            let (request, mut response) = connection.accept().await.unwrap().unwrap();
+            streams.spawn(async move {
+                accepted.send(()).unwrap();
+                signal.notified().await;
+                let send = response
+                    .send_response(
+                        http::Response::builder().status(403).body(()).unwrap(),
+                        false,
+                    )
+                    .unwrap();
+                let _send = send;
+                let mut receive = request.into_body();
+                while receive.data().await.is_some_and(|data| data.is_ok()) {}
+            });
+            while connection.accept().await.is_some() {}
+        });
+        let request = http::Request::builder()
+            .method("CONNECT")
+            .uri(
+                http::Uri::builder()
+                    .authority("example.invalid:443")
+                    .build()
+                    .unwrap(),
+            )
+            .body(())
+            .unwrap();
+        let mut stream = pool
+            .open_connect(request, Instant::now() + Duration::from_secs(5), || async {
+                Ok(Box::new(raw) as BoxStream)
+            })
+            .await
+            .unwrap();
+        ready.await.unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        stream.write_all(b"blocked").await.unwrap();
+        let (pending, reached) = tokio::sync::oneshot::channel();
+        let mut pending = Some(pending);
+        let writer = tokio::spawn(async move {
+            let mut flush = Box::pin(stream.flush());
+            std::future::poll_fn(|cx| {
+                let result = flush.as_mut().poll(cx);
+                if result.is_pending()
+                    && let Some(signal) = pending.take()
+                {
+                    let _ = signal.send(());
+                }
+                result
+            })
+            .await
+        });
+        reached.await.unwrap();
+        reject.notify_one();
+        // Timeout observes the child join; its wake cannot re-poll the blocked
+        // flush and hide a missing Close writer notification.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), writer)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        pool.shutdown().await;
+        peers.close();
+        peers.wait().await;
+    }
+
+    #[cfg(feature = "outbound-trusttunnel")]
+    #[tokio::test(start_paused = true)]
+    async fn trusttunnel_h2_probe_idle_retirement_and_stop_admission() {
+        let observation = ResourceProbe::default();
+        observation
+            .scope(async {
+                let peers = TaskTracker::new();
+                let count = AtomicUsize::new(0);
+                let pool = GrpcPool::connect_client();
+                let factory = || async {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let (raw, peer) = tokio::io::duplex(65536);
+                    let streams = peers.clone();
+                    peers.spawn(async move {
+                        let mut connection = h2::server::handshake(peer).await.unwrap();
+                        while let Some(Ok((request, mut response))) = connection.accept().await {
+                            if request.uri().authority().unwrap().as_str() == "_check" {
+                                assert!(request.body().is_end_stream());
+                                response
+                                    .send_response(http::Response::new(()), true)
+                                    .unwrap();
+                            } else {
+                                let mut send = response
+                                    .send_response(http::Response::new(()), false)
+                                    .unwrap();
+                                streams.spawn(async move {
+                                    let mut receive = request.into_body();
+                                    while let Some(Ok(data)) = receive.data().await {
+                                        receive
+                                            .flow_control()
+                                            .release_capacity(data.len())
+                                            .unwrap();
+                                        if send.send_data(data, false).is_err() {
+                                            return;
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+                    Ok(Box::new(raw) as BoxStream)
+                };
+                let request = |target| {
+                    http::Request::builder()
+                        .method("CONNECT")
+                        .uri(http::Uri::builder().authority(target).build().unwrap())
+                        .body(())
+                        .unwrap()
+                };
+                let mut first = pool
+                    .open_connect(
+                        request("example.invalid:443"),
+                        Instant::now() + Duration::from_secs(5),
+                        factory,
+                    )
+                    .await
+                    .unwrap();
+                first.write_all(b"first").await.unwrap();
+                first.flush().await.unwrap();
+                tokio::time::advance(Duration::from_secs(6)).await;
+                // Headers arrived before the read: an expired setup deadline must
+                // not invalidate an established CONNECT response.
+                let mut echo = [0; 5];
+                first.read_exact(&mut echo).await.unwrap();
+                assert_eq!(&echo, b"first");
+                first.shutdown().await.unwrap();
+                drop(first);
+                pool.probe(
+                    request("_check"),
+                    Instant::now() + Duration::from_secs(7),
+                    factory,
+                )
+                .await
+                .unwrap();
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+                tokio::time::advance(Duration::from_secs(31)).await;
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                let mut second = pool
+                    .open_connect(
+                        request("example.invalid:443"),
+                        Instant::now() + Duration::from_secs(5),
+                        factory,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(count.load(Ordering::SeqCst), 2);
+                second.write_all(b"again").await.unwrap();
+                second.flush().await.unwrap();
+                second.read_exact(&mut echo).await.unwrap();
+                assert_eq!(&echo, b"again");
+                pool.shutdown().await;
+                assert!(second.write_all(b"stopped").await.is_err());
+                drop(second);
+                let (raw, _peer) = tokio::io::duplex(65536);
+                assert!(pool.establish(Box::new(raw)).await.is_err());
+                assert!(pool.tasks.is_empty());
+                assert!(
+                    pool.open_connect(
+                        request("example.invalid:443"),
+                        Instant::now() + Duration::from_secs(5),
+                        factory
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(count.load(Ordering::SeqCst), 2);
+                peers.close();
+                peers.wait().await;
+            })
+            .await;
+        assert!(observation.snapshot().is_idle());
+    }
 
     #[tokio::test]
     async fn grpc_duplex_pool_keeps_response_and_sibling_after_end_stream_and_joins_stop() {
@@ -349,6 +652,8 @@ struct Connection {
     active: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
     token: CancellationToken,
+    idle_since: Arc<SyncMutex<Option<Instant>>>,
+    activity: Arc<tokio::sync::Notify>,
     _observation: crate::resources::observation::Guard,
 }
 impl Connection {
@@ -358,12 +663,16 @@ impl Connection {
                 count.checked_add(1)
             })
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        *self.idle_since.lock().unwrap() = None;
+        self.activity.notify_one();
         Ok((
             self.sender.clone(),
             Lease {
                 active: self.active.clone(),
                 closed: self.closed.clone(),
                 pool: Arc::downgrade(pool),
+                idle_since: self.idle_since.clone(),
+                activity: self.activity.clone(),
             },
         ))
     }
@@ -384,6 +693,8 @@ pub(super) struct Lease {
     active: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
     pool: std::sync::Weak<SyncMutex<Vec<Connection>>>,
+    idle_since: Arc<SyncMutex<Option<Instant>>>,
+    activity: Arc<tokio::sync::Notify>,
 }
 impl Lease {
     pub(super) fn stopped(&self) -> bool {
@@ -392,11 +703,16 @@ impl Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if self.active.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(pool) = self.pool.upgrade()
-        {
+        let pool = self.pool.upgrade();
+        let mut connections = pool.as_ref().map(|pool| pool.lock().unwrap());
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            *self.idle_since.lock().unwrap() = Some(Instant::now());
+            self.activity.notify_one();
+            let Some(connections) = &mut connections else {
+                return;
+            };
             let mut idle = 0;
-            pool.lock().unwrap().retain(|connection| {
+            connections.retain(|connection| {
                 if connection.closed.load(Ordering::Acquire) {
                     return false;
                 }

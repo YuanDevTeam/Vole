@@ -229,12 +229,16 @@ sniffer:
 # username/password 均非空才认证；headers 为字符串映射；仅 TCP，不支持 udp: true。
 # tls: true 时支持 sni/skip-cert-verify/name-cert-verify/fingerprint，
 # 以及成对的 certificate/private-key（PEM 或文件路径）。支持 dialer-proxy；详见 outbounds.md。
-# TrustTunnel 当前支持 TLS + H2 CONNECT TCP，type: trusttunnel；username/password 默认空串，
+# TrustTunnel 当前支持 TLS + H2 CONNECT TCP/UDP，type: trusttunnel；username/password 默认空串，
 # 始终发送 Basic 认证，不要求非空。sni 缺省/空串使用 server；alpn 缺省/[] 为 [h2]，
 # 自定义列表必须包含 h2，不降级 H1。支持上述证书策略、mTLS、client-fingerprint、ech-opts。
-# 连接分配 max-connections/min-streams/max-streams 全为 0 时采用 8/5/0；
-# max-connections > 0 优先，混合填写不报互斥，阈值不限制业务总连接数。
-# quic/udp/health-check 缺省或 false；当前 true 尚未支持。
+# 逻辑客户端池 max-connections/min-streams/max-streams 全为 0 时采用 8/5/0；
+# 优先复用流数最少的客户端，max-connections > 0 时，达到客户端数上限或
+# 当前流数 < min-streams 即复用；max-connections <= 0 时，按
+# max-streams > 0 且当前流数 < max-streams 复用；未满足条件则增加客户端。
+# 零活跃流始终复用，混合填写不报互斥，阈值不限制业务总连接数。物理 H2 空闲 30 秒关闭。
+# udp: true 启用 _udp2 多目标数据报；health-check: true 启用 _check 协议探测，
+# 读取活动重置 7 秒计时，单次探测期限 7 秒；二者缺省 false。quic: true 尚未支持。
 # congestion-controller/cwnd/bbr-profile 可填写，在 H2 模式与 Mihomo 一样不生效。
 proxies:
   - name: trusttunnel-edge
@@ -243,6 +247,8 @@ proxies:
     port: 443
     username: synthetic-user
     password: synthetic-password
+    udp: true
+    health-check: true
 
   # 标准 WireGuard：用户态内层 TCP/UDP，不创建系统接口/路由/NAT。
   # 密钥为公开测试值，不可用于真实连接。外层始终需要双向 UDP；业务 udp 默认 false。
