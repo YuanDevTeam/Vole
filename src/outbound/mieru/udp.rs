@@ -2,16 +2,17 @@
 //! Datagram loss never advances the receiver or releases unacknowledged bytes.
 use super::{
     crypto,
+    pattern::{EffectivePattern, NonceState},
     reliability::{Cubic, Rtt},
     stream::{ReceivedChunk, State, closed},
     tcp::{Shared, WriterCommand},
     wire::{
-        DataKind, DataMetadata, Frame, Metadata, PacketDecoder, PacketEncoder, Padding,
-        SessionKind, SessionMetadata,
+        DataKind, DataMetadata, Frame, Metadata, PacketDecoder, PacketEncoder, SessionKind,
+        SessionMetadata,
     },
 };
 use crate::{
-    config::MieruOutboundConfig,
+    config::{MieruOutboundConfig, MieruTransport},
     dispatch::{DatagramBudget, DatagramTransport},
     outbound::{DatagramRequest, EstablishContext, UpstreamPath, server_destination},
     resources::observation::{self, ResourceKind},
@@ -79,6 +80,11 @@ struct Partial {
     sequence: u32,
     payload: Bytes,
     offset: usize,
+}
+struct PacketPattern<'a> {
+    pattern: &'a EffectivePattern,
+    nonce: NonceState,
+    wire_budget: usize,
 }
 struct Reliable {
     state: Arc<State>,
@@ -165,10 +171,13 @@ impl Reliable {
         let due = now + ACK_DELAY;
         self.ack_due = Some(self.ack_due.map_or(due, |old| old.min(due)));
     }
-    fn enqueue(&mut self, command: WriterCommand, chunk: usize) {
+    fn enqueue(&mut self, command: WriterCommand, chunk: usize, allow_piggyback: bool) {
         let first = !self.state.opened.swap(true, Ordering::AcqRel);
-        let piggyback =
-            first && command.piggyback && command.data.len() <= 1024 && command.data.len() <= chunk;
+        let piggyback = first
+            && allow_piggyback
+            && command.piggyback
+            && command.data.len() <= 1024
+            && command.data.len() <= chunk;
         let count = if piggyback {
             1
         } else {
@@ -399,6 +408,7 @@ fn advance_partial(
 pub(super) async fn drive(
     config: &MieruOutboundConfig,
     upstream: &UpstreamPath,
+    pattern: &EffectivePattern,
     session: StreamSession,
     context: EstablishContext,
     shared: &Arc<Shared>,
@@ -435,7 +445,8 @@ pub(super) async fn drive(
                 "Mieru UDP path budget is too small",
             ));
         }
-        let chunk = usize::from(budget.transmit()) - DATA_OVERHEAD;
+        let chunk = pattern
+            .plaintext_fragment_limit(MieruTransport::Udp, usize::from(budget.transmit()))?;
         shared.set_maximum_write((chunk * 255).min(32768));
         let key = Arc::new(crypto::derive_key(
             &config.username,
@@ -461,6 +472,7 @@ pub(super) async fn drive(
                     &encoder,
                     &decoder,
                     &config.username,
+                    pattern,
                     shared,
                     commands,
                 )
@@ -481,18 +493,26 @@ async fn send(
     encoder: &PacketEncoder,
     username: &str,
     shared: &Shared,
+    pattern: &mut PacketPattern<'_>,
     metadata: Metadata,
     payload: &[u8],
     output: &mut Vec<u8>,
 ) -> io::Result<()> {
-    let nonce = crypto::make_client_nonce(username, rand::random());
+    let mut nonce = rand::random();
+    pattern
+        .pattern
+        .rewrite_nonce(&mut pattern.nonce, &mut nonce, MieruTransport::Udp);
+    let nonce = crypto::make_client_nonce(username, nonce);
+    let prepared = pattern.pattern.prepare_frame(
+        metadata,
+        payload.len(),
+        MieruTransport::Udp,
+        pattern.wire_budget,
+    )?;
     encoder.encode_frame(
         metadata,
         payload,
-        Padding {
-            prefix: &[],
-            suffix: &[],
-        },
+        prepared.encoding(),
         nonce,
         super::tcp::now()?,
         output,
@@ -508,6 +528,7 @@ async fn output(
     encoder: &PacketEncoder,
     username: &str,
     shared: &Shared,
+    pattern: &mut PacketPattern<'_>,
     state: &mut Reliable,
     partial_available: bool,
     buffer: &mut Vec<u8>,
@@ -540,6 +561,7 @@ async fn output(
             encoder,
             username,
             shared,
+            pattern,
             segment.metadata,
             &segment.payload,
             buffer,
@@ -580,6 +602,7 @@ async fn output(
             encoder,
             username,
             shared,
+            pattern,
             segment.metadata,
             &segment.payload,
             buffer,
@@ -616,6 +639,7 @@ async fn output(
             encoder,
             username,
             shared,
+            pattern,
             metadata,
             &[],
             buffer,
@@ -645,10 +669,17 @@ async fn run(
     encoder: &PacketEncoder,
     decoder: &PacketDecoder,
     username: &str,
+    pattern: &EffectivePattern,
     shared: &Shared,
     mut commands: mpsc::Receiver<WriterCommand>,
 ) -> io::Result<()> {
-    let chunk = usize::from(budget.transmit()) - DATA_OVERHEAD;
+    let chunk =
+        pattern.plaintext_fragment_limit(MieruTransport::Udp, usize::from(budget.transmit()))?;
+    let mut packet_pattern = PacketPattern {
+        pattern,
+        nonce: NonceState::new(),
+        wire_budget: usize::from(budget.transmit()),
+    };
     let receive_chunk = usize::from(budget.receive())
         .saturating_sub(DATA_OVERHEAD)
         .max(1);
@@ -668,7 +699,7 @@ async fn run(
             .min(now + Duration::from_secs(5));
         tokio::select! {biased;
             ()=shared.cancel.cancelled()=>return Ok(()),
-            command=commands.recv()=>{let Some(command)=command else{return Ok(());};if command.state.cancel.is_cancelled(){let _=command.done.send(Err(closed()));}else{let state=sessions.entry(command.state.id).or_insert_with(||Reliable::new(command.state.clone(),receive_chunk));if state.remote_close.is_some(){let _=command.done.send(Err(closed()));}else{state.enqueue(command,chunk);}}},
+            command=commands.recv()=>{let Some(command)=command else{return Ok(());};if command.state.cancel.is_cancelled(){let _=command.done.send(Err(closed()));}else{let state=sessions.entry(command.state.id).or_insert_with(||Reliable::new(command.state.clone(),receive_chunk));if state.remote_close.is_some(){let _=command.done.send(Err(closed()));}else{state.enqueue(command,chunk,!pattern.low_entropy_enabled());}}},
             ()=shared.activity.notified()=>{},
             ()=tokio::time::sleep_until(deadline)=>{},
             packet=transport.receive(),if !sessions.is_empty()=>{
@@ -681,7 +712,7 @@ async fn run(
                 if let Some(state)=sessions.get_mut(&id){
                     match frame.metadata {
                         Metadata::Session(meta) if matches!(meta.kind,SessionKind::CloseRequest|SessionKind::CloseResponse)=>{
-                            if meta.kind==SessionKind::CloseRequest{let metadata=close_metadata(&state.state,SessionKind::CloseResponse);send(transport,peer,encoder,username,shared,metadata,&[],&mut buffer).await?;}
+                            if meta.kind==SessionKind::CloseRequest{let metadata=close_metadata(&state.state,SessionKind::CloseResponse);send(transport,peer,encoder,username,shared,&mut packet_pattern,metadata,&[],&mut buffer).await?;}
                             if partial.as_ref().is_some_and(|pending|pending.session_id==id){
                                 state.remote_close=Some(state.remote_close.unwrap_or(false)||meta.status!=0);
                                 state.pending.clear();state.outstanding.clear();state.reorder.clear();
@@ -692,7 +723,7 @@ async fn run(
                         _=>state.input(frame,Instant::now(),&mut partial),
                     }
                 }else if let Metadata::Data(meta)=frame.metadata {
-                    let close=Metadata::Session(SessionMetadata{kind:SessionKind::CloseRequest,session_id:id,sequence:meta.unack_sequence,status:0});send(transport,peer,encoder,username,shared,close,&[],&mut buffer).await?;
+                    let close=Metadata::Session(SessionMetadata{kind:SessionKind::CloseRequest,session_id:id,sequence:meta.unack_sequence,status:0});send(transport,peer,encoder,username,shared,&mut packet_pattern,close,&[],&mut buffer).await?;
                 }
             }
         }
@@ -715,6 +746,7 @@ async fn run(
                         encoder,
                         username,
                         shared,
+                        &mut packet_pattern,
                         metadata,
                         &[],
                         &mut buffer,
@@ -737,6 +769,7 @@ async fn run(
                 encoder,
                 username,
                 shared,
+                &mut packet_pattern,
                 state,
                 partial.is_none(),
                 &mut buffer,
@@ -751,6 +784,7 @@ async fn run(
                     encoder,
                     username,
                     shared,
+                    &mut packet_pattern,
                     metadata,
                     &[],
                     &mut buffer,
@@ -765,6 +799,7 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    use super::super::wire::Padding;
     use super::*;
     use crate::{
         dispatch::DispatchError,
@@ -792,15 +827,21 @@ mod tests {
         cancel: CancellationToken,
         opens: AtomicUsize,
         nonces: Mutex<Vec<[u8; 24]>>,
+        transmit_limit: u16,
+        received: Mutex<Vec<(u8, usize, usize)>>,
     }
     struct Memory {
         input: mpsc::Receiver<Datagram>,
         output: mpsc::Sender<Datagram>,
         cancel: CancellationToken,
         task: Option<JoinHandle<()>>,
+        budget: DatagramBudget,
     }
     #[async_trait]
     impl DatagramTransport for Memory {
+        fn payload_budget(&self, _: &Destination) -> DatagramBudget {
+            self.budget
+        }
         async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
             self.output
                 .send(packet)
@@ -844,6 +885,8 @@ mod tests {
                 cancel: CancellationToken::new(),
                 opens: AtomicUsize::new(0),
                 nonces: Mutex::new(Vec::new()),
+                transmit_limit: MTU,
+                received: Mutex::new(Vec::new()),
             })
         }
         async fn stop(&self) {
@@ -877,6 +920,7 @@ mod tests {
                 output,
                 cancel,
                 task: Some(task),
+                budget: DatagramBudget::new(self.transmit_limit, MTU),
             }))
         }
     }
@@ -1023,6 +1067,7 @@ mod tests {
             super::super::tcp::now()?,
         ));
         let decoder = PacketDecoder::new(key.clone());
+        let header_cipher = crypto::PacketCipher::new(key.clone());
         let encoder = PacketEncoder::new(key);
         let mut sessions = BTreeMap::<u32, ServerSession>::new();
         let mut dropped = false;
@@ -1072,7 +1117,16 @@ mod tests {
             let mut nonce = [0; 24];
             nonce.copy_from_slice(&packet.payload[..24]);
             peer.nonces.lock().unwrap().push(nonce);
+            let wire_len = packet.payload.len();
+            let mut header = packet.payload[24..56].to_vec();
+            let mut tag = [0; 16];
+            tag.copy_from_slice(&packet.payload[56..72]);
+            header_cipher.open(nonce, &mut header, tag)?;
             let frame = decoder.decode_frame(packet.payload, super::super::tcp::now()?)?;
+            peer.received
+                .lock()
+                .unwrap()
+                .push((header[0], wire_len, frame.payload.len()));
             let id = session_id(frame.metadata);
             if matches!(frame.metadata,Metadata::Session(m) if m.kind==SessionKind::CloseResponse) {
                 peer.close_replied.notify_one();
@@ -1258,6 +1312,65 @@ mod tests {
         c.address = "127.0.0.1".into();
         c.transport = crate::config::MieruTransport::Udp;
         c
+    }
+    #[tokio::test]
+    async fn mieru_udp_pattern_consumes_nonce_low_entropy_and_actual_path_budget() {
+        // Independently encoded MODE32 pattern with no padding/control
+        // fragmentation; fixed nonce prefix applies to every UDP attempt.
+        const PATTERN: &str = "CAAaBAgAEAAiEAgDEAEYACAAKgZhYWJiY2MqBAgAEAAyBAgBEAA=";
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let mut peer = Peer::new(true, false);
+                Arc::get_mut(&mut peer).unwrap().transmit_limit = 128;
+                let mut configuration = config();
+                configuration.traffic_pattern = Some(PATTERN.into());
+                let node = super::super::MieruOutbound::new(
+                    &configuration,
+                    UpstreamPath::proxy(Arc::new(peer.clone())),
+                    4096,
+                )
+                .unwrap();
+                let context = EstablishContext::with_timeout(Duration::from_secs(5));
+                let mut stream = node
+                    .connect_stream(super::super::tests::session(), &context)
+                    .await
+                    .unwrap()
+                    .io;
+                super::super::tests::echo(&mut stream, &vec![0x69; 400]).await;
+                assert!(
+                    peer.opens.load(Ordering::Acquire) >= 2,
+                    "OPEN loss was not retried"
+                );
+                {
+                    let received = peer.received.lock().unwrap();
+                    assert!(received.iter().all(|(_, wire_len, _)| *wire_len <= 128));
+                    let data: Vec<_> = received
+                        .iter()
+                        .filter(|(protocol, _, _)| *protocol == 10)
+                        .collect();
+                    assert!(!data.is_empty(), "production DATA did not use low entropy");
+                    assert!(data.iter().all(|(_, _, payload_len)| *payload_len <= 20));
+                    assert!(
+                        received
+                            .iter()
+                            .filter(|(protocol, _, _)| *protocol == 2)
+                            .all(|(_, _, size)| *size == 0)
+                    );
+                    let nonces = peer.nonces.lock().unwrap();
+                    assert!(nonces.iter().all(|nonce| nonce[..3] == [0xaa, 0xbb, 0xcc]));
+                    assert!(nonces.iter().all(|nonce| {
+                        nonce[20..] == crypto::make_client_nonce("vole", *nonce)[20..]
+                    }));
+                    assert!(nonces.windows(2).all(|pair| pair[0] != pair[1]));
+                }
+                drop(stream);
+                node.shutdown().await;
+                drop(node);
+                peer.stop().await;
+            })
+            .await;
+        assert!(probe.snapshot().is_idle());
     }
     #[tokio::test]
     async fn mieru_udp_remote_close_preserves_small_budget_partial_frame() {
@@ -1671,6 +1784,7 @@ mod tests {
                 _bytes: permit,
             },
             2,
+            true,
         );
         while let Some(mut segment) = reliable.pending.pop_front() {
             segment.sent = Some(Instant::now());

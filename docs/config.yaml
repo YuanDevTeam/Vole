@@ -261,7 +261,7 @@ proxies:
   # multiplexing 为 MULTIPLEXING_DEFAULT/OFF/LOW/MIDDLE/HIGH，默认 LOW；
   # handshake-mode 为 HANDSHAKE_DEFAULT/STANDARD/NO_WAIT，默认 STANDARD。
   # 枚举须携带上述完整前缀。UDP 底层提供 ACK/重传/排序/窗口，不是裸 UDP 转发。
-  # 非空 traffic-pattern 尚未提供。
+  # traffic-pattern：可选的标准 Base64 Mieru protobuf；省略/空值使用协议默认策略。
   - name: mieru-edge
     type: mieru
     server: mieru.example.com

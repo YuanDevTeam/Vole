@@ -73,9 +73,63 @@ pub(crate) struct Padding<'a> {
     pub(crate) suffix: &'a [u8],
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct LowEntropyEncoding {
+    pub(crate) mode: u8,
+    pub(crate) half_mask: u32,
+    pub(crate) rotation: u8,
+    pub(crate) padding_bit: u8,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BodyEncoding {
+    Plain,
+    LowEntropy(LowEntropyEncoding),
+}
+
+impl BodyEncoding {
+    pub(crate) fn encoded_len(self, plain_len: usize) -> io::Result<usize> {
+        match self {
+            Self::Plain => Ok(plain_len),
+            Self::LowEntropy(encoding) => encoding.encoded_len(plain_len),
+        }
+    }
+
+    fn expand(self, body: &mut [u8], plain_len: usize) -> io::Result<()> {
+        match self {
+            Self::Plain => Ok(()),
+            Self::LowEntropy(encoding) => encoding.expand(body, plain_len),
+        }
+    }
+
+    fn compact(self, body: &mut [u8], plain_len: usize) -> io::Result<()> {
+        match self {
+            Self::Plain => Ok(()),
+            Self::LowEntropy(encoding) => encoding.compact(body, plain_len),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FrameEncoding<'a> {
+    pub(crate) padding: Padding<'a>,
+    pub(crate) body: BodyEncoding,
+}
+
+impl<'a> From<Padding<'a>> for FrameEncoding<'a> {
+    fn from(padding: Padding<'a>) -> Self {
+        Self {
+            padding,
+            body: BodyEncoding::Plain,
+        }
+    }
+}
+
 struct Header {
     metadata: Metadata,
     payload_len: usize,
+    plain_len: usize,
+    body: BodyEncoding,
     prefix_len: usize,
     suffix_len: usize,
 }
@@ -87,16 +141,20 @@ fn invalid_frame() -> io::Error {
 fn encode_metadata(
     metadata: Metadata,
     payload_len: usize,
-    padding: Padding<'_>,
+    encoding: FrameEncoding<'_>,
     unix_secs: u64,
 ) -> io::Result<[u8; METADATA_LEN]> {
-    let prefix_len = u8::try_from(padding.prefix.len()).map_err(|_| invalid_frame())?;
-    let suffix_len = u8::try_from(padding.suffix.len()).map_err(|_| invalid_frame())?;
+    let prefix_len = u8::try_from(encoding.padding.prefix.len()).map_err(|_| invalid_frame())?;
+    let suffix_len = u8::try_from(encoding.padding.suffix.len()).map_err(|_| invalid_frame())?;
+    let encoded_len = encoding.body.encoded_len(payload_len)?;
     let mut header = [0; METADATA_LEN];
     header[2..6].copy_from_slice(&((unix_secs / 60) as u32).to_be_bytes());
     match metadata {
         Metadata::Session(session) => {
-            if payload_len > MAX_CONTROL_PAYLOAD || prefix_len != 0 {
+            if payload_len > MAX_CONTROL_PAYLOAD
+                || prefix_len != 0
+                || !matches!(encoding.body, BodyEncoding::Plain)
+            {
                 return Err(invalid_frame());
             }
             header[0] = match session.kind {
@@ -121,13 +179,24 @@ fn encode_metadata(
                 DataKind::ClientAck => 8,
                 DataKind::ServerAck => 9,
             };
+            if let BodyEncoding::LowEntropy(body) = encoding.body {
+                header[0] = match data.kind {
+                    DataKind::ClientData => 10,
+                    DataKind::ServerData => 11,
+                    _ => return Err(invalid_frame()),
+                };
+                header[1] = body.mode;
+                header[25..29].copy_from_slice(&body.half_mask.to_be_bytes());
+                header[29..31].copy_from_slice(&(payload_len as u16).to_be_bytes());
+                header[31] = body.rotation;
+            }
             header[6..10].copy_from_slice(&data.session_id.to_be_bytes());
             header[10..14].copy_from_slice(&data.sequence.to_be_bytes());
             header[14..18].copy_from_slice(&data.unack_sequence.to_be_bytes());
             header[18..20].copy_from_slice(&data.window.to_be_bytes());
             header[20] = data.fragment;
             header[21] = prefix_len;
-            header[22..24].copy_from_slice(&(payload_len as u16).to_be_bytes());
+            header[22..24].copy_from_slice(&(encoded_len as u16).to_be_bytes());
             header[24] = suffix_len;
         }
     }
@@ -162,16 +231,34 @@ fn decode_metadata(header: [u8; METADATA_LEN], unix_secs: u64) -> io::Result<Hea
                 status: header[14],
             }),
             payload_len,
+            plain_len: payload_len,
+            body: BodyEncoding::Plain,
             prefix_len: 0,
             suffix_len: usize::from(header[17]),
         });
     }
     let kind = match header[0] {
-        6 => DataKind::ClientData,
-        7 => DataKind::ServerData,
+        6 | 10 => DataKind::ClientData,
+        7 | 11 => DataKind::ServerData,
         8 => DataKind::ClientAck,
         9 => DataKind::ServerAck,
         _ => return Err(invalid_frame()),
+    };
+    let payload_len = usize::from(u16_at(22));
+    let (body, plain_len) = if matches!(header[0], 10 | 11) {
+        let body = BodyEncoding::LowEntropy(LowEntropyEncoding {
+            mode: header[1],
+            half_mask: u32_at(25),
+            rotation: header[31],
+            padding_bit: 0,
+        });
+        let plain_len = usize::from(u16_at(29));
+        if body.encoded_len(plain_len)? != payload_len {
+            return Err(invalid_frame());
+        }
+        (body, plain_len)
+    } else {
+        (BodyEncoding::Plain, payload_len)
     };
     // Received ordinary data uses the full wire u16 bound. The 32 KiB fragment limit
     // constrains our sender; it must not become an additional peer parser restriction.
@@ -184,7 +271,9 @@ fn decode_metadata(header: [u8; METADATA_LEN], unix_secs: u64) -> io::Result<Hea
             window: u16_at(18),
             fragment: header[20],
         }),
-        payload_len: usize::from(u16_at(22)),
+        payload_len,
+        plain_len,
+        body,
         prefix_len: usize::from(header[21]),
         suffix_len: usize::from(header[24]),
     })
@@ -203,34 +292,40 @@ impl PacketEncoder {
         }
     }
 
-    pub(crate) fn encode_frame(
+    pub(crate) fn encode_frame<'a>(
         &self,
         metadata: Metadata,
         payload: &[u8],
-        padding: Padding<'_>,
+        encoding: impl Into<FrameEncoding<'a>>,
         nonce: [u8; NONCE_LEN],
         unix_secs: u64,
         out: &mut Vec<u8>,
     ) -> io::Result<()> {
-        let header = encode_metadata(metadata, payload.len(), padding, unix_secs)?;
+        let encoding = encoding.into();
+        let padding = encoding.padding;
+        let header = encode_metadata(metadata, payload.len(), encoding, unix_secs)?;
         let payload_start = PACKET_HEADER_LEN + padding.prefix.len();
-        let payload_end = payload_start + payload.len();
+        let payload_end = payload_start + encoding.body.encoded_len(payload.len())?;
         let suffix_start = payload_end + if payload.is_empty() { 0 } else { TAG_LEN };
         out.clear();
         out.resize(suffix_start + padding.suffix.len(), 0);
         out[..NONCE_LEN].copy_from_slice(&nonce);
         out[NONCE_LEN..NONCE_LEN + METADATA_LEN].copy_from_slice(&header);
         out[PACKET_HEADER_LEN..payload_start].copy_from_slice(padding.prefix);
-        out[payload_start..payload_end].copy_from_slice(payload);
+        out[payload_start..payload_start + payload.len()].copy_from_slice(payload);
         out[suffix_start..].copy_from_slice(padding.suffix);
         let tag = self
             .cipher
             .seal(nonce, &mut out[NONCE_LEN..NONCE_LEN + METADATA_LEN])?;
         out[NONCE_LEN + METADATA_LEN..PACKET_HEADER_LEN].copy_from_slice(&tag);
         if !payload.is_empty() {
-            let tag = self
-                .cipher
-                .seal(nonce, &mut out[payload_start..payload_end])?;
+            let tag = self.cipher.seal(
+                nonce,
+                &mut out[payload_start..payload_start + payload.len()],
+            )?;
+            encoding
+                .body
+                .expand(&mut out[payload_start..payload_end], payload.len())?;
             out[payload_end..suffix_start].copy_from_slice(&tag);
         }
         Ok(())
@@ -284,9 +379,15 @@ impl PacketDecoder {
             let tag = packet[payload_end..suffix_start]
                 .try_into()
                 .expect("fixed payload tag");
-            self.cipher
-                .open(nonce, &mut packet[payload_start..payload_end], tag)?;
-            packet.truncate(payload_end);
+            header
+                .body
+                .compact(&mut packet[payload_start..payload_end], header.plain_len)?;
+            self.cipher.open(
+                nonce,
+                &mut packet[payload_start..payload_start + header.plain_len],
+                tag,
+            )?;
+            packet.truncate(payload_start + header.plain_len);
             packet.freeze().slice(payload_start..)
         };
         Ok(Frame {
@@ -329,22 +430,25 @@ impl StreamEncoder {
 
     /// Replace `out` with exactly one frame. Invalid local shapes do not consume a nonce;
     /// cryptographic failure retires this encoder and its physical connection.
-    pub(crate) fn encode_frame(
+    pub(crate) fn encode_frame<'a>(
         &mut self,
         metadata: Metadata,
         payload: &[u8],
-        padding: Padding<'_>,
+        encoding: impl Into<FrameEncoding<'a>>,
         unix_secs: u64,
         out: &mut Vec<u8>,
     ) -> io::Result<()> {
         if self.unusable {
             return Err(io::Error::other("Mieru encoder retired"));
         }
-        let header = encode_metadata(metadata, payload.len(), padding, unix_secs)?;
+        let encoding = encoding.into();
+        let padding = encoding.padding;
+        let header = encode_metadata(metadata, payload.len(), encoding, unix_secs)?;
         let nonce_len = if self.first { NONCE_LEN } else { 0 };
         let payload_tag_len = if payload.is_empty() { 0 } else { TAG_LEN };
         let payload_start = nonce_len + ENCRYPTED_METADATA_LEN + padding.prefix.len();
-        let suffix_start = payload_start + payload.len() + payload_tag_len;
+        let payload_end = payload_start + encoding.body.encoded_len(payload.len())?;
+        let suffix_start = payload_end + payload_tag_len;
         let frame_len = suffix_start + padding.suffix.len();
         out.clear();
         out.resize(frame_len, 0);
@@ -364,7 +468,10 @@ impl StreamEncoder {
             let tag = self
                 .cipher
                 .seal(&mut out[payload_start..payload_start + payload.len()])?;
-            out[payload_start + payload.len()..suffix_start].copy_from_slice(&tag);
+            encoding
+                .body
+                .expand(&mut out[payload_start..payload_end], payload.len())?;
+            out[payload_end..suffix_start].copy_from_slice(&tag);
         }
         self.first = false;
         self.unusable = false;
@@ -462,8 +569,11 @@ impl StreamDecoder {
             let tag = payload[header.payload_len..]
                 .try_into()
                 .expect("fixed payload tag");
-            cipher.open(&mut payload[..header.payload_len], tag)?;
-            payload.truncate(header.payload_len);
+            header
+                .body
+                .compact(&mut payload[..header.payload_len], header.plain_len)?;
+            cipher.open(&mut payload[..header.plain_len], tag)?;
+            payload.truncate(header.plain_len);
             Bytes::from(payload)
         };
         reader.read_exact(&mut padding[..header.suffix_len]).await?;
@@ -575,6 +685,156 @@ mod tests {
         })
     }
 
+    fn data() -> Metadata {
+        let Metadata::Data(mut data) = ack() else {
+            unreachable!()
+        };
+        data.kind = DataKind::ClientData;
+        Metadata::Data(data)
+    }
+
+    #[test]
+    fn mieru_low_entropy_packet_preserves_aead_tag_and_owned_buffer() {
+        let encoder = PacketEncoder::new(key());
+        let decoder = PacketDecoder::new(key());
+        let plain = b"partial last chunk";
+        let padding = Padding {
+            prefix: &[0x42],
+            suffix: &[0x55, 0x66],
+        };
+        let mut ordinary = Vec::new();
+        encoder
+            .encode_frame(data(), plain, padding, nonce(), TIME, &mut ordinary)
+            .unwrap();
+        for (mode, half_mask) in [
+            (1, 0x0f0f0f0f),
+            (2, 0x00fffff0),
+            (3, 0x00ffffff),
+            (4, 0x0fffffff),
+        ] {
+            for rotation in [0, 7, 16, 240] {
+                for padding_bit in [0, 1] {
+                    let body = LowEntropyEncoding {
+                        mode,
+                        half_mask,
+                        rotation,
+                        padding_bit,
+                    };
+                    let mut packet = Vec::new();
+                    encoder
+                        .encode_frame(
+                            data(),
+                            plain,
+                            FrameEncoding {
+                                padding,
+                                body: BodyEncoding::LowEntropy(body),
+                            },
+                            nonce(),
+                            TIME,
+                            &mut packet,
+                        )
+                        .unwrap();
+                    let start = PACKET_HEADER_LEN + 1;
+                    let end = start + body.encoded_len(plain.len()).unwrap();
+                    // Both representations encrypt precisely the original plaintext.
+                    // Expansion changes ciphertext bytes and length, never the tag.
+                    assert_eq!(
+                        &packet[end..end + TAG_LEN],
+                        &ordinary[start + plain.len()..start + plain.len() + TAG_LEN]
+                    );
+                    let cipher = PacketCipher::new(key());
+                    let mut metadata: [u8; METADATA_LEN] = packet
+                        [NONCE_LEN..NONCE_LEN + METADATA_LEN]
+                        .try_into()
+                        .unwrap();
+                    cipher
+                        .open(
+                            nonce(),
+                            &mut metadata,
+                            packet[NONCE_LEN + METADATA_LEN..PACKET_HEADER_LEN]
+                                .try_into()
+                                .unwrap(),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        (metadata[0], metadata[1], metadata[31]),
+                        (10, mode, rotation)
+                    );
+                    assert_eq!(&metadata[25..29], &half_mask.to_be_bytes());
+                    assert_eq!(&metadata[29..31], &(plain.len() as u16).to_be_bytes());
+                    let received = Bytes::from(packet);
+                    let payload_address = received.as_ptr().wrapping_add(start);
+                    let received = decoder.decode_frame(received, TIME).unwrap();
+                    assert_eq!(received.metadata, data());
+                    assert_eq!(&received.payload[..], plain);
+                    assert_eq!(received.payload.as_ptr(), payload_address);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mieru_low_entropy_stream_shares_normal_nonce_sequence() {
+        let mut encoder = StreamEncoder::new(key(), nonce());
+        let body = BodyEncoding::LowEntropy(LowEntropyEncoding {
+            mode: 1,
+            half_mask: 0x0f0f0f0f,
+            rotation: 7,
+            padding_bit: 1,
+        });
+        let encoding = FrameEncoding {
+            padding: Padding::default(),
+            body,
+        };
+        let mut bytes = Vec::new();
+        let mut frame = Vec::new();
+        // Rejected local shapes leave the initial implicit cursor untouched.
+        assert!(
+            encoder
+                .encode_frame(open(), b"invalid", encoding, TIME, &mut frame)
+                .is_err()
+        );
+        encoder
+            .encode_frame(open(), b"open", Padding::default(), TIME, &mut frame)
+            .unwrap();
+        bytes.extend_from_slice(&frame);
+        encoder
+            .encode_frame(data(), b"expanded", encoding, TIME, &mut frame)
+            .unwrap();
+        bytes.extend_from_slice(&frame);
+        encoder
+            .encode_frame(ack(), &[], Padding::default(), TIME, &mut frame)
+            .unwrap();
+        bytes.extend_from_slice(&frame);
+        encoder
+            .encode_frame(data(), b"ordinary", Padding::default(), TIME, &mut frame)
+            .unwrap();
+        bytes.extend_from_slice(&frame);
+        let mut decoder = StreamDecoder::new(key());
+        let mut reader = bytes.as_slice();
+        for (metadata, payload) in [
+            (open(), b"open".as_slice()),
+            (data(), b"expanded"),
+            (ack(), b""),
+            (data(), b"ordinary"),
+        ] {
+            let frame = decoder
+                .read_frame(&mut reader, TIME)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.metadata, metadata);
+            assert_eq!(&frame.payload[..], payload);
+        }
+        assert!(
+            decoder
+                .read_frame(&mut reader, TIME)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn fixed_udp_vectors_reorder_and_repeated_datagrams() {
         let payload = hex("050100017f0000010050");
@@ -667,7 +927,7 @@ mod tests {
         let reply_time = 1_700_000_160;
         let key = Arc::new(derive_key("vole", "fixture-password", creation_time));
         let nonce = [0x5a; NONCE_LEN];
-        let mut header = encode_metadata(ack(), 0, Padding::default(), reply_time).unwrap();
+        let mut header = encode_metadata(ack(), 0, Padding::default().into(), reply_time).unwrap();
         header[0] = 7;
         header[1] = 0xfe;
         header[22..24].copy_from_slice(&u16::MAX.to_be_bytes());
@@ -849,7 +1109,7 @@ mod tests {
     #[tokio::test]
     async fn receiver_accepts_full_u16_payload_and_ignored_reserved_bytes() {
         // Construct a peer frame directly, since our own sender fragments at 32 KiB.
-        let mut header = encode_metadata(ack(), 0, Padding::default(), TIME).unwrap();
+        let mut header = encode_metadata(ack(), 0, Padding::default().into(), TIME).unwrap();
         header[0] = 7;
         header[1] = 0xfe;
         header[22..24].copy_from_slice(&u16::MAX.to_be_bytes());

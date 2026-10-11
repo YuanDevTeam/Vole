@@ -2,9 +2,10 @@
 //! Wire semantics follow the public Mieru protocol and its v3 client scheduler.
 use super::{
     crypto,
+    pattern::{EffectivePattern, HostProfile, NonceState},
     stream::{RawStream, State, closed},
     wire::{
-        DataKind, DataMetadata, Metadata, Padding, SessionKind, SessionMetadata, StreamDecoder,
+        DataKind, DataMetadata, Metadata, SessionKind, SessionMetadata, StreamDecoder,
         StreamEncoder,
     },
 };
@@ -207,6 +208,7 @@ impl Drop for Reservation {
 struct Factory {
     config: MieruOutboundConfig,
     upstream: UpstreamPath,
+    pattern: Arc<EffectivePattern>,
 }
 #[derive(Default)]
 struct Registry {
@@ -241,10 +243,18 @@ impl Client {
             MieruMultiplexing::Middle => 2,
             MieruMultiplexing::High => 3,
         };
+        let host = HostProfile::capture();
+        let idle = Duration::from_secs(120 + u64::from(host.fixed_int(61)));
+        let pattern = Arc::new(EffectivePattern::compile(
+            config.traffic_pattern.as_deref(),
+            host,
+            &config.username,
+        )?);
         Ok(Self {
             factory: Arc::new(Factory {
                 config: config.clone(),
                 upstream,
+                pattern,
             }),
             registry: Arc::default(),
             admission: Mutex::new(()),
@@ -252,7 +262,7 @@ impl Client {
             tasks: TaskTracker::new(),
             capacity,
             factor,
-            idle: Duration::from_secs(120 + u64::from(super::defaults::fixed_host_int(61))),
+            idle,
         })
     }
     pub fn cancellation(&self) -> CancellationToken {
@@ -458,6 +468,7 @@ async fn drive(
         super::udp::drive(
             &factory.config,
             &factory.upstream,
+            &factory.pattern,
             session,
             context,
             &shared,
@@ -474,6 +485,11 @@ async fn drive(
     }
     let setup = async {
         let _handshake = observation::track(ResourceKind::Handshake);
+        shared.set_maximum_write(
+            factory
+                .pattern
+                .plaintext_fragment_limit(MieruTransport::Tcp, usize::MAX)?,
+        );
         let port = rand::random_range(factory.config.port..=factory.config.port_end);
         let server = server_destination(&factory.config.address, port)?;
         let upstream = factory.upstream.for_server(&server, true);
@@ -486,7 +502,11 @@ async fn drive(
             &factory.config.password,
             now()?,
         ));
-        let nonce = crypto::make_client_nonce(&factory.config.username, rand::random());
+        let mut nonce = rand::random();
+        factory
+            .pattern
+            .rewrite_nonce(&mut NonceState::new(), &mut nonce, MieruTransport::Tcp);
+        let nonce = crypto::make_client_nonce(&factory.config.username, nonce);
         Ok::<_, io::Error>((
             io.io,
             StreamEncoder::new(key.clone(), nonce),
@@ -504,7 +524,7 @@ async fn drive(
                 tokio::select! {biased;
                     ()=shared.cancel.cancelled()=>{},
                     _=read_loop(&mut reader,&mut decoder,&shared)=>{},
-                    _=write_loop(&mut writer,&mut encoder,commands,control_frames,&shared)=>{},
+                    _=write_loop(&mut writer,&mut encoder,commands,control_frames,&shared,&factory.pattern)=>{},
                     ()=idle_loop(&shared)=>{},
                 }
                 shared.fail();
@@ -613,24 +633,25 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     mut commands: mpsc::Receiver<WriterCommand>,
     mut control_frames: mpsc::Receiver<Metadata>,
     shared: &Shared,
+    pattern: &EffectivePattern,
 ) -> io::Result<()> {
     let mut output = Vec::new();
     loop {
         tokio::select! {
-            frame=control_frames.recv()=>{let Some(metadata)=frame else{return Ok(());};write_frame(writer,encoder,metadata,&[],&mut output).await?;},
+            frame=control_frames.recv()=>{let Some(metadata)=frame else{return Ok(());};write_frame(writer,encoder,pattern,metadata,&[],&mut output).await?;},
             command=commands.recv()=>{
                 let Some(command)=command else{return Ok(());};
                 if command.state.local_closed.load(Ordering::Acquire) || command.state.remote_closed.load(Ordering::Acquire){let _=command.done.send(Err(closed()));continue;}
                 let operation=async {
                     let first=!command.state.opened.swap(true,Ordering::AcqRel);
                     if first {
-                        let piggyback=command.piggyback && command.data.len()<=1024;
+                        let piggyback=!pattern.low_entropy_enabled() && command.piggyback && command.data.len()<=1024;
                         let metadata=Metadata::Session(SessionMetadata{kind:SessionKind::OpenRequest,session_id:command.state.id,sequence:command.state.sequence.fetch_add(1,Ordering::AcqRel),status:0});
-                        write_frame(writer,encoder,metadata,if piggyback{&command.data}else{&[]},&mut output).await?;
+                        write_frame(writer,encoder,pattern,metadata,if piggyback{&command.data}else{&[]},&mut output).await?;
                         if piggyback{return Ok(());}
                     }
                     let metadata=Metadata::Data(DataMetadata{kind:DataKind::ClientData,session_id:command.state.id,sequence:command.state.sequence.fetch_add(1,Ordering::AcqRel),unack_sequence:command.state.next_receive.load(Ordering::Acquire),window:1,fragment:0});
-                    write_frame(writer,encoder,metadata,&command.data,&mut output).await
+                    write_frame(writer,encoder,pattern,metadata,&command.data,&mut output).await
                 }.await;
                 let failed=operation.is_err();let _=command.done.send(operation);if failed{return Err(closed());}
             },
@@ -639,7 +660,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
                 for state in closing {
                     if state.opened.load(Ordering::Acquire) {
                         let kind=if state.close_response.load(Ordering::Acquire){SessionKind::CloseResponse}else{SessionKind::CloseRequest};
-                        write_frame(writer,encoder,Metadata::Session(SessionMetadata{kind,session_id:state.id,sequence:state.sequence.fetch_add(1,Ordering::AcqRel),status:0}),&[],&mut output).await?;
+                        write_frame(writer,encoder,pattern,Metadata::Session(SessionMetadata{kind,session_id:state.id,sequence:state.sequence.fetch_add(1,Ordering::AcqRel),status:0}),&[],&mut output).await?;
                     }
                     shared.sessions.lock().unwrap().remove(&state.id);
                 }
@@ -650,23 +671,26 @@ async fn write_loop<W: AsyncWrite + Unpin>(
 async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     encoder: &mut StreamEncoder,
+    pattern: &EffectivePattern,
     metadata: Metadata,
     payload: &[u8],
     output: &mut Vec<u8>,
 ) -> io::Result<()> {
-    encoder.encode_frame(
-        metadata,
-        payload,
-        Padding {
-            prefix: &[],
-            suffix: &[],
-        },
-        now()?,
-        output,
-    )?;
+    let prepared =
+        pattern.prepare_frame(metadata, payload.len(), MieruTransport::Tcp, usize::MAX)?;
+    encoder.encode_frame(metadata, payload, prepared.encoding(), now()?, output)?;
     // Encoding commits the directional nonce. Business cancellation cannot
     // interrupt this write or retry it; only physical Stop/failure can retire it.
-    writer.write_all(output).await?;
+    if matches!(metadata, Metadata::Session(_)) {
+        for chunk in pattern.control_chunks(output.len()) {
+            writer.write_all(&output[chunk.range]).await?;
+            if !chunk.delay_after.is_zero() {
+                tokio::time::sleep(chunk.delay_after).await;
+            }
+        }
+    } else {
+        writer.write_all(output).await?;
+    }
     writer.flush().await
 }
 
@@ -678,6 +702,137 @@ mod tests {
     };
     use super::*;
     use crate::{config::MieruHandshake, resources::observation::ResourceProbe};
+    #[derive(Default)]
+    struct RecordedWriter {
+        bytes: Vec<u8>,
+        writes: Vec<usize>,
+    }
+    impl AsyncWrite for RecordedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.push(bytes.len());
+            self.bytes.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    #[tokio::test]
+    async fn mieru_tcp_pattern_consumes_low_entropy_and_control_fragmentation() {
+        // Independently encoded protobuf: fixed nonce prefix, no padding,
+        // MODE32 low entropy and TCP control fragmentation with zero sleep.
+        const PATTERN: &str = "CAAaBAgBEAAiEAgDEAEYACAAKgZhYWJiY2MqBAgAEAAyBAgBEAA=";
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let peer = Peer::new(false);
+                let mut configuration = config(MieruHandshake::NoWait);
+                configuration.traffic_pattern = Some(PATTERN.into());
+                let client =
+                    Client::new(&configuration, UpstreamPath::proxy(peer.clone()), 32768).unwrap();
+                let context = EstablishContext::with_timeout(Duration::from_secs(5));
+                let raw = client.open(session(), &context).await.unwrap();
+                let state = raw.state.clone();
+                assert_eq!(
+                    client
+                        .registry
+                        .lock()
+                        .unwrap()
+                        .carriers
+                        .values()
+                        .next()
+                        .unwrap()
+                        .maximum_write(),
+                    32764
+                );
+                let mut stream: BoxStream =
+                    Box::new(Stream::no_wait(raw, &session().destination, 1).unwrap());
+                echo(&mut stream, b"client-first low entropy").await;
+                assert_eq!(state.sequence.load(Ordering::Acquire), 2);
+                echo(&mut stream, &vec![0x53; 32768]).await;
+                assert_eq!(state.sequence.load(Ordering::Acquire), 4);
+
+                let pattern = &client.factory.pattern;
+                let key = Arc::new(crypto::derive_key(
+                    "vole",
+                    "fixture-password",
+                    now().unwrap(),
+                ));
+                let mut encoder = StreamEncoder::new(key.clone(), rand::random());
+                let mut recorded = RecordedWriter::default();
+                let mut output = Vec::new();
+                let control = Metadata::Session(SessionMetadata {
+                    kind: SessionKind::CloseRequest,
+                    session_id: 1,
+                    sequence: 0,
+                    status: 0,
+                });
+                write_frame(
+                    &mut recorded,
+                    &mut encoder,
+                    pattern,
+                    control,
+                    &[],
+                    &mut output,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    recorded.writes.len() > 1,
+                    "control frame was not fragmented"
+                );
+                recorded.writes.clear();
+                let metadata = Metadata::Data(DataMetadata {
+                    kind: DataKind::ClientData,
+                    session_id: 1,
+                    sequence: 1,
+                    unack_sequence: 0,
+                    window: 1,
+                    fragment: 0,
+                });
+                let payload = vec![0x35; 32764];
+                write_frame(
+                    &mut recorded,
+                    &mut encoder,
+                    pattern,
+                    metadata,
+                    &payload,
+                    &mut output,
+                )
+                .await
+                .unwrap();
+                assert_eq!(recorded.writes.len(), 1, "DATA was control-fragmented");
+                assert_eq!(output.len(), 48 + 65528 + 16);
+                let mut decoder = StreamDecoder::new(key);
+                let mut input = recorded.bytes.as_slice();
+                let first = decoder
+                    .read_frame_with_clock(&mut input, now)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(first.metadata, control);
+                let data = decoder
+                    .read_frame_with_clock(&mut input, now)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(data.metadata, metadata);
+                assert_eq!(data.payload, payload);
+                assert!(input.is_empty());
+                client.shutdown().await;
+                drop((stream, state, client));
+                peer.stop().await;
+            })
+            .await;
+        assert!(probe.snapshot().is_idle());
+    }
     #[tokio::test]
     async fn mieru_tcp_shared_carrier_preserves_sibling_and_bounded_reader() {
         let probe = ResourceProbe::default();

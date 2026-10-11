@@ -124,9 +124,9 @@ impl RawMieru {
             "HANDSHAKE_NO_WAIT" => MieruHandshake::NoWait,
             _ => return invalid("invalid Mieru handshake mode"),
         };
-        if !self.traffic_pattern.is_empty() {
-            return invalid("Mieru traffic-pattern is not implemented");
-        }
+        #[cfg(feature = "outbound-mieru")]
+        crate::outbound::mieru::pattern::validate_raw(&self.traffic_pattern)?;
+        let traffic_pattern = (!self.traffic_pattern.is_empty()).then_some(self.traffic_pattern);
         Ok((
             self.name,
             self.dialer_proxy,
@@ -141,7 +141,7 @@ impl RawMieru {
                 udp: self.udp,
                 multiplexing,
                 handshake_mode,
-                traffic_pattern: None,
+                traffic_pattern,
             }),
         ))
     }
@@ -226,5 +226,23 @@ mod tests {
         assert_eq!(node.transport, MieruTransport::Udp);
         assert!(!node.udp);
         assert_eq!((node.port, node.port_end), (4000, 4002));
+    }
+
+    #[test]
+    fn traffic_pattern_is_validated_without_replacing_its_encoded_configuration() {
+        // Independent public protobuf fixture: seed 0, fixed nonce, zero
+        // padding, low-entropy mode 32, control fragmentation enabled.
+        let encoded = "CAAaBAgBEAAiEAgDEAEYACAAKgZhYWJiY2MqBAgAEAAyBAgBEAA=";
+        let node = parse(
+            "TCP",
+            &format!("    port: 443\n    traffic-pattern: '{encoded}'\n"),
+        );
+        assert_eq!(node.traffic_pattern.as_deref(), Some(encoded));
+        assert_eq!(
+            parse("TCP", "    port: 443\n    traffic-pattern: ''\n").traffic_pattern,
+            None
+        );
+        let yaml = "proxies:\n- name: edge\n  type: mieru\n  server: edge.invalid\n  port: 443\n  transport: TCP\n  username: user\n  password: password\n  traffic-pattern: 'not base64'\n";
+        assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
     }
 }

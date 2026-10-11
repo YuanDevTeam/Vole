@@ -1,7 +1,8 @@
 //! Native Mieru client. Carriers use only the shared configured upstream path.
 mod crypto;
-mod defaults;
+mod low_entropy;
 mod packet;
+pub(crate) mod pattern;
 mod reliability;
 mod stream;
 mod tcp;
@@ -40,16 +41,6 @@ impl MieruOutbound {
         upstream: UpstreamPath,
         stream_buffer_capacity: usize,
     ) -> io::Result<Self> {
-        if config
-            .traffic_pattern
-            .as_ref()
-            .is_some_and(|pattern| !pattern.is_empty())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Mieru traffic pattern is not implemented",
-            ));
-        }
         Ok(Self {
             client: tcp::Client::new(config, upstream, stream_buffer_capacity)?,
             udp: config.udp,
