@@ -1136,6 +1136,24 @@ fn build_proxy_graph(
                     ));
                 }
             }
+            ProxyProtocol::Mieru(config) => {
+                #[cfg(feature = "outbound-mieru")]
+                {
+                    Arc::new(crate::outbound::mieru::MieruOutbound::new(
+                        config,
+                        upstream,
+                        limits.tcp_buffer_per_direction,
+                    )?)
+                }
+                #[cfg(not(feature = "outbound-mieru"))]
+                {
+                    let _ = (config, upstream);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Mieru outbound support is disabled at build time",
+                    ));
+                }
+            }
             ProxyProtocol::Tuic(config) => {
                 #[cfg(feature = "outbound-tuic")]
                 {
@@ -1438,6 +1456,7 @@ async fn prepare_proxy_endpoints(
                 | ProxyProtocol::Socks5(_)
                 | ProxyProtocol::Trojan(_)
                 | ProxyProtocol::TrustTunnel(_)
+                | ProxyProtocol::Mieru(_)
                 | ProxyProtocol::Vmess(_)
                 | ProxyProtocol::AnyTls(_)
                 | ProxyProtocol::Shadowsocks(_)
@@ -1555,7 +1574,7 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
                 standard_count + usize::from(config.tls.is_some()),
             ),
             ProxyProtocol::Tuic(_) => (client_count + 1, standard_count),
-            ProxyProtocol::WireGuard(_) => (client_count, standard_count),
+            ProxyProtocol::WireGuard(_) | ProxyProtocol::Mieru(_) => (client_count, standard_count),
         },
     )
 }

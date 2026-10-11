@@ -1,0 +1,738 @@
+//! TCP carrier ownership, probabilistic scheduling and serialized AEAD framing.
+//! Wire semantics follow the public Mieru protocol and its v3 client scheduler.
+use super::{
+    crypto,
+    stream::{RawStream, State, closed},
+    wire::{
+        DataKind, DataMetadata, Metadata, Padding, SessionKind, SessionMetadata, StreamDecoder,
+        StreamEncoder,
+    },
+};
+use crate::{
+    config::{MieruMultiplexing, MieruOutboundConfig},
+    dispatch::BoxStream,
+    outbound::{EstablishContext, UpstreamPath, server_destination},
+    resources::observation::{self, ResourceKind},
+    session::StreamSession,
+};
+use bytes::Bytes;
+use futures_util::future::BoxFuture;
+use std::{
+    collections::HashMap,
+    io,
+    pin::Pin,
+    sync::{Arc, Mutex, Weak, atomic::Ordering},
+    task::{Context, Poll},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    task::JoinHandle,
+    time::{Instant, timeout_at},
+};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+const CLEAN_INTERVAL: Duration = Duration::from_secs(5);
+const WRITER_COMMANDS: usize = 2;
+pub(super) struct WriterCommand {
+    pub state: Arc<State>,
+    pub data: Bytes,
+    pub piggyback: bool,
+    pub done: oneshot::Sender<io::Result<()>>,
+    pub _bytes: OwnedSemaphorePermit,
+}
+struct Schedule {
+    pending: usize,
+    last_schedule: Instant,
+    disabled: Option<Instant>,
+    closed: bool,
+    in_bytes: u64,
+    out_bytes: u64,
+}
+struct Shared {
+    sessions: Mutex<HashMap<u32, Arc<State>>>,
+    control: mpsc::Sender<Metadata>,
+    schedule: Mutex<Schedule>,
+    cancel: CancellationToken,
+    activity: Arc<Notify>,
+    idle: Duration,
+    volume: u64,
+}
+impl Shared {
+    fn reserve(&self) -> bool {
+        let mut schedule = self.schedule.lock().unwrap();
+        if schedule.closed || schedule.disabled.is_some() || self.cancel.is_cancelled() {
+            return false;
+        }
+        schedule.pending += 1;
+        schedule.last_schedule = Instant::now();
+        true
+    }
+    fn release(&self) {
+        let mut schedule = self.schedule.lock().unwrap();
+        schedule.pending -= 1;
+        schedule.last_schedule = Instant::now();
+    }
+    fn count(&self) -> usize {
+        self.sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|state| {
+                !state.local_closed.load(Ordering::Acquire)
+                    && !state.remote_closed.load(Ordering::Acquire)
+            })
+            .count()
+    }
+    fn clean(&self) -> bool {
+        let active = self.count();
+        let mut schedule = self.schedule.lock().unwrap();
+        let now = Instant::now();
+        if active == 0
+            && schedule.pending == 0
+            && now >= schedule.last_schedule + self.idle
+            && schedule.disabled.is_none()
+        {
+            schedule.disabled = Some(now);
+        }
+        if (schedule.in_bytes > self.volume || schedule.out_bytes > self.volume)
+            && schedule.disabled.is_none()
+        {
+            schedule.disabled = Some(now);
+        }
+        if active == 0
+            && schedule.pending == 0
+            && schedule.disabled.is_some_and(|disabled| {
+                now >= disabled + self.idle && now >= schedule.last_schedule + self.idle
+            })
+        {
+            schedule.closed = true;
+            return true;
+        }
+        false
+    }
+    fn fail(&self) {
+        self.cancel.cancel();
+        self.schedule.lock().unwrap().closed = true;
+        for state in self.sessions.lock().unwrap().values() {
+            state.finish(true);
+        }
+        self.activity.notify_one();
+    }
+}
+// The scheduler counts carrier traffic, including authenticated headers and padding.
+struct CountedIo {
+    io: BoxStream,
+    shared: Arc<Shared>,
+}
+impl AsyncRead for CountedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.io).poll_read(cx, buf);
+        self.shared.schedule.lock().unwrap().in_bytes += (buf.filled().len() - before) as u64;
+        result
+    }
+}
+impl AsyncWrite for CountedIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.io).poll_write(cx, bytes);
+        if let Poll::Ready(Ok(count)) = &result {
+            self.shared.schedule.lock().unwrap().out_bytes += *count as u64;
+        }
+        result
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+pub(super) struct Carrier {
+    shared: Arc<Shared>,
+    pub writer: mpsc::Sender<WriterCommand>,
+    pub bytes: Arc<Semaphore>,
+}
+impl Drop for Carrier {
+    fn drop(&mut self) {
+        self.shared.cancel.cancel();
+    }
+}
+struct Reservation(Arc<Carrier>);
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.0.shared.release();
+    }
+}
+struct Factory {
+    config: MieruOutboundConfig,
+    upstream: UpstreamPath,
+}
+#[derive(Default)]
+struct Registry {
+    next: u64,
+    carriers: HashMap<u64, Arc<Carrier>>,
+}
+pub(super) struct Client {
+    factory: Arc<Factory>,
+    registry: Arc<Mutex<Registry>>,
+    admission: Mutex<()>,
+    cancel: CancellationToken,
+    tasks: TaskTracker,
+    capacity: usize,
+    factor: usize,
+    idle: Duration,
+}
+impl Client {
+    pub fn new(
+        config: &MieruOutboundConfig,
+        upstream: UpstreamPath,
+        capacity: usize,
+    ) -> io::Result<Self> {
+        if capacity == 0 || capacity > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Mieru stream buffer capacity",
+            ));
+        }
+        let factor = match config.multiplexing {
+            MieruMultiplexing::Off => 0,
+            MieruMultiplexing::Low => 1,
+            MieruMultiplexing::Middle => 2,
+            MieruMultiplexing::High => 3,
+        };
+        Ok(Self {
+            factory: Arc::new(Factory {
+                config: config.clone(),
+                upstream,
+            }),
+            registry: Arc::default(),
+            admission: Mutex::new(()),
+            cancel: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+            capacity,
+            factor,
+            idle: Duration::from_secs(120 + u64::from(super::defaults::fixed_host_int(61))),
+        })
+    }
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+    pub fn spawn(&self, future: BoxFuture<'static, ()>) -> io::Result<JoinHandle<()>> {
+        let _admission = self.admission.lock().unwrap();
+        if self.cancel.is_cancelled() {
+            return Err(closed());
+        }
+        Ok(self.tasks.spawn(observation::task(future)))
+    }
+    pub async fn open(
+        &self,
+        session: StreamSession,
+        context: &EstablishContext,
+    ) -> io::Result<RawStream> {
+        let operation = async {
+            let _waiter = observation::track(ResourceKind::Waiter);
+            let reusable = {
+                let _admission = self.admission.lock().unwrap();
+                if self.cancel.is_cancelled() {
+                    return Err(closed());
+                }
+                let registry = self.registry.lock().unwrap();
+                let available: Vec<_> = registry
+                    .carriers
+                    .values()
+                    .filter(|carrier| {
+                        carrier.shared.clean();
+                        let schedule = carrier.shared.schedule.lock().unwrap();
+                        !schedule.closed && schedule.disabled.is_none()
+                    })
+                    .cloned()
+                    .collect();
+                let weight = available
+                    .len()
+                    .checked_mul(self.factor)
+                    .ok_or_else(closed)?;
+                let choice = rand::random_range(0..=weight);
+                if choice < weight {
+                    let carrier = available[choice / self.factor].clone();
+                    if carrier.shared.reserve() {
+                        Some(Reservation(carrier))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            let reservation = match reusable {
+                Some(reservation) => reservation,
+                None => self.create(session, context).await?,
+            };
+            let carrier = reservation.0.clone();
+            let state = {
+                let _admission = self.admission.lock().unwrap();
+                if self.cancel.is_cancelled() || carrier.shared.cancel.is_cancelled() {
+                    return Err(closed());
+                }
+                let mut sessions = carrier.shared.sessions.lock().unwrap();
+                let id = loop {
+                    let id = rand::random::<u32>();
+                    if id != 0 && !sessions.contains_key(&id) {
+                        break id;
+                    }
+                };
+                let state = State::new(
+                    id,
+                    self.capacity,
+                    &carrier.shared.cancel,
+                    carrier.shared.activity.clone(),
+                );
+                sessions.insert(id, state.clone());
+                state
+            };
+            drop(reservation);
+            Ok(RawStream::new(carrier, state, self.capacity))
+        };
+        tokio::select! {biased;()=self.cancel.cancelled()=>Err(closed()),result=timeout_at(context.deadline(),operation)=>result.map_err(|_|io::ErrorKind::TimedOut)?}
+    }
+    async fn create(
+        &self,
+        session: StreamSession,
+        context: &EstablishContext,
+    ) -> io::Result<Reservation> {
+        let (control, control_frames) = mpsc::channel(1);
+        let shared = Arc::new(Shared {
+            control,
+            sessions: Mutex::new(HashMap::new()),
+            schedule: Mutex::new(Schedule {
+                pending: 1,
+                last_schedule: Instant::now(),
+                disabled: None,
+                closed: false,
+                in_bytes: 0,
+                out_bytes: 0,
+            }),
+            cancel: self.cancel.child_token(),
+            activity: Arc::new(Notify::new()),
+            idle: self.idle,
+            volume: 512 * 1024 * 1024_u64 << self.factor,
+        });
+        let (writer, commands) = mpsc::channel(WRITER_COMMANDS);
+        let carrier = Arc::new(Carrier {
+            shared: shared.clone(),
+            writer,
+            bytes: Arc::new(Semaphore::new(self.capacity)),
+        });
+        let id = {
+            let mut registry = self.registry.lock().unwrap();
+            registry.next = registry.next.checked_add(1).ok_or_else(closed)?;
+            registry.next
+        };
+        let (ready, connected) = oneshot::channel();
+        let context = context.clone();
+        let factory = self.factory.clone();
+        let registry = Arc::downgrade(&self.registry);
+        let deadline = context.deadline();
+        let mut setup = SetupCancel(Some(shared.cancel.clone()));
+        self.spawn(Box::pin(drive(
+            factory,
+            session,
+            context,
+            shared,
+            commands,
+            control_frames,
+            ready,
+            registry,
+            id,
+        )))?;
+        timeout_at(deadline, connected)
+            .await
+            .map_err(|_| io::ErrorKind::TimedOut)?
+            .map_err(|_| closed())??;
+        let _admission = self.admission.lock().unwrap();
+        if self.cancel.is_cancelled() || carrier.shared.cancel.is_cancelled() {
+            return Err(closed());
+        }
+        self.registry
+            .lock()
+            .unwrap()
+            .carriers
+            .insert(id, carrier.clone());
+        setup.0.take(); // Published ownership now belongs to registry/streams.
+        Ok(Reservation(carrier))
+    }
+    pub fn begin_shutdown(&self) {
+        let _admission = self.admission.lock().unwrap();
+        self.cancel.cancel();
+        self.tasks.close();
+    }
+    pub async fn shutdown(&self) {
+        self.begin_shutdown();
+        self.tasks.wait().await;
+        self.registry.lock().unwrap().carriers.clear();
+    }
+}
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.tasks.close();
+    }
+}
+struct SetupCancel(Option<CancellationToken>);
+impl Drop for SetupCancel {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.0 {
+            cancel.cancel();
+        }
+    }
+}
+fn now() -> io::Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| time.as_secs())
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "system clock precedes Mieru epoch",
+            )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive(
+    factory: Arc<Factory>,
+    session: StreamSession,
+    context: EstablishContext,
+    shared: Arc<Shared>,
+    commands: mpsc::Receiver<WriterCommand>,
+    control_frames: mpsc::Receiver<Metadata>,
+    ready: oneshot::Sender<io::Result<()>>,
+    registry: Weak<Mutex<Registry>>,
+    id: u64,
+) {
+    let _pool = observation::track(ResourceKind::Pool);
+    let setup = async {
+        let _handshake = observation::track(ResourceKind::Handshake);
+        let port = rand::random_range(factory.config.port..=factory.config.port_end);
+        let server = server_destination(&factory.config.address, port)?;
+        let upstream = factory.upstream.for_server(&server, true);
+        let io = upstream
+            .connect_server(session, &server, &context)
+            .await
+            .map_err(|_| closed())?;
+        let key = Arc::new(crypto::derive_key(
+            &factory.config.username,
+            &factory.config.password,
+            now()?,
+        ));
+        let nonce = crypto::make_client_nonce(&factory.config.username, rand::random());
+        Ok::<_, io::Error>((
+            io.io,
+            StreamEncoder::new(key.clone(), nonce),
+            StreamDecoder::new(key),
+        ))
+    };
+    let setup = tokio::select! {biased;()=shared.cancel.cancelled()=>Err(closed()),result=timeout_at(context.deadline(),setup)=>result.map_err(|_|io::ErrorKind::TimedOut.into()).and_then(|result|result)};
+    match setup {
+        Ok((io, mut encoder, mut decoder)) => {
+            if ready.send(Ok(())).is_ok() {
+                let (mut reader, mut writer) = tokio::io::split(CountedIo {
+                    io,
+                    shared: shared.clone(),
+                });
+                tokio::select! {biased;
+                    ()=shared.cancel.cancelled()=>{},
+                    _=read_loop(&mut reader,&mut decoder,&shared)=>{},
+                    _=write_loop(&mut writer,&mut encoder,commands,control_frames,&shared)=>{},
+                    ()=idle_loop(&shared)=>{},
+                }
+                shared.fail();
+                let _ = tokio::time::timeout(Duration::from_secs(1), writer.shutdown()).await;
+                drop((reader, writer));
+            }
+        }
+        Err(error) => {
+            let _ = ready.send(Err(error));
+        }
+    }
+    shared.fail();
+    shared.sessions.lock().unwrap().clear();
+    if let Some(registry) = registry.upgrade() {
+        registry.lock().unwrap().carriers.remove(&id);
+    }
+}
+async fn idle_loop(shared: &Shared) {
+    let mut interval = tokio::time::interval(CLEAN_INTERVAL);
+    loop {
+        interval.tick().await;
+        if shared.clean() {
+            return;
+        }
+    }
+}
+async fn read_loop<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    decoder: &mut StreamDecoder,
+    shared: &Shared,
+) -> io::Result<()> {
+    while let Some(frame) = decoder.read_frame_with_clock(reader, now).await? {
+        let (id, sequence, kind) = match frame.metadata {
+            Metadata::Session(meta) => (meta.session_id, meta.sequence, 0_u8),
+            Metadata::Data(meta) => (
+                meta.session_id,
+                meta.sequence,
+                if meta.kind == DataKind::ServerAck {
+                    1
+                } else {
+                    0
+                },
+            ),
+        };
+        let state = shared.sessions.lock().unwrap().get(&id).cloned();
+        let Some(state) = state else {
+            match frame.metadata {
+                Metadata::Data(meta) => {
+                    shared
+                        .control
+                        .send(Metadata::Session(SessionMetadata {
+                            kind: SessionKind::CloseRequest,
+                            session_id: id,
+                            sequence: meta.unack_sequence,
+                            status: 0,
+                        }))
+                        .await
+                        .map_err(|_| closed())?;
+                }
+                Metadata::Session(meta) if meta.kind == SessionKind::OpenResponse => {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                Metadata::Session(_) => {}
+            }
+            continue;
+        };
+        if kind == 1 {
+            continue;
+        }
+        if sequence != state.next_receive.load(Ordering::Acquire) {
+            state.finish(true);
+            state.close();
+            continue;
+        }
+        state
+            .next_receive
+            .store(sequence.wrapping_add(1), Ordering::Release);
+        match frame.metadata {
+            Metadata::Session(meta) => match meta.kind {
+                SessionKind::OpenResponse => {}
+                SessionKind::CloseRequest => {
+                    state.close_response.store(true, Ordering::Release);
+                    state.finish(meta.status != 0);
+                    continue;
+                }
+                SessionKind::CloseResponse => {
+                    state.finish(meta.status != 0);
+                    shared.sessions.lock().unwrap().remove(&id);
+                    continue;
+                }
+                SessionKind::OpenRequest => return Err(io::ErrorKind::InvalidData.into()),
+            },
+            Metadata::Data(meta) if meta.kind != DataKind::ServerData => {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            Metadata::Data(_) => {}
+        }
+        // Business cancellation interrupts delivery, never the physical decoder.
+        let _ = state.deliver(frame.payload).await;
+    }
+    Err(io::ErrorKind::UnexpectedEof.into())
+}
+async fn write_loop<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    encoder: &mut StreamEncoder,
+    mut commands: mpsc::Receiver<WriterCommand>,
+    mut control_frames: mpsc::Receiver<Metadata>,
+    shared: &Shared,
+) -> io::Result<()> {
+    let mut output = Vec::new();
+    loop {
+        tokio::select! {
+            frame=control_frames.recv()=>{let Some(metadata)=frame else{return Ok(());};write_frame(writer,encoder,metadata,&[],&mut output).await?;},
+            command=commands.recv()=>{
+                let Some(command)=command else{return Ok(());};
+                if command.state.local_closed.load(Ordering::Acquire) || command.state.remote_closed.load(Ordering::Acquire){let _=command.done.send(Err(closed()));continue;}
+                let operation=async {
+                    let first=!command.state.opened.swap(true,Ordering::AcqRel);
+                    if first {
+                        let piggyback=command.piggyback && command.data.len()<=1024;
+                        let metadata=Metadata::Session(SessionMetadata{kind:SessionKind::OpenRequest,session_id:command.state.id,sequence:command.state.sequence.fetch_add(1,Ordering::AcqRel),status:0});
+                        write_frame(writer,encoder,metadata,if piggyback{&command.data}else{&[]},&mut output).await?;
+                        if piggyback{return Ok(());}
+                    }
+                    let metadata=Metadata::Data(DataMetadata{kind:DataKind::ClientData,session_id:command.state.id,sequence:command.state.sequence.fetch_add(1,Ordering::AcqRel),unack_sequence:command.state.next_receive.load(Ordering::Acquire),window:1,fragment:0});
+                    write_frame(writer,encoder,metadata,&command.data,&mut output).await
+                }.await;
+                let failed=operation.is_err();let _=command.done.send(operation);if failed{return Err(closed());}
+            },
+            ()=shared.activity.notified()=>{
+                let closing:Vec<_>=shared.sessions.lock().unwrap().values().filter(|state|state.local_closed.load(Ordering::Acquire)||state.remote_closed.load(Ordering::Acquire)).cloned().collect();
+                for state in closing {
+                    if state.opened.load(Ordering::Acquire) {
+                        let kind=if state.close_response.load(Ordering::Acquire){SessionKind::CloseResponse}else{SessionKind::CloseRequest};
+                        write_frame(writer,encoder,Metadata::Session(SessionMetadata{kind,session_id:state.id,sequence:state.sequence.fetch_add(1,Ordering::AcqRel),status:0}),&[],&mut output).await?;
+                    }
+                    shared.sessions.lock().unwrap().remove(&state.id);
+                }
+            },
+        }
+    }
+}
+async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    encoder: &mut StreamEncoder,
+    metadata: Metadata,
+    payload: &[u8],
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
+    encoder.encode_frame(
+        metadata,
+        payload,
+        Padding {
+            prefix: &[],
+            suffix: &[],
+        },
+        now()?,
+        output,
+    )?;
+    // Encoding commits the directional nonce. Business cancellation cannot
+    // interrupt this write or retry it; only physical Stop/failure can retire it.
+    writer.write_all(output).await?;
+    writer.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        stream::Stream,
+        tests::{Peer, config, echo, session},
+    };
+    use super::*;
+    use crate::{config::MieruHandshake, resources::observation::ResourceProbe};
+    #[tokio::test]
+    async fn mieru_tcp_shared_carrier_preserves_sibling_and_bounded_reader() {
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let peer = Peer::new(false);
+                let client = Client::new(
+                    &config(MieruHandshake::NoWait),
+                    UpstreamPath::proxy(peer.clone()),
+                    32768,
+                )
+                .unwrap();
+                let context = EstablishContext::with_timeout(Duration::from_secs(5));
+                let raw = client.open(session(), &context).await.unwrap();
+                let target = session().destination;
+                let mut first: BoxStream = Box::new(Stream::no_wait(raw, &target, 1).unwrap());
+                echo(&mut first, &vec![1; 8192]).await;
+                // Pin this second business session to the actual published carrier
+                // so probabilistic scheduling cannot make the wire fixture flaky.
+                let carrier = client
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .carriers
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                assert!(carrier.shared.reserve());
+                let reservation = Reservation(carrier.clone());
+                let id = loop {
+                    let id = rand::random::<u32>();
+                    if id != 0 && !carrier.shared.sessions.lock().unwrap().contains_key(&id) {
+                        break id;
+                    }
+                };
+                let state = State::new(
+                    id,
+                    client.capacity,
+                    &carrier.shared.cancel,
+                    carrier.shared.activity.clone(),
+                );
+                carrier
+                    .shared
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .insert(id, state.clone());
+                drop(reservation);
+                let raw = RawStream::new(carrier.clone(), state, client.capacity);
+                let mut second: BoxStream = Box::new(Stream::no_wait(raw, &target, 1).unwrap());
+                echo(&mut second, b"second-session").await;
+                assert_eq!(peer.calls.load(Ordering::Acquire), 1);
+                drop(first);
+                echo(&mut second, b"sibling-after-close").await;
+                assert!(carrier.bytes.available_permits() <= client.capacity);
+                client.shutdown().await;
+                drop((second, carrier, client));
+                peer.stop().await;
+            })
+            .await;
+        assert!(probe.snapshot().is_idle());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn mieru_tcp_scheduler_drains_without_killing_active_session() {
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let peer = Peer::new(false);
+                let client = Client::new(
+                    &config(MieruHandshake::NoWait),
+                    UpstreamPath::proxy(peer.clone()),
+                    1024,
+                )
+                .unwrap();
+                let context = EstablishContext::with_timeout(Duration::from_secs(5));
+                let raw = client.open(session(), &context).await.unwrap();
+                let carrier = client
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .carriers
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let mut io: BoxStream =
+                    Box::new(Stream::no_wait(raw, &session().destination, 1).unwrap());
+                echo(&mut io, b"active").await;
+                carrier.shared.schedule.lock().unwrap().out_bytes = carrier.shared.volume + 1;
+                assert!(!carrier.shared.clean());
+                assert!(!carrier.shared.reserve());
+                echo(&mut io, b"after-scheduling-disabled").await;
+                drop(io);
+                tokio::time::advance(client.idle + CLEAN_INTERVAL).await;
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !carrier.shared.cancel.is_cancelled() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                client.shutdown().await;
+                drop((carrier, client));
+                peer.stop().await;
+            })
+            .await;
+        assert!(probe.snapshot().is_idle());
+    }
+}

@@ -16,6 +16,7 @@ cargo test --locked --features cli,interop-test --test tuic_memory configured_ip
 cargo test --locked --features cli --lib tuic_uot_
 cargo test --locked --lib config::tests::
 cargo test --locked --features cli --lib trusttunnel
+cargo test --locked --features cli --lib mieru
 cargo test --locked --lib config::credentials::tests::
 cargo test --locked --features cli --lib age_
 cargo test --locked --lib dns::hosts::tests::

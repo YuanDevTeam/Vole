@@ -77,6 +77,25 @@ aggressive，未知profile使用standard；负窗口参数按原带符号语义�
 两代为独立的Google算法移植与参考参数适配，meta_v2不表示标准BBR2；来源见
 [拥塞算法](../src/transport/quic/congestion/README.md)。H2中这三个QUIC字段不消费。
 
+## Mieru
+
+`type: mieru` 使用 `outbound-mieru`，当前底层为必填的 `transport: TCP`，
+同时承载 TCP 和 `udp: true` 的多目标 UDP Associate。用户名、密码各为1–64 UTF-8字节，
+不 trim；XChaCha20-Poly1305 分段认证使用物理连接建立时的时间派生密钥。
+业务目标通过协议内 SOCKS 请求传递，不进行 SOCKS 认证方法协商。
+
+port 与非空 port-range 互斥；范围完整匹配十进制 `起点-终点`，两端为1–65535且起点不大于终点。
+每次新物理连接随机选择范围内端口，通过共享 Dialer 建链，复用连接保留原上游选择。
+MULTIPLEXING_DEFAULT/LOW 对应因子1，MIDDLE/HIGH为2/3；按可复用连接数及因子随机选择
+复用或新建，OFF始终新建。因子不是业务流上限。空闲和累计传输量使连接停止接收新流，
+已有流继续工作；退休连接在空闲期限后回收。
+
+HANDSHAKE_DEFAULT/STANDARD 发送请求并等待 SOCKS 回复；HANDSHAKE_NO_WAIT 延迟至
+首个业务写入发送请求和数据，再确认回复。枚举必须使用完整前缀。
+关闭单个流仅释放其会话；节点 Stop 取消并 join 物理读写、清理及 UDP 读取任务。
+写队列、接收字节及 UDP 单包受运行时预算约束；取消不会重放加密帧。
+UDP 底层和非空 traffic-pattern 尚未提供。
+
 ## SOCKS5
 
 仅 SOCKS5 CONNECT / UDP ASSOCIATE；用户名密码成对配置，不支持 SOCKS4。

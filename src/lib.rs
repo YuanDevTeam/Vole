@@ -56,6 +56,7 @@ pub mod session;
 pub mod sniffing;
 #[cfg(any(
     feature = "inbound-socks5",
+    feature = "outbound-mieru",
     feature = "outbound-http",
     feature = "outbound-anytls",
     feature = "outbound-shadowsocks",

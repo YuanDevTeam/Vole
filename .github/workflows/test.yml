@@ -144,6 +144,8 @@ jobs:
           require(wireguard.get("license") == "BSD-3-Clause", "unapproved WireGuard license")
           require(not features(wireguard) & {"device", "ffi-bindings", "jni-bindings"}, "WireGuard must use only the userspace protocol")
           require("ring" in features(rustls) and not features(rustls) & {"reality", "aws_lc_rs", "fips"}, "rustls must use only the ring TLS provider")
+          mieru_aead = next(item for item in packages if item["name"] == "chacha20poly1305" and item["version"] == "0.11.0")
+          require(mieru_aead.get("source") in registry and "zeroize" in features(mieru_aead), "Mieru must use official zeroizing XChaCha20-Poly1305")
           hpke = package("hpke", "0.14.1")
           require(features(hpke) == {"alloc", "aes", "chacha", "x25519", "hkdfsha2", "nistp", "mlkem", "shake"}, "unapproved HPKE algorithms")
           age = package("age", "0.11.5")
@@ -250,7 +252,7 @@ jobs:
             inbound::http::parser::tests:: inbound::http::framing::tests::
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
-            outbound::trusttunnel:: transport::quic::
+            outbound::trusttunnel:: outbound::mieru:: transport::quic::
             transport::sing_mux::smux_driver::tests:: transport::sing_mux::tests::
             grpc_duplex_pool_keeps_response
             outbound::sing_mux::tests::

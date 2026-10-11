@@ -255,6 +255,23 @@ proxies:
     udp: true
     health-check: true
 
+  # Mieru：transport 必填 TCP；同时承载 TCP 和 udp: true 的 UDP Associate。
+  # username/password 各为 1–64 UTF-8 字节，保留原值。port 与非空 port-range 互斥，
+  # 范围如 "24810-24812"，每次新物理连接随机选择包含两端的端口。
+  # multiplexing 为 MULTIPLEXING_DEFAULT/OFF/LOW/MIDDLE/HIGH，默认 LOW；
+  # handshake-mode 为 HANDSHAKE_DEFAULT/STANDARD/NO_WAIT，默认 STANDARD。
+  # 枚举须携带上述完整前缀。UDP 底层与非空 traffic-pattern 尚未提供。
+  - name: mieru-edge
+    type: mieru
+    server: mieru.example.com
+    port: 24810
+    transport: TCP
+    username: synthetic-user
+    password: synthetic-password
+    udp: true
+    multiplexing: MULTIPLEXING_LOW
+    handshake-mode: HANDSHAKE_STANDARD
+
   # 标准 WireGuard：用户态内层 TCP/UDP，不创建系统接口/路由/NAT。
   # 密钥为公开测试值，不可用于真实连接。外层始终需要双向 UDP；业务 udp 默认 false。
   # ip/ipv6 接受 IP 或 CIDR，按实际地址族选择，每族最多一个；至少配置一个。

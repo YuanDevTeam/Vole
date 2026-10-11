@@ -13,6 +13,7 @@
 | Controller 随机服务端身份 | 官方 rsa 仅生成 RSA 2048 密钥；rcgen + ring 签发自签证书，实际 TLS 和握手签名仍由 rustls + ring 处理；随 Controller 入站 feature 启用 |
 | 命名 ClientHello、REALITY、JLS、ShadowTLS v3 | YuanDevTeam/boring，同一 fork 的本地 development path；发布门禁仍要求 release 分支及批准 revision |
 | SS 2022 | 官方 shadowsocks，仅 `aead-cipher-2022` |
+| Mieru 分段认证 | 官方 RustCrypto chacha20poly1305 0.11.0 + ring PBKDF2；不使用 TLS 或另一套 TLS provider |
 | Encryption | 同一 boring 的 X25519、ML-KEM、AEAD、AES-CTR；官方 blake3 |
 | 静态/动态 ECH | 官方 hpke + rustls HPKE trait；指纹模板使用 boring ECH selector |
 | Provider AGE | 官方 age/age-core 的 armor、MAC 和 STREAM；Hybrid 身份用官方 hpke XWing，关闭插件与 CLI |
