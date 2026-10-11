@@ -61,7 +61,7 @@ max-connections <= 0 时，只在 max-streams > 0 且流数 < max-streams 时复
 
 TCP 流使用原始字节，无 gRPC 帧；响应头延迟到读取，允许服务端等待 client-first 业务。
 udp 缺省 false，开启后使用 `_udp2` CONNECT 承载多目标数据报。
-health-check 缺省 false，开启后使用 `_check` CONNECT；读取活动重置 7 秒计时，
+health-check 缺省 false，开启后使用 `_check` CONNECT；成功 CONNECT 响应重置 7 秒计时，
 单次探测期限为 7 秒。关闭只结束当前逻辑流；节点 Stop 取消并 join 池、探测和 H2 驱动。
 
 quic: true 目前尚未支持；H2 中的 congestion-controller/cwnd/bbr-profile
