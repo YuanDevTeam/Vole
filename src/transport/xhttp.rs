@@ -21,7 +21,7 @@ use tokio::{
 use crate::dispatch::BoxStream;
 mod h2_driver;
 mod h3_driver;
-mod h3_upload;
+use crate::transport::h3_stream as h3_upload;
 pub(crate) use h3_driver::QuicTransport;
 mod http_io;
 mod packet_up;

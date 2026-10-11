@@ -125,6 +125,12 @@ jobs:
           require("rustls-ring" in features(quinn), "Quinn wrapper must use rustls/ring")
           require(not (features(proto) | features(quinn)) & {"aws-lc-rs", "aws-lc-rs-fips", "rustls-aws-lc-rs", "rustls-aws-lc-rs-fips"}, "QUIC may not enable a second TLS provider")
           require(proto["id"] in {dependency["pkg"] for dependency in nodes[quinn["id"]]["deps"]}, "Quinn wrapper must resolve the reviewed protocol source")
+          h3 = package("h3", "0.0.8", {None})
+          h3_root = (Path(metadata["workspace_root"]) / "vendor" / "h3").resolve()
+          require(Path(h3["manifest_path"]).resolve() == h3_root / "Cargo.toml", "HTTP/3 must use the reviewed in-repository source")
+          require(h3.get("license") == "MIT" and all((h3_root / name).is_file() for name in ("LICENSE", "README.vole.md")), "HTTP/3 provenance or license is missing")
+          h3_quinn = package("h3-quinn", "0.0.10")
+          require(h3["id"] in {dependency["pkg"] for dependency in nodes[h3_quinn["id"]]["deps"]}, "HTTP/3 adapter must resolve the reviewed source")
           rsa = package("rsa", "0.9.10")
           rcgen = package("rcgen", "0.14.10")
           require(features(rsa) == {"std"}, "RSA is restricted to controller key generation")
@@ -173,6 +179,18 @@ jobs:
         if: matrix.profile == 'features'
         run: |
           cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --no-default-features --features rustls-ring --lib vole_
+      - name: H3 header fixture
+        if: matrix.profile == 'features'
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          cargo = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")))
+          adapter = next((cargo / "registry" / "src").glob("*/h3-quinn-0.0.10"))
+          Path("vendor/h3-quinn").symlink_to(adapter, target_is_directory=True)
+          PY
+          trap 'rm vendor/h3-quinn' EXIT
+          cargo test --manifest-path vendor/h3/Cargo.toml --locked --features i-implement-a-third-party-backend-and-opt-into-breaking-changes --lib vole_connect_pseudo_headers_preserve_request_modes
       - name: Production and netstack clippy
         if: matrix.profile == 'features'
         run: |
@@ -232,6 +250,7 @@ jobs:
             inbound::http::parser::tests:: inbound::http::framing::tests::
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
+            outbound::trusttunnel:: transport::quic::
             transport::sing_mux::smux_driver::tests:: transport::sing_mux::tests::
             grpc_duplex_pool_keeps_response
             outbound::sing_mux::tests::

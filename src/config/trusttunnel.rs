@@ -125,9 +125,6 @@ impl RawTrustTunnel {
         }
         validate_host(&self.server, "TrustTunnel server")?;
         validate_port(self.port, "TrustTunnel")?;
-        if self.quic {
-            return invalid("TrustTunnel QUIC support is not implemented");
-        }
         let server_name = self
             .sni
             .filter(|value| !value.is_empty())
@@ -293,10 +290,71 @@ mod tests {
 
     #[test]
     fn h2_requires_its_alpn_and_forwards_udp_and_health_check() {
-        for options in ["    alpn: [http/1.1]\n", "    quic: true\n"] {
-            assert!(parse(options).is_err());
-        }
+        assert!(parse("    alpn: [http/1.1]\n").is_err());
         let config = parse("    udp: true\n    health-check: true\n").unwrap();
         assert!(config.proxies[0].udp && node(&config).udp && node(&config).health_check);
+    }
+
+    #[test]
+    fn h3_defaults_force_http3_and_preserve_transport_independent_udp() {
+        for extra in ["", "    alpn: []\n    sni: ''\n"] {
+            let config = parse(&format!("    quic: true\n{extra}")).unwrap();
+            let node = node(&config);
+            assert!(node.quic && node.tls.tls13_only);
+            assert_eq!(node.tls.alpn, [b"h3".to_vec()]);
+            assert_eq!(node.tls.required_alpn.as_deref(), Some(b"h3".as_slice()));
+            assert_eq!(node.tls.server_name, "cover.invalid");
+            assert!(!node.udp && !config.proxies[0].udp);
+            assert!(node.username.is_empty() && node.password.is_empty());
+        }
+        let config =
+            parse("    quic: true\n    udp: true\n    health-check: true\n    alpn: [h3, h2]\n")
+                .unwrap();
+        assert!(config.proxies[0].udp && node(&config).udp && node(&config).health_check);
+        assert_eq!(node(&config).tls.alpn, [b"h3".to_vec(), b"h2".to_vec()]);
+        for options in [
+            "    quic: true\n    alpn: [h2]\n",
+            "    quic: true\n    alpn: ['']\n",
+        ] {
+            assert!(parse(options).is_err());
+        }
+    }
+
+    #[test]
+    fn h3_does_not_consume_tcp_fingerprint_or_add_congestion_restrictions() {
+        for fingerprint in ["chrome", "none", "unknown-http3-noop", ""] {
+            let config = parse(&format!("    quic: true\n    client-fingerprint: '{fingerprint}'\n    cwnd: -1\n    congestion-controller: arbitrary-default\n    bbr-profile: arbitrary-default\n    max-connections: -3\n    min-streams: -4\n")).unwrap();
+            let node = node(&config);
+            assert!(node.tls.client_fingerprint.is_none());
+            assert_eq!(node.cwnd, -1);
+            assert_eq!(node.congestion_controller, "arbitrary-default");
+            assert_eq!(node.bbr_profile, "arbitrary-default");
+            assert_eq!(node.pool.max_connections, -3);
+            assert_eq!(node.pool.min_streams, -4);
+        }
+        assert!(parse("    client-fingerprint: unknown-http3-noop\n").is_err());
+        for value in ["null", "[]", "1"] {
+            assert!(
+                parse(&format!(
+                    "    quic: true\n    client-fingerprint: {value}\n"
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn h3_shares_certificate_and_dynamic_ech_policy() {
+        let config = parse("    quic: true\n    sni: cover-name.invalid\n    client-fingerprint: unknown-http3-noop\n    skip-cert-verify: true\n    name-cert-verify: verified.invalid\n    fingerprint: 'abababababababababababababababababababababababababababababababab'\n    ech-opts:\n      enable: true\n      query-server-name: ech-query.invalid\n").unwrap();
+        let node = node(&config);
+        assert_eq!(node.tls.server_name, "cover-name.invalid");
+        assert_eq!(
+            node.tls.certificate.verification_name.as_deref(),
+            Some("verified.invalid")
+        );
+        assert!(node.tls.certificate.skip_cert_verify);
+        assert_eq!(node.tls.certificate.fingerprint, Some([0xab; 32]));
+        assert!(node.tls.ech.is_some());
+        assert!(node.tls.client_fingerprint.is_none());
     }
 }

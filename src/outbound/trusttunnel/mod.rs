@@ -1,8 +1,8 @@
-//! TrustTunnel CONNECT over supplied TLS/H2 IO. Physical sockets remain owned
+//! TrustTunnel CONNECT over supplied TLS/H2 or controlled QUIC IO. Physical sockets remain owned
 //! by the shared Dialer; the node owns the pool and its synchronous stop barrier.
 use crate::{
     config::TrustTunnelOutboundConfig,
-    dispatch::{DatagramTransport, DispatchError},
+    dispatch::{DatagramBudget, DatagramTransport, DispatchError},
     outbound::{
         ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector, UpstreamPath,
         server_destination,
@@ -10,7 +10,7 @@ use crate::{
     security::{
         SecurityContext, StandardTlsClient, TlsClientIdentity, TlsClientOptions, TlsVersions,
     },
-    session::{Destination, StreamSession},
+    session::{DatagramSession, Destination, StreamSession},
     transport::GrpcPool,
 };
 use async_trait::async_trait;
@@ -34,6 +34,7 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+mod h3;
 mod packet;
 const HEALTH_INTERVAL: Duration = Duration::from_secs(7);
 
@@ -42,6 +43,8 @@ struct ConnectionFactory {
     upstream: UpstreamPath,
     tls: StandardTlsClient,
     authorization: String,
+    quic: bool,
+    congestion: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
 }
 impl ConnectionFactory {
     async fn connect(
@@ -56,19 +59,129 @@ impl ConnectionFactory {
             .map_err(io::Error::other)?;
         self.tls.connect_with_context(raw.io, context).await
     }
+    async fn connect_quic(
+        &self,
+        session: StreamSession,
+        context: &EstablishContext,
+    ) -> io::Result<h3::QuicTransport> {
+        let (tls, server_name) = self.tls.quic_config_with_context(context).await?;
+        let server = self
+            .upstream
+            .datagram_server(&self.server, context)
+            .await
+            .map_err(io::Error::other)?;
+        let peer = context
+            .resolve_ip(&server)
+            .await
+            .map_err(io::Error::other)?;
+        let budget = DatagramBudget::new(1400, 1400);
+        let request = DatagramRequest::new(
+            DatagramSession::new(session.inbound, session.source).with_metadata(session.metadata),
+        )
+        .with_budget(budget);
+        let transport = self
+            .upstream
+            .open_datagram(request, context)
+            .await
+            .map_err(io::Error::other)?;
+        Ok(h3::QuicTransport {
+            transport,
+            peer,
+            budget,
+            tls,
+            server_name,
+        })
+    }
 }
 
+enum ClientTransport {
+    H2(GrpcPool),
+    H3(h3::Pool),
+}
+impl ClientTransport {
+    async fn open(
+        &self,
+        request: http::Request<()>,
+        context: &EstablishContext,
+        observer: Option<Arc<dyn Fn() + Send + Sync>>,
+        factory: Arc<ConnectionFactory>,
+        session: StreamSession,
+    ) -> io::Result<crate::dispatch::BoxStream> {
+        match self {
+            Self::H2(pool) => match observer {
+                Some(observer) => {
+                    pool.open_connect_observed(request, context.deadline(), observer, || {
+                        factory.connect(session, context)
+                    })
+                    .await
+                }
+                None => {
+                    pool.open_connect(request, context.deadline(), || {
+                        factory.connect(session, context)
+                    })
+                    .await
+                }
+            },
+            Self::H3(pool) => {
+                let setup = context.clone();
+                pool.open_connect(request, context.deadline(), observer, move || async move {
+                    factory.connect_quic(session, &setup).await
+                })
+                .await
+            }
+        }
+    }
+    async fn probe(
+        &self,
+        request: http::Request<()>,
+        context: &EstablishContext,
+        factory: Arc<ConnectionFactory>,
+        session: StreamSession,
+    ) -> io::Result<()> {
+        match self {
+            Self::H2(pool) => {
+                pool.probe(request, context.deadline(), || {
+                    factory.connect(session, context)
+                })
+                .await
+            }
+            Self::H3(pool) => {
+                let setup = context.clone();
+                pool.probe(request, context.deadline(), move || async move {
+                    factory.connect_quic(session, &setup).await
+                })
+                .await
+            }
+        }
+    }
+    fn begin_shutdown(&self) {
+        match self {
+            Self::H2(pool) => pool.begin_shutdown(),
+            Self::H3(pool) => pool.begin_shutdown(),
+        }
+    }
+    async fn shutdown(&self) {
+        match self {
+            Self::H2(pool) => pool.shutdown().await,
+            Self::H3(pool) => pool.shutdown().await,
+        }
+    }
+}
 struct Client {
-    transport: GrpcPool,
+    transport: ClientTransport,
     active: AtomicUsize,
     health_started: Mutex<bool>,
     last_success: watch::Sender<Instant>,
 }
 impl Client {
-    fn new() -> Self {
+    fn new(factory: &ConnectionFactory) -> Self {
         let (last_success, _) = watch::channel(Instant::now());
         Self {
-            transport: GrpcPool::connect_client(),
+            transport: if factory.quic {
+                ClientTransport::H3(h3::Pool::new(factory.congestion.clone()))
+            } else {
+                ClientTransport::H2(GrpcPool::connect_client())
+            },
             active: AtomicUsize::new(0),
             health_started: Mutex::new(false),
             last_success,
@@ -140,7 +253,11 @@ impl TrustTunnelOutbound {
             &policy.server_name,
             TlsClientOptions {
                 ech: policy.ech.clone(),
-                client_fingerprint: policy.client_fingerprint,
+                client_fingerprint: if config.quic {
+                    None
+                } else {
+                    policy.client_fingerprint
+                },
                 versions: if policy.tls13_only {
                     TlsVersions::Tls13
                 } else {
@@ -160,21 +277,33 @@ impl TrustTunnelOutbound {
             sessions,
             buffer_limit,
         )?;
+        let connection = Arc::new(ConnectionFactory {
+            server: server_destination(&config.address, config.port)?,
+            upstream,
+            tls,
+            authorization: format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("{}:{}", config.username, config.password))
+            ),
+            quic: config.quic,
+            congestion: if config.quic {
+                crate::transport::quic::congestion_controller(
+                    &config.congestion_controller,
+                    config.cwnd,
+                    &config.bbr_profile,
+                )
+            } else {
+                None
+            },
+        });
+        let first = Arc::new(Client::new(&connection));
         Ok(Self {
-            connection: Arc::new(ConnectionFactory {
-                server: server_destination(&config.address, config.port)?,
-                upstream,
-                tls,
-                authorization: format!(
-                    "Basic {}",
-                    base64::engine::general_purpose::STANDARD
-                        .encode(format!("{}:{}", config.username, config.password))
-                ),
-            }),
+            connection,
             options: config.pool.clone(),
             udp: config.udp,
             health_check: config.health_check,
-            clients: Mutex::new(vec![Arc::new(Client::new())]),
+            clients: Mutex::new(vec![first]),
             owned: OwnedTasks::new(),
         })
     }
@@ -199,7 +328,7 @@ impl TrustTunnelOutbound {
                 client
             }
             _ => {
-                let client = Arc::new(Client::new());
+                let client = Arc::new(Client::new(&self.connection));
                 clients.push(client.clone());
                 client
             }
@@ -248,9 +377,7 @@ impl TrustTunnelOutbound {
                 {
                     let _ = client
                         .transport
-                        .probe(request, context.deadline(), || {
-                            factory.connect(session.clone(), &context)
-                        })
+                        .probe(request, &context, factory.clone(), session.clone())
                         .await;
                 }
                 // Probe failure does not reset physical connections or mutate a
@@ -279,30 +406,21 @@ impl TrustTunnelOutbound {
             )
         };
         let request = authority_request(authority, &self.connection.authorization, &user_agent)?;
-        let factory = || self.connection.connect(session, context);
-        let stream = if self.health_check {
+        let observer = if self.health_check {
             let client = Arc::downgrade(&lease.0);
-            lease
-                .0
-                .transport
-                .open_connect_observed(
-                    request,
-                    context.deadline(),
-                    Arc::new(move || {
-                        if let Some(client) = client.upgrade() {
-                            client.last_success.send_replace(Instant::now());
-                        }
-                    }),
-                    factory,
-                )
-                .await?
+            Some(Arc::new(move || {
+                if let Some(client) = client.upgrade() {
+                    client.last_success.send_replace(Instant::now());
+                }
+            }) as Arc<dyn Fn() + Send + Sync>)
         } else {
-            lease
-                .0
-                .transport
-                .open_connect(request, context.deadline(), factory)
-                .await?
+            None
         };
+        let stream = lease
+            .0
+            .transport
+            .open(request, context, observer, self.connection.clone(), session)
+            .await?;
         Ok(Box::new(CountedStream {
             io: stream,
             lease: Some(lease),
@@ -379,7 +497,7 @@ fn authority_request(
     authorization: &str,
     user_agent: &str,
 ) -> io::Result<http::Request<()>> {
-    // CONNECT uses only :authority. HTTP/2 elides :scheme and :path.
+    // Ordinary CONNECT uses only :authority in both H2 and H3.
     let uri = http::Uri::builder()
         .authority(authority)
         .build()
@@ -407,7 +525,7 @@ impl OutboundConnector for TrustTunnelOutbound {
         };
         let io = context
             .run_io(
-                "TrustTunnel HTTP/2 CONNECT",
+                "TrustTunnel CONNECT",
                 self.connect(session, &authority, context),
             )
             .await?;
@@ -598,9 +716,10 @@ mod tests {
                 node.start_health(&lease.0, &session, &context).unwrap();
                 let observed_client = Arc::downgrade(&lease.0);
                 let observed_ready = ready.clone();
-                let mut stream = lease
-                    .0
-                    .transport
+                let ClientTransport::H2(transport) = &lease.0.transport else {
+                    unreachable!();
+                };
+                let mut stream = transport
                     .open_connect_observed(
                         connect_request(&session.destination, &node.connection.authorization)
                             .unwrap(),

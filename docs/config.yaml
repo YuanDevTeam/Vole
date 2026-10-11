@@ -229,22 +229,27 @@ sniffer:
 # username/password 均非空才认证；headers 为字符串映射；仅 TCP，不支持 udp: true。
 # tls: true 时支持 sni/skip-cert-verify/name-cert-verify/fingerprint，
 # 以及成对的 certificate/private-key（PEM 或文件路径）。支持 dialer-proxy；详见 outbounds.md。
-# TrustTunnel 当前支持 TLS + H2 CONNECT TCP/UDP，type: trusttunnel；username/password 默认空串，
-# 始终发送 Basic 认证，不要求非空。sni 缺省/空串使用 server；alpn 缺省/[] 为 [h2]，
-# 自定义列表必须包含 h2，不降级 H1。支持上述证书策略、mTLS、client-fingerprint、ech-opts。
+# TrustTunnel 支持 H2/H3 CONNECT TCP/UDP，type: trusttunnel；username/password 默认空串，
+# 始终发送 Basic 认证，不要求非空。quic 默认 false（TLS+H2），true 使用 QUIC/TLS1.3+H3。
+# sni 缺省/空串使用 server；alpn 缺省/[] 随模式使用 [h2]/[h3]，自定义列表须包含该值，
+# 实际协商也必须匹配。两模式共享证书策略、mTLS、ech-opts；client-fingerprint 仅 H2 消费，
+# H3 将该字符串视为 no-op，不校验模板名。H3 外层始终需要双向至少1200字节UDP路径。
 # 逻辑客户端池 max-connections/min-streams/max-streams 全为 0 时采用 8/5/0；
 # 优先复用流数最少的客户端，max-connections > 0 时，达到客户端数上限或
 # 当前流数 < min-streams 即复用；max-connections <= 0 时，按
 # max-streams > 0 且当前流数 < max-streams 复用；未满足条件则增加客户端。
-# 零活跃流始终复用，混合填写不报互斥，阈值不限制业务总连接数。物理 H2 空闲 30 秒关闭。
+# 零活跃流始终复用，混合填写不报互斥，阈值不限制业务总连接数。物理连接空闲30秒关闭。
 # udp: true 启用 _udp2 多目标数据报；health-check: true 启用 _check 协议探测，
-# 读取活动重置 7 秒计时，单次探测期限 7 秒；二者缺省 false。quic: true 尚未支持。
-# congestion-controller/cwnd/bbr-profile 可填写，在 H2 模式与 Mihomo 一样不生效。
+# 成功CONNECT响应重置7秒计时，单次探测期限7秒；二者缺省false。UDP业务在两模式均走可靠流。
+# congestion-controller 仅H3消费：cubic/new_reno/bbr_meta_v1/bbr_meta_v2，bbr 是 meta_v2别名，
+# 省略/未知保持传输默认。cwnd 仅BBR消费，0使用32；bbr-profile仅meta_v2消费，
+# 支持standard/conservative/aggressive，省略/未知使用standard。H2三字段均不生效。
 proxies:
   - name: trusttunnel-edge
     type: trusttunnel
     server: trusttunnel.example.com
     port: 443
+    quic: false # true 改为H3，其余业务配置不变
     username: synthetic-user
     password: synthetic-password
     udp: true

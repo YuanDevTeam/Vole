@@ -31,7 +31,7 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   HTTP 出站已有的可选 TLS 字段保留 null 等同省略的行为。
   凭据、UUID、业务目标和完整请求不进入 Debug/错误；资源与 Stop 见[公共策略](runtime-resource-policy.md)。
 
-VMess + TLS、Trojan、AnyTLS、TrustTunnel H2、VLESS 和 Hysteria2 支持 `ech-opts.enable/config/query-server-name`，
+VMess + TLS、Trojan、AnyTLS、TrustTunnel、VLESS 和 Hysteria2 支持 `ech-opts.enable/config/query-server-name`，
 静态优先和动态节点 DNS 来源、后端算法及失败边界见 [ECH](vless.md#ech)。
 TUIC 的固定参考未消费 ECH，因此不接受该字段。
 
@@ -46,10 +46,12 @@ HTTP CONNECT 本身不提供 UDP，也不接受 `udp` 字段。公共 smux 可�
 
 ## TrustTunnel
 
-`type: trusttunnel` 当前提供 TLS + HTTP/2 CONNECT TCP/UDP，使用 `outbound-trusttunnel`。
+`type: trusttunnel` 提供 H2/H3 CONNECT TCP/UDP，使用 `outbound-trusttunnel`。
+quic 缺省 false 使用 TLS + HTTP/2；true 使用 QUIC v1/TLS1.3 + HTTP/3，无 0-RTT。
 username/password 默认空字符串，始终发送 Basic 认证；不增加非空限制。
-SNI 缺省/空串使用 server，ALPN 缺省/空列表使用 h2，自定义列表必须包含 h2，
-实际握手必须协商 h2，不回退 HTTP/1.1。共享证书策略、mTLS、命名指纹与 ECH。
+SNI 缺省/空串使用 server，ALPN 缺省/空列表随模式使用 h2/h3，自定义列表必须包含该值，
+实际握手必须协商选定版本。两模式使用共享证书策略、mTLS 和 ECH。
+client-fingerprint 仅 H2 消费；H3 接受该字符串但不校验模板名、不应用 TCP ClientHello 模板。
 
 三项 max-connections/min-streams/max-streams 全为 0 才应用 8/5/0。
 逻辑客户端池先选择活跃流最少的客户端，零活跃流始终复用。
@@ -57,15 +59,23 @@ max-connections > 0 时，达到客户端数上限或该客户端流数 < min-st
 max-connections <= 0 时，只在 max-streams > 0 且流数 < max-streams 时复用。
 各分支未满足复用条件时增加客户端。
 混合配置和负阈值不额外拒绝；池参数是分配阈值，不是业务流总量上限。
-每个逻辑客户端复用自己的物理 H2 连接，物理连接空闲 30 秒后关闭。
+每个逻辑客户端复用自己的物理连接，空闲30秒后关闭；H3 的 QUIC 空闲期限74秒，
+不增加周期 QUIC keepalive。逻辑空闲回收与 QUIC 传输空闲是不同期限。
 
-TCP 流使用原始字节，无 gRPC 帧；响应头延迟到读取，允许服务端等待 client-first 业务。
+TCP 流使用原始字节，无 gRPC 帧；建立流后独立消费响应头，允许服务端等待 client-first 业务。
 udp 缺省 false，开启后使用 `_udp2` CONNECT 承载多目标数据报。
 health-check 缺省 false，开启后使用 `_check` CONNECT；成功 CONNECT 响应重置 7 秒计时，
-单次探测期限为 7 秒。关闭只结束当前逻辑流；节点 Stop 取消并 join 池、探测和 H2 驱动。
+单次探测期限为7秒。两模式的UDP业务都使用可靠CONNECT流，不使用QUIC DATAGRAM。
+关闭只结束当前逻辑流；节点Stop取消并join池、探测、H2/H3及QUIC驱动，释放受控上游。
 
-quic: true 目前尚未支持；H2 中的 congestion-controller/cwnd/bbr-profile
-与 Mihomo 一样不消费，不据此声明 H3 或拥塞算法支持。
+H3 外层无论业务 udp 是否开启，都要求受控上游提供双向至少1200字节UDP路径；
+QUIC payload 最大1400并取实际双向上游预算交集，PMTUD不超过该预算，不回落TCP或DIRECT。
+congestion-controller 支持 cubic、new_reno、bbr_meta_v1、bbr_meta_v2，bbr 是 meta_v2别名；
+省略或未知名称保持传输默认。cwnd 仅BBR消费，0使用32；meta_v1保留固定1280字节初始MSS
+及其窗口、带宽和pacing消费行为，忽略profile。meta_v2消费standard（默认）、conservative、
+aggressive，未知profile使用standard；负窗口参数按原带符号语义消费，不增加正数校验。
+两代为独立的Google算法移植与参考参数适配，meta_v2不表示标准BBR2；来源见
+[拥塞算法](../src/transport/quic/congestion/README.md)。H2中这三个QUIC字段不消费。
 
 ## SOCKS5
 

@@ -443,7 +443,8 @@ impl StandardTlsClient {
     #[cfg(any(
         feature = "outbound-vless",
         feature = "outbound-hysteria2",
-        feature = "outbound-tuic"
+        feature = "outbound-tuic",
+        feature = "outbound-trusttunnel"
     ))]
     pub(crate) async fn quic_config_with_context(
         &self,

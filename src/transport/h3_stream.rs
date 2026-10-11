@@ -1,8 +1,8 @@
 //! Request-stream adapter for acknowledged QUIC upload completion. h3-quinn
 //! still owns the HTTP/3 control streams; h3 owns all HTTP encoding. Quinn's
 //! finish only queues FIN, so a logical close must also wait for stopped(None)
-//! before its last lease can close the physical connection. The XHTTP wrapper
-//! retains its one-second deadline and node Stop can cancel every wait.
+//! before its last lease can close the physical connection. Each protocol
+//! wrapper owns its close deadline and node Stop can cancel every wait.
 use bytes::{Buf, Bytes};
 use h3::quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf};
 use std::{
@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 type Operation<T> = Pin<Box<dyn Future<Output = Result<T, StreamErrorIncoming>> + Send>>;
 
-pub(super) struct Connection {
+pub(crate) struct Connection {
     control: h3_quinn::Connection,
     open: OpenStreams,
 }
@@ -63,7 +63,7 @@ impl quic::Connection<Bytes> for Connection {
     }
 }
 
-pub(super) struct OpenStreams {
+pub(crate) struct OpenStreams {
     control: h3_quinn::OpenStreams,
     connection: quinn::Connection,
     pending: Option<Operation<(quinn::SendStream, quinn::RecvStream)>>,
@@ -141,17 +141,17 @@ impl quic::OpenStreams<Bytes> for Connection {
     }
 }
 
-pub(super) struct BidiStream {
+pub(crate) struct BidiStream {
     send: SendStream,
     recv: RecvStream,
 }
-pub(super) struct SendStream {
+pub(crate) struct SendStream {
     raw: quinn::SendStream,
     queued: Option<WriteBuf<Bytes>>,
     completion: Option<Operation<()>>,
     finished: bool,
 }
-pub(super) struct RecvStream(quinn::RecvStream);
+pub(crate) struct RecvStream(quinn::RecvStream);
 
 fn stream_error(error: impl std::error::Error + Send + Sync + 'static) -> StreamErrorIncoming {
     StreamErrorIncoming::Unknown(Box::new(error))

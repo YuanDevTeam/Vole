@@ -1,5 +1,7 @@
 //! Outbound wire transports.
 
+#[cfg(any(feature = "outbound-vless", feature = "outbound-trusttunnel"))]
+pub(crate) mod h3_stream;
 #[cfg(feature = "sing-mux")]
 pub(crate) mod sing_mux;
 #[cfg(feature = "outbound-vless")]

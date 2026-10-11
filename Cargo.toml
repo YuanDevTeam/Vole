@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/vole-blake3-raw", "crates/vole-netstack"]
-exclude = ["vendor/quinn-proto"]
+exclude = ["vendor/quinn-proto", "vendor/h3"]
 resolver = "3"
 
 [package]
@@ -56,7 +56,7 @@ outbound-http = []
 outbound-shadowsocks = ["dep:shadowsocks", "dep:log"]
 outbound-vless = ["ech", "tls-fingerprint", "boring/reality", "boring/jls", "boring/mlkem", "dep:blake3", "dep:vole-blake3-raw", "stream-transport", "quic-transport", "dep:hyper", "dep:hyper-util", "dep:h3", "dep:h3-quinn"]
 outbound-trojan = ["stream-transport", "tls-fingerprint", "ech"]
-outbound-trusttunnel = ["stream-transport", "tls-fingerprint", "ech", "quic-transport"]
+outbound-trusttunnel = ["stream-transport", "tls-fingerprint", "ech", "quic-transport", "dep:h3", "dep:h3-quinn"]
 outbound-vmess = ["stream-transport", "tls-fingerprint", "ech", "dep:aes", "dep:md-5", "dep:ring", "dep:shake"]
 tls-fingerprint = ["dep:boring", "dep:tokio-boring"]
 ech = []
@@ -245,3 +245,4 @@ pedantic = "allow"
 
 [patch.crates-io]
 quinn-proto = { path = "vendor/quinn-proto" }
+h3 = { path = "vendor/h3" }
