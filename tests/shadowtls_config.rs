@@ -40,7 +40,7 @@ fn policy(node: Value) -> ShadowTlsConfig {
 
 #[cfg(feature = "shadow-tls-v3")]
 #[test]
-fn shadowtls_preserves_policy_values_and_shared_profile_aliases() {
+fn shadowtls_preserves_policy_values_and_shared_profiles() {
     #[cfg(feature = "interop-test")]
     let _case = vole::resources::case_events::Case::new("SHADOWTLS-CFG", "policy");
     let config = policy(node());
@@ -71,11 +71,8 @@ fn shadowtls_preserves_policy_values_and_shared_profile_aliases() {
         ("", None),
         ("none", None),
         ("chrome", Some(ClientFingerprint::Chrome133)),
-        ("chrome120", Some(ClientFingerprint::Chrome120)),
         ("firefox", Some(ClientFingerprint::Firefox120)),
-        ("firefox120", Some(ClientFingerprint::Firefox120)),
         ("safari", Some(ClientFingerprint::Safari16)),
-        ("safari16", Some(ClientFingerprint::Safari16)),
         ("ios", Some(ClientFingerprint::Ios14)),
     ] {
         let mut n = node();

@@ -74,7 +74,7 @@ fn outbound(
     runtime: bool,
 ) -> VlessOutbound {
     let config = Config::parse_yaml(json!({
-        "port": 1080,
+        "mixed-port": 1080,
         "proxies": [{
             "name": "p", "type": "vless", "server": "192.0.2.1", "port": 443,
             "uuid": "07070707-0707-0707-0707-070707070707", "tls": true,
@@ -169,9 +169,9 @@ async fn selected_xhttp_legs_isolate_tickets_and_client_identities() {
     let upload_identity = identity();
     let download_identity = identity();
     for runtime in [false, true] {
-        for profile in ["chrome", "chrome120", "firefox", "safari"] {
+        for profile in ["chrome", "firefox", "safari", "ios"] {
             for variant in ["inherit", "different", "clear"] {
-                let other = if profile.starts_with("chrome") {
+                let other = if profile == "chrome" {
                     "firefox"
                 } else {
                     "chrome"

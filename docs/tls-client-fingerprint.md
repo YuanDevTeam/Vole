@@ -5,20 +5,19 @@
 | 字段 | 含义 | 接受值 |
 | --- | --- | --- |
 | `fingerprint` | 服务端证书 DER 的 SHA-256 pin | 64 个十六进制字符，可带冒号 |
-| `client-fingerprint` | 客户端 ClientHello 的命名模板 | 下列九值；空串也关闭 |
+| `client-fingerprint` | 客户端 ClientHello 的命名模板 | 下列六值；空串也关闭 |
 
 | 公开值 | 实际模板 |
 | --- | --- |
 | `none` | 关闭命名指纹，不关闭 TLS 或 REALITY 认证 |
 | `chrome` | Chrome133 |
-| `chrome120` | Chrome120（固定） |
-| `firefox` / `firefox120` | Firefox120 |
-| `safari` / `safari16` | Safari16.0 |
+| `firefox` | Firefox120 |
+| `safari` | Safari16.0 |
 | `ios` | iOS14 |
 | `random` | 进程首次按 Chrome133/Safari16/iOS14/Firefox120 = 6:3:2:1 选中一个模板 |
 
 节点省略时关闭，显式启用推荐 `chrome`；这是节点级选项，无全局默认。
-大小写敏感，未知名称、`null`、错型全部拒绝；不接受 `chrome133`、`safari16.0`、
+大小写敏感，未知名称、`null`、错型全部拒绝；不接受带版本号的名称、
 其它移动端名称、废弃的 `randomized` 或 PSK/PQ 专用名称。短名只随显式依赖升级和验收变更，不随 OS 自动选择。
 `random` 仅共享不可变模板选择，后续连接、配置替换及 Stop/Start 不重抽，不共享 TLS 会话。
 兼容约束按实际选中模板检查，不能通过 random 绕过 REALITY 混合模式或 H3 限制。
@@ -85,13 +84,12 @@ Android、iOS 和 tvOS 在此库的 Unix 发现分支中，不能完整读取平
 这些平台保留内置与自定义根，实际可读文件仅补充来源，不宣称完整系统信任等价。
 Windows UWP/AppContainer 的真实根读取仍需独立设备验证；交叉编译不构成签收。
 
-## 五模板边界
+## 四模板边界
 
 模板由 fork 固定密码套件、组/share、签名算法、扩展排列及受限扩展编码。
 
 | 模板 | 主要差异 |
 | --- | --- |
-| Chrome120 | 经典 X25519 share，GREASE/乱序、ECH GREASE、Brotli、条件 padding、旧 ALPS 17513 |
 | Chrome133 | 普通 TLS 与显式混合 REALITY 使用原生 X25519MLKEM768 和 X25519 双 share；新 ALPS 17613，无 padding |
 | Firefox120 | 自有 cipher 顺序、固定扩展顺序、X25519/P-256 双 share，无 GREASE/ALPS/证书压缩 |
 | Safari16.0 | 固定扩展和签名顺序、GREASE、条件 padding、真实 Zlib 解压，模板本身不加 ECH/ALPS |
@@ -110,7 +108,7 @@ Firefox 的额外经典 share 不产生第二份 REALITY 身份。REALITY 仍拒
 
 `reality-opts.support-x25519mlkem768`：默认 false，true 要求实际
 发送且协商 X25519MLKEM768（4588），经典选组即失败，不重试或降级。只兼容 `chrome`
-或关闭命名指纹；后者使用原生混合-only offer，不自动切到 chrome。Chrome120、Firefox120、
+或关闭命名指纹；后者使用原生混合-only offer，不自动切到 chrome。Firefox120、
 Safari16.0/iOS14 在配置期拒绝该组合。下载腿继承/整体替换 REALITY 后，再独立验证最终 profile。
 ML-KEM 增强 TLS 密钥交换，REALITY 身份认证仍基于 X25519，不宣称后量子身份认证。
 
@@ -120,7 +118,7 @@ iOS 的 c024/c028/003d 与 Safari/iOS 的 c008 仅声明，对端选中会失败
 已有原生 RSA/AES-CBC/SHA256 实际协商，并保留 deprecated 标记，默认套件不启用。
 
 模板不模拟浏览器 HTTP/2 SETTINGS、QUIC 参数，也不会自动启用实际 ECH。
-VLESS/VMess/Trojan/AnyTLS/Hysteria2 可另行显式配置 [ECH](vless.md#ech)：五模板均可使用，届时强制 TLS1.3、
+VLESS/VMess/Trojan/AnyTLS/Hysteria2 可另行显式配置 [ECH](vless.md#ech)：四模板均可使用，届时强制 TLS1.3、
 加入真实 ECH 并关闭恢复；不再声称与未启用 ECH 的历史浏览器模板逐字节相同。
 当前 HTTP 驱动不导入 TLS ALPS 中的应用设置，因此**非空 ALPS 响应明确失败**；
 未协商或协商空设置可用。Brotli/Zlib 解压输出和原生证书消息上限均为 128 KiB；
@@ -135,7 +133,7 @@ TLS 1.3 票据只消费一次，TLS 1.2 会话也计入预算，过期票据清�
 Safari16/iOS14 不声明 TLS1.2 session-ticket 扩展，该版本的恢复使用会话 ID，不能把不存在的
 票据提示当作它的过期时间。TLS1.3 的票据期限已由原生握手收敛。
 握手及应用层 ALPN 策略通过前，暂存票据不会进入节点缓存。REALITY 始终不恢复。
-别名只复用模板，不扩大节点/下载腿缓存归属。冷连接和恢复连接分开验收；Vole 的
+同一模板的使用不扩大节点/下载腿缓存归属。冷连接和恢复连接分开验收；Vole 的
 票据策略不同于 Mihomo，恢复 hello 不宣称逐字段相同，也不伪造 PSK/binder。
 
 CloseWrite 刷新 close_notify 最多 5 秒，保留底层连接和读方向；重复关闭幂等，

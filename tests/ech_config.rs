@@ -46,15 +46,7 @@ fn static_ech_builds_both_tls_backends_without_dns_or_io() {
         "SECURITY-CONFIG-TLS",
         "static_ech_builds_both_tls_backends_without_dns_or_io",
     );
-    for profile in [
-        "none",
-        "chrome",
-        "chrome120",
-        "firefox",
-        "safari",
-        "ios",
-        "random",
-    ] {
+    for profile in ["none", "chrome", "firefox", "safari", "ios", "random"] {
         let mut input = node();
         input["client-fingerprint"] = json!(profile);
         let config = parse(input).expect("static ECH must normalize without a DNS entry point");

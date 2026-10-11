@@ -101,14 +101,7 @@ async fn capture(client: &SecurityClient) -> Vec<u8> {
 #[tokio::test]
 async fn selected_public_profiles_emit_bounded_client_hellos() {
     let mut cases: Vec<Value> = Vec::new();
-    for profile in [
-        "chrome",
-        "chrome120",
-        "firefox",
-        "firefox120",
-        "safari",
-        "safari16",
-    ] {
+    for profile in ["chrome", "firefox", "safari", "ios"] {
         for context in [
             "tcp", "ws", "grpc", "reality", "vision", "xhttp-h1", "xhttp-h2",
         ] {
@@ -124,7 +117,7 @@ async fn selected_public_profiles_emit_bounded_client_hellos() {
             }
         }
     }
-    assert_eq!(cases.len(), 168);
+    assert_eq!(cases.len(), 112);
     if let Ok(path) = std::env::var("VOLE_FINGERPRINT_CAPTURE") {
         std::fs::write(path, serde_json::to_vec_pretty(&cases).unwrap()).unwrap();
     }

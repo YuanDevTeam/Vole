@@ -861,7 +861,6 @@ pub struct TlsClientPolicy {
 /// A version-pinned ClientHello profile, independent of certificate pins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientFingerprint {
-    Chrome120,
     Chrome133,
     Firefox120,
     Safari16,
@@ -892,9 +891,8 @@ fn parse_client_fingerprint(value: Option<&str>) -> Result<Option<ClientFingerpr
             invalid("client-fingerprint is not compiled in")
         }
         Some("chrome") => Ok(Some(ClientFingerprint::Chrome133)),
-        Some("chrome120") => Ok(Some(ClientFingerprint::Chrome120)),
-        Some("firefox" | "firefox120") => Ok(Some(ClientFingerprint::Firefox120)),
-        Some("safari" | "safari16") => Ok(Some(ClientFingerprint::Safari16)),
+        Some("firefox") => Ok(Some(ClientFingerprint::Firefox120)),
+        Some("safari") => Ok(Some(ClientFingerprint::Safari16)),
         Some("ios") => Ok(Some(ClientFingerprint::Ios14)),
         Some("random") => Ok(Some(process_random_fingerprint())),
         Some(_) => invalid("unsupported client-fingerprint"),

@@ -36,6 +36,9 @@ remains a source fixture. Success means **reference captured / baseline verified
 support, REALITY authentication or proxy interoperability. A capture-only observer
 intentionally aborts; OpenSSL handshake cases do not implement VLESS or HTTP.
 
+Chrome120 observations remain historical reference evidence. Vole's current
+supported templates are defined in the [TLS contract](../../docs/tls-client-fingerprint.md).
+
 ## Comparison rules
 
 The bounded parser preserves ordered cipher/signature/group/share vectors,

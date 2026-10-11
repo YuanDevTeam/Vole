@@ -111,10 +111,10 @@ async fn selected_profiles_warm_wire_and_expired_tickets_use_real_handshakes() {
     let mut observations = Vec::new();
     let mut clients = Vec::new();
     for (name, profile) in [
-        ("chrome120", crate::config::ClientFingerprint::Chrome120),
         ("chrome", crate::config::ClientFingerprint::Chrome133),
         ("firefox", crate::config::ClientFingerprint::Firefox120),
         ("safari", crate::config::ClientFingerprint::Safari16),
+        ("ios", crate::config::ClientFingerprint::Ios14),
     ] {
         for version in [&TLS12, &TLS13] {
             let chain = chain(false);
@@ -152,9 +152,10 @@ async fn selected_profiles_warm_wire_and_expired_tickets_use_real_handshakes() {
     for (name, version, client, peer, issued) in clients {
         let prior_ticket_bytes = issued.lock().unwrap().last().copied();
         let (resumed, bytes) = observed_handshake(&client, peer).await;
-        // Safari16 does not offer the TLS1.2 session-ticket extension. Its
-        // stateful session ID has no server ticket-lifetime hint to expire.
-        let stateful_id = name == "safari" && version.version == rustls::ProtocolVersion::TLSv1_2;
+        // Safari16/iOS14 do not offer the TLS1.2 session-ticket extension.
+        // Their stateful session IDs have no ticket-lifetime hint to expire.
+        let stateful_id =
+            matches!(name, "safari" | "ios") && version.version == rustls::ProtocolVersion::TLSv1_2;
         assert_eq!(
             resumed, stateful_id,
             "{name}/{version:?}: ticket hint expiry"

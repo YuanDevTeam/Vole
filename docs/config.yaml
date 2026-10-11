@@ -209,7 +209,7 @@ sniffer:
 #   gRPC 与 Trojan/VMess 共用 UA、空闲 PING、max-connections/min-streams/max-streams 池阈值。
 # - 公共节点 smux 支持 h2mux/smux/yamux、padding/only-tcp 与池阈值；与 Vision 互斥。
 # - random 在进程首次按 Chrome/Safari/iOS/Firefox = 6:3:2:1 选定后稳定复用。
-# - client-fingerprint 接受 none/chrome/chrome120/firefox/firefox120/safari/safari16/ios/random；
+# - client-fingerprint 接受 none/chrome/firefox/safari/ios/random；
 #   chrome=Chrome133，firefox=Firefox120，safari=Safari16.0；节点缺省关闭。
 #   适用于标准 TCP TLS/REALITY，不改变证书 fingerprint；下载腿缺省继承、
 #   显式名称覆盖、none/空串清除，转 H3/明文必须清除指纹。
@@ -540,7 +540,7 @@ proxies:
     #   skip-cert-verify: false
     #   fingerprint: "<SHA-256 certificate pin, 64 hex digits>"
     #   name-cert-verify: verified.example.com # 可选独立证书验证名
-    # client-fingerprint: chrome # 仅有插件时允许；共享九值，缺省/none/空串关闭命名模板
+    # client-fingerprint: chrome # 仅有插件时允许；共享六值，缺省/none/空串关闭命名模板
 
 # select/url-test/fallback/load-balance 组支持静态 proxies 与动态 use；include-all 同时包含静态节点和所有 providers，
 # 也可分别使用 include-all-proxies / include-all-providers。后者启用时忽略 use。

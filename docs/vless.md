@@ -9,7 +9,7 @@
 
 - TCP/WS/gRPC/HTTP 首包伪装/legacy H2 可明文或标准 TLS。TLS 支持 1.2/1.3，TCP 默认不发送 ALPN，WS 默认 `[http/1.1]`，gRPC/H2 默认 `[h2]`。有序 ALPN 保留且必须包含传输要求值；标准 TLS 检查协商结果。`servername` 优先显式值、WS Host 去端口、server；不会改变拨号地址。TLS 关闭时禁止安全选项。
 - 标准 TLS 支持 `skip-cert-verify`、SHA-256 `fingerprint`、独立 `name-cert-verify`；沿用共享证书验证器的叶 pin / 非叶信任锚优先级。`certificate` / `private-key` 接受配对的内联 PEM 或文件路径，相对路径从数据目录解析，解析或密钥不匹配在网络 IO 前失败。REALITY 不能混用这些标准证书策略。
-- `client-fingerprint` 使用 [TLS 指纹](tls-client-fingerprint.md)的九值/五模板，适用于 TCP 上的标准 TLS/REALITY（含 Vision 和 XHTTP H1/H2），与证书 pin 独立；`none` / 空串关闭，H3 拒绝已启用的 profile。
+- `client-fingerprint` 使用 [TLS 指纹](tls-client-fingerprint.md)的六值/四模板，适用于 TCP 上的标准 TLS/REALITY（含 Vision 和 XHTTP H1/H2），与证书 pin 独立；`none` / 空串关闭，H3 拒绝已启用的 profile。
 - WS 的 ED 支持默认头、自定义头或路径（上限 2048 字节）。`v2ray-http-upgrade` 开启升级后裸流；`v2ray-http-upgrade-fast-open` 必须与前者一起启用，只允许默认 ED 头。fast-open 提前发协议首包但仍等待合法 101，拒绝不返回连接成功。
 - gRPC 与 Trojan/VMess 共用配置：省略或空 `grpc-service-name` 默认 `GunService`，普通名映射 `/name/Tun`，`/` 开头使用完整路径；省略或空 `grpc-user-agent` 默认 `grpc-go/1.36.0`。`ping-interval` 为带符号秒数，0 不主动 PING，负值明确拒绝；三项池阈值接受带符号整数，负阈值禁用相应分支。空闲连接总是复用；max-connections>0 时按连接上限/min-streams 扩容，否则按 max-streams 复用阈值扩容。三项字面全零归一 max-connections=1；正 max-connections 优先于 max-streams。阈值不是硬流数上限。物理连接归节点所有，关闭逻辑流不会杀死兄弟流；复用不重选上游组。
 - gRPC 不新增业务流/建链数量额度；每个物理连接一个自有驱动，每个等待调用只保留自身 future、取消与原期限，不派生队列任务。每节点最多保留 4 条空闲连接，多余空闲连接退役且不影响活动流。空闲 PING 等待 ACK 最多 15 秒，节点 Stop 取消并 join 所有驱动。
@@ -35,7 +35,7 @@ TLS 密钥交换，服务端选择经典组时失败；可用于主连接和 XHT
   主连接不接受空对象；未知字段、null、错型、缺项及超限在 IO 前拒绝。
 - 必须 `tls: true`。同一腿不能混用 REALITY、标准证书策略或客户端证书；
   ECH、其他安全封装、Vision 和 HTTP/3 也不属于此组合。
-- `servername`、有序 ALPN、传输必需 ALPN 与已支持的九值/五模板
+- `servername`、有序 ALPN、传输必需 ALPN 与已支持的六值/四模板
   `client-fingerprint` 沿用共享配置，不增加全局默认或别名。
 - `download-settings.jls-opts` 缺省继承整个身份；非空对象必须完整替换两项，
   `{}` 清除，不能按叶继承另一个身份的密码。其他下载字段独立覆盖。

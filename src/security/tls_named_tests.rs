@@ -95,11 +95,8 @@ async fn selected_profiles_enforce_alps_before_business_and_ticket_publication()
     use crate::config::ClientFingerprint;
     let chain = chain(false);
     for profile in crate::security::test_profiles().iter().copied().flatten() {
-        let chrome = matches!(
-            profile,
-            ClientFingerprint::Chrome120 | ClientFingerprint::Chrome133
-        );
-        let new_codepoint = profile == ClientFingerprint::Chrome133;
+        let chrome = profile == ClientFingerprint::Chrome133;
+        let new_codepoint = chrome;
         for settings in [
             None,
             Some(b"".as_slice()),

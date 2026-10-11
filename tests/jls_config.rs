@@ -277,16 +277,7 @@ fn selected_profiles_build_jls_without_changing_its_identity() {
         "SECURITY-CONFIG-TLS",
         "selected_profiles_build_jls_without_changing_its_identity",
     );
-    for profile in [
-        "none",
-        "",
-        "chrome",
-        "chrome120",
-        "firefox",
-        "firefox120",
-        "safari",
-        "safari16",
-    ] {
+    for profile in ["none", "", "chrome", "firefox", "safari", "ios", "random"] {
         let mut input = node();
         input["client-fingerprint"] = json!(profile);
         input["network"] = json!("xhttp");

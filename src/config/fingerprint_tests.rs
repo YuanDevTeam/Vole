@@ -30,7 +30,7 @@ fn profile(config: &Config) -> Option<ClientFingerprint> {
 fn named_fingerprint_is_strict_and_independent_of_certificate_pins() {
     for protocol in ["anytls", "trojan", "vmess", "vless"] {
         for (value, expected) in [
-            ("chrome120", Some(ClientFingerprint::Chrome120)),
+            ("chrome", Some(ClientFingerprint::Chrome133)),
             ("none", None),
             ("\"\"", None),
         ] {
@@ -52,6 +52,9 @@ fn named_fingerprint_is_strict_and_independent_of_certificate_pins() {
             None
         );
         for value in [
+            "chrome120",
+            "firefox120",
+            "safari16",
             "Chrome120",
             "Chrome",
             "NONE",
@@ -91,27 +94,26 @@ fn named_fingerprint_is_strict_and_independent_of_certificate_pins() {
 }
 
 #[test]
-fn selected_names_resolve_to_four_distinct_templates_and_only_documented_aliases() {
+fn selected_names_resolve_to_four_distinct_fixed_templates() {
     for protocol in ["anytls", "trojan", "vmess", "vless"] {
         let mut templates = Vec::new();
-        for name in ["chrome", "chrome120", "firefox", "safari"] {
+        for (name, expected) in [
+            ("chrome", ClientFingerprint::Chrome133),
+            ("firefox", ClientFingerprint::Firefox120),
+            ("safari", ClientFingerprint::Safari16),
+            ("ios", ClientFingerprint::Ios14),
+        ] {
             let config = Config::parse_yaml(
                 yaml(protocol, &format!("client-fingerprint: {name}")).as_bytes(),
             )
             .unwrap();
             let selected = profile(&config).expect("enabled profile");
+            assert_eq!(selected, expected);
             assert!(
                 !templates.contains(&selected),
                 "{name} cannot reuse another template"
             );
             templates.push(selected);
-        }
-        for (alias, template) in [("firefox120", templates[2]), ("safari16", templates[3])] {
-            let config = Config::parse_yaml(
-                yaml(protocol, &format!("client-fingerprint: {alias}")).as_bytes(),
-            )
-            .unwrap();
-            assert_eq!(profile(&config), Some(template));
         }
     }
 }
@@ -119,7 +121,6 @@ fn selected_names_resolve_to_four_distinct_templates_and_only_documented_aliases
 #[test]
 fn download_fingerprint_inherits_and_can_be_cleared_independently() {
     for (name, template) in [
-        ("chrome120", ClientFingerprint::Chrome120),
         ("chrome", ClientFingerprint::Chrome133),
         ("firefox", ClientFingerprint::Firefox120),
         ("safari", ClientFingerprint::Safari16),
@@ -139,15 +140,11 @@ fn download_fingerprint_inherits_and_can_be_cleared_independently() {
                 Some(ClientFingerprint::Chrome133),
             ),
             (
-                "\n        client-fingerprint: chrome120",
-                Some(ClientFingerprint::Chrome120),
-            ),
-            (
-                "\n        client-fingerprint: firefox120",
+                "\n        client-fingerprint: firefox",
                 Some(ClientFingerprint::Firefox120),
             ),
             (
-                "\n        client-fingerprint: safari16",
+                "\n        client-fingerprint: safari",
                 Some(ClientFingerprint::Safari16),
             ),
         ] {
@@ -194,6 +191,9 @@ fn download_fingerprint_inherits_and_can_be_cleared_independently() {
             "[]",
             "{}",
             "Chrome",
+            "chrome120",
+            "firefox120",
+            "safari16",
             "chrome133",
             "safari16.0",
         ] {
@@ -211,7 +211,6 @@ fn download_fingerprint_inherits_and_can_be_cleared_independently() {
 #[test]
 fn reality_accepts_named_profile_without_admitting_certificate_policy() {
     for (name, expected) in [
-        ("chrome120", Some(ClientFingerprint::Chrome120)),
         ("chrome", Some(ClientFingerprint::Chrome133)),
         ("firefox", Some(ClientFingerprint::Firefox120)),
         ("safari", Some(ClientFingerprint::Safari16)),
@@ -253,7 +252,6 @@ fn ios_and_process_random_fingerprint_use_the_shared_entries() {
             ClientFingerprint::Safari16 => 1,
             ClientFingerprint::Ios14 => 2,
             ClientFingerprint::Firefox120 => 3,
-            ClientFingerprint::Chrome120 => panic!("random selected a fixed old Chrome"),
         }] += 1;
     }
     assert_eq!(counts, [6, 3, 2, 1]);

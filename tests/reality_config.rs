@@ -49,7 +49,7 @@ fn public_reality_rejects_profiles_without_the_required_hybrid_share() {
         "SECURITY-CONFIG-TLS",
         "public_reality_rejects_profiles_without_the_required_hybrid_share",
     );
-    for profile in ["chrome120", "firefox", "firefox120", "safari", "safari16"] {
+    for profile in ["firefox", "safari", "ios"] {
         let mut node = proxy();
         node["client-fingerprint"] = json!(profile);
         assert!(
@@ -150,15 +150,7 @@ fn classic_default_and_explicit_false_preserve_all_existing_profiles() {
         "SECURITY-CONFIG-TLS",
         "classic_default_and_explicit_false_preserve_all_existing_profiles",
     );
-    for profile in [
-        "none",
-        "chrome",
-        "chrome120",
-        "firefox",
-        "firefox120",
-        "safari",
-        "safari16",
-    ] {
+    for profile in ["none", "chrome", "firefox", "safari", "ios", "random"] {
         for explicit in [false, true] {
             let mut node = split_proxy();
             node["client-fingerprint"] = json!(profile);

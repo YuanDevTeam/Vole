@@ -30,10 +30,10 @@ async fn cancelled_shadowtls_handshakes_release_io_and_never_reuse_authenticated
         let mut seen = HashSet::new();
         for profile in [
             None,
-            Some(Chrome120),
             Some(Chrome133),
             Some(Firefox120),
             Some(Safari16),
+            Some(Ios14),
         ] {
             let client = ShadowTlsClient::new(&SecurityContext::new(), &options(profile)).unwrap();
             for _ in 0..4 {
