@@ -1,18 +1,19 @@
-use super::{ConnectionFactory, datagram::Registry, packet};
+use super::{ConnectionFactory, datagram::Registry, packet, resolver};
 use crate::{
-    config::MasqueOutboundConfig,
+    config::{MasqueNetwork, MasqueOutboundConfig},
     dispatch::DispatchError,
     dns::resolution::ResolutionContext,
     outbound::{DEFAULT_ESTABLISH_TIMEOUT, EstablishContext},
     resources::observation,
+    security::SecurityContext,
     session::{Destination, StreamSession},
-    transport::{h3_connect, masque_codec as codec},
+    transport::{GrpcPool, h3_connect, masque_codec as codec},
 };
 use bytes::Bytes;
 use std::{
     io,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -35,6 +36,10 @@ enum Ready {
 }
 
 pub(super) struct Engine {
+    pub config: Arc<MasqueOutboundConfig>,
+    pub security: SecurityContext,
+    pub resolution: ResolutionContext,
+    pub remote: OnceLock<Arc<crate::dns::runtime::RuntimeDns>>,
     pub client: ClientConfig,
     pub mtu: usize,
     pub cancel: CancellationToken,
@@ -47,10 +52,13 @@ pub(super) struct Engine {
     stop: AsyncMutex<()>,
 }
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         config: Arc<MasqueOutboundConfig>,
         factory: Arc<ConnectionFactory>,
         pool: Arc<h3_connect::Pool>,
+        h2_pool: Arc<GrpcPool>,
+        security: SecurityContext,
         session: StreamSession,
         context: EstablishContext,
         cancel: CancellationToken,
@@ -87,6 +95,10 @@ impl Engine {
         let (ready_sender, ready) = watch::channel(Ready::Pending);
         let registry = Arc::new(Registry::default());
         let engine = Arc::new(Self {
+            config: config.clone(),
+            security,
+            resolution: context.resolution(),
+            remote: OnceLock::new(),
             client,
             mtu,
             cancel: cancel.clone(),
@@ -103,7 +115,7 @@ impl Engine {
         *engine.job.try_lock().unwrap() = Some(observation::spawn(async move {
             let result = tokio::select! {biased;
                 ()=cancel.cancelled()=>Err(closed()),
-                result=run(config,factory,pool,session,context,client,packet_sink,packet_stream,output,registry,&ready_sender)=>result,
+                result=run(config,factory,pool,h2_pool,session,context,client,packet_sink,packet_stream,output,registry,&ready_sender)=>result,
             };
             let _ = result;
             ready_sender.send_replace(Ready::Failed);
@@ -128,31 +140,33 @@ impl Engine {
             }
         }).await
     }
+    pub(super) fn initializing(&self) -> bool {
+        *self.ready.borrow() == Ready::Pending
+    }
+    #[cfg(test)]
+    pub(super) async fn job_is_joined(&self) -> bool {
+        self.job.lock().await.is_none()
+    }
     pub fn local(&self, destination: IpAddr) -> Result<IpAddr, DispatchError> {
         self.client
             .source_for(destination)
             .map_err(DispatchError::from)
     }
     pub async fn resolve(
-        &self,
+        self: &Arc<Self>,
         target: &Destination,
         resolution: &ResolutionContext,
         deadline: Instant,
     ) -> Result<SocketAddr, DispatchError> {
-        resolution
-            .resolve_local_family(
-                target,
-                deadline,
-                self.client
-                    .prefixes()
-                    .any(|prefix| prefix.address.is_ipv4()),
-                self.client.has_ipv6(),
-            )
-            .await
+        resolver::resolve_ip(self, target, resolution, deadline).await
     }
     pub async fn stop(&self) {
         let _stop = self.stop.lock().await;
         self.cancel.cancel();
+        if let Some(remote) = self.remote.get() {
+            remote.begin_shutdown();
+            remote.shutdown().await;
+        }
         let mut job = self.job.lock().await;
         if let Some(job) = job.as_mut() {
             let _ = job.await;
@@ -165,10 +179,49 @@ impl Drop for Engine {
     fn drop(&mut self) {
         self.cancel.cancel();
         self.control.cancel();
+        if let Some(remote) = self.remote.get() {
+            remote.begin_shutdown();
+        }
         if let Some(job) = self.job.get_mut().take() {
             job.abort();
         }
     }
+}
+
+fn h2_request(uri: &str) -> io::Result<http::Request<()>> {
+    // Url normalizes explicit default ports away. Preserve the raw authority
+    // so http://host:80 stays :80 while an omitted port always uses :443.
+    let raw = uri
+        .split_once("://")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid MASQUE URI"))?
+        .1
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let raw = raw.rsplit('@').next().unwrap_or_default();
+    let authority: http::uri::Authority = raw
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid MASQUE authority"))?;
+    let authority = if authority.port().is_some() {
+        authority.to_string()
+    } else {
+        format!("{}:443", authority.host())
+    };
+    http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(
+            http::Uri::builder()
+                .authority(authority)
+                .build()
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid MASQUE authority")
+                })?,
+        )
+        .header("cf-connect-proto", "cf-connect-ip")
+        .header("pq-enabled", "false")
+        .header("user-agent", "")
+        .body(())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid MASQUE request"))
 }
 
 fn request(uri: &str) -> io::Result<http::Request<()>> {
@@ -207,6 +260,7 @@ async fn run(
     config: Arc<MasqueOutboundConfig>,
     factory: Arc<ConnectionFactory>,
     pool: Arc<h3_connect::Pool>,
+    h2_pool: Arc<GrpcPool>,
     session: StreamSession,
     context: EstablishContext,
     client: ClientConfig,
@@ -216,31 +270,77 @@ async fn run(
     registry: Arc<Registry>,
     ready: &watch::Sender<Ready>,
 ) -> io::Result<()> {
-    let request = request(&config.uri)?;
-    let setup = context.clone();
-    let mut tunnel = pool
-        .open_ip_connect(request, context.deadline(), move || async move {
-            factory.connect(session, &setup).await
-        })
-        .await?;
-    tunnel.capsules.write_all(&routes()?).await?;
-    tunnel.capsules.flush().await?;
-    if client.has_ipv6() {
-        // QUIC starts at the reference's 1242-byte UDP payload. A declared
-        // IPv6 path must demonstrate that a 1280-byte IP packet fits before
-        // publishing the stack, rather than dropping its first full segment.
-        tunnel
-            .datagrams
-            .wait_packet_budget(1280, context.deadline())
+    enum Tunnel {
+        H2(crate::dispatch::BoxStream),
+        H3(h3_connect::IpConnect),
+    }
+    let tunnel = tokio::time::timeout_at(context.deadline(), async {
+        let setup = context.clone();
+        if config.network == MasqueNetwork::H2 {
+            let request = h2_request(&config.uri)?;
+            let io = h2_pool
+                .open_connect_admitted(request, context.deadline(), move || async move {
+                    factory.connect_h2(session, &setup).await
+                })
+                .await?;
+            return Ok(Tunnel::H2(io));
+        }
+        let request = request(&config.uri)?;
+        let mut tunnel = pool
+            .open_ip_connect(request, context.deadline(), move || async move {
+                factory.connect(session, &setup).await
+            })
             .await?;
+        tunnel.capsules.write_all(&routes()?).await?;
+        tunnel.capsules.flush().await?;
+        if client.has_ipv6() {
+            tunnel
+                .datagrams
+                .wait_packet_budget(1280, context.deadline())
+                .await?;
+        }
+        Ok::<_, io::Error>(Tunnel::H3(tunnel))
+    })
+    .await
+    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+    if Instant::now() >= context.deadline() {
+        return Err(io::ErrorKind::TimedOut.into());
     }
     ready.send_replace(Ready::Open);
-    tokio::try_join!(
-        pump_output(packets, output, &tunnel.datagrams, &sink),
-        pump_input(&tunnel.datagrams, &sink, &registry, &client),
-        pump_capsules(tunnel.capsules, &sink, &registry, &client),
-    )?;
+    match tunnel {
+        Tunnel::H2(io) => {
+            let (read, write) = tokio::io::split(io);
+            tokio::try_join!(
+                pump_h2_output(packets, output, write),
+                pump_capsules(read, &sink, &registry, &client, true)
+            )?;
+        }
+        Tunnel::H3(tunnel) => {
+            tokio::try_join!(
+                pump_output(packets, output, &tunnel.datagrams, &sink),
+                pump_input(&tunnel.datagrams, &sink, &registry, &client),
+                pump_capsules(tunnel.capsules, &sink, &registry, &client, false),
+            )?;
+        }
+    }
     Err(closed())
+}
+async fn pump_h2_output<W: tokio::io::AsyncWrite + Unpin>(
+    mut packets: PacketStream,
+    mut udp: mpsc::Receiver<Packet>,
+    mut writer: W,
+) -> io::Result<()> {
+    loop {
+        let packet = tokio::select! {
+            packet=packets.recv()=>packet.ok_or_else(closed)?,
+            packet=udp.recv()=>packet.ok_or_else(closed)?,
+        };
+        if let Some(bytes) = packet::outgoing(packet.into_bytes()) {
+            let capsule = codec::encode_capsule(codec::DATAGRAM, &bytes, MAX_RECEIVE_PACKET_SIZE)?;
+            writer.write_all(&capsule).await?;
+            writer.flush().await?;
+        }
+    }
 }
 async fn pump_output(
     mut packets: PacketStream,
@@ -317,11 +417,12 @@ async fn pump_input(
         deliver(datagrams.receive().await?, sink, registry, client).await?;
     }
 }
-async fn pump_capsules(
-    mut stream: crate::dispatch::BoxStream,
+async fn pump_capsules<R: tokio::io::AsyncRead + Unpin>(
+    mut stream: R,
     sink: &PacketSink,
     registry: &Registry,
     client: &ClientConfig,
+    h2: bool,
 ) -> io::Result<()> {
     let mut decoder = codec::CapsuleDecoder::new(MAX_RECEIVE_PACKET_SIZE);
     let mut chunk = [0u8; crate::transport::STREAM_CHUNK_BYTES];
@@ -340,17 +441,11 @@ async fn pump_capsules(
             input = &input[consumed..];
             let Some(capsule) = capsule else { continue };
             match capsule.kind {
-                codec::DATAGRAM => {
-                    let (context, len) =
-                        codec::decode_varint(&capsule.value)?.ok_or_else(closed)?;
-                    if context == 0 {
-                        deliver(capsule.value.slice(len..), sink, registry, client).await?;
-                    }
-                }
-                codec::ADDRESS_ASSIGN | codec::ADDRESS_REQUEST => {
+                codec::DATAGRAM if h2 => deliver(capsule.value, sink, registry, client).await?,
+                codec::ADDRESS_ASSIGN | codec::ADDRESS_REQUEST if !h2 => {
                     codec::parse_addresses(capsule.kind, &capsule.value, CONTROL_ENTRIES)?;
                 }
-                codec::ROUTE_ADVERTISEMENT => {
+                codec::ROUTE_ADVERTISEMENT if !h2 => {
                     codec::parse_routes(&capsule.value, CONTROL_ENTRIES)?;
                 }
                 _ => {}
@@ -363,8 +458,36 @@ fn closed() -> io::Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    pub(crate) fn test_config() -> Arc<MasqueOutboundConfig> {
+        Arc::new(MasqueOutboundConfig {
+            address: "example.invalid".into(),
+            port: 443,
+            private_key: String::new(),
+            public_key: String::new(),
+            server_name: "example.invalid".into(),
+            network: MasqueNetwork::H2,
+            ip: "192.0.2.2".into(),
+            ipv6: String::new(),
+            uri: "https://example.invalid".into(),
+            mtu: 1280,
+            udp: true,
+            handshake_timeout: 0,
+            skip_cert_verify: false,
+            name_cert_verify: String::new(),
+            congestion_controller: String::new(),
+            cwnd: 0,
+            bbr_profile: String::new(),
+            ip_stack: crate::config::MasqueIpStackOptions {
+                mode: "auto".into(),
+                congestion_controller: String::new(),
+            },
+            remote_dns_resolve: false,
+            dns: Vec::new(),
+            local_prefixes: [Some((IpAddr::from([192, 0, 2, 2]), 32)), None],
+        })
+    }
     #[test]
     fn masque_ip_request_and_full_routes_use_cf_wire_contract() {
         let request = request("https://example.invalid:443/tunnel?x=1#ignored").unwrap();
@@ -410,6 +533,10 @@ mod tests {
             let _ = work.await;
         });
         let engine = Engine {
+            config: test_config(),
+            security: SecurityContext::default(),
+            resolution: ResolutionContext::default(),
+            remote: OnceLock::new(),
             client,
             mtu: 1500,
             cancel: CancellationToken::new(),
@@ -429,5 +556,24 @@ mod tests {
         release.send(()).unwrap();
         engine.stop().await;
         assert!(engine.job.try_lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn masque_h2_authority_and_headers_preserve_mode_contract() {
+        for (uri, authority) in [
+            ("https://example.invalid/path?x=1", "example.invalid:443"),
+            ("http://example.invalid:80/path", "example.invalid:80"),
+            ("http://example.invalid/path", "example.invalid:443"),
+            ("https://[2001:db8::1]/path", "[2001:db8::1]:443"),
+        ] {
+            let request = h2_request(uri).unwrap();
+            assert_eq!(request.uri().authority().unwrap().as_str(), authority);
+            assert!(request.uri().scheme().is_none());
+            assert!(request.uri().path_and_query().is_none());
+            assert_eq!(request.headers()["cf-connect-proto"], "cf-connect-ip");
+            assert_eq!(request.headers()["pq-enabled"], "false");
+            assert!(request.headers().get("capsule-protocol").is_none());
+            assert!(request.extensions().get::<h3::ext::Protocol>().is_none());
+        }
     }
 }

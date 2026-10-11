@@ -27,6 +27,8 @@ enum RequestKind<'a> {
     Grpc(&'a str),
     #[cfg(feature = "outbound-trusttunnel")]
     Connect(http::Request<()>, Option<Arc<dyn Fn() + Send + Sync>>),
+    #[cfg(feature = "outbound-masque")]
+    ConnectAdmitted(http::Request<()>),
 }
 
 pub struct GrpcPool {
@@ -61,6 +63,15 @@ impl GrpcPool {
         });
         pool.idle_timeout = Some(Duration::from_secs(30));
         pool
+    }
+    #[cfg(feature = "outbound-masque")]
+    pub(crate) fn masque_ip() -> Self {
+        Self::new(GrpcOptions {
+            max_connections: 1,
+            min_streams: 0,
+            ping_interval: 30,
+            ..Default::default()
+        })
     }
     /// Trojan keeps its response and lease after upload END_STREAM.
     #[cfg(any(test, feature = "outbound-trojan"))]
@@ -118,6 +129,20 @@ impl GrpcPool {
             connect,
         )
         .await
+    }
+    #[cfg(feature = "outbound-masque")]
+    pub(crate) async fn open_connect_admitted<F, Fut>(
+        &self,
+        request: http::Request<()>,
+        deadline: Instant,
+        connect: F,
+    ) -> io::Result<BoxStream>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<BoxStream>>,
+    {
+        self.open_request(RequestKind::ConnectAdmitted(request), deadline, connect)
+            .await
     }
     #[cfg(feature = "outbound-trusttunnel")]
     pub(crate) async fn probe<F, Fut>(
@@ -179,6 +204,10 @@ impl GrpcPool {
                         tokio::select! {biased; ()=cancellation.cancelled()=>{}, ()=response=>{}}
                     }));
                     Ok(stream)
+                }
+                #[cfg(feature = "outbound-masque")]
+                RequestKind::ConnectAdmitted(request) => {
+                    super::grpc::pooled_connect_admitted(sender, request, deadline, lease).await
                 }
             }
         };
@@ -346,6 +375,246 @@ mod tests {
     use super::*;
     use crate::resources::observation::{ResourceKind, ResourceProbe};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(feature = "outbound-masque")]
+    struct MasqueRequest {
+        receive: h2::RecvStream,
+        response: h2::server::SendResponse<bytes::Bytes>,
+    }
+
+    #[cfg(feature = "outbound-masque")]
+    fn masque_request(authority: &str) -> http::Request<()> {
+        http::Request::builder()
+            .method("CONNECT")
+            .uri(http::Uri::builder().authority(authority).build().unwrap())
+            .header("cf-connect-proto", "cf-connect-ip")
+            .header("pq-enabled", "false")
+            .header("user-agent", "")
+            .body(())
+            .unwrap()
+    }
+
+    #[cfg(feature = "outbound-masque")]
+    async fn masque_peer(
+        peer: tokio::io::DuplexStream,
+        requests: tokio::sync::mpsc::Sender<MasqueRequest>,
+    ) {
+        let mut connection = h2::server::handshake(peer).await.unwrap();
+        while let Some(Ok((request, response))) = connection.accept().await {
+            assert_eq!(request.method(), "CONNECT");
+            assert!(request.uri().scheme().is_none());
+            assert!(request.extensions().get::<h2::ext::Protocol>().is_none());
+            assert_eq!(request.headers()["cf-connect-proto"], "cf-connect-ip");
+            assert_eq!(request.headers()["pq-enabled"], "false");
+            assert_eq!(request.headers()["user-agent"], "");
+            assert!(!request.headers().contains_key("capsule-protocol"));
+            if requests
+                .send(MasqueRequest {
+                    receive: request.into_body(),
+                    response,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    #[cfg(feature = "outbound-masque")]
+    #[tokio::test(start_paused = true)]
+    async fn masque_h2_admission_preserves_data_and_sibling_until_joined_stop() {
+        let observation = ResourceProbe::default();
+        observation
+            .scope(async {
+                let peers = TaskTracker::new();
+                let pool = GrpcPool::masque_ip();
+                let count = AtomicUsize::new(0);
+                let (requests, mut accepted) = tokio::sync::mpsc::channel(4);
+                let factory = || async {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let (raw, peer) = tokio::io::duplex(65536);
+                    peers.spawn(masque_peer(peer, requests.clone()));
+                    Ok(Box::new(raw) as BoxStream)
+                };
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("first.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let mut first_peer = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                std::future::poll_fn(|cx| {
+                    assert!(opening.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                let mut first_send = first_peer
+                    .response
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                first_send
+                    .send_data(bytes::Bytes::from_static(b"server-first"), false)
+                    .unwrap();
+                let mut first = opening.await.unwrap();
+                tokio::time::advance(Duration::from_secs(6)).await;
+                let mut prefix = [0; 12];
+                first.read_exact(&mut prefix).await.unwrap();
+                assert_eq!(&prefix, b"server-first");
+
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("sibling.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let mut sibling_peer = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                let mut sibling_send = sibling_peer
+                    .response
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                let mut sibling = opening.await.unwrap();
+
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("reject.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let mut rejected = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                let _rejected_send = rejected
+                    .response
+                    .send_response(
+                        http::Response::builder().status(201).body(()).unwrap(),
+                        false,
+                    )
+                    .unwrap();
+                assert_eq!(opening.await.err().unwrap().kind(), io::ErrorKind::InvalidData);
+                assert!(rejected.receive.data().await.unwrap().is_err());
+
+                first.write_all(b"past-deadline").await.unwrap();
+                first.flush().await.unwrap();
+                let upload = first_peer.receive.data().await.unwrap().unwrap();
+                assert_eq!(upload.as_ref(), b"past-deadline");
+                first_peer
+                    .receive
+                    .flow_control()
+                    .release_capacity(upload.len())
+                    .unwrap();
+                first.shutdown().await.unwrap();
+                assert!(first_peer.receive.data().await.unwrap().is_err());
+                sibling_send
+                    .send_data(bytes::Bytes::from_static(b"alive"), false)
+                    .unwrap();
+                let mut echo = [0; 5];
+                sibling.read_exact(&mut echo).await.unwrap();
+                assert_eq!(&echo, b"alive");
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+                assert_eq!(observation.snapshot().current(ResourceKind::Task), 1);
+                pool.shutdown().await;
+                assert!(pool.tasks.is_empty());
+                assert_eq!(observation.snapshot().current(ResourceKind::Task), 0);
+                assert!(sibling.write_all(b"stopped").await.is_err());
+                drop(first);
+                drop(sibling);
+                drop(first_send);
+                drop(sibling_send);
+                peers.close();
+                peers.wait().await;
+            })
+            .await;
+        assert!(observation.snapshot().is_idle());
+    }
+
+    #[cfg(feature = "outbound-masque")]
+    #[tokio::test(start_paused = true)]
+    async fn masque_h2_cancel_timeout_and_stop_reset_pending_admission() {
+        let observation = ResourceProbe::default();
+        observation
+            .scope(async {
+                let peers = TaskTracker::new();
+                let pool = GrpcPool::masque_ip();
+                let count = AtomicUsize::new(0);
+                let (requests, mut accepted) = tokio::sync::mpsc::channel(4);
+                let factory = || async {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let (raw, peer) = tokio::io::duplex(65536);
+                    peers.spawn(masque_peer(peer, requests.clone()));
+                    Ok(Box::new(raw) as BoxStream)
+                };
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("cancel.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let mut cancelled = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                drop(opening);
+                assert!(cancelled.receive.data().await.unwrap().is_err());
+
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("timeout.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let mut expired = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                tokio::time::advance(Duration::from_secs(6)).await;
+                assert_eq!(opening.await.err().unwrap().kind(), io::ErrorKind::TimedOut);
+                assert!(expired.receive.data().await.unwrap().is_err());
+
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("late-ready.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let mut late = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                let _late_send = late
+                    .response
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                // Let the independent driver process an accepted response,
+                // but do not poll admission again until setup has expired.
+                tokio::time::advance(Duration::from_secs(6)).await;
+                assert_eq!(opening.await.err().unwrap().kind(), io::ErrorKind::TimedOut);
+                assert!(late.receive.data().await.unwrap().is_err());
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("stop.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let _stopped = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                pool.shutdown().await;
+                assert_eq!(
+                    opening.await.err().unwrap().kind(),
+                    io::ErrorKind::ConnectionAborted
+                );
+                assert!(pool.tasks.is_empty());
+                assert_eq!(observation.snapshot().current(ResourceKind::Task), 0);
+                peers.close();
+                peers.wait().await;
+            })
+            .await;
+        assert!(observation.snapshot().is_idle());
+    }
 
     #[cfg(feature = "outbound-trusttunnel")]
     #[tokio::test]

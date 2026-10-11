@@ -231,10 +231,34 @@ impl EstablishContext {
         }
     }
 
-    #[cfg(feature = "outbound-wireguard")]
+    #[cfg(any(feature = "outbound-wireguard", feature = "outbound-masque"))]
     pub(crate) fn with_metadata(mut self, metadata: &crate::session::InboundMetadata) -> Self {
         self.inbound = metadata.clone();
         self
+    }
+
+    /// MASQUE's positive timeout owns shared creation independently of a
+    /// waiting caller. Preserve its selected upstreams and inbound identity.
+    #[cfg(feature = "outbound-masque")]
+    pub(crate) fn masque_handshake(&self, seconds: i64) -> Self {
+        // Go's time.Duration multiplication wraps at signed nanoseconds.
+        let nanos = seconds.wrapping_mul(1_000_000_000);
+        let now = Instant::now();
+        Self {
+            deadline: if nanos > 0 {
+                now + Duration::from_nanos(nanos as u64)
+            } else {
+                now
+            },
+            resolution: self.resolution.clone(),
+            selections: Arc::new(Mutex::new(
+                self.selections
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            )),
+            inbound: self.inbound.clone(),
+        }
     }
 
     #[cfg(any(feature = "outbound-wireguard", feature = "outbound-hysteria2"))]

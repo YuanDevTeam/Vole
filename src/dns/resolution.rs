@@ -212,12 +212,12 @@ impl ResolutionContext {
             .ok_or(DispatchError::HostUnreachable)
     }
 
-    #[cfg(feature = "outbound-wireguard")]
+    #[cfg(any(feature = "outbound-wireguard", feature = "outbound-masque"))]
     pub(crate) fn ipv6_allowed(&self) -> bool {
         self.inner.as_ref().is_none_or(|state| state.ipv6)
     }
 
-    #[cfg(feature = "outbound-wireguard")]
+    #[cfg(any(feature = "outbound-wireguard", feature = "outbound-masque"))]
     pub(crate) async fn resolve_node_local(
         &self,
         target: &Destination,

@@ -1133,7 +1133,7 @@ impl RuntimeDns {
 
     /// A raw-IP node's private resolver uses its own data plane, while DNS
     /// server domains bootstrap through the Core's original proxy DNS role.
-    #[cfg(feature = "outbound-wireguard")]
+    #[cfg(any(feature = "outbound-wireguard", feature = "outbound-masque"))]
     pub(crate) fn new_for_node(
         config: &DnsConfig,
         dispatcher: Arc<dyn Dispatcher>,
@@ -1161,6 +1161,34 @@ impl RuntimeDns {
         let stats = Arc::get_mut(&mut pool.stats).expect("fresh node DNS counters");
         stats.idle_limit = 0;
         stats.idle_per_key_limit = 0;
+        resolver
+    }
+
+    /// MASQUE keeps special system/DHCP sources physical. Share only an
+    /// already protected runtime source and register the private cache without
+    /// retaining that runtime or a retired resource generation.
+    #[cfg(feature = "outbound-masque")]
+    pub(crate) fn new_for_masque_node(
+        config: &DnsConfig,
+        dispatcher: Arc<dyn Dispatcher>,
+        bootstrap: super::resolution::ResolutionContext,
+        security: crate::security::SecurityContext,
+    ) -> Arc<Self> {
+        let physical = config
+            .nameservers
+            .iter()
+            .any(|nameserver| matches!(nameserver.address, DnsAddress::Source(_)))
+            .then(|| bootstrap.runtime_dns())
+            .flatten();
+        let mut resolver = Self::new_for_node(config, dispatcher, bootstrap, security);
+        if let Some(physical) = physical.filter(|resolver| resolver.source_dialer.is_some()) {
+            resolver.sources = physical.sources.clone();
+            resolver.source_dialer = physical.source_dialer.clone();
+            resolver.source_exclusions = physical.source_exclusions.clone();
+            resolver.share_cache_epoch(physical.cache_epoch.clone());
+        }
+        let resolver = Arc::new(resolver);
+        resolver.sources.register(&resolver);
         resolver
     }
 
@@ -6820,6 +6848,151 @@ dns:
                 requires_encryption: false,
             }],
         }
+    }
+
+    #[cfg(feature = "outbound-masque")]
+    #[tokio::test]
+    async fn masque_node_dns_sources_share_exclusions_and_invalidate_private_cache() {
+        use super::super::source::SourceExclusions;
+        use crate::config::DnsSource;
+        let dispatcher = Arc::new(MockDispatcher::default());
+        let mut configuration = config(false, vec![nameserver(1, DnsTransport::Udp)]);
+        configuration.use_system_hosts = false;
+        let physical = Arc::new(
+            RuntimeDns::new(&configuration, dispatcher.clone()).with_network_sources(
+                crate::dialer::Dialer::default(),
+                SourceExclusions {
+                    interface: Some("physical1".into()),
+                    addresses: vec!["203.0.113.53".parse().unwrap()],
+                },
+            ),
+        );
+        let sources = physical.network_sources();
+        sources.register(&physical);
+        sources
+            .replace(dns_source_snapshot(1, "203.0.113.53"))
+            .await
+            .unwrap();
+        let bootstrap = super::super::resolution::ResolutionContext::runtime(false);
+        bootstrap.bind_runtime(Some(&physical)).unwrap();
+        configuration.nameservers = vec![DnsNameserver {
+            address: DnsAddress::Source(DnsSource::System),
+            ..nameserver(1, DnsTransport::Udp)
+        }];
+        let private = RuntimeDns::new_for_masque_node(
+            &configuration,
+            dispatcher.clone(),
+            bootstrap,
+            crate::security::SecurityContext::new(),
+        );
+        assert!(Arc::ptr_eq(&sources, &private.sources));
+        assert!(Arc::ptr_eq(&physical.cache_epoch, &private.cache_epoch));
+        assert!(private.source_dialer.is_some());
+        assert!(
+            private
+                .sources
+                .select(&DnsSource::System, None, &private.source_exclusions)
+                .await
+                .is_err()
+        );
+        assert!(
+            private
+                .sources
+                .select(
+                    &DnsSource::Dhcp("physical1".into()),
+                    None,
+                    &private.source_exclusions
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(private.tcp_pool.max_idle, 0);
+        assert_eq!(private.tcp_pool.max_idle_per_key, 0);
+
+        let now = Instant::now();
+        for resolver in [physical.as_ref(), private.as_ref()] {
+            resolver
+                .cache
+                .lock()
+                .await
+                .insert(
+                    "cached.example",
+                    QueryType::A,
+                    CacheValue::Positive(vec!["192.0.2.10".parse().unwrap()]),
+                    60,
+                    now,
+                )
+                .unwrap();
+        }
+        let epoch = *private.cache_epoch.read().await;
+        sources
+            .replace(dns_source_snapshot(2, "203.0.113.54"))
+            .await
+            .unwrap();
+        assert_eq!(*private.cache_epoch.read().await, epoch.wrapping_add(1));
+        assert!(physical.cache.lock().await.is_empty());
+        assert!(private.cache.lock().await.is_empty());
+        let selected = private
+            .sources
+            .select(&DnsSource::System, None, &private.source_exclusions)
+            .await
+            .unwrap();
+        assert_eq!(
+            selected.endpoints[0].endpoint.ip(),
+            "203.0.113.54".parse::<IpAddr>().unwrap()
+        );
+        let weak = Arc::downgrade(&private);
+        drop(private);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 0);
+        assert_eq!(dispatcher.tcp_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(feature = "outbound-masque")]
+    #[tokio::test]
+    async fn masque_node_dns_requires_a_physical_owner_to_inherit_sources() {
+        let dispatcher = Arc::new(MockDispatcher::default());
+        let mut configuration = config(false, vec![nameserver(1, DnsTransport::Udp)]);
+        configuration.use_system_hosts = false;
+        let unbound = Arc::new(RuntimeDns::new(&configuration, dispatcher.clone()));
+        unbound
+            .sources
+            .replace(dns_source_snapshot(1, "203.0.113.53"))
+            .await
+            .unwrap();
+        let bootstrap = super::super::resolution::ResolutionContext::runtime(false);
+        bootstrap.bind_runtime(Some(&unbound)).unwrap();
+        configuration.nameservers[0].address = DnsAddress::Source(crate::config::DnsSource::System);
+        let private = RuntimeDns::new_for_masque_node(
+            &configuration,
+            dispatcher,
+            bootstrap,
+            crate::security::SecurityContext::new(),
+        );
+        assert!(!Arc::ptr_eq(&unbound.sources, &private.sources));
+        assert!(private.source_dialer.is_none());
+        assert!(
+            private
+                .sources
+                .select(
+                    &crate::config::DnsSource::System,
+                    None,
+                    &private.source_exclusions
+                )
+                .await
+                .is_err()
+        );
+        let owner = Arc::downgrade(&unbound);
+        drop(unbound);
+        assert!(owner.upgrade().is_none());
+        assert!(
+            private
+                .node_bootstrap
+                .as_ref()
+                .unwrap()
+                .runtime_dns()
+                .is_none()
+        );
     }
 
     #[tokio::test]

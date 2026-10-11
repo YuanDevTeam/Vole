@@ -379,6 +379,56 @@ pub(super) async fn connect_probe(
     }
 }
 
+/// CONNECT-IP is usable only after the peer has accepted its request. Keep
+/// the logical stream owned while awaiting headers so cancellation resets only
+/// this request, and leave its first DATA frame for the caller.
+#[cfg(feature = "outbound-masque")]
+pub(super) async fn pooled_connect_admitted(
+    sender: Sender,
+    request: http::Request<()>,
+    deadline: Instant,
+    lease: super::grpc_pool::Lease,
+) -> io::Result<BoxStream> {
+    let writes = sender.writes;
+    let mut sender = timeout_at(deadline, sender.request.ready())
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+        .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
+    let (response, send) = sender.send_request(request, false).map_err(|_| invalid())?;
+    let mut stream = Grpc::new(
+        response,
+        send,
+        Framing::Plain,
+        false,
+        deadline,
+        Arc::default(),
+        None,
+        Some(lease),
+        writes,
+    );
+    let response = match stream.response.take().unwrap() {
+        PendingResponse::Direct(response) => response,
+        #[cfg(feature = "outbound-trusttunnel")]
+        PendingResponse::Observed(_) => unreachable!(),
+    };
+    if Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    let response = timeout_at(deadline, response)
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+        .map_err(|_| invalid())?;
+    if Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    if response.status() != http::StatusCode::OK {
+        return Err(invalid());
+    }
+    stream.receive = Some(response.into_body());
+    stream.response_deadline = false;
+    Ok(Box::new(stream))
+}
+
 /// sing-mux uses plain HTTP/2 CONNECT streams, not gRPC records.
 #[cfg(feature = "sing-mux")]
 pub(super) async fn mux_stream(sender: Sender, deadline: Instant) -> io::Result<BoxStream> {

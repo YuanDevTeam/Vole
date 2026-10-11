@@ -125,7 +125,9 @@ Python，直接运行此检查，仅验证各自构建的产物。
 `outbound::wireguard::tests::` 在内存中交换真实 Noise 与 raw-IP 包，覆盖主动 TCP、双栈 UDP、真实握手重试、多 peer 最长前缀与 reserved、节点远端 DNS、端点更新、取消与 Stop；不打开 socket 或系统接口。
 
 `masque_` 使用内存密钥、IP/UDP 包和受控 QUIC 对端，验证模式准入、CONNECT、
-capsule、流关联、包预算及 Stop；主动栈的原始 TCP/PMTU 回归位于 `vole-netstack`。
+capsule、流关联、包预算及 Stop。实际内存 H2 双端验证响应准入、DATA 保留与取消隔离；
+节点 DNS 验证启用规则、来源继承与缓存失效，共享创建验证独立期限和取消所有权。
+主动栈的原始 TCP/PMTU 回归位于 `vole-netstack`。
 
 宿主只执行明确的纯内存过滤器；全目标使用 `--no-run`。
 `invoke::tests::` 含监听器用例，不可整体在宿主执行；可执行过滤器以

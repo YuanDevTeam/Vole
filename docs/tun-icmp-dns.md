@@ -115,7 +115,7 @@ dns:
 ### Endpoint
 
 - `dns.enable`、`dns.ipv6` 默认 false。主 nameserver 默认使用 DoH/DoT，可显式替换为非空列表。
-- 接受裸 IPv4/IPv6、`udp://`、`tcp://`、`tls://`、`https://`、`http://` 和 `quic://`。加密连接复用会话的内置、可读系统与 `tls.custom-certifactes` 信任根；各解析角色及 WireGuard 私有 DNS 同样适用，平台边界见 [TLS 契约](tls-client-fingerprint.md)。HTTPS 根据实际 ALPN 使用 HTTP/2 或 HTTP/1.1；没有 ALPN 时使用 HTTP/1.1。明文 HTTP 仅支持 HTTP/1.1，不启用 h2c。
+- 接受裸 IPv4/IPv6、`udp://`、`tcp://`、`tls://`、`https://`、`http://` 和 `quic://`。加密连接复用会话的内置、可读系统与 `tls.custom-certifactes` 信任根；各解析角色及 WireGuard/MASQUE 私有 DNS 同样适用，平台边界见 [TLS 契约](tls-client-fingerprint.md)。HTTPS 根据实际 ALPN 使用 HTTP/2 或 HTTP/1.1；没有 ALPN 时使用 HTTP/1.1。明文 HTTP 仅支持 HTTP/1.1，不启用 h2c。
 - `rcode://success`、`rcode://format_error`、`rcode://server_failure`、`rcode://name_error`、`rcode://not_implemented`、`rcode://refused` 分别返回本地 RCODE 0–5；可用于 nameserver、policy、fallback、节点和直连 resolver，不能用于 default-nameserver。
 - 同一个上游列表中存在本地 RCODE 时使用第一项本地响应，不建立网络连接，也不把 SERVFAIL/REFUSED 当作上游故障重试。响应保留原查询的 flags 和 additional，仅设置 QR 与 RCODE；不额外开启 RA，不写入结果缓存。
 - `dns.ipv6: false` 不限制 IPv6 nameserver；顶层 `ipv6: false` 会阻止通过 DIRECT（含 `RULES` 选中 DIRECT）的 IPv6 nameserver 在本机物理建链，并继续当前组的故障转移。
@@ -170,7 +170,7 @@ H1/H2/H3 的请求及响应头各限 16 KiB，DNS body 仍限 4,096 字节。
 第一条成功连接用于查询；某条先失败时继续等待另一条，取消输家并等待其资源清理。
 复用已选连接，H1/H2 的版本选择最多保留 4 项、空闲 30 秒，失败后重新选择；不为每次查询重新探测。
 `https://…#h3=true` 仅建立 H3，失败不能降级；明文 HTTP 的 h3/prefer-h3 不改变 H1 行为。
-bootstrap、主、节点和直连 DNS 角色均应用全局 prefer-h3；WireGuard 私有 DNS 与固定参考一致，
+bootstrap、主、节点和直连 DNS 角色均应用全局 prefer-h3；WireGuard/MASQUE 私有 DNS 与固定参考一致，
 不继承全局偏好，但支持 URL `h3=true`。H3 共用 GET/Basic/ID 与包装，不启用 0-RTT。
 
 ### DoQ
@@ -343,7 +343,7 @@ TCP、DoT 和 DoH 使用解析器所属的连接池：
 - 非法、截断或超限响应不重试、不归还连接。
 
 HTTP/2 单流取消发送 RST，其他流可继续使用原连接；响应错误使该连接不再接受新查询。
-解析器拥有连接 driver 与有界空闲回收任务，Session Stop 和资源代际退役关闭全部解析角色并等待 driver 结束；WireGuard 私有 DNS 同样由节点 Stop 关闭且不保留空闲连接。
+解析器拥有连接 driver 与有界空闲回收任务，Session Stop 和资源代际退役关闭全部解析角色并等待 driver 结束；WireGuard/MASQUE 私有 DNS 同样由节点 Stop 关闭且不保留空闲连接。MASQUE IP 查询经过节点内部栈，L4 仅可使用 TCP DNS 传输；system/DHCP 始终沿物理来源策略，不因节点模式改变出口。
 DoQ/H3 的取消和退役先关闭 endpoint，最多等待一秒 QUIC close exchange，随后停止并等待 Quinn runtime 与受控 datagram driver；初始化探测同样属于此 Stop 所有权。
 
 Controller 切换代理组后，只在后续需要创建新 DNS transport 时使用新选择。类型化/原始响应 cache、singleflight 状态和已经位于 TCP pool 中的 transport 不清空、不迁移；因此命中 cache 或复用既有 TCP transport 时，不会为切换单独建链。停止 session 才统一释放这些状态。

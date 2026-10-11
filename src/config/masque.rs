@@ -1,5 +1,7 @@
 //! MASQUE's mode-specific Mihomo fields and dedicated ECDSA key policy.
-use super::{ProxyProtocol, deserialize_present_option, invalid, validate_host, validate_port};
+use super::{
+    DnsNameserver, ProxyProtocol, deserialize_present_option, invalid, validate_host, validate_port,
+};
 use crate::Result;
 use serde::Deserialize;
 
@@ -41,7 +43,7 @@ pub struct MasqueOutboundConfig {
     pub bbr_profile: String,
     pub ip_stack: MasqueIpStackOptions,
     pub remote_dns_resolve: bool,
-    pub dns: Vec<String>,
+    pub dns: Vec<DnsNameserver>,
     pub local_prefixes: [Option<(std::net::IpAddr, u8)>; 2],
 }
 
@@ -160,12 +162,14 @@ impl RawMasque {
             "h3-l4proxy" => MasqueNetwork::H3L4Proxy,
             _ => MasqueNetwork::Quic,
         };
-        if network == MasqueNetwork::H2 {
-            return invalid("MASQUE H2 CONNECT-IP mode is not supported yet");
-        }
-        if self.remote_dns_resolve && !self.dns.is_empty() {
-            return invalid("MASQUE node DNS is not supported yet");
-        }
+        let dns = if self.remote_dns_resolve && !self.dns.is_empty() {
+            self.dns
+                .iter()
+                .map(|nameserver| super::dns::parse_node_dns_nameserver(nameserver))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let server_name = if self.sni.is_empty() {
             match network {
                 MasqueNetwork::H3L4Proxy => L4_CONNECT_SNI,
@@ -265,7 +269,7 @@ impl RawMasque {
                 bbr_profile: self.bbr_profile,
                 ip_stack,
                 remote_dns_resolve: self.remote_dns_resolve,
-                dns: self.dns,
+                dns,
                 local_prefixes,
             }),
         ))
@@ -372,7 +376,8 @@ mod tests {
         }
         let mut raw = node();
         raw["network"] = json!("h2");
-        assert!(parse(raw).unwrap_err().to_string().contains("H2"));
+        raw["ip"] = json!("192.0.2.10");
+        assert_eq!(options(&parse(raw).unwrap()).network, MasqueNetwork::H2);
         let mut raw = node();
         raw["network"] = json!("quic");
         raw["ip"] = json!("192.0.2.10/24");
@@ -391,7 +396,7 @@ mod tests {
         raw["dns"] = json!([]);
         assert!(parse(raw.clone()).is_ok());
         raw["dns"] = json!(["tcp://192.0.2.53"]);
-        assert!(parse(raw).unwrap_err().to_string().contains("node DNS"));
+        assert_eq!(options(&parse(raw).unwrap()).dns.len(), 1);
         for (field, value) in [
             ("handshake-timeout", json!(-1)),
             ("ip-stack", json!({"mode": "mips"})),
@@ -405,6 +410,39 @@ mod tests {
             raw[field] = value;
             assert!(parse(raw).is_err());
         }
+    }
+
+    #[test]
+    fn masque_node_dns_activation_preserves_wrappers_and_physical_sources() {
+        use crate::config::{DnsAddress, DnsRoute, DnsSource, DnsTransport};
+        let mut raw = node();
+        raw["dns"] = json!(["not a nameserver"]);
+        assert!(options(&parse(raw.clone()).unwrap()).dns.is_empty());
+        raw["remote-dns-resolve"] = json!(true);
+        assert!(parse(raw.clone()).is_err());
+        raw["dns"] = json!([
+            "tcp://192.0.2.53#unused-route&ecs=192.0.2.255/25&disable-ipv6=true",
+            "system#unused-route&disable-ipv4=true",
+            "dhcp://physical0"
+        ]);
+        let config = parse(raw).unwrap();
+        let dns = &options(&config).dns;
+        assert_eq!(dns.len(), 3);
+        assert!(
+            dns.iter()
+                .all(|nameserver| nameserver.route == DnsRoute::Direct)
+        );
+        assert_eq!(dns[0].transport, DnsTransport::Tcp);
+        assert!(dns[0].options.ecs.is_some());
+        assert!(dns[0].options.disabled_types.contains(&28));
+        assert!(matches!(
+            dns[1].address,
+            DnsAddress::Source(DnsSource::System)
+        ));
+        assert!(dns[1].options.disabled_types.contains(&1));
+        assert!(
+            matches!(&dns[2].address, DnsAddress::Source(DnsSource::Dhcp(interface)) if interface.as_ref() == "physical0")
+        );
     }
 
     #[test]

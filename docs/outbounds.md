@@ -109,7 +109,11 @@ UDP 底层使用可靠会话，提供累计 ACK、重传、有序交付、分片
 
 `type: masque` 由 `outbound-masque` 提供。缺省、空串及非 `h2`/`h3-l4proxy`
 的 network 使用 H3 `cf-connect-ip`；每个节点按需建立一条共享 IP 隧道，TCP/UDP
-经同一个内部 `vole-netstack`，不创建系统 TUN。H3 等待实际 peer SETTINGS 中的
+经同一个内部 `vole-netstack`，不创建系统 TUN。`network: h2` 使用严格 H2 TLS
+与普通 CONNECT，设置 `cf-connect-proto: cf-connect-ip` 和 `pq-enabled: false`；
+精确 HTTP 200 后交付隧道，DATA 内 DATAGRAM capsule 直接携带原始 IP，不添加 context ID。
+H2 每 30 秒发送空闲 PING，ACK 期限为 15 秒；不因隧道暂时空闲而回收。
+H3 等待实际 peer SETTINGS 中的
 现代 DATAGRAM 支持，同时发送现代与旧 DATAGRAM setting；原始 IP 使用请求流关联及
 context ID 0。控制 capsule 有界解析，发送 IPv4/IPv6 完整 route advertisement。
 IP 模式在所有受控抽象 socket 平台启用有界 QUIC PMTUD；具有 IPv6 本地地址时，
@@ -123,7 +127,18 @@ PMTU 反馈按连接生效。内部队列、capsule 和 packet 均有界，停�
 
 `network: h3-l4proxy` 使用 Cloudflare L4 HTTP/3 CONNECT，每个 TCP 目标独占请求流，共享受控 QUIC 连接；
 等待 2xx 响应后才交付业务流，拒绝响应不取消其它流，节点 Stop 等待所有驱动退出。
-业务域名使用受控本地解析；基础 UDP 始终关闭，`udp: true` 也不启用它。
+基础 UDP 始终关闭，`udp: true` 也不启用它。
+
+`remote-dns-resolve: true` 且 `dns` 非空时启用节点私有 DNS；否则忽略 dns 内容，
+业务域名沿原受控本地解析。IP 模式的 DNS 查询通过同一个内部栈，L4 仅支持经节点的
+TCP DNS 传输，不将 UDP 查询改为 TCP 或改走 DIRECT。节点 DNS 沿用 Core DNS 上游格式，
+不继承全局 prefer-h3；解析上游域名仍使用节点外部的 bootstrap 上下文，避免自递归。
+system/DHCP 来源沿共享物理来源策略处理，网络快照更新清理节点缓存；不可用时失败。
+私有 resolver 不保留空闲连接，由节点 Stop 关闭并等待驱动。
+
+IP 模式 `handshake-timeout` 为整数秒：0 使用创建调用的建立期限，创建者取消会终止
+尚未就绪的创建；正值使用节点拥有的独立期限，创建者或其它等待者取消不终止共享创建。
+已交付业务不继承建立期限；节点 Stop 取消创建和业务并等待全部任务。
 
 private-key 是标准 Base64 SEC1 ECDSA 私钥，public-key 是标准 Base64 ECDSA SPKI。
 客户端发送对应自签证书，服务端每张证书都必须使用固定公钥；不检查证书名称、
@@ -138,7 +153,6 @@ L4 不解析 ip/ipv6/uri，不消费 mtu 或正 handshake-timeout；负超时拒
 QUIC 使用 20 字节 CID、初始 payload 1242 与受控预算交集、30 秒 keepalive；
 拥塞字段使用 TrustTunnel H3 的五种控制器及其参数语义。
 `ip-stack` 支持省略/auto 与省略/cubic，不把其它栈或算法映射为现有栈。
-当前 H2 模式和有效的节点私有 DNS 配置明确拒绝。
 
 ## SOCKS5
 
