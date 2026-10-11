@@ -27,7 +27,15 @@ impl<'a> IdentityFiles<'a> {
         if !matches!(
             map.get("type").and_then(Value::as_str),
             Some(
-                "http" | "socks5" | "anytls" | "trojan" | "vmess" | "vless" | "hysteria2" | "tuic"
+                "http"
+                    | "socks5"
+                    | "anytls"
+                    | "trojan"
+                    | "vmess"
+                    | "vless"
+                    | "hysteria2"
+                    | "tuic"
+                    | "trusttunnel"
             )
         ) {
             return Ok(());

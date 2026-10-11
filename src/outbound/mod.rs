@@ -5,6 +5,8 @@ pub mod address;
 pub mod http;
 #[cfg(feature = "outbound-trojan")]
 pub mod trojan;
+#[cfg(feature = "outbound-trusttunnel")]
+pub mod trusttunnel;
 #[cfg(feature = "outbound-vmess")]
 pub mod vmess;
 #[cfg(feature = "outbound-wireguard")]

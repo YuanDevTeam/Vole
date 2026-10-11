@@ -24,7 +24,7 @@
 
 ## 适用范围
 
-AnyTLS、Trojan、VMess + TLS、VLESS + TLS/REALITY/JLS 使用同一共享连接器。
+AnyTLS、Trojan、TrustTunnel H2、VMess + TLS、VLESS + TLS/REALITY/JLS 使用同一共享连接器。
 TCP、WS、gRPC、HTTP 首包伪装、legacy H2、Vision、XHTTP H1/H2 仍遵守各自的协议约束。
 关闭 TLS 时不能携带该字段。SS2022 + ShadowTLS v3 复用上述模板，作用于 cover
 握手并强制 TLS1.3；其未命名握手也由 boring 执行。SOCKS5 和裸 SS 不接入 TLS 指纹。
@@ -49,7 +49,7 @@ client-fingerprint: chrome
 - 命名指纹的标准 TLS，以及所有 REALITY/JLS，使用自有 boring fork；开发及 PR/发布的来源规则见 [TLS 依赖](tls-dependencies.md)。
 - 普通 TLS 两条路径共用同一个 WebPKI 证书验证器和发布信任根；叶 pin、非叶信任锚、
   独立验证名、skip 优先级不变。TLS 握手签名仍由各自后端强制验证。
-- HTTP、SOCKS5、AnyTLS、Trojan、VMess、VLESS、Hysteria2 与 TUIC v5 的 mTLS 使用配对内联 PEM 或文件路径，
+- HTTP、SOCKS5、AnyTLS、Trojan、TrustTunnel H2、VMess、VLESS、Hysteria2 与 TUIC v5 的 mTLS 使用配对内联 PEM 或文件路径，
   配置校验与资源生成时读取文件并检查密钥匹配；客户端证书不增加服务端信任根，profile 不修改身份。
 - REALITY 仅允许自身临时证书认证，不能混用 pin/skip/mTLS 或降级到普通站点证书。
 - [JLS](vless.md#jls) 使用共享凭据身份和完整原生 TLS1.3，不启用恢复或 PKI 回退；profile 不改变身份。

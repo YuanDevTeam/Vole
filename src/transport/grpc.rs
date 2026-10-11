@@ -264,6 +264,34 @@ impl Drop for Grpc {
     }
 }
 
+#[cfg(feature = "outbound-trusttunnel")]
+pub(super) async fn pooled_connect(
+    sender: Sender,
+    request: http::Request<()>,
+    deadline: Instant,
+    lease: super::grpc_pool::Lease,
+) -> io::Result<BoxStream> {
+    let writes = sender.writes;
+    let mut sender = timeout_at(deadline, sender.request.ready())
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+        .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
+    let (response, send) = sender.send_request(request, false).map_err(|_| invalid())?;
+    // TrustTunnel, like gRPC, returns once the connection/request exists.
+    // Headers remain deferred so a peer may wait for client-first payload.
+    Ok(Box::new(Grpc::new(
+        response,
+        send,
+        Framing::Plain,
+        false,
+        deadline,
+        Arc::default(),
+        None,
+        Some(lease),
+        writes,
+    )))
+}
+
 /// sing-mux uses plain HTTP/2 CONNECT streams, not gRPC records.
 #[cfg(feature = "sing-mux")]
 pub(super) async fn mux_stream(sender: Sender, deadline: Instant) -> io::Result<BoxStream> {

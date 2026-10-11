@@ -31,7 +31,7 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   HTTP 出站已有的可选 TLS 字段保留 null 等同省略的行为。
   凭据、UUID、业务目标和完整请求不进入 Debug/错误；资源与 Stop 见[公共策略](runtime-resource-policy.md)。
 
-VMess + TLS、Trojan、AnyTLS、VLESS 和 Hysteria2 支持 `ech-opts.enable/config/query-server-name`，
+VMess + TLS、Trojan、AnyTLS、TrustTunnel H2、VLESS 和 Hysteria2 支持 `ech-opts.enable/config/query-server-name`，
 静态优先和动态节点 DNS 来源、后端算法及失败边界见 [ECH](vless.md#ech)。
 TUIC 的固定参考未消费 ECH，因此不接受该字段。
 
@@ -43,6 +43,22 @@ TUIC 的固定参考未消费 ECH，因此不接受该字段。
 HTTP CONNECT 本身不提供 UDP，也不接受 `udp` 字段。公共 smux 可承载 UDP。
 握手沿用原期限，失败关闭，
 成功后保留响应头后的业务字节。启用此协议需要 `outbound-http` feature。
+
+## TrustTunnel
+
+`type: trusttunnel` 当前提供 TLS + HTTP/2 CONNECT TCP，使用 `outbound-trusttunnel`。
+username/password 默认空字符串，始终发送 Basic 认证；不增加非空限制。
+SNI 缺省/空串使用 server，ALPN 缺省/空列表使用 h2，自定义列表必须包含 h2，
+实际握手必须协商 h2，不回退 HTTP/1.1。共享证书策略、mTLS、命名指纹与 ECH。
+
+三项 max-connections/min-streams/max-streams 全为0才应用8/5/0；
+max-connections>0优先采用连接数/最小流分支，否则按max-streams分配。
+混合配置和负阈值不额外拒绝；池参数是分配阈值，不是业务流总量上限。
+逻辑流使用原始字节，无gRPC帧；响应头延迟到读取，允许服务端等待client-first业务。
+关闭只结束当前逻辑流；节点Stop取消并join全部H2驱动，不影响其他节点。
+
+quic、udp、health-check目前仅接受关闭；H2中的congestion-controller/cwnd/bbr-profile
+与Mihomo一样不消费，不据此声明H3或拥塞算法支持。
 
 ## SOCKS5
 

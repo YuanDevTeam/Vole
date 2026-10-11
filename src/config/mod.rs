@@ -12,8 +12,10 @@ pub use grpc::GrpcOptions;
 pub use sing_mux::{SingMuxConfig, SingMuxProtocol};
 mod http_proxy;
 mod ip_version;
+mod trusttunnel;
 pub use http_proxy::HttpOutboundConfig;
 pub use ip_version::IpVersion;
+pub use trusttunnel::{TrustTunnelOutboundConfig, TrustTunnelPoolOptions};
 
 mod groups;
 pub(crate) use groups::status_ranges;
@@ -735,6 +737,7 @@ pub struct ProxyConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyProtocol {
+    TrustTunnel(TrustTunnelOutboundConfig),
     Http(HttpOutboundConfig),
     WireGuard(WireGuardOutboundConfig),
     Tuic(TuicOutboundConfig),
@@ -751,6 +754,7 @@ impl ProxyConfig {
     #[must_use]
     pub fn address(&self) -> &str {
         match &self.protocol {
+            ProxyProtocol::TrustTunnel(config) => &config.address,
             ProxyProtocol::WireGuard(config) => &config.address,
             ProxyProtocol::Http(config) => &config.address,
             ProxyProtocol::Tuic(config) => &config.address,
@@ -767,6 +771,7 @@ impl ProxyConfig {
     #[must_use]
     pub const fn port(&self) -> u16 {
         match &self.protocol {
+            ProxyProtocol::TrustTunnel(config) => config.port,
             ProxyProtocol::WireGuard(config) => config.port,
             ProxyProtocol::Http(config) => config.port,
             ProxyProtocol::Tuic(config) => config.port,
@@ -1623,6 +1628,10 @@ impl<'de> Deserialize<'de> for RawOutbound {
 // protocol fields inline avoids extra heap allocations in the startup path.
 #[allow(clippy::large_enum_variant)]
 enum RawProtocol {
+    #[serde(rename = "trusttunnel")]
+    TrustTunnel(
+        #[serde(deserialize_with = "trusttunnel::deserialize")] trusttunnel::RawTrustTunnel,
+    ),
     #[serde(rename = "wireguard")]
     WireGuard(#[serde(deserialize_with = "wireguard::deserialize")] wireguard::RawWireGuard),
     #[serde(rename = "http")]
@@ -2837,6 +2846,7 @@ pub(crate) fn proxy_graph_order(
 impl RawOutbound {
     fn normalize(self) -> Result<PendingProxyConfig> {
         let (tag, dialer_proxy, udp, protocol) = match self.protocol {
+            RawProtocol::TrustTunnel(raw) => raw.normalize()?,
             RawProtocol::WireGuard(raw) => raw.normalize()?,
             RawProtocol::Http(raw) => raw.normalize()?,
             RawProtocol::Hysteria2(raw) => raw.normalize()?,

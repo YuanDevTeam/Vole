@@ -15,6 +15,7 @@ cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --no-default-f
 cargo test --locked --features cli,interop-test --test tuic_memory configured_ip_sni_millisecond_heartbeat_and_uot_versions_are_consumed
 cargo test --locked --features cli --lib tuic_uot_
 cargo test --locked --lib config::tests::
+cargo test --locked --features cli --lib trusttunnel
 cargo test --locked --lib config::credentials::tests::
 cargo test --locked --features cli --lib age_
 cargo test --locked --lib dns::hosts::tests::

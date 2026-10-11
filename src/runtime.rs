@@ -77,6 +77,8 @@ use crate::outbound::ShadowsocksOutbound;
 use crate::outbound::Socks5Outbound;
 #[cfg(feature = "outbound-trojan")]
 use crate::outbound::trojan::TrojanOutbound;
+#[cfg(feature = "outbound-trusttunnel")]
+use crate::outbound::trusttunnel::TrustTunnelOutbound;
 #[cfg(feature = "outbound-anytls")]
 use crate::outbound::{AnyTlsOutbound, server_destination};
 #[cfg(feature = "outbound-vless")]
@@ -90,6 +92,7 @@ use crate::security::StandardTlsClient;
     feature = "outbound-anytls",
     feature = "outbound-vless",
     feature = "outbound-trojan",
+    feature = "outbound-trusttunnel",
     feature = "outbound-vmess",
     feature = "outbound-hysteria2",
     feature = "outbound-tuic",
@@ -970,6 +973,7 @@ fn build_proxy_graph(
         feature = "outbound-anytls",
         feature = "outbound-vless",
         feature = "outbound-trojan",
+        feature = "outbound-trusttunnel",
         feature = "outbound-vmess",
         feature = "outbound-hysteria2",
         feature = "outbound-tuic",
@@ -982,6 +986,7 @@ fn build_proxy_graph(
         feature = "outbound-anytls",
         feature = "outbound-vless",
         feature = "outbound-trojan",
+        feature = "outbound-trusttunnel",
         feature = "outbound-vmess",
         feature = "outbound-hysteria2",
         feature = "outbound-tuic",
@@ -994,6 +999,7 @@ fn build_proxy_graph(
         feature = "outbound-anytls",
         feature = "outbound-vless",
         feature = "outbound-trojan",
+        feature = "outbound-trusttunnel",
         feature = "outbound-vmess",
         feature = "outbound-hysteria2",
         feature = "outbound-tuic",
@@ -1105,6 +1111,28 @@ fn build_proxy_graph(
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "HTTP outbound support is disabled",
+                    ));
+                }
+            }
+            ProxyProtocol::TrustTunnel(config) => {
+                #[cfg(feature = "outbound-trusttunnel")]
+                {
+                    Arc::new(TrustTunnelOutbound::with_shared_security(
+                        config,
+                        upstream,
+                        security_context
+                            .as_ref()
+                            .expect("TrustTunnel security context"),
+                        resumption_sessions,
+                        limits.tls_buffer_limit,
+                    )?)
+                }
+                #[cfg(not(feature = "outbound-trusttunnel"))]
+                {
+                    let _ = (config, upstream);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "TrustTunnel outbound support is disabled at build time",
                     ));
                 }
             }
@@ -1409,6 +1437,7 @@ async fn prepare_proxy_endpoints(
                 | ProxyProtocol::Http(_)
                 | ProxyProtocol::Socks5(_)
                 | ProxyProtocol::Trojan(_)
+                | ProxyProtocol::TrustTunnel(_)
                 | ProxyProtocol::Vmess(_)
                 | ProxyProtocol::AnyTls(_)
                 | ProxyProtocol::Shadowsocks(_)
@@ -1478,6 +1507,7 @@ fn restrict_endpoint_addresses(
     feature = "outbound-anytls",
     feature = "outbound-vless",
     feature = "outbound-trojan",
+    feature = "outbound-trusttunnel",
     feature = "outbound-vmess",
     feature = "outbound-hysteria2",
     feature = "outbound-tuic",
@@ -1504,9 +1534,10 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
                         }),
                 )
             }
-            ProxyProtocol::AnyTls(_) | ProxyProtocol::Trojan(_) | ProxyProtocol::Hysteria2(_) => {
-                (client_count + 1, standard_count + 1)
-            }
+            ProxyProtocol::AnyTls(_)
+            | ProxyProtocol::Trojan(_)
+            | ProxyProtocol::TrustTunnel(_)
+            | ProxyProtocol::Hysteria2(_) => (client_count + 1, standard_count + 1),
             ProxyProtocol::Vmess(config) => (
                 client_count + 1,
                 standard_count + usize::from(config.tls.is_some()),
@@ -1535,6 +1566,7 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
     feature = "outbound-anytls",
     feature = "outbound-vless",
     feature = "outbound-trojan",
+    feature = "outbound-trusttunnel",
     feature = "outbound-vmess",
     feature = "outbound-hysteria2",
     feature = "outbound-tuic",
@@ -2642,6 +2674,38 @@ rules:
             prepared.build_proxy_graph(Dialer::default()).unwrap().len(),
             2
         );
+    }
+
+    #[cfg(feature = "outbound-trusttunnel")]
+    #[tokio::test]
+    async fn trusttunnel_graph_defers_resolution_and_shares_tls_budget() {
+        let yaml = br#"proxies:
+  - name: tunnel-child
+    type: trusttunnel
+    server: child.test
+    port: 443
+    dialer-proxy: upstream
+  - name: tunnel-root
+    type: trusttunnel
+    server: root.test
+    port: 443
+proxy-groups:
+  - name: upstream
+    type: select
+    proxies: [DIRECT, tunnel-root]
+rules: ["MATCH,tunnel-child"]
+"#;
+        let resolver = RecordingResolver::default();
+        let prepared = PreparedCore::prepare(yaml, &resolver, ResourceLimits::default())
+            .await
+            .unwrap();
+        assert!(resolver.hosts.lock().unwrap().is_empty());
+        assert_eq!(security_counts(&prepared.config.proxies), (2, 2));
+        assert_eq!(standard_tls_resumption_sessions(2), 2);
+        let graph = prepared.build_proxy_graph(Dialer::default()).unwrap();
+        assert_eq!(graph.len(), 2);
+        graph.begin_shutdown();
+        graph.shutdown().await;
     }
 
     #[cfg(all(feature = "outbound-socks5", feature = "outbound-vless"))]

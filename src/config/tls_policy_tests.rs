@@ -14,7 +14,9 @@ fn node(protocol: &str) -> serde_json::Value {
         "name-cert-verify": "verified.invalid", "fingerprint": "ab".repeat(32),
     });
     match protocol {
-        "anytls" | "trojan" | "hysteria2" => node["password"] = "synthetic-secret".into(),
+        "anytls" | "trojan" | "hysteria2" | "trusttunnel" => {
+            node["password"] = "synthetic-secret".into()
+        }
         "vmess" | "vless" => {
             node["uuid"] = "00000000-0000-4000-8000-000000000001".into();
             node["tls"] = true.into();
@@ -53,6 +55,7 @@ fn client_identity(config: &Config) -> &TlsIdentityPem {
         ProxyProtocol::Http(config) => &config.tls.as_ref().unwrap().identity,
         ProxyProtocol::Hysteria2(config) => &config.tls.identity,
         ProxyProtocol::Tuic(config) => &config.tls.identity,
+        ProxyProtocol::TrustTunnel(config) => &config.tls.identity,
         ProxyProtocol::Vless(config) => match &config.security {
             SecurityConfig::Tls(tls) => &tls.identity,
             _ => unreachable!(),
@@ -84,6 +87,8 @@ fn common_tls_identity_files_use_the_configuration_directory_and_inline_validati
         "hysteria2",
         #[cfg(feature = "outbound-tuic")]
         "tuic",
+        #[cfg(feature = "outbound-trusttunnel")]
+        "trusttunnel",
     ] {
         let mut node = node(protocol);
         node["certificate"] = "./client.crt".into();

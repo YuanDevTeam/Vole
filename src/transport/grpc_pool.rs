@@ -23,6 +23,12 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 const MAX_IDLE_CONNECTIONS: usize = crate::limits::GRPC_IDLE_CONNECTIONS;
 const PING_TIMEOUT: Duration = Duration::from_secs(crate::limits::GRPC_PING_TIMEOUT_SECONDS as u64);
 
+enum RequestKind<'a> {
+    Grpc(&'a str),
+    #[cfg(feature = "outbound-trusttunnel")]
+    Connect(http::Request<()>),
+}
+
 pub struct GrpcPool {
     options: GrpcOptions,
     half_close: bool,
@@ -54,6 +60,35 @@ impl GrpcPool {
     pub async fn open<F, Fut>(
         &self,
         uri: &str,
+        deadline: Instant,
+        connect: F,
+    ) -> io::Result<BoxStream>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<BoxStream>>,
+    {
+        self.open_request(RequestKind::Grpc(uri), deadline, connect)
+            .await
+    }
+    /// An unframed CONNECT stream shares the same physical-IO ownership and
+    /// pool policy as gRPC, without importing gRPC headers or record framing.
+    #[cfg(feature = "outbound-trusttunnel")]
+    pub(crate) async fn open_connect<F, Fut>(
+        &self,
+        request: http::Request<()>,
+        deadline: Instant,
+        connect: F,
+    ) -> io::Result<BoxStream>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<BoxStream>>,
+    {
+        self.open_request(RequestKind::Connect(request), deadline, connect)
+            .await
+    }
+    async fn open_request<F, Fut>(
+        &self,
+        request: RequestKind<'_>,
         deadline: Instant,
         connect: F,
     ) -> io::Result<BoxStream>
@@ -97,15 +132,23 @@ impl GrpcPool {
                     }
                 }
             };
-            super::grpc::pooled_stream(
-                sender,
-                uri,
-                &self.options.user_agent,
-                self.half_close,
-                deadline,
-                lease,
-            )
-            .await
+            match request {
+                RequestKind::Grpc(uri) => {
+                    super::grpc::pooled_stream(
+                        sender,
+                        uri,
+                        &self.options.user_agent,
+                        self.half_close,
+                        deadline,
+                        lease,
+                    )
+                    .await
+                }
+                #[cfg(feature = "outbound-trusttunnel")]
+                RequestKind::Connect(request) => {
+                    super::grpc::pooled_connect(sender, request, deadline, lease).await
+                }
+            }
         };
         tokio::select! {biased;
             ()=self.cancellation.cancelled()=>Err(io::ErrorKind::ConnectionAborted.into()),

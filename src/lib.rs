@@ -41,6 +41,7 @@ pub mod routing;
         feature = "outbound-shadowsocks",
         feature = "outbound-vless",
         feature = "outbound-trojan",
+        feature = "outbound-trusttunnel",
         feature = "outbound-vmess",
         feature = "outbound-hysteria2",
         feature = "outbound-tuic",

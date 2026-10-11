@@ -229,7 +229,21 @@ sniffer:
 # username/password 均非空才认证；headers 为字符串映射；仅 TCP，不支持 udp: true。
 # tls: true 时支持 sni/skip-cert-verify/name-cert-verify/fingerprint，
 # 以及成对的 certificate/private-key（PEM 或文件路径）。支持 dialer-proxy；详见 outbounds.md。
+# TrustTunnel 当前支持 TLS + H2 CONNECT TCP，type: trusttunnel；username/password 默认空串，
+# 始终发送 Basic 认证，不要求非空。sni 缺省/空串使用 server；alpn 缺省/[] 为 [h2]，
+# 自定义列表必须包含 h2，不降级 H1。支持上述证书策略、mTLS、client-fingerprint、ech-opts。
+# 连接分配 max-connections/min-streams/max-streams 全为 0 时采用 8/5/0；
+# max-connections > 0 优先，混合填写不报互斥，阈值不限制业务总连接数。
+# quic/udp/health-check 缺省或 false；当前 true 尚未支持。
+# congestion-controller/cwnd/bbr-profile 可填写，在 H2 模式与 Mihomo 一样不生效。
 proxies:
+  - name: trusttunnel-edge
+    type: trusttunnel
+    server: trusttunnel.example.com
+    port: 443
+    username: synthetic-user
+    password: synthetic-password
+
   # 标准 WireGuard：用户态内层 TCP/UDP，不创建系统接口/路由/NAT。
   # 密钥为公开测试值，不可用于真实连接。外层始终需要双向 UDP；业务 udp 默认 false。
   # ip/ipv6 接受 IP 或 CIDR，按实际地址族选择，每族最多一个；至少配置一个。
