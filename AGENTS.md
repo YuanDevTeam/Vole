@@ -8,6 +8,8 @@ iOS, tvOS 17+ (ARM64 device/simulator), macOS, Android and Linux use config-owne
 
 Current source, tests, and the public contract documents under `docs/` define implemented behavior. Keep documentation focused on current usage and contracts; record validation results in the relevant CI run or PR rather than accumulating development logs. When touching a documented boundary, reconcile its document with the Invoke API and current tests in the same change.
 
+Keep all development plans in the workspace's `references/plan/` directory outside Git repositories (`../references/plan/` from this checkout). Repository documentation contains finalized conclusions, accepted decisions, and current contracts; implementation plans and task lists stay in that external directory.
+
 Read the relevant document completely before changing that area:
 
 - Invoke, FFI, lifecycle, Android protect, or config delivery: `docs/invoke-api.md`, `src/invoke/`, and `src/ffi/`.
