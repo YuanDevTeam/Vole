@@ -401,6 +401,21 @@ where
         future::poll_fn(|cx| self.poll_close(cx)).await
     }
 
+    /// Drive control I/O until the peer's actual SETTINGS arrive.
+    /// A missing frame remains pending; initial default values are not a reply.
+    pub fn poll_peer_settings(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<crate::config::Settings, ConnectionError>> {
+        if let Poll::Ready(error) = self.poll_close(cx) {
+            return Poll::Ready(Err(error));
+        }
+        match self.received_settings() {
+            Some(settings) => Poll::Ready(Ok(settings)),
+            None => Poll::Pending,
+        }
+    }
+
     /// Maintain the connection state until it is closed
     #[cfg_attr(feature = "tracing", instrument(skip_all, level = "trace"))]
     pub fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionError> {

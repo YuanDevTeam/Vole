@@ -11,6 +11,8 @@ mod client;
 mod context;
 #[cfg(feature = "ech")]
 pub(crate) mod ech;
+#[cfg(feature = "outbound-masque")]
+pub(crate) mod masque;
 mod resumption;
 #[cfg(feature = "shadow-tls-v3")]
 mod shadow_tls;

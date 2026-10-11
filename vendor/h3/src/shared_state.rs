@@ -67,7 +67,7 @@ pub trait ConnectionState {
     }
 
     /// Get the settings
-    fn settings(&self) -> Cow<Settings> {
+    fn settings(&self) -> Cow<'_, Settings> {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.2
         //# Each endpoint SHOULD use
         //# these initial values to send messages before the peer's SETTINGS
@@ -78,6 +78,10 @@ pub trait ConnectionState {
             .get()
             .map(|s| Cow::Borrowed(s))
             .unwrap_or_default()
+    }
+    /// A snapshot only after the peer's actual SETTINGS frame has arrived.
+    fn received_settings(&self) -> Option<Settings> {
+        self.shared_state().settings.get().copied()
     }
     /// Set the connection to closing
     fn set_closing(&self) {

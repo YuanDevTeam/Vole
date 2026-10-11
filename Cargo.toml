@@ -41,6 +41,7 @@ default = [
     "outbound-trojan",
     "outbound-trusttunnel",
     "outbound-mieru",
+    "outbound-masque",
     "outbound-vmess",
     "outbound-vless",
     "outbound-hysteria2",
@@ -59,6 +60,7 @@ outbound-vless = ["ech", "tls-fingerprint", "boring/reality", "boring/jls", "bor
 outbound-trojan = ["stream-transport", "tls-fingerprint", "ech"]
 outbound-trusttunnel = ["stream-transport", "tls-fingerprint", "ech", "quic-transport", "dep:h3", "dep:h3-quinn"]
 outbound-mieru = ["dep:chacha20poly1305", "dep:hostname", "dep:prost", "dep:ring"]
+outbound-masque = ["quic-transport", "dep:h3", "dep:h3-quinn", "dep:boring"]
 outbound-vmess = ["stream-transport", "tls-fingerprint", "ech", "dep:aes", "dep:md-5", "dep:ring", "dep:shake"]
 tls-fingerprint = ["dep:boring", "dep:tokio-boring"]
 ech = []
@@ -91,6 +93,7 @@ tun = [
     "outbound-trojan",
     "outbound-trusttunnel",
     "outbound-mieru",
+    "outbound-masque",
     "outbound-vmess",
     "outbound-vless",
     "outbound-hysteria2",

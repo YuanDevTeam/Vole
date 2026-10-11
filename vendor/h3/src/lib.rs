@@ -54,4 +54,7 @@ mod qpack;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+#[path = "tests/vole_memory.rs"]
+mod vole_memory;
+#[cfg(test)]
 extern crate self as h3;

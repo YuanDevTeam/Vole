@@ -406,7 +406,8 @@ impl SettingId {
                 | SettingId::ENABLE_CONNECT_PROTOCOL
                 | SettingId::ENABLE_WEBTRANSPORT
                 | SettingId::WEBTRANSPORT_MAX_SESSIONS
-                | SettingId::H3_DATAGRAM,
+                | SettingId::H3_DATAGRAM
+                | SettingId::H3_DATAGRAM_00,
         )
     }
 
@@ -449,6 +450,8 @@ setting_identifiers! {
     ENABLE_CONNECT_PROTOCOL = 0x8,
     // https://datatracker.ietf.org/doc/html/rfc9297#name-http-3-setting
     H3_DATAGRAM = 0x33,
+    // Cloudflare additionally uses draft-00's HTTP Datagram setting.
+    H3_DATAGRAM_00 = 0x276,
     // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2
     ENABLE_WEBTRANSPORT = 0x2B603742,
     // https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-8.2
@@ -530,6 +533,10 @@ impl Settings {
 
             let identifier = SettingId::decode(buf).map_err(|_| SettingsError::Malformed)?;
             let value = buf.get_var().map_err(|_| SettingsError::Malformed)?;
+
+            if matches!(identifier, SettingId::H3_DATAGRAM | SettingId::H3_DATAGRAM_00) && value > 1 {
+                return Err(SettingsError::InvalidSettingValue(identifier, value));
+            }
 
             if identifier.is_forbidden() {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
@@ -700,6 +707,29 @@ mod tests {
             &[4, 0],
             Frame::Settings(Settings::default()),
         );
+    }
+
+    #[test]
+    fn vole_datagram_settings_reject_invalid_boolean_and_duplicate_wire_values() {
+        for (id, encoded_id) in [
+            (SettingId::H3_DATAGRAM, vec![0x33]),
+            (SettingId::H3_DATAGRAM_00, vec![0x42, 0x76]),
+        ] {
+            let mut payload = encoded_id.clone();
+            payload.push(2);
+            assert_matches!(
+                Settings::decode(&mut Cursor::new(payload)),
+                Err(SettingsError::InvalidSettingValue(found, 2)) if found == id
+            );
+            let mut payload = encoded_id.clone();
+            payload.push(1);
+            payload.extend_from_slice(&encoded_id);
+            payload.push(0);
+            assert_matches!(
+                Settings::decode(&mut Cursor::new(payload)),
+                Err(SettingsError::Repeated(found)) if found == id
+            );
+        }
     }
 
     #[test]

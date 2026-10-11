@@ -39,6 +39,9 @@ pub struct Settings {
     pub(crate) enable_extended_connect: bool,
     /// Enable HTTP Datagrams, see https://datatracker.ietf.org/doc/rfc9297/ for details
     pub(crate) enable_datagram: bool,
+    // Presence is retained separately from a missing setting's default false.
+    pub(crate) modern_datagram: Option<bool>,
+    pub(crate) legacy_datagram: Option<bool>,
     /// The maximum number of concurrent streams that can be opened by the peer.
     pub(crate) max_webtransport_sessions: u64,
 }
@@ -59,8 +62,10 @@ impl From<&frame::Settings> for Settings {
                 .unwrap_or(defaults.max_webtransport_sessions),
             enable_datagram: settings
                 .get(frame::SettingId::H3_DATAGRAM)
-                .map(|value| value != 0)
+                .map(|value| value == 1)
                 .unwrap_or(defaults.enable_datagram),
+            modern_datagram: settings.get(frame::SettingId::H3_DATAGRAM).map(|value| value == 1),
+            legacy_datagram: settings.get(frame::SettingId::H3_DATAGRAM_00).map(|value| value == 1),
             enable_extended_connect: settings
                 .get(frame::SettingId::ENABLE_CONNECT_PROTOCOL)
                 .map(|value| value != 0)
@@ -84,6 +89,8 @@ impl TryFrom<Config> for frame::Settings {
                     enable_webtransport,
                     enable_extended_connect,
                     enable_datagram,
+                    modern_datagram: _,
+                    legacy_datagram,
                     max_webtransport_sessions,
                 },
         } = value;
@@ -125,6 +132,9 @@ impl TryFrom<Config> for frame::Settings {
             enable_webtransport as u64,
         )?;
         settings.insert(frame::SettingId::H3_DATAGRAM, enable_datagram as u64)?;
+        if let Some(enabled) = legacy_datagram {
+            settings.insert(frame::SettingId::H3_DATAGRAM_00, enabled as u64)?;
+        }
         settings.insert(
             frame::SettingId::WEBTRANSPORT_MAX_SESSIONS,
             max_webtransport_sessions,
@@ -141,6 +151,8 @@ impl Default for Settings {
             enable_webtransport: false,
             enable_extended_connect: false,
             enable_datagram: false,
+            modern_datagram: None,
+            legacy_datagram: None,
             max_webtransport_sessions: 0,
         }
     }
@@ -156,6 +168,16 @@ impl Settings {
     /// Enable HTTP Datagrams, see https://datatracker.ietf.org/doc/rfc9297/ for details
     pub fn enable_datagram(&self) -> bool {
         self.enable_datagram
+    }
+
+    /// The peer's modern HTTP Datagram setting, including explicit false.
+    pub fn modern_datagram_setting(&self) -> Option<bool> {
+        self.modern_datagram
+    }
+
+    /// The peer's legacy draft HTTP Datagram setting, including explicit false.
+    pub fn legacy_datagram_setting(&self) -> Option<bool> {
+        self.legacy_datagram
     }
 
     /// https://www.rfc-editor.org/info/rfc8441 defines an extended CONNECT method in Section 4,

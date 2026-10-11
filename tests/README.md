@@ -160,7 +160,8 @@ QUIC 的 `vole_` native fixtures 使用官方 vendored crate 的 standalone lock
 provider/features；检查消费/RTT驱动的真实MAX信用帧、初始transport parameters、
 含头部DATAGRAM帧限额，以及 ACK/loss/discard、路径切换和实际 pacing。
 `transport::quic::` 是 Core 的纯内存拥塞控制过滤器，覆盖窗口、profile、采样、恢复和内存边界。
-H3 的普通/扩展 CONNECT 伪头内存回归由 test workflow 的 `H3 header fixture` 执行，
-使用上游要求的临时 sibling adapter 布局，不启动其网络 integration tests。
+H3 的 CONNECT 伪头、Cloudflare 协议 token 与实际 peer SETTINGS 内存回归由 test workflow
+的 `H3 memory fixtures` 执行，使用有界内存 QUIC 和上游要求的临时 sibling adapter
+布局，不启动其网络 integration tests。
 TUIC额外内存对端消费入口ip、SNI、毫秒Heartbeat和UoT v1/v2
 字节；不创建宿主监听服务。它们不替代最终参考互通、吞吐和RSS测量。

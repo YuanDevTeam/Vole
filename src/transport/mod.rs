@@ -1,7 +1,13 @@
 //! Outbound wire transports.
 
-#[cfg(any(feature = "outbound-vless", feature = "outbound-trusttunnel"))]
+#[cfg(any(
+    feature = "outbound-vless",
+    feature = "outbound-trusttunnel",
+    feature = "outbound-masque"
+))]
 pub(crate) mod h3_stream;
+#[cfg(feature = "outbound-masque")]
+pub(crate) mod masque_codec;
 #[cfg(feature = "sing-mux")]
 pub(crate) mod sing_mux;
 #[cfg(feature = "outbound-vless")]

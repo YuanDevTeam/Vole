@@ -105,6 +105,13 @@ impl Builder {
         self
     }
 
+    /// Additionally advertise the legacy draft HTTP Datagram setting.
+    /// Ordinary clients keep this absent. It does not replace the modern setting.
+    pub fn legacy_datagram_setting(&mut self, enabled: bool) -> &mut Self {
+        self.config.settings.legacy_datagram = Some(enabled);
+        self
+    }
+
     /// Enables the extended CONNECT protocol required for various HTTP/3 extensions.
     pub fn enable_extended_connect(&mut self, value: bool) -> &mut Self {
         self.config.settings.enable_extended_connect = value;

@@ -183,7 +183,7 @@ jobs:
         if: matrix.profile == 'features'
         run: |
           cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --no-default-features --features rustls-ring --lib vole_
-      - name: H3 header fixture
+      - name: H3 memory fixtures
         if: matrix.profile == 'features'
         run: |
           python3 - <<'PY'
@@ -194,7 +194,7 @@ jobs:
           Path("vendor/h3-quinn").symlink_to(adapter, target_is_directory=True)
           PY
           trap 'rm vendor/h3-quinn' EXIT
-          cargo test --manifest-path vendor/h3/Cargo.toml --locked --features i-implement-a-third-party-backend-and-opt-into-breaking-changes --lib vole_connect_pseudo_headers_preserve_request_modes
+          cargo test --manifest-path vendor/h3/Cargo.toml --locked --features i-implement-a-third-party-backend-and-opt-into-breaking-changes --lib vole_
       - name: Production and netstack clippy
         if: matrix.profile == 'features'
         run: |
@@ -254,7 +254,7 @@ jobs:
             inbound::http::parser::tests:: inbound::http::framing::tests::
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
-            outbound::trusttunnel:: outbound::mieru:: transport::quic::
+            outbound::trusttunnel:: outbound::mieru:: transport::quic:: transport::masque_codec::
             transport::sing_mux::smux_driver::tests:: transport::sing_mux::tests::
             grpc_duplex_pool_keeps_response
             outbound::sing_mux::tests::
@@ -320,7 +320,7 @@ jobs:
             cargo check --locked --no-default-features --features "outbound-$protocol" --lib
             run_test 1 --features "outbound-$protocol" --lib runtime::tests::integration_feature_admission_is_explicit_without_opening_sockets -- --exact
           done
-          for feature in outbound-http inbound-http inbound-socks5 stream-transport quic-transport sing-mux shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
+          for feature in outbound-masque outbound-http inbound-http inbound-socks5 stream-transport quic-transport sing-mux shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
             cargo check --locked --no-default-features --features "$feature" --lib
           done
           cargo check --locked --no-default-features --features cli --bin vole
