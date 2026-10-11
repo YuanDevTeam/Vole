@@ -719,6 +719,7 @@ impl UpstreamPath {
         feature = "outbound-tuic",
         feature = "outbound-trusttunnel",
         feature = "outbound-mieru",
+        feature = "outbound-masque",
         feature = "outbound-wireguard"
     ))]
     pub(crate) async fn datagram_server(

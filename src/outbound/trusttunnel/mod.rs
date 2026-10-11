@@ -11,7 +11,7 @@ use crate::{
         SecurityContext, StandardTlsClient, TlsClientIdentity, TlsClientOptions, TlsVersions,
     },
     session::{DatagramSession, Destination, StreamSession},
-    transport::GrpcPool,
+    transport::{GrpcPool, h3_connect as h3},
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -34,7 +34,6 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-mod h3;
 mod packet;
 const HEALTH_INTERVAL: Duration = Duration::from_secs(7);
 

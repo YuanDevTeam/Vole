@@ -3,6 +3,8 @@
 pub mod address;
 #[cfg(feature = "outbound-http")]
 pub mod http;
+#[cfg(feature = "outbound-masque")]
+pub mod masque;
 #[cfg(feature = "outbound-mieru")]
 pub mod mieru;
 #[cfg(feature = "outbound-trojan")]

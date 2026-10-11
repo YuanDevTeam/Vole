@@ -273,6 +273,20 @@ proxies:
     multiplexing: MULTIPLEXING_LOW
     handshake-mode: HANDSHAKE_STANDARD
 
+  # MASQUE L4：标准Base64 SEC1 ECDSA私钥与SPKI服务端公钥；独立客户端证书。
+  # 仅TCP，udp: true仍关闭基础UDP；SNI缺省为consumer-masque-proxy.cloudflareclient.com。
+  # ip/ipv6/uri/mtu及正handshake-timeout在L4不消费；负超时拒绝。
+  # name-cert-verify占位不消费；skip-cert-verify关闭公钥固定但仍验证握手签名。
+  # - name: masque-l4
+  #   type: masque
+  #   server: masque.example.com
+  #   port: 443
+  #   network: h3-l4proxy
+  #   private-key: "<Base64 SEC1 DER>"
+  #   public-key: "<Base64 ECDSA SPKI DER>"
+  #   congestion-controller: bbr # 同TrustTunnel H3；cwnd与bbr-profile消费规则相同
+  #   ip-stack: {mode: auto, congestion-controller: cubic}
+
   # 标准 WireGuard：用户态内层 TCP/UDP，不创建系统接口/路由/NAT。
   # 密钥为公开测试值，不可用于真实连接。外层始终需要双向 UDP；业务 udp 默认 false。
   # ip/ipv6 接受 IP 或 CIDR，按实际地址族选择，每族最多一个；至少配置一个。

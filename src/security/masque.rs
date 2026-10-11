@@ -78,22 +78,11 @@ impl MasqueTls {
         skip: bool,
         context: &SecurityContext,
     ) -> io::Result<Self> {
-        let private_der = decode_key(private_b64)?;
-        // Parse SEC1 specifically: PKCS8 is not the configured wire format.
-        let ec = sec1_private_key(&private_der)?;
-        let key = PKey::from_ec_key(ec).map_err(|_| invalid("invalid MASQUE ECDSA private key"))?;
-        let identity_curve = curve(&key)?;
+        let (key, identity_curve, peer) = keys(private_b64, public_b64)?;
         let spki = key
             .public_key_to_der()
             .map_err(|_| invalid("invalid MASQUE ECDSA private key"))?;
         let certificate = certificate(&key, identity_curve)?;
-
-        let public_der = decode_key(public_b64)?;
-        complete_der_sequence(&public_der)
-            .map_err(|_| invalid("invalid MASQUE SPKI public key"))?;
-        let peer = PKey::public_key_from_der(&public_der)
-            .map_err(|_| invalid("invalid MASQUE SPKI public key"))?;
-        curve(&peer)?;
 
         Ok(Self {
             identity: Arc::new(Identity {
@@ -141,6 +130,25 @@ impl MasqueTls {
         config.enable_early_data = false;
         Ok(Arc::new(config))
     }
+}
+
+/// Configuration validation parses the immutable material without reading
+/// time, generating a certificate, or acquiring runtime resources.
+pub(crate) fn validate_keys(private_b64: &str, public_b64: &str) -> io::Result<()> {
+    keys(private_b64, public_b64).map(|_| ())
+}
+
+fn keys(private_b64: &str, public_b64: &str) -> io::Result<(PKey<Private>, Curve, PKey<Public>)> {
+    let private_der = decode_key(private_b64)?;
+    let ec = sec1_private_key(&private_der)?;
+    let key = PKey::from_ec_key(ec).map_err(|_| invalid("invalid MASQUE ECDSA private key"))?;
+    let identity_curve = curve(&key)?;
+    let public_der = decode_key(public_b64)?;
+    complete_der_sequence(&public_der).map_err(|_| invalid("invalid MASQUE SPKI public key"))?;
+    let peer = PKey::public_key_from_der(&public_der)
+        .map_err(|_| invalid("invalid MASQUE SPKI public key"))?;
+    curve(&peer)?;
+    Ok((key, identity_curve, peer))
 }
 
 struct Identity {

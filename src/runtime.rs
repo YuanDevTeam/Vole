@@ -1076,6 +1076,24 @@ fn build_proxy_graph(
             &node_dialer,
         )?;
         let connector: Arc<dyn OutboundConnector> = match &proxy.protocol {
+            ProxyProtocol::Masque(config) => {
+                #[cfg(feature = "outbound-masque")]
+                {
+                    Arc::new(
+                        crate::outbound::masque::MasqueOutbound::with_shared_security(
+                            config, upstream, security,
+                        )?,
+                    )
+                }
+                #[cfg(not(feature = "outbound-masque"))]
+                {
+                    let _ = (config, upstream);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "MASQUE outbound support is disabled at build time",
+                    ));
+                }
+            }
             ProxyProtocol::WireGuard(config) => {
                 #[cfg(feature = "outbound-wireguard")]
                 {
@@ -1452,6 +1470,7 @@ async fn prepare_proxy_endpoints(
             let download = match &proxy.protocol {
                 ProxyProtocol::Vless(config) => config.download(),
                 ProxyProtocol::WireGuard(_)
+                | ProxyProtocol::Masque(_)
                 | ProxyProtocol::Http(_)
                 | ProxyProtocol::Socks5(_)
                 | ProxyProtocol::Trojan(_)
@@ -1573,7 +1592,7 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
                 client_count + usize::from(config.tls.is_some()),
                 standard_count + usize::from(config.tls.is_some()),
             ),
-            ProxyProtocol::Tuic(_) => (client_count + 1, standard_count),
+            ProxyProtocol::Tuic(_) | ProxyProtocol::Masque(_) => (client_count + 1, standard_count),
             ProxyProtocol::WireGuard(_) | ProxyProtocol::Mieru(_) => (client_count, standard_count),
         },
     )
@@ -1996,10 +2015,83 @@ mod tests {
 
     struct FixedResolver;
 
+    #[cfg(feature = "outbound-masque")]
+    #[tokio::test]
+    async fn masque_runtime_graph_owns_the_node_without_creating_physical_io() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use boring::{
+            ec::{EcGroup, EcKey},
+            nid::Nid,
+            pkey::PKey,
+        };
+        use serde_json::json;
+
+        let key =
+            EcKey::generate(&EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap()).unwrap();
+        let private = STANDARD.encode(key.private_key_to_der().unwrap());
+        let public = STANDARD.encode(PKey::from_ec_key(key).unwrap().public_key_to_der().unwrap());
+        let config = Config::parse_yaml(
+            &serde_json::to_vec(&json!({
+                "proxies": [{
+                    "name": "edge", "type": "masque", "server": "unresolved.invalid", "port": 443,
+                    "private-key": private, "public-key": public, "network": "h3-l4proxy",
+                    "udp": true, "dialer-proxy": "upstream"
+                }],
+                "proxy-groups": [{"name": "upstream", "type": "select", "proxies": ["DIRECT"]}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!config.proxies[0].udp);
+        let graph = build_proxy_graph(
+            &config.proxies,
+            &config.proxy_groups,
+            &[PreparedProxyEndpoints::default()],
+            ResourceLimits::default(),
+            Dialer::default(),
+            ResolutionContext::default(),
+            &SecurityContext::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(graph.len(), 1);
+        graph.begin_shutdown();
+        graph.shutdown().await;
+    }
+
     #[tokio::test]
     async fn integration_feature_admission_is_explicit_without_opening_sockets() {
+        #[cfg(feature = "outbound-masque")]
+        let masque_fields = {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            use boring::{
+                ec::{EcGroup, EcKey},
+                nid::Nid,
+                pkey::PKey,
+            };
+
+            let key =
+                EcKey::generate(&EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap()).unwrap();
+            let private = STANDARD.encode(key.private_key_to_der().unwrap());
+            let public =
+                STANDARD.encode(PKey::from_ec_key(key).unwrap().public_key_to_der().unwrap());
+            format!(", network: h3-l4proxy, private-key: '{private}', public-key: '{public}'")
+        };
+        #[cfg(not(feature = "outbound-masque"))]
+        let masque_fields = ", network: h3-l4proxy, private-key: '', public-key: ''".to_owned();
         let variants = [
             ("socks5", "", cfg!(feature = "outbound-socks5")),
+            ("trusttunnel", "", cfg!(feature = "outbound-trusttunnel")),
+            (
+                "mieru",
+                ", transport: TCP, username: fixture, password: fixture",
+                cfg!(feature = "outbound-mieru"),
+            ),
+            (
+                "masque",
+                masque_fields.as_str(),
+                cfg!(feature = "outbound-masque"),
+            ),
             (
                 "anytls",
                 ", password: fixture",

@@ -254,7 +254,7 @@ jobs:
             inbound::http::parser::tests:: inbound::http::framing::tests::
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
-            outbound::trusttunnel:: outbound::mieru:: transport::quic:: transport::masque_codec::
+            outbound::trusttunnel:: outbound::mieru:: transport::quic:: transport::masque_codec:: transport::h3_connect::
             transport::sing_mux::smux_driver::tests:: transport::sing_mux::tests::
             grpc_duplex_pool_keeps_response
             outbound::sing_mux::tests::
@@ -314,13 +314,13 @@ jobs:
             test "$(grep -Ec '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$test_log")" -eq "$expected_summaries"
             rm -f "$test_log"
           }
-          protocols=(socks5 anytls shadowsocks trojan vmess vless hysteria2 tuic wireguard)
+          protocols=(socks5 anytls shadowsocks trojan trusttunnel mieru masque vmess vless hysteria2 tuic wireguard)
           cargo check --locked --no-default-features --lib
           for protocol in "${protocols[@]}"; do
             cargo check --locked --no-default-features --features "outbound-$protocol" --lib
             run_test 1 --features "outbound-$protocol" --lib runtime::tests::integration_feature_admission_is_explicit_without_opening_sockets -- --exact
           done
-          for feature in outbound-masque outbound-http inbound-http inbound-socks5 stream-transport quic-transport sing-mux shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
+          for feature in outbound-http inbound-http inbound-socks5 stream-transport quic-transport sing-mux shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
             cargo check --locked --no-default-features --features "$feature" --lib
           done
           cargo check --locked --no-default-features --features cli --bin vole

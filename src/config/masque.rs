@@ -1,0 +1,336 @@
+//! MASQUE's mode-specific Mihomo fields and dedicated ECDSA key policy.
+use super::{ProxyProtocol, deserialize_present_option, invalid, validate_host, validate_port};
+use crate::Result;
+use serde::Deserialize;
+
+const CONNECT_URI: &str = "https://cloudflareaccess.com";
+const CONNECT_SNI: &str = "consumer-masque.cloudflareclient.com";
+const L4_CONNECT_SNI: &str = "consumer-masque-proxy.cloudflareclient.com";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasqueNetwork {
+    Quic,
+    H2,
+    H3L4Proxy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasqueIpStackOptions {
+    pub mode: String,
+    pub congestion_controller: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct MasqueOutboundConfig {
+    pub address: String,
+    pub port: u16,
+    pub private_key: String,
+    pub public_key: String,
+    pub server_name: String,
+    pub network: MasqueNetwork,
+    pub ip: String,
+    pub ipv6: String,
+    pub uri: String,
+    pub mtu: i64,
+    pub udp: bool,
+    pub handshake_timeout: i64,
+    pub skip_cert_verify: bool,
+    pub name_cert_verify: String,
+    pub congestion_controller: String,
+    pub cwnd: i64,
+    pub bbr_profile: String,
+    pub ip_stack: MasqueIpStackOptions,
+    pub remote_dns_resolve: bool,
+    pub dns: Vec<String>,
+}
+
+impl std::fmt::Debug for MasqueOutboundConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MasqueOutboundConfig")
+            .field("network", &self.network)
+            .field("udp", &self.udp)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct RawIpStack {
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    congestion_controller: String,
+}
+
+impl RawIpStack {
+    fn normalize(self) -> Result<MasqueIpStackOptions> {
+        let mode = self.mode.to_lowercase();
+        let mode = if mode.is_empty() { "auto".into() } else { mode };
+        let congestion_controller = self.congestion_controller.to_lowercase();
+        if mode != "auto" {
+            return invalid("MASQUE IP stack mode is not supported");
+        }
+        if !matches!(congestion_controller.as_str(), "" | "cubic") {
+            return invalid("MASQUE IP stack congestion controller is not supported");
+        }
+        Ok(MasqueIpStackOptions {
+            mode,
+            congestion_controller,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub(super) struct RawMasque {
+    name: String,
+    server: String,
+    port: u16,
+    private_key: String,
+    public_key: String,
+    #[serde(default)]
+    ip: String,
+    #[serde(default)]
+    ipv6: String,
+    #[serde(default)]
+    uri: String,
+    #[serde(default)]
+    sni: String,
+    #[serde(default)]
+    mtu: i64,
+    #[serde(default)]
+    udp: bool,
+    #[serde(default)]
+    handshake_timeout: i64,
+    #[serde(default)]
+    skip_cert_verify: bool,
+    #[serde(default)]
+    name_cert_verify: String,
+    #[serde(default)]
+    network: String,
+    #[serde(default)]
+    congestion_controller: String,
+    #[serde(default)]
+    cwnd: i64,
+    #[serde(default)]
+    bbr_profile: String,
+    #[serde(default)]
+    ip_stack: RawIpStack,
+    #[serde(default)]
+    remote_dns_resolve: bool,
+    #[serde(default)]
+    dns: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    dialer_proxy: Option<String>,
+}
+
+impl std::fmt::Debug for RawMasque {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RawMasque").finish_non_exhaustive()
+    }
+}
+
+pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<RawMasque, D::Error> {
+    RawMasque::deserialize(deserializer)
+        .map_err(|_| serde::de::Error::custom("invalid MASQUE configuration fields"))
+}
+
+impl RawMasque {
+    pub(super) fn normalize(self) -> Result<(String, Option<String>, bool, ProxyProtocol)> {
+        if !cfg!(feature = "outbound-masque") {
+            return invalid("MASQUE outbound support is disabled at build time");
+        }
+        validate_host(&self.server, "MASQUE server")?;
+        validate_port(self.port, "MASQUE")?;
+        if self.handshake_timeout < 0 {
+            return invalid("MASQUE handshake timeout must be non-negative");
+        }
+        // The reference validates this object even when L4 does not create an
+        // IP stack. Unsupported stacks are not aliases for Vole's stack.
+        let ip_stack = self.ip_stack.normalize()?;
+        #[cfg(feature = "outbound-masque")]
+        crate::security::masque::validate_keys(&self.private_key, &self.public_key)
+            .map_err(|_| crate::VoleError::InvalidConfig("invalid MASQUE ECDSA keys".into()))?;
+        let network = match self.network.as_str() {
+            "h2" => MasqueNetwork::H2,
+            "h3-l4proxy" => MasqueNetwork::H3L4Proxy,
+            _ => MasqueNetwork::Quic,
+        };
+        if network != MasqueNetwork::H3L4Proxy {
+            return invalid("MASQUE CONNECT-IP mode is not supported yet");
+        }
+        if self.remote_dns_resolve && !self.dns.is_empty() {
+            return invalid("MASQUE node DNS is not supported yet");
+        }
+        let server_name = if self.sni.is_empty() {
+            match network {
+                MasqueNetwork::H3L4Proxy => L4_CONNECT_SNI,
+                MasqueNetwork::Quic | MasqueNetwork::H2 => CONNECT_SNI,
+            }
+            .into()
+        } else {
+            self.sni
+        };
+        validate_host(&server_name, "MASQUE sni")?;
+        // L4 never parses the local addresses or URI and never applies MTU
+        // or a positive handshake timeout. Retain their signed/raw values.
+        let udp = self.udp && network != MasqueNetwork::H3L4Proxy;
+        Ok((
+            self.name,
+            self.dialer_proxy,
+            udp,
+            ProxyProtocol::Masque(MasqueOutboundConfig {
+                address: self.server,
+                port: self.port,
+                private_key: self.private_key,
+                public_key: self.public_key,
+                server_name,
+                network,
+                ip: self.ip,
+                ipv6: self.ipv6,
+                uri: if self.uri.is_empty() {
+                    CONNECT_URI.into()
+                } else {
+                    self.uri
+                },
+                mtu: if self.mtu == 0 { 1280 } else { self.mtu },
+                udp,
+                handshake_timeout: self.handshake_timeout,
+                skip_cert_verify: self.skip_cert_verify,
+                name_cert_verify: self.name_cert_verify,
+                congestion_controller: self.congestion_controller,
+                cwnd: self.cwnd,
+                bbr_profile: self.bbr_profile,
+                ip_stack,
+                remote_dns_resolve: self.remote_dns_resolve,
+                dns: self.dns,
+            }),
+        ))
+    }
+}
+
+#[cfg(all(test, feature = "outbound-masque"))]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use boring::{
+        ec::{EcGroup, EcKey},
+        nid::Nid,
+        pkey::PKey,
+    };
+    use serde_json::{Value, json};
+
+    fn node() -> Value {
+        let key =
+            EcKey::generate(&EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap()).unwrap();
+        let private = STANDARD.encode(key.private_key_to_der().unwrap());
+        let public = STANDARD.encode(PKey::from_ec_key(key).unwrap().public_key_to_der().unwrap());
+        json!({
+            "name": "edge", "type": "masque", "server": "cover.invalid", "port": 443,
+            "private-key": private, "public-key": public, "network": "h3-l4proxy"
+        })
+    }
+
+    fn parse(node: Value) -> Result<Config> {
+        Config::parse_yaml(&serde_json::to_vec(&json!({"proxies": [node]})).unwrap())
+    }
+
+    fn options(config: &Config) -> &MasqueOutboundConfig {
+        let ProxyProtocol::Masque(options) = &config.proxies[0].protocol else {
+            panic!("MASQUE node");
+        };
+        options
+    }
+
+    #[test]
+    fn masque_l4_normalization_keeps_noop_fields_and_disables_business_udp() {
+        let config = parse(node()).unwrap();
+        assert_eq!(options(&config).server_name, L4_CONNECT_SNI);
+        assert_eq!(options(&config).uri, CONNECT_URI);
+        assert_eq!(options(&config).mtu, 1280);
+        let mut raw = node();
+        for (key, value) in [
+            ("ip", json!("not an IP")),
+            ("ipv6", json!("also not an IP")),
+            ("uri", json!("not a URI")),
+            ("mtu", json!(-1)),
+            ("udp", json!(true)),
+            ("handshake-timeout", json!(12)),
+            ("name-cert-verify", json!("not a hostname")),
+            ("congestion-controller", json!("unknown-default")),
+            ("cwnd", json!(-4)),
+            ("bbr-profile", json!("unknown-default")),
+            ("dns", json!(["not a nameserver"])),
+            (
+                "ip-stack",
+                json!({"mode": "AUTO", "congestion-controller": "CUBIC"}),
+            ),
+        ] {
+            raw[key] = value;
+        }
+        let config = parse(raw).unwrap();
+        let options = options(&config);
+        assert!(!config.proxies[0].udp && !options.udp);
+        assert_eq!(options.ip, "not an IP");
+        assert_eq!(options.uri, "not a URI");
+        assert_eq!(options.mtu, -1);
+        assert_eq!(options.handshake_timeout, 12);
+        assert_eq!(options.name_cert_verify, "not a hostname");
+        assert_eq!(options.ip_stack.mode, "auto");
+        assert_eq!(options.ip_stack.congestion_controller, "cubic");
+        let debug = format!("{:?}", config.proxies[0]);
+        assert!(!debug.contains(&options.private_key));
+        assert!(!debug.contains(&options.public_key));
+        assert!(!debug.contains(&options.address));
+    }
+
+    #[test]
+    fn masque_modes_and_active_dns_fail_before_unimplemented_consumers() {
+        for network in [None, Some(""), Some("quic"), Some("unknown"), Some("h2")] {
+            let mut raw = node();
+            if let Some(network) = network {
+                raw["network"] = json!(network);
+            } else {
+                raw.as_object_mut().unwrap().remove("network");
+            }
+            assert!(parse(raw).unwrap_err().to_string().contains("CONNECT-IP"));
+        }
+        let mut raw = node();
+        raw["remote-dns-resolve"] = json!(true);
+        raw["dns"] = json!([]);
+        assert!(parse(raw.clone()).is_ok());
+        raw["dns"] = json!(["tcp://192.0.2.53"]);
+        assert!(parse(raw).unwrap_err().to_string().contains("node DNS"));
+        for (field, value) in [
+            ("handshake-timeout", json!(-1)),
+            ("ip-stack", json!({"mode": "mips"})),
+            ("ip-stack", json!({"congestion-controller": "bbr3"})),
+            ("private-key", json!("invalid-private-key")),
+            ("certificate", json!("must not be a TLS identity field")),
+            ("client-fingerprint", json!("chrome")),
+            ("ip-stack", json!({"hidden-field": true})),
+        ] {
+            let mut raw = node();
+            raw[field] = value;
+            assert!(parse(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn masque_provider_overrides_reach_the_dedicated_policy() {
+        let config = Config::parse_yaml(&serde_json::to_vec(&json!({
+            "proxy-providers": {"nodes": {
+                "type": "inline",
+                "override": {"skip-cert-verify": true, "name-cert-verify": "placeholder", "udp": true},
+                "payload": [node()]
+            }}
+        })).unwrap()).unwrap();
+        assert!(options(&config).skip_cert_verify);
+        assert_eq!(options(&config).name_cert_verify, "placeholder");
+        assert!(!config.proxies[0].udp);
+    }
+}

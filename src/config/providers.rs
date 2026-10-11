@@ -790,7 +790,7 @@ fn apply_overrides(
             "up" | "down" => kind == "hysteria2",
             "udp-over-tcp" => kind == "ss",
             "skip-cert-verify" | "name-cert-verify" => match kind {
-                "trojan" | "anytls" | "hysteria2" | "tuic" | "trusttunnel" => true,
+                "trojan" | "anytls" | "hysteria2" | "tuic" | "trusttunnel" | "masque" => true,
                 "http" | "socks5" | "vmess" => {
                     map.get("tls").and_then(Value::as_bool) == Some(true)
                 }

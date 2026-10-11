@@ -197,7 +197,7 @@ impl ResolutionContext {
 
     /// A raw-IP node cannot originate a family without a configured local IP.
     /// Keep the same business DNS role, policy ordering and absolute deadline.
-    #[cfg(feature = "outbound-wireguard")]
+    #[cfg(any(feature = "outbound-wireguard", feature = "outbound-masque"))]
     pub(crate) async fn resolve_local_family(
         &self,
         target: &Destination,

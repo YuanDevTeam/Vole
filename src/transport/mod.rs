@@ -1,5 +1,7 @@
 //! Outbound wire transports.
 
+#[cfg(any(feature = "outbound-trusttunnel", feature = "outbound-masque"))]
+pub(crate) mod h3_connect;
 #[cfg(any(
     feature = "outbound-vless",
     feature = "outbound-trusttunnel",

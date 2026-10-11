@@ -105,6 +105,26 @@ UDP 底层使用可靠会话，提供累计 ACK、重传、有序交付、分片
 低熵编码作用于数据密文，认证 tag 保持原值；按真实载体预算缩小明文分片，
 不会扩大队列或接收预算。重传重新应用 nonce 与 padding，控制帧分片由物理写任务完成。
 
+## MASQUE
+
+`type: masque` 的 `network: h3-l4proxy` 使用 Cloudflare L4 HTTP/3 CONNECT，
+由 `outbound-masque` 提供。每个 TCP 目标独占请求流，共享受控 QUIC 连接；
+等待 2xx 响应后才交付业务流，拒绝响应不取消其它流，节点 Stop 等待所有驱动退出。
+业务域名使用受控本地解析；基础 UDP 始终关闭，`udp: true` 也不启用它。
+
+private-key 是标准 Base64 SEC1 ECDSA 私钥，public-key 是标准 Base64 ECDSA SPKI。
+客户端发送对应自签证书，服务端每张证书都必须使用固定公钥；不检查证书名称、
+信任根或有效期。skip-cert-verify 只关闭公钥固定，握手签名仍验证；
+name-cert-verify 是 Mihomo 保留的占位字段，不消费。每个物理连接使用独立 TLS 配置，
+关闭恢复与 0-RTT，TLS/QUIC 仍由 rustls/ring 执行。
+
+SNI 缺省或空串使用 consumer-masque-proxy.cloudflareclient.com。
+L4 不解析 ip/ipv6/uri，不消费 mtu 或正 handshake-timeout；负超时拒绝。
+QUIC 使用 20 字节 CID、初始 payload 1242 与受控预算交集、30 秒 keepalive；
+拥塞字段使用 TrustTunnel H3 的五种控制器及其参数语义。
+`ip-stack` 支持省略/auto 与省略/cubic，不把其它栈或算法映射为现有栈。
+当前 CONNECT-IP 模式和有效的节点私有 DNS 配置明确拒绝。
+
 ## SOCKS5
 
 仅 SOCKS5 CONNECT / UDP ASSOCIATE；用户名密码成对配置，不支持 SOCKS4。

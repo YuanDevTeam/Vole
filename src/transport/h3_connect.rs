@@ -1,5 +1,5 @@
-//! One logical TrustTunnel client's physical HTTP/3 session. Creation and
-//! request streams use supplied datagrams; the pool owns every protocol task.
+//! Shared HTTP/3 CONNECT sessions over supplied datagrams. Each protocol
+//! chooses its admission, response and idle policy; the pool owns its tasks.
 use crate::{
     dispatch::{BoxStream, DatagramBudget, DatagramTransport},
     resources::observation::{self, ResourceKind},
@@ -38,7 +38,7 @@ type RecvStream = h3::client::RequestStream<h3_stream::RecvStream, Bytes>;
 type SendOperation = Pin<Box<dyn Future<Output = (SendHalf, io::Result<()>)> + Send + 'static>>;
 type Observer = Arc<dyn Fn() + Send + Sync>;
 
-pub(super) struct QuicTransport {
+pub(crate) struct QuicTransport {
     pub transport: Box<dyn DatagramTransport>,
     pub peer: SocketAddr,
     pub budget: DatagramBudget,
@@ -58,6 +58,7 @@ struct Physical {
     connection: Mutex<Option<quinn::Connection>>,
     activity: Notify,
     cancel: CancellationToken,
+    idle_timeout: Option<Duration>,
 }
 impl Physical {
     fn reserve(self: &Arc<Self>) -> io::Result<Lease> {
@@ -82,7 +83,10 @@ impl Physical {
     fn retire_idle(&self, now: Instant) -> bool {
         let mut usage = self.usage.lock().unwrap();
         if usage.active == 0
-            && (usage.retiring || usage.idle_since.is_some_and(|since| now >= since + IDLE))
+            && (usage.retiring
+                || self.idle_timeout.is_some_and(|timeout| {
+                    usage.idle_since.is_some_and(|since| now >= since + timeout)
+                }))
         {
             usage.closed = true;
             true
@@ -125,13 +129,33 @@ impl Drop for Entry {
     }
 }
 
-pub(super) struct Pool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flavor {
+    TrustTunnel,
+    #[cfg(feature = "outbound-masque")]
+    MasqueL4,
+}
+impl Flavor {
+    fn deferred(self) -> bool {
+        self == Self::TrustTunnel
+    }
+    fn accepts(self, status: http::StatusCode) -> bool {
+        if self.deferred() {
+            status == 200
+        } else {
+            status.is_success()
+        }
+    }
+}
+
+pub(crate) struct Pool {
     connection: Arc<Mutex<Option<Entry>>>,
     opening: tokio::sync::Mutex<()>,
     admission: Mutex<()>,
     cancellation: CancellationToken,
     tasks: TaskTracker,
     congestion: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
+    flavor: Flavor,
 }
 impl Pool {
     pub fn new(
@@ -144,7 +168,16 @@ impl Pool {
             cancellation: CancellationToken::new(),
             tasks: TaskTracker::new(),
             congestion,
+            flavor: Flavor::TrustTunnel,
         }
+    }
+    #[cfg(feature = "outbound-masque")]
+    pub fn masque_l4(
+        congestion: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
+    ) -> Self {
+        let mut pool = Self::new(congestion);
+        pool.flavor = Flavor::MasqueL4;
+        pool
     }
     // Managed tasks observe cancellation themselves, so their cleanup is
     // awaited rather than dropped by an outer cancellation select.
@@ -180,6 +213,7 @@ impl Pool {
             let cancellation = self.cancellation.clone();
             let headers_close = close.clone();
             let headers_physical = lease.0.clone();
+            let flavor = self.flavor;
             self.spawn(async move {
                 let mut receive = ReceiveHalf(receive);
                 let result = tokio::select! {biased;
@@ -188,7 +222,7 @@ impl Pool {
                     ()=headers_physical.cancel.cancelled()=>Err(closed()),
                     response=receive.0.recv_response()=>response
                         .map_err(|error| { retire_physical(&headers_physical, &error); closed() })
-                        .and_then(|response|if response.status()==200 {Ok(())} else {Err(closed())}),
+                        .and_then(|response|if flavor.accepts(response.status()) {Ok(())} else {Err(closed())}),
                 };
                 if result.is_ok() {
                     if let Some(observer) = observer {
@@ -199,7 +233,7 @@ impl Pool {
                 }
                 let _ = ready.send(result.map(|()| receive));
             })?;
-            Ok(Box::new(Stream {
+            let mut stream = Stream {
                 response: Some(response),
                 receive: None,
                 send: Some(SendHalf { stream: send }),
@@ -210,7 +244,17 @@ impl Pool {
                 finishing: false,
                 finished: false,
                 _observation: observation::track(ResourceKind::Session),
-            }) as BoxStream)
+            };
+            if !self.flavor.deferred() {
+                let receive = stream
+                    .response
+                    .take()
+                    .unwrap()
+                    .await
+                    .map_err(|_| closed())??;
+                stream.receive = Some(receive);
+            }
+            Ok(Box::new(stream) as BoxStream)
         };
         tokio::select! {biased;
             ()=self.cancellation.cancelled()=>Err(closed()),
@@ -288,6 +332,7 @@ impl Pool {
             connection: Mutex::new(None),
             activity: Notify::new(),
             cancel,
+            idle_timeout: self.flavor.deferred().then_some(IDLE),
         });
         let (ready, response) = oneshot::channel();
         let congestion = self.congestion.clone();
@@ -298,6 +343,7 @@ impl Pool {
             physical.clone(),
             registry,
             congestion,
+            self.flavor,
             ready,
         ))?;
         let mut setup = SetupCancel(Some(physical.cancel.clone()));
@@ -343,6 +389,7 @@ async fn drive<F, Fut>(
     physical: Arc<Physical>,
     registry: Weak<Mutex<Option<Entry>>>,
     congestion: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
+    flavor: Flavor,
     ready: oneshot::Sender<io::Result<Entry>>,
 ) where
     F: FnOnce() -> Fut + Send + 'static,
@@ -375,7 +422,11 @@ async fn drive<F, Fut>(
             None
         };
         transport
-            .initial_mtu(1200)
+            .initial_mtu(if flavor.deferred() {
+                1200
+            } else {
+                mtu.min(1242)
+            })
             .min_mtu(1200)
             .mtu_discovery_config(discovery)
             .max_concurrent_bidi_streams(0_u8.into())
@@ -386,6 +437,15 @@ async fn drive<F, Fut>(
             .datagram_receive_buffer_size(None)
             .datagram_send_buffer_size(0)
             .max_idle_timeout(Some(QUIC_IDLE.try_into().map_err(|_| closed())?));
+        if !flavor.deferred() {
+            transport
+                .keep_alive_interval(Some(Duration::from_secs(30)))
+                .max_idle_timeout(Some(
+                    Duration::from_secs(30).try_into().map_err(|_| closed())?,
+                ))
+                .datagram_receive_buffer_size(Some(32 * 1024))
+                .datagram_send_buffer_size(32 * 1024);
+        }
         if let Some(congestion) = congestion {
             transport.congestion_controller_factory(congestion);
         }
@@ -396,6 +456,9 @@ async fn drive<F, Fut>(
         client.version(1);
         let mut limits = quinn::EndpointConfig::default();
         limits.max_udp_payload_size(mtu).map_err(|_| closed())?;
+        if !flavor.deferred() {
+            limits.cid_generator(|| Box::new(quinn_proto::RandomConnectionIdGenerator::new(20)));
+        }
         let mut ep =
             quinn::Endpoint::new_with_abstract_socket(limits, None, socket, runtime.clone())?;
         ep.set_default_client_config(client);
@@ -454,7 +517,8 @@ async fn drive<F, Fut>(
                 .lock()
                 .unwrap()
                 .idle_since
-                .map(|since| since + IDLE);
+                .zip(physical.idle_timeout)
+                .map(|(since, timeout)| since + timeout);
             tokio::select! {biased;
                 ()=physical.cancel.cancelled()=>break,
                 _=control.wait_idle()=>break,
@@ -829,6 +893,7 @@ mod tests {
         checks: AtomicUsize,
         reject: Arc<Notify>,
         goaway: Notify,
+        l4: bool,
     }
     impl Peer {
         fn new() -> Arc<Self> {
@@ -864,7 +929,14 @@ mod tests {
                 checks: AtomicUsize::new(0),
                 reject: Arc::new(Notify::new()),
                 goaway: Notify::new(),
+                l4: false,
             })
+        }
+        #[cfg(feature = "outbound-masque")]
+        fn l4() -> Arc<Self> {
+            let mut peer = Self::new();
+            Arc::get_mut(&mut peer).unwrap().l4 = true;
+            peer
         }
         async fn connect(self: Arc<Self>) -> io::Result<QuicTransport> {
             self.calls.fetch_add(1, Ordering::AcqRel);
@@ -913,7 +985,11 @@ mod tests {
                         assert_eq!(request.method(),http::Method::CONNECT);
                         assert!(request.uri().scheme().is_none());
                         assert!(request.uri().path_and_query().is_none());
-                        assert_eq!(request.headers()["proxy-authorization"],"Basic dTpw");
+                        if owner.l4 {
+                            assert!(!request.headers().contains_key("proxy-authorization"));
+                        } else {
+                            assert_eq!(request.headers()["proxy-authorization"],"Basic dTpw");
+                        }
                         let target=request.uri().authority().unwrap().as_str().to_owned();
                         let handler=owner.clone();
                         owner.tasks.spawn(async move {
@@ -924,14 +1000,17 @@ mod tests {
                                     stream.finish().await.unwrap();
                                     handler.checks.fetch_add(1,Ordering::AcqRel);
                                 } else if target=="reject.invalid:443" {
-                                    handler.reject.notified().await;
+                                    if !handler.l4 { handler.reject.notified().await; }
                                     stream.send_response(http::Response::builder().status(407).body(()).unwrap()).await.unwrap();
                                     stream.finish().await.unwrap();
                                 } else {
+                                    if handler.l4 {
+                                        stream.send_response(http::Response::builder().status(204).body(()).unwrap()).await.unwrap();
+                                    }
                                     let first=stream.recv_data().await.unwrap().unwrap();
                                     let mut first=first;
                                     let first=first.copy_to_bytes(first.remaining());
-                                    stream.send_response(http::Response::new(())).await.unwrap();
+                                    if !handler.l4 { stream.send_response(http::Response::new(())).await.unwrap(); }
                                     stream.send_data(first).await.unwrap();
                                     while let Ok(Some(mut data))=stream.recv_data().await {
                                         let data=data.copy_to_bytes(data.remaining());
@@ -968,7 +1047,13 @@ mod tests {
         }
     }
     fn request(target: &str) -> http::Request<()> {
-        super::super::authority_request(target, "Basic dTpw", "memory").unwrap()
+        http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(http::Uri::builder().authority(target).build().unwrap())
+            .header("proxy-authorization", "Basic dTpw")
+            .header("user-agent", "memory")
+            .body(())
+            .unwrap()
     }
     async fn open(pool: &Pool, peer: &Arc<Peer>, target: &str) -> BoxStream {
         let peer = peer.clone();
@@ -988,6 +1073,59 @@ mod tests {
         let mut response = vec![0; data.len()];
         stream.read_exact(&mut response).await.unwrap();
         assert_eq!(response, data);
+    }
+    #[cfg(feature = "outbound-masque")]
+    #[tokio::test]
+    async fn masque_l4_waits_for_2xx_and_rejection_keeps_independent_sibling_alive() {
+        let observation = ResourceProbe::default();
+        observation
+            .scope(async {
+                let peer = Peer::l4();
+                let pool = Pool::masque_l4(None);
+                let open = |target: &str| {
+                    let factory = peer.clone();
+                    let request = http::Request::builder()
+                        .method(http::Method::CONNECT)
+                        .uri(http::Uri::builder().authority(target).build().unwrap())
+                        .body(())
+                        .unwrap();
+                    pool.open_connect(
+                        request,
+                        Instant::now() + Duration::from_secs(3),
+                        None,
+                        move || factory.connect(),
+                    )
+                };
+                let mut first = open("echo.invalid:443").await.unwrap();
+                // The peer sends 204 before any DATA: a deferred or 200-only
+                // implementation would hang or reject this actual CONNECT stream.
+                let mut second = open("echo.invalid:443").await.unwrap();
+                echo(&mut first, b"first").await;
+                echo(&mut second, b"second").await;
+                assert!(open("reject.invalid:443").await.is_err());
+                echo(&mut second, b"after-rejection").await;
+                first.shutdown().await.unwrap();
+                echo(&mut second, b"after-close").await;
+                assert_eq!(peer.calls.load(Ordering::Acquire), 1);
+                let physical = pool
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .physical
+                    .clone();
+                assert!(physical.idle_timeout.is_none());
+                pool.shutdown().await;
+                assert!(second.write_all(b"after-stop").await.is_err());
+                assert!(open("echo.invalid:443").await.is_err());
+                assert_eq!(peer.calls.load(Ordering::Acquire), 1);
+                drop((first, second, pool, physical));
+                peer.stop().await;
+                assert_eq!(peer.closed.load(Ordering::Acquire), 1);
+            })
+            .await;
+        assert!(observation.snapshot().is_idle());
     }
     #[tokio::test]
     async fn trusttunnel_h3_deferred_headers_share_streams_probe_and_join_stop() {

@@ -12,10 +12,12 @@ pub use grpc::GrpcOptions;
 pub use sing_mux::{SingMuxConfig, SingMuxProtocol};
 mod http_proxy;
 mod ip_version;
+mod masque;
 mod mieru;
 mod trusttunnel;
 pub use http_proxy::HttpOutboundConfig;
 pub use ip_version::IpVersion;
+pub use masque::{MasqueIpStackOptions, MasqueNetwork, MasqueOutboundConfig};
 pub use mieru::{MieruHandshake, MieruMultiplexing, MieruOutboundConfig, MieruTransport};
 pub use trusttunnel::{TrustTunnelOutboundConfig, TrustTunnelPoolOptions};
 
@@ -739,6 +741,7 @@ pub struct ProxyConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyProtocol {
+    Masque(MasqueOutboundConfig),
     TrustTunnel(TrustTunnelOutboundConfig),
     Mieru(MieruOutboundConfig),
     Http(HttpOutboundConfig),
@@ -757,6 +760,7 @@ impl ProxyConfig {
     #[must_use]
     pub fn address(&self) -> &str {
         match &self.protocol {
+            ProxyProtocol::Masque(config) => &config.address,
             ProxyProtocol::TrustTunnel(config) => &config.address,
             ProxyProtocol::Mieru(config) => &config.address,
             ProxyProtocol::WireGuard(config) => &config.address,
@@ -775,6 +779,7 @@ impl ProxyConfig {
     #[must_use]
     pub const fn port(&self) -> u16 {
         match &self.protocol {
+            ProxyProtocol::Masque(config) => config.port,
             ProxyProtocol::TrustTunnel(config) => config.port,
             ProxyProtocol::Mieru(config) => config.port,
             ProxyProtocol::WireGuard(config) => config.port,
@@ -1633,6 +1638,8 @@ impl<'de> Deserialize<'de> for RawOutbound {
 // protocol fields inline avoids extra heap allocations in the startup path.
 #[allow(clippy::large_enum_variant)]
 enum RawProtocol {
+    #[serde(rename = "masque")]
+    Masque(#[serde(deserialize_with = "masque::deserialize")] masque::RawMasque),
     #[serde(rename = "trusttunnel")]
     TrustTunnel(
         #[serde(deserialize_with = "trusttunnel::deserialize")] trusttunnel::RawTrustTunnel,
@@ -2853,6 +2860,7 @@ pub(crate) fn proxy_graph_order(
 impl RawOutbound {
     fn normalize(self) -> Result<PendingProxyConfig> {
         let (tag, dialer_proxy, udp, protocol) = match self.protocol {
+            RawProtocol::Masque(raw) => raw.normalize()?,
             RawProtocol::TrustTunnel(raw) => raw.normalize()?,
             RawProtocol::Mieru(raw) => raw.normalize()?,
             RawProtocol::WireGuard(raw) => raw.normalize()?,
