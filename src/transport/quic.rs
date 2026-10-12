@@ -86,6 +86,23 @@ impl std::fmt::Debug for DatagramSocket {
 }
 
 impl DatagramSocket {
+    /// Transfer one validated, complete packet to the quiche owner. Quinn's
+    /// borrowed AsyncUdpSocket path continues to use poll_recv below.
+    #[cfg(feature = "quiche-h3-transport")]
+    pub(crate) fn poll_recv_owned(&self, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
+        self.shared.reader.register(cx.waker());
+        let mut state = self.shared.state.lock().unwrap();
+        if state.closed {
+            return Poll::Ready(Err(state.error.unwrap_or(io::ErrorKind::BrokenPipe).into()));
+        }
+        let Some(payload) = state.incoming.pop_front() else {
+            return Poll::Pending;
+        };
+        drop(state);
+        self.shared.changed.notify_one();
+        Poll::Ready(Ok(payload))
+    }
+
     /// The endpoint must configure its QUIC MTU no larger than this budget.
     pub fn budget(&self) -> DatagramBudget {
         self.budget
