@@ -90,9 +90,9 @@ jobs:
       - name: Cache native Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.name }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**') }}
+          key: release-${{ matrix.name }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
           workspaces: ". -> target"
-          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR BORING AWS_LC LIBCLANG BINDGEN
+          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR VOLE BORING AWS_LC LIBCLANG BINDGEN
           cache-bin: "false"
       - name: Build and package production CLI
         shell: bash
@@ -222,7 +222,7 @@ jobs:
       - name: Cache native Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.name }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**') }}
+          key: release-${{ matrix.name }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
           workspaces: ". -> target"
           env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR ANDROID_NDK_HOME VOLE BORING AWS_LC LIBCLANG BINDGEN
           cache-bin: "false"
@@ -301,7 +301,7 @@ jobs:
       - name: Cache native Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-ffi-apple-${{ matrix.target }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**') }}
+          key: release-ffi-apple-${{ matrix.target }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
           workspaces: ". -> target"
           env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR VOLE BORING AWS_LC LIBCLANG BINDGEN
           cache-bin: "false"

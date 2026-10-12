@@ -84,7 +84,7 @@ CPU 数判断、业务数量配额、FD 预热或 DNS socket 复用。
 
 `stream-transport` 仅包装传入 IO，不创建 socket 或 DNS。WS/HTTP响应首部最多16 KiB、100字段；WS用户请求头最多100字段，额外固定升级头和early-data仍计入16 KiB总预算。WS early-data最多2,048原始字节，头名称/路径后缀由类型化选项区分。WS消息和单帧最多64 KiB，写入切块16 KiB；HTTP首包正文直接写入，不整体复制或持续按HTTP正文定界。
 
-共享的无池gRPC/legacy H2适配器每个实例仅拥有一条底层连接与一个逻辑流，不是全局并发许可。Trojan/VMess/VLESS共用节点级gRPC池，物理连接按节点实例隔离，复用保留原上游与安全策略，每条逻辑流独立认证。流窗口64 KiB、连接窗口128 KiB、最大HTTP/2帧和发送缓冲各16 KiB、解码负载64 KiB。读侧按实际消费量释放窗口；每poll最多处理32个片段/控制消息。Trojan池使用内部duplex模式，仅发送END_STREAM并保留读取和lease；VMess/VLESS只结束当前逻辑流。关闭前已接受的数据须到达所提供IO的flush边界，不能仅排入h2队列后立即reset/abort；每个逻辑写端最多一个待确认数据块，Stop可取消等待。节点池最多保留4条空闲连接，PING ACK期限15秒；节点Stop取消并join全部物理驱动。无池模式的owner.stop同样等待驱动任务退出；Drop只做取消兜底，不作为同步停止通过证据。WS/HTTP适配器按底层CloseWrite语义工作，协议包装层可以根据Mihomo契约结束整个逻辑流。所有握手使用调用方同一个绝对deadline。
+共享的无池gRPC/legacy H2适配器每个实例仅拥有一条底层连接与一个逻辑流，不是全局并发许可。Trojan/VMess/VLESS共用节点级gRPC池，物理连接按节点实例隔离，复用保留原上游与安全策略，每条逻辑流独立认证。流窗口64 KiB、连接窗口128 KiB、最大HTTP/2帧和发送缓冲各16 KiB、解码负载64 KiB。读侧按实际消费量释放窗口；每poll最多处理32个片段/控制消息。Trojan池使用内部duplex模式，仅发送END_STREAM并保留读取和lease；VMess/VLESS只结束当前逻辑流。关闭前已接受的数据须到达所提供IO的flush边界，不能仅排入h2队列后立即reset/abort；每个逻辑写端最多一个待确认数据块，Stop可取消等待。节点池最多保留4条空闲连接，PING ACK期限15秒；节点Stop取消并join全部物理驱动。无池模式的owner.stop同样等待驱动任务退出；Drop只做取消兜底，不作为同步停止通过证据。WS/HTTP适配器按底层CloseWrite语义工作，协议包装层可以根据已声明的协议关闭契约结束整个逻辑流。所有握手使用调用方同一个绝对deadline。
 
 XUDP现在只拥有已认证流上的帧编码；VLESS响应头由VLESS包装层处理。元数据仍最多512字节，单payload仍受调用方预算和u16 wire上限约束，不新增全局会话额度。
 
@@ -133,13 +133,23 @@ DELETE 通过取消令牌立即唤醒等待中的接收，关闭与 flow-id 替�
 
 `DatagramBudget` 分别表达当前层的发送和接收 payload 上限。嵌套协议先为下层申请有界 envelope 空间，再按实际协议/地址族开销扣除下层能力，与调用方预算取交集；不能把接收上限直接当作发送能力。DIRECT、SOCKS5、SS 2022、SS/AnyTLS UoT 和 VLESS XUDP 保留对端/地址校验。超出发送预算在写入前失败，超出接收预算丢当前包并有界让出执行权，close 后不能恢复收发。UoT 的流头不从 UDP payload 预算扣除；SS 首包门控、读取任务与单响应队列的局部上限见[出站](outbounds.md#udp-over-tcp-v2)。
 
-`quic-transport` 只把已有 `DatagramTransport` 适配成 Quinn 的受控 UDP 接口，没有内部 bind、DNS 或 DIRECT 回落。每个连接双向各最多32个排队数据报，另允许一个正在发送的包；TX满返回WouldBlock，RX满暂停读取。接收等待不会持有发送队列锁；Pending发送不会重复提交。单逻辑peer/物理peer映射和来源校验独立保留，不接受未请求的目标、GSO或源地址覆盖。物理 socket 仍只能来自 Dialer。
+`quic-transport` 只把已有 `DatagramTransport` 适配成 Quinn/quiche 共用的受控 UDP 接口，没有内部 bind、DNS 或 DIRECT 回落。每个连接双向各最多32个排队数据报，另允许一个正在发送的包；TX满返回WouldBlock，RX满暂停读取。接收等待不会持有发送队列锁；Pending发送不会重复提交。单逻辑peer/物理peer映射和来源校验独立保留，不接受未请求的目标、GSO或源地址覆盖。物理 socket 仍只能来自 Dialer。
+
+`h3-transport` 使用官方 quiche 的低层驱动，共享上述数据报适配器，不创建新的 socket。
+每个 H3 stream 的已读取 body 最多保留 64 KiB，每次业务写入最多 16 KiB；
+只有本地主动请求创建业务状态，未知 DATAGRAM flow 丢弃，已注册 flow 的交付队列最多 64 项。
+这些是局部缓存界限，不宣称 QUIC 库内部总内存固定，也不限制活动业务流总数。
 
 QUIC双向可用payload至少1,200字节；endpoint必须显式把QUIC MTU限制在有效预算内。IPv4/IPv6路径MTU分别先扣除28/48字节IP+UDP头，边界和单字节不足均有定向测试。
 
-QUIC owner.stop先取消并等待驱动，再关闭并释放上游；上游close最多1秒。Driver Drop仅为取消/abort兜底，不能作为同步Stop验收。队列容量是单连接局部界限，不是全局QUIC连接准入数。
+QUIC owner.stop先取消并等待驱动，再关闭并释放上游；上游close最多1秒。H3 在其一秒物理关闭预算内停止新请求准入、继续传输收尾并执行关闭交换，不承诺逐流远端 ACK。Driver Drop仅为取消/abort兜底，不能作为同步Stop验收。队列容量是单连接局部界限，不是全局QUIC连接准入数。
 
-TUIC 与 Hysteria2 共用这一接点；TUIC 的独立会话、关联 ID 退役、控制流、分片负载
+TUIC 与 Hysteria2 共用这一接点。接收窗口通过官方 Quinn API 固定设置：
+每流 max(initial, min(maximum, 4 MiB))，
+连接 initial；默认 TUIC 4 / 6.4 MiB，HY2 8 / 20 MiB，不预分配全部信用额度。
+DoQ 初始及最小发送 payload 为 1200 字节，接收预算独立保留，允许较大的合法对端包。
+
+TUIC 的独立会话、关联 ID 退役、控制流、分片负载
 及交付队列边界见 [TUIC v5](outbounds.md#tuic-v5)。旧池的待建流也持有所有权，
 不能在等待 credit 时被当成空闲池回收。TUIC 业务 UDP 队列使用独立观测类别。
 
@@ -148,7 +158,7 @@ TUIC 与 Hysteria2 共用这一接点；TUIC 的独立会话、关联 ID 退役�
 - 不设置固定的活动请求或活动传输总许可数。
 - 相同 key 的 cache miss 使用 singleflight；leader 取消后 follower 重新选举。
 - UDP 传输属于单次请求，同一尝试的重发复用当前传输。
-- TCP、DoT、DoH 按上游身份、endpoint 和 route target 复用；一条连接同时只处理一个查询。DNS TLS 不保留恢复票据，复用已认证连接。
+- TCP、DoT、DoH 按上游身份、endpoint 和 route target 复用；TCP、DoT、HTTP/1.1 一条连接同时只处理一个查询，HTTP/2 和 HTTP/3 每连接最多 32 个并发查询。DNS TLS 不保留恢复票据，复用已认证连接。
 - 活动 TCP 不设固定数量上限；空闲连接总数最多 4，同 key 最多 2，空闲超时 30 秒。
 - 查询、单次尝试和 UDP 重发期限分别为 5 秒、3 秒和 1 秒。每次查询最多并发 4 个上游，胜出后取消其余尝试；UDP TC 转同一上游 TCP。
 - 响应最多扫描 64 条记录，类型化缓存和提示最多保留 16 个唯一 IP。

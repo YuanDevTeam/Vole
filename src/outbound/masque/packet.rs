@@ -133,11 +133,11 @@ fn valid_udp(ip: &IpPacket<'_>) -> bool {
 }
 
 fn add(sum: &mut u32, bytes: &[u8]) {
-    let mut words = bytes.chunks_exact(2);
-    for word in &mut words {
+    let (words, remainder) = bytes.as_chunks::<2>();
+    for word in words {
         *sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
     }
-    if let Some(last) = words.remainder().first() {
+    if let Some(last) = remainder.first() {
         *sum += u32::from(*last) << 8;
     }
 }

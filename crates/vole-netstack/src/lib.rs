@@ -11,6 +11,7 @@ mod device;
 mod icmp;
 mod packet;
 mod pmtu;
+mod segmentation;
 mod stack;
 mod tcp;
 mod udp;

@@ -27,6 +27,17 @@ pub(crate) struct ConnectRequest {
     pub(crate) response: oneshot::Sender<std::io::Result<TcpStream>>,
 }
 
+pub(crate) struct InitialMtuRequest {
+    pub(crate) mtu: usize,
+    pub(crate) deadline: Instant,
+    pub(crate) response: oneshot::Sender<std::io::Result<()>>,
+}
+
+pub(crate) enum ClientRequest {
+    Connect(ConnectRequest),
+    InitialMtu(InitialMtuRequest),
+}
+
 struct ConnectGuard {
     cancellation: CancellationToken,
     notify: Arc<Notify>,
@@ -45,13 +56,48 @@ impl Drop for ConnectGuard {
 /// Active TCP connections driven entirely by the stack's raw-IP endpoints.
 #[derive(Clone)]
 pub struct TcpConnector {
-    pub(crate) sender: mpsc::Sender<ConnectRequest>,
+    pub(crate) sender: mpsc::Sender<ClientRequest>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) notify: Arc<Notify>,
     pub(crate) addresses: ClientConfig,
 }
 
 impl TcpConnector {
+    /// Reduces the initial transmit MTU to a known packet-transport budget.
+    ///
+    /// This must complete before the first TCP connection. Receive packet
+    /// limits and source prefixes remain unchanged. Admission and completion
+    /// share the supplied deadline, and Stop never waits on this command.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for an increase or invalid family MTU,
+    /// `AlreadyExists` once TCP output or a flow exists, `TimedOut` at the
+    /// deadline, and `ConnectionAborted` when the stack stops.
+    pub async fn set_initial_mtu(&self, mtu: usize, deadline: Instant) -> std::io::Result<()> {
+        if Instant::now() >= deadline {
+            return Err(connect_timeout());
+        }
+        let (response, received) = oneshot::channel();
+        let request = ClientRequest::InitialMtu(InitialMtuRequest {
+            mtu,
+            deadline,
+            response,
+        });
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => return Err(connect_stopped()),
+            () = tokio::time::sleep_until(deadline) => return Err(connect_timeout()),
+            result = self.sender.send(request) => result.map_err(|_| connect_stopped())?,
+        }
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => Err(connect_stopped()),
+            () = tokio::time::sleep_until(deadline) => Err(connect_timeout()),
+            result = received => result.unwrap_or_else(|_| Err(connect_stopped())),
+        }
+    }
+
     /// Connects to an IP endpoint and returns only after TCP is established.
     ///
     /// Queue admission and handshake share the supplied absolute deadline.
@@ -106,7 +152,7 @@ impl TcpConnector {
             biased;
             () = self.cancellation.cancelled() => return Err(connect_stopped()),
             () = tokio::time::sleep_until(deadline) => return Err(connect_timeout()),
-            result = self.sender.send(request) => result.map_err(|_| connect_stopped())?,
+            result = self.sender.send(ClientRequest::Connect(request)) => result.map_err(|_| connect_stopped())?,
         }
         let result = tokio::select! {
             biased;

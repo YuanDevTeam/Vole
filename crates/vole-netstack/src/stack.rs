@@ -28,8 +28,8 @@ use crate::{
     icmp::{IcmpIngress, classify as classify_icmp},
     pmtu::parse_path_mtu_hint,
     tcp::{
-        ConnectRequest, FlowKey, TcpConnector, TcpListener, TcpStream, TcpStreamHandle,
-        connect_stopped, connect_timeout,
+        ClientRequest, ConnectRequest, FlowKey, InitialMtuRequest, TcpConnector, TcpListener,
+        TcpStream, TcpStreamHandle, connect_stopped, connect_timeout,
     },
     udp::{UdpDatagram, UdpSocket, parse_udp_packet},
 };
@@ -505,7 +505,7 @@ struct TcpEntry {
 
 struct ClientDriver {
     addresses: ClientConfig,
-    requests: mpsc::Receiver<ConnectRequest>,
+    requests: mpsc::Receiver<ClientRequest>,
     next_port: u16,
 }
 
@@ -585,6 +585,9 @@ impl Driver {
     }
 
     fn configure_client(&mut self, addresses: &ClientConfig) {
+        if addresses.path_mtu_discovery {
+            self.device.enable_path_mtu();
+        }
         self.interface.set_any_ip(false);
         self.interface.update_ip_addrs(|configured| {
             configured.clear();
@@ -624,7 +627,7 @@ impl Driver {
         }
     }
 
-    async fn next_connect(client: &mut Option<ClientDriver>) -> Option<ConnectRequest> {
+    async fn next_request(client: &mut Option<ClientDriver>) -> Option<ClientRequest> {
         match client {
             Some(client) => client.requests.recv().await,
             None => std::future::pending().await,
@@ -660,9 +663,9 @@ impl Driver {
                         tokio::task::consume_budget().await;
                     }
                 }
-                request = Self::next_connect(&mut self.client), if has_connect_requests => {
+                request = Self::next_request(&mut self.client), if has_connect_requests => {
                     if let Some(request) = request {
-                        self.connect_tcp(request);
+                        self.handle_client_request(request);
                         tokio::task::consume_budget().await;
                     }
                 }
@@ -719,17 +722,15 @@ impl Driver {
             let client = self.client.as_ref().unwrap();
             if hint.outer_destination == hint.local.ip()
                 && client.addresses.contains_address(hint.local.ip())
-                && let Some(entry) = self.tcp_entries.get(&FlowKey {
+                && self.tcp_entries.contains_key(&FlowKey {
                     source: hint.remote,
                     destination: hint.local,
                 })
             {
-                // Only the matching active socket can validate a quote against
-                // bytes it actually sent. No host route or global PMTU cache
-                // participates in this userspace connection's update.
-                self.sockets
-                    .get_mut::<tcp::Socket>(entry.socket)
-                    .apply_icmp_path_mtu(hint.sequence, hint.mtu);
+                // Packet metadata admits only actually emitted, unacknowledged
+                // bytes. The unmodified TCP engine owns retransmission timing;
+                // its next output is split to this flow's reduced path budget.
+                self.device.apply_path_mtu(hint);
             }
             return;
         }
@@ -810,6 +811,7 @@ impl Driver {
                 return;
             }
         }
+        self.device.acknowledge(&packet);
         if self.device.push_rx(packet).is_err() {
             // A pending ingress packet must never be overwritten.
             self.stats.0.rejected_tcp.fetch_add(1, Ordering::AcqRel);
@@ -890,7 +892,6 @@ impl Driver {
                 return;
             }
         };
-        let path_mtu_discovery = client.addresses.path_mtu_discovery;
         let mut selected = None;
         for _ in EPHEMERAL_PORT_START..=u16::MAX {
             let port = client.next_port;
@@ -926,9 +927,6 @@ impl Driver {
             )));
             return;
         }
-        if path_mtu_discovery {
-            socket.configure_path_mtu(self.config.mtu);
-        }
         let handle = Arc::new(TcpStreamHandle::new(
             self.config.recv_layer_buffer_size(),
             self.config.send_layer_buffer_size(),
@@ -949,11 +947,59 @@ impl Driver {
         self.update_flow_stats();
     }
 
+    fn handle_client_request(&mut self, request: ClientRequest) {
+        match request {
+            ClientRequest::Connect(request) => self.connect_tcp(request),
+            ClientRequest::InitialMtu(request) => self.set_initial_mtu(request),
+        }
+    }
+
+    fn set_initial_mtu(&mut self, request: InitialMtuRequest) {
+        if request.response.is_closed() {
+            return;
+        }
+        let result = if self.cancellation.is_cancelled() {
+            Err(connect_stopped())
+        } else if tokio::time::Instant::now() >= request.deadline {
+            Err(connect_timeout())
+        } else if !self.tcp_entries.is_empty() || self.device.emitted() != 0 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "initial TCP MTU is already in use",
+            ))
+        } else {
+            let addresses = self
+                .client
+                .as_ref()
+                .expect("active command has a client")
+                .addresses;
+            if request.mtu > self.config.mtu || addresses.validate(request.mtu).is_err() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid initial TCP packet budget",
+                ))
+            } else {
+                self.config.mtu = request.mtu;
+                self.device.set_initial_mtu(request.mtu);
+                // smoltcp snapshots DeviceCapabilities when Interface is
+                // created. Before the first flow, rebuild that snapshot and
+                // restore the same sources/routes without replacing sockets.
+                let mut config = InterfaceConfig::new(HardwareAddress::Ip);
+                config.random_seed = 0x4f_6e_65_56_43_6f_72_65;
+                self.interface = Interface::new(config, &mut self.device, Instant::now());
+                self.configure_client(&addresses);
+                Ok(())
+            }
+        };
+        let _ = request.response.send(result);
+    }
+
     fn drive(&mut self) {
         if self.raw_outbound.is_closed() {
             self.cancellation.cancel();
             return;
         }
+        self.device.flush_pending();
         // Busy packet traffic must not starve command admission. The same
         // bounded prefix as raw ingress avoids draining an unbounded burst.
         for _ in 0..RAW_INGRESS_BATCH {
@@ -964,17 +1010,19 @@ impl Driver {
             let Some(request) = request else {
                 break;
             };
-            self.connect_tcp(request);
+            self.handle_client_request(request);
         }
         if !self.device.tx_is_full() {
             self.interface
                 .poll(Instant::now(), &mut self.device, &mut self.sockets);
         }
         self.drive_tcp_sockets();
+        self.device.flush_pending();
         if !self.device.tx_is_full() {
             self.interface
                 .poll(Instant::now(), &mut self.device, &mut self.sockets);
         }
+        self.device.flush_pending();
     }
 
     fn drive_tcp_sockets(&mut self) {
@@ -1064,6 +1112,7 @@ impl Driver {
 
         for flow in inactive {
             if let Some(entry) = self.tcp_entries.remove(&flow) {
+                self.device.forget_flow(flow);
                 self.sockets.remove(entry.socket);
                 self.half_open.remove(&flow);
                 entry.handle.socket_closed.store(true, Ordering::Release);
@@ -1168,11 +1217,18 @@ impl Driver {
 
     fn shutdown(&mut self) {
         self.cancellation.cancel();
-        self.device.discard_rx();
+        self.device.clear();
         if let Some(client) = &mut self.client {
             client.requests.close();
             while let Ok(request) = client.requests.try_recv() {
-                let _ = request.response.send(Err(connect_stopped()));
+                match request {
+                    ClientRequest::Connect(request) => {
+                        let _ = request.response.send(Err(connect_stopped()));
+                    }
+                    ClientRequest::InitialMtu(request) => {
+                        let _ = request.response.send(Err(connect_stopped()));
+                    }
+                }
             }
         }
         for entry in self.tcp_entries.values_mut() {

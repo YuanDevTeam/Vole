@@ -11,7 +11,8 @@ cargo clippy --locked --all-features --lib --bins -- -D warnings
 cargo test --locked --all-features --all-targets --no-run
 cargo test --locked --no-default-features --features cli --bin vole cli::tests::
 cargo test --locked --no-default-features --features cli --lib invoke::foreground::tests::
-cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --no-default-features --features rustls-ring --lib vole_
+cargo test --locked --features cli,interop-test --lib transport::quic::
+cargo test --locked -p vole-blake3-raw --test derive
 cargo test --locked --features cli,interop-test --test tuic_memory configured_ip_sni_millisecond_heartbeat_and_uot_versions_are_consumed
 cargo test --locked --features cli --lib tuic_uot_
 cargo test --locked --lib config::tests::
@@ -93,7 +94,7 @@ uv run --project scripts --locked ruff check scripts
 uv run --project scripts --locked ruff format --check scripts
 ```
 
-DNS URL 参数、DoH GET/Basic、H2 并发与取消、ALPN/H1 回退只使用内存报文、显式来源快照和 duplex TLS 对端。DoQ/H3 与版本竞争使用有界 memory DatagramTransport 和抽象 Quinn socket；不读取宿主 DNS 或启动监听服务。
+DNS URL 参数、DoH GET/Basic、H2 并发与取消、ALPN/H1 回退只使用内存报文、显式来源快照和 duplex TLS 对端。DoQ/H3 与版本竞争使用有界 memory DatagramTransport，分别驱动 Quinn/quiche；不读取宿主 DNS 或启动监听服务。
 `dns::runtime::ech_tests::` 与 `security::ech_dynamic_tests::` 使用内存 DNS 报文、显式来源快照和 duplex TLS，验证 HTTPS65 ECH 来源、节点角色、内层名称、取消和 Stop。`security::ech::tests::` 用真实 rustls Outer/Inner 加解密验证各 KEM/KDF/AEAD 家族，命名模板保留独立准入。
 `controller_secure_` 使用 duplex HTTP/TLS/H2、内存证书与临时文件，验证 CORS、共享鉴权/路由、客户端认证与握手签名、RSA 2048、候选更新及 Stop；不绑定宿主监听器。
 
@@ -162,12 +163,12 @@ Controller 主动探测与内存使用纯内存过滤：`manual_probes_keep_one_
 
 规则bundle的定向内存/临时文件验证使用 `resource::bundle` 与 `resource::cache::tests::bundle_`，覆盖真实MRS成员、解码预算/取消、缓存优先及原HTTP来源回退，不启动宿主服务。
 
-QUIC 的 `vole_` native fixtures 使用官方 vendored crate 的 standalone lock，不启用默认
-provider/features；检查消费/RTT驱动的真实MAX信用帧、初始transport parameters、
-含头部DATAGRAM帧限额，以及 ACK/loss/discard、路径切换和实际 pacing。
-`transport::quic::` 是 Core 的纯内存拥塞控制过滤器，覆盖窗口、profile、采样、恢复和内存边界。
-H3 的 CONNECT 伪头、Cloudflare 协议 token 与实际 peer SETTINGS 内存回归由 test workflow
-的 `H3 memory fixtures` 执行，使用有界内存 QUIC 和上游要求的临时 sibling adapter
-布局，不启动其网络 integration tests。
+`transport::quic::` 验证官方 Quinn Middle 固定窗口、独立初始/最大值和规范 DATAGRAM 容量。
+`tuic_memory` 使用真实内存 Quinn 对端覆盖固定信用、数据报预算、未读取流与 Stop；
+`dns_quic_` 覆盖 DoQ 的独立发送/接收预算、复用及取消。它们不修改 registry 源码。
+`transport::quiche_h3::tests::` 与 `transport::h3_connect::` 使用真实内存 QUIC，
+覆盖 CONNECT、Cloudflare token、实际 peer SETTINGS、未知 DATAGRAM flow 丢弃与 Stop 回收；
+`security::tls::tests::quiche::` 验证新 H3 路径的证书、pin、mTLS 和 ECH。
+这些用例不启动网络 listener。
 TUIC额外内存对端消费入口ip、SNI、毫秒Heartbeat和UoT v1/v2
 字节；不创建宿主监听服务。它们不替代最终参考互通、吞吐和RSS测量。

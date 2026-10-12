@@ -88,7 +88,7 @@ ech-opts:
   保留其原始编码；下载腿切换后端时按完整来源重新选择。未知版本或不兼容条目可跳过，
   无兼容条目、畸形长度、非法 public_name 或不支持的必需扩展失败，不能依赖 BoringSSL 静默忽略。
 - public_name 要求多标签 LDH 名称；Rustls 的名称类型另限制每标签 63 字节并拒绝纯数值末段，
-  named Boring 还拒绝十六进制 IP lookalike。这里保留真实后端限制，不能宣称任意 Go DNS 名称均兼容。
+  Boring（命名指纹和 H3）还拒绝十六进制 IP lookalike。这里保留真实后端限制，不能宣称任意 Go DNS 名称均兼容。
 - `{}` / `{enable: false}` 清除 ECH。null、未知字段、错型均拒绝；诊断不回显配置或查询名。
 
 `xhttp-opts.download-settings.ech-opts` 缺省继承整个主腿对象；出现时整对象替换，
@@ -98,12 +98,16 @@ ech-opts:
 
 ### 后端与失败边界
 
-无指纹 TCP TLS 与 H3 使用官方 rustls + ring，通过公开 HPKE trait 接入官方
-`hpke`；命名指纹使用锁定的自有 boring fork ECH 接口。动态来源只获取配置，
-不改变接收算法或 Shadowsocks 的 AWS-LC 例外。
+无指纹 TCP TLS 与 HY2 的 Quinn 使用官方 rustls + ring，通过公开 HPKE trait 接入官方
+`hpke`；命名指纹和 quiche H3 使用锁定的同一 boring ECH 接口。
+H3 的实际算法范围为 X25519/HKDF-SHA256，加 AES128/256-GCM 或 ChaCha20-Poly1305。
+切到 H3 时按完整静态来源重新选择，动态来源按 H3 后端解析；没有兼容配置就失败，
+不把 rustls 的其他 KEM/KDF 支持带入原生后端。动态来源只获取配置，
+不改变后端算法或 Shadowsocks 的 AWS-LC 例外。
 
 两后端都必须真正接受 ECH 才交出业务连接。rustls QUIC 的 ECH 拒绝作为原生
-握手错误传播，H3 在握手完成前不发送 HTTP 请求；TCP 另检查 accepted 状态。
+握手错误传播；quiche H3 在首包前配置真实 ECH，并在握手后检查接受状态与实际 ALPN，
+通过前不发送 HTTP 请求。TCP 同样检查 accepted 状态。
 不把 GREASE 当真实 ECH，不自动采用 retry config，不重拨、不回放业务，也不
 降级为未加密 ClientHello 的成功连接。静态旧密钥需宿主更新配置；动态新连接随 DNS 缓存有效期取得来源。
 
@@ -174,7 +178,7 @@ raw/packetaddr 每关联只拥有一个已建流，首次发送前已固定物�
 
 VLESS 响应头允许延迟到业务响应前；TCP 不等待它才允许发送请求。读取、首次响应和传输握手共用原建链期限，错误或超时释放 IO。UUID 和业务目标不进入 Debug/诊断。
 
-普通 TCP/TLS 按底层 CloseWrite 语义工作；HTTP 首包伪装没有 Mihomo CloseWrite，shutdown 释放整个逻辑流并唤醒读侧。gRPC/H2 结束当前逻辑流，gRPC 的兄弟流与节点池不受影响。XHTTP 上传 EOF/shutdown 关闭整条逻辑连接，包括下载腿；需要完整响应时在关闭前读完。验收分别检查正常完整性和对齐 Mihomo 的关闭行为，不要求所有传输半关闭后都收到尾包。
+普通 TCP/TLS 按底层 CloseWrite 语义工作；HTTP 首包伪装没有 Mihomo CloseWrite，shutdown 释放整个逻辑流并唤醒读侧。gRPC/H2 结束当前逻辑流，gRPC 的兄弟流与节点池不受影响。XHTTP 上传 EOF/shutdown 关闭整条逻辑连接，包括下载腿；需要完整响应时在关闭前读完。验收检查正常数据完整性、与支持对端的互通，以及 Vole 声明的关闭、取消和 Stop 契约，不要求所有传输半关闭后都收到尾包。
 
 ## 验证边界
 

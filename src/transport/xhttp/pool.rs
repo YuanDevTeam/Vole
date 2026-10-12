@@ -59,7 +59,7 @@ struct Entry {
 }
 impl Entry {
     fn retired(&self) -> bool {
-        matches!(&self.transport, Transport::Multiplexed(physical) if physical.driver.task.is_finished())
+        matches!(&self.transport, Transport::Multiplexed(physical) if physical.driver.task.is_finished() || matches!(&physical.sender, SendRequest::H3(sender) if !sender.requests.can_open_request()))
             || self.remaining == Some(0)
             || self.max_reuses > 0 && self.reuses >= self.max_reuses
             || self.expires.is_some_and(|at| Instant::now() >= at)
@@ -230,7 +230,7 @@ impl Pool {
                 else {
                     return None;
                 };
-                Some(sender.observation.stats().frame_tx.ping)
+                Some(sender.observation.pings())
             })
             .collect()
     }

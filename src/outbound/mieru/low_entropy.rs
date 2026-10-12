@@ -19,7 +19,7 @@ impl LowEntropyEncoding {
     fn validate(self) -> io::Result<usize> {
         let count = self.source_bytes()?;
         if self.half_mask.count_ones() != (count * 4) as u32
-            || !(self.rotation <= 15 || (self.rotation % 16 == 0 && self.rotation <= 240))
+            || !(self.rotation <= 15 || (self.rotation.is_multiple_of(16) && self.rotation <= 240))
             || self.padding_bit > 1
         {
             return Err(invalid());
@@ -111,7 +111,7 @@ impl LowEntropyEncoding {
 fn deposit(mut source: u64, mut positions: u64) -> u64 {
     let mut result = 0;
     while positions != 0 {
-        let position = positions & positions.wrapping_neg();
+        let position = positions.isolate_lowest_one();
         if source & 1 != 0 {
             result |= position;
         }
@@ -125,7 +125,7 @@ fn extract(source: u64, mut positions: u64) -> u64 {
     let mut result = 0;
     let mut bit = 1;
     while positions != 0 {
-        let position = positions & positions.wrapping_neg();
+        let position = positions.isolate_lowest_one();
         if source & position != 0 {
             result |= bit;
         }

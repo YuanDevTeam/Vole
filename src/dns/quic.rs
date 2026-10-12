@@ -3,9 +3,12 @@ use super::{MAX_HTTP_HEADER_BYTES, MAX_MESSAGE_SIZE};
 use crate::{
     config::DnsNameserver,
     dispatch::{DatagramBudget, DatagramTransport},
-    transport::quic::{self, OwnedRuntime},
+    transport::{
+        quic::{self, OwnedRuntime},
+        quiche_h3,
+    },
 };
-use bytes::{Buf, Bytes};
+use bytes::Buf;
 use std::{
     collections::HashMap,
     future::Future,
@@ -39,13 +42,18 @@ pub(super) struct Raw {
     pub transport: Box<dyn DatagramTransport>,
     pub peer: SocketAddr,
     pub budget: DatagramBudget,
-    pub tls: Arc<rustls::ClientConfig>,
+    pub tls: Tls,
     pub server_name: String,
+}
+
+pub(super) enum Tls {
+    Quinn(Arc<rustls::ClientConfig>),
+    H3(crate::security::QuicheTls),
 }
 
 enum Protocol {
     Doq(quinn::Connection),
-    H3(h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>),
+    H3(quiche_h3::Client),
 }
 
 struct Connection {
@@ -251,6 +259,10 @@ impl<K: Clone + Eq + Hash + Send + Sync + 'static> Pool<K> {
 
 fn live(connection: &Connection) -> bool {
     connection.metadata.healthy.load(Ordering::Acquire)
+        && match &connection.protocol {
+            Protocol::H3(sender) => sender.can_open_request(),
+            Protocol::Doq(connection) => connection.close_reason().is_none(),
+        }
         && !connection.cancel.is_cancelled()
         && (connection.metadata.active.load(Ordering::Acquire) != 0
             || Instant::now().duration_since(*connection.metadata.used.lock().unwrap())
@@ -328,16 +340,24 @@ async fn drive(
     metadata: Arc<Metadata>,
     ready: oneshot::Sender<io::Result<Protocol>>,
 ) {
+    if matches!(kind, Kind::H3) {
+        drive_h3(open, stop, metadata, ready).await;
+        return;
+    }
     let runtime = Arc::new(OwnedRuntime::new(CancellationToken::new()));
     let mut endpoint = None;
     let mut datagram = None;
     let mut ready = Some(ready);
     let connected = async {
         let raw = open.await?;
-        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(raw.tls).map_err(failure)?;
+        let Tls::Quinn(tls) = raw.tls else {
+            return Err(closed());
+        };
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(failure)?;
         let (socket, driver) = quic::attach(raw.transport, raw.peer, raw.budget)?;
         datagram = Some(driver);
-        let mtu = socket.budget().quic_payload_limit()?;
+        let udp_limit = socket.budget().quic_payload_limit()?;
+        let mtu = udp_limit.min(crate::dispatch::QUIC_MIN_PAYLOAD_BYTES);
         let mut limits = quinn::TransportConfig::default();
         limits
             .initial_mtu(mtu)
@@ -354,7 +374,9 @@ async fn drive(
         let mut client = quinn::ClientConfig::new(Arc::new(crypto));
         client.transport_config(Arc::new(limits));
         let mut config = quinn::EndpointConfig::default();
-        config.max_udp_payload_size(mtu).map_err(failure)?;
+        config
+            .max_udp_payload_size(socket.budget().receive())
+            .map_err(failure)?;
         let mut peer =
             quinn::Endpoint::new_with_abstract_socket(config, None, socket, runtime.clone())?;
         peer.set_default_client_config(client);
@@ -379,31 +401,12 @@ async fn drive(
         if handshake.protocol.as_deref() != Some(alpn) {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        match kind {
-            Kind::Doq => {
-                ready
-                    .take()
-                    .unwrap()
-                    .send(Ok(Protocol::Doq(connection.clone())))
-                    .map_err(|_| closed())?;
-                connection.closed().await;
-            }
-            Kind::H3 => {
-                let (mut control, requests) = h3::client::builder()
-                    .max_field_section_size(MAX_HTTP_HEADER_BYTES as u64)
-                    .build(h3_quinn::Connection::new(connection))
-                    .await
-                    .map_err(failure)?;
-                let keep_requests = requests.clone();
-                ready
-                    .take()
-                    .unwrap()
-                    .send(Ok(Protocol::H3(requests)))
-                    .map_err(|_| closed())?;
-                let _ = control.wait_idle().await;
-                drop(keep_requests);
-            }
-        }
+        ready
+            .take()
+            .unwrap()
+            .send(Ok(Protocol::Doq(connection.clone())))
+            .map_err(|_| closed())?;
+        connection.closed().await;
         Ok::<_, io::Error>(())
     };
     let result =
@@ -422,6 +425,70 @@ async fn drive(
     }
 }
 
+async fn drive_h3(
+    open: impl Future<Output = io::Result<Raw>>,
+    stop: CancellationToken,
+    metadata: Arc<Metadata>,
+    ready: oneshot::Sender<io::Result<Protocol>>,
+) {
+    let raw =
+        tokio::select! {biased; () = stop.cancelled() => Err(closed()), result = open => result };
+    let raw = match raw {
+        Ok(raw) => raw,
+        Err(error) => {
+            metadata.healthy.store(false, Ordering::Release);
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    let Tls::H3(tls) = raw.tls else {
+        metadata.healthy.store(false, Ordering::Release);
+        let _ = ready.send(Err(closed()));
+        return;
+    };
+    let transport = quiche_h3::Transport {
+        transport: raw.transport,
+        peer: raw.peer,
+        budget: raw.budget,
+        tls,
+        server_name: raw.server_name,
+    };
+    let options = quiche_h3::Options {
+        stream_window: (MAX_MESSAGE_SIZE + 2) as u64,
+        connection_window: (MAX_MESSAGE_SIZE * MAX_STREAMS) as u64,
+        idle: IDLE_TIMEOUT,
+        headers: MAX_HTTP_HEADER_BYTES as u64,
+        ..Default::default()
+    };
+    match quiche_h3::Driver::new(transport, options).await {
+        Ok((client, driver)) => {
+            let cancel = CancellationToken::new();
+            let driver = driver.run(cancel.clone());
+            tokio::pin!(driver);
+            let mut finished = false;
+            let connected = tokio::select! {biased; () = stop.cancelled() => Err(closed()), _ = &mut driver => { finished = true; Err(closed()) }, result = client.ready(false) => result };
+            match connected {
+                Ok(()) => {
+                    if ready.send(Ok(Protocol::H3(client))).is_ok() {
+                        tokio::select! {biased; () = stop.cancelled() => {}, _ = &mut driver => { finished = true; } }
+                    }
+                }
+                Err(error) => {
+                    let _ = ready.send(Err(error));
+                }
+            }
+            cancel.cancel();
+            if !finished {
+                let _ = driver.await;
+            }
+        }
+        Err(error) => {
+            let _ = ready.send(Err(error));
+        }
+    }
+    metadata.healthy.store(false, Ordering::Release);
+}
+
 struct DoqStream {
     send: quinn::SendStream,
     receive: quinn::RecvStream,
@@ -435,15 +502,12 @@ impl Drop for DoqStream {
         }
     }
 }
-struct H3Stream(
-    h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    bool,
-);
+struct H3Stream(quiche_h3::RequestStream, bool);
 impl Drop for H3Stream {
     fn drop(&mut self) {
         if !self.1 {
-            self.0.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
-            self.0.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+            self.0.stop_sending(quiche_h3::REQUEST_CANCELLED);
+            self.0.stop_stream(quiche_h3::REQUEST_CANCELLED);
         }
     }
 }

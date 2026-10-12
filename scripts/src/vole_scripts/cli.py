@@ -4,8 +4,16 @@ import argparse
 import subprocess
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
-from .builds import build_android, build_apple, build_cli, build_linux, build_windows
+from .builds import (
+    build_android,
+    build_apple,
+    build_cli,
+    build_linux,
+    build_windows,
+    prepare_native_dependencies,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -14,6 +22,17 @@ def _parser() -> argparse.ArgumentParser:
         description="Build Vole platform artifacts.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+
+    dependencies = commands.add_parser(
+        "deps", help="prepare official native dependencies"
+    )
+    dependencies.add_argument(
+        "--target", help="Rust target triple (default: native host)"
+    )
+    dependencies.add_argument("--backend", choices=("wintun", "uwp"), default="wintun")
+    dependencies.add_argument(
+        "--github-env", type=Path, help="append paths for CI Cargo checks"
+    )
 
     build = commands.add_parser("build", help="build platform artifacts")
     platforms = build.add_subparsers(dest="platform", required=True)
@@ -36,7 +55,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        if args.platform == "cli":
+        if args.command == "deps":
+            prepare_native_dependencies(args.target, args.backend, args.github_env)
+        elif args.platform == "cli":
             build_cli(args.target, args.profile)
         elif args.platform == "apple":
             build_apple()

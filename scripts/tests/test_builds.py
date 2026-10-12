@@ -25,6 +25,13 @@ class BuildTests(unittest.TestCase):
         )
         self.commands = []
         self.enterContext(patch.object(builds, "_run", side_effect=self.compile))
+        self.enterContext(
+            patch.object(
+                builds.blake3,
+                "environment",
+                side_effect=lambda target, host, env, backend: env,
+            )
+        )
 
     def write(self, relative, data=b"library"):
         path = self.root / relative

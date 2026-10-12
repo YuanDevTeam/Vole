@@ -150,7 +150,7 @@ pub(crate) enum StandardTlsProfile {
 /// Reusable standard TLS client shared by protocol-specific outbound code.
 ///
 /// REALITY remains in [`super::SecurityClient`] with a distinct authentication
-/// and session policy. Ordinary unprofiled TLS and QUIC continue to use rustls.
+/// and session policy. Unprofiled stream TLS and Quinn continue to use rustls.
 #[derive(Clone)]
 pub struct StandardTlsClient {
     connector: StandardConnector,
@@ -159,6 +159,14 @@ pub struct StandardTlsClient {
     buffer_limit: usize,
     require_ech: bool,
     dynamic_ech: Option<Arc<DynamicEchTls>>,
+    #[cfg(feature = "h3-transport")]
+    quiche_source: Option<Arc<QuicheSource>>,
+}
+
+#[cfg(feature = "h3-transport")]
+struct QuicheSource {
+    context: SecurityContext,
+    options: TlsClientOptions,
 }
 
 struct DynamicEchTls {
@@ -184,6 +192,42 @@ impl std::fmt::Debug for StandardTlsClient {
 }
 
 impl StandardTlsClient {
+    #[cfg(feature = "h3-transport")]
+    pub(crate) fn quiche_config(&self) -> io::Result<super::QuicheTls> {
+        if self.dynamic_ech.is_some() {
+            return Err(io::Error::other(
+                "dynamic ECH requires a node resolution context",
+            ));
+        }
+        let source = self
+            .quiche_source
+            .as_ref()
+            .ok_or_else(|| io::Error::other("HTTP/3 requires H3 ALPN"))?;
+        super::QuicheTls::standard(&source.context, &self.server_name, &source.options)
+    }
+
+    #[cfg(feature = "h3-transport")]
+    pub(crate) async fn quiche_config_with_context(
+        &self,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<super::QuicheTls> {
+        let Some(dynamic) = &self.dynamic_ech else {
+            return self.quiche_config();
+        };
+        let mut options = dynamic.options.clone();
+        options.ech = Some(
+            options
+                .ech
+                .as_ref()
+                .expect("dynamic ECH source")
+                .for_backend(true)
+                .map_err(|_| io::Error::other("ECH has no compatible QUIC configuration"))?
+                .resolve(&self.server_name, context)
+                .await?,
+        );
+        super::QuicheTls::standard(&dynamic.context, &self.server_name, &options)
+    }
+
     #[cfg(feature = "quic-transport")]
     pub(crate) fn quic_config(&self) -> io::Result<(Arc<ClientConfig>, String)> {
         if self.dynamic_ech.is_some() {
@@ -317,6 +361,18 @@ impl StandardTlsClient {
             ));
         }
 
+        #[cfg(feature = "h3-transport")]
+        let quiche_source = options
+            .alpn
+            .iter()
+            .any(|protocol| protocol == b"h3")
+            .then(|| {
+                Arc::new(QuicheSource {
+                    context: context.clone(),
+                    options: options.clone(),
+                })
+            });
+
         if options.client_fingerprint.is_some() {
             #[cfg(not(feature = "tls-fingerprint"))]
             return Err(io::Error::new(
@@ -338,6 +394,8 @@ impl StandardTlsClient {
                     buffer_limit,
                     require_ech,
                     dynamic_ech: None,
+                    #[cfg(feature = "h3-transport")]
+                    quiche_source,
                 });
             }
         }
@@ -407,6 +465,8 @@ impl StandardTlsClient {
             buffer_limit,
             require_ech,
             dynamic_ech: None,
+            #[cfg(feature = "h3-transport")]
+            quiche_source,
         })
     }
 

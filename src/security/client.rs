@@ -1,6 +1,5 @@
 use std::{io, sync::Arc};
 
-use rustls::ClientConfig;
 #[cfg(feature = "interop-test")]
 use rustls::RootCertStore;
 
@@ -63,12 +62,13 @@ impl std::fmt::Debug for SecurityClient {
 }
 
 impl SecurityClient {
-    pub(crate) async fn quic_config_with_context(
+    #[cfg(feature = "h3-transport")]
+    pub(crate) async fn quiche_config_with_context(
         &self,
         context: &crate::outbound::EstablishContext,
-    ) -> io::Result<(Arc<ClientConfig>, String)> {
+    ) -> io::Result<super::QuicheTls> {
         match &self.backend {
-            SecurityBackend::Standard(client) => client.quic_config_with_context(context).await,
+            SecurityBackend::Standard(client) => client.quiche_config_with_context(context).await,
             _ => Err(io::Error::other("HTTP/3 requires standard TLS")),
         }
     }

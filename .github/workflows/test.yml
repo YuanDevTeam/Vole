@@ -44,13 +44,16 @@ jobs:
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "0.12"
+      - name: Prepare official BLAKE3 static dependency
+        shell: bash
+        run: uv run --project scripts --locked vole-scripts deps --github-env "$GITHUB_ENV"
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: tests-${{ matrix.profile }}
+          key: tests-${{ matrix.profile }}-${{ hashFiles('scripts/native/**', 'scripts/src/vole_scripts/*.py') }}
           workspaces: ". -> target"
           # Native TLS artifacts must not cross runner SDK/image changes.
-          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR BORING AWS_LC LIBCLANG BINDGEN
+          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR BORING AWS_LC LIBCLANG BINDGEN VOLE_BLAKE3
           cache-bin: "false"
       - name: Format and scripts
         if: matrix.profile == 'features'
@@ -112,29 +115,40 @@ jobs:
               return set(nodes[item["id"]]["features"])
 
           require(not any("watfaq" in (item.get("source") or "").lower() for item in packages), "retired dependency source is forbidden")
+          workspace_root = Path(metadata["workspace_root"])
+          require(not (workspace_root / "vendor").exists(), "Core vendor sources are forbidden")
+          require(not (workspace_root / "crates" / "vole-blake3-raw" / "vendor").exists(), "BLAKE3 must use the installed official C library")
+          native_manifest = json.loads((workspace_root / "scripts" / "native" / "blake3" / "vcpkg.json").read_text(encoding="utf-8"))
+          require(native_manifest.get("builtin-baseline") == "e456309491fd875487bf02b8a0dca76c1b1b00cc", "unapproved official BLAKE3 C registry baseline")
+          require(native_manifest.get("dependencies") == [{"name": "blake3", "default-features": False}], "BLAKE3 C must use the reviewed static-only package")
+          require(native_manifest.get("overrides") == [{"name": "blake3", "version": "1.8.7", "port-version": 0}], "unapproved official BLAKE3 C version")
+          for name, version in (("idna", "1.1.0"), ("url", "2.5.8")):
+              require(package(name, version).get("license") == "MIT OR Apache-2.0", f"unapproved {name} license")
+          for item in packages:
+              if item["name"].startswith(("icu_", "unicode-")):
+                  require(item.get("source") in registry, f"{item['name']} must use official registry Unicode data")
+          rust_blake3 = package("blake3", "1.8.7")
+          require(rust_blake3.get("license") == "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception", "unapproved Rust BLAKE3 license")
           rustls = package("rustls", "0.23.45")
           package("tokio-rustls", "0.26.5")
           package("rustls-native-certs", "0.8.4")
           ring = package("ring")
           quinn = package("quinn", "0.11.12")
-          proto = package("quinn-proto", "0.11.19", {None})
-          proto_root = (Path(metadata["workspace_root"]) / "vendor" / "quinn-proto").resolve()
-          require(Path(proto["manifest_path"]).resolve() == proto_root / "Cargo.toml", "QUIC protocol must use the reviewed in-repository source")
-          require(proto.get("license") == "MIT OR Apache-2.0" and all((proto_root / name).is_file() for name in ("LICENSE-MIT", "LICENSE-APACHE", "README.vole.md")), "QUIC protocol provenance or licenses are missing")
+          proto = package("quinn-proto", "0.11.19")
+          require(proto.get("license") == "MIT OR Apache-2.0", "unapproved QUIC protocol license")
           require({"rustls-ring", "ring"} <= features(proto), "QUIC protocol must use rustls/ring")
           require("rustls-ring" in features(quinn), "Quinn wrapper must use rustls/ring")
-          require(not (features(proto) | features(quinn)) & {"aws-lc-rs", "aws-lc-rs-fips", "rustls-aws-lc-rs", "rustls-aws-lc-rs-fips"}, "QUIC may not enable a second TLS provider")
-          require(proto["id"] in {dependency["pkg"] for dependency in nodes[quinn["id"]]["deps"]}, "Quinn wrapper must resolve the reviewed protocol source")
-          h3 = package("h3", "0.0.8", {None})
-          h3_root = (Path(metadata["workspace_root"]) / "vendor" / "h3").resolve()
-          require(Path(h3["manifest_path"]).resolve() == h3_root / "Cargo.toml", "HTTP/3 must use the reviewed in-repository source")
-          require(h3.get("license") == "MIT" and all((h3_root / name).is_file() for name in ("LICENSE", "README.vole.md")), "HTTP/3 provenance or license is missing")
+          require(not (features(proto) | features(quinn)) & {"aws-lc-rs", "aws-lc-rs-fips", "rustls-aws-lc-rs", "rustls-aws-lc-rs-fips"}, "Quinn must keep the approved ring TLS provider")
+          require(proto["id"] in {dependency["pkg"] for dependency in nodes[quinn["id"]]["deps"]}, "Quinn wrapper must resolve the official protocol source")
+          h3 = package("h3", "0.0.8")
+          require(h3.get("license") == "MIT", "unapproved Hysteria2 HTTP/3 license")
           h3_quinn = package("h3-quinn", "0.0.10")
-          require(h3["id"] in {dependency["pkg"] for dependency in nodes[h3_quinn["id"]]["deps"]}, "HTTP/3 adapter must resolve the reviewed source")
-          stack = package("smoltcp", "0.14.0", {None})
-          stack_root = Path("vendor/smoltcp").resolve()
-          require(Path(stack["manifest_path"]).resolve() == stack_root / "Cargo.toml", "raw IP stack must use the reviewed in-repository source")
-          require(stack.get("license") == "0BSD" and all((stack_root / name).is_file() for name in ("LICENSE-0BSD.txt", "README.vole.md")), "raw IP stack provenance or license is missing")
+          require(h3["id"] in {dependency["pkg"] for dependency in nodes[h3_quinn["id"]]["deps"]}, "Hysteria2 HTTP/3 adapter must resolve the official source")
+          quiche = package("quiche", "0.30.0")
+          require(features(quiche) == {"boring", "boring-sys", "boringssl-boring-crate", "foreign-types-shared"}, "quiche must use the shared Boring provider without FFI or qlog")
+          require(quiche.get("license") == "BSD-2-Clause", "unapproved quiche license")
+          stack = package("smoltcp", "0.14.0")
+          require(stack.get("license") == "0BSD", "unapproved raw IP stack license")
           rsa = package("rsa", "0.9.10")
           rcgen = package("rcgen", "0.14.10")
           require(features(rsa) == {"std"}, "RSA is restricted to controller key generation")
@@ -168,6 +182,7 @@ jobs:
           for parent, children in (("boring", {"boring-sys"}), ("tokio-boring", {"boring", "boring-sys"})):
               dependencies = {dependency["pkg"] for dependency in nodes[native[parent]["id"]]["deps"]}
               require(all(native[child]["id"] in dependencies for child in children), f"{parent} must use the approved native TLS packages")
+          require(native["boring"]["id"] in {dependency["pkg"] for dependency in nodes[quiche["id"]]["deps"]}, "quiche must share Vole's approved Boring package")
           aws = [item for item in packages if item["name"].lower().startswith("aws-lc")]
           if aws:
               require({item["name"] for item in aws} == {"aws-lc-rs", "aws-lc-sys"}, "unapproved AWS-LC package")
@@ -181,24 +196,16 @@ jobs:
               for name, required in (("shadowsocks", {"aead-cipher-2022"}), ("shadowsocks-crypto", {"v2", "aws-lc"})):
                   require(required <= features(chain[name]), f"{name} must enable SS 2022")
               require(not any(features(item) & {"fips", "aead-cipher-2022-extra", "v2-extra"} for item in chain.values()), "unapproved SS 2022 or AWS-LC mode")
-          print("Locked TLS sources, controller generation, HPKE/AGE algorithms and SS 2022 dependency chain passed")
+          print("Locked TLS/Unicode/BLAKE3 sources, controller generation, HPKE/AGE algorithms and SS 2022 dependency chain passed")
           PY
-      - name: QUIC native memory fixtures
+      - name: Official BLAKE3 raw memory vectors
         if: matrix.profile == 'features'
         run: |
-          cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --no-default-features --features rustls-ring --lib vole_
+          cargo test --locked -p vole-blake3-raw
       - name: H3 memory fixtures
         if: matrix.profile == 'features'
         run: |
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          cargo = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")))
-          adapter = next((cargo / "registry" / "src").glob("*/h3-quinn-0.0.10"))
-          Path("vendor/h3-quinn").symlink_to(adapter, target_is_directory=True)
-          PY
-          trap 'rm vendor/h3-quinn' EXIT
-          cargo test --manifest-path vendor/h3/Cargo.toml --locked --features i-implement-a-third-party-backend-and-opt-into-breaking-changes --lib vole_
+          cargo test --locked --features cli --lib transport::quiche_h3::tests::
       - name: Production and netstack clippy
         if: matrix.profile == 'features'
         run: |
@@ -259,7 +266,7 @@ jobs:
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
             outbound::trusttunnel:: outbound::mieru:: outbound::masque:: security::masque:: config::masque::
-            transport::quic:: transport::masque_codec:: transport::h3_connect::
+            transport::quic:: transport::quiche_h3:: transport::masque_codec:: transport::h3_connect::
             transport::sing_mux::smux_driver::tests:: transport::sing_mux::tests::
             grpc_duplex_pool_keeps_response
             outbound::sing_mux::tests::
@@ -325,7 +332,7 @@ jobs:
             cargo check --locked --no-default-features --features "outbound-$protocol" --lib
             run_test 1 --features "outbound-$protocol" --lib runtime::tests::integration_feature_admission_is_explicit_without_opening_sockets -- --exact
           done
-          for feature in outbound-http inbound-http inbound-socks5 stream-transport quic-transport sing-mux shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
+          for feature in outbound-http inbound-http inbound-socks5 stream-transport quic-transport h3-transport sing-mux shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
             cargo check --locked --no-default-features --features "$feature" --lib
           done
           cargo check --locked --no-default-features --features cli --bin vole

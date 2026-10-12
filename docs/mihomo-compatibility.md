@@ -1,4 +1,14 @@
-# Mihomo 配置兼容范围
+# Mihomo 兼容原则与范围
+
+## 兼容原则
+
+Vole Core 以**内存优化和吞吐达标为第一目标**。与 Mihomo 的兼容要求是：在 Vole 支持的协议和模式范围内，与 **Mihomo listener 和官方协议 server 端互通**，不寻求配置字段行为完全一致。
+
+实现策略、默认值、窗口、缓冲区、定时器和资源生命周期可按 Vole 的性能目标取舍；差异必须在对应契约中明确说明，并保持协议数据正确性、认证和安全边界。字段名称继续参考 Mihomo，当前接受的配置仍以 Vole 文档为准。
+
+兼容验收以真实对端的握手、认证、数据传输和关闭验证为依据；内存与吞吐通过相同输入和目标负载的压力测试验证。逐字段对照用于确认支持范围和说明差异，不以字段行为相等作为验收门槛。验证范围见 [验收边界](acceptance.md)。
+
+## 当前支持范围
 
 配置名称以 [Mihomo v1.19.32](https://github.com/MetaCubeX/mihomo/tree/88dcbf7f1614a67c3b36b848ee3592dfa92ada36) 为参考。
 Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配置子集不等于完整替代 Mihomo。
@@ -51,13 +61,16 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - Apple、Android、Windows UWP 的网络设置、权限和 App 生命周期仍归宿主；Windows Wintun 使用外置 DLL。
   借用 Unix fd 只复制并保留原描述符。Linux 扩展路由、旁路由、防火墙/NAT、进程/UID 规则不在当前范围。
 
-平台编译、内存回归、双 CLI 行为比较、官方协议互通和压力测试是不同的验证层次，见
+平台编译、内存回归、CLI 对照诊断、协议互通和压力测试是不同的验证层次，见
 [验收边界](acceptance.md)。任一层通过都不代表所有字段取值、组合、平台或真机行为已验证。
 
-QUIC 窗口由本仓库 quinn-proto 补丁实际消费并发出 MAX_STREAM_DATA/MAX_DATA；不是
-将四个字段折成固定窗口。initial>max 保留初值，max 大于 VarInt clamp，无法编码的
-initial 明确拒绝。Quinn 的 credit 通告节奏仍沿其实现，与 quic-go 的通告阈值不完全相同。
+QUIC 使用官方 Quinn 固定 Middle 接收窗口：每流为 max(initial, min(maximum, 4 MiB))，
+连接为 initial，不复现 Mihomo 的自适应窗口。initial>max 保留初值，max 大于 VarInt clamp，
+无法编码的 initial 明确拒绝；credit 通告沿 Quinn 原生实现。
 HY2 正 handshake-timeout 与 Core 原期限合并；参考正值后台 offer 的生命周期可能超出
 单次调用期限，该差异保留。TUIC max-open-streams=1 接受但实际不能取得业务所有权；
-frame 无法容纳 TUIC 头时可解析，业务 UDP 发送失败，不额外拒绝TCP配置。全字段互通与窗口增大后的 RSS/吞吐/UDP loss 不由
+frame 无法容纳 TUIC 头时可解析，业务 UDP 发送失败，不额外拒绝TCP配置。支持模式的互通与窗口增大后的 RSS/吞吐/UDP loss 不由
 这些内存 fixture 证明，由最终 CLI/container 对照分别记录。
+
+Provider override 表达式的 upcase/downcase 使用 Rust 标准 Unicode 全映射，可能产生多个字符；
+输出、取消和计算预算保持。它不固定到 Go 的 Unicode 15 单字符映射，也不改变 IDNA 域名处理。

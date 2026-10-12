@@ -22,6 +22,10 @@ mod named;
 #[path = "tls_named_wire_tests.rs"]
 mod named_wire;
 
+#[cfg(feature = "h3-transport")]
+#[path = "tls_quiche_tests.rs"]
+mod quiche;
+
 struct Chain {
     certificates: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,

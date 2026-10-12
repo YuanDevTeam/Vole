@@ -93,6 +93,14 @@ async fn active_connect(
     parts: &mut vole_netstack::ClientNetStackParts,
     destination: SocketAddr,
 ) -> (vole_netstack::TcpStream, Flow, u32) {
+    active_connect_with_mss(parts, destination, 1460).await
+}
+
+async fn active_connect_with_mss(
+    parts: &mut vole_netstack::ClientNetStackParts,
+    destination: SocketAddr,
+    peer_mss: u16,
+) -> (vole_netstack::TcpStream, Flow, u32) {
     let mut connect = Box::pin(
         parts
             .tcp_connector
@@ -114,12 +122,104 @@ async fn active_connect(
             sequence,
             TcpFlags::SYN | TcpFlags::ACK,
             &[],
-            1460,
+            peer_mss,
         ))
         .await
         .unwrap();
     let stream = tokio::time::timeout(WAIT, connect).await.unwrap().unwrap();
     (stream, peer, sequence)
+}
+
+#[tokio::test]
+async fn client_pmtu_partial_ack_recovers_and_stop_releases_a_blocked_split() {
+    let mut parts = NetStack::start_client(
+        NetStackConfig {
+            mtu: 9000,
+            packet_queue: 1,
+            max_poll_interval: Duration::from_millis(2),
+            ..NetStackConfig::default()
+        },
+        ClientConfig {
+            prefixes: [Some(client_prefix("10.23.0.2", 24)), None],
+            receive_packet_limit: 9000,
+            path_mtu_discovery: true,
+        },
+    )
+    .unwrap();
+    let (mut stream, peer, sequence) =
+        active_connect_with_mss(&mut parts, "198.51.100.20:443".parse().unwrap(), 8960).await;
+    let payload: Vec<_> = (0..2048)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    stream.write_all(&payload).await.unwrap();
+    let original = timeout_tcp_data(&mut parts.packet_stream).await;
+    assert!(
+        tcp_payload(&original).len() >= 2000,
+        "jumbo fixture emitted only {} bytes",
+        tcp_payload(&original).len()
+    );
+    let payload = &payload[..tcp_payload(&original).len()];
+    assert_eq!(tcp_payload(&original), payload);
+    let acknowledged = 900;
+    parts
+        .packet_sink
+        .send(build_tcp(
+            &peer,
+            701,
+            sequence.wrapping_add(acknowledged),
+            TcpFlags::ACK,
+            b"!",
+        ))
+        .await
+        .unwrap();
+    let mut barrier = [0];
+    tokio::time::timeout(WAIT, stream.read_exact(&mut barrier))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(barrier, *b"!");
+    // A checksum-valid quote inside the acknowledged prefix is stale.
+    parts
+        .packet_sink
+        .send(build_path_mtu_hint(&original, 576))
+        .await
+        .unwrap();
+    // Quote the first unacknowledged sequence using a complete genuine TCP
+    // packet. The ICMP message still retains only its eight-byte TCP prefix.
+    let tail = build_tcp(
+        &Flow {
+            source: peer.destination,
+            destination: peer.source,
+        },
+        sequence.wrapping_add(acknowledged),
+        702,
+        TcpFlags::ACK,
+        &payload[usize::try_from(acknowledged).unwrap()..],
+    );
+    parts
+        .packet_sink
+        .send(build_path_mtu_hint(&tail, 576))
+        .await
+        .unwrap();
+    let recovered = timeout_tcp_data(&mut parts.packet_stream).await;
+    assert_eq!(
+        tcp_sequence(&recovered),
+        sequence.wrapping_add(acknowledged)
+    );
+    assert!(recovered.len() <= 576);
+    assert_eq!(
+        tcp_payload(&recovered),
+        &payload[900..900 + tcp_payload(&recovered).len()]
+    );
+    // A one-slot output leaves thousands of bytes in the packet adapter's
+    // original. Waiting neither drains the output nor makes Stop depend on it.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tokio::time::timeout(WAIT, parts.control.stop())
+        .await
+        .unwrap();
+    assert!(stream.is_stopped());
+    assert_eq!(parts.stats.snapshot().active_tcp, 0);
+    assert!(parts.packet_stream.recv().await.is_none());
 }
 
 #[tokio::test]
@@ -130,7 +230,7 @@ async fn masque_client_mtu_sources_and_independent_receive_budget_use_actual_pac
     ] {
         let mut parts = NetStack::start_client(
             NetStackConfig {
-                mtu,
+                mtu: 1500,
                 ..NetStackConfig::default()
             },
             ClientConfig {
@@ -140,6 +240,11 @@ async fn masque_client_mtu_sources_and_independent_receive_budget_use_actual_pac
             },
         )
         .unwrap();
+        parts
+            .tcp_connector
+            .set_initial_mtu(mtu, tokio::time::Instant::now() + WAIT)
+            .await
+            .unwrap();
         let mut connect = Box::pin(parts.tcp_connector.connect(
             destination.parse().unwrap(),
             tokio::time::Instant::now() + WAIT,
@@ -209,6 +314,67 @@ async fn masque_client_mtu_sources_and_independent_receive_budget_use_actual_pac
         assert_eq!(parts.stats.snapshot().active_tcp, 0);
     }
     assert_two_configured_sources().await;
+}
+
+#[tokio::test]
+async fn initial_mtu_rejects_invalid_late_and_stopped_commands() {
+    let mut parts = NetStack::start_client(
+        NetStackConfig::default(),
+        ClientConfig {
+            prefixes: [Some(client_prefix("10.23.0.2", 24)), None],
+            receive_packet_limit: 1500,
+            path_mtu_discovery: true,
+        },
+    )
+    .unwrap();
+    let connector = &parts.tcp_connector;
+    for mtu in [67, 1501] {
+        assert_eq!(
+            connector
+                .set_initial_mtu(mtu, tokio::time::Instant::now() + WAIT)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+    assert_eq!(
+        connector
+            .set_initial_mtu(1280, tokio::time::Instant::now())
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    connector
+        .set_initial_mtu(1280, tokio::time::Instant::now() + WAIT)
+        .await
+        .unwrap();
+    let mut connect = Box::pin(connector.connect(
+        "198.51.100.2:443".parse().unwrap(),
+        tokio::time::Instant::now() + WAIT,
+    ));
+    assert!(futures_util::poll!(connect.as_mut()).is_pending());
+    let syn = timeout_tcp_flag(&mut parts.packet_stream, TcpFlags::SYN).await;
+    assert_eq!(tcp_mss(&syn), Some(1240));
+    assert_eq!(
+        connector
+            .set_initial_mtu(1000, tokio::time::Instant::now() + WAIT)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    parts.control.stop().await;
+    assert_eq!(
+        connector
+            .set_initial_mtu(1280, tokio::time::Instant::now() + WAIT)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::ConnectionAborted
+    );
+    assert!(connect.await.is_err());
 }
 
 async fn assert_two_configured_sources() {

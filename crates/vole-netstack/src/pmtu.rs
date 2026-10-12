@@ -1,5 +1,5 @@
 //! Client-only ICMP path feedback. Parsing borrows the packet and allocates no
-//! state; the active socket owns tuple/sequence correlation and its path MTU.
+//! state; bounded egress metadata owns tuple/sequence correlation and path MTU.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -24,7 +24,7 @@ pub struct PathMtuHint {
 /// can exceed the quotation length; eight TCP bytes suffice for correlation.
 ///
 /// The caller must match the outer destination and local/remote tuple against
-/// an active client socket. That socket must validate the quoted sequence
+/// an active client socket. Its packet adapter must validate the quoted sequence
 /// against actually emitted output before accepting any MTU reduction.
 #[must_use]
 pub fn parse_path_mtu_hint(packet: &[u8]) -> Option<PathMtuHint> {

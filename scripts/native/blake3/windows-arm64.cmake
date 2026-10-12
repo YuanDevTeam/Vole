@@ -1,0 +1,16 @@
+# Use the same native ARM64 Clang/MSVC ABI as the Core build. The official
+# vcpkg toolchain retains the selected SDK, CRT and UWP API-family restrictions.
+set(CMAKE_C_COMPILER "$ENV{CC_aarch64_pc_windows_msvc}")
+set(CMAKE_CXX_COMPILER "$ENV{CXX_aarch64_pc_windows_msvc}")
+set(CMAKE_C_COMPILER_TARGET aarch64-pc-windows-msvc)
+set(CMAKE_CXX_COMPILER_TARGET aarch64-pc-windows-msvc)
+if(DEFINED Z_VCPKG_ROOT_DIR)
+  set(_vole_vcpkg_root "${Z_VCPKG_ROOT_DIR}")
+else()
+  set(_vole_vcpkg_root "${_VCPKG_ROOT_DIR}")
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+  include("${_vole_vcpkg_root}/scripts/toolchains/uwp.cmake")
+else()
+  include("${_vole_vcpkg_root}/scripts/toolchains/windows.cmake")
+endif()

@@ -13,6 +13,8 @@ mod context;
 pub(crate) mod ech;
 #[cfg(feature = "outbound-masque")]
 pub(crate) mod masque;
+#[cfg(feature = "h3-transport")]
+mod quiche_tls;
 mod resumption;
 #[cfg(feature = "shadow-tls-v3")]
 mod shadow_tls;
@@ -29,6 +31,8 @@ pub(crate) mod vision;
 #[cfg(feature = "outbound-vless")]
 pub use client::{REALITY_CLIENT_VERSION, SecurityClient};
 pub use context::SecurityContext;
+#[cfg(feature = "h3-transport")]
+pub(crate) use quiche_tls::QuicheTls;
 pub use stream::CLOSE_NOTIFY_TIMEOUT;
 pub use tls::{
     StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsCertificatePolicy, TlsClientIdentity,

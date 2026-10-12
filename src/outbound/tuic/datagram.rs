@@ -29,6 +29,7 @@ pub(super) struct Registry {
     state: Mutex<State>,
     mode: TuicUdpMode,
     native_payload_limit: u16,
+    native_send_message_limit: usize,
 }
 #[derive(Default)]
 struct State {
@@ -46,13 +47,22 @@ struct Registration {
 impl Registry {
     #[cfg(test)]
     pub fn new(mode: TuicUdpMode) -> Self {
-        Self::with_limit(mode, 1252)
+        Self::with_limit(
+            mode,
+            1252,
+            crate::transport::quic::datagram_payload_limit(1281),
+        )
     }
-    pub fn with_limit(mode: TuicUdpMode, native_payload_limit: u16) -> Self {
+    pub fn with_limit(
+        mode: TuicUdpMode,
+        native_payload_limit: u16,
+        native_send_message_limit: usize,
+    ) -> Self {
         Self {
             state: Mutex::new(State::default()),
             mode,
             native_payload_limit,
+            native_send_message_limit,
         }
     }
     pub fn open(
@@ -206,7 +216,11 @@ impl Transport {
     }
     fn message_limit(&self) -> usize {
         match self.registry.mode {
-            TuicUdpMode::Native => self.connection.max_datagram_size().unwrap_or(0),
+            TuicUdpMode::Native => self
+                .connection
+                .max_datagram_size()
+                .unwrap_or(0)
+                .min(self.registry.native_send_message_limit),
             TuicUdpMode::Quic => u16::MAX as usize + 10 + 259,
         }
     }
@@ -419,7 +433,17 @@ pub(super) async fn receive(
             _=expiry.tick()=>registry.expire(),
             result=connection.read_datagram()=>{
                 let raw=result.map_err(|_|DispatchError::ConnectionRefused)?;
-                if registry.mode==TuicUdpMode::Native && let Ok(fragment)=wire::decode(raw) { registry.deliver(fragment); }
+                // A peer's fragmentation is independent of our send frame
+                // limit. The physical adapter already enforces its RX budget.
+                // Reject unknown associations and excess declared payload
+                // before allocating an address or reassembly state.
+                if registry.mode==TuicUdpMode::Native
+                    && raw.len()<=crate::limits::TUIC_QUIC_PAYLOAD
+                    && let Some(header)=raw.get(..10)
+                    && let Some(budget)=registry.budget(u16::from_be_bytes([header[2],header[3]]))
+                    && u16::from_be_bytes([header[8],header[9]])<=budget
+                    && let Ok(fragment)=wire::decode(raw)
+                { registry.deliver(fragment); }
             },
             stream=connection.accept_uni(),if streams.len()<crate::limits::TUIC_CONTROL_READERS=>{
                 let stream=stream.map_err(|_|DispatchError::ConnectionRefused)?;

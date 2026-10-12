@@ -10,6 +10,8 @@ import sysconfig
 import tempfile
 from pathlib import Path
 
+from . import blake3
+
 CORE_DIR = Path(__file__).resolve().parents[3]
 # Both transports enable the production core through invoke -> tun in Cargo.toml.
 DEFAULT_FEATURES = "ffi"
@@ -118,6 +120,12 @@ def _cargo_build(
     artifacts: tuple[str, ...] = ("--lib",),
 ) -> Path:
     _production_features(features)
+    env = blake3.environment(
+        target,
+        native_target(),
+        env,
+        "uwp" if "windows-uwp" in re.split(r"[,\s]+", features) else "wintun",
+    )
     _run(
         [
             "cargo",
@@ -137,6 +145,42 @@ def _cargo_build(
     )
     profile = "release" if "--release" in profile_flags else "debug"
     return _cargo_target_dir(env) / target / profile
+
+
+def prepare_native_dependencies(
+    target: str | None = None, backend: str = "wintun", github_env: Path | None = None
+) -> None:
+    """Prepare the same package for direct Cargo checks outside platform builds."""
+    host = native_target()
+    target = host if target is None else target
+    env = os.environ.copy()
+    if target in blake3.ANDROID_ABIS:
+        if platform.system() not in {"Darwin", "Linux"}:
+            raise RuntimeError("Android dependencies require macOS or Linux")
+        env["ANDROID_NDK_HOME"] = str(_android_ndk_home())
+    elif target in APPLE_TARGETS:
+        if platform.system() != "Darwin":
+            raise RuntimeError("Apple dependencies require macOS")
+        for variable, override, default in (
+            ("IPHONEOS", "VOLE_IOS_DEPLOYMENT_TARGET", "13.0"),
+            ("MACOSX", "VOLE_MACOS_DEPLOYMENT_TARGET", "10.15"),
+            ("TVOS", "VOLE_TVOS_DEPLOYMENT_TARGET", "17.0"),
+        ):
+            env.setdefault(variable + "_DEPLOYMENT_TARGET", _env(override, default))
+    elif target != host:
+        raise ValueError("Linux and Windows dependencies require the native target")
+    if platform.system() == "Windows":
+        env = _windows_msvc_environment(CLI_TARGETS[host][1])
+    env = blake3.environment(target, host, env, backend)
+    suffix = "_" + target.upper().replace("-", "_")
+    entries = [
+        f"{name + suffix}={env[name + suffix]}" for name in blake3.DEPENDENCY_NAMES
+    ]
+    if github_env is not None:
+        with github_env.open("a", encoding="utf-8") as stream:
+            stream.write("\n".join(entries) + "\n")
+    for entry in entries:
+        print(entry)
 
 
 def build_cli(target: str | None = None, profile: str = "release") -> Path:

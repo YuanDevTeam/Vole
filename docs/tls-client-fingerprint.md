@@ -45,12 +45,15 @@ client-fingerprint: chrome
 - 默认验证公开信任链、名称及有效期。叶证书 pin 匹配时以叶证书为显式信任依据，
   不再要求公共根、名称或有效期；匹配非叶证书时将其作为信任锚，仍验证叶链、名称和有效期。
   skip 只跳过常规验证，不能覆盖不匹配的 pin；所有策略仍验证握手签名。
-- 未启用指纹的标准 TLS 和 QUIC 使用 crates.io 官方 rustls + ring，不依赖 rustls fork。
+- 未启用指纹的流 TLS，以及 HY2/TUIC/DoQ 的 Quinn QUIC，使用官方 rustls + ring。
+  TrustTunnel/MASQUE/XHTTP/DoH 的 H3 使用官方 quiche 与同一 boring；H3 不应用命名指纹。
 - 命名指纹的标准 TLS，以及所有 REALITY/JLS，使用自有 boring fork；开发及 PR/发布的来源规则见 [TLS 依赖](tls-dependencies.md)。
-- 普通 TLS 两条路径共用同一个 WebPKI 证书验证器和发布信任根；叶 pin、非叶信任锚、
+- 普通 TLS、Quinn 与采用标准 TLS 认证的 quiche H3 共用同一个 WebPKI 证书验证器和会话信任根；叶 pin、非叶信任锚、
   独立验证名、skip 优先级不变。TLS 握手签名仍由各自后端强制验证。
-- HTTP、SOCKS5、AnyTLS、Trojan、TrustTunnel H2、VMess、VLESS、Hysteria2 与 TUIC v5 的 mTLS 使用配对内联 PEM 或文件路径，
+- HTTP、SOCKS5、AnyTLS、Trojan、TrustTunnel、VMess、VLESS、Hysteria2 与 TUIC v5 的 mTLS 使用配对内联 PEM 或文件路径，
   配置校验与资源生成时读取文件并检查密钥匹配；客户端证书不增加服务端信任根，profile 不修改身份。
+- quiche H3 的 ECH 仅支持 X25519/HKDF-SHA256，AEAD 为 AES128/256-GCM 或 ChaCha20-Poly1305。
+  静态和 DNS 来源按该后端选择；不兼容或未实际接受时失败，不用 GREASE 替代，不降级为明文 ClientHello。
 - REALITY 仅允许自身临时证书认证，不能混用 pin/skip/mTLS 或降级到普通站点证书。
 - [JLS](vless.md#jls) 使用共享凭据身份和完整原生 TLS1.3，不启用恢复或 PKI 回退；profile 不改变身份。
 - 连接器只包装 Dialer/上游交付的 IO；动态 ECH 通过既有解析上下文请求原始 HTTPS 记录，
@@ -135,6 +138,8 @@ Safari16/iOS14 不声明 TLS1.2 session-ticket 扩展，该版本的恢复使用
 握手及应用层 ALPN 策略通过前，暂存票据不会进入节点缓存。REALITY 始终不恢复。
 同一模板的使用不扩大节点/下载腿缓存归属。冷连接和恢复连接分开验收；Vole 的
 票据策略不同于 Mihomo，恢复 hello 不宣称逐字段相同，也不伪造 PSK/binder。
+quiche H3 为每条物理连接构造独立原生 TLS 上下文，禁用恢复与 0-RTT；
+节点内已认证的 H3 连接仍可复用，关闭和取消由其驱动所有者同步回收。
 
 CloseWrite 刷新 close_notify 最多 5 秒，保留底层连接和读方向；重复关闭幂等，
 关闭后拒绝写入。Vision direct 切换保留同一 TLS 记录边界，先排空明文/刷新密文，

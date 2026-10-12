@@ -46,10 +46,10 @@ struct WriteLease {
 }
 impl WriteLease {
     fn sent(&self) {
-        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            if let Some(done) = self.done.lock().unwrap().take() {
-                let _ = done.send(Ok(()));
-            }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(done) = self.done.lock().unwrap().take()
+        {
+            let _ = done.send(Ok(()));
         }
     }
 }
@@ -243,10 +243,8 @@ impl Reliable {
             self.cubic.on_ack(now);
         }
         self.remote_window = u32::from(window);
-        if only_ack {
-            if let Some(segment) = self.outstanding.get_mut(&unack) {
-                segment.ack_count = segment.ack_count.saturating_add(1);
-            }
+        if only_ack && let Some(segment) = self.outstanding.get_mut(&unack) {
+            segment.ack_count = segment.ack_count.saturating_add(1);
         }
     }
     fn input(&mut self, frame: Frame, now: Instant, partial: &mut Option<Partial>) {
@@ -354,9 +352,7 @@ fn advance_partial(
     partial: &mut Option<Partial>,
     sessions: &mut BTreeMap<u32, Reliable>,
 ) -> Option<u32> {
-    let Some(pending) = partial.as_mut() else {
-        return None;
-    };
+    let pending = partial.as_mut()?;
     let Some(state) = sessions.get_mut(&pending.session_id) else {
         *partial = None;
         return None;
@@ -405,6 +401,7 @@ fn advance_partial(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn drive(
     config: &MieruOutboundConfig,
     upstream: &UpstreamPath,

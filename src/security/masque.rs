@@ -1,6 +1,6 @@
 //! MASQUE uses an ECDSA identity and a peer public-key pin, without WebPKI.
-//! rustls/ring still owns TLS and QUIC. Boring supplies the ECDSA primitives
-//! needed for P-224/P-521 and TLS 1.2's curve-independent hash selection.
+//! HTTP/2 uses rustls/ring; HTTP/3 uses the shared Boring QUIC backend. Boring
+//! also supplies P-224/P-521 and TLS 1.2's curve-independent hash selection.
 use std::{
     fmt, io,
     sync::{
@@ -72,6 +72,45 @@ impl fmt::Debug for MasqueTls {
 }
 
 impl MasqueTls {
+    #[cfg(feature = "h3-transport")]
+    pub(crate) fn quiche_config(
+        &self,
+        server_name: impl Into<String>,
+    ) -> io::Result<super::QuicheTls> {
+        use boring::ssl::{SslAlert, SslVerifyError, SslVerifyMode};
+
+        let mut builder = super::QuicheTls::builder()?;
+        let certificate = parsed_certificate(&self.identity.certificate)
+            .map_err(|_| io::Error::other("cannot create MASQUE QUIC TLS configuration"))?;
+        builder
+            .set_certificate(&certificate)
+            .map_err(|_| io::Error::other("cannot set MASQUE QUIC certificate"))?;
+        builder
+            .set_private_key(&self.identity.key)
+            .map_err(|_| io::Error::other("cannot set MASQUE QUIC identity"))?;
+        builder
+            .check_private_key()
+            .map_err(|_| io::Error::other("invalid MASQUE QUIC identity"))?;
+        let verifier = MasqueVerifier {
+            peer: self.peer.clone(),
+            skip_pin: self.skip_pin,
+            version: Arc::new(AtomicU8::new(VERSION_13)),
+        };
+        builder.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| {
+            let reject = || SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE);
+            let certificates = super::quiche_tls::peer_certificates(ssl).map_err(|_| reject())?;
+            let (leaf, rest) = certificates.split_first().ok_or_else(reject)?;
+            verifier.verify_chain(leaf, rest).map_err(|_| reject())
+        });
+        super::QuicheTls::from_builder(
+            builder,
+            server_name.into(),
+            vec![b"h3".to_vec()],
+            Some(b"h3".to_vec()),
+            None,
+        )
+    }
+
     pub(crate) fn new(
         private_b64: &str,
         public_b64: &str,

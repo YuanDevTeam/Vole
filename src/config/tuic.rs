@@ -37,7 +37,6 @@ pub struct TuicOutboundConfig {
     pub stream_window: super::QuicReceiveWindow,
     pub connection_window: super::QuicReceiveWindow,
     pub max_open_streams: usize,
-    pub incoming_streams: u64,
     pub max_udp_relay_packet_size: u16,
     pub max_datagram_frame_size: u16,
     pub disable_mtu_discovery: bool,
@@ -131,13 +130,6 @@ impl RawTuic {
         } else {
             self.max_open_streams
         };
-        let incoming_streams = if open_streams < 0 {
-            0
-        } else {
-            (open_streams as u64)
-                .saturating_add((open_streams as u64).div_ceil(10))
-                .min(1 << 60)
-        };
         let client_threshold = if open_streams == 100 {
             90
         } else {
@@ -197,7 +189,6 @@ impl RawTuic {
                 },
             )?,
             max_open_streams,
-            incoming_streams,
             max_udp_relay_packet_size: frame.saturating_sub(29).max(0) as u16,
             max_datagram_frame_size: frame as u16,
             disable_mtu_discovery: self.disable_mtu_discovery,

@@ -19,14 +19,18 @@ struct Packets {
     silent: bool,
     live: Arc<AtomicUsize>,
     closed: Arc<AtomicUsize>,
+    budget: DatagramBudget,
+    largest_sent: Arc<AtomicUsize>,
 }
 #[async_trait]
 impl DatagramTransport for Packets {
     fn payload_budget(&self, _: &Destination) -> DatagramBudget {
-        DatagramBudget::new(1400, 1400)
+        self.budget
     }
     async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
         assert_eq!(packet.remote, Destination::Ip(self.peer));
+        self.largest_sent
+            .fetch_max(packet.payload.len(), Ordering::AcqRel);
         self.sender
             .send(packet.payload)
             .await
@@ -64,6 +68,7 @@ struct PeerSocket {
     receiver: StdMutex<mpsc::Receiver<Bytes>>,
     local: SocketAddr,
     peer: SocketAddr,
+    largest_sent: Arc<AtomicUsize>,
 }
 #[derive(Debug)]
 struct Writable(StdMutex<tokio_util::sync::PollSender<Bytes>>);
@@ -84,6 +89,8 @@ impl quinn::AsyncUdpSocket for PeerSocket {
     }
     fn try_send(&self, packet: &quinn::udp::Transmit<'_>) -> io::Result<()> {
         assert_eq!(packet.destination, self.peer);
+        self.largest_sent
+            .fetch_max(packet.contents.len(), Ordering::AcqRel);
         match self
             .sender
             .try_send(Bytes::copy_from_slice(packet.contents))
@@ -138,6 +145,10 @@ struct Peer {
     udp_calls: AtomicUsize,
     live: Arc<AtomicUsize>,
     closed: Arc<AtomicUsize>,
+    udp_budget: DatagramBudget,
+    initial_udp_payload: u16,
+    largest_client_sent: Arc<AtomicUsize>,
+    largest_server_sent: Arc<AtomicUsize>,
     requests: Arc<AtomicUsize>,
     cancel: CancellationToken,
     tasks: StdMutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -176,6 +187,7 @@ impl Dispatcher for Peer {
             receiver: StdMutex::new(from_client),
             local: peer_address,
             peer: client_address,
+            largest_sent: self.largest_server_sent.clone(),
         });
         let mut tls = self.tls.clone();
         tls.alpn_protocols = vec![if matches!(self.protocol, super::super::quic::Kind::Doq) {
@@ -187,10 +199,18 @@ impl Dispatcher for Peer {
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         Arc::get_mut(&mut config.transport)
             .unwrap()
+            .initial_mtu(self.initial_udp_payload)
+            .min_mtu(self.initial_udp_payload)
             .mtu_discovery_config(None);
         let runtime = Arc::new(OwnedRuntime::new(CancellationToken::new()));
+        let mut endpoint_config = quinn::EndpointConfig::default();
+        if u64::from(self.udp_budget.transmit()) > endpoint_config.get_max_udp_payload_size() {
+            endpoint_config
+                .max_udp_payload_size(self.udp_budget.transmit())
+                .unwrap();
+        }
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
+            endpoint_config,
             Some(config),
             socket,
             runtime.clone(),
@@ -263,6 +283,8 @@ impl Dispatcher for Peer {
             silent: matches!(self.udp, Udp::Silent),
             live: self.live.clone(),
             closed: self.closed.clone(),
+            budget: self.udp_budget,
+            largest_sent: self.largest_client_sent.clone(),
         }))
     }
 }
@@ -312,6 +334,10 @@ impl Peer {
                 udp_calls: AtomicUsize::new(0),
                 live: Arc::new(AtomicUsize::new(0)),
                 closed: Arc::new(AtomicUsize::new(0)),
+                udp_budget: DatagramBudget::new(1400, 1400),
+                initial_udp_payload: 1200,
+                largest_client_sent: Arc::new(AtomicUsize::new(0)),
+                largest_server_sent: Arc::new(AtomicUsize::new(0)),
                 requests: Arc::new(AtomicUsize::new(0)),
                 cancel: CancellationToken::new(),
                 tasks: StdMutex::new(Vec::new()),
@@ -372,6 +398,31 @@ async fn dns_quic_doq_and_forced_h3_exchange_real_frames_reuse_and_stop() {
         assert_eq!(peer.closed.load(Ordering::Acquire), 1);
         peer.stop().await;
     }
+}
+
+#[tokio::test]
+async fn dns_quic_doq_large_receive_budget_keeps_initial_small_and_receives_larger_peer_packets() {
+    let (mut peer, roots) = Peer::new(super::super::quic::Kind::Doq, Tcp::Pending, Udp::Ready);
+    let config = Arc::get_mut(&mut peer).unwrap();
+    config.udp_budget = DatagramBudget::new(1200, 4096);
+    config.initial_udp_payload = 1280;
+    let dns = resolver(
+        peer.clone(),
+        roots,
+        "quic://192.0.2.1:853#name-cert-verify=dns.example&ecs=192.0.2.1",
+        false,
+    );
+    two_queries(&dns).await;
+    assert_eq!(peer.requests.load(Ordering::Acquire), 2);
+    assert_eq!(peer.udp_calls.load(Ordering::Acquire), 1);
+    let client_payload = peer.largest_client_sent.load(Ordering::Acquire);
+    assert!((1..=1200).contains(&client_payload));
+    assert!(peer.largest_server_sent.load(Ordering::Acquire) >= 1280);
+    dns.shutdown().await;
+    assert_eq!(dns.tcp_pool.quic.task_count(), 0);
+    assert_eq!(peer.live.load(Ordering::Acquire), 0);
+    assert_eq!(peer.closed.load(Ordering::Acquire), 1);
+    peer.stop().await;
 }
 
 #[cfg(feature = "outbound-wireguard")]

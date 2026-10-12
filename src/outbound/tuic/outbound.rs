@@ -325,6 +325,7 @@ async fn drive(
     let datagrams = Arc::new(super::datagram::Registry::with_limit(
         config.udp_mode,
         config.max_udp_relay_packet_size,
+        quic::datagram_payload_limit(config.max_datagram_frame_size),
     ));
     let activity = Arc::new(Activity::default());
     let operation = async {
@@ -342,6 +343,12 @@ async fn drive(
         driver = Some(owned);
         let mtu = socket.budget().quic_payload_limit()?;
         let mut limits = quinn::TransportConfig::default();
+        quic::configure_receive_windows(
+            &mut limits,
+            config.stream_window,
+            config.connection_window,
+            quic::RECEIVE_WINDOW_POLICY,
+        )?;
         let discovery = if config.disable_mtu_discovery {
             None
         } else {
@@ -354,21 +361,10 @@ async fn drive(
             .initial_mtu(initial_mtu)
             .min_mtu(1200)
             .mtu_discovery_config(discovery)
-            .max_concurrent_bidi_streams(
-                quinn::VarInt::from_u64(config.incoming_streams).map_err(failure)?,
-            )
-            .max_concurrent_uni_streams(
-                quinn::VarInt::from_u64(config.incoming_streams).map_err(failure)?,
-            )
-            .adaptive_stream_receive_window(
-                quinn::VarInt::from_u64(config.stream_window.initial).map_err(failure)?,
-                quinn::VarInt::from_u64(config.stream_window.maximum).map_err(failure)?,
-            )
-            .adaptive_receive_window(
-                quinn::VarInt::from_u64(config.connection_window.initial).map_err(failure)?,
-                quinn::VarInt::from_u64(config.connection_window.maximum).map_err(failure)?,
-            )
-            .max_datagram_frame_size(Some(config.max_datagram_frame_size.into()))
+            // Business owner thresholds never flow into Quinn's eager maps.
+            // The decoder already bounds concurrent remote uni streams to 32.
+            .max_concurrent_bidi_streams(0_u8.into())
+            .max_concurrent_uni_streams((crate::limits::TUIC_CONTROL_READERS as u32).into())
             .send_window(crate::limits::TUIC_SEND_WINDOW as u64)
             .datagram_receive_buffer_size(Some(crate::limits::TUIC_DATAGRAM_BUFFER))
             .datagram_send_buffer_size(crate::limits::TUIC_DATAGRAM_BUFFER)

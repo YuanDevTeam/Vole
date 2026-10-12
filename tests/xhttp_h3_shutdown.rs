@@ -266,7 +266,12 @@ async fn run(mode: &str, closing: Closing, handshake_delay: Option<Duration>) {
         Ordering::SeqCst,
     );
     stream.write_all(&[b'x'; 16384]).await.unwrap();
-    stream.flush().await.unwrap();
+    if closing == Closing::Normal {
+        stream.flush().await.unwrap();
+    }
+    // A stalled controlled transport can exhaust native QUIC send capacity.
+    // Shutdown must bound this outstanding flush instead of the fixture
+    // waiting indefinitely for flush before it even requests shutdown.
     assert!(
         poll_fn(|cx| Poll::Ready(Pin::new(&mut stream).poll_shutdown(cx)))
             .await

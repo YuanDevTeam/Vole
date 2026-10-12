@@ -1,6 +1,7 @@
 # 编译与发布
 
-在 Vole 根目录执行。需要 Rust、uv、C/C++、CMake、Perl 和 libclang，以及对应平台工具链。
+在 Vole 根目录执行。需要 Rust、uv、Git、C/C++、CMake、Perl 和 libclang，以及对应平台工具链。
+Linux 自动准备原生依赖还需要 curl、zip、unzip 和 tar。
 
 ```sh
 uv run --project scripts --locked vole-scripts build cli
@@ -33,6 +34,29 @@ Apple 最低版本为 iOS 13、macOS 10.15、tvOS 17；ARM64 iOS 模拟器/macOS
 Android 优先使用 `ANDROID_NDK_HOME`，否则在 `ANDROID_HOME/ndk` 中选择 NDK 30 的最新已安装正式版。
 `VOLE_ANDROID_NDK_VERSION` 可指定版本，`VOLE_ANDROID_API` 默认 24。
 `CARGO_TARGET_DIR` 按 Cargo 约定覆盖中间产物目录；其余本地覆盖见 `builds.py`。
+
+所有编译入口自动准备官方 BLAKE3 1.8.7 C 静态库。依赖通过
+`native/blake3/vcpkg.json` 锁定正式 vcpkg registry/port，正常 bootstrap 和 install
+使用宿主网络及用户缓存；首次构建需要联网。默认缓存位于 macOS 的
+`~/Library/Caches/vole/native`、Linux 的 `$XDG_CACHE_HOME/vole/native`
+（未设置时为 `~/.cache/vole/native`）、Windows 的 `%LOCALAPPDATA%/vole/native`，
+可用 `VOLE_NATIVE_CACHE_DIR` 覆盖。第三方源、工具、头文件和静态库留在依赖缓存，
+不加入仓库或发布归档。自有 triplet 为 C 符号设置 `vole_c_` 编译宏；官方 port 和源码不改。
+Apple 使用对应 SDK 和上述最低版本，Android 使用同一 NDK/API，Windows 区分
+Windows/WindowsStore 并匹配 Rust 的静态 CRT；各目标安装目录独立。
+
+直接执行 Cargo 时可先准备宿主依赖：
+
+```sh
+uv run --project scripts --locked vole-scripts deps
+```
+
+该命令打印两个目标后缀环境变量；在当前 shell 中设置后执行 Cargo。
+CI 使用 `deps --github-env "$GITHUB_ENV"` 自动传给后续步骤。
+显式提供 `VOLE_BLAKE3_INCLUDE_DIR_<TARGET>` 与 `VOLE_BLAKE3_LIB_DIR_<TARGET>`
+可复用已准备的同目标 namespaced 静态包；`<TARGET>` 为大写 Rust target，连字符改成下划线。
+无后缀的两变量仅在宿主原生构建有效。缺少一项或路径无效直接失败，不回退到其他架构。
+平台构建命令本身不需要手工设置这些变量。
 
 ## 发布
 

@@ -70,12 +70,10 @@ health-check 缺省 false，开启后使用 `_check` CONNECT；成功 CONNECT �
 
 H3 外层无论业务 udp 是否开启，都要求受控上游提供双向至少1200字节UDP路径；
 QUIC payload 最大1400并取实际双向上游预算交集，PMTUD不超过该预算，不回落TCP或DIRECT。
-congestion-controller 支持 cubic、new_reno、bbr_meta_v1、bbr_meta_v2，bbr 是 meta_v2别名；
-省略或未知名称保持传输默认。cwnd 仅BBR消费，0使用32；meta_v1保留固定1280字节初始MSS
-及其窗口、带宽和pacing消费行为，忽略profile。meta_v2消费standard（默认）、conservative、
-aggressive，未知profile使用standard；负窗口参数按原带符号语义消费，不增加正数校验。
-两代为独立的Google算法移植与参考参数适配，meta_v2不表示标准BBR2；来源见
-[拥塞算法](../src/transport/quic/congestion/README.md)。H2中这三个QUIC字段不消费。
+congestion-controller 的 cubic、new_reno 使用官方 quiche 算法；bbr、bbr_meta_v1、
+bbr_meta_v2 均使用 quiche 的 Bbr2Gcongestion。省略或未知名称使用 cubic。
+cwnd、profile 保留配置准入，但 H3 不消费其调参值，不复现 Meta BBR 参数行为。
+H2 不消费这三个 QUIC 字段。
 
 ## Mieru
 
@@ -122,7 +120,9 @@ IP 模式在所有受控抽象 socket 平台启用有界 QUIC PMTUD；具有 IPv
 mapped IPv4 归一，重复地址取较长前缀，同族两地址按目标选择源地址。
 MTU 缺省/零值为 1280；只有 IPv4 时允许 68..65535，存在实际 IPv6 时至少 1280。
 收包预算与发包 MTU 分离；TCP 的有效 MSS 和经过活动 tuple/已发送序号验证的 ICMP
-PMTU 反馈按连接生效。内部队列、capsule 和 packet 均有界，停止等待其工作任务回收。
+PMTU 反馈按连接生效，通过包层软件分段恢复，重传由官方 smoltcp 的定时器触发。
+初始发送 MTU 取配置与真实隧道预算的交集，避免已知预算下的持续二次分段。
+内部队列、capsule 和 packet 均有界，停止等待其工作任务回收。
 发送期间预算缩小只反馈当前过大包；不因此关闭其它业务流。
 
 `network: h3-l4proxy` 使用 Cloudflare L4 HTTP/3 CONNECT，每个 TCP 目标独占请求流，共享受控 QUIC 连接；
@@ -144,14 +144,15 @@ private-key 是标准 Base64 SEC1 ECDSA 私钥，public-key 是标准 Base64 ECD
 客户端发送对应自签证书，服务端每张证书都必须使用固定公钥；不检查证书名称、
 信任根或有效期。skip-cert-verify 只关闭公钥固定，握手签名仍验证；
 name-cert-verify 是 Mihomo 保留的占位字段，不消费。每个物理连接使用独立 TLS 配置，
-关闭恢复与 0-RTT，TLS/QUIC 仍由 rustls/ring 执行。
+关闭恢复与 0-RTT；H2 使用 rustls/ring，H3 使用 quiche 与共享 Boring，
+两者保留相同的公钥固定与握手签名校验。
 
 SNI 缺省或空串在 IP 模式使用 consumer-masque.cloudflareclient.com，
 L4 使用 consumer-masque-proxy.cloudflareclient.com。IP URI 缺省为
 https://cloudflareaccess.com，不支持含变量的 IP flow URI template。
 L4 不解析 ip/ipv6/uri，不消费 mtu 或正 handshake-timeout；负超时拒绝。
 QUIC 使用 20 字节 CID、初始 payload 1242 与受控预算交集、30 秒 keepalive；
-拥塞字段使用 TrustTunnel H3 的五种控制器及其参数语义。
+拥塞字段采用上述 TrustTunnel H3 的算法映射；cwnd、profile 不消费调参值。
 `ip-stack` 支持省略/auto 与省略/cubic，不把其它栈或算法映射为现有栈。
 
 ## SOCKS5
@@ -297,8 +298,8 @@ port 为 1–65535，仅提供 ports 时可省略；显式非法 port 仍拒绝�
 写 EOF 关闭当前逻辑 TCP 双向通道，与 Mihomo 一致，不影响兄弟流。
 
 四个 initial/max 接收窗口按字节配置；0 独立使用默认：stream 8 MiB，connection 20 MiB。
-首次数据到达后按实际应用消费量与 smoothed RTT 增长当前窗口，最多倍增到指定最大值；
-stream 增长可将 connection 当前窗口提升到其 1.5 倍，但仍受独立 connection 最大值约束。
+采用固定 Middle 策略：每流信用为 max(initial, min(maximum, 4 MiB))，连接信用为 initial；
+不执行消费量或 RTT 驱动的自适应增长。默认仍为 8 / 20 MiB。
 initial 大于 max 时保留初始值，不缩小或额外拒绝；max 限制到 QUIC VarInt，无法编码的
 initial 拒绝。窗口是信用额度，不预分配整个缓冲。handshake-timeout 为整数秒，正值与
 原建链绝对期限取较早值，<=0 保留原期限；成功后的业务/端口跳跃不重新应用此期限。
@@ -360,17 +361,20 @@ TCP shutdown 立即完成逻辑关闭，发送所有权保留到 FIN/数据确�
 `ip` 覆盖物理拨号地址，逻辑 server/SNI 保留。heartbeat-interval 单位毫秒，<=0 回落
 10000，同时控制 QUIC keepalive 与实际 v5 HEARTBEAT，两种 UDP relay 模式均用 DATAGRAM。
 recv-window-conn 实际为 stream，recv-window 实际为 connection；正值同时设 initial/max，
-零值分别从 15 MiB/10、64 MiB/10 开始，上限15 MiB、64 MiB；增长采用上述真实消费/RTT路径。
+零值分别按 15 MiB/10、64 MiB/10 初值与 15 MiB、64 MiB 最大值归一化，
+随后采用上述 Middle 策略，默认实际为固定 stream 4 MiB / connection 6.4 MiB。
 
-max-open-streams 控制客户端 TCP/UDP 所有者池和远端可开启 stream credit（后者取1.1倍
-向上取整）。0 使用100；参考客户端100阈值转换90，入池计数必须严格小于阈值，所以
+max-open-streams 控制客户端 TCP/UDP 所有者池，不扩大 Quinn 内部远端 stream 表；
+远端双向流信用固定为 0，单向流为 32。0 使用100；参考客户端100阈值转换90，入池计数必须严格小于阈值，所以
 默认89个同时所有者，其它正N为N-1；1和负值可解析但无法开启业务。饱和新建物理
 会话，退役会话继续服务已有所有者，最后所有者退出回收，不重放已发送业务。
 
-max-datagram-frame-size 是含 type/length varint 的完整 frame 上限，最多1400；缺省以
+max-datagram-frame-size 是按规范 type/length varint 编码计的完整 frame 上限，最多1400；缺省以
 max-udp-relay-packet-size（0使用1252）+IPv6最坏TUIC头29计算。native relay 的业务
 fragment 上限取 frame-29 与实际路径扣头容量交集；能在实际容量内发送的包不分片。
 quic relay 按参考在一条单向流发送完整 u16 packet，不使用 native fragment 限额。
+frame 配置限制本机发送与分片，不修改 Quinn transport parameter。接收按独立物理预算、
+关联和完整包重组预算校验，允许对端采用不同分片大小；未知关联或超预算负载在解码前丢弃。
 DATAGRAM 累计收发缓冲仍各256 KiB，独立于 frame 上限。disable-mtu-discovery 缺省
 false，PMTUD 探测始终限制在受控双向路径预算内，QUIC payload 最多1400。
 

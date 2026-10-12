@@ -6,7 +6,7 @@
 
 Vole 是用于 VPN 客户端和本地代理的 Rust 代理内核，提供原生库和前台 CLI。它通过直连、代理节点、代理组和代理链转发 TCP/UDP 流量，并集成 DNS、GeoData 和跨平台 TUN 数据面。
 
-配置采用**与 Mihomo 兼容的 YAML，兼容范围限于 Vole 已支持的功能**。Vole 聚焦客户端能力，并未实现 Mihomo 的全部字段或完整 Dashboard API。
+配置采用 **Mihomo 风格的 YAML，范围限于 Vole 已支持的功能**。Vole 以内存优化和吞吐达标为第一目标；兼容要求是与 Mihomo listener 和官方协议 server 端互通，不寻求逐字段行为完全一致，见 [兼容原则](../docs/mihomo-compatibility.md#兼容原则)。
 
 ## 内核能做什么
 

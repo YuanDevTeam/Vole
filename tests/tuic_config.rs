@@ -207,7 +207,6 @@ fn quic_fields_consume_defaults_and_reversed_fixed_windows() {
         }
     );
     assert_eq!(defaults.max_open_streams, 89);
-    assert_eq!(defaults.incoming_streams, 110);
     assert_eq!(
         defaults.heartbeat_interval,
         std::time::Duration::from_secs(10)
@@ -245,7 +244,6 @@ fn quic_fields_consume_defaults_and_reversed_fixed_windows() {
         }
     );
     assert_eq!(t.max_open_streams, 2);
-    assert_eq!(t.incoming_streams, 4);
     assert_eq!(t.max_datagram_frame_size, 80);
     assert_eq!(t.max_udp_relay_packet_size, 51);
     assert!(t.disable_mtu_discovery);
@@ -262,6 +260,8 @@ fn quic_fields_consume_defaults_and_reversed_fixed_windows() {
     assert_eq!(extract(n.clone()).max_open_streams, 0);
     n["max-open-streams"] = json!(-1);
     assert_eq!(extract(n.clone()).max_open_streams, 0);
+    n["max-open-streams"] = json!(i64::MAX);
+    assert_eq!(extract(n.clone()).max_open_streams, i64::MAX as usize - 1);
     n["udp-over-stream"] = json!(false);
     n["udp-over-stream-version"] = json!(3);
     assert!(parse(n).is_err());

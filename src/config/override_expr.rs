@@ -9,9 +9,6 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-#[path = "override_expr_case.rs"]
-mod unicode_case;
-
 const SOURCE_LIMIT: usize = 16 * 1024;
 const NODE_LIMIT: usize = 4096;
 const COMPILE_NODES: usize = 64 * 1024;
@@ -1167,8 +1164,17 @@ fn single(node: &Node, input: &Value, budget: &mut Budget<'_>, depth: usize) -> 
         }
     }
 }
-fn simple_case_map(input: &str, upper: bool, budget: &mut Budget<'_>) -> Result<String> {
-    let mut chars = input.chars();
+fn full_case_map(input: &str, upper: bool, budget: &mut Budget<'_>) -> Result<String> {
+    if upper {
+        bounded_case_output(input.chars().flat_map(char::to_uppercase), budget)
+    } else {
+        bounded_case_output(input.chars().flat_map(char::to_lowercase), budget)
+    }
+}
+fn bounded_case_output(
+    mut chars: impl Iterator<Item = char>,
+    budget: &mut Budget<'_>,
+) -> Result<String> {
     let mut output = String::new();
     budget.reserve(0)?;
     loop {
@@ -1176,10 +1182,9 @@ fn simple_case_map(input: &str, upper: bool, budget: &mut Budget<'_>) -> Result<
         let mut count = 0;
         let mut bytes = 0;
         for (index, character) in chars.by_ref().take(batch.len()).enumerate() {
-            let mapped = unicode_case::map(character, upper);
-            batch[index] = mapped;
+            batch[index] = character;
             count = index + 1;
-            bytes += mapped.len_utf8();
+            bytes += character.len_utf8();
         }
         if count == 0 {
             break;
@@ -2495,8 +2500,8 @@ fn call(
                 .as_str()
                 .ok_or_else(|| error("provider override string transform requires a string"))?;
             Value::String(match name {
-                "upcase" => simple_case_map(value, true, budget)?,
-                "downcase" => simple_case_map(value, false, budget)?,
+                "upcase" => full_case_map(value, true, budget)?,
+                "downcase" => full_case_map(value, false, budget)?,
                 _ => {
                     budget.reserve(value.len().saturating_mul(3))?;
                     value.trim().to_owned()
@@ -2664,42 +2669,46 @@ mod tests {
         value
     }
     #[test]
-    fn case_transforms_use_simple_unicode_mapping() {
+    fn case_transforms_use_standard_full_unicode_mapping() {
         let result = run(
             "name: fixture\n",
             r#".upper = ("straße ﬁ ᾀ ας 𐐨" | upcase) | .lower = ("İΣ ΟΣ ᾈ 𐐀 中" | downcase)"#,
         );
-        assert_eq!(result["upper"], Value::String("STRAßE ﬁ ᾈ ΑΣ 𐐀".into()));
-        assert_eq!(result["lower"], Value::String("iσ οσ ᾀ 𐐨 中".into()));
-        // Later Unicode case pairs retain identity under the fixed Go15 data.
-        let later = "\u{019b}\u{0264}\u{1c89}\u{10d50}\u{16ea0}";
-        for upper in [true, false] {
-            assert_eq!(
-                simple_case_map(later, upper, &mut Budget::new(None)).unwrap(),
-                later
-            );
-        }
+        assert_eq!(result["upper"], Value::String("STRASSE FI ἈΙ ΑΣ 𐐀".into()));
+        assert_eq!(result["lower"], Value::String("i\u{307}σ οσ ᾀ 𐐨 中".into()));
     }
     #[test]
-    fn simple_case_mapping_checks_cancel_and_actual_utf8_output_budget() {
+    fn full_case_mapping_checks_cancel_and_actual_utf8_output_budget() {
         let cancel = CancellationToken::new();
         cancel.cancel();
-        assert!(simple_case_map("input", true, &mut Budget::new(Some(&cancel))).is_err());
+        assert!(full_case_map("input", true, &mut Budget::new(Some(&cancel))).is_err());
         let mut budget = Budget::new(None);
         budget.bytes = BYTE_LIMIT - 2;
         // U+023F has a two-byte UTF-8 input and maps to three-byte U+2C7E.
-        assert!(simple_case_map("ȿ", true, &mut budget).is_err());
+        assert!(full_case_map("ȿ", true, &mut budget).is_err());
     }
     #[test]
-    fn simple_case_mapping_charges_bounded_batches() {
+    fn full_case_mapping_charges_bounded_batches() {
         let input = "a".repeat(16 * 1024);
         let mut budget = Budget::new(None);
         assert_eq!(
-            simple_case_map(&input, true, &mut budget).unwrap(),
+            full_case_map(&input, true, &mut budget).unwrap(),
             "A".repeat(input.len())
         );
         assert_eq!(budget.bytes, input.len());
         assert!(budget.steps < 200);
+    }
+    #[test]
+    fn full_case_expansion_crosses_batch_and_checks_output_budget() {
+        let input = format!("{}ßz", "a".repeat(127));
+        let expected = format!("{}SSZ", "A".repeat(127));
+        let mut budget = Budget::new(None);
+        budget.bytes = BYTE_LIMIT - expected.len();
+        assert_eq!(full_case_map(&input, true, &mut budget).unwrap(), expected);
+        assert_eq!(budget.bytes, BYTE_LIMIT);
+        let mut budget = Budget::new(None);
+        budget.bytes = BYTE_LIMIT - expected.len() + 1;
+        assert!(full_case_map(&input, true, &mut budget).is_err());
     }
     #[test]
     fn signed_minimum_literal_is_parsed_with_its_sign() {

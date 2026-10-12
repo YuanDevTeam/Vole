@@ -365,7 +365,7 @@ impl Client {
             cancel: self.cancel.child_token(),
             activity: Arc::new(Notify::new()),
             idle: self.idle,
-            volume: 512 * 1024 * 1024_u64 << self.factor,
+            volume: (512 * 1024 * 1024_u64) << self.factor,
             created: Instant::now(),
             udp: self.factory.config.transport == MieruTransport::Udp,
             maximum_write: AtomicUsize::new(32768),

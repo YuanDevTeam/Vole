@@ -43,7 +43,7 @@ struct ConnectionFactory {
     tls: StandardTlsClient,
     authorization: String,
     quic: bool,
-    congestion: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
+    congestion: Option<quiche::CongestionControlAlgorithm>,
 }
 impl ConnectionFactory {
     async fn connect(
@@ -63,7 +63,8 @@ impl ConnectionFactory {
         session: StreamSession,
         context: &EstablishContext,
     ) -> io::Result<h3::QuicTransport> {
-        let (tls, server_name) = self.tls.quic_config_with_context(context).await?;
+        let tls = self.tls.quiche_config_with_context(context).await?;
+        let server_name = tls.server_name().to_owned();
         let server = self
             .upstream
             .datagram_server(&self.server, context)
@@ -177,7 +178,7 @@ impl Client {
         let (last_success, _) = watch::channel(Instant::now());
         Self {
             transport: if factory.quic {
-                ClientTransport::H3(h3::Pool::new(factory.congestion.clone()))
+                ClientTransport::H3(h3::Pool::new(factory.congestion))
             } else {
                 ClientTransport::H2(GrpcPool::connect_client())
             },
@@ -287,7 +288,7 @@ impl TrustTunnelOutbound {
             ),
             quic: config.quic,
             congestion: if config.quic {
-                crate::transport::quic::congestion_controller(
+                crate::transport::quiche_h3::congestion_controller(
                     &config.congestion_controller,
                     config.cwnd,
                     &config.bbr_profile,
@@ -299,7 +300,7 @@ impl TrustTunnelOutbound {
         let first = Arc::new(Client::new(&connection));
         Ok(Self {
             connection,
-            options: config.pool.clone(),
+            options: config.pool,
             udp: config.udp,
             health_check: config.health_check,
             clients: Mutex::new(vec![first]),

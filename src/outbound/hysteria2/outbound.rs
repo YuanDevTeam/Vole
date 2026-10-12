@@ -272,20 +272,18 @@ async fn drive(
         let mtu = path.mtu;
         paths = Some(path);
         let mut limits = quinn::TransportConfig::default();
+        quic::configure_receive_windows(
+            &mut limits,
+            config.stream_window,
+            config.connection_window,
+            quic::RECEIVE_WINDOW_POLICY,
+        )?;
         limits
             .initial_mtu(mtu)
             .min_mtu(mtu)
             .mtu_discovery_config(None)
             .max_concurrent_bidi_streams(0_u8.into())
             .max_concurrent_uni_streams((crate::limits::HY2_UNI_STREAMS as u32).into())
-            .adaptive_stream_receive_window(
-                quinn::VarInt::from_u64(config.stream_window.initial).map_err(failure)?,
-                quinn::VarInt::from_u64(config.stream_window.maximum).map_err(failure)?,
-            )
-            .adaptive_receive_window(
-                quinn::VarInt::from_u64(config.connection_window.initial).map_err(failure)?,
-                quinn::VarInt::from_u64(config.connection_window.maximum).map_err(failure)?,
-            )
             .send_window(crate::limits::HY2_SEND_WINDOW as u64)
             .datagram_receive_buffer_size(Some(crate::limits::HY2_DATAGRAM_BUFFER))
             .datagram_send_buffer_size(crate::limits::HY2_DATAGRAM_BUFFER)

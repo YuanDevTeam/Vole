@@ -3,10 +3,9 @@
 mod runtime;
 pub(crate) use runtime::OwnedRuntime;
 
-/// Congestion algorithms used by the TrustTunnel and MASQUE consumers.
-pub mod congestion;
-mod congestion_factory;
-pub use congestion_factory::congestion_controller;
+mod policy;
+pub(crate) use policy::datagram_payload_limit;
+pub use policy::{RECEIVE_WINDOW_POLICY, ReceiveWindowPolicy, configure_receive_windows};
 
 use std::{
     collections::VecDeque,
@@ -94,6 +93,25 @@ impl DatagramSocket {
 
     pub fn stats(&self) -> Stats {
         self.shared.state.lock().unwrap().stats
+    }
+
+    /// Waits for previously enqueued packets to pass the controlled transport.
+    /// This is local IO progress, not acknowledgement by the QUIC peer.
+    pub(crate) fn poll_transmitted(
+        &self,
+        cx: &mut Context<'_>,
+        count: usize,
+    ) -> Poll<io::Result<()>> {
+        self.shared.writer.register(cx.waker());
+        let state = self.shared.state.lock().unwrap();
+        if state.closed {
+            return Poll::Ready(Err(state.error.unwrap_or(io::ErrorKind::BrokenPipe).into()));
+        }
+        if state.stats.sent >= count {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -201,10 +219,19 @@ async fn drive(
 ) -> io::Result<()> {
     let mut has_sent = false;
     loop {
-        let can_receive = shared.state.lock().unwrap().incoming.len() < QUEUE_LIMIT;
+        let (can_receive, can_send) = {
+            let state = shared.state.lock().unwrap();
+            (
+                state.incoming.len() < QUEUE_LIMIT,
+                !state.outgoing.is_empty(),
+            )
+        };
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
             _ = shared.changed.notified() => {},
+            // Notify permits coalesce. A producer may have queued several
+            // packets before this owner runs, so queued TX is itself ready.
+            _ = std::future::ready(()), if can_send => {},
             received = transport.receive(), if has_sent && can_receive => {
                 let datagram = received.map_err(dispatch_error)?;
                 let mut state = shared.state.lock().unwrap();
@@ -238,6 +265,7 @@ async fn drive(
             has_sent = true;
             let mut state = shared.state.lock().unwrap();
             state.stats.sent += 1;
+            shared.writer.wake();
             if !state.outgoing.is_empty() {
                 shared.changed.notify_one();
             }
@@ -356,5 +384,64 @@ impl AsyncUdpSocket for DatagramSocket {
 
     fn may_fragment(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Sink {
+        sent: Arc<AtomicUsize>,
+        changed: Arc<Notify>,
+    }
+    #[async_trait::async_trait]
+    impl DatagramTransport for Sink {
+        async fn send(&mut self, _: Datagram) -> Result<(), DispatchError> {
+            self.sent.fetch_add(1, Ordering::AcqRel);
+            self.changed.notify_one();
+            Ok(())
+        }
+        async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            std::future::pending().await
+        }
+    }
+    #[tokio::test]
+    async fn quic_memory_coalesced_notifications_drain_all_queued_packets_without_rx() {
+        let sent = Arc::new(AtomicUsize::new(0));
+        let changed = Arc::new(Notify::new());
+        let peer = "192.0.2.1:443".parse().unwrap();
+        let (socket, driver) = attach(
+            Box::new(Sink {
+                sent: sent.clone(),
+                changed: changed.clone(),
+            }),
+            peer,
+            DatagramBudget::new(1400, 1400),
+        )
+        .unwrap();
+        // No await until all notifications have coalesced. The peer never
+        // replies, so queued output must itself keep the owner runnable.
+        for _ in 0..16 {
+            socket
+                .try_send(&quinn::udp::Transmit {
+                    destination: peer,
+                    ecn: None,
+                    contents: b"packet",
+                    segment_size: None,
+                    src_ip: None,
+                })
+                .unwrap();
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while sent.load(Ordering::Acquire) < 16 {
+                changed.notified().await;
+            }
+        })
+        .await;
+        driver.stop().await.unwrap();
+        assert!(result.is_ok());
+        assert_eq!(sent.load(Ordering::Acquire), 16);
     }
 }

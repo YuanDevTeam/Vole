@@ -23,7 +23,7 @@ pub struct ClientConfig {
     pub prefixes: [Option<ClientPrefix>; 2],
     /// Zero preserves the legacy behavior of using the configured TX MTU.
     pub receive_packet_limit: usize,
-    /// Enables correlated per-socket ICMP PMTU feedback in active mode only.
+    /// Enables correlated packet-layer ICMP PMTU feedback in active mode only.
     pub path_mtu_discovery: bool,
 }
 

@@ -63,7 +63,7 @@ fn fixture_mode(
     let (mut config, packets, endpoint) =
         fixture_parts(budget, datagrams, credit, congestion, mode);
     // These existing pressure/credit fixtures intentionally use small fixed
-    // receive credit. New default/adaptive behavior has separate native cases.
+    // receive credit; the fixed-window policies behave identically here.
     config.stream_window = vole::config::QuicReceiveWindow {
         initial: 256 * 1024,
         maximum: 256 * 1024,
@@ -72,7 +72,6 @@ fn fixture_mode(
         initial: 1024 * 1024,
         maximum: 1024 * 1024,
     };
-    config.incoming_streams = 32;
     config.disable_mtu_discovery = true;
     let outbound = TuicOutbound::new_with_path(
         &config,
@@ -1284,6 +1283,180 @@ async fn configured_mtu_discovery_changes_native_probes_and_path_mtu() {
             })
             .await;
         assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+        finish(endpoint, peer).await;
+    }
+}
+
+#[tokio::test]
+async fn official_quinn_credit_is_bounded_and_replenished_independent_of_owner_threshold() {
+    let _case = Case::new("TUIC-UNIT", "official_quinn_credit");
+    let (mut config, packets, endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
+    config.max_open_streams = i64::MAX as usize - 1;
+    let outbound = TuicOutbound::new_with_path(
+        &config,
+        UpstreamPath::proxy(Arc::new(MemoryUpstream(Mutex::new(Some(packets))))),
+    )
+    .unwrap();
+    let ep = endpoint.clone();
+    let (ready, wait) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let connection = authenticated(&ep).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), connection.open_bi())
+                .await
+                .is_err()
+        );
+        let mut held = VecDeque::new();
+        for _ in 0..32 {
+            let send = connection.open_uni().await.unwrap();
+            held.push_back(send);
+        }
+        // Receiving the highest permitted ID implicitly opens the preceding
+        // gaps. They must fit the same 32 slots even without their own data.
+        held.back_mut().unwrap().write_all(&[5]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), connection.open_uni())
+                .await
+                .is_err()
+        );
+        // EOF ends each partial decoder. Official Quinn batches MAX_STREAMS
+        // updates until more than 1/8 of the 32-slot window has been released;
+        // a single completed stream need not immediately grant peer credit.
+        for _ in 0..4 {
+            held.pop_front().unwrap().finish().unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), connection.open_uni())
+                .await
+                .is_err()
+        );
+        held.pop_front().unwrap().finish().unwrap();
+        for _ in 0..5 {
+            let mut next = tokio::time::timeout(Duration::from_secs(2), connection.open_uni())
+                .await
+                .unwrap()
+                .unwrap();
+            next.write_all(&[5]).await.unwrap();
+            held.push_back(next);
+        }
+        for _ in 0..8 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), connection.open_uni())
+                    .await
+                    .is_err()
+            );
+            for _ in 0..5 {
+                held.pop_front().unwrap().finish().unwrap();
+            }
+            for _ in 0..5 {
+                let mut next = tokio::time::timeout(Duration::from_secs(2), connection.open_uni())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                next.write_all(&[5]).await.unwrap();
+                held.push_back(next);
+            }
+        }
+        // Stream IDs above the first concurrency window work through automatic
+        // recycling; cumulative accepts do not increase concurrent permission.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), connection.open_uni())
+                .await
+                .is_err()
+        );
+        ready.send(()).unwrap();
+        connection.closed().await;
+    });
+    let probe = ResourceProbe::default();
+    probe
+        .scope(async {
+            let udp = outbound
+                .open_datagram(udp_request(), &EstablishContext::default())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(4), wait)
+                .await
+                .unwrap()
+                .unwrap();
+            outbound.shutdown().await;
+            drop(udp);
+            assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+        })
+        .await;
+    finish(endpoint, peer).await;
+}
+
+#[tokio::test]
+async fn official_quinn_receive_budget_is_independent_of_send_frame_limit() {
+    let _case = Case::new("TUIC-UNIT", "official_quinn_receive_budget");
+    for receive_budget in [60, 64] {
+        let (mut config, packets, endpoint) = fixture_parts(1400, true, 8, "cubic", "native");
+        config.max_datagram_frame_size = 80;
+        config.max_udp_relay_packet_size = 51;
+        let outbound = TuicOutbound::new_with_path(
+            &config,
+            UpstreamPath::proxy(Arc::new(MemoryUpstream(Mutex::new(Some(packets))))),
+        )
+        .unwrap();
+        let ep = endpoint.clone();
+        let peer = tokio::spawn(async move {
+            let connection = authenticated(&ep).await;
+            // An outbound packet proves association registration completed before
+            // the peer sends its responses; authentication alone precedes it.
+            connection.read_datagram().await.unwrap();
+            // These peer messages fit the physical path. The 61-byte response
+            // exceeds our configured send frame limit but fits a 64-byte source
+            // receive budget; a 60-byte receive budget must reject it.
+            for size in [61_u16, 60] {
+                let mut raw = vec![5, 2, 0, 0, 0, 0, 1, 0];
+                raw.extend_from_slice(&size.to_be_bytes());
+                raw.extend_from_slice(&[1, 192, 0, 2, 1, 0, 53]);
+                raw.resize(raw.len() + usize::from(size), size as u8);
+                connection.send_datagram_wait(raw.into()).await.unwrap();
+            }
+            connection.closed().await;
+        });
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let mut udp = outbound
+                    .open_datagram(
+                        udp_request().with_budget(DatagramBudget::new(u16::MAX, receive_budget)),
+                        &EstablishContext::default(),
+                    )
+                    .await
+                    .unwrap();
+                udp.send(Datagram {
+                    remote: request().destination,
+                    payload: bytes::Bytes::from_static(b"start"),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+                let packet = tokio::time::timeout(Duration::from_secs(2), udp.receive())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if receive_budget == 64 {
+                    assert_eq!(packet.payload, vec![61; 61]);
+                    let packet = tokio::time::timeout(Duration::from_secs(2), udp.receive())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(packet.payload, vec![60; 60]);
+                } else {
+                    assert_eq!(packet.payload, vec![60; 60]);
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), udp.receive())
+                        .await
+                        .is_err()
+                );
+                outbound.shutdown().await;
+                drop(udp);
+                assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+            })
+            .await;
         finish(endpoint, peer).await;
     }
 }

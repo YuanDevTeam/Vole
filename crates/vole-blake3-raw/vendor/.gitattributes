@@ -1,3 +1,0 @@
-# Preserve the official release bytes, including upstream whitespace.
-blake3_impl.h whitespace=-blank-at-eol
-LICENSE_A2LLVM whitespace=-blank-at-eof

@@ -27,7 +27,8 @@ smoltcp 负责生成 Echo Reply，Vole 负责更严格的输入分类和运行�
 MASQUE 的内部主动客户端另行支持 ICMP PMTU 反馈：验证外层校验和、本地地址、
 被引用的活动 TCP tuple 及实际发送且尚未确认的序号，只降低对应连接的 MTU并重新分段。
 IPv6 宣告 MTU 小于 1280 时忽略，IPv4 小于 68 时取 68。
-这不启用宿主 TUN 的 ICMP error 转发，也不改变其 MTU 门禁或 Echo 配置。
+分段使用官方 smoltcp 的包层适配，重传沿用其 TCP 定时器；不启用宿主 TUN 的
+ICMP error 转发，也不改变其 MTU 门禁或 Echo 配置。
 
 ## TUN DNS 入口
 
@@ -171,7 +172,7 @@ H1/H2/H3 的请求及响应头各限 16 KiB，DNS body 仍限 4,096 字节。
 复用已选连接，H1/H2 的版本选择最多保留 4 项、空闲 30 秒，失败后重新选择；不为每次查询重新探测。
 `https://…#h3=true` 仅建立 H3，失败不能降级；明文 HTTP 的 h3/prefer-h3 不改变 H1 行为。
 bootstrap、主、节点和直连 DNS 角色均应用全局 prefer-h3；WireGuard/MASQUE 私有 DNS 与固定参考一致，
-不继承全局偏好，但支持 URL `h3=true`。H3 共用 GET/Basic/ID 与包装，不启用 0-RTT。
+不继承全局偏好，但支持 URL `h3=true`。H3 共用 GET/Basic/ID 与包装，不启用 0-RTT，使用 quiche 与共享 Boring；DoQ 使用 Quinn。
 
 ### DoQ
 
@@ -337,14 +338,15 @@ TCP、DoT 和 DoH 使用解析器所属的连接池：
   来源 generation 和物理接口绑定；
 - TCP、DoT、HTTP/1.1 一条连接只处理一个查询，不做 pipeline；这部分空闲连接总数最多 4、同 key 最多 2、超时 30 秒；
 - HTTP/2 同 key 首次建连串行发布，之后共享 sender；每连接最多 32 个并发 stream，超出时在查询原期限内等待。流接收窗口 4 KiB、连接接收窗口 128 KiB，禁用 server push；H2 空闲连接另限 4、超时 30 秒；
-- DoQ/H3 同 key 串行初始化后复用，每连接最多 32 条查询；QUIC stream 接收窗口 4,098 字节、connection 接收/发送窗口 128 KiB，不接收服务器双向 stream 或 QUIC DATAGRAM。H3 最多接收 4 条单向控制 stream，DoQ 为 0；空闲 QUIC 连接另限 4、超时 30 秒；
+- DoQ/H3 同 key 串行初始化后复用，每连接最多 32 条查询；业务 QUIC stream 接收窗口 4,098 字节、connection 接收窗口 128 KiB，不接收服务器双向 stream 或 QUIC DATAGRAM。DoQ 另限发送窗口 128 KiB，不接收单向 stream；H3 最多接收 8 条单向 stream，控制流初始信用 16 KiB，后续滚动窗口受 4,098 字节上限约束。空闲 QUIC 连接另限 4、超时 30 秒；
 - 活动物理连接不设固定业务数量上限；完整响应校验后才能归还 H1 连接或继续复用 H2；
 - TCP/DoT/H1 复用连接遇到 EOF、I/O、reset 或响应不匹配时，在原尝试期限内最多新建一次连接；
 - 非法、截断或超限响应不重试、不归还连接。
 
 HTTP/2 单流取消发送 RST，其他流可继续使用原连接；响应错误使该连接不再接受新查询。
 解析器拥有连接 driver 与有界空闲回收任务，Session Stop 和资源代际退役关闭全部解析角色并等待 driver 结束；WireGuard/MASQUE 私有 DNS 同样由节点 Stop 关闭且不保留空闲连接。MASQUE IP 查询经过节点内部栈，L4 仅可使用 TCP DNS 传输；system/DHCP 始终沿物理来源策略，不因节点模式改变出口。
-DoQ/H3 的取消和退役先关闭 endpoint，最多等待一秒 QUIC close exchange，随后停止并等待 Quinn runtime 与受控 datagram driver；初始化探测同样属于此 Stop 所有权。
+DoQ/H3 的取消和退役最多等待一秒 QUIC close exchange，随后停止并等待相应的
+Quinn/quiche 驱动与受控 datagram driver；初始化探测同样属于此 Stop 所有权。
 
 Controller 切换代理组后，只在后续需要创建新 DNS transport 时使用新选择。类型化/原始响应 cache、singleflight 状态和已经位于 TCP pool 中的 transport 不清空、不迁移；因此命中 cache 或复用既有 TCP transport 时，不会为切换单独建链。停止 session 才统一释放这些状态。
 

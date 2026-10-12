@@ -7,7 +7,7 @@ REALITY、JLS、ECH 的身份规则见 [VLESS](vless.md)，实际验证边界见
 
 `network: xhttp` 使用现有 Dialer、上游图、保护接口与 SecurityClient，不另建系统解析器或裸 socket。`alpn: [http/1.1]` 选择 H1；空列表、`[h2]` 或包含 H1/H2 的列表选择 H2；只有独占 `[h3]` 选择 H3。不会静默降级 HTTP 版本。
 
-H1/H2 可使用明文、标准 TLS 1.3、REALITY（经典默认、显式混合模式）或 JLS。H3 必须使用标准 TLS 1.3，不允许同腿明文、REALITY 或 JLS。QUIC 收发走受控数据报，上游有效预算小于 1200 字节即拒绝，不绕开代理、protect 或接口绑定；路径 MTU 探测关闭。
+H1/H2 可使用明文、标准 TLS 1.3、REALITY（经典默认、显式混合模式）或 JLS。H3 必须使用标准 TLS 1.3，不允许同腿明文、REALITY 或 JLS。QUIC 收发走受控数据报，上游有效预算小于 1200 字节即拒绝，不绕开代理、protect 或接口绑定；quiche 路径 MTU 探测受真实双向预算限制。
 
 `xhttp-opts.mode` 接受 `auto`（省略或空串默认）、`packet-up`、`stream-up`、`stream-one`。auto 在 REALITY 无下载配置时选择 stream-one，有下载配置时选择 stream-up，其余选择 packet-up。stream-one 是一条双工 POST，不允许 `download-settings`；其余模式以同一会话 ID 关联上传与下载。`path` 省略或空串默认 `/`，`host` 显式非空优先，否则使用该腿 servername/server；IPv6 authority 使用方括号。主腿与下载腿的 host 均禁止 userinfo（`@`）。
 
@@ -100,13 +100,15 @@ sing-mux 的外层是底层协议的普通 TCP 到 `sp.mux.sing-box.arpa:444`，
 
 ## 关闭、安全与验收边界
 
-XHTTP 按 Mihomo 整条逻辑连接关闭：shutdown 先尝试送完已接受的上传，再取消下载，
+XHTTP 关闭整条逻辑连接：shutdown 先尝试送完已接受的上传，再取消下载，
 所有模式的待决上传最多等待一秒；超时或节点 Stop 可以取消，异常终止不承诺交付。
 H1/H2 flush 等待已接受的 payload 到达所供应 IO 的 flush 边界；H3 flush 等待上传任务
-写入 QUIC，shutdown 进一步等待该请求上传的 QUIC 确认，再释放物理连接租约。
+写入 QUIC，shutdown 提交上传 FIN 后释放物理连接租约，不提供逐请求的远端 ACK 屏障。
 这些等待不依赖下载响应。需要完整回复的应用必须在关闭前读完；不承诺 TCP 半关闭
 后继续收到尾包。复用只延长物理 transport 生命周期，不改变单个逻辑连接的关闭范围。
 
-H3 的 QUIC 驱动、数据报适配器和后台任务归节点所有。Stop 先执行有界关闭交换，再取消/join 内部任务和上游 IO，不把 Drop 或“等一会儿资源消失”当作完成屏障。
+H3 的 QUIC 驱动、数据报适配器和后台任务归节点所有。物理连接退役立即停止新请求准入，
+在既有一秒关闭预算内继续发送和接收，再关闭并 join 内部任务与上游 IO；这段传输收尾
+不构成远端 ACK 屏障。Stop 返回以任务回收为准，不把 Drop 或等待时间当作完成证明。
 
 H1/H2 原生验证优先使用官方 latest Mihomo；H3 使用官方 latest Xray。不被 Xray 直接解码的 packetaddr/sing-mux 使用明确标注的 Xray XHTTP → Mihomo VLESS 分层拓扑；mTLS 使用已批准的 xcaddy/Caddy H3 网关，后端仍是同一个 Xray handler。分层成功不改写直接对端失败。所有服务端与原站在隔离容器中，配置和私钥不入 Git；原生数据、公共入口、资源、跨平台构建和阶段签收分别记录。

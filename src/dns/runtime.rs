@@ -3061,7 +3061,7 @@ impl RuntimeDns {
                 super::quic::Kind::Doq => b"doq".to_vec(),
                 super::quic::Kind::H3 => b"h3".to_vec(),
             };
-            let (tls, server_name) = crate::security::StandardTlsClient::with_options(
+            let client = crate::security::StandardTlsClient::with_options(
                 &security,
                 nameserver.address.to_string(),
                 crate::security::TlsClientOptions {
@@ -3077,8 +3077,18 @@ impl RuntimeDns {
                 },
                 0,
                 64 * 1024,
-            )?
-            .quic_config()?;
+            )?;
+            let (tls, server_name) = match kind {
+                super::quic::Kind::Doq => {
+                    let (tls, name) = client.quic_config()?;
+                    (super::quic::Tls::Quinn(tls), name)
+                }
+                super::quic::Kind::H3 => {
+                    let tls = client.quiche_config()?;
+                    let name = tls.server_name().to_owned();
+                    (super::quic::Tls::H3(tls), name)
+                }
+            };
             let transport = dispatcher
                 .open_datagram(DatagramSession::new(
                     InboundKind::InternalDns,

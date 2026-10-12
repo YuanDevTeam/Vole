@@ -110,12 +110,13 @@ impl Engine {
             job: AsyncMutex::new(None),
             stop: AsyncMutex::new(()),
         });
+        let tcp = engine.tcp.clone();
         // The worker owns endpoint handles, never its Engine Arc. Publication
         // precedes authentication, so Stop owns setup as well as packet I/O.
         *engine.job.try_lock().unwrap() = Some(observation::spawn(async move {
             let result = tokio::select! {biased;
                 ()=cancel.cancelled()=>Err(closed()),
-                result=run(config,factory,pool,h2_pool,session,context,client,packet_sink,packet_stream,output,registry,&ready_sender)=>result,
+                result=run(config,factory,pool,h2_pool,session,context,client,tcp,packet_sink,packet_stream,output,registry,&ready_sender)=>result,
             };
             let _ = result;
             ready_sender.send_replace(Ready::Failed);
@@ -240,7 +241,7 @@ fn request(uri: &str) -> io::Result<http::Request<()>> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid MASQUE request"))?;
     request
         .extensions_mut()
-        .insert(h3::ext::Protocol::CF_CONNECT_IP);
+        .insert(crate::transport::quiche_h3::Protocol::CF_CONNECT_IP);
     Ok(request)
 }
 fn routes() -> io::Result<Bytes> {
@@ -264,6 +265,7 @@ async fn run(
     session: StreamSession,
     context: EstablishContext,
     client: ClientConfig,
+    tcp: TcpConnector,
     sink: PacketSink,
     packets: PacketStream,
     output: mpsc::Receiver<Packet>,
@@ -305,6 +307,19 @@ async fn run(
     .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
     if Instant::now() >= context.deadline() {
         return Err(io::ErrorKind::TimedOut.into());
+    }
+    if let Tunnel::H3(tunnel) = &tunnel {
+        let configured = usize::try_from(config.mtu)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // Only peer-negotiated transmit capacity seeds the TCP device MTU.
+        // The independent full-IP receive allocation bound stays unchanged.
+        // Ready cannot expose a connector until its first SYN will use the
+        // actual budget rather than continually requiring software splitting.
+        tcp.set_initial_mtu(
+            configured.min(tunnel.datagrams.packet_budget()),
+            context.deadline(),
+        )
+        .await?;
     }
     ready.send_replace(Ready::Open);
     match tunnel {
@@ -498,8 +513,10 @@ pub(super) mod tests {
         );
         assert_eq!(request.headers()["capsule-protocol"], "?1");
         assert_eq!(
-            request.extensions().get::<h3::ext::Protocol>(),
-            Some(&h3::ext::Protocol::CF_CONNECT_IP)
+            request
+                .extensions()
+                .get::<crate::transport::quiche_h3::Protocol>(),
+            Some(&crate::transport::quiche_h3::Protocol::CF_CONNECT_IP)
         );
         let frame = routes().unwrap();
         let mut decoder = codec::CapsuleDecoder::new(256);
@@ -573,7 +590,12 @@ pub(super) mod tests {
             assert_eq!(request.headers()["cf-connect-proto"], "cf-connect-ip");
             assert_eq!(request.headers()["pq-enabled"], "false");
             assert!(request.headers().get("capsule-protocol").is_none());
-            assert!(request.extensions().get::<h3::ext::Protocol>().is_none());
+            assert!(
+                request
+                    .extensions()
+                    .get::<crate::transport::quiche_h3::Protocol>()
+                    .is_none()
+            );
         }
     }
 }

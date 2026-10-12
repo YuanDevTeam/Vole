@@ -1,16 +1,15 @@
 //! Shared HTTP/3 CONNECT sessions over supplied datagrams. Each protocol
 //! chooses its admission, response and idle policy; the pool owns its tasks.
 use crate::{
-    dispatch::{BoxStream, DatagramBudget, DatagramTransport},
+    dispatch::BoxStream,
     resources::observation::{self, ResourceKind},
-    transport::{h3_stream, quic},
+    transport::{quic, quiche_h3},
 };
 use bytes::{Buf, Bytes};
 use futures_util::task::AtomicWaker;
 use std::{
     future::Future,
     io,
-    net::SocketAddr,
     pin::Pin,
     sync::{
         Arc, Mutex, Weak,
@@ -28,23 +27,14 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 const IDLE: Duration = Duration::from_secs(30);
 const QUIC_IDLE: Duration = Duration::from_secs(74);
-const STREAM_WINDOW: u32 = 128 * 1024;
-const CONNECTION_WINDOW: u32 = 256 * 1024;
-const SEND_WINDOW: u64 = 64 * 1024;
 const CHUNK: usize = crate::transport::STREAM_CHUNK_BYTES;
-type Sender = h3::client::SendRequest<h3_stream::OpenStreams, Bytes>;
-type SendStream = h3::client::RequestStream<h3_stream::SendStream, Bytes>;
-type RecvStream = h3::client::RequestStream<h3_stream::RecvStream, Bytes>;
+type Sender = quiche_h3::Client;
+type SendStream = quiche_h3::SendStream;
+type RecvStream = quiche_h3::RecvStream;
 type SendOperation = Pin<Box<dyn Future<Output = (SendHalf, io::Result<()>)> + Send + 'static>>;
 type Observer = Arc<dyn Fn() + Send + Sync>;
 
-pub(crate) struct QuicTransport {
-    pub transport: Box<dyn DatagramTransport>,
-    pub peer: SocketAddr,
-    pub budget: DatagramBudget,
-    pub tls: Arc<rustls::ClientConfig>,
-    pub server_name: String,
-}
+pub(crate) use quiche_h3::Transport as QuicTransport;
 
 #[cfg(feature = "outbound-masque")]
 pub(crate) struct IpConnect {
@@ -53,9 +43,9 @@ pub(crate) struct IpConnect {
 }
 
 /// The associated request owns its lease. The IP engine owns this handle
-/// together with that request, and is the physical connection's sole reader.
+/// together with that request and reads only its registered DATAGRAM flow.
 pub(crate) struct IpDatagrams {
-    connection: quinn::Connection,
+    connection: quiche_h3::Client,
     physical: Arc<Physical>,
     request_id: u64,
 }
@@ -109,7 +99,7 @@ impl IpDatagrams {
             ()=self.physical.cancel.cancelled()=>Err(IpDatagramSendError::Closed),
             result=self.connection.send_datagram_wait(frame)=>match result {
                 Ok(())=>Ok(()),
-                Err(quinn::SendDatagramError::TooLarge)=>Err(IpDatagramSendError::TooLarge {
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput=>Err(IpDatagramSendError::TooLarge {
                     packet_budget:self.packet_budget(),
                 }),
                 Err(_)=>Err(IpDatagramSendError::Closed),
@@ -120,7 +110,7 @@ impl IpDatagrams {
         loop {
             let frame = tokio::select! { biased;
                 ()=self.physical.cancel.cancelled()=>return Err(closed()),
-                result=self.connection.read_datagram()=>result.map_err(|_|closed())?,
+                result=self.connection.read_datagram(self.request_id)=>result.map_err(|_|closed())?,
             };
             let Ok(packet) = crate::transport::masque_codec::decode_h3_datagram(
                 &frame,
@@ -151,8 +141,7 @@ async fn wait_for_packet_budget(
             if maximum >= minimum {
                 return Ok(maximum);
             }
-            // Quinn has no public MTU-change notification. This bounded poll
-            // reads its discovery result without assuming a probe succeeded.
+            // Poll the actual native path budget without assuming a probe succeeded.
             tokio::select! { biased;
                 ()=cancel.cancelled()=>return Err(closed()),
                 ()=tokio::time::sleep(Duration::from_millis(20))=>{},
@@ -173,7 +162,7 @@ struct Usage {
 }
 struct Physical {
     usage: Mutex<Usage>,
-    connection: Mutex<Option<quinn::Connection>>,
+    connection: Mutex<Option<quiche_h3::Client>>,
     activity: Notify,
     cancel: CancellationToken,
     idle_timeout: Option<Duration>,
@@ -284,13 +273,11 @@ pub(crate) struct Pool {
     admission: Mutex<()>,
     cancellation: CancellationToken,
     tasks: TaskTracker,
-    congestion: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
+    congestion: Option<quiche::CongestionControlAlgorithm>,
     flavor: Flavor,
 }
 impl Pool {
-    pub fn new(
-        congestion: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
-    ) -> Self {
+    pub fn new(congestion: Option<quiche::CongestionControlAlgorithm>) -> Self {
         Self {
             connection: Arc::default(),
             opening: tokio::sync::Mutex::new(()),
@@ -302,17 +289,13 @@ impl Pool {
         }
     }
     #[cfg(feature = "outbound-masque")]
-    pub fn masque_l4(
-        congestion: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
-    ) -> Self {
+    pub fn masque_l4(congestion: Option<quiche::CongestionControlAlgorithm>) -> Self {
         let mut pool = Self::new(congestion);
         pool.flavor = Flavor::MasqueL4;
         pool
     }
     #[cfg(feature = "outbound-masque")]
-    pub fn masque_ip(
-        congestion: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
-    ) -> Self {
+    pub fn masque_ip(congestion: Option<quiche::CongestionControlAlgorithm>) -> Self {
         let mut pool = Self::new(congestion);
         pool.flavor = Flavor::MasqueIp;
         pool
@@ -378,6 +361,14 @@ impl Pool {
                 closed()
             })?;
             let datagrams = if self.flavor.ip() {
+                lease
+                    .0
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .ok_or_else(closed)?
+                    .register_datagrams(request.id().into_inner())?;
                 Some(IpDatagrams {
                     connection: lease
                         .0
@@ -521,7 +512,7 @@ impl Pool {
             idle_timeout: self.flavor.deferred().then_some(IDLE),
         });
         let (ready, response) = oneshot::channel();
-        let congestion = self.congestion.clone();
+        let congestion = self.congestion;
         let registry = Arc::downgrade(&self.connection);
         self.spawn(drive(
             connect,
@@ -574,180 +565,94 @@ async fn drive<F, Fut>(
     deadline: Instant,
     physical: Arc<Physical>,
     registry: Weak<Mutex<Option<Entry>>>,
-    congestion: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
+    congestion: Option<quiche::CongestionControlAlgorithm>,
     flavor: Flavor,
     ready: oneshot::Sender<io::Result<Entry>>,
 ) where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = io::Result<QuicTransport>> + Send + 'static,
 {
-    let runtime = Arc::new(quic::OwnedRuntime::new(CancellationToken::new()));
-    let mut endpoint = None;
-    let mut datagram = None;
     let mut ready = Some(ready);
-    let mut control = None;
-    let mut keep_sender = None;
+    let raw = tokio::select! {biased;
+        () = physical.cancel.cancelled() => Err(closed()),
+        result = timeout_at(deadline, connect()) => result.map_err(|_| io::Error::from(io::ErrorKind::TimedOut)).and_then(|result| result),
+    };
     let mut pool_observation = None;
-    let establishment = async {
-        let _handshake = observation::track(ResourceKind::Handshake);
-        let raw = connect().await?;
-        let (socket, driver) = quic::attach(raw.transport, raw.peer, raw.budget)?;
-        datagram = Some(driver);
-        let mtu = socket.budget().quic_payload_limit()?;
-        let mut transport = quinn::TransportConfig::default();
-        // The controlled adapter advertises may_fragment=false to Quinn, so
-        // MASQUE IP can discover its real raw-IP budget on every target. Keep
-        // the established TrustTunnel and L4 discovery policy unchanged.
-        let discovery = if flavor.ip()
-            || cfg!(any(
-                target_os = "windows",
-                target_os = "linux",
-                target_os = "android",
-                target_os = "macos"
-            )) {
-            let mut discovery = quinn::MtuDiscoveryConfig::default();
-            discovery.upper_bound(mtu);
-            Some(discovery)
-        } else {
-            None
-        };
-        transport
-            .initial_mtu(if flavor.deferred() {
-                1200
+    if let Ok(raw) = raw {
+        let options = quiche_h3::Options {
+            idle: if flavor.deferred() {
+                QUIC_IDLE
             } else {
-                mtu.min(1242)
-            })
-            .min_mtu(1200)
-            .mtu_discovery_config(discovery)
-            .max_concurrent_bidi_streams(0_u8.into())
-            .max_concurrent_uni_streams(8_u8.into())
-            .stream_receive_window(STREAM_WINDOW.into())
-            .receive_window(CONNECTION_WINDOW.into())
-            .send_window(SEND_WINDOW)
-            .datagram_receive_buffer_size(None)
-            .datagram_send_buffer_size(0)
-            .max_idle_timeout(Some(QUIC_IDLE.try_into().map_err(|_| closed())?));
-        if !flavor.deferred() {
-            transport
-                .keep_alive_interval(Some(Duration::from_secs(30)))
-                .max_idle_timeout(Some(
-                    Duration::from_secs(30).try_into().map_err(|_| closed())?,
-                ))
-                .datagram_receive_buffer_size(Some(32 * 1024))
-                .datagram_send_buffer_size(32 * 1024);
-        }
-        if let Some(congestion) = congestion {
-            transport.congestion_controller_factory(congestion);
-        }
-        let crypto =
-            quinn::crypto::rustls::QuicClientConfig::try_from(raw.tls).map_err(|_| closed())?;
-        let mut client = quinn::ClientConfig::new(Arc::new(crypto));
-        client.transport_config(Arc::new(transport));
-        client.version(1);
-        let mut limits = quinn::EndpointConfig::default();
-        limits.max_udp_payload_size(mtu).map_err(|_| closed())?;
-        if !flavor.deferred() {
-            limits.cid_generator(|| Box::new(quinn_proto::RandomConnectionIdGenerator::new(20)));
-        }
-        let mut ep =
-            quinn::Endpoint::new_with_abstract_socket(limits, None, socket, runtime.clone())?;
-        ep.set_default_client_config(client);
-        endpoint = Some(ep);
-        let connected = endpoint
-            .as_ref()
-            .unwrap()
-            .connect(raw.peer, &raw.server_name)
-            .map_err(|_| closed())?
-            .await
-            .map_err(|_| closed())?;
-        let negotiated = connected
-            .handshake_data()
-            .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
-            .and_then(|data| data.protocol);
-        if negotiated.as_deref() != Some(b"h3") {
-            return Err(closed());
-        }
-        *physical.connection.lock().unwrap() = Some(connected.clone());
-        let mut builder = h3::client::builder();
-        builder.max_field_section_size(CHUNK as u64);
-        if flavor.ip() {
-            builder.enable_datagram(true).legacy_datagram_setting(true);
-        }
-        let (mut driver, sender) = builder
-            .build(h3_stream::Connection::new(connected))
-            .await
-            .map_err(|_| closed())?;
-        if flavor.ip() {
-            // The reference checks modern DATAGRAM support after actual
-            // SETTINGS, and deliberately does not require Extended CONNECT.
-            let settings = futures_util::future::poll_fn(|cx| driver.poll_peer_settings(cx))
-                .await
-                .map_err(|_| closed())?;
-            if !settings.enable_datagram() {
-                return Err(closed());
-            }
-        }
-        control = Some(driver);
-        keep_sender = Some(sender.clone());
-        pool_observation = Some(observation::track(ResourceKind::Pool));
-        ready
-            .take()
-            .unwrap()
-            .send(Ok(Entry {
-                sender,
-                physical: physical.clone(),
-                draining: false,
-            }))
-            .map_err(|_| closed())?;
-        Ok::<_, io::Error>(())
-    };
-    let setup = tokio::select! {biased;
-        ()=physical.cancel.cancelled()=>Err(closed()),
-        result=timeout_at(deadline,establishment)=>result.map_err(|_|io::Error::from(io::ErrorKind::TimedOut)).and_then(|result|result),
-    };
-    if let Err(error) = setup {
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Err(error));
-        }
-    } else {
-        let control = control.as_mut().unwrap();
-        loop {
-            let activity = physical.activity.notified();
-            if physical.retire_idle(Instant::now()) {
-                break;
-            }
-            let expires = physical
-                .usage
-                .lock()
-                .unwrap()
-                .idle_since
-                .zip(physical.idle_timeout)
-                .map(|(since, timeout)| since + timeout);
-            tokio::select! {biased;
-                ()=physical.cancel.cancelled()=>break,
-                _=control.wait_idle()=>break,
-                ()=activity=>{},
-                ()=async{ match expires { Some(deadline)=>tokio::time::sleep_until(deadline).await, None=>std::future::pending().await } }=>{
-                    if physical.retire_idle(Instant::now()) { break; }
+                Duration::from_secs(74)
+            },
+            keepalive: (!flavor.deferred()).then_some(Duration::from_secs(30)),
+            datagrams: flavor.ip(),
+            congestion: congestion.unwrap_or(quiche::CongestionControlAlgorithm::CUBIC),
+            ..Default::default()
+        };
+        match quiche_h3::Driver::new(raw, options).await {
+            Ok((sender, driver)) => {
+                let driver_cancel = CancellationToken::new();
+                let driver = driver.run(driver_cancel.clone());
+                tokio::pin!(driver);
+                let mut driver_finished = false;
+                let setup = tokio::select! {biased;
+                    () = physical.cancel.cancelled() => Err(closed()),
+                    _ = &mut driver => { driver_finished = true; Err(closed()) },
+                    result = timeout_at(deadline, sender.ready(flavor.ip())) => result.map_err(|_| io::Error::from(io::ErrorKind::TimedOut)).and_then(|result| result),
+                };
+                if let Err(error) = setup {
+                    let _ = ready.take().unwrap().send(Err(error));
+                } else {
+                    *physical.connection.lock().unwrap() = Some(sender.clone());
+                    pool_observation = Some(observation::track(ResourceKind::Pool));
+                    if ready
+                        .take()
+                        .unwrap()
+                        .send(Ok(Entry {
+                            sender,
+                            physical: physical.clone(),
+                            draining: false,
+                        }))
+                        .is_err()
+                    {
+                        physical.cancel.cancel();
+                    }
+                    loop {
+                        let activity = physical.activity.notified();
+                        if physical.retire_idle(Instant::now()) {
+                            break;
+                        }
+                        let expires = physical
+                            .usage
+                            .lock()
+                            .unwrap()
+                            .idle_since
+                            .zip(physical.idle_timeout)
+                            .map(|(since, timeout)| since + timeout);
+                        tokio::select! {biased;
+                            () = physical.cancel.cancelled() => break,
+                            _ = &mut driver => { driver_finished = true; break; },
+                            () = activity => {},
+                            () = async { match expires { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => { if physical.retire_idle(Instant::now()) { break; } },
+                        }
+                    }
+                }
+                driver_cancel.cancel();
+                if !driver_finished {
+                    let _ = driver.await;
                 }
             }
+            Err(error) => {
+                let _ = ready.take().unwrap().send(Err(error));
+            }
         }
+    } else if let Err(error) = raw {
+        let _ = ready.take().unwrap().send(Err(error));
     }
     physical.usage.lock().unwrap().closed = true;
     physical.cancel.cancel();
-    // Logical cancellation must not cancel Quinn's runtime until the bounded
-    // CONNECTION_CLOSE exchange has had its chance to reach the supplied IO.
-    if let Some(endpoint) = endpoint {
-        endpoint.close(0_u8.into(), b"");
-        let _ = tokio::time::timeout(quic::CLOSE_TIMEOUT, endpoint.wait_idle()).await;
-    }
-    drop(control);
-    drop(keep_sender);
     physical.connection.lock().unwrap().take();
-    runtime.stop().await;
-    if let Some(driver) = datagram {
-        let _ = driver.stop().await;
-    }
     if let Some(registry) = registry.upgrade() {
         let mut current = registry.lock().unwrap();
         if current
@@ -760,10 +665,10 @@ async fn drive<F, Fut>(
     drop(pool_observation);
 }
 
-fn retire_on_connection_error(lease: &Lease, error: &h3::error::StreamError) {
+fn retire_on_connection_error(lease: &Lease, error: &io::Error) {
     retire_physical(&lease.0, error);
 }
-fn retire_physical(physical: &Physical, _: &h3::error::StreamError) {
+fn retire_physical(physical: &Physical, _: &io::Error) {
     // h3's default stable API deliberately hides its internal error variants.
     // A stream error alone must not abort its siblings. The public QUIC state
     // identifies actual physical closure; the control driver retires H3 errors.
@@ -806,14 +711,13 @@ struct SendHalf {
 }
 impl Drop for SendHalf {
     fn drop(&mut self) {
-        self.stream
-            .stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+        self.stream.stop_stream(quiche_h3::REQUEST_CANCELLED);
     }
 }
 struct ReceiveHalf(RecvStream);
 impl Drop for ReceiveHalf {
     fn drop(&mut self) {
-        self.0.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+        self.0.stop_sending(quiche_h3::REQUEST_CANCELLED);
     }
 }
 struct Stream {
@@ -988,12 +892,12 @@ impl AsyncWrite for Stream {
 mod tests {
     use super::*;
     use crate::{
-        dispatch::DispatchError,
+        dispatch::{DatagramBudget, DatagramTransport, DispatchError},
         resources::observation::ResourceProbe,
         session::{Datagram, Destination},
     };
     use async_trait::async_trait;
-    use std::{io::IoSliceMut, sync::atomic::AtomicUsize};
+    use std::{io::IoSliceMut, net::SocketAddr, sync::atomic::AtomicUsize};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         sync::mpsc,
@@ -1123,7 +1027,7 @@ mod tests {
         }
     }
     struct Peer {
-        client: Arc<rustls::ClientConfig>,
+        client: crate::security::StandardTlsClient,
         server: rustls::ServerConfig,
         cancel: CancellationToken,
         tasks: TaskTracker,
@@ -1140,12 +1044,19 @@ mod tests {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(identity.cert.der().clone()).unwrap();
             let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let mut client = rustls::ClientConfig::builder_with_provider(provider.clone())
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-            client.alpn_protocols = vec![b"h3".to_vec()];
+            let client = crate::security::StandardTlsClient::with_options(
+                &crate::security::SecurityContext::with_tls_roots(roots),
+                "localhost",
+                crate::security::TlsClientOptions {
+                    alpn: vec![b"h3".to_vec()],
+                    required_alpn: Some(b"h3".to_vec()),
+                    versions: crate::security::TlsVersions::Tls13,
+                    ..Default::default()
+                },
+                0,
+                64 * 1024,
+            )
+            .unwrap();
             let mut server = rustls::ServerConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
                 .unwrap()
@@ -1159,7 +1070,7 @@ mod tests {
                 .unwrap();
             server.alpn_protocols = vec![b"h3".to_vec()];
             Arc::new(Self {
-                client: Arc::new(client),
+                client,
                 server,
                 cancel: CancellationToken::new(),
                 tasks: TaskTracker::new(),
@@ -1275,7 +1186,7 @@ mod tests {
                 }),
                 peer: local,
                 budget: DatagramBudget::new(1400, 1400),
-                tls: self.client.clone(),
+                tls: self.client.quiche_config()?,
                 server_name: "localhost".into(),
             })
         }
@@ -1372,7 +1283,7 @@ mod tests {
         observation
             .scope(async {
                 let peer = Peer::new();
-                let pool = Pool::new(quic::congestion_controller("bbr", 0, "standard"));
+                let pool = Pool::new(quiche_h3::congestion_controller("bbr", 0, "standard"));
                 let mut first = open(&pool, &peer, "echo.invalid:443").await;
                 let mut second = open(&pool, &peer, "echo.invalid:443").await;
                 assert_eq!(peer.calls.load(Ordering::Acquire), 1);

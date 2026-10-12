@@ -12,7 +12,7 @@ use crate::{
     },
     security::{SecurityContext, masque::MasqueTls},
     session::{DatagramSession, Destination, StreamSession},
-    transport::{GrpcPool, h3_connect, quic},
+    transport::{GrpcPool, h3_connect, quiche_h3},
 };
 use async_trait::async_trait;
 use std::{
@@ -61,6 +61,7 @@ impl ConnectionFactory {
         session: StreamSession,
         context: &EstablishContext,
     ) -> io::Result<h3_connect::QuicTransport> {
+        let tls = self.tls.quiche_config(self.server_name.clone())?;
         let server = self
             .upstream
             .datagram_server(&self.server, context)
@@ -84,7 +85,7 @@ impl ConnectionFactory {
             transport,
             peer,
             budget,
-            tls: self.tls.config(true)?,
+            tls,
             server_name: self.server_name.clone(),
         })
     }
@@ -116,7 +117,7 @@ impl MasqueOutbound {
         )?;
         let congestion = (config.network != MasqueNetwork::H2)
             .then(|| {
-                quic::congestion_controller(
+                quiche_h3::congestion_controller(
                     &config.congestion_controller,
                     config.cwnd,
                     &config.bbr_profile,
@@ -380,6 +381,7 @@ mod tests {
             _request: DatagramRequest,
             _context: &EstablishContext,
         ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             Err(DispatchError::NotAllowed)
         }
     }
@@ -410,6 +412,24 @@ mod tests {
             sniffed_domain: None,
             metadata: Default::default(),
         }
+    }
+    #[tokio::test]
+    async fn masque_memory_invalid_quic_tls_does_not_acquire_upstream() {
+        let upstream = Arc::new(PendingUpstream::default());
+        let mut outbound = outbound(0, upstream.clone());
+        let factory = Arc::get_mut(&mut outbound.connection).unwrap();
+        factory.server = Destination::Ip("192.0.2.10:443".parse().unwrap());
+        // Config host validation permits this name, while the native TLS
+        // policy rejects an all-numeric final DNS label.
+        factory.server_name = "abc.123".into();
+        assert!(
+            factory
+                .connect(session(), &EstablishContext::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(upstream.calls.load(Ordering::Relaxed), 0);
+        outbound.shutdown().await;
     }
     #[tokio::test(start_paused = true)]
     async fn masque_shared_creation_cancellation_has_one_owned_attempt() {
