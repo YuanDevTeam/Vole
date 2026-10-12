@@ -5,7 +5,7 @@ use crate::{
     dispatch::{DatagramBudget, DatagramTransport},
     transport::{
         quic::{self, OwnedRuntime},
-        quiche_h3,
+        quinn_h3,
     },
 };
 use bytes::Buf;
@@ -42,18 +42,13 @@ pub(super) struct Raw {
     pub transport: Box<dyn DatagramTransport>,
     pub peer: SocketAddr,
     pub budget: DatagramBudget,
-    pub tls: Tls,
+    pub tls: Arc<rustls::ClientConfig>,
     pub server_name: String,
-}
-
-pub(super) enum Tls {
-    Quinn(Arc<rustls::ClientConfig>),
-    H3(crate::security::QuicheTls),
 }
 
 enum Protocol {
     Doq(quinn::Connection),
-    H3(quiche_h3::Client),
+    H3(quinn_h3::Client),
 }
 
 struct Connection {
@@ -340,31 +335,48 @@ async fn drive(
     metadata: Arc<Metadata>,
     ready: oneshot::Sender<io::Result<Protocol>>,
 ) {
-    if matches!(kind, Kind::H3) {
-        drive_h3(open, stop, metadata, ready).await;
-        return;
-    }
+    // Keep native IO alive until the bounded close exchange completes; its
+    // cancellation token must not be the resolver's already canceled token.
     let runtime = Arc::new(OwnedRuntime::new(CancellationToken::new()));
+    let mut upstream = None;
     let mut endpoint = None;
     let mut datagram = None;
     let mut ready = Some(ready);
     let connected = async {
         let raw = open.await?;
-        let Tls::Quinn(tls) = raw.tls else {
-            return Err(closed());
-        };
+        upstream = Some(raw.transport);
+        let mut tls = (*raw.tls).clone();
+        tls.resumption = rustls::client::Resumption::disabled();
+        tls.enable_early_data = false;
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(failure)?;
-        let (socket, driver) = quic::attach(raw.transport, raw.peer, raw.budget)?;
+        if raw.peer.port() == 0 || raw.peer.ip().is_unspecified() || raw.peer.ip().is_multicast() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        // Preserve close ownership when preparation fails before attach can
+        // transfer the transport to its tracked datagram driver.
+        raw.budget
+            .intersect(upstream.as_ref().unwrap().payload_budget(&raw.peer.into()))
+            .quic_payload_limit()?;
+        let (socket, driver) = quic::attach(upstream.take().unwrap(), raw.peer, raw.budget)?;
         datagram = Some(driver);
-        let udp_limit = socket.budget().quic_payload_limit()?;
-        let mtu = udp_limit.min(crate::dispatch::QUIC_MIN_PAYLOAD_BYTES);
+        let path = socket.budget();
+        let mtu = path
+            .quic_payload_limit()?
+            .min(crate::dispatch::QUIC_MIN_PAYLOAD_BYTES);
+        let discovery = if matches!(kind, Kind::H3) {
+            let mut discovery = quinn::MtuDiscoveryConfig::default();
+            discovery.upper_bound(path.transmit());
+            Some(discovery)
+        } else {
+            None
+        };
         let mut limits = quinn::TransportConfig::default();
         limits
             .initial_mtu(mtu)
             .min_mtu(mtu)
-            .mtu_discovery_config(None)
+            .mtu_discovery_config(discovery)
             .max_concurrent_bidi_streams(0_u8.into())
-            .max_concurrent_uni_streams((if matches!(kind, Kind::H3) { 4_u8 } else { 0 }).into())
+            .max_concurrent_uni_streams((if matches!(kind, Kind::H3) { 8_u8 } else { 0 }).into())
             .stream_receive_window(((MAX_MESSAGE_SIZE + 2) as u32).into())
             .receive_window(((MAX_MESSAGE_SIZE * MAX_STREAMS) as u32).into())
             .send_window((MAX_MESSAGE_SIZE * MAX_STREAMS) as u64)
@@ -375,7 +387,7 @@ async fn drive(
         client.transport_config(Arc::new(limits));
         let mut config = quinn::EndpointConfig::default();
         config
-            .max_udp_payload_size(socket.budget().receive())
+            .max_udp_payload_size(path.receive())
             .map_err(failure)?;
         let mut peer =
             quinn::Endpoint::new_with_abstract_socket(config, None, socket, runtime.clone())?;
@@ -401,20 +413,37 @@ async fn drive(
         if handshake.protocol.as_deref() != Some(alpn) {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        ready
-            .take()
-            .unwrap()
-            .send(Ok(Protocol::Doq(connection.clone())))
-            .map_err(|_| closed())?;
-        connection.closed().await;
+        match kind {
+            Kind::Doq => {
+                ready
+                    .take()
+                    .unwrap()
+                    .send(Ok(Protocol::Doq(connection.clone())))
+                    .map_err(|_| closed())?;
+                connection.closed().await;
+            }
+            Kind::H3 => {
+                let (sender, mut control) =
+                    quinn_h3::attach(connection, MAX_HTTP_HEADER_BYTES as u64)
+                        .await
+                        .map_err(failure)?;
+                // Dropping the last h3 sender closes QUIC. Retain one until the
+                // owner retires; a dropped query only owns its request halves.
+                let keep_sender = sender.clone();
+                ready
+                    .take()
+                    .unwrap()
+                    .send(Ok(Protocol::H3(sender)))
+                    .map_err(|_| closed())?;
+                let _ = control.wait_idle().await;
+                drop(keep_sender);
+            }
+        }
         Ok::<_, io::Error>(())
     };
     let result =
         tokio::select! { biased; ()=stop.cancelled()=>Err(closed()), result=connected=>result };
     metadata.healthy.store(false, Ordering::Release);
-    if let Some(ready) = ready {
-        let _ = ready.send(Err(result.err().unwrap_or_else(closed)));
-    }
     if let Some(endpoint) = endpoint {
         endpoint.close(0_u8.into(), b"");
         let _ = tokio::time::timeout(quic::CLOSE_TIMEOUT, endpoint.wait_idle()).await;
@@ -423,70 +452,12 @@ async fn drive(
     if let Some(driver) = datagram {
         let _ = driver.stop().await;
     }
-}
-
-async fn drive_h3(
-    open: impl Future<Output = io::Result<Raw>>,
-    stop: CancellationToken,
-    metadata: Arc<Metadata>,
-    ready: oneshot::Sender<io::Result<Protocol>>,
-) {
-    let raw =
-        tokio::select! {biased; () = stop.cancelled() => Err(closed()), result = open => result };
-    let raw = match raw {
-        Ok(raw) => raw,
-        Err(error) => {
-            metadata.healthy.store(false, Ordering::Release);
-            let _ = ready.send(Err(error));
-            return;
-        }
-    };
-    let Tls::H3(tls) = raw.tls else {
-        metadata.healthy.store(false, Ordering::Release);
-        let _ = ready.send(Err(closed()));
-        return;
-    };
-    let transport = quiche_h3::Transport {
-        transport: raw.transport,
-        peer: raw.peer,
-        budget: raw.budget,
-        tls,
-        server_name: raw.server_name,
-    };
-    let options = quiche_h3::Options {
-        stream_window: (MAX_MESSAGE_SIZE + 2) as u64,
-        connection_window: (MAX_MESSAGE_SIZE * MAX_STREAMS) as u64,
-        idle: IDLE_TIMEOUT,
-        headers: MAX_HTTP_HEADER_BYTES as u64,
-        ..Default::default()
-    };
-    match quiche_h3::Driver::new(transport, options).await {
-        Ok((client, driver)) => {
-            let cancel = CancellationToken::new();
-            let driver = driver.run(cancel.clone());
-            tokio::pin!(driver);
-            let mut finished = false;
-            let connected = tokio::select! {biased; () = stop.cancelled() => Err(closed()), _ = &mut driver => { finished = true; Err(closed()) }, result = client.ready(false) => result };
-            match connected {
-                Ok(()) => {
-                    if ready.send(Ok(Protocol::H3(client))).is_ok() {
-                        tokio::select! {biased; () = stop.cancelled() => {}, _ = &mut driver => { finished = true; } }
-                    }
-                }
-                Err(error) => {
-                    let _ = ready.send(Err(error));
-                }
-            }
-            cancel.cancel();
-            if !finished {
-                let _ = driver.await;
-            }
-        }
-        Err(error) => {
-            let _ = ready.send(Err(error));
-        }
+    if let Some(mut upstream) = upstream {
+        let _ = tokio::time::timeout(quic::CLOSE_TIMEOUT, upstream.close()).await;
     }
-    metadata.healthy.store(false, Ordering::Release);
+    if let Some(ready) = ready {
+        let _ = ready.send(Err(result.err().unwrap_or_else(closed)));
+    }
 }
 
 struct DoqStream {
@@ -499,15 +470,6 @@ impl Drop for DoqStream {
         if !self.completed {
             let _ = self.send.reset(3_u8.into());
             let _ = self.receive.stop(3_u8.into());
-        }
-    }
-}
-struct H3Stream(quiche_h3::RequestStream, bool);
-impl Drop for H3Stream {
-    fn drop(&mut self) {
-        if !self.1 {
-            self.0.stop_sending(quiche_h3::REQUEST_CANCELLED);
-            self.0.stop_stream(quiche_h3::REQUEST_CANCELLED);
         }
     }
 }
@@ -584,18 +546,15 @@ impl<K: Clone + Eq + Hash + Send + Sync + 'static> Lease<K> {
             }
             Protocol::H3(sender) => {
                 let mut sender = sender.clone();
-                let mut stream = H3Stream(
-                    sender
-                        .send_request(super::https::request(server, query)?)
-                        .await
-                        .map_err(failure)?,
-                    false,
-                );
-                stream.0.finish().await.map_err(failure)?;
-                let headers = stream.0.recv_response().await.map_err(failure)?;
+                let mut stream = sender
+                    .send_request(super::https::request(server, query)?)
+                    .await
+                    .map_err(failure)?;
+                stream.finish().await.map_err(failure)?;
+                let headers = stream.recv_response().await.map_err(failure)?;
                 let length = super::https::validate_headers(headers.status(), headers.headers())?;
                 let mut response = Vec::new();
-                while let Some(mut bytes) = stream.0.recv_data().await.map_err(failure)? {
+                while let Some(mut bytes) = stream.recv_data().await.map_err(failure)? {
                     if response.len() + bytes.remaining() > MAX_MESSAGE_SIZE {
                         return Err(io::ErrorKind::InvalidData.into());
                     }
@@ -604,10 +563,9 @@ impl<K: Clone + Eq + Hash + Send + Sync + 'static> Lease<K> {
                 if length.is_some_and(|length| length != response.len()) {
                     return Err(io::ErrorKind::InvalidData.into());
                 }
-                let _ = stream.0.recv_trailers().await.map_err(failure)?;
+                let _ = stream.recv_trailers().await.map_err(failure)?;
                 super::https::restore_id(query, &mut response)?;
                 let validated = validate(&response)?;
-                stream.1 = true;
                 Ok((response, validated))
             }
         }

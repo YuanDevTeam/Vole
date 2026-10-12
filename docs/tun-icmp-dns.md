@@ -168,11 +168,15 @@ H1/H2/H3 的请求及响应头各限 16 KiB，DNS body 仍限 4,096 字节。
 仅接受 HTTP 200 与 `application/dns-message`，响应长度声明、分帧及完整 DNS 校验必须通过。
 
 `dns.prefer-h3` 默认 false。true 时 HTTPS 的冷初始化同时建立已认证的 TCP TLS 与实际 H3，
-第一条成功连接用于查询；某条先失败时继续等待另一条，取消输家并等待其资源清理。
-复用已选连接，H1/H2 的版本选择最多保留 4 项、空闲 30 秒，失败后重新选择；不为每次查询重新探测。
+第一条成功连接用于查询；某条先失败时继续等待另一条。TCP 获胜时取消 QUIC 初始化并等待其 driver / adapter 收尾；
+H3 获胜时丢弃本次 TCP checkout，底层已开始的初始化由 Dialer / connector 的 Stop barrier 回收。
+这不是 DNS 响应竞速；已选 H3 的查询失败不自动重放到 TCP。复用已选连接，H1/H2 的版本选择最多保留 4 项、空闲 30 秒，失败后重新选择；不为每次查询重新探测。
 `https://…#h3=true` 仅建立 H3，失败不能降级；明文 HTTP 的 h3/prefer-h3 不改变 H1 行为。
 bootstrap、主、节点和直连 DNS 角色均应用全局 prefer-h3；WireGuard/MASQUE 私有 DNS 与固定参考一致，
-不继承全局偏好，但支持 URL `h3=true`。H3 共用 GET/Basic/ID 与包装，不启用 0-RTT，使用 quiche 与共享 Boring；DoQ 使用 Quinn。
+不继承全局偏好，但支持 URL `h3=true`。H3 共用 GET/Basic/ID 与包装，不启用 0-RTT 或恢复，
+使用官方 Quinn、h3 与 h3-quinn，通过共享 TLS 1.3 / rustls 证书政策建立严格 `h3` ALPN；DoQ 同样使用 Quinn。
+普通 H3 请求 FIN 不等待逐请求 QUIC ACK。取消丢弃当前请求所有者，未完成发送 reset，接收半关闭使用原生 STOP(0)，
+不关闭仍可用的兄弟请求；响应错误仍使该连接不再接受新查询。GOAWAY 停止新请求准入，已存在的查询可完成。
 
 ### DoQ
 
@@ -338,15 +342,21 @@ TCP、DoT 和 DoH 使用解析器所属的连接池：
   来源 generation 和物理接口绑定；
 - TCP、DoT、HTTP/1.1 一条连接只处理一个查询，不做 pipeline；这部分空闲连接总数最多 4、同 key 最多 2、超时 30 秒；
 - HTTP/2 同 key 首次建连串行发布，之后共享 sender；每连接最多 32 个并发 stream，超出时在查询原期限内等待。流接收窗口 4 KiB、连接接收窗口 128 KiB，禁用 server push；H2 空闲连接另限 4、超时 30 秒；
-- DoQ/H3 同 key 串行初始化后复用，每连接最多 32 条查询；业务 QUIC stream 接收窗口 4,098 字节、connection 接收窗口 128 KiB，不接收服务器双向 stream 或 QUIC DATAGRAM。DoQ 另限发送窗口 128 KiB，不接收单向 stream；H3 最多接收 8 条单向 stream，控制流初始信用 16 KiB，后续滚动窗口受 4,098 字节上限约束。空闲 QUIC 连接另限 4、超时 30 秒；
+- DoQ/H3 同 key 串行初始化后复用，每连接最多 32 条查询；QUIC stream 固定接收窗口 4,098 字节、connection 接收窗口 128 KiB，发送额度 128 KiB，不接收服务器双向 stream 或 QUIC DATAGRAM。DoQ 不接收单向 stream；H3 最多接收 8 条单向 stream，控制流与业务流均从 4,098 字节信用开始，消费后由 Quinn 通告后续信用。该信用不是完整 HEADERS parser 内存上限。空闲 QUIC 连接另限 4、超时 30 秒；
 - 活动物理连接不设固定业务数量上限；完整响应校验后才能归还 H1 连接或继续复用 H2；
 - TCP/DoT/H1 复用连接遇到 EOF、I/O、reset 或响应不匹配时，在原尝试期限内最多新建一次连接；
 - 非法、截断或超限响应不重试、不归还连接。
 
 HTTP/2 单流取消发送 RST，其他流可继续使用原连接；响应错误使该连接不再接受新查询。
 解析器拥有连接 driver 与有界空闲回收任务，Session Stop 和资源代际退役关闭全部解析角色并等待 driver 结束；WireGuard/MASQUE 私有 DNS 同样由节点 Stop 关闭且不保留空闲连接。MASQUE IP 查询经过节点内部栈，L4 仅可使用 TCP DNS 传输；system/DHCP 始终沿物理来源策略，不因节点模式改变出口。
-DoQ/H3 的取消和退役最多等待一秒 QUIC close exchange，随后停止并等待相应的
-Quinn/quiche 驱动与受控 datagram driver；初始化探测同样属于此 Stop 所有权。
+DoQ/H3 的连接取消和退役最多等待一秒 QUIC close exchange，随后停止并等待
+Quinn 原生任务与受控 datagram driver；未发布初始化、握手取消和移交前的准备失败同样属于此 Stop 所有权。
+初始发送 MTU 为 1200 字节，H3 的 PMTUD 上限受当前发送路径预算约束；接收广告独立使用实际接收预算，
+不把 fixture 中的 4096 字节接收值作为所有路径的统一上限。任一方向不足 1200 的 QUIC 路径拒绝。
+H3 在非 DATA 帧声明长度完整时提前检查：HEADERS 编码长度最多 24 KiB，SETTINGS 最多 256 字节，
+CANCEL_PUSH / GOAWAY / MAX_PUSH 长度为 1..8 字节，PUSH_PROMISE 最多 24 KiB 加 8 字节且非空。
+未知 H3 帧也限 24 KiB，超限立即拒绝，不先累计完整 payload；这比 quiche 对未知帧最多 16 MiB 的跳过范围更严格。
+DATA 仍按应用读取流式处理，DNS body 保持 4096 字节限制；QPACK 与未知单向 stream 的分类沿官方 h3 实现。
 
 Controller 切换代理组后，只在后续需要创建新 DNS transport 时使用新选择。类型化/原始响应 cache、singleflight 状态和已经位于 TCP pool 中的 transport 不清空、不迁移；因此命中 cache 或复用既有 TCP transport 时，不会为切换单独建链。停止 session 才统一释放这些状态。
 

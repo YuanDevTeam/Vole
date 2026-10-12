@@ -72,7 +72,7 @@ stream-transport = ["dep:tokio-tungstenite", "dep:httparse", "dep:log"]
 quic-transport = ["dep:quinn", "dep:quinn-proto"]
 quinn-h3-transport = ["quic-transport", "dep:h3", "dep:h3-quinn", "h3/i-implement-a-third-party-backend-and-opt-into-breaking-changes"]
 h3-transport = ["quic-transport", "dep:quiche", "dep:boring"]
-dns-quic = ["h3-transport"]
+dns-quic = ["quinn-h3-transport"]
 # Enables local interoperability-only trust-root injection. Release build
 # scripts must not enable this feature.
 interop-test = ["outbound-anytls", "outbound-vless"]

@@ -3078,17 +3078,7 @@ impl RuntimeDns {
                 0,
                 64 * 1024,
             )?;
-            let (tls, server_name) = match kind {
-                super::quic::Kind::Doq => {
-                    let (tls, name) = client.quic_config()?;
-                    (super::quic::Tls::Quinn(tls), name)
-                }
-                super::quic::Kind::H3 => {
-                    let tls = client.quiche_config()?;
-                    let name = tls.server_name().to_owned();
-                    (super::quic::Tls::H3(tls), name)
-                }
-            };
+            let (tls, server_name) = client.quic_config()?;
             let transport = dispatcher
                 .open_datagram(DatagramSession::new(
                     InboundKind::InternalDns,

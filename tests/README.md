@@ -94,7 +94,7 @@ uv run --project scripts --locked ruff check scripts
 uv run --project scripts --locked ruff format --check scripts
 ```
 
-DNS URL 参数、DoH GET/Basic、H2 并发与取消、ALPN/H1 回退只使用内存报文、显式来源快照和 duplex TLS 对端。DoQ/H3 与版本竞争使用有界 memory DatagramTransport，分别驱动 Quinn/quiche；不读取宿主 DNS 或启动监听服务。
+DNS URL 参数、DoH GET/Basic、H2 并发与取消、ALPN/H1 回退只使用内存报文、显式来源快照和 duplex TLS 对端。DoQ/H3 与冷建连版本竞争使用有界 memory DatagramTransport，驱动官方 Quinn 与 shared h3/h3-quinn；不读取宿主 DNS 或启动监听服务。
 `dns::runtime::ech_tests::` 与 `security::ech_dynamic_tests::` 使用内存 DNS 报文、显式来源快照和 duplex TLS，验证 HTTPS65 ECH 来源、节点角色、内层名称、取消和 Stop。`security::ech::tests::` 用真实 rustls Outer/Inner 加解密验证各 KEM/KDF/AEAD 家族，命名模板保留独立准入。
 `controller_secure_` 使用 duplex HTTP/TLS/H2、内存证书与临时文件，验证 CORS、共享鉴权/路由、客户端认证与握手签名、RSA 2048、候选更新及 Stop；不绑定宿主监听器。
 
@@ -165,7 +165,14 @@ Controller 主动探测与内存使用纯内存过滤：`manual_probes_keep_one_
 
 `transport::quic::` 验证官方 Quinn Middle 固定窗口、独立初始/最大值和规范 DATAGRAM 容量。
 `tuic_memory` 使用真实内存 Quinn 对端覆盖固定信用、数据报预算、未读取流与 Stop；
-`dns_quic_` 覆盖 DoQ 的独立发送/接收预算、复用及取消。它们不修改 registry 源码。
+`dns_quic_` 覆盖 DoQ/H3 的独立发送/接收预算、实际 DNS GET/Basic/ID 包装、复用与取消；
+响应 HEADERS/body 被对端暂停后取消仍能复用兄弟请求，8192 字节字段在 4098 字节初始信用下继续读取，
+正常 SETTINGS 和 GOAWAY 能推进；GOAWAY 后的新查询建立新连接，旧查询继续完成。
+未发布初始化、握手取消与移交前的坏预算失败均验证 driver / adapter Stop 回收。
+peer 暂停响应阶段验证 DNS 所有权，不声称每次都精确落在某个内部 Pending poll；共享层的显式 Pending 取消另由
+`transport::quinn_h3::tests::` 验证。它们不修改 registry 源码。
+独立 DNS feature 编译使用 `cargo check --locked --no-default-features --features dns-quic --lib`；
+该闭包不启用 quiche，`cli` / `ffi` 仍通过 TUN 启用 TrustTunnel / MASQUE 等 quiche 协议。
 `transport::quiche_h3::tests::` 与 `transport::h3_connect::` 使用真实内存 QUIC，
 覆盖 CONNECT、Cloudflare token、实际 peer SETTINGS、未知 DATAGRAM flow 丢弃与 Stop 回收；
 `security::tls::tests::quiche::` 验证新 H3 路径的证书、pin、mTLS 和 ECH。

@@ -5,12 +5,17 @@ use crate::{
     transport::quic::OwnedRuntime,
 };
 use async_trait::async_trait;
+use futures_util::FutureExt;
+use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::{
     io::IoSliceMut,
     pin::Pin,
     task::{Context, Poll, ready},
 };
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{Notify, mpsc},
+    task::JoinSet,
+};
 
 struct Packets {
     sender: mpsc::Sender<Bytes>,
@@ -134,6 +139,15 @@ enum Udp {
     Silent,
     Unavailable,
 }
+#[derive(Clone, Copy)]
+enum H3Reply {
+    Normal,
+    HoldHeaders,
+    HoldBody,
+    LargeHeaders,
+    Goaway,
+}
+
 struct Peer {
     h1: encrypted_tests::Peer,
     tls: rustls::ServerConfig,
@@ -147,6 +161,10 @@ struct Peer {
     closed: Arc<AtomicUsize>,
     udp_budget: DatagramBudget,
     initial_udp_payload: u16,
+    h3_reply: H3Reply,
+    response_ready: Arc<Notify>,
+    response_release: Arc<Notify>,
+    rejected: Arc<AtomicUsize>,
     largest_client_sent: Arc<AtomicUsize>,
     largest_server_sent: Arc<AtomicUsize>,
     requests: Arc<AtomicUsize>,
@@ -219,7 +237,12 @@ impl Dispatcher for Peer {
         let cancel = self.cancel.clone();
         let protocol = self.protocol;
         let requests = self.requests.clone();
+        let reply = self.h3_reply;
+        let response_ready = self.response_ready.clone();
+        let response_release = self.response_release.clone();
+        let rejected = self.rejected.clone();
         self.tasks.lock().unwrap().push(tokio::spawn(async move {
+            let mut responses = JoinSet::new();
             let serve = async {
                 let Ok(connection) = endpoint.accept().await.unwrap().await else {
                     return;
@@ -255,25 +278,65 @@ impl Dispatcher for Peer {
                             .decode(request.uri().query().unwrap().strip_prefix("dns=").unwrap())
                             .unwrap();
                         let wire = response(&query);
-                        requests.fetch_add(1, Ordering::AcqRel);
-                        stream
-                            .send_response(
-                                http::Response::builder()
-                                    .status(200)
-                                    .header("content-type", "application/dns-message")
-                                    .body(())
-                                    .unwrap(),
-                            )
-                            .await
-                            .unwrap();
-                        stream.send_data(Bytes::from(wire)).await.unwrap();
-                        stream.finish().await.unwrap();
+                        let first = requests.fetch_add(1, Ordering::AcqRel) == 0;
+                        if matches!(reply, H3Reply::Goaway) {
+                            h3.shutdown(0).await.unwrap();
+                        }
+                        let response_ready = response_ready.clone();
+                        let response_release = response_release.clone();
+                        let rejected = rejected.clone();
+                        responses.spawn(async move {
+                            let held = first && matches!(reply,
+                                H3Reply::HoldHeaders | H3Reply::HoldBody | H3Reply::Goaway);
+                            if held && matches!(reply, H3Reply::HoldHeaders) {
+                                response_ready.notify_one();
+                                response_release.notified().await;
+                            }
+                            let mut headers = http::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/dns-message");
+                            if matches!(reply, H3Reply::LargeHeaders) {
+                                headers = headers.header("x-fixture", "x".repeat(8192));
+                            }
+                            let outcome = async {
+                                stream.send_response(headers.body(()).unwrap()).await?;
+                                if held && !matches!(reply, H3Reply::HoldHeaders) {
+                                    response_ready.notify_one();
+                                    response_release.notified().await;
+                                }
+                                if held && !matches!(reply, H3Reply::Goaway) {
+                                    // Exceed one receive window so the peer must
+                                    // observe STOP rather than enqueueing a tiny response.
+                                    stream.send_data(Bytes::from(vec![0; 128 * 1024])).await?;
+                                } else {
+                                    stream.send_data(Bytes::from(wire)).await?;
+                                }
+                                stream.finish().await
+                            }.await;
+                            if held && !matches!(reply, H3Reply::Goaway) {
+                                assert!(matches!(&outcome,
+                                    Err(h3::error::StreamError::RemoteTerminate { code })
+                                    if code.value() == 0),
+                                    "query receive Drop must stop only this peer response: {outcome:?}");
+                                rejected.fetch_add(1, Ordering::AcqRel);
+                            } else {
+                                outcome.unwrap();
+                            }
+                        });
                     }
                 }
             };
             tokio::select! { biased; ()=cancel.cancelled()=>{}, ()=serve=>{} }
+            responses.abort_all();
+            let mut failure = None;
+            while let Some(result) = responses.join_next().await {
+                if let Err(error) = result && error.is_panic() && failure.is_none() {
+                    failure = Some(error.into_panic());
+                }
+            }
             endpoint.close(0_u8.into(), b"");
             runtime.stop().await;
+            if let Some(failure) = failure { resume_unwind(failure); }
         }));
         self.live.fetch_add(1, Ordering::AcqRel);
         Ok(Box::new(Packets {
@@ -336,6 +399,10 @@ impl Peer {
                 closed: Arc::new(AtomicUsize::new(0)),
                 udp_budget: DatagramBudget::new(1400, 1400),
                 initial_udp_payload: 1200,
+                h3_reply: H3Reply::Normal,
+                response_ready: Arc::new(Notify::new()),
+                response_release: Arc::new(Notify::new()),
+                rejected: Arc::new(AtomicUsize::new(0)),
                 largest_client_sent: Arc::new(AtomicUsize::new(0)),
                 largest_server_sent: Arc::new(AtomicUsize::new(0)),
                 requests: Arc::new(AtomicUsize::new(0)),
@@ -347,10 +414,18 @@ impl Peer {
     }
     async fn stop(&self) {
         self.cancel.cancel();
+        let mut failure = None;
         for task in std::mem::take(&mut *self.tasks.lock().unwrap()) {
-            task.await.unwrap();
+            if let Err(error) = task.await {
+                if error.is_panic() && failure.is_none() {
+                    failure = Some(error.into_panic());
+                }
+            }
         }
         self.h1.join().await;
+        if let Some(failure) = failure {
+            resume_unwind(failure);
+        }
     }
 }
 fn resolver(
@@ -372,6 +447,52 @@ async fn two_queries(dns: &RuntimeDns) {
         assert_eq!(&wire[..2], &query[..2]);
         validate_response_identity(&parse_query(&query).unwrap(), &wire).unwrap();
     }
+}
+
+// Always join both owners before rethrowing a primary assertion or timeout.
+async fn checked(peer: &Peer, dns: &RuntimeDns, future: impl Future<Output = ()>) {
+    let result = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(5), future))
+        .catch_unwind()
+        .await;
+    let cleanup = AssertUnwindSafe(async {
+        let dns_stopped = tokio::time::timeout(Duration::from_secs(3), dns.shutdown()).await;
+        let peer_stopped = tokio::time::timeout(Duration::from_secs(3), peer.stop()).await;
+        dns_stopped.unwrap();
+        peer_stopped.unwrap();
+        assert_eq!(dns.tcp_pool.quic.task_count(), 0);
+        assert_eq!(peer.live.load(Ordering::Acquire), 0);
+    })
+    .catch_unwind()
+    .await;
+    match result {
+        Err(error) => resume_unwind(error),
+        Ok(Err(error)) => panic!("DNS memory exchange exceeded its bound: {error}"),
+        Ok(Ok(())) => {}
+    }
+    if let Err(error) = cleanup {
+        resume_unwind(error);
+    }
+}
+
+fn literal_server(dns: &RuntimeDns) -> ResolvedNameserver {
+    let config = dns.nameservers[0].clone();
+    ResolvedNameserver {
+        endpoint: config.endpoint(),
+        config,
+        physical: None,
+        source_generation: 0,
+        source_binding: None,
+    }
+}
+
+async fn wait_until(mut ready: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -401,28 +522,32 @@ async fn dns_quic_doq_and_forced_h3_exchange_real_frames_reuse_and_stop() {
 }
 
 #[tokio::test]
-async fn dns_quic_doq_large_receive_budget_keeps_initial_small_and_receives_larger_peer_packets() {
-    let (mut peer, roots) = Peer::new(super::super::quic::Kind::Doq, Tcp::Pending, Udp::Ready);
-    let config = Arc::get_mut(&mut peer).unwrap();
-    config.udp_budget = DatagramBudget::new(1200, 4096);
-    config.initial_udp_payload = 1280;
-    let dns = resolver(
-        peer.clone(),
-        roots,
-        "quic://192.0.2.1:853#name-cert-verify=dns.example&ecs=192.0.2.1",
-        false,
-    );
-    two_queries(&dns).await;
-    assert_eq!(peer.requests.load(Ordering::Acquire), 2);
-    assert_eq!(peer.udp_calls.load(Ordering::Acquire), 1);
-    let client_payload = peer.largest_client_sent.load(Ordering::Acquire);
-    assert!((1..=1200).contains(&client_payload));
-    assert!(peer.largest_server_sent.load(Ordering::Acquire) >= 1280);
-    dns.shutdown().await;
-    assert_eq!(dns.tcp_pool.quic.task_count(), 0);
-    assert_eq!(peer.live.load(Ordering::Acquire), 0);
-    assert_eq!(peer.closed.load(Ordering::Acquire), 1);
-    peer.stop().await;
+async fn dns_quic_directional_mtu_keeps_initial_small_and_receives_larger_peer_packets() {
+    for (kind, upstream) in [
+        (
+            super::super::quic::Kind::Doq,
+            "quic://192.0.2.1:853#name-cert-verify=dns.example&ecs=192.0.2.1",
+        ),
+        (
+            super::super::quic::Kind::H3,
+            "https://alice:pw@192.0.2.1:853/dns-query#h3=true&name-cert-verify=dns.example&ecs=192.0.2.1",
+        ),
+    ] {
+        let (mut peer, roots) = Peer::new(kind, Tcp::Pending, Udp::Ready);
+        let config = Arc::get_mut(&mut peer).unwrap();
+        config.udp_budget = DatagramBudget::new(1200, 4096);
+        config.initial_udp_payload = 1280;
+        let dns = resolver(peer.clone(), roots, upstream, false);
+        checked(&peer, &dns, async {
+            two_queries(&dns).await;
+            assert_eq!(peer.requests.load(Ordering::Acquire), 2);
+            assert_eq!(peer.udp_calls.load(Ordering::Acquire), 1);
+            let client_payload = peer.largest_client_sent.load(Ordering::Acquire);
+            assert!((1..=1200).contains(&client_payload));
+            assert!(peer.largest_server_sent.load(Ordering::Acquire) >= 1280);
+        })
+        .await;
+    }
 }
 
 #[cfg(feature = "outbound-wireguard")]
@@ -512,24 +637,175 @@ async fn dns_quic_forced_failure_does_not_fallback_and_stop_joins_canceled_hands
     assert_eq!(peer.tcp_calls.load(Ordering::Acquire), 0);
     dns.shutdown().await;
     peer.stop().await;
-    let (peer, roots) = Peer::new(super::super::quic::Kind::Doq, Tcp::Pending, Udp::Silent);
+    for (kind, upstream) in [
+        (
+            super::super::quic::Kind::Doq,
+            "quic://192.0.2.1:853#name-cert-verify=dns.example",
+        ),
+        (
+            super::super::quic::Kind::H3,
+            "https://alice:pw@192.0.2.1:853/dns-query#h3=true&name-cert-verify=dns.example",
+        ),
+    ] {
+        let (peer, roots) = Peer::new(kind, Tcp::Pending, Udp::Silent);
+        let dns = resolver(peer.clone(), roots, upstream, false);
+        checked(&peer, &dns, async {
+            let request_dns = dns.clone();
+            let request = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                request_dns.resolve("first.example").await
+            }));
+            wait_until(|| peer.udp_calls.load(Ordering::Acquire) != 0).await;
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+        })
+        .await;
+        assert_eq!(peer.closed.load(Ordering::Acquire), 1);
+        assert_eq!(peer.requests.load(Ordering::Acquire), 0);
+    }
+}
+
+#[tokio::test]
+async fn dns_quic_h3_canceled_response_preserves_sibling_and_connection() {
+    for reply in [H3Reply::HoldHeaders, H3Reply::HoldBody] {
+        let (mut peer, roots) = Peer::new(super::super::quic::Kind::H3, Tcp::Pending, Udp::Ready);
+        Arc::get_mut(&mut peer).unwrap().h3_reply = reply;
+        let dns = resolver(
+            peer.clone(),
+            roots,
+            "https://alice:pw@192.0.2.1:853/dns-query#h3=true&name-cert-verify=dns.example&ecs=192.0.2.1",
+            false,
+        );
+        checked(&peer, &dns, async {
+            let request_dns = dns.clone();
+            let query = build_query(1, "cancel.example", QueryType::A).unwrap();
+            let request = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                request_dns.exchange(&query).await
+            }));
+            peer.response_ready.notified().await;
+            assert!(
+                !request.is_finished(),
+                "the peer has withheld the selected response phase"
+            );
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            two_queries(&dns).await;
+            assert_eq!(peer.udp_calls.load(Ordering::Acquire), 1);
+            assert_eq!(peer.requests.load(Ordering::Acquire), 3);
+            peer.response_release.notify_one();
+            wait_until(|| peer.rejected.load(Ordering::Acquire) == 1).await;
+        })
+        .await;
+        assert_eq!(peer.closed.load(Ordering::Acquire), 1);
+    }
+}
+
+#[tokio::test]
+async fn dns_quic_h3_large_headers_progress_with_small_stream_credit() {
+    let (mut peer, roots) = Peer::new(super::super::quic::Kind::H3, Tcp::Pending, Udp::Ready);
+    Arc::get_mut(&mut peer).unwrap().h3_reply = H3Reply::LargeHeaders;
     let dns = resolver(
         peer.clone(),
         roots,
-        "quic://192.0.2.1:853#name-cert-verify=dns.example",
+        "https://alice:pw@192.0.2.1:853/dns-query#h3=true&name-cert-verify=dns.example&ecs=192.0.2.1",
         false,
     );
-    let request_dns = dns.clone();
-    let request = tokio::spawn(async move { request_dns.resolve("first.example").await });
-    while peer.udp_calls.load(Ordering::Acquire) == 0 {
-        tokio::task::yield_now().await;
+    checked(&peer, &dns, async {
+        // The peer sends an 8192-byte field within the 16KiB header limit,
+        // while each native receive stream starts with only 4098-byte credit.
+        // Normal SETTINGS/control and two complete response frames must progress.
+        two_queries(&dns).await;
+        assert_eq!(peer.requests.load(Ordering::Acquire), 2);
+        assert_eq!(peer.udp_calls.load(Ordering::Acquire), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn dns_quic_h3_goaway_drains_existing_query_and_opens_new_connection() {
+    let (mut peer, roots) = Peer::new(super::super::quic::Kind::H3, Tcp::Pending, Udp::Ready);
+    Arc::get_mut(&mut peer).unwrap().h3_reply = H3Reply::Goaway;
+    let dns = resolver(
+        peer.clone(),
+        roots,
+        "https://alice:pw@192.0.2.1:853/dns-query#h3=true&name-cert-verify=dns.example&ecs=192.0.2.1",
+        false,
+    );
+    checked(&peer, &dns, async {
+        let server = literal_server(&dns);
+        let (key, _) = dns.quic_route(&server).unwrap();
+        let old_lease = dns
+            .start_quic(&server, super::super::quic::Kind::H3)
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let request_dns = dns.clone();
+        let first_query = build_query(11, "first.example", QueryType::A).unwrap();
+        let request = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            request_dns.exchange(&first_query).await
+        }));
+        peer.response_ready.notified().await;
+        wait_until(|| !dns.tcp_pool.quic.has(&key)).await;
+        assert!(
+            !request.is_finished(),
+            "GOAWAY must not complete or cancel the existing query"
+        );
+        let query = build_query(12, "second.example", QueryType::A).unwrap();
+        let wire = dns.exchange(&query).await.unwrap();
+        validate_response_identity(&parse_query(&query).unwrap(), &wire).unwrap();
+        assert_eq!(peer.udp_calls.load(Ordering::Acquire), 2);
+        peer.response_release.notify_one();
+        let wire = request.await.unwrap().unwrap();
+        assert_eq!(&wire[..2], &11_u16.to_be_bytes());
+        assert_eq!(peer.requests.load(Ordering::Acquire), 2);
+        drop(old_lease);
+    })
+    .await;
+    assert_eq!(peer.closed.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test]
+async fn dns_quic_unpublished_h3_initialization_cancel_joins_without_query() {
+    let (peer, roots) = Peer::new(super::super::quic::Kind::H3, Tcp::Pending, Udp::Ready);
+    let dns = resolver(
+        peer.clone(),
+        roots,
+        "https://alice:pw@192.0.2.1:853/dns-query#h3=true&name-cert-verify=dns.example",
+        false,
+    );
+    checked(&peer, &dns, async {
+        let server = literal_server(&dns);
+        let mut pending = dns
+            .start_quic(&server, super::super::quic::Kind::H3)
+            .unwrap();
+        pending.wait_ready().await.unwrap();
+        // It has completed TLS/H3 setup, but no lease or query was published.
+        pending.cancel().await;
+        assert!(dns.cached_quic(&server).unwrap().is_none());
+        assert_eq!(peer.live.load(Ordering::Acquire), 0);
+        assert_eq!(peer.closed.load(Ordering::Acquire), 1);
+        assert_eq!(peer.requests.load(Ordering::Acquire), 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn dns_quic_invalid_prepare_budget_closes_unattached_transport() {
+    for kind in [super::super::quic::Kind::Doq, super::super::quic::Kind::H3] {
+        let (mut peer, roots) = Peer::new(kind, Tcp::Pending, Udp::Ready);
+        Arc::get_mut(&mut peer).unwrap().udp_budget = DatagramBudget::new(1199, 1400);
+        let upstream = if matches!(kind, super::super::quic::Kind::Doq) {
+            "quic://192.0.2.1:853#name-cert-verify=dns.example"
+        } else {
+            "https://alice:pw@192.0.2.1:853/dns-query#h3=true&name-cert-verify=dns.example"
+        };
+        let dns = resolver(peer.clone(), roots, upstream, false);
+        checked(&peer, &dns, async {
+            assert!(dns.resolve("first.example").await.is_err());
+            assert_eq!(peer.closed.load(Ordering::Acquire), 1);
+            assert_eq!(peer.live.load(Ordering::Acquire), 0);
+            assert_eq!(peer.requests.load(Ordering::Acquire), 0);
+        })
+        .await;
     }
-    request.abort();
-    assert!(request.await.unwrap_err().is_cancelled());
-    tokio::time::timeout(Duration::from_secs(3), dns.shutdown())
-        .await
-        .unwrap();
-    assert_eq!(peer.live.load(Ordering::Acquire), 0);
-    assert_eq!(dns.tcp_pool.quic.task_count(), 0);
-    peer.stop().await;
 }
