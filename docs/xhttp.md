@@ -7,7 +7,7 @@ REALITY、JLS、ECH 的身份规则见 [VLESS](vless.md)，实际验证边界见
 
 `network: xhttp` 使用现有 Dialer、上游图、保护接口与 SecurityClient，不另建系统解析器或裸 socket。`alpn: [http/1.1]` 选择 H1；空列表、`[h2]` 或包含 H1/H2 的列表选择 H2；只有独占 `[h3]` 选择 H3。不会静默降级 HTTP 版本。
 
-H1/H2 可使用明文、标准 TLS 1.3、REALITY（经典默认、显式混合模式）或 JLS。H3 必须使用标准 TLS 1.3，不允许同腿明文、REALITY 或 JLS。QUIC 收发走受控数据报，上游有效预算小于 1200 字节即拒绝，不绕开代理、protect 或接口绑定；quiche 路径 MTU 探测受真实双向预算限制。
+H1/H2 可使用明文、标准 TLS 1.3、REALITY（经典默认、显式混合模式）或 JLS。H3 使用官方 h3/h3-quinn 与 Quinn，必须使用标准 TLS 1.3，不允许同腿明文、REALITY 或 JLS。QUIC 收发走受控数据报，上游任一方向有效预算小于 1200 字节即拒绝，不绕开代理、protect 或接口绑定；发送从 1200 字节起探测 MTU，探测上限受发送预算约束，接收广告独立使用实际接收预算。
 
 `xhttp-opts.mode` 接受 `auto`（省略或空串默认）、`packet-up`、`stream-up`、`stream-one`。auto 在 REALITY 无下载配置时选择 stream-one，有下载配置时选择 stream-up，其余选择 packet-up。stream-one 是一条双工 POST，不允许 `download-settings`；其余模式以同一会话 ID 关联上传与下载。`path` 省略或空串默认 `/`，`host` 显式非空优先，否则使用该腿 servername/server；IPv6 authority 使用方括号。主腿与下载腿的 host 均禁止 userinfo（`@`）。
 
@@ -41,6 +41,8 @@ session/sequence 均支持 path/query/header/cookie。键使用至多 64 字节�
 路径遵循 Mihomo：session 或 sequence 任一放在 path 时补尾斜杠，否则保留显式路径。原生 Xray 的 handler 始终补尾斜杠；因此与 Xray 互通且两项均不在 path 时，须显式配置带尾斜杠的路径（例如 `/proxy/`）。这是对端路径配置差异，不通过修改 Vole 的默认规范化规则解决。
 
 header/cookie payload 使用无填充 Base64URL，并按实际请求预算拆块；完整请求（URI、生成字段和自定义头）不超过 16 KiB / 128 项。业务数据按有界块处理，不把整个 POST 限额、对端声明或业务流读入无界 Vec。
+
+H3 响应 HEADERS 的解码字段预算为 16 KiB，编码 payload 预算为其 1.5 倍（24 KiB），在帧声明长度到达时检查；SETTINGS payload 最多 256 字节，携带单个 varint 的控制帧为 1–8 字节。未知非 DATA 帧也受 24 KiB 编码预算限制，超额提前拒绝，不等待完整 payload。这比 quiche 路径最多 16 MiB、流式跳过未知帧的范围更窄，以避免官方 h3 解码器累计整帧造成内存增长；DATA 仍增量交付，不受该整帧预算限制。
 
 packet-up 在发送间隔内聚合小块写入，而不是把每个 write 变成一个 POST。最多保留一个待发送批次和一个在途批次，每批最多 64 KiB，并与本连接采样的 POST 上限取较小值；头部 payload 仍按请求预算拆分。write 完成只表示数据已进入有界缓冲，flush 等待对应 POST 确认；计时器无需调用方再次读写即可发送。shutdown 立即尝试 flush 未发送批次，卡住的 POST 仍受一秒上限控制。计时器/上传任务归节点所有，Stop 同步等待。
 
@@ -102,13 +104,15 @@ sing-mux 的外层是底层协议的普通 TCP 到 `sp.mux.sing-box.arpa:444`，
 
 XHTTP 关闭整条逻辑连接：shutdown 先尝试送完已接受的上传，再取消下载，
 所有模式的待决上传最多等待一秒；超时或节点 Stop 可以取消，异常终止不承诺交付。
-H1/H2 flush 等待已接受的 payload 到达所供应 IO 的 flush 边界；H3 flush 等待上传任务
-写入 QUIC，shutdown 提交上传 FIN 后释放物理连接租约，不提供逐请求的远端 ACK 屏障。
+H1/H2 流式 flush 等待已接受的 payload 到达所供应 IO 的 flush 边界；H3 stream-one / stream-up
+flush 等待上传任务写入 QUIC。packet-up flush 等每批 POST 的成功响应与有界响应 body 结束。
+shutdown 提交上传 FIN 后释放物理连接租约，不提供逐请求的远端 ACK 屏障。
 这些等待不依赖下载响应。需要完整回复的应用必须在关闭前读完；不承诺 TCP 半关闭
 后继续收到尾包。复用只延长物理 transport 生命周期，不改变单个逻辑连接的关闭范围。
 
 H3 的 QUIC 驱动、数据报适配器和后台任务归节点所有。物理连接退役立即停止新请求准入，
 在既有一秒关闭预算内继续发送和接收，再关闭并 join 内部任务与上游 IO；这段传输收尾
-不构成远端 ACK 屏障。Stop 返回以任务回收为准，不把 Drop 或等待时间当作完成证明。
+不构成远端 ACK 屏障。未完成的上传取消会 reset 当前请求，已提交 FIN 的发送不因此 reset，
+兄弟流继续。shutdown 返回不代表物理驱动已退出；Stop 返回以任务回收为准，不把 Drop 或等待时间当作完成证明。
 
 H1/H2 原生验证优先使用官方 latest Mihomo；H3 使用官方 latest Xray。不被 Xray 直接解码的 packetaddr/sing-mux 使用明确标注的 Xray XHTTP → Mihomo VLESS 分层拓扑；mTLS 使用已批准的 xcaddy/Caddy H3 网关，后端仍是同一个 Xray handler。分层成功不改写直接对端失败。所有服务端与原站在隔离容器中，配置和私钥不入 Git；原生数据、公共入口、资源、跨平台构建和阶段签收分别记录。

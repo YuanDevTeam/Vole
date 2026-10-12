@@ -73,17 +73,6 @@ impl SecurityClient {
         }
     }
 
-    #[cfg(feature = "h3-transport")]
-    pub(crate) async fn quiche_config_with_context(
-        &self,
-        context: &crate::outbound::EstablishContext,
-    ) -> io::Result<super::QuicheTls> {
-        match &self.backend {
-            SecurityBackend::Standard(client) => client.quiche_config_with_context(context).await,
-            _ => Err(io::Error::other("HTTP/3 requires standard TLS")),
-        }
-    }
-
     pub(crate) async fn connect_with_context(
         &self,
         stream: BoxStream,

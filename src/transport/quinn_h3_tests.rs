@@ -267,3 +267,6 @@ async fn settle(pair: Pair, future: impl Future<Output = ()>) {
 
 #[path = "quinn_h3_cancel_tests.rs"]
 mod cancellation;
+
+#[path = "quinn_h3_wire_tests.rs"]
+mod wire_budget;

@@ -663,8 +663,7 @@ impl VlessOutbound {
                     .await
                     .map(TransportIo::Stream);
             }
-            let tls = leg.security.quiche_config_with_context(context).await?;
-            let server_name = tls.server_name().to_owned();
+            let (tls, server_name) = leg.security.quic_config_with_context(context).await?;
             let server = leg.upstream.datagram_server(&leg.server, context).await?;
             let peer = context.resolve_ip(&server).await?;
             let budget = DatagramBudget::new(1400, 1400);

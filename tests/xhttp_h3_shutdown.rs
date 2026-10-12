@@ -18,14 +18,17 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
     sync::mpsc,
     task::JoinSet,
 };
 use vole::{
     config::{Config, ProxyProtocol},
     dispatch::{DatagramBudget, DatagramTransport, DispatchError},
-    outbound::{EstablishContext, OutboundConnector, UpstreamPath, VlessOutbound},
+    outbound::{
+        ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector, UpstreamPath,
+        VlessOutbound,
+    },
     session::{Datagram, Destination, InboundKind, StreamSession},
 };
 
@@ -121,6 +124,31 @@ enum Closing {
     Stop,
 }
 
+struct MixedUpstream {
+    datagram: Mutex<Option<SlowPackets>>,
+    stream: Mutex<Option<DuplexStream>>,
+}
+#[async_trait::async_trait]
+impl OutboundConnector for MixedUpstream {
+    async fn connect_stream(
+        &self,
+        session: StreamSession,
+        _: &EstablishContext,
+    ) -> Result<ConnectedStream, DispatchError> {
+        Ok(ConnectedStream {
+            io: Box::new(self.stream.lock().unwrap().take().unwrap()),
+            effective_peer: session.destination,
+        })
+    }
+    async fn open_datagram(
+        &self,
+        _: DatagramRequest,
+        _: &EstablishContext,
+    ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        Ok(Box::new(self.datagram.lock().unwrap().take().unwrap()))
+    }
+}
+
 #[tokio::test]
 async fn h3_shutdown_does_not_cancel_the_last_upload() {
     for mode in ["stream-one", "stream-up"] {
@@ -144,13 +172,31 @@ async fn h3_stalled_upload_is_bounded_and_owner_stop_joins_it() {
     }
 }
 
-async fn exercise(mode: &str, closing: Closing, handshake_delay: Option<Duration>) {
-    tokio::time::timeout(Duration::from_secs(6), run(mode, closing, handshake_delay))
-        .await
-        .expect("memory QUIC fixture exceeded its cleanup bound");
+#[tokio::test]
+async fn h3_first_upload_precedes_responses_and_mixed_download_cancel_joins_owners() {
+    tokio::time::timeout(
+        Duration::from_secs(6),
+        run("stream-up", Closing::Stop, None, true),
+    )
+    .await
+    .expect("mixed H3/H2 owners did not join");
 }
 
-async fn run(mode: &str, closing: Closing, handshake_delay: Option<Duration>) {
+async fn exercise(mode: &str, closing: Closing, handshake_delay: Option<Duration>) {
+    tokio::time::timeout(
+        Duration::from_secs(6),
+        run(mode, closing, handshake_delay, false),
+    )
+    .await
+    .expect("memory QUIC fixture exceeded its cleanup bound");
+}
+
+async fn run(
+    mode: &str,
+    closing: Closing,
+    handshake_delay: Option<Duration>,
+    mixed_first_bytes: bool,
+) {
     let server_address: SocketAddr = "192.0.2.1:443".parse().unwrap();
     let client_address: SocketAddr = "192.0.2.2:1234".parse().unwrap();
     let (to_server, from_client) = mpsc::channel(32);
@@ -188,6 +234,7 @@ async fn run(mode: &str, closing: Closing, handshake_delay: Option<Duration>) {
     .unwrap();
     let (started, ready) = tokio::sync::oneshot::channel();
     let (cleanup, cleaned) = tokio::sync::oneshot::channel();
+    let (uploaded, first_upload) = tokio::sync::oneshot::channel();
     let reader = tokio::spawn(async move {
         let connection = endpoint.accept().await.unwrap().await.unwrap();
         let mut h3 = h3::server::builder()
@@ -204,7 +251,9 @@ async fn run(mode: &str, closing: Closing, handshake_delay: Option<Duration>) {
                 .resolve_request()
                 .await
                 .unwrap();
-            stream.send_response(http::Response::new(())).await.unwrap();
+            if !mixed_first_bytes {
+                stream.send_response(http::Response::new(())).await.unwrap();
+            }
             if headers.method() == http::Method::POST {
                 break stream;
             }
@@ -213,17 +262,35 @@ async fn run(mode: &str, closing: Closing, handshake_delay: Option<Duration>) {
         };
         started.send(()).unwrap();
         let mut received = Vec::new();
+        let mut uploaded = Some(uploaded);
         while let Ok(Ok(Some(mut data))) =
             tokio::time::timeout(Duration::from_secs(1), request.recv_data()).await
         {
             received.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+            if received.ends_with(&[b'x'; 16384])
+                && let Some(uploaded) = uploaded.take()
+            {
+                let _ = uploaded.send(());
+            }
         }
         let _ = cleaned.await;
+        if mixed_first_bytes || closing == Closing::Normal && handshake_delay.is_none() {
+            let closed = tokio::time::timeout(Duration::from_secs(2), connection.closed())
+                .await
+                .expect("quiet client retirement never sent CONNECTION_CLOSE");
+            let quinn::ConnectionError::ApplicationClosed(error) = closed else {
+                panic!("quiet retirement failed its close exchange: {closed}");
+            };
+            assert!(
+                error.error_code == 0_u8.into()
+                    || error.error_code.into_inner() == h3::error::Code::H3_NO_ERROR.value()
+            );
+        }
         drop(h3);
         endpoint.close(0_u32.into(), b"");
         received
     });
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "mixed-port":1080,
         "proxies":[{
             "name":"peer", "type":"vless", "server":"192.0.2.1", "port":443,
@@ -233,21 +300,49 @@ async fn run(mode: &str, closing: Closing, handshake_delay: Option<Duration>) {
         }],
         "rules":["MATCH,peer"]
     });
+    let (h2_client, h2_peer, h2_ready) = if mixed_first_bytes {
+        config["proxies"][0]["xhttp-opts"]["download-settings"] = serde_json::json!({
+            "port":8443, "tls":false, "skip-cert-verify":false, "alpn":["h2"]
+        });
+        let (client, server) = tokio::io::duplex(4096);
+        let (seen, ready) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server).await.unwrap();
+            let (request, response) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.method(), http::Method::GET);
+            let _held = (request, response); // Keep HEADERS pending until client cancellation.
+            seen.send(()).unwrap();
+            while let Some(result) = connection.accept().await {
+                if result.is_err() {
+                    break;
+                }
+                panic!("unexpected second download request");
+            }
+        });
+        (Some(client), Some(peer), Some(ready))
+    } else {
+        (None, None, None)
+    };
     let config = Config::parse_yaml(config.to_string().as_bytes()).unwrap();
     let ProxyProtocol::Vless(config) = &config.proxies[0].protocol else {
         panic!("protocol")
     };
     let state = Arc::new(AtomicU8::new(0));
-    let outbound = VlessOutbound::new_with_path(
-        config,
-        UpstreamPath::proxy(Arc::new(MemoryUpstream(Mutex::new(Some(SlowPackets {
-            inner: client_io,
-            state: state.clone(),
-            handshake_delay,
-            delayed_receive: None,
-        }))))),
-    )
-    .unwrap();
+    let packets = SlowPackets {
+        inner: client_io,
+        state: state.clone(),
+        handshake_delay,
+        delayed_receive: None,
+    };
+    let upstream: Arc<dyn OutboundConnector> = if let Some(stream) = h2_client {
+        Arc::new(MixedUpstream {
+            datagram: Mutex::new(Some(packets)),
+            stream: Mutex::new(Some(stream)),
+        })
+    } else {
+        Arc::new(MemoryUpstream(Mutex::new(Some(packets))))
+    };
+    let outbound = VlessOutbound::new_with_path(config, UpstreamPath::proxy(upstream)).unwrap();
     let session = StreamSession {
         metadata: Default::default(),
         inbound: InboundKind::InternalMeasure,
@@ -261,13 +356,36 @@ async fn run(mode: &str, closing: Closing, handshake_delay: Option<Duration>) {
         .unwrap()
         .io;
     ready.await.unwrap();
+    if let Some(ready) = h2_ready {
+        ready.await.unwrap();
+    }
     state.store(
-        if closing == Closing::Normal { 1 } else { 2 },
+        if mixed_first_bytes {
+            0
+        } else if closing == Closing::Normal {
+            1
+        } else {
+            2
+        },
         Ordering::SeqCst,
     );
     stream.write_all(&[b'x'; 16384]).await.unwrap();
-    if closing == Closing::Normal {
+    if closing == Closing::Normal || mixed_first_bytes {
         stream.flush().await.unwrap();
+    }
+    if mixed_first_bytes {
+        tokio::time::timeout(Duration::from_secs(1), first_upload)
+            .await
+            .expect("upload waited for an HTTP response")
+            .unwrap();
+        let mut bytes = [0; 1];
+        let mut output = ReadBuf::new(&mut bytes);
+        assert!(
+            poll_fn(|cx| Poll::Ready(Pin::new(&mut stream).poll_read(cx, &mut output)))
+                .await
+                .is_pending(),
+            "download unexpectedly received response HEADERS"
+        );
     }
     // A stalled controlled transport can exhaust native QUIC send capacity.
     // Shutdown must bound this outstanding flush instead of the fixture
@@ -292,13 +410,19 @@ async fn run(mode: &str, closing: Closing, handshake_delay: Option<Duration>) {
     let _ = cleanup.send(());
     let received = reader.await.unwrap();
     outbound.shutdown().await;
+    if let Some(peer) = h2_peer {
+        tokio::time::timeout(Duration::from_secs(1), peer)
+            .await
+            .expect("mixed H2 peer did not join")
+            .unwrap();
+    }
     // QUIC retains closed connections for 3 * PTO, which depends on RTT and
     // can legitimately exceed two seconds. After the upload and client Stop,
     // reclaim the fixture's tasks explicitly instead of timing its draining.
     tokio::time::timeout(Duration::from_secs(2), peer_runtime.stop())
         .await
         .expect("memory QUIC peer tasks did not join");
-    if closing == Closing::Normal {
+    if closing == Closing::Normal || mixed_first_bytes {
         assert!(
             received.ends_with(&[b'x'; 16384]),
             "mode={mode}: only {} upload bytes reached the peer",

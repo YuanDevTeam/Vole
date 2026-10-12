@@ -45,8 +45,8 @@ client-fingerprint: chrome
 - 默认验证公开信任链、名称及有效期。叶证书 pin 匹配时以叶证书为显式信任依据，
   不再要求公共根、名称或有效期；匹配非叶证书时将其作为信任锚，仍验证叶链、名称和有效期。
   skip 只跳过常规验证，不能覆盖不匹配的 pin；所有策略仍验证握手签名。
-- 未启用指纹的流 TLS，以及 HY2/TUIC/DoQ 的 Quinn QUIC，使用官方 rustls + ring。
-  TrustTunnel/MASQUE/XHTTP/DoH 的 H3 使用官方 quiche 与同一 boring；H3 不应用命名指纹。
+- 未启用指纹的流 TLS，以及 HY2/TUIC/DoQ/XHTTP H3 的 Quinn QUIC，使用官方 rustls + ring。
+  TrustTunnel/MASQUE/DoH 的 H3 使用官方 quiche 与同一 boring；H3 不应用命名指纹。
 - 命名指纹的标准 TLS，以及所有 REALITY/JLS，使用自有 boring fork；开发及 PR/发布的来源规则见 [TLS 依赖](tls-dependencies.md)。
 - 普通 TLS、Quinn 与采用标准 TLS 认证的 quiche H3 共用同一个 WebPKI 证书验证器和会话信任根；叶 pin、非叶信任锚、
   独立验证名、skip 优先级不变。TLS 握手签名仍由各自后端强制验证。
@@ -140,6 +140,7 @@ Safari16/iOS14 不声明 TLS1.2 session-ticket 扩展，该版本的恢复使用
 票据策略不同于 Mihomo，恢复 hello 不宣称逐字段相同，也不伪造 PSK/binder。
 quiche H3 为每条物理连接构造独立原生 TLS 上下文，禁用恢复与 0-RTT；
 节点内已认证的 H3 连接仍可复用，关闭和取消由其驱动所有者同步回收。
+XHTTP H3 同样禁用恢复与 0-RTT；ECH 从完整来源按 rustls 后端选择，未接受时握手失败。
 
 CloseWrite 刷新 close_notify 最多 5 秒，保留底层连接和读方向；重复关闭幂等，
 关闭后拒绝写入。Vision direct 切换保留同一 TLS 记录边界，先排空明文/刷新密文，

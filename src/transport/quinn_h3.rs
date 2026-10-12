@@ -9,7 +9,16 @@ use h3::{
     ConnectionState,
     quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf},
 };
-use std::task::{Context, Poll};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll},
+};
+
+#[path = "quinn_h3_budget.rs"]
+mod budget;
 
 pub(crate) type RequestStream = h3::client::RequestStream<BidiStream, Bytes>;
 pub(crate) type SendStream = h3::client::RequestStream<GuardedSend, Bytes>;
@@ -19,18 +28,37 @@ pub(crate) type ControlDriver = h3::client::Connection<Backend, Bytes>;
 #[derive(Clone)]
 pub(crate) struct Client {
     sender: h3::client::SendRequest<Streams, Bytes>,
+    retiring: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QuinnH3Client")
+            .field("can_open_request", &self.can_open_request())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Client {
     /// A pool admission snapshot; send_request also checks the shared H3 state.
     pub(crate) fn can_open_request(&self) -> bool {
-        self.sender.get_conn_error().is_none() && !self.sender.is_closing()
+        !self.retiring.load(Ordering::Acquire)
+            && self.sender.get_conn_error().is_none()
+            && !self.sender.is_closing()
+    }
+
+    pub(crate) fn retire(&self) {
+        self.retiring.store(true, Ordering::Release);
     }
 
     pub(crate) async fn send_request(
         &mut self,
         request: http::Request<()>,
     ) -> Result<RequestStream, h3::error::StreamError> {
+        if self.retiring.load(Ordering::Acquire) {
+            return Err(h3::error::StreamError::RemoteClosing);
+        }
         self.sender.send_request(request).await
     }
 }
@@ -42,17 +70,27 @@ pub(crate) async fn attach(
     let (control, sender) = h3::client::builder()
         .max_field_section_size(header_limit)
         .build(Backend {
-            inner: h3_quinn::Connection::new(connection),
+            inner: h3_quinn::Connection::new(connection.clone()),
+            connection,
+            header_limit,
         })
         .await?;
-    Ok((Client { sender }, control))
+    Ok((
+        Client {
+            sender,
+            retiring: Arc::new(AtomicBool::new(false)),
+        },
+        control,
+    ))
 }
 
 /// The official backend keeps QUIC I/O, framing and buffering. These delegates
-/// change only request-half cancellation ownership, including HEADERS that are
-/// still being written before h3 has returned a RequestStream to its caller.
+/// bound retained non-DATA frames and preserve request-half cancellation,
+/// including HEADERS still being written before h3 returns a RequestStream.
 pub(crate) struct Backend {
     inner: h3_quinn::Connection,
+    connection: quinn::Connection,
+    header_limit: u64,
 }
 
 impl quic::Connection<Bytes> for Backend {
@@ -63,8 +101,16 @@ impl quic::Connection<Bytes> for Backend {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
-        quic::Connection::<Bytes>::poll_accept_recv(&mut self.inner, cx)
-            .map(|result| result.map(GuardedRecv::new))
+        quic::Connection::<Bytes>::poll_accept_recv(&mut self.inner, cx).map(|result| {
+            result.map(|stream| {
+                GuardedRecv::new(
+                    stream,
+                    self.header_limit,
+                    true,
+                    Some(self.connection.clone()),
+                )
+            })
+        })
     }
 
     fn poll_accept_bidi(
@@ -72,24 +118,27 @@ impl quic::Connection<Bytes> for Backend {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
         quic::Connection::<Bytes>::poll_accept_bidi(&mut self.inner, cx)
-            .map(|result| result.map(BidiStream::new))
+            .map(|result| result.map(|stream| BidiStream::new(stream, self.header_limit)))
     }
 
     fn opener(&self) -> Self::OpenStreams {
         Streams {
             inner: quic::Connection::<Bytes>::opener(&self.inner),
+            header_limit: self.header_limit,
         }
     }
 }
 
 pub(crate) struct Streams {
     inner: h3_quinn::OpenStreams,
+    header_limit: u64,
 }
 
 impl Clone for Streams {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            header_limit: self.header_limit,
         }
     }
 }
@@ -103,7 +152,7 @@ impl quic::OpenStreams<Bytes> for Backend {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
         quic::OpenStreams::<Bytes>::poll_open_bidi(&mut self.inner, cx)
-            .map(|result| result.map(BidiStream::new))
+            .map(|result| result.map(|stream| BidiStream::new(stream, self.header_limit)))
     }
 
     fn poll_open_send(
@@ -127,7 +176,7 @@ impl quic::OpenStreams<Bytes> for Streams {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
         quic::OpenStreams::<Bytes>::poll_open_bidi(&mut self.inner, cx)
-            .map(|result| result.map(BidiStream::new))
+            .map(|result| result.map(|stream| BidiStream::new(stream, self.header_limit)))
     }
 
     fn poll_open_send(
@@ -148,14 +197,14 @@ pub(crate) struct BidiStream {
 }
 
 impl BidiStream {
-    fn new(stream: h3_quinn::BidiStream<Bytes>) -> Self {
+    fn new(stream: h3_quinn::BidiStream<Bytes>, header_limit: u64) -> Self {
         let (send, receive) = quic::BidiStream::<Bytes>::split(stream);
         Self {
             send: GuardedSend {
                 inner: send,
                 finished: false,
             },
-            receive: GuardedRecv::new(receive),
+            receive: GuardedRecv::new(receive, header_limit, false, None),
         }
     }
 }
@@ -258,16 +307,25 @@ pub(crate) struct GuardedRecv {
     id: StreamId,
     pending: bool,
     stopped: Option<u64>,
+    budget: budget::Budget,
+    connection: Option<quinn::Connection>,
 }
 
 impl GuardedRecv {
-    fn new(stream: h3_quinn::RecvStream) -> Self {
+    fn new(
+        stream: h3_quinn::RecvStream,
+        header_limit: u64,
+        unidirectional: bool,
+        connection: Option<quinn::Connection>,
+    ) -> Self {
         let id = quic::RecvStream::recv_id(&stream);
         Self {
             inner: Some(stream),
             id,
             pending: false,
             stopped: None,
+            budget: budget::Budget::new(header_limit, unidirectional),
+            connection,
         }
     }
 }
@@ -284,6 +342,28 @@ impl quic::RecvStream for GuardedRecv {
         }
         let result = quic::RecvStream::poll_data(self.inner.as_mut().unwrap(), cx);
         self.pending = result.is_pending();
+        if let Poll::Ready(Ok(Some(bytes))) = &result
+            && let Err(code) = self.budget.check(bytes)
+        {
+            self.stop_sending(code.value());
+            if self.budget.is_control() {
+                // A prefix can already include the control stream type. If
+                // rejected before h3 sees that type, a plain reset would be
+                // tolerated as an unclassified uni stream ending early.
+                self.connection
+                    .as_ref()
+                    .unwrap()
+                    .close(quinn::VarInt::from_u64(code.value()).unwrap(), b"");
+                return Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                    connection_error: ConnectionErrorIncoming::ApplicationClose {
+                        error_code: code.value(),
+                    },
+                }));
+            }
+            return Poll::Ready(Err(StreamErrorIncoming::StreamTerminated {
+                error_code: code.value(),
+            }));
+        }
         result
     }
 

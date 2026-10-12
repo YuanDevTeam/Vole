@@ -98,7 +98,10 @@ impl Sender {
                     .send_request(request)
                     .await
                     .map_err(super::h3_driver::failure)?;
-                let (mut send, mut receive) = request.split();
+                let (mut send, mut receive): (
+                    crate::transport::quinn_h3::SendStream,
+                    crate::transport::quinn_h3::RecvStream,
+                ) = request.split();
                 let cancel = sender.runtime.cancel.child_token();
                 let (upload, mut data) = mpsc::channel::<H3Chunk>(BODY_QUEUE);
                 let (finish, finished) = oneshot::channel();
@@ -120,7 +123,7 @@ impl Sender {
                             result = transmit => result.is_ok(),
                         };
                         if !completed {
-                            send.stop_stream(crate::transport::quiche_h3::REQUEST_CANCELLED);
+                            send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
                         }
                         let _ = finish.send(if completed {
                             Ok(())
@@ -426,7 +429,7 @@ pub(super) enum Download {
     H1(Incoming),
     H3(H3Download),
 }
-pub(super) struct H3Download(crate::transport::quiche_h3::RecvStream);
+pub(super) struct H3Download(crate::transport::quinn_h3::RecvStream);
 impl Download {
     pub(super) fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Bytes>>> {
         match self {

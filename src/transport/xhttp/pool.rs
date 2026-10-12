@@ -230,7 +230,7 @@ impl Pool {
                 else {
                     return None;
                 };
-                Some(sender.observation.pings())
+                Some(sender.observation.stats().frame_tx.ping)
             })
             .collect()
     }
