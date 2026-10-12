@@ -7,14 +7,14 @@ use crate::{
     security::QuicheTls,
     transport::quic,
 };
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use futures_util::{future::poll_fn, task::AtomicWaker};
 use http::{Request, Response};
 use quiche::h3::NameValue;
 use quinn::AsyncUdpSocket;
 use std::{
     collections::{BTreeMap, VecDeque},
-    io,
+    io::{self, IoSliceMut},
     net::SocketAddr,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -267,6 +267,7 @@ impl Driver {
         result
     }
     async fn drive(&mut self, cancel: &CancellationToken) -> io::Result<()> {
+        let mut incoming = vec![0; self.socket.budget().receive() as usize];
         let mut output = vec![0; self.mtu];
         let mut pending: Option<(usize, std::time::Instant)> = None;
         let mut writable = self.socket.clone().create_io_poller();
@@ -450,11 +451,15 @@ impl Driver {
                 // waking writers. Never wait for a batch to fill or retain
                 // additional packet buffers, and bound owner work per poll.
                 for _ in 0..RECEIVE_BATCH {
-                    match self.socket.poll_recv_owned(cx) {
-                        Poll::Ready(Ok(packet)) => {
-                            let mut incoming = mutable_packet(packet);
+                    let mut meta = [quinn::udp::RecvMeta::default()];
+                    match self.socket.poll_recv(
+                        cx,
+                        &mut [IoSliceMut::new(&mut incoming)],
+                        &mut meta,
+                    ) {
+                        Poll::Ready(Ok(_)) => {
                             match connection.recv(
-                                &mut incoming,
+                                &mut incoming[..meta[0].len],
                                 quiche::RecvInfo {
                                     from: self.peer,
                                     to: self.local,
@@ -496,14 +501,6 @@ impl Driver {
         Ok(())
     }
 }
-// quiche decrypts in place. Reuse a uniquely owned allocation; shared,
-// static and from_owner storage must be copied before native mutation.
-fn mutable_packet(packet: Bytes) -> BytesMut {
-    packet
-        .try_into_mut()
-        .unwrap_or_else(|packet| BytesMut::from(packet.as_ref()))
-}
-
 // A retirement grace follows real transport progress and measured RTT. It is
 // only an opportunity to deliver queued data, never proof of remote receipt.
 fn retire_grace(connection: &quiche::Connection) -> Duration {
@@ -1153,95 +1150,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn quiche_h3_memory_owned_receive_fifo_unique_and_shared_fallback() {
-        use futures_util::FutureExt;
-        use std::panic::AssertUnwindSafe;
-        let peer = "192.0.2.1:443".parse().unwrap();
-        let (to_peer, mut from_client) = mpsc::channel(8);
-        let (to_client, from_peer) = mpsc::channel(8);
-        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (socket, driver) = quic::attach(
-            Box::new(Packets {
-                send: to_peer,
-                receive: from_peer,
-                peer,
-                closed: closed.clone(),
-            }),
-            peer,
-            DatagramBudget::new(1400, 1400),
-        )
-        .unwrap();
-        let unique = Bytes::from((0..1337).map(|n| (n % 251) as u8).collect::<Vec<_>>());
-        let unique_pointer = unique.as_ptr();
-        let expected_unique = unique.to_vec();
-        let shared = Bytes::from(vec![0x7b; 1400]);
-        let shared_owner = shared.clone();
-        let static_packet = Bytes::from_static(b"static immutable packet");
-        let static_owner = static_packet.clone();
-        let owner_storage: Arc<[u8]> = vec![0xab; 1399].into();
-        let owner_packet = Bytes::from_owner(owner_storage.clone());
-        let owner_pointer = owner_packet.as_ptr();
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(2),
-            AssertUnwindSafe(async {
-                for packet in [unique, shared, static_packet, owner_packet] {
-                    to_client.send(packet).await.unwrap();
-                }
-                socket
-                    .try_send(&quinn::udp::Transmit {
-                        destination: peer,
-                        ecn: None,
-                        contents: b"activate",
-                        segment_size: None,
-                        src_ip: None,
-                    })
-                    .unwrap();
-                assert_eq!(from_client.recv().await.unwrap(), b"activate"[..]);
-                let unique = poll_fn(|cx| socket.poll_recv_owned(cx)).await.unwrap();
-                assert_eq!(unique.as_ptr(), unique_pointer);
-                let mut unique = mutable_packet(unique);
-                assert_eq!(
-                    unique.as_ptr(),
-                    unique_pointer,
-                    "unique storage must be reused"
-                );
-                assert_eq!(unique.as_ref(), expected_unique);
-                unique[0] = 0xff;
-                let shared = poll_fn(|cx| socket.poll_recv_owned(cx)).await.unwrap();
-                assert_eq!(shared.as_ptr(), shared_owner.as_ptr());
-                let mut shared = mutable_packet(shared);
-                assert_ne!(shared.as_ptr(), shared_owner.as_ptr());
-                assert_eq!(shared.as_ref(), &[0x7b; 1400]);
-                shared[0] = 0;
-                assert_eq!(shared_owner.as_ref(), &[0x7b; 1400]);
-                let static_packet = poll_fn(|cx| socket.poll_recv_owned(cx)).await.unwrap();
-                let static_pointer = static_packet.as_ptr();
-                let mut static_packet = mutable_packet(static_packet);
-                assert_ne!(static_packet.as_ptr(), static_pointer);
-                assert_eq!(static_packet.as_ref(), b"static immutable packet");
-                static_packet[0] = 0;
-                assert_eq!(static_owner.as_ref(), b"static immutable packet");
-                let owner_packet = poll_fn(|cx| socket.poll_recv_owned(cx)).await.unwrap();
-                assert_eq!(owner_packet.as_ptr(), owner_pointer);
-                let mut owner_packet = mutable_packet(owner_packet);
-                assert_ne!(owner_packet.as_ptr(), owner_pointer);
-                assert_eq!(owner_packet.as_ref(), &[0xab; 1399]);
-                owner_packet[0] = 0;
-                assert_eq!(owner_storage.as_ref(), &[0xab; 1399]);
-                assert_eq!(socket.stats().received, 4);
-                assert!(socket.stats().peak_incoming <= quic::QUEUE_LIMIT);
-            })
-            .catch_unwind(),
-        )
-        .await;
-        let stopped = driver.stop().await;
-        assert!(closed.load(std::sync::atomic::Ordering::Acquire));
-        assert!(poll_fn(|cx| socket.poll_recv_owned(cx)).await.is_err());
-        stopped.unwrap();
-        outcome.unwrap().unwrap();
-    }
-
     /// Real TLS/QUIC/HTTP3 peer entirely in bounded memory channels. The server
     /// sends unsolicited flow IDs without allowing those IDs to admit clients.
     async fn peer(
@@ -1274,7 +1182,6 @@ mod tests {
         let mut legitimate = false;
         let mut buf = [0; 1400];
         let mut pending = None;
-        let mut retained_first_packet = None;
         loop {
             if connection.is_established() && h3.is_none() {
                 let mut config = quiche::h3::Config::new().unwrap();
@@ -1369,12 +1276,7 @@ mod tests {
                 },
                 permit = outgoing.reserve(), if pending.as_ref().is_some_and(|(_, at)| *at <= now) => {
                     let Ok(permit) = permit else { break; };
-                    let packet = pending.take().unwrap().0;
-                    // Force shared-storage fallback on real encrypted native IO.
-                    if retained_first_packet.is_none() {
-                        retained_first_packet = Some(packet.clone());
-                    }
-                    permit.send(packet);
+                    permit.send(pending.take().unwrap().0);
                 },
                 () = tokio::time::sleep_until(deadline.into()) => {
                     if connection.timeout().is_some_and(|delay| delay.is_zero()) {
