@@ -121,7 +121,6 @@ struct State {
     ready: bool,
     datagram_budget: Option<usize>,
     settings: Option<Vec<(u64, u64)>>,
-    pings: u64,
 }
 struct Shared {
     state: Mutex<State>,
@@ -235,7 +234,6 @@ impl Driver {
                 ready: false,
                 datagram_budget: None,
                 settings: None,
-                pings: 0,
             }),
             changed: Notify::new(),
             status: Notify::new(),
@@ -330,15 +328,7 @@ impl Driver {
                 if closing.is_none()
                     && keepalive.is_some_and(|at| tokio::time::Instant::now() >= at)
                 {
-                    if state
-                        .connection
-                        .as_mut()
-                        .unwrap()
-                        .send_ack_eliciting()
-                        .is_ok()
-                    {
-                        state.pings += 1;
-                    }
+                    let _ = state.connection.as_mut().unwrap().send_ack_eliciting();
                     keepalive = self
                         .options
                         .keepalive
@@ -745,10 +735,6 @@ impl Client {
             }
             notified.await;
         }
-    }
-    #[cfg(feature = "interop-test")]
-    pub(crate) fn pings(&self) -> u64 {
-        self.shared.state.lock().unwrap().pings
     }
     pub(crate) fn max_datagram_size(&self) -> Option<usize> {
         self.shared.state.lock().unwrap().datagram_budget

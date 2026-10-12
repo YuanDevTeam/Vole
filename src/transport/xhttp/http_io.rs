@@ -138,7 +138,7 @@ impl Sender {
                             .recv_response()
                             .await
                             .map_err(super::h3_driver::failure)?;
-                        Ok(response.map(|_| Download::H3(H3Download(receive))))
+                        Ok(response.map(|_| Download::H3(Box::new(receive))))
                     }),
                     Upload {
                         inner: UploadKind::H3(H3Upload {
@@ -427,13 +427,12 @@ impl Upload {
 pub(super) enum Download {
     H2(h2::RecvStream),
     H1(Incoming),
-    H3(H3Download),
+    H3(Box<crate::transport::quinn_h3::RecvStream>),
 }
-pub(super) struct H3Download(crate::transport::quinn_h3::RecvStream);
 impl Download {
     pub(super) fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Bytes>>> {
         match self {
-            Self::H3(stream) => stream.0.poll_recv_data(cx).map(|result| match result {
+            Self::H3(stream) => stream.poll_recv_data(cx).map(|result| match result {
                 Ok(Some(mut data)) => Some(Ok(data.copy_to_bytes(data.remaining()))),
                 Ok(None) => None,
                 Err(error) => Some(Err(super::h3_driver::failure(error))),
