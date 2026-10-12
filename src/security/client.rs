@@ -62,6 +62,17 @@ impl std::fmt::Debug for SecurityClient {
 }
 
 impl SecurityClient {
+    #[cfg(feature = "quinn-h3-transport")]
+    pub(crate) async fn quic_config_with_context(
+        &self,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<(Arc<rustls::ClientConfig>, String)> {
+        match &self.backend {
+            SecurityBackend::Standard(client) => client.quic_config_with_context(context).await,
+            _ => Err(io::Error::other("HTTP/3 requires standard TLS")),
+        }
+    }
+
     #[cfg(feature = "h3-transport")]
     pub(crate) async fn quiche_config_with_context(
         &self,

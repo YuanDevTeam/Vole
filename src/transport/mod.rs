@@ -1,5 +1,8 @@
 //! Outbound wire transports.
 
+#[cfg(feature = "quinn-h3-transport")]
+pub(crate) mod quinn_h3;
+
 #[cfg(feature = "h3-transport")]
 pub(crate) mod quiche_h3;
 
