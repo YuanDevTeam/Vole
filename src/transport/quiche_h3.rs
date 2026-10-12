@@ -356,44 +356,40 @@ impl Driver {
                     .map(|delay| tokio::time::Instant::now() + delay)
             };
             let mut native_idle = false;
-            for _ in 0..WORK {
-                if pending.is_none() {
-                    let sent = self
-                        .shared
-                        .state
-                        .lock()
-                        .unwrap()
-                        .connection
-                        .as_mut()
-                        .unwrap()
-                        .send(&mut output);
-                    match sent {
-                        Ok((n, info)) if info.to == self.peer => pending = Some((n, info.at)),
-                        Ok(_) => return Err(invalid()),
-                        Err(quiche::Error::Done) => {
-                            native_idle = true;
-                            break;
+            {
+                // Keep the native guard within one bounded TX burst.
+                let mut state = self.shared.state.lock().unwrap();
+                for _ in 0..WORK {
+                    if pending.is_none() {
+                        let sent = state.connection.as_mut().unwrap().send(&mut output);
+                        match sent {
+                            Ok((n, info)) if info.to == self.peer => pending = Some((n, info.at)),
+                            Ok(_) => return Err(invalid()),
+                            Err(quiche::Error::Done) => {
+                                native_idle = true;
+                                break;
+                            }
+                            Err(error) => return Err(failure(error)),
                         }
-                        Err(error) => return Err(failure(error)),
                     }
-                }
-                let (n, at) = pending.unwrap();
-                if at > std::time::Instant::now() {
-                    break;
-                }
-                match self.socket.try_send(&quinn::udp::Transmit {
-                    destination: self.peer,
-                    ecn: None,
-                    contents: &output[..n],
-                    segment_size: None,
-                    src_ip: None,
-                }) {
-                    Ok(()) => {
-                        pending = None;
-                        queued += 1;
+                    let (n, at) = pending.unwrap();
+                    if at > std::time::Instant::now() {
+                        break;
                     }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => return Err(error),
+                    match self.socket.try_send(&quinn::udp::Transmit {
+                        destination: self.peer,
+                        ecn: None,
+                        contents: &output[..n],
+                        segment_size: None,
+                        src_ip: None,
+                    }) {
+                        Ok(()) => {
+                            pending = None;
+                            queued += 1;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             let sent = self.socket.stats().sent;

@@ -175,6 +175,7 @@ peer 暂停响应阶段验证 DNS 所有权，不声称每次都精确落在某�
 该闭包不启用 quiche，`cli` / `ffi` 仍通过 TUN 启用 TrustTunnel / MASQUE 等 quiche 协议。
 `transport::quiche_h3::tests::` 与 `transport::h3_connect::` 使用真实内存 QUIC，
 覆盖 TrustTunnel/MASQUE 的 CONNECT、Cloudflare token、实际 peer SETTINGS、未知 DATAGRAM flow 丢弃与 Stop 回收；
+CONNECT 驱动还验证 512 KiB 双向内容、信用推进、对端实际收到请求 FIN 与同步 Stop。
 `security::tls::tests::quiche::` 验证 quiche H3 路径的证书、pin、mTLS 和 ECH。
 这些用例不启动网络 listener。
 TUIC额外内存对端消费入口ip、SNI、毫秒Heartbeat和UoT v1/v2

@@ -1026,6 +1026,8 @@ mod tests {
             Ok(self.local)
         }
     }
+    const LARGE_DUPLEX_BYTES: usize = 512 * 1024;
+
     struct Peer {
         client: crate::security::StandardTlsClient,
         server: rustls::ServerConfig,
@@ -1036,6 +1038,7 @@ mod tests {
         checks: AtomicUsize,
         reject: Arc<Notify>,
         goaway: Notify,
+        duplex_fin: Mutex<Option<oneshot::Sender<io::Result<usize>>>>,
         l4: bool,
     }
     impl Peer {
@@ -1079,6 +1082,7 @@ mod tests {
                 checks: AtomicUsize::new(0),
                 reject: Arc::new(Notify::new()),
                 goaway: Notify::new(),
+                duplex_fin: Mutex::new(None),
                 l4: false,
             })
         }
@@ -1153,6 +1157,27 @@ mod tests {
                                     if !handler.l4 { handler.reject.notified().await; }
                                     stream.send_response(http::Response::builder().status(407).body(()).unwrap()).await.unwrap();
                                     stream.finish().await.unwrap();
+                                } else if target=="large-duplex.invalid:443" {
+                                    let witness=handler.duplex_fin.lock().unwrap().take().unwrap();
+                                    let result=async {
+                                        let (mut send,mut receive)=stream.split();
+                                        let mut received=0;
+                                        while let Some(mut data)=receive.recv_data().await.map_err(|error|io::Error::other(error.to_string()))? {
+                                            let data=data.copy_to_bytes(data.remaining());
+                                            if data.is_empty() {continue;}
+                                            if data.len()>LARGE_DUPLEX_BYTES-received || data.iter().enumerate().any(|(index,byte)|*byte!=((received+index) as u8).wrapping_mul(31).wrapping_add(7)) {
+                                                return Err(io::Error::other("large duplex peer payload mismatch"));
+                                            }
+                                            if received==0 {send.send_response(http::Response::new(())).await.map_err(|error|io::Error::other(error.to_string()))?;}
+                                            received+=data.len();
+                                            send.send_data(data).await.map_err(|error|io::Error::other(error.to_string()))?;
+                                            if received==LARGE_DUPLEX_BYTES {send.finish().await.map_err(|error|io::Error::other(error.to_string()))?;}
+                                        }
+                                        // recv_data(None) is the peer's real request FIN witness.
+                                        if received!=LARGE_DUPLEX_BYTES {return Err(io::Error::other("large duplex peer received a short body"));}
+                                        Ok::<_,io::Error>(received)
+                                    }.await;
+                                    let _=witness.send(result);
                                 } else {
                                     if handler.l4 {
                                         stream.send_response(http::Response::builder().status(204).body(()).unwrap()).await.unwrap();
@@ -1333,6 +1358,91 @@ mod tests {
             })
             .await;
         assert!(observation.snapshot().is_idle());
+    }
+    #[tokio::test]
+    async fn trusttunnel_h3_large_duplex_data_fin_and_joined_stop() {
+        use futures_util::FutureExt;
+        use std::panic::{AssertUnwindSafe, resume_unwind};
+
+        let observation = ResourceProbe::default();
+        let (result, cleanup, calls, closed, empty) = observation
+            .scope(async {
+                let peer = Peer::new();
+                let pool = Pool::new(None);
+                let (finished, fin) = oneshot::channel();
+                *peer.duplex_fin.lock().unwrap() = Some(finished);
+                let result =
+                    AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(15), async {
+                        let stream = open(&pool, &peer, "large-duplex.invalid:443").await;
+                        let (mut read, mut write) = tokio::io::split(stream);
+                        let payload = (0..LARGE_DUPLEX_BYTES)
+                            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+                            .collect::<Vec<_>>();
+                        let read_complete = Notify::new();
+                        let upload = async {
+                            write.write_all(&payload).await?;
+                            write.flush().await?;
+                            // Shutdown ends this whole logical CONNECT stream; keep
+                            // the reader alive until the concurrent echo is complete.
+                            read_complete.notified().await;
+                            write.shutdown().await
+                        };
+                        let download = async {
+                            let mut echoed = vec![0; LARGE_DUPLEX_BYTES];
+                            read.read_exact(&mut echoed).await?;
+                            if echoed != payload {
+                                return Err(io::Error::other(
+                                    "large duplex client payload mismatch",
+                                ));
+                            }
+                            let mut extra = [0];
+                            if read.read(&mut extra).await? != 0 {
+                                return Err(io::Error::other(
+                                    "large duplex response exceeded its body",
+                                ));
+                            }
+                            read_complete.notify_one();
+                            Ok::<_, io::Error>(())
+                        };
+                        tokio::try_join!(upload, download)?;
+                        let received = fin.await.map_err(|_| {
+                            io::Error::other("large duplex peer did not report FIN")
+                        })??;
+                        if received != LARGE_DUPLEX_BYTES {
+                            return Err(io::Error::other(
+                                "large duplex FIN witness had a short body",
+                            ));
+                        }
+                        Ok::<_, io::Error>(())
+                    }))
+                    .catch_unwind()
+                    .await;
+                // Always join the owned client and memory peer before exposing
+                // the operation's timeout, IO error, or panic to the test runner.
+                let cleanup = tokio::time::timeout(Duration::from_secs(5), async {
+                    pool.shutdown().await;
+                    peer.stop().await;
+                })
+                .await;
+                let calls = peer.calls.load(Ordering::Acquire);
+                let closed = peer.closed.load(Ordering::Acquire);
+                let empty = pool.tasks.is_empty() && peer.tasks.is_empty();
+                drop((pool, peer));
+                (result, cleanup, calls, closed, empty)
+            })
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(panic) => resume_unwind(panic),
+        };
+        cleanup.expect("large duplex Stop did not join within its bound");
+        assert!(empty);
+        assert_eq!(calls, 1);
+        assert_eq!(closed, 1);
+        assert!(observation.snapshot().is_idle());
+        result
+            .expect("large duplex DATA/FIN timed out")
+            .expect("large duplex DATA/FIN failed");
     }
     #[tokio::test]
     async fn trusttunnel_h3_rejected_headers_wake_stalled_write_without_read() {
