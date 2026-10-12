@@ -217,8 +217,6 @@ async fn drive(
     shared: &Shared,
     cancel: &CancellationToken,
 ) -> io::Result<()> {
-    let polled_receive = transport.supports_poll_receive();
-    let mut receive_scratch = Vec::new();
     let mut has_sent = false;
     loop {
         let (can_receive, can_send) = {
@@ -234,16 +232,7 @@ async fn drive(
             // Notify permits coalesce. A producer may have queued several
             // packets before this owner runs, so queued TX is itself ready.
             _ = std::future::ready(()), if can_send => {},
-            received = async {
-                if polled_receive {
-                    std::future::poll_fn(|context| {
-                        transport.poll_receive(context, &mut receive_scratch)
-                    })
-                    .await
-                } else {
-                    transport.receive().await
-                }
-            }, if has_sent && can_receive => {
+            received = transport.receive(), if has_sent && can_receive => {
                 let datagram = received.map_err(dispatch_error)?;
                 let mut state = shared.state.lock().unwrap();
                 if datagram.remote != Destination::Ip(peer) {
@@ -283,10 +272,6 @@ async fn drive(
         }
     }
 }
-
-#[cfg(test)]
-#[path = "quic_poll_receive_tests.rs"]
-mod poll_receive_tests;
 
 fn dispatch_error(error: DispatchError) -> io::Error {
     match error {
