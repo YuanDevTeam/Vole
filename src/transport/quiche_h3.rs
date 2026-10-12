@@ -77,7 +77,7 @@ struct Body {
     signals: Arc<Signals>,
     headers: Option<Response<()>>,
     headers_received: bool,
-    trailers: Option<http::HeaderMap>,
+    trailers_received: bool,
     data: VecDeque<Bytes>,
     buffered: usize,
     readable: bool,
@@ -94,7 +94,7 @@ impl Body {
             signals,
             headers: None,
             headers_received: false,
-            trailers: None,
+            trailers_received: false,
             data: VecDeque::new(),
             buffered: 0,
             readable: false,
@@ -544,8 +544,8 @@ fn process_h3(state: &mut State) -> io::Result<()> {
                         *response.headers_mut() = headers;
                         body.headers = Some(response);
                     }
-                } else if body.headers_received && body.trailers.is_none() {
-                    body.trailers = Some(headers);
+                } else if body.headers_received && !body.trailers_received {
+                    body.trailers_received = true;
                 } else {
                     body.failed = true;
                 }
@@ -870,30 +870,6 @@ impl RequestStream {
     }
     pub(crate) fn split(self) -> (SendStream, RecvStream) {
         (self.send, self.receive)
-    }
-    pub(crate) async fn finish(&mut self) -> io::Result<()> {
-        self.send.finish().await
-    }
-    pub(crate) async fn recv_response(&mut self) -> io::Result<Response<()>> {
-        self.receive.recv_response().await
-    }
-    pub(crate) async fn recv_data(&mut self) -> io::Result<Option<Bytes>> {
-        poll_fn(|cx| self.receive.poll_recv_data(cx)).await
-    }
-    pub(crate) async fn recv_trailers(&mut self) -> io::Result<Option<http::HeaderMap>> {
-        let mut state = self.receive.client.shared.state.lock().unwrap();
-        Ok(state
-            .streams
-            .get_mut(&self.receive.id)
-            .ok_or_else(closed)?
-            .trailers
-            .take())
-    }
-    pub(crate) fn stop_stream(&mut self, code: u64) {
-        self.send.stop_stream(code);
-    }
-    pub(crate) fn stop_sending(&mut self, code: u64) {
-        self.receive.stop_sending(code);
     }
 }
 pub(crate) struct StreamId(u64);

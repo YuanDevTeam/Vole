@@ -22,7 +22,7 @@ mod named;
 #[path = "tls_named_wire_tests.rs"]
 mod named_wire;
 
-#[cfg(feature = "h3-transport")]
+#[cfg(feature = "quiche-h3-transport")]
 #[path = "tls_quiche_tests.rs"]
 mod quiche;
 

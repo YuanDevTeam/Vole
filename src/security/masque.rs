@@ -72,7 +72,7 @@ impl fmt::Debug for MasqueTls {
 }
 
 impl MasqueTls {
-    #[cfg(feature = "h3-transport")]
+    #[cfg(feature = "quiche-h3-transport")]
     pub(crate) fn quiche_config(
         &self,
         server_name: impl Into<String>,

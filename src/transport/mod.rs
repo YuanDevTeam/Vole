@@ -3,7 +3,7 @@
 #[cfg(feature = "quinn-h3-transport")]
 pub(crate) mod quinn_h3;
 
-#[cfg(feature = "h3-transport")]
+#[cfg(feature = "quiche-h3-transport")]
 pub(crate) mod quiche_h3;
 
 #[cfg(any(feature = "outbound-trusttunnel", feature = "outbound-masque"))]

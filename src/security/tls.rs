@@ -159,11 +159,11 @@ pub struct StandardTlsClient {
     buffer_limit: usize,
     require_ech: bool,
     dynamic_ech: Option<Arc<DynamicEchTls>>,
-    #[cfg(feature = "h3-transport")]
+    #[cfg(feature = "quiche-h3-transport")]
     quiche_source: Option<Arc<QuicheSource>>,
 }
 
-#[cfg(feature = "h3-transport")]
+#[cfg(feature = "quiche-h3-transport")]
 struct QuicheSource {
     context: SecurityContext,
     options: TlsClientOptions,
@@ -192,7 +192,7 @@ impl std::fmt::Debug for StandardTlsClient {
 }
 
 impl StandardTlsClient {
-    #[cfg(feature = "h3-transport")]
+    #[cfg(feature = "quiche-h3-transport")]
     pub(crate) fn quiche_config(&self) -> io::Result<super::QuicheTls> {
         if self.dynamic_ech.is_some() {
             return Err(io::Error::other(
@@ -206,7 +206,7 @@ impl StandardTlsClient {
         super::QuicheTls::standard(&source.context, &self.server_name, &source.options)
     }
 
-    #[cfg(feature = "h3-transport")]
+    #[cfg(feature = "quiche-h3-transport")]
     pub(crate) async fn quiche_config_with_context(
         &self,
         context: &crate::outbound::EstablishContext,
@@ -361,7 +361,7 @@ impl StandardTlsClient {
             ));
         }
 
-        #[cfg(feature = "h3-transport")]
+        #[cfg(feature = "quiche-h3-transport")]
         let quiche_source = options
             .alpn
             .iter()
@@ -394,7 +394,7 @@ impl StandardTlsClient {
                     buffer_limit,
                     require_ech,
                     dynamic_ech: None,
-                    #[cfg(feature = "h3-transport")]
+                    #[cfg(feature = "quiche-h3-transport")]
                     quiche_source,
                 });
             }
@@ -465,7 +465,7 @@ impl StandardTlsClient {
             buffer_limit,
             require_ech,
             dynamic_ech: None,
-            #[cfg(feature = "h3-transport")]
+            #[cfg(feature = "quiche-h3-transport")]
             quiche_source,
         })
     }

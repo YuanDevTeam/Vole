@@ -141,9 +141,9 @@ jobs:
           require(not (features(proto) | features(quinn)) & {"aws-lc-rs", "aws-lc-rs-fips", "rustls-aws-lc-rs", "rustls-aws-lc-rs-fips"}, "Quinn must keep the approved ring TLS provider")
           require(proto["id"] in {dependency["pkg"] for dependency in nodes[quinn["id"]]["deps"]}, "Quinn wrapper must resolve the official protocol source")
           h3 = package("h3", "0.0.8")
-          require(h3.get("license") == "MIT", "unapproved Hysteria2 HTTP/3 license")
+          require(h3.get("license") == "MIT", "unapproved Quinn HTTP/3 license")
           h3_quinn = package("h3-quinn", "0.0.10")
-          require(h3["id"] in {dependency["pkg"] for dependency in nodes[h3_quinn["id"]]["deps"]}, "Hysteria2 HTTP/3 adapter must resolve the official source")
+          require(h3["id"] in {dependency["pkg"] for dependency in nodes[h3_quinn["id"]]["deps"]}, "Quinn HTTP/3 adapter must resolve the official source")
           quiche = package("quiche", "0.30.0")
           require(features(quiche) == {"boring", "boring-sys", "boringssl-boring-crate", "foreign-types-shared"}, "quiche must use the shared Boring provider without FFI or qlog")
           require(quiche.get("license") == "BSD-2-Clause", "unapproved quiche license")
@@ -206,6 +206,7 @@ jobs:
         if: matrix.profile == 'features'
         run: |
           cargo test --locked --features cli --lib transport::quiche_h3::tests::
+          cargo test --locked --features cli --lib transport::quinn_h3::tests::
       - name: Production and netstack clippy
         if: matrix.profile == 'features'
         run: |
@@ -266,7 +267,7 @@ jobs:
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
             outbound::trusttunnel:: outbound::mieru:: outbound::masque:: security::masque:: config::masque::
-            transport::quic:: transport::quiche_h3:: transport::masque_codec:: transport::h3_connect::
+            transport::quic:: transport::quinn_h3:: transport::quiche_h3:: transport::masque_codec:: transport::h3_connect::
             transport::sing_mux::smux_driver::tests:: transport::sing_mux::tests::
             grpc_duplex_pool_keeps_response
             outbound::sing_mux::tests::
@@ -332,9 +333,16 @@ jobs:
             cargo check --locked --no-default-features --features "outbound-$protocol" --lib
             run_test 1 --features "outbound-$protocol" --lib runtime::tests::integration_feature_admission_is_explicit_without_opening_sockets -- --exact
           done
-          for feature in outbound-http inbound-http inbound-socks5 stream-transport quic-transport h3-transport sing-mux shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
+          for feature in outbound-http inbound-http inbound-socks5 stream-transport quic-transport quinn-h3-transport quiche-h3-transport dns-quic sing-mux shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
             cargo check --locked --no-default-features --features "$feature" --lib
           done
+          dns_graph="$(mktemp "$RUNNER_TEMP/vole-dns-graph.XXXXXX")"
+          cargo tree --locked --no-default-features --features dns-quic --target all --edges normal,build --prefix none | tee "$dns_graph"
+          if grep -Eq '^(quiche|boring|boring-sys|tokio-boring) v' "$dns_graph"; then
+            echo "The production DNS feature must use Quinn/rustls without quiche or Boring"
+            exit 1
+          fi
+          rm -f "$dns_graph"
           cargo check --locked --no-default-features --features cli --bin vole
           run_test 2 --test feature_foundations --test hysteria2_config
           cargo check --locked --lib

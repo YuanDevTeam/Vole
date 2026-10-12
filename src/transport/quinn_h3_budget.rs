@@ -121,7 +121,13 @@ impl Budget {
 
 fn check_length(frame: u64, length: u64, header_wire: u64) -> Result<(), Code> {
     match frame {
-        0 => Ok(()), // DATA is delivered incrementally, without body scanning.
+        // The official decoder stores DATA's remaining length in usize.
+        // Refuse a valid wire length that this target cannot represent rather
+        // than letting its conversion truncate framing. This is a target
+        // resource limit, not a DATA body cap: all QUIC lengths fit on 64-bit.
+        0 => usize::try_from(length)
+            .map(|_| ())
+            .map_err(|_| Code::H3_EXCESSIVE_LOAD),
         1 if length <= header_wire => Ok(()),
         1 => Err(Code::H3_EXCESSIVE_LOAD),
         3 | 7 | 13 if (1..=8).contains(&length) => Ok(()),
@@ -136,5 +142,31 @@ fn check_length(frame: u64, length: u64, header_wire: u64) -> Result<(), Code> {
         // quiche backend's 16 MiB skip limit, which does not retain a payload.
         _ if length <= header_wire => Ok(()),
         _ => Err(Code::H3_EXCESSIVE_LOAD),
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "32"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_length_overflow_is_rejected_at_prefix_without_body() {
+        // Literal HTTP/3 DATA prefixes: 2^32-1 is representable; 2^32 is not.
+        // No payload is allocated or consumed for either declaration.
+        let mut valid = Budget::new(16 * 1024, false);
+        assert!(
+            valid
+                .check(&[0, 0xc0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff])
+                .is_ok()
+        );
+        let oversized = [0, 0xc0, 0, 0, 1, 0, 0, 0, 0];
+        for split in 0..oversized.len() {
+            let mut budget = Budget::new(16 * 1024, false);
+            assert!(budget.check(&oversized[..split]).is_ok());
+            assert_eq!(
+                budget.check(&oversized[split..]),
+                Err(Code::H3_EXCESSIVE_LOAD)
+            );
+        }
     }
 }

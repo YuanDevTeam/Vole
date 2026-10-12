@@ -135,14 +135,19 @@ DELETE 通过取消令牌立即唤醒等待中的接收，关闭与 flow-id 替�
 
 `quic-transport` 只把已有 `DatagramTransport` 适配成 Quinn/quiche 共用的受控 UDP 接口，没有内部 bind、DNS 或 DIRECT 回落。每个连接双向各最多32个排队数据报，另允许一个正在发送的包；TX满返回WouldBlock，RX满暂停读取。接收等待不会持有发送队列锁；Pending发送不会重复提交。单逻辑peer/物理peer映射和来源校验独立保留，不接受未请求的目标、GSO或源地址覆盖。物理 socket 仍只能来自 Dialer。
 
-`h3-transport` 使用官方 quiche 的低层驱动，共享上述数据报适配器，不创建新的 socket。
-每个 H3 stream 的已读取 body 最多保留 64 KiB，每次业务写入最多 16 KiB；
+XHTTP 和 DoH/H3 通过 `quinn-h3-transport` 使用官方 h3/h3-quinn，共享取消安全的请求包装与
+非 DATA 帧编码预算；它不创建 socket、查询池或额外业务 body 队列。未完成发送的请求丢弃时 reset，
+成功提交 FIN 后不因丢弃发送半而 reset，也不等待逐请求 QUIC ACK。各协议窗口和并发边界见
+[XHTTP](xhttp.md) 与 [DNS](tun-icmp-dns.md)。
+
+`quiche-h3-transport` 为 TrustTunnel/MASQUE 使用官方 quiche 的低层驱动，共享上述数据报适配器，不创建新的 socket。
+每个 quiche H3 stream 的已读取 body 最多保留 64 KiB，每次业务写入最多 16 KiB；
 只有本地主动请求创建业务状态，未知 DATAGRAM flow 丢弃，已注册 flow 的交付队列最多 64 项。
 这些是局部缓存界限，不宣称 QUIC 库内部总内存固定，也不限制活动业务流总数。
 
 QUIC双向可用payload至少1,200字节；endpoint必须显式把QUIC MTU限制在有效预算内。IPv4/IPv6路径MTU分别先扣除28/48字节IP+UDP头，边界和单字节不足均有定向测试。
 
-QUIC owner.stop先取消并等待驱动，再关闭并释放上游；上游close最多1秒。H3 在其一秒物理关闭预算内停止新请求准入、继续传输收尾并执行关闭交换，不承诺逐流远端 ACK。Driver Drop仅为取消/abort兜底，不能作为同步Stop验收。队列容量是单连接局部界限，不是全局QUIC连接准入数。
+QUIC owner.stop先取消并等待驱动，再关闭并释放上游；上游close最多1秒。H3 的关闭预算内停止新请求准入并执行关闭交换，XHTTP 和 quiche 物理连接退役还保留有界的传输收尾机会，不承诺逐流远端 ACK。Driver Drop仅为取消/abort兜底，不能作为同步Stop验收。队列容量是单连接局部界限，不是全局QUIC连接准入数。
 
 TUIC 与 Hysteria2 共用这一接点。接收窗口通过官方 Quinn API 固定设置：
 每流 max(initial, min(maximum, 4 MiB))，
