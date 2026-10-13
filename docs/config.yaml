@@ -218,7 +218,8 @@ sniffer:
 #   与同腿 REALITY/证书策略/mTLS、Vision/H3 互斥。下载对象缺省继承、整体替换、
 #   {} 清除，主腿空对象拒绝。保持完整 TLS1.3 认证，无恢复；详见 vless.md#jls。
 # - ech-opts 的静态/动态来源只用于标准 TLS，详见下方示意与 docs/vless.md#ech。
-#   不接受动态 query-server-name、shadow-tls-opts 或已移除的 restls-opts。
+#   query-server-name 只覆盖动态 HTTPS 记录查询名，不改变拨号、SNI 或证书验证名。
+#   不接受 shadow-tls-opts 或已移除的 restls-opts。
 #
 # 下方 vless-edge 通过 upstream-select 当前选择的 socks-hop 建链：
 # 客户端 -> socks-hop -> vless-edge -> 目标。
@@ -241,9 +242,9 @@ sniffer:
 # 零活跃流始终复用，混合填写不报互斥，阈值不限制业务总连接数。物理连接空闲30秒关闭。
 # udp: true 启用 _udp2 多目标数据报；health-check: true 启用 _check 协议探测，
 # 成功CONNECT响应重置7秒计时，单次探测期限7秒；二者缺省false。UDP业务在两模式均走可靠流。
-# congestion-controller 仅H3消费：cubic/new_reno/bbr_meta_v1/bbr_meta_v2，bbr 是 meta_v2别名，
-# 省略/未知保持传输默认。cwnd 仅BBR消费，0使用32；bbr-profile仅meta_v2消费，
-# 支持standard/conservative/aggressive，省略/未知使用standard。H2三字段均不生效。
+# congestion-controller 仅H3消费：cubic/new_reno 使用 quiche 原生 CUBIC/Reno；
+# bbr/bbr_meta_v1/bbr_meta_v2 均映射到 quiche 原生 Bbr2Gcongestion，省略/未知使用 cubic。
+# cwnd/bbr-profile 接受配置但不消费调参值；H2 三字段均不生效。
 proxies:
   - name: trusttunnel-edge
     type: trusttunnel
@@ -374,9 +375,9 @@ proxies:
     down: 0
     udp-mtu: 1197 # 单个协议分片预算；0 同默认，范围 64–65535
     # initial-stream-receive-window: 8388608 # byte，0/省略为8MiB
-    # max-stream-receive-window: 8388608 # 消费/RTT驱动增长上限，不提前分配缓冲
-    # initial-connection-receive-window: 20971520 # 0/省略为20MiB
-    # max-connection-receive-window: 20971520 # 独立上限，stream增长可提升连接当前窗口
+    # max-stream-receive-window: 8388608 # 固定信用=max(initial,min(maximum,4MiB))，不预分配缓冲
+    # initial-connection-receive-window: 20971520 # 固定连接信用；0/省略为20MiB
+    # max-connection-receive-window: 20971520 # 接受独立上限；Middle策略仍使用连接initial，不自适应增长
     # handshake-timeout: 0 # 秒；正值与原建链绝对期限取较早值
 
     # obfs: salamander
@@ -531,7 +532,7 @@ proxies:
 
   # 标准 TLS 的可选静态/动态 ECH；主腿与 download-settings 使用相同字段。
   # 非空 config 是标准 Base64 ECHConfigList；省略/空串时通过节点 DNS 查询 HTTPS key 5。
-  # 实际只协商 TLS1.3，servername 必须是 DNS 名；不查询 DNS 或自动明文回落。
+  # 实际只协商 TLS1.3，servername 必须是 DNS 名；静态 config 不查询 DNS，失败不自动明文回落。
   # {} 清除；不能与同腿 REALITY/JLS、Vision 混用，详细契约见 docs/vless.md#ech。
   # ech-opts:
   #   enable: true
@@ -679,7 +680,7 @@ proxy-groups:
 # map/map_values/filter/to_entries/from_entries/with_entries/any_c/all_c；
 # test/sub/split/join/upcase/downcase/trim/tostring/tonumber/type/not。
 # transform 函数允许分号分隔的独立参数流；any_c/all_c 按成员短路，from_entries 要求 key/value。
-# upcase/downcase 使用 Unicode 15 单字符映射，不扩展字符或按单词上下文改变 sigma；trim 独立处理空白。
+# upcase/downcase 使用 Rust 标准 Unicode 全映射，单字符可扩展为多个字符；trim 独立处理空白。
 # 整数 literal 为有符号 64 位，含 -9223372036854775808；超出该范围的整数 literal 拒绝。
 # = 右侧读取根，|= 读取旧目标；赋值右侧的 pipeline/and/or 须带括号，多结果须收集。
 # mapping 值取最后结果，无结果省略；插值取首结果。sub 全局替换，使用 Go 的 $capture。
