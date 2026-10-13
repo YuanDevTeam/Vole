@@ -32,7 +32,7 @@ Release 构建优先吞吐（`opt-level = 3`），保留 thin LTO 与现有缓�
 DNS 响应                        128
 每个 TCP 方向缓冲区             32 KiB
 TLS / XHTTP 缓冲区              64 KiB
-DNS 类型化缓存                  256 项
+DNS 结果总容量（每角色）         默认 4,096 项，dns.cache-max-size
 DNS 原始响应缓存                64 项 / 256 KiB
 TUN 域名提示                    256 项（按需）
 ```
@@ -160,6 +160,8 @@ TUIC 的独立会话、关联 ID 退役、控制流、分片负载
 
 ## DNS
 
+- 生产运行时从归一化的`dns.cache-max-size`构造缓存，缺省或零值为4,096项。主、bootstrap及已配置的节点/直连解析角色各拥有独立结果容量；A/AAAA类型化结果与原始响应共用每个角色的这份条目数。原始响应另受64项/256KiB预算约束，TUN域名提示独立为256项。
+- `ResourceLimits::dns_address_cache_entries`默认256，只是显式低层构造可传入的容量，生产启动不会用它覆盖`dns.cache-max-size`。WireGuard/MASQUE的私有节点resolver通过独立`DnsConfig::default()`构造，当前默认同为4,096项，不继承用户全局缓存容量覆盖；DNS关闭时的系统ECH metadata resolver另固定64项。这些局部容量不构成进程RSS上限。
 - 不设置固定的活动请求或活动传输总许可数。
 - 相同 key 的 cache miss 使用 singleflight；leader 取消后 follower 重新选举。
 - UDP 传输属于单次请求，同一尝试的重发复用当前传输。
