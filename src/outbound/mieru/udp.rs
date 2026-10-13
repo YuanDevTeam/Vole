@@ -38,6 +38,7 @@ const SEGMENTS: usize = 4096;
 const TX_LIMIT: u32 = 20;
 const ACK_DELAY: Duration = Duration::from_millis(1);
 const FIRST_CHECK: Duration = Duration::from_millis(10);
+const RECEIVE_BATCH: u8 = 8;
 
 struct WriteLease {
     _bytes: OwnedSemaphorePermit,
@@ -699,6 +700,8 @@ async fn run(
     let mut sessions = BTreeMap::<u32, Reliable>::new();
     let mut partial = None;
     let mut buffer = Vec::with_capacity(usize::from(budget.transmit()));
+    // Give application readers a turn before a ready burst consumes their credit.
+    let mut received_since_yield = 0u8;
     loop {
         if let Some(id) = advance_partial(&mut partial, &mut sessions) {
             shared.sessions.lock().unwrap().remove(&id);
@@ -717,6 +720,11 @@ async fn run(
             ()=tokio::time::sleep_until(deadline)=>{},
             packet=transport.receive(),if !sessions.is_empty()=>{
                 let packet=packet.map_err(|_|closed())?;
+                received_since_yield += 1;
+                if received_since_yield == RECEIVE_BATCH {
+                    received_since_yield = 0;
+                    tokio::task::yield_now().await;
+                }
                 if &packet.remote!=peer||packet.payload.len()>usize::from(budget.receive()){continue;}
                 shared.count_input(packet.payload.len());
                 let frame=match decoder.decode_frame(packet.payload,super::tcp::now()?) {Ok(frame)=>frame,Err(_)=>continue};
