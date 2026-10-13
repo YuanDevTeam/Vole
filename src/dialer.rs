@@ -732,6 +732,15 @@ impl Dialer {
     /// Creates a direct UDP socket for one destination and applies the
     /// platform protect or binding policy before exposing it to the caller.
     pub async fn bind_udp_for(&self, destination: SocketAddr) -> io::Result<PhysicalDatagram> {
+        self.bind_udp_for_with_receive_buffer(destination, None)
+            .await
+    }
+
+    pub(crate) async fn bind_udp_for_with_receive_buffer(
+        &self,
+        destination: SocketAddr,
+        receive_buffer_size: Option<usize>,
+    ) -> io::Result<PhysicalDatagram> {
         self.require_permitted(destination)?;
         let ipv6 = destination.is_ipv6();
         let bind_address = self
@@ -751,6 +760,14 @@ impl Dialer {
                 #[cfg(all(windows, feature = "windows-uwp"))]
                 dialer.apply_interface_binding(socket.as_raw_socket(), destination)?;
                 socket.bind(&bind_address.into())?;
+                // Buffer sizing is a performance hint. Keep this same
+                // owned socket and its platform policy if the OS refuses it.
+                // socket2 converts usize to c_int, so skip invalid hints.
+                if let Some(size) =
+                    receive_buffer_size.filter(|&size| size > 0 && size <= i32::MAX as usize)
+                {
+                    let _ = socket.set_recv_buffer_size(size);
+                }
                 socket.set_nonblocking(true)?;
                 check()?;
                 dialer.protect_socket(&socket)?;

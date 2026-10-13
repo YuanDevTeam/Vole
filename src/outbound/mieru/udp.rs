@@ -19,6 +19,7 @@ use crate::{
     session::{Datagram, DatagramSession, Destination, StreamSession},
 };
 use bytes::Bytes;
+use futures_util::FutureExt;
 use std::{
     collections::{BTreeMap, VecDeque},
     io,
@@ -28,7 +29,7 @@ use std::{
     },
 };
 use tokio::{
-    sync::{OwnedSemaphorePermit, mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     time::{Duration, Instant, timeout_at},
 };
 const MTU: u16 = 1400;
@@ -39,6 +40,7 @@ const TX_LIMIT: u32 = 20;
 const ACK_DELAY: Duration = Duration::from_millis(1);
 const FIRST_CHECK: Duration = Duration::from_millis(10);
 const RECEIVE_BATCH: u8 = 8;
+const OUTPUT_QUANTUM: usize = 8;
 
 struct WriteLease {
     _bytes: OwnedSemaphorePermit,
@@ -86,12 +88,17 @@ struct PacketPattern<'a> {
     pattern: &'a EffectivePattern,
     nonce: NonceState,
     wire_budget: usize,
+    remaining: usize,
+    truncated: bool,
 }
 struct Reliable {
     state: Arc<State>,
     pending: VecDeque<Segment>,
     outstanding: BTreeMap<u32, Segment>,
     reorder: BTreeMap<u32, Inbound>,
+    // Authenticated pending DATA and application unread bytes own separate
+    // bounded leases. A blocked reader must not spend the missing head's credit.
+    reorder_bytes: Arc<Semaphore>,
     established: bool,
     remote_window: u32,
     rtt: Rtt,
@@ -133,8 +140,10 @@ impl Reliable {
     fn new(state: Arc<State>, receive_chunk: usize) -> Self {
         let now = Instant::now();
         let interval = heartbeat_interval();
+        let reorder_bytes = Arc::new(Semaphore::new(state.receive_capacity()));
         Self {
             state,
+            reorder_bytes,
             pending: VecDeque::new(),
             outstanding: BTreeMap::new(),
             reorder: BTreeMap::new(),
@@ -157,8 +166,13 @@ impl Reliable {
     fn window(&self, partial_available: bool) -> u16 {
         let count = self.reorder.len() + self.state.unread_segments();
         let segment_space = SEGMENTS.saturating_sub(count);
-        let bytes = self.state.receive_bytes.available_permits();
-        let byte_space = if self.small_budget() {
+        let small_budget = self.small_budget();
+        let bytes = if small_budget {
+            self.state.receive_bytes.available_permits()
+        } else {
+            self.reorder_bytes.available_permits()
+        };
+        let byte_space = if small_budget {
             // A single physical parser slot, plus real app byte credit,
             // permits incremental delivery without pretending the queue can
             // buffer a complete peer segment. While occupied, advertise zero.
@@ -297,24 +311,43 @@ impl Reliable {
             });
             return;
         }
-        // Future DATA must leave one complete receive segment's credit for
-        // the gap. Reorder and unread chunks share this same byte budget;
-        // otherwise a full reorder buffer can permanently reject the packet
-        // required to make any of its buffered data readable.
-        if seq != next_receive
-            && !frame.payload.is_empty()
-            && self
-                .state
-                .receive_bytes
-                .available_permits()
-                .saturating_sub(frame.payload.len())
-                < self.receive_chunk
-        {
-            return;
+        // Tiny budgets keep the existing physical Partial slot and app leases.
+        // Normal DATA first owns reorder credit, independent of app unread bytes.
+        let receive_bytes = if self.small_budget() {
+            &self.state.receive_bytes
+        } else {
+            &self.reorder_bytes
+        };
+        if !frame.payload.is_empty() {
+            let reserve = if seq == next_receive {
+                0
+            } else {
+                self.receive_chunk
+            };
+            let required = frame.payload.len().saturating_add(reserve);
+            let available = receive_bytes.available_permits();
+            if available < required {
+                let reclaimable = self
+                    .reorder
+                    .iter()
+                    .rev()
+                    .take_while(|(queued, _)| **queued > seq)
+                    .map(|(_, inbound)| inbound.frame.payload.len())
+                    .sum::<usize>();
+                if available.saturating_add(reclaimable) < required {
+                    return;
+                }
+                while receive_bytes.available_permits() < required
+                    && self
+                        .reorder
+                        .last_key_value()
+                        .is_some_and(|(queued, _)| *queued > seq)
+                {
+                    drop(self.reorder.pop_last());
+                }
+            }
         }
-        let Ok(permit) = self
-            .state
-            .receive_bytes
+        let Ok(permit) = receive_bytes
             .clone()
             .try_acquire_many_owned(frame.payload.len() as u32)
         else {
@@ -327,17 +360,63 @@ impl Reliable {
         self.reorder.insert(seq, Inbound { frame, permit });
         self.deliver_contiguous();
     }
-    fn deliver_contiguous(&mut self) {
-        while let Some(inbound) = self
-            .reorder
-            .remove(&self.state.next_receive.load(Ordering::Acquire))
-        {
-            self.state.next_receive.fetch_add(1, Ordering::AcqRel);
-            self.state.deliver_reserved(ReceivedChunk {
-                bytes: inbound.frame.payload,
-                permit: inbound.permit,
-            });
+    fn deliver_contiguous(&mut self) -> bool {
+        let mut advanced = false;
+        if self.small_budget() {
+            // Preserve the tiny path's existing app permit ownership exactly.
+            while let Some(inbound) = self
+                .reorder
+                .remove(&self.state.next_receive.load(Ordering::Acquire))
+            {
+                self.state.next_receive.fetch_add(1, Ordering::AcqRel);
+                self.state.deliver_reserved(ReceivedChunk {
+                    bytes: inbound.frame.payload,
+                    permit: inbound.permit,
+                });
+                advanced = true;
+            }
+            return advanced;
         }
+        loop {
+            let next = self.state.next_receive.load(Ordering::Acquire);
+            let Some(inbound) = self.reorder.get(&next) else {
+                break;
+            };
+            let Ok(permit) = self
+                .state
+                .receive_bytes
+                .clone()
+                .try_acquire_many_owned(inbound.frame.payload.len() as u32)
+            else {
+                break;
+            };
+            // Clone only the Bytes handle, retaining the same allocation and
+            // reorder lease until the app enqueue has actually committed.
+            let delivered = self.state.try_deliver_reserved(ReceivedChunk {
+                bytes: inbound.frame.payload.clone(),
+                permit,
+            });
+            if !delivered {
+                break;
+            }
+            drop(self.reorder.remove(&next));
+            // The cumulative ACK commits only bytes actually queued for the app.
+            self.state.next_receive.fetch_add(1, Ordering::AcqRel);
+            advanced = true;
+        }
+        advanced
+    }
+    fn retain_contiguous_on_close(&mut self) {
+        let mut next = self.state.next_receive.load(Ordering::Acquire);
+        let mut gap = false;
+        self.reorder.retain(|sequence, _| {
+            if gap || *sequence != next {
+                gap = true;
+                return false;
+            }
+            next = next.wrapping_add(1);
+            true
+        });
     }
     fn next_deadline(&self, now: Instant) -> Instant {
         let mut next = now + Duration::from_secs(5);
@@ -444,7 +523,7 @@ pub(super) async fn drive(
             .map_err(|_| closed())?;
         let mut datagram = DatagramSession::new(session.inbound, session.source);
         datagram.metadata = session.metadata;
-        let request = DatagramRequest::new(datagram);
+        let request = DatagramRequest::new(datagram).with_udp_receive_buffer_size(512 * 1024);
         let transport = upstream
             .open_datagram(request.with_budget(DatagramBudget::new(MTU, MTU)), &context)
             .await
@@ -532,6 +611,7 @@ async fn send(
         output,
     )?;
     tokio::select! {biased;()=shared.cancel.cancelled()=>return Err(closed()),result=tokio::time::timeout(Duration::from_secs(10),transport.send(Datagram{remote:peer.clone(),payload:Bytes::copy_from_slice(output),sniffed_domain:None}))=>result.map_err(|_|io::ErrorKind::TimedOut)?.map_err(|_|closed())?}
+    pattern.remaining -= 1;
     shared.count_output(output.len());
     Ok(())
 }
@@ -552,92 +632,12 @@ async fn output(
     let mut had_loss = false;
     let mut new_sent = 0u32;
     state.first_check = None;
-    for segment in state.outstanding.values_mut() {
-        let fast = segment.ack_count >= 3 && segment.tx_count <= 1;
-        let timeout = now >= segment.sent.unwrap() + state.rtt.retransmit_delay(segment.tx_count);
-        if !fast && !timeout {
-            continue;
-        }
-        if segment.tx_count >= TX_LIMIT {
-            return Ok(false);
-        }
-        had_loss |= fast;
-        had_timeout |= !fast;
-        segment.ack_count = 0;
-        segment.tx_count += 1;
-        if let Metadata::Data(ref mut meta) = segment.metadata {
-            meta.unack_sequence = state.state.next_receive.load(Ordering::Acquire);
-            meta.window = state.last_window;
-        }
-        send(
-            transport,
-            peer,
-            encoder,
-            username,
-            shared,
-            pattern,
-            segment.metadata,
-            &segment.payload,
-            buffer,
-        )
-        .await?;
-        segment.sent = Some(Instant::now());
-        state.heartbeat = segment.sent.unwrap() + state.heartbeat_interval;
-    }
-    if had_timeout {
-        state.cubic.on_timeout();
-    } else if had_loss {
-        state.cubic.on_loss(now);
-    }
-    let available = state
-        .cubic
-        .window()
-        .saturating_sub(state.outstanding.len() as u32)
-        .min(state.remote_window);
-    loop {
-        if new_sent >= available || state.outstanding.len() >= SEGMENTS - 1 {
-            break;
-        }
-        let Some(front) = state.pending.front() else {
-            break;
-        };
-        if !state.established && matches!(front.metadata, Metadata::Data(_)) {
-            break;
-        }
-        let mut segment = state.pending.pop_front().unwrap();
-        if let Metadata::Data(ref mut meta) = segment.metadata {
-            meta.unack_sequence = state.state.next_receive.load(Ordering::Acquire);
-            meta.window = state.window(partial_available);
-            state.last_window = meta.window;
-        }
-        send(
-            transport,
-            peer,
-            encoder,
-            username,
-            shared,
-            pattern,
-            segment.metadata,
-            &segment.payload,
-            buffer,
-        )
-        .await?;
-        segment.sent = Some(Instant::now());
-        state.heartbeat = segment.sent.unwrap() + state.heartbeat_interval;
-        segment.tx_count = 1;
-        if let Some(lease) = &segment.lease {
-            lease.sent();
-        }
-        if state.outstanding.is_empty() {
-            state.first_check = Some(Instant::now() + FIRST_CHECK);
-        }
-        state
-            .outstanding
-            .insert(sequence(segment.metadata), segment);
-        new_sent += 1;
-    }
     if state.established && (state.ack_due.is_some_and(|due| now >= due) || now >= state.heartbeat)
     {
+        if pattern.remaining == 0 {
+            pattern.truncated = true;
+            return Ok(true);
+        }
         let window = state.window(partial_available);
         let metadata = Metadata::Data(DataMetadata {
             kind: DataKind::ClientAck,
@@ -664,6 +664,103 @@ async fn output(
         state.heartbeat_interval = heartbeat_interval();
         state.heartbeat = Instant::now() + state.heartbeat_interval;
     }
+    for segment in state.outstanding.values_mut() {
+        let fast = segment.ack_count >= 3 && segment.tx_count <= 1;
+        let timeout = now >= segment.sent.unwrap() + state.rtt.retransmit_delay(segment.tx_count);
+        if !fast && !timeout {
+            continue;
+        }
+        if pattern.remaining == 0 {
+            pattern.truncated = true;
+            break;
+        }
+        if segment.tx_count >= TX_LIMIT {
+            return Ok(false);
+        }
+        if let Metadata::Data(ref mut meta) = segment.metadata {
+            meta.unack_sequence = state.state.next_receive.load(Ordering::Acquire);
+            meta.window = state.last_window;
+        }
+        send(
+            transport,
+            peer,
+            encoder,
+            username,
+            shared,
+            pattern,
+            segment.metadata,
+            &segment.payload,
+            buffer,
+        )
+        .await?;
+        had_loss |= fast;
+        had_timeout |= !fast;
+        segment.ack_count = 0;
+        segment.tx_count += 1;
+        segment.sent = Some(Instant::now());
+        state.heartbeat = segment.sent.unwrap() + state.heartbeat_interval;
+    }
+    if had_timeout {
+        state.cubic.on_timeout();
+    } else if had_loss {
+        state.cubic.on_loss(now);
+    }
+    if pattern.truncated {
+        return Ok(true);
+    }
+    let available = state
+        .cubic
+        .window()
+        .saturating_sub(state.outstanding.len() as u32)
+        .min(state.remote_window);
+    loop {
+        if new_sent >= available || state.outstanding.len() >= SEGMENTS - 1 {
+            break;
+        }
+        let Some(front) = state.pending.front() else {
+            break;
+        };
+        if !state.established && matches!(front.metadata, Metadata::Data(_)) {
+            break;
+        }
+        if pattern.remaining == 0 {
+            pattern.truncated = true;
+            break;
+        }
+        let mut segment = state.pending.pop_front().unwrap();
+        if let Metadata::Data(ref mut meta) = segment.metadata {
+            meta.unack_sequence = state.state.next_receive.load(Ordering::Acquire);
+            meta.window = state.window(partial_available);
+        }
+        send(
+            transport,
+            peer,
+            encoder,
+            username,
+            shared,
+            pattern,
+            segment.metadata,
+            &segment.payload,
+            buffer,
+        )
+        .await?;
+        segment.sent = Some(Instant::now());
+        state.heartbeat = segment.sent.unwrap() + state.heartbeat_interval;
+        segment.tx_count = 1;
+        if let Metadata::Data(meta) = segment.metadata {
+            state.last_window = meta.window;
+        }
+        if let Some(lease) = &segment.lease {
+            lease.sent();
+        }
+        if state.outstanding.is_empty() {
+            state.first_check = Some(Instant::now() + FIRST_CHECK);
+        }
+        state
+            .outstanding
+            .insert(sequence(segment.metadata), segment);
+        new_sent += 1;
+    }
     Ok(true)
 }
 fn valid_direction(metadata: Metadata) -> bool {
@@ -675,6 +772,125 @@ fn valid_direction(metadata: Metadata) -> bool {
         ),
     }
 }
+fn input_command(
+    command: WriterCommand,
+    sessions: &mut BTreeMap<u32, Reliable>,
+    chunk: usize,
+    receive_chunk: usize,
+    allow_piggyback: bool,
+) {
+    if command.state.cancel.is_cancelled() {
+        let _ = command.done.send(Err(closed()));
+        return;
+    }
+    let state = sessions
+        .entry(command.state.id)
+        .or_insert_with(|| Reliable::new(command.state.clone(), receive_chunk));
+    if state.remote_close.is_some() {
+        let _ = command.done.send(Err(closed()));
+    } else {
+        state.enqueue(command, chunk, allow_piggyback);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn input_packet(
+    packet: Datagram,
+    transport: &mut dyn DatagramTransport,
+    peer: &Destination,
+    budget: DatagramBudget,
+    encoder: &PacketEncoder,
+    decoder: &PacketDecoder,
+    username: &str,
+    shared: &Shared,
+    pattern: &mut PacketPattern<'_>,
+    sessions: &mut BTreeMap<u32, Reliable>,
+    partial: &mut Option<Partial>,
+    buffer: &mut Vec<u8>,
+) -> io::Result<bool> {
+    if &packet.remote != peer || packet.payload.len() > usize::from(budget.receive()) {
+        return Ok(false);
+    }
+    shared.count_input(packet.payload.len());
+    let frame = match decoder.decode_frame(packet.payload, super::tcp::now()?) {
+        Ok(frame) => frame,
+        Err(_) => return Ok(false),
+    };
+    if !valid_direction(frame.metadata) {
+        return Ok(false);
+    }
+    let id = session_id(frame.metadata);
+    if let Some(state) = sessions.get_mut(&id) {
+        match frame.metadata {
+            Metadata::Session(meta)
+                if matches!(
+                    meta.kind,
+                    SessionKind::CloseRequest | SessionKind::CloseResponse
+                ) =>
+            {
+                if meta.kind == SessionKind::CloseRequest {
+                    let metadata = close_metadata(&state.state, SessionKind::CloseResponse);
+                    send(
+                        transport,
+                        peer,
+                        encoder,
+                        username,
+                        shared,
+                        pattern,
+                        metadata,
+                        &[],
+                        buffer,
+                    )
+                    .await?;
+                }
+                if partial
+                    .as_ref()
+                    .is_some_and(|pending| pending.session_id == id)
+                {
+                    state.remote_close =
+                        Some(state.remote_close.unwrap_or(false) || meta.status != 0);
+                    state.pending.clear();
+                    state.outstanding.clear();
+                    state.reorder.clear();
+                } else if !state.small_budget() {
+                    state.remote_close =
+                        Some(state.remote_close.unwrap_or(false) || meta.status != 0);
+                    state.pending.clear();
+                    state.outstanding.clear();
+                    // Preserve only the accepted contiguous prefix. A gap
+                    // cannot be repaired after the peer has closed.
+                    state.retain_contiguous_on_close();
+                } else {
+                    state.state.finish(meta.status != 0);
+                    sessions.remove(&id);
+                    shared.sessions.lock().unwrap().remove(&id);
+                }
+            }
+            _ => state.input(frame, Instant::now(), partial),
+        }
+    } else if let Metadata::Data(meta) = frame.metadata {
+        let close = Metadata::Session(SessionMetadata {
+            kind: SessionKind::CloseRequest,
+            session_id: id,
+            sequence: meta.unack_sequence,
+            status: 0,
+        });
+        send(
+            transport,
+            peer,
+            encoder,
+            username,
+            shared,
+            pattern,
+            close,
+            &[],
+            buffer,
+        )
+        .await?;
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     transport: &mut dyn DatagramTransport,
@@ -693,6 +909,8 @@ async fn run(
         pattern,
         nonce: NonceState::new(),
         wire_budget: usize::from(budget.transmit()),
+        remaining: OUTPUT_QUANTUM,
+        truncated: false,
     };
     let receive_chunk = usize::from(budget.receive())
         .saturating_sub(DATA_OVERHEAD)
@@ -702,7 +920,13 @@ async fn run(
     let mut buffer = Vec::with_capacity(usize::from(budget.transmit()));
     // Give application readers a turn before a ready burst consumes their credit.
     let mut received_since_yield = 0u8;
-    loop {
+    let mut has_output = false;
+    let mut last_output = None;
+    'driver: loop {
+        // Direct receive requires its first successful physical send.
+        has_output |= packet_pattern.remaining < OUTPUT_QUANTUM;
+        packet_pattern.remaining = OUTPUT_QUANTUM;
+        packet_pattern.truncated = false;
         if let Some(id) = advance_partial(&mut partial, &mut sessions) {
             shared.sessions.lock().unwrap().remove(&id);
         }
@@ -713,39 +937,68 @@ async fn run(
             .min()
             .unwrap_or(now + Duration::from_secs(5))
             .min(now + Duration::from_secs(5));
+        let mut received = None;
         tokio::select! {biased;
             ()=shared.cancel.cancelled()=>return Ok(()),
-            command=commands.recv()=>{let Some(command)=command else{return Ok(());};if command.state.cancel.is_cancelled(){let _=command.done.send(Err(closed()));}else{let state=sessions.entry(command.state.id).or_insert_with(||Reliable::new(command.state.clone(),receive_chunk));if state.remote_close.is_some(){let _=command.done.send(Err(closed()));}else{state.enqueue(command,chunk,!pattern.low_entropy_enabled());}}},
+            command=commands.recv()=>{let Some(command)=command else{return Ok(());};input_command(command,&mut sessions,chunk,receive_chunk,!pattern.low_entropy_enabled());},
             ()=shared.activity.notified()=>{},
             ()=tokio::time::sleep_until(deadline)=>{},
-            packet=transport.receive(),if !sessions.is_empty()=>{
-                let packet=packet.map_err(|_|closed())?;
-                received_since_yield += 1;
-                if received_since_yield == RECEIVE_BATCH {
-                    received_since_yield = 0;
-                    tokio::task::yield_now().await;
+            packet=transport.receive(),if !sessions.is_empty()=>{received=Some(packet.map_err(|_|closed())?);}
+        }
+        let mut received_in_turn = 0u8;
+        while received_in_turn < RECEIVE_BATCH {
+            if shared.cancel.is_cancelled() {
+                return Ok(());
+            }
+            let selected_receive = received.is_some();
+            let packet = if let Some(packet) = received.take() {
+                packet
+            } else if has_output && !sessions.is_empty() {
+                // The receive contract permits dropping a pending future. A
+                // ready Datagram owns its complete payload before we borrow TX.
+                let Some(packet) = transport
+                    .receive()
+                    .now_or_never()
+                    .transpose()
+                    .map_err(|_| closed())?
+                else {
+                    break;
+                };
+                packet
+            } else {
+                break;
+            };
+            received_in_turn += 1;
+            received_since_yield += 1;
+            if received_since_yield == RECEIVE_BATCH {
+                received_since_yield = 0;
+                tokio::task::yield_now().await;
+            }
+            if shared.cancel.is_cancelled() {
+                return Ok(());
+            }
+            if !input_packet(
+                packet,
+                transport,
+                peer,
+                budget,
+                encoder,
+                decoder,
+                username,
+                shared,
+                &mut packet_pattern,
+                &mut sessions,
+                &mut partial,
+                &mut buffer,
+            )
+            .await?
+            {
+                if selected_receive {
+                    continue 'driver;
                 }
-                if &packet.remote!=peer||packet.payload.len()>usize::from(budget.receive()){continue;}
-                shared.count_input(packet.payload.len());
-                let frame=match decoder.decode_frame(packet.payload,super::tcp::now()?) {Ok(frame)=>frame,Err(_)=>continue};
-                if !valid_direction(frame.metadata){continue;}
-                let id=session_id(frame.metadata);
-                if let Some(state)=sessions.get_mut(&id){
-                    match frame.metadata {
-                        Metadata::Session(meta) if matches!(meta.kind,SessionKind::CloseRequest|SessionKind::CloseResponse)=>{
-                            if meta.kind==SessionKind::CloseRequest{let metadata=close_metadata(&state.state,SessionKind::CloseResponse);send(transport,peer,encoder,username,shared,&mut packet_pattern,metadata,&[],&mut buffer).await?;}
-                            if partial.as_ref().is_some_and(|pending|pending.session_id==id){
-                                state.remote_close=Some(state.remote_close.unwrap_or(false)||meta.status!=0);
-                                state.pending.clear();state.outstanding.clear();state.reorder.clear();
-                            }else{
-                                state.state.finish(meta.status!=0);sessions.remove(&id);shared.sessions.lock().unwrap().remove(&id);
-                            }
-                        }
-                        _=>state.input(frame,Instant::now(),&mut partial),
-                    }
-                }else if let Metadata::Data(meta)=frame.metadata {
-                    let close=Metadata::Session(SessionMetadata{kind:SessionKind::CloseRequest,session_id:id,sequence:meta.unack_sequence,status:0});send(transport,peer,encoder,username,shared,&mut packet_pattern,close,&[],&mut buffer).await?;
-                }
+                // An extra invalid packet must not discard the selected
+                // command or due timer's output turn.
+                continue;
             }
         }
         if let Some(id) = advance_partial(&mut partial, &mut sessions) {
@@ -755,8 +1008,17 @@ async fn run(
         if shared.clean() {
             return Ok(());
         }
-        let ids: Vec<_> = sessions.keys().copied().collect();
+        let mut ids: Vec<_> = sessions.keys().copied().collect();
+        if let Some(last) = last_output {
+            let first = ids.partition_point(|id| *id <= last);
+            ids.rotate_left(first);
+        }
         for id in ids {
+            if packet_pattern.remaining == 0 {
+                packet_pattern.truncated = true;
+                break;
+            }
+            last_output = Some(id);
             let state = sessions.get_mut(&id).unwrap();
             if state.state.cancel.is_cancelled() {
                 if state.remote_close.is_none() && state.state.opened.load(Ordering::Acquire) {
@@ -778,7 +1040,19 @@ async fn run(
                 shared.sessions.lock().unwrap().remove(&id);
                 continue;
             }
-            if state.remote_close.is_some() {
+            // App reads notify this driver. Retry delivery before every window
+            // calculation, including when the window floor would stay unchanged.
+            if !state.small_budget() && state.deliver_contiguous() {
+                state.request_ack(Instant::now());
+            }
+            if let Some(failure) = state.remote_close {
+                // finish cancels State and excludes it from carrier liveness.
+                // Defer it until retained normal DATA has entered the app queue.
+                if !state.small_budget() && state.reorder.is_empty() {
+                    state.state.finish(failure);
+                    sessions.remove(&id);
+                    shared.sessions.lock().unwrap().remove(&id);
+                }
                 continue;
             }
             if state.window(partial.is_none()) != state.last_window {
@@ -814,10 +1088,15 @@ async fn run(
                 sessions.remove(&id);
                 shared.sessions.lock().unwrap().remove(&id);
             }
+            if packet_pattern.truncated {
+                break;
+            }
+        }
+        if packet_pattern.truncated {
+            shared.activity.notify_one();
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::super::wire::Padding;
@@ -1836,7 +2115,7 @@ mod tests {
         assert!(probe.snapshot().is_idle());
     }
     #[tokio::test]
-    async fn mieru_udp_credit_spans_reorder_unread_and_unacknowledged_fragments() {
+    async fn mieru_udp_reorder_unread_and_unacknowledged_credit_are_independent() {
         let cancellation = CancellationToken::new();
         let state = State::new(1, 8, &cancellation, Arc::new(tokio::sync::Notify::new()));
         let mut reliable = Reliable::new(state.clone(), 2);
@@ -1853,11 +2132,13 @@ mod tests {
             payload: Bytes::from_static(bytes),
         };
         reliable.input(frame(1, b"AAAA"), Instant::now(), &mut partial);
-        assert_eq!(state.receive_bytes.available_permits(), 4);
+        assert_eq!(state.receive_bytes.available_permits(), 8);
+        assert_eq!(reliable.reorder_bytes.available_permits(), 4);
         reliable.input(frame(0, b"BBBB"), Instant::now(), &mut partial);
         assert!(reliable.reorder.is_empty());
         assert_eq!(state.receive_bytes.available_permits(), 0);
-        assert_eq!(reliable.window(true), 0);
+        assert_eq!(reliable.reorder_bytes.available_permits(), 8);
+        assert_eq!(reliable.window(true), 4);
         reliable.input(frame(1, b"wrong"), Instant::now(), &mut partial);
         let mut buffer = [0; 4];
         let mut read = tokio::io::ReadBuf::new(&mut buffer);
@@ -1910,3 +2191,9 @@ mod tests {
         drop(state);
     }
 }
+
+#[cfg(test)]
+include!("udp_split_receive_tests.rs");
+
+#[cfg(test)]
+include!("udp_balanced_driver_tests.rs");

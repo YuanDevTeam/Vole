@@ -80,6 +80,7 @@ impl OutboundConnector for DirectOutbound {
             Box::new(DirectDatagramTransport::new(
                 self.dialer.clone(),
                 usize::from(request.max_response_payload_size()),
+                request.udp_receive_buffer_size(),
             )),
             request.budget(),
         ))
@@ -90,6 +91,7 @@ struct DirectDatagramTransport {
     dialer: Dialer,
     sockets: Vec<(UdpSocketClass, UdpSocket)>,
     max_response_payload_size: usize,
+    receive_buffer_size: Option<usize>,
     receive_buffer: Vec<u8>,
     receive_cursor: usize,
 }
@@ -101,11 +103,16 @@ struct UdpSocketClass {
 }
 
 impl DirectDatagramTransport {
-    fn new(dialer: Dialer, max_response_payload_size: usize) -> Self {
+    fn new(
+        dialer: Dialer,
+        max_response_payload_size: usize,
+        receive_buffer_size: Option<usize>,
+    ) -> Self {
         Self {
             dialer,
             sockets: Vec::with_capacity(4),
             max_response_payload_size,
+            receive_buffer_size,
             receive_buffer: Vec::new(),
             receive_cursor: 0,
         }
@@ -121,7 +128,7 @@ impl DirectDatagramTransport {
         }
         let socket = self
             .dialer
-            .bind_udp_for(address)
+            .bind_udp_for_with_receive_buffer(address, self.receive_buffer_size)
             .await
             .map_err(DispatchError::from)?;
         self.sockets.push((class, socket));
@@ -325,7 +332,7 @@ mod tests {
     async fn direct_udp_drops_an_oversized_response_without_truncating_it() {
         let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let destination = remote.local_addr().unwrap();
-        let mut transport = DirectDatagramTransport::new(Dialer::default(), 4);
+        let mut transport = DirectDatagramTransport::new(Dialer::default(), 4, None);
         transport
             .send(Datagram {
                 remote: Destination::Ip(destination),

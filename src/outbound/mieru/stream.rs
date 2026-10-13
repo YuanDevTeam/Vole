@@ -123,6 +123,19 @@ impl State {
         drop(input);
         self.read.wake();
     }
+    pub(super) fn try_deliver_reserved(&self, chunk: ReceivedChunk) -> bool {
+        let mut input = self.input.lock().unwrap();
+        if input.finished || self.cancel.is_cancelled() {
+            return false;
+        }
+        if chunk.bytes.is_empty() {
+            return true;
+        }
+        input.queue.push_back(chunk);
+        drop(input);
+        self.read.wake();
+        true
+    }
     pub async fn deliver(&self, mut data: Bytes) -> io::Result<()> {
         while !data.is_empty() {
             let count = data.len().min(self.capacity);

@@ -403,6 +403,7 @@ impl std::fmt::Debug for ConnectedStream {
 pub struct DatagramRequest {
     pub session: DatagramSession,
     budget: crate::dispatch::DatagramBudget,
+    udp_receive_buffer_size: Option<usize>,
 }
 
 impl DatagramRequest {
@@ -412,6 +413,7 @@ impl DatagramRequest {
         Self {
             session,
             budget: crate::dispatch::DatagramBudget::new(u16::MAX, max_response_payload_size),
+            udp_receive_buffer_size: None,
         }
     }
 
@@ -425,6 +427,7 @@ impl DatagramRequest {
         Self {
             session: self.session.clone(),
             budget: crate::dispatch::DatagramBudget::new(self.budget.transmit(), maximum),
+            udp_receive_buffer_size: self.udp_receive_buffer_size,
         }
     }
 
@@ -437,7 +440,21 @@ impl DatagramRequest {
         Self {
             session: self.session.clone(),
             budget,
+            udp_receive_buffer_size: self.udp_receive_buffer_size,
         }
+    }
+
+    /// Best-effort hint for a locally owned physical UDP socket.
+    /// This is independent of logical payload and receive credit limits.
+    #[cfg(feature = "outbound-mieru")]
+    pub(crate) fn with_udp_receive_buffer_size(&self, size: usize) -> Self {
+        let mut request = self.clone();
+        request.udp_receive_buffer_size = Some(size);
+        request
+    }
+
+    pub(crate) const fn udp_receive_buffer_size(&self) -> Option<usize> {
+        self.udp_receive_buffer_size
     }
 
     /// Budget the wire envelope independently in each direction. A larger
@@ -1509,6 +1526,18 @@ proxy-groups:
             "127.0.0.1:10000".parse().unwrap(),
         );
         let request = DatagramRequest::new(session);
+        assert_eq!(request.udp_receive_buffer_size(), None);
+        #[cfg(feature = "outbound-mieru")]
+        {
+            let request = request.with_udp_receive_buffer_size(512 * 1024);
+            for adjusted in [
+                request.with_budget(crate::dispatch::DatagramBudget::new(1_200, 1_400)),
+                request.with_max_response_payload_size(1_714),
+                request.with_envelope(32, 64),
+            ] {
+                assert_eq!(adjusted.udp_receive_buffer_size(), Some(512 * 1024));
+            }
+        }
         assert_eq!(request.max_response_payload_size(), 1_452);
         assert_eq!(
             request

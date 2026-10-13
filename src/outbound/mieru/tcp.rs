@@ -67,6 +67,30 @@ pub(super) struct Shared {
     maximum_write: AtomicUsize,
 }
 impl Shared {
+    #[cfg(test)]
+    pub(super) fn output_test_shared(cancel: CancellationToken) -> Arc<Self> {
+        let (control, _receiver) = mpsc::channel(1);
+        Arc::new(Self {
+            sessions: Mutex::new(HashMap::new()),
+            control,
+            schedule: Mutex::new(Schedule {
+                pending: 0,
+                last_schedule: Instant::now(),
+                disabled: None,
+                closed: false,
+                in_bytes: 0,
+                out_bytes: 0,
+            }),
+            cancel,
+            activity: Arc::new(Notify::new()),
+            idle: Duration::from_secs(120),
+            volume: u64::MAX,
+            created: Instant::now(),
+            udp: true,
+            maximum_write: AtomicUsize::new(32768),
+        })
+    }
+
     pub(super) fn reap_unopened(&self) {
         self.sessions.lock().unwrap().retain(|_, state| {
             !(state.cancel.is_cancelled() && !state.opened.load(Ordering::Acquire))
