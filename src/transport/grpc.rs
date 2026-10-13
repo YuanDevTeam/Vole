@@ -9,9 +9,10 @@ use std::{
     task::{Context, Poll, ready},
 };
 
+use super::h2_empty::Send as H2Send;
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::task::AtomicWaker;
-use h2::{RecvStream, SendStream, client::ResponseFuture};
+use h2::{RecvStream, client::ResponseFuture};
 #[cfg(feature = "outbound-trusttunnel")]
 use tokio::sync::oneshot;
 use tokio::{
@@ -234,7 +235,7 @@ struct Grpc {
     response: Option<PendingResponse>,
     response_deadline: bool,
     receive: Option<RecvStream>,
-    send: SendStream<Payload>,
+    send: H2Send,
     writes: Writes,
     pending: Option<Receipt>,
     deadline: Pin<Box<tokio::time::Sleep>>,
@@ -289,6 +290,9 @@ pub(super) async fn pooled_stream(
 impl Drop for Grpc {
     fn drop(&mut self) {
         self.close.stop();
+        if let Some(lease) = &self._lease {
+            lease.close_stream();
+        }
         self.send.send_reset(h2::Reason::CANCEL);
         if let Some(abort) = &self.abort {
             abort.abort();
@@ -301,7 +305,7 @@ pub(super) async fn pooled_connect(
     sender: Sender,
     request: http::Request<()>,
     deadline: Instant,
-    lease: super::grpc_pool::Lease,
+    mut lease: super::grpc_pool::Lease,
     observer: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> io::Result<(BoxStream, impl Future<Output = ()> + Send + 'static)> {
     let writes = sender.writes;
@@ -309,7 +313,10 @@ pub(super) async fn pooled_connect(
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
         .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
-    let (response, send) = sender.send_request(request, false).map_err(|_| invalid())?;
+    let (response, send) = lease
+        .request(&mut sender, request, false)
+        .map_err(|_| invalid())?;
+    let admission = lease.admission();
     let cancel = tokio_util::sync::CancellationToken::new();
     let close = Arc::new(Close {
         response_cancel: Some(cancel.clone()),
@@ -344,6 +351,9 @@ pub(super) async fn pooled_connect(
             }),
         };
         if result.is_ok() {
+            if let Some(admission) = admission {
+                admission.activate();
+            }
             if let Some(observer) = observer {
                 observer();
             }
@@ -465,7 +475,7 @@ impl Grpc {
     #[allow(clippy::too_many_arguments)]
     fn new(
         response: ResponseFuture,
-        send: SendStream<Payload>,
+        send: impl Into<H2Send>,
         framing: Framing,
         half_close: bool,
         deadline: Instant,
@@ -484,7 +494,7 @@ impl Grpc {
             response: Some(PendingResponse::Direct(response)),
             response_deadline: true,
             receive: None,
-            send,
+            send: send.into(),
             deadline: Box::pin(tokio::time::sleep_until(deadline)),
             writes,
             pending: None,
@@ -750,6 +760,9 @@ impl AsyncWrite for Grpc {
         ready!(self.drain(cx))?;
         self.upload_closed = true;
         self.close.stop();
+        if let Some(lease) = &self._lease {
+            lease.close_stream();
+        }
         self.send.send_reset(h2::Reason::CANCEL);
         self.response = None;
         self.receive = None;

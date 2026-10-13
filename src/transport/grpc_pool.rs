@@ -1,6 +1,6 @@
 //! Node-owned gRPC physical connections. Policy matches Mihomo's two threshold
 //! branches; bounded idle retention does not impose a business-flow quota.
-use super::h2_write::{Sender, Writes};
+use super::h2_write::{Payload, Sender, Writes};
 use crate::{config::GrpcOptions, dispatch::BoxStream};
 use std::{
     future::Future,
@@ -34,6 +34,7 @@ enum RequestKind<'a> {
 pub struct GrpcPool {
     options: GrpcOptions,
     half_close: bool,
+    empty_data: bool,
     connections: Arc<SyncMutex<Vec<Connection>>>,
     opening: Mutex<()>,
     admission: SyncMutex<()>,
@@ -46,6 +47,7 @@ impl GrpcPool {
         Self {
             options,
             half_close: false,
+            empty_data: false,
             connections: Arc::default(),
             opening: Mutex::default(),
             admission: SyncMutex::default(),
@@ -62,6 +64,7 @@ impl GrpcPool {
             ..Default::default()
         });
         pool.idle_timeout = Some(Duration::from_secs(30));
+        pool.empty_data = true;
         pool
     }
     #[cfg(feature = "outbound-masque")]
@@ -257,6 +260,11 @@ impl GrpcPool {
         }
     }
     async fn establish(&self, raw: BoxStream) -> io::Result<Connection> {
+        let empty = self.empty_data.then(super::h2_empty::Registry::default);
+        let raw = match &empty {
+            Some(registry) => registry.wrap(raw),
+            None => raw,
+        };
         let last_read = Arc::new(SyncMutex::new(Instant::now()));
         let (raw, writes) = Writes::wrap(raw);
         let (sender, mut connection) = h2::client::Builder::new()
@@ -275,7 +283,7 @@ impl GrpcPool {
             .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
         let mut ping = connection.ping_pong().expect("single PING owner");
         let closed = Arc::new(AtomicBool::new(false));
-        let lifetime = Lifetime(closed.clone());
+        let lifetime = Lifetime(closed.clone(), empty.clone());
         let token = self.cancellation.child_token();
         let cancellation = token.clone();
         let interval = self.options.ping_interval;
@@ -343,6 +351,7 @@ impl GrpcPool {
                 request: sender,
                 writes,
             },
+            empty,
             closed,
             active,
             idle_since,
@@ -355,6 +364,11 @@ impl GrpcPool {
     }
     pub fn begin_shutdown(&self) {
         let _admission = self.admission.lock().unwrap();
+        for connection in self.connections.lock().unwrap().iter() {
+            if let Some(registry) = &connection.empty {
+                registry.stop();
+            }
+        }
         self.cancellation.cancel();
         self.tasks.close();
     }
@@ -366,7 +380,7 @@ impl GrpcPool {
 }
 impl Drop for GrpcPool {
     fn drop(&mut self) {
-        self.cancellation.cancel();
+        self.begin_shutdown();
     }
 }
 
@@ -918,6 +932,7 @@ mod tests {
 }
 struct Connection {
     sender: Sender,
+    empty: Option<super::h2_empty::Registry>,
     active: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
     token: CancellationToken,
@@ -942,18 +957,26 @@ impl Connection {
                 pool: Arc::downgrade(pool),
                 idle_since: self.idle_since.clone(),
                 activity: self.activity.clone(),
+                empty: self.empty.clone(),
+                ticket: None,
             },
         ))
     }
 }
 impl Drop for Connection {
     fn drop(&mut self) {
+        if let Some(registry) = &self.empty {
+            registry.stop();
+        }
         self.token.cancel();
     }
 }
-struct Lifetime(Arc<AtomicBool>);
+struct Lifetime(Arc<AtomicBool>, Option<super::h2_empty::Registry>);
 impl Drop for Lifetime {
     fn drop(&mut self) {
+        if let Some(registry) = &self.1 {
+            registry.stop();
+        }
         self.0.store(true, Ordering::Release);
     }
 }
@@ -964,14 +987,41 @@ pub(super) struct Lease {
     pool: std::sync::Weak<SyncMutex<Vec<Connection>>>,
     idle_since: Arc<SyncMutex<Option<Instant>>>,
     activity: Arc<tokio::sync::Notify>,
+    empty: Option<super::h2_empty::Registry>,
+    ticket: Option<super::h2_empty::Ticket>,
 }
 impl Lease {
+    pub(super) fn request(
+        &mut self,
+        sender: &mut h2::client::SendRequest<Payload>,
+        request: http::Request<()>,
+        end: bool,
+    ) -> Result<(h2::client::ResponseFuture, super::h2_empty::Send), h2::Error> {
+        if let Some(registry) = &self.empty {
+            let (response, send, ticket) = registry.request(sender, request, end)?;
+            self.ticket = Some(ticket);
+            Ok((response, send))
+        } else {
+            sender
+                .send_request(request, end)
+                .map(|(response, send)| (response, send.into()))
+        }
+    }
+    pub(super) fn admission(&self) -> Option<super::h2_empty::Admission> {
+        self.ticket.as_ref().map(super::h2_empty::Ticket::admission)
+    }
+    pub(super) fn close_stream(&self) {
+        if let Some(ticket) = &self.ticket {
+            ticket.close();
+        }
+    }
     pub(super) fn stopped(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 }
 impl Drop for Lease {
     fn drop(&mut self) {
+        self.ticket.take();
         let pool = self.pool.upgrade();
         let mut connections = pool.as_ref().map(|pool| pool.lock().unwrap());
         if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {

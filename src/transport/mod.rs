@@ -36,6 +36,8 @@ mod grpc;
 #[cfg(feature = "stream-transport")]
 mod grpc_pool;
 #[cfg(feature = "stream-transport")]
+mod h2_empty;
+#[cfg(feature = "stream-transport")]
 mod h2_write;
 #[cfg(feature = "stream-transport")]
 pub use grpc::{Driver as StreamDriver, grpc, grpc_duplex, legacy_h2};
