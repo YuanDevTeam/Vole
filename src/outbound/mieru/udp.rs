@@ -264,8 +264,8 @@ impl Reliable {
         }
         self.request_ack(now);
         let seq = sequence(frame.metadata);
-        if seq < self.state.next_receive.load(Ordering::Acquire) || self.reorder.contains_key(&seq)
-        {
+        let next_receive = self.state.next_receive.load(Ordering::Acquire);
+        if seq < next_receive || self.reorder.contains_key(&seq) {
             return;
         }
         if partial
@@ -274,7 +274,8 @@ impl Reliable {
         {
             return; // A retransmission must never deliver the prefix twice.
         }
-        if self.reorder.len() + self.state.unread_segments() >= SEGMENTS {
+        let segment_limit = SEGMENTS - usize::from(seq != next_receive);
+        if self.reorder.len() + self.state.unread_segments() >= segment_limit {
             return;
         }
         if self.small_budget() && !frame.payload.is_empty() {
@@ -293,6 +294,21 @@ impl Reliable {
                 payload: Bytes::copy_from_slice(&frame.payload),
                 offset: 0,
             });
+            return;
+        }
+        // Future DATA must leave one complete receive segment's credit for
+        // the gap. Reorder and unread chunks share this same byte budget;
+        // otherwise a full reorder buffer can permanently reject the packet
+        // required to make any of its buffered data readable.
+        if seq != next_receive
+            && !frame.payload.is_empty()
+            && self
+                .state
+                .receive_bytes
+                .available_permits()
+                .saturating_sub(frame.payload.len())
+                < self.receive_chunk
+        {
             return;
         }
         let Ok(permit) = self
@@ -1509,6 +1525,85 @@ mod tests {
             .await;
         assert!(probe.snapshot().is_idle());
     }
+    #[test]
+    fn mieru_udp_reorder_gap_keeps_receive_credit() {
+        const CHUNK: usize = 32;
+        const CAPACITY: usize = 3 * CHUNK;
+        let cancellation = CancellationToken::new();
+        let state = State::new(
+            1,
+            CAPACITY,
+            &cancellation,
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let mut reliable = Reliable::new(state.clone(), CHUNK);
+        let mut partial = None;
+        reliable.input(
+            Frame {
+                metadata: Metadata::Session(SessionMetadata {
+                    kind: SessionKind::OpenResponse,
+                    session_id: 1,
+                    sequence: 0,
+                    status: 0,
+                }),
+                payload: Bytes::new(),
+            },
+            Instant::now(),
+            &mut partial,
+        );
+        let frame = |sequence: u32| Frame {
+            metadata: Metadata::Data(DataMetadata {
+                kind: DataKind::ServerData,
+                session_id: 1,
+                sequence,
+                unack_sequence: 0,
+                window: 16,
+                fragment: 0,
+            }),
+            payload: Bytes::from(vec![sequence as u8; CHUNK]),
+        };
+        assert!(!reliable.small_budget());
+        // A missing seq1 followed by a burst of future DATA must not consume
+        // the credit seq1 needs to unblock the actual receive queue.
+        for sequence in 2..=4 {
+            reliable.input(frame(sequence), Instant::now(), &mut partial);
+        }
+        assert_eq!(state.next_receive.load(Ordering::Acquire), 1);
+        reliable.input(frame(1), Instant::now(), &mut partial);
+        assert_eq!(
+            state.next_receive.load(Ordering::Acquire),
+            4,
+            "future DATA exhausted the missing segment's receive credit"
+        );
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        for sequence in 1..=3 {
+            let mut bytes = [0; CHUNK];
+            let mut read = tokio::io::ReadBuf::new(&mut bytes);
+            assert!(matches!(
+                state.poll_read(&mut context, &mut read),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            assert_eq!(read.filled(), &[sequence; CHUNK]);
+        }
+        assert_eq!(state.receive_bytes.available_permits(), CAPACITY);
+        // The future seq4 may be dropped to keep the missing-segment credit.
+        // Its real retransmission succeeds once application reads free bytes.
+        reliable.input(frame(4), Instant::now(), &mut partial);
+        let mut bytes = [0; CHUNK];
+        let mut read = tokio::io::ReadBuf::new(&mut bytes);
+        assert!(matches!(
+            state.poll_read(&mut context, &mut read),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert_eq!(read.filled(), &[4; CHUNK]);
+        assert_eq!(state.next_receive.load(Ordering::Acquire), 5);
+        assert!(reliable.reorder.is_empty());
+        assert!(partial.is_none());
+        assert_eq!(state.receive_bytes.available_permits(), CAPACITY);
+        state.close();
+    }
+
     #[test]
     fn mieru_udp_partial_slot_keeps_byte_credit_and_control_live() {
         let cancellation = CancellationToken::new();
