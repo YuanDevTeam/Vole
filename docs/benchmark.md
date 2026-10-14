@@ -90,7 +90,7 @@ xychart
     bar [0.0000, 0.0396, 0.0001, 0.1892, 0.5123, 0.6432, 0.1710, 0.4699, 0.0382, 0.3789]
 ```
 
-## macOS 模拟 TUN（实验）
+## macOS 模拟 TUN（历史失败结果）
 
 Vole `1d569ee`，运行时代码为 `7fbb5f4`；60 秒、32 条双向 TCP echo 与 32 条 UDP echo、1000 DNS QPS，完整 CN GeoData、DIRECT 和 Controller。原站位于同规格 Linux 容器，Mac 运行普通 CLI 与独立负载客户端。实际吞吐为活动窗口内经内容校验的 echo 有效载荷乘二；内存为每 20 ms 采样的最大当前 physical footprint，不与 Linux RSS 混合排名。
 
@@ -166,4 +166,4 @@ xychart
     bar [0.0000, 0.0009]
 ```
 
-两档均未通过压力验收：实际吞吐与 DNS 完成不足，1 Gbps 还存在 TCP 关闭未完整完成。Mac 入口保留为实验工具，正式压力继续使用 Linux；这些采样结果不能证明 iOS/tvOS Network Extension 的真机内存达标。
+两档均未通过压力验收：实际吞吐与 DNS 完成不足，1 Gbps 还存在 TCP 关闭未完整完成。Mac 模拟测试工具已删除，正式压力使用 Linux；这些采样结果不能证明 iOS/tvOS Network Extension 的真机内存达标。

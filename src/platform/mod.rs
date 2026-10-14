@@ -8,11 +8,7 @@ pub(crate) mod apple_logging;
 pub(crate) mod linux_network;
 #[cfg(all(target_os = "linux", feature = "tun"))]
 mod linux_tun;
-#[cfg(all(
-    feature = "invoke",
-    any(target_os = "ios", target_os = "tvos", target_os = "macos")
-))]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(all(feature = "invoke", feature = "low-memory"))]
 pub(crate) mod process_memory;
 #[cfg(all(unix, feature = "tun"))]
 mod tun_fd;

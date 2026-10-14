@@ -63,14 +63,11 @@ pub const TUIC_PENDING_BYTES: usize = 256 * 1024;
 pub const TUIC_FRAGMENT_TTL_SECONDS: usize = 5;
 pub const TUIC_FIN_GRACE_SECONDS: usize = 5;
 
-/// Historical iOS TUN footprint target retained for best-effort telemetry.
-///
-/// Crossing this value never changes a runtime lifecycle result.
-pub const IOS_TUN_PEAK_OBSERVATION_TARGET_BYTES: u64 = 45 * 1024 * 1024;
+/// Low-memory process observation ceiling, never lifecycle admission.
+pub const LOW_MEMORY_OBSERVATION_CEILING_BYTES: u64 = 45 * 1024 * 1024;
 
-/// Historical iOS TUN start-footprint target retained for best-effort
-/// telemetry. Crossing this value never prevents the runtime from starting.
-pub const IOS_TUN_START_OBSERVATION_TARGET_BYTES: u64 = 35 * 1024 * 1024;
+/// Low-memory process observation target, never lifecycle admission.
+pub const LOW_MEMORY_OBSERVATION_TARGET_BYTES: u64 = 35 * 1024 * 1024;
 
 /// Fixed stack used by each bootstrap resolver worker.
 pub(crate) const DNS_WORKER_STACK_BYTES: usize = 512 * 1024;

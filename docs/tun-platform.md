@@ -48,21 +48,16 @@ Linux 压测可以把 TUN 创建在客户端 namespace，再把借用 fd 交给�
 首轮验证为 GNU/glibc 原生构建与容器真实 TUN；musl、其他架构、安装交付和设备验收
 不由一次 Linux 容器压测推导。Linux RSS/VmHWM 与 Apple physical footprint 分开报告。
 
-tvOS 首版为 17.0+、ARM64 真机和 Apple Silicon 模拟器，共用原有 TunIo、netstack 和
-Dialer；不新增低内存数量上限，不改变其他平台默认行为。iOS/tvOS 的 TUN 生命周期接入
-Apple Unified Logging、TASK_VM_INFO 当前/进程峰值观察及停止后的 allocator pressure relief。
-既有 35/40/45 MiB 阈值仅发出诊断，不是系统限额或业务准入条件；macOS 不启用这组
-移动扩展周期采样。tvOS 事件使用 tvos_memory_*，iOS 保留 ios_memory_*。
-验收按平台区分：iOS/tvOS 的整个扩展进程 footprint 必须低于 45 MiB，常规压力
-优化目标为 35 MiB；其他平台以吞吐为先，后台 Core 进程内存硬上限为 100 MiB。
-这些预算不改变现有缓冲、队列或业务准入，完整口径见[验收边界](acceptance.md)。
+tvOS 首版为 17.0+、ARM64 真机和 Apple Silicon 模拟器，共用 TunIo、netstack 和
+Dialer。低内存策略由 `low-memory` 编译 feature 显式启用，不由 iOS/tvOS 判断；
+同一 feature 也可在其他平台构建和验证。它控制 TUN 内存诊断、allocator 配置和
+Stop 后回收，当前缓冲、队列和线程策略不区分模式。真实 iOS/tvOS 扩展的 footprint
+仍须低于 45 MiB，常规压力目标为 35 MiB；完整口径见[验收边界](acceptance.md)。
 
 Apple 公开 NEPacketTunnelFlow API 是 packetFlow 的包读写，不承诺可取得 raw fd。
-Vole 的借用 fd 契约不能证明宿主 KVC 提取 fd 是稳定公开方案。macOS 普通 CLI 也可以借用
-宿主创建的非阻塞 Unix datagram socketpair，通过 Apple 四字节 PI 交换合成 IP 包；
-仍使用 `tun.file-descriptor` 和普通 CLI 启动，不需要额外 API 或配置字段。
-socketpair 只验证合成 utun 数据面；真实宿主的 fd 获取/桥接、签名与 entitlement、系统路由、设备生命周期
-及物理内存须独立验收。当前没有新增 packetFlow 回调 ABI，也不暗中回退其他接入路径。
+Vole 的借用 fd 契约不能证明宿主 KVC 提取 fd 是稳定公开方案。真实宿主的 fd 获取/桥接、
+签名与 entitlement、系统路由、设备生命周期及物理内存须独立验收。
+当前没有新增 packetFlow 回调 ABI，也不暗中回退其他接入路径。
 
 包 I/O 规则：
 

@@ -2,7 +2,7 @@
 use super::{
     CoreController, InvokeFailure, StartupConfig, invoke_instance_guarded, lock, registry,
 };
-use crate::config::{Config, InboundConfig};
+use crate::config::Config;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -199,35 +199,11 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
         let mut cleanup = ForegroundInstance(Some(controller.clone()));
         let config = super::parse_config_yaml(&yaml).map_err(|_| failure("core startup failed"))?;
         drop(yaml);
-        configure_foreground_allocator(&config);
         let result = run_controller(controller, config, signals.wait()).await;
         let stopped = cleanup.destroy();
         result.and(stopped)
     })?;
     Ok(json!({"output":"","diagnostics":""}))
-}
-
-fn configure_foreground_allocator(config: &Config) {
-    let has_tun = config
-        .inbounds
-        .iter()
-        .any(|inbound| matches!(inbound, InboundConfig::Tun(_)));
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    if has_tun
-        && std::env::var_os("MALLOC_ARENA_MAX").is_none()
-        && std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none()
-        && std::env::var_os("GLIBC_TUNABLES").is_none()
-    {
-        // SAFETY: the process-owned foreground instance has been admitted,
-        // and its Core workers have not started. glibc's public initialization
-        // interface takes integers and retains no caller-owned pointers.
-        // A refused hint preserves the system allocator's behavior.
-        let _ = unsafe { libc::mallopt(libc::M_ARENA_MAX, 1) };
-        // Keep released large arrays and buffers from raising glibc's dynamic
-        // threshold and retaining subsequent allocations inside the arena.
-        let _ = unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 32 * 1024) };
-    }
-    let _ = has_tun;
 }
 
 fn validate_bytes(bytes: Vec<u8>, directory: &Path) -> Result<(), InvokeFailure> {

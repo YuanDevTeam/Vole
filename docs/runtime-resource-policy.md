@@ -257,15 +257,28 @@ DFA 缓存各 512 KiB；不接受递归、条件式和控制动词。每次复�
 GeoData 行为见 [规则与资产](geodata.md)。性能与压力测试由独立容器测试工具执行，
 公开结果见 [benchmark](benchmark.md)，原始记录保留在对应运行中。
 
-## Apple 内存遥测
+## 低内存编译模式
 
-iOS/tvOS TUN 通过 `TASK_VM_INFO` 尽力记录当前 physical footprint、进程生命周期峰值和限频阈值事件，运行期间最多每 30 秒采样一次。macOS 不启用该周期任务；平台接入与事件标识见 [TUN 平台层](tun-platform.md)。
+Cargo `low-memory` feature 显式选择低内存策略，缺省关闭，与操作系统无关。
+CLI 和 FFI 使用同一 Invoke 启动路径，不新增 YAML 字段或 Invoke 参数。
+当前两种构建共享上述队列、缓冲、缓存、QUIC 窗口与线程策略。
 
-- 采样失败只记录一次警告；
-- 遥测不写入 `lastError`；
-- 读数和阈值越界不改变 prepare、start、running、stop 或 panic recovery；
-- 停止后的 allocator pressure relief 同样是尽力而为；
-- 固定阈值只是诊断信号，不是产品内存承诺或 admission gate。
+启用后，TUN 在生命周期边界及运行期间每 30 秒尽力记录进程内存和限频阈值事件。
+Apple 使用 `TASK_VM_INFO` 的当前与生命周期峰值 physical footprint；Linux 使用
+procfs 的 VmRSS/VmHWM。其他平台的采样不可用时只报告一次诊断，不伪造读数。
+
+GNU/Linux 的低内存 TUN 在工作线程启动前，进程内一次性尝试设置 glibc arena 为 1、
+mmap 阈值为 32 KiB；显式 `MALLOC_ARENA_MAX`、`MALLOC_MMAP_THRESHOLD_` 或
+`GLIBC_TUNABLES` 覆盖优先。该 feature 是对进程级 allocator 策略的显式选择。
+Stop 的同步释放屏障完成后，Apple 通过 malloc zone、GNU/Linux 通过 `malloc_trim`
+尽力归还空闲内存；不支持该接口的平台保留原 allocator 行为。
+
+- 未启用 feature 或未使用 TUN 时不配置 allocator、不启动周期采样或 Stop 回收。
+- 采样失败只记录一次警告，不写入 `lastError`。
+- 35/40/45 MiB 阈值仅作诊断，不改变 prepare、start、running、stop 或 panic recovery。
+- Stop 后的 allocator 回收只执行一次且尽力而为，不保证立即降低进程内存。
+
+内存预算与真实设备范围见[验收边界](acceptance.md)。
 
 ## 日志与观测
 

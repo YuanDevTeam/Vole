@@ -112,6 +112,12 @@ def _production_features(features: str) -> str:
     return features
 
 
+def _memory_features(features: str, low_memory: bool) -> str:
+    if low_memory and "low-memory" not in re.split(r"[,\s]+", features):
+        return features + ",low-memory"
+    return features
+
+
 def _cargo_build(
     target: str,
     profile_flags: list[str],
@@ -183,9 +189,11 @@ def prepare_native_dependencies(
         print(entry)
 
 
-def build_cli(target: str | None = None, profile: str = "release") -> Path:
+def build_cli(
+    target: str | None = None, profile: str = "release", *, low_memory: bool = False
+) -> Path:
     target = native_target() if target is None else target
-    features = cli_features(target)
+    features = _memory_features(cli_features(target), low_memory)
     system, architecture = CLI_TARGETS[target]
     if platform.system() != system:
         raise RuntimeError("CLI target must use the build host operating system")
@@ -211,7 +219,7 @@ def build_cli(target: str | None = None, profile: str = "release") -> Path:
     return artifact
 
 
-def build_linux(target: str | None = None) -> Path:
+def build_linux(target: str | None = None, *, low_memory: bool = False) -> Path:
     if platform.system() != "Linux":
         raise RuntimeError("Linux artifacts must be built on native Linux")
     native = native_target()
@@ -220,7 +228,12 @@ def build_linux(target: str | None = None) -> Path:
         raise ValueError("Linux FFI build requires the native GNU Rust target")
     architecture = CLI_TARGETS[target][1]
     environment = os.environ.copy()
-    release = _cargo_build(target, ["--release"], DEFAULT_FEATURES, environment)
+    release = _cargo_build(
+        target,
+        ["--release"],
+        _memory_features(DEFAULT_FEATURES, low_memory),
+        environment,
+    )
     output = CORE_DIR / "dist/linux" / architecture
     shutil.rmtree(output, ignore_errors=True)
     (output / "include").mkdir(parents=True)
@@ -309,13 +322,15 @@ def _android_ndk_home() -> Path:
     return max(candidates, key=lambda candidate: candidate[0])[1].resolve()
 
 
-def build_android() -> Path:
+def build_android(*, low_memory: bool = False) -> Path:
     if platform.system() not in {"Darwin", "Linux"}:
         raise RuntimeError("Android artifacts must be built on macOS or Linux")
     ndk_home = _android_ndk_home()
     android_api = _env("VOLE_ANDROID_API", "24")
     profile_name, profile_flags = _profile()
-    features = _production_features(_env("VOLE_FEATURES", DEFAULT_FEATURES))
+    features = _memory_features(
+        _production_features(_env("VOLE_FEATURES", DEFAULT_FEATURES)), low_memory
+    )
     targets = _env(
         "VOLE_ANDROID_TARGETS", "aarch64-linux-android x86_64-linux-android"
     ).split()
@@ -395,13 +410,15 @@ def build_android() -> Path:
     return output
 
 
-def build_apple_target(target: str) -> Path:
+def build_apple_target(target: str, *, low_memory: bool = False) -> Path:
     if platform.system() != "Darwin":
         raise RuntimeError("Apple artifacts must be built on macOS")
     if target not in APPLE_TARGETS:
         raise ValueError("unsupported Apple Rust target")
     profile_name, profile_flags = _profile()
-    features = _production_features(_env("VOLE_FEATURES", DEFAULT_FEATURES))
+    features = _memory_features(
+        _production_features(_env("VOLE_FEATURES", DEFAULT_FEATURES)), low_memory
+    )
     env = os.environ.copy()
     env["IPHONEOS_DEPLOYMENT_TARGET"] = _env("VOLE_IOS_DEPLOYMENT_TARGET", "13.0")
     env["MACOSX_DEPLOYMENT_TARGET"] = _env("VOLE_MACOS_DEPLOYMENT_TARGET", "10.15")
@@ -483,8 +500,11 @@ def assemble_apple(artifacts: dict[str, Path]) -> Path:
     return dist
 
 
-def build_apple() -> Path:
-    artifacts = {target: build_apple_target(target) for target in APPLE_TARGETS}
+def build_apple(*, low_memory: bool = False) -> Path:
+    artifacts = {
+        target: build_apple_target(target, low_memory=low_memory)
+        for target in APPLE_TARGETS
+    }
     return assemble_apple(artifacts)
 
 
@@ -587,10 +607,10 @@ def _windows_msvc_environment(architecture: str) -> dict[str, str]:
     return env
 
 
-def build_windows(backend: str = "uwp") -> Path:
+def build_windows(backend: str = "uwp", *, low_memory: bool = False) -> Path:
     if platform.system() != "Windows":
         raise RuntimeError("Windows artifacts must be built on Windows")
-    features = windows_features(backend)
+    features = _memory_features(windows_features(backend), low_memory)
     architecture = _windows_architecture()
     env = _windows_msvc_environment(architecture)
     output = CORE_DIR / "dist" / "windows" / architecture / backend

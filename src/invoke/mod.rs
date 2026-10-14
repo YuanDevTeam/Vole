@@ -141,7 +141,7 @@ struct CoreInner {
     engine: Option<Engine>,
     last_error: String,
     tun_lease: Option<TunLease>,
-    apple_tun_allocator_relief: Option<AppleTunAllocatorRelief>,
+    tun_allocator_relief: Option<TunAllocatorRelief>,
 }
 
 struct PreparedState {
@@ -178,20 +178,20 @@ impl Drop for TunLease {
 }
 
 #[derive(Clone)]
-struct AppleTunAllocatorRelief {
-    state: Arc<AppleTunAllocatorReliefState>,
+struct TunAllocatorRelief {
+    state: Arc<TunAllocatorReliefState>,
 }
 
-struct AppleTunAllocatorReliefState {
+struct TunAllocatorReliefState {
     relieved: AtomicBool,
 }
 
-impl AppleTunAllocatorRelief {
+impl TunAllocatorRelief {
     fn new(has_tun: bool) -> Option<Self> {
-        #[cfg(any(target_os = "ios", target_os = "tvos"))]
+        #[cfg(feature = "low-memory")]
         if has_tun {
             return Some(Self {
-                state: Arc::new(AppleTunAllocatorReliefState {
+                state: Arc::new(TunAllocatorReliefState {
                     relieved: AtomicBool::new(false),
                 }),
             });
@@ -201,17 +201,21 @@ impl AppleTunAllocatorRelief {
     }
 
     fn relieve(&self) {
-        if !self.state.relieved.swap(true, Ordering::AcqRel) {
-            relieve_apple_tun_allocator();
+        self.state.relieve_with(relieve_tun_allocator);
+    }
+}
+
+impl TunAllocatorReliefState {
+    fn relieve_with(&self, relief: impl FnOnce()) {
+        if !self.relieved.swap(true, Ordering::AcqRel) {
+            relief();
         }
     }
 }
 
-impl Drop for AppleTunAllocatorReliefState {
+impl Drop for TunAllocatorReliefState {
     fn drop(&mut self) {
-        if !self.relieved.swap(true, Ordering::AcqRel) {
-            relieve_apple_tun_allocator();
-        }
+        self.relieve_with(relieve_tun_allocator);
     }
 }
 
@@ -898,7 +902,11 @@ impl CoreController {
             tun_lease,
             protector,
         } = acquisition;
-        let allocator_relief = AppleTunAllocatorRelief::new(has_tun);
+        #[cfg(feature = "low-memory")]
+        if has_tun {
+            crate::platform::process_memory::configure_allocator();
+        }
+        let allocator_relief = TunAllocatorRelief::new(has_tun);
         {
             let mut inner = lock(&self.inner);
             inner.last_error.clear();
@@ -907,7 +915,7 @@ impl CoreController {
                 .transition(LifecycleState::Preparing)
                 .map_err(InvokeFailure::from)?;
             inner.tun_lease = tun_lease;
-            inner.apple_tun_allocator_relief = allocator_relief;
+            inner.tun_allocator_relief = allocator_relief;
         }
 
         let prepared = (|| {
@@ -946,7 +954,7 @@ impl CoreController {
                     .map_err(InvokeFailure::from)
                 {
                     Ok(()) => {
-                        observe_apple_tun_memory(has_tun, "prepare-complete");
+                        observe_tun_memory(has_tun, "prepare-complete");
                         Ok(())
                     }
                     Err(error) => reset_failed_operation(&mut inner, "prepare-transition-failed")
@@ -996,7 +1004,7 @@ impl CoreController {
                 .lifecycle
                 .transition(LifecycleState::Starting)
                 .map_err(InvokeFailure::from)?;
-            let allocator_relief = inner.apple_tun_allocator_relief.clone();
+            let allocator_relief = inner.tun_allocator_relief.clone();
             (prepared, tun, has_tun, allocator_relief)
         };
 
@@ -1054,7 +1062,7 @@ impl CoreController {
                         .and(Err(error));
                 }
                 inner.engine = Some(engine);
-                observe_apple_tun_memory(has_tun, "start-complete");
+                observe_tun_memory(has_tun, "start-complete");
                 Ok(())
             }
             Ok(Err(error)) => {
@@ -1094,7 +1102,7 @@ impl CoreController {
                 LifecycleState::Stopped => {
                     let had_tun = inner.tun_lease.is_some();
                     inner.last_error.clear();
-                    observe_apple_tun_memory(had_tun, "stop-complete");
+                    observe_tun_memory(had_tun, "stop-complete");
                     clear_instance_leases(&mut inner);
                     return Ok(());
                 }
@@ -1106,7 +1114,7 @@ impl CoreController {
                         .lifecycle
                         .transition(LifecycleState::Stopped)
                         .map_err(InvokeFailure::from);
-                    observe_apple_tun_memory(had_tun, "stop-complete");
+                    observe_tun_memory(had_tun, "stop-complete");
                     clear_instance_leases(&mut inner);
                     return transitioned;
                 }
@@ -1211,7 +1219,7 @@ impl CoreController {
         let mut inner = lock(&self.inner);
         inner.lifecycle = Lifecycle::default();
         inner.engine = None;
-        observe_apple_tun_memory(had_tun, "panic-recovery");
+        observe_tun_memory(had_tun, "panic-recovery");
         clear_instance_leases(&mut inner);
         Ok(())
     }
@@ -1220,20 +1228,20 @@ impl CoreController {
 fn clear_instance_leases(inner: &mut CoreInner) {
     // Prepared-only paths own the final allocator-relief handle here. Running
     // paths share it with the engine, whose completion performs relief first.
-    inner.apple_tun_allocator_relief = None;
+    inner.tun_allocator_relief = None;
     inner.tun_lease = None;
 }
 
-fn observe_apple_tun_memory(has_tun: bool, stage: &'static str) {
-    #[cfg(any(target_os = "ios", target_os = "tvos"))]
+fn observe_tun_memory(has_tun: bool, stage: &'static str) {
+    #[cfg(feature = "low-memory")]
     if has_tun {
         crate::platform::process_memory::observe(stage);
     }
     let _ = (has_tun, stage);
 }
 
-fn relieve_apple_tun_allocator() {
-    #[cfg(any(target_os = "ios", target_os = "tvos"))]
+fn relieve_tun_allocator() {
+    #[cfg(feature = "low-memory")]
     crate::platform::process_memory::relieve_allocator_pressure();
 }
 
@@ -1332,7 +1340,7 @@ fn acquire_start_tun(
 struct EngineContext {
     instance_id: u64,
     has_tun: bool,
-    allocator_relief: Option<AppleTunAllocatorRelief>,
+    allocator_relief: Option<TunAllocatorRelief>,
 }
 
 fn run_engine(
@@ -1350,7 +1358,7 @@ fn run_engine(
     } = context;
     tracing::info!(instance_id, has_tun, "Vole runtime engine starting");
     let result = run_engine_inner(instance_id, has_tun, prepared, tun, dialer, stop, startup);
-    observe_apple_tun_memory(has_tun, "stop-complete");
+    observe_tun_memory(has_tun, "stop-complete");
     if let Some(relief) = allocator_relief {
         relief.relieve();
     }
@@ -1461,9 +1469,9 @@ fn run_engine_inner(
 }
 
 async fn wait_for_engine_shutdown(stop: oneshot::Receiver<()>, has_tun: bool) -> io::Result<()> {
-    #[cfg(any(target_os = "ios", target_os = "tvos"))]
+    #[cfg(feature = "low-memory")]
     let mut stop = stop;
-    #[cfg(any(target_os = "ios", target_os = "tvos"))]
+    #[cfg(feature = "low-memory")]
     if has_tun {
         let interval = crate::platform::process_memory::TELEMETRY_INTERVAL;
         let first_tick = tokio::time::Instant::now() + interval;
@@ -1472,7 +1480,7 @@ async fn wait_for_engine_shutdown(stop: oneshot::Receiver<()>, has_tun: bool) ->
         loop {
             tokio::select! {
                 _ = &mut stop => return Ok(()),
-                _ = telemetry.tick() => observe_apple_tun_memory(true, "running"),
+                _ = telemetry.tick() => observe_tun_memory(true, "running"),
             }
         }
     }
@@ -1527,7 +1535,7 @@ fn reset_failed_operation(
         }
         LifecycleState::Stopped => {}
     }
-    observe_apple_tun_memory(had_tun, telemetry_stage);
+    observe_tun_memory(had_tun, telemetry_stage);
     clear_instance_leases(inner);
     Ok(())
 }
@@ -1576,6 +1584,45 @@ mod tests {
     use std::{ffi::CStr, ptr};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn allocator_relief_requires_low_memory_build_and_tun() {
+        assert!(TunAllocatorRelief::new(false).is_none());
+        let relief = TunAllocatorRelief::new(true);
+        assert_eq!(relief.is_some(), cfg!(feature = "low-memory"));
+        if let Some(relief) = relief {
+            // Claim with a pure hook so this regression never trims the test
+            // process's allocator as a side effect of dropping the handle.
+            relief.state.relieve_with(|| {});
+        }
+    }
+
+    #[test]
+    fn shared_allocator_relief_is_claimed_exactly_once() {
+        let state = Arc::new(TunAllocatorReliefState {
+            relieved: AtomicBool::new(false),
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts: Vec<_> = (0..8)
+            .map(|_| {
+                let state = state.clone();
+                let calls = calls.clone();
+                thread::spawn(move || {
+                    state.relieve_with(|| {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                    });
+                })
+            })
+            .collect();
+        for attempt in attempts {
+            attempt.join().unwrap();
+        }
+        state.relieve_with(|| {
+            calls.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(state.relieved.load(Ordering::Relaxed));
+    }
 
     struct TestDataDirectory {
         _temporary: tempfile::TempDir,
