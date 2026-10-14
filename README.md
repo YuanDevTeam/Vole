@@ -119,7 +119,7 @@ One public instance follows `initialize → createInstance → start(configYaml)
 
 ## Benchmark
 
-[Vole / Mihomo TUN benchmark](docs/benchmark.md)
+[Vole TUN benchmark](docs/benchmark.md)
 
 ## Documentation
 
