@@ -76,6 +76,16 @@ impl ReadyFlow {
     }
 
     pub fn enqueue(self: &Arc<Self>) {
+        self.enqueue_inner(true);
+    }
+
+    /// Requeue a ready flow at the FIFO tail while its receiver is polling.
+    /// The caller must explicitly wake if it exhausts its work budget.
+    pub fn requeue(self: &Arc<Self>) {
+        self.enqueue_inner(false);
+    }
+
+    fn enqueue_inner(self: &Arc<Self>, notify_parent: bool) {
         let Some(queue) = self.queue.upgrade() else {
             return;
         };
@@ -90,7 +100,9 @@ impl ReadyFlow {
             entries.push_back(self.clone());
         }
         // A parent wake is allowed to poll immediately and reacquire the locks.
-        queue.parent.wake();
+        if notify_parent {
+            queue.parent.wake();
+        }
     }
 
     /// Permanently retire this registration, including its outstanding item.

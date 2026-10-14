@@ -1371,7 +1371,7 @@ impl RoutedDatagramTransport {
             match flow.transport.poll_receive(&mut flow_context, scratch) {
                 Poll::Pending => {}
                 Poll::Ready(Ok(mut datagram)) => {
-                    wake.enqueue();
+                    wake.requeue();
                     if flow.restore {
                         if datagram.remote != flow.destination {
                             continue;
@@ -2256,6 +2256,150 @@ mod tests {
             RuleSet::compile(rules).unwrap(),
             Arc::new(EmptyGeoMatcher),
         )
+    }
+
+    #[derive(Default)]
+    struct ManagedWakeCount(AtomicUsize);
+    impl futures_util::task::ArcWake for ManagedWakeCount {
+        fn wake_by_ref(owner: &Arc<Self>) {
+            owner.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn managed_wake_fixture() -> (
+        RoutedDatagramTransport,
+        Arc<RecordingDispatcher>,
+        Arc<crate::connections::Registry>,
+    ) {
+        let config =
+            crate::config::Config::parse_yaml(b"mixed-port: 1080\nrules: [\"MATCH,DIRECT\"]\n")
+                .unwrap();
+        let direct = Arc::new(RecordingDispatcher {
+            pollable: true,
+            ..Default::default()
+        });
+        let rules = RuleSet::compile(config.rules.clone()).unwrap();
+        let registry = Arc::new(crate::connections::Registry::default());
+        let diagnostics = Arc::new(crate::routing::diagnostics::Diagnostics::new(
+            &config,
+            &rules,
+            registry.clone(),
+        ));
+        let router = RoutingDispatcher::new(
+            ProxyDispatchers::new(Vec::new()).unwrap(),
+            direct.clone(),
+            None,
+            rules,
+            Arc::new(EmptyGeoMatcher),
+        )
+        .with_diagnostics(diagnostics);
+        (
+            router.routed_datagrams(association(InboundKind::Socks5)),
+            direct,
+            registry,
+        )
+    }
+
+    fn poll_managed_test(
+        transport: &mut RoutedDatagramTransport,
+        cx: &mut Context<'_>,
+    ) -> Poll<(Destination, Option<Result<Datagram, DispatchError>>)> {
+        RoutedDatagramTransport::poll_managed(
+            &mut transport.managed_flows.polled,
+            transport.managed_ready.as_ref().unwrap(),
+            &mut transport.managed_receive_buffer,
+            transport.router.tun_config.udp_timeout,
+            cx,
+        )
+    }
+
+    #[tokio::test]
+    async fn managed_udp_ready_delivery_requeues_without_notifying_its_running_parent() {
+        let (mut transport, direct, registry) = managed_wake_fixture();
+        let endpoint = "198.51.100.1:443".parse().unwrap();
+        transport.send(datagram(endpoint, b"first")).await.unwrap();
+        transport.send(datagram(endpoint, b"second")).await.unwrap();
+        let counter = Arc::new(ManagedWakeCount::default());
+        let parent = futures_util::task::waker(counter.clone());
+        let mut cx = Context::from_waker(&parent);
+        let first = poll_managed_test(&mut transport, &mut cx);
+        let second = poll_managed_test(&mut transport, &mut cx);
+        let notified = counter.0.load(Ordering::Relaxed);
+        let still_queued = !transport.managed_ready.as_ref().unwrap().is_empty();
+        transport.close().await.unwrap();
+        assert!(
+            matches!(first, Poll::Ready((Destination::Ip(remote), Some(Ok(ref value)))) if remote == endpoint && value.payload == Bytes::from_static(b"first"))
+        );
+        assert!(
+            matches!(second, Poll::Ready((Destination::Ip(remote), Some(Ok(ref value)))) if remote == endpoint && value.payload == Bytes::from_static(b"second"))
+        );
+        assert_eq!(
+            notified, 0,
+            "local FIFO requeue scheduled its running parent"
+        );
+        assert!(still_queued, "ready flow lost its next receive opportunity");
+        assert!(transport.managed_ready.as_ref().unwrap().is_empty());
+        assert_eq!(transport.managed_flows.iter().count(), 0);
+        assert_eq!(direct.udp_closes.load(Ordering::Relaxed), 1);
+        assert!(
+            serde_json::to_value(registry.snapshot()).unwrap()["connections"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_udp_pending_receive_and_controller_cancel_keep_external_wakes() {
+        let (mut transport, direct, registry) = managed_wake_fixture();
+        let endpoint = "198.51.100.1:443".parse().unwrap();
+        transport.send(datagram(endpoint, b"first")).await.unwrap();
+        let counter = Arc::new(ManagedWakeCount::default());
+        let parent = futures_util::task::waker(counter.clone());
+        let mut cx = Context::from_waker(&parent);
+        let first = poll_managed_test(&mut transport, &mut cx);
+        let idle = poll_managed_test(&mut transport, &mut cx);
+        counter.0.store(0, Ordering::Relaxed);
+        transport
+            .send(datagram(endpoint, b"external"))
+            .await
+            .unwrap();
+        let ready_wakes = counter.0.load(Ordering::Relaxed);
+        let delivered = poll_managed_test(&mut transport, &mut cx);
+        let cancel_pending = poll_managed_test(&mut transport, &mut cx);
+        let snapshot = serde_json::to_value(registry.snapshot()).unwrap();
+        let id = snapshot["connections"][0]["id"].as_str().unwrap();
+        counter.0.store(0, Ordering::Relaxed);
+        registry.close(id);
+        let cancel_wakes = counter.0.load(Ordering::Relaxed);
+        let cancelled = poll_managed_test(&mut transport, &mut cx);
+        transport.close().await.unwrap();
+        assert!(matches!(first, Poll::Ready((_, Some(Ok(_))))));
+        assert!(idle.is_pending());
+        assert!(
+            ready_wakes > 0,
+            "actual Pending lost the external receive wake"
+        );
+        assert!(
+            matches!(delivered, Poll::Ready((Destination::Ip(remote), Some(Ok(ref value)))) if remote == endpoint && value.payload == Bytes::from_static(b"external"))
+        );
+        assert!(cancel_pending.is_pending());
+        assert!(
+            cancel_wakes > 0,
+            "Controller close did not wake Pending receive"
+        );
+        assert!(
+            matches!(cancelled, Poll::Ready((Destination::Ip(remote), None)) if remote == endpoint)
+        );
+        assert!(transport.managed_ready.as_ref().unwrap().is_empty());
+        assert_eq!(transport.managed_flows.iter().count(), 0);
+        assert_eq!(direct.udp_closes.load(Ordering::Relaxed), 1);
+        assert!(
+            serde_json::to_value(registry.snapshot()).unwrap()["connections"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
