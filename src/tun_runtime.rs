@@ -1977,7 +1977,7 @@ where
 {
     let association_id = context.association_id;
     let source = context.source;
-    let session = DatagramSession::for_tun(source, context.tun_mtu);
+    let session = DatagramSession::for_tun(source, context.tun_mtu).with_receive_pool();
     let opened = tokio::select! {
         biased;
         () = context.cancellation.cancelled() => return Ok(()),

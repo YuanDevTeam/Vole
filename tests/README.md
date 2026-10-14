@@ -64,6 +64,7 @@ cargo test --locked --all-features --lib ingress_
 cargo test --locked --all-features --lib routing::balance::tests::
 cargo test --locked --all-features --lib load_balance_routes_
 cargo test --locked --all-features --lib dialer::connections::tests::
+cargo test --locked --features cli --lib session::receive_pool::tests::
 cargo test --locked --all-features --lib fake_ip_
 cargo test --locked --all-features --lib sniffing::tests::
 cargo test --locked --all-features --lib tcp_sniffer::tests::
