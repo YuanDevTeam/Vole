@@ -55,8 +55,10 @@ Apple Unified Logging、TASK_VM_INFO 当前/进程峰值观察及停止后的 al
 移动扩展周期采样。tvOS 事件使用 tvos_memory_*，iOS 保留 ios_memory_*。
 
 Apple 公开 NEPacketTunnelFlow API 是 packetFlow 的包读写，不承诺可取得 raw fd。
-Vole 的借用 fd 契约不能证明宿主 KVC 提取 fd 是稳定公开方案。模拟器 socketpair 只验证
-合成 utun 数据面；真实宿主的 fd 获取/桥接、签名与 entitlement、系统路由、设备生命周期
+Vole 的借用 fd 契约不能证明宿主 KVC 提取 fd 是稳定公开方案。macOS 普通 CLI 也可以借用
+宿主创建的非阻塞 Unix datagram socketpair，通过 Apple 四字节 PI 交换合成 IP 包；
+仍使用 `tun.file-descriptor` 和普通 CLI 启动，不需要额外 API 或配置字段。
+socketpair 只验证合成 utun 数据面；真实宿主的 fd 获取/桥接、签名与 entitlement、系统路由、设备生命周期
 及物理内存须独立验收。当前没有新增 packetFlow 回调 ABI，也不暗中回退其他接入路径。
 
 包 I/O 规则：

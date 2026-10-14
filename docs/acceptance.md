@@ -19,6 +19,17 @@ Linux RSS 不等于 Apple Network Extension physical footprint。
 
 ## 性能采纳标准
 
+Apple 的内存验收针对 iOS/tvOS **整个 Network Extension 进程的 physical footprint**，
+硬上限为 **40 MiB（41,943,040 bytes）**，优化目标为 **35 MiB（36,700,160 bytes）**。
+包含 Core、宿主桥接与扩展运行时；以真机目标负载下的进程观测验收，不能只计算 Rust heap。
+
+Mac 普通 CLI 与模拟 TUN 用于优化筛选，分别报告 physical footprint、RSS 和 CPU。
+采样到的最大当前 footprint 可能遗漏瞬时峰值，内核 lifetime 高水位与 `wait4` 可能包含
+exec 前占用，应独立记录。Mac 小负载互通不替代压力验收，Mac CLI 结果不替代真实
+Network Extension、iOS 或 tvOS 的设备内存验收。
+
+Linux 压力保留以下 RSS 对照口径和指标，与 Apple footprint 分开判断：
+
 使用相同输入、负载和重复次数的普通 Release 对照，分别比较吞吐/QPS中位数与最大CLI生命周期峰值RSS。Linux CLI的RSS观察覆盖exec至退出/reap，包括启动、负载、drain和Stop；heaptrack等仪器开销、tracked heap和wait4读数不能替代这一验收口径。
 
 - CLI生命周期峰值RSS硬上限为 **40MiB（41,943,040 bytes）**；超过必须优化，不能用吞吐改善抵消。
