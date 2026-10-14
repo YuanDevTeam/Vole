@@ -2098,7 +2098,7 @@ where
                 received_in_burst += 1;
                 let capacity = context.responses.max_capacity();
                 let writer_backlog =
-                    context.responses.capacity() <= capacity - capacity.div_ceil(8);
+                    context.responses.capacity() <= capacity - capacity.div_ceil(4);
                 if writer_backlog || received_in_burst == crate::limits::IO_POLL_BUDGET {
                     received_in_burst = 0;
                     // Nonblocking response handoff must give the sole writer
