@@ -14,7 +14,7 @@ use quiche::h3::NameValue;
 use quinn::AsyncUdpSocket;
 use std::{
     collections::{BTreeMap, VecDeque},
-    io::{self, IoSliceMut},
+    io,
     net::SocketAddr,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -281,7 +281,9 @@ impl Driver {
         result
     }
     async fn drive(&mut self, cancel: &CancellationToken) -> io::Result<()> {
-        let mut incoming = vec![0; self.socket.budget().receive() as usize];
+        // Shared/static upstream packets retain the original bounded scratch
+        // fallback. Unique packets can be decrypted in their owned storage.
+        let mut incoming = Vec::new();
         let mut output = vec![0; self.mtu];
         let mut pending: Option<(usize, std::time::Instant)> = None;
         let mut writable = self.socket.clone().create_io_poller();
@@ -452,20 +454,23 @@ impl Driver {
                 // waking writers. Never wait for a batch to fill or retain
                 // additional packet buffers, and bound owner work per poll.
                 for _ in 0..RECEIVE_BATCH {
-                    let mut meta = [quinn::udp::RecvMeta::default()];
-                    match self.socket.poll_recv(
-                        cx,
-                        &mut [IoSliceMut::new(&mut incoming)],
-                        &mut meta,
-                    ) {
-                        Poll::Ready(Ok(_)) => {
-                            match connection.recv(
-                                &mut incoming[..meta[0].len],
-                                quiche::RecvInfo {
-                                    from: self.peer,
-                                    to: self.local,
-                                },
-                            ) {
+                    match self.socket.poll_recv_owned(cx) {
+                        Poll::Ready(Ok(payload)) => {
+                            let info = quiche::RecvInfo {
+                                from: self.peer,
+                                to: self.local,
+                            };
+                            let result = match payload.try_into_mut() {
+                                Ok(mut payload) => connection.recv(&mut payload, info),
+                                Err(payload) => {
+                                    if incoming.is_empty() {
+                                        incoming.resize(self.socket.budget().receive() as usize, 0);
+                                    }
+                                    incoming[..payload.len()].copy_from_slice(&payload);
+                                    connection.recv(&mut incoming[..payload.len()], info)
+                                }
+                            };
+                            match result {
                                 Ok(_) | Err(quiche::Error::Done) => {}
                                 Err(error) => return Poll::Ready(Err(failure(error))),
                             }

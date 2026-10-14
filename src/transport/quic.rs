@@ -95,6 +95,23 @@ impl DatagramSocket {
         self.shared.state.lock().unwrap().stats
     }
 
+    /// Transfers one validated packet to an owner which can consume storage.
+    /// The borrowed AsyncUdpSocket path remains available to other engines.
+    #[cfg(feature = "quiche-h3-transport")]
+    pub(crate) fn poll_recv_owned(&self, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
+        let mut state = self.shared.state.lock().unwrap();
+        if state.closed {
+            return Poll::Ready(Err(state.error.unwrap_or(io::ErrorKind::BrokenPipe).into()));
+        }
+        let Some(payload) = state.incoming.pop_front() else {
+            self.shared.reader.register(cx.waker());
+            return Poll::Pending;
+        };
+        // Freeing the same bounded queue resumes its single transport owner.
+        self.shared.changed.notify_one();
+        Poll::Ready(Ok(payload))
+    }
+
     /// Waits for previously enqueued packets to pass the controlled transport.
     /// This is local IO progress, not acknowledgement by the QUIC peer.
     pub(crate) fn poll_transmitted(
@@ -770,5 +787,186 @@ mod pending_waker_tests {
         fixture.driver.stop().await.unwrap();
         assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
         assert!(result.unwrap());
+    }
+
+    #[cfg(feature = "quiche-h3-transport")]
+    fn inject_payload(fixture: &Fixture, payload: Bytes) -> io::Result<()> {
+        fixture
+            .input
+            .try_send(Datagram {
+                remote: Destination::Ip(fixture.peer),
+                payload,
+                sniffed_domain: None,
+            })
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+
+    #[cfg(feature = "quiche-h3-transport")]
+    #[tokio::test]
+    async fn quic_memory_owned_receive_keeps_unique_storage_and_real_wakes() {
+        let fixture = fixture(false).unwrap();
+        let count = Arc::new(Count::default());
+        let waker = Waker::from(count.clone());
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            let pending = fixture
+                .socket
+                .poll_recv_owned(&mut Context::from_waker(&waker))
+                .is_pending();
+            let payload = Bytes::copy_from_slice(b"owned allocation");
+            let pointer = payload.as_ptr() as usize;
+            inject_payload(&fixture, payload)?;
+            wait_for(|| fixture.socket.stats().received == 1 && count.get() > 0).await?;
+            let payload = ready(
+                fixture
+                    .socket
+                    .poll_recv_owned(&mut Context::from_waker(&waker)),
+            )?;
+            let same_storage = payload.as_ptr() as usize == pointer;
+            let bytes = payload.to_vec();
+            let mutable = payload
+                .try_into_mut()
+                .map_err(|_| io::Error::other("owned input lost uniqueness"))?;
+            let same_mutable_storage = mutable.as_ptr() as usize == pointer;
+            drop(mutable);
+            let before = count.get();
+            inject(&fixture, b"next")?;
+            wait_for(|| fixture.socket.stats().received == 2).await?;
+            let next = ready(
+                fixture
+                    .socket
+                    .poll_recv_owned(&mut Context::from_waker(&waker)),
+            )?;
+            let quiet_after_ready = count.get() == before;
+            let stopped_pending = fixture
+                .socket
+                .poll_recv_owned(&mut Context::from_waker(&waker))
+                .is_pending();
+            Ok::<_, io::Error>((
+                pending,
+                same_storage,
+                same_mutable_storage,
+                bytes,
+                next,
+                quiet_after_ready,
+                stopped_pending,
+                count.get(),
+            ))
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        let stopped = fixture
+            .socket
+            .poll_recv_owned(&mut Context::from_waker(&waker));
+        let state = fixture.socket.shared.state.lock().unwrap();
+        assert!(state.closed && state.incoming.is_empty() && state.outgoing.is_empty());
+        drop(state);
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        let (
+            pending,
+            same_storage,
+            same_mutable_storage,
+            bytes,
+            next,
+            quiet_after_ready,
+            stopped_pending,
+            before_stop,
+        ) = result.unwrap();
+        assert!(pending && stopped_pending && quiet_after_ready);
+        assert!(
+            same_storage && same_mutable_storage,
+            "owned receive copied the real carrier allocation"
+        );
+        assert_eq!(bytes, b"owned allocation");
+        assert_eq!(next.as_ref(), b"next");
+        assert!(
+            count.get() > before_stop,
+            "Stop did not wake the actual pending reader"
+        );
+        assert!(
+            matches!(stopped, Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+    }
+
+    #[cfg(feature = "quiche-h3-transport")]
+    #[tokio::test]
+    async fn quic_memory_owned_receive_resumes_full_carrier_and_preserves_shared_inputs() {
+        let fixture = fixture(false).unwrap();
+        let count = Arc::new(Count::default());
+        let waker = Waker::from(count);
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            let shared = Bytes::copy_from_slice(b"shared input");
+            inject_payload(&fixture, shared.clone())?;
+            inject(&fixture, b"static input")?;
+            inject_payload(&fixture, Bytes::from_owner(vec![0x42; 17]))?;
+            for _ in 3..=QUEUE_LIMIT {
+                inject(&fixture, b"queued")?;
+            }
+            wait_for(|| fixture.socket.stats().received == QUEUE_LIMIT).await?;
+            let full = fixture.socket.shared.state.lock().unwrap().incoming.len();
+            let first = ready(
+                fixture
+                    .socket
+                    .poll_recv_owned(&mut Context::from_waker(&waker)),
+            )?;
+            let same_shared_storage = first.as_ptr() == shared.as_ptr();
+            let shared_bytes = first.to_vec();
+            let shared_is_readonly = first.try_into_mut().is_err();
+            wait_for(|| fixture.socket.stats().received == QUEUE_LIMIT + 1).await?;
+            let second = ready(
+                fixture
+                    .socket
+                    .poll_recv_owned(&mut Context::from_waker(&waker)),
+            )?;
+            let static_bytes = second.to_vec();
+            let static_is_readonly = second.try_into_mut().is_err();
+            let third = ready(
+                fixture
+                    .socket
+                    .poll_recv_owned(&mut Context::from_waker(&waker)),
+            )?;
+            let owner_bytes = third.to_vec();
+            let owner_is_readonly = third.try_into_mut().is_err();
+            Ok::<_, io::Error>((
+                full,
+                same_shared_storage,
+                shared_bytes,
+                shared.to_vec(),
+                shared_is_readonly,
+                static_bytes,
+                static_is_readonly,
+                owner_bytes,
+                owner_is_readonly,
+            ))
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        let state = fixture.socket.shared.state.lock().unwrap();
+        assert!(state.closed && state.incoming.is_empty() && state.outgoing.is_empty());
+        drop(state);
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        let (
+            full,
+            same_shared_storage,
+            shared_bytes,
+            original_bytes,
+            shared_is_readonly,
+            static_bytes,
+            static_is_readonly,
+            owner_bytes,
+            owner_is_readonly,
+        ) = result.unwrap();
+        assert_eq!(full, QUEUE_LIMIT);
+        assert_eq!(fixture.socket.stats().received, QUEUE_LIMIT + 1);
+        assert!(
+            same_shared_storage && shared_is_readonly && static_is_readonly && owner_is_readonly
+        );
+        assert_eq!(shared_bytes, b"shared input");
+        assert_eq!(original_bytes, b"shared input");
+        assert_eq!(static_bytes, b"static input");
+        assert_eq!(owner_bytes, [0x42; 17]);
     }
 }

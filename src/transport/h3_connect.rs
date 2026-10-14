@@ -938,7 +938,13 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
     }
 
+    #[derive(Clone, Copy)]
+    enum PacketInput {
+        Unique,
+        OwnerBacked,
+    }
     struct Packets {
+        input: PacketInput,
         send: mpsc::Sender<Bytes>,
         receive: mpsc::Receiver<Bytes>,
         peer: SocketAddr,
@@ -957,9 +963,16 @@ mod tests {
                 .map_err(|_| DispatchError::NotAllowed)
         }
         async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            let payload = self.receive.recv().await.ok_or(DispatchError::NotAllowed)?;
+            let payload = match self.input {
+                PacketInput::Unique => payload,
+                // from_owner stays immutable even if its inner Bytes later
+                // becomes unique while the adapter prefetches more packets.
+                PacketInput::OwnerBacked => Bytes::from_owner(payload),
+            };
             Ok(Datagram {
                 remote: Destination::Ip(self.peer),
-                payload: self.receive.recv().await.ok_or(DispatchError::NotAllowed)?,
+                payload,
                 sniffed_domain: None,
             })
         }
@@ -1039,6 +1052,7 @@ mod tests {
         reject: Arc<Notify>,
         goaway: Notify,
         duplex_fin: Mutex<Option<oneshot::Sender<io::Result<usize>>>>,
+        input: PacketInput,
         l4: bool,
     }
     impl Peer {
@@ -1083,6 +1097,7 @@ mod tests {
                 reject: Arc::new(Notify::new()),
                 goaway: Notify::new(),
                 duplex_fin: Mutex::new(None),
+                input: PacketInput::Unique,
                 l4: false,
             })
         }
@@ -1204,6 +1219,7 @@ mod tests {
             });
             Ok(QuicTransport {
                 transport: Box::new(Packets {
+                    input: self.input,
                     send: to_server,
                     receive: from_server,
                     peer: local,
@@ -1361,13 +1377,21 @@ mod tests {
     }
     #[tokio::test]
     async fn trusttunnel_h3_large_duplex_data_fin_and_joined_stop() {
+        large_duplex_ingress(PacketInput::Unique).await;
+    }
+    #[tokio::test]
+    async fn quiche_h3_owner_backed_ingress_preserves_duplex_fin_and_joined_stop() {
+        large_duplex_ingress(PacketInput::OwnerBacked).await;
+    }
+    async fn large_duplex_ingress(input: PacketInput) {
         use futures_util::FutureExt;
         use std::panic::{AssertUnwindSafe, resume_unwind};
 
         let observation = ResourceProbe::default();
         let (result, cleanup, calls, closed, empty) = observation
             .scope(async {
-                let peer = Peer::new();
+                let mut peer = Peer::new();
+                Arc::get_mut(&mut peer).unwrap().input = input;
                 let pool = Pool::new(None);
                 let (finished, fin) = oneshot::channel();
                 *peer.duplex_fin.lock().unwrap() = Some(finished);

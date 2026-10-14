@@ -146,6 +146,8 @@ XHTTP 和 DoH/H3 通过 `quinn-h3-transport` 使用官方 h3/h3-quinn，共享�
 [XHTTP](xhttp.md) 与 [DNS](tun-icmp-dns.md)。
 
 `quiche-h3-transport` 为 TrustTunnel/MASQUE 使用官方 quiche 的低层驱动，共享上述数据报适配器，不创建新的 socket。
+接收时移动既有队列中的数据报，独占存储直接交给 quiche 原地解密；共享或不可变存储
+使用按接收预算延迟分配的复用暂存缓冲。Quinn 的借用接收接口和两端队列上限保持不变。
 每个 quiche H3 stream 的已读取 body 最多保留 64 KiB，每次业务写入最多 16 KiB；
 只有本地主动请求创建业务状态，未知 DATAGRAM flow 丢弃，已注册 flow 的交付队列最多 64 项。
 这些是局部缓存界限，不宣称 QUIC 库内部总内存固定，也不限制活动业务流总数。
