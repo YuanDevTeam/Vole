@@ -3,6 +3,9 @@
 `vole` 是前台入口。CLI 解析参数并调用 Invoke；配置读取、初始化、信号与清理由
 Invoke 的 `foreground` 操作处理，运行时复用同一个内核。
 
+Linux CLI 的 Rust 堆使用官方 mimalloc；FFI 库保留原有分配器约定。
+这项构建选择不改变配置、Invoke API 或平台网络权限。
+
 ```sh
 vole -f /path/to/config.yaml
 vole -d /path/to/data -f ./config.yaml

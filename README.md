@@ -142,6 +142,7 @@ See [acceptance boundaries](docs/acceptance.md) for the scope of build, network 
 Vole builds on and learns from public dependencies, protocol implementations and platform references:
 
 - TUN dependencies: the local [`vole-netstack`](crates/vole-netstack/README.md) uses [smoltcp](https://github.com/smoltcp-rs/smoltcp); Unix and Windows Wintun packet I/O use [tun-rs](https://github.com/tun-rs/tun-rs) (Apache-2.0).
+- Linux CLI allocator: [mimalloc](https://github.com/microsoft/mimalloc) through its [Rust bindings](https://github.com/purpleprotocol/mimalloc_rust) (MIT), without overriding native C allocation symbols.
 - Provider case mapping uses Rust's standard Unicode case conversion through a bounded adapter.
 - WireGuard: [boringtun](https://github.com/cloudflare/boringtun) (BSD-3-Clause), without host-device, FFI or JNI features.
 - [Wintun](https://www.wintun.net/): the runtime DLL is supplied by the host, not bundled. The upstream [API header](https://github.com/tun-rs/tun-rs/blob/2.8.11/src/platform/windows/tun/wintun.h) included by tun-rs is copyright 2018–2021 WireGuard LLC, licensed `GPL-2.0 OR MIT`; distribution of the linked API bindings must retain its copyright and MIT alternative license notice.
