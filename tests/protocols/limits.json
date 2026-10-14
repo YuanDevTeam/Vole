@@ -628,7 +628,7 @@
     },
     {
       "id": "tun-udp-response",
-      "value": 1024,
+      "value": 4096,
       "unit": "items",
       "owner": "ResourceLimits::tun_udp_response_queue_capacity",
       "saturation": "drop only the current ordinary UDP response without refreshing association activity",

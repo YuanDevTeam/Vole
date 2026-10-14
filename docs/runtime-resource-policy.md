@@ -28,7 +28,7 @@ Release 构建优先吞吐（`opt-level = 3`），保留 thin LTO 与现有缓�
 包队列                          256
 普通事件 / TCP accept           128
 每关联 UDP 入站                 64
-普通 UDP 响应                   1,024
+普通 UDP 响应                   4,096
 DNS 响应                        128
 每个 TCP 方向缓冲区             32 KiB
 TLS / XHTTP 缓冲区              64 KiB
@@ -107,7 +107,7 @@ mux驱动，再等待底层协议。provider代际与node-only测速复用此屏
 
 - 关联表不设固定项数；
 - 每个关联的入站队列最多 64 项，满时只丢当前数据报，不等待慢关联并阻塞其他来源；
-- 普通响应队列最多 1,024 项，满时只丢当前响应；没有共享 UDP 入站中转队列；
+- 普通响应队列最多 4,096 项，满时只丢当前响应；没有共享 UDP 入站中转队列；
 - reader 拥有关联表和入站分发，唯一 TUN writer 直接、公平消费普通/DNS/TCP raw 三个通道；写回等待不阻塞 reader，不增加逐关联写回任务；
 - TCP/ICMP ingress 满时非阻塞丢当前完整 IP 包，避免阻塞 UDP/DNS，记录 packet queue drop；TCP 重传恢复，不引入 pending FIFO；
 - 使用代次感知所有权和子取消令牌；
