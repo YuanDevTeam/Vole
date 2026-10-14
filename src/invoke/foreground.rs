@@ -215,6 +215,7 @@ fn configure_foreground_allocator(config: &Config) {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     if has_tun
         && std::env::var_os("MALLOC_ARENA_MAX").is_none()
+        && std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none()
         && std::env::var_os("GLIBC_TUNABLES").is_none()
     {
         // SAFETY: the process-owned foreground instance has been admitted,
@@ -222,6 +223,9 @@ fn configure_foreground_allocator(config: &Config) {
         // interface takes integers and retains no caller-owned pointers.
         // A refused hint preserves the system allocator's behavior.
         let _ = unsafe { libc::mallopt(libc::M_ARENA_MAX, 1) };
+        // Keep released large arrays and buffers from raising glibc's dynamic
+        // threshold and retaining subsequent allocations inside the arena.
+        let _ = unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 32 * 1024) };
     }
     let _ = has_tun;
 }

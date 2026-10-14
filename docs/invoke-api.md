@@ -319,9 +319,10 @@ Stop 关闭本次持有的 fd、session 和原生句柄；Wintun 不承诺移除
 标准输入和退出信号，并安装有界 stderr 诊断，适用于前台进程宿主。嵌入式、服务或 VPN
 宿主继续用普通业务生命周期方法和自身的退出机制。
 GNU/Linux 的 `run` 在前台实例准入并解析配置后，若配置启用 TUN，则在 Core 工作线程
-启动前通过 glibc 的公开接口将 arena 默认设为 1，以减少包处理时的堆保留；显式
-`MALLOC_ARENA_MAX` 或 `GLIBC_TUNABLES` 环境设置优先。该提示失败时继续使用系统
-默认策略，无 TUN 的前台运行和普通业务 `start` 不调整宿主分配器。解析后的配置直接
+启动前通过 glibc 的公开接口将 arena 默认设为 1、mmap 阈值设为 32 KiB，以减少包处理
+时的堆保留；显式 `MALLOC_ARENA_MAX`、`MALLOC_MMAP_THRESHOLD_` 或 `GLIBC_TUNABLES`
+环境设置优先。未应用的提示保留对应系统默认参数。无 TUN 的前台运行和普通业务
+`start` 不调整宿主分配器。解析后的配置直接
 交给同一启动路径，不重复读取或解析。
 Unix 等待 SIGINT/SIGTERM，Windows 等待 Ctrl+C/Ctrl+Break；标准输入先读取，之后在
 内部准备和启动前注册信号。启动中收到信号仍等待启动工作器结束，再停止和销毁；运行期
