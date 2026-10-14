@@ -137,6 +137,7 @@ DELETE 通过取消令牌立即唤醒等待中的接收，关闭与 flow-id 替�
 `DatagramBudget` 分别表达当前层的发送和接收 payload 上限。嵌套协议先为下层申请有界 envelope 空间，再按实际协议/地址族开销扣除下层能力，与调用方预算取交集；不能把接收上限直接当作发送能力。DIRECT、SOCKS5、SS 2022、SS/AnyTLS UoT 和 VLESS XUDP 保留对端/地址校验。超出发送预算在写入前失败，超出接收预算丢当前包并有界让出执行权，close 后不能恢复收发。UoT 的流头不从 UDP payload 预算扣除；SS 首包门控、读取任务与单响应队列的局部上限见[出站](outbounds.md#udp-over-tcp-v2)。
 
 `quic-transport` 只把已有 `DatagramTransport` 适配成 Quinn/quiche 共用的受控 UDP 接口，没有内部 bind、DNS 或 DIRECT 回落。每个连接双向各最多32个排队数据报，另允许一个正在发送的包；TX满返回WouldBlock，RX满暂停读取。接收等待不会持有发送队列锁；Pending发送不会重复提交。单逻辑peer/物理peer映射和来源校验独立保留，不接受未请求的目标、GSO或源地址覆盖。物理 socket 仍只能来自 Dialer。
+立即就绪的读取、发送容量与发送完成检查不登记新的等待者；仅在同一状态锁内确认 Pending 后登记唤醒，保留后续数据、容量恢复、取消与 Stop 的通知。
 
 XHTTP 和 DoH/H3 通过 `quinn-h3-transport` 使用官方 h3/h3-quinn，共享取消安全的请求包装与
 非 DATA 帧编码预算；它不创建 socket、查询池或额外业务 body 队列。未完成发送的请求丢弃时 reset，
