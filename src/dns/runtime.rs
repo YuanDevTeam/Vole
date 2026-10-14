@@ -2585,8 +2585,7 @@ impl RuntimeDns {
     {
         if server.transport == DnsTransport::Quic {
             #[cfg(feature = "dns-quic")]
-            return self
-                .exchange_quic(&server, query, validate, super::quic::Kind::Doq)
+            return Box::pin(self.exchange_quic(&server, query, validate, super::quic::Kind::Doq))
                 .await;
             #[cfg(not(feature = "dns-quic"))]
             return Err(io::Error::from(io::ErrorKind::Unsupported).into());
@@ -2601,7 +2600,9 @@ impl RuntimeDns {
                 return Ok((response, parsed));
             }
         }
-        self.exchange_tcp(&server, query, validate).await
+        // TCP/TLS/H3 handshake states are only needed after selecting them.
+        // Keeping them inline would inflate every racing UDP attempt as well.
+        Box::pin(self.exchange_tcp(&server, query, validate)).await
     }
 
     async fn exchange_udp<F>(
@@ -4056,6 +4057,25 @@ mod tests {
             nameserver_policies: Vec::new(),
             ..DnsConfig::default()
         }
+    }
+
+    #[test]
+    fn udp_attempt_does_not_retain_unused_stream_handshake_state() {
+        let upstream = nameserver(1, DnsTransport::Udp);
+        let resolver = RuntimeDns::new(
+            &config(false, vec![upstream.clone()]),
+            Arc::new(MockDispatcher::default()),
+        );
+        let query = build_query(7, "memory.example", QueryType::A).unwrap();
+        let parsed = parse_query(&query).unwrap();
+        let permits = Semaphore::new(4);
+        // Construct the real racing attempt without polling or opening I/O.
+        let attempt = resolver.exchange_nameserver_limited(upstream, &query, &parsed, &permits);
+        let bytes = std::mem::size_of_val(&attempt);
+        assert!(
+            bytes <= 4096,
+            "UDP DNS attempt retains {bytes} bytes before selecting a transport"
+        );
     }
 
     #[tokio::test]
