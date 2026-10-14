@@ -291,7 +291,8 @@ fallible Vec 扩容、合法 protobuf 帧/长度、code、选中匹配值的 UTF
 验证期的新旧字节重叠、Meta 多 code 查询的临时引用索引与 MMDB metadata/图校验状态未计入。因此账本**不包含正则内部编译状态、搜索缓存、
 动态 scratch、配置需求集合、allocator 开销或整个进程 footprint**。这些未计入的
 内存并不是零；accounted peak 不能作为加载或运行期峰值上界。
-50,000,000 bytes 是限定输入与联合负载下的进程实测验收目标，不是加载器保证。
+进程 RSS 的硬上限与 2Gbps 联合负载目标统一见[验收边界](acceptance.md#性能采纳标准)，
+它们是压力测试标准，不是加载器保证。
 
 互通和内存/吞吐压力由公开 [container-benchmark](https://github.com/YuanDevTeam/container-benchmark)
 维护；`interop`、`stress` 和 `compare` 以 `--source vole=PATH` 显式指定被测 checkout。
