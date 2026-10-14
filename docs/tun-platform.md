@@ -53,6 +53,9 @@ Dialer；不新增低内存数量上限，不改变其他平台默认行为。iO
 Apple Unified Logging、TASK_VM_INFO 当前/进程峰值观察及停止后的 allocator pressure relief。
 既有 35/40/45 MiB 阈值仅发出诊断，不是系统限额或业务准入条件；macOS 不启用这组
 移动扩展周期采样。tvOS 事件使用 tvos_memory_*，iOS 保留 ios_memory_*。
+验收按平台区分：iOS/tvOS 的整个扩展进程 footprint 必须低于 45 MiB，常规压力
+优化目标为 35 MiB；其他平台以吞吐为先，后台 Core 进程内存硬上限为 100 MiB。
+这些预算不改变现有缓冲、队列或业务准入，完整口径见[验收边界](acceptance.md)。
 
 Apple 公开 NEPacketTunnelFlow API 是 packetFlow 的包读写，不承诺可取得 raw fd。
 Vole 的借用 fd 契约不能证明宿主 KVC 提取 fd 是稳定公开方案。macOS 普通 CLI 也可以借用

@@ -19,22 +19,39 @@ Linux RSS 不等于 Apple Network Extension physical footprint。
 
 ## 性能采纳标准
 
-Apple 的内存验收针对 iOS/tvOS **整个 Network Extension 进程的 physical footprint**，
-硬上限为 **40 MiB（41,943,040 bytes）**，优化目标为 **35 MiB（36,700,160 bytes）**。
-包含 Core、宿主桥接与扩展运行时；以真机目标负载下的进程观测验收，不能只计算 Rust heap。
+按平台区分优化目标，内存统一使用 MiB：
+
+| 平台 | 优先目标 | 内存硬门槛 | 软目标 |
+| --- | --- | --- | --- |
+| iOS / tvOS | 低内存与稳定性 | 整个 Network Extension 进程 physical footprint **<45 MiB（47,185,920 bytes）** | 常规压力 **≤35 MiB（36,700,160 bytes）** |
+| macOS / Windows / Linux / Android | 高吞吐 | VPN 后台 Core 进程内存 **≤100 MiB（104,857,600 bytes）** | 达到吞吐目标后继续降低 CPU 和内存，无统一 35 MiB 软门槛 |
+
+iOS/tvOS 包含 Core、宿主桥接与扩展运行时；以真机目标负载下的进程观测验收，
+不能只计算 Rust heap。45 MiB 是项目验收预算，不把它声明为各设备的系统限额。
+其他平台测量承载 Core 的整个后台进程，排除独立负载客户端和原站；macOS 使用
+physical footprint，Linux 使用 RSS，Windows/Android 记录各自进程指标及口径。
+不同平台的内存数值不直接混合排名。
 
 Mac 普通 CLI 与模拟 TUN 用于优化筛选，分别报告 physical footprint、RSS 和 CPU。
 采样到的最大当前 footprint 可能遗漏瞬时峰值，内核 lifetime 高水位与 `wait4` 可能包含
 exec 前占用，应独立记录。Mac 小负载互通不替代压力验收，Mac CLI 结果不替代真实
 Network Extension、iOS 或 tvOS 的设备内存验收。
 
-Linux 压力保留以下 RSS 对照口径和指标，与 Apple footprint 分开判断：
+Mac CLI 压力使用 macOS 的 100 MiB 预算；移动端 35 / 45 MiB 只用于优化筛选，
+不据此签署真机验收。冷启动、配置和 GeoData 更新、负载、收尾及 Stop 都应覆盖；
+未执行的生命周期场景单独标明，不从一次压力结果推导。
 
-使用相同输入、负载和重复次数的普通 Release 对照，分别比较吞吐/QPS中位数与最大CLI生命周期峰值RSS。Linux CLI的RSS观察覆盖exec至退出/reap，包括启动、负载、drain和Stop；heaptrack等仪器开销、tracked heap和wait4读数不能替代这一验收口径。
+当前 Mac 模拟 TUN 压力入口仍为实验工具，负载到达、DNS 完成和关闭行为尚未稳定。
+正式定速压力继续使用既有 Linux 原生 TUN 环境；测试执行完成不代表达到验收门槛。
 
-- CLI生命周期峰值RSS硬上限为 **40MiB（41,943,040 bytes）**；超过必须优化，不能用吞吐改善抵消。
-- 满足硬上限后，吞吐提高且RSS降低可采纳。令R为候选/基线吞吐或QPS，M为候选/基线最大RSS，也允许`R > 1.02 && M < 1.01`或`M < 0.98 && R > 0.99`：一项改善严格大于2%，另一项回退严格小于1%。按未四舍五入数值判断，等于2%或1%不满足新增容忍分支。
-- 定速压力在 **1Gbps** 下有效吞吐须 **≥990Mbps**，在 **2Gbps** 下须 **≥1980Mbps**；CLI生命周期峰值RSS优化目标仍为 **≤35MiB（36,700,160 bytes）**。保持既有负载及其有效性门槛；设置目标速率或较低负载下达到内存目标不能代替实际吞吐验收。
+性能对照使用相同输入、负载和重复次数的普通 Release 构建，分别比较吞吐/QPS 中位数
+与同平台进程内存峰值。Linux 保留原压力负载和 RSS 观察逻辑，覆盖 exec 至退出/reap，
+包括启动、负载、drain 和 Stop；heaptrack 等仪器开销、tracked heap 和 wait4 读数
+不能替代这一验收口径。
+
+- 所有优化先满足本平台内存硬门槛、协议数据正确性、取消与资源清理。超过硬门槛必须优化，不能用吞吐改善抵消。
+- 在相同输入、负载和重复次数下，令 R 为候选/基线吞吐或 QPS，M 为候选/基线进程内存峰值。吞吐提高且内存降低可采纳；iOS/tvOS 也允许 `M < 0.98 && R > 0.99`，即内存改善严格大于 2%、吞吐回退严格小于 1%。其他平台允许 `R > 1.02` 且内存仍在 100 MiB 内的方案增加内存以提高吞吐，不再套用统一 1% 内存回退限制。按未四舍五入数值判断。
+- macOS / Windows / Linux / Android 定速压力在 **1 Gbps** 下有效吞吐须 **≥990 Mbps**，在 **2 Gbps** 下须 **≥1980 Mbps**。保持既有负载及其有效性门槛；设置目标速率或较低负载下达到内存目标不能代替实际吞吐验收。iOS/tvOS 吞吐门槛根据真机与链路能力校准，不强制使用 2 Gbps 负载。
 - UDP丢包率须 **≤0.5%**，以实际发送与接收的包数计算，按上下行发送包数加权汇总，同时保留两个方向的独立计数。丢包在固定收尾后统计；吞吐仅统计活动窗口，不把漏发算作丢包。
 
 数据有效性、实际完成量、负载到达、CPU、UDP loss、DNS完成数、测量有效性及退出/join/资源清理分别记录。测量成功不等于业务成功，编译、配置解析或连接成功不代替压力验收；失败或无效样本保留原结果，不参与有效性能胜出比较。以上是验收条件，不新增运行时admission或按整进程RSS拒绝业务的机制，资源所有权与局部容量仍遵循[运行时资源策略](runtime-resource-policy.md)。
