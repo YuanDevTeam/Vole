@@ -1,40 +1,85 @@
 # Vole / Mihomo TUN benchmark
 
 测试版本：Vole `96b665a`、Mihomo `v1.19.32`，两端均开启 Controller。
-每个 Linux 容器 5 CPU、8 GiB；60 秒混合 TCP/UDP、64 条业务流、1000 DNS QPS，使用完整 `geosite:cn` / `geoip:cn` 和 DIRECT 出口。
+Linux 容器各 5 CPU、8 GiB；60 秒混合 TCP/UDP、64 条流、1000 DNS QPS，完整 `geosite:cn` / `geoip:cn`，DIRECT 出口。
+CPU 100% 表示一个逻辑核；内存为 CLI 生命周期峰值 RSS，UDP 丢包按实际发送包数加权。
 
-CPU 100% 表示一个逻辑核；RSS 为 CLI 生命周期观测峰值。UDP 丢包按实际发送包数加权汇总，吞吐仅统计活动窗口的有效载荷。表中 `PASS` 为原吞吐与 DNS 99% 门槛，当前完整标准见 [验收边界](acceptance.md#性能采纳标准)。
+## 实际吞吐
 
-## 首轮结果
+```mermaid
+---
+config:
+  xyChart:
+    width: 1000
+    height: 400
+    showDataLabel: true
+    showDataLabelOutsideBar: true
+    xAxis:
+      labelFontSize: 12
+---
+xychart
+    title "实际吞吐"
+    x-axis "负载 / 内核" ["1G Vole", "1G Mihomo", "1.5G Vole", "1.5G Mihomo", "2G Vole", "2G Mihomo", "2G复测 Vole", "2G复测 Mihomo"]
+    y-axis "Mbps" 0 --> 2100
+    bar [999.05, 999.27, 1497.17, 1496.07, 1894.44, 1986.59, 1991.27, 1990.49]
+```
 
-| 目标 Gbps | 内核 | 状态 | 有效 Mbps | CPU % | RSS MiB | UDP 丢包 % | DNS 成功 / 60,000 |
-| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 | Vole | PASS | 999.05 | 113.85 | 32.40 | 0.0000 | 60,000 |
-| 1 | Mihomo | PASS | 999.27 | 115.68 | 93.57 | 0.0396 | 60,000 |
-| 1.5 | Vole | PASS | 1497.17 | 139.62 | 32.69 | 0.0001 | 60,000 |
-| 1.5 | Mihomo | PASS | 1496.07 | 145.62 | 97.43 | 0.1892 | 59,973 |
-| 2 | Vole | LOAD_NOT_REACHED | 1894.44 | 180.88 | 40.52 | 0.5123 | 59,883 |
-| 2 | Mihomo | PASS | 1986.59 | 168.37 | 109.11 | 0.6432 | 59,861 |
+## CPU
 
-| 目标 Gbps | 内核 | UDP 丢失上 / 下 | UDP 发送上 / 下 | DNS 成功活动 / 收尾 | DNS 漏发 / 超时 | driver_complete |
-| ---: | --- | ---: | ---: | ---: | ---: | --- |
-| 1 | Vole | 0 / 0 | 1,562,496 / 1,562,496 | 59,998 / 2 | 0 / 0 | true |
-| 1 | Mihomo | 0 / 1,237 | 1,562,496 / 1,562,496 | 59,999 / 1 | 0 / 0 | false |
-| 1.5 | Vole | 6 / 0 | 2,343,744 / 2,343,744 | 59,999 / 1 | 0 / 0 | false |
-| 1.5 | Mihomo | 73 / 8,794 | 2,343,744 / 2,343,744 | 59,972 / 1 | 0 / 27 | false |
-| 2 | Vole | 22 / 31,994 | 3,124,992 / 3,124,992 | 59,877 / 6 | 117 / 0 | false |
-| 2 | Mihomo | 1,708 / 38,490 | 3,124,992 / 3,124,992 | 59,859 / 2 | 16 / 123 | false |
+```mermaid
+---
+config:
+  xyChart:
+    width: 1000
+    height: 400
+    showDataLabel: true
+    showDataLabelOutsideBar: true
+    xAxis:
+      labelFontSize: 12
+---
+xychart
+    title "CPU"
+    x-axis "负载 / 内核" ["1G Vole", "1G Mihomo", "1.5G Vole", "1.5G Mihomo", "2G Vole", "2G Mihomo", "2G复测 Vole", "2G复测 Mihomo"]
+    y-axis "%" 0 --> 200
+    bar [113.85, 115.68, 139.62, 145.62, 180.88, 168.37, 180.10, 169.68]
+```
 
-## 同条件 2 Gbps 复测
+## 内存
 
-| 目标 Gbps | 内核 | 状态 | 有效 Mbps | CPU % | RSS MiB | UDP 丢包 % | DNS 成功 / 60,000 |
-| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 2 | Vole | PASS | 1991.27 | 180.10 | 38.46 | 0.1710 | 59,998 |
-| 2 | Mihomo | PASS | 1990.49 | 169.68 | 105.04 | 0.4699 | 59,891 |
+```mermaid
+---
+config:
+  xyChart:
+    width: 1000
+    height: 400
+    showDataLabel: true
+    showDataLabelOutsideBar: true
+    xAxis:
+      labelFontSize: 12
+---
+xychart
+    title "内存"
+    x-axis "负载 / 内核" ["1G Vole", "1G Mihomo", "1.5G Vole", "1.5G Mihomo", "2G Vole", "2G Mihomo", "2G复测 Vole", "2G复测 Mihomo"]
+    y-axis "RSS MiB" 0 --> 120
+    bar [32.40, 93.57, 32.69, 97.43, 40.52, 109.11, 38.46, 105.04]
+```
 
-| 目标 Gbps | 内核 | UDP 丢失上 / 下 | UDP 发送上 / 下 | DNS 成功活动 / 收尾 | DNS 漏发 / 超时 | driver_complete |
-| ---: | --- | ---: | ---: | ---: | ---: | --- |
-| 2 | Vole | 0 / 10,687 | 3,124,992 / 3,124,992 | 59,998 / 0 | 2 / 0 | false |
-| 2 | Mihomo | 1,474 / 27,892 | 3,124,992 / 3,124,992 | 59,891 / 0 | 0 / 109 | false |
+## UDP 丢包率
 
-Vole 2 Gbps 复测达到 ≥1980 Mbps、≤40 MiB 和 ≤0.5% 丢包门槛，尚未达到 35 MiB 优化目标。
+```mermaid
+---
+config:
+  xyChart:
+    width: 1000
+    height: 400
+    showDataLabel: true
+    showDataLabelOutsideBar: true
+    xAxis:
+      labelFontSize: 12
+---
+xychart
+    title "UDP 丢包率"
+    x-axis "负载 / 内核" ["1G Vole", "1G Mihomo", "1.5G Vole", "1.5G Mihomo", "2G Vole", "2G Mihomo", "2G复测 Vole", "2G复测 Mihomo"]
+    y-axis "%" 0 --> 1
+    bar [0.0000, 0.0396, 0.0001, 0.1892, 0.5123, 0.6432, 0.1710, 0.4699]
+```
