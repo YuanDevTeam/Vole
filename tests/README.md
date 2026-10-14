@@ -19,7 +19,6 @@ cargo test --locked --lib config::tests::
 cargo test --locked --features cli --lib trusttunnel
 cargo test --locked --features cli --lib mieru
 cargo test --locked --features cli --lib masque_
-cargo test --locked --features cli --lib h3_read_batch_tests
 cargo test --locked --lib config::credentials::tests::
 cargo test --locked --features cli --lib age_
 cargo test --locked --lib dns::hosts::tests::

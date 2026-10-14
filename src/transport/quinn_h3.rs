@@ -389,4 +389,4 @@ impl quic::RecvStream for GuardedRecv {
 
 #[cfg(test)]
 #[path = "quinn_h3_tests.rs"]
-pub(crate) mod tests;
+mod tests;

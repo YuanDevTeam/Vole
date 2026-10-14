@@ -88,19 +88,19 @@ impl quinn::AsyncUdpSocket for Socket {
     }
 }
 
-pub(crate) struct Pair {
-    pub(crate) client: quinn::Connection,
-    pub(crate) server: quinn::Connection,
+struct Pair {
+    client: quinn::Connection,
+    server: quinn::Connection,
     client_endpoint: quinn::Endpoint,
     server_endpoint: quinn::Endpoint,
-    pub(crate) client_runtime: Arc<OwnedRuntime>,
+    client_runtime: Arc<OwnedRuntime>,
     server_runtime: Arc<OwnedRuntime>,
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl Pair {
-    pub(crate) async fn new(server_stream_credit: u32) -> Self {
+    async fn new(server_stream_credit: u32) -> Self {
         let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut roots = rustls::RootCertStore::empty();
@@ -192,14 +192,14 @@ impl Pair {
         }
     }
 
-    pub(crate) fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static) {
+    fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static) {
         let cancel = self.cancel.clone();
         self.tasks.push(tokio::spawn(async move {
             tokio::select! { biased; () = cancel.cancelled() => {}, () = future => {} }
         }));
     }
 
-    pub(crate) async fn h3(&mut self) -> (Client, Server) {
+    async fn h3(&mut self) -> (Client, Server) {
         let (client, mut control) = attach(self.client.clone(), 16 * 1024).await.unwrap();
         let keep_client = client.clone();
         self.spawn(async move {
@@ -214,7 +214,7 @@ impl Pair {
         (client, server)
     }
 
-    pub(crate) async fn stop(mut self) {
+    async fn stop(mut self) {
         self.client_endpoint.close(0_u8.into(), b"");
         self.server_endpoint.close(0_u8.into(), b"");
         self.cancel.cancel();
@@ -254,7 +254,7 @@ fn transport(stream_credit: u32) -> quinn::TransportConfig {
     config
 }
 
-pub(crate) async fn settle(pair: Pair, future: impl Future<Output = ()>) {
+async fn settle(pair: Pair, future: impl Future<Output = ()>) {
     let result = AssertUnwindSafe(timeout(LIMIT, future))
         .catch_unwind()
         .await;

@@ -831,7 +831,6 @@ enum DownlinkState {
 struct Downlink {
     state: DownlinkState,
     current: Bytes,
-    deferred_error: Option<io::Error>,
 }
 
 impl Downlink {
@@ -847,7 +846,6 @@ impl Downlink {
                 allow_other_success,
             },
             current: Bytes::new(),
-            deferred_error: None,
         }
     }
 
@@ -856,16 +854,9 @@ impl Downlink {
         cx: &mut Context<'_>,
         output: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if output.remaining() == 0 {
+        if output.remaining() == 0 || matches!(self.state, DownlinkState::Eof) {
             return Poll::Ready(Ok(()));
         }
-        if let Some(error) = self.deferred_error.take() {
-            return Poll::Ready(Err(error));
-        }
-        if matches!(self.state, DownlinkState::Eof) {
-            return Poll::Ready(Ok(()));
-        }
-        let filled = output.filled().len();
 
         for _ in 0..MAX_UPLOAD_RESPONSE_FRAMES_PER_POLL {
             if self.current.has_remaining() {
@@ -876,12 +867,7 @@ impl Downlink {
                     unreachable!("buffered data only exists for an active response")
                 };
                 stream.release_capacity(count)?;
-                // h3-quinn exposes native owned chunks; fill the caller's
-                // existing buffer with already-ready data, without waiting.
-                if output.remaining() == 0 || !matches!(stream, RecvStream::H3(_)) {
-                    return Poll::Ready(Ok(()));
-                }
-                continue;
+                return Poll::Ready(Ok(()));
             }
 
             match &mut self.state {
@@ -907,32 +893,15 @@ impl Downlink {
                 },
                 DownlinkState::Active(stream) => match stream.poll_data(cx) {
                     Poll::Ready(Some(Ok(data))) => self.current = data,
-                    Poll::Ready(Some(Err(error))) => {
-                        if output.filled().len() != filled {
-                            // A successful partial read precedes the error;
-                            // otherwise AsyncRead callers lose copied bytes.
-                            self.deferred_error = Some(error);
-                            return Poll::Ready(Ok(()));
-                        }
-                        return Poll::Ready(Err(error));
-                    }
+                    Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
                     Poll::Ready(None) => {
                         self.state = DownlinkState::Eof;
                         return Poll::Ready(Ok(()));
                     }
-                    Poll::Pending => {
-                        return if output.filled().len() != filled {
-                            Poll::Ready(Ok(()))
-                        } else {
-                            Poll::Pending
-                        };
-                    }
+                    Poll::Pending => return Poll::Pending,
                 },
                 DownlinkState::Eof => return Poll::Ready(Ok(())),
             }
-        }
-        if output.filled().len() != filled {
-            return Poll::Ready(Ok(()));
         }
         cx.waker().wake_by_ref();
         Poll::Pending
@@ -1305,10 +1274,6 @@ fn ensure_success(
 fn io_other(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::other(error)
 }
-
-#[cfg(all(test, feature = "quinn-h3-transport"))]
-#[path = "xhttp/h3_read_batch_tests.rs"]
-mod h3_read_batch_tests;
 
 #[cfg(test)]
 mod tests {
