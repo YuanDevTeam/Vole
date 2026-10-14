@@ -129,6 +129,11 @@ impl CoreController {
     }
 }
 
+enum StartupConfig {
+    Yaml(String),
+    Parsed(Box<Config>),
+}
+
 #[derive(Default)]
 struct CoreInner {
     lifecycle: Lifecycle,
@@ -860,7 +865,7 @@ impl CoreController {
         Ok(())
     }
 
-    fn prepare_locked(&self, config_yaml: String) -> Result<(), InvokeFailure> {
+    fn prepare_locked(&self, input: StartupConfig) -> Result<(), InvokeFailure> {
         {
             let mut inner = lock(&self.inner);
             refresh_runtime_status(&mut inner);
@@ -875,10 +880,12 @@ impl CoreController {
         // protect controller for a configuration that actually contains TUN;
         // non-TUN configurations do not depend on controller registration.
         let _data_directory = registry().data_directory()?;
-        let config = parse_config_yaml(&config_yaml)?;
+        let config = match input {
+            StartupConfig::Yaml(yaml) => parse_config_yaml(&yaml)?,
+            StartupConfig::Parsed(config) => *config,
+        };
         let dispatch = crate::logging::dispatch(config.log_level);
         let _logging = tracing::dispatcher::set_default(&dispatch);
-        drop(config_yaml);
         let has_tun = config
             .inbounds
             .iter()
@@ -951,8 +958,12 @@ impl CoreController {
     }
 
     fn start(&self, config_yaml: String) -> Result<(), InvokeFailure> {
+        self.start_config(StartupConfig::Yaml(config_yaml))
+    }
+
+    fn start_config(&self, config: StartupConfig) -> Result<(), InvokeFailure> {
         let _command = self.try_command()?;
-        self.prepare_locked(config_yaml)?;
+        self.prepare_locked(config)?;
         let result = self.start_prepared_locked();
         if result.is_err() {
             reset_failed_operation(&mut lock(&self.inner), "start-failed")?;
@@ -1614,7 +1625,7 @@ mod tests {
         let controller = registry().instance(instance_id).unwrap();
         let payload: ConfigYamlPayload = decode_payload(payload).unwrap();
         let _command = controller.try_command().unwrap();
-        let result = controller.prepare_locked(payload.config_yaml);
+        let result = controller.prepare_locked(StartupConfig::Yaml(payload.config_yaml));
         json!({"success": result.is_ok()})
     }
 

@@ -1,5 +1,8 @@
 //! Foreground lifecycle is an Invoke operation; CLI transports only options.
-use super::{CoreController, InvokeFailure, invoke_instance_guarded, lock, registry};
+use super::{
+    CoreController, InvokeFailure, StartupConfig, invoke_instance_guarded, lock, registry,
+};
+use crate::config::{Config, InboundConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -194,17 +197,24 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
             .map_err(|_| failure("data directory initialization failed"))?;
         let controller = registry().create_instance()?;
         let mut cleanup = ForegroundInstance(Some(controller.clone()));
-        configure_foreground_allocator();
-        let result = run_controller(controller, yaml, signals.wait()).await;
+        let config = super::parse_config_yaml(&yaml).map_err(|_| failure("core startup failed"))?;
+        drop(yaml);
+        configure_foreground_allocator(&config);
+        let result = run_controller(controller, config, signals.wait()).await;
         let stopped = cleanup.destroy();
         result.and(stopped)
     })?;
     Ok(json!({"output":"","diagnostics":""}))
 }
 
-fn configure_foreground_allocator() {
+fn configure_foreground_allocator(config: &Config) {
+    let has_tun = config
+        .inbounds
+        .iter()
+        .any(|inbound| matches!(inbound, InboundConfig::Tun(_)));
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    if std::env::var_os("MALLOC_ARENA_MAX").is_none()
+    if has_tun
+        && std::env::var_os("MALLOC_ARENA_MAX").is_none()
         && std::env::var_os("GLIBC_TUNABLES").is_none()
     {
         // SAFETY: the process-owned foreground instance has been admitted,
@@ -213,6 +223,7 @@ fn configure_foreground_allocator() {
         // A refused hint preserves the system allocator's behavior.
         let _ = unsafe { libc::mallopt(libc::M_ARENA_MAX, 1) };
     }
+    let _ = has_tun;
 }
 
 fn validate_bytes(bytes: Vec<u8>, directory: &Path) -> Result<(), InvokeFailure> {
@@ -241,7 +252,7 @@ impl Drop for ForegroundInstance {
 
 async fn run_controller(
     controller: Arc<CoreController>,
-    yaml: String,
+    config: Config,
     shutdown: impl std::future::Future<Output = io::Result<()>>,
 ) -> Result<(), InvokeFailure> {
     tokio::pin!(shutdown);
@@ -249,7 +260,9 @@ async fn run_controller(
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let mut startup = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&dispatch, || {
-            invoke_instance_guarded(&starting, || starting.start(yaml))
+            invoke_instance_guarded(&starting, || {
+                starting.start_config(StartupConfig::Parsed(Box::new(config)))
+            })
         })
     });
     if !await_startup(&mut startup, shutdown.as_mut()).await? {
