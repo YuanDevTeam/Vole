@@ -119,12 +119,7 @@ One public instance follows `initialize → createInstance → start(configYaml)
 
 ## Benchmark
 
-[**Vole / Mihomo TUN benchmark**](https://github.com/YuanDevTeam/container-benchmark) contains the reproducible setup, measured results and comparison charts for both cores under the same native Linux TUN environment.
-
-The benchmark project also owns protocol interoperability (`interop`) and memory-pressure runs (`stress`), with an explicit `--source vole=PATH` checkout. Vole's own scripts only compile core and platform artifacts.
-
-Workloads, input assets and measured results are maintained in the benchmark project.
-See [acceptance boundaries](docs/acceptance.md) for the scope of build, network and device validation.
+[Vole / Mihomo TUN benchmark](docs/benchmark.md)
 
 ## Documentation
 

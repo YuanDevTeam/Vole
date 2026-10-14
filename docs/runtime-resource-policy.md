@@ -254,9 +254,8 @@ DFA 缓存各 512 KiB；不接受递归、条件式和控制动词。每次复�
   304 在 matcher 已可用时只调度，不可用时重载本地资产。既有 TCP 选路与 TUN UDP
   固定 action 不回溯；没有新增公开 API、业务数量配额或 GeoData 内存预算。
 
-GeoData 行为见 [规则与资产](geodata.md)。性能与压力测试由
-[container-benchmark](https://github.com/YuanDevTeam/container-benchmark) 维护，
-测试结果记录在对应运行中。
+GeoData 行为见 [规则与资产](geodata.md)。性能与压力测试由独立容器测试工具执行，
+公开结果见 [benchmark](benchmark.md)，原始记录保留在对应运行中。
 
 ## Apple 内存遥测
 

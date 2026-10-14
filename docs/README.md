@@ -29,6 +29,7 @@
 - [CLI 与 tag 发布](cli.md)：五个参数、配置路径、共用内核入口和 CLI / FFI 统一发布。
 - [测试隔离](testing-isolation.md)：所有网络服务端必须容器化。
 - [验收边界](acceptance.md)：本地、CI、设备和发布证据分别记录。
+- [Benchmark](benchmark.md)：测试环境、指标口径与 Vole / Mihomo 实测结果。
 - [领域上下文](../CONTEXT.md)、[架构决策](adr/)。
 - 工程 skills：[Issue 跟踪](agents/issue-tracker.md)、[分类标签](agents/triage-labels.md)、[领域流程](agents/domain.md)。
 

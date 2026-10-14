@@ -297,8 +297,8 @@ fallible Vec 扩容、合法 protobuf 帧/长度、code、选中匹配值的 UTF
 进程 RSS 的硬上限与 2Gbps 联合负载目标统一见[验收边界](acceptance.md#性能采纳标准)，
 它们是压力测试标准，不是加载器保证。
 
-互通和内存/吞吐压力由公开 [container-benchmark](https://github.com/YuanDevTeam/container-benchmark)
-维护；`interop`、`stress` 和 `compare` 以 `--source vole=PATH` 显式指定被测 checkout。
+互通和内存/吞吐压力由独立容器测试工具维护，公开结果见 [benchmark](benchmark.md)；
+`interop`、`stress` 和 `compare` 以 `--source vole=PATH` 显式指定被测 checkout。
 Vole 自有脚本仅负责编译。压力与横向比较固定只引用完整 `geosite:cn` / `geoip:cn`，
 更新下载保留原始增强 DAT，但不因此加载其他分类。真实资产的类型分布、明确标识的四类型/复杂正则合成用例、
 属性/反选见证、加载与真实更新期间的峰值、联合吞吐/DNS/RSS 结果以 benchmark 的本轮文字结论为准。

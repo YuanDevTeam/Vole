@@ -117,13 +117,7 @@ void VoleFree(char *response);
 
 ## Benchmark
 
-[**Vole / Mihomo TUN benchmark**](https://github.com/YuanDevTeam/container-benchmark) 提供两个内核在相同原生 Linux TUN 环境下的可复现测试设置、实测结果与对比图表。
-
-benchmark 工程同时负责协议互通（`interop`）与内存压力（`stress`），通过显式 `--source vole=PATH` 提供被测 checkout；Vole 自有脚本只编译核心与平台产物。
-
-测试使用 **1 / 1.5 / 2 Gbps** 混合 TCP/UDP 流量、**每秒 1,000 次 DNS 查询**和增强的 `geosite:cn` / `geoip:cn` 规则，报告实际吞吐量、CPU、观察到的 Linux 峰值 RSS、UDP 丢包与成功的 DNS 查询数。它使用 DIRECT 出口评估 TUN/DNS/路由路径，不衡量加密代理吞吐量；Linux RSS 不等同于 Apple Network Extension 内存占用。
-
-独立 `stress` 使用相同的完整增强 CN 分类。CLI 压力入口验证启动时 DAT 加载，不提供 `--geodata-update` 运行时采样。实际输入、指标和失败以 benchmark 运行记录为准。
+[Vole / Mihomo TUN benchmark](../docs/benchmark.md)
 
 ## 文档
 

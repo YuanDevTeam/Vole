@@ -10,8 +10,8 @@ Vole 纯核心回归直接使用的独立输入，不包含容器 catalog、消�
   不能从待测实现重生成期望；历史生成来源可在 Git 中追溯。
 
 核心离线回归见 [tests](../README.md)，平台编译见 [scripts](../../scripts/README.md)。
-互通消费者、官方对端下载与编排位于公开的
-[container-benchmark](https://github.com/YuanDevTeam/container-benchmark)，入口为
+互通消费者、官方对端下载与编排由独立容器测试工具维护，公开结果见
+[benchmark](../../docs/benchmark.md)，入口为
 `container-benchmark interop --source vole=PATH`，默认使用 Mihomo、Xray-core、
 Hysteria2、V2Ray 与 Caddy/Xray 的 64 个代表用例；Mihomo listener 的缺口保留原生
 或明确分层验证。`--backend` / `--protocol` 可筛选，`--list` 离线列举。

@@ -4,8 +4,8 @@
 均在隔离容器中运行。宿主只运行待测客户端、测试驱动和观察工具。
 纯内存、编解码和离线配置测试可在宿主执行；容器不可用时报告未执行，不回退到宿主服务端。
 
-编排、对端下载和压力测试由 [container-benchmark](https://github.com/YuanDevTeam/container-benchmark)
-管理，执行时显式传入 `--source vole=PATH`。Vole 编译不依赖 benchmark checkout。
+编排、对端下载和压力测试由独立容器测试工具管理，执行时显式传入
+`--source vole=PATH`。Vole 编译不依赖测试工具 checkout。
 
 ## 执行要求
 
@@ -20,4 +20,4 @@
    认证拒绝应确认原站未收到被拒绝的业务，客户端超时本身不能证明拒绝生效。
 
 互通、压力和设备验收分别执行，范围见 [验收边界](acceptance.md)。具体对端与用例参数
-由 benchmark 维护，本仓库不复制运行记录。
+由测试工具维护。公开实测结论见 [benchmark](benchmark.md)，原始运行记录保留在仓库外。

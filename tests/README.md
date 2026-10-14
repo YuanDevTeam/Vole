@@ -1,7 +1,7 @@
 # 测试
 
 核心配置、内存 I/O 和生命周期回归留在本仓库。网络互通与压力测试由
-[container-benchmark](https://github.com/YuanDevTeam/container-benchmark) 管理。
+独立容器测试工具管理，公开实测结论见 [benchmark](../docs/benchmark.md)。
 
 ## 本地检查
 

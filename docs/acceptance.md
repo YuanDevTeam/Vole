@@ -29,6 +29,6 @@ Linux RSS 不等于 Apple Network Extension physical footprint。
 数据有效性、实际完成量、负载到达、CPU、UDP loss、DNS完成数、测量有效性及退出/join/资源清理分别记录。测量成功不等于业务成功，编译、配置解析或连接成功不代替压力验收；失败或无效样本保留原结果，不参与有效性能胜出比较。以上是验收条件，不新增运行时admission或按整进程RSS拒绝业务的机制，资源所有权与局部容量仍遵循[运行时资源策略](runtime-resource-policy.md)。
 
 核心测试入口见 [tests](../tests/README.md)，平台与发布入口见 [scripts](../scripts/README.md)。
-网络互通和压力由 [container-benchmark](https://github.com/YuanDevTeam/container-benchmark)
-执行，遵守 [测试隔离](testing-isolation.md)。设备要求见 [TUN 平台层](tun-platform.md)
+网络互通和压力由独立容器测试工具执行，公开结果见 [benchmark](benchmark.md)，
+遵守 [测试隔离](testing-isolation.md)。设备要求见 [TUN 平台层](tun-platform.md)
 与 [Windows VPN](windows-vpn.md)。
