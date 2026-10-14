@@ -30,6 +30,22 @@ const DATAGRAM_QUEUE: usize = 64;
 const WORK: usize = 32;
 const RECEIVE_BATCH: usize = 16;
 
+#[derive(Clone, Debug, Default)]
+struct OwnedBuffers;
+impl quiche::BufFactory for OwnedBuffers {
+    type Buf = Bytes;
+    type DgramBuf = Bytes;
+
+    fn buf_from_slice(input: &[u8]) -> Bytes {
+        Bytes::copy_from_slice(input)
+    }
+
+    fn dgram_buf_from_slice(input: &[u8]) -> Bytes {
+        Bytes::copy_from_slice(input)
+    }
+}
+type NativeConnection = quiche::Connection<OwnedBuffers>;
+
 /// Protocol token for a locally admitted extended CONNECT request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Protocol(pub &'static str);
@@ -113,7 +129,7 @@ impl Body {
     }
 }
 struct State {
-    connection: Option<quiche::Connection>,
+    connection: Option<NativeConnection>,
     h3: Option<quiche::h3::Connection>,
     streams: BTreeMap<u64, Body>,
     closed: bool,
@@ -205,7 +221,7 @@ impl Driver {
             config.enable_dgram(options.datagrams, DATAGRAM_QUEUE, DATAGRAM_QUEUE);
             let mut cid = [0_u8; 20];
             boring::rand::rand_bytes(&mut cid).map_err(failure)?;
-            let mut connection = quiche::connect(
+            let mut connection = quiche::connect_with_buffer_factory::<OwnedBuffers>(
                 Some(raw.tls.server_name()),
                 &quiche::ConnectionId::from_ref(&cid),
                 local,
@@ -493,7 +509,7 @@ impl Driver {
 }
 // A retirement grace follows real transport progress and measured RTT. It is
 // only an opportunity to deliver queued data, never proof of remote receipt.
-fn retire_grace(connection: &quiche::Connection) -> Duration {
+fn retire_grace(connection: &NativeConnection) -> Duration {
     connection
         .path_stats()
         .filter(|path| path.active)
@@ -596,9 +612,12 @@ fn process_h3(state: &mut State) -> io::Result<()> {
     }
     // Unknown flow identifiers never allocate a map entry or an event.
     for _ in 0..WORK {
-        match state.connection.as_mut().unwrap().dgram_recv(&mut buf) {
-            Ok(n) => {
-                let Some((flow, used)) = varint(&buf[..n]) else {
+        match state.connection.as_mut().unwrap().dgram_recv_buf() {
+            Ok(frame) => {
+                if frame.len() > CHUNK {
+                    return Err(failure(quiche::Error::BufferTooShort));
+                }
+                let Some((flow, _)) = varint(&frame) else {
                     continue;
                 };
                 let Some(id) = flow.checked_mul(4) else {
@@ -612,10 +631,9 @@ fn process_h3(state: &mut State) -> io::Result<()> {
                     continue;
                 };
                 if queue.len() < DATAGRAM_QUEUE {
-                    queue.push_back(Bytes::copy_from_slice(&buf[..n]));
+                    queue.push_back(frame);
                     state.streams[&id].signals.datagram.wake();
                 }
-                let _ = used;
             }
             Err(quiche::Error::Done) => break,
             Err(error) => return Err(failure(error)),
@@ -687,7 +705,7 @@ impl Client {
             || state
                 .connection
                 .as_ref()
-                .is_none_or(quiche::Connection::is_closed))
+                .is_none_or(NativeConnection::is_closed))
         .then_some(())
     }
     pub(crate) async fn send_request(&mut self, request: Request<()>) -> io::Result<RequestStream> {
@@ -760,7 +778,12 @@ impl Client {
                 if state.closed {
                     return Err(closed());
                 }
-                match state.connection.as_mut().unwrap().dgram_send(&frame) {
+                match state
+                    .connection
+                    .as_mut()
+                    .unwrap()
+                    .dgram_send_buf(frame.clone())
+                {
                     Ok(()) => {
                         drop(state);
                         self.shared.changed.notify_one();
@@ -877,6 +900,7 @@ impl SendStream {
     pub(crate) async fn send_data(&mut self, mut data: Bytes) -> io::Result<()> {
         while !data.is_empty() {
             let maximum = data.len().min(CHUNK);
+            let mut chunk = data.slice(..maximum);
             let n = poll_fn(|cx| {
                 let mut state = self.client.shared.state.lock().unwrap();
                 if state.closed
@@ -888,10 +912,10 @@ impl SendStream {
                     return Poll::Ready(Err(closed()));
                 }
                 let State { connection, h3, .. } = &mut *state;
-                match h3.as_mut().unwrap().send_body(
+                match h3.as_mut().unwrap().send_body_zc(
                     connection.as_mut().unwrap(),
                     self.id,
-                    &data[..maximum],
+                    &mut chunk,
                     false,
                 ) {
                     Ok(n) if n > 0 => {

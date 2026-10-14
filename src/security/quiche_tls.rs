@@ -196,7 +196,10 @@ impl QuicheTls {
         Ok(config)
     }
 
-    pub(crate) fn prepare_connection(&self, connection: &mut quiche::Connection) -> io::Result<()> {
+    pub(crate) fn prepare_connection<F: quiche::BufFactory>(
+        &self,
+        connection: &mut quiche::Connection<F>,
+    ) -> io::Result<()> {
         #[cfg(feature = "ech")]
         if let Some(ech) = &self.ech {
             connection
@@ -209,7 +212,10 @@ impl QuicheTls {
         Ok(())
     }
 
-    pub(crate) fn check_handshake(&self, connection: &mut quiche::Connection) -> io::Result<()> {
+    pub(crate) fn check_handshake<F: quiche::BufFactory>(
+        &self,
+        connection: &mut quiche::Connection<F>,
+    ) -> io::Result<()> {
         if !connection.is_established() {
             return Err(io::Error::other("QUIC TLS handshake is incomplete"));
         }
