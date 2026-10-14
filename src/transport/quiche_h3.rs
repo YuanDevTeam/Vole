@@ -783,14 +783,18 @@ impl Client {
                 return Poll::Ready(Err(closed()));
             }
             let body = state.streams.get_mut(&id).ok_or_else(closed)?;
-            body.signals.datagram.register(cx.waker());
             if body.failed || body.finished || !body.receive_owned {
                 return Poll::Ready(Err(closed()));
             }
             let queue = body.datagrams.as_mut().ok_or_else(closed)?;
-            queue
-                .pop_front()
-                .map_or(Poll::Pending, |frame| Poll::Ready(Ok(frame)))
+            if let Some(frame) = queue.pop_front() {
+                Poll::Ready(Ok(frame))
+            } else {
+                // The owner also holds State when delivering progress. Only
+                // blocked operations register, with no gap for a lost wake.
+                body.signals.datagram.register(cx.waker());
+                Poll::Pending
+            }
         })
         .await
     }
@@ -874,7 +878,6 @@ impl SendStream {
         while !data.is_empty() {
             let maximum = data.len().min(CHUNK);
             let n = poll_fn(|cx| {
-                self.signals.write.register(cx.waker());
                 let mut state = self.client.shared.state.lock().unwrap();
                 if state.closed
                     || state
@@ -896,7 +899,10 @@ impl SendStream {
                         self.client.shared.changed.notify_one();
                         Poll::Ready(Ok(n))
                     }
-                    Ok(_) | Err(quiche::h3::Error::Done) => Poll::Pending,
+                    Ok(_) | Err(quiche::h3::Error::Done) => {
+                        self.signals.write.register(cx.waker());
+                        Poll::Pending
+                    }
                     Err(error) => Poll::Ready(Err(failure(error))),
                 }
             })
@@ -907,7 +913,6 @@ impl SendStream {
     }
     pub(crate) async fn finish(&mut self) -> io::Result<()> {
         poll_fn(|cx| {
-            self.signals.write.register(cx.waker());
             let mut state = self.client.shared.state.lock().unwrap();
             if state.closed
                 || state
@@ -932,7 +937,10 @@ impl SendStream {
                     self.client.shared.changed.notify_one();
                     Poll::Ready(Ok(()))
                 }
-                Err(quiche::h3::Error::Done) => Poll::Pending,
+                Err(quiche::h3::Error::Done) => {
+                    self.signals.write.register(cx.waker());
+                    Poll::Pending
+                }
                 Err(error) => Poll::Ready(Err(failure(error))),
             }
         })
@@ -955,7 +963,6 @@ pub(crate) struct RecvStream {
 impl RecvStream {
     pub(crate) async fn recv_response(&mut self) -> io::Result<Response<()>> {
         poll_fn(|cx| {
-            self.signals.read.register(cx.waker());
             let mut state = self.client.shared.state.lock().unwrap();
             if state.closed {
                 return Poll::Ready(Err(closed()));
@@ -972,6 +979,7 @@ impl RecvStream {
             if body.finished {
                 return Poll::Ready(Err(invalid()));
             }
+            self.signals.read.register(cx.waker());
             Poll::Pending
         })
         .await
@@ -980,7 +988,6 @@ impl RecvStream {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<Option<Bytes>>> {
-        self.signals.read.register(cx.waker());
         let mut state = self.client.shared.state.lock().unwrap();
         if state.closed {
             return Poll::Ready(Err(closed()));
@@ -1000,6 +1007,7 @@ impl RecvStream {
         if body.finished {
             return Poll::Ready(Ok(None));
         }
+        self.signals.read.register(cx.waker());
         Poll::Pending
     }
     pub(crate) fn stop_sending(&mut self, code: u64) {
@@ -1396,6 +1404,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(driver.run(cancel.clone()));
         let phase = std::sync::atomic::AtomicUsize::new(0);
+        let retained_ready_wakers = std::sync::atomic::AtomicUsize::new(0);
         let operation = async {
             client.ready(true).await.unwrap();
             phase.store(1, std::sync::atomic::Ordering::Release);
@@ -1408,14 +1417,29 @@ mod tests {
             let stream = client.send_request(request).await.unwrap();
             let id = stream.id().into_inner();
             client.register_datagrams(id).unwrap();
-            let (_send, mut receive) = stream.split();
+            let (mut send, mut receive) = stream.split();
             assert_eq!(receive.recv_response().await.unwrap().status(), 200);
+            retained_ready_wakers.fetch_add(
+                usize::from(receive.signals.read.take().is_some()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            send.send_data(Bytes::from_static(b"accepted"))
+                .await
+                .unwrap();
+            retained_ready_wakers.fetch_add(
+                usize::from(send.signals.write.take().is_some()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             phase.store(2, std::sync::atomic::Ordering::Release);
             assert_eq!(
                 client.read_datagram(id).await.unwrap().as_ref(),
                 &[0, 0, 0x42]
             );
             let state = client.shared.state.lock().unwrap();
+            retained_ready_wakers.fetch_add(
+                usize::from(state.streams[&id].signals.datagram.take().is_some()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             assert_eq!(state.streams.len(), 1);
             assert!(state.streams[&id].datagrams.as_ref().unwrap().len() <= DATAGRAM_QUEUE);
             assert_eq!(
@@ -1439,6 +1463,11 @@ mod tests {
         assert!(client.close_reason().is_some());
         assert!(client.shared.state.lock().unwrap().connection.is_none());
         assert!(client.shared.state.lock().unwrap().streams.is_empty());
+        assert_eq!(
+            retained_ready_wakers.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "completed H3 operations retained waiters after successful progress"
+        );
         assert!(
             result.is_ok(),
             "memory H3 timed out at phase {}, unknown frames enqueued {}",
