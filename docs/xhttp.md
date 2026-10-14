@@ -46,6 +46,9 @@ H3 响应 HEADERS 的解码字段预算为 16 KiB，编码 payload 预算为其 
 
 packet-up 在发送间隔内聚合小块写入，而不是把每个 write 变成一个 POST。最多保留一个待发送批次和一个在途批次，每批最多 64 KiB，并与本连接采样的 POST 上限取较小值；头部 payload 仍按请求预算拆分。write 完成只表示数据已进入有界缓冲，flush 等待对应 POST 确认；计时器无需调用方再次读写即可发送。shutdown 立即尝试 flush 未发送批次，卡住的 POST 仍受一秒上限控制。计时器/上传任务归节点所有，Stop 同步等待。
 
+body/auto 模式的 POST 共享已冻结批次的不可变 backing，不额外复制一份业务负载；
+发送任务和批次所有者分别释放引用，头部/cookie 模式继续使用有界编码。
+
 ## 独立下载腿
 
 `download-settings` 缺省和 `{}` 不等价：存在即启用独立下载连接/池，但仍共用一次 VLESS 握手、会话 ID 和建链上下文。两腿必须汇聚到**同一个原生 XHTTP handler 的会话表**；两个独立 listener 不能构成共享会话。

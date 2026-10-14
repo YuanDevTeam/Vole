@@ -28,12 +28,12 @@ pub(super) fn check_size(request: &Request<()>) -> io::Result<()> {
 
 pub(super) fn packet_payload(
     mut request: Request<()>,
-    data: &[u8],
+    data: &bytes::Bytes,
     placement: &DataPlacement,
 ) -> io::Result<(Request<()>, bytes::Bytes, usize)> {
     use base64::Engine as _;
     let DataPlacement::Chunks { key, cookie, size } = placement else {
-        return Ok((request, bytes::Bytes::copy_from_slice(data), data.len()));
+        return Ok((request, data.clone(), data.len()));
     };
     let base = request_size(&request);
     let fits = |raw: usize| {
@@ -226,4 +226,22 @@ fn tokenish(target: usize) -> String {
         result.push(char::from(ch));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_body_shares_the_frozen_batch_without_a_second_payload_allocation() {
+        let batch = bytes::Bytes::from(vec![7; crate::limits::XHTTP_PACKET_BATCH_BYTES]);
+        let (request, payload, count) =
+            packet_payload(Request::new(()), &batch, &DataPlacement::Body).unwrap();
+        assert_eq!(count, batch.len());
+        assert!(request.headers().is_empty());
+        assert_eq!(payload.as_ptr(), batch.as_ptr());
+        drop(batch);
+        assert_eq!(payload.len(), count);
+        assert!(payload.iter().all(|byte| *byte == 7));
+    }
 }
