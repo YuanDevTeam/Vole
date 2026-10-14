@@ -3,6 +3,10 @@
 `vole` 是前台入口。CLI 解析参数并调用 Invoke；配置读取、初始化、信号与清理由
 Invoke 的 `foreground` 操作处理，运行时复用同一个内核。
 
+GNU/Linux 前台启动在 Core 工作线程启动前，将 glibc 的 arena 默认设为 1，降低多线程
+堆的保留和碎片。显式 `MALLOC_ARENA_MAX` 或 `GLIBC_TUNABLES` 环境设置优先。
+普通业务 `start` 保留宿主的分配器策略；帮助和配置校验保持纯查询行为。
+
 ```sh
 vole -f /path/to/config.yaml
 vole -d /path/to/data -f ./config.yaml

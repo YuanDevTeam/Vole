@@ -194,12 +194,27 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
             .map_err(|_| failure("data directory initialization failed"))?;
         let controller = registry().create_instance()?;
         let mut cleanup = ForegroundInstance(Some(controller.clone()));
+        configure_foreground_allocator();
         let result = run_controller(controller, yaml, signals.wait()).await;
         let stopped = cleanup.destroy();
         result.and(stopped)
     })?;
     Ok(json!({"output":"","diagnostics":""}))
 }
+
+fn configure_foreground_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none()
+        && std::env::var_os("GLIBC_TUNABLES").is_none()
+    {
+        // SAFETY: the process-owned foreground instance has been admitted,
+        // and its Core workers have not started. glibc's public initialization
+        // interface takes integers and retains no caller-owned pointers.
+        // A refused hint preserves the system allocator's behavior.
+        let _ = unsafe { libc::mallopt(libc::M_ARENA_MAX, 1) };
+    }
+}
+
 fn validate_bytes(bytes: Vec<u8>, directory: &Path) -> Result<(), InvokeFailure> {
     let yaml = String::from_utf8(bytes).map_err(|_| failure("configuration is not UTF-8"))?;
     let config = super::parse_config_yaml_with_directory(&yaml, Some(directory))
