@@ -80,7 +80,7 @@ interop-test = ["outbound-anytls", "outbound-vless"]
 benchmark-geodata-http = []
 invoke = ["tun", "dns-quic", "tokio/rt-multi-thread", "tokio/signal"]
 ffi = ["invoke"]
-cli = ["invoke", "dep:mimalloc"]
+cli = ["invoke"]
 windows-wintun = ["tun", "dep:tun-rs"]
 windows-uwp = ["invoke", "dep:windows", "dep:windows-collections", "dep:windows-core"]
 tun = [
@@ -181,9 +181,6 @@ zstd = { version = "0.14.0", default-features = false }
 
 [target.'cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))'.dependencies]
 oslog = { version = "0.2", default-features = false }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-mimalloc = { version = "=0.1.52", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # Keep one Cargo dependency name across target tables. Unix compiles this small
