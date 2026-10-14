@@ -2096,10 +2096,13 @@ where
                     }
                 }
                 received_in_burst += 1;
-                if received_in_burst == crate::limits::IO_POLL_BUDGET {
+                let capacity = context.responses.max_capacity();
+                let writer_backlog =
+                    context.responses.capacity() <= capacity - capacity.div_ceil(4);
+                if writer_backlog || received_in_burst == crate::limits::IO_POLL_BUDGET {
                     received_in_burst = 0;
                     // Nonblocking response handoff must give the sole writer
-                    // a turn even while physical UDP readiness stays asserted.
+                    // a turn before many ready sources fill its shared queue.
                     tokio::task::yield_now().await;
                 }
             }

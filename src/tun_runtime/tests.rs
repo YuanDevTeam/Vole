@@ -1676,6 +1676,15 @@ fn tun_response_capacities_are_independent_of_tcp_accept_and_each_other() {
 
 #[tokio::test]
 async fn ready_udp_receive_bursts_let_the_response_writer_run_without_drops() {
+    assert_ready_udp_receive_bursts(1).await;
+}
+
+#[tokio::test]
+async fn concurrent_ready_udp_sources_let_the_response_writer_run_without_drops() {
+    assert_ready_udp_receive_bursts(8).await;
+}
+
+async fn assert_ready_udp_receive_bursts(sources: usize) {
     const PACKETS: u32 = 512;
     struct BurstDispatcher(SocketAddr);
     struct BurstDatagrams {
@@ -1718,46 +1727,62 @@ async fn ready_udp_receive_bursts_let_the_response_writer_run_without_drops() {
             })
         }
     }
-    let source = "192.0.2.10:12000".parse().unwrap();
     let remote = "198.51.100.20:443".parse().unwrap();
-    let (inbound, mut input) = mpsc::channel(1);
     let (responses, mut output) = mpsc::channel(64);
     let cancellation = CancellationToken::new();
     let stats = RuntimeResourceStats::new("udp_receive_burst_test");
-    let context = UdpAssociationTaskContext {
-        association_id: 1,
-        source,
-        responses,
-        dispatcher: Arc::new(BurstDispatcher(remote)),
-        resource_stats: stats.clone(),
-        association_clock: AssociationClock::realtime(),
-        last_activity: Arc::new(AtomicU64::new(0)),
-        tun_mtu: TUN_MTU,
-        udp_timeout: Duration::from_secs(30),
-        sniffer: None,
-        cancellation: cancellation.clone(),
-    };
-    let producer =
-        tokio::spawn(async move { run_udp_association_inner(&mut input, &context).await });
+    let mut inbound = Vec::new();
+    let mut producers = Vec::new();
+    for index in 0..sources {
+        let source = SocketAddr::new("192.0.2.10".parse().unwrap(), 12000 + index as u16);
+        let (sender, mut input) = mpsc::channel(1);
+        inbound.push(sender);
+        let context = UdpAssociationTaskContext {
+            association_id: index as u64 + 1,
+            source,
+            responses: responses.clone(),
+            dispatcher: Arc::new(BurstDispatcher(remote)),
+            resource_stats: stats.clone(),
+            association_clock: AssociationClock::realtime(),
+            last_activity: Arc::new(AtomicU64::new(0)),
+            tun_mtu: TUN_MTU,
+            udp_timeout: Duration::from_secs(30),
+            sniffer: None,
+            cancellation: cancellation.clone(),
+        };
+        producers.push(tokio::spawn(async move {
+            run_udp_association_inner(&mut input, &context).await
+        }));
+    }
     let received = timeout(Duration::from_millis(200), async {
-        for sequence in 0..PACKETS {
+        let mut next = vec![0_u32; sources];
+        for _ in 0..PACKETS as usize * sources {
             let response = output.recv().await.expect("memory UDP producer closed");
+            let index = usize::from(response.destination.port().saturating_sub(12000));
             if response.source != remote
-                || response.destination != source
-                || response.payload[..] != sequence.to_be_bytes()
+                || response.destination
+                    != SocketAddr::new("192.0.2.10".parse().unwrap(), 12000 + index as u16)
+                || index >= sources
+                || response.payload[..] != next[index].to_be_bytes()
             {
                 return false;
             }
+            next[index] += 1;
+            // The real writer charges each emitted packet in addition to
+            // channel reception, even when all producers remain ready.
+            tokio::task::consume_budget().await;
         }
         true
     })
     .await;
     cancellation.cancel();
-    timeout(Duration::from_secs(1), producer)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    for producer in producers {
+        timeout(Duration::from_secs(1), producer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
     drop(inbound);
     assert!(
         matches!(received, Ok(true)),
