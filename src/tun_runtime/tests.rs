@@ -1658,7 +1658,7 @@ fn quic_flow_state_is_isolated_by_destination_and_unconfigured_ports_are_skipped
 #[test]
 fn tun_response_capacities_are_independent_of_tcp_accept_and_each_other() {
     let tun = ResourceLimits::default();
-    assert_eq!(tun.tun_udp_response_queue_capacity, 4_096);
+    assert_eq!(tun.tun_udp_response_queue_capacity, 1_024);
     assert_eq!(tun.tun_dns_response_queue_capacity, 128);
     let altered = ResourceLimits {
         event_queue_capacity: 3,
@@ -1690,14 +1690,15 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
         },
         cancellation.clone(),
     );
-    assert_eq!(ordinary.max_capacity(), 4_096);
+    assert_eq!(ordinary.max_capacity(), 1_024);
     assert_eq!(dns.max_capacity(), 128);
+    let capacity = u32::try_from(ordinary.max_capacity()).unwrap();
     let source: SocketAddr = "192.0.2.10:12000".parse().unwrap();
     let server: SocketAddr = "198.51.100.20:443".parse().unwrap();
     let response =
         |sequence: u32| UdpDatagram::new(server, source, sequence.to_be_bytes().to_vec());
     let last_activity = AtomicU64::new(5);
-    for sequence in 0..4_096 {
+    for sequence in 0..capacity {
         assert!(matches!(
             try_queue_tun_udp_response(
                 &ingress.responses,
@@ -1709,18 +1710,21 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
             ResponseQueueResult::Queued
         ));
     }
-    assert_eq!(ordinary.len(), 4_096);
+    assert_eq!(ordinary.len(), capacity as usize);
     assert!(matches!(
         try_queue_tun_udp_response(
             &ingress.responses,
-            response(4_096),
+            response(capacity),
             &last_activity,
             5_000,
             &stats,
         ),
         ResponseQueueResult::Dropped
     ));
-    assert_eq!(last_activity.load(Ordering::Acquire), 4_195);
+    assert_eq!(
+        last_activity.load(Ordering::Acquire),
+        u64::from(capacity) + 99
+    );
     assert_eq!(stats.snapshot().udp_response_queue_drops, 1);
     assert_eq!(stats.snapshot().udp_association_queue_drops, 0);
     assert_eq!(stats.snapshot().dns_queue_drops, 0);
@@ -1736,14 +1740,14 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
     assert!(matches!(
         try_queue_tun_udp_response(
             &ingress.responses,
-            response(4_097),
+            response(capacity + 1),
             &last_activity,
             5_001,
             &stats,
         ),
         ResponseQueueResult::Queued
     ));
-    for sequence in 1_u32..4_096 {
+    for sequence in 1_u32..capacity {
         assert_eq!(
             &ordinary.try_recv().unwrap().payload[..],
             sequence.to_be_bytes()
@@ -1751,7 +1755,7 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
     }
     assert_eq!(
         &ordinary.try_recv().unwrap().payload[..],
-        4_097_u32.to_be_bytes()
+        (capacity + 1).to_be_bytes()
     );
     assert!(matches!(
         ordinary.try_recv(),
@@ -1761,7 +1765,7 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
     assert!(matches!(
         try_queue_tun_udp_response(
             &ingress.responses,
-            response(4_098),
+            response(capacity + 2),
             &last_activity,
             6_000,
             &stats,
