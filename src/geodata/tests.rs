@@ -1171,6 +1171,53 @@ fn geoip_records_load_without_count_limits_before_cidr_compaction() {
 }
 
 #[test]
+fn loaded_geodata_releases_growth_slack_without_dropping_records() {
+    let dir = tempdir().unwrap();
+    let records: Vec<_> = (0..513)
+        .map(|index| domain(3, &format!("record-{index}.example")))
+        .collect();
+    write_asset(
+        dir.path(),
+        GEOSITE_FILE_NAME,
+        &site_list(&[site("cn", &records)]),
+    );
+    let cidrs = vec![cidr(&[203, 0, 113, 9], 32); 513];
+    write_asset(
+        dir.path(),
+        GEOIP_FILE_NAME,
+        &geoip_list(&[geoip("cn", &cidrs, false)]),
+    );
+    let data = GeoData::load(
+        dir.path(),
+        &[
+            rule(RuleKind::GeoSite("cn".into())),
+            rule(RuleKind::GeoIp("cn".into())),
+        ],
+    )
+    .unwrap();
+    for index in 0..513 {
+        assert!(data.matches_geosite("cn", &format!("record-{index}.example")));
+    }
+    assert!(data.matches_geoip("cn", "203.0.113.9".parse().unwrap()));
+    assert!(!data.matches_geoip("cn", "203.0.113.10".parse().unwrap()));
+    let site = &data.sites[0];
+    let retained =
+        site.patterns.capacity() * mem::size_of::<SitePattern>() + site.values.capacity();
+    let content = site.patterns.len() * mem::size_of::<SitePattern>() + site.values.len();
+    assert!(
+        retained <= content + content / 10,
+        "loaded immutable storage retains growth slack"
+    );
+    let ip = &data.ips[0];
+    assert!(
+        ip.v4.capacity() <= ip.v4.len() + 1,
+        "compacted prefixes retain pre-compaction capacity"
+    );
+    assert!(data.allocation_capacity() >= retained + ip.v4.capacity() * mem::size_of::<Cidr4>());
+    assert!(data.peak_allocation_capacity() >= data.allocation_capacity());
+}
+
+#[test]
 fn large_assets_skip_unselected_payloads_without_file_size_quotas() {
     use std::io::Write;
     let dir = tempdir().unwrap();

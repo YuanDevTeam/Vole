@@ -1344,7 +1344,7 @@ fn parse_site_category<'a>(
     release_vec(&present, ledger);
     release_vec(&filter_matches, ledger);
     match result {
-        Ok(regexes) => {
+        Ok(mut regexes) => {
             // In-place sort does not duplicate the arena or retain a second
             // index. Keep every record, including overlapping types/duplicates.
             patterns.sort_unstable_by(|left, right| {
@@ -1358,7 +1358,12 @@ fn parse_site_category<'a>(
                         .cmp(&right.kind)
                         .then_with(|| left.value(&values).cmp(right.value(&values)))
                 });
+                compact_vec(&mut filter.patterns, ledger)?;
+                compact_vec(&mut filter.regex_indices, ledger)?;
             }
+            compact_vec(&mut patterns, ledger)?;
+            compact_vec(&mut values, ledger)?;
+            compact_vec(&mut regexes, ledger)?;
             Ok(SiteCategory {
                 code: range.code,
                 patterns,
@@ -1896,6 +1901,8 @@ fn parse_ip_category(
         }
         compact_v4(&mut v4);
         compact_v6(&mut v6);
+        compact_vec(&mut v4, ledger)?;
+        compact_vec(&mut v6, ledger)?;
         Ok(())
     })();
     match result {
@@ -2141,6 +2148,21 @@ fn ensure_vec_capacity<T>(
 
 fn release_vec<T>(values: &Vec<T>, ledger: &mut AllocationLedger) {
     ledger.release(values.capacity().saturating_mul(mem::size_of::<T>()));
+}
+
+fn compact_vec<T>(values: &mut Vec<T>, ledger: &mut AllocationLedger) -> Result<(), GeoDataError> {
+    if values.capacity() == values.len() || mem::size_of::<T>() == 0 {
+        return Ok(());
+    }
+    let old = values.capacity() * mem::size_of::<T>();
+    let desired = values.len() * mem::size_of::<T>();
+    // Account for a possible moved allocation, including its overlap. The
+    // allocator may keep capacity; charge the actual retained size afterwards.
+    ledger.reserve(desired)?;
+    values.shrink_to_fit();
+    ledger.release(old);
+    ledger.reserve(values.capacity() * mem::size_of::<T>() - desired)?;
+    Ok(())
 }
 
 fn read_key(file: &mut File, end: u64, kind: GeoDataKind) -> Result<(u32, u8), GeoDataError> {
