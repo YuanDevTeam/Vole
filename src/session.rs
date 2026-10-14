@@ -2,8 +2,6 @@ use std::{fmt, net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 
-pub(crate) mod receive_pool;
-
 const DEFAULT_TUN_MTU: usize = 1_500;
 const IPV6_UDP_OVERHEAD: usize = 48;
 const TUN_XUDP_MAX_RESPONSE_PAYLOAD_SIZE: u16 = (DEFAULT_TUN_MTU - IPV6_UDP_OVERHEAD) as u16;
@@ -155,24 +153,13 @@ pub struct StreamSession {
     pub sniffed_domain: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatagramSession {
     pub metadata: InboundMetadata,
     pub inbound: InboundKind,
     pub source: SocketAddr,
     max_response_payload_size: u16,
-    receive_pool: Option<Arc<receive_pool::ReceivePool>>,
 }
-
-impl PartialEq for DatagramSession {
-    fn eq(&self, other: &Self) -> bool {
-        self.metadata == other.metadata
-            && self.inbound == other.inbound
-            && self.source == other.source
-            && self.max_response_payload_size == other.max_response_payload_size
-    }
-}
-impl Eq for DatagramSession {}
 
 impl DatagramSession {
     /// Builds a UDP association with an inbound-specific XUDP response limit.
@@ -196,7 +183,6 @@ impl DatagramSession {
             inbound,
             source,
             max_response_payload_size,
-            receive_pool: None,
         }
     }
 
@@ -213,21 +199,7 @@ impl DatagramSession {
             } else {
                 payload_size as u16
             },
-            receive_pool: None,
         }
-    }
-
-    pub(crate) fn with_receive_pool(mut self) -> Self {
-        if self.inbound == InboundKind::Tun && self.receive_pool.is_none() {
-            self.receive_pool = Some(receive_pool::ReceivePool::new(usize::from(
-                self.max_response_payload_size,
-            )));
-        }
-        self
-    }
-
-    pub(crate) fn receive_pool(&self) -> Option<Arc<receive_pool::ReceivePool>> {
-        self.receive_pool.clone()
     }
 
     #[must_use]

@@ -1,7 +1,6 @@
 use std::{
     io,
     net::SocketAddr,
-    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -82,7 +81,6 @@ impl OutboundConnector for DirectOutbound {
                 self.dialer.clone(),
                 usize::from(request.max_response_payload_size()),
                 request.udp_receive_buffer_size(),
-                request.session.receive_pool(),
             )),
             request.budget(),
         ))
@@ -96,7 +94,6 @@ struct DirectDatagramTransport {
     receive_buffer_size: Option<usize>,
     receive_buffer: Vec<u8>,
     receive_cursor: usize,
-    receive_pool: Option<Arc<crate::session::receive_pool::ReceivePool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +107,6 @@ impl DirectDatagramTransport {
         dialer: Dialer,
         max_response_payload_size: usize,
         receive_buffer_size: Option<usize>,
-        receive_pool: Option<Arc<crate::session::receive_pool::ReceivePool>>,
     ) -> Self {
         Self {
             dialer,
@@ -119,7 +115,6 @@ impl DirectDatagramTransport {
             receive_buffer_size,
             receive_buffer: Vec::new(),
             receive_cursor: 0,
-            receive_pool,
         }
     }
 
@@ -150,7 +145,6 @@ impl DirectDatagramTransport {
         cursor: &mut usize,
         context: &mut Context<'_>,
         scratch: &mut Vec<u8>,
-        receive_pool: Option<&Arc<crate::session::receive_pool::ReceivePool>>,
     ) -> Poll<Result<Datagram, DispatchError>> {
         if sockets.is_empty() {
             return Poll::Ready(Err(DispatchError::Other(
@@ -179,10 +173,7 @@ impl DirectDatagramTransport {
                         *cursor = (index + 1) % sockets.len();
                         return Poll::Ready(Ok(Datagram {
                             remote: Destination::Ip(remote),
-                            payload: receive_pool.map_or_else(
-                                || Bytes::copy_from_slice(&scratch[..length]),
-                                |pool| pool.copy(&scratch[..length]),
-                            ),
+                            payload: Bytes::copy_from_slice(&scratch[..length]),
                             sniffed_domain: None,
                         }));
                     }
@@ -246,7 +237,6 @@ impl DatagramTransport for DirectDatagramTransport {
             &mut self.receive_cursor,
             context,
             scratch,
-            self.receive_pool.as_ref(),
         )
     }
 
@@ -258,7 +248,6 @@ impl DatagramTransport for DirectDatagramTransport {
                 &mut self.receive_cursor,
                 context,
                 &mut self.receive_buffer,
-                self.receive_pool.as_ref(),
             )
         })
         .await
@@ -343,12 +332,7 @@ mod tests {
     async fn direct_udp_drops_an_oversized_response_without_truncating_it() {
         let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let destination = remote.local_addr().unwrap();
-        let mut transport = DirectDatagramTransport::new(
-            Dialer::default(),
-            4,
-            None,
-            Some(crate::session::receive_pool::ReceivePool::new(4)),
-        );
+        let mut transport = DirectDatagramTransport::new(Dialer::default(), 4, None);
         transport
             .send(Datagram {
                 remote: Destination::Ip(destination),
