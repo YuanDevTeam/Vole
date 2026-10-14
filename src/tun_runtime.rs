@@ -2006,6 +2006,7 @@ where
     let mut ready = VecDeque::new();
     let mut pending_send = None;
     let mut first_response_logged = false;
+    let mut received_in_burst = 0;
     loop {
         let sniff_deadline = quic_sniff.next_deadline();
         let event = tokio::select! {
@@ -2093,6 +2094,13 @@ where
                         tracing::debug!(association_id, "TUN UDP response channel closed");
                         break;
                     }
+                }
+                received_in_burst += 1;
+                if received_in_burst == crate::limits::IO_POLL_BUDGET {
+                    received_in_burst = 0;
+                    // Nonblocking response handoff must give the sole writer
+                    // a turn even while physical UDP readiness stays asserted.
+                    tokio::task::yield_now().await;
                 }
             }
         }

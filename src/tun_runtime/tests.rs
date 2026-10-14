@@ -1675,6 +1675,98 @@ fn tun_response_capacities_are_independent_of_tcp_accept_and_each_other() {
 }
 
 #[tokio::test]
+async fn ready_udp_receive_bursts_let_the_response_writer_run_without_drops() {
+    const PACKETS: u32 = 512;
+    struct BurstDispatcher(SocketAddr);
+    struct BurstDatagrams {
+        remote: SocketAddr,
+        sequence: u32,
+    }
+    #[async_trait]
+    impl Dispatcher for BurstDispatcher {
+        async fn connect_tcp(&self, _: StreamSession) -> Result<BoxStream, DispatchError> {
+            Err(DispatchError::Other("unused memory TCP path".into()))
+        }
+        async fn open_datagram(
+            &self,
+            _: DatagramSession,
+        ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+            Ok(Box::new(BurstDatagrams {
+                remote: self.0,
+                sequence: 0,
+            }))
+        }
+    }
+    #[async_trait]
+    impl DatagramTransport for BurstDatagrams {
+        async fn send(&mut self, _: Datagram) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            if self.sequence == PACKETS {
+                std::future::pending::<()>().await;
+            }
+            // A real Tokio UDP readiness operation also charges cooperation.
+            // The native quantum alone can exceed this writer handoff queue.
+            tokio::task::consume_budget().await;
+            let payload = Bytes::copy_from_slice(&self.sequence.to_be_bytes());
+            self.sequence += 1;
+            Ok(Datagram {
+                remote: Destination::Ip(self.remote),
+                payload,
+                sniffed_domain: None,
+            })
+        }
+    }
+    let source = "192.0.2.10:12000".parse().unwrap();
+    let remote = "198.51.100.20:443".parse().unwrap();
+    let (inbound, mut input) = mpsc::channel(1);
+    let (responses, mut output) = mpsc::channel(64);
+    let cancellation = CancellationToken::new();
+    let stats = RuntimeResourceStats::new("udp_receive_burst_test");
+    let context = UdpAssociationTaskContext {
+        association_id: 1,
+        source,
+        responses,
+        dispatcher: Arc::new(BurstDispatcher(remote)),
+        resource_stats: stats.clone(),
+        association_clock: AssociationClock::realtime(),
+        last_activity: Arc::new(AtomicU64::new(0)),
+        tun_mtu: TUN_MTU,
+        udp_timeout: Duration::from_secs(30),
+        sniffer: None,
+        cancellation: cancellation.clone(),
+    };
+    let producer =
+        tokio::spawn(async move { run_udp_association_inner(&mut input, &context).await });
+    let received = timeout(Duration::from_millis(200), async {
+        for sequence in 0..PACKETS {
+            let response = output.recv().await.expect("memory UDP producer closed");
+            if response.source != remote
+                || response.destination != source
+                || response.payload[..] != sequence.to_be_bytes()
+            {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+    cancellation.cancel();
+    timeout(Duration::from_secs(1), producer)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(inbound);
+    assert!(
+        matches!(received, Ok(true)),
+        "ready receive burst starved the response writer"
+    );
+    assert_eq!(stats.snapshot().udp_response_queue_drops, 0);
+}
+
+#[tokio::test]
 async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns() {
     let stats = RuntimeResourceStats::new("tun_response_capacity_test");
     let cancellation = CancellationToken::new();
