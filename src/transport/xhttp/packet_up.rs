@@ -13,7 +13,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tokio::{io::AsyncWrite, sync::Notify};
+use tokio::{io::AsyncWrite, sync::Notify, time::Instant};
 
 struct State {
     buffer: BytesMut,
@@ -169,6 +169,7 @@ async fn transmit(
     session: Arc<str>,
 ) -> io::Result<()> {
     let mut sequence = 0_u64;
+    let mut last_post_started = None;
     loop {
         loop {
             let changed = shared.changed.notified();
@@ -178,7 +179,7 @@ async fn transmit(
             changed.await;
         }
         let delay = || Duration::from_millis(request.options.post_interval_ms.sample() as u64);
-        wait_interval(shared, delay()).await;
+        wait_interval(shared, last_post_started, delay()).await;
         // One bounded batch in flight and one filling batch. Only this driver
         // owns POST completion; read cannot acknowledge a pending caller write.
         let mut batch = {
@@ -193,22 +194,30 @@ async fn transmit(
                 super::request::packet_payload(headers, &batch, &request.options.data)?;
             sequence = sequence.checked_add(1).ok_or_else(connection_closed)?;
             batch.advance(count);
+            last_post_started = Some(Instant::now());
             super::post_packet(sender.clone(), headers, payload).await?;
             shared.state.lock().unwrap().committed += count as u64;
             shared.flush.wake();
             if !batch.is_empty() {
-                wait_interval(shared, delay()).await;
+                wait_interval(shared, last_post_started, delay()).await;
             }
         }
     }
 }
 
-async fn wait_interval(shared: &Shared, delay: Duration) {
+async fn wait_interval(shared: &Shared, last_post_started: Option<Instant>, delay: Duration) {
     let finish = shared.finish.notified();
     if !shared.finishing.load(Ordering::Acquire) {
+        // The first batch retains its aggregation delay. Later POST starts are
+        // separated by the sampled interval, including the previous exchange.
+        let deadline = last_post_started.unwrap_or_else(Instant::now) + delay;
         tokio::select! { biased;
             () = finish => {},
-            () = tokio::time::sleep(delay) => {},
+            () = tokio::time::sleep_until(deadline) => {},
         }
     }
 }
+
+#[cfg(test)]
+#[path = "packet_up_timing_tests.rs"]
+mod timing_tests;
