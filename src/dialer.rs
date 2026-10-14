@@ -1294,7 +1294,7 @@ mod tests {
             }
             dialer.shutdown().await;
             assert_eq!(protector.0.load(Ordering::Relaxed), 8192);
-            assert!(probe.snapshot().peak(ResourceKind::Task) <= 64);
+            assert!(probe.snapshot().peak(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
             assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
             println!("socket initialization churn: {:?}", probe.snapshot());
         }));
@@ -1374,7 +1374,7 @@ mod tests {
             }
             timeout(Duration::from_secs(3), async {
                 while callers_started.load(Ordering::Acquire) != 4096
-                    || probe.snapshot().current(ResourceKind::Task) < 64
+                    || probe.snapshot().current(ResourceKind::Task) < MAX_SOCKET_INITIALIZATIONS
                     || protector.entered.load(Ordering::Acquire) < 4
                 {
                     tokio::task::yield_now().await;
@@ -1382,8 +1382,8 @@ mod tests {
             })
             .await
             .unwrap();
-            assert!(probe.snapshot().current(ResourceKind::Task) <= 64);
-            assert!(probe.snapshot().peak(ResourceKind::Task) <= 64);
+            assert!(probe.snapshot().current(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
+            assert!(probe.snapshot().peak(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
             println!("socket initialization backlog: {:?}", probe.snapshot());
 
             attempts.abort_all();
@@ -1523,7 +1523,7 @@ mod tests {
                 }
                 timeout(Duration::from_secs(3), async {
                     while callers_started.load(Ordering::Acquire) != submitted
-                        || probe.snapshot().current(ResourceKind::Task) < 64
+                        || probe.snapshot().current(ResourceKind::Task) < MAX_SOCKET_INITIALIZATIONS
                     {
                         tokio::task::yield_now().await;
                     }
@@ -1531,8 +1531,8 @@ mod tests {
                 .await
                 .unwrap();
                 let before_cancel = probe.snapshot();
-                assert!(before_cancel.current(ResourceKind::Task) <= 64);
-                assert!(before_cancel.peak(ResourceKind::Task) <= 64);
+                assert!(before_cancel.current(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
+                assert!(before_cancel.peak(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
                 assert_eq!(before_cancel.current(ResourceKind::Socket), 0);
                 assert_eq!(protector.0.load(Ordering::Relaxed), 0);
                 println!(
@@ -1550,8 +1550,8 @@ mod tests {
                 .await
                 .unwrap();
                 let after_cancel = probe.snapshot();
-                assert!(after_cancel.current(ResourceKind::Task) <= 64);
-                assert!(after_cancel.peak(ResourceKind::Task) <= 64);
+                assert!(after_cancel.current(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
+                assert!(after_cancel.peak(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
                 assert_eq!(after_cancel.current(ResourceKind::Socket), 0);
                 assert_eq!(protector.0.load(Ordering::Relaxed), 0);
                 println!(

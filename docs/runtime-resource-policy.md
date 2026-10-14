@@ -67,7 +67,7 @@ TCP/UDP 共用 Dialer：创建 socket、nonblocking、源地址/Windows 接口�
 业务 worker。异步 connect、reactor 注册与收发仍在原 runtime，不新增独立线程池、
 CPU 数判断、业务数量配额、FD 预热或 DNS socket 复用。
 
-每个初始化作用域最多持有 64 个未完成的阻塞提交，TCP/UDP 共用内部许可。
+每个初始化作用域最多持有 4 个未完成的阻塞提交，TCP/UDP 共用内部许可。
 在登记任务、创建 socket 和 `spawn_blocking` 前异步等待许可，不因繁忙返回容量错误；
 等待继承调用方期限和取消，Stop 关闭准入并唤醒等待者。许可由阻塞任务持有到真正
 完成或被丢弃，调用方提前取消不会释放已开始工作的许可。它不限制已建立连接，

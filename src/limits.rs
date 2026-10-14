@@ -80,7 +80,7 @@ pub(crate) const MAX_DNS_WORKERS: usize = 4;
 /// Unfinished physical socket setup jobs per lifecycle owner, shared by TCP
 /// and UDP. Callers wait for submission capacity; established connections are
 /// not counted and receive no business-concurrency quota.
-pub(crate) const MAX_SOCKET_INITIALIZATIONS: usize = 64;
+pub(crate) const MAX_SOCKET_INITIALIZATIONS: usize = 4;
 
 /// Retained-memory, queue and per-object safety boundaries.
 ///
