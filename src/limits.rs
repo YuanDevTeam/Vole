@@ -124,7 +124,7 @@ impl Default for ResourceLimits {
             dns_address_cache_entries: 256,
             dns_redir_host_entries: 256,
             tun_udp_association_queue_capacity: 64,
-            tun_udp_response_queue_capacity: 1_024,
+            tun_udp_response_queue_capacity: 256,
             tun_dns_response_queue_capacity: 128,
             tls_buffer_limit: 64 * 1024,
             xhttp_send_buffer_size: 64 * 1024,
@@ -236,7 +236,7 @@ mod tests {
         assert_eq!(limits.dns_address_cache_entries, 256);
         assert_eq!(limits.dns_redir_host_entries, 256);
         assert_eq!(limits.tun_udp_association_queue_capacity, 64);
-        assert_eq!(limits.tun_udp_response_queue_capacity, 1_024);
+        assert_eq!(limits.tun_udp_response_queue_capacity, 256);
         assert_eq!(limits.tun_dns_response_queue_capacity, 128);
         assert_eq!(limits.tls_buffer_limit, 64 * 1024);
         assert_eq!(limits.xhttp_send_buffer_size, 64 * 1024);
