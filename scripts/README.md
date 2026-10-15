@@ -7,9 +7,7 @@ Linux 自动准备原生依赖还需要 curl、zip、unzip 和 tar。
 uv run --project scripts --locked vole-scripts build cli
 uv run --project scripts --locked vole-scripts build cli --profile debug
 uv run --project scripts --locked vole-scripts build cli --target aarch64-apple-darwin
-uv run --project scripts --locked vole-scripts build cli --low-memory
 uv run --project scripts --locked vole-scripts build apple
-uv run --project scripts --locked vole-scripts build apple --low-memory
 uv run --project scripts --locked vole-scripts build android
 uv run --project scripts --locked vole-scripts build linux
 uv run --project scripts --locked vole-scripts build windows --backend wintun
@@ -17,11 +15,6 @@ uv run --project scripts --locked vole-scripts build windows --backend uwp
 ```
 
 CLI 默认构建当前宿主的 Release，Windows 固定 Wintun；Windows FFI 默认 UWP。
-所有 `build` 子命令均支持 `--low-memory`，显式启用 Core 的 `low-memory` Cargo feature。
-内存策略由该编译条件决定，不根据操作系统自动切换；非 Apple 平台也可构建同一低内存策略
-用于压力验证。未传入时保留默认策略，Apple XCFramework 的全部切片使用同一选项。
-该选项与 CLI/FFI、Windows 后端 feature 组合，不改变产物名称和发布矩阵；tag release
-继续构建默认策略。
 脚本输出产物路径，编译失败直接返回失败。
 Windows 的构建和验证只允许宿主原生架构：x64 使用 x64 Python、MSVC 与产物，
 ARM64 使用 ARM64 Python、MSVC 与产物，不跨架构编译或通过模拟运行验证。

@@ -78,8 +78,6 @@ dns-quic = ["quinn-h3-transport"]
 interop-test = ["outbound-anytls", "outbound-vless"]
 # Allows plaintext GeoData fixtures for isolated benchmarks, never production.
 benchmark-geodata-http = []
-# Enables process-level low-memory allocator hints and TUN memory diagnostics.
-low-memory = []
 invoke = ["tun", "dns-quic", "tokio/rt-multi-thread", "tokio/signal"]
 ffi = ["invoke"]
 cli = ["invoke"]

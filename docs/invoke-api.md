@@ -319,10 +319,10 @@ Stop 关闭本次持有的 fd、session 和原生句柄；Wintun 不承诺移除
 标准输入和退出信号，并安装有界 stderr 诊断，适用于前台进程宿主。嵌入式、服务或 VPN
 宿主继续用普通业务生命周期方法和自身的退出机制。
 解析后的配置直接交给同一启动路径，不重复读取或解析。
-`low-memory` 编译 feature 控制 CLI 与普通 `start` 共用的 TUN allocator 策略、
-内存诊断和 Stop 后回收；默认构建或无 TUN 的会话不修改 allocator。
+CLI 与普通 `start` 共用统一的 TUN allocator 策略、内存诊断和 Stop 后回收；
+无 TUN 的会话不修改 allocator。
 GNU/Linux 的设置是进程级、一次性的，显式 allocator 环境覆盖仍优先，
-完整语义见[运行时资源策略](runtime-resource-policy.md#低内存编译模式)。
+完整语义见[运行时资源策略](runtime-resource-policy.md#统一内存策略)。
 Unix 等待 SIGINT/SIGTERM，Windows 等待 Ctrl+C/Ctrl+Break；标准输入先读取，之后在
 内部准备和启动前注册信号。启动中收到信号仍等待启动工作器结束，再停止和销毁；运行期
 通过引擎完成通知等待结束，随后 join 确认结果，不持有命令锁等待信号。启动、关键数据面、

@@ -106,37 +106,17 @@ class BuildTests(unittest.TestCase):
             )
             self.assertEqual("--bins" in command, backend == "uwp")
 
-    def test_low_memory_cli_and_linux_preserve_transport_features(self):
+    def test_linux_cli_and_ffi_preserve_transport_features(self):
         target = "aarch64-unknown-linux-gnu"
         with (
             patch.object(builds.platform, "system", return_value="Linux"),
             patch.object(builds, "native_target", return_value=target),
         ):
-            builds.build_cli(low_memory=True)
-            builds.build_linux(low_memory=True)
+            builds.build_cli()
+            builds.build_linux()
         self.assertEqual(
             [command[command.index("--features") + 1] for command, _ in self.commands],
-            ["cli,low-memory", "ffi,low-memory"],
-        )
-
-    def test_windows_low_memory_preserves_cli_and_ffi_backends(self):
-        with (
-            patch.object(builds.platform, "system", return_value="Windows"),
-            patch.object(builds, "_windows_architecture", return_value="arm64"),
-            patch.object(
-                builds, "_windows_msvc_environment", return_value=dict(os.environ)
-            ),
-        ):
-            builds.build_cli(low_memory=True)
-            builds.build_windows("wintun", low_memory=True)
-            builds.build_windows("uwp", low_memory=True)
-        self.assertEqual(
-            [command[command.index("--features") + 1] for command, _ in self.commands],
-            [
-                "cli,windows-wintun,low-memory",
-                "ffi,windows-wintun,low-memory",
-                "ffi,windows-uwp,low-memory",
-            ],
+            ["cli", "ffi"],
         )
 
     def test_windows_requires_native_python(self):
@@ -248,14 +228,13 @@ class BuildTests(unittest.TestCase):
                 {"ANDROID_NDK_HOME": str(self.root / "ndk"), "VOLE_ANDROID_API": "28"},
             ),
         ):
-            for low_memory in (False, True):
-                output = builds.build_android(low_memory=low_memory)
-        for index, (command, env) in enumerate(self.commands):
+            output = builds.build_android()
+        for command, env in self.commands:
             target = command[command.index("--target") + 1]
             abi = env["VOLE_CMAKE_ANDROID_ABI"]
             self.assertEqual(
                 command[command.index("--features") + 1],
-                "ffi" if index < 2 else "ffi,low-memory",
+                "ffi",
             )
             self.assertEqual(
                 env[f"BINDGEN_EXTRA_CLANG_ARGS_{target}"], f"--target={target}28"
@@ -317,40 +296,21 @@ class BuildTests(unittest.TestCase):
             (work / "ios-simulator/libvole.a").read_bytes(), b"aarch64-apple-ios-sim"
         )
 
-    def test_apple_low_memory_applies_to_every_xcframework_slice(self):
-        with patch.object(builds.platform, "system", return_value="Darwin"):
-            builds.build_apple(low_memory=True)
-        commands = [
-            command for command, _ in self.commands if command[:2] == ["cargo", "build"]
-        ]
-        self.assertEqual(
-            [command[command.index("--target") + 1] for command in commands],
-            list(builds.APPLE_TARGETS),
-        )
-        self.assertTrue(
-            all(
-                command[command.index("--features") + 1] == "ffi,low-memory"
-                for command in commands
-            )
-        )
-
-    def test_low_memory_preserves_production_override_and_rejects_test_features(self):
+    def test_apple_preserves_production_override_and_rejects_test_features(self):
         with (
             patch.object(builds.platform, "system", return_value="Darwin"),
             patch.dict(os.environ, {"VOLE_FEATURES": "ffi,controller"}),
         ):
-            builds.build_apple_target("aarch64-apple-ios", low_memory=True)
+            builds.build_apple_target("aarch64-apple-ios")
         command = self.commands[-1][0]
-        self.assertEqual(
-            command[command.index("--features") + 1], "ffi,controller,low-memory"
-        )
+        self.assertEqual(command[command.index("--features") + 1], "ffi,controller")
         self.commands.clear()
         with (
             patch.object(builds.platform, "system", return_value="Darwin"),
             patch.dict(os.environ, {"VOLE_FEATURES": "ffi,interop-test"}),
             self.assertRaisesRegex(RuntimeError, "test-only features"),
         ):
-            builds.build_apple_target("aarch64-apple-ios", low_memory=True)
+            builds.build_apple_target("aarch64-apple-ios")
         self.assertEqual(self.commands, [])
 
     def test_ndk_selection_uses_latest_installed_stable_revision(self):
@@ -365,22 +325,19 @@ class BuildTests(unittest.TestCase):
 
 
 class BuildCliTests(unittest.TestCase):
-    def test_memory_flag_reaches_each_platform_builder(self):
+    def test_arguments_reach_each_platform_builder(self):
         for platform in ("cli", "apple", "android", "windows", "linux"):
-            for low_memory in (False, True):
-                args = ["build", platform]
-                positional = ()
-                if platform == "cli":
-                    args += ["--target", "aarch64-apple-darwin", "--profile", "debug"]
-                    positional = ("aarch64-apple-darwin", "debug")
-                elif platform == "windows":
-                    args += ["--backend", "wintun"]
-                    positional = ("wintun",)
-                if low_memory:
-                    args.append("--low-memory")
-                with (
-                    self.subTest(platform=platform, low_memory=low_memory),
-                    patch.object(cli, "build_" + platform) as build,
-                ):
-                    self.assertEqual(cli.main(args), 0)
-                build.assert_called_once_with(*positional, low_memory=low_memory)
+            args = ["build", platform]
+            positional = ()
+            if platform == "cli":
+                args += ["--target", "aarch64-apple-darwin", "--profile", "debug"]
+                positional = ("aarch64-apple-darwin", "debug")
+            elif platform == "windows":
+                args += ["--backend", "wintun"]
+                positional = ("wintun",)
+            with (
+                self.subTest(platform=platform),
+                patch.object(cli, "build_" + platform) as build,
+            ):
+                self.assertEqual(cli.main(args), 0)
+            build.assert_called_once_with(*positional)

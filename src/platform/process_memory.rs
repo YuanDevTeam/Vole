@@ -7,27 +7,21 @@ use std::{
 #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
 use std::{ffi::c_void, mem, ptr};
 
-use crate::limits::{LOW_MEMORY_OBSERVATION_CEILING_BYTES, LOW_MEMORY_OBSERVATION_TARGET_BYTES};
+use crate::limits::{MEMORY_OBSERVATION_CEILING_BYTES, MEMORY_OBSERVATION_TARGET_BYTES};
 
 pub(crate) const TELEMETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
 const TASK_VM_INFO: libc::task_flavor_t = 22;
-const FORTY_MIB: u64 = 40 * 1024 * 1024;
-const THRESHOLDS: [MemoryThreshold; 3] = [
+const THRESHOLDS: [MemoryThreshold; 2] = [
     MemoryThreshold {
-        bytes: LOW_MEMORY_OBSERVATION_TARGET_BYTES,
+        bytes: MEMORY_OBSERVATION_TARGET_BYTES,
         bit: 1 << 0,
-        mib: 35,
-    },
-    MemoryThreshold {
-        bytes: FORTY_MIB,
-        bit: 1 << 1,
         mib: 40,
     },
     MemoryThreshold {
-        bytes: LOW_MEMORY_OBSERVATION_CEILING_BYTES,
-        bit: 1 << 2,
+        bytes: MEMORY_OBSERVATION_CEILING_BYTES,
+        bit: 1 << 1,
         mib: 45,
     },
 ];
@@ -35,9 +29,9 @@ const THRESHOLDS: [MemoryThreshold; 3] = [
 static TELEMETRY_POLICY: MemoryTelemetryPolicy = MemoryTelemetryPolicy::new();
 
 const MEMORY_EVENTS: [&str; 3] = [
-    "low_memory_snapshot",
-    "low_memory_observation_target_crossed",
-    "low_memory_measurement_failed",
+    "memory_snapshot",
+    "memory_observation_threshold_crossed",
+    "memory_measurement_failed",
 ];
 
 /// Public `TASK_VM_INFO` layout through revision 3. Revision 3 is the first
@@ -151,7 +145,7 @@ pub(crate) fn observe(stage: &'static str) {
                 metric = snapshot.metric,
                 current_bytes = snapshot.current_bytes,
                 process_lifetime_peak_bytes = snapshot.lifetime_peak_bytes,
-                "low-memory TUN telemetry"
+                "TUN memory telemetry"
             );
             for threshold in THRESHOLDS
                 .iter()
@@ -166,7 +160,7 @@ pub(crate) fn observe(stage: &'static str) {
                     process_lifetime_peak_bytes = snapshot.lifetime_peak_bytes,
                     threshold_bytes = threshold.bytes,
                     threshold_mib = threshold.mib,
-                    "low-memory TUN current memory crossed an observation threshold"
+                    "TUN current memory crossed an observation threshold"
                 );
             }
         }
@@ -177,7 +171,7 @@ pub(crate) fn observe(stage: &'static str) {
                     platform = std::env::consts::OS,
                     stage,
                     error = %error,
-                    "unable to sample low-memory TUN telemetry"
+                    "unable to sample TUN memory telemetry"
                 );
             }
         }
@@ -239,8 +233,7 @@ pub(crate) fn relieve_allocator_pressure() {
 }
 
 /// Apply GNU allocator hints once, after TUN lifecycle admission and before
-/// Core workers start. The build feature is an explicit process-wide opt-in.
-/// Existing allocator overrides retain all system defaults.
+/// Core workers start. Existing allocator overrides retain all system defaults.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub(crate) fn configure_allocator() {
     static CONFIGURED: std::sync::Once = std::sync::Once::new();
@@ -362,16 +355,16 @@ mod tests {
     #[test]
     fn thresholds_use_current_and_are_reported_only_once() {
         let policy = MemoryTelemetryPolicy::new();
-        let (snapshot, crossed) = sampled(&policy, 35 * 1024 * 1024 - 1, 100 * 1024 * 1024);
+        let (snapshot, crossed) = sampled(&policy, 40 * 1024 * 1024 - 1, 100 * 1024 * 1024);
         assert_eq!(snapshot.lifetime_peak_bytes, 100 * 1024 * 1024);
         assert_eq!(crossed, 0);
         assert_eq!(
-            sampled(&policy, 35 * 1024 * 1024, 100 * 1024 * 1024).1,
+            sampled(&policy, 40 * 1024 * 1024, 100 * 1024 * 1024).1,
             1 << 0
         );
         assert_eq!(
-            sampled(&policy, 46 * 1024 * 1024, 100 * 1024 * 1024).1,
-            (1 << 1) | (1 << 2)
+            sampled(&policy, 45 * 1024 * 1024, 100 * 1024 * 1024).1,
+            1 << 1
         );
         assert_eq!(sampled(&policy, 46 * 1024 * 1024, 101 * 1024 * 1024).1, 0);
     }
@@ -410,7 +403,7 @@ mod tests {
                 assert_eq!(mask & crossed, 0);
                 mask | crossed
             });
-        assert_eq!(newly_crossed, (1 << 0) | (1 << 1) | (1 << 2));
+        assert_eq!(newly_crossed, (1 << 0) | (1 << 1));
     }
 
     #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]

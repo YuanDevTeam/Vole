@@ -188,16 +188,15 @@ struct TunAllocatorReliefState {
 
 impl TunAllocatorRelief {
     fn new(has_tun: bool) -> Option<Self> {
-        #[cfg(feature = "low-memory")]
         if has_tun {
-            return Some(Self {
+            Some(Self {
                 state: Arc::new(TunAllocatorReliefState {
                     relieved: AtomicBool::new(false),
                 }),
-            });
+            })
+        } else {
+            None
         }
-        let _ = has_tun;
-        None
     }
 
     fn relieve(&self) {
@@ -902,7 +901,6 @@ impl CoreController {
             tun_lease,
             protector,
         } = acquisition;
-        #[cfg(feature = "low-memory")]
         if has_tun {
             crate::platform::process_memory::configure_allocator();
         }
@@ -1233,15 +1231,12 @@ fn clear_instance_leases(inner: &mut CoreInner) {
 }
 
 fn observe_tun_memory(has_tun: bool, stage: &'static str) {
-    #[cfg(feature = "low-memory")]
     if has_tun {
         crate::platform::process_memory::observe(stage);
     }
-    let _ = (has_tun, stage);
 }
 
 fn relieve_tun_allocator() {
-    #[cfg(feature = "low-memory")]
     crate::platform::process_memory::relieve_allocator_pressure();
 }
 
@@ -1468,10 +1463,10 @@ fn run_engine_inner(
     })
 }
 
-async fn wait_for_engine_shutdown(stop: oneshot::Receiver<()>, has_tun: bool) -> io::Result<()> {
-    #[cfg(feature = "low-memory")]
-    let mut stop = stop;
-    #[cfg(feature = "low-memory")]
+async fn wait_for_engine_shutdown(
+    mut stop: oneshot::Receiver<()>,
+    has_tun: bool,
+) -> io::Result<()> {
     if has_tun {
         let interval = crate::platform::process_memory::TELEMETRY_INTERVAL;
         let first_tick = tokio::time::Instant::now() + interval;
@@ -1484,7 +1479,6 @@ async fn wait_for_engine_shutdown(stop: oneshot::Receiver<()>, has_tun: bool) ->
             }
         }
     }
-    let _ = has_tun;
     let _ = stop.await;
     Ok(())
 }
@@ -1586,15 +1580,12 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn allocator_relief_requires_low_memory_build_and_tun() {
+    fn allocator_relief_requires_tun() {
         assert!(TunAllocatorRelief::new(false).is_none());
-        let relief = TunAllocatorRelief::new(true);
-        assert_eq!(relief.is_some(), cfg!(feature = "low-memory"));
-        if let Some(relief) = relief {
-            // Claim with a pure hook so this regression never trims the test
-            // process's allocator as a side effect of dropping the handle.
-            relief.state.relieve_with(|| {});
-        }
+        let relief = TunAllocatorRelief::new(true).expect("TUN owns allocator relief");
+        // Claim with a pure hook so this regression never trims the test
+        // process's allocator as a side effect of dropping the handle.
+        relief.state.relieve_with(|| {});
     }
 
     #[test]

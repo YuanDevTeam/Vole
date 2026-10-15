@@ -49,10 +49,10 @@ Linux 压测可以把 TUN 创建在客户端 namespace，再把借用 fd 交给�
 不由一次 Linux 容器压测推导。Linux RSS/VmHWM 与 Apple physical footprint 分开报告。
 
 tvOS 首版为 17.0+、ARM64 真机和 Apple Silicon 模拟器，共用 TunIo、netstack 和
-Dialer。低内存策略由 `low-memory` 编译 feature 显式启用，不由 iOS/tvOS 判断；
-同一 feature 也可在其他平台构建和验证。它控制 TUN 内存诊断、allocator 配置和
-Stop 后回收，当前缓冲、队列和线程策略不区分模式。真实 iOS/tvOS 扩展的 footprint
-仍须低于 45 MiB，常规压力目标为 35 MiB；完整口径见[验收边界](acceptance.md)。
+Dialer。所有平台使用统一的 TUN 内存诊断、allocator 配置和 Stop 后回收策略，
+缓冲、队列和线程策略也不按平台或内存模式切换。内存硬门槛为低于 45 MiB，
+常规压力优化目标为不超过 40 MiB；真实 iOS/tvOS 扩展按整个进程的 physical footprint
+验收，完整口径见[验收边界](acceptance.md)。
 
 Apple 公开 NEPacketTunnelFlow API 是 packetFlow 的包读写，不承诺可取得 raw fd。
 Vole 的借用 fd 契约不能证明宿主 KVC 提取 fd 是稳定公开方案。真实宿主的 fd 获取/桥接、

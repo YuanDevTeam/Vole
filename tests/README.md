@@ -137,15 +137,14 @@ capsule、流关联、包预算及 Stop。实际内存 H2 双端验证响应准�
 宿主只执行明确的纯内存过滤器；全目标使用 `--no-run`。
 `invoke::tests::` 含监听器用例，不可整体在宿主执行；可执行过滤器以
 [Tests workflow](../.github/workflows/test.yml) 为准。
-低内存编译开关与共享回收所有权使用纯回归：
+统一 TUN 内存策略与共享回收所有权使用纯回归：
 
 ```sh
 cargo test --locked --no-default-features --features cli --lib allocator_relief
-cargo test --locked --no-default-features --features cli,low-memory --lib allocator_relief
-cargo test --locked --no-default-features --features cli,low-memory --lib platform::process_memory::tests::
+cargo test --locked --no-default-features --features cli --lib platform::process_memory::tests::
 ```
 
-这些测试验证编译条件、诊断失败不影响生命周期、并发回收仅执行一次；不替代容器压力或真机内存验收。
+这些测试验证 TUN 策略、诊断失败不影响生命周期、并发回收仅执行一次；不替代容器压力或真机内存验收。
 协议独立向量见 [protocols](protocols/README.md)，ClientHello 输入见 [fingerprints](fingerprints/README.md)。
 
 脚本测试保留平台文件输出、Windows 后端选择、Android ABI/runtime、Apple 切片、
