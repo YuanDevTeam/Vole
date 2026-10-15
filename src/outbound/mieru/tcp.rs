@@ -1,5 +1,5 @@
-//! TCP carrier ownership, probabilistic scheduling and serialized AEAD framing.
-//! Wire semantics follow the public Mieru protocol and its v3 client scheduler.
+//! Carrier ownership, idle reuse and serialized AEAD framing.
+//! Framing follows Mieru; LOW TCP pooling isolates concurrent slow readers.
 use super::{
     crypto,
     pattern::{EffectivePattern, HostProfile, NonceState},
@@ -107,9 +107,15 @@ impl Shared {
         self.schedule.lock().unwrap().out_bytes += count as u64;
     }
 
-    fn reserve(&self) -> bool {
+    fn reserve(&self, idle_only: bool) -> bool {
+        let active = idle_only && self.count() != 0;
         let mut schedule = self.schedule.lock().unwrap();
-        if schedule.closed || schedule.disabled.is_some() || self.cancel.is_cancelled() {
+        if schedule.closed
+            || schedule.disabled.is_some()
+            || self.cancel.is_cancelled()
+            || active
+            || (idle_only && schedule.pending != 0)
+        {
             return false;
         }
         schedule.pending += 1;
@@ -299,6 +305,48 @@ impl Client {
         }
         Ok(self.tasks.spawn(observation::task(future)))
     }
+    fn reserve_reusable(
+        &self,
+        choose: impl FnOnce(usize) -> usize,
+    ) -> io::Result<Option<Reservation>> {
+        let _admission = self.admission.lock().unwrap();
+        if self.cancel.is_cancelled() {
+            return Err(closed());
+        }
+        // Keep TCP receive backpressure local without enlarging stream buffers.
+        // The reservation also covers the gap before open publishes its session.
+        let idle_only = self.factor == 1 && self.factory.config.transport == MieruTransport::Tcp;
+        let registry = self.registry.lock().unwrap();
+        let available: Vec<_> = registry
+            .carriers
+            .values()
+            .filter(|carrier| {
+                carrier.shared.clean();
+                let active = idle_only && carrier.shared.count() != 0;
+                let schedule = carrier.shared.schedule.lock().unwrap();
+                !schedule.closed
+                    && schedule.disabled.is_none()
+                    && !active
+                    && (!idle_only || schedule.pending == 0)
+            })
+            .cloned()
+            .collect();
+        let weight = available
+            .len()
+            .checked_mul(self.factor)
+            .ok_or_else(closed)?;
+        let choice = choose(weight);
+        Ok(if choice < weight {
+            let carrier = available[choice / self.factor].clone();
+            if carrier.shared.reserve(idle_only) {
+                Some(Reservation(carrier))
+            } else {
+                None
+            }
+        } else {
+            None
+        })
+    }
     pub async fn open(
         &self,
         session: StreamSession,
@@ -306,38 +354,7 @@ impl Client {
     ) -> io::Result<RawStream> {
         let operation = async {
             let _waiter = observation::track(ResourceKind::Waiter);
-            let reusable = {
-                let _admission = self.admission.lock().unwrap();
-                if self.cancel.is_cancelled() {
-                    return Err(closed());
-                }
-                let registry = self.registry.lock().unwrap();
-                let available: Vec<_> = registry
-                    .carriers
-                    .values()
-                    .filter(|carrier| {
-                        carrier.shared.clean();
-                        let schedule = carrier.shared.schedule.lock().unwrap();
-                        !schedule.closed && schedule.disabled.is_none()
-                    })
-                    .cloned()
-                    .collect();
-                let weight = available
-                    .len()
-                    .checked_mul(self.factor)
-                    .ok_or_else(closed)?;
-                let choice = rand::random_range(0..=weight);
-                if choice < weight {
-                    let carrier = available[choice / self.factor].clone();
-                    if carrier.shared.reserve() {
-                        Some(Reservation(carrier))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            };
+            let reusable = self.reserve_reusable(|weight| rand::random_range(0..=weight))?;
             let reservation = match reusable {
                 Some(reservation) => reservation,
                 None => self.create(session, context).await?,
@@ -858,6 +875,100 @@ mod tests {
         assert!(probe.snapshot().is_idle());
     }
     #[tokio::test]
+    async fn mieru_tcp_low_reuses_idle_carriers_without_changing_other_modes() {
+        let probe = ResourceProbe::default();
+        let outcomes: io::Result<Vec<(String, bool, bool)>> = probe
+            .scope(async {
+                let mut outcomes = Vec::new();
+                for (label, transport, multiplexing, active_reusable) in [
+                    ("low", MieruTransport::Tcp, MieruMultiplexing::Low, false),
+                    (
+                        "middle",
+                        MieruTransport::Tcp,
+                        MieruMultiplexing::Middle,
+                        true,
+                    ),
+                    ("high", MieruTransport::Tcp, MieruMultiplexing::High, true),
+                    ("udp-low", MieruTransport::Udp, MieruMultiplexing::Low, true),
+                    ("off", MieruTransport::Tcp, MieruMultiplexing::Off, false),
+                ] {
+                    let peer = Peer::new(false);
+                    let mut settings = config(MieruHandshake::NoWait);
+                    settings.transport = transport;
+                    settings.multiplexing = multiplexing;
+                    let client = Client::new(&settings, UpstreamPath::proxy(peer.clone()), 1024)?;
+                    let mut shared = Shared::output_test_shared(client.cancel.child_token());
+                    Arc::get_mut(&mut shared).unwrap().udp = transport == MieruTransport::Udp;
+                    let state = State::new(1, 1024, &shared.cancel, shared.activity.clone());
+                    shared.sessions.lock().unwrap().insert(1, state.clone());
+                    let (writer, receiver) = mpsc::channel(WRITER_COMMANDS);
+                    let carrier = Arc::new(Carrier {
+                        shared: shared.clone(),
+                        writer,
+                        bytes: Arc::new(Semaphore::new(1024)),
+                    });
+                    client
+                        .registry
+                        .lock()
+                        .unwrap()
+                        .carriers
+                        .insert(1, carrier.clone());
+                    // Call the production picker, always selecting the sole reusable bucket.
+                    // No framing or network is needed to test this admission decision.
+                    let result: io::Result<Vec<(String, bool, bool)>> = (|| {
+                        let mut observed = Vec::new();
+                        let active = client.reserve_reusable(|_| 0)?;
+                        observed.push((
+                            format!("{label} active"),
+                            active.is_some(),
+                            active_reusable,
+                        ));
+                        drop(active);
+                        state.close();
+                        let idle = client.reserve_reusable(|_| 0)?;
+                        observed.push((
+                            format!("{label} idle after close"),
+                            idle.is_some(),
+                            multiplexing != MieruMultiplexing::Off,
+                        ));
+                        if transport == MieruTransport::Tcp
+                            && multiplexing == MieruMultiplexing::Low
+                        {
+                            // The first reservation stays alive across the second attempt,
+                            // matching the gap before Client::open inserts its session.
+                            let pending = client.reserve_reusable(|_| 0)?;
+                            observed.push(("low pending".into(), pending.is_some(), false));
+                            drop(pending);
+                        }
+                        drop(idle);
+                        if transport == MieruTransport::Tcp
+                            && multiplexing == MieruMultiplexing::Low
+                        {
+                            let idle_again = client.reserve_reusable(|_| 0)?;
+                            observed.push((
+                                "low after reservation release".into(),
+                                idle_again.is_some(),
+                                true,
+                            ));
+                            drop(idle_again);
+                        }
+                        Ok(observed)
+                    })();
+                    client.shutdown().await;
+                    drop((client, carrier, shared, state, receiver));
+                    peer.stop().await;
+                    outcomes.extend(result?);
+                }
+                Ok(outcomes)
+            })
+            .await;
+        // Check decisions only after every owner has been stopped/dropped.
+        assert!(probe.snapshot().is_idle());
+        for (label, actual, expected) in outcomes.unwrap() {
+            assert_eq!(actual, expected, "{label}");
+        }
+    }
+    #[tokio::test]
     async fn mieru_tcp_shared_carrier_preserves_sibling_and_bounded_reader() {
         let probe = ResourceProbe::default();
         probe
@@ -885,7 +996,7 @@ mod tests {
                     .next()
                     .unwrap()
                     .clone();
-                assert!(carrier.shared.reserve());
+                assert!(carrier.shared.reserve(false));
                 let reservation = Reservation(carrier.clone());
                 let id = loop {
                     let id = rand::random::<u32>();
@@ -948,7 +1059,7 @@ mod tests {
                 echo(&mut io, b"active").await;
                 carrier.shared.schedule.lock().unwrap().out_bytes = carrier.shared.volume + 1;
                 assert!(!carrier.shared.clean());
-                assert!(!carrier.shared.reserve());
+                assert!(!carrier.shared.reserve(false));
                 echo(&mut io, b"after-scheduling-disabled").await;
                 drop(io);
                 tokio::time::advance(client.idle + CLEAN_INTERVAL).await;
@@ -1001,11 +1112,11 @@ mod tests {
         drop(unopened);
         tokio::time::advance(Duration::from_secs(59)).await;
         assert!(!shared.clean());
-        assert!(shared.reserve());
+        assert!(shared.reserve(false));
         shared.release();
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(!shared.clean());
-        assert!(!shared.reserve());
+        assert!(!shared.reserve(false));
         assert!(!state.cancel.is_cancelled());
         state.close();
         tokio::time::advance(Duration::from_secs(150)).await;
