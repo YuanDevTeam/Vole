@@ -2171,7 +2171,9 @@ impl RuntimeDns {
                 )
                 .await?
             } else {
-                super::fallback::choose(
+                // Reserve the two racing queries only when fallback is used.
+                // Keeping this state inline inflates every ordinary DNS flight.
+                Box::pin(super::fallback::choose(
                     self.exchange_upstreams(
                         &self.nameservers,
                         &upstream_query,
@@ -2186,7 +2188,7 @@ impl RuntimeDns {
                     ),
                     self.fallback.lazy,
                     |answer| self.accepts_primary(answer),
-                )
+                ))
                 .await?
             };
         if cacheable {
@@ -4057,6 +4059,36 @@ mod tests {
             nameserver_policies: Vec::new(),
             ..DnsConfig::default()
         }
+    }
+
+    #[test]
+    fn address_query_does_not_reserve_unused_fallback_state() {
+        let upstream = nameserver(1, DnsTransport::Udp);
+        let resolver = RuntimeDns::new(
+            &config(false, vec![upstream]),
+            Arc::new(MockDispatcher::default()),
+        );
+        let query = build_query(7, "memory.example", QueryType::A).unwrap();
+        let classified = classify_query(&query).unwrap();
+        let permit = resolver.begin_query();
+        let address = resolver.exchange_address(
+            &query,
+            &classified,
+            permit.deadline,
+            FailureMode::WireServfail,
+        );
+        let leader = resolver.exchange_address_leader(&query, &classified, permit.deadline, 0);
+        // These are the production futures; constructing them opens no I/O.
+        let bytes = std::mem::size_of_val(&leader);
+        assert!(
+            bytes <= 1024,
+            "single-upstream DNS leader reserves {bytes} bytes including inactive fallback state"
+        );
+        let bytes = std::mem::size_of_val(&address);
+        assert!(
+            bytes <= 2048,
+            "ordinary address query retains {bytes} bytes"
+        );
     }
 
     #[test]
