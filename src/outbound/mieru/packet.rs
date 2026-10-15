@@ -20,15 +20,17 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt, WriteHalf},
-    sync::mpsc,
     task::JoinHandle,
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "packet_response.rs"]
+mod response_slot;
+
 pub(super) struct PacketTransport {
     writer: Option<WriteHalf<BoxStream>>,
-    responses: mpsc::Receiver<io::Result<Datagram>>,
+    responses: response_slot::Receiver<io::Result<Datagram>>,
     cancel: CancellationToken,
     reader: Option<JoinHandle<()>>,
     alive: Arc<AtomicBool>,
@@ -53,7 +55,7 @@ impl PacketTransport {
         }
         let cancel = parent.child_token();
         let (read, writer) = tokio::io::split(io);
-        let (send, responses) = mpsc::channel(1);
+        let (send, responses) = response_slot::channel();
         let alive = Arc::new(AtomicBool::new(true));
         let life = ReaderLife(alive.clone());
         let reader = spawn(Box::pin(read_loop(
@@ -178,7 +180,6 @@ impl DatagramTransport for PacketTransport {
         self.cancel.cancel();
         self.writer.take();
         self.responses.close();
-        while self.responses.try_recv().is_ok() {}
         if let Some(reader) = self.reader.take() {
             reader
                 .await
@@ -198,7 +199,7 @@ impl Drop for PacketTransport {
 }
 async fn read_loop<R: AsyncRead + Unpin>(
     mut reader: R,
-    send: mpsc::Sender<io::Result<Datagram>>,
+    mut send: response_slot::Sender<io::Result<Datagram>>,
     maximum: u16,
     cancel: CancellationToken,
     _life: ReaderLife,
