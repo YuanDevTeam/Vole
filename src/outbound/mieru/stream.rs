@@ -108,16 +108,6 @@ impl State {
     pub fn unread_segments(&self) -> usize {
         self.input.lock().unwrap().queue.len()
     }
-    #[cfg(test)]
-    pub(super) fn unread_bytes(&self) -> usize {
-        self.input
-            .lock()
-            .unwrap()
-            .queue
-            .iter()
-            .map(|chunk| chunk.bytes.len())
-            .sum()
-    }
     pub(super) fn receive_capacity(&self) -> usize {
         self.capacity
     }

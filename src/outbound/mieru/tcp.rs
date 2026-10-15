@@ -39,10 +39,6 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 const CLEAN_INTERVAL: Duration = Duration::from_secs(5);
 const WRITER_COMMANDS: usize = 2;
-#[cfg(test)]
-#[path = "tcp_receive_credit_tests.rs"]
-mod receive_credit_tests;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Business {
     TcpConnect,
@@ -378,24 +374,8 @@ impl Client {
         &self,
         session: StreamSession,
         business: Business,
-        datagram_receive_budget: Option<u16>,
         context: &EstablishContext,
     ) -> io::Result<RawStream> {
-        // Only UDP business over TCP consumes this payload budget. Physical UDP
-        // also uses State capacity for reliable windows and reorder credit.
-        let receive_capacity = if business == Business::UdpAssociate
-            && self.factory.config.transport == MieruTransport::Tcp
-        {
-            datagram_receive_budget.map_or(self.capacity, |maximum| {
-                self.capacity.min(
-                    (usize::from(maximum) + usize::from(crate::socks5::MAX_UDP_HEADER_SIZE))
-                        .min(usize::from(u16::MAX))
-                        + 4,
-                )
-            })
-        } else {
-            self.capacity
-        };
         let operation = async {
             let _waiter = observation::track(ResourceKind::Waiter);
             let reusable =
@@ -419,7 +399,7 @@ impl Client {
                 };
                 let state = State::new(
                     id,
-                    receive_capacity,
+                    self.capacity,
                     &carrier.shared.cancel,
                     carrier.shared.activity.clone(),
                 );
@@ -827,7 +807,7 @@ mod tests {
                     Client::new(&configuration, UpstreamPath::proxy(peer.clone()), 32768).unwrap();
                 let context = EstablishContext::with_timeout(Duration::from_secs(5));
                 let raw = client
-                    .open(session(), Business::TcpConnect, None, &context)
+                    .open(session(), Business::TcpConnect, &context)
                     .await
                     .unwrap();
                 let state = raw.state.clone();
@@ -1228,7 +1208,7 @@ mod tests {
                 .unwrap();
                 let context = EstablishContext::with_timeout(Duration::from_secs(5));
                 let raw = client
-                    .open(session(), Business::TcpConnect, None, &context)
+                    .open(session(), Business::TcpConnect, &context)
                     .await
                     .unwrap();
                 let target = session().destination;
@@ -1294,7 +1274,7 @@ mod tests {
                 .unwrap();
                 let context = EstablishContext::with_timeout(Duration::from_secs(5));
                 let raw = client
-                    .open(session(), Business::TcpConnect, None, &context)
+                    .open(session(), Business::TcpConnect, &context)
                     .await
                     .unwrap();
                 let carrier = client

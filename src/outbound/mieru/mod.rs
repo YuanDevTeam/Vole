@@ -50,14 +50,10 @@ impl MieruOutbound {
         &self,
         session: StreamSession,
         business: tcp::Business,
-        datagram_receive_budget: Option<u16>,
         context: &EstablishContext,
     ) -> io::Result<BoxStream> {
         let target = session.destination.clone();
-        let raw = self
-            .client
-            .open(session, business, datagram_receive_budget, context)
-            .await?;
+        let raw = self.client.open(session, business, context).await?;
         let command = business.command();
         let stream = match self.handshake {
             MieruHandshake::Standard => {
@@ -79,7 +75,7 @@ impl OutboundConnector for MieruOutbound {
         let io = context
             .run_io(
                 "Mieru business connection",
-                self.connect(session, tcp::Business::TcpConnect, None, context),
+                self.connect(session, tcp::Business::TcpConnect, context),
             )
             .await?;
         Ok(ConnectedStream {
@@ -107,12 +103,7 @@ impl OutboundConnector for MieruOutbound {
         let io = context
             .run_io(
                 "Mieru UDP associate",
-                self.connect(
-                    session,
-                    tcp::Business::UdpAssociate,
-                    Some(request.budget().receive()),
-                    context,
-                ),
+                self.connect(session, tcp::Business::UdpAssociate, context),
             )
             .await?;
         let transport = packet::PacketTransport::new(
