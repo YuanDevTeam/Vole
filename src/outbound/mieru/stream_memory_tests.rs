@@ -1,6 +1,50 @@
 //! Exercise the actual delivery/read path with observable backing ownership.
 use super::*;
 
+#[tokio::test]
+async fn mieru_standard_business_does_not_retain_lazy_handshake_state() {
+    use super::super::{
+        MieruOutbound,
+        tests::{Peer, config, session},
+    };
+    use crate::{
+        config::MieruHandshake,
+        outbound::{EstablishContext, OutboundConnector, UpstreamPath},
+        resources::observation::ResourceProbe,
+    };
+
+    let probe = ResourceProbe::default();
+    let bytes = probe
+        .scope(async {
+            let peer = Peer::new(false);
+            let node = MieruOutbound::new(
+                &config(MieruHandshake::Standard),
+                UpstreamPath::proxy(peer.clone()),
+                32768,
+            )
+            .unwrap();
+            let mut connected = node
+                .connect_stream(
+                    session(),
+                    &EstablishContext::with_timeout(Duration::from_secs(3)),
+                )
+                .await
+                .unwrap();
+            let bytes = std::mem::size_of_val(connected.io.as_ref());
+            connected.io.shutdown().await.unwrap();
+            node.shutdown().await;
+            drop((connected, node));
+            peer.stop().await;
+            bytes
+        })
+        .await;
+    assert!(probe.snapshot().is_idle());
+    assert!(
+        bytes <= 64,
+        "completed standard handshake retains {bytes} bytes of stream state"
+    );
+}
+
 struct Payload {
     bytes: Vec<u8>,
     released: Arc<AtomicBool>,

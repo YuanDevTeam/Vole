@@ -94,6 +94,7 @@ TCP CONNECT仅复用没有活动会话和建流预留的空闲连接，并发TCP
 
 HANDSHAKE_DEFAULT/STANDARD 发送请求并等待 SOCKS 回复；HANDSHAKE_NO_WAIT 延迟至
 首个业务写入发送请求和数据，再确认回复。枚举必须使用完整前缀。
+标准握手完成后直接交付逻辑字节流，不保留懒握手状态。
 关闭单个流仅释放其会话；节点 Stop 取消并 join 物理读写、清理及 UDP 读取任务。
 写队列、接收字节及 UDP 单包受运行时预算约束；取消不会重放加密帧。
 TCP 载体的 UDP Associate 接收信用取原流容量与单包接收预算（含最大 SOCKS 首部和

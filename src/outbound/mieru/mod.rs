@@ -59,13 +59,13 @@ impl MieruOutbound {
             .open(session, business, datagram_receive_budget, context)
             .await?;
         let command = business.command();
-        let stream = match self.handshake {
+        let stream: BoxStream = match self.handshake {
             MieruHandshake::Standard => {
-                stream::Stream::standard(raw, &target, command, context.deadline()).await?
+                Box::new(stream::Stream::standard(raw, &target, command, context.deadline()).await?)
             }
-            MieruHandshake::NoWait => stream::Stream::no_wait(raw, &target, command)?,
+            MieruHandshake::NoWait => Box::new(stream::Stream::no_wait(raw, &target, command)?),
         };
-        Ok(Box::new(stream))
+        Ok(stream)
     }
 }
 #[async_trait]

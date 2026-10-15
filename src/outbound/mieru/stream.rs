@@ -338,7 +338,7 @@ impl Stream {
         target: &Destination,
         command: u8,
         deadline: Instant,
-    ) -> io::Result<Self> {
+    ) -> io::Result<RawStream> {
         let request = request(target, command)?;
         let _guard = observation::track(ResourceKind::Handshake);
         timeout_at(
@@ -350,7 +350,7 @@ impl Stream {
         )
         .await
         .map_err(|_| io::ErrorKind::TimedOut)??;
-        Ok(Self::ready(raw))
+        Ok(raw)
     }
     fn ready(raw: RawStream) -> Self {
         let state = raw.state.clone();
