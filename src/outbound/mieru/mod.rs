@@ -126,4 +126,6 @@ impl OutboundConnector for MieruOutbound {
     }
 }
 #[cfg(test)]
+mod packet_routing_tests;
+#[cfg(test)]
 mod tests;

@@ -16,6 +16,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt, WriteHalf},
@@ -73,6 +74,25 @@ impl PacketTransport {
             closed: false,
             _observation: observation::track(ResourceKind::Association),
         })
+    }
+    fn poll_response(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<Datagram, DispatchError>> {
+        if self.closed || self.cancel.is_cancelled() {
+            return Poll::Ready(Err(DispatchError::NotAllowed));
+        }
+        // The reader owns the sole sender. Parent cancellation stops that reader,
+        // whose sender drop wakes poll_recv; no receive-side cancellation future
+        // or additional queue is needed. Keep queued codec errors after reader
+        // exit: alive is a send gate, not permission to discard a final response.
+        match self.responses.poll_recv(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(result)) => Poll::Ready(result.map_err(DispatchError::from)),
+            Poll::Ready(None) => {
+                Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()))
+            }
+        }
     }
     fn check(&self) -> Result<(), DispatchError> {
         if self.closed || self.cancel.is_cancelled() || !self.alive.load(Ordering::Acquire) {
@@ -140,12 +160,18 @@ impl DatagramTransport for PacketTransport {
         guard.committed = true;
         Ok(())
     }
+    fn supports_poll_receive(&self) -> bool {
+        true
+    }
+    fn poll_receive(
+        &mut self,
+        context: &mut Context<'_>,
+        _scratch: &mut Vec<u8>,
+    ) -> Poll<Result<Datagram, DispatchError>> {
+        self.poll_response(context)
+    }
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
-        self.check()?;
-        let result = tokio::select! {biased;()=self.cancel.cancelled()=>return Err(DispatchError::NotAllowed),result=self.responses.recv()=>result};
-        result
-            .ok_or_else(|| DispatchError::from(io::Error::from(io::ErrorKind::UnexpectedEof)))?
-            .map_err(DispatchError::from)
+        std::future::poll_fn(|context| self.poll_response(context)).await
     }
     async fn close(&mut self) -> Result<(), DispatchError> {
         self.closed = true;
@@ -217,3 +243,7 @@ async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R, maximum: u16) -> io::
         sniffed_domain: None,
     })
 }
+
+#[cfg(test)]
+#[path = "packet_poll_tests.rs"]
+mod poll_tests;

@@ -131,6 +131,8 @@ Python，直接运行此检查，仅验证各自构建的产物。
 TCP池回归调用实际载体选择路径与TCP/UDP出站入口，验证 LOW 的TCP活动会话与建流预留隔离、
 UDP Associate活动复用、两类池隔离、关闭后的空闲复用，以及其它复用模式不变。
 真实加密duplex回归耗尽未读TCP的接收预算，验证兄弟TCP和UDP仍可收发及Stop回收。
+Mieru UDP就绪回归通过实际出站和Controller路由验证只轮询热目标、待收连接取消及兄弟流保持；
+单项响应通道回归覆盖reader结束前后终态错误、Pending取消唤醒和关闭后缓存隔离。
 
 `masque_` 使用内存密钥、IP/UDP 包和受控 QUIC 对端，验证模式准入、CONNECT、
 capsule、流关联、包预算及 Stop。实际内存 H2 双端验证响应准入、DATA 保留与取消隔离；
