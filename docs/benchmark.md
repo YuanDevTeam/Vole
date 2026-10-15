@@ -84,7 +84,13 @@ A 为 Vole `c42eba7`，B 为 `1e12828`；真实 TUN，各三轮固定量负载�
 
 L4、IP/T、IP/U分别表示MASQUE L4、IP TCP、IP UDP；TT为TrustTunnel。
 
-九项业务与清理通过，B全部达到40MiB目标；旧相对判据保留7 PASS、2 FAIL。MASQUE L4吞吐下降约3.1%、内存下降约8.9%；IP UDP吞吐下降约0.66%、内存下降约1.11%。
+九项业务与清理通过，B全部达到40MiB目标；旧相对判据保留7 PASS、2 FAIL。MASQUE L4吞吐下降约3.10%、RSS从29.09降至26.50MiB（降低8.90%）；IP UDP吞吐下降约0.66%、RSS从23.31降至23.05MiB（降低1.11%）。
+
+旧相对规则要求吞吐与内存同时改善，或一项改善超过2%、另一项退步小于1%。L4因吞吐退步超过1%、IP UDP因内存改善不足2%而保留原始`PERFORMANCE_FAIL`，不追溯改签。
+
+按[现行内存优先标准](acceptance.md#性能采纳标准)，两项在已测固定量TUN场景下均达到40MiB目标，内存改善可渐进采纳；接受上述取舍，不再作为阶段14阻塞项，也不再专项优化。吞吐、CPU和丢包率保留实测结果。
+
+固定量结果不代签MASQUE各模式的1Gbps定速吞吐及丢包门槛，也不代签2/3Gbps内存过载验收；Linux RSS不替代iOS/tvOS整个VPN扩展的physical footprint验收。
 
 ### 实际吞吐 TCP
 
