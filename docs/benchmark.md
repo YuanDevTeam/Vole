@@ -2,13 +2,13 @@
 
 ## Mieru TCP 载体
 
-Vole 优化前 `e9d64b9`、优化后 `c84f2ba`，参考端 Mihomo `1.19.32`，均连接官方 mita `3.38.1`，使用 TCP 载体、LOW 复用和 STANDARD 握手。Linux ARM64 普通 Release CLI，真实 TUN、Controller 开启；每档各一次 60 秒，64 条混合 TCP/UDP 流、每个 UDP socket 64 个目标、1000 DNS QPS、完整 CN GeoData。规则、流量驱动、队列和采样口径固定。
+Vole `c84f2ba` 与 Mihomo `1.19.32`，均连接官方 mita `3.38.1`，使用 TCP 载体、LOW 复用和 STANDARD 握手。Linux ARM64 普通 Release CLI，真实 TUN、Controller 开启；每容器 5 CPU / 8 GiB、NAT，每端每档各一次 60 秒，64 条混合 TCP/UDP 流、每个 UDP socket 64 个目标、1000 DNS QPS、完整 CN GeoData，队列和采样口径一致。
 
-**优化后 1 Gbps 样本通过压力硬门槛**：接收 996.45 Mbps、RSS 41.48 MiB、UDP 丢包 0.0476%，尚未达到 40 MiB 内存目标。32 条 UDP 流的接收超时仍保留，`driver_complete=false`，按既有丢包容限判定；数据有效、DNS、Stop 和清理通过。优化后 2 Gbps 仍未达标：接收 1234.81 Mbps、RSS 67.19 MiB、UDP 丢包 20.2409%。统一验收标准见[压力标准](acceptance.md)。
+UDP 原站验证预期出口 IP，允许中继关联重建后的源端口变化，保留目标轮转、长度、内容、序号和重复包校验；客户端响应仍须来自固定原站 IP/端口。四组均未触发 UDP 来源、长度、目标、坏内容或重复包校验错误，实际输入、观察器与停止清理均通过。
 
-其余五个样本均未通过压力验收。Mihomo 两档均出现 `datagram-source-or-size`，接收提前终止；对应丢包包含接收终止后的未收到包，无法据此判断协议吞吐上限或作有效性能排名。优化前及优化后 2 Gbps 也保留未完成流和负载校验失败；图中仍如实列出活动窗口接收计数。
+**本轮仅 Vole 1 Gbps 通过压力硬门槛及 40 MiB 内存目标**，仍有容许范围内的 UDP 接收超时。其余三组数据或负载未完成；Mihomo 两档仍有独立 TCP broken-pipe / EOF，2 Gbps 两端还有发送超时及收尾超限。图中为活动窗口实际接收量，不能将未通过样本当作无错误容量或有效性能排名。2 Gbps 的吞吐数值接近，UDP 丢包仍有明显差距，不能据此确定协议上限。验收口径见[压力标准](acceptance.md)。
 
-CPU 100% 表示一个逻辑核；内存取 CLI 从启动至 Stop 退出的最大 Linux RSS；UDP 丢包按实际上下行发送包数加权。以下为单轮 Linux 结果，不能替代重复统计或真机 Network Extension 内存验收。
+CPU 100% 表示一个逻辑核；内存取 CLI 从启动至 Stop 退出的最大 Linux RSS；UDP 丢包按上下行实际发送包数加权，不把漏发计入丢包。单轮 Linux 结果不替代重复统计或真机 Network Extension 内存验收。
 
 ### 实际吞吐
 
@@ -16,16 +16,16 @@ CPU 100% 表示一个逻辑核；内存取 CLI 从启动至 Stop 退出的最大
 ---
 config:
   xyChart:
-    width: 1000
+    width: 850
     height: 350
     showDataLabel: true
     showDataLabelOutsideBar: true
 ---
 xychart
     title "Mieru TCP 实际吞吐"
-    x-axis "负载 / 版本" ["1G 前", "1G 后", "1G Mihomo", "2G 前", "2G 后", "2G Mihomo"]
-    y-axis "Mbps" 0 --> 1400
-    bar [277.12, 996.45, 565.98, 307.72, 1234.81, 1046.78]
+    x-axis "负载 / 内核" ["1G Vole", "1G Mihomo", "2G Vole", "2G Mihomo"]
+    y-axis "Mbps" 0 --> 2100
+    bar [990.03, 782.18, 1271.15, 1293.81]
 ```
 
 ### CPU
@@ -34,16 +34,16 @@ xychart
 ---
 config:
   xyChart:
-    width: 1000
+    width: 850
     height: 350
     showDataLabel: true
     showDataLabelOutsideBar: true
 ---
 xychart
     title "Mieru TCP CPU"
-    x-axis "负载 / 版本" ["1G 前", "1G 后", "1G Mihomo", "2G 前", "2G 后", "2G Mihomo"]
+    x-axis "负载 / 内核" ["1G Vole", "1G Mihomo", "2G Vole", "2G Mihomo"]
     y-axis "%" 0 --> 300
-    bar [248.58, 150.36, 173.47, 241.76, 196.74, 240.15]
+    bar [139.46, 154.84, 203.70, 238.65]
 ```
 
 ### 内存
@@ -52,16 +52,16 @@ xychart
 ---
 config:
   xyChart:
-    width: 1000
+    width: 850
     height: 350
     showDataLabel: true
     showDataLabelOutsideBar: true
 ---
 xychart
     title "Mieru TCP 内存"
-    x-axis "负载 / 版本" ["1G 前", "1G 后", "1G Mihomo", "2G 前", "2G 后", "2G Mihomo"]
-    y-axis "RSS MiB" 0 --> 1800
-    bar [128.08, 41.48, 349.77, 128.47, 67.19, 1630.70]
+    x-axis "负载 / 内核" ["1G Vole", "1G Mihomo", "2G Vole", "2G Mihomo"]
+    y-axis "RSS MiB" 0 --> 3000
+    bar [39.63, 344.33, 53.63, 2581.21]
 ```
 
 ### UDP 丢包率
@@ -70,16 +70,16 @@ xychart
 ---
 config:
   xyChart:
-    width: 1000
+    width: 850
     height: 350
     showDataLabel: true
     showDataLabelOutsideBar: true
 ---
 xychart
     title "Mieru TCP UDP 丢包率"
-    x-axis "负载 / 版本" ["1G 前", "1G 后", "1G Mihomo", "2G 前", "2G 后", "2G Mihomo"]
-    y-axis "%" 0 --> 100
-    bar [52.7393, 0.0476, 43.3867, 70.2554, 20.2409, 45.4280]
+    x-axis "负载 / 内核" ["1G Vole", "1G Mihomo", "2G Vole", "2G Mihomo"]
+    y-axis "%" 0 --> 25
+    bar [0.0648, 0.0537, 22.2470, 6.1387]
 ```
 
 ## 历史 DIRECT 结果
