@@ -238,9 +238,10 @@ async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R, maximum: u16) -> io::
     if payload.len() > usize::from(maximum) {
         return Err(io::ErrorKind::InvalidData.into());
     }
+    let payload_offset = body.len() - payload.len();
     Ok(Datagram {
         remote,
-        payload: Bytes::copy_from_slice(payload),
+        payload: Bytes::from(body).slice(payload_offset..),
         sniffed_domain: None,
     })
 }
@@ -248,3 +249,7 @@ async fn read_packet<R: AsyncRead + Unpin>(reader: &mut R, maximum: u16) -> io::
 #[cfg(test)]
 #[path = "packet_poll_tests.rs"]
 mod poll_tests;
+
+#[cfg(test)]
+#[path = "packet_decode_memory_tests.rs"]
+mod decode_memory_tests;

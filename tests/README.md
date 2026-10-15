@@ -98,6 +98,7 @@ uv run --project scripts --locked ruff format --check scripts
 
 DNS URL 参数、DoH GET/Basic、H2 并发与取消、ALPN/H1 回退只使用内存报文、显式来源快照和 duplex TLS 对端。DoQ/H3 与冷建连版本竞争使用有界 memory DatagramTransport，驱动官方 Quinn 与 shared h3/h3-quinn；不读取宿主 DNS 或启动监听服务。
 `address_query_does_not_reserve_unused_fallback_state` 限制真实 DNS future 的大小，避免普通查询预留双路 fallback 状态；原有 fallback 竞速、取消和缓存测试验证行为。
+`mieru_packet_payload_reuses_the_receive_allocation` 观测真实 UDP 解析器的接收地址，验证 payload 复用缓冲并独立于输入报文存活。
 `dns::runtime::ech_tests::` 与 `security::ech_dynamic_tests::` 使用内存 DNS 报文、显式来源快照和 duplex TLS，验证 HTTPS65 ECH 来源、节点角色、内层名称、取消和 Stop。`security::ech::tests::` 用真实 rustls Outer/Inner 加解密验证各 KEM/KDF/AEAD 家族，命名模板保留独立准入。
 `controller_secure_` 使用 duplex HTTP/TLS/H2、内存证书与临时文件，验证 CORS、共享鉴权/路由、客户端认证与握手签名、RSA 2048、候选更新及 Stop；不绑定宿主监听器。
 
