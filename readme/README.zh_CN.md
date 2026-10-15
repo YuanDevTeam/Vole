@@ -13,18 +13,18 @@ Vole 是用于 VPN 客户端和本地代理的 Rust 代理内核，提供原生�
 - **接入应用与 VPN 流量：**HTTP 转发、CONNECT 和 Upgrade；SOCKS5 CONNECT 和 UDP ASSOCIATE；宿主提供的 IPv4/IPv6 TUN 数据包。
 - **路由流量：**支持 rule/global/direct 模式，域名、来源/目标 IP 与端口、TCP/UDP、GeoSite/GeoIP、规则集合及逻辑规则，提供 DIRECT 和 REJECT 动作。
 - **选择和串联代理：**嵌套 select/url-test/fallback/load-balance 组、健康检查与选择持久化；`dialer-proxy` 可引用节点或组。既有连接保留原路径。
-- **处理 DNS：**hosts、独立 bootstrap/节点/直连解析角色，UDP/TCP/DoH/DoT、域名/GeoSite/rule-set policy、fallback、有界缓存、redir-host 和持久 fake-IP；按配置接管 TUN DNS。
+- **处理 DNS：**hosts、独立 bootstrap/节点/直连解析角色，UDP/TCP/DoH/DoT/DoQ、域名/GeoSite/rule-set policy、fallback、有界缓存、redir-host 和持久 fake-IP；按配置接管 TUN DNS。
 - **识别流量用于路由：**TUN/mixed TCP 的 HTTP/TLS 嗅探与 TUN UDP 的 QUIC 嗅探，支持强制/排除条件和目标覆盖开关；本地应答 ICMPv4/ICMPv6 Echo。
 - **管理路由数据：**HTTP/file/inline 节点与规则 providers、动态组、筛选和覆盖；YAML/Text 及 domain/ipcidr MRS。GeoData 完整加载引用类别，支持指定出口下载和周期更新，坏更新保留旧状态。详见 [GeoData 边界](../docs/geodata.md#内存与安全边界)。
 - **提供客户端控制：**组与资源状态、连接快照与关闭、规则命中、有效配置和受限 DNS 诊断，以及 TUN 流量和隔离的节点/代理链延迟测量。
 
 ## 代理协议
 
-默认构建启用下列全部十种协议。HTTP CONNECT 仅支持 TCP；其他协议的 UDP 能力按节点配置。
+默认构建启用下列协议。UDP 支持以协议模式和节点配置为准。
 
 | 协议 | 能力 |
 | --- | --- |
-| [VLESS](../docs/vless.md) | TCP、WebSocket / HTTPUpgrade、gRPC、HTTP 首包伪装、传统 H2、[XHTTP H1/H2/H3](../docs/xhttp.md)；在支持的组合中提供 Vision、Encryption、REALITY、JLS、静态 ECH 和 sing-mux |
+| [VLESS](../docs/vless.md) | TCP、WebSocket / HTTPUpgrade、gRPC、HTTP 首包伪装、传统 H2、[XHTTP H1/H2/H3](../docs/xhttp.md)；在支持的组合中提供 Vision、Encryption、REALITY、JLS、ECH 和 sing-mux |
 | [VMess AEAD](../docs/outbounds.md#vmess-aead) | TCP、WebSocket / HTTPUpgrade、gRPC、HTTP 首包伪装和传统 H2；TCP/UDP，明文或标准 TLS |
 | [Trojan](../docs/outbounds.md#trojan) | 通过 TLS TCP、WebSocket / HTTPUpgrade 或 gRPC 传输 TCP/UDP |
 | [Shadowsocks 2022](../docs/outbounds.md#shadowsocks-2022) | TCP/UDP；AES-128-GCM、AES-256-GCM 和 ChaCha20-Poly1305；AES 身份链；可选 strict ShadowTLS v3 TCP 包装和 UoT v2 |
@@ -34,8 +34,11 @@ Vole 是用于 VPN 客户端和本地代理的 Rust 代理内核，提供原生�
 | [Hysteria2](../docs/outbounds.md#hysteria2) | QUIC TCP/UDP、带宽控制、Salamander、端口跳跃和 mTLS |
 | [TUIC v5](../docs/outbounds.md#tuic-v5) | QUIC TCP/UDP、native/quic UDP 转发模式，以及可选的拥塞控制算法 |
 | [WireGuard](../docs/outbounds.md#wireguard) | 标准 WireGuard TCP/UDP、多 peer 与节点 DNS，使用用户态 IP 栈 |
+| [TrustTunnel](../docs/outbounds.md#trusttunnel) | H2/H3 CONNECT 承载 TCP/UDP，支持认证、健康检查、mTLS 和 ECH |
+| [Mieru](../docs/outbounds.md#mieru) | TCP/UDP 载体承载 TCP/UDP，支持复用、STANDARD/NO-WAIT 握手与 traffic-pattern |
+| [MASQUE](../docs/outbounds.md#masque) | H2/H3 CONNECT-IP 承载 TCP/UDP；H3 L4 模式仅支持 TCP |
 
-标准 TLS 连接支持证书验证与 SHA-256 证书固定。适用的 TCP TLS 路径可使用 Chrome、Firefox 或 Safari ClientHello 模板；`client-fingerprint` 与证书 `fingerprint` 相互独立。准确的名称和支持组合见 [TLS 配置与证书策略](../docs/tls-client-fingerprint.md)。这些功能不保证与浏览器不可区分，也不支持任意协议组合。
+标准 TLS 连接支持证书验证与 SHA-256 证书固定。适用的 TCP TLS 路径可使用 Chrome、Firefox、Safari 或 iOS ClientHello 模板；`client-fingerprint` 与证书 `fingerprint` 相互独立。准确的名称和支持组合见 [TLS 配置与证书策略](../docs/tls-client-fingerprint.md)。这些功能不保证与浏览器不可区分，也不支持任意协议组合。
 
 SS2022 使用未经修改的官方 Rust 库；已知的空首写入、服务端先发送和 padding 风险见 [Shadowsocks 契约](../docs/outbounds.md#shadowsocks-2022)。
 

@@ -107,7 +107,7 @@ def _profile() -> tuple[str, list[str]]:
 
 def _production_features(features: str) -> str:
     names = {name.rsplit("/", 1)[-1] for name in re.split(r"[,\s]+", features)}
-    if names & {"interop-test", "benchmark-geodata-http"}:
+    if "interop-test" in names:
         raise RuntimeError("platform builds cannot enable test-only features")
     return features
 

@@ -1296,7 +1296,6 @@ mod tests {
             assert_eq!(protector.0.load(Ordering::Relaxed), 8192);
             assert!(probe.snapshot().peak(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
             assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
-            println!("socket initialization churn: {:?}", probe.snapshot());
         }));
     }
 
@@ -1384,16 +1383,11 @@ mod tests {
             .unwrap();
             assert!(probe.snapshot().current(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
             assert!(probe.snapshot().peak(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
-            println!("socket initialization backlog: {:?}", probe.snapshot());
 
             attempts.abort_all();
             while let Some(result) = attempts.join_next().await {
                 assert!(result.unwrap_err().is_cancelled());
             }
-            println!(
-                "socket initialization backlog after caller cancellation: {:?}",
-                probe.snapshot()
-            );
             let mut stopped = Box::pin(dialer.shutdown());
             assert!(
                 timeout(Duration::from_millis(20), &mut stopped)
@@ -1401,13 +1395,8 @@ mod tests {
                     .is_err(),
                 "Stop must not detach a started protect callback"
             );
-            let release_started = std::time::Instant::now();
             protector.release();
             timeout(Duration::from_secs(3), &mut stopped).await.unwrap();
-            println!(
-                "socket initialization release-to-join: {:?}",
-                release_started.elapsed()
-            );
             drop(stopped);
             assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
             assert_eq!(protector.entered.load(Ordering::Acquire), 4);
@@ -1422,7 +1411,6 @@ mod tests {
             drop(fresh.bind_udp_for(destination).await.unwrap());
             fresh.shutdown().await;
             assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
-            println!("socket initialization reclaimed: {:?}", probe.snapshot());
         }));
     }
 
@@ -1535,16 +1523,16 @@ mod tests {
                 assert!(before_cancel.peak(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
                 assert_eq!(before_cancel.current(ResourceKind::Socket), 0);
                 assert_eq!(protector.0.load(Ordering::Relaxed), 0);
-                println!(
-                    "socket initialization shared-pool submitted={submitted} before cancel: {before_cancel:?}"
-                );
 
                 // Scope Stop must wake permit waiters without waiting for
                 // unrelated blocking jobs or requiring caller aborts.
                 dialer.begin_shutdown();
                 timeout(Duration::from_secs(3), async {
                     while let Some(result) = attempts.join_next().await {
-                        assert_eq!(result.unwrap().unwrap_err().kind(), io::ErrorKind::Interrupted);
+                        assert_eq!(
+                            result.unwrap().unwrap_err().kind(),
+                            io::ErrorKind::Interrupted
+                        );
                     }
                 })
                 .await
@@ -1554,18 +1542,17 @@ mod tests {
                 assert!(after_cancel.peak(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
                 assert_eq!(after_cancel.current(ResourceKind::Socket), 0);
                 assert_eq!(protector.0.load(Ordering::Relaxed), 0);
-                println!(
-                    "socket initialization shared-pool submitted={submitted} after Stop cancellation: {after_cancel:?}"
-                );
-
-                let release_started = std::time::Instant::now();
                 gate.release();
                 timeout(Duration::from_secs(3), dialer.shutdown())
                     .await
                     .unwrap();
-                let release_to_join = release_started.elapsed();
                 for blocker in blockers {
-                    assert!(timeout(Duration::from_secs(3), blocker).await.unwrap().unwrap());
+                    assert!(
+                        timeout(Duration::from_secs(3), blocker)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    );
                 }
                 assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
                 assert_eq!(protector.0.load(Ordering::Relaxed), 0);
@@ -1592,10 +1579,6 @@ mod tests {
                 drop(dialer);
                 drop(protector);
                 assert!(protector_lease.upgrade().is_none());
-                println!(
-                    "socket initialization shared-pool submitted={submitted} release-to-join={release_to_join:?} reclaimed: {:?}",
-                    probe.snapshot()
-                );
             }
         });
     }

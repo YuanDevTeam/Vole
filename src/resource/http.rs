@@ -64,7 +64,7 @@ impl Default for HttpOptions {
             user_agent: concat!("Vole/", env!("CARGO_PKG_VERSION")).into(),
             headers: Vec::new(),
             size_limit: None,
-            allow_http: cfg!(feature = "benchmark-geodata-http"),
+            allow_http: false,
             allow_ip: false,
         }
     }
@@ -419,11 +419,6 @@ pub(crate) fn parse_url(raw: &str, options: &HttpOptions) -> Result<Url, Downloa
     }
     url.set_fragment(None);
     Ok(url)
-}
-
-#[cfg(test)]
-fn resolve_redirect(base: &Url, location: &str) -> Result<Url, DownloadError> {
-    redirect(base, location, &HttpOptions::default())
 }
 
 fn redirect(base: &Url, location: &str, options: &HttpOptions) -> Result<Url, DownloadError> {
@@ -1091,23 +1086,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "benchmark-geodata-http")]
-    #[derive(Default)]
-    struct RecordingHttpsConnector(Mutex<Vec<String>>);
-
-    #[cfg(feature = "benchmark-geodata-http")]
-    #[async_trait]
-    impl HttpsConnector for RecordingHttpsConnector {
-        async fn connect(
-            &self,
-            server_name: &str,
-            stream: BoxStream,
-        ) -> Result<BoxStream, DownloadError> {
-            self.0.lock().unwrap().push(server_name.to_owned());
-            Ok(stream)
-        }
-    }
-
     struct ScriptedDispatcher {
         responses: Mutex<VecDeque<Vec<u8>>>,
         sessions: Mutex<Vec<StreamSession>>,
@@ -1205,119 +1183,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "benchmark-geodata-http")]
-    #[tokio::test]
-    async fn benchmark_http_uses_the_raw_stream_and_existing_download_outcomes() {
-        for (name, response) in [
-            (
-                "download",
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ndata\r\n0\r\n\r\n"
-                    .as_slice(),
-            ),
-            (
-                "not-modified",
-                b"HTTP/1.1 304 Not Modified\r\n\r\n".as_slice(),
-            ),
-            (
-                "truncated",
-                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nshort".as_slice(),
-            ),
-        ] {
-            let directory = tempdir().unwrap();
-            let path = directory.path().join("fixture.new");
-            let dispatcher = Arc::new(ScriptedDispatcher::new([response.to_vec()]));
-            // The real connector would reject this plaintext in-memory peer if
-            // HTTP accidentally attempted a TLS handshake.
-            let outcome = download(request(
-                dispatcher.clone(),
-                "http://rules.example.test/geoip.dat",
-                path.clone(),
-            ))
-            .await;
-            match name {
-                "download" => {
-                    assert!(matches!(
-                        outcome,
-                        Ok(DownloadOutcome::Downloaded { size: 4, .. })
-                    ));
-                    assert_eq!(fs::read(&path).unwrap(), b"data");
-                }
-                "not-modified" => {
-                    assert_eq!(
-                        outcome.unwrap(),
-                        DownloadOutcome::NotModified {
-                            subscription_info: None
-                        }
-                    );
-                    assert!(!path.exists());
-                }
-                "truncated" => {
-                    assert!(matches!(outcome, Err(DownloadError::Protocol(_))));
-                    assert!(!path.exists());
-                }
-                _ => unreachable!(),
-            }
-            let sessions = dispatcher.sessions();
-            assert_eq!(sessions.len(), 1);
-            assert_eq!(sessions[0].inbound, InboundKind::InternalGeoData);
-            assert_eq!(
-                sessions[0].destination,
-                Destination::domain("rules.example.test", 80).unwrap()
-            );
-            assert!(
-                std::str::from_utf8(&dispatcher.requests()[0])
-                    .unwrap()
-                    .contains("\r\nHost: rules.example.test\r\n")
-            );
-        }
-    }
-
-    #[cfg(feature = "benchmark-geodata-http")]
-    #[tokio::test]
-    async fn benchmark_http_redirects_allow_plaintext_hops_and_https_upgrade() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("redirect.new");
-        let dispatcher = Arc::new(ScriptedDispatcher::new([
-            b"HTTP/1.1 302 Found\r\nLocation: http://cdn.example.test:8080/next.dat\r\nContent-Length: 0\r\n\r\n".to_vec(),
-            b"HTTP/1.1 302 Found\r\nLocation: https://secure.example.test/final.dat\r\nContent-Length: 0\r\n\r\n".to_vec(),
-            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata".to_vec(),
-        ]));
-        let connector = RecordingHttpsConnector::default();
-        let outcome = download_with_connector(
-            request(
-                dispatcher.clone(),
-                "http://rules.example.test/start.dat",
-                path,
-            ),
-            &connector,
-        )
-        .await
-        .unwrap();
-        assert!(
-            matches!(outcome, DownloadOutcome::Downloaded { final_url, .. } if final_url == "https://secure.example.test/final.dat")
-        );
-        assert_eq!(*connector.0.lock().unwrap(), ["secure.example.test"]);
-        let destinations: Vec<_> = dispatcher
-            .sessions()
-            .into_iter()
-            .map(|session| session.destination)
-            .collect();
-        assert_eq!(
-            destinations,
-            [
-                Destination::domain("rules.example.test", 80).unwrap(),
-                Destination::domain("cdn.example.test", 8080).unwrap(),
-                Destination::domain("secure.example.test", 443).unwrap(),
-            ]
-        );
-        assert!(
-            std::str::from_utf8(&dispatcher.requests()[1])
-                .unwrap()
-                .contains("\r\nHost: cdn.example.test:8080\r\n")
-        );
-    }
-
-    #[cfg(not(feature = "benchmark-geodata-http"))]
     #[tokio::test]
     async fn plaintext_geodata_is_rejected_before_dispatch() {
         let directory = tempdir().unwrap();
@@ -1662,7 +1527,6 @@ mod tests {
 
     #[test]
     fn url_and_etag_validation_preserve_the_geodata_contract() {
-        #[cfg(not(feature = "benchmark-geodata-http"))]
         assert!(matches!(
             parse_resource_url("http://example.test/file"),
             Err(DownloadError::HttpsRequired)
@@ -1698,40 +1562,6 @@ mod tests {
             let endpoint = DownloadEndpoint::from_url(&parse_resource_url(raw).unwrap()).unwrap();
             assert_eq!(endpoint.port, port);
             assert_eq!(endpoint.authority, authority);
-        }
-        #[cfg(feature = "benchmark-geodata-http")]
-        {
-            for (raw, port, authority) in [
-                ("http://example.test/file", 80, "example.test"),
-                ("http://example.test:443/file", 443, "example.test:443"),
-            ] {
-                let endpoint =
-                    DownloadEndpoint::from_url(&parse_resource_url(raw).unwrap()).unwrap();
-                assert_eq!(endpoint.port, port);
-                assert_eq!(endpoint.authority, authority);
-            }
-            for raw in [
-                "http://127.0.0.1/file",
-                "http://[::1]/file",
-                "http://user@example.test/file",
-                "http://@example.test/file",
-                "http://example.test/file#fragment",
-            ] {
-                assert!(parse_resource_url(raw).is_err());
-            }
-            let base = parse_resource_url("http://example.test/start").unwrap();
-            assert_eq!(
-                resolve_redirect(&base, "/next").unwrap().as_str(),
-                "http://example.test/next"
-            );
-            for location in [
-                "ftp://example.test/file",
-                "http://127.0.0.1/file",
-                "http://user@example.test/file",
-                "/file#fragment",
-            ] {
-                assert!(resolve_redirect(&base, location).is_err());
-            }
         }
     }
 }

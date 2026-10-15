@@ -76,8 +76,6 @@ dns-quic = ["quinn-h3-transport"]
 # Enables local interoperability-only trust-root injection. Release build
 # scripts must not enable this feature.
 interop-test = ["outbound-anytls", "outbound-vless"]
-# Allows plaintext GeoData fixtures for isolated benchmarks, never production.
-benchmark-geodata-http = []
 invoke = ["tun", "dns-quic", "tokio/rt-multi-thread", "tokio/signal"]
 ffi = ["invoke"]
 cli = ["invoke"]

@@ -13,18 +13,18 @@ Vole — прокси-ядро на Rust для VPN-клиентов и лока
 - **Принимать трафик приложений и VPN:** пересылка HTTP, CONNECT и Upgrade; SOCKS5 CONNECT и UDP ASSOCIATE; IPv4/IPv6-пакеты TUN, предоставленные хостом.
 - **Маршрутизировать трафик:** режимы rule/global/direct; домены, IP и порты источника и назначения, TCP/UDP, GeoSite/GeoIP, наборы правил и логические условия, действия DIRECT и REJECT.
 - **Выбирать прокси и строить цепочки:** вложенные группы select/url-test/fallback/load-balance, проверки доступности и сохранение выбора; `dialer-proxy` ссылается на узлы или группы. Существующие соединения сохраняют свой маршрут.
-- **Обрабатывать DNS:** hosts, отдельные bootstrap/узловые/прямые резолверы, UDP/TCP/DoH/DoT, политики по доменам/GeoSite/rule-set, fallback, ограниченный кеш, redir-host и постоянные fake-IP; перехват DNS в TUN по конфигурации.
+- **Обрабатывать DNS:** hosts, отдельные bootstrap/узловые/прямые резолверы, UDP/TCP/DoH/DoT/DoQ, политики по доменам/GeoSite/rule-set, fallback, ограниченный кеш, redir-host и постоянные fake-IP; перехват DNS в TUN по конфигурации.
 - **Определять трафик для маршрутизации:** HTTP/TLS для TUN и mixed TCP, QUIC для TUN UDP, условия принудительного анализа и исключения, настраиваемая замена назначения. Ответы на ICMPv4/ICMPv6 Echo формируются локально.
 - **Управлять ресурсами:** HTTP/file/inline providers узлов и правил, динамические группы, фильтры и переопределения; YAML/Text и domain/ipcidr MRS. GeoData полностью загружает выбранные категории, поддерживает маршрутизируемые загрузки и периодические обновления; ошибки обновления сохраняют рабочее состояние. См. [границы GeoData](../docs/geodata.md#内存与安全边界).
 - **Предоставлять управление:** состояние групп и ресурсов, список и закрытие соединений, счётчики правил, действующая конфигурация и ограниченная DNS-диагностика, а также метрики TUN и изолированное измерение задержки.
 
 ## Прокси-протоколы
 
-Все десять протоколов ниже включены по умолчанию. HTTP CONNECT поддерживает только TCP; UDP для остальных протоколов настраивается на уровне узла.
+В сборке по умолчанию включены перечисленные ниже протоколы. Поддержка UDP зависит от режима протокола и конфигурации узла.
 
 | Протокол | Возможности |
 | --- | --- |
-| [VLESS](../docs/vless.md) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP-маскировка первого пакета, legacy H2, [XHTTP H1/H2/H3](../docs/xhttp.md); Vision, Encryption, REALITY, JLS, статический ECH и sing-mux в поддерживаемых сочетаниях |
+| [VLESS](../docs/vless.md) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP-маскировка первого пакета, legacy H2, [XHTTP H1/H2/H3](../docs/xhttp.md); Vision, Encryption, REALITY, JLS, ECH и sing-mux в поддерживаемых сочетаниях |
 | [VMess AEAD](../docs/outbounds.md#vmess-aead) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP-маскировка первого пакета и legacy H2; TCP/UDP, транспорт без TLS или со стандартным TLS |
 | [Trojan](../docs/outbounds.md#trojan) | TCP/UDP через TLS TCP, WebSocket / HTTPUpgrade или gRPC |
 | [Shadowsocks 2022](../docs/outbounds.md#shadowsocks-2022) | TCP/UDP; AES-128-GCM, AES-256-GCM и ChaCha20-Poly1305; цепочки идентификации AES; опциональный strict ShadowTLS v3 для TCP и UoT v2 |
@@ -34,8 +34,11 @@ Vole — прокси-ядро на Rust для VPN-клиентов и лока
 | [Hysteria2](../docs/outbounds.md#hysteria2) | TCP/UDP через QUIC, управление пропускной способностью, Salamander, смена портов и mTLS |
 | [TUIC v5](../docs/outbounds.md#tuic-v5) | TCP/UDP через QUIC, режимы передачи UDP native/quic и выбор алгоритма управления перегрузкой |
 | [WireGuard](../docs/outbounds.md#wireguard) | TCP/UDP через стандартный WireGuard, несколько пиров и DNS узла, с пользовательским IP-стеком |
+| [TrustTunnel](../docs/outbounds.md#trusttunnel) | TCP/UDP через H2/H3 CONNECT; аутентификация, проверки состояния, mTLS и ECH |
+| [Mieru](../docs/outbounds.md#mieru) | TCP/UDP через транспорт TCP или UDP; мультиплексирование, STANDARD/NO-WAIT и traffic-pattern |
+| [MASQUE](../docs/outbounds.md#masque) | TCP/UDP через H2/H3 CONNECT-IP; режим H3 L4 поддерживает только TCP |
 
-Стандартные TLS-соединения поддерживают проверку сертификатов и закрепление сертификата по SHA-256. Поддерживаемые TCP-пути с TLS могут использовать шаблоны ClientHello Chrome, Firefox или Safari; `client-fingerprint` не зависит от `fingerprint` сертификата. Точные имена и сочетания описаны в [профилях TLS и политике сертификатов](../docs/tls-client-fingerprint.md). Эти функции не гарантируют неотличимость от браузера или произвольные сочетания протоколов.
+Стандартные TLS-соединения поддерживают проверку сертификатов и закрепление сертификата по SHA-256. Поддерживаемые TCP-пути с TLS могут использовать шаблоны ClientHello Chrome, Firefox, Safari или iOS; `client-fingerprint` не зависит от `fingerprint` сертификата. Точные имена и сочетания описаны в [профилях TLS и политике сертификатов](../docs/tls-client-fingerprint.md). Эти функции не гарантируют неотличимость от браузера или произвольные сочетания протоколов.
 
 SS2022 использует официальную Rust-библиотеку без изменений; известные риски пустой первой записи, сценария server-first и padding описаны в [контракте Shadowsocks](../docs/outbounds.md#shadowsocks-2022).
 

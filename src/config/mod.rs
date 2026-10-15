@@ -2429,10 +2429,7 @@ fn normalize_geox_url(raw: String, field: &str) -> Result<String> {
     }
     let url = Url::parse(&raw)
         .map_err(|error| VoleError::InvalidConfig(format!("{field} is invalid: {error}")))?;
-    let allowed_scheme = url.scheme() == "https";
-    #[cfg(feature = "benchmark-geodata-http")]
-    let allowed_scheme = allowed_scheme || url.scheme() == "http";
-    if !allowed_scheme {
+    if url.scheme() != "https" {
         return invalid(format!("{field} must use HTTPS"));
     }
     let authority = raw
@@ -4342,15 +4339,12 @@ geo-update-interval: 24"#,
     }
 
     #[test]
-    fn geodata_update_http_is_benchmark_only() {
+    fn geodata_update_requires_https() {
         for url in [
             "http://geo.example.test/geoip.dat",
             "http://geo.example.test:8080/geosite.dat",
         ] {
-            assert_eq!(
-                normalize_geox_url(url.to_owned(), "geox-url.geoip").is_ok(),
-                cfg!(feature = "benchmark-geodata-http")
-            );
+            assert!(normalize_geox_url(url.to_owned(), "geox-url.geoip").is_err());
         }
         for url in [
             "http://127.0.0.1/geoip.dat",

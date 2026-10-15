@@ -146,13 +146,6 @@ geo-update-interval: 24
 - 下载以固定大小缓冲流式写入同目录暂存文件，不限制资产总字节；保留 90 秒期限、取消、HTTPS/HTTP 解析边界和字节计数溢出检查。流式落盘期间保留当前快照；文件大小、wire 结构和 staging 检查通过后，先卸载并排空旧匹配器，再构建候选。分类需求校验成功后原子替换文件，SHA-256 随状态保存；失败保留上一份磁盘资产，不保证恢复旧内存快照。
 - 跨进程更新锁和原子重命名只保护共享数据目录，不提供多实例调度协议。
 
-隔离实验可显式编译独立、非默认 `benchmark-geodata-http` feature，使 GeoData 更新
-接受以域名为主机、无 userinfo/fragment 的 HTTP fixture；仍通过同一个 dispatcher 和
-流式下载器，不建立 TLS。HTTP 重定向可保持 HTTP 或升级到 HTTPS，HTTPS 不允许降级。
-该入口没有环境变量或新的 YAML/FFI 开关；未编译该 feature 时仍强制 HTTPS，HTTPS 的
-会话共享信任根和完整证书验证不变。平台构建及 delivery 拒绝该测试 feature。HTTP 实验只验收
-更新逻辑与资源占用，不构成生产 HTTPS 信任链验收，不应启用 `interop-test`。
-
 ## GeoSite 匹配
 
 TUN 的 IP 目标采用以下选路提示优先级：
@@ -294,17 +287,16 @@ fallible Vec 扩容、合法 protobuf 帧/长度、code、选中匹配值的 UTF
 验证期的新旧字节重叠、Meta 多 code 查询的临时引用索引与 MMDB metadata/图校验状态未计入。因此账本**不包含正则内部编译状态、搜索缓存、
 动态 scratch、配置需求集合、allocator 开销或整个进程 footprint**。这些未计入的
 内存并不是零；accounted peak 不能作为加载或运行期峰值上界。
-进程 RSS 的硬上限与 2Gbps 联合负载目标统一见[验收边界](acceptance.md#性能采纳标准)，
+进程 RSS 的硬上限与 1/2/3Gbps 分档压力标准统一见[验收边界](acceptance.md#性能采纳标准)，
 它们是压力测试标准，不是加载器保证。
 
 互通和内存/吞吐压力由独立容器测试工具维护，公开结果见 [benchmark](benchmark.md)；
 `interop`、`stress` 和 `compare` 以 `--source vole=PATH` 显式指定被测 checkout。
 Vole 自有脚本仅负责编译。压力与横向比较固定只引用完整 `geosite:cn` / `geoip:cn`，
-更新下载保留原始增强 DAT，但不因此加载其他分类。真实资产的类型分布、明确标识的四类型/复杂正则合成用例、
-属性/反选见证、加载与真实更新期间的峰值、联合吞吐/DNS/RSS 结果以 benchmark 的本轮文字结论为准。
-历史 Domain/Full 子集或单纯离线加载不能替代完整真实资产的 fd-TUN 压力，也不能证明
-任意正则的加载峰值。Linux RSS 不替代 Apple Network Extension physical footprint；
-少量转发见证不等同逐条规则语义穷举。
+更新下载保留原始增强 DAT，但不因此加载其他分类。当前 CLI 压力覆盖启动时加载，
+不包含负载期间的 GeoData 热更新；加载峰值与联合吞吐/DNS/RSS 以实际记录为准。
+合成回归和离线加载不替代完整真实资产的 TUN 压力，少量转发不等同逐条规则穷举。
+Linux RSS 不替代 Apple Network Extension physical footprint。
 
 ## 失败语义
 

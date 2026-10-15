@@ -13,14 +13,14 @@ Configuration uses **Mihomo-style YAML for the supported feature set**. Vole pri
 - **Accept application and VPN traffic:** HTTP forwarding, CONNECT and Upgrade; SOCKS5 CONNECT and UDP ASSOCIATE; host-provided IPv4/IPv6 TUN packets.
 - **Route traffic:** rule/global/direct modes; domain, source/destination IP and port, TCP/UDP, GeoSite/GeoIP, rule providers and logical rules, with DIRECT and REJECT actions.
 - **Choose and chain proxies:** nested select/url-test/fallback/load-balance groups, health checks and persistent selection; `dialer-proxy` chains can reference nodes or groups. Existing connections retain their selected path.
-- **Handle DNS:** hosts, separate bootstrap/node/direct resolvers, UDP/TCP/DoH/DoT, domain/GeoSite/rule-set policies, fallback, bounded caching, redir-host and persistent fake-IP mappings; intercept configured TUN DNS targets.
+- **Handle DNS:** hosts, separate bootstrap/node/direct resolvers, UDP/TCP/DoH/DoT/DoQ, domain/GeoSite/rule-set policies, fallback, bounded caching, redir-host and persistent fake-IP mappings; intercept configured TUN DNS targets.
 - **Identify traffic for routing:** HTTP/TLS sniffing for TUN and mixed TCP, QUIC sniffing for TUN UDP, with force/skip conditions and configurable destination override. ICMPv4/ICMPv6 Echo is answered locally.
 - **Manage routing assets:** HTTP/file/inline proxy and rule providers, dynamic groups, filters and overrides; YAML/Text and domain/ipcidr MRS. GeoData loads complete referenced categories and supports routed downloads and periodic updates. Failed updates retain usable state. See [GeoData boundaries](docs/geodata.md#内存与安全边界).
 - **Expose client controls:** group/resource state, connection snapshots and cancellation, rule counters, effective configuration and bounded DNS diagnostics, alongside TUN traffic metrics and isolated node/chain delay measurement.
 
 ## Proxy protocols
 
-All ten protocols below are enabled in the default build. HTTP CONNECT itself is TCP-only; native UDP support for other protocols is configured per node.
+The default build enables the protocols below. UDP support depends on the protocol mode and node configuration.
 
 | Protocol | Capabilities |
 | --- | --- |
@@ -34,6 +34,9 @@ All ten protocols below are enabled in the default build. HTTP CONNECT itself is
 | [Hysteria2](docs/outbounds.md#hysteria2) | QUIC TCP/UDP, bandwidth control, Salamander, port hopping and mTLS |
 | [TUIC v5](docs/outbounds.md#tuic-v5) | QUIC TCP/UDP, native/quic UDP relay modes and selectable congestion control |
 | [WireGuard](docs/outbounds.md#wireguard) | TCP/UDP over standard WireGuard, multiple peers and node DNS, with a user-space IP stack |
+| [TrustTunnel](docs/outbounds.md#trusttunnel) | TCP/UDP over H2 or H3 CONNECT; authentication, health checks, mTLS and ECH |
+| [Mieru](docs/outbounds.md#mieru) | TCP/UDP over TCP or UDP carriers; multiplexing, STANDARD/NO-WAIT handshakes and traffic patterns |
+| [MASQUE](docs/outbounds.md#masque) | TCP/UDP over H2/H3 CONNECT-IP; TCP-only H3 L4 proxy mode |
 
 The shared [sing-mux wrapper](docs/xhttp.md#通用-sing-mux) supports all enabled node protocols. It provides TCP and, with `only-tcp: false`, UDP over the node's ordinary TCP path. The peer must provide sing-mux decoding; a normal HTTP/SOCKS5 listener does not automatically decode it.
 
