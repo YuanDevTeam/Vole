@@ -96,6 +96,8 @@ HANDSHAKE_DEFAULT/STANDARD 发送请求并等待 SOCKS 回复；HANDSHAKE_NO_WAI
 首个业务写入发送请求和数据，再确认回复。枚举必须使用完整前缀。
 关闭单个流仅释放其会话；节点 Stop 取消并 join 物理读写、清理及 UDP 读取任务。
 写队列、接收字节及 UDP 单包受运行时预算约束；取消不会重放加密帧。
+TCP 载体的 UDP Associate 按 UDP 接收预算收紧应用信用，完整载体帧仍可分块读取；
+TCP CONNECT、物理 UDP 的可靠窗口和写预算不变，具体界见[运行时策略](runtime-resource-policy.md#udp)。
 UDP 底层使用可靠会话，提供累计 ACK、重传、有序交付、分片和窗口。
 密钥固定于物理载体，每包使用显式 nonce；重传保留明文，重新生成 nonce 和时间戳。
 收发分别取1400字节 MTU 与真实上游预算的交集。正常接收的乱序缓存与应用未读队列
