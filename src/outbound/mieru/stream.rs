@@ -108,6 +108,16 @@ impl State {
     pub fn unread_segments(&self) -> usize {
         self.input.lock().unwrap().queue.len()
     }
+    #[cfg(test)]
+    pub(super) fn unread_bytes(&self) -> usize {
+        self.input
+            .lock()
+            .unwrap()
+            .queue
+            .iter()
+            .map(|chunk| chunk.bytes.len())
+            .sum()
+    }
     pub(super) fn receive_capacity(&self) -> usize {
         self.capacity
     }
@@ -137,14 +147,23 @@ impl State {
         true
     }
     pub async fn deliver(&self, mut data: Bytes) -> io::Result<()> {
+        // Detach every piece of a split frame, including its final short tail.
+        // Otherwise a small queued slice keeps the whole decrypted allocation
+        // alive after delivery completes and the physical reader moves on.
+        let split_frame = data.len() > self.capacity;
         while !data.is_empty() {
             let count = data.len().min(self.capacity);
             let permit = tokio::select! { biased;
                 ()=self.cancel.cancelled()=>return Err(closed()),
                 result=self.receive_bytes.clone().acquire_many_owned(count as u32)=>result.map_err(|_|closed())?,
             };
+            let bytes = data.split_to(count);
             self.deliver_reserved(ReceivedChunk {
-                bytes: data.split_to(count),
+                bytes: if split_frame {
+                    Bytes::copy_from_slice(&bytes)
+                } else {
+                    bytes
+                },
                 permit,
             });
         }
@@ -475,3 +494,7 @@ async fn read_response(raw: &mut RawStream) -> io::Result<()> {
     socks5::read_destination(raw, true).await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "stream_memory_tests.rs"]
+mod memory_tests;
