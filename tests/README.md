@@ -128,7 +128,9 @@ Python，直接运行此检查，仅验证各自构建的产物。
 `outbound::wireguard::tests::` 在内存中交换真实 Noise 与 raw-IP 包，覆盖主动 TCP、双栈 UDP、真实握手重试、多 peer 最长前缀与 reserved、节点远端 DNS、端点更新、取消与 Stop；不打开 socket 或系统接口。
 
 `mieru` 包含真实加密数据报的纯内存回归，覆盖独立接收信用、累计 ACK、乱序前缀、远端关闭后的读取与无读者 Stop；小容量 Partial 路径单独保留。
-TCP池回归调用实际载体选择路径，验证 LOW 的活动会话与建流预留隔离、关闭后的空闲复用，以及其它复用模式的选择。
+TCP池回归调用实际载体选择路径与TCP/UDP出站入口，验证 LOW 的TCP活动会话与建流预留隔离、
+UDP Associate活动复用、两类池隔离、关闭后的空闲复用，以及其它复用模式不变。
+真实加密duplex回归耗尽未读TCP的接收预算，验证兄弟TCP和UDP仍可收发及Stop回收。
 
 `masque_` 使用内存密钥、IP/UDP 包和受控 QUIC 对端，验证模式准入、CONNECT、
 capsule、流关联、包预算及 Stop。实际内存 H2 双端验证响应准入、DATA 保留与取消隔离；

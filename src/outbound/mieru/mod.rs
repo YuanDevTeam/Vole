@@ -15,7 +15,6 @@ use crate::{
         ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector, UpstreamPath,
     },
     session::{Destination, StreamSession},
-    socks5,
 };
 use async_trait::async_trait;
 use std::{
@@ -50,11 +49,12 @@ impl MieruOutbound {
     async fn connect(
         &self,
         session: StreamSession,
-        command: u8,
+        business: tcp::Business,
         context: &EstablishContext,
     ) -> io::Result<BoxStream> {
         let target = session.destination.clone();
-        let raw = self.client.open(session, context).await?;
+        let raw = self.client.open(session, business, context).await?;
+        let command = business.command();
         let stream = match self.handshake {
             MieruHandshake::Standard => {
                 stream::Stream::standard(raw, &target, command, context.deadline()).await?
@@ -75,7 +75,7 @@ impl OutboundConnector for MieruOutbound {
         let io = context
             .run_io(
                 "Mieru business connection",
-                self.connect(session, socks5::COMMAND_CONNECT, context),
+                self.connect(session, tcp::Business::TcpConnect, context),
             )
             .await?;
         Ok(ConnectedStream {
@@ -103,7 +103,7 @@ impl OutboundConnector for MieruOutbound {
         let io = context
             .run_io(
                 "Mieru UDP associate",
-                self.connect(session, socks5::COMMAND_UDP_ASSOCIATE, context),
+                self.connect(session, tcp::Business::UdpAssociate, context),
             )
             .await?;
         let transport = packet::PacketTransport::new(

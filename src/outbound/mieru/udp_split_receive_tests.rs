@@ -139,7 +139,11 @@ mod split_receive_tests {
             let context = EstablishContext::with_timeout(Duration::from_secs(1));
             let raw = match node
                 .client
-                .open(super::super::tests::session(), &context)
+                .open(
+                    super::super::tests::session(),
+                    super::super::tcp::Business::TcpConnect,
+                    &context,
+                )
                 .await
             {
                 Ok(raw) => raw,

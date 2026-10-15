@@ -39,6 +39,19 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 const CLEAN_INTERVAL: Duration = Duration::from_secs(5);
 const WRITER_COMMANDS: usize = 2;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Business {
+    TcpConnect,
+    UdpAssociate,
+}
+impl Business {
+    pub fn command(self) -> u8 {
+        match self {
+            Self::TcpConnect => crate::socks5::COMMAND_CONNECT,
+            Self::UdpAssociate => crate::socks5::COMMAND_UDP_ASSOCIATE,
+        }
+    }
+}
 pub(super) struct WriterCommand {
     pub state: Arc<State>,
     pub data: Bytes,
@@ -64,6 +77,8 @@ pub(super) struct Shared {
     pub(super) volume: u64,
     created: Instant,
     udp: bool,
+    // Only LOW TCP separates business types; other modes keep a shared pool.
+    business: Option<Business>,
     maximum_write: AtomicUsize,
 }
 impl Shared {
@@ -87,6 +102,7 @@ impl Shared {
             volume: u64::MAX,
             created: Instant::now(),
             udp: true,
+            business: None,
             maximum_write: AtomicUsize::new(32768),
         })
     }
@@ -307,15 +323,17 @@ impl Client {
     }
     fn reserve_reusable(
         &self,
+        business: Business,
         choose: impl FnOnce(usize) -> usize,
     ) -> io::Result<Option<Reservation>> {
         let _admission = self.admission.lock().unwrap();
         if self.cancel.is_cancelled() {
             return Err(closed());
         }
-        // Keep TCP receive backpressure local without enlarging stream buffers.
-        // The reservation also covers the gap before open publishes its session.
-        let idle_only = self.factor == 1 && self.factory.config.transport == MieruTransport::Tcp;
+        let pool = self.pool(business);
+        // Isolate slow TCP readers without dedicating a carrier to every UDP target.
+        // Reservations cover the gap before open publishes its session.
+        let idle_only = pool == Some(Business::TcpConnect);
         let registry = self.registry.lock().unwrap();
         let available: Vec<_> = registry
             .carriers
@@ -324,7 +342,8 @@ impl Client {
                 carrier.shared.clean();
                 let active = idle_only && carrier.shared.count() != 0;
                 let schedule = carrier.shared.schedule.lock().unwrap();
-                !schedule.closed
+                carrier.shared.business == pool
+                    && !schedule.closed
                     && schedule.disabled.is_none()
                     && !active
                     && (!idle_only || schedule.pending == 0)
@@ -347,17 +366,23 @@ impl Client {
             None
         })
     }
+    fn pool(&self, business: Business) -> Option<Business> {
+        (self.factor == 1 && self.factory.config.transport == MieruTransport::Tcp)
+            .then_some(business)
+    }
     pub async fn open(
         &self,
         session: StreamSession,
+        business: Business,
         context: &EstablishContext,
     ) -> io::Result<RawStream> {
         let operation = async {
             let _waiter = observation::track(ResourceKind::Waiter);
-            let reusable = self.reserve_reusable(|weight| rand::random_range(0..=weight))?;
+            let reusable =
+                self.reserve_reusable(business, |weight| rand::random_range(0..=weight))?;
             let reservation = match reusable {
                 Some(reservation) => reservation,
-                None => self.create(session, context).await?,
+                None => self.create(session, business, context).await?,
             };
             let carrier = reservation.0.clone();
             let state = {
@@ -389,6 +414,7 @@ impl Client {
     async fn create(
         &self,
         session: StreamSession,
+        business: Business,
         context: &EstablishContext,
     ) -> io::Result<Reservation> {
         let (control, control_frames) = mpsc::channel(1);
@@ -409,6 +435,7 @@ impl Client {
             volume: (512 * 1024 * 1024_u64) << self.factor,
             created: Instant::now(),
             udp: self.factory.config.transport == MieruTransport::Udp,
+            business: self.pool(business),
             maximum_write: AtomicUsize::new(32768),
         });
         let (writer, commands) = mpsc::channel(WRITER_COMMANDS);
@@ -779,7 +806,10 @@ mod tests {
                 let client =
                     Client::new(&configuration, UpstreamPath::proxy(peer.clone()), 32768).unwrap();
                 let context = EstablishContext::with_timeout(Duration::from_secs(5));
-                let raw = client.open(session(), &context).await.unwrap();
+                let raw = client
+                    .open(session(), Business::TcpConnect, &context)
+                    .await
+                    .unwrap();
                 let state = raw.state.clone();
                 assert_eq!(
                     client
@@ -875,22 +905,54 @@ mod tests {
         assert!(probe.snapshot().is_idle());
     }
     #[tokio::test]
-    async fn mieru_tcp_low_reuses_idle_carriers_without_changing_other_modes() {
+    async fn mieru_tcp_low_separates_business_pools_without_changing_other_modes() {
         let probe = ResourceProbe::default();
         let outcomes: io::Result<Vec<(String, bool, bool)>> = probe
             .scope(async {
                 let mut outcomes = Vec::new();
-                for (label, transport, multiplexing, active_reusable) in [
-                    ("low", MieruTransport::Tcp, MieruMultiplexing::Low, false),
+                for (label, transport, multiplexing, business, active_reusable) in [
+                    (
+                        "tcp-low",
+                        MieruTransport::Tcp,
+                        MieruMultiplexing::Low,
+                        Business::TcpConnect,
+                        false,
+                    ),
+                    (
+                        "udp-associate-low",
+                        MieruTransport::Tcp,
+                        MieruMultiplexing::Low,
+                        Business::UdpAssociate,
+                        true,
+                    ),
                     (
                         "middle",
                         MieruTransport::Tcp,
                         MieruMultiplexing::Middle,
+                        Business::TcpConnect,
                         true,
                     ),
-                    ("high", MieruTransport::Tcp, MieruMultiplexing::High, true),
-                    ("udp-low", MieruTransport::Udp, MieruMultiplexing::Low, true),
-                    ("off", MieruTransport::Tcp, MieruMultiplexing::Off, false),
+                    (
+                        "high",
+                        MieruTransport::Tcp,
+                        MieruMultiplexing::High,
+                        Business::TcpConnect,
+                        true,
+                    ),
+                    (
+                        "udp-carrier-low",
+                        MieruTransport::Udp,
+                        MieruMultiplexing::Low,
+                        Business::TcpConnect,
+                        true,
+                    ),
+                    (
+                        "off",
+                        MieruTransport::Tcp,
+                        MieruMultiplexing::Off,
+                        Business::TcpConnect,
+                        false,
+                    ),
                 ] {
                     let peer = Peer::new(false);
                     let mut settings = config(MieruHandshake::NoWait);
@@ -898,7 +960,9 @@ mod tests {
                     settings.multiplexing = multiplexing;
                     let client = Client::new(&settings, UpstreamPath::proxy(peer.clone()), 1024)?;
                     let mut shared = Shared::output_test_shared(client.cancel.child_token());
-                    Arc::get_mut(&mut shared).unwrap().udp = transport == MieruTransport::Udp;
+                    let settings = Arc::get_mut(&mut shared).unwrap();
+                    settings.udp = transport == MieruTransport::Udp;
+                    settings.business = client.pool(business);
                     let state = State::new(1, 1024, &shared.cancel, shared.activity.clone());
                     shared.sessions.lock().unwrap().insert(1, state.clone());
                     let (writer, receiver) = mpsc::channel(WRITER_COMMANDS);
@@ -917,7 +981,7 @@ mod tests {
                     // No framing or network is needed to test this admission decision.
                     let result: io::Result<Vec<(String, bool, bool)>> = (|| {
                         let mut observed = Vec::new();
-                        let active = client.reserve_reusable(|_| 0)?;
+                        let active = client.reserve_reusable(business, |_| 0)?;
                         observed.push((
                             format!("{label} active"),
                             active.is_some(),
@@ -925,33 +989,49 @@ mod tests {
                         ));
                         drop(active);
                         state.close();
-                        let idle = client.reserve_reusable(|_| 0)?;
+                        let idle = client.reserve_reusable(business, |_| 0)?;
                         observed.push((
                             format!("{label} idle after close"),
                             idle.is_some(),
                             multiplexing != MieruMultiplexing::Off,
                         ));
-                        if transport == MieruTransport::Tcp
-                            && multiplexing == MieruMultiplexing::Low
-                        {
-                            // The first reservation stays alive across the second attempt,
-                            // matching the gap before Client::open inserts its session.
-                            let pending = client.reserve_reusable(|_| 0)?;
-                            observed.push(("low pending".into(), pending.is_some(), false));
-                            drop(pending);
-                        }
+                        // Keep the first reservation across the second attempt,
+                        // matching the gap before Client::open inserts its session.
+                        let pending = client.reserve_reusable(business, |_| 0)?;
+                        observed.push((
+                            format!("{label} pending"),
+                            pending.is_some(),
+                            active_reusable,
+                        ));
+                        drop(pending);
                         drop(idle);
-                        if transport == MieruTransport::Tcp
-                            && multiplexing == MieruMultiplexing::Low
-                        {
-                            let idle_again = client.reserve_reusable(|_| 0)?;
-                            observed.push((
-                                "low after reservation release".into(),
-                                idle_again.is_some(),
-                                true,
-                            ));
-                            drop(idle_again);
-                        }
+                        let other_business = match business {
+                            Business::TcpConnect => Business::UdpAssociate,
+                            Business::UdpAssociate => Business::TcpConnect,
+                        };
+                        let other = client.reserve_reusable(other_business, |_| 0)?;
+                        observed.push((
+                            format!("{label} other business"),
+                            other.is_some(),
+                            multiplexing != MieruMultiplexing::Off
+                                && !(transport == MieruTransport::Tcp
+                                    && multiplexing == MieruMultiplexing::Low),
+                        ));
+                        drop(other);
+                        let idle_again = client.reserve_reusable(business, |_| 0)?;
+                        observed.push((
+                            format!("{label} after reservation release"),
+                            idle_again.is_some(),
+                            multiplexing != MieruMultiplexing::Off,
+                        ));
+                        drop(idle_again);
+                        let new_carrier = client.reserve_reusable(business, |weight| weight)?;
+                        observed.push((
+                            format!("{label} new carrier bucket"),
+                            new_carrier.is_some(),
+                            false,
+                        ));
+                        drop(new_carrier);
                         Ok(observed)
                     })();
                     client.shutdown().await;
@@ -969,6 +1049,152 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn mieru_tcp_low_udp_associate_uses_active_pool_from_outbound_callsite() {
+        use crate::{
+            outbound::{DatagramRequest, OutboundConnector},
+            session::DatagramSession,
+        };
+        let probe = ResourceProbe::default();
+        let active_reusable = probe
+            .scope(async {
+                let peer = Peer::new(false);
+                let mut settings = config(MieruHandshake::Standard);
+                settings.multiplexing = MieruMultiplexing::Low;
+                let node = super::super::MieruOutbound::new(
+                    &settings,
+                    UpstreamPath::proxy(peer.clone()),
+                    1024,
+                )
+                .unwrap();
+                let context = EstablishContext::with_timeout(Duration::from_secs(5));
+                let request =
+                    DatagramRequest::new(DatagramSession::for_tun(session().source, 1500));
+                let mut packet = node.open_datagram(request, &context).await.unwrap();
+                assert_eq!(peer.calls.load(Ordering::Acquire), 1);
+                // Exercise the actual outbound's published carrier, choosing the
+                // reuse bucket deterministically while its UDP session is active.
+                let reusable = node
+                    .client
+                    .reserve_reusable(Business::UdpAssociate, |_| 0)
+                    .unwrap();
+                let active_reusable = reusable.is_some();
+                drop(reusable);
+                packet.close().await.unwrap();
+                drop(packet);
+                node.shutdown().await;
+                drop(node);
+                peer.stop().await;
+                active_reusable
+            })
+            .await;
+        assert!(probe.snapshot().is_idle());
+        assert!(
+            active_reusable,
+            "LOW UDP Associate must retain active reuse"
+        );
+    }
+    #[tokio::test]
+    async fn mieru_tcp_low_slow_reader_does_not_block_tcp_or_udp_siblings() {
+        use crate::{
+            dispatch::DispatchError,
+            outbound::{DatagramRequest, OutboundConnector},
+            session::{Datagram, DatagramSession, Destination},
+        };
+        use tokio::io::AsyncReadExt;
+
+        let probe = ResourceProbe::default();
+        let (blocked, exhausted, siblings) = probe
+            .scope(async {
+                let peer = Peer::new(false);
+                let mut settings = config(MieruHandshake::Standard);
+                settings.multiplexing = MieruMultiplexing::Low;
+                let node = super::super::MieruOutbound::new(
+                    &settings,
+                    UpstreamPath::proxy(peer.clone()),
+                    1024,
+                )
+                .unwrap();
+                let context = EstablishContext::with_timeout(Duration::from_secs(5));
+                let first = node.connect_stream(session(), &context).await.unwrap();
+                let carrier = node
+                    .client
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .carriers
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let state = carrier
+                    .shared
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let (reader, mut writer) = tokio::io::split(first.io);
+                let payload = vec![7; 16384];
+                let (blocked, exhausted, siblings) = {
+                    // Hold the read half without consuming the echoed bytes. The
+                    // real decoder fills its unchanged 1 KiB receive budget.
+                    let writing = writer.write_all(&payload);
+                    tokio::pin!(writing);
+                    let blocked = tokio::time::timeout(Duration::from_millis(20), &mut writing)
+                        .await
+                        .is_err();
+                    let exhausted = state.receive_bytes.available_permits() == 0;
+                    let siblings = tokio::time::timeout(Duration::from_secs(3), async {
+                        let mut sibling = node.connect_stream(session(), &context).await?.io;
+                        sibling.write_all(b"sibling").await?;
+                        let mut echoed = [0; 7];
+                        sibling.read_exact(&mut echoed).await?;
+                        let request =
+                            DatagramRequest::new(DatagramSession::for_tun(session().source, 1500));
+                        let mut packet = node.open_datagram(request, &context).await?;
+                        let remote = Destination::Ip("198.51.100.1:53".parse().unwrap());
+                        packet
+                            .send(Datagram {
+                                remote: remote.clone(),
+                                payload: Bytes::from_static(b"packet"),
+                                sniffed_domain: None,
+                            })
+                            .await?;
+                        let response = packet.receive().await?;
+                        packet.close().await?;
+                        Ok::<_, DispatchError>(
+                            echoed == *b"sibling"
+                                && response.remote == remote
+                                && response.payload == b"packet"[..],
+                        )
+                    })
+                    .await;
+                    (blocked, exhausted, siblings)
+                };
+                drop((reader, writer, state, carrier));
+                node.shutdown().await;
+                drop(node);
+                peer.stop().await;
+                (blocked, exhausted, siblings)
+            })
+            .await;
+        assert!(probe.snapshot().is_idle());
+        assert!(
+            blocked,
+            "the unread stream must apply physical backpressure"
+        );
+        assert!(
+            exhausted,
+            "the unread stream must exhaust its original receive budget"
+        );
+        assert!(
+            siblings.unwrap().unwrap(),
+            "TCP and UDP siblings must retain their data"
+        );
+    }
+    #[tokio::test]
     async fn mieru_tcp_shared_carrier_preserves_sibling_and_bounded_reader() {
         let probe = ResourceProbe::default();
         probe
@@ -981,7 +1207,10 @@ mod tests {
                 )
                 .unwrap();
                 let context = EstablishContext::with_timeout(Duration::from_secs(5));
-                let raw = client.open(session(), &context).await.unwrap();
+                let raw = client
+                    .open(session(), Business::TcpConnect, &context)
+                    .await
+                    .unwrap();
                 let target = session().destination;
                 let mut first: BoxStream = Box::new(Stream::no_wait(raw, &target, 1).unwrap());
                 echo(&mut first, &vec![1; 8192]).await;
@@ -1044,7 +1273,10 @@ mod tests {
                 )
                 .unwrap();
                 let context = EstablishContext::with_timeout(Duration::from_secs(5));
-                let raw = client.open(session(), &context).await.unwrap();
+                let raw = client
+                    .open(session(), Business::TcpConnect, &context)
+                    .await
+                    .unwrap();
                 let carrier = client
                     .registry
                     .lock()
@@ -1100,6 +1332,7 @@ mod tests {
             volume: 512 * 1024 * 1024,
             created: Instant::now(),
             udp: true,
+            business: None,
             maximum_write: AtomicUsize::new(32768),
         };
         // A lazy NO_WAIT connection may be dropped without ever submitting a write.
