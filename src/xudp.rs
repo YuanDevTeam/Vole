@@ -137,7 +137,7 @@ impl XudpTransport {
     }
 
     /// Incrementally fills the persistent receive buffer using only
-    /// cancellation-safe `read` calls. Every successful partial read is
+    /// cancellation-safe `read_buf` calls. Every successful partial read is
     /// committed before the next await, so dropping `receive()` from a
     /// `tokio::select!` cannot lose bytes or parser progress.
     async fn fill_receive_buffer(&mut self, required: usize) -> io::Result<()> {
@@ -148,18 +148,17 @@ impl XudpTransport {
             ));
         }
 
-        let mut scratch = [0_u8; 1024];
         while self.receive_buffer.len() < required {
             // Consume available stream bytes within the existing one-frame
             // byte budget. Reading exactly each small header field repeatedly
             // enters TLS/H2 even when several complete packets are ready.
             let remaining = self.max_receive_buffer_size - self.receive_buffer.len();
-            let chunk = remaining.min(scratch.len());
+            let mut destination = (&mut self.receive_buffer).limit(remaining);
             let read = self
                 .stream
                 .as_mut()
                 .expect("open XUDP stream")
-                .read(&mut scratch[..chunk])
+                .read_buf(&mut destination)
                 .await?;
             if read == 0 {
                 return Err(io::Error::new(
@@ -167,7 +166,6 @@ impl XudpTransport {
                     "XUDP stream ended in the middle of a frame",
                 ));
             }
-            self.receive_buffer.extend_from_slice(&scratch[..read]);
         }
         Ok(())
     }
@@ -440,6 +438,7 @@ mod tests {
     struct FlushGate {
         inner: tokio::io::DuplexStream,
         blocked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
     impl tokio::io::AsyncRead for FlushGate {
         fn poll_read(
@@ -447,6 +446,8 @@ mod tests {
             cx: &mut std::task::Context<'_>,
             buffer: &mut tokio::io::ReadBuf<'_>,
         ) -> std::task::Poll<io::Result<()>> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             std::pin::Pin::new(&mut self.inner).poll_read(cx, buffer)
         }
     }
@@ -489,6 +490,7 @@ mod tests {
                 Box::new(FlushGate {
                     inner: client,
                     blocked: blocked.clone(),
+                    reads: std::sync::Arc::default(),
                 }),
                 [0; 8],
                 1452,
@@ -522,6 +524,35 @@ mod tests {
             server.read_exact(&mut actual).await.unwrap();
             assert_eq!(actual, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn mtu_sized_response_and_coalesced_tail_use_one_bounded_read() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let payload = vec![b'x'; 1452];
+        let mut wire = response_data_prefix(payload.len() as u16);
+        wire.extend_from_slice(&payload);
+        wire.extend_from_slice(&response_data_prefix(4));
+        wire.extend_from_slice(b"tail");
+        let (client, mut server) = tokio::io::duplex(4096);
+        server.write_all(&wire).await.unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut transport = XudpTransport::new(
+            Box::new(FlushGate {
+                inner: client,
+                blocked: Arc::new(AtomicBool::new(false)),
+                reads: reads.clone(),
+            }),
+            [0; 8],
+            1452,
+        );
+        assert_eq!(transport.receive().await.unwrap().payload.as_ref(), payload);
+        assert_eq!(transport.receive().await.unwrap().payload.as_ref(), b"tail");
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert!(transport.receive_buffer.capacity() <= transport.max_receive_buffer_size);
     }
 
     #[tokio::test]
