@@ -33,7 +33,7 @@ fn nonce_size(config: &ServerConfig) -> usize {
     }
 }
 const SESSION_RETENTION: Duration = Duration::from_secs(60);
-const SEND_BURST: usize = 8;
+const SEND_BURST: usize = 1;
 
 struct ServerSession {
     id: u64,
