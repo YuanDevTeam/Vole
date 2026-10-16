@@ -290,7 +290,8 @@ UDP body 最多 15,000 字节；packetaddr 另扣 IPv4 7 / IPv6 19 字节，未�
 仅 2048 字节，不能当作 Vole 上限。body wire 解析最多 16 KiB，响应头/XUDP 元数据有界。
 三种 UDP 编码均不接受零长度业务包；HTTPUpgrade 不改变这个边界。
 TCP 写块最多 4 KiB 以适配 Mihomo 拷贝边界；UDP 不按此切块。16 位帧计数耗尽前关闭，
-不重复 nonce。半帧发送取消关闭，接收取消保留进度；认证/地址/标签错误使关联失效。
+不重复 nonce。raw/packetaddr 半帧发送取消关闭；XUDP 保留一个待写帧并在下次收发时完成，
+遵循[VLESS 的 XUDP 取消边界](vless.md#udp)。接收取消保留进度；认证/地址/标签错误使关联失效。
 gRPC 池与 legacy H2 driver 由节点拥有并同步退出，无全局会话额度或历史表。
 
 ## Hysteria2

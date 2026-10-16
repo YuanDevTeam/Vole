@@ -29,9 +29,16 @@ pub struct XudpTransport {
     max_request_payload_size: u16,
     first_write: bool,
     last_remote: Option<Destination>,
+    pending_write: Option<PendingWrite>,
     receive_buffer: BytesMut,
     max_receive_buffer_size: usize,
     closed: bool,
+}
+
+struct PendingWrite {
+    frame: Bytes,
+    offset: usize,
+    remote: Destination,
 }
 
 impl std::fmt::Debug for XudpTransport {
@@ -78,10 +85,37 @@ impl XudpTransport {
             max_request_payload_size: budget.transmit(),
             first_write: true,
             last_remote: None,
+            pending_write: None,
             receive_buffer: BytesMut::with_capacity(max_receive_buffer_size),
             max_receive_buffer_size,
             closed: false,
         }
+    }
+
+    // A cancelled logical target may have submitted a frame prefix. Retain
+    // exactly that frame and finish it before another send or receive, rather
+    // than corrupting a shared wire or retaining a per-target payload queue.
+    async fn flush_pending(&mut self) -> io::Result<()> {
+        if let Some(pending) = &mut self.pending_write {
+            let stream = self.stream.as_mut().expect("open XUDP stream");
+            while pending.offset < pending.frame.len() {
+                let written = stream.write(&pending.frame[pending.offset..]).await?;
+                if written == 0 {
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
+                pending.offset += written;
+            }
+            stream.flush().await?;
+            self.first_write = false;
+            self.last_remote = Some(self.pending_write.take().expect("pending frame").remote);
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self) {
+        self.closed = true;
+        self.pending_write = None;
+        self.stream.take();
     }
 
     /// Incrementally fills the persistent receive buffer using only
@@ -267,31 +301,29 @@ impl DatagramTransport for XudpTransport {
         if datagram.payload.len() > usize::from(self.max_request_payload_size) {
             return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
         }
-        let frame = encode_data_frame(
-            &datagram,
-            self.first_write,
-            if self.first_write && self.global_id != [0; 8] {
-                Some(self.global_id)
-            } else {
-                None
-            },
-        )
-        .map_err(DispatchError::from)?;
-        // Own the stream across the non-cancellation-safe write. Dropping this
-        // future after a partial frame closes the wire rather than resuming at
-        // a new frame boundary on the next send.
-        self.closed = true;
-        let mut stream = self.stream.take().expect("open XUDP stream");
-        stream
-            .write_all(&frame)
-            .await
-            .map_err(DispatchError::from)?;
-        stream.flush().await.map_err(DispatchError::from)?;
-        self.stream = Some(stream);
-        self.closed = false;
-        self.first_write = false;
-        self.last_remote = Some(datagram.remote);
-        Ok(())
+        let result = async {
+            self.flush_pending().await?;
+            let frame = encode_data_frame(
+                &datagram,
+                self.first_write,
+                if self.first_write && self.global_id != [0; 8] {
+                    Some(self.global_id)
+                } else {
+                    None
+                },
+            )?;
+            self.pending_write = Some(PendingWrite {
+                frame,
+                offset: 0,
+                remote: datagram.remote,
+            });
+            self.flush_pending().await
+        }
+        .await;
+        if result.is_err() {
+            self.fail();
+        }
+        result.map_err(DispatchError::from)
     }
 
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
@@ -300,10 +332,13 @@ impl DatagramTransport for XudpTransport {
                 "XUDP association is closed".to_owned(),
             ));
         }
-        let result = self.read_frame().await;
+        let result = async {
+            self.flush_pending().await?;
+            self.read_frame().await
+        }
+        .await;
         if result.is_err() {
-            self.closed = true;
-            self.stream.take();
+            self.fail();
         }
         result.map_err(DispatchError::from)
     }
@@ -314,10 +349,14 @@ impl DatagramTransport for XudpTransport {
         }
         self.closed = true;
         let mut stream = self.stream.take().expect("open XUDP stream");
-        stream
-            .write_all(&[0, 4, 0, 0, STATUS_END, 0])
-            .await
-            .map_err(DispatchError::from)?;
+        // A partial data frame cannot be followed by a mux END frame. Closing
+        // the last owner may discard it and terminate the underlying stream.
+        if self.pending_write.take().is_none() {
+            stream
+                .write_all(&[0, 4, 0, 0, STATUS_END, 0])
+                .await
+                .map_err(DispatchError::from)?;
+        }
         stream.shutdown().await.map_err(DispatchError::from)?;
         Ok(())
     }
@@ -551,6 +590,62 @@ mod tests {
         assert_eq!(&datagram.payload[..], b"abc");
         assert!(transport.receive_buffer.is_empty());
         assert!(transport.receive_buffer.capacity() <= transport.max_receive_buffer_size);
+    }
+
+    #[tokio::test]
+    async fn cancelled_partial_send_preserves_the_shared_frame_boundary() {
+        let (client, mut server) = tokio::io::duplex(1);
+        let first = Datagram {
+            remote: "192.0.2.1:53"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+            payload: Bytes::from_static(b"first"),
+            sniffed_domain: None,
+        };
+        let second = Datagram {
+            remote: "192.0.2.2:53"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+            payload: Bytes::from_static(b"second"),
+            sniffed_domain: None,
+        };
+        let mut expected = encode_data_frame(&first, true, None).unwrap().to_vec();
+        expected.extend_from_slice(&encode_data_frame(&second, false, None).unwrap());
+        let mut transport = XudpTransport::new(Box::new(client), [0; 8], 1452);
+        assert!(futures_util::poll!(transport.send(first)).is_pending());
+        let length = expected.len();
+        let reader = tokio::spawn(async move {
+            let mut received = vec![0; length];
+            server.read_exact(&mut received).await.unwrap();
+            received
+        });
+        transport.send(second).await.unwrap();
+        assert_eq!(reader.await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn receive_finishes_a_cancelled_partial_send_without_another_packet() {
+        let (client, mut server) = tokio::io::duplex(1);
+        let request = Datagram {
+            remote: "1.2.3.4:53".parse::<std::net::SocketAddr>().unwrap().into(),
+            payload: Bytes::from_static(b"abc"),
+            sniffed_domain: None,
+        };
+        let expected = encode_data_frame(&request, true, None).unwrap();
+        let mut transport = XudpTransport::new(Box::new(client), [0; 8], 1452);
+        assert!(futures_util::poll!(transport.send(request)).is_pending());
+        let peer = tokio::spawn(async move {
+            let mut wire = vec![0; expected.len()];
+            server.read_exact(&mut wire).await.unwrap();
+            assert_eq!(wire, expected);
+            let mut response = response_data_prefix(3);
+            response.extend_from_slice(b"abc");
+            server.write_all(&response).await.unwrap();
+        });
+        assert_eq!(transport.receive().await.unwrap().payload.as_ref(), b"abc");
+        peer.await.unwrap();
     }
 
     #[tokio::test]
