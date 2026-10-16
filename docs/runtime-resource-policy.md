@@ -158,6 +158,9 @@ XHTTP 和 DoH/H3 通过 `quinn-h3-transport` 使用官方 h3/h3-quinn，共享�
 成功提交 FIN 后不因丢弃发送半而 reset，也不等待逐请求 QUIC ACK。各协议窗口和并发边界见
 [XHTTP](xhttp.md) 与 [DNS](tun-icmp-dns.md)。
 
+未显式配置 reuse-settings 的 XHTTP H3 复用既有活动连接，每条最多 4 个逻辑租约；
+最后一个租约释放即移出候选池并按既有预算收尾，不缓存空闲连接。显式复用参数及 H1/H2 默认保持各自契约。
+
 `quiche-h3-transport` 为 TrustTunnel/MASQUE 使用官方 quiche 的低层驱动，共享上述数据报适配器，不创建新的 socket。
 接收时移动既有队列中的数据报，独占存储直接交给 quiche 原地解密；共享或不可变存储
 使用按接收预算延迟分配的复用暂存缓冲。Quinn 的借用接收接口和两端队列上限保持不变。

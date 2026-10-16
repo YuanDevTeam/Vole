@@ -144,7 +144,7 @@ impl XHttpClient {
             upload_chunk_size: DEFAULT_UPLOAD_CHUNK_SIZE,
             http_version,
             owner: Arc::default(),
-            pool: Arc::new(pool::Pool::new(reuse.clone())),
+            pool: Arc::new(pool::Pool::new(reuse.clone(), http_version)),
             reuse,
         }
     }

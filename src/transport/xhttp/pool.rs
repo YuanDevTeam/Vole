@@ -1,7 +1,7 @@
 //! Node-owned transport leases. Thresholds choose candidates, not admission.
 use super::{ConnectionGuard, ConnectionLease, SendRequest, connection_closed};
 use crate::{
-    config::XHttpReuseConfig,
+    config::{XHttpReuseConfig, XHttpVersion},
     resources::observation::{Guard, ResourceKind, track},
 };
 use std::{
@@ -25,6 +25,7 @@ pub(super) enum Policy {
 #[derive(Debug)]
 pub(super) struct Pool {
     options: Option<Arc<XHttpReuseConfig>>,
+    share_active: bool,
     concurrency: usize,
     connections: usize,
     state: Arc<Mutex<State>>,
@@ -35,6 +36,7 @@ struct State {
     entries: Vec<Entry>,
     next_id: u64,
     closed: bool,
+    idle_limit: usize,
 }
 #[derive(Clone, Debug)]
 struct Physical {
@@ -109,21 +111,31 @@ impl State {
                 return true;
             }
             idle += 1;
-            idle <= MAX_IDLE_ENTRIES
+            idle <= self.idle_limit
         });
     }
 }
 impl Pool {
-    pub(super) fn new(options: Option<Arc<XHttpReuseConfig>>) -> Self {
+    pub(super) fn new(options: Option<Arc<XHttpReuseConfig>>, version: XHttpVersion) -> Self {
+        let share_active = options.is_none() && version == XHttpVersion::Http3;
         Self {
-            concurrency: options
-                .as_ref()
-                .map_or(0, |options| options.concurrency.sample()),
+            concurrency: options.as_ref().map_or(
+                if share_active {
+                    crate::limits::XHTTP_ACTIVE_H3_LEASES
+                } else {
+                    0
+                },
+                |options| options.concurrency.sample(),
+            ),
             connections: options
                 .as_ref()
                 .map_or(0, |options| options.connections.sample()),
             options,
-            state: Arc::default(),
+            share_active,
+            state: Arc::new(Mutex::new(State {
+                idle_limit: if share_active { 0 } else { MAX_IDLE_ENTRIES },
+                ..State::default()
+            })),
             opening: tokio::sync::Mutex::default(),
         }
     }
@@ -136,10 +148,11 @@ impl Pool {
         F: FnOnce() -> Fut,
         Fut: Future<Output = io::Result<(SendRequest, Arc<ConnectionGuard>)>>,
     {
-        let Some(options) = &self.options else {
+        if self.options.is_none() && !self.share_active {
             let (sender, driver) = make().await?;
             return Ok((sender, driver.into()));
-        };
+        }
+        let options = self.options.as_deref();
         let _opening = self.opening.lock().await;
         let existing = {
             let mut state = self.state.lock().unwrap();
@@ -187,11 +200,15 @@ impl Pool {
                 },
                 active: 0,
                 reuses: 0,
-                max_reuses: options.reuse_times.sample(),
-                remaining: (options.requests.max > 0).then(|| options.requests.sample()),
-                expires: (options.age_seconds.max > 0).then(|| {
-                    Instant::now() + Duration::from_secs(options.age_seconds.sample() as u64)
-                }),
+                max_reuses: options.map_or(0, |options| options.reuse_times.sample()),
+                remaining: options
+                    .filter(|options| options.requests.max > 0)
+                    .map(|options| options.requests.sample()),
+                expires: options
+                    .filter(|options| options.age_seconds.max > 0)
+                    .map(|options| {
+                        Instant::now() + Duration::from_secs(options.age_seconds.sample() as u64)
+                    }),
                 _observation: track(ResourceKind::Pool),
             };
             let usage = entry.reserve(&self.state, false)?;
@@ -265,5 +282,78 @@ impl Drop for Usage {
             }
             state.cleanup();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::XHttpVersion,
+        transport::xhttp::{XHttpClient, XHttpConfig, XHttpMode},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_util::task::TaskTracker;
+
+    #[tokio::test]
+    async fn implicit_h3_shares_four_active_leases_and_reconnects_after_idle() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut config = XHttpConfig::new("example.com", "/x", XHttpMode::StreamOne).unwrap();
+            config.http_version = XHttpVersion::Http3;
+            let client = XHttpClient::new(config);
+            let transport = XHttpClient::new(
+                XHttpConfig::new("example.com", "/x", XHttpMode::StreamOne).unwrap(),
+            );
+            let calls = AtomicUsize::new(0);
+            let peers = TaskTracker::new();
+            // Admission and leases are transport-independent. Real memory H2
+            // drivers expose factory calls and cleanup without QUIC scheduling.
+            let make = || async {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let (io, remote) = tokio::io::duplex(8192);
+                peers.spawn(async move {
+                    let mut connection = h2::server::handshake(remote).await.unwrap();
+                    while let Some(request) = connection.accept().await {
+                        request.unwrap();
+                    }
+                });
+                transport.handshake(Box::new(io)).await
+            };
+            let mut leases = Vec::new();
+            for _ in 0..4 {
+                let (_, lease) = client
+                    .pool
+                    .acquire(Policy::Multiplexed, &make)
+                    .await
+                    .unwrap();
+                leases.push(lease);
+            }
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            let (_, fifth) = client
+                .pool
+                .acquire(Policy::Multiplexed, &make)
+                .await
+                .unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+            drop(fifth);
+            drop(leases);
+            let (_, fresh) = client
+                .pool
+                .acquire(Policy::Multiplexed, &make)
+                .await
+                .unwrap();
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                3,
+                "idle physical transport was retained"
+            );
+            drop(fresh);
+            client.stop().await;
+            transport.stop().await;
+            peers.close();
+            peers.wait().await;
+        })
+        .await
+        .expect("active transport leases did not stop");
     }
 }

@@ -486,7 +486,7 @@ proxies:
       x-padding-bytes: "100-1000"
       sc-max-each-post-bytes: "1000000" # packet-up，最多16MiB，非预分配大小
       sc-min-posts-interval-ms: "10"    # packet-up，0–60000且最大值为正
-      reuse-settings: # 省略无额外池；{} 启用默认池，阈值不是全节点数量上限
+      reuse-settings: # 省略时仅 H3 共享活动连接（每条 4 个租约、无空闲缓存）；{} 启用显式池
         max-concurrency: "0"
         max-connections: "0"
         c-max-reuse-times: "0"

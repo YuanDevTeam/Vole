@@ -24,6 +24,7 @@ pub const XHTTP_REQUEST_BYTES: usize = 16 * 1024;
 pub const XHTTP_REQUEST_HEADERS: usize = 128;
 pub const XHTTP_IDLE_ENTRIES: usize = 64;
 pub const XHTTP_IDLE_H1_CONNECTIONS: usize = 4;
+pub const XHTTP_ACTIVE_H3_LEASES: usize = 4;
 pub const XHTTP_BODY_QUEUE: usize = 2;
 pub const XHTTP_BODY_CHUNK: usize = 16 * 1024;
 pub const XHTTP_H3_UNI_STREAMS: usize = 8;
