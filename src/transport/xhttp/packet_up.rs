@@ -21,6 +21,7 @@ struct State {
     committed: u64,
     error: Option<Arc<io::Error>>,
     closed: bool,
+    in_flight: bool,
 }
 struct Shared {
     state: Mutex<State>,
@@ -85,6 +86,7 @@ impl Writer {
                 committed: 0,
                 error: None,
                 closed: false,
+                in_flight: false,
             }),
             changed: Notify::new(),
             finishing: AtomicBool::new(false),
@@ -127,6 +129,9 @@ impl AsyncWrite for Writer {
         state.check()?;
         if input.is_empty() {
             return Poll::Ready(Ok(0));
+        }
+        if state.in_flight {
+            return Poll::Pending;
         }
         let count = input
             .len()
@@ -189,13 +194,13 @@ async fn transmit(
         }
         let delay = || Duration::from_millis(request.options.post_interval_ms.sample() as u64);
         wait_interval(shared, last_post_started, delay()).await;
-        // One bounded batch in flight and one filling batch. Only this driver
-        // owns POST completion; read cannot acknowledge a pending caller write.
+        // Only one bounded batch, including while HTTP owns its immutable body.
+        // Keep writes backpressured until the POSTs have acknowledged this batch.
         let mut batch = {
             let mut state = shared.state.lock().unwrap();
+            state.in_flight = true;
             Bytes::from(std::mem::take(&mut state.buffer))
         };
-        shared.writer.wake();
         while !batch.is_empty() {
             let headers =
                 request.build(http::Method::POST, Some(&session), Some(sequence), false)?;
@@ -211,6 +216,15 @@ async fn transmit(
                 wait_interval(shared, last_post_started, delay()).await;
             }
         }
+        // The consumed Bytes retains its backing. Recover it only if HTTP has
+        // released every reference; never copy a still-shared body to recycle it.
+        let recycled = batch.try_into_mut().map(Vec::from).unwrap_or_default();
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.buffer = recycled;
+            state.in_flight = false;
+        }
+        shared.writer.wake();
     }
 }
 

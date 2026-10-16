@@ -223,17 +223,16 @@ async fn post_start_interval_credits_request_time_and_idle_time() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn pending_post_keeps_one_filling_batch_and_failure_does_not_acknowledge() {
+async fn pending_post_backpressures_writes_and_failure_does_not_acknowledge() {
     let mut fixture = Fixture::new(100).await;
     fixture.writer.write_all(b"one1").await.unwrap();
     let mut first = fixture.next().await;
     assert_eq!(first.path, "/x/session/0");
     assert_eq!(first.body, b"one1");
-    fixture.writer.write_all(b"two2").await.unwrap();
     assert!(
         std::future::poll_fn(|cx| Poll::Ready(
             Pin::new(&mut fixture.writer)
-                .poll_write(cx, b"last")
+                .poll_write(cx, b"two2")
                 .is_pending()
         ))
         .await
@@ -262,6 +261,35 @@ async fn pending_post_keeps_one_filling_batch_and_failure_does_not_acknowledge()
         fixture.packets.try_recv(),
         Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
     ));
+    fixture.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn acknowledged_post_reuses_its_batch_and_wakes_the_waiting_writer() {
+    let mut fixture = Fixture::with_limit(100, crate::limits::XHTTP_PACKET_BATCH_BYTES).await;
+    let body = vec![0xa5; crate::limits::XHTTP_PACKET_BATCH_BYTES];
+    fixture.writer.write_all(&body).await.unwrap();
+    let shared = fixture.writer.shared.clone();
+    let original = shared.state.lock().unwrap().buffer.as_ptr() as usize;
+    let mut first = fixture.next().await;
+    assert_eq!(first.body, body);
+
+    let mut waiting = Box::pin(fixture.writer.write_all(b"next"));
+    assert!(std::future::poll_fn(|cx| Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await);
+    acknowledge(&mut first, StatusCode::OK);
+    timeout(Duration::from_secs(2), &mut waiting)
+        .await
+        .expect("POST completion did not wake the pending writer")
+        .unwrap();
+    drop(waiting);
+    let recycled = shared.state.lock().unwrap().buffer.as_ptr() as usize;
+    assert_eq!(recycled, original, "POST body storage was not reused");
+
+    let mut second = fixture.next().await;
+    assert_eq!(second.path, "/x/session/1");
+    assert_eq!(second.body, b"next");
+    acknowledge(&mut second, StatusCode::OK);
+    fixture.writer.flush().await.unwrap();
     fixture.close().await;
 }
 
