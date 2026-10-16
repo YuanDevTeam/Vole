@@ -1229,15 +1229,12 @@ impl RoutedDatagramTransport {
         let keys = self
             .managed_flows
             .iter()
-            .filter_map(|(key, flow)| {
-                matches!(flow.transport, ManagedTransport::Shared(owner) if owner == id).then(
-                    || {
-                        if !flow.connection.cancelled() {
-                            flow.connection.failed(error);
-                        }
-                        key.clone()
-                    },
-                )
+            .filter(|(_, flow)| matches!(flow.transport, ManagedTransport::Shared(owner) if owner == id))
+            .map(|(key, flow)| {
+                if !flow.connection.cancelled() {
+                    flow.connection.failed(error);
+                }
+                key.clone()
             })
             .collect::<Vec<_>>();
         for key in keys {

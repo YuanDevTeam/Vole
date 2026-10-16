@@ -29,6 +29,7 @@ pub struct XudpTransport {
     max_request_payload_size: u16,
     first_write: bool,
     last_remote: Option<Destination>,
+    multiple_remotes: bool,
     pending_write: Option<PendingWrite>,
     receive_buffer: BytesMut,
     max_receive_buffer_size: usize,
@@ -85,6 +86,7 @@ impl XudpTransport {
             max_request_payload_size: budget.transmit(),
             first_write: true,
             last_remote: None,
+            multiple_remotes: false,
             pending_write: None,
             receive_buffer: BytesMut::with_capacity(max_receive_buffer_size),
             max_receive_buffer_size,
@@ -107,7 +109,12 @@ impl XudpTransport {
             }
             stream.flush().await?;
             self.first_write = false;
-            self.last_remote = Some(self.pending_write.take().expect("pending frame").remote);
+            let remote = self.pending_write.take().expect("pending frame").remote;
+            self.multiple_remotes |= self
+                .last_remote
+                .as_ref()
+                .is_some_and(|last| last != &remote);
+            self.last_remote = Some(remote);
         }
         Ok(())
     }
@@ -237,6 +244,12 @@ impl XudpTransport {
                         }
                         Ok(destination)
                     } else {
+                        if self.multiple_remotes {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "XUDP response omitted an ambiguous destination",
+                            ));
+                        }
                         self.last_remote.clone().ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -451,6 +464,41 @@ mod tests {
             assert!(transport.receive_buffer.len() <= transport.max_receive_buffer_size);
         }
         assert!(transport.receive().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn omitted_response_destination_is_accepted_only_for_an_unambiguous_association() {
+        for destinations in [1, 2] {
+            let (client, mut server) = tokio::io::duplex(256);
+            let mut transport = XudpTransport::new(Box::new(client), [0; 8], 1452);
+            for last in 1..=destinations {
+                transport
+                    .send(Datagram {
+                        remote: format!("192.0.2.{last}:53")
+                            .parse::<std::net::SocketAddr>()
+                            .unwrap()
+                            .into(),
+                        payload: Bytes::from_static(b"q"),
+                        sniffed_domain: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            server
+                .write_all(&[0, 4, 0, 0, STATUS_KEEP, OPTION_DATA, 0, 1, b'a'])
+                .await
+                .unwrap();
+            let reply = transport.receive().await;
+            if destinations == 1 {
+                assert_eq!(reply.unwrap().remote.to_string(), "192.0.2.1:53");
+            } else {
+                assert!(
+                    reply.is_err(),
+                    "an omitted address must not select the last sender"
+                );
+                assert!(transport.closed);
+            }
+        }
     }
 
     #[test]
