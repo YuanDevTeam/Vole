@@ -10,6 +10,7 @@ struct BodyIo {
     inner: tokio::io::DuplexStream,
     body: Bytes,
     original_bytes_written: Arc<AtomicUsize>,
+    largest_body_write: Arc<AtomicUsize>,
 }
 
 impl AsyncRead for BodyIo {
@@ -34,6 +35,8 @@ impl AsyncWrite for BodyIo {
         if start >= original && start + written <= original + self.body.len() {
             self.original_bytes_written
                 .fetch_add(written, Ordering::Relaxed);
+            self.largest_body_write
+                .fetch_max(input.len(), Ordering::Relaxed);
         }
         Poll::Ready(Ok(written))
     }
@@ -48,14 +51,16 @@ impl AsyncWrite for BodyIo {
 }
 
 #[tokio::test]
-async fn http1_body_reaches_scalar_io_without_a_second_payload_copy() {
+async fn http1_body_reaches_scalar_io_in_bounded_slices_without_copying() {
     let body = Bytes::from(vec![0xa5; crate::limits::XHTTP_PACKET_BATCH_BYTES]);
     let (client, server) = tokio::io::duplex(1024);
     let original_bytes_written = Arc::<AtomicUsize>::default();
+    let largest_body_write = Arc::<AtomicUsize>::default();
     let io = BodyIo {
         inner: client,
         body: body.clone(),
         original_bytes_written: original_bytes_written.clone(),
+        largest_body_write: largest_body_write.clone(),
     };
     // Leave vectored IO at its scalar default, as required by TLS wrappers.
     assert!(!io.is_write_vectored());
@@ -116,5 +121,10 @@ async fn http1_body_reaches_scalar_io_without_a_second_payload_copy() {
         original_bytes_written.load(Ordering::Relaxed),
         body.len(),
         "HTTP/1 copied the payload before reaching the supplied scalar IO"
+    );
+    assert!(
+        largest_body_write.load(Ordering::Relaxed) <= crate::limits::XHTTP_BODY_CHUNK,
+        "HTTP/1 presented {} plaintext bytes to one scalar write",
+        largest_body_write.load(Ordering::Relaxed),
     );
 }

@@ -87,7 +87,10 @@ impl Buf for Payload {
         self.bytes.remaining()
     }
     fn chunk(&self) -> &[u8] {
-        self.bytes.chunk()
+        let bytes = self.bytes.chunk();
+        // Keep a whole packet-up POST in one backing, but feed HTTP's supplied
+        // IO in streaming-sized pieces instead of buffering 64 KiB in TLS.
+        &bytes[..bytes.len().min(crate::limits::XHTTP_BODY_CHUNK)]
     }
     fn advance(&mut self, count: usize) {
         self.bytes.advance(count);
