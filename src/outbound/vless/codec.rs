@@ -144,7 +144,7 @@ impl VlessStream {
         if self.inner.is_none() {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
-        if !self.response_header_done
+        if !self.request_header_flushed
             && self
                 .deadline
                 .as_mut()
@@ -185,6 +185,10 @@ impl VlessStream {
         if !self.request_header_flushed {
             std::task::ready!(Pin::new(self.inner.as_mut().expect("checked open")).poll_flush(cx))?;
             self.request_header_flushed = true;
+            // The authenticated transport and VLESS request are established.
+            // A valid upload-only target may send its response header much
+            // later; its silence must not expire ongoing payload writes.
+            self.deadline = None;
         }
         Poll::Ready(Ok(()))
     }
@@ -384,5 +388,48 @@ mod tests {
         })
         .await
         .expect("lazy VLESS exchange timed out");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_survives_setup_deadline_when_response_is_delayed() {
+        let header = encode_request_header(
+            uuid(),
+            VlessCommand::Tcp,
+            Some(&Destination::domain("example.com", 80).unwrap()),
+        )
+        .unwrap();
+        let (client, mut server) = tokio::io::duplex(256);
+        let mut stream = VlessStream::with_deadline(
+            Box::new(client),
+            header.clone(),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        );
+        stream.write_all(b"before").await.unwrap();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        stream
+            .write_all(b"after")
+            .await
+            .expect("active upload must outlive setup");
+        let mut request = vec![0; header.len() + 11];
+        server.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request[..header.len()], header.as_ref());
+        assert_eq!(&request[header.len()..], b"beforeafter");
+        server.write_all(&[0, 0, 42]).await.unwrap();
+        let mut response = [0];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [42]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_request_header_still_obeys_setup_deadline() {
+        let header = encode_request_header(uuid(), VlessCommand::Mux, None).unwrap();
+        let (client, _server) = tokio::io::duplex(1);
+        let mut stream = VlessStream::with_deadline(
+            Box::new(client),
+            header,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        );
+        let error = stream.write_all(b"payload").await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }
