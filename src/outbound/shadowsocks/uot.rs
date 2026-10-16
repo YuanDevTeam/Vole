@@ -117,6 +117,10 @@ struct DatagramAdapter {
 
 #[async_trait]
 impl DatagramTransport for DatagramAdapter {
+    fn supports_shared_destinations(&self) -> bool {
+        self.inner.supports_shared_destinations()
+    }
+
     async fn send(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
         let deadline = self
             .first_deadline

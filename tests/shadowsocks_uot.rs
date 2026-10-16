@@ -173,36 +173,67 @@ async fn late_first_packet_uses_original_deadline_but_established_io_does_not() 
 }
 
 #[tokio::test]
-async fn cancelled_partial_send_poisoning_and_stop_release_a_blocked_writer() {
+async fn cancelled_partial_send_resumes_and_stop_releases_a_blocked_writer() {
     #[cfg(feature = "interop-test")]
     let _case = vole::resources::case_events::Case::new("UOT-SS", "cancel_write");
     for stop in [false, true] {
-        let (outbound, mut peer) = fixture(CIPHERS[0], 64);
+        let (outbound, peer) = fixture(CIPHERS[0], 64);
         let mut association = outbound
             .open_datagram(request(), &EstablishContext::default())
             .await
             .unwrap();
+        assert!(association.supports_shared_destinations());
         if stop {
             let (sent, ()) = tokio::join!(association.send(packet(65_535)), async {
                 tokio::task::yield_now().await;
                 outbound.shutdown().await;
             });
             assert!(sent.is_err());
+            let mut peer = peer;
+            let mut bytes = Vec::new();
+            tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(bytes.len() <= 64);
         } else {
             assert!(
                 tokio::time::timeout(Duration::from_millis(10), association.send(packet(65_535)))
                     .await
                     .is_err()
             );
-            assert!(association.send(packet(0)).await.is_err());
+            let decoding = tokio::spawn(async move {
+                let mut decoded = decoder(peer, CIPHERS[0]);
+                assert_eq!(
+                    decoded.handshake().await.unwrap(),
+                    ("sp.v2.udp-over-tcp.arpa".to_owned(), 0).into()
+                );
+                let mut header = [0; 17];
+                decoded.read_exact(&mut header).await.unwrap();
+                assert_eq!(
+                    header,
+                    [0, 1, 127, 0, 0, 1, 0, 53, 0, 127, 0, 0, 1, 0, 53, 255, 255]
+                );
+                let mut payload = vec![0; 65_535];
+                decoded.read_exact(&mut payload).await.unwrap();
+                assert!(payload.iter().all(|byte| *byte == 7));
+                let mut next = [0; 9];
+                decoded.read_exact(&mut next).await.unwrap();
+                assert_eq!(next, [0, 127, 0, 0, 2, 0, 54, 0, 0]);
+                assert_eq!(decoded.read(&mut [0]).await.unwrap(), 0);
+            });
+            let mut next = packet(0);
+            next.remote = Destination::Ip("127.0.0.2:54".parse().unwrap());
+            tokio::time::timeout(Duration::from_secs(2), association.send(next))
+                .await
+                .unwrap()
+                .unwrap();
             outbound.shutdown().await;
+            tokio::time::timeout(Duration::from_secs(1), decoding)
+                .await
+                .unwrap()
+                .unwrap();
         }
-        let mut bytes = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut bytes))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(bytes.len() <= 64);
     }
 }
 
@@ -219,6 +250,7 @@ async fn all_ciphers_preserve_budget_edges_and_fragmented_receive_cancellation()
             )
             .await
             .unwrap();
+        assert!(association.supports_shared_destinations());
         assert!(association.send(packet(65_536)).await.is_err());
         let (ready, arrived) = tokio::sync::oneshot::channel();
         let (resume, proceed) = tokio::sync::oneshot::channel();

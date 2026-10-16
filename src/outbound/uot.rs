@@ -191,6 +191,11 @@ impl UotTransport {
 
 #[async_trait]
 impl DatagramTransport for UotTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        // Both versions use fully addressed datagrams, never connected mode.
+        true
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         self.check_open()?;
         self.flush_pending().await?;
