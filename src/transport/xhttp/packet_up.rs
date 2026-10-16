@@ -1,7 +1,7 @@
 //! Timer-driven bounded aggregation. Writes acknowledge admitted bytes; flush
 //! waits for their POST responses. The node owns and joins the timer/IO driver.
 use super::{ConnectionGuard, DriverOwner, RequestTemplate, SendRequest, connection_closed};
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes};
 use futures_util::task::AtomicWaker;
 use std::{
     io,
@@ -16,7 +16,7 @@ use std::{
 use tokio::{io::AsyncWrite, sync::Notify, time::Instant};
 
 struct State {
-    buffer: BytesMut,
+    buffer: Vec<u8>,
     accepted: u64,
     committed: u64,
     error: Option<Arc<io::Error>>,
@@ -80,7 +80,7 @@ impl Writer {
             .min(crate::limits::XHTTP_PACKET_BATCH_BYTES);
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                buffer: BytesMut::new(),
+                buffer: Vec::new(),
                 accepted: 0,
                 committed: 0,
                 error: None,
@@ -139,6 +139,15 @@ impl AsyncWrite for Writer {
             .accepted
             .checked_add(count as u64)
             .ok_or_else(connection_closed)?;
+        let needed = state.buffer.len() + count;
+        if state.buffer.capacity() < needed {
+            // Irregular packet sizes must not double the allocation past the
+            // batch limit. Keep amortized growth without reserving an idle
+            // writer's entire configured POST maximum.
+            let capacity = needed.next_power_of_two().min(self.capacity);
+            let additional = capacity - state.buffer.len();
+            state.buffer.reserve_exact(additional);
+        }
         state.buffer.extend_from_slice(&input[..count]);
         state.accepted = accepted;
         drop(state);
@@ -184,7 +193,7 @@ async fn transmit(
         // owns POST completion; read cannot acknowledge a pending caller write.
         let mut batch = {
             let mut state = shared.state.lock().unwrap();
-            std::mem::take(&mut state.buffer).freeze()
+            Bytes::from(std::mem::take(&mut state.buffer))
         };
         shared.writer.wake();
         while !batch.is_empty() {

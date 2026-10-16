@@ -27,6 +27,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(interval_ms: usize) -> Self {
+        Self::with_limit(interval_ms, 4).await
+    }
+
+    async fn with_limit(interval_ms: usize, post_bytes: usize) -> Self {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (packets, receiver) = mpsc::channel(2);
         let server = tokio::spawn(async move {
@@ -76,7 +80,10 @@ impl Fixture {
             path: Arc::from("/x"),
             headers: Default::default(),
             options: Arc::new(XHttpRequestOptions {
-                post_bytes: IntegerRange { min: 4, max: 4 },
+                post_bytes: IntegerRange {
+                    min: post_bytes,
+                    max: post_bytes,
+                },
                 post_interval_ms: IntegerRange {
                     min: interval_ms,
                     max: interval_ms,
@@ -84,7 +91,14 @@ impl Fixture {
                 ..Default::default()
             }),
         };
-        let writer = Writer::new(sender, request, Arc::from("session"), 4, &owner).unwrap();
+        let writer = Writer::new(
+            sender,
+            request,
+            Arc::from("session"),
+            post_bytes.min(crate::limits::XHTTP_BODY_CHUNK),
+            &owner,
+        )
+        .unwrap();
         Self {
             writer,
             owner,
@@ -121,6 +135,56 @@ fn acknowledge(packet: &mut Packet, status: StatusCode) {
         .response
         .send_response(Response::builder().status(status).body(()).unwrap(), true)
         .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn irregular_writes_keep_allocation_within_the_batch_limit() {
+    for limit in [crate::limits::XHTTP_PACKET_BATCH_BYTES, 5000] {
+        let mut fixture = Fixture::with_limit(100, limit).await;
+        assert_eq!(
+            fixture
+                .writer
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .buffer
+                .capacity(),
+            0
+        );
+        let mut expected = Vec::new();
+        while expected.len() < limit {
+            let count = if expected.is_empty() { 17 } else { 1431 }.min(limit - expected.len());
+            let bytes = vec![(expected.len() % 251) as u8; count];
+            fixture.writer.write_all(&bytes).await.unwrap();
+            expected.extend_from_slice(&bytes);
+            let allocated = fixture
+                .writer
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .buffer
+                .capacity();
+            assert!(
+                allocated <= limit,
+                "allocated {allocated} bytes for a {limit}-byte batch",
+            );
+        }
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(
+                Pin::new(&mut fixture.writer)
+                    .poll_write(cx, b"full")
+                    .is_pending()
+            ))
+            .await
+        );
+        let mut packet = fixture.next().await;
+        assert_eq!(packet.body, expected);
+        acknowledge(&mut packet, StatusCode::OK);
+        fixture.writer.flush().await.unwrap();
+        fixture.close().await;
+    }
 }
 
 #[tokio::test(start_paused = true)]
