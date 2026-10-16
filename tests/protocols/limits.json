@@ -801,7 +801,7 @@
       "value": 64,
       "unit": "partial-packets-per-connection",
       "owner": "limits::HY2_PENDING_PACKETS",
-      "saturation": "drop excess partial packets; retain bounded completion tombstones",
+      "saturation": "evict oldest incomplete packet to admit new fragments; completed IDs are immediately released",
       "cancellation": "owned logical close or physical session Stop releases retained state and joins drivers",
       "boundary_cases": [
         "HYSTERIA2-UNIT",

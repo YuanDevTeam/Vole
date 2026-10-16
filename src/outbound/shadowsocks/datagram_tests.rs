@@ -136,6 +136,47 @@ fn request(payload: &'static [u8]) -> Datagram {
 }
 
 #[tokio::test]
+async fn udp_busy_sender_yields_before_accepting_another_wire_packet() {
+    for name in CIPHERS {
+        let mut f = Fixture::new(name, 1500);
+        f.permits.add_permits(2 * SEND_BURST + 1);
+        for _ in 0..SEND_BURST {
+            f.client.send(request(b"burst")).await.unwrap();
+        }
+        // With writable IO, a new send must give other ready tasks a turn
+        // before adding another packet to the physical peer's burst.
+        let mut sending = Box::pin(f.client.send(request(b"after-burst")));
+        assert!(futures_util::poll!(&mut sending).is_pending());
+        assert_eq!(f.sent.len(), SEND_BURST);
+        drop(sending);
+        // Cancellation at that scheduling boundary has not encoded or sent
+        // the new packet, and must not poison its nonce/control ownership.
+        f.client.send(request(b"resumed")).await.unwrap();
+        assert_eq!(f.sent.len(), SEND_BURST + 1);
+        assert_eq!(f.client.control.packet_id, SEND_BURST as u64 + 1);
+        let progressed = Arc::new(AtomicBool::new(false));
+        let sibling = {
+            let progressed = progressed.clone();
+            tokio::spawn(async move { progressed.store(true, Ordering::SeqCst) })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for _ in 0..SEND_BURST {
+                f.client.send(request(b"more")).await.unwrap();
+            }
+        })
+        .await
+        .expect("writable packets must continue after yielding");
+        assert!(
+            progressed.load(Ordering::SeqCst),
+            "busy sending starved a ready sibling"
+        );
+        sibling.await.unwrap();
+        assert_eq!(f.sent.len(), 2 * SEND_BURST + 1);
+        f.client.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn udp_one_session_preserves_multiple_ip_targets_across_receive_cancellation() {
     for name in CIPHERS {
         let mut f = Fixture::new(name, 1500);

@@ -33,6 +33,7 @@ fn nonce_size(config: &ServerConfig) -> usize {
     }
 }
 const SESSION_RETENTION: Duration = Duration::from_secs(60);
+const SEND_BURST: usize = 8;
 
 struct ServerSession {
     id: u64,
@@ -53,6 +54,7 @@ pub(super) struct SsDatagram {
     closed: bool,
     request_header: usize,
     response_header: usize,
+    sent_in_burst: usize,
 }
 
 impl SsDatagram {
@@ -80,6 +82,7 @@ impl SsDatagram {
             closed: false,
             request_header: request_header(config),
             response_header: nonce_size(config) + 51,
+            sent_in_burst: 0,
         }
     }
 
@@ -170,6 +173,12 @@ impl DatagramTransport for SsDatagram {
                 "Shadowsocks UDP payload exceeds wire limit".into(),
             ));
         }
+        if self.sent_in_burst == SEND_BURST {
+            self.sent_in_burst = 0;
+            // Give sibling IO a turn before encoding another packet. A
+            // cancellation here cannot leave an accepted wire packet behind.
+            tokio::task::yield_now().await;
+        }
         // Reserve the ID before any cancellable write; an abandoned send must
         // never cause the next packet to reuse an ID/session combination.
         if self.control.packet_id == u64::MAX - 1 {
@@ -199,7 +208,9 @@ impl DatagramTransport for SsDatagram {
                 payload,
                 sniffed_domain: None,
             })
-            .await
+            .await?;
+        self.sent_in_burst += 1;
+        Ok(())
     }
 
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {

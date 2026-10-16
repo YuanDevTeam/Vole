@@ -310,7 +310,15 @@ impl Reassembly {
         }
         if !self.packets.contains_key(&key) {
             if self.packets.len() >= PENDING_PACKETS {
-                return None;
+                // Keep the same bound while making progress after UDP loss.
+                // Otherwise one missing fragment per slot rejects every new
+                // packet until the full TTL expires.
+                let oldest = self
+                    .packets
+                    .iter()
+                    .min_by_key(|(_, packet)| packet.expires)
+                    .map(|(key, _)| *key)?;
+                self.remove(&oldest);
             }
             self.packets.insert(
                 key,
@@ -460,6 +468,57 @@ mod tests {
     }
 
     #[test]
+    fn udp_missing_fragments_cannot_block_fresh_complete_packets_until_expiry() {
+        #[cfg(feature = "interop-test")]
+        let _case = crate::resources::case_events::Case::new(
+            "HYSTERIA2-UNIT",
+            "udp_missing_fragments_cannot_block_fresh_complete_packets_until_expiry",
+        );
+        let now = Instant::now();
+        let peer = Destination::domain("x", 1).unwrap();
+        let mut state = Reassembly::default();
+        // Missing suffixes fill the existing global capacity. UDP loss must
+        // not make every subsequent fragmented packet wait the whole TTL.
+        for session in 0..PENDING_PACKETS as u32 {
+            let frames = encode(session, 1, &peer, &[7; 128], 96).unwrap();
+            assert!(
+                state
+                    .push(
+                        decode(frames[0].clone()).unwrap(),
+                        now + Duration::from_nanos(u64::from(session)),
+                        4096
+                    )
+                    .is_none()
+            );
+        }
+        assert_eq!(state.packets.len(), PENDING_PACKETS);
+        let frames = encode(100, 3, &peer, &[9; 128], 96).unwrap();
+        assert!(
+            state
+                .push(
+                    decode(frames[0].clone()).unwrap(),
+                    now + Duration::from_millis(1),
+                    4096
+                )
+                .is_none()
+        );
+        let delivered = state
+            .push(
+                decode(frames[1].clone()).unwrap(),
+                now + Duration::from_millis(2),
+                4096,
+            )
+            .expect("fresh complete packet must displace an old missing fragment");
+        assert_eq!(delivered.payload, [9; 128][..]);
+        assert_eq!(state.packets.len(), PENDING_PACKETS - 1);
+        assert!(!state.packets.contains_key(&(0, 1)));
+        assert!(state.bytes <= PENDING_BYTES);
+        state.expire(now + TTL + Duration::from_secs(1), |_| true);
+        assert!(state.packets.is_empty());
+        assert_eq!(state.bytes, 0);
+    }
+
+    #[test]
     fn udp_reassembly_isolates_sources_duplicates_counts_bytes_and_expiry() {
         #[cfg(feature = "interop-test")]
         let _case = crate::resources::case_events::Case::new(
@@ -566,7 +625,9 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state.packets.len(), 64);
-        state.expire(now + Duration::from_secs(4), |session| session != 0);
+        assert!(state.packets.contains_key(&(65, 9)));
+        assert_eq!(state.bytes, 63 * 4096 + 1);
+        state.expire(now + Duration::from_secs(4), |session| session != 65);
         assert_eq!(state.packets.len(), 63);
         assert_eq!(state.bytes, 63 * 4096);
         state.expire(now + TTL, |_| true);
