@@ -837,20 +837,15 @@ impl OutboundConnector for VlessOutbound {
             let mut io = prepared.finish(VlessCommand::Mux, None).await?;
             context.run_io("VLESS XUDP request", io.flush()).await?;
             let transport = XudpTransport::with_budget(io, [0; 8], request.budget());
-            // The H2 XHTTP driver owns accepted body writes and their bounded
-            // queue. Encryption may add its own buffered writer, so preserve
-            // the conservative flush contract for that additional layer.
-            Box::new(
-                if self.encryption.is_none()
-                    && self.xhttp.as_ref().is_some_and(|client| {
-                        client.http_version() == crate::config::XHttpVersion::Http2
-                    })
-                {
-                    transport.with_autonomous_writes()
-                } else {
-                    transport
-                },
-            )
+            // Every XHTTP version independently drives accepted body writes
+            // through bounded queues. Per-frame flush would serialize XUDP
+            // packets into separate timer-delayed packet-up POSTs. Encryption
+            // may add a buffered writer, so retain its conservative contract.
+            Box::new(if self.encryption.is_none() && self.xhttp.is_some() {
+                transport.with_autonomous_writes()
+            } else {
+                transport
+            })
         } else {
             Box::new(super::datagram::VlessDatagram::new(
                 prepared,
