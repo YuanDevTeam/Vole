@@ -152,6 +152,8 @@ UoT 写入最多暂持一帧及偏移；取消单次发送后，后续收发先�
 
 `quic-transport` 只把已有 `DatagramTransport` 适配成 Quinn/quiche 共用的受控 UDP 接口，没有内部 bind、DNS 或 DIRECT 回落。每个连接双向各最多32个排队数据报，另允许一个正在发送的包；TX满返回WouldBlock，RX满暂停读取。接收等待不会持有发送队列锁；Pending发送不会重复提交。单逻辑peer/物理peer映射和来源校验独立保留，不接受未请求的目标、GSO或源地址覆盖。物理 socket 仍只能来自 Dialer。
 立即就绪的读取、发送容量与发送完成检查不登记新的等待者；仅在同一状态锁内确认 Pending 后登记唤醒，保留后续数据、容量恢复、取消与 Stop 的通知。
+队列通知采用边沿：TX由空变非空、RX由满变为有容量时通知驱动；已排队TX由就绪条件继续推进。
+普通RX消费保持底层已有的接收等待，避免逐包取消并重建同一等待。
 
 XHTTP 和 DoH/H3 通过 `quinn-h3-transport` 使用官方 h3/h3-quinn，共享取消安全的请求包装与
 非 DATA 帧编码预算；它不创建 socket、查询池或额外业务 body 队列。未完成发送的请求丢弃时 reset，

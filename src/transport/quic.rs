@@ -103,12 +103,15 @@ impl DatagramSocket {
         if state.closed {
             return Poll::Ready(Err(state.error.unwrap_or(io::ErrorKind::BrokenPipe).into()));
         }
+        let was_full = state.incoming.len() == QUEUE_LIMIT;
         let Some(payload) = state.incoming.pop_front() else {
             self.shared.reader.register(cx.waker());
             return Poll::Pending;
         };
-        // Freeing the same bounded queue resumes its single transport owner.
-        self.shared.changed.notify_one();
+        drop(state);
+        if was_full {
+            self.shared.changed.notify_one();
+        }
         Poll::Ready(Ok(payload))
     }
 
@@ -285,9 +288,6 @@ async fn drive(
             let mut state = shared.state.lock().unwrap();
             state.stats.sent += 1;
             shared.writer.wake();
-            if !state.outgoing.is_empty() {
-                shared.changed.notify_one();
-            }
         }
     }
 }
@@ -344,6 +344,7 @@ impl AsyncUdpSocket for DatagramSocket {
         if state.outgoing.len() == QUEUE_LIMIT {
             return Err(io::ErrorKind::WouldBlock.into());
         }
+        let was_empty = state.outgoing.is_empty();
         state
             .outgoing
             .push_back(Bytes::copy_from_slice(transmit.contents));
@@ -354,7 +355,9 @@ impl AsyncUdpSocket for DatagramSocket {
             QUEUE_LIMIT,
         );
         drop(state);
-        self.shared.changed.notify_one();
+        if was_empty {
+            self.shared.changed.notify_one();
+        }
         Ok(())
     }
 
@@ -383,9 +386,14 @@ impl AsyncUdpSocket for DatagramSocket {
             ecn: None,
             dst_ip: None,
         };
+        let was_full = state.incoming.len() == QUEUE_LIMIT;
         state.incoming.pop_front();
-        // Resume the single transport owner when the consumer frees capacity.
-        self.shared.changed.notify_one();
+        drop(state);
+        // Only a full queue suppresses the owner's physical receive. Other
+        // consumption must leave its already pending receive undisturbed.
+        if was_full {
+            self.shared.changed.notify_one();
+        }
         Poll::Ready(Ok(1))
     }
 
@@ -495,6 +503,7 @@ mod pending_waker_tests {
         input: mpsc::Receiver<Datagram>,
         credit: Arc<Semaphore>,
         starts: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
         closed: Arc<AtomicUsize>,
     }
     #[async_trait::async_trait]
@@ -509,6 +518,7 @@ mod pending_waker_tests {
             Ok(())
         }
         async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
             self.input
                 .recv()
                 .await
@@ -525,6 +535,7 @@ mod pending_waker_tests {
         input: mpsc::Sender<Datagram>,
         credit: Arc<Semaphore>,
         starts: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
         closed: Arc<AtomicUsize>,
         peer: SocketAddr,
     }
@@ -532,6 +543,7 @@ mod pending_waker_tests {
         let (input, receive) = mpsc::channel(64);
         let credit = Arc::new(Semaphore::new(if gated { 0 } else { 64 }));
         let starts = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicUsize::new(0));
         let peer = "192.0.2.1:443".parse().unwrap();
         let (socket, driver) = attach(
@@ -539,6 +551,7 @@ mod pending_waker_tests {
                 input: receive,
                 credit: credit.clone(),
                 starts: starts.clone(),
+                reads: reads.clone(),
                 closed: closed.clone(),
             }),
             peer,
@@ -550,6 +563,7 @@ mod pending_waker_tests {
             input,
             credit,
             starts,
+            reads,
             closed,
             peer,
         })
@@ -587,6 +601,38 @@ mod pending_waker_tests {
             Poll::Ready(result) => result,
             Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
         }
+    }
+    #[tokio::test]
+    async fn quic_memory_nonfull_receive_keeps_the_pending_carrier_read() {
+        let fixture = fixture(false).unwrap();
+        let waker = Waker::from(Arc::new(Count::default()));
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            inject(&fixture, b"first")?;
+            wait_for(|| fixture.socket.stats().received == 1).await?;
+            let before = fixture.reads.load(Ordering::Relaxed);
+            let mut bytes = [0; 1400];
+            let mut meta = [quinn::udp::RecvMeta::default()];
+            ready(fixture.socket.poll_recv(
+                &mut Context::from_waker(&waker),
+                &mut [IoSliceMut::new(&mut bytes)],
+                &mut meta,
+            ))?;
+            assert_eq!(&bytes[..meta[0].len], b"first");
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            let after = fixture.reads.load(Ordering::Relaxed);
+            inject(&fixture, b"second")?;
+            wait_for(|| fixture.socket.stats().received == 2).await?;
+            Ok::<_, io::Error>((before, after))
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        let (before, after) = result.unwrap();
+        assert_eq!(after, before, "consumption restarted an unblocked read");
     }
     // These three RED cases exercise the real attached carrier and owner. No
     // setter manufactures queue/credit/readiness, and no AtomicWaker is taken
