@@ -319,9 +319,10 @@ port 为 1–65535，仅提供 ports 时可省略；显式非法 port 仍拒绝�
 认证/上游/请求共用绝对 10 秒预算。旧会话失败后新流可新建会话，已有业务不重放。
 写 EOF 关闭当前逻辑 TCP 双向通道，与 Mihomo 一致，不影响兄弟流。
 
-四个 initial/max 接收窗口按字节配置；0 独立使用默认：stream 8 MiB，connection 20 MiB。
+四个 initial/max 接收窗口按字节配置；0 独立使用默认：stream 8 MiB，connection 2 MiB。
 采用固定 Middle 策略：每流信用为 max(initial, min(maximum, 4 MiB))，连接信用为 initial；
-不执行消费量或 RTT 驱动的自适应增长。默认仍为 8 / 20 MiB。
+不执行消费量或 RTT 驱动的自适应增长。默认为 8 / 2 MiB；连接信用以控制接收驻留为优先，
+更大的带宽时延积可显式配置初始窗口。
 initial 大于 max 时保留初始值，不缩小或额外拒绝；max 限制到 QUIC VarInt，无法编码的
 initial 拒绝。窗口是信用额度，不预分配整个缓冲。handshake-timeout 为整数秒，正值与
 原建链绝对期限取较早值，<=0 保留原期限；成功后的业务/端口跳跃不重新应用此期限。
@@ -425,7 +426,9 @@ UoT在可靠流中传输，有丢包导致的队头阻塞成本，不应用原�
 | 2022-blake3-chacha20-poly1305 | 单一 32 字节 Base64 PSK |
 
 标准 Base64 可省末尾 padding；空段/非法编码/长度错误拒绝，凭据不 trim。
-官方库只包装已有 TCP 流，UDP codec 单包有界交接，不调用其 socket 工厂。
+TCP、UDP 发送及 AES 接收使用官方 codec，只消费已有受控 IO，不调用其 socket 工厂。
+ChaCha UDP 接收使用每关联拥有的官方 cipher，在既有有界缓冲内解析响应；不按解密前的
+随机密文扩张线程级 cipher 缓存。时间、类型、地址、关联和重放校验与其余路径相同。
 
 ### ShadowTLS v3
 

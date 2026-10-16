@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use shadowsocks::{ServerConfig, config::ServerType, context::Context};
 use std::{io, sync::Arc};
 
+mod chacha_datagram;
 mod datagram;
 mod packet_io;
 mod packet_window;

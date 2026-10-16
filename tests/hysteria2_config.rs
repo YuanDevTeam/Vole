@@ -272,8 +272,18 @@ fn receive_windows_are_independent_and_preserve_initial_above_maximum() {
     assert_eq!(
         defaults.connection_window,
         QuicReceiveWindow {
+            initial: 2 * 1024 * 1024,
+            maximum: 2 * 1024 * 1024
+        }
+    );
+    let large = parse(
+        "    initial-connection-receive-window: 20971520\n    max-connection-receive-window: 16777216\n",
+    );
+    assert_eq!(
+        large.connection_window,
+        QuicReceiveWindow {
             initial: 20 * 1024 * 1024,
-            maximum: 20 * 1024 * 1024
+            maximum: 16 * 1024 * 1024,
         }
     );
     let config = parse(

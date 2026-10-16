@@ -136,6 +136,68 @@ fn request(payload: &'static [u8]) -> Datagram {
 }
 
 #[tokio::test]
+async fn udp_chacha_authenticated_invalid_headers_do_not_advance_the_replay_window() {
+    use bytes::{BufMut, BytesMut};
+    use shadowsocks::crypto::v2::udp::ChaCha20Poly1305Cipher;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut f = Fixture::new(CIPHERS[2], 1500);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Independently framed authenticated responses: wrong role, stale/future
+    // timestamp and a padding length extending past the actual message.
+    for (index, (role, time, padding)) in [
+        (0, now, 0),
+        (1, now - 3600, 0),
+        (1, now + 3600, 0),
+        (1, now, u16::MAX),
+        (1, now, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut wire = BytesMut::new();
+        let mut nonce = [0_u8; 24];
+        nonce[23] = index as u8;
+        wire.extend_from_slice(&nonce);
+        wire.put_u64(1); // server session
+        wire.put_u64(1); // packet ID must remain valid after these rejections
+        wire.put_u8(role);
+        wire.put_u64(time);
+        wire.put_u64(f.client.control.client_session_id);
+        wire.put_u16(padding);
+        super::super::address(&target()).write_to_buf(&mut wire);
+        wire.extend_from_slice(b"invalid-header");
+        if index == 4 {
+            wire.truncate(24 + 27); // authenticated response missing the client ID
+        }
+        wire.resize(wire.len() + 16, 0);
+        let (nonce, message) = wire.split_at_mut(24);
+        ChaCha20Poly1305Cipher::new(&[7; 32]).encrypt_packet(nonce, message);
+        f.replies
+            .send(Datagram {
+                remote: f.client.server.clone(),
+                payload: wire.freeze(),
+                sniffed_domain: None,
+            })
+            .await
+            .unwrap();
+    }
+    let valid = f.response(&f.control(1, 1), b"valid-after-rejection").await;
+    f.replies.send(valid).await.unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(1), f.client.receive())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.remote, target());
+    assert_eq!(received.payload, &b"valid-after-rejection"[..]);
+    assert_eq!(f.client.sessions.len(), 1);
+    f.client.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn udp_busy_sender_yields_before_accepting_another_wire_packet() {
     for name in CIPHERS {
         let mut f = Fixture::new(name, 1500);

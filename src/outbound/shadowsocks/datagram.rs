@@ -45,6 +45,7 @@ pub(super) struct SsDatagram {
     inner: Box<dyn DatagramTransport>,
     server: Destination,
     socket: ProxySocket<PacketIo>,
+    chacha_decoder: Option<super::chacha_datagram::Decoder>,
     io: PacketIo,
     control: UdpSocketControlData,
     sessions: VecDeque<ServerSession>,
@@ -73,6 +74,7 @@ impl SsDatagram {
             inner,
             server,
             socket: ProxySocket::from_socket(UdpSocketType::Client, context, config, io.clone()),
+            chacha_decoder: super::chacha_datagram::Decoder::new(config),
             io,
             control,
             sessions: VecDeque::with_capacity(2),
@@ -219,15 +221,29 @@ impl DatagramTransport for SsDatagram {
         }
         loop {
             let wire = self.inner.receive().await?;
-            if !self.peer_matches(&wire.remote) || wire.payload.len() > self.wire_maximum {
+            if !self.peer_matches(&wire.remote)
+                || wire.payload.len() < self.response_header
+                || wire.payload.len() > self.wire_maximum
+            {
                 continue;
             }
-            self.io.put(wire.payload).map_err(DispatchError::from)?;
-            // The handoff is always Ready. The only cancellable receive is
-            // the shared transport above, so partial packets cannot survive.
-            let Ok((size, source, _, Some(control))) =
-                self.socket.recv_with_ctrl(&mut self.buffer).await
-            else {
+            let decoded = if let Some(decoder) = &self.chacha_decoder {
+                let length = wire.payload.len();
+                self.buffer[..length].copy_from_slice(&wire.payload);
+                decoder.decode(&mut self.buffer[..length]).ok()
+            } else {
+                self.io.put(wire.payload).map_err(DispatchError::from)?;
+                // The handoff is always Ready. Only the shared transport
+                // above can pend; no partial packet survives cancellation.
+                self.socket
+                    .recv_with_ctrl(&mut self.buffer)
+                    .await
+                    .ok()
+                    .and_then(|(size, source, _, control)| {
+                        control.map(|control| (size, source, control))
+                    })
+            };
+            let Some((size, source, control)) = decoded else {
                 continue;
             };
             if size > self.maximum {
@@ -250,6 +266,7 @@ impl DatagramTransport for SsDatagram {
     async fn close(&mut self) -> Result<(), DispatchError> {
         self.closed = true;
         self.sessions.clear();
+        self.chacha_decoder.take();
         self.inner.close().await
     }
 }
