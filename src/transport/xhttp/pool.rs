@@ -296,7 +296,7 @@ mod tests {
     use tokio_util::task::TaskTracker;
 
     #[tokio::test]
-    async fn implicit_h3_shares_four_active_leases_and_reconnects_after_idle() {
+    async fn implicit_h3_shares_three_active_leases_and_reconnects_after_idle() {
         tokio::time::timeout(Duration::from_secs(3), async {
             let mut config = XHttpConfig::new("example.com", "/x", XHttpMode::StreamOne).unwrap();
             config.http_version = XHttpVersion::Http3;
@@ -320,7 +320,7 @@ mod tests {
                 transport.handshake(Box::new(io)).await
             };
             let mut leases = Vec::new();
-            for _ in 0..4 {
+            for _ in 0..3 {
                 let (_, lease) = client
                     .pool
                     .acquire(Policy::Multiplexed, &make)
@@ -329,13 +329,13 @@ mod tests {
                 leases.push(lease);
             }
             assert_eq!(calls.load(Ordering::Relaxed), 1);
-            let (_, fifth) = client
+            let (_, fourth) = client
                 .pool
                 .acquire(Policy::Multiplexed, &make)
                 .await
                 .unwrap();
             assert_eq!(calls.load(Ordering::Relaxed), 2);
-            drop(fifth);
+            drop(fourth);
             drop(leases);
             let (_, fresh) = client
                 .pool
