@@ -188,7 +188,7 @@ impl OutboundConnector for Hysteria2Outbound {
                 let (mut send, recv) = shared.connection.open_bi().await.map_err(failure)?;
                 tokio::io::AsyncWriteExt::write_all(&mut send, &request).await?;
                 send.flush().await?;
-                let stream = super::stream::TcpStream::new(recv, send, context.deadline());
+                let stream = super::stream::TcpStream::new(recv, send);
                 Ok(ConnectedStream {
                     io: Box::new(OwnedStream::new(Box::new(stream), shared.cancel.child_token())),
                     effective_peer: session.destination,
