@@ -296,7 +296,7 @@ mod tests {
     use tokio_util::task::TaskTracker;
 
     #[tokio::test]
-    async fn implicit_h3_shares_three_active_leases_and_reconnects_after_idle() {
+    async fn implicit_h3_shares_four_active_leases_and_reconnects_after_idle() {
         tokio::time::timeout(Duration::from_secs(3), async {
             let mut config = XHttpConfig::new("example.com", "/x", XHttpMode::StreamOne).unwrap();
             config.http_version = XHttpVersion::Http3;
@@ -320,7 +320,7 @@ mod tests {
                 transport.handshake(Box::new(io)).await
             };
             let mut leases = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (_, lease) = client
                     .pool
                     .acquire(Policy::Multiplexed, &make)
@@ -328,30 +328,35 @@ mod tests {
                     .unwrap();
                 leases.push(lease);
             }
-            assert_eq!(calls.load(Ordering::Relaxed), 1);
-            let (_, fourth) = client
+            let shared_calls = calls.load(Ordering::Relaxed);
+            let (_, fifth) = client
                 .pool
                 .acquire(Policy::Multiplexed, &make)
                 .await
                 .unwrap();
-            assert_eq!(calls.load(Ordering::Relaxed), 2);
-            drop(fourth);
+            let overflow_calls = calls.load(Ordering::Relaxed);
+            drop(fifth);
             drop(leases);
             let (_, fresh) = client
                 .pool
                 .acquire(Policy::Multiplexed, &make)
                 .await
                 .unwrap();
-            assert_eq!(
-                calls.load(Ordering::Relaxed),
-                3,
-                "idle physical transport was retained"
-            );
+            let fresh_calls = calls.load(Ordering::Relaxed);
             drop(fresh);
             client.stop().await;
             transport.stop().await;
             peers.close();
             peers.wait().await;
+            assert_eq!(
+                shared_calls, 1,
+                "active streams opened redundant transports"
+            );
+            assert_eq!(
+                overflow_calls, 2,
+                "active sharing threshold was not bounded"
+            );
+            assert_eq!(fresh_calls, 3, "idle physical transport was retained");
         })
         .await
         .expect("active transport leases did not stop");
