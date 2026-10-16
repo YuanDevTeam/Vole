@@ -67,7 +67,8 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 QUIC 使用官方 Quinn 固定 Middle 接收窗口：每流为 max(initial, min(maximum, 4 MiB))，
 连接为 initial，不复现 Mihomo 的自适应窗口。initial>max 保留初值，max 大于 VarInt clamp，
 无法编码的 initial 明确拒绝；credit 通告沿 Quinn 原生实现。
-HY2 默认连接 initial 为 2 MiB，显式配置不按此默认值钳位。
+HY2 默认每流 64 KiB、连接 initial 4 MiB，优先多流公平性与接收驻留；
+较高 RTT 的单流可显式增大窗口，配置不按这些默认值钳位。
 HY2 正 handshake-timeout 与 Core 原期限合并；参考正值后台 offer 的生命周期可能超出
 单次调用期限，该差异保留。TUIC max-open-streams=1 接受但实际不能取得业务所有权；
 frame 无法容纳 TUIC 头时可解析，业务 UDP 发送失败，不额外拒绝TCP配置。支持模式的互通与窗口增大后的 RSS/吞吐/UDP loss 不由

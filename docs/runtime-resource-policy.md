@@ -178,7 +178,7 @@ QUIC owner.stop先取消并等待驱动，再关闭并释放上游；上游close
 
 TUIC 与 Hysteria2 共用这一接点。接收窗口通过官方 Quinn API 固定设置：
 每流 max(initial, min(maximum, 4 MiB))，
-连接 initial；默认 TUIC 4 / 6.4 MiB，HY2 8 / 2 MiB，不预分配全部信用额度。
+连接 initial；默认 TUIC 4 / 6.4 MiB，HY2 64 KiB / 4 MiB，不预分配全部信用额度。
 DoQ 初始及最小发送 payload 为 1200 字节，接收预算独立保留，允许较大的合法对端包。
 
 TUIC 的独立会话、关联 ID 退役、控制流、分片负载

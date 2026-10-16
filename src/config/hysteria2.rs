@@ -242,16 +242,16 @@ impl RawHysteria2 {
                     self.initial_stream_receive_window,
                     self.max_stream_receive_window,
                     super::QuicReceiveWindow {
-                        initial: 8 * 1024 * 1024,
-                        maximum: 8 * 1024 * 1024,
+                        initial: 64 * 1024,
+                        maximum: 64 * 1024,
                     },
                 )?,
                 connection_window: super::QuicReceiveWindow::normalize(
                     self.initial_connection_receive_window,
                     self.max_connection_receive_window,
                     super::QuicReceiveWindow {
-                        initial: 2 * 1024 * 1024,
-                        maximum: 2 * 1024 * 1024,
+                        initial: 4 * 1024 * 1024,
+                        maximum: 4 * 1024 * 1024,
                     },
                 )?,
                 handshake_timeout: std::time::Duration::from_secs(

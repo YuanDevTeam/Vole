@@ -265,15 +265,15 @@ fn receive_windows_are_independent_and_preserve_initial_above_maximum() {
     assert_eq!(
         defaults.stream_window,
         QuicReceiveWindow {
-            initial: 8 * 1024 * 1024,
-            maximum: 8 * 1024 * 1024
+            initial: 64 * 1024,
+            maximum: 64 * 1024
         }
     );
     assert_eq!(
         defaults.connection_window,
         QuicReceiveWindow {
-            initial: 2 * 1024 * 1024,
-            maximum: 2 * 1024 * 1024
+            initial: 4 * 1024 * 1024,
+            maximum: 4 * 1024 * 1024
         }
     );
     let large = parse(

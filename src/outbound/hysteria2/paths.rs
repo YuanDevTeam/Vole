@@ -78,7 +78,8 @@ impl Paths {
                 0
             };
         let request = DatagramRequest::new(self.datagram.clone())
-            .with_budget(DatagramBudget::new(wire_mtu, wire_mtu));
+            .with_budget(DatagramBudget::new(wire_mtu, wire_mtu))
+            .with_udp_receive_buffer_size(2 * 1024 * 1024);
         let raw = self.upstream.open_datagram(request, context).await?;
         // Pace the encrypted wire packet, including the optional salt.
         let raw = self.bandwidth.wrap(raw, wire_mtu);
