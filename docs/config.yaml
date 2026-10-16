@@ -485,7 +485,7 @@ proxies:
       # 范围用字符串 N 或 N-M；uplink-chunk-size/sc-max-each-post-bytes/sc-min-posts-interval-ms 也接受整数。
       x-padding-bytes: "100-1000"
       sc-max-each-post-bytes: "1000000" # packet-up，最多16MiB，非预分配大小
-      sc-min-posts-interval-ms: "30"    # packet-up，0–60000且最大值为正
+      sc-min-posts-interval-ms: "10"    # packet-up，0–60000且最大值为正
       reuse-settings: # 省略无额外池；{} 启用默认池，阈值不是全节点数量上限
         max-concurrency: "0"
         max-connections: "0"

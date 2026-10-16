@@ -69,7 +69,7 @@ impl Default for XHttpRequestOptions {
                 min: 1_000_000,
                 max: 1_000_000,
             },
-            post_interval_ms: IntegerRange { min: 30, max: 30 },
+            post_interval_ms: IntegerRange { min: 10, max: 10 },
         }
     }
 }
@@ -111,7 +111,7 @@ impl XHttpRequestOptions {
         )?;
         let post_interval_ms = IntegerRange::parse_with_default(
             raw.sc_min_posts_interval_ms.as_deref(),
-            "30",
+            "10",
             0,
             60_000,
         )?;

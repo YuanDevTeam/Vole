@@ -34,7 +34,7 @@ H1/H2 可使用明文、标准 TLS 1.3、REALITY（经典默认、显式混合�
 | `uplink-data-key` | header/cookie payload 必填，body 不接受 |
 | `uplink-chunk-size` | header/cookie 默认 `"0"` 自适应；显式区间 64–8192。自适应 header 3072–4096、cookie 2048–3072 |
 | `sc-max-each-post-bytes` | packet-up，`"1000000"`，1–16 MiB；这是 POST 上限，不是预分配缓冲大小 |
-| `sc-min-posts-interval-ms` | packet-up，`"30"`，0–60000 且最大值须为正；允许 `"0-N"`，不允许纯零 |
+| `sc-min-posts-interval-ms` | packet-up，`"10"`，0–60000 且最大值须为正；允许 `"0-N"`，不允许纯零 |
 
 session/sequence 均支持 path/query/header/cookie。键使用至多 64 字节的 HTTP 安全 token，禁止互相冲突以及覆盖 padding、payload 或既有 query/header。字符表预定义值包括 `ALPHABET`、`Alphabet`、`alphabet`、`BASE36`、`base36`、`Base62`、`HEX`、`hex`、`number`。
 
@@ -53,6 +53,7 @@ body/auto 模式的 POST 共享已冻结批次的不可变 backing，不额外�
 H1 编码保留正文 backing，不将整批正文再次拼入头部写缓冲；每次向所供应 IO 提供的正文片段最多 16 KiB，避免一次提交整批正文使 TLS 同时缓冲多个记录，
 并保留原有 flush 确认与 Stop 屏障。
 
+默认间隔使用 10 ms，配合 64 KiB 批次降低持续负载下的积压；这是 Vole 的资源策略，显式配置的间隔保持原值。
 首次非空批次等待采样间隔；后续以 POST 发起时间计时，前次交换和空闲时间计入间隔。
 空闲超过间隔后可立即发送新批次。底层准入和网络可能推迟发送，计时不代表线上首字节间隔。
 

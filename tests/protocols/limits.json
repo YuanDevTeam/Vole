@@ -163,7 +163,7 @@
       "value": 65536,
       "unit": "bytes-per-batch",
       "owner": "limits::XHTTP_PACKET_BATCH_BYTES",
-      "saturation": "backpressure one filling batch and one in-flight batch; never allocate the configured POST maximum",
+      "saturation": "backpressure one batch including the in-flight POST; never allocate the configured POST maximum",
       "cancellation": "logical drop cancels the timer/upload; node Stop joins the owned driver",
       "boundary_cases": [
         "XHTTP-UNIT"
