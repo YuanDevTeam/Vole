@@ -46,30 +46,9 @@ enum ReceiveEvent {
     Failed(ReceiveFailure),
 }
 
-struct SendGuard {
-    cancellation: CancellationToken,
-    committed: bool,
-}
-
-impl SendGuard {
-    fn new(cancellation: CancellationToken) -> Self {
-        Self {
-            cancellation,
-            committed: false,
-        }
-    }
-
-    fn commit(&mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for SendGuard {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.cancellation.cancel();
-        }
-    }
+struct PendingWrite {
+    packet: Bytes,
+    offset: usize,
 }
 
 pub(crate) struct UotTransport {
@@ -79,6 +58,7 @@ pub(crate) struct UotTransport {
     reader_task: Option<JoinHandle<()>>,
     first_write: bool,
     initial_deadline: Option<tokio::time::Instant>,
+    pending_write: Option<PendingWrite>,
     closed: bool,
 }
 
@@ -142,6 +122,7 @@ impl UotTransport {
             reader_task: Some(reader_task),
             first_write: version == 2,
             initial_deadline: None,
+            pending_write: None,
             closed: false,
         }
     }
@@ -150,11 +131,8 @@ impl UotTransport {
         self.initial_deadline = Some(deadline);
         self
     }
-}
 
-#[async_trait]
-impl DatagramTransport for UotTransport {
-    async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
+    fn check_open(&mut self) -> Result<(), DispatchError> {
         if self.closed || self.cancellation.is_cancelled() {
             return Err(DispatchError::Other("UoT association is closed".to_owned()));
         }
@@ -162,39 +140,72 @@ impl DatagramTransport for UotTransport {
             .initial_deadline
             .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
         {
-            self.cancellation.cancel();
+            self.fail();
             return Err(DispatchError::TimedOut);
         }
+        Ok(())
+    }
+
+    fn fail(&mut self) {
+        self.closed = true;
+        self.pending_write = None;
+        self.cancellation.cancel();
+    }
+
+    async fn flush_pending(&mut self) -> Result<(), DispatchError> {
+        let Some(pending) = &mut self.pending_write else {
+            return Ok(());
+        };
+        let cancellation = self.cancellation.clone();
+        let initial_deadline = self.initial_deadline;
+        let writing = async {
+            while pending.offset < pending.packet.len() {
+                let written = self.writer.write(&pending.packet[pending.offset..]).await?;
+                if written == 0 {
+                    return Err(io::Error::from(io::ErrorKind::WriteZero));
+                }
+                pending.offset += written;
+            }
+            self.writer.flush().await
+        };
+        let result = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(DispatchError::NotAllowed),
+            result = async {
+                if let Some(deadline) = initial_deadline {
+                    tokio::time::timeout_at(deadline, writing).await.map_err(|_| DispatchError::TimedOut)?
+                        .map_err(DispatchError::from)
+                } else { writing.await.map_err(DispatchError::from) }
+            } => result,
+        };
+        if let Err(error) = result {
+            self.fail();
+            return Err(error);
+        }
+        self.pending_write = None;
+        self.first_write = false;
+        self.initial_deadline = None;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DatagramTransport for UotTransport {
+    async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
+        self.check_open()?;
+        self.flush_pending().await?;
         let packet = if self.first_write {
             encode_first_packet(&datagram).map_err(DispatchError::from)?
         } else {
             encode_datagram(&datagram).map_err(DispatchError::from)?
         };
-        let mut send_guard = SendGuard::new(self.cancellation.clone());
-        tokio::select! {
-            biased;
-            () = self.cancellation.cancelled() => return Err(DispatchError::NotAllowed),
-            result = async {
-                let writing = async {
-                    self.writer.write_all(&packet).await?;
-                    self.writer.flush().await
-                };
-                if let Some(deadline) = self.initial_deadline {
-                    tokio::time::timeout_at(deadline, writing).await.map_err(|_| DispatchError::TimedOut)?
-                        .map_err(DispatchError::from)
-                } else { writing.await.map_err(DispatchError::from) }
-            } => result?,
-        }
-        self.first_write = false;
-        self.initial_deadline = None;
-        send_guard.commit();
-        Ok(())
+        self.pending_write = Some(PendingWrite { packet, offset: 0 });
+        self.flush_pending().await
     }
 
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
-        if self.closed || self.cancellation.is_cancelled() {
-            return Err(DispatchError::Other("UoT association is closed".to_owned()));
-        }
+        self.check_open()?;
+        self.flush_pending().await?;
         match self.responses.recv().await {
             Some(ReceiveEvent::Datagram(datagram)) => Ok(datagram),
             Some(ReceiveEvent::Failed(error)) => {
@@ -216,6 +227,7 @@ impl DatagramTransport for UotTransport {
             return Ok(());
         }
         self.cancellation.cancel();
+        self.pending_write = None;
         if let Some(reader_task) = self.reader_task.take() {
             let _ = reader_task.await;
         }
@@ -674,20 +686,139 @@ mod tests {
         assert_eq!(decoded.payload, expected.payload);
     }
 
-    #[test]
-    fn cancelled_send_transaction_poisons_the_association() {
-        let cancellation = CancellationToken::new();
-        {
-            let _guard = SendGuard::new(cancellation.clone());
-        }
-        assert!(cancellation.is_cancelled());
+    #[tokio::test]
+    async fn cancelled_partial_write_finishes_before_the_next_datagram() {
+        assert_cancelled_frame_progress(true).await;
+    }
 
-        let committed = CancellationToken::new();
-        {
-            let mut guard = SendGuard::new(committed.clone());
-            guard.commit();
+    #[tokio::test]
+    async fn receive_finishes_a_cancelled_partial_write_without_another_send() {
+        assert_cancelled_frame_progress(false).await;
+    }
+
+    #[cfg(feature = "outbound-tuic")]
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_first_write_keeps_its_original_deadline() {
+        for version in [1, 2] {
+            let tracker = TaskTracker::new();
+            let (io, mut peer) = tokio::io::duplex(1);
+            let (reader, writer) = tokio::io::split(io);
+            let mut transport = UotTransport::new_version(
+                reader,
+                writer,
+                64,
+                CancellationToken::new(),
+                &tracker,
+                version,
+            )
+            .with_initial_deadline(tokio::time::Instant::now() + Duration::from_secs(1));
+            let packet = datagram(
+                "192.0.2.1:53".parse::<SocketAddr>().unwrap().into(),
+                b"request",
+            );
+            assert!(futures_util::poll!(transport.send(packet)).is_pending());
+            assert_eq!(peer.read_u8().await.unwrap(), 0);
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(matches!(
+                transport.receive().await,
+                Err(DispatchError::TimedOut)
+            ));
+            transport.close().await.unwrap();
+            let mut extra = Vec::new();
+            peer.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty());
+            tracker.close();
+            tracker.wait().await;
         }
-        assert!(!committed.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn close_discards_a_pending_frame_without_waiting_for_write_capacity() {
+        let tracker = TaskTracker::new();
+        let (io, mut peer) = tokio::io::duplex(1);
+        let (reader, writer) = tokio::io::split(io);
+        let mut transport =
+            UotTransport::new(reader, writer, 64, CancellationToken::new(), &tracker);
+        let packet = datagram(
+            "192.0.2.1:53".parse::<SocketAddr>().unwrap().into(),
+            b"request",
+        );
+        assert!(futures_util::poll!(transport.send(packet)).is_pending());
+        tokio::time::timeout(Duration::from_secs(1), transport.close())
+            .await
+            .unwrap()
+            .unwrap();
+        tracker.close();
+        tokio::time::timeout(Duration::from_secs(1), tracker.wait())
+            .await
+            .unwrap();
+        let mut prefix = Vec::new();
+        peer.read_to_end(&mut prefix).await.unwrap();
+        assert_eq!(prefix, [0]);
+        assert!(transport.receive().await.is_err());
+    }
+
+    async fn assert_cancelled_frame_progress(send_another: bool) {
+        for version in [1, 2] {
+            let tracker = TaskTracker::new();
+            let (io, mut peer) = tokio::io::duplex(1);
+            let (reader, writer) = tokio::io::split(io);
+            let mut transport = UotTransport::new_version(
+                reader,
+                writer,
+                64,
+                CancellationToken::new(),
+                &tracker,
+                version,
+            );
+            let first = datagram(
+                "192.0.2.1:53".parse::<SocketAddr>().unwrap().into(),
+                b"first",
+            );
+            let second = datagram(
+                "[2001:db8::2]:853".parse::<SocketAddr>().unwrap().into(),
+                b"second",
+            );
+            let mut expected = if version == 2 {
+                encode_first_packet(&first).unwrap().to_vec()
+            } else {
+                encode_datagram(&first).unwrap().to_vec()
+            };
+            if send_another {
+                expected.extend_from_slice(&encode_datagram(&second).unwrap());
+            }
+            assert!(futures_util::poll!(transport.send(first.clone())).is_pending());
+            assert!(
+                !transport.cancellation.is_cancelled(),
+                "dropping one partial send must preserve the shared wire"
+            );
+            let prefix = peer.read_u8().await.unwrap();
+            assert_eq!(prefix, expected[0]);
+            let remaining = expected.len() - 1;
+            let reply = encode_datagram(&datagram(first.remote.clone(), b"reply")).unwrap();
+            let server = tokio::spawn(async move {
+                let mut received = vec![prefix; 1];
+                received.resize(remaining + 1, 0);
+                peer.read_exact(&mut received[1..]).await.unwrap();
+                peer.write_all(&reply).await.unwrap();
+                received
+            });
+            if send_another {
+                transport.send(second).await.unwrap();
+            }
+            let reply = tokio::time::timeout(Duration::from_secs(1), transport.receive())
+                .await
+                .expect("pending frame prevented receive progress")
+                .unwrap();
+            assert_eq!(reply.remote, first.remote);
+            assert_eq!(reply.payload.as_ref(), b"reply");
+            assert_eq!(server.await.unwrap(), expected);
+            transport.close().await.unwrap();
+            tracker.close();
+            tokio::time::timeout(Duration::from_secs(1), tracker.wait())
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]

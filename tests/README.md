@@ -42,6 +42,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | TrustTunnel／Mieru／MASQUE | `trusttunnel`、`mieru`、`masque_` | 真实编解码、信用/背压、复用、单流关闭及同步Stop |
 | 有界队列与内存策略 | `routing::datagram_ready::tests::`、`managed_udp_connections_`、`allocator_relief`、`platform::process_memory::tests::` | 就绪轮询、排空、取消和单次回收 |
 | TUN 响应背压 | `tun_runtime::tests::backpressured_udp_response_handoff` | 满队列下每源至多暂持一包、双向推进及取消 |
+| UoT | `outbound::uot::tests::` | 半帧取消后继续、版本首部、原期限、单槽响应与Stop |
 | CLI前台 | `invoke::foreground::tests::` | 文件/stdin、路径、信号及清理 |
 
 独立集成回归按目标运行，例如：
