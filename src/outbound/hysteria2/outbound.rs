@@ -285,8 +285,8 @@ async fn drive(
             .max_concurrent_bidi_streams(0_u8.into())
             .max_concurrent_uni_streams((crate::limits::HY2_UNI_STREAMS as u32).into())
             .send_window(crate::limits::HY2_SEND_WINDOW as u64)
-            .datagram_receive_buffer_size(Some(crate::limits::HY2_DATAGRAM_BUFFER))
-            .datagram_send_buffer_size(crate::limits::HY2_DATAGRAM_BUFFER)
+            .datagram_receive_buffer_size(Some(crate::limits::HY2_DATAGRAM_RECEIVE_BUFFER))
+            .datagram_send_buffer_size(crate::limits::HY2_DATAGRAM_SEND_BUFFER)
             .max_idle_timeout(Some(Duration::from_secs(30).try_into().map_err(failure)?))
             .keep_alive_interval(Some(Duration::from_secs(10)))
             .congestion_controller_factory(bandwidth.clone());

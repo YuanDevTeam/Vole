@@ -628,10 +628,10 @@
     },
     {
       "id": "tun-udp-response",
-      "value": 4096,
+      "value": 256,
       "unit": "items",
       "owner": "ResourceLimits::tun_udp_response_queue_capacity",
-      "saturation": "drop only the current ordinary UDP response without refreshing association activity",
+      "saturation": "one pending response per source pauses that association until writeback capacity; cancellation discards pending data",
       "cancellation": "existing runtime-owned cancellation and Stop barrier",
       "boundary_cases": [
         "FOUNDATIONS-REGRESSION"
@@ -881,11 +881,23 @@
       ]
     },
     {
-      "id": "hy2-datagram-buffer",
+      "id": "hy2-datagram-send-buffer",
       "value": 262144,
-      "unit": "bytes-per-direction",
-      "owner": "limits::HY2_DATAGRAM_BUFFER",
-      "saturation": "QUIC bounds retained datagram queues",
+      "unit": "bytes",
+      "owner": "limits::HY2_DATAGRAM_SEND_BUFFER",
+      "saturation": "bound retained outgoing QUIC datagrams; sends wait for capacity",
+      "cancellation": "owned logical close or physical session Stop releases retained state and joins drivers",
+      "boundary_cases": [
+        "HYSTERIA2-UNIT",
+        "HYSTERIA2-OWNED"
+      ]
+    },
+    {
+      "id": "hy2-datagram-receive-buffer",
+      "value": 1048576,
+      "unit": "bytes",
+      "owner": "limits::HY2_DATAGRAM_RECEIVE_BUFFER",
+      "saturation": "bound retained incoming QUIC datagrams; Quinn drops old frames when full",
       "cancellation": "owned logical close or physical session Stop releases retained state and joins drivers",
       "boundary_cases": [
         "HYSTERIA2-UNIT",

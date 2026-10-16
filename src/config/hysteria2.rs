@@ -204,7 +204,7 @@ impl RawHysteria2 {
         let identity = normalize_client_identity(self.certificate, self.private_key)?;
         let fingerprint = normalize_certificate_fingerprint(self.fingerprint.as_deref())?;
         let udp_mtu = if self.udp_mtu == 0 {
-            1197
+            crate::limits::HY2_QUIC_PAYLOAD as u16
         } else {
             self.udp_mtu
         };

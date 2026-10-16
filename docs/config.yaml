@@ -373,7 +373,7 @@ proxies:
     udp: true
     up: 0 # 裸数单位 Mbps；0 自动，也可 "125 KBps"，b=bit/B=byte
     down: 0
-    udp-mtu: 1197 # 单个协议分片预算；0 同默认，范围 64–65535
+    udp-mtu: 1400 # 单个协议分片预算；0 同默认，范围 64–65535
     # initial-stream-receive-window: 8388608 # byte，0/省略为8MiB
     # max-stream-receive-window: 8388608 # 固定信用=max(initial,min(maximum,4MiB))，不预分配缓冲
     # initial-connection-receive-window: 2097152 # 固定连接信用；0/省略为2MiB，可显式增大

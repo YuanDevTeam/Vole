@@ -97,7 +97,7 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
             );
         }
     }
-    assert_eq!((defaults.up, defaults.down, defaults.udp_mtu), (0, 0, 1197));
+    assert_eq!((defaults.up, defaults.down, defaults.udp_mtu), (0, 0, 1400));
     assert_eq!(defaults.password, "");
     assert_eq!(defaults.tls.server_name, "localhost");
     assert_eq!(defaults.tls.alpn, vec![b"h3".to_vec()]);
@@ -140,7 +140,7 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
     let node = normalized(raw.clone());
     assert_eq!(node.password, "  raw credential  ");
     assert_eq!(node.port, 443);
-    assert_eq!(node.udp_mtu, 1197);
+    assert_eq!(node.udp_mtu, 1400);
     let hopping = node.hopping.unwrap();
     assert_eq!(hopping.ports, vec![443, 8443, 8444, 8445]);
     assert_eq!((hopping.min_seconds, hopping.max_seconds), (5, 7));

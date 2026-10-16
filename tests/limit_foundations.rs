@@ -39,7 +39,14 @@ fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
         ("hy2-quic-payload", vole::limits::HY2_QUIC_PAYLOAD),
         ("hy2-uni-streams", vole::limits::HY2_UNI_STREAMS),
         ("hy2-send-window", vole::limits::HY2_SEND_WINDOW),
-        ("hy2-datagram-buffer", vole::limits::HY2_DATAGRAM_BUFFER),
+        (
+            "hy2-datagram-send-buffer",
+            vole::limits::HY2_DATAGRAM_SEND_BUFFER,
+        ),
+        (
+            "hy2-datagram-receive-buffer",
+            vole::limits::HY2_DATAGRAM_RECEIVE_BUFFER,
+        ),
         ("hy2-auth-headers", vole::limits::HY2_AUTH_HEADERS),
         ("hy2-response-message", vole::limits::HY2_RESPONSE_MESSAGE),
         ("hy2-response-padding", vole::limits::HY2_RESPONSE_PADDING),

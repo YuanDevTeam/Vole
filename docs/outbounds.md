@@ -308,7 +308,7 @@ port 为 1–65535，仅提供 ports 时可省略；显式非法 port 仍拒绝�
 
 - up/down 独立非负整数或十进制整数字符串，裸值 Mbit/s；单位 [KMGT]?[bB]ps 使用
   十进制倍率，bit 向下取整为 byte/s。省略/归一零为自动；拒绝小数、符号、溢出。
-- udp-mtu 缺省/0 为 1197，其他值 64–65535，限制编码后单分片并取实际 DATAGRAM
+- udp-mtu 缺省/0 为 1400，其他值 64–65535，限制编码后单分片并取实际 DATAGRAM
   预算交集，不是 TUN MTU。
 - obfs 只允许 salamander，须配非空独立 obfs-password。
 - ports 是归一去重的非空端口/闭区间集合，优先于合法 port。hop-interval 仅随 ports：
@@ -328,7 +328,7 @@ initial 大于 max 时保留初始值，不缩小或额外拒绝；max 限制到
 initial 拒绝。窗口是信用额度，不预分配整个缓冲。handshake-timeout 为整数秒，正值与
 原建链绝对期限取较早值，<=0 保留原期限；成功后的业务/端口跳跃不重新应用此期限。
 
-连接未确认发送缓冲 1 MiB、DATAGRAM 收发各 256 KiB；最多 8 条单向
+连接未确认发送缓冲 1 MiB、DATAGRAM 接收 1 MiB、发送 256 KiB；最多 8 条单向
 控制流，拒绝主动双向流。PMTUD 关闭，最大 QUIC payload 1400 并取上游预算交集；
 空闲 30 秒/保活 10 秒。认证头 16 KiB，TCP 响应消息 2048/padding 4096 字节。
 业务 UDP 原生 DATAGRAM，payload 最多 4096，最多 255 分片；未知关联不创建状态。
