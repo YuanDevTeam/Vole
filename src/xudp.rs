@@ -2,7 +2,7 @@
 
 use std::io;
 
-use bytes::{BufMut as _, Bytes, BytesMut};
+use bytes::{Buf as _, BufMut as _, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::{
@@ -132,8 +132,11 @@ impl XudpTransport {
 
         let mut scratch = [0_u8; 1024];
         while self.receive_buffer.len() < required {
-            let missing = required - self.receive_buffer.len();
-            let chunk = missing.min(scratch.len());
+            // Consume available stream bytes within the existing one-frame
+            // byte budget. Reading exactly each small header field repeatedly
+            // enters TLS/H2 even when several complete packets are ready.
+            let remaining = self.max_receive_buffer_size - self.receive_buffer.len();
+            let chunk = remaining.min(scratch.len());
             let read = self
                 .stream
                 .as_mut()
@@ -208,7 +211,7 @@ impl XudpTransport {
                 (status, option)
             };
             if option & OPTION_DATA == 0 {
-                self.receive_buffer.clear();
+                self.receive_buffer.advance(metadata_end);
                 continue;
             }
 
@@ -268,12 +271,12 @@ impl XudpTransport {
             self.fill_receive_buffer(frame_end).await?;
 
             if status == STATUS_KEEP_ALIVE {
-                self.receive_buffer.clear();
+                self.receive_buffer.advance(frame_end);
                 continue;
             }
             let payload =
                 Bytes::copy_from_slice(&self.receive_buffer[payload_length_end..frame_end]);
-            self.receive_buffer.clear();
+            self.receive_buffer.advance(frame_end);
             return Ok(Datagram {
                 remote: remote.expect("non-keepalive XUDP data has a remote destination"),
                 payload,
@@ -427,6 +430,27 @@ mod tests {
         let datagram = transport.receive().await.unwrap();
         assert_eq!(datagram.remote.to_string(), "1.2.3.4:53");
         assert_eq!(datagram.payload.as_ref(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn coalesced_data_and_keepalive_preserve_every_frame_within_the_receive_budget() {
+        let (client, mut server) = tokio::io::duplex(256);
+        let payloads = [b"first".as_slice(), b"second", b"third"];
+        let mut wire = Vec::new();
+        for payload in payloads {
+            // A metadata-only keepalive must not discard the following frame.
+            wire.extend_from_slice(&[0, 4, 0, 0, STATUS_KEEP_ALIVE, 0]);
+            wire.extend_from_slice(&response_data_prefix(payload.len() as u16));
+            wire.extend_from_slice(payload);
+        }
+        server.write_all(&wire).await.unwrap();
+        drop(server);
+        let mut transport = XudpTransport::new(Box::new(client), [0; 8], 1452);
+        for payload in payloads {
+            assert_eq!(transport.receive().await.unwrap().payload.as_ref(), payload);
+            assert!(transport.receive_buffer.len() <= transport.max_receive_buffer_size);
+        }
+        assert!(transport.receive().await.is_err());
     }
 
     #[test]
