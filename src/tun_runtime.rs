@@ -1290,7 +1290,7 @@ fn try_queue_tun_dns_response(
 
 enum ResponseQueueResult {
     Queued,
-    Dropped,
+    Pending(UdpDatagram),
     Closed,
 }
 
@@ -1299,16 +1299,14 @@ fn try_queue_tun_udp_response(
     response: UdpDatagram,
     last_activity: &AtomicU64,
     now: u64,
-    resource_stats: &RuntimeResourceStats,
 ) -> ResponseQueueResult {
     match responses.try_send(QueuedUdpResponse::ordinary(response)) {
         Ok(()) => {
             last_activity.store(now, Ordering::Release);
             ResponseQueueResult::Queued
         }
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            resource_stats.queue_drop(ResourceQueue::UdpResponse, responses.max_capacity());
-            ResponseQueueResult::Dropped
+        Err(mpsc::error::TrySendError::Full(response)) => {
+            ResponseQueueResult::Pending(response.datagram)
         }
         Err(mpsc::error::TrySendError::Closed(_)) => ResponseQueueResult::Closed,
     }
@@ -1344,12 +1342,13 @@ fn tun_dns_servfail_response(request: &UdpDatagram, query: &ClassifiedDnsQuery) 
     )
 }
 
-enum AssociationEvent {
+enum AssociationEvent<'a> {
     Cancelled,
     SniffDeadline,
     ReadySend,
     Inbound(Option<UdpDatagram>),
     Outbound(Result<Datagram, DispatchError>),
+    ResponseCapacity(Result<mpsc::Permit<'a, QueuedUdpResponse>, mpsc::error::SendError<()>>),
 }
 
 trait QuicSniffEngine {
@@ -1871,6 +1870,24 @@ struct UdpAssociationTaskContext {
     cancellation: CancellationToken,
 }
 
+// One uncommitted response per source, with no additional queue or task.
+// Cancellation discards it rather than waiting for a stopped TUN writer.
+struct PendingUdpResponse<'a> {
+    datagram: Option<UdpDatagram>,
+    context: &'a UdpAssociationTaskContext,
+}
+
+impl Drop for PendingUdpResponse<'_> {
+    fn drop(&mut self) {
+        if self.datagram.is_some() {
+            self.context.resource_stats.queue_drop(
+                ResourceQueue::UdpResponse,
+                self.context.responses.max_capacity(),
+            );
+        }
+    }
+}
+
 async fn run_udp_association(
     mut inbound: mpsc::Receiver<UdpDatagram>,
     _activity: ResourceActivityGuard,
@@ -2005,6 +2022,10 @@ where
     // The deque grows only for actual QUIC replay and keeps its existing bound.
     let mut ready = VecDeque::new();
     let mut pending_send = None;
+    let mut pending_response = PendingUdpResponse {
+        datagram: None,
+        context,
+    };
     let mut first_response_logged = false;
     let mut received_in_burst = 0;
     loop {
@@ -2018,12 +2039,26 @@ where
             // Drain a ready response before accepting another datagram from
             // this same source. Fairness between the ordinary and DNS TUN
             // response queues is handled independently by the sole TUN writer.
-            datagram = transport.receive() => AssociationEvent::Outbound(datagram),
+            permit = context.responses.reserve(), if pending_response.datagram.is_some() => {
+                AssociationEvent::ResponseCapacity(permit)
+            }
+            datagram = async { transport.receive().await }, if pending_response.datagram.is_none() => AssociationEvent::Outbound(datagram),
             () = std::future::ready(()), if pending_send.is_some() || !ready.is_empty() => AssociationEvent::ReadySend,
             datagram = inbound.recv() => AssociationEvent::Inbound(datagram),
         };
         match event {
             AssociationEvent::Cancelled | AssociationEvent::Inbound(None) => break,
+            AssociationEvent::ResponseCapacity(Ok(permit)) => {
+                let response = pending_response
+                    .datagram
+                    .take()
+                    .expect("pending UDP response");
+                permit.send(QueuedUdpResponse::ordinary(response));
+                context
+                    .last_activity
+                    .store(context.association_clock.now(), Ordering::Release);
+            }
+            AssociationEvent::ResponseCapacity(Err(_)) => break,
             AssociationEvent::SniffDeadline => {
                 append_ready_datagrams(&mut ready, quic_sniff.expire(TokioInstant::now()))?;
             }
@@ -2086,10 +2121,11 @@ where
                     response,
                     &context.last_activity,
                     context.association_clock.now(),
-                    &context.resource_stats,
                 ) {
                     ResponseQueueResult::Queued => {}
-                    ResponseQueueResult::Dropped => {}
+                    ResponseQueueResult::Pending(response) => {
+                        pending_response.datagram = Some(response);
+                    }
                     ResponseQueueResult::Closed => {
                         tracing::debug!(association_id, "TUN UDP response channel closed");
                         break;

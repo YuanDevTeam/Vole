@@ -1676,20 +1676,39 @@ fn tun_response_capacities_are_independent_of_tcp_accept_and_each_other() {
 
 #[tokio::test]
 async fn ready_udp_receive_bursts_let_the_response_writer_run_without_drops() {
-    assert_ready_udp_receive_bursts(1).await;
+    assert_ready_udp_receive_bursts(1, UdpBurstConsumer::Ready).await;
 }
 
 #[tokio::test]
 async fn concurrent_ready_udp_sources_let_the_response_writer_run_without_drops() {
-    assert_ready_udp_receive_bursts(8).await;
+    assert_ready_udp_receive_bursts(8, UdpBurstConsumer::Ready).await;
 }
 
-async fn assert_ready_udp_receive_bursts(sources: usize) {
+#[tokio::test]
+async fn backpressured_udp_response_handoff_retains_one_packet_and_duplex_progress() {
+    assert_ready_udp_receive_bursts(8, UdpBurstConsumer::Delayed).await;
+}
+
+#[tokio::test]
+async fn backpressured_udp_response_handoff_stops_without_waiting_for_the_writer() {
+    assert_ready_udp_receive_bursts(8, UdpBurstConsumer::Stopped).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UdpBurstConsumer {
+    Ready,
+    Delayed,
+    Stopped,
+}
+
+async fn assert_ready_udp_receive_bursts(sources: usize, consumer: UdpBurstConsumer) {
     const PACKETS: u32 = 512;
-    struct BurstDispatcher(SocketAddr);
+    struct BurstDispatcher(SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>);
     struct BurstDatagrams {
         remote: SocketAddr,
         sequence: u32,
+        received: Arc<AtomicUsize>,
+        sent: Arc<AtomicUsize>,
     }
     #[async_trait]
     impl Dispatcher for BurstDispatcher {
@@ -1703,12 +1722,15 @@ async fn assert_ready_udp_receive_bursts(sources: usize) {
             Ok(Box::new(BurstDatagrams {
                 remote: self.0,
                 sequence: 0,
+                received: self.1.clone(),
+                sent: self.2.clone(),
             }))
         }
     }
     #[async_trait]
     impl DatagramTransport for BurstDatagrams {
         async fn send(&mut self, _: Datagram) -> Result<(), DispatchError> {
+            self.sent.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         async fn receive(&mut self) -> Result<Datagram, DispatchError> {
@@ -1720,6 +1742,7 @@ async fn assert_ready_udp_receive_bursts(sources: usize) {
             tokio::task::consume_budget().await;
             let payload = Bytes::copy_from_slice(&self.sequence.to_be_bytes());
             self.sequence += 1;
+            self.received.fetch_add(1, Ordering::Relaxed);
             Ok(Datagram {
                 remote: Destination::Ip(self.remote),
                 payload,
@@ -1733,6 +1756,8 @@ async fn assert_ready_udp_receive_bursts(sources: usize) {
     let stats = RuntimeResourceStats::new("udp_receive_burst_test");
     let mut inbound = Vec::new();
     let mut producers = Vec::new();
+    let read_count = Arc::new(AtomicUsize::new(0));
+    let send_count = Arc::new(AtomicUsize::new(0));
     for index in 0..sources {
         let source = SocketAddr::new("192.0.2.10".parse().unwrap(), 12000 + index as u16);
         let (sender, mut input) = mpsc::channel(1);
@@ -1741,7 +1766,11 @@ async fn assert_ready_udp_receive_bursts(sources: usize) {
             association_id: index as u64 + 1,
             source,
             responses: responses.clone(),
-            dispatcher: Arc::new(BurstDispatcher(remote)),
+            dispatcher: Arc::new(BurstDispatcher(
+                remote,
+                read_count.clone(),
+                send_count.clone(),
+            )),
             resource_stats: stats.clone(),
             association_clock: AssociationClock::realtime(),
             last_activity: Arc::new(AtomicU64::new(0)),
@@ -1754,27 +1783,51 @@ async fn assert_ready_udp_receive_bursts(sources: usize) {
             run_udp_association_inner(&mut input, &context).await
         }));
     }
-    let received = timeout(Duration::from_millis(200), async {
-        let mut next = vec![0_u32; sources];
-        for _ in 0..PACKETS as usize * sources {
-            let response = output.recv().await.expect("memory UDP producer closed");
-            let index = usize::from(response.destination.port().saturating_sub(12000));
-            if response.source != remote
-                || response.destination
-                    != SocketAddr::new("192.0.2.10".parse().unwrap(), 12000 + index as u16)
-                || index >= sources
-                || response.payload[..] != next[index].to_be_bytes()
-            {
-                return false;
-            }
-            next[index] += 1;
-            // The real writer charges each emitted packet in addition to
-            // channel reception, even when all producers remain ready.
-            tokio::task::consume_budget().await;
+    if consumer != UdpBurstConsumer::Ready {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
         }
-        true
-    })
-    .await;
+        assert_eq!(output.len(), output.max_capacity());
+        assert!(
+            read_count.load(Ordering::Relaxed) <= output.max_capacity() + sources,
+            "a blocked writer must retain at most one extra response per source"
+        );
+        for (index, sender) in inbound.iter().enumerate() {
+            let source = SocketAddr::new("192.0.2.10".parse().unwrap(), 12000 + index as u16);
+            sender
+                .try_send(UdpDatagram::new(source, remote, b"uplink".as_slice()))
+                .unwrap();
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(send_count.load(Ordering::Relaxed), sources);
+    }
+    let received = if consumer == UdpBurstConsumer::Stopped {
+        Ok(true)
+    } else {
+        timeout(Duration::from_millis(200), async {
+            let mut next = vec![0_u32; sources];
+            for _ in 0..PACKETS as usize * sources {
+                let response = output.recv().await.expect("memory UDP producer closed");
+                let index = usize::from(response.destination.port().saturating_sub(12000));
+                if response.source != remote
+                    || response.destination
+                        != SocketAddr::new("192.0.2.10".parse().unwrap(), 12000 + index as u16)
+                    || index >= sources
+                    || response.payload[..] != next[index].to_be_bytes()
+                {
+                    return false;
+                }
+                next[index] += 1;
+                // The real writer charges each emitted packet in addition to
+                // channel reception, even when all producers remain ready.
+                tokio::task::consume_budget().await;
+            }
+            true
+        })
+        .await
+    };
     cancellation.cancel();
     for producer in producers {
         timeout(Duration::from_secs(1), producer)
@@ -1788,7 +1841,14 @@ async fn assert_ready_udp_receive_bursts(sources: usize) {
         matches!(received, Ok(true)),
         "ready receive burst starved the response writer"
     );
-    assert_eq!(stats.snapshot().udp_response_queue_drops, 0);
+    assert_eq!(
+        stats.snapshot().udp_response_queue_drops,
+        if consumer == UdpBurstConsumer::Stopped {
+            sources as u64
+        } else {
+            0
+        }
+    );
 }
 
 #[tokio::test]
@@ -1821,29 +1881,23 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
                 response(sequence),
                 &last_activity,
                 u64::from(sequence) + 100,
-                &stats,
             ),
             ResponseQueueResult::Queued
         ));
     }
     assert_eq!(ordinary.len(), 256);
-    assert!(matches!(
-        try_queue_tun_udp_response(
-            &ingress.responses,
-            response(256),
-            &last_activity,
-            5_000,
-            &stats,
-        ),
-        ResponseQueueResult::Dropped
-    ));
+    let ResponseQueueResult::Pending(pending) =
+        try_queue_tun_udp_response(&ingress.responses, response(256), &last_activity, 5_000)
+    else {
+        panic!("full queue must return its uncommitted response")
+    };
     assert_eq!(last_activity.load(Ordering::Acquire), 355);
-    assert_eq!(stats.snapshot().udp_response_queue_drops, 1);
+    assert_eq!(stats.snapshot().udp_response_queue_drops, 0);
     assert_eq!(stats.snapshot().udp_association_queue_drops, 0);
     assert_eq!(stats.snapshot().dns_queue_drops, 0);
 
     // Saturating the ordinary channel neither consumes DNS capacity nor
-    // overwrites any accepted response. Freeing one slot admits only new work.
+    // overwrites any accepted response. Freeing one slot admits the held packet.
     try_queue_tun_dns_response(&ingress.dns_responses, response(7), None, &stats);
     assert_eq!(&dns.try_recv().unwrap().payload[..], 7_u32.to_be_bytes());
     assert_eq!(
@@ -1851,13 +1905,7 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
         0_u32.to_be_bytes()
     );
     assert!(matches!(
-        try_queue_tun_udp_response(
-            &ingress.responses,
-            response(257),
-            &last_activity,
-            5_001,
-            &stats,
-        ),
+        try_queue_tun_udp_response(&ingress.responses, pending, &last_activity, 5_001,),
         ResponseQueueResult::Queued
     ));
     for sequence in 1_u32..256 {
@@ -1868,7 +1916,7 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
     }
     assert_eq!(
         &ordinary.try_recv().unwrap().payload[..],
-        257_u32.to_be_bytes()
+        256_u32.to_be_bytes()
     );
     assert!(matches!(
         ordinary.try_recv(),
@@ -1876,17 +1924,11 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
     ));
     ordinary.close();
     assert!(matches!(
-        try_queue_tun_udp_response(
-            &ingress.responses,
-            response(258),
-            &last_activity,
-            6_000,
-            &stats,
-        ),
+        try_queue_tun_udp_response(&ingress.responses, response(258), &last_activity, 6_000,),
         ResponseQueueResult::Closed
     ));
     assert_eq!(last_activity.load(Ordering::Acquire), 5_001);
-    assert_eq!(stats.snapshot().udp_queue_drops, 1);
+    assert_eq!(stats.snapshot().udp_queue_drops, 0);
     assert_eq!(stats.snapshot().dns_queue_drops, 0);
     ingress.stop().await;
     assert!(!cancellation.is_cancelled());
@@ -2816,10 +2858,9 @@ async fn ordinary_and_dns_responses_have_independent_queue_capacity() {
 }
 
 #[tokio::test]
-async fn full_ordinary_response_queue_drops_without_refreshing_activity() {
+async fn full_ordinary_response_queue_returns_data_without_refreshing_activity() {
     let source: SocketAddr = "192.0.2.10:12000".parse().unwrap();
     let server: SocketAddr = "198.51.100.20:443".parse().unwrap();
-    let stats = RuntimeResourceStats::new("tun_runtime_test");
     let last_activity = AtomicU64::new(5);
     let (responses, mut queued) = mpsc::channel(1);
 
@@ -2829,26 +2870,26 @@ async fn full_ordinary_response_queue_drops_without_refreshing_activity() {
             UdpDatagram::new(server, source, b"queued".as_slice()),
             &last_activity,
             100,
-            &stats,
         ),
         ResponseQueueResult::Queued
     ));
     assert_eq!(last_activity.load(Ordering::Acquire), 100);
-    assert!(matches!(
-        try_queue_tun_udp_response(
-            &responses,
-            UdpDatagram::new(server, source, b"dropped".as_slice()),
-            &last_activity,
-            110,
-            &stats,
-        ),
-        ResponseQueueResult::Dropped
-    ));
+    let ResponseQueueResult::Pending(pending) = try_queue_tun_udp_response(
+        &responses,
+        UdpDatagram::new(server, source, b"held".as_slice()),
+        &last_activity,
+        110,
+    ) else {
+        panic!("full queue must return its uncommitted response")
+    };
     assert_eq!(last_activity.load(Ordering::Acquire), 100);
-    assert_eq!(stats.snapshot().udp_queue_drops, 1);
-    assert_eq!(stats.snapshot().udp_association_queue_drops, 0);
-    assert_eq!(stats.snapshot().udp_response_queue_drops, 1);
     assert_eq!(&queued.recv().await.unwrap().payload[..], b"queued");
+    assert!(matches!(
+        try_queue_tun_udp_response(&responses, pending, &last_activity, 120),
+        ResponseQueueResult::Queued
+    ));
+    assert_eq!(last_activity.load(Ordering::Acquire), 120);
+    assert_eq!(&queued.recv().await.unwrap().payload[..], b"held");
 }
 
 #[tokio::test]

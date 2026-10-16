@@ -107,7 +107,9 @@ mux驱动，再等待底层协议。provider代际与node-only测速复用此屏
 
 - 关联表不设固定项数；
 - 每个关联的入站队列最多 64 项，满时只丢当前数据报，不等待慢关联并阻塞其他来源；
-- 普通响应队列最多 256 项，满时只丢当前响应；没有共享 UDP 入站中转队列；
+- 普通响应队列最多 256 项；满时每源关联最多暂持一个已接收响应，暂停该关联继续接收，
+  同时等待写回容量、处理请求和取消，不增加队列或任务。取消或错误时丢弃未提交响应；
+  没有共享 UDP 入站中转队列；
 - 每源关联每处理 32 个实际响应显式退让；共享响应队列占用达到四分之一时提前退让，
   让唯一 writer 与其他关联推进。不等待凑批、不预取包、不按忙碌情况拒绝关联。
   接收的原生合作预算继续保留。
@@ -298,7 +300,8 @@ Stop 的同步释放屏障完成后，Apple 通过 malloc zone、GNU/Linux 通�
 独立 netstack 的 `udp_drops` 只记录通用 UDP endpoint 的入站丢弃；生产 TUN 使用
 TCP-only netstack，因此该值为零不代表 UDP 无丢包。运行时记录
 `udp_association_queue_drops` 和 `udp_response_queue_drops`，保留两者合计的
-`udp_queue_drops`；TCP/ICMP ingress Full 记录 `packet_queue_drops`。这些计数
+`udp_queue_drops`。普通响应暂持等待容量不计丢包，取消或错误后实际丢弃才计数；
+TCP/ICMP ingress Full 记录 `packet_queue_drops`。这些计数
 不包含物理 socket、内核 TUN 或对端设施中的丢包。
 
 日志必须有界且脱敏，不记录目标、DNS question、UUID、凭据、密钥、负载或完整配置。
