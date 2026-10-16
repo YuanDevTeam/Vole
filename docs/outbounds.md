@@ -332,6 +332,8 @@ initial 拒绝。窗口是信用额度，不预分配整个缓冲。handshake-ti
 业务 UDP 原生 DATAGRAM，payload 最多 4096，最多 255 分片；未知关联不创建状态。
 重组按关联/包/地址隔离，最多 64 个待完成包/256 KiB、TTL 5 秒，关联交付队列 32 包。
 重复未完成分片忽略；完成后立即释放 16 位 Packet ID，允许后续重用，**不做业务去重**。
+同一来源、具体节点和资源代际内，未改写的 IP 目标共用一个 UDP session ID 和交付队列；
+逐目标统计、取消与出口固定仍由路由层管理，退役及旧回复隔离沿用[资源策略](runtime-resource-policy.md#udp)。
 
 down 写入 Hysteria-CC-RX。up=0 或服务端 auto 使用 BBR，否则取 up 与服务端正上限
 较小值（服务端 0 无限），使用固定带宽控制与实际 wire-byte pacer。Mihomo down=0
@@ -473,6 +475,8 @@ UoT 对端使用 16 KiB 接收缓冲；容器数据验收覆盖该实际边界�
   避免官方重试长度误计。flush/关闭排空，读取也推进待写但不被写背压阻塞。
 - 原生 UDP 取消前预留 packet ID，底层实际发送后才成功；Pending 不重编码，无后台发送队列。
   接收验证来源、认证、关联与完整负载，外层 wire 最大 65,507。
+  同一来源、具体节点和资源代际内，未改写 IP 目标共享受控 socket、codec 缓冲和重放窗口；
+  逐目标统计、取消及旧回复隔离沿用[资源策略](runtime-resource-policy.md#udp)。
 - 每关联随机 client session ID、递增 packet ID，最多两个 server session 的 8128 包
   重放窗口；旧 session 一分钟仍有有效包时不替换，ID 将溢出时换 client ID 并清空窗口。
   close 清空并关闭底层，不新增后台任务。

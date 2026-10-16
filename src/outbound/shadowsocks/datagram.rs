@@ -132,6 +132,12 @@ impl SsDatagram {
 
 #[async_trait]
 impl DatagramTransport for SsDatagram {
+    fn supports_shared_destinations(&self) -> bool {
+        // SIP022 authenticates an address in every packet. The source owner
+        // keeps one replay window; the router demultiplexes live IP targets.
+        true
+    }
+
     fn payload_budget(&self, peer: &Destination) -> crate::dispatch::DatagramBudget {
         let address = super::address(peer).serialized_len();
         let response_address = if matches!(peer, Destination::Domain { .. }) {

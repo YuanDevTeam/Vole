@@ -136,6 +136,54 @@ fn request(payload: &'static [u8]) -> Datagram {
 }
 
 #[tokio::test]
+async fn udp_one_session_preserves_multiple_ip_targets_across_receive_cancellation() {
+    for name in CIPHERS {
+        let mut f = Fixture::new(name, 1500);
+        let shareable = f.client.supports_shared_destinations();
+        let id = f.client.control.client_session_id;
+        for (index, address) in ["192.0.2.1:53", "[2001:db8::1]:443", "192.0.2.1:54"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(futures_util::poll!(f.client.receive()).is_pending());
+            let target = Destination::Ip(address.parse().unwrap());
+            let packet = Datagram {
+                remote: target.clone(),
+                payload: Bytes::from_static(b"multi-target"),
+                sniffed_domain: None,
+            };
+            f.permits.add_permits(1);
+            f.client.send(packet.clone()).await.unwrap();
+            f.io.put(f.sent.recv().await.unwrap().payload).unwrap();
+            let mut buffer = [0; 2048];
+            let (size, actual, _, control) = f.server.recv_with_ctrl(&mut buffer).await.unwrap();
+            assert_eq!(actual, super::super::address(&target));
+            assert_eq!(&buffer[..size], packet.payload);
+            assert_eq!(control.unwrap().client_session_id, id);
+            f.server
+                .send_with_ctrl(&actual, &f.control(7, index as u64 + 1), &buffer[..size])
+                .await
+                .unwrap();
+            f.replies
+                .send(Datagram {
+                    remote: f.client.server.clone(),
+                    payload: f.io.take().unwrap(),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(f.client.receive().await.unwrap(), packet);
+        }
+        f.client.close().await.unwrap();
+        assert!(f.closed.load(Ordering::SeqCst));
+        assert!(
+            shareable,
+            "multi-target SS must not allocate a transport per IP target"
+        );
+    }
+}
+
+#[tokio::test]
 async fn udp_three_ciphers_pending_cancel_exactly_once_and_close() {
     for name in CIPHERS {
         let mut f = Fixture::new(name, 1500);

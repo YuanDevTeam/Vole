@@ -150,13 +150,18 @@ async fn completed_fragment_id_can_be_reused_without_losing_the_next_datagram() 
             let Ok(request) = connection.read_datagram().await else {
                 break;
             };
-            assert_eq!(&request[6..], &[0, 1, 3, b'x', b':', b'1', sequence as u8]);
+            let target = format!("192.0.2.{}:53", sequence + 10);
+            assert_eq!(&request[6..8], &[0, 1]);
+            assert_eq!(usize::from(request[8]), target.len());
+            assert_eq!(&request[9..request.len() - 1], target.as_bytes());
+            assert_eq!(request[request.len() - 1], sequence as u8);
             // Literal protocol fixtures, independent of Vole's wire encoder.
             // Out of order plus a duplicate within the unfinished assembly.
             for index in [1, 1, 0] {
                 let mut frame = request[..4].to_vec();
                 frame.extend_from_slice(&id.to_be_bytes());
-                frame.extend_from_slice(&[index, 2, 3, b'x', b':', b'1']);
+                frame.extend_from_slice(&[index, 2, target.len() as u8]);
+                frame.extend_from_slice(target.as_bytes());
                 frame.extend_from_slice(&[sequence as u8; 50]);
                 connection.send_datagram_wait(frame.into()).await.unwrap();
             }
@@ -188,10 +193,12 @@ async fn completed_fragment_id_can_be_reused_without_losing_the_next_datagram() 
     .await
     .expect("memory peer must authenticate")
     .unwrap();
+    let shareable = udp.supports_shared_destinations();
     let mut delivered = Vec::new();
     let outcome = tokio::time::timeout(Duration::from_secs(2), async {
-        let target = Destination::domain("x", 1).unwrap();
         for sequence in 0..4 {
+            assert!(futures_util::poll!(udp.receive()).is_pending());
+            let target = Destination::Ip(format!("192.0.2.{}:53", sequence + 10).parse().unwrap());
             udp.send(Datagram {
                 remote: target.clone(),
                 payload: vec![sequence].into(),
@@ -218,6 +225,10 @@ async fn completed_fragment_id_can_be_reused_without_losing_the_next_datagram() 
         "completed Packet IDs are not replay nonces"
     );
     outcome.expect("all legal replies, including completed ID reuse, must be delivered");
+    assert!(
+        shareable,
+        "multi-target HY2 must not allocate a receiver per IP target"
+    );
 }
 
 #[tokio::test(start_paused = true)]

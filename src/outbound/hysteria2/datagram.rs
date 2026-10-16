@@ -114,6 +114,12 @@ impl Drop for Transport {
 
 #[async_trait]
 impl DatagramTransport for Transport {
+    fn supports_shared_destinations(&self) -> bool {
+        // A session ID owns a multi-target UDP socket, not one destination.
+        // Each complete message carries the reply source for demultiplexing.
+        true
+    }
+
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         let space = self.message_budget().saturating_sub(header(peer).len());
         DatagramBudget::new((space * 255).min(MAX_PAYLOAD) as u16, MAX_PAYLOAD as u16)
