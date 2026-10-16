@@ -52,8 +52,47 @@ fn decode(password: &[u8], wire: Bytes) -> Option<Bytes> {
 
 #[async_trait]
 impl DatagramTransport for Salamander {
+    fn supports_poll_receive(&self) -> bool {
+        self.inner.supports_poll_receive()
+    }
+    fn poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+        scratch: &mut Vec<u8>,
+    ) -> std::task::Poll<Result<Datagram, DispatchError>> {
+        for _ in 0..crate::limits::IO_POLL_BUDGET {
+            let mut packet = std::task::ready!(self.inner.poll_receive(context, scratch))?;
+            let maximum = self.inner.payload_budget(&packet.remote).receive();
+            if packet.payload.len() > usize::from(maximum) {
+                continue;
+            }
+            if let Some(payload) = decode(&self.password, packet.payload) {
+                packet.payload = payload;
+                return std::task::Poll::Ready(Ok(packet));
+            }
+        }
+        context.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         self.inner.payload_budget(peer).subtract_overhead(8, 8)
+    }
+    fn send_owned(
+        &mut self,
+        packet: Datagram,
+    ) -> Result<crate::dispatch::OwnedDatagramSend, Datagram> {
+        if packet.payload.is_empty()
+            || packet.payload.len() > usize::from(self.payload_budget(&packet.remote).transmit())
+        {
+            return Err(packet);
+        }
+        let mut encoded = packet;
+        let plain = std::mem::take(&mut encoded.payload);
+        encoded.payload = encode(&self.password, rand::random(), &plain);
+        self.inner.send_owned(encoded).map_err(|mut packet| {
+            packet.payload = plain;
+            packet
+        })
     }
     async fn send(&mut self, mut packet: Datagram) -> Result<(), DispatchError> {
         if packet.payload.is_empty()

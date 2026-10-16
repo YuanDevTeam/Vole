@@ -114,8 +114,31 @@ struct Paced {
 }
 #[async_trait]
 impl DatagramTransport for Paced {
+    fn supports_poll_receive(&self) -> bool {
+        self.inner.supports_poll_receive()
+    }
+    fn poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+        scratch: &mut Vec<u8>,
+    ) -> std::task::Poll<Result<Datagram, DispatchError>> {
+        self.inner.poll_receive(context, scratch)
+    }
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         self.inner.payload_budget(peer)
+    }
+    fn send_owned(
+        &mut self,
+        packet: Datagram,
+    ) -> Result<crate::dispatch::OwnedDatagramSend, Datagram> {
+        let bytes = packet.payload.len();
+        let send = self.inner.send_owned(packet)?;
+        let bandwidth = self.bandwidth.clone();
+        let mtu = self.mtu;
+        Ok(Box::pin(async move {
+            bandwidth.pace(bytes, mtu).await;
+            send.await
+        }))
     }
     async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
         self.bandwidth.pace(packet.payload.len(), self.mtu).await;

@@ -19,6 +19,10 @@ impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub type BoxStream = Box<dyn AsyncStream>;
 
+/// One owned send operation; its owner must cancel or complete it before close.
+pub type OwnedDatagramSend =
+    Pin<Box<dyn std::future::Future<Output = Result<(), DispatchError>> + Send + 'static>>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
     #[error("connection is not allowed")]
@@ -90,6 +94,14 @@ pub trait DatagramTransport: Send {
     /// This never resolves a domain or opens IO.
     fn payload_budget(&self, _peer: &crate::session::Destination) -> DatagramBudget {
         DatagramBudget::new(u16::MAX, u16::MAX)
+    }
+
+    /// Lease an already-open path without borrowing this transport during IO.
+    /// Unsupported paths return the untouched datagram for ordinary `send`.
+    /// This never binds, resolves, or creates an alternative physical path.
+    /// The caller must drop or complete this lease before closing the transport.
+    fn send_owned(&mut self, datagram: Datagram) -> Result<OwnedDatagramSend, Datagram> {
+        Err(datagram)
     }
 
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError>;
@@ -333,6 +345,10 @@ impl DatagramTransport for ObservedDatagramTransport {
 
     fn payload_budget(&self, peer: &crate::session::Destination) -> DatagramBudget {
         self.inner.payload_budget(peer)
+    }
+
+    fn send_owned(&mut self, datagram: Datagram) -> Result<OwnedDatagramSend, Datagram> {
+        self.inner.send_owned(datagram)
     }
 
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {

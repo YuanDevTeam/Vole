@@ -1,6 +1,7 @@
 use std::{
     io,
     net::SocketAddr,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -89,7 +90,7 @@ impl OutboundConnector for DirectOutbound {
 
 struct DirectDatagramTransport {
     dialer: Dialer,
-    sockets: Vec<(UdpSocketClass, UdpSocket)>,
+    sockets: Vec<(UdpSocketClass, Arc<UdpSocket>)>,
     max_response_payload_size: usize,
     receive_buffer_size: Option<usize>,
     receive_buffer: Vec<u8>,
@@ -131,7 +132,7 @@ impl DirectDatagramTransport {
             .bind_udp_for_with_receive_buffer(address, self.receive_buffer_size)
             .await
             .map_err(DispatchError::from)?;
-        self.sockets.push((class, socket));
+        self.sockets.push((class, Arc::new(socket)));
         Ok(&self
             .sockets
             .last()
@@ -139,8 +140,25 @@ impl DirectDatagramTransport {
             .1)
     }
 
+    async fn send_on(
+        socket: &UdpSocket,
+        payload: &[u8],
+        address: SocketAddr,
+    ) -> Result<(), DispatchError> {
+        let written = socket
+            .send_to(payload, address)
+            .await
+            .map_err(DispatchError::from)?;
+        if written != payload.len() {
+            return Err(DispatchError::Other(
+                "direct UDP socket truncated a datagram".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn poll_sockets(
-        sockets: &[(UdpSocketClass, UdpSocket)],
+        sockets: &[(UdpSocketClass, Arc<UdpSocket>)],
         max_payload: usize,
         cursor: &mut usize,
         context: &mut Context<'_>,
@@ -205,21 +223,34 @@ impl DatagramTransport for DirectDatagramTransport {
         )
     }
 
+    fn send_owned(
+        &mut self,
+        datagram: Datagram,
+    ) -> Result<crate::dispatch::OwnedDatagramSend, Datagram> {
+        let Destination::Ip(address) = &datagram.remote else {
+            return Err(datagram);
+        };
+        let address = *address;
+        let class = UdpSocketClass {
+            ipv6: address.is_ipv6(),
+            loopback: address.ip().is_loopback(),
+        };
+        let Some((_, socket)) = self.sockets.iter().find(|(key, _)| *key == class) else {
+            // The first ordinary send owns protected initialization.
+            return Err(datagram);
+        };
+        let socket = socket.clone();
+        Ok(Box::pin(async move {
+            Self::send_on(&socket, &datagram.payload, address).await
+        }))
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         let Destination::Ip(address) = datagram.remote else {
             return Err(DispatchError::HostUnreachable);
         };
         let socket = self.socket_for(address).await?;
-        let written = socket
-            .send_to(&datagram.payload, address)
-            .await
-            .map_err(DispatchError::from)?;
-        if written != datagram.payload.len() {
-            return Err(DispatchError::Other(
-                "direct UDP socket truncated a datagram".to_owned(),
-            ));
-        }
-        Ok(())
+        Self::send_on(socket, &datagram.payload, address).await
     }
 
     fn supports_poll_receive(&self) -> bool {

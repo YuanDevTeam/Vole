@@ -130,6 +130,16 @@ impl DatagramTransport for Bounded {
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         self.budget.intersect(self.inner.payload_budget(peer))
     }
+    fn send_owned(&mut self, datagram: Datagram) -> Result<super::OwnedDatagramSend, Datagram> {
+        if self.closing
+            || datagram.payload.len()
+                > usize::from(self.payload_budget(&datagram.remote).transmit())
+        {
+            return Err(datagram);
+        }
+        self.inner.send_owned(datagram)
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         if self.closing {
             return Err(DispatchError::NotAllowed);
@@ -233,6 +243,39 @@ mod tests {
             payload: Bytes::from_static(payload),
             sniffed_domain: None,
         }
+    }
+
+    struct OwnedPackets(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl DatagramTransport for OwnedPackets {
+        fn send_owned(&mut self, _: Datagram) -> Result<super::super::OwnedDatagramSend, Datagram> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::pin(async { Ok(()) }))
+        }
+        async fn send(&mut self, _: Datagram) -> Result<(), DispatchError> {
+            panic!("bounded owned path must not invoke legacy send")
+        }
+        async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            std::future::pending().await
+        }
+    }
+    #[tokio::test]
+    async fn polled_datagram_bounded_owned_send_preserves_budget_and_close() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut transport = bounded(
+            Box::new(OwnedPackets(sends.clone())),
+            DatagramBudget::new(3, 3),
+        );
+        let Err(oversized) = transport.send_owned(packet(b"four")) else {
+            panic!("oversized packet reached inner transport")
+        };
+        assert_eq!(oversized.payload, b"four"[..]);
+        assert_eq!(sends.load(Ordering::Relaxed), 0);
+        transport.send_owned(packet(b"ok!")).unwrap().await.unwrap();
+        assert_eq!(sends.load(Ordering::Relaxed), 1);
+        transport.close().await.unwrap();
+        assert!(transport.send_owned(packet(b"ok!")).is_err());
+        assert_eq!(sends.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
