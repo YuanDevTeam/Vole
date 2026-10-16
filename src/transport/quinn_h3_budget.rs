@@ -1,5 +1,5 @@
-//! Prefix-only wire budgets before the official H3 decoder retains a payload.
-//! DATA is skipped by length; chunks stay owned by the official Quinn backend.
+//! Frame-aligned delivery and prefix budgets before the official H3 decoder.
+//! DATA is skipped by length; payload slices share the native Quinn backing.
 use h3::error::Code;
 
 #[derive(Default)]
@@ -57,11 +57,15 @@ impl Budget {
         self.control
     }
 
-    pub(super) fn check(&mut self, bytes: &[u8]) -> Result<(), Code> {
+    /// Separate a frame's header from its payload and the following frame.
+    /// h3 0.0.8 polls for another chunk before consuming its buffered DATA.
+    /// Returning coalesced frames would let that buffer grow outside Quinn's
+    /// receive window even while the application is reading slowly.
+    pub(super) fn prefix(&mut self, bytes: &[u8]) -> Result<usize, Code> {
         let mut offset = 0;
         while offset < bytes.len() {
             match &mut self.state {
-                State::Bypass => return Ok(()),
+                State::Bypass => return Ok(bytes.len()),
                 State::Payload(left) => {
                     let n = (*left).min((bytes.len() - offset) as u64) as usize;
                     offset += n;
@@ -69,6 +73,7 @@ impl Budget {
                     if *left == 0 {
                         self.state = State::FrameType(Varint::default());
                     }
+                    return Ok(offset);
                 }
                 State::UniType(value) => {
                     let value = value.push(bytes[offset]);
@@ -82,6 +87,7 @@ impl Budget {
                             // retains its QPACK streams and aborts unknown uni.
                             _ => State::Bypass,
                         };
+                        return Ok(offset);
                     }
                 }
                 State::PushId(value) => {
@@ -89,6 +95,7 @@ impl Budget {
                     offset += 1;
                     if value.is_some() {
                         self.state = State::FrameType(Varint::default());
+                        return Ok(offset);
                     }
                 }
                 State::FrameType(value) => {
@@ -96,13 +103,13 @@ impl Budget {
                     offset += 1;
                     if let Some(value) = value {
                         self.frame_type = value;
-                        self.state = if value == 0x41 {
+                        if value == 0x41 {
                             // The official codec's WebTransport bidi marker
                             // has a session ID instead of a frame length.
-                            State::Bypass
-                        } else {
-                            State::FrameLength(Varint::default())
-                        };
+                            self.state = State::Bypass;
+                            return Ok(offset);
+                        }
+                        self.state = State::FrameLength(Varint::default());
                     }
                 }
                 State::FrameLength(value) => {
@@ -110,10 +117,24 @@ impl Budget {
                     offset += 1;
                     if let Some(length) = value {
                         check_length(self.frame_type, length, self.header_wire)?;
-                        self.state = State::Payload(length);
+                        self.state = if length == 0 {
+                            State::FrameType(Varint::default())
+                        } else {
+                            State::Payload(length)
+                        };
+                        return Ok(offset);
                     }
                 }
             }
+        }
+        Ok(offset)
+    }
+
+    #[cfg(test)]
+    pub(super) fn check(&mut self, mut bytes: &[u8]) -> Result<(), Code> {
+        while !bytes.is_empty() {
+            let count = self.prefix(bytes)?;
+            bytes = &bytes[count..];
         }
         Ok(())
     }

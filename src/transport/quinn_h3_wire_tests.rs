@@ -3,6 +3,87 @@ use super::*;
 use tokio::sync::oneshot;
 
 #[test]
+fn receive_prefixes_progress_across_empty_data_and_bypass_qpack() {
+    // Empty DATA, one-byte DATA and another empty DATA. Every native chunk
+    // split must retain all wire bytes and yield nonempty framing prefixes.
+    let wire = [0, 0, 0, 1, 42, 0, 0];
+    for size in 1..=wire.len() {
+        let mut budget = super::super::budget::Budget::new(16 * 1024, false);
+        let mut count = 0;
+        for mut chunk in wire.chunks(size) {
+            while !chunk.is_empty() {
+                let length = budget.prefix(chunk).unwrap();
+                assert!(length > 0 && length <= chunk.len());
+                count += length;
+                chunk = &chunk[length..];
+            }
+        }
+        assert_eq!(count, wire.len());
+    }
+    let mut qpack = super::super::budget::Budget::new(0, true);
+    assert_eq!(qpack.prefix(&[2, 255, 255]).unwrap(), 1);
+    assert_eq!(qpack.prefix(&[255, 255]).unwrap(), 2);
+}
+
+#[tokio::test]
+async fn small_data_frames_do_not_release_unbounded_receive_credit() {
+    use std::sync::atomic::AtomicUsize;
+
+    let mut pair = Pair::new(64 * 1024).await;
+    let (mut client, server_control) = pair.h3().await;
+    let server = pair.server.clone();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let progress = sent.clone();
+    pair.spawn(async move {
+        let _server_control = server_control;
+        let (mut send, mut receive) = server.accept_bi().await.unwrap();
+        assert!(!receive.read_to_end(16 * 1024).await.unwrap().is_empty());
+        send.write_all(&[1, 3, 0, 0, 0xd9]).await.unwrap();
+        // Coalesced tiny DATA frames reproduce a continuously ready stream:
+        // one native QUIC chunk holds many application deliveries.
+        let batch = [0, 8, 1, 2, 3, 4, 5, 6, 7, 8].repeat(1000);
+        loop {
+            if send.write_all(&batch).await.is_err() {
+                break;
+            }
+            progress.fetch_add(batch.len(), Ordering::Relaxed);
+        }
+    });
+    settle(pair, async move {
+        let mut stream = client
+            .send_request(
+                http::Request::get("https://localhost/backpressure")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        stream.finish().await.unwrap();
+        assert_eq!(stream.recv_response().await.unwrap().status(), 200);
+        let mut delivered = 0;
+        while delivered < 4096 {
+            let mut data = stream.recv_data().await.unwrap().unwrap();
+            while data.has_remaining() {
+                assert_eq!(data.get_u8(), (delivered % 8 + 1) as u8);
+                delivered += 1;
+            }
+            // Let the native driver refill its bounded window before the next
+            // application read. No real sockets or network peer are involved.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(delivered, 4096);
+        let accepted = sent.load(Ordering::Relaxed);
+        // Includes both QUIC receive credit and the peer's bounded send queue.
+        // Consuming 4 KiB must not unlock a stream of prefetched DATA frames.
+        assert!(
+            accepted <= 256 * 1024,
+            "peer accepted {accepted} bytes after {delivered} application bytes"
+        );
+    })
+    .await;
+}
+
+#[test]
 fn every_prefix_split_rejects_after_complete_declared_length() {
     // Non-minimal 8-byte QUIC varints are valid. These independent wire
     // fixtures complement native IO tests, whose packet coalescing does not

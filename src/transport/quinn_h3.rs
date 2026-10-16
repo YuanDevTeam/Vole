@@ -308,6 +308,7 @@ pub(crate) struct GuardedRecv {
     pending: bool,
     stopped: Option<u64>,
     budget: budget::Budget,
+    buffered: Bytes,
     connection: Option<quinn::Connection>,
 }
 
@@ -325,6 +326,7 @@ impl GuardedRecv {
             pending: false,
             stopped: None,
             budget: budget::Budget::new(header_limit, unidirectional),
+            buffered: Bytes::new(),
             connection,
         }
     }
@@ -340,37 +342,46 @@ impl quic::RecvStream for GuardedRecv {
         if let Some(error_code) = self.stopped {
             return Poll::Ready(Err(StreamErrorIncoming::StreamTerminated { error_code }));
         }
-        let result = quic::RecvStream::poll_data(self.inner.as_mut().unwrap(), cx);
-        self.pending = result.is_pending();
-        if let Poll::Ready(Ok(Some(bytes))) = &result
-            && let Err(code) = self.budget.check(bytes)
-        {
-            self.stop_sending(code.value());
-            if self.budget.is_control() {
-                // A prefix can already include the control stream type. If
-                // rejected before h3 sees that type, a plain reset would be
-                // tolerated as an unclassified uni stream ending early.
-                self.connection
-                    .as_ref()
-                    .unwrap()
-                    .close(quinn::VarInt::from_u64(code.value()).unwrap(), b"");
-                return Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
-                    connection_error: ConnectionErrorIncoming::ApplicationClose {
-                        error_code: code.value(),
-                    },
+        if self.buffered.is_empty() {
+            let result = quic::RecvStream::poll_data(self.inner.as_mut().unwrap(), cx);
+            self.pending = result.is_pending();
+            match result {
+                Poll::Ready(Ok(Some(bytes))) => self.buffered = bytes,
+                other => return other,
+            }
+        }
+        let length = match self.budget.prefix(&self.buffered) {
+            Ok(length) => length,
+            Err(code) => {
+                self.stop_sending(code.value());
+                if self.budget.is_control() {
+                    // A prefix can already include the control stream type. If
+                    // rejected before h3 sees that type, a plain reset would be
+                    // tolerated as an unclassified uni stream ending early.
+                    self.connection
+                        .as_ref()
+                        .unwrap()
+                        .close(quinn::VarInt::from_u64(code.value()).unwrap(), b"");
+                    return Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                        connection_error: ConnectionErrorIncoming::ApplicationClose {
+                            error_code: code.value(),
+                        },
+                    }));
+                }
+                return Poll::Ready(Err(StreamErrorIncoming::StreamTerminated {
+                    error_code: code.value(),
                 }));
             }
-            return Poll::Ready(Err(StreamErrorIncoming::StreamTerminated {
-                error_code: code.value(),
-            }));
-        }
-        result
+        };
+        // Keep at most one native chunk, with no payload copy or read-ahead.
+        Poll::Ready(Ok(Some(self.buffered.split_to(length))))
     }
 
     fn stop_sending(&mut self, code: u64) {
         if self.stopped.is_some() {
             return;
         }
+        self.buffered = Bytes::new();
         if self.pending {
             // h3-quinn 0.0.10 has moved its raw stream into a private future.
             // Ownership Drop is safe and sends the native default STOP(0);
