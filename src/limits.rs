@@ -66,8 +66,8 @@ pub const TUIC_FIN_GRACE_SECONDS: usize = 5;
 /// Process observation ceiling, never lifecycle admission.
 pub const MEMORY_OBSERVATION_CEILING_BYTES: u64 = 45 * 1024 * 1024;
 
-/// Process observation target, never lifecycle admission.
-pub const MEMORY_OBSERVATION_TARGET_BYTES: u64 = 40 * 1024 * 1024;
+/// 1 Gbps process observation threshold, never lifecycle admission.
+pub const MEMORY_OBSERVATION_1GBPS_BYTES: u64 = 43 * 1024 * 1024;
 
 /// Fixed stack used by each bootstrap resolver worker.
 pub(crate) const DNS_WORKER_STACK_BYTES: usize = 512 * 1024;

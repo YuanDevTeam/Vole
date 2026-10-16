@@ -7,7 +7,7 @@ use std::{
 #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
 use std::{ffi::c_void, mem, ptr};
 
-use crate::limits::{MEMORY_OBSERVATION_CEILING_BYTES, MEMORY_OBSERVATION_TARGET_BYTES};
+use crate::limits::{MEMORY_OBSERVATION_1GBPS_BYTES, MEMORY_OBSERVATION_CEILING_BYTES};
 
 pub(crate) const TELEMETRY_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -15,9 +15,9 @@ pub(crate) const TELEMETRY_INTERVAL: Duration = Duration::from_secs(30);
 const TASK_VM_INFO: libc::task_flavor_t = 22;
 const THRESHOLDS: [MemoryThreshold; 2] = [
     MemoryThreshold {
-        bytes: MEMORY_OBSERVATION_TARGET_BYTES,
+        bytes: MEMORY_OBSERVATION_1GBPS_BYTES,
         bit: 1 << 0,
-        mib: 40,
+        mib: 43,
     },
     MemoryThreshold {
         bytes: MEMORY_OBSERVATION_CEILING_BYTES,
@@ -355,11 +355,11 @@ mod tests {
     #[test]
     fn thresholds_use_current_and_are_reported_only_once() {
         let policy = MemoryTelemetryPolicy::new();
-        let (snapshot, crossed) = sampled(&policy, 40 * 1024 * 1024 - 1, 100 * 1024 * 1024);
+        let (snapshot, crossed) = sampled(&policy, 43 * 1024 * 1024 - 1, 100 * 1024 * 1024);
         assert_eq!(snapshot.lifetime_peak_bytes, 100 * 1024 * 1024);
         assert_eq!(crossed, 0);
         assert_eq!(
-            sampled(&policy, 40 * 1024 * 1024, 100 * 1024 * 1024).1,
+            sampled(&policy, 43 * 1024 * 1024, 100 * 1024 * 1024).1,
             1 << 0
         );
         assert_eq!(
