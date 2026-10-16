@@ -836,7 +836,21 @@ impl OutboundConnector for VlessOutbound {
         let transport: Box<dyn DatagramTransport> = if self.encoding == VlessPacketEncoding::Xudp {
             let mut io = prepared.finish(VlessCommand::Mux, None).await?;
             context.run_io("VLESS XUDP request", io.flush()).await?;
-            Box::new(XudpTransport::with_budget(io, [0; 8], request.budget()))
+            let transport = XudpTransport::with_budget(io, [0; 8], request.budget());
+            // The H2 XHTTP driver owns accepted body writes and their bounded
+            // queue. Encryption may add its own buffered writer, so preserve
+            // the conservative flush contract for that additional layer.
+            Box::new(
+                if self.encryption.is_none()
+                    && self.xhttp.as_ref().is_some_and(|client| {
+                        client.http_version() == crate::config::XHttpVersion::Http2
+                    })
+                {
+                    transport.with_autonomous_writes()
+                } else {
+                    transport
+                },
+            )
         } else {
             Box::new(super::datagram::VlessDatagram::new(
                 prepared,

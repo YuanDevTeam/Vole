@@ -28,6 +28,7 @@ pub struct XudpTransport {
     max_response_payload_size: u16,
     max_request_payload_size: u16,
     first_write: bool,
+    flush_each_frame: bool,
     last_remote: Option<Destination>,
     multiple_remotes: bool,
     pending_write: Option<PendingWrite>,
@@ -85,6 +86,7 @@ impl XudpTransport {
             max_response_payload_size,
             max_request_payload_size: budget.transmit(),
             first_write: true,
+            flush_each_frame: true,
             last_remote: None,
             multiple_remotes: false,
             pending_write: None,
@@ -92,6 +94,13 @@ impl XudpTransport {
             max_receive_buffer_size,
             closed: false,
         }
+    }
+
+    /// Only for a supplied transport whose owned driver independently advances
+    /// every accepted write. Ordinary buffered streams retain per-frame flush.
+    pub(crate) fn with_autonomous_writes(mut self) -> Self {
+        self.flush_each_frame = false;
+        self
     }
 
     // A cancelled logical target may have submitted a frame prefix. Retain
@@ -107,7 +116,9 @@ impl XudpTransport {
                 }
                 pending.offset += written;
             }
-            stream.flush().await?;
+            if self.first_write || self.flush_each_frame {
+                stream.flush().await?;
+            }
             self.first_write = false;
             let remote = self.pending_write.take().expect("pending frame").remote;
             self.multiple_remotes |= self
@@ -425,6 +436,93 @@ pub(crate) fn encode_data_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FlushGate {
+        inner: tokio::io::DuplexStream,
+        blocked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl tokio::io::AsyncRead for FlushGate {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buffer)
+        }
+    }
+    impl tokio::io::AsyncWrite for FlushGate {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buffer)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.blocked.load(std::sync::atomic::Ordering::Relaxed) {
+                std::task::Poll::Pending
+            } else {
+                std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+            }
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn autonomous_upload_skips_only_established_frame_flush_barriers() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        for autonomous in [false, true] {
+            let (client, mut server) = tokio::io::duplex(256);
+            let blocked = Arc::new(AtomicBool::new(true));
+            let mut transport = XudpTransport::new(
+                Box::new(FlushGate {
+                    inner: client,
+                    blocked: blocked.clone(),
+                }),
+                [0; 8],
+                1452,
+            );
+            if autonomous {
+                transport = transport.with_autonomous_writes();
+            }
+            let packet = Datagram {
+                remote: "192.0.2.1:53"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap()
+                    .into(),
+                payload: Bytes::from_static(b"packet"),
+                sniffed_domain: None,
+            };
+            assert!(
+                futures_util::poll!(transport.send(packet.clone())).is_pending(),
+                "first frame must retain its setup flush"
+            );
+            blocked.store(false, Ordering::Relaxed);
+            // Finish the cancelled first frame without introducing a duplicate.
+            transport.flush_pending().await.unwrap();
+            blocked.store(true, Ordering::Relaxed);
+            let sent = futures_util::poll!(transport.send(packet.clone()));
+            assert_eq!(sent.is_ready(), autonomous);
+            blocked.store(false, Ordering::Relaxed);
+            transport.flush_pending().await.unwrap();
+            let mut expected = encode_data_frame(&packet, true, None).unwrap().to_vec();
+            expected.extend_from_slice(&encode_data_frame(&packet, false, None).unwrap());
+            let mut actual = vec![0; expected.len()];
+            server.read_exact(&mut actual).await.unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
 
     #[tokio::test]
     async fn shared_xudp_receives_frames_without_a_vless_response_header() {
