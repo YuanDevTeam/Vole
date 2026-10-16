@@ -162,7 +162,9 @@ pub(super) async fn http1(
     let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
         .max_headers(super::request::MAX_REQUEST_HEADERS)
         .max_buf_size(super::request::MAX_REQUEST_BYTES)
-        .writev(false)
+        // Keep body backings instead of flattening a full POST into the header
+        // buffer. Scalar TLS writers consume the queued slices incrementally.
+        .writev(true)
         .handshake(hyper_util::rt::TokioIo::new(io))
         .await
         .map_err(h1_failure)?;
@@ -467,3 +469,7 @@ impl Download {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "http1_memory_tests.rs"]
+mod memory_tests;
