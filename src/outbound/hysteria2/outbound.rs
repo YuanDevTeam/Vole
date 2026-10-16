@@ -16,6 +16,8 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     io,
     sync::{Arc, Mutex},
     time::Duration,
@@ -26,14 +28,15 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-/// A node owns its authenticated connection and every driver used by that
-/// connection. Individual streams never own the shared cancellation token.
+/// A node owns its authenticated sessions and all their drivers. Individual
+/// streams never own a shared session's cancellation token.
 pub struct Hysteria2Outbound {
     config: Arc<Hysteria2OutboundConfig>,
     server: Destination,
     upstream: UpstreamPath,
     tls: StandardTlsClient,
-    current: AsyncMutex<Option<Arc<Session>>>,
+    current: Box<[AsyncMutex<Option<Arc<Session>>>]>,
+    pacer: Arc<super::bandwidth::Pacer>,
     cancel: CancellationToken,
     admission: Mutex<()>,
     tasks: TaskTracker,
@@ -58,15 +61,18 @@ impl Hysteria2Outbound {
     /// Test-only controller/path evidence; no configuration or traffic addresses.
     #[cfg(feature = "interop-test")]
     pub async fn congestion_observation(&self) -> Option<(u64, quinn::ConnectionStats)> {
-        self.current.lock().await.as_ref().map(|session| {
-            (
-                session
-                    .bandwidth
-                    .rate
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                session.connection.stats(),
-            )
-        })
+        for slot in &self.current {
+            if let Some(session) = slot.lock().await.as_ref() {
+                return Some((
+                    session
+                        .bandwidth
+                        .rate
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    session.connection.stats(),
+                ));
+            }
+        }
+        None
     }
     pub fn new_with_path(
         config: &Hysteria2OutboundConfig,
@@ -109,12 +115,23 @@ impl Hysteria2Outbound {
             resumption_sessions,
             buffer_limit,
         )?;
+        // Explicit bandwidth modes spread UDP receive/forward work across a
+        // small fixed pool. A one-byte receive declaration cannot be divided.
+        let count = if (config.up > 0 || config.down > 0) && config.down != 1 {
+            crate::limits::HY2_AUTH_SESSIONS
+        } else {
+            1
+        };
         Ok(Self {
             config: Arc::new(config.clone()),
             server: server_destination(&config.address, config.port)?,
             upstream,
             tls,
-            current: AsyncMutex::new(None),
+            current: (0..count)
+                .map(|_| AsyncMutex::new(None))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            pacer: Arc::new(super::bandwidth::Pacer::default()),
             cancel: CancellationToken::new(),
             admission: Mutex::new(()),
             tasks: TaskTracker::new(),
@@ -130,10 +147,13 @@ impl Hysteria2Outbound {
             return Err(DispatchError::TimedOut);
         }
         let _waiter = observation::track(ResourceKind::Waiter);
+        let mut hash = DefaultHasher::new();
+        datagram.source.hash(&mut hash);
+        let index = (hash.finish() % self.current.len() as u64) as usize;
         tokio::select! {biased;
             () = self.cancel.cancelled() => Err(DispatchError::NotAllowed),
             result = context.run("Hysteria2 session", async {
-                let mut current = self.current.lock().await;
+                let mut current = self.current[index].lock().await;
                 if let Some(session) = current.as_ref().filter(|session|
                     !session.cancel.is_cancelled() && session.connection.close_reason().is_none()) {
                     return Ok(session.clone());
@@ -153,10 +173,13 @@ impl Hysteria2Outbound {
                     let server = self.server.clone();
                     let tls = self.tls.clone();
                     let context = context.clone();
+                    let bandwidth = Arc::new(super::bandwidth::Bandwidth::with_pacer(self.pacer.clone()));
+                    let count = self.current.len() as u64;
+                    let receive_rate = self.config.down / count + u64::from((index as u64) < self.config.down % count);
                     let task = observation::track(ResourceKind::Task);
                     self.tasks.spawn(observation::bind(async move {
                         let _task = task;
-                        drive(config, upstream, server, tls, datagram, context, cancel, ready).await;
+                        drive(config, upstream, server, tls, datagram, context, cancel, ready, bandwidth, receive_rate, count as usize).await;
                     }));
                 }
                 let session = reply.await.map_err(|_| DispatchError::ConnectionRefused)??;
@@ -223,7 +246,9 @@ impl OutboundConnector for Hysteria2Outbound {
     async fn shutdown(&self) {
         self.begin_shutdown();
         self.tasks.wait().await;
-        self.current.lock().await.take();
+        for slot in &self.current {
+            slot.lock().await.take();
+        }
     }
 }
 
@@ -243,13 +268,16 @@ async fn drive(
     context: EstablishContext,
     cancel: CancellationToken,
     ready: oneshot::Sender<Result<Arc<Session>, DispatchError>>,
+    bandwidth: Arc<super::bandwidth::Bandwidth>,
+    receive_rate: u64,
+    session_count: usize,
 ) {
     let runtime = Arc::new(OwnedRuntime::new(CancellationToken::new()));
     let mut ready = Some(ready);
     let mut endpoint = None;
     let mut paths = None;
-    let datagrams = Arc::new(super::datagram::Registry::default());
-    let bandwidth = Arc::new(super::bandwidth::Bandwidth::default());
+    let (datagrams, submissions) = super::datagram::Registry::new();
+    let datagrams = Arc::new(datagrams);
     let _pool = observation::track(ResourceKind::Pool);
     let established = CancellationToken::new();
     let deadline = context.deadline();
@@ -285,8 +313,10 @@ async fn drive(
             .max_concurrent_bidi_streams(0_u8.into())
             .max_concurrent_uni_streams((crate::limits::HY2_UNI_STREAMS as u32).into())
             .send_window(crate::limits::HY2_SEND_WINDOW as u64)
-            .datagram_receive_buffer_size(Some(crate::limits::HY2_DATAGRAM_RECEIVE_BUFFER))
-            .datagram_send_buffer_size(crate::limits::HY2_DATAGRAM_SEND_BUFFER)
+            .datagram_receive_buffer_size(Some(
+                crate::limits::HY2_DATAGRAM_RECEIVE_BUFFER / session_count,
+            ))
+            .datagram_send_buffer_size(crate::limits::HY2_DATAGRAM_SEND_BUFFER / session_count)
             .max_idle_timeout(Some(Duration::from_secs(30).try_into().map_err(failure)?))
             .keep_alive_interval(Some(Duration::from_secs(10)))
             .congestion_controller_factory(bandwidth.clone());
@@ -318,7 +348,7 @@ async fn drive(
                 "Hysteria-Auth",
                 http::HeaderValue::from_bytes(config.password.as_bytes()).map_err(failure)?,
             )
-            .header("Hysteria-CC-RX", config.down.to_string())
+            .header("Hysteria-CC-RX", receive_rate.to_string())
             .header("Hysteria-Padding", "padding")
             .body(())
             .map_err(failure)?;
@@ -371,6 +401,7 @@ async fn drive(
             _ = connection.closed() => {},
             _ = control.wait_idle() => {},
             _ = super::datagram::receive(&connection, &datagrams) => {},
+            _ = super::datagram::transmit(&connection, &datagrams, submissions) => {},
             _ = paths.as_mut().unwrap().hopping(endpoint.as_ref().unwrap()) => {},
         }
         drop(requests);

@@ -26,10 +26,16 @@ const PENDING_PACKETS: usize = crate::limits::HY2_PENDING_PACKETS;
 const PENDING_BYTES: usize = crate::limits::HY2_PENDING_BYTES;
 const TTL: Duration = Duration::from_secs(crate::limits::HY2_FRAGMENT_TTL_SECONDS as u64);
 
-#[derive(Default)]
 pub(super) struct Registry {
     next: AtomicU32,
     entries: Mutex<HashMap<u32, Registration>>,
+    outgoing: mpsc::Sender<Submission>,
+}
+pub(super) struct Submission {
+    session: u32,
+    packet: u16,
+    datagram: Datagram,
+    mtu: u16,
 }
 struct Registration {
     sender: mpsc::Sender<Datagram>,
@@ -38,6 +44,17 @@ struct Registration {
 }
 
 impl Registry {
+    pub fn new() -> (Self, mpsc::Receiver<Submission>) {
+        let (outgoing, submissions) = mpsc::channel(crate::limits::HY2_SUBMISSION_QUEUE);
+        (
+            Self {
+                next: AtomicU32::new(0),
+                entries: Mutex::new(HashMap::new()),
+                outgoing,
+            },
+            submissions,
+        )
+    }
     pub fn open(
         self: &Arc<Self>,
         connection: quinn::Connection,
@@ -129,30 +146,28 @@ impl DatagramTransport for Transport {
         if self.closed || self.cancel.is_cancelled() {
             return Err(DispatchError::NotAllowed);
         }
-        if datagram.payload.len() > usize::from(self.payload_budget(&datagram.remote).transmit()) {
+        if datagram.remote.port() == 0
+            || self.message_budget() <= header(&datagram.remote).len()
+            || datagram.payload.len()
+                > usize::from(self.payload_budget(&datagram.remote).transmit())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Hysteria2 datagram exceeds payload budget",
             )
             .into());
         }
-        let packets = encode(
-            self.id,
-            self.packet,
-            &datagram.remote,
-            &datagram.payload,
-            self.message_budget(),
-        )?;
+        let permit = tokio::select! {biased;
+            () = self.cancel.cancelled() => return Err(DispatchError::NotAllowed),
+            permit = self.registry.outgoing.reserve() => permit.map_err(|_| DispatchError::ConnectionRefused)?,
+        };
+        permit.send(Submission {
+            session: self.id,
+            packet: self.packet,
+            datagram,
+            mtu: self.mtu,
+        });
         self.packet = self.packet.wrapping_add(1);
-        for (index, packet) in packets.into_iter().enumerate() {
-            tokio::select! {biased;
-                () = self.cancel.cancelled() => return Err(DispatchError::NotAllowed),
-                result = self.connection.send_datagram_wait(packet) => result.map_err(|_| DispatchError::ConnectionRefused)?,
-            }
-            if (index + 1) % crate::limits::IO_POLL_BUDGET == 0 {
-                tokio::task::yield_now().await;
-            }
-        }
         Ok(())
     }
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
@@ -168,6 +183,52 @@ impl DatagramTransport for Transport {
         self.close_local();
         Ok(())
     }
+}
+
+/// Driven beside receive in the connection's existing owner. Queue raw payloads
+/// so only this one active message retains encoded fragments under backpressure.
+pub(super) async fn transmit(
+    connection: &quinn::Connection,
+    registry: &Registry,
+    mut submissions: mpsc::Receiver<Submission>,
+) -> Result<(), DispatchError> {
+    let mut processed = 0;
+    while let Some(submission) = submissions.recv().await {
+        if registry
+            .entries
+            .lock()
+            .unwrap()
+            .contains_key(&submission.session)
+        {
+            let mtu = connection
+                .max_datagram_size()
+                .unwrap_or(0)
+                .min(usize::from(submission.mtu));
+            // A path/peer limit can shrink after admission. Drop the whole
+            // message instead of truncating or closing sibling associations.
+            if let Ok(packets) = encode(
+                submission.session,
+                submission.packet,
+                &submission.datagram.remote,
+                &submission.datagram.payload,
+                mtu,
+            ) {
+                for packet in packets {
+                    match connection.send_datagram_wait(packet).await {
+                        Ok(()) => {}
+                        Err(quinn::SendDatagramError::TooLarge) => break,
+                        Err(_) => return Err(DispatchError::ConnectionRefused),
+                    }
+                    processed += 1;
+                    if processed == crate::limits::IO_POLL_BUDGET {
+                        processed = 0;
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        }
+    }
+    Err(DispatchError::ConnectionRefused)
 }
 
 fn header(peer: &Destination) -> Vec<u8> {

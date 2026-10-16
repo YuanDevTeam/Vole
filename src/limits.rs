@@ -43,6 +43,8 @@ pub const YAMUX_CONNECTION_WINDOW: usize = YAMUX_CONNECTION_ADMISSIONS * 256 * 1
 /// Hysteria2 per-packet, per-association and per-connection retained bounds.
 pub const HY2_UDP_PAYLOAD: usize = 4096;
 pub const HY2_UDP_QUEUE: usize = 32;
+pub const HY2_SUBMISSION_QUEUE: usize = 32;
+pub const HY2_AUTH_SESSIONS: usize = 2;
 pub const HY2_PENDING_PACKETS: usize = 64;
 pub const HY2_PENDING_BYTES: usize = 256 * 1024;
 pub const HY2_FRAGMENT_TTL_SECONDS: usize = 5;
@@ -50,7 +52,7 @@ pub const HY2_PATH_RETIRE_SECONDS: usize = 1;
 pub const HY2_QUIC_PAYLOAD: usize = 1400;
 pub const HY2_UNI_STREAMS: usize = 8;
 pub const HY2_SEND_WINDOW: usize = 1024 * 1024;
-pub const HY2_DATAGRAM_SEND_BUFFER: usize = 256 * 1024;
+pub const HY2_DATAGRAM_SEND_BUFFER: usize = 4 * 1024 * 1024;
 pub const HY2_DATAGRAM_RECEIVE_BUFFER: usize = 1024 * 1024;
 pub const HY2_AUTH_HEADERS: usize = 16384;
 pub const HY2_RESPONSE_MESSAGE: usize = 2048;

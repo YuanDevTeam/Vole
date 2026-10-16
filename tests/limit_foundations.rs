@@ -32,6 +32,8 @@ fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
         ),
         ("hy2-udp-payload", vole::limits::HY2_UDP_PAYLOAD),
         ("hy2-udp-queue", vole::limits::HY2_UDP_QUEUE),
+        ("hy2-submission-queue", vole::limits::HY2_SUBMISSION_QUEUE),
+        ("hy2-auth-sessions", vole::limits::HY2_AUTH_SESSIONS),
         ("hy2-pending-packets", vole::limits::HY2_PENDING_PACKETS),
         ("hy2-pending-bytes", vole::limits::HY2_PENDING_BYTES),
         ("hy2-fragment-ttl", vole::limits::HY2_FRAGMENT_TTL_SECONDS),

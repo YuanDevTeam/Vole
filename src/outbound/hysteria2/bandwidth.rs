@@ -63,18 +63,25 @@ impl Bucket {
 pub(super) struct Bandwidth {
     pub rate: AtomicU64,
     ratio: AtomicU64,
+    pacer: Arc<Pacer>,
+}
+#[derive(Default)]
+pub(super) struct Pacer {
     bucket: Mutex<Bucket>,
 }
 impl Default for Bandwidth {
     fn default() -> Self {
-        Self {
-            rate: AtomicU64::new(0),
-            ratio: AtomicU64::new(1_000_000),
-            bucket: Mutex::new(Bucket::default()),
-        }
+        Self::with_pacer(Arc::new(Pacer::default()))
     }
 }
 impl Bandwidth {
+    pub fn with_pacer(pacer: Arc<Pacer>) -> Self {
+        Self {
+            rate: AtomicU64::new(0),
+            ratio: AtomicU64::new(1_000_000),
+            pacer,
+        }
+    }
     pub fn wrap(
         self: &Arc<Self>,
         inner: Box<dyn DatagramTransport>,
@@ -93,10 +100,14 @@ impl Bandwidth {
     }
     pub async fn pace(&self, bytes: usize, mtu: u16) {
         loop {
-            let delay = self.bucket.lock().unwrap().claim(
+            let rate = self.compensated();
+            if rate == 0 {
+                return;
+            }
+            let delay = self.pacer.bucket.lock().unwrap().claim(
                 tokio::time::Instant::now().into_std(),
                 bytes,
-                self.compensated(),
+                rate,
                 mtu,
             );
             if delay.is_zero() {
@@ -285,6 +296,32 @@ pub(super) fn negotiate(up: u64, server: &[u8]) -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn sibling_connections_share_one_wire_credit_bucket() {
+        #[cfg(feature = "interop-test")]
+        let _case = crate::resources::case_events::Case::new(
+            "HYSTERIA2-UNIT",
+            "sibling_connections_share_one_wire_credit_bucket",
+        );
+        let pacer = std::sync::Arc::new(super::Pacer::default());
+        let first = super::Bandwidth::with_pacer(pacer.clone());
+        let second = super::Bandwidth::with_pacer(pacer.clone());
+        for connection in [&first, &second] {
+            connection
+                .rate
+                .store(125000, std::sync::atomic::Ordering::Relaxed);
+            for _ in 0..5 {
+                connection.pace(1400, 1400).await;
+            }
+        }
+        // An automatic connection must not reset the fixed-rate budget.
+        super::Bandwidth::with_pacer(pacer).pace(1400, 1400).await;
+        let mut pending = Box::pin(first.pace(1400, 1400));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        tokio::time::advance(std::time::Duration::from_millis(12)).await;
+        assert!(futures_util::poll!(pending.as_mut()).is_ready());
+    }
+
     #[test]
     fn pacer_limits_actual_bytes_after_one_bounded_burst() {
         #[cfg(feature = "interop-test")]

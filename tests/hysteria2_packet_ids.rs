@@ -4,7 +4,10 @@ use bytes::Bytes;
 use std::{
     io::IoSliceMut,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -117,6 +120,8 @@ async fn completed_fragment_id_can_be_reused_without_losing_the_next_datagram() 
     );
     let client_address = "192.0.2.2:1234".parse().unwrap();
     let (client_io, endpoint, _) = memory_fixture();
+    let queued_packets = Arc::new(AtomicUsize::new(0));
+    let peer_queued_packets = queued_packets.clone();
     let peer = tokio::spawn(async move {
         let connection = endpoint.accept().await.unwrap().await.unwrap();
         let mut h3 = h3::server::builder()
@@ -146,11 +151,34 @@ async fn completed_fragment_id_can_be_reused_without_losing_the_next_datagram() 
         response.finish().await.unwrap();
         // Native Hysteria randomizes its 16-bit Packet ID. A completed ID can
         // recur, including immediately; Mihomo releases the completed pieces.
+        let mut sibling_packet_ids = Vec::new();
         for (sequence, id) in [17_u16, 18, 17, 17].into_iter().enumerate() {
-            let Ok(request) = connection.read_datagram().await else {
-                break;
+            let request = loop {
+                let Ok(request) = connection.read_datagram().await else {
+                    break None;
+                };
+                if request[..4] != [0; 4] {
+                    sibling_packet_ids.push(u16::from_be_bytes([request[4], request[5]]));
+                    continue;
+                }
+                // Saturation traffic is deliberately fragmented. The
+                // cancelled admission must not consume another Packet ID.
+                if request[7] > 1 {
+                    continue;
+                }
+                break Some(request);
             };
+            let Some(request) = request else { break };
             let target = format!("192.0.2.{}:53", sequence + 10);
+            assert_eq!(
+                u16::from_be_bytes([request[4], request[5]]),
+                (sequence
+                    + if sequence > 0 {
+                        peer_queued_packets.load(Ordering::Relaxed)
+                    } else {
+                        0
+                    }) as u16
+            );
             assert_eq!(&request[6..8], &[0, 1]);
             assert_eq!(usize::from(request[8]), target.len());
             assert_eq!(&request[9..request.len() - 1], target.as_bytes());
@@ -170,8 +198,9 @@ async fn completed_fragment_id_can_be_reused_without_losing_the_next_datagram() 
         drop(h3);
         endpoint.close(0_u32.into(), b"");
         endpoint.wait_idle().await;
+        sibling_packet_ids
     });
-    let config = Config::parse_yaml(br#"{"mixed-port":1080,"proxies":[{"name":"peer","type":"hysteria2","server":"192.0.2.1","port":443,"udp":true,"skip-cert-verify":true,"sni":"fixture.invalid"}],"rules":["MATCH,peer"]}"#).unwrap();
+    let config = Config::parse_yaml(br#"{"mixed-port":1080,"proxies":[{"name":"peer","type":"hysteria2","server":"192.0.2.1","port":443,"udp":true,"udp-mtu":64,"skip-cert-verify":true,"sni":"fixture.invalid"}],"rules":["MATCH,peer"]}"#).unwrap();
     let ProxyProtocol::Hysteria2(config) = &config.proxies[0].protocol else {
         panic!("protocol")
     };
@@ -193,32 +222,121 @@ async fn completed_fragment_id_can_be_reused_without_losing_the_next_datagram() 
     .await
     .expect("memory peer must authenticate")
     .unwrap();
+    let mut sibling = outbound
+        .open_datagram(
+            DatagramRequest::new(DatagramSession::new(
+                InboundKind::InternalMeasure,
+                "192.0.2.2:1235".parse().unwrap(),
+            )),
+            &EstablishContext::default(),
+        )
+        .await
+        .unwrap();
     let shareable = udp.supports_shared_destinations();
     let mut delivered = Vec::new();
+    let mut shared_sender_blocked = false;
+    let mut shutdown_rejected_admission = false;
+    let mut shutdown_queued = 0;
     let outcome = tokio::time::timeout(Duration::from_secs(2), async {
         for sequence in 0..4 {
             assert!(futures_util::poll!(udp.receive()).is_pending());
             let target = Destination::Ip(format!("192.0.2.{}:53", sequence + 10).parse().unwrap());
-            udp.send(Datagram {
+            let request = Datagram {
                 remote: target.clone(),
                 payload: vec![sequence].into(),
                 sniffed_domain: None,
-            })
-            .await
-            .unwrap();
+            };
+            if sequence == 1 {
+                let large = Datagram {
+                    payload: vec![sequence; 4096].into(),
+                    ..request.clone()
+                };
+                loop {
+                    let mut pending = Box::pin(tokio::task::unconstrained(udp.send(large.clone())));
+                    if let Poll::Ready(result) = futures_util::poll!(pending.as_mut()) {
+                        result.unwrap();
+                        drop(pending);
+                        let accepted = queued_packets.fetch_add(1, Ordering::Relaxed) + 1;
+                        assert!(accepted <= vole::limits::HY2_SUBMISSION_QUEUE);
+                        continue;
+                    }
+                    let probe = Datagram {
+                        remote: target.clone(),
+                        payload: vec![255].into(),
+                        sniffed_domain: None,
+                    };
+                    let mut waiting =
+                        Box::pin(tokio::task::unconstrained(sibling.send(probe.clone())));
+                    shared_sender_blocked = match futures_util::poll!(waiting.as_mut()) {
+                        Poll::Pending => true,
+                        Poll::Ready(result) => {
+                            result.unwrap();
+                            false
+                        }
+                    };
+                    drop(waiting);
+                    drop(pending);
+                    if shared_sender_blocked {
+                        sibling.send(probe).await.unwrap();
+                    }
+                    break;
+                }
+            }
+            udp.send(request).await.unwrap();
             let reply = udp.receive().await.unwrap();
             assert_eq!(reply.remote, target);
             assert_eq!(reply.payload, vec![sequence; 100]);
             delivered.push(sequence);
         }
+        let mut admitted = 0;
+        loop {
+            let mut pending = Box::pin(tokio::task::unconstrained(udp.send(Datagram {
+                remote: Destination::Ip("192.0.2.13:53".parse().unwrap()),
+                payload: vec![0; 4096].into(),
+                sniffed_domain: None,
+            })));
+            if let Poll::Ready(result) = futures_util::poll!(pending.as_mut()) {
+                result.unwrap();
+                drop(pending);
+                admitted += 1;
+                assert!(admitted <= vole::limits::HY2_SUBMISSION_QUEUE);
+                continue;
+            }
+            outbound.begin_shutdown();
+            shutdown_queued = admitted;
+            shutdown_rejected_admission = matches!(
+                pending.await,
+                Err(vole::dispatch::DispatchError::NotAllowed)
+            );
+            break;
+        }
+        sibling.close().await.unwrap();
         udp.close().await.unwrap();
     })
     .await;
     outbound.shutdown().await;
-    tokio::time::timeout(Duration::from_secs(2), peer)
+    let sibling_packet_ids = tokio::time::timeout(Duration::from_secs(2), peer)
         .await
         .unwrap()
         .unwrap();
+    assert!(
+        shared_sender_blocked,
+        "a sibling bypassed the saturated connection queue"
+    );
+    assert_eq!(
+        queued_packets.load(Ordering::Relaxed),
+        vole::limits::HY2_SUBMISSION_QUEUE
+    );
+    assert_eq!(shutdown_queued, vole::limits::HY2_SUBMISSION_QUEUE);
+    assert!(
+        shutdown_rejected_admission,
+        "Stop admitted a queued UDP send"
+    );
+    assert_eq!(
+        sibling_packet_ids,
+        [0],
+        "a cancelled writer reserved a Packet ID"
+    );
     assert_eq!(
         delivered,
         [0, 1, 2, 3],
@@ -371,5 +489,148 @@ async fn configured_handshake_timeout_bounds_quic_and_auth_but_not_ready_session
         tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle())
             .await
             .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn explicit_bandwidth_sessions_preserve_node_budget_and_join_together() {
+    use std::collections::VecDeque;
+    use vole::{dispatch::DispatchError, outbound::ConnectedStream, session::StreamSession};
+    #[cfg(feature = "interop-test")]
+    let _case = vole::resources::case_events::Case::new(
+        "INTEGRATION-ADAPTER",
+        "hysteria2_explicit_bandwidth_session_pool",
+    );
+    struct Links(Mutex<VecDeque<MemoryPackets>>);
+    #[async_trait::async_trait]
+    impl OutboundConnector for Links {
+        async fn connect_stream(
+            &self,
+            _: StreamSession,
+            _: &EstablishContext,
+        ) -> Result<ConnectedStream, DispatchError> {
+            Err(DispatchError::NotAllowed)
+        }
+        async fn open_datagram(
+            &self,
+            _: DatagramRequest,
+            _: &EstablishContext,
+        ) -> Result<Box<dyn vole::dispatch::DatagramTransport>, DispatchError> {
+            self.0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .map(|link| Box::new(link) as Box<dyn vole::dispatch::DatagramTransport>)
+                .ok_or(DispatchError::NotAllowed)
+        }
+    }
+    for (down, expected) in [(5, vec![2_u64, 3]), (1, vec![1])] {
+        let mut links = VecDeque::new();
+        let mut servers = Vec::new();
+        let mut peers = Vec::new();
+        for _ in &expected {
+            let (link, endpoint, _) = memory_fixture();
+            links.push_back(link);
+            servers.push(endpoint.clone());
+            peers.push(tokio::spawn(async move {
+                let connection = endpoint.accept().await.unwrap().await.unwrap();
+                let mut h3 = h3::server::builder()
+                    .build::<_, Bytes>(h3_quinn::Connection::new(connection.clone()))
+                    .await
+                    .unwrap();
+                let (request, mut response) = h3
+                    .accept()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .resolve_request()
+                    .await
+                    .unwrap();
+                let declared: u64 = request.headers()["Hysteria-CC-RX"]
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                response
+                    .send_response(
+                        http::Response::builder()
+                            .status(233)
+                            .header("Hysteria-UDP", "true")
+                            .header("Hysteria-CC-RX", "0")
+                            .body(())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                response.finish().await.unwrap();
+                while let Ok(packet) = connection.read_datagram().await {
+                    if connection.send_datagram_wait(packet).await.is_err() {
+                        break;
+                    }
+                }
+                drop(h3);
+                endpoint.close(0_u32.into(), b"");
+                endpoint.wait_idle().await;
+                declared
+            }));
+        }
+        let upstream = Arc::new(Links(Mutex::new(links)));
+        let yaml = format!(
+            r#"{{"proxies":[{{"name":"peer","type":"hysteria2","server":"192.0.2.1","port":443,"udp":true,"up":"1 Mbps","down":"{down} Bps","skip-cert-verify":true,"sni":"fixture.invalid"}}],"rules":["MATCH,peer"]}}"#
+        );
+        let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        let ProxyProtocol::Hysteria2(config) = &config.proxies[0].protocol else {
+            panic!("protocol")
+        };
+        let outbound =
+            Hysteria2Outbound::new_with_path(config, UpstreamPath::proxy(upstream.clone()))
+                .unwrap();
+        let mut correct = Vec::new();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+            for index in 0..32_u8 {
+                let mut udp = outbound
+                    .open_datagram(
+                        DatagramRequest::new(DatagramSession::new(
+                            InboundKind::InternalMeasure,
+                            SocketAddr::from(([192, 0, 2, 2], 20000 + u16::from(index))),
+                        )),
+                        &EstablishContext::default(),
+                    )
+                    .await?;
+                let remote = Destination::Ip("192.0.2.10:53".parse().unwrap());
+                udp.send(Datagram {
+                    remote: remote.clone(),
+                    payload: vec![index].into(),
+                    sniffed_domain: None,
+                })
+                .await?;
+                let reply = udp.receive().await?;
+                correct.push(reply.remote == remote && reply.payload == [index][..]);
+                udp.close().await?;
+            }
+            Ok::<_, DispatchError>(())
+        })
+        .await;
+        outbound.shutdown().await;
+        for server in servers {
+            server.close(0_u32.into(), b"");
+        }
+        let mut declared = Vec::new();
+        for peer in peers {
+            declared.push(
+                tokio::time::timeout(Duration::from_secs(2), peer)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        outcome.unwrap().unwrap();
+        declared.sort_unstable();
+        assert_eq!(
+            declared, expected,
+            "receive declarations changed the node budget"
+        );
+        assert_eq!(correct, vec![true; 32]);
+        assert!(upstream.0.lock().unwrap().is_empty());
     }
 }

@@ -797,6 +797,28 @@
       ]
     },
     {
+      "id": "hy2-submission-queue",
+      "value": 32,
+      "unit": "messages-per-connection",
+      "owner": "limits::HY2_SUBMISSION_QUEUE",
+      "saturation": "wait before reserving a Packet ID or encoding fragments",
+      "cancellation": "cancel pending admission; connection Stop drops queued messages and joins its existing owner",
+      "boundary_cases": [
+        "INTEGRATION-ADAPTER"
+      ]
+    },
+    {
+      "id": "hy2-auth-sessions",
+      "value": 2,
+      "unit": "current-connections-per-node",
+      "owner": "limits::HY2_AUTH_SESSIONS",
+      "saturation": "reuse the source-selected slot; replace only a closed session",
+      "cancellation": "close admission and cancel/join every authenticated session",
+      "boundary_cases": [
+        "INTEGRATION-ADAPTER"
+      ]
+    },
+    {
       "id": "hy2-pending-packets",
       "value": 64,
       "unit": "partial-packets-per-connection",
@@ -882,8 +904,8 @@
     },
     {
       "id": "hy2-datagram-send-buffer",
-      "value": 262144,
-      "unit": "bytes",
+      "value": 4194304,
+      "unit": "bytes-per-node",
       "owner": "limits::HY2_DATAGRAM_SEND_BUFFER",
       "saturation": "bound retained outgoing QUIC datagrams; sends wait for capacity",
       "cancellation": "owned logical close or physical session Stop releases retained state and joins drivers",
@@ -895,7 +917,7 @@
     {
       "id": "hy2-datagram-receive-buffer",
       "value": 1048576,
-      "unit": "bytes",
+      "unit": "bytes-per-node",
       "owner": "limits::HY2_DATAGRAM_RECEIVE_BUFFER",
       "saturation": "bound retained incoming QUIC datagrams; Quinn drops old frames when full",
       "cancellation": "owned logical close or physical session Stop releases retained state and joins drivers",
