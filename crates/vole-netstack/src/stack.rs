@@ -637,40 +637,47 @@ impl Driver {
     async fn run(mut self) {
         loop {
             self.drive();
-            if self.cancellation.is_cancelled() {
+            if self.cancellation.is_cancelled() || !self.wait_for_work().await {
                 break;
             }
+        }
+    }
 
-            let delay = self.next_delay();
-            let has_connect_requests = self
-                .client
-                .as_ref()
-                .is_some_and(|client| !client.requests.is_closed());
-            tokio::select! {
-                biased;
-                () = self.cancellation.cancelled() => break,
-                () = self.notify.notified() => {}
-                // A full output still allows one ingress classification:
-                // low-priority ICMP drops immediately, while TCP retains its
-                // one pending packet until output capacity returns.
-                packet = self.raw_inbound.recv(), if self.device.rx_is_empty() => {
-                    let Some(packet) = packet else { break; };
-                    let batch_count = self.handle_packet_batch(packet);
-                    // recv() already charges the first packet. try_recv()
-                    // does not, so retain the old per-packet cooperative
-                    // accounting without repeating socket maintenance.
-                    for _ in 1..batch_count {
-                        tokio::task::consume_budget().await;
-                    }
+    async fn wait_for_work(&mut self) -> bool {
+        let delay = self.next_delay();
+        let has_connect_requests = self
+            .client
+            .as_ref()
+            .is_some_and(|client| !client.requests.is_closed());
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => false,
+            // A full output still allows one ingress classification:
+            // low-priority ICMP drops immediately, while TCP retains its
+            // one pending packet until output capacity returns.
+            packet = self.raw_inbound.recv(), if self.device.rx_is_empty() => {
+                let Some(packet) = packet else { return false; };
+                let batch_count = self.handle_packet_batch(packet);
+                // recv() already charges the first packet. try_recv()
+                // does not, so retain the old per-packet cooperative
+                // accounting without repeating socket maintenance.
+                for _ in 1..batch_count {
+                    tokio::task::consume_budget().await;
                 }
-                request = Self::next_request(&mut self.client), if has_connect_requests => {
-                    if let Some(request) = request {
-                        self.handle_client_request(request);
-                        tokio::task::consume_budget().await;
-                    }
-                }
-                () = tokio::time::sleep(delay) => {}
+                true
             }
+            // Socket maintenance runs before this wait on every iteration.
+            // Its own notifications must not outrank an already-ready packet,
+            // especially TCP ACKs which release the relay's bounded buffers.
+            () = self.notify.notified() => true,
+            request = Self::next_request(&mut self.client), if has_connect_requests => {
+                if let Some(request) = request {
+                    self.handle_client_request(request);
+                    tokio::task::consume_budget().await;
+                }
+                true
+            }
+            () = tokio::time::sleep(delay) => true,
         }
     }
 
@@ -1336,6 +1343,52 @@ mod tests {
         }
         ip.fill_checksum();
         Packet::new(ip.into_inner())
+    }
+
+    #[tokio::test]
+    async fn ready_ingress_progresses_before_repeated_app_notifications() {
+        for cancelled in [false, true] {
+            let config = NetStackConfig::default();
+            let (sender, inbound) = mpsc::channel(config.packet_queue);
+            let (outbound, _packets) = mpsc::channel(config.packet_queue);
+            let (accept, _streams) = mpsc::channel(config.tcp_accept_queue);
+            let (stopped, _) = watch::channel(false);
+            let cancellation = CancellationToken::new();
+            let notify = Arc::new(Notify::new());
+            let mut driver = Driver::new(
+                config,
+                inbound,
+                outbound,
+                Some(accept),
+                None,
+                cancellation.clone(),
+                notify.clone(),
+                NetStackStats::default(),
+                stopped,
+            );
+            sender.try_send(tcp_handshake_packet(100, None)).unwrap();
+            // Application writes and output capacity recovery can make this
+            // notification ready on every iteration of a busy duplex relay.
+            for _ in 0..3 {
+                notify.notify_one();
+                if cancelled {
+                    cancellation.cancel();
+                }
+                let running = driver.wait_for_work().await;
+                assert_eq!(running, !cancelled);
+                if cancelled {
+                    assert_eq!(driver.raw_inbound.len(), 1);
+                    assert!(driver.tcp_entries.is_empty());
+                    break;
+                }
+                assert!(
+                    driver.raw_inbound.is_empty(),
+                    "ready IP input lost to app notification"
+                );
+                assert_eq!(driver.tcp_entries.len(), 1);
+                sender.try_send(tcp_handshake_packet(100, None)).unwrap();
+            }
+        }
     }
 
     #[tokio::test]

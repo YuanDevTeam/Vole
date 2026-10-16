@@ -441,9 +441,16 @@ async fn tun_read_inner(
                 udp.offer(datagram);
                 continue;
             }
-            // A full TCP/ICMP handoff drops this complete IP packet. Awaiting
-            // capacity here would also stall unrelated UDP and DNS ingress.
-            match packet_sink.try_send(Packet::new(Bytes::copy_from_slice(packet))) {
+            // Give a transiently full handoff one scheduling turn to drain.
+            // Persistent pressure still drops this packet, keeping unrelated
+            // UDP and DNS ingress independent of TCP capacity.
+            match offer_netstack_packet(
+                &packet_sink,
+                Packet::new(Bytes::copy_from_slice(packet)),
+                &cancellation,
+            )
+            .await
+            {
                 Ok(()) => {
                     if !first_ingress_logged {
                         tracing::info!("netstack accepted first TUN packet");
@@ -471,11 +478,40 @@ async fn tun_read_inner(
             }
         }
         result.map_err(vole_to_io)?;
-        // try_send / borrowed UDP classification have no channel await. Charge
-        // actual packets, including locally dropped ones, after each <=8 batch.
+        // Fast-path packet and borrowed UDP offers have no channel await.
+        // Charge every packet, including drops, after each <=8 batch.
         for _ in 0..processed {
             tokio::task::consume_budget().await;
         }
+    }
+}
+
+async fn offer_netstack_packet(
+    sink: &PacketSink,
+    packet: Packet,
+    cancellation: &CancellationToken,
+) -> Result<(), NetStackError> {
+    if cancellation.is_cancelled() {
+        return Err(NetStackError::Stopped);
+    }
+    match sink.try_send(packet.clone()) {
+        Err(NetStackError::Backpressure) => {}
+        result => return result,
+    }
+    // Reserve the next available slot without waiting indefinitely. Holding
+    // this one packet across a yield does not create another ingress queue.
+    let send = sink.send(packet);
+    tokio::pin!(send);
+    if let std::task::Poll::Ready(result) = futures_util::poll!(send.as_mut()) {
+        return result;
+    }
+    tokio::task::yield_now().await;
+    if cancellation.is_cancelled() {
+        return Err(NetStackError::Stopped);
+    }
+    match futures_util::poll!(send.as_mut()) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => Err(NetStackError::Backpressure),
     }
 }
 

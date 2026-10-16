@@ -3375,6 +3375,55 @@ fn fill_tun_egress(host: &UnixDatagram, packet: &[u8]) -> usize {
 }
 
 #[tokio::test]
+async fn transient_tcp_ingress_pressure_yields_once_and_retains_the_packet() {
+    let limits = ResourceLimits {
+        packet_queue_capacity: 1,
+        ..ResourceLimits::default()
+    };
+    let mut parts = NetStack::start_tcp(tun_netstack_config(limits, false)).unwrap();
+    let destination = "198.51.100.20:443".parse().unwrap();
+    let first = "192.0.2.20:13000".parse().unwrap();
+    let second = "192.0.2.21:13001".parse().unwrap();
+    parts
+        .packet_sink
+        .try_send(build_tcp_syn(first, destination))
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let mut offer = Box::pin(offer_netstack_packet(
+        &parts.packet_sink,
+        Packet::new(build_tcp_syn(second, destination)),
+        &cancellation,
+    ));
+    // No await has allowed the current-thread driver to drain the only slot.
+    let first_poll = futures_util::poll!(offer.as_mut());
+    let first_poll_pending = first_poll.is_pending();
+    let first_reply = timeout(Duration::from_secs(1), parts.packet_stream.recv()).await;
+    let sent = match first_poll {
+        Poll::Ready(result) => result,
+        Poll::Pending => offer.await,
+    };
+    let second_reply = if sent.is_ok() {
+        timeout(Duration::from_secs(1), parts.packet_stream.recv())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    parts.control.stop().await;
+    assert!(
+        first_poll_pending,
+        "transient Full dropped the packet before yielding"
+    );
+    let first_reply = first_reply.unwrap().unwrap();
+    assert_eq!(first_reply.data()[22..24], first.port().to_be_bytes());
+    sent.unwrap();
+    let second_reply = second_reply.expect("retained SYN never reached the stack");
+    assert_eq!(second_reply.data()[22..24], second.port().to_be_bytes());
+    assert_eq!(second_reply.data()[33] & 0x12, 0x12);
+}
+
+#[tokio::test]
 async fn full_tcp_ingress_drops_only_that_packet_and_keeps_udp_and_dns_responsive() {
     let (host, peer) = UnixDatagram::pair().unwrap();
     host.set_nonblocking(true).unwrap();
@@ -3440,6 +3489,11 @@ async fn full_tcp_ingress_drops_only_that_packet_and_keeps_udp_and_dns_responsiv
     ));
     let pending =
         std::future::poll_fn(|cx| Poll::Ready(reader.as_mut().poll(cx).is_pending())).await;
+    // Keep the driver unscheduled through the one allowed yield. Persistent
+    // Full must still leave ordinary UDP and DNS free to make progress.
+    let still_pending =
+        std::future::poll_fn(|cx| Poll::Ready(reader.as_mut().poll(cx).is_pending())).await;
+    assert!(still_pending);
     let dropped_packets = resources.snapshot().packet_queue_drops;
     let consumed_bytes = traffic.snapshot().up_total;
     let task = tokio::spawn(reader);
