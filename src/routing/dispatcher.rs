@@ -802,6 +802,8 @@ impl RoutingDispatcher {
             route_transports: HashMap::new(),
             fake_flows: HashMap::new(),
             managed_flows: ManagedDatagramFlows::default(),
+            managed_shared: HashMap::new(),
+            managed_shared_sequence: 0,
             managed_ready,
             managed_receive_buffer: Vec::new(),
             managed_next_cleanup: Instant::now() + UDP_FLOW_CLEANUP_INTERVAL,
@@ -1002,6 +1004,8 @@ struct RoutedDatagramTransport {
     route_transports: HashMap<(RouteTargetId, Option<Destination>), CachedRouteTransport>,
     fake_flows: HashMap<SocketAddr, FakeDatagramFlow>,
     managed_flows: ManagedDatagramFlows,
+    managed_shared: HashMap<usize, ManagedSharedTransport>,
+    managed_shared_sequence: usize,
     managed_ready: Option<Arc<ReadyQueue>>,
     managed_receive_buffer: Vec<u8>,
     managed_next_cleanup: Instant,
@@ -1071,12 +1075,31 @@ impl ManagedDatagramFlows {
 
 struct ManagedDatagramFlow {
     receiver: Option<ManagedReceive>,
-    transport: Box<dyn DatagramTransport>,
+    transport: ManagedTransport,
     connection: crate::connections::Connection,
     destination: Destination,
     restore: bool,
     last_used: Instant,
     flow_id: Option<Box<[u8]>>,
+}
+
+enum ManagedTransport {
+    Dedicated(Box<dyn DatagramTransport>),
+    Shared(usize),
+}
+
+struct ManagedSharedTransport {
+    // Keep the concrete node and its resource generation alive. Pointer
+    // equality alone would permit address reuse after a provider replacement.
+    dispatcher: Arc<dyn Dispatcher>,
+    transport: Box<dyn DatagramTransport>,
+    members: usize,
+    accepting: bool,
+}
+
+enum ManagedDatagramEvent {
+    Flow(Destination, Option<Result<Datagram, DispatchError>>),
+    Shared(usize, Result<Datagram, DispatchError>),
 }
 
 impl Drop for ManagedDatagramFlow {
@@ -1176,6 +1199,93 @@ impl RoutedDatagramTransport {
     fn tracked(&self) -> bool {
         self.router.diagnostics.is_some() && business(self.session.inbound)
     }
+
+    async fn remove_managed(&mut self, key: &Destination) -> Result<(), DispatchError> {
+        let Some(mut flow) = self.managed_flows.remove(key) else {
+            return Ok(());
+        };
+        if let Some(receiver) = &flow.receiver {
+            receiver.wake.deactivate();
+        }
+        match &mut flow.transport {
+            ManagedTransport::Dedicated(transport) => transport.close().await,
+            ManagedTransport::Shared(id) => {
+                let shared = self.managed_shared.get_mut(id).expect("shared flow owner");
+                // A later connection with this same destination must not receive
+                // a delayed reply from the old generation. Existing siblings
+                // keep this wire, but new destinations use a new association.
+                shared.accepting = false;
+                shared.members -= 1;
+                if shared.members == 0 {
+                    let mut shared = self.managed_shared.remove(id).expect("last shared owner");
+                    shared.transport.close().await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn fail_managed_shared(&mut self, id: usize, error: &DispatchError) {
+        let keys = self
+            .managed_flows
+            .iter()
+            .filter_map(|(key, flow)| {
+                matches!(flow.transport, ManagedTransport::Shared(owner) if owner == id).then(
+                    || {
+                        if !flow.connection.cancelled() {
+                            flow.connection.failed(error);
+                        }
+                        key.clone()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        for key in keys {
+            let _ = self.remove_managed(&key).await;
+        }
+    }
+
+    async fn open_managed_transport(
+        &mut self,
+        dispatcher: Arc<dyn Dispatcher>,
+        connection: &crate::connections::Connection,
+        share: bool,
+    ) -> Result<ManagedTransport, DispatchError> {
+        if share
+            && let Some((&id, shared)) = self.managed_shared.iter_mut().find(|(_, shared)| {
+                shared.accepting && Arc::ptr_eq(&dispatcher, &shared.dispatcher)
+            })
+        {
+            shared.members += 1;
+            return Ok(ManagedTransport::Shared(id));
+        }
+        let token = connection.token();
+        let transport = tokio::select! {
+            biased;
+            () = token.cancelled() => return Err(DispatchError::NotAllowed),
+            result = dispatcher.open_datagram(self.session.clone()) => result?,
+        };
+        if share && transport.supports_shared_destinations() {
+            self.managed_shared_sequence = self
+                .managed_shared_sequence
+                .checked_add(1)
+                .ok_or(DispatchError::NotAllowed)?;
+            let id = self.managed_shared_sequence;
+            self.managed_shared.insert(
+                id,
+                ManagedSharedTransport {
+                    dispatcher,
+                    transport,
+                    members: 1,
+                    accepting: true,
+                },
+            );
+            Ok(ManagedTransport::Shared(id))
+        } else {
+            Ok(ManagedTransport::Dedicated(transport))
+        }
+    }
+
     async fn clean_managed(&mut self) {
         let now = Instant::now();
         if now < self.managed_next_cleanup {
@@ -1192,14 +1302,13 @@ impl RoutedDatagramTransport {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in expired {
-            if let Some(mut flow) = self.managed_flows.remove(&key) {
-                if let Some(receiver) = &flow.receiver {
-                    receiver.wake.deactivate();
-                }
-                let _ = flow.transport.close().await;
-            }
+            let _ = self.remove_managed(&key).await;
         }
         self.managed_flows.shrink();
+        if self.managed_shared.capacity() > self.managed_shared.len().saturating_mul(4).max(8) {
+            self.managed_shared
+                .shrink_to(self.managed_shared.len().saturating_mul(2));
+        }
         self.managed_ready
             .as_ref()
             .expect("tracked receive queue")
@@ -1211,12 +1320,8 @@ impl RoutedDatagramTransport {
         if self.managed_flows.get(&key).is_some_and(|flow| {
             flow.connection.cancelled()
                 || flow.last_used.elapsed() >= self.router.tun_config.udp_timeout
-        }) && let Some(mut flow) = self.managed_flows.remove(&key)
-        {
-            if let Some(receiver) = &flow.receiver {
-                receiver.wake.deactivate();
-            }
-            let _ = flow.transport.close().await;
+        }) {
+            let _ = self.remove_managed(&key).await;
         }
         if !self.managed_flows.contains_key(&key) {
             let mut decision = self
@@ -1281,8 +1386,14 @@ impl RoutedDatagramTransport {
                     chain,
                 )
                 .expect("tracked business flow");
-            let token = connection.token();
-            let result = tokio::select! { biased; () = token.cancelled() => Err(DispatchError::NotAllowed), result = dispatcher.open_datagram(self.session.clone()) => result };
+            // Only identical IP addresses can be demultiplexed without a DNS
+            // alias table. Fake-IP, QUIC override and domain requests retain
+            // dedicated wires, including two names resolving to one endpoint.
+            let share =
+                !restore && matches!(key, Destination::Ip(_)) && key == decision.destination;
+            let result = self
+                .open_managed_transport(dispatcher, &connection, share)
+                .await;
             connection.dns_path(crate::dns::trace::snapshot());
             let transport = match result {
                 Ok(transport) => transport,
@@ -1293,7 +1404,11 @@ impl RoutedDatagramTransport {
                     return Err(error);
                 }
             };
-            let receiver = transport.supports_poll_receive().then(|| {
+            let polled = match &transport {
+                ManagedTransport::Dedicated(transport) => transport.supports_poll_receive(),
+                ManagedTransport::Shared(_) => true, // readiness owns only logical cancellation
+            };
+            let receiver = polled.then(|| {
                 let wake = self
                     .managed_ready
                     .as_ref()
@@ -1324,15 +1439,30 @@ impl RoutedDatagramTransport {
         datagram.remote = flow.destination.clone();
         datagram.sniffed_domain = None;
         let token = flow.connection.token();
-        let result = tokio::select! { biased; () = token.cancelled() => Err(DispatchError::NotAllowed), result = flow.transport.send(datagram) => result };
+        let (transport, shared_id) = match &mut flow.transport {
+            ManagedTransport::Dedicated(transport) => (transport, None),
+            ManagedTransport::Shared(id) => (
+                &mut self
+                    .managed_shared
+                    .get_mut(id)
+                    .expect("shared flow owner")
+                    .transport,
+                Some(*id),
+            ),
+        };
+        let result = tokio::select! { biased; () = token.cancelled() => Err(DispatchError::NotAllowed), result = transport.send(datagram) => result };
         match &result {
             Ok(()) => flow.connection.upload(size),
             Err(error) => {
-                if !flow.connection.cancelled() {
+                if shared_id.is_none() && !flow.connection.cancelled() {
                     flow.connection.failed(error);
                 }
-                if let Some(mut flow) = self.managed_flows.remove(&key) {
-                    let _ = flow.transport.close().await;
+                if let Some(id) = shared_id
+                    && !token.is_cancelled()
+                {
+                    self.fail_managed_shared(id, error).await;
+                } else {
+                    let _ = self.remove_managed(&key).await;
                 }
             }
         }
@@ -1368,7 +1498,10 @@ impl RoutedDatagramTransport {
             {
                 return Poll::Ready((wake.key().clone(), None));
             }
-            match flow.transport.poll_receive(&mut flow_context, scratch) {
+            let ManagedTransport::Dedicated(transport) = &mut flow.transport else {
+                continue;
+            };
+            match transport.poll_receive(&mut flow_context, scratch) {
                 Poll::Pending => {}
                 Poll::Ready(Ok(mut datagram)) => {
                     wake.requeue();
@@ -1391,6 +1524,26 @@ impl RoutedDatagramTransport {
             context.waker().wake_by_ref();
         }
         Poll::Pending
+    }
+
+    async fn receive_managed_shared(
+        transports: &mut HashMap<usize, ManagedSharedTransport>,
+    ) -> (usize, Result<Datagram, DispatchError>) {
+        if transports.is_empty() {
+            return std::future::pending().await;
+        }
+        if transports.len() == 1 {
+            let (&id, shared) = transports.iter_mut().next().expect("one shared transport");
+            return (id, shared.transport.receive().await);
+        }
+        let receives = transports
+            .iter_mut()
+            .map(|(&id, shared)| {
+                Box::pin(async move { (id, shared.transport.receive().await) })
+                    as futures_util::future::BoxFuture<'_, _>
+            })
+            .collect::<Vec<_>>();
+        select_all(receives).await.0
     }
 
     async fn receive_managed(&mut self) -> Result<Datagram, DispatchError> {
@@ -1417,7 +1570,10 @@ impl RoutedDatagramTransport {
                             if flow.last_used.elapsed() >= idle_timeout {
                                 return (key.clone(), None);
                             }
-                            let result = tokio::select! { biased; () = token.cancelled() => None, result = flow.transport.receive() => Some(result) };
+                            let ManagedTransport::Dedicated(transport) = &mut flow.transport else {
+                                unreachable!("shared logical flows use cancellation readiness");
+                            };
+                            let result = tokio::select! { biased; () = token.cancelled() => None, result = transport.receive() => Some(result) };
                             if let Some(Ok(mut datagram)) = result {
                                 if flow.last_used.elapsed() >= idle_timeout {
                                     return (key.clone(), None);
@@ -1435,26 +1591,46 @@ impl RoutedDatagramTransport {
                     }) as futures_util::future::BoxFuture<'_, _>).collect::<Vec<_>>();
                     select_all(receives).await.0
                 };
+                let shared = Self::receive_managed_shared(&mut self.managed_shared);
                 tokio::select! {
-                    result = polled => Some(result),
-                    result = asynchronous => Some(result),
+                    (key, result) = polled => Some(ManagedDatagramEvent::Flow(key, result)),
+                    (key, result) = asynchronous => Some(ManagedDatagramEvent::Flow(key, result)),
+                    (id, result) = shared => Some(ManagedDatagramEvent::Shared(id, result)),
                     () = tokio::time::sleep_until(self.managed_next_cleanup) => None,
                 }
             };
-            if let Some((key, result)) = result {
-                if let Some(Ok(datagram)) = result {
+            match result {
+                Some(ManagedDatagramEvent::Flow(_, Some(Ok(datagram)))) => {
                     return Ok(datagram);
                 }
-                if let Some(mut flow) = self.managed_flows.remove(&key) {
-                    if let Some(receiver) = &flow.receiver {
-                        receiver.wake.deactivate();
-                    }
-                    if let Some(Err(error)) = result {
+                Some(ManagedDatagramEvent::Flow(key, result)) => {
+                    if let Some(Err(error)) = result
+                        && let Some(flow) = self.managed_flows.get(&key)
+                    {
                         flow.connection.failed(&error);
                     }
-                    let _ = flow.transport.close().await;
+                    let _ = self.remove_managed(&key).await;
                 }
+                Some(ManagedDatagramEvent::Shared(id, Ok(datagram))) => {
+                    let key = &datagram.remote;
+                    if let Some(flow) = self.managed_flows.get_mut(key)
+                        && matches!(flow.transport, ManagedTransport::Shared(owner) if owner == id)
+                    {
+                        if flow.connection.cancelled() || flow.last_used.elapsed() >= idle_timeout {
+                            let _ = self.remove_managed(key).await;
+                        } else {
+                            flow.connection.download(datagram.payload.len());
+                            flow.last_used = Instant::now();
+                            return Ok(datagram);
+                        }
+                    }
+                }
+                Some(ManagedDatagramEvent::Shared(id, Err(error))) => {
+                    self.fail_managed_shared(id, &error).await
+                }
+                None => {}
             }
+            tokio::task::consume_budget().await;
         }
     }
 
@@ -1815,9 +1991,8 @@ impl DatagramTransport for RoutedDatagramTransport {
                 .managed_flows
                 .get(&key)
                 .is_some_and(|flow| flow.flow_id.as_deref() != Some(flow_id))
-                && let Some(mut old) = self.managed_flows.remove(&key)
             {
-                old.transport.close().await?;
+                self.remove_managed(&key).await?;
             }
             self.send(datagram).await?;
             if let Some(flow) = self.managed_flows.get_mut(&key) {
@@ -1899,7 +2074,15 @@ impl DatagramTransport for RoutedDatagramTransport {
     async fn close(&mut self) -> Result<(), DispatchError> {
         let mut first_error = None;
         for (_, mut flow) in self.managed_flows.drain() {
-            if let Err(error) = flow.transport.close().await
+            if let ManagedTransport::Dedicated(transport) = &mut flow.transport
+                && let Err(error) = transport.close().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        for (_, mut shared) in self.managed_shared.drain() {
+            if let Err(error) = shared.transport.close().await
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -1963,6 +2146,7 @@ mod tests {
     struct RecordingDispatcher {
         tcp_only: bool,
         pollable: bool,
+        shareable: bool,
         receive_polls: Arc<AtomicUsize>,
         udp_closes: Arc<AtomicUsize>,
         tcp_sessions: Mutex<Vec<StreamSession>>,
@@ -1991,6 +2175,7 @@ mod tests {
                 sent: self.datagrams.clone(),
                 responses: VecDeque::new(),
                 pollable: self.pollable,
+                shareable: self.shareable,
                 receive_polls: self.receive_polls.clone(),
                 closes: self.udp_closes.clone(),
                 receive_waker: None,
@@ -2002,6 +2187,7 @@ mod tests {
         sent: Arc<Mutex<Vec<Datagram>>>,
         responses: VecDeque<Datagram>,
         pollable: bool,
+        shareable: bool,
         receive_polls: Arc<AtomicUsize>,
         closes: Arc<AtomicUsize>,
         receive_waker: Option<std::task::Waker>,
@@ -2009,6 +2195,10 @@ mod tests {
 
     #[async_trait]
     impl DatagramTransport for RecordingDatagrams {
+        fn supports_shared_destinations(&self) -> bool {
+            self.shareable
+        }
+
         fn supports_poll_receive(&self) -> bool {
             self.pollable
         }
@@ -2407,15 +2597,24 @@ mod tests {
         let config = crate::config::Config::parse_yaml(
             br#"
 mixed-port: 1080
-proxies: [{name: edge, type: socks5, server: 192.0.2.1, port: 1080, udp: true}]
-proxy-groups: [{name: pool, type: select, proxies: [edge]}]
+proxies:
+  - {name: edge, type: socks5, server: 192.0.2.1, port: 1080, udp: true}
+  - {name: other, type: socks5, server: 192.0.2.2, port: 1080, udp: true}
+proxy-groups: [{name: pool, type: select, proxies: [edge, other]}]
 rules: ["MATCH,pool"]
 "#,
         )
         .unwrap();
-        let proxy = Arc::new(RecordingDispatcher::default());
+        let proxy = Arc::new(RecordingDispatcher {
+            shareable: true,
+            ..Default::default()
+        });
+        let other = Arc::new(RecordingDispatcher {
+            shareable: true,
+            ..Default::default()
+        });
         let direct = Arc::new(RecordingDispatcher::default());
-        let nodes = vec![proxy.clone() as Arc<dyn Dispatcher>];
+        let nodes = vec![proxy.clone() as Arc<dyn Dispatcher>, other.clone()];
         let groups = ProxyGroups::new(&config.proxy_groups, nodes.clone(), direct.clone()).unwrap();
         let rules = RuleSet::compile(config.rules.clone()).unwrap();
         let registry = Arc::new(crate::connections::Registry::default());
@@ -2438,8 +2637,12 @@ rules: ["MATCH,pool"]
             .unwrap();
         let first = "198.51.100.1:443".parse().unwrap();
         let second = "198.51.100.2:443".parse().unwrap();
-        transport.send(datagram(first, b"one")).await.unwrap();
+        transport
+            .send(datagram(first, b"stale-original"))
+            .await
+            .unwrap();
         transport.send(datagram(second, b"two")).await.unwrap();
+        assert_eq!(proxy.udp_opens.load(Ordering::Relaxed), 1);
         let snapshot = serde_json::to_value(registry.snapshot()).unwrap();
         let entries = snapshot["connections"].as_array().unwrap();
         assert_eq!(entries.len(), 2);
@@ -2450,20 +2653,73 @@ rules: ["MATCH,pool"]
         assert_eq!(entry["chains"], serde_json::json!(["edge", "pool"]));
         assert_eq!(entry["rule"], "Match");
         registry.close(entry["id"].as_str().unwrap());
+        groups.select("pool", "other").unwrap();
+        // Recreate before reading: the old wire still has a reply for the same
+        // tuple, which must not be delivered or counted on the new connection.
+        transport.send(datagram(first, b"new")).await.unwrap();
+        let mut replies = HashMap::new();
+        for _ in 0..2 {
+            let reply = transport.receive().await.unwrap();
+            replies.insert(reply.remote, reply.payload);
+        }
         assert_eq!(
-            transport.receive().await.unwrap().remote,
-            Destination::Ip(second)
+            replies.get(&Destination::Ip(first)).unwrap().as_ref(),
+            b"new"
+        );
+        assert_eq!(
+            replies.get(&Destination::Ip(second)).unwrap().as_ref(),
+            b"two"
         );
         assert_eq!(
             serde_json::to_value(registry.snapshot()).unwrap()["connections"]
                 .as_array()
                 .unwrap()
                 .len(),
-            1
+            2
         );
-        transport.send(datagram(first, b"new")).await.unwrap();
-        assert_eq!(proxy.udp_opens.load(Ordering::Relaxed), 3);
+        let third = "198.51.100.3:443".parse().unwrap();
+        transport.send(datagram(third, b"third")).await.unwrap();
+        transport.send(datagram(second, b"pinned")).await.unwrap();
+        assert_eq!(proxy.udp_opens.load(Ordering::Relaxed), 1);
+        assert_eq!(other.udp_opens.load(Ordering::Relaxed), 1);
+        groups.select("pool", "edge").unwrap();
+        transport
+            .send(datagram("198.51.100.4:443".parse().unwrap(), b"fourth"))
+            .await
+            .unwrap();
+        assert_eq!(
+            proxy.udp_opens.load(Ordering::Relaxed),
+            2,
+            "retired wires must reject new destinations"
+        );
+        let snapshot = serde_json::to_value(registry.snapshot()).unwrap();
+        let first_entry = snapshot["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["metadata"]["destinationIP"] == "198.51.100.1")
+            .unwrap();
+        assert_eq!(first_entry["download"], 3);
+        assert_eq!(first_entry["chains"], serde_json::json!(["other", "pool"]));
+        groups.select("pool", "other").unwrap();
+        for host in ["first.example", "second.example"] {
+            transport
+                .send(Datagram {
+                    remote: Destination::domain(host, 53).unwrap(),
+                    payload: Bytes::from_static(b"domain"),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            other.udp_opens.load(Ordering::Relaxed),
+            3,
+            "domain aliases must not share a wire"
+        );
         transport.close().await.unwrap();
+        assert_eq!(proxy.udp_closes.load(Ordering::Relaxed), 2);
+        assert_eq!(other.udp_closes.load(Ordering::Relaxed), 3);
         assert!(
             serde_json::to_value(registry.snapshot()).unwrap()["connections"]
                 .as_array()

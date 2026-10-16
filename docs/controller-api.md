@@ -233,7 +233,9 @@ Expire 为 Unix 秒。未知时省略该对象，缺失子项为 0；不以本�
 
 - 只统计 TUN、HTTP、SOCKS5 的业务 TCP/UDP 负载，排除 TUN DNS 拦截、ICMP、Controller、
   Core 资源下载和健康探测。累计值在本次 Running Session 内保留，provider 更新不会重置。
-- TCP 为一条业务流，UDP 为同一来源与目标的会话；每个 UDP 目标有独立 transport，
+- TCP 为一条业务流，UDP 为同一来源与目标的会话；各目标独立计数、取消并固定所选出口。
+  XUDP 对同一来源、同一具体节点和未改写的 IP 目标共享物理关联，其它路径保留独立 transport。
+  任一目标退出后，该共享关联仅服务既有目标；新目标使用新关联，避免旧回复串入新会话。
   会话超时、关闭或新的 QUIC flow-id 后重新选择出口。资源代际不会迁移既有会话。
 - `chains` 按叶节点到业务路由组排列；当前不展开节点内部的 `dialer-proxy` 协议链。
   `providerChains` 给出这些节点关联的 provider 名称，可与 provider 状态中的脱敏 `error` 对照。

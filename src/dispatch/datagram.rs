@@ -93,6 +93,10 @@ struct Bounded {
 
 #[async_trait::async_trait]
 impl DatagramTransport for Bounded {
+    fn supports_shared_destinations(&self) -> bool {
+        self.inner.supports_shared_destinations()
+    }
+
     fn supports_poll_receive(&self) -> bool {
         self.inner.supports_poll_receive()
     }
@@ -184,6 +188,9 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl DatagramTransport for PolledPackets {
+        fn supports_shared_destinations(&self) -> bool {
+            true
+        }
         fn payload_budget(&self, _peer: &Destination) -> DatagramBudget {
             DatagramBudget::new(2, 3)
         }
@@ -241,6 +248,7 @@ mod tests {
             DatagramBudget::new(10, 4),
         );
         assert!(transport.supports_poll_receive());
+        assert!(transport.supports_shared_destinations());
         assert_eq!(
             transport.payload_budget(&packet(b"").remote),
             DatagramBudget::new(2, 3)

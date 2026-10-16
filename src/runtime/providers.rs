@@ -711,6 +711,10 @@ struct GenerationDatagram {
 }
 #[async_trait]
 impl DatagramTransport for GenerationDatagram {
+    fn supports_shared_destinations(&self) -> bool {
+        self.io.supports_shared_destinations()
+    }
+
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         self.io.payload_budget(peer)
     }

@@ -285,6 +285,10 @@ impl XudpTransport {
 
 #[async_trait::async_trait]
 impl DatagramTransport for XudpTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        true
+    }
+
     fn payload_budget(&self, _peer: &Destination) -> crate::dispatch::DatagramBudget {
         crate::dispatch::DatagramBudget::new(
             self.max_request_payload_size,

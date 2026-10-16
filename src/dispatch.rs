@@ -75,6 +75,15 @@ impl From<io::Error> for DispatchError {
 
 #[async_trait]
 pub trait DatagramTransport: Send {
+    /// Whether one source association may share this transport across distinct
+    /// unmodified IP destinations routed to the same concrete dispatcher.
+    /// Replies must retain their source destination, and cancelled sends must
+    /// preserve framing for the next send/receive. Fixed-target codecs and
+    /// ambiguous address restoration must retain independent transports.
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     /// Payload budget for packets sent to and received from this logical peer.
     /// Encapsulating transports subtract their headers from the upstream cap.
     /// The default is the u16 wire ceiling; narrower paths must override it.
@@ -306,6 +315,10 @@ struct ObservedDatagramTransport {
 
 #[async_trait]
 impl DatagramTransport for ObservedDatagramTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        self.inner.supports_shared_destinations()
+    }
+
     fn supports_poll_receive(&self) -> bool {
         self.inner.supports_poll_receive()
     }
@@ -486,6 +499,9 @@ mod tests {
         }
         #[async_trait]
         impl DatagramTransport for PolledTransport {
+            fn supports_shared_destinations(&self) -> bool {
+                true
+            }
             fn supports_poll_receive(&self) -> bool {
                 true
             }
@@ -527,6 +543,7 @@ mod tests {
         };
         assert_eq!(stats.snapshot().udp_current, 1);
         assert!(observed.supports_poll_receive());
+        assert!(observed.supports_shared_destinations());
         let mut context = Context::from_waker(&parent);
         let Poll::Ready(Ok(datagram)) = observed.poll_receive(&mut context, &mut scratch) else {
             panic!("observer must forward the ready datagram")

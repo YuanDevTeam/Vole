@@ -344,6 +344,12 @@ impl Drop for SessionDatagram {
 }
 #[async_trait]
 impl DatagramTransport for SessionDatagram {
+    fn supports_shared_destinations(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.supports_shared_destinations())
+    }
+
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         self.inner.as_ref().map_or(self.budget, |inner| {
             self.budget.intersect(inner.payload_budget(peer))
