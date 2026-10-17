@@ -62,14 +62,21 @@ Unicode 版本的 Mihomo 在所有新字符上完全等价。
 
 ## 资产格式
 
+默认资产和统一验证来源采用 [MetaCubeX/meta-rules-dat 官方完整资产](https://github.com/MetaCubeX/meta-rules-dat#readme)，
+保留原始文件，仅按配置引用加载分类。
+
 | 规则 | 文件 | 顶层消息 | 内容 |
 | --- | --- | --- | --- |
 | `GEOSITE` | `geosite.dat` | `GeoSiteList` | code 与 Domain 记录 |
 | `GEOIP` | `geoip.dat` | `GeoIPList` | code 与 IPv4/IPv6 CIDR |
-| `GEOIP`（默认模式） | 根目录国家 MMDB | MaxMind DB | 直接 IPv4/IPv6 索引查询 |
-| `IP-ASN` / `SRC-IP-ASN` | `ASN.mmdb` | MaxMind DB | IPv4/IPv6 ASN 索引 |
+| `GEOIP`（默认模式） | 根目录 `country.mmdb`、`geoip.db` 或 `geoip.metadb` | MaxMind DB | 直接 IPv4/IPv6 国家/分类索引查询 |
+| `IP-ASN` / `SRC-IP-ASN` | 上游 `GeoLite2-ASN.mmdb`，管理名 `ASN.mmdb` | MaxMind DB | IPv4/IPv6 ASN 索引 |
+| `RULE-SET` | `*.mrs` | Zstd 压缩的 MRSv1 | `domain` / `ipcidr` rule provider，与 GeoData 分别配置 |
 
-- YAML 不能指定本地路径或环境变量。MMDB 在 `dataDir` 的直接子文件中按文件名字典序，
+增强 GeoSite 仍使用相同的 DAT 格式，支持四种 Domain 类型与属性标签，不按提供方区别加载。
+MRS 不能直接替代 GeoSite/GeoIP 资产；sing-box 的 `geosite.db` 与 SRS 不是 Mihomo 的 GeoSite 输入格式。
+
+- GeoData 的 YAML 字段不能指定本地路径或环境变量。MMDB 在 `dataDir` 的直接子文件中按文件名字典序，
   不区分大小写寻找 `Country.mmdb`、`geoip.db`、`geoip.metadb`，选择第一个并保留实际名称；
   不因它损坏而改选另一个数据库。缺省下载目标为 `geoip.metadb`。
 - 所有资产必须是普通文件；DAT 校验外层帧、code、分类引用、实际选中的 CIDR / Domain 记录。
@@ -82,6 +89,7 @@ Unicode 版本的 Mihomo 在所有新字符上完全等价。
 ## 国家 MMDB
 
 国家库支持 MaxMind `country.iso_code`、`sing-geoip` 根字符串和 `Meta-geoip0` 根字符串/字符串数组。
+`.db`、`.metadb` 和 `.mmdb` 是文件命名；实际 schema 由 MMDB metadata 识别，不使用 SQLite。
 MaxMind 国家代码按 ASCII 大小写折叠，sing/Meta 保留原字符串大小写。国家库与 DAT 二选一，
 GEOIP、来源规则、classical/地址选择器及 DNS fallback 共用一个 owned Reader；查询借用字符串，
 Meta 多 code 的临时索引只保存引用。没有全量 CIDR 展开或逐地址缓存。缺库、坏索引和无效记录

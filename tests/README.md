@@ -34,7 +34,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | --- | --- | --- |
 | 配置 | `config::tests::` | YAML准入、图、字段单位与边界 |
 | GeoData | `geodata::tests::` | 合成DAT/MMDB、selector、更新发布和取消 |
-| 资源与Provider | `runtime::providers::tests::`、`resource::cache::tests::` | 候选提交、失败保留、旧代资源与缓存 |
+| 资源与Provider | `config::rule_provider::`、`runtime::providers::tests::`、`resource::cache::tests::` | 域名紧凑索引、MRS边界、候选提交、失败保留与旧代资源 |
 | 策略组 | `routing::proxy_group::tests::`、`routing::balance::tests::` | 选择、容差、恢复和负载均衡 |
 | DNS | `dns::cache::tests::`、`dns::runtime::tests::dns_fallback_`、`dns::runtime::tests::resolve_ipv6_` | 缓存、双栈、竞速和取消 |
 | QUIC与H3 | `transport::quic::`、`transport::quinn_h3::tests::`、`transport::quiche_h3::tests::`、`dns_quic_` | 官方窗口、真实内存QUIC、DATA读取背压、请求取消、兄弟请求及Stop |

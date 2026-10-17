@@ -3,13 +3,12 @@ use super::{
     providers::{RuleBehavior, RuleFormat},
     *,
 };
-use crate::{
-    dns::policy::DomainIndex,
-    routing::{GeoMatcher, RoutingContext},
-};
+use crate::routing::{GeoMatcher, RoutingContext};
+mod domain_set;
+use domain_set::DomainSet;
 use serde::Deserialize;
 use std::{
-    io::{Cursor, Read},
+    io::Read,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
 };
@@ -18,7 +17,7 @@ const MAX_RESOURCE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleCollection {
     behavior: RuleBehavior,
-    domains: Arc<DomainIndex>,
+    domains: Arc<DomainSet>,
     ranges: Vec<(IpAddr, IpAddr)>,
     pub(crate) classical: Vec<RuleSpec>,
     count: usize,
@@ -74,11 +73,12 @@ impl RuleCollection {
     pub fn from_payload(values: Vec<String>, behavior: RuleBehavior) -> Result<Self> {
         let mut data = Self {
             behavior,
-            domains: Arc::new(DomainIndex::new()),
+            domains: Arc::new(DomainSet::default()),
             ranges: Vec::new(),
             classical: Vec::new(),
             count: values.len(),
         };
+        let mut domains = Vec::new();
         for value in values {
             match behavior {
                 RuleBehavior::Domain => {
@@ -89,9 +89,7 @@ impl RuleCollection {
                     if value.contains('/') || patterns.len() != 1 {
                         return invalid("invalid rule provider domain");
                     }
-                    Arc::get_mut(&mut data.domains)
-                        .unwrap()
-                        .insert(&patterns[0], 0);
+                    domains.extend(patterns.into_vec());
                 }
                 RuleBehavior::Ipcidr => {
                     let cidr = parse_ip_cidr(&value, value.contains(':'))?;
@@ -130,6 +128,7 @@ impl RuleCollection {
                 }
             }
         }
+        data.domains = Arc::new(DomainSet::from_patterns(domains)?);
         // Reuse normal compilation to validate classical matcher semantics.
         crate::routing::RuleSet::compile(data.classical.clone())
             .map_err(|_| VoleError::InvalidConfig("invalid classical provider rules".into()))?;
@@ -161,7 +160,7 @@ impl RuleCollection {
         match self.behavior {
             RuleBehavior::Domain => Ok(context
                 .domain()
-                .is_some_and(|name| self.domains.find(0, name).is_some())),
+                .is_some_and(|name| self.domains.contains(name))),
             RuleBehavior::Ipcidr => {
                 let ip = if source {
                     context.source_ip()
@@ -300,40 +299,91 @@ fn selects_predicate(
 fn corrupt() -> VoleError {
     VoleError::InvalidConfig("invalid MRSv1 rule provider".into())
 }
-fn read<const N: usize>(reader: &mut Cursor<Vec<u8>>) -> Result<[u8; N]> {
-    let mut bytes = [0; N];
-    reader.read_exact(&mut bytes).map_err(|_| corrupt())?;
-    Ok(bytes)
+struct MrsReader<R> {
+    input: R,
+    remaining: usize,
 }
-fn length(reader: &mut Cursor<Vec<u8>>, unit: usize) -> Result<usize> {
-    let n = usize::try_from(i64::from_be_bytes(read(reader)?)).map_err(|_| corrupt())?;
-    let remaining = reader
-        .get_ref()
-        .len()
-        .saturating_sub(reader.position() as usize);
-    if n > remaining / unit {
-        return Err(corrupt());
+impl<R: Read> MrsReader<R> {
+    fn read<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let mut bytes = [0; N];
+        self.read_exact(&mut bytes)?;
+        Ok(bytes)
     }
-    Ok(n)
-}
-fn words(reader: &mut Cursor<Vec<u8>>) -> Result<Vec<u64>> {
-    let n = length(reader, 8)?;
-    (0..n)
-        .map(|_| read(reader).map(u64::from_be_bytes))
-        .collect()
+    fn read_exact(&mut self, bytes: &mut [u8]) -> Result<()> {
+        if bytes.len() > self.remaining {
+            return Err(corrupt());
+        }
+        self.input.read_exact(bytes).map_err(|_| corrupt())?;
+        self.remaining -= bytes.len();
+        Ok(())
+    }
+    fn length(&mut self, unit: usize) -> Result<usize> {
+        let n = usize::try_from(i64::from_be_bytes(self.read()?)).map_err(|_| corrupt())?;
+        if n > self.remaining / unit {
+            return Err(corrupt());
+        }
+        Ok(n)
+    }
+    fn words(&mut self) -> Result<Vec<u64>> {
+        let count = self.length(8)?;
+        let mut words = Vec::new();
+        self.chunks(count * 8, |bytes| {
+            words.extend(
+                bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(u64::from_be_bytes),
+            );
+        })?;
+        Ok(words)
+    }
+    fn bytes(&mut self, count: usize) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.chunks(count, |block| bytes.extend_from_slice(block))?;
+        Ok(bytes)
+    }
+    // Length declarations are untrusted. Grow output only after each complete
+    // block is available, so a short truncated stream cannot reserve its whole
+    // declared array before EOF is discovered. The block size is divisible by
+    // eight for the word-array decoder.
+    fn chunks(&mut self, mut bytes: usize, mut consume: impl FnMut(&[u8])) -> Result<()> {
+        if bytes > self.remaining {
+            return Err(corrupt());
+        }
+        let mut block = [0_u8; 8192];
+        while bytes != 0 {
+            let len = bytes.min(block.len());
+            self.read_exact(&mut block[..len])?;
+            consume(&block[..len]);
+            bytes -= len;
+        }
+        Ok(())
+    }
+    fn skip(&mut self, mut bytes: usize) -> Result<()> {
+        let mut block = [0_u8; 8192];
+        while bytes != 0 {
+            let len = bytes.min(block.len());
+            self.read_exact(&mut block[..len])?;
+            bytes -= len;
+        }
+        Ok(())
+    }
+    fn finish(mut self) -> Result<()> {
+        if self.input.read(&mut [0]).map_err(|_| corrupt())? != 0 {
+            return Err(corrupt());
+        }
+        Ok(())
+    }
 }
 fn parse_mrs(bytes: &[u8], behavior: RuleBehavior) -> Result<RuleCollection> {
     let decoder = zstd::stream::read::Decoder::new(bytes).map_err(|_| corrupt())?;
-    let mut decoded = Vec::new();
-    decoder
-        .take((MAX_RESOURCE_BYTES + 1) as u64)
-        .read_to_end(&mut decoded)
-        .map_err(|_| corrupt())?;
-    if decoded.len() > MAX_RESOURCE_BYTES {
-        return Err(corrupt());
-    }
-    let mut input = Cursor::new(decoded);
-    if read::<4>(&mut input)? != *b"MRS\x01" {
+    let mut input = MrsReader {
+        input: decoder,
+        remaining: MAX_RESOURCE_BYTES,
+    };
+    if input.read::<4>()? != *b"MRS\x01" {
         return Err(corrupt());
     }
     let expected = match behavior {
@@ -341,19 +391,19 @@ fn parse_mrs(bytes: &[u8], behavior: RuleBehavior) -> Result<RuleCollection> {
         RuleBehavior::Ipcidr => 1,
         RuleBehavior::Classical => return Err(corrupt()),
     };
-    if read::<1>(&mut input)?[0] != expected {
+    if input.read::<1>()?[0] != expected {
         return Err(corrupt());
     }
-    let count = usize::try_from(i64::from_be_bytes(read(&mut input)?)).map_err(|_| corrupt())?;
-    let extra = length(&mut input, 1)?;
-    input.set_position(input.position() + extra as u64);
-    if read::<1>(&mut input)? != [1] {
+    let count = usize::try_from(i64::from_be_bytes(input.read()?)).map_err(|_| corrupt())?;
+    let extra = input.length(1)?;
+    input.skip(extra)?;
+    if input.read::<1>()? != [1] {
         return Err(corrupt());
     }
     let mut data = RuleCollection::from_payload(Vec::new(), behavior)?;
     data.count = count;
     if behavior == RuleBehavior::Ipcidr {
-        let n = length(&mut input, 32)?;
+        let n = input.length(32)?;
         for _ in 0..n {
             let convert = |bytes| {
                 let ip = Ipv6Addr::from(bytes);
@@ -361,8 +411,8 @@ fn parse_mrs(bytes: &[u8], behavior: RuleBehavior) -> Result<RuleCollection> {
                     .map(IpAddr::V4)
                     .unwrap_or(IpAddr::V6(ip))
             };
-            let start = convert(read::<16>(&mut input)?);
-            let end = convert(read::<16>(&mut input)?);
+            let start = convert(input.read::<16>()?);
+            let end = convert(input.read::<16>()?);
             if start.is_ipv4() != end.is_ipv4() || start > end {
                 return Err(corrupt());
             }
@@ -370,72 +420,145 @@ fn parse_mrs(bytes: &[u8], behavior: RuleBehavior) -> Result<RuleCollection> {
         }
         data.merge_ranges();
     } else {
-        let leaves = words(&mut input)?;
-        let bitmap = words(&mut input)?;
-        let n = length(&mut input, 1)?;
-        let mut labels = vec![0; n];
-        input.read_exact(&mut labels).map_err(|_| corrupt())?;
-        let bit = |bits: &[u64], i: usize| {
-            bits.get(i / 64)
-                .is_some_and(|w| w & (1u64 << (i % 64)) != 0)
-        };
-        let nodes = n.checked_add(1).ok_or_else(corrupt)?;
-        if leaves.len().saturating_mul(64) < nodes {
-            return Err(corrupt());
-        }
-        // LOUDS stores every node's outgoing labels, followed by a one bit.
-        let mut edges = Vec::with_capacity(nodes);
-        let (mut position, mut label) = (0usize, 0usize);
-        for _ in 0..nodes {
-            let start = label;
-            while position < bitmap.len() * 64 && !bit(&bitmap, position) {
-                position += 1;
-                label += 1;
-                if label > n {
-                    return Err(corrupt());
-                }
-            }
-            if position >= bitmap.len() * 64 {
-                return Err(corrupt());
-            }
-            position += 1;
-            edges.push(start..label);
-        }
-        if label != n {
-            return Err(corrupt());
-        }
-        let mut stack = vec![(0usize, Vec::<u8>::new())];
-        while let Some((node, key)) = stack.pop() {
-            if key.len() > 253 {
-                return Err(corrupt());
-            }
-            if bit(&leaves, node) {
-                let key = std::str::from_utf8(&key)
-                    .map_err(|_| corrupt())?
-                    .trim_end_matches('+');
-                let domain: String = key.chars().rev().collect();
-                Arc::get_mut(&mut data.domains).unwrap().insert(&domain, 0);
-            }
-            for edge in edges[node].clone().rev() {
-                let child = edge + 1;
-                if child <= node || child >= nodes {
-                    return Err(corrupt());
-                }
-                let mut next = key.clone();
-                next.push(labels[edge]);
-                stack.push((child, next));
-            }
-        }
+        let leaves = input.words()?;
+        let bitmap = input.words()?;
+        let n = input.length(1)?;
+        let labels = input.bytes(n)?;
+        data.domains = Arc::new(DomainSet::from_mrs(leaves, bitmap, labels)?);
     }
-    if input.position() != input.get_ref().len() as u64 {
-        return Err(corrupt());
-    }
+    input.finish()?;
     Ok(data)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn domain_provider_keeps_normalization_input_count_and_generation_snapshots() {
+        let first = Arc::new(
+            RuleCollection::from_payload(
+                vec![
+                    "API.Example.COM".into(),
+                    ".example.com".into(),
+                    "API.EXAMPLE.COM".into(),
+                    "é.test".into(),
+                ],
+                RuleBehavior::Domain,
+            )
+            .unwrap(),
+        );
+        let existing = Arc::clone(&first);
+        let next = Arc::new(
+            RuleCollection::from_payload(vec!["next.test".into()], RuleBehavior::Domain).unwrap(),
+        );
+        assert_eq!(first.len(), 4);
+        let matches = |set: &RuleCollection, domain| {
+            set.matches_domain(
+                domain,
+                &crate::routing::EmptyGeoMatcher,
+                &Default::default(),
+            )
+            .unwrap()
+        };
+        assert!(matches(&existing, "api.example.com"));
+        assert!(matches(&existing, "www.example.com"));
+        assert!(!matches(&existing, "example.com"));
+        // Preserve current selector normalization: Unicode patterns are lower
+        // cased, while query destinations are independently normalized to IDNA.
+        assert!(!matches(&existing, "é.test"));
+        assert!(!matches(&existing, "xn--9ca.test"));
+        assert!(!matches(&existing, "next.test"));
+        assert!(matches(&next, "next.test"));
+        for invalid in ["foo/bar", "one.test,two.test", "foo*bar.test", "geosite:cn"] {
+            assert!(
+                RuleCollection::from_payload(vec![invalid.into()], RuleBehavior::Domain).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mrs_stream_reader_keeps_cumulative_limit_and_rejects_trailing_or_truncated_data() {
+        let mut reader = MrsReader {
+            input: &b"abcdefgh"[..],
+            remaining: 7,
+        };
+        assert_eq!(reader.read::<4>().unwrap(), *b"abcd");
+        assert!(reader.read::<4>().is_err());
+        reader.skip(3).unwrap();
+        assert!(reader.finish().is_err());
+        let mut reader = MrsReader {
+            input: &b"abc"[..],
+            remaining: 3,
+        };
+        assert_eq!(reader.read::<3>().unwrap(), *b"abc");
+        reader.finish().unwrap();
+
+        let mut bytes = b"MRS\x01".to_vec();
+        bytes.push(0);
+        bytes.extend(97_i64.to_be_bytes());
+        bytes.extend(0_i64.to_be_bytes());
+        bytes.push(1);
+        // A single exact 'a' domain. Header count remains the writer's input
+        // count, which need not equal the number of unique stored terminals.
+        bytes.extend(1_i64.to_be_bytes());
+        bytes.extend(2_u64.to_be_bytes());
+        bytes.extend(1_i64.to_be_bytes());
+        bytes.extend(6_u64.to_be_bytes());
+        bytes.extend(1_i64.to_be_bytes());
+        bytes.push(b'a');
+        let compressed = zstd::encode_all(bytes.as_slice(), 1).unwrap();
+        let set =
+            RuleCollection::parse(&compressed, RuleBehavior::Domain, RuleFormat::Mrs).unwrap();
+        assert_eq!(set.len(), 97);
+        for cut in [0, 4, 13, bytes.len() - 1] {
+            let truncated = zstd::encode_all(&bytes[..cut], 1).unwrap();
+            assert!(
+                RuleCollection::parse(&truncated, RuleBehavior::Domain, RuleFormat::Mrs).is_err()
+            );
+        }
+        bytes.push(0);
+        let trailing = zstd::encode_all(bytes.as_slice(), 1).unwrap();
+        assert!(RuleCollection::parse(&trailing, RuleBehavior::Domain, RuleFormat::Mrs).is_err());
+    }
+
+    #[test]
+    fn mrs_truncated_large_arrays_only_retain_successfully_read_blocks() {
+        let actual = vec![0_u8; 8200];
+        let mut reader = MrsReader {
+            input: actual.as_slice(),
+            remaining: MAX_RESOURCE_BYTES,
+        };
+        let mut retained = Vec::new();
+        assert!(
+            reader
+                .chunks(MAX_RESOURCE_BYTES - 8, |block| {
+                    retained.extend_from_slice(block)
+                })
+                .is_err()
+        );
+        assert_eq!(retained.len(), 8192);
+        assert!(retained.capacity() <= actual.len());
+        assert_eq!(reader.remaining, MAX_RESOURCE_BYTES - retained.len());
+
+        let mut header = b"MRS\x01".to_vec();
+        header.push(0);
+        header.extend(1_i64.to_be_bytes());
+        header.extend(0_i64.to_be_bytes());
+        header.push(1);
+        let mut missing_words = header.clone();
+        missing_words.extend(((MAX_RESOURCE_BYTES / 8 - 16) as i64).to_be_bytes());
+        let compressed = zstd::encode_all(missing_words.as_slice(), 1).unwrap();
+        assert!(RuleCollection::parse(&compressed, RuleBehavior::Domain, RuleFormat::Mrs).is_err());
+        // Valid one-word arrays followed by a large label declaration and EOF.
+        for word in [2_u64, 6_u64] {
+            header.extend(1_i64.to_be_bytes());
+            header.extend(word.to_be_bytes());
+        }
+        header.extend(((MAX_RESOURCE_BYTES - 128) as i64).to_be_bytes());
+        let compressed = zstd::encode_all(header.as_slice(), 1).unwrap();
+        assert!(RuleCollection::parse(&compressed, RuleBehavior::Domain, RuleFormat::Mrs).is_err());
+    }
+
     #[test]
     fn classical_selectors_keep_complete_logical_domain_and_ip_predicates() {
         let geo = crate::routing::EmptyGeoMatcher;
