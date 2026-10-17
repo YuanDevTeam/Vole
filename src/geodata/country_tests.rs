@@ -41,6 +41,108 @@ fn stage(session: &GeoUpdateSession, bytes: &[u8]) -> ([u8; 32], u64) {
     (Sha256::digest(bytes).into(), bytes.len() as u64)
 }
 
+// Independently remove the one description entry from the existing synthetic
+// MMDB fixture. Tree/data/marker bytes keep their exact offsets.
+fn empty_description(fixture: &[u8]) -> Vec<u8> {
+    let description = b"\xe1\x42en\x56Vole synthetic country";
+    let start = fixture
+        .windows(description.len())
+        .position(|value| value == description)
+        .unwrap();
+    let mut bytes = fixture.to_vec();
+    bytes.splice(start..start + description.len(), [0xe0]);
+    bytes
+}
+
+#[test]
+fn country_mmdb_empty_description_keeps_original_bytes_metadata_and_lookup() {
+    for (fixture, filename) in [(SING, "geoip.db"), (META, "geoip.metadb")] {
+        let original = empty_description(fixture);
+        let metadata = {
+            let reader = maxminddb::Reader::from_source(original.as_slice()).unwrap();
+            assert!(reader.metadata().description.is_empty());
+            assert!(reader.verify().is_err());
+            reader.metadata().clone()
+        };
+        let mut bytes = original.clone();
+        bytes.reserve_exact(512);
+        let pointer = bytes.as_ptr();
+        country::verify_country_mmdb(&mut bytes).unwrap();
+        assert_eq!(bytes, original);
+        assert_eq!(bytes.as_ptr(), pointer);
+        let reader = maxminddb::Reader::from_source(bytes.as_slice()).unwrap();
+        assert_eq!(reader.metadata(), &metadata);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(filename);
+        fs::write(&path, &original).unwrap();
+        let manager =
+            GeoDataManager::open(directory.path().join("geodata"), Duration::from_secs(3600))
+                .unwrap();
+        let registration = manager
+            .register(GeoRequirements::for_config(&config()).unwrap())
+            .unwrap();
+        assert!(registration.initial_report().geoip.available);
+        let snapshot = registration.matcher().snapshot();
+        assert!(snapshot.matches_geoip("cn", "1.2.3.4".parse().unwrap()));
+        assert!(snapshot.matches_geoip("cn", "2001:db8::1".parse().unwrap()));
+        assert!(snapshot.matches_geoip("!cn", "8000::1".parse().unwrap()));
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+    // An empty description is not a general exception for other DB schemas.
+    let mut country = empty_description(COUNTRY);
+    let original = country.clone();
+    assert!(country::verify_country_mmdb(&mut country).is_err());
+    assert_eq!(country, original);
+}
+
+#[test]
+fn country_mmdb_empty_description_still_rejects_corrupt_tree_separator_and_data() {
+    for fixture in [SING, META] {
+        let valid = empty_description(fixture);
+        let metadata = maxminddb::Reader::from_source(valid.as_slice())
+            .unwrap()
+            .metadata()
+            .clone();
+        let tree_bytes = metadata.node_count as usize * usize::from(metadata.record_size) / 4;
+        for corruption in ["tree", "separator", "data-pointer", "utf8"] {
+            let mut bytes = valid.clone();
+            match corruption {
+                "tree" => bytes[..3].copy_from_slice(&[0xff; 3]),
+                "separator" => bytes[tree_bytes] = 1,
+                // Small pointer 0 resolves to its own record: verification
+                // must follow pointer targets rather than use IgnoredAny.
+                "data-pointer" => {
+                    bytes[tree_bytes + 16..tree_bytes + 18].copy_from_slice(&[0x20, 0])
+                }
+                "utf8" => {
+                    // CN string is the first data record for sing, and the
+                    // first element of the root array for Meta.
+                    let offset = if metadata.database_type == "sing-geoip" {
+                        17
+                    } else {
+                        19
+                    };
+                    bytes[tree_bytes + offset] = 0xff;
+                }
+                _ => unreachable!(),
+            }
+            let original = bytes.clone();
+            assert!(
+                country::verify_country_mmdb(&mut bytes).is_err(),
+                "{corruption}"
+            );
+            assert_eq!(bytes, original, "{corruption}");
+            assert_eq!(
+                maxminddb::Reader::from_source(bytes.as_slice())
+                    .unwrap()
+                    .metadata(),
+                &metadata
+            );
+        }
+    }
+}
+
 #[test]
 fn country_mmdb_schemas_share_route_source_collection_and_fallback() {
     for fixture in [COUNTRY, SING, META] {
