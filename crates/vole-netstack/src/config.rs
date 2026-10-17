@@ -18,7 +18,7 @@ pub struct ClientAddresses {
 ///
 /// Queue counts are hard limits. Each TCP buffer includes both the smoltcp
 /// socket buffer and the application-facing queue for one flow in that
-/// direction. Each layer reserves half of the configured total.
+/// direction. Each layer is bounded to half of the configured total.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetStackConfig {
     /// Maximum raw IP packet size and the IP-medium MTU advertised to smoltcp.

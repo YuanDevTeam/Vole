@@ -54,6 +54,7 @@ MTU 由 `tun.mtu` 配置，默认值和平台限制统一见 [TUN 平台层](tun
 ## TCP 与握手
 
 - TCP 流按需创建任务；TUN 转发每方向缓冲区为 4 KiB，通用 TCP relay 为 32 KiB。
+- netstack 的 TCP 应用队列从空分配按实际写入有界增长，保留每方向 16 KiB 逻辑上限；排空不收缩，连接释放时销毁。smoltcp 收发缓冲仍各为 16 KiB，不用进程内存或连接总数改变容量。
 - rustls/XHTTP 的配置缓冲区为 64 KiB；boring 每次应用写入最多 min(节点缓冲预算, 16 KiB)，原生 TLS 记录有界，命名模板证书消息/解压输出另限 128 KiB。
 - 标准 TLS 恢复会话总预算为 4，按节点（含独立下载端点）分配；每个缓存绑定不可变的 SNI、ALPN 和证书策略，绝不跨节点复用。TLS 1.3 票据有界、一次性消费，TLS 1.2 会话占用同一额度；额度为 0 则禁用恢复。REALITY 不参与该缓存。
 - 共享 TLS 客户端的显式验证名、协议版本、客户端证书身份和 ClientHello profile 也属于不可变策略，单独构造缓存，不跨身份共享。boring 只保存当前节点/SSL 上下文产生的票据，应用层 ALPN 接受前不发布，失败或取消丢弃临时票据。标准 TLS 和 REALITY CloseWrite 只发送 close_notify，刷新最多5秒，保持读方向和底层传输；Drop 释放整个流。XHTTP 仍以逻辑连接整体关闭为准。

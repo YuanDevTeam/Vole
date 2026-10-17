@@ -106,10 +106,12 @@ token 归还容量。满输出保留尚未处理的 TCP 包和协议状态，低
 丢当前请求。writer 消费包会显式唤醒 Driver；满输出不以零延迟 timer 忙重试，
 输出端关闭则停止 Driver、释放 socket 并唤醒全部等待者。
 
-netstack 的 TCP 接收与发送缓冲可独立配置，各方向的容量包含 smoltcp 与应用
-缓冲，两层各占一半。生产 TUN 仍从现有资源策略取得每方向 32 KiB，合计每流
-64 KiB 数据缓冲；不扩大默认容量、不新增用户 YAML 参数，也不改变其他协议
-的缓冲策略。该容量不包含代理 relay、包队列或 allocator 的内存。
+netstack 的 TCP 接收与发送缓冲可独立配置，各方向的容量包含 smoltcp 缓冲与应用
+队列，两层上限各占一半。生产 TUN 仍使用每方向 32 KiB、合计每流 64 KiB 的数据
+容量上限。应用队列从空分配开始，按实际写入有界增长，分配请求不超过该队列的
+逻辑上限；排空后保留已分配空间直到连接释放。smoltcp 缓冲容量、背压、唤醒、
+flush 与关闭语义保持不变。该容量不包含代理 relay、包队列或 allocator 的内存，
+也不保证进程 RSS 与数据容量相同。
 
 Linux 目前不启用 GRO/GSO：`tun-rs` 的 Linux offload 示例通过 builder 创建并
 配置带 VNET header 的设备，而 Vole 的原生和借用路径均不启用该模式。对现有 raw-IP

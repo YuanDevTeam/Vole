@@ -184,7 +184,7 @@ pub(crate) struct FlowKey {
     pub(crate) destination: SocketAddr,
 }
 
-/// A bounded queue whose allocation is made once when a flow is accepted.
+/// A bounded queue whose storage grows with use and is retained until drop.
 pub(crate) struct ByteQueue {
     bytes: Mutex<VecDeque<u8>>,
     capacity: usize,
@@ -193,7 +193,7 @@ pub(crate) struct ByteQueue {
 impl ByteQueue {
     fn new(capacity: usize) -> Self {
         Self {
-            bytes: Mutex::new(VecDeque::with_capacity(capacity)),
+            bytes: Mutex::new(VecDeque::new()),
             capacity,
         }
     }
@@ -207,6 +207,16 @@ impl ByteQueue {
     pub(crate) fn write(&self, source: &[u8]) -> usize {
         let mut bytes = self.lock();
         let count = source.len().min(self.capacity - bytes.len());
+        let needed = bytes.len() + count;
+        if needed > bytes.capacity() {
+            // Amortized VecDeque growth can overshoot even a power-of-two
+            // limit when the first write is an arbitrary-sized TCP segment.
+            let target = needed
+                .max(bytes.capacity().saturating_mul(2))
+                .min(self.capacity);
+            let additional = target - bytes.len();
+            bytes.reserve_exact(additional);
+        }
         bytes.extend(&source[..count]);
         count
     }
@@ -478,6 +488,68 @@ mod tests {
         let mut bytes = [0_u8; 8];
         assert_eq!(queue.read(&mut bytes), 4);
         assert_eq!(&bytes[..4], b"abcd");
+    }
+
+    #[test]
+    fn byte_queue_grows_with_use_without_exceeding_its_storage_limit() {
+        for limit in [16 * 1024, 16 * 1024 - 3] {
+            let queue = ByteQueue::new(limit);
+            assert_eq!(queue.lock().capacity(), 0);
+            assert_eq!(queue.write(&[]), 0);
+            assert_eq!(queue.lock().capacity(), 0);
+
+            assert_eq!(queue.write(&[42]), 1);
+            assert!(queue.lock().capacity() < limit);
+            let mut hello = [0];
+            assert_eq!(queue.read(&mut hello), 1);
+            assert_eq!(hello, [42]);
+
+            let payload: Vec<_> = (0_u8..=250).cycle().take(limit).collect();
+            for chunk in payload.chunks(1460) {
+                assert_eq!(queue.write(chunk), chunk.len());
+                assert!(queue.lock().capacity() <= limit);
+            }
+            let full_capacity = queue.lock().capacity();
+            assert_eq!(queue.len(), limit);
+            assert_eq!(queue.write(b"full"), 0);
+            assert_eq!(queue.lock().capacity(), full_capacity);
+
+            let mut prefix = vec![0; 6 * 1024];
+            assert_eq!(queue.read(&mut prefix), prefix.len());
+            assert_eq!(prefix, payload[..prefix.len()]);
+            let suffix = vec![7; prefix.len()];
+            assert_eq!(queue.write(&suffix), suffix.len());
+            let mut remaining = vec![0; limit];
+            let mut received = 0;
+            while received < limit {
+                let count = queue.read(&mut remaining[received..]);
+                assert!(count > 0);
+                received += count;
+            }
+            assert_eq!(&remaining[..limit - suffix.len()], &payload[prefix.len()..]);
+            assert_eq!(&remaining[limit - suffix.len()..], &suffix);
+            assert!(queue.is_empty());
+            assert_eq!(queue.lock().capacity(), full_capacity);
+        }
+
+        let queue = ByteQueue::new(13);
+        assert_eq!(queue.write(b"abcdef"), 6);
+        let mut prefix = [0; 4];
+        assert_eq!(queue.read(&mut prefix), 4);
+        assert_eq!(&prefix, b"abcd");
+        assert_eq!(queue.write(b"ghijkl"), 6);
+        assert!(queue.lock().capacity() <= 13);
+        assert_eq!(queue.write(b"mnopq"), 5);
+        assert_eq!(queue.write(b"full"), 0);
+        assert!(queue.lock().capacity() <= 13);
+        let mut remaining = [0; 13];
+        let mut received = 0;
+        while received < remaining.len() {
+            let count = queue.read(&mut remaining[received..]);
+            assert!(count > 0);
+            received += count;
+        }
+        assert_eq!(&remaining, b"efghijklmnopq");
     }
 
     #[tokio::test]
