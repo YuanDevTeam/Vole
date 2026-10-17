@@ -332,7 +332,7 @@ initial 大于 max 时保留初始值，不缩小或额外拒绝；max 限制到
 initial 拒绝。窗口是信用额度，不预分配整个缓冲。handshake-timeout 为整数秒，正值与
 原建链绝对期限取较早值，<=0 保留原期限；成功后的业务/端口跳跃不重新应用此期限。
 
-每连接未确认发送缓冲 1 MiB；节点 DATAGRAM 接收预算 1 MiB、发送 4 MiB，均分给连接。
+每连接未确认发送缓冲 1 MiB；节点 DATAGRAM 接收预算 2 MiB、发送 4 MiB，均分给连接。
 每连接最多 8 条单向
 控制流，拒绝主动双向流。PMTUD 关闭，最大 QUIC payload 1400 并取上游预算交集；
 空闲 30 秒/保活 10 秒。认证头 16 KiB，TCP 响应消息 2048/padding 4096 字节。
@@ -348,9 +348,11 @@ initial 拒绝。窗口是信用额度，不预分配整个缓冲。handshake-ti
 同一来源、具体节点和资源代际内，未改写的 IP 目标共用一个 UDP session ID 和交付队列；
 逐目标统计、取消与出口固定仍由路由层管理，退役及旧回复隔离沿用[资源策略](runtime-resource-policy.md#udp)。
 
-down 写入 Hysteria-CC-RX。up=0 或服务端 auto 使用 BBR，否则取 up 与服务端正上限
+down 写入 Hysteria-CC-RX。up=0 或服务端 auto 使用官方 Quinn CUBIC，否则取 up 与服务端正上限
 较小值（服务端 0 无限），使用固定带宽控制与实际 wire-byte pacer。Mihomo down=0
 可能返回 RxAuto，优先自动模式。丢包补偿五秒窗口、最小采样量、ACK 比例下限 0.8。
+自动模式采用 CUBIC 的本地策略，符合 [Hysteria 拥塞控制协议](https://hysteria.network/docs/developers/Protocol/#congestion-control)，
+不承诺与 Mihomo/官方客户端的 BBR 在高 RTT 或有损网络下性能相同。
 Salamander 采用公开 salt + XOR/BLAKE2b-256，每包加 8 字节，先扣 QUIC 预算但计入
 pacer；这是混淆不是认证，错误密钥由 QUIC 拒绝，短包有界丢弃。
 

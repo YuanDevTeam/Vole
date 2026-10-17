@@ -916,7 +916,7 @@
     },
     {
       "id": "hy2-datagram-receive-buffer",
-      "value": 1048576,
+      "value": 2097152,
       "unit": "bytes-per-node",
       "owner": "limits::HY2_DATAGRAM_RECEIVE_BUFFER",
       "saturation": "bound retained incoming QUIC datagrams; Quinn drops old frames when full",

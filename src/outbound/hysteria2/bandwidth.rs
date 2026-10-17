@@ -5,7 +5,7 @@ use crate::{
 use async_trait::async_trait;
 use quinn_proto::{
     RttEstimator,
-    congestion::{BbrConfig, Controller, ControllerFactory},
+    congestion::{Controller, ControllerFactory, CubicConfig},
 };
 use std::{
     io,
@@ -57,7 +57,7 @@ impl Bucket {
     }
 }
 
-/// Rate zero uses Quinn BBR. A positive negotiated rate installs Brutal's
+/// Rate zero uses official Quinn CUBIC. A positive negotiated rate installs Brutal's
 /// fixed-rate window policy and a separate wire-byte pacer. Quinn's own cwnd
 /// pacer is retained, but is not relied on as a configured bandwidth limit.
 pub(super) struct Bandwidth {
@@ -165,7 +165,7 @@ impl DatagramTransport for Paced {
 impl ControllerFactory for Bandwidth {
     fn build(self: Arc<Self>, now: Instant, mtu: u16) -> Box<dyn Controller> {
         Box::new(Switchable {
-            bbr: Arc::new(BbrConfig::default()).build(now, mtu),
+            automatic: Arc::new(CubicConfig::default()).build(now, mtu),
             shared: self,
             start: now,
             slots: [Slot::default(); 5],
@@ -181,7 +181,7 @@ struct Slot {
     lost: u64,
 }
 struct Switchable {
-    bbr: Box<dyn Controller>,
+    automatic: Box<dyn Controller>,
     shared: Arc<Bandwidth>,
     start: Instant,
     slots: [Slot; 5],
@@ -221,7 +221,7 @@ impl Switchable {
 }
 impl Controller for Switchable {
     fn on_sent(&mut self, now: Instant, bytes: u64, packet: u64) {
-        self.bbr.on_sent(now, bytes, packet);
+        self.automatic.on_sent(now, bytes, packet);
     }
     fn on_ack(
         &mut self,
@@ -231,24 +231,25 @@ impl Controller for Switchable {
         limited: bool,
         rtt: &RttEstimator,
     ) {
-        self.bbr.on_ack(now, sent, bytes, limited, rtt);
+        self.automatic.on_ack(now, sent, bytes, limited, rtt);
         self.rtt = rtt.get();
         self.sample(now, u64::from(bytes > 0), 0);
     }
     fn on_end_acks(&mut self, now: Instant, flight: u64, limited: bool, largest: Option<u64>) {
-        self.bbr.on_end_acks(now, flight, limited, largest);
+        self.automatic.on_end_acks(now, flight, limited, largest);
     }
     fn on_congestion_event(&mut self, now: Instant, sent: Instant, persistent: bool, lost: u64) {
-        self.bbr.on_congestion_event(now, sent, persistent, lost);
+        self.automatic
+            .on_congestion_event(now, sent, persistent, lost);
         self.sample(now, 0, lost.div_ceil(u64::from(self.mtu)));
     }
     fn on_mtu_update(&mut self, mtu: u16) {
         self.mtu = mtu;
-        self.bbr.on_mtu_update(mtu);
+        self.automatic.on_mtu_update(mtu);
     }
     fn window(&self) -> u64 {
         if self.shared.rate.load(Ordering::Relaxed) == 0 {
-            return self.bbr.window();
+            return self.automatic.window();
         }
         // Keep enough flight space for Quinn's delayed ACKs at very low RTT.
         // The independent wire pacer, not this floor, enforces the exact rate.
@@ -257,11 +258,11 @@ impl Controller for Switchable {
             .max(u64::from(self.mtu) * 2)
     }
     fn initial_window(&self) -> u64 {
-        self.bbr.initial_window()
+        self.automatic.initial_window()
     }
     fn clone_box(&self) -> Box<dyn Controller> {
         Box::new(Self {
-            bbr: self.bbr.clone_box(),
+            automatic: self.automatic.clone_box(),
             shared: self.shared.clone(),
             start: self.start,
             slots: self.slots,
