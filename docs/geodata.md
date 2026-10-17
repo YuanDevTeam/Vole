@@ -91,15 +91,21 @@ MRS 不能直接替代 GeoSite/GeoIP 资产；sing-box 的 `geosite.db` 与 SRS 
 国家库支持 MaxMind `country.iso_code`、`sing-geoip` 根字符串和 `Meta-geoip0` 根字符串/字符串数组。
 `.db`、`.metadb` 和 `.mmdb` 是文件命名；实际 schema 由 MMDB metadata 识别，不使用 SQLite。
 MaxMind 国家代码按 ASCII 大小写折叠，sing/Meta 保留原字符串大小写。国家库与 DAT 二选一，
-GEOIP、来源规则、classical/地址选择器及 DNS fallback 共用一个 owned Reader；查询借用字符串，
-Meta 多 code 的临时索引只保存引用。没有全量 CIDR 展开或逐地址缓存。缺库、坏索引和无效记录
+GEOIP、来源规则、classical/地址选择器及 DNS fallback 共用一个国家库快照。
+MaxMind/sing 使用 owned Reader，查询借用字符串。Meta 完整校验后优先将配置引用的
+分类投影为与 DAT 共用的紧凑 CIDR，正反选择器共享分类，保留多 code、IPv4/IPv6、
+别名地址及无记录地址的语义；构建完成后释放原始文件缓冲，磁盘资产保持原样。
+投影不更省内存、遍历不适合或记录无法按 Meta schema 解码时，保留原 Reader，
+不截断记录或拒绝原本可用的库。Reader 路径的多 code 临时索引只保存字符串引用。
+不建立逐地址缓存。缺库、坏索引和无效记录
 不通过反选成为全匹配；有效库的无记录地址按空 code 集合处理。
 保留 maxminddb 的默认单次解码与索引验证保护；解码错误不当作合法的空记录。
 官方 `sing-geoip` / `Meta-geoip0` 的空 description 可加载：只在元数据图已完整验证且
 唯一错误为描述为空时，以临时描述完成原库的全部索引与数据校验，再恢复原字节和元数据。
 此兼容不改写磁盘资产，不放宽指针、separator 或数据图验证。
 
-国家 MMDB 更新与 ASN 同样先借用候选字节完整校验，旧读者排空后移动该缓冲到 owned Reader；
+国家 MMDB 更新与 ASN 同样先借用候选字节完整校验，旧读者排空后构建国家库表示，
+或将同一缓冲移动到 owned Reader；
 无效候选、取消或提交失败保留/恢复旧代。模式和实际文件名共同绑定调度来源与 ETag/hash，
 下载暂存及原子替换始终使用被选中的实际路径，GeoSite/ASN 的存储与状态目录不变。
 
@@ -295,7 +301,8 @@ fallible Vec 扩容、合法 protobuf 帧/长度、code、选中匹配值的 UTF
 容量账本仅作诊断：统计 Vole 自有 matcher/index/value/临时 Vec 的可见容量，扩容时
 记录新旧缓冲可能重叠的容量；没有最大值、不控制准入。`regex::bytes::Regex` 不提供
 完整内部状态的准确 `memory_usage`；国家/ASN 文件缓冲容量计入快照容量，借用候选
-验证期的新旧字节重叠、Meta 多 code 查询的临时引用索引与 MMDB metadata/图校验状态未计入。因此账本**不包含正则内部编译状态、搜索缓存、
+验证期的新旧字节重叠、Meta 投影构建期间的源字节、Reader 路径的多 code 临时引用索引与
+MMDB metadata/图校验状态未计入。因此账本**不包含正则内部编译状态、搜索缓存、
 动态 scratch、配置需求集合、allocator 开销或整个进程 footprint**。这些未计入的
 内存并不是零；accounted peak 不能作为加载或运行期峰值上界。
 进程 RSS 的硬上限与 1/2/3Gbps 分档压力标准统一见[验收边界](acceptance.md#性能采纳标准)，

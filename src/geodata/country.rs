@@ -1,14 +1,17 @@
-//! One country MMDB, queried in place without expanding its network tree.
+//! Verified country MMDBs, with selective compact indexes for Meta records.
 
 use std::{fmt, io::Read, net::IpAddr, path::Path};
 
-use maxminddb::{MaxMindDbError, Metadata, Reader};
+use maxminddb::{MaxMindDbError, Metadata, Reader, WithinOptions};
 use serde::{
     Deserialize,
     de::{self, SeqAccess, Visitor},
 };
 
-use super::{GeoDataError, open_asset_path, selector_code};
+use super::{
+    AllocationLedger, Cidr4, Cidr6, Code, GeoDataError, GeoDataKind, IpCategory, compact_v4,
+    compact_v6, compact_vec, ensure_vec_capacity, open_asset_path, selector_code,
+};
 
 const METADATA_MARKER: &[u8] = b"\xab\xcd\xefMaxMind.com";
 const METADATA_HEADROOM: usize = 512;
@@ -32,10 +35,20 @@ impl Format {
 }
 
 pub(super) struct CountryDb {
-    reader: Reader<Vec<u8>>,
-    format: Format,
+    storage: Storage,
     selectors: Vec<String>,
     capacity: usize,
+}
+
+enum Storage {
+    Reader {
+        reader: Reader<Vec<u8>>,
+        format: Format,
+    },
+    Meta {
+        categories: Vec<IpCategory>,
+        ipv6: bool,
+    },
 }
 
 impl CountryDb {
@@ -61,11 +74,26 @@ impl CountryDb {
         if !self.available(selector) {
             return false;
         }
-        let Ok(record) = self.reader.lookup(address) else {
+        let code = selector_code(selector);
+        let (reader, format) = match &self.storage {
+            Storage::Reader { reader, format } => (reader, format),
+            Storage::Meta { categories, ipv6 } => {
+                // Reader rejects IPv6 queries against IPv4-only databases,
+                // including inverse selectors. This is not a no-record result.
+                if !ipv6 && address.is_ipv6() {
+                    return false;
+                }
+                let matched = categories
+                    .binary_search_by(|category| category.code.cmp_str(code))
+                    .ok()
+                    .is_some_and(|at| categories[at].matches(address));
+                return matched != selector.starts_with('!');
+            }
+        };
+        let Ok(record) = reader.lookup(address) else {
             return false;
         };
-        let code = selector_code(selector);
-        let matched = match self.format {
+        let matched = match format {
             Format::MaxMind => {
                 match record.decode_path::<&str>(&maxminddb::path!["country", "iso_code"]) {
                     Ok(value) => value.is_some_and(|value| value.eq_ignore_ascii_case(code)),
@@ -179,25 +207,165 @@ impl CountryCandidate {
             stored.push(value);
         }
         stored.sort_unstable();
-        let capacity = stored
+        let selector_capacity = stored
             .iter()
             .fold(
-                stored
-                    .capacity()
-                    .checked_mul(std::mem::size_of::<String>())
-                    .and_then(|count| self.bytes.capacity().checked_add(count)),
+                stored.capacity().checked_mul(std::mem::size_of::<String>()),
                 |total, value| total.and_then(|total| total.checked_add(value.capacity())),
             )
             .ok_or(GeoDataError::AllocationFailed { bytes: usize::MAX })?;
-        let reader =
-            Reader::from_source(self.bytes).map_err(|_| invalid("invalid country MMDB"))?;
+        let projected = if matches!(self.format, Format::Meta) {
+            match project_meta(&self.bytes, &stored) {
+                Ok(projected) => projected,
+                Err(GeoDataError::AllocationFailed { .. }) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let (storage, capacity) = match projected {
+            Some((categories, capacity, ipv6)) => {
+                // Drop the verified file after projection; it is not retained
+                // alongside the selected immutable CIDRs.
+                (Storage::Meta { categories, ipv6 }, capacity)
+            }
+            None => {
+                let capacity = self.bytes.capacity();
+                let reader =
+                    Reader::from_source(self.bytes).map_err(|_| invalid("invalid country MMDB"))?;
+                (
+                    Storage::Reader {
+                        reader,
+                        format: self.format,
+                    },
+                    capacity,
+                )
+            }
+        };
+        let capacity = capacity
+            .checked_add(selector_capacity)
+            .ok_or(GeoDataError::AllocationFailed { bytes: usize::MAX })?;
         Ok(CountryDb {
-            reader,
-            format: self.format,
+            storage,
             selectors: stored,
             capacity,
         })
     }
+}
+
+/// A representation choice, never a resource admission limit. Invalid Meta
+/// record types retain Reader's per-address error behavior, and a projection
+/// that is not smaller than the file retains the original reader as well.
+fn project_meta(
+    bytes: &[u8],
+    selectors: &[String],
+) -> Result<Option<(Vec<IpCategory>, usize, bool)>, GeoDataError> {
+    let reader = Reader::from_source(bytes).map_err(|_| invalid("invalid country MMDB"))?;
+    let ipv6 = reader.metadata().ip_version == 6;
+    let mut ledger = AllocationLedger::default();
+    let mut categories: Vec<IpCategory> = Vec::new();
+    for selector in selectors {
+        let code = Code::parse(GeoDataKind::GeoIp, selector_code(selector).as_bytes())?;
+        ensure_vec_capacity(&mut categories, 1, &mut ledger)?;
+        categories.push(IpCategory {
+            code,
+            v4: Vec::new(),
+            v6: Vec::new(),
+            selectors: Vec::new(),
+        });
+    }
+    categories.sort_unstable_by_key(|category| category.code);
+    categories.dedup_by_key(|category| category.code);
+    compact_vec(&mut categories, &mut ledger)?;
+    if ledger.used >= bytes.len() {
+        return Ok(None);
+    }
+    let Ok(networks) = reader.networks(WithinOptions::default().include_aliased_networks()) else {
+        return Ok(None);
+    };
+    for (visited, record) in networks.enumerate() {
+        // Aliases can revisit the same verified subtree. If projection work
+        // ceases to be proportional to this file, keep its compact MMDB tree.
+        if visited >= bytes.len() {
+            return Ok(None);
+        }
+        let Ok(record) = record else { return Ok(None) };
+        let Ok(Some(codes)) = record.decode::<BorrowedCodes<'_>>() else {
+            return Ok(None);
+        };
+        let Ok(network) = record.network() else {
+            return Ok(None);
+        };
+        let codes: &[&str] = match &codes {
+            BorrowedCodes::One(code) => std::slice::from_ref(code),
+            BorrowedCodes::Many(codes) => codes,
+        };
+        for code in codes {
+            // Stored Meta strings are case-sensitive. Only selectors are
+            // canonicalized; an uppercase record must not gain a new match.
+            let Ok(at) = categories.binary_search_by(|category| category.code.as_str().cmp(code))
+            else {
+                continue;
+            };
+            let category = &mut categories[at];
+            match network.network() {
+                IpAddr::V4(address) => {
+                    ensure_vec_capacity(&mut category.v4, 1, &mut ledger)?;
+                    category.v4.push(Cidr4 {
+                        network: address.octets(),
+                        prefix: network.prefix(),
+                    });
+                    if ipv6 {
+                        // The iterator formats the ::/96 IPv4 subtree as V4.
+                        // Literal IPv6 lookups in that subtree still match it.
+                        ensure_vec_capacity(&mut category.v6, 1, &mut ledger)?;
+                        category.v6.push(Cidr6 {
+                            network: u128::from(u32::from(address)).to_be_bytes(),
+                            prefix: network.prefix() + 96,
+                        });
+                    }
+                }
+                IpAddr::V6(address) => {
+                    ensure_vec_capacity(&mut category.v6, 1, &mut ledger)?;
+                    category.v6.push(Cidr6 {
+                        network: address.octets(),
+                        prefix: network.prefix(),
+                    });
+                    if address.is_unspecified() && network.prefix() <= 96 {
+                        // A data leaf above the IPv4 subtree answers every V4
+                        // lookup, while remaining a V6 CIDR for V6 lookups.
+                        ensure_vec_capacity(&mut category.v4, 1, &mut ledger)?;
+                        category.v4.push(Cidr4 {
+                            network: [0; 4],
+                            prefix: 0,
+                        });
+                    }
+                }
+            }
+        }
+        if ledger.used >= bytes.len() {
+            compact_projection(&mut categories, &mut ledger)?;
+            if ledger.used >= bytes.len() {
+                return Ok(None);
+            }
+        }
+    }
+    compact_projection(&mut categories, &mut ledger)?;
+    compact_vec(&mut categories, &mut ledger)?;
+    Ok((ledger.used < bytes.len()).then_some((categories, ledger.used, ipv6)))
+}
+
+fn compact_projection(
+    categories: &mut [IpCategory],
+    ledger: &mut AllocationLedger,
+) -> Result<(), GeoDataError> {
+    for category in categories {
+        compact_v4(&mut category.v4);
+        compact_v6(&mut category.v6);
+        compact_vec(&mut category.v4, ledger)?;
+        compact_vec(&mut category.v6, ledger)?;
+    }
+    Ok(())
 }
 
 /// Some official sing/Meta databases have a valid empty description map.
