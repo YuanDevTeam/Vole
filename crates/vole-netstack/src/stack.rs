@@ -1045,7 +1045,7 @@ impl Driver {
             let handle = &entry.handle;
 
             let mut received = false;
-            while socket.can_recv() && !handle.app_recv.is_full() {
+            while socket.can_recv() {
                 match socket.recv(|bytes| {
                     let count = handle.app_recv.write(bytes);
                     (count, count)
@@ -1059,7 +1059,7 @@ impl Driver {
             }
 
             let mut sent = false;
-            while socket.can_send() && !handle.app_send.is_empty() {
+            while socket.can_send() {
                 match socket.send(|bytes| {
                     let count = handle.app_send.read(bytes);
                     (count, count)

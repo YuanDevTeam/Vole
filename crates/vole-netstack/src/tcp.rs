@@ -221,10 +221,6 @@ impl ByteQueue {
         self.lock().is_empty()
     }
 
-    pub(crate) fn is_full(&self) -> bool {
-        self.lock().len() == self.capacity
-    }
-
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.lock().len()
