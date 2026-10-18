@@ -52,6 +52,13 @@ impl<'a> IdentityFiles<'a> {
             return Ok(());
         }
         self.inline_pair(map)?;
+        if map.get("type").and_then(Value::as_str) == Some("hysteria2") {
+            if let Some(realm) = map.get_mut("realm-opts").and_then(Value::as_mapping_mut)
+                && realm.get("enable").and_then(Value::as_bool) == Some(true)
+            {
+                self.inline_pair(realm)?;
+            }
+        }
         if let Some(download) = map
             .get_mut("xhttp-opts")
             .and_then(Value::as_mapping_mut)
@@ -132,5 +139,54 @@ mod tests {
         assert_eq!(files.read("first").unwrap(), "ab");
         assert!(files.read("second").is_err());
         assert!(files.read(".").is_err());
+    }
+}
+
+#[cfg(all(test, feature = "outbound-hysteria2"))]
+mod realm_tests {
+    use super::*;
+    #[test]
+    fn realm_identity_files_use_the_same_generation_budget_and_directory() {
+        use base64::Engine as _;
+        let identity = rcgen::generate_simple_self_signed(vec!["client.invalid".into()]).unwrap();
+        let pem = |label: &str, bytes: &[u8]| {
+            format!(
+                "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        };
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("client.crt"),
+            pem("CERTIFICATE", identity.cert.der()),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("client.key"),
+            pem("PRIVATE KEY", &identity.signing_key.serialize_der()),
+        )
+        .unwrap();
+        let input = serde_json::json!({"proxies":[{"type":"hysteria2","name":"edge","server":"peer.invalid","port":443,"password":"synthetic","realm-opts":{"enable":true,"server-url":"https://control.invalid","realm-id":"synthetic-zone","stun-servers":["192.0.2.1"],"certificate":"client.crt","private-key":"client.key"}}]});
+        let bytes = serde_json::to_vec(&input).unwrap();
+        let config =
+            super::super::Config::parse_yaml_with_directory(&bytes, Some(directory.path()))
+                .unwrap();
+        let super::super::ProxyProtocol::Hysteria2(node) = &config.proxies[0].protocol else {
+            panic!("HY2")
+        };
+        assert!(
+            node.realm
+                .as_ref()
+                .unwrap()
+                .tls
+                .as_ref()
+                .unwrap()
+                .identity
+                .is_some()
+        );
+        let mut source: Value = serde_yaml_ng::from_slice(&bytes).unwrap();
+        let mut files = IdentityFiles::new(Some(directory.path()));
+        files.remaining = 1;
+        assert!(files.inline_node(&mut source["proxies"][0]).is_err());
     }
 }

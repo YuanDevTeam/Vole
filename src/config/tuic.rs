@@ -41,6 +41,7 @@ pub struct TuicOutboundConfig {
     pub max_datagram_frame_size: u16,
     pub disable_mtu_discovery: bool,
     pub udp_over_stream: bool,
+    pub disable_sni: bool,
 }
 
 impl std::fmt::Debug for TuicOutboundConfig {
@@ -94,6 +95,8 @@ pub(super) struct RawTuic {
     max_datagram_frame_size: i64,
     #[serde(default)]
     disable_mtu_discovery: bool,
+    #[serde(default)]
+    disable_sni: bool,
     #[serde(default)]
     udp_over_stream: bool,
     #[serde(default, deserialize_with = "super::deserialize_present_option")]
@@ -192,6 +195,7 @@ impl RawTuic {
             max_udp_relay_packet_size: frame.saturating_sub(29).max(0) as u16,
             max_datagram_frame_size: frame as u16,
             disable_mtu_discovery: self.disable_mtu_discovery,
+            disable_sni: self.disable_sni,
             udp_over_stream: self.udp_over_stream,
             tls: TlsConfig {
                 server_name: self

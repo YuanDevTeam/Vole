@@ -639,7 +639,11 @@ impl std::fmt::Debug for UpstreamPath {
 impl UpstreamPath {
     /// A multi-endpoint node shares the declared graph, while each
     /// physical peer has its own server and may refresh a previously pinned IP.
-    #[cfg(any(feature = "outbound-wireguard", feature = "outbound-mieru"))]
+    #[cfg(any(
+        feature = "outbound-wireguard",
+        feature = "outbound-mieru",
+        feature = "outbound-hysteria2"
+    ))]
     pub(crate) fn for_server(&self, server: &Destination, refresh: bool) -> Self {
         match self {
             Self::Direct { endpoint, dialer }

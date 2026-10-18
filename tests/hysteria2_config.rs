@@ -243,7 +243,7 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         raw["hop-interval"] = value;
         assert!(parse(raw).is_err());
     }
-    for value in [json!(""), json!("gecko")] {
+    for value in [json!("")] {
         let mut raw = base.clone();
         raw["obfs"] = value;
         raw["obfs-password"] = json!("secret");

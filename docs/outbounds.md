@@ -373,9 +373,24 @@ port 为 1–65535，仅提供 ports 时可省略；显式非法 port 仍拒绝�
   十进制倍率，bit 向下取整为 byte/s。省略/归一零为自动；拒绝小数、符号、溢出。
 - udp-mtu 缺省/0 为 1400，其他值 64–65535，限制编码后单分片并取实际 DATAGRAM
   预算交集，不是 TUN MTU。
-- obfs 只允许 salamander，须配非空独立 obfs-password。
+- obfs 支持 salamander 或 gecko，须配非空独立 obfs-password。Gecko 对 QUIC 长头随机分片并填充，
+  短头只用 Salamander；`obfs-min-packet-size/obfs-max-packet-size` 默认512/1200，
+  正值且 min≤max≤2048，只用于 Gecko。max 是填充目标，不是 QUIC MTU，实际片仍受物理预算限制。
 - ports 是归一去重的非空端口/闭区间集合，优先于合法 port。hop-interval 仅随 ports：
   整数秒 N、字符串 N 或 N-M，默认 30，5 ≤ N ≤ M ≤ u32::MAX；过短严格拒绝。
+
+`realm-opts.enable: true` 使用 Realm 控制面/STUN/UDP 打洞，和 ports 跳端口互斥。
+必填 server-url、realm-id 与非空 stun-servers；token 默认空，服务端按实际认证处理。
+server-url 为无 userinfo/query/fragment 的 HTTP(S) base URL，不跟随重定向。
+STUN 可用 IP/域名及可选端口，默认3478；每个域名使用一个受控解析地址，同时探测两族应列出两族端点。
+HTTPS 控制面独立接受 sni/alpn、skip-cert-verify/name-cert-verify/fingerprint 与成对
+certificate/private-key（内联 PEM 或相对配置目录的文件）；它们不改变业务 QUIC 身份。
+实际 UDP 对端由 Realm 发现，但原节点 server/SNI 仍用于 QUIC 认证，不解析未使用的原 server。
+
+最多2个候选UDP association、16个STUN、32个控制面peer、128个打洞候选；首部/body各16KiB，
+所有网络操作使用同一节点受控出口、建立期限和取消。胜出的原 association 移交 Quinn，
+失败/取消/Stop 关闭未交付候选并等待驱动。无额外 resolver、物理 socket 工厂或 DIRECT 回落。
+Gecko 重组最多8个消息/每消息8片/1400字节，TTL8秒，不保留 padding backing。
 
 up/down 均为零时，每节点一个当前认证 QUIC 会话；显式带宽模式按需使用最多两个，
 按来源地址稳定选择，分担对端逐连接 UDP 处理。上行共用节点 wire pacer，
@@ -432,6 +447,8 @@ pacer；这是混淆不是认证，错误密钥由 QUIC 拒绝，短包有界丢
 固定 QUIC/TLS 1.3，复用官方 Quinn、rustls/ring 与共享受控数据报适配器。
 仅 v5；必填标准 UUID。password 为原样 UTF-8，省略/空串为空密码，最长 65,535 字节。
 SNI 缺省 server，ALPN 缺省 h3；显式空列表拒绝，非空有序列表必须实际协商命中。
+`disable-sni: true` 只关闭 ClientHello 的 SNI，仍验证原认证名/显式 name-cert-verify 和 pin，
+不隐式关闭证书验证。
 使用共享 pin/skip/独立验证名，支持配对内联 PEM 或文件路径的 certificate/private-key 客户端身份；无命名 TCP 指纹、ECH、0-RTT 或跨节点恢复。
 拥塞使用官方 Quinn cubic（默认）、new_reno 或 bbr，不承诺与其他实现的吞吐相同。
 `log-level: debug` 在物理会话建立后记录实际 controller 的固定算法标签；

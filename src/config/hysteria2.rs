@@ -17,10 +17,27 @@ pub struct Hysteria2OutboundConfig {
     pub down: u64,
     pub udp_mtu: u16,
     pub obfs_password: Option<String>,
+    pub gecko: Option<Hysteria2Gecko>,
+    pub realm: Option<super::Hysteria2Realm>,
     pub hopping: Option<Hysteria2Hopping>,
     pub stream_window: super::QuicReceiveWindow,
     pub connection_window: super::QuicReceiveWindow,
     pub handshake_timeout: std::time::Duration,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct Hysteria2Gecko {
+    pub password: String,
+    pub min_packet_size: u16,
+    pub max_packet_size: u16,
+}
+impl std::fmt::Debug for Hysteria2Gecko {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hysteria2Gecko")
+            .field("min_packet_size", &self.min_packet_size)
+            .field("max_packet_size", &self.max_packet_size)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +117,16 @@ pub(super) struct RawHysteria2 {
         deserialize_with = "deserialize_present_option"
     )]
     obfs_password: Option<String>,
+    #[serde(rename = "obfs-min-packet-size", default)]
+    obfs_min_packet_size: i64,
+    #[serde(rename = "obfs-max-packet-size", default)]
+    obfs_max_packet_size: i64,
+    #[serde(
+        rename = "realm-opts",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    realm: Option<super::hysteria2_realm::RawRealm>,
     #[serde(rename = "initial-stream-receive-window", default)]
     initial_stream_receive_window: u64,
     #[serde(rename = "max-stream-receive-window", default)]
@@ -171,13 +198,48 @@ impl RawHysteria2 {
         {
             return invalid("invalid or over-limit Hysteria2 authentication header");
         }
-        let obfs_password = match (
-            self.obfs.as_deref().filter(|obfs| !obfs.is_empty()),
+        let realm = self.realm.map(|raw| raw.normalize()).transpose()?.flatten();
+        if realm.is_some() && hopping.is_some() {
+            return invalid("Hysteria2 Realm and ports are mutually exclusive");
+        }
+        let (obfs_password, gecko) = match (
+            self.obfs.as_deref().filter(|value| !value.is_empty()),
             self.obfs_password,
         ) {
-            (None, None) => None,
-            (Some("salamander"), Some(password)) if !password.is_empty() => Some(password),
-            _ => return invalid("Hysteria2 Salamander requires obfs and a nonempty obfs-password"),
+            (None, None) if self.obfs_min_packet_size == 0 && self.obfs_max_packet_size == 0 => {
+                (None, None)
+            }
+            (Some("salamander"), Some(password))
+                if !password.is_empty()
+                    && self.obfs_min_packet_size == 0
+                    && self.obfs_max_packet_size == 0 =>
+            {
+                (Some(password), None)
+            }
+            (Some("gecko"), Some(password)) if !password.is_empty() => {
+                let min = if self.obfs_min_packet_size == 0 {
+                    512
+                } else {
+                    self.obfs_min_packet_size
+                };
+                let max = if self.obfs_max_packet_size == 0 {
+                    1200
+                } else {
+                    self.obfs_max_packet_size
+                };
+                if min <= 0 || min > max || max > 2048 {
+                    return invalid("invalid Hysteria2 Gecko packet size range");
+                }
+                (
+                    None,
+                    Some(Hysteria2Gecko {
+                        password,
+                        min_packet_size: min as u16,
+                        max_packet_size: max as u16,
+                    }),
+                )
+            }
+            _ => return invalid("invalid Hysteria2 obfuscation options"),
         };
         let server_name = self
             .sni
@@ -237,6 +299,8 @@ impl RawHysteria2 {
                 down: parse_rate(self.down)?,
                 udp_mtu,
                 obfs_password,
+                gecko,
+                realm,
                 hopping,
                 stream_window: super::QuicReceiveWindow::normalize(
                     self.initial_stream_receive_window,
@@ -327,4 +391,33 @@ fn parse_interval(value: Option<&NumberOrText>) -> Result<(u32, u32)> {
         return invalid("Hysteria2 hop-interval requires 5 <= min <= max <= 4294967295 seconds");
     }
     Ok((start, end))
+}
+
+#[cfg(all(test, feature = "outbound-hysteria2"))]
+mod p08_tests {
+    use super::*;
+    fn parse(extra: serde_json::Value) -> Result<Hysteria2OutboundConfig> {
+        let mut raw = serde_json::json!({"name":"edge","server":"peer.invalid","port":443});
+        raw.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let raw: RawHysteria2 = serde_json::from_value(raw).unwrap();
+        let (_, _, _, ProxyProtocol::Hysteria2(config)) = raw.normalize()? else {
+            panic!("HY2")
+        };
+        Ok(config)
+    }
+    #[test]
+    fn gecko_options_consume_actual_min_max_and_realm_excludes_hopping() {
+        let gecko=parse(serde_json::json!({"obfs":"gecko","obfs-password":"private","obfs-min-packet-size":600,"obfs-max-packet-size":1400})).unwrap().gecko.unwrap();
+        assert_eq!((gecko.min_packet_size, gecko.max_packet_size), (600, 1400));
+        assert!(!format!("{gecko:?}").contains("private"));
+        for fields in [
+            serde_json::json!({"obfs":"gecko","obfs-password":"private","obfs-min-packet-size":1401,"obfs-max-packet-size":1400}),
+            serde_json::json!({"obfs":"salamander","obfs-password":"private","obfs-max-packet-size":1200}),
+            serde_json::json!({"ports":"443,8443","realm-opts":{"enable":true,"server-url":"https://control.example","realm-id":"zone","stun-servers":["192.0.2.1"]}}),
+        ] {
+            assert!(parse(fields).is_err());
+        }
+    }
 }

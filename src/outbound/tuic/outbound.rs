@@ -121,7 +121,7 @@ impl TuicOutbound {
         buffer_limit: usize,
     ) -> io::Result<Self> {
         config.validate().map_err(failure)?;
-        let tls = StandardTlsClient::with_options(
+        let mut tls = StandardTlsClient::with_options(
             security,
             &config.tls.server_name,
             TlsClientOptions {
@@ -146,6 +146,9 @@ impl TuicOutbound {
         )?
         .quic_config()?
         .0;
+        // Suppress only the extension. Quinn still supplies the immutable
+        // server name to the same WebPKI/pin verifier; no implicit skip.
+        Arc::make_mut(&mut tls).enable_sni = !config.disable_sni;
         Ok(Self {
             config: Arc::new(config.clone()),
             server: server_destination(
@@ -459,5 +462,61 @@ async fn drive(
     runtime.stop().await;
     if let Some(driver) = driver {
         let _ = driver.stop().await;
+    }
+}
+
+#[cfg(test)]
+mod p08_tests {
+    use super::*;
+    fn sni_extension(hello: &[u8]) -> bool {
+        assert_eq!(hello[0], 1);
+        let mut at = 4 + 2 + 32;
+        at += 1 + usize::from(hello[at]);
+        let ciphers = usize::from(u16::from_be_bytes([hello[at], hello[at + 1]]));
+        at += 2 + ciphers;
+        at += 1 + usize::from(hello[at]);
+        let end = at + 2 + usize::from(u16::from_be_bytes([hello[at], hello[at + 1]]));
+        at += 2;
+        while at < end {
+            let kind = u16::from_be_bytes([hello[at], hello[at + 1]]);
+            let len = usize::from(u16::from_be_bytes([hello[at + 2], hello[at + 3]]));
+            if kind == 0 {
+                return true;
+            }
+            at += 4 + len;
+        }
+        false
+    }
+    #[test]
+    fn tuic_disable_sni_changes_real_quic_hello_without_changing_verification_policy() {
+        for disable in [false, true] {
+            let config=crate::config::Config::parse_yaml(serde_json::json!({"proxies":[{"name":"edge","type":"tuic","server":"peer.invalid","port":443,"uuid":"01234567-89ab-cdef-0123-456789abcdef","disable-sni":disable,"name-cert-verify":"identity.example","fingerprint":"12".repeat(32)}]}).to_string().as_bytes()).unwrap();
+            let crate::config::ProxyProtocol::Tuic(config) = &config.proxies[0].protocol else {
+                panic!("TUIC")
+            };
+            assert!(!config.tls.certificate.skip_cert_verify);
+            assert_eq!(
+                config.tls.certificate.verification_name.as_deref(),
+                Some("identity.example")
+            );
+            assert_eq!(config.tls.certificate.fingerprint, Some([0x12; 32]));
+            let node = TuicOutbound::new_with_path(
+                config,
+                UpstreamPath::LazyDirect {
+                    dialer: crate::dialer::Dialer::default(),
+                },
+            )
+            .unwrap();
+            let mut connection = rustls::quic::ClientConnection::new(
+                node.tls.clone(),
+                rustls::quic::Version::V1,
+                rustls::pki_types::ServerName::try_from(config.tls.server_name.clone()).unwrap(),
+                Vec::new(),
+            )
+            .unwrap();
+            let mut hello = Vec::new();
+            connection.write_hs(&mut hello);
+            assert_eq!(sni_extension(&hello), !disable);
+        }
     }
 }

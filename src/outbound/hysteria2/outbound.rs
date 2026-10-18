@@ -35,6 +35,7 @@ pub struct Hysteria2Outbound {
     server: Destination,
     upstream: UpstreamPath,
     tls: StandardTlsClient,
+    realm_tls: Option<StandardTlsClient>,
     current: Box<[AsyncMutex<Option<Arc<Session>>>]>,
     pacer: Arc<super::bandwidth::Pacer>,
     cancel: CancellationToken,
@@ -115,6 +116,35 @@ impl Hysteria2Outbound {
             resumption_sessions,
             buffer_limit,
         )?;
+        let realm_tls = config
+            .realm
+            .as_ref()
+            .and_then(|options| options.tls.as_ref())
+            .map(|policy| {
+                StandardTlsClient::with_options(
+                    security,
+                    &policy.server_name,
+                    TlsClientOptions {
+                        versions: TlsVersions::Tls12And13,
+                        alpn: policy.alpn.clone(),
+                        certificate: policy.certificate.clone(),
+                        identity: policy
+                            .identity
+                            .as_ref()
+                            .map(|identity| {
+                                TlsClientIdentity::from_pem(
+                                    &identity.certificate,
+                                    &identity.private_key,
+                                )
+                            })
+                            .transpose()?,
+                        ..Default::default()
+                    },
+                    0,
+                    buffer_limit,
+                )
+            })
+            .transpose()?;
         // Explicit bandwidth modes spread UDP receive/forward work across a
         // small fixed pool. A one-byte receive declaration cannot be divided.
         let count = if (config.up > 0 || config.down > 0) && config.down != 1 {
@@ -127,6 +157,7 @@ impl Hysteria2Outbound {
             server: server_destination(&config.address, config.port)?,
             upstream,
             tls,
+            realm_tls,
             current: (0..count)
                 .map(|_| AsyncMutex::new(None))
                 .collect::<Vec<_>>()
@@ -172,6 +203,7 @@ impl Hysteria2Outbound {
                     let upstream = self.upstream.clone();
                     let server = self.server.clone();
                     let tls = self.tls.clone();
+                    let realm_tls=self.realm_tls.clone();
                     let context = context.clone();
                     let bandwidth = Arc::new(super::bandwidth::Bandwidth::with_pacer(self.pacer.clone()));
                     let count = self.current.len() as u64;
@@ -179,7 +211,7 @@ impl Hysteria2Outbound {
                     let task = observation::track(ResourceKind::Task);
                     self.tasks.spawn(observation::bind(async move {
                         let _task = task;
-                        drive(config, upstream, server, tls, datagram, context, cancel, ready, bandwidth, receive_rate, count as usize).await;
+                        drive(config, upstream, server, tls, realm_tls, datagram, context, cancel, ready, bandwidth, receive_rate, count as usize).await;
                     }));
                 }
                 let session = reply.await.map_err(|_| DispatchError::ConnectionRefused)??;
@@ -201,7 +233,8 @@ impl OutboundConnector for Hysteria2Outbound {
         let request = super::wire::tcp_request(&session.destination)?;
         let shared = self
             .session(
-                DatagramSession::new(session.inbound, session.source),
+                DatagramSession::new(session.inbound, session.source)
+                    .with_metadata(session.metadata.clone()),
                 context,
             )
             .await?;
@@ -264,6 +297,7 @@ async fn drive(
     upstream: UpstreamPath,
     server: Destination,
     tls: StandardTlsClient,
+    realm_tls: Option<StandardTlsClient>,
     datagram: DatagramSession,
     context: EstablishContext,
     cancel: CancellationToken,
@@ -276,6 +310,7 @@ async fn drive(
     let mut ready = Some(ready);
     let mut endpoint = None;
     let mut paths = None;
+    let mut realm_pending = super::realm::Pending::default();
     let (datagrams, submissions) = super::datagram::Registry::new();
     let datagrams = Arc::new(datagrams);
     let _pool = observation::track(ResourceKind::Pool);
@@ -294,6 +329,8 @@ async fn drive(
             datagram,
             context,
             bandwidth.clone(),
+            realm_tls.as_ref(),
+            &mut realm_pending,
         )
         .await?;
         let peer = path.peer;
@@ -424,6 +461,7 @@ async fn drive(
         let _ = tokio::time::timeout(quic::CLOSE_TIMEOUT, endpoint.wait_idle()).await;
     }
     runtime.stop().await;
+    realm_pending.stop().await;
     if let Some(mut paths) = paths {
         paths.stop().await;
     }
