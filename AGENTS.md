@@ -16,6 +16,7 @@ Read the relevant document completely before changing that area:
 - Invoke, FFI, lifecycle, Android protect, or config delivery: `docs/invoke-api.md`, `src/invoke/`, and `src/ffi/`.
 - YAML, proxy graph, proxy groups, DNS, rules, or sniffer: `docs/config.yaml`, `docs/tun-icmp-dns.md`, and `src/config/`.
 - HTTP/SOCKS5 inbound, authentication, or listeners: `docs/inbounds.md` and `src/inbound/`.
+- Business HTTP rewrite, selective TLS, or its separate configuration: `docs/http-processing.md` and `src/http_processing/`.
 - SOCKS5, AnyTLS, Trojan, VMess, Hysteria2, TUIC v5 or SS 2022: `docs/outbounds.md`.
 - VLESS, Vision, Encryption, JLS or static ECH: `docs/vless.md`.
 - XHTTP request fields, download legs, H1/H2/H3 or sing-mux: `docs/xhttp.md`.
@@ -35,7 +36,7 @@ Read the relevant document completely before changing that area:
 
 - `src/invoke/` owns shared JSON dispatch, registry, lifecycle admission, panic containment, and engine completion. `start(configYaml)` performs internal preparation and platform acquisition; no public `prepare` or fd/framing payload exists. `validateConfig` needs no initialization.
 - `src/ffi/` adapts C ABI and Android JNI to Invoke and preserves native buffer/callback boundaries.
-- `src/cli.rs` owns five flags, Invoke request conversion, rendering, and exit status. `src/invoke/foreground.rs` owns file/stdin reads, native path metadata, environment defaults, process signals, bounded stderr, and foreground cleanup. Foreground validation reads its input but does not initialize data, resolve remote endpoints, or inspect platform devices.
+- `src/cli.rs` owns argument parsing, Invoke request conversion, rendering, and exit status. `src/invoke/foreground.rs` owns file/stdin reads, native path metadata, environment defaults, process signals, bounded stderr, and foreground cleanup. Foreground validation reads its input but does not initialize data, resolve remote endpoints, or inspect platform devices.
 - `src/runtime.rs` prepares and owns DNS, routing, outbound graphs, listeners, GeoData, and long-lived tasks.
 - `src/tun_runtime.rs` connects platform raw-IP I/O to `vole-netstack` and dispatches TCP, UDP, DNS, ICMP, and sniffing.
 - `src/platform/` contains platform adapters. Keep framing internal, propagate configured MTU, and preserve original borrowed-fd flags and ownership. Windows backend selection occurs at compilation; keep Windows callback semantics here instead of simulating a Unix fd.

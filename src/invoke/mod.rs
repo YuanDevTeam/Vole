@@ -132,6 +132,7 @@ impl CoreController {
 
 enum StartupConfig {
     Yaml(String),
+    WithHttp { yaml: String, http: String },
     Parsed(Box<Config>),
 }
 
@@ -356,7 +357,7 @@ impl From<io::Error> for InvokeFailure {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RequestEnvelope {
     method: String,
@@ -378,10 +379,23 @@ where
     String::deserialize(deserializer).map(Some)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ConfigYamlPayload {
     config_yaml: String,
+    #[serde(default)]
+    http_config_yaml: Option<String>,
+}
+impl std::fmt::Debug for ConfigYamlPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigYamlPayload")
+            .field("config_bytes", &self.config_yaml.len())
+            .field(
+                "http_config_bytes",
+                &self.http_config_yaml.as_ref().map(String::len),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -758,9 +772,16 @@ fn dispatch_config_update(request: &str) -> Result<Option<InvokeResponse>, Invok
         let admission = apply
             .try_admit()
             .map_err(|e| InvokeFailure::new(e.message()))?;
-        let yaml = decode_update_yaml(raw.payload.get())?;
+        let input = decode_update_input(raw.payload.get())?;
+        let update = match input.http_config_yaml {
+            Some(http) => ConfigUpdate::ReplaceWithHttp {
+                yaml: input.config_yaml,
+                http,
+            },
+            None => ConfigUpdate::Replace(input.config_yaml),
+        };
         admission
-            .submit(ConfigUpdate::Replace(yaml))
+            .submit(update)
             .map_err(|e| InvokeFailure::new(e.message()))?
             .wait_blocking()
             .map_err(|e| InvokeFailure::new(e.message()))?;
@@ -768,18 +789,34 @@ fn dispatch_config_update(request: &str) -> Result<Option<InvokeResponse>, Invok
     })
 }
 
-fn decode_update_yaml(payload: &str) -> Result<String, InvokeFailure> {
+fn decode_update_input(payload: &str) -> Result<ConfigYamlPayload, InvokeFailure> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct RawConfig<'a> {
         #[serde(rename = "configYaml", borrow)]
         yaml: &'a serde_json::value::RawValue,
+        #[serde(rename = "httpConfigYaml", default, borrow)]
+        http: Option<&'a serde_json::value::RawValue>,
     }
     let raw: RawConfig<'_> = serde_json::from_str(payload)
-        .map_err(|_| InvokeFailure::invalid_request("payload must contain only configYaml"))?;
+        .map_err(|_| InvokeFailure::invalid_request("invalid configuration update payload"))?;
     check_json_string_limit(raw.yaml.get(), crate::config::MAX_CONFIG_BYTES)?;
-    serde_json::from_str(raw.yaml.get())
-        .map_err(|_| InvokeFailure::invalid_request("configYaml must be a valid string"))
+    if let Some(http) = raw.http {
+        check_json_string_limit(http.get(), crate::http_processing::MAX_ADDENDUM)?;
+    }
+    Ok(ConfigYamlPayload {
+        config_yaml: serde_json::from_str(raw.yaml.get())
+            .map_err(|_| InvokeFailure::invalid_request("invalid configYaml string"))?,
+        http_config_yaml: raw
+            .http
+            .map(|http| serde_json::from_str(http.get()))
+            .transpose()
+            .map_err(|_| InvokeFailure::invalid_request("invalid httpConfigYaml string"))?,
+    })
+}
+#[cfg(test)]
+fn decode_update_yaml(payload: &str) -> Result<String, InvokeFailure> {
+    decode_update_input(payload).map(|input| input.config_yaml)
 }
 
 // RawValue validates JSON syntax without decoding strings. Count decoded UTF-8
@@ -842,7 +879,7 @@ fn check_json_string_limit(raw: &str, limit: usize) -> Result<(), InvokeFailure>
         decoded += width;
         if decoded > limit {
             return Err(InvokeFailure::invalid_request(
-                "configuration exceeds the 8 MiB limit",
+                "configuration string exceeds its input limit",
             ));
         }
     }
@@ -907,7 +944,7 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
         "validateConfig" => {
             require_instance_omitted(&envelope)?;
             let payload: ConfigYamlPayload = decode_payload(envelope.payload)?;
-            validate_config(payload.config_yaml)?;
+            validate_config_with_http(payload.config_yaml, payload.http_config_yaml)?;
             json!({})
         }
         "measureDelay" => {
@@ -920,7 +957,13 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
             let controller = require_instance(&envelope)?;
             let payload: ConfigYamlPayload = decode_payload(envelope.payload)?;
             invoke_instance_guarded(&controller, || {
-                controller.start(payload.config_yaml)?;
+                match payload.http_config_yaml {
+                    Some(http) => controller.start_config(StartupConfig::WithHttp {
+                        yaml: payload.config_yaml,
+                        http,
+                    })?,
+                    None => controller.start(payload.config_yaml)?,
+                }
                 Ok(json!({}))
             })?
         }
@@ -1032,6 +1075,9 @@ impl CoreController {
         let _data_directory = registry().data_directory()?;
         let config = match input {
             StartupConfig::Yaml(yaml) => parse_config_yaml(&yaml)?,
+            StartupConfig::WithHttp { yaml, http } => {
+                parse_config_yaml_with_http(&yaml, Some(&http))?
+            }
             StartupConfig::Parsed(config) => *config,
         };
         let dispatch = crate::logging::dispatch(config.log_level);
@@ -1396,15 +1442,27 @@ pub(crate) fn replace_android_socket_protector(
     registry().replace_android_socket_protector(protector)
 }
 
-fn validate_config(config_yaml: String) -> Result<(), InvokeFailure> {
-    let config = parse_config_yaml(&config_yaml)?;
+fn validate_config_with_http(
+    config_yaml: String,
+    http_config_yaml: Option<String>,
+) -> Result<(), InvokeFailure> {
+    let config = parse_config_yaml_with_http(&config_yaml, http_config_yaml.as_deref())?;
     drop(config_yaml);
     PreparedCore::validate_config(config).map_err(InvokeFailure::from)
 }
 
 fn parse_config_yaml(config_yaml: &str) -> Result<Config, InvokeFailure> {
+    parse_config_yaml_with_http(config_yaml, None)
+}
+fn parse_config_yaml_with_http(
+    config_yaml: &str,
+    http: Option<&str>,
+) -> Result<Config, InvokeFailure> {
     let directory = registry().data_directory().ok();
-    parse_config_yaml_with_directory(config_yaml, directory.as_ref().map(|dir| dir.root()))
+    let mut config =
+        parse_config_yaml_with_directory(config_yaml, directory.as_ref().map(|dir| dir.root()))?;
+    config.set_http_config(http).map_err(InvokeFailure::from)?;
+    Ok(config)
 }
 
 fn parse_config_yaml_with_directory(
@@ -3039,5 +3097,27 @@ rules:
         assert!(lock(&registry().inner).instance.is_none());
         let platform = lock(&registry().platform);
         assert_eq!(platform.tun_owner, None);
+    }
+
+    #[test]
+    fn update_http_addendum_preserves_optional_clear_and_its_separate_byte_limit() {
+        let input = decode_update_input(
+            r#"{"configYaml":"rules: ['MATCH,DIRECT']","httpConfigYaml":"rewrite: []"}"#,
+        )
+        .unwrap();
+        assert_eq!(input.http_config_yaml.as_deref(), Some("rewrite: []"));
+        assert_eq!(
+            decode_update_input(r#"{"configYaml":"x","httpConfigYaml":""}"#)
+                .unwrap()
+                .http_config_yaml
+                .as_deref(),
+            Some("")
+        );
+        assert!(decode_update_input(r#"{"configYaml":"x","httpConfigYaml":1}"#).is_err());
+        let input = format!(
+            r#"{{"configYaml":"x","httpConfigYaml":"{}"}}"#,
+            "x".repeat(crate::http_processing::MAX_ADDENDUM + 1)
+        );
+        assert!(decode_update_input(&input).is_err());
     }
 }

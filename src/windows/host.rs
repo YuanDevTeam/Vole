@@ -99,6 +99,8 @@ struct StartPayload {
     #[serde(default)]
     profile_name: ProfileName,
     config_yaml: String,
+    #[serde(default)]
+    http_config_yaml: Option<String>,
     network_settings: WindowsNetworkSettings,
     policy: WindowsVpnPolicy,
     #[serde(default, deserialize_with = "deserialize_session_backend")]
@@ -227,12 +229,16 @@ fn start_vpn(payload: StartPayload) -> Result<Value, String> {
     let StartPayload {
         profile_name,
         config_yaml,
+        http_config_yaml,
         network_settings,
         policy,
         session_backend,
     } = payload;
-    let config = Config::parse_yaml(config_yaml.as_bytes())
+    let mut config = Config::parse_yaml(config_yaml.as_bytes())
         .map_err(|_| "invalid Vole configuration".to_owned())?;
+    config
+        .set_http_config(http_config_yaml.as_deref())
+        .map_err(|_| "invalid HTTP processing configuration".to_owned())?;
     if !config.tun.enable {
         return Err("Windows VPN configuration must enable TUN".to_owned());
     }
@@ -251,6 +257,7 @@ fn start_vpn(payload: StartPayload) -> Result<Value, String> {
         &environment.installed_folder,
         config_yaml,
         session_backend,
+        http_config_yaml,
     )
     .map_err(display_error)?;
     let profile_configuration =

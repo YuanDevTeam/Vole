@@ -116,3 +116,6 @@ wire 最大 65,507 字节，额外 sentinel 识别截断，自有 UDP socket 请
 TUN 使用独立 MTU；SOCKS5 数据不计入 Controller 的 TUN 流量。
 
 [验收边界](acceptance.md)区分容器双栈与真实 LAN/物理 IPv6，不能相互替代。
+
+
+显式启用独立 HTTP 配置时，mixed HTTP/CONNECT 与 TUN 共用[URL rewrite](http-processing.md)和同代 Dispatcher。规则先确定最终 URL，再选路；本地动作不连接旧目标。请求正文与 Upgrade 继续复用本文件的流式 framing／relay；入口认证和用户名语义保持。

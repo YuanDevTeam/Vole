@@ -147,3 +147,7 @@ VMess mKCP 的纯内存回归使用 `--lib mkcp_`，覆盖配置/线协议向量
 HY2 Gecko/Realm 的配置和内存wire回归按 `gecko_`、`realm_` 中列出的memory-only名称定向执行；
 TUIC ClientHello 使用 `tuic_disable_sni_changes_real_quic_hello_without_changing_verification_policy`。
 不得将包含网络peer的整个outbound模块直接作为宿主测试执行。
+
+HTTP URL 动作的纯内存回归：`http_processing::`、`main_config_and_provider_rebuild_preserve_the_addendum_until_explicit_clear`、`update_http_addendum_preserves_optional_clear_and_its_separate_byte_limit`、`explicit_http_file_is_validated_without_initializing_data_or_autoloading`、`http_addendum_option_only_transports_an_explicit_native_path`；Windows 平台另编译 `snapshot_identity_and_readback_include_the_http_addendum`。覆盖共享 TUN/mixed/CONNECT Adapter、预读、最终目标单次选路、原元数据、跨 origin 凭据隔离、未读 Expect body 的本地响应、禁用／非候选轻路径、代际继承与显式关闭。外部互通仅由真实 TUN benchmark 见证，不从这些内存回归推导。
+
+HTTP/1 早响应与空正文 Upgrade 的定向内存回归：`inbound::http::server::early_final_memory_tests::`；不运行包含宿主 socket 的整个入站测试模块。

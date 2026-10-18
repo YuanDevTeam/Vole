@@ -20,6 +20,7 @@ struct Options {
     mode: Mode,
     data_dir: Option<PathBuf>,
     config_file: Option<PathBuf>,
+    http_config_file: Option<PathBuf>,
 }
 
 impl Options {
@@ -32,6 +33,7 @@ impl Options {
         let (mut version, mut validate) = (false, false);
         let mut data_dir = data_dir.map(PathBuf::from);
         let mut config_file = config_file.map(PathBuf::from);
+        let mut http_config_file = None;
         while let Some(argument) = arguments.next() {
             let Some((flag, inline)) = flag_parts(&argument)? else {
                 // Like Go flag, a positional argument or -- ends parsing.
@@ -45,6 +47,7 @@ impl Options {
                         mode: Mode::Help,
                         data_dir,
                         config_file,
+                        http_config_file,
                     });
                 }
                 b"v" | b"t" => {
@@ -54,6 +57,13 @@ impl Options {
                     } else {
                         validate = value;
                     }
+                }
+                b"http-config" => {
+                    let value = inline
+                        .map(OsStr::to_owned)
+                        .or_else(|| arguments.next())
+                        .ok_or(CliError::argument("missing value for -http-config"))?;
+                    http_config_file = Some(PathBuf::from(value));
                 }
                 b"d" | b"f" => {
                     let value = inline
@@ -83,6 +93,7 @@ impl Options {
             },
             data_dir,
             config_file,
+            http_config_file,
         })
     }
 }
@@ -136,6 +147,10 @@ fn request(options: Options) -> Value {
     }
     if let Some(path) = options.config_file {
         payload["configPath"] =
+            serde_json::to_value(InvokePath::from(path)).expect("native path serialization");
+    }
+    if let Some(path) = options.http_config_file {
+        payload["httpConfigPath"] =
             serde_json::to_value(InvokePath::from(path)).expect("native path serialization");
     }
     json!({"method":"foreground","payload":payload})
@@ -287,6 +302,18 @@ mod tests {
             )
             .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn http_addendum_option_only_transports_an_explicit_native_path() {
+        for option in ["-http-config=extra.yaml", "--http-config=extra.yaml"] {
+            let value = request(parse(&[option, "-t"]).unwrap());
+            assert_eq!(value["payload"]["httpConfigPath"], "extra.yaml");
+        }
+        assert_eq!(
+            request(parse(&["-http-config", "extra.yaml", "-v"]).unwrap()),
+            json!({"method":"version","payload":{}})
         );
     }
 }

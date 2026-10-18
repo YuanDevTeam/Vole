@@ -52,6 +52,18 @@ pub struct HttpServerConfig {
 }
 
 impl HttpServerConfig {
+    pub(crate) fn processing() -> Self {
+        Self {
+            listen: ([127, 0, 0, 1], 0).into(),
+            auth: None,
+            ipv6: false,
+            header_limit: DEFAULT_HEADER_LIMIT,
+            header_timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(10),
+            body_idle_timeout: Duration::from_secs(30),
+        }
+    }
+
     pub fn loopback(listen: SocketAddr, auth: HttpBasicAuth) -> io::Result<Self> {
         if !listen.ip().is_loopback() {
             return Err(io::Error::new(
@@ -203,7 +215,7 @@ pub(crate) async fn handle_connection_with_deadline<S>(
     deadline: Instant,
 ) -> io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     // This cancellation boundary covers every read, write, handshake and tunnel,
     // including error responses to a client that has stopped reading.
@@ -213,7 +225,7 @@ where
         result = async {
             let (read, mut write) = tokio::io::split(inbound);
             let mut reader = BufReader::with_capacity(framing::COPY_BUFFER, read);
-            serve_requests(&mut reader, &mut write, peer, local_address, &dispatcher, &config, deadline).await
+            serve_requests(&mut reader, &mut write, peer, local_address, &dispatcher, &config, (deadline,&cancellation)).await
         } => result,
     }
 }
@@ -225,13 +237,14 @@ async fn serve_requests<R, W>(
     local_address: SocketAddr,
     dispatcher: &Arc<dyn Dispatcher>,
     config: &HttpServerConfig,
-    first_deadline: Instant,
+    scope: (Instant, &CancellationToken),
 ) -> io::Result<()>
 where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
 {
-    let mut deadline = first_deadline;
+    let (mut deadline, cancellation) = scope;
+    let http = dispatcher.http_context();
     loop {
         let request = timeout_at(deadline, async {
             if reader.fill_buf().await?.is_empty() {
@@ -274,6 +287,10 @@ where
         let forward = if request.is_connect() {
             framing::validate_connect(&request)
                 .and_then(|()| request.connect_destination().map(|target| (target, None)))
+        } else if http.is_some() {
+            request
+                .forward_target()
+                .map(|(destination, _)| (destination, None))
         } else {
             RequestPlan::new(&request).map(|plan| (plan.destination.clone(), Some(plan)))
         };
@@ -300,6 +317,70 @@ where
             destination,
             sniffed_domain: None,
         };
+        if let Some(http) = &http {
+            if !request.is_connect() {
+                if !http
+                    .forward_h1(
+                        reader,
+                        writer,
+                        &request,
+                        session,
+                        crate::http_processing::Scheme::Http,
+                        config,
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+                deadline = Instant::now() + config.header_timeout;
+                continue;
+            }
+            if http.candidate_port(session.destination.port()) {
+                write_timed(
+                    writer,
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                    config.header_timeout,
+                )
+                .await?;
+                let mut io = crate::http_processing::io::Joined {
+                    reader: &mut *reader,
+                    writer: &mut *writer,
+                };
+                let outcome = http
+                    .try_intercept(&mut io, session.clone(), cancellation.clone())
+                    .await?;
+                return match outcome {
+                    crate::http_processing::Intercept::Handled => Ok(()),
+                    crate::http_processing::Intercept::Transparent { prefix } => {
+                        forward_tunnel(
+                            reader,
+                            writer,
+                            prefix,
+                            session,
+                            http.dispatcher(),
+                            config,
+                            true,
+                            diagnostic,
+                        )
+                        .await
+                    }
+                };
+            }
+        }
+        if request.is_connect() {
+            let dispatcher = http.as_ref().map_or(dispatcher, |http| http.dispatcher());
+            return forward_tunnel(
+                reader,
+                writer,
+                Vec::new(),
+                session,
+                dispatcher,
+                config,
+                false,
+                diagnostic,
+            )
+            .await;
+        }
         let sniff = dispatcher
             .sniff_plan(peer, &session.destination)
             .await
@@ -311,51 +392,75 @@ where
                 .await
                 .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?;
         }
-        if plan.is_none()
-            && let Some(sniff) = sniff
-        {
-            write_timed(
-                writer,
-                b"HTTP/1.1 200 Connection Established\r\n\r\n",
-                config.header_timeout,
-            )
-            .await?;
-            let prefix = sniff
-                .sniff(reader, &mut session)
-                .await
-                .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?;
-            let mut outbound = timeout(config.connect_timeout, dispatcher.connect_tcp(session))
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "HTTP outbound connect timed out")
-                })?
-                .map_err(dispatch_to_io)?;
-            if !prefix.is_empty() {
-                write_timed(&mut outbound, &prefix, config.connect_timeout).await?;
-            }
-            let (mut remote_read, mut remote_write) = tokio::io::split(outbound);
-            return relay(reader, writer, &mut remote_read, &mut remote_write).await;
-        }
         let outbound = connect(dispatcher, session, config, writer, diagnostic).await?;
-        if let Some(plan) = plan {
-            if !forward_request(reader, writer, outbound, &request, plan, config).await? {
-                return Ok(());
-            }
-            deadline = Instant::now() + config.header_timeout;
-        } else {
-            write_timed(
-                writer,
-                b"HTTP/1.1 200 Connection Established\r\n\r\n",
-                config.header_timeout,
-            )
-            .await?;
-            let (mut remote_read, mut remote_write) = tokio::io::split(outbound);
-            return relay(reader, writer, &mut remote_read, &mut remote_write).await;
+        let plan = plan.expect("non-CONNECT forwarding has a message plan");
+        if !forward_request(reader, writer, outbound, &request, plan, config).await? {
+            return Ok(());
         }
+        deadline = Instant::now() + config.header_timeout;
     }
 }
 
-async fn forward_request<R, W>(
+#[allow(clippy::too_many_arguments)]
+async fn forward_tunnel<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    prefix: Vec<u8>,
+    mut session: StreamSession,
+    dispatcher: &Arc<dyn Dispatcher>,
+    config: &HttpServerConfig,
+    mut acknowledged: bool,
+    diagnostic: bool,
+) -> io::Result<()> {
+    let mut reader = crate::http_processing::io::Replay::new(prefix, reader);
+    let sniff = dispatcher
+        .sniff_plan(session.source, &session.destination)
+        .await
+        .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?
+        .filter(|plan| plan.tcp_enabled());
+    let prefetched = if let Some(sniff) = sniff {
+        if !acknowledged {
+            write_timed(
+                writer,
+                b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                config.header_timeout,
+            )
+            .await?;
+            acknowledged = true;
+        }
+        sniff
+            .sniff(&mut reader, &mut session)
+            .await
+            .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?
+    } else {
+        Vec::new()
+    };
+    let mut outbound = if acknowledged {
+        timeout(config.connect_timeout, dispatcher.connect_tcp(session))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "HTTP outbound connect timed out")
+            })?
+            .map_err(dispatch_to_io)?
+    } else {
+        connect(dispatcher, session, config, writer, diagnostic).await?
+    };
+    if !acknowledged {
+        write_timed(
+            writer,
+            b"HTTP/1.1 200 Connection Established\r\n\r\n",
+            config.header_timeout,
+        )
+        .await?;
+    }
+    if !prefetched.is_empty() {
+        write_timed(&mut outbound, &prefetched, config.connect_timeout).await?;
+    }
+    let (mut remote_read, mut remote_write) = tokio::io::split(outbound);
+    relay(&mut reader, writer, &mut remote_read, &mut remote_write).await
+}
+
+pub(crate) async fn forward_request<R, W>(
     reader: &mut R,
     writer: &mut W,
     mut outbound: BoxStream,
@@ -378,7 +483,9 @@ where
         &plan.trailer_blocklist,
         false,
     ));
-    let mut uploaded = false;
+    // Empty bodies are already complete. Reading a ready 101 first must not
+    // turn an otherwise valid Upgrade into an apparent early response.
+    let mut uploaded = matches!(plan.body, Body::Empty | Body::Length(0));
     let mut informational = 0;
     let response = loop {
         let mut reading = Box::pin(async {
@@ -403,6 +510,9 @@ where
             }
             tokio::select! {
                 biased;
+                // Preserve an already available upstream response even when
+                // its request side closed at the same time as our upload.
+                response = &mut reading => break response,
                 result = &mut uploading => {
                     if let Err(error) = result {
                         write_error(writer, if error.kind() == io::ErrorKind::TimedOut { 408 } else { 400 }).await?;
@@ -410,7 +520,6 @@ where
                     }
                     uploaded = true;
                 }
-                response = &mut reading => break response,
             }
         };
         let response = match response {
@@ -1013,5 +1122,138 @@ mod tests {
 
         cancellation.cancel();
         task.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod early_final_memory_tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{DuplexStream, ReadBuf};
+
+    // A real duplex peer has a complete early response ready while rejecting
+    // subsequent request-body writes. No socket or detached peer is needed.
+    struct ClosedRequestHalf {
+        io: DuplexStream,
+        head_written: bool,
+    }
+    impl AsyncRead for ClosedRequestHalf {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+    impl AsyncWrite for ClosedRequestHalf {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.head_written {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+            let result = Pin::new(&mut self.io).poll_write(cx, buf);
+            if matches!(result, Poll::Ready(Ok(_))) {
+                self.head_written = true;
+            }
+            result
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+    #[tokio::test]
+    async fn ready_final_response_wins_over_simultaneous_upload_failure() {
+        let (outbound, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 3\r\n\r\nbad")
+            .await
+            .unwrap();
+        let request = parse_request_head(
+            b"POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nContent-Length: 6",
+            Vec::new(),
+        )
+        .unwrap();
+        let plan = RequestPlan::new(&request).unwrap();
+        let config = HttpServerConfig::proxy(
+            0,
+            ProxyAccess {
+                bind_address: None,
+                allow_lan: false,
+                ipv6: false,
+            },
+            None,
+        )
+        .unwrap();
+        let mut reader = BufReader::new(b"upload".as_slice());
+        let mut response = Vec::new();
+        let keep_alive = timeout(
+            Duration::from_secs(1),
+            forward_request(
+                &mut reader,
+                &mut response,
+                Box::new(ClosedRequestHalf {
+                    io: outbound,
+                    head_written: false,
+                }),
+                &request,
+                plan,
+                &config,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!keep_alive);
+        assert!(response.starts_with(b"HTTP/1.1 413 Content Too Large\r\n"));
+        assert!(response.ends_with(b"\r\n\r\nbad"));
+    }
+    #[tokio::test]
+    async fn ready_upgrade_without_request_body_preserves_the_tunnel() {
+        let (outbound, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\necho").await.unwrap();
+        peer.shutdown().await.unwrap();
+        let request=parse_request_head(b"GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nConnection: Upgrade\r\nUpgrade: websocket",Vec::new()).unwrap();
+        let plan = RequestPlan::new(&request).unwrap();
+        let config = HttpServerConfig::proxy(
+            0,
+            ProxyAccess {
+                bind_address: None,
+                allow_lan: false,
+                ipv6: false,
+            },
+            None,
+        )
+        .unwrap();
+        let mut reader = BufReader::new(b"".as_slice());
+        let mut response = Vec::new();
+        let keep_alive = timeout(
+            Duration::from_secs(1),
+            forward_request(
+                &mut reader,
+                &mut response,
+                Box::new(ClosedRequestHalf {
+                    io: outbound,
+                    head_written: false,
+                }),
+                &request,
+                plan,
+                &config,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!keep_alive);
+        assert!(response.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
+        assert!(response.ends_with(b"\r\n\r\necho"));
     }
 }

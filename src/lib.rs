@@ -18,6 +18,8 @@ pub mod error;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 pub mod geodata;
+#[doc(hidden)]
+pub mod http_processing;
 pub mod inbound;
 #[cfg(feature = "invoke")]
 pub mod invoke;

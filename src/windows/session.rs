@@ -245,7 +245,14 @@ async fn start_session(
         .session_backend()
         .map(|backend| ManagedProcessSet::start(installed_folder, backend))
         .transpose()?;
-    let started = start_vole(local_folder, snapshot.config_yaml(), binding, data).await;
+    let started = start_vole(
+        local_folder,
+        snapshot.config_yaml(),
+        snapshot.http_config_yaml(),
+        binding,
+        data,
+    )
+    .await;
     let (running, mut data_tasks) = match started {
         Ok(started) => started,
         Err(error) => {
@@ -272,11 +279,19 @@ async fn start_session(
 async fn start_vole(
     local_folder: &Path,
     config_yaml: &str,
+    http_config_yaml: Option<&str>,
     binding: PhysicalBinding,
     data: NamedPipeClient,
 ) -> io::Result<(RunningCore, JoinSet<io::Result<()>>)> {
-    let config = Config::parse_yaml(config_yaml.as_bytes())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let mut config = Config::parse_yaml(config_yaml.as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "invalid session configuration")
+    })?;
+    config.set_http_config(http_config_yaml).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid HTTP processing configuration",
+        )
+    })?;
     let mtu = validate_packet_channel_config(&config.tun)?;
     let geodata = GeoDataManager::open(
         local_folder.join("vole/geodata"),

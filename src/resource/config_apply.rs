@@ -12,6 +12,7 @@ pub(crate) struct ConfigApplyHandle {
 }
 pub(crate) enum ConfigUpdate {
     Replace(String),
+    ReplaceWithHttp { yaml: String, http: String },
     Patch(ConfigPatch),
     RefreshGeoData,
     FlushFakeIp,

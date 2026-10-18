@@ -97,6 +97,21 @@ impl ProviderRuntime {
                         yaml.as_bytes(),
                         &directory,
                     )
+                    .map(|mut next| {
+                        Arc::make_mut(&mut next).http_policy = previous.config.http_policy();
+                        next
+                    })
+                }
+                ConfigUpdate::ReplaceWithHttp { yaml, http } => {
+                    crate::config::providers::ProviderTemplate::update_yaml(
+                        yaml.as_bytes(),
+                        &directory,
+                    )
+                    .and_then(|mut next| {
+                        Arc::make_mut(&mut next).http_policy =
+                            crate::http_processing::Policy::compile_optional(Some(&http))?;
+                        Ok(next)
+                    })
                 }
                 ConfigUpdate::Patch(patch) => previous
                     .config
@@ -367,6 +382,78 @@ mod tests {
             Err(ApplyError::Stopped)
         );
         assert_eq!(live.current.load().config.mode, crate::config::Mode::Direct);
+        live.shutdown().await;
+    }
+}
+
+#[cfg(all(test, feature = "inbound-http"))]
+mod http_tests {
+    use super::*;
+    use crate::dialer::SystemResolver;
+    #[tokio::test]
+    async fn main_config_and_provider_rebuild_preserve_the_addendum_until_explicit_clear() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nodes.yaml");
+        std::fs::write(&path, "proxies: [{name: first, type: direct}]").unwrap();
+        let yaml = "proxy-providers: {fixture: {type: file, path: nodes.yaml}}\nproxy-groups: [{name: chosen, type: select, use: [fixture]}]\nrules: ['MATCH,chosen']\n";
+        let mut config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        config
+            .set_http_config(Some("rewrite: [{pattern: '.', action: reject}]"))
+            .unwrap();
+        let policy = config.http_policy().unwrap();
+        let manager =
+            GeoDataManager::open(&root.path().join("geodata"), Duration::from_secs(86400)).unwrap();
+        let prepared = PreparedCore::prepare_config(
+            config,
+            manager,
+            &SystemResolver,
+            ResourceLimits::default(),
+        )
+        .await
+        .unwrap();
+        let parts = prepared.build_dispatcher(Dialer::default()).unwrap();
+        let live = parts.resources.clone().unwrap();
+        let pinned = live.http_context().unwrap();
+        live.apply_update(ConfigUpdate::Replace(yaml.into()), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &policy,
+            &live.current.load().config.http_policy().unwrap()
+        ));
+        std::fs::write(&path, "proxies: [{name: fresh, type: direct}]").unwrap();
+        live.update(0).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &policy,
+            &live.current.load().config.http_policy().unwrap()
+        ));
+        assert!(
+            live.apply_update(
+                ConfigUpdate::ReplaceWithHttp {
+                    yaml: yaml.into(),
+                    http: "private-bad: private-value".into()
+                },
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &policy,
+            &live.current.load().config.http_policy().unwrap()
+        ));
+        live.apply_update(
+            ConfigUpdate::ReplaceWithHttp {
+                yaml: yaml.into(),
+                http: String::new(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(live.http_context().is_none());
+        assert!(pinned.candidate_port(80));
+        drop(pinned);
         live.shutdown().await;
     }
 }

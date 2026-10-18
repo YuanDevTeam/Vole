@@ -26,9 +26,10 @@ use tracing::{
 };
 
 const HELP: &str = "Vole standalone proxy core\n\
-Usage: vole [-d <data-dir>] [-f <config-file>] [-t] [-v] [-h]\n\
+Usage: vole [-d <data-dir>] [-f <config-file>] [-http-config <file>] [-t] [-v] [-h]\n\
   -d <data-dir>     Data directory (default: home/.config/vole)\n\
   -f <config-file>  Configuration file; - reads stdin (default: <data-dir>/config.yaml)\n\
+  -http-config <file>  Explicit HTTP processing addendum (optional)\n\
   -t               Validate configuration and exit\n\
   -v               Print software version and build identity\n\
   -h               Print this help\n";
@@ -105,6 +106,8 @@ pub(super) struct ForegroundPayload {
     data_dir: Option<InvokePath>,
     #[serde(default)]
     config_path: Option<InvokePath>,
+    #[serde(default)]
+    http_config_path: Option<InvokePath>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -165,6 +168,23 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
     let cwd = std::env::current_dir().map_err(|e| io_failure("resolve working directory", e))?;
     let paths = Paths::resolve(&options, &cwd, &PathDefaults::environment())
         .map_err(|e| io_failure("resolve paths", e))?;
+    let http_yaml = payload
+        .http_config_path
+        .map(|path| {
+            let path = path.into_path();
+            if path.as_os_str().is_empty() || path == Path::new("-") {
+                return Err(failure("HTTP configuration requires an explicit file path"));
+            }
+            let path = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            let bytes = read_config_limit(&path, crate::http_processing::MAX_ADDENDUM)
+                .map_err(|error| io_failure("read HTTP configuration", error))?;
+            String::from_utf8(bytes).map_err(|_| failure("HTTP configuration is not UTF-8"))
+        })
+        .transpose()?;
     // Stdin belongs to the foreground request. Default OS Ctrl+C handling is
     // preserved while it is still supplying its bounded configuration input.
     let stdin = paths
@@ -176,7 +196,7 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
         let config = stdin
             .map_or_else(|| read_config(&paths.config_file), Ok)
             .map_err(|e| io_failure("read configuration file", e))?;
-        validate_bytes(config, &paths.data_dir)?;
+        validate_bytes(config, &paths.data_dir, http_yaml.as_deref())?;
         return Ok(json!({"output":"configuration valid\n","diagnostics":""}));
     }
     let dispatch = tracing::Dispatch::new(StderrSubscriber::new());
@@ -197,7 +217,8 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
             .map_err(|_| failure("data directory initialization failed"))?;
         let controller = registry().create_instance()?;
         let mut cleanup = ForegroundInstance(Some(controller.clone()));
-        let config = super::parse_config_yaml(&yaml).map_err(|_| failure("core startup failed"))?;
+        let config = super::parse_config_yaml_with_http(&yaml, http_yaml.as_deref())
+            .map_err(|_| failure("core startup failed"))?;
         drop(yaml);
         let result = run_controller(controller, config, signals.wait()).await;
         let stopped = cleanup.destroy();
@@ -206,10 +227,17 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
     Ok(json!({"output":"","diagnostics":""}))
 }
 
-fn validate_bytes(bytes: Vec<u8>, directory: &Path) -> Result<(), InvokeFailure> {
+fn validate_bytes(
+    bytes: Vec<u8>,
+    directory: &Path,
+    http: Option<&str>,
+) -> Result<(), InvokeFailure> {
     let yaml = String::from_utf8(bytes).map_err(|_| failure("configuration is not UTF-8"))?;
-    let config = super::parse_config_yaml_with_directory(&yaml, Some(directory))
+    let mut config = super::parse_config_yaml_with_directory(&yaml, Some(directory))
         .map_err(|_| failure("invalid configuration"))?;
+    config
+        .set_http_config(http)
+        .map_err(|_| failure("invalid HTTP processing configuration"))?;
     crate::runtime::PreparedCore::validate_config(config)
         .map_err(|_| failure("invalid configuration"))
 }
@@ -400,16 +428,19 @@ fn clean_path(path: &Path) -> PathBuf {
     clean
 }
 fn read_config(path: &Path) -> io::Result<Vec<u8>> {
+    read_config_limit(path, crate::config::MAX_CONFIG_BYTES)
+}
+fn read_config_limit(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     let metadata = fs::metadata(path)?;
     require_regular(&metadata)?;
-    if metadata.len() > crate::config::MAX_CONFIG_BYTES as u64 {
+    if metadata.len() > limit as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "configuration exceeds byte limit",
         ));
     }
     let file = open_regular(path)?;
-    read_bounded(file)
+    read_bounded_limit(file, limit)
 }
 
 fn open_regular(path: &Path) -> io::Result<File> {
@@ -440,7 +471,9 @@ fn require_regular(metadata: &fs::Metadata) -> io::Result<()> {
 }
 
 fn read_bounded(reader: impl Read) -> io::Result<Vec<u8>> {
-    let limit = crate::config::MAX_CONFIG_BYTES;
+    read_bounded_limit(reader, crate::config::MAX_CONFIG_BYTES)
+}
+fn read_bounded_limit(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
     let mut config = Vec::new();
     reader.take((limit + 1) as u64).read_to_end(&mut config)?;
     if config.len() > limit {
@@ -811,6 +844,7 @@ mod tests {
             action: ForegroundAction::Validate,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
+            http_config_path: None,
         };
         assert_eq!(execute(payload).unwrap()["output"], "configuration valid\n");
         assert!(!data.exists());
@@ -845,6 +879,7 @@ mod tests {
             action: ForegroundAction::Validate,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
+            http_config_path: None,
         })
         .unwrap();
         assert_eq!(result["output"], "configuration valid\n");
@@ -861,6 +896,7 @@ mod tests {
             action: ForegroundAction::Validate,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
+            http_config_path: None,
         })
         .unwrap_err();
         assert!(!error.message.contains("secret"));
@@ -873,6 +909,7 @@ mod tests {
             action: ForegroundAction::Run,
             data_dir: Some(InvokePath::Text("\0".to_owned())),
             config_path: Some(InvokePath::Text("-".to_owned())),
+            http_config_path: None,
         })
         .unwrap_err();
         assert_eq!(error.message, "foreground is already running");
@@ -883,6 +920,7 @@ mod tests {
             action: ForegroundAction::Run,
             data_dir: None,
             config_path: Some(InvokePath::Text("-".to_owned())),
+            http_config_path: None,
         })
         .unwrap_err();
         assert!(error.message.contains("synchronous caller"));
@@ -894,6 +932,7 @@ mod tests {
             action: ForegroundAction::Help,
             data_dir: Some(InvokePath::Text("\0".to_owned())),
             config_path: Some(InvokePath::Text("\0".to_owned())),
+            http_config_path: None,
         })
         .unwrap();
         assert_eq!(result["diagnostics"], HELP);
@@ -1046,5 +1085,35 @@ mod tests {
         for private in ["private", "destination", "uuid", "password", "message"] {
             assert!(!rendered.contains(private));
         }
+    }
+
+    #[test]
+    #[cfg(feature = "inbound-http")]
+    fn explicit_http_file_is_validated_without_initializing_data_or_autoloading() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("absent");
+        let main = root.path().join("main.yaml");
+        let http = root.path().join("extra.yaml");
+        fs::write(&main, "rules: ['MATCH,DIRECT']").unwrap();
+        fs::write(&http, "rewrite: [{pattern: '.', action: reject}]").unwrap();
+        let result = execute(ForegroundPayload {
+            action: ForegroundAction::Validate,
+            data_dir: Some(data.clone().into()),
+            config_path: Some(main.clone().into()),
+            http_config_path: Some(http.clone().into()),
+        })
+        .unwrap();
+        assert_eq!(result["output"], "configuration valid\n");
+        assert!(!data.exists());
+        fs::write(http, "private-secret: private-data").unwrap();
+        let result = execute(ForegroundPayload {
+            action: ForegroundAction::Validate,
+            data_dir: Some(data.clone().into()),
+            config_path: Some(main.clone().into()),
+            http_config_path: None,
+        })
+        .unwrap();
+        assert_eq!(result["output"], "configuration valid\n");
+        assert!(!data.exists());
     }
 }

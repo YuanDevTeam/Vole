@@ -19,6 +19,7 @@ cat config.yaml | vole -f -
 | --- | --- |
 | `-d <dir>` | 配置及数据目录，默认用户目录下的 `.config/vole` |
 | `-f <file>` | 配置路径；默认 `<data-dir>/config.yaml`，`-f -` 从标准输入读取 |
+| `-http-config <file>` | 显式的独立 HTTP 附加配置，交给 Invoke 读取与验证 |
 | `-t` | 校验配置后退出，不初始化数据、联网或启动 TUN |
 | `-v` | 输出内核版本及构建身份 |
 | `-h` | 输出帮助 |
@@ -33,6 +34,7 @@ cat config.yaml | vole -f -
 Unix 用户目录取 `HOME`，Windows 取 `USERPROFILE`，缺失时使用工作目录。
 默认 `.config/vole` 不存在或不可访问时，若设置 `XDG_CONFIG_HOME`，使用其中的 `vole` 目录。
 配置文件必须是普通文件，文件和标准输入上限均为 8 MiB，CLI 不写回配置。
+独立 HTTP 配置上限 1 MiB，使用 `-http-config <file>` 或 `--http-config=<file>`。省略不探测文件；空路径与 `-` 失败，空文件关闭处理；`-t` 同时验证，`-v/-h` 不读取附加文件。详细输入见 [HTTP 处理](http-processing.md)。
 客户端 certificate/private-key 可引用 PEM 文件，相对路径从 -d 的数据目录解析；-t 同样读取并校验身份，仍不初始化目录。
 
 正常运行执行 `initialize → createInstance → start(configYaml)`，等待退出后

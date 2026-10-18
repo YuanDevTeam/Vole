@@ -28,11 +28,13 @@ pub(crate) struct SessionReference {
     digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SessionSnapshot {
     revision: u32,
     config_yaml: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    http_config_yaml: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -71,8 +73,10 @@ impl SessionReference {
         install_root: &Path,
         config_yaml: String,
         session_backend: Option<SessionBackend>,
+        http_config_yaml: Option<String>,
     ) -> Result<Self> {
         validate_config_yaml(&config_yaml)?;
+        validate_http_config_yaml(http_config_yaml.as_deref())?;
         if let Some(backend) = &session_backend {
             backend.validate(install_root).map_err(windows_error)?;
         }
@@ -80,6 +84,7 @@ impl SessionReference {
             revision: SESSION_REVISION,
             config_yaml,
             session_backend,
+            http_config_yaml,
         };
         let bytes = snapshot.to_canonical_json()?;
         let reference = Self {
@@ -173,7 +178,20 @@ impl SessionReference {
     }
 }
 
+impl std::fmt::Debug for SessionSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionSnapshot")
+            .field("revision", &self.revision)
+            .field("config_bytes", &self.config_yaml.len())
+            .field("http_config_present", &self.http_config_yaml.is_some())
+            .field("backend_present", &self.session_backend.is_some())
+            .finish_non_exhaustive()
+    }
+}
 impl SessionSnapshot {
+    pub(crate) fn http_config_yaml(&self) -> Option<&str> {
+        self.http_config_yaml.as_deref()
+    }
     pub(crate) fn config_yaml(&self) -> &str {
         &self.config_yaml
     }
@@ -187,6 +205,7 @@ impl SessionSnapshot {
             return Err(invalid_snapshot());
         }
         validate_config_yaml(&self.config_yaml)?;
+        validate_http_config_yaml(self.http_config_yaml.as_deref())?;
         if let Some(backend) = &self.session_backend {
             backend.validate(install_root).map_err(windows_error)?;
         }
@@ -202,6 +221,12 @@ impl SessionSnapshot {
     }
 }
 
+fn validate_http_config_yaml(input: Option<&str>) -> Result<()> {
+    if input.is_some_and(|input| input.len() > crate::http_processing::MAX_ADDENDUM) {
+        return Err(invalid_snapshot());
+    }
+    Ok(())
+}
 fn validate_config_yaml(config_yaml: &str) -> Result<()> {
     if config_yaml.is_empty() || config_yaml.len() > MAX_CONFIG_BYTES {
         return Err(Error::new(
@@ -312,6 +337,7 @@ mod tests {
             install.path(),
             "tun:\n  enable: true\n".to_owned(),
             Some(backend(&["run", "one"])),
+            None,
         )
         .unwrap();
         let same = SessionReference::publish(
@@ -319,6 +345,7 @@ mod tests {
             install.path(),
             "tun:\n  enable: true\n".to_owned(),
             Some(backend(&["run", "one"])),
+            None,
         )
         .unwrap();
         let changed = SessionReference::publish(
@@ -326,6 +353,7 @@ mod tests {
             install.path(),
             "tun:\n  enable: true\n".to_owned(),
             Some(backend(&["run", "two"])),
+            None,
         )
         .unwrap();
 
@@ -348,6 +376,7 @@ mod tests {
             local.path(),
             install.path(),
             "tun:\n  enable: true\n".to_owned(),
+            None,
             None,
         )
         .unwrap();
@@ -379,7 +408,8 @@ mod tests {
         let local = tempfile::tempdir().unwrap();
         let install = install_root();
         let publish = |yaml: &str| {
-            SessionReference::publish(local.path(), install.path(), yaml.to_owned(), None).unwrap()
+            SessionReference::publish(local.path(), install.path(), yaml.to_owned(), None, None)
+                .unwrap()
         };
         let first = publish("first");
         let second = publish("second");
@@ -396,5 +426,23 @@ mod tests {
         assert!(sessions.join(second.file_name()).exists());
         assert!(sessions.join(third.file_name()).exists());
         assert!(!sessions.join("staging-old").exists());
+    }
+
+    #[test]
+    fn snapshot_identity_and_readback_include_the_http_addendum() {
+        let local = tempfile::tempdir().unwrap();
+        let install = install_root();
+        let main = "tun: {enable: true}".to_owned();
+        let initial =
+            SessionReference::publish(local.path(), install.path(), main.clone(), None, None)
+                .unwrap();
+        let http = "rewrite: [{pattern: '.', action: reject}]".to_owned();
+        let updated =
+            SessionReference::publish(local.path(), install.path(), main, None, Some(http.clone()))
+                .unwrap();
+        assert_ne!(initial, updated);
+        let snapshot = updated.read(local.path(), install.path()).unwrap();
+        assert_eq!(snapshot.http_config_yaml(), Some(http.as_str()));
+        assert!(!format!("{snapshot:?}").contains("pattern"));
     }
 }

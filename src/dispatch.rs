@@ -149,6 +149,12 @@ pub trait DatagramTransport: Send {
 
 #[async_trait]
 pub trait Dispatcher: Send + Sync {
+    #[cfg(feature = "inbound-http")]
+    #[doc(hidden)]
+    fn http_context(&self) -> Option<crate::http_processing::HttpContext> {
+        None
+    }
+
     /// Configured datagram capability, independent of reachability or health.
     fn supports_udp(&self) -> bool {
         true

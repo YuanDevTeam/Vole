@@ -109,7 +109,7 @@ where
     parse_request_head(&input, buffered)
 }
 
-pub(super) fn parse_request_head(input: &[u8], buffered: Vec<u8>) -> io::Result<RequestHead> {
+pub(crate) fn parse_request_head(input: &[u8], buffered: Vec<u8>) -> io::Result<RequestHead> {
     let head =
         std::str::from_utf8(input).map_err(|_| invalid("HTTP request head is not valid UTF-8"))?;
     let mut lines = head.split("\r\n");

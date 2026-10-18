@@ -633,6 +633,25 @@ impl RuntimeResources for ProviderRuntime {
 }
 #[async_trait]
 impl Dispatcher for ProviderRuntime {
+    #[cfg(feature = "inbound-http")]
+    fn http_context(&self) -> Option<crate::http_processing::HttpContext> {
+        if self.cancellation.is_cancelled() {
+            return None;
+        }
+        let generation = self.current.load();
+        let policy = generation.config.http_policy()?;
+        let generation = Arc::clone(&generation);
+        let dispatcher = Arc::new(PinnedDispatcher {
+            dispatcher: generation.dispatcher.clone(),
+            generation,
+        });
+        Some(crate::http_processing::HttpContext::new(
+            policy,
+            dispatcher,
+            self.security.clone(),
+        ))
+    }
+
     fn supports_udp(&self) -> bool {
         self.current.load().dispatcher.supports_udp()
     }

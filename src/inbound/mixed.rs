@@ -153,7 +153,7 @@ struct MixedConnection {
 impl MixedConnection {
     async fn serve<S>(self, stream: S) -> io::Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let cancellation = self.cancellation.clone();
         tokio::select! {
@@ -165,7 +165,7 @@ impl MixedConnection {
 
     async fn serve_inner<S>(mut self, stream: S) -> io::Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         if !self.access_rules.permits(self.peer.ip()) {
             return Err(io::ErrorKind::PermissionDenied.into());

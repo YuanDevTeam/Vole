@@ -545,3 +545,6 @@ ProtectFd(fd) -> bool
 - Secret、password、UUID、REALITY key、short ID、目标地址和完整配置不得进入日志。
 - Apple Unified Logging 的 subsystem 固定为 `io.github.yuandevteam.vole`，category 为
   `vole`，不继承宿主应用的 bundle identifier；Console 或 `log stream` 应按该标识筛选。
+
+
+HTTP 附加配置独立于 Mihomo YAML：`validateConfig` / `start` 可选 `httpConfigYaml`；`updateConfig` 省略该字段继承、空串明确关闭，并与 `configYaml` 一同经既有候选许可发布。foreground 可选原生路径 `httpConfigPath`，仅显式普通文件，最多 1 MiB，`-` 与空路径失败。详细语法与流转见[HTTP URL rewrite](http-processing.md)。配置响应和日志不返回附加原文。

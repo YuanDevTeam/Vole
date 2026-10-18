@@ -1,8 +1,8 @@
 #[cfg(feature = "inbound-http")]
-mod framing;
-mod parser;
+pub(crate) mod framing;
+pub(crate) mod parser;
 #[cfg(feature = "inbound-http")]
-mod server;
+pub(crate) mod server;
 
 #[cfg(all(test, feature = "inbound-http"))]
 mod tests;

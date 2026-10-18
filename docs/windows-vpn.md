@@ -369,3 +369,6 @@ Stopped { version, packetCounters }
 - [Package identity](https://learn.microsoft.com/windows/apps/desktop/modernize/package-identity-overview)
 - [`RoInitialize`](https://learn.microsoft.com/windows/win32/api/roapi/nf-roapi-roinitialize)
 - [`CoIncrementMTAUsage`](https://learn.microsoft.com/windows/win32/api/combaseapi/nf-combaseapi-coincrementmtausage)
+
+
+`startVpn` 可选 `httpConfigYaml` 接收[独立 HTTP 规则](http-processing.md)，不放入 Mihomo YAML。规则进入已校验的 Session Snapshot canonical 内容并参与 digest；实际 Session Host 读取并构造规则，前台 registry 不替代业务消费者。未携带该字段的快照序列化保持原形式，快照和 bridge 的既有总体字节预算继续生效。
