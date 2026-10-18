@@ -3,7 +3,7 @@ use crate::{
     config::{MasqueNetwork, MasqueOutboundConfig},
     dispatch::DispatchError,
     dns::resolution::ResolutionContext,
-    outbound::{DEFAULT_ESTABLISH_TIMEOUT, EstablishContext},
+    outbound::EstablishContext,
     resources::observation,
     security::SecurityContext,
     session::{Destination, StreamSession},
@@ -357,10 +357,31 @@ async fn pump_h2_output<W: tokio::io::AsyncWrite + Unpin>(
         }
     }
 }
-async fn pump_output(
+// Static dispatch keeps the actual IP sender unchanged and permits an
+// in-memory test of a path-budget change without fake host sockets.
+trait IpPacketSender: Sync {
+    fn packet_budget(&self) -> usize;
+    fn send_packet<'a>(
+        &'a self,
+        packet: &'a [u8],
+    ) -> impl std::future::Future<Output = Result<(), h3_connect::IpDatagramSendError>> + Send + 'a;
+}
+impl IpPacketSender for h3_connect::IpDatagrams {
+    fn packet_budget(&self) -> usize {
+        self.packet_budget()
+    }
+    fn send_packet<'a>(
+        &'a self,
+        packet: &'a [u8],
+    ) -> impl std::future::Future<Output = Result<(), h3_connect::IpDatagramSendError>> + Send + 'a
+    {
+        self.send(packet)
+    }
+}
+async fn pump_output<D: IpPacketSender>(
     mut packets: PacketStream,
     mut udp: mpsc::Receiver<Packet>,
-    datagrams: &h3_connect::IpDatagrams,
+    datagrams: &D,
     sink: &PacketSink,
 ) -> io::Result<()> {
     loop {
@@ -369,12 +390,7 @@ async fn pump_output(
             packet=udp.recv()=>packet.ok_or_else(closed)?,
         };
         let bytes = packet.into_bytes();
-        let mut maximum = datagrams.packet_budget();
-        if bytes.first().is_some_and(|first| first >> 4 == 6) && maximum < 1280 {
-            maximum = datagrams
-                .wait_packet_budget(1280, Instant::now() + DEFAULT_ESTABLISH_TIMEOUT)
-                .await?;
-        }
+        let maximum = datagrams.packet_budget();
         if bytes.len() > maximum {
             if let Some(feedback) = vole_netstack::build_packet_too_big(&bytes, maximum) {
                 sink.send(feedback).await.map_err(|_| closed())?;
@@ -382,26 +398,19 @@ async fn pump_output(
             continue;
         }
         if let Some(bytes) = packet::outgoing(bytes) {
-            let deadline = Instant::now() + DEFAULT_ESTABLISH_TIMEOUT;
-            loop {
-                match datagrams.send(&bytes).await {
-                    Ok(()) => break,
-                    Err(h3_connect::IpDatagramSendError::TooLarge { packet_budget }) => {
-                        if bytes.first().is_some_and(|first| first >> 4 == 6)
-                            && packet_budget < 1280
-                        {
-                            datagrams.wait_packet_budget(1280, deadline).await?;
-                            continue;
-                        }
-                        if let Some(feedback) =
-                            vole_netstack::build_packet_too_big(&bytes, packet_budget)
-                        {
-                            sink.send(feedback).await.map_err(|_| closed())?;
-                        }
-                        break;
+            match datagrams.send_packet(&bytes).await {
+                Ok(()) => {}
+                Err(h3_connect::IpDatagramSendError::TooLarge { packet_budget }) => {
+                    // A post-ready path change affects this packet. Do not
+                    // turn IPv6 rediscovery timeout into failure of every
+                    // stream (including independent IPv4 siblings).
+                    if let Some(feedback) =
+                        vole_netstack::build_packet_too_big(&bytes, packet_budget)
+                    {
+                        sink.send(feedback).await.map_err(|_| closed())?;
                     }
-                    Err(h3_connect::IpDatagramSendError::Closed) => return Err(closed()),
                 }
+                Err(h3_connect::IpDatagramSendError::Closed) => return Err(closed()),
             }
         }
     }
@@ -596,6 +605,108 @@ pub(super) mod tests {
                     .get::<crate::transport::quiche_h3::Protocol>()
                     .is_none()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_budget_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct Sender {
+        budget: AtomicUsize,
+        shrink: AtomicBool,
+        sent: AtomicUsize,
+        changed: tokio::sync::Notify,
+    }
+    impl IpPacketSender for Sender {
+        fn packet_budget(&self) -> usize {
+            self.budget.load(Ordering::Acquire)
+        }
+        async fn send_packet<'a>(
+            &'a self,
+            packet: &'a [u8],
+        ) -> Result<(), h3_connect::IpDatagramSendError> {
+            if self.shrink.swap(false, Ordering::AcqRel) {
+                self.budget.store(1200, Ordering::Release);
+                return Err(h3_connect::IpDatagramSendError::TooLarge {
+                    packet_budget: 1200,
+                });
+            }
+            assert_eq!(packet[0] >> 4, 4);
+            self.sent.fetch_add(1, Ordering::AcqRel);
+            self.changed.notify_one();
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn masque_runtime_ipv6_budget_shrink_does_not_stall_or_close_ipv4_sibling() {
+        for shrink_on_send in [false, true] {
+            let client = ClientConfig {
+                prefixes: [
+                    Some(ClientPrefix {
+                        address: "192.0.2.2".parse().unwrap(),
+                        prefix_len: 32,
+                    }),
+                    Some(ClientPrefix {
+                        address: "fd00::2".parse().unwrap(),
+                        prefix_len: 128,
+                    }),
+                ],
+                receive_packet_limit: MAX_RECEIVE_PACKET_SIZE,
+                path_mtu_discovery: true,
+            };
+            let parts = NetStack::start_client(
+                NetStackConfig {
+                    mtu: 1500,
+                    ..Default::default()
+                },
+                client,
+            )
+            .unwrap();
+            let (input, output) = mpsc::channel(2);
+            let sender = Arc::new(Sender {
+                budget: AtomicUsize::new(if shrink_on_send { 1400 } else { 1200 }),
+                shrink: AtomicBool::new(shrink_on_send),
+                sent: AtomicUsize::new(0),
+                changed: tokio::sync::Notify::new(),
+            });
+            let active = sender.clone();
+            let cancel = CancellationToken::new();
+            let stop = cancel.clone();
+            let sink = parts.packet_sink;
+            let driver = tokio::spawn(async move {
+                tokio::select! {()=stop.cancelled()=>{},_=pump_output(parts.packet_stream,output,&*active,&sink)=>{}}
+            });
+            for (source, destination, length) in [
+                ("[fd00::2]:20000", "[2001:db8::1]:30000", 1300),
+                ("192.0.2.2:20001", "198.51.100.1:30001", 10),
+            ] {
+                let mut bytes = Vec::new();
+                vole_netstack::encode_udp_packet_into(
+                    &vole_netstack::UdpDatagram::new(
+                        source.parse().unwrap(),
+                        destination.parse().unwrap(),
+                        Bytes::from(vec![0u8; length]),
+                    ),
+                    1500,
+                    &mut bytes,
+                )
+                .unwrap();
+                input.send(Packet::new(bytes)).await.unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while sender.sent.load(Ordering::Acquire) == 0 {
+                    sender.changed.notified().await;
+                }
+            })
+            .await
+            .expect("IPv6 shrink blocked an unrelated IPv4 packet");
+            assert!(!driver.is_finished());
+            assert_eq!(sender.sent.load(Ordering::Acquire), 1);
+            cancel.cancel();
+            driver.await.unwrap();
+            parts.control.stop().await;
         }
     }
 }
