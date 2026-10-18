@@ -520,6 +520,12 @@ mod tests {
         // accidentally force H3. The value after one decode is not "true".
         assert!(!config.dns[1].options.force_h3);
         assert!(config.dns[1].options.disabled_types.is_empty());
+        assert!(
+            config
+                .dns
+                .iter()
+                .all(|server| server.options.interface.is_none())
+        );
 
         document["proxies"][0]["dns"] = json!(["https://dns.example#undeclared&h3=true"]);
         let parsed = Config::parse_yaml(&serde_json::to_vec(&document).unwrap());
@@ -533,11 +539,15 @@ mod tests {
             assert!(parsed.is_err());
         }
 
-        // Shared DNS keeps its route validation, while the private parser still
-        // rejects invalid keyed options instead of discarding the fragment.
+        // Ordinary DNS uses an undeclared name as a physical interface, while
+        // private DNS retains its fixed adapter and validates keyed options.
         document["proxies"][0]["dns"] = json!([tls]);
         document["dns"] = json!({"nameserver": ["tls://192.0.2.53#undeclared"]});
-        assert!(Config::parse_yaml(&serde_json::to_vec(&document).unwrap()).is_err());
+        let ordinary = Config::parse_yaml(&serde_json::to_vec(&document).unwrap()).unwrap();
+        assert_eq!(
+            ordinary.dns.nameservers[0].options.interface.as_deref(),
+            Some("undeclared")
+        );
         document["dns"] = json!({});
         document["proxies"][0]["dns"] = json!(["tls://192.0.2.53#undeclared&ecs=not-an-ip"]);
         assert!(Config::parse_yaml(&serde_json::to_vec(&document).unwrap()).is_err());

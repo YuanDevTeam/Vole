@@ -1,5 +1,8 @@
 #[path = "dialer_connections.rs"]
 mod connections;
+#[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
+#[path = "dialer_windows.rs"]
+mod windows_egress;
 pub(crate) use connections::race_connections;
 use std::{
     io,
@@ -15,7 +18,7 @@ use std::{
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(all(windows, feature = "windows-uwp"))]
+#[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
 use std::{
     num::NonZeroU32,
     os::windows::io::{AsRawSocket, RawSocket},
@@ -29,7 +32,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-#[cfg(all(windows, feature = "windows-uwp"))]
+#[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
 use windows::Win32::Networking::WinSock::{
     IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET, SOCKET_ERROR,
     WSAGetLastError, setsockopt,
@@ -368,6 +371,7 @@ struct InterfaceBinding {
 
 #[derive(Clone)]
 pub struct Dialer {
+    egress: crate::config::EgressOptions,
     dns_sources: Arc<crate::dns::source::NetworkSources>,
     dns_binding: Option<crate::dns::source::DnsBinding>,
     dns_tun_interface: Option<Arc<str>>,
@@ -405,6 +409,7 @@ impl std::fmt::Debug for Dialer {
 impl Default for Dialer {
     fn default() -> Self {
         Self {
+            egress: Default::default(),
             dns_sources: Arc::new(crate::dns::source::NetworkSources::default()),
             dns_binding: None,
             dns_tun_interface: None,
@@ -426,6 +431,38 @@ impl Default for Dialer {
 }
 
 impl Dialer {
+    pub(crate) fn with_egress(mut self, options: &crate::config::EgressOptions) -> Self {
+        self.egress = self.egress.overlay(options);
+        self
+    }
+
+    pub(crate) fn validate_egress(&self) -> io::Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        if self.egress.routing_mark != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "routing-mark requires Linux",
+            ));
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(windows, any(feature = "windows-uwp", feature = "windows-wintun"))
+        )))]
+        if self.egress.interface.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "interface-name binding is unavailable on this target",
+            ));
+        }
+        #[cfg(all(target_os = "linux", feature = "tun"))]
+        if let Some(policy) = &self.linux_policy {
+            policy.validate_mark(self.egress.routing_mark)?;
+        }
+        Ok(())
+    }
     pub(crate) fn with_dns_sources(
         mut self,
         sources: Arc<crate::dns::source::NetworkSources>,
@@ -504,9 +541,48 @@ impl Dialer {
         self.initialization.run(operation).await
     }
     #[cfg(unix)]
-    fn apply_dns_binding(&self, socket: &impl AsRawFd, destination: SocketAddr) -> io::Result<()> {
-        let _ = socket;
-        let Some(binding) = &self.dns_binding else {
+    fn apply_socket_policy(
+        &self,
+        socket: &impl AsRawFd,
+        destination: SocketAddr,
+    ) -> io::Result<()> {
+        self.validate_egress()?;
+        if destination.ip().is_loopback() && self.dns_binding.is_none() {
+            // Local proxies must remain reachable when a physical default
+            // interface is selected. Keep native TUN's private isolation.
+            #[cfg(all(target_os = "linux", feature = "tun"))]
+            if let Some(policy) = &self.linux_policy {
+                return policy.apply(socket, destination);
+            }
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if self.egress.routing_mark != 0 {
+            let value = self.egress.routing_mark;
+            // SAFETY: the live socket and u32 match Linux SO_MARK.
+            if unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_MARK,
+                    (&raw const value).cast(),
+                    std::mem::size_of_val(&value) as libc::socklen_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let binding = self.dns_binding.clone().or_else(|| {
+            self.egress
+                .interface
+                .clone()
+                .map(|interface| crate::dns::source::DnsBinding {
+                    interface,
+                    interface_index: None,
+                })
+        });
+        let Some(binding) = binding else {
             #[cfg(all(target_os = "linux", feature = "tun"))]
             if let Some(policy) = &self.linux_policy {
                 return policy.apply(socket, destination);
@@ -520,7 +596,7 @@ impl Dialer {
         if index == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "DNS source interface disappeared",
+                "outbound interface is unavailable",
             ));
         }
         if binding
@@ -742,6 +818,7 @@ impl Dialer {
         receive_buffer_size: Option<usize>,
     ) -> io::Result<PhysicalDatagram> {
         self.require_permitted(destination)?;
+        self.validate_egress()?;
         let ipv6 = destination.is_ipv6();
         let bind_address = self
             .source_address_for(destination)?
@@ -759,6 +836,8 @@ impl Dialer {
                 check()?;
                 #[cfg(all(windows, feature = "windows-uwp"))]
                 dialer.apply_interface_binding(socket.as_raw_socket(), destination)?;
+                #[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
+                dialer.apply_configured_interface(socket.as_raw_socket(), destination)?;
                 socket.bind(&bind_address.into())?;
                 // Buffer sizing is a performance hint. Keep this same
                 // owned socket and its platform policy if the OS refuses it.
@@ -772,7 +851,7 @@ impl Dialer {
                 check()?;
                 dialer.protect_socket(&socket)?;
                 #[cfg(unix)]
-                dialer.apply_dns_binding(&socket, destination)?;
+                dialer.apply_socket_policy(&socket, destination)?;
                 check()?;
                 Ok((std::net::UdpSocket::from(socket), guard))
             })
@@ -867,6 +946,7 @@ impl Dialer {
 
     async fn connect_one(&self, address: SocketAddr) -> io::Result<PhysicalStream> {
         self.require_permitted(address)?;
+        self.validate_egress()?;
         let ipv6 = address.is_ipv6();
         let source_address = self.source_address_for(address)?;
         let dialer = self.clone();
@@ -883,10 +963,12 @@ impl Dialer {
                 dialer.connections.apply(&socket2::SockRef::from(&socket))?;
                 dialer.protect_socket(&socket)?;
                 #[cfg(unix)]
-                dialer.apply_dns_binding(&socket, address)?;
+                dialer.apply_socket_policy(&socket, address)?;
                 check()?;
                 #[cfg(all(windows, feature = "windows-uwp"))]
                 dialer.apply_interface_binding(socket.as_raw_socket(), address)?;
+                #[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
+                dialer.apply_configured_interface(socket.as_raw_socket(), address)?;
                 if let Some(source_address) = source_address {
                     socket.bind(source_address)?;
                 }
@@ -948,7 +1030,7 @@ fn loopback_address(ipv6: bool) -> SocketAddr {
     }
 }
 
-#[cfg(all(windows, feature = "windows-uwp"))]
+#[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
 fn interface_option_value(index: NonZeroU32, ipv6: bool) -> [u8; 4] {
     if ipv6 {
         index.get().to_ne_bytes()
@@ -967,6 +1049,33 @@ mod tests {
     };
 
     use tokio::net::TcpListener;
+
+    #[test]
+    fn egress_clones_keep_the_protection_and_stop_owner() {
+        struct UncalledProtector;
+        impl SocketProtector for UncalledProtector {
+            fn protect(&self, _: i32) -> io::Result<()> {
+                unreachable!("memory-only test");
+            }
+        }
+        let initial = Dialer::default().with_protector(Arc::new(UncalledProtector));
+        let node = initial.clone().with_egress(&crate::config::EgressOptions {
+            interface: Some("Ethernet 网络 2".into()),
+            routing_mark: 0,
+        });
+        assert_eq!(node.egress.interface.as_deref(), Some("Ethernet 网络 2"));
+        assert!(Arc::ptr_eq(&initial.initialization, &node.initialization));
+        assert!(Arc::ptr_eq(&initial.dns_sources, &node.dns_sources));
+        assert!(Arc::ptr_eq(
+            initial.protector.as_ref().unwrap(),
+            node.protector.as_ref().unwrap()
+        ));
+        node.begin_shutdown();
+        assert!(*initial.initialization.closed.lock().unwrap());
+        let fresh = node.with_fresh_initialization();
+        assert!(!Arc::ptr_eq(&initial.initialization, &fresh.initialization));
+        assert_eq!(fresh.egress.interface.as_deref(), Some("Ethernet 网络 2"));
+    }
 
     use super::*;
 

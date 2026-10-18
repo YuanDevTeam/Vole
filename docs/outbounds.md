@@ -7,6 +7,18 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
 
 - 物理 TCP/UDP 只能由共享 Dialer 创建，保留 Android protect、Windows 物理绑定和受控解析。
   传输包装器只消费 IO，不另建 socket 或系统 resolver。
+- 全局与节点 `interface-name/routing-mark` 使用同一物理出口策略：节点非空接口/非零 mark
+  分别覆盖全局，空/0 继承；未指定接口时保留平台默认或 Linux TUN 自动识别。
+  接口支持 Linux、Apple 和 Windows；名称在建 socket 时核验，失效不回退。
+  回环物理目标保留本机路径，不套用公开接口或 mark；UWP 原有字面量回环门禁不变。
+  Android 显式接口尚不可用，protect 仍强制执行；非零 mark 仅 Linux 可用。
+  UWP 显式接口只能匹配 Provider 当前物理适配器，不能替换源地址/索引。
+  Linux 自建 TUN auto-route 与任何非零公开 mark 的组合在取得网络资源前拒绝；
+  Provider 候选同样校验，失败保留旧代。借用 fd 或关闭 auto-route 可使用公开 mark。
+- 代理链只由实际物理首跳消费出口策略；当前节点不覆盖其上游节点的策略。
+  上游组选择 DIRECT 时使用当前节点策略。XHTTP 两腿、多端点刷新、跳端口和新 QUIC
+  socket 沿用其所属路径的策略与选择快照；已建立连接不迁移。DNS、Provider、GeoData
+  和健康检查继续使用当前运行图的受控出口，不建立额外裸 socket。
 - `dialer-proxy` 省略/空串使用物理 Dialer，也可指定 DIRECT 或引用节点、策略组；与业务路由共享选择，完整 DAG 在配置期验证。
   一次建链使用组快照和同一绝对期限；已有连接不随切组迁移，无自动 failover 或 DIRECT 回落。
 - 节点 `ip-version` 为 `dual`（默认）、`ipv4`、`ipv6`、`ipv4-prefer` 或 `ipv6-prefer`。

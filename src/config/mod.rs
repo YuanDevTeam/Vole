@@ -43,6 +43,8 @@ use uuid::Uuid;
 use crate::{Result, VoleError};
 
 mod dns;
+mod egress;
+pub use egress::EgressOptions;
 mod domain_regex;
 mod identity_files;
 mod ip_suffix;
@@ -126,6 +128,7 @@ pub struct Config {
     pub etag_support: bool,
     pub unified_delay: bool,
     pub connections: ConnectionSettings,
+    pub egress: EgressOptions,
     pub profile: ProfileConfig,
     pub geodata_update: Option<GeoDataUpdateConfig>,
     pub external_controller: Option<ExternalControllerConfig>,
@@ -442,6 +445,7 @@ impl std::fmt::Debug for DnsHttpAuth {
 
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct DnsNameserverOptions {
+    pub interface: Option<std::sync::Arc<str>>,
     pub ecs: Option<DnsEcs>,
     pub ecs_override: bool,
     pub disabled_types: Box<[u16]>,
@@ -454,6 +458,7 @@ pub struct DnsNameserverOptions {
 impl std::fmt::Debug for DnsNameserverOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DnsNameserverOptions")
+            .field("has_interface", &self.interface.is_some())
             .field("ecs", &self.ecs.is_some())
             .field("ecs_override", &self.ecs_override)
             .field("disabled_type_count", &self.disabled_types.len())
@@ -731,6 +736,7 @@ pub enum Network {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyConfig {
+    pub egress: EgressOptions,
     pub ip_version: IpVersion,
     pub smux: Option<SingMuxConfig>,
     pub tag: String,
@@ -1154,6 +1160,10 @@ impl std::fmt::Debug for HttpInboundConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVoleConfig {
+    #[serde(rename = "interface-name", default)]
+    interface: String,
+    #[serde(rename = "routing-mark", default)]
+    routing_mark: i64,
     #[serde(default)]
     tls: TlsTrustConfig,
     #[serde(rename = "bind-address", default)]
@@ -1594,6 +1604,7 @@ where
 
 #[derive(Debug)]
 struct RawOutbound {
+    egress: EgressOptions,
     ip_version: IpVersion,
     smux: Option<sing_mux::RawSingMux>,
     protocol: RawProtocol,
@@ -1603,6 +1614,22 @@ impl<'de> Deserialize<'de> for RawOutbound {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let mut value = serde_yaml_ng::Value::deserialize(deserializer)?;
+        let mapping = value
+            .as_mapping_mut()
+            .ok_or_else(|| serde::de::Error::custom("proxy requires a mapping"))?;
+        let interface = mapping
+            .remove("interface-name")
+            .map(serde_yaml_ng::from_value::<String>)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_default();
+        let mark = mapping
+            .remove("routing-mark")
+            .map(serde_yaml_ng::from_value::<i64>)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_default();
+        let egress = EgressOptions::normalize(interface, mark).map_err(serde::de::Error::custom)?;
         let ip_version = value
             .as_mapping_mut()
             .ok_or_else(|| serde::de::Error::custom("proxy requires a mapping"))?
@@ -1625,6 +1652,7 @@ impl<'de> Deserialize<'de> for RawOutbound {
             .map_err(serde::de::Error::custom)?;
         let protocol = serde_yaml_ng::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(Self {
+            egress,
             ip_version,
             smux,
             protocol,
@@ -2061,6 +2089,7 @@ struct RawRealitySettings {
 
 #[derive(Debug)]
 struct PendingProxyConfig {
+    egress: EgressOptions,
     ip_version: IpVersion,
     smux: Option<SingMuxConfig>,
     tag: String,
@@ -2329,6 +2358,7 @@ impl RawVoleConfig {
         }
 
         Ok(Config {
+            egress: EgressOptions::normalize(self.interface, self.routing_mark)?,
             tls: self.tls,
             ipv6: self.ipv6,
             proxies,
@@ -2679,6 +2709,7 @@ fn normalize_proxy_graph_with_groups(
         .into_iter()
         .zip(dialer_proxies)
         .map(|(proxy, dialer_proxy)| ProxyConfig {
+            egress: proxy.egress,
             ip_version: proxy.ip_version,
             smux: proxy.smux,
             tag: proxy.tag,
@@ -3004,6 +3035,7 @@ impl RawOutbound {
             validate_route_target_name(dialer_proxy, "dialer-proxy")?;
         }
         Ok(PendingProxyConfig {
+            egress: self.egress,
             ip_version: self.ip_version,
             smux,
             tag,
@@ -6872,9 +6904,8 @@ dns:
     #[test]
     fn current_config_strictly_rejects_invalid_dns_route_fragments() {
         for nameserver in [
-            "udp://1.1.1.1:53#direct",
-            "udp://1.1.1.1:53#unknown",
-            "udp://1.1.1.1:53#DIRECT#RULES",
+            "udp://1.1.1.1:53#bad%00interface",
+            "udp://1.1.1.1:53#unknown-option=true",
         ] {
             let yaml = current_yaml(&format!(
                 "mixed-port: 1080

@@ -25,6 +25,15 @@ pub(crate) struct SocketPolicy {
     interfaces: Mutex<Option<Interfaces>>,
 }
 impl SocketPolicy {
+    pub(crate) fn validate_mark(&self, mark: u32) -> io::Result<()> {
+        if self.mark && mark != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "routing-mark conflicts with native TUN auto-route protection",
+            ));
+        }
+        Ok(())
+    }
     fn new(detect: bool, mark: bool) -> Self {
         Self {
             detect,

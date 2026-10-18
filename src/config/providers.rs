@@ -141,6 +141,8 @@ impl ProviderSpec {
         for key in self.overrides.keys() {
             if ![
                 "ip-version",
+                "interface-name",
+                "routing-mark",
                 "udp",
                 "udp-over-tcp",
                 "up",
@@ -741,6 +743,9 @@ struct Replacement {
 fn validate_overrides(overrides: &BTreeMap<String, Value>) -> Result<()> {
     for (key, value) in overrides {
         let valid = match key.as_str() {
+            "routing-mark" => value
+                .as_i64()
+                .is_some_and(|mark| EgressOptions::normalize(String::new(), mark).is_ok()),
             "udp" | "udp-over-tcp" | "skip-cert-verify" => value.is_bool(),
             "override-expr" => value
                 .as_sequence()

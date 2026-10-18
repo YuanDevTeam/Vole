@@ -123,9 +123,11 @@ dns:
 - 上游域名由 `default-nameserver` 引导解析，后者允许 IP 上游和显式 system。未启用 DNS 时，内部解析使用系统 resolver；启用后不因查询失败回退系统解析。
 - `system`、`system://`、`dhcp://system` 使用物理系统 DNS；`dhcp://<精确接口名>` 仅使用该接口的 DHCP DNS，不匹配其他接口。各 nameserver 角色、policy 和 fallback 均支持；DHCP 接口不能用于 default-nameserver。来源始终直连物理接口，fragment 与 respect-rules 不改其出口。
 - 无 fragment 时默认 DIRECT；`respect-rules: true` 改为 RULES，要求非空 `proxy-server-nameserver`。
-- Fragment 使用 `#出口&参数=值`；出口接受 `DIRECT`、`RULES`、实际代理节点名或支持的代理组名。
+- Fragment 使用 `#出口或接口&参数=值`；出口接受 `DIRECT`、`RULES`、实际代理节点名或支持的代理组名。
   仅提供参数时沿用默认出口；整个 fragment 先百分号解码，再按 `&` 和首个 `=` 拆分，
-  同名参数和出口 token 以后项为准。未知参数、普通上游的未知出口及物理网卡 token 不支持。
+  同名参数和出口 token 以后项为准。节点/组名称优先，没有同名目标时作为物理接口名。
+  指定接口直接连接该 DNS 上游，覆盖全局接口、沿用全局 mark；接口失效时失败，不回退。
+  DoT/DoH/DoQ 的连接池身份包含接口，不能跨接口复用。未知键值参数拒绝。
   system/DHCP 来源始终使用物理出口，忽略出口 token；节点私有 DNS 也忽略出口 token。
 - `#RULES` 只按 nameserver endpoint 和传输执行业务规则，不把 DNS question 当作选路域名。
 - 规则模式下，UDP 跳过不支持 UDP 的节点或组，继续匹配后续规则；显式出口和 global 模式不做此跳过。

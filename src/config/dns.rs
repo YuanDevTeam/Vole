@@ -145,7 +145,7 @@ fn parse_dns_nameserver_with_route(
         )
     };
     let (endpoint, fragment) = input.split_once('#').unwrap_or((input, ""));
-    let (route_name, options) =
+    let (route_name, mut options) =
         parse_nameserver_options(fragment, !endpoint.starts_with("https://"))?;
     // Special sources remain physical, but use the same query wrappers.
     let source = match endpoint {
@@ -172,11 +172,13 @@ fn parse_dns_nameserver_with_route(
         Some(targets) if !route_name.is_empty() => match route_name.as_str() {
             "DIRECT" => DnsRoute::Direct,
             "RULES" => DnsRoute::Rules,
-            _ => targets
-                .get(&route_name)
-                .copied()
-                .map(DnsRoute::Route)
-                .ok_or_else(bad)?,
+            _ => match targets.get(&route_name).copied() {
+                Some(id) => DnsRoute::Route(id),
+                None => {
+                    options.interface = EgressOptions::normalize(route_name, 0)?.interface;
+                    DnsRoute::Direct
+                }
+            },
         },
         _ => default_route,
     };
@@ -375,6 +377,39 @@ fn valid_disabled_type(kind: u16) -> bool {
 #[cfg(test)]
 mod upstream_options_tests {
     use super::*;
+
+    #[test]
+    fn dns_interface_selector_prefers_proxy_names_and_separates_pool_identity() {
+        let mut targets = RouteTargetsByName::new();
+        let target = RouteTargetId::Proxy(ProxyId::from_index(0));
+        targets.insert("eth0".into(), target);
+        let proxy =
+            parse_dns_nameserver("tls://192.0.2.53#eth0", &targets, DnsRoute::Direct).unwrap();
+        assert_eq!(proxy.route, DnsRoute::Route(target));
+        assert!(proxy.options.interface.is_none());
+        let interface =
+            parse_dns_nameserver("tls://192.0.2.53#eth1", &targets, DnsRoute::Rules).unwrap();
+        assert_eq!(interface.route, DnsRoute::Direct);
+        assert_eq!(interface.options.interface.as_deref(), Some("eth1"));
+        let other =
+            parse_dns_nameserver("tls://192.0.2.53#eth2", &targets, DnsRoute::Direct).unwrap();
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(interface);
+        keys.insert(other);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            parse_dns_nameserver(
+                "tcp://192.0.2.53#Ethernet%202&disable-reuse=true",
+                &targets,
+                DnsRoute::Direct
+            )
+            .unwrap()
+            .options
+            .interface
+            .as_deref(),
+            Some("Ethernet 2")
+        );
+    }
 
     #[test]
     fn dns_quic_feature_gates_and_plain_http_fragment() {

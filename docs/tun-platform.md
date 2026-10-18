@@ -126,11 +126,15 @@ MTU/格式与 fd 标志，原生 builder 只打开 raw-IP TUN，不暗中启用 
 - `auto-detect-interface` 从主路由表检测每个地址族的默认物理出口，最多缓存一秒。
   新建 TCP/UDP socket 绑定该接口，所有协议、DNS、资源下载共用 Dialer；没有出口时失败。
   已有 socket 不迁移，下一次建链重新检测。回环目标保持本机访问。
+  全局/节点 `interface-name` 的显式非空值优先于自动识别，DNS `#接口` 优先于全局接口；
+  system/DHCP 来源保留自己的物理接口约束。显式接口不存在或绑定失败不会回退自动识别。
 - `auto-route` 独占创建配置命名的 raw-IP TUN，已有同名接口失败。IPv4 使用
   `dns.fake-ip-range` 的原始 IPv4 地址（默认 `198.18.0.1`），前缀固定 /30；启用 IPv6 时使用 `fdfe:dcba:9876::1/126`。
   内部路由表 2022、规则优先级 9000/9001 必须空闲；保留主表的非默认路由，
   本机未标记流量经 TUN，转发流量不在本功能范围。Core socket 使用内部 mark 绕过捕获，
   不依靠 source IP 避免递归。配置接口与路由直接通过内核接口完成，不调用 ip 子进程。
+  全局或任一节点设置非零 `routing-mark` 时，该自建 auto-route 组合在创建接口前失败；
+  动态 Provider 候选也不能引入冲突。借用 fd 和关闭 auto-route 的路径使用配置 mark。
 - 自动路由启用，且 `dns.enable: true`、`dns-hijack` 匹配接口 IPv4 下一地址的 53 端口时，
   通过 systemd-resolved 给新接口设置 DNS（默认 `198.18.0.2`）、路由域 `~.` 和 default-route。
   系统须使用 systemd-resolved；调用 `/usr/bin/resolvectl --no-ask-password`，

@@ -79,7 +79,7 @@ interop-test = ["outbound-anytls", "outbound-vless"]
 invoke = ["tun", "dns-quic", "tokio/rt-multi-thread", "tokio/signal"]
 ffi = ["invoke"]
 cli = ["invoke"]
-windows-wintun = ["tun", "dep:tun-rs"]
+windows-wintun = ["tun", "dep:tun-rs", "dep:windows"]
 windows-uwp = ["invoke", "dep:windows", "dep:windows-collections", "dep:windows-core"]
 tun = [
     "dep:vole-netstack",

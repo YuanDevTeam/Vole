@@ -151,6 +151,11 @@ Session Host 的每个非回环出站 socket 必须同时应用：
 
 只绑定其中一项不满足契约。只有配置中显式使用 `127.0.0.0/8` 范围内的 IPv4 字面量或 `::1` 的本地出站可以跳过；物理代理服务器的域名在准备阶段解析到任何回环地址都会失败关闭。局域网和私有地址不属于例外。缺少地址族、源地址绑定或接口设置失败时，当前连接失败关闭。
 
+全局/节点 `interface-name` 和普通 DNS `#接口` 只允许选择同一个 Provider 物理适配器。
+友好名、系统接口名和 GUID 由 Windows SDK 转换为实际接口身份；不匹配时当前连接失败，
+不改变绑定源地址、接口索引或会话快照。非零 `routing-mark` 在 Windows 上不可用。
+桌面 Wintun 的显式接口选择仅设置普通出站 socket，不取得 Provider 绑定或代替宿主路由配置。
+
 `AssociateTransport` 只用于 Provider 的受管理唤醒传输，不用于普通代理流。Session Host 不持有 `VpnChannel`，不能给逐流 socket 获取同类豁免。
 
 显式 `system` DNS 仅由实际 Session Host 在显式查询按需读取既有物理适配器 GUID 的 DNS 数据（metadata 缓存 20 秒），继续执行同一 `(源 IP, 接口索引)` 绑定；不读取前台 Invoke registry，也不改变控制协议。`GetInterfaceDnsSettings` v3 不可用或存在无法满足的加密要求时来源不可用。原生 IPv6 DNS 的加密策略无法通过该只读查询确认，也保持不可用。无法确认 DHCP option 6 来源时 `dhcp://<接口>` 不可用。系统 DNS 发现不配置或恢复系统网络，App 仍负责原有网络设置和生命周期。

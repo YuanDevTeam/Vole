@@ -35,6 +35,16 @@ tcp-concurrent: false
 keep-alive-idle: 0
 keep-alive-interval: 0
 disable-keep-alive: false
+# 物理 TCP/UDP 的默认出口；空接口/零 mark 使用平台默认或 TUN 自动识别。
+# 节点的非空 interface-name / 非零 routing-mark 分别覆盖全局值，空/0 继续继承。
+# 接口支持 Linux、Apple 和 Windows，名称在建 socket 时校验；失败不回退其他出口。
+# 回环物理目标保留本机路径，不应用公开接口/mark；UWP 回环目标的现有安全门禁不变。
+# Android 显式接口绑定尚不可用，保留原 protect；非零 mark 仅 Linux 可用。
+# Linux 自建 TUN auto-route 使用私有防环 mark，与全局或任何节点的非零 mark 冲突时启动失败；
+# 借用 fd 或 auto-route: false 时可设置 mark。动态 Provider 候选沿用同一校验。
+# UWP 仅允许选择 Provider 当前物理适配器，不改变其源地址/接口索引；Wintun 不继承该绑定。
+interface-name: ""
+routing-mark: 0
 profile:
   store-selected: true
   store-fake-ip: false # true：dataDir/fake-ip.redb 持久化双向映射与分配位置
@@ -224,6 +234,8 @@ sniffer:
 # 下方 vless-edge 通过 upstream-select 当前选择的 socks-hop 建链：
 # 客户端 -> socks-hop -> vless-edge -> 目标。
 # 所有节点支持 ip-version: dual/ipv4/ipv6/ipv4-prefer/ipv6-prefer；默认 dual。
+# 所有节点均可声明 interface-name / routing-mark，仅物理首跳消费；经 dialer-proxy 时
+# 使用真正上游节点的出口策略，组落到 DIRECT 时保留当前节点策略。XHTTP 两腿使用相同策略。
 # 所有节点支持 smux 包装，要求对端提供 sing-mux 解码；普通 HTTP/SOCKS listener 不自动解码。
 # only-tcp: false 提供 mux UDP，即使底层 udp 为 false；true 保留底层 UDP 能力与编码。
 # HTTP(S) CONNECT 示例：type: http，必填 name/server/port，tls 默认 false。
@@ -669,7 +681,7 @@ proxy-groups:
 # proxy provider 文件为 {proxies: [...]}；可用 filter/exclude-filter/exclude-type。
 # provider 的 dialer-proxy 覆盖每个节点的同名字段，override 最后应用；
 # 它只控制节点上游，资源下载仍使用独立的 proxy 字段。
-# override 支持 udp、udp-over-tcp、up/down、dialer-proxy、ip-version、skip-cert-verify、name-cert-verify、
+# override 支持 udp、udp-over-tcp、up/down、dialer-proxy、ip-version、interface-name、routing-mark、skip-cert-verify、name-cert-verify、
 # additional-prefix/suffix、proxy-name: [{pattern: '表达式', target: '替换文本'}]、override-expr 字符串数组；
 # 协议专属覆盖只用于支持该字段的节点。未实现的覆盖字段严格拒绝。
 # override-expr 为原生有限 yq 方言，校验时预编译：原名称过滤 → 结构化 override / 改名 / 前后缀
@@ -760,12 +772,14 @@ hosts:
 # 可用于各 nameserver 列表与 policy（default-nameserver 除外）；不建立网络连接或额外设置 RA。
 # 无 fragment 时默认 DIRECT；respect-rules: true 时默认 RULES，且必须配置
 # proxy-server-nameserver。显式 fragment 可选 DIRECT、RULES 或已配置的节点/组名；
-# fragment 使用 #出口&参数=值，整个 fragment 先百分号解码，再拆分；重复项以后者为准。
+# fragment 使用 #出口或接口&参数=值，整个 fragment 先百分号解码，再拆分；重复项以后者为准。
+# 出口名优先；没有同名节点/组时按接口直接连接，覆盖全局接口并沿用全局 mark。
+# 接口身份隔离 DoT/DoH/DoQ 的连接复用；system/DHCP、RCODE 和节点私有 DNS 保持自身出口语义。
 # ecs=IP/CIDR 与 ecs-override=true 控制 ECS，保留其他 EDNS 参数。
 # disable-ipv4=true、disable-ipv6=true、disable-qtype-N=true 抑制相应 question 并过滤全部响应 sections；
 # ECS/过滤适用于 system、DHCP、RCODE 及各 resolver 角色，DHCP 接口名不含 fragment。
 # skip-cert-verify=true、name-cert-verify 用于 DoT/DoH/DoQ；显式名称验证优先且不改变 SNI。
-# disable-reuse=true 仅禁用指定 DoT 复用；HTTPS 仍可复用，未知参数/出口拒绝。
+# disable-reuse=true 仅禁用指定 DoT 复用；HTTPS 仍可复用，未知键值参数拒绝。
 # proxy-server-nameserver 专门解析节点，direct-nameserver
 # 专门解析 DIRECT 业务目标；未配置时复用 nameserver。两者不隐式开启 respect-rules。
 # direct-nameserver-follow-policy 默认 false；true 让直连解析遵循 nameserver-policy。

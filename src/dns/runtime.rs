@@ -1749,6 +1749,32 @@ impl RuntimeDns {
         &self,
         nameserver: &DnsNameserver,
     ) -> Result<ResolvedNameserver, AttemptError> {
+        let physical = if let Some(interface) = &nameserver.options.interface {
+            if matches!(self.egress, DnsEgress::Single(_)) {
+                return Err(AttemptError::Io(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "private DNS cannot select a physical interface",
+                )));
+            }
+            let dialer = self
+                .source_dialer
+                .as_ref()
+                .ok_or_else(|| {
+                    AttemptError::Io(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "DNS interface binding is unavailable",
+                    ))
+                })?
+                .clone()
+                .with_egress(&crate::config::EgressOptions {
+                    interface: Some(interface.clone()),
+                    routing_mark: 0,
+                });
+            dialer.validate_egress().map_err(AttemptError::Io)?;
+            Some(Arc::new(crate::outbound::DirectOutbound::new(dialer)) as Arc<dyn Dispatcher>)
+        } else {
+            None
+        };
         let address = match &nameserver.address {
             DnsAddress::Ip(ip) => *ip,
             DnsAddress::Source(_) => return Err(AttemptError::Io(super::source::unavailable())),
@@ -1786,7 +1812,7 @@ impl RuntimeDns {
         Ok(ResolvedNameserver {
             config: nameserver.clone(),
             endpoint: SocketAddr::new(address, nameserver.port),
-            physical: None,
+            physical,
             source_generation: 0,
             source_binding: None,
         })

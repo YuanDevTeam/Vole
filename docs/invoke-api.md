@@ -263,6 +263,9 @@ TUN；移动平台仍需要宿主描述符。Linux 自建 TUN 支持 `auto-route
 `tun.mtu` 省略或为 0 使用 9000；字段契约及借用 fd 边界见
 [配置参考](config.yaml)与 [TUN 平台层](tun-platform.md)。
 
+物理出口来自同一 YAML 的全局/节点 `interface-name/routing-mark` 与普通 DNS `#接口`，
+不增加 Invoke 参数。平台能力、继承和 auto-route 冲突见[出站契约](outbounds.md)。
+
 Windows 编译时选择互斥的 `windows-wintun` 或 `windows-uwp`：
 
 - Wintun 构建中，业务 `start(configYaml)` 在 `tun.enable: true` 时自动打开或创建

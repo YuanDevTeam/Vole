@@ -33,6 +33,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | 范围 | 过滤器 | 覆盖重点 |
 | --- | --- | --- |
 | 配置 | `config::tests::` | YAML准入、图、字段单位与边界 |
+| 物理出口 | `config::egress::tests::`、`config::dns::upstream_options_tests::`、`runtime::egress_tests::`、`dialer::tests::egress_clones_keep_the_protection_and_stop_owner` | 全局/节点继承、Provider整数覆盖、DNS名称优先与池身份、auto-route冲突和共同Stop owner |
 | GeoData | `geodata::tests::` | 合成DAT/MMDB、selector、更新发布和取消 |
 | 资源与Provider | `config::rule_provider::`、`runtime::providers::tests::`、`resource::cache::tests::` | 域名紧凑索引、MRS边界、候选提交、失败保留与旧代资源 |
 | 策略组 | `routing::proxy_group::tests::`、`routing::balance::tests::` | 选择、容差、恢复和负载均衡 |
