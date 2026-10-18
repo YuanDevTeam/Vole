@@ -3,6 +3,8 @@ pub(crate) mod age_provider;
 pub(crate) mod bundle;
 mod bundle_limits;
 pub(crate) mod cache;
+#[cfg(any(feature = "invoke", test))]
+pub(crate) mod config_apply;
 pub(crate) mod control;
 pub(crate) mod http;
 pub(crate) mod probe;

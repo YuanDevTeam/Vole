@@ -103,6 +103,22 @@ impl ProviderCache {
         template: Arc<ProviderTemplate>,
         cancellation: Option<&CancellationToken>,
     ) -> io::Result<Self> {
+        Self::open_mode(root, template, cancellation, true)
+    }
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn open_candidate(
+        root: &Path,
+        template: Arc<ProviderTemplate>,
+        cancellation: &CancellationToken,
+    ) -> io::Result<Self> {
+        Self::open_mode(root, template, Some(cancellation), false)
+    }
+    fn open_mode(
+        root: &Path,
+        template: Arc<ProviderTemplate>,
+        cancellation: Option<&CancellationToken>,
+        persist_bundle: bool,
+    ) -> io::Result<Self> {
         let mut entries = Vec::new();
         let mut contents = ProviderContents::new();
         let user_agent = template.request_user_agent();
@@ -154,7 +170,7 @@ impl ProviderCache {
                     } else {
                         &spec.path
                     },
-                    spec.kind == ProviderType::Http,
+                    persist_bundle && spec.kind == ProviderType::Http,
                 )?;
                 let metadata = fs::read(metadata_path(&path))
                     .ok()
@@ -232,7 +248,7 @@ impl ProviderCache {
                             } else {
                                 &spec.path
                             },
-                            true,
+                            persist_bundle,
                         )?;
                         let metadata = Metadata {
                             url: source_key(spec, &user_agent)?,
@@ -242,22 +258,25 @@ impl ProviderCache {
                             bundled: true,
                             subscription_info: None,
                         };
-                        let temporary = TemporaryFile(Some(temporary_path(&write_path)));
-                        fs::write(temporary.0.as_ref().unwrap(), &bytes)?;
-                        if cancellation.is_cancelled() {
-                            return Err(io::ErrorKind::Interrupted.into());
+                        if persist_bundle {
+                            let temporary = TemporaryFile(Some(temporary_path(&write_path)));
+                            fs::write(temporary.0.as_ref().unwrap(), &bytes)?;
+                            if cancellation.is_cancelled() {
+                                return Err(io::ErrorKind::Interrupted.into());
+                            }
+                            commit_download(&write_path, temporary.0.as_ref().unwrap(), &metadata)?;
                         }
-                        commit_download(&write_path, temporary.0.as_ref().unwrap(), &metadata)?;
                         entry.state.available = true;
                         entry.state.downloaded = false;
                         entry.state.count = content_len(&content);
-                        entry.state.updated_at = fs::metadata(&write_path)
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .map(unix_time);
-                        entry.modified = fs::metadata(&write_path)
-                            .ok()
-                            .and_then(|m| m.modified().ok());
+                        entry.modified = persist_bundle
+                            .then(|| {
+                                fs::metadata(&write_path)
+                                    .ok()
+                                    .and_then(|m| m.modified().ok())
+                            })
+                            .flatten();
+                        entry.state.updated_at = entry.modified.map(unix_time);
                         entry.state.error = None;
                         entry.metadata = metadata;
                         contents.insert(key.clone(), content);
@@ -281,6 +300,27 @@ impl ProviderCache {
             entries,
             contents,
         })
+    }
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn prepare_paths(&self, root: &Path, cancel: &CancellationToken) -> io::Result<()> {
+        for entry in &self.entries {
+            if cancel.is_cancelled() {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if entry.spec.kind == ProviderType::Http {
+                resource_path(
+                    root,
+                    entry
+                        .path
+                        .as_ref()
+                        .expect("HTTP cache path")
+                        .to_str()
+                        .ok_or_else(|| io::Error::other("invalid cache path"))?,
+                    true,
+                )?;
+            }
+        }
+        Ok(())
     }
     pub fn next_due(&self) -> Option<usize> {
         self.next_refresh()
@@ -321,7 +361,16 @@ impl ProviderCache {
         entry.state.updating = true;
         let operation = async {
             if entry.spec.kind == ProviderType::File {
-                let modified = fs::metadata(&path)?.modified()?;
+                let modified = match fs::metadata(&path) {
+                    Err(error)
+                        if error.kind() == io::ErrorKind::NotFound
+                            && entry.metadata.bundled
+                            && entry.modified.is_none() =>
+                    {
+                        return Ok(None);
+                    }
+                    value => value?.modified()?,
+                };
                 if Some(modified) == entry.modified && entry.state.available {
                     return Ok(None);
                 }

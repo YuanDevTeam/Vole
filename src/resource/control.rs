@@ -29,6 +29,10 @@ pub(crate) struct DnsSnapshot {
 #[async_trait]
 pub(crate) trait RuntimeResources: Send + Sync {
     fn connections(&self) -> Arc<crate::connections::Registry>;
+    #[cfg(any(feature = "invoke", test))]
+    fn config_apply(&self) -> Option<crate::resource::config_apply::ConfigApplyHandle> {
+        None
+    }
     fn configs(&self) -> serde_json::Value;
     fn rules(&self) -> serde_json::Value;
     fn groups(&self) -> Arc<ProxyGroups>;

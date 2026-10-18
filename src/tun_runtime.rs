@@ -161,6 +161,11 @@ impl TunRuntime {
         mut self,
         resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
     ) -> Self {
+        // The provider graph owns the live policy, including a disabled one.
+        // A startup fallback would otherwise revive sniffing after a reload.
+        if resources.is_some() {
+            self.sniffer = None;
+        }
         self.resources = resources;
         self
     }
@@ -177,7 +182,6 @@ impl TunRuntime {
             dns_hijack = self.dns.is_some(),
             ipv6 = self.ipv6,
             fake_icmp_echo = self.fake_icmp_echo,
-            domain_sniffing = self.sniffer.is_some(),
             "TUN runtime starting"
         );
         let parts = NetStack::start_tcp(config).map_err(netstack_to_io)?;

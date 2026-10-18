@@ -175,6 +175,38 @@ impl FakePools {
                 .map(Mutex::new),
         })
     }
+    /// Forget forward bindings without immediately reusing addresses that may
+    /// still be present in a client's active flow. Reverse maps and cursor keep
+    /// their normal bounded lifetime; database commit precedes memory mutation.
+    pub(crate) fn flush_forward(&self) -> io::Result<()> {
+        let mut v4 = self
+            .v4
+            .as_ref()
+            .map(|pool| pool.lock().map_err(storage_error))
+            .transpose()?;
+        let mut v6 = self
+            .v6
+            .as_ref()
+            .map(|pool| pool.lock().map_err(storage_error))
+            .transpose()?;
+        if let Some(db) = v4
+            .as_ref()
+            .and_then(|p| p.database.as_ref())
+            .or_else(|| v6.as_ref().and_then(|p| p.database.as_ref()))
+        {
+            let tx = db.begin_write().map_err(storage_error)?;
+            for pool in [v4.as_ref(), v6.as_ref()].into_iter().flatten() {
+                tx.delete_table(pool.hosts).map_err(storage_error)?;
+                tx.open_table(pool.hosts).map_err(storage_error)?;
+            }
+            tx.commit().map_err(storage_error)?;
+        }
+        for pool in [v4.as_mut(), v6.as_mut()].into_iter().flatten() {
+            pool.memory.clear();
+        }
+        Ok(())
+    }
+
     pub(crate) fn lookup(&self, host: &str, ipv6: bool) -> io::Result<Option<IpAddr>> {
         let pool = if ipv6 { &self.v6 } else { &self.v4 };
         pool.as_ref()
@@ -297,7 +329,13 @@ impl Pool {
                     .map_err(storage_error)?
                     .map(|v| v.value().to_owned());
                 if let Some(previous) = previous {
-                    hosts.remove(previous.as_str()).map_err(storage_error)?;
+                    let same = hosts
+                        .get(previous.as_str())
+                        .map_err(storage_error)?
+                        .is_some_and(|value| value.value() == next);
+                    if same {
+                        hosts.remove(previous.as_str()).map_err(storage_error)?;
+                    }
                 }
                 hosts.insert(host, next).map_err(storage_error)?;
                 ips.insert(next, host).map_err(storage_error)?;
@@ -308,8 +346,27 @@ impl Pool {
             }
             tx.commit().map_err(storage_error)?;
         } else {
-            if let Some(previous) = self.reverse.remove(&next) {
+            if let Some(previous) = self.reverse.remove(&next)
+                && self
+                    .memory
+                    .get(&previous)
+                    .is_some_and(|(address, _)| *address == next)
+            {
                 self.memory.remove(&previous);
+            }
+            if self.reverse.len() >= MEMORY_ENTRIES {
+                // Cleared forward maps may leave reverse-only slots. Reclaim
+                // one before insertion, retaining the original memory bound.
+                let stale = self.reverse.iter().find_map(|(address, host)| {
+                    (!self
+                        .memory
+                        .get(host)
+                        .is_some_and(|(current, _)| current == address))
+                    .then_some(*address)
+                });
+                if let Some(stale) = stale {
+                    self.reverse.remove(&stale);
+                }
             }
             if self.memory.len() >= MEMORY_ENTRIES
                 && let Some(old) = self
@@ -348,6 +405,42 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fake_ip_forward_flush_preserves_reverse_and_never_erases_a_newer_binding() {
+        let mut config = crate::config::DnsConfig::default().fake_ip;
+        config.range = FakeIpRange::parse("198.18.0.1/29", false).unwrap();
+        for persist in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("fake-ip.redb");
+            let pools = FakePools::open(&config, false, persist.then_some(path.as_path())).unwrap();
+            let old = pools.lookup("one.example", false).unwrap().unwrap();
+            pools.flush_forward().unwrap();
+            assert_eq!(pools.recover(old).unwrap().as_deref(), Some("one.example"));
+            let new = pools.lookup("one.example", false).unwrap().unwrap();
+            assert_ne!(old, new);
+            pools.lookup("two.example", false).unwrap();
+            assert_eq!(pools.lookup("three.example", false).unwrap(), Some(old));
+            // Reusing the old reverse slot must keep one's newer binding.
+            assert_eq!(pools.lookup("one.example", false).unwrap(), Some(new));
+            drop(pools);
+            if persist {
+                let pools = FakePools::open(&config, false, Some(&path)).unwrap();
+                assert_eq!(pools.lookup("one.example", false).unwrap(), Some(new));
+            }
+        }
+        config.range = FakeIpRange::parse("198.18.0.1/16", false).unwrap();
+        let pools = FakePools::open(&config, false, None).unwrap();
+        for i in 0..MEMORY_ENTRIES * 3 {
+            if i % 17 == 0 {
+                pools.flush_forward().unwrap();
+            }
+            pools.lookup(&format!("{i}.example"), false).unwrap();
+            let pool = pools.v4.as_ref().unwrap().lock().unwrap();
+            assert!(pool.reverse.len() <= MEMORY_ENTRIES);
+            assert!(pool.memory.len() <= MEMORY_ENTRIES);
+        }
+    }
+
     #[test]
     fn fake_ip_persistence_restarts_and_reuses_addresses_transactionally() {
         let mut config = crate::config::DnsConfig::default().fake_ip;

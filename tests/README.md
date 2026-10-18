@@ -116,3 +116,6 @@ container-benchmark compare --source vole=/path/to/Vole
 所有网络业务经真实TUN，Controller仅作管理入口；服务端与原站遵守[容器隔离](../docs/testing-isolation.md)。
 `interop --list`可离线列举当前用例。测试工具维护负载、对端和计量，Vole不依赖其checkout编译。
 互通、压力、平台编译、原生调用与真机验证的结果分别记录，见[验收边界](../docs/acceptance.md)。
+
+
+在线配置的纯内存定向回归：`resource::config_apply::tests::`、`config::live_update::tests::`、`controller::configs::tests::`、`runtime::providers::apply::tests::`、`configuration_candidate_reads_bundle_without_persisting_body_or_metadata`、`configuration_publication_stops_late_old_tree_hint_refill`。覆盖单候选许可、异步／外部线程结果交付、取消后持许可至收尾、严格 API 字段、启动资源拒绝、坏候选保旧图、新 provider 模板延续、候选不写活动资源，以及退休 DNS 树不能回填活动提示。真实 TUN 见证由 benchmark 夹具执行，内存回归不代替平台或业务互通。

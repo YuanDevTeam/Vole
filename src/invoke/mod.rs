@@ -28,6 +28,7 @@ use crate::{
     data_dir::DataDirectory,
     dialer::{Dialer, SocketProtector, SystemResolver},
     geodata::{GeoDataManager, GeoDataStatus, GeoResourceState},
+    resource::config_apply::{ConfigApplyHandle, ConfigUpdate},
     runtime::PreparedCore,
 };
 
@@ -153,6 +154,7 @@ struct Engine {
     stop: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<io::Result<()>>>,
     completion: tokio::sync::watch::Receiver<bool>,
+    config_apply: Option<ConfigApplyHandle>,
 }
 
 struct EngineCompletion(tokio::sync::watch::Sender<bool>);
@@ -708,6 +710,148 @@ fn check_dns_network_envelope(request: &str) -> Result<(), InvokeFailure> {
     Ok(())
 }
 
+// Admit configuration work before allocating a JSON Value or decoded YAML.
+// Both Controller and Invoke use the one runtime candidate worker.
+fn dispatch_config_update(request: &str) -> Result<Option<InvokeResponse>, InvokeFailure> {
+    let raw: RawRequestEnvelope<'_> = serde_json::from_str(request)
+        .map_err(|_| InvokeFailure::invalid_request("invalid request envelope"))?;
+    if raw.method.get().len() > 6 * "updateConfig".len() + 2
+        || !serde_json::from_str::<String>(raw.method.get())
+            .is_ok_and(|method| method == "updateConfig")
+    {
+        return Ok(None);
+    }
+    if request.len() - raw.payload.get().len() > 64 * 1024 {
+        return Err(InvokeFailure::invalid_request(
+            "configuration envelope overhead exceeds 64 KiB",
+        ));
+    }
+    let id = raw._instance_id.ok_or_else(|| {
+        InvokeFailure::invalid_request("instanceId is required for method `updateConfig`")
+    })?;
+    if id.get().len() > 128 {
+        return Err(InvokeFailure::invalid_request("invalid instanceId"));
+    }
+    let id: String = serde_json::from_str(id.get())
+        .map_err(|_| InvokeFailure::invalid_request("invalid instanceId"))?;
+    let controller = registry().instance(&id)?;
+    invoke_instance_guarded(&controller, || {
+        let _command = controller.try_command()?;
+        let apply = {
+            let mut inner = lock(&controller.inner);
+            refresh_runtime_status(&mut inner);
+            if inner.lifecycle.state() != LifecycleState::Running {
+                return Err(InvokeFailure::invalid_state(
+                    "instance must be running before updateConfig",
+                ));
+            }
+            inner
+                .engine
+                .as_ref()
+                .and_then(|engine| engine.config_apply.clone())
+                .ok_or_else(|| {
+                    InvokeFailure::invalid_state(
+                        "runtime does not support configuration application",
+                    )
+                })?
+        };
+        let admission = apply
+            .try_admit()
+            .map_err(|e| InvokeFailure::new(e.message()))?;
+        let yaml = decode_update_yaml(raw.payload.get())?;
+        admission
+            .submit(ConfigUpdate::Replace(yaml))
+            .map_err(|e| InvokeFailure::new(e.message()))?
+            .wait_blocking()
+            .map_err(|e| InvokeFailure::new(e.message()))?;
+        Ok(Some(InvokeResponse::success(json!({}))))
+    })
+}
+
+fn decode_update_yaml(payload: &str) -> Result<String, InvokeFailure> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawConfig<'a> {
+        #[serde(rename = "configYaml", borrow)]
+        yaml: &'a serde_json::value::RawValue,
+    }
+    let raw: RawConfig<'_> = serde_json::from_str(payload)
+        .map_err(|_| InvokeFailure::invalid_request("payload must contain only configYaml"))?;
+    check_json_string_limit(raw.yaml.get(), crate::config::MAX_CONFIG_BYTES)?;
+    serde_json::from_str(raw.yaml.get())
+        .map_err(|_| InvokeFailure::invalid_request("configYaml must be a valid string"))
+}
+
+// RawValue validates JSON syntax without decoding strings. Count decoded UTF-8
+// first, including surrogate pairs, so escaped input cannot allocate >8 MiB.
+fn check_json_string_limit(raw: &str, limit: usize) -> Result<(), InvokeFailure> {
+    let bad = || InvokeFailure::invalid_request("configYaml must be a valid string");
+    let bytes = raw.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' || *bytes.last().unwrap() != b'"' {
+        return Err(bad());
+    }
+    let hex = |slice: &[u8]| -> Option<u16> {
+        slice.iter().try_fold(0_u16, |n, c| {
+            let digit = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                _ => return None,
+            };
+            Some((n << 4) | u16::from(digit))
+        })
+    };
+    let mut i = 1;
+    let mut decoded = 0;
+    while i < bytes.len() - 1 {
+        let width = if bytes[i] != b'\\' {
+            i += 1;
+            1
+        } else {
+            i += 1;
+            match bytes.get(i).copied().ok_or_else(bad)? {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                    i += 1;
+                    1
+                }
+                b'u' => {
+                    let code = hex(bytes.get(i + 1..i + 5).ok_or_else(bad)?).ok_or_else(bad)?;
+                    i += 5;
+                    match code {
+                        0..=0x7f => 1,
+                        0x80..=0x7ff => 2,
+                        0xd800..=0xdbff => {
+                            if bytes.get(i..i + 2) != Some(b"\\u") {
+                                return Err(bad());
+                            }
+                            let low =
+                                hex(bytes.get(i + 2..i + 6).ok_or_else(bad)?).ok_or_else(bad)?;
+                            if !(0xdc00..=0xdfff).contains(&low) {
+                                return Err(bad());
+                            }
+                            i += 6;
+                            4
+                        }
+                        0xdc00..=0xdfff => return Err(bad()),
+                        _ => 3,
+                    }
+                }
+                _ => return Err(bad()),
+            }
+        };
+        decoded += width;
+        if decoded > limit {
+            return Err(InvokeFailure::invalid_request(
+                "configuration exceeds the 8 MiB limit",
+            ));
+        }
+    }
+    if i != bytes.len() - 1 {
+        return Err(bad());
+    }
+    Ok(())
+}
+
 fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
     if request.len() > MAX_INVOKE_BYTES {
         return Err(InvokeFailure::invalid_request(format!(
@@ -717,6 +861,9 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
     let request = str::from_utf8(request)
         .map_err(|_| InvokeFailure::invalid_request("request is not valid UTF-8"))?;
     check_dns_network_envelope(request)?;
+    if let Some(response) = dispatch_config_update(request)? {
+        return Ok(response);
+    }
     let envelope: RequestEnvelope =
         serde_json::from_str(request).map_err(InvokeFailure::invalid_request)?;
     if !envelope.payload.is_object() {
@@ -1043,10 +1190,12 @@ impl CoreController {
             stop: Some(stop_tx),
             thread: Some(runtime_thread),
             completion: completed_rx,
+            config_apply: None,
         };
 
         match startup_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(())) => {
+            Ok(Ok(config_apply)) => {
+                engine.config_apply = config_apply;
                 let mut inner = lock(&self.inner);
                 if let Err(error) = inner
                     .lifecycle
@@ -1344,7 +1493,7 @@ fn run_engine(
     tun: Option<InvokeTun>,
     dialer: Dialer,
     stop: oneshot::Receiver<()>,
-    startup: SyncSender<Result<(), InvokeFailure>>,
+    startup: SyncSender<Result<Option<ConfigApplyHandle>, InvokeFailure>>,
 ) -> io::Result<()> {
     let EngineContext {
         instance_id,
@@ -1377,7 +1526,7 @@ fn run_engine_inner(
     tun: Option<InvokeTun>,
     dialer: Dialer,
     stop: oneshot::Receiver<()>,
-    startup: SyncSender<Result<(), InvokeFailure>>,
+    startup: SyncSender<Result<Option<ConfigApplyHandle>, InvokeFailure>>,
 ) -> io::Result<()> {
     let runtime = match engine_runtime_builder().enable_io().enable_time().build() {
         Ok(runtime) => runtime,
@@ -1454,7 +1603,7 @@ fn run_engine_inner(
             }
         };
         tracing::info!(instance_id, has_tun, "Vole runtime engine started");
-        if startup.send(Ok(())).is_err() {
+        if startup.send(Ok(running.config_apply_handle())).is_err() {
             return running.stop().await;
         }
         running
@@ -2119,6 +2268,105 @@ rules:
     }
 
     #[test]
+    fn update_config_invoke_shares_admission_and_keeps_lifecycle_command_serial() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_registry();
+        let id = create_instance();
+        let controller = registry().instance(&id).unwrap();
+        assert_failure(&request(
+            "updateConfig",
+            Some(&id),
+            json!({"configYaml":"rules: [MATCH,DIRECT]"}),
+        ));
+        let (handle, mut receiver) =
+            ConfigApplyHandle::channel(tokio_util::sync::CancellationToken::new());
+        let (_sent, completion) = tokio::sync::watch::channel(false);
+        {
+            let mut inner = lock(&controller.inner);
+            for state in [
+                LifecycleState::Preparing,
+                LifecycleState::Prepared,
+                LifecycleState::Starting,
+                LifecycleState::Running,
+            ] {
+                inner.lifecycle.transition(state).unwrap();
+            }
+            inner.engine = Some(Engine {
+                stop: None,
+                thread: None,
+                completion,
+                config_apply: Some(handle.clone()),
+            });
+        }
+        let occupied = handle.try_admit().unwrap();
+        let busy = request(
+            "updateConfig",
+            Some(&id),
+            json!({"extra":"invalid schema must not be decoded"}),
+        );
+        assert_eq!(busy["error"], "configuration application is busy");
+        drop(occupied);
+        let id2 = id.clone();
+        let caller = thread::spawn(move || {
+            request(
+                "updateConfig",
+                Some(&id2),
+                json!({"configYaml":"rules: [MATCH,DIRECT]"}),
+            )
+        });
+        let mut candidate = receiver.blocking_recv().unwrap();
+        assert!(
+            matches!(candidate.take_update(), ConfigUpdate::Replace(yaml) if yaml == "rules: [MATCH,DIRECT]")
+        );
+        let stopped = request("stop", Some(&id), json!({}));
+        assert_failure(&stopped);
+        assert!(stopped["error"].as_str().unwrap().contains("busy"));
+        candidate.complete(Ok(()));
+        assert_eq!(caller.join().unwrap()["success"], true);
+        destroy_instance(&id);
+        assert_registry_is_idle();
+    }
+
+    #[test]
+    fn update_config_raw_string_budget_and_strict_shape_precede_decoding() {
+        for value in ["", "plain", "界", "\\", "\n", "😀"] {
+            let encoded = serde_json::to_string(value).unwrap();
+            assert!(check_json_string_limit(&encoded, value.len()).is_ok());
+            if !value.is_empty() {
+                assert!(check_json_string_limit(&encoded, value.len() - 1).is_err());
+            }
+            assert_eq!(
+                decode_update_yaml(&format!(r#"{{"configYaml":{encoded}}}"#)).unwrap(),
+                value
+            );
+        }
+        assert!(check_json_string_limit(r#""\u754c""#, 3).is_ok());
+        assert!(check_json_string_limit(r#""\uD83D\uDE00""#, 4).is_ok());
+        assert!(check_json_string_limit(r#""\uD83D\uDE00""#, 3).is_err());
+        for invalid in [r#""\uD800""#, r#""\uDC00""#, "null", "1"] {
+            assert!(check_json_string_limit(invalid, 32).is_err());
+        }
+        for payload in [
+            r#"{"configYaml":"a","extra":1}"#,
+            r#"{"configYaml":"a","configYaml":"b"}"#,
+            r#"{"configYaml":null}"#,
+            "{}",
+        ] {
+            assert!(decode_update_yaml(payload).is_err());
+        }
+        let max = crate::config::MAX_CONFIG_BYTES;
+        let escaped = format!(r#"{{"configYaml":"{}"}}"#, r"\u0061".repeat(max + 1));
+        assert!(decode_update_yaml(&escaped).is_err());
+        // A raw input of arbitrary JSON shape cannot bypass method matching.
+        assert!(
+            dispatch_config_update(r#"{"method":"version","payload":{}}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(dispatch_config_update(r#"{"method":"updateConfig","payload":{}}"#).is_err());
+    }
+
+    #[test]
     fn update_dns_network_raw_admission_is_bounded_before_value_or_registry_work() {
         let padded = format!(
             "{{{}\"generation\":1,\"system\":[],\"dhcp\":[]}}",
@@ -2718,6 +2966,7 @@ rules:
                 stop: Some(stop),
                 thread: Some(worker),
                 completion,
+                config_apply: None,
             });
         }
         let result = invoke_instance_guarded(&controller, || {
@@ -2774,6 +3023,7 @@ rules:
             stop: None,
             thread: Some(worker),
             completion: received,
+            config_apply: None,
         };
         assert!(engine.stop().is_err());
     }

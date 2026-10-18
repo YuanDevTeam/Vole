@@ -664,3 +664,42 @@ async fn age_provider_cache_and_file_refresh_preserve_candidate_contract() {
     assert_eq!(file_cache.contents, old);
     assert!(file_cache.entries[0].state.available);
 }
+
+#[test]
+fn configuration_candidate_reads_bundle_without_persisting_body_or_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let configured=Config::parse_yaml(br#"
+rule-providers:
+  offline: {type: http, url: 'http://rules.invalid/current.mrs', path: nested/rules.mrs, behavior: ipcidr, format: mrs, path-in-bundle: rules/cn.mrs}
+rules: ['RULE-SET,offline,DIRECT', 'MATCH,DIRECT']
+"#).unwrap().providers.unwrap();
+    let archive =
+        crate::resource::bundle::tests::archive(&crate::resource::bundle::tests::mrs(), true);
+    fs::write(root.path().join("BundleMRS.7z"), archive).unwrap();
+    let cache =
+        ProviderCache::open_candidate(root.path(), configured.clone(), &CancellationToken::new())
+            .unwrap();
+    assert!(cache.entries[0].state.available);
+    assert!(!root.path().join("nested").exists());
+    assert!(cache.template.materialize(&cache.contents).is_ok());
+    cache
+        .prepare_paths(root.path(), &CancellationToken::new())
+        .unwrap();
+    assert!(root.path().join("nested").is_dir());
+    assert!(!root.path().join("nested/rules.mrs").exists());
+    fs::write(
+        root.path().join("nested/rules.mrs"),
+        b"invalid existing body",
+    )
+    .unwrap();
+    let metadata = metadata_path(&root.path().join("nested/rules.mrs"));
+    fs::write(&metadata, b"existing sidecar").unwrap();
+    let second =
+        ProviderCache::open_candidate(root.path(), configured, &CancellationToken::new()).unwrap();
+    assert!(second.entries[0].state.available);
+    assert_eq!(
+        fs::read(root.path().join("nested/rules.mrs")).unwrap(),
+        b"invalid existing body"
+    );
+    assert_eq!(fs::read(metadata).unwrap(), b"existing sidecar");
+}

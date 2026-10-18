@@ -97,7 +97,7 @@ impl GeoDataUpdateService {
                         if !retries.ready(kind, Instant::now()) {
                             continue;
                         }
-                        match self.update_one(kind, cancellation.clone()).await {
+                        match self.update_one(kind, cancellation.clone(), false).await {
                             Ok(UpdateAttempt::Completed) => retries.succeeded(kind),
                             Ok(UpdateAttempt::Busy) => {
                                 retries.defer(kind, UPDATE_BUSY_RETRY);
@@ -176,10 +176,30 @@ impl GeoDataUpdateService {
         .map_err(|error: GeoDataManagerError| error.to_string())
     }
 
+    /// Explicit Controller refresh uses the same lock, download and commit path.
+    /// Only assets required by the active registration are acquired.
+    pub(crate) async fn refresh_active(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<(), &'static str> {
+        for kind in GeoDataKind::ALL {
+            if cancellation.is_cancelled() {
+                return Err("runtime stopped");
+            }
+            match self.update_one(kind, cancellation.clone(), true).await {
+                Ok(UpdateAttempt::Completed) => {}
+                Ok(UpdateAttempt::Busy) => return Err("GeoData update is busy"),
+                Err(_) => return Err("GeoData update failed"),
+            }
+        }
+        Ok(())
+    }
+
     async fn update_one(
         &self,
         kind: GeoDataKind,
         cancellation: CancellationToken,
+        force: bool,
     ) -> Result<UpdateAttempt, String> {
         let source_url = resource_url(&self.urls, kind, self.geodata_mode).to_owned();
         let manager = self.manager.clone();
@@ -187,13 +207,22 @@ impl GeoDataUpdateService {
         let begin_source = source_url.clone();
         let begin_cancellation = cancellation.clone();
         let session = match blocking_operation(move || {
-            manager.begin_update_for_active_registration_with_cancellation(
-                &registration,
-                kind,
-                &begin_source,
-                SystemTime::now(),
-                &begin_cancellation,
-            )
+            if force {
+                manager.force_update_for_active_registration_with_cancellation(
+                    &registration,
+                    kind,
+                    &begin_source,
+                    &begin_cancellation,
+                )
+            } else {
+                manager.begin_update_for_active_registration_with_cancellation(
+                    &registration,
+                    kind,
+                    &begin_source,
+                    SystemTime::now(),
+                    &begin_cancellation,
+                )
+            }
         })
         .await?
         {

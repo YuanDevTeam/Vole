@@ -1,6 +1,8 @@
 //! Strict parsing for the current Vole YAML configuration.
 mod anytls;
 mod fake_ip;
+#[cfg(any(feature = "invoke", test))]
+pub(crate) mod live_update;
 pub use anytls::AnyTlsSessionOptions;
 mod fallback;
 mod grpc;

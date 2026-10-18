@@ -1773,6 +1773,14 @@ impl std::fmt::Debug for RunningCore {
 }
 
 impl RunningCore {
+    pub(crate) fn config_apply_handle(
+        &self,
+    ) -> Option<crate::resource::config_apply::ConfigApplyHandle> {
+        self.resources
+            .as_ref()
+            .map(|resources| resources.config_apply_handle())
+    }
+
     // Runtime construction keeps ownership transfers explicit; grouping these
     // independent components into another one-use container would only hide
     // the shutdown responsibilities enforced below.

@@ -90,7 +90,7 @@ stopped -> preparing -> prepared -> starting -> running
 - `validateConfig` 是可并发的纯校验方法，不要求或执行 `initialize`。
 - `measureDelay` 使用独立批次和私有工作器，不进入公共实例表。
 - 公开生命周期为 `initialize -> createInstance -> start(configYaml) -> stop -> destroyInstance`。`preparing`、`prepared` 和 `starting` 是 `start` 内部阶段，没有公共 `prepare` 方法。
-- 不支持配置整体热重载；切换配置需要 `stop -> start(新 configYaml)`。运行期间可更新 providers、自动选择健康成员或通过 Controller 切组；这些操作不修改启动 YAML，既有连接保留原资源和路径。
+- `updateConfig` 与 Controller 共用一个候选应用器；路由、节点、provider 和允许的 DNS/连接策略更新只影响新连接。TUN、监听器、系统网络等启动资源变更需要 `stop -> start(新 configYaml)`。既有连接保留原资源和路径。
 - `stop` 在 stopped 状态幂等；`destroyInstance` 是最终同步清理屏障。
 
 ## 方法
@@ -278,6 +278,24 @@ Windows 编译时选择互斥的 `windows-wintun` 或 `windows-uwp`：
 
 Stop 关闭本次持有的 fd、session 和原生句柄；Wintun 不承诺移除宿主已有的同名接口
 或卸载驱动。平台启动失败不切换另一种 Windows 后端。
+
+### `updateConfig`
+
+实例级方法，只允许 running 状态，payload 与 `start` 相同：
+
+```json
+{"method":"updateConfig","instanceId":"1","payload":{"configYaml":"rules: [MATCH,DIRECT]"}}
+```
+
+共享 Controller 的单候选许可、解析、完整图准备与原子发布，不建立第二个运行时。
+先取得许可，再解码最多 8 MiB 的 YAML；并发应用返回 busy。无效候选或准备失败保留旧代，
+改变启动资源返回 reconnect required。成功仅表示候选配置及当前可用资源已经发布；HTTP provider
+继续沿原更新流程刷新，不表示所有远端订阅已下载。Controller GET `/configs` 可确认当前有效值。
+
+沿用实例命令锁：调用完成前，同实例 Stop/getState/其他命令返回 busy；候选等待上限 90 秒。
+超时或取消会阻止未发布候选继续提交；工作器保留许可并回收已开始的准备任务，Stop 仍等待其完成。如超时与发布同时发生，
+通过 Controller 查询确认当前值。既有连接仍持有旧代至结束；新连接使用新代。Provider 身份和
+Windows Session Snapshot 不由此重建；Windows UWP 的活动 Provider 配置仍由宿主管理和重连。
 
 ### `foreground`
 

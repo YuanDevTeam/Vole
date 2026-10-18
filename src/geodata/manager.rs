@@ -445,6 +445,19 @@ impl RegistrationEntry {
     }
 }
 
+fn restore_requirement_matcher(
+    entry: &mut RegistrationEntry,
+    old: &std::sync::Weak<GeoData>,
+    old_report: GeoDataLoadReport,
+) {
+    let (snapshot, report) = old.upgrade().map_or_else(
+        || load_snapshot(&entry.assets, &entry.requirements),
+        |snapshot| (snapshot, old_report),
+    );
+    entry.retired = None;
+    entry.publish(snapshot, report);
+}
+
 /// Fixed paths for one registration. MMDB discovery never changes the store
 /// used by GeoSite/ASN, state, locks, or provider data-directory derivation.
 #[derive(Debug, Clone)]
@@ -699,18 +712,33 @@ impl GeoDataManager {
             .as_mut()
             .filter(|entry| lease.matches(entry))
             .ok_or(GeoDataManagerError::RegistrationActive)?;
-        if entry.requirements == requirements {
+        if entry.requirements == requirements && !entry.reload_pending {
             return Ok(());
         }
         check_cancellation(cancellation)?;
+        // Do not retain a second full GeoData allocation while draining. A weak
+        // rollback reference can recover a reader-held payload; once drained,
+        // reload the original requirements from their unchanged asset paths.
+        let old = Arc::downgrade(&entry.matcher.snapshot());
+        let old_report = entry.report.clone();
+        let next_assets = if entry.requirements.geodata_mode != requirements.geodata_mode {
+            AssetPaths::for_registration(&self.store_dir, requirements.geodata_mode)
+        } else {
+            entry.assets.clone()
+        };
         entry.unload();
-        entry.drain(cancellation)?;
-        if entry.requirements.geodata_mode != requirements.geodata_mode {
-            entry.assets = AssetPaths::for_registration(&self.store_dir, requirements.geodata_mode);
+        if let Err(error) = entry.drain(cancellation) {
+            restore_requirement_matcher(entry, &old, old_report);
+            return Err(error);
         }
+        let (snapshot, report) = load_snapshot(&next_assets, &requirements);
+        if let Err(error) = check_cancellation(cancellation) {
+            drop(snapshot);
+            restore_requirement_matcher(entry, &old, old_report);
+            return Err(error);
+        }
+        entry.assets = next_assets;
         entry.requirements = requirements;
-        let (snapshot, report) = load_snapshot(&entry.assets, &entry.requirements);
-        check_cancellation(cancellation)?;
         entry.publish(snapshot, report);
         Ok(())
     }
@@ -888,6 +916,36 @@ impl GeoDataManager {
         now: SystemTime,
         cancellation: &CancellationToken,
     ) -> Result<Option<GeoUpdateSession>, GeoDataManagerError> {
+        self.begin_registration_update(lease, kind, source_url, now, cancellation, false)
+    }
+
+    pub(crate) fn force_update_for_active_registration_with_cancellation(
+        self: &Arc<Self>,
+        lease: &GeoDataRegistrationLease,
+        kind: GeoDataKind,
+        source_url: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<GeoUpdateSession>, GeoDataManagerError> {
+        self.begin_registration_update(
+            lease,
+            kind,
+            source_url,
+            SystemTime::now(),
+            cancellation,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_registration_update(
+        self: &Arc<Self>,
+        lease: &GeoDataRegistrationLease,
+        kind: GeoDataKind,
+        source_url: &str,
+        now: SystemTime,
+        cancellation: &CancellationToken,
+        force: bool,
+    ) -> Result<Option<GeoUpdateSession>, GeoDataManagerError> {
         check_cancellation(cancellation)?;
         if source_url.len() > MAX_SOURCE_URL_BYTES {
             return Err(GeoDataManagerError::SourceUrlTooLarge { kind });
@@ -905,13 +963,18 @@ impl GeoDataManager {
         let Some((status, assets)) = selected else {
             return Ok(None);
         };
-        if !resource_due(
-            status.resource(kind),
-            source_url,
-            &assets.identity(kind),
-            unix_seconds(now),
-            self.update_interval.load(Ordering::Relaxed),
-        ) {
+        if !status.resource(kind).required {
+            return Ok(None);
+        }
+        if !force
+            && !resource_due(
+                status.resource(kind),
+                source_url,
+                &assets.identity(kind),
+                unix_seconds(now),
+                self.update_interval.load(Ordering::Relaxed),
+            )
+        {
             return Ok(None);
         }
         let resource = status.resource(kind);
@@ -2964,6 +3027,116 @@ mod tests {
             .unwrap();
         assert!(manager.status().unwrap().geosite.required);
         drop(replacement);
+    }
+
+    #[test]
+    fn cancelled_requirement_change_restores_the_old_matcher_and_registration() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join(super::super::GEOSITE_FILE_NAME),
+            site_file("a", "a.example"),
+        )
+        .unwrap();
+        let manager = GeoDataManager::open(root.path(), Duration::from_secs(3600)).unwrap();
+        let original = requirements(&[rule(RuleKind::GeoSite("a".into()))]);
+        let registration = manager.register(original.clone()).unwrap();
+        let matcher = registration.matcher();
+        let reader = matcher.snapshot();
+        assert!(reader.matches_geosite("a", "www.a.example"));
+        let lease = registration.updater_lease();
+        let cancel = CancellationToken::new();
+        let worker_manager = manager.clone();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            worker_manager.replace_requirements(
+                &lease,
+                requirements(&[rule(RuleKind::GeoSite("b".into()))]),
+                &worker_cancel,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matcher.geosite_available("a") {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        cancel.cancel();
+        assert!(worker.join().unwrap().is_err());
+        assert!(matcher.matches_geosite("a", "www.a.example"));
+        assert_eq!(
+            lock(&manager.registration).as_ref().unwrap().requirements,
+            original
+        );
+        assert!(!lock(&manager.registration).as_ref().unwrap().reload_pending);
+        drop(reader);
+    }
+
+    #[test]
+    fn explicit_refresh_keeps_source_validators_but_bypasses_only_the_schedule() {
+        let root = tempdir().unwrap();
+        let manager = GeoDataManager::open(root.path(), Duration::from_secs(3600)).unwrap();
+        let source = "https://assets.example.test/geosite.dat";
+        let registration = manager
+            .register(requirements(&[rule(RuleKind::GeoSite("a".into()))]))
+            .unwrap();
+        let lease = registration.updater_lease();
+        let update = manager
+            .begin_update_for_active_registration(
+                &lease,
+                GeoDataKind::GeoSite,
+                source,
+                SystemTime::now(),
+            )
+            .unwrap()
+            .unwrap();
+        let (hash, size) = stage_candidate(&update, &site_file("a", "a.example"));
+        update
+            .commit(Some("\"same-source\"".into()), hash, size)
+            .unwrap();
+        assert!(
+            manager
+                .begin_update_for_active_registration(
+                    &lease,
+                    GeoDataKind::GeoSite,
+                    source,
+                    SystemTime::now()
+                )
+                .unwrap()
+                .is_none()
+        );
+        let cancel = CancellationToken::new();
+        let forced = manager
+            .force_update_for_active_registration_with_cancellation(
+                &lease,
+                GeoDataKind::GeoSite,
+                source,
+                &cancel,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(forced.request_etag(), Some("\"same-source\""));
+        forced.not_modified(Some("\"same-source\"".into())).unwrap();
+        assert!(
+            manager
+                .force_update_for_active_registration_with_cancellation(
+                    &lease,
+                    GeoDataKind::GeoIp,
+                    source,
+                    &cancel
+                )
+                .unwrap()
+                .is_none()
+        );
+        cancel.cancel();
+        assert!(
+            manager
+                .force_update_for_active_registration_with_cancellation(
+                    &lease,
+                    GeoDataKind::GeoSite,
+                    source,
+                    &cancel
+                )
+                .is_err()
+        );
     }
 
     #[test]

@@ -183,7 +183,7 @@ impl ProviderSpec {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderTemplate {
-    base: Value,
+    pub(super) base: Value,
     pub(super) identity_directory: Option<std::path::PathBuf>,
     pub proxies: Vec<(String, ProviderSpec)>,
     pub rules: Vec<(String, ProviderSpec)>,

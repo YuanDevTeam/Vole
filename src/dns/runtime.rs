@@ -149,6 +149,9 @@ pub struct RuntimeDns {
     // Hint lookup and insertion are bounded synchronous work. Keep this
     // shared TUN hot path free of asynchronous mutex scheduling.
     hints: Option<Arc<StdMutex<RedirHostHints>>>,
+    // Retired policy trees may answer their pinned flows but cannot refill
+    // the active generation's shared address-to-domain mapping.
+    hints_writable: AtomicBool,
     singleflight: Arc<SingleflightRegistry>,
     tcp_pool: Arc<TcpConnectionPool>,
     next_id: AtomicU16,
@@ -1008,6 +1011,55 @@ impl RuntimeDns {
         self.clear_cache_tree().await;
     }
 
+    /// Keep active reverse mappings, but start fresh forward assignments.
+    /// Hold the shared epoch until the durable transaction has been joined.
+    pub(crate) async fn flush_fake_ip(&self) -> io::Result<()> {
+        let mut epoch = self.cache_epoch.write().await;
+        *epoch = epoch.wrapping_add(1);
+        self.clear_cache_tree().await;
+        if let Some(pools) = self.fake_pools.clone() {
+            tokio::task::spawn_blocking(move || pools.flush_forward())
+                .await
+                .map_err(|_| io::Error::other("fake-IP maintenance failed"))??;
+        }
+        Ok(())
+    }
+
+    /// Keep this guard until the resource generation has been published. Cache
+    /// admission/refill observes the same boundary as network-source updates.
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) async fn configuration_publication(&self) -> tokio::sync::RwLockWriteGuard<'_, u64> {
+        let mut epoch = self.cache_epoch.write().await;
+        *epoch = epoch.wrapping_add(1);
+        self.clear_cache_tree().await;
+        epoch
+    }
+
+    /// Called only while the common cache epoch is exclusively held. A pinned
+    /// old tree can start another query after publication; epoch alone would
+    /// not prevent that query from adding an old-policy hint to the shared map.
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn retire_configuration_hints(&self) {
+        let mut pending = vec![self];
+        let mut seen = HashSet::new();
+        while let Some(resolver) = pending.pop() {
+            if !seen.insert(std::ptr::from_ref(resolver) as usize) {
+                continue;
+            }
+            resolver.hints_writable.store(false, Ordering::Release);
+            pending.extend(
+                [
+                    resolver.bootstrap.as_deref(),
+                    resolver.proxy_resolver.as_deref(),
+                    resolver.direct_resolver.as_deref(),
+                    resolver.ech_system_resolver.as_deref(),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
+    }
+
     pub(super) async fn clear_cache_tree(&self) {
         let mut pending = vec![self];
         let mut seen = HashSet::new();
@@ -1451,6 +1503,7 @@ impl RuntimeDns {
                     redir_host_entries,
                 )))
             }),
+            hints_writable: AtomicBool::new(true),
             singleflight: SingleflightRegistry::new(resource_stats.clone()),
             tcp_pool: TcpConnectionPool::new(security),
             next_id: AtomicU16::new(1),
@@ -2116,6 +2169,7 @@ impl RuntimeDns {
         if matches!(failure_mode, FailureMode::WireServfail)
             && self.use_fake_ip(&parsed_query.question.name)?
         {
+            let _epoch = self.cache_epoch.read().await;
             return self.synthetic_answer(&parsed_query, &parsed_query.question.name);
         }
 
@@ -3231,7 +3285,9 @@ impl RuntimeDns {
                 .insert_positive(name, query_type, &answers.addresses, ttl, now)
                 .map_err(RuntimeDnsError::Cache)?;
         }
-        if let Some(hints) = &self.hints {
+        if self.hints_writable.load(Ordering::Acquire)
+            && let Some(hints) = &self.hints
+        {
             let mut hints = hints
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7654,6 +7710,40 @@ dns:
         assert_eq!(
             current.domain_hint(new).await.as_deref(),
             Some("generation.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_publication_stops_late_old_tree_hint_refill() {
+        let old = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 120));
+        let late = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 121));
+        let new = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 122));
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            vec![
+                MockReply::Response(ResponseSpec::answer(old)),
+                MockReply::Response(ResponseSpec::answer(late)),
+                MockReply::Response(ResponseSpec::answer(new)),
+            ],
+            vec![],
+        ));
+        let configuration = config(false, vec![nameserver(1, DnsTransport::Udp)]);
+        let previous = RuntimeDns::new(&configuration, dispatcher.clone());
+        previous.resolve("old.example").await.unwrap();
+        let current =
+            RuntimeDns::new(&configuration, dispatcher).with_mapping_from(Some(&previous));
+        {
+            let _publication = current.configuration_publication().await;
+            previous.retire_configuration_hints();
+        }
+        assert!(current.domain_hint(old).await.is_none());
+        // This query starts after the boundary and therefore sees the new
+        // epoch. The retired policy still must not write the active hint map.
+        assert_eq!(previous.resolve("late.example").await.unwrap(), vec![late]);
+        assert!(current.domain_hint(late).await.is_none());
+        assert_eq!(current.resolve("new.example").await.unwrap(), vec![new]);
+        assert_eq!(
+            current.domain_hint(new).await.as_deref(),
+            Some("new.example")
         );
     }
 

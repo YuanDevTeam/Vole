@@ -353,3 +353,8 @@ TCP/ICMP ingress Full 记录 `packet_queue_drops`。这些计数
 4. 记录主机和对应物理平台证据。
 
 没有测量证据时不增加新的资源控制层。实际验证范围见 [验收矩阵](acceptance.md)。
+
+
+## 在线配置候选
+
+Controller 与 Invoke 共用每实例一个候选许可，在完整请求 body／JSON 分配前准入；队列仅一项。候选复用 provider 代际 worker，所有已启动阻塞解析、图准备、路径准备与 GeoData 注册操作均由该 worker join。失败不发布新图，不覆盖活动 provider body／metadata；完成图验证后可以创建受 dataDir 约束的缓存目录。配置替换原子发布模板、图、DNS、组和可用资源快照，退休代际由活动业务持有。此局部准入不限制正常业务连接数，也不将 YAML 上限描述为整进程 RSS 限制。

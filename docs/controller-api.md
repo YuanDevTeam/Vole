@@ -57,7 +57,7 @@ OPTIONS 携带 Origin 和非空 `Access-Control-Request-Method` 时为预检，�
 
 ## 请求预算与停止
 
-HTTP/HTTPS 合计最多 8 条活动连接。普通 H1 每连接处理一个请求后关闭，WebSocket 升级后保持当前订阅；H2 每连接最多 8 条并发请求，超出准入复位 stream，接收窗口每流 1 KiB、连接 8 KiB，发送缓冲每流 16 KiB。头部上限 32 KiB/100 字段，H2 target 上限 8 KiB，PUT body 上限 1 KiB；握手、H1 读头、body 与写响应各有 5 秒期限。停止取消活动请求与订阅、关闭协议 driver，并等待所有 H2 请求和文件候选读取完成。
+HTTP/HTTPS 合计最多 8 条活动连接。普通 H1 每连接处理一个请求后关闭，WebSocket 升级后保持当前订阅；H2 每连接最多 8 条并发请求，超出准入复位 stream，接收窗口每流 1 KiB、连接 8 KiB，发送缓冲每流 16 KiB。头部上限 32 KiB/100 字段，H2 target 上限 8 KiB，组选择与 PATCH body 上限 1 KiB，内联配置 PUT body 上限 8 MiB；握手、H1 读头、body 与写响应各有 5 秒期限。停止取消活动请求与订阅、关闭协议 driver，并等待所有 H2 请求和文件候选读取完成。
 
 ## Bearer 鉴权
 
@@ -334,3 +334,21 @@ Windows WinRT VPN 的完整运行时和 Controller 位于独立 Session Host；�
 Controller 位于普通业务运行时。宿主通过配置的 HTTP 地址直接访问实际 Running Session；
 组查询和切换不经过 `VoleInvoke`、Windows bridge 或 Provider 控制管道，
 不携带 `instanceId`，也不占用 Invoke 命令锁。
+
+
+## `PATCH /configs`、`PUT /configs`
+
+配置应用与 Invoke `updateConfig(configYaml)` 共用一个候选许可和运行时 worker，不更改持久 YAML。`Content-Type` 必须为 `application/json`，必须提供唯一有效的 `Content-Length`，不接受 chunked body。Bearer 与 CORS 沿用普通 REST 规则；无 query 参数。
+
+PATCH 仅接受 `mode`、`log-level`、`sniffing`、`tcp-concurrent`、`find-process-mode`、`interface-name`。`sniffing` 是 Mihomo Controller 的 API 字段，对应配置的 `sniffer.enable`；不向 YAML 增加同名旧字段。其余字段和值由严格配置解析器验证；未知字段失败。PUT 只接受 `{"payload":"完整 Mihomo YAML"}`，不接受任意本地路径。成功返回 204。
+
+候选基于新的本地可用 provider 内容完整构图后发布，HTTP provider 继续遵循既有本地缓存／bundle／后续更新语义，204 不表示所有远端订阅都已同步刷新。配置、图与 provider 模板一起替换；后续订阅更新使用新模板。坏配置保留活动代际；已建立业务保持其原代际，新连接取得新代际。可继承且仍存在的组选择保留。
+
+地址、监听／TUN、全局 IPv6、TLS 根与 Controller 证书、安全配置、fake-IP 范围、profile 存储和系统网络相关启动资源需要宿主重新连接，在线更改返回 409。Linux 原生 auto-route 持有的物理出口隔离同样不在在线重建范围。在线 DNS 策略／hosts 改动在共享缓存 epoch 下清缓存与域名提示；退休 DNS 树继续服务其已持有业务，但不能重新填充活动域名提示。fake-IP 映射保持。
+
+许可在扩展请求 body 和解析前取得，忙时返回 503。解析错误返回 400，准备失败返回固定脱敏 503；应用等待上限 90 秒，超时返回 504，并取消候选。等待 future 被取消会取消候选；普通请求半关闭不代表取消。已开始的阻塞任务继续由 worker 等待收尾，并持有候选许可；返回错误或超时不承诺所有收尾已同步完成。Stop 关闭准入、取消候选并等待完整 worker 收尾。没有运行时资源的 Controller 返回 404。
+
+`POST /configs/geo` 强制检查当前所需的 GeoData，复用现有下载、ETag、校验和原子发布；
+不下载未被活动注册引用的资产。`POST /cache/fakeip/flush` 清除 DNS 结果及 fake-IP 前向分配绑定，
+保留反向映射和分配游标，已有地址仍受原池的容量与正常复用约束；持久化事务完成后才改内存。
+两者不接受正文，成功为 204；与配置应用共用单候选许可，Stop 等待已开始的文件事务和管理任务。

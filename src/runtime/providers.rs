@@ -1,6 +1,8 @@
 //! Transactional provider generations. Existing sessions pin their original graph.
+mod apply;
 use super::*;
 use crate::config::ProxyId;
+use crate::resource::config_apply::{ApplyRequest, ConfigApplyHandle};
 use crate::{
     config::{RuleAction, RuleKind, RuleSpec},
     dispatch::{BoxStream, DatagramBudget, DatagramTransport, DispatchError},
@@ -75,6 +77,9 @@ pub(super) struct ProviderRuntime {
     requests: mpsc::Sender<Refresh>,
     receiver: tokio::sync::Mutex<Option<mpsc::Receiver<Refresh>>>,
     cancellation: CancellationToken,
+    config_apply: ConfigApplyHandle,
+    config_receiver: tokio::sync::Mutex<Option<mpsc::Receiver<ApplyRequest>>>,
+    logs: Option<Arc<crate::logging::RuntimeLog>>,
     dialer: Dialer,
     limits: ResourceLimits,
     manager: Arc<GeoDataManager>,
@@ -89,6 +94,8 @@ impl ProviderRuntime {
         dialer: Dialer,
     ) -> Arc<Self> {
         let (requests, receiver) = mpsc::channel(16);
+        let cancellation = CancellationToken::new();
+        let (config_apply, config_receiver) = ConfigApplyHandle::channel(cancellation.clone());
         let requirements = GeoRequirements::for_rules(&prepared.config, prepared.rules.all_rules())
             .expect("prepared requirements");
         let root = prepared
@@ -122,7 +129,10 @@ impl ProviderRuntime {
             cache: tokio::sync::Mutex::new(cache),
             requests,
             receiver: tokio::sync::Mutex::new(Some(receiver)),
-            cancellation: CancellationToken::new(),
+            cancellation,
+            config_apply,
+            config_receiver: tokio::sync::Mutex::new(Some(config_receiver)),
+            logs: crate::logging::current(),
             dialer,
             limits: prepared.limits,
             manager: prepared.geodata_manager.clone(),
@@ -130,7 +140,11 @@ impl ProviderRuntime {
             geo: prepared.geodata_registration.matcher(),
         })
     }
+    pub(super) fn config_apply_handle(&self) -> ConfigApplyHandle {
+        self.config_apply.clone()
+    }
     pub(super) fn begin_shutdown(&self) {
+        let _publication = self.publication.lock().unwrap();
         self.cancellation.cancel();
         self.current.load().connections.shutdown();
         self.current.load().graph.begin_shutdown();
@@ -216,6 +230,12 @@ impl ProviderRuntime {
             .await
             .take()
             .ok_or_else(|| io::Error::other("provider worker already running"))?;
+        let mut config_receiver = self
+            .config_receiver
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| io::Error::other("configuration worker already running"))?;
         let mut maintenance = tokio::time::interval(Duration::from_secs(1));
         loop {
             let deadline = self.cache.lock().await.next_refresh().map(|(_, at)| at);
@@ -230,6 +250,7 @@ impl ProviderRuntime {
                 biased;
                 ()=parent.cancelled()=>{self.begin_shutdown();return Ok(());}
                 ()=self.cancellation.cancelled()=>return Ok(()),
+                request=config_receiver.recv()=>if let Some(request)=request {self.apply_request(request).await;},
                 request=receiver.recv()=>if let Some(request)=request {
                     let index=self.cache.lock().await.entries.iter().position(|entry|entry.state.rule==request.rules && entry.state.name==request.name);
                     let result=match index {Some(index)=>self.update(index).await,None=>Err("unknown provider")};
@@ -459,6 +480,9 @@ impl ProviderRuntime {
 impl RuntimeResources for ProviderRuntime {
     fn connections(&self) -> Arc<crate::connections::Registry> {
         self.current.load().connections.clone()
+    }
+    fn config_apply(&self) -> Option<ConfigApplyHandle> {
+        Some(self.config_apply.clone())
     }
     fn configs(&self) -> serde_json::Value {
         self.current

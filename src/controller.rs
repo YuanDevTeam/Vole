@@ -1,5 +1,7 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
+#[cfg(any(feature = "invoke", test))]
+mod configs;
 mod cors;
 mod tls;
 mod transport;
@@ -353,6 +355,15 @@ async fn handle_request<S: ControllerIo>(
         return write_error(&mut stream, 400, "Bad request", &[]).await;
     }
 
+    #[cfg(any(feature = "invoke", test))]
+    if matches!(
+        request.target.as_str(),
+        "/cache/fakeip/flush" | "/configs/geo"
+    ) {
+        return configs::maintenance(&mut stream, request, resources.as_deref(), cancellation)
+            .await;
+    }
+
     if request.target == "/cache/dns/flush" {
         if request.method != "POST" {
             return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "POST")]).await;
@@ -367,6 +378,10 @@ async fn handle_request<S: ControllerIo>(
         return write_response(&mut stream, 204, &[], &[]).await;
     }
 
+    #[cfg(any(feature = "invoke", test))]
+    if request.target == "/configs" && matches!(request.method.as_str(), "PATCH" | "PUT") {
+        return configs::apply(&mut stream, request, resources.as_deref(), cancellation).await;
+    }
     if matches!(request.target.as_str(), "/configs" | "/rules") {
         if request.method != "GET" {
             return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
