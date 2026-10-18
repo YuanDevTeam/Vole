@@ -23,7 +23,12 @@ pub mod inbound;
 pub mod invoke;
 pub mod lifecycle;
 pub mod limits;
-#[cfg(any(feature = "invoke", test))]
+#[cfg(any(
+    feature = "invoke",
+    feature = "inbound-http",
+    feature = "inbound-socks5",
+    test
+))]
 mod logging;
 pub mod outbound;
 pub mod packet;

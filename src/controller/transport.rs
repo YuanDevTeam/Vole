@@ -13,6 +13,12 @@ use tokio_util::sync::CancellationToken;
 use super::{CONTROLLER_BODY_TIMEOUT, CONTROLLER_HEADER_TIMEOUT, RequestContext};
 
 pub(super) trait ControllerIo: AsyncRead + Unpin + Send {
+    fn websocket_io(&mut self) -> Option<&mut (dyn super::websocket::WebSocketIo + '_)> {
+        None
+    }
+    fn websocket_headers(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
     fn respond(
         &mut self,
         status: u16,
@@ -32,6 +38,10 @@ impl<T: AsyncRead + Unpin> AsyncRead for H1Io<T> {
     }
 }
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ControllerIo for H1Io<T> {
+    fn websocket_io(&mut self) -> Option<&mut (dyn super::websocket::WebSocketIo + '_)> {
+        Some(&mut self.0)
+    }
+
     async fn respond(
         &mut self,
         status: u16,
@@ -82,6 +92,15 @@ impl<T: AsyncRead + Unpin> AsyncRead for CorsIo<T> {
     }
 }
 impl<T: ControllerIo> ControllerIo for CorsIo<T> {
+    fn websocket_io(&mut self) -> Option<&mut (dyn super::websocket::WebSocketIo + '_)> {
+        self.inner.websocket_io()
+    }
+    fn websocket_headers(&self) -> Vec<(String, String)> {
+        let mut headers = self.inner.websocket_headers();
+        headers.extend(self.headers.clone());
+        headers
+    }
+
     async fn respond(
         &mut self,
         status: u16,

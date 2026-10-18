@@ -422,7 +422,7 @@ impl HealthRuntime {
         Ok(())
     }
 
-    fn apply_group_health(&self) {
+    pub(super) fn apply_group_health(&self) {
         let samples = self.samples.lock().unwrap();
         for job in self.jobs.lock().unwrap().iter() {
             if let Some(index) = job.group {

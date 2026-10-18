@@ -23,6 +23,7 @@ pub(crate) struct ProxyGroupState {
     pub(crate) now: String,
     pub(crate) hidden: bool,
     pub(crate) icon: String,
+    pub(crate) fixed: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +244,22 @@ impl ProxyGroups {
 
     pub(crate) fn select(&self, group: &str, member: &str) -> Result<(), ProxyGroupError> {
         self.inherit_selection(group, member, true)
+    }
+    pub(crate) fn clear_fixed(&self, name: &str) -> Result<(), ProxyGroupError> {
+        let id = self
+            .ids_by_name
+            .get(name)
+            .copied()
+            .ok_or(ProxyGroupError::UnknownGroup)?;
+        let group = &self.groups[id.index()];
+        if !matches!(
+            group.config.kind,
+            crate::config::GroupKind::UrlTest | crate::config::GroupKind::Fallback
+        ) {
+            return Err(ProxyGroupError::NotSelectable);
+        }
+        group.selected.clear_forced();
+        Ok(())
     }
     pub(crate) fn inherit_selection(
         &self,
@@ -532,6 +549,15 @@ impl SelectProxyGroup {
             },
             hidden: self.hidden,
             icon: self.icon.clone(),
+            fixed: matches!(
+                self.config.kind,
+                crate::config::GroupKind::UrlTest | crate::config::GroupKind::Fallback
+            )
+            .then(|| {
+                self.selected
+                    .forced()
+                    .map_or_else(String::new, |index| self.members[index].name.clone())
+            }),
         }
     }
 }
@@ -954,6 +980,7 @@ proxy-groups:
                     now: "second".to_owned(),
                     hidden: false,
                     icon: String::new(),
+                    fixed: None,
                 },
                 ProxyGroupState {
                     kind: crate::config::GroupKind::Select,
@@ -962,6 +989,7 @@ proxy-groups:
                     now: "child".to_owned(),
                     hidden: false,
                     icon: String::new(),
+                    fixed: None,
                 },
             ]
         );
@@ -1131,5 +1159,52 @@ proxy-groups:
             Err(error) => error,
         };
         assert!(error.to_string().contains("hop ceiling"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_fixed_clear_uses_existing_health_without_probe() {
+        let mut automatic = group(
+            "automatic",
+            vec![
+                member("first", ProxyGroupMemberTarget::Direct),
+                member("second", ProxyGroupMemberTarget::Reject),
+            ],
+            0,
+        );
+        automatic.kind = crate::config::GroupKind::UrlTest;
+        let manual = group(
+            "manual",
+            vec![member("first", ProxyGroupMemberTarget::Direct)],
+            0,
+        );
+        let node = Arc::new(FailingDispatcher);
+        let groups = ProxyGroups::new(&[automatic, manual], Vec::new(), node).unwrap();
+        assert_eq!(
+            groups.state("automatic").unwrap().fixed.as_deref(),
+            Some("")
+        );
+        assert_eq!(groups.state("manual").unwrap().fixed, None);
+        groups.select("automatic", "first").unwrap();
+        groups.apply_health(0, &[Some(100), Some(10)]);
+        assert_eq!(groups.state("automatic").unwrap().now, "first");
+        assert_eq!(
+            groups.state("automatic").unwrap().fixed.as_deref(),
+            Some("first")
+        );
+        groups.clear_fixed("automatic").unwrap();
+        groups.apply_health(0, &[Some(100), Some(10)]);
+        assert_eq!(groups.state("automatic").unwrap().now, "second");
+        assert_eq!(
+            groups.state("automatic").unwrap().fixed.as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            groups.clear_fixed("manual"),
+            Err(ProxyGroupError::NotSelectable)
+        );
+        assert_eq!(
+            groups.clear_fixed("missing"),
+            Err(ProxyGroupError::UnknownGroup)
+        );
     }
 }

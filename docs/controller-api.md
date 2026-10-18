@@ -1,6 +1,6 @@
 # 运行时 Controller API
 
-Controller 是当前 Running Session 的 HTTP 接口。它提供业务连接管理、有效设置与规则查询、一次性 TUN 流量快照，以及静态与动态 `select`、`url-test`、`fallback`、`load-balance` 代理组的状态查询和实时选择；它不是 Invoke API，也不承诺完整 Mihomo Dashboard 兼容。
+Controller 是当前 Running Session 的 HTTP 接口。它提供业务连接管理、有效设置与规则查询、单次 TUN 流量快照、按需 WebSocket 推送，以及静态与动态 `select`、`url-test`、`fallback`、`load-balance` 代理组的状态查询和实时选择；它不是 Invoke API，也不承诺完整 Mihomo Dashboard 兼容。
 
 ## 配置与生命周期
 
@@ -57,7 +57,7 @@ OPTIONS 携带 Origin 和非空 `Access-Control-Request-Method` 时为预检，�
 
 ## 请求预算与停止
 
-HTTP/HTTPS 合计最多 8 条活动连接。H1 每连接处理一个请求后关闭；H2 每连接最多 8 条并发请求，超出准入复位 stream，接收窗口每流 1 KiB、连接 8 KiB，发送缓冲每流 16 KiB。头部上限 32 KiB/100 字段，H2 target 上限 8 KiB，PUT body 上限 1 KiB；握手、H1 读头、body 与写响应各有 5 秒期限。停止取消活动请求、关闭协议 driver，并等待所有 H2 请求和文件候选读取完成。
+HTTP/HTTPS 合计最多 8 条活动连接。普通 H1 每连接处理一个请求后关闭，WebSocket 升级后保持当前订阅；H2 每连接最多 8 条并发请求，超出准入复位 stream，接收窗口每流 1 KiB、连接 8 KiB，发送缓冲每流 16 KiB。头部上限 32 KiB/100 字段，H2 target 上限 8 KiB，PUT body 上限 1 KiB；握手、H1 读头、body 与写响应各有 5 秒期限。停止取消活动请求与订阅、关闭协议 driver，并等待所有 H2 请求和文件候选读取完成。
 
 ## Bearer 鉴权
 
@@ -74,6 +74,12 @@ Authorization: Bearer vole-runtime-secret
 - 比较过程不能通过日志、响应或明显的提前返回时序泄漏 token；
 - 省略或空串 `secret` 时不要求 `Authorization`；Controller 不使用 HTTP Basic，顶层 `authentication` 只属于 HTTP/SOCKS5 业务代理。
 - `allow-lan` 只控制业务代理监听，不改变 Controller 的监听地址或 Bearer 鉴权。
+
+WebSocket 浏览器可在下述四个升级路径使用唯一的 `token` query；非空 secret 时 token 优先于 Authorization。缺失 token 则沿用相同 Bearer 校验。重复 token 返回 400，错误 token 返回 401；普通 REST 不接受 token 替代 Bearer。token 不进入日志。
+
+## `GET /version`
+
+返回 `{"meta":false,"version":"..."}`。version 是当前 Vole crate 版本，meta 为 false；该接口不宣称自身为 Mihomo，也不增加 Invoke/Windows 协商字段。
 
 ## `GET /traffic`
 
@@ -97,7 +103,7 @@ Authorization: Bearer vole-runtime-secret
 
 Apple utun 的四字节包信息头不计入统计。统计只覆盖跨过 TUN L3 边界的包，包括 TUN DNS 和 ICMP；不重复计算 TLS、XHTTP 或其他代理封装，也不包含 HTTP/SOCKS5 代理入站、GeoData 下载、Controller 请求和 `measureDelay`。
 
-请求不会等待下一次采样，不保持分块响应，不升级 WebSocket，也不为调用方保存“上次读取”状态。首个采样窗口完成前和空闲窗口内，`up`/`down` 为 0；累计值在同一 session 内单调不减并采用饱和语义。没有 TUN 的代理组 Controller 对该路由返回 `404 Not Found`。
+普通 GET 不会等待下一次采样，不保持分块响应，也不为调用方保存“上次读取”状态；升级订阅见下文。首个采样窗口完成前和空闲窗口内，`up`/`down` 为 0；累计值在同一 session 内单调不减并采用饱和语义。没有 TUN 的代理组 Controller 对该路由返回 `404 Not Found`。
 
 TUN 按最多 8 包中有效消费／平台报告成功的包合并记账，取消或错误不会遗漏已经完成的前缀。批次恰好跨越一秒采样边界时，该批字节统一归入记账时的窗口，累计值不受影响；流量快照不是逐包时间戳统计。
 
@@ -136,7 +142,9 @@ time 为 Unix 秒；未探测节点初始 alive 为 true、history 为空。HTTP
 
 load-balance 根据每条新连接的元数据选择成员，响应不含 `now`，不接受手动选择。业务 UDP 按目标会话固定出口。
 
-url-test/fallback 的手动选择在该成员健康时保持固定，失败后恢复自动选择。url-test 使用 tolerance 抑制小幅切换，fallback 按成员顺序选择与恢复。
+url-test/fallback 的手动选择在该成员健康时保持固定，失败后恢复自动选择。url-test 使用 tolerance 抑制小幅切换，fallback 按成员顺序选择与恢复。这两类组的 `fixed` 是固定成员名字符串；未固定为空串，select/load-balance 不返回该字段。
+
+`DELETE /proxies/{name}` 清除 url-test/fallback 的固定成员，使用已有健康结果重新进行自动选择，并按 profile 设置保存空选择；不主动探测、不改变现有业务路径。成功返回 204，未知名称 404，普通节点、select 或 load-balance 返回 400。
 
 ## 主动探测与内存
 
@@ -156,7 +164,26 @@ HTTP 响应完成时即返回延迟，即使状态不符合 `expected`；该 URL
 
 `GET /memory` 返回一次 `{"inuse":123456,"oslimit":null}` 快照：Linux/Android 读取自身 `/proc/self/status` 的 VmRSS，
 Apple 使用自身 Mach task resident size，Windows 使用当前进程 working set。单位均为字节；读取失败为 null。
-未获取进程内存上限，oslimit 为 null。该路由不提供 Mihomo 的周期流式响应，不启动后台采样；不同平台口径不能直接横比。
+未获取进程内存上限，oslimit 为 null。普通 GET 不启动后台采样；不同平台口径不能直接横比。
+
+## WebSocket 订阅
+
+在 HTTP/1.1 上使用标准 WebSocket Upgrade；HTTPS 使用 H1 ALPN，现有 H2 请求继续提供普通 REST，不启用扩展 CONNECT。认证和 CORS 复用同一请求处理链，升级响应含适用的 CORS 头。
+
+| 路径 | 消息内容 | 发送时机 |
+| --- | --- | --- |
+| `/traffic` | `up/down/upTotal/downTotal` | 每秒 |
+| `/memory` | 与普通 GET 相同的 `inuse/oslimit` | 每秒，直接读取真实值 |
+| `/connections` | 与普通 GET 相同的业务快照 | 立即一次，其后按 `interval` 毫秒；缺省 1000，内部接受 100–60000 |
+| `/logs` | `type/payload`，或 `format=structured` 时的 `time/level/message/fields` | 有日志时 |
+
+**WebSocket `/traffic` 使用业务 Registry 的应用负载字节**，与 `/connections` 累计值一致；速率是本订阅实际采样间隔内的字节/秒。普通 GET `/traffic` 仍是 TUN L3 包统计，两者不能混用。Provider 更新不重置业务累计值。
+
+`/logs?level=info` 支持 debug/info/warning/error/silent，缺省 info，并受当前运行时 log-level 过滤。结构化 time 为 UTC 时分秒，warning 转为 warn。日志总线属于当前运行时，独立于宿主 tracing subscriber；仅输出内部 target 和明确允许的数值/布尔指标，不格式化 message、错误原文、目标、配置或任意 Debug 值。它不提供历史回放。
+
+HTTP/HTTPS 合计最多 4 个订阅，仍占用既有 8 条连接名额。每条输出消息最多 256 KiB，序列化扩容前检查；connections 订阅至多捕获 512 条引用，超预算关闭当前订阅，普通 REST 快照保持完整。接收缓冲/消息/帧各限 1 KiB，业务 Text/Binary 不作为 Controller 命令；Ping/Pong/Close 按协议处理。写入和控制帧 flush 最多 5 秒，慢客户端只保留当前发送消息，不排队后续快照。
+
+日志环仅在有订阅时创建，64 条共享事件、单条至多 512 字节，每秒至多 32 条；过载丢弃，最后订阅离开释放历史缓冲。无订阅时不运行周期采样或日志轮询。Stop 取消并 join 当前连接任务，释放订阅许可与日志接收器。
 
 ## `PUT /proxies/{name}`
 
@@ -185,7 +212,7 @@ Content-Length: 26
 
 ## 名称与路径
 
-节点和代理组定义名共享一个大小写敏感的命名空间，名称为非空 UTF-8 字符串。保留定义名为 `DIRECT`、`REJECT`、`REJECT-DROP`、`COMPATIBLE`、`PASS` 和 `PASS-RULE`；其中当前可用的内置动作是 DIRECT 与 REJECT。
+节点和代理组定义名共享一个大小写敏感的命名空间，名称为非空 UTF-8 字符串。保留定义名为 `DIRECT`、`REJECT`、`REJECT-DROP`、`COMPATIBLE`、`PASS` 和 `PASS-RULE`；其中 DIRECT/COMPATIBLE 直连，REJECT/REJECT-DROP 按对应拒绝语义执行，PASS/PASS-RULE 属于规则控制。
 
 路径中的 `{name}` 对 percent-encoding 严格解码一次；原始路径分隔符、无效 `%` 和无效 UTF-8 会失败。名称中的 `/`、`?`、`#`、`%` 等字符应 percent-encode；`%252F` 表示字面名称 `%2F`，不会再次解码。`+` 保留为 `+`。请求总大小仍受 HTTP 边界约束。
 
@@ -218,7 +245,7 @@ HTTP proxy provider 收到 `Subscription-Userinfo` 后另含 `subscriptionInfo` 
 Expire 为 Unix 秒。未知时省略该对象，缺失子项为 0；不以本地业务流量代替订阅信息。
 数值接受十进制整数、有限小数和科学计数法，小数向零截断；非法或超范围子项忽略。
 成功候选或合法 304 才更新元信息；未带该头时保留旧值，失败更新保留已发布对象。
-缓存恢复只接受与配置 URL 和内容 hash 一致的元信息。
+缓存恢复只接受与精确 URL、实际请求 header/UA 的摘要及内容 hash 一致的元信息。
 
 更新将节点、组和规则作为完整候选检查，发布时保留仍存在的当前选择。
 既有会话持有旧资源，最后一个使用者释放后回收；下载通过当前可用的运行配置建立出口，
@@ -277,7 +304,7 @@ policy 与 fallback 仍生效。DNS 关闭或查询失败返回 500。这里只�
 不提供其他 qtype、Authority/Additional 展开或后台 DNS 查询日志。
 
 这些接口复用 Controller 的 Bearer 鉴权。目标与 DNS 路径只通过显式查询返回，
-不会写入普通日志。`/connections` 是业务负载统计，`/traffic` 继续表示 TUN 原始 IP 包流量，
+不会写入普通日志。`/connections` 与 WebSocket `/traffic` 是业务负载统计，普通 GET `/traffic` 表示 TUN 原始 IP 包流量，
 `/proxies` 的节点健康数据继续表示探测结果，三者不可相互替代。
 
 `POST /cache/dns/flush` 清除当前资源代际所有 DNS 角色的普通地址、负响应、原始响应缓存和
@@ -298,10 +325,10 @@ policy 与 fallback 仍生效。DNS 关闭或查询失败返回 500。这里只�
 | `411 Length Required` | PUT 缺少 `Content-Length` |
 | `413 Payload Too Large` | PUT 正文超过 1 KiB |
 | `415 Unsupported Media Type` | PUT 不是严格 `application/json` |
-| `503 Service Unavailable` | 探测或资源更新失败 |
+| `503 Service Unavailable` | 探测、资源更新失败或订阅准入已满 |
 | `504 Gateway Timeout` | 主动探测超时 |
 
-当前不提供配置修改、WebSocket 推送、Controller 版本协商或完整 Dashboard response。除本文列出的连接、规则、配置、DNS、主动探测、内存和 provider 路由、`GET /proxies`、`GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}` 外，其他路径和方法均不属于公共协议。
+当前不提供配置修改或完整 Dashboard response。公开范围为本文列出的版本、连接、规则、配置、DNS、主动探测、内存、provider、代理组查询/选择/固定清除，以及四个 WebSocket 路径；其他路径和方法不属于公共协议。
 
 Windows WinRT VPN 的完整运行时和 Controller 位于独立 Session Host；桌面 Wintun 的
 Controller 位于普通业务运行时。宿主通过配置的 HTTP 地址直接访问实际 Running Session；

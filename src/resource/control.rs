@@ -33,6 +33,9 @@ pub(crate) trait RuntimeResources: Send + Sync {
     fn rules(&self) -> serde_json::Value;
     fn groups(&self) -> Arc<ProxyGroups>;
     fn select(&self, group: &str, member: &str) -> Result<(), ProxyGroupError>;
+    fn clear_fixed(&self, _group: &str) -> Result<(), ProxyGroupError> {
+        Err(ProxyGroupError::NotSelectable)
+    }
     fn health(&self) -> serde_json::Value;
     fn providers(&self, rules: bool) -> serde_json::Value;
     fn dns(&self) -> Option<DnsSnapshot>;

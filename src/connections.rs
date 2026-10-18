@@ -239,6 +239,22 @@ impl Registry {
             business_totals,
         }
     }
+    pub(crate) fn totals(&self) -> (u64, u64) {
+        (
+            self.totals.upload.load(Ordering::Relaxed),
+            self.totals.download.load(Ordering::Relaxed),
+        )
+    }
+    pub(crate) fn snapshot_bounded(&self, limit: usize) -> Option<Snapshot> {
+        let entries = {
+            let entries = self.entries.lock().unwrap();
+            if entries.len() > limit {
+                return None;
+            }
+            entries.values().cloned().collect::<Vec<_>>()
+        };
+        Some(self.capture(entries))
+    }
     pub fn snapshot(&self) -> Snapshot {
         let entries = self
             .entries
@@ -247,6 +263,9 @@ impl Registry {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        self.capture(entries)
+    }
+    fn capture(&self, entries: Vec<Arc<Entry>>) -> Snapshot {
         let connections = entries
             .into_iter()
             .map(|entry| ConnectionSnapshot::capture(&entry))

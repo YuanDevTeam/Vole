@@ -49,8 +49,8 @@ default = [
     "shadow-tls-v3",
     "sing-mux",
 ]
-inbound-http = ["dep:rcgen", "dep:rsa"]
-inbound-socks5 = ["dep:rcgen", "dep:rsa", "dep:ring"]
+inbound-http = ["dep:rcgen", "dep:rsa", "dep:tokio-tungstenite"]
+inbound-socks5 = ["dep:rcgen", "dep:rsa", "dep:ring", "dep:tokio-tungstenite"]
 outbound-anytls = ["dep:md-5", "tls-fingerprint", "ech"]
 outbound-socks5 = []
 outbound-http = []

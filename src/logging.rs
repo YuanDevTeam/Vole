@@ -1,47 +1,263 @@
-//! Per-runtime filtering around the host's subscriber; no process-wide level.
+//! Session-local filtering and bounded, explicitly redacted Controller logs.
 
+use crate::config::LogLevel;
+use std::{
+    fmt::Write as _,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use tokio::sync::broadcast;
 use tracing::{
     Dispatch, Event, Metadata, Subscriber,
+    field::{Field, Visit},
     level_filters::LevelFilter,
     span::{Attributes, Id, Record},
     subscriber::Interest,
 };
-
-use crate::config::LogLevel;
 use tracing_core::span::Current;
 
+const LOG_CAPACITY: usize = 64;
+const MAX_LOG_BYTES: usize = 512;
+const MAX_EVENTS_PER_SECOND: usize = 32;
+
 pub(crate) fn dispatch(level: LogLevel) -> Dispatch {
-    let level = match level {
-        LogLevel::Silent => LevelFilter::OFF,
-        LogLevel::Error => LevelFilter::ERROR,
-        LogLevel::Warning => LevelFilter::WARN,
-        LogLevel::Info => LevelFilter::INFO,
-        LogLevel::Debug => LevelFilter::DEBUG,
-    };
-    Dispatch::new(Filtered {
-        inner: tracing::dispatcher::get_default(Clone::clone),
-        level,
+    let (inner, logs) = tracing::dispatcher::get_default(|current| {
+        if let Some(filtered) = current.downcast_ref::<Filtered>() {
+            (filtered.inner.clone(), filtered.logs.clone())
+        } else {
+            (current.clone(), Arc::new(RuntimeLog::new(level)))
+        }
+    });
+    Dispatch::new(Filtered { inner, logs })
+}
+
+pub(crate) fn current() -> Option<Arc<RuntimeLog>> {
+    tracing::dispatcher::get_default(|current| {
+        current.downcast_ref::<Filtered>().map(|f| f.logs.clone())
     })
 }
 
-struct Filtered {
-    inner: Dispatch,
-    level: LevelFilter,
+fn number(level: LogLevel) -> u8 {
+    match level {
+        LogLevel::Silent => 0,
+        LogLevel::Error => 1,
+        LogLevel::Warning => 2,
+        LogLevel::Info => 3,
+        LogLevel::Debug => 4,
+    }
+}
+fn event_number(level: &tracing::Level) -> u8 {
+    match *level {
+        tracing::Level::ERROR => 1,
+        tracing::Level::WARN => 2,
+        tracing::Level::INFO => 3,
+        _ => 4,
+    }
+}
+fn own_target(target: &str) -> bool {
+    target == "vole"
+        || target.starts_with("vole::")
+        || target == "vole_netstack"
+        || target.starts_with("vole_netstack::")
 }
 
-impl Subscriber for Filtered {
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        *metadata.level() <= self.level && self.inner.enabled(metadata)
+pub(crate) struct RuntimeLog {
+    level: AtomicU8,
+    channel: Mutex<Option<broadcast::Sender<Arc<LogEvent>>>>,
+    rate: Mutex<(Instant, usize)>,
+}
+impl RuntimeLog {
+    pub(crate) fn new(level: LogLevel) -> Self {
+        let logs = Self {
+            level: AtomicU8::new(0),
+            channel: Mutex::new(None),
+            rate: Mutex::new((Instant::now(), 0)),
+        };
+        logs.set_level(level);
+        logs
     }
-    fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
-        if *metadata.level() <= self.level {
-            self.inner.register_callsite(metadata)
-        } else {
-            Interest::never()
+    pub(crate) fn set_level(&self, level: LogLevel) {
+        self.level.store(number(level), Ordering::Relaxed);
+    }
+    pub(crate) fn level(&self) -> LogLevel {
+        match self.level.load(Ordering::Relaxed) {
+            0 => LogLevel::Silent,
+            1 => LogLevel::Error,
+            2 => LogLevel::Warning,
+            3 => LogLevel::Info,
+            _ => LogLevel::Debug,
         }
     }
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        event_number(metadata.level()) <= number(self.level())
+    }
+    fn has_subscribers(&self) -> bool {
+        self.channel
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|sender| sender.receiver_count() != 0)
+    }
+    pub(crate) fn subscribe(self: &Arc<Self>) -> LogSubscription {
+        let mut channel = self.channel.lock().unwrap();
+        let receiver = channel
+            .get_or_insert_with(|| broadcast::channel(LOG_CAPACITY).0)
+            .subscribe();
+        LogSubscription {
+            logs: self.clone(),
+            receiver: Some(receiver),
+        }
+    }
+    fn event(&self, event: &Event<'_>) {
+        if !own_target(event.metadata().target()) || !self.has_subscribers() {
+            return;
+        }
+        {
+            let mut rate = self.rate.lock().unwrap();
+            if rate.0.elapsed() >= Duration::from_secs(1) {
+                *rate = (Instant::now(), 0);
+            }
+            if rate.1 >= MAX_EVENTS_PER_SECOND {
+                return;
+            }
+            rate.1 += 1;
+        }
+        let mut fields = SafeFields {
+            payload: String::with_capacity(MAX_LOG_BYTES),
+        };
+        let target = event.metadata().target();
+        let mut end = target.len().min(128);
+        while !target.is_char_boundary(end) {
+            end -= 1;
+        }
+        fields.payload.push_str(&target[..end]);
+        event.record(&mut fields);
+        let value = Arc::new(LogEvent {
+            level: event_number(event.metadata().level()),
+            payload: fields.payload,
+            time: time::OffsetDateTime::now_utc(),
+        });
+        if let Some(sender) = self.channel.lock().unwrap().as_ref() {
+            let _ = sender.send(value);
+        }
+    }
+}
+pub(crate) struct LogSubscription {
+    logs: Arc<RuntimeLog>,
+    receiver: Option<broadcast::Receiver<Arc<LogEvent>>>,
+}
+impl LogSubscription {
+    pub(crate) async fn recv(&mut self) -> Option<Arc<LogEvent>> {
+        loop {
+            match self.receiver.as_mut()?.recv().await {
+                Ok(event) => return Some(event),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+}
+impl Drop for LogSubscription {
+    fn drop(&mut self) {
+        self.receiver.take();
+        let mut channel = self.logs.channel.lock().unwrap();
+        if channel
+            .as_ref()
+            .is_some_and(|sender| sender.receiver_count() == 0)
+        {
+            *channel = None;
+        }
+    }
+}
+pub(crate) struct LogEvent {
+    level: u8,
+    payload: String,
+    time: time::OffsetDateTime,
+}
+impl LogEvent {
+    pub(crate) fn matches(&self, level: LogLevel) -> bool {
+        self.level <= number(level)
+    }
+    pub(crate) fn json(&self, structured: bool) -> serde_json::Value {
+        let level = match self.level {
+            1 => "error",
+            2 => "warning",
+            3 => "info",
+            _ => "debug",
+        };
+        if structured {
+            serde_json::json!({"time":format!("{:02}:{:02}:{:02}",self.time.hour(),self.time.minute(),self.time.second()),"level":if level == "warning" { "warn" } else { level },"message":self.payload,"fields":[]})
+        } else {
+            serde_json::json!({"type":level,"payload":self.payload})
+        }
+    }
+}
+struct SafeFields {
+    payload: String,
+}
+impl SafeFields {
+    fn record(&mut self, field: &Field, value: impl std::fmt::Display) {
+        // Only explicitly reviewed public numeric metrics. Never stringify event
+        // messages, destinations, errors, credentials or arbitrary Debug values.
+        if !matches!(
+            field.name(),
+            "mtu"
+                | "packet_queue"
+                | "event_queue"
+                | "cancelled"
+                | "panicked"
+                | "dns_hijack"
+                | "ipv6"
+                | "count"
+                | "packets"
+                | "bytes"
+                | "elapsed_ms"
+                | "duration_ms"
+                | "active_connections"
+                | "tcp_connections"
+                | "udp_sessions"
+                | "dropped_packets"
+                | "current_bytes"
+                | "peak_bytes"
+        ) {
+            return;
+        }
+        if self.payload.len() + field.name().len() + 24 <= MAX_LOG_BYTES {
+            let _ = write!(self.payload, " {}={value}", field.name());
+        }
+    }
+}
+impl Visit for SafeFields {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.record(field, value);
+    }
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.record(field, value);
+    }
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.record(field, value);
+    }
+    fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+}
+struct Filtered {
+    inner: Dispatch,
+    logs: Arc<RuntimeLog>,
+}
+impl Subscriber for Filtered {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        self.logs.enabled(metadata)
+            && (self.inner.enabled(metadata)
+                || own_target(metadata.target()) && self.logs.has_subscribers())
+    }
+    fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+        let _ = self.inner.register_callsite(metadata);
+        Interest::sometimes()
+    }
     fn max_level_hint(&self) -> Option<LevelFilter> {
-        Some(self.level)
+        Some(LevelFilter::DEBUG)
     }
     fn new_span(&self, attrs: &Attributes<'_>) -> Id {
         self.inner.new_span(attrs)
@@ -53,8 +269,11 @@ impl Subscriber for Filtered {
         self.inner.record_follows_from(span, follows);
     }
     fn event(&self, event: &Event<'_>) {
-        if self.enabled(event.metadata()) {
-            self.inner.event(event);
+        if self.logs.enabled(event.metadata()) {
+            if self.inner.enabled(event.metadata()) {
+                self.inner.event(event);
+            }
+            self.logs.event(event);
         }
     }
     fn enter(&self, span: &Id) {
@@ -129,5 +348,76 @@ mod tests {
             });
             assert_eq!(count.load(Ordering::Relaxed), expected + 1);
         }
+    }
+
+    #[tokio::test]
+    async fn controller_logs_are_session_local_redacted_bounded_and_host_independent() {
+        let logs = Arc::new(RuntimeLog::new(LogLevel::Info));
+        let filtered = Dispatch::new(Filtered {
+            inner: Dispatch::none(),
+            logs: logs.clone(),
+        });
+        assert!(!logs.has_subscribers());
+        tracing::dispatcher::with_default(&filtered, || {
+            tracing::info!(target:"vole::controller", bytes=1, secret="never-publish", "private target");
+        });
+        assert!(logs.channel.lock().unwrap().is_none());
+        let mut subscription = logs.subscribe();
+        tracing::dispatcher::with_default(&filtered, || {
+            tracing::info!(target:"vole::controller", bytes=17, destination="private-host", error=?"private-error", "secret-message");
+        });
+        let event = subscription.recv().await.unwrap();
+        let value = event.json(false).to_string();
+        assert!(value.contains("bytes=17"));
+        for secret in [
+            "private-host",
+            "private-error",
+            "secret-message",
+            "destination",
+            "error",
+        ] {
+            assert!(!value.contains(secret));
+        }
+        logs.set_level(LogLevel::Error);
+        tracing::dispatcher::with_default(
+            &filtered,
+            || tracing::info!(target:"vole::controller",bytes=3),
+        );
+        assert!(subscription.receiver.as_mut().unwrap().try_recv().is_err());
+        logs.set_level(LogLevel::Debug);
+        tracing::dispatcher::with_default(
+            &filtered,
+            || tracing::debug!(target:"vole::controller",bytes=4),
+        );
+        assert!(
+            subscription
+                .recv()
+                .await
+                .unwrap()
+                .json(false)
+                .to_string()
+                .contains("bytes=4")
+        );
+        for _ in 0..128 {
+            tracing::dispatcher::with_default(
+                &filtered,
+                || tracing::info!(target:"vole::controller",bytes=1),
+            );
+        }
+        assert!(subscription.receiver.as_ref().unwrap().len() <= MAX_EVENTS_PER_SECOND);
+        drop(subscription);
+        assert!(logs.channel.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn nested_runtime_dispatch_reuses_one_log_bus_and_mutable_filter() {
+        let filtered = dispatch(LogLevel::Warning);
+        let first = tracing::dispatcher::with_default(&filtered, || current().unwrap());
+        let nested = tracing::dispatcher::with_default(&filtered, || dispatch(LogLevel::Debug));
+        let next = tracing::dispatcher::with_default(&nested, || current().unwrap());
+        assert!(Arc::ptr_eq(&first, &next));
+        assert_eq!(next.level(), LogLevel::Warning);
+        next.set_level(LogLevel::Debug);
+        assert_eq!(first.level(), LogLevel::Debug);
     }
 }

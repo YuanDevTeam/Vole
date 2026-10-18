@@ -487,6 +487,18 @@ impl RuntimeResources for ProviderRuntime {
             .map(|_| "selection cache write failed");
         Ok(())
     }
+    fn clear_fixed(&self, group: &str) -> Result<(), ProxyGroupError> {
+        let _publication = self.publication.lock().unwrap();
+        let current = self.current.load();
+        current.groups.clear_fixed(group)?;
+        current.health.apply_group_health();
+        *self.persistence_error.write().unwrap() = self
+            .store
+            .save(group, "")
+            .err()
+            .map(|_| "selection cache write failed");
+        Ok(())
+    }
     fn health(&self) -> serde_json::Value {
         serde_json::json!({"proxies":self.current.load().health.states(),"selectionError":*self.persistence_error.read().unwrap()})
     }

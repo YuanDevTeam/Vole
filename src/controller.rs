@@ -3,6 +3,7 @@ use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 mod cors;
 mod tls;
 mod transport;
+mod websocket;
 use transport::{ControllerIo, H1Io};
 
 #[cfg(test)]
@@ -36,6 +37,8 @@ struct RequestContext {
     resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
     cors: Arc<cors::Policy>,
     requests: tokio_util::task::TaskTracker,
+    subscriptions: Arc<tokio::sync::Semaphore>,
+    logs: Option<Arc<crate::logging::RuntimeLog>>,
 }
 
 pub(crate) struct RuntimeController {
@@ -101,6 +104,8 @@ impl RuntimeController {
                 resources: None,
                 cors: Arc::new(cors::Policy::new(&config.cors)),
                 requests: tokio_util::task::TaskTracker::new(),
+                subscriptions: Arc::new(tokio::sync::Semaphore::new(websocket::MAX_SUBSCRIPTIONS)),
+                logs: crate::logging::current(),
             },
         })
     }
@@ -239,6 +244,7 @@ async fn handle_request<S: ControllerIo>(
     context: RequestContext,
     cancellation: CancellationToken,
 ) -> io::Result<()> {
+    let subscription = websocket::requested(&request).then(|| context.clone());
     let RequestContext {
         secret,
         traffic,
@@ -252,6 +258,9 @@ async fn handle_request<S: ControllerIo>(
     if outcome.preflight {
         return write_response(&mut stream, 200, &[], &[]).await;
     }
+    if let Some(context) = subscription {
+        return websocket::handle(&mut stream, request, context, cancellation).await;
+    }
     if !authorized(&request.headers, secret.as_deref()) {
         return write_error(
             &mut stream,
@@ -262,6 +271,18 @@ async fn handle_request<S: ControllerIo>(
         .await;
     }
 
+    if request.target == "/version" {
+        if request.method != "GET" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
+        }
+        return write_json(
+            &mut stream,
+            200,
+            &serde_json::json!({"meta":false,"version":env!("CARGO_PKG_VERSION")}),
+            &[],
+        )
+        .await;
+    }
     if request.target == "/memory" {
         if request.method != "GET" {
             return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
@@ -525,6 +546,29 @@ async fn handle_request<S: ControllerIo>(
                     }
                 }
             },
+            "DELETE" => {
+                let result = resources.as_ref().map_or_else(
+                    || proxy_groups.clear_fixed(&name),
+                    |resources| resources.clear_fixed(&name),
+                );
+                match result {
+                    Ok(()) => write_response(&mut stream, 204, &[], &[]).await,
+                    Err(ProxyGroupError::UnknownGroup) => {
+                        if resources
+                            .as_ref()
+                            .is_some_and(|r| r.health()["proxies"].get(&name).is_some())
+                        {
+                            write_error(&mut stream, 400, "Proxy is not an automatic group", &[])
+                                .await
+                        } else {
+                            write_error(&mut stream, 404, "Resource not found", &[]).await
+                        }
+                    }
+                    Err(_) => {
+                        write_error(&mut stream, 400, "Proxy is not an automatic group", &[]).await
+                    }
+                }
+            }
             "PUT" => {
                 handle_select(
                     &mut stream,
@@ -542,7 +586,7 @@ async fn handle_request<S: ControllerIo>(
                     &mut stream,
                     405,
                     "Method not allowed",
-                    &[("Allow", "GET, PUT")],
+                    &[("Allow", "GET, PUT, DELETE")],
                 )
                 .await
             }
@@ -826,6 +870,8 @@ struct GroupResponse {
     now: String,
     hidden: bool,
     icon: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fixed: Option<String>,
 }
 
 impl From<ProxyGroupState> for GroupResponse {
@@ -837,6 +883,7 @@ impl From<ProxyGroupState> for GroupResponse {
             now: state.now,
             hidden: state.hidden,
             icon: state.icon,
+            fixed: state.fixed,
         }
     }
 }

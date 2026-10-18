@@ -13,6 +13,8 @@ fn context() -> RequestContext {
             allow_private_network: true,
         })),
         requests: tokio_util::task::TaskTracker::new(),
+        subscriptions: Arc::new(tokio::sync::Semaphore::new(websocket::MAX_SUBSCRIPTIONS)),
+        logs: None,
     }
 }
 

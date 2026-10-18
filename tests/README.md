@@ -24,6 +24,11 @@ Windows的UWP/Wintun feature互斥，应明确选择后端，不使用`--all-fea
 
 ## 定向回归
 
+Controller 推送（纯内存 duplex，无网络监听）：`controller::websocket::tests::`；
+安全传输/CORS：`controller::secure_tests::`；实例日志脱敏/动态过滤：`logging::tests::`。
+组固定清除：`routing::proxy_group::tests::automatic_fixed_clear_uses_existing_health_without_probe`。
+这些过滤器不代替真实 TUN 计数与 Stop 验证。
+
 功能出站（纯内存）：`config::functional::tests::`、`outbound::dns::tests::`、
 `outbound::reject::tests::`；直连解析角色接线：
 `dns::runtime::tests::runtime_dns_separates_bootstrap_proxy_direct_and_hosts`。
