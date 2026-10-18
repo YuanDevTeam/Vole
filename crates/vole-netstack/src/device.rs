@@ -69,6 +69,10 @@ impl RawIpDevice {
         self.path_mtu = Some(PathMtu::default());
     }
 
+    pub(crate) fn disable_path_mtu(&mut self) {
+        self.path_mtu = None;
+    }
+
     pub(crate) fn set_initial_mtu(&mut self, mtu: usize) {
         self.capabilities.max_transmission_unit = mtu;
     }

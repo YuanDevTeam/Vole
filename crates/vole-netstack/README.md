@@ -120,7 +120,8 @@ flow after any reset reaches the existing output queue; a full output never
 blocks Stop. Successful streams retain the existing direction buffers and TCP
 half-close behavior. Stop closes admission, wakes queued/in-flight connects
 and releases every socket before returning. Passive `start`/`start_tcp` TUN
-behavior and their configured bounds remain unchanged.
+uses the same configured data buffers and admits validated TCP PMTU feedback
+without changing connection admission or adding packet queues.
 
 An active owner may call `tcp_connector.set_initial_mtu(mtu, deadline)` after
 its transport handshake and before any TCP connection. The same bounded
@@ -139,6 +140,9 @@ adapter splits later TCP output, including ordinary retransmissions. Recovery
 uses smoltcp's own retransmission/congestion timers; no immediate retransmission
 or Mihomo timer equality is promised.
 
+Passive TUN TCP enables this bounded fallback as well; an incoming error must
+identify an active intercepted flow. Active clients additionally require a
+configured local source address and explicitly enable PMTU discovery.
 The adapter validates the local/remote tuple, outer destination and quoted
 sequence against output actually placed in the raw queue and not acknowledged.
 Sent ranges, ACK watermarks and path budgets each hold at most 64 metadata

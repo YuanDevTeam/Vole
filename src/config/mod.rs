@@ -1,6 +1,8 @@
 //! Strict parsing for the current Vole YAML configuration.
 mod anytls;
 mod fake_ip;
+mod tun_network;
+pub use tun_network::{TunAddress6, TunNetworkConfig};
 #[cfg(any(feature = "invoke", test))]
 pub(crate) mod live_update;
 pub use anytls::AnyTlsSessionOptions;
@@ -268,6 +270,7 @@ impl std::fmt::Debug for GeoDataUrls {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunConfig {
+    pub network: TunNetworkConfig,
     pub auto_route: bool,
     pub auto_detect_interface: bool,
     pub enable: bool,
@@ -281,6 +284,7 @@ pub struct TunConfig {
 impl Default for TunConfig {
     fn default() -> Self {
         Self {
+            network: TunNetworkConfig::default(),
             auto_route: cfg!(target_os = "linux"),
             auto_detect_interface: cfg!(target_os = "linux"),
             enable: false,
@@ -1384,6 +1388,38 @@ impl Default for RawGeoDataUrls {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTunConfig {
+    #[serde(
+        rename = "inet6-address",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    inet6_address: Option<Vec<String>>,
+    #[serde(rename = "route-address", default)]
+    route_address: Vec<String>,
+    #[serde(rename = "route-exclude-address", default)]
+    route_exclude_address: Vec<String>,
+    #[serde(rename = "iproute2-table-index", default)]
+    table_index: u32,
+    #[serde(rename = "iproute2-rule-index", default)]
+    rule_index: u32,
+    #[serde(rename = "strict-route", default)]
+    strict_route: bool,
+    #[serde(rename = "include-uid", default)]
+    include_uid: Vec<u32>,
+    #[serde(rename = "include-uid-range", default)]
+    include_uid_range: Vec<String>,
+    #[serde(rename = "exclude-uid", default)]
+    exclude_uid: Vec<u32>,
+    #[serde(rename = "exclude-uid-range", default)]
+    exclude_uid_range: Vec<String>,
+    #[serde(rename = "exclude-src-port", default)]
+    exclude_src_port: Vec<u16>,
+    #[serde(rename = "exclude-src-port-range", default)]
+    exclude_src_port_range: Vec<String>,
+    #[serde(rename = "exclude-dst-port", default)]
+    exclude_dst_port: Vec<u16>,
+    #[serde(rename = "exclude-dst-port-range", default)]
+    exclude_dst_port_range: Vec<String>,
     #[serde(rename = "auto-route", default)]
     auto_route: Option<bool>,
     #[serde(rename = "auto-detect-interface", default)]
@@ -1443,6 +1479,23 @@ impl RawTunConfig {
             self.udp_timeout
         });
         Ok(TunConfig {
+            network: tun_network::RawTunNetworkConfig {
+                inet6_address: self.inet6_address,
+                route_address: self.route_address,
+                route_exclude_address: self.route_exclude_address,
+                table_index: self.table_index,
+                rule_index: self.rule_index,
+                strict_route: self.strict_route,
+                include_uid: self.include_uid,
+                include_uid_range: self.include_uid_range,
+                exclude_uid: self.exclude_uid,
+                exclude_uid_range: self.exclude_uid_range,
+                exclude_src_port: self.exclude_src_port,
+                exclude_src_port_range: self.exclude_src_port_range,
+                exclude_dst_port: self.exclude_dst_port,
+                exclude_dst_port_range: self.exclude_dst_port_range,
+            }
+            .normalize()?,
             auto_route: self.auto_route.unwrap_or(cfg!(target_os = "linux")),
             auto_detect_interface: self
                 .auto_detect_interface
@@ -5886,9 +5939,6 @@ authentication:
             "auto-redirect: false",
             "stack: mips",
             "inet4-address: [198.18.0.1/30]",
-            "inet6-address: ['fd00::1/126']",
-            "route-address: [0.0.0.0/1]",
-            "strict-route: false",
             "gso: false",
         ] {
             let yaml = current_yaml(&format!("tun:\n  enable: true\n  {fields}"));

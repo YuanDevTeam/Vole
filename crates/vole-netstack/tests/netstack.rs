@@ -506,6 +506,68 @@ async fn masque_client_pmtu_resegments_only_the_active_quoted_flow() {
     }
 }
 
+#[tokio::test]
+async fn passive_tun_pmtu_resegments_only_live_sent_tcp_and_preserves_siblings() {
+    for (first_flow, second_flow, length, mtu) in [
+        (Flow::v4(21001), Flow::v4(21002), 800, 576u16),
+        (Flow::v6(21001), Flow::v6(21002), 1400, 1280u16),
+    ] {
+        let mut parts = NetStack::start(NetStackConfig::default())
+            .unwrap()
+            .into_parts();
+        let mut streams = Vec::new();
+        for flow in [&first_flow, &second_flow] {
+            parts
+                .packet_sink
+                .send(build_tcp_mss(flow, 100, 0, TcpFlags::SYN, &[], 1460))
+                .await
+                .unwrap();
+            let reply = timeout_tcp_flag(&mut parts.packet_stream, TcpFlags::SYN).await;
+            assert!(is_syn_ack(&reply, flow));
+            parts
+                .packet_sink
+                .send(build_tcp(
+                    flow,
+                    101,
+                    tcp_sequence(&reply).wrapping_add(1),
+                    TcpFlags::ACK,
+                    &[],
+                ))
+                .await
+                .unwrap();
+            streams.push(
+                tokio::time::timeout(WAIT, parts.tcp_listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        streams[0].write_all(&vec![0x51; length]).await.unwrap();
+        let outstanding = timeout_tcp_data(&mut parts.packet_stream).await;
+        assert!(outstanding.len() > usize::from(mtu));
+        parts
+            .packet_sink
+            .send(build_path_mtu_hint(&outstanding, mtu))
+            .await
+            .unwrap();
+        let retransmitted = timeout_tcp_data(&mut parts.packet_stream).await;
+        assert_eq!(tcp_sequence(&retransmitted), tcp_sequence(&outstanding));
+        assert_eq!(tcp_flow(&retransmitted).destination, first_flow.source);
+        assert!(retransmitted.len() <= usize::from(mtu));
+        streams[1].write_all(&vec![0x52; length]).await.unwrap();
+        loop {
+            let packet = timeout_tcp_data(&mut parts.packet_stream).await;
+            if tcp_flow(&packet).destination == second_flow.source {
+                assert!(packet.len() > usize::from(mtu));
+                assert_eq!(tcp_payload(&packet), vec![0x52; length]);
+                break;
+            }
+        }
+        parts.control.stop().await;
+        assert_eq!(parts.stats.snapshot().active_tcp, 0);
+    }
+}
+
 fn build_path_mtu_hint(quoted: &Packet, mtu: u16) -> Packet {
     let flow = tcp_flow(quoted);
     // Quote only the IP header and the first eight transport bytes. The original

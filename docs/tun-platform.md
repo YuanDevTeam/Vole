@@ -129,8 +129,9 @@ MTU/格式与 fd 标志，原生 builder 只打开 raw-IP TUN，不暗中启用 
   全局/节点 `interface-name` 的显式非空值优先于自动识别，DNS `#接口` 优先于全局接口；
   system/DHCP 来源保留自己的物理接口约束。显式接口不存在或绑定失败不会回退自动识别。
 - `auto-route` 独占创建配置命名的 raw-IP TUN，已有同名接口失败。IPv4 使用
-  `dns.fake-ip-range` 的原始 IPv4 地址（默认 `198.18.0.1`），前缀固定 /30；启用 IPv6 时使用 `fdfe:dcba:9876::1/126`。
-  内部路由表 2022、规则优先级 9000/9001 必须空闲；保留主表的非默认路由，
+  `dns.fake-ip-range` 的原始 IPv4 地址（默认 `198.18.0.1`），前缀固定 /30；IPv6 地址从 `inet6-address` 读取。
+  路由表 `iproute2-table-index`（缺省/0 为 2022）、规则优先级
+  `iproute2-rule-index` 到 `+4`（缺省/0 从 9000 开始）必须空闲；保留主表的非默认路由，
   本机未标记流量经 TUN，转发流量不在本功能范围。Core socket 使用内部 mark 绕过捕获，
   不依靠 source IP 避免递归。配置接口与路由直接通过内核接口完成，不调用 ip 子进程。
   全局或任一节点设置非零 `routing-mark` 时，该自建 auto-route 组合在创建接口前失败；
@@ -152,6 +153,32 @@ polkit 与提供 setcap 的包。deb postinst / rpm %post 每次更新二进制�
 后者使用已安装的 [resolve1 授权](https://github.com/systemd/systemd/blob/main/src/resolve/org.freedesktop.resolve1.policy)。
 CLI 的进程启动、后台管理及用户授权仍由调用方负责。
 
+### Linux 捕获范围
+
+`inet6-address` 是接口地址列表，保留地址的 host bits，缺省为
+`fdfe:dcba:9876::1/126`；显式 `[]` 不配置 IPv6 捕获，顶层 `ipv6: false`
+也不配置该地址族。IPv4 地址仍从有效 fake-IP 范围导出 `/30`，不新增独立 IPv4 地址字段。
+
+`route-address` 与 `route-exclude-address` 接受统一的 IPv4/IPv6 CIDR。
+每个可用地址族没有指定捕获网段时使用默认网段；排除网段优先，先做精确 CIDR 相减，
+再安装本会话独占表中的路由。保留 main 表的非默认路由；53 端口先尝试捕获表，
+排除网段仍可绕过。只匹配本机未标记流量，Core 的私有出口 mark 不进入捕获规则。
+
+`include-uid/include-uid-range` 限定本机 UID 捕获范围；省略时为全部 UID。
+`exclude-uid/exclude-uid-range` 优先排除，端口排除使用
+`exclude-src-port/exclude-src-port-range/exclude-dst-port/exclude-dst-port-range`。
+范围格式为 `start:end`，不枚举范围内每个 UID 或端口。排除流量跳过本会话捕获规则，
+由后续系统路由决定去向。这些选项不改变出口的 protect/物理绑定，也不处理转发流量。
+
+`strict-route: true` 在自动路由中拒绝本机应用使用没有 TUN 地址的 IPv6 族，
+UID/端口的显式旁路仍生效。它不代替宿主防火墙、权限设置或网络故障时的独立 kill switch。
+配置最多 256 项网络输入、派生最多 4096 条 CIDR 路由；超过预算在创建接口前失败。
+路由索引、UID、端口和 CIDR 改动需要重建捕获计划，运行期应用会返回需要重连。
+
+这些自动设置仅用于 Core 自建 Linux TUN 且 `auto-route: true` 的路径。
+借用 fd 与 Apple/Android/UWP/Wintun 的接口地址、捕获范围、DNS 和权限由宿主应用；
+Core 不修改借用接口或将跨平台解析成功视为系统网络配置完成。
+
 ## Windows Wintun
 
 桌面 Wintun 使用宿主提供的动态库与原始 IP 适配器，通过同一 `TunIo` 边界进入
@@ -162,7 +189,7 @@ TunRuntime、netstack、DNS、规则和出站图。启用 TUN 的普通 Windows 
 宿主提供与程序架构一致的官方 `wintun.dll`。加载路径固定为进程可执行文件所在目录下的
 `wintun.dll`；适配器名由 `tun.device` 控制，空值为 `Vole`，启动可打开已有同名适配器或创建新适配器。
 Vole 不下载或打包该动态库，不搜索 PATH 或启动工作目录。
-系统接口地址、DNS、路由与防递归出口配置由宿主完成；YAML 不提供 DLL 路径或路由字段。
+系统接口地址、DNS、路由与防递归出口配置由宿主完成；YAML 不提供 DLL 路径，网络字段由宿主应用。
 Wintun 使用配置的 MTU，共享原始包校验、IPv6 政策、局部队列预算和同步停止屏障。
 UWP 的 1400 MTU 上限只适用于该安装包路径；超过上限明确拒绝，不静默截断。
 Windows 不接受 Unix file-descriptor 借用路径。

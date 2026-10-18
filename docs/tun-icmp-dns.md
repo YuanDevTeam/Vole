@@ -24,11 +24,12 @@ Vole 在 TUN netstack 内回答受支持的 ICMP Echo Request。启用运行时 
 
 smoltcp 负责生成 Echo Reply，Vole 负责更严格的输入分类和运行时门禁。响应直接尝试进入现有原始包出站队列；队列满时只丢当前低优先级响应并更新统计，不创建等待任务或积压队列。
 
-MASQUE 的内部主动客户端另行支持 ICMP PMTU 反馈：验证外层校验和、本地地址、
+TUN 的被动 TCP 与 MASQUE 的内部主动客户端均支持 ICMP PMTU 反馈：验证外层校验和、本地地址、
 被引用的活动 TCP tuple 及实际发送且尚未确认的序号，只降低对应连接的 MTU并重新分段。
 IPv6 宣告 MTU 小于 1280 时忽略，IPv4 小于 68 时取 68。
-分段使用官方 smoltcp 的包层适配，重传沿用其 TCP 定时器；不启用宿主 TUN 的
-ICMP error 转发，也不改变其 MTU 门禁或 Echo 配置。
+分段使用官方 smoltcp 的包层适配，重传沿用其 TCP 定时器；元信息保存已发序号，
+不保留报文正文，容量独立有界，关闭连接时清除。其他 ICMP error 不转发或创建新流，
+不改变 TUN 的 MTU 门禁或 Echo 配置。
 
 ## TUN DNS 入口
 
@@ -398,7 +399,7 @@ Running Session上下文仅弱引用本 session 的 RuntimeDns；业务 IP-only 
 
 ## 不支持
 
-- 真实 ICMP 转发、ICMP error、Traceroute、ICMP 选路规则或 ICMP 测速；
+- 真实 ICMP 转发、PMTU 以外的 ICMP error、Traceroute、ICMP 选路规则或 ICMP 测速；
 - 运行中随接口变化自动刷新 hosts: lan；
 - 用户可配置的查询总超时、重试或并发度；
 - 使用 DNS question 执行业务规则，或用 DNS 出口改写后续业务动作。

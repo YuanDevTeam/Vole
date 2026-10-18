@@ -26,7 +26,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 | QUIC 配置 | HY2 独立 initial/max 接收窗口、秒 handshake-timeout；TUIC v5 入口ip、毫秒heartbeat、反向命名的stream/connection窗口、所有者池阈值、frame/fragment限制、PMTUD与UoT v2 |
 | 客户端 TLS | tls.custom-certifactes 证书内容；启动时合并可读系统根、WebPKI 与显式根并跨组件共享；TUIC v5 与其它 TLS 节点复用 cert/private-key 身份加载 |
 | 嗅探 | TUN/mixed TCP 的 HTTP1/HTTP2/TLS；TUN 与授权 SOCKS5 UDP 共用 QUIC v1/v2；域名/地址排除、强制条件和目标覆盖 |
-| Linux 自建设备 | auto-detect-interface、auto-route、systemd-resolved DNS 接管；失败和停止时恢复本次修改 |
+| Linux 自建设备 | auto-detect-interface、auto-route、IPv6 地址、CIDR 捕获/排除、UID/端口作用域、路由索引、strict-route 与 systemd-resolved DNS 接管；失败和停止时恢复本次修改 |
 | 运行状态 | 连接快照、流量计数和关闭；组与资源状态；规则命中、有效配置、受限 DNS 诊断 |
 
 ## 必须保留的边界
@@ -65,7 +65,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - DNS、fake-IP 与嗅探的 classical selector 使用对应的域名或目标 IP 条件，支持纯对应条件组成的 AND/OR/NOT。
   混合端口、来源、网络等叶子的整个逻辑项不参与匹配；Mihomo 使用零值元数据执行全部 classical 条件，因此这些组合仍有语义边界。
 - Apple、Android、Windows UWP 的网络设置、权限和 App 生命周期仍归宿主；Windows Wintun 使用外置 DLL。
-  借用 Unix fd 只复制并保留原描述符。Linux 扩展路由、旁路由、防火墙/NAT 不在当前范围。
+  借用 Unix fd 只复制并保留原描述符。Linux 本机捕获范围与网络恢复见 TUN 契约；旁路由、防火墙/NAT 不在当前范围。
   六类进程规则与 find-process-mode 按真实可获取的本机身份工作，UID 仅 Linux/Android；
   不复制 port-only、跨 namespace 或任一同 UID 进程的弱归属推断。权限、预算或平台无法证明时未知，
   不提权、不增加 Android owner 回调；范围和扫描预算见配置契约。

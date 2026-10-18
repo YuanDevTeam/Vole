@@ -543,6 +543,10 @@ impl Driver {
         let mut interface_config = InterfaceConfig::new(HardwareAddress::Ip);
         interface_config.random_seed = 0x4f_6e_65_56_43_6f_72_65;
         let mut device = RawIpDevice::new(config.mtu, raw_outbound.clone());
+        // Passive TUN TCP uses the same bounded, body-free PMTU metadata as
+        // IP-carrier clients. A quote still needs the exact live socket and
+        // an emitted, unacknowledged sequence before it can lower its budget.
+        device.enable_path_mtu();
         let mut interface = Interface::new(interface_config, &mut device, Instant::now());
         interface.set_any_ip(true);
         interface.update_ip_addrs(|addresses| {
@@ -585,8 +589,8 @@ impl Driver {
     }
 
     fn configure_client(&mut self, addresses: &ClientConfig) {
-        if addresses.path_mtu_discovery {
-            self.device.enable_path_mtu();
+        if !addresses.path_mtu_discovery {
+            self.device.disable_path_mtu();
         }
         self.interface.set_any_ip(false);
         self.interface.update_ip_addrs(|configured| {
@@ -723,20 +727,20 @@ impl Driver {
         if self
             .client
             .as_ref()
-            .is_some_and(|client| client.addresses.path_mtu_discovery)
+            .is_none_or(|client| client.addresses.path_mtu_discovery)
             && let Some(hint) = parse_path_mtu_hint(packet.data())
         {
-            let client = self.client.as_ref().unwrap();
+            let local_address = self
+                .client
+                .as_ref()
+                .is_none_or(|client| client.addresses.contains_address(hint.local.ip()));
             if hint.outer_destination == hint.local.ip()
-                && client.addresses.contains_address(hint.local.ip())
+                && local_address
                 && self.tcp_entries.contains_key(&FlowKey {
                     source: hint.remote,
                     destination: hint.local,
                 })
             {
-                // Packet metadata admits only actually emitted, unacknowledged
-                // bytes. The unmodified TCP engine owns retransmission timing;
-                // its next output is split to this flow's reduced path budget.
                 self.device.apply_path_mtu(hint);
             }
             return;

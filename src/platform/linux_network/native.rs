@@ -1,4 +1,7 @@
-use super::{Backend, Change, Lease, NetworkLease, netlink};
+use super::{
+    Backend, Change, Lease, NetworkLease, netlink,
+    plan::{Plan, Route},
+};
 use crate::{
     config::{DnsConfig, TunConfig},
     dialer::Dialer,
@@ -255,8 +258,16 @@ pub(crate) fn open(
             None,
         ));
     }
-    for family in [false, true].into_iter().take(if ipv6 { 2 } else { 1 }) {
-        netlink::ensure_available(family)?;
+    // Plan and collision checks precede creating any interface or network object.
+    let plan = Plan::new(config, ipv6)?;
+    for family in [false, true] {
+        if !family || plan.ipv6 || config.network.strict_route {
+            netlink::ensure_available(
+                family,
+                config.network.table_index,
+                config.network.rule_index,
+            )?;
+        }
     }
     let tun = TunIo::open_exclusive(&config.device, config.mtu).map_err(io::Error::other)?;
     let device = tun.linux_device();
@@ -294,23 +305,22 @@ pub(crate) fn open(
         dns_server: dns_address.to_string(),
     });
     device.set_network_address(address, 30, None::<std::net::Ipv4Addr>)?;
-    if ipv6 {
-        device.add_address_v6("fdfe:dcba:9876::1", 126)?;
+    if plan.ipv6 {
+        for address in &config.network.inet6_address {
+            device.add_address_v6(address.address, address.prefix_len)?;
+        }
     }
     device.enabled(true)?;
-    for family in [false, true].into_iter().take(if ipv6 { 2 } else { 1 }) {
-        lease.apply(Change::Route {
-            ipv6: family,
+    for destination in plan.routes {
+        lease.apply(Change::Route(Route {
+            ipv6: destination.network.is_ipv6(),
             index,
-        })?;
-        lease.apply(Change::Rule {
-            ipv6: family,
-            preserve_local: true,
-        })?;
-        lease.apply(Change::Rule {
-            ipv6: family,
-            preserve_local: false,
-        })?;
+            table: config.network.table_index,
+            destination,
+        }))?;
+    }
+    for rule in plan.rules {
+        lease.apply(Change::Rule(rule))?;
     }
     if dns.enable && config.hijacks_dns(SocketAddr::new(dns_address.into(), 53)) {
         lease.apply(Change::DnsServers)?;

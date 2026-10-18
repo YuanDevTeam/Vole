@@ -163,7 +163,8 @@ struct Acknowledgment {
 }
 
 /// Quotes must identify an actually emitted and still unacknowledged range.
-/// Only active client mode allocates this bounded metadata; it stores no body.
+/// Passive TUN and opted-in client mode allocate this bounded metadata; it
+/// stores no body and never grows with the number of live connections.
 #[derive(Default)]
 pub(crate) struct PathMtu {
     sent: VecDeque<SentRange>,

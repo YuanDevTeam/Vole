@@ -1,10 +1,13 @@
 //! Transactional system network changes for one core-owned Linux TUN.
 use std::io;
 
+mod plan;
+use plan::{Route, Rule};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Change {
-    Route { ipv6: bool, index: u32 },
-    Rule { ipv6: bool, preserve_local: bool },
+    Route(Route),
+    Rule(Rule),
     DnsServers,
     DnsDomains,
     DnsDefaultRoute,
@@ -82,18 +85,27 @@ mod tests {
     #[test]
     fn failed_start_and_normal_stop_restore_only_completed_changes_in_reverse() {
         let changes = [
-            Change::Route {
+            Change::Route(Route {
                 ipv6: false,
                 index: 7,
-            },
-            Change::Rule {
+                table: 2022,
+                destination: crate::config::IpCidr {
+                    network: "0.0.0.0".parse().unwrap(),
+                    prefix_len: 0,
+                },
+            }),
+            Change::Rule(Rule {
                 ipv6: false,
-                preserve_local: true,
-            },
-            Change::Rule {
+                priority: 9000,
+                selector: plan::Selector::Local,
+                action: plan::Action::MainNonDefault,
+            }),
+            Change::Rule(Rule {
                 ipv6: false,
-                preserve_local: false,
-            },
+                priority: 9001,
+                selector: plan::Selector::Local,
+                action: plan::Action::Table(2022),
+            }),
             Change::DnsServers,
             Change::DnsDomains,
             Change::DnsDefaultRoute,
