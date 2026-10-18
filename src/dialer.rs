@@ -922,7 +922,25 @@ impl Dialer {
                         return Err(io::ErrorKind::InvalidInput.into());
                     }
                     if ipv6 {
-                        #[cfg(unix)]
+                        #[cfg(any(target_os = "ios", target_os = "tvos"))]
+                        {
+                            let class = libc::c_int::from(dscp) << 2;
+                            // SAFETY: Darwin expects a live c_int for IPV6_TCLASS;
+                            // this initialized socket remains owned by this scope.
+                            let status = unsafe {
+                                libc::setsockopt(
+                                    socket.as_raw_fd(),
+                                    libc::IPPROTO_IPV6,
+                                    libc::IPV6_TCLASS,
+                                    (&raw const class).cast(),
+                                    std::mem::size_of_val(&class) as libc::socklen_t,
+                                )
+                            };
+                            if status < 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                        }
+                        #[cfg(all(unix, not(any(target_os = "ios", target_os = "tvos"))))]
                         socket.set_tclass_v6(u32::from(dscp) << 2)?;
                         #[cfg(not(unix))]
                         return Err(io::Error::new(
