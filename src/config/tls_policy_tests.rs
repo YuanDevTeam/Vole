@@ -228,8 +228,8 @@ fn common_tls_policy_keeps_verified_identity_separate_from_server_name() {
         let debug = format!("{policy:?}");
         assert!(!debug.contains("PRIVATE KEY") && !debug.contains("verified.invalid"));
         assert_eq!(
-            (config.proxies[0].address(), config.proxies[0].port()),
-            ("cover.invalid", 443)
+            config.proxies[0].server_endpoint(),
+            Some(("cover.invalid", 443))
         );
     }
 }
@@ -349,8 +349,8 @@ fn common_tls_empty_overrides_use_defaults_without_a_client_identity() {
             assert_eq!(certificate.fingerprint, None, "{protocol}");
             assert!(!has_identity && !has_profile, "{protocol}");
             assert_eq!(
-                (config.proxies[0].address(), config.proxies[0].port()),
-                ("cover.invalid", 443)
+                config.proxies[0].server_endpoint(),
+                Some(("cover.invalid", 443))
             );
         }
     }

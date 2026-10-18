@@ -1,4 +1,4 @@
-//! Bounded QUIC Initial sniffing for the TUN UDP inbound.
+//! Bounded QUIC Initial sniffing shared by TUN and authorized SOCKS5 UDP.
 //!
 //! Only public QUIC Initial keys are used. Decryption is advisory and operates
 //! on scratch buffers; the intercepted datagram remains owned by the caller for

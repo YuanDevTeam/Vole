@@ -24,7 +24,7 @@ fn v5_identity_defaults_password_without_enabling_business_udp() {
     }
     let c = parse(node()).unwrap();
     assert!(!c.proxies[0].udp);
-    assert_eq!(c.proxies[0].address(), "peer.invalid");
+    assert_eq!(c.proxies[0].server_endpoint(), Some(("peer.invalid", 443)));
     let mut n = node();
     n.as_object_mut().unwrap().remove("password");
     let c = parse(n).unwrap();

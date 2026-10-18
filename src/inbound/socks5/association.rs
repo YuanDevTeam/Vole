@@ -225,6 +225,7 @@ mod tests {
         lease.metadata = InboundMetadata {
             local_port: 1080,
             user: Some(user),
+            ..Default::default()
         };
         drop(credentials);
         let source = "192.0.2.1:4321".parse().unwrap();

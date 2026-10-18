@@ -74,6 +74,7 @@ impl Diagnostics {
                     _ => match spec.action {
                         RuleAction::Direct => "DIRECT",
                         RuleAction::Reject => "REJECT",
+                        RuleAction::RejectDrop => "REJECT-DROP",
                         RuleAction::Route(RouteTargetId::Proxy(id)) => {
                             &config.proxies[id.index()].tag
                         }
@@ -166,7 +167,7 @@ fn effective_config(config: &Config) -> Value {
         "bind-address":mixed.and_then(|m| m.access.bind_address).map_or_else(|| "*".into(), |ip| ip.to_string()),
         "mode": match config.mode { Mode::Rule => "rule", Mode::Direct => "direct", Mode::Global => "global" },
         "log-level":match config.log_level { LogLevel::Silent => "silent", LogLevel::Error => "error", LogLevel::Warning => "warning", LogLevel::Info => "info", LogLevel::Debug => "debug" },
-        "ipv6": config.ipv6, "sniffing": config.sniffer.enable, "tcp-concurrent": config.connections.tcp_concurrent,
+        "ipv6": config.ipv6, "sniffing": config.sniffer.enable, "tcp-concurrent": config.connections.tcp_concurrent, "find-process-mode":config.find_process_mode.name(),
         "keep-alive-idle": config.connections.keep_alive_idle, "keep-alive-interval":config.connections.keep_alive_interval, "disable-keep-alive":config.connections.disable_keep_alive,
         "unified-delay":config.unified_delay, "profile":{"store-selected":config.profile.store_selected,"store-fake-ip":config.profile.store_fake_ip},
         "tun":{"enable":config.tun.enable,"device":config.tun.device,"file-descriptor":config.tun.file_descriptor,"mtu":config.tun.mtu,"udp-timeout":config.tun.udp_timeout.as_secs(),"auto-route":config.tun.auto_route,"auto-detect-interface":config.tun.auto_detect_interface,"dns-hijack":config.tun.dns_hijack.iter().map(ToString::to_string).collect::<Vec<_>>()}
@@ -193,6 +194,21 @@ fn rule_description(rule: &RuleKind) -> (&'static str, String) {
                 .join("/"),
         ),
         RuleKind::InUsers(users) => ("InUser", users.join("/")),
+        RuleKind::Process(rule) => (rule.description(), rule.pattern.clone()),
+        RuleKind::Uid(ranges) => (
+            "UID",
+            ranges
+                .iter()
+                .map(|range| {
+                    if range.start == range.end {
+                        range.start.to_string()
+                    } else {
+                        format!("{}-{}", range.start, range.end)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("/"),
+        ),
         RuleKind::RuleSet { name, .. } => ("RuleSet", name.clone()),
         RuleKind::IpSuffix(value) => ("IPSuffix", value.as_str().into()),
         RuleKind::SrcIpSuffix(value) => ("SrcIPSuffix", value.as_str().into()),

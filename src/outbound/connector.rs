@@ -1181,6 +1181,7 @@ proxy-groups:
         let metadata = crate::session::InboundMetadata {
             local_port: 1080,
             user: Some(user),
+            ..Default::default()
         };
         let mut session = test_session();
         session.metadata = metadata.clone();

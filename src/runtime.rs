@@ -205,6 +205,7 @@ struct BuiltProxyGraph {
     nodes: Vec<Arc<dyn OutboundConnector>>,
     lifecycle_order: Vec<BuiltRouteTarget>,
     selections: Vec<Arc<crate::routing::GroupSelection>>,
+    reject_drop: Arc<crate::outbound::RejectOutbound>,
 }
 
 enum BuiltRouteTarget {
@@ -230,6 +231,7 @@ impl BuiltProxyGraph {
     fn begin_shutdown(&self) {
         self.dialer.begin_shutdown();
         self.resolution.close();
+        self.reject_drop.begin_shutdown();
         for target in self.lifecycle_order.iter().rev() {
             if let BuiltRouteTarget::Proxy(connector) = target {
                 connector.begin_shutdown();
@@ -723,11 +725,16 @@ impl GraphBuilder {
             .collect::<Vec<_>>();
         let direct_raw: Arc<dyn Dispatcher> = Arc::new(DirectOutbound::new(dialer.clone()));
         let direct = observe_handshakes_with_stats(direct_raw, handshake_stats.clone());
-        let proxy_groups = ProxyGroups::with_selections(
+        let reject_drop: Arc<dyn Dispatcher> = Arc::new(
+            ConnectorDispatcher::new(proxy_graph.reject_drop.clone())
+                .with_resolution(proxy_graph.resolution.clone()),
+        );
+        let proxy_groups = ProxyGroups::with_selections_and_drop(
             &self.config.proxy_groups,
             proxy_dispatchers.clone(),
             direct.clone(),
             &proxy_graph.selections,
+            reject_drop.clone(),
         )
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let route_targets =
@@ -823,7 +830,9 @@ impl GraphBuilder {
         )
         .with_tun_config(&self.config.tun)
         .with_sniffer(&self.config.sniffer)
+        .with_process_lookup(self.config.find_process_mode, proxy_graph.dialer.clone())
         .with_tcp_concurrent(self.config.connections.tcp_concurrent);
+        router = router.with_reject_drop(reject_drop);
         if let Some(diagnostics) = &diagnostics {
             router = router.with_diagnostics(diagnostics.clone());
         }
@@ -1028,6 +1037,7 @@ fn build_proxy_graph(
                 selection
             })
             .collect(),
+        reject_drop: Arc::new(crate::outbound::RejectOutbound::drop_connections()),
     };
     let mut nodes: Vec<Option<Arc<dyn OutboundConnector>>> = vec![None; proxies.len()];
     let mut group_nodes: Vec<Option<Arc<SelectUpstream>>> = vec![None; groups.len()];
@@ -1057,6 +1067,9 @@ fn build_proxy_graph(
                         }
                         ProxyGroupMemberTarget::Direct => SelectUpstreamMember::Direct,
                         ProxyGroupMemberTarget::Reject => SelectUpstreamMember::Reject,
+                        ProxyGroupMemberTarget::RejectDrop => {
+                            SelectUpstreamMember::Proxy(graph.reject_drop.clone())
+                        }
                         ProxyGroupMemberTarget::Control(_) => SelectUpstreamMember::Control,
                     })
                     .collect();
@@ -1076,134 +1089,147 @@ fn build_proxy_graph(
             .with_ip_version(proxy.ip_version)
             .with_egress(&proxy.egress);
         node_dialer.validate_egress()?;
-        let upstream = build_upstream_path(
-            crate::outbound::server_destination(proxy.address(), proxy.port())?,
-            proxy.dialer_proxy,
-            endpoints[index].upload.clone(),
-            &nodes,
-            &group_nodes,
-            &node_dialer,
-        )?;
         let connector: Arc<dyn OutboundConnector> = match &proxy.protocol {
-            ProxyProtocol::Masque(config) => {
-                #[cfg(feature = "outbound-masque")]
-                {
-                    Arc::new(
-                        crate::outbound::masque::MasqueOutbound::with_shared_security(
-                            config, upstream, security,
-                        )?,
-                    )
-                }
-                #[cfg(not(feature = "outbound-masque"))]
-                {
-                    let _ = (config, upstream);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "MASQUE outbound support is disabled at build time",
-                    ));
-                }
+            ProxyProtocol::Direct => {
+                Arc::new(crate::outbound::NamedDirectOutbound::new(node_dialer))
             }
-            ProxyProtocol::WireGuard(config) => {
-                #[cfg(feature = "outbound-wireguard")]
-                {
-                    Arc::new(
+            ProxyProtocol::Dns => Arc::new(crate::outbound::DnsOutbound::default()),
+            ProxyProtocol::Reject => Arc::new(crate::outbound::RejectOutbound::default()),
+            _ => {
+                let (address, port) = proxy
+                    .server_endpoint()
+                    .expect("remote protocol has an endpoint");
+                let upstream = build_upstream_path(
+                    crate::outbound::server_destination(address, port)?,
+                    proxy.dialer_proxy,
+                    endpoints[index].upload.clone(),
+                    &nodes,
+                    &group_nodes,
+                    &node_dialer,
+                )?;
+                match &proxy.protocol {
+                    ProxyProtocol::Direct | ProxyProtocol::Dns | ProxyProtocol::Reject => {
+                        unreachable!("functional route was constructed without a server endpoint")
+                    }
+                    ProxyProtocol::Masque(config) => {
+                        #[cfg(feature = "outbound-masque")]
+                        {
+                            Arc::new(
+                                crate::outbound::masque::MasqueOutbound::with_shared_security(
+                                    config, upstream, security,
+                                )?,
+                            )
+                        }
+                        #[cfg(not(feature = "outbound-masque"))]
+                        {
+                            let _ = (config, upstream);
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "MASQUE outbound support is disabled at build time",
+                            ));
+                        }
+                    }
+                    ProxyProtocol::WireGuard(config) => {
+                        #[cfg(feature = "outbound-wireguard")]
+                        {
+                            Arc::new(
                         crate::outbound::wireguard::WireGuardOutbound::with_shared_security(
                             config, upstream, security,
                         )?,
                     )
-                }
-                #[cfg(not(feature = "outbound-wireguard"))]
-                {
-                    let _ = (config, upstream);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "WireGuard support is disabled",
-                    ));
-                }
-            }
-            ProxyProtocol::Http(config) => {
-                #[cfg(feature = "outbound-http")]
-                {
-                    Arc::new(crate::outbound::http::HttpOutbound::with_shared_security(
-                        config,
-                        upstream,
-                        security_context.as_ref().expect("HTTP security context"),
-                        resumption_sessions,
-                        limits.tls_buffer_limit,
-                    )?)
-                }
-                #[cfg(not(feature = "outbound-http"))]
-                {
-                    let _ = (config, upstream);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "HTTP outbound support is disabled",
-                    ));
-                }
-            }
-            ProxyProtocol::TrustTunnel(config) => {
-                #[cfg(feature = "outbound-trusttunnel")]
-                {
-                    Arc::new(TrustTunnelOutbound::with_shared_security(
-                        config,
-                        upstream,
-                        security_context
-                            .as_ref()
-                            .expect("TrustTunnel security context"),
-                        resumption_sessions,
-                        limits.tls_buffer_limit,
-                    )?)
-                }
-                #[cfg(not(feature = "outbound-trusttunnel"))]
-                {
-                    let _ = (config, upstream);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "TrustTunnel outbound support is disabled at build time",
-                    ));
-                }
-            }
-            ProxyProtocol::Mieru(config) => {
-                #[cfg(feature = "outbound-mieru")]
-                {
-                    Arc::new(crate::outbound::mieru::MieruOutbound::new(
-                        config,
-                        upstream,
-                        limits.tcp_buffer_per_direction,
-                    )?)
-                }
-                #[cfg(not(feature = "outbound-mieru"))]
-                {
-                    let _ = (config, upstream);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "Mieru outbound support is disabled at build time",
-                    ));
-                }
-            }
-            ProxyProtocol::Tuic(config) => {
-                #[cfg(feature = "outbound-tuic")]
-                {
-                    Arc::new(crate::outbound::tuic::TuicOutbound::with_shared_security(
-                        config,
-                        upstream,
-                        security_context.as_ref().expect("TLS context"),
-                        limits.tls_buffer_limit,
-                    )?)
-                }
-                #[cfg(not(feature = "outbound-tuic"))]
-                {
-                    let _ = config;
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "TUIC support is disabled in this build",
-                    ));
-                }
-            }
-            ProxyProtocol::Hysteria2(config) => {
-                #[cfg(feature = "outbound-hysteria2")]
-                {
-                    Arc::new(
+                        }
+                        #[cfg(not(feature = "outbound-wireguard"))]
+                        {
+                            let _ = (config, upstream);
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "WireGuard support is disabled",
+                            ));
+                        }
+                    }
+                    ProxyProtocol::Http(config) => {
+                        #[cfg(feature = "outbound-http")]
+                        {
+                            Arc::new(crate::outbound::http::HttpOutbound::with_shared_security(
+                                config,
+                                upstream,
+                                security_context.as_ref().expect("HTTP security context"),
+                                resumption_sessions,
+                                limits.tls_buffer_limit,
+                            )?)
+                        }
+                        #[cfg(not(feature = "outbound-http"))]
+                        {
+                            let _ = (config, upstream);
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "HTTP outbound support is disabled",
+                            ));
+                        }
+                    }
+                    ProxyProtocol::TrustTunnel(config) => {
+                        #[cfg(feature = "outbound-trusttunnel")]
+                        {
+                            Arc::new(TrustTunnelOutbound::with_shared_security(
+                                config,
+                                upstream,
+                                security_context
+                                    .as_ref()
+                                    .expect("TrustTunnel security context"),
+                                resumption_sessions,
+                                limits.tls_buffer_limit,
+                            )?)
+                        }
+                        #[cfg(not(feature = "outbound-trusttunnel"))]
+                        {
+                            let _ = (config, upstream);
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "TrustTunnel outbound support is disabled at build time",
+                            ));
+                        }
+                    }
+                    ProxyProtocol::Mieru(config) => {
+                        #[cfg(feature = "outbound-mieru")]
+                        {
+                            Arc::new(crate::outbound::mieru::MieruOutbound::new(
+                                config,
+                                upstream,
+                                limits.tcp_buffer_per_direction,
+                            )?)
+                        }
+                        #[cfg(not(feature = "outbound-mieru"))]
+                        {
+                            let _ = (config, upstream);
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "Mieru outbound support is disabled at build time",
+                            ));
+                        }
+                    }
+                    ProxyProtocol::Tuic(config) => {
+                        #[cfg(feature = "outbound-tuic")]
+                        {
+                            Arc::new(crate::outbound::tuic::TuicOutbound::with_shared_security(
+                                config,
+                                upstream,
+                                security_context.as_ref().expect("TLS context"),
+                                limits.tls_buffer_limit,
+                            )?)
+                        }
+                        #[cfg(not(feature = "outbound-tuic"))]
+                        {
+                            let _ = config;
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "TUIC support is disabled in this build",
+                            ));
+                        }
+                    }
+                    ProxyProtocol::Hysteria2(config) => {
+                        #[cfg(feature = "outbound-hysteria2")]
+                        {
+                            Arc::new(
                         crate::outbound::hysteria2::Hysteria2Outbound::with_shared_security(
                             config,
                             upstream,
@@ -1212,170 +1238,172 @@ fn build_proxy_graph(
                             limits.tls_buffer_limit,
                         )?,
                     )
-                }
-                #[cfg(not(feature = "outbound-hysteria2"))]
-                {
-                    let _ = config;
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "Hysteria2 support is disabled in this build",
-                    ));
-                }
-            }
-            ProxyProtocol::Vmess(config) => {
-                #[cfg(feature = "outbound-vmess")]
-                {
-                    Arc::new(crate::outbound::vmess::VmessOutbound::with_shared_security(
-                        config,
-                        upstream,
-                        security_context.as_ref().expect("VMess security context"),
-                        resumption_sessions,
-                        limits.tls_buffer_limit,
-                    )?)
-                }
-                #[cfg(not(feature = "outbound-vmess"))]
-                {
-                    let _ = (config, upstream);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "VMess outbound support is disabled at build time",
-                    ));
-                }
-            }
-            ProxyProtocol::Trojan(config) => {
-                #[cfg(feature = "outbound-trojan")]
-                {
-                    Arc::new(TrojanOutbound::with_shared_security(
-                        config,
-                        upstream,
-                        security_context
-                            .as_ref()
-                            .expect("Trojan graph has security material"),
-                        resumption_sessions,
-                        limits.tls_buffer_limit,
-                    )?)
-                }
-                #[cfg(not(feature = "outbound-trojan"))]
-                {
-                    let _ = (config, upstream);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "Trojan outbound support is disabled at build time",
-                    ));
-                }
-            }
-            ProxyProtocol::Shadowsocks(config) => {
-                #[cfg(feature = "outbound-shadowsocks")]
-                {
-                    #[cfg(feature = "shadow-tls-v3")]
-                    let security = security_context.as_ref();
-                    Arc::new(ShadowsocksOutbound::with_security(
-                        config,
-                        upstream,
-                        #[cfg(feature = "shadow-tls-v3")]
-                        security,
-                    )?)
-                }
-                #[cfg(not(feature = "outbound-shadowsocks"))]
-                {
-                    let _ = (config, upstream);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "Shadowsocks outbound support is disabled at build time",
-                    ));
-                }
-            }
-            ProxyProtocol::Vless(config) => {
-                #[cfg(feature = "outbound-vless")]
-                {
-                    let download_upstream = config
-                        .download()
-                        .map(|download| {
-                            build_upstream_path(
-                                crate::outbound::server_destination(
-                                    &download.address,
-                                    download.port,
-                                )?,
-                                proxy.dialer_proxy,
-                                endpoints[index].download.clone(),
-                                &nodes,
-                                &group_nodes,
-                                &node_dialer,
-                            )
-                        })
-                        .transpose()?;
-                    Arc::new(VlessOutbound::new_with_shared_security(
-                        config,
-                        upstream,
-                        download_upstream,
-                        security_context
-                            .as_ref()
-                            .expect("VLESS graph has shared security material"),
-                        resumption_sessions,
-                        VlessResourceLimits::new(
-                            limits.tls_buffer_limit,
-                            limits.xhttp_send_buffer_size,
-                            limits.xhttp_upload_chunk_size,
-                        ),
-                    )?)
-                }
-                #[cfg(not(feature = "outbound-vless"))]
-                {
-                    let _ = (config, upstream);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "VLESS outbound support is disabled at build time",
-                    ));
-                }
-            }
-            ProxyProtocol::Socks5(config) => {
-                #[cfg(feature = "outbound-socks5")]
-                {
-                    Arc::new(Socks5Outbound::with_shared_security(
-                        config,
-                        upstream,
-                        security_context.as_ref(),
-                        resumption_sessions,
-                        limits.tls_buffer_limit,
-                    )?)
-                }
-                #[cfg(not(feature = "outbound-socks5"))]
-                {
-                    let _ = (config, upstream);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "SOCKS5 outbound support is disabled at build time",
-                    ));
-                }
-            }
-            ProxyProtocol::AnyTls(config) => {
-                #[cfg(feature = "outbound-anytls")]
-                {
-                    let tls = StandardTlsClient::with_options(
-                        security_context
-                            .as_ref()
-                            .expect("AnyTLS graph has shared security material"),
-                        &config.server_name,
-                        crate::security::TlsClientOptions::from_policy(&config.tls, None)?,
-                        resumption_sessions,
-                        limits.tls_buffer_limit,
-                    )?;
-                    Arc::new(AnyTlsOutbound::with_session_options(
-                        server_destination(&config.address, config.port)?,
-                        upstream,
-                        &config.password,
-                        Arc::new(tls),
-                        limits.tcp_buffer_per_direction,
-                        config.session.clone(),
-                    )?)
-                }
-                #[cfg(not(feature = "outbound-anytls"))]
-                {
-                    let _ = (config, upstream);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "AnyTLS outbound support is disabled at build time",
-                    ));
+                        }
+                        #[cfg(not(feature = "outbound-hysteria2"))]
+                        {
+                            let _ = config;
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "Hysteria2 support is disabled in this build",
+                            ));
+                        }
+                    }
+                    ProxyProtocol::Vmess(config) => {
+                        #[cfg(feature = "outbound-vmess")]
+                        {
+                            Arc::new(crate::outbound::vmess::VmessOutbound::with_shared_security(
+                                config,
+                                upstream,
+                                security_context.as_ref().expect("VMess security context"),
+                                resumption_sessions,
+                                limits.tls_buffer_limit,
+                            )?)
+                        }
+                        #[cfg(not(feature = "outbound-vmess"))]
+                        {
+                            let _ = (config, upstream);
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "VMess outbound support is disabled at build time",
+                            ));
+                        }
+                    }
+                    ProxyProtocol::Trojan(config) => {
+                        #[cfg(feature = "outbound-trojan")]
+                        {
+                            Arc::new(TrojanOutbound::with_shared_security(
+                                config,
+                                upstream,
+                                security_context
+                                    .as_ref()
+                                    .expect("Trojan graph has security material"),
+                                resumption_sessions,
+                                limits.tls_buffer_limit,
+                            )?)
+                        }
+                        #[cfg(not(feature = "outbound-trojan"))]
+                        {
+                            let _ = (config, upstream);
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "Trojan outbound support is disabled at build time",
+                            ));
+                        }
+                    }
+                    ProxyProtocol::Shadowsocks(config) => {
+                        #[cfg(feature = "outbound-shadowsocks")]
+                        {
+                            #[cfg(feature = "shadow-tls-v3")]
+                            let security = security_context.as_ref();
+                            Arc::new(ShadowsocksOutbound::with_security(
+                                config,
+                                upstream,
+                                #[cfg(feature = "shadow-tls-v3")]
+                                security,
+                            )?)
+                        }
+                        #[cfg(not(feature = "outbound-shadowsocks"))]
+                        {
+                            let _ = (config, upstream);
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "Shadowsocks outbound support is disabled at build time",
+                            ));
+                        }
+                    }
+                    ProxyProtocol::Vless(config) => {
+                        #[cfg(feature = "outbound-vless")]
+                        {
+                            let download_upstream = config
+                                .download()
+                                .map(|download| {
+                                    build_upstream_path(
+                                        crate::outbound::server_destination(
+                                            &download.address,
+                                            download.port,
+                                        )?,
+                                        proxy.dialer_proxy,
+                                        endpoints[index].download.clone(),
+                                        &nodes,
+                                        &group_nodes,
+                                        &node_dialer,
+                                    )
+                                })
+                                .transpose()?;
+                            Arc::new(VlessOutbound::new_with_shared_security(
+                                config,
+                                upstream,
+                                download_upstream,
+                                security_context
+                                    .as_ref()
+                                    .expect("VLESS graph has shared security material"),
+                                resumption_sessions,
+                                VlessResourceLimits::new(
+                                    limits.tls_buffer_limit,
+                                    limits.xhttp_send_buffer_size,
+                                    limits.xhttp_upload_chunk_size,
+                                ),
+                            )?)
+                        }
+                        #[cfg(not(feature = "outbound-vless"))]
+                        {
+                            let _ = (config, upstream);
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "VLESS outbound support is disabled at build time",
+                            ));
+                        }
+                    }
+                    ProxyProtocol::Socks5(config) => {
+                        #[cfg(feature = "outbound-socks5")]
+                        {
+                            Arc::new(Socks5Outbound::with_shared_security(
+                                config,
+                                upstream,
+                                security_context.as_ref(),
+                                resumption_sessions,
+                                limits.tls_buffer_limit,
+                            )?)
+                        }
+                        #[cfg(not(feature = "outbound-socks5"))]
+                        {
+                            let _ = (config, upstream);
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "SOCKS5 outbound support is disabled at build time",
+                            ));
+                        }
+                    }
+                    ProxyProtocol::AnyTls(config) => {
+                        #[cfg(feature = "outbound-anytls")]
+                        {
+                            let tls = StandardTlsClient::with_options(
+                                security_context
+                                    .as_ref()
+                                    .expect("AnyTLS graph has shared security material"),
+                                &config.server_name,
+                                crate::security::TlsClientOptions::from_policy(&config.tls, None)?,
+                                resumption_sessions,
+                                limits.tls_buffer_limit,
+                            )?;
+                            Arc::new(AnyTlsOutbound::with_session_options(
+                                server_destination(&config.address, config.port)?,
+                                upstream,
+                                &config.password,
+                                Arc::new(tls),
+                                limits.tcp_buffer_per_direction,
+                                config.session.clone(),
+                            )?)
+                        }
+                        #[cfg(not(feature = "outbound-anytls"))]
+                        {
+                            let _ = (config, upstream);
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "AnyTLS outbound support is disabled at build time",
+                            ));
+                        }
+                    }
                 }
             }
         };
@@ -1526,17 +1554,23 @@ async fn prepare_proxy_endpoints(
     let lookups = proxies
         .iter()
         .enumerate()
-        .filter(|(_, proxy)| match proxy.dialer_proxy {
-            None => true,
-            Some(RouteTargetId::Group(id)) => direct_groups[id.index()],
-            Some(RouteTargetId::Proxy(_)) => false,
+        .filter(|(_, proxy)| {
+            proxy.server_endpoint().is_some()
+                && match proxy.dialer_proxy {
+                    None => true,
+                    Some(RouteTargetId::Group(id)) => direct_groups[id.index()],
+                    Some(RouteTargetId::Proxy(_)) => false,
+                }
         })
         .map(|(index, proxy)| async move {
-            let upload_address = proxy.address();
-            let upload_port = proxy.port();
+            let (upload_address, upload_port) =
+                proxy.server_endpoint().expect("filtered remote endpoint");
             let download = match &proxy.protocol {
                 ProxyProtocol::Vless(config) => config.download(),
-                ProxyProtocol::WireGuard(_)
+                ProxyProtocol::Direct
+                | ProxyProtocol::Dns
+                | ProxyProtocol::Reject
+                | ProxyProtocol::WireGuard(_)
                 | ProxyProtocol::Masque(_)
                 | ProxyProtocol::Http(_)
                 | ProxyProtocol::Socks5(_)
@@ -1660,7 +1694,11 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
                 standard_count + usize::from(config.tls.is_some()),
             ),
             ProxyProtocol::Tuic(_) | ProxyProtocol::Masque(_) => (client_count + 1, standard_count),
-            ProxyProtocol::WireGuard(_) | ProxyProtocol::Mieru(_) => (client_count, standard_count),
+            ProxyProtocol::Direct
+            | ProxyProtocol::Dns
+            | ProxyProtocol::Reject
+            | ProxyProtocol::WireGuard(_)
+            | ProxyProtocol::Mieru(_) => (client_count, standard_count),
         },
     )
 }

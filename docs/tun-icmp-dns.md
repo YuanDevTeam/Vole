@@ -60,7 +60,7 @@ redir-host 域名提示在 DNS 开启且规则需要域名或已启用嗅探时�
 
 ## 嗅探
 
-HTTP/TLS 用于 TUN 与 mixed TCP；QUIC v1/v2 多包识别用于 TUN UDP。
+HTTP/TLS 用于 TUN 与 mixed TCP；QUIC v1/v2 多包识别由 TUN 和已授权的 SOCKS5 UDP 共用。
 `parse-pure-ip` 控制无域名目标，`force-dns-mapping` 控制 redir-host 提示，均默认 true。
 fake-IP 恢复后的域名与显式域名只在 `force-domain` 匹配时强制嗅探。
 `skip-src-address` / `skip-dst-address` 在读取前排除地址；`skip-domain` 排除识别结果。
@@ -74,7 +74,10 @@ UDP 覆盖保留原始目标供回包使用，活动流不随后续查询变更�
 
 HTTP/TLS 端口可重叠。每连接共享最多 64 KiB 预读，首字节最多一秒，随后解析最多一秒；
 优先识别 TLS，再识别 HTTP。失败、超时或跳过均保留已读数据供业务转发。
-HTTP 识别 HTTP/1.x Host；TLS/QUIC 识别 ClientHello，检测到 ECH 时不使用外层 SNI。
+HTTP 识别 HTTP/1.x Host、absolute-form 与 CONNECT 目标，以及 HTTP/2 首个请求的 authority/Host。
+HTTP/2 接收完整 HEADERS/CONTINUATION 后解码 HPACK，动态表上限 4 KiB，最多 128 帧/字段，
+编码与解码字节受相同 64 KiB 预算限制；歧义字段或非法帧不产生域名提示。
+TLS/QUIC 识别 ClientHello，检测到 ECH 时不使用外层 SNI。
 不嗅探劫持的 DNS。没有列出任何协议时不读取业务数据。
 
 ## Fake-IP
@@ -123,7 +126,7 @@ dns:
 - 上游域名由 `default-nameserver` 引导解析，后者允许 IP 上游和显式 system。未启用 DNS 时，内部解析使用系统 resolver；启用后不因查询失败回退系统解析。
 - `system`、`system://`、`dhcp://system` 使用物理系统 DNS；`dhcp://<精确接口名>` 仅使用该接口的 DHCP DNS，不匹配其他接口。各 nameserver 角色、policy 和 fallback 均支持；DHCP 接口不能用于 default-nameserver。来源始终直连物理接口，fragment 与 respect-rules 不改其出口。
 - 无 fragment 时默认 DIRECT；`respect-rules: true` 改为 RULES，要求非空 `proxy-server-nameserver`。
-- Fragment 使用 `#出口或接口&参数=值`；出口接受 `DIRECT`、`RULES`、实际代理节点名或支持的代理组名。
+- Fragment 使用 `#出口或接口&参数=值`；出口接受 `DIRECT`、`COMPATIBLE`、`REJECT`、`REJECT-DROP`、`RULES`、实际代理节点名或支持的代理组名。
   仅提供参数时沿用默认出口；整个 fragment 先百分号解码，再按 `&` 和首个 `=` 拆分，
   同名参数和出口 token 以后项为准。节点/组名称优先，没有同名目标时作为物理接口名。
   指定接口直接连接该 DNS 上游，覆盖全局接口、沿用全局 mark；接口失效时失败，不回退。
@@ -132,9 +135,9 @@ dns:
 - `#RULES` 只按 nameserver endpoint 和传输执行业务规则，不把 DNS question 当作选路域名。
 - 规则模式下，UDP 跳过不支持 UDP 的节点或组，继续匹配后续规则；显式出口和 global 模式不做此跳过。
 - `RULES` 与业务 TCP/UDP 使用同一子规则求值器：`SUB-RULE`、`PASS`、`PASS-RULE` 的作用域一致；规则控制和组控制先于 UDP 能力检查。
-- 规则结果为 `REJECT` 时，当前尝试失败并继续当前组下一项。
+- `COMPATIBLE` 使用直连语义；`REJECT` 结束当前尝试，`REJECT-DROP` 的 TCP 等待仍受当前 DNS 查询期限和 Stop 限制，UDP 立即结束。失败后继续当前上游组下一项。
 
-代理组成员可以是具体节点、嵌套组、`DIRECT`、`REJECT`、`PASS` 或 `PASS-RULE`。后两者仅在 rule 模式的 `RULES` 中参与规则流程，global 模式、显式命名组或 dialer-proxy 选中控制目标时拒绝连接。DNS exchange 需要新建物理 transport 时解析当时的当前叶节点；选中成员失败不会使代理组自动改选，但 nameserver 列表仍按本节已有故障转移语义继续下一项。
+代理组成员可以是具体节点、嵌套组、`DIRECT`、`COMPATIBLE`、`REJECT`、`REJECT-DROP`、`PASS` 或 `PASS-RULE`。后两者仅在 rule 模式的 `RULES` 中参与规则流程，global 模式、显式命名组或 dialer-proxy 选中控制目标时拒绝连接。DNS exchange 需要新建物理 transport 时解析当时的当前叶节点；选中成员失败不会使代理组自动改选，但 nameserver 列表仍按本节已有故障转移语义继续下一项。
 
 ### 上游参数
 

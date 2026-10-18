@@ -20,8 +20,10 @@ fn trojan_tcp_configuration_and_node_graph_accept_the_approved_fields() {
     );
     let yaml = b"mixed-port: 1080\nproxies:\n  - name: edge\n    type: trojan\n    server: example.com\n    port: 443\n    password: ' password '\n    udp: true\n    sni: tls.example.com\n    alpn: [h2, http/1.1]\n    skip-cert-verify: false\n    fingerprint: '0000000000000000000000000000000000000000000000000000000000000000'\n    dialer-proxy: upstream\nproxy-groups:\n  - name: upstream\n    type: select\n    proxies: [DIRECT, REJECT]\nrules: ['MATCH,edge']\n";
     let config = Config::parse_yaml(yaml).expect("TROJAN Trojan TCP configuration");
-    assert_eq!(config.proxies[0].address(), "example.com");
-    assert_eq!(config.proxies[0].port(), 443);
+    assert_eq!(
+        config.proxies[0].server_endpoint(),
+        Some(("example.com", 443))
+    );
     assert!(config.proxies[0].udp);
     assert!(!format!("{config:?}").contains(" password "));
 }

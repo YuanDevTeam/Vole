@@ -180,11 +180,11 @@ pub(crate) async fn handle_connection(
     cancellation: CancellationToken,
 ) -> io::Result<()> {
     let deadline = Instant::now() + config.header_timeout;
-    let local_port = inbound.local_addr()?.port();
+    let local_address = inbound.local_addr()?;
     handle_connection_with_deadline(
         inbound,
         peer,
-        local_port,
+        local_address,
         dispatcher,
         config,
         cancellation,
@@ -196,7 +196,7 @@ pub(crate) async fn handle_connection(
 pub(crate) async fn handle_connection_with_deadline<S>(
     inbound: S,
     peer: SocketAddr,
-    local_port: u16,
+    local_address: SocketAddr,
     dispatcher: Arc<dyn Dispatcher>,
     config: HttpServerConfig,
     cancellation: CancellationToken,
@@ -213,7 +213,7 @@ where
         result = async {
             let (read, mut write) = tokio::io::split(inbound);
             let mut reader = BufReader::with_capacity(framing::COPY_BUFFER, read);
-            serve_requests(&mut reader, &mut write, peer, local_port, &dispatcher, &config, deadline).await
+            serve_requests(&mut reader, &mut write, peer, local_address, &dispatcher, &config, deadline).await
         } => result,
     }
 }
@@ -222,7 +222,7 @@ async fn serve_requests<R, W>(
     reader: &mut R,
     writer: &mut W,
     peer: SocketAddr,
-    local_port: u16,
+    local_address: SocketAddr,
     dispatcher: &Arc<dyn Dispatcher>,
     config: &HttpServerConfig,
     first_deadline: Instant,
@@ -285,7 +285,12 @@ where
             }
         };
         let mut session = StreamSession {
-            metadata: InboundMetadata { local_port, user },
+            metadata: InboundMetadata {
+                local_port: local_address.port(),
+                local_address: Some(local_address),
+                user,
+                ..Default::default()
+            },
             inbound: if request.is_connect() {
                 InboundKind::Https
             } else {

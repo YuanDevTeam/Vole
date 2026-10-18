@@ -50,7 +50,7 @@ default = [
     "sing-mux",
 ]
 inbound-http = ["dep:rcgen", "dep:rsa"]
-inbound-socks5 = ["dep:rcgen", "dep:rsa"]
+inbound-socks5 = ["dep:rcgen", "dep:rsa", "dep:ring"]
 outbound-anytls = ["dep:md-5", "tls-fingerprint", "ech"]
 outbound-socks5 = []
 outbound-http = []
@@ -131,6 +131,7 @@ http = "1"
 hyper = { version = "=1.11.1", default-features = false, features = ["client", "http1"], optional = true }
 hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio"], optional = true }
 httparse = { version = "1.10", optional = true }
+httlib-hpack = "=0.1.3"
 idna = "1.1"
 libc = "0.2"
 # Upstream SS trace/debug logs include key material and traffic destinations.

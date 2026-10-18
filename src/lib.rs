@@ -28,7 +28,8 @@ mod logging;
 pub mod outbound;
 pub mod packet;
 pub mod platform;
-#[cfg(any(feature = "tun", test))]
+mod process;
+#[cfg(any(feature = "tun", feature = "inbound-socks5", test))]
 mod quic_sniffer;
 pub(crate) mod resource;
 pub mod resources;
@@ -88,6 +89,8 @@ pub mod transport;
     )
 ))]
 mod tun_runtime;
+#[cfg(any(feature = "tun", feature = "inbound-socks5", test))]
+mod udp_sniffing;
 #[cfg(all(windows, feature = "windows-uwp"))]
 #[doc(hidden)]
 pub mod windows;

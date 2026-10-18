@@ -13,6 +13,9 @@ use tokio::{
 
 use crate::routing::normalize_domain_name;
 
+#[path = "tcp_sniffer/http2.rs"]
+mod http2;
+
 pub(crate) const TCP_SNIFF_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const TCP_SNIFF_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -147,6 +150,16 @@ fn parse(protocol: SniffProtocol, input: &[u8]) -> ParseOutcome {
 }
 
 fn sniff_http_host(input: &[u8]) -> ParseOutcome {
+    if http2::PREFACE.starts_with(input) {
+        return ParseOutcome::NeedMoreData;
+    }
+    if input.starts_with(http2::PREFACE) {
+        return http2::sniff(input);
+    }
+    sniff_http1_host(input)
+}
+
+fn sniff_http1_host(input: &[u8]) -> ParseOutcome {
     let Some(headers_end) = find_bytes(input, b"\r\n\r\n") else {
         return if input.len() == TCP_SNIFF_MAX_BYTES {
             ParseOutcome::NotMatched
@@ -155,14 +168,14 @@ fn sniff_http_host(input: &[u8]) -> ParseOutcome {
         };
     };
     let headers = &input[..headers_end];
-    let Some(request_line_end) = find_bytes(headers, b"\r\n") else {
-        return ParseOutcome::NotMatched;
-    };
+    let request_line_end = find_bytes(headers, b"\r\n").unwrap_or(headers.len());
     if !is_http_request_line(&headers[..request_line_end]) {
         return ParseOutcome::NotMatched;
     }
 
+    let target_host = request_target_host(&headers[..request_line_end]);
     let mut host = None;
+    let mut saw_host = false;
     let mut cursor = request_line_end + 2;
     while cursor < headers.len() {
         let line_end =
@@ -174,18 +187,38 @@ fn sniff_http_host(input: &[u8]) -> ParseOutcome {
         if line[..colon].eq_ignore_ascii_case(b"host") {
             // Multiple Host fields are invalid for the routing hint even when
             // they happen to contain the same text.
-            if host.is_some() {
+            if saw_host {
                 return ParseOutcome::NotMatched;
             }
+            saw_host = true;
             host = normalize_host_header(&line[colon + 1..]);
-            if host.is_none() {
+            if host.is_none() && target_host.is_none() {
                 return ParseOutcome::NotMatched;
             }
         }
         cursor = line_end.saturating_add(2);
     }
 
-    host.map_or(ParseOutcome::NotMatched, ParseOutcome::Matched)
+    target_host
+        .or(host)
+        .map_or(ParseOutcome::NotMatched, ParseOutcome::Matched)
+}
+
+fn request_target_host(line: &[u8]) -> Option<String> {
+    let mut fields = line.split(|byte| *byte == b' ');
+    let method = fields.next()?;
+    let target = std::str::from_utf8(fields.next()?).ok()?;
+    if method.eq_ignore_ascii_case(b"CONNECT") {
+        return match crate::session::Destination::from_authority(target).ok()? {
+            crate::session::Destination::Domain { host, .. } => normalize_domain(&host),
+            crate::session::Destination::Ip(_) => None,
+        };
+    }
+    if target.starts_with('/') || target == "*" {
+        return None;
+    }
+    let url = url::Url::parse(target).ok()?;
+    normalize_domain(url.host_str()?)
 }
 
 fn early_http_decision(input: &[u8]) -> ParseOutcome {
@@ -564,6 +597,29 @@ pub(crate) mod tests {
 
     fn http_request(host: &str) -> Vec<u8> {
         format!("GET / HTTP/1.1\r\nUser-Agent: test\r\nHost: {host}\r\n\r\n").into_bytes()
+    }
+
+    #[test]
+    fn http_target_authority_precedes_host_and_connect_needs_no_host_header() {
+        for request in [
+            b"GET http://Target.Example:8080/path HTTP/1.1\r\nHost: other.example\r\n\r\n"
+                .as_slice(),
+            b"CONNECT target.example:443 HTTP/1.1\r\n\r\n",
+            b"GET https://target.example/path HTTP/1.1\r\n\r\n",
+        ] {
+            assert_eq!(
+                sniff_http_host(request),
+                ParseOutcome::Matched("target.example".into())
+            );
+        }
+        assert_eq!(
+            sniff_http_host(b"GET http://target.example/ HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n"),
+            ParseOutcome::NotMatched
+        );
+        assert_eq!(
+            sniff_http_host(b"CONNECT target.example:0 HTTP/1.1\r\n\r\n"),
+            ParseOutcome::NotMatched
+        );
     }
 
     pub(crate) fn tls_client_hello(host: &str) -> Vec<u8> {

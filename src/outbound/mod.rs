@@ -34,6 +34,9 @@ mod uot;
 #[cfg(feature = "outbound-shadowsocks")]
 pub use shadowsocks::ShadowsocksOutbound;
 mod direct;
+mod dns;
+mod named_direct;
+mod reject;
 #[cfg(feature = "outbound-socks5")]
 mod socks5;
 #[cfg(feature = "outbound-vless")]
@@ -52,6 +55,9 @@ pub(crate) use connector::{
     capture_outbound_diagnostic,
 };
 pub use direct::DirectOutbound;
+pub(crate) use dns::{DnsExchange, DnsOutbound, dns_tcp_stream};
+pub(crate) use named_direct::NamedDirectOutbound;
+pub(crate) use reject::RejectOutbound;
 #[cfg(feature = "outbound-socks5")]
 pub use socks5::{Socks5Auth, Socks5Outbound};
 #[cfg(feature = "outbound-vless")]

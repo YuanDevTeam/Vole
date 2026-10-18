@@ -16,16 +16,16 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 
 | 范围 | 当前支持 |
 | --- | --- |
-| 配置与选路 | YAML anchor/merge；rule/global/direct；内置 DIRECT/REJECT；域名、地址、端口、网络、GeoData、RULE-SET 和 AND/OR/NOT |
+| 配置与选路 | YAML anchor/merge；rule/global/direct；内置 DIRECT/COMPATIBLE/REJECT/REJECT-DROP；域名、地址、端口、网络、GeoData、RULE-SET 和 AND/OR/NOT |
 | 物理出口 | 全局/节点 interface-name、Linux routing-mark、Provider 对应 override、普通 DNS #接口；平台约束和 auto-route mark 冲突见出站与 TUN 契约 |
 | 资源 | HTTP/file/inline proxy/rule providers；YAML/URI/标准 Base64 订阅、AGE；共享流式 gzip/URL Basic；动态成员、筛选、覆盖、健康检查；Provider dialer-proxy 与 HTTP 订阅信息；YAML/Text 与 domain/ipcidr MRS；有界离线规则bundle；失败保留旧代 |
 | 策略组 | select/url-test/fallback/load-balance；默认和持久选择；延迟容差、恢复、三种负载均衡策略；旧连接保持原路径 |
 | DNS | hosts（含启动 LAN 地址快照）、bootstrap/节点/直连解析角色、policy、respect-rules；UDP/TCP/DoH/DoT/DoQ、DoH/H3；fallback；redir-host/fake-IP 与映射持久化 |
 | mixed-port | HTTP/SOCKS5 TCP 与 SOCKS5 UDP；LAN 地址限制、多用户认证、认证跳过网段；allow-lan 不强制认证 |
-| 出站 | HTTP(S) CONNECT、SOCKS5、AnyTLS、Trojan、VMess AEAD、VLESS、Hysteria2、TUIC v5、Shadowsocks 2022、标准 WireGuard 单/多 peer、TrustTunnel H2/H3、Mieru TCP/UDP 载体、MASQUE H2/H3 IP 与 H3 L4；依赖启用的 Cargo feature |
+| 出站 | 具名 direct/dns/reject；HTTP(S) CONNECT、SOCKS5、AnyTLS、Trojan、VMess AEAD、VLESS、Hysteria2、TUIC v5、Shadowsocks 2022、标准 WireGuard 单/多 peer、TrustTunnel H2/H3、Mieru TCP/UDP 载体、MASQUE H2/H3 IP 与 H3 L4；协议依赖启用的 Cargo feature |
 | QUIC 配置 | HY2 独立 initial/max 接收窗口、秒 handshake-timeout；TUIC v5 入口ip、毫秒heartbeat、反向命名的stream/connection窗口、所有者池阈值、frame/fragment限制、PMTUD与UoT v2 |
 | 客户端 TLS | tls.custom-certifactes 证书内容；启动时合并可读系统根、WebPKI 与显式根并跨组件共享；TUIC v5 与其它 TLS 节点复用 cert/private-key 身份加载 |
-| 嗅探 | TUN/mixed TCP 的 HTTP/TLS；TUN UDP 的 QUIC；域名/地址排除、强制条件和目标覆盖 |
+| 嗅探 | TUN/mixed TCP 的 HTTP1/HTTP2/TLS；TUN 与授权 SOCKS5 UDP 共用 QUIC v1/v2；域名/地址排除、强制条件和目标覆盖 |
 | Linux 自建设备 | auto-detect-interface、auto-route、systemd-resolved DNS 接管；失败和停止时恢复本次修改 |
 | 运行状态 | 连接快照、流量计数和关闭；组与资源状态；规则命中、有效配置、受限 DNS 诊断 |
 
@@ -63,7 +63,10 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - DNS、fake-IP 与嗅探的 classical selector 使用对应的域名或目标 IP 条件，支持纯对应条件组成的 AND/OR/NOT。
   混合端口、来源、网络等叶子的整个逻辑项不参与匹配；Mihomo 使用零值元数据执行全部 classical 条件，因此这些组合仍有语义边界。
 - Apple、Android、Windows UWP 的网络设置、权限和 App 生命周期仍归宿主；Windows Wintun 使用外置 DLL。
-  借用 Unix fd 只复制并保留原描述符。Linux 扩展路由、旁路由、防火墙/NAT、进程/UID 规则不在当前范围。
+  借用 Unix fd 只复制并保留原描述符。Linux 扩展路由、旁路由、防火墙/NAT 不在当前范围。
+  六类进程规则与 find-process-mode 按真实可获取的本机身份工作，UID 仅 Linux/Android；
+  不复制 port-only、跨 namespace 或任一同 UID 进程的弱归属推断。权限、预算或平台无法证明时未知，
+  不提权、不增加 Android owner 回调；范围和扫描预算见配置契约。
 
 平台编译、内存回归、CLI 对照诊断、协议互通和压力测试是不同的验证层次，见
 [验收边界](acceptance.md)。任一层通过都不代表所有字段取值、组合、平台或真机行为已验证。

@@ -200,7 +200,7 @@ impl MixedConnection {
                 handle_connection_with_deadline(
                     stream,
                     self.peer,
-                    self.relay.port(),
+                    self.relay,
                     self.dispatcher,
                     self.http,
                     self.cancellation,

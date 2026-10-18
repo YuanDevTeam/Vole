@@ -514,6 +514,7 @@ impl ProviderTemplate {
                 if fallback != "COMPATIBLE"
                     && fallback != "DIRECT"
                     && fallback != "REJECT"
+                    && fallback != "REJECT-DROP"
                     && !types.contains_key(&fallback)
                 {
                     return invalid("empty-fallback must be a proxy node or built-in target");

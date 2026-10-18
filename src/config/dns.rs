@@ -170,7 +170,9 @@ fn parse_dns_nameserver_with_route(
     }
     let route = match targets {
         Some(targets) if !route_name.is_empty() => match route_name.as_str() {
-            "DIRECT" => DnsRoute::Direct,
+            "DIRECT" | "COMPATIBLE" => DnsRoute::Direct,
+            "REJECT" => DnsRoute::Reject,
+            "REJECT-DROP" => DnsRoute::RejectDrop,
             "RULES" => DnsRoute::Rules,
             _ => match targets.get(&route_name).copied() {
                 Some(id) => DnsRoute::Route(id),

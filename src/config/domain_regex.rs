@@ -284,17 +284,38 @@ impl DomainRegex {
     ) -> std::result::Result<bool, MatchFailure> {
         decision.with(|budget| self.match_bounded(domain, budget, None))
     }
+    pub(crate) fn is_match_process(
+        &self,
+        value: &str,
+        decision: &RuleDecision,
+    ) -> std::result::Result<bool, MatchFailure> {
+        decision.with(|budget| self.match_input(value, budget, None, false))
+    }
     fn match_bounded(
         &self,
         domain: &str,
         budget: &mut DecisionBudget,
         cancel: Option<&CancellationToken>,
     ) -> std::result::Result<bool, MatchFailure> {
+        self.match_input(domain, budget, cancel, true)
+    }
+    fn match_input(
+        &self,
+        domain: &str,
+        budget: &mut DecisionBudget,
+        cancel: Option<&CancellationToken>,
+        dns: bool,
+    ) -> std::result::Result<bool, MatchFailure> {
         budget.check(cancel)?;
         if domain.is_empty()
-            || domain.len() > DOMAIN_BYTES
-            || !domain.is_ascii()
-            || domain.bytes().any(|b| b.is_ascii_control())
+            || domain.len()
+                > if dns {
+                    DOMAIN_BYTES
+                } else {
+                    super::process::MAX_PROCESS_TEXT
+                }
+            || (dns && (!domain.is_ascii() || domain.bytes().any(|b| b.is_ascii_control())))
+            || domain.contains('\0')
         {
             return budget.fail(MatchFailure::InvalidInput);
         }

@@ -411,6 +411,7 @@ impl ProviderRuntime {
             let action = match name {
                 "DIRECT" | "COMPATIBLE" => RuleAction::Direct,
                 "REJECT" => RuleAction::Reject,
+                "REJECT-DROP" => RuleAction::RejectDrop,
                 _ => {
                     if let Some(index) = generation
                         .config

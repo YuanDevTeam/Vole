@@ -49,6 +49,8 @@ pub struct RoutingContext {
     source_port: u16,
     inbound: InboundKind,
     metadata: InboundMetadata,
+    process: Option<crate::process::Identity>,
+    process_lookup_enabled: bool,
     normalized_domain: Option<Arc<str>>,
     destination_ip: Option<IpAddr>,
     pinned_ip: Option<IpAddr>,
@@ -108,6 +110,8 @@ impl RoutingContext {
             source_port: 0,
             inbound: InboundKind::InternalDns,
             metadata: InboundMetadata::new(0),
+            process: None,
+            process_lookup_enabled: false,
             normalized_domain,
             destination_ip,
             pinned_ip: None,
@@ -134,6 +138,22 @@ impl RoutingContext {
     }
     pub(crate) fn authenticated_user(&self) -> Option<&str> {
         self.metadata.user.as_deref()
+    }
+    pub(crate) fn enable_process_lookup(&mut self, enabled: bool) {
+        self.process_lookup_enabled = enabled;
+    }
+    pub(crate) fn set_process(&mut self, identity: crate::process::Identity) {
+        self.process = Some(identity);
+    }
+    pub(crate) fn process(&self) -> Option<&crate::process::Identity> {
+        self.process.as_ref()
+    }
+    fn process_identity(&self) -> Result<Option<&crate::process::Identity>, PredicateFailure> {
+        match &self.process {
+            Some(identity) => Ok(Some(identity)),
+            None if self.process_lookup_enabled => Err(PredicateFailure::NeedsProcessLookup),
+            None => Ok(None),
+        }
     }
     /// A local rule-provider view only. Host and ingress identity are unchanged.
     pub(crate) fn swap_source_destination(&mut self) {
@@ -329,6 +349,7 @@ pub struct RuleMatch {
 pub enum RuleEvaluation {
     Matched(RuleMatch),
     NeedsIpResolution { rule_index: usize },
+    NeedsProcessLookup { rule_index: usize },
     NoMatch,
     Failed(crate::config::MatchFailure),
 }
@@ -686,6 +707,17 @@ fn normalize_rule(
                 *bytes = checked_text_bytes(*bytes, user.len())?;
             }
         }
+        RuleKind::Process(value) => {
+            *bytes = checked_text_bytes(*bytes, value.pattern.len())?;
+        }
+        RuleKind::Uid(ranges) => {
+            if ranges.is_empty()
+                || ranges.len() > 28
+                || ranges.iter().any(|range| range.start > range.end)
+            {
+                return Err(RuleSetError::InvalidInboundRule { rule_index: index });
+            }
+        }
         RuleKind::InTypes(types) => {
             if types.is_empty() {
                 return Err(RuleSetError::InvalidInboundRule { rule_index: index });
@@ -733,6 +765,7 @@ pub(crate) fn uses_destination_ip(rule: &RuleSpec) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PredicateFailure {
     NeedsIpResolution,
+    NeedsProcessLookup,
     Evaluation(crate::config::MatchFailure),
 }
 impl From<crate::config::MatchFailure> for PredicateFailure {
@@ -847,6 +880,25 @@ pub(crate) fn matches_rule(
         RuleKind::InUsers(users) => context
             .authenticated_user()
             .is_some_and(|user| users.iter().any(|expected| expected == user)),
+        RuleKind::Process(rule) => match context.process_identity()? {
+            Some(identity) => match match rule.field {
+                crate::config::ProcessField::Name => identity.name.as_deref(),
+                crate::config::ProcessField::Path => identity.path.as_deref(),
+            } {
+                Some(value) => rule.matches(value, context.decision())?,
+                None => false,
+            },
+            None => false,
+        },
+        RuleKind::Uid(ranges) => context
+            .process_identity()?
+            .and_then(|identity| identity.uid)
+            .filter(|uid| *uid != 0)
+            .is_some_and(|uid| {
+                ranges
+                    .iter()
+                    .any(|range| range.start <= uid && uid <= range.end)
+            }),
         RuleKind::InPorts(ranges) => port_matches(ranges, context.metadata.local_port),
         RuleKind::DstPorts(ranges) => port_matches(ranges, context.destination_port),
         RuleKind::Network(network) => *network == context.network,

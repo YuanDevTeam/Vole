@@ -159,6 +159,8 @@ pub struct RuntimeDns {
 enum DnsEgressKey {
     Single,
     Direct,
+    Reject,
+    RejectDrop,
     Route(RouteTargetId),
 }
 
@@ -884,7 +886,7 @@ impl DnsWireResponse {
         &self.wire
     }
 
-    fn into_wire(self) -> Vec<u8> {
+    pub(crate) fn into_wire(self) -> Vec<u8> {
         self.wire
     }
 
@@ -1522,6 +1524,11 @@ impl RuntimeDns {
         if let Some(physical) = &nameserver.physical {
             return Ok((DnsEgressKey::Direct, physical.clone()));
         }
+        match nameserver.route {
+            DnsRoute::Reject => return Ok((DnsEgressKey::Reject, self.rejection(false))),
+            DnsRoute::RejectDrop => return Ok((DnsEgressKey::RejectDrop, self.rejection(true))),
+            _ => {}
+        }
         let DnsEgress::Routed {
             proxies,
             direct,
@@ -1553,6 +1560,9 @@ impl RuntimeDns {
             )
         };
         match nameserver.route {
+            DnsRoute::Reject | DnsRoute::RejectDrop => {
+                unreachable!("handled before egress selection")
+            }
             DnsRoute::Direct => Ok((DnsEgressKey::Direct, direct.clone())),
             DnsRoute::Route(id) => match inspect(id).map_err(AttemptError::Dispatch)? {
                 InspectedRuleTarget::Egress(leaf) => Ok((DnsEgressKey::Route(id), leaf.dispatcher)),
@@ -1614,13 +1624,28 @@ impl RuntimeDns {
                         RuleAction::Reject => {
                             Err(AttemptError::Dispatch(DispatchError::NotAllowed))
                         }
+                        RuleAction::RejectDrop => {
+                            Ok((DnsEgressKey::RejectDrop, self.rejection(true)))
+                        }
                     },
-                    ProgramEvaluation::NeedsIpResolution(_) => {
+                    ProgramEvaluation::NeedsIpResolution(_)
+                    | ProgramEvaluation::NeedsProcessLookup(_) => {
                         Err(AttemptError::Dispatch(DispatchError::HostUnreachable))
                     }
                 }
             }
         }
+    }
+
+    fn rejection(&self, drop: bool) -> Arc<dyn Dispatcher> {
+        let reject = if drop {
+            crate::outbound::RejectOutbound::with_drop_cancellation(
+                self.tcp_pool.reaper_cancel.child_token(),
+            )
+        } else {
+            crate::outbound::RejectOutbound::default()
+        };
+        Arc::new(crate::outbound::ConnectorDispatcher::new(Arc::new(reject)))
     }
 
     /// Resolves A and AAAA concurrently, retaining IPv4 first and waiting at
@@ -4531,8 +4556,15 @@ dns:
             answers[2]
         );
         assert_eq!(
-            dns.resolve_direct("direct.example").await.unwrap(),
-            [answers[3]]
+            resolution
+                .resolve_direct(
+                    &Destination::domain("direct.example", 443).unwrap(),
+                    TokioInstant::now() + QUERY_TIMEOUT,
+                )
+                .await
+                .unwrap()
+                .addresses,
+            [SocketAddr::new(answers[3], 443)]
         );
         assert_eq!(
             dns.resolve("alias.example").await.unwrap(),

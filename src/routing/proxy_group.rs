@@ -90,6 +90,7 @@ pub(crate) struct ProxyGroups {
     proxies: Box<[Arc<dyn Dispatcher>]>,
     direct: Arc<dyn Dispatcher>,
     reject: Arc<dyn Dispatcher>,
+    reject_drop: Arc<dyn Dispatcher>,
     groups: Box<[SelectProxyGroup]>,
     ids_by_name: HashMap<String, ProxyGroupId>,
 }
@@ -118,11 +119,30 @@ impl ProxyGroups {
         Self::with_selections(configs, proxies, direct, &selections)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_selections(
         configs: &[SelectProxyGroupConfig],
         proxies: Vec<Arc<dyn Dispatcher>>,
         direct: Arc<dyn Dispatcher>,
         selections: &[Arc<GroupSelection>],
+    ) -> Result<Arc<Self>, DispatchError> {
+        Self::with_selections_and_drop(
+            configs,
+            proxies,
+            direct,
+            selections,
+            Arc::new(crate::outbound::ConnectorDispatcher::new(Arc::new(
+                crate::outbound::RejectOutbound::drop_connections(),
+            ))),
+        )
+    }
+
+    pub(crate) fn with_selections_and_drop(
+        configs: &[SelectProxyGroupConfig],
+        proxies: Vec<Arc<dyn Dispatcher>>,
+        direct: Arc<dyn Dispatcher>,
+        selections: &[Arc<GroupSelection>],
+        reject_drop: Arc<dyn Dispatcher>,
     ) -> Result<Arc<Self>, DispatchError> {
         if selections.len() != configs.len() {
             return Err(DispatchError::Other(
@@ -174,6 +194,7 @@ impl ProxyGroups {
             proxies: proxies.into_boxed_slice(),
             direct,
             reject: Arc::new(RejectDispatcher),
+            reject_drop,
             groups: configs
                 .iter()
                 .zip(selections)
@@ -305,7 +326,7 @@ impl ProxyGroups {
                 }
                 ProxyGroupMemberTarget::Route(RouteTargetId::Group(id)) => group_id = id,
                 ProxyGroupMemberTarget::Direct => {
-                    chain.push("DIRECT".into());
+                    chain.push(member.name.clone());
                     chain.reverse();
                     return Ok(ResolvedProxyGroupLeaf {
                         chain,
@@ -322,6 +343,16 @@ impl ProxyGroups {
                         chain,
                         selections,
                         dispatcher: self.reject.clone(),
+                        direct: false,
+                    });
+                }
+                ProxyGroupMemberTarget::RejectDrop => {
+                    chain.push(member.name.clone());
+                    chain.reverse();
+                    return Ok(ResolvedProxyGroupLeaf {
+                        chain,
+                        selections,
+                        dispatcher: self.reject_drop.clone(),
                         direct: false,
                     });
                 }
@@ -385,6 +416,7 @@ impl ProxyGroups {
                 ),
                 ProxyGroupMemberTarget::Direct => (self.direct.clone(), true),
                 ProxyGroupMemberTarget::Reject => (self.reject.clone(), false),
+                ProxyGroupMemberTarget::RejectDrop => (self.reject_drop.clone(), false),
             };
             if udp && (disabled || !dispatcher.supports_udp()) {
                 return Ok(InspectedRuleTarget::Unavailable);
@@ -537,7 +569,9 @@ impl Dispatcher for SelectProxyGroupDispatcher {
                         .is_some_and(|d| d.supports_udp());
                 }
                 ProxyGroupMemberTarget::Route(RouteTargetId::Group(nested)) => id = nested,
-                ProxyGroupMemberTarget::Direct | ProxyGroupMemberTarget::Reject => return true,
+                ProxyGroupMemberTarget::Direct
+                | ProxyGroupMemberTarget::Reject
+                | ProxyGroupMemberTarget::RejectDrop => return true,
                 ProxyGroupMemberTarget::Control(_) => return false,
             }
         }

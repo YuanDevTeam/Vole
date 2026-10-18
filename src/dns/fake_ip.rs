@@ -111,7 +111,10 @@ impl Filter {
                 } else {
                     match crate::routing::matches_rule(rule, &context, geo) {
                         Ok(matched) => matched,
-                        Err(crate::routing::PredicateFailure::NeedsIpResolution) => false,
+                        Err(
+                            crate::routing::PredicateFailure::NeedsIpResolution
+                            | crate::routing::PredicateFailure::NeedsProcessLookup,
+                        ) => false,
                         Err(crate::routing::PredicateFailure::Evaluation(failure)) => {
                             return Err(failure);
                         }

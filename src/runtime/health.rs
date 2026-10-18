@@ -231,7 +231,8 @@ impl HealthRuntime {
     ) -> Result<probe::Observation, ProbeError> {
         let action = match name {
             "DIRECT" | "COMPATIBLE" => crate::config::RuleAction::Direct,
-            "REJECT" | "REJECT-DROP" | "PASS" | "PASS-RULE" => crate::config::RuleAction::Reject,
+            "REJECT" | "PASS" | "PASS-RULE" => crate::config::RuleAction::Reject,
+            "REJECT-DROP" => crate::config::RuleAction::RejectDrop,
             _ => {
                 crate::config::RuleAction::Route(*self.names.get(name).ok_or(ProbeError::NotFound)?)
             }

@@ -37,19 +37,36 @@ pub(crate) struct ConnectionMetadata {
     pub host: Arc<str>,
     pub dns_mode: &'static str,
     pub sniff_host: Arc<str>,
+    pub(crate) process: crate::process::Identity,
+    // Retains immutable original facts for current-flow consumers; no config.
+    pub(crate) original: Option<Arc<crate::session::InboundSnapshot>>,
 }
 impl Serialize for ConnectionMetadata {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("ConnectionMetadata", 9)?;
+        let mut state = serializer.serialize_struct("ConnectionMetadata", 12)?;
         state.serialize_field("network", self.network)?;
         state.serialize_field("type", self.inbound_type)?;
         state.serialize_field("sourceIP", &self.source.ip())?;
         state.serialize_field("sourcePort", &Port(self.source.port()))?;
-        state.serialize_field("destinationIP", &self.destination_ip)?;
+        let destination_ip = self.destination_ip.or_else(|| {
+            self.original
+                .as_ref()
+                .and_then(|origin| match &origin.destination {
+                    crate::session::Destination::Ip(address) => Some(address.ip()),
+                    _ => None,
+                })
+        });
+        state.serialize_field("destinationIP", &destination_ip)?;
         state.serialize_field("destinationPort", &Port(self.destination_port))?;
         state.serialize_field("host", self.host.as_ref())?;
         state.serialize_field("dnsMode", self.dns_mode)?;
         state.serialize_field("sniffHost", self.sniff_host.as_ref())?;
+        state.serialize_field("uid", &self.process.uid.unwrap_or(0))?;
+        state.serialize_field("process", self.process.name.as_deref().unwrap_or_default())?;
+        state.serialize_field(
+            "processPath",
+            self.process.path.as_deref().unwrap_or_default(),
+        )?;
         state.end()
     }
 }
@@ -445,6 +462,8 @@ mod tests {
                 host: "example.com".into(),
                 dns_mode: "normal",
                 sniff_host: "".into(),
+                process: Default::default(),
+                original: None,
             },
             chains: vec!["edge".into(), "auto".into()],
             provider_chains: vec!["nodes".into()],

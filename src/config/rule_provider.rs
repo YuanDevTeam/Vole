@@ -258,7 +258,10 @@ impl RuleCollection {
                 }
                 match crate::routing::matches_rule(rule, context, geo) {
                     Ok(true) => return Ok(true),
-                    Ok(false) | Err(PredicateFailure::NeedsIpResolution) => {}
+                    Ok(false)
+                    | Err(
+                        PredicateFailure::NeedsIpResolution | PredicateFailure::NeedsProcessLookup,
+                    ) => {}
                     Err(PredicateFailure::Evaluation(failure)) => return Err(failure),
                 }
             }
@@ -266,7 +269,9 @@ impl RuleCollection {
         } else {
             match self.matches(context, geo, true, false) {
                 Ok(matched) => Ok(matched),
-                Err(PredicateFailure::NeedsIpResolution) => Ok(false),
+                Err(PredicateFailure::NeedsIpResolution | PredicateFailure::NeedsProcessLookup) => {
+                    Ok(false)
+                }
                 Err(PredicateFailure::Evaluation(failure)) => Err(failure),
             }
         }
@@ -664,6 +669,7 @@ mod tests {
             &InboundMetadata {
                 local_port: 1080,
                 user: Some("Alice".into()),
+                ..Default::default()
             },
         );
         let before = context.clone();

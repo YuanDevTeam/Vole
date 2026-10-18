@@ -302,69 +302,71 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
             no_resolve: false,
         });
     }
-    let (payload, action, no_resolve, source) =
-        if matches!(kind.as_str(), "AND" | "OR" | "NOT" | "DOMAIN-REGEX") {
-            match targets {
-                Some(targets) => {
-                    let (payload, action) = rest
-                        .rsplit_once(',')
-                        .ok_or_else(|| VoleError::InvalidConfig("rule requires a target".into()))?;
-                    (
-                        trim_ascii_whitespace(payload),
-                        parse_rule_action(trim_ascii_whitespace(action), targets)?,
-                        false,
-                        false,
-                    )
-                }
-                None => (
-                    trim_ascii_whitespace(rest),
-                    RuleAction::Direct,
+    let (payload, action, no_resolve, source) = if matches!(
+        kind.as_str(),
+        "AND" | "OR" | "NOT" | "DOMAIN-REGEX" | "PROCESS-NAME-REGEX" | "PROCESS-PATH-REGEX"
+    ) {
+        match targets {
+            Some(targets) => {
+                let (payload, action) = rest
+                    .rsplit_once(',')
+                    .ok_or_else(|| VoleError::InvalidConfig("rule requires a target".into()))?;
+                (
+                    trim_ascii_whitespace(payload),
+                    parse_rule_action(trim_ascii_whitespace(action), targets)?,
                     false,
                     false,
-                ),
+                )
             }
-        } else {
-            let mut fields = rest.split(',').map(trim_ascii_whitespace);
-            let payload = fields.next().unwrap_or_default();
-            let action = match targets {
-                Some(targets) => parse_rule_action(fields.next().unwrap_or_default(), targets)?,
-                None => RuleAction::Direct,
-            };
-            let mut no_resolve = false;
-            let mut source = matches!(
-                kind.as_str(),
-                "SRC-GEOIP" | "SRC-IP-CIDR" | "SRC-IP-ASN" | "SRC-IP-SUFFIX"
-            );
-            for option in fields {
-                if option == "no-resolve"
-                    && matches!(
-                        kind.as_str(),
-                        "RULE-SET"
-                            | "GEOIP"
-                            | "SRC-GEOIP"
-                            | "IP-CIDR"
-                            | "IP-CIDR6"
-                            | "SRC-IP-CIDR"
-                            | "IP-ASN"
-                            | "SRC-IP-ASN"
-                            | "IP-SUFFIX"
-                            | "SRC-IP-SUFFIX"
-                    )
-                {
-                    no_resolve = true;
-                } else if option == "src"
-                    && matches!(
-                        kind.as_str(),
-                        "RULE-SET" | "GEOIP" | "IP-CIDR" | "IP-CIDR6" | "IP-ASN" | "IP-SUFFIX"
-                    )
-                {
-                    source = true;
-                } else {
-                    return invalid("unsupported rule parameter");
-                }
-            }
-            (payload, action, no_resolve || source, source)
+            None => (
+                trim_ascii_whitespace(rest),
+                RuleAction::Direct,
+                false,
+                false,
+            ),
+        }
+    } else {
+        let mut fields = rest.split(',').map(trim_ascii_whitespace);
+        let payload = fields.next().unwrap_or_default();
+        let action = match targets {
+            Some(targets) => parse_rule_action(fields.next().unwrap_or_default(), targets)?,
+            None => RuleAction::Direct,
         };
+        let mut no_resolve = false;
+        let mut source = matches!(
+            kind.as_str(),
+            "SRC-GEOIP" | "SRC-IP-CIDR" | "SRC-IP-ASN" | "SRC-IP-SUFFIX"
+        );
+        for option in fields {
+            if option == "no-resolve"
+                && matches!(
+                    kind.as_str(),
+                    "RULE-SET"
+                        | "GEOIP"
+                        | "SRC-GEOIP"
+                        | "IP-CIDR"
+                        | "IP-CIDR6"
+                        | "SRC-IP-CIDR"
+                        | "IP-ASN"
+                        | "SRC-IP-ASN"
+                        | "IP-SUFFIX"
+                        | "SRC-IP-SUFFIX"
+                )
+            {
+                no_resolve = true;
+            } else if option == "src"
+                && matches!(
+                    kind.as_str(),
+                    "RULE-SET" | "GEOIP" | "IP-CIDR" | "IP-CIDR6" | "IP-ASN" | "IP-SUFFIX"
+                )
+            {
+                source = true;
+            } else {
+                return invalid("unsupported rule parameter");
+            }
+        }
+        (payload, action, no_resolve || source, source)
+    };
     let rule_kind = match kind.as_str() {
         "RULE-SET" => RuleKind::RuleSet {
             name: payload.to_owned(),
@@ -413,6 +415,13 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
         "NETWORK" => RuleKind::Network(parse_network(payload)?),
         "IN-TYPE" => RuleKind::InTypes(parse_in_types(payload)?),
         "IN-USER" => RuleKind::InUsers(parse_in_users(payload)?),
+        "PROCESS-NAME"
+        | "PROCESS-PATH"
+        | "PROCESS-NAME-WILDCARD"
+        | "PROCESS-PATH-WILDCARD"
+        | "PROCESS-NAME-REGEX"
+        | "PROCESS-PATH-REGEX" => RuleKind::Process(ProcessRule::parse(&kind, payload)?),
+        "UID" => RuleKind::Uid(super::process::uid_ranges(payload)?),
         "IN-PORT" => RuleKind::InPorts(parse_port_ranges(payload)?),
         "AND" | "OR" | "NOT" => {
             let children = logical_children(payload)?

@@ -49,6 +49,7 @@ impl RuleCursor {
 pub(crate) enum ProgramEvaluation {
     Matched(RuleMatch),
     NeedsIpResolution(RuleCursor),
+    NeedsProcessLookup(RuleCursor),
     Failed(crate::config::MatchFailure),
 }
 
@@ -58,6 +59,9 @@ impl ProgramEvaluation {
             Self::Failed(failure) => RuleEvaluation::Failed(failure),
             Self::Matched(matched) => RuleEvaluation::Matched(matched),
             Self::NeedsIpResolution(cursor) => RuleEvaluation::NeedsIpResolution {
+                rule_index: cursor.root_index(),
+            },
+            Self::NeedsProcessLookup(cursor) => RuleEvaluation::NeedsProcessLookup {
                 rule_index: cursor.root_index(),
             },
         }
@@ -123,6 +127,9 @@ impl RuleSet {
                             break;
                         }
                         Ok(false) | Err(super::PredicateFailure::NeedsIpResolution) => {}
+                        Err(super::PredicateFailure::NeedsProcessLookup) => {
+                            return ProgramEvaluation::NeedsProcessLookup(cursor);
+                        }
                         Err(super::PredicateFailure::Evaluation(failure)) => {
                             return ProgramEvaluation::Failed(failure);
                         }
@@ -142,6 +149,9 @@ impl RuleSet {
                     Ok(matched) => matched,
                     Err(super::PredicateFailure::NeedsIpResolution) => {
                         return ProgramEvaluation::NeedsIpResolution(cursor);
+                    }
+                    Err(super::PredicateFailure::NeedsProcessLookup) => {
+                        return ProgramEvaluation::NeedsProcessLookup(cursor);
                     }
                     Err(super::PredicateFailure::Evaluation(failure)) => {
                         return ProgramEvaluation::Failed(failure);
@@ -231,6 +241,136 @@ mod tests {
             &Destination::domain("example.com", 443).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn process_cursor_is_lazy_once_and_keeps_dns_and_subrule_progress() {
+        let rules = compile(
+            "rules: ['SUB-RULE,(NETWORK,TCP),child', 'MATCH,REJECT']\nsub-rules: {child: ['DOMAIN,never.invalid,DIRECT', 'AND,((PROCESS-NAME,APP),(IP-CIDR,192.0.2.0/24)),DIRECT']}\n",
+        );
+        let mut context = context();
+        context.enable_process_lookup(true);
+        let cursor =
+            match rules.evaluate_program(&mut context, &EmptyGeoMatcher, None, None, |_, _| {
+                RuleTargetEffect::Accept
+            }) {
+                ProgramEvaluation::NeedsProcessLookup(cursor) => cursor,
+                _ => panic!("strict must pause at the actual identity predicate"),
+            };
+        context.set_process(crate::process::Identity {
+            name: Some("app".into()),
+            ..Default::default()
+        });
+        let cursor = match rules.evaluate_program(
+            &mut context,
+            &EmptyGeoMatcher,
+            Some(cursor),
+            None,
+            |_, _| RuleTargetEffect::Accept,
+        ) {
+            ProgramEvaluation::NeedsIpResolution(cursor) => cursor,
+            _ => panic!("identity continuation must preserve the child DNS position"),
+        };
+        let addresses = ["192.0.2.7".parse().unwrap()];
+        assert!(matches!(
+            rules.evaluate_program(
+                &mut context,
+                &EmptyGeoMatcher,
+                Some(cursor),
+                Some(&addresses),
+                |_, _| RuleTargetEffect::Accept
+            ),
+            ProgramEvaluation::Matched(RuleMatch {
+                action: RuleAction::Direct,
+                rule_index: 0
+            })
+        ));
+        assert_eq!(context.pinned_ip(), Some(addresses[0]));
+
+        for yaml in [
+            "rules: ['MATCH,DIRECT', 'PROCESS-NAME,app,REJECT']\n",
+            "rules: ['AND,((DOMAIN,never.invalid),(PROCESS-NAME,app)),REJECT', 'MATCH,DIRECT']\n",
+            "rules: ['MATCH,DIRECT']\n",
+        ] {
+            let mut context = self::context();
+            context.enable_process_lookup(true);
+            assert!(matches!(
+                compile(yaml).evaluate_program(
+                    &mut context,
+                    &EmptyGeoMatcher,
+                    None,
+                    None,
+                    |_, _| RuleTargetEffect::Accept
+                ),
+                ProgramEvaluation::Matched(RuleMatch {
+                    action: RuleAction::Direct,
+                    ..
+                })
+            ));
+            assert!(context.process().is_none());
+        }
+        let mut context = self::context();
+        let rules = compile("rules: ['PROCESS-NAME-REGEX,.*,REJECT', 'MATCH,DIRECT']\n");
+        // off and inaccessible identity never match an empty-string regex.
+        assert!(matches!(
+            rules.evaluate(&context),
+            RuleEvaluation::Matched(RuleMatch {
+                action: RuleAction::Direct,
+                ..
+            })
+        ));
+        context.enable_process_lookup(true);
+        context.set_process(Default::default());
+        assert!(matches!(
+            rules.evaluate(&context),
+            RuleEvaluation::Matched(RuleMatch {
+                action: RuleAction::Direct,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn classical_process_provider_resumes_without_selector_side_effects() {
+        let rules = compile(
+            "rule-providers: {identity: {type: inline, behavior: classical, payload: ['PROCESS-PATH-REGEX,^/路径/.*$']}}\nrules: ['RULE-SET,identity,DIRECT','MATCH,REJECT']\n",
+        );
+        let mut context = context();
+        context.enable_process_lookup(true);
+        let cursor =
+            match rules.evaluate_program(&mut context, &EmptyGeoMatcher, None, None, |_, _| {
+                RuleTargetEffect::Accept
+            }) {
+                ProgramEvaluation::NeedsProcessLookup(cursor) => cursor,
+                _ => panic!("provider must pause"),
+            };
+        context.set_process(crate::process::Identity {
+            path: Some("/路径/程序".into()),
+            ..Default::default()
+        });
+        assert!(matches!(
+            rules.evaluate_program(
+                &mut context,
+                &EmptyGeoMatcher,
+                Some(cursor),
+                None,
+                |_, _| RuleTargetEffect::Accept
+            ),
+            ProgramEvaluation::Matched(RuleMatch {
+                action: RuleAction::Direct,
+                ..
+            })
+        ));
+        let crate::config::RuleKind::RuleSet {
+            content: Some(set), ..
+        } = &rules.graph.main[0].kind
+        else {
+            panic!("bound provider")
+        };
+        assert!(
+            !set.matches_domain("example.com", &EmptyGeoMatcher, &Default::default())
+                .unwrap()
+        );
     }
 
     #[test]

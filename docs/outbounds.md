@@ -19,15 +19,15 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   上游组选择 DIRECT 时使用当前节点策略。XHTTP 两腿、多端点刷新、跳端口和新 QUIC
   socket 沿用其所属路径的策略与选择快照；已建立连接不迁移。DNS、Provider、GeoData
   和健康检查继续使用当前运行图的受控出口，不建立额外裸 socket。
-- `dialer-proxy` 省略/空串使用物理 Dialer，也可指定 DIRECT 或引用节点、策略组；与业务路由共享选择，完整 DAG 在配置期验证。
+- `dialer-proxy` 省略/空串使用物理 Dialer，也可指定 DIRECT、COMPATIBLE 或引用节点、策略组；与业务路由共享选择，完整 DAG 在配置期验证。
   一次建链使用组快照和同一绝对期限；已有连接不随切组迁移，无自动 failover 或 DIRECT 回落。
-- 节点 `ip-version` 为 `dual`（默认）、`ipv4`、`ipv6`、`ipv4-prefer` 或 `ipv6-prefer`。
+- 普通协议节点和具名 direct 的 `ip-version` 为 `dual`（默认）、`ipv4`、`ipv6`、`ipv4-prefer` 或 `ipv6-prefer`。
   限制或排序该节点的物理服务器地址与本地解析结果，仍受全局 IPv6 开关约束。
   不要求远端代理按相同地址族解析业务域名。
 - gRPC/legacy H2 首次读取延迟响应头时先检查原建链期限，即使响应已就绪也不能绕过
   超时；响应头已确认后的业务读取不再受该期限限制。
 - HTTP、SOCKS5、TUN、DNS 选路及 node-only `measureDelay` 使用同一连接器。
-  底层业务 UDP 默认为 false；收发预算分别逐层扣封装开销，超限不截断交付。
+  普通协议节点的业务 UDP 默认为 false；收发预算分别逐层扣封装开销，超限不截断交付。
 - 所有普通节点都可启用公共 `smux` 包装，使用节点自己的正常 TCP 传输与独立 mux 池，
   业务路由、`dialer-proxy`、provider 代际与测速都使用最终包装器。
   `only-tcp: false` 提供 mux UDP，包括底层 `udp: false` 或仅支持 TCP 的节点；
@@ -46,6 +46,26 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
 VMess + TLS、Trojan、AnyTLS、TrustTunnel、VLESS 和 Hysteria2 支持 `ech-opts.enable/config/query-server-name`，
 静态优先和动态节点 DNS 来源、后端算法及失败边界见 [ECH](vless.md#ech)。
 TUIC 的固定参考未消费 ECH，因此不接受该字段。
+
+## 功能出站
+
+具名 `direct`、`dns`、`reject` 只需 `name/type`，没有代理服务器端点，均提供 UDP。
+`direct` 另接受 `ip-version/interface-name/routing-mark`，通过共享 Dialer 直连业务目标，
+域名使用当前会话的 `direct-nameserver` 角色，并保留其取消和地址族策略。
+`dns/reject` 不接受未被其实际消费的节点出口参数。
+
+`type: dns` 将普通规则选中的 TCP/UDP DNS 查询交给当前会话的共享解析器；目标端口不限于 53，
+不新增 DNS 监听端口或解析引擎。TCP 与 TUN DNS 接管共用有界的长度帧处理，支持连续查询及半关闭；
+UDP 保留原目标作为响应源，每个关联只保留一个活动查询、一个待处理请求和一个待交付响应，
+队列已满时丢弃新请求。查询及响应上限为 4096 字节，响应还受入口实际 UDP 预算限制。
+丢弃会话取消其任务，停止节点关闭准入并等待所有工作退出。独立测量没有运行会话解析器时，
+不能使用具名 DNS 出站。
+
+具名 `reject` 立即结束 TCP，丢弃 UDP 并立即结束其接收路径；没有 `action` 字段。
+内置 `REJECT` 保持建链拒绝及 UDP 逐包丢弃。
+内置 `REJECT-DROP` 的 TCP 读写等待同一个 60 秒期限，不发往远端、不另留请求副本，
+Stop 立即取消等待；UDP 逐包丢弃，沿用关联的正常空闲清理，不套用 TCP 延迟。
+`COMPATIBLE` 在规则、代理组、DNS 上游选择和 `dialer-proxy` 中使用直连语义。
 
 ## HTTP / HTTPS CONNECT
 

@@ -44,7 +44,14 @@ impl std::fmt::Debug for ResolutionContext {
 #[derive(Clone)]
 struct ActiveResolution {
     deadline: Instant,
-    names: Vec<(usize, bool, u16, String)>,
+    names: Vec<(usize, ResolveRole, u16, String)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResolveRole {
+    Business,
+    Proxy,
+    Direct,
 }
 
 tokio::task_local! {
@@ -129,7 +136,12 @@ impl ResolutionContext {
             }
             .ok_or_else(|| io::Error::other("ECH DNS source unavailable"))?;
             let deadline = inherited_deadline(deadline);
-            let key = (Arc::as_ptr(state) as usize, true, 65, name.clone());
+            let key = (
+                Arc::as_ptr(state) as usize,
+                ResolveRole::Proxy,
+                65,
+                name.clone(),
+            );
             let mut active = ACTIVE.try_with(Clone::clone).unwrap_or(ActiveResolution {
                 deadline,
                 names: Vec::new(),
@@ -188,7 +200,7 @@ impl ResolutionContext {
         target: &Destination,
         deadline: Instant,
     ) -> Result<SocketAddr, DispatchError> {
-        self.resolve_addresses(target, deadline, false)
+        self.resolve_addresses(target, deadline, ResolveRole::Business)
             .await?
             .into_iter()
             .next()
@@ -205,7 +217,7 @@ impl ResolutionContext {
         ipv4: bool,
         ipv6: bool,
     ) -> Result<SocketAddr, DispatchError> {
-        self.resolve_addresses(target, deadline, false)
+        self.resolve_addresses(target, deadline, ResolveRole::Business)
             .await?
             .into_iter()
             .find(|address| if address.is_ipv4() { ipv4 } else { ipv6 })
@@ -226,7 +238,7 @@ impl ResolutionContext {
         ipv4: bool,
         ipv6: bool,
     ) -> Result<SocketAddr, DispatchError> {
-        self.resolve_addresses_via(target, deadline, false, Some(dns))
+        self.resolve_addresses_via(target, deadline, ResolveRole::Business, Some(dns))
             .await?
             .into_iter()
             .find(|address| if address.is_ipv4() { ipv4 } else { ipv6 })
@@ -238,24 +250,44 @@ impl ResolutionContext {
         target: &Destination,
         deadline: Instant,
     ) -> Result<crate::dialer::ResolvedEndpoint, DispatchError> {
-        let addresses = self.resolve_addresses(target, deadline, true).await?;
-        Ok(crate::dialer::ResolvedEndpoint {
+        let addresses = self
+            .resolve_addresses(target, deadline, ResolveRole::Proxy)
+            .await?;
+        Ok(Self::endpoint(target, addresses))
+    }
+
+    pub(crate) async fn resolve_direct(
+        &self,
+        target: &Destination,
+        deadline: Instant,
+    ) -> Result<crate::dialer::ResolvedEndpoint, DispatchError> {
+        let addresses = self
+            .resolve_addresses(target, deadline, ResolveRole::Direct)
+            .await?;
+        Ok(Self::endpoint(target, addresses))
+    }
+
+    fn endpoint(
+        target: &Destination,
+        addresses: Vec<SocketAddr>,
+    ) -> crate::dialer::ResolvedEndpoint {
+        crate::dialer::ResolvedEndpoint {
             logical_host: match target {
                 Destination::Domain { host, .. } => host.clone(),
                 Destination::Ip(address) => address.ip().to_string(),
             },
             port: target.port(),
             addresses,
-        })
+        }
     }
 
     async fn resolve_addresses(
         &self,
         target: &Destination,
         deadline: Instant,
-        proxy: bool,
+        role: ResolveRole,
     ) -> Result<Vec<SocketAddr>, DispatchError> {
-        self.resolve_addresses_via(target, deadline, proxy, None)
+        self.resolve_addresses_via(target, deadline, role, None)
             .await
     }
 
@@ -263,7 +295,7 @@ impl ResolutionContext {
         &'a self,
         target: &'a Destination,
         deadline: Instant,
-        proxy: bool,
+        role: ResolveRole,
         node_dns: Option<&'a RuntimeDns>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<SocketAddr>, DispatchError>> + Send + 'a>,
@@ -304,7 +336,7 @@ impl ResolutionContext {
                 || Arc::as_ptr(inner.unwrap()) as usize,
                 |dns| dns as *const RuntimeDns as usize,
             );
-            let key = (identity, proxy, 0, host.clone());
+            let key = (identity, role, 0, host.clone());
             let mut active = ACTIVE.try_with(Clone::clone).unwrap_or(ActiveResolution {
                 deadline,
                 names: Vec::new(),
@@ -341,10 +373,10 @@ impl ResolutionContext {
                                 .as_ref()
                                 .and_then(Weak::upgrade)
                                 .ok_or_else(unavailable)?;
-                            if proxy {
-                                dns.resolve_proxy(&host).await
-                            } else {
-                                dns.resolve(&host).await
+                            match role {
+                                ResolveRole::Business => dns.resolve(&host).await,
+                                ResolveRole::Proxy => dns.resolve_proxy(&host).await,
+                                ResolveRole::Direct => dns.resolve_direct(&host).await,
                             }
                             .map_err(runtime_error)?
                             .into_iter()

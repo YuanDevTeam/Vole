@@ -121,6 +121,24 @@ pub enum InboundKind {
 pub struct InboundMetadata {
     pub local_port: u16,
     pub user: Option<Arc<str>>,
+    /// Actual accepted socket address, distinct from its proxy request target.
+    pub local_address: Option<SocketAddr>,
+    pub(crate) original: Option<Arc<InboundSnapshot>>,
+}
+/// Immutable ingress facts, captured before sniffing/routing/upstream rewrites.
+/// It owns only small values, never a runtime/configuration generation.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct InboundSnapshot {
+    pub source: SocketAddr,
+    pub destination: Destination,
+    pub socket_destination: Option<SocketAddr>,
+    pub inbound: InboundKind,
+    pub user: Option<Arc<str>>,
+}
+impl fmt::Debug for InboundSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("InboundSnapshot { .. }")
+    }
 }
 impl fmt::Debug for InboundMetadata {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -136,6 +154,39 @@ impl InboundMetadata {
         Self {
             local_port,
             user: None,
+            local_address: None,
+            original: None,
+        }
+    }
+    pub(crate) fn snapshot(
+        &self,
+        source: SocketAddr,
+        inbound: InboundKind,
+        destination: &Destination,
+    ) -> Arc<InboundSnapshot> {
+        self.original
+            .clone()
+            .unwrap_or_else(|| Arc::new(self.facts(source, inbound, destination)))
+    }
+    pub(crate) fn facts(
+        &self,
+        source: SocketAddr,
+        inbound: InboundKind,
+        destination: &Destination,
+    ) -> InboundSnapshot {
+        InboundSnapshot {
+            source,
+            destination: destination.clone(),
+            inbound,
+            user: self.user.clone(),
+            socket_destination: if inbound == InboundKind::Tun {
+                match destination {
+                    Destination::Ip(address) => Some(*address),
+                    _ => None,
+                }
+            } else {
+                self.local_address
+            },
         }
     }
 }
@@ -151,6 +202,17 @@ pub struct StreamSession {
     /// This is routing-only metadata. Outbounds must continue to use
     /// `destination`, which preserves the original TUN IP target.
     pub sniffed_domain: Option<String>,
+}
+impl StreamSession {
+    pub(crate) fn capture_original(&mut self) {
+        if self.metadata.original.is_none() {
+            self.metadata.original = Some(self.metadata.snapshot(
+                self.source,
+                self.inbound,
+                &self.destination,
+            ));
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

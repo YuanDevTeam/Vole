@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
@@ -11,20 +10,12 @@ use std::{
 
 use async_trait::async_trait;
 use futures_util::future::select_all;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, DuplexStream, ReadBuf},
-    sync::Notify,
-    task::JoinHandle,
-    time::Instant,
-};
+use tokio::{sync::Notify, time::Instant};
 
 use crate::{
     config::{Network, ProxyId, RouteTargetId, RuleAction, TunConfig},
     dispatch::{BoxStream, DatagramTransport, DispatchError, Dispatcher},
-    dns::{
-        MAX_MESSAGE_SIZE,
-        runtime::{DnsWireResponse, RuntimeDns},
-    },
+    dns::runtime::{DnsWireResponse, RuntimeDns},
     session::{Datagram, DatagramSession, Destination, InboundKind, StreamSession},
 };
 
@@ -34,8 +25,6 @@ use super::{
     datagram_ready::{ReadyFlow, ReadyQueue},
     proxy_group::InspectedRuleTarget,
 };
-
-const TCP_DNS_DUPLEX_CAPACITY: usize = 8 * 1024;
 
 const UDP_FLOW_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -261,6 +250,7 @@ pub(crate) type RouteTargetDispatchers = ProxyDispatchers;
 pub struct RoutingDispatcher {
     route_targets: ProxyDispatchers,
     direct: Arc<dyn Dispatcher>,
+    reject_drop: Arc<dyn Dispatcher>,
     dns: Option<Arc<dyn RoutingDns>>,
     ipv6: bool,
     rules: Arc<RuleSet>,
@@ -269,9 +259,24 @@ pub struct RoutingDispatcher {
     sniffer: Option<Arc<crate::sniffing::Policy>>,
     tcp_concurrent: bool,
     diagnostics: Option<Arc<crate::routing::diagnostics::Diagnostics>>,
+    process_mode: crate::config::FindProcessMode,
+    process_dialer: Option<crate::dialer::Dialer>,
 }
 
 impl RoutingDispatcher {
+    pub(crate) fn with_process_lookup(
+        mut self,
+        mode: crate::config::FindProcessMode,
+        dialer: crate::dialer::Dialer,
+    ) -> Self {
+        self.process_mode = mode;
+        self.process_dialer = Some(dialer);
+        self
+    }
+    pub(crate) fn with_reject_drop(mut self, dispatcher: Arc<dyn Dispatcher>) -> Self {
+        self.reject_drop = dispatcher;
+        self
+    }
     pub(crate) fn with_diagnostics(
         mut self,
         diagnostics: Arc<crate::routing::diagnostics::Diagnostics>,
@@ -312,6 +317,7 @@ impl RoutingDispatcher {
         Self {
             route_targets,
             direct,
+            reject_drop: default_reject_drop(),
             dns: dns.map(|dns| dns as Arc<dyn RoutingDns>),
             ipv6,
             rules: Arc::new(rules),
@@ -320,6 +326,8 @@ impl RoutingDispatcher {
             sniffer: None,
             tcp_concurrent: false,
             diagnostics: None,
+            process_mode: crate::config::FindProcessMode::Strict,
+            process_dialer: None,
         }
     }
 
@@ -336,6 +344,7 @@ impl RoutingDispatcher {
             route_targets: ProxyDispatchers::new(vec![proxy])
                 .expect("test proxy registry contains one entry"),
             direct,
+            reject_drop: default_reject_drop(),
             dns,
             ipv6,
             rules: Arc::new(rules),
@@ -343,6 +352,8 @@ impl RoutingDispatcher {
             sniffer: None,
             tcp_concurrent: false,
             diagnostics: None,
+            process_mode: crate::config::FindProcessMode::Strict,
+            process_dialer: None,
             tun_config: TunConfig {
                 udp_timeout: Duration::from_secs(30),
                 ..TunConfig::default()
@@ -391,6 +402,9 @@ impl RoutingDispatcher {
         >,
     ) -> Result<RouteDecision, DispatchError> {
         let (inbound, inbound_metadata) = inbound;
+        let unsaved = (business(inbound) && inbound_metadata.original.is_none())
+            .then(|| inbound_metadata.facts(source, inbound, destination));
+        let original = inbound_metadata.original.as_deref().or(unsaved.as_ref());
         self.ensure_destination_allowed(destination)?;
         let recovered = if matches!(
             inbound,
@@ -450,6 +464,14 @@ impl RoutingDispatcher {
 
         context.set_source(source);
         context.set_inbound(inbound, inbound_metadata);
+        context.enable_process_lookup(
+            business(inbound)
+                && self.process_mode != crate::config::FindProcessMode::Off
+                && self.process_dialer.is_some(),
+        );
+        if business(inbound) && self.process_mode == crate::config::FindProcessMode::Always {
+            self.lookup_process(&mut context, network, original).await?;
+        }
 
         // All GeoData rules in this decision see the same immutable view.
         let snapshot = self.geo_matcher.routing_snapshot();
@@ -507,12 +529,20 @@ impl RoutingDispatcher {
                 }
             }
         };
-        let evaluation =
-            match self
-                .rules
-                .evaluate_program(&mut context, geo_matcher, None, None, &mut select)
-            {
-                ProgramEvaluation::NeedsIpResolution(cursor) => {
+        let mut cursor = None;
+        let evaluation = loop {
+            match self.rules.evaluate_program(
+                &mut context,
+                geo_matcher,
+                cursor.take(),
+                resolved.as_deref(),
+                &mut select,
+            ) {
+                ProgramEvaluation::NeedsProcessLookup(next) => {
+                    self.lookup_process(&mut context, network, original).await?;
+                    cursor = Some(next);
+                }
+                ProgramEvaluation::NeedsIpResolution(next) => {
                     let addresses = match (destination, &self.dns) {
                         (Destination::Domain { host, .. }, Some(dns)) => {
                             context
@@ -523,16 +553,13 @@ impl RoutingDispatcher {
                         _ => Vec::new(),
                     };
                     resolved = Some(addresses);
-                    self.rules.evaluate_program(
-                        &mut context,
-                        geo_matcher,
-                        Some(cursor),
-                        resolved.as_deref(),
-                        &mut select,
-                    )
+                    // Resume the exact predicate, including nested sub-rules.
+                    // A process pause may follow DNS (or precede it) once.
+                    cursor = Some(next);
                 }
-                evaluation => evaluation,
-            };
+                evaluation => break evaluation,
+            }
+        };
         if let Some(error) = selection_error {
             return Err(error);
         }
@@ -562,6 +589,12 @@ impl RoutingDispatcher {
             Destination::Ip(_) => destination.clone(),
         };
         let mut decision = RouteDecision {
+            original: inbound_metadata.original.clone().or_else(|| {
+                self.diagnostics
+                    .as_ref()
+                    .and_then(|_| original.cloned().map(Arc::new))
+            }),
+            process: context.process().cloned().unwrap_or_default(),
             rule_index: rule_match.rule_index,
             dns_mode: if recovered.is_some() {
                 "fake-ip"
@@ -588,6 +621,27 @@ impl RoutingDispatcher {
             self.resolve_direct_destination(&mut decision).await?;
         }
         Ok(decision)
+    }
+    async fn lookup_process(
+        &self,
+        context: &mut RoutingContext,
+        network: Network,
+        original: Option<&crate::session::InboundSnapshot>,
+    ) -> Result<(), DispatchError> {
+        let query =
+            original.and_then(|origin| crate::process::Query::from_snapshot(network, origin));
+        let identity = match (query, &self.process_dialer) {
+            (Some(query), Some(dialer)) => dialer
+                .process_identity(query)
+                .await
+                .map_err(|_| DispatchError::NotAllowed)?,
+            _ => Default::default(),
+        };
+        context.set_process(identity);
+        context
+            .decision()
+            .check()
+            .map_err(DispatchError::RuleEvaluation)
     }
 
     async fn resolve_direct_destination(
@@ -621,88 +675,36 @@ impl RoutingDispatcher {
     }
 
     fn dns_tcp_stream(&self, dns: Arc<dyn RoutingDns>) -> BoxStream {
-        let (client, mut server) = tokio::io::duplex(TCP_DNS_DUPLEX_CAPACITY);
-        let relay = crate::resources::observation::spawn(async move {
-            let mut query = vec![0_u8; MAX_MESSAGE_SIZE];
-            let mut length = [0_u8; 2];
-            loop {
-                if server.read_exact(&mut length).await.is_err() {
-                    break;
-                }
-                let length = usize::from(u16::from_be_bytes(length));
-                if length == 0 || length > MAX_MESSAGE_SIZE {
-                    break;
-                }
-                if server.read_exact(&mut query[..length]).await.is_err() {
-                    break;
-                }
-                let Ok(response) = dns.exchange(&query[..length]).await else {
-                    break;
-                };
-                if response.wire().is_empty() || response.wire().len() > MAX_MESSAGE_SIZE {
-                    break;
-                }
-                let Ok(response_len) = u16::try_from(response.wire().len()) else {
-                    break;
-                };
-                if server.write_all(&response_len.to_be_bytes()).await.is_err()
-                    || server.write_all(response.wire()).await.is_err()
-                {
-                    break;
-                }
-            }
-            let _ = server.shutdown().await;
-        });
-        Box::new(DnsTcpStream {
-            inner: client,
-            relay,
-        })
+        crate::outbound::dns_tcp_stream(
+            Arc::new(RoutingDnsExchange(Arc::downgrade(&dns))),
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
     }
 }
 
-/// Couples the local TCP DNS relay task to the stream returned to the inbound.
-/// Dropping a cancelled TUN session aborts an in-flight upstream query instead
-/// of leaving it detached in the runtime until its nameserver timeout expires.
-struct DnsTcpStream {
-    inner: DuplexStream,
-    relay: JoinHandle<()>,
+fn default_reject_drop() -> Arc<dyn Dispatcher> {
+    Arc::new(crate::outbound::ConnectorDispatcher::new(Arc::new(
+        crate::outbound::RejectOutbound::drop_connections(),
+    )))
 }
 
-impl AsyncRead for DnsTcpStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(context, buffer)
-    }
-}
+struct RoutingDnsExchange(std::sync::Weak<dyn RoutingDns>);
 
-impl AsyncWrite for DnsTcpStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(context, buffer)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(context)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(context)
-    }
-}
-
-impl Drop for DnsTcpStream {
-    fn drop(&mut self) {
-        self.relay.abort();
+#[async_trait]
+impl crate::outbound::DnsExchange for RoutingDnsExchange {
+    async fn exchange(&self, query: &[u8]) -> Result<DnsWireResponse, DispatchError> {
+        self.0
+            .upgrade()
+            .ok_or(DispatchError::HostUnreachable)?
+            .exchange(query)
+            .await
     }
 }
 
 struct RouteDecision {
+    original: Option<Arc<crate::session::InboundSnapshot>>,
+    process: crate::process::Identity,
     rule_index: usize,
     dns_mode: &'static str,
     metadata: Destination,
@@ -738,6 +740,12 @@ fn log_route_decision(network: Network, decision: &RouteDecision) {
         RuleAction::Reject => tracing::debug!(
             ?network,
             action = "reject",
+            destination_port,
+            "routing decision"
+        ),
+        RuleAction::RejectDrop => tracing::debug!(
+            ?network,
+            action = "reject_drop",
             destination_port,
             "routing decision"
         ),
@@ -834,6 +842,9 @@ impl RoutingDispatcher {
         &self,
         mut session: StreamSession,
     ) -> Result<BoxStream, DispatchError> {
+        if business(session.inbound) {
+            session.capture_original();
+        }
         self.ensure_destination_allowed(&session.destination)?;
         if session.inbound == InboundKind::Tun
             && matches!(&session.destination, Destination::Ip(address) if self.tun_config.hijacks_dns(*address))
@@ -905,6 +916,7 @@ impl RoutingDispatcher {
                 }
                 RuleAction::Direct => self.direct.connect_tcp(session).await,
                 RuleAction::Reject => Err(DispatchError::NotAllowed),
+                RuleAction::RejectDrop => self.reject_drop.connect_tcp(session).await,
             }
         };
         if let Some(connection) = connection {
@@ -948,6 +960,7 @@ impl RoutingDispatcher {
             chain.push(match decision.action {
                 RuleAction::Direct => diagnostics.text("DIRECT"),
                 RuleAction::Reject => diagnostics.text("REJECT"),
+                RuleAction::RejectDrop => diagnostics.text("REJECT-DROP"),
                 RuleAction::Route(RouteTargetId::Proxy(id)) => {
                     diagnostics.proxy_names[id.index()].clone()
                 }
@@ -988,6 +1001,8 @@ impl RoutingDispatcher {
                         host,
                         dns_mode: decision.dns_mode,
                         sniff_host: diagnostics.text(sniffed.unwrap_or_default()),
+                        process: decision.process.clone(),
+                        original: decision.original.clone(),
                     },
                     chains: chain,
                     provider_chains,
@@ -1002,6 +1017,7 @@ impl RoutingDispatcher {
         Self {
             route_targets: self.route_targets.clone(),
             direct: self.direct.clone(),
+            reject_drop: self.reject_drop.clone(),
             dns: self.dns.clone(),
             ipv6: self.ipv6,
             rules: self.rules.clone(),
@@ -1010,6 +1026,8 @@ impl RoutingDispatcher {
             sniffer: self.sniffer.clone(),
             tcp_concurrent: self.tcp_concurrent,
             diagnostics: self.diagnostics.clone(),
+            process_mode: self.process_mode,
+            process_dialer: self.process_dialer.clone(),
         }
     }
 }
@@ -1199,6 +1217,7 @@ enum LoggedRouteAction {
     Route(RouteTargetId),
     Direct,
     Reject,
+    RejectDrop,
 }
 
 impl From<RuleAction> for LoggedRouteAction {
@@ -1207,6 +1226,7 @@ impl From<RuleAction> for LoggedRouteAction {
             RuleAction::Route(id) => Self::Route(id),
             RuleAction::Direct => Self::Direct,
             RuleAction::Reject => Self::Reject,
+            RuleAction::RejectDrop => Self::RejectDrop,
         }
     }
 }
@@ -1348,7 +1368,7 @@ impl RoutedDatagramTransport {
                     None,
                 )
                 .await?;
-            if decision.action == RuleAction::Reject {
+            if matches!(decision.action, RuleAction::Reject | RuleAction::RejectDrop) {
                 return Ok(());
             }
             let (dispatcher, direct, chain) = match decision.action {
@@ -1360,7 +1380,7 @@ impl RoutedDatagramTransport {
                         .expect("accepted route owns its selected leaf")?;
                     (leaf.dispatcher, leaf.direct, leaf.chain)
                 }
-                RuleAction::Reject => unreachable!(),
+                RuleAction::Reject | RuleAction::RejectDrop => unreachable!(),
             };
             if direct {
                 self.router
@@ -1697,7 +1717,7 @@ impl RoutedDatagramTransport {
                 )
                 .await?;
             let (dispatcher, direct) = match decision.action {
-                RuleAction::Reject => return Ok(()),
+                RuleAction::Reject | RuleAction::RejectDrop => return Ok(()),
                 RuleAction::Direct => (self.router.direct.clone(), true),
                 RuleAction::Route(_) => {
                     let target = decision
@@ -1942,6 +1962,8 @@ impl DatagramTransport for RoutedDatagramTransport {
         let action = flow.and_then(|destination| self.flows.action(destination, now));
         let decision = if let Some(action) = action {
             RouteDecision {
+                original: None,
+                process: Default::default(),
                 rule_index: self.router.rules.len(),
                 dns_mode: "normal",
                 metadata: datagram.remote.clone(),
@@ -1986,7 +2008,7 @@ impl DatagramTransport for RoutedDatagramTransport {
             }
             // UDP REJECT applies only to this datagram. The association stays
             // alive so a later destination can select another action.
-            RuleAction::Reject => Ok(()),
+            RuleAction::Reject | RuleAction::RejectDrop => Ok(()),
         }
     }
 
@@ -2143,6 +2165,7 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
     use crate::{
@@ -3033,6 +3056,7 @@ rules:
         let metadata = crate::session::InboundMetadata {
             local_port: 1080,
             user: Some(Arc::from("Alice")),
+            ..Default::default()
         };
         for (source, remote) in [
             ("192.0.2.1:5555", "198.51.100.1:443"),
@@ -3258,6 +3282,7 @@ sub-rules:
         let router = RoutingDispatcher {
             route_targets: targets,
             direct: direct.clone(),
+            reject_drop: default_reject_drop(),
             dns: Some(dns.clone()),
             ipv6: true,
             rules: Arc::new(
@@ -3268,6 +3293,8 @@ sub-rules:
             sniffer: None,
             tcp_concurrent: false,
             diagnostics: None,
+            process_dialer: None,
+            process_mode: crate::config::FindProcessMode::Strict,
         };
 
         router

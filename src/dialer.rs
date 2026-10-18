@@ -261,6 +261,7 @@ struct SocketInitialization {
     cancellation: CancellationToken,
     tasks: TaskTracker,
     submissions: Arc<Semaphore>,
+    process_submissions: Arc<Semaphore>,
 }
 
 impl Default for SocketInitialization {
@@ -270,6 +271,7 @@ impl Default for SocketInitialization {
             cancellation: CancellationToken::new(),
             tasks: TaskTracker::new(),
             submissions: Arc::new(Semaphore::new(MAX_SOCKET_INITIALIZATIONS)),
+            process_submissions: Arc::new(Semaphore::new(4)),
         }
     }
 }
@@ -718,6 +720,47 @@ impl Dialer {
 
     pub(crate) async fn shutdown(&self) {
         self.initialization.shutdown().await;
+    }
+    pub(crate) async fn process_identity(
+        &self,
+        query: crate::process::Query,
+    ) -> io::Result<crate::process::Identity> {
+        self.inspect_process(move |check| crate::process::lookup(query, check))
+            .await
+    }
+    async fn inspect_process<F>(&self, operation: F) -> io::Result<crate::process::Identity>
+    where
+        F: FnOnce(&dyn Fn() -> io::Result<()>) -> io::Result<crate::process::Identity>
+            + Send
+            + 'static,
+    {
+        // Four ordinary simultaneous lookups wait briefly instead of silently
+        // losing identity due to a single busy scanner. No detached waiter/task.
+        let capacity = self.initialization.process_submissions.clone();
+        let permit = tokio::select! {
+            biased;
+            () = self.initialization.cancellation.cancelled() => return Err(socket_initialization_cancelled()),
+            permit = tokio::time::timeout(crate::process::LOOKUP_TIME, capacity.acquire_owned()) => {
+                match permit { Ok(Ok(permit)) => permit, _ => return Ok(Default::default()) }
+            }
+        };
+        let result = tokio::time::timeout(
+            crate::process::LOOKUP_TIME,
+            self.initialization.run(move |check| {
+                let _permit = permit;
+                operation(check)
+            }),
+        )
+        .await;
+        result
+            .unwrap_or_else(|_| Ok(Default::default()))
+            .or_else(|error| {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    Err(error)
+                } else {
+                    Ok(Default::default())
+                }
+            })
     }
 
     #[must_use]
@@ -1365,6 +1408,99 @@ mod tests {
             addresses.last().unwrap().port(),
             MAX_RESOLVED_ADDRESSES as u16
         );
+    }
+
+    #[tokio::test]
+    async fn process_inspection_small_concurrency_preserves_identity_and_joins_stop() {
+        let dialer = Dialer::default();
+        let mut work = tokio::task::JoinSet::new();
+        for uid in 1..=4 {
+            let dialer = dialer.clone();
+            work.spawn(async move {
+                dialer
+                    .inspect_process(move |check| {
+                        check()?;
+                        Ok(crate::process::Identity {
+                            uid: Some(uid),
+                            ..Default::default()
+                        })
+                    })
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(identity) = work.join_next().await {
+            seen.insert(identity.unwrap().uid.unwrap());
+        }
+        assert_eq!(seen, [1, 2, 3, 4].into_iter().collect());
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let owned = dialer.clone();
+        let caller = tokio::spawn(async move {
+            owned
+                .inspect_process(move |_check| {
+                    let _ = entered.send(());
+                    let _ = released.recv_timeout(Duration::from_secs(2));
+                    Ok(Default::default())
+                })
+                .await
+        });
+        entering.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+        let mut stopped = Box::pin(dialer.shutdown());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut stopped)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped)
+            .await
+            .unwrap();
+        assert!(
+            dialer
+                .inspect_process(|_| Ok(Default::default()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn process_inspection_shared_socket_capacity_has_its_own_deadline() {
+        let dialer = Dialer::default();
+        // Hold capacity directly: no socket/protect callback or OS lookup.
+        let occupied = dialer
+            .initialization
+            .submissions
+            .clone()
+            .acquire_many_owned(MAX_SOCKET_INITIALIZATIONS as u32)
+            .await
+            .unwrap();
+        let called = Arc::new(AtomicUsize::new(0));
+        let calls = called.clone();
+        let result = dialer
+            .inspect_process(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(crate::process::Identity {
+                    uid: Some(1001),
+                    ..Default::default()
+                })
+            })
+            .await
+            .unwrap();
+        assert!(result.uid.is_none());
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            dialer
+                .initialization
+                .process_submissions
+                .available_permits(),
+            4
+        );
+        drop(occupied);
+        dialer.shutdown().await;
     }
 
     #[cfg(all(unix, feature = "ffi"))]

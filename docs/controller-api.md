@@ -239,7 +239,9 @@ Expire 为 Unix 秒。未知时省略该对象，缺失子项为 0；不以本�
   会话超时、关闭或新的 QUIC flow-id 后重新选择出口。资源代际不会迁移既有会话。
 - `chains` 按叶节点到业务路由组排列；当前不展开节点内部的 `dialer-proxy` 协议链。
   `providerChains` 给出这些节点关联的 provider 名称，可与 provider 状态中的脱敏 `error` 对照。
-- `metadata` 提供来源、目标、入口、协议、嗅探域名与 `dnsMode`，不查询进程或 ASN。
+- `metadata` 提供来源、目标、入口、协议、嗅探域名与 `dnsMode`；`uid`、`process`、
+  `processPath` 来自本次业务选路实际取得的本机身份，未知分别为 0、空串、空串。
+  Controller 查询不追加身份查询，是否获取沿 `find-process-mode`；不查询 ASN。
   扩展字段 `dnsPath` 是当前建链任务实际经过的有界 DNS 阶段标签，例如缓存、policy、
   fallback、fake-IP 与解析角色；不包含上游地址、URL 或认证头。
 - 扩展字段 `errors` 最多保留最近 32 次建链/数据报失败的连接信息与固定错误码，
@@ -248,6 +250,13 @@ Expire 为 Unix 秒。未知时省略该对象，缺失子项为 0；不以本�
 连接元数据保存原生地址、端口和时间，重复的节点、组及规则文本共享存储。
 查询只在短锁内取得连接引用，再固定计数和 DNS 路径并直接序列化；快照不保活
 业务 I/O 或资源代际。字节计数即时饱和累计，零字节 I/O 不更新计数。
+
+入站首次改写前保存不可变原目标、真实 socket tuple、入口及认证身份；嗅探、DNS、
+上游代理链不会覆盖它。Controller 沿现有字段展示有效目标；有效目标仍是未解析域名时，
+`destinationIP` 可取保存的原 IP。TCP 身份核查使用实际入站 socket，HTTP CONNECT 的
+业务目标不冒充入站 socket 的本地端点；UDP 身份按当前目标流获取，不按数据包建快照。
+未启用 Controller 的 mixed UDP 保留原有逐包选路；其进程查询按该次决策执行，
+原始事实使用栈值，不逐包分配共享快照。TUN 与 Controller 管理的 UDP 流沿现有流缓存。
 
 `DELETE /connections/{id}` 取消指定连接，`DELETE /connections` 取消当前全部连接。
 均返回 204，未知 ID 同样返回 204；取消唤醒正在等待的 I/O 并释放对应流资源。

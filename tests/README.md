@@ -24,6 +24,17 @@ Windows的UWP/Wintun feature互斥，应明确选择后端，不使用`--all-fea
 
 ## 定向回归
 
+功能出站（纯内存）：`config::functional::tests::`、`outbound::dns::tests::`、
+`outbound::reject::tests::`；直连解析角色接线：
+`dns::runtime::tests::runtime_dns_separates_bootstrap_proxy_direct_and_hosts`。
+
+进程规则与原始元信息（纯内存，无系统查询）：`config::process::tests::`、
+`process::tests::`、`process::linux::tests::`（Linux）、`process::macos::tests::`（macOS）、
+`routing::program::tests::process_cursor_is_lazy_once_and_keeps_dns_and_subrule_progress`、
+`routing::program::tests::classical_process_provider_resumes_without_selector_side_effects`、
+`dialer::tests::process_inspection_small_concurrency_preserves_identity_and_joins_stop`。
+共享 socket 初始化槽占满的身份查询截止：`dialer::tests::process_inspection_shared_socket_capacity_has_its_own_deadline`。
+
 对受影响范围选择过滤器，不逐次重跑整张表。下列库测试使用：
 
 ```sh
@@ -38,6 +49,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | 资源与Provider | `config::rule_provider::`、`runtime::providers::tests::`、`resource::cache::tests::`、`resource::provider_input::tests::`、`resource::http::tests::` | 域名紧凑索引、MRS、URI/Base64/AGE候选、流式gzip与认证隔离、失败保留与旧代资源 |
 | 策略组 | `routing::proxy_group::tests::`、`routing::balance::tests::` | 选择、容差、恢复和负载均衡 |
 | DNS | `dns::cache::tests::`、`dns::runtime::tests::dns_fallback_`、`dns::runtime::tests::resolve_ipv6_` | 缓存、双栈、竞速和取消 |
+| 入口嗅探 | `tcp_sniffer::tests::`、`tcp_sniffer::http2::tests::`、`udp_sniffing::tests::`、`tun_runtime::tests::quic_` | HTTP1/HTTP2目标、HPACK与完整前缀回放；共享QUIC域名键、ECH、预算与重组 |
 | QUIC与H3 | `transport::quic::`、`transport::quinn_h3::tests::`、`transport::quiche_h3::tests::`、`dns_quic_` | 官方窗口、真实内存QUIC、DATA读取背压、请求取消、兄弟请求及Stop |
 | XHTTP与XUDP | `transport::xhttp::`、`transport::h2_write::tests::`、`xudp::tests::` | 正文缓冲共享、标量部分写入、flush确认、计时与Stop |
 | TLS与ECH | `security::context::tests::`、`security::ech::tests::`、`dns::runtime::ech_tests::` | 证书与身份、内存TLS、动态ECH来源 |

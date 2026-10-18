@@ -46,8 +46,11 @@ mod dns;
 mod egress;
 pub use egress::EgressOptions;
 mod domain_regex;
+mod functional;
 mod identity_files;
 mod ip_suffix;
+mod process;
+pub use process::{FindProcessMode, ProcessField, ProcessRule, UidRange};
 mod name_regex;
 mod override_expr;
 pub mod providers;
@@ -128,6 +131,7 @@ pub struct Config {
     pub etag_support: bool,
     pub unified_delay: bool,
     pub connections: ConnectionSettings,
+    pub find_process_mode: FindProcessMode,
     pub egress: EgressOptions,
     pub profile: ProfileConfig,
     pub geodata_update: Option<GeoDataUpdateConfig>,
@@ -529,6 +533,8 @@ pub enum DnsTransport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DnsRoute {
     Direct,
+    Reject,
+    RejectDrop,
     Rules,
     Route(RouteTargetId),
 }
@@ -618,6 +624,8 @@ pub enum RuleKind {
     SrcIpAsn(String),
     InTypes(Vec<RuleInboundType>),
     InUsers(Vec<String>),
+    Process(ProcessRule),
+    Uid(Vec<UidRange>),
     InPorts(Vec<PortRange>),
     IpCidr(IpCidr),
     IpSuffix(IpSuffix),
@@ -631,6 +639,7 @@ pub enum RuleAction {
     Route(RouteTargetId),
     Direct,
     Reject,
+    RejectDrop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -686,6 +695,7 @@ pub enum ProxyGroupMemberTarget {
     Route(RouteTargetId),
     Direct,
     Reject,
+    RejectDrop,
     Control(RuleControl),
 }
 
@@ -760,6 +770,9 @@ pub struct ProxyConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyProtocol {
+    Direct,
+    Dns,
+    Reject,
     Masque(MasqueOutboundConfig),
     TrustTunnel(TrustTunnelOutboundConfig),
     Mieru(MieruOutboundConfig),
@@ -776,42 +789,25 @@ pub enum ProxyProtocol {
 }
 
 impl ProxyConfig {
+    /// Functional route targets have no proxy-server endpoint.
     #[must_use]
-    pub fn address(&self) -> &str {
-        match &self.protocol {
-            ProxyProtocol::Masque(config) => &config.address,
-            ProxyProtocol::TrustTunnel(config) => &config.address,
-            ProxyProtocol::Mieru(config) => &config.address,
-            ProxyProtocol::WireGuard(config) => &config.address,
-            ProxyProtocol::Http(config) => &config.address,
-            ProxyProtocol::Tuic(config) => &config.address,
-            ProxyProtocol::Hysteria2(config) => &config.address,
-            ProxyProtocol::Vmess(config) => &config.address,
-            ProxyProtocol::Trojan(config) => &config.address,
-            ProxyProtocol::Vless(config) => &config.address,
-            ProxyProtocol::Socks5(config) => &config.address,
-            ProxyProtocol::AnyTls(config) => &config.address,
-            ProxyProtocol::Shadowsocks(config) => &config.address,
-        }
-    }
-
-    #[must_use]
-    pub const fn port(&self) -> u16 {
-        match &self.protocol {
-            ProxyProtocol::Masque(config) => config.port,
-            ProxyProtocol::TrustTunnel(config) => config.port,
-            ProxyProtocol::Mieru(config) => config.port,
-            ProxyProtocol::WireGuard(config) => config.port,
-            ProxyProtocol::Http(config) => config.port,
-            ProxyProtocol::Tuic(config) => config.port,
-            ProxyProtocol::Hysteria2(config) => config.port,
-            ProxyProtocol::Vmess(config) => config.port,
-            ProxyProtocol::Trojan(config) => config.port,
-            ProxyProtocol::Vless(config) => config.port,
-            ProxyProtocol::Socks5(config) => config.port,
-            ProxyProtocol::AnyTls(config) => config.port,
-            ProxyProtocol::Shadowsocks(config) => config.port,
-        }
+    pub fn server_endpoint(&self) -> Option<(&str, u16)> {
+        Some(match &self.protocol {
+            ProxyProtocol::Direct | ProxyProtocol::Dns | ProxyProtocol::Reject => return None,
+            ProxyProtocol::Masque(config) => (&config.address, config.port),
+            ProxyProtocol::TrustTunnel(config) => (&config.address, config.port),
+            ProxyProtocol::Mieru(config) => (&config.address, config.port),
+            ProxyProtocol::WireGuard(config) => (&config.address, config.port),
+            ProxyProtocol::Http(config) => (&config.address, config.port),
+            ProxyProtocol::Tuic(config) => (&config.address, config.port),
+            ProxyProtocol::Hysteria2(config) => (&config.address, config.port),
+            ProxyProtocol::Vmess(config) => (&config.address, config.port),
+            ProxyProtocol::Trojan(config) => (&config.address, config.port),
+            ProxyProtocol::Vless(config) => (&config.address, config.port),
+            ProxyProtocol::Socks5(config) => (&config.address, config.port),
+            ProxyProtocol::AnyTls(config) => (&config.address, config.port),
+            ProxyProtocol::Shadowsocks(config) => (&config.address, config.port),
+        })
     }
 }
 
@@ -1173,6 +1169,8 @@ impl std::fmt::Debug for HttpInboundConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVoleConfig {
+    #[serde(rename = "find-process-mode", default)]
+    find_process_mode: FindProcessMode,
     #[serde(rename = "interface-name", default)]
     interface: String,
     #[serde(rename = "routing-mark", default)]
@@ -1635,6 +1633,7 @@ impl<'de> Deserialize<'de> for RawOutbound {
         let mapping = value
             .as_mapping_mut()
             .ok_or_else(|| serde::de::Error::custom("proxy requires a mapping"))?;
+        functional::validate_fields(mapping).map_err(serde::de::Error::custom)?;
         let interface = mapping
             .remove("interface-name")
             .map(serde_yaml_ng::from_value::<String>)
@@ -1684,6 +1683,12 @@ impl<'de> Deserialize<'de> for RawOutbound {
 // protocol fields inline avoids extra heap allocations in the startup path.
 #[allow(clippy::large_enum_variant)]
 enum RawProtocol {
+    #[serde(rename = "direct")]
+    Direct(functional::RawFunctional),
+    #[serde(rename = "dns")]
+    Dns(functional::RawFunctional),
+    #[serde(rename = "reject")]
+    Reject(functional::RawFunctional),
     #[serde(rename = "masque")]
     Masque(#[serde(deserialize_with = "masque::deserialize")] masque::RawMasque),
     #[serde(rename = "trusttunnel")]
@@ -2386,6 +2391,7 @@ impl RawVoleConfig {
             global_ua: self.global_ua,
             etag_support: self.etag_support,
             unified_delay: self.unified_delay,
+            find_process_mode: self.find_process_mode,
             connections: ConnectionSettings {
                 tcp_concurrent: self.tcp_concurrent,
                 keep_alive_idle: self.keep_alive_idle,
@@ -2702,7 +2708,7 @@ fn normalize_proxy_graph_with_groups(
             proxy
                 .dialer_proxy
                 .as_deref()
-                .filter(|tag| *tag != "DIRECT")
+                .filter(|tag| !matches!(*tag, "DIRECT" | "COMPATIBLE"))
                 .map(|tag| {
                     if let Some(id) = proxy_group_ids.get(tag) {
                         return Ok(RouteTargetId::Group(*id));
@@ -2793,6 +2799,7 @@ fn normalize_proxy_groups(
                     let target = match name.as_str() {
                         "DIRECT" | "COMPATIBLE" => ProxyGroupMemberTarget::Direct,
                         "REJECT" => ProxyGroupMemberTarget::Reject,
+                        "REJECT-DROP" => ProxyGroupMemberTarget::RejectDrop,
                         "PASS" => ProxyGroupMemberTarget::Control(RuleControl::Pass),
                         "PASS-RULE" => ProxyGroupMemberTarget::Control(RuleControl::PassRule),
                         _ => route_targets
@@ -2801,7 +2808,7 @@ fn normalize_proxy_groups(
                             .map(ProxyGroupMemberTarget::Route)
                             .ok_or_else(|| {
                                 VoleError::InvalidConfig(format!(
-                                    "proxy group `{}` member `{name}` does not reference a configured proxy, proxy group, DIRECT, REJECT, PASS, or PASS-RULE",
+                                    "proxy group `{}` member `{name}` does not reference a configured proxy, proxy group, DIRECT, COMPATIBLE, REJECT, REJECT-DROP, PASS, or PASS-RULE",
                                     group.name
                                 ))
                             })?,
@@ -2900,6 +2907,9 @@ pub(crate) fn proxy_graph_order(
 impl RawOutbound {
     fn normalize(self) -> Result<PendingProxyConfig> {
         let (tag, dialer_proxy, udp, protocol) = match self.protocol {
+            RawProtocol::Direct(raw) => raw.normalize(ProxyProtocol::Direct)?,
+            RawProtocol::Dns(raw) => raw.normalize(ProxyProtocol::Dns)?,
+            RawProtocol::Reject(raw) => raw.normalize(ProxyProtocol::Reject)?,
             RawProtocol::Masque(raw) => raw.normalize()?,
             RawProtocol::TrustTunnel(raw) => raw.normalize()?,
             RawProtocol::Mieru(raw) => raw.normalize()?,
@@ -3722,15 +3732,16 @@ fn trim_ascii_whitespace(input: &str) -> &str {
 
 fn parse_rule_action(action: &str, route_targets: &RouteTargetsByName) -> Result<RuleAction> {
     match action {
-        "DIRECT" => Ok(RuleAction::Direct),
+        "DIRECT" | "COMPATIBLE" => Ok(RuleAction::Direct),
         "REJECT" => Ok(RuleAction::Reject),
+        "REJECT-DROP" => Ok(RuleAction::RejectDrop),
         tag => route_targets
             .get(tag)
             .copied()
             .map(RuleAction::Route)
             .ok_or_else(|| {
                 VoleError::InvalidConfig(format!(
-                    "rule target must be exactly DIRECT, REJECT, or a configured proxy or proxy group name; found `{action}`"
+                    "rule target must be exactly DIRECT, COMPATIBLE, REJECT, REJECT-DROP, or a configured proxy or proxy group name; found `{action}`"
                 ))
             }),
     }
@@ -4016,7 +4027,10 @@ rules:
   - 'DOMAIN-REGEX,^a{1,2}\.example\.com$,second'
 "#;
         let mut config = Config::parse_yaml(yaml.as_bytes()).unwrap();
-        assert_eq!(config.proxies[1].port(), 1081);
+        assert_eq!(
+            config.proxies[1].server_endpoint(),
+            Some(("192.0.2.1", 1081))
+        );
         let rules = RuleSet::compile(config.take_runtime_rules()).unwrap();
         let destination = crate::session::Destination::domain("AA.example.com", 443).unwrap();
         let mut context = RoutingContext::new(Network::Tcp, &destination).unwrap();
@@ -5292,8 +5306,7 @@ authentication:
         let proxy = &config.proxies[0];
         assert_eq!(proxy.tag, "anytls-node");
         assert!(!proxy.udp);
-        assert_eq!(proxy.address(), "anytls.example.com");
-        assert_eq!(proxy.port(), 443);
+        assert_eq!(proxy.server_endpoint(), Some(("anytls.example.com", 443)));
         let ProxyProtocol::AnyTls(anytls) = &proxy.protocol else {
             panic!("expected AnyTLS proxy");
         };

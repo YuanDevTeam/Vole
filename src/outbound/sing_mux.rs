@@ -77,6 +77,8 @@ impl SingMuxConnector {
                         host: Arc::from("sp.mux.sing-box.arpa"),
                         dns_mode: "normal",
                         sniff_host: Arc::from(""),
+                        process: Default::default(),
+                        original: None,
                     },
                     chains: vec![tracking.chain.clone()],
                     provider_chains: tracking.providers.clone(),
@@ -236,6 +238,7 @@ mod tests {
                     metadata: crate::session::InboundMetadata {
                         local_port: 1080,
                         user: Some(Arc::from("alice")),
+                        ..Default::default()
                     },
                     inbound: InboundKind::Socks5,
                     source: "127.0.0.1:1080".parse().unwrap(),

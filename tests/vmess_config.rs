@@ -18,8 +18,10 @@ fn vmess_default_node_and_explicit_cipher_aliases_are_accepted_without_io() {
         "vmess_default_node_and_explicit_cipher_aliases_are_accepted_without_io",
     );
     let parsed = Config::parse_yaml(&document(json!({}))).expect("VMess default node");
-    assert_eq!(parsed.proxies[0].address(), "example.com");
-    assert_eq!(parsed.proxies[0].port(), 443);
+    assert_eq!(
+        parsed.proxies[0].server_endpoint(),
+        Some(("example.com", 443))
+    );
     assert!(!parsed.proxies[0].udp);
     for cipher in ["auto", "aes-128-gcm", "chacha20-poly1305", "none", "zero"] {
         assert!(
