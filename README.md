@@ -17,6 +17,7 @@ Configuration uses **Mihomo-style YAML for the supported feature set**. Vole pri
 - **Identify traffic for routing:** HTTP/TLS sniffing for TUN and mixed TCP, QUIC sniffing for TUN UDP, with force/skip conditions and configurable destination override. ICMPv4/ICMPv6 Echo is answered locally.
 - **Manage routing assets:** HTTP/file/inline proxy and rule providers, dynamic groups, filters and overrides; YAML/Text and domain/ipcidr MRS. GeoData loads complete referenced categories and supports routed downloads and periodic updates. Failed updates retain usable state. See [GeoData boundaries](docs/geodata.md#内存与安全边界).
 - **Expose client controls:** group/resource state, connection snapshots and cancellation, rule counters, effective configuration and bounded DNS diagnostics, alongside TUN traffic metrics and isolated node/chain delay measurement.
+- **Process selected business HTTP:** URL rewrites and redirects, with optional host-supplied CA interception for explicitly allowed HTTPS domains and bounded H1/H2 streaming. This uses a [separate HTTP configuration](docs/http-processing.md).
 
 ## Proxy protocols
 

@@ -13,6 +13,7 @@
 | QUIC 拥塞控制 | HY2/TUIC 保留其 Quinn 控制器；XHTTP/DoH 使用 Quinn 原生默认控制器，TrustTunnel/MASQUE 使用 quiche 原生控制器，配置映射见 [出站](outbounds.md) |
 | MASQUE 密钥 TLS | H2 使用 rustls/ring，H3 使用 quiche + 同一 boring；ECDSA 身份、逐证书 SPKI pin 与握手签名认证保持独立于 WebPKI |
 | Controller 随机服务端身份 | 官方 rsa 仅生成 RSA 2048 密钥；rcgen + ring 签发自签证书，实际 TLS 和握手签名仍由 rustls + ring 处理；随 Controller 入站 feature 启用 |
+| 业务 HTTPS 处理 | rcgen + ring 使用宿主提供的 CA 签发短期叶证书；官方 x509-parser 校验 CA、密钥匹配与有效期，不生成根 CA 或安装信任，见 [HTTP 处理](http-processing.md) |
 | 命名 ClientHello、REALITY、JLS、ShadowTLS v3 | YuanDevTeam/boring，同一 fork 的本地 development path；发布门禁仍要求 release 分支及批准 revision |
 | SS 2022 | 官方 shadowsocks，仅 `aead-cipher-2022` |
 | Mieru 分段认证 | 官方 RustCrypto chacha20poly1305 0.11.0 + ring PBKDF2；不使用 TLS 或另一套 TLS provider |

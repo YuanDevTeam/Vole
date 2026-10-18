@@ -15,6 +15,7 @@ struct RawConfig {
     http_ports: Vec<u16>,
     #[serde(default)]
     rewrite: Vec<RawRule>,
+    mitm: Option<super::mitm::RawMitm>,
 }
 fn default_ports() -> Vec<u16> {
     vec![80, 8080]
@@ -43,6 +44,8 @@ pub(crate) struct Policy {
     identity: [u8; 32],
     http_ports: Box<[u16]>,
     rules: Box<[Rule]>,
+    #[cfg(feature = "inbound-http")]
+    mitm: Option<Arc<super::mitm::Mitm>>,
 }
 impl fmt::Debug for Policy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -102,9 +105,50 @@ impl Policy {
                 return Err(invalid());
             }
         }
+        // Validate bounded MITM material before RawMitm allocates its own
+        // vectors/strings from a potentially alias-expanded YAML value.
+        if let Some(mitm) = value.get("mitm") {
+            for key in ["domains", "exclude-domains", "ports"] {
+                if mitm
+                    .get(key)
+                    .and_then(serde_yaml_ng::Value::as_sequence)
+                    .is_some_and(|items| items.len() > 64)
+                {
+                    return Err(invalid());
+                }
+            }
+            for key in ["domains", "exclude-domains"] {
+                if mitm
+                    .get(key)
+                    .and_then(serde_yaml_ng::Value::as_sequence)
+                    .is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|item| item.as_str().is_some_and(|name| name.len() > 255))
+                    })
+                {
+                    return Err(invalid());
+                }
+            }
+            for key in ["certificate", "private-key"] {
+                if mitm
+                    .get(key)
+                    .and_then(serde_yaml_ng::Value::as_str)
+                    .is_some_and(|pem| pem.len() > 32 * 1024)
+                {
+                    return Err(invalid());
+                }
+            }
+        }
         let raw: RawConfig = serde_yaml_ng::from_value(value).map_err(|_| invalid())?;
         if raw.rewrite.len() > MAX_RULES || raw.http_ports.len() > 64 || raw.http_ports.contains(&0)
         {
+            return Err(invalid());
+        }
+        #[cfg(feature = "inbound-http")]
+        let mitm = raw.mitm.map(super::mitm::Mitm::compile).transpose()?;
+        #[cfg(not(feature = "inbound-http"))]
+        if raw.mitm.is_some() {
             return Err(invalid());
         }
         let mut total = 0;
@@ -119,6 +163,11 @@ impl Policy {
             }
             if (rule.action == ActionKind::Reject) != rule.replacement.is_none() {
                 return Err(invalid());
+            }
+            if let Some(replacement) = &rule.replacement
+                && !replacement.contains('$')
+            {
+                checked_url(replacement)?;
             }
             let pattern = RegexBuilder::new(&rule.pattern)
                 .size_limit(128 * 1024)
@@ -135,13 +184,23 @@ impl Policy {
             identity: Sha256::digest(input.as_bytes()).into(),
             http_ports: raw.http_ports.into(),
             rules: rules.into(),
+            #[cfg(feature = "inbound-http")]
+            mitm,
         }))
     }
     pub(crate) fn enabled(&self) -> bool {
+        #[cfg(feature = "inbound-http")]
+        if self.mitm.is_some() {
+            return true;
+        }
         !self.rules.is_empty()
     }
     pub(crate) fn plain_port(&self, port: u16) -> bool {
         !self.rules.is_empty() && self.http_ports.contains(&port)
+    }
+    #[cfg(feature = "inbound-http")]
+    pub(super) fn mitm(&self) -> Option<&Arc<super::mitm::Mitm>> {
+        self.mitm.as_ref()
     }
     pub(super) fn evaluate(&self, url: Url) -> io::Result<Action> {
         if url.as_str().len() > MAX_URL {
@@ -307,6 +366,7 @@ mod snapshot_tests {
             "rewrite: [{pattern: '.', action: mock}]",
             "http-ports: [0]",
             "rewrite: [{pattern: '.', action: replace}]",
+            "rewrite: [{pattern: '.', action: redirect302, replacement: 'javascript:bad'}]",
         ] {
             assert!(Policy::compile(bad).is_err());
         }

@@ -151,3 +151,5 @@ TUIC ClientHello 使用 `tuic_disable_sni_changes_real_quic_hello_without_changi
 HTTP URL 动作的纯内存回归：`http_processing::`、`main_config_and_provider_rebuild_preserve_the_addendum_until_explicit_clear`、`update_http_addendum_preserves_optional_clear_and_its_separate_byte_limit`、`explicit_http_file_is_validated_without_initializing_data_or_autoloading`、`http_addendum_option_only_transports_an_explicit_native_path`；Windows 平台另编译 `snapshot_identity_and_readback_include_the_http_addendum`。覆盖共享 TUN/mixed/CONNECT Adapter、预读、最终目标单次选路、原元数据、跨 origin 凭据隔离、未读 Expect body 的本地响应、禁用／非候选轻路径、代际继承与显式关闭。外部互通仅由真实 TUN benchmark 见证，不从这些内存回归推导。
 
 HTTP/1 早响应与空正文 Upgrade 的定向内存回归：`inbound::http::server::early_final_memory_tests::`；不运行包含宿主 socket 的整个入站测试模块。
+
+`http_processing::` 同时覆盖选择性 HTTPS：CA/私钥匹配、叶证书 AKI、代内缓存计费、逐 authority 授权，以及内存 TLS/H2 流控、早响应、真实截断拒绝与取消。TLS/H2 对端使用内存 duplex，不创建宿主 socket；这些回归不代签设备信任安装或系统 VPN。

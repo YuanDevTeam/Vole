@@ -1,8 +1,21 @@
 //! Business HTTP processing. Core-owned HTTP never enters this module.
+#[cfg(feature = "inbound-http")]
+mod authority;
 mod config;
+mod mitm;
 pub(crate) use config::{MAX_ADDENDUM, Policy};
 #[cfg(feature = "inbound-http")]
 mod h1;
+#[cfg(feature = "inbound-http")]
+mod h2;
+#[cfg(feature = "inbound-http")]
+mod h2_body;
+#[cfg(feature = "inbound-http")]
+mod h2_h1;
+#[cfg(feature = "inbound-http")]
+mod h2_headers;
+#[cfg(all(test, feature = "inbound-http"))]
+mod h2_tests;
 #[cfg(feature = "inbound-http")]
 pub(crate) mod io;
 #[cfg(feature = "inbound-http")]
@@ -47,6 +60,10 @@ impl HttpContext {
     }
     pub(crate) fn candidate_port(&self, port: u16) -> bool {
         self.policy.plain_port(port)
+            || self
+                .policy
+                .mitm()
+                .is_some_and(|policy| policy.candidate_port(port))
     }
 }
 #[cfg(feature = "inbound-http")]

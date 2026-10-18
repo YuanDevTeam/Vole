@@ -29,6 +29,9 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 | Linux 自建设备 | auto-detect-interface、auto-route、IPv6 地址、CIDR 捕获/排除、UID/端口作用域、路由索引、strict-route 与 systemd-resolved DNS 接管；失败和停止时恢复本次修改 |
 | 运行状态 | 连接快照、流量计数和关闭；组与资源状态；规则命中、有效配置、受限 DNS 诊断 |
 
+[业务 HTTP 处理](http-processing.md) 是独立扩展：URL rewrite 与选择性 HTTPS MITM 使用单独输入，
+不向 Mihomo 主配置增加字段；CA 信任与安全存储归宿主管理。
+
 ## 必须保留的边界
 
 - 业务入口只有 mixed-port 与 TUN；不支持 port、socks-port、listeners、redir/tproxy 或服务端协议配置。

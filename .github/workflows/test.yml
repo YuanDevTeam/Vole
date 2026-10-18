@@ -152,7 +152,12 @@ jobs:
           rsa = package("rsa", "0.9.10")
           rcgen = package("rcgen", "0.14.10")
           require(features(rsa) == {"std"}, "RSA is restricted to controller key generation")
-          require(features(rcgen) == {"crypto", "ring"}, "controller certificate generation must use ring")
+          require(features(rcgen) == {"crypto", "ring", "x509-parser"}, "certificate generation must use ring and the reviewed CA parser")
+          x509 = package("x509-parser", "0.18.1")
+          require(x509.get("license") == "MIT OR Apache-2.0", "unapproved X.509 parser license")
+          require(features(x509) == {"default", "ring", "verify"}, "X.509 verification must use ring")
+          x509_parents = {node["id"] for node in nodes.values() if any(dependency["pkg"] == x509["id"] for dependency in node.get("deps", []))}
+          require(x509_parents == {metadata["resolve"]["root"], rcgen["id"]}, "X.509 parsing is restricted to Vole and rcgen")
           for item in (rsa, rcgen):
               require(item.get("license") == "MIT OR Apache-2.0", f"unapproved {item['name']} license")
               parents = {node["id"] for node in nodes.values() if any(dependency["pkg"] == item["id"] for dependency in node.get("deps", []))}

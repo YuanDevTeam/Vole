@@ -49,7 +49,7 @@ default = [
     "shadow-tls-v3",
     "sing-mux",
 ]
-inbound-http = ["dep:rcgen", "dep:rsa", "dep:tokio-tungstenite"]
+inbound-http = ["dep:rcgen", "rcgen/x509-parser", "dep:rsa", "dep:tokio-tungstenite", "dep:hyper", "dep:hyper-util", "dep:x509-parser"]
 inbound-socks5 = ["dep:rcgen", "dep:rsa", "dep:ring", "dep:tokio-tungstenite"]
 outbound-anytls = ["dep:md-5", "stream-security", "ech"]
 outbound-socks5 = []
@@ -186,6 +186,7 @@ uuid = { version = "1", features = ["serde"] }
 vole-netstack = { path = "crates/vole-netstack", optional = true }
 vole-blake3-raw = { path = "crates/vole-blake3-raw", optional = true }
 webpki-roots = "1"
+x509-parser = { version = "=0.18.1", default-features = false, optional = true }
 yamux = { version = "=0.14.1", optional = true }
 zeroize = { version = "=1.9.1" }
 zstd = { version = "0.14.0", default-features = false }

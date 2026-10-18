@@ -23,14 +23,20 @@ impl HttpContext {
         scheme: Scheme,
         apply_url_actions: bool,
     ) -> io::Result<Decision> {
-        // P12 replaces this check with per-original-authority MITM permission;
-        // an allowed SNI alone never authorizes another HTTP authority.
-        if scheme == Scheme::Https {
+        // Authorization is per original HTTP authority, before any URL action.
+        // One allowed TLS SNI never grants other authorities on this connection.
+        if scheme == Scheme::Https && !self.permits_https(&original) {
             return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "HTTPS interception is not enabled",
+                io::ErrorKind::PermissionDenied,
+                "HTTPS authority is not permitted",
             ));
         }
+        let original_matches_tls = scheme != Scheme::Https
+            || (session.sniffed_domain.as_deref().is_some_and(|sni| {
+                original
+                    .host_str()
+                    .is_some_and(|host| host.eq_ignore_ascii_case(sni))
+            }) && original.port_or_known_default() == Some(session.destination.port()));
         let origin = (
             original.scheme() == "https",
             original.host_str().unwrap_or_default().to_owned(),
@@ -58,9 +64,12 @@ impl HttpContext {
         session.capture_original();
         // A same-origin path/query action must not re-resolve an already
         // selected TUN address or silently change its CDN endpoint.
-        if strip_origin_credentials {
+        if strip_origin_credentials || !original_matches_tls {
             session.destination = destination.clone();
             session.sniffed_domain = None;
+        } else if scheme == Scheme::Https {
+            // Retain the fixed SNI's selected IP only for its own authority.
+            session.sniffed_domain = Some(host.to_owned());
         }
         Ok(Decision::Forward(Target {
             url,

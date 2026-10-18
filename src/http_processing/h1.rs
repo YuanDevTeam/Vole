@@ -36,6 +36,13 @@ impl HttpContext {
         if !self.candidate_port(session.destination.port()) {
             return Ok(Intercept::Transparent { prefix: Vec::new() });
         }
+        if self
+            .policy()
+            .mitm()
+            .is_some_and(|policy| policy.candidate_port(session.destination.port()))
+        {
+            return self.intercept_tls(stream, session, cancellation).await;
+        }
         let mut prefix = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
         let recognized = tokio::select! {biased;

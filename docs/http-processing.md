@@ -1,6 +1,15 @@
-# HTTP URL rewrite
+# HTTP 处理
 
-HTTP 处理使用独立附加配置，与 Mihomo YAML 分开。当前支持明文 HTTP/1 的 URL 改写、302/307 与拒绝；上游 URL 可以使用 HTTPS，并保持正常的证书链与主机名验证。现有 TLS／QUIC 透明转发保持原路径。
+HTTP 处理只作用于 TUN 和 mixed-port 的业务 TCP。Core 自己的 DNS、provider、GeoData、
+节点握手及 Controller 请求不进入该路径。关闭时不创建 CA、证书缓存或后台任务。
+
+## 独立输入
+
+主配置仍使用 Mihomo YAML。`validateConfig`、`start` 和 `updateConfig` 可另外传入
+`httpConfigYaml`；CLI 的 `-http-config PATH` 由 foreground 读取该文件，不自动搜索。
+附加配置最多 1 MiB，和主配置一起验证、发布，失败保留当前运行代。
+`updateConfig` 省略附加输入时继承当前值，显式空字符串关闭；provider 刷新继承同一策略。
+Windows Session Host 从同一个不可变启动 Snapshot 读取附加输入，运行时更新不改变旧 token。
 
 ```yaml
 http-ports: [80, 8080]
@@ -8,25 +17,51 @@ rewrite:
   - pattern: '^http://old\.example/(.*)$'
     action: replace
     replacement: 'https://new.example/$1'
-  - pattern: '^http://redirect\.example/'
-    action: redirect307
-    replacement: 'https://new.example/'
-  - pattern: '^http://blocked\.example/'
+  - pattern: '^https://private\.example/blocked$'
     action: reject
+mitm:
+  domains: ['private.example', '*.example.net']
+  exclude-domains: ['excluded.example.net']
+  ports: [443]
+  certificate: | # 用户提供的 CA 证书 PEM
+    ...
+  private-key: | # 匹配的 CA 私钥 PEM
+    ...
 ```
 
-规则按顺序仅执行首个匹配。`replace` 透明修改最终目标／path／query；`redirect302`、`redirect307` 返回本地重定向；`reject` 返回 403。`replacement` 对前三种动作必填，拒绝不能携带它；支持 `$1`、`${name}` 等 capture 与 `$$` 字面美元符号。最终 URL 必须为无 userinfo、fragment、控制字符的 HTTP/HTTPS URL。未知字段与动作失败。
+`mitm` 可省略；CA 私钥由 App/宿主管理安全存储与信任安装，Core 不生成或安装根证书。
+附加输入包含私密材料，不应作为普通代理订阅分享。Controller 查询、日志和 Debug 不返回其原文。
 
-`http-ports` 默认 `[80,8080]`，只控制 TUN／CONNECT 隧道内明文 HTTP 的候选端口；显式 HTTP 代理请求本身已经确定协议。未启用或非候选端口不预读、不创建处理任务。非 HTTP 前缀与代理 CONNECT 控制流按原字节回放后透明转发。候选端口按最长 10 秒首部期限分类；已确认的 HTTP 使用既有严格消息定界。HTTP/1 持久请求、chunked、Content-Length、临时响应、Upgrade、预读与半关闭复用同一套 HTTP 入站 framing／relay；正文流式透传。OPTIONS `*` 保留原语义，不执行 URL 动作。
+## URL 动作
 
-最终 URL 确定后才通过同一资源代际的 Dispatcher 选路、建链。重定向／拒绝不预建上游，未读请求正文通过关闭当前连接隔离。同 origin 的 path/query 动作保留 TUN 已解析的实际目的 IP；HTTP Host／authority 仍使用逻辑 URL。跨 scheme／host／有效端口时重建 Host、清除旧目的的 sniff 提示，并剥离旧站点 Authorization/Cookie；已验证入口用户名和原来源／目的快照保留。内部 DoH、provider、GeoData、协议握手与 Controller 不进入业务处理。
+规则按顺序匹配完整规范化 URL，只执行第一条，不递归改写。动作包括 `replace`、
+`redirect302`、`redirect307`、`reject`；前三者需要 replacement，reject 不接受 replacement。
+支持 `$1`、`${name}` 与 `$$`。只接受 HTTP(S) URL，不接受 userinfo、fragment 或控制字符。
+最多 64 条规则，每个 pattern 2 KiB，pattern/replacement 合计 64 KiB，单个结果 8 KiB；
+每条正则的编译与搜索缓存有局部上限，替换先检查输出空间再扩容。
 
-## 输入与应用
+redirect/reject 本地响应后关闭连接，不先连接原目标，也不把未读正文当作下一请求。
+转发复用既有 HTTP/1 定界和流式正文，支持持久连接、chunked、Expect、临时响应及 Upgrade。
+同 origin 的 path/query 动作保留已选择的目标 IP；跨 origin 时重新解析、选路、重建 Host，
+并移除旧站点的 Authorization/Cookie。入口认证身份和原始目标快照保持。
 
-- Invoke `validateConfig`、`start` 可以在 `configYaml` 之外传可选 `httpConfigYaml`；省略或空串表示关闭。
-- Invoke `updateConfig` 同时接收主配置与可选 `httpConfigYaml`；省略保留当前附加配置，空串明确关闭。主配置与附加规则作为同一候选发布；坏候选保留旧代。
-- CLI 使用 `-http-config <file>`／`--http-config=<file>`，只将显式路径传给 `foreground.httpConfigPath`，文件读取和验证归 foreground。没有环境或目录探测；不从 stdin 读取附加文件。显式空路径失败，空文件关闭处理。`-t` 同时验证两个配置且不初始化 dataDir。
-- 普通 Controller PUT 主 YAML 和 provider 重建继承活动附加策略，不把规则塞回主 YAML。已建立 HTTP 连接固定其资源／规则代际；新连接取得新候选。
-- Windows `startVpn` 的可选 `httpConfigYaml` 经过 Session Snapshot 的 canonical digest 和包内传递，在实际 Session Host 中构造相同策略；缺省快照保持原形式。启动 snapshotToken 的含义不因在线更新而改变。
+## 选择性 HTTPS
 
-必须编译 `inbound-http` 才能启用处理；缺少时非空附加输入明确失败。附加文档最多 1 MiB，最多 64 个规则和 64 个非零端口；单 pattern 2 KiB，replacement 与最终 URL 各 8 KiB，总规则文本 64 KiB。YAML 展开、正则编译和 capture 输出均在分配前保留局部预算。规则／信任与既有数据面按资源代共享；不新增全局业务配额、第二个 Dialer 或后台扫描任务。Stop 覆盖解析、上游握手、正文和透明 relay。
+域名为精确匹配或 `*.example.net` 子域匹配，后者不包含域本身；排除项优先。
+只有明确允许的 SNI/端口才终止 TLS。无 SNI、ECH（含 GREASE）、未命中域名和 UDP/QUIC
+透明保留；不会用 ECH 的外层覆盖名假装获得目标授权。证书固定或客户端证书要求可能使
+选定连接失败，失败不会回退为关闭上游证书校验。
+
+每个原始 HTTP authority 独立检查域名与端口授权；H2 连接的第一个域名不会授权所有流。
+与连接 SNI/端口不同的 authority 重新选择目标。上下游 TLS 独立；最终上游经过同一
+Dispatcher 和受保护物理出口，按实际最终主机验证证书，H2/H1 使用真实协商结果。
+H1 上游按 HTTP/1.1 协商；H2 下游可对接 H2 或 H1 上游。正文背压传递，不缓存全文。
+
+每个 CA 身份归运行代所有，叶证书同时限制 32 项、材料计费 256 KiB、空闲 10 分钟，
+有效期最多 24 小时且不超过 CA。计费含证书、私钥及配置的保守成本，不代表进程 RSS。
+同一 CA 的发行串行，同域名复用缓存；没有可脱离 Stop 的发行队列或任务。
+HTTP 会话固定使用进入时的策略和资源代，reload 只影响后续新会话；CA 轮换也遵循该规则。
+
+H2 每连接最多 8 个活动请求；流/连接接收窗口分别 32/64 KiB，头最多 32 KiB/100 字段，
+单帧 16 KiB，动态 HPACK 表关闭。上游连接不跨请求复用，不存在跨身份的闲置池。
+取消和 Stop 同时覆盖下游、上游、正文及驱动；设备信任与原生 VPN 验收独立于编译和容器互通。
