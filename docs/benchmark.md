@@ -71,7 +71,7 @@ xychart-beta horizontal
 ## 高并发内存对照
 
 VLESS RAW、1 Gbps、512 条持续活跃连接（256 TCP + 256 UDP）、单源 IP、每条 UDP 一个目标，
-完整 CN GeoSite 与 MetaDB、Controller 空闲，各一轮 60 秒。B 为 `c66757b`，A 为应用队列有界按需分配版本；
+完整 CN GeoSite 与 MetaDB、Controller 空闲，各一轮 60 秒。B 为 `c66757b`，A 为 `d96ffe8` 应用队列有界按需分配版本；
 每方向逻辑上限仍为 16 KiB，smoltcp、背压与关闭逻辑不变。
 
 ```mermaid
@@ -91,5 +91,9 @@ xychart-beta horizontal
 峰值 RSS 降低 5.078 MiB（9.81%），仍超过 43 MiB；吞吐、丢包及 TCP 完整交付通过，保留内存未达标结论。
 CPU 时间为 122.21 → 124.21 秒、统计墙时为 63.209 → 62.076 秒，不将单轮 CPU 差异解释为稳定变化。
 同一改动完成单 TCP、日常有限任务和少量慢连接混合的 TUN 守护，全部 TCP 与任务完整，未观察到体验退化。
+
+后续不可变注册表共享通过单 TCP、日常及少量慢连接 TUN 守护，有限任务均完整，UDP 丢包为零。
+该版本及原二进制参考的高并发复验均有屏障前准备超时，未达到完整负载；不据其较低 RSS 声称内存改善。
+上图保留最近一次有效高并发对照，不代表当前版本通过高并发复验，43 MiB 门槛仍未通过。
 
 以上为 Linux RSS 压力筛选，不代替 iOS/tvOS 整个 VPN 扩展的 physical footprint 验收，见[验收边界](acceptance.md)。

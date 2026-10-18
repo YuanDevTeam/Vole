@@ -101,6 +101,10 @@ fn runtime_dns_error(error: crate::dns::runtime::RuntimeDnsError) -> DispatchErr
 /// name and methods while this type preserves the public node-only API.
 #[derive(Clone)]
 pub struct ProxyDispatchers {
+    entries: Arc<DispatcherRegistry>,
+}
+
+struct DispatcherRegistry {
     proxies: Vec<Arc<dyn Dispatcher>>,
     groups: Vec<Arc<dyn Dispatcher>>,
     proxy_groups: Option<Arc<ProxyGroups>>,
@@ -110,7 +114,8 @@ impl std::fmt::Debug for ProxyDispatchers {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ProxyDispatchers")
-            .field("len", &self.proxies.len())
+            .field("len", &self.entries.proxies.len())
+            .field("groups", &self.entries.groups.len())
             .finish_non_exhaustive()
     }
 }
@@ -118,9 +123,11 @@ impl std::fmt::Debug for ProxyDispatchers {
 impl ProxyDispatchers {
     pub fn new(proxies: Vec<Arc<dyn Dispatcher>>) -> Result<Self, DispatchError> {
         Ok(Self {
-            proxies,
-            groups: Vec::new(),
-            proxy_groups: None,
+            entries: Arc::new(DispatcherRegistry {
+                proxies,
+                groups: Vec::new(),
+                proxy_groups: None,
+            }),
         })
     }
 
@@ -128,8 +135,7 @@ impl ProxyDispatchers {
         proxies: Vec<Arc<dyn Dispatcher>>,
         proxy_groups: &Arc<ProxyGroups>,
     ) -> Result<Self, DispatchError> {
-        let mut registry = Self::new(proxies)?;
-        registry.groups = (0..proxy_groups.len())
+        let groups = (0..proxy_groups.len())
             .map(|index| {
                 proxy_groups.dispatcher(
                     crate::config::ProxyGroupId::new(index)
@@ -137,22 +143,28 @@ impl ProxyDispatchers {
                 )
             })
             .collect();
-        registry.proxy_groups = Some(proxy_groups.clone());
-        Ok(registry)
+        Ok(Self {
+            entries: Arc::new(DispatcherRegistry {
+                proxies,
+                groups,
+                proxy_groups: Some(proxy_groups.clone()),
+            }),
+        })
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.proxies.len()
+        self.entries.proxies.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.proxies.is_empty()
+        self.entries.proxies.is_empty()
     }
 
     pub fn get(&self, id: ProxyId) -> Result<&Arc<dyn Dispatcher>, DispatchError> {
-        self.proxies
+        self.entries
+            .proxies
             .get(id.index())
             .ok_or_else(|| DispatchError::Other(format!("unknown proxy id {}", id.index())))
     }
@@ -164,7 +176,7 @@ impl ProxyDispatchers {
     ) -> Result<&Arc<dyn Dispatcher>, DispatchError> {
         match id {
             RouteTargetId::Proxy(id) => self.get(id),
-            RouteTargetId::Group(id) => self.groups.get(id.index()).ok_or_else(|| {
+            RouteTargetId::Group(id) => self.entries.groups.get(id.index()).ok_or_else(|| {
                 DispatchError::Other(format!("unknown proxy group id {}", id.index()))
             }),
         }
@@ -193,6 +205,7 @@ impl ProxyDispatchers {
                 }))
             }
             RouteTargetId::Group(id) => self
+                .entries
                 .proxy_groups
                 .as_ref()
                 .ok_or(DispatchError::NotAllowed)?
@@ -201,7 +214,7 @@ impl ProxyDispatchers {
     }
 
     fn per_flow(&self, id: RouteTargetId) -> bool {
-        matches!(id, RouteTargetId::Group(id) if self.proxy_groups.as_ref().is_some_and(|groups| groups.contains_balance(id)))
+        matches!(id, RouteTargetId::Group(id) if self.entries.proxy_groups.as_ref().is_some_and(|groups| groups.contains_balance(id)))
     }
     fn resolve_for(
         &self,
@@ -213,6 +226,7 @@ impl ProxyDispatchers {
     ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
         match id {
             RouteTargetId::Proxy(id) => self
+                .entries
                 .proxies
                 .get(id.index())
                 .cloned()
@@ -224,6 +238,7 @@ impl ProxyDispatchers {
                 })
                 .ok_or_else(|| DispatchError::Other(format!("unknown proxy id {}", id.index()))),
             RouteTargetId::Group(id) => self
+                .entries
                 .proxy_groups
                 .as_ref()
                 .ok_or_else(|| {
@@ -415,6 +430,7 @@ impl RoutingDispatcher {
                 || self.diagnostics.is_some()
                 || self
                     .route_targets
+                    .entries
                     .proxy_groups
                     .as_ref()
                     .is_some_and(|groups| groups.has_balance()));
@@ -3148,6 +3164,67 @@ sub-rules:
                 .await,
             Err(DispatchError::NotAllowed)
         ));
+    }
+
+    #[test]
+    fn proxy_registry_clones_share_ownership_and_release_dependencies() {
+        let proxy: Arc<dyn Dispatcher> = Arc::new(RecordingDispatcher::default());
+        let direct = Arc::new(RecordingDispatcher::default());
+        let proxy_id = ProxyId::new(0).unwrap();
+        let group_id = RouteTargetId::Group(ProxyGroupId::new(0).unwrap());
+        let groups = ProxyGroups::new(
+            &[select_group(
+                "route",
+                vec![(
+                    "node",
+                    ProxyGroupMemberTarget::Route(RouteTargetId::Proxy(proxy_id)),
+                )],
+            )],
+            vec![proxy.clone()],
+            direct,
+        )
+        .unwrap();
+        let registry = ProxyDispatchers::with_proxy_groups(vec![proxy.clone()], &groups).unwrap();
+        let weak_proxy = Arc::downgrade(&proxy);
+        let weak_groups = Arc::downgrade(&groups);
+        let weak_group_dispatcher = Arc::downgrade(registry.get_route(group_id).unwrap());
+        let reference_counts = (
+            Arc::strong_count(&proxy),
+            weak_group_dispatcher.strong_count(),
+            Arc::strong_count(&groups),
+        );
+
+        let cloned = registry.clone();
+        assert_eq!(
+            (
+                Arc::strong_count(&proxy),
+                weak_group_dispatcher.strong_count(),
+                Arc::strong_count(&groups),
+            ),
+            reference_counts,
+            "cloning the registry must not clone its node or group ownership arrays"
+        );
+        assert!(Arc::ptr_eq(
+            registry.get(proxy_id).unwrap(),
+            cloned.get(proxy_id).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            registry.get_route(group_id).unwrap(),
+            cloned.get_route(group_id).unwrap()
+        ));
+
+        drop(registry);
+        drop(groups);
+        drop(proxy);
+        assert!(weak_proxy.upgrade().is_some());
+        assert!(weak_groups.upgrade().is_some());
+        assert!(cloned.get(proxy_id).unwrap().supports_udp());
+        assert!(cloned.get_route(group_id).unwrap().supports_udp());
+
+        drop(cloned);
+        assert!(weak_group_dispatcher.upgrade().is_none());
+        assert!(weak_groups.upgrade().is_none());
+        assert!(weak_proxy.upgrade().is_none());
     }
 
     #[test]
