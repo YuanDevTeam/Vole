@@ -51,7 +51,7 @@ Linux 压测可以把 TUN 创建在客户端 namespace，再把借用 fd 交给�
 tvOS 首版为 17.0+、ARM64 真机和 Apple Silicon 模拟器，共用 TunIo、netstack 和
 Dialer。所有平台使用统一的 TUN 内存诊断、allocator 配置和 Stop 后回收策略，
 缓冲、队列和线程策略也不按平台或内存模式切换。内存按压力负载统一验收：1 Gbps 不超过 43 MiB，
-2 / 3 Gbps 不超过 45 MiB；真实 iOS/tvOS 扩展按整个进程的 physical footprint
+3 Gbps 不超过 45 MiB；真实 iOS/tvOS 扩展按整个进程的 physical footprint
 验收，完整口径见[验收边界](acceptance.md)。
 
 Apple 公开 NEPacketTunnelFlow API 是 packetFlow 的包读写，不承诺可取得 raw fd。

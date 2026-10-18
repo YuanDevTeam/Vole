@@ -207,6 +207,9 @@ fn transport(
     };
     match network.as_str() {
         "tcp" => {}
+        // Mihomo preserves these VMess aliases, then its outbound constructs
+        // default mKCP. Its converter does not translate seed/header options.
+        "mkcp" | "kcp" if kind == "vmess" => {}
         "http" => {
             let mut options = json!({"path":[path], "headers":{}});
             if !link.get("host").is_empty() {
@@ -512,6 +515,51 @@ fn vmess_json(bytes: &[u8], budget: &mut usize) -> Result<Map<String, Value>> {
     Ok(node)
 }
 
+// SIP003's URL-encoded plugin string is decoded once by Link. Only the
+// converters actually present in Mihomo common/convert/converter.go are used;
+// this is not a generic bridge from URI queries to plugin YAML fields.
+fn shadowsocks_plugin(node: &mut Map<String, Value>, input: &str) -> Result<()> {
+    if input.is_empty() {
+        return Ok(());
+    }
+    let (name, raw_options) = input.split_once(';').ok_or_else(invalid)?;
+    let encoded = raw_options.replace(';', "&");
+    let mut fields = BTreeMap::new();
+    for (name, value) in url::form_urlencoded::parse(encoded.as_bytes()) {
+        fields
+            .entry(name.into_owned())
+            .or_insert_with(|| value.into_owned());
+    }
+    let get = |key: &str| fields.get(key).map_or("", String::as_str);
+    let (plugin, mut options) = if name.contains("obfs") {
+        ("obfs", json!({"mode":get("obfs")}))
+    } else if name.contains("v2ray-plugin") {
+        let mode = if get("mode").is_empty() {
+            get("obfs")
+        } else {
+            get("mode")
+        };
+        (
+            "v2ray-plugin",
+            json!({"mode":mode,"path":get("path"),"tls":fields.contains_key("tls")}),
+        )
+    } else {
+        return Err(invalid());
+    };
+    let host = if plugin == "obfs" || get("host").is_empty() {
+        get("obfs-host")
+    } else {
+        get("host")
+    };
+    // Preserve the strict plugin schema's documented default for absent host.
+    if !host.is_empty() {
+        options["host"] = json!(host);
+    }
+    node.insert("plugin".into(), json!(plugin));
+    node.insert("plugin-opts".into(), options);
+    Ok(())
+}
+
 fn shadowsocks(line: &str, budget: &mut usize) -> Result<Map<String, Value>> {
     let mut link = Link::parse(line, budget)?;
     if link.url.port().is_none() {
@@ -541,12 +589,12 @@ fn shadowsocks(line: &str, budget: &mut usize) -> Result<Map<String, Value>> {
     if !matches!(
         cipher.as_str(),
         "2022-blake3-aes-128-gcm" | "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305"
-    ) || !link.get("plugin").is_empty()
-    {
+    ) {
         return Err(invalid());
     }
     node.insert("cipher".into(), json!(cipher));
     node.insert("password".into(), json!(password));
+    shadowsocks_plugin(&mut node, link.get("plugin"))?;
     node.insert("udp".into(), json!(true));
     if link.get("udp-over-tcp") == "true" || link.get("uot") == "1" {
         node.insert("udp-over-tcp".into(), json!(true));
@@ -1009,6 +1057,99 @@ mod tests {
                     .as_bytes(),
             )
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn newly_supported_uri_transports_reach_the_existing_strict_consumers() {
+        let uuid = "00000000-0000-4000-8000-000000000001";
+        for network in ["kcp", "mkcp"] {
+            let vmess = json!({"v":"2","ps":"edge","add":"proxy.invalid","port":443,"id":uuid,"net":network,"type":"srtp","path":"not-a-seed"});
+            for input in [
+                format!(
+                    "vmess://{}",
+                    STANDARD.encode(serde_json::to_vec(&vmess).unwrap())
+                ),
+                format!("vmess://{uuid}@proxy.invalid:443?type={network}"),
+            ] {
+                let node = one(&input);
+                assert_eq!(node["network"].as_str(), Some(network));
+                assert!(node.get("mkcp-opts").is_none());
+                if cfg!(feature = "outbound-vmess") {
+                    let rule = format!("MATCH,{}", node["name"].as_str().unwrap());
+                    let config = crate::config::Config::parse_yaml(
+                        serde_json::to_vec(&json!({"proxies":[node],"rules":[rule]}))
+                            .unwrap()
+                            .as_slice(),
+                    )
+                    .unwrap();
+                    let crate::config::ProxyProtocol::Vmess(vmess) = &config.proxies[0].protocol
+                    else {
+                        panic!("VMess");
+                    };
+                    let crate::config::StreamTransport::Mkcp(options) = &vmess.transport else {
+                        panic!("mKCP");
+                    };
+                    assert!(options.seed.is_empty());
+                    assert_eq!(options.header, crate::config::MkcpHeader::None);
+                }
+            }
+        }
+        for (plugin, expected, tls) in [
+            (
+                "obfs-local;obfs=http;obfs-host=cover.invalid",
+                "obfs",
+                false,
+            ),
+            ("simple-obfs;obfs=tls;obfs-host=cover.invalid", "obfs", true),
+            (
+                "v2ray-plugin;mode=websocket;host=cover.invalid;path=/edge;tls",
+                "v2ray-plugin",
+                true,
+            ),
+            (
+                "v2ray-plugin;obfs=websocket;obfs-host=cover.invalid;path=/edge",
+                "v2ray-plugin",
+                false,
+            ),
+        ] {
+            let user = URL_SAFE_NO_PAD.encode(format!(
+                "2022-blake3-aes-128-gcm:{}",
+                STANDARD.encode([7u8; 16])
+            ));
+            let mut link = Url::parse(&format!("ss://{user}@proxy.invalid:443#edge")).unwrap();
+            link.query_pairs_mut().append_pair("plugin", plugin);
+            let node = one(link.as_str());
+            assert_eq!(node["plugin"].as_str(), Some(expected));
+            assert_eq!(node["plugin-opts"]["host"].as_str(), Some("cover.invalid"));
+            if cfg!(feature = "outbound-shadowsocks") {
+                let config = crate::config::Config::parse_yaml(
+                    serde_json::to_vec(&json!({"proxies":[node],"rules":["MATCH,edge"]}))
+                        .unwrap()
+                        .as_slice(),
+                )
+                .unwrap();
+                let crate::config::ProxyProtocol::Shadowsocks(ss) = &config.proxies[0].protocol
+                else {
+                    panic!("SS2022");
+                };
+                match ss.plugin.as_ref().unwrap() {
+                    crate::config::ShadowsocksPlugin::Obfs { tls: actual, .. } => {
+                        assert_eq!(*actual, tls)
+                    }
+                    crate::config::ShadowsocksPlugin::WebSocket {
+                        tls: actual,
+                        mux,
+                        gost,
+                        ..
+                    } => {
+                        assert_eq!(actual.is_some(), tls);
+                        assert!(*mux);
+                        assert!(!gost);
+                    }
+                    _ => panic!("URI did not choose its actual plugin consumer"),
+                }
+            }
         }
     }
 

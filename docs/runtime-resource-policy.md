@@ -213,7 +213,7 @@ IP-only协议接点持有`ResolutionContext`，runtime DNS通过Weak绑定，不
 - 节点上游和全部组成员在同一 DAG 中校验；组连接器只持有声明依赖，按逆依赖顺序释放。建链快照只按需记录本次遇到的组，不成为全局缓存。Hysteria2 的已认证连接为后续端口跳跃保留该快照，直到此物理会话退出；它不再读取实时选择，也不延长原建链期限。
 - 同组成功选择是线性化的，不同组独立；选择失败不改变状态，也不创建重试或自动 failover 任务。
 - 切换不扫描或迁移现有 TCP、UDP、DNS transport，不刷新 DNS cache/singleflight 或 TCP pool；资源仍由原所有者按既有 timeout、EOF、取消和 stop 语义回收。
-- Controller 同时最多跟踪 8 个连接任务，包含最多 4 个 WebSocket 订阅。header、PUT body 和输出各有 5 秒期限，PUT body 最大 1 KiB；超时、超限和解析失败只终止当前请求。
+- Controller 同时最多跟踪 8 个连接任务，包含最多 4 个 WebSocket 订阅。header、body 和输出各有 5 秒 I/O 期限；普通 PUT body 最大 1 KiB，`PUT /configs` 在取得独立配置应用许可后允许最多 8 MiB，并使用配置候选的 90 秒总期限。超时、超限和解析失败只终止当前请求。
 - WebSocket 按需采样，不为每个订阅保存历史快照；输出 JSON 在扩容前限制 256 KiB，连接快照先限制 512 个引用。客户端缓冲/消息/帧各 1 KiB，慢写取消当前订阅。日志总线仅在订阅时保留 64 条共享事件，单条 512 字节、每秒 32 条；无订阅不轮询，Stop join 连接并释放订阅。
 
 完整接口见 [运行时 Controller](controller-api.md)。
