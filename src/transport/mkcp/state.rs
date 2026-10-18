@@ -342,7 +342,10 @@ impl State {
             self.tokens = self.rate_bytes;
             self.next_tick = now + Duration::from_millis(u64::from(self.options.tti));
         }
-        let option = u8::from(self.app_end || self.peer_close);
+        // CLOSE advertises our application end. A peer CLOSE only stops new
+        // local writes; reflecting it would make a ReadyToClose peer terminate
+        // before its remaining reply segments have been retransmitted.
+        let option = u8::from(self.app_end);
         if self.ack_dirty && now >= self.ack_at {
             let mut numbers = Vec::new();
             let mut time = 0;
@@ -539,5 +542,153 @@ mod tests {
         assert_eq!(state.shared.acked.load(Ordering::Acquire), 7);
         assert!(before(u32::MAX, 0));
         assert!(!before(0, u32::MAX));
+    }
+
+    #[test]
+    fn mkcp_peer_close_keeps_ack_and_retransmit_open_until_own_application_end() {
+        let mut state = state();
+        let now = Instant::now();
+        state.queue(b"request");
+        let sent = state.next(now).unwrap();
+        assert!(matches!(
+            wire::parse(&sent, state.conv),
+            Some((
+                wire::Segment::Data {
+                    option: 0,
+                    number: 0,
+                    ..
+                },
+                _
+            ))
+        ));
+
+        // An independently closing peer can still owe a lost earlier reply.
+        // Receiving its final-number segment first must preserve that hole.
+        state.input(
+            wire::Segment::Data {
+                option: 1,
+                time: 1,
+                number: 1,
+                sending_next: 0,
+                payload: b"tail",
+            },
+            now,
+        );
+        assert!(state.peer_close);
+        assert!(!state.app_end);
+        assert!(state.ready.is_empty());
+        assert_eq!(state.reorder.len(), 1);
+        assert_eq!(state.read_capacity(), 0);
+        let ack = state.next(now).unwrap();
+        assert!(
+            matches!(
+                wire::parse(&ack, state.conv),
+                Some((wire::Segment::Ack { option: 0, next: 0, numbers, .. }, _))
+                    if numbers == 1u32.to_be_bytes().as_slice()
+            ),
+            "a remote CLOSE is not our CLOSE acknowledgement"
+        );
+
+        // Existing locally queued bytes remain eligible for retransmission,
+        // but also must not pretend the local application closed.
+        let retry = state.next(now + Duration::from_millis(101)).unwrap();
+        assert!(matches!(
+            wire::parse(&retry, state.conv),
+            Some((wire::Segment::Data { option: 0, number: 0, payload, .. }, _))
+                if payload == b"request"
+        ));
+        assert_eq!(state.tx.len(), 1);
+        assert_eq!(state.tx_bytes, 7);
+
+        // The peer's missing retransmission completes the exact reply in
+        // order even though its CLOSE was observed before these bytes.
+        state.input(
+            wire::Segment::Data {
+                option: 1,
+                time: 2,
+                number: 0,
+                sending_next: 0,
+                payload: b"head",
+            },
+            now + Duration::from_millis(102),
+        );
+        let mut reply = Vec::new();
+        while let Some(bytes) = state.ready.front().cloned() {
+            reply.extend_from_slice(&bytes);
+            state.delivered(bytes.len());
+        }
+        assert_eq!(reply, b"headtail");
+        assert_eq!(state.rx_bytes, 0);
+        assert!(state.reorder.is_empty());
+        assert!(!state.finished());
+        let ack = state.next(now + Duration::from_millis(102)).unwrap();
+        assert!(matches!(
+            wire::parse(&ack, state.conv),
+            Some((
+                wire::Segment::Ack {
+                    option: 0,
+                    next: 2,
+                    ..
+                },
+                _
+            ))
+        ));
+
+        // Local application EOF still advertises CLOSE on its next ACK and
+        // pending DATA. Once our DATA is confirmed, termination keeps the
+        // existing bounded closing deadline.
+        state.app_end = true;
+        state.input(
+            wire::Segment::Control {
+                command: 3,
+                option: 1,
+                sending_next: 0,
+                receiving_next: 0,
+                rto: 100,
+            },
+            now + Duration::from_millis(200),
+        );
+        let ack = state.next(now + Duration::from_millis(200)).unwrap();
+        assert!(matches!(
+            wire::parse(&ack, state.conv),
+            Some((
+                wire::Segment::Ack {
+                    option: 1,
+                    next: 2,
+                    ..
+                },
+                _
+            ))
+        ));
+        let retry = state.next(now + Duration::from_millis(302)).unwrap();
+        assert!(matches!(
+            wire::parse(&retry, state.conv),
+            Some((wire::Segment::Data { option: 1, number: 0, payload, .. }, _))
+                if payload == b"request"
+        ));
+        state.input(
+            wire::Segment::Ack {
+                option: 0,
+                window: 100,
+                next: 1,
+                time: 0,
+                numbers: &[],
+            },
+            now + Duration::from_millis(303),
+        );
+        let terminate = state.next(now + Duration::from_millis(303)).unwrap();
+        assert!(matches!(
+            wire::parse(&terminate, state.conv),
+            Some((
+                wire::Segment::Control {
+                    command: 2,
+                    option: 1,
+                    ..
+                },
+                _
+            ))
+        ));
+        assert!(!state.expired(now + Duration::from_secs(8)));
+        assert!(state.expired(now + Duration::from_secs(9)));
     }
 }

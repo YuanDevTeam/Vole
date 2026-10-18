@@ -343,6 +343,8 @@ mKCP 复用同一受控 UDP、建立期限和节点 Stop；发送 MTU扣除全�
 参考实现 nonce/MSS 计算形成的有界额外开销。ACK、重传、乱序和有效载荷分别受字节与项数
 约束，最多16384项；flush 等待已接受写入的远端 ACK。空闲30秒、关闭宽限8秒，
 不是 TCP CloseWrite；不新增 socket 工厂、全局池或第二个执行器。
+对端的 CLOSE 提示不作为本地 CLOSE 回显，仍确认和接收未完成的可靠传输；
+本地应用结束后才发送自身关闭标记。
 
 UDP packet-encoding 默认空串（raw），外层为所选可靠流（mKCP 使用受控 UDP）：
 
