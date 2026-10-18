@@ -6,6 +6,9 @@ pub(crate) mod smux;
 #[cfg(feature = "outbound-shadowsocks")]
 pub(crate) mod ss_framed;
 
+#[cfg(feature = "outbound-vmess")]
+pub(crate) mod mkcp;
+
 #[cfg(feature = "quinn-h3-transport")]
 pub(crate) mod quinn_h3;
 

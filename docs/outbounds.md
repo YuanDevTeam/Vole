@@ -61,7 +61,7 @@ ShadowTLS cover 接受共享 pin/skip/name-cert-verify 与成对 `certificate/pr
 ShadowTLS/JLS 均使用原生完整 TLS 1.3 认证且关闭会话恢复；指纹不能替代密码认证。
 受控上游、建立期限、取消和 Stop 仍由原连接器所有者管理。
 
-VMess 的 TCP/HTTP/H2/gRPC、Trojan 的 TCP/gRPC 可用 `reality-opts`，须提供有效的
+VMess 的 TCP/HTTP/H2/gRPC/mKCP、Trojan 的 TCP/gRPC 可用 `reality-opts`，须提供有效的
 `client-fingerprint`；WS/HTTPUpgrade 不接受 REALITY。REALITY 不混用证书策略、
 mTLS 或 ECH，沿用 [REALITY](reality-wire-protocol.md) 的无回退身份与密钥交换边界。
 
@@ -314,7 +314,7 @@ aes-128-gcm、chacha20-poly1305、none；zero 归一 none。auto 按实际 AES �
 none 只关闭 body 加密，仍验证响应身份；不能启用 global-padding/authenticated-length，
 两开关默认 false。
 
-network 省略/空串为 tcp，另支持 ws/grpc/http/h2；均可明文或 TLS，安全身份范围见上文。tls 默认 false，
+network 省略/空串为 tcp，另支持 ws/grpc/http/h2/mkcp（kcp 为别名）；均可明文或 TLS，安全身份范围见上文。tls 默认 false，
 关闭时禁止 TLS 字段，即便空串、空列表或 false。认证名依次为 servername、WS Host
 去端口、server；HTTP 伪装 Host/H2 authority 不替代认证名。WS 需 http/1.1，gRPC/H2 需 h2。
 TLS 支持独立的 `name-cert-verify` 和成对内联 PEM 或文件路径 `certificate/private-key` 客户端身份。
@@ -328,10 +328,23 @@ TLS 支持独立的 `name-cert-verify` 和成对内联 PEM 或文件路径 `cert
 - h2 的 authority 列表省略/空时使用 www.example.com，path 省略/空时为 /，每流选一个 authority，通过 HTTP/2 PUT body
   双向传输；明文 prior knowledge、TLS h2，无 gRPC 帧。
 
-关闭对齐 Mihomo：TCP/WS 可保留上传 EOF 后的读取；gRPC/HTTP/H2 关闭整条逻辑流，
+关闭对齐 Mihomo：TCP/WS 可保留上传 EOF 后的读取；gRPC/HTTP/H2/mKCP 关闭整条逻辑流，
 完整响应应在关闭前读取，不统一要求半关闭尾包。
 
-UDP packet-encoding 默认空串（raw），外层仍 TCP：
+`network: mkcp` 的 `mkcp-opts` 消费 mtu/tti/uplink-capacity/downlink-capacity/congestion、
+read-buffer/write-buffer、seed/header。容量单位 MiB/s，缓冲单位字节；0 使用默认值。
+MTU 默认1350（576–1460），TTI默认50ms（10–100），上下行容量默认5/20 MiB/s，
+读写缓冲各默认2 MiB、按需分配，上限各16 MiB。header 支持 none/srtp/utp/wechat-video/dtls/wireguard，
+none/noop 与 wechat 别名沿参考归一。空 seed 使用简单校验封装，非空使用 AES-GCM；
+seed 不替代 VMess 身份。对接官方 V2Ray 的无 seed 服务端时应省略其 JSON seed 字段，
+显式空字符串在该服务端仍选择 AES-GCM。mKCP 流继续进入普通 TLS/REALITY，不接受 ShadowTLS/JLS。
+
+mKCP 复用同一受控 UDP、建立期限和节点 Stop；发送 MTU扣除全部封装，接收独立允许
+参考实现 nonce/MSS 计算形成的有界额外开销。ACK、重传、乱序和有效载荷分别受字节与项数
+约束，最多16384项；flush 等待已接受写入的远端 ACK。空闲30秒、关闭宽限8秒，
+不是 TCP CloseWrite；不新增 socket 工厂、全局池或第二个执行器。
+
+UDP packet-encoding 默认空串（raw），外层为所选可靠流（mKCP 使用受控 UDP）：
 
 | 编码 | 目标与预算 |
 | --- | --- |

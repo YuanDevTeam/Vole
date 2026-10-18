@@ -16,6 +16,8 @@ mod http_proxy;
 mod ip_version;
 mod masque;
 mod mieru;
+mod mkcp;
+pub use mkcp::{MkcpHeader, MkcpOptions};
 mod trusttunnel;
 pub use http_proxy::HttpOutboundConfig;
 pub use ip_version::IpVersion;

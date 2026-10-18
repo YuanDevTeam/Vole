@@ -772,6 +772,7 @@ impl UpstreamPath {
     /// Pins a native UDP server using the node resolver when first needed.
     /// Resolving here and opening IO below share the context's group snapshot.
     #[cfg(any(
+        feature = "outbound-vmess",
         feature = "outbound-shadowsocks",
         feature = "outbound-vless",
         feature = "outbound-hysteria2",

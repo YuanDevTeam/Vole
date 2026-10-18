@@ -21,6 +21,7 @@ pub enum VmessPacketEncoding {
 #[derive(Clone, PartialEq, Eq)]
 pub enum StreamTransport {
     Tcp,
+    Mkcp(super::MkcpOptions),
     WebSocket {
         uri: String,
         headers: BTreeMap<String, String>,
@@ -45,6 +46,7 @@ impl std::fmt::Debug for StreamTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Tcp => "Tcp",
+            Self::Mkcp(_) => "Mkcp",
             Self::WebSocket { .. } => "WebSocket",
             Self::Grpc { .. } => "Grpc",
             Self::Http { .. } => "Http",
@@ -304,6 +306,12 @@ pub(super) struct RawVmess {
     #[serde(rename = "packet-encoding", default)]
     packet_encoding: VmessPacketEncoding,
     #[serde(
+        rename = "mkcp-opts",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    mkcp: Option<super::mkcp::RawMkcp>,
+    #[serde(
         rename = "ws-opts",
         default,
         deserialize_with = "deserialize_present_option"
@@ -367,20 +375,44 @@ impl RawVmess {
         {
             return invalid("VMess TLS options require tls=true");
         }
-        let (transport, fallback_name) = normalize_transport(
-            &self.server,
-            self.port,
-            self.tls,
-            self.network
-                .as_deref()
-                .filter(|network| !network.is_empty())
-                .unwrap_or("tcp"),
-            self.ws,
-            self.grpc,
-            self.http,
-            self.h2,
-            self.servername.as_deref().filter(|name| !name.is_empty()),
-        )?;
+        let network = self
+            .network
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("tcp");
+        let (transport, fallback_name) = if matches!(network, "mkcp" | "kcp") {
+            if self.ws.is_some() || self.grpc.is_some() || self.http.is_some() || self.h2.is_some()
+            {
+                return invalid("VMess mKCP cannot enable TCP transport options");
+            }
+            (
+                StreamTransport::Mkcp(self.mkcp.unwrap_or_default().normalize()?),
+                self.server.clone(),
+            )
+        } else {
+            if self.mkcp.is_some() {
+                return invalid("mkcp-opts requires VMess network mkcp");
+            }
+            normalize_transport(
+                &self.server,
+                self.port,
+                self.tls,
+                self.network
+                    .as_deref()
+                    .filter(|network| !network.is_empty())
+                    .unwrap_or("tcp"),
+                self.ws,
+                self.grpc,
+                self.http,
+                self.h2,
+                self.servername.as_deref().filter(|name| !name.is_empty()),
+            )?
+        };
+        if matches!(transport, StreamTransport::Mkcp(_))
+            && (self.shadow_tls_opts.is_some() || self.jls_opts.is_some())
+        {
+            return invalid("VMess mKCP cannot use ShadowTLS or JLS");
+        }
         let server_name = self
             .servername
             .filter(|name| !name.is_empty())
@@ -636,4 +668,48 @@ pub(super) fn normalize_transport(
         _ => return invalid("stream transport options do not match network"),
     };
     Ok((transport, fallback_name))
+}
+
+#[cfg(all(test, feature = "outbound-vmess"))]
+mod mkcp_tests {
+    use super::*;
+    fn raw(extra: serde_json::Value) -> RawVmess {
+        let mut value = serde_json::json!({"name":"mKCP", "server":"192.0.2.1", "port":443, "uuid":"11111111-1111-4111-8111-111111111111", "network":"mkcp"});
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    }
+    #[test]
+    fn mkcp_vmess_options_select_real_transport_and_existing_tls() {
+        for network in ["mkcp", "kcp"] {
+            let (_,_,_,protocol)=raw(serde_json::json!({"network":network,"mkcp-opts":{"header":"wireguard","seed":"known peer","read-buffer":65536}})).normalize().unwrap();
+            let ProxyProtocol::Vmess(config) = protocol else {
+                panic!("VMess")
+            };
+            let StreamTransport::Mkcp(options) = config.transport else {
+                panic!("mKCP")
+            };
+            assert_eq!(options.header, super::super::MkcpHeader::Wireguard);
+            assert_eq!(options.read_buffer, 65536);
+        }
+        let (_, _, _, protocol) = raw(serde_json::json!({"tls":true})).normalize().unwrap();
+        let ProxyProtocol::Vmess(config) = protocol else {
+            panic!("VMess")
+        };
+        assert!(matches!(
+            config.security,
+            super::super::SecurityConfig::Tls(_)
+        ));
+        for extra in [
+            serde_json::json!({"servername":"example.org"}),
+            serde_json::json!({"ws-opts":{}}),
+            serde_json::json!({"network":"tcp","mkcp-opts":{}}),
+            serde_json::json!({"tls":true,"shadow-tls-opts":{"version":3,"password":"synthetic-cover"}}),
+            serde_json::json!({"tls":true,"jls-opts":{"username":"synthetic-user","password":"synthetic-password"}}),
+        ] {
+            assert!(raw(extra).normalize().is_err());
+        }
+    }
 }

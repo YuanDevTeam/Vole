@@ -15,7 +15,10 @@ use crate::{
     transport::{GrpcPool, connect_websocket, http_obfs, legacy_h2},
 };
 use async_trait::async_trait;
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{Arc, Mutex},
+};
 use tokio::{io::AsyncWriteExt, time::Instant};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -34,6 +37,7 @@ pub struct VmessOutbound {
     grpc_pool: Option<GrpcPool>,
     cancellation: CancellationToken,
     tasks: TaskTracker,
+    driver_admission: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for VmessOutbound {
@@ -87,6 +91,7 @@ impl VmessOutbound {
             },
             cancellation: CancellationToken::new(),
             tasks: TaskTracker::new(),
+            driver_admission: Arc::new(Mutex::new(())),
         })
     }
     async fn connect_transport(
@@ -94,11 +99,40 @@ impl VmessOutbound {
         session: StreamSession,
         context: &EstablishContext,
     ) -> Result<BoxStream, DispatchError> {
-        let raw = self
-            .upstream
-            .connect_server(session, &self.server, context)
-            .await?
-            .io;
+        let raw = if let VmessTransport::Mkcp(options) = &self.options.transport {
+            let server = self.upstream.datagram_server(&self.server, context).await?;
+            let peer = context.resolve_ip(&server).await?;
+            let request = DatagramRequest::new(
+                crate::session::DatagramSession::new(session.inbound, session.source)
+                    .with_metadata(session.metadata),
+            )
+            .with_budget(DatagramBudget::new(
+                options.mtu,
+                options.peer_receive_limit(),
+            ));
+            let transport = self.upstream.open_datagram(request, context).await?;
+            // Registration and node Stop are synchronous under one small lock;
+            // TLS/authentication and UDP IO never hold this admission guard.
+            let _admission = self
+                .driver_admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.cancellation.is_cancelled() {
+                return Err(DispatchError::NotAllowed);
+            }
+            crate::transport::mkcp::connect(
+                transport,
+                peer,
+                options.clone(),
+                self.cancellation.child_token(),
+                &self.tasks,
+            )?
+        } else {
+            self.upstream
+                .connect_server(session, &self.server, context)
+                .await?
+                .io
+        };
         context
             .run_io(
                 "VMess transport handshake",
@@ -123,7 +157,7 @@ impl VmessOutbound {
                     }).await?
                 } else { self.connect_transport(session,context).await? };
                 let token=self.cancellation.child_token();
-                Ok(PreparedStream { raw:Box::new(OwnedStream::new(raw,token.clone())),options:self.options.clone(),deadline:context.deadline(),tasks:self.tasks.clone(),token })
+                Ok(PreparedStream { raw:Box::new(OwnedStream::new(raw,token.clone())),options:self.options.clone(),deadline:context.deadline(),tasks:self.tasks.clone(),token,driver_admission:self.driver_admission.clone() })
             }=>result,
         }
     }
@@ -135,6 +169,7 @@ struct PreparedStream {
     deadline: Instant,
     tasks: TaskTracker,
     token: CancellationToken,
+    driver_admission: Arc<Mutex<()>>,
 }
 impl PreparedStream {
     async fn finish(
@@ -149,7 +184,10 @@ impl PreparedStream {
             ClientHandshake::new(&self.options.identity, command, target, self.options.body)?;
         let whole_close = matches!(
             self.options.transport,
-            VmessTransport::Grpc { .. } | VmessTransport::Http { .. } | VmessTransport::H2 { .. }
+            VmessTransport::Grpc { .. }
+                | VmessTransport::Http { .. }
+                | VmessTransport::H2 { .. }
+                | VmessTransport::Mkcp(_)
         );
         let deadline = self.deadline;
         let result = tokio::time::timeout_at(deadline, async {
@@ -157,7 +195,7 @@ impl PreparedStream {
             let mut sent = false;
             let mut driver = None;
             match &self.options.transport {
-                VmessTransport::Tcp => {}
+                VmessTransport::Tcp | VmessTransport::Mkcp(_) => {}
                 VmessTransport::WebSocket { .. } => {
                     raw = connect_websocket(
                         raw,
@@ -199,11 +237,27 @@ impl PreparedStream {
             if let Some(driver) = driver {
                 let token = self.token.clone();
                 let observation = observation::track(ResourceKind::Task);
-                self.tasks.spawn(observation::bind(async move {
+                let task = observation::bind(async move {
                     let _observation = observation;
                     token.cancelled().await;
                     let _ = driver.stop().await;
-                }));
+                });
+                let unregistered = {
+                    let _admission = self
+                        .driver_admission
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if self.token.is_cancelled() {
+                        Some(task)
+                    } else {
+                        self.tasks.spawn(task);
+                        None
+                    }
+                };
+                if let Some(task) = unregistered {
+                    task.await;
+                    return Err(io::ErrorKind::ConnectionAborted.into());
+                }
             }
             // Dropping setup after a partial header must also stop an H2 driver.
             let guard = self.token.clone().drop_guard();
@@ -298,7 +352,12 @@ impl OutboundConnector for VmessOutbound {
         ))
     }
     fn begin_shutdown(&self) {
+        let _admission = self
+            .driver_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.cancellation.cancel();
+        self.tasks.close();
         if let Some(pool) = &self.grpc_pool {
             pool.begin_shutdown();
         }
