@@ -23,7 +23,7 @@ impl Fec {
         let codec = if k == 0 || n == 0 {
             None
         } else {
-            Some(ReedSolomon::new(k, n).map_err(io::Error::other)?)
+            Some(ReedSolomon::new(k, n).map_err(codec_error)?)
         };
         let size = (k + n).max(1) as u32;
         Ok(Self {
@@ -59,7 +59,7 @@ impl Fec {
                 .as_ref()
                 .unwrap()
                 .encode(&mut shards)
-                .map_err(io::Error::other)?;
+                .map_err(codec_error)?;
             for shard in &shards[self.k..] {
                 output.push(self.frame(PARITY, shard));
             }
@@ -140,6 +140,10 @@ impl Fec {
         }
         Ok(output)
     }
+}
+
+fn codec_error(error: reed_solomon_erasure::Error) -> io::Error {
+    io::Error::other(error.to_string())
 }
 
 #[cfg(test)]
