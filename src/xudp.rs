@@ -409,10 +409,18 @@ pub(crate) fn encode_data_frame(
         )
     })?;
 
-    let mut destination = BytesMut::with_capacity(19);
-    encode_destination(&datagram.remote, &mut destination)?;
+    let destination_length = match &datagram.remote {
+        Destination::Ip(address) if address.is_ipv4() => 7,
+        Destination::Ip(_) => 19,
+        Destination::Domain { host, .. } => {
+            let length = u8::try_from(host.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "proxy domain is too long")
+            })?;
+            4 + usize::from(length)
+        }
+    };
     let global_id_length = global_id.map_or(0, |_| 8);
-    let metadata_length = 2 + 1 + 1 + 1 + destination.len() + global_id_length;
+    let metadata_length = 2 + 1 + 1 + 1 + destination_length + global_id_length;
     let metadata_length = u16::try_from(metadata_length).expect("XUDP metadata is bounded");
 
     let mut output =
@@ -422,7 +430,7 @@ pub(crate) fn encode_data_frame(
     output.put_u8(if first { STATUS_NEW } else { STATUS_KEEP });
     output.put_u8(OPTION_DATA);
     output.put_u8(NETWORK_UDP);
-    output.extend_from_slice(&destination);
+    encode_destination(&datagram.remote, &mut output)?;
     if let Some(global_id) = global_id {
         output.extend_from_slice(&global_id);
     }
@@ -663,15 +671,75 @@ mod tests {
             "FOUNDATIONS-XUDP",
             "followup_frame_carries_each_datagrams_destination",
         );
-        let datagram = Datagram {
-            remote: Destination::domain("dns.example", 53).unwrap(),
-            payload: Bytes::from_static(b"q"),
+        let cases: [(Destination, &[u8]); 2] = [
+            (
+                Destination::domain("dns.example", 53).unwrap(),
+                b"\x00\x14\x00\x00\x02\x01\x02\x00\x35\x02\x0bdns.example\x00\x01q",
+            ),
+            (
+                "[2001:db8::1]:443"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap()
+                    .into(),
+                &[
+                    0, 24, 0, 0, 2, 1, 2, 1, 187, 3, // KEEP, UDP, port, IPv6
+                    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, b'q',
+                ],
+            ),
+        ];
+        for (remote, expected) in cases {
+            let datagram = Datagram {
+                remote,
+                payload: Bytes::from_static(b"q"),
+                sniffed_domain: None,
+            };
+            assert_eq!(
+                encode_data_frame(&datagram, false, None).unwrap().as_ref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_domain_and_payload_preserve_wire_lengths_and_reject_overflow() {
+        let mut datagram = Datagram {
+            remote: Destination::domain("x".repeat(255), 443).unwrap(),
+            payload: Bytes::from(vec![7; usize::from(u16::MAX)]),
             sniffed_domain: None,
         };
-        let frame = encode_data_frame(&datagram, false, None).unwrap();
-        assert_eq!(u16::from_be_bytes([frame[0], frame[1]]), 20);
-        assert_eq!(&frame[2..7], &[0, 0, STATUS_KEEP, OPTION_DATA, NETWORK_UDP]);
-        assert!(frame.ends_with(&[0, 1, b'q']));
+        let frame = encode_data_frame(&datagram, true, Some([9; 8])).unwrap();
+        assert_eq!(frame.len(), 65_811);
+        assert_eq!(&frame[..11], &[1, 16, 0, 0, 1, 1, 2, 1, 187, 2, 255]);
+        assert!(frame[11..266].iter().all(|byte| *byte == b'x'));
+        assert_eq!(&frame[266..274], &[9; 8]);
+        assert_eq!(&frame[274..276], &[255, 255]);
+        assert!(frame[276..].iter().all(|byte| *byte == 7));
+
+        datagram.payload = Bytes::from(vec![7; usize::from(u16::MAX) + 1]);
+        assert_eq!(
+            encode_data_frame(&datagram, false, None)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        datagram.payload = Bytes::new();
+        assert_eq!(
+            encode_data_frame(&datagram, false, None)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        datagram.payload = Bytes::from_static(b"q");
+        datagram.remote = Destination::Domain {
+            host: "x".repeat(256),
+            port: 443,
+        };
+        assert_eq!(
+            encode_data_frame(&datagram, false, None)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

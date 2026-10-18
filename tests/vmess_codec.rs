@@ -8,11 +8,11 @@ use vole::{
 };
 
 #[tokio::test]
-async fn xudp_cancelled_send_and_bad_frame_release_io_and_cannot_resume() {
+async fn xudp_explicit_close_after_cancel_and_bad_frame_release_io() {
     #[cfg(feature = "interop-test")]
     let _evidence = vole::resources::case_events::Case::new(
         "VMESS-CODEC",
-        "xudp_cancelled_send_and_bad_frame_release_io_and_cannot_resume",
+        "xudp_explicit_close_after_cancel_and_bad_frame_release_io",
     );
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use vole::{dispatch::DatagramTransport, session::Datagram, xudp::XudpTransport};
@@ -34,6 +34,9 @@ async fn xudp_cancelled_send_and_bad_frame_release_io_and_cannot_resume() {
         .await
         .is_err()
     );
+    // Cancellation retains the pending XUDP frame for a later send/receive.
+    // Explicit close abandons it without inserting END into the partial frame.
+    client.close().await.unwrap();
     let mut wire = Vec::new();
     tokio::time::timeout(
         std::time::Duration::from_millis(100),

@@ -167,6 +167,10 @@ Vision padding、TLS 记录过滤和读写切换状态独立管理。内层非 T
 
 `none` 是 Vole 的显式 raw 拼写，不是对 Mihomo 同名字段的兼容承诺。原生约定地址不做本地 DNS。UDP 443 不额外过滤。
 
+VLESS 不发送非零 XUDP GlobalID，不请求服务端跨载体继承 UDP 关联。同一来源可能同时拥有
+不同节点、资源代际、域名隔离或退役后仍服务兄弟目标的通道；这些通道保持独立，不能仅按
+来源生成相同 GlobalID。当前关联失败后关闭，不自动重连或恢复服务端原有 UDP 出口映射。
+
 raw/packetaddr 每关联只拥有一个已建流，首次发送前已固定物理上游选择和建链期限；等待首包不会重新选择组或重启期限。packetaddr 不调用系统 resolver：运行期使用本 Running Session DNS，独立测速使用受控 bootstrap。
 
 收发预算独立与调用方预算取交集。raw/XUDP payload 受 u16 上限约束，packetaddr 另扣 IPv4 7 / IPv6 19 字节地址头（未解析域名按较大开销预检）。raw/packetaddr 接收 wire 最多 65,537 字节，逐段读取，合法超接收预算的整包丢弃。对端可能有更小容量，原生夹具预算不能冒充生产协议上限。
