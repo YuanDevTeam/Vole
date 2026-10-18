@@ -7,7 +7,7 @@ REALITY、JLS、ECH 的身份规则见 [VLESS](vless.md)，实际验证边界见
 
 `network: xhttp` 使用现有 Dialer、上游图、保护接口与 SecurityClient，不另建系统解析器或裸 socket。`alpn: [http/1.1]` 选择 H1；空列表、`[h2]` 或包含 H1/H2 的列表选择 H2；只有独占 `[h3]` 选择 H3。不会静默降级 HTTP 版本。
 
-H1/H2 可使用明文、标准 TLS 1.3、REALITY（经典默认、显式混合模式）或 JLS。H3 使用官方 h3/h3-quinn 与 Quinn，必须使用标准 TLS 1.3，不允许同腿明文、REALITY 或 JLS。QUIC 收发走受控数据报，上游任一方向有效预算小于 1200 字节即拒绝，不绕开代理、protect 或接口绑定；发送从 1200 字节起探测 MTU，探测上限受发送预算约束，接收广告独立使用实际接收预算。
+H1/H2 可使用明文、标准 TLS 1.3、REALITY（经典默认、显式混合模式）、JLS 或 ShadowTLS v3。H3 使用官方 h3/h3-quinn 与 Quinn，必须使用标准 TLS 1.3，不允许同腿明文、REALITY、JLS 或 ShadowTLS。QUIC 收发走受控数据报，上游任一方向有效预算小于 1200 字节即拒绝，不绕开代理、protect 或接口绑定；发送从 1200 字节起探测 MTU，探测上限受发送预算约束，接收广告独立使用实际接收预算。
 
 `xhttp-opts.mode` 接受 `auto`（省略或空串默认）、`packet-up`、`stream-up`、`stream-one`。auto 在 REALITY 无下载配置时选择 stream-one，有下载配置时选择 stream-up，其余选择 packet-up。stream-one 是一条双工 POST，不允许 `download-settings`；其余模式以同一会话 ID 关联上传与下载。`path` 省略或空串默认 `/`，`host` 显式非空优先，否则使用该腿 servername/server；IPv6 authority 使用方括号。主腿与下载腿的 host 均禁止 userinfo（`@`）。
 
@@ -64,7 +64,7 @@ H1 编码保留正文 backing，不将整批正文再次拼入头部写缓冲；
 
 `download-settings` 缺省和 `{}` 不等价：存在即启用独立下载连接/池，但仍共用一次 VLESS 握手、会话 ID 和建链上下文。两腿必须汇聚到**同一个原生 XHTTP handler 的会话表**；两个独立 listener 不能构成共享会话。
 
-可覆盖 `server/port/tls/servername/alpn/host/path/headers`、`client-fingerprint`、普通 TLS 的 `skip-cert-verify/name-cert-verify/fingerprint/certificate/private-key/ech-opts`、`reality-opts`、`jls-opts` 和 `reuse-settings`。
+可覆盖 `server/port/tls/servername/alpn/host/path/headers`、`client-fingerprint`、普通 TLS 的 `skip-cert-verify/name-cert-verify/fingerprint/certificate/private-key/ech-opts`、`reality-opts`、`jls-opts`、`shadow-tls-opts` 和 `reuse-settings`。
 
 - 缺省叶字段继承主腿。headers 是整体替换，`{}` 清空；显式空 host 恢复下载认证名/server 推导。
 - `skip-cert-verify: false` 必须覆盖主腿 true；空 name-cert-verify/fingerprint 清除对应 override/pin。
@@ -72,6 +72,7 @@ H1 编码保留正文 backing，不将整批正文再次拼入头部写缓冲；
 - certificate/private-key 必须配对替换或同时空串清除；PEM 与密钥匹配在 IO 前检查。
 - reality-opts 缺省继承整个对象，`{}` 清除；非空对象必须提供 public-key，short-id 缺省空、support-x25519mlkem768 缺省 false，不按叶合并旧对象。仅提供混合开关不等同空对象，仍须提供 public-key。null 拒绝。
 - jls-opts 缺省继承整个身份，非空对象必须完整替换 username/password，`{}` 清除；同腿与 REALITY 和证书策略互斥，切换时须显式清除旧对象。JLS 仅 H1/H2，实际 TLS1.3，无恢复；完整约束见 [JLS](vless.md#jls)。
+- shadow-tls-opts 缺省继承整个身份，非空对象须完整提供 version 3/password，`{}` 清除。仅 H1/H2，与 REALITY/JLS/ECH 互斥；cover 证书策略和 mTLS 按下载腿重算，模式切换须显式清除冲突身份。
 - ech-opts 缺省继承、对象整体替换，`{}` 清除。`enable: true` 使用非空静态 config 或节点 DNS 的 HTTPS key 5，静态优先；query-server-name 只覆盖查询名。按下载腿实际 TLS backend 从完整来源重选配置。仅标准 TLS，可用于 H1/H2/H3；切换到 REALITY/JLS/明文前必须显式清除继承的 ECH。失败不重拨或重放。
 - 切换到明文或 REALITY 不会悄悄丢弃继承的证书策略；须显式清除冲突字段。每条腿独立重新校验最终安全配置。
 - 独立地址/端口在实际建立物理连接时通过节点 resolver 分别解析；两腿共享原绝对期限和每个上游组的选择快照，下载失败不会另起超时预算或绕过原图。

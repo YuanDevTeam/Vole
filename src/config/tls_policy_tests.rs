@@ -36,21 +36,29 @@ fn parse(node: serde_json::Value) -> Result<Config> {
     )
 }
 
-fn policy(config: &Config) -> &TlsClientPolicy {
-    match &config.proxies[0].protocol {
-        ProxyProtocol::AnyTls(config) => &config.tls,
-        ProxyProtocol::Trojan(config) => &config.tls,
-        ProxyProtocol::Vmess(config) => config.tls.as_ref().unwrap(),
-        ProxyProtocol::Socks5(config) => config.tls.as_ref().unwrap(),
+fn policy(config: &Config) -> TlsClientPolicy {
+    let security = match &config.proxies[0].protocol {
+        ProxyProtocol::AnyTls(config) => &config.security,
+        ProxyProtocol::Trojan(config) => &config.security,
+        ProxyProtocol::Vmess(config) => &config.security,
+        ProxyProtocol::Socks5(config) => return config.tls.clone().unwrap(),
         _ => unreachable!(),
+    };
+    let tls = security.as_tls().unwrap();
+    TlsClientPolicy {
+        ech: tls.ech.clone(),
+        client_fingerprint: tls.client_fingerprint,
+        alpn: tls.alpn.clone(),
+        certificate: tls.certificate.clone(),
+        identity: tls.identity.clone(),
     }
 }
 
 fn client_identity(config: &Config) -> &TlsIdentityPem {
     let identity = match &config.proxies[0].protocol {
-        ProxyProtocol::AnyTls(config) => &config.tls.identity,
-        ProxyProtocol::Trojan(config) => &config.tls.identity,
-        ProxyProtocol::Vmess(config) => &config.tls.as_ref().unwrap().identity,
+        ProxyProtocol::AnyTls(config) => &config.security.as_tls().unwrap().identity,
+        ProxyProtocol::Trojan(config) => &config.security.as_tls().unwrap().identity,
+        ProxyProtocol::Vmess(config) => &config.security.as_tls().unwrap().identity,
         ProxyProtocol::Socks5(config) => &config.tls.as_ref().unwrap().identity,
         ProxyProtocol::Http(config) => &config.tls.as_ref().unwrap().identity,
         ProxyProtocol::Hysteria2(config) => &config.tls.identity,
@@ -220,7 +228,7 @@ fn common_tls_policy_keeps_verified_identity_separate_from_server_name() {
         );
         assert_eq!(policy.certificate.fingerprint, Some([0xab; 32]));
         assert!(
-            crate::security::TlsClientOptions::from_policy(policy, None)
+            crate::security::TlsClientOptions::from_policy(&policy, None)
                 .unwrap()
                 .identity
                 .is_some()
@@ -288,18 +296,18 @@ fn common_tls_empty_overrides_use_defaults_without_a_client_identity() {
             let (name, certificate, has_identity, has_profile) = match &config.proxies[0].protocol {
                 ProxyProtocol::AnyTls(node) => (
                     node.server_name.as_str(),
-                    &node.tls.certificate,
-                    node.tls.identity.is_some(),
-                    node.tls.client_fingerprint.is_some(),
+                    &node.security.as_tls().unwrap().certificate,
+                    node.security.as_tls().unwrap().identity.is_some(),
+                    node.security.as_tls().unwrap().client_fingerprint.is_some(),
                 ),
                 ProxyProtocol::Trojan(node) => (
                     node.server_name.as_str(),
-                    &node.tls.certificate,
-                    node.tls.identity.is_some(),
-                    node.tls.client_fingerprint.is_some(),
+                    &node.security.as_tls().unwrap().certificate,
+                    node.security.as_tls().unwrap().identity.is_some(),
+                    node.security.as_tls().unwrap().client_fingerprint.is_some(),
                 ),
                 ProxyProtocol::Vmess(node) => {
-                    let tls = node.tls.as_ref().unwrap();
+                    let tls = node.security.as_tls().unwrap();
                     (
                         node.server_name.as_str(),
                         &tls.certificate,

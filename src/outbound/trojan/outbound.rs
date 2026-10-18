@@ -12,9 +12,7 @@ use crate::{
         ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector, UpstreamPath,
         server_destination,
     },
-    security::{
-        SecurityContext, StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsClientOptions,
-    },
+    security::{SecurityClient, SecurityContext, TLS_RESUMPTION_SESSION_BUDGET},
     session::{Destination, StreamSession},
     transport::{GrpcPool, WebSocketOptions, connect_websocket},
 };
@@ -25,7 +23,7 @@ pub struct TrojanOutbound {
     server: Destination,
     upstream: UpstreamPath,
     auth: TrojanAuth,
-    tls: StandardTlsClient,
+    security: SecurityClient,
     cancellation: CancellationToken,
     transport: Transport,
 }
@@ -80,10 +78,9 @@ impl TrojanOutbound {
             server: server_destination(&config.address, config.port)?,
             upstream,
             auth: TrojanAuth::new(&config.password)?,
-            tls: StandardTlsClient::with_options(
+            security: SecurityClient::from_security_with_context(
+                &config.security,
                 security,
-                &config.server_name,
-                TlsClientOptions::from_policy(&config.tls, config.transport.required_alpn())?,
                 resumption_sessions,
                 buffer_limit,
             )?,
@@ -103,7 +100,7 @@ impl TrojanOutbound {
         context
             .run_io(
                 "Trojan TLS handshake",
-                self.tls.connect_with_context(raw.io, context),
+                self.security.connect_with_context(raw.io, context),
             )
             .await
     }

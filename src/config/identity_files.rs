@@ -24,6 +24,17 @@ impl<'a> IdentityFiles<'a> {
         let Some(map) = node.as_mapping_mut() else {
             return Ok(()); // The strict node parser reports the invalid shape.
         };
+        if map.get("type").and_then(Value::as_str) == Some("ss")
+            && matches!(
+                map.get("plugin").and_then(Value::as_str),
+                Some("shadow-tls" | "v2ray-plugin" | "gost-plugin")
+            )
+        {
+            if let Some(options) = map.get_mut("plugin-opts").and_then(Value::as_mapping_mut) {
+                self.inline_pair(options)?;
+            }
+            return Ok(());
+        }
         if !matches!(
             map.get("type").and_then(Value::as_str),
             Some(

@@ -299,15 +299,15 @@ fn ech_is_consumed_by_every_reference_protocol_without_changing_the_tls_name() {
             .unwrap();
             match &config.proxies[0].protocol {
                 ProxyProtocol::AnyTls(p) => {
-                    assert!(p.tls.ech.is_some());
+                    assert!(p.security.as_tls().unwrap().ech.is_some());
                     assert_eq!(p.server_name, "example.invalid");
                 }
                 ProxyProtocol::Trojan(p) => {
-                    assert!(p.tls.ech.is_some());
+                    assert!(p.security.as_tls().unwrap().ech.is_some());
                     assert_eq!(p.server_name, "example.invalid");
                 }
                 ProxyProtocol::Vmess(p) => {
-                    assert!(p.tls.as_ref().unwrap().ech.is_some());
+                    assert!(p.security.as_tls().unwrap().ech.is_some());
                     assert_eq!(p.server_name, "example.invalid");
                 }
                 ProxyProtocol::Hysteria2(p) => {

@@ -52,6 +52,7 @@ mod functional;
 mod identity_files;
 mod ip_suffix;
 mod process;
+mod security;
 pub use process::{FindProcessMode, ProcessField, ProcessRule, UidRange};
 mod name_regex;
 mod override_expr;
@@ -84,8 +85,12 @@ mod jls;
 pub use jls::JlsConfig;
 mod tls_trust;
 pub use tls_trust::TlsTrustConfig;
+mod kcptun;
 mod shadowsocks;
+mod shadowsocks_plugin;
+pub use kcptun::KcptunConfig;
 pub use shadowsocks::{ShadowTlsConfig, ShadowsocksCipher, ShadowsocksOutboundConfig};
+pub use shadowsocks_plugin::ShadowsocksPlugin;
 mod trojan;
 pub use trojan::{TrojanOutboundConfig, TrojanTransport, WebSocketHandshake};
 mod vless;
@@ -877,7 +882,7 @@ pub struct AnyTlsOutboundConfig {
     pub port: u16,
     pub password: String,
     pub server_name: String,
-    pub tls: TlsClientPolicy,
+    pub security: SecurityConfig,
     pub session: AnyTlsSessionOptions,
 }
 
@@ -971,15 +976,24 @@ pub enum SecurityConfig {
     Tls(TlsConfig),
     Reality(RealityConfig),
     Jls(JlsConfig),
+    ShadowTls(ShadowTlsConfig),
 }
 
 impl SecurityConfig {
+    #[must_use]
+    pub fn as_tls(&self) -> Option<&TlsConfig> {
+        match self {
+            Self::Tls(config) => Some(config),
+            _ => None,
+        }
+    }
     fn client_fingerprint(&self) -> Option<ClientFingerprint> {
         match self {
             Self::None => None,
             Self::Tls(config) => config.client_fingerprint,
             Self::Reality(config) => config.client_fingerprint,
             Self::Jls(config) => config.tls.client_fingerprint,
+            Self::ShadowTls(config) => config.client_fingerprint,
         }
     }
     #[must_use]
@@ -989,6 +1003,7 @@ impl SecurityConfig {
             Self::Tls(config) => &config.server_name,
             Self::Reality(config) => &config.server_name,
             Self::Jls(config) => &config.tls.server_name,
+            Self::ShadowTls(config) => &config.server_name,
         }
     }
 }
@@ -1723,9 +1738,9 @@ enum RawProtocol {
         #[serde(
             rename = "plugin-opts",
             default,
-            deserialize_with = "shadowsocks::deserialize_plugin"
+            deserialize_with = "shadowsocks_plugin::deserialize"
         )]
-        plugin_opts: Option<shadowsocks::RawShadowTls>,
+        plugin_opts: Option<serde_yaml_ng::Value>,
         #[serde(
             rename = "client-fingerprint",
             default,
@@ -1815,8 +1830,12 @@ enum RawProtocol {
         sni: Option<String>,
         #[serde(default, deserialize_with = "deserialize_present_option")]
         alpn: Option<Vec<String>>,
-        #[serde(rename = "skip-cert-verify", default)]
-        skip_cert_verify: bool,
+        #[serde(
+            rename = "skip-cert-verify",
+            default,
+            deserialize_with = "deserialize_present_option"
+        )]
+        skip_cert_verify: Option<bool>,
         #[serde(default, deserialize_with = "deserialize_present_option")]
         fingerprint: Option<String>,
         #[serde(
@@ -1839,6 +1858,14 @@ enum RawProtocol {
             deserialize_with = "deserialize_present_option"
         )]
         client_fingerprint: Option<String>,
+        #[serde(
+            rename = "shadow-tls-opts",
+            default,
+            deserialize_with = "security::deserialize_shadow_tls"
+        )]
+        shadow_tls_opts: Option<security::RawShadowTlsMode>,
+        #[serde(rename = "jls-opts", default, deserialize_with = "jls::deserialize")]
+        jls_opts: Option<jls::RawJls>,
         #[serde(rename = "ech-opts", default, deserialize_with = "ech::deserialize")]
         ech_opts: Option<ech::RawEch>,
         #[serde(
@@ -2066,6 +2093,12 @@ struct RawXHttpDownloadSettings {
         deserialize_with = "deserialize_present_map"
     )]
     reality_opts: Option<RawXHttpDownloadReality>,
+    #[serde(
+        rename = "shadow-tls-opts",
+        default,
+        deserialize_with = "security::deserialize_shadow_tls"
+    )]
+    shadow_tls_opts: Option<security::RawShadowTlsMode>,
     #[serde(rename = "jls-opts", default, deserialize_with = "jls::deserialize")]
     jls_opts: Option<jls::RawJls>,
     #[serde(rename = "ech-opts", default, deserialize_with = "ech::deserialize")]
@@ -2936,17 +2969,21 @@ impl RawOutbound {
                 dialer_proxy,
             } => {
                 let mut config = shadowsocks::normalize(server, port, cipher, password)?;
-                config.shadow_tls = shadowsocks::plugin(plugin, plugin_opts, client_fingerprint)?;
+                config.plugin =
+                    shadowsocks_plugin::normalize(plugin, plugin_opts, client_fingerprint, port)?;
+                let requires_uot = matches!(config.plugin, Some(ShadowsocksPlugin::Kcptun(_)));
                 if udp_over_tcp && !cfg!(feature = "outbound-shadowsocks") {
                     return invalid("Shadowsocks UoT support is not enabled in this build");
                 }
                 if udp_over_tcp && !udp {
                     return invalid("Shadowsocks udp-over-tcp requires udp: true");
                 }
-                if udp_over_tcp_version.is_some_and(|version| !udp_over_tcp || version != 2) {
+                if udp_over_tcp_version
+                    .is_some_and(|version| !(udp_over_tcp || requires_uot) || version != 2)
+                {
                     return invalid("Shadowsocks udp-over-tcp-version requires enabled UoT v2");
                 }
-                config.udp_over_tcp = udp_over_tcp;
+                config.udp_over_tcp = udp_over_tcp || requires_uot;
                 (name, dialer_proxy, udp, ProxyProtocol::Shadowsocks(config))
             }
             RawProtocol::Vless(raw) => raw.normalize()?,
@@ -3008,22 +3045,30 @@ impl RawOutbound {
                 private_key,
                 client_fingerprint,
                 ech_opts,
+                shadow_tls_opts,
+                jls_opts,
                 dialer_proxy,
             } => {
+                let certificate_options = skip_cert_verify.is_some()
+                    || fingerprint.is_some()
+                    || name_cert_verify.is_some()
+                    || certificate.is_some()
+                    || private_key.is_some();
                 let mut config = normalize_anytls(
                     server,
                     port,
                     password,
                     sni,
                     alpn,
-                    skip_cert_verify,
+                    skip_cert_verify.unwrap_or(false),
                     fingerprint,
                 )?;
-                config.tls.certificate.verification_name =
-                    normalize_verification_name(name_cert_verify)?;
-                config.tls.identity = normalize_client_identity(certificate, private_key)?;
-                config.tls.client_fingerprint =
-                    parse_client_fingerprint(client_fingerprint.as_deref())?;
+                let SecurityConfig::Tls(mut tls) = config.security else {
+                    unreachable!()
+                };
+                tls.certificate.verification_name = normalize_verification_name(name_cert_verify)?;
+                tls.identity = normalize_client_identity(certificate, private_key)?;
+                tls.client_fingerprint = parse_client_fingerprint(client_fingerprint.as_deref())?;
                 config.session = AnyTlsSessionOptions::normalize(
                     idle_session_check_interval,
                     idle_session_timeout,
@@ -3031,13 +3076,19 @@ impl RawOutbound {
                     disable_reuse,
                     client_metadata,
                 )?;
-                config.tls.ech = ech_opts
-                    .map(|raw| raw.normalize(config.tls.client_fingerprint.is_some()))
+                tls.ech = ech_opts
+                    .map(|raw| raw.normalize(tls.client_fingerprint.is_some()))
                     .transpose()?
                     .flatten();
-                if config.tls.ech.is_some() && config.server_name.parse::<IpAddr>().is_ok() {
+                if tls.ech.is_some() && config.server_name.parse::<IpAddr>().is_ok() {
                     return invalid("AnyTLS ECH requires DNS sni");
                 }
+                config.security = security::RawSecurityModes {
+                    reality: None,
+                    jls: jls_opts,
+                    shadow_tls: shadow_tls_opts,
+                }
+                .normalize(tls, certificate_options)?;
 
                 (name, dialer_proxy, udp, ProxyProtocol::AnyTls(config))
             }
@@ -3179,9 +3230,14 @@ fn normalize_anytls(
         address: server,
         port,
         password,
-        server_name,
+        server_name: server_name.clone(),
         session: AnyTlsSessionOptions::default(),
-        tls: TlsClientPolicy {
+        security: SecurityConfig::Tls(TlsConfig {
+            server_name,
+            tls13_only: false,
+            required_alpn: None,
+            ech: None,
+            identity: None,
             client_fingerprint: None,
             alpn,
             certificate: TlsCertificatePolicy {
@@ -3189,8 +3245,7 @@ fn normalize_anytls(
                 fingerprint,
                 ..Default::default()
             },
-            ..Default::default()
-        },
+        }),
     })
 }
 
@@ -3366,6 +3421,7 @@ impl RawXHttpDownloadSettings {
             private_key,
             reality_opts,
             jls_opts,
+            shadow_tls_opts,
             ech_opts,
             path,
             host,
@@ -3462,6 +3518,7 @@ impl RawXHttpDownloadSettings {
         let mut config = match default_security {
             SecurityConfig::Tls(config) => config.clone(),
             SecurityConfig::Jls(config) => config.tls.clone(),
+            SecurityConfig::ShadowTls(config) => config.tls_config(),
             _ => TlsConfig::xhttp(server_name.clone()),
         };
         config.server_name = server_name;
@@ -3529,10 +3586,24 @@ impl RawXHttpDownloadSettings {
                 _ => None,
             },
         };
-        if reality.is_some() && jls.is_some() {
-            return invalid("XHTTP download JLS and REALITY are mutually exclusive");
+        let shadow_tls = match shadow_tls_opts {
+            Some(raw) if raw.is_empty() => None,
+            Some(raw) => Some(raw.normalize(config.clone())?),
+            None => match default_security {
+                SecurityConfig::ShadowTls(config) => Some(config.clone()),
+                _ => None,
+            },
+        };
+        if usize::from(reality.is_some())
+            + usize::from(jls.is_some())
+            + usize::from(shadow_tls.is_some())
+            > 1
+        {
+            return invalid("XHTTP download transport identities are mutually exclusive");
         }
-        if config.ech.is_some() && (reality.is_some() || jls.is_some() || !tls) {
+        if config.ech.is_some()
+            && (reality.is_some() || jls.is_some() || shadow_tls.is_some() || !tls)
+        {
             return invalid(
                 "XHTTP download ECH requires standard TLS; clear inherited ECH before changing security mode",
             );
@@ -3557,6 +3628,18 @@ impl RawXHttpDownloadSettings {
             jls.tls = config;
             jls.validate()?;
             SecurityConfig::Jls(jls)
+        } else if let Some(mut shadow_tls) = shadow_tls {
+            if !tls {
+                return invalid("XHTTP download ShadowTLS requires TLS");
+            }
+            shadow_tls.server_name = config.server_name;
+            shadow_tls.client_fingerprint = config.client_fingerprint;
+            shadow_tls.alpn = config.alpn;
+            shadow_tls.required_alpn = config.required_alpn;
+            shadow_tls.certificate = config.certificate;
+            shadow_tls.identity = config.identity;
+            shadow_tls.validate()?;
+            SecurityConfig::ShadowTls(shadow_tls)
         } else if tls {
             SecurityConfig::Tls(config)
         } else {
@@ -4844,12 +4927,7 @@ geo-update-interval: 24"#,
 
     #[test]
     fn rejects_unsupported_xhttp_download_fields_fail_closed() {
-        for fields in [
-            "shadow-tls-opts: {}",
-            "restls-opts: {}",
-            "mode: stream-up",
-            "typo: true",
-        ] {
+        for fields in ["restls-opts: {}", "mode: stream-up", "typo: true"] {
             let yaml = with_xhttp_download(CURRENT_TLS, fields);
             let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
             assert!(
@@ -4858,7 +4936,7 @@ geo-update-interval: 24"#,
             );
         }
 
-        for unsupported in ["    shadow-tls-opts: {}\n", "    restls-opts: {}\n"] {
+        for unsupported in ["    restls-opts: {}\n"] {
             let yaml = CURRENT_TLS.replace(
                 "    xhttp-opts:\n",
                 &format!("{unsupported}    xhttp-opts:\n"),
@@ -5402,7 +5480,12 @@ authentication:
             let ProxyProtocol::AnyTls(anytls) = &config.proxies[0].protocol else {
                 panic!()
             };
-            assert_eq!(anytls.tls, TlsClientPolicy::default());
+            let tls = anytls.security.as_tls().unwrap();
+            assert!(tls.alpn.is_empty());
+            assert_eq!(tls.certificate, TlsCertificatePolicy::default());
+            assert!(
+                tls.identity.is_none() && tls.ech.is_none() && tls.client_fingerprint.is_none()
+            );
         }
         let plain = "aB".repeat(32);
         let colon = std::iter::repeat_n("AB", 32).collect::<Vec<_>>().join(":");
@@ -5418,11 +5501,21 @@ authentication:
                 panic!()
             };
             assert_eq!(
-                anytls.tls.alpn,
+                anytls.security.as_tls().unwrap().alpn,
                 [b"h2".to_vec(), b"http/1.1".to_vec(), b"h2".to_vec()]
             );
-            assert!(anytls.tls.certificate.skip_cert_verify);
-            assert_eq!(anytls.tls.certificate.fingerprint, Some([0xab; 32]));
+            assert!(
+                anytls
+                    .security
+                    .as_tls()
+                    .unwrap()
+                    .certificate
+                    .skip_cert_verify
+            );
+            assert_eq!(
+                anytls.security.as_tls().unwrap().certificate.fingerprint,
+                Some([0xab; 32])
+            );
         }
         for fields in [
             "alpn: null",

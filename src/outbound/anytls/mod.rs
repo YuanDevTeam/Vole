@@ -47,6 +47,20 @@ impl AnyTlsTlsConnector for crate::security::StandardTlsClient {
     }
 }
 
+#[async_trait]
+impl AnyTlsTlsConnector for crate::security::SecurityClient {
+    async fn connect(&self, stream: BoxStream) -> io::Result<BoxStream> {
+        crate::security::SecurityClient::connect(self, stream).await
+    }
+    async fn connect_with_context(
+        &self,
+        stream: BoxStream,
+        context: &EstablishContext,
+    ) -> io::Result<BoxStream> {
+        crate::security::SecurityClient::connect_with_context(self, stream, context).await
+    }
+}
+
 struct OutboundSessionDialer {
     server: Destination,
     upstream: UpstreamPath,

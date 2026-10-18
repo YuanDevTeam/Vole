@@ -119,3 +119,18 @@ container-benchmark compare --source vole=/path/to/Vole
 
 
 在线配置的纯内存定向回归：`resource::config_apply::tests::`、`config::live_update::tests::`、`controller::configs::tests::`、`runtime::providers::apply::tests::`、`configuration_candidate_reads_bundle_without_persisting_body_or_metadata`、`configuration_publication_stops_late_old_tree_hint_refill`。覆盖单候选许可、异步／外部线程结果交付、取消后持许可至收尾、严格 API 字段、启动资源拒绝、坏候选保旧图、新 provider 模板延续、候选不写活动资源，以及退休 DNS 树不能回填活动提示。真实 TUN 见证由 benchmark 夹具执行，内存回归不代替平台或业务互通。
+
+共享流式安全身份的纯内存检查（不启动宿主监听器）：
+
+```shell
+cargo test --locked --lib config::security::tests::
+cargo test --locked --lib security::client_identity_tests::
+```
+
+配置检查覆盖具名协议的安全模式、传输限制、XHTTP 两腿继承和 cover mTLS 文件预算；
+内存 IO 检查共享连接器握手取消和每次握手的独立状态。真实对端互通另行验收。
+
+
+SS2022 流式插件的纯内存过滤器：`config::shadowsocks_plugin::tests::`、
+`transport::ss_framed::tests::`、`transport::smux::`、`transport::kcptun::`。
+它们使用内存流或内存数据报，不启动网络对端；真实TUN互通与压力仍由外部夹具单独验收。

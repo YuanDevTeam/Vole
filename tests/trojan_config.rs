@@ -42,9 +42,12 @@ fn trojan_tcp_defaults_preserve_credentials_and_address_policy() {
     assert_eq!(node.password, " 密码 ");
     assert_eq!(node.server_name, "localhost");
     assert!(!parsed.proxies[0].udp);
-    assert!(node.tls.alpn.is_empty());
-    assert!(!node.tls.certificate.skip_cert_verify);
-    assert_eq!(node.tls.certificate.fingerprint, None);
+    assert!(node.security.as_tls().unwrap().alpn.is_empty());
+    assert!(!node.security.as_tls().unwrap().certificate.skip_cert_verify);
+    assert_eq!(
+        node.security.as_tls().unwrap().certificate.fingerprint,
+        None
+    );
     for server in ["127.0.0.1", "::1", "example.com"] {
         assert!(Config::parse_yaml(&document(json!({"server":server, "network":"tcp"}))).is_ok());
     }
@@ -52,9 +55,15 @@ fn trojan_tcp_defaults_preserve_credentials_and_address_policy() {
     let ProxyProtocol::Trojan(node) = &config.proxies[0].protocol else {
         unreachable!()
     };
-    assert_eq!(node.tls.alpn, [b"second".to_vec(), b"first".to_vec()]);
-    assert!(node.tls.certificate.skip_cert_verify);
-    assert_eq!(node.tls.certificate.fingerprint, Some([0xab; 32]));
+    assert_eq!(
+        node.security.as_tls().unwrap().alpn,
+        [b"second".to_vec(), b"first".to_vec()]
+    );
+    assert!(node.security.as_tls().unwrap().certificate.skip_cert_verify);
+    assert_eq!(
+        node.security.as_tls().unwrap().certificate.fingerprint,
+        Some([0xab; 32])
+    );
 }
 
 #[test]
@@ -139,7 +148,7 @@ fn trojan_ws_and_grpc_configuration_applies_transport_specific_defaults() {
     let ProxyProtocol::Trojan(node) = &config.proxies[0].protocol else {
         unreachable!()
     };
-    assert_eq!(node.tls.alpn, [b"http/1.1".to_vec()]);
+    assert_eq!(node.security.as_tls().unwrap().alpn, [b"http/1.1".to_vec()]);
     assert_eq!(node.server_name, "localhost");
     let vole::config::TrojanTransport::WebSocket { uri, .. } = &node.transport else {
         unreachable!()
@@ -160,7 +169,7 @@ fn trojan_ws_and_grpc_configuration_applies_transport_specific_defaults() {
     let ProxyProtocol::Trojan(node) = &config.proxies[0].protocol else {
         unreachable!()
     };
-    assert_eq!(node.tls.alpn, [b"h2".to_vec()]);
+    assert_eq!(node.security.as_tls().unwrap().alpn, [b"h2".to_vec()]);
     let vole::config::TrojanTransport::Grpc { uri, .. } = &node.transport else {
         unreachable!()
     };

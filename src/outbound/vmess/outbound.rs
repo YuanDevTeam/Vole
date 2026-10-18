@@ -10,9 +10,7 @@ use crate::{
         owned_stream::OwnedStream, server_destination,
     },
     resources::observation::{self, ResourceKind},
-    security::{
-        SecurityContext, StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsClientOptions,
-    },
+    security::{SecurityClient, SecurityContext, TLS_RESUMPTION_SESSION_BUDGET},
     session::{Datagram, Destination, StreamSession},
     transport::{GrpcPool, connect_websocket, http_obfs, legacy_h2},
 };
@@ -30,7 +28,7 @@ struct SessionOptions {
 pub struct VmessOutbound {
     server: Destination,
     upstream: UpstreamPath,
-    tls: Option<StandardTlsClient>,
+    security: SecurityClient,
     options: Arc<SessionOptions>,
     encoding: VmessPacketEncoding,
     grpc_pool: Option<GrpcPool>,
@@ -67,23 +65,16 @@ impl VmessOutbound {
             VmessCipher::Chacha20Poly1305 => BodyCipher::Chacha20Poly1305,
             VmessCipher::None => BodyCipher::None,
         };
-        let tls = config
-            .tls
-            .as_ref()
-            .map(|tls| {
-                StandardTlsClient::with_options(
-                    security,
-                    &config.server_name,
-                    TlsClientOptions::from_policy(tls, config.transport.required_alpn())?,
-                    sessions,
-                    buffer,
-                )
-            })
-            .transpose()?;
+        let security = SecurityClient::from_security_with_context(
+            &config.security,
+            security,
+            sessions,
+            buffer,
+        )?;
         Ok(Self {
             server: server_destination(&config.address, config.port)?,
             upstream,
-            tls,
+            security,
             options: Arc::new(SessionOptions {
                 identity: VmessIdentity::new(config.id),
                 body: BodyOptions::new(cipher, config.global_padding, config.authenticated_length)?,
@@ -108,16 +99,12 @@ impl VmessOutbound {
             .connect_server(session, &self.server, context)
             .await?
             .io;
-        if let Some(tls) = &self.tls {
-            context
-                .run_io(
-                    "VMess TLS handshake",
-                    tls.connect_with_context(raw, context),
-                )
-                .await
-        } else {
-            Ok(raw)
-        }
+        context
+            .run_io(
+                "VMess transport handshake",
+                self.security.connect_with_context(raw, context),
+            )
+            .await
     }
     async fn prepare(
         &self,

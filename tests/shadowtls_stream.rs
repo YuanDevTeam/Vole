@@ -16,6 +16,8 @@ fn options(profile: Option<ClientFingerprint>) -> ShadowTlsConfig {
         server_name: "cover.invalid".into(),
         password: PASSWORD.into(),
         alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        required_alpn: None,
+        identity: None,
         certificate: Default::default(),
         client_fingerprint: profile,
     }

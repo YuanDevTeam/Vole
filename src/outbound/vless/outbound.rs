@@ -281,6 +281,7 @@ impl VlessOutbound {
                 }
                 crate::config::SecurityConfig::Reality(_)
                 | crate::config::SecurityConfig::Jls(_)
+                | crate::config::SecurityConfig::ShadowTls(_)
                 | crate::config::SecurityConfig::None => {
                     SecurityClient::from_security(&download.security)
                 }

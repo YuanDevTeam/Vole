@@ -35,7 +35,10 @@ fn policy(node: Value) -> ShadowTlsConfig {
     let ProxyProtocol::Shadowsocks(ss) = &config.proxies[0].protocol else {
         panic!()
     };
-    ss.shadow_tls.clone().unwrap()
+    match ss.plugin.clone().unwrap() {
+        vole::config::ShadowsocksPlugin::ShadowTls(config) => config,
+        _ => panic!("expected ShadowTLS"),
+    }
 }
 
 #[cfg(feature = "shadow-tls-v3")]
@@ -51,7 +54,7 @@ fn shadowtls_preserves_policy_values_and_shared_profiles() {
     let ProxyProtocol::Shadowsocks(plain) = &disabled.proxies[0].protocol else {
         panic!()
     };
-    assert!(plain.shadow_tls.is_none());
+    assert!(plain.plugin.is_none());
     assert_eq!(plain.address, "fixture.invalid");
     assert_eq!(plain.port, 443);
     assert_eq!(config.password, " synthetic-private-marker ");

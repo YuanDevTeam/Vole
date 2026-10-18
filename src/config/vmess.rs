@@ -214,7 +214,7 @@ pub struct VmessOutboundConfig {
     pub authenticated_length: bool,
     pub packet_encoding: VmessPacketEncoding,
     pub server_name: String,
-    pub tls: Option<super::TlsClientPolicy>,
+    pub security: super::SecurityConfig,
     pub transport: StreamTransport,
 }
 impl std::fmt::Debug for VmessOutboundConfig {
@@ -279,6 +279,24 @@ pub(super) struct RawVmess {
         deserialize_with = "super::ech::deserialize"
     )]
     ech_opts: Option<super::ech::RawEch>,
+    #[serde(
+        rename = "shadow-tls-opts",
+        default,
+        deserialize_with = "super::security::deserialize_shadow_tls"
+    )]
+    shadow_tls_opts: Option<super::security::RawShadowTlsMode>,
+    #[serde(
+        rename = "jls-opts",
+        default,
+        deserialize_with = "super::jls::deserialize"
+    )]
+    jls_opts: Option<super::jls::RawJls>,
+    #[serde(
+        rename = "reality-opts",
+        default,
+        deserialize_with = "super::deserialize_present_map"
+    )]
+    reality_opts: Option<super::RawRealitySettings>,
     #[serde(rename = "global-padding", default)]
     global_padding: bool,
     #[serde(rename = "authenticated-length", default)]
@@ -342,6 +360,9 @@ impl RawVmess {
                 || self.name_cert_verify.is_some()
                 || self.certificate.is_some()
                 || self.private_key.is_some()
+                || self.shadow_tls_opts.is_some()
+                || self.jls_opts.is_some()
+                || self.reality_opts.is_some()
                 || (self.client_fingerprint.is_some() || self.ech_opts.is_some()))
         {
             return invalid("VMess TLS options require tls=true");
@@ -365,7 +386,12 @@ impl RawVmess {
             .filter(|name| !name.is_empty())
             .unwrap_or(fallback_name);
         validate_host(&server_name, "VMess servername")?;
-        let tls = if self.tls {
+        let certificate_options = self.skip_cert_verify.is_some()
+            || self.fingerprint.is_some()
+            || self.name_cert_verify.is_some()
+            || self.certificate.is_some()
+            || self.private_key.is_some();
+        let security = if self.tls {
             let alpn: Vec<Vec<u8>> = self
                 .alpn
                 .unwrap_or_else(|| {
@@ -397,19 +423,39 @@ impl RawVmess {
             if ech.is_some() && server_name.parse::<std::net::IpAddr>().is_ok() {
                 return invalid("VMess ECH requires DNS servername");
             }
-            Some(super::TlsClientPolicy {
-                ech,
-                client_fingerprint,
-                alpn,
-                certificate: super::TlsCertificatePolicy {
-                    fingerprint,
-                    skip_cert_verify: self.skip_cert_verify.unwrap_or(false),
-                    verification_name: super::normalize_verification_name(self.name_cert_verify)?,
+            if self.reality_opts.is_some() && matches!(transport, StreamTransport::WebSocket { .. })
+            {
+                return invalid("VMess REALITY requires a stream TLS transport");
+            }
+            if self.reality_opts.is_some() && client_fingerprint.is_none() {
+                return invalid("VMess REALITY requires a named client-fingerprint");
+            }
+            super::security::RawSecurityModes {
+                reality: self.reality_opts,
+                jls: self.jls_opts,
+                shadow_tls: self.shadow_tls_opts,
+            }
+            .normalize(
+                super::TlsConfig {
+                    server_name: server_name.clone(),
+                    required_alpn: transport.required_alpn().map(<[u8]>::to_vec),
+                    tls13_only: ech.is_some(),
+                    ech,
+                    client_fingerprint,
+                    alpn,
+                    certificate: super::TlsCertificatePolicy {
+                        fingerprint,
+                        skip_cert_verify: self.skip_cert_verify.unwrap_or(false),
+                        verification_name: super::normalize_verification_name(
+                            self.name_cert_verify,
+                        )?,
+                    },
+                    identity: super::normalize_client_identity(self.certificate, self.private_key)?,
                 },
-                identity: super::normalize_client_identity(self.certificate, self.private_key)?,
-            })
+                certificate_options,
+            )?
         } else {
-            None
+            super::SecurityConfig::None
         };
         Ok((
             self.name,
@@ -424,7 +470,7 @@ impl RawVmess {
                 authenticated_length: self.authenticated_length,
                 packet_encoding: self.packet_encoding,
                 server_name,
-                tls,
+                security,
                 transport,
             }),
         ))

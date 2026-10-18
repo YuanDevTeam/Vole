@@ -109,7 +109,7 @@ async fn empty_writes_after_first_payload_emit_no_extra_encrypted_chunks() {
             port: 443,
             cipher,
             password: STANDARD.encode(&key),
-            shadow_tls: None,
+            plugin: None,
             udp_over_tcp: false,
         };
         let (client, peer) = tokio::io::duplex(4096);
@@ -195,7 +195,7 @@ async fn growing_caller_buffer_after_backpressure_never_loses_plaintext() {
             port: 443,
             cipher,
             password: STANDARD.encode(&key),
-            shadow_tls: None,
+            plugin: None,
             udp_over_tcp: false,
         };
         let (client, peer) = tokio::io::duplex(4096);
@@ -279,7 +279,7 @@ async fn read_first_flushes_the_official_header_over_a_buffered_upstream() {
             port: 443,
             cipher,
             password: STANDARD.encode(&key),
-            shadow_tls: None,
+            plugin: None,
             udp_over_tcp: false,
         };
         let (client, peer) = tokio::io::duplex(4096);

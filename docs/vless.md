@@ -14,7 +14,7 @@
 - gRPC 与 Trojan/VMess 共用配置：省略或空 `grpc-service-name` 默认 `GunService`，普通名映射 `/name/Tun`，`/` 开头使用完整路径；省略或空 `grpc-user-agent` 默认 `grpc-go/1.36.0`。`ping-interval` 为带符号秒数，0 不主动 PING，负值明确拒绝；三项池阈值接受带符号整数，负阈值禁用相应分支。空闲连接总是复用；max-connections>0 时按连接上限/min-streams 扩容，否则按 max-streams 复用阈值扩容。三项字面全零归一 max-connections=1；正 max-connections 优先于 max-streams。阈值不是硬流数上限。物理连接归节点所有，关闭逻辑流不会杀死兄弟流；复用不重选上游组。
 - gRPC 不新增业务流/建链数量额度；每个物理连接一个自有驱动，每个等待调用只保留自身 future、取消与原期限，不派生队列任务。每节点最多保留 4 条空闲连接，多余空闲连接退役且不影响活动流。空闲 PING 等待 ACK 最多 15 秒，节点 Stop 取消并 join 所有驱动。
 - gRPC authority 使用非空显式 `servername`，否则使用 server:port；`name-cert-verify` 只改变证书验证名称。legacy H2 的 host 省略或为空列表时使用 www.example.com，path 省略或为空时使用 `/`。
-- `network: xhttp` 支持 H1/H2 明文、TLS1.3 或 REALITY，H3 仅标准 TLS1.3。请求字段、独立下载腿、池与版本选择见 [XHTTP](xhttp.md)。H3 的物理 UDP 仍由原 Dialer/上游图创建。
+- `network: xhttp` 支持 H1/H2 明文、TLS1.3、REALITY、JLS 或 ShadowTLS v3，H3 仅标准 TLS1.3。请求字段、独立下载腿、池与版本选择见 [XHTTP](xhttp.md)。H3 的物理 UDP 仍由原 Dialer/上游图创建。
 - 公共节点 `smux` 以独立的 h2mux/smux v1/yamux 承载逻辑 TCP/UDP；VLESS 只提供正常 TCP 到约定目标，不拥有第二个 mux 池。它不是 XUDP；only-tcp、调度及关闭边界见 [通用 sing-mux](xhttp.md#通用-sing-mux)。
 - Vision 仅允许 `network: tcp`，要求 TLS 1.3/REALITY 或 Encryption；UDP 仅 XUDP。启用 Encryption 后外层 TLS 可省略，存在时仍保持独立认证。配置阶段拒绝 WS/gRPC/HTTP/H2/XHTTP、raw/packetaddr、sing-mux 与 Vision 的组合，包括未启用业务 UDP 但显式选错编码。ECH 和附加安全封装仍拒绝。
 - Vision 请求不自动降级；对端用户不支持 Vision 时业务失败。Mihomo 服务端允许为 Vision 用户显式配置空 flow，这属于普通 VLESS 模式，不是错误 flow 的拒绝用例。
@@ -200,6 +200,8 @@ HTTP/H2/扩展 WS 可用 Xray TLS 网关 → V2Ray transport；需 UDP/Encryptio
 Mihomo 解码。网关使用官方 XRAY_BUF_SPLICE=disable，避免下行 raw splice 绕过 TLS；
 不代表 V2Ray 直接支持 ECH。无指纹 JLS/gRPC 及 Safari ECH/gRPC 的官方对照缺口采用
 明确标注的 Chrome 关闭参照；Vole 原配置的数据面单独验证，不声称同配置差分。
-VLESS 不接受 ShadowTLS 或 Restls 配置；ShadowTLS v3 仅用于 SS2022 插件。
+VLESS 的 `shadow-tls-opts` 仅接已有 TCP 承载传输及 XHTTP H1/H2，包含独立下载腿；
+须 `tls: true`、显式 version 3 和 password，不能与 Vision/JLS/REALITY/ECH 同腿混用。
+cover 的证书策略与 mTLS 独立于业务身份，行为见 [流式安全身份](outbounds.md#流式安全身份)。
 
-分层关闭参照与独立 REALITY 验证不能代替 WS + REALITY（普通 WS、HTTPUpgrade、fast-open）的同组合客户端互通或差分验证；具体对端、覆盖范围与结论由 benchmark 工程记录。
+REALITY 只接流式 TLS 消费路径；普通 WS、HTTPUpgrade 及其 fast-open 与 REALITY 的组合在配置期拒绝。

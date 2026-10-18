@@ -43,6 +43,12 @@ use crate::resources::observation::{ObservedIo, ResourceKind, track};
 
 pub type PhysicalStream = ObservedIo<tokio::net::TcpStream>;
 pub type PhysicalDatagram = ObservedIo<UdpSocket>;
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct UdpSocketOptions {
+    pub receive_buffer: Option<usize>,
+    pub send_buffer: Option<usize>,
+    pub dscp: Option<u8>,
+}
 
 const MAX_RESOLVED_ADDRESSES: usize = 8;
 
@@ -860,6 +866,20 @@ impl Dialer {
         destination: SocketAddr,
         receive_buffer_size: Option<usize>,
     ) -> io::Result<PhysicalDatagram> {
+        self.bind_udp_for_with_options(
+            destination,
+            UdpSocketOptions {
+                receive_buffer: receive_buffer_size,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+    pub(crate) async fn bind_udp_for_with_options(
+        &self,
+        destination: SocketAddr,
+        options: UdpSocketOptions,
+    ) -> io::Result<PhysicalDatagram> {
         self.require_permitted(destination)?;
         self.validate_egress()?;
         let ipv6 = destination.is_ipv6();
@@ -885,10 +905,33 @@ impl Dialer {
                 // Buffer sizing is a performance hint. Keep this same
                 // owned socket and its platform policy if the OS refuses it.
                 // socket2 converts usize to c_int, so skip invalid hints.
-                if let Some(size) =
-                    receive_buffer_size.filter(|&size| size > 0 && size <= i32::MAX as usize)
+                if let Some(size) = options
+                    .receive_buffer
+                    .filter(|&size| size > 0 && size <= i32::MAX as usize)
                 {
                     let _ = socket.set_recv_buffer_size(size);
+                }
+                if let Some(size) = options
+                    .send_buffer
+                    .filter(|&size| size > 0 && size <= i32::MAX as usize)
+                {
+                    let _ = socket.set_send_buffer_size(size);
+                }
+                if let Some(dscp) = options.dscp {
+                    if dscp > 63 {
+                        return Err(io::ErrorKind::InvalidInput.into());
+                    }
+                    if ipv6 {
+                        #[cfg(unix)]
+                        socket.set_tclass_v6(u32::from(dscp) << 2)?;
+                        #[cfg(not(unix))]
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "IPv6 UDP traffic class is unavailable",
+                        ));
+                    } else {
+                        socket.set_tos_v4(u32::from(dscp) << 2)?;
+                    }
                 }
                 socket.set_nonblocking(true)?;
                 check()?;

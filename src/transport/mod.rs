@@ -1,4 +1,10 @@
 //! Outbound wire transports.
+#[cfg(feature = "outbound-shadowsocks")]
+pub(crate) mod kcptun;
+#[cfg(any(feature = "sing-mux", feature = "outbound-shadowsocks"))]
+pub(crate) mod smux;
+#[cfg(feature = "outbound-shadowsocks")]
+pub(crate) mod ss_framed;
 
 #[cfg(feature = "quinn-h3-transport")]
 pub(crate) mod quinn_h3;

@@ -6,7 +6,7 @@ mod boring;
 mod boring_resumption;
 #[cfg(feature = "tls-fingerprint")]
 mod boring_stream;
-#[cfg(feature = "outbound-vless")]
+#[cfg(feature = "stream-security")]
 mod client;
 mod context;
 #[cfg(feature = "ech")]
@@ -28,7 +28,7 @@ pub use shadow_tls::ShadowTlsClient;
 #[cfg(feature = "outbound-vless")]
 pub(crate) mod vision;
 
-#[cfg(feature = "outbound-vless")]
+#[cfg(feature = "stream-security")]
 pub use client::{REALITY_CLIENT_VERSION, SecurityClient};
 pub use context::SecurityContext;
 #[cfg(feature = "quiche-h3-transport")]
@@ -38,6 +38,9 @@ pub use tls::{
     StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsCertificatePolicy, TlsClientIdentity,
     TlsClientOptions, TlsVersions,
 };
+
+#[cfg(all(test, feature = "stream-security"))]
+mod client_identity_tests;
 
 #[cfg(test)]
 fn test_profiles() -> &'static [Option<crate::config::ClientFingerprint>] {

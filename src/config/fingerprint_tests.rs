@@ -14,9 +14,9 @@ fn yaml(protocol: &str, fields: &str) -> String {
 
 fn profile(config: &Config) -> Option<ClientFingerprint> {
     match &config.proxies[0].protocol {
-        ProxyProtocol::AnyTls(p) => p.tls.client_fingerprint,
-        ProxyProtocol::Trojan(p) => p.tls.client_fingerprint,
-        ProxyProtocol::Vmess(p) => p.tls.as_ref().unwrap().client_fingerprint,
+        ProxyProtocol::AnyTls(p) => p.security.client_fingerprint(),
+        ProxyProtocol::Trojan(p) => p.security.client_fingerprint(),
+        ProxyProtocol::Vmess(p) => p.security.client_fingerprint(),
         ProxyProtocol::Vless(p) => match &p.security {
             SecurityConfig::Tls(tls) => tls.client_fingerprint,
             SecurityConfig::Reality(reality) => reality.client_fingerprint,

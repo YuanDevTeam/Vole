@@ -819,11 +819,12 @@ fn apply_overrides(
             "up" | "down" => kind == "hysteria2",
             "udp-over-tcp" => kind == "ss",
             "skip-cert-verify" | "name-cert-verify" => match kind {
-                "trojan" | "anytls" | "hysteria2" | "tuic" | "trusttunnel" | "masque" => true,
-                "http" | "socks5" | "vmess" => {
-                    map.get("tls").and_then(Value::as_bool) == Some(true)
+                "hysteria2" | "tuic" | "trusttunnel" | "masque" => true,
+                "trojan" | "anytls" => {
+                    !map.contains_key("reality-opts") && !map.contains_key("jls-opts")
                 }
-                "vless" => {
+                "http" | "socks5" => map.get("tls").and_then(Value::as_bool) == Some(true),
+                "vmess" | "vless" => {
                     map.get("tls").and_then(Value::as_bool) == Some(true)
                         && !map.contains_key("reality-opts")
                         && !map.contains_key("jls-opts")

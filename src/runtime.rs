@@ -83,9 +83,9 @@ use crate::outbound::trusttunnel::TrustTunnelOutbound;
 use crate::outbound::{AnyTlsOutbound, server_destination};
 #[cfg(feature = "outbound-vless")]
 use crate::outbound::{VlessOutbound, VlessResourceLimits};
-use crate::security::SecurityContext;
 #[cfg(feature = "outbound-anytls")]
-use crate::security::StandardTlsClient;
+use crate::security::SecurityClient;
+use crate::security::SecurityContext;
 #[cfg(any(
     feature = "outbound-http",
     feature = "outbound-socks5",
@@ -96,7 +96,8 @@ use crate::security::StandardTlsClient;
     feature = "outbound-vmess",
     feature = "outbound-hysteria2",
     feature = "outbound-tuic",
-    feature = "shadow-tls-v3"
+    feature = "shadow-tls-v3",
+    feature = "outbound-shadowsocks"
 ))]
 use crate::security::TLS_RESUMPTION_SESSION_BUDGET;
 
@@ -991,7 +992,8 @@ fn build_proxy_graph(
         feature = "outbound-vmess",
         feature = "outbound-hysteria2",
         feature = "outbound-tuic",
-        feature = "shadow-tls-v3"
+        feature = "shadow-tls-v3",
+        feature = "outbound-shadowsocks"
     ))]
     let (_, standard_tls_count) = security_counts(proxies);
     #[cfg(any(
@@ -1004,7 +1006,8 @@ fn build_proxy_graph(
         feature = "outbound-vmess",
         feature = "outbound-hysteria2",
         feature = "outbound-tuic",
-        feature = "shadow-tls-v3"
+        feature = "shadow-tls-v3",
+        feature = "outbound-shadowsocks"
     ))]
     let security_context = Some(security.clone());
     #[cfg(any(
@@ -1017,7 +1020,8 @@ fn build_proxy_graph(
         feature = "outbound-vmess",
         feature = "outbound-hysteria2",
         feature = "outbound-tuic",
-        feature = "shadow-tls-v3"
+        feature = "shadow-tls-v3",
+        feature = "outbound-shadowsocks"
     ))]
     let resumption_sessions = standard_tls_resumption_sessions(standard_tls_count);
 
@@ -1293,13 +1297,12 @@ fn build_proxy_graph(
                     ProxyProtocol::Shadowsocks(config) => {
                         #[cfg(feature = "outbound-shadowsocks")]
                         {
-                            #[cfg(feature = "shadow-tls-v3")]
-                            let security = security_context.as_ref();
                             Arc::new(ShadowsocksOutbound::with_security(
                                 config,
                                 upstream,
-                                #[cfg(feature = "shadow-tls-v3")]
-                                security,
+                                security_context.as_ref(),
+                                resumption_sessions,
+                                limits.tls_buffer_limit,
                             )?)
                         }
                         #[cfg(not(feature = "outbound-shadowsocks"))]
@@ -1377,12 +1380,11 @@ fn build_proxy_graph(
                     ProxyProtocol::AnyTls(config) => {
                         #[cfg(feature = "outbound-anytls")]
                         {
-                            let tls = StandardTlsClient::with_options(
+                            let tls = SecurityClient::from_security_with_context(
+                                &config.security,
                                 security_context
                                     .as_ref()
                                     .expect("AnyTLS graph has shared security material"),
-                                &config.server_name,
-                                crate::security::TlsClientOptions::from_policy(&config.tls, None)?,
                                 resumption_sessions,
                                 limits.tls_buffer_limit,
                             )?;
@@ -1650,7 +1652,8 @@ fn restrict_endpoint_addresses(
     feature = "outbound-vmess",
     feature = "outbound-hysteria2",
     feature = "outbound-tuic",
-    feature = "shadow-tls-v3"
+    feature = "shadow-tls-v3",
+    feature = "outbound-shadowsocks"
 ))]
 fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
     proxies.iter().fold(
@@ -1673,17 +1676,40 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
                         }),
                 )
             }
-            ProxyProtocol::AnyTls(_)
-            | ProxyProtocol::Trojan(_)
-            | ProxyProtocol::TrustTunnel(_)
-            | ProxyProtocol::Hysteria2(_) => (client_count + 1, standard_count + 1),
+            ProxyProtocol::AnyTls(config) => (
+                client_count + 1,
+                standard_count
+                    + usize::from(matches!(
+                        config.security,
+                        crate::config::SecurityConfig::Tls(_)
+                    )),
+            ),
+            ProxyProtocol::Trojan(config) => (
+                client_count + 1,
+                standard_count
+                    + usize::from(matches!(
+                        config.security,
+                        crate::config::SecurityConfig::Tls(_)
+                    )),
+            ),
+            ProxyProtocol::TrustTunnel(_) | ProxyProtocol::Hysteria2(_) => {
+                (client_count + 1, standard_count + 1)
+            }
             ProxyProtocol::Vmess(config) => (
                 client_count + 1,
-                standard_count + usize::from(config.tls.is_some()),
+                standard_count
+                    + usize::from(matches!(
+                        config.security,
+                        crate::config::SecurityConfig::Tls(_)
+                    )),
             ),
             ProxyProtocol::Shadowsocks(config) => (
-                client_count + usize::from(config.shadow_tls.is_some()),
-                standard_count,
+                client_count + usize::from(config.plugin.is_some()),
+                standard_count
+                    + config
+                        .plugin
+                        .as_ref()
+                        .map_or(0, crate::config::ShadowsocksPlugin::tls_sessions),
             ),
             ProxyProtocol::Http(config) => (
                 client_count + 1,
@@ -1713,7 +1739,8 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
     feature = "outbound-vmess",
     feature = "outbound-hysteria2",
     feature = "outbound-tuic",
-    feature = "shadow-tls-v3"
+    feature = "shadow-tls-v3",
+    feature = "outbound-shadowsocks"
 ))]
 fn standard_tls_resumption_sessions(standard_tls_count: usize) -> usize {
     if standard_tls_count == 0 || standard_tls_count > TLS_RESUMPTION_SESSION_BUDGET {
@@ -3036,7 +3063,16 @@ rules:
                     port: 443,
                     password: "secret".to_owned(),
                     server_name: "example.com".to_owned(),
-                    tls: Default::default(),
+                    security: crate::config::SecurityConfig::Tls(crate::config::TlsConfig {
+                        server_name: "example.com".into(),
+                        ech: None,
+                        client_fingerprint: None,
+                        alpn: Vec::new(),
+                        tls13_only: false,
+                        required_alpn: None,
+                        certificate: Default::default(),
+                        identity: None,
+                    }),
                     session: Default::default(),
                 }),
             }

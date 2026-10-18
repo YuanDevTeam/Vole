@@ -51,16 +51,17 @@ default = [
 ]
 inbound-http = ["dep:rcgen", "dep:rsa", "dep:tokio-tungstenite"]
 inbound-socks5 = ["dep:rcgen", "dep:rsa", "dep:ring", "dep:tokio-tungstenite"]
-outbound-anytls = ["dep:md-5", "tls-fingerprint", "ech"]
+outbound-anytls = ["dep:md-5", "stream-security", "ech"]
 outbound-socks5 = []
 outbound-http = []
-outbound-shadowsocks = ["dep:shadowsocks", "dep:log"]
-outbound-vless = ["ech", "tls-fingerprint", "boring/reality", "boring/jls", "boring/mlkem", "dep:blake3", "dep:vole-blake3-raw", "stream-transport", "quinn-h3-transport", "dep:hyper", "dep:hyper-util"]
-outbound-trojan = ["stream-transport", "tls-fingerprint", "ech"]
+outbound-shadowsocks = ["dep:shadowsocks", "dep:log", "stream-security", "stream-transport", "ech", "dep:aes", "dep:ring", "dep:kcp", "dep:snap", "dep:reed-solomon-erasure", "dep:crc32c", "dep:salsa20", "dep:twofish", "dep:blowfish", "dep:cast5", "dep:des", "dep:xtea"]
+outbound-vless = ["ech", "stream-security", "boring/mlkem", "dep:blake3", "dep:vole-blake3-raw", "stream-transport", "quinn-h3-transport", "dep:hyper", "dep:hyper-util"]
+outbound-trojan = ["stream-transport", "stream-security", "ech"]
 outbound-trusttunnel = ["stream-transport", "tls-fingerprint", "ech", "quiche-h3-transport"]
 outbound-mieru = ["dep:chacha20poly1305", "dep:hostname", "dep:prost", "dep:ring"]
 outbound-masque = ["stream-transport", "quiche-h3-transport", "dep:vole-netstack"]
-outbound-vmess = ["stream-transport", "tls-fingerprint", "ech", "dep:aes", "dep:md-5", "dep:ring", "dep:shake"]
+outbound-vmess = ["stream-transport", "stream-security", "ech", "dep:aes", "dep:md-5", "dep:ring", "dep:shake"]
+stream-security = ["tls-fingerprint", "boring/reality", "boring/jls"]
 tls-fingerprint = ["dep:boring", "dep:tokio-boring"]
 ech = []
 shadow-tls-v3 = ["tls-fingerprint", "boring/shadow-tls-v3", "dep:ring"]
@@ -116,6 +117,16 @@ boringtun = { version = "=0.7.1", default-features = false, optional = true }
 boring = { path = "../boring/boring", version = "=5.2.0", features = ["client-fingerprint"], optional = true }
 bytes = "1"
 chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["zeroize"], optional = true }
+blowfish = {version="=0.10.0",optional=true,features=["zeroize"]}
+cast5 = {version="=0.12.0",optional=true,features=["zeroize"]}
+crc32c = {version="=0.6.8",optional=true}
+des = {version="=0.9.0",optional=true,features=["zeroize"]}
+kcp = {version="=0.6.0",optional=true,default-features=false}
+reed-solomon-erasure = {version="=6.0.0",optional=true,default-features=false,features=["std"]}
+salsa20 = {version="=0.11.0",optional=true,features=["zeroize"]}
+snap = {version="=1.1.2",optional=true}
+twofish = {version="=0.8.0",optional=true,features=["zeroize"]}
+xtea = {version="=0.1.0",optional=true,features=["zeroize"]}
 crc32fast = "=1.5.2"
 domain = { version = "=0.12.3", default-features = false, features = ["std"] }
 fancy-regex = { version = "=0.19.2", default-features = false, features = ["std", "unicode"] }

@@ -84,5 +84,6 @@ pub mod hysteria2;
     feature = "outbound-masque"
 ))]
 mod owned_stream;
+pub(crate) use owned_stream::OwnedStream;
 #[cfg(feature = "outbound-tuic")]
 pub mod tuic;

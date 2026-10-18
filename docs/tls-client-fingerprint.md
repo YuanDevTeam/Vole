@@ -24,10 +24,11 @@
 
 ## 适用范围
 
-AnyTLS、Trojan、TrustTunnel H2、VMess + TLS、VLESS + TLS/REALITY/JLS 使用同一共享连接器。
+AnyTLS、Trojan、VMess、VLESS 的普通 TLS 和已支持的 REALITY/JLS/ShadowTLS 身份复用共享连接器；
+TrustTunnel H2 保持标准 TLS。各协议可用身份与传输范围见 [出站](outbounds.md#流式安全身份)。
 TCP、WS、gRPC、HTTP 首包伪装、legacy H2、Vision、XHTTP H1/H2 仍遵守各自的协议约束。
-关闭 TLS 时不能携带该字段。SS2022 + ShadowTLS v3 复用上述模板，作用于 cover
-握手并强制 TLS1.3；其未命名握手也由 boring 执行。SOCKS5 和裸 SS 不接入 TLS 指纹。
+关闭 TLS 时不能携带该字段。SS2022 + ShadowTLS v3/JLS 复用上述模板，作用于插件握手；两种身份均强制 TLS1.3，
+未命名握手也由 boring 执行。SOCKS5 和裸 SS 不接入 TLS 指纹。
 
 XHTTP `download-settings.client-fingerprint` 缺省继承主腿，显式名称覆盖，`none` / 空串清除。
 下载腿即使与主腿使用同一服务器，也拥有独立的 TLS 策略、身份和缓存。
@@ -50,7 +51,7 @@ client-fingerprint: chrome
 - 命名指纹的标准 TLS，以及所有 REALITY/JLS，使用自有 boring fork；开发及 PR/发布的来源规则见 [TLS 依赖](tls-dependencies.md)。
 - 普通 TLS、Quinn 与采用标准 TLS 认证的 quiche H3 共用同一个 WebPKI 证书验证器和会话信任根；叶 pin、非叶信任锚、
   独立验证名、skip 优先级不变。TLS 握手签名仍由各自后端强制验证。
-- HTTP、SOCKS5、AnyTLS、Trojan、TrustTunnel、VMess、VLESS、Hysteria2 与 TUIC v5 的 mTLS 使用配对内联 PEM 或文件路径，
+- HTTP、SOCKS5、AnyTLS、Trojan、TrustTunnel、VMess、VLESS、Hysteria2、TUIC v5 与 SS2022 ShadowTLS cover 的 mTLS 使用配对内联 PEM 或文件路径，
   配置校验与资源生成时读取文件并检查密钥匹配；客户端证书不增加服务端信任根，profile 不修改身份。
 - quiche H3 的 ECH 仅支持 X25519/HKDF-SHA256，AEAD 为 AES128/256-GCM 或 ChaCha20-Poly1305。
   静态和 DNS 来源按该后端选择；不兼容或未实际接受时失败，不用 GREASE 替代，不降级为明文 ClientHello。

@@ -35,7 +35,9 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - tls 同时接受客户端信任根及 Controller 服务端 TLS 配置；无效显式客户端信任根拒绝配置，Mihomo 会跳过无效项。iOS/tvOS、Android 不保证取得完整系统信任库；
   所有后端仍使用 WebPKI 校验，未复制 Go 的原生系统验证器。详细范围见 [TLS 契约](tls-client-fingerprint.md)。
   独立测量 YAML 只接受 proxies 与同名客户端 tls 子集，不接受 TLS 服务端配置。
-- Shadowsocks 只支持三个 2022 cipher；插件仅 strict ShadowTLS v3，UoT 仅 v2。
+- Shadowsocks 只支持三个 2022 cipher；插件支持 obfs 的 http/tls、v2ray-plugin/gost-plugin 的 websocket、JLS、kcptun 和 strict ShadowTLS v3，UoT 仅 v2。
+  通用 ShadowTLS v3/JLS 与 VMess/Trojan 的流式 REALITY 沿实际 TCP TLS 消费路径接入，
+  各协议和 XHTTP 两腿的组合门禁见出站契约；不把公共字段推导成所有载体均可使用。
 - DNS 不提供独立 listen。DoQ、DoH/H3、prefer-h3、ECS、上游类型过滤、TLS 验证参数、
   DoT 独立禁用复用、LRU/ARC 与显式 system/DHCP 上游已支持，
   来源发现和物理绑定的可用平台及参考差异以 DNS 契约为准。

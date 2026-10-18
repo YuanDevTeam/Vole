@@ -197,6 +197,7 @@ sniffer:
 #   详细语义见 docs/vless.md 和 docs/xhttp.md。
 # - packet-encoding 默认 xudp；none 是显式 raw，packetaddr/packet 为 IP-only
 #   地址帧。raw 固定首包目标；packetaddr 域名通过受控 DNS 解析。
+# - REALITY 不用于 WS/HTTPUpgrade；该组合在配置期拒绝。
 # - TLS 省略 reality-opts；REALITY 必须提供 reality-opts.public-key，可选 short-id；
 #   support-x25519mlkem768 默认 false；true 强制真实混合协商、不回退经典组。
 #   true 只允许 client-fingerprint chrome 或未命名（省略/none/空串）；不改写模板。
@@ -207,7 +208,7 @@ sniffer:
 #   XHTTP session ID，不进行第二次 VLESS 握手。两条请求最终必须由 CDN 或
 #   反向代理汇聚到同一个服务端 XHTTP 处理器和会话存储。
 # - download-settings 缺省叶字段继承；headers/reuse-settings/reality-opts/jls-opts/ech-opts 整对象
-#   替换，{} 分别清空请求头、重置复用默认、清除 REALITY/JLS/ECH。false/空串不等同缺省；
+#   替换，{} 分别清空请求头、重置复用默认、清除 REALITY/JLS/ShadowTLS/ECH。false/空串不等同缺省；
 #   certificate/private-key 成对替换或同时空串清除。改变安全类型须显式清除冲突
 #   策略。两个独立 listener 不能组成共享会话。
 #   auto 为 TLS -> packet-up、REALITY +
@@ -231,7 +232,8 @@ sniffer:
 #   {} 清除，主腿空对象拒绝。保持完整 TLS1.3 认证，无恢复；详见 vless.md#jls。
 # - ech-opts 的静态/动态来源只用于标准 TLS，详见下方示意与 docs/vless.md#ech。
 #   query-server-name 只覆盖动态 HTTPS 记录查询名，不改变拨号、SNI 或证书验证名。
-#   不接受 shadow-tls-opts 或已移除的 restls-opts。
+#   shadow-tls-opts 必须 {version: 3, password: 非空密码}，与 REALITY/JLS/ECH、Vision 互斥；
+#   使用既有 servername/SNI 与证书策略，只用于 TCP 承载和 XHTTP H1/H2。
 #
 # 下方 vless-edge 通过 upstream-select 当前选择的 socks-hop 建链：
 # 客户端 -> socks-hop -> vless-edge -> 目标。
@@ -416,6 +418,9 @@ proxies:
   # TLS 支持 name-cert-verify 和成对的内联 PEM 或文件路径 certificate/private-key；
   # 验证名不改变 servername，客户端身份不增加服务端信任根。
   # ws-opts/grpc-opts 与下面 Trojan 的结构相同；HTTP/H2 选项见示例注释。
+  # tls: true 时可选 shadow-tls-opts: {version: 3, password: cover-password} 或
+  # jls-opts: {username: user, password: password}；身份单选。REALITY 仅 TCP/HTTP/H2/gRPC，
+  # 必须有效 client-fingerprint，不用于 WS/HTTPUpgrade。
   # UDP 默认 false；packet-encoding 默认为空（raw），或 xudp/packetaddr。
   # raw transport 固定首包目标；packetaddr 域名由受控 Vole DNS 解析为 IP。
   # TCP/WS 保留下载侧；gRPC/HTTP/H2 上传 EOF 关闭逻辑流，详见 outbounds.md#vmess-aead。
@@ -445,6 +450,7 @@ proxies:
     #   path: /cover              # 默认 /；普通 PUT body，不使用 gRPC framing
 
   # Trojan（outbound-trojan feature）：固定 TLS，不接受 tls 开关。
+  # 可选通用 ShadowTLS v3/JLS；TCP/gRPC 另支持 REALITY，须有效 client-fingerprint。
   # password 必须非空，按原始 UTF-8 字节认证，不 trim。
   # network 接受 tcp（默认）、ws、grpc。sni 默认 server，不回退 WS Host；
   # alpn 默认 tcp=[]、ws=[http/1.1]、grpc=[h2]。显式列表保留顺序，WS/gRPC
@@ -533,6 +539,7 @@ proxies:
         # private-key: ./client.key
         # reality-opts: {} # 清除继承的 REALITY；非空对象必须提供 public-key
         # jls-opts: {} # 清除继承的 JLS；非空对象必须提供 username/password
+        # shadow-tls-opts: {} # 清除继承的 ShadowTLS；非空须 version: 3 和 password
     smux:
       enabled: false
       protocol: h2mux # 缺省/空为 h2mux，另支持 smux/yamux
@@ -577,7 +584,8 @@ proxies:
   # skip-cert-verify 不能覆盖 fingerprint；pin 是证书 SHA-256，不是客户端伪造指纹。
   # 叶 pin 直接决定信任；非叶 pin 作为根继续验证链和名称。所有策略均验证握手签名。
   # name-cert-verify 只改变证书验证名；certificate/private-key 为成对内联 PEM 或文件路径 客户端身份。
-  # 支持共享 client-fingerprint；支持静态/动态 ech-opts；不支持 REALITY 或 padding 调参，详见 outbounds.md#anytls。
+  # 支持共享 client-fingerprint 和静态/动态 ech-opts；普通TLS、ShadowTLS v3或JLS身份单选。
+  # 不支持 REALITY 或 padding 调参，详见 outbounds.md#anytls。
   # 两个 idle 时间字段为整数秒，<=5 回落30秒；min-idle-session 只保留现有空闲会话。
   # TCP 使用 AnyTLS session；udp: true 使用 UoT v2 datagram mode。
   - name: anytls-edge
@@ -611,7 +619,17 @@ proxies:
     cipher: 2022-blake3-aes-128-gcm
     password: "BwcHBwcHBwcHBwcHBwcHBw=="
     udp: true
-    # 可选 TCP 包装，两字段必须成对。仅 strict ShadowTLS v3 / TLS1.3。
+    # 可选流式插件，plugin/plugin-opts成对且只选一种：
+    # obfs: {mode: http 或 tls, host: bing.com}
+    # v2ray-plugin/gost-plugin: {mode: websocket, host: bing.com, path: /, mux: true, tls: false}
+    # v2ray-plugin另接受v2ray-http-upgrade/v2ray-http-upgrade-fast-open。
+    # TLS开启后才接受plugin-opts内的skip-cert-verify/name-cert-verify/fingerprint、
+    # 配对certificate/private-key与ech-opts；Host头同时确定SNI。
+    # jls: {host: cover.invalid, username: jls-user, password: jls-password, alpn: [h2, http/1.1]}
+    # kcptun: {key: transport-key, crypt: aes, mode: fast, smuxver: 1}；自动使用UoT v2。
+    # kcptun另消费conn/autoexpire/scavengettl/mtu/ratelimit/sndwnd/rcvwnd/datashard/parityshard/
+    # dscp/nocomp/acknodelay/nodelay/interval/resend/nc/sockbuf/smuxbuf/framesize/streambuf/keepalive。
+    # ShadowTLS仅显式v3，使用完整TLS1.3认证。
     # UoT 默认关闭。开启须 udp: true，UDP 经 SS TCP（含可选插件），不回退原生 UDP。
     # udp-over-tcp: true
     # udp-over-tcp-version: 2 # 开启时省略或整数 2；关闭时不得配置版本

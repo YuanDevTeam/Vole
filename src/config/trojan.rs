@@ -3,8 +3,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use super::{
-    GrpcOptions, ProxyProtocol, TlsClientPolicy, deserialize_present_option, invalid,
-    validate_host, validate_port,
+    GrpcOptions, ProxyProtocol, deserialize_present_option, invalid, validate_host, validate_port,
 };
 use crate::Result;
 
@@ -14,7 +13,7 @@ pub struct TrojanOutboundConfig {
     pub port: u16,
     pub password: String,
     pub server_name: String,
-    pub tls: TlsClientPolicy,
+    pub security: super::SecurityConfig,
     pub transport: TrojanTransport,
 }
 
@@ -224,8 +223,12 @@ pub(super) struct RawTrojan {
     sni: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     alpn: Option<Vec<String>>,
-    #[serde(rename = "skip-cert-verify", default)]
-    skip_cert_verify: bool,
+    #[serde(
+        rename = "skip-cert-verify",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    skip_cert_verify: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     fingerprint: Option<String>,
     #[serde(
@@ -254,6 +257,24 @@ pub(super) struct RawTrojan {
         deserialize_with = "super::ech::deserialize"
     )]
     ech_opts: Option<super::ech::RawEch>,
+    #[serde(
+        rename = "shadow-tls-opts",
+        default,
+        deserialize_with = "super::security::deserialize_shadow_tls"
+    )]
+    shadow_tls_opts: Option<super::security::RawShadowTlsMode>,
+    #[serde(
+        rename = "jls-opts",
+        default,
+        deserialize_with = "super::jls::deserialize"
+    )]
+    jls_opts: Option<super::jls::RawJls>,
+    #[serde(
+        rename = "reality-opts",
+        default,
+        deserialize_with = "super::deserialize_present_map"
+    )]
+    reality_opts: Option<super::RawRealitySettings>,
     #[serde(
         rename = "dialer-proxy",
         default,
@@ -358,6 +379,11 @@ impl RawTrojan {
         {
             return invalid("Trojan ALPN does not include the selected transport");
         }
+        let certificate_options = self.skip_cert_verify.is_some()
+            || self.fingerprint.is_some()
+            || self.name_cert_verify.is_some()
+            || self.certificate.is_some()
+            || self.private_key.is_some();
         let fingerprint = super::normalize_certificate_fingerprint(self.fingerprint.as_deref())?;
         let client_fingerprint =
             super::parse_client_fingerprint(self.client_fingerprint.as_deref())?;
@@ -369,6 +395,34 @@ impl RawTrojan {
         if ech.is_some() && server_name.parse::<std::net::IpAddr>().is_ok() {
             return invalid("Trojan ECH requires DNS sni");
         }
+        if self.reality_opts.is_some() && matches!(transport, TrojanTransport::WebSocket { .. }) {
+            return invalid("Trojan REALITY requires a stream TLS transport");
+        }
+        if self.reality_opts.is_some() && client_fingerprint.is_none() {
+            return invalid("Trojan REALITY requires a named client-fingerprint");
+        }
+        let security = super::security::RawSecurityModes {
+            reality: self.reality_opts,
+            jls: self.jls_opts,
+            shadow_tls: self.shadow_tls_opts,
+        }
+        .normalize(
+            super::TlsConfig {
+                server_name: server_name.clone(),
+                required_alpn: transport.required_alpn().map(<[u8]>::to_vec),
+                tls13_only: ech.is_some(),
+                ech,
+                client_fingerprint,
+                alpn,
+                certificate: super::TlsCertificatePolicy {
+                    skip_cert_verify: self.skip_cert_verify.unwrap_or(false),
+                    fingerprint,
+                    verification_name: super::normalize_verification_name(self.name_cert_verify)?,
+                },
+                identity: super::normalize_client_identity(self.certificate, self.private_key)?,
+            },
+            certificate_options,
+        )?;
         Ok((
             self.name,
             self.dialer_proxy,
@@ -379,19 +433,7 @@ impl RawTrojan {
                 password: self.password,
                 server_name,
                 transport,
-                tls: TlsClientPolicy {
-                    ech,
-                    client_fingerprint,
-                    alpn,
-                    certificate: super::TlsCertificatePolicy {
-                        skip_cert_verify: self.skip_cert_verify,
-                        fingerprint,
-                        verification_name: super::normalize_verification_name(
-                            self.name_cert_verify,
-                        )?,
-                    },
-                    identity: super::normalize_client_identity(self.certificate, self.private_key)?,
-                },
+                security,
             }),
         ))
     }

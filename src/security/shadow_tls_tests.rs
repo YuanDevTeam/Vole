@@ -52,6 +52,8 @@ fn material() -> Material {
             server_name: "cover.invalid".into(),
             password: String::from_utf8(PASSWORD.to_vec()).unwrap(),
             alpn: vec![],
+            required_alpn: None,
+            identity: None,
             certificate: Default::default(),
             client_fingerprint: None,
         },

@@ -26,13 +26,13 @@ pub(super) struct BoringTlsClient {
     required_alpn: Option<Vec<u8>>,
     sessions: super::boring_resumption::Sessions,
     ech: Option<crate::config::StaticEchConfig>,
-    #[cfg(feature = "outbound-vless")]
+    #[cfg(feature = "stream-security")]
     reality: Option<boring::ssl::RealityClientConfig>,
-    #[cfg(feature = "outbound-vless")]
+    #[cfg(feature = "stream-security")]
     jls: Option<Arc<JlsCredentials>>,
 }
 
-#[cfg(feature = "outbound-vless")]
+#[cfg(feature = "stream-security")]
 struct JlsCredentials {
     username: zeroize::Zeroizing<Vec<u8>>,
     password: zeroize::Zeroizing<Vec<u8>>,
@@ -157,14 +157,14 @@ impl BoringTlsClient {
             required_alpn: options.required_alpn.clone(),
             sessions,
             ech: options.ech.clone(),
-            #[cfg(feature = "outbound-vless")]
+            #[cfg(feature = "stream-security")]
             reality: None,
-            #[cfg(feature = "outbound-vless")]
+            #[cfg(feature = "stream-security")]
             jls: None,
         })
     }
 
-    #[cfg(feature = "outbound-vless")]
+    #[cfg(feature = "stream-security")]
     pub(super) fn reality(config: &crate::config::RealityConfig) -> io::Result<Self> {
         config.validate_fingerprint().map_err(|_| invalid())?;
         ServerName::try_from(config.server_name.to_owned()).map_err(|_| invalid())?;
@@ -221,7 +221,7 @@ impl BoringTlsClient {
         })
     }
 
-    #[cfg(feature = "outbound-vless")]
+    #[cfg(feature = "stream-security")]
     pub(super) fn jls(config: &crate::config::JlsConfig) -> io::Result<Self> {
         config.validate().map_err(|_| invalid())?;
         ServerName::try_from(config.tls.server_name.to_owned()).map_err(|_| invalid())?;
@@ -312,11 +312,11 @@ impl BoringTlsClient {
                 .set_ech_config_list(ech.as_bytes())
                 .map_err(|_| invalid())?;
         }
-        #[cfg(feature = "outbound-vless")]
+        #[cfg(feature = "stream-security")]
         if let Some(reality) = &self.reality {
             config.set_reality_client(reality).map_err(|_| invalid())?;
         }
-        #[cfg(feature = "outbound-vless")]
+        #[cfg(feature = "stream-security")]
         if let Some(jls) = &self.jls {
             config
                 .set_jls_client(&jls.username, &jls.password)

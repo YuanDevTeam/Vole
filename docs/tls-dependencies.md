@@ -41,6 +41,8 @@ AGE 使用获准的官方兼容稳定版本 `age 0.11.5` 与 `age-core 0.11.0`�
 3. 在不依赖本地 fork 的 checkout 执行 locked 构建，核对来源、provider/feature graph，
    运行受影响的 TLS、协议和平台回归。回退同样通过新提交恢复已验证的锁文件。
 
+`stream-security` 由 VMess/Trojan/AnyTLS/VLESS 共同启用，不依赖另一个出站协议；
+Vision 仍单独随 VLESS 编译。ShadowTLS 由 `shadow-tls-v3` 独立控制。
 普通 TLS 与 REALITY 使用独立的不可变连接器。REALITY/JLS 握手、临时密钥和原生
 验证边界见 [REALITY](reality-wire-protocol.md)；模板与证书策略见 [TLS 指纹](tls-client-fingerprint.md)。
 Encryption 的二进制 context 使用 [薄 FFI](../crates/vole-blake3-raw/README.md) 调用

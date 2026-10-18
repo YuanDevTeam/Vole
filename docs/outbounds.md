@@ -47,6 +47,24 @@ VMess + TLS、Trojan、AnyTLS、TrustTunnel、VLESS 和 Hysteria2 支持 `ech-op
 静态优先和动态节点 DNS 来源、后端算法及失败边界见 [ECH](vless.md#ech)。
 TUIC 的固定参考未消费 ECH，因此不接受该字段。
 
+## 流式安全身份
+
+VMess/VLESS 在 `tls: true` 时接受 `shadow-tls-opts` 或 `jls-opts`；Trojan/AnyTLS
+沿其固定 TLS 路径接受这两种身份，不增加 `tls` 开关。ShadowTLS 必须显式
+`version: 3` 和非空 `password`，SNI 使用节点现有 `servername/sni`；SS2022 插件
+仍使用自己的 `plugin-opts.host`。普通 TLS、ShadowTLS、JLS、REALITY 是同一腿的互斥模式，
+不叠第二次 TLS，也不在认证失败后降级。ShadowTLS/JLS 只用于对应节点已有的 TCP 承载传输；
+XHTTP 仅 H1/H2，主腿和下载腿独立持有身份。两者不能与 Vision 或 ECH 混用。
+
+ShadowTLS cover 接受共享 pin/skip/name-cert-verify 与成对 `certificate/private-key`，
+它们只影响 cover 握手；JLS 以用户名/密码认证，不能混用证书策略或 mTLS。
+ShadowTLS/JLS 均使用原生完整 TLS 1.3 认证且关闭会话恢复；指纹不能替代密码认证。
+受控上游、建立期限、取消和 Stop 仍由原连接器所有者管理。
+
+VMess 的 TCP/HTTP/H2/gRPC、Trojan 的 TCP/gRPC 可用 `reality-opts`，须提供有效的
+`client-fingerprint`；WS/HTTPUpgrade 不接受 REALITY。REALITY 不混用证书策略、
+mTLS 或 ECH，沿用 [REALITY](reality-wire-protocol.md) 的无回退身份与密钥交换边界。
+
 ## 功能出站
 
 具名 `direct`、`dns`、`reject` 只需 `name/type`，没有代理服务器端点，均提供 UDP。
@@ -296,7 +314,7 @@ aes-128-gcm、chacha20-poly1305、none；zero 归一 none。auto 按实际 AES �
 none 只关闭 body 加密，仍验证响应身份；不能启用 global-padding/authenticated-length，
 两开关默认 false。
 
-network 省略/空串为 tcp，另支持 ws/grpc/http/h2；均可明文或标准 TLS。tls 默认 false，
+network 省略/空串为 tcp，另支持 ws/grpc/http/h2；均可明文或 TLS，安全身份范围见上文。tls 默认 false，
 关闭时禁止 TLS 字段，即便空串、空列表或 false。认证名依次为 servername、WS Host
 去端口、server；HTTP 伪装 Host/H2 authority 不替代认证名。WS 需 http/1.1，gRPC/H2 需 h2。
 TLS 支持独立的 `name-cert-verify` 和成对内联 PEM 或文件路径 `certificate/private-key` 客户端身份。
@@ -476,13 +494,43 @@ UDP 编码及 AES 接收使用官方 codec，只消费已有受控 IO，不调�
 ChaCha UDP 接收使用每关联拥有的官方 cipher，在既有有界缓冲内解析响应；不按解密前的
 随机密文扩张线程级 cipher 缓存。时间、类型、地址、关联和重放校验与其余路径相同。
 
+### 流式传输插件
+
+一个 SS2022 节点最多使用一个 `plugin/plugin-opts`，包装位于官方 SS2022 codec 之前；
+原生 UDP 使用独立受控路径。插件不启动子进程，也不绑定本地代理端口。
+
+- `plugin: obfs`：`mode: http/tls`，`host` 默认 `bing.com`；TLS 模式是 simple-obfs 报文，
+  与提供身份认证的 ShadowTLS 不同。HTTP 首个响应头和 TLS 记录均有大小上限，保留尾部字节。
+- `plugin: v2ray-plugin` 或 `gost-plugin`：`mode: websocket`，支持 `host/path/headers/tls/mux`。
+  host 缺省为 `bing.com`，空 path 使用 `/`，mux 缺省 true。TLS 模式使用 HTTP/1.1 ALPN，
+  支持 `skip-cert-verify/name-cert-verify/fingerprint/certificate/private-key/ech-opts`；
+  未启用 TLS 时不接受这些选项。Host 头同时确定 TLS SNI。v2ray-plugin 另外接受
+  `v2ray-http-upgrade/v2ray-http-upgrade-fast-open`。两种 mux 分别是单通道 V2Ray mux 和裸 smux，
+  不附加 sing-mux 的目标与响应头；它们的关闭结束整个下层会话。
+- `plugin: jls`：`host/username/password/alpn`；ALPN 缺省 h2、http/1.1，显式空列表保持为空。
+  节点 `client-fingerprint` 作用于 JLS 握手；不增加标准证书策略或客户端证书字段。
+- `plugin: kcptun`：可靠 UDP + 可选 FEC/Snappy + smux；`udp-over-tcp` 自动启用并固定为 v2。
+  `udp: true` 控制业务 UDP；TCP 仍可单独使用这个载体。字段包括 `key/crypt/mode/conn/autoexpire/`
+  `scavengettl/mtu/ratelimit/sndwnd/rcvwnd/datashard/parityshard/dscp/nocomp/acknodelay/nodelay/`
+  `interval/resend/nc/sockbuf/smuxver/smuxbuf/framesize/streambuf/keepalive`。
+  支持 normal、fast、fast2、fast3；manual 消费 nodelay/interval/resend/nc。
+  crypt 支持 aes、aes-128、aes-192、aes-128-gcm、tea、xtea、xor、none、null、
+  blowfish、twofish、cast5、3des、salsa20。加密密码使用 kcptun 的 PBKDF2-SHA1 派生，
+  不能替代内层 SS2022 的 PSK。FEC 的任一 shard 设为 -1 时关闭；0 使用 10/3 默认值。
+  连接池轮流选择声明的槽位；autoexpire 不为 0 时替换到期连接，旧连接最迟在 scavengettl 后关闭。
+  ratelimit 单位 bytes/s，0 不限速。sockbuf 为本地物理 UDP 的双向 OS 缓冲建议；
+  DSCP 沿同一物理出口设置，平台不提供所请求的设置时失败。
+
+`client-fingerprint` 仅 ShadowTLS/JLS 插件消费，其余插件不接受该字段。
+插件参数只接受对应模式的字段；队列、窗口、连接池和配置范围均有界，取消/Stop 不等待远端回包。
+
 ### ShadowTLS v3
 
 SS 三算法的 TCP 可配置 `plugin: shadow-tls` 与完整 `plugin-opts`，不是新的代理类型。
 仅整数 version 3，始终 strict/TLS 1.3；不提供 v1/v2、弱认证或版本回退。
 host 为独立 cover DNS 名/IP，不参与拨号或业务解析；password 保留原始 UTF-8。
-ALPN 缺省 `[h2, http/1.1]`、空列表不发送；共享 pin/skip/name-cert-verify 与
-节点 client-fingerprint 只影响 cover，不能替代 ShadowTLS 密码。
+ALPN 缺省 `[h2, http/1.1]`、空列表不发送；支持共享 pin/skip/name-cert-verify、
+成对内联 PEM 或文件路径的 certificate/private-key；节点 client-fingerprint 只影响 cover，不能替代 ShadowTLS 密码。
 
 顺序为受控上游流 → 原生完整 TLS 握手与 relay 认证 → v3 记录流 → 官方 SS2022。
 借用原建链期限、取消和组快照，握手失败不发送 SS 目标或业务；pin/skip 不绕过
@@ -498,7 +546,7 @@ v3 的额外四字节记录特征仍存在，完整认证和互通不等于不�
 ### UDP over TCP v2
 
 `udp-over-tcp` 默认 false；true 要求 `udp: true`，三算法均可用于裸 SS 或
-ShadowTLS v3。开启时 `udp-over-tcp-version` 省略或整数 2 均固定使用 v2；
+任一流式插件。开启时 `udp-over-tcp-version` 省略或整数 2 均固定使用 v2；
 关闭时不得提供版本，不支持 v1、协商或原生 UDP 降级。无 SS feature 在 IO 前拒绝。
 
 同一源关联、具体节点和资源代际内，未改写 IP 目标共用一条既有 SS TCP 路径；
