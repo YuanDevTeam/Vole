@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub(super) fn address(peer: &Destination, out: &mut Vec<u8>) -> io::Result<()> {
     if peer.port() == 0
-        && !matches!(peer, Destination::Domain { host, .. } if matches!(host.as_str(), "sp.udp-over-tcp.arpa" | "sp.v2.udp-over-tcp.arpa"))
+        && !matches!(peer, Destination::Domain { host, .. } if host == crate::outbound::uot::MAGIC_DESTINATION)
     {
         return Err(io::ErrorKind::InvalidInput.into());
     }
@@ -284,6 +284,27 @@ mod tests {
                 })
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn only_uot_v2_connect_allows_a_zero_port() {
+        assert_eq!(
+            connect(&crate::outbound::uot::magic_destination()).unwrap(),
+            b"\x05\x01\x00\x17sp.v2.udp-over-tcp.arpa\x00\x00"
+        );
+        for peer in [
+            Destination::Domain {
+                host: "sp.udp-over-tcp.arpa".into(),
+                port: 0,
+            },
+            Destination::Domain {
+                host: "peer.invalid".into(),
+                port: 0,
+            },
+            Destination::Ip("192.0.2.1:0".parse().unwrap()),
+        ] {
+            assert!(connect(&peer).is_err());
         }
     }
 

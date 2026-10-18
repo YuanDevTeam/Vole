@@ -417,8 +417,9 @@ frame 配置限制本机发送与分片，不修改 Quinn transport parameter。
 DATAGRAM 累计收发缓冲仍各256 KiB，独立于 frame 上限。disable-mtu-discovery 缺省
 false，PMTUD 探测始终限制在受控双向路径预算内，QUIC payload 最多1400。
 
-udp-over-stream 使用 TUIC Connect 到版本 magic domain 的真正 UoT，0/省略version为1，
-支持1/2；v1直接 packet，v2首包含 Datagram-mode request。仍需要 QUIC 数据报物理入口；
+udp-over-stream 默认关闭；开启后使用 TUIC Connect 到 `sp.v2.udp-over-tcp.arpa:0` 的 UoT v2，
+udp-over-stream-version 省略或整数2均使用v2，其余版本拒绝。首包含 Datagram-mode request，
+后续每包携带目标与长度。仍需要 QUIC 数据报物理入口；
 首包保留原绝对建链期限；取消单次发送保留一帧进度，后续收发继续完成。
 实际错误或超时使关联失效。响应队列1项、任务归节点Stop同步回收。
 UoT在可靠流中传输，有丢包导致的队头阻塞成本，不应用原生TUIC分片额度。

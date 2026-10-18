@@ -352,8 +352,8 @@ proxies:
     # max-udp-relay-packet-size: 1252 # 仅在缺省 frame 上限时用于计算 frame=该值+29
     # max-datagram-frame-size: 1281 # 完整 QUIC DATAGRAM frame，参考限制到1400；与累计256KiB缓冲独立
     # disable-mtu-discovery: false # 发现受实际上游双向预算限制
-    # udp-over-stream: false # TCP承载业务UDP；QUIC物理入口仍须数据报
-    # udp-over-stream-version: 1 # 0/省略为1，支持1/2
+    # udp-over-stream: false # QUIC可靠流承载业务UDP；QUIC物理入口仍须数据报
+    # udp-over-stream-version: 2 # 省略同2；仅接受整数2
 
     # dialer-proxy: upstream-select # 所选上游必须实际支持双向至少 1200 字节数据报
 

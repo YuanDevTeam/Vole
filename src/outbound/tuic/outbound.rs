@@ -240,14 +240,14 @@ impl OutboundConnector for TuicOutbound {
         request: DatagramRequest,
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
-        if let Some(version) = self.config.udp_over_stream {
+        if self.config.udp_over_stream {
             let connected = self
                 .connect_stream(
                     StreamSession {
                         metadata: request.session.metadata.clone(),
                         inbound: request.session.inbound,
                         source: request.session.source,
-                        destination: crate::outbound::uot::magic_destination_version(version),
+                        destination: crate::outbound::uot::magic_destination(),
                         sniffed_domain: None,
                     },
                     context,
@@ -260,13 +260,12 @@ impl OutboundConnector for TuicOutbound {
             let (reader, writer) = tokio::io::split(connected.io);
             return Ok(crate::dispatch::bound_datagram(
                 Box::new(
-                    crate::outbound::uot::UotTransport::new_version(
+                    crate::outbound::uot::UotTransport::new(
                         reader,
                         writer,
                         request.max_response_payload_size(),
                         self.cancel.clone(),
                         &self.tasks,
-                        version,
                     )
                     .with_initial_deadline(context.deadline()),
                 ),

@@ -207,6 +207,7 @@ fn quic_fields_consume_defaults_and_reversed_fixed_windows() {
         }
     );
     assert_eq!(defaults.max_open_streams, 89);
+    assert!(!defaults.udp_over_stream);
     assert_eq!(
         defaults.heartbeat_interval,
         std::time::Duration::from_secs(10)
@@ -247,11 +248,7 @@ fn quic_fields_consume_defaults_and_reversed_fixed_windows() {
     assert_eq!(t.max_datagram_frame_size, 80);
     assert_eq!(t.max_udp_relay_packet_size, 51);
     assert!(t.disable_mtu_discovery);
-    assert_eq!(t.udp_over_stream, Some(2));
-    for (version, expected) in [(0, 1), (1, 1), (2, 2)] {
-        n["udp-over-stream-version"] = json!(version);
-        assert_eq!(extract(n.clone()).udp_over_stream, Some(expected));
-    }
+    assert!(t.udp_over_stream);
     n["max-datagram-frame-size"] = json!(1);
     let tiny = extract(n.clone());
     assert_eq!(tiny.max_datagram_frame_size, 1);
@@ -262,7 +259,38 @@ fn quic_fields_consume_defaults_and_reversed_fixed_windows() {
     assert_eq!(extract(n.clone()).max_open_streams, 0);
     n["max-open-streams"] = json!(i64::MAX);
     assert_eq!(extract(n.clone()).max_open_streams, i64::MAX as usize - 1);
-    n["udp-over-stream"] = json!(false);
-    n["udp-over-stream-version"] = json!(3);
-    assert!(parse(n).is_err());
+}
+
+#[cfg(feature = "outbound-tuic")]
+#[test]
+fn uot_is_opt_in_and_accepts_only_explicit_or_default_v2() {
+    for enabled in [false, true] {
+        let mut n = node();
+        n["udp-over-stream"] = json!(enabled);
+        for version in [None, Some(json!(2))] {
+            if let Some(version) = version {
+                n["udp-over-stream-version"] = version;
+            }
+            let c = parse(n.clone()).unwrap();
+            let vole::config::ProxyProtocol::Tuic(t) = &c.proxies[0].protocol else {
+                panic!("TUIC");
+            };
+            assert_eq!(t.udp_over_stream, enabled);
+        }
+        for bad in [
+            json!(0),
+            json!(1),
+            json!(3),
+            json!(-1),
+            json!(256),
+            json!(2.0),
+            json!("2"),
+            Value::Null,
+            json!(true),
+            json!({}),
+        ] {
+            n["udp-over-stream-version"] = bad;
+            assert!(parse(n.clone()).is_err());
+        }
+    }
 }

@@ -40,7 +40,7 @@ pub struct TuicOutboundConfig {
     pub max_udp_relay_packet_size: u16,
     pub max_datagram_frame_size: u16,
     pub disable_mtu_discovery: bool,
-    pub udp_over_stream: Option<u8>,
+    pub udp_over_stream: bool,
 }
 
 impl std::fmt::Debug for TuicOutboundConfig {
@@ -96,8 +96,8 @@ pub(super) struct RawTuic {
     disable_mtu_discovery: bool,
     #[serde(default)]
     udp_over_stream: bool,
-    #[serde(default)]
-    udp_over_stream_version: i64,
+    #[serde(default, deserialize_with = "super::deserialize_present_option")]
+    udp_over_stream_version: Option<u8>,
     #[serde(default)]
     congestion_controller: TuicCongestion,
     #[serde(default)]
@@ -153,12 +153,12 @@ impl RawTuic {
         if frame < 0 {
             return invalid("TUIC DATAGRAM frame limit cannot be negative");
         }
-        let version = match self.udp_over_stream_version {
-            0 | 1 => 1,
-            2 => 2,
-            _ => return invalid("TUIC UDP-over-stream version must be 1 or 2"),
-        };
-        let udp_over_stream = self.udp_over_stream.then_some(version);
+        if self
+            .udp_over_stream_version
+            .is_some_and(|version| version != 2)
+        {
+            return invalid("TUIC UDP-over-stream only supports version 2");
+        }
         let config = TuicOutboundConfig {
             address: self.server.clone(),
             port: self.port,
@@ -192,7 +192,7 @@ impl RawTuic {
             max_udp_relay_packet_size: frame.saturating_sub(29).max(0) as u16,
             max_datagram_frame_size: frame as u16,
             disable_mtu_discovery: self.disable_mtu_discovery,
-            udp_over_stream,
+            udp_over_stream: self.udp_over_stream,
             tls: TlsConfig {
                 server_name: self
                     .sni
