@@ -122,14 +122,10 @@ impl OutboundConnector for ShadowsocksOutbound {
         } else {
             io
         };
-        let stream = shadowsocks::ProxyClientStream::from_stream(
-            self.context.clone(),
-            io,
-            &self.config,
-            address(&target),
-        );
+        let stream =
+            stream::SsStream::new(self.context.clone(), io, &self.config, address(&target));
         Ok(ConnectedStream {
-            io: Box::new(stream::SsStream::new(stream)),
+            io: Box::new(stream),
             effective_peer: target,
         })
     }
@@ -160,7 +156,7 @@ impl OutboundConnector for ShadowsocksOutbound {
                 inner,
                 server,
                 self.context.clone(),
-                &self.config,
+                self.config.clone(),
                 maximum,
                 wire_maximum,
             )),

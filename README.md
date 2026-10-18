@@ -42,7 +42,7 @@ The shared [sing-mux wrapper](docs/xhttp.md#通用-sing-mux) supports all enable
 
 Standard TLS connections support certificate verification and SHA-256 certificate pins. Applicable TCP TLS paths can use Chrome, Firefox, Safari or iOS ClientHello templates; `client-fingerprint` is independent of the certificate `fingerprint`. See [TLS profiles and certificate policy](docs/tls-client-fingerprint.md) for the exact names and combinations. These features do not promise indistinguishability from a browser or unrestricted protocol combinations.
 
-SS2022 uses the unmodified official Rust library; its known empty-first-write/server-first and padding risks remain documented in the [Shadowsocks contract](docs/outbounds.md#shadowsocks-2022).
+SS2022 uses the unmodified official Rust crypto and codecs with Vole-owned initialized padding and server-first handling. See the [Shadowsocks contract](docs/outbounds.md#shadowsocks-2022).
 
 ## Mihomo-style configuration
 

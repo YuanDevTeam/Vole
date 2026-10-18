@@ -58,6 +58,11 @@ impl Fixture {
             method,
         )
         .unwrap();
+        let config = Arc::new(config);
+        Self::with_configs(config.clone(), &config, maximum)
+    }
+
+    fn with_configs(config: Arc<ServerConfig>, server_config: &ServerConfig, maximum: u16) -> Self {
         let (tx, sent) = mpsc::channel(32);
         let (replies, rx) = mpsc::channel(32);
         let permits = Arc::new(Semaphore::new(0));
@@ -72,7 +77,7 @@ impl Fixture {
             Box::new(inner),
             Destination::Ip("127.0.0.1:12345".parse().unwrap()),
             Context::new_shared(ServerType::Local),
-            &config,
+            config,
             maximum,
             maximum.saturating_add(MAX_RESPONSE_HEADER),
         );
@@ -80,7 +85,7 @@ impl Fixture {
         let server = ProxySocket::from_socket(
             UdpSocketType::Server,
             Context::new_shared(ServerType::Server),
-            &config,
+            server_config,
             io.clone(),
         );
         Self {
@@ -195,6 +200,80 @@ async fn udp_chacha_authenticated_invalid_headers_do_not_advance_the_replay_wind
     assert_eq!(received.payload, &b"valid-after-rejection"[..]);
     assert_eq!(f.client.sessions.len(), 1);
     f.client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn udp_empty_payload_preserves_cancellation_ids_and_official_decoding() {
+    for name in CIPHERS {
+        let mut f = Fixture::new(name, 1500);
+        let session_id = f.client.control.client_session_id;
+        let mut pending = Box::pin(f.client.send(request(b"")));
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        drop(pending);
+        assert_eq!(f.client.control.packet_id, 1);
+        assert!(f.sent.try_recv().is_err());
+        assert!(f.client.io.take().is_err());
+
+        f.permits.add_permits(2);
+        f.client.send(request(b"")).await.unwrap();
+        let wire = f.sent.recv().await.unwrap();
+        let minimum = f.client.request_header + super::super::address(&target()).serialized_len();
+        assert!((minimum..=minimum + 900).contains(&wire.payload.len()));
+        let (body, control) = f.decode_request(wire).await;
+        assert!(body.is_empty());
+        assert_eq!(control.client_session_id, session_id);
+        assert_eq!(control.packet_id, 2);
+
+        // Switching back to the ordinary nonempty codec keeps one association
+        // and never replays the cancelled empty packet or a stale handoff.
+        f.client.send(request(b"after-empty")).await.unwrap();
+        let wire = f.sent.recv().await.unwrap();
+        let (body, control) = f.decode_request(wire).await;
+        assert_eq!(body, b"after-empty");
+        assert_eq!(control.client_session_id, session_id);
+        assert_eq!(control.packet_id, 3);
+        assert!(f.sent.try_recv().is_err());
+        assert!(f.client.io.take().is_err());
+        f.client.close().await.unwrap();
+        assert!(f.closed.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn udp_empty_payload_keeps_aes_eih_authentication() {
+    use shadowsocks::config::{ServerUser, ServerUserManager};
+
+    for name in &CIPHERS[..2] {
+        let method: CipherKind = name.parse().unwrap();
+        let identity = vec![3; method.key_len()];
+        let user_key = vec![7; method.key_len()];
+        let password = format!(
+            "{}:{}",
+            STANDARD.encode(&identity),
+            STANDARD.encode(&user_key)
+        );
+        let config = Arc::new(ServerConfig::new(("127.0.0.1", 12345), password, method).unwrap());
+        let mut server_config =
+            ServerConfig::new(("127.0.0.1", 12345), STANDARD.encode(&identity), method).unwrap();
+        let mut users = ServerUserManager::new();
+        users.add_user(ServerUser::new("fixture", user_key.clone()));
+        server_config.set_user_manager(users);
+        let mut f = Fixture::with_configs(config, &server_config, 1500);
+        f.permits.add_permits(1);
+        f.client.send(request(b"")).await.unwrap();
+        let wire = f.sent.recv().await.unwrap();
+        let minimum = f.client.request_header + super::super::address(&target()).serialized_len();
+        assert!((minimum..=minimum + 900).contains(&wire.payload.len()));
+        let (body, control) = f.decode_request(wire).await;
+        assert!(body.is_empty());
+        assert_eq!(
+            control.client_session_id,
+            f.client.control.client_session_id
+        );
+        assert_eq!(control.packet_id, 1);
+        assert_eq!(control.user.unwrap().key(), user_key);
+        f.client.close().await.unwrap();
+    }
 }
 
 #[tokio::test]

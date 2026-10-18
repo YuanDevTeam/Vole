@@ -7,13 +7,16 @@ use crate::{
     session::{Datagram, Destination},
 };
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use shadowsocks::{
     ServerConfig,
     context::SharedContext,
-    relay::udprelay::{ProxySocket, options::UdpSocketControlData, proxy_socket::UdpSocketType},
+    relay::udprelay::{
+        ProxySocket, crypto_io::encrypt_client_payload, options::UdpSocketControlData,
+        proxy_socket::UdpSocketType,
+    },
 };
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::time::Instant;
 
 // Largest response: XChaCha nonce, IDs/type/time/length, optional padding,
@@ -45,6 +48,8 @@ pub(super) struct SsDatagram {
     inner: Box<dyn DatagramTransport>,
     server: Destination,
     socket: ProxySocket<PacketIo>,
+    context: SharedContext,
+    config: Arc<ServerConfig>,
     chacha_decoder: Option<super::chacha_datagram::Decoder>,
     io: PacketIo,
     control: UdpSocketControlData,
@@ -63,7 +68,7 @@ impl SsDatagram {
         inner: Box<dyn DatagramTransport>,
         server: Destination,
         context: SharedContext,
-        config: &ServerConfig,
+        config: Arc<ServerConfig>,
         maximum: u16,
         wire_maximum: u16,
     ) -> Self {
@@ -73,8 +78,14 @@ impl SsDatagram {
         Self {
             inner,
             server,
-            socket: ProxySocket::from_socket(UdpSocketType::Client, context, config, io.clone()),
-            chacha_decoder: super::chacha_datagram::Decoder::new(config),
+            socket: ProxySocket::from_socket(
+                UdpSocketType::Client,
+                context.clone(),
+                &config,
+                io.clone(),
+            ),
+            context,
+            chacha_decoder: super::chacha_datagram::Decoder::new(&config),
             io,
             control,
             sessions: VecDeque::with_capacity(2),
@@ -82,8 +93,9 @@ impl SsDatagram {
             wire_maximum: usize::from(wire_maximum).min(MAX_WIRE_PACKET),
             buffer: vec![0; usize::from(wire_maximum).min(MAX_WIRE_PACKET)],
             closed: false,
-            request_header: request_header(config),
-            response_header: nonce_size(config) + 51,
+            request_header: request_header(&config),
+            response_header: nonce_size(&config) + 51,
+            config,
             sent_in_burst: 0,
         }
     }
@@ -195,15 +207,42 @@ impl DatagramTransport for SsDatagram {
             self.sessions.clear();
         }
         self.control.packet_id += 1;
-        self.socket
-            .send_with_ctrl(
-                &super::address(&datagram.remote),
+        let target = super::address(&datagram.remote);
+        let payload = if datagram.payload.is_empty() {
+            // The official empty-payload encoder advances over up to 900
+            // padding bytes without initializing them. Initialize its entire
+            // maximum wire image before clear: capacity and initialized bytes
+            // survive, so its reserve cannot replace this backing allocation.
+            let initialized_len = self
+                .request_header
+                .checked_add(target.serialized_len())
+                .and_then(|length| length.checked_add(900))
+                .filter(|length| *length <= MAX_WIRE_PACKET)
+                .ok_or_else(|| {
+                    DispatchError::Other("Shadowsocks UDP packet exceeds wire limit".into())
+                })?;
+            let mut encoded = BytesMut::zeroed(initialized_len);
+            rand::fill(&mut encoded[..]);
+            encoded.clear();
+            encrypt_client_payload(
+                &self.context,
+                self.config.method(),
+                self.config.key(),
+                &target,
                 &self.control,
-                &datagram.payload,
-            )
-            .await
-            .map_err(|_| DispatchError::Other("Shadowsocks UDP encoding failed".into()))?;
-        let payload = self.io.take().map_err(DispatchError::from)?;
+                self.config.identity_keys(),
+                &[],
+                &mut encoded,
+            );
+            debug_assert!(encoded.len() <= initialized_len);
+            encoded.freeze()
+        } else {
+            self.socket
+                .send_with_ctrl(&target, &self.control, &datagram.payload)
+                .await
+                .map_err(|_| DispatchError::Other("Shadowsocks UDP encoding failed".into()))?;
+            self.io.take().map_err(DispatchError::from)?
+        };
         self.inner
             .send(Datagram {
                 remote: self.server.clone(),

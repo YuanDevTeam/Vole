@@ -44,6 +44,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | 有界队列与内存策略 | `routing::datagram_ready::tests::`、`managed_udp_connections_`、`allocator_relief`、`platform::process_memory::tests::` | 就绪轮询、排空、取消和单次回收 |
 | TUN 响应背压 | `tun_runtime::tests::backpressured_udp_response_handoff` | 满队列下每源至多暂持一包、双向推进及取消 |
 | UoT | `outbound::uot::tests::` | 半帧取消后继续、版本首部、原期限、单槽响应与Stop |
+| SS2022 | `outbound::shadowsocks::datagram::tests::` | 三种 cipher、空 UDP、EIH、取消后的 packet ID 与重放边界 |
 | CLI前台 | `invoke::foreground::tests::` | 文件/stdin、路径、信号及清理 |
 
 独立集成回归按目标运行，例如：
@@ -52,11 +53,15 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 cargo test --locked --no-default-features --features cli,interop-test --test tuic_memory
 cargo test --locked --no-default-features --features cli,interop-test --test grpc_pool --test grpc_protocol_pool
 cargo test --locked --no-default-features --features cli,interop-test --test sing_mux
+cargo test --locked --no-default-features --features cli,interop-test --test shadowsocks_backpressure --test shadowsocks_uot
 cargo test --locked --no-default-features --features cli --bin vole cli::tests::
 cargo test --locked -p vole-blake3-raw --test derive
 ```
 
 内存QUIC/H3对端通过受控DatagramTransport交换真实包，不绑定宿主监听器。
+SS2022 的严格官方 TCP codec 回归可单独选择 `official_tcp_codecs_all_ciphers_` 和
+`tcp_response_header_time_salt_auth_and_fragmentation_follow_official_codec`；不要在宿主整体运行
+`outbound::shadowsocks::tests::`，其中还包含监听器用例。
 Mieru回归保留TCP/UDP分池、慢读背压、单槽交接、终态传播、接收分配复用和未读响应下的Stop。
 GeoData、AGE、Provider和缓存测试使用合成输入、公开固定向量、内存流及临时文件。
 这些局部预算与行为检查不证明进程RSS、网络吞吐或真机内存达标。

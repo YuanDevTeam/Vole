@@ -40,7 +40,7 @@ Vole 是用于 VPN 客户端和本地代理的 Rust 代理内核，提供原生�
 
 标准 TLS 连接支持证书验证与 SHA-256 证书固定。适用的 TCP TLS 路径可使用 Chrome、Firefox、Safari 或 iOS ClientHello 模板；`client-fingerprint` 与证书 `fingerprint` 相互独立。准确的名称和支持组合见 [TLS 配置与证书策略](../docs/tls-client-fingerprint.md)。这些功能不保证与浏览器不可区分，也不支持任意协议组合。
 
-SS2022 使用未经修改的官方 Rust 库；已知的空首写入、服务端先发送和 padding 风险见 [Shadowsocks 契约](../docs/outbounds.md#shadowsocks-2022)。
+SS2022 复用未经修改的官方 Rust 加密与编解码，由 Vole 初始化 padding 并处理 server-first，详见 [Shadowsocks 契约](../docs/outbounds.md#shadowsocks-2022)。
 
 ## Mihomo 风格配置
 

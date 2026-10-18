@@ -6,18 +6,21 @@ use shadowsocks::{
     config::ServerType,
     context::Context,
     relay::tcprelay::{
-        crypto_io::{CryptoRead, CryptoStream, CryptoWrite, StreamType},
-        proxy_stream::{ProxyServerStream, protocol::TcpRequestHeader},
+        crypto_io::{CryptoStream, CryptoWrite, StreamType},
+        proxy_stream::ProxyServerStream,
     },
 };
 use std::{
     future::poll_fn,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::Poll,
     time::Duration,
 };
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter, ReadBuf};
 use vole::{
     config::{ShadowsocksCipher, ShadowsocksOutboundConfig},
     dispatch::{BoxStream, DatagramTransport, DispatchError},
@@ -29,6 +32,49 @@ use vole::{
 };
 
 struct MemoryUpstream(Mutex<Option<BoxStream>>);
+
+struct RecordedIo {
+    inner: tokio::io::DuplexStream,
+    written: Arc<AtomicUsize>,
+}
+
+impl AsyncRead for RecordedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, out)
+    }
+}
+
+impl AsyncWrite for RecordedIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, bytes);
+        if let Poll::Ready(Ok(written)) = result {
+            self.written.fetch_add(written, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 #[async_trait]
 impl OutboundConnector for MemoryUpstream {
     async fn connect_stream(
@@ -47,6 +93,86 @@ impl OutboundConnector for MemoryUpstream {
         _: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         Err(DispatchError::NotAllowed)
+    }
+}
+
+#[tokio::test]
+async fn empty_writes_after_first_payload_emit_no_extra_encrypted_chunks() {
+    for cipher in [
+        ShadowsocksCipher::Aes128Gcm,
+        ShadowsocksCipher::Aes256Gcm,
+        ShadowsocksCipher::Chacha20Poly1305,
+    ] {
+        let key = vec![7; cipher.key_len()];
+        let config = ShadowsocksOutboundConfig {
+            address: "fixture.invalid".into(),
+            port: 443,
+            cipher,
+            password: STANDARD.encode(&key),
+            shadow_tls: None,
+            udp_over_tcp: false,
+        };
+        let (client, peer) = tokio::io::duplex(4096);
+        let written = Arc::new(AtomicUsize::new(0));
+        let outbound = ShadowsocksOutbound::new_with_path(
+            &config,
+            UpstreamPath::proxy(Arc::new(MemoryUpstream(Mutex::new(Some(Box::new(
+                RecordedIo {
+                    inner: client,
+                    written: written.clone(),
+                },
+            )))))),
+        )
+        .unwrap();
+        let target = Destination::domain("target.invalid", 80).unwrap();
+        let mut stream = outbound
+            .connect_stream(
+                StreamSession {
+                    metadata: Default::default(),
+                    inbound: InboundKind::Socks5,
+                    source: "127.0.0.1:1234".parse().unwrap(),
+                    destination: target,
+                    sniffed_domain: None,
+                },
+                &EstablishContext::default(),
+            )
+            .await
+            .unwrap()
+            .io;
+        assert!(
+            poll_fn(|cx| Poll::Ready(
+                Pin::new(&mut stream).poll_read(cx, &mut ReadBuf::new(&mut []))
+            ))
+            .await
+            .is_ready()
+        );
+        stream.flush().await.unwrap();
+        assert_eq!(written.load(Ordering::Relaxed), 0);
+        stream.write_all(b"first").await.unwrap();
+        stream.flush().await.unwrap();
+        let before = written.load(Ordering::Relaxed);
+        for _ in 0..2 {
+            assert_eq!(stream.write(&[]).await.unwrap(), 0);
+            stream.flush().await.unwrap();
+            assert_eq!(
+                written.load(Ordering::Relaxed),
+                before,
+                "{cipher:?}: an empty write emitted another encrypted chunk"
+            );
+        }
+        let mut decoder = ProxyServerStream::from_stream(
+            Context::new_shared(ServerType::Server),
+            peer,
+            cipher.as_str().parse().unwrap(),
+            &key,
+        );
+        assert_eq!(
+            decoder.handshake().await.unwrap(),
+            ("target.invalid".to_owned(), 80).into()
+        );
+        let mut payload = [0; 5];
+        decoder.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"first");
     }
 }
 
@@ -180,11 +306,9 @@ async fn read_first_flushes_the_official_header_over_a_buffered_upstream() {
             .await
             .unwrap()
             .io;
-        let context = Context::new_shared(ServerType::Server);
-        let mut decoder = CryptoStream::from_stream(
-            &context,
+        let mut decoder = ProxyServerStream::from_stream(
+            Context::new_shared(ServerType::Server),
             peer,
-            StreamType::Server,
             cipher.as_str().parse().unwrap(),
             &key,
         );
@@ -196,32 +320,12 @@ async fn read_first_flushes_the_official_header_over_a_buffered_upstream() {
                     assert_eq!(&greeting, b"hello");
                 },
                 async {
-                    // Exercise only the adapter's flush contract. The official
-                    // client randomly chooses zero padding for an empty request,
-                    // which its strict server rejects. Parse with its codec here;
-                    // the deterministic test below separately locks that rejection.
-                    let mut bytes = [0; 1024];
-                    let mut buffer = tokio::io::ReadBuf::new(&mut bytes);
-                    poll_fn(|cx| {
-                        Pin::new(&mut decoder).poll_read_decrypted(cx, &context, &mut buffer)
-                    })
-                    .await
-                    .unwrap();
-                    let mut plaintext = buffer.filled();
-                    let header = TcpRequestHeader::read_from(
-                        cipher.as_str().parse().unwrap(),
-                        &mut plaintext,
-                    )
-                    .await
-                    .unwrap();
-                    assert_eq!(header.addr(), ("target.invalid".to_owned(), 80).into());
-                    assert!(plaintext.is_empty());
-                    let request_nonce = decoder.received_nonce().unwrap().to_vec();
-                    decoder.set_request_nonce(&request_nonce);
-                    poll_fn(|cx| Pin::new(&mut decoder).poll_write_encrypted(cx, b"hello"))
-                        .await
-                        .unwrap();
-                    poll_fn(|cx| decoder.poll_flush(cx)).await.unwrap();
+                    assert_eq!(
+                        decoder.handshake().await.unwrap(),
+                        ("target.invalid".to_owned(), 80).into()
+                    );
+                    decoder.write_all(b"hello").await.unwrap();
+                    decoder.flush().await.unwrap();
                 }
             );
         })
