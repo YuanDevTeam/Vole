@@ -11,12 +11,12 @@ Configuration uses **Mihomo-style YAML for the supported feature set**. Vole pri
 ## What Vole can do
 
 - **Accept application and VPN traffic:** HTTP forwarding, CONNECT and Upgrade; SOCKS5 CONNECT and UDP ASSOCIATE; host-provided IPv4/IPv6 TUN packets.
-- **Route traffic:** rule/global/direct modes; domain, source/destination IP and port, TCP/UDP, GeoSite/GeoIP, rule providers and logical rules, with DIRECT and REJECT actions.
+- **Route traffic:** rule/global/direct modes; domain, source/destination IP and port, TCP/UDP, GeoSite/GeoIP, rule providers and logical rules; process/UID rules on supported platforms; named direct/dns/reject outbounds and built-in routing actions.
 - **Choose and chain proxies:** nested select/url-test/fallback/load-balance groups, health checks and persistent selection; `dialer-proxy` chains can reference nodes or groups. Existing connections retain their selected path.
 - **Handle DNS:** hosts, separate bootstrap/node/direct resolvers, UDP/TCP/DoH/DoT/DoQ, domain/GeoSite/rule-set policies, fallback, bounded caching, redir-host and persistent fake-IP mappings; intercept configured TUN DNS targets.
-- **Identify traffic for routing:** HTTP/TLS sniffing for TUN and mixed TCP, QUIC sniffing for TUN UDP, with force/skip conditions and configurable destination override. ICMPv4/ICMPv6 Echo is answered locally.
-- **Manage routing assets:** HTTP/file/inline proxy and rule providers, dynamic groups, filters and overrides; YAML/Text and domain/ipcidr MRS. GeoData loads complete referenced categories and supports routed downloads and periodic updates. Failed updates retain usable state. See [GeoData boundaries](docs/geodata.md#内存与安全边界).
-- **Expose client controls:** group/resource state, connection snapshots and cancellation, rule counters, effective configuration and bounded DNS diagnostics, alongside TUN traffic metrics and isolated node/chain delay measurement.
+- **Identify traffic for routing:** HTTP/1, HTTP/2 and TLS sniffing for TUN and mixed TCP; QUIC v1/v2 sniffing for TUN and SOCKS5 UDP associations, with force/skip conditions and configurable destination override. ICMPv4/ICMPv6 Echo is answered locally.
+- **Manage routing assets:** HTTP/file/inline proxy and rule providers, URI/Base64/AGE subscriptions, dynamic groups, filters and overrides; YAML/Text and domain/ipcidr MRS. GeoData loads complete referenced categories and supports routed downloads and periodic updates. Failed updates retain usable state. See [GeoData boundaries](docs/geodata.md#内存与安全边界).
+- **Expose client controls:** group/resource state, connection snapshots and cancellation, rule counters, effective configuration, bounded WebSocket streams and DNS diagnostics; supported configuration updates, TUN traffic metrics and isolated node/chain delay measurement. See the [Controller contract](docs/controller-api.md) for update boundaries.
 - **Process selected business HTTP:** URL rewrites and redirects, with optional host-supplied CA interception for explicitly allowed HTTPS domains and bounded H1/H2 streaming. This uses a [separate HTTP configuration](docs/http-processing.md).
 
 ## Proxy protocols
@@ -26,20 +26,22 @@ The default build enables the protocols below. UDP support depends on the protoc
 | Protocol | Capabilities |
 | --- | --- |
 | [VLESS](docs/vless.md) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP first-packet camouflage, legacy H2, [XHTTP H1/H2/H3](docs/xhttp.md); Vision, Encryption, REALITY, JLS and ECH in supported combinations |
-| [VMess AEAD](docs/outbounds.md#vmess-aead) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP first-packet camouflage and legacy H2; TCP/UDP, plaintext or standard TLS |
+| [VMess AEAD](docs/outbounds.md#vmess-aead) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP first-packet camouflage, legacy H2 and mKCP; TCP/UDP, plaintext or supported TLS modes |
 | [Trojan](docs/outbounds.md#trojan) | TCP/UDP over TLS TCP, WebSocket / HTTPUpgrade or gRPC |
-| [Shadowsocks 2022](docs/outbounds.md#shadowsocks-2022) | TCP/UDP; AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305; AES identity chains; optional strict ShadowTLS v3 TCP wrapping and UoT v2 |
+| [Shadowsocks 2022](docs/outbounds.md#shadowsocks-2022) | TCP/UDP; three 2022 ciphers and AES identity chains; optional obfs, WebSocket, JLS, kcptun or strict ShadowTLS v3 plugins; UoT v2 |
 | [AnyTLS](docs/outbounds.md#anytls) | TLS sessions and UDP over TCP v2 |
 | [HTTP / HTTPS CONNECT](docs/outbounds.md#http--https-connect) | TCP CONNECT, optional proxy authentication and TLS |
 | [SOCKS5](docs/outbounds.md#socks5) | CONNECT and UDP ASSOCIATE, with optional username/password authentication |
-| [Hysteria2](docs/outbounds.md#hysteria2) | QUIC TCP/UDP, bandwidth control, Salamander, port hopping and mTLS |
-| [TUIC v5](docs/outbounds.md#tuic-v5) | QUIC TCP/UDP, native/quic UDP relay modes and selectable congestion control |
+| [Hysteria2](docs/outbounds.md#hysteria2) | QUIC TCP/UDP, bandwidth control, Salamander/Gecko, port hopping or Realm/STUN, and mTLS |
+| [TUIC v5](docs/outbounds.md#tuic-v5) | QUIC TCP/UDP, native/quic UDP relay modes, UoT v2, selectable congestion control and `disable-sni` with certificate verification retained |
 | [WireGuard](docs/outbounds.md#wireguard) | TCP/UDP over standard WireGuard, multiple peers and node DNS, with a user-space IP stack |
 | [TrustTunnel](docs/outbounds.md#trusttunnel) | TCP/UDP over H2 or H3 CONNECT; authentication, health checks, mTLS and ECH |
 | [Mieru](docs/outbounds.md#mieru) | TCP/UDP over TCP or UDP carriers; multiplexing, STANDARD/NO-WAIT handshakes and traffic patterns |
 | [MASQUE](docs/outbounds.md#masque) | TCP/UDP over H2/H3 CONNECT-IP; TCP-only H3 L4 proxy mode |
 
 The shared [sing-mux wrapper](docs/xhttp.md#通用-sing-mux) supports all enabled node protocols. It provides TCP and, with `only-tcp: false`, UDP over the node's ordinary TCP path. The peer must provide sing-mux decoding; a normal HTTP/SOCKS5 listener does not automatically decode it.
+
+VMess, VLESS, Trojan and AnyTLS support ShadowTLS v3 or JLS on their supported TCP carriers; VMess and Trojan also support REALITY. These modes follow the [shared stream security constraints](docs/outbounds.md#流式安全身份), including transport exclusions and mutually exclusive identities.
 
 Standard TLS connections support certificate verification and SHA-256 certificate pins. Applicable TCP TLS paths can use Chrome, Firefox, Safari or iOS ClientHello templates; `client-fingerprint` is independent of the certificate `fingerprint`. See [TLS profiles and certificate policy](docs/tls-client-fingerprint.md) for the exact names and combinations. These features do not promise indistinguishability from a browser or unrestricted protocol combinations.
 
@@ -110,7 +112,7 @@ vole -t -f ./config.yaml
 
 Vole provides native libraries and a foreground CLI. Apple, Android and Windows hosts own system network configuration and application lifecycle; Linux core-owned TUN additionally supports automatic routes and system DNS. Unix hosts own the original TUN descriptor; Vole uses and closes its own duplicate. Apple's public packetFlow API does not guarantee raw-fd access, so actual Network Extension integration and device validation remain host responsibilities. See [TUN integration](docs/tun-platform.md) and [platform acceptance boundaries](docs/acceptance.md).
 
-Desktop Wintun loads a host-provided `wintun.dll` from the process executable's directory. The host configures interface addresses, DNS, routes and physical egress; Windows Wintun device validation is separate from the existing packaged VPN results. See [CLI usage and tag releases](docs/cli.md) for command-line delivery.
+Desktop Wintun loads a host-provided `wintun.dll` from the process executable's directory. The host configures interface addresses, DNS, routes and physical egress; Windows Wintun and packaged UWP require separate device validation. See [CLI usage and tag releases](docs/cli.md) for command-line delivery.
 
 The cross-platform C ABI accepts JSON requests through Invoke API:
 

@@ -277,7 +277,7 @@ impl RawHysteria2 {
             self.name,
             self.dialer_proxy,
             self.udp,
-            ProxyProtocol::Hysteria2(Hysteria2OutboundConfig {
+            ProxyProtocol::Hysteria2(Box::new(Hysteria2OutboundConfig {
                 address: self.server,
                 port,
                 password: self.password,
@@ -321,7 +321,7 @@ impl RawHysteria2 {
                 handshake_timeout: std::time::Duration::from_secs(
                     self.handshake_timeout.max(0) as u64
                 ),
-            }),
+            })),
         ))
     }
 }
@@ -405,7 +405,7 @@ mod p08_tests {
         let (_, _, _, ProxyProtocol::Hysteria2(config)) = raw.normalize()? else {
             panic!("HY2")
         };
-        Ok(config)
+        Ok(*config)
     }
     #[test]
     fn gecko_options_consume_actual_min_max_and_realm_excludes_hopping() {

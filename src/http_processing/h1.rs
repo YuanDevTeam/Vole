@@ -148,7 +148,7 @@ impl HttpContext {
                 framing::write_timed(writer, head.as_bytes(), config.header_timeout).await?;
                 return Ok(false);
             }
-            Decision::Forward(target) => target,
+            Decision::Forward(target) => *target,
         };
         let mut origin = if asterisk {
             "*".to_owned()

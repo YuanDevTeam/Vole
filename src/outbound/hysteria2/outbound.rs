@@ -329,8 +329,10 @@ async fn drive(
             datagram,
             context,
             bandwidth.clone(),
-            realm_tls.as_ref(),
-            &mut realm_pending,
+            super::paths::RealmSetup {
+                tls: realm_tls.as_ref(),
+                pending: &mut realm_pending,
+            },
         )
         .await?;
         let peer = path.peer;

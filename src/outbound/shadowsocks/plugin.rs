@@ -2,7 +2,7 @@
 use crate::{
     config::{SecurityConfig, ShadowsocksPlugin, StreamTransport},
     dispatch::{BoxStream, DispatchError},
-    outbound::{EstablishContext, OwnedStream, UpstreamPath},
+    outbound::{EstablishContext, UpstreamPath, owned_stream::OwnedStream},
     security::{SecurityClient, SecurityContext},
     session::{Destination, StreamSession},
     transport::{self, ss_framed},

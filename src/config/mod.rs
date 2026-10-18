@@ -794,7 +794,7 @@ pub enum ProxyProtocol {
     Http(HttpOutboundConfig),
     WireGuard(WireGuardOutboundConfig),
     Tuic(TuicOutboundConfig),
-    Hysteria2(Hysteria2OutboundConfig),
+    Hysteria2(Box<Hysteria2OutboundConfig>),
     Vmess(VmessOutboundConfig),
     Trojan(TrojanOutboundConfig),
     Vless(VlessOutboundConfig),

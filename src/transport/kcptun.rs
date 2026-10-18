@@ -124,12 +124,10 @@ impl Owner {
                 .await
                 .map_err(io::Error::other)?;
             let address = context.resolve_ip(&peer).await.map_err(io::Error::other)?;
-            let request = DatagramRequest::new(DatagramSession::new(
-                session.inbound.clone(),
-                session.source,
-            ))
-            .with_budget(DatagramBudget::new(self.options.mtu, 1500))
-            .with_kcptun_socket(self.options.socket_buffer, self.options.dscp);
+            let request =
+                DatagramRequest::new(DatagramSession::new(session.inbound, session.source))
+                    .with_budget(DatagramBudget::new(self.options.mtu, 1500))
+                    .with_kcptun_socket(self.options.socket_buffer, self.options.dscp);
             let transport = upstream
                 .open_datagram(request, context)
                 .await

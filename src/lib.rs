@@ -64,6 +64,7 @@ pub mod session;
 #[doc(hidden)]
 pub mod sniffing;
 #[cfg(any(
+    feature = "sing-mux",
     feature = "inbound-socks5",
     feature = "outbound-mieru",
     feature = "outbound-http",

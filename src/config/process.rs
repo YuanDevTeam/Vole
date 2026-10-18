@@ -125,7 +125,7 @@ fn wildcard(pattern: &str, value: &str) -> bool {
                 p += 1;
                 retry = Some((p, v));
             }
-            Some(c) if c == '?' || Some(c) == value[v..].chars().next() => {
+            Some(c) if c == '?' || value[v..].starts_with(c) => {
                 p += c.len_utf8();
                 v += value[v..].chars().next().unwrap().len_utf8();
             }

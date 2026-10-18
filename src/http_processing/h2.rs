@@ -124,7 +124,7 @@ impl HttpContext {
                     Some(url.as_str()),
                 );
             }
-            Ok(Decision::Forward(target)) => target,
+            Ok(Decision::Forward(target)) => *target,
             Err(_) => return local(response, StatusCode::FORBIDDEN, None),
         };
         if request.headers().contains_key("expect") && !request.body().is_end_stream() {

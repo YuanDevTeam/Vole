@@ -37,11 +37,10 @@ impl ShadowsocksPlugin {
             Self::ShadowTls(options) => options.validate(),
             Self::Jls(options) => options.validate(),
             Self::Obfs { host, .. } => validate_host(host, "Shadowsocks obfs host"),
-            Self::WebSocket { transport, .. }
-                if matches!(transport, StreamTransport::WebSocket { .. }) =>
-            {
-                Ok(())
-            }
+            Self::WebSocket {
+                transport: StreamTransport::WebSocket { .. },
+                ..
+            } => Ok(()),
             Self::WebSocket { .. } => invalid("invalid Shadowsocks WebSocket transport"),
             Self::Kcptun(options) => options.validate(),
         }

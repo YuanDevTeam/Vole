@@ -112,9 +112,8 @@ impl Client {
             .reserve_owned()
             .await
             .map_err(|_| io::ErrorKind::ConnectionAborted)?;
-        let capacity = (self.shared.options.stream_buffer / self.shared.options.frame_size)
-            .max(1)
-            .min(256);
+        let capacity =
+            (self.shared.options.stream_buffer / self.shared.options.frame_size).clamp(1, 256);
         let (tx, receive) = mpsc::channel(capacity);
         let flow = Arc::new(Flow::new());
         let close = CancellationToken::new();

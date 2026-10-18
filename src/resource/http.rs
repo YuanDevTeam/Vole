@@ -440,12 +440,10 @@ pub(crate) fn parse_url(raw: &str, options: &HttpOptions) -> Result<Url, Downloa
     if url.host().is_none() || (!options.allow_ip && !matches!(url.host(), Some(Host::Domain(_)))) {
         return Err(DownloadError::DomainRequired);
     }
-    if url.scheme() == "http" {
-        if url.fragment().is_some() {
-            return Err(DownloadError::InvalidUrl(
-                "URL must not contain a fragment".to_owned(),
-            ));
-        }
+    if url.scheme() == "http" && url.fragment().is_some() {
+        return Err(DownloadError::InvalidUrl(
+            "URL must not contain a fragment".to_owned(),
+        ));
     }
     url.set_fragment(None);
     Ok(url)

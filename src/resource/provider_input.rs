@@ -95,16 +95,16 @@ struct Link {
 impl Link {
     fn parse(line: &str, budget: &mut usize) -> Result<Self> {
         let mut url = Url::parse(line).map_err(|_| invalid())?;
-        if url.scheme() == "vless" && url.port().is_none() {
-            if let Some(decoded) = url
+        if url.scheme() == "vless"
+            && url.port().is_none()
+            && let Some(decoded) = url
                 .host_str()
                 .and_then(|host| decode64(host.as_bytes(), false))
-            {
-                let endpoint = std::str::from_utf8(&decoded).map_err(|_| invalid())?;
-                let endpoint = Url::parse(&format!("vless://{endpoint}")).map_err(|_| invalid())?;
-                url.set_host(endpoint.host_str()).map_err(|_| invalid())?;
-                url.set_port(endpoint.port()).map_err(|_| invalid())?;
-            }
+        {
+            let endpoint = std::str::from_utf8(&decoded).map_err(|_| invalid())?;
+            let endpoint = Url::parse(&format!("vless://{endpoint}")).map_err(|_| invalid())?;
+            url.set_host(endpoint.host_str()).map_err(|_| invalid())?;
+            url.set_port(endpoint.port()).map_err(|_| invalid())?;
         }
         let mut query = BTreeMap::<String, Vec<String>>::new();
         for (key, value) in url.query_pairs() {
@@ -280,17 +280,17 @@ fn reuse(source: &Map<String, Value>) -> Map<String, Value> {
         ("hMaxRequestTimes", "h-max-request-times"),
         ("hMaxReusableSecs", "h-max-reusable-secs"),
     ] {
-        if let Some(value) = source.get(source_key) {
-            if value.is_string() || value.is_i64() || value.is_u64() {
-                options.insert(
-                    target.into(),
-                    json!(
-                        value
-                            .as_str()
-                            .map_or_else(|| value.to_string(), str::to_owned)
-                    ),
-                );
-            }
+        if let Some(value) = source.get(source_key)
+            && (value.is_string() || value.is_i64() || value.is_u64())
+        {
+            options.insert(
+                target.into(),
+                json!(
+                    value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), str::to_owned)
+                ),
+            );
         }
     }
     if let Some(value) = source.get("hKeepAlivePeriod") {
@@ -358,16 +358,16 @@ fn xhttp_extra(options: &mut Map<String, Value>, extra: &Map<String, Value>) -> 
                     }
                 }
             }
-            if security == "reality" {
-                if let Some(reality) = download.get("realitySettings").and_then(Value::as_object) {
-                    let mut settings = Map::new();
-                    for (source, target) in [("publicKey", "public-key"), ("shortId", "short-id")] {
-                        if let Some(value) = reality.get(source) {
-                            settings.insert(target.into(), value.clone());
-                        }
+            if security == "reality"
+                && let Some(reality) = download.get("realitySettings").and_then(Value::as_object)
+            {
+                let mut settings = Map::new();
+                for (source, target) in [("publicKey", "public-key"), ("shortId", "short-id")] {
+                    if let Some(value) = reality.get(source) {
+                        settings.insert(target.into(), value.clone());
                     }
-                    result.insert("reality-opts".into(), Value::Object(settings));
                 }
+                result.insert("reality-opts".into(), Value::Object(settings));
             }
         }
         if let Some(xhttp) = download.get("xhttpSettings").and_then(Value::as_object) {
@@ -628,24 +628,23 @@ fn convert(line: &str, scheme: &str, parser: &mut Parser<'_>) -> Result<()> {
             .map_or(("", authority), |(user, host)| {
                 (&line[offset..offset + user.len() + 1], host)
             });
-        if !authority.contains(']') {
-            if let Some((host, ports)) = authority.rsplit_once(':') {
-                if ports.contains([',', '-']) {
-                    let first = ports.split([',', '-']).next().unwrap();
-                    if first.is_empty() {
-                        return Err(invalid());
-                    }
-                    normalized = format!(
-                        "{}{}{}:{}{}",
-                        &line[..offset],
-                        userinfo,
-                        host,
-                        first,
-                        &line[end..]
-                    );
-                    hopping = Some(ports.to_owned());
-                }
+        if !authority.contains(']')
+            && let Some((host, ports)) = authority.rsplit_once(':')
+            && ports.contains([',', '-'])
+        {
+            let first = ports.split([',', '-']).next().unwrap();
+            if first.is_empty() {
+                return Err(invalid());
             }
+            normalized = format!(
+                "{}{}{}:{}{}",
+                &line[..offset],
+                userinfo,
+                host,
+                first,
+                &line[end..]
+            );
+            hopping = Some(ports.to_owned());
         }
     }
     let link = Link::parse(&normalized, &mut parser.budget)?;

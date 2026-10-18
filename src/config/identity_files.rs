@@ -52,12 +52,11 @@ impl<'a> IdentityFiles<'a> {
             return Ok(());
         }
         self.inline_pair(map)?;
-        if map.get("type").and_then(Value::as_str) == Some("hysteria2") {
-            if let Some(realm) = map.get_mut("realm-opts").and_then(Value::as_mapping_mut)
-                && realm.get("enable").and_then(Value::as_bool) == Some(true)
-            {
-                self.inline_pair(realm)?;
-            }
+        if map.get("type").and_then(Value::as_str) == Some("hysteria2")
+            && let Some(realm) = map.get_mut("realm-opts").and_then(Value::as_mapping_mut)
+            && realm.get("enable").and_then(Value::as_bool) == Some(true)
+        {
+            self.inline_pair(realm)?;
         }
         if let Some(download) = map
             .get_mut("xhttp-opts")

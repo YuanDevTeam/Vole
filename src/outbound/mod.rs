@@ -78,12 +78,12 @@ pub mod hysteria2;
     feature = "outbound-trojan",
     feature = "outbound-vmess",
     feature = "outbound-vless",
+    feature = "outbound-shadowsocks",
     feature = "outbound-hysteria2",
     feature = "outbound-tuic",
     feature = "outbound-wireguard",
     feature = "outbound-masque"
 ))]
 mod owned_stream;
-pub(crate) use owned_stream::OwnedStream;
 #[cfg(feature = "outbound-tuic")]
 pub mod tuic;

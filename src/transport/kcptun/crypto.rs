@@ -56,7 +56,7 @@ enum Mode {
     Cfb(Box<dyn EncryptBlock>),
     Xor(Zeroizing<Vec<u8>>),
     Salsa(Zeroizing<[u8; 32]>),
-    Gcm(ring::aead::LessSafeKey),
+    Gcm(Box<ring::aead::LessSafeKey>),
 }
 pub(super) struct PacketCrypt(Mode);
 impl PacketCrypt {
@@ -104,10 +104,10 @@ impl PacketCrypt {
                 .map_err(io::Error::other)?;
                 Mode::Xor(table)
             }
-            "aes-128-gcm" => Mode::Gcm(ring::aead::LessSafeKey::new(
+            "aes-128-gcm" => Mode::Gcm(Box::new(ring::aead::LessSafeKey::new(
                 ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &key[..16])
                     .map_err(|_| invalid())?,
-            )),
+            ))),
             _ => return Err(invalid()),
         };
         Ok(Self(mode))

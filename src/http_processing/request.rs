@@ -11,7 +11,7 @@ pub(super) struct Target {
     pub(super) strip_origin_credentials: bool,
 }
 pub(super) enum Decision {
-    Forward(Target),
+    Forward(Box<Target>),
     Redirect { status: u16, url: Url },
     Reject,
 }
@@ -71,12 +71,12 @@ impl HttpContext {
             // Retain the fixed SNI's selected IP only for its own authority.
             session.sniffed_domain = Some(host.to_owned());
         }
-        Ok(Decision::Forward(Target {
+        Ok(Decision::Forward(Box::new(Target {
             url,
             session,
             logical_destination: destination,
             strip_origin_credentials,
-        }))
+        })))
     }
 }
 fn invalid() -> io::Error {

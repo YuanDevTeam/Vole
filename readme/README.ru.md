@@ -11,12 +11,13 @@ Vole — прокси-ядро на Rust для VPN-клиентов и лока
 ## Что умеет Vole
 
 - **Принимать трафик приложений и VPN:** пересылка HTTP, CONNECT и Upgrade; SOCKS5 CONNECT и UDP ASSOCIATE; IPv4/IPv6-пакеты TUN, предоставленные хостом.
-- **Маршрутизировать трафик:** режимы rule/global/direct; домены, IP и порты источника и назначения, TCP/UDP, GeoSite/GeoIP, наборы правил и логические условия, действия DIRECT и REJECT.
+- **Маршрутизировать трафик:** режимы rule/global/direct; домены, IP и порты источника и назначения, TCP/UDP, GeoSite/GeoIP, наборы правил и логические условия; правила процессов/UID на поддерживаемых платформах, именованные direct/dns/reject и встроенные действия маршрутизации.
 - **Выбирать прокси и строить цепочки:** вложенные группы select/url-test/fallback/load-balance, проверки доступности и сохранение выбора; `dialer-proxy` ссылается на узлы или группы. Существующие соединения сохраняют свой маршрут.
 - **Обрабатывать DNS:** hosts, отдельные bootstrap/узловые/прямые резолверы, UDP/TCP/DoH/DoT/DoQ, политики по доменам/GeoSite/rule-set, fallback, ограниченный кеш, redir-host и постоянные fake-IP; перехват DNS в TUN по конфигурации.
-- **Определять трафик для маршрутизации:** HTTP/TLS для TUN и mixed TCP, QUIC для TUN UDP, условия принудительного анализа и исключения, настраиваемая замена назначения. Ответы на ICMPv4/ICMPv6 Echo формируются локально.
-- **Управлять ресурсами:** HTTP/file/inline providers узлов и правил, динамические группы, фильтры и переопределения; YAML/Text и domain/ipcidr MRS. GeoData полностью загружает выбранные категории, поддерживает маршрутизируемые загрузки и периодические обновления; ошибки обновления сохраняют рабочее состояние. См. [границы GeoData](../docs/geodata.md#内存与安全边界).
-- **Предоставлять управление:** состояние групп и ресурсов, список и закрытие соединений, счётчики правил, действующая конфигурация и ограниченная DNS-диагностика, а также метрики TUN и изолированное измерение задержки.
+- **Определять трафик для маршрутизации:** HTTP/1, HTTP/2 и TLS для TUN и mixed TCP; QUIC v1/v2 для TUN и ассоциаций SOCKS5 UDP, условия принудительного анализа и исключения, настраиваемая замена назначения. Ответы на ICMPv4/ICMPv6 Echo формируются локально.
+- **Управлять ресурсами:** HTTP/file/inline providers узлов и правил, подписки URI/Base64/AGE, динамические группы, фильтры и переопределения; YAML/Text и domain/ipcidr MRS. GeoData полностью загружает выбранные категории, поддерживает маршрутизируемые загрузки и периодические обновления; ошибки обновления сохраняют рабочее состояние. См. [границы GeoData](../docs/geodata.md#内存与安全边界).
+- **Предоставлять управление:** состояние групп и ресурсов, список и закрытие соединений, счётчики правил, действующая конфигурация, ограниченные потоки WebSocket и DNS-диагностика; поддерживаемые обновления конфигурации, метрики TUN и изолированное измерение задержки. Границы обновлений описаны в [контракте Controller](../docs/controller-api.md).
+- **Обрабатывать выбранный HTTP-трафик:** переписывание URL и перенаправления; выборочный MITM для явно разрешённых HTTPS-доменов с CA от хоста и ограниченная потоковая передача H1/H2. Используется [отдельная HTTP-конфигурация](../docs/http-processing.md).
 
 ## Прокси-протоколы
 
@@ -25,18 +26,20 @@ Vole — прокси-ядро на Rust для VPN-клиентов и лока
 | Протокол | Возможности |
 | --- | --- |
 | [VLESS](../docs/vless.md) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP-маскировка первого пакета, legacy H2, [XHTTP H1/H2/H3](../docs/xhttp.md); Vision, Encryption, REALITY, JLS, ECH и sing-mux в поддерживаемых сочетаниях |
-| [VMess AEAD](../docs/outbounds.md#vmess-aead) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP-маскировка первого пакета и legacy H2; TCP/UDP, транспорт без TLS или со стандартным TLS |
+| [VMess AEAD](../docs/outbounds.md#vmess-aead) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP-маскировка первого пакета, legacy H2 и mKCP; TCP/UDP, транспорт без TLS или с поддерживаемыми режимами TLS |
 | [Trojan](../docs/outbounds.md#trojan) | TCP/UDP через TLS TCP, WebSocket / HTTPUpgrade или gRPC |
-| [Shadowsocks 2022](../docs/outbounds.md#shadowsocks-2022) | TCP/UDP; AES-128-GCM, AES-256-GCM и ChaCha20-Poly1305; цепочки идентификации AES; опциональный strict ShadowTLS v3 для TCP и UoT v2 |
+| [Shadowsocks 2022](../docs/outbounds.md#shadowsocks-2022) | TCP/UDP; три алгоритма 2022 и цепочки идентификации AES; плагины obfs, WebSocket, JLS, kcptun или strict ShadowTLS v3; UoT v2 |
 | [AnyTLS](../docs/outbounds.md#anytls) | TLS-сессии и UDP over TCP v2 |
 | [HTTP / HTTPS CONNECT](../docs/outbounds.md#http--https-connect) | TCP CONNECT, опциональная аутентификация прокси и TLS |
 | [SOCKS5](../docs/outbounds.md#socks5) | CONNECT и UDP ASSOCIATE, с опциональной аутентификацией по имени пользователя и паролю |
-| [Hysteria2](../docs/outbounds.md#hysteria2) | TCP/UDP через QUIC, управление пропускной способностью, Salamander, смена портов и mTLS |
-| [TUIC v5](../docs/outbounds.md#tuic-v5) | TCP/UDP через QUIC, режимы передачи UDP native/quic и выбор алгоритма управления перегрузкой |
+| [Hysteria2](../docs/outbounds.md#hysteria2) | TCP/UDP через QUIC, управление пропускной способностью, Salamander/Gecko, смена портов или Realm/STUN и mTLS |
+| [TUIC v5](../docs/outbounds.md#tuic-v5) | TCP/UDP через QUIC, native/quic UDP, UoT v2, выбор алгоритма управления перегрузкой; `disable-sni` сохраняет проверку сертификата |
 | [WireGuard](../docs/outbounds.md#wireguard) | TCP/UDP через стандартный WireGuard, несколько пиров и DNS узла, с пользовательским IP-стеком |
 | [TrustTunnel](../docs/outbounds.md#trusttunnel) | TCP/UDP через H2/H3 CONNECT; аутентификация, проверки состояния, mTLS и ECH |
 | [Mieru](../docs/outbounds.md#mieru) | TCP/UDP через транспорт TCP или UDP; мультиплексирование, STANDARD/NO-WAIT и traffic-pattern |
 | [MASQUE](../docs/outbounds.md#masque) | TCP/UDP через H2/H3 CONNECT-IP; режим H3 L4 поддерживает только TCP |
+
+VMess, VLESS, Trojan и AnyTLS поддерживают ShadowTLS v3 или JLS на своих поддерживаемых TCP-транспортах; VMess и Trojan также поддерживают REALITY. Ограничения транспортов и взаимоисключение режимов описаны в [общем контракте потоковой безопасности](../docs/outbounds.md#流式安全身份).
 
 Стандартные TLS-соединения поддерживают проверку сертификатов и закрепление сертификата по SHA-256. Поддерживаемые TCP-пути с TLS могут использовать шаблоны ClientHello Chrome, Firefox, Safari или iOS; `client-fingerprint` не зависит от `fingerprint` сертификата. Точные имена и сочетания описаны в [профилях TLS и политике сертификатов](../docs/tls-client-fingerprint.md). Эти функции не гарантируют неотличимость от браузера или произвольные сочетания протоколов.
 
@@ -107,7 +110,7 @@ vole -t -f ./config.yaml
 
 Vole предоставляет нативные библиотеки и CLI. На Apple, Android и Windows системной сетью и жизненным циклом приложения управляет хост; собственный TUN в Linux дополнительно поддерживает автоматические маршруты и системный DNS. На Unix исходный дескриптор TUN принадлежит хосту; Vole использует и закрывает собственную копию. Публичный API packetFlow от Apple не гарантирует доступ к raw fd, поэтому интеграция с Network Extension и проверка на устройствах остаются ответственностью хоста. См. [интеграцию TUN](../docs/tun-platform.md) и [границы приёмки платформ](../docs/acceptance.md).
 
-Настольный Wintun загружает предоставленный хостом `wintun.dll` из каталога исполняемого файла процесса. Адреса интерфейса, DNS, маршруты и физический выход настраивает хост; проверка Wintun на устройстве независима от результатов пакетного VPN. Использование CLI и поставка описаны в [документации CLI и релизов по тегам](../docs/cli.md).
+Настольный Wintun загружает предоставленный хостом `wintun.dll` из каталога исполняемого файла процесса. Адреса интерфейса, DNS, маршруты и физический выход настраивает хост; Wintun и пакетный UWP требуют отдельных проверок на устройстве. Использование CLI и поставка описаны в [документации CLI и релизов по тегам](../docs/cli.md).
 
 Кроссплатформенный C ABI принимает JSON-запросы через Invoke API:
 

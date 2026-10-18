@@ -294,8 +294,8 @@ impl State {
                 }
                 let old = self.tx_bytes;
                 self.accepted_before(next);
-                for number in numbers.chunks_exact(4) {
-                    self.accepted(u32::from_be_bytes(number.try_into().unwrap()));
+                for number in numbers.as_chunks::<4>().0 {
+                    self.accepted(u32::from_be_bytes(*number));
                 }
                 if self.tx_bytes < old {
                     self.sample_rtt(time, now);

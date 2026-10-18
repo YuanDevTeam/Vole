@@ -202,14 +202,14 @@ async fn discover(
                 if request.done || request.server != source {
                     continue;
                 }
-                if let Some(address) = wire::stun_response(&packet.payload, &request.id) {
-                    if address.is_ipv6() == source.is_ipv6() {
-                        request.done = true;
-                        if !addresses.contains(&address) {
-                            addresses.push(address);
-                        }
-                        break;
+                if let Some(address) = wire::stun_response(&packet.payload, &request.id)
+                    && address.is_ipv6() == source.is_ipv6()
+                {
+                    request.done = true;
+                    if !addresses.contains(&address) {
+                        addresses.push(address);
                     }
+                    break;
                 }
             }
             if requests.iter().all(|request| request.done) {

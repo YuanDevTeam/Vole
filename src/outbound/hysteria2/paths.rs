@@ -14,6 +14,12 @@ use tokio::time::Instant;
 const QUIC_PAYLOAD: u16 = crate::limits::HY2_QUIC_PAYLOAD as u16;
 const RETIRE_AFTER: Duration = Duration::from_secs(crate::limits::HY2_PATH_RETIRE_SECONDS as u64);
 
+/// Borrow Realm preparation state without moving its cancellation/Stop owner.
+pub(super) struct RealmSetup<'a> {
+    pub tls: Option<&'a StandardTlsClient>,
+    pub pending: &'a mut super::realm::Pending,
+}
+
 pub(super) struct Paths {
     config: Arc<Hysteria2OutboundConfig>,
     upstream: UpstreamPath,
@@ -34,8 +40,7 @@ impl Paths {
         datagram: DatagramSession,
         context: EstablishContext,
         bandwidth: Arc<Bandwidth>,
-        realm_tls: Option<&StandardTlsClient>,
-        realm_pending: &mut super::realm::Pending,
+        realm: RealmSetup<'_>,
     ) -> Result<(Self, Arc<WindowSocket>), DispatchError> {
         let peer = if config.realm.is_some() {
             SocketAddr::from(([0, 0, 0, 0], config.port))
@@ -55,12 +60,13 @@ impl Paths {
             retiring: None,
             current_socket: None,
         };
-        let (socket, driver) = if let Some(realm) = &paths.config.realm {
+        let (socket, driver) = if let Some(options) = &paths.config.realm {
             let wire_mtu = paths.wire_mtu();
-            let (raw, peer) = realm_pending
+            let (raw, peer) = realm
+                .pending
                 .open(
-                    realm,
-                    realm_tls,
+                    options,
+                    realm.tls,
                     &paths.upstream,
                     &paths.datagram,
                     &paths.context,

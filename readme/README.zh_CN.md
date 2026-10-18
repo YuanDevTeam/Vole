@@ -11,12 +11,13 @@ Vole 是用于 VPN 客户端和本地代理的 Rust 代理内核，提供原生�
 ## 内核能做什么
 
 - **接入应用与 VPN 流量：**HTTP 转发、CONNECT 和 Upgrade；SOCKS5 CONNECT 和 UDP ASSOCIATE；宿主提供的 IPv4/IPv6 TUN 数据包。
-- **路由流量：**支持 rule/global/direct 模式，域名、来源/目标 IP 与端口、TCP/UDP、GeoSite/GeoIP、规则集合及逻辑规则，提供 DIRECT 和 REJECT 动作。
+- **路由流量：**支持 rule/global/direct 模式，域名、来源/目标 IP 与端口、TCP/UDP、GeoSite/GeoIP、规则集合及逻辑规则；在支持的平台使用进程/UID 规则，提供具名 direct/dns/reject 出站与内置路由动作。
 - **选择和串联代理：**嵌套 select/url-test/fallback/load-balance 组、健康检查与选择持久化；`dialer-proxy` 可引用节点或组。既有连接保留原路径。
 - **处理 DNS：**hosts、独立 bootstrap/节点/直连解析角色，UDP/TCP/DoH/DoT/DoQ、域名/GeoSite/rule-set policy、fallback、有界缓存、redir-host 和持久 fake-IP；按配置接管 TUN DNS。
-- **识别流量用于路由：**TUN/mixed TCP 的 HTTP/TLS 嗅探与 TUN UDP 的 QUIC 嗅探，支持强制/排除条件和目标覆盖开关；本地应答 ICMPv4/ICMPv6 Echo。
-- **管理路由数据：**HTTP/file/inline 节点与规则 providers、动态组、筛选和覆盖；YAML/Text 及 domain/ipcidr MRS。GeoData 完整加载引用类别，支持指定出口下载和周期更新，坏更新保留旧状态。详见 [GeoData 边界](../docs/geodata.md#内存与安全边界)。
-- **提供客户端控制：**组与资源状态、连接快照与关闭、规则命中、有效配置和受限 DNS 诊断，以及 TUN 流量和隔离的节点/代理链延迟测量。
+- **识别流量用于路由：**TUN/mixed TCP 的 HTTP1/HTTP2/TLS 嗅探与 TUN、SOCKS5 UDP 关联的 QUIC v1/v2 嗅探，支持强制/排除条件和目标覆盖开关；本地应答 ICMPv4/ICMPv6 Echo。
+- **管理路由数据：**HTTP/file/inline 节点与规则 providers、URI/Base64/AGE 订阅、动态组、筛选和覆盖；YAML/Text 及 domain/ipcidr MRS。GeoData 完整加载引用类别，支持指定出口下载和周期更新，坏更新保留旧状态。详见 [GeoData 边界](../docs/geodata.md#内存与安全边界)。
+- **提供客户端控制：**组与资源状态、连接快照与关闭、规则命中、有效配置、有界 WebSocket 推送和 DNS 诊断；支持范围内的配置更新、TUN 流量与隔离的节点/代理链延迟测量。更新边界见 [Controller 契约](../docs/controller-api.md)。
+- **处理选定的业务 HTTP：**URL 改写和重定向，可使用宿主提供的 CA 对明确授权的 HTTPS 域名进行选择性解密，并以有界 H1/H2 流式转发。使用[独立 HTTP 配置](../docs/http-processing.md)。
 
 ## 代理协议
 
@@ -25,18 +26,20 @@ Vole 是用于 VPN 客户端和本地代理的 Rust 代理内核，提供原生�
 | 协议 | 能力 |
 | --- | --- |
 | [VLESS](../docs/vless.md) | TCP、WebSocket / HTTPUpgrade、gRPC、HTTP 首包伪装、传统 H2、[XHTTP H1/H2/H3](../docs/xhttp.md)；在支持的组合中提供 Vision、Encryption、REALITY、JLS、ECH 和 sing-mux |
-| [VMess AEAD](../docs/outbounds.md#vmess-aead) | TCP、WebSocket / HTTPUpgrade、gRPC、HTTP 首包伪装和传统 H2；TCP/UDP，明文或标准 TLS |
+| [VMess AEAD](../docs/outbounds.md#vmess-aead) | TCP、WebSocket / HTTPUpgrade、gRPC、HTTP 首包伪装、传统 H2 和 mKCP；TCP/UDP，明文或支持的 TLS 模式 |
 | [Trojan](../docs/outbounds.md#trojan) | 通过 TLS TCP、WebSocket / HTTPUpgrade 或 gRPC 传输 TCP/UDP |
-| [Shadowsocks 2022](../docs/outbounds.md#shadowsocks-2022) | TCP/UDP；AES-128-GCM、AES-256-GCM 和 ChaCha20-Poly1305；AES 身份链；可选 strict ShadowTLS v3 TCP 包装和 UoT v2 |
+| [Shadowsocks 2022](../docs/outbounds.md#shadowsocks-2022) | TCP/UDP；三种 2022 算法与 AES 身份链；可选 obfs、WebSocket、JLS、kcptun 或 strict ShadowTLS v3 插件；UoT v2 |
 | [AnyTLS](../docs/outbounds.md#anytls) | TLS 会话与 UDP over TCP v2 |
 | [HTTP / HTTPS CONNECT](../docs/outbounds.md#http--https-connect) | TCP CONNECT、可选代理认证与 TLS |
 | [SOCKS5](../docs/outbounds.md#socks5) | CONNECT 和 UDP ASSOCIATE，可选用户名/密码认证 |
-| [Hysteria2](../docs/outbounds.md#hysteria2) | QUIC TCP/UDP、带宽控制、Salamander、端口跳跃和 mTLS |
-| [TUIC v5](../docs/outbounds.md#tuic-v5) | QUIC TCP/UDP、native/quic UDP 转发模式，以及可选的拥塞控制算法 |
+| [Hysteria2](../docs/outbounds.md#hysteria2) | QUIC TCP/UDP、带宽控制、Salamander/Gecko、端口跳跃或 Realm/STUN，以及 mTLS |
+| [TUIC v5](../docs/outbounds.md#tuic-v5) | QUIC TCP/UDP、native/quic UDP 转发、UoT v2、拥塞控制选择；`disable-sni` 仍保留证书验证 |
 | [WireGuard](../docs/outbounds.md#wireguard) | 标准 WireGuard TCP/UDP、多 peer 与节点 DNS，使用用户态 IP 栈 |
 | [TrustTunnel](../docs/outbounds.md#trusttunnel) | H2/H3 CONNECT 承载 TCP/UDP，支持认证、健康检查、mTLS 和 ECH |
 | [Mieru](../docs/outbounds.md#mieru) | TCP/UDP 载体承载 TCP/UDP，支持复用、STANDARD/NO-WAIT 握手与 traffic-pattern |
 | [MASQUE](../docs/outbounds.md#masque) | H2/H3 CONNECT-IP 承载 TCP/UDP；H3 L4 模式仅支持 TCP |
+
+VMess、VLESS、Trojan 与 AnyTLS 可在各自支持的 TCP 载体上使用 ShadowTLS v3 或 JLS；VMess 与 Trojan 还支持 REALITY。传输限制与身份互斥遵循[共享流式安全约束](../docs/outbounds.md#流式安全身份)。
 
 标准 TLS 连接支持证书验证与 SHA-256 证书固定。适用的 TCP TLS 路径可使用 Chrome、Firefox、Safari 或 iOS ClientHello 模板；`client-fingerprint` 与证书 `fingerprint` 相互独立。准确的名称和支持组合见 [TLS 配置与证书策略](../docs/tls-client-fingerprint.md)。这些功能不保证与浏览器不可区分，也不支持任意协议组合。
 
@@ -107,7 +110,7 @@ vole -t -f ./config.yaml
 
 Vole 提供原生库和前台 CLI。Apple、Android、Windows 的系统网络与 App 生命周期由宿主负责；Linux 自建 TUN 另外支持自动路由和系统 DNS。Unix 宿主持有原始 TUN 描述符；Vole 使用并关闭自己复制的描述符。Apple 公开的 packetFlow API 不保证可获取 raw fd，因此实际 Network Extension 集成和设备验证仍由宿主负责。详见 [TUN 集成](../docs/tun-platform.md)与[平台验收边界](../docs/acceptance.md)。
 
-桌面 Wintun 从进程可执行文件所在目录加载宿主提供的 `wintun.dll`。接口地址、DNS、路由与物理出口由宿主配置；Wintun 设备验收独立于已有安装包 VPN 结果。命令行使用与交付见 [CLI 与 tag 发布](../docs/cli.md)。
+桌面 Wintun 从进程可执行文件所在目录加载宿主提供的 `wintun.dll`。接口地址、DNS、路由与物理出口由宿主配置；Wintun 与安装包 UWP 分别进行设备验收。命令行使用与交付见 [CLI 与 tag 发布](../docs/cli.md)。
 
 跨平台 C ABI 通过 Invoke API 接受 JSON 请求：
 
