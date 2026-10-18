@@ -217,6 +217,25 @@ IP-only协议接点持有`ResolutionContext`，runtime DNS通过Weak绑定，不
 
 完整接口见 [运行时 Controller](controller-api.md)。
 
+## Provider 与 HTTP 资源
+
+Provider 在现有 AGE 解密后读取 YAML、URI 列表或标准 Base64 URI 订阅，转换结果继续走
+名称过滤、override、完整节点与依赖图校验及资源代次发布。输入和解密结果最多 8 MiB，
+URI 转换使用 32 MiB 保守空间计费，单行最多 64 KiB，嵌套最多 64 层。
+URL/query、凭据解码、JSON/YAML 转换和选项 clone 前按单行最坏结构预留临时空间；
+展开节点及名称索引单独保留计费，多端口来源逐个加入候选。外层 Base64 清理与解码
+先检查并存空间。JSON 先做不构建值树的语法检查，再复用有界 YAML visitor。
+这份估算不包含调用者已持有的源文件，不代表 allocator 精确容量或进程 RSS 上界；
+不足时整个候选失败，不增加业务数量准入或新的配置字段。
+
+HTTP(S) 资源共用流式 gzip 解码与 URL Basic。压缩 framing 与解压内容分别计数，
+size-limit 作用于解压内容；完整 gzip 校验和落盘成功后才返回候选，坏流或取消删除暂存。
+解码输出块检查同一取消与期限，不整包缓冲解压结果。跨 origin 不转发原认证或 Cookie。
+Provider 来源身份摘要绑定精确 URL 和实际请求 header/UA；GeoData 用精确 URL 摘要。
+来源元数据和 Debug 不保存或输出明文凭据，GeoData 的来源显示仅保留 origin。
+Provider 旧 URL-only 身份须无条件刷新；旧内容可用与其 ETag/订阅元信息可信度分别判断，
+来源身份不符时保留内容但无条件重新获取，不用旧身份授权 304。
+
 ## 离线规则 bundle
 
 `rule-providers.*.path-in-bundle` 使用 `dataDir/BundleMRS.7z` 中的精确成员名；

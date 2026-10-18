@@ -226,6 +226,7 @@ pub struct GeoResourceState {
     pub etag: Option<String>,
     pub hash: Option<String>,
     pub(crate) source_url: Option<String>,
+    pub(crate) source_identity: Option<String>,
     pub(crate) asset_identity: Option<String>,
 }
 
@@ -296,6 +297,8 @@ struct PersistentResourceState {
     #[serde(default)]
     source_url: Option<String>,
     #[serde(default)]
+    source_identity: Option<String>,
+    #[serde(default)]
     asset_identity: Option<String>,
 }
 
@@ -316,7 +319,20 @@ impl PersistentResourceState {
                 .or_else(|| self.last_error.clone()),
             etag: self.etag.clone(),
             hash: self.hash.clone(),
-            source_url: self.source_url.clone(),
+            source_url: self
+                .source_url
+                .as_deref()
+                .and_then(crate::resource::http::source_origin),
+            source_identity: self.source_identity.clone().or_else(|| {
+                self.source_url
+                    .as_deref()
+                    .filter(|raw| {
+                        url::Url::parse(raw).ok().is_some_and(|url| {
+                            url.username().is_empty() && url.password().is_none()
+                        })
+                    })
+                    .map(crate::resource::http::source_identity)
+            }),
             asset_identity: self.asset_identity.clone(),
         }
     }
@@ -899,7 +915,8 @@ impl GeoDataManager {
             return Ok(None);
         }
         let resource = status.resource(kind);
-        let request_etag = (resource.source_url.as_deref() == Some(source_url)
+        let request_etag = (resource.source_identity.as_deref()
+            == Some(crate::resource::http::source_identity(source_url).as_str())
             && resource.asset_identity.as_deref() == Some(assets.identity(kind).as_str())
             && resource.available
             && resource
@@ -1064,7 +1081,12 @@ impl GeoDataManager {
         resource.last_error = None;
         resource.etag = etag;
         resource.hash = Some(hash);
-        resource.source_url = source_url;
+        resource.source_identity = source_url
+            .as_deref()
+            .map(crate::resource::http::source_identity);
+        resource.source_url = source_url
+            .as_deref()
+            .and_then(crate::resource::http::source_origin);
         resource.asset_identity = Some(asset_identity);
         persist_state(&self.store_dir, &state)?;
         *lock(&self.state) = state;
@@ -1089,7 +1111,12 @@ impl GeoDataManager {
         if etag.is_some() {
             resource.etag = etag;
         }
-        resource.source_url = source_url;
+        resource.source_identity = source_url
+            .as_deref()
+            .map(crate::resource::http::source_identity);
+        resource.source_url = source_url
+            .as_deref()
+            .and_then(crate::resource::http::source_origin);
         resource.asset_identity = Some(asset_identity);
         persist_state(&self.store_dir, &state)?;
         *lock(&self.state) = state;
@@ -1763,7 +1790,8 @@ fn resource_due(
     resource.required
         && !resource.updating
         && (!resource.available
-            || resource.source_url.as_deref() != Some(source_url)
+            || resource.source_identity.as_deref()
+                != Some(crate::resource::http::source_identity(source_url).as_str())
             || resource.asset_identity.as_deref() != Some(asset_identity)
             || resource
                 .last_success
@@ -2008,6 +2036,48 @@ mod tests {
     use super::super::GeoDataError;
     use super::*;
     use crate::config::{DnsNameserverPolicy, RuleAction, RuleKind, RuleSpec};
+
+    #[test]
+    fn source_identity_is_private_and_changes_invalidate_update_scheduling() {
+        let first = "https://user:first@asset.example/data?token=private";
+        let second = "https://user:second@asset.example/data?token=private";
+        let resource = PersistentResourceState {
+            available: true,
+            last_success: Some(10),
+            source_url: crate::resource::http::source_origin(first),
+            source_identity: Some(crate::resource::http::source_identity(first)),
+            asset_identity: Some("same-asset".into()),
+            ..Default::default()
+        };
+        let stored = serde_json::to_string(&resource).unwrap();
+        assert!(!stored.contains("user"));
+        assert!(!stored.contains("first"));
+        assert!(!stored.contains("private"));
+        let view = resource.with_required(true, None);
+        assert_eq!(view.source_url.as_deref(), Some("https://asset.example"));
+        assert!(!resource_due(&view, first, "same-asset", 11, 3600));
+        assert!(resource_due(&view, second, "same-asset", 11, 3600));
+        let legacy = PersistentResourceState {
+            source_url: Some("https://asset.example/data".into()),
+            source_identity: None,
+            ..resource.clone()
+        }
+        .with_required(true, None);
+        assert!(!resource_due(
+            &legacy,
+            "https://asset.example/data",
+            "same-asset",
+            11,
+            3600
+        ));
+        let legacy_auth = PersistentResourceState {
+            source_url: Some(first.into()),
+            source_identity: None,
+            ..resource
+        }
+        .with_required(true, None);
+        assert!(resource_due(&legacy_auth, first, "same-asset", 11, 3600));
+    }
 
     fn varint(mut value: u64) -> Vec<u8> {
         let mut output = Vec::new();

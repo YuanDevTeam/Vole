@@ -18,7 +18,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 | --- | --- |
 | 配置与选路 | YAML anchor/merge；rule/global/direct；内置 DIRECT/REJECT；域名、地址、端口、网络、GeoData、RULE-SET 和 AND/OR/NOT |
 | 物理出口 | 全局/节点 interface-name、Linux routing-mark、Provider 对应 override、普通 DNS #接口；平台约束和 auto-route mark 冲突见出站与 TUN 契约 |
-| 资源 | HTTP/file/inline proxy/rule providers；动态成员、筛选、覆盖、健康检查；Provider dialer-proxy 与 HTTP 订阅信息；YAML/Text 与 domain/ipcidr MRS；有界离线规则bundle；失败保留旧代 |
+| 资源 | HTTP/file/inline proxy/rule providers；YAML/URI/标准 Base64 订阅、AGE；共享流式 gzip/URL Basic；动态成员、筛选、覆盖、健康检查；Provider dialer-proxy 与 HTTP 订阅信息；YAML/Text 与 domain/ipcidr MRS；有界离线规则bundle；失败保留旧代 |
 | 策略组 | select/url-test/fallback/load-balance；默认和持久选择；延迟容差、恢复、三种负载均衡策略；旧连接保持原路径 |
 | DNS | hosts（含启动 LAN 地址快照）、bootstrap/节点/直连解析角色、policy、respect-rules；UDP/TCP/DoH/DoT/DoQ、DoH/H3；fallback；redir-host/fake-IP 与映射持久化 |
 | mixed-port | HTTP/SOCKS5 TCP 与 SOCKS5 UDP；LAN 地址限制、多用户认证、认证跳过网段；allow-lan 不强制认证 |
@@ -48,6 +48,9 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - 订阅元信息只在成功候选或合法 304 后发布，失败响应或坏候选保留旧值；
   与 Mihomo 在读取响应头时更新的时点不同。数值仅接受有限且可表示的十进制数，
   不保留非有限/溢出浮点转换的参考行为。
+- URI 转换仍受当前严格节点/版本范围限制；HTTPS URI 节点默认校验证书，不复制参考
+  转换器的隐式跳过校验。Provider 缓存按精确 URL 与实际 header/UA 摘要隔离，
+  GeoData 按精确 URL 摘要隔离；凭据不写入来源元数据或 Debug。
 - WireGuard 使用标准用户态单/多 peer、最长前缀选择、reserved（数组或 Base64）、节点远端 DNS 与按需端点更新；
   每个本地地址族最多一个地址，MTU 至少1280。无 peers 时顶层 allowed-ips 与参考一致地忽略。
   peer 仅在实际使用时解析/建链；Mihomo 在节点初始化时解析所有 peer。

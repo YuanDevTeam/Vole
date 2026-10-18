@@ -4055,6 +4055,7 @@ dependencies = [
  "crc32fast",
  "domain",
  "fancy-regex",
+ "flate2",
  "foreign-types",
  "futures-util",
  "getifaddrs",

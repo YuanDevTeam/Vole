@@ -35,7 +35,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | 配置 | `config::tests::` | YAML准入、图、字段单位与边界 |
 | 物理出口 | `config::egress::tests::`、`config::dns::upstream_options_tests::`、`runtime::egress_tests::`、`dialer::tests::egress_clones_keep_the_protection_and_stop_owner` | 全局/节点继承、Provider整数覆盖、DNS名称优先与池身份、auto-route冲突和共同Stop owner |
 | GeoData | `geodata::tests::` | 合成DAT/MMDB、selector、更新发布和取消 |
-| 资源与Provider | `config::rule_provider::`、`runtime::providers::tests::`、`resource::cache::tests::` | 域名紧凑索引、MRS边界、候选提交、失败保留与旧代资源 |
+| 资源与Provider | `config::rule_provider::`、`runtime::providers::tests::`、`resource::cache::tests::`、`resource::provider_input::tests::`、`resource::http::tests::` | 域名紧凑索引、MRS、URI/Base64/AGE候选、流式gzip与认证隔离、失败保留与旧代资源 |
 | 策略组 | `routing::proxy_group::tests::`、`routing::balance::tests::` | 选择、容差、恢复和负载均衡 |
 | DNS | `dns::cache::tests::`、`dns::runtime::tests::dns_fallback_`、`dns::runtime::tests::resolve_ipv6_` | 缓存、双栈、竞速和取消 |
 | QUIC与H3 | `transport::quic::`、`transport::quinn_h3::tests::`、`transport::quiche_h3::tests::`、`dns_quic_` | 官方窗口、真实内存QUIC、DATA读取背压、请求取消、兄弟请求及Stop |

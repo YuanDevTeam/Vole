@@ -52,7 +52,8 @@ profile:
 # 资源下载使用 global-ua（缺省 Vole/ 加 Core 版本）；etag-support 缺省 true。
 # geodata-mode 默认 false，使用国家 MMDB；true 使用 GeoIP DAT。此示例显式选择 DAT。
 # URL 缺省 MetaCubeX meta-rules-dat latest DAT / 国家 MMDB / ASN MMDB。
-# URL 以域名为主机、无 userinfo/fragment，生产构建使用 HTTPS。
+# URL 以域名为主机、无 fragment，生产构建使用 HTTPS；userinfo 用于 HTTP Basic。
+# HTTP 资源自动流式解压 gzip，状态只保存来源摘要与脱敏 origin。
 # 自动更新默认 false；启动后仍获取缺失的必需资产。周期单位小时，默认 24，0 关闭周期检查。
 global-ua: "Vole/0.1.0"
 etag-support: true
@@ -678,7 +679,15 @@ proxy-groups:
 # HTTP interval 单位秒，0 只获取一次；file 监测文件变化。下载失败退避重试。
 # proxy 指定当前运行配置中的出口；缺省按规则选路。不会等待新资源才能建立下载连接。
 # header 值为字符串数组；size-limit 单位字节，0 不设下载上限，解析仍有容量边界。
-# proxy provider 文件为 {proxies: [...]}；可用 filter/exclude-filter/exclude-type。
+# proxy provider 支持 {proxies: [...]} YAML、URI 列表及标准 Base64 编码的 URI 列表。
+# URI 转换后仍执行原名称过滤、override 与完整严格节点/依赖图校验。
+# 支持当前协议范围内的 vless/vmess/trojan/ss/anytls/hy2/hysteria2/tuic/mierus，
+# 以及 socks/socks5/socks5h/http/https；SS 仍只允许 SS2022，TUIC 仅 v5。
+# URI HTTPS 节点保持默认验证证书，不复制参考转换器的隐式 skip-cert-verify。
+# 可用 filter/exclude-filter/exclude-type。URI 转换失败保留旧资源，不记录原始 URI。
+# HTTP 来源 URL 的 userinfo 使用 Basic；跨 origin 跳转不转发原认证/Cookie。
+# gzip 流式解压后写缓存；size-limit、hash 与后续解析针对解压内容，gzip 损坏或超限不发布。
+# 来源摘要绑定精确 URL、实际 header/UA；旧 URL-only 元数据保留可用内容但不复用 ETag。
 # provider 的 dialer-proxy 覆盖每个节点的同名字段，override 最后应用；
 # 它只控制节点上游，资源下载仍使用独立的 proxy 字段。
 # override 支持 udp、udp-over-tcp、up/down、dialer-proxy、ip-version、interface-name、routing-mark、skip-cert-verify、name-cert-verify、
@@ -708,10 +717,11 @@ proxy-groups:
 # 随缓存保存；缺少该头保留旧值，失败候选不更新。Controller 不用本地流量填充订阅用量。
 # proxy providers 的 age-secret-key 可含多行 X25519/Hybrid AGE 私钥，空行和 # 注释跳过。
 # HTTP/file 来源写法：age-secret-key: |，下方缩进填写私钥；不用于 rule providers。
-# 配置期验证私钥；仅精确 AGE armor 前缀触发原生解密，普通 YAML 仍可使用同一来源。
+# 配置期验证私钥；仅精确 AGE armor 前缀触发原生解密，之后识别 YAML/URI/Base64。
 # file、初始缓存和 HTTP 更新共用解密；缓存/hash/ETag 保留原密文，解密失败不发布候选。
 # 私钥最多 16 KiB/128 个，AGE 头最多 64 KiB/1024 次身份尝试；解密输出限 8 MiB，
-# 沿用 YAML 展开预算。读取/解密共享 90 秒期限，并在读块和密钥操作之间检查取消。
+# URI、JSON 选项和多端口节点转换共用 32 MiB 内部展开计费；不是整进程 RSS 保证。
+# 读取/解密共享 90 秒期限，并在读块和密钥操作之间检查取消。
 # 新连接使用新资源，旧 TCP/UDP 会话保留原资源；停止等待下载、解析和资源释放。
 # rule providers 支持 domain/ipcidr/classical，format 为 yaml/text/mrs；MRS 仅 domain/ipcidr。
 # YAML 规则文件为 {payload: [...]}，text 每行一条，支持空行和 # 注释。

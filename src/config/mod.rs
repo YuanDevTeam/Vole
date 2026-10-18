@@ -57,7 +57,7 @@ pub use domain_regex::{DomainRegex, MatchFailure, RuleDecision};
 pub use ip_suffix::IpSuffix;
 mod scalar;
 pub use rule_provider::RuleCollection;
-mod yaml;
+pub(crate) mod yaml;
 pub use rules::RuleInboundType;
 use rules::parse_rule;
 
@@ -230,12 +230,25 @@ pub struct GeoDataUpdateConfig {
     pub interval_hours: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GeoDataUrls {
     pub geoip: String,
     pub mmdb: String,
     pub geosite: String,
     pub asn: String,
+}
+impl std::fmt::Debug for GeoDataUrls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeoDataUrls")
+            .field("geoip", &crate::resource::http::source_origin(&self.geoip))
+            .field("mmdb", &crate::resource::http::source_origin(&self.mmdb))
+            .field(
+                "geosite",
+                &crate::resource::http::source_origin(&self.geosite),
+            )
+            .field("asn", &crate::resource::http::source_origin(&self.asn))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1306,7 +1319,7 @@ struct RawProxyGroup {
     default_selected: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawGeoDataUrls {
     #[serde(default = "default_geoip_url")]
@@ -1317,6 +1330,11 @@ struct RawGeoDataUrls {
     geosite: String,
     #[serde(default = "default_asn_url")]
     asn: String,
+}
+impl std::fmt::Debug for RawGeoDataUrls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawGeoDataUrls").finish_non_exhaustive()
+    }
 }
 fn default_global_ua() -> String {
     concat!("Vole/", env!("CARGO_PKG_VERSION")).into()
@@ -2462,14 +2480,8 @@ fn normalize_geox_url(raw: String, field: &str) -> Result<String> {
     if url.scheme() != "https" {
         return invalid(format!("{field} must use HTTPS"));
     }
-    let authority = raw
-        .split_once("://")
-        .map(|(_, suffix)| suffix)
-        .and_then(|suffix| suffix.split(['/', '?', '#']).next())
-        .unwrap_or_default();
-    if !url.username().is_empty() || url.password().is_some() || authority.contains('@') {
-        return invalid(format!("{field} must not contain credentials"));
-    }
+    crate::resource::http::parse_url(&raw, &Default::default())
+        .map_err(|_| VoleError::InvalidConfig(format!("{field} has invalid URL authentication")))?;
     if !matches!(url.host(), Some(Host::Domain(_))) {
         return invalid(format!("{field} must contain a domain host"));
     }
@@ -4335,12 +4347,12 @@ geo-update-interval: 24"#,
                 "24",
             ),
             complete(
-                "https://user:password@geo.example.test/geoip.dat",
+                "https://user%GG:password@geo.example.test/geoip.dat",
                 "https://geo.example.test/geosite.dat",
                 "24",
             ),
             complete(
-                "https://@geo.example.test/geoip.dat",
+                "https://user%3Aname:password@geo.example.test/geoip.dat",
                 "https://geo.example.test/geosite.dat",
                 "24",
             ),
@@ -4387,6 +4399,23 @@ geo-update-interval: 24"#,
         ] {
             assert!(normalize_geox_url(url.to_owned(), "geox-url.geoip").is_err());
         }
+    }
+
+    #[test]
+    fn geodata_url_basic_auth_keeps_validation_and_debug_private() {
+        let yaml = with_geodata(
+            "geox-url: {geoip: 'https://subscriber:password@geo.example.test/private-path?token=private-query'}",
+        );
+        let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        let debug = format!("{:?}", config.geodata_update.as_ref().unwrap());
+        for secret in ["subscriber", "password", "private-path", "private-query"] {
+            assert!(!debug.contains(secret));
+        }
+        assert!(debug.contains("https://geo.example.test"));
+        let raw: RawGeoDataUrls=serde_yaml_ng::from_str("geoip: 'https://subscriber:password@geo.example.test/private-path?token=private-query'").unwrap();
+        let debug = format!("{raw:?}");
+        assert!(!debug.contains("password"));
+        assert!(!debug.contains("private-query"));
     }
 
     #[test]

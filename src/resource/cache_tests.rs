@@ -68,11 +68,12 @@ proxy-groups:
 }
 
 async fn fetch(cache: &mut ProviderCache, response: Vec<u8>) -> io::Result<Option<Candidate>> {
+    let user_agent = cache.template.request_user_agent();
     cache
         .fetch(
             0,
             Arc::new(Responses(Mutex::new([response].into()))),
-            "fixture".into(),
+            user_agent,
             true,
             crate::security::SecurityContext::new(),
             CancellationToken::new(),
@@ -87,6 +88,173 @@ fn commit_valid(cache: &mut ProviderCache, candidate: Candidate) {
     cache
         .commit(0, candidate, &CancellationToken::new())
         .unwrap();
+}
+
+#[tokio::test]
+async fn uri_provider_candidate_keeps_filters_override_and_authenticated_cache_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let configured = |password: &str| {
+        Config::parse_yaml(
+            format!(
+                r#"
+proxy-providers:
+  remote:
+    type: http
+    url: 'http://subscriber:{password}@subscription.invalid/nodes?token=private'
+    path: nodes
+    filter: '^edge$'
+    override: {{additional-prefix: 'chosen-', interface-name: eth0}}
+proxy-groups:
+  - {{name: choice, type: select, use: [remote]}}
+"#
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+        .providers
+        .unwrap()
+    };
+    let source = configured("first");
+    let mut cache = ProviderCache::open(root.path(), source.clone()).unwrap();
+    let uri = "socks5://candidate-user:candidate-password@192.0.2.1:1080#edge\nsocks5://192.0.2.2:1080#other\n";
+    let candidate = fetch(
+        &mut cache,
+        response(200, "Subscription-Userinfo: upload=7\r\n", uri),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let debug = format!("{:?}", candidate.content);
+    assert!(!debug.contains("candidate-password"));
+    assert!(!debug.contains("192.0.2.1"));
+    let mut contents = cache.contents.clone();
+    contents.insert(cache.entries[0].key.clone(), candidate.content.clone());
+    let config = cache.template.materialize(&contents).unwrap();
+    assert_eq!(config.proxies.len(), 1);
+    assert_eq!(config.proxies[0].tag, "chosen-edge");
+    commit_valid(&mut cache, candidate);
+    let path = root.path().join("nodes");
+    let sidecar = metadata_path(&path);
+    let old_body = fs::read(&path).unwrap();
+    let old_metadata = fs::read(&sidecar).unwrap();
+    let visible = String::from_utf8(old_metadata.clone()).unwrap();
+    for secret in ["subscriber", "first", "private", "subscription.invalid"] {
+        assert!(!visible.contains(secret));
+    }
+    let mut legacy: serde_json::Value = serde_json::from_slice(&old_metadata).unwrap();
+    legacy["url"] = serde_json::json!(http::source_identity(&source.proxies[0].1.url));
+    fs::write(&sidecar, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let upgraded = ProviderCache::open(root.path(), source.clone()).unwrap();
+    assert!(upgraded.entries[0].state.available);
+    assert!(!upgraded.entries[0].state.downloaded);
+    assert_eq!(upgraded.entries[0].metadata.etag, None);
+    fs::write(&sidecar, &old_metadata).unwrap();
+    let mut header_source = source.as_ref().clone();
+    header_source.proxies[0]
+        .1
+        .header
+        .insert("Authorization".into(), vec!["Bearer changed".into()]);
+    // URL Basic wins over this unused header, so its actual request is unchanged.
+    assert!(
+        ProviderCache::open(root.path(), Arc::new(header_source))
+            .unwrap()
+            .entries[0]
+            .state
+            .downloaded
+    );
+    let mut cookie_source = source.as_ref().clone();
+    cookie_source.proxies[0]
+        .1
+        .header
+        .insert("Cookie".into(), vec!["subscription=different".into()]);
+    let cookie_cache = ProviderCache::open(root.path(), Arc::new(cookie_source)).unwrap();
+    assert!(cookie_cache.entries[0].state.available);
+    assert!(!cookie_cache.entries[0].state.downloaded);
+    assert_eq!(cookie_cache.entries[0].metadata.etag, None);
+    let mut cache = ProviderCache::open(root.path(), configured("second")).unwrap();
+    assert!(cache.entries[0].state.available);
+    assert!(!cache.entries[0].state.downloaded);
+    assert_eq!(cache.entries[0].metadata.etag, None);
+    assert_eq!(cache.entries[0].state.subscription_info, None);
+    // A validator from a different credential identity cannot authorize 304.
+    assert!(fetch(&mut cache, response(304, "", "")).await.is_err());
+    assert_eq!(fs::read(&path).unwrap(), old_body);
+    assert_eq!(fs::read(&sidecar).unwrap(), old_metadata);
+    assert!(
+        fetch(
+            &mut cache,
+            response(
+                200,
+                "Subscription-Userinfo: upload=99\r\n",
+                "socks5://private-password@invalid"
+            )
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(fs::read(&path).unwrap(), old_body);
+    assert_eq!(fs::read(&sidecar).unwrap(), old_metadata);
+    let mut restored = ProviderCache::open(root.path(), source).unwrap();
+    assert_eq!(
+        restored.entries[0].state.subscription_info.unwrap().upload,
+        7
+    );
+    assert!(
+        fetch(
+            &mut restored,
+            response(304, "Subscription-Userinfo: upload=9\r\n", "")
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(
+        restored.entries[0].state.subscription_info.unwrap().upload,
+        9
+    );
+}
+
+#[test]
+fn age_then_base64_uri_provider_uses_the_existing_candidate_parser() {
+    use base64::Engine as _;
+    use std::io::Write;
+    let secret = include_str!("../../tests/fixtures/provider-age/x25519.key").trim();
+    let identity = secret.parse::<age::x25519::Identity>().unwrap();
+    let encryptor = age::Encryptor::with_recipients(std::iter::once(
+        &identity.to_public() as &dyn age::Recipient
+    ))
+    .unwrap();
+    let mut encrypted = Vec::new();
+    let armor =
+        age::armor::ArmoredWriter::wrap_output(&mut encrypted, age::armor::Format::AsciiArmor)
+            .unwrap();
+    let mut writer = encryptor.wrap_output(armor).unwrap();
+    writer
+        .write_all(
+            base64::engine::general_purpose::STANDARD
+                .encode("socks5://192.0.2.1:1080#edge")
+                .as_bytes(),
+        )
+        .unwrap();
+    writer.finish().unwrap().finish().unwrap();
+    let mut template = template();
+    Arc::make_mut(&mut template).proxies[0].1.age_identities =
+        super::super::age_provider::Identities::from_value(serde_yaml_ng::Value::String(
+            secret.into(),
+        ))
+        .unwrap();
+    let content = template
+        .parse_content(&template.proxies[0].1, &encrypted)
+        .unwrap();
+    assert!(
+        matches!(content,ProviderContent::Proxies(ref proxies) if proxies.len()==1 && proxies[0]["name"].as_str()==Some("edge"))
+    );
+    let mut contents = ProviderContents::new();
+    contents.insert(
+        ProviderTemplate::key(false, &template.proxies[0].0),
+        content,
+    );
+    assert_eq!(template.materialize(&contents).unwrap().proxies.len(), 1);
 }
 
 #[tokio::test]

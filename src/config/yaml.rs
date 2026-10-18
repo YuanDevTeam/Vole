@@ -9,7 +9,11 @@ use super::MAX_CONFIG_BYTES;
 
 /// Charge aliases while they are expanded, before allocating their values.
 /// An input-size limit alone does not bound the materialized YAML tree.
-pub(super) fn parse(input: &[u8]) -> Result<Value> {
+pub(crate) fn parse(input: &[u8]) -> Result<Value> {
+    parse_with_budget(input, &mut (MAX_CONFIG_BYTES * 4))
+}
+
+pub(crate) fn parse_with_budget(input: &[u8], budget: &mut usize) -> Result<Value> {
     if input.len() > MAX_CONFIG_BYTES {
         return Err(VoleError::InvalidConfig(format!(
             "configuration exceeds the {MAX_CONFIG_BYTES}-byte limit"
@@ -19,13 +23,9 @@ pub(super) fn parse(input: &[u8]) -> Result<Value> {
     let document = documents.next().ok_or_else(|| {
         VoleError::InvalidConfig("configuration must contain one YAML document".into())
     })?;
-    let mut budget = MAX_CONFIG_BYTES * 4;
-    let mut value = BoundedValue {
-        budget: &mut budget,
-        depth: 0,
-    }
-    .deserialize(document)
-    .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
+    let mut value = BoundedValue { budget, depth: 0 }
+        .deserialize(document)
+        .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
     if documents.next().is_some() {
         return Err(VoleError::InvalidConfig(
             "configuration must contain one YAML document".into(),

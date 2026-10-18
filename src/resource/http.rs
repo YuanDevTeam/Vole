@@ -7,11 +7,13 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::BytesMut;
+use flate2::write::MultiGzDecoder;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -50,13 +52,23 @@ pub(crate) struct DownloadRequest {
     pub options: HttpOptions,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct HttpOptions {
     pub user_agent: String,
     pub headers: Vec<(String, String)>,
     pub size_limit: Option<u64>,
     pub allow_http: bool,
     pub allow_ip: bool,
+}
+impl std::fmt::Debug for HttpOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpOptions")
+            .field("header_count", &self.headers.len())
+            .field("size_limit", &self.size_limit)
+            .field("allow_http", &self.allow_http)
+            .field("allow_ip", &self.allow_ip)
+            .finish_non_exhaustive()
+    }
 }
 impl Default for HttpOptions {
     fn default() -> Self {
@@ -70,7 +82,7 @@ impl Default for HttpOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum DownloadOutcome {
     NotModified {
         subscription_info: Option<SubscriptionInfo>,
@@ -83,6 +95,17 @@ pub(crate) enum DownloadOutcome {
         subscription_info: Option<SubscriptionInfo>,
     },
 }
+impl std::fmt::Debug for DownloadOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotModified { .. } => f.debug_struct("NotModified").finish_non_exhaustive(),
+            Self::Downloaded { size, .. } => f
+                .debug_struct("Downloaded")
+                .field("size", size)
+                .finish_non_exhaustive(),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum DownloadError {
@@ -92,8 +115,6 @@ pub(crate) enum DownloadError {
     HttpsRequired,
     #[error("resource download URL must contain a domain host")]
     DomainRequired,
-    #[error("resource download URL must not contain credentials")]
-    CredentialsNotAllowed,
     #[error("resource download ETag is not a bounded HTTP header value")]
     InvalidEtag,
     #[error("resource proxy dispatch failed: {0}")]
@@ -193,8 +214,11 @@ async fn download_with_connector(
     let mut cleanup = TemporaryDownload(Some(temporary_path.clone()));
     let cancellation = request.cancellation.clone();
     let timeout = request.timeout;
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        DownloadError::Protocol("resource deadline exceeds the clock range".into())
+    })?;
     let result = {
-        let operation = download_inner(request, connector, initial_url, file);
+        let operation = download_inner(request, connector, initial_url, file, deadline);
         tokio::pin!(operation);
         tokio::select! {
             biased;
@@ -219,9 +243,11 @@ async fn download_inner(
     connector: &dyn HttpsConnector,
     mut current_url: Url,
     file: File,
+    deadline: Instant,
 ) -> Result<DownloadOutcome, DownloadError> {
     let mut file = Some(file);
     let initial_origin = current_url.origin();
+    let initial_auth = url_authorization(&current_url)?;
 
     for redirects_followed in 0..=MAX_REDIRECTS {
         let endpoint = DownloadEndpoint::from_url(&current_url)?;
@@ -247,6 +273,11 @@ async fn download_inner(
             connector.connect(&endpoint.host, stream).await?
         };
         let mut response = HttpReader::new(stream);
+        let same_origin = current_url.origin() == initial_origin;
+        let url_auth = url_authorization(&current_url)?;
+        let authorization = url_auth
+            .as_deref()
+            .or_else(|| same_origin.then_some(initial_auth.as_deref()).flatten());
 
         response
             .stream
@@ -254,7 +285,8 @@ async fn download_inner(
                 &endpoint,
                 request.etag.as_deref(),
                 &request.options,
-                current_url.origin() == initial_origin,
+                same_origin,
+                authorization,
             ))
             .await
             .map_err(DownloadError::NetworkIo)?;
@@ -291,18 +323,27 @@ async fn download_inner(
             status => return Err(DownloadError::HttpStatus(status)),
         }
 
-        validate_content_encoding(head.content_encoding.as_deref())?;
+        let gzip = content_is_gzip(head.content_encoding.as_deref())?;
         let framing = body_framing(&head)?;
         let target = file
             .take()
             .expect("temporary file must be consumed by one final response");
-        let mut sink = BodySink::new(target, request.options.size_limit);
+        let mut sink = DecodedBody::new(
+            BodySink::new(
+                target,
+                request.options.size_limit,
+                request.cancellation.clone(),
+                deadline,
+            ),
+            gzip,
+        );
         match framing {
             BodyFraming::ContentLength(length) => {
-                if request
-                    .options
-                    .size_limit
-                    .is_some_and(|limit| length > limit)
+                if !gzip
+                    && request
+                        .options
+                        .size_limit
+                        .is_some_and(|limit| length > limit)
                 {
                     return Err(DownloadError::Protocol(
                         "resource exceeds size-limit".into(),
@@ -322,7 +363,7 @@ async fn download_inner(
             etag: head.etag,
             sha256,
             size,
-            final_url: current_url.to_string(),
+            final_url: without_credentials(&current_url),
             subscription_info: head.subscription_info,
         });
     }
@@ -330,7 +371,6 @@ async fn download_inner(
     Err(DownloadError::TooManyRedirects)
 }
 
-#[derive(Debug)]
 struct DownloadEndpoint {
     host: String,
     port: u16,
@@ -396,21 +436,11 @@ pub(crate) fn parse_url(raw: &str, options: &HttpOptions) -> Result<Url, Downloa
     if !allowed_scheme {
         return Err(DownloadError::HttpsRequired);
     }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(DownloadError::CredentialsNotAllowed);
-    }
+    url_authorization(&url)?;
     if url.host().is_none() || (!options.allow_ip && !matches!(url.host(), Some(Host::Domain(_)))) {
         return Err(DownloadError::DomainRequired);
     }
     if url.scheme() == "http" {
-        let authority = raw
-            .split_once("://")
-            .map(|(_, suffix)| suffix)
-            .and_then(|suffix| suffix.split(['/', '?', '#']).next())
-            .unwrap_or_default();
-        if authority.contains('@') {
-            return Err(DownloadError::CredentialsNotAllowed);
-        }
         if url.fragment().is_some() {
             return Err(DownloadError::InvalidUrl(
                 "URL must not contain a fragment".to_owned(),
@@ -419,6 +449,110 @@ pub(crate) fn parse_url(raw: &str, options: &HttpOptions) -> Result<Url, Downloa
     }
     url.set_fragment(None);
     Ok(url)
+}
+
+/// Exact private cache identity, including credentials/query without retaining either.
+pub(crate) fn source_identity(raw: &str) -> String {
+    format!(
+        "sha256:{}",
+        Sha256::digest(raw.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+pub(crate) fn without_credentials(url: &Url) -> String {
+    let mut safe = url.clone();
+    let _ = safe.set_username("");
+    let _ = safe.set_password(None);
+    safe.to_string()
+}
+
+pub(crate) fn source_origin(raw: &str) -> Option<String> {
+    Url::parse(raw)
+        .ok()
+        .map(|url| url.origin().ascii_serialization())
+}
+
+/// Bind a provider validator to the effective request, never its cleartext secrets.
+pub(crate) fn request_identity(raw: &str, options: &HttpOptions) -> Result<String, DownloadError> {
+    let url = parse_url(raw, options)?;
+    validate_options(options)?;
+    let mut canonical = options.clone();
+    for (name, _) in &mut canonical.headers {
+        name.make_ascii_lowercase();
+    }
+    canonical
+        .headers
+        .sort_by(|left, right| left.0.cmp(&right.0));
+    let authorization = url_authorization(&url)?;
+    let request = build_request(
+        &DownloadEndpoint::from_url(&url)?,
+        None,
+        &canonical,
+        true,
+        authorization.as_deref(),
+    );
+    let mut hash = Sha256::new();
+    hash.update(b"Vole resource request identity v1\0");
+    for value in [raw.as_bytes(), request.as_slice()] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+    Ok(format!(
+        "request-sha256:{}",
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+fn unescape_userinfo(value: &str) -> Result<Vec<u8>, DownloadError> {
+    let mut result = Vec::with_capacity(value.len());
+    let mut input = value.bytes();
+    while let Some(byte) = input.next() {
+        if byte == b'%' {
+            let high = input.next().and_then(|byte| (byte as char).to_digit(16));
+            let low = input.next().and_then(|byte| (byte as char).to_digit(16));
+            match (high, low) {
+                (Some(high), Some(low)) => result.push((high * 16 + low) as u8),
+                _ => {
+                    return Err(DownloadError::InvalidUrl(
+                        "invalid HTTP authentication encoding".into(),
+                    ));
+                }
+            }
+        } else {
+            result.push(byte);
+        }
+    }
+    Ok(result)
+}
+
+fn url_authorization(url: &Url) -> Result<Option<String>, DownloadError> {
+    let authority = url
+        .as_str()
+        .split_once("://")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| suffix.split(['/', '?', '#']).next())
+        .unwrap_or_default();
+    if !authority.contains('@') {
+        return Ok(None);
+    }
+    let mut credentials = unescape_userinfo(url.username())?;
+    if credentials.contains(&b':') {
+        return Err(DownloadError::InvalidUrl(
+            "invalid HTTP authentication username".into(),
+        ));
+    }
+    credentials.push(b':');
+    credentials.extend_from_slice(&unescape_userinfo(url.password().unwrap_or_default())?);
+    Ok(Some(format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(credentials)
+    )))
 }
 
 fn redirect(base: &Url, location: &str, options: &HttpOptions) -> Result<Url, DownloadError> {
@@ -482,10 +616,14 @@ fn build_request(
     etag: Option<&str>,
     options: &HttpOptions,
     same_origin: bool,
+    authorization: Option<&str>,
 ) -> Vec<u8> {
     let conditional = etag.map_or_else(String::new, |etag| format!("If-None-Match: {etag}\r\n"));
     let mut headers = String::new();
     for (name, value) in &options.headers {
+        if authorization.is_some() && name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
         if !same_origin
             && ["authorization", "cookie", "proxy-authorization"]
                 .iter()
@@ -494,6 +632,9 @@ fn build_request(
             continue;
         }
         headers.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if let Some(authorization) = authorization {
+        headers.push_str(&format!("Authorization: {authorization}\r\n"));
     }
     let user_agent = if options
         .headers
@@ -505,7 +646,7 @@ fn build_request(
         format!("User-Agent: {}\r\n", options.user_agent)
     };
     format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: application/octet-stream\r\nAccept-Encoding: identity\r\n{}Connection: close\r\n{}{}\r\n",
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: application/octet-stream\r\nAccept-Encoding: gzip\r\n{}Connection: close\r\n{}{}\r\n",
         endpoint.origin_form, endpoint.authority, user_agent, conditional, headers
     ).into_bytes()
 }
@@ -523,7 +664,6 @@ fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-#[derive(Debug)]
 struct ResponseHead {
     status: u16,
     content_length: Option<u64>,
@@ -549,9 +689,9 @@ fn body_framing(head: &ResponseHead) -> Result<BodyFraming, DownloadError> {
     }
     if let Some(encoding) = &head.transfer_encoding {
         if !encoding.eq_ignore_ascii_case("chunked") {
-            return Err(DownloadError::Protocol(format!(
-                "unsupported Transfer-Encoding `{encoding}`"
-            )));
+            return Err(DownloadError::Protocol(
+                "unsupported resource Transfer-Encoding".into(),
+            ));
         }
         return Ok(BodyFraming::Chunked);
     }
@@ -561,17 +701,20 @@ fn body_framing(head: &ResponseHead) -> Result<BodyFraming, DownloadError> {
     Ok(BodyFraming::UntilEof)
 }
 
-fn validate_content_encoding(encoding: Option<&str>) -> Result<(), DownloadError> {
-    if let Some(encoding) = encoding
-        && !encoding
-            .split(',')
-            .all(|value| value.trim().eq_ignore_ascii_case("identity"))
-    {
-        return Err(DownloadError::Protocol(format!(
-            "unsupported Content-Encoding `{encoding}`"
-        )));
+fn content_is_gzip(encoding: Option<&str>) -> Result<bool, DownloadError> {
+    if encoding.is_some_and(|value| value.eq_ignore_ascii_case("gzip")) {
+        return Ok(true);
     }
-    Ok(())
+    if encoding.is_some_and(|value| {
+        !value
+            .split(',')
+            .all(|item| item.trim().eq_ignore_ascii_case("identity"))
+    }) {
+        return Err(DownloadError::Protocol(
+            "unsupported resource Content-Encoding".into(),
+        ));
+    }
+    Ok(false)
 }
 
 struct HttpReader {
@@ -643,7 +786,7 @@ impl HttpReader {
     async fn copy_exact_body(
         &mut self,
         mut remaining: u64,
-        sink: &mut BodySink,
+        sink: &mut DecodedBody,
     ) -> Result<(), DownloadError> {
         let mut scratch = [0_u8; IO_BUFFER_BYTES];
         while remaining > 0 {
@@ -661,7 +804,7 @@ impl HttpReader {
         Ok(())
     }
 
-    async fn copy_body_until_eof(&mut self, sink: &mut BodySink) -> Result<(), DownloadError> {
+    async fn copy_body_until_eof(&mut self, sink: &mut DecodedBody) -> Result<(), DownloadError> {
         let mut scratch = [0_u8; IO_BUFFER_BYTES];
         loop {
             let read = self.read_some(&mut scratch).await?;
@@ -672,7 +815,7 @@ impl HttpReader {
         }
     }
 
-    async fn copy_chunked_body(&mut self, sink: &mut BodySink) -> Result<(), DownloadError> {
+    async fn copy_chunked_body(&mut self, sink: &mut DecodedBody) -> Result<(), DownloadError> {
         loop {
             let line = self.read_line(MAX_CHUNK_LINE_BYTES).await?;
             if !is_header_value(&line) {
@@ -997,19 +1140,36 @@ struct BodySink {
     hasher: Sha256,
     size: u64,
     limit: Option<u64>,
+    cancellation: CancellationToken,
+    deadline: Instant,
 }
 
 impl BodySink {
-    fn new(file: File, limit: Option<u64>) -> Self {
+    fn new(
+        file: File,
+        limit: Option<u64>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Self {
         Self {
             file,
             hasher: Sha256::new(),
             limit,
             size: 0,
+            cancellation,
+            deadline,
         }
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<(), DownloadError> {
+        if self.cancellation.is_cancelled() {
+            return Err(DownloadError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(DownloadError::Protocol(
+                "resource decoding deadline exceeded".into(),
+            ));
+        }
         let added = u64::try_from(bytes.len()).expect("buffer length fits u64");
         let next = self
             .size
@@ -1039,6 +1199,47 @@ impl BodySink {
             })?;
         let sha256 = self.hasher.finalize().into();
         Ok((sha256, self.size))
+    }
+}
+
+impl Write for BodySink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        BodySink::write(self, bytes).map_err(io::Error::other)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+enum DecodedBody {
+    Identity(BodySink),
+    Gzip(Box<MultiGzDecoder<BodySink>>),
+}
+impl DecodedBody {
+    fn new(sink: BodySink, gzip: bool) -> Self {
+        if gzip {
+            Self::Gzip(Box::new(MultiGzDecoder::new(sink)))
+        } else {
+            Self::Identity(sink)
+        }
+    }
+    fn write(&mut self, bytes: &[u8]) -> Result<(), DownloadError> {
+        match self {
+            Self::Identity(sink) => sink.write(bytes),
+            Self::Gzip(decoder) => decoder.write_all(bytes).map_err(|_| {
+                DownloadError::Protocol("invalid or over-budget gzip resource body".into())
+            }),
+        }
+    }
+    fn finish(self, path: &std::path::Path) -> Result<([u8; 32], u64), DownloadError> {
+        let sink = match self {
+            Self::Identity(sink) => sink,
+            Self::Gzip(decoder) => decoder.finish().map_err(|_| {
+                DownloadError::Protocol("invalid or truncated gzip resource body".into())
+            })?,
+        };
+        sink.finish(path)
     }
 }
 
@@ -1262,7 +1463,7 @@ mod tests {
         let first = std::str::from_utf8(&requests[0]).expect("request is ASCII");
         assert!(first.starts_with("GET /geosite.dat HTTP/1.1\r\n"));
         assert!(first.contains("\r\nHost: rules.example.test\r\n"));
-        assert!(first.contains("\r\nAccept-Encoding: identity\r\n"));
+        assert!(first.contains("\r\nAccept-Encoding: gzip\r\n"));
         assert!(first.contains("\r\nIf-None-Match: \"old\"\r\n"));
     }
 
@@ -1535,10 +1736,7 @@ mod tests {
             parse_resource_url("https://127.0.0.1/file"),
             Err(DownloadError::DomainRequired)
         ));
-        assert!(matches!(
-            parse_resource_url("https://user@example.test/file"),
-            Err(DownloadError::CredentialsNotAllowed)
-        ));
+        assert!(parse_resource_url("https://user@example.test/file").is_ok());
         assert_eq!(
             parse_resource_url("https://example.test/file#fragment")
                 .unwrap()
@@ -1563,5 +1761,233 @@ mod tests {
             assert_eq!(endpoint.port, port);
             assert_eq!(endpoint.authority, authority);
         }
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        writer.write_all(bytes).unwrap();
+        writer.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn gzip_streams_all_framing_modes_and_limits_the_decoded_content() {
+        let directory = tempdir().unwrap();
+        let mut compressed = gzip(b"one");
+        compressed.extend_from_slice(&gzip(b"two"));
+        for framing in ["length", "chunked", "eof"] {
+            let body = if framing == "chunked" {
+                let mut body = Vec::new();
+                for part in compressed.chunks(3) {
+                    body.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+                    body.extend_from_slice(part);
+                    body.extend_from_slice(b"\r\n");
+                }
+                body.extend_from_slice(b"0\r\n\r\n");
+                body
+            } else {
+                compressed.clone()
+            };
+            let head = match framing {
+                "length" => format!("Content-Length: {}\r\n", body.len()),
+                "chunked" => "Transfer-Encoding: chunked\r\n".into(),
+                _ => String::new(),
+            };
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\n{head}Content-Encoding: gzip\r\nETag: \"gzip\"\r\n\r\n"
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            let path = directory.path().join(framing);
+            let mut input = request(
+                Arc::new(ScriptedDispatcher::new([response])),
+                "https://subscription.example/file",
+                path.clone(),
+            );
+            input.options.size_limit = Some(6);
+            let outcome = download_with_connector(input, &PlainHttpsConnector)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome,DownloadOutcome::Downloaded{size:6,sha256,..} if sha256.as_slice()==Sha256::digest(b"onetwo").as_slice())
+            );
+            assert_eq!(fs::read(path).unwrap(), b"onetwo");
+        }
+    }
+
+    #[tokio::test]
+    async fn gzip_corruption_truncation_expansion_and_cancelled_writes_discard_candidates() {
+        let directory = tempdir().unwrap();
+        let encoded = gzip(&vec![b'x'; 64 * 1024]);
+        let mut corrupted = encoded.clone();
+        let end = corrupted.len();
+        corrupted[end - 8] ^= 1;
+        for (index, body, limit) in [
+            (0, encoded.clone(), Some(16)),
+            (1, corrupted, None),
+            (2, encoded[..encoded.len() - 1].to_vec(), None),
+            (3, [encoded.as_slice(), b"junk"].concat(), None),
+        ] {
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            let path = directory.path().join(index.to_string());
+            let mut input = request(
+                Arc::new(ScriptedDispatcher::new([response])),
+                "https://subscription.example/file",
+                path.clone(),
+            );
+            input.options.size_limit = limit;
+            assert!(
+                download_with_connector(input, &PlainHttpsConnector)
+                    .await
+                    .is_err()
+            );
+            assert!(!path.exists());
+        }
+        let path = directory.path().join("cancelled-decoder");
+        let cancellation = CancellationToken::new();
+        let sink = BodySink::new(
+            File::create(path).unwrap(),
+            None,
+            cancellation.clone(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        let mut decoder = DecodedBody::new(sink, true);
+        cancellation.cancel();
+        assert!(decoder.write(&encoded).is_err());
+    }
+
+    #[tokio::test]
+    async fn url_basic_auth_is_percent_decoded_overrides_headers_and_never_crosses_origins() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("basic");
+        let dispatcher=Arc::new(ScriptedDispatcher::new([
+            b"HTTP/1.1 302 Found\r\nLocation: /same\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 302 Found\r\nLocation: https://other.example/final\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ]));
+        let mut input = request(
+            dispatcher.clone(),
+            "https://us%40er:pa%3Ass@subscription.example/start",
+            path,
+        );
+        input.options.headers = vec![
+            ("Authorization".into(), "Bearer must-be-replaced".into()),
+            ("Cookie".into(), "private=fixture".into()),
+        ];
+        let result = download_with_connector(input, &PlainHttpsConnector)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result,DownloadOutcome::Downloaded{final_url,..} if final_url=="https://other.example/final")
+        );
+        let requests = dispatcher.requests();
+        for request in &requests[..2] {
+            let text = std::str::from_utf8(request).unwrap();
+            assert!(text.contains("Authorization: Basic dXNAZXI6cGE6c3M=\r\n"));
+            assert!(!text.contains("must-be-replaced"));
+            assert!(!text.contains("%40"));
+        }
+        let last = std::str::from_utf8(&requests[2]).unwrap();
+        assert!(!last.contains("Authorization:"));
+        assert!(!last.contains("Cookie:"));
+        assert!(parse_resource_url("https://user%GG:secret@subscription.example/file").is_err());
+    }
+
+    #[test]
+    fn exact_source_identity_preserves_credential_isolation_without_cleartext() {
+        let a = "https://user:one@subscription.example/file?token=private";
+        let b = "https://user:two@subscription.example/file?token=private";
+        let identity = source_identity(a);
+        assert_eq!(identity, source_identity(a));
+        assert_ne!(identity, source_identity(b));
+        assert_eq!(
+            source_origin(a).as_deref(),
+            Some("https://subscription.example")
+        );
+        assert_eq!(
+            without_credentials(&Url::parse(a).unwrap()),
+            "https://subscription.example/file?token=private"
+        );
+        assert!(!identity.contains("user"));
+        assert!(!identity.contains("private"));
+        let outcome = DownloadOutcome::Downloaded {
+            etag: Some("private-etag".into()),
+            sha256: [0; 32],
+            size: 1,
+            final_url: a.into(),
+            subscription_info: None,
+        };
+        let options = HttpOptions {
+            headers: vec![("Authorization".into(), "private-bearer".into())],
+            ..Default::default()
+        };
+        for debug in [format!("{outcome:?}"), format!("{options:?}")] {
+            assert!(!debug.contains("private"));
+            assert!(!debug.contains("user"));
+            assert!(!debug.contains("subscription.example"));
+        }
+    }
+
+    #[test]
+    fn request_identity_binds_effective_headers_and_ua_without_concat_ambiguity() {
+        let url = "https://subscription.example/file";
+        let options = HttpOptions {
+            headers: vec![
+                ("Cookie".into(), "a=1".into()),
+                ("Authorization".into(), "Bearer first".into()),
+            ],
+            user_agent: "fixture-first".into(),
+            ..Default::default()
+        };
+        let first = request_identity(url, &options).unwrap();
+        let mut reordered = options.clone();
+        reordered.headers.reverse();
+        reordered.headers[0].0.make_ascii_lowercase();
+        assert_eq!(first, request_identity(url, &reordered).unwrap());
+        for (headers, user_agent) in [
+            (
+                vec![
+                    ("Cookie".into(), "a=2".into()),
+                    ("Authorization".into(), "Bearer first".into()),
+                ],
+                options.user_agent.clone(),
+            ),
+            (options.headers.clone(), "fixture-second".into()),
+            (
+                vec![
+                    ("Cookie".into(), "a=1".into()),
+                    ("Authorization".into(), "Bearer second".into()),
+                ],
+                options.user_agent.clone(),
+            ),
+        ] {
+            let changed = HttpOptions {
+                headers,
+                user_agent,
+                ..Default::default()
+            };
+            assert_ne!(first, request_identity(url, &changed).unwrap());
+        }
+        let explicit = HttpOptions {
+            headers: vec![
+                ("User-Agent".into(), "explicit".into()),
+                ("Authorization".into(), "unused".into()),
+            ],
+            ..Default::default()
+        };
+        let mut changed = explicit.clone();
+        changed.user_agent = "unused-global-ua".into();
+        changed.headers[1].1 = "also-unused".into();
+        assert_eq!(
+            request_identity("https://user:pass@subscription.example/file", &explicit).unwrap(),
+            request_identity("https://user:pass@subscription.example/file", &changed).unwrap()
+        );
+        assert_ne!(first, source_identity(url));
+        assert!(!first.contains("Bearer"));
+        assert!(!first.contains("first"));
     }
 }

@@ -124,7 +124,7 @@ impl ProviderSpec {
                 };
                 crate::resource::http::parse_url(&self.url, &options).map_err(|_| {
                     VoleError::InvalidConfig(
-                        "provider requires an absolute HTTP(S) URL without credentials".into(),
+                        "provider requires a valid absolute HTTP(S) URL".into(),
                     )
                 })?;
             }
@@ -196,14 +196,34 @@ impl std::fmt::Debug for ProviderTemplate {
             .finish_non_exhaustive()
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ProviderContent {
     Proxies(Vec<Value>),
     Rules(Arc<RuleCollection>),
 }
+impl std::fmt::Debug for ProviderContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proxies(nodes) => f
+                .debug_struct("Proxies")
+                .field("count", &nodes.len())
+                .finish(),
+            Self::Rules(rules) => f
+                .debug_struct("Rules")
+                .field("count", &rules.len())
+                .finish(),
+        }
+    }
+}
 pub type ProviderContents = BTreeMap<String, ProviderContent>;
 
 impl ProviderTemplate {
+    pub(crate) fn request_user_agent(&self) -> String {
+        self.base
+            .get("global-ua")
+            .and_then(Value::as_str)
+            .map_or_else(super::default_global_ua, str::to_owned)
+    }
     pub(super) fn extract(mut base: Value) -> Result<Self> {
         let map = base
             .as_mapping_mut()
@@ -313,12 +333,15 @@ impl ProviderTemplate {
             control,
             MAX_CONFIG_BYTES,
         )?;
-        let raw = yaml::parse(decoded.as_ref())
-            .map_err(|_| VoleError::InvalidConfig("invalid proxy provider YAML".into()))?;
-        let parsed: Payload = serde_yaml_ng::from_value(raw)
-            .map_err(|_| VoleError::InvalidConfig("invalid proxy provider YAML".into()))?;
+        let proxies = yaml::parse(decoded.as_ref())
+            .and_then(|raw| {
+                serde_yaml_ng::from_value::<Payload>(raw)
+                    .map(|payload| payload.proxies)
+                    .map_err(|_| VoleError::InvalidConfig("invalid proxy provider YAML".into()))
+            })
+            .or_else(|_| crate::resource::provider_input::parse(decoded.as_ref(), control))?;
         control.check()?;
-        Ok(ProviderContent::Proxies(parsed.proxies))
+        Ok(ProviderContent::Proxies(proxies))
     }
     fn bundled(&self, spec: &ProviderSpec) -> Result<ProviderContent> {
         if let Some(behavior) = spec.behavior {

@@ -119,6 +119,7 @@ chacha20poly1305 = { version = "=0.11.0", default-features = false, features = [
 crc32fast = "=1.5.2"
 domain = { version = "=0.12.3", default-features = false, features = ["std"] }
 fancy-regex = { version = "=0.19.2", default-features = false, features = ["std", "unicode"] }
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
 futures-util = { version = "0.3", features = ["sink"] }
 getifaddrs = "=0.6.2"
 h2 = "0.4.19"

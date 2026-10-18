@@ -23,6 +23,24 @@ use tokio_util::sync::CancellationToken;
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 const MAX_PARSE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn request_options(spec: &ProviderSpec, user_agent: String) -> HttpOptions {
+    HttpOptions {
+        user_agent,
+        headers: spec.headers(),
+        size_limit: (spec.size_limit > 0).then_some(spec.size_limit),
+        allow_http: true,
+        allow_ip: true,
+    }
+}
+fn source_key(spec: &ProviderSpec, user_agent: &str) -> io::Result<String> {
+    if spec.kind == ProviderType::Http {
+        http::request_identity(&spec.url, &request_options(spec, user_agent.into()))
+            .map_err(|_| io::Error::other("invalid provider request identity"))
+    } else {
+        Ok(http::source_identity(&spec.url))
+    }
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Metadata {
     url: String,
@@ -87,6 +105,7 @@ impl ProviderCache {
     ) -> io::Result<Self> {
         let mut entries = Vec::new();
         let mut contents = ProviderContents::new();
+        let user_agent = template.request_user_agent();
         for (rule, (name, spec)) in template
             .proxies
             .iter()
@@ -157,7 +176,8 @@ impl ProviderCache {
                                 .map(unix_time);
                             entry.modified =
                                 fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-                            if metadata.url == spec.url
+                            let source_identity = source_key(spec, &user_agent)?;
+                            if metadata.url == source_identity
                                 && metadata.hash == hex(&Sha256::digest(&bytes))
                             {
                                 entry.state.downloaded &= !metadata.bundled;
@@ -168,6 +188,10 @@ impl ProviderCache {
                                 } else {
                                     entry.metadata.subscription_info = None;
                                 }
+                            } else if spec.kind == ProviderType::Http {
+                                // Old content can keep the session usable, but a new
+                                // source/auth identity owes an unconditional refresh.
+                                entry.state.downloaded = false;
                             }
                             contents.insert(key.clone(), content);
                             if spec.kind == ProviderType::Http && entry.state.downloaded {
@@ -211,7 +235,7 @@ impl ProviderCache {
                             true,
                         )?;
                         let metadata = Metadata {
-                            url: spec.url.clone(),
+                            url: source_key(spec, &user_agent)?,
                             etag: None,
                             hash: hex(&Sha256::digest(&bytes)),
                             checked: 0,
@@ -326,21 +350,26 @@ impl ProviderCache {
                 }));
             }
             let temporary = temporary_path(&path);
+            let options = request_options(&entry.spec, user_agent);
+            let source_identity = http::request_identity(&entry.spec.url, &options)
+                .map_err(|_| io::Error::other("invalid provider request identity"))?;
+            let same_source = entry.metadata.url == source_identity;
+            let previous_subscription = if same_source {
+                entry.metadata.subscription_info
+            } else {
+                None
+            };
             let outcome = http::download(DownloadRequest {
                 security,
                 dispatcher,
                 url: entry.spec.url.clone(),
-                etag: etag_support.then(|| entry.metadata.etag.clone()).flatten(),
+                etag: (etag_support && same_source)
+                    .then(|| entry.metadata.etag.clone())
+                    .flatten(),
                 temporary_path: temporary.clone(),
                 timeout: deadline.saturating_duration_since(std::time::Instant::now()),
                 cancellation: cancellation.clone(),
-                options: HttpOptions {
-                    user_agent,
-                    headers: entry.spec.headers(),
-                    size_limit: (entry.spec.size_limit > 0).then_some(entry.spec.size_limit),
-                    allow_http: true,
-                    allow_ip: true,
-                },
+                options,
             })
             .await
             .map_err(|_| io::Error::other("provider download failed"))?;
@@ -350,6 +379,7 @@ impl ProviderCache {
                         return Err(io::ErrorKind::Interrupted.into());
                     }
                     let mut metadata = entry.metadata.clone();
+                    metadata.url = source_identity;
                     metadata.checked = unix_time(SystemTime::now());
                     if !entry.state.rule {
                         metadata.subscription_info =
@@ -397,7 +427,7 @@ impl ProviderCache {
                                 content,
                                 temporary: Some(temporary),
                                 metadata: Metadata {
-                                    url: entry.spec.url.clone(),
+                                    url: source_identity,
                                     etag,
                                     hash: sha256.iter().map(|byte| format!("{byte:02x}")).collect(),
                                     checked: unix_time(SystemTime::now()),
@@ -405,7 +435,7 @@ impl ProviderCache {
                                     subscription_info: if entry.state.rule {
                                         None
                                     } else {
-                                        subscription_info.or(entry.metadata.subscription_info)
+                                        subscription_info.or(previous_subscription)
                                     },
                                 },
                             }))

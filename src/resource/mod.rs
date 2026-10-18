@@ -7,4 +7,5 @@ pub(crate) mod control;
 pub(crate) mod http;
 pub(crate) mod probe;
 pub(crate) mod profile;
+pub(crate) mod provider_input;
 pub(crate) mod subscription;
