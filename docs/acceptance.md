@@ -59,6 +59,6 @@ Stop 都应覆盖；未执行的生命周期场景单独标明，不从一次压
 过载保护应遵循[运行时资源策略](runtime-resource-policy.md)的资源所有权、局部容量、取消和同步 Stop 边界。
 
 核心测试入口见 [tests](../tests/README.md)，平台与发布入口见 [scripts](../scripts/README.md)。
-网络互通和压力由独立容器测试工具执行，公开结果见 [benchmark](benchmark.md)，
+网络互通和压力由独立容器测试工具执行，结果与结论统一保存在 benchmark 工程，
 遵守 [测试隔离](testing-isolation.md)。设备要求见 [TUN 平台层](tun-platform.md)
 与 [Windows VPN](windows-vpn.md)。

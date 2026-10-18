@@ -118,10 +118,6 @@ void VoleFree(char *response);
 
 单个公共实例遵循 `initialize → createInstance → start(configYaml) → stop → destroyInstance` 生命周期，准备过程由 `start` 内部完成；`validateConfig` 不要求初始化。CLI 通过显式的前台 Invoke 操作处理文件、环境默认值、信号与清理。API 还提供状态查询、GeoData 状态与延迟测量。详见 [Invoke API](../docs/invoke-api.md)、[Controller API](../docs/controller-api.md)与 [Windows 集成示例](../example/windows-uwp/README.md)。
 
-## Benchmark
-
-[Vole / Mihomo TUN benchmark](../docs/benchmark.md)
-
 ## 文档
 
 - [文档索引](../docs/README.md)

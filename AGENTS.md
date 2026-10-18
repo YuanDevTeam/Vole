@@ -27,7 +27,7 @@ Read the relevant document completely before changing that area:
 - CLI, foreground file/environment/path/signal behavior, or tag releases: `docs/cli.md`, `docs/invoke-api.md`, `scripts/README.md`, `src/cli.rs`, `src/invoke/foreground.rs`, and `.github/workflows/release.yml`; distinguish configured workflows from executed release validation.
 - Builds: `scripts/README.md`; `vole-scripts build` compiles platform outputs, and `vole_scripts.release` packages them for CI.
 - Offline regressions: `tests/README.md`. Rust memory/configuration tests remain in Vole; run explicit pure-memory filters, with all-target coverage limited to `--no-run`.
-- Protocol interoperability or pressure: isolated benchmark tooling owns container orchestration and fixtures. Supply the checkout explicitly with `--source vole=PATH`; Vole builds do not import it or infer workspace paths. Publish reviewed results in `docs/benchmark.md`; keep tooling repository addresses and raw runs outside Vole.
+- Protocol interoperability or pressure: isolated benchmark tooling owns container orchestration and fixtures. Supply the checkout explicitly with `--source vole=PATH`; Vole builds do not import it or infer workspace paths. Keep benchmark results, comparisons and conclusions in the benchmark project; Vole documents implementation contracts and acceptance criteria. Keep tooling repository addresses and raw runs outside Vole.
 - Server-side tests: `docs/testing-isolation.md`. Use isolated benchmark containers for every server peer and network origin; container failure is not permission for a host fallback.
 - Claims that something passed: `docs/acceptance.md`. Record only commands and environments actually executed; host tests and cross-builds do not prove physical-device data paths.
 

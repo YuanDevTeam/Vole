@@ -118,10 +118,6 @@ void VoleFree(char *response);
 
 Один публичный экземпляр проходит жизненный цикл `initialize → createInstance → start(configYaml) → stop → destroyInstance`; подготовка выполняется внутри `start`. `validateConfig` не требует инициализации. CLI использует явную операцию foreground Invoke для файлов, окружения, сигналов и очистки. API также предоставляет запросы состояния, статус GeoData и измерение задержки. См. [Invoke API](../docs/invoke-api.md), [Controller API](../docs/controller-api.md) и [пример интеграции Windows](../example/windows-uwp/README.md).
 
-## Benchmark
-
-[TUN-бенчмарк Vole / Mihomo](../docs/benchmark.md)
-
 ## Документация
 
 - [Указатель документации](../docs/README.md)

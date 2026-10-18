@@ -308,11 +308,11 @@ MMDB metadata/图校验状态未计入。因此账本**不包含正则内部编�
 进程 RSS 的硬上限与 1/2/3Gbps 分档压力标准统一见[验收边界](acceptance.md#性能采纳标准)，
 它们是压力测试标准，不是加载器保证。
 
-互通和内存/吞吐压力由独立容器测试工具维护，公开结果见 [benchmark](benchmark.md)；
+互通和内存/吞吐压力由独立容器测试工具维护，结果与结论统一保存在 benchmark 工程；
 `interop`、`stress` 和 `compare` 以 `--source vole=PATH` 显式指定被测 checkout。
 Vole 自有脚本仅负责编译。压力与横向比较固定只引用完整 `geosite:cn` / `geoip:cn`，
-更新下载保留原始增强 DAT，但不因此加载其他分类。当前 CLI 压力覆盖启动时加载，
-不包含负载期间的 GeoData 热更新；加载峰值与联合吞吐/DNS/RSS 以实际记录为准。
+更新下载保留原始增强 DAT，但不因此加载其他分类。加载峰值、热更新覆盖范围与
+联合吞吐/DNS/RSS 以 benchmark 工程的实际记录为准。
 合成回归和离线加载不替代完整真实资产的 TUN 压力，少量转发不等同逐条规则穷举。
 Linux RSS 不替代 Apple Network Extension physical footprint。
 

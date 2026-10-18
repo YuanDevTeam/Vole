@@ -24,4 +24,4 @@
    Controller 仅作管理入口。纯内存、离线和编译检查不要求 TUN。
 
 互通、压力和设备验收分别执行，范围见 [验收边界](acceptance.md)。具体对端与用例参数
-由测试工具维护。公开实测结论见 [benchmark](benchmark.md)，详细文字结论保留在仓库外。
+与实测结论统一由 benchmark 工程维护。

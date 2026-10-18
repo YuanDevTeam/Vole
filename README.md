@@ -120,10 +120,6 @@ void VoleFree(char *response);
 
 One public instance follows `initialize → createInstance → start(configYaml) → stop → destroyInstance`; preparation is internal to `start`. `validateConfig` requires no initialization. The CLI uses the explicit foreground Invoke operation for files, environment defaults, signals and cleanup. The API also provides state queries, GeoData status and delay measurement. See [Invoke API](docs/invoke-api.md), [Controller API](docs/controller-api.md) and the [Windows integration example](example/windows-uwp/README.md).
 
-## Benchmark
-
-[Vole TUN benchmark](docs/benchmark.md)
-
 ## Documentation
 
 - [Documentation index](docs/README.md)

@@ -198,4 +198,4 @@ Mihomo 解码。网关使用官方 XRAY_BUF_SPLICE=disable，避免下行 raw sp
 明确标注的 Chrome 关闭参照；Vole 原配置的数据面单独验证，不声称同配置差分。
 VLESS 不接受 ShadowTLS 或 Restls 配置；ShadowTLS v3 仅用于 SS2022 插件。
 
-WS + REALITY（普通 WS、HTTPUpgrade、fast-open）的数据及认证使用真实 Mihomo listener；关闭验证采用明确标注的分层参照。当前 Mihomo WS 客户端分支未接入 REALITY，不能作为同组合对照，因此使用标准 TLS 的同种传输客户端关闭基线，并独立验证 REALITY。不得将该结果写成 Mihomo WS + REALITY 客户端互通或同组合差分通过。
+分层关闭参照与独立 REALITY 验证不能代替 WS + REALITY（普通 WS、HTTPUpgrade、fast-open）的同组合客户端互通或差分验证；具体对端、覆盖范围与结论由 benchmark 工程记录。

@@ -283,7 +283,7 @@ DFA 缓存各 512 KiB；不接受递归、条件式和控制动词。每次复�
   固定 action 不回溯；没有新增公开 API、业务数量配额或 GeoData 内存预算。
 
 GeoData 行为见 [规则与资产](geodata.md)。性能与压力测试由独立容器测试工具执行，
-公开结果见 [benchmark](benchmark.md)，原始记录保留在对应运行中。
+结果与结论统一保存在 benchmark 工程。
 
 ## 统一内存策略
 
