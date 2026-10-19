@@ -7,6 +7,7 @@ use rustls::{
     ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject},
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     fmt, io,
@@ -100,6 +101,10 @@ impl Authority {
                 bytes: 0,
             }),
         }))
+    }
+    /// Public certificate identity; private-key spelling never affects a token.
+    pub(super) fn identity(&self) -> [u8; 32] {
+        Sha256::digest(self.certificate.as_ref()).into()
     }
     pub(super) fn server_config(&self, name: &str) -> io::Result<Arc<ServerConfig>> {
         // Validate before a key is generated and never put IP literals or an

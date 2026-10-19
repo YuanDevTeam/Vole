@@ -5,6 +5,7 @@ mod config;
 #[cfg(test)]
 mod rules;
 mod mitm;
+pub(crate) mod private_context;
 pub(crate) use config::{MAX_ADDENDUM, Policy};
 #[cfg(feature = "inbound-http")]
 mod h1;
