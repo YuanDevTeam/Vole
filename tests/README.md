@@ -68,6 +68,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | 有界队列与内存策略 | `routing::datagram_ready::tests::`、`managed_udp_connections_`、`allocator_relief`、`platform::process_memory::tests::` | 就绪轮询、排空、取消和单次回收 |
 | TUN 响应背压 | `tun_runtime::tests::backpressured_udp_response_handoff` | 满队列下每源至多暂持一包、双向推进及取消 |
 | UoT | `outbound::uot::tests::` | 半帧取消后继续、v2首部、原期限、单槽响应与Stop |
+| VMess 响应边界 | `outbound::vmess::header::delayed_response_memory_tests::`、`outbound::vmess::stream::tests::`、`--test vmess_lifecycle` | 官方延迟响应向量、提交前期限、响应认证、nonce 耗尽与关闭 |
 | SS2022 | `outbound::shadowsocks::datagram::tests::` | 三种 cipher、空 UDP、EIH、取消后的 packet ID 与重放边界 |
 | CLI前台 | `invoke::foreground::tests::` | 文件/stdin、路径、信号及清理 |
 

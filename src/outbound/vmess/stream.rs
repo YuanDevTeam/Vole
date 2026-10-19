@@ -7,15 +7,11 @@ use bytes::{Buf, Bytes, BytesMut};
 use ring::aead;
 use shake::{ExtendableOutput, Shake128, Update, XofReader};
 use std::{
-    future::Future,
     io,
     pin::Pin,
     task::{Context, Poll, ready},
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    time::{Instant, Sleep},
-};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub const MAX_BODY_WIRE: usize = 16 * 1024;
 // Keep TCP chunks within the native Mihomo listener's initial copy buffer.
@@ -175,13 +171,13 @@ enum ReadStage {
     Eof,
 }
 
-/// Bounded, cancellation-safe framed IO. The caller writes `handshake.request()`
-/// before wrapping (including WS early data). Response authentication is lazy so
-/// both server-first and client-first protocols work; it shares setup's deadline.
+/// Bounded, cancellation-safe framed IO after the caller has written and
+/// flushed `handshake.request()` (including WS early data) within setup's
+/// deadline. Response authentication is lazy and does not expire active business
+/// IO while a peer legitimately waits for upload before its first response.
 pub struct VmessStream {
     io: Option<BoxStream>,
     handshake: Option<ClientHandshake>,
-    deadline: Pin<Box<Sleep>>,
     read: BodyCodec,
     write: BodyCodec,
     stage: ReadStage,
@@ -195,7 +191,7 @@ pub struct VmessStream {
 }
 
 impl VmessStream {
-    pub fn new(io: BoxStream, handshake: ClientHandshake, deadline: Instant) -> Self {
+    pub fn new(io: BoxStream, handshake: ClientHandshake) -> Self {
         Self {
             io: Some(io),
             read: BodyCodec::new(
@@ -215,7 +211,6 @@ impl VmessStream {
                 handshake.iv,
             ),
             handshake: Some(handshake),
-            deadline: Box::pin(tokio::time::sleep_until(deadline)),
             stage: ReadStage::ResponseLength,
             input: BytesMut::new(),
             plain: Bytes::new(),
@@ -232,16 +227,9 @@ impl VmessStream {
         self.whole_close = true;
         self
     }
-    fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+    fn check(&self) -> io::Result<()> {
         if self.io.is_none() {
             return Err(io::ErrorKind::BrokenPipe.into());
-        }
-        if self.handshake.is_some() && self.deadline.as_mut().poll(cx).is_ready() {
-            self.io.take();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "VMess response deadline",
-            ));
         }
         Ok(())
     }
@@ -281,7 +269,7 @@ impl VmessStream {
         if self.closed {
             return Poll::Ready(Ok(None));
         }
-        self.check(cx)?;
+        self.check()?;
         loop {
             match self.stage {
                 ReadStage::ResponseLength => {
@@ -350,7 +338,7 @@ impl VmessStream {
         Poll::Ready(self.fail(result))
     }
     fn drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.check(cx)?;
+        self.check()?;
         while !self.output.is_empty() {
             let n = ready!(Pin::new(self.io.as_mut().unwrap()).poll_write(cx, &self.output))?;
             if n == 0 {

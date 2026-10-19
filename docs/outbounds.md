@@ -314,6 +314,10 @@ aes-128-gcm、chacha20-poly1305、none；zero 归一 none。auto 按实际 AES �
 none 只关闭 body 加密，仍验证响应身份；不能启用 global-padding/authenticated-length，
 两开关默认 false。
 
+物理出口、安全身份、传输握手及完整认证请求的写入和 flush 共用原建立绝对期限；
+请求提交后，服务端可等待业务上传再发送响应头，不继承旧建立期限。响应 AEAD、身份和长度仍须
+验证通过才交付下行数据；失败关闭、传输自身的握手期限、取消和 Stop 边界不变。
+
 network 省略/空串为 tcp，另支持 ws/grpc/http/h2/mkcp（kcp 为别名）；均可明文或 TLS，安全身份范围见上文。tls 默认 false，
 关闭时禁止 TLS 字段，即便空串、空列表或 false。认证名依次为 servername、WS Host
 去端口、server；HTTP 伪装 Host/H2 authority 不替代认证名。WS 需 http/1.1，gRPC/H2 需 h2。

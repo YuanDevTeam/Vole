@@ -74,11 +74,7 @@ async fn xudp_explicit_close_after_cancel_and_bad_frame_release_io() {
             BodyOptions::new(BodyCipher::None, false, false).unwrap(),
         )
         .unwrap();
-        let stream = VmessStream::new(
-            Box::new(io),
-            handshake,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-        );
+        let stream = VmessStream::new(Box::new(io), handshake);
         let budget = DatagramBudget::new(32, 32);
         let mut client = if packetaddr {
             VmessDatagram::packet_addr(stream, budget, ResolutionContext::default())
@@ -211,11 +207,7 @@ async fn vmess_response_authentication_cannot_be_skipped_by_none_cipher() {
     )
     .unwrap();
     let (client, mut peer) = tokio::io::duplex(1024);
-    let mut stream = VmessStream::new(
-        Box::new(client),
-        handshake,
-        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-    );
+    let mut stream = VmessStream::new(Box::new(client), handshake);
     peer.write_all(&[0; 18]).await.unwrap();
     let mut data = [0; 1];
     assert_eq!(
@@ -241,12 +233,7 @@ async fn vmess_whole_close_wakes_reader_and_releases_io_before_response() {
     )
     .unwrap();
     let (io, mut peer) = tokio::io::duplex(1024);
-    let stream = VmessStream::new(
-        Box::new(io),
-        handshake,
-        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-    )
-    .with_whole_close();
+    let stream = VmessStream::new(Box::new(io), handshake).with_whole_close();
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut byte = [0; 1];
     let read = reader.read(&mut byte);

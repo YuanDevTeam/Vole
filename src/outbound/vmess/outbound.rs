@@ -265,7 +265,9 @@ impl PreparedStream {
                 raw.write_all(handshake.request()).await?;
                 raw.flush().await?;
             }
-            let stream = VmessStream::new(raw, handshake, deadline);
+            // Complete request submission uses the setup deadline. A peer can
+            // send its response header with the first application reply.
+            let stream = VmessStream::new(raw, handshake);
             guard.disarm();
             Ok::<_, io::Error>(if whole_close {
                 stream.with_whole_close()

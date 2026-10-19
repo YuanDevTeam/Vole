@@ -215,3 +215,126 @@ impl ClientHandshake {
         )
     }
 }
+
+#[cfg(test)]
+mod delayed_response_memory_tests {
+    use super::*;
+    use crate::outbound::vmess::VmessStream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(serde::Deserialize)]
+    struct OfficialVector {
+        cipher: String,
+        alter_id: u32,
+        global_padding: bool,
+        authenticated_length: bool,
+        request: Vec<u8>,
+        request_key: [u8; 16],
+        request_iv: [u8; 16],
+        response_tag: u8,
+        response: Vec<u8>,
+        payload: Vec<u8>,
+        response_empty_before_first_server_write: bool,
+        official_client_response_roundtrip: bool,
+    }
+
+    fn fixture() -> (ClientHandshake, OfficialVector) {
+        let vector: OfficialVector = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/vmess-delayed-response.json"
+        ))
+        .unwrap();
+        assert_eq!(vector.cipher, "aes-128-gcm");
+        assert_eq!(vector.alter_id, 0);
+        assert!(!vector.global_padding && !vector.authenticated_length);
+        assert!(vector.response_empty_before_first_server_write);
+        assert!(vector.official_client_response_roundtrip);
+        assert!(vector.response.len() > 38 && !vector.payload.is_empty());
+        // The actual official client/Service produced and independently decoded
+        // these synthetic bytes. Core's normal response authenticator/body
+        // codec consumes them; no replacement AsyncRead parser is used.
+        let handshake = ClientHandshake {
+            request: vector.request.clone(),
+            key: vector.request_key,
+            iv: vector.request_iv,
+            response_key: Sha256::digest(vector.request_key)[..16].try_into().unwrap(),
+            response_iv: Sha256::digest(vector.request_iv)[..16].try_into().unwrap(),
+            response_tag: vector.response_tag,
+            options: BodyOptions::new(BodyCipher::Aes128Gcm, false, false).unwrap(),
+            command: Command::Tcp,
+        };
+        (handshake, vector)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn vmess_committed_request_accepts_official_response_after_setup_deadline() {
+        let (handshake, vector) = fixture();
+        let (mut raw, mut peer) = tokio::io::duplex(4096);
+        // This is the real call-site contract: the complete request prefix was
+        // successfully written and flushed before business IO was returned.
+        raw.write_all(handshake.request()).await.unwrap();
+        raw.flush().await.unwrap();
+        let mut request = vec![0; handshake.request().len()];
+        peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, vector.request);
+        let stream = VmessStream::new(Box::new(raw), handshake);
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        writer
+            .write_all(b"upload before delayed response")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let mut reply = vec![0; vector.payload.len()];
+        {
+            let pending = reader.read_exact(&mut reply);
+            tokio::pin!(pending);
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+            tokio::time::advance(std::time::Duration::from_secs(11)).await;
+            assert!(
+                futures_util::poll!(pending.as_mut()).is_pending(),
+                "submitted request cannot expire while a one-way upload legitimately has no response header"
+            );
+            writer
+                .write_all(b"upload continues after setup deadline")
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            peer.write_all(&vector.response).await.unwrap();
+            pending.await.unwrap();
+        }
+        assert_eq!(reply, vector.payload);
+        drop(reader);
+        drop(writer);
+        let mut remaining_upload = Vec::new();
+        peer.read_to_end(&mut remaining_upload).await.unwrap();
+        assert!(!remaining_upload.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn vmess_delayed_official_response_still_authenticates_before_delivery() {
+        let (handshake, mut vector) = fixture();
+        let (mut raw, mut peer) = tokio::io::duplex(4096);
+        raw.write_all(handshake.request()).await.unwrap();
+        raw.flush().await.unwrap();
+        let mut request = vec![0; handshake.request().len()];
+        peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, vector.request);
+        let mut stream = VmessStream::new(Box::new(raw), handshake);
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        // Alter the actual response header's AEAD tag, preserving all lengths.
+        vector.response[17] ^= 1;
+        peer.write_all(&vector.response).await.unwrap();
+        let mut reply = [0; 128];
+        assert_eq!(
+            stream.read(&mut reply).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(reply.iter().all(|byte| *byte == 0));
+        assert!(
+            stream
+                .write_all(b"cannot continue after authentication failure")
+                .await
+                .is_err()
+        );
+        assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    }
+}
