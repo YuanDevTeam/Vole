@@ -138,7 +138,7 @@ impl WireBodyMeta {
         if let Some(reason) = self.bypass {
             return Err(reason);
         }
-        if self.encoding != Encoding::Identity {
+        if self.encoding == Encoding::Unsupported {
             return Err(Bypass::Encoding);
         }
         if self.length.is_some_and(|length| length > MAX_BODY as u64) {
