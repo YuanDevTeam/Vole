@@ -287,7 +287,7 @@ impl HttpContext {
             .await
             .map_err(|_| io::ErrorKind::TimedOut)?
             .map_err(|_| failed())?;
-        let exchange = async {
+        let exchange = Box::pin(async {
             let (parts, body) = request.into_parts();
             let method = parts.method.clone();
             // Original credentials were removed before request-header actions.
@@ -410,7 +410,7 @@ impl HttpContext {
                     download.await
                 }
             }
-        };
+        });
         inline_driver(driver, exchange).await
     }
     async fn h1_upstream(
@@ -442,7 +442,7 @@ impl HttpContext {
         let state = response.clone();
         let info_cancel = CancellationToken::new();
         let upload_idle = h2_h1::UploadIdle::new();
-        let exchange = async {
+        let exchange = Box::pin(async {
             let (parts, body) = request.into_parts();
             let method = parts.method.clone();
             let mut headers = h2_headers::clean(parts.headers, false, true)?;
@@ -535,7 +535,7 @@ impl HttpContext {
             parts.version = Version::HTTP_2;
             let downstream = state.final_response(Response::from_parts(parts, ()), false)?;
             h2_h1::download(body, downstream, expected).await
-        };
+        });
         tokio::select! {biased;()=info_cancel.cancelled()=>Err(failed()),result=inline_driver(driver,exchange)=>result}
     }
 }
