@@ -434,8 +434,8 @@ fn normalize(path: &Path) -> io::Result<PathBuf> {
     Ok(result)
 }
 
-// Resolve existing parent aliases before comparing writable caches against
-// source files. No payload is opened, including for disabled declarations.
+// Resolve active cache aliases before comparing writable caches against source
+// files. Disabled and unreferenced declarations never call this function.
 fn canonical_target(path: &Path) -> io::Result<PathBuf> {
     let mut ancestor = path;
     let mut missing = Vec::new();

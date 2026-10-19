@@ -346,3 +346,60 @@ pub(super) fn publish(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_multi_cache_publication_restores_payload_metadata_and_cleans_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first.yaml");
+        let first_meta = metadata_path(&first);
+        fs::write(&first, b"previous payload").unwrap();
+        fs::write(&first_meta, b"previous metadata").unwrap();
+        let blocked = root.path().join("second.yaml");
+        fs::create_dir(&blocked).unwrap();
+        let directory = StageDirectory::new(root.path()).unwrap();
+        let input = directory.path().join("new-payload");
+        let metadata = directory.path().join("new-metadata");
+        fs::write(&input, b"candidate payload").unwrap();
+        fs::write(&metadata, b"candidate metadata").unwrap();
+        let first_write = PendingWrite {
+            directory,
+            replacements: vec![
+                Replacement {
+                    temporary: input,
+                    target: first.clone(),
+                    backup: None,
+                    installed: false,
+                },
+                Replacement {
+                    temporary: metadata,
+                    target: first_meta.clone(),
+                    backup: None,
+                    installed: false,
+                },
+            ],
+        };
+        let directory = StageDirectory::new(root.path()).unwrap();
+        let input = directory.path().join("new-payload");
+        fs::write(&input, b"candidate second").unwrap();
+        let second_write = PendingWrite {
+            directory,
+            replacements: vec![Replacement {
+                temporary: input,
+                target: blocked.clone(),
+                backup: None,
+                installed: false,
+            }],
+        };
+        let mut writes = vec![first_write, second_write];
+        assert!(publish(&mut writes, &CancellationToken::new()).is_err());
+        assert_eq!(fs::read(&first).unwrap(), b"previous payload");
+        assert_eq!(fs::read(&first_meta).unwrap(), b"previous metadata");
+        assert!(blocked.is_dir());
+        drop(writes);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 3);
+    }
+}

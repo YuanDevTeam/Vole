@@ -194,3 +194,29 @@ async fn changed_authentication_cannot_borrow_old_cache_or_validator() {
             .any(|slice| slice == b"If-None-Match:")
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn disabled_sources_skip_fifo_and_unresolvable_cache_parent_without_io() {
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, fs::symlink},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    symlink("loop", directory.path().join("loop")).unwrap();
+    let fifo = CString::new(directory.path().join("pipe").as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let document = Document::parse("rewrite-providers:\n  fifo: {type: file, path: pipe}\n  inaccessible: {type: http, url: 'http://rules.example.test/rules.yaml', path: loop/cache.yaml}\nrewrite:\n  rules: [{rule-set: fifo, enabled: false}, {rule-set: inaccessible, enabled: false}]\n").unwrap();
+    let source = SourceContext {
+        base_dir: Some(directory.path().into()),
+        data_dir: Some(directory.path().into()),
+        config_path: None,
+    };
+    let mut store = Store::new();
+    let candidate = store
+        .prepare(document, &source, None, &CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert!(candidate.payloads.is_empty());
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+}
