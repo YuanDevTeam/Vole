@@ -2,6 +2,8 @@
 #[cfg(feature = "inbound-http")]
 mod authority;
 mod config;
+#[cfg(test)]
+mod rules;
 mod mitm;
 pub(crate) use config::{MAX_ADDENDUM, Policy};
 #[cfg(feature = "inbound-http")]
