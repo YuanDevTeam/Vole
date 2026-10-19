@@ -6,7 +6,7 @@ use crate::{
 use std::{collections::BTreeSet, sync::atomic::AtomicUsize};
 use tokio::sync::mpsc;
 
-struct Packets {
+pub(super) struct Packets {
     to_peer: mpsc::Sender<Datagram>,
     to_client: mpsc::Receiver<Datagram>,
     closed: Arc<AtomicBool>,
@@ -33,7 +33,7 @@ impl DatagramTransport for Packets {
         Ok(())
     }
 }
-fn packets() -> (
+pub(super) fn packets() -> (
     Packets,
     mpsc::Receiver<Datagram>,
     mpsc::Sender<Datagram>,
@@ -54,7 +54,7 @@ fn packets() -> (
         closed,
     )
 }
-async fn reply(
+pub(super) async fn reply(
     output: &mpsc::Sender<Datagram>,
     codec: &mut wire::Codec,
     peer: &Destination,

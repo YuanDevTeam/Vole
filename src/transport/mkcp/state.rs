@@ -10,6 +10,8 @@ use std::{
 use tokio::time::Instant;
 
 const PACKETS: usize = 16_384;
+// Bound producer prefetch without changing configured wire flight credit.
+const TX_PREFETCH_BYTES: usize = 256 * 1024;
 pub(super) fn before(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
 }
@@ -146,7 +148,10 @@ impl State {
         if self.app_end || self.peer_close || self.tx.len() >= PACKETS {
             0
         } else {
-            self.tx_limit.saturating_sub(self.tx_bytes).min(self.mss)
+            self.tx_limit
+                .min(TX_PREFETCH_BYTES)
+                .saturating_sub(self.tx_bytes)
+                .min(self.mss)
         }
     }
     pub fn queue(&mut self, bytes: &[u8]) {
@@ -690,5 +695,152 @@ mod tests {
         ));
         assert!(!state.expired(now + Duration::from_secs(8)));
         assert!(state.expired(now + Duration::from_secs(9)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mkcp_memory_prefetch_backpressure_resumes_and_flushes() {
+        use super::super::{
+            connect,
+            tests::{packets, reply},
+        };
+        use crate::session::Destination;
+        use tokio::{io::AsyncWriteExt, sync::oneshot, time::timeout};
+        use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+        // A lower configured budget remains lower; a 1 MiB budget gains only
+        // the prefetch cap, not a different configured wire-flight allowance.
+        for (write_buffer, payload_len, slots) in [
+            (64 * 1024, 128 * 1024 + 17, 47),
+            (1024 * 1024, 512 * 1024 + 17, 801),
+        ] {
+            let options = MkcpOptions {
+                tti: 20,
+                uplink_capacity: 256,
+                downlink_capacity: 256,
+                read_buffer: 1024 * 1024,
+                write_buffer,
+                seed: Arc::from("memory queue"),
+                ..MkcpOptions::default()
+            };
+            let state = State::new(
+                options.clone(),
+                1350,
+                1362,
+                2700,
+                Arc::new(Shared::default()),
+            )
+            .unwrap();
+            assert_eq!(state.mss, 1304);
+            assert_eq!(state.tx_limit, write_buffer - 2700 - state.mss);
+            assert_eq!(
+                state.tx_slots, slots,
+                "prefetch must not shrink configured wire flight"
+            );
+            drop(state);
+
+            let expected: Vec<u8> = (0..payload_len).map(|n| (n % 251) as u8).collect();
+            let (transport, mut incoming, output, closed) = packets();
+            let address = "192.0.2.1:443".parse().unwrap();
+            let peer = Destination::Ip(address);
+            let mut codec = wire::Codec::new(&options).unwrap();
+            let (initial_tx, initial_rx) = oneshot::channel();
+            let (release_tx, mut release_rx) = oneshot::channel();
+            let worker = tokio::spawn(async move {
+                let mut initial_tx = Some(initial_tx);
+                let mut released = false;
+                let mut next = 0u32;
+                let mut last_time = 0;
+                let mut conversation = None;
+                let mut reorder = BTreeMap::new();
+                let mut bytes = Vec::new();
+                loop {
+                    tokio::select! {
+                        result = &mut release_rx, if !released => {
+                            result.unwrap();
+                            released = true;
+                            reply(&output, &mut codec, &peer,
+                                wire::ack(conversation.unwrap(), 0, next.wrapping_add(1024), next, last_time, &[])).await;
+                        }
+                        packet = incoming.recv() => {
+                            let Some(packet) = packet else { break; };
+                            let plain = codec.open(&packet.payload, 1362).unwrap();
+                            let conv = u16::from_be_bytes(plain[..2].try_into().unwrap());
+                            conversation = Some(conv);
+                            let (segment, size) = wire::parse(&plain, conv).unwrap();
+                            assert_eq!(size, plain.len());
+                            match segment {
+                                wire::Segment::Data { number, time, payload, .. } => {
+                                    last_time = time;
+                                    if !before(number, next) {
+                                        reorder.entry(number).or_insert_with(|| payload.to_vec());
+                                    }
+                                    while let Some(payload) = reorder.remove(&next) {
+                                        bytes.extend_from_slice(&payload);
+                                        next = next.wrapping_add(1);
+                                    }
+                                    // Consume initial wire credit, then hold every ACK.
+                                    if next >= 32 && let Some(sender) = initial_tx.take() {
+                                        sender.send(()).unwrap();
+                                    }
+                                    if released {
+                                        reply(&output, &mut codec, &peer,
+                                            wire::ack(conv, 0, next.wrapping_add(1024), next, time, &[number])).await;
+                                    }
+                                }
+                                wire::Segment::Control { command: 2, .. } => break,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                assert!(reorder.is_empty());
+                bytes
+            });
+
+            let tasks = TaskTracker::new();
+            let cancel = CancellationToken::new();
+            let mut stream = connect(
+                Box::new(transport),
+                address,
+                options,
+                cancel.clone(),
+                &tasks,
+            )
+            .unwrap();
+            let payload = expected.clone();
+            let (written_tx, mut written_rx) = oneshot::channel();
+            let writer = tokio::spawn(async move {
+                stream.write_all(&payload).await.unwrap();
+                written_tx.send(()).unwrap();
+                stream.flush().await.unwrap();
+                stream
+            });
+            timeout(Duration::from_secs(1), initial_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                timeout(Duration::from_millis(20), &mut written_rx)
+                    .await
+                    .is_err(),
+                "application writes must backpressure before ACK, including smaller configured budgets"
+            );
+            release_tx.send(()).unwrap();
+            let stream = timeout(Duration::from_secs(3), writer)
+                .await
+                .unwrap()
+                .unwrap();
+            written_rx.await.unwrap();
+            drop(stream);
+            tasks.close();
+            timeout(Duration::from_secs(1), tasks.wait()).await.unwrap();
+            let received = timeout(Duration::from_secs(1), worker)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received, expected);
+            assert!(cancel.is_cancelled());
+            assert!(closed.load(Ordering::Acquire));
+        }
     }
 }
