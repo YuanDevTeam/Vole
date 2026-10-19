@@ -95,7 +95,7 @@ fn decimal(raw: &str) -> Option<(bool, String, i64)> {
 fn decimal_spelling(raw: &str) -> bool {
     let raw = raw.replace('_', "");
     let raw = raw.trim_start_matches(['-', '+']);
-    let (mantissa, exponent) = raw.split_once(['e', 'E']).unwrap_or((&raw, "0"));
+    let (mantissa, exponent) = raw.split_once(['e', 'E']).unwrap_or((raw, "0"));
     let exponent = exponent.strip_prefix(['-', '+']).unwrap_or(exponent);
     let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     (!integer.is_empty() || !fraction.is_empty())
@@ -133,6 +133,7 @@ mod tests {
             "x: !!float 9007199254740993",
             "x: 1e309",
             "x: 1e9223372036854775808",
+            "x: ! 0.123456789012345678901",
         ] {
             assert!(validate(input.as_bytes()).is_err(), "{input}");
         }

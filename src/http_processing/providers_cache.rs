@@ -31,6 +31,7 @@ pub(super) struct CacheEntry {
     metadata: Metadata,
 }
 impl CacheEntry {
+    #[cfg(any(test, all(windows, feature = "windows-uwp")))]
     pub(super) fn adopt(source: String, path: PathBuf, payload: Arc<Payload>) -> Self {
         let checked = unix_time();
         Self {

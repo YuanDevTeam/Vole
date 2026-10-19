@@ -539,7 +539,7 @@ fn refresh_idle(input: String, context: SourceContext) -> Result<serde_json::Val
 
 pub(crate) async fn maintenance(
     store: Arc<tokio::sync::Mutex<Store>>,
-    network: DownloadContext,
+    download_context: impl Fn() -> DownloadContext,
     cancellation: CancellationToken,
 ) -> io::Result<()> {
     loop {
@@ -566,6 +566,7 @@ pub(crate) async fn maintenance(
         if store.next_due().is_some_and(|due| due.is_zero()) {
             // Failed updates keep the last complete candidate; the store owns
             // retry backoff. Awaiting this work preserves the Stop barrier.
+            let network = download_context();
             let _ = store.refresh_due(&network, &cancellation).await;
         }
     }

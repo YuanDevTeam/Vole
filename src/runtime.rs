@@ -1845,10 +1845,14 @@ impl RunningCore {
         let Some(resources) = &self.resources else {
             return;
         };
-        let network = resources.http_download_context();
+        let resources = resources.clone();
         self.tasks
             .push(tokio::spawn(crate::resources::observation::task(
-                crate::invoke::http::maintenance(store, network, self.cancellation.clone()),
+                crate::invoke::http::maintenance(
+                    store,
+                    move || resources.http_download_context(),
+                    self.cancellation.clone(),
+                ),
             )));
     }
     pub(crate) fn config_apply_handle(

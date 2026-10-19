@@ -72,6 +72,7 @@ impl Store {
 
     /// Restore actual content from a protected snapshot without touching its
     /// former sources or claiming that a disk validator has been checked.
+    #[cfg(any(test, all(windows, feature = "windows-uwp")))]
     pub(crate) fn adopt(
         &mut self,
         candidate: Arc<PolicyCandidate>,
@@ -167,25 +168,26 @@ impl Store {
                     } else {
                         memory
                     };
-                    let (entry, write) = if !force_refresh && cached.is_some() {
-                        (cached.expect("checked cached resource"), None)
-                    } else {
-                        let network = network.ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::NotConnected,
-                                "HTTP rewrite resource requires a download context",
+                    let (entry, write) = match cached {
+                        Some(entry) if !force_refresh => (entry, None),
+                        cached => {
+                            let network = network.ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::NotConnected,
+                                    "HTTP rewrite resource requires a download context",
+                                )
+                            })?;
+                            prepare_download(
+                                spec,
+                                path,
+                                &source,
+                                cached.as_ref(),
+                                network,
+                                cancellation,
+                                crate::http_processing::MAX_ADDENDUM.saturating_sub(input_bytes),
                             )
-                        })?;
-                        prepare_download(
-                            spec,
-                            path,
-                            &source,
-                            cached.as_ref(),
-                            network,
-                            cancellation,
-                            crate::http_processing::MAX_ADDENDUM.saturating_sub(input_bytes),
-                        )
-                        .await?
+                            .await?
+                        }
                     };
                     contents.insert(name.to_owned(), entry.payload.clone());
                     entries.insert(name.to_owned(), entry);

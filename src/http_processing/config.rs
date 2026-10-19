@@ -8,12 +8,15 @@ use super::{
     providers::Payload,
     rules::{self, Rule, UrlAction},
 };
-use serde::{Deserialize, Serialize};
+#[cfg(any(test, all(windows, feature = "windows-uwp")))]
+use serde::Deserialize;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt, io, sync::Arc};
 use url::Url;
 
 pub(crate) const MAX_ADDENDUM: usize = 1024 * 1024;
+#[cfg(any(test, all(windows, feature = "windows-uwp")))]
 pub(crate) const MAX_SNAPSHOT: usize = MAX_ADDENDUM * 8;
 pub(super) use rules::MAX_URL;
 pub(super) use rules::checked_url;
@@ -92,6 +95,7 @@ impl PolicyCandidate {
 
     /// Complete actual content for an internal, protected cross-process
     /// snapshot. CA material is deliberately not representable here.
+    #[cfg(any(test, all(windows, feature = "windows-uwp")))]
     pub(crate) fn export_snapshot(&self) -> io::Result<String> {
         #[derive(Serialize)]
         struct Snapshot<'a> {
@@ -115,6 +119,7 @@ impl PolicyCandidate {
         Ok(encoded)
     }
 
+    #[cfg(any(test, all(windows, feature = "windows-uwp")))]
     pub(crate) fn import_snapshot(input: &str) -> io::Result<Arc<Self>> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
