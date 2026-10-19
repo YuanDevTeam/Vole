@@ -478,22 +478,24 @@ impl AsyncWrite for Stream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         ready!(self.flush_pending(cx))?;
+        self.flow.changed.register(cx.waker());
         if self.remote_fin.load(Ordering::Acquire) {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        ready!(self.write.poll_reserve(cx)).map_err(|_| io::ErrorKind::BrokenPipe)?;
-        self.flow.changed.register(cx.waker());
         let credit = if self.shared.options.version == 2 {
             self.flow.credit() as usize
         } else {
             usize::MAX
         };
         if credit == 0 {
+            // A window-blocked flow must leave queue capacity for other streams.
+            self.write.abort_send();
             return Poll::Pending;
         }
+        ready!(self.write.poll_reserve(cx)).map_err(|_| io::ErrorKind::BrokenPipe)?;
         let size = buf.len().min(self.shared.options.frame_size).min(credit);
         let (tx, rx) = oneshot::channel();
         let id = self.id;
@@ -600,6 +602,131 @@ mod tests {
 #[cfg(test)]
 mod version_two_tests {
     use super::*;
+    #[tokio::test]
+    async fn v2_zero_credit_streams_leave_shared_send_capacity_available() {
+        use std::{future::poll_fn, time::Duration};
+        fn frame(command: u8, id: u32, data: &[u8]) -> Vec<u8> {
+            let mut wire = vec![2, command];
+            wire.extend_from_slice(&(data.len() as u16).to_le_bytes());
+            wire.extend_from_slice(&id.to_le_bytes());
+            wire.extend_from_slice(data);
+            wire
+        }
+        let (raw, mut peer) = tokio::io::duplex(64 * 1024);
+        let (client, driver) = with_options(
+            Box::new(raw),
+            Options {
+                version: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut driver = tokio::spawn(driver);
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut streams = Vec::new();
+            let mut ids = Vec::new();
+            for _ in 0..=crate::limits::SING_MUX_COMMAND_QUEUE {
+                streams.push(client.open().await?);
+                let mut syn = [0; 8];
+                peer.read_exact(&mut syn).await?;
+                ids.push(u32::from_le_bytes(syn[4..].try_into().unwrap()));
+            }
+            let mut healthy = streams.pop().unwrap();
+            let normal_id = *ids.last().unwrap();
+            for &id in &ids[..streams.len()] {
+                peer.write_all(&frame(4, id, &[0; 8])).await?;
+            }
+            // Reading a later PSH proves all preceding zero-window UPDs parsed.
+            peer.write_all(&frame(2, normal_id, b"r")).await?;
+            let mut marker = [0];
+            healthy.read_exact(&mut marker).await?;
+            let mut update = [0; 16];
+            peer.read_exact(&mut update).await?; // Drain the marker's own UPD.
+            let mut held: Vec<_> = streams
+                .iter_mut()
+                .map(|stream| Box::pin(stream.write_all(b"x")))
+                .collect();
+            let all_pending = poll_fn(|cx| {
+                Poll::Ready(
+                    held.iter_mut()
+                        .map(|write| write.as_mut().poll(cx).is_pending())
+                        .all(|p| p),
+                )
+            })
+            .await;
+            let normal = tokio::time::timeout(Duration::from_millis(150), async {
+                healthy.write_all(b"h").await?;
+                healthy.flush().await?;
+                let mut wire = [0; 9];
+                peer.read_exact(&mut wire).await?;
+                Ok::<_, io::Error>(wire)
+            })
+            .await;
+            // A real UPD must still wake and permit a previously blocked writer.
+            peer.write_all(&frame(4, ids[0], &[0, 0, 0, 0, 1, 0, 0, 0]))
+                .await?;
+            let restored = tokio::time::timeout(Duration::from_millis(150), async {
+                held[0].as_mut().await?;
+                let mut wire = [0; 9];
+                peer.read_exact(&mut wire).await?;
+                Ok::<_, io::Error>(wire)
+            })
+            .await;
+            // Invalid peer framing ends the actual driver and wakes zero-credit writers.
+            peer.write_all(&[9, 0, 0, 0, 0, 0, 0, 0]).await?;
+            let stopped = tokio::time::timeout(Duration::from_millis(150), held[1].as_mut()).await;
+            drop(held);
+            drop(streams);
+            drop(healthy);
+            Ok::<_, io::Error>((
+                all_pending,
+                marker,
+                update,
+                normal,
+                restored,
+                stopped,
+                frame(2, normal_id, b"h"),
+                frame(2, ids[0], b"x"),
+            ))
+        })
+        .await;
+        // Both timeout/error paths drop held writes and streams before joining.
+        drop(client);
+        drop(peer);
+        let joined = tokio::time::timeout(Duration::from_secs(1), &mut driver).await;
+        if joined.is_err() {
+            driver.abort();
+            let _ = driver.await;
+        }
+        assert!(
+            joined.is_ok_and(|result| result.is_ok()),
+            "smux driver did not join"
+        );
+        let (pending, marker, update, normal, restored, stopped, expected, resumed) = result
+            .expect("memory fixture timed out")
+            .expect("memory fixture IO failed");
+        assert!(pending, "zero-window writes were unexpectedly accepted");
+        assert_eq!(&marker, b"r");
+        assert_eq!(&update[..2], &[2, 4]);
+        assert_eq!(
+            normal
+                .expect("healthy stream blocked by zero-credit streams")
+                .unwrap()
+                .as_slice(),
+            expected
+        );
+        assert_eq!(
+            restored
+                .expect("UPD did not wake the blocked writer")
+                .unwrap()
+                .as_slice(),
+            resumed
+        );
+        assert!(
+            matches!(stopped, Ok(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe),
+            "driver close did not reject a zero-credit write"
+        );
+    }
     #[tokio::test]
     async fn v2_updates_open_credit_and_acknowledge_consumed_bytes() {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
