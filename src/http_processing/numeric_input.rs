@@ -25,7 +25,8 @@ pub(super) fn validate(input: &[u8]) -> io::Result<()> {
             Event::Scalar(raw, style, _, tag) => {
                 let tag = tag
                     .as_ref()
-                    .map(|tag| format!("{}{}", tag.handle, tag.suffix));
+                    .map(|tag| format!("{}{}", tag.handle, tag.suffix))
+                    .filter(|tag| tag != "!");
                 let forced_float = tag.as_deref() == Some("tag:yaml.org,2002:float");
                 if tag.is_some() && !forced_float || !forced_float && style != TScalarStyle::Plain {
                     continue;

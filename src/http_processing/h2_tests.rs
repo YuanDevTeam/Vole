@@ -19,6 +19,87 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 const PAYLOAD: usize = 96 * 1024;
 
+#[tokio::test]
+async fn h2_rewrite_stages_use_original_url_for_h2_and_h1_origins() {
+    let rules = r#"
+rewrite:
+  enabled: true
+  rules:
+    - {url: '^https://a\.test/upload$', action: replace, replacement: 'https://b.test/rewritten'}
+    - {url: '^https://a\.test/upload$', action: request-header-set, header: X-Request, value: rewritten}
+    - {url: '^https://a\.test/upload$', action: request-header-set, header: Authorization, value: 'Bearer explicit'}
+    - {url: '^https://a\.test/upload$', action: request-header-set, header: Cookie, value: 'new=explicit'}
+    - {url: '^https://a\.test/upload$', action: request-body-replace, search: old, replacement: new}
+    - {url: '^https://a\.test/upload$', action: response-header-remove, header: Server}
+    - url: '^https://a\.test/upload$'
+      action: response-body-json-patch
+      patch:
+        - {op: replace, path: /ads, value: []}
+        - {op: replace, path: /token, value: new}
+"#;
+    for upstream_h2 in [true, false] {
+        let (context, origin) =
+            prepared_origin_rules(upstream_h2, false, false, OriginMode::Rewrite, rules);
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let (client, mut server) = tokio::io::duplex(8192);
+        let worker = tokio::spawn(async move {
+            context
+                .serve_h2(&mut server, session(), stop)
+                .await
+                .unwrap();
+        });
+        let (mut sender, connection) = wire::client::handshake(client).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let (response, mut upload) = sender
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri("https://a.test/upload")
+                    .header("content-length", 11)
+                    .header("authorization", "Bearer original")
+                    .header("cookie", "old=original")
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        upload
+            .send_data(Bytes::from_static(b"old request"), true)
+            .unwrap();
+        let response = timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!response.headers().contains_key("server"));
+        let expected = response.headers()["content-length"]
+            .to_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(frame) = timeout(Duration::from_secs(5), body.data()).await.unwrap() {
+            let frame = frame.unwrap();
+            body.flow_control().release_capacity(frame.len()).unwrap();
+            bytes.extend_from_slice(&frame);
+        }
+        assert_eq!(bytes.len(), expected);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::json!({"ads":[],"token":"new"})
+        );
+        assert_eq!(origin.received.lock().unwrap()[0], b"new request");
+        cancel.cancel();
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        origin.join().await;
+        driver.abort();
+        let _ = driver.await;
+    }
+}
 #[derive(Clone, Copy)]
 enum OriginMode {
     None,
