@@ -445,18 +445,18 @@ proxies:
   # VMess AEAD：alterId 仅 0；cipher 默认 auto（实际 AES 硬件检测），还支持
   # aes-128-gcm/chacha20-poly1305/none，zero 归一为 none。
   # global-padding/authenticated-length 默认 false；none/zero 不接受 true。
-  # network 默认 tcp，支持 tcp/ws/grpc/http/h2/mkcp（kcp别名）。tls 默认 false；关闭时
+  # network 默认 tcp，支持 tcp/ws/grpc/http/h2。tls 默认 false；关闭时
   # 禁止 servername/alpn/fingerprint/skip-cert-verify 等 TLS 专属字段。
   # servername 优先显式值，其次 WS Host 去端口，否则 server。
   # TLS 支持 name-cert-verify 和成对的内联 PEM 或文件路径 certificate/private-key；
   # 验证名不改变 servername，客户端身份不增加服务端信任根。
   # ws-opts/grpc-opts 与下面 Trojan 的结构相同；HTTP/H2 选项见示例注释。
   # tls: true 时可选 shadow-tls-opts: {version: 3, password: cover-password} 或
-  # jls-opts: {username: user, password: password}；身份单选。REALITY 仅 TCP/HTTP/H2/gRPC/mKCP，
+  # jls-opts: {username: user, password: password}；身份单选。REALITY 仅 TCP/HTTP/H2/gRPC，
   # 必须有效 client-fingerprint，不用于 WS/HTTPUpgrade。
   # UDP 默认 false；packet-encoding 默认为空（raw），或 xudp/packetaddr。
   # raw transport 固定首包目标；packetaddr 域名由受控 Vole DNS 解析为 IP。
-  # TCP/WS 保留下载侧；gRPC/HTTP/H2/mKCP 上传 EOF 关闭逻辑流，详见 outbounds.md#vmess-aead。
+  # TCP/WS 保留下载侧；gRPC/HTTP/H2 上传 EOF 关闭逻辑流，详见 outbounds.md#vmess-aead。
   - name: vmess-edge
     type: vmess
     server: vmess.example.com
@@ -471,17 +471,6 @@ proxies:
     packet-encoding: xudp
     global-padding: false
     authenticated-length: false
-    # network: mkcp
-    # mkcp-opts:
-    #   mtu: 1350
-    #   tti: 50                 # ms
-    #   uplink-capacity: 5      # MiB/s
-    #   downlink-capacity: 20   # MiB/s
-    #   congestion: false
-    #   read-buffer: 2097152    # bytes，按需分配
-    #   write-buffer: 2097152
-    #   seed: ""
-    #   header: none            # none/srtp/utp/wechat-video/dtls/wireguard
     # network: http
     # http-opts:
     #   method: GET

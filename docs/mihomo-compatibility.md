@@ -53,8 +53,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - 订阅元信息只在成功候选或合法 304 后发布，失败响应或坏候选保留旧值；
   与 Mihomo 在读取响应头时更新的时点不同。数值仅接受有限且可表示的十进制数，
   不保留非有限/溢出浮点转换的参考行为。
-- URI 转换接受参考转换器实际保留的 VMess `kcp/mkcp` 默认载体，以及 SIP003 的 obfs、v2ray-plugin 参数；
-  不从分享 JSON 推导额外 mKCP 参数，也不把插件 URI 参数通透转为 YAML。空 host 沿严格插件的默认值，
+- URI 转换接受 SIP003 的 obfs、v2ray-plugin 参数，不把插件 URI 参数通透转为 YAML。空 host 沿严格插件的默认值，
   WebSocket TLS 仅由明确的 `tls` 标记启用。转换仍受当前严格节点/版本范围限制；HTTPS URI 节点默认校验证书，不复制参考
   转换器的隐式跳过校验。Provider 缓存按精确 URL 与实际 header/UA 摘要隔离，
   GeoData 按精确 URL 摘要隔离；凭据不写入来源元数据或 Debug。

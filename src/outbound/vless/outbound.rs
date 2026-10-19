@@ -717,12 +717,6 @@ impl PreparedStream {
             let mut prefix_sent = false;
             match &self.transport {
                 StreamTransport::Tcp => {}
-                StreamTransport::Mkcp(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "mKCP is a VMess-only transport",
-                    ));
-                }
                 StreamTransport::WebSocket { .. } => {
                     if self.options.http_upgrade {
                         raw = crate::transport::http_upgrade(

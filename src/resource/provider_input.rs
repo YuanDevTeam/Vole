@@ -207,9 +207,6 @@ fn transport(
     };
     match network.as_str() {
         "tcp" => {}
-        // Mihomo preserves these VMess aliases, then its outbound constructs
-        // default mKCP. Its converter does not translate seed/header options.
-        "mkcp" | "kcp" if kind == "vmess" => {}
         "http" => {
             let mut options = json!({"path":[path], "headers":{}});
             if !link.get("host").is_empty() {
@@ -1060,40 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn newly_supported_uri_transports_reach_the_existing_strict_consumers() {
-        let uuid = "00000000-0000-4000-8000-000000000001";
-        for network in ["kcp", "mkcp"] {
-            let vmess = json!({"v":"2","ps":"edge","add":"proxy.invalid","port":443,"id":uuid,"net":network,"type":"srtp","path":"not-a-seed"});
-            for input in [
-                format!(
-                    "vmess://{}",
-                    STANDARD.encode(serde_json::to_vec(&vmess).unwrap())
-                ),
-                format!("vmess://{uuid}@proxy.invalid:443?type={network}"),
-            ] {
-                let node = one(&input);
-                assert_eq!(node["network"].as_str(), Some(network));
-                assert!(node.get("mkcp-opts").is_none());
-                if cfg!(feature = "outbound-vmess") {
-                    let rule = format!("MATCH,{}", node["name"].as_str().unwrap());
-                    let config = crate::config::Config::parse_yaml(
-                        serde_json::to_vec(&json!({"proxies":[node],"rules":[rule]}))
-                            .unwrap()
-                            .as_slice(),
-                    )
-                    .unwrap();
-                    let crate::config::ProxyProtocol::Vmess(vmess) = &config.proxies[0].protocol
-                    else {
-                        panic!("VMess");
-                    };
-                    let crate::config::StreamTransport::Mkcp(options) = &vmess.transport else {
-                        panic!("mKCP");
-                    };
-                    assert!(options.seed.is_empty());
-                    assert_eq!(options.header, crate::config::MkcpHeader::None);
-                }
-            }
-        }
+    fn ss_plugin_uris_reach_the_existing_strict_consumers() {
         for (plugin, expected, tls) in [
             (
                 "obfs-local;obfs=http;obfs-host=cover.invalid",

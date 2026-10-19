@@ -99,40 +99,11 @@ impl VmessOutbound {
         session: StreamSession,
         context: &EstablishContext,
     ) -> Result<BoxStream, DispatchError> {
-        let raw = if let VmessTransport::Mkcp(options) = &self.options.transport {
-            let server = self.upstream.datagram_server(&self.server, context).await?;
-            let peer = context.resolve_ip(&server).await?;
-            let request = DatagramRequest::new(
-                crate::session::DatagramSession::new(session.inbound, session.source)
-                    .with_metadata(session.metadata),
-            )
-            .with_budget(DatagramBudget::new(
-                options.mtu,
-                options.peer_receive_limit(),
-            ));
-            let transport = self.upstream.open_datagram(request, context).await?;
-            // Registration and node Stop are synchronous under one small lock;
-            // TLS/authentication and UDP IO never hold this admission guard.
-            let _admission = self
-                .driver_admission
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if self.cancellation.is_cancelled() {
-                return Err(DispatchError::NotAllowed);
-            }
-            crate::transport::mkcp::connect(
-                transport,
-                peer,
-                options.clone(),
-                self.cancellation.child_token(),
-                &self.tasks,
-            )?
-        } else {
-            self.upstream
-                .connect_server(session, &self.server, context)
-                .await?
-                .io
-        };
+        let raw = self
+            .upstream
+            .connect_server(session, &self.server, context)
+            .await?
+            .io;
         context
             .run_io(
                 "VMess transport handshake",
@@ -184,10 +155,7 @@ impl PreparedStream {
             ClientHandshake::new(&self.options.identity, command, target, self.options.body)?;
         let whole_close = matches!(
             self.options.transport,
-            VmessTransport::Grpc { .. }
-                | VmessTransport::Http { .. }
-                | VmessTransport::H2 { .. }
-                | VmessTransport::Mkcp(_)
+            VmessTransport::Grpc { .. } | VmessTransport::Http { .. } | VmessTransport::H2 { .. }
         );
         let deadline = self.deadline;
         let result = tokio::time::timeout_at(deadline, async {
@@ -195,7 +163,7 @@ impl PreparedStream {
             let mut sent = false;
             let mut driver = None;
             match &self.options.transport {
-                VmessTransport::Tcp | VmessTransport::Mkcp(_) => {}
+                VmessTransport::Tcp => {}
                 VmessTransport::WebSocket { .. } => {
                     raw = connect_websocket(
                         raw,
