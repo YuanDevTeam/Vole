@@ -143,7 +143,8 @@ SS2022 流式插件的纯内存过滤器：`config::shadowsocks_plugin::tests::`
 它们使用内存流或内存数据报，不启动网络对端；真实TUN互通与压力仍由外部夹具单独验收。
 
 VMess mKCP 的纯内存回归使用 `--lib mkcp_`，覆盖配置/线协议向量、seed/header、
-丢包乱序、ACK/flush和Stop；不创建 socket。官方对端业务仍须真实TUN另验。
+丢包乱序、发送预取背压、接收信用与已确认数据保留、读取消、ACK/flush和Stop；不创建 socket。
+官方对端业务仍须真实TUN另验。
 
 HY2 Gecko/Realm 的配置和内存wire回归按 `gecko_`、`realm_` 中列出的memory-only名称定向执行；
 TUIC ClientHello 使用 `tuic_disable_sni_changes_real_quic_hello_without_changing_verification_policy`。

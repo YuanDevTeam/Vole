@@ -12,6 +12,8 @@ use tokio::time::Instant;
 const PACKETS: usize = 16_384;
 // Bound producer prefetch without changing configured wire flight credit.
 const TX_PREFETCH_BYTES: usize = 256 * 1024;
+// Ready and reordered receive payload share one bounded credit budget.
+const RX_PAYLOAD_BYTES: usize = 256 * 1024;
 pub(super) fn before(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
 }
@@ -93,7 +95,8 @@ impl State {
             .read_buffer
             .checked_sub(pipe + 2 * receive_limit)
             .filter(|n| *n >= rx_mss)
-            .ok_or_else(|| std::io::Error::other("mKCP read budget is too small"))?;
+            .ok_or_else(|| std::io::Error::other("mKCP read budget is too small"))?
+            .min(RX_PAYLOAD_BYTES);
         let capacity =
             |mib: u32| (u64::from(mib) * 1024 * 1024 * u64::from(options.tti) / 1000).max(1);
         let rate_bytes = capacity(options.uplink_capacity);
@@ -842,5 +845,304 @@ mod tests {
             assert!(cancel.is_cancelled());
             assert!(closed.load(Ordering::Acquire));
         }
+    }
+    #[test]
+    fn mkcp_receive_budget_bounds_initial_credit_and_keeps_acknowledged_data_until_read() {
+        const CAP: usize = 256 * 1024;
+        for read_buffer in [64 * 1024, 1024 * 1024] {
+            let options = MkcpOptions {
+                tti: 20,
+                uplink_capacity: 256,
+                downlink_capacity: 256,
+                read_buffer,
+                write_buffer: 1024 * 1024,
+                seed: Arc::from("memory queue"),
+                ..MkcpOptions::default()
+            };
+            let mut state =
+                State::new(options, 1350, 1362, 2700, Arc::new(Shared::default())).unwrap();
+            assert_eq!(state.rx_limit, (read_buffer - 2700 - 2 * 1362).min(CAP));
+            assert_eq!(state.rx_mss, 1316);
+            let initial = state.receive_upper;
+            assert!(initial > 1);
+            assert_eq!(initial as usize, state.rx_limit / state.rx_mss);
+            let mut now = Instant::now();
+            let mss = state.rx_mss;
+
+            // Preserve the first hole while occupying the entire advertised
+            // range. Reorder and ready are two owners of one payload budget.
+            for number in 1..initial {
+                let payload = vec![(number % 251) as u8; mss];
+                state.input(
+                    wire::Segment::Data {
+                        option: 0,
+                        time: 0,
+                        number,
+                        sending_next: 0,
+                        payload: &payload,
+                    },
+                    now,
+                );
+            }
+            assert!(state.ready.is_empty());
+            assert_eq!(state.reorder.len(), initial as usize - 1);
+            let before = state.rx_bytes;
+            let outside = vec![0xef; mss];
+            state.input(
+                wire::Segment::Data {
+                    option: 0,
+                    time: 0,
+                    number: initial,
+                    sending_next: 0,
+                    payload: &outside,
+                },
+                now,
+            );
+            assert_eq!(state.rx_bytes, before);
+            assert!(
+                !state.acks.contains_key(&initial),
+                "out-of-credit data must not be acknowledged"
+            );
+
+            let first = vec![0; mss];
+            state.input(
+                wire::Segment::Data {
+                    option: 0,
+                    time: 0,
+                    number: 0,
+                    sending_next: 0,
+                    payload: &first,
+                },
+                now,
+            );
+            assert!(state.reorder.is_empty());
+            assert_eq!(state.ready.len(), initial as usize);
+            assert_eq!(state.rx_bytes, initial as usize * mss);
+            assert!(state.rx_bytes <= state.rx_limit);
+            let mut acknowledged = Vec::new();
+            // The wire protocol caps one ACK at128 entries. Drain real ACKs
+            // at the unchanged TTI instead of assuming the whole199-slot
+            // receive window fits in a single packet; bound by accepted count.
+            for _ in 0..initial {
+                if state.acks.is_empty() {
+                    break;
+                }
+                let ack = state.next(now).expect("pending ACK at its next TTI");
+                let (
+                    wire::Segment::Ack {
+                        window,
+                        next,
+                        numbers,
+                        ..
+                    },
+                    _,
+                ) = wire::parse(&ack, state.conv).unwrap()
+                else {
+                    panic!("expected ACK");
+                };
+                assert_eq!(window, initial);
+                assert_eq!(next, initial);
+                assert!(numbers.len() / 4 <= wire::ACKS);
+                acknowledged.extend(
+                    numbers
+                        .chunks_exact(4)
+                        .map(|n| u32::from_be_bytes(n.try_into().unwrap())),
+                );
+                now += Duration::from_millis(20);
+            }
+            assert!(state.acks.is_empty(), "bounded ACK draining must finish");
+            assert_eq!(acknowledged, (0..initial).collect::<Vec<_>>());
+
+            // A duplicated acknowledged packet allocates nothing. Partial
+            // application reads preserve its tail and grant only actual space.
+            let before = state.rx_bytes;
+            state.input(
+                wire::Segment::Data {
+                    option: 0,
+                    time: 0,
+                    number: 0,
+                    sending_next: 0,
+                    payload: &first,
+                },
+                now,
+            );
+            assert_eq!(state.rx_bytes, before);
+            let half = mss / 2;
+            state.delivered(half);
+            assert_eq!(state.ready.front().unwrap().as_ref(), &first[half..]);
+            assert_eq!(
+                state.receive_upper,
+                state.next_receive + ((state.rx_limit - state.rx_bytes) / mss) as u32
+            );
+            state.delivered(mss - half);
+            assert!(state.receive_upper > initial);
+            let ack = state.next(now).unwrap();
+            let (
+                wire::Segment::Ack {
+                    window,
+                    next,
+                    numbers,
+                    ..
+                },
+                _,
+            ) = wire::parse(&ack, state.conv).unwrap()
+            else {
+                panic!("expected credit ACK");
+            };
+            assert!(window > initial);
+            assert_eq!(
+                next, initial,
+                "reading must not acknowledge the earlier rejected packet"
+            );
+            assert!(numbers.is_empty());
+
+            // Retry the previously rejected packet only after new credit exists.
+            state.input(
+                wire::Segment::Data {
+                    option: 0,
+                    time: 0,
+                    number: initial,
+                    sending_next: 0,
+                    payload: &outside,
+                },
+                now,
+            );
+            assert_eq!(state.next_receive, initial + 1);
+            assert!(state.rx_bytes <= state.rx_limit);
+            let mut delivered = first;
+            while let Some(bytes) = state.ready.front().cloned() {
+                delivered.extend_from_slice(&bytes);
+                state.delivered(bytes.len());
+            }
+            let mut expected = Vec::new();
+            for number in 0..initial {
+                expected.extend(std::iter::repeat_n((number % 251) as u8, mss));
+            }
+            expected.extend_from_slice(&outside);
+            assert_eq!(delivered, expected);
+            assert_eq!(state.rx_bytes, 0);
+            assert!(state.ready.is_empty() && state.reorder.is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mkcp_memory_receive_credit_and_cancelled_read_preserve_acked_payload_and_stop() {
+        use super::super::{
+            connect,
+            tests::{packets, reply},
+        };
+        use crate::session::Destination;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            time::timeout,
+        };
+        use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+        let options = MkcpOptions {
+            tti: 20,
+            uplink_capacity: 256,
+            downlink_capacity: 256,
+            read_buffer: 1024 * 1024,
+            write_buffer: 1024 * 1024,
+            seed: Arc::from("memory queue"),
+            ..MkcpOptions::default()
+        };
+        let (transport, mut incoming, output, closed) = packets();
+        let peer_addr = "192.0.2.1:443".parse().unwrap();
+        let peer = Destination::Ip(peer_addr);
+        let mut codec = wire::Codec::new(&options).unwrap();
+        let peer_mss = usize::from(options.mtu) - options.overhead() - wire::DATA_HEADER;
+        let tasks = TaskTracker::new();
+        let cancel = CancellationToken::new();
+        let mut stream = connect(
+            Box::new(transport),
+            peer_addr,
+            options,
+            cancel.clone(),
+            &tasks,
+        )
+        .unwrap();
+        stream.write_all(b"open").await.unwrap();
+        let first = timeout(Duration::from_secs(1), incoming.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let plain = codec.open(&first.payload, 1362).unwrap();
+        let conv = u16::from_be_bytes(plain[..2].try_into().unwrap());
+        let (wire::Segment::Data { number, .. }, _) = wire::parse(&plain, conv).unwrap() else {
+            panic!("expected opening DATA");
+        };
+        reply(
+            &output,
+            &mut codec,
+            &peer,
+            wire::control(conv, 3, 0, 0, number + 1, 100),
+        )
+        .await;
+        let window = loop {
+            let packet = timeout(Duration::from_secs(1), incoming.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let plain = codec.open(&packet.payload, 1362).unwrap();
+            if let (wire::Segment::Ack { window, .. }, _) = wire::parse(&plain, conv).unwrap() {
+                break window;
+            }
+        };
+        let bounded_credit = window as usize <= 256 * 1024 / 1316;
+        if !bounded_credit {
+            cancel.cancel();
+            tasks.close();
+            timeout(Duration::from_secs(1), tasks.wait()).await.unwrap();
+            assert!(closed.load(Ordering::Acquire));
+            assert!(
+                bounded_credit,
+                "initial on-wire credit exceeded the receive payload cap"
+            );
+        }
+
+        let mut scratch = [0; 1];
+        let mut abandoned = Box::pin(stream.read(&mut scratch));
+        assert!(futures_util::poll!(&mut abandoned).is_pending());
+        drop(abandoned);
+        let expected: Vec<u8> = (0..32 * 1024).map(|n| (n % 251) as u8).collect();
+        let segments = expected.len().div_ceil(peer_mss) as u32;
+        for (number, bytes) in expected.chunks(peer_mss).enumerate() {
+            reply(
+                &output,
+                &mut codec,
+                &peer,
+                wire::data(conv, 0, 0, number as u32, 0, bytes),
+            )
+            .await;
+        }
+        // Keep application reads stopped while the peer receives confirmation.
+        // The driver's pending duplex writes may lose select races to RX, but
+        // acknowledged ready bytes must remain available for a later read.
+        tokio::time::advance(Duration::from_millis(20)).await;
+        loop {
+            let packet = timeout(Duration::from_secs(1), incoming.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let plain = codec.open(&packet.payload, 1362).unwrap();
+            if matches!(wire::parse(&plain, conv), Some((wire::Segment::Ack { next, .. }, _)) if next == segments)
+            {
+                break;
+            }
+        }
+        let mut actual = vec![0; expected.len()];
+        timeout(Duration::from_secs(1), stream.read_exact(&mut actual))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual, expected);
+        let mut pending = Box::pin(stream.read(&mut scratch));
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        cancel.cancel();
+        tasks.close();
+        timeout(Duration::from_secs(1), tasks.wait()).await.unwrap();
+        assert_eq!(pending.await.unwrap(), 0);
+        assert!(closed.load(Ordering::Acquire));
     }
 }
