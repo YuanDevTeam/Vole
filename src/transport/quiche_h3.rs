@@ -309,7 +309,7 @@ impl Driver {
                 );
             }
             let notify = self.shared.changed.notified();
-            let timeout = {
+            {
                 let mut state = self.shared.state.lock().unwrap();
                 if state
                     .connection
@@ -357,15 +357,9 @@ impl Driver {
                     body.signals.write.wake();
                 }
                 self.shared.status.notify_waiters();
-                state
-                    .connection
-                    .as_mut()
-                    .unwrap()
-                    .timeout()
-                    .map(|delay| tokio::time::Instant::now() + delay)
-            };
+            }
             let mut native_idle = false;
-            {
+            let mut timeout = {
                 let mut sending = self.shared.state.lock().unwrap();
                 for _ in 0..WORK {
                     if pending.is_none() {
@@ -399,7 +393,14 @@ impl Driver {
                         Err(error) => return Err(error),
                     }
                 }
-            }
+                // Native send arms recovery timers, including an isolated PTO.
+                sending
+                    .connection
+                    .as_ref()
+                    .unwrap()
+                    .timeout()
+                    .map(|delay| tokio::time::Instant::now() + delay)
+            };
             let sent = self.socket.stats().sent;
             if sent != transmitted {
                 transmitted = sent;
@@ -421,16 +422,15 @@ impl Driver {
                 // FIN acceptance is not an ACK barrier. Give native queues and
                 // the controlled transport bounded continued IO before close
                 // can preempt them; never extend the original close deadline.
-                let _ = self
-                    .shared
-                    .state
-                    .lock()
-                    .unwrap()
-                    .connection
-                    .as_mut()
-                    .unwrap()
-                    .close(true, 0x100, b"");
+                let mut state = self.shared.state.lock().unwrap();
+                let connection = state.connection.as_mut().unwrap();
+                let _ = connection.close(true, 0x100, b"");
+                // Close may replace the timer sampled after the send loop.
+                timeout = connection
+                    .timeout()
+                    .map(|delay| tokio::time::Instant::now() + delay);
                 close_sent = true;
+                drop(state);
                 self.shared.changed.notify_one();
             }
             let deadline = timeout
@@ -1180,7 +1180,13 @@ mod tests {
     ) {
         let local: SocketAddr = "192.0.2.1:443".parse().unwrap();
         let remote: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let mut first = packets.recv().await.unwrap().to_vec();
+        let first = tokio::select! {
+            () = cancel.cancelled() => return,
+            first = packets.recv() => first,
+        };
+        let Some(mut first) = first.map(|packet| packet.to_vec()) else {
+            return;
+        };
         let header = quiche::Header::from_slice(&mut first, 20).unwrap();
         let cid = header.dcid.into_owned();
         let mut connection = quiche::accept(&cid, None, local, remote, &mut config).unwrap();
@@ -1270,6 +1276,9 @@ mod tests {
                 }
             }
             if connection.is_closed() {
+                // A remote QUIC close does not close a physical UDP socket.
+                // Keep the memory transport alive through the client's Stop.
+                cancel.cancelled().await;
                 break;
             }
             let now = std::time::Instant::now();
@@ -1345,6 +1354,162 @@ mod tests {
         assert!(result.is_err());
         assert!(closed.load(std::sync::atomic::Ordering::Acquire));
         assert!(sent.recv().await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn quiche_h3_memory_isolated_initial_loss_uses_fresh_pto_and_joins_stop() {
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(identity.cert.der().clone()).unwrap();
+        let tls = StandardTlsClient::with_options(
+            &SecurityContext::with_tls_roots(roots),
+            "localhost",
+            TlsClientOptions {
+                alpn: vec![b"h3".to_vec()],
+                required_alpn: Some(b"h3".to_vec()),
+                versions: TlsVersions::Tls13,
+                ..Default::default()
+            },
+            0,
+            BODY_LIMIT,
+        )
+        .unwrap()
+        .quiche_config()
+        .unwrap();
+        let mut builder =
+            boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
+        builder
+            .set_certificate(&boring::x509::X509::from_der(identity.cert.der()).unwrap())
+            .unwrap();
+        builder
+            .set_private_key(
+                &boring::pkey::PKey::private_key_from_der(&identity.signing_key.serialize_der())
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut config =
+            quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder).unwrap();
+        config.set_application_protos(&[b"h3"]).unwrap();
+        config.set_curves_list("X25519").unwrap();
+        config.verify_peer(false);
+        config.set_max_idle_timeout(10000);
+        config.set_max_send_udp_payload_size(1400);
+        config.set_max_recv_udp_payload_size(1400);
+        config.set_initial_max_data(1024 * 1024);
+        config.set_initial_max_stream_data_bidi_remote(128 * 1024);
+        config.set_initial_max_stream_data_bidi_local(128 * 1024);
+        config.set_initial_max_stream_data_uni(16 * 1024);
+        config.set_initial_max_streams_bidi(256);
+        config.set_initial_max_streams_uni(8);
+        config.enable_dgram(true, 64, 64);
+        let (to_server, mut from_client) = mpsc::channel(32);
+        let (to_client, from_server) = mpsc::channel(32);
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (client, driver) = Driver::new(
+            Transport {
+                transport: Box::new(Packets {
+                    send: to_server,
+                    receive: from_server,
+                    peer: "192.0.2.1:443".parse().unwrap(),
+                    closed: closed.clone(),
+                }),
+                peer: "192.0.2.1:443".parse().unwrap(),
+                budget: DatagramBudget::new(1400, 1400),
+                tls,
+                server_name: "localhost".into(),
+            },
+            Options {
+                datagrams: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // Keep this loss probe to a single Initial. A large PQ ClientHello
+        // could require paced extra packets that wake the old driver by chance.
+        {
+            let mut state = client.shared.state.lock().unwrap();
+            let ssl: &mut boring::ssl::SslRef = state.connection.as_mut().unwrap().as_mut();
+            ssl.set_curves_list("X25519").unwrap();
+        }
+        let server_cancel = CancellationToken::new();
+        let peer_cancel = server_cancel.clone();
+        let (dropped, observed_drop) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(async move {
+            let first = tokio::select! {
+                () = peer_cancel.cancelled() => return,
+                first = from_client.recv() => first,
+            };
+            let Some(mut first) = first.map(|packet: Bytes| packet.to_vec()) else {
+                return;
+            };
+            let initial = quiche::Header::from_slice(&mut first, 20)
+                .is_ok_and(|header| header.ty == quiche::Type::Initial);
+            // No input, app request or synthetic wake reaches the driver until
+            // its real native PTO produces another packet after this loss.
+            let _ = dropped.send(initial);
+            if initial {
+                peer(
+                    from_client,
+                    to_client,
+                    config,
+                    peer_cancel,
+                    0,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                )
+                .await;
+            }
+        });
+        let cancel = CancellationToken::new();
+        let mut task = tokio::spawn(driver.run(cancel.clone()));
+        let result = tokio::time::timeout(Duration::from_secs(4), async {
+            if !observed_drop
+                .await
+                .map_err(|_| "Initial drop was not witnessed")?
+            {
+                return Err("the dropped packet was not an Initial");
+            }
+            let (fresh_pto, first_flight) = {
+                let state = client.shared.state.lock().unwrap();
+                let connection = state.connection.as_ref().unwrap();
+                (connection.timeout(), connection.stats().sent)
+            };
+            let fresh_pto = fresh_pto.ok_or("native send did not arm its PTO")?;
+            if first_flight != 1 || fresh_pto > Duration::from_secs(2) {
+                return Err("the first lost Initial was not an isolated flight");
+            }
+            tokio::time::timeout(fresh_pto + Duration::from_millis(500), client.ready(true))
+                .await
+                .map_err(|_| "isolated Initial loss did not recover at the fresh PTO")?
+                .map_err(|_| "native H3 preparation failed after Initial loss")
+        })
+        .await;
+        // Retire and join both sides before asserting, including the RED path
+        // where the server has not received its first surviving Initial.
+        cancel.cancel();
+        let driver_join = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+        let driver_stopped = matches!(driver_join, Ok(Ok(Ok(()))));
+        if driver_join.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        server_cancel.cancel();
+        let server_join = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        let server_stopped = matches!(server_join, Ok(Ok(())));
+        if server_join.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        assert!(matches!(&result, Ok(Ok(()))), "{result:?}");
+        assert!(
+            driver_stopped,
+            "client driver failed to stop and join: {driver_join:?}"
+        );
+        assert!(
+            server_stopped,
+            "server failed to stop and join: {server_join:?}"
+        );
+        assert!(closed.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test]
