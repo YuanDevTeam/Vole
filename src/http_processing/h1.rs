@@ -59,9 +59,10 @@ impl HttpContext {
         if !recognized || prefix == b"CONNECT " {
             return Ok(Intercept::Transparent { prefix });
         }
+        // Allocate H1's larger streaming state only on the selected path;
+        // otherwise it also enlarges every TLS/H2 connection future.
         let mut replay = Replay::new(prefix, stream);
-        self.serve_h1(&mut replay, session, Scheme::Http, cancellation)
-            .await?;
+        Box::pin(self.serve_h1(&mut replay, session, Scheme::Http, cancellation)).await?;
         Ok(Intercept::Handled)
     }
 

@@ -216,7 +216,7 @@ mod enabled {
                     && prefix.first().is_some_and(u8::is_ascii_uppercase)
                 {
                     let mut replay = Replay::new(prefix, stream);
-                    self.serve_h1(&mut replay, session, Scheme::Http, cancellation)
+                    Box::pin(self.serve_h1(&mut replay, session, Scheme::Http, cancellation))
                         .await?;
                     return Ok(Intercept::Handled);
                 }
@@ -243,10 +243,11 @@ mod enabled {
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "business TLS handshake failed")
                 })?;
+                // Keep the unused H1 body/relay state out of an H2 session.
                 if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
                     self.serve_h2(&mut tls, session, cancellation.clone()).await
                 } else {
-                    self.serve_h1(&mut tls, session, Scheme::Https, cancellation.clone())
+                    Box::pin(self.serve_h1(&mut tls, session, Scheme::Https, cancellation.clone()))
                         .await
                 }
             };
