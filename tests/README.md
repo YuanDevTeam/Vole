@@ -179,7 +179,13 @@ HTTP 内容或来源上下文变更要求显式重连。失败恢复的策略组
 `invoke::foreground::tests::` 检查显式文件与路径、校验不初始化、不自动加载 HTTP 文件、
 MITM 关闭不读 CA、无 HTTP 配置的 CA 参数提前拒绝，以及启动期信号取消后 join 清理。
 Windows 平台另编译 `snapshot_identity_and_readback_include_the_http_addendum`，
-检查规则实际内容与私密材料的会话快照边界。
+`snapshot_preserves_valid_http_content_expanded_beyond_one_mibibyte` 和
+`snapshot_json_budget_counts_actual_escaping_before_allocation`，检查规则实际内容、
+独立展开预算、JSON 转义计数与私密材料的会话快照边界。
+无默认特性的纯内存回归选择
+`http_documents_without_adapter_are_rejected_before_resource_preparation`；
+`ca_identity_is_public_der_and_does_not_require_the_http_adapter` 检查公开证书身份不依赖 HTTP 适配器，
+启用 HTTP 后另选 `ca_identity_matches_runtime_authority_without_weakening_key_validation` 检查运行期密钥校验。
 
 HTTP/1 早响应与空正文 Upgrade 的定向内存回归：`inbound::http::server::early_final_memory_tests::`；不运行包含宿主 socket 的整个入站测试模块。
 上传完成后的响应等待、静默上限与首字节后绝对读头期限：`inbound::http::server::response_deadline_memory_tests::`；使用 paused Tokio clock 和内存 duplex。

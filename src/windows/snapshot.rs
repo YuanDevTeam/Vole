@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io::{Read as _, Write as _},
+    io::{self, Read as _, Write as _},
     os::windows::ffi::{OsStrExt as _, OsStringExt as _},
     os::windows::fs::{MetadataExt as _, OpenOptionsExt as _},
     path::{Path, PathBuf},
@@ -16,12 +16,26 @@ use windows::{
 
 use super::managed_processes::SessionBackend;
 use crate::config::MAX_CONFIG_BYTES;
-use crate::http_processing::{config::PolicyCandidate, private_context::CaMaterial};
+use crate::http_processing::{
+    config::{MAX_SNAPSHOT, PolicyCandidate},
+    private_context::CaMaterial,
+};
 
 pub(crate) const SESSION_DIRECTORY: &str = "vole/windows/sessions";
 const SESSION_TOKEN_PREFIX: &str = "vole-session-v2:";
 const SESSION_REVISION: u32 = 2;
-const MAX_SESSION_SNAPSHOT_BYTES: u64 = 1024 * 1024;
+const MAX_BASE_DIR_CODE_UNITS: usize = 32_768;
+// Backend validation limits paths to 8 KiB and arguments to 128 KiB in total.
+// Their worst-case JSON escaping, process fields and separators fit in 1 MiB.
+const MAX_BACKEND_SNAPSHOT_BYTES: usize = 1024 * 1024;
+// JSON strings expand by at most six bytes per UTF-8 source byte; each u16
+// path element uses at most five digits and a separator. The final 1 KiB
+// covers field names, revision, the public digest and container punctuation.
+// This is only a read ceiling: publication allocates the exact encoded size.
+const MAX_SESSION_SNAPSHOT_BYTES: usize = (MAX_CONFIG_BYTES + MAX_SNAPSHOT) * 6
+    + MAX_BASE_DIR_CODE_UNITS * 6
+    + MAX_BACKEND_SNAPSHOT_BYTES
+    + 1024;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 static STAGING_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -273,7 +287,7 @@ impl SessionReference {
 
     pub(crate) fn read(&self, local_folder: &Path, install_root: &Path) -> Result<SessionSnapshot> {
         let path = session_directory(local_folder, false)?.join(self.file_name());
-        let bytes = read_regular_file(&path, MAX_SESSION_SNAPSHOT_BYTES)?;
+        let bytes = read_regular_file(&path, MAX_SESSION_SNAPSHOT_BYTES as u64)?;
         if snapshot_digest(&bytes) != self.digest {
             return Err(Error::new(
                 E_FAIL,
@@ -360,23 +374,72 @@ impl SessionSnapshot {
     }
 
     fn to_canonical_json(&self) -> Result<Vec<u8>> {
-        let bytes = serde_json::to_vec(self).map_err(|_| invalid_snapshot())?;
-        if bytes.is_empty() || bytes.len() as u64 > MAX_SESSION_SNAPSHOT_BYTES {
+        validate_config_yaml(&self.config_yaml)?;
+        if let Some(http) = &self.http
+            && (http.rules.len() > MAX_SNAPSHOT
+                || http
+                    .base_dir
+                    .as_ref()
+                    .is_some_and(|path| path.len() > MAX_BASE_DIR_CODE_UNITS))
+        {
             return Err(invalid_snapshot());
         }
+        if let Some(backend) = &self.session_backend {
+            serialized_size(backend, MAX_BACKEND_SNAPSHOT_BYTES)?;
+        }
+        let size = serialized_size(self, MAX_SESSION_SNAPSHOT_BYTES)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| invalid_snapshot())?;
+        serde_json::to_writer(&mut bytes, self).map_err(|_| invalid_snapshot())?;
+        debug_assert_eq!(bytes.len(), size);
         Ok(bytes)
     }
 }
 
+fn serialized_size(value: &impl Serialize, maximum: usize) -> Result<usize> {
+    struct Counter {
+        size: usize,
+        maximum: usize,
+    }
+    impl io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.size = self
+                .size
+                .checked_add(bytes.len())
+                .filter(|size| *size <= self.maximum)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "session snapshot exceeds limit",
+                    )
+                })?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { size: 0, maximum };
+    serde_json::to_writer(&mut counter, value).map_err(|_| invalid_snapshot())?;
+    Ok(counter.size)
+}
+
 fn validate_http_snapshot(input: Option<&HttpSessionSnapshot>) -> Result<()> {
     if let Some(input) = input {
-        if input.rules.len() > crate::http_processing::MAX_ADDENDUM {
+        if input.rules.len() > MAX_SNAPSHOT {
             return Err(invalid_snapshot());
         }
         PolicyCandidate::import_snapshot(&input.rules).map_err(|_| invalid_snapshot())?;
         if let Some(wide) = &input.base_dir {
             let path = PathBuf::from(std::ffi::OsString::from_wide(wide));
-            if wide.is_empty() || wide.len() > 32_768 || wide.contains(&0) || !path.is_absolute() {
+            if wide.is_empty()
+                || wide.len() > MAX_BASE_DIR_CODE_UNITS
+                || wide.contains(&0)
+                || !path.is_absolute()
+            {
                 return Err(invalid_snapshot());
             }
         }
@@ -484,6 +547,56 @@ fn windows_error(error: impl std::fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_json_budget_counts_actual_escaping_before_allocation() {
+        let value = "\\\n\"\u{0000}é";
+        let expected = serde_json::to_vec(value).unwrap();
+        assert_eq!(
+            serialized_size(&value, expected.len()).unwrap(),
+            expected.len()
+        );
+        assert!(serialized_size(&value, expected.len() - 1).is_err());
+        let snapshot = SessionSnapshot {
+            revision: SESSION_REVISION,
+            config_yaml: "x".repeat(MAX_CONFIG_BYTES + 1),
+            http: None,
+            session_backend: None,
+        };
+        assert!(snapshot.to_canonical_json().is_err());
+    }
+
+    #[test]
+    fn snapshot_preserves_valid_http_content_expanded_beyond_one_mibibyte() {
+        let input = format!(
+            "rewrite:\n  enabled: true\n  rules:\n    - &rule {{url: '.', action: response-body-set, value: '{}'}}\n    - *rule\n    - *rule\n    - *rule\n    - *rule\n",
+            "x".repeat(256 * 1024)
+        );
+        assert!(input.len() < crate::http_processing::MAX_ADDENDUM);
+        let document = crate::http_processing::config::Document::parse(&input).unwrap();
+        let rules = document
+            .compile(&Default::default())
+            .unwrap()
+            .export_snapshot()
+            .unwrap();
+        assert!(rules.len() > 1024 * 1024);
+        let snapshot = SessionSnapshot {
+            revision: SESSION_REVISION,
+            config_yaml: "tun: {enable: true}".into(),
+            http: Some(HttpSessionSnapshot {
+                rules,
+                base_dir: None,
+                ca_identity: None,
+            }),
+            session_backend: None,
+        };
+        snapshot.validate(Path::new(".")).unwrap();
+        let encoded = snapshot.to_canonical_json().unwrap();
+        assert!(encoded.len() > 1024 * 1024);
+        let restored: SessionSnapshot = serde_json::from_slice(&encoded).unwrap();
+        restored.validate(Path::new(".")).unwrap();
+        assert_eq!(restored.to_canonical_json().unwrap(), encoded);
+    }
 
     fn install_root() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();

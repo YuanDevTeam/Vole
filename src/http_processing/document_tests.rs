@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(feature = "inbound-http")]
 #[test]
 fn http_document_is_static_strict_and_keeps_disabled_sources_unprepared() {
     let document = Document::parse("rewrite-providers: {missing: {type: file, path: missing.yaml}}\nrewrite: {enabled: true, rules: [{rule-set: missing}]}\n").unwrap();
@@ -17,6 +18,7 @@ fn http_document_is_static_strict_and_keeps_disabled_sources_unprepared() {
         assert!(Document::parse(bad).is_err(), "accepted {bad}");
     }
 }
+#[cfg(feature = "inbound-http")]
 #[test]
 fn inline_http_resources_expand_at_reference_position_and_roundtrip_actual_content() {
     let doc = Document::parse("rewrite-providers:\n  inside:\n    type: inline\n    payload: [{url: '/old/', action: replace, replacement: '/new/'}]\nrewrite:\n  enabled: true\n  rules:\n    - {rule-set: inside}\n    - {url: '.', action: reject}\n").unwrap();
@@ -39,6 +41,30 @@ fn inline_http_resources_expand_at_reference_position_and_roundtrip_actual_conte
             .unwrap(),
         Action::Reject
     ));
+}
+
+#[cfg(not(feature = "inbound-http"))]
+#[test]
+fn http_documents_without_adapter_are_rejected_before_resource_preparation() {
+    for input in [
+        "{}",
+        "rewrite: {enabled: true, rules: [{url: '.', action: reject}]}",
+        "rewrite-providers: {missing: {type: file, path: missing.yaml}}\nrewrite: {rules: [{rule-set: missing}]}",
+    ] {
+        let error = Document::parse(input)
+            .err()
+            .expect("HTTP input was accepted");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+    // Even an internal DTO that bypasses parsing cannot become a runtime policy.
+    let document: Document = serde_yaml_ng::from_str("{}").unwrap();
+    let candidate = Arc::new(document).compile(&BTreeMap::new()).unwrap();
+    assert_eq!(
+        candidate.bind_ca(None).err().unwrap().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert!(Policy::compile_optional(None).unwrap().is_none());
+    assert!(Policy::compile_optional(Some("")).unwrap().is_none());
 }
 #[test]
 fn external_http_payload_is_mandatory_and_never_carries_local_authority() {

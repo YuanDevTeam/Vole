@@ -52,6 +52,8 @@ file 在显式准备时读取；http 的 interval 默认 86400 秒，0 只关闭
 
 当前工程上限为主文档与实际外部内容合计 1 MiB、展开规则 64 条、选择器／搜索各 2 KiB、非正文规则文本合计 64 KiB、单个 URL 结果 8 KiB。正则编译与 DFA 缓存分别限 128／64 KiB；YAML 别名、模板输出及并行准备也受限。超限失败，不截断规则；这些准入上限不代表进程 RSS。
 
+HTTP 处理需要编译启用 `inbound-http`。缺少该能力时，非空 HTTP 配置在静态校验时拒绝，不读取 provider 或私密 CA；省略或空输入仍表示不启用。
+
 ## URL 阶段
 
 规则共有必填 `url`、`action`，可选 `match`、`enabled` 和展示用 `name`。`match` 为 regex（默认）、exact 或 prefix，不根据文本猜测。URL 动作为 replace、redirect302、redirect307、reject；前三者必须有 replacement，reject 不接受替换参数。

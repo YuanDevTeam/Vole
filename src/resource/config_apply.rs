@@ -11,6 +11,20 @@ pub(crate) struct ConfigApplyHandle {
     cancel: CancellationToken,
 }
 pub(crate) enum ConfigUpdate {
+    #[cfg(any(
+        feature = "outbound-http",
+        feature = "outbound-anytls",
+        feature = "outbound-socks5",
+        feature = "outbound-shadowsocks",
+        feature = "outbound-vless",
+        feature = "outbound-trojan",
+        feature = "outbound-trusttunnel",
+        feature = "outbound-masque",
+        feature = "outbound-vmess",
+        feature = "outbound-hysteria2",
+        feature = "outbound-tuic",
+        feature = "outbound-wireguard"
+    ))]
     RecoverySnapshot(mpsc::SyncSender<Box<crate::runtime::RecoverySnapshot>>),
     Replace(String),
     ReplaceWithHttp {
@@ -92,6 +106,22 @@ struct Completion {
     synchronous: Option<mpsc::SyncSender<Result<(), ApplyError>>>,
 }
 impl ConfigApplyHandle {
+    // config_apply already requires invoke or test; the outbound condition
+    // completes the same gate used by the runtime module in lib.rs.
+    #[cfg(any(
+        feature = "outbound-http",
+        feature = "outbound-anytls",
+        feature = "outbound-socks5",
+        feature = "outbound-shadowsocks",
+        feature = "outbound-vless",
+        feature = "outbound-trojan",
+        feature = "outbound-trusttunnel",
+        feature = "outbound-masque",
+        feature = "outbound-vmess",
+        feature = "outbound-hysteria2",
+        feature = "outbound-tuic",
+        feature = "outbound-wireguard"
+    ))]
     pub(crate) fn recovery_snapshot(
         &self,
     ) -> Result<Box<crate::runtime::RecoverySnapshot>, ApplyError> {

@@ -19,6 +19,7 @@ pub(crate) const MAX_ADDENDUM: usize = 1024 * 1024;
 #[cfg(any(test, all(windows, feature = "windows-uwp")))]
 pub(crate) const MAX_SNAPSHOT: usize = MAX_ADDENDUM * 8;
 pub(super) use rules::MAX_URL;
+#[cfg(feature = "inbound-http")]
 pub(super) use rules::checked_url;
 
 pub(super) fn invalid() -> io::Error {
@@ -26,6 +27,16 @@ pub(super) fn invalid() -> io::Error {
         io::ErrorKind::InvalidInput,
         "invalid HTTP processing configuration",
     )
+}
+
+pub(super) fn require_http_adapter() -> io::Result<()> {
+    if !cfg!(feature = "inbound-http") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "HTTP processing is not compiled in",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -72,12 +83,11 @@ impl PolicyCandidate {
         self: &Arc<Self>,
         material: Option<&CaMaterial>,
     ) -> io::Result<Arc<Policy>> {
+        require_http_adapter()?;
         #[cfg(feature = "inbound-http")]
         let mitm = super::mitm::Mitm::compile(self.document.mitm.clone(), material)?;
         #[cfg(not(feature = "inbound-http"))]
-        if self.document.mitm.enabled || material.is_some() {
-            return Err(invalid());
-        }
+        let _ = material;
         let mut hash = Sha256::new();
         hash.update(self.identity);
         #[cfg(feature = "inbound-http")]

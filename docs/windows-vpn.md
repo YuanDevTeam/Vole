@@ -373,4 +373,6 @@ Stopped { version, packetCounters }
 
 `startVpn` 可选 `httpConfigYaml` 和 `httpContext` 接收[独立 HTTP 规则](http-processing.md)与 baseDir／私密 CA。断开状态可准备来源；活动前台不使用默认 socket 获取资源。canonical Session Snapshot 固定主设置、实际 payload、原生基目录和公开 CA 指纹，参与 token；私钥仅在当前用户 DPAPI sidecar 中，entropy 绑定 package family 与 token，先发布 sidecar 再发布普通快照。随机密文不参与 token。
 
-Session Host 完成 token 握手后才读取并解密 sidecar，复验 token、CA 身份和证私匹配；恢复实际规则不重读源文件。运行中的周期更新使用原 PhysicalBinding 的直接出口，只产生 pending；Stop 等待更新结束。私密 sidecar 随当前／上一份快照保留并同步清理，不进入普通缓存、Controller、日志或包通道。既有快照与 bridge 总体字节预算继续生效；编译不代替实际 Windows DPAPI／VPN 验证。
+Session Host 完成 token 握手后才读取并解密 sidecar，复验 token、CA 身份和证私匹配；恢复实际规则不重读源文件。运行中的周期更新使用原 PhysicalBinding 的直接出口，只产生 pending；Stop 等待更新结束。私密 sidecar 随当前／上一份快照保留并同步清理，不进入普通缓存、Controller、日志或包通道。
+
+主配置保持 8 MiB 上限，独立 HTTP 输入与实际来源合计保持 1 MiB；内部展开 HTTP 快照最多 8 MiB。普通 Session Snapshot 在写出前精确计算 JSON 转义后的大小，只预留实际所需字节；读取上限同时计入这两份内容、原生基目录和有界 backend 元数据。bridge 请求仍最多 1 MiB。公开 CA 身份使用证书 DER 的 SHA-256，不依赖 PEM 排版；真正使用 CA 时仍验证有效期、CA 约束和证私匹配。编译不代替实际 Windows DPAPI／VPN 验证。

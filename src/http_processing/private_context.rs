@@ -38,14 +38,24 @@ fn invalid() -> io::Error {
 }
 
 impl CaMaterial {
-    #[cfg(all(
-        feature = "inbound-http",
-        any(test, all(target_os = "windows", feature = "windows-uwp"))
-    ))]
+    #[cfg(any(test, all(target_os = "windows", feature = "windows-uwp")))]
     pub(crate) fn identity(&self) -> io::Result<[u8; 32]> {
+        use rustls::pki_types::{CertificateDer, pem::PemObject as _};
+        use sha2::{Digest as _, Sha256};
+
         self.validate_size()?;
-        super::authority::Authority::load(&self.certificate, &self.private_key)
-            .map(|authority| authority.identity())
+        // A snapshot identity names the public certificate, independently of
+        // its PEM spelling or the HTTP adapter. Runtime binding still checks
+        // certificate validity, CA constraints and the matching private key.
+        let mut certificates = CertificateDer::pem_slice_iter(self.certificate.as_bytes());
+        let certificate = certificates
+            .next()
+            .ok_or_else(invalid)?
+            .map_err(|_| invalid())?;
+        if certificate.as_ref().is_empty() || certificates.next().is_some() {
+            return Err(invalid());
+        }
+        Ok(Sha256::digest(certificate.as_ref()).into())
     }
 
     pub(crate) fn validate_size(&self) -> io::Result<()> {
@@ -131,6 +141,43 @@ pub(crate) fn test_material() -> CaMaterial {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ca_identity_is_public_der_and_does_not_require_the_http_adapter() {
+        use sha2::{Digest as _, Sha256};
+
+        let mut material = CaMaterial {
+            certificate: "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n".into(),
+            private_key: Zeroizing::new("private material".into()),
+        };
+        assert_eq!(
+            material.identity().unwrap(),
+            <[u8; 32]>::from(Sha256::digest([1, 2, 3]))
+        );
+        let identity = material.identity().unwrap();
+        material.certificate = material.certificate.replace('\n', "\r\n");
+        material.private_key = Zeroizing::new("different private material".into());
+        assert_eq!(material.identity().unwrap(), identity);
+        material.certificate.push_str(&material.certificate.clone());
+        assert!(material.identity().is_err());
+    }
+
+    #[cfg(feature = "inbound-http")]
+    #[test]
+    fn ca_identity_matches_runtime_authority_without_weakening_key_validation() {
+        let mut material = test_material();
+        let authority =
+            super::super::authority::Authority::load(&material.certificate, &material.private_key)
+                .unwrap();
+        let identity = material.identity().unwrap();
+        assert_eq!(identity, authority.identity());
+        material.private_key = Zeroizing::new("not a private key".into());
+        assert_eq!(identity, material.identity().unwrap());
+        assert!(
+            super::super::authority::Authority::load(&material.certificate, &material.private_key)
+                .is_err()
+        );
+    }
 
     #[test]
     fn private_ca_input_is_strict_bounded_and_redacted() {
