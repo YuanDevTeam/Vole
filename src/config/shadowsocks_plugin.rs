@@ -286,6 +286,7 @@ mod tests {
                 assert_eq!(tls.required_alpn.as_deref(), Some(b"http/1.1".as_slice()));
             }
             if let Some(ShadowsocksPlugin::Kcptun(config)) = &ss.plugin {
+                assert_eq!(config.smux_version, 2);
                 let _ = crate::transport::kcptun::Owner::new(config.clone()).unwrap();
             }
             let debug = format!("{config:?}");
@@ -310,6 +311,7 @@ mod tests {
                 json!({"host":"cover.invalid","username":"synthetic-user","password":"synthetic-password","certificate":"unused"}),
             ),
             ("kcptun", json!({"conn":255})),
+            ("kcptun", json!({"smuxver":1})),
             ("kcptun", json!({"smuxver":3})),
             ("kcptun", json!({"mtu":65535})),
             ("kcptun", json!({"smuxbuf":1,"streambuf":2})),

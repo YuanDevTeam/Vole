@@ -38,6 +38,9 @@ impl std::fmt::Debug for KcptunConfig {
 }
 impl KcptunConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.smux_version != 2 {
+            return invalid("kcptun requires smux version 2");
+        }
         if self.key.len() > 65535
             || !(1..=8).contains(&self.connections)
             || !(512..=1500).contains(&self.mtu)
@@ -48,7 +51,6 @@ impl KcptunConfig {
             || self.dscp > 63
             || !(10..=5000).contains(&self.interval)
             || self.resend > 32
-            || !(1..=2).contains(&self.smux_version)
             || self.socket_buffer > 16 * 1024 * 1024
             || self.smux_buffer == 0
             || self.smux_buffer > 8 * 1024 * 1024
@@ -201,7 +203,7 @@ pub(super) fn normalize(value: Value) -> Result<KcptunConfig> {
         resend,
         no_congestion: nc,
         socket_buffer: default_usize(raw.sockbuf, 4 * 1024 * 1024),
-        smux_version: if raw.smuxver == 0 { 1 } else { raw.smuxver },
+        smux_version: if raw.smuxver == 0 { 2 } else { raw.smuxver },
         smux_buffer: default_usize(raw.smuxbuf, 4 * 1024 * 1024),
         frame_size: default_usize(raw.framesize, 8192),
         stream_buffer: default_usize(raw.streambuf, 2 * 1024 * 1024),

@@ -554,7 +554,8 @@ TCP 使用官方 `CryptoStream` 的加解密与记录分帧，Vole 构造目标�
   不附加 sing-mux 的目标与响应头；它们的关闭结束整个下层会话。
 - `plugin: jls`：`host/username/password/alpn`；ALPN 缺省 h2、http/1.1，显式空列表保持为空。
   节点 `client-fingerprint` 作用于 JLS 握手；不增加标准证书策略或客户端证书字段。
-- `plugin: kcptun`：可靠 UDP + 可选 FEC/Snappy + smux；`udp-over-tcp` 自动启用并固定为 v2。
+- `plugin: kcptun`：可靠 UDP + 可选 FEC/Snappy + smux v2；`smuxver` 缺省或 0 均使用 2，其他值仅接受 2，服务端须配置相同版本。
+  `udp-over-tcp` 自动启用并固定为 v2。
   `udp: true` 控制业务 UDP；TCP 仍可单独使用这个载体。字段包括 `key/crypt/mode/conn/autoexpire/`
   `scavengettl/mtu/ratelimit/sndwnd/rcvwnd/datashard/parityshard/dscp/nocomp/acknodelay/nodelay/`
   `interval/resend/nc/sockbuf/smuxver/smuxbuf/framesize/streambuf/keepalive`。
