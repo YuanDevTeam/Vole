@@ -28,7 +28,7 @@ The default build enables the protocols below. UDP support depends on the protoc
 | [VLESS](docs/vless.md) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP first-packet camouflage, legacy H2, [XHTTP H1/H2/H3](docs/xhttp.md); Vision, Encryption, REALITY, JLS and ECH in supported combinations |
 | [VMess AEAD](docs/outbounds.md#vmess-aead) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP first-packet camouflage, legacy H2 and mKCP; TCP/UDP, plaintext or supported TLS modes |
 | [Trojan](docs/outbounds.md#trojan) | TCP/UDP over TLS TCP, WebSocket / HTTPUpgrade or gRPC |
-| [Shadowsocks 2022](docs/outbounds.md#shadowsocks-2022) | TCP/UDP; three 2022 ciphers and AES identity chains; optional obfs, WebSocket, JLS, kcptun or strict ShadowTLS v3 plugins; UoT v2 |
+| [Shadowsocks 2022](docs/outbounds.md#shadowsocks-2022) | TCP/UDP; three 2022 ciphers and AES identity chains; optional obfs, WebSocket, JLS or strict ShadowTLS v3 plugins; UoT v2 |
 | [AnyTLS](docs/outbounds.md#anytls) | TLS sessions and UDP over TCP v2 |
 | [HTTP / HTTPS CONNECT](docs/outbounds.md#http--https-connect) | TCP CONNECT, optional proxy authentication and TLS |
 | [SOCKS5](docs/outbounds.md#socks5) | CONNECT and UDP ASSOCIATE, with optional username/password authentication |

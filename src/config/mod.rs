@@ -91,10 +91,8 @@ mod jls;
 pub use jls::JlsConfig;
 mod tls_trust;
 pub use tls_trust::TlsTrustConfig;
-mod kcptun;
 mod shadowsocks;
 mod shadowsocks_plugin;
-pub use kcptun::KcptunConfig;
 pub use shadowsocks::{ShadowTlsConfig, ShadowsocksCipher, ShadowsocksOutboundConfig};
 pub use shadowsocks_plugin::ShadowsocksPlugin;
 mod trojan;
@@ -3043,19 +3041,16 @@ impl RawOutbound {
                 let mut config = shadowsocks::normalize(server, port, cipher, password)?;
                 config.plugin =
                     shadowsocks_plugin::normalize(plugin, plugin_opts, client_fingerprint, port)?;
-                let requires_uot = matches!(config.plugin, Some(ShadowsocksPlugin::Kcptun(_)));
                 if udp_over_tcp && !cfg!(feature = "outbound-shadowsocks") {
                     return invalid("Shadowsocks UoT support is not enabled in this build");
                 }
                 if udp_over_tcp && !udp {
                     return invalid("Shadowsocks udp-over-tcp requires udp: true");
                 }
-                if udp_over_tcp_version
-                    .is_some_and(|version| !(udp_over_tcp || requires_uot) || version != 2)
-                {
+                if udp_over_tcp_version.is_some_and(|version| !udp_over_tcp || version != 2) {
                     return invalid("Shadowsocks udp-over-tcp-version requires enabled UoT v2");
                 }
-                config.udp_over_tcp = udp_over_tcp || requires_uot;
+                config.udp_over_tcp = udp_over_tcp;
                 (name, dialer_proxy, udp, ProxyProtocol::Shadowsocks(config))
             }
             RawProtocol::Vless(raw) => raw.normalize()?,

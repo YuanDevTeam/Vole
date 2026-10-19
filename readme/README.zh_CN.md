@@ -28,7 +28,7 @@ Vole 是用于 VPN 客户端和本地代理的 Rust 代理内核，提供原生�
 | [VLESS](../docs/vless.md) | TCP、WebSocket / HTTPUpgrade、gRPC、HTTP 首包伪装、传统 H2、[XHTTP H1/H2/H3](../docs/xhttp.md)；在支持的组合中提供 Vision、Encryption、REALITY、JLS、ECH 和 sing-mux |
 | [VMess AEAD](../docs/outbounds.md#vmess-aead) | TCP、WebSocket / HTTPUpgrade、gRPC、HTTP 首包伪装、传统 H2 和 mKCP；TCP/UDP，明文或支持的 TLS 模式 |
 | [Trojan](../docs/outbounds.md#trojan) | 通过 TLS TCP、WebSocket / HTTPUpgrade 或 gRPC 传输 TCP/UDP |
-| [Shadowsocks 2022](../docs/outbounds.md#shadowsocks-2022) | TCP/UDP；三种 2022 算法与 AES 身份链；可选 obfs、WebSocket、JLS、kcptun 或 strict ShadowTLS v3 插件；UoT v2 |
+| [Shadowsocks 2022](../docs/outbounds.md#shadowsocks-2022) | TCP/UDP；三种 2022 算法与 AES 身份链；可选 obfs、WebSocket、JLS 或 strict ShadowTLS v3 插件；UoT v2 |
 | [AnyTLS](../docs/outbounds.md#anytls) | TLS 会话与 UDP over TCP v2 |
 | [HTTP / HTTPS CONNECT](../docs/outbounds.md#http--https-connect) | TCP CONNECT、可选代理认证与 TLS |
 | [SOCKS5](../docs/outbounds.md#socks5) | CONNECT 和 UDP ASSOCIATE，可选用户名/密码认证 |

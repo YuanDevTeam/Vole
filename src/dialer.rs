@@ -46,8 +46,6 @@ pub type PhysicalDatagram = ObservedIo<UdpSocket>;
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct UdpSocketOptions {
     pub receive_buffer: Option<usize>,
-    pub send_buffer: Option<usize>,
-    pub dscp: Option<u8>,
 }
 
 const MAX_RESOLVED_ADDRESSES: usize = 8;
@@ -870,7 +868,6 @@ impl Dialer {
             destination,
             UdpSocketOptions {
                 receive_buffer: receive_buffer_size,
-                ..Default::default()
             },
         )
         .await
@@ -910,46 +907,6 @@ impl Dialer {
                     .filter(|&size| size > 0 && size <= i32::MAX as usize)
                 {
                     let _ = socket.set_recv_buffer_size(size);
-                }
-                if let Some(size) = options
-                    .send_buffer
-                    .filter(|&size| size > 0 && size <= i32::MAX as usize)
-                {
-                    let _ = socket.set_send_buffer_size(size);
-                }
-                if let Some(dscp) = options.dscp {
-                    if dscp > 63 {
-                        return Err(io::ErrorKind::InvalidInput.into());
-                    }
-                    if ipv6 {
-                        #[cfg(any(target_os = "ios", target_os = "tvos"))]
-                        {
-                            let class = libc::c_int::from(dscp) << 2;
-                            // SAFETY: Darwin expects a live c_int for IPV6_TCLASS;
-                            // this initialized socket remains owned by this scope.
-                            let status = unsafe {
-                                libc::setsockopt(
-                                    socket.as_raw_fd(),
-                                    libc::IPPROTO_IPV6,
-                                    libc::IPV6_TCLASS,
-                                    (&raw const class).cast(),
-                                    std::mem::size_of_val(&class) as libc::socklen_t,
-                                )
-                            };
-                            if status < 0 {
-                                return Err(io::Error::last_os_error());
-                            }
-                        }
-                        #[cfg(all(unix, not(any(target_os = "ios", target_os = "tvos"))))]
-                        socket.set_tclass_v6(u32::from(dscp) << 2)?;
-                        #[cfg(not(unix))]
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "IPv6 UDP traffic class is unavailable",
-                        ));
-                    } else {
-                        socket.set_tos_v4(u32::from(dscp) << 2)?;
-                    }
                 }
                 socket.set_nonblocking(true)?;
                 check()?;

@@ -22,7 +22,6 @@ enum Kind {
         gost: bool,
         mux: bool,
     },
-    Kcptun(transport::kcptun::Owner),
 }
 pub(super) struct Owner {
     kind: Kind,
@@ -81,9 +80,6 @@ impl Owner {
                 gost: *gost,
                 mux: *mux,
             },
-            ShadowsocksPlugin::Kcptun(config) => {
-                Kind::Kcptun(transport::kcptun::Owner::new(config.clone())?)
-            }
         };
         Ok(Self {
             kind,
@@ -99,9 +95,6 @@ impl Owner {
         session: StreamSession,
         context: &EstablishContext,
     ) -> Result<BoxStream, DispatchError> {
-        if let Kind::Kcptun(owner) = &self.kind {
-            return owner.open(upstream, server, &session, context).await;
-        }
         tokio::select! {biased;
             ()=self.cancel.cancelled()=>Err(DispatchError::NotAllowed),
             result=async {
@@ -128,7 +121,6 @@ impl Owner {
                         guard.disarm();
                         Ok(Box::new(OwnedStream::new(raw,cancel))as BoxStream)
                     }
-                    Kind::Kcptun(_)=>unreachable!(),
                 }
             }=>result,
         }
@@ -138,15 +130,9 @@ impl Owner {
         let mut closed = self.closed.lock().unwrap();
         *closed = true;
         self.tasks.close();
-        if let Kind::Kcptun(owner) = &self.kind {
-            owner.begin_shutdown();
-        }
     }
     pub(super) async fn shutdown(&self) {
         self.begin_shutdown();
-        if let Kind::Kcptun(owner) = &self.kind {
-            owner.shutdown().await;
-        }
         self.tasks.wait().await;
     }
 }

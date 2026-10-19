@@ -404,8 +404,6 @@ pub struct DatagramRequest {
     pub session: DatagramSession,
     budget: crate::dispatch::DatagramBudget,
     udp_receive_buffer_size: Option<usize>,
-    udp_send_buffer_size: Option<usize>,
-    udp_dscp: Option<u8>,
 }
 
 impl DatagramRequest {
@@ -416,8 +414,6 @@ impl DatagramRequest {
             session,
             budget: crate::dispatch::DatagramBudget::new(u16::MAX, max_response_payload_size),
             udp_receive_buffer_size: None,
-            udp_send_buffer_size: None,
-            udp_dscp: None,
         }
     }
 
@@ -432,8 +428,6 @@ impl DatagramRequest {
             session: self.session.clone(),
             budget: crate::dispatch::DatagramBudget::new(self.budget.transmit(), maximum),
             udp_receive_buffer_size: self.udp_receive_buffer_size,
-            udp_send_buffer_size: self.udp_send_buffer_size,
-            udp_dscp: self.udp_dscp,
         }
     }
 
@@ -447,8 +441,6 @@ impl DatagramRequest {
             session: self.session.clone(),
             budget,
             udp_receive_buffer_size: self.udp_receive_buffer_size,
-            udp_send_buffer_size: self.udp_send_buffer_size,
-            udp_dscp: self.udp_dscp,
         }
     }
 
@@ -461,18 +453,9 @@ impl DatagramRequest {
         request
     }
 
-    #[cfg(feature = "outbound-shadowsocks")]
-    pub(crate) fn with_kcptun_socket(mut self, buffer: usize, dscp: u8) -> Self {
-        self.udp_receive_buffer_size = Some(buffer);
-        self.udp_send_buffer_size = Some(buffer);
-        self.udp_dscp = (dscp > 0).then_some(dscp);
-        self
-    }
     pub(crate) fn udp_socket_options(&self) -> crate::dialer::UdpSocketOptions {
         crate::dialer::UdpSocketOptions {
             receive_buffer: self.udp_receive_buffer_size,
-            send_buffer: self.udp_send_buffer_size,
-            dscp: self.udp_dscp,
         }
     }
     /// Budget the wire envelope independently in each direction. A larger

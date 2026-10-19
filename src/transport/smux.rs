@@ -102,9 +102,6 @@ pub(crate) struct Client {
     write: mpsc::Sender<Frame>,
 }
 impl Client {
-    pub(crate) fn is_closed(&self) -> bool {
-        self.shared.state.lock().unwrap().closed
-    }
     pub(crate) async fn open(&self) -> io::Result<BoxStream> {
         let permit = self
             .write

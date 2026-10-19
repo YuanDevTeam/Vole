@@ -670,9 +670,6 @@ proxies:
     # TLS开启后才接受plugin-opts内的skip-cert-verify/name-cert-verify/fingerprint、
     # 配对certificate/private-key与ech-opts；Host头同时确定SNI。
     # jls: {host: cover.invalid, username: jls-user, password: jls-password, alpn: [h2, http/1.1]}
-    # kcptun: {key: transport-key, crypt: aes, mode: fast, smuxver: 2}；smux仅v2，自动使用UoT v2。
-    # kcptun另消费conn/autoexpire/scavengettl/mtu/ratelimit/sndwnd/rcvwnd/datashard/parityshard/
-    # dscp/nocomp/acknodelay/nodelay/interval/resend/nc/sockbuf/smuxbuf/framesize/streambuf/keepalive。
     # ShadowTLS仅显式v3，使用完整TLS1.3认证。
     # UoT 默认关闭。开启须 udp: true，UDP 经 SS TCP（含可选插件），不回退原生 UDP。
     # udp-over-tcp: true

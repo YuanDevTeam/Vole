@@ -139,8 +139,8 @@ cargo test --locked --lib security::client_identity_tests::
 
 
 SS2022 流式插件的纯内存过滤器：`config::shadowsocks_plugin::tests::`、
-`transport::ss_framed::tests::`、`transport::smux::`、`transport::kcptun::`。
-它们使用内存流或内存数据报，不启动网络对端；真实TUN互通与压力仍由外部夹具单独验收。
+`transport::ss_framed::tests::`、`transport::smux::`。
+它们使用内存流，不启动网络对端；真实TUN互通与压力仍由外部夹具单独验收。
 
 VMess mKCP 的纯内存回归使用 `--lib mkcp_`，覆盖配置/线协议向量、seed/header、
 丢包乱序、发送预取背压、接收信用与已确认数据保留、读取消、ACK/flush和Stop；不创建 socket。

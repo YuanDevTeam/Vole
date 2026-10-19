@@ -28,7 +28,7 @@ Vole — прокси-ядро на Rust для VPN-клиентов и лока
 | [VLESS](../docs/vless.md) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP-маскировка первого пакета, legacy H2, [XHTTP H1/H2/H3](../docs/xhttp.md); Vision, Encryption, REALITY, JLS, ECH и sing-mux в поддерживаемых сочетаниях |
 | [VMess AEAD](../docs/outbounds.md#vmess-aead) | TCP, WebSocket / HTTPUpgrade, gRPC, HTTP-маскировка первого пакета, legacy H2 и mKCP; TCP/UDP, транспорт без TLS или с поддерживаемыми режимами TLS |
 | [Trojan](../docs/outbounds.md#trojan) | TCP/UDP через TLS TCP, WebSocket / HTTPUpgrade или gRPC |
-| [Shadowsocks 2022](../docs/outbounds.md#shadowsocks-2022) | TCP/UDP; три алгоритма 2022 и цепочки идентификации AES; плагины obfs, WebSocket, JLS, kcptun или strict ShadowTLS v3; UoT v2 |
+| [Shadowsocks 2022](../docs/outbounds.md#shadowsocks-2022) | TCP/UDP; три алгоритма 2022 и цепочки идентификации AES; плагины obfs, WebSocket, JLS или strict ShadowTLS v3; UoT v2 |
 | [AnyTLS](../docs/outbounds.md#anytls) | TLS-сессии и UDP over TCP v2 |
 | [HTTP / HTTPS CONNECT](../docs/outbounds.md#http--https-connect) | TCP CONNECT, опциональная аутентификация прокси и TLS |
 | [SOCKS5](../docs/outbounds.md#socks5) | CONNECT и UDP ASSOCIATE, с опциональной аутентификацией по имени пользователя и паролю |

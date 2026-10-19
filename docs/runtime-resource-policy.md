@@ -360,9 +360,6 @@ TCP/ICMP ingress Full 记录 `packet_queue_drops`。这些计数
 Controller 与 Invoke 共用每实例一个候选许可，在完整请求 body／JSON 分配前准入；队列仅一项。候选复用 provider 代际 worker，所有已启动阻塞解析、图准备、路径准备与 GeoData 注册操作均由该 worker join。失败不发布新图，不覆盖活动 provider body／metadata；完成图验证后可以创建受 dataDir 约束的缓存目录。配置替换原子发布模板、图、DNS、组和可用资源快照，退休代际由活动业务持有。此局部准入不限制正常业务连接数，也不将 YAML 上限描述为整进程 RSS 限制。
 
 
-SS2022 插件复用受控 TCP/UDP、原有 TLS 预算和 Stop 所有者。obfs/V2Ray mux 每次最多保留
+SS2022 插件复用受控 TCP、原有 TLS 预算和 Stop 所有者。obfs/V2Ray mux 每次最多保留
 一个 16 KiB 输出帧；HTTP 头最大16 KiB，mux元数据最大512字节。裸smux的物理命令队列和
-配置限定的聚合接收字节数均有界；v2消费对端窗口更新并在应用读取后发送UPD。
-kcptun最多8个活动池槽位和16个退休会话，退休会话到期主动取消；KCP发送队列128包、
-每连接收发窗口各受512 KiB内部上限约束，FEC最多4组缓存，Snappy块最大64 KiB。
-这些是内存边界，不能通过配置扩大到无界；物理拥塞可丢弃待重传包，Stop取消并等待全部驱动与定时器。
+聚合接收字节数均有界；取消/Stop等待全部自有驱动结束。

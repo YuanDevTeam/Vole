@@ -554,19 +554,6 @@ TCP 使用官方 `CryptoStream` 的加解密与记录分帧，Vole 构造目标�
   不附加 sing-mux 的目标与响应头；它们的关闭结束整个下层会话。
 - `plugin: jls`：`host/username/password/alpn`；ALPN 缺省 h2、http/1.1，显式空列表保持为空。
   节点 `client-fingerprint` 作用于 JLS 握手；不增加标准证书策略或客户端证书字段。
-- `plugin: kcptun`：可靠 UDP + 可选 FEC/Snappy + smux v2；`smuxver` 缺省或 0 均使用 2，其他值仅接受 2，服务端须配置相同版本。
-  单流发送窗口耗尽时等待对端更新，不占公共发送队列名额；关闭解除等待。
-  `udp-over-tcp` 自动启用并固定为 v2。
-  `udp: true` 控制业务 UDP；TCP 仍可单独使用这个载体。字段包括 `key/crypt/mode/conn/autoexpire/`
-  `scavengettl/mtu/ratelimit/sndwnd/rcvwnd/datashard/parityshard/dscp/nocomp/acknodelay/nodelay/`
-  `interval/resend/nc/sockbuf/smuxver/smuxbuf/framesize/streambuf/keepalive`。
-  支持 normal、fast、fast2、fast3；manual 消费 nodelay/interval/resend/nc。
-  crypt 支持 aes、aes-128、aes-192、aes-128-gcm、tea、xtea、xor、none、null、
-  blowfish、twofish、cast5、3des、salsa20。加密密码使用 kcptun 的 PBKDF2-SHA1 派生，
-  不能替代内层 SS2022 的 PSK。FEC 的任一 shard 设为 -1 时关闭；0 使用 10/3 默认值。
-  连接池轮流选择声明的槽位；autoexpire 不为 0 时替换到期连接，旧连接最迟在 scavengettl 后关闭。
-  ratelimit 单位 bytes/s，0 不限速。sockbuf 为本地物理 UDP 的双向 OS 缓冲建议；
-  DSCP 沿同一物理出口设置，平台不提供所请求的设置时失败。
 
 `client-fingerprint` 仅 ShadowTLS/JLS 插件消费，其余插件不接受该字段。
 插件参数只接受对应模式的字段；队列、窗口、连接池和配置范围均有界，取消/Stop 不等待远端回包。

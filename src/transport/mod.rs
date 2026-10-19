@@ -1,6 +1,4 @@
 //! Outbound wire transports.
-#[cfg(feature = "outbound-shadowsocks")]
-pub(crate) mod kcptun;
 #[cfg(any(feature = "sing-mux", feature = "outbound-shadowsocks"))]
 pub(crate) mod smux;
 #[cfg(feature = "outbound-shadowsocks")]

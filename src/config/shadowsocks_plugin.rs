@@ -18,7 +18,6 @@ pub enum ShadowsocksPlugin {
         transport: StreamTransport,
         tls: Option<TlsConfig>,
     },
-    Kcptun(KcptunConfig),
 }
 impl std::fmt::Debug for ShadowsocksPlugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -27,7 +26,6 @@ impl std::fmt::Debug for ShadowsocksPlugin {
             Self::Jls(_) => "Jls",
             Self::Obfs { .. } => "Obfs",
             Self::WebSocket { .. } => "WebSocket",
-            Self::Kcptun(_) => "Kcptun",
         })
     }
 }
@@ -42,7 +40,6 @@ impl ShadowsocksPlugin {
                 ..
             } => Ok(()),
             Self::WebSocket { .. } => invalid("invalid Shadowsocks WebSocket transport"),
-            Self::Kcptun(options) => options.validate(),
         }
     }
     pub(crate) fn tls_sessions(&self) -> usize {
@@ -233,7 +230,6 @@ pub(super) fn normalize(
                 tls,
             }
         }
-        "kcptun" => ShadowsocksPlugin::Kcptun(kcptun::normalize(options)?),
         _ => return invalid("unsupported Shadowsocks plugin"),
     };
     plugin.validate()?;
@@ -257,7 +253,7 @@ mod tests {
         Config::parse_yaml(&serde_json::to_vec(&json!({"proxies":[{"name":"edge","type":"ss","server":"proxy.invalid","port":443,"cipher":"2022-blake3-aes-128-gcm","password":base64::engine::general_purpose::STANDARD.encode([7;16]),"udp":true,"plugin":plugin,"plugin-opts":options}],"rules":["MATCH,edge"]})).unwrap())
     }
     #[test]
-    fn strict_plugins_construct_their_actual_transport_and_uot() {
+    fn strict_plugins_construct_their_actual_transport() {
         for (plugin, options) in [
             ("obfs", json!({"mode":"http"})),
             ("obfs", json!({"mode":"tls","host":"cover.invalid"})),
@@ -270,24 +266,15 @@ mod tests {
                 "jls",
                 json!({"host":"cover.invalid","username":"synthetic-user","password":"synthetic-password"}),
             ),
-            ("kcptun", json!({})),
-            (
-                "kcptun",
-                json!({"smuxver":2,"crypt":"aes-128-gcm","datashard":-1}),
-            ),
         ] {
             let config = parse(plugin, options).unwrap();
             let ProxyProtocol::Shadowsocks(ss) = &config.proxies[0].protocol else {
                 panic!("expected SS")
             };
-            assert_eq!(ss.udp_over_tcp, plugin == "kcptun");
+            assert!(!ss.udp_over_tcp);
             if let Some(ShadowsocksPlugin::WebSocket { tls: Some(tls), .. }) = &ss.plugin {
                 assert_eq!(tls.server_name, "identity.invalid");
                 assert_eq!(tls.required_alpn.as_deref(), Some(b"http/1.1".as_slice()));
-            }
-            if let Some(ShadowsocksPlugin::Kcptun(config)) = &ss.plugin {
-                assert_eq!(config.smux_version, 2);
-                let _ = crate::transport::kcptun::Owner::new(config.clone()).unwrap();
             }
             let debug = format!("{config:?}");
             assert!(!debug.contains("synthetic-user"));
@@ -310,12 +297,6 @@ mod tests {
                 "jls",
                 json!({"host":"cover.invalid","username":"synthetic-user","password":"synthetic-password","certificate":"unused"}),
             ),
-            ("kcptun", json!({"conn":255})),
-            ("kcptun", json!({"smuxver":1})),
-            ("kcptun", json!({"smuxver":3})),
-            ("kcptun", json!({"mtu":65535})),
-            ("kcptun", json!({"smuxbuf":1,"streambuf":2})),
-            ("kcptun", json!({"dscp":64})),
         ] {
             let error = parse(plugin, options).unwrap_err().to_string();
             assert!(!error.contains("synthetic-user"));
