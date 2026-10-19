@@ -6842,7 +6842,12 @@ dns:
 authentication:
   - measure:secret\ndns:\n  enable: true\n  nameserver: [udp://1.1.1.1:53#PROXY]",
         );
-        assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
+        let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        assert_eq!(config.dns.nameservers[0].route, DnsRoute::Direct);
+        assert_eq!(
+            config.dns.nameservers[0].options.interface.as_deref(),
+            Some("PROXY")
+        );
 
         let yaml = current_yaml(
             "mixed-port: 1080
@@ -6856,6 +6861,7 @@ authentication:
             config.dns.nameservers[0].route,
             DnsRoute::Route(RouteTargetId::Proxy(ProxyId::new(0).unwrap()))
         );
+        assert!(config.dns.nameservers[0].options.interface.is_none());
 
         let yaml = two_proxy_yaml(
             "mixed-port: 1080
