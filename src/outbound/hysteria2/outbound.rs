@@ -145,9 +145,9 @@ impl Hysteria2Outbound {
                 )
             })
             .transpose()?;
-        // Explicit bandwidth modes spread UDP receive/forward work across a
-        // small fixed pool. A one-byte receive declaration cannot be divided.
-        let count = if (config.up > 0 || config.down > 0) && config.down != 1 {
+        // Spread UDP receive/forward work across a small lazy pool. A one-byte
+        // receive declaration cannot be divided.
+        let count = if config.down != 1 {
             crate::limits::HY2_AUTH_SESSIONS
         } else {
             1
@@ -351,7 +351,7 @@ async fn drive(
             .mtu_discovery_config(None)
             .max_concurrent_bidi_streams(0_u8.into())
             .max_concurrent_uni_streams((crate::limits::HY2_UNI_STREAMS as u32).into())
-            .send_window(crate::limits::HY2_SEND_WINDOW as u64)
+            .send_window((crate::limits::HY2_SEND_WINDOW / session_count) as u64)
             .datagram_receive_buffer_size(Some(
                 crate::limits::HY2_DATAGRAM_RECEIVE_BUFFER / session_count,
             ))

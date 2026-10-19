@@ -226,7 +226,7 @@ async fn completed_fragment_id_can_be_reused_without_losing_the_next_datagram() 
         .open_datagram(
             DatagramRequest::new(DatagramSession::new(
                 InboundKind::InternalMeasure,
-                "192.0.2.2:1235".parse().unwrap(),
+                client_address,
             )),
             &EstablishContext::default(),
         )
@@ -493,13 +493,18 @@ async fn configured_handshake_timeout_bounds_quic_and_auth_but_not_ready_session
 }
 
 #[tokio::test]
-async fn explicit_bandwidth_sessions_preserve_node_budget_and_join_together() {
-    use std::collections::VecDeque;
-    use vole::{dispatch::DispatchError, outbound::ConnectedStream, session::StreamSession};
+async fn authenticated_sessions_preserve_source_budget_and_join_together() {
+    use futures_util::FutureExt;
+    use std::{collections::VecDeque, panic::AssertUnwindSafe};
+    use vole::{
+        dispatch::{DatagramBudget, DatagramTransport, DispatchError},
+        outbound::ConnectedStream,
+        session::StreamSession,
+    };
     #[cfg(feature = "interop-test")]
     let _case = vole::resources::case_events::Case::new(
         "INTEGRATION-ADAPTER",
-        "hysteria2_explicit_bandwidth_session_pool",
+        "hysteria2_authenticated_session_pool",
     );
     struct Links(Mutex<VecDeque<MemoryPackets>>);
     #[async_trait::async_trait]
@@ -515,25 +520,50 @@ async fn explicit_bandwidth_sessions_preserve_node_budget_and_join_together() {
             &self,
             _: DatagramRequest,
             _: &EstablishContext,
-        ) -> Result<Box<dyn vole::dispatch::DatagramTransport>, DispatchError> {
+        ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
             self.0
                 .lock()
                 .unwrap()
                 .pop_front()
-                .map(|link| Box::new(link) as Box<dyn vole::dispatch::DatagramTransport>)
+                .map(|link| Box::new(link) as Box<dyn DatagramTransport>)
                 .ok_or(DispatchError::NotAllowed)
         }
     }
-    for (down, expected) in [(5, vec![2_u64, 3]), (1, vec![1])] {
+    for (down, expected) in [(0, vec![0_u64, 0]), (5, vec![2, 3]), (1, vec![1])] {
+        let rates = if down == 0 {
+            String::new()
+        } else {
+            format!(r#", "up":"1 Mbps", "down":"{down} Bps""#)
+        };
+        let yaml = format!(
+            r#"{{"proxies":[{{"name":"peer","type":"hysteria2","server":"192.0.2.1","port":443,"udp":true{rates},"skip-cert-verify":true,"sni":"fixture.invalid"}}],"rules":["MATCH,peer"]}}"#
+        );
+        // Parse before starting peers, including the actual omitted-field auto case.
+        let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        let ProxyProtocol::Hysteria2(config) = &config.proxies[0].protocol else {
+            panic!("protocol")
+        };
         let mut links = VecDeque::new();
         let mut servers = Vec::new();
-        let mut peers = Vec::new();
+        let mut client_links = Vec::new();
         for _ in &expected {
-            let (link, endpoint, _) = memory_fixture();
+            let (link, endpoint, client_link) = memory_fixture();
             links.push_back(link);
-            servers.push(endpoint.clone());
+            servers.push(endpoint);
+            client_links.push(client_link);
+        }
+        let upstream = Arc::new(Links(Mutex::new(links)));
+        let outbound =
+            Hysteria2Outbound::new_with_path(config, UpstreamPath::proxy(upstream.clone()))
+                .unwrap();
+        let mut peers = Vec::new();
+        for (slot, endpoint) in servers.iter().cloned().enumerate() {
             peers.push(tokio::spawn(async move {
-                let connection = endpoint.accept().await.unwrap().await.unwrap();
+                // Closing an unused peer after a RED must also terminate accept.
+                let Some(incoming) = endpoint.accept().await else {
+                    return None;
+                };
+                let connection = incoming.await.unwrap();
                 let mut h3 = h3::server::builder()
                     .build::<_, Bytes>(h3_quinn::Connection::new(connection.clone()))
                     .await
@@ -564,73 +594,160 @@ async fn explicit_bandwidth_sessions_preserve_node_budget_and_join_together() {
                     .unwrap();
                 response.finish().await.unwrap();
                 while let Ok(packet) = connection.read_datagram().await {
-                    if connection.send_datagram_wait(packet).await.is_err() {
+                    // A label from the actual authenticated peer, not a copy of
+                    // the production source hash or slot-count formula.
+                    let mut reply = packet.to_vec();
+                    reply.push(slot as u8);
+                    if connection.send_datagram_wait(reply.into()).await.is_err() {
                         break;
                     }
                 }
                 drop(h3);
                 endpoint.close(0_u32.into(), b"");
                 endpoint.wait_idle().await;
-                declared
+                Some(declared)
             }));
         }
-        let upstream = Arc::new(Links(Mutex::new(links)));
-        let yaml = format!(
-            r#"{{"proxies":[{{"name":"peer","type":"hysteria2","server":"192.0.2.1","port":443,"udp":true,"up":"1 Mbps","down":"{down} Bps","skip-cert-verify":true,"sni":"fixture.invalid"}}],"rules":["MATCH,peer"]}}"#
-        );
-        let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
-        let ProxyProtocol::Hysteria2(config) = &config.proxies[0].protocol else {
-            panic!("protocol")
-        };
-        let outbound =
-            Hysteria2Outbound::new_with_path(config, UpstreamPath::proxy(upstream.clone()))
-                .unwrap();
+        let budget = DatagramBudget::new(1, 2);
+        let remote = Destination::Ip("192.0.2.10:53".parse().unwrap());
+        let mut assignment = [None; 32];
+        let mut retained: Vec<Option<Box<dyn DatagramTransport>>> =
+            expected.iter().map(|_| None).collect();
         let mut correct = Vec::new();
-        let outcome = tokio::time::timeout(Duration::from_secs(3), async {
-            for index in 0..32_u8 {
-                let mut udp = outbound
-                    .open_datagram(
-                        DatagramRequest::new(DatagramSession::new(
-                            InboundKind::InternalMeasure,
-                            SocketAddr::from(([192, 0, 2, 2], 20000 + u16::from(index))),
-                        )),
-                        &EstablishContext::default(),
-                    )
+        let outcome = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(3), async {
+            for _ in 0..2 {
+                for index in 0..32_u8 {
+                    let mut udp = outbound
+                        .open_datagram(
+                            DatagramRequest::new(DatagramSession::new(
+                                InboundKind::InternalMeasure,
+                                SocketAddr::from(([192, 0, 2, 2], 20000 + u16::from(index))),
+                            ))
+                            .with_budget(budget),
+                            &EstablishContext::default(),
+                        )
+                        .await?;
+                    let oversized = udp
+                        .send(Datagram {
+                            remote: remote.clone(),
+                            payload: Bytes::from_static(&[0, 0]),
+                            sniffed_domain: None,
+                        })
+                        .await
+                        .is_err();
+                    udp.send(Datagram {
+                        remote: remote.clone(),
+                        payload: vec![index].into(),
+                        sniffed_domain: None,
+                    })
                     .await?;
-                let remote = Destination::Ip("192.0.2.10:53".parse().unwrap());
+                    let reply = udp.receive().await?;
+                    let slot = reply
+                        .payload
+                        .get(1)
+                        .copied()
+                        .filter(|slot| usize::from(*slot) < retained.len());
+                    correct.push(
+                        oversized
+                            && udp.supports_shared_destinations()
+                            && udp.payload_budget(&remote) == budget
+                            && reply.remote == remote
+                            && reply.payload.first() == Some(&index)
+                            && reply.payload.len() == 2
+                            && slot.is_some()
+                            && assignment[usize::from(index)].is_none_or(|old| Some(old) == slot),
+                    );
+                    if let Some(slot) = slot {
+                        assignment[usize::from(index)] = Some(slot);
+                        if retained[usize::from(slot)].is_none() {
+                            retained[usize::from(slot)] = Some(udp);
+                            continue;
+                        }
+                    }
+                    udp.close().await?;
+                }
+            }
+            // Closing sibling associations did not close their shared carrier.
+            for (slot, udp) in retained.iter_mut().enumerate() {
+                let Some(udp) = udp else { continue };
                 udp.send(Datagram {
                     remote: remote.clone(),
-                    payload: vec![index].into(),
+                    payload: Bytes::from_static(&[0xa5]),
                     sniffed_domain: None,
                 })
                 .await?;
                 let reply = udp.receive().await?;
-                correct.push(reply.remote == remote && reply.payload == [index][..]);
-                udp.close().await?;
+                correct.push(reply.remote == remote && reply.payload == [0xa5, slot as u8][..]);
             }
             Ok::<_, DispatchError>(())
-        })
+        }))
+        .catch_unwind()
         .await;
-        outbound.shutdown().await;
-        for server in servers {
+        let owners = retained.len();
+        let all_used = retained.iter().all(Option::is_some);
+        let stop = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(3), async {
+            outbound.shutdown().await;
+            let mut closed = true;
+            for udp in retained.iter_mut().flatten() {
+                closed &= udp.receive().await.is_err();
+            }
+            closed
+        }))
+        .catch_unwind()
+        .await;
+        let physical_closed = client_links.iter().all(mpsc::Sender::is_closed);
+        let all_opened = upstream.0.lock().unwrap().is_empty();
+        // Cleanup is unconditional, including an unused auto slot on the RED,
+        // a business panic/error, and every individual peer's failed join.
+        retained.clear();
+        for server in &servers {
             server.close(0_u32.into(), b"");
         }
+        upstream.0.lock().unwrap().clear();
         let mut declared = Vec::new();
-        for peer in peers {
-            declared.push(
-                tokio::time::timeout(Duration::from_secs(2), peer)
-                    .await
-                    .unwrap()
-                    .unwrap(),
-            );
+        let mut peer_ok = true;
+        for mut peer in peers {
+            match tokio::time::timeout(Duration::from_secs(2), &mut peer).await {
+                Ok(Ok(value)) => declared.push(value),
+                Ok(Err(_)) => peer_ok = false,
+                Err(_) => {
+                    peer.abort();
+                    let _ = peer.await;
+                    peer_ok = false;
+                }
+            }
         }
-        outcome.unwrap().unwrap();
+        let mut drained = true;
+        for server in &servers {
+            drained &= tokio::time::timeout(Duration::from_secs(2), server.wait_idle())
+                .await
+                .is_ok();
+        }
+        // If the first bounded Stop failed, closing all peer paths above gives
+        // its cancelled drivers a final chance to join before any assertion.
+        let cleanup = AssertUnwindSafe(tokio::time::timeout(
+            Duration::from_secs(3),
+            outbound.shutdown(),
+        ))
+        .catch_unwind()
+        .await;
+        drop(servers);
+        drop(outbound);
+        drop(upstream);
         declared.sort_unstable();
-        assert_eq!(
-            declared, expected,
-            "receive declarations changed the node budget"
+        assert!(peer_ok && drained, "every memory peer must join and drain");
+        assert!(matches!(cleanup, Ok(Ok(()))), "node cleanup must join");
+        assert_eq!(declared, expected.into_iter().map(Some).collect::<Vec<_>>());
+        outcome.unwrap().unwrap().unwrap();
+        assert_eq!(correct, vec![true; 64 + owners]);
+        assert!(all_used && all_opened, "every real carrier must be used");
+        assert!(
+            matches!(stop, Ok(Ok(true))),
+            "Stop must terminate logical owners"
         );
-        assert_eq!(correct, vec![true; 32]);
-        assert!(upstream.0.lock().unwrap().is_empty());
+        assert!(
+            physical_closed,
+            "Stop must close every controlled physical receiver"
+        );
     }
 }
