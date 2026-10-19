@@ -97,4 +97,6 @@ pub(crate) enum Intercept {
 }
 
 #[cfg(all(test, feature = "inbound-http"))]
+mod h1_boundary_tests;
+#[cfg(all(test, feature = "inbound-http"))]
 mod tests;
