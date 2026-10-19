@@ -518,7 +518,7 @@ UoT在可靠流中传输，有丢包导致的队头阻塞成本，不应用原�
 
 ## Shadowsocks 2022
 
-原样复用官方 shadowsocks-rust，仅三算法：
+使用官方 shadowsocks-rust 的加密实现，仅三算法：
 
 | cipher | 密钥 |
 | --- | --- |
@@ -527,10 +527,12 @@ UoT在可靠流中传输，有丢包导致的队头阻塞成本，不应用原�
 | 2022-blake3-chacha20-poly1305 | 单一 32 字节 Base64 PSK |
 
 标准 Base64 可省末尾 padding；空段/非法编码/长度错误拒绝，凭据不 trim。
-TCP 使用官方 `CryptoStream` 的加解密与记录分帧，Vole 构造目标地址与 padding 前导；
-UDP 编码及 AES 接收使用官方 codec，只消费已有受控 IO，不调用其 socket 工厂。
-ChaCha UDP 接收使用每关联拥有的官方 cipher，在既有有界缓冲内解析响应；不按解密前的
-随机密文扩张线程级 cipher 缓存。时间、类型、地址、关联和重放校验与其余路径相同。
+TCP 使用官方 `CryptoStream` 的加解密与记录分帧，Vole 构造目标地址与 padding 前导。
+原生 UDP 使用 Vole 的 SIP022 包层适配官方公共 `UdpCipher`，处理包头、EIH、padding 与地址，
+只消费已有受控 IO，不调用 socket 工厂。每关联持有一个当前 TX cipher；AES 至多保留两个
+已认证 server session 的 RX cipher，ChaCha 收发复用同一 PSK cipher。未知 server ID 仅使用
+临时 cipher，通过认证、类型、时间、client session、地址、负载及重放校验后才保留。
+接收复用既有有界缓冲；取消、重放窗口与受控 IO 的生命周期见下文，close/Stop 回收关联 cipher。
 
 ### 流式传输插件
 
@@ -633,7 +635,7 @@ TCP 前导不使用上游私有的 padding 构造器；响应在交付前校验 
 发送 salt 的绑定，类型、时间与认证仍由官方 codec 校验。裸 SS、AES EIH 与外包
 ShadowTLS v3 共用此路径，不通过伪造业务字节或握手失败重拨支持 server-first。
 空原生 UDP 使用调用者持有的临时编码缓冲：按 nonce、身份、地址、最大 900 字节
-padding 和 tag 的完整上界初始化后交给官方编码器，保证不会读取未初始化 padding。
+padding 和 tag 的完整上界初始化，SIP022 包层仅将已初始化字节交给官方 cipher。
 缓冲不常驻，不为普通非空数据报增加整包初始化；session/packet ID、取消和重放保护不变。
 SS UoT 仍由非空请求帧和专用读取门控完成首包，不触发独立空 SS 握手。
 首次固定头不够单次读取时，上游按探测防护拒绝，不改成 read_exact。

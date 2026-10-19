@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::io::ReadBuf;
 
-pub(crate) const MAX_WIRE_PACKET: usize = 65_507;
+use super::datagram::MAX_WIRE_PACKET;
 
 #[derive(Clone, Default)]
 pub(crate) struct PacketIo(Arc<Mutex<Option<Bytes>>>);

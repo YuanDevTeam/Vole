@@ -1,23 +1,18 @@
-use super::{
-    packet_io::{MAX_WIRE_PACKET, PacketIo},
-    packet_window::PacketWindowFilter,
-};
+use super::{datagram_codec, packet_window::PacketWindowFilter};
 use crate::{
     dispatch::{DatagramTransport, DispatchError},
     session::{Datagram, Destination},
 };
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use shadowsocks::{
-    ServerConfig,
-    context::SharedContext,
-    relay::udprelay::{
-        ProxySocket, crypto_io::encrypt_client_payload, options::UdpSocketControlData,
-        proxy_socket::UdpSocketType,
-    },
+    ServerConfig, context::SharedContext, crypto::v2::udp::UdpCipher,
+    relay::udprelay::options::UdpSocketControlData,
 };
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::time::Instant;
+
+pub(super) const MAX_WIRE_PACKET: usize = 65_507;
 
 // Largest response: XChaCha nonce, IDs/type/time/length, optional padding,
 // maximum SOCKS address and AEAD tag. The payload is separately bounded.
@@ -42,16 +37,15 @@ struct ServerSession {
     id: u64,
     last: Instant,
     window: PacketWindowFilter,
+    cipher: Option<UdpCipher>,
 }
 
 pub(super) struct SsDatagram {
     inner: Box<dyn DatagramTransport>,
     server: Destination,
-    socket: ProxySocket<PacketIo>,
     context: SharedContext,
     config: Arc<ServerConfig>,
-    chacha_decoder: Option<super::chacha_datagram::Decoder>,
-    io: PacketIo,
+    tx_cipher: Option<UdpCipher>,
     control: UdpSocketControlData,
     sessions: VecDeque<ServerSession>,
     maximum: usize,
@@ -72,21 +66,17 @@ impl SsDatagram {
         maximum: u16,
         wire_maximum: u16,
     ) -> Self {
-        let io = PacketIo::default();
         let mut control = UdpSocketControlData::default();
         control.client_session_id = rand::random();
         Self {
             inner,
             server,
-            socket: ProxySocket::from_socket(
-                UdpSocketType::Client,
-                context.clone(),
-                &config,
-                io.clone(),
-            ),
+            tx_cipher: Some(UdpCipher::new(
+                config.method(),
+                config.key(),
+                control.client_session_id,
+            )),
             context,
-            chacha_decoder: super::chacha_datagram::Decoder::new(&config),
-            io,
             control,
             sessions: VecDeque::with_capacity(2),
             maximum: usize::from(maximum),
@@ -100,7 +90,11 @@ impl SsDatagram {
         }
     }
 
-    fn accept_control(&mut self, control: &UdpSocketControlData) -> bool {
+    fn accept_control(
+        &mut self,
+        control: &UdpSocketControlData,
+        cipher: Option<UdpCipher>,
+    ) -> bool {
         if control.client_session_id != self.control.client_session_id
             || control.packet_id == u64::MAX
         {
@@ -126,6 +120,7 @@ impl SsDatagram {
                 id: control.server_session_id,
                 last: now,
                 window: PacketWindowFilter::new(),
+                cipher,
             });
             self.sessions.len() - 1
         };
@@ -205,44 +200,24 @@ impl DatagramTransport for SsDatagram {
             }
             self.control.packet_id = 0;
             self.sessions.clear();
+            self.tx_cipher = Some(UdpCipher::new(
+                self.config.method(),
+                self.config.key(),
+                self.control.client_session_id,
+            ));
         }
         self.control.packet_id += 1;
         let target = super::address(&datagram.remote);
-        let payload = if datagram.payload.is_empty() {
-            // The official empty-payload encoder advances over up to 900
-            // padding bytes without initializing them. Initialize its entire
-            // maximum wire image before clear: capacity and initialized bytes
-            // survive, so its reserve cannot replace this backing allocation.
-            let initialized_len = self
-                .request_header
-                .checked_add(target.serialized_len())
-                .and_then(|length| length.checked_add(900))
-                .filter(|length| *length <= MAX_WIRE_PACKET)
-                .ok_or_else(|| {
-                    DispatchError::Other("Shadowsocks UDP packet exceeds wire limit".into())
-                })?;
-            let mut encoded = BytesMut::zeroed(initialized_len);
-            rand::fill(&mut encoded[..]);
-            encoded.clear();
-            encrypt_client_payload(
-                &self.context,
-                self.config.method(),
-                self.config.key(),
-                &target,
-                &self.control,
-                self.config.identity_keys(),
-                &[],
-                &mut encoded,
-            );
-            debug_assert!(encoded.len() <= initialized_len);
-            encoded.freeze()
-        } else {
-            self.socket
-                .send_with_ctrl(&target, &self.control, &datagram.payload)
-                .await
-                .map_err(|_| DispatchError::Other("Shadowsocks UDP encoding failed".into()))?;
-            self.io.take().map_err(DispatchError::from)?
-        };
+        let payload = datagram_codec::encode_request(
+            &self.context,
+            &self.config,
+            self.tx_cipher.as_ref().expect("open SS association"),
+            &target,
+            &self.control,
+            &datagram.payload,
+        )
+        .map_err(|_| DispatchError::Other("Shadowsocks UDP encoding failed".into()))?
+        .freeze();
         self.inner
             .send(Datagram {
                 remote: self.server.clone(),
@@ -266,23 +241,35 @@ impl DatagramTransport for SsDatagram {
             {
                 continue;
             }
-            let decoded = if let Some(decoder) = &self.chacha_decoder {
-                let length = wire.payload.len();
-                self.buffer[..length].copy_from_slice(&wire.payload);
-                decoder.decode(&mut self.buffer[..length]).ok()
-            } else {
-                self.io.put(wire.payload).map_err(DispatchError::from)?;
-                // The handoff is always Ready. Only the shared transport
-                // above can pend; no partial packet survives cancellation.
-                self.socket
-                    .recv_with_ctrl(&mut self.buffer)
-                    .await
-                    .ok()
-                    .and_then(|(size, source, _, control)| {
-                        control.map(|control| (size, source, control))
-                    })
+            let length = wire.payload.len();
+            self.buffer[..length].copy_from_slice(&wire.payload);
+            drop(wire);
+            let Ok(server_id) =
+                datagram_codec::prepare_response(&self.config, &mut self.buffer[..length])
+            else {
+                continue;
             };
-            let Some((size, source, control)) = decoded else {
+            let mut candidate = None;
+            let cipher = if let Some(id) = server_id {
+                if let Some(session) = self.sessions.iter().find(|session| session.id == id) {
+                    session.cipher.as_ref().expect("AES session cipher")
+                } else {
+                    if self.sessions.len() == 2
+                        && Instant::now().duration_since(self.sessions[0].last) < SESSION_RETENTION
+                    {
+                        continue;
+                    }
+                    // A tentative unauthenticated ID never enters retained state.
+                    candidate = Some(UdpCipher::new(self.config.method(), self.config.key(), id));
+                    candidate.as_ref().unwrap()
+                }
+            } else {
+                // ChaCha's cipher depends only on PSK; the nonce is per packet.
+                self.tx_cipher.as_ref().expect("open SS association")
+            };
+            let Ok((size, source, control)) =
+                datagram_codec::decode_response(&self.config, cipher, &mut self.buffer[..length])
+            else {
                 continue;
             };
             if size > self.maximum {
@@ -291,7 +278,7 @@ impl DatagramTransport for SsDatagram {
             let Ok(remote) = super::destination(source) else {
                 continue;
             };
-            if !self.accept_control(&control) {
+            if !self.accept_control(&control, candidate) {
                 continue;
             }
             return Ok(Datagram {
@@ -305,7 +292,7 @@ impl DatagramTransport for SsDatagram {
     async fn close(&mut self) -> Result<(), DispatchError> {
         self.closed = true;
         self.sessions.clear();
-        self.chacha_decoder.take();
+        self.tx_cipher.take();
         self.inner.close().await
     }
 }

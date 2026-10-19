@@ -69,7 +69,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | TUN 响应背压 | `tun_runtime::tests::backpressured_udp_response_handoff` | 满队列下每源至多暂持一包、双向推进及取消 |
 | UoT | `outbound::uot::tests::` | 半帧取消后继续、v2首部、原期限、单槽响应与Stop |
 | VMess 响应边界 | `outbound::vmess::header::delayed_response_memory_tests::`、`outbound::vmess::stream::tests::`、`--test vmess_lifecycle` | 官方延迟响应向量、提交前期限、响应认证、nonce 耗尽与关闭 |
-| SS2022 | `outbound::shadowsocks::datagram::tests::` | 三种 cipher、空 UDP、EIH、取消后的 packet ID 与重放边界 |
+| SS2022 | `outbound::shadowsocks::datagram::tests::` | 官方内存对端、三种 cipher、空 UDP/EIH、认证后 cipher 准入、取消与轮换 ID、重放边界 |
 | CLI前台 | `invoke::foreground::tests::` | 文件/stdin、路径、信号及清理 |
 
 独立集成回归按目标运行，例如：
