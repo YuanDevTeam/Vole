@@ -506,7 +506,9 @@ where
         });
         let response = loop {
             if uploaded {
-                break timeout_io(config.header_timeout, &mut reading).await;
+                // A completed local write does not mean the origin has consumed
+                // the body. Keep its response wait within the body idle budget.
+                break timeout_io(config.body_idle_timeout, &mut reading).await;
             }
             tokio::select! {
                 biased;
@@ -1255,5 +1257,159 @@ mod early_final_memory_tests {
         assert!(!keep_alive);
         assert!(response.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
         assert!(response.ends_with(b"\r\n\r\necho"));
+    }
+}
+
+#[cfg(test)]
+mod response_deadline_memory_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn uploaded_body_allows_first_response_after_header_timeout() {
+        let request = parse_request_head(
+            b"POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nContent-Length: 6\r\nConnection: close",
+            Vec::new(),
+        )
+        .unwrap();
+        let plan = RequestPlan::new(&request).unwrap();
+        let (outbound, peer) = tokio::io::duplex(1024);
+        let forward = tokio::spawn(async move {
+            let mut reader = BufReader::new(b"upload".as_slice());
+            let mut response = Vec::new();
+            let start = Instant::now();
+            let result = forward_request(
+                &mut reader,
+                &mut response,
+                Box::new(outbound),
+                &request,
+                plan,
+                &HttpServerConfig::processing(),
+            )
+            .await;
+            (result, response, start.elapsed())
+        });
+        let peer = tokio::spawn(async move {
+            let mut peer = BufReader::new(peer);
+            read_head(&mut peer, DEFAULT_HEADER_LIMIT).await?;
+            let mut body = [0_u8; 6];
+            peer.read_exact(&mut body).await?;
+            // The entire real upload has reached the peer before this delay.
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            peer.get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await?;
+            peer.get_mut().shutdown().await?;
+            Ok::<_, io::Error>(body)
+        });
+
+        // Join both owners even on the expected RED timeout/BrokenPipe path.
+        let (forward, peer) = tokio::join!(forward, peer);
+        let (result, response, elapsed) = forward.unwrap();
+        assert!(result.is_ok(), "late first response failed: {result:?}");
+        assert!(!result.unwrap());
+        assert_eq!(peer.unwrap().unwrap(), *b"upload");
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(b"\r\n\r\nok"));
+        assert!(elapsed >= Duration::from_secs(11) && elapsed < Duration::from_secs(12));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn started_response_head_retains_its_absolute_header_deadline() {
+        let request = parse_request_head(
+            b"POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nContent-Length: 6\r\nConnection: close",
+            Vec::new(),
+        )
+        .unwrap();
+        let plan = RequestPlan::new(&request).unwrap();
+        let (outbound, peer) = tokio::io::duplex(1024);
+        let forward = tokio::spawn(async move {
+            let mut reader = BufReader::new(b"upload".as_slice());
+            let mut response = Vec::new();
+            let start = Instant::now();
+            let result = forward_request(
+                &mut reader,
+                &mut response,
+                Box::new(outbound),
+                &request,
+                plan,
+                &HttpServerConfig::processing(),
+            )
+            .await;
+            (result, response, start.elapsed())
+        });
+        let peer = tokio::spawn(async move {
+            let mut peer = BufReader::new(peer);
+            read_head(&mut peer, DEFAULT_HEADER_LIMIT).await?;
+            let mut body = [0_u8; 6];
+            peer.read_exact(&mut body).await?;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            peer.get_mut().write_all(b"HTTP/1.1 200").await?;
+            // Keep the real response half open beyond its ten-second header
+            // deadline, without EOF or a failed write causing the outcome.
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            Ok::<_, io::Error>(body)
+        });
+
+        let (forward, peer) = tokio::join!(forward, peer);
+        let (result, response, elapsed) = forward.unwrap();
+        assert_eq!(peer.unwrap().unwrap(), *b"upload");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(response.starts_with(b"HTTP/1.1 504 Gateway Timeout\r\n"));
+        // First byte at t=5; the unchanged absolute read_head deadline is t=15.
+        assert!(elapsed >= Duration::from_secs(15) && elapsed < Duration::from_secs(16));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_first_response_is_bounded_by_postupload_deadline() {
+        for starts_partial_head in [false, true] {
+            let request = parse_request_head(
+                b"POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nContent-Length: 6\r\nConnection: close",
+                Vec::new(),
+            )
+            .unwrap();
+            let plan = RequestPlan::new(&request).unwrap();
+            let (outbound, peer) = tokio::io::duplex(1024);
+            let forward = tokio::spawn(async move {
+                let mut reader = BufReader::new(b"upload".as_slice());
+                let mut response = Vec::new();
+                let start = Instant::now();
+                let result = forward_request(
+                    &mut reader,
+                    &mut response,
+                    Box::new(outbound),
+                    &request,
+                    plan,
+                    &HttpServerConfig::processing(),
+                )
+                .await;
+                (result, response, start.elapsed())
+            });
+            let peer = tokio::spawn(async move {
+                let mut peer = BufReader::new(peer);
+                read_head(&mut peer, DEFAULT_HEADER_LIMIT).await?;
+                let mut body = [0_u8; 6];
+                peer.read_exact(&mut body).await?;
+                if starts_partial_head {
+                    tokio::time::sleep(Duration::from_secs(29)).await;
+                    peer.get_mut().write_all(b"HTTP/1.1 200").await?;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_secs(31)).await;
+                }
+                // Keep the response half alive to t=31, beyond the outer deadline.
+                Ok::<_, io::Error>(body)
+            });
+
+            let (forward, peer) = tokio::join!(forward, peer);
+            let (result, response, elapsed) = forward.unwrap();
+            assert_eq!(peer.unwrap().unwrap(), *b"upload");
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert!(response.starts_with(b"HTTP/1.1 504 Gateway Timeout\r\n"));
+            assert!(
+                elapsed >= Duration::from_secs(30) && elapsed < Duration::from_secs(31),
+                "post-upload deadline differs: partial_head={starts_partial_head}, elapsed={elapsed:?}"
+            );
+        }
     }
 }
