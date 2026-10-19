@@ -154,6 +154,7 @@ pub(crate) enum Phase {
 pub(crate) enum PatchOperation {
     Add {
         path: String,
+        #[serde(deserialize_with = "json_value")]
         value: serde_json::Value,
     },
     Remove {
@@ -161,6 +162,7 @@ pub(crate) enum PatchOperation {
     },
     Replace {
         path: String,
+        #[serde(deserialize_with = "json_value")]
         value: serde_json::Value,
     },
     Move {
@@ -173,6 +175,33 @@ pub(crate) enum PatchOperation {
     },
     Test {
         path: String,
+        #[serde(deserialize_with = "json_value")]
         value: serde_json::Value,
     },
+}
+
+// serde_json::Value turns a non-finite floating-point visitor value into
+// JSON null. Reject such YAML numbers before conversion, rather than silently
+// changing their type. Real JSON null remains a supported patch value.
+fn json_value<'de, D: Deserializer<'de>>(deserializer: D) -> Result<serde_json::Value, D::Error> {
+    fn compatible(value: &serde_yaml_ng::Value) -> bool {
+        use serde_yaml_ng::Value;
+        match value {
+            Value::Null | Value::Bool(_) | Value::String(_) => true,
+            Value::Number(number) => number.as_f64().is_some_and(f64::is_finite),
+            Value::Sequence(values) => values.iter().all(compatible),
+            Value::Mapping(values) => values
+                .iter()
+                .all(|(key, value)| matches!(key, Value::String(_)) && compatible(value)),
+            Value::Tagged(_) => false,
+        }
+    }
+    let value = serde_yaml_ng::Value::deserialize(deserializer)?;
+    if !compatible(&value) {
+        return Err(serde::de::Error::custom(
+            "JSON Patch value is not JSON-compatible",
+        ));
+    }
+    serde_yaml_ng::from_value(value)
+        .map_err(|_| serde::de::Error::custom("JSON Patch value is not JSON-compatible"))
 }

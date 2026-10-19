@@ -60,10 +60,18 @@ impl Search {
     /// The caller owns the input and output workspace permits. Allocation is
     /// checked before every append, including unmatched portions and captures.
     pub(crate) fn apply(&self, input: &str, limit: usize) -> io::Result<String> {
+        let mut out = String::new();
+        self.apply_into(input, &mut out, limit)?;
+        Ok(out)
+    }
+
+    /// Reuse a caller-owned, already charged output workspace. Existing output
+    /// is discarded; callers commit only after this operation succeeds.
+    pub(crate) fn apply_into(&self, input: &str, out: &mut String, limit: usize) -> io::Result<()> {
+        out.clear();
         if input.len() > limit {
             return Err(invalid());
         }
-        let mut out = String::new();
         let mut end = 0;
         match &self.pattern {
             Pattern::Literal {
@@ -71,8 +79,8 @@ impl Search {
                 replacement,
             } => {
                 for (start, value) in input.match_indices(search.as_ref()) {
-                    template::append(&mut out, &input[end..start], limit)?;
-                    template::append(&mut out, replacement, limit)?;
+                    template::append(out, &input[end..start], limit)?;
+                    template::append(out, replacement, limit)?;
                     end = start + value.len();
                     if self.occurrences == Occurrences::First {
                         break;
@@ -85,8 +93,8 @@ impl Search {
             } => {
                 for captures in search.captures_iter(input) {
                     let found = captures.get(0).expect("regex always has capture zero");
-                    template::append(&mut out, &input[end..found.start()], limit)?;
-                    replacement.append(&captures, &mut out, limit)?;
+                    template::append(out, &input[end..found.start()], limit)?;
+                    replacement.append(&captures, out, limit)?;
                     end = found.end();
                     if self.occurrences == Occurrences::First {
                         break;
@@ -94,7 +102,6 @@ impl Search {
                 }
             }
         }
-        template::append(&mut out, &input[end..], limit)?;
-        Ok(out)
+        template::append(out, &input[end..], limit)
     }
 }

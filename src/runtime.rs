@@ -296,6 +296,9 @@ impl PreparedCore {
         resolver: &dyn Resolver,
         limits: ResourceLimits,
     ) -> io::Result<Self> {
+        if config.http_policy().is_some_and(|policy| !policy.is_prepared()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "HTTP resources or private context are not prepared"));
+        }
         limits
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;

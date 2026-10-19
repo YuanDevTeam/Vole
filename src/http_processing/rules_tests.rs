@@ -183,6 +183,7 @@ fn body_values_are_not_limited_to_url_size_and_json_patch_is_strict() {
         "{url: '.', action: response-body-json-patch, patch: [{op: add, path: /x}]}",
         "{url: '.', action: response-body-json-patch, patch: [{op: move, from: /x, path: /bad~2}]}",
         "{url: '.', action: response-body-json-patch, patch: null}",
+        "{url: '.', action: response-body-json-patch, patch: [{op: add, path: /x, value: .nan}]}",
     ] {
         assert!(compile(input).is_err(), "accepted invalid patch: {input}");
     }

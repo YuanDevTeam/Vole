@@ -1,56 +1,186 @@
-//! The HTTP addendum is separate from the Mihomo configuration schema.
-use regex::{Captures, Regex, RegexBuilder};
-use serde::Deserialize;
+//! Immutable business HTTP policy, separate from Mihomo configuration.
+#[path = "document.rs"]
+mod document;
+pub(crate) use document::{Document, compile_rule, nonnull};
+
+use super::{
+    private_context::CaMaterial,
+    providers::Payload,
+    rules::{self, Rule, UrlAction},
+};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fmt, io, sync::Arc};
+use std::{collections::BTreeMap, fmt, io, sync::Arc};
 use url::Url;
 
 pub(crate) const MAX_ADDENDUM: usize = 1024 * 1024;
-pub(super) const MAX_URL: usize = 8192;
-const MAX_RULES: usize = 64;
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-struct RawConfig {
-    #[serde(default = "default_ports")]
-    http_ports: Vec<u16>,
-    #[serde(default)]
-    rewrite: Vec<RawRule>,
-    mitm: Option<super::mitm::RawMitm>,
+pub(crate) const MAX_SNAPSHOT: usize = MAX_ADDENDUM * 8;
+pub(super) use rules::MAX_URL;
+pub(super) use rules::checked_url;
+
+pub(super) fn invalid() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "invalid HTTP processing configuration",
+    )
 }
-fn default_ports() -> Vec<u16> {
-    vec![80, 8080]
+
+#[derive(Clone)]
+pub(crate) struct PolicyCandidate {
+    pub(crate) document: Arc<Document>,
+    pub(super) rules: Arc<[Rule]>,
+    pub(super) payloads: BTreeMap<String, Arc<Payload>>,
+    pub(super) identity: [u8; 32],
+    pub(super) origins: Box<[SourceLocation]>,
+    pub(super) source_identity: Option<[u8; 32]>,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-struct RawRule {
-    pattern: String,
-    action: ActionKind,
-    replacement: Option<String>,
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "source", rename_all = "kebab-case")]
+pub(crate) enum SourceLocation {
+    Local { index: usize },
+    Provider { provider: String, index: usize },
 }
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub(super) enum ActionKind {
-    Replace,
-    Redirect302,
-    Redirect307,
-    Reject,
+
+impl PolicyCandidate {
+    pub(crate) fn identity(&self) -> [u8; 32] {
+        self.identity
+    }
+
+    pub(crate) fn source_identity(&self) -> Option<[u8; 32]> {
+        self.source_identity
+    }
+
+    pub(crate) fn origin(&self, index: usize) -> Option<&SourceLocation> {
+        self.origins.get(index)
+    }
+
+    pub(crate) fn bind_source(mut self: Arc<Self>, identity: [u8; 32]) -> Arc<Self> {
+        let candidate = Arc::make_mut(&mut self);
+        let mut hash = Sha256::new();
+        hash.update(candidate.identity);
+        hash.update(identity);
+        candidate.identity = hash.finalize().into();
+        candidate.source_identity = Some(identity);
+        self
+    }
+
+    pub(crate) fn bind_ca(
+        self: &Arc<Self>,
+        material: Option<&CaMaterial>,
+    ) -> io::Result<Arc<Policy>> {
+        #[cfg(feature = "inbound-http")]
+        let mitm = super::mitm::Mitm::compile(self.document.mitm.clone(), material)?;
+        #[cfg(not(feature = "inbound-http"))]
+        if self.document.mitm.enabled || material.is_some() {
+            return Err(invalid());
+        }
+        let mut hash = Sha256::new();
+        hash.update(self.identity);
+        #[cfg(feature = "inbound-http")]
+        if let Some(mitm) = &mitm {
+            hash.update(mitm.identity());
+        }
+        Ok(Arc::new(Policy {
+            identity: hash.finalize().into(),
+            document: self.document.clone(),
+            candidate: Some(self.clone()),
+            #[cfg(feature = "inbound-http")]
+            mitm,
+        }))
+    }
+
+    /// Complete actual content for an internal, protected cross-process
+    /// snapshot. CA material is deliberately not representable here.
+    pub(crate) fn export_snapshot(&self) -> io::Result<String> {
+        #[derive(Serialize)]
+        struct Snapshot<'a> {
+            document: &'a Document,
+            payloads: BTreeMap<&'a str, &'a Payload>,
+            source_identity: Option<[u8; 32]>,
+        }
+        let snapshot = Snapshot {
+            document: &self.document,
+            payloads: self
+                .payloads
+                .iter()
+                .map(|(name, payload)| (name.as_str(), payload.as_ref()))
+                .collect(),
+            source_identity: self.source_identity,
+        };
+        let encoded = serde_yaml_ng::to_string(&snapshot).map_err(|_| invalid())?;
+        if encoded.len() > MAX_SNAPSHOT {
+            return Err(invalid());
+        }
+        Ok(encoded)
+    }
+
+    pub(crate) fn import_snapshot(input: &str) -> io::Result<Arc<Self>> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Snapshot {
+            #[serde(deserialize_with = "nonnull")]
+            document: Document,
+            #[serde(deserialize_with = "nonnull")]
+            payloads: BTreeMap<String, Payload>,
+            source_identity: Option<[u8; 32]>,
+        }
+        if input.len() > MAX_SNAPSHOT {
+            return Err(invalid());
+        }
+        let value =
+            crate::config::yaml::parse_with_budget(input.as_bytes(), &mut (MAX_SNAPSHOT * 4))
+                .map_err(|_| invalid())?;
+        let mut snapshot: Snapshot = serde_yaml_ng::from_value(value).map_err(|_| invalid())?;
+        snapshot.document.input_bytes = serde_yaml_ng::to_string(&snapshot.document)
+            .map_err(|_| invalid())?
+            .len();
+        snapshot.document.finish()?;
+        let names: std::collections::BTreeSet<_> = snapshot
+            .document
+            .active_provider_names()
+            .filter(|name| {
+                !matches!(
+                    snapshot.document.providers[*name],
+                    super::providers::ProviderSpec::Inline { .. }
+                )
+            })
+            .map(str::to_owned)
+            .collect();
+        if snapshot.payloads.keys().any(|name| !names.contains(name)) {
+            return Err(invalid());
+        }
+        for payload in snapshot.payloads.values_mut() {
+            payload.finish()?;
+        }
+        let candidate = Arc::new(snapshot.document).compile(
+            &snapshot
+                .payloads
+                .into_iter()
+                .map(|(name, payload)| (name, Arc::new(payload)))
+                .collect(),
+        )?;
+        Ok(if let Some(identity) = snapshot.source_identity {
+            candidate.bind_source(identity)
+        } else {
+            candidate
+        })
+    }
 }
-struct Rule {
-    pattern: Regex,
-    action: ActionKind,
-    replacement: Option<Box<str>>,
-}
+
 pub(crate) struct Policy {
     identity: [u8; 32],
-    http_ports: Box<[u16]>,
-    rules: Box<[Rule]>,
+    document: Arc<Document>,
+    candidate: Option<Arc<PolicyCandidate>>,
     #[cfg(feature = "inbound-http")]
     mitm: Option<Arc<super::mitm::Mitm>>,
 }
+
 impl fmt::Debug for Policy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpPolicy")
-            .field("rules", &self.rules.len())
+            .field("rules", &self.all_rules().len())
+            .field("prepared", &self.is_prepared())
             .finish_non_exhaustive()
     }
 }
@@ -60,18 +190,21 @@ impl PartialEq for Policy {
     }
 }
 impl Eq for Policy {}
+
 pub(super) enum Action {
     Forward(Url),
     Redirect { status: u16, url: Url },
     Reject,
 }
-fn invalid() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "invalid HTTP processing configuration",
-    )
-}
+
 impl Policy {
+    pub(crate) fn for_evaluation(candidate: Arc<PolicyCandidate>) -> Arc<Self> {
+        Arc::new(Self::from_static(
+            candidate.document.clone(),
+            Some(candidate),
+        ))
+    }
+
     pub(crate) fn compile_optional(input: Option<&str>) -> crate::Result<Option<Arc<Self>>> {
         let input = input.filter(|value| !value.is_empty());
         #[cfg(not(feature = "inbound-http"))]
@@ -80,123 +213,81 @@ impl Policy {
                 "HTTP processing is not compiled in".into(),
             ));
         }
-        input
-            .map(Self::compile)
-            .transpose()
-            .map(|policy| policy.filter(|policy| policy.enabled()))
-            .map_err(|_| {
-                crate::VoleError::InvalidConfig("invalid HTTP processing configuration".into())
-            })
+        input.map(Self::compile).transpose().map_err(|_| {
+            crate::VoleError::InvalidConfig("invalid HTTP processing configuration".into())
+        })
     }
 
     pub(crate) fn compile(input: &str) -> io::Result<Arc<Self>> {
-        if input.len() > MAX_ADDENDUM {
-            return Err(invalid());
-        }
-        let value =
-            crate::config::yaml::parse_with_budget(input.as_bytes(), &mut (MAX_ADDENDUM * 4))
-                .map_err(|_| invalid())?;
-        for (key, limit) in [("rewrite", MAX_RULES), ("http-ports", 64)] {
-            if value
-                .get(key)
-                .and_then(serde_yaml_ng::Value::as_sequence)
-                .is_some_and(|items| items.len() > limit)
-            {
-                return Err(invalid());
-            }
-        }
-        // Validate bounded MITM material before RawMitm allocates its own
-        // vectors/strings from a potentially alias-expanded YAML value.
-        if let Some(mitm) = value.get("mitm") {
-            for key in ["domains", "exclude-domains", "ports"] {
-                if mitm
-                    .get(key)
-                    .and_then(serde_yaml_ng::Value::as_sequence)
-                    .is_some_and(|items| items.len() > 64)
-                {
-                    return Err(invalid());
-                }
-            }
-            for key in ["domains", "exclude-domains"] {
-                if mitm
-                    .get(key)
-                    .and_then(serde_yaml_ng::Value::as_sequence)
-                    .is_some_and(|items| {
-                        items
-                            .iter()
-                            .any(|item| item.as_str().is_some_and(|name| name.len() > 255))
-                    })
-                {
-                    return Err(invalid());
-                }
-            }
-            for key in ["certificate", "private-key"] {
-                if mitm
-                    .get(key)
-                    .and_then(serde_yaml_ng::Value::as_str)
-                    .is_some_and(|pem| pem.len() > 32 * 1024)
-                {
-                    return Err(invalid());
-                }
-            }
-        }
-        let raw: RawConfig = serde_yaml_ng::from_value(value).map_err(|_| invalid())?;
-        if raw.rewrite.len() > MAX_RULES || raw.http_ports.len() > 64 || raw.http_ports.contains(&0)
-        {
-            return Err(invalid());
-        }
-        #[cfg(feature = "inbound-http")]
-        let mitm = raw.mitm.map(super::mitm::Mitm::compile).transpose()?;
-        #[cfg(not(feature = "inbound-http"))]
-        if raw.mitm.is_some() {
-            return Err(invalid());
-        }
-        let mut total = 0;
-        let mut rules = Vec::with_capacity(raw.rewrite.len());
-        for rule in raw.rewrite {
-            total += rule.pattern.len() + rule.replacement.as_ref().map_or(0, String::len);
-            if rule.pattern.len() > 2048
-                || total > 64 * 1024
-                || rule.replacement.as_ref().is_some_and(|s| s.len() > MAX_URL)
-            {
-                return Err(invalid());
-            }
-            if (rule.action == ActionKind::Reject) != rule.replacement.is_none() {
-                return Err(invalid());
-            }
-            if let Some(replacement) = &rule.replacement
-                && !replacement.contains('$')
-            {
-                checked_url(replacement)?;
-            }
-            let pattern = RegexBuilder::new(&rule.pattern)
-                .size_limit(128 * 1024)
-                .dfa_size_limit(64 * 1024)
-                .build()
-                .map_err(|_| invalid())?;
-            rules.push(Rule {
-                pattern,
-                action: rule.action,
-                replacement: rule.replacement.map(String::into_boxed_str),
-            });
-        }
-        Ok(Arc::new(Self {
-            identity: Sha256::digest(input.as_bytes()).into(),
-            http_ports: raw.http_ports.into(),
-            rules: rules.into(),
+        Document::parse(input)?.static_policy()
+    }
+
+    pub(super) fn from_static(
+        document: Arc<Document>,
+        candidate: Option<Arc<PolicyCandidate>>,
+    ) -> Self {
+        let identity = candidate
+            .as_ref()
+            .map_or_else(|| document.identity(), |candidate| candidate.identity());
+        Self {
+            identity,
+            document,
+            candidate,
             #[cfg(feature = "inbound-http")]
-            mitm,
-        }))
+            mitm: None,
+        }
+    }
+
+    pub(crate) fn document(&self) -> &Arc<Document> {
+        &self.document
+    }
+    pub(crate) fn candidate(&self) -> Option<&Arc<PolicyCandidate>> {
+        self.candidate.as_ref()
+    }
+    pub(crate) fn is_prepared(&self) -> bool {
+        self.candidate.is_some()
+            && (!self.document.mitm.enabled || {
+                #[cfg(feature = "inbound-http")]
+                {
+                    self.mitm.is_some()
+                }
+                #[cfg(not(feature = "inbound-http"))]
+                {
+                    false
+                }
+            })
     }
     pub(crate) fn enabled(&self) -> bool {
-        #[cfg(feature = "inbound-http")]
-        if self.mitm.is_some() {
-            return true;
-        }
-        !self.rules.is_empty()
+        self.document.mitm.enabled || !self.rules().is_empty()
+    }
+    pub(crate) fn rewrite_enabled(&self) -> bool {
+        self.document.rewrite.enabled
     }
     pub(crate) fn plain_port(&self, port: u16) -> bool {
-        !self.rules.is_empty() && self.http_ports.contains(&port)
+        !self.rules().is_empty() && self.document.http_ports.contains(&port)
+    }
+    pub(crate) fn rules(&self) -> &[Rule] {
+        if self.document.rewrite.enabled {
+            self.all_rules()
+        } else {
+            &[]
+        }
+    }
+    pub(crate) fn all_rules(&self) -> &[Rule] {
+        self.candidate
+            .as_ref()
+            .map_or(&[], |candidate| &candidate.rules)
+    }
+    pub(crate) fn origin(&self, index: usize) -> Option<&SourceLocation> {
+        self.candidate
+            .as_ref()
+            .and_then(|candidate| candidate.origin(index))
+    }
+    #[cfg(feature = "inbound-http")]
+    pub(crate) fn body_budget(&self) -> &super::body_budget::Budget {
+        static BUDGET: std::sync::LazyLock<super::body_budget::Budget> =
+            std::sync::LazyLock::new(super::body_budget::Budget::default);
+        &BUDGET
     }
     #[cfg(feature = "inbound-http")]
     pub(super) fn mitm(&self) -> Option<&Arc<super::mitm::Mitm>> {
@@ -206,176 +297,19 @@ impl Policy {
         if url.as_str().len() > MAX_URL {
             return Err(invalid());
         }
-        for rule in &self.rules {
-            let Some(captures) = rule.pattern.captures(url.as_str()) else {
-                continue;
-            };
-            if rule.action == ActionKind::Reject {
-                return Ok(Action::Reject);
+        for rule in self.rules() {
+            if let Some(action) = rule.evaluate_url(&url)? {
+                return Ok(match action {
+                    UrlAction::Forward(url) => Action::Forward(url),
+                    UrlAction::Redirect { status, url } => Action::Redirect { status, url },
+                    UrlAction::Reject => Action::Reject,
+                });
             }
-            let replacement = expand(
-                &captures,
-                rule.replacement.as_deref().expect("validated replacement"),
-            )?;
-            let target = checked_url(&replacement)?;
-            return Ok(match rule.action {
-                ActionKind::Replace => Action::Forward(target),
-                ActionKind::Redirect302 => Action::Redirect {
-                    status: 302,
-                    url: target,
-                },
-                ActionKind::Redirect307 => Action::Redirect {
-                    status: 307,
-                    url: target,
-                },
-                ActionKind::Reject => unreachable!(),
-            });
         }
         Ok(Action::Forward(url))
     }
 }
-pub(super) fn checked_url(raw: &str) -> io::Result<Url> {
-    if raw.len() > MAX_URL || raw.bytes().any(|b| b <= b' ' || b == 127 || b == b'\\') {
-        return Err(invalid());
-    }
-    let url = Url::parse(raw).map_err(|_| invalid())?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-        || url.port() == Some(0)
-    {
-        return Err(invalid());
-    }
-    Ok(url)
-}
-// Expand only into a bounded result. regex::Captures::expand may allocate a
-// multiple of the input when a long capture appears many times in a template.
-fn expand(captures: &Captures<'_>, template: &str) -> io::Result<String> {
-    let mut out = String::new();
-    let mut rest = template;
-    while let Some(index) = rest.find('$') {
-        append(&mut out, &rest[..index])?;
-        rest = &rest[index + 1..];
-        if rest.starts_with('$') {
-            append(&mut out, "$")?;
-            rest = &rest[1..];
-            continue;
-        }
-        let (name, tail) = if let Some(braced) = rest.strip_prefix('{') {
-            let end = braced.find('}').ok_or_else(invalid)?;
-            (&braced[..end], &braced[end + 1..])
-        } else {
-            let end = rest
-                .bytes()
-                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
-                .count();
-            if end == 0 {
-                append(&mut out, "$")?;
-                continue;
-            }
-            (&rest[..end], &rest[end..])
-        };
-        if name.is_empty() {
-            return Err(invalid());
-        }
-        let value = if name.bytes().all(|b| b.is_ascii_digit()) {
-            name.parse::<usize>().ok().and_then(|i| captures.get(i))
-        } else {
-            captures.name(name)
-        };
-        if let Some(value) = value {
-            append(&mut out, value.as_str())?;
-        }
-        rest = tail;
-    }
-    append(&mut out, rest)?;
-    Ok(out)
-}
-fn append(out: &mut String, value: &str) -> io::Result<()> {
-    if value.len() > MAX_URL.saturating_sub(out.len()) {
-        return Err(invalid());
-    }
-    out.push_str(value);
-    Ok(())
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn independent_http_rules_bound_capture_expansion_and_apply_only_first_match() {
-        let policy=Policy::compile("rewrite:\n- {pattern: '^http://old\\.example/(.*)$', action: replace, replacement: 'https://new.example/$1'}\n- {pattern: '.', action: reject}\n").unwrap();
-        let Action::Forward(url) = policy
-            .evaluate(checked_url("http://old.example/path?q=1").unwrap())
-            .unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(url.as_str(), "https://new.example/path?q=1");
-        assert!(matches!(
-            policy
-                .evaluate(checked_url("http://other.example/").unwrap())
-                .unwrap(),
-            Action::Reject
-        ));
-        let regex = Regex::new("(.*)").unwrap();
-        let input = "x".repeat(MAX_URL);
-        let captures = regex.captures(&input).unwrap();
-        assert!(expand(&captures, "$1$1").is_err());
-        assert_eq!(expand(&captures, "$$/literal").unwrap(), "$/literal");
-        for raw in [
-            "http://u:p@host/",
-            "file:///tmp/file",
-            "http://host/#fragment",
-            "http://host/\r\n",
-        ] {
-            assert!(checked_url(raw).is_err());
-        }
-        assert!(
-            Policy::compile(
-                "rewrite: [{pattern: '.', action: reject, replacement: 'http://host/'}]"
-            )
-            .is_err()
-        );
-        assert!(Policy::compile("rewrite: [{pattern: '.', action: replace}]").is_err());
-    }
-}
 
-#[cfg(all(test, feature = "inbound-http"))]
-mod snapshot_tests {
-    use super::*;
-    #[test]
-    fn addendum_is_strict_and_kept_outside_mihomo_yaml() {
-        let mut config = crate::config::Config::parse_yaml(b"rules: ['MATCH,DIRECT']\n").unwrap();
-        config
-            .set_http_config(Some("rewrite: [{pattern: '.', action: reject}]"))
-            .unwrap();
-        let policy = config.http_policy().unwrap();
-        assert!(policy.enabled());
-        let template = config.providers.as_ref().unwrap();
-        let rebuilt = template
-            .materialize(&crate::config::providers::ProviderContents::new())
-            .unwrap();
-        assert!(Arc::ptr_eq(&policy, &rebuilt.http_policy().unwrap()));
-        assert!(
-            crate::config::Config::parse_yaml(b"rewrite: []\nrules: ['MATCH,DIRECT']\n").is_err()
-        );
-        for bad in [
-            "mitm: {}",
-            "rewrite: [{pattern: '.', action: mock}]",
-            "http-ports: [0]",
-            "rewrite: [{pattern: '.', action: replace}]",
-            "rewrite: [{pattern: '.', action: redirect302, replacement: 'javascript:bad'}]",
-        ] {
-            assert!(Policy::compile(bad).is_err());
-        }
-        assert!(Policy::compile(&format!("http-ports: [{}]", vec!["80"; 65].join(","))).is_err());
-        assert!(Policy::compile_optional(Some("")).unwrap().is_none());
-        assert!(
-            Policy::compile_optional(Some("rewrite: []"))
-                .unwrap()
-                .is_none()
-        );
-    }
-}
+#[cfg(test)]
+#[path = "document_tests.rs"]
+mod tests;

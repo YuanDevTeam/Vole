@@ -110,6 +110,9 @@ pub(super) fn append(out: &mut String, value: &str, limit: usize) -> io::Result<
     if value.len() > limit.saturating_sub(out.len()) {
         return Err(invalid());
     }
+    out.try_reserve_exact(value.len()).map_err(|_| {
+        io::Error::new(io::ErrorKind::OutOfMemory, "HTTP rewrite allocation failed")
+    })?;
     out.push_str(value);
     Ok(())
 }

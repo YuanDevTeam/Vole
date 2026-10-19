@@ -1,26 +1,132 @@
 //! Selective business TLS termination. Trust installation belongs to the host.
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::{collections::BTreeSet, io};
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub(super) struct RawMitm {
-    pub(super) domains: Vec<String>,
+pub(crate) struct RawMitm {
     #[serde(default)]
-    pub(super) exclude_domains: Vec<String>,
-    #[serde(default = "default_ports")]
-    pub(super) ports: Vec<u16>,
-    pub(super) certificate: String,
-    pub(super) private_key: String,
+    pub(crate) enabled: bool,
+    #[serde(default, deserialize_with = "non_null_vec")]
+    pub(crate) domains: Vec<RawDomain>,
+    #[serde(default, deserialize_with = "non_null_vec")]
+    pub(crate) exclude_domains: Vec<RawDomain>,
+    #[serde(default = "default_ports", deserialize_with = "non_null_vec")]
+    pub(crate) ports: Vec<u16>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct RawDomain {
+    pub(crate) pattern: String,
+    #[serde(default = "enabled")]
+    pub(crate) enabled: bool,
+}
+
+fn enabled() -> bool {
+    true
+}
+
+fn non_null_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer)?
+        .ok_or_else(|| serde::de::Error::custom("MITM sequence must not be null"))
 }
 fn default_ports() -> Vec<u16> {
     vec![443]
 }
 
+impl Default for RawMitm {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            domains: Vec::new(),
+            exclude_domains: Vec::new(),
+            ports: default_ports(),
+        }
+    }
+}
+
+fn invalid() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "invalid selective TLS policy")
+}
+
+struct Pattern {
+    name: Box<str>,
+    suffix: bool,
+}
+
+impl Pattern {
+    fn compile(raw: &str) -> io::Result<Self> {
+        let (suffix, raw) = raw.strip_prefix("*.").map_or((false, raw), |s| (true, s));
+        if raw.contains('*') || raw.len() > 253 || raw.parse::<std::net::IpAddr>().is_ok() {
+            return Err(invalid());
+        }
+        let name = crate::routing::normalize_domain_name(raw).map_err(|_| invalid())?;
+        if !matches!(
+            rustls::pki_types::ServerName::try_from(name.as_str()),
+            Ok(rustls::pki_types::ServerName::DnsName(_))
+        ) {
+            return Err(invalid());
+        }
+        Ok(Self {
+            name: name.into(),
+            suffix,
+        })
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        if self.suffix {
+            name.strip_suffix(self.name.as_ref())
+                .is_some_and(|prefix| prefix.len() > 1 && prefix.ends_with('.'))
+        } else {
+            name == self.name.as_ref()
+        }
+    }
+}
+
+fn patterns(raw: &[RawDomain]) -> io::Result<Box<[Pattern]>> {
+    let mut seen = BTreeSet::new();
+    let mut output = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let pattern = Pattern::compile(&entry.pattern)?;
+        if !seen.insert((pattern.name.clone(), pattern.suffix)) {
+            return Err(invalid());
+        }
+        if entry.enabled {
+            output.push(pattern);
+        }
+    }
+    Ok(output.into())
+}
+
+impl RawMitm {
+    pub(crate) fn validate_static(&self) -> io::Result<()> {
+        if self.domains.len() > 64
+            || self.exclude_domains.len() > 64
+            || self.ports.len() > 64
+            || self.ports.contains(&0)
+        {
+            return Err(invalid());
+        }
+        let domains = patterns(&self.domains)?;
+        patterns(&self.exclude_domains)?;
+        if self.enabled && (domains.is_empty() || self.ports.is_empty()) {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(feature = "inbound-http")]
 mod enabled {
     use super::super::{HttpContext, Intercept, Scheme, authority::Authority, io::Replay};
-    use super::RawMitm;
+    use super::{Pattern, RawMitm, invalid, patterns};
     use crate::{
+        http_processing::private_context::CaMaterial,
         session::StreamSession,
         tcp_sniffer::{SniffOutcome, SniffProtocol, TcpSniffer},
     };
@@ -29,40 +135,6 @@ mod enabled {
     use tokio_util::sync::CancellationToken;
     use url::Url;
 
-    pub(super) struct Pattern {
-        name: Box<str>,
-        suffix: bool,
-    }
-    impl Pattern {
-        pub(super) fn compile(raw: &str) -> io::Result<Self> {
-            let (suffix, raw) = raw.strip_prefix("*.").map_or((false, raw), |s| (true, s));
-            if raw.contains('*') || raw.len() > 253 || raw.parse::<std::net::IpAddr>().is_ok() {
-                return Err(invalid());
-            }
-            let name = crate::routing::normalize_domain_name(raw).map_err(|_| invalid())?;
-            if !matches!(
-                rustls::pki_types::ServerName::try_from(name.as_str()),
-                Ok(rustls::pki_types::ServerName::DnsName(_))
-            ) {
-                return Err(invalid());
-            }
-            Ok(Self {
-                name: name.into(),
-                suffix,
-            })
-        }
-        pub(super) fn matches(&self, name: &str) -> bool {
-            if self.suffix {
-                name.strip_suffix(self.name.as_ref())
-                    .is_some_and(|prefix| prefix.len() > 1 && prefix.ends_with('.'))
-            } else {
-                name == self.name.as_ref()
-            }
-        }
-    }
-    fn invalid() -> io::Error {
-        io::Error::new(io::ErrorKind::InvalidInput, "invalid selective TLS policy")
-    }
     pub(in crate::http_processing) struct Mitm {
         domains: Box<[Pattern]>,
         exclusions: Box<[Pattern]>,
@@ -70,36 +142,31 @@ mod enabled {
         authority: Arc<Authority>,
     }
     impl Mitm {
-        pub(in crate::http_processing) fn compile(raw: RawMitm) -> io::Result<Arc<Self>> {
-            if raw.domains.is_empty()
-                || raw.domains.len() > 64
-                || raw.exclude_domains.len() > 64
-                || raw.ports.is_empty()
-                || raw.ports.len() > 64
-                || raw.ports.contains(&0)
-            {
-                return Err(invalid());
+        pub(in crate::http_processing) fn compile(
+            raw: RawMitm,
+            ca: Option<&CaMaterial>,
+        ) -> io::Result<Option<Arc<Self>>> {
+            raw.validate_static()?;
+            if !raw.enabled {
+                return Ok(None);
             }
-            let domains = raw
-                .domains
-                .iter()
-                .map(|s| Pattern::compile(s))
-                .collect::<io::Result<Vec<_>>>()?;
-            let exclusions = raw
-                .exclude_domains
-                .iter()
-                .map(|s| Pattern::compile(s))
-                .collect::<io::Result<Vec<_>>>()?;
-            let authority = Authority::load(&raw.certificate, &raw.private_key)?;
+            let domains = patterns(&raw.domains)?;
+            let exclusions = patterns(&raw.exclude_domains)?;
+            let ca = ca.ok_or_else(invalid)?;
+            ca.validate_size()?;
+            let authority = Authority::load(&ca.certificate, &ca.private_key)?;
             let mut ports = raw.ports;
             ports.sort_unstable();
             ports.dedup();
-            Ok(Arc::new(Self {
-                domains: domains.into(),
-                exclusions: exclusions.into(),
+            Ok(Some(Arc::new(Self {
+                domains,
+                exclusions,
                 ports: ports.into(),
                 authority,
-            }))
+            })))
+        }
+        pub(in crate::http_processing) fn identity(&self) -> [u8; 32] {
+            self.authority.identity()
         }
         pub(in crate::http_processing) fn candidate_port(&self, port: u16) -> bool {
             self.ports.binary_search(&port).is_ok()
@@ -198,7 +265,7 @@ pub(in crate::http_processing) use enabled::Mitm;
 
 #[cfg(all(test, feature = "inbound-http"))]
 mod tests {
-    use super::enabled::Pattern;
+    use super::{Pattern, RawMitm};
     #[test]
     fn selective_domains_do_not_accept_suffix_confusion_or_ip_literals() {
         let p = Pattern::compile("*.example.com").unwrap();
@@ -209,5 +276,68 @@ mod tests {
         for name in ["*", "a*b.example", "127.0.0.1", "[::1]"] {
             assert!(Pattern::compile(name).is_err());
         }
+    }
+
+    #[test]
+    fn static_mitm_validation_needs_no_private_material() {
+        let input = r#"enabled: true
+domains:
+  - pattern: API.Example.COM.
+  - pattern: '*.example.net'
+exclude-domains:
+  - pattern: private.example.net
+"#;
+        let policy: RawMitm = serde_yaml_ng::from_str(input).unwrap();
+        policy.validate_static().unwrap();
+        for input in [
+            "domains: null",
+            "ports: null",
+            "exclude-domains: null",
+            "domains: [{pattern: example.com}, {pattern: EXAMPLE.COM., enabled: false}]",
+            "domains: [{pattern: '*.example.com'}, {pattern: '*.EXAMPLE.COM.'}]",
+            "domains: [{pattern: '*', enabled: false}]",
+            "enabled: true\ndomains: [{pattern: example.com, enabled: false}]",
+            "enabled: true\ndomains: [{pattern: example.com}]\nports: []",
+            "certificate: ignored\nprivate-key: ignored",
+        ] {
+            assert!(
+                serde_yaml_ng::from_str::<RawMitm>(input)
+                    .and_then(|raw| raw.validate_static().map_err(serde::de::Error::custom))
+                    .is_err(),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_mitm_binds_private_identity_and_keeps_existing_authority() {
+        use crate::http_processing::private_context::test_material;
+        let settings: RawMitm = serde_yaml_ng::from_str(
+            "enabled: true\ndomains: [{pattern: '*.example.com'}]\nexclude-domains: [{pattern: private.example.com}]",
+        )
+        .unwrap();
+        assert!(super::enabled::Mitm::compile(settings.clone(), None).is_err());
+        assert!(
+            super::enabled::Mitm::compile(RawMitm::default(), None)
+                .unwrap()
+                .is_none()
+        );
+        let first_material = test_material();
+        let first = super::enabled::Mitm::compile(settings.clone(), Some(&first_material))
+            .unwrap()
+            .unwrap();
+        let first_identity = first.identity();
+        assert_eq!(first_identity, first_material.identity().unwrap());
+        assert!(first.permits("api.example.com", 443));
+        assert!(!first.permits("example.com", 443));
+        assert!(!first.permits("private.example.com", 443));
+        assert!(!first.permits("api.example.com", 8443));
+        drop(first_material);
+        let second = super::enabled::Mitm::compile(settings, Some(&test_material()))
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.identity(), second.identity());
+        assert_eq!(first.identity(), first_identity);
+        assert!(first.permits("api.example.com", 443));
     }
 }

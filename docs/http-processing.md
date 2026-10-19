@@ -1,70 +1,86 @@
 # HTTP 处理
 
-HTTP 处理只作用于 TUN 和 mixed-port 的业务 TCP。Core 自己的 DNS、provider、GeoData、
-节点握手及 Controller 请求不进入该路径。关闭时不创建 CA、证书缓存或后台任务。
+独立 HTTP 配置作用于 TUN 和 mixed-port 的业务 TCP。Core 的 DNS、provider、GeoData、节点握手及 Controller 不进入业务重写。主代理配置仍使用 Mihomo YAML。
 
-## 独立输入
+## 配置与资源
 
-主配置仍使用 Mihomo YAML。`validateConfig`、`start` 和 `updateConfig` 可另外传入
-`httpConfigYaml`；CLI 的 `-http-config PATH` 由 foreground 读取该文件，不自动搜索。
-附加配置最多 1 MiB，和主配置一起验证、发布，失败保留当前运行代。
-`updateConfig` 省略附加输入时继承当前值，显式空字符串关闭；provider 刷新继承同一策略。
-Windows Session Host 从同一个不可变启动 Snapshot 读取附加输入，运行时更新不改变旧 token。
+`httpConfigYaml` 使用单份 YAML 文档。未知字段、旧格式、重复键、类型错误及 `null` 冒充省略值均拒绝。四个顶层字段均可省略：
 
 ```yaml
 http-ports: [80, 8080]
+rewrite-providers: {}
 rewrite:
-  - pattern: '^http://old\.example/(.*)$'
-    action: replace
-    replacement: 'https://new.example/$1'
-  - pattern: '^https://private\.example/blocked$'
-    action: reject
+  enabled: false
+  rules: []
 mitm:
-  domains: ['private.example', '*.example.net']
-  exclude-domains: ['excluded.example.net']
+  enabled: false
   ports: [443]
-  certificate: | # 用户提供的 CA 证书 PEM
-    ...
-  private-key: | # 匹配的 CA 私钥 PEM
-    ...
+  domains: []
+  exclude-domains: []
 ```
 
-`mitm` 可省略；CA 私钥由 App/宿主管理安全存储与信任安装，Core 不生成或安装根证书。
-附加输入包含私密材料，不应作为普通代理订阅分享。Controller 查询、日志和 Debug 不返回其原文。
+端口有效且不可重复。`rewrite.enabled` 控制真实执行，关闭仍校验直接规则与 inline 内容；规则和引用的 `enabled` 默认 true。关闭引用不读取来源。MITM 为独立本机授权，远程规则不能扩大它。
 
-## URL 动作
+```yaml
+rewrite-providers:
+  local: {type: file, path: ./rules/local.yaml}
+  remote:
+    type: http
+    url: https://rules.example.com/http.yaml
+    path: ./rewrite-cache/remote.yaml
+    interval: 86400
+    header:
+      Authorization: ['Bearer example-token']
+  builtin:
+    type: inline
+    payload:
+      - {url: 'https://example.com/debug', match: exact, action: reject}
+rewrite:
+  enabled: true
+  rules:
+    - {url: 'http://old.example/v1/', match: prefix, action: replace, replacement: 'https://new.example/v2/'}
+    - {rule-set: local}
+    - {rule-set: remote}
+    - {rule-set: builtin, enabled: false}
+```
 
-规则按顺序匹配完整规范化 URL，只执行第一条，不递归改写。动作包括 `replace`、
-`redirect302`、`redirect307`、`reject`；前三者需要 replacement，reject 不接受 replacement。
-支持 `$1`、`${name}` 与 `$$`。只接受 HTTP(S) URL，不接受 userinfo、fragment 或控制字符。
-最多 64 条规则，每个 pattern 2 KiB，pattern/replacement 合计 64 KiB，单个结果 8 KiB；
-每条正则的编译与搜索缓存有局部上限，替换先检查输出空间再扩容。
+file 只接受必填 `path`；inline 只接受必填 `payload`；http 接受必填 `url` 和可选 `path`、`interval`、多值 `header`。外部文件只有 `payload`，与本机直接规则同形，不能嵌套引用或携带本机授权／CA。按引用位置展开，不允许重复引用或未知名称。
 
-redirect/reject 本地响应后关闭连接，不先连接原目标，也不把未读正文当作下一请求。
-转发复用既有 HTTP/1 定界和流式正文，支持持久连接、chunked、Expect、临时响应及 Upgrade。
-同 origin 的 path/query 动作保留已选择的目标 IP；跨 origin 时重新解析、选路、重建 Host，
-并移除旧站点的 Authorization/Cookie。入口认证身份和原始目标快照保持。
+file 相对路径锚定宿主提供的 HTTP 文件目录，HTTP 缓存锚定初始化的数据目录；缓存不能与主文件、源文件或其他缓存冲突。URL 与规范化请求头绑定来源；认证变化不能借用旧缓存。304 要求完整有效的同来源内容。全部来源及总体编译通过后，才提交缓存与完整待应用候选；失败保留旧内容。
+
+file 在显式准备时读取；http 的 interval 默认 86400 秒，0 只关闭周期更新。准备与下载使用底层资源路径，不经过本次 HTTP 业务处理。
+
+当前工程上限为主文档与实际外部内容合计 1 MiB、展开规则 64 条、选择器／搜索各 2 KiB、非正文规则文本合计 64 KiB、单个 URL 结果 8 KiB。正则编译与 DFA 缓存分别限 128／64 KiB；YAML 别名、模板输出及并行准备也受限。超限失败，不截断规则；这些准入上限不代表进程 RSS。
+
+## URL 阶段
+
+规则共有必填 `url`、`action`，可选 `match`、`enabled` 和展示用 `name`。`match` 为 regex（默认）、exact 或 prefix，不根据文本猜测。URL 动作为 replace、redirect302、redirect307、reject；前三者必须有 replacement，reject 不接受替换参数。
+
+`replacement-mode` 默认 match：exact 替换整个 URL，prefix 保留后缀，regex 仅替换首个匹配片段。显式 url 使用整个展开结果。prefix 只在无查询的 replacement 以 `/` 结尾、后缀也以 `/` 开头时去掉一个边界斜杠，不拼接路径或合并查询。
+
+正则模板支持 `$0`、`$N`、`${N}`、`${name}`、`$$`，不支持 `$name`；未知捕获加载失败，可选未参与捕获为空。字面模式不展开捕获。仅接受合法绝对 HTTP(S) URL，拒绝 userinfo、fragment、端口 0、控制／空白字符和反斜杠。离线输入 trim 并去掉 fragment；配置目标不允许 fragment。
+
+所有阶段按原始规范化 URL（U0）筛选。URL 动作首条命中产生 U1，不递归。非法生成目标本地返回空 502；redirect 与 reject 本地结束，不访问原站，reject 为空 403。相同 origin 的路径／查询改写保留已选 IP；跨 origin 重选路、重建 authority，先清理收到的 Authorization／Cookie。原始目标与入口身份保留。
 
 ## 选择性 HTTPS
 
-域名为精确匹配或 `*.example.net` 子域匹配，后者不包含域本身；排除项优先。
-只有明确允许的 SNI/端口才终止 TLS。无 SNI、ECH（含 GREASE）、未命中域名和 UDP/QUIC
-透明保留；不会用 ECH 的外层覆盖名假装获得目标授权。证书固定或客户端证书要求可能使
-选定连接失败，失败不会回退为关闭上游证书校验。
+```yaml
+mitm:
+  enabled: true
+  domains:
+    - {pattern: private.example}
+    - {pattern: '*.example.net', enabled: true}
+  exclude-domains:
+    - {pattern: excluded.example.net}
+  ports: [443]
+```
 
-每个原始 HTTP authority 独立检查域名与端口授权；H2 连接的第一个域名不会授权所有流。
-与连接 SNI/端口不同的 authority 重新选择目标。上下游 TLS 独立；最终上游经过同一
-Dispatcher 和受保护物理出口，按实际最终主机验证证书，H2/H1 使用真实协商结果。
-H1 上游按 HTTP/1.1 协商；H2 下游可对接 H2 或 H1 上游。正文背压传递，不缓存全文。
+域名项只有 pattern 和默认 true 的 enabled。支持精确名称及 `*.suffix` 子域匹配，后者不包含域本身；启用排除项优先，关闭项仍校验。开启要求有效允许域名、端口及匹配的有效 CA／私钥。关闭不构造 CA；宿主提供独立私密输入，规则、payload 和普通快照不承载私钥。
 
-每个 CA 身份归运行代所有，叶证书同时限制 32 项、材料计费 256 KiB、空闲 10 分钟，
-有效期最多 24 小时且不超过 CA。计费含证书、私钥及配置的保守成本，不代表进程 RSS。
-同一 CA 的发行串行，同域名复用缓存；没有可脱离 Stop 的发行队列或任务。
-HTTP 会话固定使用进入时的策略和资源代，reload 只影响后续新会话；CA 轮换也遵循该规则。
+只终止允许的 SNI／端口；无 SNI、ECH（含 GREASE）、未授权名称和 UDP／QUIC 保持透明。每个原始 HTTP authority 独立授权，同一 H2 连接不扩大权限。最终上游按实际目标验证证书，使用受保护出口；不通过关闭验证处理 pinning 或客户端证书要求。
 
-H2 每连接最多 8 个活动请求；流/连接接收窗口分别 32/64 KiB，头最多 32 KiB/100 字段，
-单帧 16 KiB，动态 HPACK 表关闭。H2 不支持 CONNECT 或扩展 CONNECT；普通 CONNECT 返回 405。
-WebSocket 沿 H1 Upgrade 路径透明转发。上游连接不跨请求复用，不存在跨身份的闲置池。
-上传活动按 30 秒无进展期限控制，持续上传不消耗响应头等待预算；上传完成后，
-尚未收到的响应头有独立 30 秒等待期限。提前响应继续与上传并发，响应正文使用逐帧空闲期限。
-取消和 Stop 同时覆盖下游、上游、正文及驱动；设备信任与原生 VPN 验收独立于编译和容器互通。
+H1 上游协商 HTTP/1.1，H2 下游对接实际协商的 H2 或 H1。普通 H2 CONNECT 返回 405；WebSocket 使用 H1 Upgrade。叶证书最多 32 项、材料预算 256 KiB、空闲 10 分钟，有效期不超过 24 小时或 CA。
+
+H2 每连接最多 8 个活动请求，流／连接接收窗口 32／64 KiB，头最多 32 KiB／100 字段，帧 16 KiB，关闭动态 HPACK 表。上游不跨请求复用。上传使用 30 秒无进展期限；上传完成后响应头另有 30 秒等待期限，提前响应仍与上传并发。取消和 Stop 覆盖上下游、正文与驱动。
+
+当前会话固定主设置、实际 payload、授权和 CA。保存／资源刷新只产生待应用候选，节点选择和分流更新继承 active。显式重连准备候选后切换，后续启动失败使用旧实际内容恢复，不重读已变化文件；普通 Stop 释放私密材料。共享入口见 [Invoke API](invoke-api.md) 与 [CLI](cli.md)。
