@@ -10,6 +10,7 @@ fn http_document_is_static_strict_and_keeps_disabled_sources_unprepared() {
         "rewrite: []",
         "rewrite: {rules: null}",
         "http-ports: [80,80]",
+        "mitm: {ports: [443,443]}",
         "mitm: {domains: null}",
         "rewrite-providers: {x: {type: inline, payload: null}}",
         "rewrite-providers: {x: {type: file, path: x, interval: 0}}",

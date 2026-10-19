@@ -91,6 +91,7 @@ impl Document {
     pub(super) fn finish(&mut self) -> io::Result<()> {
         super::require_http_adapter()?;
         validate_ports(&self.http_ports)?;
+        validate_ports(&self.mitm.ports)?;
         self.mitm.validate_static()?;
         if self.providers.len() > MAX_RULES || self.rewrite.rules.len() > MAX_RULES {
             return Err(invalid());
