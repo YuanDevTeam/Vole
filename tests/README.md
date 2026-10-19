@@ -70,7 +70,10 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | UoT | `outbound::uot::tests::` | 半帧取消后继续、v2首部、原期限、单槽响应与Stop |
 | VMess 响应边界 | `outbound::vmess::header::delayed_response_memory_tests::`、`outbound::vmess::stream::tests::`、`--test vmess_lifecycle` | 官方延迟响应向量、提交前期限、响应认证、nonce 耗尽与关闭 |
 | SS2022 | `outbound::shadowsocks::datagram::tests::` | 官方内存对端、三种 cipher、空 UDP/EIH、认证后 cipher 准入、取消与轮换 ID、重放边界 |
-| CLI前台 | `invoke::foreground::tests::` | 文件/stdin、路径、信号及清理 |
+| HTTP 编译与执行 | `http_processing::` | 严格规则与 provider、URL/头/正文、压缩与 JSON Patch、选择性 TLS、H1/H2 和有界回退 |
+| HTTP Invoke | `invoke::http::`、`resource::http_control::tests::` | 有界私密输入、离线演算、来源未准备、下载 dispatcher 接线、单一准入、取消与 Stop 收尾 |
+| HTTP 在线配置 | `runtime::providers::apply::http_tests::` | 活动快照继承、变更要求重连、旧候选保留 |
+| CLI前台 | `invoke::foreground::tests::` | 文件/stdin、原生路径、显式 HTTP 文件、CA 读取边界、信号取消及清理 |
 
 独立集成回归按目标运行，例如：
 
@@ -146,9 +149,40 @@ HY2 Gecko/Realm 的配置和内存wire回归按 `gecko_`、`realm_` 中列出的
 TUIC ClientHello 使用 `tuic_disable_sni_changes_real_quic_hello_without_changing_verification_policy`。
 不得将包含网络peer的整个outbound模块直接作为宿主测试执行。
 
-HTTP URL 动作的纯内存回归：`http_processing::`、`main_config_and_provider_rebuild_preserve_the_addendum_until_explicit_clear`、`update_http_addendum_preserves_optional_clear_and_its_separate_byte_limit`、`explicit_http_file_is_validated_without_initializing_data_or_autoloading`、`http_addendum_option_only_transports_an_explicit_native_path`；Windows 平台另编译 `snapshot_identity_and_readback_include_the_http_addendum`。覆盖共享 TUN/mixed/CONNECT Adapter、预读、最终目标单次选路、原元数据、跨 origin 凭据隔离、未读 Expect body 的本地响应、禁用／非候选轻路径、代际继承与显式关闭。外部互通仅由真实 TUN benchmark 见证，不从这些内存回归推导。
+## HTTP 处理与 Invoke
+
+`http_processing::` 使用合成规则、临时文件、内存 dispatcher 和 duplex，不创建宿主监听器。
+规则入口采用 `http-ports`、`mitm`、`rewrite-providers`、`rewrite` 四个顶层字段，
+覆盖严格类型与数值、URL 捕获与替换、请求／响应头、文本与 JSON Patch、压缩、正文预算及整阶段回退。
+provider 回归覆盖启用引用的有序展开、关闭引用零 I/O、来源身份、实际 payload 快照、
+失败保留、缓存原子发布与取消。规则与私密 CA 的完整合同见 [HTTP 处理](../docs/http-processing.md)。
+
+H1/H2 内存对端覆盖共享 TUN/mixed/CONNECT 适配、预读、最终目标单次选路、
+原始 URL 选择、跨 origin 凭据隔离、Expect 早响应、流式背压、半关闭、截断拒绝与取消。
+选择性 TLS 同时检查 CA/私钥匹配、叶证书 AKI、证书缓存计费与逐 authority 授权。
+未命中正文规则时不收集完整正文；命中后只在有界工作区完成处理，失败恢复原始阶段内容。
+
+`invoke::http::` 检查私密输入在 JSON Value 分配前的准入与 `testHttp` 离线演算。
+离线演算不下载、不读 provider、不生成证书；没有实际来源时报告未准备，
+没有方向样本时仅报告规则被选中，不声称正文已验证。重写总开关关闭仍可演算启用规则，
+真实 HTTPS 授权与 CA 条件单独判断。
+
+`resource::http_control::tests::` 检查指定 dispatcher 的传递、共享配置许可、
+Store 争用及取消后等待下载收尾；`invoke::http::` 同时检查 idle refresh 与实例创建互斥。
+`runtime::providers::apply::http_tests::` 检查普通路由更新保留活动 HTTP 快照，
+HTTP 内容或来源上下文变更要求显式重连。失败恢复的策略组选择另选
+`recovery_snapshot_keeps_current_group_member_without_selection_persistence`。
+
+显式配置传递另选 `main_config_and_provider_rebuild_preserve_the_addendum_until_explicit_clear`、
+`update_http_addendum_preserves_optional_clear_and_its_separate_byte_limit` 和二进制
+`cli::tests::http_addendum_option_only_transports_an_explicit_native_path`。
+`invoke::foreground::tests::` 检查显式文件与路径、校验不初始化、不自动加载 HTTP 文件、
+MITM 关闭不读 CA、无 HTTP 配置的 CA 参数提前拒绝，以及启动期信号取消后 join 清理。
+Windows 平台另编译 `snapshot_identity_and_readback_include_the_http_addendum`，
+检查规则实际内容与私密材料的会话快照边界。
 
 HTTP/1 早响应与空正文 Upgrade 的定向内存回归：`inbound::http::server::early_final_memory_tests::`；不运行包含宿主 socket 的整个入站测试模块。
 上传完成后的响应等待、静默上限与首字节后绝对读头期限：`inbound::http::server::response_deadline_memory_tests::`；使用 paused Tokio clock 和内存 duplex。
 
-`http_processing::` 同时覆盖选择性 HTTPS：CA/私钥匹配、叶证书 AKI、代内缓存计费、逐 authority 授权，以及内存 TLS/H2 流控、早响应、持续上传、上传后静默、背压与空正文的有界等待、真实截断拒绝与取消。TLS/H2 对端使用内存 duplex，不创建宿主 socket；这些回归不代签设备信任安装或系统 VPN。
+这些回归不证明真实 TUN 互通、进程 RSS、吞吐、设备信任安装、系统 VPN 或平台真机行为；
+对应验收分别由容器夹具、平台构建和设备测试完成。

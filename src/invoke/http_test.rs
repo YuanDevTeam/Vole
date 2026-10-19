@@ -267,6 +267,18 @@ mod tests {
         evaluate(serde_json::from_value(input).unwrap()).unwrap()
     }
     #[test]
+    fn offline_pipeline_uses_original_url_and_preserves_header_values() {
+        let input = json!({"httpConfigYaml": "rewrite: {enabled: false, rules: [{url: 'http://old.example/a', match: exact, action: replace, replacement: 'http://new.example/b'}, {url: 'http://old.example/a', match: exact, action: request-header-set, header: X-Test, value: selected}]}","url":" http://old.example/a#fragment ","request":{"headers":[["Authorization","old-secret"],["Cookie","old-cookie"]]}});
+        let result = run(input);
+        assert_eq!(result["targetUrl"], "http://new.example/b");
+        assert_eq!(result["rewriteEnabled"], false);
+        assert_eq!(
+            result["stages"][0]["headers"],
+            json!([["x-test", "selected"]])
+        );
+        assert_eq!(result["httpsReady"], false);
+    }
+    #[test]
     fn unprepared_external_rules_are_distinct_from_no_match() {
         let result = run(
             json!({"httpConfigYaml":"rewrite-providers: {missing: {type: file, path: no-io.yaml}}\nrewrite: {rules: [{rule-set: missing}]}","url":"https://example.com/"}),

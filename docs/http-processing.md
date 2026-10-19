@@ -62,6 +62,34 @@ file 在显式准备时读取；http 的 interval 默认 86400 秒，0 只关闭
 
 所有阶段按原始规范化 URL（U0）筛选。URL 动作首条命中产生 U1，不递归。非法生成目标本地返回空 502；redirect 与 reject 本地结束，不访问原站，reject 为空 403。相同 origin 的路径／查询改写保留已选 IP；跨 origin 重选路、重建 authority，先清理收到的 Authorization／Cookie。原始目标与入口身份保留。
 
+## Header 与正文
+
+`request-header-set/add/remove/replace` 和 `response-header-set/add/remove/replace` 按规则顺序累计执行。`header` 为字段名；set/add 必须有字面 `value`，remove 不携带值，replace 使用 `search` 与 `replacement`。多值字段逐项处理；set 覆盖原值，add 追加独立值。协议控制字段、Connection 提名字段不能修改。阶段失败时整个 header 阶段回退；跨 origin 清理旧凭据后，规则可明确设置新的 Authorization／Cookie。
+
+正文动作是 `request-body-set/replace/json-patch` 和对应的 `response-body-*`。set 使用 UTF-8 字面 `value`，包含空字符串；replace 使用 `search`、`replacement`。`search-mode` 默认 literal，可选 regex；`occurrences` 默认 all，可选 first。只有 regex search 的替换展开其自身捕获，其他值不展开 URL 捕获。所有正文操作按序执行，一条失败则整个正文阶段原文旁路，保留独立 header 阶段的成功修改。
+
+```yaml
+rewrite:
+  enabled: true
+  rules:
+    - {url: 'https://api.example/v1/', match: prefix, action: request-header-set, header: X-Client, value: Vole}
+    - url: 'https://api.example/v1/settings'
+      match: exact
+      action: response-body-json-patch
+      patch:
+        - {op: add, path: /enabled, value: true}
+        - {op: replace, path: /message, value: ready}
+    - {url: 'http://example.com/', match: prefix, action: response-body-replace, search: old, replacement: new}
+```
+
+JSON Patch 支持 RFC 6902 的 add/remove/replace/move/copy/test 和 RFC 6901 Pointer；`value` 可为真正的 null、布尔、数值、字符串、数组、对象。配置数值必须能无损转换，不能静默舍入；业务 JSON 保留数值原文并拒绝重复键。空 patch 不触发解析或重新编码。非法 JSON、Pointer 或失败的 test 导致整个正文阶段原样旁路。
+
+只有被正文规则选中的消息才缓冲。原始、解码、中间和最终正文各限 256 KiB；进程共享 2 MiB 正文工作区，包含 JSON 与 codec 临时空间。先预留再分配，无额度直接旁路；发送期间保留额度。未知长度最多探测上限加一字节，超限按原实体字节回放已读前缀和余下数据，不截断。传输中断、超时和取消仍是错误，不能假装完成。
+
+支持 identity、gzip、deflate、br；按收到的 Content-Type、charset、Content-Encoding 和原始请求 Accept-Encoding 判断资格。改写后使用 UTF-8 identity，修正长度与表示元数据并删除失效的校验／签名字段。没有实际改动时保留原始编码表示。未知编码、非法文本、压缩校验失败或预算不足均整阶段原文旁路。
+
+HEAD、无正文状态、206/Content-Range、CONNECT、Upgrade、SSE、gRPC、multipart 及带 trailer 的消息不做正文改写，普通 header 规则仍可执行。选中正文的 H1 Expect: 100-continue 在读取前完成握手；未匹配消息保持原有流式背压、早响应和半关闭语义。H1/H2 与成功解密的 HTTPS 共用规则与预算。
+
 ## 选择性 HTTPS
 
 ```yaml
