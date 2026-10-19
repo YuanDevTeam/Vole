@@ -18,6 +18,13 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 const PAYLOAD: usize = 96 * 1024;
+#[derive(Clone, Copy)]
+enum OriginMode {
+    None,
+    BeforeUpload,
+    AfterUpload,
+    ShortClose { truncated: bool },
+}
 fn pem(label: &str, bytes: &[u8]) -> String {
     use base64::Engine as _;
     format!(
@@ -30,6 +37,7 @@ struct Origin {
     h2: bool,
     early: bool,
     truncated: bool,
+    mode: OriginMode,
     sessions: Mutex<Vec<StreamSession>>,
     received: Arc<Mutex<Vec<Vec<u8>>>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -51,6 +59,7 @@ impl Dispatcher for Origin {
         let h2 = self.h2;
         let early = self.early;
         let truncated = self.truncated;
+        let mode = self.mode;
         let received = self.received.clone();
         let (client, peer) = tokio::io::duplex(8192);
         let task = tokio::spawn(async move {
@@ -60,6 +69,14 @@ impl Dispatcher for Origin {
             else {
                 return;
             };
+            if let OriginMode::ShortClose { truncated } = mode {
+                if let Ok(body) = short_h2_reply_and_close(&mut tls, truncated).await {
+                    received.lock().unwrap().push(body);
+                }
+                // Match an origin that sends one complete response and closes
+                // without GOAWAY or TLS close_notify.
+                return;
+            }
             if h2 {
                 let mut builder = wire::server::Builder::new();
                 builder
@@ -68,6 +85,10 @@ impl Dispatcher for Origin {
                 let mut connection = builder.handshake::<_, Bytes>(tls).await.unwrap();
                 let (request, mut response) = connection.accept().await.unwrap().unwrap();
                 let exchange = async move {
+                    if matches!(mode, OriginMode::BeforeUpload) {
+                        tokio::time::sleep(Duration::from_secs(31)).await;
+                        return;
+                    }
                     if early || truncated {
                         received.lock().unwrap().push(Vec::new());
                         let mut out = response
@@ -107,6 +128,10 @@ impl Dispatcher for Origin {
                     }
                     assert!(bytes.iter().all(|b| *b == 7));
                     received.lock().unwrap().push(bytes);
+                    if matches!(mode, OriginMode::AfterUpload) {
+                        tokio::time::sleep(Duration::from_secs(31)).await;
+                        return;
+                    }
                     let mut out = response
                         .send_response(
                             Response::builder()
@@ -136,6 +161,10 @@ impl Dispatcher for Origin {
                     head.push(tls.read_u8().await.unwrap());
                 }
                 let head = String::from_utf8(head).unwrap();
+                if matches!(mode, OriginMode::BeforeUpload) {
+                    tokio::time::sleep(Duration::from_secs(31)).await;
+                    return;
+                }
                 if early || truncated {
                     received.lock().unwrap().push(Vec::new());
                     let status = if early {
@@ -166,9 +195,15 @@ impl Dispatcher for Origin {
                         .contains(&format!("content-length: {PAYLOAD}\r\n"))
                 );
                 let mut bytes = vec![0; PAYLOAD];
-                tls.read_exact(&mut bytes).await.unwrap();
+                if tls.read_exact(&mut bytes).await.is_err() {
+                    return;
+                }
                 assert!(bytes.iter().all(|b| *b == 7));
                 received.lock().unwrap().push(bytes);
+                if matches!(mode, OriginMode::AfterUpload) {
+                    tokio::time::sleep(Duration::from_secs(31)).await;
+                    return;
+                }
                 tls.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x-check\r\nConnection: close\r\n\r\n").await.unwrap();
                 for _ in 0..PAYLOAD / 4096 {
                     tls.write_all(b"1000\r\n").await.unwrap();
@@ -202,6 +237,78 @@ impl Origin {
         }
     }
 }
+fn raw_h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    assert!(payload.len() <= 16 * 1024);
+    let mut frame = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+    frame.extend_from_slice(&[kind, flags]);
+    frame.extend_from_slice(&stream.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+async fn short_h2_reply_and_close<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    truncated: bool,
+) -> std::io::Result<Vec<u8>> {
+    let mut preface = [0; 24];
+    stream.read_exact(&mut preface).await?;
+    if preface != *b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
+        return Err(std::io::Error::other("invalid H2 preface"));
+    }
+    stream
+        .write_all(&raw_h2_frame(4, 0, 0, &[0, 1, 0, 0, 0, 0]))
+        .await?;
+    let mut body = Vec::new();
+    for _ in 0..128 {
+        let mut head = [0; 9];
+        stream.read_exact(&mut head).await?;
+        let size = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        if size > 16 * 1024 {
+            return Err(std::io::Error::other("oversized H2 frame"));
+        }
+        let mut frame = vec![0; size];
+        stream.read_exact(&mut frame).await?;
+        let id = u32::from_be_bytes(head[5..9].try_into().unwrap()) & 0x7fff_ffff;
+        if head[3] == 4 && head[4] & 1 == 0 {
+            stream.write_all(&raw_h2_frame(4, 1, 0, &[])).await?;
+        } else if head[3] == 0 && id == 1 {
+            body.extend_from_slice(&frame);
+            if body.len() > 21_504 || frame.iter().any(|byte| *byte != 7) {
+                return Err(std::io::Error::other("incorrect short upload"));
+            }
+            if !frame.is_empty() {
+                let count = (frame.len() as u32).to_be_bytes();
+                stream
+                    .write_all(
+                        &[raw_h2_frame(8, 0, 0, &count), raw_h2_frame(8, 0, 1, &count)].concat(),
+                    )
+                    .await?;
+            }
+        } else if matches!(head[3], 3 | 7) {
+            return Err(std::io::Error::other("upload reset before short response"));
+        }
+        if id == 1 && (matches!(head[3], 0 | 1) && head[4] & 1 != 0) {
+            if body.len() != 21_504 {
+                return Err(std::io::Error::other("incomplete short upload"));
+            }
+            // HPACK: zero table, :status 200, literal content-length 11264.
+            let mut headers = vec![0x20, 0x88];
+            headers.extend_from_slice(&[0x0f, 0x0d, 5]);
+            headers.extend_from_slice(b"11264");
+            let mut reply = raw_h2_frame(1, 4, 1, &headers);
+            let data = [9; 11_264];
+            reply.extend_from_slice(&raw_h2_frame(
+                0,
+                1,
+                1,
+                &data[..if truncated { 5_632 } else { 11_264 }],
+            ));
+            stream.write_all(&reply).await?;
+            stream.flush().await?;
+            return Ok(body);
+        }
+    }
+    Err(std::io::Error::other("short origin frame budget exceeded"))
+}
 fn prepared(h2: bool) -> (HttpContext, Arc<Origin>) {
     prepared_with(h2, false)
 }
@@ -209,6 +316,14 @@ fn prepared_with(h2: bool, early: bool) -> (HttpContext, Arc<Origin>) {
     prepared_response(h2, early, false)
 }
 fn prepared_response(h2: bool, early: bool, truncated: bool) -> (HttpContext, Arc<Origin>) {
+    prepared_origin(h2, early, truncated, OriginMode::None)
+}
+fn prepared_origin(
+    h2: bool,
+    early: bool,
+    truncated: bool,
+    mode: OriginMode,
+) -> (HttpContext, Arc<Origin>) {
     let mut params = rcgen::CertificateParams::default();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
@@ -230,6 +345,7 @@ fn prepared_response(h2: bool, early: bool, truncated: bool) -> (HttpContext, Ar
         h2,
         early,
         truncated,
+        mode,
         sessions: Mutex::new(Vec::new()),
         received: Arc::new(Mutex::new(Vec::new())),
         tasks: Mutex::new(Vec::new()),
@@ -251,6 +367,263 @@ fn session() -> StreamSession {
         destination: Destination::Ip("203.0.113.1:443".parse().unwrap()),
         sniffed_domain: Some("a.test".into()),
     }
+}
+async fn join_memory_owner<T>(mut task: tokio::task::JoinHandle<T>, seconds: u64) -> bool {
+    match timeout(Duration::from_secs(seconds), &mut task).await {
+        Ok(result) => result.is_ok(),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            false
+        }
+    }
+}
+#[tokio::test]
+async fn h2_short_upload_preserves_complete_response_after_abrupt_origin_close() {
+    let mut outcomes = Vec::new();
+    for truncated in [false, true] {
+        let (context, origin) =
+            prepared_origin(true, false, false, OriginMode::ShortClose { truncated });
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let (client, mut server) = tokio::io::duplex(8192);
+        let worker = tokio::spawn(async move {
+            context
+                .serve_h2(&mut server, session(), stop)
+                .await
+                .unwrap();
+        });
+        let (mut sender, driver) = wire::client::handshake(client).await.unwrap();
+        let driver = tokio::spawn(driver);
+        let (response, mut body) = sender
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri("https://a.test/upload")
+                    .header("content-length", 21_504)
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        let upload = async {
+            super::h2_body::send_data(&mut body, Bytes::from_static(&[7; 21_504])).await?;
+            body.send_data(Bytes::new(), true)
+                .map_err(std::io::Error::other)
+        };
+        let download = async {
+            let response = response.await.map_err(std::io::Error::other)?;
+            if response.status() != StatusCode::OK {
+                return Err(std::io::Error::other("wrong short response status"));
+            }
+            let mut body = response.into_body();
+            let mut count = 0;
+            while let Some(frame) = body.data().await {
+                let frame = frame.map_err(std::io::Error::other)?;
+                if frame.iter().any(|byte| *byte != 9) {
+                    return Err(std::io::Error::other("incorrect short response body"));
+                }
+                count += frame.len();
+                body.flow_control()
+                    .release_capacity(frame.len())
+                    .map_err(std::io::Error::other)?;
+            }
+            Ok(count)
+        };
+        let result = timeout(Duration::from_secs(3), async {
+            tokio::join!(upload, download)
+        })
+        .await;
+        cancel.cancel();
+        let worker_joined = join_memory_owner(worker, 1).await;
+        drop(sender);
+        let driver_joined = join_memory_owner(driver, 1).await;
+        let tasks = std::mem::take(&mut *origin.tasks.lock().unwrap());
+        let mut origin_joined = true;
+        for task in tasks {
+            origin_joined &= join_memory_owner(task, 1).await;
+        }
+        let delivered = if truncated {
+            matches!(&result, Ok((Ok(()), Err(_))))
+        } else {
+            matches!(&result, Ok((Ok(()), Ok(11_264))))
+        };
+        let received = origin.received.lock().unwrap();
+        let complete_upload = received.len() == 1 && received[0].len() == 21_504;
+        outcomes.push((
+            truncated,
+            delivered && complete_upload && worker_joined && driver_joined && origin_joined,
+            format!("{result:?}"),
+        ));
+    }
+    assert!(
+        outcomes.iter().all(|(_, passed, _)| *passed),
+        "short origin close changed delivery: {outcomes:?}"
+    );
+}
+#[tokio::test(start_paused = true)]
+async fn h2_continuous_upload_can_outlive_response_idle_for_h2_and_h1_origins() {
+    let mut outcomes = Vec::new();
+    for upstream_h2 in [true, false] {
+        let (context, origin) = prepared(upstream_h2);
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let (client, mut server) = tokio::io::duplex(8192);
+        let worker = tokio::spawn(async move {
+            context
+                .serve_h2(&mut server, session(), stop)
+                .await
+                .unwrap();
+        });
+        let (mut sender, driver) = wire::client::handshake(client).await.unwrap();
+        let driver = tokio::spawn(driver);
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://a.test/upload")
+            .header("content-length", PAYLOAD)
+            .body(())
+            .unwrap();
+        let (response, mut body) = sender.send_request(request, false).unwrap();
+        let start = tokio::time::Instant::now();
+        let upload = async {
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_secs(8)).await;
+                super::h2_body::send_data(&mut body, Bytes::from_static(&[7; PAYLOAD / 6])).await?;
+            }
+            body.send_data(Bytes::new(), true)
+                .map_err(std::io::Error::other)
+        };
+        let download = async {
+            let response = response.await.map_err(std::io::Error::other)?;
+            let mut body = response.into_body();
+            let mut count = 0;
+            while let Some(frame) = body.data().await {
+                let frame = frame.map_err(std::io::Error::other)?;
+                if frame.iter().any(|byte| *byte != 9) {
+                    return Err(std::io::Error::other("incorrect response body"));
+                }
+                count += frame.len();
+                body.flow_control()
+                    .release_capacity(frame.len())
+                    .map_err(std::io::Error::other)?;
+            }
+            if count != PAYLOAD
+                || body
+                    .trailers()
+                    .await
+                    .map_err(std::io::Error::other)?
+                    .and_then(|trailers| trailers.get("x-check").cloned())
+                    .is_none_or(|value| value != "complete")
+            {
+                return Err(std::io::Error::other(
+                    "incomplete response body or trailers",
+                ));
+            }
+            Ok(())
+        };
+        let result = timeout(Duration::from_secs(70), async {
+            tokio::join!(upload, download)
+        })
+        .await;
+        let elapsed = start.elapsed();
+        cancel.cancel();
+        let worker_joined = join_memory_owner(worker, 1).await;
+        drop(sender);
+        let driver_joined = join_memory_owner(driver, 1).await;
+        let tasks = std::mem::take(&mut *origin.tasks.lock().unwrap());
+        let mut origins_joined = true;
+        for task in tasks {
+            origins_joined &= join_memory_owner(task, 1).await;
+        }
+        let passed = matches!(&result, Ok((Ok(()), Ok(()))))
+            && elapsed >= Duration::from_secs(48)
+            && elapsed < Duration::from_secs(49)
+            && origin.received.lock().unwrap().len() == 1
+            && worker_joined
+            && driver_joined
+            && origins_joined;
+        outcomes.push((upstream_h2, passed, elapsed, format!("{result:?}")));
+    }
+    assert!(
+        outcomes.iter().all(|(_, passed, _, _)| *passed),
+        "continuous upload was cut off before its response: {outcomes:?}"
+    );
+}
+#[tokio::test(start_paused = true)]
+async fn h2_response_wait_stays_bounded_after_upload_and_during_backpressure() {
+    let mut outcomes = Vec::new();
+    for upstream_h2 in [true, false] {
+        for (mode, empty) in [
+            (OriginMode::BeforeUpload, false),
+            (OriginMode::AfterUpload, false),
+            (OriginMode::BeforeUpload, true),
+        ] {
+            let (context, origin) = prepared_origin(upstream_h2, false, false, mode);
+            let cancel = CancellationToken::new();
+            let stop = cancel.clone();
+            let (client, mut server) = tokio::io::duplex(8192);
+            let worker = tokio::spawn(async move {
+                context
+                    .serve_h2(&mut server, session(), stop)
+                    .await
+                    .unwrap();
+            });
+            let (mut sender, driver) = wire::client::handshake(client).await.unwrap();
+            let driver = tokio::spawn(driver);
+            let (response, mut body) = sender
+                .send_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("https://a.test/upload")
+                        .header("content-length", if empty { 0 } else { PAYLOAD })
+                        .body(())
+                        .unwrap(),
+                    empty,
+                )
+                .unwrap();
+            let start = tokio::time::Instant::now();
+            let upload = async {
+                if empty {
+                    return Ok(());
+                }
+                super::h2_body::send_data(&mut body, Bytes::from_static(&[7; PAYLOAD])).await?;
+                body.send_data(Bytes::new(), true)
+                    .map_err(std::io::Error::other)
+            };
+            let download = async {
+                let result = response.await;
+                (result.is_err(), start.elapsed())
+            };
+            let result = timeout(Duration::from_secs(35), async {
+                tokio::join!(upload, download)
+            })
+            .await;
+            cancel.cancel();
+            let worker_joined = join_memory_owner(worker, 1).await;
+            drop(sender);
+            let driver_joined = join_memory_owner(driver, 1).await;
+            let tasks = std::mem::take(&mut *origin.tasks.lock().unwrap());
+            let mut origins_joined = true;
+            for task in tasks {
+                origins_joined &= join_memory_owner(task, 2).await;
+            }
+            let uploaded = !matches!(mode, OriginMode::AfterUpload)
+                || (matches!(&result, Ok((Ok(()), _)))
+                    && origin.received.lock().unwrap().len() == 1);
+            let bounded = matches!(result,
+                Ok((_, (true, elapsed))) if elapsed >= Duration::from_secs(30)
+                    && elapsed < Duration::from_secs(31));
+            outcomes.push((
+                upstream_h2,
+                empty,
+                bounded && uploaded && worker_joined && driver_joined && origins_joined,
+            ));
+        }
+    }
+    assert!(
+        outcomes.iter().all(|(_, _, passed)| *passed),
+        "unbounded response wait: {outcomes:?}"
+    );
 }
 #[tokio::test]
 async fn h2_streams_large_bodies_and_trailers_through_actual_h2_and_h1_alpn() {
@@ -370,60 +743,62 @@ fn https_authority_permission_and_sni_coalescing_are_per_request() {
 }
 #[tokio::test]
 async fn h2_per_request_authority_and_cancellation_do_not_leave_inline_drivers() {
-    let (context, origin) = prepared(true);
-    let cancel = CancellationToken::new();
-    let stop = cancel.clone();
-    let (client, mut server) = tokio::io::duplex(8192);
-    let worker = tokio::spawn(async move {
-        context
-            .serve_h2(&mut server, session(), stop)
-            .await
+    for upstream_h2 in [true, false] {
+        let (context, origin) = prepared(upstream_h2);
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let (client, mut server) = tokio::io::duplex(8192);
+        let worker = tokio::spawn(async move {
+            context
+                .serve_h2(&mut server, session(), stop)
+                .await
+                .unwrap();
+        });
+        let (mut sender, driver) = wire::client::handshake(client).await.unwrap();
+        let driver = tokio::spawn(driver);
+        let (forbidden, _) = sender
+            .send_request(
+                Request::builder()
+                    .uri("https://forbidden.test/upload")
+                    .body(())
+                    .unwrap(),
+                true,
+            )
             .unwrap();
-    });
-    let (mut sender, driver) = wire::client::handshake(client).await.unwrap();
-    let driver = tokio::spawn(driver);
-    let (forbidden, _) = sender
-        .send_request(
-            Request::builder()
-                .uri("https://forbidden.test/upload")
-                .body(())
-                .unwrap(),
-            true,
-        )
-        .unwrap();
-    assert_eq!(
-        timeout(Duration::from_secs(1), forbidden)
+        assert_eq!(
+            timeout(Duration::from_secs(1), forbidden)
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(origin.sessions.lock().unwrap().is_empty());
+        let (mut held, _held_upload) = sender
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri("https://b.test/upload")
+                    .header("content-length", PAYLOAD)
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        tokio::select! {result=&mut held=>panic!("incomplete body unexpectedly completed: {}",result.is_ok()),()=tokio::time::sleep(Duration::from_millis(20))=>{}}
+        cancel.cancel();
+        timeout(Duration::from_secs(1), worker)
             .await
             .unwrap()
-            .unwrap()
-            .status(),
-        StatusCode::FORBIDDEN
-    );
-    assert!(origin.sessions.lock().unwrap().is_empty());
-    let (mut held, _held_upload) = sender
-        .send_request(
-            Request::builder()
-                .method("POST")
-                .uri("https://b.test/upload")
-                .header("content-length", PAYLOAD)
-                .body(())
-                .unwrap(),
-            false,
-        )
-        .unwrap();
-    tokio::select! {result=&mut held=>panic!("incomplete body unexpectedly completed: {}",result.is_ok()),()=tokio::time::sleep(Duration::from_millis(20))=>{}}
-    cancel.cancel();
-    timeout(Duration::from_secs(1), worker)
-        .await
-        .unwrap()
-        .unwrap();
-    drop(sender);
-    let _ = timeout(Duration::from_secs(1), driver).await.unwrap();
-    // Upstream fixture expects a complete business body; cancellation is
-    // deliberately observed as EOF/reset instead of normal completion.
-    let tasks = std::mem::take(&mut *origin.tasks.lock().unwrap());
-    for task in tasks {
-        let _ = timeout(Duration::from_secs(1), task).await.unwrap();
+            .unwrap();
+        drop(sender);
+        let _ = timeout(Duration::from_secs(1), driver).await.unwrap();
+        // Upstream fixture expects a complete business body; cancellation is
+        // deliberately observed as EOF/reset instead of normal completion.
+        let tasks = std::mem::take(&mut *origin.tasks.lock().unwrap());
+        for task in tasks {
+            let _ = timeout(Duration::from_secs(1), task).await.unwrap();
+        }
     }
 }
 

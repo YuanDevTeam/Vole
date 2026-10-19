@@ -151,4 +151,4 @@ HTTP URL 动作的纯内存回归：`http_processing::`、`main_config_and_provi
 HTTP/1 早响应与空正文 Upgrade 的定向内存回归：`inbound::http::server::early_final_memory_tests::`；不运行包含宿主 socket 的整个入站测试模块。
 上传完成后的响应等待、静默上限与首字节后绝对读头期限：`inbound::http::server::response_deadline_memory_tests::`；使用 paused Tokio clock 和内存 duplex。
 
-`http_processing::` 同时覆盖选择性 HTTPS：CA/私钥匹配、叶证书 AKI、代内缓存计费、逐 authority 授权，以及内存 TLS/H2 流控、早响应、真实截断拒绝与取消。TLS/H2 对端使用内存 duplex，不创建宿主 socket；这些回归不代签设备信任安装或系统 VPN。
+`http_processing::` 同时覆盖选择性 HTTPS：CA/私钥匹配、叶证书 AKI、代内缓存计费、逐 authority 授权，以及内存 TLS/H2 流控、早响应、持续上传、上传后静默、背压与空正文的有界等待、真实截断拒绝与取消。TLS/H2 对端使用内存 duplex，不创建宿主 socket；这些回归不代签设备信任安装或系统 VPN。

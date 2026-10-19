@@ -219,41 +219,48 @@ impl HttpContext {
             let mut sender = sender.ready().await.map_err(|_| failed())?;
             let (mut incoming, upload) =
                 sender.send_request(outgoing, false).map_err(|_| failed())?;
-            let upload = h2_body::relay(body, upload, length, target.strip_origin_credentials);
+            let (upload_finished, uploaded) = tokio::sync::oneshot::channel();
+            let upload = async move {
+                let result =
+                    h2_body::relay(body, upload, length, target.strip_origin_credentials).await;
+                if result.is_ok() {
+                    let _ = upload_finished.send(());
+                }
+                result
+            };
             let download = async {
-                let mut infos = 0;
-                let incoming = loop {
-                    let event = timeout(
-                        IDLE,
-                        poll_fn(|cx| {
+                let incoming = response_after_upload(uploaded, async {
+                    let mut infos = 0;
+                    loop {
+                        let event = poll_fn(|cx| {
                             if let Poll::Ready(Some(info)) = incoming.poll_informational(cx) {
                                 return Poll::Ready(info.map(Head::Informational));
                             }
                             Pin::new(&mut incoming)
                                 .poll(cx)
                                 .map(|value| value.map(Head::Final))
-                        }),
-                    )
-                    .await
-                    .map_err(|_| io::ErrorKind::TimedOut)?
-                    .map_err(|_| failed())?;
-                    match event {
-                        Head::Informational(info) => {
-                            infos += 1;
-                            if infos > 16 {
-                                return Err(failed());
+                        })
+                        .await
+                        .map_err(|_| failed())?;
+                        match event {
+                            Head::Informational(info) => {
+                                infos += 1;
+                                if infos > 16 {
+                                    return Err(failed());
+                                }
+                                if info.status() != StatusCode::CONTINUE {
+                                    let (mut parts, ()) = info.into_parts();
+                                    parts.headers = h2_headers::clean(parts.headers, false, false)?;
+                                    response
+                                        .informational(Response::from_parts(parts, ()))
+                                        .map_err(|_| failed())?;
+                                }
                             }
-                            if info.status() != StatusCode::CONTINUE {
-                                let (mut parts, ()) = info.into_parts();
-                                parts.headers = h2_headers::clean(parts.headers, false, false)?;
-                                response
-                                    .informational(Response::from_parts(parts, ()))
-                                    .map_err(|_| failed())?;
-                            }
+                            Head::Final(response) => break Ok(response),
                         }
-                        Head::Final(response) => break response,
                     }
-                };
+                })
+                .await?;
                 let (mut parts, body) = incoming.into_parts();
                 let expected = h2_headers::response_body(&parts.headers, parts.status, &method)?;
                 parts.headers = h2_headers::clean(parts.headers, false, false)?;
@@ -306,6 +313,7 @@ impl HttpContext {
         // request handle is shared; no body queue or extra task is introduced.
         let state = response.clone();
         let info_cancel = CancellationToken::new();
+        let upload_idle = h2_h1::UploadIdle::new();
         let exchange = async {
             let (parts, body) = request.into_parts();
             let method = parts.method.clone();
@@ -335,6 +343,7 @@ impl HttpContext {
                     body,
                     length,
                     target.strip_origin_credentials,
+                    upload_idle.clone(),
                 ))
                 .map_err(|_| failed())?;
             *request.headers_mut() = headers;
@@ -358,10 +367,9 @@ impl HttpContext {
                 }
             });
             sender.ready().await.map_err(|_| failed())?;
-            let incoming = timeout(IDLE, sender.send_request(request))
-                .await
-                .map_err(|_| io::ErrorKind::TimedOut)?
-                .map_err(|_| failed())?;
+            let incoming = upload_idle
+                .wait_response(sender.send_request(request))
+                .await?;
             if incoming.status() == StatusCode::SWITCHING_PROTOCOLS {
                 return Err(failed());
             }
@@ -373,6 +381,24 @@ impl HttpContext {
             h2_h1::download(body, downstream, expected).await
         };
         tokio::select! {biased;()=info_cancel.cancelled()=>Err(failed()),result=inline_driver(driver,exchange)=>result}
+    }
+}
+async fn response_after_upload<F, T>(
+    uploaded: tokio::sync::oneshot::Receiver<()>,
+    response: F,
+) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    tokio::pin!(response);
+    // Keep accepting early responses while the separately bounded upload is
+    // active. A response head gets its own idle budget only after upload EOS.
+    tokio::select! {biased;
+        result=&mut response=>result,
+        result=uploaded=>{
+            result.map_err(|_|failed())?;
+            timeout(IDLE,response).await.map_err(|_|io::ErrorKind::TimedOut)?
+        }
     }
 }
 enum Head {
