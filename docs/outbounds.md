@@ -181,7 +181,7 @@ H2 每 30 秒发送空闲 PING，ACK 期限为 15 秒；不因隧道暂时空闲
 H3 等待实际 peer SETTINGS 中的
 现代 DATAGRAM 支持，同时发送现代与旧 DATAGRAM setting；原始 IP 使用请求流关联及
 context ID 0。控制 capsule 有界解析，发送 IPv4/IPv6 完整 route advertisement。
-IP 模式在所有受控抽象 socket 平台启用有界 QUIC PMTUD；具有 IPv6 本地地址时，
+H3 IP 模式在所有受控抽象 socket 平台启用有界 QUIC PMTUD；具有 IPv6 本地地址时，
 就绪前确认真实 DATAGRAM 预算可承载 1280 字节 IP 包，未满足时按建链期限失败。
 `ip`/`ipv6` 最多提供两条本地 prefix，标签不强制地址族；未带前缀分别补 /32 与 /128。
 mapped IPv4 归一，重复地址取较长前缀，同族两地址按目标选择源地址。
@@ -190,7 +190,8 @@ MTU 缺省/零值为 1280；只有 IPv4 时允许 68..65535，存在实际 IPv6 
 PMTU 反馈按连接生效，通过包层软件分段恢复，重传由官方 smoltcp 的定时器触发。
 初始发送 MTU 取配置与真实隧道预算的交集，避免已知预算下的持续二次分段。
 内部队列、capsule 和 packet 均有界，停止等待其工作任务回收。
-发送期间预算缩小只反馈当前过大包；不因此关闭其它业务流。
+当底层实际报告发送预算缩小时，只反馈当前过大包，不关闭其它业务流。
+稳定路径的 MTU 下降目前不会自动触发 QUIC PMTU 重新探测。
 
 `network: h3-l4proxy` 使用 Cloudflare L4 HTTP/3 CONNECT，每个 TCP 目标独占请求流，共享受控 QUIC 连接；
 等待 2xx 响应后才交付业务流，拒绝响应不取消其它流，节点 Stop 等待所有驱动退出。
