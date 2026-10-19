@@ -5,6 +5,7 @@ use std::{io, net::IpAddr};
 use url::Url;
 
 pub(super) struct Target {
+    pub(super) original: Url,
     pub(super) url: Url,
     pub(super) session: StreamSession,
     pub(super) logical_destination: Destination,
@@ -43,9 +44,9 @@ impl HttpContext {
             original.port_or_known_default(),
         );
         let action = if apply_url_actions {
-            self.policy().evaluate(original)?
+            self.policy().evaluate(original.clone())?
         } else {
-            Action::Forward(original)
+            Action::Forward(original.clone())
         };
         let url = match action {
             Action::Reject => return Ok(Decision::Reject),
@@ -72,6 +73,7 @@ impl HttpContext {
             session.sniffed_domain = Some(host.to_owned());
         }
         Ok(Decision::Forward(Box::new(Target {
+            original,
             url,
             session,
             logical_destination: destination,

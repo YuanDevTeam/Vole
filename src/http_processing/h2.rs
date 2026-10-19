@@ -1,10 +1,12 @@
 //! HTTP/2 downstream owner. Every request and upstream driver is polled inline.
 use super::{
     HttpContext, Scheme,
+    body::{OriginalRequestMeta, Transaction, WireBodyMeta},
     config::checked_url,
     h2_body::{self, IDLE},
-    h2_h1, h2_headers,
+    h2_h1, h2_headers, headers,
     request::{Decision, Target},
+    rules::Phase,
 };
 use crate::{
     dispatch::BoxStream,
@@ -29,6 +31,17 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 const STREAMS: usize = 8;
 const SETUP: Duration = Duration::from_secs(10);
+struct MessageMeta {
+    original: OriginalRequestMeta,
+    length: Option<u64>,
+    asterisk: bool,
+}
+struct BodyMessage {
+    phase: Phase,
+    wire: Option<WireBodyMeta>,
+    expected: Option<u64>,
+    strip_credentials: bool,
+}
 fn failed() -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionAborted, "HTTP proxy stream failed")
 }
@@ -111,6 +124,17 @@ impl HttpContext {
             Ok(length) => length,
             Err(_) => return local(response, StatusCode::BAD_REQUEST, None),
         };
+        let original_fields = headers::from_map(request.headers());
+        let mut original_meta = OriginalRequestMeta::new(
+            request.method().as_str(),
+            original_fields.as_ref().unwrap_or(&Vec::new()),
+        );
+        if original_fields.is_none() {
+            original_meta.identity_allowed = false;
+        }
+        let wire = original_fields.as_ref().map(|fields| {
+            WireBodyMeta::new(fields, &original_meta, Phase::Request, None, length, false)
+        });
         let (original, asterisk) = match original_url(&request) {
             Ok(value) => value,
             Err(_) => return local(response, StatusCode::BAD_REQUEST, None),
@@ -125,19 +149,85 @@ impl HttpContext {
                 );
             }
             Ok(Decision::Forward(target)) => *target,
-            Err(_) => return local(response, StatusCode::FORBIDDEN, None),
+            Err(error) => {
+                return local(
+                    response,
+                    if error.kind() == io::ErrorKind::PermissionDenied {
+                        StatusCode::FORBIDDEN
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    },
+                    None,
+                );
+            }
         };
         if request.headers().contains_key("expect") && !request.body().is_end_stream() {
             response.continue_upload()?;
         }
+        let (mut parts, body) = request.into_parts();
+        parts.headers = h2_headers::clean(parts.headers, target.strip_origin_credentials, true)?;
+        headers::apply_map(
+            self.policy().rules(),
+            &target.original,
+            Phase::Request,
+            &mut parts.headers,
+        );
+        let (body, length) = self
+            .prepare_body(
+                h2_body::Source::h2(body),
+                &target.original,
+                &mut parts.headers,
+                BodyMessage {
+                    phase: Phase::Request,
+                    wire,
+                    expected: length,
+                    strip_credentials: target.strip_origin_credentials,
+                },
+            )
+            .await?;
+        let request = Request::from_parts(parts, body);
+        let metadata = MessageMeta {
+            original: original_meta,
+            length,
+            asterisk,
+        };
         let (io, protocol) = self.http_upstream(&target).await?;
         if protocol.as_deref() == Some(b"h2") {
-            self.h2_upstream(io, request, response, target, length, asterisk)
+            self.h2_upstream(io, request, response, target, metadata)
                 .await
         } else {
-            self.h1_upstream(io, request, response, target, length, asterisk)
+            self.h1_upstream(io, request, response, target, metadata)
                 .await
         }
+    }
+    async fn prepare_body(
+        &self,
+        source: h2_body::Source,
+        original: &url::Url,
+        headers: &mut http::HeaderMap,
+        message: BodyMessage,
+    ) -> io::Result<(h2_body::Source, Option<u64>)> {
+        let Some(wire) = message.wire else {
+            return Ok((source, message.expected));
+        };
+        let Ok(transaction) = Transaction::begin(
+            self.policy().body_budget(),
+            self.policy().rules(),
+            original,
+            message.phase,
+            &wire,
+        ) else {
+            return Ok((source, message.expected));
+        };
+        let prepared = h2_body::prepare(
+            source,
+            transaction,
+            message.expected,
+            message.strip_credentials,
+            headers,
+        )
+        .await?;
+        Ok((prepared.source, prepared.expected))
     }
     async fn http_upstream(&self, target: &Target) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
         let deadline = Instant::now() + SETUP;
@@ -173,12 +263,16 @@ impl HttpContext {
     async fn h2_upstream(
         &self,
         io: BoxStream,
-        request: Request<h2::RecvStream>,
+        request: Request<h2_body::Source>,
         response: &ResponseSlot,
         target: Target,
-        length: Option<u64>,
-        asterisk: bool,
+        metadata: MessageMeta,
     ) -> io::Result<()> {
+        let MessageMeta {
+            original: original_meta,
+            length,
+            asterisk,
+        } = metadata;
         let mut builder = h2::client::Builder::new();
         builder
             .initial_window_size(32 * 1024)
@@ -196,8 +290,9 @@ impl HttpContext {
         let exchange = async {
             let (parts, body) = request.into_parts();
             let method = parts.method.clone();
-            let mut headers =
-                h2_headers::clean(parts.headers, target.strip_origin_credentials, true)?;
+            // Original credentials were removed before request-header actions.
+            // A second origin cleanup must not erase explicitly supplied ones.
+            let mut headers = h2_headers::clean(parts.headers, false, true)?;
             headers.remove("expect");
             let uri = if asterisk {
                 http::Uri::builder()
@@ -263,7 +358,36 @@ impl HttpContext {
                 .await?;
                 let (mut parts, body) = incoming.into_parts();
                 let expected = h2_headers::response_body(&parts.headers, parts.status, &method)?;
+                let wire = headers::from_map(&parts.headers).map(|fields| {
+                    WireBodyMeta::new(
+                        &fields,
+                        &original_meta,
+                        Phase::Response,
+                        Some(parts.status.as_u16()),
+                        expected,
+                        false,
+                    )
+                });
+                headers::apply_map(
+                    self.policy().rules(),
+                    &target.original,
+                    Phase::Response,
+                    &mut parts.headers,
+                );
                 parts.headers = h2_headers::clean(parts.headers, false, false)?;
+                let (body, expected) = self
+                    .prepare_body(
+                        h2_body::Source::h2(body),
+                        &target.original,
+                        &mut parts.headers,
+                        BodyMessage {
+                            phase: Phase::Response,
+                            wire,
+                            expected,
+                            strip_credentials: false,
+                        },
+                    )
+                    .await?;
                 let downstream = response
                     .final_response(Response::from_parts(parts, ()), false)
                     .map_err(|_| failed())?;
@@ -292,12 +416,16 @@ impl HttpContext {
     async fn h1_upstream(
         &self,
         io: BoxStream,
-        request: Request<h2::RecvStream>,
+        request: Request<h2_body::Source>,
         response: &ResponseSlot,
         target: Target,
-        length: Option<u64>,
-        asterisk: bool,
+        metadata: MessageMeta,
     ) -> io::Result<()> {
+        let MessageMeta {
+            original: original_meta,
+            length,
+            asterisk,
+        } = metadata;
         let (mut sender, driver) = timeout(
             SETUP,
             hyper::client::conn::http1::Builder::new()
@@ -317,8 +445,7 @@ impl HttpContext {
         let exchange = async {
             let (parts, body) = request.into_parts();
             let method = parts.method.clone();
-            let mut headers =
-                h2_headers::clean(parts.headers, target.strip_origin_credentials, true)?;
+            let mut headers = h2_headers::clean(parts.headers, false, true)?;
             headers.remove("expect");
             headers.remove("te");
             headers.insert(
@@ -375,7 +502,36 @@ impl HttpContext {
             }
             let (mut parts, body) = incoming.into_parts();
             let expected = h2_headers::response_body(&parts.headers, parts.status, &method)?;
+            let wire = headers::from_map(&parts.headers).map(|fields| {
+                WireBodyMeta::new(
+                    &fields,
+                    &original_meta,
+                    Phase::Response,
+                    Some(parts.status.as_u16()),
+                    expected,
+                    false,
+                )
+            });
+            headers::apply_map(
+                self.policy().rules(),
+                &target.original,
+                Phase::Response,
+                &mut parts.headers,
+            );
             parts.headers = h2_headers::clean(parts.headers, false, false)?;
+            let (body, expected) = self
+                .prepare_body(
+                    h2_body::Source::h1(body),
+                    &target.original,
+                    &mut parts.headers,
+                    BodyMessage {
+                        phase: Phase::Response,
+                        wire,
+                        expected,
+                        strip_credentials: false,
+                    },
+                )
+                .await?;
             parts.version = Version::HTTP_2;
             let downstream = state.final_response(Response::from_parts(parts, ()), false)?;
             h2_h1::download(body, downstream, expected).await

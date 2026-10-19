@@ -31,6 +31,24 @@ pub(crate) struct RequestPlan {
 }
 
 impl RequestPlan {
+    pub(crate) fn edit_headers(
+        &mut self,
+        edit: impl FnOnce(&mut Vec<(String, String)>),
+    ) -> io::Result<()> {
+        let bytes = self
+            .head
+            .strip_suffix(b"\r\n\r\n")
+            .ok_or_else(|| invalid("incomplete generated HTTP header"))?;
+        let mut request = super::parser::parse_request_head(bytes, Vec::new())?;
+        edit(&mut request.headers);
+        let keep_alive = self.keep_alive;
+        let blocklist = self.trailer_blocklist.clone();
+        let origin = request.target.clone();
+        *self = Self::for_target(&request, self.destination.clone(), origin, false)?;
+        self.keep_alive = keep_alive;
+        self.trailer_blocklist.extend(blocklist);
+        Ok(())
+    }
     pub fn new(request: &RequestHead) -> io::Result<Self> {
         let (destination, origin) = request.forward_target()?;
         Self::for_target(request, destination, origin, false)
@@ -110,6 +128,20 @@ pub(crate) struct ResponseHead {
 }
 
 impl ResponseHead {
+    pub(crate) fn headers(&self) -> &Vec<(String, String)> {
+        &self.headers
+    }
+    pub(crate) fn edit_headers(
+        &mut self,
+        edit: impl FnOnce(&mut Vec<(String, String)>),
+    ) -> io::Result<()> {
+        let mut candidate = self.headers.clone();
+        edit(&mut candidate);
+        let framing = Framing::parse(&candidate)?;
+        self.headers = candidate;
+        self.framing = framing;
+        Ok(())
+    }
     pub fn parse(bytes: &[u8]) -> io::Result<Self> {
         let text =
             std::str::from_utf8(bytes).map_err(|_| invalid("invalid response head encoding"))?;
@@ -359,7 +391,7 @@ fn stripped(name: &str, connection: &HashSet<String>) -> bool {
         "transfer-encoding",
     ]
     .contains(&name.as_str())
-        || name.starts_with("x-vole-")
+        || name == "x-vole-measure-diagnostic"
         || connection.contains(&name)
 }
 
@@ -414,7 +446,10 @@ pub(crate) async fn read_head<R: AsyncBufRead + Unpin>(
     }
 }
 
-async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R, maximum: usize) -> io::Result<Vec<u8>> {
+pub(crate) async fn read_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    maximum: usize,
+) -> io::Result<Vec<u8>> {
     let mut line = Vec::with_capacity(maximum.min(128));
     loop {
         let buffer = reader.fill_buf().await?;
@@ -512,7 +547,7 @@ where
     timeout_io(idle, writer.flush()).await
 }
 
-fn forbidden_trailer(name: &str, connection: &HashSet<String>) -> bool {
+pub(crate) fn forbidden_trailer(name: &str, connection: &HashSet<String>) -> bool {
     stripped(name, connection)
         || [
             "authorization",
@@ -525,7 +560,7 @@ fn forbidden_trailer(name: &str, connection: &HashSet<String>) -> bool {
         .any(|field| name.eq_ignore_ascii_case(field))
 }
 
-fn chunk_size(line: &[u8]) -> io::Result<u64> {
+pub(crate) fn chunk_size(line: &[u8]) -> io::Result<u64> {
     let text = line
         .strip_suffix(b"\r\n")
         .ok_or_else(|| invalid("invalid chunk line"))?;

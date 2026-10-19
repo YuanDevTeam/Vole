@@ -90,7 +90,7 @@ fn session() -> StreamSession {
     }
 }
 fn context(origin: Arc<Origin>) -> HttpContext {
-    HttpContext::new(Policy::compile("rewrite:\n- {pattern: '^http://old\\.invalid/(.*)$', action: replace, replacement: 'http://new.invalid:8081/$1'}\n").unwrap(),origin,SecurityContext::new())
+    HttpContext::new(Policy::compile("rewrite:\n  enabled: true\n  rules:\n  - {url: '^http://old\\.invalid/(.*)$', action: replace, replacement: 'http://new.invalid:8081/$1'}\n").unwrap(),origin,SecurityContext::new())
 }
 #[tokio::test]
 async fn transparent_h1_routes_only_the_final_target_and_preserves_original_facts() {
@@ -159,19 +159,19 @@ async fn local_actions_do_not_connect_or_wait_for_an_unread_expect_body() {
         ("reject", "", 403),
         (
             "redirect302",
-            ", replacement: 'https://new.invalid/path'",
+            ", replacement-mode: url, replacement: 'https://new.invalid/path'",
             302,
         ),
         (
             "redirect307",
-            ", replacement: 'https://new.invalid/path'",
+            ", replacement-mode: url, replacement: 'https://new.invalid/path'",
             307,
         ),
     ] {
         let origin = Arc::new(Origin::default());
         let context = HttpContext::new(
             Policy::compile(&format!(
-                "rewrite: [{{pattern: '.', action: {action}{replacement}}}]"
+                "rewrite: {{enabled: true, rules: [{{url: '.', action: {action}{replacement}}}]}}"
             ))
             .unwrap(),
             origin.clone(),
@@ -225,7 +225,7 @@ async fn same_origin_path_action_preserves_resolved_transport_and_logical_host()
     let origin = Arc::new(Origin::default());
     let context = HttpContext::new(
         Policy::compile(
-            "rewrite: [{pattern: '.', action: replace, replacement: 'http://old.invalid/new'}]",
+            "rewrite: {enabled: true, rules: [{url: '.', action: replace, replacement-mode: url, replacement: 'http://old.invalid/new'}]}",
         )
         .unwrap(),
         origin.clone(),

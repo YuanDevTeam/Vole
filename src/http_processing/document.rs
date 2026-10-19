@@ -232,7 +232,7 @@ impl Document {
 }
 
 pub(crate) fn compile_rule(raw: RawRule, text: &mut usize) -> io::Result<Rule> {
-    if !(raw.action.is_url()) {
+    if matches!(raw.action, crate::http_processing::rules::ActionKind::RequestBodySet | crate::http_processing::rules::ActionKind::RequestBodyReplace | crate::http_processing::rules::ActionKind::RequestBodyJsonPatch | crate::http_processing::rules::ActionKind::ResponseBodySet | crate::http_processing::rules::ActionKind::ResponseBodyReplace | crate::http_processing::rules::ActionKind::ResponseBodyJsonPatch) {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "HTTP rewrite action is not available"));
     }
     Rule::compile(raw, text)

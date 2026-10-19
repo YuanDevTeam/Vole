@@ -115,14 +115,6 @@ pub(super) fn clean(
         headers.remove("authorization");
         headers.remove("cookie");
     }
-    let internal = headers
-        .keys()
-        .filter(|name| name.as_str().starts_with("x-vole-"))
-        .cloned()
-        .collect::<Vec<_>>();
-    for name in internal {
-        headers.remove(name);
-    }
     Ok(headers)
 }
 pub(super) fn trailers(
@@ -145,7 +137,7 @@ pub(super) fn trailers(
                 | "content-type"
                 | "content-encoding"
                 | "content-range"
-        ) || name.as_str().starts_with("x-vole-")
+        )
     }) {
         return Err(invalid());
     }

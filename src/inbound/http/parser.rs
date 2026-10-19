@@ -7,7 +7,7 @@ use crate::session::Destination;
 
 use super::super::DEFAULT_HEADER_COUNT_LIMIT;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RequestHead {
     pub method: String,
     pub target: String,
@@ -141,7 +141,7 @@ pub(crate) fn parse_request_head(input: &[u8], buffered: Vec<u8>) -> io::Result<
     })
 }
 
-pub(super) fn parse_headers<'a>(
+pub(crate) fn parse_headers<'a>(
     lines: impl Iterator<Item = &'a str>,
 ) -> io::Result<Vec<(String, String)>> {
     let mut headers = Vec::new();

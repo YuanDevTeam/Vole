@@ -29,9 +29,7 @@ use super::super::{
     listen::{bind_proxy_tcp, bind_tcp},
 };
 use super::{
-    framing::{
-        self, Body, RequestPlan, ResponseHead, read_head, timeout_io, transfer_body, write_timed,
-    },
+    framing::{self, Body, RequestPlan, ResponseHead, read_head, timeout_io, write_timed},
     parser::{RequestHead, parse_request_head},
 };
 
@@ -463,7 +461,7 @@ async fn forward_tunnel<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 pub(crate) async fn forward_request<R, W>(
     reader: &mut R,
     writer: &mut W,
-    mut outbound: BoxStream,
+    outbound: BoxStream,
     request: &RequestHead,
     plan: RequestPlan,
     config: &HttpServerConfig,
@@ -472,13 +470,58 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    forward_request_inner(reader, writer, outbound, request, plan, config, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_processed<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    outbound: BoxStream,
+    request: &RequestHead,
+    plan: RequestPlan,
+    config: &HttpServerConfig,
+    processing: &crate::http_processing::h1_body::Message<'_>,
+) -> io::Result<bool> {
+    forward_request_inner(
+        reader,
+        writer,
+        outbound,
+        request,
+        plan,
+        config,
+        Some(processing),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_request_inner<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    mut outbound: BoxStream,
+    request: &RequestHead,
+    mut plan: RequestPlan,
+    config: &HttpServerConfig,
+    processing: Option<&crate::http_processing::h1_body::Message<'_>>,
+) -> io::Result<bool> {
+    let upload = match processing {
+        Some(processing) => {
+            processing
+                .request(reader, writer, &mut plan, config)
+                .await?
+        }
+        None => crate::http_processing::h1_body::PreparedBody::original(plan.body),
+    };
     write_timed(&mut outbound, &plan.head, config.connect_timeout).await?;
+    // Some protocol transports accept the head into an internal frame. Empty
+    // requests never poll the body sender, so publish the head before reading.
+    timeout_io(config.connect_timeout, outbound.flush()).await?;
     let (remote_read, mut remote_write) = tokio::io::split(outbound);
     let mut remote_read = BufReader::with_capacity(framing::COPY_BUFFER, remote_read);
-    let mut uploading = Box::pin(transfer_body(
+    let mut uploading = Box::pin(upload.transfer(
         reader,
         &mut remote_write,
-        plan.body,
         config.body_idle_timeout,
         &plan.trailer_blocklist,
         false,
@@ -487,7 +530,7 @@ where
     // turn an otherwise valid Upgrade into an apparent early response.
     let mut uploaded = matches!(plan.body, Body::Empty | Body::Length(0));
     let mut informational = 0;
-    let response = loop {
+    let mut response = loop {
         let mut reading = Box::pin(async {
             // Waiting for the first response byte may overlap a large upload.
             // Once headers begin, their total read deadline is absolute.
@@ -524,7 +567,7 @@ where
                 }
             }
         };
-        let response = match response {
+        let mut response = match response {
             Ok(value) => value,
             Err(error) => {
                 write_error(
@@ -548,13 +591,22 @@ where
                     "too many informational responses",
                 ));
             }
-            if request.version == "HTTP/1.1" {
+            if request.version == "HTTP/1.1"
+                && !(processing.is_some_and(|processing| processing.suppress_continue())
+                    && response.status == 100)
+            {
+                if let Some(processing) = processing {
+                    processing.response_headers(&mut response)?;
+                }
                 write_timed(
                     writer,
                     &response.encode(false, false, false),
                     config.header_timeout,
                 )
                 .await?;
+                // A client waiting for 100 cannot produce its body until this
+                // handshake response leaves any downstream transport buffer.
+                timeout_io(config.header_timeout, writer.flush()).await?;
             }
             continue;
         }
@@ -571,16 +623,28 @@ where
                 "invalid HTTP protocol switch",
             ));
         }
+        if let Some(processing) = processing {
+            processing.response_headers(&mut response)?;
+        }
         write_timed(
             writer,
             &response.encode(false, true, false),
             config.header_timeout,
         )
         .await?;
+        timeout_io(config.header_timeout, writer.flush()).await?;
         relay(reader, writer, &mut remote_read, &mut remote_write).await?;
         return Ok(false);
     }
     let body = response.body(&request.method);
+    let download = match processing {
+        Some(processing) => {
+            processing
+                .response(&mut remote_read, &mut response, config)
+                .await?
+        }
+        None => crate::http_processing::h1_body::PreparedBody::original(body),
+    };
     let legacy = request.version == "HTTP/1.0";
     let dechunk = legacy && body == Body::Chunked;
     let keep_alive = plan.keep_alive && uploaded && body != Body::UntilEof && !dechunk;
@@ -590,15 +654,15 @@ where
         config.header_timeout,
     )
     .await?;
-    transfer_body(
-        &mut remote_read,
-        writer,
-        body,
-        config.body_idle_timeout,
-        response.trailer_blocklist(),
-        dechunk,
-    )
-    .await?;
+    download
+        .transfer(
+            &mut remote_read,
+            writer,
+            config.body_idle_timeout,
+            response.trailer_blocklist(),
+            dechunk,
+        )
+        .await?;
     Ok(keep_alive)
 }
 

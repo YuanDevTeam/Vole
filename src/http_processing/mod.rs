@@ -14,6 +14,8 @@ pub(crate) use config::{MAX_ADDENDUM, Policy};
 #[cfg(feature = "inbound-http")]
 mod h1;
 #[cfg(feature = "inbound-http")]
+pub(crate) mod h1_body;
+#[cfg(feature = "inbound-http")]
 mod h2;
 #[cfg(feature = "inbound-http")]
 mod h2_body;

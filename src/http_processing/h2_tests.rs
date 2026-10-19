@@ -18,12 +18,14 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 const PAYLOAD: usize = 96 * 1024;
+
 #[derive(Clone, Copy)]
 enum OriginMode {
     None,
     BeforeUpload,
     AfterUpload,
     ShortClose { truncated: bool },
+    Rewrite,
 }
 fn pem(label: &str, bytes: &[u8]) -> String {
     use base64::Engine as _;
@@ -85,6 +87,38 @@ impl Dispatcher for Origin {
                 let mut connection = builder.handshake::<_, Bytes>(tls).await.unwrap();
                 let (request, mut response) = connection.accept().await.unwrap().unwrap();
                 let exchange = async move {
+                    if matches!(mode, OriginMode::Rewrite) {
+                        assert_eq!(request.uri().path(), "/rewritten");
+                        assert_eq!(request.headers()["x-request"], "rewritten");
+                        assert_eq!(request.headers()["authorization"], "Bearer explicit");
+                        assert_eq!(request.headers()["cookie"], "new=explicit");
+                        let mut body = request.into_body();
+                        let mut bytes = Vec::new();
+                        while let Some(frame) = body.data().await {
+                            let frame = frame.unwrap();
+                            body.flow_control().release_capacity(frame.len()).unwrap();
+                            bytes.extend_from_slice(&frame);
+                        }
+                        assert_eq!(bytes, b"new request");
+                        received.lock().unwrap().push(bytes);
+                        let payload = Bytes::from_static(br#"{"ads":[1],"token":"old"}"#);
+                        let mut outgoing = response
+                            .send_response(
+                                Response::builder()
+                                    .header("content-length", payload.len())
+                                    .header("content-type", "application/json")
+                                    .header("server", "origin")
+                                    .body(())
+                                    .unwrap(),
+                                false,
+                            )
+                            .unwrap();
+                        super::h2_body::send_data(&mut outgoing, payload)
+                            .await
+                            .unwrap();
+                        outgoing.send_data(Bytes::new(), true).unwrap();
+                        return;
+                    }
                     if matches!(mode, OriginMode::BeforeUpload) {
                         tokio::time::sleep(Duration::from_secs(31)).await;
                         return;
@@ -161,6 +195,25 @@ impl Dispatcher for Origin {
                     head.push(tls.read_u8().await.unwrap());
                 }
                 let head = String::from_utf8(head).unwrap();
+                if matches!(mode, OriginMode::Rewrite) {
+                    assert!(head.starts_with("POST /rewritten HTTP/1.1\r\n"));
+                    assert!(
+                        head.to_ascii_lowercase()
+                            .contains("x-request: rewritten\r\n")
+                    );
+                    assert!(head.contains("Bearer explicit\r\n"));
+                    assert!(head.contains("new=explicit\r\n"));
+                    assert!(!head.contains("original\r\n"));
+                    let mut body = [0u8; 11];
+                    tls.read_exact(&mut body).await.unwrap();
+                    assert_eq!(&body, b"new request");
+                    received.lock().unwrap().push(body.to_vec());
+                    let payload = br#"{"ads":[1],"token":"old"}"#;
+                    tls.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nServer: origin\r\nConnection: close\r\n\r\n", payload.len()).as_bytes()).await.unwrap();
+                    tls.write_all(payload).await.unwrap();
+                    tls.shutdown().await.unwrap();
+                    return;
+                }
                 if matches!(mode, OriginMode::BeforeUpload) {
                     tokio::time::sleep(Duration::from_secs(31)).await;
                     return;
@@ -324,6 +377,15 @@ fn prepared_origin(
     truncated: bool,
     mode: OriginMode,
 ) -> (HttpContext, Arc<Origin>) {
+    prepared_origin_rules(h2, early, truncated, mode, "")
+}
+fn prepared_origin_rules(
+    h2: bool,
+    early: bool,
+    truncated: bool,
+    mode: OriginMode,
+    rules: &str,
+) -> (HttpContext, Arc<Origin>) {
     let mut params = rcgen::CertificateParams::default();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
@@ -332,12 +394,18 @@ fn prepared_origin(
     let cert_pem = pem("CERTIFICATE", cert.der());
     let key_pem = pem("PRIVATE KEY", &key.serialize_der());
     let authority = authority::Authority::load(&cert_pem, &key_pem).unwrap();
-    let policy = Policy::compile(&format!(
-        "mitm:\n  domains: [a.test, b.test]\n  certificate: {}\n  private-key: {}\n",
-        serde_json::to_string(&cert_pem).unwrap(),
-        serde_json::to_string(&key_pem).unwrap()
+    let document = super::config::Document::parse(&format!(
+        "mitm:\n  enabled: true\n  domains: [{{pattern: a.test}}, {{pattern: b.test}}]\n{rules}"
     ))
     .unwrap();
+    let candidate = document
+        .compile(&std::collections::BTreeMap::new())
+        .unwrap();
+    let material = super::private_context::CaMaterial {
+        certificate: cert_pem,
+        private_key: zeroize::Zeroizing::new(key_pem),
+    };
+    let policy = candidate.bind_ca(Some(&material)).unwrap();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.der().clone()).unwrap();
     let origin = Arc::new(Origin {

@@ -72,17 +72,15 @@ impl UploadIdle {
 }
 
 pub(super) struct Upload {
-    source: h2::RecvStream,
+    source: h2_body::Source,
     length: Length,
-    release: usize,
-    trailers: bool,
     done: bool,
     strip_credentials: bool,
     idle: UploadIdle,
 }
 impl Upload {
     pub(super) fn new(
-        source: h2::RecvStream,
+        source: h2_body::Source,
         length: Option<u64>,
         strip_credentials: bool,
         idle: UploadIdle,
@@ -90,8 +88,6 @@ impl Upload {
         Self {
             source,
             length: Length::new(length),
-            release: 0,
-            trailers: false,
             done: false,
             strip_credentials,
             idle,
@@ -105,15 +101,6 @@ impl Upload {
         ))))
     }
 }
-impl Drop for Upload {
-    fn drop(&mut self) {
-        // Hyper may stop polling upload after an early final response. Return
-        // the last handed-off frame's credit before the response owner ends.
-        if self.release != 0 {
-            let _ = self.source.flow_control().release_capacity(self.release);
-        }
-    }
-}
 impl Body for Upload {
     type Data = Bytes;
     type Error = io::Error;
@@ -124,56 +111,41 @@ impl Body for Upload {
         if self.done {
             return Poll::Ready(None);
         }
-        if self.release != 0 {
-            let count = std::mem::take(&mut self.release);
-            if self.source.flow_control().release_capacity(count).is_err() {
-                return self.stop();
-            }
-        }
         if self.idle.poll_expired(cx).is_ready() {
             return self.stop();
         }
-        if !self.trailers {
-            match self.source.poll_data(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(Ok(data))) => {
+        match Pin::new(&mut self.source).poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => {
                     if self.length.consume(data.len()).is_err() {
                         return self.stop();
                     }
-                    self.release = data.len();
                     if !data.is_empty() {
                         self.idle.progress();
                     }
-                    return Poll::Ready(Some(Ok(Frame::data(data))));
+                    Poll::Ready(Some(Ok(Frame::data(data))))
                 }
-                Poll::Ready(Some(Err(_))) => return self.stop(),
-                Poll::Ready(None) => {
+                Err(frame) => {
                     if self.length.finish().is_err() {
                         return self.stop();
                     }
-                    self.trailers = true;
+                    self.done = true;
+                    self.idle.finish();
+                    Poll::Ready(frame.into_trailers().ok().map(|headers| {
+                        h2_headers::trailers(headers, self.strip_credentials).map(Frame::trailers)
+                    }))
                 }
-            }
-        }
-        match self.source.poll_trailers(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(headers)) => {
+            },
+            Poll::Ready(Some(Err(_))) => self.stop(),
+            Poll::Ready(None) => {
+                if self.length.finish().is_err() {
+                    return self.stop();
+                }
                 self.done = true;
-                let frame = match headers {
-                    Some(headers) => h2_headers::trailers(headers, self.strip_credentials)
-                        .map(Frame::trailers)
-                        .map(Some),
-                    None => Ok(None),
-                };
-                match frame {
-                    Ok(frame) => {
-                        self.idle.finish();
-                        Poll::Ready(frame.map(Ok))
-                    }
-                    Err(error) => Poll::Ready(Some(Err(error))),
-                }
+                self.idle.finish();
+                Poll::Ready(None)
             }
-            Poll::Ready(Err(_)) => self.stop(),
         }
     }
     fn is_end_stream(&self) -> bool {
@@ -198,32 +170,9 @@ impl Body for Upload {
     }
 }
 pub(super) async fn download(
-    mut body: hyper::body::Incoming,
-    mut target: h2::SendStream<Bytes>,
+    body: h2_body::Source,
+    target: h2::SendStream<Bytes>,
     expected: Option<u64>,
 ) -> io::Result<()> {
-    let mut length = Length::new(expected);
-    while let Some(frame) = tokio::time::timeout(
-        IDLE,
-        futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)),
-    )
-    .await
-    .map_err(|_| io::ErrorKind::TimedOut)?
-    {
-        let frame = frame.map_err(|_| io::Error::other("HTTP response body failed"))?;
-        match frame.into_data() {
-            Ok(data) => {
-                length.consume(data.len())?;
-                h2_body::send_data(&mut target, data).await?;
-            }
-            Err(frame) => {
-                if let Ok(trailers) = frame.into_trailers() {
-                    length.finish()?;
-                    return h2_body::finish(&mut target, Some(trailers), false);
-                }
-            }
-        }
-    }
-    length.finish()?;
-    h2_body::finish(&mut target, None, false)
+    h2_body::relay(body, target, expected, false).await
 }

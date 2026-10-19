@@ -126,7 +126,20 @@ impl HttpContext {
     ) -> io::Result<bool> {
         let original = request_url(request, scheme)?;
         let asterisk = request.method == "OPTIONS" && request.target == "*";
-        let target = match self.plan(original, session, scheme, !asterisk)? {
+        let decision = match self.plan(original, session, scheme, !asterisk) {
+            Ok(decision) => decision,
+            Err(error) if error.kind() != io::ErrorKind::PermissionDenied => {
+                framing::write_timed(
+                    writer,
+                    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    config.header_timeout,
+                )
+                .await?;
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let target = match decision {
             Decision::Reject => {
                 framing::write_timed(
                     writer,
@@ -159,12 +172,35 @@ impl HttpContext {
             origin.push('?');
             origin.push_str(query);
         }
-        let plan = RequestPlan::for_target(
+        // Validate framing before any editable fields enter the pipeline.
+        RequestPlan::for_target(
             request,
             target.logical_destination.clone(),
-            origin,
-            target.strip_origin_credentials,
+            origin.clone(),
+            false,
         )?;
+        let message = super::h1_body::Message {
+            policy: self.policy(),
+            original: &target.original,
+            request,
+            meta: super::body::OriginalRequestMeta::new(&request.method, &request.headers),
+            continued: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut outgoing = request.clone();
+        if target.strip_origin_credentials {
+            super::headers::strip_origin_credentials(&mut outgoing.headers);
+        }
+        super::headers::apply(
+            self.policy().rules(),
+            &target.original,
+            super::rules::Phase::Request,
+            &mut outgoing.headers,
+        );
+        let mut plan =
+            RequestPlan::for_target(&outgoing, target.logical_destination.clone(), origin, false)?;
+        if target.strip_origin_credentials {
+            plan.trailer_blocklist.insert("cookie".into());
+        }
         let deadline = Instant::now() + config.connect_timeout;
         let mut outbound = timeout_at(deadline, self.dispatcher.connect_tcp(target.session))
             .await
@@ -192,7 +228,7 @@ impl HttpContext {
                 })?
                 .map_err(|_| io::Error::other("HTTP upstream TLS failed"))?;
         }
-        server::forward_request(reader, writer, outbound, request, plan, config).await
+        server::forward_processed(reader, writer, outbound, request, plan, config, &message).await
     }
 }
 fn request_url(request: &RequestHead, scheme: Scheme) -> io::Result<Url> {
