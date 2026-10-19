@@ -128,6 +128,7 @@ impl PolicyCandidate {
         if input.len() > MAX_SNAPSHOT {
             return Err(invalid());
         }
+        super::numeric_input::validate(input.as_bytes())?;
         let value =
             crate::config::yaml::parse_with_budget(input.as_bytes(), &mut (MAX_SNAPSHOT * 4))
                 .map_err(|_| invalid())?;
@@ -257,12 +258,6 @@ impl Policy {
                 }
             })
     }
-    pub(crate) fn enabled(&self) -> bool {
-        self.document.mitm.enabled || !self.rules().is_empty()
-    }
-    pub(crate) fn rewrite_enabled(&self) -> bool {
-        self.document.rewrite.enabled
-    }
     pub(crate) fn plain_port(&self, port: u16) -> bool {
         !self.rules().is_empty() && self.document.http_ports.contains(&port)
     }
@@ -277,11 +272,6 @@ impl Policy {
         self.candidate
             .as_ref()
             .map_or(&[], |candidate| &candidate.rules)
-    }
-    pub(crate) fn origin(&self, index: usize) -> Option<&SourceLocation> {
-        self.candidate
-            .as_ref()
-            .and_then(|candidate| candidate.origin(index))
     }
     #[cfg(feature = "inbound-http")]
     pub(crate) fn body_budget(&self) -> &super::body_budget::Budget {

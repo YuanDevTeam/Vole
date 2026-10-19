@@ -11,10 +11,23 @@ pub(crate) struct ConfigApplyHandle {
     cancel: CancellationToken,
 }
 pub(crate) enum ConfigUpdate {
+    RecoverySnapshot(mpsc::SyncSender<Box<crate::runtime::RecoverySnapshot>>),
     Replace(String),
-    ReplaceWithHttp { yaml: String, http: String },
+    ReplaceWithHttp {
+        yaml: String,
+        http: String,
+        base_dir: Option<Option<std::path::PathBuf>>,
+    },
     Patch(ConfigPatch),
     RefreshGeoData,
+    RefreshHttp {
+        document: Arc<crate::http_processing::config::Document>,
+        context: crate::http_processing::providers::SourceContext,
+        store: Arc<tokio::sync::Mutex<crate::http_processing::providers::Store>>,
+        force: bool,
+        security: Option<crate::security::SecurityContext>,
+        reply: Option<mpsc::SyncSender<Arc<crate::http_processing::config::PolicyCandidate>>>,
+    },
     FlushFakeIp,
 }
 #[derive(Deserialize, Default)]
@@ -79,6 +92,15 @@ struct Completion {
     synchronous: Option<mpsc::SyncSender<Result<(), ApplyError>>>,
 }
 impl ConfigApplyHandle {
+    pub(crate) fn recovery_snapshot(
+        &self,
+    ) -> Result<Box<crate::runtime::RecoverySnapshot>, ApplyError> {
+        let (send, receive) = mpsc::sync_channel(1);
+        self.try_admit()?
+            .submit(ConfigUpdate::RecoverySnapshot(send))?
+            .wait_blocking()?;
+        receive.recv().map_err(|_| ApplyError::Stopped)
+    }
     pub(crate) fn channel(cancel: CancellationToken) -> (Self, async_mpsc::Receiver<ApplyRequest>) {
         let (requests, receiver) = async_mpsc::channel(1);
         (

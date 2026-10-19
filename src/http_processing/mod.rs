@@ -1,12 +1,15 @@
 //! Business HTTP processing. Core-owned HTTP never enters this module.
 #[cfg(feature = "inbound-http")]
 mod authority;
-pub(crate) mod config;
-pub(crate) mod rules;
+pub(crate) mod body;
 mod body_budget;
-pub(crate) mod providers;
+pub(crate) mod config;
+pub(crate) mod headers;
 mod mitm;
+mod numeric_input;
 pub(crate) mod private_context;
+pub(crate) mod providers;
+pub(crate) mod rules;
 pub(crate) use config::{MAX_ADDENDUM, Policy};
 #[cfg(feature = "inbound-http")]
 mod h1;

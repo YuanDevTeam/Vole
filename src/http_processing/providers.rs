@@ -152,6 +152,7 @@ impl Payload {
         if input.len() > MAX_ADDENDUM {
             return Err(invalid());
         }
+        crate::http_processing::numeric_input::validate(input)?;
         let value = crate::config::yaml::parse_with_budget(input, &mut (MAX_ADDENDUM * 4))
             .map_err(|_| invalid())?;
         let mut payload: Self = serde_yaml_ng::from_value(value).map_err(|_| invalid())?;

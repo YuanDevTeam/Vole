@@ -125,6 +125,14 @@ pub(crate) struct PreparedCore {
     traffic_stats: Option<Arc<TunTrafficStats>>,
 }
 
+/// A short-lived reconnect lease of actual configuration and provider content.
+/// It owns no live transports and never serializes private HTTP material.
+#[cfg(any(feature = "invoke", test))]
+pub(crate) struct RecoverySnapshot {
+    pub(crate) config: Config,
+    pub(crate) provider_cache: Option<crate::resource::cache::ProviderCache>,
+}
+
 /// A node-only outbound graph prepared for one built-in latency probe.
 ///
 /// Unlike `PreparedCore`, this type never registers GeoData, compiles rules,
@@ -291,17 +299,30 @@ impl PreparedCore {
     /// claim runtime-local resources, notably the unique TUN lease, before a
     /// potentially blocking DNS lookup.
     pub(crate) async fn prepare_config(
-        mut config: Config,
+        config: Config,
         geodata_manager: Arc<GeoDataManager>,
         resolver: &dyn Resolver,
         limits: ResourceLimits,
     ) -> io::Result<Self> {
-        if config.http_policy().is_some_and(|policy| !policy.is_prepared()) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "HTTP resources or private context are not prepared"));
+        let (config, provider_cache) = Self::resolve_config(config, &geodata_manager).await?;
+        Self::prepare_resolved(config, provider_cache, geodata_manager, resolver, limits).await
+    }
+
+    /// Resolve providers before stopping an existing session. Recovery uses
+    /// the returned actual content instead of reopening mutable source files.
+    pub(crate) async fn resolve_config(
+        mut config: Config,
+        geodata_manager: &GeoDataManager,
+    ) -> io::Result<(Config, Option<crate::resource::cache::ProviderCache>)> {
+        if config
+            .http_policy()
+            .is_some_and(|policy| !policy.is_prepared())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HTTP resources or private context are not prepared",
+            ));
         }
-        limits
-            .validate()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let provider_cache = if let Some(template) = config.providers.clone() {
             let root = geodata_manager
                 .store_dir()
@@ -321,6 +342,19 @@ impl PreparedCore {
         } else {
             None
         };
+        Ok((config, provider_cache))
+    }
+
+    pub(crate) async fn prepare_resolved(
+        mut config: Config,
+        provider_cache: Option<crate::resource::cache::ProviderCache>,
+        geodata_manager: Arc<GeoDataManager>,
+        resolver: &dyn Resolver,
+        limits: ResourceLimits,
+    ) -> io::Result<Self> {
+        limits
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         crate::dns::hosts::materialize_lan(&mut config.dns.hosts)?;
         let (rules, geodata_registration) = prepare_routing(&mut config, &geodata_manager)?;
         let _ = resolver;
@@ -1803,6 +1837,20 @@ impl std::fmt::Debug for RunningCore {
 }
 
 impl RunningCore {
+    #[cfg(feature = "invoke")]
+    pub(crate) fn maintain_http(
+        &mut self,
+        store: Arc<tokio::sync::Mutex<crate::http_processing::providers::Store>>,
+    ) {
+        let Some(resources) = &self.resources else {
+            return;
+        };
+        let network = resources.http_download_context();
+        self.tasks
+            .push(tokio::spawn(crate::resources::observation::task(
+                crate::invoke::http::maintenance(store, network, self.cancellation.clone()),
+            )));
+    }
     pub(crate) fn config_apply_handle(
         &self,
     ) -> Option<crate::resource::config_apply::ConfigApplyHandle> {

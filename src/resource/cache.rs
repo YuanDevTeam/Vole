@@ -67,6 +67,7 @@ pub(crate) struct ProviderState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_info: Option<SubscriptionInfo>,
 }
+#[derive(Clone)]
 pub(crate) struct ResourceEntry {
     pub key: String,
     pub spec: ProviderSpec,
@@ -77,6 +78,7 @@ pub(crate) struct ResourceEntry {
     modified: Option<SystemTime>,
     failures: u32,
 }
+#[derive(Clone)]
 pub(crate) struct ProviderCache {
     pub template: Arc<ProviderTemplate>,
     pub entries: Vec<ResourceEntry>,

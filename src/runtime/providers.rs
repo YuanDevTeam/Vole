@@ -87,6 +87,14 @@ pub(super) struct ProviderRuntime {
     geo: Arc<dyn GeoMatcher>,
 }
 impl ProviderRuntime {
+    pub(super) fn http_download_context(
+        &self,
+    ) -> crate::http_processing::providers::DownloadContext {
+        crate::http_processing::providers::DownloadContext {
+            dispatcher: self.current.load().direct.clone(),
+            security: self.security.clone(),
+        }
+    }
     pub(super) fn new(
         cache: ProviderCache,
         prepared: &PreparedCore,

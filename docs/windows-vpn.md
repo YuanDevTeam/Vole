@@ -371,4 +371,6 @@ Stopped { version, packetCounters }
 - [`CoIncrementMTAUsage`](https://learn.microsoft.com/windows/win32/api/combaseapi/nf-combaseapi-coincrementmtausage)
 
 
-`startVpn` 可选 `httpConfigYaml` 接收[独立 HTTP 规则](http-processing.md)，不放入 Mihomo YAML。规则进入已校验的 Session Snapshot canonical 内容并参与 digest；实际 Session Host 读取并构造规则，前台 registry 不替代业务消费者。未携带该字段的快照序列化保持原形式，快照和 bridge 的既有总体字节预算继续生效。
+`startVpn` 可选 `httpConfigYaml` 和 `httpContext` 接收[独立 HTTP 规则](http-processing.md)与 baseDir／私密 CA。断开状态可准备来源；活动前台不使用默认 socket 获取资源。canonical Session Snapshot 固定主设置、实际 payload、原生基目录和公开 CA 指纹，参与 token；私钥仅在当前用户 DPAPI sidecar 中，entropy 绑定 package family 与 token，先发布 sidecar 再发布普通快照。随机密文不参与 token。
+
+Session Host 完成 token 握手后才读取并解密 sidecar，复验 token、CA 身份和证私匹配；恢复实际规则不重读源文件。运行中的周期更新使用原 PhysicalBinding 的直接出口，只产生 pending；Stop 等待更新结束。私密 sidecar 随当前／上一份快照保留并同步清理，不进入普通缓存、Controller、日志或包通道。既有快照与 bridge 总体字节预算继续生效；编译不代替实际 Windows DPAPI／VPN 验证。

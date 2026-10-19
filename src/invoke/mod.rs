@@ -62,6 +62,7 @@ type InvokeTun = (TunFd, TunFraming, u16);
 type InvokeTun = ();
 
 mod foreground;
+pub(crate) mod http;
 mod measure_delay;
 pub use foreground::InvokePath;
 
@@ -77,6 +78,7 @@ thread_local! {
 #[derive(Default)]
 struct RegistryInner {
     instance: Option<Arc<CoreController>>,
+    idle_http_refresh: bool,
 }
 
 #[derive(Default)]
@@ -97,6 +99,7 @@ struct RuntimeData {
     directory: Arc<DataDirectory>,
     geodata: Arc<GeoDataManager>,
     dns_sources: Arc<crate::dns::source::NetworkSources>,
+    http: Arc<tokio::sync::Mutex<crate::http_processing::providers::Store>>,
 }
 
 impl Default for RuntimeRegistry {
@@ -131,9 +134,10 @@ impl CoreController {
 }
 
 enum StartupConfig {
+    #[cfg(test)]
     Yaml(String),
-    WithHttp { yaml: String, http: String },
-    Parsed(Box<Config>),
+    Input(http::StartPayload),
+    Resolved(Box<crate::runtime::RecoverySnapshot>),
 }
 
 #[derive(Default)]
@@ -385,6 +389,8 @@ struct ConfigYamlPayload {
     config_yaml: String,
     #[serde(default)]
     http_config_yaml: Option<String>,
+    #[serde(default)]
+    http_context: Option<http::HttpContextInput>,
 }
 impl std::fmt::Debug for ConfigYamlPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -470,6 +476,9 @@ impl RuntimeRegistry {
             directory: initialized.clone(),
             geodata,
             dns_sources: Arc::new(crate::dns::source::NetworkSources::default()),
+            http: Arc::new(tokio::sync::Mutex::new(
+                crate::http_processing::providers::Store::new(),
+            )),
         });
         Ok(initialized)
     }
@@ -504,6 +513,11 @@ impl RuntimeRegistry {
     }
     fn create_instance(&self) -> Result<Arc<CoreController>, InvokeFailure> {
         let mut inner = lock(&self.inner);
+        if inner.idle_http_refresh {
+            return Err(InvokeFailure::invalid_state(
+                "HTTP resource preparation is busy",
+            ));
+        }
         if inner.instance.is_some() {
             return Err(InvokeFailure::invalid_state(
                 "a public lifecycle instance already exists; destroy it before creating another",
@@ -773,10 +787,33 @@ fn dispatch_config_update(request: &str) -> Result<Option<InvokeResponse>, Invok
             .try_admit()
             .map_err(|e| InvokeFailure::new(e.message()))?;
         let input = decode_update_input(raw.payload.get())?;
+        let base_dir = input
+            .http_context
+            .map(|context| {
+                if context.ca.is_some() {
+                    return Err(InvokeFailure::invalid_request(
+                        "updateConfig does not accept CA material",
+                    ));
+                }
+                let base = context.base_dir.map(InvokePath::into_path);
+                if base.as_ref().is_some_and(|path| !path.is_absolute()) {
+                    return Err(InvokeFailure::invalid_request(
+                        "HTTP baseDir must be absolute",
+                    ));
+                }
+                Ok(base)
+            })
+            .transpose()?;
+        if input.http_config_yaml.is_none() && base_dir.is_some() {
+            return Err(InvokeFailure::invalid_request(
+                "httpContext requires httpConfigYaml",
+            ));
+        }
         let update = match input.http_config_yaml {
             Some(http) => ConfigUpdate::ReplaceWithHttp {
                 yaml: input.config_yaml,
                 http,
+                base_dir,
             },
             None => ConfigUpdate::Replace(input.config_yaml),
         };
@@ -797,12 +834,19 @@ fn decode_update_input(payload: &str) -> Result<ConfigYamlPayload, InvokeFailure
         yaml: &'a serde_json::value::RawValue,
         #[serde(rename = "httpConfigYaml", default, borrow)]
         http: Option<&'a serde_json::value::RawValue>,
+        #[serde(rename = "httpContext", default, borrow)]
+        context: Option<&'a serde_json::value::RawValue>,
     }
     let raw: RawConfig<'_> = serde_json::from_str(payload)
         .map_err(|_| InvokeFailure::invalid_request("invalid configuration update payload"))?;
     check_json_string_limit(raw.yaml.get(), crate::config::MAX_CONFIG_BYTES)?;
     if let Some(http) = raw.http {
         check_json_string_limit(http.get(), crate::http_processing::MAX_ADDENDUM)?;
+    }
+    if raw.context.is_some_and(|raw| raw.get().len() > 8192) {
+        return Err(InvokeFailure::invalid_request(
+            "HTTP context exceeds input limit",
+        ));
     }
     Ok(ConfigYamlPayload {
         config_yaml: serde_json::from_str(raw.yaml.get())
@@ -812,6 +856,11 @@ fn decode_update_input(payload: &str) -> Result<ConfigYamlPayload, InvokeFailure
             .map(|http| serde_json::from_str(http.get()))
             .transpose()
             .map_err(|_| InvokeFailure::invalid_request("invalid httpConfigYaml string"))?,
+        http_context: raw
+            .context
+            .map(|raw| serde_json::from_str(raw.get()))
+            .transpose()
+            .map_err(|_| InvokeFailure::invalid_request("invalid HTTP context"))?,
     })
 }
 #[cfg(test)]
@@ -898,6 +947,7 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
     let request = str::from_utf8(request)
         .map_err(|_| InvokeFailure::invalid_request("request is not valid UTF-8"))?;
     check_dns_network_envelope(request)?;
+    http::check_envelope(request)?;
     if let Some(response) = dispatch_config_update(request)? {
         return Ok(response);
     }
@@ -944,8 +994,32 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
         "validateConfig" => {
             require_instance_omitted(&envelope)?;
             let payload: ConfigYamlPayload = decode_payload(envelope.payload)?;
+            if let Some(context) = payload.http_context {
+                if context.ca.is_some() {
+                    return Err(InvokeFailure::invalid_request(
+                        "validateConfig does not accept CA material",
+                    ));
+                }
+                if context
+                    .base_dir
+                    .map(InvokePath::into_path)
+                    .is_some_and(|path| !path.is_absolute())
+                {
+                    return Err(InvokeFailure::invalid_request(
+                        "HTTP baseDir must be absolute",
+                    ));
+                }
+            }
+            let resources_ready = payload
+                .http_config_yaml
+                .as_deref()
+                .filter(|input| !input.is_empty())
+                .map(crate::http_processing::config::Document::parse)
+                .transpose()
+                .map_err(|_| InvokeFailure::new("invalid HTTP processing configuration"))?
+                .is_none_or(|document| document.unresolved_count() == 0);
             validate_config_with_http(payload.config_yaml, payload.http_config_yaml)?;
-            json!({})
+            json!({"httpResourcesValidated":resources_ready,"httpsReady":false})
         }
         "measureDelay" => {
             require_instance_omitted(&envelope)?;
@@ -953,19 +1027,26 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
             let results = measure_delay::measure_delay(payload)?;
             json!({"results": results})
         }
-        "start" => {
+        "start" | "reconnect" => {
             let controller = require_instance(&envelope)?;
-            let payload: ConfigYamlPayload = decode_payload(envelope.payload)?;
+            let reconnect = envelope.method == "reconnect";
+            let payload: http::StartPayload = decode_payload(envelope.payload)?;
             invoke_instance_guarded(&controller, || {
-                match payload.http_config_yaml {
-                    Some(http) => controller.start_config(StartupConfig::WithHttp {
-                        yaml: payload.config_yaml,
-                        http,
-                    })?,
-                    None => controller.start(payload.config_yaml)?,
+                if reconnect {
+                    controller.reconnect(payload)?;
+                } else {
+                    controller.start_config(StartupConfig::Input(payload))?;
                 }
                 Ok(json!({}))
             })?
+        }
+        "refreshHttpProviders" => {
+            require_instance_omitted(&envelope)?;
+            http::refresh(decode_payload(envelope.payload)?)?
+        }
+        "testHttp" => {
+            require_instance_omitted(&envelope)?;
+            http::evaluate(decode_payload::<http::TestPayload>(envelope.payload)?)?
         }
         "foreground" => {
             require_instance_omitted(&envelope)?;
@@ -1073,12 +1154,17 @@ impl CoreController {
         // protect controller for a configuration that actually contains TUN;
         // non-TUN configurations do not depend on controller registration.
         let _data_directory = registry().data_directory()?;
-        let config = match input {
-            StartupConfig::Yaml(yaml) => parse_config_yaml(&yaml)?,
-            StartupConfig::WithHttp { yaml, http } => {
-                parse_config_yaml_with_http(&yaml, Some(&http))?
+        let (mut config, http_input, resolved_cache) = match input {
+            #[cfg(test)]
+            StartupConfig::Yaml(yaml) => (parse_config_yaml(&yaml)?, None, None),
+            StartupConfig::Input(payload) => (
+                parse_config_yaml(&payload.config_yaml)?,
+                Some(payload),
+                None,
+            ),
+            StartupConfig::Resolved(snapshot) => {
+                (snapshot.config, None, Some(snapshot.provider_cache))
             }
-            StartupConfig::Parsed(config) => *config,
         };
         let dispatch = crate::logging::dispatch(config.log_level);
         let _logging = tracing::dispatcher::set_default(&dispatch);
@@ -1117,14 +1203,47 @@ impl CoreController {
                 .enable_time()
                 .build()
                 .map_err(InvokeFailure::from)?;
-            let prepared = runtime
-                .block_on(PreparedCore::prepare_config(
-                    config,
-                    geodata_manager,
-                    &SystemResolver,
-                    limits,
-                ))
-                .map_err(InvokeFailure::from);
+            let prepared = runtime.block_on(async {
+                let cancellation = http_input
+                    .as_ref()
+                    .and_then(|input| input.cancellation.clone());
+                if let Some(input) = http_input {
+                    http::attach(
+                        &mut config,
+                        input.http_config_yaml.as_deref(),
+                        input.http_context,
+                        input.source_file,
+                        input.cancellation.as_ref(),
+                    )
+                    .await?;
+                }
+                let prepared = match resolved_cache {
+                    Some(cache) => {
+                        PreparedCore::prepare_resolved(
+                            config,
+                            cache,
+                            geodata_manager,
+                            &SystemResolver,
+                            limits,
+                        )
+                        .await
+                    }
+                    None => {
+                        PreparedCore::prepare_config(
+                            config,
+                            geodata_manager,
+                            &SystemResolver,
+                            limits,
+                        )
+                        .await
+                    }
+                }
+                .map_err(InvokeFailure::from)?;
+                if cancellation.is_some_and(|token| token.is_cancelled()) {
+                    return Err(InvokeFailure::new("core preparation was cancelled"));
+                }
+                Ok(prepared)
+            });
             // Bootstrap DNS runs on the runtime-shared bounded worker. Keep a
             // finite shutdown boundary so future prepare-only tasks cannot
             // turn Runtime::drop into an unbounded synchronous wait.
@@ -1156,10 +1275,6 @@ impl CoreController {
         }
     }
 
-    fn start(&self, config_yaml: String) -> Result<(), InvokeFailure> {
-        self.start_config(StartupConfig::Yaml(config_yaml))
-    }
-
     fn start_config(&self, config: StartupConfig) -> Result<(), InvokeFailure> {
         let _command = self.try_command()?;
         self.prepare_locked(config)?;
@@ -1168,6 +1283,64 @@ impl CoreController {
             reset_failed_operation(&mut lock(&self.inner), "start-failed")?;
         }
         result
+    }
+
+    fn reconnect(&self, input: http::StartPayload) -> Result<(), InvokeFailure> {
+        let _command = self.try_command()?;
+        let apply = {
+            let mut inner = lock(&self.inner);
+            refresh_runtime_status(&mut inner);
+            if inner.lifecycle.state() != LifecycleState::Running {
+                return Err(InvokeFailure::invalid_state(
+                    "instance must be running before reconnect",
+                ));
+            }
+            inner
+                .engine
+                .as_ref()
+                .and_then(|engine| engine.config_apply.clone())
+                .ok_or_else(|| {
+                    InvokeFailure::invalid_state("runtime cannot capture a recovery snapshot")
+                })?
+        };
+        // Resolve external sources while the old engine and its platform lease
+        // are still usable. GeoData registration and TUN binding happen only
+        // after the synchronous old-engine stop barrier.
+        let config = http::parse_reconnect(input, &apply)?;
+        let manager = registry().geodata_manager()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(InvokeFailure::from)?;
+        let next = runtime.block_on(PreparedCore::resolve_config(config, &manager));
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        let (config, provider_cache) = next.map_err(InvokeFailure::from)?;
+        let next = Box::new(crate::runtime::RecoverySnapshot {
+            config,
+            provider_cache,
+        });
+        let previous = apply
+            .recovery_snapshot()
+            .map_err(|error| InvokeFailure::new(error.message()))?;
+        self.stop_locked()?;
+        let result = self
+            .prepare_locked(StartupConfig::Resolved(next))
+            .and_then(|()| self.start_prepared_locked());
+        if let Err(error) = result {
+            reset_failed_operation(&mut lock(&self.inner), "reconnect-failed")?;
+            if self
+                .prepare_locked(StartupConfig::Resolved(previous))
+                .and_then(|()| self.start_prepared_locked())
+                .is_err()
+            {
+                reset_failed_operation(&mut lock(&self.inner), "reconnect-recovery-failed")?;
+                return Err(InvokeFailure::new(
+                    "reconnect failed and previous session could not be restored",
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn start_prepared_locked(&self) -> Result<(), InvokeFailure> {
@@ -1651,7 +1824,7 @@ fn run_engine_inner(
             debug_assert!(tun.is_none());
             prepared.start_local(dialer).await
         };
-        let running = match started {
+        let mut running = match started {
             Ok(running) => running,
             Err(error) => {
                 let kind = error.kind();
@@ -1660,6 +1833,9 @@ fn run_engine_inner(
                 return Err(io::Error::new(kind, message));
             }
         };
+        running.maintain_http(
+            http::runtime_store().map_err(|_| io::Error::other("HTTP runtime store is missing"))?,
+        );
         tracing::info!(instance_id, has_tun, "Vole runtime engine started");
         if startup.send(Ok(running.config_apply_handle())).is_err() {
             return running.stop().await;

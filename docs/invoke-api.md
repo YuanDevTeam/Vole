@@ -230,7 +230,7 @@ stopped -> preparing -> prepared -> starting -> running
 
 ### `start`
 
-实例级方法，只允许 stopped 状态。唯一 payload 字段是内联配置：
+实例级方法，只允许 stopped 状态。`configYaml` 必填，独立 HTTP 设置与私密上下文可选：
 
 ```json
 {
@@ -283,7 +283,7 @@ Stop 关闭本次持有的 fd、session 和原生句柄；Wintun 不承诺移除
 
 ### `updateConfig`
 
-实例级方法，只允许 running 状态，payload 与 `start` 相同：
+实例级方法，只允许 running 状态。接受 `configYaml`、可选 `httpConfigYaml` 与只含 `baseDir` 的 `httpContext`；不接受 CA：
 
 ```json
 {"method":"updateConfig","instanceId":"1","payload":{"configYaml":"rules: [MATCH,DIRECT]"}}
@@ -547,4 +547,63 @@ ProtectFd(fd) -> bool
   `vole`，不继承宿主应用的 bundle identifier；Console 或 `log stream` 应按该标识筛选。
 
 
-HTTP 附加配置独立于 Mihomo YAML：`validateConfig` / `start` 可选 `httpConfigYaml`；`updateConfig` 省略该字段继承、空串明确关闭，并与 `configYaml` 一同经既有候选许可发布。foreground 可选原生路径 `httpConfigPath`，仅显式普通文件，最多 1 MiB，`-` 与空路径失败。详细语法与流转见[HTTP URL rewrite](http-processing.md)。配置响应和日志不返回附加原文。
+## 独立 HTTP 设置与私密上下文
+
+`validateConfig`、`start`、`reconnect` 可选 `httpConfigYaml`。HTTP YAML 不承载 CA；旧数组规则、字符串域名项和共享 PEM 字段均拒绝。字段、动作与 provider 见 [HTTP 处理](http-processing.md)。
+
+```json
+{
+  "method": "start",
+  "instanceId": "1",
+  "payload": {
+    "configYaml": "rules: ['MATCH,DIRECT']",
+    "httpConfigYaml": "mitm: {enabled: true, domains: [{pattern: example.com}]}",
+    "httpContext": {
+      "baseDir": "/absolute/http-settings",
+      "ca": {"certificate": "...PEM...", "privateKey": "...PEM..."}
+    }
+  }
+}
+```
+
+baseDir 使用原生路径元数据并且必须绝对；相对 file 来源必须有该上下文。HTTP 缓存使用已初始化 dataDir。CA 仅由 start／reconnect 和 Windows startVpn 接受；私密 DTO 不可普通序列化、Debug 脱敏，临时密钥输入在释放时零化。关闭 MITM 不要求 CA。
+
+validateConfig 只静态校验，不读取外部 HTTP provider 或 CA。返回 `httpResourcesValidated` 表示外部资源是否全部可在输入中校验，`httpsReady` 固定 false；静态通过不代表真实 HTTPS 就绪。foreground 的 validate 也不读取 `httpCaPath`。
+
+### `reconnect`
+
+实例级、只允许 running，payload 与 start 相同。先准备新资源候选，再执行停止屏障并启动。后续启动失败时用临时保留的旧主配置、实际 provider 内容及原 HTTP／CA 快照恢复，方法仍报告失败。新候选准备失败不停止旧引擎。恢复也失败则回到 stopped 并明确报告；普通 Stop 不长期保留恢复密钥。
+
+updateConfig 省略 HTTP 时继承 active；同设置可继续使用 active。显式改变 HTTP（包括空串关闭）或来源基目录返回 reconnect required，整个 routing 更新失败；不把待应用候选混入当前会话。节点切换与普通 provider 更新也不应用 pending HTTP。
+
+### `refreshHttpProviders`
+
+运行时级，要求 initialize，无须创建或启动实例。只接受 `httpConfigYaml` 与可选只含 baseDir 的 httpContext：
+
+```json
+{"method":"refreshHttpProviders","payload":{"httpConfigYaml":"...","httpContext":{"baseDir":"/absolute/http-settings"}}}
+```
+
+完整准备与缓存提交成功返回 `{"resourcesReady":true,"applied":false}`。未运行时只执行一轮；运行时与现有资源更新共用受保护出口、候选许可、取消和 Stop 屏障。周期 HTTP 更新只发布待应用候选；file 不 watch，interval 0 不周期刷新。Windows UWP 的物理更新由已绑定的 Session Host 承担，普通前台 Invoke 不回退到未绑定 socket。
+
+### `testHttp`
+
+运行时级离线演算，不初始化、不联网、不读文件、不读取 CA。输入必填 httpConfigYaml 和 url，可选只含 baseDir 的 httpContext、request／response 样本：
+
+```json
+{
+  "method":"testHttp",
+  "payload":{
+    "httpConfigYaml":"rewrite: {rules: [{url: '.', action: reject}]}",
+    "url":"https://example.com/path",
+    "request":{"method":"POST","headers":[["Content-Type","application/json"]],"bodyBase64":"e30="},
+    "response":{"status":200,"headers":[["Content-Type","application/json"]],"bodyBase64":"e30="}
+  }
+}
+```
+
+method 默认 GET，response.status 必填；headers 是保留顺序与重复项的二元数组，bodyBase64 表示原始编码实体。外部资源只取同来源已准备内存候选；缺少则返回 resourcesReady false／unprepared，不伪装为未命中。总开关关闭仍可演算启用规则；没有样本只报告被选中。结果包含 U0/U1、来源索引、URL 结果、各阶段执行或旁路与样本输出，httpsReady 不宣称真实信任就绪。结果不含 CA，也不持久化正文。
+
+### foreground 私密文件
+
+可选 httpConfigPath、httpCaPath 都是明确的普通文件路径，不自动搜索、不从环境获取；HTTP 文件最多 1 MiB。私密文件格式为 `{"certificate":"...PEM...","privateKey":"...PEM..."}`，Unix 要求当前用户所有、group／other 权限全关闭，并拒绝符号链接。foreground 保留 HTTP 文件目录作为 baseDir。CLI 只传路径，读取仍归 Invoke；空路径与 `-` 拒绝。

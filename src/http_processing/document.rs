@@ -3,7 +3,7 @@ use super::{MAX_ADDENDUM, Policy, PolicyCandidate, SourceLocation, invalid};
 use crate::http_processing::{
     mitm::RawMitm,
     providers::{Payload, ProviderSpec},
-    rules::{ActionKind, MAX_RULES, RawRule, Rule},
+    rules::{MAX_RULES, RawRule, Rule},
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -75,6 +75,7 @@ impl Document {
         if input.len() > MAX_ADDENDUM {
             return Err(invalid());
         }
+        crate::http_processing::numeric_input::validate(input.as_bytes())?;
         let value =
             crate::config::yaml::parse_with_budget(input.as_bytes(), &mut (MAX_ADDENDUM * 4))
                 .map_err(|_| invalid())?;
@@ -231,7 +232,7 @@ impl Document {
 }
 
 pub(crate) fn compile_rule(raw: RawRule, text: &mut usize) -> io::Result<Rule> {
-    if !raw.action.is_url() {
+    if !(raw.action.is_url()) {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "HTTP rewrite action is not available"));
     }
     Rule::compile(raw, text)

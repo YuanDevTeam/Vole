@@ -4,7 +4,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     ptr,
-    sync::{Mutex, TryLockError},
+    sync::{Mutex, OnceLock, TryLockError},
 };
 
 use serde::{Deserialize, Deserializer};
@@ -31,9 +31,15 @@ use super::{
     managed_processes::SessionBackend,
     policy::WindowsVpnPolicy,
     profile::{WindowsNetworkSettings, WindowsProfileConfiguration},
-    snapshot::SessionReference,
+    snapshot::{HttpSessionInput, SessionReference},
 };
-use crate::{config::Config, platform::validate_packet_channel_config};
+use crate::{
+    config::Config,
+    dialer::Dialer,
+    http_processing::providers::Store,
+    invoke::http::{HttpContextInput, download_context, prepare_candidate, source_context},
+    platform::validate_packet_channel_config,
+};
 
 const BRIDGE_VERSION: u32 = 3;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -42,6 +48,7 @@ const DEFAULT_PROFILE_NAME: &str = "Vole";
 const MAX_PROFILE_NAME_BYTES: usize = 256;
 const STARTUP_TASK_ID: &str = "VoleStartup";
 static COMMAND: Mutex<()> = Mutex::new(());
+static HTTP_STORE: OnceLock<tokio::sync::Mutex<Store>> = OnceLock::new();
 // windows-rs caches agile WinRT factories for process lifetime. Keep one opaque
 // MTA usage cookie for the same lifetime, including gaps between caller threads.
 // Never decrement it per request or during DLL/process teardown: cached factories
@@ -101,6 +108,8 @@ struct StartPayload {
     config_yaml: String,
     #[serde(default)]
     http_config_yaml: Option<String>,
+    #[serde(default)]
+    http_context: Option<HttpContextInput>,
     network_settings: WindowsNetworkSettings,
     policy: WindowsVpnPolicy,
     #[serde(default, deserialize_with = "deserialize_session_backend")]
@@ -230,15 +239,13 @@ fn start_vpn(payload: StartPayload) -> Result<Value, String> {
         profile_name,
         config_yaml,
         http_config_yaml,
+        http_context,
         network_settings,
         policy,
         session_backend,
     } = payload;
     let mut config = Config::parse_yaml(config_yaml.as_bytes())
         .map_err(|_| "invalid Vole configuration".to_owned())?;
-    config
-        .set_http_config(http_config_yaml.as_deref())
-        .map_err(|_| "invalid HTTP processing configuration".to_owned())?;
     if !config.tun.enable {
         return Err("Windows VPN configuration must enable TUN".to_owned());
     }
@@ -252,12 +259,79 @@ fn start_vpn(payload: StartPayload) -> Result<Value, String> {
         .map_err(str::to_owned)?;
 
     let environment = package_environment()?;
+    let agent = VpnManagementAgent::new().map_err(display_error)?;
+    let existing = find_profile(&agent, &environment.family_name, &profile_name.0)?;
+    let connected = if let Some(existing) = &existing {
+        match existing.status {
+            VpnManagementConnectionStatus::Connected => true,
+            VpnManagementConnectionStatus::Disconnected => false,
+            VpnManagementConnectionStatus::Connecting
+            | VpnManagementConnectionStatus::Disconnecting => {
+                return Err("Windows VPN profile is busy".to_owned());
+            }
+            _ => return Err("unknown Windows VPN profile status".to_owned()),
+        }
+    } else {
+        false
+    };
+    let mut http_candidate = None;
+    let mut http_base_dir = None;
+    let mut private_ca = None;
+    if let Some(input) = http_config_yaml
+        .as_deref()
+        .filter(|input| !input.is_empty())
+    {
+        let (source, ca) =
+            source_context(http_context, environment.local_folder.join("vole"), None)
+                .map_err(|_| "invalid HTTP source context".to_owned())?;
+        http_base_dir = source.base_dir.clone();
+        // The frontend does not own the active Provider's PhysicalBinding.
+        // When connected it may reuse validated content, never create an
+        // unbound fallback socket through the VPN being configured.
+        let network = (!connected).then(|| download_context(&config, Dialer::default()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| "HTTP resource runtime creation failed".to_owned())?;
+        let result = runtime.block_on(prepare_candidate(
+            input,
+            source,
+            network.as_ref(),
+            HTTP_STORE.get_or_init(|| tokio::sync::Mutex::new(Store::default())),
+            false,
+        ));
+        runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+        let candidate = result.map_err(|_| "HTTP resource preparation failed".to_owned())?;
+        private_ca = candidate.document.mitm.enabled.then_some(ca).flatten();
+        let policy = candidate
+            .bind_ca(private_ca.as_ref())
+            .map_err(|_| "invalid or missing private HTTP CA".to_owned())?;
+        config
+            .set_http_policy(Some(policy))
+            .map_err(|_| "invalid HTTP processing configuration".to_owned())?;
+        http_candidate = Some(candidate);
+    } else if http_context.is_some() {
+        return Err("httpContext requires httpConfigYaml".to_owned());
+    }
+    let http = http_candidate
+        .as_ref()
+        .map(|candidate| -> Result<HttpSessionInput<'_>, String> {
+            Ok(HttpSessionInput {
+                rules: candidate
+                    .export_snapshot()
+                    .map_err(|_| "HTTP snapshot preparation failed".to_owned())?,
+                base_dir: http_base_dir,
+                ca: private_ca.as_ref(),
+                package_family: &environment.family_name,
+            })
+        })
+        .transpose()?;
     let snapshot = SessionReference::publish(
         &environment.local_folder,
         &environment.installed_folder,
         config_yaml,
         session_backend,
-        http_config_yaml,
+        http,
     )
     .map_err(display_error)?;
     let profile_configuration =
@@ -265,8 +339,6 @@ fn start_vpn(payload: StartPayload) -> Result<Value, String> {
     let profile_configuration_json = profile_configuration.to_json().map_err(display_error)?;
     let always_on = profile_configuration.policy().always_on();
     let token = snapshot.token();
-    let agent = VpnManagementAgent::new().map_err(display_error)?;
-    let existing = find_profile(&agent, &environment.family_name, &profile_name.0)?;
 
     if let Some(existing) = &existing {
         match existing.status {

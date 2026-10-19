@@ -62,9 +62,66 @@ impl ProviderRuntime {
             return Err(ApplyError::Stopped);
         }
         match &update {
+            ConfigUpdate::RecoverySnapshot(reply) => {
+                let cache = self.cache.lock().await.clone();
+                let _publication = self.publication.lock().unwrap();
+                if cancel.is_cancelled() || self.cancellation.is_cancelled() {
+                    return Err(ApplyError::Stopped);
+                }
+                let current = self.current.load_full();
+                let mut config = current.config.clone();
+                for state in current.groups.list_states() {
+                    if state.kind == crate::config::GroupKind::LoadBalance {
+                        continue;
+                    }
+                    let Some(group) = config
+                        .proxy_groups
+                        .iter_mut()
+                        .find(|group| group.name == state.name)
+                    else {
+                        return Err(ApplyError::PreparationFailed);
+                    };
+                    group.initial_member = group
+                        .members
+                        .iter()
+                        .position(|member| member.name == state.now)
+                        .ok_or(ApplyError::PreparationFailed)?;
+                }
+                let snapshot = Box::new(crate::runtime::RecoverySnapshot {
+                    config,
+                    provider_cache: Some(cache),
+                });
+                return reply.send(snapshot).map_err(|_| ApplyError::Stopped);
+            }
             // Implementations are supplied by the shared maintenance adapter;
             // these commands occupy the same admission and worker as reloads.
             ConfigUpdate::RefreshGeoData => return self.refresh_geodata(&cancel).await,
+            ConfigUpdate::RefreshHttp {
+                document,
+                context,
+                store,
+                force,
+                security,
+                reply,
+            } => {
+                let mut network = self.http_download_context();
+                if let Some(security) = security {
+                    network.security = security.clone();
+                }
+                let candidate = crate::resource::http_control::refresh(
+                    document.clone(),
+                    context,
+                    store,
+                    &network,
+                    &cancel,
+                    *force,
+                )
+                .await?;
+                if let Some(reply) = reply {
+                    reply.try_send(candidate).map_err(|_| ApplyError::Stopped)?;
+                }
+                return Ok(());
+            }
             ConfigUpdate::FlushFakeIp => return self.flush_fake_ip(&cancel).await,
             _ => {}
         }
@@ -102,14 +159,46 @@ impl ProviderRuntime {
                         next
                     })
                 }
-                ConfigUpdate::ReplaceWithHttp { yaml, http } => {
+                ConfigUpdate::ReplaceWithHttp {
+                    yaml,
+                    http,
+                    base_dir,
+                } => {
+                    let candidate = crate::http_processing::Policy::compile_optional(Some(&http))
+                        .map_err(|_| ApplyError::InvalidConfig)?;
+                    let same = match (&previous.config.http_policy(), &candidate) {
+                        (None, None) => true,
+                        (Some(active), Some(candidate)) => {
+                            active.document().identity() == candidate.document().identity()
+                        }
+                        _ => false,
+                    };
+                    if !same {
+                        return Err(ApplyError::RestartRequired);
+                    }
+                    if let Some(base_dir) = base_dir {
+                        let source = crate::http_processing::providers::SourceContext {
+                            base_dir,
+                            data_dir: Some(directory.clone()),
+                            config_path: None,
+                        };
+                        if previous
+                            .config
+                            .http_policy()
+                            .as_ref()
+                            .and_then(|policy| policy.candidate())
+                            .and_then(|candidate| candidate.source_identity())
+                            != Some(source.identity())
+                        {
+                            return Err(ApplyError::RestartRequired);
+                        }
+                    }
                     crate::config::providers::ProviderTemplate::update_yaml(
                         yaml.as_bytes(),
                         &directory,
                     )
                     .and_then(|mut next| {
-                        Arc::make_mut(&mut next).http_policy =
-                            crate::http_processing::Policy::compile_optional(Some(&http))?;
+                        Arc::make_mut(&mut next).http_policy = previous.config.http_policy();
                         Ok(next)
                     })
                 }
@@ -119,7 +208,10 @@ impl ProviderRuntime {
                     .as_ref()
                     .ok_or(ApplyError::PreparationFailed)?
                     .patched(&patch),
-                ConfigUpdate::RefreshGeoData | ConfigUpdate::FlushFakeIp => {
+                ConfigUpdate::RefreshGeoData
+                | ConfigUpdate::RefreshHttp { .. }
+                | ConfigUpdate::FlushFakeIp
+                | ConfigUpdate::RecoverySnapshot(_) => {
                     unreachable!("maintenance handled before candidate construction")
                 }
             }
@@ -302,6 +394,39 @@ impl ProviderRuntime {
 mod tests {
     use super::*;
     use crate::{dialer::SystemResolver, resource::config_apply::ConfigPatch};
+
+    #[tokio::test]
+    async fn recovery_snapshot_keeps_current_group_member_without_selection_persistence() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config::parse_yaml(b"profile: {store-selected: false}\nproxy-groups: [{name: chosen, type: select, proxies: [DIRECT, REJECT]}, {name: balanced, type: load-balance, proxies: [DIRECT, REJECT]}]\nrules: ['MATCH,chosen']\n").unwrap();
+        let manager =
+            GeoDataManager::open(&root.path().join("geodata"), Duration::from_secs(86400)).unwrap();
+        let prepared = PreparedCore::prepare_config(
+            config,
+            manager,
+            &SystemResolver,
+            ResourceLimits::default(),
+        )
+        .await
+        .unwrap();
+        let parts = prepared.build_dispatcher(Dialer::default()).unwrap();
+        let live = parts.resources.clone().unwrap();
+        live.select("chosen", "REJECT").unwrap();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        live.apply_update(
+            ConfigUpdate::RecoverySnapshot(send),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let snapshot = receive.recv().unwrap();
+        assert!(!snapshot.config.profile.store_selected);
+        let group = &snapshot.config.proxy_groups[0];
+        assert_eq!(group.members[group.initial_member].name, "REJECT");
+        assert_eq!(live.current.load().config.proxy_groups[0].initial_member, 0);
+        live.shutdown().await;
+    }
+
     #[tokio::test]
     async fn config_candidates_preserve_old_generation_and_latest_provider_template() {
         let root = tempfile::tempdir().unwrap();
@@ -391,14 +516,16 @@ mod http_tests {
     use super::*;
     use crate::dialer::SystemResolver;
     #[tokio::test]
-    async fn main_config_and_provider_rebuild_preserve_the_addendum_until_explicit_clear() {
+    async fn routing_updates_keep_active_http_and_changed_http_requires_reconnect() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("nodes.yaml");
         std::fs::write(&path, "proxies: [{name: first, type: direct}]").unwrap();
         let yaml = "proxy-providers: {fixture: {type: file, path: nodes.yaml}}\nproxy-groups: [{name: chosen, type: select, use: [fixture]}]\nrules: ['MATCH,chosen']\n";
         let mut config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         config
-            .set_http_config(Some("rewrite: [{pattern: '.', action: reject}]"))
+            .set_http_config(Some(
+                "rewrite: {enabled: true, rules: [{url: '.', action: reject}]}",
+            ))
             .unwrap();
         let policy = config.http_policy().unwrap();
         let manager =
@@ -431,7 +558,8 @@ mod http_tests {
             live.apply_update(
                 ConfigUpdate::ReplaceWithHttp {
                     yaml: yaml.into(),
-                    http: "private-bad: private-value".into()
+                    http: "private-bad: private-value".into(),
+                    base_dir: None
                 },
                 CancellationToken::new()
             )
@@ -442,16 +570,21 @@ mod http_tests {
             &policy,
             &live.current.load().config.http_policy().unwrap()
         ));
-        live.apply_update(
-            ConfigUpdate::ReplaceWithHttp {
-                yaml: yaml.into(),
-                http: String::new(),
-            },
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(live.http_context().is_none());
+        let result = live
+            .apply_update(
+                ConfigUpdate::ReplaceWithHttp {
+                    yaml: yaml.into(),
+                    http: String::new(),
+                    base_dir: None,
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(ApplyError::RestartRequired)));
+        assert!(Arc::ptr_eq(
+            &policy,
+            &live.current.load().config.http_policy().unwrap()
+        ));
         assert!(pinned.candidate_port(80));
         drop(pinned);
         live.shutdown().await;

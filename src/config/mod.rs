@@ -2291,6 +2291,12 @@ impl Config {
     }
     pub(crate) fn set_http_config(&mut self, input: Option<&str>) -> Result<()> {
         let policy = crate::http_processing::Policy::compile_optional(input)?;
+        self.set_http_policy(policy)
+    }
+    pub(crate) fn set_http_policy(
+        &mut self,
+        policy: Option<std::sync::Arc<crate::http_processing::Policy>>,
+    ) -> Result<()> {
         let template = self
             .providers
             .as_mut()
