@@ -116,6 +116,10 @@ authentication:
 # 完整接口见 controller-api.md；不属于 Invoke API。
 external-controller: 127.0.0.1:9090
 # external-controller-tls: 127.0.0.1:9443
+# Linux 本地 HTTP/1 / WebSocket 管理入口；空串关闭，相对路径从 dataDir 解析。
+# 父目录须已存在；0600 在 listen 前设置，已有文件/目录/链接/socket 均不接管。
+# 本地入口依赖文件权限，不要求 secret；并行网络 HTTP/HTTPS 仍使用原 Bearer。
+external-controller-unix: ""
 external-controller-cors:
   allow-origins: ["*"]
   allow-private-network: true

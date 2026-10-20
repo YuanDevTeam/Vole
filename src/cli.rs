@@ -25,6 +25,7 @@ struct Options {
     age_secret_key: Option<Zeroizing<String>>,
     external_controller: Option<Zeroizing<String>>,
     external_controller_tls: Option<Zeroizing<String>>,
+    external_controller_unix: Option<Zeroizing<String>>,
     secret: Option<Zeroizing<String>>,
     http_config_file: Option<PathBuf>,
     http_ca_file: Option<PathBuf>,
@@ -52,6 +53,7 @@ impl Options {
         let mut age_secret_key = None;
         let mut external_controller = None;
         let mut external_controller_tls = None;
+        let mut external_controller_unix = None;
         let mut secret = None;
         let mut http_config_file = None;
         let mut http_ca_file = None;
@@ -72,6 +74,7 @@ impl Options {
                         age_secret_key,
                         external_controller,
                         external_controller_tls,
+                        external_controller_unix,
                         secret,
                         http_config_file,
                         http_ca_file,
@@ -85,7 +88,8 @@ impl Options {
                         validate = value;
                     }
                 }
-                b"config" | b"age-secret-key" | b"ext-ctl" | b"ext-ctl-tls" | b"secret" => {
+                b"config" | b"age-secret-key" | b"ext-ctl" | b"ext-ctl-tls" | b"ext-ctl-unix"
+                | b"secret" => {
                     let value = inline
                         .map(OsStr::to_owned)
                         .or_else(|| arguments.next())
@@ -94,6 +98,7 @@ impl Options {
                             b"age-secret-key" => "missing value for -age-secret-key",
                             b"ext-ctl" => "missing value for -ext-ctl",
                             b"ext-ctl-tls" => "missing value for -ext-ctl-tls",
+                            b"ext-ctl-unix" => "missing value for -ext-ctl-unix",
                             _ => "missing value for -secret",
                         }))?;
                     let value = value.into_string().map(Zeroizing::new).map_err(|value| {
@@ -105,6 +110,7 @@ impl Options {
                         b"age-secret-key" => age_secret_key = Some(value),
                         b"ext-ctl" => external_controller = Some(value),
                         b"ext-ctl-tls" => external_controller_tls = Some(value),
+                        b"ext-ctl-unix" => external_controller_unix = Some(value),
                         _ => secret = Some(value),
                     }
                     drop(Zeroizing::new(argument.into_encoded_bytes()));
@@ -156,6 +162,7 @@ impl Options {
             age_secret_key,
             external_controller,
             external_controller_tls,
+            external_controller_unix,
             secret,
             http_config_file,
             http_ca_file,
@@ -222,6 +229,7 @@ fn request(options: Options) -> Value {
         ("ageSecretKey", options.age_secret_key),
         ("externalController", options.external_controller),
         ("externalControllerTls", options.external_controller_tls),
+        ("externalControllerUnix", options.external_controller_unix),
         ("secret", options.secret),
     ] {
         if let Some(mut value) = value {
@@ -305,6 +313,14 @@ mod tests {
     fn parse(args: &[&str]) -> Result<Options, CliError> {
         Options::parse(args.iter().map(OsString::from), None, None)
     }
+    #[test]
+    fn unix_controller_flag_only_transports_the_explicit_text_value() {
+        let options = Options::parse(["-ext-ctl-unix=/run/vole.sock".into()], None, None).unwrap();
+        let value = request(options);
+        assert_eq!(value["payload"]["externalControllerUnix"], "/run/vole.sock");
+        assert!(Options::parse(["-ext-ctl-unix".into()], None, None).is_err());
+    }
+
     #[test]
     fn supported_go_flag_spellings_and_priority() {
         for value in ["true", "T", "TRUE", "1", "t", "True"] {

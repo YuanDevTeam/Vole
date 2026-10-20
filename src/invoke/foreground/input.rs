@@ -240,6 +240,8 @@ pub(super) fn check_envelope(request: &str) -> Result<(), InvokeFailure> {
         #[serde(borrow)]
         external_controller_tls: Option<&'a RawValue>,
         #[serde(borrow)]
+        external_controller_unix: Option<&'a RawValue>,
+        #[serde(borrow)]
         secret: Option<&'a RawValue>,
     }
     let input: Input<'_> = serde_json::from_str(envelope.payload.get())
@@ -249,6 +251,7 @@ pub(super) fn check_envelope(request: &str) -> Result<(), InvokeFailure> {
         (input.age_secret_key, MAX_SECRET_BYTES),
         (input.external_controller, MAX_CONFIG_BYTES),
         (input.external_controller_tls, MAX_CONFIG_BYTES),
+        (input.external_controller_unix, MAX_CONFIG_BYTES),
         (input.secret, MAX_CONFIG_BYTES),
     ] {
         if let Some(raw) = raw {

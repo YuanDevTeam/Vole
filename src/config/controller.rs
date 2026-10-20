@@ -43,8 +43,39 @@ impl std::fmt::Debug for ControllerTls {
     }
 }
 
+pub(crate) fn normalize_unix(value: Option<String>) -> super::Result<Option<String>> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.contains('\0') {
+        return super::invalid("external-controller-unix requires a filesystem path without NUL");
+    }
+    Ok(Some(value))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn controller_unix_is_independent_of_network_listeners_and_keeps_secret() {
+        use super::super::Config;
+        let config = Config::parse_yaml(
+            b"external-controller-unix: controller.sock\nsecret: network-token\n",
+        )
+        .unwrap();
+        let controller = config.external_controller.unwrap();
+        assert!(!controller.http_enabled);
+        assert!(controller.tls_listen.is_none());
+        assert_eq!(controller.unix_path.as_deref(), Some("controller.sock"));
+        assert_eq!(controller.secret.as_deref(), Some("network-token"));
+        assert!(
+            Config::parse_yaml(b"external-controller-unix: ''\nsecret: retained\n")
+                .unwrap()
+                .external_controller
+                .is_none()
+        );
+        assert!(Config::parse_yaml(b"external-controller-unix: 7\n").is_err());
+        assert!(super::normalize_unix(Some("bad\0path".into())).is_err());
+    }
     #[test]
     fn controller_secure_configuration_keeps_http_tls_and_client_trust_separate() {
         let config = super::super::Config::parse_yaml(

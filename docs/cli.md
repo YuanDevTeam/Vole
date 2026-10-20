@@ -25,6 +25,7 @@ vole -t -config "$(base64 < config.yaml)"
 | `-age-secret-key <key>` | 解密 AGE armor 主配置的身份，可含多行身份 |
 | `-ext-ctl <address>` | 非空时覆盖 HTTP Controller 地址 |
 | `-ext-ctl-tls <address>` | 非空时覆盖 TLS Controller 地址 |
+| `-ext-ctl-unix <path>` | 非空时覆盖 Linux 本地 Controller 路径 |
 | `-secret <token>` | 非空时覆盖 Controller 认证密钥 |
 | `-http-config <file>` | 显式的独立 HTTP 附加配置，交给 Invoke 读取与验证 |
 | `-http-ca <file>` | 独立私密 CA JSON 路径，交给 Invoke 读取；`-t` 不读取它 |
@@ -50,7 +51,7 @@ Unix 用户目录取 `HOME`，Windows 取 `USERPROFILE`，缺失时使用工作�
 默认 `.config/vole` 不存在或不可访问时，若设置 `XDG_CONFIG_HOME`，使用其中的 `vole` 目录。
 配置文件必须是普通文件，文件和标准输入上限均为 8 MiB，CLI 不写回配置。
 正常运行时，`VOLE_OVERRIDE_EXTERNAL_CONTROLLER`、`VOLE_OVERRIDE_EXTERNAL_CONTROLLER_TLS`、
-`VOLE_OVERRIDE_SECRET` 提供三项 Controller 覆盖的环境默认。显式参数优先，显式空值清除该环境默认，
+`VOLE_OVERRIDE_EXTERNAL_CONTROLLER_UNIX`、`VOLE_OVERRIDE_SECRET` 提供 Controller 覆盖的环境默认。显式参数优先，显式空值清除该环境默认，
 且不覆盖 YAML 原值；只更改具体的 Controller 配置，不提供通用字段覆盖。
 地址沿用 YAML 的 IP／localhost／空 host 与数字端口规则，不查询域名；密钥不会输出到日志或错误。
 `-t` 与 Mihomo 一致，只校验输入配置，不应用或解析这些运行期覆盖；`-h/-v` 不读取其环境值。

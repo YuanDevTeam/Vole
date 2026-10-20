@@ -9,12 +9,14 @@ use zeroize::{Zeroize, Zeroizing};
 pub(in crate::invoke) struct ControllerOverrides {
     http: Option<SocketAddr>,
     tls: Option<SocketAddr>,
+    unix: Option<String>,
     secret: Option<Zeroizing<String>>,
 }
 impl ControllerOverrides {
     pub(in crate::invoke) fn read(
         http: Option<Zeroizing<String>>,
         tls: Option<Zeroizing<String>>,
+        unix: Option<Zeroizing<String>>,
         secret: Option<Zeroizing<String>>,
     ) -> Result<Self, InvokeFailure> {
         let limit = crate::config::MAX_CONFIG_BYTES;
@@ -22,7 +24,12 @@ impl ControllerOverrides {
             input::option_text(http, "VOLE_OVERRIDE_EXTERNAL_CONTROLLER", limit)?,
             input::option_text(tls, "VOLE_OVERRIDE_EXTERNAL_CONTROLLER_TLS", limit)?,
             input::option_text(secret, "VOLE_OVERRIDE_SECRET", limit)?,
-        )
+        )?
+        .with_unix(input::option_text(
+            unix,
+            "VOLE_OVERRIDE_EXTERNAL_CONTROLLER_UNIX",
+            limit,
+        )?)
     }
     fn from_values(
         http: Option<Zeroizing<String>>,
@@ -40,8 +47,16 @@ impl ControllerOverrides {
         Ok(Self {
             http: listener(http)?,
             tls: listener(tls)?,
+            unix: None,
             secret: secret.filter(|value| !value.is_empty()),
         })
+    }
+    fn with_unix(mut self, value: Option<Zeroizing<String>>) -> Result<Self, InvokeFailure> {
+        self.unix = crate::config::normalize_controller_unix(
+            value.map(|mut value| std::mem::take(&mut *value)),
+        )
+        .map_err(|_| failure("invalid foreground Controller Unix path"))?;
+        Ok(self)
     }
     pub(in crate::invoke) fn apply_template(
         &self,
@@ -50,6 +65,7 @@ impl ControllerOverrides {
         template.override_controller(
             self.http,
             self.tls,
+            self.unix.as_deref(),
             self.secret.as_ref().map(|value| value.as_str()),
         );
     }
@@ -57,7 +73,9 @@ impl ControllerOverrides {
         if let Some(template) = &mut config.providers {
             self.apply_template(Arc::make_mut(template));
         }
-        if (self.http.is_some() || self.tls.is_some()) && config.external_controller.is_none() {
+        if (self.http.is_some() || self.tls.is_some() || self.unix.is_some())
+            && config.external_controller.is_none()
+        {
             config.external_controller = Some(ExternalControllerConfig {
                 http_enabled: false,
                 secret: config
@@ -84,6 +102,9 @@ impl ControllerOverrides {
                 controller.listen = tls;
             }
             controller.tls_listen = Some(tls);
+        }
+        if let Some(unix) = &self.unix {
+            controller.unix_path = Some(unix.clone());
         }
         if let Some(secret) = &self.secret {
             if let Some(mut old) = controller.secret.take() {
@@ -149,6 +170,40 @@ rules: ['MATCH,DIRECT']
         assert_eq!(materialized.external_controller, config.external_controller);
     }
 
+    #[test]
+    fn unix_override_survives_materialization_without_creating_a_network_listener() {
+        let mut config =
+            Config::parse_yaml(b"secret: yaml-token\nrules: ['MATCH,DIRECT']\n").unwrap();
+        ControllerOverrides::default()
+            .with_unix(text("local.sock"))
+            .unwrap()
+            .apply(&mut config);
+        let controller = config.external_controller.as_ref().unwrap();
+        assert_eq!(controller.unix_path.as_deref(), Some("local.sock"));
+        assert!(!controller.http_enabled);
+        assert!(controller.tls_listen.is_none());
+        let expected = controller.clone();
+        let fresh = config
+            .providers
+            .as_ref()
+            .unwrap()
+            .materialize(&Default::default())
+            .unwrap();
+        assert_eq!(fresh.external_controller, Some(expected));
+        ControllerOverrides::default()
+            .with_unix(text(""))
+            .unwrap()
+            .apply(&mut config);
+        assert_eq!(
+            config.external_controller.unwrap().unix_path.as_deref(),
+            Some("local.sock")
+        );
+        assert!(
+            ControllerOverrides::default()
+                .with_unix(text("bad\0path"))
+                .is_err()
+        );
+    }
     #[test]
     fn concrete_overrides_preserve_yaml_and_only_replace_nonempty_values() {
         let mut config = Config::parse_yaml(b"external-controller: localhost:9000\nexternal-controller-tls: ':9443'\nsecret: yaml-token\n").unwrap();

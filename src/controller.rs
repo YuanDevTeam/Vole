@@ -7,6 +7,8 @@ mod dns;
 mod rules;
 mod tls;
 mod transport;
+#[cfg(target_os = "linux")]
+mod unix;
 mod websocket;
 use transport::{ControllerIo, H1Io};
 
@@ -45,7 +47,26 @@ struct RequestContext {
     logs: Option<Arc<crate::logging::RuntimeLog>>,
 }
 
+#[cfg(any(target_os = "linux", test))]
+impl RequestContext {
+    fn for_local_transport(&self) -> Self {
+        Self {
+            secret: None,
+            ..self.clone()
+        }
+    }
+}
+
+enum AcceptedController {
+    Http(tokio::net::TcpStream),
+    Tls(tokio::net::TcpStream),
+    #[cfg(target_os = "linux")]
+    Unix(tokio::net::UnixStream),
+}
+
 pub(crate) struct RuntimeController {
+    #[cfg(target_os = "linux")]
+    unix_listener: Option<unix::Listener>,
     listener: Option<TcpListener>,
     tls_listener: Option<TcpListener>,
     tls: Option<Arc<tls::ServerTls>>,
@@ -78,6 +99,19 @@ impl RuntimeController {
         proxy_groups: Arc<ProxyGroups>,
         root: &std::path::Path,
     ) -> io::Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        if config.unix_path.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "external-controller-unix requires Linux",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let unix_listener = config
+            .unix_path
+            .as_deref()
+            .map(|path| unix::Listener::bind(path, root))
+            .transpose()?;
         let listener = config
             .http_enabled
             .then(|| bind_controller(config))
@@ -98,6 +132,8 @@ impl RuntimeController {
             (None, None)
         };
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            unix_listener,
             listener,
             tls_listener,
             tls,
@@ -131,6 +167,28 @@ impl RuntimeController {
             .local_addr()
     }
 
+    async fn accept(&self) -> io::Result<AcceptedController> {
+        let network = async {
+            tokio::select! {
+                accepted = async { self.listener.as_ref().unwrap().accept().await }, if self.listener.is_some() => {
+                    accepted.map(|(stream, _)| AcceptedController::Http(stream))
+                }
+                accepted = async { self.tls_listener.as_ref().unwrap().accept().await }, if self.tls_listener.is_some() => {
+                    accepted.map(|(stream, _)| AcceptedController::Tls(stream))
+                }
+                else => std::future::pending().await,
+            }
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(listener) = &self.unix_listener {
+            return tokio::select! {
+                result = network => result,
+                result = listener.accept() => result.map(AcceptedController::Unix),
+            };
+        }
+        network.await
+    }
+
     pub(crate) async fn serve(self, cancellation: CancellationToken) -> io::Result<()> {
         let watcher = self
             .tls
@@ -148,16 +206,17 @@ impl RuntimeController {
                 joined = tasks.join_next(), if !tasks.is_empty() => {
                     if let Some(Err(error)) = joined { break Err(io::Error::other(error)); }
                 }
-                accepted = async { self.listener.as_ref().unwrap().accept().await }, if self.listener.is_some() && tasks.len() < MAX_CONTROLLER_CONNECTIONS => {
-                    let (stream, _) = match accepted { Ok(value) => value, Err(error) => break Err(error) };
+                accepted = self.accept(), if tasks.len() < MAX_CONTROLLER_CONNECTIONS => {
+                    let accepted = match accepted { Ok(value) => value, Err(error) => break Err(error) };
                     let context = self.context.clone(); let child = cancellation.clone();
-                    tasks.spawn(crate::resources::observation::task(async move { let _ = handle_connection(H1Io(stream), context, child).await; }));
-                }
-                accepted = async { self.tls_listener.as_ref().unwrap().accept().await }, if self.tls_listener.is_some() && tasks.len() < MAX_CONTROLLER_CONNECTIONS => {
-                    let (stream, _) = match accepted { Ok(value) => value, Err(error) => break Err(error) };
-                    let tls = self.tls.as_ref().unwrap().clone(); let context = self.context.clone(); let child = cancellation.clone();
+                    let tls = self.tls.clone();
                     tasks.spawn(crate::resources::observation::task(async move {
-                        let _ = transport::serve_tls(stream, tls, context, child).await;
+                        match accepted {
+                            AcceptedController::Http(stream) => { let _ = handle_connection(H1Io(stream), context, child).await; }
+                            AcceptedController::Tls(stream) => { let _ = transport::serve_tls(stream, tls.expect("TLS listener owns TLS config"), context, child).await; }
+                            #[cfg(target_os = "linux")]
+                            AcceptedController::Unix(stream) => { let _ = handle_connection(H1Io(stream), context.for_local_transport(), child).await; }
+                        }
                     }));
                 }
             }
@@ -1171,6 +1230,54 @@ mod tests {
         result.unwrap();
         assert!(response.is_empty());
         assert_eq!(groups.state("主线路").unwrap().now, "node-a");
+    }
+
+    #[tokio::test]
+    async fn local_context_shares_limits_and_bypasses_only_local_rest_and_websocket_auth() {
+        let network = RequestContext {
+            secret: Some(Arc::from("network-token")),
+            traffic: None,
+            proxy_groups: test_groups(),
+            resources: None,
+            cors: Arc::new(cors::Policy::new(&Default::default())),
+            requests: tokio_util::task::TaskTracker::new(),
+            subscriptions: Arc::new(tokio::sync::Semaphore::new(websocket::MAX_SUBSCRIPTIONS)),
+            logs: None,
+        };
+        let local = network.for_local_transport();
+        assert!(network.secret.is_some());
+        assert!(local.secret.is_none());
+        assert!(Arc::ptr_eq(&network.proxy_groups, &local.proxy_groups));
+        assert!(Arc::ptr_eq(&network.subscriptions, &local.subscriptions));
+        let websocket = "GET /memory?token=wrong HTTP/1.1\r\nHost: controller\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        for (context, request, status) in [
+            (network.clone(), "GET /version HTTP/1.1\r\n\r\n", 401),
+            (local.clone(), "GET /version HTTP/1.1\r\n\r\n", 200),
+            (network.clone(), websocket, 401),
+            (local.clone(), websocket, 101),
+        ] {
+            let (mut client, stream) = tokio::io::duplex(4096);
+            let cancel = CancellationToken::new();
+            let child = cancel.clone();
+            let task = tokio::spawn(handle_connection(H1Io(stream), context, child));
+            client.write_all(request.as_bytes()).await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 2048);
+                head.push(client.read_u8().await.unwrap());
+            }
+            assert!(
+                head.starts_with(format!("HTTP/1.1 {status}").as_bytes()),
+                "unexpected response status: {}",
+                String::from_utf8_lossy(&head).lines().next().unwrap_or("")
+            );
+            cancel.cancel();
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            network.subscriptions.available_permits(),
+            websocket::MAX_SUBSCRIPTIONS
+        );
     }
 
     #[test]

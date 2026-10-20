@@ -30,6 +30,13 @@ Linux 目标的报文编码：`platform::linux_network::netlink::tests::`。
 被动 TCP 的 PMTU 与兄弟流：netstack 集成过滤器
 `passive_tun_pmtu_resegments_only_live_sent_tcp_and_preserves_siblings`。
 
+Linux Unix Controller 的配置与共享鉴权（不绑定 socket）：
+`config::controller::tests::controller_unix_`、
+`controller::tests::local_context_shares_limits_and_bypasses_only_local_rest_and_websocket_auth`、
+`invoke::foreground::overrides::tests::unix_override_`、
+二进制 `cli::tests::unix_controller_flag_only_transports_the_explicit_text_value`。
+实际文件权限、绑定冲突、对象替换、drop/Stop 清理在隔离 Linux 真实 TUN 夹具验收。
+
 Controller 推送（纯内存 duplex，无网络监听）：`controller::websocket::tests::`；
 安全传输/CORS：`controller::secure_tests::`；DNS 展示：`controller::dns::tests::`；
 实例日志脱敏/动态过滤：`logging::tests::`。

@@ -227,6 +227,7 @@ impl ProviderTemplate {
         &mut self,
         http: Option<std::net::SocketAddr>,
         tls: Option<std::net::SocketAddr>,
+        unix: Option<&str>,
         secret: Option<&str>,
     ) {
         use zeroize::Zeroize as _;
@@ -237,6 +238,7 @@ impl ProviderTemplate {
                 "external-controller-tls",
                 tls.map(|value| value.to_string()),
             ),
+            ("external-controller-unix", unix.map(str::to_owned)),
             ("secret", secret.map(str::to_owned)),
         ] {
             if let Some(value) = value {

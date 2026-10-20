@@ -342,12 +342,12 @@ Windows Session Snapshot 不由此重建；Windows UWP 的活动 Provider 配置
 输入以标准 AGE armor 开头时复用资源层的认证解密，身份最多 16 KiB，解密后 YAML 最多 8 MiB；
 解密受 30 秒处理期限约束，运行模式的退出信号取消并 join 解码工作器后返回。
 临时身份与私密请求缓冲清零，编码／密文在后续阶段及时释放。配置仍只解析一次后交给共享启动路径。
-运行模式可选 `externalController`、`externalControllerTls` 和 `secret` 三项具体覆盖，
+运行模式可选 `externalController`、`externalControllerTls`、`externalControllerUnix` 和 `secret` 具体覆盖，
 分别对应 `VOLE_OVERRIDE_EXTERNAL_CONTROLLER`、`VOLE_OVERRIDE_EXTERNAL_CONTROLLER_TLS`、
-`VOLE_OVERRIDE_SECRET` 的环境默认。显式参数优先，空串仅清除环境默认，不清空原 YAML 字段。
+`VOLE_OVERRIDE_EXTERNAL_CONTROLLER_UNIX`、`VOLE_OVERRIDE_SECRET` 的环境默认。显式参数优先，空串仅清除环境默认，不清空原 YAML 字段。
 地址复用主配置的既有严格解析器，覆盖在 foreground 解析／校验后应用到同一启动配置；没有任意 map 合并。
 `validate` 保持 Mihomo 的配置测试语义，不读取这些环境值或解析／应用覆盖。`help` 也不读取。
-覆盖元数据不进入普通 `start` payload 或 Mihomo YAML schema；Controller 的 TLS 身份仍由主配置提供。
+覆盖元数据不进入普通 `start` payload 或 Mihomo YAML schema；Controller 的 TLS 身份仍由主配置提供。新激活的入口保留主配置中的 secret/CORS；Unix 本地入口另依文件权限授权，不改变网络鉴权。
 前台运行可通过 `VOLE_SAFE_PATHS` 的系统原生路径列表扩展 provider 授权根；仅用于主配置 file provider 读取、
 HTTP provider 缓存正文及 sidecar 写入。目录在初始化时 canonicalize 并冻结，沿普通候选、HUP 和恢复快照继承；
 重复初始化不得改变已明确设置的授权上下文。空项不授权工作目录，读取不创建目录，路径 traversal 与符号链接逃逸拒绝。

@@ -31,13 +31,14 @@ use tracing::{
 use zeroize::Zeroizing;
 
 const HELP: &str = "Vole standalone proxy core\n\
-Usage: vole [-d <data-dir>] [-f <config-file>] [-config <base64>] [-age-secret-key <key>] [-ext-ctl <address>] [-ext-ctl-tls <address>] [-secret <token>] [-http-config <file>] [-http-ca <file>] [-t] [-v] [-h]\n\
+Usage: vole [-d <data-dir>] [-f <config-file>] [-config <base64>] [-age-secret-key <key>] [-ext-ctl <address>] [-ext-ctl-tls <address>] [-ext-ctl-unix <path>] [-secret <token>] [-http-config <file>] [-http-ca <file>] [-t] [-v] [-h]\n\
   -d <data-dir>     Data directory (default: home/.config/vole)\n\
   -f <config-file>  Configuration file; - reads stdin (default: <data-dir>/config.yaml)\n\
   -config <base64>  Base64-encoded configuration; nonempty text takes priority\n\
   -age-secret-key <key>  AGE identity for an encrypted configuration\n\
   -ext-ctl <address>  Override the HTTP Controller address when nonempty\n\
   -ext-ctl-tls <address>  Override the TLS Controller address when nonempty\n\
+  -ext-ctl-unix <path>  Override the Linux Unix Controller path when nonempty\n\
   -secret <token>   Override Controller authentication when nonempty\n\
   -http-config <file>  Explicit HTTP processing addendum (optional)\n\
   -http-ca <file>   Private CA JSON file for selected HTTPS processing\n\
@@ -125,6 +126,8 @@ pub(super) struct ForegroundPayload {
     external_controller: Option<Zeroizing<String>>,
     #[serde(default, deserialize_with = "input::private_text")]
     external_controller_tls: Option<Zeroizing<String>>,
+    #[serde(default, deserialize_with = "input::private_text")]
+    external_controller_unix: Option<Zeroizing<String>>,
     #[serde(default, deserialize_with = "input::private_text")]
     secret: Option<Zeroizing<String>>,
     #[serde(default)]
@@ -241,6 +244,7 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
     let overrides = ControllerOverrides::read(
         payload.external_controller,
         payload.external_controller_tls,
+        payload.external_controller_unix,
         payload.secret,
     )?;
     let mut provider_paths = crate::resource::paths::ProviderPaths::from_os_value(
@@ -1026,6 +1030,7 @@ mod tests {
             age_secret_key: None,
             external_controller: None,
             external_controller_tls: None,
+            external_controller_unix: None,
             secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
@@ -1067,6 +1072,7 @@ mod tests {
             age_secret_key: None,
             external_controller: None,
             external_controller_tls: None,
+            external_controller_unix: None,
             secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
@@ -1090,6 +1096,7 @@ mod tests {
             age_secret_key: None,
             external_controller: None,
             external_controller_tls: None,
+            external_controller_unix: None,
             secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
@@ -1123,6 +1130,7 @@ mod tests {
             age_secret_key: None,
             external_controller: None,
             external_controller_tls: None,
+            external_controller_unix: None,
             secret: None,
             data_dir: invalid_path(),
             config_path: invalid_path(),
@@ -1141,6 +1149,7 @@ mod tests {
             age_secret_key: None,
             external_controller: None,
             external_controller_tls: None,
+            external_controller_unix: None,
             secret: None,
             data_dir: Some(InvokePath::Text("\0".to_owned())),
             config_path: Some(InvokePath::Text("-".to_owned())),
@@ -1158,6 +1167,7 @@ mod tests {
             age_secret_key: None,
             external_controller: None,
             external_controller_tls: None,
+            external_controller_unix: None,
             secret: None,
             data_dir: None,
             config_path: Some(InvokePath::Text("-".to_owned())),
@@ -1176,6 +1186,7 @@ mod tests {
             age_secret_key: None,
             external_controller: None,
             external_controller_tls: None,
+            external_controller_unix: None,
             secret: None,
             data_dir: Some(InvokePath::Text("\0".to_owned())),
             config_path: Some(InvokePath::Text("\0".to_owned())),
@@ -1377,6 +1388,7 @@ mod tests {
             age_secret_key: None,
             external_controller: None,
             external_controller_tls: None,
+            external_controller_unix: None,
             secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(main.clone().into()),
@@ -1393,6 +1405,7 @@ mod tests {
             age_secret_key: None,
             external_controller: None,
             external_controller_tls: None,
+            external_controller_unix: None,
             secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(main.clone().into()),

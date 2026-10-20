@@ -7,19 +7,25 @@ Controller 是当前 Running Session 的 HTTP 接口。它提供业务连接管�
 ```yaml
 external-controller: 127.0.0.1:9090
 external-controller-tls: 127.0.0.1:9443 # 可单独启用或与 HTTP 同时启用
+external-controller-unix: controller.sock # Linux，可独立启用
 external-controller-cors:
   allow-origins: ["https://ui.example"]
   allow-private-network: false
 secret: "vole-runtime-secret"
 ```
 
-- 两个 Controller 地址均省略或空串时不启动 Controller，也不采集业务连接、规则命中和建链诊断；配置中的 `secret` 可保留。代理组选择、健康检查、资源更新与 TUN 原始流量统计独立运行。
+- 三个 Controller 地址均省略或空串时不启动 Controller，也不采集业务连接、规则命中和建链诊断；配置中的 `secret` 可保留。代理组选择、健康检查、资源更新与 TUN 原始流量统计独立运行。
 - `external-controller` 接受 IP、`localhost` 或空 host 与数值端口组成的地址，如 `127.0.0.1:9090`、`0.0.0.0:9090`、`[::]:9090`、`localhost:9090`、`:9090`。端口范围为 0–65535，0 由系统选择端口；`localhost` 使用 IPv4 回环。其他域名和命名服务端口不在当前范围内。静态节点、纯 DIRECT 及关闭业务入口的配置均可使用。
 - 空 host、`0.0.0.0` 和 `[::]` 均优先使用允许 IPv4 映射连接的双栈通配监听，仅地址族不可用时改用 IPv4。Controller 的地址族选择独立于顶层 `ipv6`。
 - `external-controller-tls` 使用相同地址格式、绑定与端口范围。HTTP/HTTPS 共享当前会话、API handler、选择状态和 Bearer 认证；HTTPS 按实际 ALPN 提供 H2/H1，无 ALPN 使用 H1；明文 HTTP 仅 H1。
+- `external-controller-unix` 是 Linux 文件系统路径，空串关闭；相对路径从 dataDir 解析，不自动创建父目录。
+  绑定后在 listen 前设置当前用户 0600 权限；已有文件、目录、符号链接或 socket 都使绑定失败，不接管旧对象。
+  本地 HTTP/1 与 WebSocket 共用现有 API、CORS、资源和订阅限额，通过文件权限授权，不要求 Bearer 或 token。
+  网络 HTTP/HTTPS 保留原 secret；本地访问不会修改它。Stop 和启动失败只清理本次创建且 dev+ino 仍一致的 socket，
+  也覆盖绑定后尚未 serve 就丢弃的情况；其它平台启动该入口返回不支持。
 - `secret` 始终可选，省略或空串表示不要求认证；配置非空值时保护本文定义的业务路由，CORS 预检在认证之前处理。配置仅受整体 YAML 大小预算约束，HTTP 请求头仍限 32 KiB。
 - `measureDelay` 的 node-only 配置不能包含 Controller 或代理组字段。
-- `validateConfig` 只校验 Controller 字段；`start` 加载服务端证书并绑定端口，任一失败则启动失败。`stop` 和 `destroyInstance` 关闭两种监听器并等待请求与证书 watcher 回收。
+- `validateConfig` 只校验 Controller 字段；`start` 加载服务端证书并绑定端口，任一失败则启动失败。`stop` 和 `destroyInstance` 关闭全部监听器并等待请求与证书 watcher 回收。
 
 Controller 与公共运行时 session 同生共灭。`profile.store-selected` 默认 true，Core 将显式选择保存到 dataDir/selected.json，在下次启动时恢复有效成员；不写回 YAML。关闭该选项后只保留会话内选择。写入失败不回滚已生效的选择，`GET /proxies` 的 `selectionError` 给出脱敏原因。
 
@@ -57,7 +63,7 @@ OPTIONS 携带 Origin 和非空 `Access-Control-Request-Method` 时为预检，�
 
 ## 请求预算与停止
 
-HTTP/HTTPS 合计最多 8 条活动连接。普通 H1 每连接处理一个请求后关闭，WebSocket 升级后保持当前订阅；H2 每连接最多 8 条并发请求，超出准入复位 stream，接收窗口每流 1 KiB、连接 8 KiB，发送缓冲每流 16 KiB。头部上限 32 KiB/100 字段，H2 target 上限 8 KiB，组选择与 PATCH body 上限 1 KiB，内联配置 PUT body 上限 8 MiB；握手、H1 读头、body 与写响应各有 5 秒期限。停止取消活动请求与订阅、关闭协议 driver，并等待所有 H2 请求和文件候选读取完成。
+HTTP/HTTPS/Unix 合计最多 8 条活动连接。普通 H1 每连接处理一个请求后关闭，WebSocket 升级后保持当前订阅；H2 每连接最多 8 条并发请求，超出准入复位 stream，接收窗口每流 1 KiB、连接 8 KiB，发送缓冲每流 16 KiB。头部上限 32 KiB/100 字段，H2 target 上限 8 KiB，组选择与 PATCH body 上限 1 KiB，内联配置 PUT body 上限 8 MiB；握手、H1 读头、body 与写响应各有 5 秒期限。停止取消活动请求与订阅、关闭协议 driver，并等待所有 H2 请求和文件候选读取完成。
 
 ## Bearer 鉴权
 
