@@ -458,7 +458,7 @@ async fn both_udp_modes_preserve_empty_and_u16_packets_and_dissociate() {
                         &EstablishContext::default(),
                     )
                     .await?;
-                assert_eq!(udp.supports_shared_destinations(), mode == "native");
+                assert!(udp.supports_shared_destinations());
                 assert!(
                     udp.send(Datagram {
                         remote: Destination::domain("x", 80).unwrap(),

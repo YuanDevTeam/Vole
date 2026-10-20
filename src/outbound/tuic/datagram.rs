@@ -234,9 +234,10 @@ impl Drop for Transport {
 #[async_trait]
 impl DatagramTransport for Transport {
     fn supports_shared_destinations(&self) -> bool {
-        // Native packets retain their own address and consume an ID before
-        // awaiting capacity. The router owns target and cancellation identity.
-        matches!(self.registry.mode, TuicUdpMode::Native)
+        // Both modes carry a per-packet address and consume an ID before
+        // awaiting capacity. Cancelling a partial QUIC send resets that stream;
+        // the router owns target and cancellation identity.
+        true
     }
 
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
