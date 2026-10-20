@@ -711,6 +711,53 @@ impl Dialer {
         addresses
     }
 
+    /// Connected TCP and explicitly opted-in UDP node endpoints use physical
+    /// IP4P addresses before family/source/interface selection. Generic UDP
+    /// ordering and bind_udp_for deliberately retain their original addresses.
+    pub(crate) fn ordered_connected_addresses(&self, addresses: &[SocketAddr]) -> Vec<SocketAddr> {
+        let mut addresses = addresses
+            .iter()
+            .filter_map(|address| self.connected_address(*address).ok())
+            .collect();
+        self.ip_version.order(&mut addresses);
+        addresses
+    }
+    pub(crate) fn ip4p_loopback_restricted(&self) -> bool {
+        #[cfg(all(windows, feature = "windows-uwp"))]
+        {
+            self.interface_binding.is_some()
+        }
+        #[cfg(not(all(windows, feature = "windows-uwp")))]
+        {
+            false
+        }
+    }
+    pub(crate) fn connected_address(&self, original: SocketAddr) -> io::Result<SocketAddr> {
+        let actual = self.connections.convert_ip4p_endpoint(original);
+        preserve_ip4p_loopback(original, actual, !self.ip4p_loopback_restricted())?;
+        self.require_permitted(actual)?;
+        Ok(actual)
+    }
+
+    pub(crate) fn validate_connected_endpoint(
+        &self,
+        endpoint: &ResolvedEndpoint,
+    ) -> io::Result<()> {
+        if !self.connections.dialer_ip4p_convert {
+            return Ok(());
+        }
+        let allow_loopback =
+            endpoint.logical_host.parse::<IpAddr>().is_ok() && !self.ip4p_loopback_restricted();
+        for original in &endpoint.addresses {
+            preserve_ip4p_loopback(
+                *original,
+                self.connections.convert_ip4p_endpoint(*original),
+                allow_loopback,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Start a new owner for a Running Session or private measurement. Policy
     /// is retained, but stopping one graph must not close another session.
     pub(crate) fn with_fresh_initialization(mut self) -> Self {
@@ -817,7 +864,11 @@ impl Dialer {
     }
 
     pub async fn connect(&self, endpoint: &ResolvedEndpoint) -> io::Result<PhysicalStream> {
-        let addresses = self.ordered_addresses(&endpoint.addresses);
+        // DNS resolution may precede physical conversion; keep the resolver's
+        // hostname -> loopback denial after decoding too. Literal loopback
+        // nodes retain their existing exemption.
+        self.validate_connected_endpoint(endpoint)?;
+        let addresses = self.ordered_connected_addresses(&endpoint.addresses);
         if self.connections.tcp_concurrent && !addresses.is_empty() {
             let preferred = match self.ip_version {
                 crate::config::IpVersion::Ipv4Prefer => Some(false),
@@ -1006,7 +1057,7 @@ impl Dialer {
     }
 
     async fn connect_one(&self, address: SocketAddr) -> io::Result<PhysicalStream> {
-        self.require_permitted(address)?;
+        let address = self.connected_address(address)?;
         self.validate_egress()?;
         let ipv6 = address.is_ipv6();
         let source_address = self.source_address_for(address)?;
@@ -1070,6 +1121,23 @@ impl Dialer {
                 "address family is disabled",
             ));
         }
+        Ok(())
+    }
+}
+
+/// Conversion cannot grant a loopback exemption forbidden by the original
+/// logical/source policy. This runs before any physical socket acquisition.
+pub(crate) fn preserve_ip4p_loopback(
+    original: SocketAddr,
+    actual: SocketAddr,
+    allow: bool,
+) -> io::Result<()> {
+    if !allow && actual.ip().is_loopback() && !original.ip().is_loopback() {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "IP4P endpoint violates loopback policy",
+        ))
+    } else {
         Ok(())
     }
 }
@@ -1844,5 +1912,40 @@ mod tests {
                 assert!(protector_lease.upgrade().is_none());
             }
         });
+    }
+    #[test]
+    fn connected_ip4p_conversion_precedes_family_and_source_binding_only_at_opted_in_seams() {
+        let encoded: SocketAddr = "[2001:0::1bb:c000:201]:8443".parse().unwrap();
+        let physical: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let dialer = Dialer::default()
+            .with_ipv6(false)
+            .with_ip_version(crate::config::IpVersion::Ipv4)
+            .with_connections(crate::config::ConnectionSettings {
+                dialer_ip4p_convert: true,
+                ..Default::default()
+            })
+            .with_source_ip("192.0.2.2".parse().unwrap());
+        assert_eq!(dialer.ordered_connected_addresses(&[encoded]), [physical]);
+        assert_eq!(
+            dialer.source_address_for(physical).unwrap(),
+            Some("192.0.2.2:0".parse().unwrap())
+        );
+        assert!(dialer.require_permitted(physical).is_ok());
+        assert!(dialer.ordered_addresses(&[encoded]).is_empty());
+        assert!(dialer.require_permitted(encoded).is_err());
+        assert!(dialer.source_address_for(encoded).is_err());
+        assert_eq!(
+            Dialer::default().ordered_connected_addresses(&[encoded]),
+            [encoded]
+        );
+    }
+    #[test]
+    fn ip4p_loopback_mapping_cannot_acquire_a_new_literal_exemption() {
+        let original: SocketAddr = "[2001:0::1bb:7f00:1]:8443".parse().unwrap();
+        let actual: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        assert!(preserve_ip4p_loopback(original, actual, false).is_err());
+        assert!(preserve_ip4p_loopback(original, actual, true).is_ok());
+        assert!(preserve_ip4p_loopback(actual, actual, false).is_ok());
+        assert!(preserve_ip4p_loopback(original, "192.0.2.1:443".parse().unwrap(), false).is_ok());
     }
 }

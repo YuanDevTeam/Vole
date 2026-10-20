@@ -32,6 +32,8 @@ struct State {
 #[derive(Clone, Default)]
 pub struct ResolutionContext {
     ip_version: crate::config::IpVersion,
+    ip4p_convert: bool,
+    ip4p_reject_loopback: bool,
     inner: Option<Arc<State>>,
 }
 
@@ -70,9 +72,37 @@ impl ResolutionContext {
         self
     }
 
+    /// Scoped only to a physical endpoint lookup. Ordinary business/IP-only
+    /// resolution, DNS answers and proxy-chain destinations do not opt in.
+    pub(crate) fn with_physical_dialer(mut self, dialer: &crate::dialer::Dialer) -> Self {
+        self.ip4p_convert = dialer.connections().dialer_ip4p_convert;
+        self.ip4p_reject_loopback = dialer.ip4p_loopback_restricted();
+        self
+    }
+    fn physical_address(
+        &self,
+        original: SocketAddr,
+        literal: bool,
+    ) -> Result<SocketAddr, DispatchError> {
+        let actual = crate::config::ConnectionSettings {
+            dialer_ip4p_convert: self.ip4p_convert,
+            ..Default::default()
+        }
+        .convert_ip4p_endpoint(original);
+        crate::dialer::preserve_ip4p_loopback(
+            original,
+            actual,
+            literal && !self.ip4p_reject_loopback,
+        )
+        .map_err(|_| DispatchError::NotAllowed)?;
+        Ok(actual)
+    }
+
     pub fn runtime(ipv6: bool) -> Self {
         Self {
             ip_version: crate::config::IpVersion::Dual,
+            ip4p_convert: false,
+            ip4p_reject_loopback: false,
             inner: Some(Arc::new(State {
                 source: OnceLock::new(),
                 measurement_ech: OnceLock::new(),
@@ -315,13 +345,14 @@ impl ResolutionContext {
                 return Err(DispatchError::NotAllowed);
             }
             if let Destination::Ip(address) = target {
+                let address = self.physical_address(*address, true)?;
                 if !self.ip_version.permits(address.ip())
                     || address.port() == 0
                     || (address.is_ipv6() && self.inner.as_ref().is_some_and(|inner| !inner.ipv6))
                 {
                     return Err(DispatchError::HostUnreachable);
                 }
-                return Ok(vec![*address]);
+                return Ok(vec![address]);
             }
             let Destination::Domain { host, port } = target else {
                 unreachable!()
@@ -403,8 +434,10 @@ impl ResolutionContext {
                 };
                 let mut addresses: Vec<_> = addresses
                     .into_iter()
-                    .filter(|address| inner.is_none_or(|inner| inner.ipv6) || address.is_ipv4())
-                    .collect();
+                    .map(|address| self.physical_address(address, false))
+                    .collect::<Result<_, _>>()?;
+                addresses
+                    .retain(|address| inner.is_none_or(|inner| inner.ipv6) || address.is_ipv4());
                 self.ip_version.order(&mut addresses);
                 if addresses.is_empty() {
                     Err(DispatchError::HostUnreachable)
@@ -432,4 +465,93 @@ fn runtime_error(error: super::runtime::RuntimeDnsError) -> DispatchError {
 
 fn unavailable() -> DispatchError {
     DispatchError::Other("runtime DNS is unavailable".into())
+}
+
+#[cfg(test)]
+mod ip4p_tests {
+    use super::*;
+    struct Encoded;
+    #[async_trait::async_trait]
+    impl Resolver for Encoded {
+        async fn resolve(
+            &self,
+            host: &str,
+            port: u16,
+        ) -> io::Result<crate::dialer::ResolvedEndpoint> {
+            Ok(crate::dialer::ResolvedEndpoint {
+                logical_host: host.into(),
+                port,
+                addresses: vec![SocketAddr::new(
+                    "2001:0::1bb:c000:201".parse().unwrap(),
+                    port,
+                )],
+            })
+        }
+    }
+    #[tokio::test]
+    async fn scoped_ip4p_keeps_logical_identity_cancellation_and_ordinary_resolution() {
+        let dialer =
+            crate::dialer::Dialer::default().with_connections(crate::config::ConnectionSettings {
+                dialer_ip4p_convert: true,
+                ..Default::default()
+            });
+        let target = Destination::domain("encoded.example", 8443).unwrap();
+        let base = ResolutionContext::measurement(Arc::new(Encoded), true);
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let normal = base.resolve_proxy(&target, deadline).await.unwrap();
+        assert_eq!(
+            normal.addresses[0],
+            "[2001:0::1bb:c000:201]:8443".parse::<SocketAddr>().unwrap()
+        );
+        let physical = base
+            .clone()
+            .with_ip_version(crate::config::IpVersion::Ipv4)
+            .with_physical_dialer(&dialer)
+            .resolve_proxy(&target, deadline)
+            .await
+            .unwrap();
+        assert_eq!(physical.logical_host, "encoded.example");
+        assert_eq!(physical.port, 8443);
+        assert_eq!(
+            physical.addresses,
+            ["192.0.2.1:443".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            base.resolve_ip(&target, deadline).await.unwrap(),
+            normal.addresses[0]
+        );
+        let limited = ResolutionContext::measurement(Arc::new(Encoded), false)
+            .with_ip_version(crate::config::IpVersion::Ipv4)
+            .with_physical_dialer(&dialer);
+        assert_eq!(
+            limited
+                .resolve_proxy(&target, deadline)
+                .await
+                .unwrap()
+                .addresses,
+            physical.addresses
+        );
+        base.close();
+        assert!(
+            base.with_physical_dialer(&dialer)
+                .resolve_proxy(&target, deadline)
+                .await
+                .is_err()
+        );
+    }
+    #[test]
+    fn physical_ip4p_loopback_checks_keep_original_literal_and_source_boundaries() {
+        let mut context = ResolutionContext::default();
+        context.ip4p_convert = true;
+        let encoded: SocketAddr = "[2001:0::1bb:7f00:1]:8443".parse().unwrap();
+        assert!(context.physical_address(encoded, false).is_err());
+        assert_eq!(
+            context.physical_address(encoded, true).unwrap(),
+            "127.0.0.1:443".parse().unwrap()
+        );
+        context.ip4p_reject_loopback = true; // Same pure predicate as a UWP physical binding.
+        assert!(context.physical_address(encoded, true).is_err());
+        let explicit: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        assert_eq!(context.physical_address(explicit, true).unwrap(), explicit);
+    }
 }

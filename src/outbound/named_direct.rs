@@ -38,6 +38,7 @@ impl OutboundConnector for NamedDirectOutbound {
     ) -> Result<ConnectedStream, DispatchError> {
         let endpoint = context
             .resolution()
+            .with_physical_dialer(&self.dialer)
             .resolve_direct(&session.destination, context.deadline())
             .await?;
         let stream = context

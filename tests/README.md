@@ -228,3 +228,9 @@ HTTP/1 早响应与空正文 Upgrade 的定向内存回归：`inbound::http::ser
 对应验收分别由容器夹具、平台构建和设备测试完成。
 
 IP4P 纯解码与严格配置回归：`config::ip4p::tests::`；不创建 socket 或解析网络名称。
+
+IP4P 接点纯内存回归：`dns::resolution::ip4p_tests::`、
+`dialer::tests::connected_ip4p_conversion_precedes_family_and_source_binding_only_at_opted_in_seams`、
+`dialer::tests::ip4p_loopback_mapping_cannot_acquire_a_new_literal_exemption`、
+`outbound::connector::tests::ip4p_udp_node_endpoint_retains_chain_identity_and_uses_actual_reply_peer`。
+这些测试不建立网络 socket；真实 TUN 的 TCP/SS2022/SOCKS5/WireGuard 及 UWP 平台路径单独验收。

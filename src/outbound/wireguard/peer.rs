@@ -52,7 +52,7 @@ impl Driver {
         let server = server_destination(&self.peer().address, self.peer().port)
             .map_err(|_| DispatchError::HostUnreachable)?;
         let path = self.upstream.for_server(&server, refresh);
-        let server = path.datagram_server(&server, context).await?;
+        let server = path.ip4p_datagram_server(&server, context).await?;
         let endpoint = context
             .resolution()
             .resolve_proxy(&server, context.deadline())

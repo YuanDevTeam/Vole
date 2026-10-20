@@ -137,7 +137,10 @@ impl OutboundConnector for ShadowsocksOutbound {
         if let Some(uot) = &self.uot {
             return uot.open(self, request, context).await;
         }
-        let server = self.upstream.datagram_server(&self.server, context).await?;
+        let server = self
+            .upstream
+            .ip4p_datagram_server(&self.server, context)
+            .await?;
         let maximum = request.max_response_payload_size();
         let wire_maximum = maximum.saturating_add(datagram::MAX_RESPONSE_HEADER);
         let inner = self

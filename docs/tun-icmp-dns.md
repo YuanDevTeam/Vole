@@ -399,6 +399,11 @@ DNS 提示或 GeoData 更新改路；新流使用当前数据。每目标按同�
 
 ## IP-only协议与独立测速接点
 
+`experimental.dialer-ip4p-convert` 只在已声明的物理 connected TCP 和指定 UDP 节点端点生效。
+物理端点解析后先解码、再按实际 IPv4/IPv6 应用地址族及 source/interface 绑定；
+解析角色、逻辑 host/port、认证和代理链不改变。DNS 的查询族与缓存仍遵循原配置，
+不自动开启 AAAA、不改写对外 DNS 记录或通用 IP-only 业务解析结果。
+
 公共`ResolutionContext`仅在协议必须取得IP地址的边界解析业务目标或逻辑上游；原始`Destination`保持不变，HTTP Host、TLS SNI和路由仍使用逻辑名称。代理服务器在实际建链时通过节点 resolver 解析，准备阶段不解析备用节点。静态 ECH 不查询 DNS；动态 ECH 通过同一解析上下文消费节点角色的原始 HTTPS 记录。查询名可独立覆盖，不改业务/服务器逻辑名称；沿原建链期限、取消和 weak runtime 所有权，不增加 Invoke DNS 入参。DNS 关闭和独立测速使用物理 system source，不可用时失败。
 
 Running Session上下文仅弱引用本 session 的 RuntimeDns；业务 IP-only 解析使用 nameserver/policy，代理服务器使用 proxy-server-nameserver/policy，DIRECT 目标使用 direct-nameserver。未绑定、上游不可达或 session 已停止时失败；只有配置关闭 DNS 时才使用系统解析。IP字面量仍执行端口/地址族政策。解析共享同一次建链期限，Stop取消当前及后续查询；在进入可能等待自身的singleflight之前拒绝同名递归依赖，嵌套依赖深度最多32层。不会因为DNS经代理出口就无条件禁止整个图。

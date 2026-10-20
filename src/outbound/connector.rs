@@ -723,6 +723,7 @@ impl UpstreamPath {
                     .resolution
                     .clone()
                     .with_ip_version(dialer.ip_version())
+                    .with_physical_dialer(dialer)
                     .resolve_proxy(server, context.deadline)
                     .await?;
                 let stream = context
@@ -760,6 +761,52 @@ impl UpstreamPath {
     /// Resolving here and opening IO below share the context's group snapshot.
     #[cfg(any(
         feature = "outbound-vmess",
+        feature = "outbound-vless",
+        feature = "outbound-hysteria2",
+        feature = "outbound-tuic",
+        feature = "outbound-trusttunnel",
+        feature = "outbound-mieru",
+        feature = "outbound-masque"
+    ))]
+    pub(crate) async fn datagram_server(
+        &self,
+        server: &Destination,
+        context: &EstablishContext,
+    ) -> Result<Destination, DispatchError> {
+        self.resolve_datagram_server(server, context, false).await
+    }
+
+    /// Only SS2022/WireGuard use IP4P when resolving their native UDP server.
+    #[cfg(any(feature = "outbound-shadowsocks", feature = "outbound-wireguard"))]
+    pub(crate) async fn ip4p_datagram_server(
+        &self,
+        server: &Destination,
+        context: &EstablishContext,
+    ) -> Result<Destination, DispatchError> {
+        self.resolve_datagram_server(server, context, true).await
+    }
+
+    #[cfg(feature = "outbound-socks5")]
+    pub(crate) fn ip4p_datagram_relay(
+        &self,
+        relay: Destination,
+        context: &EstablishContext,
+    ) -> Result<Destination, DispatchError> {
+        Ok(match (self.resolve(context)?, relay) {
+            (
+                ResolvedUpstream::Direct(_, dialer) | ResolvedUpstream::LazyDirect(dialer),
+                Destination::Ip(address),
+            ) => Destination::Ip(
+                dialer
+                    .connected_address(address)
+                    .map_err(DispatchError::from)?,
+            ),
+            (_, relay) => relay,
+        })
+    }
+
+    #[cfg(any(
+        feature = "outbound-vmess",
         feature = "outbound-shadowsocks",
         feature = "outbound-vless",
         feature = "outbound-hysteria2",
@@ -769,32 +816,48 @@ impl UpstreamPath {
         feature = "outbound-masque",
         feature = "outbound-wireguard"
     ))]
-    pub(crate) async fn datagram_server(
+    async fn resolve_datagram_server(
         &self,
         server: &Destination,
         context: &EstablishContext,
+        ip4p: bool,
     ) -> Result<Destination, DispatchError> {
         match self.resolve(context)? {
             ResolvedUpstream::Direct(endpoint, dialer) => {
                 validate_prepared_endpoint(server, endpoint)?;
-                dialer
-                    .ordered_addresses(&endpoint.addresses)
+                if ip4p {
+                    dialer
+                        .validate_connected_endpoint(endpoint)
+                        .map_err(DispatchError::from)?;
+                }
+                let addresses = if ip4p {
+                    dialer.ordered_connected_addresses(&endpoint.addresses)
+                } else {
+                    dialer.ordered_addresses(&endpoint.addresses)
+                };
+                addresses
                     .first()
                     .copied()
                     .map(Destination::Ip)
                     .ok_or(DispatchError::HostUnreachable)
             }
-            ResolvedUpstream::LazyDirect(dialer) => context
-                .resolution
-                .clone()
-                .with_ip_version(dialer.ip_version())
-                .resolve_proxy(server, context.deadline)
-                .await?
-                .addresses
-                .first()
-                .copied()
-                .map(Destination::Ip)
-                .ok_or(DispatchError::HostUnreachable),
+            ResolvedUpstream::LazyDirect(dialer) => {
+                let mut resolution = context
+                    .resolution
+                    .clone()
+                    .with_ip_version(dialer.ip_version());
+                if ip4p {
+                    resolution = resolution.with_physical_dialer(dialer);
+                }
+                resolution
+                    .resolve_proxy(server, context.deadline)
+                    .await?
+                    .addresses
+                    .first()
+                    .copied()
+                    .map(Destination::Ip)
+                    .ok_or(DispatchError::HostUnreachable)
+            }
             ResolvedUpstream::Proxy(_) => Ok(server.clone()),
         }
     }
@@ -1620,5 +1683,51 @@ proxy-groups:
         assert_eq!(diagnostic.stage(), "physical-connect");
         assert_eq!(diagnostic.kind(), "timed_out");
         assert_eq!(diagnostic.message(), "outbound setup deadline expired");
+    }
+    #[cfg(any(feature = "outbound-shadowsocks", feature = "outbound-wireguard"))]
+    #[tokio::test]
+    async fn ip4p_udp_node_endpoint_retains_chain_identity_and_uses_actual_reply_peer() {
+        let encoded: std::net::SocketAddr = "[2001:0::1bb:c000:201]:8443".parse().unwrap();
+        let server = Destination::Ip(encoded);
+        let endpoint = ResolvedEndpoint {
+            logical_host: encoded.ip().to_string(),
+            port: encoded.port(),
+            addresses: vec![encoded],
+        };
+        let dialer = Dialer::default()
+            .with_ipv6(false)
+            .with_ip_version(crate::config::IpVersion::Ipv4)
+            .with_connections(crate::config::ConnectionSettings {
+                dialer_ip4p_convert: true,
+                ..Default::default()
+            });
+        let path = UpstreamPath::direct(endpoint.clone(), dialer);
+        let context = EstablishContext::default();
+        let actual = path.ip4p_datagram_server(&server, &context).await.unwrap();
+        assert_eq!(actual, Destination::Ip("192.0.2.1:443".parse().unwrap()));
+        assert_eq!(server, Destination::Ip(encoded));
+        assert_eq!(endpoint.logical_host, encoded.ip().to_string());
+        assert_eq!(endpoint.port, 8443);
+        let remote = UpstreamPath::proxy(Arc::new(UnreachableConnector));
+        assert_eq!(
+            remote
+                .ip4p_datagram_server(&server, &context)
+                .await
+                .unwrap(),
+            server
+        );
+        #[cfg(feature = "outbound-socks5")]
+        {
+            assert_eq!(
+                path.ip4p_datagram_relay(server.clone(), &context).unwrap(),
+                actual
+            );
+            assert_eq!(
+                remote
+                    .ip4p_datagram_relay(server.clone(), &context)
+                    .unwrap(),
+                server
+            );
+        }
     }
 }

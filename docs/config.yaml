@@ -36,6 +36,7 @@ find-process-mode: strict # strict 按实际身份谓词惰性查询；always �
 # octets[12..16] 为IPv4；普通地址保持。逻辑server/SNI与认证身份不改变。
 experimental:
   dialer-ip4p-convert: false
+# 开启时转换物理TCP和SS2022/SOCKS5/WireGuard UDP节点端点；不转换DIRECT无连接UDP或DNS答复。
 
 tcp-concurrent: false
 keep-alive-idle: 0

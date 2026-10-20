@@ -220,6 +220,8 @@ impl Socks5Outbound {
             self.upstream.is_direct(context)?,
         )?;
 
+        let relay = self.upstream.ip4p_datagram_relay(relay, context)?;
+
         let upstream_limit = request_parameters
             .max_response_payload_size()
             .saturating_add(MAX_UDP_HEADER_SIZE);
@@ -1193,6 +1195,34 @@ mod tests {
         assert!(!relay_source_matches(
             &relay,
             &Destination::domain("other.example", 53_000).unwrap()
+        ));
+    }
+    #[test]
+    fn ip4p_udp_relay_source_check_uses_the_actual_endpoint() {
+        let encoded: std::net::SocketAddr = "[2001:0::1bb:c000:201]:8443".parse().unwrap();
+        let dialer = Dialer::default().with_connections(crate::config::ConnectionSettings {
+            dialer_ip4p_convert: true,
+            ..Default::default()
+        });
+        let path = UpstreamPath::direct(
+            ResolvedEndpoint {
+                logical_host: encoded.ip().to_string(),
+                port: 8443,
+                addresses: vec![encoded],
+            },
+            dialer,
+        );
+        let expected = path
+            .ip4p_datagram_relay(Destination::Ip(encoded), &EstablishContext::default())
+            .unwrap();
+        assert!(relay_source_matches(
+            &expected,
+            &Destination::Ip("192.0.2.1:443".parse().unwrap())
+        ));
+        assert!(!relay_source_matches(&expected, &Destination::Ip(encoded)));
+        assert!(!relay_source_matches(
+            &expected,
+            &Destination::Ip("192.0.2.2:443".parse().unwrap())
         ));
     }
 }

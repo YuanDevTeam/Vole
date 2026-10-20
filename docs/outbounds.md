@@ -24,6 +24,13 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
 - 普通协议节点和具名 direct 的 `ip-version` 为 `dual`（默认）、`ipv4`、`ipv6`、`ipv4-prefer` 或 `ipv6-prefer`。
   限制或排序该节点的物理服务器地址与本地解析结果，仍受全局 IPv6 开关约束。
   不要求远端代理按相同地址族解析业务域名。
+- `experimental.dialer-ip4p-convert` 缺省 false；开启后，物理 TCP 与 SS2022、SOCKS5、WireGuard
+  的原生 UDP 节点端点识别 `2001:0000::/32`，按编码的 IPv4/端口建立实际首跳。
+  转换先于实际地址族、源地址和接口绑定；逻辑 server、TLS SNI、认证、代理链目标保持原值，
+  收包校验使用实际端点。经代理的逻辑端点不在本地强制转换，实际物理首跳按其自身策略处理。
+  不转换 DIRECT 无连接业务 UDP、DNS 答复或其他原生 QUIC 节点入口，不增加缓存或连接池。
+  域名的编码地址不能通过转换取得新的回环例外；UWP 物理绑定下同样拒绝编码地址转为回环。
+  显式普通回环节点保留原行为；解析查询仍遵循 DNS 的既有 IPv6 开关，不为 IP4P 自动增加 AAAA 查询。
 - gRPC/legacy H2 首次读取延迟响应头时先检查原建链期限，即使响应已就绪也不能绕过
   超时；响应头已确认后的业务读取不再受该期限限制。
 - HTTP、SOCKS5、TUN、DNS 选路及 node-only `measureDelay` 使用同一连接器。
