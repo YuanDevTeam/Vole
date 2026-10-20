@@ -68,7 +68,7 @@ H1 编码保留正文 backing，不将整批正文再次拼入头部写缓冲；
 
 - 缺省叶字段继承主腿。headers 是整体替换，`{}` 清空；显式空 host 恢复下载认证名/server 推导。
 - `skip-cert-verify: false` 必须覆盖主腿 true；空 name-cert-verify/fingerprint 清除对应 override/pin。
-- `client-fingerprint` 缺省继承，显式名称覆盖，`none` / 空串清除。下载腿切到明文或 H3 前必须清除继承的已启用 profile；它不属于证书策略，不因切换 TLS/REALITY 自动清除。六值/四模板见 [TLS 指纹](tls-client-fingerprint.md)。
+- `client-fingerprint` 缺省继承，显式名称覆盖，`none` / 空串清除。下载腿切到明文或 H3 前必须清除继承的已启用 profile；它不属于证书策略，不因切换 TLS/REALITY 自动清除。十值/八模板见 [TLS 指纹](tls-client-fingerprint.md)。
 - certificate/private-key 必须配对替换或同时空串清除；PEM 与密钥匹配在 IO 前检查。
 - reality-opts 缺省继承整个对象，`{}` 清除；非空对象必须提供 public-key，short-id 缺省空、support-x25519mlkem768 缺省 false，不按叶合并旧对象。仅提供混合开关不等同空对象，仍须提供 public-key。null 拒绝。
 - jls-opts 缺省继承整个身份，非空对象必须完整替换 username/password，`{}` 清除；同腿与 REALITY 和证书策略互斥，切换时须显式清除旧对象。JLS 仅 H1/H2，实际 TLS1.3，无恢复；完整约束见 [JLS](vless.md#jls)。

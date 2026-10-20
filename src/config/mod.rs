@@ -929,6 +929,21 @@ pub enum ClientFingerprint {
     Firefox120,
     Safari16,
     Ios14,
+    Android11,
+    Edge85,
+    ThreeSixty75,
+    Qq111,
+}
+impl ClientFingerprint {
+    pub(crate) const fn supports_tls13(self) -> bool {
+        !matches!(self, Self::Android11 | Self::ThreeSixty75)
+    }
+}
+fn validate_tls13_fingerprint(profile: Option<ClientFingerprint>) -> Result<()> {
+    if profile.is_some_and(|profile| !profile.supports_tls13()) {
+        return invalid("client-fingerprint only supports TLS1.2 for this transport");
+    }
+    Ok(())
 }
 
 // Only the immutable template value is process-shared. Selection precedes all
@@ -958,6 +973,10 @@ fn parse_client_fingerprint(value: Option<&str>) -> Result<Option<ClientFingerpr
         Some("firefox") => Ok(Some(ClientFingerprint::Firefox120)),
         Some("safari") => Ok(Some(ClientFingerprint::Safari16)),
         Some("ios") => Ok(Some(ClientFingerprint::Ios14)),
+        Some("android") => Ok(Some(ClientFingerprint::Android11)),
+        Some("edge") => Ok(Some(ClientFingerprint::Edge85)),
+        Some("360") => Ok(Some(ClientFingerprint::ThreeSixty75)),
+        Some("qq") => Ok(Some(ClientFingerprint::Qq111)),
         Some("random") => Ok(Some(process_random_fingerprint())),
         Some(_) => invalid("unsupported client-fingerprint"),
     }
@@ -1105,6 +1124,7 @@ pub struct RealityConfig {
 
 impl RealityConfig {
     pub(crate) fn validate_fingerprint(&self) -> Result<()> {
+        validate_tls13_fingerprint(self.client_fingerprint)?;
         if self.support_x25519mlkem768
             && !matches!(
                 self.client_fingerprint,
@@ -3796,6 +3816,9 @@ impl RawXHttpDownloadSettings {
             return invalid(
                 "XHTTP download must explicitly clear inherited certificate policy before changing security mode",
             );
+        }
+        if tls {
+            validate_tls13_fingerprint(client_fingerprint)?;
         }
         let security = if let Some(mut reality) = reality {
             if !tls {

@@ -51,7 +51,7 @@ impl Connector {
                 config.set_alpn_protos(alpn)?;
                 Ok(config)
             }
-            Self::Named(connector) => connector.configure(alpn),
+            Self::Named(connector) => connector.configure_with_application_settings(alpn, false),
         }
     }
 }
@@ -63,6 +63,13 @@ impl BoringTlsClient {
         options: &TlsClientOptions,
         capacity: usize,
     ) -> io::Result<Self> {
+        if (options.ech.is_some() || options.versions == TlsVersions::Tls13)
+            && options
+                .client_fingerprint
+                .is_some_and(|profile| !profile.supports_tls13())
+        {
+            return Err(invalid());
+        }
         let name = ServerName::try_from(server_name.to_owned()).map_err(|_| invalid())?;
         let verifier = Arc::new(super::verifier::CertificateVerifier::new(
             context,
@@ -362,6 +369,10 @@ fn profile(value: crate::config::ClientFingerprint) -> ClientFingerprint {
         crate::config::ClientFingerprint::Firefox120 => ClientFingerprint::Firefox120,
         crate::config::ClientFingerprint::Safari16 => ClientFingerprint::Safari16,
         crate::config::ClientFingerprint::Ios14 => ClientFingerprint::Ios14,
+        crate::config::ClientFingerprint::Android11 => ClientFingerprint::Android11,
+        crate::config::ClientFingerprint::Edge85 => ClientFingerprint::Edge85,
+        crate::config::ClientFingerprint::ThreeSixty75 => ClientFingerprint::ThreeSixty75,
+        crate::config::ClientFingerprint::Qq111 => ClientFingerprint::Qq111,
     }
 }
 

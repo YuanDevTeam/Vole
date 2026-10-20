@@ -42,6 +42,7 @@ impl ShadowTlsConfig {
         }
     }
     pub(crate) fn validate(&self) -> Result<()> {
+        super::validate_tls13_fingerprint(self.client_fingerprint)?;
         if !cfg!(feature = "shadow-tls-v3") {
             return invalid("ShadowTLS v3 is not compiled in");
         }

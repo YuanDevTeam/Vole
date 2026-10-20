@@ -19,6 +19,7 @@ impl std::fmt::Debug for JlsConfig {
 
 impl JlsConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        validate_tls13_fingerprint(self.tls.client_fingerprint)?;
         for value in [&self.username, &self.password] {
             if value.is_empty() || value.len() > 65_535 {
                 return invalid("JLS credentials must each contain 1..65535 bytes");

@@ -15,6 +15,13 @@ impl RawSecurityModes {
         certificate_options: bool,
     ) -> Result<SecurityConfig> {
         tls.tls13_only |= tls.ech.is_some();
+        if tls.tls13_only
+            || self.reality.is_some()
+            || self.jls.is_some()
+            || self.shadow_tls.is_some()
+        {
+            validate_tls13_fingerprint(tls.client_fingerprint)?;
+        }
         if usize::from(self.reality.is_some())
             + usize::from(self.jls.is_some())
             + usize::from(self.shadow_tls.is_some())

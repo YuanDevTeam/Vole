@@ -5,7 +5,7 @@
 | 字段 | 含义 | 接受值 |
 | --- | --- | --- |
 | `fingerprint` | 服务端证书 DER 的 SHA-256 pin | 64 个十六进制字符，可带冒号 |
-| `client-fingerprint` | 客户端 ClientHello 的命名模板 | 下列六值；空串也关闭 |
+| `client-fingerprint` | 客户端 ClientHello 的命名模板 | 下列十值；空串也关闭 |
 
 | 公开值 | 实际模板 |
 | --- | --- |
@@ -14,11 +14,15 @@
 | `firefox` | Firefox120 |
 | `safari` | Safari16.0 |
 | `ios` | iOS14 |
+| `android` | Android11 OkHttp，TLS1.2 |
+| `edge` | Edge85 |
+| `360` | 360 Browser7.5 的已实现能力子集，TLS1.2；YAML 中写为字符串 |
+| `qq` | QQ11.1 |
 | `random` | 进程首次按 Chrome133/Safari16/iOS14/Firefox120 = 6:3:2:1 选中一个模板 |
 
 节点省略时关闭，显式启用推荐 `chrome`；这是节点级选项，无全局默认。
 大小写敏感，未知名称、`null`、错型全部拒绝；不接受带版本号的名称、
-其它移动端名称、废弃的 `randomized` 或 PSK/PQ 专用名称。短名只随显式依赖升级和验收变更，不随 OS 自动选择。
+其它未列出名称、废弃的 `randomized` 或 PSK/PQ 专用名称。短名只随显式依赖升级和验收变更，不随 OS 自动选择。
 `random` 仅共享不可变模板选择，后续连接、配置替换及 Stop/Start 不重抽，不共享 TLS 会话。
 兼容约束按实际选中模板检查，不能通过 random 绕过 REALITY 混合模式或 H3 限制。
 
@@ -88,25 +92,30 @@ Android、iOS 和 tvOS 在此库的 Unix 发现分支中，不能完整读取平
 这些平台保留内置与自定义根，实际可读文件仅补充来源，不宣称完整系统信任等价。
 Windows UWP/AppContainer 的真实根读取仍需独立设备验证；交叉编译不构成签收。
 
-## 四模板边界
+## 命名模板边界
 
 模板由 fork 固定密码套件、组/share、签名算法、扩展排列及受限扩展编码。
 
 | 模板 | 主要差异 |
 | --- | --- |
-| Chrome133 | 普通 TLS 与显式混合 REALITY 使用原生 X25519MLKEM768 和 X25519 双 share；新 ALPS 17613，无 padding |
+| Chrome133 | 普通 TLS 与显式混合 REALITY 使用原生 X25519MLKEM768 和 X25519 双 share，无 padding |
 | Firefox120 | 自有 cipher 顺序、固定扩展顺序、X25519/P-256 双 share，无 GREASE/ALPS/证书压缩 |
 | Safari16.0 | 固定扩展和签名顺序、GREASE、条件 padding、真实 Zlib 解压，模板本身不加 ECH/ALPS |
 | iOS14 | 独立套件与扩展顺序、GREASE、条件 padding，无证书压缩；真实 c023/c027/003c CBC-SHA256 协商 |
+| Android11 OkHttp | 独立套件与扩展顺序，无 GREASE、证书压缩或 TLS1.3 声明 |
+| Edge85 | 固定扩展顺序、GREASE、X25519 share、Brotli 证书解压 |
+| 360 Browser7.5 | TLS1.2、P-256/P-384/P-521；不启用假 DHE/DSA、RC4 或禁用套件 |
+| QQ11.1 | 独立命名模板，固定扩展顺序、GREASE、X25519 share、Brotli 证书解压 |
 
 TLS 版本范围、SNI、ALPN、证书策略、身份和恢复预算仍由节点及传输决定。
+Android/360 的参考模板只有 TLS1.2 能力；要求 TLS1.3 的身份与传输拒绝此组合，不伪造 share 或改名。
 因此名称表示版本固定的 TLS 模板，不承诺完整浏览器行为或所有上下文的逐字节相同。
 最低 TLS1.2；Safari/iOS 的 TLS1.0/1.1 声明裁剪，Vision/XHTTP/REALITY 继续强制 TLS1.3。
 普通 Vision/XHTTP 的版本约束同时省略 TLS1.2 cipher 及仅用于旧握手的
 EC point formats、extended master secret、session ticket、renegotiation info 扩展。
 命名 REALITY 则保留模板的 TLS1.2 声明与字段，由原生 REALITY 在 ServerHello 阶段
 拒绝非 TLS1.3 协商；这与关闭命名指纹时的 TLS1.3-only 默认 offer 分开。
-ALPS 仅在实际提供 h2 时发送，不复制 Mihomo 某些 WS 调用中的额外 h2 ALPS。
+Core 使用标准 H2 SETTINGS，不声明 TLS ALPS，也不复制 Mihomo 某些 WS 调用中的额外 h2 ALPS。
 classic REALITY 移除 Chrome133 的 ML-KEM group/share，并绑定实际 X25519 私钥；
 Firefox 的额外经典 share 不产生第二份 REALITY 身份。REALITY 仍拒绝 HRR、恢复和 0-RTT。
 
@@ -122,10 +131,10 @@ iOS 的 c024/c028/003d 与 Safari/iOS 的 c008 仅声明，对端选中会失败
 已有原生 RSA/AES-CBC/SHA256 实际协商，并保留 deprecated 标记，默认套件不启用。
 
 模板不模拟浏览器 HTTP/2 SETTINGS、QUIC 参数，也不会自动启用实际 ECH。
-VLESS/VMess/Trojan/AnyTLS/Hysteria2 可另行显式配置 [ECH](vless.md#ech)：四模板均可使用，届时强制 TLS1.3、
+VLESS/VMess/Trojan/AnyTLS/Hysteria2 可另行显式配置 [ECH](vless.md#ech)：具备 TLS1.3 能力的六种模板可使用，届时强制 TLS1.3、
 加入真实 ECH 并关闭恢复；不再声称与未启用 ECH 的历史浏览器模板逐字节相同。
-当前 HTTP 驱动不导入 TLS ALPS 中的应用设置，因此**非空 ALPS 响应明确失败**；
-未协商或协商空设置可用。Brotli/Zlib 解压输出和原生证书消息上限均为 128 KiB；
+当前 HTTP 驱动不导入 TLS ALPS 中的应用设置，握手时不声明该可选扩展，
+由标准 SETTINGS/ACK 初始化。意外协商的非空 ALPS 仍失败，不能静默忽略设置。Brotli/Zlib 解压输出和原生证书消息上限均为 128 KiB；
 超限、截断、错误算法和损坏压缩流失败，不能绕过证书认证。
 
 ## 所有权与关闭

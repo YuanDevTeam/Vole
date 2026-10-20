@@ -63,8 +63,9 @@ Sources: [Mihomo TLS connection path](https://github.com/MetaCubeX/mihomo/blob/a
 
 ## Intentional Vole differences
 
-Vole retains a TLS1.2 floor, transport-owned ALPN, h2-only ALPS advertisement,
-nonempty ALPS rejection and its bounded ordinary-TLS session cache. Safari's
+Vole retains a TLS1.2 floor, transport-owned ALPN, standard HTTP/2 SETTINGS
+without TLS ALPS advertisement, a guard for unexpected nonempty ALPS,
+and its bounded ordinary-TLS session cache. Safari's
 TLS1.0/1.1 declarations are trimmed; Mihomo's WS Chrome still advertises h2 ALPS
 when ALPN is only HTTP/1.1, which Vole deliberately does not do. Warm/resumed
 hellos have separate expectations; PSK is not ignored by the comparator. These

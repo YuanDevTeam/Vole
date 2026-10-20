@@ -60,8 +60,10 @@ fn named_fingerprint_is_strict_and_independent_of_certificate_pins() {
             "NONE",
             "chrome133",
             "safari16.0",
-            "android",
-            "edge",
+            "android11",
+            "edge85",
+            "3607.5",
+            "qq11.1",
             "randomized",
             "chrome_psk",
             "chrome_pq",
@@ -94,7 +96,7 @@ fn named_fingerprint_is_strict_and_independent_of_certificate_pins() {
 }
 
 #[test]
-fn selected_names_resolve_to_four_distinct_fixed_templates() {
+fn selected_names_resolve_to_eight_distinct_fixed_templates() {
     for protocol in ["anytls", "trojan", "vmess", "vless"] {
         let mut templates = Vec::new();
         for (name, expected) in [
@@ -102,9 +104,13 @@ fn selected_names_resolve_to_four_distinct_fixed_templates() {
             ("firefox", ClientFingerprint::Firefox120),
             ("safari", ClientFingerprint::Safari16),
             ("ios", ClientFingerprint::Ios14),
+            ("android", ClientFingerprint::Android11),
+            ("edge", ClientFingerprint::Edge85),
+            ("360", ClientFingerprint::ThreeSixty75),
+            ("qq", ClientFingerprint::Qq111),
         ] {
             let config = Config::parse_yaml(
-                yaml(protocol, &format!("client-fingerprint: {name}")).as_bytes(),
+                yaml(protocol, &format!("client-fingerprint: {name:?}")).as_bytes(),
             )
             .unwrap();
             let selected = profile(&config).expect("enabled profile");
@@ -252,7 +258,28 @@ fn ios_and_process_random_fingerprint_use_the_shared_entries() {
             ClientFingerprint::Safari16 => 1,
             ClientFingerprint::Ios14 => 2,
             ClientFingerprint::Firefox120 => 3,
+            _ => unreachable!("random keeps its four-template weights"),
         }] += 1;
     }
     assert_eq!(counts, [6, 3, 2, 1]);
+}
+
+#[test]
+fn tls12_profiles_reject_only_transports_that_require_tls13() {
+    for profile in ["android", "360"] {
+        for transport in [
+            "network: xhttp",
+            "flow: xtls-rprx-vision",
+            "jls-opts: {username: fixture, password: fixture}",
+            "shadow-tls-opts: {version: 3, password: fixture}",
+            "ech-opts: {enable: true}",
+        ] {
+            let fields = format!("client-fingerprint: {profile:?}\n    {transport}");
+            assert!(Config::parse_yaml(yaml("vless", &fields).as_bytes()).is_err());
+        }
+        let fields = format!(
+            "network: xhttp\n    client-fingerprint: chrome\n    xhttp-opts:\n      mode: stream-up\n      download-settings:\n        client-fingerprint: {profile:?}"
+        );
+        assert!(Config::parse_yaml(yaml("vless", &fields).as_bytes()).is_err());
+    }
 }

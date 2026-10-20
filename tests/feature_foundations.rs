@@ -33,9 +33,11 @@ fn selected_fingerprints_follow_protocol_feature_admission() {
             cfg!(feature = "outbound-vless"),
         ),
     ] {
-        for name in ["none", "chrome", "firefox", "safari", "ios", "random"] {
+        for name in [
+            "none", "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random",
+        ] {
             let yaml = format!(
-                "mixed-port: 1080\nproxies: [{{name: node, type: {protocol}, server: localhost, port: 443, {authentication}, client-fingerprint: {name}}}]\nrules: ['MATCH,node']\n"
+                "mixed-port: 1080\nproxies: [{{name: node, type: {protocol}, server: localhost, port: 443, {authentication}, client-fingerprint: {name:?}}}]\nrules: ['MATCH,node']\n"
             );
             assert_eq!(
                 Config::parse_yaml(yaml.as_bytes()).is_ok(),
