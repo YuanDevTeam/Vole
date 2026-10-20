@@ -3,6 +3,7 @@ use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 #[cfg(any(feature = "invoke", test))]
 mod configs;
 mod cors;
+mod dns;
 mod tls;
 mod transport;
 mod websocket;
@@ -342,7 +343,7 @@ async fn handle_request<S: ControllerIo>(
         if request.method != "GET" {
             return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
         }
-        return dns_query(
+        return dns::query(
             &mut stream,
             &request.target,
             resources.as_deref(),
@@ -901,65 +902,6 @@ impl From<ProxyGroupState> for GroupResponse {
             fixed: state.fixed,
         }
     }
-}
-
-async fn dns_query<S: ControllerIo>(
-    stream: &mut S,
-    target: &str,
-    resources: Option<&dyn crate::resource::control::RuntimeResources>,
-    cancellation: CancellationToken,
-) -> io::Result<()> {
-    use crate::dns::{QueryType, RecordData};
-    let Some(snapshot) = resources
-        .and_then(|r| r.dns())
-        .filter(|s| s.dns.is_enabled())
-    else {
-        return write_error(stream, 500, "DNS is disabled", &[]).await;
-    };
-    let mut name = None;
-    let mut qtype = None;
-    if target.contains('#') {
-        return write_error(stream, 400, "Bad request", &[]).await;
-    }
-    for (key, value) in
-        url::form_urlencoded::parse(target.split_once('?').map_or("", |(_, q)| q).as_bytes())
-    {
-        match key.as_ref() {
-            "name" if name.is_none() => name = Some(value.into_owned()),
-            "type" if qtype.is_none() => qtype = Some(value.into_owned()),
-            _ => return write_error(stream, 400, "Bad request", &[]).await,
-        }
-    }
-    let query_type = match qtype.as_deref().unwrap_or("A") {
-        "A" | "" => QueryType::A,
-        "AAAA" => QueryType::Aaaa,
-        _ => return write_error(stream, 400, "Unsupported query type", &[]).await,
-    };
-    let Ok(query) = crate::dns::build_query(1, name.as_deref().unwrap_or_default(), query_type)
-    else {
-        return write_error(stream, 400, "Bad request", &[]).await;
-    };
-    let (result, path) = tokio::select! { biased; () = cancellation.cancelled() => return Ok(()), result = crate::dns::trace::capture(snapshot.dns.query_upstream(&query)) => result };
-    let Ok(wire) = result else {
-        return write_error(stream, 500, "DNS query failed", &[]).await;
-    };
-    let Ok(response) = crate::dns::parse_response(&wire) else {
-        return write_error(stream, 500, "DNS response invalid", &[]).await;
-    };
-    let answers = response
-        .answers
-        .iter()
-        .map(|r| {
-            let (kind, data) = match &r.data {
-                RecordData::A(ip) => (1, ip.to_string()),
-                RecordData::Aaaa(ip) => (28, ip.to_string()),
-                RecordData::Cname(name) => (5, format!("{name}.")),
-            };
-            serde_json::json!({"name":format!("{}.",r.name),"type":kind,"TTL":r.ttl,"data":data})
-        })
-        .collect::<Vec<_>>();
-    let value = serde_json::json!({"Status":response.rcode,"Question":[{"Name":format!("{}.",response.question.name),"Qtype":query_type as u16,"Qclass":1}],"Answer":answers,"TC":wire[2]&2!=0,"RD":response.recursion_desired,"RA":response.recursion_available,"AD":wire[3]&0x20!=0,"CD":wire[3]&0x10!=0,"QueryPath":path});
-    write_json(stream, 200, &value, &[]).await
 }
 
 async fn write_json<T: Serialize, S: ControllerIo>(

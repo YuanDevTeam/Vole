@@ -297,11 +297,16 @@ Expire 为 Unix 秒。未知时省略该对象，缺失子项为 0；不以本�
 连接选项、profile 和 TUN 字段。它使用字段白名单，不提供完整 YAML、节点凭据、订阅位置、
 认证头、Controller secret 或认证用户列表；不支持 PUT/PATCH 配置修改。
 
-`GET /dns/query?name=example.com&type=A` 使用当前上游 resolver 与相同缓存查询；支持 A/AAAA，
-省略 type 使用 A。响应包含 `Status/Question/Answer/TC/RD/RA/AD/CD` 和扩展 `QueryPath`。
+`GET /dns/query?name=example.com&type=A` 使用当前上游 resolver 与相同缓存查询，
+接受 Mihomo Controller DNS 类型表的精确名称，包括 A、AAAA、TXT、MX、SRV、HTTPS、SVCB 和 DNSSEC 类型；
+类型名称区分大小写，省略或空 type 使用 A，不接受数字或 `TYPE1234` 形式。重复、未知 query 参数返回 400。
+响应保留 `Status/Question/Answer/TC/RD/RA/AD/CD` 和扩展 `QueryPath`，非空的权威与附加段另含
+`Authority/Additional`。每条记录提供 `name/type/TTL/data`，名称包含末尾点，TTL 使用本次响应的实际值，
+RDATA 使用 DNS 展示格式；未知记录使用 RFC 3597 十六进制形式。Answer 保持数组，空权威与附加段省略。
 与 Mihomo 一样，此诊断接口跳过入口的 hosts、fake-IP 与 IPv6 响应过滤，返回上游真实答案；
-policy 与 fallback 仍生效。DNS 关闭或查询失败返回 500。这里只输出地址/CNAME 答案，
-不提供其他 qtype、Authority/Additional 展开或后台 DNS 查询日志。
+policy 与 fallback 仍生效。展示借用现有最多 4096 字节 wire 响应，不建立后台记录树或查询日志，
+JSON 转义和名称展开后的正文最多 256 KiB。DNS 关闭、查询失败、无效或截断的 wire 响应、输出超限返回 500，
+不以部分记录或伪造 TC 标记返回成功；该展示层不另加记录数量限制，上游仍沿用 DNS 解析预算。
 
 这些接口复用 Controller 的 Bearer 鉴权。目标与 DNS 路径只通过显式查询返回，
 不会写入普通日志。`/connections` 与 WebSocket `/traffic` 是业务负载统计，普通 GET `/traffic` 表示 TUN 原始 IP 包流量，

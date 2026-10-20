@@ -31,7 +31,8 @@ Linux 目标的报文编码：`platform::linux_network::netlink::tests::`。
 `passive_tun_pmtu_resegments_only_live_sent_tcp_and_preserves_siblings`。
 
 Controller 推送（纯内存 duplex，无网络监听）：`controller::websocket::tests::`；
-安全传输/CORS：`controller::secure_tests::`；实例日志脱敏/动态过滤：`logging::tests::`。
+安全传输/CORS：`controller::secure_tests::`；DNS 展示：`controller::dns::tests::`；
+实例日志脱敏/动态过滤：`logging::tests::`。
 组固定清除：`routing::proxy_group::tests::automatic_fixed_clear_uses_existing_health_without_probe`。
 这些过滤器不代替真实 TUN 计数与 Stop 验证。
 

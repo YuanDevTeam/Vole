@@ -112,7 +112,7 @@ authentication:
 # 不允许 credentials；allow-private-network 缺省 true，只在成功预检且请求 true 时返回允许头。
 # Controller 提供 GET /traffic、GET /group、GET /group/{name}、
 # GET /proxies/{name} 和 PUT /proxies/{name}；另含连接查询/关闭、有效配置、规则
-# 与 A/AAAA DNS 查询、节点/组 delay、Provider healthcheck、实际进程内存；
+# 与有界原始 DNS 记录查询、节点/组 delay、Provider healthcheck、实际进程内存；
 # 完整接口见 controller-api.md；不属于 Invoke API。
 external-controller: 127.0.0.1:9090
 # external-controller-tls: 127.0.0.1:9443

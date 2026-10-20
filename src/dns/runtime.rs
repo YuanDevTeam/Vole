@@ -2156,13 +2156,26 @@ impl RuntimeDns {
             Box<dyn Future<Output = Result<Vec<u8>, RuntimeDnsError>> + Send + '_>,
         > = Box::pin(permit.decision.scope(async {
             permit.decision.check()?;
-            self.exchange_address_upstream(
-                query,
-                &classified,
-                permit.deadline,
-                FailureMode::BoundedError,
-            )
-            .await
+            match classified.kind {
+                DnsQueryKind::Address(_) => {
+                    self.exchange_address_upstream(
+                        query,
+                        &classified,
+                        permit.deadline,
+                        FailureMode::BoundedError,
+                    )
+                    .await
+                }
+                DnsQueryKind::Opaque => {
+                    self.exchange_opaque(
+                        query,
+                        &classified,
+                        permit.deadline,
+                        FailureMode::BoundedError,
+                    )
+                    .await
+                }
+            }
         }));
         timeout_at(permit.deadline, exchange).await.map_err(|_| {
             RuntimeDnsError::UpstreamsExhausted {
@@ -6569,7 +6582,9 @@ dns:
         assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 3);
 
         let cached_query = opaque_query(99, "txt.example", 16);
-        let cached = resolver.exchange(&cached_query).await.unwrap();
+        // Controller diagnostics share the existing opaque cache, without
+        // passing through address-only middleware or adding a second cache.
+        let cached = resolver.query_upstream(&cached_query).await.unwrap();
         assert_eq!(u16::from_be_bytes([cached[0], cached[1]]), 99);
         assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 3);
         assert_eq!(resolver.domain_hint(address).await, None);
