@@ -139,9 +139,9 @@ impl PhysicalPing {
     pub(crate) async fn recv(&self, bytes: &mut [u8]) -> io::Result<PingReceipt> {
         loop {
             let mut ready = self.socket.readable().await?;
-            match ready.try_io(|socket| receive(socket.get_ref().as_raw_fd(), bytes)) {
-                Ok(result) => return result,
-                Err(_) => {}
+            if let Ok(result) = ready.try_io(|socket| receive(socket.get_ref().as_raw_fd(), bytes))
+            {
+                return result;
             }
         }
     }
@@ -234,13 +234,13 @@ fn receive(fd: libc::c_int, bytes: &mut [u8]) -> io::Result<PingReceipt> {
         } else {
             None
         };
-        if let Some(found) = found {
-            if pktinfo.replace(found).is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "ambiguous ICMP packet info",
-                ));
-            }
+        if let Some(found) = found
+            && pktinfo.replace(found).is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ambiguous ICMP packet info",
+            ));
         }
         cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
     }

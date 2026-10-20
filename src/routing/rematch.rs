@@ -12,7 +12,8 @@ pub(crate) struct RematchTarget {
 
 /// The ordinary graph keeps None; only actual rematch nodes allocate entries.
 #[derive(Clone, Default)]
-pub(crate) struct RematchTargets(Option<Arc<[(ProxyId, Arc<RematchTarget>)]>>);
+pub(crate) struct RematchTargets(Option<RematchEntries>);
+type RematchEntries = Arc<[(ProxyId, Arc<RematchTarget>)]>;
 impl RematchTargets {
     pub(crate) fn new(proxies: &[ProxyConfig]) -> Self {
         let mut entries = Vec::new();

@@ -137,7 +137,7 @@ impl CoreController {
 enum StartupConfig {
     #[cfg(test)]
     Yaml(String),
-    Input(http::StartPayload),
+    Input(Box<http::StartPayload>),
     Resolved(Box<crate::runtime::RecoverySnapshot>),
 }
 
@@ -1092,7 +1092,7 @@ fn dispatch_request(request: DecodedRequest) -> Result<InvokeResponse, InvokeFai
                 if reconnect {
                     controller.reconnect(payload)?;
                 } else {
-                    controller.start_config(StartupConfig::Input(payload))?;
+                    controller.start_config(StartupConfig::Input(Box::new(payload)))?;
                 }
                 Ok(json!({}))
             })?

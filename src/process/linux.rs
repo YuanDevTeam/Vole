@@ -28,8 +28,10 @@ fn address(value: &str) -> Option<SocketAddr> {
             let mut bytes = [0; 16];
             for (word, out) in host
                 .as_bytes()
-                .chunks_exact(8)
-                .zip(bytes.chunks_exact_mut(4))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .zip(bytes.as_chunks_mut::<4>().0.iter_mut())
             {
                 out.copy_from_slice(
                     &u32::from_str_radix(std::str::from_utf8(word).ok()?, 16)

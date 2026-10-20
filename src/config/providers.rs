@@ -243,11 +243,10 @@ impl ProviderTemplate {
             ("external-controller-unix", unix.map(str::to_owned)),
             ("secret", secret.map(str::to_owned)),
         ] {
-            if let Some(value) = value {
-                if let Some(Value::String(mut old)) = base.insert(key.into(), Value::String(value))
-                {
-                    old.zeroize();
-                }
+            if let Some(value) = value
+                && let Some(Value::String(mut old)) = base.insert(key.into(), Value::String(value))
+            {
+                old.zeroize();
             }
         }
         if let Some(mark) = mark {

@@ -319,7 +319,7 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
                 ca,
             });
         let (http_config_yaml, source_file) = http_input.unzip();
-        let startup = StartupConfig::Input(super::http::StartPayload {
+        let startup = StartupConfig::Input(Box::new(super::http::StartPayload {
             config_yaml: std::mem::take(&mut *yaml),
             http_config_yaml,
             http_context: context,
@@ -327,7 +327,7 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
             cancellation: Some(cancellation.clone()),
             foreground_overrides: overrides,
             provider_paths: Some(provider_paths.clone()),
-        });
+        }));
         let result = run_controller(controller, startup, signals, cancellation, reload).await;
         let stopped = cleanup.destroy();
         result.and(stopped)
