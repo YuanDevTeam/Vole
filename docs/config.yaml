@@ -154,8 +154,16 @@ secret: "vole-runtime-secret"
 # dns-hijack 缺省 [0.0.0.0:53]；[] 关闭。只在 dns.enable:true 的 TUN TCP/UDP 上生效。
 # 精确 IP:port 匹配指定目标；any/未指定地址匹配任何地址族的 53 端口。
 # udp-timeout 单位秒，缺省或 0 为 300；控制源关联及各目的流的空闲失效。
+# Linux 专属 ICMP：真实 Echo 走共享 Dialer 的 DIRECT；真实 TUN 前缀、启用的 fake-IP 池或
+# disable-icmp-forwarding:true 使用本地合成，不代表真实 RTT。其他平台拒绝这两个字段。
+# icmp-timeout 为非负 int64 秒，缺省/0 为 10；超出本机单调时钟范围明确拒绝。
+# 运行组须由安装器/宿主在出口 namespace 预先授权 ping_group_range；Core 不改 sysctl、不提权、无 IP raw fallback。
+# 最多两个物理 ping socket、64 个许可、入/出各 8 项，真实包限 min(mtu,2048)；Stop 清理全部所有者。
+# 这些值变化须显式重连；详细合同见 tun-icmp-dns.md 与 tun-platform.md。
 # mixed-port 与 TUN 均关闭时仍可运行 Controller 和资源任务。
 tun:
+  # icmp-timeout: 10 # 仅 Linux；0 同缺省，其他平台不要填写
+  # disable-icmp-forwarding: false # 仅 Linux；true 保留本地合成回应
   # auto-route: true # Linux：自动路由；DNS 启用且劫持网关时接管 systemd-resolved
   # auto-detect-interface: true # Linux：出站自动绑定物理接口
   # inet6-address: ["fdfe:dcba:9876::1/126"] # 顶层 ipv6 关闭时不添加；[] 关闭 IPv6 捕获

@@ -284,6 +284,10 @@ pub struct TunConfig {
     pub device: String,
     pub dns_hijack: Vec<SocketAddr>,
     pub udp_timeout: Duration,
+    #[cfg(target_os = "linux")]
+    pub icmp_timeout: Duration,
+    #[cfg(target_os = "linux")]
+    pub disable_icmp_forwarding: bool,
 }
 
 impl Default for TunConfig {
@@ -298,6 +302,10 @@ impl Default for TunConfig {
             device: String::new(),
             dns_hijack: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 53))],
             udp_timeout: Duration::from_secs(300),
+            #[cfg(target_os = "linux")]
+            icmp_timeout: Duration::from_secs(10),
+            #[cfg(target_os = "linux")]
+            disable_icmp_forwarding: false,
         }
     }
 }
@@ -1472,6 +1480,12 @@ struct RawTunConfig {
     dns_hijack: Vec<String>,
     #[serde(rename = "udp-timeout", default)]
     udp_timeout: u64,
+    #[cfg(target_os = "linux")]
+    #[serde(rename = "icmp-timeout", default)]
+    icmp_timeout: i64,
+    #[cfg(target_os = "linux")]
+    #[serde(rename = "disable-icmp-forwarding", default)]
+    disable_icmp_forwarding: bool,
 }
 
 impl RawTunConfig {
@@ -1510,6 +1524,17 @@ impl RawTunConfig {
         } else {
             self.udp_timeout
         });
+        #[cfg(target_os = "linux")]
+        let icmp_timeout = {
+            let seconds = u64::try_from(self.icmp_timeout).map_err(|_| {
+                VoleError::InvalidConfig("tun.icmp-timeout must be nonnegative seconds".into())
+            })?;
+            let timeout = Duration::from_secs(if seconds == 0 { 10 } else { seconds });
+            if std::time::Instant::now().checked_add(timeout).is_none() {
+                return invalid("tun.icmp-timeout exceeds the clock range");
+            }
+            timeout
+        };
         Ok(TunConfig {
             network: tun_network::RawTunNetworkConfig {
                 inet6_address: self.inet6_address,
@@ -1540,6 +1565,10 @@ impl RawTunConfig {
             device: self.device,
             dns_hijack,
             udp_timeout,
+            #[cfg(target_os = "linux")]
+            icmp_timeout,
+            #[cfg(target_os = "linux")]
+            disable_icmp_forwarding: self.disable_icmp_forwarding,
         })
     }
 }
@@ -5967,6 +5996,54 @@ authentication:
             );
             assert_eq!(config.tun.mtu, 9000);
             assert_eq!(config.tun.udp_timeout, Duration::from_secs(300));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_icmp_options_normalize_and_use_the_existing_reconnect_boundary() {
+        let baseline = Config::parse_yaml(b"tun: {enable: true}").unwrap();
+        assert_eq!(baseline.tun.icmp_timeout, Duration::from_secs(10));
+        assert!(!baseline.tun.disable_icmp_forwarding);
+        for (fields, seconds, disabled, compatible) in [
+            ("icmp-timeout: 0", 10, false, true),
+            ("icmp-timeout: 7", 7, false, false),
+            ("disable-icmp-forwarding: true", 10, true, false),
+        ] {
+            let yaml = format!("tun:\n  enable: true\n  {fields}\n");
+            let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            assert_eq!(config.tun.icmp_timeout, Duration::from_secs(seconds));
+            assert_eq!(config.tun.disable_icmp_forwarding, disabled);
+            assert_eq!(
+                live_update::startup_compatible(&baseline, &config),
+                compatible
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_icmp_options_reject_negative_and_unrepresentable_timeouts() {
+        for (seconds, reason) in [
+            ("-1", "nonnegative"),
+            ("9223372036854775807", "clock range"),
+            ("9223372036854775808", ""),
+        ] {
+            let yaml = format!("tun:\n  icmp-timeout: {seconds}\n");
+            let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
+            if !reason.is_empty() {
+                assert!(error.to_string().contains(reason), "{error}");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn tun_icmp_options_are_unknown_without_the_linux_consumer() {
+        for fields in ["icmp-timeout: 0", "disable-icmp-forwarding: false"] {
+            let yaml = format!("tun:\n  {fields}\n");
+            let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
         }
     }
 

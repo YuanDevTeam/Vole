@@ -27,6 +27,10 @@ Windows的UWP/Wintun feature互斥，应明确选择后端，不使用`--all-fea
 TUN 网络计划（纯内存，不查询宿主路由或创建接口）：`config::tun_network::tests::`、
 `platform::linux_network::plan::tests::`、`platform::linux_network::tests::`；
 Linux 目标的报文编码：`platform::linux_network::netlink::tests::`。
+ICMP 配置的纯内存过滤器：`config::tests::tun_icmp_options_`；Linux 覆盖默认/零值、
+实际秒值、禁用与现有重连门禁，以及负值/时钟范围/整数溢出拒绝；其他平台验证未知字段拒绝。
+Linux Echo 所有权用 `tun_runtime::echo::tests::`，netstack 编解码用 `echo::tests::`；
+不打开物理 ping socket，不代替实际 TUN、物理源、校验和、权限与 Stop 验证。
 被动 TCP 的 PMTU 与兄弟流：netstack 集成过滤器
 `passive_tun_pmtu_resegments_only_live_sent_tcp_and_preserves_siblings`。
 

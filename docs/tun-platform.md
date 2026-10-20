@@ -85,7 +85,7 @@ Unix 读缓冲区和公共批次容器复用；非法包只丢该槽位，不丢
 共享 UDP 入站中转队列。TCP/ICMP 使用独立有界 ingress；满时丢当前完整 IP 包并
 计数，TCP 可重传，不等待容量而阻塞其他来源的 UDP/DNS。
 
-唯一 writer 公平轮转 TCP/ICMP raw、普通 UDP 响应和 DNS 响应三个独立通道。
+唯一 writer 公平轮转 TCP/ICMP raw、普通 UDP 响应和 DNS 响应；Linux 真实 Echo 另有独立有界通道。
 UDP 直接在复用的 MTU frame 中构包，不再经过 response writer 和 raw output
 的二次交接；每批最多处理 8 个已就绪项目，非法响应也消耗工作预算。DNS permit
 保留到对应包被平台接受、最终丢弃或取消，ENOBUFS 待重试时不释放；Windows
@@ -186,6 +186,25 @@ UID/端口的显式旁路仍生效。它不代替宿主防火墙、权限设置�
 这些自动设置仅用于 Core 自建 Linux TUN 且 `auto-route: true` 的路径。
 借用 fd 与 Apple/Android/UWP/Wintun 的接口地址、捕获范围、DNS 和权限由宿主应用；
 Core 不修改借用接口或将跨平台解析成功视为系统网络配置完成。
+
+## Linux 物理 ICMP Echo
+
+Linux 的真实 Echo 在公共 TUN reader 进入 netstack 前分流，复用共享 Dialer 的受控物理出口，
+只走 DIRECT，不解释 TCP/UDP 代理图。`tun.icmp-timeout` 缺省或 0 为 10 秒；
+`disable-icmp-forwarding` 缺省 false。两个字段只在 Linux 配置中存在，其他平台拒绝未知字段并保留原本地合成行为。
+归一化后的 timeout 或 disable 变化由整个 TunConfig 的现有重连门禁处理。
+
+真实 TUN 地址前缀在启动时从实际接口及其 network namespace 读取；这些前缀、启用的 fake-IP 池
+及禁用转发的合法 Echo 使用原本地回应。物理失败、权限不足或容量不足不合成成功。
+Linux 通过普通 DGRAM ping socket 收发 IPv4/IPv6，安装器或宿主须预先用
+`net.ipv4.ping_group_range` 授权运行组；现有 TUN 所需 CAP_NET_ADMIN 不替代此授权。
+Core 不改 sysctl、不运行提权命令、不回退 IP raw socket，也不修改借用 TUN 的地址、路由或 fd 标志。
+
+一个驱动最多持有每族一个物理 ping socket、合计 64 个请求许可，入站/响应队列各 8 项；
+真实包上限为 `min(tun.mtu, 2048)`，发送后的 pending 只留元数据与摘要。
+答复验证实际物理源地址、校验和、标识、长度、摘要和期限后，由现有唯一 TUN writer 公平写回。
+Stop 取消并等待全部所有者，清理 pending、队列、许可和 ping socket；停止后不得再回包。
+详细输入和合成边界见 [ICMP 契约](tun-icmp-dns.md#icmp-echo)。
 
 ## Windows Wintun
 

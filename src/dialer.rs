@@ -1,9 +1,9 @@
 #[path = "dialer_connections.rs"]
 mod connections;
-#[cfg(all(feature = "tun", all(target_os = "linux", feature = "interop-test")))]
+#[cfg(all(feature = "tun", target_os = "linux"))]
 #[path = "dialer_ping.rs"]
 mod ping;
-#[cfg(all(feature = "tun", all(target_os = "linux", feature = "interop-test")))]
+#[cfg(all(feature = "tun", target_os = "linux"))]
 pub(crate) use ping::{PhysicalPing, PingReceipt};
 #[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
 #[path = "dialer_windows.rs"]

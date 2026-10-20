@@ -1,6 +1,6 @@
 # TUN ICMP 与 DNS
 
-Vole 在 TUN netstack 内回答受支持的 ICMP Echo Request。启用运行时 DNS 后，匹配 `tun.dns-hijack` 的 TUN TCP/UDP、选路惰性解析和内部查询共享同一套有界 DNS 实现。
+Vole 在公共 TUN 入口处理 ICMP Echo：Linux 可经受控物理接口实际发送，接口内地址、fake-IP 与禁用转发的请求保留本地合成回应；其他平台保持 netstack 本地回应。启用运行时 DNS 后，匹配 `tun.dns-hijack` 的 TUN TCP/UDP、选路惰性解析和内部查询共享同一套有界 DNS 实现。
 
 顶层 `ipv6: false` 时，IPv6 原始包会在进入 netstack 前被丢弃，因此不会触发 ICMPv6 回应或 IPv6 上的 DNS/业务流量；运行时 DNS 的有效 IPv6 能力同时要求顶层 `ipv6` 和 `dns.ipv6` 为 `true`。
 
@@ -11,18 +11,40 @@ Vole 在 TUN netstack 内回答受支持的 ICMP Echo Request。启用运行时 
 | IPv4 | type 8, code 0 | type 0, code 0 |
 | IPv6 | type 128, code 0 | type 129, code 0 |
 
-响应会交换源地址和目标地址，保留 identifier、sequence 和 payload，重建最小 IP 头，将 TTL/Hop Limit 设为 64，并重新计算所有校验和。该路径完全位于 netstack 内，不调用 DNS、规则、出站、protect 或物理接口。
+Linux 的 `tun.disable-icmp-forwarding` 缺省 false。合法 Echo Request 按以下方式处理：
 
-输入要求：
+- 目标属于启动时读取的真实 TUN 接口地址前缀，或属于启用的 fake-IP 地址池时，由 netstack 本地合成回应；借用 TUN 的前缀从其所属网络 namespace 读取，不以配置的设备名或任意物理 LAN 网段代替。
+- `disable-icmp-forwarding: true` 时，所有合法 Echo 保留本地回应，不打开物理 ping socket；合成耗时不代表目标的真实 RTT。
+- 其余请求经共享 Dialer 的 DIRECT 物理出口发送，不执行 DNS、普通 TCP/UDP 规则、代理节点或组，也不声称普通代理协议可以承载 ICMP。
 
-- 校验 IP 版本、头长度、声明长度、地址和校验和；
-- IPv4 可以携带合法 options，但响应不复制 options；
-- 不重组 IPv4 分片或 IPv6 Fragment Header；
-- IPv6 base Next Header 必须直接是 ICMPv6；
-- 非 Echo、非零 code、截断和非单播地址一律丢弃；
-- 单包失败不停止 netstack，也不生成 ICMP error。
+`tun.icmp-timeout` 单位为整数秒，缺省或 0 使用 10 秒，控制请求准入至物理答复匹配的期限。
+负值、超出有符号 64 位的整数及本机单调时钟无法表示的期限均拒绝，不复制 Duration 溢出。
+这两个字段仅 Linux 接受；其他平台将其视为未知字段，保持原本地合成行为。
+运行中改变归一化后的值须显式重连，沿用现有配置应用门禁，不增加独立控制 API。
 
-smoltcp 负责生成 Echo Reply，Vole 负责更严格的输入分类和运行时门禁。响应直接尝试进入现有原始包出站队列；队列满时只丢当前低优先级响应并更新统计，不创建等待任务或积压队列。
+真实请求先经过 IP 长度、单播地址、IPv4 头及 ICMP 校验和验证；IPv6 校验包含实际地址的伪头。
+IPv4 可携带合法 options，但不重组分片；IPv6 base Next Header 必须直接为 ICMPv6，不处理扩展首部链。
+已识别的非法 Echo、非零 code、截断、分片或不支持的形状直接丢弃，不回退到自动合成。
+非 Echo 与既有可验证 PMTU 仍交给原 netstack 路径，不将物理错误解释为成功。
+
+真实 TUN 前缀快照读取失败时启动失败；显式禁用转发时不读取该快照。
+Linux 使用 `SOCK_DGRAM` ping socket；安装器或宿主须预先在相应出口 network namespace 中，
+通过 `net.ipv4.ping_group_range` 授权运行组。Core 不写 sysctl、不请求提权，也不回退 IP raw socket。
+创建、源地址、protect、物理接口与 mark 均复用共享 Dialer 的初始化和停止所有者。
+权限不足、出口错误、不可达、超时或容量不足只丢弃相应真实请求，不伪造本地成功。
+
+每会话最多两个物理 ping socket（每地址族一个），由一个驱动收发；不按目标创建任务或长期 socket。
+真实请求总共最多持有 64 个许可，入站与响应队列各 8 项，单个完整 IP 包最多 `min(tun.mtu, 2048)` 字节。
+发送后 pending 只保留地址、原始与 wire identifier/sequence、长度、SHA-256 摘要、期限和许可，不保留 payload。
+物理答复须携带有效接收接口与本地地址元数据，并匹配实际对端、校验和、wire 标识、长度、摘要及未过期记录；重复或不匹配答复丢弃。
+到期、发送失败、队列满或取消均释放对应所有权；不增加重传、无界目标表或待发送积压。
+这些是局部资源边界，不是进程 RSS 上限。
+
+真实答复和本地合成答复均恢复原 TUN 请求的 identifier、sequence、地址方向与 payload，
+重建最小 IP 头、TTL/Hop Limit 64 及校验和。本地合成继续使用 netstack 的原有 MTU 和有界 raw 出站队列，
+不受真实转发的 2048 字节上限限制。真实答复进入独立有界通道，与 TCP/raw、UDP、DNS 共用唯一 TUN writer；
+许可保留到写入完成、最终丢弃或取消。Stop 取消并等待驱动、reader 与 writer，释放 pending、队列和物理 socket；
+返回后不再向 TUN 回包。上述物理路径仅限 Linux，不扩展其他平台的权限或网络设置职责。
 
 TUN 的被动 TCP 与 MASQUE 的内部主动客户端均支持 ICMP PMTU 反馈：验证外层校验和、本地地址、
 被引用的活动 TCP tuple 及实际发送且尚未确认的序号，只降低对应连接的 MTU并重新分段。
@@ -384,7 +406,7 @@ Controller 切换代理组后，只在后续需要创建新 DNS transport 时使
 
 reader 在进入 TCP netstack 前分流 UDP，拥有按源地址建立的关联表，没有共享 UDP 入站接收器或独立 DNS 请求准入数。每普通 UDP 关联有独立请求队列；DNS 查询继续提交受跟踪的任务，不等待上游。入站或 DNS 响应队列满时只丢当前数据报，不阻塞 reader。普通响应队列满时，每源关联最多暂持一个已接收响应并暂停继续接收，等待容量期间仍可发送请求或取消，不增加任务；取消或错误时丢弃未提交响应。TCP accept 仍为 128 项。TUN UDP 响应按有效 MTU 减去 48 字节保守限制；默认 9000 MTU 时为 8,952 字节；显式 1500 为 1,452 字节，Windows UWP 使用 1400 时为 1,352 字节。
 
-唯一受跟踪的 TUN writer 公平读取普通 UDP、DNS 和 TCP/ICMP raw 三个通道，任一通道关闭不丢弃其他通道的待写响应。UDP 构包后直接写平台，不再转发到共享 raw output。DNS 查询观测 permit 保留至该包被平台接受、最终丢弃或取消，写回阻塞和 ENOBUFS 重试不提前释放；WinRT Adapter 成功处理不等于框架最终交付。MTU/地址族错误只丢当前响应。
+唯一受跟踪的 TUN writer 公平读取普通 UDP、DNS 和 TCP/ICMP raw 通道，Linux 的真实 Echo 使用第四个有界通道；任一通道关闭不丢弃其他通道的待写响应。UDP 构包后直接写平台，不再转发到共享 raw output。DNS 查询观测 permit 保留至该包被平台接受、最终丢弃或取消，写回阻塞和 ENOBUFS 重试不提前释放；WinRT Adapter 成功处理不等于框架最终交付。MTU/地址族错误只丢当前响应。
 
 运行时停止会取消 open、send、receive、retry 和 response-send，释放全部传输并等待已跟踪任务结束。停止返回后不得再向 TUN 回包。
 
@@ -412,7 +434,7 @@ Running Session上下文仅弱引用本 session 的 RuntimeDns；业务 IP-only 
 
 ## 不支持
 
-- 真实 ICMP 转发、PMTU 以外的 ICMP error、Traceroute、ICMP 选路规则或 ICMP 测速；
+- Linux Echo 以外的真实 ICMP 转发、PMTU 以外的 ICMP error、Traceroute、ICMP 选路规则或 ICMP 测速；
 - 运行中随接口变化自动刷新 hosts: lan；
 - 用户可配置的查询总超时、重试或并发度；
 - 使用 DNS question 执行业务规则，或用 DNS 出口改写后续业务动作。

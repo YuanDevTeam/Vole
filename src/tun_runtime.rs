@@ -41,24 +41,21 @@ use crate::{
     traffic::TunTrafficStats,
 };
 
-#[cfg(all(target_os = "linux", feature = "interop-test"))]
+#[cfg(target_os = "linux")]
 #[path = "tun_echo.rs"]
 mod echo;
-#[cfg(all(target_os = "linux", feature = "interop-test"))]
+#[cfg(target_os = "linux")]
 use echo::EchoIngress;
-#[cfg(not(all(target_os = "linux", feature = "interop-test")))]
+#[cfg(not(target_os = "linux"))]
 struct EchoIngress;
-#[cfg_attr(
-    not(all(target_os = "linux", feature = "interop-test")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EchoOffer {
     NotEcho,
     LocalSynthetic,
     Consumed,
 }
-#[cfg(not(all(target_os = "linux", feature = "interop-test")))]
+#[cfg(not(target_os = "linux"))]
 impl EchoIngress {
     fn offer(&self, _: &[u8]) -> EchoOffer {
         EchoOffer::NotEcho
@@ -124,7 +121,7 @@ pub(crate) struct TunRuntime {
     fake_icmp_echo: bool,
     sniffer: Option<Arc<SnifferConfig>>,
     traffic_stats: Arc<TunTrafficStats>,
-    #[cfg(all(target_os = "linux", feature = "interop-test"))]
+    #[cfg(target_os = "linux")]
     echo_options: Option<echo::EchoOptions>,
 }
 
@@ -189,7 +186,7 @@ impl TunRuntime {
             fake_icmp_echo,
             sniffer,
             traffic_stats,
-            #[cfg(all(target_os = "linux", feature = "interop-test"))]
+            #[cfg(target_os = "linux")]
             echo_options: None,
         })
     }
@@ -207,7 +204,7 @@ impl TunRuntime {
         self
     }
 
-    #[cfg(all(target_os = "linux", feature = "interop-test"))]
+    #[cfg(target_os = "linux")]
     pub(crate) async fn with_real_echo(
         mut self,
         dialer: crate::dialer::Dialer,
@@ -240,7 +237,7 @@ impl TunRuntime {
         let control = parts.control.clone();
         let netstack_stats = parts.stats.clone();
         let mut tasks = JoinSet::new();
-        #[cfg(all(target_os = "linux", feature = "interop-test"))]
+        #[cfg(target_os = "linux")]
         let (echo, echo_responses) = if let Some(options) = self.echo_options {
             let (ingress, responses, driver) =
                 echo::channel(options, effective_tun_mtu(self.limits));
@@ -249,7 +246,7 @@ impl TunRuntime {
         } else {
             (None, closed_echo_lane())
         };
-        #[cfg(not(all(target_os = "linux", feature = "interop-test")))]
+        #[cfg(not(target_os = "linux"))]
         let (echo, echo_responses): (Option<EchoIngress>, _) = (None, closed_echo_lane());
         let (udp, responses, dns_responses) = UdpIngress::new(
             UdpIngressContext {

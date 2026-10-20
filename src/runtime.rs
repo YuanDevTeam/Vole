@@ -691,7 +691,7 @@ impl PreparedCore {
             traffic_stats.clone(),
         )?
         .with_resources(control);
-        #[cfg(all(target_os = "linux", feature = "interop-test"))]
+        #[cfg(target_os = "linux")]
         let tun_runtime = tun_runtime
             .with_real_echo(
                 proxy_graph.dialer.clone(),
@@ -704,8 +704,8 @@ impl PreparedCore {
                         .filter(|_| self.config.dns.fake_ip.enabled)
                         .map(|range| range.cidr)
                 }),
-                std::time::Duration::from_secs(10),
-                false,
+                self.config.tun.icmp_timeout,
+                self.config.tun.disable_icmp_forwarding,
             )
             .await?;
         RunningCore::start_components(

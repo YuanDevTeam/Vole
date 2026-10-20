@@ -74,7 +74,8 @@ pub(crate) struct EchoIngress {
 }
 impl EchoIngress {
     // Nonblocking: physical failures/pressure are consumed and cannot become
-    // synthetic successful replies. Invalid/non-Echo packets keep the old path.
+    // synthetic successful replies. Recognized invalid Echo is consumed; genuine
+    // non-Echo/error packets keep the existing netstack path.
     pub(crate) fn offer(&self, packet: &[u8]) -> EchoOffer {
         let view = match classify_echo_request(packet) {
             EchoPacketClass::NotEcho => return EchoOffer::NotEcho,
