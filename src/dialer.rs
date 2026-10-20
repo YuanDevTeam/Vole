@@ -5,6 +5,14 @@ mod connections;
 mod ping;
 #[cfg(all(feature = "tun", target_os = "linux"))]
 pub(crate) use ping::{PhysicalPing, PingReceipt};
+#[cfg(target_os = "linux")]
+#[path = "dialer_fast_open.rs"]
+mod fast_open;
+#[cfg(all(target_os = "linux", test, feature = "tun"))]
+#[path = "dialer_mptcp_gate.rs"]
+mod mptcp_gate;
+#[path = "dialer_server_tcp.rs"]
+mod server_tcp;
 #[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
 #[path = "dialer_windows.rs"]
 mod windows_egress;
@@ -382,6 +390,7 @@ struct InterfaceBinding {
 
 #[derive(Clone)]
 pub struct Dialer {
+    tfo: bool,
     egress: crate::config::EgressOptions,
     dns_sources: Arc<crate::dns::source::NetworkSources>,
     dns_binding: Option<crate::dns::source::DnsBinding>,
@@ -411,6 +420,7 @@ impl std::fmt::Debug for Dialer {
         #[cfg(all(windows, feature = "windows-uwp"))]
         debug.field("interface_binding", &self.interface_binding);
         debug
+            .field("tfo", &self.tfo)
             .field("ipv6", &self.ipv6)
             .field("connect_timeout", &self.connect_timeout)
             .finish()
@@ -420,6 +430,7 @@ impl std::fmt::Debug for Dialer {
 impl Default for Dialer {
     fn default() -> Self {
         Self {
+            tfo: false,
             egress: Default::default(),
             dns_sources: Arc::new(crate::dns::source::NetworkSources::default()),
             dns_binding: None,
@@ -696,6 +707,12 @@ impl Dialer {
         policy: Arc<crate::platform::linux_network::SocketPolicy>,
     ) -> Self {
         self.linux_policy = Some(policy);
+        self
+    }
+
+    /// Exact node policy: false does not inherit another node's TFO setting.
+    pub(crate) fn with_tfo(mut self, tfo: bool) -> Self {
+        self.tfo = tfo;
         self
     }
 
@@ -1061,7 +1078,62 @@ impl Dialer {
         Ok(())
     }
 
+    // Returns explicitly pending single-address I/O and the converted physical
+    // address. Ordinary connect()/address races keep their eager TCP contract.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn prepare_tcp_fast_open(
+        &self,
+        address: SocketAddr,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<(ObservedIo<fast_open::PendingFastOpen>, SocketAddr)> {
+        let deadline = deadline.min(tokio::time::Instant::now() + self.connect_timeout);
+        let operation = async {
+            let (socket, guard, address) = self.prepare_tcp_socket(address).await?;
+            let stream = tokio_tfo::TfoStream::connect_with_socket(socket, address).await?;
+            stream.set_nodelay(true)?;
+            let stream = fast_open::PendingFastOpen::new(stream, deadline, &self.initialization)?;
+            Ok((ObservedIo::with_guard(stream, guard), address))
+        };
+        tokio::select! {
+            biased;
+            () = self.initialization.cancellation.cancelled() => Err(socket_initialization_cancelled()),
+            result = tokio::time::timeout_at(deadline, operation) => {
+                result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))?
+            }
+        }
+    }
+
     async fn connect_one(&self, address: SocketAddr) -> io::Result<PhysicalStream> {
+        let (socket, guard, address) = self.prepare_tcp_socket(address).await?;
+        let stream = timeout(self.connect_timeout, socket.connect(address))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
+        stream.set_nodelay(true)?;
+        Ok(ObservedIo::with_guard(stream, guard))
+    }
+
+    async fn prepare_tcp_socket(
+        &self,
+        address: SocketAddr,
+    ) -> io::Result<(TcpSocket, crate::resources::observation::Guard, SocketAddr)> {
+        self.prepare_tcp_socket_with(address, |ipv6| {
+            if ipv6 {
+                TcpSocket::new_v6()
+            } else {
+                TcpSocket::new_v4()
+            }
+        })
+        .await
+    }
+
+    async fn prepare_tcp_socket_with<F>(
+        &self,
+        address: SocketAddr,
+        create: F,
+    ) -> io::Result<(TcpSocket, crate::resources::observation::Guard, SocketAddr)>
+    where
+        F: FnOnce(bool) -> io::Result<TcpSocket> + Send + 'static,
+    {
         let address = self.connected_address(address)?;
         self.validate_egress()?;
         let ipv6 = address.is_ipv6();
@@ -1070,11 +1142,7 @@ impl Dialer {
         let (socket, guard) = self
             .initialization
             .run(move |check| {
-                let socket = if ipv6 {
-                    TcpSocket::new_v6()?
-                } else {
-                    TcpSocket::new_v4()?
-                };
+                let socket = create(ipv6)?;
                 let guard = track(ResourceKind::Socket);
                 check()?;
                 dialer.connections.apply(&socket2::SockRef::from(&socket))?;
@@ -1093,11 +1161,7 @@ impl Dialer {
                 Ok((socket, guard))
             })
             .await?;
-        let stream = timeout(self.connect_timeout, socket.connect(address))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
-        stream.set_nodelay(true)?;
-        Ok(ObservedIo::with_guard(stream, guard))
+        Ok((socket, guard, address))
     }
 
     #[cfg(unix)]

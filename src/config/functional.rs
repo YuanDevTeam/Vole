@@ -12,7 +12,10 @@ pub(super) fn validate_fields(mapping: &serde_yaml_ng::Mapping) -> Result<()> {
     for key in mapping.keys().filter_map(serde_yaml_ng::Value::as_str) {
         let accepted = matches!(key, "name" | "type")
             || (kind == "direct"
-                && matches!(key, "interface-name" | "routing-mark" | "ip-version"))
+                && matches!(
+                    key,
+                    "interface-name" | "routing-mark" | "ip-version" | "tfo"
+                ))
             || (kind == "rematch" && matches!(key, "target-rematch-name" | "target-sub-rule"));
         if !accepted {
             return invalid("unsupported functional outbound field");
@@ -152,6 +155,21 @@ rules: ['REMATCH-NAME,blue/Green,DIRECT', 'MATCH,selected']
             .unwrap();
         assert_eq!(config.proxies, fresh.proxies);
         assert_eq!(config.rules, fresh.rules);
+    }
+
+    #[test]
+    fn node_tfo_is_explicit_and_does_not_inherit_across_proxy_chain() {
+        let config = Config::parse_yaml(
+            br#"proxies:
+  - {name: leaf, type: socks5, server: 192.0.2.1, port: 1080, tfo: true, dialer-proxy: hop}
+  - {name: hop, type: socks5, server: 192.0.2.2, port: 1080}
+  - {name: local, type: direct, tfo: true}
+"#,
+        )
+        .unwrap();
+        assert!(config.proxies[0].tfo);
+        assert!(!config.proxies[1].tfo);
+        assert!(config.proxies[2].tfo);
     }
 
     #[test]

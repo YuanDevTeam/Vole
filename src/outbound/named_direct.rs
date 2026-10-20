@@ -42,11 +42,15 @@ impl OutboundConnector for NamedDirectOutbound {
             .resolve_direct(&session.destination, context.deadline())
             .await?;
         let stream = context
-            .run_io("direct TCP connect", self.dialer.connect(&endpoint))
+            .run_io(
+                "direct TCP connect",
+                self.dialer
+                    .connect_server_tcp(&endpoint, context.deadline()),
+            )
             .await?;
-        let effective_peer = Destination::Ip(stream.peer_addr().map_err(DispatchError::from)?);
+        let effective_peer = Destination::Ip(stream.address);
         Ok(ConnectedStream {
-            io: Box::new(stream),
+            io: stream.io,
             effective_peer,
         })
     }

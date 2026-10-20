@@ -24,6 +24,14 @@ Windows的UWP/Wintun feature互斥，应明确选择后端，不使用`--all-fea
 
 ## 定向回归
 
+TFO 纯内存策略与生命周期：
+`config::functional::tests::node_tfo_is_explicit_and_does_not_inherit_across_proxy_chain`、
+`config::providers::tests::provider_tfo_override_preserves_false_and_materializes_exact_node_policy`、
+Linux `dialer::server_tcp::tests::` 和 `dialer::fast_open::tests::`。
+`dialer::fast_open::gate::real_tun_private_tfo_gate` 为显式 ignored 容器驱动，
+实际 SYN-data、首读/空写/半关闭、源绑定/protect、建链期限与 Stop 须由 Linux 真实 TUN 验证。
+这些内存过滤器不证明内核 Fast Open 或其它平台行为。
+
 TUN 网络计划（纯内存，不查询宿主路由或创建接口）：`config::tun_network::tests::`、
 `platform::linux_network::plan::tests::`、`platform::linux_network::tests::`；
 Linux 目标的报文编码：`platform::linux_network::netlink::tests::`。

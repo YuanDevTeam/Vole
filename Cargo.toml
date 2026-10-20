@@ -186,6 +186,10 @@ zstd = { version = "0.14.0", default-features = false }
 [target.'cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))'.dependencies]
 oslog = { version = "0.2", default-features = false }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Public socket adapter; shared Dialer retains protection, deadlines and Stop.
+tokio-tfo = "=0.4.3"
+
 [target.'cfg(unix)'.dependencies]
 # Keep one Cargo dependency name across target tables. Unix compiles this small
 # adapter dependency; platform I/O remains gated by the tun feature.

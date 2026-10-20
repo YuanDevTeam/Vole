@@ -4134,6 +4134,7 @@ dependencies = [
  "tokio",
  "tokio-boring",
  "tokio-rustls",
+ "tokio-tfo",
  "tokio-tungstenite",
  "tokio-util",
  "tracing",

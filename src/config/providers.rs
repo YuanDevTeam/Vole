@@ -141,6 +141,7 @@ impl ProviderSpec {
         for key in self.overrides.keys() {
             if ![
                 "ip-version",
+                "tfo",
                 "interface-name",
                 "routing-mark",
                 "udp",
@@ -833,7 +834,7 @@ fn validate_overrides(overrides: &BTreeMap<String, Value>) -> Result<()> {
             "routing-mark" => value
                 .as_i64()
                 .is_some_and(|mark| EgressOptions::normalize(String::new(), mark).is_ok()),
-            "udp" | "udp-over-tcp" | "skip-cert-verify" => value.is_bool(),
+            "tfo" | "udp" | "udp-over-tcp" | "skip-cert-verify" => value.is_bool(),
             "override-expr" => value
                 .as_sequence()
                 .is_some_and(|values| values.iter().all(Value::is_string)),
@@ -1091,6 +1092,31 @@ proxy-groups:
                 .materialize_with_cancel(&ProviderContents::new(), Some(&cancelled))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn provider_tfo_override_preserves_false_and_materializes_exact_node_policy() {
+        for enabled in [false, true] {
+            let yaml = format!(
+                r#"proxy-providers:
+  nodes:
+    type: inline
+    override: {{tfo: {enabled}}}
+    payload:
+      - {{name: local, type: direct, tfo: true}}
+      - {{name: remote, type: socks5, server: 192.0.2.1, port: 1080}}
+"#,
+            );
+            let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            assert!(config.proxies.iter().all(|node| node.tfo == enabled));
+            let fresh = config
+                .providers
+                .as_ref()
+                .unwrap()
+                .materialize(&ProviderContents::new())
+                .unwrap();
+            assert_eq!(config.proxies, fresh.proxies);
+        }
     }
 
     #[test]

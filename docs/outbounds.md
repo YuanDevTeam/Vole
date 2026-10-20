@@ -21,6 +21,12 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   和健康检查继续使用当前运行图的受控出口，不建立额外裸 socket。
 - `dialer-proxy` 省略/空串使用物理 Dialer，也可指定 DIRECT、COMPATIBLE 或引用节点、策略组；与业务路由共享选择，完整 DAG 在配置期验证。
   一次建链使用组快照和同一绝对期限；已有连接不随切组迁移，无自动 failover 或 DIRECT 回落。
+- 节点 `tfo` 缺省 false，具名 direct 同样可用。Linux 在只剩一个允许的物理 TCP 地址时
+  使用 TCP Fast Open；多地址保留普通串行/并发建链，其他系统使用普通受控 TCP。
+  代理链由实际物理首跳消费自己的 `tfo`，组选择 DIRECT 时使用当前节点值；不影响原生 UDP。
+  TFO 不把尚未连接的 socket 当成地址竞速赢家；实际地址来自同一出口校验/转换，
+  首读、空写、flush 和零上传半关闭也推进握手，并保留同一建链期限与同步 Stop。
+  不缓存、重新拨号或重放已接受的业务字节。Provider 同名覆盖保留显式 false。
 - 普通协议节点和具名 direct 的 `ip-version` 为 `dual`（默认）、`ipv4`、`ipv6`、`ipv4-prefer` 或 `ipv6-prefer`。
   限制或排序该节点的物理服务器地址与本地解析结果，仍受全局 IPv6 开关约束。
   不要求远端代理按相同地址族解析业务域名。

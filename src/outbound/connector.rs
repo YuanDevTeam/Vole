@@ -709,12 +709,14 @@ impl UpstreamPath {
             ResolvedUpstream::Direct(endpoint, dialer) => {
                 validate_prepared_endpoint(server, endpoint)?;
                 let stream = context
-                    .run_io("physical proxy-server connect", dialer.connect(endpoint))
+                    .run_io(
+                        "physical proxy-server connect",
+                        dialer.connect_server_tcp(endpoint, context.deadline()),
+                    )
                     .await?;
-                let effective_peer =
-                    Destination::Ip(stream.peer_addr().map_err(DispatchError::from)?);
+                let effective_peer = Destination::Ip(stream.address);
                 Ok(ConnectedStream {
-                    io: Box::new(stream),
+                    io: stream.io,
                     effective_peer,
                 })
             }
@@ -727,12 +729,14 @@ impl UpstreamPath {
                     .resolve_proxy(server, context.deadline)
                     .await?;
                 let stream = context
-                    .run_io("physical proxy-server connect", dialer.connect(&endpoint))
+                    .run_io(
+                        "physical proxy-server connect",
+                        dialer.connect_server_tcp(&endpoint, context.deadline()),
+                    )
                     .await?;
-                let effective_peer =
-                    Destination::Ip(stream.peer_addr().map_err(DispatchError::from)?);
+                let effective_peer = Destination::Ip(stream.address);
                 Ok(ConnectedStream {
-                    io: Box::new(stream),
+                    io: stream.io,
                     effective_peer,
                 })
             }
