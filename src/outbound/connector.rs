@@ -261,7 +261,26 @@ impl EstablishContext {
         }
     }
 
-    #[cfg(any(feature = "outbound-wireguard", feature = "outbound-hysteria2"))]
+    /// A positive Hysteria2 timeout belongs to its shared offer, not to the
+    /// first caller waiting for it. Preserve already selected upstreams.
+    #[cfg(feature = "outbound-hysteria2")]
+    pub(crate) fn hysteria2_handshake(&self, timeout: Duration) -> Result<Self, DispatchError> {
+        Ok(Self {
+            deadline: Instant::now()
+                .checked_add(timeout)
+                .ok_or(DispatchError::TimedOut)?,
+            resolution: self.resolution.clone(),
+            selections: Arc::new(Mutex::new(
+                self.selections
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            )),
+            inbound: self.inbound.clone(),
+        })
+    }
+
+    #[cfg(feature = "outbound-wireguard")]
     pub(crate) fn capped_by(mut self, deadline: Instant) -> Self {
         self.deadline = self.deadline.min(inherited_deadline(deadline));
         self

@@ -82,8 +82,8 @@ QUIC 使用官方 Quinn 固定 Middle 接收窗口：每流为 max(initial, min(
 无法编码的 initial 明确拒绝；credit 通告沿 Quinn 原生实现。
 HY2 默认每流 64 KiB、连接 initial 4 MiB，优先多流公平性与接收驻留；
 较高 RTT 的单流可显式增大窗口，配置不按这些默认值钳位。
-HY2 正 handshake-timeout 与 Core 原期限合并；参考正值后台 offer 的生命周期可能超出
-单次调用期限，该差异保留。TUIC max-open-streams=1 接受但实际不能取得业务所有权；
+HY2 正 handshake-timeout 的共享建链由节点持有，单次调用退出不会提前销毁它；
+每个等待调用仍受自己的期限约束，失败与 Stop 等待驱动清理。TUIC max-open-streams=1 接受但实际不能取得业务所有权；
 frame 无法容纳 TUIC 头时可解析，业务 UDP 发送失败，不额外拒绝TCP配置。支持模式的互通与窗口增大后的 RSS/吞吐/UDP loss 不由
 这些内存 fixture 证明，由最终 CLI/container 对照分别记录。
 

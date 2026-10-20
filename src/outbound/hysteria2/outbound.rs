@@ -24,7 +24,7 @@ use std::{
 };
 use tokio::{
     io::AsyncWriteExt,
-    sync::{Mutex as AsyncMutex, oneshot},
+    sync::{Mutex as AsyncMutex, watch},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -36,7 +36,7 @@ pub struct Hysteria2Outbound {
     upstream: UpstreamPath,
     tls: StandardTlsClient,
     realm_tls: Option<StandardTlsClient>,
-    current: Box<[AsyncMutex<Option<Arc<Session>>>]>,
+    current: Box<[AsyncMutex<Option<Arc<Handshake>>>]>,
     pacer: Arc<super::bandwidth::Pacer>,
     cancel: CancellationToken,
     admission: Mutex<()>,
@@ -52,6 +52,76 @@ struct Session {
     bandwidth: Arc<super::bandwidth::Bandwidth>,
 }
 
+#[derive(Clone)]
+enum Ready {
+    Pending,
+    Open(Arc<Session>),
+    Failed(Arc<DispatchError>),
+}
+
+/// A slot retains its offer even when every waiting call has gone away. The
+/// driver owns publication and holds no Handshake Arc, so there is no cycle.
+struct Handshake {
+    cancel: CancellationToken,
+    ready: watch::Receiver<Ready>,
+}
+
+impl Handshake {
+    fn initializing(&self) -> bool {
+        matches!(*self.ready.borrow(), Ready::Pending)
+    }
+
+    fn finished(&self) -> bool {
+        matches!(*self.ready.borrow(), Ready::Failed(_))
+    }
+
+    async fn wait_ready(&self) -> Result<Arc<Session>, DispatchError> {
+        let mut ready = self.ready.clone();
+        loop {
+            let state = ready.borrow_and_update().clone();
+            match state {
+                Ready::Open(session) => {
+                    if session.cancel.is_cancelled() || session.connection.close_reason().is_some()
+                    {
+                        return Err(DispatchError::ConnectionRefused);
+                    }
+                    return Ok(session);
+                }
+                Ready::Failed(error) => return Err(copy_failure(&error)),
+                Ready::Pending => {}
+            }
+            if ready.changed().await.is_err() {
+                return Err(DispatchError::ConnectionRefused);
+            }
+        }
+    }
+}
+
+struct CreationGuard<'a> {
+    handshake: &'a Handshake,
+    armed: bool,
+}
+
+impl Drop for CreationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed && self.handshake.initializing() {
+            self.handshake.cancel.cancel();
+        }
+    }
+}
+
+fn copy_failure(error: &DispatchError) -> DispatchError {
+    match error {
+        DispatchError::NotAllowed => DispatchError::NotAllowed,
+        DispatchError::RuleEvaluation(failure) => DispatchError::RuleEvaluation(*failure),
+        DispatchError::NetworkUnreachable => DispatchError::NetworkUnreachable,
+        DispatchError::HostUnreachable => DispatchError::HostUnreachable,
+        DispatchError::ConnectionRefused => DispatchError::ConnectionRefused,
+        DispatchError::TimedOut => DispatchError::TimedOut,
+        DispatchError::Other(message) => DispatchError::Other(message.clone()),
+    }
+}
+
 impl std::fmt::Debug for Hysteria2Outbound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Hysteria2Outbound").finish_non_exhaustive()
@@ -63,7 +133,10 @@ impl Hysteria2Outbound {
     #[cfg(feature = "interop-test")]
     pub async fn congestion_observation(&self) -> Option<(u64, quinn::ConnectionStats)> {
         for slot in &self.current {
-            if let Some(session) = slot.lock().await.as_ref() {
+            let slot = slot.lock().await;
+            if let Some(handshake) = slot.as_ref()
+                && let Ready::Open(session) = &*handshake.ready.borrow()
+            {
                 return Some((
                     session
                         .bandwidth
@@ -185,41 +258,82 @@ impl Hysteria2Outbound {
             () = self.cancel.cancelled() => Err(DispatchError::NotAllowed),
             result = context.run("Hysteria2 session", async {
                 let mut current = self.current[index].lock().await;
-                if let Some(session) = current.as_ref().filter(|session|
-                    !session.cancel.is_cancelled() && session.connection.close_reason().is_none()) {
-                    return Ok(session.clone());
-                }
-                current.take();
-                let (ready, reply) = oneshot::channel();
-                let context = if self.config.handshake_timeout.is_zero() { context.clone() } else {
-                    context.clone().capped_by(tokio::time::Instant::now().checked_add(self.config.handshake_timeout).ok_or(DispatchError::TimedOut)?)
+                // A failed offer becomes replaceable only after its driver has
+                // finished cleanup. Repeated calls cannot stack retiring tasks.
+                let (handshake, created) = match current.as_ref().filter(|offer| !offer.finished()) {
+                    Some(handshake) => (handshake.clone(), false),
+                    None => {
+                        let handshake = self.start_handshake(index, datagram, context)?;
+                        *current = Some(handshake.clone());
+                        (handshake, true)
+                    }
                 };
-                let cancel = self.cancel.child_token();
-                let guard = cancel.clone().drop_guard();
-                {
-                    let _admission = self.admission.lock().unwrap();
-                    if self.cancel.is_cancelled() { return Err(DispatchError::NotAllowed); }
-                    let config = self.config.clone();
-                    let upstream = self.upstream.clone();
-                    let server = self.server.clone();
-                    let tls = self.tls.clone();
-                    let realm_tls=self.realm_tls.clone();
-                    let context = context.clone();
-                    let bandwidth = Arc::new(super::bandwidth::Bandwidth::with_pacer(self.pacer.clone()));
-                    let count = self.current.len() as u64;
-                    let receive_rate = self.config.down / count + u64::from((index as u64) < self.config.down % count);
-                    let task = observation::track(ResourceKind::Task);
-                    self.tasks.spawn(observation::bind(async move {
-                        let _task = task;
-                        drive(config, upstream, server, tls, realm_tls, datagram, context, cancel, ready, bandwidth, receive_rate, count as usize).await;
-                    }));
-                }
-                let session = reply.await.map_err(|_| DispatchError::ConnectionRefused)??;
-                guard.disarm();
-                *current = Some(session.clone());
-                Ok(session)
+                let independent = !self.config.handshake_timeout.is_zero();
+                // Default offers retain the creator's serialization and
+                // cancellation semantics. Positive timeouts share a pending
+                // offer without keeping its first waiter or the slot lock.
+                if independent { drop(current); }
+                let mut guard = CreationGuard {
+                    handshake: &handshake,
+                    armed: created && !independent,
+                };
+                let result = handshake.wait_ready().await;
+                guard.armed = false;
+                result
             }) => result,
         }
+    }
+
+    fn start_handshake(
+        &self,
+        index: usize,
+        datagram: DatagramSession,
+        context: &EstablishContext,
+    ) -> Result<Arc<Handshake>, DispatchError> {
+        let _admission = self.admission.lock().unwrap();
+        if self.cancel.is_cancelled() {
+            return Err(DispatchError::NotAllowed);
+        }
+        let context = if self.config.handshake_timeout.is_zero() {
+            context.clone()
+        } else {
+            context.hysteria2_handshake(self.config.handshake_timeout)?
+        };
+        let cancel = self.cancel.child_token();
+        let (ready, receive) = watch::channel(Ready::Pending);
+        let handshake = Arc::new(Handshake {
+            cancel: cancel.clone(),
+            ready: receive,
+        });
+        let config = self.config.clone();
+        let upstream = self.upstream.clone();
+        let server = self.server.clone();
+        let tls = self.tls.clone();
+        let realm_tls = self.realm_tls.clone();
+        let bandwidth = Arc::new(super::bandwidth::Bandwidth::with_pacer(self.pacer.clone()));
+        let count = self.current.len() as u64;
+        let receive_rate =
+            self.config.down / count + u64::from((index as u64) < self.config.down % count);
+        let task = observation::track(ResourceKind::Task);
+        self.tasks.spawn(observation::bind(async move {
+            let _task = task;
+            drive(
+                config,
+                upstream,
+                server,
+                tls,
+                realm_tls,
+                datagram,
+                context,
+                cancel,
+                ready,
+                bandwidth,
+                receive_rate,
+                count as usize,
+            )
+            .await;
+        }));
+        Ok(handshake)
     }
 }
 
@@ -301,13 +415,12 @@ async fn drive(
     datagram: DatagramSession,
     context: EstablishContext,
     cancel: CancellationToken,
-    ready: oneshot::Sender<Result<Arc<Session>, DispatchError>>,
+    ready: watch::Sender<Ready>,
     bandwidth: Arc<super::bandwidth::Bandwidth>,
     receive_rate: u64,
     session_count: usize,
 ) {
     let runtime = Arc::new(OwnedRuntime::new(CancellationToken::new()));
-    let mut ready = Some(ready);
     let mut endpoint = None;
     let mut paths = None;
     let mut realm_pending = super::realm::Pending::default();
@@ -431,11 +544,7 @@ async fn drive(
             return Err(DispatchError::TimedOut);
         }
         established.cancel();
-        ready
-            .take()
-            .unwrap()
-            .send(Ok(session))
-            .map_err(|_| DispatchError::ConnectionRefused)?;
+        ready.send_replace(Ready::Open(session));
         tokio::select! {
             _ = connection.closed() => {},
             _ = control.wait_idle() => {},
@@ -453,11 +562,6 @@ async fn drive(
     };
     cancel.cancel();
     datagrams.close();
-    if let Some(ready) = ready {
-        let _ = ready.send(Err(result
-            .err()
-            .unwrap_or(DispatchError::ConnectionRefused)));
-    }
     if let Some(endpoint) = endpoint {
         endpoint.close(0_u8.into(), b"");
         let _ = tokio::time::timeout(quic::CLOSE_TIMEOUT, endpoint.wait_idle()).await;
@@ -467,8 +571,184 @@ async fn drive(
     if let Some(mut paths) = paths {
         paths.stop().await;
     }
+    ready.send_replace(Ready::Failed(Arc::new(
+        result.err().unwrap_or(DispatchError::ConnectionRefused),
+    )));
 }
 
 fn failure(_: impl std::fmt::Display) -> io::Error {
     io::Error::other("Hysteria2 QUIC exchange failed")
+}
+
+#[cfg(test)]
+mod shared_handshake_memory_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::{sync::Notify, time::Instant};
+
+    #[derive(Default)]
+    struct PendingUpstream {
+        entered: Notify,
+        fail: Notify,
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        deadline: Mutex<Option<Instant>>,
+    }
+
+    struct Active<'a>(&'a AtomicUsize);
+
+    impl Drop for Active<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait]
+    impl OutboundConnector for PendingUpstream {
+        async fn connect_stream(
+            &self,
+            _session: StreamSession,
+            _context: &EstablishContext,
+        ) -> Result<ConnectedStream, DispatchError> {
+            panic!("memory fixture does not create a stream")
+        }
+
+        async fn open_datagram(
+            &self,
+            _request: DatagramRequest,
+            context: &EstablishContext,
+        ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.active.fetch_add(1, Ordering::Relaxed);
+            let _active = Active(&self.active);
+            *self.deadline.lock().unwrap() = Some(context.deadline());
+            self.entered.notify_one();
+            // Stop before creating any socket, QUIC endpoint or peer. The
+            // actual production owner/driver/cancellation path remains in use.
+            self.fail.notified().await;
+            Err(DispatchError::ConnectionRefused)
+        }
+    }
+
+    fn outbound(seconds: u64, upstream: Arc<PendingUpstream>) -> Hysteria2Outbound {
+        let config = crate::config::Config::parse_yaml(
+            format!(
+                "proxies: [{{name: synthetic, type: hysteria2, server: 192.0.2.10, port: 443, password: synthetic, handshake-timeout: {seconds}}}]"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let crate::config::ProxyProtocol::Hysteria2(config) = &config.proxies[0].protocol else {
+            panic!("Hysteria2 configuration")
+        };
+        Hysteria2Outbound::new_with_path(config, UpstreamPath::proxy(upstream)).unwrap()
+    }
+
+    fn datagram() -> DatagramSession {
+        DatagramSession::new(
+            crate::session::InboundKind::Tun,
+            "192.0.2.1:1000".parse().unwrap(),
+        )
+    }
+
+    async fn current(outbound: &Hysteria2Outbound) -> Arc<Handshake> {
+        for slot in &outbound.current {
+            if let Some(handshake) = slot.lock().await.as_ref() {
+                return handshake.clone();
+            }
+        }
+        panic!("an offer was admitted")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn positive_offer_survives_waiter_timeout_and_last_waiter_drop() {
+        let upstream = Arc::new(PendingUpstream::default());
+        let outbound = outbound(5, upstream.clone());
+        let short = EstablishContext::with_timeout(Duration::from_millis(10));
+        let long = EstablishContext::with_timeout(Duration::from_secs(10));
+        let mut creator = Box::pin(outbound.session(datagram(), &short));
+        assert!(futures_util::poll!(creator.as_mut()).is_pending());
+        upstream.entered.notified().await;
+        let handshake = current(&outbound).await;
+        let weak = Arc::downgrade(&handshake);
+        let mut waiter = Box::pin(outbound.session(datagram(), &long));
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert!(matches!(creator.await, Err(DispatchError::TimedOut)));
+        assert!(!handshake.cancel.is_cancelled());
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        drop(waiter);
+        assert!(!handshake.cancel.is_cancelled());
+        assert!(handshake.initializing());
+        assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(upstream.active.load(Ordering::Relaxed), 1);
+        assert!(*upstream.deadline.lock().unwrap().as_ref().unwrap() > short.deadline());
+        outbound.shutdown().await;
+        assert!(handshake.finished());
+        assert_eq!(upstream.active.load(Ordering::Relaxed), 0);
+        assert!(outbound.tasks.is_empty());
+        drop(handshake);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_offer_keeps_creator_cancellation_and_one_serialized_attempt() {
+        let upstream = Arc::new(PendingUpstream::default());
+        let outbound = outbound(0, upstream.clone());
+        let context = EstablishContext::with_timeout(Duration::from_secs(5));
+        let mut creator = Box::pin(outbound.session(datagram(), &context));
+        assert!(futures_util::poll!(creator.as_mut()).is_pending());
+        upstream.entered.notified().await;
+        let mut waiter = Box::pin(outbound.session(datagram(), &context));
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        drop(waiter);
+        assert_eq!(upstream.active.load(Ordering::Relaxed), 1);
+        assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(*upstream.deadline.lock().unwrap(), Some(context.deadline()));
+        drop(creator);
+        outbound.shutdown().await;
+        assert_eq!(upstream.active.load(Ordering::Relaxed), 0);
+        assert!(outbound.tasks.is_empty());
+        for slot in &outbound.current {
+            assert!(slot.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_offer_finishes_before_one_replacement_and_stop_joins_it() {
+        for deadline_failure in [false, true] {
+            let upstream = Arc::new(PendingUpstream::default());
+            let outbound = outbound(1, upstream.clone());
+            let context = EstablishContext::with_timeout(Duration::from_secs(10));
+            let mut first = Box::pin(outbound.session(datagram(), &context));
+            assert!(futures_util::poll!(first.as_mut()).is_pending());
+            upstream.entered.notified().await;
+            let old = current(&outbound).await;
+            if deadline_failure {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                assert!(matches!(first.await, Err(DispatchError::TimedOut)));
+            } else {
+                upstream.fail.notify_one();
+                assert!(matches!(first.await, Err(DispatchError::ConnectionRefused)));
+            }
+            assert!(old.finished());
+            assert_eq!(upstream.active.load(Ordering::Relaxed), 0);
+            let mut retry = Box::pin(outbound.session(datagram(), &context));
+            assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            upstream.entered.notified().await;
+            let next = current(&outbound).await;
+            assert!(!Arc::ptr_eq(&old, &next));
+            assert_eq!(upstream.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(upstream.active.load(Ordering::Relaxed), 1);
+            outbound.shutdown().await;
+            assert!(matches!(retry.await, Err(DispatchError::NotAllowed)));
+            assert!(next.finished());
+            assert_eq!(upstream.active.load(Ordering::Relaxed), 0);
+            assert!(outbound.tasks.is_empty());
+            assert!(matches!(
+                outbound.session(datagram(), &context).await,
+                Err(DispatchError::NotAllowed)
+            ));
+        }
+    }
 }

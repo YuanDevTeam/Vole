@@ -194,6 +194,8 @@ SS2022 流式插件的纯内存过滤器：`config::shadowsocks_plugin::tests::`
 `transport::ss_framed::tests::`、`transport::smux::`。
 它们使用内存流，不启动网络对端；真实TUN互通与压力仍由外部夹具单独验收。
 
+HY2 共享握手的纯内存所有权/期限/同步 Stop：`outbound::hysteria2::outbound::shared_handshake_memory_tests::`。
+
 HY2 Gecko/Realm 的配置和内存wire回归按 `gecko_`、`realm_` 中列出的memory-only名称定向执行；
 TUIC ClientHello 使用 `tuic_disable_sni_changes_real_quic_hello_without_changing_verification_policy`。
 不得将包含网络peer的整个outbound模块直接作为宿主测试执行。
