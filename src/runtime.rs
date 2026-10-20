@@ -1137,6 +1137,7 @@ fn build_proxy_graph(
             }
             ProxyProtocol::Dns => Arc::new(crate::outbound::DnsOutbound::default()),
             ProxyProtocol::Reject => Arc::new(crate::outbound::RejectOutbound::default()),
+            ProxyProtocol::Rematch(_) => Arc::new(crate::outbound::RuleControlConnector),
             _ => {
                 let (address, port) = proxy
                     .server_endpoint()
@@ -1150,7 +1151,10 @@ fn build_proxy_graph(
                     &node_dialer,
                 )?;
                 match &proxy.protocol {
-                    ProxyProtocol::Direct | ProxyProtocol::Dns | ProxyProtocol::Reject => {
+                    ProxyProtocol::Direct
+                    | ProxyProtocol::Dns
+                    | ProxyProtocol::Reject
+                    | ProxyProtocol::Rematch(_) => {
                         unreachable!("functional route was constructed without a server endpoint")
                     }
                     ProxyProtocol::Masque(config) => {
@@ -1610,6 +1614,7 @@ async fn prepare_proxy_endpoints(
                 ProxyProtocol::Direct
                 | ProxyProtocol::Dns
                 | ProxyProtocol::Reject
+                | ProxyProtocol::Rematch(_)
                 | ProxyProtocol::WireGuard(_)
                 | ProxyProtocol::Masque(_)
                 | ProxyProtocol::Http(_)
@@ -1761,6 +1766,7 @@ fn security_counts(proxies: &[ProxyConfig]) -> (usize, usize) {
             ProxyProtocol::Direct
             | ProxyProtocol::Dns
             | ProxyProtocol::Reject
+            | ProxyProtocol::Rematch(_)
             | ProxyProtocol::WireGuard(_)
             | ProxyProtocol::Mieru(_) => (client_count, standard_count),
         },

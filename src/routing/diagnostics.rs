@@ -201,6 +201,7 @@ fn rule_description(rule: &RuleKind) -> (&'static str, String) {
                 .join("/"),
         ),
         RuleKind::InUsers(users) => ("InUser", users.join("/")),
+        RuleKind::RematchNames(names) => ("RematchName", names.join("/")),
         RuleKind::Process(rule) => (rule.description(), rule.pattern.clone()),
         RuleKind::Uid(ranges) => (
             "UID",

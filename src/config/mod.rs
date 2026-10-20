@@ -51,6 +51,7 @@ mod egress;
 pub use egress::EgressOptions;
 mod domain_regex;
 mod functional;
+pub use functional::RematchConfig;
 mod identity_files;
 mod ip_suffix;
 mod process;
@@ -635,6 +636,7 @@ pub enum RuleKind {
     SrcIpAsn(String),
     InTypes(Vec<RuleInboundType>),
     InUsers(Vec<String>),
+    RematchNames(Vec<String>),
     Process(ProcessRule),
     Uid(Vec<UidRange>),
     InPorts(Vec<PortRange>),
@@ -782,6 +784,7 @@ pub struct ProxyConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyProtocol {
     Direct,
+    Rematch(RematchConfig),
     Dns,
     Reject,
     Masque(MasqueOutboundConfig),
@@ -804,7 +807,10 @@ impl ProxyConfig {
     #[must_use]
     pub fn server_endpoint(&self) -> Option<(&str, u16)> {
         Some(match &self.protocol {
-            ProxyProtocol::Direct | ProxyProtocol::Dns | ProxyProtocol::Reject => return None,
+            ProxyProtocol::Direct
+            | ProxyProtocol::Dns
+            | ProxyProtocol::Reject
+            | ProxyProtocol::Rematch(_) => return None,
             ProxyProtocol::Masque(config) => (&config.address, config.port),
             ProxyProtocol::TrustTunnel(config) => (&config.address, config.port),
             ProxyProtocol::Mieru(config) => (&config.address, config.port),
@@ -1757,6 +1763,8 @@ enum RawProtocol {
     Direct(functional::RawFunctional),
     #[serde(rename = "dns")]
     Dns(functional::RawFunctional),
+    #[serde(rename = "rematch")]
+    Rematch(functional::RawRematch),
     #[serde(rename = "reject")]
     Reject(functional::RawFunctional),
     #[serde(rename = "masque")]
@@ -3019,6 +3027,7 @@ impl RawOutbound {
             RawProtocol::Direct(raw) => raw.normalize(ProxyProtocol::Direct)?,
             RawProtocol::Dns(raw) => raw.normalize(ProxyProtocol::Dns)?,
             RawProtocol::Reject(raw) => raw.normalize(ProxyProtocol::Reject)?,
+            RawProtocol::Rematch(raw) => raw.normalize()?,
             RawProtocol::Masque(raw) => raw.normalize()?,
             RawProtocol::TrustTunnel(raw) => raw.normalize()?,
             RawProtocol::Mieru(raw) => raw.normalize()?,

@@ -19,6 +19,8 @@ pub mod wireguard;
 #[cfg(feature = "outbound-anytls")]
 mod anytls;
 mod connector;
+mod control;
+pub(crate) use control::RuleControlConnector;
 #[cfg(feature = "sing-mux")]
 mod sing_mux;
 #[cfg(feature = "sing-mux")]

@@ -55,6 +55,14 @@ impl MeasureConfig {
 impl RawMeasureConfig {
     fn normalize(self) -> Result<MeasureConfig> {
         let (proxies, _) = normalize_proxy_graph(self.proxies)?;
+        if proxies
+            .iter()
+            .any(|node| matches!(&node.protocol, super::ProxyProtocol::Rematch(_)))
+        {
+            return Err(VoleError::InvalidConfig(
+                "measurement requires concrete proxy nodes, not rematch controls".into(),
+            ));
+        }
         let mut referenced_as_parent = vec![false; proxies.len()];
         for proxy in &proxies {
             if let Some(RouteTargetId::Proxy(parent)) = proxy.dialer_proxy {
@@ -109,6 +117,16 @@ impl RawMeasureConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn measurement_rejects_routing_only_rematch_nodes() {
+        assert!(
+            super::MeasureConfig::parse_yaml(
+                b"proxies: [{name: mark, type: rematch, target-rematch-name: blue}]\n"
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn measurement_rejects_oversized_documents() {
         let _case = crate::resources::case_events::Case::new(

@@ -415,6 +415,18 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
         "NETWORK" => RuleKind::Network(parse_network(payload)?),
         "IN-TYPE" => RuleKind::InTypes(parse_in_types(payload)?),
         "IN-USER" => RuleKind::InUsers(parse_in_users(payload)?),
+        "REMATCH-NAME" => RuleKind::RematchNames(
+            payload
+                .split('/')
+                .map(|value| {
+                    let value = value.trim();
+                    if value.is_empty() {
+                        return invalid("REMATCH-NAME requires nonempty names");
+                    }
+                    Ok(value.to_owned())
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
         "PROCESS-NAME"
         | "PROCESS-PATH"
         | "PROCESS-NAME-WILDCARD"

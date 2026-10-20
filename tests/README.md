@@ -41,6 +41,11 @@ Controller 推送（纯内存 duplex，无网络监听）：`controller::websock
 `routing::diagnostics::tests::rule_switch_view_shares_only_small_state_with_the_program` 和
 `runtime::providers::tests::file_refresh_publishes_valid_members_and_preserves_old_sessions`。
 
+规则重匹配的配置与失败关闭（纯内存）：`config::functional::tests::rematch_`、
+`config::measure::tests::measurement_rejects_routing_only_rematch_nodes`、
+`routing::tests::rematch_name_predicate_is_trimmed_nonempty_and_case_sensitive`、
+`outbound::control::tests::`。
+
 功能出站（纯内存）：`config::functional::tests::`、`outbound::dns::tests::`、
 `outbound::reject::tests::`；直连解析角色接线：
 `dns::runtime::tests::runtime_dns_separates_bootstrap_proxy_direct_and_hosts`。

@@ -53,6 +53,7 @@ pub struct RoutingContext {
     process: Option<crate::process::Identity>,
     process_lookup_enabled: bool,
     normalized_domain: Option<Arc<str>>,
+    rematch_name: Option<Arc<str>>,
     destination_ip: Option<IpAddr>,
     pinned_ip: Option<IpAddr>,
     ip_resolution_unavailable: bool,
@@ -114,6 +115,7 @@ impl RoutingContext {
             process: None,
             process_lookup_enabled: false,
             normalized_domain,
+            rematch_name: None,
             destination_ip,
             pinned_ip: None,
             ip_resolution_unavailable: false,
@@ -706,7 +708,7 @@ fn normalize_rule(
                 return Err(RuleSetError::InvalidPortRange { rule_index: index });
             }
         }
-        RuleKind::InUsers(users) => {
+        RuleKind::InUsers(users) | RuleKind::RematchNames(users) => {
             if users.is_empty() || users.iter().any(|user| user.is_empty()) {
                 return Err(RuleSetError::InvalidInboundRule { rule_index: index });
             }
@@ -926,6 +928,10 @@ pub(crate) fn matches_rule(
             false
         }
         RuleKind::Not(child) => !matches_rule(child, context, geo)?,
+        RuleKind::RematchNames(names) => context
+            .rematch_name
+            .as_deref()
+            .is_some_and(|mark| names.iter().any(|name| name == mark)),
         RuleKind::Match => true,
         RuleKind::Flow { predicate, .. } | RuleKind::SubRule { predicate, .. } => {
             matches_rule(predicate, context, geo)?
@@ -1049,6 +1055,42 @@ mod tests {
         RuleAction::Route(crate::config::RouteTargetId::Proxy(
             crate::config::ProxyId::new(index).unwrap(),
         ))
+    }
+
+    #[test]
+    fn rematch_name_predicate_is_trimmed_nonempty_and_case_sensitive() {
+        let mut config = crate::config::Config::parse_yaml(
+            b"rules: ['REMATCH-NAME, blue / Green ,DIRECT', 'MATCH,REJECT']\n",
+        )
+        .unwrap();
+        let rules = RuleSet::compile_config(&mut config).unwrap();
+        let mut context = domain_context(Network::Tcp, "example.com", 443);
+        assert!(matches!(
+            rules.evaluate(&context),
+            RuleEvaluation::Matched(RuleMatch {
+                action: RuleAction::Reject,
+                ..
+            })
+        ));
+        for (name, action) in [
+            ("blue", RuleAction::Direct),
+            ("Green", RuleAction::Direct),
+            ("Blue", RuleAction::Reject),
+            ("", RuleAction::Reject),
+        ] {
+            context.rematch_name = Some(Arc::from(name));
+            assert!(
+                matches!(rules.evaluate(&context), RuleEvaluation::Matched(found) if found.action == action)
+            );
+        }
+        for names in ["blue/", "/blue", "blue/ /Green"] {
+            assert!(
+                crate::config::Config::parse_yaml(
+                    format!("rules: ['REMATCH-NAME,{names},DIRECT']").as_bytes()
+                )
+                .is_err()
+            );
+        }
     }
 
     fn domain_context(network: Network, host: &str, port: u16) -> RoutingContext {
