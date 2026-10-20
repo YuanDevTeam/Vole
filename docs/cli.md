@@ -14,12 +14,15 @@ vole -f /path/to/config.yaml
 vole -d /path/to/data -f ./config.yaml
 vole -t -f ./config.yaml
 cat config.yaml | vole -f -
+vole -t -config "$(base64 < config.yaml)"
 ```
 
 | 参数 | 作用 |
 | --- | --- |
 | `-d <dir>` | 配置及数据目录，默认用户目录下的 `.config/vole` |
 | `-f <file>` | 配置路径；默认 `<data-dir>/config.yaml`，`-f -` 从标准输入读取 |
+| `-config <base64>` | 标准 Base64 编码的主配置，非空时优先于 `-f` |
+| `-age-secret-key <key>` | 解密 AGE armor 主配置的身份，可含多行身份 |
 | `-http-config <file>` | 显式的独立 HTTP 附加配置，交给 Invoke 读取与验证 |
 | `-http-ca <file>` | 独立私密 CA JSON 路径，交给 Invoke 读取；`-t` 不读取它 |
 | `-t` | 校验配置后退出，不初始化数据、联网或启动 TUN |
@@ -32,7 +35,14 @@ cat config.yaml | vole -f -
 
 `-d` 与 `-f` 独立。与 Mihomo 一致，相对路径从启动工作目录解析并折叠 `.`/`..`；
 绝对路径原样交给文件系统，保留符号链接后的 `..` 语义。路径支持空格及平台原生字符。
-`VOLE_HOME_DIR`、`VOLE_CONFIG_FILE` 提供环境默认值，显式参数优先。
+`VOLE_HOME_DIR`、`VOLE_CONFIG_FILE`、`VOLE_CONFIG_STRING` 和 `VOLE_AGE_SECRET_KEY`
+提供环境默认值，分别对应 `-d/-f/-config/-age-secret-key`；显式参数优先，显式空值清除相应环境默认。
+非空 Base64 主配置优先，其次是配置路径 `-` 明确选择的标准输入，最后为配置文件；不会探测标准输入。
+`VOLE_CONFIG_FILE=-` 同样明确选择标准输入。Base64 使用带 padding 的标准字母表，允许 CR/LF，
+不接受 URL-safe 字母表；编码文本最多 11,184,812 字节，解码后最多 8 MiB。
+解码后的输入和文件／标准输入均可为标准 AGE armor，复用 provider 的 X25519／hybrid 身份与认证解密；
+身份文本最多 16 KiB，解密后的 YAML 最多 8 MiB。编码、密文、明文按阶段释放，不在运行会话中保留编码副本；
+临时身份与请求缓冲清零，错误不包含正文或密钥。帮助和版本不读取这些环境值或配置来源。
 Unix 用户目录取 `HOME`，Windows 取 `USERPROFILE`，缺失时使用工作目录。
 默认 `.config/vole` 不存在或不可访问时，若设置 `XDG_CONFIG_HOME`，使用其中的 `vole` 目录。
 配置文件必须是普通文件，文件和标准输入上限均为 8 MiB，CLI 不写回配置。

@@ -6,7 +6,8 @@ use std::{
     path::PathBuf,
     process::ExitCode,
 };
-use vole::invoke::{InvokePath, invoke_bytes};
+use vole::invoke::{InvokePath, invoke_owned_bytes};
+use zeroize::{Zeroize, Zeroizing};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Help,
@@ -15,13 +16,23 @@ enum Mode {
     Run,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct Options {
     mode: Mode,
     data_dir: Option<PathBuf>,
     config_file: Option<PathBuf>,
+    config_string: Option<Zeroizing<String>>,
+    age_secret_key: Option<Zeroizing<String>>,
     http_config_file: Option<PathBuf>,
     http_ca_file: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Options")
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Options {
@@ -34,6 +45,8 @@ impl Options {
         let (mut version, mut validate) = (false, false);
         let mut data_dir = data_dir.map(PathBuf::from);
         let mut config_file = config_file.map(PathBuf::from);
+        let mut config_string = None;
+        let mut age_secret_key = None;
         let mut http_config_file = None;
         let mut http_ca_file = None;
         while let Some(argument) = arguments.next() {
@@ -49,6 +62,8 @@ impl Options {
                         mode: Mode::Help,
                         data_dir,
                         config_file,
+                        config_string,
+                        age_secret_key,
                         http_config_file,
                         http_ca_file,
                     });
@@ -60,6 +75,26 @@ impl Options {
                     } else {
                         validate = value;
                     }
+                }
+                b"config" | b"age-secret-key" => {
+                    let value = inline
+                        .map(OsStr::to_owned)
+                        .or_else(|| arguments.next())
+                        .ok_or(CliError::argument(if flag == b"config" {
+                            "missing value for -config"
+                        } else {
+                            "missing value for -age-secret-key"
+                        }))?;
+                    let value = value.into_string().map(Zeroizing::new).map_err(|value| {
+                        drop(Zeroizing::new(value.into_encoded_bytes()));
+                        CliError::argument("text option requires UTF-8")
+                    })?;
+                    if flag == b"config" {
+                        config_string = Some(value);
+                    } else {
+                        age_secret_key = Some(value);
+                    }
+                    drop(Zeroizing::new(argument.into_encoded_bytes()));
                 }
                 b"http-config" | b"http-ca" => {
                     let value = inline
@@ -104,6 +139,8 @@ impl Options {
             },
             data_dir,
             config_file,
+            config_string,
+            age_secret_key,
             http_config_file,
             http_ca_file,
         })
@@ -149,6 +186,9 @@ impl CliError {
     }
 }
 fn request(options: Options) -> Value {
+    if options.mode == Mode::Help {
+        return json!({"method":"foreground","payload":{"action":"help"}});
+    }
     if options.mode == Mode::Version {
         return json!({"method":"version","payload":{}});
     }
@@ -161,6 +201,12 @@ fn request(options: Options) -> Value {
         payload["configPath"] =
             serde_json::to_value(InvokePath::from(path)).expect("native path serialization");
     }
+    if let Some(mut value) = options.config_string {
+        payload["configString"] = Value::String(std::mem::take(&mut *value));
+    }
+    if let Some(mut value) = options.age_secret_key {
+        payload["ageSecretKey"] = Value::String(std::mem::take(&mut *value));
+    }
     if let Some(path) = options.http_config_file {
         payload["httpConfigPath"] =
             serde_json::to_value(InvokePath::from(path)).expect("native path serialization");
@@ -169,12 +215,21 @@ fn request(options: Options) -> Value {
         payload["httpCaPath"] =
             serde_json::to_value(InvokePath::from(path)).expect("native path serialization");
     }
-    json!({"method":"foreground","payload":payload})
+    let mut request = json!({"method":"foreground"});
+    request["payload"] = payload;
+    request
 }
-fn call(request: Value) -> Result<Value, CliError> {
-    let bytes =
-        serde_json::to_vec(&request).map_err(|_| CliError("request serialization failed"))?;
-    serde_json::from_slice(&invoke_bytes(&bytes)).map_err(|_| CliError("invalid Invoke response"))
+fn call(mut request: Value) -> Result<Value, CliError> {
+    let bytes = serde_json::to_vec(&request);
+    for name in ["configString", "ageSecretKey"] {
+        if let Some(Value::String(value)) = request["payload"].get_mut(name) {
+            value.zeroize();
+        }
+    }
+    drop(request);
+    let bytes = bytes.map_err(|_| CliError("request serialization failed"))?;
+    serde_json::from_slice(&invoke_owned_bytes(bytes))
+        .map_err(|_| CliError("invalid Invoke response"))
 }
 fn render(
     response: &Value,
@@ -293,6 +348,29 @@ mod tests {
         assert_eq!(
             request(options)["payload"]["configPath"],
             json!({"unixBytes":[255]})
+        );
+    }
+    #[test]
+    fn encoded_configuration_and_age_options_only_transport_text() {
+        let options = parse(&[
+            "-config",
+            "c2VjcmV0",
+            "--age-secret-key=private-fixture",
+            "-t",
+        ])
+        .unwrap();
+        assert!(!format!("{options:?}").contains("private-fixture"));
+        assert!(!format!("{options:?}").contains("c2VjcmV0"));
+        let value = request(options);
+        assert_eq!(value["payload"]["configString"], "c2VjcmV0");
+        assert_eq!(value["payload"]["ageSecretKey"], "private-fixture");
+        assert_eq!(
+            request(parse(&["-config=", "-t"]).unwrap())["payload"]["configString"],
+            ""
+        );
+        assert_eq!(
+            request(parse(&["-config=invalid", "-v"]).unwrap()),
+            json!({"method":"version","payload":{}})
         );
     }
     #[test]

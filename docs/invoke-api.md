@@ -1,8 +1,10 @@
 # Vole Invoke API
 
-业务实例通过内联的 `configYaml` 启动，测速通过 `configYamls` 传入节点配置；前台 `foreground` 操作负责从文件或标准输入加载同一配置。每份已加载的 Vole 运行时最多拥有一个公共实例。业务代理入口仅通过 `mixed-port` 配置，HTTP/SOCKS5 TCP 与 SOCKS5 UDP 共用端口；顶层 `port`、`socks-port`、`udp` 和 `listeners` 都会失败。代理组实时选择沿用 Controller。ECH 使用节点内联静态配置或运行时节点 DNS 角色；measureDelay 的动态 ECH 使用原 Dialer 的 system-source 原始 HTTPS 记录叶服务，平台物理来源不可用时失败，不增加 DNS 或宿主元数据入参。
+业务实例通过内联的 `configYaml` 启动，测速通过 `configYamls` 传入节点配置；前台 `foreground` 操作负责从明确的 Base64、文件或标准输入加载同一配置。每份已加载的 Vole 运行时最多拥有一个公共实例。业务代理入口仅通过 `mixed-port` 配置，HTTP/SOCKS5 TCP 与 SOCKS5 UDP 共用端口；顶层 `port`、`socks-port`、`udp` 和 `listeners` 都会失败。代理组实时选择沿用 Controller。ECH 使用节点内联静态配置或运行时节点 DNS 角色；measureDelay 的动态 ECH 使用原 Dialer 的 system-source 原始 HTTPS 记录叶服务，平台物理来源不可用时失败，不增加 DNS 或宿主元数据入参。
 
-共享请求处理位于 `src/invoke/`。Rust 调用方使用 `vole::invoke::invoke_bytes(&[u8]) -> Vec<u8>`；CLI 和 C ABI 都调用该入口。`invoke` feature 提供共享操作，`cli` 和 `ffi` 分别添加命令行与原生传输适配。
+共享请求处理位于 `src/invoke/`。Rust 调用方使用 `vole::invoke::invoke_bytes(&[u8]) -> Vec<u8>`；C ABI 使用同一入口。
+CLI 使用共用解析、准入、派发和 panic 边界的 `invoke_owned_bytes(Vec<u8>)`，
+将序列化输入的所有权交给 Invoke，使其在进入长驻前台操作前清零并释放原始 JSON；不增加 JSON 方法。`invoke` feature 提供共享操作，`cli` 和 `ffi` 分别添加命令行与原生传输适配。
 
 ## C ABI
 
@@ -331,7 +333,16 @@ Windows Session Snapshot 不由此重建；Windows UWP 的活动 Provider 配置
 配置默认 `<dataDir>/config.yaml`。
 `configPath: "-"` 从标准输入读取。文件必须是普通文件，文件和标准输入均最多 8 MiB；
 证书/密钥相对路径从选定 dataDir 解析，validate 也读取身份文件但不初始化目录。
-不会下载、创建模板或改写配置。详细命令行映射见 [CLI](cli.md)。
+不会下载、创建模板或改写配置。
+可选 `configString` 和 `ageSecretKey` 是 UTF-8 文本，分别取 `VOLE_CONFIG_STRING`、
+`VOLE_AGE_SECRET_KEY` 的环境默认；显式空值清除该默认。非空 `configString` 按带 padding 的
+标准 Base64 解码（允许 CR/LF），优先于配置路径，因此即使路径为 `-` 也不打开或锁定标准输入。
+没有非空 Base64 时才使用明确选择的 `-`（含 `VOLE_CONFIG_FILE=-`）或文件，不探测输入。
+编码文本最多 11,184,812 字节，解码后的内容、主文件和标准输入均最多 8 MiB。
+输入以标准 AGE armor 开头时复用资源层的认证解密，身份最多 16 KiB，解密后 YAML 最多 8 MiB；
+解密受 30 秒处理期限约束，运行模式的退出信号取消并 join 解码工作器后返回。
+临时身份与私密请求缓冲清零，编码／密文在后续阶段及时释放。配置仍只解析一次后交给共享启动路径。
+详细命令行映射见 [CLI](cli.md)。
 
 普通 Unicode 路径使用 JSON 字符串。需要保留平台原生编码时，Unix 可使用
 `{"unixBytes":[47,116,109,112,255]}`，Windows 可使用

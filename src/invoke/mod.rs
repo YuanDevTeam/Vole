@@ -650,6 +650,23 @@ pub fn invoke_bytes(request: &[u8]) -> Vec<u8> {
     invoke_bytes_admitted(request)
 }
 
+/// Executes an owned JSON request through the same dispatcher. The CLI uses
+/// this to clear and release serialized configuration/key text before a long
+/// foreground session; borrowed FFI callers retain ownership of their input.
+pub fn invoke_owned_bytes(request: Vec<u8>) -> Vec<u8> {
+    let request = zeroize::Zeroizing::new(request);
+    if is_runtime_thread() {
+        return runtime_thread_response();
+    }
+    #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+    let _logging = crate::platform::apple_logging::enter();
+    invoke_guarded(move || {
+        let decoded = decode_request(&request)?;
+        drop(request);
+        dispatch_request(decoded)
+    })
+}
+
 /// Shared byte-oriented dispatcher used by C and Android JNI.
 /// It intentionally returns bytes so JNI never routes arbitrary JSON through
 /// Modified UTF-8 strings.
@@ -938,7 +955,16 @@ fn check_json_string_limit(raw: &str, limit: usize) -> Result<(), InvokeFailure>
     Ok(())
 }
 
+enum DecodedRequest {
+    Complete(InvokeResponse),
+    Envelope(RequestEnvelope),
+}
+
 fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
+    dispatch_request(decode_request(request)?)
+}
+
+fn decode_request(request: &[u8]) -> Result<DecodedRequest, InvokeFailure> {
     if request.len() > MAX_INVOKE_BYTES {
         return Err(InvokeFailure::invalid_request(format!(
             "Invoke envelope exceeds the {MAX_INVOKE_BYTES}-byte limit"
@@ -948,8 +974,9 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
         .map_err(|_| InvokeFailure::invalid_request("request is not valid UTF-8"))?;
     check_dns_network_envelope(request)?;
     http::check_envelope(request)?;
+    foreground::check_envelope(request)?;
     if let Some(response) = dispatch_config_update(request)? {
-        return Ok(response);
+        return Ok(DecodedRequest::Complete(response));
     }
     let envelope: RequestEnvelope =
         serde_json::from_str(request).map_err(InvokeFailure::invalid_request)?;
@@ -957,6 +984,14 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
         return Err(InvokeFailure::invalid_request("payload must be an object"));
     }
 
+    Ok(DecodedRequest::Envelope(envelope))
+}
+
+fn dispatch_request(request: DecodedRequest) -> Result<InvokeResponse, InvokeFailure> {
+    let envelope = match request {
+        DecodedRequest::Complete(response) => return Ok(response),
+        DecodedRequest::Envelope(envelope) => envelope,
+    };
     let data = match envelope.method.as_str() {
         "initialize" => {
             require_instance_omitted(&envelope)?;
@@ -1945,6 +1980,36 @@ fn bounded_error(mut message: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owned_invoke_uses_the_shared_strict_and_runtime_thread_boundaries() {
+        let version = br#"{"method":"version","payload":{}}"#;
+        assert_eq!(
+            super::invoke_bytes(version),
+            super::invoke_owned_bytes(version.to_vec())
+        );
+        for invalid in [
+            br#"{"method":"version","payload":{},"extra":true}"#.as_slice(),
+            br#"{"method":"version","payload":{"secret":"private-fixture"}}"#,
+            br#"{"method":"foreground","payload":{"action":"help","extra":true}}"#,
+        ] {
+            assert_eq!(
+                super::invoke_bytes(invalid),
+                super::invoke_owned_bytes(invalid.to_vec())
+            );
+        }
+        let oversized_key = serde_json::json!({"method":"foreground","payload":{"action":"help","ageSecretKey":"x".repeat(16 * 1024 + 1)}}).to_string();
+        assert_eq!(
+            super::invoke_bytes(oversized_key.as_bytes()),
+            super::invoke_owned_bytes(oversized_key.into_bytes())
+        );
+        super::IS_RUNTIME_THREAD.with(|flag| {
+            let old = flag.replace(true);
+            let response = super::invoke_owned_bytes(version.to_vec());
+            flag.set(old);
+            assert_eq!(response, super::runtime_thread_response());
+        });
+    }
+
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},

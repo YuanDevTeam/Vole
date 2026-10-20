@@ -2,6 +2,8 @@
 use super::{
     CoreController, InvokeFailure, StartupConfig, invoke_instance_guarded, lock, registry,
 };
+mod input;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -23,11 +25,14 @@ use tracing::{
     span::{Attributes, Id, Record},
     subscriber::Interest,
 };
+use zeroize::Zeroizing;
 
 const HELP: &str = "Vole standalone proxy core\n\
-Usage: vole [-d <data-dir>] [-f <config-file>] [-http-config <file>] [-http-ca <file>] [-t] [-v] [-h]\n\
+Usage: vole [-d <data-dir>] [-f <config-file>] [-config <base64>] [-age-secret-key <key>] [-http-config <file>] [-http-ca <file>] [-t] [-v] [-h]\n\
   -d <data-dir>     Data directory (default: home/.config/vole)\n\
   -f <config-file>  Configuration file; - reads stdin (default: <data-dir>/config.yaml)\n\
+  -config <base64>  Base64-encoded configuration; nonempty text takes priority\n\
+  -age-secret-key <key>  AGE identity for an encrypted configuration\n\
   -http-config <file>  Explicit HTTP processing addendum (optional)\n\
   -http-ca <file>   Private CA JSON file for selected HTTPS processing\n\
   -t               Validate configuration and exit\n\
@@ -106,6 +111,10 @@ pub(super) struct ForegroundPayload {
     data_dir: Option<InvokePath>,
     #[serde(default)]
     config_path: Option<InvokePath>,
+    #[serde(default, deserialize_with = "input::private_text")]
+    config_string: Option<Zeroizing<String>>,
+    #[serde(default, deserialize_with = "input::private_text")]
+    age_secret_key: Option<Zeroizing<String>>,
     #[serde(default)]
     http_config_path: Option<InvokePath>,
     #[serde(default)]
@@ -142,6 +151,10 @@ fn io_failure(stage: &str, error: io::Error) -> InvokeFailure {
 }
 static FOREGROUND: Mutex<()> = Mutex::new(());
 
+pub(super) fn check_envelope(request: &str) -> Result<(), InvokeFailure> {
+    input::check_envelope(request)
+}
+
 pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure> {
     if matches!(payload.action, ForegroundAction::Help) {
         return Ok(json!({"output":"","diagnostics":HELP}));
@@ -166,6 +179,7 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
     } else {
         None
     };
+    let source = input::options(payload.config_string, payload.age_secret_key)?;
     let options = PathOptions {
         data_dir: option_path(payload.data_dir, "VOLE_HOME_DIR"),
         config_file: option_path(payload.config_path, "VOLE_CONFIG_FILE"),
@@ -195,16 +209,12 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
     let http_yaml = http_input.as_ref().map(|(yaml, _)| yaml.as_str());
     // Stdin belongs to the foreground request. Default OS Ctrl+C handling is
     // preserved while it is still supplying its bounded configuration input.
-    let stdin = paths
-        .stdin
-        .then(|| read_bounded(io::stdin().lock()))
-        .transpose()
-        .map_err(|e| io_failure("read configuration input", e))?;
+    let input = input::MainInput::read(source.config, source.key, &paths, || {
+        read_bounded(io::stdin().lock())
+    })?;
     if matches!(payload.action, ForegroundAction::Validate) {
-        let config = stdin
-            .map_or_else(|| read_config(&paths.config_file), Ok)
-            .map_err(|e| io_failure("read configuration file", e))?;
-        validate_bytes(config, &paths.data_dir, http_yaml)?;
+        let config = Zeroizing::new(input.into_yaml(None)?);
+        validate_yaml(&config, &paths.data_dir, http_yaml)?;
         let external = http_yaml
             .filter(|input| !input.is_empty())
             .map(crate::http_processing::config::Document::parse)
@@ -225,10 +235,27 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
     runtime.block_on(async {
         let signals =
             ShutdownSignals::register().map_err(|e| io_failure("register shutdown signals", e))?;
-        let config = stdin
-            .map_or_else(|| read_config(&paths.config_file), Ok)
-            .map_err(|e| io_failure("read configuration file", e))?;
-        let yaml = String::from_utf8(config).map_err(|_| failure("configuration is not UTF-8"))?;
+        let shutdown = signals.wait();
+        tokio::pin!(shutdown);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let decoding_cancellation = cancellation.clone();
+        let mut decoding = tokio::task::spawn_blocking(move || {
+            input
+                .into_yaml(Some(&decoding_cancellation))
+                .map(Zeroizing::new)
+        });
+        let mut yaml = tokio::select! {
+            biased;
+            signal = &mut shutdown => {
+                cancellation.cancel();
+                let _ = decoding.await.map_err(|_| failure("configuration decoder failed"))?;
+                signal.map_err(|e| io_failure("shutdown signal", e))?;
+                return Ok(());
+            }
+            result = &mut decoding => {
+                result.map_err(|_| failure("configuration decoder failed"))??
+            }
+        };
         registry()
             .initialize_path(&paths.data_dir)
             .map_err(|_| failure("data directory initialization failed"))?;
@@ -241,15 +268,14 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
                 ca,
             });
         let (http_config_yaml, source_file) = http_input.unzip();
-        let cancellation = tokio_util::sync::CancellationToken::new();
         let startup = StartupConfig::Input(super::http::StartPayload {
-            config_yaml: yaml,
+            config_yaml: std::mem::take(&mut *yaml),
             http_config_yaml,
             http_context: context,
             source_file,
             cancellation: Some(cancellation.clone()),
         });
-        let result = run_controller(controller, startup, signals.wait(), cancellation).await;
+        let result = run_controller(controller, startup, shutdown, cancellation).await;
         let stopped = cleanup.destroy();
         result.and(stopped)
     })?;
@@ -282,13 +308,8 @@ fn read_http_ca(
         .map_err(|_| failure("private HTTP CA input failed"))
 }
 
-fn validate_bytes(
-    bytes: Vec<u8>,
-    directory: &Path,
-    http: Option<&str>,
-) -> Result<(), InvokeFailure> {
-    let yaml = String::from_utf8(bytes).map_err(|_| failure("configuration is not UTF-8"))?;
-    let mut config = super::parse_config_yaml_with_directory(&yaml, Some(directory))
+fn validate_yaml(yaml: &str, directory: &Path, http: Option<&str>) -> Result<(), InvokeFailure> {
+    let mut config = super::parse_config_yaml_with_directory(yaml, Some(directory))
         .map_err(|_| failure("invalid configuration"))?;
     config
         .set_http_config(http)
@@ -901,6 +922,8 @@ mod tests {
         fs::write(&config,"tun: {enable: true, file-descriptor: 2147483647, mtu: 1500}\nproxies: [{name: unused, type: socks5, server: 127.0.0.1, port: 1081}]\nrules: ['GEOSITE,cn,DIRECT','MATCH,unused']").unwrap();
         let payload = ForegroundPayload {
             action: ForegroundAction::Validate,
+            config_string: None,
+            age_secret_key: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
             http_config_path: None,
@@ -937,6 +960,8 @@ mod tests {
         fs::write(&config, "proxies:\n  - name: edge\n    type: http\n    server: proxy.invalid\n    port: 443\n    tls: true\n    certificate: client.crt\n    private-key: client.key\n").unwrap();
         let result = execute(ForegroundPayload {
             action: ForegroundAction::Validate,
+            config_string: None,
+            age_secret_key: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
             http_config_path: None,
@@ -955,6 +980,8 @@ mod tests {
         fs::write(&config, "private-token: super-secret").unwrap();
         let error = execute(ForegroundPayload {
             action: ForegroundAction::Validate,
+            config_string: None,
+            age_secret_key: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
             http_config_path: None,
@@ -983,6 +1010,8 @@ mod tests {
         );
         let error = execute(ForegroundPayload {
             action: ForegroundAction::Validate,
+            config_string: None,
+            age_secret_key: None,
             data_dir: invalid_path(),
             config_path: invalid_path(),
             http_config_path: None,
@@ -996,6 +1025,8 @@ mod tests {
         let _lease = lock(&FOREGROUND);
         let error = execute(ForegroundPayload {
             action: ForegroundAction::Run,
+            config_string: None,
+            age_secret_key: None,
             data_dir: Some(InvokePath::Text("\0".to_owned())),
             config_path: Some(InvokePath::Text("-".to_owned())),
             http_config_path: None,
@@ -1008,6 +1039,8 @@ mod tests {
     async fn run_rejects_external_tokio_context_before_input() {
         let error = execute(ForegroundPayload {
             action: ForegroundAction::Run,
+            config_string: None,
+            age_secret_key: None,
             data_dir: None,
             config_path: Some(InvokePath::Text("-".to_owned())),
             http_config_path: None,
@@ -1021,6 +1054,8 @@ mod tests {
     fn help_does_not_read_or_initialize_paths() {
         let result = execute(ForegroundPayload {
             action: ForegroundAction::Help,
+            config_string: None,
+            age_secret_key: None,
             data_dir: Some(InvokePath::Text("\0".to_owned())),
             config_path: Some(InvokePath::Text("\0".to_owned())),
             http_config_path: None,
@@ -1217,6 +1252,8 @@ mod tests {
         .unwrap();
         let result = execute(ForegroundPayload {
             action: ForegroundAction::Validate,
+            config_string: None,
+            age_secret_key: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(main.clone().into()),
             http_config_path: Some(http.clone().into()),
@@ -1228,6 +1265,8 @@ mod tests {
         fs::write(http, "private-secret: private-data").unwrap();
         let result = execute(ForegroundPayload {
             action: ForegroundAction::Validate,
+            config_string: None,
+            age_secret_key: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(main.clone().into()),
             http_config_path: None,

@@ -15,7 +15,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
-const ARMOR_HEADER: &[u8] = b"-----BEGIN AGE ENCRYPTED FILE-----";
+pub(crate) const ARMOR_HEADER: &[u8] = b"-----BEGIN AGE ENCRYPTED FILE-----";
 const SECRET_BYTES: usize = 16 * 1024;
 const IDENTITIES: usize = 128;
 const HEADER_BYTES: usize = 64 * 1024;
@@ -57,7 +57,7 @@ impl Identities {
         };
         Self::parse(&secret).map(Some)
     }
-    fn parse(secret: &str) -> Result<Self> {
+    pub(crate) fn parse(secret: &str) -> Result<Self> {
         if secret.len() > SECRET_BYTES {
             return Err(invalid("AGE identity budget exceeded"));
         }

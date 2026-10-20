@@ -87,7 +87,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | HTTP 编译与执行 | `http_processing::` | 严格规则与 provider、URL/头/正文、压缩与 JSON Patch、选择性 TLS、H1/H2 和有界回退 |
 | HTTP Invoke | `invoke::http::`、`resource::http_control::tests::` | 有界私密输入、离线演算、来源未准备、下载 dispatcher 接线、单一准入、取消与 Stop 收尾 |
 | HTTP 在线配置 | `runtime::providers::apply::http_tests::` | 活动快照继承、变更要求重连、旧候选保留 |
-| CLI前台 | `invoke::foreground::tests::` | 文件/stdin、原生路径、显式 HTTP 文件、CA 读取边界、信号取消及清理 |
+| CLI前台 | `invoke::foreground::tests::`、`invoke::foreground::input::tests::` | 文件/stdin、原生路径、显式 HTTP 文件、CA 读取边界、信号取消及清理 |
 
 独立集成回归按目标运行，例如：
 
@@ -190,6 +190,9 @@ HTTP 内容或来源上下文变更要求显式重连。失败恢复的策略组
 显式配置传递另选 `main_config_and_provider_rebuild_preserve_the_addendum_until_explicit_clear`、
 `update_http_addendum_preserves_optional_clear_and_its_separate_byte_limit` 和二进制
 `cli::tests::http_addendum_option_only_transports_an_explicit_native_path`。
+`invoke::foreground::input::tests::` 检查 Base64 来源优先、标准 padding、认证 AGE 固定向量、
+输入预算与取消；`invoke::tests::owned_invoke_uses_the_shared_strict_and_runtime_thread_boundaries`
+检查 CLI 的 owned 请求与借用请求共用严格准入和重入边界。
 `invoke::foreground::tests::` 检查显式文件与路径、校验不初始化、不自动加载 HTTP 文件、
 MITM 关闭不读 CA、无 HTTP 配置的 CA 参数提前拒绝，以及启动期信号取消后 join 清理。
 Windows 平台另编译 `snapshot_identity_and_readback_include_the_http_addendum`，
