@@ -63,6 +63,12 @@ impl TunRsIo {
         self.device.get_ref().name()
     }
 
+    #[cfg(all(target_os = "linux", feature = "interop-test"))]
+    pub(crate) fn echo_prefixes(&self) -> io::Result<Vec<crate::config::IpCidr>> {
+        use std::os::fd::AsFd;
+        super::linux_tun::interface_prefixes(self.device.get_ref().as_fd())
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn linux_device(&self) -> &tun_rs::SyncDevice {
         self.device.get_ref()

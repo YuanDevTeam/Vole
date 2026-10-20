@@ -8,6 +8,7 @@
 mod client;
 mod config;
 mod device;
+mod echo;
 mod icmp;
 mod packet;
 mod pmtu;
@@ -18,6 +19,10 @@ mod udp;
 
 pub use client::{ClientConfig, ClientPrefix, MAX_RECEIVE_PACKET_SIZE};
 pub use config::{ClientAddresses, ConfigError, NetStackConfig};
+pub use echo::{
+    EchoPacketClass, EchoPacketError, EchoPacketView, classify_echo_request,
+    encode_echo_reply_into, parse_echo_reply_body, parse_echo_request_view,
+};
 pub use packet::Packet;
 pub use pmtu::{PathMtuHint, build_packet_too_big, parse_path_mtu_hint};
 pub use stack::{

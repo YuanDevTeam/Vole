@@ -12,6 +12,12 @@ use std::{
     thread,
 };
 
+#[cfg(feature = "interop-test")]
+#[path = "linux_tun_echo.rs"]
+mod echo;
+#[cfg(feature = "interop-test")]
+pub(super) use echo::interface_prefixes;
+
 const NETLINK_HEADER: usize = 16;
 const LINK_HEADER: usize = 16;
 const MAX_LINK_MESSAGE: usize = 8192;

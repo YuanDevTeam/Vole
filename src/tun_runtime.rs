@@ -41,6 +41,39 @@ use crate::{
     traffic::TunTrafficStats,
 };
 
+#[cfg(all(target_os = "linux", feature = "interop-test"))]
+#[path = "tun_echo.rs"]
+mod echo;
+#[cfg(all(target_os = "linux", feature = "interop-test"))]
+use echo::EchoIngress;
+#[cfg(not(all(target_os = "linux", feature = "interop-test")))]
+struct EchoIngress;
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "interop-test")),
+    allow(dead_code)
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EchoOffer {
+    NotEcho,
+    LocalSynthetic,
+    Consumed,
+}
+#[cfg(not(all(target_os = "linux", feature = "interop-test")))]
+impl EchoIngress {
+    fn offer(&self, _: &[u8]) -> EchoOffer {
+        EchoOffer::NotEcho
+    }
+}
+struct QueuedEchoResponse {
+    packet: Packet,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+fn closed_echo_lane() -> mpsc::Receiver<QueuedEchoResponse> {
+    let (sender, receiver) = mpsc::channel(1);
+    drop(sender);
+    receiver
+}
+
 #[cfg(test)]
 use crate::dns::{ClassifiedDnsQuery, synthesize_servfail_response};
 #[cfg(test)]
@@ -91,6 +124,8 @@ pub(crate) struct TunRuntime {
     fake_icmp_echo: bool,
     sniffer: Option<Arc<SnifferConfig>>,
     traffic_stats: Arc<TunTrafficStats>,
+    #[cfg(all(target_os = "linux", feature = "interop-test"))]
+    echo_options: Option<echo::EchoOptions>,
 }
 
 impl TunRuntime {
@@ -154,6 +189,8 @@ impl TunRuntime {
             fake_icmp_echo,
             sniffer,
             traffic_stats,
+            #[cfg(all(target_os = "linux", feature = "interop-test"))]
+            echo_options: None,
         })
     }
 
@@ -168,6 +205,21 @@ impl TunRuntime {
         }
         self.resources = resources;
         self
+    }
+
+    #[cfg(all(target_os = "linux", feature = "interop-test"))]
+    pub(crate) async fn with_real_echo(
+        mut self,
+        dialer: crate::dialer::Dialer,
+        fake_ranges: [Option<crate::config::IpCidr>; 2],
+        timeout: Duration,
+        disabled: bool,
+    ) -> io::Result<Self> {
+        self.echo_options = Some(
+            echo::EchoOptions::prepare(dialer, self.tun.clone(), fake_ranges, timeout, disabled)
+                .await?,
+        );
+        Ok(self)
     }
 
     pub(crate) async fn run(self, cancellation: CancellationToken) -> io::Result<()> {
@@ -188,6 +240,17 @@ impl TunRuntime {
         let control = parts.control.clone();
         let netstack_stats = parts.stats.clone();
         let mut tasks = JoinSet::new();
+        #[cfg(all(target_os = "linux", feature = "interop-test"))]
+        let (echo, echo_responses) = if let Some(options) = self.echo_options {
+            let (ingress, responses, driver) =
+                echo::channel(options, effective_tun_mtu(self.limits));
+            tasks.spawn(observation::task(driver.run(cancellation.clone())));
+            (Some(ingress), responses)
+        } else {
+            (None, closed_echo_lane())
+        };
+        #[cfg(not(all(target_os = "linux", feature = "interop-test")))]
+        let (echo, echo_responses): (Option<EchoIngress>, _) = (None, closed_echo_lane());
         let (udp, responses, dns_responses) = UdpIngress::new(
             UdpIngressContext {
                 dispatcher: self.dispatcher.clone(),
@@ -210,19 +273,21 @@ impl TunRuntime {
                 .clone()
                 .run_rate_clock(cancellation.clone()),
         ));
-        tasks.spawn(observation::task(tun_read_loop(
+        tasks.spawn(observation::task(tun_read_loop_with_echo(
             self.tun.clone(),
             parts.packet_sink,
             self.ipv6,
             udp,
+            echo,
             self.traffic_stats.clone(),
             cancellation.clone(),
         )));
-        tasks.spawn(observation::task(tun_write_loop(
+        tasks.spawn(observation::task(tun_write_loop_with_echo(
             self.tun,
             parts.packet_stream,
             responses,
             dns_responses,
+            echo_responses,
             effective_tun_mtu(self.limits),
             self.traffic_stats,
             cancellation.clone(),
@@ -320,11 +385,33 @@ fn tun_ingress_allowed(ipv6: bool, packet: &[u8]) -> bool {
     ipv6 || packet_ip_version(packet) != 6
 }
 
+#[cfg(test)]
 async fn tun_read_loop(
     tun: Arc<TunIo>,
     packet_sink: PacketSink,
     ipv6: bool,
+    udp: UdpIngress,
+    traffic_stats: Arc<TunTrafficStats>,
+    cancellation: CancellationToken,
+) -> io::Result<()> {
+    tun_read_loop_with_echo(
+        tun,
+        packet_sink,
+        ipv6,
+        udp,
+        None,
+        traffic_stats,
+        cancellation,
+    )
+    .await
+}
+
+async fn tun_read_loop_with_echo(
+    tun: Arc<TunIo>,
+    packet_sink: PacketSink,
+    ipv6: bool,
     mut udp: UdpIngress,
+    echo: Option<EchoIngress>,
     traffic_stats: Arc<TunTrafficStats>,
     cancellation: CancellationToken,
 ) -> io::Result<()> {
@@ -333,6 +420,7 @@ async fn tun_read_loop(
         packet_sink,
         ipv6,
         &mut udp,
+        echo.as_ref(),
         traffic_stats,
         cancellation,
     )
@@ -348,6 +436,7 @@ async fn tun_read_inner(
     packet_sink: PacketSink,
     ipv6: bool,
     udp: &mut UdpIngress,
+    echo: Option<&EchoIngress>,
     traffic_stats: Arc<TunTrafficStats>,
     cancellation: CancellationToken,
 ) -> io::Result<()> {
@@ -436,6 +525,9 @@ async fn tun_read_inner(
                 );
                 continue;
             }
+            if echo.is_some_and(|echo| echo.offer(packet) == EchoOffer::Consumed) {
+                continue;
+            }
             if let Some(datagram) = parse_udp_packet_view(packet) {
                 udp.offer(datagram);
                 continue;
@@ -517,6 +609,7 @@ async fn offer_netstack_packet(
 enum TunOutput {
     Raw(Packet),
     Udp(QueuedUdpResponse),
+    Echo(QueuedEchoResponse),
 }
 
 /// One bounded scheduling owner, not another packet queue. The cursor persists
@@ -525,7 +618,8 @@ struct TunOutputMux {
     raw: PacketStream,
     ordinary: mpsc::Receiver<QueuedUdpResponse>,
     dns: mpsc::Receiver<QueuedUdpResponse>,
-    open: [bool; 3],
+    echo: mpsc::Receiver<QueuedEchoResponse>,
+    open: [bool; 4],
     next_lane: usize,
 }
 
@@ -534,30 +628,33 @@ impl TunOutputMux {
         raw: PacketStream,
         ordinary: mpsc::Receiver<QueuedUdpResponse>,
         dns: mpsc::Receiver<QueuedUdpResponse>,
+        echo: mpsc::Receiver<QueuedEchoResponse>,
     ) -> Self {
         Self {
             raw,
             ordinary,
             dns,
-            open: [true; 3],
+            echo,
+            open: [true; 4],
             next_lane: 0,
         }
     }
 
     fn try_next(&mut self) -> Option<TunOutput> {
-        for offset in 0..3 {
-            let lane = (self.next_lane + offset) % 3;
+        for offset in 0..4 {
+            let lane = (self.next_lane + offset) % 4;
             if !self.open[lane] {
                 continue;
             }
             let result = match lane {
                 0 => self.raw.try_recv().map(TunOutput::Raw),
                 1 => self.ordinary.try_recv().map(TunOutput::Udp),
-                _ => self.dns.try_recv().map(TunOutput::Udp),
+                2 => self.dns.try_recv().map(TunOutput::Udp),
+                _ => self.echo.try_recv().map(TunOutput::Echo),
             };
             match result {
                 Ok(output) => {
-                    self.next_lane = (lane + 1) % 3;
+                    self.next_lane = (lane + 1) % 4;
                     return Some(output);
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => self.open[lane] = false,
@@ -579,9 +676,10 @@ impl TunOutputMux {
                 packet = self.raw.recv(), if self.open[0] => (0, packet.map(TunOutput::Raw)),
                 response = self.ordinary.recv(), if self.open[1] => (1, response.map(TunOutput::Udp)),
                 response = self.dns.recv(), if self.open[2] => (2, response.map(TunOutput::Udp)),
+                response = self.echo.recv(), if self.open[3] => (3, response.map(TunOutput::Echo)),
             };
             if let Some(output) = output {
-                self.next_lane = (lane + 1) % 3;
+                self.next_lane = (lane + 1) % 4;
                 return Some(output);
             }
             self.open[lane] = false;
@@ -589,6 +687,7 @@ impl TunOutputMux {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn tun_write_loop(
     tun: Arc<TunIo>,
@@ -599,12 +698,38 @@ async fn tun_write_loop(
     traffic_stats: Arc<TunTrafficStats>,
     cancellation: CancellationToken,
 ) -> io::Result<()> {
-    let mut mux = TunOutputMux::new(packet_stream, responses, dns_responses);
+    tun_write_loop_with_echo(
+        tun,
+        packet_stream,
+        responses,
+        dns_responses,
+        closed_echo_lane(),
+        mtu,
+        traffic_stats,
+        cancellation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn tun_write_loop_with_echo(
+    tun: Arc<TunIo>,
+    packet_stream: PacketStream,
+    responses: mpsc::Receiver<QueuedUdpResponse>,
+    dns_responses: mpsc::Receiver<QueuedUdpResponse>,
+    echo_responses: mpsc::Receiver<QueuedEchoResponse>,
+    mtu: usize,
+    traffic_stats: Arc<TunTrafficStats>,
+    cancellation: CancellationToken,
+) -> io::Result<()> {
+    let mut mux = TunOutputMux::new(packet_stream, responses, dns_responses, echo_responses);
     let mut first_write_logged = false;
     let mut frames: [Vec<u8>; TUN_PACKET_BATCH_SIZE] =
         std::array::from_fn(|_| Vec::with_capacity(mtu));
     let mut raw: [Option<Packet>; TUN_PACKET_BATCH_SIZE] = std::array::from_fn(|_| None);
     let mut permits: [Option<DnsQueryPermit>; TUN_PACKET_BATCH_SIZE] =
+        std::array::from_fn(|_| None);
+    let mut echo_permits: [Option<tokio::sync::OwnedSemaphorePermit>; TUN_PACKET_BATCH_SIZE] =
         std::array::from_fn(|_| None);
     let mut outcomes = Vec::with_capacity(TUN_PACKET_BATCH_SIZE);
     loop {
@@ -631,6 +756,10 @@ async fn tun_write_loop(
             processed += 1;
             match output {
                 TunOutput::Raw(packet) => raw[count] = Some(packet),
+                TunOutput::Echo(QueuedEchoResponse { packet, permit }) => {
+                    raw[count] = Some(packet);
+                    echo_permits[count] = Some(permit);
+                }
                 TunOutput::Udp(QueuedUdpResponse {
                     datagram,
                     dns_permit,
@@ -662,6 +791,7 @@ async fn tun_write_loop(
             let mut down_bytes = 0usize;
             for (index, outcome) in outcomes.drain(..).enumerate() {
                 permits[index].take();
+                echo_permits[index].take();
                 match outcome {
                     Ok(_) => {
                         down_bytes = down_bytes.saturating_add(slices[index].len());
@@ -694,6 +824,7 @@ async fn tun_write_loop(
         for index in 0..count {
             raw[index] = None;
             permits[index] = None;
+            echo_permits[index] = None;
         }
         for _ in 0..processed {
             tokio::task::consume_budget().await;

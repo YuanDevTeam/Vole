@@ -691,6 +691,23 @@ impl PreparedCore {
             traffic_stats.clone(),
         )?
         .with_resources(control);
+        #[cfg(all(target_os = "linux", feature = "interop-test"))]
+        let tun_runtime = tun_runtime
+            .with_real_echo(
+                proxy_graph.dialer.clone(),
+                [
+                    self.config.dns.fake_ip.range,
+                    self.config.dns.fake_ip.range6,
+                ]
+                .map(|range| {
+                    range
+                        .filter(|_| self.config.dns.fake_ip.enabled)
+                        .map(|range| range.cidr)
+                }),
+                std::time::Duration::from_secs(10),
+                false,
+            )
+            .await?;
         RunningCore::start_components(
             &self.config.inbounds,
             dispatcher,
