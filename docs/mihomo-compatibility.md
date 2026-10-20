@@ -26,7 +26,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 | QUIC 配置 | HY2 独立 initial/max 接收窗口、秒 handshake-timeout；TUIC v5 入口ip、毫秒heartbeat、反向命名的stream/connection窗口、所有者池阈值、frame/fragment限制、PMTUD与UoT v2 |
 | 客户端 TLS | tls.custom-certifactes 证书内容；启动时合并可读系统根、WebPKI 与显式根并跨组件共享；TUIC v5 与其它 TLS 节点复用 cert/private-key 身份加载 |
 | 嗅探 | TUN/mixed TCP 的 HTTP1/HTTP2/TLS；TUN 与授权 SOCKS5 UDP 共用 QUIC v1/v2；域名/地址排除、强制条件和目标覆盖 |
-| Linux 自建设备 | auto-detect-interface、auto-route、IPv6 地址、CIDR 捕获/排除、UID/端口作用域、路由索引、strict-route 与 systemd-resolved DNS 接管；失败和停止时恢复本次修改 |
+| Linux 自建设备 | auto-detect-interface、auto-route、IPv6 地址、CIDR 捕获/排除、输入接口与 UID/端口作用域、路由索引、strict-route 与 systemd-resolved DNS 接管；失败和停止时恢复本次修改 |
 | 运行状态 | 连接快照、流量计数和关闭；组与资源状态；规则命中、有效配置、受限 DNS 诊断 |
 
 [业务 HTTP 处理](http-processing.md) 是独立扩展：URL rewrite 与选择性 HTTPS MITM 使用单独输入，

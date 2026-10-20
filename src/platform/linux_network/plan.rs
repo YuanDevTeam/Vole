@@ -6,7 +6,8 @@ use std::{
 };
 
 pub(super) const MAX_ROUTES: usize = 4096;
-pub(super) const RULE_SPAN: u32 = 4;
+pub(super) const RULE_SPAN: u32 = 8;
+const MAX_RULES: usize = 2 * (2 * 256 + 16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Route {
     pub ipv6: bool,
@@ -17,6 +18,8 @@ pub(crate) struct Route {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Selector {
     Local,
+    /// NUL-terminated Linux input-interface name; not an egress binding.
+    Ingress([u8; 16]),
     Uid(UidRange),
     SourcePort(PortRange),
     DestinationPort(PortRange),
@@ -85,11 +88,13 @@ impl Plan {
         let excluded = excluded_uids(&options.include_uid, &options.exclude_uid);
         let mut rules = Vec::new();
         let base = options.rule_index;
+        base.checked_add(RULE_SPAN).ok_or_else(invalid)?;
         for family in [false, true] {
             let available = !family || ipv6;
             if !available && !options.strict_route {
                 continue;
             }
+            let capture_priority = base + if available { 4 } else { 6 };
             let mut push = |offset, selector, action| {
                 rules.push(Rule {
                     ipv6: family,
@@ -115,22 +120,54 @@ impl Plan {
             for &range in &excluded {
                 push(0, Selector::Uid(range), Action::Goto(base + RULE_SPAN));
             }
+            // TUN egress must never be captured a second time. Kernel name
+            // selectors survive interface deletion and become dormant; no
+            // interface discovery, index cache or background watcher is needed.
+            push(
+                1,
+                ingress(if config.device.is_empty() {
+                    "Vole"
+                } else {
+                    &config.device
+                })?,
+                Action::Goto(base + RULE_SPAN),
+            );
+            if !options.include_interface.is_empty() {
+                // Fixed sing-tun reference gives include precedence over exclude.
+                // Local output has Iif=lo and must be included explicitly.
+                for name in &options.include_interface {
+                    push(2, ingress(name)?, Action::Goto(capture_priority));
+                }
+                push(3, Selector::Any, Action::Goto(base + RULE_SPAN));
+            } else if !options.exclude_interface.is_empty() {
+                for name in &options.exclude_interface {
+                    push(2, ingress(name)?, Action::Goto(base + RULE_SPAN));
+                }
+            } else {
+                // Preserve the existing local-only default when no interface
+                // scope is requested, rather than expanding the capture domain.
+                push(2, Selector::Local, Action::Goto(capture_priority));
+                push(3, Selector::Any, Action::Goto(base + RULE_SPAN));
+            }
             if available {
-                // LAN routes stay usable; DNS is first offered to the configured
-                // capture table, as in the reference's non-53 main-table rule.
+                // LAN routes stay usable; DNS is first offered to the capture
+                // table. The preceding Iif gate scopes every later lookup.
                 push(
-                    1,
+                    4,
                     Selector::DestinationPort(PortRange { start: 53, end: 53 }),
                     Action::Table(options.table_index),
                 );
-                push(2, Selector::Local, Action::MainNonDefault);
-                push(3, Selector::Local, Action::Table(options.table_index));
+                push(5, Selector::Any, Action::MainNonDefault);
+                push(6, Selector::Any, Action::Table(options.table_index));
             } else {
-                // This rejects the uncaptured family for local application
-                // traffic, but never the core's protected physical sockets.
-                push(1, Selector::Local, Action::Unreachable);
+                // Strict-route applies to the same selected input scope,
+                // but never the core's protected physical sockets.
+                push(6, Selector::Any, Action::Unreachable);
             }
             push(RULE_SPAN, Selector::Any, Action::Nop);
+        }
+        if rules.len() > MAX_RULES {
+            return Err(invalid());
         }
         Ok(Self {
             routes,
@@ -139,6 +176,15 @@ impl Plan {
         })
     }
 }
+fn ingress(name: &str) -> io::Result<Selector> {
+    if name.is_empty() || name.len() >= 16 || name.as_bytes().contains(&0) {
+        return Err(invalid());
+    }
+    let mut bytes = [0; 16];
+    bytes[..name.len()].copy_from_slice(name.as_bytes());
+    Ok(Selector::Ingress(bytes))
+}
+
 fn key(prefix: IpCidr) -> (bool, u8, u128) {
     (
         prefix.network.is_ipv6(),
@@ -307,9 +353,9 @@ mod tests {
         config.network.strict_route = true;
         let plan = Plan::new(&config, false).unwrap();
         assert!(
-            plan.rules.iter().any(|r| r.ipv6
-                && r.action == Action::Unreachable
-                && r.selector == Selector::Local)
+            plan.rules
+                .iter()
+                .any(|r| r.ipv6 && r.action == Action::Unreachable && r.selector == Selector::Any)
         );
         for uid in [0, 1000, 1001, 1002, 1003, 1004] {
             let excluded=plan.rules.iter().any(|r|!r.ipv6 && matches!(r.selector,Selector::Uid(range) if (range.start..=range.end).contains(&uid)));
@@ -324,5 +370,78 @@ mod tests {
         )));
         config.network.inet6_address.clear();
         assert!(!Plan::new(&config, true).unwrap().ipv6);
+    }
+    fn captured(plan: &Plan, ipv6: bool, input: &str, mark: u32, uid: u32, source: u16) -> bool {
+        if mark != 0 {
+            return false;
+        }
+        let mut next = 0;
+        while let Some(rule) = plan
+            .rules
+            .iter()
+            .filter(|rule| rule.ipv6 == ipv6 && rule.priority >= next)
+            .find(|rule| match rule.selector {
+                Selector::Local => input == "lo",
+                Selector::Ingress(name) => {
+                    name[..input.len().min(16)] == *input.as_bytes()
+                        && name.get(input.len()) == Some(&0)
+                }
+                Selector::Uid(range) => input == "lo" && (range.start..=range.end).contains(&uid),
+                Selector::SourcePort(range) => (range.start..=range.end).contains(&source),
+                Selector::DestinationPort(range) => (range.start..=range.end).contains(&443),
+                Selector::Any => true,
+            })
+        {
+            match rule.action {
+                Action::Goto(priority) => next = priority,
+                Action::Table(_) => return true,
+                Action::Unreachable => return true,
+                Action::MainNonDefault | Action::Nop => next = rule.priority + 1,
+            }
+        }
+        false
+    }
+    #[test]
+    fn native_tun_input_interfaces_scope_local_and_ingress_with_reference_precedence() {
+        let mut config = TunConfig::default();
+        let default = Plan::new(&config, true).unwrap();
+        for family in [false, true] {
+            assert!(captured(&default, family, "lo", 0, 1000, 42000));
+            assert!(!captured(&default, family, "veth-a", 0, 1000, 42000));
+        }
+        config.network.include_interface =
+            vec!["lo".into(), "veth-a".into(), "missing-input".into()];
+        config.network.exclude_interface = vec!["lo".into(), "veth-a".into()];
+        config.network.exclude_src_port = vec![PortRange {
+            start: 5353,
+            end: 5353,
+        }];
+        config.network.exclude_uid = vec![UidRange {
+            start: 1005,
+            end: 1005,
+        }];
+        let plan = Plan::new(&config, true).unwrap();
+        for family in [false, true] {
+            for input in ["lo", "veth-a", "missing-input"] {
+                assert!(captured(&plan, family, input, 0, 1000, 42000));
+                assert!(!captured(&plan, family, input, 9, 1000, 42000));
+                assert!(!captured(&plan, family, input, 0, 1000, 5353));
+            }
+            assert!(!captured(&plan, family, "veth-b", 0, 1000, 42000));
+            assert!(!captured(&plan, family, "lo", 0, 1005, 42000));
+            assert!(captured(&plan, family, "veth-a", 0, 1005, 42000));
+            assert!(!captured(&plan, family, "Vole", 0, 1000, 42000));
+        }
+        // No OS lookup occurs. A named device disappearing removes matching
+        // packets, without mutating the lease or falling back to another Iif.
+        assert_eq!(plan.rules, Plan::new(&config, true).unwrap().rules);
+        config.network.include_interface.clear();
+        config.network.exclude_interface = vec!["lo".into(), "veth-b".into()];
+        let plan = Plan::new(&config, true).unwrap();
+        for family in [false, true] {
+            assert!(!captured(&plan, family, "lo", 0, 1000, 42000));
+            assert!(!captured(&plan, family, "veth-b", 0, 1000, 42000));
+            assert!(captured(&plan, family, "veth-a", 0, 1000, 42000));
+        }
     }
 }

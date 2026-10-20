@@ -106,6 +106,12 @@ mod tests {
                 selector: plan::Selector::Local,
                 action: plan::Action::Table(2022),
             }),
+            Change::Rule(Rule {
+                ipv6: true,
+                priority: 9002,
+                selector: plan::Selector::Ingress(*b"absent-dev\0\0\0\0\0\0"),
+                action: plan::Action::Goto(9004),
+            }),
             Change::DnsServers,
             Change::DnsDomains,
             Change::DnsDefaultRoute,

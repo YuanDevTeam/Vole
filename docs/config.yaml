@@ -131,7 +131,7 @@ secret: "vole-runtime-secret"
 # TUN 使用 Mihomo 同名字段；auto-route/auto-detect-interface 仅供 Linux 自建 TUN。
 # Linux 缺省均为 true，其他平台缺省 false；借用 fd 的网络配置始终由宿主负责。
 # Linux 自建 auto-route 消费 inet6-address、route-address/route-exclude-address、
-# iproute2-table-index/iproute2-rule-index、strict-route 和 UID/端口排除。
+# iproute2-table-index/iproute2-rule-index、strict-route、输入接口和 UID/端口排除。
 # 借用 fd、Apple/Android/Windows 仍由宿主应用这些网络设置；改动需要宿主重配/重连。
 # auto-redirect、stack、offload 等字段仍严格拒绝。
 # file-descriptor 缺省或 0 时由 core 打开本机平台 TUN；正数为当前进程已有 fd。
@@ -156,8 +156,10 @@ tun:
   # route-address: [] # 各地址族省略时捕获其默认网段
   # route-exclude-address: ["192.168.0.0/16", "fc00::/7"]
   # iproute2-table-index: 2022 # 0 使用缺省值；不得占用系统表
-  # iproute2-rule-index: 9000 # 0 使用缺省值；本会话使用该值到 +4
-  # strict-route: false # 自动路由时，阻止本机应用绕过未捕获的 IPv6 地址族
+  # iproute2-rule-index: 9000 # 0 使用缺省值；本会话使用该值到 +8
+  # strict-route: false # 自动路由时，阻止所选输入绕过未捕获的 IPv6 地址族
+  # include-interface: [lo, veth-client] # Linux ingress接口；本机output为lo；非空时忽略exclude-interface
+  # exclude-interface: [veth-bypass] # 仅include为空时使用；两者均空保持仅本机捕获
   # include-uid: [1001] # Linux 本机应用捕获范围；不解析 Android 包名
   # include-uid-range: ["1001:1010"]
   # exclude-uid: [1005] # exclude 优先于 include

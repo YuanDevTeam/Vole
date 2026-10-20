@@ -131,8 +131,8 @@ MTU/格式与 fd 标志，原生 builder 只打开 raw-IP TUN，不暗中启用 
 - `auto-route` 独占创建配置命名的 raw-IP TUN，已有同名接口失败。IPv4 使用
   `dns.fake-ip-range` 的原始 IPv4 地址（默认 `198.18.0.1`），前缀固定 /30；IPv6 地址从 `inet6-address` 读取。
   路由表 `iproute2-table-index`（缺省/0 为 2022）、规则优先级
-  `iproute2-rule-index` 到 `+4`（缺省/0 从 9000 开始）必须空闲；保留主表的非默认路由，
-  本机未标记流量经 TUN，转发流量不在本功能范围。Core socket 使用内部 mark 绕过捕获，
+  `iproute2-rule-index` 到 `+8`（缺省/0 从 9000 开始）必须空闲；保留主表的非默认路由，
+  缺省仅本机未标记流量经 TUN，显式输入接口作用域见下节。Core socket 使用内部 mark 绕过捕获，
   不依靠 source IP 避免递归。配置接口与路由直接通过内核接口完成，不调用 ip 子进程。
   全局或任一节点设置非零 `routing-mark` 时，该自建 auto-route 组合在创建接口前失败；
   动态 Provider 候选也不能引入冲突。借用 fd 和关闭 auto-route 的路径使用配置 mark。
@@ -162,18 +162,26 @@ CLI 的进程启动、后台管理及用户授权仍由调用方负责。
 `route-address` 与 `route-exclude-address` 接受统一的 IPv4/IPv6 CIDR。
 每个可用地址族没有指定捕获网段时使用默认网段；排除网段优先，先做精确 CIDR 相减，
 再安装本会话独占表中的路由。保留 main 表的非默认路由；53 端口先尝试捕获表，
-排除网段仍可绕过。只匹配本机未标记流量，Core 的私有出口 mark 不进入捕获规则。
+排除网段仍可绕过。捕获作用域内的未标记流量进入规则，Core 的私有出口 mark 不进入捕获。
+
+`include-interface/exclude-interface` 是 Linux RPDB 的输入接口名称筛选，不是物理出口。
+本机 output 使用 `lo`。非空 include 仅捕获所列输入，优先于 exclude（此时不使用 exclude）；
+要同时捕获本机须列出 `lo`。include 为空、exclude 非空时捕获未排除的输入和本机；
+两者均空保留仅本机的缺省作用域。TUN 自身输入与 Core 的带标记物理 socket 始终绕过。
+接口名在配置阶段按 Linux 名称语法与 15 字节上限验证，不要求接口已存在；
+缺失或消失的名称不匹配其他输入，之后出现或恢复同名接口可再次匹配，无需监视任务或重建规则。
+IPv4/IPv6 使用相同接口筛选；只改变本会话的捕获，不设置 forwarding、NAT 或防火墙。
 
 `include-uid/include-uid-range` 限定本机 UID 捕获范围；省略时为全部 UID。
 `exclude-uid/exclude-uid-range` 优先排除，端口排除使用
 `exclude-src-port/exclude-src-port-range/exclude-dst-port/exclude-dst-port-range`。
 范围格式为 `start:end`，不枚举范围内每个 UID 或端口。排除流量跳过本会话捕获规则，
-由后续系统路由决定去向。这些选项不改变出口的 protect/物理绑定，也不处理转发流量。
+由后续系统路由决定去向。UID 仅排除本机应用，端口排除作用于所选输入流量；这些选项不改变出口的 protect/物理绑定。
 
-`strict-route: true` 在自动路由中拒绝本机应用使用没有 TUN 地址的 IPv6 族，
+`strict-route: true` 在自动路由中拒绝所选输入使用没有 TUN 地址的 IPv6 族，
 UID/端口的显式旁路仍生效。它不代替宿主防火墙、权限设置或网络故障时的独立 kill switch。
 配置最多 256 项网络输入、派生最多 4096 条 CIDR 路由；超过预算在创建接口前失败。
-路由索引、UID、端口和 CIDR 改动需要重建捕获计划，运行期应用会返回需要重连。
+路由索引、输入接口、UID、端口和 CIDR 改动需要重建捕获计划，运行期应用会返回需要重连。
 
 这些自动设置仅用于 Core 自建 Linux TUN 且 `auto-route: true` 的路径。
 借用 fd 与 Apple/Android/UWP/Wintun 的接口地址、捕获范围、DNS 和权限由宿主应用；

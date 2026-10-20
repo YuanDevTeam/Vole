@@ -253,7 +253,7 @@ pub(super) fn ensure_available(ipv6: bool, table: u32, priority: u32) -> io::Res
             return Err(invalid());
         }
         let found_priority = property(&rule[12..], 6, 0)?;
-        if (priority..=priority + super::plan::RULE_SPAN).contains(&found_priority) {
+        if priority_occupied(priority, found_priority) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "Linux TUN rule priority is occupied",
@@ -261,6 +261,11 @@ pub(super) fn ensure_available(ipv6: bool, table: u32, priority: u32) -> io::Res
         }
     }
     Ok(())
+}
+fn priority_occupied(base: u32, found: u32) -> bool {
+    found
+        .checked_sub(base)
+        .is_some_and(|offset| offset <= super::plan::RULE_SPAN)
 }
 fn prefix_attribute(payload: &mut Vec<u8>, kind: u16, prefix: crate::config::IpCidr) {
     match prefix.network {
@@ -306,10 +311,23 @@ fn message(change: &Change, add: bool) -> io::Result<(u16, Vec<u8>)> {
                 Action::Goto(priority) => attr(&mut payload, 4, &priority.to_ne_bytes()),
                 Action::Unreachable | Action::Nop => {}
             }
-            if rule.selector != Selector::Any {
-                attr(&mut payload, 3, b"lo\0"); // Local application traffic only.
+            // Core physical sockets carry MARK. Gate all plan operations,
+            // including unrestricted input lookups, on zero mark. No interface
+            // selector is accidentally interpreted as a physical output name.
+            if rule.action != Action::Nop {
                 attr(&mut payload, 10, &0u32.to_ne_bytes());
                 attr(&mut payload, 16, &u32::MAX.to_ne_bytes());
+            }
+            match rule.selector {
+                Selector::Ingress(name) => {
+                    let end = name
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .ok_or_else(invalid)?;
+                    attr(&mut payload, 3, &name[..=end]);
+                }
+                Selector::Local | Selector::Uid(_) => attr(&mut payload, 3, b"lo\0"),
+                Selector::SourcePort(_) | Selector::DestinationPort(_) | Selector::Any => {}
             }
             match rule.selector {
                 Selector::Uid(range) => {
@@ -320,7 +338,7 @@ fn message(change: &Change, add: bool) -> io::Result<(u16, Vec<u8>)> {
                 }
                 Selector::SourcePort(range) => port_attribute(&mut payload, 23, range),
                 Selector::DestinationPort(range) => port_attribute(&mut payload, 24, range),
-                Selector::Local | Selector::Any => {}
+                Selector::Local | Selector::Ingress(_) | Selector::Any => {}
             }
             attr(&mut payload, 6, &rule.priority.to_ne_bytes());
             if add { NEW_RULE } else { DEL_RULE }
@@ -394,7 +412,7 @@ mod tests {
             assert_eq!(property(&bytes[12..], 4, 0).unwrap(), 8504);
             assert_eq!(
                 attribute(&bytes[12..], 3).unwrap(),
-                Some(b"lo\0".as_slice())
+                matches!(selector, Selector::Uid(_)).then_some(b"lo\0".as_slice())
             );
             assert_eq!(property(&bytes[12..], 16, 0).unwrap(), u32::MAX);
             match selector {
@@ -419,6 +437,49 @@ mod tests {
                 _ => unreachable!(),
             }
             assert_eq!(message(&rule, false).unwrap().1, bytes);
+        }
+    }
+    #[test]
+    fn native_tun_ingress_wire_and_reserved_span_restore_exact_name_selectors() {
+        use super::super::plan::Rule;
+        for family in [false, true] {
+            let mut name = [0; 16];
+            name[..10].copy_from_slice(b"absent-dev");
+            let rule = Change::Rule(Rule {
+                ipv6: family,
+                priority: 9002,
+                selector: Selector::Ingress(name),
+                action: Action::Goto(9004),
+            });
+            let (_, bytes) = message(&rule, true).unwrap();
+            assert_eq!(bytes[0], if family { 10 } else { 2 });
+            assert_eq!(
+                attribute(&bytes[12..], 3).unwrap(),
+                Some(b"absent-dev\0".as_slice())
+            );
+            assert_eq!(property(&bytes[12..], 16, 0).unwrap(), u32::MAX);
+            assert_eq!(message(&rule, false).unwrap().1, bytes);
+            let any = Change::Rule(Rule {
+                selector: Selector::Any,
+                action: Action::Table(2022),
+                ..match rule {
+                    Change::Rule(rule) => rule,
+                    _ => unreachable!(),
+                }
+            });
+            let (_, bytes) = message(&any, true).unwrap();
+            assert!(attribute(&bytes[12..], 3).unwrap().is_none());
+            assert_eq!(property(&bytes[12..], 10, 1).unwrap(), 0);
+        }
+        for (priority, expected) in [
+            (8999, false),
+            (9000, true),
+            (9007, true),
+            (9008, true),
+            (9009, false),
+            (u32::MAX, false),
+        ] {
+            assert_eq!(priority_occupied(9000, priority), expected);
         }
     }
 }

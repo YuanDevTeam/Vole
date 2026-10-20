@@ -1421,6 +1421,10 @@ struct RawTunConfig {
     rule_index: u32,
     #[serde(rename = "strict-route", default)]
     strict_route: bool,
+    #[serde(rename = "include-interface", default)]
+    include_interface: Vec<String>,
+    #[serde(rename = "exclude-interface", default)]
+    exclude_interface: Vec<String>,
     #[serde(rename = "include-uid", default)]
     include_uid: Vec<u32>,
     #[serde(rename = "include-uid-range", default)]
@@ -1503,6 +1507,8 @@ impl RawTunConfig {
                 table_index: self.table_index,
                 rule_index: self.rule_index,
                 strict_route: self.strict_route,
+                include_interface: self.include_interface,
+                exclude_interface: self.exclude_interface,
                 include_uid: self.include_uid,
                 include_uid_range: self.include_uid_range,
                 exclude_uid: self.exclude_uid,

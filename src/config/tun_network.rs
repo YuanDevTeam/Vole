@@ -16,6 +16,8 @@ pub struct TunNetworkConfig {
     pub table_index: u32,
     pub rule_index: u32,
     pub strict_route: bool,
+    pub include_interface: Vec<String>,
+    pub exclude_interface: Vec<String>,
     pub include_uid: Vec<UidRange>,
     pub exclude_uid: Vec<UidRange>,
     pub exclude_src_port: Vec<PortRange>,
@@ -38,6 +40,8 @@ impl Default for TunNetworkConfig {
             table_index: DEFAULT_TUN_TABLE,
             rule_index: DEFAULT_TUN_RULE,
             strict_route: false,
+            include_interface: Vec::new(),
+            exclude_interface: Vec::new(),
             include_uid: Vec::new(),
             exclude_uid: Vec::new(),
             exclude_src_port: Vec::new(),
@@ -54,6 +58,8 @@ pub(super) struct RawTunNetworkConfig {
     pub table_index: u32,
     pub rule_index: u32,
     pub strict_route: bool,
+    pub include_interface: Vec<String>,
+    pub exclude_interface: Vec<String>,
     pub include_uid: Vec<u32>,
     pub include_uid_range: Vec<String>,
     pub exclude_uid: Vec<u32>,
@@ -68,6 +74,8 @@ impl RawTunNetworkConfig {
         let count = self.inet6_address.as_ref().map_or(0, Vec::len)
             + self.route_address.len()
             + self.route_exclude_address.len()
+            + self.include_interface.len()
+            + self.exclude_interface.len()
             + self.include_uid.len()
             + self.include_uid_range.len()
             + self.exclude_uid.len()
@@ -90,8 +98,8 @@ impl RawTunNetworkConfig {
             self.rule_index
         };
         if matches!(table_index, 253..=255)
-            || rule_index.checked_add(4).is_none()
-            || (rule_index..=rule_index + 4).any(|priority| matches!(priority, 0 | 32766 | 32767))
+            || rule_index.checked_add(8).is_none()
+            || (rule_index..=rule_index + 8).any(|priority| matches!(priority, 0 | 32766 | 32767))
         {
             return invalid("TUN routing indices overlap reserved system objects");
         }
@@ -151,6 +159,8 @@ impl RawTunNetworkConfig {
             table_index,
             rule_index,
             strict_route: self.strict_route,
+            include_interface: interface_names(self.include_interface)?,
+            exclude_interface: interface_names(self.exclude_interface)?,
             include_uid: uid_ranges(self.include_uid, self.include_uid_range)?,
             exclude_uid: uid_ranges(self.exclude_uid, self.exclude_uid_range)?,
             exclude_src_port: port_ranges(self.exclude_src_port, self.exclude_src_port_range)?,
@@ -158,6 +168,24 @@ impl RawTunNetworkConfig {
         })
     }
 }
+fn interface_names(mut names: Vec<String>) -> Result<Vec<String>> {
+    // Linux IFNAMSIZ includes NUL. Retain names rather than ifindices: an
+    // absent interface is a dormant RPDB selector and can appear later.
+    if names.iter().any(|name| {
+        name.is_empty()
+            || name.len() >= 16
+            || matches!(name.as_str(), "." | "..")
+            || name
+                .bytes()
+                .any(|byte| byte == 0 || byte == b'/' || byte == b':' || byte.is_ascii_whitespace())
+    }) {
+        return invalid("TUN input interfaces require valid Linux interface names");
+    }
+    names.sort_unstable();
+    names.dedup();
+    Ok(names)
+}
+
 fn number(text: &str) -> Option<u32> {
     if text.is_empty() || text.trim() != text || text.starts_with('-') {
         return None;
@@ -290,5 +318,35 @@ rules: ["MATCH,DIRECT"]
         .normalize()
         .unwrap();
         assert!(empty.inet6_address.is_empty());
+    }
+    #[test]
+    fn tun_input_interfaces_are_bounded_names_without_interface_discovery() {
+        let config = super::super::Config::parse_yaml(
+            br#"tun: {include-interface: [lo, absent-veth, lo], exclude-interface: [other-veth]}
+rules: ['MATCH,DIRECT']"#,
+        )
+        .unwrap();
+        assert_eq!(config.tun.network.include_interface, ["absent-veth", "lo"]);
+        for name in [
+            "",
+            ".",
+            "..",
+            "with/slash",
+            "bad:name",
+            "bad name",
+            "1234567890123456",
+            "bad\0name",
+        ] {
+            assert!(interface_names(vec![name.into()]).is_err());
+        }
+        assert!(
+            RawTunNetworkConfig {
+                include_interface: vec!["lo".into(); MAX_NETWORK_ITEMS + 1],
+                ..Default::default()
+            }
+            .normalize()
+            .is_err()
+        );
+        assert!(super::super::Config::parse_yaml(b"tun: {iproute2-rule-index: 32760}").is_err());
     }
 }
