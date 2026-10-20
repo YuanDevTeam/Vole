@@ -233,6 +233,12 @@ impl Drop for Transport {
 
 #[async_trait]
 impl DatagramTransport for Transport {
+    fn supports_shared_destinations(&self) -> bool {
+        // Native packets retain their own address and consume an ID before
+        // awaiting capacity. The router owns target and cancellation identity.
+        matches!(self.registry.mode, TuicUdpMode::Native)
+    }
+
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         let mut address = Vec::new();
         let space = if wire::address(peer, &mut address).is_ok() {
@@ -479,6 +485,44 @@ mod tests {
             payload,
         }
     }
+    #[test]
+    fn shared_native_partial_fragments_keep_destination_and_packet_id_boundaries() {
+        let first = Destination::Ip("198.51.100.1:443".parse().unwrap());
+        let second = Destination::Ip("[2001:db8::2]:8443".parse().unwrap());
+        let old =
+            wire::packets_with_payload_limit(7, u16::MAX, &first, b"old-tail", 64, 4).unwrap();
+        let fresh = wire::packets_with_payload_limit(7, 0, &second, b"new-body", 64, 4).unwrap();
+        let now = Instant::now();
+        let mut reassembly = Reassembly::default();
+        // Model a send cancelled after its first complete native fragment.
+        // The next ID may wrap, but must retain its independent destination.
+        assert!(
+            reassembly
+                .push(wire::decode(old[0].clone()).unwrap(), now, 8)
+                .is_none()
+        );
+        assert!(
+            reassembly
+                .push(wire::decode(fresh[1].clone()).unwrap(), now, 8)
+                .is_none()
+        );
+        let packet = reassembly
+            .push(wire::decode(fresh[0].clone()).unwrap(), now, 8)
+            .unwrap();
+        assert_eq!(packet.remote, second);
+        assert_eq!(packet.payload, b"new-body"[..]);
+        assert_eq!(reassembly.packets.len(), 1);
+        reassembly.expire(now + TTL);
+        assert!(reassembly.packets.is_empty());
+        assert_eq!(reassembly.bytes, 0);
+        // A late tail cannot borrow the later packet's address or payload.
+        assert!(
+            reassembly
+                .push(wire::decode(old[1].clone()).unwrap(), now + TTL, 8)
+                .is_none()
+        );
+    }
+
     #[test]
     fn reassembly_releases_completed_ids_and_orders_duplicates_without_cross_packet_mix() {
         let _case = crate::resources::case_events::Case::new("TUIC-UNIT", "reassembly_order");

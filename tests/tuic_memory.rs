@@ -353,6 +353,22 @@ async fn stalled_quic_handshake_obeys_setup_deadline_and_stop_barrier() {
     }
 }
 
+fn udp_wire_target(index: usize) -> (Destination, &'static [u8]) {
+    match index % 3 {
+        0 => (Destination::domain("x", 80).unwrap(), b"\0\x01x\0\x50"),
+        1 => (
+            Destination::Ip("198.51.100.7:443".parse().unwrap()),
+            &[1, 198, 51, 100, 7, 1, 187],
+        ),
+        _ => (
+            Destination::Ip("[2001:db8::7]:8443".parse().unwrap()),
+            &[
+                2, 32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 32, 251,
+            ],
+        ),
+    }
+}
+
 #[tokio::test]
 async fn both_udp_modes_preserve_empty_and_u16_packets_and_dissociate() {
     let _case = Case::new("TUIC-UNIT", "udp_wire");
@@ -381,9 +397,9 @@ async fn both_udp_modes_preserve_empty_and_u16_packets_and_dissociate() {
                     assert_eq!(&raw[..4], &[5, 2, 0, 0]);
                     assert_eq!(u16::from_be_bytes([raw[4], raw[5]]), packet as u16);
                     let start = if raw[7] == 0 {
-                        assert_eq!(&raw[10..14], b"\0\x01x\0");
-                        assert_eq!(raw[14], 80);
-                        15
+                        let (_, address) = udp_wire_target(packet);
+                        assert_eq!(&raw[10..10 + address.len()], address);
+                        10 + address.len()
                     } else {
                         assert_eq!(raw[10], 255);
                         11
@@ -442,6 +458,7 @@ async fn both_udp_modes_preserve_empty_and_u16_packets_and_dissociate() {
                         &EstablishContext::default(),
                     )
                     .await?;
+                assert_eq!(udp.supports_shared_destinations(), mode == "native");
                 assert!(
                     udp.send(Datagram {
                         remote: Destination::domain("x", 80).unwrap(),
@@ -459,7 +476,7 @@ async fn both_udp_modes_preserve_empty_and_u16_packets_and_dissociate() {
                 let result = tokio::time::timeout(Duration::from_secs(5), async {
                     for (packet, size) in SIZES.iter().copied().enumerate() {
                         let request = Datagram {
-                            remote: Destination::domain("x", 80).unwrap(),
+                            remote: udp_wire_target(packet).0,
                             payload: vec![packet as u8; size].into(),
                             sniffed_domain: None,
                         };
