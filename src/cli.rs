@@ -23,6 +23,9 @@ struct Options {
     config_file: Option<PathBuf>,
     config_string: Option<Zeroizing<String>>,
     age_secret_key: Option<Zeroizing<String>>,
+    external_controller: Option<Zeroizing<String>>,
+    external_controller_tls: Option<Zeroizing<String>>,
+    secret: Option<Zeroizing<String>>,
     http_config_file: Option<PathBuf>,
     http_ca_file: Option<PathBuf>,
 }
@@ -47,6 +50,9 @@ impl Options {
         let mut config_file = config_file.map(PathBuf::from);
         let mut config_string = None;
         let mut age_secret_key = None;
+        let mut external_controller = None;
+        let mut external_controller_tls = None;
+        let mut secret = None;
         let mut http_config_file = None;
         let mut http_ca_file = None;
         while let Some(argument) = arguments.next() {
@@ -64,6 +70,9 @@ impl Options {
                         config_file,
                         config_string,
                         age_secret_key,
+                        external_controller,
+                        external_controller_tls,
+                        secret,
                         http_config_file,
                         http_ca_file,
                     });
@@ -76,23 +85,27 @@ impl Options {
                         validate = value;
                     }
                 }
-                b"config" | b"age-secret-key" => {
+                b"config" | b"age-secret-key" | b"ext-ctl" | b"ext-ctl-tls" | b"secret" => {
                     let value = inline
                         .map(OsStr::to_owned)
                         .or_else(|| arguments.next())
-                        .ok_or(CliError::argument(if flag == b"config" {
-                            "missing value for -config"
-                        } else {
-                            "missing value for -age-secret-key"
+                        .ok_or(CliError::argument(match flag {
+                            b"config" => "missing value for -config",
+                            b"age-secret-key" => "missing value for -age-secret-key",
+                            b"ext-ctl" => "missing value for -ext-ctl",
+                            b"ext-ctl-tls" => "missing value for -ext-ctl-tls",
+                            _ => "missing value for -secret",
                         }))?;
                     let value = value.into_string().map(Zeroizing::new).map_err(|value| {
                         drop(Zeroizing::new(value.into_encoded_bytes()));
                         CliError::argument("text option requires UTF-8")
                     })?;
-                    if flag == b"config" {
-                        config_string = Some(value);
-                    } else {
-                        age_secret_key = Some(value);
+                    match flag {
+                        b"config" => config_string = Some(value),
+                        b"age-secret-key" => age_secret_key = Some(value),
+                        b"ext-ctl" => external_controller = Some(value),
+                        b"ext-ctl-tls" => external_controller_tls = Some(value),
+                        _ => secret = Some(value),
                     }
                     drop(Zeroizing::new(argument.into_encoded_bytes()));
                 }
@@ -141,6 +154,9 @@ impl Options {
             config_file,
             config_string,
             age_secret_key,
+            external_controller,
+            external_controller_tls,
+            secret,
             http_config_file,
             http_ca_file,
         })
@@ -201,11 +217,16 @@ fn request(options: Options) -> Value {
         payload["configPath"] =
             serde_json::to_value(InvokePath::from(path)).expect("native path serialization");
     }
-    if let Some(mut value) = options.config_string {
-        payload["configString"] = Value::String(std::mem::take(&mut *value));
-    }
-    if let Some(mut value) = options.age_secret_key {
-        payload["ageSecretKey"] = Value::String(std::mem::take(&mut *value));
+    for (name, value) in [
+        ("configString", options.config_string),
+        ("ageSecretKey", options.age_secret_key),
+        ("externalController", options.external_controller),
+        ("externalControllerTls", options.external_controller_tls),
+        ("secret", options.secret),
+    ] {
+        if let Some(mut value) = value {
+            payload[name] = Value::String(std::mem::take(&mut *value));
+        }
     }
     if let Some(path) = options.http_config_file {
         payload["httpConfigPath"] =
@@ -221,7 +242,7 @@ fn request(options: Options) -> Value {
 }
 fn call(mut request: Value) -> Result<Value, CliError> {
     let bytes = serde_json::to_vec(&request);
-    for name in ["configString", "ageSecretKey"] {
+    for name in ["configString", "ageSecretKey", "secret"] {
         if let Some(Value::String(value)) = request["payload"].get_mut(name) {
             value.zeroize();
         }
@@ -371,6 +392,27 @@ mod tests {
         assert_eq!(
             request(parse(&["-config=invalid", "-v"]).unwrap()),
             json!({"method":"version","payload":{}})
+        );
+    }
+    #[test]
+    fn controller_override_options_only_transport_specific_values() {
+        let options = parse(&[
+            "-ext-ctl=:9900",
+            "--ext-ctl-tls",
+            "localhost:9943",
+            "-secret",
+            "private-token",
+            "-t",
+        ])
+        .unwrap();
+        assert!(!format!("{options:?}").contains("private-token"));
+        let value = request(options);
+        assert_eq!(value["payload"]["externalController"], ":9900");
+        assert_eq!(value["payload"]["externalControllerTls"], "localhost:9943");
+        assert_eq!(value["payload"]["secret"], "private-token");
+        assert_eq!(
+            request(parse(&["-secret=", "-t"]).unwrap())["payload"]["secret"],
+            ""
         );
     }
     #[test]

@@ -190,6 +190,7 @@ HTTP 内容或来源上下文变更要求显式重连。失败恢复的策略组
 显式配置传递另选 `main_config_and_provider_rebuild_preserve_the_addendum_until_explicit_clear`、
 `update_http_addendum_preserves_optional_clear_and_its_separate_byte_limit` 和二进制
 `cli::tests::http_addendum_option_only_transports_an_explicit_native_path`。
+`invoke::foreground::overrides::tests::` 检查具体 Controller 覆盖、空值保留及沿用地址解析器；
 `invoke::foreground::input::tests::` 检查 Base64 来源优先、标准 padding、认证 AGE 固定向量、
 输入预算与取消；`invoke::tests::owned_invoke_uses_the_shared_strict_and_runtime_thread_boundaries`
 检查 CLI 的 owned 请求与借用请求共用严格准入和重入边界。

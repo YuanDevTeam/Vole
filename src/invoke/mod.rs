@@ -1192,11 +1192,11 @@ impl CoreController {
         let (mut config, http_input, resolved_cache) = match input {
             #[cfg(test)]
             StartupConfig::Yaml(yaml) => (parse_config_yaml(&yaml)?, None, None),
-            StartupConfig::Input(payload) => (
-                parse_config_yaml(&payload.config_yaml)?,
-                Some(payload),
-                None,
-            ),
+            StartupConfig::Input(mut payload) => {
+                let mut config = parse_config_yaml(&payload.config_yaml)?;
+                std::mem::take(&mut payload.foreground_overrides).apply(&mut config);
+                (config, Some(payload), None)
+            }
             StartupConfig::Resolved(snapshot) => {
                 (snapshot.config, None, Some(snapshot.provider_cache))
             }

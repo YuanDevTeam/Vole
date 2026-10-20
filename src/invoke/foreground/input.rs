@@ -16,7 +16,7 @@ pub(super) fn private_text<'de, D: Deserializer<'de>>(
     Option::<String>::deserialize(deserializer).map(|value| value.map(Zeroizing::new))
 }
 
-fn option_text(
+pub(super) fn option_text(
     value: Option<Zeroizing<String>>,
     environment: &str,
     limit: usize,
@@ -144,12 +144,21 @@ pub(super) fn check_envelope(request: &str) -> Result<(), InvokeFailure> {
         config_string: Option<&'a RawValue>,
         #[serde(borrow)]
         age_secret_key: Option<&'a RawValue>,
+        #[serde(borrow)]
+        external_controller: Option<&'a RawValue>,
+        #[serde(borrow)]
+        external_controller_tls: Option<&'a RawValue>,
+        #[serde(borrow)]
+        secret: Option<&'a RawValue>,
     }
     let input: Input<'_> = serde_json::from_str(envelope.payload.get())
         .map_err(|_| failure("invalid foreground input"))?;
     for (raw, limit) in [
         (input.config_string, MAX_ENCODED_BYTES),
         (input.age_secret_key, MAX_SECRET_BYTES),
+        (input.external_controller, MAX_CONFIG_BYTES),
+        (input.external_controller_tls, MAX_CONFIG_BYTES),
+        (input.secret, MAX_CONFIG_BYTES),
     ] {
         if let Some(raw) = raw {
             super::super::check_json_string_limit(raw.get(), limit)

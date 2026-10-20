@@ -2531,7 +2531,7 @@ impl RawVoleConfig {
     }
 }
 
-fn normalize_external_controller(
+pub(crate) fn normalize_external_controller(
     listen: Option<String>,
     secret: Option<String>,
 ) -> Result<Option<ExternalControllerConfig>> {

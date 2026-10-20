@@ -3,6 +3,8 @@ use super::{
     CoreController, InvokeFailure, StartupConfig, invoke_instance_guarded, lock, registry,
 };
 mod input;
+mod overrides;
+pub(super) use overrides::ControllerOverrides;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -28,11 +30,14 @@ use tracing::{
 use zeroize::Zeroizing;
 
 const HELP: &str = "Vole standalone proxy core\n\
-Usage: vole [-d <data-dir>] [-f <config-file>] [-config <base64>] [-age-secret-key <key>] [-http-config <file>] [-http-ca <file>] [-t] [-v] [-h]\n\
+Usage: vole [-d <data-dir>] [-f <config-file>] [-config <base64>] [-age-secret-key <key>] [-ext-ctl <address>] [-ext-ctl-tls <address>] [-secret <token>] [-http-config <file>] [-http-ca <file>] [-t] [-v] [-h]\n\
   -d <data-dir>     Data directory (default: home/.config/vole)\n\
   -f <config-file>  Configuration file; - reads stdin (default: <data-dir>/config.yaml)\n\
   -config <base64>  Base64-encoded configuration; nonempty text takes priority\n\
   -age-secret-key <key>  AGE identity for an encrypted configuration\n\
+  -ext-ctl <address>  Override the HTTP Controller address when nonempty\n\
+  -ext-ctl-tls <address>  Override the TLS Controller address when nonempty\n\
+  -secret <token>   Override Controller authentication when nonempty\n\
   -http-config <file>  Explicit HTTP processing addendum (optional)\n\
   -http-ca <file>   Private CA JSON file for selected HTTPS processing\n\
   -t               Validate configuration and exit\n\
@@ -115,6 +120,12 @@ pub(super) struct ForegroundPayload {
     config_string: Option<Zeroizing<String>>,
     #[serde(default, deserialize_with = "input::private_text")]
     age_secret_key: Option<Zeroizing<String>>,
+    #[serde(default, deserialize_with = "input::private_text")]
+    external_controller: Option<Zeroizing<String>>,
+    #[serde(default, deserialize_with = "input::private_text")]
+    external_controller_tls: Option<Zeroizing<String>>,
+    #[serde(default, deserialize_with = "input::private_text")]
+    secret: Option<Zeroizing<String>>,
     #[serde(default)]
     http_config_path: Option<InvokePath>,
     #[serde(default)]
@@ -225,6 +236,12 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
             json!({"output":"configuration valid\n","diagnostics":if external {"HTTP external resources are not validated\n"} else {""}}),
         );
     }
+    // Like Mihomo, -t validates the source and returns before run-only overrides.
+    let overrides = ControllerOverrides::read(
+        payload.external_controller,
+        payload.external_controller_tls,
+        payload.secret,
+    )?;
     let dispatch = tracing::Dispatch::new(StderrSubscriber::new());
     let _logging = tracing::dispatcher::set_default(&dispatch);
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -274,6 +291,7 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
             http_context: context,
             source_file,
             cancellation: Some(cancellation.clone()),
+            foreground_overrides: overrides,
         });
         let result = run_controller(controller, startup, shutdown, cancellation).await;
         let stopped = cleanup.destroy();
@@ -924,6 +942,9 @@ mod tests {
             action: ForegroundAction::Validate,
             config_string: None,
             age_secret_key: None,
+            external_controller: None,
+            external_controller_tls: None,
+            secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
             http_config_path: None,
@@ -962,6 +983,9 @@ mod tests {
             action: ForegroundAction::Validate,
             config_string: None,
             age_secret_key: None,
+            external_controller: None,
+            external_controller_tls: None,
+            secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
             http_config_path: None,
@@ -982,6 +1006,9 @@ mod tests {
             action: ForegroundAction::Validate,
             config_string: None,
             age_secret_key: None,
+            external_controller: None,
+            external_controller_tls: None,
+            secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
             http_config_path: None,
@@ -1012,6 +1039,9 @@ mod tests {
             action: ForegroundAction::Validate,
             config_string: None,
             age_secret_key: None,
+            external_controller: None,
+            external_controller_tls: None,
+            secret: None,
             data_dir: invalid_path(),
             config_path: invalid_path(),
             http_config_path: None,
@@ -1027,6 +1057,9 @@ mod tests {
             action: ForegroundAction::Run,
             config_string: None,
             age_secret_key: None,
+            external_controller: None,
+            external_controller_tls: None,
+            secret: None,
             data_dir: Some(InvokePath::Text("\0".to_owned())),
             config_path: Some(InvokePath::Text("-".to_owned())),
             http_config_path: None,
@@ -1041,6 +1074,9 @@ mod tests {
             action: ForegroundAction::Run,
             config_string: None,
             age_secret_key: None,
+            external_controller: None,
+            external_controller_tls: None,
+            secret: None,
             data_dir: None,
             config_path: Some(InvokePath::Text("-".to_owned())),
             http_config_path: None,
@@ -1056,6 +1092,9 @@ mod tests {
             action: ForegroundAction::Help,
             config_string: None,
             age_secret_key: None,
+            external_controller: None,
+            external_controller_tls: None,
+            secret: None,
             data_dir: Some(InvokePath::Text("\0".to_owned())),
             config_path: Some(InvokePath::Text("\0".to_owned())),
             http_config_path: None,
@@ -1254,6 +1293,9 @@ mod tests {
             action: ForegroundAction::Validate,
             config_string: None,
             age_secret_key: None,
+            external_controller: None,
+            external_controller_tls: None,
+            secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(main.clone().into()),
             http_config_path: Some(http.clone().into()),
@@ -1267,6 +1309,9 @@ mod tests {
             action: ForegroundAction::Validate,
             config_string: None,
             age_secret_key: None,
+            external_controller: None,
+            external_controller_tls: None,
+            secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(main.clone().into()),
             http_config_path: None,

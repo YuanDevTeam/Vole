@@ -219,6 +219,48 @@ impl std::fmt::Debug for ProviderContent {
 pub type ProviderContents = BTreeMap<String, ProviderContent>;
 
 impl ProviderTemplate {
+    /// Concrete foreground defaults must survive provider re-materialization.
+    /// This does not expose arbitrary overrides or write back the source document.
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn override_controller(
+        &mut self,
+        http: Option<std::net::SocketAddr>,
+        tls: Option<std::net::SocketAddr>,
+        secret: Option<&str>,
+    ) {
+        use zeroize::Zeroize as _;
+        let base = self.base.as_mapping_mut().expect("validated mapping");
+        for (key, value) in [
+            ("external-controller", http.map(|value| value.to_string())),
+            (
+                "external-controller-tls",
+                tls.map(|value| value.to_string()),
+            ),
+            ("secret", secret.map(str::to_owned)),
+        ] {
+            if let Some(value) = value {
+                if let Some(Value::String(mut old)) = base.insert(key.into(), Value::String(value))
+                {
+                    old.zeroize();
+                }
+            }
+        }
+    }
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn controller_secret(&self) -> Option<&str> {
+        self.base
+            .get("secret")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    }
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn controller_cors(&self) -> super::ControllerCors {
+        self.base
+            .get("external-controller-cors")
+            .map_or_else(Default::default, |value| {
+                serde_yaml_ng::from_value(value.clone()).expect("validated Controller CORS")
+            })
+    }
     pub(crate) fn request_user_agent(&self) -> String {
         self.base
             .get("global-ua")

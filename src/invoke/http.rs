@@ -198,6 +198,8 @@ pub(super) struct StartPayload {
     pub(super) source_file: Option<PathBuf>,
     #[serde(skip)]
     pub(super) cancellation: Option<CancellationToken>,
+    #[serde(skip)]
+    pub(super) foreground_overrides: super::foreground::ControllerOverrides,
 }
 
 pub(crate) fn source_context(
