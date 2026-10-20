@@ -190,6 +190,10 @@ HTTP 内容或来源上下文变更要求显式重连。失败恢复的策略组
 显式配置传递另选 `main_config_and_provider_rebuild_preserve_the_addendum_until_explicit_clear`、
 `update_http_addendum_preserves_optional_clear_and_its_separate_byte_limit` 和二进制
 `cli::tests::http_addendum_option_only_transports_an_explicit_native_path`。
+`resource::paths::tests::` 与
+`resource::cache::tests::authorized_provider_roots_read_file_sources_and_write_only_http_caches`
+检查原生授权根、符号链接边界、file 读取与 HTTP 缓存写入分离；候选回归同时检查授权上下文继承。
+`resource::cache::tests::provider_metadata_requires_bounded_regular_files` 检查 sidecar 大小与 FIFO 拒绝，坏 metadata 不阻止有效正文读取。
 `invoke::foreground::overrides::tests::` 检查具体 Controller 覆盖、空值保留及沿用地址解析器；
 `invoke::foreground::input::tests::` 检查 Base64 来源优先、标准 padding、认证 AGE 固定向量、
 输入预算、取消、单份有效输入复用与主文件重读；

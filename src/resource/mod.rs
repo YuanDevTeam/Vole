@@ -9,6 +9,7 @@ pub(crate) mod control;
 pub(crate) mod http;
 #[cfg(any(feature = "invoke", test))]
 pub(crate) mod http_control;
+pub(crate) mod paths;
 pub(crate) mod probe;
 pub(crate) mod profile;
 pub(crate) mod provider_input;

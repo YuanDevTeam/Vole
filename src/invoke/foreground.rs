@@ -46,7 +46,7 @@ Usage: vole [-d <data-dir>] [-f <config-file>] [-config <base64>] [-age-secret-k
   -h               Print this help\n";
 
 /// Lossless native paths in Invoke metadata. Ordinary hosts may use a string.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum InvokePath {
     Text(String),
@@ -56,13 +56,13 @@ pub enum InvokePath {
     Windows(WindowsPath),
 }
 #[cfg(unix)]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UnixPath {
     unix_bytes: Vec<u8>,
 }
 #[cfg(windows)]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct WindowsPath {
     windows_wide: Vec<u16>,
@@ -243,6 +243,31 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
         payload.external_controller_tls,
         payload.secret,
     )?;
+    let mut provider_paths = crate::resource::paths::ProviderPaths::from_os_value(
+        std::env::var_os("VOLE_SAFE_PATHS"),
+        &cwd,
+    )
+    .map_err(|error| io_failure("provider path authorization", error))?;
+    let mut reserved = Vec::with_capacity(3);
+    if let Some(path) = input.source_file() {
+        reserved.push((path.to_owned(), false));
+    }
+    if let Some((_, path)) = &http_input {
+        reserved.push((path.clone(), false));
+    }
+    if let Some(path) = &payload.http_ca_path {
+        let path = path.clone().into_path();
+        reserved.push((
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            },
+            true,
+        ));
+    }
+    provider_paths.reserve_inputs(reserved);
+    let provider_paths = Arc::new(provider_paths);
     let dispatch = tracing::Dispatch::new(StderrSubscriber::new());
     let _logging = tracing::dispatcher::set_default(&dispatch);
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -275,7 +300,7 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
             input, directory: paths.data_dir.clone(), overrides: Arc::new(overrides.clone()),
         });
         registry()
-            .initialize_path(&paths.data_dir)
+            .initialize_path_with_provider_paths(&paths.data_dir, Some(Arc::new(provider_paths.authorization_only())))
             .map_err(|_| failure("data directory initialization failed"))?;
         let controller = registry().create_instance()?;
         let mut cleanup = ForegroundInstance(Some(controller.clone()));
@@ -293,6 +318,7 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
             source_file,
             cancellation: Some(cancellation.clone()),
             foreground_overrides: overrides,
+            provider_paths: Some(provider_paths.clone()),
         });
         let result = run_controller(controller, startup, signals, cancellation, reload).await;
         let stopped = cleanup.destroy();

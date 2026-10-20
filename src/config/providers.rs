@@ -183,6 +183,7 @@ impl ProviderSpec {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderTemplate {
+    pub(crate) resource_paths: Arc<crate::resource::paths::ProviderPaths>,
     pub(crate) http_policy: Option<Arc<crate::http_processing::Policy>>,
     pub(super) base: Value,
     pub(super) identity_directory: Option<std::path::PathBuf>,
@@ -331,6 +332,7 @@ impl ProviderTemplate {
         let proxies = take("proxy-providers", false)?;
         let rules = take("rule-providers", true)?;
         Ok(Self {
+            resource_paths: Arc::new(crate::resource::paths::ProviderPaths::default()),
             http_policy: None,
             base,
             identity_directory: None,

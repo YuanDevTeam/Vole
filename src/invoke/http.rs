@@ -200,6 +200,8 @@ pub(super) struct StartPayload {
     pub(super) cancellation: Option<CancellationToken>,
     #[serde(skip)]
     pub(super) foreground_overrides: super::foreground::ControllerOverrides,
+    #[serde(skip)]
+    pub(super) provider_paths: Option<Arc<crate::resource::paths::ProviderPaths>>,
 }
 
 pub(crate) fn source_context(

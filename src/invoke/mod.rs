@@ -100,6 +100,7 @@ struct RuntimeData {
     geodata: Arc<GeoDataManager>,
     dns_sources: Arc<crate::dns::source::NetworkSources>,
     http: Arc<tokio::sync::Mutex<crate::http_processing::providers::Store>>,
+    provider_paths: Arc<crate::resource::paths::ProviderPaths>,
 }
 
 impl Default for RuntimeRegistry {
@@ -455,6 +456,13 @@ impl RuntimeRegistry {
     }
 
     fn initialize_path(&self, path: &Path) -> Result<Arc<DataDirectory>, InvokeFailure> {
+        self.initialize_path_with_provider_paths(path, None)
+    }
+    fn initialize_path_with_provider_paths(
+        &self,
+        path: &Path,
+        provider_paths: Option<Arc<crate::resource::paths::ProviderPaths>>,
+    ) -> Result<Arc<DataDirectory>, InvokeFailure> {
         let initialized = Arc::new(DataDirectory::initialize(path).map_err(|error| {
             InvokeFailure::new(format!("failed to initialize dataDir: {error}"))
         })?);
@@ -466,6 +474,14 @@ impl RuntimeRegistry {
         let mut current = lock(&self.runtime_data);
         if let Some(current) = current.as_ref() {
             if current.directory.root() == initialized.root() {
+                if provider_paths
+                    .as_ref()
+                    .is_some_and(|next| next.as_ref() != current.provider_paths.as_ref())
+                {
+                    return Err(InvokeFailure::invalid_state(
+                        "provider path authorization is already initialized differently",
+                    ));
+                }
                 return Ok(current.directory.clone());
             }
             return Err(InvokeFailure::invalid_state(
@@ -474,6 +490,7 @@ impl RuntimeRegistry {
         }
         *current = Some(RuntimeData {
             directory: initialized.clone(),
+            provider_paths: provider_paths.unwrap_or_default(),
             geodata,
             dns_sources: Arc::new(crate::dns::source::NetworkSources::default()),
             http: Arc::new(tokio::sync::Mutex::new(
@@ -483,6 +500,11 @@ impl RuntimeRegistry {
         Ok(initialized)
     }
 
+    fn provider_paths(&self) -> Option<Arc<crate::resource::paths::ProviderPaths>> {
+        lock(&self.runtime_data)
+            .as_ref()
+            .map(|data| data.provider_paths.clone())
+    }
     fn data_directory(&self) -> Result<Arc<DataDirectory>, InvokeFailure> {
         lock(&self.runtime_data)
             .as_ref()
@@ -1194,6 +1216,11 @@ impl CoreController {
             StartupConfig::Yaml(yaml) => (parse_config_yaml(&yaml)?, None, None),
             StartupConfig::Input(mut payload) => {
                 let mut config = parse_config_yaml(&payload.config_yaml)?;
+                if let (Some(template), Some(paths)) =
+                    (&mut config.providers, payload.provider_paths.take())
+                {
+                    Arc::make_mut(template).resource_paths = paths;
+                }
                 std::mem::take(&mut payload.foreground_overrides).apply(&mut config);
                 (config, Some(payload), None)
             }
@@ -1669,6 +1696,9 @@ fn parse_config_yaml_with_http(
     let directory = registry().data_directory().ok();
     let mut config =
         parse_config_yaml_with_directory(config_yaml, directory.as_ref().map(|dir| dir.root()))?;
+    if let (Some(template), Some(paths)) = (&mut config.providers, registry().provider_paths()) {
+        Arc::make_mut(template).resource_paths = paths;
+    }
     config.set_http_config(http).map_err(InvokeFailure::from)?;
     Ok(config)
 }

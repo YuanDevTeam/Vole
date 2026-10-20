@@ -60,6 +60,15 @@ Unix 用户目录取 `HOME`，Windows 取 `USERPROFILE`，缺失时使用工作�
 开启选择性 HTTPS 时，额外传 `-http-ca /private/ca.json`，格式为 `{"certificate":"...PEM...","privateKey":"...PEM..."}`。Unix 文件必须属于当前用户、关闭 group／other 权限（如 0600），且不能是符号链接。私钥不进入共享规则、命令行正文、普通快照或日志；宿主管理证书生成与客户端信任。
 客户端 certificate/private-key 可引用 PEM 文件，相对路径从 -d 的数据目录解析；-t 同样读取并校验身份，仍不初始化目录。
 
+`VOLE_SAFE_PATHS` 可为主配置的 file provider 读取和 HTTP provider 缓存增加授权目录。
+使用系统路径列表分隔符（Unix 为 `:`、Windows 为 `;`），保留原生路径编码；相对目录从启动工作目录解析，
+空项不授权当前目录。授权目录必须已经存在，初始化后固定，并由 provider 候选与恢复快照继承。
+文件读取不创建目录；只有 HTTP provider 缓存可在授权根内新建目录及写入正文／sidecar。
+路径中的 `..`、祖先或目标符号链接逃逸被拒绝。默认仍限 dataDir；file provider 在额外目录内不会回写 bundle 回退。
+本次主配置／独立 HTTP 文件保留为不可被缓存覆盖的输入，显式私密 CA 路径不授予 provider 读写。
+该环境只进入 provider 资源上下文，不改变主配置、客户端身份／私密 CA、独立 HTTP 设置或 Controller socket 的文件合同；
+不修改全进程环境，也不提供任意目录写入授权。`-t/-h/-v` 不读取此环境值。
+
 正常运行执行 `initialize → createInstance → start(configYaml)`，等待退出后
 `stop → destroyInstance`。Unix 支持 SIGINT/SIGTERM，Windows 支持 Ctrl+C/Ctrl+Break；
 退出等待内核清理完成。诊断写入有界 stderr，遵循配置的 `log-level`，不包含配置正文或凭据。

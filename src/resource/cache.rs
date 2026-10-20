@@ -1,5 +1,6 @@
 //! Provider files and candidate updates. Publication belongs to the runtime graph owner.
 use super::http::{self, DownloadOutcome, DownloadRequest, HttpOptions};
+use super::paths::{Access, ProviderPaths};
 use super::subscription::SubscriptionInfo;
 use crate::{
     config::providers::{
@@ -12,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Read},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -23,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 const MAX_PARSE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_METADATA_BYTES: u64 = 64 * 1024;
 
 fn request_options(spec: &ProviderSpec, user_agent: String) -> HttpOptions {
     HttpOptions {
@@ -80,6 +82,7 @@ pub(crate) struct ResourceEntry {
 }
 #[derive(Clone)]
 pub(crate) struct ProviderCache {
+    root: PathBuf,
     pub template: Arc<ProviderTemplate>,
     pub entries: Vec<ResourceEntry>,
     pub contents: ProviderContents,
@@ -121,6 +124,7 @@ impl ProviderCache {
         cancellation: Option<&CancellationToken>,
         persist_bundle: bool,
     ) -> io::Result<Self> {
+        let root = fs::canonicalize(root)?;
         let mut entries = Vec::new();
         let mut contents = ProviderContents::new();
         let user_agent = template.request_user_agent();
@@ -165,23 +169,33 @@ impl ProviderCache {
                     if rule { "rules" } else { "proxies" },
                     hex(&Sha256::digest(spec.url.as_bytes()))
                 );
-                let path = resource_path(
-                    root,
-                    if spec.path.is_empty() {
+                let access = match spec.kind {
+                    ProviderType::File => Access::FileRead,
+                    _ if persist_bundle => Access::CacheWrite,
+                    _ => Access::CacheRead,
+                };
+                let path = template.resource_paths.resolve(
+                    &root,
+                    Path::new(if spec.path.is_empty() {
                         &fallback
                     } else {
                         &spec.path
-                    },
-                    persist_bundle && spec.kind == ProviderType::Http,
+                    }),
+                    access,
                 )?;
-                let metadata = fs::read(metadata_path(&path))
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Metadata>(&bytes).ok())
-                    .unwrap_or_default();
+                let sidecar = template.resource_paths.resolve(
+                    &root,
+                    &metadata_path(&path),
+                    Access::CacheRead,
+                )?;
                 let control = super::age_provider::DecodeControl::new(
                     cancellation,
                     std::time::Instant::now() + http::DEFAULT_DOWNLOAD_TIMEOUT,
                 );
+                let metadata = read_bounded(&sidecar, MAX_METADATA_BYTES, &control)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Metadata>(&bytes).ok())
+                    .unwrap_or_default();
                 if let Ok(bytes) = read_bounded(&path, spec.size_limit, &control) {
                     match template.parse_content_with_control(spec, &bytes, &control) {
                         Ok(content) => {
@@ -229,7 +243,7 @@ impl ProviderCache {
                     let fallback_cancellation = CancellationToken::new();
                     let cancellation = cancellation.unwrap_or(&fallback_cancellation);
                     if let Ok((bytes, content)) = super::bundle::read_member(
-                        root,
+                        &root,
                         &spec.path_in_bundle,
                         spec.size_limit,
                         cancellation,
@@ -243,15 +257,30 @@ impl ProviderCache {
                         if cancellation.is_cancelled() {
                             return Err(io::ErrorKind::Interrupted.into());
                         }
-                        let write_path = resource_path(
-                            root,
-                            if spec.path.is_empty() {
+                        // Extra roots grant file reads, never a bundle write to that source.
+                        let persist_fallback = persist_bundle
+                            && (spec.kind == ProviderType::Http || path.starts_with(&root));
+                        let access = if persist_fallback {
+                            Access::CacheWrite
+                        } else {
+                            Access::FileRead
+                        };
+                        let write_path = template.resource_paths.resolve(
+                            &root,
+                            Path::new(if spec.path.is_empty() {
                                 &fallback
                             } else {
                                 &spec.path
-                            },
-                            persist_bundle,
+                            }),
+                            access,
                         )?;
+                        if persist_fallback {
+                            template.resource_paths.resolve(
+                                &root,
+                                &metadata_path(&write_path),
+                                Access::CacheWrite,
+                            )?;
+                        }
                         let metadata = Metadata {
                             url: source_key(spec, &user_agent)?,
                             etag: None,
@@ -260,7 +289,7 @@ impl ProviderCache {
                             bundled: true,
                             subscription_info: None,
                         };
-                        if persist_bundle {
+                        if persist_fallback {
                             let temporary = TemporaryFile(Some(temporary_path(&write_path)));
                             fs::write(temporary.0.as_ref().unwrap(), &bytes)?;
                             if cancellation.is_cancelled() {
@@ -271,7 +300,7 @@ impl ProviderCache {
                         entry.state.available = true;
                         entry.state.downloaded = false;
                         entry.state.count = content_len(&content);
-                        entry.modified = persist_bundle
+                        entry.modified = persist_fallback
                             .then(|| {
                                 fs::metadata(&write_path)
                                     .ok()
@@ -298,6 +327,7 @@ impl ProviderCache {
             return Err(io::ErrorKind::Interrupted.into());
         }
         Ok(Self {
+            root,
             template,
             entries,
             contents,
@@ -310,15 +340,14 @@ impl ProviderCache {
                 return Err(io::ErrorKind::Interrupted.into());
             }
             if entry.spec.kind == ProviderType::Http {
-                resource_path(
+                let path = entry.path.as_ref().expect("HTTP cache path");
+                self.template
+                    .resource_paths
+                    .resolve(root, path, Access::CacheWrite)?;
+                self.template.resource_paths.resolve(
                     root,
-                    entry
-                        .path
-                        .as_ref()
-                        .expect("HTTP cache path")
-                        .to_str()
-                        .ok_or_else(|| io::Error::other("invalid cache path"))?,
-                    true,
+                    &metadata_path(path),
+                    Access::CacheWrite,
                 )?;
             }
         }
@@ -359,9 +388,25 @@ impl ProviderCache {
         if entry.spec.kind == ProviderType::Inline {
             return Ok(None);
         }
-        let path = entry.path.as_ref().expect("file resource path").clone();
         entry.state.updating = true;
         let operation = async {
+            let access = if entry.spec.kind == ProviderType::File {
+                Access::FileRead
+            } else {
+                Access::CacheWrite
+            };
+            let path = self.template.resource_paths.resolve(
+                &self.root,
+                entry.path.as_ref().expect("file resource path"),
+                access,
+            )?;
+            if entry.spec.kind == ProviderType::Http {
+                self.template.resource_paths.resolve(
+                    &self.root,
+                    &metadata_path(&path),
+                    Access::CacheWrite,
+                )?;
+            }
             if entry.spec.kind == ProviderType::File {
                 let modified = match fs::metadata(&path) {
                     Err(error)
@@ -528,6 +573,14 @@ impl ProviderCache {
         let entry = &mut self.entries[index];
         if let Some(temporary) = &candidate.temporary {
             let path = entry.path.as_ref().expect("cache path");
+            self.template
+                .resource_paths
+                .resolve(&self.root, path, Access::CacheWrite)?;
+            self.template.resource_paths.resolve(
+                &self.root,
+                &metadata_path(path),
+                Access::CacheWrite,
+            )?;
             commit_download(path, temporary, &candidate.metadata)?;
             candidate.temporary = None;
             entry.metadata = candidate.metadata.clone();
@@ -604,7 +657,14 @@ fn read_bounded(
     control
         .check()
         .map_err(|_| io::Error::other("provider read stopped"))?;
-    let mut file = fs::File::open(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("provider path must be a regular file"));
     }
@@ -700,50 +760,15 @@ fn commit_download(path: &Path, temporary: &Path, metadata: &Metadata) -> io::Re
     Ok(())
 }
 pub(crate) fn resource_path(root: &Path, path: &str, create: bool) -> io::Result<PathBuf> {
-    let root = fs::canonicalize(root)?;
-    let requested = Path::new(path);
-    let target = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        root.join(requested)
-    };
-    if !target.starts_with(&root)
-        || target
-            .strip_prefix(&root)
-            .unwrap()
-            .components()
-            .any(|c| matches!(c, Component::ParentDir))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "provider path escapes dataDir",
-        ));
-    }
-    let parent = target
-        .parent()
-        .ok_or_else(|| io::Error::other("provider path requires parent"))?;
-    let mut ancestor = parent;
-    while !ancestor.exists() {
-        ancestor = ancestor
-            .parent()
-            .ok_or_else(|| io::Error::other("invalid provider path"))?;
-    }
-    if !fs::canonicalize(ancestor)?.starts_with(&root) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "provider path escapes dataDir",
-        ));
-    }
-    if create {
-        fs::create_dir_all(parent)?;
-    }
-    if target.exists() && !fs::canonicalize(&target)?.starts_with(&root) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "provider path escapes dataDir",
-        ));
-    }
-    Ok(target)
+    ProviderPaths::default().resolve(
+        root,
+        Path::new(path),
+        if create {
+            Access::CacheWrite
+        } else {
+            Access::FileRead
+        },
+    )
 }
 
 impl std::fmt::Debug for ProviderCache {

@@ -348,6 +348,11 @@ Windows Session Snapshot 不由此重建；Windows UWP 的活动 Provider 配置
 地址复用主配置的既有严格解析器，覆盖在 foreground 解析／校验后应用到同一启动配置；没有任意 map 合并。
 `validate` 保持 Mihomo 的配置测试语义，不读取这些环境值或解析／应用覆盖。`help` 也不读取。
 覆盖元数据不进入普通 `start` payload 或 Mihomo YAML schema；Controller 的 TLS 身份仍由主配置提供。
+前台运行可通过 `VOLE_SAFE_PATHS` 的系统原生路径列表扩展 provider 授权根；仅用于主配置 file provider 读取、
+HTTP provider 缓存正文及 sidecar 写入。目录在初始化时 canonicalize 并冻结，沿普通候选、HUP 和恢复快照继承；
+重复初始化不得改变已明确设置的授权上下文。空项不授权工作目录，读取不创建目录，路径 traversal 与符号链接逃逸拒绝。
+本次显式主配置／独立 HTTP 输入禁止被缓存覆盖，显式私密 CA 路径禁止 provider 读写。
+它不扩展主配置写回、客户端身份／私密 CA、独立 HTTP 设置或 Controller 清理权限，也不进入 YAML／普通 initialize payload。
 详细命令行映射见 [CLI](cli.md)。
 
 普通 Unicode 路径使用 JSON 字符串。需要保留平台原生编码时，Unix 可使用

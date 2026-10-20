@@ -148,7 +148,7 @@ impl ProviderRuntime {
                 return Err(ApplyError::Stopped);
             }
             let patch = matches!(&update, ConfigUpdate::Patch(_));
-            let template = match update {
+            let mut template = match update {
                 ConfigUpdate::Replace(yaml) => {
                     crate::config::providers::ProviderTemplate::update_yaml(
                         yaml.as_bytes(),
@@ -220,6 +220,10 @@ impl ProviderRuntime {
                 }
             }
             .map_err(|_| ApplyError::InvalidConfig)?;
+            if let Some(previous_template) = &previous.config.providers {
+                Arc::make_mut(&mut template).resource_paths =
+                    previous_template.resource_paths.clone();
+            }
             let cache = ProviderCache::open_candidate(&directory, template, &blocking_cancel)
                 .map_err(|_| {
                     if blocking_cancel.is_cancelled() {
@@ -596,6 +600,15 @@ mod http_tests {
             &policy,
             &live.current.load().config.http_policy().unwrap()
         ));
+        let provider_paths = live
+            .current
+            .load()
+            .config
+            .providers
+            .as_ref()
+            .unwrap()
+            .resource_paths
+            .clone();
         // The foreground input form takes the same worker and active HTTP snapshot.
         let template =
             crate::config::providers::ProviderTemplate::update_yaml(yaml.as_bytes(), root.path())
@@ -609,6 +622,17 @@ mod http_tests {
         assert!(Arc::ptr_eq(
             &policy,
             &live.current.load().config.http_policy().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &provider_paths,
+            &live
+                .current
+                .load()
+                .config
+                .providers
+                .as_ref()
+                .unwrap()
+                .resource_paths
         ));
         let invalid = crate::config::providers::ProviderTemplate::update_yaml(
             b"rules: ['MATCH,missing']",

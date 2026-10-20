@@ -4,7 +4,7 @@ use crate::{config::MAX_CONFIG_BYTES, resource::age_provider};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Deserializer};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -147,6 +147,9 @@ impl ReloadInput {
     }
 }
 impl MainInput {
+    pub(super) fn source_file(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
     pub(super) fn read(
         config: Option<Zeroizing<String>>,
         key: Option<Zeroizing<String>>,

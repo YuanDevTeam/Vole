@@ -703,3 +703,97 @@ rules: ['RULE-SET,offline,DIRECT', 'MATCH,DIRECT']
     );
     assert_eq!(fs::read(metadata).unwrap(), b"existing sidecar");
 }
+
+#[test]
+fn provider_metadata_requires_bounded_regular_files() {
+    let root = tempfile::tempdir().unwrap();
+    let body = root.path().join("nodes.yaml");
+    fs::write(&body, b"proxies: [{name: cached, type: direct}]").unwrap();
+    let sidecar = metadata_path(&body);
+    fs::File::create(&sidecar)
+        .unwrap()
+        .set_len(MAX_METADATA_BYTES + 1)
+        .unwrap();
+    let control = super::super::age_provider::DecodeControl::new(
+        None,
+        std::time::Instant::now() + http::DEFAULT_DOWNLOAD_TIMEOUT,
+    );
+    assert!(read_bounded(&sidecar, MAX_METADATA_BYTES, &control).is_err());
+    let cache = ProviderCache::open(root.path(), template()).unwrap();
+    assert!(cache.entries[0].state.available);
+    assert!(!cache.entries[0].state.downloaded);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        fs::remove_file(&sidecar).unwrap();
+        let name = std::ffi::CString::new(sidecar.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let cache = ProviderCache::open(root.path(), template()).unwrap();
+        assert!(cache.entries[0].state.available);
+        assert!(!cache.entries[0].state.downloaded);
+    }
+}
+
+#[test]
+fn authorized_provider_roots_read_file_sources_and_write_only_http_caches() {
+    use crate::resource::paths::ProviderPaths;
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let shared = root.path().join("shared");
+    fs::create_dir(&data).unwrap();
+    fs::create_dir(&shared).unwrap();
+    let source = shared.join("source.yaml");
+    let cache_path = shared.join("http/nodes.yaml");
+    let source_bytes = b"proxies: [{name: from-file, type: direct}]";
+    fs::write(&source, source_bytes).unwrap();
+    let document = serde_json::json!({"proxy-providers":{
+        "file":{"type":"file","path":source.to_str().unwrap()},
+        "http":{"type":"http","url":"https://fixture.invalid/nodes","path":cache_path.to_str().unwrap()}
+    },"rules":["MATCH,DIRECT"]}).to_string();
+    let mut template = crate::config::Config::parse_yaml(document.as_bytes())
+        .unwrap()
+        .providers
+        .unwrap();
+    assert!(ProviderCache::open(&data, template.clone()).is_err());
+    let paths =
+        ProviderPaths::from_os_value(Some(std::env::join_paths([&shared]).unwrap()), root.path())
+            .unwrap();
+    Arc::make_mut(&mut template).resource_paths = Arc::new(paths);
+    let mut cache = ProviderCache::open(&data, template.clone()).unwrap();
+    assert!(cache.contents.contains_key("proxies/file"));
+    cache
+        .prepare_paths(&data, &CancellationToken::new())
+        .unwrap();
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    assert!(!metadata_path(&source).exists());
+    let body = b"proxies: [{name: from-http, type: direct}]";
+    let temporary = cache_path.parent().unwrap().join("owned-download.tmp");
+    fs::write(&temporary, body).unwrap();
+    let index = cache
+        .entries
+        .iter()
+        .position(|entry| entry.state.name == "http")
+        .unwrap();
+    let content = template
+        .parse_content(&cache.entries[index].spec, body)
+        .unwrap();
+    cache
+        .commit(
+            index,
+            Candidate {
+                content,
+                temporary: Some(temporary),
+                metadata: Metadata {
+                    url: source_key(&cache.entries[index].spec, &template.request_user_agent())
+                        .unwrap(),
+                    hash: hex(&Sha256::digest(body)),
+                    ..Metadata::default()
+                },
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(fs::read(&cache_path).unwrap(), body);
+    assert!(metadata_path(&cache_path).is_file());
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+}
