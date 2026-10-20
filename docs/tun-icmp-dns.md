@@ -135,10 +135,10 @@ dns:
   system/DHCP 来源始终使用物理出口，忽略出口 token；节点私有 DNS 也忽略出口 token。
 - `#RULES` 只按 nameserver endpoint 和传输执行业务规则，不把 DNS question 当作选路域名。
 - 规则模式下，UDP 跳过不支持 UDP 的节点或组，继续匹配后续规则；显式出口和 global 模式不做此跳过。
-- `RULES` 与业务 TCP/UDP 使用同一子规则求值器：`SUB-RULE`、`PASS`、`PASS-RULE` 的作用域一致；规则控制和组控制先于 UDP 能力检查。
+- `RULES` 与业务 TCP/UDP 使用同一子规则求值器：`SUB-RULE`、`PASS`、`PASS-RULE` 的作用域一致，`rematch` 与 `REMATCH-NAME` 保留同一决策上下文；规则控制和组控制先于 UDP 能力检查。
 - `COMPATIBLE` 使用直连语义；`REJECT` 结束当前尝试，`REJECT-DROP` 的 TCP 等待仍受当前 DNS 查询期限和 Stop 限制，UDP 立即结束。失败后继续当前上游组下一项。
 
-代理组成员可以是具体节点、嵌套组、`DIRECT`、`COMPATIBLE`、`REJECT`、`REJECT-DROP`、`PASS` 或 `PASS-RULE`。后两者仅在 rule 模式的 `RULES` 中参与规则流程，global 模式、显式命名组或 dialer-proxy 选中控制目标时拒绝连接。DNS exchange 需要新建物理 transport 时解析当时的当前叶节点；选中成员失败不会使代理组自动改选，但 nameserver 列表仍按本节已有故障转移语义继续下一项。
+代理组成员可以是具体节点、嵌套组、`DIRECT`、`COMPATIBLE`、`REJECT`、`REJECT-DROP`、`PASS` 或 `PASS-RULE`。PASS、PASS-RULE 和具名 rematch 仅在 rule 模式的 `RULES` 中参与规则流程；global 模式、显式命名组/节点或 dialer-proxy 选中控制目标时拒绝连接。DNS exchange 需要新建物理 transport 时解析当时的当前叶节点；选中成员失败不会使代理组自动改选，但 nameserver 列表仍按本节已有故障转移语义继续下一项。
 
 ### 上游参数
 

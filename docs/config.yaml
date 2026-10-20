@@ -279,13 +279,18 @@ sniffer:
 # bbr/bbr_meta_v1/bbr_meta_v2 均映射到 quiche 原生 Bbr2Gcongestion，省略/未知使用 cubic。
 # H2 不消费 congestion-controller。
 proxies:
-  # 功能出站没有 server/port，均支持 UDP；不接受 udp、smux 或 dialer-proxy。
+  # 功能出站没有 server/port；不接受 udp、smux 或 dialer-proxy。
   # direct 另接受上方三项物理出口/地址族字段，域名使用 direct-nameserver。
   - {name: direct-local, type: direct}
   # dns 仅接受 name/type，复用当前会话解析器，可由普通规则接管任意端口的 TCP/UDP DNS。
   - {name: dns-local, type: dns}
   # reject 仅接受 name/type；立即结束，不增加 action 字段。
   - {name: reject-local, type: reject}
+  # rematch 是规则控制，不建立连接。两个 target 至少出现一个，省略保留原值；
+  # target-rematch-name: '' 清标记；target-sub-rule: '' 或未知名称回主规则。
+  # 已存在的空子列表耗尽后 DIRECT；省略 target-sub-rule 保留当前根列表。
+  # 仅业务 rule 模式和 DNS #RULES 消费，不能用于 node-only 测速或物理上游。
+  - {name: mark-blue, type: rematch, target-rematch-name: blue}
   - name: trusttunnel-edge
     type: trusttunnel
     server: trusttunnel.example.com
@@ -906,7 +911,7 @@ dns:
 # 支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、DOMAIN-WILDCARD、DOMAIN-REGEX、
 # GEOSITE、GEOIP、SRC-GEOIP、IP-ASN、SRC-IP-ASN、IP-CIDR、IP-CIDR6、SRC-IP-CIDR、
 # IP-SUFFIX、SRC-IP-SUFFIX、DST-PORT、SRC-PORT、NETWORK、
-# IN-TYPE、IN-USER、IN-PORT、RULE-SET、SUB-RULE、AND/OR/NOT 和 MATCH。来源信息来自实际入站会话。
+# IN-TYPE、IN-USER、IN-PORT、REMATCH-NAME、RULE-SET、SUB-RULE、AND/OR/NOT 和 MATCH。来源信息来自实际入站会话。
 # PROCESS-NAME、PROCESS-PATH 及各自 -WILDCARD/-REGEX 支持已确认的本机 socket owner，忽略大小写。
 # Linux/Android 还接受 UID（uint32 单值/范围，/ 分隔，最多 28 段）；UID 0 不匹配。
 # 进程路径保留 Unicode，最多 32 KiB；正则沿同一编译/决策预算，不当作域名处理。
@@ -941,6 +946,10 @@ dns:
 # SUB-RULE,(纯条件),名称 在条件匹配时进入指定列表；子列表耗尽则继续调用者。
 # PASS（含组选择为 PASS）退出所有子调用并继续主列表下一条；PASS-RULE 仅继续
 # 当前子列表，出现在主列表时为 REJECT。两者不能出现在逻辑谓词或 classical 集合中。
+# REMATCH-NAME,blue/Green,DIRECT 按 / 分隔、逐项 trim，名称非空且区分大小写。
+# rematch 节点更新本次决策标记或根列表，从首条重新求值，不创建连接或回到调用位置。
+# 重入保留已完成 DNS/process、来源/目标及原期限、取消、预算、规则禁用快照。
+# 同次决策最多 32 个 rematch 节点，节点名重复即失败；不增加可调递归参数。
 # 组的控制目标先于 disable-udp/节点 UDP 检查；跳过不推进轮询。实际出口只选择一次。
 # GEOSITE 支持 [!]<code>[@<attr>...]，GEOIP 支持 [!]<code> 和可选 no-resolve。
 # SRC-GEOIP 与 GEOIP,...,src 等价，来源规则不触发 DNS；lan 为无需资产的内置 GeoIP。
@@ -967,7 +976,7 @@ sub-rules:
 # tun、sniffer、Controller、DNS、rules 或 GeoData；此接口的 dialer-proxy 可指定 DIRECT 或具体
 # 节点。Vole 从“未被任何 dialer-proxy 引用”的节点推导唯一链头，且该链必须覆盖
 # 全部节点。测速不创建监听器、公共实例、TUN/protect 租约、DNS、规则引擎、代理组
-# 或 GeoData 注册。
+# 或 GeoData 注册。rematch 是路由控制，不属于可测量的具体节点，测速配置拒绝它。
 #
 # 最小测速示例：
 # proxies:

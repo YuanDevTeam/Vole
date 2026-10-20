@@ -72,12 +72,16 @@ _Avoid_: Managed core, child core, URI configuration
 A named, concrete outbound protocol path that can be selected as a route target or referenced by another proxy node through `dialer-proxy`.
 _Avoid_: Proxy when a proxy group or route target is intended, server profile
 
+**Routing control**:
+A named rule-flow effect that updates the current decision and resumes rule evaluation without establishing a protocol connection. It is not a measurable proxy node.
+_Avoid_: Physical outbound, transport, fake connection
+
 **Proxy group**:
 A named route or upstream target whose current-session selection identifies one direct member. Routing and `dialer-proxy` share the same selection; an upstream group's DIRECT member connects the current node's server resolved on demand.
 _Avoid_: Folder, provider, subscription
 
 **Route target**:
-A proxy node, proxy group, or reserved built-in target that routing rules, modes, and DNS routes can select.
+A proxy node, routing control, proxy group, or reserved built-in target. Rule-flow controls run only during rule evaluation; selecting one as a physical upstream does not establish a connection.
 _Avoid_: Proxy when the distinction between a node and group matters, dialer
 
 **Group selection**:

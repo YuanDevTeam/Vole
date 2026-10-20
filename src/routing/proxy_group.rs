@@ -70,6 +70,7 @@ pub(crate) struct ResolvedProxyGroupLeaf {
 
 pub(crate) enum InspectedRuleTarget {
     Control(crate::config::RuleControl),
+    Rematch(Arc<super::rematch::RematchTarget>),
     Egress(ResolvedProxyGroupLeaf),
     Unavailable,
 }
@@ -94,6 +95,7 @@ pub(crate) struct ProxyGroups {
     reject_drop: Arc<dyn Dispatcher>,
     groups: Box<[SelectProxyGroup]>,
     ids_by_name: HashMap<String, ProxyGroupId>,
+    rematches: super::RematchTargets,
 }
 
 impl fmt::Debug for ProxyGroups {
@@ -135,6 +137,7 @@ impl ProxyGroups {
             Arc::new(crate::outbound::ConnectorDispatcher::new(Arc::new(
                 crate::outbound::RejectOutbound::drop_connections(),
             ))),
+            super::RematchTargets::default(),
         )
     }
 
@@ -144,6 +147,7 @@ impl ProxyGroups {
         direct: Arc<dyn Dispatcher>,
         selections: &[Arc<GroupSelection>],
         reject_drop: Arc<dyn Dispatcher>,
+        rematches: super::RematchTargets,
     ) -> Result<Arc<Self>, DispatchError> {
         if selections.len() != configs.len() {
             return Err(DispatchError::Other(
@@ -221,7 +225,15 @@ impl ProxyGroups {
                 })
                 .collect(),
             ids_by_name,
+            rematches,
         }))
+    }
+
+    pub(super) fn rematch(
+        &self,
+        id: crate::config::ProxyId,
+    ) -> Option<&Arc<super::rematch::RematchTarget>> {
+        self.rematches.get(id)
     }
 
     #[must_use]
@@ -325,6 +337,9 @@ impl ProxyGroups {
             })?;
             match member.target {
                 ProxyGroupMemberTarget::Route(RouteTargetId::Proxy(id)) => {
+                    if self.rematches.get(id).is_some() {
+                        return Err(DispatchError::NotAllowed);
+                    }
                     chain.push(member.name.clone());
                     chain.reverse();
                     return self
@@ -424,13 +439,18 @@ impl ProxyGroups {
                     group_id = id;
                     continue;
                 }
-                ProxyGroupMemberTarget::Route(RouteTargetId::Proxy(id)) => (
-                    self.proxies
-                        .get(id.index())
-                        .ok_or(DispatchError::NotAllowed)?
-                        .clone(),
-                    false,
-                ),
+                ProxyGroupMemberTarget::Route(RouteTargetId::Proxy(id)) => {
+                    if let Some(target) = self.rematches.get(id) {
+                        return Ok(InspectedRuleTarget::Rematch(target.clone()));
+                    }
+                    (
+                        self.proxies
+                            .get(id.index())
+                            .ok_or(DispatchError::NotAllowed)?
+                            .clone(),
+                        false,
+                    )
+                }
                 ProxyGroupMemberTarget::Direct => (self.direct.clone(), true),
                 ProxyGroupMemberTarget::Reject => (self.reject.clone(), false),
                 ProxyGroupMemberTarget::RejectDrop => (self.reject_drop.clone(), false),

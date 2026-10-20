@@ -402,6 +402,7 @@ Unix 等待 SIGINT/SIGTERM，Windows 等待 Ctrl+C/Ctrl+Break；标准输入先�
 - `configYamls` 接受 1–5 份非空节点配置，`timeout` 为 1–30 秒。
 - 同一运行时一次只允许一个测速批次，最多并发五个私有工作器。
 - 节点配置顶层只允许 `proxies` 和客户端信任 `tls.custom-certifactes`，不接受服务端 TLS 字段或 `proxy-groups`；`dialer-proxy` 可指定 DIRECT 或引用具体节点。Vole 推导唯一链头，且该链必须覆盖全部节点。
+- `type: rematch` 是运行时规则控制，不属于具体可测节点，测速配置拒绝它。
 - 工作器只准备出站图并执行 TCP、可选 TLS 和 HTTP/1.1 HEAD；不创建公共实例、监听器、TUN、DNS、规则、嗅探器或 GeoData。
 - 宿主测量组成员时，按当前选择快照展开具体链后提交；上游选到 DIRECT 时移除相应 `dialer-proxy`，选到 REJECT 时不发起该项测量。该快照不改变运行中的组选择。
 - URL 必须是无 userinfo 和 fragment 的绝对 HTTP/HTTPS URL；HTTPS 与本次节点握手共享内置、可读系统及配置自定义信任根；各测量工作器的信任互相隔离。

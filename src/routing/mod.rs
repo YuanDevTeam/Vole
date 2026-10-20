@@ -17,9 +17,11 @@ use crate::{
 };
 
 mod program;
+mod rematch;
 mod rule_disable;
 use program::CompiledProgram;
 pub(crate) use program::{ProgramEvaluation, RuleTargetEffect};
+pub(crate) use rematch::RematchTargets;
 mod balance;
 pub(super) mod datagram_ready;
 mod selection;

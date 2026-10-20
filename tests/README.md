@@ -45,6 +45,9 @@ Controller 推送（纯内存 duplex，无网络监听）：`controller::websock
 `config::measure::tests::measurement_rejects_routing_only_rematch_nodes`、
 `routing::tests::rematch_name_predicate_is_trimmed_nonempty_and_case_sensitive`、
 `outbound::control::tests::`。
+运行时消费者与续跑另选 `routing::program::tests::rematch_`、`routing::rematch::tests::`、
+`routing::dispatcher::tests::rematch_`、`dns::runtime::tests::rematch_`；这些用例只使用内存
+Dispatcher 和合成端点，不建立监听器或发送网络报文，不代替真实 TUN 组切换验收。
 
 功能出站（纯内存）：`config::functional::tests::`、`outbound::dns::tests::`、
 `outbound::reject::tests::`；直连解析角色接线：

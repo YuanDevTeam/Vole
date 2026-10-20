@@ -85,6 +85,24 @@ UDP 保留原目标作为响应源，每个关联只保留一个活动查询、�
 Stop 立即取消等待；UDP 逐包丢弃，沿用关联的正常空闲清理，不套用 TCP 延迟。
 `COMPATIBLE` 在规则、代理组、DNS 上游选择和 `dialer-proxy` 中使用直连语义。
 
+## 规则重匹配
+
+`type: rematch` 是规则控制，只有 `name/type/target-rematch-name/target-sub-rule`，
+没有服务器、物理连接或额外任务。两个 target 字段至少提供一个非 null 值；null 与省略一致。
+省略某字段保留本次决策原值。`target-rematch-name: ''` 清除标记；非空字符串按原样设置，
+`REMATCH-NAME,a/b` 将各项 trim 后逐字、区分大小写比较，不接受空项。
+
+`target-sub-rule` 指向已定义子规则列表时，从该列表首条重新求值；存在但为空的列表耗尽后 DIRECT。
+空字符串或不存在的名称回到主列表首条；省略时保留当前根列表。
+它不是 `SUB-RULE` 调用，不返回原调用位置，也不要求名称在配置时存在。
+主列表中的普通 `SUB-RULE` 调用和 `PASS/PASS-RULE` 保留原作用域。
+
+业务 rule 模式及 DNS `#RULES` 共享此流程，组间接选中 rematch 时也生效，先于 UDP 能力检查。
+重入保留来源、目标、已解析地址、process 结果和同一次决策的取消、期限、总执行预算与规则开关快照。
+同一决策最多进入 32 个 rematch 节点，重复节点名称或超预算即失败关闭；不会建立空连接或回落 DIRECT。
+已建立连接保持原路径。global 模式、显式 DNS 出口、`dialer-proxy`、健康探测和 node-only
+`measureDelay` 不执行该控制；物理建链选中它时拒绝，测速配置直接拒绝 rematch 节点。
+
 ## HTTP / HTTPS CONNECT
 
 `type: http` 提供 TCP CONNECT；`tls: true` 在代理链路使用共享 TLS 与证书策略。

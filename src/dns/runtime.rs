@@ -1794,7 +1794,9 @@ impl RuntimeDns {
             DnsRoute::Direct => Ok((DnsEgressKey::Direct, direct.clone())),
             DnsRoute::Route(id) => match inspect(id).map_err(AttemptError::Dispatch)? {
                 InspectedRuleTarget::Egress(leaf) => Ok((DnsEgressKey::Route(id), leaf.dispatcher)),
-                InspectedRuleTarget::Control(_) | InspectedRuleTarget::Unavailable => {
+                InspectedRuleTarget::Control(_)
+                | InspectedRuleTarget::Rematch(_)
+                | InspectedRuleTarget::Unavailable => {
                     Err(AttemptError::Dispatch(DispatchError::NotAllowed))
                 }
             },
@@ -1813,6 +1815,13 @@ impl RuntimeDns {
                             return RuleTargetEffect::Accept;
                         };
                         match inspect(id) {
+                            Ok(InspectedRuleTarget::Rematch(_)) if !rules.filters_udp() => {
+                                error = Some(DispatchError::NotAllowed);
+                                RuleTargetEffect::Accept
+                            }
+                            Ok(InspectedRuleTarget::Rematch(target)) => {
+                                RuleTargetEffect::Rematch(target)
+                            }
                             Ok(InspectedRuleTarget::Control(_)) if !rules.filters_udp() => {
                                 error = Some(DispatchError::NotAllowed);
                                 RuleTargetEffect::Accept
@@ -5576,6 +5585,66 @@ dns:
         assert_eq!(direct.tcp_calls.load(Ordering::Acquire), 1);
         assert_eq!(proxy.tcp_calls.load(Ordering::Acquire), 1);
         assert_eq!(resolver.tcp_pool.snapshot().current_idle, 2);
+    }
+
+    #[tokio::test]
+    async fn rematch_dns_rules_consume_controls_but_explicit_routes_refuse_them() {
+        use crate::{
+            config::Config,
+            routing::{ProxyGroups, RematchTargets, RouteTargetDispatchers},
+        };
+        let mut configured = Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxies: [{name: mark, type: rematch, target-rematch-name: phase}]
+proxy-groups: [{name: gate, type: select, proxies: [mark], disable-udp: true}]
+rules: ['REMATCH-NAME,phase,DIRECT', 'MATCH,gate', 'MATCH,REJECT']
+"#,
+        )
+        .unwrap();
+        let direct: Arc<dyn Dispatcher> = Arc::new(MockDispatcher::default());
+        let control = Arc::new(MockDispatcher::default());
+        let nodes: Vec<Arc<dyn Dispatcher>> = vec![control.clone()];
+        let selections = configured
+            .proxy_groups
+            .iter()
+            .map(|group| Arc::new(crate::routing::GroupSelection::new(group.initial_member)))
+            .collect::<Vec<_>>();
+        let groups = ProxyGroups::with_selections_and_drop(
+            &configured.proxy_groups,
+            nodes.clone(),
+            direct.clone(),
+            &selections,
+            direct.clone(),
+            RematchTargets::new(&configured.proxies),
+        )
+        .unwrap();
+        let targets = RouteTargetDispatchers::with_proxy_groups(nodes, &groups).unwrap();
+        let mut upstream = nameserver(1, DnsTransport::Udp);
+        upstream.route = DnsRoute::Rules;
+        let resolver = RuntimeDns::new_routed_proxies(
+            &config(false, vec![upstream.clone()]),
+            targets,
+            direct.clone(),
+            RuleSet::compile_config(&mut configured).unwrap(),
+            Arc::new(EmptyGeoMatcher),
+        );
+        let server = resolver.resolve_nameserver(&upstream).await.unwrap();
+        for network in [Network::Tcp, Network::Udp] {
+            let (key, dispatcher) = resolver.egress_for(&server, network, |_| false).unwrap();
+            assert!(matches!(key, DnsEgressKey::Direct));
+            assert!(Arc::ptr_eq(&dispatcher, &direct));
+        }
+        upstream.route = DnsRoute::Route(crate::config::RouteTargetId::Group(
+            crate::config::ProxyGroupId::new(0).unwrap(),
+        ));
+        let server = resolver.resolve_nameserver(&upstream).await.unwrap();
+        assert!(matches!(
+            resolver.egress_for(&server, Network::Udp, |_| false),
+            Err(AttemptError::Dispatch(DispatchError::NotAllowed))
+        ));
+        assert_eq!(control.tcp_calls.load(Ordering::Acquire), 0);
+        assert_eq!(control.udp_calls.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

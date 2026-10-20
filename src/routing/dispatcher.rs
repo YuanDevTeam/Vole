@@ -182,6 +182,14 @@ impl ProxyDispatchers {
     ) -> Result<InspectedRuleTarget, DispatchError> {
         match id {
             RouteTargetId::Proxy(id) => {
+                if let Some(target) = self
+                    .entries
+                    .proxy_groups
+                    .as_ref()
+                    .and_then(|groups| groups.rematch(id))
+                {
+                    return Ok(InspectedRuleTarget::Rematch(target.clone()));
+                }
                 let dispatcher = self.get(id)?.clone();
                 if udp && !dispatcher.supports_udp() {
                     return Ok(InspectedRuleTarget::Unavailable);
@@ -507,6 +515,11 @@ impl RoutingDispatcher {
                 Some(&metadata),
                 candidate.authenticated_user(),
             ) {
+                Ok(InspectedRuleTarget::Rematch(_)) if !self.rules.filters_udp() => {
+                    selected = Some(Err(DispatchError::NotAllowed));
+                    RuleTargetEffect::Accept
+                }
+                Ok(InspectedRuleTarget::Rematch(target)) => RuleTargetEffect::Rematch(target),
                 Ok(InspectedRuleTarget::Control(_)) if !self.rules.filters_udp() => {
                     selected = Some(Err(DispatchError::NotAllowed));
                     RuleTargetEffect::Accept
@@ -2841,6 +2854,106 @@ rules: ["MATCH,pool"]
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn rematch_group_selection_routes_tcp_udp_without_control_io_or_old_flow_migration() {
+        let mut config = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxies: [{name: mark, type: rematch, target-rematch-name: phase}]
+proxy-groups:
+  - {name: gate, type: select, proxies: [mark,DIRECT]}
+  - {name: outer, type: select, proxies: [gate], disable-udp: true}
+rules: ['REMATCH-NAME,phase,REJECT', 'MATCH,outer', 'MATCH,DIRECT']
+"#,
+        )
+        .unwrap();
+        // If a rematch is mistaken for an egress, this mock would succeed and
+        // expose the wrong physical path through its counters.
+        let control = Arc::new(RecordingDispatcher {
+            tcp_only: true,
+            ..Default::default()
+        });
+        let direct = Arc::new(RecordingDispatcher::default());
+        let nodes: Vec<Arc<dyn Dispatcher>> = vec![control.clone()];
+        let selections = config
+            .proxy_groups
+            .iter()
+            .map(|group| Arc::new(super::super::GroupSelection::new(group.initial_member)))
+            .collect::<Vec<_>>();
+        let groups = ProxyGroups::with_selections_and_drop(
+            &config.proxy_groups,
+            nodes.clone(),
+            direct.clone(),
+            &selections,
+            direct.clone(),
+            super::super::RematchTargets::new(&config.proxies),
+        )
+        .unwrap();
+        let router = RoutingDispatcher::new(
+            ProxyDispatchers::with_proxy_groups(nodes, &groups).unwrap(),
+            direct.clone(),
+            None,
+            RuleSet::compile_config(&mut config).unwrap(),
+            Arc::new(EmptyGeoMatcher),
+        );
+        let first = "198.51.100.1:443".parse().unwrap();
+        for network in [Network::Tcp, Network::Udp] {
+            let decision = router
+                .route(
+                    network,
+                    (InboundKind::Tun, &Default::default()),
+                    "192.0.2.2:10000".parse().unwrap(),
+                    &Destination::Ip(first),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(decision.action, RuleAction::Reject);
+        }
+        assert!(matches!(
+            router.connect_tcp(stream(first, InboundKind::Tun)).await,
+            Err(DispatchError::NotAllowed)
+        ));
+        let mut udp = router
+            .open_datagram(association(InboundKind::Tun))
+            .await
+            .unwrap();
+        udp.send(datagram(first, b"rejected")).await.unwrap();
+        assert!(direct.datagrams.lock().unwrap().is_empty());
+
+        groups.select("gate", "DIRECT").unwrap();
+        router
+            .connect_tcp(stream(first, InboundKind::Tun))
+            .await
+            .unwrap();
+        let second = "198.51.100.2:443".parse().unwrap();
+        udp.send(datagram(second, b"direct")).await.unwrap();
+        groups.select("gate", "mark").unwrap();
+        udp.send(datagram(second, b"established")).await.unwrap();
+        udp.send(datagram(
+            "198.51.100.3:443".parse().unwrap(),
+            b"new-rejected",
+        ))
+        .await
+        .unwrap();
+        udp.close().await.unwrap();
+        assert_eq!(direct.tcp_sessions.lock().unwrap().len(), 1);
+        assert_eq!(direct.datagrams.lock().unwrap().len(), 2);
+        assert!(control.tcp_sessions.lock().unwrap().is_empty());
+        assert_eq!(control.udp_opens.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            groups.resolve_leaf_for(
+                crate::config::ProxyGroupId::new(0).unwrap(),
+                false,
+                None,
+                None,
+                None
+            ),
+            Err(DispatchError::NotAllowed)
+        ));
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@ pub(crate) struct RuleCursor {
     frames: [Frame; 33],
     depth: usize,
     disabled: super::rule_disable::Snapshot,
+    rematch: Option<Box<super::rematch::RematchCursor>>,
 }
 
 impl RuleCursor {
@@ -43,10 +44,17 @@ impl RuleCursor {
             frames,
             depth: 0,
             disabled,
+            rematch: None,
         }
     }
     pub(crate) fn root_index(&self) -> usize {
-        self.frames[0].index
+        if self.frames[0].program == 0 {
+            self.frames[0].index
+        } else {
+            self.rematch
+                .as_ref()
+                .map_or(usize::MAX, |state| state.unlisted_index)
+        }
     }
 }
 
@@ -78,6 +86,7 @@ pub(crate) enum RuleTargetEffect {
     Accept,
     Skip,
     Control(RuleControl),
+    Rematch(Arc<super::rematch::RematchTarget>),
 }
 
 impl RuleSet {
@@ -187,6 +196,35 @@ impl RuleSet {
                 _ => effect(rule.action, &candidate),
             };
             match effect {
+                RuleTargetEffect::Rematch(target) => {
+                    let state = cursor.rematch.get_or_insert_with(|| {
+                        Box::new(super::rematch::RematchCursor::new(self.len()))
+                    });
+                    if let Err(failure) = state.enter(&target.name, context.decision()) {
+                        return ProgramEvaluation::Failed(failure);
+                    }
+                    // Retain addresses, source, identity, budget and deadline from
+                    // the predicate that actually selected this control.
+                    *context = candidate;
+                    if let Some(name) = &target.config.target_rematch_name {
+                        context.rematch_name = (!name.is_empty()).then(|| name.clone());
+                    }
+                    let program = if let Some(name) = &target.config.target_sub_rule {
+                        match self.rematch_program(name, context.decision()) {
+                            Ok(program) => program,
+                            Err(failure) => return ProgramEvaluation::Failed(failure),
+                        }
+                    } else {
+                        cursor.frames[0].program
+                    };
+                    cursor.depth = 0;
+                    cursor.frames[0] = Frame {
+                        program,
+                        index: 0,
+                        address: None,
+                    };
+                    // Keep the original D07 switch snapshot across every restart.
+                }
                 RuleTargetEffect::Control(RuleControl::Pass) => {
                     cursor.depth = 0;
                     cursor.frames[0].index += 1;
@@ -211,6 +249,22 @@ impl RuleSet {
                 }
             }
         }
+    }
+
+    fn rematch_program(
+        &self,
+        name: &str,
+        decision: &crate::config::RuleDecision,
+    ) -> Result<usize, crate::config::MatchFailure> {
+        if !name.is_empty() {
+            for (index, program) in self.graph.sub_rules.iter().enumerate() {
+                decision.visit()?;
+                if program.name == name {
+                    return Ok(index + 1);
+                }
+            }
+        }
+        Ok(0)
     }
 
     pub(super) fn flat_resolved(
@@ -252,6 +306,214 @@ mod tests {
             &Destination::domain("example.com", 443).unwrap(),
         )
         .unwrap()
+    }
+
+    fn rematch_fixture(yaml: &str) -> (RuleSet, super::super::RematchTargets) {
+        let mut config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        let targets = super::super::RematchTargets::new(&config.proxies);
+        (RuleSet::compile_config(&mut config).unwrap(), targets)
+    }
+
+    fn rematch_effect(
+        targets: &super::super::RematchTargets,
+        action: RuleAction,
+    ) -> RuleTargetEffect {
+        if let RuleAction::Route(crate::config::RouteTargetId::Proxy(id)) = action
+            && let Some(target) = targets.get(id)
+        {
+            return RuleTargetEffect::Rematch(target.clone());
+        }
+        RuleTargetEffect::Accept
+    }
+
+    #[test]
+    fn rematch_sets_clears_and_preserves_metadata_and_selects_root_programs() {
+        let cases = [
+            // A selected child root has no row in GET /rules. Its hit must use
+            // the existing sentinel, even when child index equals a main index.
+            (
+                r#"
+proxies:
+  - {name: mark, type: rematch, target-rematch-name: phase}
+  - {name: clear, type: rematch, target-rematch-name: '', target-sub-rule: clean}
+rules: ['REMATCH-NAME,phase,clear', 'MATCH,mark']
+sub-rules:
+  clean: ['NOT,((REMATCH-NAME,phase)),DIRECT', 'MATCH,REJECT']
+"#,
+                2,
+                None,
+            ),
+            // Omitting the sub-rule preserves the selected root; omitting the
+            // name on a subsequent control preserves the mark.
+            (
+                r#"
+proxies:
+  - {name: mark, type: rematch, target-rematch-name: phase, target-sub-rule: first}
+  - {name: retag, type: rematch, target-rematch-name: done}
+  - {name: jump, type: rematch, target-sub-rule: last}
+rules: ['MATCH,mark']
+sub-rules:
+  first: ['REMATCH-NAME,phase,retag', 'REMATCH-NAME,done,jump', 'MATCH,REJECT']
+  last: ['REMATCH-NAME,done,DIRECT', 'MATCH,REJECT']
+"#,
+                1,
+                Some("done"),
+            ),
+            (
+                r#"
+proxies: [{name: jump, type: rematch, target-rematch-name: phase, target-sub-rule: missing}]
+rules: ['REMATCH-NAME,phase,DIRECT', 'MATCH,jump']
+"#,
+                0,
+                Some("phase"),
+            ),
+            (
+                r#"
+proxies: [{name: jump, type: rematch, target-rematch-name: phase, target-sub-rule: ''}]
+rules: ['REMATCH-NAME,phase,DIRECT', 'MATCH,jump']
+"#,
+                0,
+                Some("phase"),
+            ),
+            // Existing empty programs exhaust to DIRECT; they are not unknown.
+            (
+                r#"
+proxies: [{name: jump, type: rematch, target-sub-rule: empty}]
+rules: ['MATCH,jump', 'MATCH,REJECT']
+sub-rules: {empty: []}
+"#,
+                2,
+                None,
+            ),
+        ];
+        for (yaml, expected_index, expected_name) in cases {
+            let (rules, targets) = rematch_fixture(yaml);
+            let mut context = context();
+            assert!(matches!(
+                rules.evaluate_program(&mut context, &EmptyGeoMatcher, None, None,
+                    |action, _| rematch_effect(&targets, action)),
+                ProgramEvaluation::Matched(RuleMatch { action: RuleAction::Direct, rule_index })
+                    if rule_index == expected_index
+            ));
+            assert_eq!(context.rematch_name.as_deref(), expected_name);
+        }
+    }
+
+    #[test]
+    fn rematch_keeps_lazy_progress_and_the_original_rule_switch_snapshot() {
+        let (rules, targets) = rematch_fixture(
+            r#"
+proxies: [{name: mark, type: rematch, target-rematch-name: done}]
+rules:
+  - REMATCH-NAME,done,DIRECT
+  - AND,((PROCESS-NAME,app),(IP-CIDR,192.0.2.0/24)),mark
+  - MATCH,REJECT
+"#,
+        );
+        let mut context = context();
+        context.enable_process_lookup(true);
+        let cursor =
+            match rules.evaluate_program(&mut context, &EmptyGeoMatcher, None, None, |action, _| {
+                rematch_effect(&targets, action)
+            }) {
+                ProgramEvaluation::NeedsProcessLookup(cursor) => cursor,
+                _ => panic!("process identity must be requested only at its predicate"),
+            };
+        assert!(cursor.rematch.is_none());
+        context.set_process(crate::process::Identity {
+            name: Some("app".into()),
+            ..Default::default()
+        });
+        let cursor = match rules.evaluate_program(
+            &mut context,
+            &EmptyGeoMatcher,
+            Some(cursor),
+            None,
+            |action, _| rematch_effect(&targets, action),
+        ) {
+            ProgramEvaluation::NeedsIpResolution(cursor) => cursor,
+            _ => panic!("DNS continuation must retain completed process lookup"),
+        };
+        rules.disable_state().apply(&[(0, true)]).unwrap();
+        let addresses = ["192.0.2.7".parse().unwrap()];
+        assert!(matches!(
+            rules.evaluate_program(
+                &mut context,
+                &EmptyGeoMatcher,
+                Some(cursor),
+                Some(&addresses),
+                |action, _| rematch_effect(&targets, action)
+            ),
+            ProgramEvaluation::Matched(RuleMatch {
+                action: RuleAction::Direct,
+                rule_index: 0
+            })
+        ));
+        assert_eq!(context.pinned_ip(), Some(addresses[0]));
+        assert_eq!(
+            context
+                .process()
+                .and_then(|identity| identity.name.as_deref()),
+            Some("app")
+        );
+    }
+
+    #[test]
+    fn rematch_keeps_the_original_cancellation_and_deadline() {
+        let (rules, targets) = rematch_fixture(
+            r#"
+proxies: [{name: mark, type: rematch, target-rematch-name: done}]
+rules: ['REMATCH-NAME,done,DIRECT', 'MATCH,mark']
+"#,
+        );
+        for cancel in [false, true] {
+            let mut context = context();
+            let token = tokio_util::sync::CancellationToken::new();
+            context.decision().set_cancellation(token.clone());
+            let result = rules.evaluate_program(
+                &mut context,
+                &EmptyGeoMatcher,
+                None,
+                None,
+                |action, candidate| {
+                    if cancel {
+                        token.cancel();
+                    } else {
+                        candidate.decision().set_deadline(
+                            std::time::Instant::now() - std::time::Duration::from_secs(1),
+                        );
+                    }
+                    rematch_effect(&targets, action)
+                },
+            );
+            let expected = if cancel {
+                crate::config::MatchFailure::Cancelled
+            } else {
+                crate::config::MatchFailure::Budget
+            };
+            assert!(matches!(result, ProgramEvaluation::Failed(failure) if failure == expected));
+        }
+    }
+
+    #[test]
+    fn rematch_repeated_node_fails_before_replaying_its_effect() {
+        let (rules, targets) = rematch_fixture(
+            r#"
+proxies:
+  - {name: first, type: rematch, target-rematch-name: a}
+  - {name: second, type: rematch, target-rematch-name: b}
+rules: ['REMATCH-NAME,b,first', 'REMATCH-NAME,a,second', 'MATCH,first']
+"#,
+        );
+        let mut calls = 0;
+        assert!(matches!(
+            rules.evaluate_program(&mut context(), &EmptyGeoMatcher, None, None, |action, _| {
+                calls += 1;
+                rematch_effect(&targets, action)
+            }),
+            ProgramEvaluation::Failed(crate::config::MatchFailure::Budget)
+        ));
+        assert_eq!(calls, 3);
     }
 
     #[test]

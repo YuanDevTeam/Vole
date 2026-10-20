@@ -773,6 +773,7 @@ impl GraphBuilder {
             direct.clone(),
             &proxy_graph.selections,
             reject_drop.clone(),
+            crate::routing::RematchTargets::new(&self.config.proxies),
         )
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         let route_targets =
