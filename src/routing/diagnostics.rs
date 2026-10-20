@@ -19,6 +19,7 @@ pub(crate) struct Diagnostics {
     names: BTreeSet<Arc<str>>,
     config: Value,
     rules: Vec<Rule>,
+    disabled: Arc<super::rule_disable::RuleDisable>,
 }
 struct Rule {
     kind: &'static str,
@@ -64,6 +65,7 @@ impl Diagnostics {
                 (intern(&mut texts, name), members)
             })
             .collect();
+        let disabled = rules.disable_state().clone();
         let rules = (0..rules.len())
             .filter_map(|i| rules.rule(i))
             .map(|spec| {
@@ -99,6 +101,7 @@ impl Diagnostics {
             names,
             config: effective_config(config),
             rules,
+            disabled,
         }
     }
     /// Reuse known route/provider names, without retaining dynamic destinations.
@@ -137,14 +140,18 @@ impl Diagnostics {
             .get(index)
             .map_or_else(|| ("", self.text("")), |r| (r.kind, r.payload.clone()))
     }
+    pub fn disable_rules(&self, changes: &[(usize, bool)]) -> Result<(), ()> {
+        self.disabled.apply(changes)
+    }
     pub fn rules(&self) -> Value {
+        let disabled = self.disabled.snapshot();
         json!({"rules": self.rules.iter().enumerate().map(|(index, r)| {
             let hit_at = *r.hit_at.lock().unwrap();
             let hit_at = hit_at.map(|time| {
                 time.format(&time::format_description::well_known::Rfc3339)
                     .expect("recorded UTC date")
             });
-            json!({"index":index,"type":r.kind,"payload":r.payload.as_ref(),"proxy":r.target.as_ref(),"size":-1,"extra":{"disabled":false,"hitCount":r.hits.load(Ordering::Relaxed),"hitAt":hit_at}})
+            json!({"index":index,"type":r.kind,"payload":r.payload.as_ref(),"proxy":r.target.as_ref(),"size":-1,"extra":{"disabled":disabled.contains(index),"hitCount":r.hits.load(Ordering::Relaxed),"hitAt":hit_at}})
         }).collect::<Vec<_>>()})
     }
 }
@@ -335,6 +342,39 @@ rules: ["DOMAIN-SUFFIX,example.com,pool", "DOMAIN-SUFFIX,example.com,pool", "MAT
         assert!(owner.upgrade().is_none());
         assert_eq!(payload.as_ref(), "example.com");
         assert_eq!(providers[0].as_ref(), "a-provider");
+    }
+
+    #[test]
+    fn rule_switch_view_shares_only_small_state_with_the_program() {
+        let config =
+            Config::parse_yaml(b"mixed-port: 1080\nrules: ['MATCH,DIRECT', 'MATCH,REJECT']\n")
+                .unwrap();
+        let rules = RuleSet::compile(config.rules.clone()).unwrap();
+        let program = Arc::downgrade(&rules.graph);
+        let diagnostics = Diagnostics::new(&config, &rules, Default::default());
+        diagnostics.disable_rules(&[(0, true)]).unwrap();
+        let view = diagnostics.rules();
+        assert_eq!(view["rules"][0]["extra"]["disabled"], true);
+        assert_eq!(view["rules"][1]["extra"]["disabled"], false);
+        assert!(matches!(
+            rules.evaluate(
+                &crate::routing::RoutingContext::new(
+                    crate::config::Network::Tcp,
+                    &crate::session::Destination::Ip("192.0.2.1:443".parse().unwrap())
+                )
+                .unwrap()
+            ),
+            crate::routing::RuleEvaluation::Matched(crate::routing::RuleMatch {
+                action: RuleAction::Reject,
+                rule_index: 1
+            })
+        ));
+        drop(rules);
+        assert!(
+            program.upgrade().is_none(),
+            "diagnostics must not pin the whole program"
+        );
+        assert_eq!(diagnostics.rules()["rules"][0]["extra"]["disabled"], true);
     }
 
     #[test]

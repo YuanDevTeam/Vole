@@ -17,6 +17,7 @@ use crate::{
 };
 
 mod program;
+mod rule_disable;
 use program::CompiledProgram;
 pub(crate) use program::{ProgramEvaluation, RuleTargetEffect};
 mod balance;
@@ -445,7 +446,8 @@ pub struct RuleSet {
 
 impl RuleSet {
     /// Validates and normalizes the ordered rules. This is the only rule-set
-    /// construction path that allocates.
+    /// construction path that allocates during normal routing. Controller
+    /// switches may publish their own bounded snapshot separately.
     pub fn compile(program: impl Into<RuntimeRuleProgram>) -> Result<Self, RuleSetError> {
         let mut program = program.into();
         let count = program
@@ -477,6 +479,7 @@ impl RuleSet {
             .map_err(|_| RuleSetError::InvalidProgram)?;
         Ok(Self {
             graph: Arc::new(CompiledProgram {
+                disabled: Arc::new(rule_disable::RuleDisable::new(program.main.len())),
                 main: program.main.into_boxed_slice(),
                 sub_rules: program.sub_rules.into_boxed_slice(),
                 uses_domain_routing,
@@ -490,6 +493,10 @@ impl RuleSet {
         let mut rules = Self::compile(config.take_runtime_rules())?;
         rules.filter_udp = config.mode == crate::config::Mode::Rule;
         Ok(rules)
+    }
+
+    pub(crate) fn disable_state(&self) -> &Arc<rule_disable::RuleDisable> {
+        &self.graph.disabled
     }
 
     #[must_use]

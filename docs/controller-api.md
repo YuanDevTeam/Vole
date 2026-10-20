@@ -291,7 +291,21 @@ Expire 为 Unix 秒。未知时省略该对象，缺失子项为 0；不以本�
 
 `GET /rules` 返回 `rules` 数组，包括规则索引、类型、payload、目标及命中次数和最后命中时间。
 计数属于当前资源代际，只记录业务的新选路，不将每个 UDP 包重复计为一次选路。
-没有采集未命中次数、GeoData 记录大小；`size` 为 -1。规则列表反映当前有效路由模式。
+没有采集未命中次数、GeoData 记录大小；`size` 为 -1。规则列表反映当前有效路由模式，
+`extra.disabled` 来自与实际路由共用的一份临时开关快照。
+
+`PATCH /rules/disable` 接受 JSON 索引到布尔值对象，例如 `{"0":true,"2":false}`。
+`true` 跳过该主规则，`false` 恢复；跳过 SUB-RULE 入口时不会进入其子规则。
+请求要求唯一 `Content-Length` 和严格 `application/json`，正文最多 1 KiB，不接受 chunked。
+索引必须是当前列表范围内的非负整数，值只能是 bool；重复索引、未知索引、非法 JSON 或多份 JSON
+使整请求返回 400，任何规则都不改变。空对象返回 204。有效请求一次原子发布，成功返回 204。
+并发请求在提交时合并到当时的开关状态，不丢失其他索引已经成功提交的改动；同一索引以最后提交为准。
+新选路取得一个快照，后续 DNS／进程惰性查询继续沿用该快照；已建立 TCP 和 UDP 会话保留原路径。
+
+临时开关不修改 YAML，也不持久化。任何新规则程序编译与资源代际发布（含 provider 更新或配置替换）
+都清除临时开关，失败候选保留原状态。请求只在一个当前快照内校验并应用；接口没有 generation 字段，
+旧列表中的数字索引在重载后不保证仍表示同一规则，调用方应在资源变更后重新获取列表。
+开关使用不可变紧凑位集，最多 8 KiB 位数据，首次实际禁用时才分配；诊断只共享开关状态，不保活整个程序。
 
 `GET /configs` 返回归一化后的运行设置：mixed 入口、mode、log-level、IPv6、sniffing、
 连接选项、profile 和 TUN 字段。它使用字段白名单，不提供完整 YAML、节点凭据、订阅位置、
@@ -321,15 +335,15 @@ JSON 转义和名称展开后的正文最多 256 KiB。DNS 关闭、查询失败
 | 状态 | 含义 |
 | --- | --- |
 | `200 OK` | 查询成功，返回 `application/json` |
-| `204 No Content` | 选择、刷新或清理成功，正文为空 |
+| `204 No Content` | 选择、规则开关、刷新或清理成功，正文为空 |
 | `400 Bad Request` | 路径、JSON、长度格式或成员无效 |
 | `401 Unauthorized` | Bearer 鉴权失败 |
 | `404 Not Found` | 路由、组或当前 session 中的 TUN 流量资源不存在 |
 | `405 Method Not Allowed` | 路由存在但方法不允许 |
 | `408 Request Timeout` | header 或 body 读取超时 |
-| `411 Length Required` | PUT 缺少 `Content-Length` |
-| `413 Payload Too Large` | PUT 正文超过 1 KiB |
-| `415 Unsupported Media Type` | PUT 不是严格 `application/json` |
+| `411 Length Required` | 管理写请求缺少 `Content-Length` |
+| `413 Payload Too Large` | 管理写请求正文超过对应路径预算 |
+| `415 Unsupported Media Type` | 管理写请求不是严格 `application/json` |
 | `503 Service Unavailable` | 探测、资源更新失败或订阅准入已满 |
 | `504 Gateway Timeout` | 主动探测超时 |
 

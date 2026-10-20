@@ -4,6 +4,7 @@ use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 mod configs;
 mod cors;
 mod dns;
+mod rules;
 mod tls;
 mod transport;
 mod websocket;
@@ -365,6 +366,10 @@ async fn handle_request<S: ControllerIo>(
             .await;
     }
 
+    if request.target == "/rules/disable" {
+        return rules::disable(&mut stream, request, resources.as_deref(), cancellation).await;
+    }
+
     if request.target == "/cache/dns/flush" {
         if request.method != "POST" {
             return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "POST")]).await;
@@ -692,17 +697,18 @@ async fn delay_query<S: ControllerIo>(
     }
 }
 
-async fn handle_select<S: ControllerIo>(
+/// Small authenticated management writes share the existing 1 KiB envelope.
+/// None means a rejection response was written or the read was cancelled.
+async fn read_small_json_body<S: ControllerIo>(
     stream: &mut S,
     headers: &[(String, String)],
     mut body: Vec<u8>,
-    group: &str,
-    proxy_groups: &ProxyGroups,
-    resources: Option<&dyn crate::resource::control::RuntimeResources>,
     cancellation: CancellationToken,
-) -> io::Result<()> {
+) -> io::Result<Option<Vec<u8>>> {
     if header_values(headers, "transfer-encoding").next().is_some() {
-        return write_error(stream, 400, "Body invalid", &[]).await;
+        return write_error(stream, 400, "Body invalid", &[])
+            .await
+            .map(|()| None);
     }
 
     let mut content_types = header_values(headers, "content-type");
@@ -711,27 +717,39 @@ async fn handle_select<S: ControllerIo>(
         .is_some_and(|value| value.eq_ignore_ascii_case("application/json"))
         && content_types.next().is_none();
     if !valid_content_type {
-        return write_error(stream, 415, "Unsupported media type", &[]).await;
+        return write_error(stream, 415, "Unsupported media type", &[])
+            .await
+            .map(|()| None);
     }
 
     let mut content_lengths = header_values(headers, "content-length");
     let Some(content_length) = content_lengths.next() else {
-        return write_error(stream, 411, "Length required", &[]).await;
+        return write_error(stream, 411, "Length required", &[])
+            .await
+            .map(|()| None);
     };
     if content_lengths.next().is_some()
         || content_length.is_empty()
         || !content_length.bytes().all(|byte| byte.is_ascii_digit())
     {
-        return write_error(stream, 400, "Body invalid", &[]).await;
+        return write_error(stream, 400, "Body invalid", &[])
+            .await
+            .map(|()| None);
     }
     let Ok(content_length) = content_length.parse::<usize>() else {
-        return write_error(stream, 400, "Body invalid", &[]).await;
+        return write_error(stream, 400, "Body invalid", &[])
+            .await
+            .map(|()| None);
     };
     if content_length > MAX_CONTROLLER_BODY_BYTES {
-        return write_error(stream, 413, "Payload too large", &[]).await;
+        return write_error(stream, 413, "Payload too large", &[])
+            .await
+            .map(|()| None);
     }
     if body.len() > content_length {
-        return write_error(stream, 400, "Body invalid", &[]).await;
+        return write_error(stream, 400, "Body invalid", &[])
+            .await
+            .map(|()| None);
     }
 
     let buffered = body.len();
@@ -739,7 +757,7 @@ async fn handle_select<S: ControllerIo>(
     if buffered != content_length {
         let read = tokio::select! {
             biased;
-            () = cancellation.cancelled() => return Ok(()),
+            () = cancellation.cancelled() => return Ok(None),
             result = timeout(
                 CONTROLLER_BODY_TIMEOUT,
                 stream.read_exact(&mut body[buffered..]),
@@ -760,6 +778,22 @@ async fn handle_select<S: ControllerIo>(
             }
         }
     }
+
+    Ok(Some(body))
+}
+
+async fn handle_select<S: ControllerIo>(
+    stream: &mut S,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+    group: &str,
+    proxy_groups: &ProxyGroups,
+    resources: Option<&dyn crate::resource::control::RuntimeResources>,
+    cancellation: CancellationToken,
+) -> io::Result<()> {
+    let Some(body) = read_small_json_body(stream, headers, body, cancellation).await? else {
+        return Ok(());
+    };
 
     let request = match serde_json::from_slice::<SelectRequest>(&body) {
         Ok(request) => request,
@@ -1016,6 +1050,127 @@ mod tests {
 
     fn response_body(response: &str) -> &str {
         response.split_once("\r\n\r\n").unwrap().1
+    }
+
+    fn small_body_headers(length: usize) -> Vec<(String, String)> {
+        vec![
+            ("Content-Type".into(), "application/json".into()),
+            ("Content-Length".into(), length.to_string()),
+        ]
+    }
+
+    async fn small_select_memory(
+        headers: Vec<(String, String)>,
+        prefix: Vec<u8>,
+        tail: &[u8],
+        close_write: bool,
+        cancellation: CancellationToken,
+    ) -> (io::Result<()>, String, Arc<ProxyGroups>) {
+        let groups = test_groups();
+        let selected = groups.clone();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let serve = tokio::spawn(async move {
+            let mut stream = H1Io(server);
+            handle_select(
+                &mut stream,
+                &headers,
+                prefix,
+                "主线路",
+                &selected,
+                None,
+                cancellation,
+            )
+            .await
+        });
+        client.write_all(tail).await.unwrap();
+        if close_write {
+            client.shutdown().await.unwrap();
+        }
+        let result = serve.await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        (result, String::from_utf8(response).unwrap(), groups)
+    }
+
+    #[tokio::test]
+    async fn small_json_body_keeps_group_selection_and_header_budget() {
+        let mut body = br#"{"name":"node-b"}"#.to_vec();
+        body.resize(MAX_CONTROLLER_BODY_BYTES, b' ');
+        let (result, response, groups) = small_select_memory(
+            small_body_headers(body.len()),
+            body[..5].to_vec(),
+            &body[5..],
+            false,
+            CancellationToken::new(),
+        )
+        .await;
+        result.unwrap();
+        assert!(response.starts_with("HTTP/1.1 204"));
+        assert_eq!(groups.state("主线路").unwrap().now, "node-b");
+
+        for (status, headers) in [
+            (400, {
+                let mut headers = small_body_headers(body.len());
+                headers.push(("Transfer-Encoding".into(), "chunked".into()));
+                headers
+            }),
+            (415, {
+                let mut headers = small_body_headers(body.len());
+                headers[0].1 = "application/json; charset=utf-8".into();
+                headers
+            }),
+            (
+                411,
+                vec![("Content-Type".into(), "application/json".into())],
+            ),
+            (400, {
+                let mut headers = small_body_headers(body.len());
+                headers.push(("Content-Length".into(), body.len().to_string()));
+                headers
+            }),
+            (413, small_body_headers(MAX_CONTROLLER_BODY_BYTES + 1)),
+            (400, small_body_headers(body.len() - 1)),
+        ] {
+            let (result, response, groups) =
+                small_select_memory(headers, body.to_vec(), &[], false, CancellationToken::new())
+                    .await;
+            result.unwrap();
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}")));
+            assert_eq!(groups.state("主线路").unwrap().now, "node-a");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn small_json_body_keeps_group_eof_timeout_and_cancel_semantics() {
+        for (close_write, kind, status) in [
+            (true, io::ErrorKind::UnexpectedEof, 400),
+            (false, io::ErrorKind::TimedOut, 408),
+        ] {
+            let (result, response, groups) = small_select_memory(
+                small_body_headers(17),
+                b"{".to_vec(),
+                &[],
+                close_write,
+                CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(result.unwrap_err().kind(), kind);
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}")));
+            assert_eq!(groups.state("主线路").unwrap().now, "node-a");
+        }
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let (result, response, groups) = small_select_memory(
+            small_body_headers(17),
+            b"{".to_vec(),
+            &[],
+            false,
+            cancellation,
+        )
+        .await;
+        result.unwrap();
+        assert!(response.is_empty());
+        assert_eq!(groups.state("主线路").unwrap().now, "node-a");
     }
 
     #[test]

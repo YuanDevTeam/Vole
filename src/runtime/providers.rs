@@ -8,7 +8,7 @@ use crate::{
     dispatch::{BoxStream, DatagramBudget, DatagramTransport, DispatchError},
     resource::{
         cache::{ProviderCache, ProviderState},
-        control::{DelayRequest, DnsSnapshot, ProbeError, RuntimeResources},
+        control::{DelayRequest, DnsSnapshot, ProbeError, RuleUpdateError, RuntimeResources},
     },
     routing::ProxyGroupError,
     session::{Datagram, DatagramSession, Destination, StreamSession},
@@ -516,6 +516,18 @@ impl RuntimeResources for ProviderRuntime {
         )
     }
 
+    fn disable_rules(&self, changes: &[(usize, bool)]) -> Result<(), RuleUpdateError> {
+        // A replacement uses this same outer lock, so validation and mutation
+        // cannot accidentally target the previous generation after publication.
+        let _publication = self.publication.lock().unwrap();
+        let current = self.current.load();
+        current
+            .diagnostics
+            .as_ref()
+            .ok_or(RuleUpdateError::NotFound)?
+            .disable_rules(changes)
+            .map_err(|()| RuleUpdateError::InvalidIndex)
+    }
     fn groups(&self) -> Arc<ProxyGroups> {
         self.current.load().groups.clone()
     }
@@ -826,6 +838,7 @@ mod tests {
         let mut config = Config::parse_yaml(
             br#"
 mixed-port: 1080
+external-controller: 127.0.0.1:0
 proxy-providers:
   remote:
     type: file
@@ -866,6 +879,13 @@ rules: ['MATCH,choice']
         let parts = prepared.build_dispatcher(Dialer::default()).unwrap();
         let live = parts.resources.clone().unwrap();
         let generation = live.current.load_full();
+        live.disable_rules(&[(0, true)]).unwrap();
+        assert!(matches!(
+            live.disable_rules(&[(0, false), (1, true)]),
+            Err(RuleUpdateError::InvalidIndex)
+        ));
+        assert_eq!(live.rules()["rules"][0]["extra"]["disabled"], true);
+        let old_rule_view = generation.diagnostics.clone().unwrap();
         let query = crate::dns::build_query(1, "example.com", crate::dns::QueryType::A).unwrap();
         let wire = generation
             .dns
@@ -890,6 +910,9 @@ rules: ['MATCH,choice']
         assert_eq!(live.groups().state("choice").unwrap().now, "old-renamed");
         std::fs::write(&file, payload("new-node")).unwrap();
         live.update(0).await.unwrap();
+        assert_eq!(live.rules()["rules"][0]["extra"]["disabled"], false);
+        assert_eq!(old_rule_view.rules()["rules"][0]["extra"]["disabled"], true);
+        drop(old_rule_view);
         assert_eq!(live.groups().state("choice").unwrap().now, "new-node");
         assert!(Arc::ptr_eq(&registry, &live.connections()));
         std::fs::write(&file, payload("bad-expr")).unwrap();

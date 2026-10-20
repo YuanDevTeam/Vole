@@ -1,5 +1,5 @@
 //! Immutable programs and bounded resumable rule traversal.
-use std::net::IpAddr;
+use std::{net::IpAddr, sync::Arc};
 
 use super::{
     GeoMatcher, RoutingContext, RuleEvaluation, RuleMatch, RuleSet, matches_rule,
@@ -12,6 +12,7 @@ pub(super) struct CompiledProgram {
     pub main: Box<[RuleSpec]>,
     pub sub_rules: Box<[NamedRuleProgram]>,
     pub uses_domain_routing: bool,
+    pub disabled: Arc<super::rule_disable::RuleDisable>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,10 +27,11 @@ struct Frame {
 pub(crate) struct RuleCursor {
     frames: [Frame; 33],
     depth: usize,
+    disabled: super::rule_disable::Snapshot,
 }
 
 impl RuleCursor {
-    fn new(index: usize) -> Self {
+    fn new(index: usize, disabled: super::rule_disable::Snapshot) -> Self {
         let frame = Frame {
             program: 0,
             index: 0,
@@ -37,7 +39,11 @@ impl RuleCursor {
         };
         let mut frames = [frame; 33];
         frames[0].index = index;
-        Self { frames, depth: 0 }
+        Self {
+            frames,
+            depth: 0,
+            disabled,
+        }
     }
     pub(crate) fn root_index(&self) -> usize {
         self.frames[0].index
@@ -83,12 +89,17 @@ impl RuleSet {
         addresses: Option<&[IpAddr]>,
         mut effect: impl FnMut(RuleAction, &RoutingContext) -> RuleTargetEffect,
     ) -> ProgramEvaluation {
-        let mut cursor = cursor.unwrap_or_else(|| RuleCursor::new(0));
+        let mut cursor =
+            cursor.unwrap_or_else(|| RuleCursor::new(0, self.graph.disabled.snapshot()));
         loop {
             if let Err(failure) = context.decision().check() {
                 return ProgramEvaluation::Failed(failure);
             }
             let frame = cursor.frames[cursor.depth];
+            if frame.program == 0 && cursor.disabled.contains(frame.index) {
+                cursor.frames[0].index += 1;
+                continue;
+            }
             let rules = if frame.program == 0 {
                 &self.graph.main[..]
             } else {
@@ -213,7 +224,7 @@ impl RuleSet {
         self.evaluate_program(
             context,
             geo,
-            Some(RuleCursor::new(index)),
+            Some(RuleCursor::new(index, self.graph.disabled.snapshot())),
             Some(addresses),
             effect,
         )
@@ -241,6 +252,49 @@ mod tests {
             &Destination::domain("example.com", 443).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn disabled_main_rules_skip_subprograms_and_keep_the_decision_snapshot() {
+        let rules = compile(
+            "rules: ['SUB-RULE,(NETWORK,TCP),child', 'MATCH,REJECT']\nsub-rules: {child: ['IP-CIDR,192.0.2.0/24,DIRECT']}\n",
+        );
+        let mut context = self::context();
+        let cursor =
+            match rules.evaluate_program(&mut context, &EmptyGeoMatcher, None, None, |_, _| {
+                RuleTargetEffect::Accept
+            }) {
+                ProgramEvaluation::NeedsIpResolution(cursor) => cursor,
+                _ => panic!("child IP predicate must pause"),
+            };
+        rules.disable_state().apply(&[(0, true)]).unwrap();
+        assert!(matches!(
+            rules.evaluate_program(
+                &mut context,
+                &EmptyGeoMatcher,
+                Some(cursor),
+                Some(&["192.0.2.7".parse().unwrap()]),
+                |_, _| RuleTargetEffect::Accept
+            ),
+            ProgramEvaluation::Matched(RuleMatch {
+                action: RuleAction::Direct,
+                rule_index: 0
+            })
+        ));
+        assert!(matches!(
+            rules.evaluate(&self::context()),
+            RuleEvaluation::Matched(RuleMatch {
+                action: RuleAction::Reject,
+                rule_index: 1
+            })
+        ));
+        let fresh = compile(
+            "rules: ['SUB-RULE,(NETWORK,TCP),child', 'MATCH,REJECT']\nsub-rules: {child: ['IP-CIDR,192.0.2.0/24,DIRECT']}\n",
+        );
+        assert!(matches!(
+            fresh.evaluate(&self::context()),
+            RuleEvaluation::NeedsIpResolution { rule_index: 0 }
+        ));
     }
 
     #[test]

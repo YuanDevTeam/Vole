@@ -35,6 +35,11 @@ Controller 推送（纯内存 duplex，无网络监听）：`controller::websock
 实例日志脱敏/动态过滤：`logging::tests::`。
 组固定清除：`routing::proxy_group::tests::automatic_fixed_clear_uses_existing_health_without_probe`。
 这些过滤器不代替真实 TUN 计数与 Stop 验证。
+临时规则控制另选 `routing::rule_disable::tests::`、`controller::rules::tests::`、
+`controller::tests::small_json_body_`、
+`routing::program::tests::disabled_main_rules_skip_subprograms_and_keep_the_decision_snapshot`、
+`routing::diagnostics::tests::rule_switch_view_shares_only_small_state_with_the_program` 和
+`runtime::providers::tests::file_refresh_publishes_valid_members_and_preserves_old_sessions`。
 
 功能出站（纯内存）：`config::functional::tests::`、`outbound::dns::tests::`、
 `outbound::reject::tests::`；直连解析角色接线：

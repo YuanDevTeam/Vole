@@ -21,6 +21,12 @@ pub(crate) enum ProbeError {
     Stopped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuleUpdateError {
+    NotFound,
+    InvalidIndex,
+}
+
 /// A query holds its resource generation through completion and output admission.
 pub(crate) struct DnsSnapshot {
     pub dns: Arc<RuntimeDns>,
@@ -35,6 +41,9 @@ pub(crate) trait RuntimeResources: Send + Sync {
     }
     fn configs(&self) -> serde_json::Value;
     fn rules(&self) -> serde_json::Value;
+    fn disable_rules(&self, _changes: &[(usize, bool)]) -> Result<(), RuleUpdateError> {
+        Err(RuleUpdateError::NotFound)
+    }
     fn groups(&self) -> Arc<ProxyGroups>;
     fn select(&self, group: &str, member: &str) -> Result<(), ProxyGroupError>;
     fn clear_fixed(&self, _group: &str) -> Result<(), ProxyGroupError> {
