@@ -30,7 +30,7 @@
       "value": 32,
       "unit": "streams",
       "owner": "limits::TUIC_CONTROL_READERS",
-      "saturation": "limit active control decoders; incoming QUIC credit follows max-open-streams; expire partial parsers after five seconds",
+      "saturation": "limit active control decoders independently of fixed incoming QUIC credit; expire admitted partial parsers after five seconds",
       "cancellation": "node Stop cancels and joins all owned QUIC, parser, heartbeat and upstream tasks",
       "boundary_cases": [
         "TUIC-MEMORY"
@@ -461,10 +461,10 @@
     },
     {
       "id": "ws-early-data",
-      "value": 2048,
+      "value": 11904,
       "unit": "bytes",
       "owner": "transport::MAX_EARLY_DATA_BYTES",
-      "saturation": "reject invalid option, put excess initial bytes in data frames",
+      "saturation": "cap initial bytes by the actual HTTP head budget and this maximum; put excess bytes in data frames",
       "cancellation": "no separate task",
       "boundary_cases": [
         "FOUNDATIONS-STREAM"
