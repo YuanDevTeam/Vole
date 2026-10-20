@@ -244,8 +244,8 @@ sniffer:
 #   地址帧。raw 固定首包目标；packetaddr 域名通过受控 DNS 解析。
 # - REALITY 不用于 WS/HTTPUpgrade；该组合在配置期拒绝。
 # - TLS 省略 reality-opts；REALITY 必须提供 reality-opts.public-key，可选 short-id；
-#   support-x25519mlkem768 默认 false；true 强制真实混合协商、不回退经典组。
-#   true 只允许 client-fingerprint chrome 或未命名（省略/none/空串）；不改写模板。
+#   support-x25519mlkem768 默认 false；true 允许同次握手协商真实混合或经典组。
+#   chrome 和未命名模板提供混合/X25519 双 share；其余 TLS1.3 模板保留真实经典 share。
 # - xhttp-opts 请求字段与值域详见 docs/xhttp.md；mode 只接受
 #   auto/packet-up/stream-up/stream-one；stream-one 不能与 download-settings 同用；
 # - download-settings 一旦出现（包括 {}），就为下行 GET 创建独立的

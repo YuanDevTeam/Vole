@@ -21,9 +21,10 @@
 
 ## REALITY
 
-`reality-opts.support-x25519mlkem768` 为非 null 布尔值，默认 false。true 强制真实混合
-TLS 密钥交换，服务端选择经典组时失败；可用于主连接和 XHTTP 独立下载连接。
-仅 `chrome` 或未命名 profile 兼容，模板及下载继承约束见 [TLS 指纹](tls-client-fingerprint.md)。
+`reality-opts.support-x25519mlkem768` 为非 null 布尔值，默认 false。true 允许同次握手
+协商真实混合或经典 TLS 密钥交换，可用于主连接和 XHTTP 独立下载连接。
+`chrome` 和未命名 profile 提供混合/X25519 双 share，其余 TLS1.3 模板保留真实经典 share；
+不改写模板、重试握手或放宽 REALITY 认证。模板及下载继承约束见 [TLS 指纹](tls-client-fingerprint.md)。
 
 ## JLS
 

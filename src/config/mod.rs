@@ -1125,16 +1125,6 @@ pub struct RealityConfig {
 impl RealityConfig {
     pub(crate) fn validate_fingerprint(&self) -> Result<()> {
         validate_tls13_fingerprint(self.client_fingerprint)?;
-        if self.support_x25519mlkem768
-            && !matches!(
-                self.client_fingerprint,
-                None | Some(ClientFingerprint::Chrome133)
-            )
-        {
-            return invalid(
-                "hybrid REALITY requires client-fingerprint chrome or no named fingerprint",
-            );
-        }
         Ok(())
     }
 }

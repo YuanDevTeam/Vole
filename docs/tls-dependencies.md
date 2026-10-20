@@ -50,7 +50,7 @@ Encryption 的二进制 context 使用 [薄 FFI](../crates/vole-blake3-raw/READM
 官方 BLAKE3 C API；平台脚本通过官方 vcpkg 准备静态包，编译时隔离符号，不内置第三方源码。
 
 本地开发统一使用 `../boring/{boring,tokio-boring,boring-sys}`，当前原生实现为本地提交
-`4bac76121f259adcdb829f56ba52e864d10eaef5`。此来源需要配套 fork checkout，不是独立可移植
+`a6f70a5913548a1e0c08399bf6251f7a61f3c62b`。此来源需要配套 fork checkout，不是独立可移植
 Git 构建；未发布该提交。CI 的公开 Git 来源及批准 revision 门禁保持原样，本地 path 验证
 不代表发布门禁通过。发布前仍须按上述流程恢复直接依赖与 patch 的统一 Git 来源。
 

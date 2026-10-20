@@ -24,7 +24,7 @@
 大小写敏感，未知名称、`null`、错型全部拒绝；不接受带版本号的名称、
 其它未列出名称、废弃的 `randomized` 或 PSK/PQ 专用名称。短名只随显式依赖升级和验收变更，不随 OS 自动选择。
 `random` 仅共享不可变模板选择，后续连接、配置替换及 Stop/Start 不重抽，不共享 TLS 会话。
-兼容约束按实际选中模板检查，不能通过 random 绕过 REALITY 混合模式或 H3 限制。
+兼容约束按实际选中模板检查，不能通过 random 绕过 TLS 版本或 H3 限制。
 
 ## 适用范围
 
@@ -119,10 +119,12 @@ Core 使用标准 H2 SETTINGS，不声明 TLS ALPS，也不复制 Mihomo 某些 
 classic REALITY 移除 Chrome133 的 ML-KEM group/share，并绑定实际 X25519 私钥；
 Firefox 的额外经典 share 不产生第二份 REALITY 身份。REALITY 仍拒绝 HRR、恢复和 0-RTT。
 
-`reality-opts.support-x25519mlkem768`：默认 false，true 要求实际
-发送且协商 X25519MLKEM768（4588），经典选组即失败，不重试或降级。只兼容 `chrome`
-或关闭命名指纹；后者使用原生混合-only offer，不自动切到 chrome。Firefox120、
-Safari16.0/iOS14 在配置期拒绝该组合。下载腿继承/整体替换 REALITY 后，再独立验证最终 profile。
+`reality-opts.support-x25519mlkem768`：默认 false，true 允许在同次握手中协商
+真实 X25519MLKEM768（4588）或经典组。Chrome133 与未命名 profile 提供混合/X25519
+双 share，其余 TLS1.3 模板保留各自真实经典 share，不伪造混合能力或自动改成 Chrome。
+Android/360 的模板只有 TLS1.2，不能用于 REALITY；这项限制来自实际模板版本，
+并非新增协议限制。下载腿继承/整体替换 REALITY 后独立验证最终 profile。
+服务端选择允许的经典组不触发重试；HRR、认证失败仍终止，不降级为普通 WebPKI。
 ML-KEM 增强 TLS 密钥交换，REALITY 身份认证仍基于 X25519，不宣称后量子身份认证。
 
 Firefox 的 FFDHE、delegated credentials、record size limit 及 Safari/iOS 的模板专用

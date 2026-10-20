@@ -191,7 +191,7 @@ impl BoringTlsClient {
             .map_err(|_| invalid())?;
         builder
             .set_curves_list(if config.support_x25519mlkem768 {
-                "X25519MLKEM768"
+                "X25519MLKEM768:X25519"
             } else {
                 "X25519"
             })
@@ -210,7 +210,7 @@ impl BoringTlsClient {
         )
         .map_err(|_| invalid())?;
         let reality = if config.support_x25519mlkem768 {
-            reality.require_x25519mlkem768()
+            reality.allow_x25519mlkem768()
         } else {
             reality
         };

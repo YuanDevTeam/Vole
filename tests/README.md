@@ -140,6 +140,8 @@ GeoData、AGE、Provider和缓存测试使用合成输入、公开固定向量�
 这些局部预算与行为检查不证明进程RSS、网络吞吐或真机内存达标。
 命名指纹准入使用 `config::fingerprint_tests::`；标准 H2 SETTINGS/ACK 与 ALPS 可选性使用
 `selected_profiles_use_standard_h2_settings_when_the_server_supports_alps`（内存 TLS/H2）。
+REALITY 允许经典/混合协商的配置与两腿真实 share 使用
+`--test reality_config --test security_capabilities`（无网络 IO）。
 
 协议输入见[protocols](protocols/README.md)，ClientHello输入见[fingerprints](fingerprints/README.md)。
 脚本回归验证产物布局、后端/ABI选择和归档；真实编译与原生加载分别验证。
