@@ -479,10 +479,6 @@ impl Dialer {
                 "interface-name binding is unavailable on this target",
             ));
         }
-        #[cfg(all(target_os = "linux", feature = "tun"))]
-        if let Some(policy) = &self.linux_policy {
-            policy.validate_mark(self.egress.routing_mark)?;
-        }
         Ok(())
     }
     pub(crate) fn with_dns_sources(
@@ -574,7 +570,7 @@ impl Dialer {
             // interface is selected. Keep native TUN's private isolation.
             #[cfg(all(target_os = "linux", feature = "tun"))]
             if let Some(policy) = &self.linux_policy {
-                return policy.apply(socket, destination);
+                return policy.apply(socket, destination, 0);
             }
             return Ok(());
         }
@@ -607,7 +603,7 @@ impl Dialer {
         let Some(binding) = binding else {
             #[cfg(all(target_os = "linux", feature = "tun"))]
             if let Some(policy) = &self.linux_policy {
-                return policy.apply(socket, destination);
+                return policy.apply(socket, destination, self.egress.routing_mark);
             }
             return Ok(());
         };
@@ -644,6 +640,7 @@ impl Dialer {
             return policy.apply_with_interface(
                 socket,
                 destination,
+                self.egress.routing_mark,
                 Some(binding.interface.as_ref()),
             );
         }

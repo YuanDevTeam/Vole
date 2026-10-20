@@ -17,7 +17,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 | 范围 | 当前支持 |
 | --- | --- |
 | 配置与选路 | YAML anchor/merge；rule/global/direct；内置 DIRECT/COMPATIBLE/REJECT/REJECT-DROP；域名、地址、端口、网络、GeoData、RULE-SET 和 AND/OR/NOT |
-| 物理出口 | 全局/节点 interface-name、Linux routing-mark、Provider 对应 override、物理 TCP 与指定 UDP 节点的 IP4P 转换、普通 DNS #接口；平台约束和 auto-route mark 冲突见出站与 TUN 契约 |
+| 物理出口 | 全局/节点 interface-name、Linux routing-mark、Provider 对应 override、物理 TCP 与指定 UDP 节点的 IP4P 转换、普通 DNS #接口；平台约束和 auto-route 防环见出站与 TUN 契约 |
 | 资源 | HTTP/file/inline proxy/rule providers；YAML/URI/标准 Base64 订阅、AGE；共享流式 gzip/URL Basic；动态成员、筛选、覆盖、健康检查；Provider dialer-proxy 与 HTTP 订阅信息；YAML/Text 与 domain/ipcidr MRS；有界离线规则bundle；失败保留旧代 |
 | 策略组 | select/url-test/fallback/load-balance；默认和持久选择；延迟容差、恢复、三种负载均衡策略；旧连接保持原路径 |
 | DNS | hosts（含启动 LAN 地址快照）、bootstrap/节点/直连解析角色、policy、respect-rules；UDP/TCP/DoH/DoT/DoQ、DoH/H3；fallback；redir-host/fake-IP 与映射持久化 |

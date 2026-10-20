@@ -132,10 +132,12 @@ MTU/格式与 fd 标志，原生 builder 只打开 raw-IP TUN，不暗中启用 
   `dns.fake-ip-range` 的原始 IPv4 地址（默认 `198.18.0.1`），前缀固定 /30；IPv6 地址从 `inet6-address` 读取。
   路由表 `iproute2-table-index`（缺省/0 为 2022）、规则优先级
   `iproute2-rule-index` 到 `+8`（缺省/0 从 9000 开始）必须空闲；保留主表的非默认路由，
-  缺省仅本机未标记流量经 TUN，显式输入接口作用域见下节。Core socket 使用内部 mark 绕过捕获，
-  不依靠 source IP 避免递归。配置接口与路由直接通过内核接口完成，不调用 ip 子进程。
-  全局或任一节点设置非零 `routing-mark` 时，该自建 auto-route 组合在创建接口前失败；
-  动态 Provider 候选也不能引入冲突。借用 fd 和关闭 auto-route 的路径使用配置 mark。
+  缺省仅本机未标记流量经 TUN，显式输入接口作用域见下节。物理 socket 保留全局/节点
+  继承后的非零 `routing-mark`；只有零 mark 才注入内部防环值，两者均绕过本会话捕获。
+  不依靠 source IP 避免递归，也不新增覆盖用户策略路由的旁路规则。配置接口与路由直接
+  通过内核接口完成，不调用 ip 子进程。动态 Provider 候选沿用相同 socket 策略。
+  回环物理目标继续忽略公开 mark/接口并使用私有隔离；system/DHCP 保留其精确物理绑定。
+  借用 fd 和关闭 auto-route 的路径不注入私有 mark，保留原配置 mark。
 - 自动路由启用，且 `dns.enable: true`、`dns-hijack` 匹配接口 IPv4 下一地址的 53 端口时，
   通过 systemd-resolved 给新接口设置 DNS（默认 `198.18.0.2`）、路由域 `~.` 和 default-route。
   系统须使用 systemd-resolved；调用 `/usr/bin/resolvectl --no-ask-password`，
@@ -162,7 +164,7 @@ CLI 的进程启动、后台管理及用户授权仍由调用方负责。
 `route-address` 与 `route-exclude-address` 接受统一的 IPv4/IPv6 CIDR。
 每个可用地址族没有指定捕获网段时使用默认网段；排除网段优先，先做精确 CIDR 相减，
 再安装本会话独占表中的路由。保留 main 表的非默认路由；53 端口先尝试捕获表，
-排除网段仍可绕过。捕获作用域内的未标记流量进入规则，Core 的私有出口 mark 不进入捕获。
+排除网段仍可绕过。捕获作用域内的未标记流量进入规则，Core 的非零公开或私有出口 mark 不进入捕获。
 
 `include-interface/exclude-interface` 是 Linux RPDB 的输入接口名称筛选，不是物理出口。
 本机 output 使用 `lo`。非空 include 仅捕获所列输入，优先于 exclude（此时不使用 exclude）；

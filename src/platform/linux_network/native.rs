@@ -28,14 +28,10 @@ pub(crate) struct SocketPolicy {
     interfaces: Mutex<Option<Interfaces>>,
 }
 impl SocketPolicy {
-    pub(crate) fn validate_mark(&self, mark: u32) -> io::Result<()> {
-        if self.mark && mark != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "routing-mark conflicts with native TUN auto-route protection",
-            ));
-        }
-        Ok(())
+    fn default_mark(&self, configured_mark: u32) -> Option<u32> {
+        // Every capture rule matches only mark zero. A nonzero public mark
+        // already bypasses this lease and must retain its own RPDB meaning.
+        (self.mark && configured_mark == 0).then_some(netlink::MARK)
     }
     fn new(detect: bool, mark: bool) -> Self {
         Self {
@@ -44,17 +40,22 @@ impl SocketPolicy {
             interfaces: Mutex::new(None),
         }
     }
-    pub(crate) fn apply(&self, socket: &impl AsRawFd, destination: SocketAddr) -> io::Result<()> {
-        self.apply_with_interface(socket, destination, None)
+    pub(crate) fn apply(
+        &self,
+        socket: &impl AsRawFd,
+        destination: SocketAddr,
+        configured_mark: u32,
+    ) -> io::Result<()> {
+        self.apply_with_interface(socket, destination, configured_mark, None)
     }
     pub(crate) fn apply_with_interface(
         &self,
         socket: &impl AsRawFd,
         destination: SocketAddr,
+        configured_mark: u32,
         interface: Option<&str>,
     ) -> io::Result<()> {
-        if self.mark {
-            let value = netlink::MARK;
+        if let Some(value) = self.default_mark(configured_mark) {
             // SAFETY: socket is live and the option points to a u32 mark.
             if unsafe {
                 libc::setsockopt(
@@ -328,4 +329,27 @@ pub(crate) fn open(
         lease.apply(Change::DnsDefaultRoute)?;
     }
     Ok((tun, dialer, Some(lease)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_route_injects_only_a_default_mark_and_preserves_public_marks() {
+        for detect in [false, true] {
+            let protected = SocketPolicy::new(detect, true);
+            assert_eq!(protected.default_mark(0), Some(netlink::MARK));
+            for mark in [1, 7, 42, netlink::MARK, u32::MAX] {
+                assert_eq!(protected.default_mark(mark), None);
+            }
+            let unmanaged = SocketPolicy::new(detect, false);
+            for mark in [0, 1, netlink::MARK, u32::MAX] {
+                assert_eq!(unmanaged.default_mark(mark), None);
+            }
+            // Loopback callers deliberately pass zero rather than the public
+            // mark, keeping local proxies on the existing private bypass.
+            assert_eq!(protected.default_mark(0), Some(netlink::MARK));
+        }
+    }
 }

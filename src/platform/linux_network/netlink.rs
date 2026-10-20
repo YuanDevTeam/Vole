@@ -311,9 +311,10 @@ fn message(change: &Change, add: bool) -> io::Result<(u16, Vec<u8>)> {
                 Action::Goto(priority) => attr(&mut payload, 4, &priority.to_ne_bytes()),
                 Action::Unreachable | Action::Nop => {}
             }
-            // Core physical sockets carry MARK. Gate all plan operations,
-            // including unrestricted input lookups, on zero mark. No interface
-            // selector is accidentally interpreted as a physical output name.
+            // Core physical sockets carry the configured nonzero mark or
+            // private MARK. Gate all capture operations on zero so both marks
+            // retain their bypass without an extra rule or a replaced RPDB.
+            // Interface selectors always name input, not physical output.
             if rule.action != Action::Nop {
                 attr(&mut payload, 10, &0u32.to_ne_bytes());
                 attr(&mut payload, 16, &u32::MAX.to_ne_bytes());
@@ -366,6 +367,41 @@ mod tests {
             assert!(attribute(&bytes[..len], 15).is_err());
         }
     }
+    #[test]
+    fn capture_wire_matches_zero_marks_for_both_families_and_every_action() {
+        use super::super::plan::Rule;
+        for ipv6 in [false, true] {
+            for action in [
+                Action::Goto(9008),
+                Action::Table(2022),
+                Action::MainNonDefault,
+                Action::Unreachable,
+                Action::Nop,
+            ] {
+                let change = Change::Rule(Rule {
+                    ipv6,
+                    priority: 9004,
+                    selector: Selector::Any,
+                    action,
+                });
+                let (_, bytes) = message(&change, true).unwrap();
+                let attrs = &bytes[12..];
+                if action == Action::Nop {
+                    assert!(attribute(attrs, 10).unwrap().is_none());
+                    assert!(attribute(attrs, 16).unwrap().is_none());
+                } else {
+                    let value = property(attrs, 10, u32::MAX).unwrap();
+                    let mask = property(attrs, 16, 0).unwrap();
+                    assert_eq!((value, mask), (0, u32::MAX));
+                    for mark in [1, 7, 42, MARK, u32::MAX] {
+                        assert_ne!(mark & mask, value);
+                    }
+                }
+                assert_eq!(message(&change, false).unwrap().1, bytes);
+            }
+        }
+    }
+
     #[test]
     fn native_tun_wire_uses_exact_indices_cidrs_uid_and_native_port_attributes() {
         use super::super::plan::{Route, Rule};

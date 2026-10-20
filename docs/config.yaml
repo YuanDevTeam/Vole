@@ -51,8 +51,8 @@ disable-keep-alive: false
 # 接口支持 Linux、Apple 和 Windows，名称在建 socket 时校验；失败不回退其他出口。
 # 回环物理目标保留本机路径，不应用公开接口/mark；UWP 回环目标的现有安全门禁不变。
 # Android 显式接口绑定尚不可用，保留原 protect；非零 mark 仅 Linux 可用。
-# Linux 自建 TUN auto-route 使用私有防环 mark，与全局或任何节点的非零 mark 冲突时启动失败；
-# 借用 fd 或 auto-route: false 时可设置 mark。动态 Provider 候选沿用同一校验。
+# Linux 自建 TUN auto-route 仅捕获未标记流量；物理首跳保留有效的非零公开 mark，
+# 未配置 mark 时注入私有防环值。全局/节点与动态 Provider 使用同一继承与 socket 策略。
 # UWP 仅允许选择 Provider 当前物理适配器，不改变其源地址/接口索引；Wintun 不继承该绑定。
 interface-name: ""
 routing-mark: 0

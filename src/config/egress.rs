@@ -60,6 +60,41 @@ mod tests {
     }
 
     #[test]
+    fn native_auto_route_preserves_global_node_and_provider_marks_in_candidates() {
+        for mark in [7, u32::MAX] {
+            let yaml = format!(
+                r#"routing-mark: 42
+tun: {{enable: true, auto-route: true, file-descriptor: 0}}
+proxies:
+  - {{name: inherit, type: direct}}
+  - {{name: explicit, type: direct, routing-mark: 9}}
+proxy-providers:
+  nodes:
+    type: inline
+    override: {{routing-mark: {mark}}}
+    payload:
+      - {{name: supplied, type: direct, routing-mark: 3}}
+"#,
+            );
+            let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            let candidate = config
+                .providers
+                .as_ref()
+                .unwrap()
+                .materialize(&super::super::providers::ProviderContents::new())
+                .unwrap();
+            for config in [&config, &candidate] {
+                assert!(config.tun.enable && config.tun.auto_route);
+                assert_eq!(config.tun.file_descriptor, 0);
+                for (name, expected) in [("inherit", 42), ("explicit", 9), ("supplied", mark)] {
+                    let node = config.proxies.iter().find(|node| node.tag == name).unwrap();
+                    assert_eq!(config.egress.overlay(&node.egress).routing_mark, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn egress_provider_overrides_materialize_before_node_and_global_inheritance() {
         let config = Config::parse_yaml(br#"
 interface-name: global-if

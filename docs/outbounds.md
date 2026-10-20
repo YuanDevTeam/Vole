@@ -13,8 +13,8 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   回环物理目标保留本机路径，不套用公开接口或 mark；UWP 原有字面量回环门禁不变。
   Android 显式接口尚不可用，protect 仍强制执行；非零 mark 仅 Linux 可用。
   UWP 显式接口只能匹配 Provider 当前物理适配器，不能替换源地址/索引。
-  Linux 自建 TUN auto-route 与任何非零公开 mark 的组合在取得网络资源前拒绝；
-  Provider 候选同样校验，失败保留旧代。借用 fd 或关闭 auto-route 可使用公开 mark。
+  Linux 自建 TUN auto-route 的捕获规则只匹配零 mark；物理首跳保留非零公开 mark，
+  只有未配置 mark 才注入私有防环值。动态 Provider 候选沿用相同策略，失败仍保留旧代。
 - 代理链只由实际物理首跳消费出口策略；当前节点不覆盖其上游节点的策略。
   上游组选择 DIRECT 时使用当前节点策略。XHTTP 两腿、多端点刷新、跳端口和新 QUIC
   socket 沿用其所属路径的策略与选择快照；已建立连接不迁移。DNS、Provider、GeoData

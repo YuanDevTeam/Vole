@@ -615,7 +615,6 @@ impl PreparedCore {
 
     #[cfg(all(feature = "tun", target_os = "linux"))]
     pub(crate) async fn start_native_tun(self, dialer: Dialer) -> io::Result<RunningCore> {
-        validate_native_tun_egress(&self.config)?;
         let (tun, dialer, mut network) = crate::platform::linux_network::open(
             &self.config.tun,
             &self.config.dns,
@@ -742,8 +741,6 @@ impl GraphBuilder {
             .with_egress(&self.config.egress)
             .with_fresh_initialization();
         dialer.validate_egress()?;
-        #[cfg(target_os = "linux")]
-        validate_native_tun_egress(&self.config)?;
         let handshake_stats = RuntimeResourceStats::new("runtime_handshake_observation");
         let diagnostics = (self.config.external_controller.is_some()
             || self
@@ -1497,64 +1494,6 @@ fn build_proxy_graph(
         .map(|node| node.expect("every validated proxy graph node was built"))
         .collect();
     Ok(graph)
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn validate_native_tun_egress(config: &Config) -> io::Result<()> {
-    if config.tun.enable
-        && config.tun.file_descriptor == 0
-        && config.tun.auto_route
-        && (config.egress.routing_mark != 0
-            || config
-                .proxies
-                .iter()
-                .any(|proxy| proxy.egress.routing_mark != 0))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "routing-mark conflicts with native TUN auto-route protection",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod egress_tests {
-    use super::*;
-
-    #[test]
-    fn native_auto_route_rejects_static_and_provider_marks_before_acquisition() {
-        let mut config = Config::parse_yaml(
-            br#"
-tun: {enable: true, auto-route: true, file-descriptor: 0}
-proxy-providers:
-  nodes:
-    type: inline
-    override: {routing-mark: 7}
-    payload:
-      - {name: edge, type: socks5, server: 192.0.2.1, port: 1080}
-proxy-groups:
-  - {name: select, type: select, use: [nodes]}
-"#,
-        )
-        .unwrap();
-        // This predicate runs before native open(), and again before a
-        // materialized provider candidate can replace its running graph.
-        assert_eq!(
-            validate_native_tun_egress(&config).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        config.tun.file_descriptor = 7;
-        assert!(validate_native_tun_egress(&config).is_ok());
-        config.tun.file_descriptor = 0;
-        config.tun.auto_route = false;
-        assert!(validate_native_tun_egress(&config).is_ok());
-        config.tun.auto_route = true;
-        config.proxies[0].egress.routing_mark = 0;
-        assert!(validate_native_tun_egress(&config).is_ok());
-        config.egress.routing_mark = 42;
-        assert!(validate_native_tun_egress(&config).is_err());
-    }
 }
 
 fn build_upstream_path(
