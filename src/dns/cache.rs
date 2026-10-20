@@ -1,10 +1,14 @@
 //! Single-owner hash index and safe slot-linked DNS retention order.
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use super::{
-    CacheValue, DnsError, MAX_OPAQUE_CACHE_BYTES, MAX_OPAQUE_CACHE_ENTRIES, QueryType, Result,
-    WireQuestion,
+    CacheLookup, CacheValue, DnsError, MAX_OPAQUE_CACHE_BYTES, MAX_OPAQUE_CACHE_ENTRIES, QueryType,
+    Result, WireQuestion,
 };
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -62,6 +66,7 @@ struct Entry {
     key: Arc<Key>,
     value: Option<Value>,
     expires_at: Instant,
+    stale_eligible: bool,
     list: List,
     previous: Option<usize>,
     next: Option<usize>,
@@ -107,6 +112,9 @@ impl Key {
         }
     }
 }
+
+/// Maximum additional age after a positive result's fresh expiry.
+pub(super) const STALE_RETENTION: Duration = Duration::from_secs(3_600);
 
 /// One role's shared result store. Hash/slot storage starts empty. LRU retains
 /// at most c slots; ARC retains at most c payloads and c payload-free ghosts.
@@ -174,24 +182,58 @@ impl Store {
         *self = Self::with_algorithm(self.max_entries, self.algorithm);
     }
 
+    #[cfg(test)]
     pub(super) fn get(&mut self, key: &Key, now: Instant) -> Option<(&Value, Instant)> {
-        let slot = *self.index.get(key)?;
-        if self.entry(slot).expires_at <= now {
+        self.lookup(key, now, false).into_fresh()
+    }
+
+    /// Stale payloads remain residents in the existing count and byte budgets.
+    /// A lookup never extends either the fresh expiry or the fixed stale age.
+    pub(super) fn lookup(
+        &mut self,
+        key: &Key,
+        now: Instant,
+        allow_stale: bool,
+    ) -> CacheLookup<(&Value, Instant)> {
+        let Some(&slot) = self.index.get(key) else {
+            return CacheLookup::Miss;
+        };
+        let entry = self.entry(slot);
+        let stale = entry.expires_at <= now;
+        if stale
+            && (!allow_stale
+                || !entry.stale_eligible
+                || entry.value.is_none()
+                || now.saturating_duration_since(entry.expires_at) >= STALE_RETENTION)
+        {
             self.remove(slot);
-            return None;
+            return CacheLookup::Miss;
         }
-        self.entry(slot).value.as_ref()?;
-        let list = match self.algorithm {
-            crate::config::DnsCacheAlgorithm::Lru => List::Lru,
-            crate::config::DnsCacheAlgorithm::Arc => List::Frequent,
+        if entry.value.is_none() {
+            return CacheLookup::Miss;
+        }
+        // Repeated stale access may retain a resident, but does not count as
+        // fresh frequency evidence or resurrect an ARC ghost payload.
+        let list = if stale {
+            entry.list
+        } else {
+            match self.algorithm {
+                crate::config::DnsCacheAlgorithm::Lru => List::Lru,
+                crate::config::DnsCacheAlgorithm::Arc => List::Frequent,
+            }
         };
         self.unlink(slot);
         self.append(slot, list);
         let entry = self.entry(slot);
-        Some((
+        let hit = (
             entry.value.as_ref().expect("resident entry has a payload"),
             entry.expires_at,
-        ))
+        );
+        if stale {
+            CacheLookup::Stale(hit)
+        } else {
+            CacheLookup::Fresh(hit)
+        }
     }
 
     pub(super) fn insert(
@@ -200,6 +242,7 @@ impl Store {
         value: Value,
         expires_at: Instant,
         now: Instant,
+        stale_eligible: bool,
     ) -> Result<()> {
         let mut replaced = self.index.get(&key).copied();
         if let Some(slot) = replaced
@@ -290,6 +333,7 @@ impl Store {
             key,
             value: Some(value),
             expires_at,
+            stale_eligible,
             list: destination,
             previous: None,
             next: None,
@@ -500,6 +544,7 @@ mod tests {
                 Value::Address(CacheValue::Positive(vec![Ipv4Addr::LOCALHOST.into()])),
                 now + Duration::from_secs(60),
                 now,
+                true,
             )
             .unwrap();
     }
@@ -528,8 +573,92 @@ mod tests {
                 },
                 now + Duration::from_secs(ttl),
                 now,
+                true,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn stale_positive_age_is_fixed_and_does_not_turn_ghosts_into_payloads() {
+        let now = Instant::now();
+        for algorithm in [DnsCacheAlgorithm::Lru, DnsCacheAlgorithm::Arc] {
+            let mut store = Store::with_algorithm(2, algorithm);
+            put(&mut store, "a", now);
+            assert!(matches!(
+                store.lookup(&address("a"), now, true),
+                CacheLookup::Fresh(_)
+            ));
+            let expires = now + Duration::from_secs(60);
+            assert!(matches!(
+                store.lookup(&address("a"), expires, true),
+                CacheLookup::Stale(_)
+            ));
+            assert!(matches!(
+                store.lookup(
+                    &address("a"),
+                    expires + STALE_RETENTION - Duration::from_secs(1),
+                    true
+                ),
+                CacheLookup::Stale(_)
+            ));
+            assert!(matches!(
+                store.lookup(&address("a"), expires + STALE_RETENTION, true),
+                CacheLookup::Miss
+            ));
+            assert_eq!(store.len(), 0);
+
+            put(&mut store, "a", now);
+            store.get(&address("a"), now).unwrap();
+            put_opaque(&mut store, "b", now, 60);
+            put(&mut store, "c", now);
+            if algorithm == DnsCacheAlgorithm::Arc {
+                let ghost = store.entry(*store.index.get(&opaque_key("b")).unwrap());
+                assert!(ghost.value.is_none());
+                assert!(matches!(
+                    store.lookup(&opaque_key("b"), now, true),
+                    CacheLookup::Miss
+                ));
+                assert_eq!(store.opaque_len(), 0);
+                assert_eq!(store.recent_target, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_mixed_results_use_the_same_resident_and_opaque_budgets() {
+        let now = Instant::now();
+        let stale = now + Duration::from_secs(61);
+        for algorithm in [DnsCacheAlgorithm::Lru, DnsCacheAlgorithm::Arc] {
+            let mut store = Store::with_algorithm(64, algorithm);
+            for index in 0..64 {
+                put_opaque(&mut store, &format!("wire{index}"), now, 60);
+            }
+            let bytes = store.opaque_bytes();
+            let mut stale_hits = 0;
+            for index in 0..64 {
+                stale_hits += usize::from(matches!(
+                    store.lookup(&opaque_key(&format!("wire{index}")), stale, true),
+                    CacheLookup::Stale(_)
+                ));
+            }
+            assert!(stale_hits > 0);
+            assert_eq!(store.opaque_bytes(), bytes);
+            for index in 0..200 {
+                put_opaque(&mut store, &format!("new{index}"), stale, 60);
+                if index % 4 == 0 {
+                    put(&mut store, &format!("typed{index}"), stale);
+                }
+                assert!(store.len() <= 64);
+                assert!(store.opaque_len() <= MAX_OPAQUE_CACHE_ENTRIES);
+                assert!(store.opaque_bytes() <= MAX_OPAQUE_CACHE_BYTES);
+                assert!(store.index.len() <= store.metadata_limit());
+                assert!(store.slots.len() <= store.metadata_limit());
+            }
+            store.clear();
+            assert_eq!(store.len(), 0);
+            assert_eq!(store.opaque_bytes(), 0);
+            assert_eq!(store.allocated_slots(), 0);
+        }
     }
 
     #[test]
@@ -590,6 +719,7 @@ mod tests {
                 Value::Address(CacheValue::Negative { rcode: 3 }),
                 now + Duration::from_secs(30),
                 now,
+                false,
             )
             .unwrap();
         let expired = now + Duration::from_secs(31);

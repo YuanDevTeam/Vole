@@ -176,6 +176,7 @@ pub struct ClassifiedDnsQuery {
     // Plain address lookups use the small address cache. Client EDNS or
     // semantic flags require retaining the validated wire response instead.
     needs_wire_cache: bool,
+    dnssec_context: bool,
 }
 
 impl ClassifiedDnsQuery {
@@ -221,6 +222,7 @@ pub struct ValidatedOpaqueResponse {
     ttl_offsets: Box<[u16]>,
     rcode: u16,
     cache_policy: OpaqueCachePolicy,
+    stale_eligible: bool,
 }
 
 impl ValidatedOpaqueResponse {
@@ -417,11 +419,14 @@ pub fn classify_query(message: &[u8]) -> Result<ClassifiedDnsQuery> {
     }
 
     let mut cursor = parsed.records_offset;
+    let mut dnssec_context =
+        parsed.flags & 0x0030 != 0 || dnssec_record_type(parsed.question.query_type);
     for _ in 0..parsed.additional_count {
         let record = scan_record(message, &mut cursor)?;
         if record.record_type != TYPE_OPT || !record.owner.is_empty() {
             return Err(DnsError::InvalidRecord);
         }
+        dnssec_context |= record.ttl & 0x8000 != 0;
         validate_edns_options(
             message,
             usize::from(record.data_start),
@@ -447,6 +452,7 @@ pub fn classify_query(message: &[u8]) -> Result<ClassifiedDnsQuery> {
         question_wire,
         semantics_digest,
         needs_wire_cache: parsed.additional_count != 0 || parsed.flags & !0x0100 != 0,
+        dnssec_context,
     })
 }
 
@@ -525,9 +531,11 @@ fn validate_wire_response(
     let mut seen_opt = false;
     let mut extended_rcode = 0_u8;
     let mut authority_has_soa = false;
+    let mut dnssec_context = query.dnssec_context || parsed.flags & 0x0030 != 0;
     for (section, count) in section_counts.into_iter().enumerate() {
         for _ in 0..count {
             let record = scan_record(response, &mut cursor)?;
+            dnssec_context |= dnssec_record_type(record.record_type);
             if section == 1
                 && record.record_type == 6
                 && record.record_class == query.question.query_class
@@ -540,6 +548,7 @@ fn validate_wire_response(
                 }
                 seen_opt = true;
                 extended_rcode = (record.ttl >> 24) as u8;
+                dnssec_context |= record.ttl & 0x8000 != 0;
                 validate_edns_options(
                     response,
                     usize::from(record.data_start),
@@ -590,7 +599,14 @@ fn validate_wire_response(
         ttl_offsets: ttl_offsets.into_boxed_slice(),
         rcode,
         cache_policy,
+        stale_eligible: matches!(cache_policy, OpaqueCachePolicy::Positive { .. })
+            && !dnssec_context,
     })
+}
+
+// Keep signed-response lifetime policy separate from ordinary positive TTLs.
+const fn dnssec_record_type(record_type: u16) -> bool {
+    matches!(record_type, 43 | 46 | 47 | 48 | 50 | 51 | 59 | 60)
 }
 
 /// Parses and validates a DNS query. Only opcode 0, class IN and A/AAAA are
@@ -1032,6 +1048,31 @@ pub enum CacheValue {
     },
 }
 
+/// Internal lookup state; the current public cache getters remain fresh-only.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CacheLookup<T> {
+    Fresh(T),
+    Stale(T),
+    Miss,
+}
+
+impl<T> CacheLookup<T> {
+    fn into_fresh(self) -> Option<T> {
+        match self {
+            Self::Fresh(value) => Some(value),
+            Self::Stale(_) | Self::Miss => None,
+        }
+    }
+
+    fn map<U>(self, convert: impl FnOnce(T) -> U) -> CacheLookup<U> {
+        match self {
+            Self::Fresh(value) => CacheLookup::Fresh(convert(value)),
+            Self::Stale(value) => CacheLookup::Stale(convert(value)),
+            Self::Miss => CacheLookup::Miss,
+        }
+    }
+}
+
 /// Single-owner result cache with a shared count for typed and opaque questions.
 /// Lookups, recency updates and capacity eviction use a hash index and linked
 /// slots; payloads remain bounded by their respective address/wire budgets.
@@ -1095,11 +1136,36 @@ impl DnsCache {
         query_type: QueryType,
         now: Instant,
     ) -> Option<(CacheValue, u32)> {
-        let key = cache::Key::Address(canonicalize_name(name).ok()?, query_type);
-        let (cache::Value::Address(value), expires_at) = self.store.get(&key, now)? else {
-            return None;
+        self.lookup_with_ttl(name, query_type, now, false)
+            .into_fresh()
+    }
+
+    pub(crate) fn lookup_with_ttl(
+        &mut self,
+        name: &str,
+        query_type: QueryType,
+        now: Instant,
+        allow_stale: bool,
+    ) -> CacheLookup<(CacheValue, u32)> {
+        let Ok(name) = canonicalize_name(name) else {
+            return CacheLookup::Miss;
         };
-        Some((value.clone(), remaining_ttl(expires_at, now)))
+        let key = cache::Key::Address(name, query_type);
+        self.store
+            .lookup(&key, now, allow_stale)
+            .map(|(value, expires_at)| {
+                let cache::Value::Address(value) = value else {
+                    unreachable!("typed cache key has a typed payload");
+                };
+                (
+                    value.clone(),
+                    if expires_at <= now {
+                        1
+                    } else {
+                        remaining_ttl(expires_at, now)
+                    },
+                )
+            })
     }
 
     pub fn insert_positive(
@@ -1128,7 +1194,7 @@ impl DnsCache {
             name,
             query_type,
             CacheValue::Positive(addresses.to_vec()),
-            clamp_ttl(ttl),
+            ttl,
             now,
         )
     }
@@ -1160,11 +1226,13 @@ impl DnsCache {
         ttl: u32,
         now: Instant,
     ) -> Result<()> {
+        let stale_eligible = matches!(value, CacheValue::Positive(_)) && ttl != 0;
         self.store.insert(
             cache::Key::Address(canonicalize_name(name)?, query_type),
             cache::Value::Address(value),
-            expiry(now, ttl),
+            expiry(now, clamp_ttl(ttl)),
             now,
+            stale_eligible,
         )
     }
 
@@ -1181,31 +1249,46 @@ impl DnsCache {
     }
 
     pub(crate) fn get_wire(&mut self, query: &ClassifiedDnsQuery, now: Instant) -> Option<Vec<u8>> {
+        self.lookup_wire(query, now, false).into_fresh()
+    }
+
+    pub(crate) fn lookup_wire(
+        &mut self,
+        query: &ClassifiedDnsQuery,
+        now: Instant,
+        allow_stale: bool,
+    ) -> CacheLookup<Vec<u8>> {
         let key = cache::Key::Opaque(query.question.clone(), query.semantics_digest);
-        let (
-            cache::Value::Opaque {
-                wire, ttl_offsets, ..
-            },
-            expires_at,
-        ) = self.store.get(&key, now)?
-        else {
-            return None;
-        };
-        let mut wire = wire.to_vec();
-        wire[..2].copy_from_slice(&query.id.to_be_bytes());
-        let mut flags = u16::from_be_bytes([wire[2], wire[3]]);
-        if query.recursion_desired {
-            flags |= 0x0100;
-        } else {
-            flags &= !0x0100;
-        }
-        wire[2..4].copy_from_slice(&flags.to_be_bytes());
-        let ttl = remaining_ttl(expires_at, now).to_be_bytes();
-        for offset in ttl_offsets {
-            let offset = usize::from(*offset);
-            wire[offset..offset + 4].copy_from_slice(&ttl);
-        }
-        Some(wire)
+        self.store
+            .lookup(&key, now, allow_stale)
+            .map(|(value, expires_at)| {
+                let cache::Value::Opaque {
+                    wire, ttl_offsets, ..
+                } = value
+                else {
+                    unreachable!("wire cache key has a wire payload");
+                };
+                let mut wire = wire.to_vec();
+                wire[..2].copy_from_slice(&query.id.to_be_bytes());
+                let mut flags = u16::from_be_bytes([wire[2], wire[3]]);
+                if query.recursion_desired {
+                    flags |= 0x0100;
+                } else {
+                    flags &= !0x0100;
+                }
+                wire[2..4].copy_from_slice(&flags.to_be_bytes());
+                let ttl = if expires_at <= now {
+                    1
+                } else {
+                    remaining_ttl(expires_at, now)
+                }
+                .to_be_bytes();
+                for offset in ttl_offsets {
+                    let offset = usize::from(*offset);
+                    wire[offset..offset + 4].copy_from_slice(&ttl);
+                }
+                wire
+            })
     }
 
     /// Opaque payloads share the role's result count while retaining their own
@@ -1237,6 +1320,7 @@ impl DnsCache {
                 },
                 expiry(now, lifetime_secs),
                 now,
+                response.stale_eligible,
             )
             .is_ok()
     }
@@ -2154,6 +2238,133 @@ mod tests {
             synthesize_empty_response(&query, 16),
             Err(DnsError::InvalidRcode)
         );
+    }
+
+    #[test]
+    fn typed_stale_lookup_keeps_public_getters_fresh_only_and_excludes_negative_or_zero_ttl() {
+        let now = Instant::now();
+        let expired = now + Duration::from_secs(30);
+        let address = "192.0.2.1".parse().unwrap();
+        let mut cache = DnsCache::new();
+        cache
+            .insert_positive("positive.test", QueryType::A, &[address], 30, now)
+            .unwrap();
+        assert_eq!(
+            cache.lookup_with_ttl("positive.test", QueryType::A, expired, true),
+            CacheLookup::Stale((CacheValue::Positive(vec![address]), 1))
+        );
+        assert_eq!(cache.len(), 1);
+        // This stage does not enable stale answers in an existing runtime.
+        assert_eq!(cache.get("positive.test", QueryType::A, expired), None);
+        assert!(cache.is_empty());
+        cache
+            .insert_negative("negative.test", QueryType::A, RCODE_NXDOMAIN, now)
+            .unwrap();
+        cache
+            .insert_positive("zero.test", QueryType::A, &[address], 0, now)
+            .unwrap();
+        for name in ["negative.test", "zero.test"] {
+            assert_eq!(
+                cache.lookup_with_ttl(name, QueryType::A, expired, true),
+                CacheLookup::Miss
+            );
+        }
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn stale_wire_lookup_restores_id_and_limits_record_ttls_without_rewriting_opt() {
+        let now = Instant::now();
+        let query_wire = wire_query(1, "txt.example", 16);
+        let query = classify_query(&query_wire).unwrap();
+        let mut response = opaque_response(&query_wire, RCODE_NOERROR, false);
+        set_counts(&mut response, 1, 1, 1);
+        let answer_ttl =
+            append_wire_record(&mut response, &[0xc0, 0x0c], 16, CLASS_IN, 30, b"\x05value");
+        let authority_ttl = append_wire_record(&mut response, &[0xc0, 0x0c], 2, CLASS_IN, 60, &[0]);
+        let opt_ttl = append_wire_record(&mut response, &[0], TYPE_OPT, 1232, 0, &[]);
+        let validated = validate_opaque_response(&query, &response).unwrap();
+        let mut cache = DnsCache::new();
+        assert!(cache.insert_opaque(&validated, now));
+        let hit_query = classify_query(&wire_query(2, "txt.example", 16)).unwrap();
+        let CacheLookup::Stale(hit) =
+            cache.lookup_wire(&hit_query, now + Duration::from_secs(30), true)
+        else {
+            panic!("validated positive should retain a bounded stale answer");
+        };
+        assert_eq!(read_u16(&hit, 0).unwrap(), 2);
+        assert_eq!(read_u32(&hit, answer_ttl).unwrap(), 1);
+        assert_eq!(read_u32(&hit, authority_ttl).unwrap(), 1);
+        assert_eq!(read_u32(&hit, opt_ttl).unwrap(), 0);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.store.opaque_bytes() <= MAX_OPAQUE_CACHE_BYTES);
+        assert_eq!(
+            cache.get_opaque(&hit_query, now + Duration::from_secs(30)),
+            None
+        );
+        assert_eq!(cache.store.opaque_bytes(), 0);
+    }
+
+    #[test]
+    fn stale_wire_lookup_excludes_dnssec_context_and_negative_answers() {
+        let now = Instant::now();
+        for (name, qtype, query_flags, query_do, response_flags, record_type, response_do, rcode) in [
+            ("plain", 16, 0x0100, false, 0, 16, false, RCODE_NOERROR),
+            ("query-do", 16, 0x0100, true, 0, 16, false, RCODE_NOERROR),
+            ("query-cd", 16, 0x0110, false, 0, 16, false, RCODE_NOERROR),
+            (
+                "answer-ad",
+                16,
+                0x0100,
+                false,
+                0x0020,
+                16,
+                false,
+                RCODE_NOERROR,
+            ),
+            ("answer-do", 16, 0x0100, false, 0, 16, true, RCODE_NOERROR),
+            ("signature", 16, 0x0100, false, 0, 46, false, RCODE_NOERROR),
+            ("dnskey", 48, 0x0100, false, 0, 48, false, RCODE_NOERROR),
+            ("negative", 16, 0x0100, false, 0, 16, false, RCODE_NXDOMAIN),
+        ] {
+            let mut wire = wire_query(1, &format!("{name}.test"), qtype);
+            wire[2..4].copy_from_slice(&u16::to_be_bytes(query_flags));
+            if query_do {
+                wire[10..12].copy_from_slice(&1_u16.to_be_bytes());
+                append_wire_record(&mut wire, &[0], TYPE_OPT, 1232, 0x8000, &[]);
+            }
+            let query = classify_query(&wire).unwrap();
+            let mut response = opaque_response(&wire, rcode, false);
+            let flags = read_u16(&response, 2).unwrap() | response_flags;
+            response[2..4].copy_from_slice(&flags.to_be_bytes());
+            set_counts(&mut response, 1, 0, u16::from(response_do));
+            append_wire_record(
+                &mut response,
+                &[0xc0, 0x0c],
+                record_type,
+                CLASS_IN,
+                30,
+                b"\x05value",
+            );
+            if response_do {
+                append_wire_record(&mut response, &[0], TYPE_OPT, 1232, 0x8000, &[]);
+            }
+            let validated = validate_opaque_response(&query, &response).unwrap();
+            let mut cache = DnsCache::new();
+            assert!(cache.insert_opaque(&validated, now));
+            assert!(
+                matches!(cache.lookup_wire(&query, now, true), CacheLookup::Fresh(_)),
+                "{name}"
+            );
+            assert_eq!(
+                matches!(
+                    cache.lookup_wire(&query, now + Duration::from_secs(30), true),
+                    CacheLookup::Stale(_)
+                ),
+                name == "plain",
+                "{name}"
+            );
+        }
     }
 
     #[test]
