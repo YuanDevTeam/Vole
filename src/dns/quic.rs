@@ -357,7 +357,8 @@ async fn drive(
         raw.budget
             .intersect(upstream.as_ref().unwrap().payload_budget(&raw.peer.into()))
             .quic_payload_limit()?;
-        let (socket, driver) = quic::attach(upstream.take().unwrap(), raw.peer, raw.budget)?;
+        let (socket, driver) =
+            quic::attach_quinn(upstream.take().unwrap(), raw.peer, raw.budget).await?;
         datagram = Some(driver);
         let path = socket.budget();
         let mtu = path
@@ -371,6 +372,7 @@ async fn drive(
             None
         };
         let mut limits = quinn::TransportConfig::default();
+        socket.configure_transport(&mut limits);
         limits
             .initial_mtu(mtu)
             .min_mtu(mtu)

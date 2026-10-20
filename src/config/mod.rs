@@ -1332,11 +1332,24 @@ struct RawVoleConfig {
     sub_rules: std::collections::BTreeMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawExperimental {
     #[serde(rename = "dialer-ip4p-convert", default)]
     dialer_ip4p_convert: bool,
+    #[serde(rename = "quic-go-disable-gso", default)]
+    quic_disable_gso: bool,
+    #[serde(rename = "quic-go-disable-ecn", default = "default_true")]
+    quic_disable_ecn: bool,
+}
+impl Default for RawExperimental {
+    fn default() -> Self {
+        Self {
+            dialer_ip4p_convert: false,
+            quic_disable_gso: false,
+            quic_disable_ecn: true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2595,6 +2608,10 @@ impl RawVoleConfig {
             find_process_mode: self.find_process_mode,
             connections: ConnectionSettings {
                 dialer_ip4p_convert: self.experimental.dialer_ip4p_convert,
+                quic: QuicSocketSettings {
+                    disable_gso: self.experimental.quic_disable_gso,
+                    disable_ecn: self.experimental.quic_disable_ecn,
+                },
                 tcp_concurrent: self.tcp_concurrent,
                 keep_alive_idle: self.keep_alive_idle,
                 keep_alive_interval: self.keep_alive_interval,
@@ -7375,8 +7392,24 @@ authentication:
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConnectionSettings {
     pub dialer_ip4p_convert: bool,
+    pub quic: QuicSocketSettings,
     pub tcp_concurrent: bool,
     pub keep_alive_idle: i32,
     pub keep_alive_interval: i32,
     pub disable_keep_alive: bool,
+}
+
+/// Per-session capabilities of an unchanged physical QUIC UDP path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuicSocketSettings {
+    pub disable_gso: bool,
+    pub disable_ecn: bool,
+}
+impl Default for QuicSocketSettings {
+    fn default() -> Self {
+        Self {
+            disable_gso: false,
+            disable_ecn: true,
+        }
+    }
 }

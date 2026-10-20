@@ -93,6 +93,20 @@ struct Bounded {
 
 #[async_trait::async_trait]
 impl DatagramTransport for Bounded {
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    async fn lease_quic_socket(
+        &mut self,
+        peer: std::net::SocketAddr,
+    ) -> Result<Option<crate::transport::quic::PhysicalQuicLease>, DispatchError> {
+        if self.closing {
+            return Err(DispatchError::NotAllowed);
+        }
+        self.inner.lease_quic_socket(peer).await
+    }
+
     fn supports_shared_destinations(&self) -> bool {
         self.inner.supports_shared_destinations()
     }

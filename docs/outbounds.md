@@ -56,6 +56,21 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   HTTP 出站已有的可选 TLS 字段保留 null 等同省略的行为。
   凭据、UUID、业务目标和完整请求不进入 Debug/错误；资源与 Stop 见[公共策略](runtime-resource-policy.md)。
 
+`experimental.quic-go-disable-gso` 缺省 false，`quic-go-disable-ecn` 缺省 true。
+这两个会话配置只由 Linux 上 TUIC、XHTTP H3、DoQ/DoH H3 的 DIRECT 物理首跳消费，
+使用共享 Dialer 已保护、已绑定的同一 socket；不修改宿主进程环境。
+GSO 分段批次依实际路径与预算每次最多 8 段、整批最多 65,507 字节，每段保留原 UDP 预算。
+未分段的数据报沿用原方向预算，IPv6 可达 65,527 字节；关闭 GSO 后只发独立数据报。
+DoQ/DoH H3 的当前 DIRECT 预算为 IPv4 65,507、IPv6 65,527 字节，分段能力为 1；
+这些 DNS 路径使用同 socket 的原生收发与 ECN 元数据，不据此声称实际 GSO 批量发送。
+ECN 开启时传递实际发送标记和接收元数据；关闭时不发送/交付 ECN 标记。
+系统无法开启 ECN 接收元数据时，保留同一受保护 socket，沿用原单包、无元数据路径。
+GRO 保持关闭，接收仍使用一个有界完整包，不放大 QUIC 接收区或 socket 缓冲。
+代理 hop、HY2 的 pacer/混淆/Realm、quiche 后端以及非 Linux 平台当前保持单包且不保留 ECN；
+这些路径不声称消费新元数据能力。停止时撤销物理 socket 的共同租约；保留已关闭的 QUIC
+连接或写就绪 poller 不会延长物理 fd 的生命周期。GSO 的明确能力错误只关闭后续批量发送，失败批次
+作为 UDP 丢失交给 Quinn 的正常 ACK/重传；不会立即重发该批次，不掩盖地址、策略或 ECN 错误。H3 的正常传输、认证、PMTUD、取消及同步 Stop 仍沿原所有者。
+
 VMess + TLS、Trojan、AnyTLS、TrustTunnel、VLESS 和 Hysteria2 支持 `ech-opts.enable/config/query-server-name`，
 静态优先和动态节点 DNS 来源、后端算法及失败边界见 [ECH](vless.md#ech)。
 TUIC 的固定参考未消费 ECH，因此不接受该字段。

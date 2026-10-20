@@ -341,10 +341,11 @@ async fn drive(
         let raw = upstream
             .open_datagram(DatagramRequest::new(datagram).with_budget(budget), &context)
             .await?;
-        let (socket, owned) = quic::attach(raw, peer, budget)?;
+        let (socket, owned) = quic::attach_quinn(raw, peer, budget).await?;
         driver = Some(owned);
         let mtu = socket.budget().quic_payload_limit()?;
         let mut limits = quinn::TransportConfig::default();
+        socket.configure_transport(&mut limits);
         quic::configure_receive_windows(
             &mut limits,
             config.stream_window,

@@ -28,6 +28,35 @@ mod tests {
     use super::*;
     use crate::config::Config;
     #[test]
+    fn physical_quic_switches_are_session_scoped_strict_and_keep_mihomo_defaults() {
+        for yaml in [
+            "rules: ['MATCH,DIRECT']",
+            "experimental: {}\nrules: ['MATCH,DIRECT']",
+        ] {
+            let settings = Config::parse_yaml(yaml.as_bytes())
+                .unwrap()
+                .connections
+                .quic;
+            assert!(!settings.disable_gso);
+            assert!(settings.disable_ecn);
+        }
+        let settings = Config::parse_yaml(b"experimental: {quic-go-disable-gso: true, quic-go-disable-ecn: false}\nrules: ['MATCH,DIRECT']").unwrap().connections.quic;
+        assert!(settings.disable_gso);
+        assert!(!settings.disable_ecn);
+        for value in ["'true'", "null", "1"] {
+            for field in ["quic-go-disable-gso", "quic-go-disable-ecn"] {
+                assert!(
+                    Config::parse_yaml(
+                        format!("experimental: {{{field}: {value}}}\nrules: ['MATCH,DIRECT']")
+                            .as_bytes()
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ip4p_exact_prefix_network_port_and_default_off() {
         let policy = ConnectionSettings {
             dialer_ip4p_convert: true,

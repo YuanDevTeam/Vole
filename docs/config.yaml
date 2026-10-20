@@ -36,6 +36,10 @@ find-process-mode: strict # strict 按实际身份谓词惰性查询；always �
 # octets[12..16] 为IPv4；普通地址保持。逻辑server/SNI与认证身份不改变。
 experimental:
   dialer-ip4p-convert: false
+  # Quinn 的 Linux DIRECT 物理首跳：TUIC/XHTTP H3/DoQ/DoH H3。
+  # GSO 开启时依 OS 能力每次最多8段；ECN 缺省关闭，不改变进程环境。
+  quic-go-disable-gso: false
+  quic-go-disable-ecn: true
 # 开启时转换物理TCP和SS2022/SOCKS5/WireGuard UDP节点端点；不转换DIRECT无连接UDP或DNS答复。
 
 tcp-concurrent: false

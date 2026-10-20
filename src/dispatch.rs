@@ -104,6 +104,21 @@ pub trait DatagramTransport: Send {
         Err(datagram)
     }
 
+    /// A dedicated QUIC endpoint may initialize this same DIRECT physical
+    /// socket through Dialer and retain a lease until endpoint retirement.
+    /// Codecs, proxy hops and pacers do not forward this capability.
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    #[doc(hidden)]
+    async fn lease_quic_socket(
+        &mut self,
+        _peer: std::net::SocketAddr,
+    ) -> Result<Option<crate::transport::quic::PhysicalQuicLease>, DispatchError> {
+        Ok(None)
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError>;
 
     /// Sends the first packet of an authenticated logical connection.
@@ -333,6 +348,17 @@ struct ObservedDatagramTransport {
 
 #[async_trait]
 impl DatagramTransport for ObservedDatagramTransport {
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    async fn lease_quic_socket(
+        &mut self,
+        peer: std::net::SocketAddr,
+    ) -> Result<Option<crate::transport::quic::PhysicalQuicLease>, DispatchError> {
+        self.inner.lease_quic_socket(peer).await
+    }
+
     fn supports_shared_destinations(&self) -> bool {
         self.inner.supports_shared_destinations()
     }

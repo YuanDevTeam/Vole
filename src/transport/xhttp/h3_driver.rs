@@ -65,13 +65,15 @@ pub(super) async fn connect(
                 budget
                     .intersect(upstream.as_ref().unwrap().payload_budget(&peer.into()))
                     .quic_payload_limit()?;
-                let (socket, driver) = quic::attach(upstream.take().unwrap(), peer, budget)?;
+                let (socket, driver) =
+                    quic::attach_quinn(upstream.take().unwrap(), peer, budget).await?;
                 datagram = Some(driver);
                 let path = socket.budget();
                 path.quic_payload_limit()?;
                 let mut discovery = quinn::MtuDiscoveryConfig::default();
                 discovery.upper_bound(path.transmit());
                 let mut limits = quinn::TransportConfig::default();
+                socket.configure_transport(&mut limits);
                 limits
                     .initial_mtu(crate::dispatch::QUIC_MIN_PAYLOAD_BYTES)
                     .min_mtu(crate::dispatch::QUIC_MIN_PAYLOAD_BYTES)

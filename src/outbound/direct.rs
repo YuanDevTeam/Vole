@@ -211,6 +211,26 @@ impl DirectDatagramTransport {
 
 #[async_trait]
 impl DatagramTransport for DirectDatagramTransport {
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    async fn lease_quic_socket(
+        &mut self,
+        peer: SocketAddr,
+    ) -> Result<Option<crate::transport::quic::PhysicalQuicLease>, DispatchError> {
+        // Only a fresh single-peer endpoint may take the lease. Do not expose
+        // a socket already used by connectionless/shared business datagrams.
+        if !self.sockets.is_empty() {
+            return Err(DispatchError::NotAllowed);
+        }
+        self.socket_for(peer).await?;
+        Ok(Some(crate::transport::quic::PhysicalQuicLease {
+            socket: self.sockets[0].1.clone(),
+            settings: self.dialer.connections().quic,
+        }))
+    }
+
     fn payload_budget(&self, peer: &Destination) -> crate::dispatch::DatagramBudget {
         let wire_limit = if matches!(peer, Destination::Ip(address) if address.is_ipv6()) {
             65_527

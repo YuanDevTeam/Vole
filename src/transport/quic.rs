@@ -3,6 +3,16 @@
 mod runtime;
 pub(crate) use runtime::OwnedRuntime;
 
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+))]
+mod linux_udp;
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+))]
+mod physical;
 mod policy;
 pub(crate) use policy::datagram_payload_limit;
 pub use policy::{RECEIVE_WINDOW_POLICY, ReceiveWindowPolicy, configure_receive_windows};
@@ -67,6 +77,7 @@ impl Shared {
         drop(state);
         self.reader.wake();
         self.writer.wake();
+        self.changed.notify_waiters();
     }
 }
 
@@ -75,6 +86,11 @@ pub struct DatagramSocket {
     peer: SocketAddr,
     budget: DatagramBudget,
     shared: Arc<Shared>,
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    physical: Option<Box<physical::Socket>>,
 }
 
 impl std::fmt::Debug for DatagramSocket {
@@ -86,6 +102,24 @@ impl std::fmt::Debug for DatagramSocket {
 }
 
 impl DatagramSocket {
+    #[cfg(any(feature = "outbound-tuic", feature = "quinn-h3-transport"))]
+    pub(crate) fn configure_transport(&self, limits: &mut quinn::TransportConfig) {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        let enabled = self
+            .physical
+            .as_ref()
+            .is_some_and(|socket| socket.transmit_segments() > 1);
+        #[cfg(not(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        )))]
+        let enabled = false;
+        limits.enable_segmentation_offload(enabled);
+    }
+
     /// The endpoint must configure its QUIC MTU no larger than this budget.
     pub fn budget(&self) -> DatagramBudget {
         self.budget
@@ -141,6 +175,11 @@ pub struct DatagramDriver {
     shared: Arc<Shared>,
     cancel: CancellationToken,
     task: Option<JoinHandle<io::Result<()>>>,
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    physical: Option<physical::Retirement>,
 }
 
 impl DatagramDriver {
@@ -165,10 +204,101 @@ impl Drop for DatagramDriver {
     fn drop(&mut self) {
         self.cancel.cancel();
         self.shared.finish(None);
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(physical) = &self.physical {
+            physical.retire();
+        }
         if let Some(task) = self.task.take() {
             task.abort();
         }
     }
+}
+
+/// Protected physical IO remains owned by its original transport and Dialer.
+/// This lease does not provide another socket factory or expose descriptor IO.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+))]
+#[doc(hidden)]
+pub struct PhysicalQuicLease {
+    pub(crate) socket: Arc<crate::dialer::PhysicalDatagram>,
+    pub(crate) settings: crate::config::QuicSocketSettings,
+}
+
+#[cfg(any(feature = "outbound-tuic", feature = "quinn-h3-transport"))]
+pub(crate) async fn attach_quinn(
+    transport: Box<dyn DatagramTransport>,
+    peer: SocketAddr,
+    budget: DatagramBudget,
+) -> io::Result<(Arc<DatagramSocket>, DatagramDriver)> {
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    let mut transport = transport;
+    if peer.port() == 0 || peer.ip().is_unspecified() || peer.ip().is_multicast() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let budget = budget.intersect(transport.payload_budget(&Destination::Ip(peer)));
+    budget.quic_payload_limit()?;
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    if let Some(lease) = transport
+        .lease_quic_socket(peer)
+        .await
+        .map_err(dispatch_error)?
+    {
+        let shared = Arc::new(Shared::default());
+        let physical = match physical::Socket::new(lease, peer, budget, shared.clone()) {
+            Ok(Some(socket)) => socket,
+            // Optional receive-ECN metadata is unavailable. Retain this same
+            // protected transport and its original bounded packet path.
+            Ok(None) => return attach(transport, peer, budget),
+            Err(error) => {
+                let _ = tokio::time::timeout(CLOSE_TIMEOUT, transport.close()).await;
+                return Err(error);
+            }
+        };
+        let retirement = physical.retirement();
+        let task_retirement = retirement.clone();
+        let socket = Arc::new(DatagramSocket {
+            peer,
+            budget,
+            shared: shared.clone(),
+            physical: Some(Box::new(physical)),
+        });
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task_shared = shared.clone();
+        let task = crate::resources::observation::spawn(async move {
+            // The native endpoint directly polls the same protected socket;
+            // no packet queue, auxiliary receive pump, or keepalive is added.
+            task_cancel.cancelled().await;
+            task_shared.finish(None);
+            task_retirement.retire();
+            let result = tokio::time::timeout(CLOSE_TIMEOUT, transport.close()).await;
+            drop(transport);
+            result
+                .map_err(|_| io::ErrorKind::TimedOut)?
+                .map_err(dispatch_error)
+        });
+        return Ok((
+            socket,
+            DatagramDriver {
+                shared,
+                cancel,
+                task: Some(task),
+                physical: Some(retirement),
+            },
+        ));
+    }
+    attach(transport, peer, budget)
 }
 
 pub fn attach(
@@ -200,6 +330,11 @@ pub fn attach_mapped(
         peer: logical_peer,
         budget,
         shared: shared.clone(),
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        physical: None,
     });
     let cancel = CancellationToken::new();
     let task_shared = shared.clone();
@@ -228,6 +363,11 @@ pub fn attach_mapped(
             shared,
             cancel,
             task: Some(task),
+            #[cfg(all(
+                target_os = "linux",
+                any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+            ))]
+            physical: None,
         },
     ))
 }
@@ -361,10 +501,24 @@ impl UdpPoller for PacketPoller {
 
 impl AsyncUdpSocket for DatagramSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(socket) = &self.physical {
+            return socket.create_io_poller();
+        }
         Box::pin(PacketPoller(self.shared.clone()))
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(socket) = &self.physical {
+            return socket.try_send(transmit);
+        }
         if transmit.destination != self.peer
             || transmit.contents.len() > usize::from(self.budget.transmit())
             || transmit.segment_size.is_some()
@@ -402,6 +556,13 @@ impl AsyncUdpSocket for DatagramSocket {
         buffers: &mut [IoSliceMut<'_>],
         meta: &mut [quinn::udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(socket) = &self.physical {
+            return socket.poll_recv(cx, buffers, meta);
+        }
         let mut state = self.shared.state.lock().unwrap();
         if state.closed {
             return Poll::Ready(Err(state.error.unwrap_or(io::ErrorKind::BrokenPipe).into()));
@@ -445,6 +606,13 @@ impl AsyncUdpSocket for DatagramSocket {
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(socket) = &self.physical {
+            return socket.local_addr();
+        }
         // Logical socket metadata only. Vole's public datagram transport owns
         // physical sockets and intentionally does not expose their bound ports.
         Ok(if self.peer.is_ipv4() {
@@ -457,7 +625,29 @@ impl AsyncUdpSocket for DatagramSocket {
     }
 
     fn may_fragment(&self) -> bool {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(socket) = &self.physical {
+            return socket.may_fragment();
+        }
         false
+    }
+    fn max_transmit_segments(&self) -> usize {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(socket) = &self.physical {
+            return socket.transmit_segments();
+        }
+        1
+    }
+    // GRO is explicitly disabled on the native owned socket. Keep the same
+    // per-datagram receive allocation and packet boundaries on every path.
+    fn max_receive_segments(&self) -> usize {
+        1
     }
 }
 
