@@ -39,8 +39,6 @@ pub struct MasqueOutboundConfig {
     pub skip_cert_verify: bool,
     pub name_cert_verify: String,
     pub congestion_controller: String,
-    pub cwnd: i64,
-    pub bbr_profile: String,
     pub ip_stack: MasqueIpStackOptions,
     pub remote_dns_resolve: bool,
     pub dns: Vec<DnsNameserver>,
@@ -114,10 +112,6 @@ pub(super) struct RawMasque {
     network: String,
     #[serde(default)]
     congestion_controller: String,
-    #[serde(default)]
-    cwnd: i64,
-    #[serde(default)]
-    bbr_profile: String,
     #[serde(default)]
     ip_stack: RawIpStack,
     #[serde(default)]
@@ -265,8 +259,6 @@ impl RawMasque {
                 skip_cert_verify: self.skip_cert_verify,
                 name_cert_verify: self.name_cert_verify,
                 congestion_controller: self.congestion_controller,
-                cwnd: self.cwnd,
-                bbr_profile: self.bbr_profile,
                 ip_stack,
                 remote_dns_resolve: self.remote_dns_resolve,
                 dns,
@@ -326,8 +318,6 @@ mod tests {
             ("handshake-timeout", json!(12)),
             ("name-cert-verify", json!("not a hostname")),
             ("congestion-controller", json!("unknown-default")),
-            ("cwnd", json!(-4)),
-            ("bbr-profile", json!("unknown-default")),
             ("dns", json!(["not a nameserver"])),
             (
                 "ip-stack",
@@ -350,6 +340,19 @@ mod tests {
         assert!(!debug.contains(&options.private_key));
         assert!(!debug.contains(&options.public_key));
         assert!(!debug.contains(&options.address));
+    }
+
+    #[test]
+    fn removed_quic_tuning_fields_are_rejected_in_all_modes() {
+        for network in ["h2", "quic", "h3-l4proxy"] {
+            for (field, value) in [("cwnd", json!(16)), ("bbr-profile", json!("standard"))] {
+                let mut raw = node();
+                raw["network"] = json!(network);
+                raw["ip"] = json!("192.0.2.10");
+                raw[field] = value;
+                assert!(parse(raw).is_err());
+            }
+        }
     }
 
     #[test]

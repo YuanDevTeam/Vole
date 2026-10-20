@@ -116,13 +116,7 @@ impl MasqueOutbound {
             security,
         )?;
         let congestion = (config.network != MasqueNetwork::H2)
-            .then(|| {
-                quiche_h3::congestion_controller(
-                    &config.congestion_controller,
-                    config.cwnd,
-                    &config.bbr_profile,
-                )
-            })
+            .then(|| quiche_h3::congestion_controller(&config.congestion_controller))
             .flatten();
         let pool = if config.network == MasqueNetwork::H3L4Proxy {
             h3_connect::Pool::masque_l4(congestion)

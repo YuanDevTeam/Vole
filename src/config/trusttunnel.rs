@@ -18,8 +18,6 @@ pub struct TrustTunnelOutboundConfig {
     pub health_check: bool,
     pub pool: TrustTunnelPoolOptions,
     pub congestion_controller: String,
-    pub cwnd: i64,
-    pub bbr_profile: String,
 }
 
 impl std::fmt::Debug for TrustTunnelOutboundConfig {
@@ -77,10 +75,6 @@ pub(super) struct RawTrustTunnel {
     max_streams: i64,
     #[serde(default)]
     congestion_controller: String,
-    #[serde(default)]
-    cwnd: i64,
-    #[serde(default)]
-    bbr_profile: String,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     sni: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
@@ -204,8 +198,6 @@ impl RawTrustTunnel {
                 health_check: self.health_check,
                 pool,
                 congestion_controller: self.congestion_controller,
-                cwnd: self.cwnd,
-                bbr_profile: self.bbr_profile,
             }),
         ))
     }
@@ -270,9 +262,9 @@ mod tests {
     }
 
     #[test]
-    fn h2_tls_options_and_noop_quic_fields_do_not_leak_credentials() {
+    fn h2_tls_options_do_not_leak_credentials() {
         let config = parse(
-            "    username: synthetic-user\n    password: synthetic-password\n    sni: cover-name.invalid\n    alpn: [h2, http/1.1]\n    skip-cert-verify: true\n    name-cert-verify: verified.invalid\n    fingerprint: 'abababababababababababababababababababababababababababababababab'\n    congestion-controller: arbitrary-unused-h2-value\n    cwnd: -8\n    bbr-profile: arbitrary-unused-h2-value\n",
+            "    username: synthetic-user\n    password: synthetic-password\n    sni: cover-name.invalid\n    alpn: [h2, http/1.1]\n    skip-cert-verify: true\n    name-cert-verify: verified.invalid\n    fingerprint: 'abababababababababababababababababababababababababababababababab'\n    congestion-controller: arbitrary-unused-h2-value\n",
         )
         .unwrap();
         let node = node(&config);
@@ -283,7 +275,6 @@ mod tests {
         );
         assert!(node.tls.certificate.skip_cert_verify);
         assert_eq!(node.tls.certificate.fingerprint, Some([0xab; 32]));
-        assert_eq!(node.cwnd, -8);
         let debug = format!("{config:?}");
         assert!(!debug.contains("synthetic-user") && !debug.contains("synthetic-password"));
     }
@@ -323,12 +314,10 @@ mod tests {
     #[test]
     fn h3_does_not_consume_tcp_fingerprint_or_add_congestion_restrictions() {
         for fingerprint in ["chrome", "none", "unknown-http3-noop", ""] {
-            let config = parse(&format!("    quic: true\n    client-fingerprint: '{fingerprint}'\n    cwnd: -1\n    congestion-controller: arbitrary-default\n    bbr-profile: arbitrary-default\n    max-connections: -3\n    min-streams: -4\n")).unwrap();
+            let config = parse(&format!("    quic: true\n    client-fingerprint: '{fingerprint}'\n    congestion-controller: arbitrary-default\n    max-connections: -3\n    min-streams: -4\n")).unwrap();
             let node = node(&config);
             assert!(node.tls.client_fingerprint.is_none());
-            assert_eq!(node.cwnd, -1);
             assert_eq!(node.congestion_controller, "arbitrary-default");
-            assert_eq!(node.bbr_profile, "arbitrary-default");
             assert_eq!(node.pool.max_connections, -3);
             assert_eq!(node.pool.min_streams, -4);
         }
@@ -340,6 +329,15 @@ mod tests {
                 ))
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn removed_quic_tuning_fields_are_rejected_in_both_modes() {
+        for quic in [false, true] {
+            for field in ["cwnd: 16", "bbr-profile: standard"] {
+                assert!(parse(&format!("    quic: {quic}\n    {field}\n")).is_err());
+            }
         }
     }
 

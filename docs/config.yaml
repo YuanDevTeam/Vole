@@ -277,7 +277,7 @@ sniffer:
 # 成功CONNECT响应重置7秒计时，单次探测期限7秒；二者缺省false。UDP业务在两模式均走可靠流。
 # congestion-controller 仅H3消费：cubic/new_reno 使用 quiche 原生 CUBIC/Reno；
 # bbr/bbr_meta_v1/bbr_meta_v2 均映射到 quiche 原生 Bbr2Gcongestion，省略/未知使用 cubic。
-# cwnd/bbr-profile 接受配置但不消费调参值；H2 三字段均不生效。
+# H2 不消费 congestion-controller。
 proxies:
   # 功能出站没有 server/port，均支持 UDP；不接受 udp、smux 或 dialer-proxy。
   # direct 另接受上方三项物理出口/地址族字段，域名使用 direct-nameserver。
@@ -331,7 +331,7 @@ proxies:
   #   dns: [] # IP 模式支持 UDP/TCP 等；L4 需要 tcp:// 或其它 TCP DNS 传输
   #   private-key: "<Base64 SEC1 DER>"
   #   public-key: "<Base64 ECDSA SPKI DER>"
-  #   congestion-controller: bbr # 同TrustTunnel H3；cwnd与bbr-profile消费规则相同
+  #   congestion-controller: bbr # 同 TrustTunnel H3 的算法映射
   #   ip-stack: {mode: auto, congestion-controller: cubic}
 
   # 标准 WireGuard：用户态内层 TCP/UDP，不创建系统接口/路由/NAT。

@@ -501,8 +501,6 @@ pub(super) mod tests {
             skip_cert_verify: false,
             name_cert_verify: String::new(),
             congestion_controller: String::new(),
-            cwnd: 0,
-            bbr_profile: String::new(),
             ip_stack: crate::config::MasqueIpStackOptions {
                 mode: "auto".into(),
                 congestion_controller: String::new(),

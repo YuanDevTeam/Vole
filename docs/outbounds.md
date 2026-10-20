@@ -122,8 +122,7 @@ H3 外层无论业务 udp 是否开启，都要求受控上游提供双向至少
 QUIC payload 最大1400并取实际双向上游预算交集，PMTUD不超过该预算，不回落TCP或DIRECT。
 congestion-controller 的 cubic、new_reno 使用官方 quiche 算法；bbr、bbr_meta_v1、
 bbr_meta_v2 均使用 quiche 的 Bbr2Gcongestion。省略或未知名称使用 cubic。
-cwnd、profile 保留配置准入，但 H3 不消费其调参值，不复现 Meta BBR 参数行为。
-H2 不消费这三个 QUIC 字段。
+H2 不消费 congestion-controller。
 
 ## Mieru
 
@@ -220,7 +219,7 @@ L4 使用 consumer-masque-proxy.cloudflareclient.com。IP URI 缺省为
 https://cloudflareaccess.com，不支持含变量的 IP flow URI template。
 L4 不解析 ip/ipv6/uri，不消费 mtu 或正 handshake-timeout；负超时拒绝。
 QUIC 使用 20 字节 CID、初始 payload 1242 与受控预算交集、30 秒 keepalive；
-拥塞字段采用上述 TrustTunnel H3 的算法映射；cwnd、profile 不消费调参值。
+拥塞字段采用上述 TrustTunnel H3 的算法映射。
 `ip-stack` 支持省略/auto 与省略/cubic，不把其它栈或算法映射为现有栈。
 
 ## SOCKS5

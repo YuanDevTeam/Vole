@@ -1107,13 +1107,8 @@ fn failure(_: impl std::fmt::Display) -> io::Error {
     io::Error::other("HTTP/3 transport failed")
 }
 
-/// Old Meta controller labels select official BBRv2. Window/profile tuning of
-/// another engine is deliberately not copied into the native state machine.
-pub(crate) fn congestion_controller(
-    name: &str,
-    _cwnd: i64,
-    _profile: &str,
-) -> Option<quiche::CongestionControlAlgorithm> {
+/// Meta BBR labels select the public quiche BBRv2 controller.
+pub(crate) fn congestion_controller(name: &str) -> Option<quiche::CongestionControlAlgorithm> {
     Some(match name {
         "cubic" => quiche::CongestionControlAlgorithm::CUBIC,
         "new_reno" => quiche::CongestionControlAlgorithm::Reno,

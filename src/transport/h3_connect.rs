@@ -1324,7 +1324,7 @@ mod tests {
         observation
             .scope(async {
                 let peer = Peer::new();
-                let pool = Pool::new(quiche_h3::congestion_controller("bbr", 0, "standard"));
+                let pool = Pool::new(quiche_h3::congestion_controller("bbr"));
                 let mut first = open(&pool, &peer, "echo.invalid:443").await;
                 let mut second = open(&pool, &peer, "echo.invalid:443").await;
                 assert_eq!(peer.calls.load(Ordering::Acquire), 1);

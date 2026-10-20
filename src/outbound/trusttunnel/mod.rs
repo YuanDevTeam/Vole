@@ -288,11 +288,7 @@ impl TrustTunnelOutbound {
             ),
             quic: config.quic,
             congestion: if config.quic {
-                crate::transport::quiche_h3::congestion_controller(
-                    &config.congestion_controller,
-                    config.cwnd,
-                    &config.bbr_profile,
-                )
+                crate::transport::quiche_h3::congestion_controller(&config.congestion_controller)
             } else {
                 None
             },
