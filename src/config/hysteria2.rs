@@ -166,14 +166,13 @@ impl RawHysteria2 {
             return invalid("Hysteria2 outbound support is disabled at build time");
         }
         validate_host(&self.server, "Hysteria2 server")?;
-        if let Some(port) = self.port {
-            validate_port(port, "Hysteria2")?;
-        }
         let hopping = self
             .ports
             .filter(|ports| !ports.is_empty())
+            .map(|ports| parse_ports(&ports))
+            .transpose()?
+            .filter(|ports| !ports.is_empty())
             .map(|ports| {
-                let ports = parse_ports(&ports)?;
                 let (min_seconds, max_seconds) = parse_interval(self.hop_interval.as_ref())?;
                 Ok::<_, crate::VoleError>(Hysteria2Hopping {
                     ports,
@@ -191,6 +190,7 @@ impl RawHysteria2 {
                 crate::VoleError::InvalidConfig("Hysteria2 requires port or ports".into())
             })?,
         };
+        validate_port(port, "Hysteria2")?;
         // The complete auth header section is bounded to 16 KiB. Validate the
         // raw value, without trimming credentials or printing them on failure.
         if self.password.len() > 8192
@@ -366,12 +366,19 @@ fn decimal(value: &str) -> Result<u32> {
 }
 
 fn parse_ports(value: &str) -> Result<Vec<u16>> {
+    if matches!(value.trim(), "" | "*") {
+        return Ok(Vec::new());
+    }
     let mut ports = std::collections::BTreeSet::new();
-    for item in value.split(',') {
+    for item in value.split([',', '/']).filter(|item| !item.is_empty()) {
         let item = item.trim();
         let (start, end) = item.split_once('-').unwrap_or((item, item));
-        let (start, end) = (decimal(start)?, decimal(end)?);
-        if start == 0 || start > end || end > 65535 {
+        let (start, end) = (
+            decimal(start.trim_matches(['[', ']', ' ']))?,
+            decimal(end.trim_matches(['[', ']', ' ']))?,
+        );
+        let (start, end) = (start.min(end), start.max(end));
+        if start == 0 || end > 65535 {
             return invalid("invalid Hysteria2 ports");
         }
         ports.extend((start..=end).map(|port| port as u16));
@@ -385,17 +392,58 @@ fn parse_interval(value: Option<&NumberOrText>) -> Result<(u32, u32)> {
         Some(NumberOrText::Number(value)) => value.to_string(),
         Some(NumberOrText::Text(value)) => value.clone(),
     };
-    let (start, end) = text.split_once('-').unwrap_or((&text, &text));
-    let (start, end) = (decimal(start)?, decimal(end)?);
-    if start < 5 || start > end {
-        return invalid("Hysteria2 hop-interval requires 5 <= min <= max <= 4294967295 seconds");
-    }
-    Ok((start, end))
+    let text = text.trim();
+    let (start, end) = text.split_once('-').unwrap_or((text, text));
+    let (start, end) = if text.is_empty() {
+        (0, 0)
+    } else {
+        (
+            decimal(start.trim_matches(['[', ']', ' ']))?,
+            decimal(end.trim_matches(['[', ']', ' ']))?,
+        )
+    };
+    let (start, end) = (start.min(end), start.max(end));
+    let start = if start == 0 { 30 } else { start.max(5) };
+    Ok((start, end.max(start)))
 }
 
 #[cfg(all(test, feature = "outbound-hysteria2"))]
 mod p08_tests {
     use super::*;
+
+    #[test]
+    fn hopping_accepts_reference_ranges_and_ignores_unused_zero_port() {
+        let config =
+            parse(serde_json::json!({"port":0,"ports":"8445-8443/443,,8444","hop-interval":"1-3"}))
+                .unwrap();
+        assert_eq!(config.port, 443);
+        let hopping = config.hopping.unwrap();
+        assert_eq!(hopping.ports, vec![443, 8443, 8444, 8445]);
+        assert_eq!((hopping.min_seconds, hopping.max_seconds), (5, 5));
+        let hopping = parse(serde_json::json!({"ports":"443","hop-interval":0}))
+            .unwrap()
+            .hopping
+            .unwrap();
+        assert_eq!((hopping.min_seconds, hopping.max_seconds), (30, 30));
+        assert!(
+            parse(serde_json::json!({"ports":"*"}))
+                .unwrap()
+                .hopping
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hopping_keeps_invalid_ports_and_overflow_out_of_the_socket_path() {
+        for fields in [
+            serde_json::json!({"port":0}),
+            serde_json::json!({"ports":"0/443"}),
+            serde_json::json!({"ports":"65536"}),
+            serde_json::json!({"ports":"443","hop-interval":"4294967296"}),
+        ] {
+            assert!(parse(fields).is_err());
+        }
+    }
     fn parse(extra: serde_json::Value) -> Result<Hysteria2OutboundConfig> {
         let mut raw = serde_json::json!({"name":"edge","server":"peer.invalid","port":443});
         raw.as_object_mut()

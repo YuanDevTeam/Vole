@@ -4177,6 +4177,10 @@ fn validate_port(port: u16, kind: &str) -> Result<()> {
     Ok(())
 }
 
+fn parse_client_uuid(input: &str) -> Uuid {
+    Uuid::parse_str(input).unwrap_or_else(|_| Uuid::new_v5(&Uuid::nil(), input.as_bytes()))
+}
+
 fn parse_standard_uuid(input: &str) -> Result<Uuid> {
     let id = Uuid::parse_str(input)
         .map_err(|_| VoleError::InvalidConfig("invalid VLESS settings.id UUID".to_owned()))?;
@@ -4193,6 +4197,27 @@ fn invalid<T>(message: impl Into<String>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_uuid_preserves_uuid_bytes_and_maps_named_credentials() {
+        let expected = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        for input in [
+            "00000000-0000-4000-8000-000000000001",
+            "00000000000040008000000000000001",
+            "{00000000-0000-4000-8000-000000000001}",
+            "urn:uuid:00000000-0000-4000-8000-000000000001",
+        ] {
+            assert_eq!(parse_client_uuid(input), expected);
+        }
+        assert_eq!(
+            parse_client_uuid("synthetic-user").hyphenated().to_string(),
+            "d17c2bfe-ad7e-5a4e-8ea9-f3158f5f8aec"
+        );
+        assert_ne!(
+            parse_client_uuid("synthetic-user"),
+            parse_client_uuid(" synthetic-user")
+        );
+    }
 
     #[test]
     fn modes_and_global_group_work_without_a_final_match() {
@@ -5737,10 +5762,6 @@ authentication:
         for yaml in [
             CURRENT_TLS.replace("server: 203.0.113.1", "server: 'bad host'"),
             CURRENT_TLS.replace("port: 443", "port: 0"),
-            CURRENT_TLS.replace(
-                "uuid: 00000000-0000-4000-8000-000000000001",
-                "uuid: 00000000000040008000000000000001",
-            ),
             CURRENT_TLS.replace("encryption: none", "encryption: auto"),
             CURRENT_TLS.replace("flow: \"\"", "flow: xtls-rprx-vision"),
         ] {

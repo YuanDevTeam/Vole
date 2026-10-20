@@ -1,6 +1,6 @@
 use super::grpc::RawGrpc;
 use super::{
-    GrpcOptions, ProxyProtocol, deserialize_present_option, invalid, parse_standard_uuid,
+    GrpcOptions, ProxyProtocol, deserialize_present_option, invalid, parse_client_uuid,
     validate_host, validate_port,
 };
 use crate::Result;
@@ -191,17 +191,49 @@ fn authority_host(value: &str) -> Result<String> {
     Ok(host.to_owned())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VmessCipher {
     #[default]
-    #[serde(rename = "auto")]
     Auto,
-    #[serde(rename = "aes-128-gcm")]
     Aes128Gcm,
-    #[serde(rename = "chacha20-poly1305")]
     Chacha20Poly1305,
-    #[serde(rename = "none", alias = "zero")]
     None,
+}
+
+impl<'de> Deserialize<'de> for VmessCipher {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "aes-128-gcm" => Ok(Self::Aes128Gcm),
+            "chacha20-poly1305" => Ok(Self::Chacha20Poly1305),
+            "none" | "zero" => Ok(Self::None),
+            _ => Err(serde::de::Error::custom("unsupported VMess cipher")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod cipher_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn cipher_names_are_case_insensitive_without_legacy_ciphers() {
+        for (input, expected) in [
+            ("AUTO", VmessCipher::Auto),
+            ("AES-128-GCM", VmessCipher::Aes128Gcm),
+            ("ChaCha20-Poly1305", VmessCipher::Chacha20Poly1305),
+            ("ZERO", VmessCipher::None),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<VmessCipher>(input.into()).unwrap(),
+                expected
+            );
+        }
+        assert!(serde_json::from_value::<VmessCipher>("aes-128-cfb".into()).is_err());
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -466,7 +498,7 @@ impl RawVmess {
             ProxyProtocol::Vmess(VmessOutboundConfig {
                 address: self.server,
                 port: self.port,
-                id: parse_standard_uuid(&self.uuid)?,
+                id: parse_client_uuid(&self.uuid),
                 cipher: self.cipher,
                 global_padding: self.global_padding,
                 authenticated_length: self.authenticated_length,

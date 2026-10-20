@@ -156,7 +156,7 @@ impl RawVless {
         }
         validate_host(&self.server, "VLESS server")?;
         validate_port(self.port, "VLESS")?;
-        let id = parse_standard_uuid(&self.uuid)?;
+        let id = parse_client_uuid(&self.uuid);
         let encryption = if matches!(self.encryption.as_str(), "" | "none") {
             VlessEncryption::None
         } else {

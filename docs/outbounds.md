@@ -355,7 +355,8 @@ Mihomo IP 路径可传空包；Xray 不转发空包，且域名回复的 8192 �
 
 ## VMess AEAD
 
-标准 UUID，alterId 仅省略/0，请求和响应头均 AEAD，无旧认证回退。cipher 为 auto、
+UUID 接受标准、紧凑、花括号、URN 表示，其他字符串按 UUIDv5(nil, 原始 UTF-8) 映射，不 trim。
+alterId 仅省略/0，请求和响应头均 AEAD，无旧认证回退。cipher 不区分 ASCII 大小写，为 auto、
 aes-128-gcm、chacha20-poly1305、none；zero 归一 none。auto 按实际 AES 硬件能力选择。
 none 只关闭 body 加密，仍验证响应身份；不能启用 global-padding/authenticated-length，
 两开关默认 false。
@@ -413,8 +414,10 @@ port 为 1–65535，仅提供 ports 时可省略；显式非法 port 仍拒绝�
 - obfs 支持 salamander 或 gecko，须配非空独立 obfs-password。Gecko 对 QUIC 长头随机分片并填充，
   短头只用 Salamander；`obfs-min-packet-size/obfs-max-packet-size` 默认512/1200，
   正值且 min≤max≤2048，只用于 Gecko。max 是填充目标，不是 QUIC MTU，实际片仍受物理预算限制。
-- ports 是归一去重的非空端口/闭区间集合，优先于合法 port。hop-interval 仅随 ports：
-  整数秒 N、字符串 N 或 N-M，默认 30，5 ≤ N ≤ M ≤ u32::MAX；过短严格拒绝。
+- ports 为端口/闭区间集合，接受逗号或斜线分隔，逆序范围归一并去重；有效非空集合优先于 port，
+  此时 port 可省略或为0。空集合或 `*` 使用非零 port，不启用跳跃。
+  hop-interval 随 ports 使用整数秒 N、字符串 N 或 N-M，范围先排序，0 使用30秒，
+  正数小于5归一为5，最终上界至少为归一后的下界；仍须可表示为 u32。
 
 `realm-opts.enable: true` 使用 Realm 控制面/STUN/UDP 打洞，和 ports 跳端口互斥。
 必填 server-url、realm-id 与非空 stun-servers；token 默认空，服务端按实际认证处理。

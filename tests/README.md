@@ -25,6 +25,10 @@ Windows的UWP/Wintun feature互斥，应明确选择后端，不使用`--all-fea
 
 ## 定向回归
 
+客户端凭据与输入（纯内存）：`config::tests::client_uuid_`、
+`config::vmess::cipher_compatibility_tests::`、`config::hysteria2::p08_tests::hopping_`。
+实际映射凭据、端口跳跃和各协议数据面由真实 TUN 另验收。
+
 TFO 纯内存策略与生命周期：
 `config::functional::tests::node_tfo_is_explicit_and_does_not_inherit_across_proxy_chain`、
 `config::providers::tests::provider_tfo_override_preserves_false_and_materializes_exact_node_policy`、

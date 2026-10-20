@@ -216,6 +216,7 @@ sniffer:
       ports: [443, 8443]
 
 # proxies 可省略或设为 []，允许仅使用 DIRECT、REJECT 或只包含内置动作的代理组。
+# VLESS/VMess uuid 支持标准、紧凑、花括号和 URN；其他字符串按 UUIDv5(nil, 原始UTF-8)映射。
 # 引用的节点和代理组必须存在。节点和代理组定义名共享同一大小写敏感的命名空间，
 # 引用精确匹配且不做 Unicode normalization 或大小写折叠。名称必须为非空字符串；
 # DIRECT、REJECT、REJECT-DROP、COMPATIBLE、PASS、PASS-RULE 为保留定义名。
@@ -473,8 +474,8 @@ proxies:
     #   fingerprint: ""
     #   certificate: ./client.crt # 与private-key成对，或内联PEM
     #   private-key: ./client.key
-    # ports: "443,8443-8445" # 非空集合控制初始及后续入口；出现时 port 可省略
-    # hop-interval: "5-7" # 仅与 ports 配套，默认 30 秒，最小 5 秒
+    # ports: "443/8443-8445" # 逗号或斜线；有效集合控制初始/后续入口，port可省略或0
+    # hop-interval: "5-7" # 随 ports；0使用30秒，正数小于5归一为5，范围归一
     # dialer-proxy: upstream-select
 
   # VMess AEAD：alterId 仅 0；cipher 默认 auto（实际 AES 硬件检测），还支持

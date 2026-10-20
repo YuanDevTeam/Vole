@@ -174,7 +174,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-core = "0.1.36"
 url = "2"
-uuid = { version = "1", features = ["serde"] }
+uuid = { version = "=1.28.0", features = ["serde", "v5"] }
 vole-netstack = { path = "crates/vole-netstack", optional = true }
 vole-blake3-raw = { path = "crates/vole-blake3-raw", optional = true }
 webpki-roots = "1"

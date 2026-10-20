@@ -5,7 +5,7 @@
 
 ## 配置与传输
 
-`type: vless`，`server`、非零 `port` 和标准格式 `uuid` 必填。`udp` 默认 false；`network` 默认 `tcp`，`tls` 默认 false。`encryption` 省略、空或 `none` 关闭该层；其他值见下文。`flow` 省略、null 或空串时关闭，也接受 `xtls-rprx-vision`。其余不接受 null 的字段、未知字段、错型或不匹配的传输选项失败，不隐式迁移配置。
+`type: vless`，`server`、非零 `port` 和字符串 `uuid` 必填。UUID 接受标准、紧凑、花括号或 URN 表示；其他字符串按 UUIDv5(nil, 原始 UTF-8) 映射，不 trim，与 VMess 共用转换。`udp` 默认 false；`network` 默认 `tcp`，`tls` 默认 false。`encryption` 省略、空或 `none` 关闭该层；其他值见下文。`flow` 省略、null 或空串时关闭，也接受 `xtls-rprx-vision`。其余不接受 null 的字段、未知字段、错型或不匹配的传输选项失败，不隐式迁移配置。
 
 - TCP/WS/gRPC/HTTP 首包伪装/legacy H2 可明文或标准 TLS。TLS 支持 1.2/1.3，TCP 默认不发送 ALPN，WS 默认 `[http/1.1]`，gRPC/H2 默认 `[h2]`。有序 ALPN 保留且必须包含传输要求值；标准 TLS 检查协商结果。`servername` 优先显式值、WS Host 去端口、server；不会改变拨号地址。TLS 关闭时禁止安全选项。
 - 标准 TLS 支持 `skip-cert-verify`、SHA-256 `fingerprint`、独立 `name-cert-verify`；沿用共享证书验证器的叶 pin / 非叶信任锚优先级。`certificate` / `private-key` 接受配对的内联 PEM 或文件路径，相对路径从数据目录解析，解析或密钥不匹配在网络 IO 前失败。REALITY 不能混用这些标准证书策略。
