@@ -40,12 +40,7 @@ impl HttpOutbound {
                         identity: config
                             .identity
                             .as_ref()
-                            .map(|identity| {
-                                TlsClientIdentity::from_pem(
-                                    &identity.certificate,
-                                    &identity.private_key,
-                                )
-                            })
+                            .map(|identity| TlsClientIdentity::from_config(identity, security))
                             .transpose()?,
                         ..Default::default()
                     },

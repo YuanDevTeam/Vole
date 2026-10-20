@@ -228,10 +228,14 @@ fn common_tls_policy_keeps_verified_identity_separate_from_server_name() {
         );
         assert_eq!(policy.certificate.fingerprint, Some([0xab; 32]));
         assert!(
-            crate::security::TlsClientOptions::from_policy(&policy, None)
-                .unwrap()
-                .identity
-                .is_some()
+            crate::security::TlsClientOptions::from_policy(
+                &policy,
+                None,
+                &crate::security::SecurityContext::new()
+            )
+            .unwrap()
+            .identity
+            .is_some()
         );
         let debug = format!("{policy:?}");
         assert!(!debug.contains("PRIVATE KEY") && !debug.contains("verified.invalid"));

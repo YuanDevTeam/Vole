@@ -605,6 +605,7 @@ impl ProviderTemplate {
                 error
             }
         })?;
+        identities.attach(&mut config.proxies);
         let mut sets = HashMap::new();
         for (name, spec) in &self.rules {
             let fallback = self.bundled(spec)?;

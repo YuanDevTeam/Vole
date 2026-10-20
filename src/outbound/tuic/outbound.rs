@@ -32,7 +32,7 @@ pub struct TuicOutbound {
     config: Arc<TuicOutboundConfig>,
     server: Destination,
     upstream: UpstreamPath,
-    tls: Arc<rustls::ClientConfig>,
+    tls: StandardTlsClient,
     current: AsyncMutex<Option<Arc<Session>>>,
     cancel: CancellationToken,
     admission: Mutex<()>,
@@ -121,7 +121,7 @@ impl TuicOutbound {
         buffer_limit: usize,
     ) -> io::Result<Self> {
         config.validate().map_err(failure)?;
-        let mut tls = StandardTlsClient::with_options(
+        let tls = StandardTlsClient::with_options(
             security,
             &config.tls.server_name,
             TlsClientOptions {
@@ -133,22 +133,17 @@ impl TuicOutbound {
                     .identity
                     .as_ref()
                     .map(|identity| {
-                        crate::security::TlsClientIdentity::from_pem(
-                            &identity.certificate,
-                            &identity.private_key,
-                        )
+                        crate::security::TlsClientIdentity::from_config(identity, security)
                     })
                     .transpose()?,
                 ..Default::default()
             },
             0,
             buffer_limit,
-        )?
-        .quic_config()?
-        .0;
-        // Suppress only the extension. Quinn still supplies the immutable
-        // server name to the same WebPKI/pin verifier; no implicit skip.
-        Arc::make_mut(&mut tls).enable_sni = !config.disable_sni;
+        )?;
+        // Validate the QUIC policy now, but snapshot the current file identity
+        // only when a new physical connection is constructed.
+        tls.quic_config()?;
         Ok(Self {
             config: Arc::new(config.clone()),
             server: server_destination(
@@ -313,7 +308,7 @@ async fn drive(
     config: Arc<TuicOutboundConfig>,
     upstream: UpstreamPath,
     server: Destination,
-    tls: Arc<rustls::ClientConfig>,
+    tls: StandardTlsClient,
     datagram: DatagramSession,
     context: EstablishContext,
     cancel: CancellationToken,
@@ -378,7 +373,10 @@ async fn drive(
                 TuicCongestion::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
                 TuicCongestion::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
             });
-        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(failure)?;
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(
+            current_tls(&tls, config.disable_sni).map_err(failure)?,
+        )
+        .map_err(failure)?;
         let mut client = quinn::ClientConfig::new(Arc::new(crypto));
         client.transport_config(Arc::new(limits));
         let mut options = quinn::EndpointConfig::default();
@@ -466,6 +464,18 @@ async fn drive(
     }
 }
 
+fn current_tls(
+    tls: &StandardTlsClient,
+    disable_sni: bool,
+) -> io::Result<Arc<rustls::ClientConfig>> {
+    let (mut config, _) = tls.quic_config()?;
+    // The verifier still receives Quinn's immutable server name.
+    if disable_sni {
+        Arc::make_mut(&mut config).enable_sni = false;
+    }
+    Ok(config)
+}
+
 #[cfg(test)]
 mod p08_tests {
     use super::*;
@@ -496,7 +506,7 @@ mod p08_tests {
         .unwrap();
         // A request for early data alone cannot make a cold client connection
         // available. No sockets, system resolver, peers, or ticket cache exist.
-        let mut tls = (*node.tls).clone();
+        let mut tls = (*current_tls(&node.tls, config.disable_sni).unwrap()).clone();
         tls.enable_early_data = true;
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
         let peer = "192.0.2.1:443".parse().unwrap();
@@ -562,7 +572,7 @@ mod p08_tests {
             )
             .unwrap();
             let mut connection = rustls::quic::ClientConnection::new(
-                node.tls.clone(),
+                current_tls(&node.tls, config.disable_sni).unwrap(),
                 rustls::quic::Version::V1,
                 rustls::pki_types::ServerName::try_from(config.tls.server_name.clone()).unwrap(),
                 Vec::new(),

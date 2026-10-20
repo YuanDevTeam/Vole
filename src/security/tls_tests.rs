@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "identity_rotation_tests.rs"]
+mod identity_rotation_memory_tests;
 use crate::config::TlsClientPolicy;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -49,6 +52,7 @@ impl Chain {
                 "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
                 STANDARD.encode(self.key.secret_der())
             ),
+            origin: None,
         }
     }
 }
@@ -104,6 +108,7 @@ fn trusted(chain: &Chain) -> SecurityContext {
     SecurityContext {
         provider: Arc::new(rustls::crypto::ring::default_provider()),
         tls_roots: Arc::new(roots),
+        identities: Arc::default(),
     }
 }
 
@@ -111,7 +116,7 @@ fn client(context: &SecurityContext, name: &str, policy: TlsClientPolicy) -> Sta
     StandardTlsClient::with_options(
         context,
         name,
-        TlsClientOptions::from_policy(&policy, None).unwrap(),
+        TlsClientOptions::from_policy(&policy, None, context).unwrap(),
         4,
         DEFAULT_TLS_BUFFER_LIMIT,
     )
@@ -590,7 +595,6 @@ async fn ticket_storage_obeys_exact_node_budget_and_consumes_each_ticket_once() 
         "ticket_storage_obeys_exact_node_budget_and_consumes_each_ticket_once",
     );
     use crate::security::resumption::NodeSessionStore;
-    use rustls::client::ClientSessionStore;
     let chain = chain(false);
     let context = trusted(&chain);
     let name = ServerName::try_from("fixture.invalid").unwrap().to_owned();
@@ -598,12 +602,15 @@ async fn ticket_storage_obeys_exact_node_budget_and_consumes_each_ticket_once() 
         for capacity in [0, 1, 4] {
             let store = Arc::new(NodeSessionStore::new(name.clone(), capacity));
             let mut client = client(&context, "fixture.invalid", Default::default());
-            let StandardConnector::Rustls(connector) = &client.connector else {
+            let Some(StandardConnector::Rustls(connector)) = &client.connector else {
                 panic!("unprofiled TLS uses rustls")
             };
             let mut config = connector.config().as_ref().clone();
-            config.resumption = Resumption::store(store.clone());
-            client.connector = StandardConnector::Rustls(TlsConnector::from(Arc::new(config)));
+            let epoch_store = store.for_epoch(Default::default());
+            config.resumption = Resumption::store(epoch_store.clone());
+            client.connector = Some(StandardConnector::Rustls(TlsConnector::from(Arc::new(
+                config,
+            ))));
             let mut server = server(&chain, version, false);
             Arc::get_mut(&mut server).unwrap().send_tls13_tickets = 8;
             assert!(handshake(&client, server.clone()).await.0);
@@ -614,19 +621,19 @@ async fn ticket_storage_obeys_exact_node_budget_and_consumes_each_ticket_once() 
             };
             assert_eq!(store.stored_sessions(), expected);
             let wrong = ServerName::try_from("wrong.invalid").unwrap();
-            assert!(store.take_tls13_ticket(&wrong).is_none());
-            assert!(store.tls12_session(&wrong).is_none());
+            assert!(epoch_store.take_tls13_ticket(&wrong).is_none());
+            assert!(epoch_store.tls12_session(&wrong).is_none());
             if version == &TLS13 {
                 for _ in 0..expected {
-                    assert!(store.take_tls13_ticket(&name).is_some());
+                    assert!(epoch_store.take_tls13_ticket(&name).is_some());
                 }
-                assert!(store.take_tls13_ticket(&name).is_none());
+                assert!(epoch_store.take_tls13_ticket(&name).is_none());
             } else {
                 assert_eq!(
                     handshake(&client, server.clone()).await.1.resumed,
                     capacity > 0
                 );
-                store.remove_tls12_session(&name);
+                epoch_store.remove_tls12_session(&name);
             }
             assert_eq!(store.stored_sessions(), 0);
         }
@@ -808,7 +815,7 @@ async fn explicit_verification_name_does_not_change_sni_or_allow_skip_to_overrid
             let client = StandardTlsClient::with_options(
                 &context,
                 "sni.invalid",
-                TlsClientOptions::from_policy(&policy, None).unwrap(),
+                TlsClientOptions::from_policy(&policy, None, &context).unwrap(),
                 1,
                 DEFAULT_TLS_BUFFER_LIMIT,
             )
@@ -862,7 +869,7 @@ async fn mutual_tls_identity_is_required_verified_and_not_shared_between_clients
                 let client = StandardTlsClient::with_options(
                     &trusted(&chain),
                     "fixture.invalid",
-                    TlsClientOptions::from_policy(&policy, None).unwrap(),
+                    TlsClientOptions::from_policy(&policy, None, &trusted(&chain)).unwrap(),
                     1,
                     DEFAULT_TLS_BUFFER_LIMIT,
                 )

@@ -146,7 +146,16 @@ impl Socks5Outbound {
                             )
                         })?,
                         &config.address,
-                        TlsClientOptions::from_policy(policy, None)?,
+                        TlsClientOptions::from_policy(
+                            policy,
+                            None,
+                            security.ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "SOCKS5 TLS requires security context",
+                                )
+                            })?,
+                        )?,
                         sessions,
                         buffer_limit,
                     )

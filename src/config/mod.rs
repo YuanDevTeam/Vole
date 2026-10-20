@@ -53,7 +53,7 @@ pub use egress::EgressOptions;
 mod domain_regex;
 mod functional;
 pub use functional::RematchConfig;
-mod identity_files;
+pub(crate) mod identity_files;
 mod ip_suffix;
 mod process;
 mod security;
@@ -1091,6 +1091,7 @@ impl std::fmt::Debug for TlsCertificatePolicy {
 pub struct TlsIdentityPem {
     pub certificate: String,
     pub private_key: String,
+    pub(crate) origin: Option<std::sync::Arc<identity_files::IdentityFileOrigin>>,
 }
 impl std::fmt::Debug for TlsIdentityPem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3474,6 +3475,7 @@ fn normalize_client_identity(
             Ok(Some(TlsIdentityPem {
                 certificate,
                 private_key,
+                origin: None,
             }))
         }
         _ => invalid("TLS certificate and private-key must be provided together"),
@@ -3761,6 +3763,7 @@ impl RawXHttpDownloadSettings {
                 config.identity = Some(TlsIdentityPem {
                     certificate,
                     private_key,
+                    origin: None,
                 });
             }
             _ => {

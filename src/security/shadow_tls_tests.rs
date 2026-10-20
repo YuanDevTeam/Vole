@@ -47,6 +47,7 @@ fn material() -> Material {
         context: SecurityContext {
             provider,
             tls_roots: Arc::new(roots),
+            identities: Arc::default(),
         },
         options: ShadowTlsConfig {
             server_name: "cover.invalid".into(),

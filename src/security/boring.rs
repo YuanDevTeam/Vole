@@ -1,15 +1,11 @@
 //! Named TLS profiles over caller-supplied IO. Certificate policy is shared with
 //! rustls, not a second OpenSSL trust policy. This module never resolves or dials.
 use super::boring_stream::{BoringStream, KeepOpen};
-use super::{SecurityContext, TlsClientOptions, TlsVersions};
+use super::{SecurityContext, TlsClientIdentity, TlsClientOptions, TlsVersions};
 use crate::dispatch::BoxStream;
-use boring::{
-    pkey::PKey,
-    ssl::{
-        ClientFingerprint, ConnectConfiguration, FingerprintConnector, SslAlert, SslConnector,
-        SslMethod, SslVerifyError, SslVerifyMode, SslVersion,
-    },
-    x509::X509,
+use boring::ssl::{
+    ClientFingerprint, ConnectConfiguration, FingerprintConnector, SslAlert, SslConnector,
+    SslMethod, SslVerifyError, SslVerifyMode, SslVersion,
 };
 use rustls::{
     client::danger::ServerCertVerifier,
@@ -25,6 +21,7 @@ pub(super) struct BoringTlsClient {
     alpn: Vec<u8>,
     required_alpn: Option<Vec<u8>>,
     sessions: super::boring_resumption::Sessions,
+    identity: Option<TlsClientIdentity>,
     ech: Option<crate::config::StaticEchConfig>,
     #[cfg(feature = "stream-security")]
     reality: Option<boring::ssl::RealityClientConfig>,
@@ -63,6 +60,14 @@ impl BoringTlsClient {
         options: &TlsClientOptions,
         capacity: usize,
     ) -> io::Result<Self> {
+        let identity = options
+            .identity
+            .as_ref()
+            .map(TlsClientIdentity::for_native)
+            .transpose()?;
+        if let Some(identity) = &identity {
+            identity.native_snapshot()?.material.validate()?;
+        }
         if (options.ech.is_some() || options.versions == TlsVersions::Tls13)
             && options
                 .client_fingerprint
@@ -127,29 +132,6 @@ impl BoringTlsClient {
                 .map(|_| ())
                 .map_err(|_| reject())
         });
-        if let Some(identity) = &options.identity {
-            let size = identity
-                .certificates
-                .iter()
-                .try_fold(identity.key.secret_der().len(), |size, cert| {
-                    size.checked_add(cert.len())
-                });
-            if size.is_none_or(|n| n > crate::config::MAX_CONFIG_BYTES) {
-                return Err(invalid());
-            }
-            let (leaf, rest) = identity.certificates.split_first().ok_or_else(invalid)?;
-            let leaf = X509::from_der(leaf).map_err(|_| invalid())?;
-            builder.set_certificate(&leaf).map_err(|_| invalid())?;
-            for cert in rest {
-                builder
-                    .add_extra_chain_cert(X509::from_der(cert).map_err(|_| invalid())?)
-                    .map_err(|_| invalid())?;
-            }
-            let key =
-                PKey::private_key_from_der(identity.key.secret_der()).map_err(|_| invalid())?;
-            builder.set_private_key(&key).map_err(|_| invalid())?;
-            builder.check_private_key().map_err(|_| invalid())?;
-        }
         let connector = match options.client_fingerprint {
             Some(value) => Connector::Named(
                 FingerprintConnector::new(builder, profile(value)).map_err(|_| invalid())?,
@@ -163,6 +145,7 @@ impl BoringTlsClient {
             alpn,
             required_alpn: options.required_alpn.clone(),
             sessions,
+            identity,
             ech: options.ech.clone(),
             #[cfg(feature = "stream-security")]
             reality: None,
@@ -222,6 +205,7 @@ impl BoringTlsClient {
             // configured HTTP version; no ordinary PKI fallback is permitted.
             required_alpn: None,
             sessions,
+            identity: None,
             ech: None,
             reality: Some(reality),
             jls: None,
@@ -254,6 +238,7 @@ impl BoringTlsClient {
             alpn: wire_alpn(&config.tls.alpn)?,
             required_alpn: config.tls.required_alpn.clone(),
             sessions,
+            identity: None,
             ech: None,
             reality: None,
             jls: Some(Arc::new(JlsCredentials {
@@ -313,7 +298,35 @@ impl BoringTlsClient {
         // The shared WebPKI verifier owns name checking, including independent
         // verification names and pin precedence; wire SNI still uses server_name.
         config.set_verify_hostname(false);
-        let sink = self.sessions.configure(&mut config)?;
+        // Read one identity generation for this physical handshake. The SSL
+        // object owns its certificate/key references after installation; a
+        // later rotation cannot rewrite a handshake already in progress.
+        let identity = self
+            .identity
+            .as_ref()
+            .map(TlsClientIdentity::native_snapshot)
+            .transpose()?;
+        if let Some(identity) = &identity {
+            let material = &identity.material;
+            let size = material
+                .certificates
+                .iter()
+                .try_fold(material.key.secret_der().len(), |size, cert| {
+                    size.checked_add(cert.len())
+                });
+            if size.is_none_or(|n| n > crate::config::MAX_CONFIG_BYTES) {
+                return Err(invalid());
+            }
+            let native = identity.native.as_ref().ok_or_else(invalid)?;
+            let (leaf, rest) = native.certificates.split_first().ok_or_else(invalid)?;
+            config.set_certificate(leaf).map_err(|_| invalid())?;
+            for cert in rest {
+                config.add_chain_cert(cert).map_err(|_| invalid())?;
+            }
+            config.set_private_key(&native.key).map_err(|_| invalid())?;
+        }
+        let epoch = identity.map(|snapshot| snapshot.epoch).unwrap_or_default();
+        let sink = self.sessions.configure(&mut config, epoch)?;
         if let Some(ech) = &self.ech {
             config
                 .set_ech_config_list(ech.as_bytes())

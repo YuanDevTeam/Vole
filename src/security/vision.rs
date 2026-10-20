@@ -25,6 +25,7 @@ mod tests {
         let context = SecurityContext {
             provider: provider.clone(),
             tls_roots: Arc::new(roots),
+            identities: Arc::default(),
         };
         let client = StandardTlsClient::with_options(
             &context,

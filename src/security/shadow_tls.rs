@@ -50,12 +50,7 @@ impl ShadowTlsClient {
                     identity: config
                         .identity
                         .as_ref()
-                        .map(|identity| {
-                            super::TlsClientIdentity::from_pem(
-                                &identity.certificate,
-                                &identity.private_key,
-                            )
-                        })
+                        .map(|identity| super::TlsClientIdentity::from_config(identity, context))
                         .transpose()?,
                     certificate: config.certificate.clone(),
                     client_fingerprint: config.client_fingerprint,

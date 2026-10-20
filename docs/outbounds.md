@@ -48,7 +48,7 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   对端必须解码 sing-mux；普通 HTTP/SOCKS5 listener 不因此自动提供解码。
   字段、半关闭及池边界见 [通用 sing-mux](xhttp.md#通用-sing-mux)。
 - TLS 使用共享 WebPKI、叶证书 pin/非叶信任锚与 skip 策略。pin 不匹配不能被 skip 绕过，
-  TLS 握手签名始终验证。节点策略与恢复缓存不可变、互相隔离，标准 TLS 总票据预算为 4。
+  TLS 握手签名始终验证。节点策略固定，恢复缓存按节点和身份代隔离，标准 TLS 总票据预算为 4。
   字段及模板详见 [TLS 证书与指纹](tls-client-fingerprint.md)。
   SNI/servername 空串使用协议默认名称；pin/name-cert-verify 空串关闭对应覆盖。
   certificate/private-key 均省略或为空时不启用客户端身份；非空身份仍须成对且有效。

@@ -11,6 +11,7 @@ mod client;
 mod context;
 #[cfg(feature = "ech")]
 pub(crate) mod ech;
+mod identity;
 #[cfg(feature = "outbound-masque")]
 pub(crate) mod masque;
 #[cfg(feature = "quiche-h3-transport")]

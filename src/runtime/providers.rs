@@ -163,6 +163,7 @@ impl ProviderRuntime {
     }
     pub(super) fn begin_shutdown(&self) {
         let _publication = self.publication.lock().unwrap();
+        self.security.identities.begin_shutdown();
         self.cancellation.cancel();
         self.current.load().connections.shutdown();
         self.current.load().graph.begin_shutdown();
@@ -210,6 +211,18 @@ impl ProviderRuntime {
                 .await;
             }
         }
+    }
+
+    async fn maintain(&self) {
+        self.reap().await;
+        if !self.security.identities.has_sources() || self.cancellation.is_cancelled() {
+            return;
+        }
+        let identities = self.security.identities.clone();
+        let cancellation = self.cancellation.clone();
+        // Await even during Stop: no file read or candidate publication may
+        // outlive the existing resource worker's synchronous join barrier.
+        let _ = tokio::task::spawn_blocking(move || identities.refresh(&cancellation)).await;
     }
     fn combined_requirements(
         &self,
@@ -278,7 +291,7 @@ impl ProviderRuntime {
                     let due=self.cache.lock().await.next_due();
                     if let Some(index)=due { let _=self.update(index).await; }
                 },
-                _=maintenance.tick()=>self.reap().await,
+                _=maintenance.tick()=>self.maintain().await,
             }
         }
     }

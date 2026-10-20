@@ -233,12 +233,7 @@ impl SecurityClient {
                     identity: tls
                         .identity
                         .as_ref()
-                        .map(|identity| {
-                            super::TlsClientIdentity::from_pem(
-                                &identity.certificate,
-                                &identity.private_key,
-                            )
-                        })
+                        .map(|identity| super::TlsClientIdentity::from_config(identity, context))
                         .transpose()?,
                 },
                 resumption_sessions,

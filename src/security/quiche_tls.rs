@@ -2,13 +2,9 @@
 //! The native backend owns handshake signatures; WebPKI still owns trust.
 use std::{io, sync::Arc};
 
-use boring::{
-    pkey::PKey,
-    ssl::{
-        SslAlert, SslContextBuilder, SslMethod, SslOptions, SslSessionCacheMode, SslVerifyError,
-        SslVerifyMode, SslVersion,
-    },
-    x509::X509,
+use boring::ssl::{
+    SslAlert, SslContextBuilder, SslMethod, SslOptions, SslSessionCacheMode, SslVerifyError,
+    SslVerifyMode, SslVersion,
 };
 use rustls::{
     client::danger::ServerCertVerifier,
@@ -106,6 +102,8 @@ impl QuicheTls {
                 .map_err(|_| reject())
         });
         if let Some(identity) = &options.identity {
+            let snapshot = identity.native_snapshot()?;
+            let identity = &snapshot.material;
             let size = identity
                 .certificates
                 .iter()
@@ -115,17 +113,17 @@ impl QuicheTls {
             if size.is_none_or(|size| size > crate::config::MAX_CONFIG_BYTES) {
                 return Err(invalid());
             }
-            let (leaf, rest) = identity.certificates.split_first().ok_or_else(invalid)?;
-            let leaf = X509::from_der(leaf).map_err(|_| invalid())?;
-            builder.set_certificate(&leaf).map_err(|_| invalid())?;
+            let native = snapshot.native.as_ref().ok_or_else(invalid)?;
+            let (leaf, rest) = native.certificates.split_first().ok_or_else(invalid)?;
+            builder.set_certificate(leaf).map_err(|_| invalid())?;
             for cert in rest {
                 builder
-                    .add_extra_chain_cert(X509::from_der(cert).map_err(|_| invalid())?)
+                    .add_extra_chain_cert(cert.clone())
                     .map_err(|_| invalid())?;
             }
-            let key =
-                PKey::private_key_from_der(identity.key.secret_der()).map_err(|_| invalid())?;
-            builder.set_private_key(&key).map_err(|_| invalid())?;
+            builder
+                .set_private_key(&native.key)
+                .map_err(|_| invalid())?;
             builder.check_private_key().map_err(|_| invalid())?;
         }
         Self::from_builder(

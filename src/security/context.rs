@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rustls::RootCertStore;
 
-/// Immutable cryptographic material shared by every TLS client in one runtime.
+/// Shared immutable roots/provider and the runtime's client-identity publisher.
 ///
 /// Protocol-specific clients still own their small `ClientConfig`, while the
 /// crypto provider and WebPKI roots are constructed only once.
@@ -10,6 +10,7 @@ use rustls::RootCertStore;
 pub struct SecurityContext {
     pub(super) provider: Arc<rustls::crypto::CryptoProvider>,
     pub(super) tls_roots: Arc<RootCertStore>,
+    pub(crate) identities: Arc<super::identity::IdentityRegistry>,
 }
 
 impl std::fmt::Debug for SecurityContext {
@@ -53,6 +54,7 @@ impl SecurityContext {
         Self {
             provider: Arc::new(rustls::crypto::ring::default_provider()),
             tls_roots: Arc::new(roots),
+            identities: Arc::default(),
         }
     }
 
@@ -61,6 +63,7 @@ impl SecurityContext {
         Self {
             provider: Arc::new(rustls::crypto::ring::default_provider()),
             tls_roots: Arc::new(webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect()),
+            identities: Arc::default(),
         }
     }
 
@@ -69,6 +72,7 @@ impl SecurityContext {
         Self {
             provider: Arc::new(rustls::crypto::ring::default_provider()),
             tls_roots: Arc::new(tls_roots),
+            identities: Arc::default(),
         }
     }
 }

@@ -268,7 +268,7 @@ UID/端口范围、路由索引和 strict-route 从同一配置读取；借用 f
 [配置参考](config.yaml)与 [TUN 平台层](tun-platform.md)。
 
 物理出口来自同一 YAML 的全局/节点 `interface-name/routing-mark` 与普通 DNS `#接口`，
-不增加 Invoke 参数。平台能力、继承和 auto-route 冲突见[出站契约](outbounds.md)。
+不增加 Invoke 参数。平台能力、继承和 auto-route 共存边界见[出站契约](outbounds.md)。
 
 Windows 编译时选择互斥的 `windows-wintun` 或 `windows-uwp`：
 

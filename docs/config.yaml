@@ -417,6 +417,7 @@ proxies:
     # fingerprint: "<SHA-256 certificate pin, 64 hex digits>"
     # name-cert-verify: verified.example.com
     # certificate/private-key: 成对内联 PEM 或文件路径；不改变服务端信任根
+    # 文件对由既有资源工作器检查并用于新物理连接；失败保旧，边界见 docs/tls-client-fingerprint.md
     congestion-controller: cubic # cubic（默认）/new_reno/bbr
     disable-sni: false # true只关闭SNI，证书名称/pin验证保持
     udp: true # 缺省 false；只控制业务 UDP，QUIC 首跳始终需要数据报

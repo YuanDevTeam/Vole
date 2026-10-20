@@ -269,14 +269,15 @@ impl TrustTunnelOutbound {
                 identity: policy
                     .identity
                     .as_ref()
-                    .map(|identity| {
-                        TlsClientIdentity::from_pem(&identity.certificate, &identity.private_key)
-                    })
+                    .map(|identity| TlsClientIdentity::from_config(identity, security))
                     .transpose()?,
             },
             sessions,
             buffer_limit,
         )?;
+        if config.quic {
+            tls.prepare_quiche_identity()?;
+        }
         let connection = Arc::new(ConnectionFactory {
             server: server_destination(&config.address, config.port)?,
             upstream,

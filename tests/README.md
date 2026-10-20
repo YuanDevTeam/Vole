@@ -200,6 +200,12 @@ SS2022 流式插件的纯内存过滤器：`config::shadowsocks_plugin::tests::`
 
 HY2 共享握手的纯内存所有权/期限/同步 Stop：`outbound::hysteria2::outbound::shared_handshake_memory_tests::`。
 
+文件 mTLS 身份的纯内存 TLS/临时文件回归：
+`security::tls::tests::identity_rotation_memory_tests::`（启用 `outbound-http`；命名后端再启用 `tls-fingerprint`）、
+`security::identity::tests::` 与 `config::identity_files::tests::`。
+覆盖连续换代/旧连接与票据隔离、坏文件保留和读取失败恢复、来源独立、取消/Stop、输入预算及原生材料按需分配；
+不创建监听器，实际 TUN/QUIC 轮换仍由容器夹具验收。
+
 HY2 Gecko/Realm 的配置和内存wire回归按 `gecko_`、`realm_` 中列出的memory-only名称定向执行；
 TUIC ClientHello 使用 `tuic_disable_sni_changes_real_quic_hello_without_changing_verification_policy`。
 不得将包含网络peer的整个outbound模块直接作为宿主测试执行。
