@@ -43,6 +43,10 @@ impl std::fmt::Debug for ControllerTls {
     }
 }
 
+pub(crate) fn normalize_mark(value: i64) -> super::Result<u32> {
+    super::EgressOptions::normalize(String::new(), value).map(|options| options.routing_mark)
+}
+
 pub(crate) fn normalize_unix(value: Option<String>) -> super::Result<Option<String>> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return Ok(None);
@@ -55,6 +59,22 @@ pub(crate) fn normalize_unix(value: Option<String>) -> super::Result<Option<Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn controller_mark_uses_socket_range_without_changing_business_egress() {
+        use super::super::Config;
+        let config = Config::parse_yaml(b"routing-mark: 9\nexternal-controller: ':9000'\nexternal-controller-routing-mark: -1\n").unwrap();
+        assert_eq!(config.egress.routing_mark, 9);
+        assert_eq!(config.external_controller.unwrap().routing_mark, u32::MAX);
+        assert!(
+            Config::parse_yaml(b"external-controller-routing-mark: 7\n")
+                .unwrap()
+                .external_controller
+                .is_none()
+        );
+        for value in [i64::from(i32::MIN) - 1, i64::from(u32::MAX) + 1] {
+            assert!(super::normalize_mark(value).is_err());
+        }
+    }
     #[test]
     fn controller_unix_is_independent_of_network_listeners_and_keeps_secret() {
         use super::super::Config;

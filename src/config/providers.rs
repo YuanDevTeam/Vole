@@ -228,6 +228,7 @@ impl ProviderTemplate {
         http: Option<std::net::SocketAddr>,
         tls: Option<std::net::SocketAddr>,
         unix: Option<&str>,
+        mark: Option<u32>,
         secret: Option<&str>,
     ) {
         use zeroize::Zeroize as _;
@@ -248,6 +249,12 @@ impl ProviderTemplate {
                 }
             }
         }
+        if let Some(mark) = mark {
+            base.insert(
+                "external-controller-routing-mark".into(),
+                Value::Number(mark.into()),
+            );
+        }
     }
     #[cfg(any(feature = "invoke", test))]
     pub(crate) fn controller_secret(&self) -> Option<&str> {
@@ -255,6 +262,14 @@ impl ProviderTemplate {
             .get("secret")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
+    }
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn controller_routing_mark(&self) -> u32 {
+        self.base
+            .get("external-controller-routing-mark")
+            .and_then(Value::as_i64)
+            .and_then(|value| super::normalize_controller_mark(value).ok())
+            .unwrap_or_default()
     }
     #[cfg(any(feature = "invoke", test))]
     pub(crate) fn controller_cors(&self) -> super::ControllerCors {

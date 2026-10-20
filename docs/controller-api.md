@@ -8,6 +8,7 @@ Controller 是当前 Running Session 的 HTTP 接口。它提供业务连接管�
 external-controller: 127.0.0.1:9090
 external-controller-tls: 127.0.0.1:9443 # 可单独启用或与 HTTP 同时启用
 external-controller-unix: controller.sock # Linux，可独立启用
+external-controller-routing-mark: 0 # Linux，仅管理 TCP
 external-controller-cors:
   allow-origins: ["https://ui.example"]
   allow-private-network: false
@@ -23,6 +24,10 @@ secret: "vole-runtime-secret"
   本地 HTTP/1 与 WebSocket 共用现有 API、CORS、资源和订阅限额，通过文件权限授权，不要求 Bearer 或 token。
   网络 HTTP/HTTPS 保留原 secret；本地访问不会修改它。Stop 和启动失败只清理本次创建且 dev+ino 仍一致的 socket，
   也覆盖绑定后尚未 serve 就丢弃的情况；其它平台启动该入口返回不支持。
+- `external-controller-routing-mark` 仅作用 Linux HTTP/HTTPS 的 TCP listener 和已接受 socket，
+  在 bind 前设置 SO_MARK；Unix socket 与业务 Dialer 不受影响。0 不设置；沿用 socket mark 的
+  32 位范围（负的 i32 值转换为同位模式的 u32）。SO_MARK 权限或系统错误原样导致绑定／接受失败，
+  不静默清零或回退；非 Linux 在启用网络监听且 mark 非零时返回不支持。
 - `secret` 始终可选，省略或空串表示不要求认证；配置非空值时保护本文定义的业务路由，CORS 预检在认证之前处理。配置仅受整体 YAML 大小预算约束，HTTP 请求头仍限 32 KiB。
 - `measureDelay` 的 node-only 配置不能包含 Controller 或代理组字段。
 - `validateConfig` 只校验 Controller 字段；`start` 加载服务端证书并绑定端口，任一失败则启动失败。`stop` 和 `destroyInstance` 关闭全部监听器并等待请求与证书 watcher 回收。

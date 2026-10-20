@@ -26,6 +26,7 @@ vole -t -config "$(base64 < config.yaml)"
 | `-ext-ctl <address>` | 非空时覆盖 HTTP Controller 地址 |
 | `-ext-ctl-tls <address>` | 非空时覆盖 TLS Controller 地址 |
 | `-ext-ctl-unix <path>` | 非空时覆盖 Linux 本地 Controller 路径 |
+| `-ext-ctl-routing-mark <mark>` | 非零时覆盖 Linux 管理 TCP socket mark |
 | `-secret <token>` | 非空时覆盖 Controller 认证密钥 |
 | `-http-config <file>` | 显式的独立 HTTP 附加配置，交给 Invoke 读取与验证 |
 | `-http-ca <file>` | 独立私密 CA JSON 路径，交给 Invoke 读取；`-t` 不读取它 |
@@ -54,7 +55,11 @@ Unix 用户目录取 `HOME`，Windows 取 `USERPROFILE`，缺失时使用工作�
 `VOLE_OVERRIDE_EXTERNAL_CONTROLLER_UNIX`、`VOLE_OVERRIDE_SECRET` 提供 Controller 覆盖的环境默认。显式参数优先，显式空值清除该环境默认，
 且不覆盖 YAML 原值；只更改具体的 Controller 配置，不提供通用字段覆盖。
 地址沿用 YAML 的 IP／localhost／空 host 与数字端口规则，不查询域名；密钥不会输出到日志或错误。
-`-t` 与 Mihomo 一致，只校验输入配置，不应用或解析这些运行期覆盖；`-h/-v` 不读取其环境值。
+`-ext-ctl-routing-mark` 在 CLI 按 Go flag 的平台 int/base-0 语法解析，支持符号、进制前缀和合法下划线；
+非法显式数字参数返回 2，`-t` 也执行参数语法检查。Invoke 接收数值元数据；32 位 socket mark 范围由运行期统一校验。
+`VOLE_OVERRIDE_EXTERNAL_CONTROLLER_ROUTING_MARK` 是十进制环境默认，沿用 Mihomo 的 Atoi 返回值；缺失或语法错误使用 0，溢出返回平台饱和值后仍受 socket 范围校验；
+显式 0 屏蔽环境默认但保留 YAML mark。此项只用于管理 TCP，不改变业务 routing-mark 或 Unix socket。
+`-t` 与 Mihomo 一致，只校验输入配置，不读取环境／应用运行期覆盖；`-h/-v` 不读取其环境值。
 
 独立 HTTP 配置上限 1 MiB，使用 `-http-config <file>` 或 `--http-config=<file>`。省略不探测文件；空路径与 `-` 失败，空文件关闭处理。相对 provider 文件从 HTTP 文件目录解析，缓存从数据目录解析。`-t` 只校验主文档／inline 内容，不读取外部 provider、下载或私密 CA；`-v/-h` 不读取附加文件。详细输入见 [HTTP 处理](http-processing.md)。
 

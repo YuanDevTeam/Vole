@@ -70,6 +70,7 @@ pub(crate) struct RuntimeController {
     listener: Option<TcpListener>,
     tls_listener: Option<TcpListener>,
     tls: Option<Arc<tls::ServerTls>>,
+    routing_mark: u32,
     context: RequestContext,
 }
 
@@ -125,6 +126,7 @@ impl RuntimeController {
                     .map_err(io::Error::other)??;
             let listener = bind_controller(&ExternalControllerConfig {
                 listen,
+                routing_mark: config.routing_mark,
                 ..ExternalControllerConfig::default()
             })?;
             (Some(listener), Some(Arc::new(tls)))
@@ -137,6 +139,7 @@ impl RuntimeController {
             listener,
             tls_listener,
             tls,
+            routing_mark: config.routing_mark,
             context: RequestContext {
                 secret: config.secret.as_deref().map(Arc::from),
                 traffic,
@@ -171,10 +174,10 @@ impl RuntimeController {
         let network = async {
             tokio::select! {
                 accepted = async { self.listener.as_ref().unwrap().accept().await }, if self.listener.is_some() => {
-                    accepted.map(|(stream, _)| AcceptedController::Http(stream))
+                    accepted.and_then(|(stream, _)| mark_accepted_tcp(stream, self.routing_mark)).map(AcceptedController::Http)
                 }
                 accepted = async { self.tls_listener.as_ref().unwrap().accept().await }, if self.tls_listener.is_some() => {
-                    accepted.map(|(stream, _)| AcceptedController::Tls(stream))
+                    accepted.and_then(|(stream, _)| mark_accepted_tcp(stream, self.routing_mark)).map(AcceptedController::Tls)
                 }
                 else => std::future::pending().await,
             }
@@ -239,18 +242,21 @@ fn bind_controller(config: &ExternalControllerConfig) -> io::Result<TcpListener>
     } else {
         config.listen
     };
-    match bind_controller_tcp(listen) {
+    match bind_controller_tcp(listen, config.routing_mark) {
         Err(error)
             if config.listen.ip().is_unspecified()
                 && crate::inbound::listen::address_family_unavailable(&error) =>
         {
-            bind_controller_tcp(SocketAddr::from(([0, 0, 0, 0], config.listen.port())))
+            bind_controller_tcp(
+                SocketAddr::from(([0, 0, 0, 0], config.listen.port())),
+                config.routing_mark,
+            )
         }
         result => result,
     }
 }
 
-fn bind_controller_tcp(address: SocketAddr) -> io::Result<TcpListener> {
+fn bind_controller_tcp(address: SocketAddr, routing_mark: u32) -> io::Result<TcpListener> {
     let socket = Socket::new(
         Domain::for_address(address),
         Type::STREAM,
@@ -263,9 +269,35 @@ fn bind_controller_tcp(address: SocketAddr) -> io::Result<TcpListener> {
     #[cfg(unix)]
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
+    set_controller_mark(&socket, routing_mark)?;
     socket.bind(&address.into())?;
     socket.listen(128)?;
     TcpListener::from_std(socket.into())
+}
+
+fn set_controller_mark(socket: &Socket, mark: u32) -> io::Result<()> {
+    if mark == 0 {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        socket.set_mark(mark)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = socket;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "external-controller-routing-mark requires Linux",
+        ))
+    }
+}
+fn mark_accepted_tcp(
+    stream: tokio::net::TcpStream,
+    mark: u32,
+) -> io::Result<tokio::net::TcpStream> {
+    set_controller_mark(&socket2::SockRef::from(&stream), mark)?;
+    Ok(stream)
 }
 
 async fn handle_connection<S: ControllerIo>(

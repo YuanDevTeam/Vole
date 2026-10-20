@@ -73,8 +73,10 @@ use rules::parse_rule;
 mod credentials;
 pub use credentials::{ProxyAccess, ProxyAccessRules, ProxyCredentials};
 mod controller;
-pub(crate) use controller::normalize_unix as normalize_controller_unix;
 pub use controller::{ControllerCors, ControllerTls};
+pub(crate) use controller::{
+    normalize_mark as normalize_controller_mark, normalize_unix as normalize_controller_unix,
+};
 mod ech;
 pub use ech::StaticEchConfig;
 mod quic;
@@ -211,6 +213,7 @@ pub struct ExternalControllerConfig {
     pub http_enabled: bool,
     pub tls_listen: Option<SocketAddr>,
     pub unix_path: Option<String>,
+    pub routing_mark: u32,
     pub cors: ControllerCors,
     pub server_tls: ControllerTls,
 }
@@ -223,6 +226,7 @@ impl Default for ExternalControllerConfig {
             http_enabled: true,
             tls_listen: None,
             unix_path: None,
+            routing_mark: 0,
             cors: ControllerCors::default(),
             server_tls: ControllerTls::default(),
         }
@@ -1279,6 +1283,8 @@ struct RawVoleConfig {
         deserialize_with = "deserialize_present_option"
     )]
     external_controller_unix: Option<String>,
+    #[serde(rename = "external-controller-routing-mark", default)]
+    external_controller_routing_mark: i64,
     #[serde(rename = "external-controller-cors", default)]
     external_controller_cors: ControllerCors,
     #[serde(default, deserialize_with = "deserialize_present_option")]
@@ -2460,6 +2466,7 @@ impl RawVoleConfig {
         let proxy_groups = normalize_proxy_groups(raw_proxy_groups, &route_targets)?;
         proxy_graph_order(&proxies, &proxy_groups)?;
         let unix_path = normalize_controller_unix(self.external_controller_unix)?;
+        let routing_mark = normalize_controller_mark(self.external_controller_routing_mark)?;
         let mut external_controller =
             normalize_external_controller(self.external_controller, self.secret.clone())?;
         let tls_controller =
@@ -2480,6 +2487,7 @@ impl RawVoleConfig {
         }
         if let Some(controller) = &mut external_controller {
             controller.unix_path = unix_path;
+            controller.routing_mark = routing_mark;
             controller.cors = self.external_controller_cors;
             controller.server_tls = self.tls.server.clone();
         }

@@ -26,6 +26,7 @@ struct Options {
     external_controller: Option<Zeroizing<String>>,
     external_controller_tls: Option<Zeroizing<String>>,
     external_controller_unix: Option<Zeroizing<String>>,
+    external_controller_routing_mark: Option<i64>,
     secret: Option<Zeroizing<String>>,
     http_config_file: Option<PathBuf>,
     http_ca_file: Option<PathBuf>,
@@ -54,6 +55,7 @@ impl Options {
         let mut external_controller = None;
         let mut external_controller_tls = None;
         let mut external_controller_unix = None;
+        let mut external_controller_routing_mark = None;
         let mut secret = None;
         let mut http_config_file = None;
         let mut http_ca_file = None;
@@ -75,6 +77,7 @@ impl Options {
                         external_controller,
                         external_controller_tls,
                         external_controller_unix,
+                        external_controller_routing_mark,
                         secret,
                         http_config_file,
                         http_ca_file,
@@ -87,6 +90,15 @@ impl Options {
                     } else {
                         validate = value;
                     }
+                }
+                b"ext-ctl-routing-mark" => {
+                    let value = inline
+                        .map(OsStr::to_owned)
+                        .or_else(|| arguments.next())
+                        .ok_or(CliError::argument(
+                            "missing value for -ext-ctl-routing-mark",
+                        ))?;
+                    external_controller_routing_mark = Some(parse_go_int(&value)?);
                 }
                 b"config" | b"age-secret-key" | b"ext-ctl" | b"ext-ctl-tls" | b"ext-ctl-unix"
                 | b"secret" => {
@@ -163,6 +175,7 @@ impl Options {
             external_controller,
             external_controller_tls,
             external_controller_unix,
+            external_controller_routing_mark,
             secret,
             http_config_file,
             http_ca_file,
@@ -191,6 +204,87 @@ fn flag_parts(argument: &OsStr) -> Result<Option<ParsedFlag<'_>>, CliError> {
     } else {
         Ok(Some((flag, None)))
     }
+}
+
+// Go flag.IntVar uses strconv.ParseInt(base=0, bitSize=strconv.IntSize).
+fn parse_go_int(value: &OsStr) -> Result<i64, CliError> {
+    let invalid = || CliError::argument("invalid integer option value");
+    let mut digits = value.as_encoded_bytes();
+    let negative = digits.first() == Some(&b'-');
+    if matches!(digits.first(), Some(b'+' | b'-')) {
+        digits = &digits[1..];
+    }
+    if digits.is_empty() {
+        return Err(invalid());
+    }
+    let mut radix = 10_u64;
+    let mut prefix = false;
+    if digits.len() > 1 && digits[0] == b'0' {
+        prefix = true;
+        let offset = match digits[1] {
+            b'x' | b'X' => {
+                radix = 16;
+                2
+            }
+            b'b' | b'B' => {
+                radix = 2;
+                2
+            }
+            b'o' | b'O' => {
+                radix = 8;
+                2
+            }
+            _ => {
+                radix = 8;
+                1
+            }
+        };
+        digits = &digits[offset..];
+    }
+    let decode = |byte: u8| {
+        match byte {
+            b'0'..=b'9' => Some(u64::from(byte - b'0')),
+            b'a'..=b'f' => Some(u64::from(byte - b'a' + 10)),
+            b'A'..=b'F' => Some(u64::from(byte - b'A' + 10)),
+            _ => None,
+        }
+        .filter(|digit| *digit < radix)
+    };
+    let limit = (isize::MAX as u64) + u64::from(negative);
+    let mut value = 0_u64;
+    let mut previous_digit = false;
+    let mut any_digit = false;
+    for (index, &byte) in digits.iter().enumerate() {
+        if byte == b'_' {
+            if !(previous_digit || index == 0 && prefix)
+                || digits
+                    .get(index + 1)
+                    .and_then(|next| decode(*next))
+                    .is_none()
+            {
+                return Err(invalid());
+            }
+            previous_digit = false;
+        } else {
+            let digit = decode(byte).ok_or_else(invalid)?;
+            value = value
+                .checked_mul(radix)
+                .and_then(|value| value.checked_add(digit))
+                .filter(|value| *value <= limit)
+                .ok_or_else(invalid)?;
+            previous_digit = true;
+            any_digit = true;
+        }
+    }
+    if !any_digit {
+        return Err(invalid());
+    }
+    let signed = if negative {
+        -(value as i128)
+    } else {
+        value as i128
+    };
+    Ok(signed as i64)
 }
 
 fn parse_bool(value: &OsStr) -> Result<bool, CliError> {
@@ -235,6 +329,9 @@ fn request(options: Options) -> Value {
         if let Some(mut value) = value {
             payload[name] = Value::String(std::mem::take(&mut *value));
         }
+    }
+    if let Some(mark) = options.external_controller_routing_mark {
+        payload["externalControllerRoutingMark"] = Value::from(mark);
     }
     if let Some(path) = options.http_config_file {
         payload["httpConfigPath"] =
@@ -312,6 +409,43 @@ mod tests {
     use super::*;
     fn parse(args: &[&str]) -> Result<Options, CliError> {
         Options::parse(args.iter().map(OsString::from), None, None)
+    }
+    #[test]
+    fn controller_mark_flag_uses_go_integer_syntax_and_numeric_invoke_metadata() {
+        for (input, expected) in [
+            ("42", 42),
+            ("0x2a", 42),
+            ("0o52", 42),
+            ("0b10_1010", 42),
+            ("052", 42),
+            ("0x_2a", 42),
+            ("-1", -1),
+            ("+0", 0),
+        ] {
+            let options = Options::parse(
+                ["-t".into(), format!("-ext-ctl-routing-mark={input}").into()],
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                request(options)["payload"]["externalControllerRoutingMark"],
+                expected
+            );
+        }
+        for invalid in ["08", "1__2", "0x", "9223372036854775808"] {
+            assert!(
+                Options::parse(
+                    [
+                        "-t".into(),
+                        format!("-ext-ctl-routing-mark={invalid}").into()
+                    ],
+                    None,
+                    None
+                )
+                .is_err()
+            );
+        }
     }
     #[test]
     fn unix_controller_flag_only_transports_the_explicit_text_value() {

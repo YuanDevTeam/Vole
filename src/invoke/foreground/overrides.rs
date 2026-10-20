@@ -10,6 +10,7 @@ pub(in crate::invoke) struct ControllerOverrides {
     http: Option<SocketAddr>,
     tls: Option<SocketAddr>,
     unix: Option<String>,
+    mark: u32,
     secret: Option<Zeroizing<String>>,
 }
 impl ControllerOverrides {
@@ -17,6 +18,7 @@ impl ControllerOverrides {
         http: Option<Zeroizing<String>>,
         tls: Option<Zeroizing<String>>,
         unix: Option<Zeroizing<String>>,
+        mark: Option<i64>,
         secret: Option<Zeroizing<String>>,
     ) -> Result<Self, InvokeFailure> {
         let limit = crate::config::MAX_CONFIG_BYTES;
@@ -29,7 +31,13 @@ impl ControllerOverrides {
             unix,
             "VOLE_OVERRIDE_EXTERNAL_CONTROLLER_UNIX",
             limit,
-        )?)
+        )?)?
+        .with_mark(mark.unwrap_or_else(|| {
+            std::env::var("VOLE_OVERRIDE_EXTERNAL_CONTROLLER_ROUTING_MARK")
+                .ok()
+                .map(|value| environment_mark(&value))
+                .unwrap_or(0)
+        }))
     }
     fn from_values(
         http: Option<Zeroizing<String>>,
@@ -48,6 +56,7 @@ impl ControllerOverrides {
             http: listener(http)?,
             tls: listener(tls)?,
             unix: None,
+            mark: 0,
             secret: secret.filter(|value| !value.is_empty()),
         })
     }
@@ -58,6 +67,11 @@ impl ControllerOverrides {
         .map_err(|_| failure("invalid foreground Controller Unix path"))?;
         Ok(self)
     }
+    fn with_mark(mut self, value: i64) -> Result<Self, InvokeFailure> {
+        self.mark = crate::config::normalize_controller_mark(value)
+            .map_err(|_| failure("invalid foreground Controller routing mark"))?;
+        Ok(self)
+    }
     pub(in crate::invoke) fn apply_template(
         &self,
         template: &mut crate::config::providers::ProviderTemplate,
@@ -66,6 +80,7 @@ impl ControllerOverrides {
             self.http,
             self.tls,
             self.unix.as_deref(),
+            (self.mark != 0).then_some(self.mark),
             self.secret.as_ref().map(|value| value.as_str()),
         );
     }
@@ -78,6 +93,10 @@ impl ControllerOverrides {
         {
             config.external_controller = Some(ExternalControllerConfig {
                 http_enabled: false,
+                routing_mark: config
+                    .providers
+                    .as_ref()
+                    .map_or(0, |template| template.controller_routing_mark()),
                 secret: config
                     .providers
                     .as_ref()
@@ -106,12 +125,27 @@ impl ControllerOverrides {
         if let Some(unix) = &self.unix {
             controller.unix_path = Some(unix.clone());
         }
+        if self.mark != 0 {
+            controller.routing_mark = self.mark;
+        }
         if let Some(secret) = &self.secret {
             if let Some(mut old) = controller.secret.take() {
                 old.zeroize();
             }
             controller.secret = Some(secret.as_str().to_owned());
         }
+    }
+}
+
+// Mihomo's getIntEnv discards Atoi's error, including its saturated range value.
+fn environment_mark(value: &str) -> i64 {
+    match value.parse::<isize>() {
+        Ok(value) => value as i64,
+        Err(error) => match error.kind() {
+            std::num::IntErrorKind::PosOverflow => isize::MAX as i64,
+            std::num::IntErrorKind::NegOverflow => isize::MIN as i64,
+            _ => 0,
+        },
     }
 }
 
@@ -170,6 +204,65 @@ rules: ['MATCH,DIRECT']
         assert_eq!(materialized.external_controller, config.external_controller);
     }
 
+    #[test]
+    fn mark_override_preserves_zero_yaml_and_materialized_values() {
+        assert_eq!(environment_mark("+42"), 42);
+        assert_eq!(environment_mark("0x2a"), 0);
+        assert_eq!(
+            environment_mark("999999999999999999999999999"),
+            isize::MAX as i64
+        );
+
+        let mut config = Config::parse_yaml(b"external-controller: ':9000'\nexternal-controller-routing-mark: 7\nrules: ['MATCH,DIRECT']\n").unwrap();
+        ControllerOverrides::default()
+            .with_mark(0)
+            .unwrap()
+            .apply(&mut config);
+        assert_eq!(config.external_controller.as_ref().unwrap().routing_mark, 7);
+        ControllerOverrides::default()
+            .with_mark(42)
+            .unwrap()
+            .apply(&mut config);
+        assert_eq!(
+            config.external_controller.as_ref().unwrap().routing_mark,
+            42
+        );
+        assert_eq!(
+            config
+                .providers
+                .as_ref()
+                .unwrap()
+                .materialize(&Default::default())
+                .unwrap()
+                .external_controller,
+            config.external_controller
+        );
+        assert!(ControllerOverrides::default().with_mark(i64::MAX).is_err());
+
+        let mut inactive =
+            Config::parse_yaml(b"external-controller-routing-mark: -1\nrules: ['MATCH,DIRECT']\n")
+                .unwrap();
+        assert!(inactive.external_controller.is_none());
+        ControllerOverrides::from_values(text("localhost:9000"), None, None)
+            .unwrap()
+            .with_mark(0)
+            .unwrap()
+            .apply(&mut inactive);
+        assert_eq!(
+            inactive.external_controller.as_ref().unwrap().routing_mark,
+            u32::MAX
+        );
+        assert_eq!(
+            inactive
+                .providers
+                .as_ref()
+                .unwrap()
+                .materialize(&Default::default())
+                .unwrap()
+                .external_controller,
+            inactive.external_controller
+        );
+    }
     #[test]
     fn unix_override_survives_materialization_without_creating_a_network_listener() {
         let mut config =
