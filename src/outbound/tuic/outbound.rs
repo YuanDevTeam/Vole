@@ -468,6 +468,59 @@ async fn drive(
 #[cfg(test)]
 mod p08_tests {
     use super::*;
+    #[tokio::test]
+    async fn tuic_cold_connection_cannot_publish_an_early_quinn_handle_without_resumption() {
+        struct Discard;
+        #[async_trait]
+        impl DatagramTransport for Discard {
+            async fn send(&mut self, _: crate::session::Datagram) -> Result<(), DispatchError> {
+                Ok(())
+            }
+            async fn receive(&mut self) -> Result<crate::session::Datagram, DispatchError> {
+                std::future::pending().await
+            }
+        }
+        let parsed = crate::config::Config::parse_yaml(
+            br#"proxies: [{name: edge, type: tuic, server: peer.invalid, port: 443, uuid: 01234567-89ab-cdef-0123-456789abcdef}]"#,
+        ).unwrap();
+        let crate::config::ProxyProtocol::Tuic(config) = &parsed.proxies[0].protocol else {
+            panic!("TUIC");
+        };
+        let node = TuicOutbound::new_with_path(
+            config,
+            UpstreamPath::LazyDirect {
+                dialer: crate::dialer::Dialer::default(),
+            },
+        )
+        .unwrap();
+        // A request for early data alone cannot make a cold client connection
+        // available. No sockets, system resolver, peers, or ticket cache exist.
+        let mut tls = (*node.tls).clone();
+        tls.enable_early_data = true;
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+        let peer = "192.0.2.1:443".parse().unwrap();
+        let (socket, driver) =
+            quic::attach(Box::new(Discard), peer, DatagramBudget::new(1400, 1400)).unwrap();
+        let runtime = Arc::new(OwnedRuntime::new(CancellationToken::new()));
+        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime.clone(),
+        )
+        .unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+        let connecting = endpoint.connect(peer, "peer.invalid").unwrap();
+        assert!(
+            connecting.into_0rtt().is_err(),
+            "a cold client obtained an early handle"
+        );
+        endpoint.close(0_u8.into(), b"");
+        runtime.stop().await;
+        drop(endpoint);
+        driver.stop().await.unwrap();
+    }
+
     fn sni_extension(hello: &[u8]) -> bool {
         assert_eq!(hello[0], 1);
         let mut at = 4 + 2 + 32;

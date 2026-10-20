@@ -246,3 +246,7 @@ IP4P 接点纯内存回归：`dns::resolution::ip4p_tests::`、
 `dialer::tests::ip4p_loopback_mapping_cannot_acquire_a_new_literal_exemption`、
 `outbound::connector::tests::ip4p_udp_node_endpoint_retains_chain_identity_and_uses_actual_reply_peer`。
 这些测试不建立网络 socket；真实 TUN 的 TCP/SS2022/SOCKS5/WireGuard 及 UWP 平台路径单独验收。
+
+TUIC 冷连接的公开 API 门禁（纯内存、无票据缓存或网络 socket）：
+`tuic_cold_connection_cannot_publish_an_early_quinn_handle_without_resumption`。
+它检查仅启用 early-data 不能取得 Quinn 的早期客户端连接，不代表恢复连接或服务端验收。
