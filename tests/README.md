@@ -59,7 +59,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | GeoData | `geodata::tests::` | 合成DAT/MMDB、selector、更新发布和取消 |
 | 资源与Provider | `config::rule_provider::`、`runtime::providers::tests::`、`resource::cache::tests::`、`resource::provider_input::tests::`、`resource::http::tests::` | 域名紧凑索引、MRS、URI/Base64/AGE候选、流式gzip与认证隔离、失败保留与旧代资源 |
 | 策略组 | `routing::proxy_group::tests::`、`routing::balance::tests::` | 选择、容差、恢复和负载均衡 |
-| DNS | `dns::cache::tests::`、`dns::runtime::tests::dns_fallback_`、`dns::runtime::tests::resolve_ipv6_` | 缓存、双栈、竞速和取消 |
+| DNS | `dns::cache::tests::`、`dns::runtime::tests::stale_refresh_`、`dns::runtime::tests::dns_fallback_`、`dns::runtime::tests::resolve_ipv6_` | 缓存、过期答复/后台预算/退避/epoch/Stop、双栈、竞速和取消 |
 | 入口嗅探 | `tcp_sniffer::tests::`、`tcp_sniffer::http2::tests::`、`udp_sniffing::tests::`、`tun_runtime::tests::quic_` | HTTP1/HTTP2目标、HPACK与完整前缀回放；共享QUIC域名键、ECH、预算与重组 |
 | QUIC与H3 | `transport::quic::`、`transport::quinn_h3::tests::`、`transport::quiche_h3::tests::`、`dns_quic_` | 官方窗口、真实内存QUIC、DATA读取背压、请求取消、兄弟请求及Stop |
 | XHTTP与XUDP | `transport::xhttp::`、`transport::h2_write::tests::`、`xudp::tests::` | 正文缓冲共享、标量部分写入、flush确认、计时与Stop |

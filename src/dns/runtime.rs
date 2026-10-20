@@ -14,6 +14,9 @@ mod quic_tests;
 #[path = "tests_ech.rs"]
 mod ech_tests;
 
+#[path = "refresh.rs"]
+mod refresh;
+
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -21,7 +24,7 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        Arc, Mutex as StdMutex, Weak,
+        Arc, Mutex as StdMutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -156,6 +159,20 @@ pub struct RuntimeDns {
     tcp_pool: Arc<TcpConnectionPool>,
     next_id: AtomicU16,
     resource_stats: RuntimeResourceStats,
+    refresh: OnceLock<RefreshBinding>,
+}
+
+struct RefreshBinding {
+    resolver: Weak<RuntimeDns>,
+    owner: Arc<refresh::Owner>,
+}
+
+impl Drop for RuntimeDns {
+    fn drop(&mut self) {
+        if let Some(binding) = self.refresh.get() {
+            binding.owner.close();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -785,6 +802,26 @@ impl SingleflightRegistry {
         })
     }
 
+    fn try_lead(self: &Arc<Self>, key: SingleflightKey) -> Option<FlightLeaderGuard> {
+        let mut flights = self
+            .flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if flights.contains_key(&key) {
+            return None;
+        }
+        let (updates, _) = watch::channel(FlightUpdate::Pending);
+        let state = Arc::new(FlightState { updates });
+        flights.insert(key.clone(), state.clone());
+        Some(FlightLeaderGuard {
+            registry: self.clone(),
+            key,
+            state,
+            activity: Some(self.resource_stats.begin(ResourceActivity::Singleflight)),
+            completed: false,
+        })
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.flights
@@ -1000,6 +1037,132 @@ impl RuntimeDns {
         self.cache_epoch = epoch;
     }
 
+    /// Bind only after graph/configuration assembly: weak links must not
+    /// invalidate Arc::get_mut used while constructing the resolver roles.
+    pub(crate) fn enable_refresh(self: &Arc<Self>, previous: Option<&Self>) {
+        if self.refresh.get().is_some() {
+            return;
+        }
+        let parent = self
+            .node_bootstrap
+            .as_ref()
+            .and_then(super::resolution::ResolutionContext::runtime_dns);
+        let budget = previous
+            .or(parent.as_deref())
+            .and_then(|dns| dns.refresh.get())
+            .map(|binding| binding.owner.budget.clone());
+        let owner = refresh::Owner::new(budget);
+        let mut pending = vec![self.clone()];
+        let mut seen = HashSet::new();
+        while let Some(resolver) = pending.pop() {
+            if !seen.insert(Arc::as_ptr(&resolver) as usize) {
+                continue;
+            }
+            assert!(
+                resolver
+                    .refresh
+                    .set(RefreshBinding {
+                        resolver: Arc::downgrade(&resolver),
+                        owner: owner.clone(),
+                    })
+                    .is_ok(),
+                "DNS refresh roles must have one owner"
+            );
+            pending.extend(
+                [
+                    resolver.bootstrap.clone(),
+                    resolver.proxy_resolver.clone(),
+                    resolver.direct_resolver.clone(),
+                    resolver.ech_system_resolver.clone(),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
+    }
+
+    fn refresh_stale(
+        &self,
+        query: &[u8],
+        classified: &ClassifiedDnsQuery,
+        epoch: u64,
+        cache: &mut DnsCache,
+    ) {
+        let Some(binding) = self.refresh.get() else {
+            return;
+        };
+        let Some(permit) = binding.owner.reserve() else {
+            return;
+        };
+        if !cache.reserve_refresh(classified, Instant::now(), refresh::BACKOFF) {
+            return;
+        }
+        let Some(leader) = self
+            .singleflight
+            .try_lead(SingleflightKey::new(classified, epoch))
+        else {
+            return;
+        };
+        let resolver = binding.resolver.clone();
+        let query = query.to_vec();
+        let classified = classified.clone();
+        binding.owner.spawn(permit, async move {
+            let Some(resolver) = resolver.upgrade() else {
+                return;
+            };
+            let permit = resolver.begin_query();
+            let exchange = permit.decision.scope(async {
+                match classified.kind {
+                    DnsQueryKind::Address(_) => {
+                        resolver
+                            .exchange_address_leader(&query, &classified, permit.deadline, epoch)
+                            .await
+                    }
+                    DnsQueryKind::Opaque => {
+                        resolver
+                            .exchange_opaque_leader(&query, &classified, permit.deadline, epoch)
+                            .await
+                    }
+                }
+            });
+            let result = timeout_at(permit.deadline, Box::pin(exchange))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(RuntimeDnsError::UpstreamsExhausted {
+                        last_error: "runtime DNS total query deadline expired".into(),
+                    })
+                })
+                .map(Arc::<[u8]>::from);
+            let current = resolver.cache_epoch.read().await;
+            if *current == epoch {
+                resolver.cache.lock().await.finish_refresh(
+                    &classified,
+                    Instant::now(),
+                    refresh::BACKOFF,
+                );
+            }
+            leader.complete(result);
+        });
+    }
+
+    fn stale_hints(&self, response: &DnsMessage) -> Result<(), RuntimeDnsError> {
+        if self.hints_writable.load(Ordering::Acquire)
+            && let Some(hints) = &self.hints
+        {
+            let answers =
+                matching_answer_set(response).map_err(RuntimeDnsError::InvalidResponse)?;
+            let mut hints = hints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for address in answers.addresses {
+                hints
+                    .insert(address, &response.question.name, 1, Instant::now())
+                    .map_err(RuntimeDnsError::Cache)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Clears typed and wire results and redir-host hints for every DNS role.
     /// Fake-IP mappings, active queries and upstream connections stay live.
     /// Queries admitted before this boundary cannot refill cleared state.
@@ -1047,6 +1210,9 @@ impl RuntimeDns {
                 continue;
             }
             resolver.hints_writable.store(false, Ordering::Release);
+            if let Some(binding) = resolver.refresh.get() {
+                binding.owner.close();
+            }
             pending.extend(
                 [
                     resolver.bootstrap.as_deref(),
@@ -1095,6 +1261,9 @@ impl RuntimeDns {
             if !seen.insert(std::ptr::from_ref(resolver) as usize) {
                 continue;
             }
+            if let Some(binding) = resolver.refresh.get() {
+                binding.owner.close();
+            }
             resolver.tcp_pool.http2.close();
             #[cfg(feature = "dns-quic")]
             resolver.tcp_pool.quic.close();
@@ -1121,6 +1290,9 @@ impl RuntimeDns {
         while let Some(resolver) = pending.pop() {
             if !seen.insert(std::ptr::from_ref(resolver) as usize) {
                 continue;
+            }
+            if let Some(binding) = resolver.refresh.get() {
+                binding.owner.shutdown().await;
             }
             resolver.tcp_pool.http2.shutdown().await;
             #[cfg(feature = "dns-quic")]
@@ -1205,7 +1377,8 @@ impl RuntimeDns {
         );
         resolver.node_bootstrap = Some(bootstrap);
         // No idle background reaper belongs to this private node resolver.
-        // Queries remain caller-owned; the raw-IP engine owns transport stop.
+        // Foreground queries remain caller-owned. The raw-IP engine joins
+        // bounded refresh work and transport drivers through DNS shutdown.
         let pool = Arc::get_mut(&mut resolver.tcp_pool).expect("fresh node DNS pool");
         pool.max_idle = 0;
         pool.max_idle_per_key = 0;
@@ -1242,6 +1415,7 @@ impl RuntimeDns {
             resolver.share_cache_epoch(physical.cache_epoch.clone());
         }
         let resolver = Arc::new(resolver);
+        resolver.enable_refresh(None);
         resolver.sources.register(&resolver);
         resolver
     }
@@ -1508,6 +1682,7 @@ impl RuntimeDns {
             tcp_pool: TcpConnectionPool::new(security),
             next_id: AtomicU16::new(1),
             resource_stats,
+            refresh: OnceLock::new(),
         }
     }
 
@@ -2194,20 +2369,41 @@ impl RuntimeDns {
                 // entry, so a caller cannot observe a miss and then create a
                 // duplicate flight after that leader has disappeared.
                 let mut cache = self.cache.lock().await;
-                if classified.needs_wire_cache {
-                    if let Some(wire) = cache.get_wire(classified, Instant::now()) {
+                let allow_stale = self
+                    .refresh
+                    .get()
+                    .is_some_and(|binding| !binding.owner.is_closed());
+                let cached = if classified.needs_wire_cache {
+                    cache
+                        .lookup_wire(classified, Instant::now(), allow_stale)
+                        .map(Ok)
+                } else {
+                    cache
+                        .lookup_with_ttl(
+                            &parsed_query.question.name,
+                            parsed_query.question.query_type,
+                            Instant::now(),
+                            allow_stale,
+                        )
+                        .map(|(value, ttl)| synthesize_response(&parsed_query, &value, ttl))
+                };
+                match cached {
+                    super::CacheLookup::Fresh(wire) => {
                         super::trace::record("cache");
+                        self.resource_stats.dns_cache_hit();
+                        return wire;
+                    }
+                    super::CacheLookup::Stale(wire) => {
+                        let wire = wire?;
+                        let response =
+                            parse_response(&wire).map_err(RuntimeDnsError::InvalidResponse)?;
+                        self.stale_hints(&response)?;
+                        self.refresh_stale(query, classified, *epoch, &mut cache);
+                        super::trace::record("stale-cache");
                         self.resource_stats.dns_cache_hit();
                         return Ok(wire);
                     }
-                } else if let Some((cached, remaining_ttl)) = cache.get_with_ttl(
-                    &parsed_query.question.name,
-                    parsed_query.question.query_type,
-                    Instant::now(),
-                ) {
-                    super::trace::record("cache");
-                    self.resource_stats.dns_cache_hit();
-                    return synthesize_response(&parsed_query, &cached, remaining_ttl);
+                    super::CacheLookup::Miss => {}
                 }
                 if self.nameservers.is_empty() {
                     return finish_shared_result(
@@ -2315,10 +2511,23 @@ impl RuntimeDns {
             let (role, epoch) = {
                 let epoch = self.cache_epoch.read().await;
                 let mut cache = self.cache.lock().await;
-                if let Some(response) = cache.get_opaque(classified, Instant::now()) {
-                    super::trace::record("cache");
-                    self.resource_stats.dns_cache_hit();
-                    return Ok(response);
+                let allow_stale = self
+                    .refresh
+                    .get()
+                    .is_some_and(|binding| !binding.owner.is_closed());
+                match cache.lookup_wire(classified, Instant::now(), allow_stale) {
+                    super::CacheLookup::Fresh(wire) => {
+                        super::trace::record("cache");
+                        self.resource_stats.dns_cache_hit();
+                        return Ok(wire);
+                    }
+                    super::CacheLookup::Stale(wire) => {
+                        self.refresh_stale(query, classified, *epoch, &mut cache);
+                        super::trace::record("stale-cache");
+                        self.resource_stats.dns_cache_hit();
+                        return Ok(wire);
+                    }
+                    super::CacheLookup::Miss => {}
                 }
                 if self.nameservers.is_empty() {
                     return finish_shared_result(
@@ -4166,6 +4375,383 @@ mod tests {
             nameserver_policies: Vec::new(),
             ..DnsConfig::default()
         }
+    }
+
+    async fn stale_seed(resolver: &RuntimeDns, name: &str, address: IpAddr) {
+        resolver
+            .cache
+            .lock()
+            .await
+            .insert_positive(
+                name,
+                QueryType::A,
+                &[address],
+                30,
+                Instant::now() - Duration::from_secs(31),
+            )
+            .unwrap();
+    }
+
+    async fn stale_wait(mut ready: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_roles_bind_one_owner_and_new_trees_only_share_budget() {
+        let mut configuration = config(false, vec![nameserver(1, DnsTransport::Udp)]);
+        configuration.proxy_nameservers = configuration.nameservers.clone();
+        configuration.direct_nameservers = configuration.nameservers.clone();
+        let egress = Arc::new(MockDispatcher::default());
+        let old = Arc::new(RuntimeDns::new(&configuration, egress.clone()));
+        old.enable_refresh(None);
+        let current =
+            Arc::new(RuntimeDns::new(&configuration, egress).with_mapping_from(Some(&old)));
+        current.enable_refresh(Some(&old));
+        for root in [&old, &current] {
+            for role in [
+                root.bootstrap.as_ref().unwrap(),
+                root.proxy_resolver.as_ref().unwrap(),
+                root.direct_resolver.as_ref().unwrap(),
+            ] {
+                assert!(Arc::ptr_eq(
+                    &root.refresh.get().unwrap().owner,
+                    &role.refresh.get().unwrap().owner
+                ));
+            }
+        }
+        old.retire_configuration_hints();
+        for role in [
+            &current,
+            current.bootstrap.as_ref().unwrap(),
+            current.proxy_resolver.as_ref().unwrap(),
+            current.direct_resolver.as_ref().unwrap(),
+        ] {
+            assert!(!role.refresh.get().unwrap().owner.is_closed());
+        }
+        old.shutdown().await;
+        current.shutdown().await;
+    }
+
+    #[cfg(any(feature = "outbound-wireguard", feature = "outbound-masque"))]
+    #[tokio::test]
+    async fn stale_refresh_private_nodes_share_budget_without_stopping_parent() {
+        let configuration = config(false, vec![nameserver(1, DnsTransport::Udp)]);
+        let egress = Arc::new(MockDispatcher::default());
+        let root = Arc::new(RuntimeDns::new(&configuration, egress.clone()));
+        root.enable_refresh(None);
+        let resolution = super::super::resolution::ResolutionContext::runtime(false);
+        resolution.bind_runtime(Some(&root)).unwrap();
+        let private = Arc::new(RuntimeDns::new_for_node(
+            &configuration,
+            egress.clone(),
+            resolution.clone(),
+            crate::security::SecurityContext::new(),
+        ));
+        private.enable_refresh(None);
+        assert!(Arc::ptr_eq(
+            &root.refresh.get().unwrap().owner.budget,
+            &private.refresh.get().unwrap().owner.budget
+        ));
+        assert!(!Arc::ptr_eq(
+            &root.refresh.get().unwrap().owner,
+            &private.refresh.get().unwrap().owner
+        ));
+        private.shutdown().await;
+        assert!(!root.refresh.get().unwrap().owner.is_closed());
+        #[cfg(feature = "outbound-masque")]
+        {
+            let masque = RuntimeDns::new_for_masque_node(
+                &configuration,
+                egress,
+                resolution,
+                crate::security::SecurityContext::new(),
+            );
+            assert!(Arc::ptr_eq(
+                &root.refresh.get().unwrap().owner.budget,
+                &masque.refresh.get().unwrap().owner.budget
+            ));
+            masque.shutdown().await;
+            assert!(!root.refresh.get().unwrap().owner.is_closed());
+        }
+        root.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_typed_answers_do_not_replay_upstream_authenticated_flags() {
+        let configuration = config(false, vec![nameserver(1, DnsTransport::Udp)]);
+        let dns = Arc::new(RuntimeDns::new(
+            &configuration,
+            Arc::new(MockDispatcher::default()),
+        ));
+        dns.enable_refresh(None);
+        let query = build_query(1, "ordinary.example", QueryType::A).unwrap();
+        let parsed = parse_query(&query).unwrap();
+        let classified = classify_query(&query).unwrap();
+        let mut upstream =
+            response_for_query(&query, &ResponseSpec::answer("192.0.2.50".parse().unwrap()));
+        upstream[3] |= 0x20;
+        let response = parse_response(&upstream).unwrap();
+        dns.cache_response(&response, &classified, &upstream, 0)
+            .await
+            .unwrap();
+        let super::super::CacheLookup::Stale((cached, ttl)) =
+            dns.cache.lock().await.lookup_with_ttl(
+                "ordinary.example",
+                QueryType::A,
+                Instant::now() + Duration::from_secs(61),
+                true,
+            )
+        else {
+            panic!("ordinary typed result retains only IP semantics");
+        };
+        let wire = synthesize_response(&parsed, &cached, ttl).unwrap();
+        assert_eq!(u16::from_be_bytes([wire[2], wire[3]]) & 0x0030, 0);
+        assert_eq!(&wire[8..12], &[0, 0, 0, 0]);
+        dns.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_returns_immediately_deduplicates_and_restores_hints() {
+        let old = "192.0.2.10".parse().unwrap();
+        let new = "192.0.2.11".parse().unwrap();
+        let release = Arc::new(Notify::new());
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            vec![MockReply::Gated {
+                response: ResponseSpec::answer(new),
+                release: release.clone(),
+            }],
+            vec![],
+        ));
+        let dns = Arc::new(RuntimeDns::new(
+            &config(false, vec![nameserver(1, DnsTransport::Udp)]),
+            dispatcher.clone(),
+        ));
+        dns.enable_refresh(None);
+        stale_seed(&dns, "stale.example", old).await;
+        for id in 1..=32 {
+            let wire = dns
+                .exchange(&build_query(id, "stale.example", QueryType::A).unwrap())
+                .await
+                .unwrap();
+            let parsed = parse_response(&wire).unwrap();
+            assert_eq!(parsed.id, id);
+            assert_eq!(parsed.answers[0].ttl, 1);
+            assert_eq!(matching_answer_set(&parsed).unwrap().addresses, [old]);
+        }
+        stale_wait(|| dispatcher.udp_calls.load(Ordering::Acquire) == 1).await;
+        assert_eq!(dns.singleflight.len(), 1);
+        assert_eq!(dns.domain_hint(old).await.as_deref(), Some("stale.example"));
+        release.notify_waiters();
+        stale_wait(|| dns.singleflight.len() == 0).await;
+        let wire = dns
+            .exchange(&build_query(33, "stale.example", QueryType::A).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            matching_answer_set(&parse_response(&wire).unwrap())
+                .unwrap()
+                .addresses,
+            [new]
+        );
+        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 1);
+        dns.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_failure_backs_off_without_losing_the_resident() {
+        let old = "192.0.2.20".parse().unwrap();
+        let new = "192.0.2.21".parse().unwrap();
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            vec![
+                MockReply::TransportError,
+                MockReply::Response(ResponseSpec::answer(new)),
+            ],
+            vec![],
+        ));
+        let dns = Arc::new(RuntimeDns::new(
+            &config(false, vec![nameserver(1, DnsTransport::Udp)]),
+            dispatcher.clone(),
+        ));
+        dns.enable_refresh(None);
+        stale_seed(&dns, "retry.example", old).await;
+        let query = build_query(1, "retry.example", QueryType::A).unwrap();
+        dns.exchange(&query).await.unwrap();
+        stale_wait(|| {
+            dispatcher.udp_calls.load(Ordering::Acquire) == 1 && dns.singleflight.len() == 0
+        })
+        .await;
+        for _ in 0..16 {
+            dns.exchange(&query).await.unwrap();
+        }
+        assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 1);
+        let classified = classify_query(&query).unwrap();
+        dns.cache
+            .lock()
+            .await
+            .finish_refresh(&classified, Instant::now(), Duration::ZERO);
+        dns.exchange(&query).await.unwrap();
+        stale_wait(|| {
+            dispatcher.udp_calls.load(Ordering::Acquire) == 2 && dns.singleflight.len() == 0
+        })
+        .await;
+        let wire = dns.exchange(&query).await.unwrap();
+        assert_eq!(
+            matching_answer_set(&parse_response(&wire).unwrap())
+                .unwrap()
+                .addresses,
+            [new]
+        );
+        dns.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_shared_budget_keeps_generation_stop_owners_separate() {
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            (0..5).map(|_| MockReply::Pending).collect(),
+            vec![],
+        ));
+        let configuration = config(false, vec![nameserver(1, DnsTransport::Udp)]);
+        let old = Arc::new(RuntimeDns::new(&configuration, dispatcher.clone()));
+        old.enable_refresh(None);
+        let current = Arc::new(
+            RuntimeDns::new(&configuration, dispatcher.clone()).with_mapping_from(Some(&old)),
+        );
+        current.enable_refresh(Some(&old));
+        assert!(Arc::ptr_eq(
+            &old.refresh.get().unwrap().owner.budget,
+            &current.refresh.get().unwrap().owner.budget
+        ));
+        assert!(!Arc::ptr_eq(
+            &old.refresh.get().unwrap().owner,
+            &current.refresh.get().unwrap().owner
+        ));
+        for index in 0..5 {
+            let name = format!("budget{index}.example");
+            stale_seed(&old, &name, "192.0.2.30".parse().unwrap()).await;
+            old.exchange(&build_query(index, &name, QueryType::A).unwrap())
+                .await
+                .unwrap();
+        }
+        stale_wait(|| dispatcher.udp_calls.load(Ordering::Acquire) == 4).await;
+        assert_eq!(old.singleflight.len(), 4);
+        stale_seed(&current, "current.example", "192.0.2.31".parse().unwrap()).await;
+        let query = build_query(7, "current.example", QueryType::A).unwrap();
+        current.exchange(&query).await.unwrap();
+        assert_eq!(current.singleflight.len(), 0);
+        old.shutdown().await;
+        assert_eq!(old.singleflight.len(), 0);
+        assert!(!current.refresh.get().unwrap().owner.is_closed());
+        current.exchange(&query).await.unwrap();
+        stale_wait(|| dispatcher.udp_calls.load(Ordering::Acquire) == 5).await;
+        current.shutdown().await;
+        assert_eq!(current.singleflight.len(), 0);
+        assert_eq!(
+            current
+                .refresh
+                .get()
+                .unwrap()
+                .owner
+                .budget
+                .available_permits(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_flush_and_retirement_cannot_refill_current_state() {
+        let release = Arc::new(Notify::new());
+        let old = "192.0.2.40".parse().unwrap();
+        let late = "192.0.2.41".parse().unwrap();
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            vec![
+                MockReply::Gated {
+                    response: ResponseSpec::answer(late),
+                    release: release.clone(),
+                },
+                MockReply::Pending,
+            ],
+            vec![],
+        ));
+        let configuration = config(false, vec![nameserver(1, DnsTransport::Udp)]);
+        let dns = Arc::new(RuntimeDns::new(&configuration, dispatcher.clone()));
+        dns.enable_refresh(None);
+        stale_seed(&dns, "epoch.example", old).await;
+        let query = build_query(1, "epoch.example", QueryType::A).unwrap();
+        dns.exchange(&query).await.unwrap();
+        stale_wait(|| dispatcher.udp_calls.load(Ordering::Acquire) == 1).await;
+        dns.flush_cache().await;
+        release.notify_waiters();
+        stale_wait(|| dns.singleflight.len() == 0).await;
+        assert!(dns.cache.lock().await.is_empty());
+        assert!(dns.domain_hint(late).await.is_none());
+        stale_seed(&dns, "epoch.example", old).await;
+        dns.exchange(&query).await.unwrap();
+        stale_wait(|| dispatcher.udp_calls.load(Ordering::Acquire) == 2).await;
+        let current =
+            Arc::new(RuntimeDns::new(&configuration, dispatcher).with_mapping_from(Some(&dns)));
+        current.enable_refresh(Some(&dns));
+        {
+            let _publication = current.configuration_publication().await;
+            dns.retire_configuration_hints();
+        }
+        dns.refresh.get().unwrap().owner.shutdown().await;
+        assert_eq!(dns.singleflight.len(), 0);
+        assert!(current.cache.lock().await.is_empty());
+        assert!(current.domain_hint(old).await.is_none());
+        assert!(!current.refresh.get().unwrap().owner.is_closed());
+        dns.shutdown().await;
+        current.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_refresh_opaque_uses_wire_cache_and_stop_joins_its_flight() {
+        let dispatcher = Arc::new(MockDispatcher::with_replies(
+            vec![MockReply::Pending],
+            vec![],
+        ));
+        let dns = Arc::new(RuntimeDns::new(
+            &config(false, vec![nameserver(1, DnsTransport::Udp)]),
+            dispatcher.clone(),
+        ));
+        dns.enable_refresh(None);
+        let query = opaque_query(1, "txt-stale.example", 16);
+        let classified = classify_query(&query).unwrap();
+        let mut wire = super::super::synthesize_empty_response(&classified, 0).unwrap();
+        wire[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        wire.extend_from_slice(&[
+            0xc0, 0x0c, 0, 16, 0, 1, 0, 0, 0, 30, 0, 4, 3, b'o', b'l', b'd',
+        ]);
+        let validated = validate_opaque_response(&classified, &wire).unwrap();
+        dns.cache
+            .lock()
+            .await
+            .insert_opaque(&validated, Instant::now() - Duration::from_secs(31));
+        for _ in 0..16 {
+            let response = dns.exchange(&query).await.unwrap();
+            assert_eq!(&response[response.len() - 4..], &[3, b'o', b'l', b'd']);
+        }
+        stale_wait(|| dispatcher.udp_calls.load(Ordering::Acquire) == 1).await;
+        assert_eq!(dns.singleflight.len(), 1);
+        assert!(
+            dns.domain_hint("192.0.2.1".parse().unwrap())
+                .await
+                .is_none()
+        );
+        tokio::time::timeout(Duration::from_secs(1), dns.shutdown())
+            .await
+            .unwrap();
+        assert_eq!(dns.singleflight.len(), 0);
+        assert_eq!(dns.resource_stats.snapshot().dns_current, 0);
+        assert_eq!(
+            dns.refresh.get().unwrap().owner.budget.available_permits(),
+            4
+        );
     }
 
     #[test]

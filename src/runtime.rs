@@ -846,6 +846,7 @@ impl GraphBuilder {
             )?,
         ));
         if let Some(dns) = &dns {
+            dns.enable_refresh(self.previous_dns.as_deref());
             dns.network_sources().register(dns);
         }
         proxy_graph.resolution.bind_runtime(dns.as_ref())?;

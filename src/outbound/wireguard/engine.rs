@@ -31,7 +31,7 @@ pub(super) struct Engine {
     pub ipv6: Option<Ipv6Addr>,
     pub mtu: usize,
     pub resolution: ResolutionContext,
-    pub remote: OnceLock<crate::dns::runtime::RuntimeDns>,
+    pub remote: OnceLock<Arc<crate::dns::runtime::RuntimeDns>>,
     pub config: Arc<WireGuardOutboundConfig>,
     routes: Arc<Routes>,
     upstream: UpstreamPath,

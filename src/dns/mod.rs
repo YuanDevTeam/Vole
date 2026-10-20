@@ -1236,6 +1236,36 @@ impl DnsCache {
         )
     }
 
+    fn refresh_key(query: &ClassifiedDnsQuery) -> cache::Key {
+        if let DnsQueryKind::Address(kind) = query.kind
+            && !query.needs_wire_cache
+        {
+            cache::Key::Address(query.question.name.clone(), kind)
+        } else {
+            cache::Key::Opaque(query.question.clone(), query.semantics_digest)
+        }
+    }
+
+    pub(crate) fn reserve_refresh(
+        &mut self,
+        query: &ClassifiedDnsQuery,
+        now: Instant,
+        backoff: Duration,
+    ) -> bool {
+        self.store
+            .reserve_refresh(&Self::refresh_key(query), now, backoff)
+    }
+
+    pub(crate) fn finish_refresh(
+        &mut self,
+        query: &ClassifiedDnsQuery,
+        now: Instant,
+        backoff: Duration,
+    ) {
+        self.store
+            .finish_refresh(&Self::refresh_key(query), now, backoff);
+    }
+
     /// An opaque hit restores the caller's ID/RD and remaining record TTLs.
     pub(crate) fn get_opaque(
         &mut self,

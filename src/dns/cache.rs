@@ -67,6 +67,7 @@ struct Entry {
     value: Option<Value>,
     expires_at: Instant,
     stale_eligible: bool,
+    refresh_after: Instant,
     list: List,
     previous: Option<usize>,
     next: Option<usize>,
@@ -236,6 +237,31 @@ impl Store {
         }
     }
 
+    pub(super) fn reserve_refresh(&mut self, key: &Key, now: Instant, backoff: Duration) -> bool {
+        let Some(&slot) = self.index.get(key) else {
+            return false;
+        };
+        let entry = self.entry_mut(slot);
+        if entry.value.is_none()
+            || !entry.stale_eligible
+            || entry.expires_at > now
+            || entry.refresh_after > now
+        {
+            return false;
+        }
+        entry.refresh_after = now.checked_add(backoff).unwrap_or(now);
+        true
+    }
+
+    pub(super) fn finish_refresh(&mut self, key: &Key, now: Instant, backoff: Duration) {
+        if let Some(&slot) = self.index.get(key) {
+            let entry = self.entry_mut(slot);
+            if entry.expires_at <= now {
+                entry.refresh_after = now.checked_add(backoff).unwrap_or(now);
+            }
+        }
+    }
+
     pub(super) fn insert(
         &mut self,
         key: Key,
@@ -334,6 +360,7 @@ impl Store {
             value: Some(value),
             expires_at,
             stale_eligible,
+            refresh_after: expires_at,
             list: destination,
             previous: None,
             next: None,
