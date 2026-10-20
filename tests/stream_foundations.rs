@@ -15,7 +15,7 @@ fn transport_options_reject_ambiguous_headers_before_io() {
         assert!(WebSocketOptions::new("ws://example.com/", headers.clone(), None).is_err());
         assert!(HttpObfsOptions::new(http::Method::GET, "http://example.com/", headers).is_err());
     }
-    for maximum in [0, 2049] {
+    for maximum in [0] {
         assert!(
             WebSocketOptions::new(
                 "ws://example.com/",
@@ -260,10 +260,10 @@ async fn websocket_early_data_and_remaining_frames_keep_the_original_byte_order(
     );
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use vole::transport::{WebSocketEarlyData, WebSocketOptions, connect_websocket};
-    for maximum in [1, 2048] {
+    for maximum in [1, 2048, 4096] {
         timeout(Duration::from_secs(3), async {
             let (client, peer) = tokio::io::duplex(128);
-            let input: Vec<u8> = (0..3000).map(|value| (value % 251) as u8).collect();
+            let input: Vec<u8> = (0..6000).map(|value| (value % 251) as u8).collect();
             let expected = input.clone();
             let peer = tokio::spawn(async move {
                 let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -286,7 +286,7 @@ async fn websocket_early_data_and_remaining_frames_keep_the_original_byte_order(
                 .unwrap();
                 let mut received = observed.lock().unwrap().clone();
                 assert_eq!(received.len(), maximum);
-                while received.len() < 3000 {
+                while received.len() < 6000 {
                     if let Message::Binary(data) = ws.next().await.unwrap().unwrap() {
                         received.extend_from_slice(&data);
                     }

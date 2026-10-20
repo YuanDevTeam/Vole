@@ -25,14 +25,14 @@ H1/H2 可使用明文、标准 TLS 1.3、REALITY（经典默认、显式混合�
 | `x-padding-key` | 混淆 queryInHeader/query/cookie 时必填；header 不使用此字段 |
 | `x-padding-header` | 混淆 header/queryInHeader 时必填合法头名；其他位置不使用 |
 | `x-padding-method` | repeat-x；开启混淆后也可 tokenish，按 HPACK 编码后的长度生成 |
-| `uplink-http-method` | POST，也接受 PUT/PATCH/DELETE；不将 GET 或 OPTIONS 用于上传 |
+| `uplink-http-method` | 默认 POST，接受合法的自定义 HTTP method token；GET 下载与 OPTIONS 预检不能用于上传 |
 | `session-placement` / `session-key` | path（不填写 key）；header 默认 X-Session，query/cookie 默认 x_session |
 | `session-table` | 空：32 字符随机 hex；uuid：标准 UUID v4；或预定义/自定义去重 ASCII 字符表 |
 | `session-length` | 字符表模式默认 `"16-32"`，1–128；全部长度构成的命名空间至少 2^31。空表/uuid 不接受显式长度 |
 | `seq-placement` / `seq-key` | 仅 packet-up；path，或 header 默认 X-Seq、query/cookie 默认 x_seq |
 | `uplink-data-placement` | body，auto 归一 body；header/cookie 仅用于 packet-up |
 | `uplink-data-key` | header/cookie payload 必填，body 不接受 |
-| `uplink-chunk-size` | header/cookie 默认 `"0"` 自适应；显式区间 64–8192。自适应 header 3072–4096、cookie 2048–3072 |
+| `uplink-chunk-size` | header/cookie 默认 `"0"` 自适应；非零区间小于64归一到64，上限8192。自适应 header 3072–4096、cookie 2048–3072 |
 | `sc-max-each-post-bytes` | packet-up，`"1000000"`，1–16 MiB；这是 POST 上限，不是预分配缓冲大小 |
 | `sc-min-posts-interval-ms` | packet-up，`"10"`，0–60000 且最大值须为正；允许 `"0-N"`，不允许纯零 |
 

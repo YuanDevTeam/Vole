@@ -29,7 +29,7 @@ use tokio_tungstenite::{
 use super::{STREAM_BUFFER_BYTES as LIMIT, STREAM_CHUNK_BYTES as CHUNK};
 use crate::dispatch::BoxStream;
 
-pub const MAX_EARLY_DATA_BYTES: usize = 2048;
+pub const MAX_EARLY_DATA_BYTES: usize = (super::HTTP_HEAD_BYTES - 512) / 4 * 3;
 
 #[derive(Clone)]
 pub enum WebSocketEarlyData {
@@ -62,7 +62,7 @@ impl WebSocketOptions {
     pub fn new(
         uri: &str,
         headers: http::HeaderMap,
-        early_data: Option<WebSocketEarlyData>,
+        mut early_data: Option<WebSocketEarlyData>,
     ) -> io::Result<Self> {
         use super::http_head::{HTTP_HEAD_BYTES, HTTP_HEADER_COUNT};
         let uri: http::Uri = uri.parse().map_err(|_| invalid_options())?;
@@ -99,24 +99,29 @@ impl WebSocketOptions {
         if size > HTTP_HEAD_BYTES {
             return Err(invalid_options());
         }
-        if let Some(early) = &early_data {
-            let maximum = match early {
+        if let Some(early) = &mut early_data {
+            let (maximum, name_bytes) = match early {
                 WebSocketEarlyData::Header { name, max_bytes } => {
-                    if reserved(name) || name == "host" || headers.contains_key(name) {
+                    if reserved(name) || name == "host" || headers.contains_key(&*name) {
                         return Err(invalid_options());
                     }
-                    *max_bytes
+                    (max_bytes, name.as_str().len())
                 }
                 WebSocketEarlyData::Path { max_bytes } => {
                     if uri.query().is_some() {
                         return Err(invalid_options());
                     }
-                    *max_bytes
+                    (max_bytes, 0)
                 }
             };
-            if !(1..=MAX_EARLY_DATA_BYTES).contains(&maximum) {
+            // A configured limit is a ceiling, not a reservation. Keep the
+            // Base64 value inside this request's actual bounded head budget.
+            let capacity =
+                HTTP_HEAD_BYTES.saturating_sub(size.saturating_add(512 + name_bytes)) / 4 * 3;
+            if *maximum == 0 || capacity == 0 {
                 return Err(invalid_options());
             }
+            *maximum = (*maximum).min(capacity).min(MAX_EARLY_DATA_BYTES);
         }
         Ok(Self {
             uri,

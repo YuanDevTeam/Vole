@@ -314,10 +314,13 @@ impl RawTrojan {
         ) {
             ("tcp", None, None) => TrojanTransport::Tcp,
             ("ws", ws, None) => {
-                let ws = ws.unwrap_or_default();
-                if ws.max_early_data > 2048
-                    || (ws.max_early_data == 0 && ws.early_data_header_name.is_some())
-                {
+                let mut ws = ws.unwrap_or_default();
+                super::vmess::normalize_ws_early_data(
+                    &mut ws.path,
+                    &mut ws.max_early_data,
+                    &mut ws.early_data_header_name,
+                )?;
+                if ws.max_early_data == 0 && ws.early_data_header_name.is_some() {
                     return invalid("invalid Trojan WebSocket early-data options");
                 }
                 let transport = TrojanTransport::WebSocket {

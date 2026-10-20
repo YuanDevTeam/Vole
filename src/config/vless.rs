@@ -190,7 +190,12 @@ impl RawVless {
         let mut stream_options = VlessStreamOptions::default();
         let ws = self
             .ws
-            .map(|ws| {
+            .map(|mut ws| {
+                vmess::normalize_ws_early_data(
+                    &mut ws.path,
+                    &mut ws.max_early_data,
+                    &mut ws.early_data_header_name,
+                )?;
                 if (ws.fast_open && !ws.http_upgrade)
                     || (ws.http_upgrade
                         && ws.early_data_header_name.as_ref().is_some_and(|name| {

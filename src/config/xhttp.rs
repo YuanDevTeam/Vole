@@ -118,13 +118,13 @@ impl XHttpRequestOptions {
         if post_interval_ms.max == 0 {
             return invalid("XHTTP post interval must have a positive maximum");
         }
-        let uplink_method = match nonempty(raw.uplink_http_method.as_deref()).unwrap_or("POST") {
-            "POST" => http::Method::POST,
-            "PUT" => http::Method::PUT,
-            "PATCH" => http::Method::PATCH,
-            "DELETE" => http::Method::DELETE,
-            _ => return invalid("unsupported XHTTP uplink method"),
-        };
+        let uplink_method = nonempty(raw.uplink_http_method.as_deref())
+            .unwrap_or("POST")
+            .parse::<http::Method>()
+            .map_err(|_| crate::VoleError::InvalidConfig("invalid XHTTP uplink method".into()))?;
+        if matches!(uplink_method, http::Method::GET | http::Method::OPTIONS) {
+            return invalid("XHTTP download and preflight methods cannot carry upload data");
+        }
         let options = Self {
             no_grpc_header: raw.no_grpc_header,
             padding: XHttpPadding::normalize(raw, headers)?,
@@ -288,9 +288,8 @@ impl DataPlacement {
                 }
             };
         }
-        if size.min < 64 {
-            return invalid("XHTTP explicit header/cookie chunk size must be at least 64");
-        }
+        size.min = size.min.max(64);
+        size.max = size.max.max(size.min);
         Ok(Self::Chunks {
             key: key.clone(),
             cookie: placement == "cookie",
@@ -688,4 +687,31 @@ pub(super) fn reserved_header(name: &HeaderName) -> bool {
             | "content-type"
             | "referer"
     )
+}
+
+#[cfg(test)]
+mod request_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn custom_upload_method_and_small_chunks_keep_bounded_request_options() {
+        let raw = serde_json::from_value(serde_json::json!({
+            "uplink-http-method":"PROPFIND",
+            "uplink-data-placement":"header",
+            "uplink-data-key":"X-Payload",
+            "uplink-chunk-size":1
+        }))
+        .unwrap();
+        let options = XHttpRequestOptions::normalize(
+            &raw,
+            &XHttpHeaders::default(),
+            super::super::XHttpMode::PacketUp,
+        )
+        .unwrap();
+        assert_eq!(options.uplink_method.as_str(), "PROPFIND");
+        let DataPlacement::Chunks { size, .. } = options.data else {
+            panic!("chunks")
+        };
+        assert_eq!((size.min, size.max), (64, 64));
+    }
 }

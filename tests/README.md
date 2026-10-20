@@ -28,6 +28,10 @@ Windows的UWP/Wintun feature互斥，应明确选择后端，不使用`--all-fea
 客户端凭据与输入（纯内存）：`config::tests::client_uuid_`、
 `config::vmess::cipher_compatibility_tests::`、`config::hysteria2::p08_tests::hopping_`。
 实际映射凭据、端口跳跃和各协议数据面由真实 TUN 另验收。
+WS 查询和头预算：`config::vmess::websocket_query_tests::` 与内存 duplex 的
+`--test stream_foundations websocket_early_data_and_remaining_frames_keep_the_original_byte_order`；
+XHTTP 输入和自定义上行方法：`--test xhttp_config`、
+`--test xhttp_requests packet_metadata_and_upload_methods_are_sent_in_each_supported_location`。
 
 TFO 纯内存策略与生命周期：
 `config::functional::tests::node_tfo_is_explicit_and_does_not_inherit_across_proxy_chain`、

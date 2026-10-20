@@ -488,6 +488,7 @@ async fn packet_metadata_and_upload_methods_are_sent_in_each_supported_location(
         ("query", "PUT"),
         ("header", "PATCH"),
         ("cookie", "DELETE"),
+        ("path", "PROPFIND"),
     ] {
         let mut options = serde_json::json!({"mode":"packet-up","session-placement":placement,
             "seq-placement":placement,"session-table":"number","session-length":"10","uplink-http-method":method});

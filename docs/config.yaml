@@ -543,7 +543,7 @@ proxies:
     # ws-opts:
     #   path: /edge?query=1       # 默认 /，必须绝对路径
     #   headers: {Host: cover.example:443, X-Custom: value}
-    #   max-early-data: 2048    # 0–2048，默认 0
+    #   max-early-data: 4096    # 默认0；发送按实际HTTP头预算钳位，不预分配此上限
     #   early-data-header-name: Sec-WebSocket-Protocol
     #   v2ray-http-upgrade: true # 默认 false；原始流，不发送 WebSocket 帧
     #   v2ray-http-upgrade-fast-open: false # 仅 upgrade=true 可开启

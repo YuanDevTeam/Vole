@@ -229,7 +229,7 @@ fn xhttp_numeric_upload_fields_match_strings_and_retain_bounds() {
     );
 
     for (field, low, high) in [
-        ("uplink-chunk-size", 64, 8192),
+        ("uplink-chunk-size", 0, 8192),
         ("sc-max-each-post-bytes", 1, 16 * 1024 * 1024),
         ("sc-min-posts-interval-ms", 1, 60000),
     ] {

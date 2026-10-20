@@ -141,6 +141,85 @@ pub(super) struct RawWs {
     )]
     pub(super) early_data_header_name: Option<String>,
 }
+
+pub(super) fn normalize_ws_early_data(
+    path: &mut Option<String>,
+    maximum: &mut u16,
+    header: &mut Option<String>,
+) -> Result<()> {
+    let effective = path.as_deref().unwrap_or("/").split('#').next().unwrap();
+    if effective.len() > 16 * 1024 - 256 {
+        return invalid("WebSocket path exceeds HTTP head budget");
+    }
+    if let Some((base, _)) = path.as_deref().and_then(|path| path.split_once('#')) {
+        *path = Some(base.to_owned());
+    }
+    let Some((base, query)) = path.as_deref().and_then(|path| path.split_once('?')) else {
+        return Ok(());
+    };
+    let Some((_, value)) =
+        url::form_urlencoded::parse(query.as_bytes()).find(|(key, _)| key == "ed")
+    else {
+        return Ok(());
+    };
+    let Ok(value) = value.parse::<i64>() else {
+        return Ok(());
+    };
+    *maximum = if value <= 0 {
+        0
+    } else {
+        u16::try_from(value).map_err(|_| {
+            crate::VoleError::InvalidConfig("WebSocket early-data limit is out of range".into())
+        })?
+    };
+    *header = (*maximum > 0).then(|| "Sec-WebSocket-Protocol".to_owned());
+    let mut pairs = BTreeMap::<String, Vec<String>>::new();
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()).filter(|(key, _)| key != "ed")
+    {
+        pairs
+            .entry(key.into_owned())
+            .or_default()
+            .push(value.into_owned());
+    }
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    for (key, values) in pairs {
+        for value in values {
+            query.append_pair(&key, &value);
+        }
+    }
+    let query = query.finish();
+    *path = Some(if query.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{query}")
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod websocket_query_tests {
+    use super::*;
+
+    #[test]
+    fn ed_query_overrides_explicit_options_and_removes_only_ed() {
+        let mut path = Some("/transport?z=last&ed=4096&x=a%20b&ed=5".to_owned());
+        let mut maximum = 12;
+        let mut header = Some("X-Explicit".to_owned());
+        normalize_ws_early_data(&mut path, &mut maximum, &mut header).unwrap();
+        assert_eq!(path.as_deref(), Some("/transport?x=a+b&z=last"));
+        assert_eq!(maximum, 4096);
+        assert_eq!(header.as_deref(), Some("Sec-WebSocket-Protocol"));
+        path = Some("/transport?ed=0".to_owned());
+        normalize_ws_early_data(&mut path, &mut maximum, &mut header).unwrap();
+        assert_eq!(path.as_deref(), Some("/transport"));
+        assert_eq!(maximum, 0);
+        assert!(header.is_none());
+        path = Some("/transport?ed=4096&token=x#local".to_owned());
+        normalize_ws_early_data(&mut path, &mut maximum, &mut header).unwrap();
+        assert_eq!(path.as_deref(), Some("/transport?token=x"));
+        assert_eq!(maximum, 4096);
+    }
+}
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawHttp {
@@ -533,10 +612,13 @@ pub(super) fn normalize_transport(
     let transport = match (network, ws, grpc, http, h2) {
         ("tcp", None, None, None, None) => StreamTransport::Tcp,
         ("ws", ws, None, None, None) => {
-            let ws = ws.unwrap_or_default();
-            if ws.max_early_data > 2048
-                || (ws.max_early_data == 0 && ws.early_data_header_name.is_some())
-            {
+            let mut ws = ws.unwrap_or_default();
+            normalize_ws_early_data(
+                &mut ws.path,
+                &mut ws.max_early_data,
+                &mut ws.early_data_header_name,
+            )?;
+            if ws.max_early_data == 0 && ws.early_data_header_name.is_some() {
                 return invalid("invalid VMess early-data options");
             }
             for (key, value) in &ws.headers {

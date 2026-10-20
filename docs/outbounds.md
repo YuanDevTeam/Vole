@@ -329,7 +329,8 @@ WS http/1.1、gRPC h2，显式列表及实际协商均须满足传输，不能�
 用于客户端 mTLS 身份，共用标准 TLS 的验证、指纹与恢复策略。
 
 WS path 默认 /，可带 query；头字段不得覆盖握手保留头或大小写重复。early-data
-0–2048 字节，启用时默认 Sec-WebSocket-Protocol，可自定义；空头名表示路径后缀，
+按配置最大值与当前请求16KiB头预算的较小值发送，不预留配置上限。path 的 `?ed=N`
+覆盖显式ED配置并移除ed参数；启用时默认 Sec-WebSocket-Protocol，可自定义；空头名表示路径后缀，
 此时禁止 query。禁用时不能附 ED 头名。首请求头与剩余数据只按序发送一次。
 `ws-opts.v2ray-http-upgrade:true` 使用原始 HTTPUpgrade 流，不发送 WebSocket 帧。
 普通模式在有效 101 后发送剩余认证前缀；`v2ray-http-upgrade-fast-open:true` 提前
