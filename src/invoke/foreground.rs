@@ -4,6 +4,7 @@ use super::{
 };
 mod input;
 mod overrides;
+mod reload;
 pub(super) use overrides::ControllerOverrides;
 
 use serde::{Deserialize, Serialize};
@@ -250,29 +251,29 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
         .map_err(|e| io_failure("create foreground runtime", e))?;
     let ca = read_http_ca(payload.http_ca_path, http_yaml, &cwd)?;
     runtime.block_on(async {
-        let signals =
+        let mut signals =
             ShutdownSignals::register().map_err(|e| io_failure("register shutdown signals", e))?;
-        let shutdown = signals.wait();
-        tokio::pin!(shutdown);
         let cancellation = tokio_util::sync::CancellationToken::new();
         let decoding_cancellation = cancellation.clone();
-        let mut decoding = tokio::task::spawn_blocking(move || {
-            input
-                .into_yaml(Some(&decoding_cancellation))
-                .map(Zeroizing::new)
-        });
-        let mut yaml = tokio::select! {
-            biased;
-            signal = &mut shutdown => {
-                cancellation.cancel();
-                let _ = decoding.await.map_err(|_| failure("configuration decoder failed"))?;
-                signal.map_err(|e| io_failure("shutdown signal", e))?;
-                return Ok(());
-            }
-            result = &mut decoding => {
-                result.map_err(|_| failure("configuration decoder failed"))??
+        let mut decoding = tokio::task::spawn_blocking(move || input.into_loaded(&decoding_cancellation));
+        let loaded = {
+            let shutdown = signals.wait_shutdown();
+            tokio::pin!(shutdown);
+            tokio::select! {
+                biased;
+                signal = &mut shutdown => {
+                    cancellation.cancel();
+                    let _ = decoding.await.map_err(|_| failure("configuration decoder failed"))?;
+                    signal.map_err(|e| io_failure("shutdown signal", e))?;
+                    return Ok(());
+                }
+                result = &mut decoding => result.map_err(|_| failure("configuration decoder failed"))??,
             }
         };
+        let mut yaml = loaded.yaml;
+        let reload = loaded.reload.map(|input| reload::ReloadContext {
+            input, directory: paths.data_dir.clone(), overrides: Arc::new(overrides.clone()),
+        });
         registry()
             .initialize_path(&paths.data_dir)
             .map_err(|_| failure("data directory initialization failed"))?;
@@ -293,7 +294,7 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
             cancellation: Some(cancellation.clone()),
             foreground_overrides: overrides,
         });
-        let result = run_controller(controller, startup, shutdown, cancellation).await;
+        let result = run_controller(controller, startup, signals, cancellation, reload).await;
         let stopped = cleanup.destroy();
         result.and(stopped)
     })?;
@@ -355,10 +356,10 @@ impl Drop for ForegroundInstance {
 async fn run_controller(
     controller: Arc<CoreController>,
     config: StartupConfig,
-    shutdown: impl std::future::Future<Output = io::Result<()>>,
+    mut signals: ShutdownSignals,
     cancellation: tokio_util::sync::CancellationToken,
+    reload: Option<reload::ReloadContext>,
 ) -> Result<(), InvokeFailure> {
-    tokio::pin!(shutdown);
     let starting = controller.clone();
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let mut startup = tokio::task::spawn_blocking(move || {
@@ -366,8 +367,12 @@ async fn run_controller(
             invoke_instance_guarded(&starting, || starting.start_config(config))
         })
     });
-    if !await_startup(&mut startup, shutdown.as_mut(), Some(&cancellation)).await? {
-        return Ok(());
+    {
+        let shutdown = signals.wait_shutdown();
+        tokio::pin!(shutdown);
+        if !await_startup(&mut startup, shutdown.as_mut(), Some(&cancellation)).await? {
+            return Ok(());
+        }
     }
     // Copy a completion subscription without holding command admission while
     // waiting. The owner may still getState/stop/destroy through ordinary Invoke.
@@ -387,11 +392,37 @@ async fn run_controller(
             .completion
             .clone()
     };
-    if !*completion.borrow() {
+    while !*completion.borrow() {
         tokio::select! {
             biased;
-            changed=completion.changed()=> { let _=changed; },
-            signal=&mut shutdown=>return signal.map_err(|e|io_failure("shutdown signal",e)),
+            changed = completion.changed() => { let _ = changed; break; },
+            signal = signals.next() => match signal.map_err(|error| io_failure("foreground signal", error))? {
+                SignalEvent::Shutdown => return Ok(()),
+                SignalEvent::Reload => if let Some(reload) = &reload {
+                    let reload_cancel = cancellation.child_token();
+                    let applying = reload.apply(&controller, &reload_cancel);
+                    tokio::pin!(applying);
+                    let result = tokio::select! {
+                        biased;
+                        signal = signals.wait_shutdown() => {
+                            reload_cancel.cancel();
+                            let _ = applying.await;
+                            return signal.map_err(|error| io_failure("shutdown signal", error));
+                        },
+                        changed = completion.changed() => {
+                            let _ = changed;
+                            reload_cancel.cancel();
+                            let _ = applying.await;
+                            break;
+                        },
+                        result = &mut applying => result,
+                    };
+                    if let Err(error) = result {
+                        // The summary is selected locally; never include request/file contents.
+                        let _ = writeln!(io::stderr().lock(), "vole: {}", error.message);
+                    }
+                },
+            },
         }
     }
     // Joining is authoritative, including panics. Preserve its failure before
@@ -583,10 +614,17 @@ fn read_bounded_limit(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
     Ok(config)
 }
 
+enum SignalEvent {
+    Shutdown,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Reload,
+}
+
 #[cfg(unix)]
 struct ShutdownSignals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
@@ -597,15 +635,27 @@ impl ShutdownSignals {
         Ok(Self {
             interrupt: signal(SignalKind::interrupt())?,
             terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
         })
     }
 
-    async fn wait(mut self) -> io::Result<()> {
+    async fn wait_shutdown(&mut self) -> io::Result<()> {
         let received = tokio::select! {
             received = self.interrupt.recv() => received,
             received = self.terminate.recv() => received,
         };
         received.ok_or_else(|| io::Error::other("shutdown signal stream closed"))
+    }
+    async fn next(&mut self) -> io::Result<SignalEvent> {
+        let (received, event) = tokio::select! {
+            biased;
+            received = self.interrupt.recv() => (received, SignalEvent::Shutdown),
+            received = self.terminate.recv() => (received, SignalEvent::Shutdown),
+            received = self.hangup.recv() => (received, SignalEvent::Reload),
+        };
+        received
+            .ok_or_else(|| io::Error::other("foreground signal stream closed"))
+            .map(|()| event)
     }
 }
 
@@ -624,12 +674,15 @@ impl ShutdownSignals {
         })
     }
 
-    async fn wait(mut self) -> io::Result<()> {
+    async fn wait_shutdown(&mut self) -> io::Result<()> {
         let received = tokio::select! {
             received = self.interrupt.recv() => received,
             received = self.break_signal.recv() => received,
         };
         received.ok_or_else(|| io::Error::other("shutdown signal stream closed"))
+    }
+    async fn next(&mut self) -> io::Result<SignalEvent> {
+        self.wait_shutdown().await.map(|()| SignalEvent::Shutdown)
     }
 }
 
@@ -642,7 +695,10 @@ impl ShutdownSignals {
         Err(io::ErrorKind::Unsupported.into())
     }
 
-    async fn wait(self) -> io::Result<()> {
+    async fn wait_shutdown(&mut self) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    async fn next(&mut self) -> io::Result<SignalEvent> {
         Err(io::ErrorKind::Unsupported.into())
     }
 }

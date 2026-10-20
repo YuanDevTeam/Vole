@@ -365,7 +365,14 @@ GNU/Linux 的设置是进程级、一次性的，显式 allocator 环境覆盖�
 完整语义见[运行时资源策略](runtime-resource-policy.md#统一内存策略)。
 Unix 等待 SIGINT/SIGTERM，Windows 等待 Ctrl+C/Ctrl+Break；标准输入先读取，之后在
 内部准备和启动前注册信号。启动中收到信号仍等待启动工作器结束，再停止和销毁；运行期
-通过引擎完成通知等待结束，随后 join 确认结果，不持有命令锁等待信号。启动、关键数据面、
+通过引擎完成通知等待结束，随后 join 确认结果，不持有命令锁等待信号。
+Unix SIGHUP 只通过已有候选许可与工作器热更新主配置：文件源有界重读，Base64／stdin 复用首次有效 YAML。
+后者不保留 Base64、AGE 密文或原始 JSON；文件 AGE 仅保留已解析身份，不重读密钥环境或独立 HTTP 私密 CA 文件。
+同一请求启动时的具体 Controller 覆盖继续应用于新候选。错误候选保留当前配置；启动资源变化返回
+reconnect required 的本地摘要并保留当前会话，HUP 不自动 Stop/start，也不关闭或替换宿主 fd。
+候选继承活动 HTTP policy 的同一实际 payload／CA，普通 provider 更新继续正常执行；独立 HTTP 文件和
+HTTP pending 不由 HUP 读取或应用。退出信号／引擎结束取消并等待重载的已开始工作，Stop 保留原同步屏障。
+启动、关键数据面、
 信号或清理失败返回失败响应，错误保留有界摘要；操作返回前完成本次清理。
 
 ### `stop`

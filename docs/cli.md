@@ -63,6 +63,12 @@ Unix 用户目录取 `HOME`，Windows 取 `USERPROFILE`，缺失时使用工作�
 正常运行执行 `initialize → createInstance → start(configYaml)`，等待退出后
 `stop → destroyInstance`。Unix 支持 SIGINT/SIGTERM，Windows 支持 Ctrl+C/Ctrl+Break；
 退出等待内核清理完成。诊断写入有界 stderr，遵循配置的 `log-level`，不包含配置正文或凭据。
+Unix 的 SIGHUP 通过同一候选工作器重载主配置：文件源重读该文件，Base64／标准输入源复用首次
+解密后的有效 YAML，不重读标准输入、环境默认、独立 HTTP 文件或私密 CA。文件 AGE 保留已解析身份，
+不保留原始密钥文本。Controller 覆盖继续应用于候选；规则、节点与普通 provider 候选沿原热更新流程。
+坏候选、繁忙或超时保留当前会话；启动资源变化报告 reconnect required，SIGHUP 不自动停止或重连，
+需宿主协调或重启前台进程。活动 HTTP payload／CA 继续固定，HTTP provider 待应用内容不会由 SIGHUP 应用。
+退出或引擎停止会取消并等待已开始的重载工作；宿主原 TUN fd 不被替换或关闭。
 具体请求格式见 [Invoke API](invoke-api.md)。
 
 ## TUN 与发布

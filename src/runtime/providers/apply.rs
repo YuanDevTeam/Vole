@@ -159,6 +159,10 @@ impl ProviderRuntime {
                         next
                     })
                 }
+                ConfigUpdate::ReplaceTemplate(mut next) => {
+                    Arc::make_mut(&mut next).http_policy = previous.config.http_policy();
+                    Ok(next)
+                }
                 ConfigUpdate::ReplaceWithHttp {
                     yaml,
                     http,
@@ -588,6 +592,51 @@ mod http_tests {
         live.apply_update(ConfigUpdate::Replace(yaml.into()), CancellationToken::new())
             .await
             .unwrap();
+        assert!(Arc::ptr_eq(
+            &policy,
+            &live.current.load().config.http_policy().unwrap()
+        ));
+        // The foreground input form takes the same worker and active HTTP snapshot.
+        let template =
+            crate::config::providers::ProviderTemplate::update_yaml(yaml.as_bytes(), root.path())
+                .unwrap();
+        live.apply_update(
+            ConfigUpdate::ReplaceTemplate(template),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &policy,
+            &live.current.load().config.http_policy().unwrap()
+        ));
+        let invalid = crate::config::providers::ProviderTemplate::update_yaml(
+            b"rules: ['MATCH,missing']",
+            root.path(),
+        )
+        .unwrap();
+        assert!(matches!(
+            live.apply_update(
+                ConfigUpdate::ReplaceTemplate(invalid),
+                CancellationToken::new()
+            )
+            .await,
+            Err(ApplyError::InvalidConfig)
+        ));
+        let reconnect = format!("external-controller: 127.0.0.1:9999\n{yaml}");
+        let reconnect = crate::config::providers::ProviderTemplate::update_yaml(
+            reconnect.as_bytes(),
+            root.path(),
+        )
+        .unwrap();
+        assert!(matches!(
+            live.apply_update(
+                ConfigUpdate::ReplaceTemplate(reconnect),
+                CancellationToken::new()
+            )
+            .await,
+            Err(ApplyError::RestartRequired)
+        ));
         assert!(Arc::ptr_eq(
             &policy,
             &live.current.load().config.http_policy().unwrap()

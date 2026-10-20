@@ -27,6 +27,8 @@ pub(crate) enum ConfigUpdate {
     ))]
     RecoverySnapshot(mpsc::SyncSender<Box<crate::runtime::RecoverySnapshot>>),
     Replace(String),
+    // An already decoded foreground input uses the same candidate worker.
+    ReplaceTemplate(Arc<crate::config::providers::ProviderTemplate>),
     ReplaceWithHttp {
         yaml: String,
         http: String,
@@ -203,6 +205,11 @@ impl ApplyRequest {
     }
 }
 impl PendingApply {
+    #[cfg(feature = "invoke")]
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
     pub(crate) async fn wait(mut self) -> Result<(), ApplyError> {
         match tokio::time::timeout(
             std::time::Duration::from_secs(90),

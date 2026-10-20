@@ -3,7 +3,11 @@ use super::{InvokeFailure, Paths, failure, io_failure, read_config};
 use crate::{config::MAX_CONFIG_BYTES, resource::age_provider};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Deserializer};
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -52,9 +56,95 @@ pub(super) fn options(
     })
 }
 
+#[derive(Clone, Default)]
+pub(super) struct Decoder {
+    identities: Option<age_provider::Identities>,
+    invalid_identity: bool,
+}
+impl Decoder {
+    fn new(key: Option<Zeroizing<String>>) -> Self {
+        let parsed = key
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .map(|key| age_provider::Identities::parse(key));
+        drop(key);
+        match parsed {
+            Some(Ok(identities)) => Self {
+                identities: Some(identities),
+                invalid_identity: false,
+            },
+            Some(Err(_)) => Self {
+                identities: None,
+                invalid_identity: true,
+            },
+            None => Self::default(),
+        }
+    }
+    fn decode(
+        &self,
+        bytes: Zeroizing<Vec<u8>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<String, InvokeFailure> {
+        if bytes.starts_with(age_provider::ARMOR_HEADER) && self.invalid_identity {
+            return Err(failure("invalid AGE configuration identity"));
+        }
+        let control = age_provider::DecodeControl::new(
+            cancellation,
+            Instant::now() + Duration::from_secs(30),
+        );
+        let decrypted = match age_provider::decode(
+            &bytes,
+            self.identities.as_ref(),
+            &control,
+            MAX_CONFIG_BYTES,
+        )
+        .map_err(|_| failure("configuration decryption failed"))?
+        {
+            age_provider::Decoded::Plain(_) => None,
+            age_provider::Decoded::Decrypted(plaintext) => Some(plaintext),
+        };
+        let mut plaintext = decrypted.unwrap_or(bytes);
+        String::from_utf8(std::mem::take(&mut *plaintext)).map_err(|error| {
+            drop(Zeroizing::new(error.into_bytes()));
+            failure("configuration is not UTF-8")
+        })
+    }
+}
+
 pub(super) struct MainInput {
     bytes: Zeroizing<Vec<u8>>,
-    key: Option<Zeroizing<String>>,
+    decoder: Decoder,
+    file: Option<PathBuf>,
+}
+pub(super) struct LoadedInput {
+    pub(super) yaml: Zeroizing<String>,
+    pub(super) reload: Option<ReloadInput>,
+}
+#[derive(Clone)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) enum ReloadInput {
+    File { path: PathBuf, decoder: Decoder },
+    Snapshot(Arc<Zeroizing<String>>),
+}
+impl ReloadInput {
+    pub(super) fn read(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Zeroizing<String>, InvokeFailure> {
+        if cancellation.is_cancelled() {
+            return Err(failure("configuration reload cancelled"));
+        }
+        match self {
+            Self::File { path, decoder } => {
+                let bytes = read_config(path)
+                    .map_err(|error| io_failure("read configuration file", error))?;
+                decoder
+                    .decode(Zeroizing::new(bytes), Some(cancellation))
+                    .map(Zeroizing::new)
+            }
+            Self::Snapshot(yaml) => Ok(Zeroizing::new(yaml.as_str().to_owned())),
+        }
+    }
 }
 impl MainInput {
     pub(super) fn read(
@@ -64,6 +154,8 @@ impl MainInput {
         stdin: impl FnOnce() -> std::io::Result<Vec<u8>>,
     ) -> Result<Self, InvokeFailure> {
         // The alternative input is never opened, locked or probed.
+        let file = (!paths.stdin && !config.as_ref().is_some_and(|value| !value.is_empty()))
+            .then(|| paths.config_file.clone());
         let bytes = if let Some(mut encoded) = config.filter(|value| !value.is_empty()) {
             if encoded.len() > MAX_ENCODED_BYTES {
                 return Err(failure("encoded configuration exceeds byte limit"));
@@ -87,42 +179,38 @@ impl MainInput {
         if bytes.len() > MAX_CONFIG_BYTES {
             return Err(failure("configuration exceeds byte limit"));
         }
-        Ok(Self { bytes, key })
+        Ok(Self {
+            bytes,
+            decoder: Decoder::new(key),
+            file,
+        })
     }
 
     pub(super) fn into_yaml(
         self,
         cancellation: Option<&CancellationToken>,
     ) -> Result<String, InvokeFailure> {
-        let Self { bytes, key } = self;
-        // A supplied key does not add a failure path to an ordinary YAML input.
-        let identities = if bytes.starts_with(age_provider::ARMOR_HEADER) {
-            key.as_deref()
-                .filter(|value| !value.is_empty())
-                .map(|key| age_provider::Identities::parse(key))
-                .transpose()
-                .map_err(|_| failure("invalid AGE configuration identity"))?
-        } else {
+        self.decoder.decode(self.bytes, cancellation)
+    }
+    pub(super) fn into_loaded(
+        self,
+        cancellation: &CancellationToken,
+    ) -> Result<LoadedInput, InvokeFailure> {
+        let yaml = Zeroizing::new(self.decoder.decode(self.bytes, Some(cancellation))?);
+        #[cfg(unix)]
+        let reload = Some(match self.file {
+            Some(path) => ReloadInput::File {
+                path,
+                decoder: self.decoder,
+            },
+            None => ReloadInput::Snapshot(Arc::new(Zeroizing::new(yaml.as_str().to_owned()))),
+        });
+        #[cfg(not(unix))]
+        let reload = {
+            let _ = (&self.file, &self.decoder);
             None
         };
-        drop(key);
-        let control = age_provider::DecodeControl::new(
-            cancellation,
-            Instant::now() + Duration::from_secs(30),
-        );
-        let decrypted =
-            match age_provider::decode(&bytes, identities.as_ref(), &control, MAX_CONFIG_BYTES)
-                .map_err(|_| failure("configuration decryption failed"))?
-            {
-                age_provider::Decoded::Plain(_) => None,
-                age_provider::Decoded::Decrypted(plaintext) => Some(plaintext),
-            };
-        // unwrap_or consumes and clears ciphertext when a plaintext allocation exists.
-        let mut plaintext = decrypted.unwrap_or(bytes);
-        String::from_utf8(std::mem::take(&mut *plaintext)).map_err(|error| {
-            drop(Zeroizing::new(error.into_bytes()));
-            failure("configuration is not UTF-8")
-        })
+        Ok(LoadedInput { yaml, reload })
     }
 }
 
@@ -250,6 +338,55 @@ mod tests {
             || panic!("stdin read"),
         );
         assert!(input.is_err());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn reload_reuses_snapshot_bytes_and_rereads_only_the_main_file() {
+        let cancellation = CancellationToken::new();
+        let input = MainInput::read(
+            private(&STANDARD.encode(b"rules: ['MATCH,DIRECT']")),
+            None,
+            &paths(true),
+            || panic!("stdin read"),
+        )
+        .unwrap();
+        let loaded = input.into_loaded(&cancellation).unwrap();
+        assert_eq!(
+            *loaded.reload.as_ref().unwrap().read(&cancellation).unwrap(),
+            *loaded.yaml
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("config.yaml");
+        std::fs::write(&file, b"rules: ['MATCH,DIRECT']").unwrap();
+        let mut selected = paths(false);
+        selected.config_file = file.clone();
+        let identity = include_str!("../../../tests/fixtures/provider-age/x25519.key");
+        let loaded = MainInput::read(None, private(identity), &selected, || panic!("stdin read"))
+            .unwrap()
+            .into_loaded(&cancellation)
+            .unwrap();
+        std::fs::write(&file, b"rules: ['MATCH,REJECT']").unwrap();
+        assert_eq!(
+            &**loaded.reload.as_ref().unwrap().read(&cancellation).unwrap(),
+            "rules: ['MATCH,REJECT']"
+        );
+        std::fs::write(
+            &file,
+            include_bytes!("../../../tests/fixtures/provider-age/x25519.age"),
+        )
+        .unwrap();
+        assert_eq!(
+            loaded
+                .reload
+                .as_ref()
+                .unwrap()
+                .read(&cancellation)
+                .unwrap()
+                .as_str(),
+            include_str!("../../../tests/fixtures/provider-age/provider.yaml")
+        );
+        cancellation.cancel();
+        assert!(loaded.reload.as_ref().unwrap().read(&cancellation).is_err());
     }
     #[test]
     fn foreground_envelope_checks_decoded_lengths_without_disclosing_values() {

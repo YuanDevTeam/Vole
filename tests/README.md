@@ -192,7 +192,9 @@ HTTP 内容或来源上下文变更要求显式重连。失败恢复的策略组
 `cli::tests::http_addendum_option_only_transports_an_explicit_native_path`。
 `invoke::foreground::overrides::tests::` 检查具体 Controller 覆盖、空值保留及沿用地址解析器；
 `invoke::foreground::input::tests::` 检查 Base64 来源优先、标准 padding、认证 AGE 固定向量、
-输入预算与取消；`invoke::tests::owned_invoke_uses_the_shared_strict_and_runtime_thread_boundaries`
+输入预算、取消、单份有效输入复用与主文件重读；
+`runtime::providers::apply::http_tests::routing_updates_keep_active_http_and_changed_http_requires_reconnect`
+同时检查 foreground 内部模板输入共用候选工作器、坏候选保留与启动资源变化拒绝。`invoke::tests::owned_invoke_uses_the_shared_strict_and_runtime_thread_boundaries`
 检查 CLI 的 owned 请求与借用请求共用严格准入和重入边界。
 `invoke::foreground::tests::` 检查显式文件与路径、校验不初始化、不自动加载 HTTP 文件、
 MITM 关闭不读 CA、无 HTTP 配置的 CA 参数提前拒绝，以及启动期信号取消后 join 清理。
