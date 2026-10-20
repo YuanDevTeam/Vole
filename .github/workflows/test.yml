@@ -19,7 +19,7 @@ env:
 jobs:
   client-contracts:
     name: ${{ matrix.name }}
-    runs-on: macos-26
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -44,6 +44,10 @@ jobs:
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "0.12"
+      - name: Linux native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake ninja-build perl pkg-config
       - name: Prepare official BLAKE3 static dependency
         shell: bash
         run: uv run --project scripts --locked vole-scripts deps --github-env "$GITHUB_ENV"

@@ -20,6 +20,7 @@ uv run --project scripts --locked ruff format --check scripts
 宿主只运行明确的无网络对端回归，全目标测试仅编译。`invoke::tests::`包含监听器用例，
 不能整体在宿主执行。CI完整过滤器以[Tests workflow](../.github/workflows/test.yml)为准；
 CI使用Debug和继承Release优化的`ci-release`，正式产物使用标准`release`。
+Core Debug、Release 和 Quality 测试使用 Ubuntu 26.04；发布构建的 Linux runner 保持 Ubuntu 24.04。
 Windows的UWP/Wintun feature互斥，应明确选择后端，不使用`--all-features`。
 
 ## 定向回归
