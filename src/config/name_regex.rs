@@ -50,17 +50,39 @@ impl<'a> Budget<'a> {
     }
 }
 
-pub(super) enum NameRegex {
+pub(super) struct NameRegex {
+    engine: Engine,
+    numbers: Option<Box<[usize]>>,
+}
+
+enum Engine {
     Fast(regex::Regex),
     Complex(Box<fancy_regex::Regex>),
 }
 impl NameRegex {
     pub fn new(pattern: &str) -> Result<Self> {
-        if let Ok(regex) = regex::Regex::new(pattern) {
-            return Ok(Self::Fast(regex));
-        }
         if pattern.len() > PATTERN_BYTES {
             return Err(error("provider expression compilation budget exceeded"));
+        }
+        let translated = super::domain_regex::common_dialect(pattern)
+            .map_err(|_| error("invalid or unsupported provider/group expression syntax"))?;
+        let (translated, numbers) = super::domain_regex::capture_dialect(&translated)
+            .map_err(|_| error("invalid or unsupported provider/group capture syntax"))?;
+        let capture_count = numbers.len();
+        let numbers = (!numbers
+            .iter()
+            .enumerate()
+            .all(|(index, &number)| index == number))
+        .then(|| numbers.into_boxed_slice());
+        let pattern = translated.as_str();
+        if let Ok(regex) = regex::Regex::new(pattern) {
+            if regex.captures_len() != capture_count {
+                return Err(error("unsupported provider/group capture layout"));
+            }
+            return Ok(Self {
+                engine: Engine::Fast(regex),
+                numbers,
+            });
         }
         let tree = fancy_regex::Expr::parse_tree(pattern)
             .map_err(|_| error("invalid provider/group expression"))?;
@@ -99,13 +121,24 @@ impl NameRegex {
             .delegate_dfa_size_limit(512 * 1024)
             .build()
             .map_err(|_| error("invalid provider/group expression"))?;
-        Ok(Self::Complex(Box::new(regex)))
+        if regex.captures_len() != capture_count {
+            return Err(error("unsupported provider/group capture layout"));
+        }
+        Ok(Self {
+            engine: Engine::Complex(Box::new(regex)),
+            numbers,
+        })
+    }
+    fn group_index(&self, index: usize) -> usize {
+        self.numbers
+            .as_ref()
+            .map_or(index, |numbers| numbers[index])
     }
     pub fn is_match(&self, name: &str, budget: &mut Budget<'_>) -> Result<bool> {
         budget.check()?;
-        match self {
-            Self::Fast(regex) => Ok(regex.is_match(name)),
-            Self::Complex(regex) => {
+        match &self.engine {
+            Engine::Fast(regex) => Ok(regex.is_match(name)),
+            Engine::Complex(regex) => {
                 budget.spend(name)?;
                 let started = Instant::now();
                 let result = regex
@@ -126,8 +159,8 @@ impl NameRegex {
     fn replace_inner(&self, name: &str, target: &str, budget: &mut Budget<'_>) -> Result<String> {
         let mut output = String::new();
         let mut end = 0;
-        match self {
-            Self::Fast(regex) => {
+        match &self.engine {
+            Engine::Fast(regex) => {
                 for captures in regex.captures_iter(name) {
                     budget.spend(name)?;
                     let matched = captures.get(0).expect("whole match");
@@ -139,7 +172,7 @@ impl NameRegex {
                         matched.start(),
                         matched.end(),
                         captures.len(),
-                        |i| captures.get(i).map(|m| m.as_str()),
+                        |i| captures.get(self.group_index(i)).map(|m| m.as_str()),
                         |key| {
                             regex
                                 .capture_names()
@@ -150,7 +183,7 @@ impl NameRegex {
                     end = matched.end();
                 }
             }
-            Self::Complex(regex) => {
+            Engine::Complex(regex) => {
                 budget.spend(name)?;
                 for captures in regex.captures_iter(name) {
                     budget.spend(name)?;
@@ -165,7 +198,7 @@ impl NameRegex {
                         matched.start(),
                         matched.end(),
                         captures.len(),
-                        |i| captures.get(i).map(|m| m.as_str()),
+                        |i| captures.get(self.group_index(i)).map(|m| m.as_str()),
                         |key| {
                             regex
                                 .capture_names()
@@ -266,11 +299,61 @@ mod tests {
         );
         let fast = NameRegex::new(r"(?<area>HK)-(\d+)").unwrap();
         assert_eq!(
-            fast.replace("HK-01", "${area}:$2x:$$:$&", &mut budget)
+            fast.replace("HK-01", "${area}:$1x:$$:$&", &mut budget)
                 .unwrap(),
             "HK:01x:$:HK-01"
         );
     }
+    #[test]
+    fn name_expressions_accept_reference_named_capture_and_comment_spelling() {
+        let mut budget = Budget::new(None);
+        let repeated = NameRegex::new(r"^(?'region'HK|SG)-\k'region'$").unwrap();
+        assert!(repeated.is_match("HK-HK", &mut budget).unwrap());
+        assert!(!repeated.is_match("HK-SG", &mut budget).unwrap());
+        assert_eq!(
+            repeated.replace("SG-SG", "${region}", &mut budget).unwrap(),
+            "SG"
+        );
+        let comment =
+            NameRegex::new(r"^(?#subscription category)(?'region'HK)-(?<node>\d+)$").unwrap();
+        assert_eq!(
+            comment
+                .replace("HK-01", "${node}:${region}", &mut budget)
+                .unwrap(),
+            "01:HK"
+        );
+    }
+
+    #[test]
+    fn dotnet_mixed_capture_numbers_apply_to_matching_and_replacement() {
+        let mut budget = Budget::new(None);
+        let simple = NameRegex::new(r"^(?<area>HK)-(\d+)$").unwrap();
+        assert_eq!(
+            simple
+                .replace("HK-01", "$1:${2}:${area}:$+", &mut budget)
+                .unwrap(),
+            "01:HK:HK:HK"
+        );
+        for pattern in [
+            r"^(?<area>HK|SG)-(\d+)-\1-\2$",
+            r"^(?'area'HK|SG)-(\d+)-\k'1'-\k'2'$",
+            "(?x)^(?<area>HK|SG) # (ignored capture)\n - (\\d+) - \\1 - \\2$",
+            r"^(?<area>HK|SG)-(\d+)-\k<1>-\k<area>$",
+        ] {
+            let regex = NameRegex::new(pattern).unwrap();
+            assert!(regex.is_match("HK-01-01-HK", &mut budget).unwrap());
+            assert!(!regex.is_match("HK-01-HK-01", &mut budget).unwrap());
+            assert_eq!(
+                regex
+                    .replace("SG-02-02-SG", "$1:${2}:${area}:$+", &mut budget)
+                    .unwrap(),
+                "02:SG:SG:SG"
+            );
+        }
+        let escaped = NameRegex::new(r"^\((?<area>HK)\)-(\d+)-\1-\2$").unwrap();
+        assert!(escaped.is_match("(HK)-01-01-HK", &mut budget).unwrap());
+    }
+
     #[test]
     fn name_expressions_fail_on_budget_and_cancellation() {
         let regex = NameRegex::new(r"(?i)(a|b|ab)*(?>c)").unwrap();

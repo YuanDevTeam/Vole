@@ -237,17 +237,10 @@ impl DomainRegex {
             return Err(invalid("DOMAIN-REGEX compilation budget exceeded"));
         }
         let translated = common_dialect(pattern)?;
+        let (translated, _) = capture_dialect(&translated)?;
         let tree = fancy_regex::Expr::parse_tree(&translated)
             .map_err(|_| invalid("invalid or unsupported DOMAIN-REGEX syntax"))?;
-        let (nodes, weight, groups) = inspect(&tree.expr)?;
-        let named = !tree.named_groups.is_empty();
-        let numbered = groups > tree.named_groups.len();
-        // .NET numbers unnamed captures before named captures, unlike opening-order
-        // numbering in Rust. A mixed pattern with numeric references must be explicit
-        // unsupported, never accepted with different group identity.
-        if named && numbered && has_numeric_reference(&translated) {
-            return Err(invalid("unsupported DOMAIN-REGEX mixed capture numbering"));
-        }
+        let (nodes, weight, _) = inspect(&tree.expr)?;
         let engine = if let Ok(regex) = regex::RegexBuilder::new(&translated)
             .case_insensitive(true)
             .nest_limit(AST_DEPTH as u32)
@@ -353,7 +346,7 @@ impl DomainRegex {
 
 /// A small independent lexical compatibility fence, not a .NET parser.
 /// The third-party public AST validates the accepted grammar afterward.
-fn common_dialect(pattern: &str) -> Result<String> {
+pub(super) fn common_dialect(pattern: &str) -> Result<String> {
     let bytes = pattern.as_bytes();
     let mut output = String::with_capacity(pattern.len());
     let (mut index, mut in_class, mut depth) = (0, false, 0_usize);
@@ -370,7 +363,9 @@ fn common_dialect(pattern: &str) -> Result<String> {
                 let end = rest
                     .find('\'')
                     .ok_or_else(|| invalid("invalid DOMAIN-REGEX capture reference"))?;
-                capture_name(&rest[..end])?;
+                if rest[..end].is_empty() || !rest[..end].bytes().all(|b| b.is_ascii_digit()) {
+                    capture_name(&rest[..end])?;
+                }
                 output.push_str("\\k<");
                 output.push_str(&rest[..end]);
                 output.push('>');
@@ -525,23 +520,152 @@ fn capture_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn has_numeric_reference(pattern: &str) -> bool {
-    let (mut escaped, mut in_class) = (false, false);
-    for byte in pattern.bytes() {
-        if escaped {
-            if !in_class && byte.is_ascii_digit() && byte != b'0' {
-                return true;
+/// Return a bounded .NET-number -> engine-number map, rewriting numeric
+/// backreferences only. Both engines otherwise keep their original grammar.
+/// `pattern` has already passed common_dialect's lexical/depth fence.
+pub(super) fn capture_dialect(pattern: &str) -> Result<(String, Vec<usize>)> {
+    let bytes = pattern.as_bytes();
+    let mut groups = Vec::<Option<String>>::new();
+    let mut references = Vec::new();
+    let mut scopes = Vec::new();
+    let (mut index, mut in_class, mut verbose) = (0, false, false);
+    while index < bytes.len() {
+        let tail = &pattern[index..];
+        if bytes[index] == b'\\' {
+            let next = *bytes
+                .get(index + 1)
+                .ok_or_else(|| invalid("invalid regex escape"))?;
+            if !in_class && matches!(next, b'1'..=b'9') {
+                let end = index
+                    + 1
+                    + bytes[index + 1..]
+                        .iter()
+                        .take_while(|b| b.is_ascii_digit())
+                        .count();
+                let number = pattern[index + 1..end]
+                    .parse::<usize>()
+                    .map_err(|_| invalid("invalid regex capture reference"))?;
+                references.push((index, end, number));
+                index = end;
+                continue;
             }
-            escaped = false;
-        } else if byte == b'\\' {
-            escaped = true;
-        } else if byte == b'[' {
+            if !in_class && tail.starts_with("\\k<") {
+                let end = index
+                    + 3
+                    + tail[3..]
+                        .find('>')
+                        .ok_or_else(|| invalid("invalid regex capture reference"))?;
+                let key = &pattern[index + 3..end];
+                if !key.is_empty() && key.bytes().all(|b| b.is_ascii_digit()) {
+                    let number = key
+                        .parse::<usize>()
+                        .map_err(|_| invalid("invalid regex capture reference"))?;
+                    references.push((index, end + 1, number));
+                }
+                index = end + 1;
+                continue;
+            }
+            index += 1 + tail[1..].chars().next().expect("escape checked").len_utf8();
+            continue;
+        }
+        if in_class {
+            if bytes[index] == b']' {
+                in_class = false;
+            }
+        } else if verbose && bytes[index] == b'#' {
+            index += tail.find('\n').map_or(tail.len(), |end| end + 1);
+            continue;
+        } else if bytes[index] == b'[' {
             in_class = true;
-        } else if byte == b']' {
-            in_class = false;
+        } else if bytes[index] == b'(' {
+            if let Some(rest) = tail.strip_prefix("(?") {
+                let flags = rest
+                    .bytes()
+                    .take_while(|b| b.is_ascii_alphabetic() || *b == b'-')
+                    .count();
+                if flags > 0
+                    && bytes
+                        .get(index + 2 + flags)
+                        .is_some_and(|b| matches!(b, b':' | b')'))
+                {
+                    let old_verbose = verbose;
+                    let mut on = true;
+                    for flag in tail[2..2 + flags].bytes() {
+                        if flag == b'-' {
+                            on = false;
+                        }
+                        if flag == b'x' {
+                            verbose = on;
+                        }
+                    }
+                    if bytes[index + 2 + flags] == b':' {
+                        scopes.push(old_verbose);
+                    }
+                    index += 3 + flags;
+                    continue;
+                }
+            }
+            scopes.push(verbose);
+            if tail.starts_with("(?<") && !tail.starts_with("(?<=") && !tail.starts_with("(?<!") {
+                let end = index
+                    + 3
+                    + tail[3..]
+                        .find('>')
+                        .ok_or_else(|| invalid("invalid regex capture name"))?;
+                let name = &pattern[index + 3..end];
+                // Duplicate .NET names share a capture history; neither engine's
+                // ordinary single-slot name lookup can represent that history.
+                if groups.iter().any(|group| group.as_deref() == Some(name)) {
+                    return Err(invalid("duplicate regex capture names are unsupported"));
+                }
+                groups.push(Some(name.to_owned()));
+                index = end + 1;
+                if groups.len() > AST_NODES {
+                    return Err(invalid("regex capture budget exceeded"));
+                }
+                continue;
+            }
+            if !tail.starts_with("(?") {
+                groups.push(None);
+                if groups.len() > AST_NODES {
+                    return Err(invalid("regex capture budget exceeded"));
+                }
+            }
+        } else if bytes[index] == b')' {
+            verbose = scopes
+                .pop()
+                .ok_or_else(|| invalid("invalid regex group syntax"))?;
+        }
+        index += tail.chars().next().expect("within pattern").len_utf8();
+    }
+    let mut numbers = Vec::with_capacity(groups.len() + 1);
+    numbers.push(0);
+    for named in [false, true] {
+        for (index, group) in groups.iter().enumerate() {
+            if group.is_some() == named {
+                numbers.push(index + 1);
+            }
         }
     }
-    false
+    let mut rewritten = String::with_capacity(pattern.len());
+    let mut offset = 0;
+    for (start, end, reference) in references {
+        rewritten.push_str(&pattern[offset..start]);
+        if let Some(&engine_number) = numbers
+            .get(reference)
+            .filter(|&&number| number != reference)
+        {
+            use std::fmt::Write as _;
+            write!(&mut rewritten, "\\k<{engine_number}>").expect("String write");
+        } else {
+            // Unknown references remain the engine's compile error, rather than
+            // becoming a different group or an implicit compatibility fallback.
+            rewritten.push_str(&pattern[start..end]);
+        }
+        offset = end;
+    }
+    rewritten.push_str(&pattern[offset..]);
+    Ok((rewritten, numbers))
 }
 
 fn inspect(root: &fancy_regex::Expr) -> Result<(usize, u64, usize)> {
@@ -606,6 +730,14 @@ mod tests {
             (r"^(?<label>[a-z]+)\.\k<label>\.test$", "same.SAME.test"),
             (r"^(?'label'[a-z]+)\.\k'label'\.test$", "word.WORD.test"),
             (r"^(?#independent fixture)(?>api|www)\.test$", "API.test"),
+            (
+                r"^(?<label>[a-z]+)\.([a-z]+)\.\1\.\2\.test$",
+                "named.part.PART.NAMED.test",
+            ),
+            (
+                r"^(?'label'[a-z]+)\.([a-z]+)\.\k'1'\.\k'2'\.test$",
+                "named.part.PART.NAMED.test",
+            ),
         ] {
             let regex = DomainRegex::new(pattern).unwrap();
             assert!(

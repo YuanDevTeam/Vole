@@ -88,8 +88,8 @@ HTTP/TLS 用于 TUN 与 mixed TCP；QUIC v1/v2 多包识别由 TUN 和已授权�
 fake-IP 恢复后的域名与显式域名只在 `force-domain` 匹配时强制嗅探。
 `skip-src-address` / `skip-dst-address` 在读取前排除地址；`skip-domain` 排除识别结果。
 域名项支持通配、GeoSite 和 domain/classical 规则集合；地址项支持 CIDR、GeoIP 与
-ipcidr/classical 集合，classical 使用对应的域名或目标 IP 条件及完全由其组成的
-AND/OR/NOT。混合其他类型叶子的整个逻辑项不参与 selector，不做部分求值。
+ipcidr/classical 集合。classical 对完整 AND/OR/NOT 求值；只提供对应域名或目标 IP，
+其余元数据沿参考零值 TCP/HTTP、端口0、空入口名和未知身份，不发起地址解析或进程扫描。
 
 全局 `override-destination` 默认 true，协议级值优先。false 只将识别域名提供给规则，
 保留实际目标；true 替换为识别域名，DIRECT 或必须 IP 的传输再解析。
@@ -228,7 +228,8 @@ DoQ/H3 都沿用原 DNS 路由、bootstrap、证书政策与查询包装，不�
   `code`、`code@attr@attr` 或前置 `!` 的反选，属性为 key 存在性 AND。与业务规则共享分类和记录，
   `@!cn` 是字面属性 key，不是属性排除；
 - GeoSite 项隔开域名区块，区块与 GeoSite 项按声明顺序匹配；重复 GeoSite selector 也按此顺序处理；
-- value 接受单个 nameserver 字符串或非空数组；`rule-set:` 引用 domain/classical 集合，classical 使用域名条件及纯域名 AND/OR/NOT，不使用混合其他叶子的逻辑项；
+- value 接受单个 nameserver 字符串或非空数组；`rule-set:` 引用 domain/classical 集合。
+  classical 以域名和其余零值元数据执行完整逻辑；不继承触发查询的业务端口、来源或入口身份；
 - 命中后只在所选列表内并发查询，列表耗尽不查询其他 policy 或主组；
 - GeoSite 资产或分类不可用时该 policy 不命中，不能因反选变成全匹配；
 - 存在分类但属性筛选为空时仍可用，正选不命中、反选匹配合法非空名称。
@@ -447,5 +448,9 @@ TUN TCP 的 `IN-TYPE` 为 TUN，`IN-PORT` 为虚拟连接的原始目标端口�
 没有本地监听端口，`IN-PORT` 为 0。两者没有认证用户，来源规则读取原始来源 IP/端口。
 这与 Mihomo 默认 MIPS 栈一致；其他栈的内部 TCP listener 端口可能不同。
 
+业务规则中的 `IN-NAME` 为区分大小写的固定入口名：TUN 为 DEFAULT-TUN；
+mixed 的 HTTP/SOCKS5 为 DEFAULT-MIXED。内部请求的名称为空，不新增可命名 listeners。
 Core 的 DNS、GeoData 下载及测速入口均映射为 INNER，端口为 0、用户为空。
 DNS `respect-rules` 使用同一个规则求值器，但不继承触发解析的业务用户。
+classical selector 的空元数据是单独参考视图（TCP/HTTP、端口0、无入口名和身份），
+并不把内部 DNS 路由伪装成业务 HTTP 连接。

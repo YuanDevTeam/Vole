@@ -51,6 +51,7 @@ pub struct RoutingContext {
     source_ip: Option<IpAddr>,
     source_port: u16,
     inbound: InboundKind,
+    selector_metadata: bool,
     metadata: InboundMetadata,
     process: Option<crate::process::Identity>,
     process_lookup_enabled: bool,
@@ -113,6 +114,7 @@ impl RoutingContext {
             source_ip: None,
             source_port: 0,
             inbound: InboundKind::InternalDns,
+            selector_metadata: false,
             metadata: InboundMetadata::new(0),
             process: None,
             process_lookup_enabled: false,
@@ -136,7 +138,33 @@ impl RoutingContext {
 
     pub(crate) fn set_inbound(&mut self, kind: InboundKind, metadata: &InboundMetadata) {
         self.inbound = kind;
+        self.selector_metadata = false;
         self.metadata = metadata.clone();
+    }
+
+    fn inbound_name(&self) -> &'static str {
+        if self.selector_metadata {
+            return "";
+        }
+        match self.inbound {
+            InboundKind::Tun => "DEFAULT-TUN",
+            InboundKind::Http | InboundKind::Https | InboundKind::Socks5 => "DEFAULT-MIXED",
+            InboundKind::InternalDns
+            | InboundKind::InternalGeoData
+            | InboundKind::InternalMeasure => "",
+        }
+    }
+
+    /// A reference selector receives only Host or DstIP. Other fields keep the
+    /// zero values of Mihomo Metadata (TCP/HTTP, port 0 and no ingress name).
+    /// It is not a business HTTP connection and must never acquire an identity.
+    pub(crate) fn selector(destination: &Destination) -> Result<Self, DomainNameError> {
+        let mut context = Self::new(Network::Tcp, destination)?;
+        context.destination_port = 0;
+        context.inbound = InboundKind::Http;
+        context.selector_metadata = true;
+        context.disable_ip_resolution();
+        Ok(context)
     }
     pub(crate) fn source_ip(&self) -> Option<IpAddr> {
         self.source_ip
@@ -710,7 +738,7 @@ fn normalize_rule(
                 return Err(RuleSetError::InvalidPortRange { rule_index: index });
             }
         }
-        RuleKind::InUsers(users) | RuleKind::RematchNames(users) => {
+        RuleKind::InNames(users) | RuleKind::InUsers(users) | RuleKind::RematchNames(users) => {
             if users.is_empty() || users.iter().any(|user| user.is_empty()) {
                 return Err(RuleSetError::InvalidInboundRule { rule_index: index });
             }
@@ -888,6 +916,7 @@ pub(crate) fn matches_rule(
         RuleKind::InTypes(types) => types.contains(&crate::config::RuleInboundType::for_inbound(
             context.inbound,
         )),
+        RuleKind::InNames(names) => names.iter().any(|name| name == context.inbound_name()),
         RuleKind::InUsers(users) => context
             .authenticated_user()
             .is_some_and(|user| users.iter().any(|expected| expected == user)),
@@ -1057,6 +1086,47 @@ mod tests {
         RuleAction::Route(crate::config::RouteTargetId::Proxy(
             crate::config::ProxyId::new(index).unwrap(),
         ))
+    }
+
+    #[test]
+    fn in_name_uses_actual_tun_or_mixed_ingress_without_naming_internal_requests() {
+        let mut config = crate::config::Config::parse_yaml(
+            b"rules: ['IN-NAME, ignored / DEFAULT-TUN ,DIRECT', 'IN-NAME,DEFAULT-MIXED,REJECT-DROP', 'MATCH,REJECT']\n",
+        )
+        .unwrap();
+        let rules = RuleSet::compile_config(&mut config).unwrap();
+        let destination = Destination::domain("example.test", 443).unwrap();
+        for (kind, expected) in [
+            (InboundKind::Tun, RuleAction::Direct),
+            (InboundKind::Http, RuleAction::RejectDrop),
+            (InboundKind::Https, RuleAction::RejectDrop),
+            (InboundKind::Socks5, RuleAction::RejectDrop),
+            (InboundKind::InternalDns, RuleAction::Reject),
+            (InboundKind::InternalGeoData, RuleAction::Reject),
+            (InboundKind::InternalMeasure, RuleAction::Reject),
+        ] {
+            for network in [Network::Tcp, Network::Udp] {
+                let mut context = RoutingContext::new(network, &destination).unwrap();
+                context.set_inbound(kind, &InboundMetadata::new(0));
+                assert!(
+                    matches!(rules.evaluate(&context), RuleEvaluation::Matched(found) if found.action == expected)
+                );
+            }
+        }
+        let lower_case = crate::config::Config::parse_yaml(
+            b"rules: ['IN-NAME,default-tun,DIRECT', 'MATCH,REJECT']\n",
+        )
+        .unwrap();
+        let rules = RuleSet::compile(lower_case.rules).unwrap();
+        let mut context = RoutingContext::new(Network::Tcp, &destination).unwrap();
+        context.set_inbound(InboundKind::Tun, &InboundMetadata::new(0));
+        assert!(
+            matches!(rules.evaluate(&context), RuleEvaluation::Matched(found) if found.action == RuleAction::Reject)
+        );
+        assert!(
+            crate::config::Config::parse_yaml(b"rules: ['IN-NAME,DEFAULT-TUN / ,DIRECT']\n")
+                .is_err()
+        );
     }
 
     #[test]

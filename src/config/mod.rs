@@ -651,6 +651,7 @@ pub enum RuleKind {
     IpAsn(String),
     SrcIpAsn(String),
     InTypes(Vec<RuleInboundType>),
+    InNames(Vec<String>),
     InUsers(Vec<String>),
     RematchNames(Vec<String>),
     Process(ProcessRule),

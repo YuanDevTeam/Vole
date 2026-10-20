@@ -414,6 +414,18 @@ fn parse(input: &str, targets: Option<&RouteTargetsByName>, depth: usize) -> Res
         "SRC-PORT" => RuleKind::SrcPorts(parse_port_ranges(payload)?),
         "NETWORK" => RuleKind::Network(parse_network(payload)?),
         "IN-TYPE" => RuleKind::InTypes(parse_in_types(payload)?),
+        "IN-NAME" => RuleKind::InNames(
+            payload
+                .split('/')
+                .map(|value| {
+                    let value = value.trim();
+                    if value.is_empty() {
+                        return invalid("IN-NAME requires nonempty names");
+                    }
+                    Ok(value.to_owned())
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
         "IN-USER" => RuleKind::InUsers(parse_in_users(payload)?),
         "REMATCH-NAME" => RuleKind::RematchNames(
             payload

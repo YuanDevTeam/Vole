@@ -45,9 +45,11 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
   DoT 独立禁用复用、LRU/ARC 与显式 system/DHCP 上游已支持，
   来源发现和物理绑定的可用平台及参考差异以 DNS 契约为准。
   DoH 使用 GET、URL Basic 与实际 H3/H2/H1；详细解析角色、缓存、预算与过滤行为见 [DNS 契约](tun-icmp-dns.md)。
-- Provider/group 名称筛选和改名支持 lookahead、定长 lookbehind、数字/命名 backreference；
-  普通表达式保留 Rust regex 快速路径。复杂表达式和改名有内部预算，超限使候选失败。
-  不支持递归/条件式或完整 .NET 方言；DOMAIN-REGEX 与 GeoSite regex 不扩展。
+- Provider/group 名称筛选、改名和 DOMAIN-REGEX 使用有界的常用复杂表达式子集，
+  支持 lookahead、定长 lookbehind、数字/ASCII 命名 backreference 与两种命名拼写。
+  混合捕获按 .NET 的未命名优先、命名随后编号，匹配与名称替换使用同一编号；
+  普通表达式保留 Rust regex 快速路径。不支持重复命名、显式数字组、递归、条件/平衡组或
+  完整 .NET 方言。编译、执行和输出预算保持；GeoSite regex 的现有线性语义不扩展。
 - gRPC 三协议共用选项和节点连接池。负 ping-interval 明确拒绝，不复制固定参考
   HTTP/2 客户端的立即重复 PING；超出本机可表示期限的正秒数也明确拒绝，不复制 Duration 溢出。
 - 订阅元信息只在成功候选或合法 304 后发布，失败响应或坏候选保留旧值；
@@ -66,8 +68,10 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
   CORS 按 origins/预检/私网字段处理；HTTP 与 HTTPS H2/H1 共用 handler 与 Bearer，支持服务端证书文件更新和五种客户端认证模式。
   /dns/query 查询真实上游；连接表按 UDP 目标流管理，memory 返回当前进程 resident bytes，平台口径不同。
 - fake-IP TTL 最小一秒；映射生命周期独立于 TTL。本地选择和映射存储不保证与 Mihomo 数据库互读。
-- DNS、fake-IP 与嗅探的 classical selector 使用对应的域名或目标 IP 条件，支持纯对应条件组成的 AND/OR/NOT。
-  混合端口、来源、网络等叶子的整个逻辑项不参与匹配；Mihomo 使用零值元数据执行全部 classical 条件，因此这些组合仍有语义边界。
+- DNS、fake-IP 与嗅探的 classical selector 对完整 AND/OR/NOT 求值；参考只提供域名或目标 IP，
+  其余元数据沿零值 TCP/HTTP、端口0、空入口名和未知身份，不伪造业务来源、53端口或进程身份。
+  selector 不发起额外地址解析或进程扫描，仍共用原决策预算。业务 IN-NAME 使用固定的
+  DEFAULT-TUN/DEFAULT-MIXED，内部请求没有业务入口名，不新增 listeners。
 - Apple、Android、Windows UWP 的网络设置、权限和 App 生命周期仍归宿主；Windows Wintun 使用外置 DLL。
   借用 Unix fd 只复制并保留原描述符。Linux 本机捕获范围与网络恢复见 TUN 契约；旁路由、防火墙/NAT 不在当前范围。
   六类进程规则与 find-process-mode 按真实可获取的本机身份工作，UID 仅 Linux/Android；

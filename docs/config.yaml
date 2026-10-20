@@ -714,8 +714,11 @@ proxies:
 # select/url-test/fallback/load-balance 组支持静态 proxies 与动态 use；include-all 同时包含静态节点和所有 providers，
 # 也可分别使用 include-all-proxies / include-all-providers。后者启用时忽略 use。
 # filter 筛选动态成员；exclude-filter / exclude-type 同时排除显式成员。
-# 名称正则区分大小写；支持 lookahead、定长 lookbehind、数字/命名 backreference。
-# 反引号分隔的多表达式按匹配顺序排列。节点改名使用 $1 / ${name} / $$ 等 .NET replacement。
+# 名称正则区分大小写；支持 lookahead、定长 lookbehind、数字/ASCII命名 backreference。
+# 命名组接受 (?<name>...) / (?'name'...)，引用接受 \k<name> / \k'name'；注释接受 (?#...)。
+# 混合捕获按 .NET 规则先给未命名组编号，再给命名组编号；数字回引、$1 / ${1} / $+ 使用该编号。
+# 反引号分隔的多表达式按匹配顺序排列。节点改名另支持 ${name} / $$ 等 .NET replacement。
+# 重复命名、显式数字组和递归/条件/平衡组不支持，不宣称完整.NET方言。
 # 复杂表达式有内部编译/执行预算；失败候选保留旧资源，不静默当不匹配。
 # 静态成员保留顺序与重复项。
 # 过滤后组成员为空时使用 empty-fallback（缺省 COMPATIBLE，即 DIRECT），可指定节点或内置目标。
@@ -942,7 +945,7 @@ dns:
 # 支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、DOMAIN-WILDCARD、DOMAIN-REGEX、
 # GEOSITE、GEOIP、SRC-GEOIP、IP-ASN、SRC-IP-ASN、IP-CIDR、IP-CIDR6、SRC-IP-CIDR、
 # IP-SUFFIX、SRC-IP-SUFFIX、DST-PORT、SRC-PORT、NETWORK、
-# IN-TYPE、IN-USER、IN-PORT、REMATCH-NAME、RULE-SET、SUB-RULE、AND/OR/NOT 和 MATCH。来源信息来自实际入站会话。
+# IN-TYPE、IN-NAME、IN-USER、IN-PORT、REMATCH-NAME、RULE-SET、SUB-RULE、AND/OR/NOT 和 MATCH。来源信息来自实际入站会话。
 # PROCESS-NAME、PROCESS-PATH 及各自 -WILDCARD/-REGEX 支持已确认的本机 socket owner，忽略大小写。
 # Linux/Android 还接受 UID（uint32 单值/范围，/ 分隔，最多 28 段）；UID 0 不匹配。
 # 进程路径保留 Unicode，最多 32 KiB；正则沿同一编译/决策预算，不当作域名处理。
@@ -957,13 +960,15 @@ dns:
 # SRC-IP-SUFFIX 只使用真实来源地址；目的后缀支持 no-resolve，并复用既有惰性 DNS 结果。
 # RULE-SET 的 src 在局部视图交换源/目标 IP 与端口，保留域名、入口类型和身份。
 # IN-TYPE 为 / 分隔的 Mihomo 类型名，大小写无关，SOCKS 展开为 SOCKS4/SOCKS5；
-# IN-USER 为 / 分隔、区分大小写的已认证用户名。两种列表逐项 trim，空项报错。
+# IN-NAME 为 / 分隔、区分大小写的入口名：TUN为DEFAULT-TUN，mixed的HTTP/SOCKS5为DEFAULT-MIXED；内部请求为空。
+# IN-USER 为 / 分隔、区分大小写的已认证用户名。三种列表逐项 trim，空项报错。
 # IN-PORT/DST-PORT/SRC-PORT 为 uint16 端口或范围，/ 分隔，含 0，逆序范围归一，
 # 最多 28 段；分隔中的空段跳过。真实入口和服务器端口仍须非零。
 # 通配符 * 匹配任意长度、? 匹配一个字符；DOMAIN-REGEX 默认忽略大小写，普通表达式走线性引擎。
 # 有限复杂语法支持前向正/负断言、固定宽度后向断言、数字及 ASCII 命名 backreference、原子组，
 # 命名捕获支持 (?<name>...) 与 (?'name'...)；引用支持 \k<name> 与 \k'name'。
-# 不支持递归、条件/平衡组、possessive quantifier、变长后向断言或混合捕获的数字引用；
+# 混合命名/未命名捕获的数字引用沿 .NET 编号；每模式最多512个捕获，转译仅改变编号。
+# 不支持重复命名、显式数字组、递归、条件/平衡组、possessive quantifier或变长后向断言；
 # 此有限方言不保证全部 regexp2/.NET Unicode、锚点或捕获语义等价。无法编译或越界明确报错。
 # 每模式限制 4 KiB、512 AST 节点/32 层、有限重复 1024，委托编译/搜索缓存有近似大小边界。
 # 一次决策跨逻辑/子规则、classical provider、候选地址和 DNS 续跑共享 sticky 执行预算：

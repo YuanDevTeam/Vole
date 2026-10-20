@@ -33,6 +33,10 @@ WS 查询和头预算：`config::vmess::websocket_query_tests::` 与内存 duple
 XHTTP 输入和自定义上行方法：`--test xhttp_config`、
 `--test xhttp_requests packet_metadata_and_upload_methods_are_sent_in_each_supported_location`。
 
+规则输入与 selector 元数据（纯内存）：`config::name_regex::tests::`、
+`config::domain_regex::tests::`、`config::rule_provider::tests::classical_`、
+`routing::tests::in_name_`。覆盖命名/数字捕获编号、IN-NAME 和混合 classical 条件。
+
 TFO 纯内存策略与生命周期：
 `config::functional::tests::node_tfo_is_explicit_and_does_not_inherit_across_proxy_chain`、
 `config::providers::tests::provider_tfo_override_preserves_false_and_materializes_exact_node_policy`、

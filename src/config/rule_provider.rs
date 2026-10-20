@@ -204,18 +204,10 @@ impl RuleCollection {
     ) -> std::result::Result<bool, super::MatchFailure> {
         decision.visit()?;
         let destination = crate::session::Destination::Ip(std::net::SocketAddr::new(address, 1));
-        let context = RoutingContext::new(Network::Tcp, &destination)
+        let context = RoutingContext::selector(&destination)
             .expect("literal address")
             .with_decision(decision);
-        self.matches_selected(&context, geo, |kind| {
-            matches!(
-                kind,
-                RuleKind::IpCidr(_)
-                    | RuleKind::IpSuffix(_)
-                    | RuleKind::GeoIp(_)
-                    | RuleKind::IpAsn(_)
-            )
-        })
+        self.matches_selector(&context, geo)
     }
     pub(crate) fn matches_domain(
         &self,
@@ -227,35 +219,20 @@ impl RuleCollection {
         let Ok(destination) = crate::session::Destination::domain(domain, 53) else {
             return Ok(false);
         };
-        let Ok(context) = RoutingContext::new(Network::Tcp, &destination) else {
+        let Ok(context) = RoutingContext::selector(&destination) else {
             return Ok(false);
         };
         let context = context.with_decision(decision);
-        // DNS selectors consume domain predicates only, never port/IP/source criteria.
-        self.matches_selected(&context, geo, |kind| {
-            matches!(
-                kind,
-                RuleKind::Domain(_)
-                    | RuleKind::DomainSuffix(_)
-                    | RuleKind::DomainKeyword(_)
-                    | RuleKind::DomainWildcard(_)
-                    | RuleKind::DomainRegex(_)
-                    | RuleKind::GeoSite(_)
-            )
-        })
+        self.matches_selector(&context, geo)
     }
-    fn matches_selected(
+    fn matches_selector(
         &self,
         context: &RoutingContext,
         geo: &dyn GeoMatcher,
-        selects: impl Fn(&RuleKind) -> bool,
     ) -> std::result::Result<bool, super::MatchFailure> {
         use crate::routing::PredicateFailure;
         if self.behavior == RuleBehavior::Classical {
             for rule in &self.classical {
-                if !selects_predicate(&rule.kind, &selects, context.decision())? {
-                    continue;
-                }
                 match crate::routing::matches_rule(rule, context, geo) {
                     Ok(true) => return Ok(true),
                     Ok(false)
@@ -275,29 +252,6 @@ impl RuleCollection {
                 Err(PredicateFailure::Evaluation(failure)) => Err(failure),
             }
         }
-    }
-}
-
-// Selector contexts carry only a domain or destination IP. Admit complete
-// logical predicates whose leaves consume that value, rather than evaluating
-// a partial expression or exposing synthetic port/ingress metadata.
-fn selects_predicate(
-    kind: &RuleKind,
-    selects: &impl Fn(&RuleKind) -> bool,
-    decision: &RuleDecision,
-) -> std::result::Result<bool, MatchFailure> {
-    decision.visit()?;
-    match kind {
-        RuleKind::And(children) | RuleKind::Or(children) => {
-            for child in children {
-                if !selects_predicate(&child.kind, selects, decision)? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        RuleKind::Not(child) => selects_predicate(&child.kind, selects, decision),
-        _ => Ok(selects(kind)),
     }
 }
 
@@ -630,8 +584,8 @@ mod tests {
                 Ok(false)
             );
         }
-        // A true supported leaf must not turn a mixed OR into a partial match;
-        // NOT must not invert a foreign predicate into a selector-wide match.
+        // Reference selectors evaluate the complete expression using their
+        // zero metadata; a missing source predicate is false and NOT is true.
         for payload in [
             "AND,((DOMAIN,api.example),(NETWORK,TCP))",
             "OR,((DOMAIN,api.example),(DST-PORT,53))",
@@ -641,7 +595,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 set.matches_domain("api.example", &geo, &Default::default()),
-                Ok(false)
+                Ok(true)
             );
         }
         for payload in [
@@ -653,7 +607,47 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 set.matches_ip("192.0.2.1".parse().unwrap(), &geo, &Default::default()),
-                Ok(false)
+                Ok(true)
+            );
+        }
+    }
+
+    #[test]
+    fn classical_selector_uses_zero_metadata_without_business_ingress_or_resolution() {
+        let geo = crate::routing::EmptyGeoMatcher;
+        for (payload, expected) in [
+            ("AND,((DOMAIN,api.example),(DST-PORT,0))", true),
+            ("AND,((DOMAIN,api.example),(DST-PORT,53))", false),
+            ("AND,((DOMAIN,api.example),(NETWORK,TCP))", true),
+            ("AND,((DOMAIN,api.example),(NETWORK,UDP))", false),
+            ("AND,((DOMAIN,api.example),(IN-TYPE,HTTP))", true),
+            ("AND,((DOMAIN,api.example),(IN-TYPE,INNER))", false),
+            ("AND,((DOMAIN,api.example),(IN-NAME,DEFAULT-MIXED))", false),
+            ("AND,((DOMAIN,api.example),(IN-NAME,DEFAULT-TUN))", false),
+            ("AND,((DOMAIN,api.example),(IN-PORT,0))", true),
+            ("NOT,((IP-CIDR,192.0.2.0/24))", true),
+            ("NOT,((PROCESS-NAME,synthetic))", true),
+        ] {
+            let set = RuleCollection::from_payload(vec![payload.into()], RuleBehavior::Classical)
+                .unwrap();
+            assert_eq!(
+                set.matches_domain("api.example", &geo, &Default::default()),
+                Ok(expected),
+                "{payload}"
+            );
+        }
+        for (payload, expected) in [
+            ("AND,((IP-CIDR,192.0.2.0/24),(DST-PORT,0))", true),
+            ("AND,((IP-CIDR,192.0.2.0/24),(DST-PORT,1))", false),
+            ("AND,((IP-CIDR,192.0.2.0/24),(SRC-PORT,0))", true),
+            ("AND,((IP-CIDR,192.0.2.0/24),(IN-TYPE,HTTP))", true),
+        ] {
+            let set = RuleCollection::from_payload(vec![payload.into()], RuleBehavior::Classical)
+                .unwrap();
+            assert_eq!(
+                set.matches_ip("192.0.2.1".parse().unwrap(), &geo, &Default::default()),
+                Ok(expected),
+                "{payload}"
             );
         }
     }
