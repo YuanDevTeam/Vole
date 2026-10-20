@@ -28,7 +28,7 @@ pub enum EchoPacketError {
 }
 
 /// Recognized Echo failures and unsupported raw-IP shapes cannot fall through
-/// to the existing synthetic responder. Other ICMP/error/PMTU remains NotEcho.
+/// to the existing synthetic responder. Other ICMP/error/PMTU remains `NotEcho`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EchoPacketClass<'a> {
     NotEcho,
@@ -169,14 +169,14 @@ fn parse_echo_view(bytes: &[u8], reply: bool) -> Option<EchoPacketView<'_>> {
 }
 
 /// Validate a body returned by a Linux DGRAM ICMP socket. `source` comes from
-/// recvmsg's peer sockaddr, `destination` from IP_PKTINFO/IPV6_PKTINFO. The IPv6
+/// recvmsg's peer sockaddr, `destination` from `IP_PKTINFO/IPV6_PKTINFO`. The IPv6
 /// checksum therefore uses physical addresses, never the original TUN tuple.
 #[must_use]
-pub fn parse_echo_reply_body<'a>(
+pub fn parse_echo_reply_body(
     source: IpAddr,
     destination: IpAddr,
-    bytes: &'a [u8],
-) -> Option<EchoPacketView<'a>> {
+    bytes: &[u8],
+) -> Option<EchoPacketView<'_>> {
     if !unicast(source) || !unicast(destination) {
         return None;
     }
@@ -218,6 +218,10 @@ pub fn parse_echo_reply_body<'a>(
 /// Build a reply from the peer-validated Echo body and the retained TUN tuple.
 /// The caller supplies reply-direction endpoints, not the original request.
 /// Allocation happens only after address-family and complete length checks.
+///
+/// # Errors
+/// Returns an error if the address families differ or the complete packet
+/// exceeds the raw-IP MTU or IP length limit.
 pub fn encode_echo_reply_into(
     packet: &EchoPacketView<'_>,
     mtu: usize,
