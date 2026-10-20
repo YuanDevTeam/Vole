@@ -15,6 +15,7 @@ pub use fallback::DnsFallbackConfig;
 pub use grpc::GrpcOptions;
 pub use sing_mux::{SingMuxConfig, SingMuxProtocol};
 mod http_proxy;
+mod ip4p;
 mod ip_version;
 mod masque;
 mod mieru;
@@ -1220,6 +1221,9 @@ struct RawVoleConfig {
     #[serde(rename = "skip-auth-prefixes", default)]
     skip_auth_prefixes: Vec<String>,
 
+    #[serde(default)]
+    experimental: RawExperimental,
+
     #[serde(rename = "tcp-concurrent", default)]
     tcp_concurrent: bool,
     #[serde(rename = "keep-alive-idle", default)]
@@ -1317,6 +1321,13 @@ struct RawVoleConfig {
     rules: Vec<String>,
     #[serde(rename = "sub-rules", default)]
     sub_rules: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExperimental {
+    #[serde(rename = "dialer-ip4p-convert", default)]
+    dialer_ip4p_convert: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2542,6 +2553,7 @@ impl RawVoleConfig {
             unified_delay: self.unified_delay,
             find_process_mode: self.find_process_mode,
             connections: ConnectionSettings {
+                dialer_ip4p_convert: self.experimental.dialer_ip4p_convert,
                 tcp_concurrent: self.tcp_concurrent,
                 keep_alive_idle: self.keep_alive_idle,
                 keep_alive_interval: self.keep_alive_interval,
@@ -7267,9 +7279,11 @@ authentication:
     }
 }
 
-/// Global physical TCP policy. YAML keeps Mihomo's top-level field names.
+/// Shared physical connection policy. TCP settings keep Mihomo's top-level
+/// names; IP4P is separately gated by experimental.dialer-ip4p-convert.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConnectionSettings {
+    pub dialer_ip4p_convert: bool,
     pub tcp_concurrent: bool,
     pub keep_alive_idle: i32,
     pub keep_alive_interval: i32,

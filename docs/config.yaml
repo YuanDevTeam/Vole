@@ -32,6 +32,11 @@ find-process-mode: strict # strict 按实际身份谓词惰性查询；always �
 # Android 始终禁用 TCP keep-alive；Windows 保留系统探测次数，其余平台为 9 次。
 # tcp-concurrent=true 同时尝试解析结果，首次成功取消其余尝试；ip-version 的偏好
 # 给首选地址族最多 300ms 优先窗口。已建立的复用连接保留创建时的设置。
+# IP4P 仅用于受控物理端点：2001:0000::/32 的 octets[10..12] 为网络序端口，
+# octets[12..16] 为IPv4；普通地址保持。逻辑server/SNI与认证身份不改变。
+experimental:
+  dialer-ip4p-convert: false
+
 tcp-concurrent: false
 keep-alive-idle: 0
 keep-alive-interval: 0
