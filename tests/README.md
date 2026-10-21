@@ -48,6 +48,8 @@ Linux `dialer::server_tcp::tests::` 和 `dialer::fast_open::tests::`。
 MPTCP / TCP Brutal 纯内存过滤器：`--lib mptcp`、`config::functional::tests::`、
 `config::sing_mux::tests::`、`transport::sing_mux::brutal::tests::`、
 Linux `dialer::tcp_control::tests::`；池与生命周期另用下方 sing_mux 集成回归。
+sing-mux 懒响应与首业务写入期限：`transport::sing_mux::tests::`，覆盖纯上传期间
+延迟 H2 headers/status、空/未完成写入保留原期限，以及迟到状态校验与半关闭。
 双子流、出口约束、TCP 回退、TFO、模块及真实参数/发送侧生效、对端协商与 Stop
 须在隔离 Linux 真实 TUN 中另验；1 / 3 Gbps 压力及平台、真机结果分别记录。
 

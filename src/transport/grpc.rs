@@ -450,7 +450,7 @@ pub(super) async fn mux_stream(sender: Sender, deadline: Instant) -> io::Result<
         .body(())
         .map_err(|_| invalid())?;
     let (response, send) = sender.send_request(request, false).map_err(|_| invalid())?;
-    Ok(Box::new(Grpc::new(
+    let mut stream = Grpc::new(
         response,
         send,
         Framing::Plain,
@@ -460,7 +460,12 @@ pub(super) async fn mux_stream(sender: Sender, deadline: Instant) -> io::Result<
         None,
         None,
         writes,
-    )))
+    );
+    // sing-mux owns the logical setup deadline, including metadata and the
+    // optional Brutal exchange. A valid upload can outlive delayed H2 headers;
+    // do not hide a second response timer beneath its business-write boundary.
+    stream.response_deadline = false;
+    Ok(Box::new(stream))
 }
 
 fn invalid() -> io::Error {

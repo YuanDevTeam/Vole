@@ -198,7 +198,7 @@ impl Pool {
                 response: false,
                 half_close: self.options.protocol != SingMuxProtocol::Smux,
                 upload_closed: false,
-                deadline: Box::pin(tokio::time::sleep_until(deadline)),
+                deadline: Some(Box::pin(tokio::time::sleep_until(deadline))),
             }) as BoxStream)
         };
         tokio::select! { biased;
@@ -339,7 +339,21 @@ struct ResponseStream {
     response: bool,
     half_close: bool,
     upload_closed: bool,
-    deadline: Pin<Box<tokio::time::Sleep>>,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+impl ResponseStream {
+    fn check_setup(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        if self
+            .deadline
+            .as_mut()
+            .is_some_and(|deadline| deadline.as_mut().poll(cx).is_ready())
+        {
+            self.raw.take();
+            self.lease.take();
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
+    }
 }
 impl AsyncRead for ResponseStream {
     fn poll_read(
@@ -350,12 +364,8 @@ impl AsyncRead for ResponseStream {
         if out.remaining() == 0 || self.raw.is_none() {
             return Poll::Ready(Ok(()));
         }
+        self.check_setup(cx)?;
         if !self.response {
-            // A pooled physical connection does not extend this logical
-            // stream's setup deadline, including an already-buffered status.
-            if self.deadline.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
-            }
             let mut status = [0];
             let mut buf = ReadBuf::new(&mut status);
             ready!(Pin::new(self.raw.as_mut().unwrap()).poll_read(cx, &mut buf))?;
@@ -368,6 +378,7 @@ impl AsyncRead for ResponseStream {
                 )));
             }
             self.response = true;
+            self.deadline = None;
         }
         Pin::new(self.raw.as_mut().unwrap()).poll_read(cx, out)
     }
@@ -381,15 +392,26 @@ impl AsyncWrite for ResponseStream {
         if self.upload_closed {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
-        Pin::new(self.raw.as_mut().ok_or(io::ErrorKind::BrokenPipe)?).poll_write(cx, buf)
+        self.check_setup(cx)?;
+        let result =
+            Pin::new(self.raw.as_mut().ok_or(io::ErrorKind::BrokenPipe)?).poll_write(cx, buf);
+        if matches!(result, Poll::Ready(Ok(written)) if written > 0) {
+            // A peer may delay both HTTP headers and mux status until target
+            // data exists. Only actual business writes reach this wrapper;
+            // Pool::open has already flushed the mux request metadata.
+            self.deadline = None;
+        }
+        result
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.check_setup(cx)?;
         Pin::new(self.raw.as_mut().ok_or(io::ErrorKind::BrokenPipe)?).poll_flush(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.upload_closed {
             return Poll::Ready(Ok(()));
         }
+        self.check_setup(cx)?;
         if let Some(raw) = &mut self.raw {
             ready!(Pin::new(raw).poll_shutdown(cx))?;
         }
@@ -422,7 +444,7 @@ mod tests {
                 response: true,
                 half_close,
                 upload_closed: false,
-                deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(1))),
+                deadline: None,
             };
             stream.write_all(b"upload").await.unwrap();
             stream.shutdown().await.unwrap();
@@ -456,7 +478,9 @@ mod tests {
                 response: false,
                 half_close: true,
                 upload_closed: false,
-                deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(1))),
+                deadline: Some(Box::pin(tokio::time::sleep(
+                    std::time::Duration::from_secs(1),
+                ))),
             };
             if timing == "late-after-pending" {
                 assert!(futures_util::poll!(std::pin::pin!(stream.read_u8())).is_pending());
@@ -479,12 +503,242 @@ mod tests {
                     io::ErrorKind::TimedOut,
                     "{timing}"
                 );
-                // A late response cannot revive a stream after a timeout.
-                assert_eq!(
-                    stream.read_u8().await.unwrap_err().kind(),
-                    io::ErrorKind::TimedOut
-                );
+                // Timeout closes the supplied IO and lease; late writes or
+                // already-buffered status cannot revive this logical stream.
+                assert!(stream.raw.is_none());
+                assert!(stream.lease.is_none());
+                assert!(stream.write(b"late").await.is_err());
+                assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
             }
         }
+    }
+    fn pending_status(raw: BoxStream, deadline: Instant) -> ResponseStream {
+        ResponseStream {
+            raw: Some(raw),
+            lease: None,
+            response: false,
+            half_close: true,
+            upload_closed: false,
+            deadline: Some(Box::pin(tokio::time::sleep_until(deadline))),
+        }
+    }
+
+    enum NoBusinessWrite {
+        Pending,
+        Zero,
+        Error,
+    }
+    impl AsyncRead for NoBusinessWrite {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+    impl AsyncWrite for NoBusinessWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            match self.get_mut() {
+                Self::Pending => Poll::Pending,
+                Self::Zero => Poll::Ready(Ok(0)),
+                Self::Error => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_pending_and_error_writes_do_not_release_setup_deadline() {
+        for raw in [
+            NoBusinessWrite::Pending,
+            NoBusinessWrite::Zero,
+            NoBusinessWrite::Error,
+        ] {
+            let mut stream = pending_status(
+                Box::new(raw),
+                Instant::now() + std::time::Duration::from_secs(1),
+            );
+            let _ = futures_util::poll!(std::pin::pin!(stream.write(b"payload")));
+            assert!(stream.deadline.is_some());
+            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            assert_eq!(
+                stream.write(b"late").await.unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+            assert!(stream.raw.is_none());
+        }
+        for operation in ["empty-write", "flush", "shutdown"] {
+            let (raw, _peer) = tokio::io::duplex(16);
+            let mut stream = pending_status(
+                Box::new(raw),
+                Instant::now() + std::time::Duration::from_secs(1),
+            );
+            match operation {
+                "empty-write" => assert_eq!(stream.write(&[]).await.unwrap(), 0),
+                "flush" => stream.flush().await.unwrap(),
+                "shutdown" => stream.shutdown().await.unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(stream.deadline.is_some(), "{operation}");
+            assert_eq!(stream.read(&mut []).await.unwrap(), 0);
+            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            assert_eq!(
+                stream.read_u8().await.unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+            assert!(stream.raw.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn h2mux_upload_outlives_delayed_headers_and_validates_late_status() {
+        for status in [Some(0), Some(1), Some(2), None] {
+            let (raw, peer) = tokio::io::duplex(65536);
+            let (accepted, mut requests) = tokio::sync::mpsc::channel(1);
+            let peer_driver = tokio::spawn(async move {
+                let mut connection = h2::server::handshake(peer).await.unwrap();
+                while let Some(Ok(request)) = connection.accept().await {
+                    if accepted.send(request).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let (sender, driver) = h2_driver::new(Box::new(raw)).await.unwrap();
+            let client_driver = tokio::spawn(driver);
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            let mut raw = Sender::H2(sender).open(deadline).await.unwrap();
+            let metadata = [0, 0, 1, 192, 0, 2, 1, 1, 187];
+            raw.write_all(&metadata).await.unwrap();
+            raw.flush().await.unwrap();
+            let (request, mut response) = requests.recv().await.unwrap();
+            let mut input = request.into_body();
+            let first = input.data().await.unwrap().unwrap();
+            assert_eq!(first.as_ref(), metadata);
+            input.flow_control().release_capacity(first.len()).unwrap();
+            let mut stream = pending_status(raw, deadline);
+            assert!(futures_util::poll!(std::pin::pin!(stream.read_u8())).is_pending());
+            stream.write_all(b"before").await.unwrap();
+            stream.flush().await.unwrap();
+            let first = input.data().await.unwrap().unwrap();
+            assert_eq!(first.as_ref(), b"before");
+            input.flow_control().release_capacity(first.len()).unwrap();
+            assert!(stream.deadline.is_none());
+
+            tokio::time::advance(std::time::Duration::from_secs(11)).await;
+            assert!(futures_util::poll!(std::pin::pin!(stream.read_u8())).is_pending());
+            stream.write_all(b"after").await.unwrap();
+            stream.flush().await.unwrap();
+            let second = input.data().await.unwrap().unwrap();
+            assert_eq!(second.as_ref(), b"after");
+            input.flow_control().release_capacity(second.len()).unwrap();
+            let mut output = response
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            match status {
+                Some(status) => output
+                    .send_data(Bytes::copy_from_slice(&[status, 42]), false)
+                    .unwrap(),
+                None => output.send_data(Bytes::new(), true).unwrap(),
+            }
+            if status == Some(0) {
+                assert_eq!(stream.read_u8().await.unwrap(), 42);
+                stream.shutdown().await.unwrap();
+                while let Some(bytes) = input.data().await {
+                    assert!(
+                        bytes.unwrap().is_empty(),
+                        "upload FIN must carry no extra payload"
+                    );
+                }
+                output.send_data(Bytes::from_static(b"tail"), true).unwrap();
+                let mut tail = Vec::new();
+                stream.read_to_end(&mut tail).await.unwrap();
+                assert_eq!(tail, b"tail");
+            } else {
+                assert_eq!(
+                    stream.read_u8().await.unwrap_err().kind(),
+                    io::ErrorKind::ConnectionRefused
+                );
+                assert!(stream.raw.is_none());
+            }
+            drop(stream);
+            drop(input);
+            drop(output);
+            client_driver.abort();
+            let _ = client_driver.await;
+            peer_driver.abort();
+            let _ = peer_driver.await;
+        }
+    }
+
+    #[cfg(feature = "outbound-vless")]
+    #[tokio::test(start_paused = true)]
+    async fn brutal_control_reply_still_uses_the_original_setup_deadline() {
+        let (raw, mut peer) = tokio::io::duplex(65536);
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer_observed = observed.clone();
+        let peer_driver = tokio::spawn(async move {
+            let mut protocol = [0; 2];
+            peer.read_exact(&mut protocol).await.unwrap();
+            assert_eq!(protocol, [0, 2]);
+            let mut connection = h2::server::handshake(peer).await.unwrap();
+            let mut requests = tokio::task::JoinSet::new();
+            while let Some(Ok((request, response))) = connection.accept().await {
+                let observed = peer_observed.clone();
+                requests.spawn(async move {
+                    let mut input = request.into_body();
+                    while let Some(Ok(bytes)) = input.data().await {
+                        observed.store(true, Ordering::SeqCst);
+                        input.flow_control().release_capacity(bytes.len()).unwrap();
+                    }
+                    drop(response);
+                });
+            }
+            while let Some(result) = requests.join_next().await {
+                result.unwrap();
+            }
+        });
+        let config = crate::config::Config::parse_yaml(
+            br#"proxies:
+- name: edge
+  type: vless
+  server: example.test
+  port: 443
+  uuid: 07070707-0707-0707-0707-070707070707
+  smux: {enabled: true, brutal-opts: {enabled: true, up: 8, down: 8}}
+rules: ['MATCH,DIRECT']
+"#,
+        )
+        .unwrap();
+        let pool = Pool::new(config.proxies[0].smux.clone().unwrap());
+        let start = Instant::now();
+        let result = pool
+            .open(
+                &Destination::Ip("192.0.2.1:443".parse().unwrap()),
+                false,
+                start + std::time::Duration::from_secs(1),
+                || async move {
+                    Ok(SuppliedStream {
+                        io: Box::new(raw),
+                        #[cfg(target_os = "linux")]
+                        control: None,
+                    })
+                },
+            )
+            .await;
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(Instant::now() - start, std::time::Duration::from_secs(1));
+        assert!(observed.load(Ordering::SeqCst));
+        pool.stop().await;
+        peer_driver.await.unwrap();
     }
 }
