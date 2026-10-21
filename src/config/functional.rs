@@ -14,7 +14,7 @@ pub(super) fn validate_fields(mapping: &serde_yaml_ng::Mapping) -> Result<()> {
             || (kind == "direct"
                 && matches!(
                     key,
-                    "interface-name" | "routing-mark" | "ip-version" | "tfo"
+                    "interface-name" | "routing-mark" | "ip-version" | "tfo" | "mptcp"
                 ))
             || (kind == "rematch" && matches!(key, "target-rematch-name" | "target-sub-rule"));
         if !accepted {
@@ -124,6 +124,7 @@ mod tests {
             "target-sub-rule: child, udp: true",
             "target-sub-rule: child, dialer-proxy: DIRECT",
             "target-sub-rule: child, smux: {enabled: false}",
+            "target-sub-rule: child, mptcp: true",
         ] {
             assert!(
                 Config::parse_yaml(
@@ -173,6 +174,31 @@ rules: ['REMATCH-NAME,blue/Green,DIRECT', 'MATCH,selected']
     }
 
     #[test]
+    fn node_mptcp_preserves_explicit_policy_across_proxy_chain() {
+        let config = Config::parse_yaml(
+            br#"proxies:
+  - {name: leaf, type: socks5, server: 192.0.2.1, port: 1080, mptcp: true, dialer-proxy: hop}
+  - {name: hop, type: socks5, server: 192.0.2.2, port: 1080}
+  - {name: local, type: direct, mptcp: true}
+  - {name: ordinary, type: direct, mptcp: false}
+"#,
+        )
+        .unwrap();
+        assert!(config.proxies[0].mptcp);
+        assert!(!config.proxies[1].mptcp);
+        assert!(config.proxies[2].mptcp);
+        assert!(!config.proxies[3].mptcp);
+        assert!(config.proxies.iter().all(|node| !node.tfo));
+
+        for kind in ["direct", "socks5, server: 192.0.2.1, port: 1080"] {
+            for value in ["null", "'true'", "1"] {
+                let input = format!("proxies: [{{name: edge, type: {kind}, mptcp: {value}}}]");
+                assert!(Config::parse_yaml(input.as_bytes()).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn functional_outbounds_have_names_and_udp_without_server_endpoints() {
         let config = Config::parse_yaml(
             br#"
@@ -208,7 +234,12 @@ rules: ['DST-PORT,53,resolver', 'DOMAIN,blocked.test,blocked', 'MATCH,local']
                 "action: drop",
             ];
             if kind != "direct" {
-                fields.extend(["interface-name: ''", "routing-mark: 0", "ip-version: dual"]);
+                fields.extend([
+                    "interface-name: ''",
+                    "routing-mark: 0",
+                    "ip-version: dual",
+                    "mptcp: false",
+                ]);
             }
             for field in fields {
                 let input = format!("proxies: [{{name: edge, type: {kind}, {field}}}]");

@@ -1145,6 +1145,7 @@ fn build_proxy_graph(
             .clone()
             .with_ip_version(proxy.ip_version)
             .with_tfo(proxy.tfo)
+            .with_mptcp(proxy.mptcp)
             .with_egress(&proxy.egress);
         node_dialer.validate_egress()?;
         let connector: Arc<dyn OutboundConnector> = match &proxy.protocol {
@@ -3055,6 +3056,7 @@ rules:
         fn socks5(tag: &str) -> ProxyConfig {
             ProxyConfig {
                 tfo: false,
+                mptcp: false,
                 egress: Default::default(),
                 smux: None,
                 ip_version: crate::config::IpVersion::Dual,
@@ -3074,6 +3076,7 @@ rules:
         fn anytls(tag: &str) -> ProxyConfig {
             ProxyConfig {
                 tfo: false,
+                mptcp: false,
                 egress: Default::default(),
                 smux: None,
                 ip_version: crate::config::IpVersion::Dual,

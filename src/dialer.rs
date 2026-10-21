@@ -8,6 +8,9 @@ pub(crate) use ping::{PhysicalPing, PingReceipt};
 #[cfg(target_os = "linux")]
 #[path = "dialer_fast_open.rs"]
 mod fast_open;
+#[cfg(target_os = "linux")]
+#[path = "dialer_mptcp.rs"]
+mod mptcp;
 #[cfg(all(target_os = "linux", test, feature = "tun"))]
 #[path = "dialer_mptcp_gate.rs"]
 mod mptcp_gate;
@@ -391,6 +394,7 @@ struct InterfaceBinding {
 #[derive(Clone)]
 pub struct Dialer {
     tfo: bool,
+    mptcp: bool,
     egress: crate::config::EgressOptions,
     dns_sources: Arc<crate::dns::source::NetworkSources>,
     dns_binding: Option<crate::dns::source::DnsBinding>,
@@ -421,6 +425,7 @@ impl std::fmt::Debug for Dialer {
         debug.field("interface_binding", &self.interface_binding);
         debug
             .field("tfo", &self.tfo)
+            .field("mptcp", &self.mptcp)
             .field("ipv6", &self.ipv6)
             .field("connect_timeout", &self.connect_timeout)
             .finish()
@@ -431,6 +436,7 @@ impl Default for Dialer {
     fn default() -> Self {
         Self {
             tfo: false,
+            mptcp: false,
             egress: Default::default(),
             dns_sources: Arc::new(crate::dns::source::NetworkSources::default()),
             dns_binding: None,
@@ -710,6 +716,11 @@ impl Dialer {
     /// Exact node policy: false does not inherit another node's TFO setting.
     pub(crate) fn with_tfo(mut self, tfo: bool) -> Self {
         self.tfo = tfo;
+        self
+    }
+
+    pub(crate) fn with_mptcp(mut self, mptcp: bool) -> Self {
+        self.mptcp = mptcp;
         self
     }
 
@@ -1113,7 +1124,13 @@ impl Dialer {
         &self,
         address: SocketAddr,
     ) -> io::Result<(TcpSocket, crate::resources::observation::Guard, SocketAddr)> {
-        self.prepare_tcp_socket_with(address, |ipv6| {
+        #[cfg(target_os = "linux")]
+        let mptcp = self.permits_mptcp();
+        self.prepare_tcp_socket_with(address, move |ipv6| {
+            #[cfg(target_os = "linux")]
+            if mptcp {
+                return mptcp::socket(ipv6);
+            }
             if ipv6 {
                 TcpSocket::new_v6()
             } else {

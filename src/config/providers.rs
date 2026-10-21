@@ -142,6 +142,7 @@ impl ProviderSpec {
             if ![
                 "ip-version",
                 "tfo",
+                "mptcp",
                 "interface-name",
                 "routing-mark",
                 "udp",
@@ -834,7 +835,7 @@ fn validate_overrides(overrides: &BTreeMap<String, Value>) -> Result<()> {
             "routing-mark" => value
                 .as_i64()
                 .is_some_and(|mark| EgressOptions::normalize(String::new(), mark).is_ok()),
-            "tfo" | "udp" | "udp-over-tcp" | "skip-cert-verify" => value.is_bool(),
+            "tfo" | "mptcp" | "udp" | "udp-over-tcp" | "skip-cert-verify" => value.is_bool(),
             "override-expr" => value
                 .as_sequence()
                 .is_some_and(|values| values.iter().all(Value::is_string)),
@@ -1116,6 +1117,37 @@ proxy-groups:
                 .materialize(&ProviderContents::new())
                 .unwrap();
             assert_eq!(config.proxies, fresh.proxies);
+        }
+    }
+
+    #[test]
+    fn provider_mptcp_override_survives_rematerialization_with_explicit_false() {
+        for enabled in [false, true] {
+            let yaml = format!(
+                r#"proxy-providers:
+  nodes:
+    type: inline
+    override: {{mptcp: {enabled}}}
+    payload:
+      - {{name: local, type: direct, mptcp: true}}
+      - {{name: remote, type: socks5, server: 192.0.2.1, port: 1080}}
+"#,
+            );
+            let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            assert!(config.proxies.iter().all(|node| node.mptcp == enabled));
+            let fresh = config
+                .providers
+                .as_ref()
+                .unwrap()
+                .materialize(&ProviderContents::new())
+                .unwrap();
+            assert_eq!(config.proxies, fresh.proxies);
+        }
+        for value in ["null", "'true'", "1"] {
+            let yaml = format!(
+                "proxy-providers: {{nodes: {{type: inline, override: {{mptcp: {value}}}, payload: []}}}}"
+            );
+            assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
         }
     }
 

@@ -27,6 +27,15 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   TFO 不把尚未连接的 socket 当成地址竞速赢家；实际地址来自同一出口校验/转换，
   首读、空写、flush 和零上传半关闭也推进握手，并保留同一建链期限与同步 Stop。
   不缓存、重新拨号或重放已接受的业务字节。Provider 同名覆盖保留显式 false。
+- 节点 `mptcp` 缺省 false，具名 direct 同样可用，Provider 同名覆盖保留显式 false；
+  均只接受非 null 布尔值。Linux 的无约束物理 TCP 首跳可尝试 MPTCP，保留既有
+  routing-mark 与防环策略；路径管理器、额外路径与系统路由由宿主管理，Core 不配置子流。
+  有 socket protector、显式或自动接口绑定、专用 DNS binding、源 IP 约束时使用普通
+  受控 TCP，避免内核额外子流越过初始 socket 的保护范围。Linux 自建 TUN 的
+  `auto-detect-interface` 同样属于接口约束；启用 MPTCP 的宿主须自行确保物理路径与防环。
+  其他系统或本机/对端没有 MPTCP 能力时允许普通 TCP 回退，但保护、绑定及实际 IO 错误
+  不触发绕过策略的重拨。代理链仅实际物理首跳消费自身值，组落到 DIRECT 时使用
+  当前节点值；原生 UDP/QUIC 不受影响。多路径协商不代表已建立多条子流。
 - 普通协议节点和具名 direct 的 `ip-version` 为 `dual`（默认）、`ipv4`、`ipv6`、`ipv4-prefer` 或 `ipv6-prefer`。
   限制或排序该节点的物理服务器地址与本地解析结果，仍受全局 IPv6 开关约束。
   不要求远端代理按相同地址族解析业务域名。
@@ -96,7 +105,7 @@ mTLS 或 ECH，沿用 [REALITY](reality-wire-protocol.md) 的无回退身份与�
 ## 功能出站
 
 具名 `direct`、`dns`、`reject` 只需 `name/type`，没有代理服务器端点，均提供 UDP。
-`direct` 另接受 `ip-version/interface-name/routing-mark`，通过共享 Dialer 直连业务目标，
+`direct` 另接受 `ip-version/interface-name/routing-mark/tfo/mptcp`，通过共享 Dialer 直连业务目标，
 域名使用当前会话的 `direct-nameserver` 角色，并保留其取消和地址族策略。
 `dns/reject` 不接受未被其实际消费的节点出口参数。
 

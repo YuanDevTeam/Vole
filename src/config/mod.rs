@@ -790,6 +790,7 @@ pub enum Network {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyConfig {
     pub tfo: bool,
+    pub mptcp: bool,
     pub egress: EgressOptions,
     pub ip_version: IpVersion,
     pub smux: Option<SingMuxConfig>,
@@ -1784,6 +1785,7 @@ where
 #[derive(Debug)]
 struct RawOutbound {
     tfo: bool,
+    mptcp: bool,
     egress: EgressOptions,
     ip_version: IpVersion,
     smux: Option<sing_mux::RawSingMux>,
@@ -1819,6 +1821,14 @@ impl<'de> Deserialize<'de> for RawOutbound {
             .transpose()
             .map_err(serde::de::Error::custom)?
             .unwrap_or_default();
+        let mptcp = value
+            .as_mapping_mut()
+            .expect("mapping checked")
+            .remove("mptcp")
+            .map(serde_yaml_ng::from_value::<bool>)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_default();
         let ip_version = value
             .as_mapping_mut()
             .ok_or_else(|| serde::de::Error::custom("proxy requires a mapping"))?
@@ -1842,6 +1852,7 @@ impl<'de> Deserialize<'de> for RawOutbound {
         let protocol = serde_yaml_ng::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(Self {
             tfo,
+            mptcp,
             egress,
             ip_version,
             smux,
@@ -2306,6 +2317,7 @@ struct RawRealitySettings {
 #[derive(Debug)]
 struct PendingProxyConfig {
     tfo: bool,
+    mptcp: bool,
     egress: EgressOptions,
     ip_version: IpVersion,
     smux: Option<SingMuxConfig>,
@@ -2959,6 +2971,7 @@ fn normalize_proxy_graph_with_groups(
         .zip(dialer_proxies)
         .map(|(proxy, dialer_proxy)| ProxyConfig {
             tfo: proxy.tfo,
+            mptcp: proxy.mptcp,
             egress: proxy.egress,
             ip_version: proxy.ip_version,
             smux: proxy.smux,
@@ -3306,6 +3319,7 @@ impl RawOutbound {
         }
         Ok(PendingProxyConfig {
             tfo: self.tfo,
+            mptcp: self.mptcp,
             egress: self.egress,
             ip_version: self.ip_version,
             smux,

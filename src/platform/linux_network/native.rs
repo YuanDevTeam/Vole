@@ -28,6 +28,13 @@ pub(crate) struct SocketPolicy {
     interfaces: Mutex<Option<Interfaces>>,
 }
 impl SocketPolicy {
+    // A kernel-created subflow can replace its inherited bound interface with
+    // the path manager's endpoint. SO_MARK is inherited; interface discovery
+    // requires ordinary TCP until all subflows can be constrained as well.
+    pub(crate) fn permits_mptcp(&self) -> bool {
+        !self.detect
+    }
+
     fn default_mark(&self, configured_mark: u32) -> Option<u32> {
         // Every capture rule matches only mark zero. A nonzero public mark
         // already bypasses this lease and must retain its own RPDB meaning.

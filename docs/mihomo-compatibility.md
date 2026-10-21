@@ -19,7 +19,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 | 范围 | 当前支持 |
 | --- | --- |
 | 配置与选路 | YAML anchor/merge；rule/global/direct；内置 DIRECT/COMPATIBLE/REJECT/REJECT-DROP；域名、地址、端口、网络、GeoData、RULE-SET 和 AND/OR/NOT |
-| 物理出口 | 全局/节点 interface-name、Linux routing-mark、Provider 对应 override、物理 TCP 与指定 UDP 节点的 IP4P 转换、普通 DNS #接口；平台约束和 auto-route 防环见出站与 TUN 契约 |
+| 物理出口 | 全局/节点 interface-name、Linux routing-mark、节点 tfo/mptcp 与 Provider 对应 override、物理 TCP 与指定 UDP 节点的 IP4P 转换、普通 DNS #接口；平台约束和 auto-route 防环见出站与 TUN 契约 |
 | 资源 | HTTP/file/inline proxy/rule providers；YAML/URI/标准 Base64 订阅、AGE；共享流式 gzip/URL Basic；动态成员、筛选、覆盖、健康检查；Provider dialer-proxy 与 HTTP 订阅信息；YAML/Text 与 domain/ipcidr MRS；有界离线规则bundle；失败保留旧代 |
 | 策略组 | select/url-test/fallback/load-balance；默认和持久选择；延迟容差、恢复、三种负载均衡策略；旧连接保持原路径 |
 | DNS | hosts（含启动 LAN 地址快照）、bootstrap/节点/直连解析角色、policy、respect-rules；UDP/TCP/DoH/DoT/DoQ、DoH/H3；fallback；redir-host/fake-IP 与映射持久化 |
@@ -67,6 +67,11 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 - WireGuard 使用标准用户态单/多 peer、最长前缀选择、reserved（数组或 Base64）、节点远端 DNS 与按需端点更新；
   每个本地地址族最多一个地址，MTU 至少1280。无 peers 时顶层 allowed-ips 与参考一致地忽略。
   peer 仅在实际使用时解析/建链；Mihomo 在节点初始化时解析所有 peer。
+- `mptcp` 是物理 TCP 首跳的可选能力，不改变协议报文。仅 Linux 的宿主管理、无
+  protector、显式/自动接口、专用 DNS binding 或源 IP 约束路径尝试；其余路径使用普通
+  受控 TCP，保留原保护与绑定的失败关闭。本机/对端不支持时允许 TCP 回退；
+  系统路径管理器、额外子流与出口网络配置仍归宿主，不将初始 socket 绑定推导为全部子流受控。
+  这比 Mihomo 的统一 MPTCP 开关更保守；原生 UDP/QUIC 不消费该字段。
 - 节点 UDP 能力按 [出站契约](outbounds.md) 声明；rule 模式跳过不支持 UDP 的目标，继续匹配后续规则。
   global 模式和显式 DNS 出口不执行此跳过。负载均衡组按其声明能力参与规则匹配，实际选中成员仍须支持 UDP。
 - 未启用 mixed-port 或 TUN 时仍可运行 Controller 和资源任务。Controller 接受通配 IP、localhost 和空 host；secret 可选，见 [Controller API](controller-api.md)。

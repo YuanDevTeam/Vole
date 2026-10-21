@@ -285,6 +285,11 @@ sniffer:
 # 普通协议节点和具名 direct 可声明 tfo: false（默认）。Linux 单个可用物理 TCP 地址启用
 # TCP Fast Open；多地址沿普通 eager TCP 选择，其他系统沿普通受控 TCP。原生 UDP 不受影响。
 # 仅真实物理首跳消费；经代理使用上游节点自己的 tfo，组落到 DIRECT 时使用当前节点 tfo。
+# 普通协议节点和具名 direct 可声明 mptcp: false（默认，非 null 布尔值）。仅 Linux
+# 无 socket protector、显式/自动接口、专用 DNS binding 或源 IP 约束的物理 TCP 路径尝试 MPTCP。
+# 系统路径管理器与额外路径由宿主管理，Core 不配置接口/子流；routing-mark 仍沿现有防环策略。
+# 受约束路径、其他系统或本机/对端不支持时使用普通受控 TCP，不绕过保护或绑定失败。
+# 代理链只消费实际首跳自己的值，组落到 DIRECT 时使用当前节点值；原生 UDP/QUIC 不受影响。
 # 普通协议节点和具名 direct 支持 ip-version: dual/ipv4/ipv6/ipv4-prefer/ipv6-prefer；默认 dual。
 # 普通协议节点和具名 direct 可声明 interface-name / routing-mark，仅物理首跳消费；经 dialer-proxy 时
 # 使用真正上游节点的出口策略，组落到 DIRECT 时保留当前节点策略。XHTTP 两腿使用相同策略。
@@ -311,7 +316,7 @@ sniffer:
 # H2 不消费 congestion-controller。
 proxies:
   # 功能出站没有 server/port；不接受 udp、smux 或 dialer-proxy。
-  # direct 另接受上方三项物理出口/地址族字段，域名使用 direct-nameserver。
+  # direct 另接受 interface-name/routing-mark/ip-version/tfo/mptcp，域名使用 direct-nameserver。
   - {name: direct-local, type: direct}
   # dns 仅接受 name/type，复用当前会话解析器，可由普通规则接管任意端口的 TCP/UDP DNS。
   - {name: dns-local, type: dns}
@@ -645,6 +650,7 @@ proxies:
     type: socks5
     server: socks.example.com
     port: 1080
+    mptcp: false # true 仅在上述 Linux 宿主管理的无接口/源地址约束路径尝试
     username: user
     password: password
     udp: true
@@ -786,7 +792,7 @@ proxy-groups:
 # 来源摘要绑定精确 URL、实际 header/UA；旧 URL-only 元数据保留可用内容但不复用 ETag。
 # provider 的 dialer-proxy 覆盖每个节点的同名字段，override 最后应用；
 # 它只控制节点上游，资源下载仍使用独立的 proxy 字段。
-# override 支持 tfo、udp、udp-over-tcp、up/down、dialer-proxy、ip-version、interface-name、routing-mark、skip-cert-verify、name-cert-verify、
+# override 支持 tfo、mptcp、udp、udp-over-tcp、up/down、dialer-proxy、ip-version、interface-name、routing-mark、skip-cert-verify、name-cert-verify、
 # additional-prefix/suffix、proxy-name: [{pattern: '表达式', target: '替换文本'}]、override-expr 字符串数组；
 # 协议专属覆盖只用于支持该字段的节点。未实现的覆盖字段严格拒绝。
 # override-expr 为原生有限 yq 方言，校验时预编译：原名称过滤 → 结构化 override / 改名 / 前后缀
