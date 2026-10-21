@@ -74,6 +74,10 @@ impl Flow {
         )
     }
 }
+enum Command {
+    Frame(Frame),
+    Flush(oneshot::Sender<io::Result<()>>),
+}
 struct Frame {
     cmd: u8,
     id: u32,
@@ -95,11 +99,12 @@ struct Shared {
     state: Mutex<State>,
     changed: Notify,
     options: Options,
+    autonomous_writes: bool,
 }
 #[derive(Clone)]
 pub(crate) struct Client {
     shared: Arc<Shared>,
-    write: mpsc::Sender<Frame>,
+    write: mpsc::Sender<Command>,
 }
 impl Client {
     pub(crate) async fn open(&self) -> io::Result<BoxStream> {
@@ -135,12 +140,12 @@ impl Client {
                 },
             );
             let (tx, rx) = oneshot::channel();
-            permit.send(Frame {
+            permit.send(Command::Frame(Frame {
                 cmd: 0,
                 id,
                 data: Bytes::new(),
                 done: tx,
-            });
+            }));
             (id, rx)
         };
         let stream = Stream {
@@ -152,6 +157,8 @@ impl Client {
             cancelled: Box::pin(close.cancelled_owned()),
             remote_fin,
             pending: None,
+            pending_is_flush: false,
+            dirty: false,
             data: Bytes::new(),
             receive_permit: None,
             flow,
@@ -176,9 +183,23 @@ impl Drop for Lifetime {
 pub(crate) fn new(raw: BoxStream) -> (Client, impl Future<Output = ()> + Send) {
     with_options(raw, Options::default()).expect("valid default smux options")
 }
+#[cfg(any(feature = "sing-mux", test))]
+pub(crate) fn new_with_autonomous_writes(
+    raw: BoxStream,
+    autonomous_writes: bool,
+) -> (Client, impl Future<Output = ()> + Send) {
+    configure(raw, Options::default(), autonomous_writes).expect("valid default smux options")
+}
 pub(crate) fn with_options(
     raw: BoxStream,
     options: Options,
+) -> io::Result<(Client, impl Future<Output = ()> + Send)> {
+    configure(raw, options, false)
+}
+fn configure(
+    raw: BoxStream,
+    options: Options,
+    autonomous_writes: bool,
 ) -> io::Result<(Client, impl Future<Output = ()> + Send)> {
     if !(1..=2).contains(&options.version)
         || !(1..=65535).contains(&options.frame_size)
@@ -201,9 +222,10 @@ pub(crate) fn with_options(
         }),
         changed: Notify::new(),
         options,
+        autonomous_writes,
     });
     let lifetime = Lifetime(shared.clone());
-    let (write, mut frames) = mpsc::channel::<Frame>(crate::limits::SING_MUX_COMMAND_QUEUE);
+    let (write, mut frames) = mpsc::channel::<Command>(crate::limits::SING_MUX_COMMAND_QUEUE);
     let client = Client {
         shared: shared.clone(),
         write,
@@ -283,6 +305,8 @@ pub(crate) fn with_options(
     };
     let write = async move {
         let mut processed = 0;
+        // Keep only completion senders, never a second payload queue.
+        let mut completions = Vec::with_capacity(crate::limits::SING_MUX_COMMAND_QUEUE);
         let duration = options
             .keepalive
             .unwrap_or(std::time::Duration::from_secs(24 * 3600));
@@ -332,33 +356,100 @@ pub(crate) fn with_options(
                     },
                     frame=frames.recv()=>{let Some(frame)=frame else {return Ok::<(),io::Error>(());};frame}
                 };
-                let alive = shared
-                    .state
-                    .lock()
-                    .unwrap()
-                    .streams
-                    .get(&frame.id)
-                    .is_some_and(|e| !e.close.is_cancelled());
-                if !alive {
-                    let _ = frame.done.send(Err(io::ErrorKind::BrokenPipe.into()));
-                    continue;
+                let mut command = frame;
+                let mut count = 0;
+                let mut bytes = 0_usize;
+                let mut result = Ok(());
+                loop {
+                    let mut flush_barrier = false;
+                    match command {
+                        Command::Flush(done) => {
+                            // FIFO after all earlier DATA writes. Its receiver
+                            // remains in Stream even if a flush future is dropped.
+                            completions.push(done);
+                            flush_barrier = true;
+                        }
+                        Command::Frame(Frame {
+                            cmd,
+                            id,
+                            data,
+                            done,
+                        }) => {
+                            let alive = shared
+                                .state
+                                .lock()
+                                .unwrap()
+                                .streams
+                                .get(&id)
+                                .is_some_and(|entry| !entry.close.is_cancelled());
+                            if alive {
+                                bytes += 8 + data.len();
+                                result =
+                                    write_frame(&mut writer, options.version, cmd, id, &data).await;
+                                if autonomous_writes && cmd == 2 {
+                                    // This capability is restricted to owned
+                                    // XHTTP drivers that advance accepted bodies
+                                    // independently. It never weakens explicit flush.
+                                    let _ = done.send(match &result {
+                                        Ok(()) => Ok(()),
+                                        Err(error) => Err(error.kind().into()),
+                                    });
+                                } else {
+                                    completions.push(done);
+                                }
+                            } else {
+                                let _ = done.send(Err(io::ErrorKind::BrokenPipe.into()));
+                            }
+                            // No second payload queue: at most the original
+                            // command queue plus the currently written frame.
+                            drop(data);
+                        }
+                    }
+                    count += 1;
+                    let control_pending = {
+                        let state = shared.state.lock().unwrap();
+                        state.streams.values().any(|entry| {
+                            entry.close.is_cancelled()
+                                || (options.version == 2
+                                    && entry.flow.update.load(Ordering::Acquire))
+                        })
+                    };
+                    if flush_barrier
+                        || result.is_err()
+                        || count == crate::limits::SING_MUX_COMMAND_QUEUE
+                        || processed + count >= crate::limits::IO_POLL_BUDGET
+                        || bytes + 8 + options.frame_size > 64 * 1024
+                        || control_pending
+                    {
+                        break;
+                    }
+                    match frames.try_recv() {
+                        Ok(next) => command = next,
+                        Err(_) => break,
+                    }
                 }
-                let result = send(
-                    &mut writer,
-                    options.version,
-                    frame.cmd,
-                    frame.id,
-                    &frame.data,
-                )
-                .await;
-                let failed = result.is_err();
-                let _ = frame.done.send(result);
-                if failed {
+                if result.is_ok() && !completions.is_empty() {
+                    result = writer.flush().await;
+                }
+                let error = result.err().map(|error| error.kind());
+                for done in completions.drain(..) {
+                    let _ = done.send(match error {
+                        Some(kind) => Err(kind.into()),
+                        None => Ok(()),
+                    });
+                }
+                if error.is_some() {
                     return Err(io::ErrorKind::ConnectionAborted.into());
                 }
+                processed += count;
+                if processed >= crate::limits::IO_POLL_BUDGET {
+                    processed = 0;
+                    tokio::task::yield_now().await;
+                }
+                continue;
             }
             processed += 1;
-            if processed == crate::limits::IO_POLL_BUDGET {
+            if processed >= crate::limits::IO_POLL_BUDGET {
                 processed = 0;
                 tokio::task::yield_now().await;
             }
@@ -380,19 +471,28 @@ async fn send<W: AsyncWrite + Unpin>(
     id: u32,
     data: &[u8],
 ) -> io::Result<()> {
+    write_frame(writer, version, cmd, id, data).await?;
+    writer.flush().await
+}
+async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    version: u8,
+    cmd: u8,
+    id: u32,
+    data: &[u8],
+) -> io::Result<()> {
     let mut header = [0; 8];
     header[0] = version;
     header[1] = cmd;
     header[2..4].copy_from_slice(&(data.len() as u16).to_le_bytes());
     header[4..8].copy_from_slice(&id.to_le_bytes());
     writer.write_all(&header).await?;
-    writer.write_all(data).await?;
-    writer.flush().await
+    writer.write_all(data).await
 }
 struct Stream {
     id: u32,
     shared: Arc<Shared>,
-    write: PollSender<Frame>,
+    write: PollSender<Command>,
     receive: mpsc::Receiver<Packet>,
     receive_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     flow: Arc<Flow>,
@@ -401,6 +501,8 @@ struct Stream {
     cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
     remote_fin: Arc<AtomicBool>,
     pending: Option<oneshot::Receiver<io::Result<()>>>,
+    pending_is_flush: bool,
+    dirty: bool,
     data: Bytes,
 }
 impl Stream {
@@ -420,8 +522,26 @@ impl Stream {
         if let Some(pending) = &mut self.pending {
             ready!(Pin::new(pending).poll(cx)).map_err(|_| io::ErrorKind::BrokenPipe)??;
             self.pending = None;
+            if self.pending_is_flush {
+                self.pending_is_flush = false;
+                self.dirty = false;
+            }
         }
         Poll::Ready(Ok(()))
+    }
+    fn poll_flush_barrier(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.flush_pending(cx))?;
+        if !self.shared.autonomous_writes || !self.dirty {
+            return Poll::Ready(Ok(()));
+        }
+        ready!(self.write.poll_reserve(cx)).map_err(|_| io::ErrorKind::BrokenPipe)?;
+        let (done, completed) = oneshot::channel();
+        self.write
+            .send_item(Command::Flush(done))
+            .map_err(|_| io::ErrorKind::BrokenPipe)?;
+        self.pending = Some(completed);
+        self.pending_is_flush = true;
+        self.flush_pending(cx)
     }
 }
 impl Drop for Stream {
@@ -498,24 +618,25 @@ impl AsyncWrite for Stream {
         let id = self.id;
         self.flow.written.fetch_add(size as u32, Ordering::AcqRel);
         self.write
-            .send_item(Frame {
+            .send_item(Command::Frame(Frame {
                 cmd: 2,
                 id,
                 data: Bytes::copy_from_slice(&buf[..size]),
                 done: tx,
-            })
+            }))
             .map_err(|_| io::ErrorKind::BrokenPipe)?;
         self.pending = Some(rx);
+        self.dirty = true;
         Poll::Ready(Ok(size))
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.flush_pending(cx)
+        self.poll_flush_barrier(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.close.is_cancelled() {
             return Poll::Ready(Ok(()));
         }
-        ready!(self.flush_pending(cx))?;
+        ready!(self.poll_flush_barrier(cx))?;
         self.stop();
         Poll::Ready(Ok(()))
     }
@@ -525,6 +646,271 @@ impl AsyncWrite for Stream {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[derive(Default)]
+    struct FlushGateState {
+        // 0: blocked; 1: successful physical flush; 2: physical error.
+        mode: std::sync::atomic::AtomicU8,
+        flushes: std::sync::atomic::AtomicUsize,
+        changed: AtomicWaker,
+    }
+    struct FlushGate {
+        raw: tokio::io::DuplexStream,
+        state: Arc<FlushGateState>,
+    }
+    impl AsyncRead for FlushGate {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            out: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.raw).poll_read(cx, out)
+        }
+    }
+    impl AsyncWrite for FlushGate {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.raw).poll_write(cx, data)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.state.changed.register(cx.waker());
+            match self.state.mode.load(Ordering::Acquire) {
+                0 => Poll::Pending,
+                2 => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
+                _ => {
+                    ready!(Pin::new(&mut self.raw).poll_flush(cx))?;
+                    self.state.flushes.fetch_add(1, Ordering::AcqRel);
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.raw).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn autonomous_data_keeps_explicit_flush_strong_and_cancelled_barrier_unique() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let (raw, mut peer) = tokio::io::duplex(1024);
+            let gate = Arc::new(FlushGateState::default());
+            gate.mode.store(1, Ordering::Release);
+            let (client, driver) = new_with_autonomous_writes(
+                Box::new(FlushGate {
+                    raw,
+                    state: gate.clone(),
+                }),
+                true,
+            );
+            let mut driver = Box::pin(driver);
+            let mut opening = Box::pin(client.open());
+            assert!(futures_util::poll!(opening.as_mut()).is_pending());
+            assert!(futures_util::poll!(driver.as_mut()).is_pending());
+            let mut stream = opening.await.unwrap();
+            let mut syn = [0; 8];
+            peer.read_exact(&mut syn).await.unwrap();
+            assert_eq!(gate.flushes.load(Ordering::Acquire), 1);
+
+            gate.mode.store(0, Ordering::Release);
+            for payload in [b"one", b"two"] {
+                stream.write_all(payload).await.unwrap();
+                assert!(futures_util::poll!(driver.as_mut()).is_pending());
+            }
+            let mut wire = [0; 22];
+            peer.read_exact(&mut wire).await.unwrap();
+            assert_eq!(&wire[..4], &[1, 2, 3, 0]);
+            assert_eq!(&wire[8..11], b"one");
+            assert_eq!(&wire[11..15], &[1, 2, 3, 0]);
+            assert_eq!(&wire[19..], b"two");
+            assert_eq!(
+                gate.flushes.load(Ordering::Acquire),
+                1,
+                "accepted DATA must not require a successful physical flush"
+            );
+
+            let mut first_flush = Box::pin(stream.flush());
+            assert!(futures_util::poll!(first_flush.as_mut()).is_pending());
+            assert!(futures_util::poll!(driver.as_mut()).is_pending());
+            drop(first_flush);
+            let mut resumed_flush = Box::pin(stream.flush());
+            assert!(futures_util::poll!(resumed_flush.as_mut()).is_pending());
+            assert_eq!(
+                client.write.capacity(),
+                crate::limits::SING_MUX_COMMAND_QUEUE,
+                "retrying must retain the in-flight barrier, not queue another"
+            );
+            gate.mode.store(1, Ordering::Release);
+            gate.changed.wake();
+            assert!(futures_util::poll!(driver.as_mut()).is_pending());
+            resumed_flush.await.unwrap();
+            assert_eq!(gate.flushes.load(Ordering::Acquire), 2);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn autonomous_shutdown_orders_flush_before_fin_and_stop_releases_waiters() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for outcome in [1, 2, 3] {
+                let (raw, mut peer) = tokio::io::duplex(1024);
+                let gate = Arc::new(FlushGateState::default());
+                gate.mode.store(1, Ordering::Release);
+                let (client, driver) = new_with_autonomous_writes(
+                    Box::new(FlushGate {
+                        raw,
+                        state: gate.clone(),
+                    }),
+                    true,
+                );
+                let mut driver = Some(Box::pin(driver));
+                let mut opening = Box::pin(client.open());
+                assert!(futures_util::poll!(opening.as_mut()).is_pending());
+                assert!(futures_util::poll!(driver.as_mut().unwrap().as_mut()).is_pending());
+                let mut stream = opening.await.unwrap();
+                let mut syn = [0; 8];
+                peer.read_exact(&mut syn).await.unwrap();
+                gate.mode.store(0, Ordering::Release);
+                stream.write_all(b"one").await.unwrap();
+                assert!(futures_util::poll!(driver.as_mut().unwrap().as_mut()).is_pending());
+                let mut shutdown = Box::pin(stream.shutdown());
+                assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+                assert!(futures_util::poll!(driver.as_mut().unwrap().as_mut()).is_pending());
+                let mut frame = [0; 11];
+                peer.read_exact(&mut frame).await.unwrap();
+                assert_eq!(&frame[..4], &[1, 2, 3, 0]);
+                assert_eq!(&frame[8..], b"one");
+                {
+                    let mut next = [0];
+                    let reading = peer.read(&mut next);
+                    tokio::pin!(reading);
+                    assert!(
+                        futures_util::poll!(reading.as_mut()).is_pending(),
+                        "FIN must not overtake a pending explicit payload flush"
+                    );
+                }
+                if outcome == 3 {
+                    // This is the node owner's cancellation boundary: dropping
+                    // its one driver closes both halves and all logical waiters.
+                    drop(driver.take());
+                } else {
+                    gate.mode.store(outcome, Ordering::Release);
+                    gate.changed.wake();
+                    assert_eq!(
+                        futures_util::poll!(driver.as_mut().unwrap().as_mut()).is_ready(),
+                        outcome == 2
+                    );
+                }
+                let shutdown_result = shutdown.await;
+                if outcome == 1 {
+                    assert!(shutdown_result.is_ok());
+                    assert!(futures_util::poll!(driver.as_mut().unwrap().as_mut()).is_pending());
+                    let mut fin = [0; 8];
+                    peer.read_exact(&mut fin).await.unwrap();
+                    assert_eq!(&fin[..4], &[1, 1, 0, 0]);
+                    assert_eq!(&fin[4..], &syn[4..]);
+                    assert_eq!(gate.flushes.load(Ordering::Acquire), 3);
+                } else {
+                    // Driver exit already cancels the stream, so shutdown
+                    // may be idempotent while explicit flush still fails.
+                    assert!(stream.flush().await.is_err());
+                    assert!(client.shared.state.lock().unwrap().closed);
+                    assert!(client.open().await.is_err());
+                }
+                drop(stream);
+                drop(driver);
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_frames_share_one_real_flush_and_never_ack_early() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // Exercise physical success, physical flush error and owner Stop
+            // after all queued payloads have been written but not flushed.
+            for outcome in [1, 2, 3] {
+                let (raw, mut peer) = tokio::io::duplex(1024);
+                let gate = Arc::new(FlushGateState::default());
+                gate.mode.store(1, Ordering::Release);
+                let (client, driver) = new(Box::new(FlushGate {
+                    raw,
+                    state: gate.clone(),
+                }));
+                let mut driver = Some(Box::pin(driver));
+                let mut openings = (0..3).map(|_| Box::pin(client.open())).collect::<Vec<_>>();
+                for opening in &mut openings {
+                    assert!(futures_util::poll!(opening.as_mut()).is_pending());
+                }
+                assert!(futures_util::poll!(driver.as_mut().unwrap().as_mut()).is_pending());
+                let mut streams = Vec::new();
+                for opening in openings {
+                    streams.push(opening.await.unwrap());
+                }
+                assert_eq!(gate.flushes.load(Ordering::Acquire), 1);
+                let mut syn = [0; 24];
+                peer.read_exact(&mut syn).await.unwrap();
+                for (index, header) in syn.chunks_exact(8).enumerate() {
+                    assert_eq!(&header[..4], &[1, 0, 0, 0]);
+                    assert_eq!(
+                        u32::from_le_bytes(header[4..].try_into().unwrap()),
+                        3 + index as u32 * 2
+                    );
+                }
+                gate.mode.store(0, Ordering::Release);
+                // The physical driver is not spawned: all three logical
+                // writes are deterministically ready before it is polled.
+                for stream in &mut streams {
+                    stream.write_all(b"one").await.unwrap();
+                }
+                assert!(futures_util::poll!(driver.as_mut().unwrap().as_mut()).is_pending());
+                for stream in &mut streams {
+                    let flush = stream.flush();
+                    tokio::pin!(flush);
+                    assert!(futures_util::poll!(flush.as_mut()).is_pending());
+                }
+                assert_eq!(gate.flushes.load(Ordering::Acquire), 1);
+                let mut wire = [0; 33];
+                peer.read_exact(&mut wire).await.unwrap();
+                for (index, frame) in wire.chunks_exact(11).enumerate() {
+                    assert_eq!(&frame[..4], &[1, 2, 3, 0]);
+                    assert_eq!(
+                        u32::from_le_bytes(frame[4..8].try_into().unwrap()),
+                        3 + index as u32 * 2
+                    );
+                    assert_eq!(&frame[8..], b"one");
+                }
+                if outcome == 3 {
+                    drop(driver.take());
+                } else {
+                    gate.mode.store(outcome, Ordering::Release);
+                    gate.changed.wake();
+                    assert_eq!(
+                        futures_util::poll!(driver.as_mut().unwrap().as_mut()).is_ready(),
+                        outcome == 2
+                    );
+                }
+                for stream in &mut streams {
+                    assert_eq!(stream.flush().await.is_ok(), outcome == 1);
+                }
+                assert_eq!(
+                    gate.flushes.load(Ordering::Acquire),
+                    if outcome == 1 { 2 } else { 1 }
+                );
+                if outcome != 1 {
+                    assert!(client.open().await.is_err());
+                }
+                drop(streams);
+                drop(driver);
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn shutdown_flushes_the_pending_frame_before_fin() {

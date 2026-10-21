@@ -1471,7 +1471,8 @@ fn build_proxy_graph(
 
         #[cfg(feature = "sing-mux")]
         let connector: Arc<dyn OutboundConnector> = if let Some(options) = &proxy.smux {
-            let mut mux = crate::outbound::SingMuxConnector::new(connector, options.clone());
+            let mut mux = crate::outbound::SingMuxConnector::new(connector, options.clone())
+                .with_autonomous_xhttp(proxy);
             #[cfg(target_os = "linux")]
             {
                 mux = mux.with_physical_tcp_control(proxy);

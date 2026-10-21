@@ -37,6 +37,7 @@ pub(crate) struct SuppliedStream {
 }
 pub(crate) struct Pool {
     options: SingMuxConfig,
+    autonomous_writes: bool,
     state: Arc<Mutex<State>>,
     opening: tokio::sync::Mutex<()>,
     cancel: CancellationToken,
@@ -71,12 +72,20 @@ impl Pool {
         let drained = options.brutal.map(|_| Arc::new(tokio::sync::Notify::new()));
         Self {
             options,
+            autonomous_writes: false,
             state: Arc::default(),
             opening: Default::default(),
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
             drained,
         }
+    }
+    pub(crate) fn set_autonomous_writes(&mut self, enabled: bool) {
+        self.autonomous_writes =
+            enabled && self.options.protocol == SingMuxProtocol::Smux && !self.options.padding;
+    }
+    pub(crate) fn autonomous_writes(&self) -> bool {
+        self.autonomous_writes
     }
     pub(crate) fn only_tcp(&self) -> bool {
         self.options.only_tcp
@@ -208,7 +217,8 @@ impl Pool {
     }
     async fn establish(&self, raw: BoxStream) -> io::Result<Connection> {
         if self.options.protocol == SingMuxProtocol::Smux {
-            let (sender, driver) = smux_driver::new(raw);
+            let (sender, driver) =
+                smux_driver::new_with_autonomous_writes(raw, self.autonomous_writes);
             return self.own(Sender::Smux(sender), driver);
         }
         if self.options.protocol == SingMuxProtocol::Yamux {

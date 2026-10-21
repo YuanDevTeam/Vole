@@ -40,6 +40,18 @@ impl SingMuxConnector {
             capture_tcp: false,
         }
     }
+    pub(crate) fn with_autonomous_xhttp(mut self, proxy: &crate::config::ProxyConfig) -> Self {
+        // Match the proven XUDP path: VLESS Encryption and sing-mux padding
+        // retain their own final write, so they cannot inherit this capability.
+        let enabled = matches!(
+            &proxy.protocol,
+            crate::config::ProxyProtocol::Vless(config)
+                if config.xhttp().is_some()
+                    && matches!(&config.encryption, crate::config::VlessEncryption::None)
+        );
+        self.pool.set_autonomous_writes(enabled);
+        self
+    }
     #[cfg(target_os = "linux")]
     pub(crate) fn with_physical_tcp_control(mut self, proxy: &crate::config::ProxyConfig) -> Self {
         self.capture_tcp = self.pool.brutal_enabled() && exclusive_tcp(proxy);
@@ -177,7 +189,9 @@ impl OutboundConnector for SingMuxConnector {
                 let target = Destination::domain("sp.mux.sing-box.arpa", 444)?;
                 let session = StreamSession { metadata:request.session.metadata.clone(), inbound:request.session.inbound, source:request.session.source, destination:target.clone(), sniffed_domain:None };
                 let io=self.pool.open(&target, true, context.deadline(), || self.connect(session, context)).await?;
-                Ok(crate::dispatch::bound_datagram(Box::new(DatagramIo::new(io,request.budget(),context.resolution(),context.deadline(),self.cancellation.clone())),request.budget()))
+                let transport = DatagramIo::new(io,request.budget(),context.resolution(),context.deadline(),self.cancellation.clone());
+                let transport = if self.pool.autonomous_writes() { transport.with_autonomous_writes() } else { transport };
+                Ok(crate::dispatch::bound_datagram(Box::new(transport),request.budget()))
             }=>result,
         }
     }
@@ -228,6 +242,44 @@ mod tests {
                 exclusive_tcp(&config.proxies[0]),
                 allowed,
                 "{network}, {extra}"
+            );
+        }
+    }
+
+    #[cfg(feature = "outbound-vless")]
+    #[test]
+    fn autonomous_capability_requires_unbuffered_vless_xhttp_smux() {
+        for (network, protocol, padding, encryption, expected) in [
+            ("xhttp", "smux", false, false, true),
+            ("tcp", "smux", false, false, false),
+            ("xhttp", "h2mux", false, false, false),
+            ("xhttp", "yamux", false, false, false),
+            ("xhttp", "smux", true, false, false),
+            ("xhttp", "smux", false, true, false),
+        ] {
+            let yaml = format!(
+                "mixed-port: 1080\nproxies:\n- name: edge\n  type: vless\n  server: 192.0.2.1\n  port: 443\n  uuid: 07070707-0707-4707-8707-070707070707\n  network: {network}\n  smux: {{enabled: true, protocol: {protocol}, padding: {padding}}}\nrules: ['MATCH,DIRECT']\n"
+            );
+            let mut config = crate::config::Config::parse_yaml(yaml.as_bytes()).unwrap();
+            let proxy = &mut config.proxies[0];
+            if encryption {
+                let crate::config::ProxyProtocol::Vless(config) = &mut proxy.protocol else {
+                    panic!("VLESS test node");
+                };
+                config.encryption =
+                    crate::config::VlessEncryption::MlKem768X25519Plus(String::new());
+            }
+            let inner = Arc::new(MuxPeer {
+                calls: Mutex::default(),
+                tasks: Mutex::default(),
+                probe: ResourceProbe::default(),
+            });
+            let node = SingMuxConnector::new(inner, proxy.smux.as_ref().unwrap().clone())
+                .with_autonomous_xhttp(proxy);
+            assert_eq!(
+                node.pool.autonomous_writes(),
+                expected,
+                "{network}/{protocol}, padding={padding}, encryption={encryption}"
             );
         }
     }

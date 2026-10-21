@@ -21,6 +21,7 @@ pub(crate) struct DatagramIo {
     resolution: ResolutionContext,
     deadline: Instant,
     first: bool,
+    flush_each_frame: bool,
     pending_write: Option<PendingWrite>,
     cancel: CancellationToken,
 }
@@ -43,10 +44,16 @@ impl DatagramIo {
             resolution,
             deadline,
             first: true,
+            flush_each_frame: true,
             pending_write: None,
             cancel,
         }
     }
+    pub(crate) fn with_autonomous_writes(mut self) -> Self {
+        self.flush_each_frame = false;
+        self
+    }
+
     // A cancelled logical target may already have submitted a frame prefix.
     // Finish exactly that retained frame before the next send or receive;
     // never duplicate bytes or add a per-target payload queue.
@@ -58,6 +65,7 @@ impl DatagramIo {
             return Err(io::ErrorKind::TimedOut.into());
         }
         let first = self.first;
+        let flush = first || self.flush_each_frame;
         let deadline = self.deadline;
         let cancel = self.cancel.clone();
         let write = async {
@@ -70,7 +78,10 @@ impl DatagramIo {
                 }
                 pending.offset += written;
             }
-            io.flush().await
+            if flush {
+                io.flush().await?;
+            }
+            Ok(())
         };
         tokio::select! { biased;
             ()=cancel.cancelled()=>return Err(io::ErrorKind::ConnectionAborted.into()),
@@ -309,6 +320,70 @@ mod tests {
         bytes.extend_from_slice(&(packet.payload.len() as u16).to_be_bytes());
         bytes.extend_from_slice(&packet.payload);
         bytes
+    }
+
+    #[tokio::test]
+    async fn autonomous_udp_preserves_first_setup_flush_and_skips_only_later_barriers() {
+        for autonomous in [false, true] {
+            let (transport, mut peer, gates) = fixture(false);
+            let mut transport = if autonomous {
+                transport.with_autonomous_writes()
+            } else {
+                transport
+            };
+            let first = packet("192.0.2.1:53", b"first");
+            let second = packet("198.51.100.1:54", b"second");
+            assert!(futures_util::poll!(transport.send(first.clone())).is_pending());
+            assert!(
+                transport.first,
+                "the first frame still owns its setup flush"
+            );
+            assert_eq!(
+                transport.pending_write.as_ref().unwrap().offset,
+                wire(&first).len()
+            );
+            gates.release();
+            transport.flush_pending().await.unwrap();
+            gates.flush_blocked.store(true, Ordering::SeqCst);
+            let result = futures_util::poll!(transport.send(second.clone()));
+            assert_eq!(result.is_ready(), autonomous);
+            if autonomous {
+                assert!(matches!(result, Poll::Ready(Ok(()))));
+                assert!(transport.pending_write.is_none());
+            } else {
+                assert!(transport.pending_write.is_some());
+            }
+            gates.release();
+            transport.flush_pending().await.unwrap();
+            let mut expected = wire(&first);
+            expected.extend(wire(&second));
+            let mut actual = vec![0; expected.len()];
+            peer.read_exact(&mut actual).await.unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn autonomous_first_flush_keeps_original_deadline_after_cancellation() {
+        let (transport, mut peer, gates) = fixture(false);
+        let mut transport = transport.with_autonomous_writes();
+        let first = packet("192.0.2.1:53", b"first");
+        let second = packet("198.51.100.1:54", b"second");
+        assert!(futures_util::poll!(transport.send(first.clone())).is_pending());
+        tokio::time::advance(Duration::from_secs(6)).await;
+        gates.release();
+        assert!(matches!(
+            transport.send(second).await,
+            Err(DispatchError::TimedOut)
+        ));
+        assert!(transport.io.is_none() && transport.pending_write.is_none());
+        let mut actual = Vec::new();
+        peer.read_to_end(&mut actual).await.unwrap();
+        assert_eq!(
+            actual,
+            wire(&first),
+            "deadline must not admit another frame"
+        );
     }
 
     #[tokio::test]
