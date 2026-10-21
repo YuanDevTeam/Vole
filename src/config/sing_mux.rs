@@ -23,6 +23,71 @@ pub struct SingMuxConfig {
     pub padding: bool,
     pub only_tcp: bool,
     pub statistic: bool,
+    pub brutal: Option<SingMuxBrutalConfig>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SingMuxBrutalConfig {
+    pub up: u64,
+    pub down: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct RawBrutal {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    up: Bandwidth,
+    #[serde(default)]
+    down: Bandwidth,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Bandwidth {
+    Number(u64),
+    Text(String),
+}
+impl Default for Bandwidth {
+    fn default() -> Self {
+        Self::Number(0)
+    }
+}
+impl Bandwidth {
+    fn bytes_per_second(self) -> Result<u64> {
+        let text = match self {
+            Self::Number(value) => value.to_string(),
+            Self::Text(value) => value,
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(0);
+        }
+        let end = text.bytes().take_while(u8::is_ascii_digit).count();
+        let Ok(value) = text[..end].parse::<u64>() else {
+            return invalid("invalid sing-mux Brutal bandwidth");
+        };
+        let (factor, divisor) = match text[end..].trim() {
+            "" | "Mbps" => (1_000_000_u64, 8),
+            "bps" => (1, 8),
+            "Kbps" => (1_000, 8),
+            "Gbps" => (1_000_000_000, 8),
+            "Tbps" => (1_000_000_000_000, 8),
+            "Bps" => (1, 1),
+            "KBps" => (1_000, 1),
+            "MBps" => (1_000_000, 1),
+            "GBps" => (1_000_000_000, 1),
+            "TBps" => (1_000_000_000_000, 1),
+            _ => return invalid("invalid sing-mux Brutal bandwidth unit"),
+        };
+        value
+            .checked_mul(factor)
+            .map(|rate| rate / divisor)
+            .ok_or_else(|| {
+                crate::VoleError::InvalidConfig("sing-mux Brutal bandwidth overflows".into())
+            })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -44,6 +109,8 @@ pub(super) struct RawSingMux {
     only_tcp: bool,
     #[serde(default)]
     statistic: bool,
+    #[serde(default)]
+    brutal_opts: RawBrutal,
 }
 impl RawSingMux {
     pub(super) fn normalize(self) -> Result<Option<SingMuxConfig>> {
@@ -69,6 +136,14 @@ impl RawSingMux {
             padding: self.padding,
             only_tcp: self.only_tcp,
             statistic: self.statistic,
+            brutal: if self.brutal_opts.enabled {
+                Some(SingMuxBrutalConfig {
+                    up: self.brutal_opts.up.bytes_per_second()?,
+                    down: self.brutal_opts.down.bytes_per_second()?,
+                })
+            } else {
+                None
+            },
         }))
     }
 }
@@ -76,6 +151,37 @@ impl RawSingMux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sing-mux")]
+    #[test]
+    fn brutal_bandwidth_is_checked_and_uses_bytes_per_second() {
+        for (up, down, expected) in [
+            ("8", "\"125 KBps\"", (1_000_000, 125_000)),
+            ("\"1Gbps\"", "\"2 MBps\"", (125_000_000, 2_000_000)),
+            ("\"\"", "0", (0, 0)),
+            ("\"18446744073709551615 Bps\"", "0", (u64::MAX, 0)),
+        ] {
+            let raw: RawSingMux = serde_yaml_ng::from_str(&format!(
+                "enabled: true\nbrutal-opts: {{enabled: true, up: {up}, down: {down}}}"
+            ))
+            .unwrap();
+            let brutal = raw.normalize().unwrap().unwrap().brutal.unwrap();
+            assert_eq!((brutal.up, brutal.down), expected);
+        }
+        for bandwidth in [
+            "\"18446744073709551615 Mbps\"",
+            "\"18446744073709551616 Bps\"",
+            "\"-1 Mbps\"",
+            "\"1.5 Mbps\"",
+            "\"1 MiBps\"",
+        ] {
+            let raw: RawSingMux = serde_yaml_ng::from_str(&format!(
+                "enabled: true\nbrutal-opts: {{enabled: true, up: {bandwidth}}}"
+            ))
+            .unwrap();
+            assert!(raw.normalize().is_err());
+        }
+    }
 
     #[cfg(feature = "sing-mux")]
     #[test]

@@ -24,6 +24,7 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 const IDLE_RETAINED: usize = crate::limits::SING_MUX_IDLE_CONNECTIONS;
+mod brutal;
 pub(crate) mod datagram;
 mod h2_driver;
 mod padding;
@@ -35,6 +36,7 @@ pub(crate) struct Pool {
     opening: tokio::sync::Mutex<()>,
     cancel: CancellationToken,
     tasks: TaskTracker,
+    drained: Option<Arc<tokio::sync::Notify>>,
 }
 #[derive(Default)]
 struct State {
@@ -61,12 +63,14 @@ impl Drop for Connection {
 }
 impl Pool {
     pub(crate) fn new(options: SingMuxConfig) -> Self {
+        let drained = options.brutal.map(|_| Arc::new(tokio::sync::Notify::new()));
         Self {
             options,
             state: Arc::default(),
             opening: Default::default(),
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
+            drained,
         }
     }
     pub(crate) fn only_tcp(&self) -> bool {
@@ -84,39 +88,51 @@ impl Pool {
         Fut: Future<Output = io::Result<BoxStream>>,
     {
         let operation = async {
+            let mut connect = Some(connect);
             let (sender, lease) = {
                 let _opening = self.opening.lock().await;
-                let existing = {
-                    let mut state = self.state.lock().unwrap();
-                    if state.closed {
-                        return Err(io::ErrorKind::ConnectionAborted.into());
+                loop {
+                    // notify_one stores a permit if the final lease drains
+                    // between the state check and polling this waiter. The
+                    // opening lock permits only one retirement waiter.
+                    let notified = self.drained.as_ref().map(|notify| notify.notified());
+                    let (existing, retiring) = {
+                        let mut state = self.state.lock().unwrap();
+                        if state.closed {
+                            return Err(io::ErrorKind::ConnectionAborted.into());
+                        }
+                        state.connections.retain(|c| !c.cancel.is_cancelled());
+                        let existing = state
+                            .connections
+                            .iter()
+                            .filter(|c| c.can_admit())
+                            .min_by_key(|c| c.active.load(Ordering::Acquire))
+                            .filter(|c| {
+                                let active = c.active.load(Ordering::Acquire);
+                                self.options.brutal.is_some()
+                                    || active == 0
+                                    || if self.options.max_connections > 0 {
+                                        state.connections.len() >= self.options.max_connections
+                                            || active < self.options.min_streams
+                                    } else {
+                                        self.options.max_streams > 0
+                                            && active < self.options.max_streams
+                                    }
+                            })
+                            .map(|c| c.reserve(&self.state, self.drained.as_ref()));
+                        let retiring = self.options.brutal.is_some()
+                            && existing.is_none()
+                            && !state.connections.is_empty();
+                        (existing, retiring)
+                    };
+                    if let Some(pair) = existing {
+                        break pair;
                     }
-                    state.connections.retain(|c| !c.cancel.is_cancelled());
-                    state
-                        .connections
-                        .iter()
-                        .filter(|c| {
-                            !matches!(c.sender, Sender::Yamux(_))
-                                || c.issued.load(Ordering::Acquire) < yamux_driver::STREAMS
-                        })
-                        .min_by_key(|c| c.active.load(Ordering::Acquire))
-                        .filter(|c| {
-                            let active = c.active.load(Ordering::Acquire);
-                            active == 0
-                                || if self.options.max_connections > 0 {
-                                    state.connections.len() >= self.options.max_connections
-                                        || active < self.options.min_streams
-                                } else {
-                                    self.options.max_streams > 0
-                                        && active < self.options.max_streams
-                                }
-                        })
-                        .map(|c| c.reserve(&self.state))
-                };
-                if let Some(pair) = existing {
-                    pair
-                } else {
-                    let mut raw = connect().await?;
+                    if retiring {
+                        notified.expect("Brutal retirement notification").await;
+                        continue;
+                    }
+                    let mut raw = connect.take().expect("one physical creation")().await?;
                     let protocol = match self.options.protocol {
                         SingMuxProtocol::Smux => 0,
                         SingMuxProtocol::Yamux => 1,
@@ -136,20 +152,23 @@ impl Pool {
                         raw = Box::new(padding::Padding::new(raw));
                     }
                     let connection = self.establish(raw).await?;
+                    if let Some(options) = self.options.brutal {
+                        // This control stream consumes an actual transport ID
+                        // even though it never becomes a business lease.
+                        connection.issued.fetch_add(1, Ordering::AcqRel);
+                        let mut control = connection.sender.open(deadline).await?;
+                        brutal::exchange(&mut control, options.up, options.down).await?;
+                    }
                     let mut state = self.state.lock().unwrap();
                     if state.closed {
                         return Err(io::ErrorKind::ConnectionAborted.into());
                     }
-                    let pair = connection.reserve(&self.state);
+                    let pair = connection.reserve(&self.state, self.drained.as_ref());
                     state.connections.push(connection);
-                    pair
+                    break pair;
                 }
             };
-            let mut raw = match sender {
-                Sender::H2(sender) => super::grpc::mux_stream(sender, deadline).await?,
-                Sender::Yamux(sender) => sender.open().await?,
-                Sender::Smux(sender) => sender.open().await?,
-            };
+            let mut raw = sender.open(deadline).await?;
             let mut request = Vec::with_capacity(262);
             request.extend_from_slice(&(if udp { 3_u16 } else { 0 }).to_be_bytes());
             crate::socks5::encode_address(target, &mut request)?;
@@ -188,6 +207,7 @@ impl Pool {
     ) -> io::Result<Connection> {
         let cancel = self.cancel.child_token();
         let token = cancel.clone();
+        let drained = self.drained.clone();
         let state = self.state.lock().unwrap();
         if state.closed {
             return Err(io::ErrorKind::ConnectionAborted.into());
@@ -197,6 +217,9 @@ impl Pool {
             let _guard = guard;
             tokio::select! { biased; ()=token.cancelled()=>{}, _=driver=>{} }
             token.cancel();
+            if let Some(drained) = drained {
+                drained.notify_one();
+            }
         }));
         Ok(Connection {
             sender,
@@ -223,8 +246,25 @@ impl Drop for Pool {
         self.begin_stop();
     }
 }
+impl Sender {
+    async fn open(&self, deadline: Instant) -> io::Result<BoxStream> {
+        match self {
+            Self::H2(sender) => super::grpc::mux_stream(sender.clone(), deadline).await,
+            Self::Yamux(sender) => sender.open().await,
+            Self::Smux(sender) => sender.open().await,
+        }
+    }
+}
 impl Connection {
-    fn reserve(&self, pool: &Arc<Mutex<State>>) -> (Sender, Lease) {
+    fn can_admit(&self) -> bool {
+        !matches!(self.sender, Sender::Yamux(_))
+            || self.issued.load(Ordering::Acquire) < yamux_driver::STREAMS
+    }
+    fn reserve(
+        &self,
+        pool: &Arc<Mutex<State>>,
+        drained: Option<&Arc<tokio::sync::Notify>>,
+    ) -> (Sender, Lease) {
         self.active.fetch_add(1, Ordering::AcqRel);
         // A dropped logical lease is not proof that yamux has processed its
         // reset. Its public poll_new_outbound closes the entire connection on
@@ -237,6 +277,7 @@ impl Connection {
             Lease {
                 active: self.active.clone(),
                 pool: Arc::downgrade(pool),
+                drained: drained.cloned(),
             },
         )
     }
@@ -244,12 +285,14 @@ impl Connection {
 struct Lease {
     active: Arc<AtomicUsize>,
     pool: Weak<Mutex<State>>,
+    drained: Option<Arc<tokio::sync::Notify>>,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if self.active.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(pool) = self.pool.upgrade()
-        {
+        if self.active.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        if let Some(pool) = self.pool.upgrade() {
             let mut idle = 0;
             pool.lock().unwrap().connections.retain(|c| {
                 if c.cancel.is_cancelled() {
@@ -266,6 +309,9 @@ impl Drop for Lease {
                 idle += 1;
                 idle <= IDLE_RETAINED
             });
+        }
+        if let Some(drained) = &self.drained {
+            drained.notify_one();
         }
     }
 }
@@ -353,6 +399,7 @@ mod tests {
                 lease: Some(Lease {
                     active: active.clone(),
                     pool: Weak::new(),
+                    drained: None,
                 }),
                 response: true,
                 half_close,

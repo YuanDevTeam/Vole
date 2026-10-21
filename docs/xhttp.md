@@ -98,7 +98,21 @@ H1 编码保留正文 backing，不将整批正文再次拼入头部写缓冲；
 
 ## 通用 sing-mux
 
-所有已启用的普通节点协议都接受 `smux`，字段为 enabled、protocol、max-connections、min-streams、max-streams、padding、only-tcp、statistic。enabled 默认 false；protocol 缺省/空为 h2mux，也支持 smux v1/yamux。计数为带符号平台整数；负阈值禁用，两个正 max 字段同时配置时采用 max-connections 分支。padding、only-tcp、statistic 默认 false。Vision 与启用的 sing-mux 互斥。精简构建可独立启用 `sing-mux`，不要求 VLESS；未启用此 feature 时拒绝 enabled=true。
+所有已启用的普通节点协议都接受 `smux`，字段为 enabled、protocol、max-connections、min-streams、max-streams、padding、only-tcp、statistic、brutal-opts。enabled 默认 false；protocol 缺省/空为 h2mux，也支持 smux v1/yamux。计数为带符号平台整数；负阈值禁用，两个正 max 字段同时配置时采用 max-connections 分支。padding、only-tcp、statistic 默认 false。Vision 与启用的 sing-mux 互斥。精简构建可独立启用 `sing-mux`，不要求 VLESS；未启用此 feature 时拒绝 enabled=true。
+
+`smux.brutal-opts` 接受 `enabled/up/down`。enabled 默认 false；带宽默认为零，
+裸数或纯数字字符串以 Mbps 为单位，也接受十进制 K/M/G/T 的 bps/Bps，b 表示位、
+B 表示字节。速率转换检查整数溢出；不接受小数、负数或二进制单位。
+开启后，每条新物理会话在业务准入前，沿同一个绝对建链期限完成一次 Mihomo
+sing-mux 带宽协商；控制目标不进入业务路由、DNS 或连接表。down 告知服务端本端
+接收带宽，远端拒绝、截断、无效回复或超时使本次物理会话失败，错误不包含远端消息。
+本地是否安装 TCP Brutal 模块不影响远端协商。当前该路径只请求远端发送侧配置，
+不配置客户端内核拥塞控制，不承诺本地 up 发送速率生效。
+
+开启 Brutal 时，同一节点池同时只准入一条物理会话，不按 max-connections、
+min-streams 或 max-streams 扩容。yamux 仍保留累计 64 流退役边界，协商控制流
+也占一个流 ID；退役后等待既有租约全部释放，再为新请求建立会话，不并行复制
+完整配置带宽。等待使用调用方原期限，可被 Stop 取消；现有业务与关闭语义保持。
 
 `statistic: true` 在 Running Session 的连接注册表记录每条真实底层认证流，类型 Inner、
 目标 sp.mux.sing-box.arpa:444，节点和 provider 名称共享不可变文本。复用流共用一条

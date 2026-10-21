@@ -25,6 +25,7 @@ struct MemoryPeer {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     udp: bool,
     protocol: u8,
+    brutal_exchanges: Option<Arc<AtomicUsize>>,
 }
 #[async_trait]
 impl OutboundConnector for MemoryPeer {
@@ -37,6 +38,7 @@ impl OutboundConnector for MemoryPeer {
         let (client, mut server) = tokio::io::duplex(65536);
         let udp = self.udp;
         let protocol = self.protocol;
+        let brutal_exchanges = self.brutal_exchanges.clone();
         self.tasks.lock().unwrap().push(tokio::spawn(async move {
             let mut header = [0; 23];
             server.read_exact(&mut header).await.unwrap();
@@ -75,8 +77,14 @@ impl OutboundConnector for MemoryPeer {
                         }
                         2 => {
                             if opened.insert(id) {
-                                assert_eq!(data, [0, 0, 1, 192, 0, 2, 1, 1, 187]);
-                                data = b"\x00hello".to_vec();
+                                if let Some(response) =
+                                    brutal_response(&data, brutal_exchanges.as_deref())
+                                {
+                                    data = response;
+                                } else {
+                                    assert_eq!(data, [0, 0, 1, 192, 0, 2, 1, 1, 187]);
+                                    data = b"\x00hello".to_vec();
+                                }
                             }
                             head[2..4].copy_from_slice(&(data.len() as u16).to_le_bytes());
                             server.write_all(&head).await.unwrap();
@@ -99,11 +107,26 @@ impl OutboundConnector for MemoryPeer {
                 while let Some(Ok(stream)) =
                     futures_util::future::poll_fn(|cx| connection.poll_next_inbound(cx)).await
                 {
+                    let brutal_exchanges = brutal_exchanges.clone();
                     tasks.spawn(async move {
                         let mut io = stream.compat();
-                        let mut request = [0; 9];
-                        io.read_exact(&mut request).await.unwrap();
-                        assert_eq!(request, [0, 0, 1, 192, 0, 2, 1, 1, 187]);
+                        let mut prefix = [0; 4];
+                        io.read_exact(&mut prefix).await.unwrap();
+                        if prefix == [0, 0, 3, 17] {
+                            let mut request = prefix.to_vec();
+                            let mut rest = [0; 27];
+                            io.read_exact(&mut rest).await.unwrap();
+                            request.extend_from_slice(&rest);
+                            let response =
+                                brutal_response(&request, brutal_exchanges.as_deref()).unwrap();
+                            io.write_all(&response).await.unwrap();
+                            io.flush().await.unwrap();
+                            return;
+                        }
+                        let mut rest = [0; 5];
+                        io.read_exact(&mut rest).await.unwrap();
+                        assert_eq!(prefix, [0, 0, 1, 192]);
+                        assert_eq!(rest, [0, 2, 1, 1, 187]);
                         io.write_all(b"\x00hello").await.unwrap();
                         io.flush().await.unwrap();
                         let mut scratch = [0; 1024];
@@ -127,9 +150,19 @@ impl OutboundConnector for MemoryPeer {
             let mut streams = tokio::task::JoinSet::new();
             while let Some(Ok((request, mut response))) = connection.accept().await {
                 assert_eq!(request.method(), "CONNECT");
+                let brutal_exchanges = brutal_exchanges.clone();
                 streams.spawn(async move {
                     let mut input = request.into_body();
                     let first = input.data().await.unwrap().unwrap();
+                    if let Some(reply) = brutal_response(&first, brutal_exchanges.as_deref()) {
+                        input.flow_control().release_capacity(first.len()).unwrap();
+                        response
+                            .send_response(http::Response::new(()), false)
+                            .unwrap()
+                            .send_data(Bytes::from(reply), true)
+                            .unwrap();
+                        return;
+                    }
                     if udp {
                         assert_eq!(&first[..2], &[0, 3]);
                     } else {
@@ -179,6 +212,23 @@ impl OutboundConnector for MemoryPeer {
         Err(DispatchError::NotAllowed)
     }
 }
+fn brutal_response(request: &[u8], exchanges: Option<&AtomicUsize>) -> Option<Vec<u8>> {
+    if !request.starts_with(&[0, 0, 3, 17]) {
+        return None;
+    }
+    assert_eq!(&request[4..23], b"_BrutalBwExchange\0\0");
+    assert_eq!(
+        u64::from_be_bytes(request[23..].try_into().unwrap()),
+        12_500_000
+    );
+    exchanges
+        .expect("unexpected Brutal exchange")
+        .fetch_add(1, Ordering::SeqCst);
+    let mut reply = vec![0, 1];
+    reply.extend_from_slice(&8_000_000_u64.to_be_bytes());
+    Some(reply)
+}
+
 fn outbound(peer: Arc<MemoryPeer>, options: &str) -> SingMuxConnector {
     let raw = format!(
         "mixed-port: 1080\nproxies:\n- name: edge\n  type: vless\n  server: example.com\n  port: 443\n  uuid: 07070707-0707-0707-0707-070707070707\n  smux: {{enabled: true, {options}}}\nrules: [MATCH,edge]\n"
@@ -214,6 +264,113 @@ async fn hello(io: &mut BoxStream) {
     io.read_exact(&mut greeting).await.unwrap();
     assert_eq!(&greeting, b"hello");
 }
+
+#[tokio::test]
+async fn brutal_negotiates_once_and_reuses_one_session_for_all_mux_protocols() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for (protocol, wire) in [("h2mux", 2), ("smux", 0), ("yamux", 1)] {
+            let exchanges = Arc::new(AtomicUsize::new(0));
+            let peer = Arc::new(MemoryPeer {
+                count: AtomicUsize::new(0),
+                tasks: Mutex::new(vec![]),
+                udp: false,
+                protocol: wire,
+                brutal_exchanges: Some(exchanges.clone()),
+            });
+            let node = outbound(peer.clone(), &format!(
+                "protocol: {protocol}, max-connections: 4, min-streams: 0, brutal-opts: {{enabled: true, up: 100, down: 100}}"
+            ));
+            let mut streams = Vec::new();
+            for _ in 0..4 {
+                let mut stream = open(&node).await;
+                hello(&mut stream).await;
+                streams.push(stream);
+            }
+            assert_eq!(peer.count.load(Ordering::SeqCst), 1, "{protocol}");
+            assert_eq!(exchanges.load(Ordering::SeqCst), 1, "{protocol}");
+            drop(streams);
+            node.shutdown().await;
+            let tasks = std::mem::take(&mut *peer.tasks.lock().unwrap());
+            for task in tasks {
+                task.await.unwrap();
+            }
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn brutal_yamux_retirement_waits_for_siblings_and_obeys_deadline_and_stop() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let peer = Arc::new(MemoryPeer {
+            count: AtomicUsize::new(0),
+            tasks: Mutex::new(vec![]),
+            udp: false,
+            protocol: 1,
+            brutal_exchanges: Some(exchanges.clone()),
+        });
+        let node = outbound(
+            peer.clone(),
+            "protocol: yamux, brutal-opts: {enabled: true, up: 100, down: 100}",
+        );
+        let mut streams = Vec::new();
+        // The negotiation consumes the first of the 64 transport IDs.
+        for _ in 0..63 {
+            let mut stream = open(&node).await;
+            hello(&mut stream).await;
+            streams.push(stream);
+        }
+        let session = StreamSession {
+            metadata: Default::default(),
+            inbound: InboundKind::InternalMeasure,
+            source: "127.0.0.1:1".parse().unwrap(),
+            destination: Destination::Ip("192.0.2.1:443".parse().unwrap()),
+            sniffed_domain: None,
+        };
+        let short = EstablishContext::with_timeout(Duration::from_millis(20));
+        assert!(matches!(
+            node.connect_stream(session.clone(), &short).await,
+            Err(DispatchError::TimedOut)
+        ));
+        assert_eq!(peer.count.load(Ordering::SeqCst), 1);
+
+        let waiting = open(&node);
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        streams[0].write_all(b"alive").await.unwrap();
+        streams[0].flush().await.unwrap();
+        let mut reply = [0; 5];
+        streams[0].read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"alive");
+        assert_eq!(peer.count.load(Ordering::SeqCst), 1);
+        drop(streams);
+        let mut replacement = waiting.await;
+        hello(&mut replacement).await;
+        assert_eq!(peer.count.load(Ordering::SeqCst), 2);
+        assert_eq!(exchanges.load(Ordering::SeqCst), 2);
+
+        let mut streams = vec![replacement];
+        for _ in 1..63 {
+            let mut stream = open(&node).await;
+            hello(&mut stream).await;
+            streams.push(stream);
+        }
+        let context = EstablishContext::default();
+        let waiting = node.connect_stream(session, &context);
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        node.shutdown().await;
+        assert!(waiting.await.is_err());
+        drop(streams);
+        let tasks = std::mem::take(&mut *peer.tasks.lock().unwrap());
+        for task in tasks {
+            task.await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn shared_mux_preserves_h2mux_yamux_tail_and_smux_whole_close() {
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -223,6 +380,7 @@ async fn shared_mux_preserves_h2mux_yamux_tail_and_smux_whole_close() {
                 tasks: Mutex::new(vec![]),
                 udp: false,
                 protocol: wire,
+                brutal_exchanges: None,
             });
             let node = outbound(
                 peer.clone(),
@@ -277,6 +435,7 @@ async fn yamux_replacing_dropped_streams_at_capacity_keeps_the_sibling_alive() {
             tasks: Mutex::new(vec![]),
             udp: false,
             protocol: 1,
+            brutal_exchanges: None,
         });
         let node = outbound(peer.clone(), "protocol: yamux, max-connections: 1");
         let mut streams = Vec::new();
@@ -325,6 +484,7 @@ async fn sing_mux_scheduling_uses_the_selected_branch_not_a_global_stream_quota(
                     tasks: Mutex::new(vec![]),
                     udp: false,
                     protocol: wire,
+                    brutal_exchanges: None,
                 });
                 let node = outbound(peer.clone(), &format!("protocol: {protocol}, {settings}"));
                 let mut streams = Vec::new();
@@ -521,6 +681,7 @@ async fn siblings(protocol: &str, wire: u8) -> io::Result<()> {
             tasks: Mutex::new(vec![]),
             udp: false,
             protocol: wire,
+            brutal_exchanges: None,
         });
         let node = outbound(
             peer.clone(),
@@ -566,6 +727,7 @@ async fn sing_mux_udp_preserves_addresses_and_cancellation_safe_partial_frames()
             tasks: Mutex::new(vec![]),
             udp: true,
             protocol: 2,
+            brutal_exchanges: None,
         });
         let node = outbound(peer.clone(), "max-connections: 1");
         let mut io = node
