@@ -694,6 +694,25 @@ pub(super) struct PreparedStream {
     pub(super) token: CancellationToken,
 }
 impl PreparedStream {
+    #[cfg(test)]
+    pub(super) fn for_memory_test(
+        raw: BoxStream,
+        deadline: tokio::time::Instant,
+        token: CancellationToken,
+    ) -> Self {
+        Self {
+            raw,
+            encryption: None,
+            id: uuid::Uuid::from_bytes([7; 16]),
+            transport: StreamTransport::Tcp,
+            options: Default::default(),
+            vision_control: None,
+            deadline,
+            tasks: TaskTracker::new(),
+            token,
+        }
+    }
+
     pub(super) async fn finish(
         self,
         command: VlessCommand,
@@ -847,10 +866,18 @@ impl OutboundConnector for VlessOutbound {
             } else {
                 transport
             })
+        } else if self.encoding == VlessPacketEncoding::PacketAddr {
+            Box::new(
+                super::datagram::VlessDatagram::packet_addr(
+                    prepared,
+                    request.budget(),
+                    context.resolution(),
+                )
+                .await?,
+            )
         } else {
             Box::new(super::datagram::VlessDatagram::new(
                 prepared,
-                self.encoding == VlessPacketEncoding::PacketAddr,
                 request.budget(),
                 context.resolution(),
             ))
