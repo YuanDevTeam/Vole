@@ -10,6 +10,8 @@ use crate::dispatch::BoxStream;
 pub(crate) struct ServerTcpConnection {
     pub io: BoxStream,
     pub address: SocketAddr,
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    pub control: Option<super::tcp_control::Control>,
 }
 
 impl Dialer {
@@ -20,12 +22,45 @@ impl Dialer {
         endpoint: &ResolvedEndpoint,
         deadline: Instant,
     ) -> io::Result<ServerTcpConnection> {
+        self.connect_server_tcp_inner(endpoint, deadline, false)
+            .await
+    }
+
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    pub(crate) async fn connect_server_tcp_controlled(
+        &self,
+        endpoint: &ResolvedEndpoint,
+        deadline: Instant,
+    ) -> io::Result<ServerTcpConnection> {
+        self.connect_server_tcp_inner(endpoint, deadline, true)
+            .await
+    }
+
+    async fn connect_server_tcp_inner(
+        &self,
+        endpoint: &ResolvedEndpoint,
+        deadline: Instant,
+        capture: bool,
+    ) -> io::Result<ServerTcpConnection> {
+        #[cfg(not(all(target_os = "linux", feature = "sing-mux")))]
+        let _ = capture;
         #[cfg(target_os = "linux")]
         if let Some(address) = self.single_tfo_address(endpoint)? {
             let (stream, address) = self.prepare_tcp_fast_open(address, deadline).await?;
+            #[cfg(feature = "sing-mux")]
+            if capture && !self.mptcp {
+                let (io, control) = super::tcp_control::fast_open(stream);
+                return Ok(ServerTcpConnection {
+                    io,
+                    address,
+                    control: Some(control),
+                });
+            }
             return Ok(ServerTcpConnection {
                 io: Box::new(stream),
                 address,
+                #[cfg(feature = "sing-mux")]
+                control: None,
             });
         }
         // Multiple permitted addresses retain the existing eager serial/race
@@ -34,9 +69,20 @@ impl Dialer {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
         let address = stream.peer_addr()?;
+        #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+        if capture && !self.mptcp {
+            let (io, control) = super::tcp_control::stream(stream);
+            return Ok(ServerTcpConnection {
+                io,
+                address,
+                control: Some(control),
+            });
+        }
         Ok(ServerTcpConnection {
             io: Box::new(stream),
             address,
+            #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+            control: None,
         })
     }
 

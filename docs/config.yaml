@@ -295,6 +295,9 @@ sniffer:
 # 使用真正上游节点的出口策略，组落到 DIRECT 时保留当前节点策略。XHTTP 两腿使用相同策略。
 # 普通协议节点支持 smux 包装，要求对端提供 sing-mux 解码；普通 HTTP/SOCKS listener 不自动解码。
 # only-tcp: false 提供 mux UDP，即使底层 udp 为 false；true 保留底层 UDP 能力与编码。
+# smux.brutal-opts 启用后，每条新会话先与支持 TCP Brutal 的对端协商；远端下行协商不限定客户端平台。
+# Linux 本地上行只在可确认独占的直连物理 TCP 上尝试；代理 hop、共享/多腿传输与 mptcp:true 不设置本地算法。
+# Core 不安装/加载模块；本地不可用保留有效远端协商。池保持单会话，退役等待旧流释放；详见 xhttp.md。
 # HTTP(S) CONNECT 示例：type: http，必填 name/server/port，tls 默认 false。
 # username/password 均非空才认证；headers 为字符串映射；仅 TCP，不支持 udp: true。
 # tls: true 时支持 sni/skip-cert-verify/name-cert-verify/fingerprint，
@@ -624,6 +627,10 @@ proxies:
       padding: false
       only-tcp: false # true 委托底层 UDP；false 提供 sing-mux UDP
       statistic: false # true 记录真实 Inner 连接，可由 Controller 关闭，不重复计入业务总字节
+      brutal-opts:
+        enabled: false # true 要求服务端支持并启用 TCP Brutal；失败不回退普通 mux
+        up: 100 Mbps # 客户端发送能力；裸整数/纯数字字符串单位为 Mbps，b=bit、B=byte
+        down: 100 Mbps # 客户端接收能力；接受十进制 K/M/G/T bps/Bps，缺省为 0
     dialer-proxy: upstream-select
 
   # REALITY 写法示意：在 VLESS 节点中保留 tls: true，并增加以下 mapping；不要与

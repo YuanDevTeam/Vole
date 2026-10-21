@@ -2,9 +2,9 @@
 use super::{ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector};
 use crate::{
     config::SingMuxConfig,
-    dispatch::{BoxStream, DatagramTransport, DispatchError},
+    dispatch::{DatagramTransport, DispatchError},
     session::{Destination, StreamSession},
-    transport::sing_mux::{Pool, datagram::DatagramIo},
+    transport::sing_mux::{Pool, SuppliedStream, datagram::DatagramIo},
 };
 use async_trait::async_trait;
 use std::{io, sync::Arc};
@@ -15,6 +15,8 @@ pub struct SingMuxConnector {
     pool: Pool,
     cancellation: CancellationToken,
     tracking: Option<Tracking>,
+    #[cfg(target_os = "linux")]
+    capture_tcp: bool,
 }
 struct Tracking {
     registry: Arc<crate::connections::Registry>,
@@ -34,7 +36,14 @@ impl SingMuxConnector {
             pool: Pool::new(options),
             cancellation: CancellationToken::new(),
             tracking: None,
+            #[cfg(target_os = "linux")]
+            capture_tcp: false,
         }
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_physical_tcp_control(mut self, proxy: &crate::config::ProxyConfig) -> Self {
+        self.capture_tcp = self.pool.brutal_enabled() && exclusive_tcp(proxy);
+        self
     }
     pub(crate) fn with_tracking(
         mut self,
@@ -53,17 +62,27 @@ impl SingMuxConnector {
         &self,
         mut session: StreamSession,
         context: &EstablishContext,
-    ) -> io::Result<BoxStream> {
+    ) -> io::Result<SuppliedStream> {
         session.destination = Destination::domain("sp.mux.sing-box.arpa", 444)?;
         session.sniffed_domain = None;
         let source = session.source;
+        #[cfg(target_os = "linux")]
+        let capture = self
+            .capture_tcp
+            .then(crate::dialer::tcp_control::Capture::default);
+        #[cfg(target_os = "linux")]
+        let captured_context = capture
+            .as_ref()
+            .map(|capture| context.capture_tcp_control(capture.clone()));
+        #[cfg(target_os = "linux")]
+        let context = captured_context.as_ref().unwrap_or(context);
         let raw = self
             .inner
             .connect_stream(session, context)
             .await
             .map(|connected| connected.io)
             .map_err(io::Error::other)?;
-        Ok(match &self.tracking {
+        let io = match &self.tracking {
             None => raw,
             Some(tracking) => tracking
                 .registry
@@ -87,7 +106,41 @@ impl SingMuxConnector {
                     dns_path: Vec::new(),
                 })
                 .stream(raw),
+        };
+        Ok(SuppliedStream {
+            io,
+            #[cfg(target_os = "linux")]
+            control: capture.and_then(|capture| capture.finish()),
         })
+    }
+}
+#[cfg(target_os = "linux")]
+fn exclusive_tcp(proxy: &crate::config::ProxyConfig) -> bool {
+    use crate::config::{
+        ProxyProtocol, ShadowsocksPlugin, StreamTransport, TrojanTransport, VlessTransport,
+    };
+    if proxy.mptcp {
+        return false;
+    }
+    match &proxy.protocol {
+        ProxyProtocol::Http(_) | ProxyProtocol::Socks5(_) => true,
+        ProxyProtocol::Vless(config) => matches!(
+            &config.transport,
+            VlessTransport::Stream(StreamTransport::Tcp | StreamTransport::WebSocket { .. })
+        ),
+        ProxyProtocol::Vmess(config) => matches!(
+            &config.transport,
+            StreamTransport::Tcp | StreamTransport::WebSocket { .. }
+        ),
+        ProxyProtocol::Trojan(config) => matches!(
+            &config.transport,
+            TrojanTransport::Tcp | TrojanTransport::WebSocket { .. }
+        ),
+        ProxyProtocol::Shadowsocks(config) => !matches!(
+            &config.plugin,
+            Some(ShadowsocksPlugin::WebSocket { mux: true, .. })
+        ),
+        _ => false,
     }
 }
 #[async_trait]
@@ -156,6 +209,28 @@ mod tests {
     use std::sync::Mutex;
     use tokio::io::AsyncReadExt;
     use tokio::{sync::Notify, time::Instant};
+
+    #[cfg(all(target_os = "linux", feature = "outbound-vless"))]
+    #[test]
+    fn brutal_physical_control_requires_exclusive_non_mptcp_transport() {
+        for (network, extra, allowed) in [
+            ("tcp", "", true),
+            ("ws", "", true),
+            ("grpc", "", false),
+            ("xhttp", "", false),
+            ("tcp", "mptcp: true", false),
+        ] {
+            let yaml = format!(
+                "mixed-port: 1080\nproxies:\n- name: edge\n  type: vless\n  server: 192.0.2.1\n  port: 443\n  uuid: 07070707-0707-0707-0707-070707070707\n  network: {network}\n  {extra}\nrules: ['MATCH,edge']\n"
+            );
+            let config = crate::config::Config::parse_yaml(yaml.as_bytes()).unwrap();
+            assert_eq!(
+                exclusive_tcp(&config.proxies[0]),
+                allowed,
+                "{network}, {extra}"
+            );
+        }
+    }
 
     struct MuxPeer {
         calls: Mutex<Vec<(StreamSession, Instant)>>,

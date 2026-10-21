@@ -56,6 +56,12 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   true 则原样委托底层 UDP，继承其能力。组 `disable-udp` 仍生效。
   对端必须解码 sing-mux；普通 HTTP/SOCKS5 listener 不因此自动提供解码。
   字段、半关闭及池边界见 [通用 sing-mux](xhttp.md#通用-sing-mux)。
+- `smux.brutal-opts` 在新 mux 会话接纳业务前完成一次远端 TCP Brutal 带宽协商，
+  不限定客户端平台；对端必须支持并启用它。本地上行仅在 Linux 可证明独占的直连
+  物理 TCP 上尝试，保护与绑定保持。代理 hop、共享/多腿传输及 `mptcp: true` 不设置
+  本地算法，即使 MPTCP 已回退普通 TCP；完整协议范围见上述 sing-mux 契约。
+  Core 不安装或加载模块，本地不可用不否定有效远端协商；参数设置失败恢复旧算法，
+  恢复失败终止物理 socket。Brutal 使用单会话池，退役等待旧业务释放，沿原期限与 Stop。
 - TLS 使用共享 WebPKI、叶证书 pin/非叶信任锚与 skip 策略。pin 不匹配不能被 skip 绕过，
   TLS 握手签名始终验证。节点策略固定，恢复缓存按节点和身份代隔离，标准 TLS 总票据预算为 4。
   字段及模板详见 [TLS 证书与指纹](tls-client-fingerprint.md)。

@@ -45,6 +45,12 @@ Linux `dialer::server_tcp::tests::` 和 `dialer::fast_open::tests::`。
 实际 SYN-data、首读/空写/半关闭、源绑定/protect、建链期限与 Stop 须由 Linux 真实 TUN 验证。
 这些内存过滤器不证明内核 Fast Open 或其它平台行为。
 
+MPTCP / TCP Brutal 纯内存过滤器：`--lib mptcp`、`config::functional::tests::`、
+`config::sing_mux::tests::`、`transport::sing_mux::brutal::tests::`、
+Linux `dialer::tcp_control::tests::`；池与生命周期另用下方 sing_mux 集成回归。
+双子流、出口约束、TCP 回退、TFO、模块及真实参数/发送侧生效、对端协商与 Stop
+须在隔离 Linux 真实 TUN 中另验；1 / 3 Gbps 压力及平台、真机结果分别记录。
+
 TUN 网络计划（纯内存，不查询宿主路由或创建接口）：`config::tun_network::tests::`、
 `platform::linux_network::plan::tests::`、`platform::linux_network::tests::`；
 Linux 目标的报文编码：`platform::linux_network::netlink::tests::`。

@@ -211,6 +211,8 @@ pub struct EstablishContext {
     resolution: ResolutionContext,
     selections: Arc<Mutex<SelectionSnapshot>>,
     inbound: crate::session::InboundMetadata,
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    tcp_control: Option<crate::dialer::tcp_control::Capture>,
 }
 
 type SelectionSnapshot = HashMap<usize, (Arc<GroupSelection>, usize)>;
@@ -228,6 +230,8 @@ impl EstablishContext {
             resolution,
             selections: Arc::new(Mutex::new(HashMap::new())),
             inbound: Default::default(),
+            #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+            tcp_control: None,
         }
     }
 
@@ -235,6 +239,22 @@ impl EstablishContext {
     pub(crate) fn with_metadata(mut self, metadata: &crate::session::InboundMetadata) -> Self {
         self.inbound = metadata.clone();
         self
+    }
+
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    pub(crate) fn capture_tcp_control(&self, capture: crate::dialer::tcp_control::Capture) -> Self {
+        let mut context = self.clone();
+        context.tcp_control = Some(capture);
+        context
+    }
+
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    fn without_tcp_control(&self) -> Self {
+        let mut context = self.clone();
+        if let Some(capture) = context.tcp_control.take() {
+            capture.report(None);
+        }
+        context
     }
 
     /// MASQUE's positive timeout owns shared creation independently of a
@@ -258,6 +278,8 @@ impl EstablishContext {
                     .clone(),
             )),
             inbound: self.inbound.clone(),
+            #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+            tcp_control: None,
         }
     }
 
@@ -277,6 +299,8 @@ impl EstablishContext {
                     .clone(),
             )),
             inbound: self.inbound.clone(),
+            #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+            tcp_control: None,
         })
     }
 
@@ -311,6 +335,8 @@ impl EstablishContext {
             deadline: Instant::now() + DEFAULT_ESTABLISH_TIMEOUT,
             resolution: self.resolution.clone(),
             inbound: self.inbound.clone(),
+            #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+            tcp_control: None,
             selections: Arc::new(Mutex::new(
                 self.selections
                     .lock()
@@ -594,6 +620,34 @@ impl SelectUpstream {
     }
 }
 
+async fn connect_direct_server(
+    dialer: &Dialer,
+    endpoint: &ResolvedEndpoint,
+    context: &EstablishContext,
+) -> Result<ConnectedStream, DispatchError> {
+    let stream = context
+        .run_io("physical proxy-server connect", async {
+            #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+            if context.tcp_control.is_some() {
+                return dialer
+                    .connect_server_tcp_controlled(endpoint, context.deadline())
+                    .await;
+            }
+            dialer
+                .connect_server_tcp(endpoint, context.deadline())
+                .await
+        })
+        .await?;
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    if let Some(capture) = &context.tcp_control {
+        capture.report(stream.control);
+    }
+    Ok(ConnectedStream {
+        io: stream.io,
+        effective_peer: Destination::Ip(stream.address),
+    })
+}
+
 enum ResolvedUpstream<'a> {
     Direct(&'a ResolvedEndpoint, &'a Dialer),
     LazyDirect(&'a Dialer),
@@ -727,17 +781,7 @@ impl UpstreamPath {
         match self.resolve(context)? {
             ResolvedUpstream::Direct(endpoint, dialer) => {
                 validate_prepared_endpoint(server, endpoint)?;
-                let stream = context
-                    .run_io(
-                        "physical proxy-server connect",
-                        dialer.connect_server_tcp(endpoint, context.deadline()),
-                    )
-                    .await?;
-                let effective_peer = Destination::Ip(stream.address);
-                Ok(ConnectedStream {
-                    io: stream.io,
-                    effective_peer,
-                })
+                connect_direct_server(dialer, endpoint, context).await
             }
             ResolvedUpstream::LazyDirect(dialer) => {
                 let endpoint = context
@@ -747,19 +791,17 @@ impl UpstreamPath {
                     .with_physical_dialer(dialer)
                     .resolve_proxy(server, context.deadline)
                     .await?;
-                let stream = context
-                    .run_io(
-                        "physical proxy-server connect",
-                        dialer.connect_server_tcp(&endpoint, context.deadline()),
-                    )
-                    .await?;
-                let effective_peer = Destination::Ip(stream.address);
-                Ok(ConnectedStream {
-                    io: stream.io,
-                    effective_peer,
-                })
+                connect_direct_server(dialer, &endpoint, context).await
             }
-            ResolvedUpstream::Proxy(connector) => connector.connect_stream(session, context).await,
+            ResolvedUpstream::Proxy(connector) => {
+                #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+                if context.tcp_control.is_some() {
+                    return connector
+                        .connect_stream(session, &context.without_tcp_control())
+                        .await;
+                }
+                connector.connect_stream(session, context).await
+            }
         }
     }
 
@@ -1752,5 +1794,42 @@ proxy-groups:
                 server
             );
         }
+    }
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    #[tokio::test]
+    async fn brutal_capture_does_not_cross_a_proxy_hop() {
+        struct Check;
+        #[async_trait]
+        impl OutboundConnector for Check {
+            async fn connect_stream(
+                &self,
+                session: StreamSession,
+                context: &EstablishContext,
+            ) -> Result<ConnectedStream, DispatchError> {
+                assert!(context.tcp_control.is_none());
+                let (io, _) = tokio::io::duplex(1);
+                Ok(ConnectedStream {
+                    io: Box::new(io),
+                    effective_peer: session.destination,
+                })
+            }
+            async fn open_datagram(
+                &self,
+                _: DatagramRequest,
+                _: &EstablishContext,
+            ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+                panic!("no datagram IO in physical TCP policy test")
+            }
+        }
+        let capture = crate::dialer::tcp_control::Capture::default();
+        let context = EstablishContext::default().capture_tcp_control(capture.clone());
+        let path = UpstreamPath::proxy(Arc::new(Check));
+        let server = Destination::domain("proxy.invalid", 443).unwrap();
+        let io = path
+            .connect_server(test_session(), &server, &context)
+            .await
+            .unwrap();
+        assert!(capture.finish().is_none());
+        assert_eq!(io.effective_peer, server);
     }
 }

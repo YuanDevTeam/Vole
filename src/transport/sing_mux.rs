@@ -30,6 +30,11 @@ mod h2_driver;
 mod padding;
 mod smux_driver;
 mod yamux_driver;
+pub(crate) struct SuppliedStream {
+    pub io: BoxStream,
+    #[cfg(target_os = "linux")]
+    pub control: Option<crate::dialer::tcp_control::Control>,
+}
 pub(crate) struct Pool {
     options: SingMuxConfig,
     state: Arc<Mutex<State>>,
@@ -76,6 +81,10 @@ impl Pool {
     pub(crate) fn only_tcp(&self) -> bool {
         self.options.only_tcp
     }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn brutal_enabled(&self) -> bool {
+        self.options.brutal.is_some()
+    }
     pub(crate) async fn open<F, Fut>(
         &self,
         target: &Destination,
@@ -85,7 +94,7 @@ impl Pool {
     ) -> io::Result<BoxStream>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = io::Result<BoxStream>>,
+        Fut: Future<Output = io::Result<SuppliedStream>>,
     {
         let operation = async {
             let mut connect = Some(connect);
@@ -132,7 +141,8 @@ impl Pool {
                         notified.expect("Brutal retirement notification").await;
                         continue;
                     }
-                    let mut raw = connect.take().expect("one physical creation")().await?;
+                    let supplied = connect.take().expect("one physical creation")().await?;
+                    let mut raw = supplied.io;
                     let protocol = match self.options.protocol {
                         SingMuxProtocol::Smux => 0,
                         SingMuxProtocol::Yamux => 1,
@@ -157,7 +167,15 @@ impl Pool {
                         // even though it never becomes a business lease.
                         connection.issued.fetch_add(1, Ordering::AcqRel);
                         let mut control = connection.sender.open(deadline).await?;
-                        brutal::exchange(&mut control, options.up, options.down).await?;
+                        let rate = brutal::exchange(&mut control, options.up, options.down).await?;
+                        #[cfg(target_os = "linux")]
+                        if let Some(physical) = supplied.control
+                            && let Err(error) = physical.apply_brutal(rate)
+                        {
+                            tracing::debug!(error_kind = ?error.kind(), "local TCP Brutal unavailable");
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        let _ = rate;
                     }
                     let mut state = self.state.lock().unwrap();
                     if state.closed {

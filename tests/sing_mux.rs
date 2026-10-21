@@ -156,11 +156,19 @@ impl OutboundConnector for MemoryPeer {
                     let first = input.data().await.unwrap().unwrap();
                     if let Some(reply) = brutal_response(&first, brutal_exchanges.as_deref()) {
                         input.flow_control().release_capacity(first.len()).unwrap();
-                        response
+                        let mut output = response
                             .send_response(http::Response::new(()), false)
-                            .unwrap()
-                            .send_data(Bytes::from(reply), true)
                             .unwrap();
+                        output.send_data(Bytes::from(reply), true).unwrap();
+                        // send_data only queues DATA. Keep the request and
+                        // response references until the client closes its
+                        // control stream, so h2 cannot reset it before the
+                        // reply is driven onto the supplied IO. Mihomo's
+                        // server flushes its writer before closing this stream.
+                        while let Some(Ok(data)) = input.data().await {
+                            input.flow_control().release_capacity(data.len()).unwrap();
+                        }
+                        drop(output);
                         return;
                     }
                     if udp {
@@ -245,6 +253,9 @@ fn outbound(peer: Arc<MemoryPeer>, options: &str) -> SingMuxConnector {
     )
 }
 async fn open(node: &SingMuxConnector) -> BoxStream {
+    try_open(node).await.unwrap()
+}
+async fn try_open(node: &SingMuxConnector) -> Result<BoxStream, DispatchError> {
     node.connect_stream(
         StreamSession {
             metadata: Default::default(),
@@ -256,8 +267,7 @@ async fn open(node: &SingMuxConnector) -> BoxStream {
         &EstablishContext::default(),
     )
     .await
-    .unwrap()
-    .io
+    .map(|connected| connected.io)
 }
 async fn hello(io: &mut BoxStream) {
     let mut greeting = [0; 5];
@@ -281,8 +291,10 @@ async fn brutal_negotiates_once_and_reuses_one_session_for_all_mux_protocols() {
                 "protocol: {protocol}, max-connections: 4, min-streams: 0, brutal-opts: {{enabled: true, up: 100, down: 100}}"
             ));
             let mut streams = Vec::new();
-            for _ in 0..4 {
-                let mut stream = open(&node).await;
+            for index in 0..4 {
+                let mut stream = try_open(&node).await.unwrap_or_else(|error|
+                    panic!("Brutal {protocol} logical stream {index}: {error:?}; physical={}, exchanges={}",
+                        peer.count.load(Ordering::SeqCst), exchanges.load(Ordering::SeqCst)));
                 hello(&mut stream).await;
                 streams.push(stream);
             }

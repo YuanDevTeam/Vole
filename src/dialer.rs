@@ -16,6 +16,9 @@ mod mptcp;
 mod mptcp_gate;
 #[path = "dialer_server_tcp.rs"]
 mod server_tcp;
+#[cfg(all(target_os = "linux", feature = "sing-mux"))]
+#[path = "dialer_tcp_control.rs"]
+pub(crate) mod tcp_control;
 #[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
 #[path = "dialer_windows.rs"]
 mod windows_egress;

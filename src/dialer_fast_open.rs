@@ -89,6 +89,12 @@ pub(crate) struct PendingFastOpen {
     handshake: Arc<Handshake>,
     activated: bool,
 }
+#[cfg(feature = "sing-mux")]
+impl AsRawFd for PendingFastOpen {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.inner.as_raw_fd()
+    }
+}
 
 impl std::fmt::Debug for PendingFastOpen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

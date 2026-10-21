@@ -25,6 +25,7 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
 | DNS | hosts（含启动 LAN 地址快照）、bootstrap/节点/直连解析角色、policy、respect-rules；UDP/TCP/DoH/DoT/DoQ、DoH/H3；fallback；redir-host/fake-IP 与映射持久化 |
 | mixed-port | HTTP/SOCKS5 TCP 与 SOCKS5 UDP；LAN 地址限制、多用户认证、认证跳过网段；allow-lan 不强制认证 |
 | 出站 | 具名 direct/dns/reject；HTTP(S) CONNECT、SOCKS5、AnyTLS、Trojan、VMess AEAD、VLESS、Hysteria2、TUIC v5、Shadowsocks 2022、标准 WireGuard 单/多 peer、TrustTunnel H2/H3、Mieru TCP/UDP 载体、MASQUE H2/H3 IP 与 H3 L4；协议依赖启用的 Cargo feature |
+| sing-mux | h2mux/smux v1/yamux、padding、TCP/UDP；brutal-opts 远端带宽协商及受限 Linux 本地发送侧设置 |
 | QUIC 配置 | HY2 独立 initial/max 接收窗口、秒 handshake-timeout；TUIC v5 入口ip、毫秒heartbeat、反向命名的stream/connection窗口、所有者池阈值、frame/fragment限制、PMTUD与UoT v2 |
 | 客户端 TLS | tls.custom-certifactes 证书内容；启动时合并可读系统根、WebPKI 与显式根并跨组件共享；TUIC v5 与其它 TLS 节点复用 cert/private-key 身份加载 |
 | 嗅探 | TUN/mixed TCP 的 HTTP1/HTTP2/TLS；TUN 与授权 SOCKS5 UDP 共用 QUIC v1/v2；域名/地址排除、强制条件和目标覆盖 |
@@ -72,6 +73,11 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
   受控 TCP，保留原保护与绑定的失败关闭。本机/对端不支持时允许 TCP 回退；
   系统路径管理器、额外子流与出口网络配置仍归宿主，不将初始 socket 绑定推导为全部子流受控。
   这比 Mihomo 的统一 MPTCP 开关更保守；原生 UDP/QUIC 不消费该字段。
+- `smux.brutal-opts.enabled/up/down` 的远端协商不限定客户端平台，要求对端实际启用
+  TCP Brutal；本地模块缺失不否定有效远端协商。Linux 仅对可确认独占的直连物理
+  TCP 尝试本地设置，不解包代理 hop、共享 H2/gRPC、XHTTP 多腿或 QUIC 的逻辑流，
+  `mptcp: true` 同样不设置本地 Brutal。Core 不加载模块或修改系统规则；单会话与
+  退役等待保持有界，详见 [sing-mux 契约](xhttp.md#通用-sing-mux)。
 - 节点 UDP 能力按 [出站契约](outbounds.md) 声明；rule 模式跳过不支持 UDP 的目标，继续匹配后续规则。
   global 模式和显式 DNS 出口不执行此跳过。负载均衡组按其声明能力参与规则匹配，实际选中成员仍须支持 UDP。
 - 未启用 mixed-port 或 TUN 时仍可运行 Controller 和资源任务。Controller 接受通配 IP、localhost 和空 host；secret 可选，见 [Controller API](controller-api.md)。
