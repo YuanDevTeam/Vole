@@ -75,7 +75,7 @@ Linux Unix Controller 的配置与共享鉴权（不绑定 socket）：
 
 Controller 推送（纯内存 duplex，无网络监听）：`controller::websocket::tests::`；
 安全传输/CORS：`controller::secure_tests::`；DNS 展示：`controller::dns::tests::`；
-实例日志脱敏/动态过滤：`logging::tests::`。
+实例完整日志/动态级别过滤：`logging::tests::`。
 组固定清除：`routing::proxy_group::tests::automatic_fixed_clear_uses_existing_health_without_probe`。
 这些过滤器不代替真实 TUN 计数与 Stop 验证。
 临时规则控制另选 `routing::rule_disable::tests::`、`controller::rules::tests::`、
@@ -127,6 +127,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | UoT | `outbound::uot::tests::` | 半帧取消后继续、v2首部、原期限、单槽响应与Stop |
 | VMess 响应边界 | `outbound::vmess::header::delayed_response_memory_tests::`、`outbound::vmess::stream::tests::`、`--test vmess_lifecycle` | 官方延迟响应向量、提交前期限、响应认证、nonce 耗尽与关闭 |
 | SS2022 | `outbound::shadowsocks::datagram::tests::` | 官方内存对端、三种 cipher、空 UDP/EIH、认证后 cipher 准入、取消与轮换 ID、重放边界 |
+| Trojan UDP | `routing::dispatcher::tests::managed_trojan_udp_`、`--test trojan` | 真实内存帧、同源多目标共享、来源及关闭后旧回复隔离、取消与流释放 |
 | HTTP 编译与执行 | `http_processing::` | 严格规则与 provider、URL/头/正文、压缩与 JSON Patch、选择性 TLS、H1/H2 和有界回退 |
 | HTTP Invoke | `invoke::http::`、`resource::http_control::tests::` | 有界私密输入、离线演算、来源未准备、下载 dispatcher 接线、单一准入、取消与 Stop 收尾 |
 | HTTP 在线配置 | `runtime::providers::apply::http_tests::` | 活动快照继承、变更要求重连、旧候选保留 |

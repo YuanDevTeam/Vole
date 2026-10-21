@@ -4109,7 +4109,6 @@ dependencies = [
  "hyper-util",
  "idna",
  "libc",
- "log",
  "maxminddb",
  "md-5",
  "oslog",

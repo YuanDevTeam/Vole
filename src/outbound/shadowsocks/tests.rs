@@ -219,7 +219,6 @@ async fn ss_physical_tcp_uses_shared_dialer_and_logical_target() {
     })
     .await
     .unwrap();
-    assert_eq!(log::STATIC_MAX_LEVEL, log::LevelFilter::Off);
     assert!(!format!("{outbound:?}").contains(&config.password));
 }
 

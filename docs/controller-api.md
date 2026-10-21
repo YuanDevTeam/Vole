@@ -190,11 +190,11 @@ Apple 使用自身 Mach task resident size，Windows 使用当前进程 working 
 
 **WebSocket `/traffic` 使用业务 Registry 的应用负载字节**，与 `/connections` 累计值一致；速率是本订阅实际采样间隔内的字节/秒。普通 GET `/traffic` 仍是 TUN L3 包统计，两者不能混用。Provider 更新不重置业务累计值。
 
-`/logs?level=info` 支持 debug/info/warning/error/silent，缺省 info，并受当前运行时 log-level 过滤。结构化 time 为 UTC 时分秒，warning 转为 warn。日志总线属于当前运行时，独立于宿主 tracing subscriber；仅输出内部 target 和明确允许的数值/布尔指标，不格式化 message、错误原文、目标、配置或任意 Debug 值。它不提供历史回放。
+`/logs?level=info` 支持 debug/info/warning/error/silent，缺省 info，并受当前运行时 log-level 过滤，debug 同时接收 tracing 的 TRACE 事件。结构化 time 为 UTC 时分秒，warning 转为 warn。日志总线属于当前运行时，独立于宿主 tracing subscriber；完整保留已生成事件的 target、message 和所有字段，包括字符串、错误和 Debug 值，不按敏感字段脱敏或截断内容。它不提供历史回放。
 
 HTTP/HTTPS 合计最多 4 个订阅，仍占用既有 8 条连接名额。每条输出消息最多 256 KiB，序列化扩容前检查；connections 订阅至多捕获 512 条引用，超预算关闭当前订阅，普通 REST 快照保持完整。接收缓冲/消息/帧各限 1 KiB，业务 Text/Binary 不作为 Controller 命令；Ping/Pong/Close 按协议处理。写入和控制帧 flush 最多 5 秒，慢客户端只保留当前发送消息，不排队后续快照。
 
-日志环仅在有订阅时创建，64 条共享事件、单条至多 512 字节，每秒至多 32 条；过载丢弃，最后订阅离开释放历史缓冲。无订阅时不运行周期采样或日志轮询。Stop 取消并 join 当前连接任务，释放订阅许可与日志接收器。
+日志环仅在有订阅时创建，保留 64 条共享事件，不另设每秒条数限制；队列过载时慢订阅者会落后，最后订阅离开释放历史缓冲。WebSocket 仍受上述消息大小和写入期限约束，超出消息预算时关闭订阅，不发送被截断的事件。无订阅时不格式化日志，也不运行周期采样或日志轮询。Stop 取消并 join 当前连接任务，释放订阅许可与日志接收器。
 
 ## `PUT /proxies/{name}`
 

@@ -2777,6 +2777,169 @@ rules: ["MATCH,pool"]
         );
     }
 
+    #[cfg(feature = "outbound-trojan")]
+    #[tokio::test]
+    async fn managed_trojan_udp_shares_ip_destinations_and_retires_closed_members() {
+        use crate::{dispatch::DatagramBudget, outbound::trojan::TrojanDatagram};
+
+        #[derive(Default)]
+        struct MemoryTrojan {
+            wires: Mutex<Vec<(SocketAddr, tokio::io::DuplexStream)>>,
+        }
+        #[async_trait]
+        impl Dispatcher for MemoryTrojan {
+            async fn connect_tcp(&self, _: StreamSession) -> Result<BoxStream, DispatchError> {
+                Err(DispatchError::NotAllowed)
+            }
+            async fn open_datagram(
+                &self,
+                session: DatagramSession,
+            ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+                let (client, peer) = tokio::io::duplex(4096);
+                self.wires.lock().unwrap().push((session.source, peer));
+                Ok(Box::new(TrojanDatagram::new(
+                    Box::new(client),
+                    DatagramBudget::new(8192, 8192),
+                )))
+            }
+        }
+        fn frame(target: SocketAddr, payload: &[u8]) -> Vec<u8> {
+            let IpAddr::V4(ip) = target.ip() else {
+                panic!("fixture uses IPv4 targets");
+            };
+            let mut wire = vec![1];
+            wire.extend_from_slice(&ip.octets());
+            wire.extend_from_slice(&target.port().to_be_bytes());
+            wire.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            wire.extend_from_slice(b"\r\n");
+            wire.extend_from_slice(payload);
+            wire
+        }
+        async fn expect_wire(peer: &mut tokio::io::DuplexStream, expected: &[u8]) {
+            let mut sent = vec![0; expected.len()];
+            peer.read_exact(&mut sent).await.unwrap();
+            assert_eq!(sent, expected);
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let config = crate::config::Config::parse_yaml(
+                br#"
+proxies:
+  - {name: edge, type: trojan, server: 192.0.2.1, port: 443, password: fixture, udp: true}
+rules: ["MATCH,edge"]
+"#,
+            )
+            .unwrap();
+            let proxy = Arc::new(MemoryTrojan::default());
+            let rules = RuleSet::compile(config.rules.clone()).unwrap();
+            let registry = Arc::new(crate::connections::Registry::default());
+            let diagnostics = Arc::new(crate::routing::diagnostics::Diagnostics::new(
+                &config,
+                &rules,
+                registry.clone(),
+            ));
+            let router = RoutingDispatcher::new(
+                ProxyDispatchers::new(vec![proxy.clone()]).unwrap(),
+                Arc::new(RecordingDispatcher::default()),
+                None,
+                rules,
+                Arc::new(EmptyGeoMatcher),
+            )
+            .with_diagnostics(diagnostics);
+            let session = association(InboundKind::Tun);
+            let mut first = router.open_datagram(session.clone()).await.unwrap();
+            let mut second = router
+                .open_datagram(DatagramSession::new(
+                    InboundKind::Tun,
+                    "127.0.0.1:10001".parse().unwrap(),
+                ))
+                .await
+                .unwrap();
+            let a = "198.51.100.1:443".parse().unwrap();
+            let b = "198.51.100.2:443".parse().unwrap();
+            let c = "198.51.100.1:8443".parse().unwrap();
+            for (target, payload) in [(a, &b"one"[..]), (b, b"two"), (c, b"three")] {
+                first.send(datagram(target, payload)).await.unwrap();
+            }
+            assert_eq!(
+                proxy.wires.lock().unwrap().len(),
+                1,
+                "same-source IP targets must share the real Trojan association"
+            );
+            second.send(datagram(a, b"other")).await.unwrap();
+            let mut peers = std::mem::take(&mut *proxy.wires.lock().unwrap());
+            assert_eq!(peers.len(), 2, "different sources need independent wires");
+            let (second_source, mut second_peer) = peers.pop().unwrap();
+            let (first_source, mut old_peer) = peers.pop().unwrap();
+            assert_eq!(first_source, session.source);
+            assert_eq!(second_source.port(), 10001);
+            expect_wire(
+                &mut old_peer,
+                &[frame(a, b"one"), frame(b, b"two"), frame(c, b"three")].concat(),
+            )
+            .await;
+            expect_wire(&mut second_peer, &frame(a, b"other")).await;
+
+            let snapshot = serde_json::to_value(registry.snapshot()).unwrap();
+            assert_eq!(snapshot["connections"].as_array().unwrap().len(), 4);
+            let closed = snapshot["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| {
+                    entry["metadata"]["sourcePort"] == "10000"
+                        && entry["metadata"]["destinationIP"] == "198.51.100.1"
+                        && entry["metadata"]["destinationPort"] == "443"
+                })
+                .unwrap();
+            registry.close(closed["id"].as_str().unwrap());
+            first.send(datagram(a, b"new")).await.unwrap();
+            let mut peers = std::mem::take(&mut *proxy.wires.lock().unwrap());
+            assert_eq!(
+                peers.len(),
+                1,
+                "closed members must retire their shared wire"
+            );
+            let (_, mut new_peer) = peers.pop().unwrap();
+            expect_wire(&mut new_peer, &frame(a, b"new")).await;
+            old_peer
+                .write_all(&[frame(a, b"stale"), frame(b, b"sibling"), frame(c, b"port")].concat())
+                .await
+                .unwrap();
+            new_peer.write_all(&frame(a, b"fresh")).await.unwrap();
+            second_peer.write_all(&frame(a, b"separate")).await.unwrap();
+            let mut replies = HashMap::new();
+            for _ in 0..3 {
+                let reply = first.receive().await.unwrap();
+                assert!(replies.insert(reply.remote, reply.payload).is_none());
+            }
+            for (target, expected) in [(a, &b"fresh"[..]), (b, b"sibling"), (c, b"port")] {
+                assert_eq!(replies[&Destination::Ip(target)].as_ref(), expected);
+            }
+            let reply = second.receive().await.unwrap();
+            assert_eq!(reply.remote, Destination::Ip(a));
+            assert_eq!(reply.payload.as_ref(), b"separate");
+            first.close().await.unwrap();
+            second.close().await.unwrap();
+            assert!(
+                serde_json::to_value(registry.snapshot()).unwrap()["connections"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            for peer in [&mut old_peer, &mut new_peer, &mut second_peer] {
+                let mut remainder = Vec::new();
+                peer.read_to_end(&mut remainder).await.unwrap();
+                assert!(
+                    remainder.is_empty(),
+                    "close must release both wire directions"
+                );
+            }
+        })
+        .await
+        .expect("memory-only routing must complete without peer or shutdown waits");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn managed_udp_connections_poll_only_ready_targets_and_close_pending_flow() {
         let config =

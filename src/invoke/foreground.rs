@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
-    fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
@@ -19,11 +18,9 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
 };
 use tracing::{
-    Event, Level, Metadata, Subscriber,
-    field::{Field, Visit},
+    Event, Metadata, Subscriber,
     level_filters::LevelFilter,
     span::{Attributes, Id, Record},
     subscriber::Interest,
@@ -737,44 +734,31 @@ impl ShutdownSignals {
     }
 }
 
-const LOG_BYTES: usize = 512;
-const LOG_EVENTS_PER_SECOND: u32 = 64;
-
 struct StderrSubscriber {
     next_span: AtomicU64,
-    rate: Mutex<(Instant, u32)>,
 }
 
 impl StderrSubscriber {
     fn new() -> Self {
         Self {
             next_span: AtomicU64::new(1),
-            rate: Mutex::new((Instant::now(), 0)),
         }
     }
 
     fn accepts(metadata: &Metadata<'_>) -> bool {
-        let target = metadata.target();
         metadata.is_event()
-            && *metadata.level() <= Level::DEBUG
-            && (target == "vole"
-                || target.starts_with("vole::")
-                || target == "vole_netstack"
-                || target.starts_with("vole_netstack::"))
     }
 
-    fn admit(&self) -> bool {
-        let Ok(mut rate) = self.rate.lock() else {
-            return false;
-        };
-        if rate.0.elapsed() >= Duration::from_secs(1) {
-            *rate = (Instant::now(), 0);
+    fn write_event(event: &Event<'_>, output: &mut impl Write) -> io::Result<()> {
+        if Self::accepts(event.metadata()) {
+            writeln!(
+                output,
+                "vole: [{}] {}",
+                event.metadata().level(),
+                crate::logging::format_event(event)
+            )?;
         }
-        if rate.1 >= LOG_EVENTS_PER_SECOND {
-            return false;
-        }
-        rate.1 += 1;
-        true
+        Ok(())
     }
 }
 
@@ -792,7 +776,7 @@ impl Subscriber for StderrSubscriber {
     }
 
     fn max_level_hint(&self) -> Option<LevelFilter> {
-        Some(LevelFilter::DEBUG)
+        Some(LevelFilter::TRACE)
     }
 
     fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
@@ -810,111 +794,14 @@ impl Subscriber for StderrSubscriber {
     fn exit(&self, _span: &Id) {}
 
     fn event(&self, event: &Event<'_>) {
-        if !Self::accepts(event.metadata()) || !self.admit() {
-            return;
-        }
-        use fmt::Write as _;
-
-        let mut line = LogLine::new();
-        _ = write!(
-            line,
-            "vole: [{}] {}",
-            event.metadata().level(),
-            event.metadata().target()
-        );
-        event.record(&mut NumericFields(&mut line));
-        _ = writeln!(io::stderr().lock(), "{}", line.as_str());
-    }
-}
-
-struct NumericFields<'a>(&'a mut LogLine);
-
-impl Visit for NumericFields<'_> {
-    fn record_u64(&mut self, field: &Field, value: u64) {
-        use fmt::Write as _;
-        if public_numeric_field(field.name()) {
-            _ = write!(self.0, " {}={value}", field.name());
-        }
-    }
-
-    fn record_i64(&mut self, field: &Field, value: i64) {
-        use fmt::Write as _;
-        if public_numeric_field(field.name()) {
-            _ = write!(self.0, " {}={value}", field.name());
-        }
-    }
-
-    fn record_bool(&mut self, field: &Field, value: bool) {
-        use fmt::Write as _;
-        if public_numeric_field(field.name()) {
-            _ = write!(self.0, " {}={value}", field.name());
-        }
-    }
-
-    fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
-    fn record_str(&mut self, _field: &Field, _value: &str) {}
-}
-
-fn public_numeric_field(name: &str) -> bool {
-    matches!(
-        name,
-        "mtu" | "packet_queue" | "event_queue" | "cancelled" | "panicked" | "dns_hijack" | "ipv6"
-    ) || name.starts_with("current_")
-        || name.starts_with("peak_")
-        || [
-            "_current",
-            "_peak",
-            "_count",
-            "_dropped",
-            "_drops",
-            "_bytes",
-            "_capacity",
-            "_limit",
-            "_ms",
-            "_seconds",
-        ]
-        .iter()
-        .any(|suffix| name.ends_with(suffix))
-}
-
-struct LogLine {
-    bytes: [u8; LOG_BYTES],
-    len: usize,
-}
-
-impl LogLine {
-    fn new() -> Self {
-        Self {
-            bytes: [0; LOG_BYTES],
-            len: 0,
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        // Writes append complete UTF-8 characters only.
-        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
-    }
-}
-
-impl fmt::Write for LogLine {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        for character in text.chars().filter(|character| !character.is_control()) {
-            let mut buffer = [0; 4];
-            let character = character.encode_utf8(&mut buffer);
-            if self.len + character.len() > self.bytes.len() {
-                break;
-            }
-            self.bytes[self.len..self.len + character.len()].copy_from_slice(character.as_bytes());
-            self.len += character.len();
-        }
-        Ok(())
+        _ = Self::write_event(event, &mut io::stderr().lock());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::{io::Cursor, time::Duration};
     fn options(data: Option<PathBuf>, config: Option<PathBuf>) -> PathOptions {
         PathOptions {
             data_dir: data,
@@ -1317,22 +1204,11 @@ mod tests {
             .is_some()));
     }
 
-    #[test]
-    fn stderr_fields_exclude_targets_and_log_buffer_is_bounded() {
-        assert!(!public_numeric_field("destination"));
-        assert!(!public_numeric_field("uuid"));
-        let mut line = LogLine::new();
-        fmt::Write::write_str(&mut line, &"😀".repeat(200)).unwrap();
-        assert!(line.len <= LOG_BYTES);
-        assert!(!line.as_str().is_empty());
-    }
-
-    #[test]
-    fn stderr_events_preserve_drop_counts_and_filter_private_values() {
-        struct Capture(Arc<Mutex<String>>);
+    fn capture_stderr_logs(emit: impl FnOnce()) -> String {
+        struct Capture(Arc<Mutex<Vec<u8>>>);
         impl Subscriber for Capture {
-            fn enabled(&self, _: &Metadata<'_>) -> bool {
-                true
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                StderrSubscriber::accepts(metadata)
             }
             fn new_span(&self, _: &Attributes<'_>) -> Id {
                 Id::from_u64(1)
@@ -1342,13 +1218,28 @@ mod tests {
             fn enter(&self, _: &Id) {}
             fn exit(&self, _: &Id) {}
             fn event(&self, event: &Event<'_>) {
-                let mut line = LogLine::new();
-                event.record(&mut NumericFields(&mut line));
-                self.0.lock().unwrap().push_str(line.as_str());
+                StderrSubscriber::write_event(event, &mut *self.0.lock().unwrap()).unwrap();
             }
         }
-        let rendered = Arc::new(Mutex::new(String::new()));
-        tracing::subscriber::with_default(Capture(rendered.clone()), || {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Capture(output.clone()), emit);
+        let output = output.lock().unwrap().clone();
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn stderr_messages_preserve_long_unicode_and_control_characters() {
+        let message = "😀\n\t".repeat(200);
+        let output = capture_stderr_logs(|| {
+            tracing::info!(target: "external::library", message = message.as_str());
+        });
+        assert!(output.starts_with("vole: [INFO] external::library"));
+        assert!(output.contains(&message));
+    }
+
+    #[test]
+    fn stderr_events_preserve_all_generated_fields() {
+        let output = capture_stderr_logs(|| {
             tracing::info!(
                 packet_queue_drops = 1_u64,
                 udp_queue_drops = 2_u64,
@@ -1357,13 +1248,12 @@ mod tests {
                 dns_queue_drops = 5_u64,
                 udp_drops = 6_u64,
                 mtu = 1500_u64,
-                destination = "private destination",
+                destination = "synthetic destination",
                 uuid = 123_u64,
-                password_bytes = "private credential",
-                "private message"
+                password_bytes = "synthetic credential",
+                "synthetic message"
             );
         });
-        let rendered = rendered.lock().unwrap();
         for (field, count) in [
             ("packet_queue_drops", 1),
             ("udp_queue_drops", 2),
@@ -1372,12 +1262,28 @@ mod tests {
             ("dns_queue_drops", 5),
             ("udp_drops", 6),
         ] {
-            assert!(rendered.contains(&format!(" {field}={count}")));
+            assert!(output.contains(&format!(" {field}={count}")));
         }
-        assert!(rendered.contains(" mtu=1500"));
-        for private in ["private", "destination", "uuid", "password", "message"] {
-            assert!(!rendered.contains(private));
+        for content in [
+            "mtu=1500",
+            "synthetic destination",
+            "uuid=123",
+            "synthetic credential",
+            "synthetic message",
+        ] {
+            assert!(output.contains(content));
         }
+    }
+
+    #[test]
+    fn stderr_events_are_not_rate_limited() {
+        let output = capture_stderr_logs(|| {
+            for sequence in 0..128 {
+                tracing::info!(target: "external", sequence, "complete event");
+            }
+        });
+        assert_eq!(output.lines().count(), 128);
+        assert_eq!(output.matches("complete event").count(), 128);
     }
 
     #[test]

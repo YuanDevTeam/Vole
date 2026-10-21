@@ -216,7 +216,7 @@ IP-only协议接点持有`ResolutionContext`，runtime DNS通过Weak绑定，不
 - 同组成功选择是线性化的，不同组独立；选择失败不改变状态，也不创建重试或自动 failover 任务。
 - 切换不扫描或迁移现有 TCP、UDP、DNS transport，不刷新 DNS cache/singleflight 或 TCP pool；资源仍由原所有者按既有 timeout、EOF、取消和 stop 语义回收。
 - Controller 同时最多跟踪 8 个连接任务，包含最多 4 个 WebSocket 订阅。header、body 和输出各有 5 秒 I/O 期限；普通 PUT body 最大 1 KiB，`PUT /configs` 在取得独立配置应用许可后允许最多 8 MiB，并使用配置候选的 90 秒总期限。超时、超限和解析失败只终止当前请求。
-- WebSocket 按需采样，不为每个订阅保存历史快照；输出 JSON 在扩容前限制 256 KiB，连接快照先限制 512 个引用。客户端缓冲/消息/帧各 1 KiB，慢写取消当前订阅。日志总线仅在订阅时保留 64 条共享事件，单条 512 字节、每秒 32 条；无订阅不轮询，Stop join 连接并释放订阅。
+- WebSocket 按需采样，不为每个订阅保存历史快照；输出 JSON 在扩容前限制 256 KiB，连接快照先限制 512 个引用。客户端缓冲/消息/帧各 1 KiB，慢写取消当前订阅。日志总线仅在订阅时保留 64 条共享事件，不截断事件内容或另设每秒条数限制；无订阅不格式化或轮询，Stop join 连接并释放订阅。
 
 完整接口见 [运行时 Controller](controller-api.md)。
 
@@ -340,7 +340,7 @@ TCP-only netstack，因此该值为零不代表 UDP 无丢包。运行时记录
 TCP/ICMP ingress Full 记录 `packet_queue_drops`。这些计数
 不包含物理 socket、内核 TUN 或对端设施中的丢包。
 
-日志必须有界且脱敏，不记录目标、DNS question、UUID、凭据、密钥、负载或完整配置。
+CLI 与 Controller 按日志级别完整输出事件的 target、message 和字段，不按敏感内容脱敏或删减。Controller 的订阅队列、WebSocket 消息与写入期限仍按上文限制；超过消息预算时关闭订阅，不发送截断事件。
 
 仅`cfg(test)`/`interop-test`启用的`ResourceProbe`按测试作用域记录RAII当前值/峰值；子任务显式继承作用域，不使用进程全局reset或更换生产allocator。当前接入物理TCP/UDP、共享流/QUIC驱动与session、数据报association、DNS池/等待者及既有运行时活动guard。Hysteria2 的待完成分片通过 `Reassembly` 登记，交付后释放 Packet ID 和重组资源；零计数必须与实际执行过的重组路径一起解释。
 

@@ -594,14 +594,31 @@ mod tests {
         tokio::task::yield_now().await;
         tracing::dispatcher::with_default(&filtered, || {
             tracing::info!(target:"vole::controller",bytes=1,"not requested");
-            tracing::warn!(target:"vole::controller",bytes=7,secret="must remain private","must remain private");
+            tracing::warn!(target:"external::library",bytes=7,secret="synthetic credential","synthetic message");
         });
         let value = tokio::time::timeout(Duration::from_secs(1), json(&mut client))
             .await
             .unwrap();
         assert_eq!(value["level"], "warn");
         assert!(value["message"].as_str().unwrap().contains("bytes=7"));
-        assert!(!value.to_string().contains("private"));
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap()
+                .contains("synthetic credential")
+        );
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap()
+                .contains("synthetic message")
+        );
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap()
+                .contains("external::library")
+        );
         cancel.cancel();
         task.await.unwrap().unwrap();
 

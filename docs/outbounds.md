@@ -362,6 +362,10 @@ ping-interval 为秒，0 不主动 PING，负值明确拒绝；max-connections/m
 
 TCP 保留半关闭；gRPC duplex 发送 END_STREAM，不用 RST_STREAM 提前结束读侧。
 UDP 使用同一已认证流上的地址/长度/CRLF 帧，无额外 socket/读取泵/池。
+同一来源、具体节点和资源代际内，未改写 IP 目标共享该流，回复按每帧地址分流；
+逐目标统计、关闭及旧回复隔离沿用[资源策略](runtime-resource-policy.md#udp)。
+不同来源、域名及需要地址还原的目标保持独立；关闭一个目标不关闭仍有成员的流，
+但部分发送取消仍使整条关联失效，不重放已提交的帧。
 payload 最多 8192 字节，待解析最多 8455 字节，并与调用方收发预算分别取交集。
 非法/截断帧关闭，合法超接收预算整包丢弃；取消读取保留进度，部分发送取消使关联失效。
 运行时先取消并 join 入站所有者，再等待节点 gRPC 驱动。
@@ -675,8 +679,6 @@ UoT 对端使用 16 KiB 接收缓冲；容器数据验收覆盖该实际边界�
 
 依赖仅 crates.io 版本，不使用 Git/path/源码补丁。AWS-LC 仅允许沿 shadowsocks →
 shadowsocks-crypto 链使用，TLS/REALITY 不消费它，详见[TLS 依赖](tls-dependencies.md)。
-启用 SS 时通过 log 的 max_level_off/release_max_level_off 关闭整个依赖图该 facade，
-防止上游日志泄密；Vole tracing 不受影响。上游 Debug 不暴露。
 重放窗口派生代码的来源/完整许可保留在源码头，发布仍审计实际链接图。
 
 TCP 前导不使用上游私有的 padding 构造器；响应在交付前校验 request-salt 与本连接

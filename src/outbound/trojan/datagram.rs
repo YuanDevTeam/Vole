@@ -93,6 +93,10 @@ fn invalid_frame() -> io::Error {
 
 #[async_trait]
 impl DatagramTransport for TrojanDatagram {
+    fn supports_shared_destinations(&self) -> bool {
+        true
+    }
+
     fn payload_budget(&self, _: &Destination) -> DatagramBudget {
         self.budget
     }

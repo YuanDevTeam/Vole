@@ -571,11 +571,11 @@ ProtectFd(fd) -> bool
 ## 编码与安全边界
 
 - 所有 JSON DTO 拒绝未知字段。
-- 配置、错误和日志按 UTF-8 字节计数并受固定上限约束。
+- 配置和错误按 UTF-8 字节计数并受固定上限约束；CLI 与 Controller 日志完整输出已生成的事件，级别与订阅预算见各自契约。
 - TUN 原始数据包按 `tun.mtu` 限制；最终代理 UDP 响应最多为该 MTU 减去 48 字节。默认 9000 对应 8952 字节；显式 1500 对应 1452 字节，Windows UWP 的最高 1400 对应 1352 字节。
 - 嵌套 UDP 协议可以增加有界帧头，但解封装后的最终负载仍受该平台响应上限限制。
 - 节点和代理组定义名共享大小写敏感的严格 UTF-8 命名空间；内置动作名称保留，具体名称与编码规则见 [Controller](controller-api.md#名称与路径)。
-- Secret、password、UUID、REALITY key、short ID、目标地址和完整配置不得进入日志。
+- Invoke 不额外记录完整配置或凭据；CLI 与 Controller 不对已生成的日志消息或字段进行二次脱敏。
 - Apple Unified Logging 的 subsystem 固定为 `io.github.yuandevteam.vole`，category 为
   `vole`，不继承宿主应用的 bundle identifier；Console 或 `log stream` 应按该标识筛选。
 
