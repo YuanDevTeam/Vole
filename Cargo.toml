@@ -54,7 +54,7 @@ inbound-socks5 = ["dep:rcgen", "dep:rsa", "dep:ring", "dep:tokio-tungstenite"]
 outbound-anytls = ["dep:md-5", "stream-security", "ech"]
 outbound-socks5 = []
 outbound-http = []
-outbound-shadowsocks = ["dep:shadowsocks", "dep:blake3", "dep:log", "stream-security", "stream-transport", "ech", "dep:aes", "dep:ring"]
+outbound-shadowsocks = ["dep:shadowsocks", "dep:blake3", "stream-security", "stream-transport", "ech", "dep:aes", "dep:ring"]
 outbound-vless = ["ech", "stream-security", "boring/mlkem", "dep:blake3", "dep:vole-blake3-raw", "stream-transport", "quinn-h3-transport", "dep:hyper", "dep:hyper-util"]
 outbound-trojan = ["stream-transport", "stream-security", "ech"]
 outbound-trusttunnel = ["stream-transport", "tls-fingerprint", "ech", "quiche-h3-transport"]
@@ -65,12 +65,14 @@ stream-security = ["tls-fingerprint", "boring/reality", "boring/jls"]
 tls-fingerprint = ["dep:boring", "dep:tokio-boring"]
 ech = []
 shadow-tls-v3 = ["tls-fingerprint", "boring/shadow-tls-v3", "dep:ring"]
-outbound-hysteria2 = ["ech", "quic-transport", "dep:quinn-proto", "dep:h3", "dep:h3-quinn", "dep:blake2", "dep:hyper", "dep:hyper-util"]
+outbound-hysteria2 = ["ech", "quic-transport", "dep:h3", "dep:h3-quinn", "dep:blake2", "dep:hyper", "dep:hyper-util"]
 outbound-tuic = ["quic-transport"]
 sing-mux = ["stream-transport", "dep:yamux", "tokio-util/compat"]
 outbound-wireguard = ["dep:boringtun", "dep:vole-netstack"]
 stream-transport = ["dep:tokio-tungstenite", "dep:httparse", "dep:log"]
 quic-transport = ["dep:quinn", "dep:quinn-proto"]
+# Exposes h3::ConnectionState for connection error/closing checks before reuse.
+# h3-quinn does not enable this feature on Vole's behalf.
 quinn-h3-transport = ["quic-transport", "dep:h3", "dep:h3-quinn", "h3/i-implement-a-third-party-backend-and-opt-into-breaking-changes"]
 quiche-h3-transport = ["quic-transport", "dep:quiche", "dep:boring"]
 dns-quic = ["quinn-h3-transport"]
@@ -83,7 +85,6 @@ cli = ["invoke"]
 windows-wintun = ["tun", "dep:tun-rs", "dep:windows"]
 windows-uwp = ["invoke", "dep:windows", "dep:windows-collections", "dep:windows-core"]
 tun = [
-    "dep:vole-netstack",
     "inbound-http",
     "inbound-socks5",
     "outbound-anytls",
