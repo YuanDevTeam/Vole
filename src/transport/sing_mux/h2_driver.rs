@@ -9,7 +9,9 @@ pub(super) async fn new(raw: BoxStream) -> io::Result<(Sender, impl Future<Outpu
     let (sender, mut connection) = h2::client::Builder::new()
         .enable_push(false)
         .initial_window_size(65536)
-        .initial_connection_window_size(131072)
+        // Leave bounded connection credit for other streams when a few TCP
+        // consumers hold their individual receive windows.
+        .initial_connection_window_size(524288)
         .max_frame_size(16384)
         .max_header_list_size(16384)
         .max_concurrent_streams(0)

@@ -523,6 +523,101 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn h2mux_unread_siblings_do_not_block_a_short_response() {
+        use crate::transport::h2_write::{Payload, Writes};
+        use std::time::Duration;
+
+        let (raw, peer) = tokio::io::duplex(65536);
+        let (peer, writes) = Writes::wrap(Box::new(peer));
+        let (accepted, mut requests) = tokio::sync::mpsc::channel(1);
+        let peer_driver = tokio::spawn(async move {
+            let mut connection = h2::server::Builder::new()
+                .handshake::<_, Payload>(peer)
+                .await
+                .unwrap();
+            while let Some(Ok(request)) = connection.accept().await {
+                if accepted.send(request).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let (sender, driver) = h2_driver::new(Box::new(raw)).await.unwrap();
+        let client_driver = tokio::spawn(driver);
+        let sender = Sender::H2(sender);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut streams = Vec::new();
+        let mut peer_streams = Vec::new();
+        let mut short_receipt = None;
+
+        for index in 0..3 {
+            let mut raw = sender.open(deadline).await.unwrap();
+            let metadata = [0, if index == 2 { 3 } else { 0 }, 1, 192, 0, 2, 1, 1, 187];
+            raw.write_all(&metadata).await.unwrap();
+            raw.flush().await.unwrap();
+            let (request, mut response) = requests.recv().await.unwrap();
+            let mut input = request.into_body();
+            let first = input.data().await.unwrap().unwrap();
+            assert_eq!(first.as_ref(), metadata);
+            input.flow_control().release_capacity(first.len()).unwrap();
+            let mut output = response
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let body = if index == 2 {
+                Bytes::from_static(&[0, 42])
+            } else {
+                let mut body = vec![b'a' + index; 65536];
+                body[0] = 0;
+                Bytes::from(body)
+            };
+            let (payload, receipt) = writes.payload(body);
+            output.send_data(payload, false).unwrap();
+            if index < 2 {
+                // The held streams consume actual connection credit before
+                // opening the short stream; enqueueing DATA alone is no proof.
+                tokio::time::timeout(Duration::from_secs(1), receipt)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            } else {
+                short_receipt = Some(receipt);
+            }
+            streams.push(pending_status(raw, deadline));
+            peer_streams.push((input, output));
+        }
+
+        let mut short = streams.pop().unwrap();
+        let short_response =
+            tokio::time::timeout(Duration::from_millis(100), short.read_u8()).await;
+        // Neither held sibling has been read or dropped at this point. The
+        // short stream must make progress without borrowing their credit.
+        for (index, stream) in streams.iter_mut().enumerate() {
+            let mut payload = vec![0; 65535];
+            tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut payload))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(payload.iter().all(|byte| *byte == b'a' + index as u8));
+        }
+        tokio::time::timeout(Duration::from_secs(1), short_receipt.unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(short);
+        drop(streams);
+        drop(peer_streams);
+        client_driver.abort();
+        let _ = client_driver.await;
+        peer_driver.abort();
+        let _ = peer_driver.await;
+        assert!(
+            matches!(short_response, Ok(Ok(42))),
+            "unread siblings blocked the short response: {short_response:?}"
+        );
+    }
+
     enum NoBusinessWrite {
         Pending,
         Zero,
