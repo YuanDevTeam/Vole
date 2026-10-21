@@ -14,7 +14,7 @@ use bytes::Bytes;
 use std::{
     collections::VecDeque,
     future::pending,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
 use tokio::{
@@ -54,6 +54,13 @@ fn session() -> StreamSession {
     }
 }
 
+#[derive(Default)]
+struct ReceiveFlood {
+    remaining: AtomicUsize,
+    sent_while_ready: AtomicBool,
+    armed: tokio::sync::Notify,
+}
+
 struct Peer {
     multi: bool,
     reserved: bool,
@@ -63,6 +70,7 @@ struct Peer {
     silent_first: bool,
     sends: Arc<AtomicUsize>,
     closes: Arc<AtomicUsize>,
+    flood: Arc<ReceiveFlood>,
 }
 #[async_trait]
 impl OutboundConnector for Peer {
@@ -121,6 +129,7 @@ impl OutboundConnector for Peer {
             silent_first: self.silent_first,
             sends: self.sends.clone(),
             closes: self.closes.clone(),
+            flood: self.flood.clone(),
             scratch: vec![0; 1440],
         }))
     }
@@ -141,6 +150,7 @@ struct MemoryPeer {
     silent_first: bool,
     sends: Arc<AtomicUsize>,
     closes: Arc<AtomicUsize>,
+    flood: Arc<ReceiveFlood>,
     scratch: Vec<u8>,
 }
 impl MemoryPeer {
@@ -224,6 +234,9 @@ impl DatagramTransport for MemoryPeer {
         DatagramBudget::new(1440, 1440)
     }
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
+        if self.flood.remaining.load(Ordering::Relaxed) != 0 {
+            self.flood.sent_while_ready.store(true, Ordering::Relaxed);
+        }
         if self.endpoint.is_none() {
             assert!(
                 datagram.remote == Destination::Ip(ENDPOINT.parse().unwrap())
@@ -265,6 +278,10 @@ impl DatagramTransport for MemoryPeer {
     }
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
         loop {
+            if self.flood.remaining.load(Ordering::Relaxed) != 0 {
+                self.flood.remaining.fetch_sub(1, Ordering::Relaxed);
+                self.encrypt(&[]);
+            }
             if let Some(payload) = self.network.pop_front() {
                 return Ok(Datagram {
                     remote: self.endpoint.clone().unwrap(),
@@ -278,11 +295,11 @@ impl DatagramTransport for MemoryPeer {
             {
                 return pending().await;
             }
-            let packet = self
-                .packets
-                .recv()
-                .await
-                .ok_or(DispatchError::ConnectionRefused)?;
+            let packet = tokio::select! {
+                biased;
+                () = self.flood.armed.notified() => continue,
+                packet = self.packets.recv() => packet.ok_or(DispatchError::ConnectionRefused)?,
+            };
             self.encrypt(packet.data());
         }
     }
@@ -305,6 +322,13 @@ impl Drop for MemoryPeer {
 }
 
 fn outbound(silent: bool) -> (Arc<WireGuardOutbound>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    outbound_with_flood(silent, Arc::default())
+}
+
+fn outbound_with_flood(
+    silent: bool,
+    flood: Arc<ReceiveFlood>,
+) -> (Arc<WireGuardOutbound>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let sends = Arc::new(AtomicUsize::new(0));
     let closes = Arc::new(AtomicUsize::new(0));
     let peer = Arc::new(Peer {
@@ -316,12 +340,62 @@ fn outbound(silent: bool) -> (Arc<WireGuardOutbound>, Arc<AtomicUsize>, Arc<Atom
         silent_first: false,
         sends: sends.clone(),
         closes: closes.clone(),
+        flood,
     });
     (
         Arc::new(WireGuardOutbound::new_with_path(&config(), UpstreamPath::Proxy(peer)).unwrap()),
         sends,
         closes,
     )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn wireguard_memory_ready_receive_does_not_starve_send_or_stop() {
+    let probe = ResourceProbe::default();
+    probe
+        .scope(async {
+            let flood = Arc::new(ReceiveFlood::default());
+            let (outbound, _, closes) = outbound_with_flood(false, flood.clone());
+            let context = EstablishContext::with_timeout(Duration::from_secs(2));
+            let request =
+                DatagramRequest::new(DatagramSession::new(InboundKind::Socks5, session().source));
+            let mut udp = outbound.open_datagram(request, &context).await.unwrap();
+            let remote = Destination::Ip("10.0.0.1:53".parse().unwrap());
+            let send = |payload| Datagram {
+                remote: remote.clone(),
+                payload: Bytes::from_static(payload),
+                sniffed_domain: None,
+            };
+            udp.send(send(b"warmup")).await.unwrap();
+            assert_eq!(udp.receive().await.unwrap().payload.as_ref(), b"warmup");
+
+            // On this current-thread runtime, enqueue before the peer resumes.
+            // Both a real encrypted inbound keepalive and outgoing data are
+            // then ready; a receive-first driver exhausts this finite flood.
+            flood.remaining.store(1024, Ordering::Relaxed);
+            flood.armed.notify_one();
+            udp.send(send(b"fair")).await.unwrap();
+            let echoed = tokio::time::timeout(Duration::from_secs(2), udp.receive())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(echoed.payload.as_ref(), b"fair");
+            let progressed_while_ready = flood.sent_while_ready.load(Ordering::Relaxed);
+
+            flood.remaining.store(1024, Ordering::Relaxed);
+            tokio::time::timeout(Duration::from_secs(1), outbound.shutdown())
+                .await
+                .unwrap();
+            assert_eq!(closes.load(Ordering::Relaxed), 1);
+            assert_eq!(flood.remaining.load(Ordering::Relaxed), 1024);
+            drop(udp);
+            assert!(probe.snapshot().is_idle());
+            assert!(
+                progressed_while_ready,
+                "queued outbound data waited until every ready inbound keepalive was consumed"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -535,7 +609,7 @@ async fn wireguard_peers_longest_prefix_reserved_and_remote_dns_have_owned_io() 
         let carrier = Arc::new(Peer {
             multi: true, reserved: true, records: records.clone(),
             dns_queries: queries.clone(), silent: false, silent_first: false,
-            sends: Arc::default(), closes: closes.clone(),
+            sends: Arc::default(), closes: closes.clone(), flood: Arc::default(),
         });
         let outbound = WireGuardOutbound::new_with_path(&config, UpstreamPath::Proxy(carrier)).unwrap();
         let calls = Arc::<AtomicUsize>::default();
@@ -591,6 +665,7 @@ async fn wireguard_endpoint_refresh_keeps_the_stack_and_releases_old_peer_io() {
                 silent_first: false,
                 sends: Arc::default(),
                 closes: closes.clone(),
+                flood: Arc::default(),
             });
             let outbound =
                 WireGuardOutbound::new_with_path(&config, UpstreamPath::Proxy(carrier)).unwrap();
@@ -671,6 +746,7 @@ async fn wireguard_failed_peer_keeps_other_peer_and_shared_stack_live() {
                 silent_first: true,
                 sends: Arc::default(),
                 closes: closes.clone(),
+                flood: Arc::default(),
             });
             let outbound =
                 WireGuardOutbound::new_with_path(&config, UpstreamPath::Proxy(carrier)).unwrap();

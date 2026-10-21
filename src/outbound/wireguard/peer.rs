@@ -211,6 +211,12 @@ async fn run_peer(
     scratch: &mut [u8],
     network: &mut [u8],
 ) -> Result<(), DispatchError> {
+    enum Event {
+        Datagram(Result<Datagram, DispatchError>),
+        Packet(Option<Packet>),
+        Command(Option<Refresh>),
+        Timer,
+    }
     let mut timer = tokio::time::interval(Duration::from_millis(250));
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut established = false;
@@ -221,45 +227,112 @@ async fn run_peer(
         } else {
             handshake_deadline
         };
-        tokio::select! {biased;
+        // Cancellation and the original handshake deadline stay ahead of all
+        // work. Ready network input must not starve output, refresh or timers.
+        let event = tokio::select! {biased;
             ()=driver.cancel.cancelled()=>return Err(DispatchError::ConnectionRefused),
             ()=tokio::time::sleep_until(handshake_deadline),if !established=>return Err(DispatchError::TimedOut),
-            datagram=transport.receive()=>{
-                let datagram=datagram?;let len=datagram.payload.len();
-                if datagram.remote!=Destination::Ip(endpoint)||!(4..=network.len()).contains(&len){continue;}
-                network[..len].copy_from_slice(&datagram.payload);network[1..4].fill(0);
-                let result=tunn.decapsulate(Some(endpoint.ip()),&network[..len],scratch);
-                let authenticated=matches!(network[0],1|2)&&matches!(result,TunnResult::WriteToNetwork(_))&&tunn.time_since_last_handshake().is_some();
-                driver.handle(result,endpoint,transport.as_mut(),deadline).await?;
-                loop{let result=tunn.decapsulate(None,&[],scratch);if matches!(result,TunnResult::Done){break;}driver.handle(result,endpoint,transport.as_mut(),deadline).await?;}
-                if !established&&authenticated{established=true;driver.ready.send_replace(Ready::Established);tracing::debug!("WireGuard handshake ready");}
-            },
-            packet=packets.recv(),if established=>{
-                let packet=packet.ok_or(DispatchError::ConnectionRefused)?;
-                driver.handle(tunn.encapsulate(packet.data(),scratch),endpoint,transport.as_mut(),deadline).await?;
-            },
-            command=commands.recv(),if established=>{
-                let Some(command)=command else {return Err(DispatchError::ConnectionRefused);};
-                let refresh=async{
-                    let(next,path)=driver.endpoint(&command.context,true).await?;
-                    if next==endpoint{return Ok(None);}
-                    Ok(Some((next,driver.transport(next,&path,&command.context).await?)))
+            event=async {
+                tokio::select! {
+                    datagram=transport.receive()=>Event::Datagram(datagram),
+                    packet=packets.recv(),if established=>Event::Packet(packet),
+                    command=commands.recv(),if established=>Event::Command(command),
+                    _=timer.tick()=>Event::Timer,
+                }
+            }=>event,
+        };
+        match event {
+            Event::Datagram(datagram) => {
+                let datagram = datagram?;
+                let len = datagram.payload.len();
+                if datagram.remote != Destination::Ip(endpoint)
+                    || !(4..=network.len()).contains(&len)
+                {
+                    continue;
+                }
+                network[..len].copy_from_slice(&datagram.payload);
+                network[1..4].fill(0);
+                let result = tunn.decapsulate(Some(endpoint.ip()), &network[..len], scratch);
+                let authenticated = matches!(network[0], 1 | 2)
+                    && matches!(result, TunnResult::WriteToNetwork(_))
+                    && tunn.time_since_last_handshake().is_some();
+                driver
+                    .handle(result, endpoint, transport.as_mut(), deadline)
+                    .await?;
+                loop {
+                    let result = tunn.decapsulate(None, &[], scratch);
+                    if matches!(result, TunnResult::Done) {
+                        break;
+                    }
+                    driver
+                        .handle(result, endpoint, transport.as_mut(), deadline)
+                        .await?;
+                }
+                if !established && authenticated {
+                    established = true;
+                    driver.ready.send_replace(Ready::Established);
+                    tracing::debug!("WireGuard handshake ready");
+                }
+            }
+            Event::Packet(packet) => {
+                let packet = packet.ok_or(DispatchError::ConnectionRefused)?;
+                driver
+                    .handle(
+                        tunn.encapsulate(packet.data(), scratch),
+                        endpoint,
+                        transport.as_mut(),
+                        deadline,
+                    )
+                    .await?;
+            }
+            Event::Command(command) => {
+                let Some(command) = command else {
+                    return Err(DispatchError::ConnectionRefused);
                 };
-                let update=tokio::select!{biased;()=driver.cancel.cancelled()=>return Err(DispatchError::ConnectionRefused),result=command.context.run("WireGuard refresh",refresh)=>result};
-                if let Ok(next)=update{
-                    *driver.updated.lock().unwrap()=Instant::now();
-                    if let Some((next,new))=next{
-                        let mut old=std::mem::replace(transport,new);endpoint=next;
-                        established=false;handshake_deadline=command.context.deadline();driver.ready.send_replace(Ready::Waiting);
-                        let _=tokio::time::timeout(Duration::from_secs(1),old.close()).await;
-                        driver.handle(tunn.format_handshake_initiation(scratch,true),endpoint,transport.as_mut(),handshake_deadline).await?;
+                let refresh = async {
+                    let (next, path) = driver.endpoint(&command.context, true).await?;
+                    if next == endpoint {
+                        return Ok(None);
+                    }
+                    Ok(Some((
+                        next,
+                        driver.transport(next, &path, &command.context).await?,
+                    )))
+                };
+                let update = tokio::select! {biased;()=driver.cancel.cancelled()=>return Err(DispatchError::ConnectionRefused),result=command.context.run("WireGuard refresh",refresh)=>result};
+                if let Ok(next) = update {
+                    *driver.updated.lock().unwrap() = Instant::now();
+                    if let Some((next, new)) = next {
+                        let mut old = std::mem::replace(transport, new);
+                        endpoint = next;
+                        established = false;
+                        handshake_deadline = command.context.deadline();
+                        driver.ready.send_replace(Ready::Waiting);
+                        let _ = tokio::time::timeout(Duration::from_secs(1), old.close()).await;
+                        driver
+                            .handle(
+                                tunn.format_handshake_initiation(scratch, true),
+                                endpoint,
+                                transport.as_mut(),
+                                handshake_deadline,
+                            )
+                            .await?;
                     }
                 }
                 // DNS/setup failure retains the old endpoint and is retried by
                 // a later business call, as in reference updateServerAddr.
-                let _=command.reply.send(());
-            },
-            _=timer.tick()=>{driver.handle(tunn.update_timers(scratch),endpoint,transport.as_mut(),deadline).await?;},
+                let _ = command.reply.send(());
+            }
+            Event::Timer => {
+                driver
+                    .handle(
+                        tunn.update_timers(scratch),
+                        endpoint,
+                        transport.as_mut(),
+                        deadline,
+                    )
+                    .await?;
+            }
         }
     }
 }
