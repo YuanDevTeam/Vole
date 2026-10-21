@@ -107,7 +107,9 @@ mitm:
 
 域名项只有 pattern 和默认 true 的 enabled。支持精确名称及 `*.suffix` 子域匹配，后者不包含域本身；启用排除项优先，关闭项仍校验。开启要求有效允许域名、端口及匹配的有效 CA／私钥。关闭不构造 CA；宿主提供独立私密输入，规则、payload 和普通快照不承载私钥。
 
-只终止允许的 SNI／端口；无 SNI、ECH（含 GREASE）、未授权名称和 UDP／QUIC 保持透明。每个原始 HTTP authority 独立授权，同一 H2 连接不扩大权限。最终上游按实际目标验证证书，使用受保护出口；不通过关闭验证处理 pinning 或客户端证书要求。
+MITM 支持 HTTP/1.1 与 HTTP/2。HTTP/3 MITM 暂不支持；UDP／QUIC（含 H3）按原字节透明转发，不进入 URL/header/body rewrite，也不通过阻断 QUIC 强制客户端回落。
+
+只终止允许的 SNI／端口；无 SNI、ECH（含 GREASE）和未授权名称保持透明。每个原始 HTTP authority 独立授权，同一 H2 连接不扩大权限。最终上游按实际目标验证证书，使用受保护出口；不通过关闭验证处理 pinning 或客户端证书要求。
 
 H1 上游协商 HTTP/1.1，H2 下游对接实际协商的 H2 或 H1。普通 H2 CONNECT 返回 405；WebSocket 使用 H1 Upgrade。叶证书最多 32 项、材料预算 256 KiB、空闲 10 分钟，有效期不超过 24 小时或 CA。
 
