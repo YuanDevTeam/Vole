@@ -69,6 +69,7 @@ pub(crate) struct Options {
     pub datagrams: bool,
     pub headers: u64,
     pub congestion: quiche::CongestionControlAlgorithm,
+    pub send_capacity_factor: f64,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -80,6 +81,7 @@ impl Default for Options {
             datagrams: false,
             headers: CHUNK as u64,
             congestion: quiche::CongestionControlAlgorithm::CUBIC,
+            send_capacity_factor: 1.0,
         }
     }
 }
@@ -218,6 +220,7 @@ impl Driver {
             config.set_max_connection_window(options.connection_window);
             config.set_max_stream_window(options.stream_window);
             config.set_cc_algorithm(options.congestion);
+            config.set_send_capacity_factor(options.send_capacity_factor);
             config.enable_dgram(options.datagrams, DATAGRAM_QUEUE, DATAGRAM_QUEUE);
             let mut cid = [0_u8; 20];
             boring::rand::rand_bytes(&mut cid).map_err(failure)?;

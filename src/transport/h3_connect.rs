@@ -588,6 +588,11 @@ async fn drive<F, Fut>(
             keepalive: (!flavor.deferred()).then_some(Duration::from_secs(30)),
             datagrams: flavor.ip(),
             congestion: congestion.unwrap_or(quiche::CongestionControlAlgorithm::CUBIC),
+            send_capacity_factor: if flavor == Flavor::TrustTunnel {
+                0.5
+            } else {
+                1.0
+            },
             ..Default::default()
         };
         match quiche_h3::Driver::new(raw, options).await {

@@ -184,6 +184,9 @@ XHTTP 和 DoH/H3 通过 `quinn-h3-transport` 使用官方 h3/h3-quinn，共享�
 每个 quiche H3 stream 的已读取 body 最多保留 64 KiB，每次业务写入最多 16 KiB；
 只有本地主动请求创建业务状态，未知 DATAGRAM flow 丢弃，已注册 flow 的交付队列最多 64 项。
 这些是局部缓存界限，不宣称 QUIC 库内部总内存固定，也不限制活动业务流总数。
+TrustTunnel H3 使用 quiche 的本地发送容量比例 0.5，按当前可用拥塞窗口与对端信用
+折算应用写入额度，不足时沿原异步背压等待；不改变拥塞控制算法、接收窗口或协议帧，也不是固定字节或 RSS 上限。
+MASQUE 与其余 quiche H3 默认使用原生比例 1.0。
 
 QUIC双向可用payload至少1,200字节；endpoint必须显式把QUIC MTU限制在有效预算内。IPv4/IPv6路径MTU分别先扣除28/48字节IP+UDP头，边界和单字节不足均有定向测试。
 
