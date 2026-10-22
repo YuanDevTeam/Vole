@@ -322,7 +322,8 @@ Expire 为 Unix 秒。未知时省略该对象，缺失子项为 0；不以本�
 
 `GET /configs` 返回归一化后的运行设置：mixed 入口、mode、log-level、IPv6、sniffing、
 连接选项、profile 和 TUN 字段。它使用字段白名单，不提供完整 YAML、节点凭据、订阅位置、
-认证头、Controller secret 或认证用户列表；不支持 PUT/PATCH 配置修改。
+认证头、Controller secret 或认证用户列表。在线修改使用下文的
+[`PATCH /configs`、`PUT /configs`](#patch-configsput-configs)，受候选准入与需重连条件限制。
 
 `GET /dns/query?name=example.com&type=A` 使用当前上游 resolver 与相同缓存查询，
 接受 Mihomo Controller DNS 类型表的精确名称，包括 A、AAAA、TXT、MX、SRV、HTTPS、SVCB 和 DNSSEC 类型；
@@ -348,19 +349,20 @@ JSON 转义和名称展开后的正文最多 256 KiB。DNS 关闭、查询失败
 | 状态 | 含义 |
 | --- | --- |
 | `200 OK` | 查询成功，返回 `application/json` |
-| `204 No Content` | 选择、规则开关、刷新或清理成功，正文为空 |
-| `400 Bad Request` | 路径、JSON、长度格式或成员无效 |
+| `204 No Content` | 选择、规则开关、配置应用、刷新或清理成功，正文为空 |
+| `400 Bad Request` | 路径、JSON、长度格式、成员或候选配置无效 |
 | `401 Unauthorized` | Bearer 鉴权失败 |
-| `404 Not Found` | 路由、组或当前 session 中的 TUN 流量资源不存在 |
+| `404 Not Found` | 路由、组、当前 session 的 TUN 流量或配置应用资源不存在 |
 | `405 Method Not Allowed` | 路由存在但方法不允许 |
 | `408 Request Timeout` | header 或 body 读取超时 |
+| `409 Conflict` | 在线配置修改涉及需重连的启动资源 |
 | `411 Length Required` | 管理写请求缺少 `Content-Length` |
 | `413 Payload Too Large` | 管理写请求正文超过对应路径预算 |
 | `415 Unsupported Media Type` | 管理写请求不是严格 `application/json` |
-| `503 Service Unavailable` | 探测、资源更新失败或订阅准入已满 |
-| `504 Gateway Timeout` | 主动探测超时 |
+| `503 Service Unavailable` | 探测、资源更新或候选准备失败，订阅准入已满，配置应用忙碌或已停止 |
+| `504 Gateway Timeout` | 主动探测或配置应用等待超时 |
 
-当前不提供配置修改或完整 Dashboard response。公开范围为本文列出的版本、连接、规则、配置、DNS、主动探测、内存、provider、代理组查询/选择/固定清除，以及四个 WebSocket 路径；其他路径和方法不属于公共协议。
+公开范围为本文列出的版本、连接、规则、配置查询与在线应用、DNS、主动探测、内存、provider、代理组查询/选择/固定清除，以及四个 WebSocket 路径。它不承诺完整 Dashboard response；其他路径和方法不属于公共协议。
 
 Windows WinRT VPN 的完整运行时和 Controller 位于独立 Session Host；桌面 Wintun 的
 Controller 位于普通业务运行时。宿主通过配置的 HTTP 地址直接访问实际 Running Session；
