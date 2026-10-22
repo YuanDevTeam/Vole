@@ -1139,6 +1139,10 @@ mod tests {
     }
     #[async_trait]
     impl DatagramTransport for Memory {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         fn payload_budget(&self, _: &Destination) -> DatagramBudget {
             self.budget
         }

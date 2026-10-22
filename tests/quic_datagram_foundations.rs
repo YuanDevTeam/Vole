@@ -103,6 +103,10 @@ struct PendingSend {
 }
 #[async_trait::async_trait]
 impl vole::dispatch::DatagramTransport for PendingSend {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(
         &mut self,
         _: vole::session::Datagram,

@@ -582,6 +582,194 @@ pub(super) mod tests {
         assert!(engine.job.try_lock().unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn masque_ip_memory_shared_udp_leases_cancel_and_close_independently() {
+        use crate::{
+            dispatch::{DatagramBudget, DatagramTransport},
+            resources::observation::{ResourceKind, ResourceProbe},
+            session::Datagram,
+        };
+        use vole_netstack::{UdpDatagram, encode_udp_packet_into, parse_udp_packet_view};
+
+        fn reply(engine: &Engine, packet: Packet, remote: SocketAddr, payload: &[u8]) -> u16 {
+            let sent = parse_udp_packet_view(packet.data()).unwrap();
+            assert_eq!(sent.destination, remote);
+            assert_eq!(sent.payload, payload);
+            assert_eq!(sent.source.ip(), engine.local(remote.ip()).unwrap());
+            let port = sent.source.port();
+            let mut raw = Vec::new();
+            encode_udp_packet_into(
+                &UdpDatagram::new(remote, sent.source, Bytes::copy_from_slice(payload)),
+                engine.mtu,
+                &mut raw,
+            )
+            .unwrap();
+            assert!(packet::incoming(&raw, &engine.client));
+            let response = parse_udp_packet_view(&raw).unwrap();
+            engine
+                .registry
+                .deliver(response.source, response.destination, response.payload);
+            port
+        }
+
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let client = ClientConfig {
+                    prefixes: [
+                        Some(ClientPrefix {
+                            address: "192.0.2.2".parse().unwrap(),
+                            prefix_len: 32,
+                        }),
+                        Some(ClientPrefix {
+                            address: "fd00::2".parse().unwrap(),
+                            prefix_len: 128,
+                        }),
+                    ],
+                    receive_packet_limit: MAX_RECEIVE_PACKET_SIZE,
+                    path_mtu_discovery: true,
+                };
+                let parts = NetStack::start_client(NetStackConfig::default(), client).unwrap();
+                // One packet slot makes cancellation at the actual raw-IP handoff observable.
+                let (tx, mut output) = mpsc::channel(1);
+                let (_, ready) = watch::channel(Ready::Open);
+                let engine = Arc::new(Engine {
+                    config: test_config(),
+                    security: SecurityContext::default(),
+                    resolution: ResolutionContext::default(),
+                    remote: OnceLock::new(),
+                    client,
+                    mtu: 1500,
+                    cancel: CancellationToken::new(),
+                    tcp: parts.tcp_connector,
+                    tx,
+                    registry: Arc::new(Registry::default()),
+                    ready,
+                    control: parts.control,
+                    job: AsyncMutex::new(None),
+                    stop: AsyncMutex::new(()),
+                });
+                let open = || {
+                    super::super::datagram::Datagrams::new(
+                        engine.clone(),
+                        DatagramBudget::new(1200, 1200),
+                        ResolutionContext::default(),
+                    )
+                    .unwrap()
+                };
+                let mut shared = open();
+                let mut sibling = open();
+                assert!(shared.supports_shared_destinations());
+                assert_eq!(probe.snapshot().current(ResourceKind::Association), 2);
+                let mut waiting = Box::pin(shared.receive());
+                assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+                drop(waiting);
+                let targets: [SocketAddr; 3] = [
+                    "198.51.100.1:53".parse().unwrap(),
+                    "198.51.100.2:443".parse().unwrap(),
+                    "[2001:db8::1]:443".parse().unwrap(),
+                ];
+                let datagram = |remote, payload| Datagram {
+                    remote: Destination::Ip(remote),
+                    payload: Bytes::from_static(payload),
+                    sniffed_domain: None,
+                };
+                shared.send(datagram(targets[0], b"first")).await.unwrap();
+                let mut cancelled = Box::pin(shared.send(datagram(targets[1], b"cancelled")));
+                assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+                drop(cancelled);
+                let port = reply(&engine, output.recv().await.unwrap(), targets[0], b"first");
+                assert!(
+                    output.try_recv().is_err(),
+                    "cancelled handoff submitted an extra packet"
+                );
+                assert_eq!(shared.receive().await.unwrap().payload.as_ref(), b"first");
+                for target in targets {
+                    shared.send(datagram(target, b"shared")).await.unwrap();
+                    assert_eq!(
+                        reply(&engine, output.recv().await.unwrap(), target, b"shared"),
+                        port
+                    );
+                    let response = shared.receive().await.unwrap();
+                    assert_eq!(response.remote, Destination::Ip(target));
+                    assert_eq!(response.payload.as_ref(), b"shared");
+                }
+                sibling
+                    .send(datagram(targets[0], b"sibling"))
+                    .await
+                    .unwrap();
+                let other_port = reply(
+                    &engine,
+                    output.recv().await.unwrap(),
+                    targets[0],
+                    b"sibling",
+                );
+                assert_ne!(port, other_port);
+                assert_eq!(
+                    sibling.receive().await.unwrap().payload.as_ref(),
+                    b"sibling"
+                );
+                shared.close().await.unwrap();
+                assert_eq!(probe.snapshot().current(ResourceKind::Association), 1);
+                assert!(shared.send(datagram(targets[0], b"closed")).await.is_err());
+                assert!(shared.receive().await.is_err());
+                engine.registry.deliver(
+                    targets[0],
+                    SocketAddr::new(client.prefixes[0].unwrap().address, port),
+                    b"late",
+                );
+                let mut rebuilt = open();
+                let mut waiting = Box::pin(rebuilt.receive());
+                assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+                drop(waiting);
+                rebuilt
+                    .send(datagram(targets[0], b"rebuilt"))
+                    .await
+                    .unwrap();
+                let rebuilt_port = reply(
+                    &engine,
+                    output.recv().await.unwrap(),
+                    targets[0],
+                    b"rebuilt",
+                );
+                assert_ne!(port, rebuilt_port);
+                assert_eq!(
+                    rebuilt.receive().await.unwrap().payload.as_ref(),
+                    b"rebuilt"
+                );
+                sibling
+                    .send(datagram(targets[0], b"still-live"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    reply(
+                        &engine,
+                        output.recv().await.unwrap(),
+                        targets[0],
+                        b"still-live"
+                    ),
+                    other_port
+                );
+                assert_eq!(
+                    sibling.receive().await.unwrap().payload.as_ref(),
+                    b"still-live"
+                );
+                engine.stop().await;
+                assert!(sibling.receive().await.is_err());
+                assert!(
+                    rebuilt
+                        .send(datagram(targets[0], b"stopped"))
+                        .await
+                        .is_err()
+                );
+                sibling.close().await.unwrap();
+                rebuilt.close().await.unwrap();
+                drop((shared, sibling, rebuilt, output, engine));
+                assert!(probe.snapshot().is_idle());
+            })
+            .await;
+    }
+
     #[test]
     fn masque_h2_authority_and_headers_preserve_mode_contract() {
         for (uri, authority) in [

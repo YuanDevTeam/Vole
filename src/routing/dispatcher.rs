@@ -1937,6 +1937,11 @@ impl RoutedDatagramTransport {
 
 #[async_trait]
 impl DatagramTransport for RoutedDatagramTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        // Owns routing and address restoration; it is not a transparent codec.
+        false
+    }
+
     async fn send(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
         if self.tracked() {
             return crate::dns::trace::capture(self.send_managed(datagram))
@@ -4368,6 +4373,10 @@ sub-rules:
 
         #[async_trait]
         impl DatagramTransport for FailingReceiveDatagrams {
+            fn supports_shared_destinations(&self) -> bool {
+                false
+            }
+
             async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
                 self.responses.push_back(datagram);
                 Ok(())
@@ -5250,7 +5259,10 @@ sub-rules:
                 None
             }
         }
-        let proxy = Arc::new(RecordingDispatcher::default());
+        let proxy = Arc::new(RecordingDispatcher {
+            shareable: true,
+            ..Default::default()
+        });
         let direct = Arc::new(RecordingDispatcher::default());
         let router = dispatcher(
             proxy.clone(),
@@ -5258,6 +5270,18 @@ sub-rules:
             Some(Arc::new(FakeDns)),
             vec![rule(RuleKind::Match, proxy_action(0))],
         );
+        let config = crate::config::Config::parse_yaml(
+            br#"proxies: [{name: edge, type: socks5, server: 192.0.2.1, port: 1080, udp: true}]
+rules: ["MATCH,edge"]"#,
+        )
+        .unwrap();
+        let registry = Arc::new(crate::connections::Registry::default());
+        let diagnostics = Arc::new(crate::routing::diagnostics::Diagnostics::new(
+            &config,
+            &router.rules,
+            registry.clone(),
+        ));
+        let router = router.with_diagnostics(diagnostics);
         let first: SocketAddr = "198.18.0.4:443".parse().unwrap();
         let second: SocketAddr = "198.18.0.5:443".parse().unwrap();
         let _stream = router
@@ -5271,6 +5295,7 @@ sub-rules:
                 port: 443
             }
         );
+        drop(_stream);
         let mut udp = router
             .open_datagram(DatagramSession::new(
                 InboundKind::Tun,
@@ -5296,13 +5321,29 @@ sub-rules:
         assert!(received.contains(&(Destination::Ip(second), Bytes::from("two"))));
         assert_eq!(proxy.udp_opens.load(Ordering::Relaxed), 2);
         assert!(proxy.datagrams.lock().unwrap().iter().all(|packet| packet.remote == Destination::Ip("203.0.113.10:443".parse().unwrap())));
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap()["connections"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         udp.close().await.unwrap();
+        assert!(
+            serde_json::to_value(registry.snapshot()).unwrap()["connections"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
     #[tokio::test]
     async fn quic_override_resolves_new_domain_and_restores_udp_response_target() {
         let mut config = crate::config::SnifferConfig::disabled();
         config.enable = true;
-        let proxy = Arc::new(RecordingDispatcher::default());
+        let proxy = Arc::new(RecordingDispatcher {
+            shareable: true,
+            ..Default::default()
+        });
         let direct = Arc::new(RecordingDispatcher::default());
         let dns = Arc::new(MockDns::new(vec!["203.0.113.8".parse().unwrap()]));
         let router = dispatcher(
@@ -5312,6 +5353,18 @@ sub-rules:
             vec![rule(RuleKind::Match, proxy_action(0))],
         )
         .with_sniffer(&config);
+        let config = crate::config::Config::parse_yaml(
+            br#"proxies: [{name: edge, type: socks5, server: 192.0.2.1, port: 1080, udp: true}]
+rules: ["MATCH,edge"]"#,
+        )
+        .unwrap();
+        let registry = Arc::new(crate::connections::Registry::default());
+        let diagnostics = Arc::new(crate::routing::diagnostics::Diagnostics::new(
+            &config,
+            &router.rules,
+            registry.clone(),
+        ));
+        let router = router.with_diagnostics(diagnostics);
         let original = "198.51.100.4:443".parse().unwrap();
         let mut transport = router
             .open_datagram(association(InboundKind::Tun))
@@ -5328,8 +5381,37 @@ sub-rules:
             transport.receive().await.unwrap().remote,
             Destination::Ip(original)
         );
-        assert_eq!(*dns.resolved_hosts.lock().unwrap(), ["sniffed.example"]);
+        let other = "198.51.100.5:443".parse().unwrap();
+        let mut packet = datagram(other, b"other");
+        packet.sniffed_domain = Some("alias.example".into());
+        transport.send(packet).await.unwrap();
+        assert_eq!(
+            transport.receive().await.unwrap().remote,
+            Destination::Ip(other)
+        );
+        assert_eq!(
+            proxy.udp_opens.load(Ordering::Relaxed),
+            2,
+            "two original destinations mapping to one real endpoint need separate wires"
+        );
+        assert_eq!(
+            *dns.resolved_hosts.lock().unwrap(),
+            ["sniffed.example", "alias.example"]
+        );
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap()["connections"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         transport.close().await.unwrap();
+        assert!(
+            serde_json::to_value(registry.snapshot()).unwrap()["connections"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 

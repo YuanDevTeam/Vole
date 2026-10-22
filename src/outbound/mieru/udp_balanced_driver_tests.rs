@@ -71,6 +71,10 @@ mod balanced_driver_tests {
     }
     #[async_trait]
     impl DatagramTransport for Packets {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
             let frame = self
                 .decoder

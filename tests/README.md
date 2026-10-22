@@ -123,6 +123,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | TLS与ECH | `security::context::tests::`、`security::ech::tests::`、`dns::runtime::ech_tests::` | 证书与身份、内存TLS、动态ECH来源 |
 | TrustTunnel／Mieru／MASQUE | `trusttunnel`、`mieru`、`masque_` | 真实编解码、信用/背压、复用、单流关闭及同步Stop |
 | 有界队列与内存策略 | `routing::datagram_ready::tests::`、`managed_udp_connections_`、`allocator_relief`、`platform::process_memory::tests::` | 就绪轮询、排空、取消和单次回收 |
+| UDP 共享与隔离 | `managed_udp_connections_`、`fake_ip_routing_preserves_tcp_names_and_distinct_udp_reply_addresses`、`quic_override_resolves_new_domain_and_restores_udp_response_target` | 同源多目标、固定目标、逐目标关闭与旧回复隔离，支持共享的底层仍保留 Fake-IP/嗅探还原隔离 |
 | TUN 响应背压 | `tun_runtime::tests::backpressured_udp_response_handoff` | 满队列下每源至多暂持一包、双向推进及取消 |
 | UoT | `outbound::uot::tests::` | 半帧取消后继续、v2首部、原期限、单槽响应与Stop |
 | VMess 响应边界 | `outbound::vmess::header::delayed_response_memory_tests::`、`outbound::vmess::stream::tests::`、`--test vmess_lifecycle` | 官方延迟响应向量、提交前期限、响应认证、nonce 耗尽与关闭 |
@@ -150,6 +151,13 @@ SS2022 的严格官方 TCP codec 回归可单独选择 `official_tcp_codecs_all_
 `tcp_response_header_time_salt_auth_and_fragmentation_follow_official_codec`；不要在宿主整体运行
 `outbound::shadowsocks::tests::`，其中还包含监听器用例。
 Mieru回归保留TCP/UDP分池、慢读背压、单槽交接、终态传播、接收分配复用和未读响应下的Stop。
+新增多目标真实 codec 回归使用 `outbound::mieru::packet_routing_tests::`、
+`outbound::trusttunnel::packet::tests::`、`outbound::vmess::header::datagram_memory_tests::`、
+`wireguard_memory_shared_udp_targets_cancel_and_close_independently` 与
+`masque_ip_memory_shared_udp_leases_cancel_and_close_independently`。
+HY2 透明混淆/pacer 传递使用
+`salamander_memory_and_pacer_preserve_address_sharing_owned_send_and_close`。
+它们覆盖逐包地址、取消与独立关闭，不以能力布尔断言替代真实帧和所有权验证。
 GeoData、AGE、Provider和缓存测试使用合成输入、公开固定向量、内存流及临时文件。
 这些局部预算与行为检查不证明进程RSS、网络吞吐或真机内存达标。
 命名指纹准入使用 `config::fingerprint_tests::`；标准 H2 SETTINGS/ACK 与 ALPS 可选性使用

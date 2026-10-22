@@ -127,6 +127,11 @@ impl Drop for SendGuard<'_> {
 
 #[async_trait]
 impl DatagramTransport for PacketTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        // The _udp2 stream encodes and returns an address on every frame.
+        true
+    }
+
     fn payload_budget(&self, _: &Destination) -> DatagramBudget {
         self.budget
     }
@@ -415,19 +420,135 @@ mod tests {
     }
 
     async fn assert_client_packet<R: AsyncRead + Unpin>(reader: &mut R, payload: &[u8]) {
+        assert_client_packet_to(reader, "192.0.2.10:53".parse().unwrap(), payload).await;
+    }
+
+    async fn assert_client_packet_to<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        remote: SocketAddr,
+        payload: &[u8],
+    ) {
         let length = reader.read_u32().await.unwrap() as usize;
         assert_eq!(length, 37 + APP_NAME.len() + payload.len());
         let mut body = vec![0; length];
         reader.read_exact(&mut body).await.unwrap();
         assert_eq!(&body[..18], &[0; 18]);
-        assert_eq!(
-            &body[18..34],
-            &padded_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))
-        );
-        assert_eq!(&body[34..36], &53_u16.to_be_bytes());
+        assert_eq!(&body[18..34], &padded_ip(remote.ip()));
+        assert_eq!(&body[34..36], &remote.port().to_be_bytes());
         assert_eq!(body[36] as usize, APP_NAME.len());
         assert_eq!(&body[37..37 + APP_NAME.len()], APP_NAME);
         assert_eq!(&body[37 + APP_NAME.len()..], payload);
+    }
+
+    #[tokio::test]
+    async fn trusttunnel_udp_shared_stream_preserves_targets_and_independent_close() {
+        let probe = ResourceProbe::default();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            probe.scope(async {
+                let tasks = TaskTracker::new();
+                let context = EstablishContext::default();
+                let parent = CancellationToken::new();
+                let (first, mut peer) = tokio::io::duplex(4096);
+                let mut shared = PacketTransport::new(
+                    Box::new(first),
+                    &request(128),
+                    &context,
+                    parent.clone(),
+                    |future| Ok(tasks.spawn(crate::resources::observation::task(future))),
+                )
+                .unwrap();
+                let targets: [SocketAddr; 2] = [
+                    "198.51.100.1:53".parse().unwrap(),
+                    "[2001:db8::1]:5353".parse().unwrap(),
+                ];
+                let (resume, resumed) = oneshot::channel();
+                let remote = tokio::spawn(async move {
+                    for target in targets {
+                        assert_client_packet_to(&mut peer, target, b"request").await;
+                    }
+                    resumed.await.unwrap();
+                    // Responses need not arrive in send order.
+                    for target in targets.into_iter().rev() {
+                        peer.write_all(&server_packet(target, b"reply"))
+                            .await
+                            .unwrap();
+                    }
+                    let mut remaining = Vec::new();
+                    peer.read_to_end(&mut remaining).await.unwrap();
+                    assert!(remaining.is_empty());
+                });
+                assert!(shared.supports_shared_destinations());
+                for target in targets {
+                    shared
+                        .send(Datagram {
+                            remote: Destination::Ip(target),
+                            payload: Bytes::from_static(b"request"),
+                            sniffed_domain: None,
+                        })
+                        .await
+                        .unwrap();
+                }
+                // Dropping a pending read cannot lose either addressed response.
+                let mut waiting = Box::pin(shared.receive());
+                assert!(futures_util::poll!(&mut waiting).is_pending());
+                drop(waiting);
+                resume.send(()).unwrap();
+                for target in targets.into_iter().rev() {
+                    let response = shared.receive().await.unwrap();
+                    assert_eq!(response.remote, Destination::Ip(target));
+                    assert_eq!(response.payload, Bytes::from_static(b"reply"));
+                }
+                shared.close().await.unwrap();
+                assert!(
+                    shared
+                        .send(Datagram {
+                            remote: Destination::Ip(targets[0]),
+                            payload: Bytes::from_static(b"closed"),
+                            sniffed_domain: None,
+                        })
+                        .await
+                        .is_err()
+                );
+                drop(shared);
+                remote.await.unwrap();
+                assert!(!parent.is_cancelled());
+
+                // Closing one association must not revoke the node's parent or a
+                // new association, even when it uses exactly the same target.
+                let (second, mut peer) = tokio::io::duplex(4096);
+                let mut sibling = PacketTransport::new(
+                    Box::new(second),
+                    &request(128),
+                    &context,
+                    parent.clone(),
+                    |future| Ok(tasks.spawn(crate::resources::observation::task(future))),
+                )
+                .unwrap();
+                sibling
+                    .send(Datagram {
+                        remote: Destination::Ip(targets[0]),
+                        payload: Bytes::from_static(b"sibling"),
+                        sniffed_domain: None,
+                    })
+                    .await
+                    .unwrap();
+                assert_client_packet_to(&mut peer, targets[0], b"sibling").await;
+                peer.write_all(&server_packet(targets[0], b"live"))
+                    .await
+                    .unwrap();
+                let response = sibling.receive().await.unwrap();
+                assert_eq!(response.remote, Destination::Ip(targets[0]));
+                assert_eq!(response.payload, Bytes::from_static(b"live"));
+                sibling.close().await.unwrap();
+                drop((sibling, peer));
+                tasks.close();
+                tasks.wait().await;
+            }),
+        )
+        .await
+        .expect("TrustTunnel multi-target memory operation must finish");
+        assert!(probe.snapshot().is_idle());
     }
 
     #[tokio::test(start_paused = true)]

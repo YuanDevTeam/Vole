@@ -84,9 +84,9 @@ pub trait DatagramTransport: Send {
     /// Replies must retain their source destination, and cancelled sends must
     /// preserve framing for the next send/receive. Fixed-target codecs and
     /// ambiguous address restoration must retain independent transports.
-    fn supports_shared_destinations(&self) -> bool {
-        false
-    }
+    /// Every implementation must declare this capability explicitly; transparent
+    /// wrappers forward the underlying transport's decision.
+    fn supports_shared_destinations(&self) -> bool;
 
     /// Payload budget for packets sent to and received from this logical peer.
     /// Encapsulating transports subtract their headers from the upstream cap.
@@ -446,6 +446,10 @@ mod tests {
 
     #[async_trait]
     impl DatagramTransport for NullDatagrams {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
             Ok(())
         }
@@ -500,6 +504,10 @@ mod tests {
         struct InitialTransport(Arc<AtomicUsize>);
         #[async_trait]
         impl DatagramTransport for InitialTransport {
+            fn supports_shared_destinations(&self) -> bool {
+                false
+            }
+
             async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
                 panic!("observer must preserve first-flow metadata");
             }

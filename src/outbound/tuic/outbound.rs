@@ -484,6 +484,10 @@ mod p08_tests {
         struct Discard;
         #[async_trait]
         impl DatagramTransport for Discard {
+            fn supports_shared_destinations(&self) -> bool {
+                false
+            }
+
             async fn send(&mut self, _: crate::session::Datagram) -> Result<(), DispatchError> {
                 Ok(())
             }

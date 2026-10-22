@@ -738,6 +738,10 @@ async fn quic_prepared_datagrams_forward_flow_identity_only_on_the_marked_send()
 
     #[async_trait]
     impl DatagramTransport for RecordingFlowTransport {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
             self.sent.push((datagram, None));
             Ok(())
@@ -1729,6 +1733,10 @@ async fn assert_ready_udp_receive_bursts(sources: usize, consumer: UdpBurstConsu
     }
     #[async_trait]
     impl DatagramTransport for BurstDatagrams {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, _: Datagram) -> Result<(), DispatchError> {
             self.sent.fetch_add(1, Ordering::Relaxed);
             Ok(())
@@ -2161,6 +2169,10 @@ impl Dispatcher for RecordingUdpDispatcher {
 
 #[async_trait]
 impl DatagramTransport for RecordingUdpTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         self.datagrams.lock().unwrap().push(datagram);
         self.sent.notify_one();
@@ -2192,6 +2204,10 @@ impl Dispatcher for ReplayFairDispatcher {
 
 #[async_trait]
 impl DatagramTransport for ReplayFairDatagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
         let send_index = self.send_count.fetch_add(1, Ordering::Relaxed);
         if send_index == 0 {
@@ -2268,6 +2284,10 @@ impl DnsReplyDatagrams {
 
 #[async_trait]
 impl DatagramTransport for DnsReplyDatagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
         let query = classify_query(&datagram.payload)
             .map_err(|error| DispatchError::Other(error.to_string()))?;
@@ -2340,6 +2360,10 @@ struct ResponseFirstDatagrams {
 
 #[async_trait]
 impl DatagramTransport for ResponseFirstDatagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
         std::future::pending().await
     }
@@ -2354,6 +2378,10 @@ impl DatagramTransport for ResponseFirstDatagrams {
 
 #[async_trait]
 impl DatagramTransport for BlockingDatagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
         if let Some(send_count) = &self.send_count {
             send_count.fetch_add(1, Ordering::Relaxed);
@@ -2380,6 +2408,10 @@ impl EchoDatagrams {
 
 #[async_trait]
 impl DatagramTransport for EchoDatagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
         if datagram.payload.as_ref() == b"oversize-response" {
             datagram.payload = Bytes::from(vec![0_u8; TUN_MTU]);

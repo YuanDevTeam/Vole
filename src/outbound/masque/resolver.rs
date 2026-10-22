@@ -252,6 +252,9 @@ mod tests {
 
     #[async_trait]
     impl DatagramTransport for MemoryReply {
+        fn supports_shared_destinations(&self) -> bool {
+            true
+        }
         async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
             // RuntimeDns generates this bounded, uncompressed A question.
             let end = 12

@@ -63,6 +63,10 @@ struct Echo {
 
 #[async_trait]
 impl DatagramTransport for Echo {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         if self.block_send {
             self.blocked.fetch_add(1, Ordering::SeqCst);

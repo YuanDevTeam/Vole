@@ -6,10 +6,12 @@ use super::{
 use crate::{
     config::{Config, MieruHandshake},
     connections::Registry,
+    dialer::{ResolvedEndpoint, Resolver},
     dispatch::{
         BoxStream, DatagramBudget, DatagramTransport, DispatchError, Dispatcher,
         observe_sessions_with_stats,
     },
+    dns::resolution::ResolutionContext,
     outbound::{ConnectorDispatcher, OutboundConnector, UpstreamPath},
     resources::{RuntimeResourceStats, observation::ResourceProbe},
     routing::{
@@ -22,6 +24,7 @@ use bytes::Bytes;
 use futures_util::task::ArcWake;
 use std::{
     future::{Future, poll_fn},
+    io,
     net::SocketAddr,
     pin::Pin,
     sync::{
@@ -97,6 +100,10 @@ struct CountedTransport {
 // Spell out the async_trait ABI so creation is counted before the returned
 // receive future is first polled. Every operation delegates to the real IO.
 impl DatagramTransport for CountedTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        self.inner.supports_shared_destinations()
+    }
+
     fn supports_poll_receive(&self) -> bool {
         self.inner.supports_poll_receive()
     }
@@ -215,6 +222,40 @@ async fn echo(
     Ok(())
 }
 
+struct FixedResolver;
+
+#[async_trait]
+impl Resolver for FixedResolver {
+    async fn resolve(&self, host: &str, port: u16) -> io::Result<ResolvedEndpoint> {
+        Ok(ResolvedEndpoint {
+            logical_host: host.into(),
+            port,
+            addresses: vec![SocketAddr::from(([198, 51, 100, 1], port))],
+        })
+    }
+}
+
+async fn echo_domain(
+    transport: &mut dyn DatagramTransport,
+    remote: SocketAddr,
+    body: &'static [u8],
+) -> Result<(), String> {
+    bounded(transport.send(Datagram {
+        remote: Destination::Domain {
+            host: format!("target-{}.invalid", remote.port()),
+            port: remote.port(),
+        },
+        payload: Bytes::from_static(body),
+        sniffed_domain: None,
+    }))
+    .await?;
+    let response = bounded(transport.receive()).await?;
+    if response.remote != Destination::Ip(remote) || response.payload.as_ref() != body {
+        return Err("Mieru domain datagram payload or source differs".into());
+    }
+    Ok(())
+}
+
 struct Evidence {
     prime_pending: bool,
     before_hot: Vec<CountSnapshot>,
@@ -225,7 +266,8 @@ struct Evidence {
 }
 
 #[tokio::test]
-async fn mieru_udp_routing_poll_visits_only_ready_targets_and_preserves_cancelled_siblings() {
+async fn mieru_udp_dedicated_domain_routing_polls_only_ready_targets_and_preserves_cancelled_siblings()
+ {
     let probe = ResourceProbe::default();
     let (business, closed, joined, peer_joined, final_counts, remaining, udp_current) = probe.scope(async {
         let parsed = Config::parse_yaml(br#"
@@ -238,7 +280,9 @@ rules: ["MATCH,edge"]
         ).unwrap());
         let counts = Arc::new(Mutex::new(Vec::new()));
         let counted: Arc<dyn Dispatcher> = Arc::new(CountedDispatcher {
-            inner: Arc::new(ConnectorDispatcher::new(node.clone())),
+            inner: Arc::new(ConnectorDispatcher::new(node.clone()).with_resolution(
+                ResolutionContext::measurement(Arc::new(FixedResolver), false),
+            )),
             counts: counts.clone(),
         });
         let stats = RuntimeResourceStats::new("mieru_packet_router");
@@ -251,27 +295,38 @@ rules: ["MATCH,edge"]
         let router = RoutingDispatcher::new(
             ProxyDispatchers::new(vec![leaf.clone()]).unwrap(), direct, None, rules, Arc::new(EmptyGeoMatcher),
         ).with_diagnostics(diagnostics);
-        let mut association = None;
+        let mut associations = Vec::new();
         let business = tokio::time::timeout(Duration::from_secs(10), async {
-            association = Some(bounded(router.open_datagram(DatagramSession::for_tun(
-                session().source, 1500,
-            ))).await?);
-            let transport = association.as_mut().unwrap();
             let targets: [SocketAddr; 3] = [
                 "198.51.100.1:11000".parse().unwrap(),
                 "198.51.100.1:11001".parse().unwrap(),
                 "198.51.100.1:11002".parse().unwrap(),
             ];
-            for remote in targets {
-                echo(transport.as_mut(), remote, b"prime").await?;
+            let mut prime_pending = true;
+            // Each source owns its routing receiver. Domain requests retain
+            // dedicated transports because the IP response cannot identify a
+            // domain alias. This protects Dedicated readiness, not shared IO.
+            for source_index in 0..3 {
+                let mut source = session().source;
+                source.set_port(source.port() + source_index);
+                let mut transport = bounded(router.open_datagram(DatagramSession::for_tun(
+                    source, 1500,
+                ))).await?;
+                for mut remote in targets {
+                    remote.set_port(remote.port() + source_index * 10);
+                    echo_domain(transport.as_mut(), remote, b"prime").await?;
+                }
+                // Consume requeues and prime all three actual empty receivers.
+                let pending = {
+                    let mut receive = transport.receive();
+                    futures_util::poll!(receive.as_mut()).is_pending()
+                };
+                prime_pending &= pending;
+                associations.push(transport);
             }
-            // Consume each ready requeue and register the actual empty receivers.
-            let prime_pending = {
-                let mut receive = transport.receive();
-                futures_util::poll!(receive.as_mut()).is_pending()
-            };
+            let transport = &mut associations[0];
             let before_hot = snapshots(&counts);
-            echo(transport.as_mut(), targets[0], b"hot").await?;
+            echo_domain(transport.as_mut(), targets[0], b"hot").await?;
             let after_hot = snapshots(&counts);
 
             let snapshot = serde_json::to_value(registry.snapshot()).map_err(|error| error.to_string())?;
@@ -300,21 +355,20 @@ rules: ["MATCH,edge"]
             drop(waiting);
             let snapshot = serde_json::to_value(registry.snapshot()).map_err(|error| error.to_string())?;
             let remaining_after_cancel = snapshot["connections"].as_array().ok_or("connections missing")?.len();
-            echo(transport.as_mut(), targets[0], b"sibling-after-cancel").await?;
+            echo_domain(transport.as_mut(), targets[0], b"sibling-after-cancel").await?;
             Ok::<_, String>(Evidence {
                 prime_pending, before_hot, after_hot, controller_pending,
                 controller_wakes, remaining_after_cancel,
             })
         }).await.map_err(|_| "routed memory scenario timed out".to_owned()).and_then(|result| result);
 
-        // Complete every owner before asserting counters, including the old RED.
-        let closed = if let Some(mut transport) = association.take() {
-            let result = bounded(transport.close()).await;
-            drop(transport);
-            result
-        } else {
-            Err("association was not opened".into())
-        };
+        // Complete all three source owners before asserting readiness counters.
+        let mut closed = Ok(());
+        for mut transport in associations {
+            if let Err(error) = bounded(transport.close()).await {
+                closed = Err(error);
+            }
+        }
         let joined = tokio::time::timeout(STEP, node.shutdown()).await.is_ok();
         let peer_joined = tokio::time::timeout(STEP, peer.stop()).await.is_ok();
         drop((router, leaf, node, peer));
@@ -333,10 +387,10 @@ rules: ["MATCH,edge"]
         evidence.controller_wakes > 0,
         "Controller close did not wake the pending router"
     );
-    assert_eq!(evidence.remaining_after_cancel, 2);
-    assert_eq!(evidence.before_hot.len(), 3);
-    assert_eq!(evidence.after_hot.len(), 3);
-    assert_eq!(final_counts.len(), 3);
+    assert_eq!(evidence.remaining_after_cancel, 8);
+    assert_eq!(evidence.before_hot.len(), 9);
+    assert_eq!(evidence.after_hot.len(), 9);
+    assert_eq!(final_counts.len(), 9);
     for (index, counts) in final_counts.iter().enumerate() {
         assert_eq!(
             counts.async_created, 0,
@@ -366,4 +420,99 @@ rules: ["MATCH,edge"]
             );
         }
     }
+}
+
+#[tokio::test]
+async fn mieru_udp_routing_shares_targets_and_retires_closed_generations_without_closing_siblings()
+{
+    let probe = ResourceProbe::default();
+    let (business, closed, joined, peer_joined, closes, remaining, udp_current) = probe.scope(async {
+        let parsed = Config::parse_yaml(br#"
+proxies: [{name: edge, type: mieru, server: memory.invalid, port: 2000, username: vole, password: fixture-password, transport: TCP, udp: true, multiplexing: MULTIPLEXING_HIGH}]
+rules: ["MATCH,edge"]
+"#).unwrap();
+        let peer = Peer::new(false);
+        let node = Arc::new(MieruOutbound::new(
+            &config(MieruHandshake::Standard), UpstreamPath::proxy(peer.clone()), 1024,
+        ).unwrap());
+        let counts = Arc::new(Mutex::new(Vec::new()));
+        let counted: Arc<dyn Dispatcher> = Arc::new(CountedDispatcher {
+            inner: Arc::new(ConnectorDispatcher::new(node.clone())), counts: counts.clone(),
+        });
+        let stats = RuntimeResourceStats::new("mieru_packet_router");
+        let leaf = observe_sessions_with_stats(counted, stats.clone());
+        let direct: Arc<dyn Dispatcher> = Arc::new(ConnectorDispatcher::new(peer.clone()));
+        let rules = RuleSet::compile(parsed.rules.clone()).unwrap();
+        let registry = Arc::new(Registry::default());
+        let diagnostics = Arc::new(Diagnostics::new(&parsed, &rules, registry.clone()));
+        let router = RoutingDispatcher::new(
+            ProxyDispatchers::new(vec![leaf.clone()]).unwrap(), direct, None, rules, Arc::new(EmptyGeoMatcher),
+        ).with_diagnostics(diagnostics);
+        let mut associations = Vec::new();
+        let business = tokio::time::timeout(Duration::from_secs(10), async {
+            let targets: [SocketAddr; 3] = [
+                "198.51.100.1:11000".parse().unwrap(),
+                "198.51.100.1:11001".parse().unwrap(),
+                "[2001:db8::1]:11002".parse().unwrap(),
+            ];
+            associations.push(bounded(router.open_datagram(DatagramSession::for_tun(
+                session().source, 1500,
+            ))).await?);
+            for remote in targets {
+                echo(associations[0].as_mut(), remote, b"prime").await?;
+            }
+            if counts.lock().unwrap().len() != 1 {
+                return Err("same-source targets did not share one UDP Associate".into());
+            }
+            let snapshot = serde_json::to_value(registry.snapshot()).map_err(|error| error.to_string())?;
+            let port = targets[1].port().to_string();
+            let id = snapshot["connections"].as_array().ok_or("connections missing")?
+                .iter().find(|entry| entry["metadata"]["destinationPort"].as_str() == Some(port.as_str()))
+                .and_then(|entry| entry["id"].as_str()).ok_or("connection missing")?.to_owned();
+            registry.close(&id);
+            echo(associations[0].as_mut(), targets[0], b"sibling-after-close").await?;
+            if counts.lock().unwrap()[0].closes.load(Ordering::Relaxed) != 0 {
+                return Err("closing one target closed its live sibling".into());
+            }
+            echo(associations[0].as_mut(), targets[1], b"reopened").await?;
+            if counts.lock().unwrap().len() != 2 {
+                return Err("reopened target reused a retired association".into());
+            }
+            echo(associations[0].as_mut(), targets[2], b"old-generation-sibling").await?;
+            associations.push(bounded(router.open_datagram(DatagramSession::for_tun(
+                "192.0.2.10:1001".parse().unwrap(), 1500,
+            ))).await?);
+            for remote in targets {
+                echo(associations[1].as_mut(), remote, b"other-source").await?;
+            }
+            if counts.lock().unwrap().len() != 3 {
+                return Err("different sources were merged or targets were not shared".into());
+            }
+            let remaining = serde_json::to_value(registry.snapshot()).map_err(|error| error.to_string())?
+                ["connections"].as_array().ok_or("connections missing")?.len();
+            if remaining != 6 {
+                return Err("shared associations did not retain per-target connections".into());
+            }
+            Ok::<_, String>(())
+        }).await.map_err(|_| "routed memory scenario timed out".to_owned()).and_then(|result| result);
+        let mut closed = Ok(());
+        for mut transport in associations {
+            if let Err(error) = bounded(transport.close()).await {
+                closed = Err(error);
+            }
+        }
+        let joined = tokio::time::timeout(STEP, node.shutdown()).await.is_ok();
+        let peer_joined = tokio::time::timeout(STEP, peer.stop()).await.is_ok();
+        drop((router, leaf, node, peer));
+        let remaining = serde_json::to_value(registry.snapshot()).unwrap()["connections"].as_array().unwrap().len();
+        let closes = counts.lock().unwrap().iter().map(|count| count.closes.load(Ordering::Relaxed)).collect::<Vec<_>>();
+        (business, closed, joined, peer_joined, closes, remaining, stats.snapshot().udp_current)
+    }).await;
+    assert!(probe.snapshot().is_idle());
+    assert!(closed.is_ok(), "association close: {closed:?}");
+    assert!(joined && peer_joined, "Mieru or memory peer did not join");
+    assert_eq!(remaining, 0);
+    assert_eq!(udp_current, 0);
+    business.unwrap();
+    assert_eq!(closes, vec![1, 1, 1]);
 }

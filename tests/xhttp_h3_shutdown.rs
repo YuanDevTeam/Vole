@@ -89,6 +89,10 @@ struct SlowPackets {
 }
 #[async_trait::async_trait]
 impl DatagramTransport for SlowPackets {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     fn payload_budget(&self, target: &Destination) -> DatagramBudget {
         self.inner.payload_budget(target)
     }

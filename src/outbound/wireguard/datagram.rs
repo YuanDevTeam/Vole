@@ -168,6 +168,11 @@ impl Datagrams {
 }
 #[async_trait]
 impl DatagramTransport for Datagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        // The lease owns an inner source port; each packet selects its own
+        // destination/peer and replies retain their actual source address.
+        true
+    }
     fn payload_budget(&self, _: &Destination) -> DatagramBudget {
         self.budget
     }
@@ -212,6 +217,8 @@ impl DatagramTransport for Datagrams {
     async fn close(&mut self) -> Result<(), DispatchError> {
         self.slot.take();
         self.receiver.close();
+        while self.receiver.try_recv().is_ok() {}
+        self.frame = Vec::new();
         Ok(())
     }
 }
@@ -223,5 +230,66 @@ pub(super) fn local_destination(
     match destination {
         IpAddr::V4(ip) => config.ipv4 == Some(ip),
         IpAddr::V6(ip) => config.ipv6 == Some(ip),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::outbound::OutboundConnector;
+    use crate::{
+        outbound::EstablishContext, resources::observation::ResourceProbe, session::InboundKind,
+    };
+
+    #[tokio::test]
+    async fn wireguard_memory_closed_udp_releases_queued_replies_and_frame() {
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let (outbound, _, _) = super::super::tests::outbound(false);
+                let engine = outbound.engine(&EstablishContext::default()).await.unwrap();
+                let open = || {
+                    Datagrams::new(
+                        engine.clone(),
+                        DatagramBudget::new(1200, 1200),
+                        ResolutionContext::default(),
+                        DatagramSession::new(InboundKind::Tun, "192.0.2.1:23000".parse().unwrap()),
+                    )
+                    .unwrap()
+                };
+                let mut closed = open();
+                let mut sibling = open();
+                let remote = "10.0.0.1:53".parse().unwrap();
+                let destination =
+                    SocketAddr::new("10.0.0.2".parse().unwrap(), closed.port().unwrap());
+                for _ in 0..RESPONSE_QUEUE {
+                    engine.registry.deliver(remote, destination, b"queued");
+                }
+                assert_eq!(closed.receiver.len(), RESPONSE_QUEUE);
+                assert!(closed.frame.capacity() >= engine.mtu);
+                closed.close().await.unwrap();
+                closed.close().await.unwrap();
+                assert!(closed.slot.is_none());
+                assert_eq!(closed.receiver.len(), 0);
+                assert_eq!(closed.frame.capacity(), 0);
+                engine.registry.deliver(remote, destination, b"late");
+                assert_eq!(closed.receiver.len(), 0);
+                assert!(closed.receive().await.is_err());
+                engine.registry.deliver(
+                    remote,
+                    SocketAddr::new(destination.ip(), sibling.port().unwrap()),
+                    b"sibling",
+                );
+                let response = sibling.receive().await.unwrap();
+                assert_eq!(response.remote, Destination::Ip(remote));
+                assert_eq!(response.payload.as_ref(), b"sibling");
+                assert_eq!(engine.registry.0.lock().unwrap().entries.len(), 1);
+                sibling.close().await.unwrap();
+                assert!(engine.registry.0.lock().unwrap().entries.is_empty());
+                drop((closed, sibling, engine));
+                outbound.shutdown().await;
+                assert!(probe.snapshot().is_idle());
+            })
+            .await;
     }
 }

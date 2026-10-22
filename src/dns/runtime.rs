@@ -4258,6 +4258,10 @@ mod tests {
 
     #[async_trait]
     impl DatagramTransport for MockDatagrams {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
             self.send_count += 1;
             self.payloads

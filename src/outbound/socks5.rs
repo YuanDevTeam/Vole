@@ -804,6 +804,10 @@ mod tests {
 
     #[async_trait]
     impl DatagramTransport for MockDatagrams {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
             if self.fragment_response {
                 let mut payload = datagram.payload.to_vec();

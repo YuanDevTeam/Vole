@@ -29,6 +29,10 @@ use memory_quic::{MemoryPackets, MemoryUpstream, PeerSocket};
 struct BudgetPackets(MemoryPackets, u16);
 #[async_trait::async_trait]
 impl DatagramTransport for BudgetPackets {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     fn payload_budget(&self, _: &Destination) -> DatagramBudget {
         DatagramBudget::new(self.1, self.1)
     }
@@ -1056,6 +1060,10 @@ async fn blocked_outer_path_bounds_stream_and_datagram_send_buffers_and_stop() {
     struct Blockable(BudgetPackets, Arc<AtomicBool>);
     #[async_trait::async_trait]
     impl DatagramTransport for Blockable {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
             self.0.payload_budget(peer)
         }

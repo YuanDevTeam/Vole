@@ -24,6 +24,10 @@ struct MockTransport {
 
 #[async_trait]
 impl DatagramTransport for MockTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
         self.permits.acquire().await.unwrap().forget();
         self.sent.send(packet).await.unwrap();

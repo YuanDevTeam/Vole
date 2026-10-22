@@ -56,6 +56,10 @@ impl Dispatcher for DnsPeer {
 }
 #[async_trait]
 impl DatagramTransport for DnsTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, query: Datagram) -> Result<(), DispatchError> {
         let question = classify_query(&query.payload).unwrap().question;
         assert_eq!(question.query_type, 65);

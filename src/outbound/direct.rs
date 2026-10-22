@@ -211,6 +211,11 @@ impl DirectDatagramTransport {
 
 #[async_trait]
 impl DatagramTransport for DirectDatagramTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        // Unconnected sockets preserve each send target and actual reply source.
+        true
+    }
+
     #[cfg(all(
         target_os = "linux",
         any(feature = "outbound-tuic", feature = "quinn-h3-transport")

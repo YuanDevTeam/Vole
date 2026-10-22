@@ -183,3 +183,46 @@ async fn mieru_packet_pending_cancel_wakes_and_closed_or_cancelled_queues_do_not
         assert!(matches!(asynchronous, Err(DispatchError::NotAllowed)));
     }
 }
+
+#[tokio::test]
+async fn mieru_packet_cancelled_partial_send_revokes_shared_stream_without_cancelling_parent() {
+    let probe = ResourceProbe::default();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        probe.scope(async {
+            let (client, mut peer) = tokio::io::duplex(1);
+            let parent = CancellationToken::new();
+            let tasks = TaskTracker::new();
+            let request = DatagramRequest::new(DatagramSession::for_tun(
+                "192.0.2.10:1000".parse().unwrap(),
+                1500,
+            ));
+            let mut transport = PacketTransport::new(
+                Box::new(client),
+                &request,
+                &EstablishContext::default(),
+                parent.clone(),
+                |reader| Ok(tasks.spawn(observation::task(reader))),
+            )
+            .unwrap();
+            let packet = Datagram {
+                remote: Destination::Ip("198.51.100.1:53".parse().unwrap()),
+                payload: Bytes::from_static(b"partially-written"),
+                sniffed_domain: None,
+            };
+            let mut sending = Box::pin(transport.send(packet.clone()));
+            assert!(futures_util::poll!(&mut sending).is_pending());
+            drop(sending);
+            let mut partial = Vec::new();
+            peer.read_to_end(&mut partial).await.unwrap();
+            assert_eq!(partial, vec![0]);
+            assert!(transport.send(packet).await.is_err());
+            assert!(transport.receive().await.is_err());
+            close(transport, tasks).await;
+            assert!(!parent.is_cancelled());
+        }),
+    )
+    .await
+    .expect("cancelled Mieru shared stream must release both halves");
+    assert!(probe.snapshot().is_idle());
+}

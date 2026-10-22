@@ -673,6 +673,11 @@ struct BalancedDatagrams {
 }
 #[async_trait]
 impl DatagramTransport for BalancedDatagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        // The first destination selects a leaf whose framing is not known yet.
+        false
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         if self.transport.is_none() {
             let leaf = self.groups.resolve_leaf_for(
@@ -724,6 +729,10 @@ struct RejectDatagramTransport;
 
 #[async_trait]
 impl DatagramTransport for RejectDatagramTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        true
+    }
+
     async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
         Ok(())
     }
@@ -778,6 +787,10 @@ mod tests {
 
     #[async_trait]
     impl DatagramTransport for RecordingDatagramTransport {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
             self.sends.fetch_add(1, Ordering::Relaxed);
             Ok(())

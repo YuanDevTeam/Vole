@@ -125,6 +125,11 @@ impl Drop for SendGuard<'_> {
 }
 #[async_trait]
 impl DatagramTransport for PacketTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        // Every packet carries its own SOCKS address inside the associate stream.
+        true
+    }
+
     fn payload_budget(&self, remote: &Destination) -> DatagramBudget {
         let overhead = 3 + socks5::encoded_address_size(remote)
             .unwrap_or(usize::from(socks5::MAX_UDP_HEADER_SIZE));

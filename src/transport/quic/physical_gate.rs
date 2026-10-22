@@ -112,6 +112,11 @@ impl Dispatcher for Gate {
 }
 #[async_trait]
 impl DatagramTransport for Bridge {
+    fn supports_shared_destinations(&self) -> bool {
+        // This retirement fixture accepts exactly the configured peer.
+        false
+    }
+
     async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
         if packet.remote != Destination::Ip(self.peer) {
             return Err(DispatchError::NotAllowed);

@@ -25,6 +25,10 @@ struct Packets {
 }
 #[async_trait]
 impl DatagramTransport for Packets {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     fn payload_budget(&self, _: &Destination) -> DatagramBudget {
         DatagramBudget::new(1400, 1400)
     }

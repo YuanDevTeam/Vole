@@ -26,6 +26,10 @@ struct Transport {
 }
 #[async_trait::async_trait]
 impl DatagramTransport for Transport {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, _: Datagram) -> Result<(), DispatchError> {
         self.sends.fetch_add(1, Ordering::SeqCst);
         Err(io::Error::from(io::ErrorKind::NotConnected).into())

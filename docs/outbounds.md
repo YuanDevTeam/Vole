@@ -50,6 +50,14 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   超时；响应头已确认后的业务读取不再受该期限限制。
 - HTTP、SOCKS5、TUN、DNS 选路及 node-only `measureDelay` 使用同一连接器。
   普通协议节点的业务 UDP 默认为 false；收发预算分别逐层扣封装开销，超限不截断交付。
+- UDP 关联复用由共享路由层管理。DIRECT、Mieru、TrustTunnel、WireGuard 内层 UDP、
+  MASQUE/IP 内层 UDP 和 VMess packetaddr 的 `none`／`zero` body 均提供逐包目标与实际回包来源，可复用多目标关联。
+  开启逐目标连接追踪时，仅同一来源、同一具体出站实例和同一资源代际的未改写 IP 目标共享；
+  逐目标路由、统计、关闭、关联退役和旧回复隔离见[资源策略](runtime-resource-policy.md#udp)。
+  域名、fake-IP 和需要地址还原的目标保持独立。VLESS/VMess raw 的首目标约束不变；
+  VMess 加密 packetaddr 也保持独立，避免聚合流量提前耗尽 16 位 body nonce，且不削弱 nonce 防重复检查。
+  Gecko 等固定对端的底层适配也不因此获得多目标能力，外层业务关联按自身能力处理。
+  每层明确声明共享能力，透明包装传递底层声明，不根据外层协议或字段推断其内部载体可共享。
 - 所有普通节点都可启用公共 `smux` 包装，使用节点自己的正常 TCP 传输与独立 mux 池，
   业务路由、`dialer-proxy`、provider 代际与测速都使用最终包装器。
   `only-tcp: false` 提供 mux UDP，包括底层 `udp: false` 或仅支持 TCP 的节点；

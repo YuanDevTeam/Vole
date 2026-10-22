@@ -132,11 +132,20 @@ mux驱动，再等待底层协议。provider代际与node-only测速复用此屏
   响应队列满不会延长源关联所有者的生命周期。
 - reader EOF、错误或取消时，先取消其 UDP 子作用域，再删除、取消并等待全部关联和 DNS 任务；父运行时统一取消并等待唯一 writer 与 netstack。UDP 子作用域停止不取消调用者令牌。
 
-开启 Controller 的业务 UDP 按目标独立统计、取消并固定出口。提供多目标与取消安全帧边界的
-SOCKS5 UDP、Trojan UDP、XUDP、UoT、原生 SS2022、HY2 UDP 和 TUIC native/quic 在同一源关联、同一具体节点和资源代际内共享 transport；仅用于未改写的 IP 目标。
-fake-IP、QUIC 目标改写、域名及其它未声明共享能力的协议保留独立 transport。
+开启 Controller 的业务 UDP 按目标独立统计、取消并固定出口。`DatagramTransport` 必须显式声明
+多目标共享能力，没有默认值；透明包装传递底层能力，不能在包装时退回隐式独占。
+公共路由层统一决定复用，仅允许同一源关联、同一具体节点和资源代际内的未改写 IP 目标。
+支持路径包括 DIRECT、SOCKS5 UDP、Trojan UDP、XUDP、VLESS packetaddr、VMess `none`／`zero` packetaddr、UoT、
+原生 SS2022、HY2 UDP、TUIC native/quic、Mieru、TrustTunnel，以及 WireGuard/MASQUE/IP 的内层 UDP。
+内层复用只合并端口租约、逻辑会话或响应交接；底层物理隧道的已有池化保持原状。
+raw VLESS/VMess、Gecko、固定物理 peer、尚未确定具体出站的路由包装保留独立传输。
+VMess 加密 packetaddr 保留逐目标独立传输，避免聚合后提前耗尽每方向 65,536 条加密记录；
+没有可保持远端 UDP 关联的透明迁移，不通过重用 nonce 或隐式切换 cipher 延长连接。
+fake-IP、QUIC 目标改写、域名及其它需要地址还原的请求始终隔离，即使底层支持多目标；
+两个原目标可能解析到同一个真实端点，不能仅靠回包源地址区分。
 共享路径只有一个接收者，按回复地址找到仍有效的目标，未请求或过期回复丢弃。
-目标退出后物理关联退役，继续服务既有目标，新目标另建关联；防止目标重建或 flow-id 更换后
+帧写入中途取消时，不能重试已损坏的可靠流：整条关联失败关闭，其成员按关联错误退出。
+目标正常退出后物理关联退役，继续服务既有目标，新目标另建关联；防止目标重建或 flow-id 更换后
 旧回复串入新会话，不保留历史目标墓碑。最后目标退出关闭关联，Stop 同步释放全部关联。
 每目标只登记取消通知，不分配逐目标接收 future、任务或负载队列。
 DIRECT 在源关联内共用一个延迟分配的接收暂存缓冲，保留预算加一字节的超长包检测；

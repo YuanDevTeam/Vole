@@ -1196,6 +1196,10 @@ mod tests {
 
     #[async_trait]
     impl DatagramTransport for MarkedDatagrams {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
             self.sends.fetch_add(1, Ordering::Relaxed);
             Ok(())

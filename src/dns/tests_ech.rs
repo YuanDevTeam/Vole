@@ -101,6 +101,10 @@ impl Drop for Transport {
 }
 #[async_trait]
 impl DatagramTransport for Transport {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         let parsed = classify_query(&datagram.payload).unwrap();
         self.queries

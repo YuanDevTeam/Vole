@@ -195,6 +195,11 @@ impl Datagrams {
 }
 #[async_trait]
 impl DatagramTransport for Datagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        // One inner source-port lease can address multiple IP destinations;
+        // the shared IP tunnel already owns the physical transport.
+        true
+    }
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         let overhead = match peer {
             Destination::Ip(peer) if peer.is_ipv4() => 28,

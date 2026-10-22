@@ -262,6 +262,10 @@ mod tests {
     struct OwnedPackets(Arc<AtomicUsize>);
     #[async_trait::async_trait]
     impl DatagramTransport for OwnedPackets {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         fn send_owned(&mut self, _: Datagram) -> Result<super::super::OwnedDatagramSend, Datagram> {
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(Box::pin(async { Ok(()) }))

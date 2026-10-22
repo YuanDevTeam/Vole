@@ -221,6 +221,10 @@ impl VmessStream {
             reader: futures_util::task::AtomicWaker::new(),
         }
     }
+    pub(super) fn uses_body_nonce(&self) -> bool {
+        self.write.options.cipher != BodyCipher::None
+    }
+
     /// Mihomo falls back to whole-connection Close for gRPC, HTTP camouflage
     /// and legacy H2. TCP/ordinary WS keep the underlying CloseWrite behavior.
     pub fn with_whole_close(mut self) -> Self {

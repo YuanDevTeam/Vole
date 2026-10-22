@@ -217,6 +217,189 @@ impl ClientHandshake {
 }
 
 #[cfg(test)]
+mod datagram_memory_tests {
+    use super::*;
+    use crate::{
+        dispatch::{DatagramBudget, DatagramTransport},
+        dns::resolution::ResolutionContext,
+        outbound::{
+            address::encode_packet_addr,
+            vmess::{VmessDatagram, VmessStream},
+        },
+        session::Datagram,
+    };
+    use bytes::Bytes;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    fn fixture(capacity: usize, packetaddr: bool) -> (VmessDatagram, DuplexStream, Vec<u8>) {
+        fixture_with_cipher(capacity, packetaddr, BodyCipher::None)
+    }
+
+    fn fixture_with_cipher(
+        capacity: usize,
+        packetaddr: bool,
+        cipher: BodyCipher,
+    ) -> (VmessDatagram, DuplexStream, Vec<u8>) {
+        let peer = Destination::Ip("192.0.2.1:53".parse().unwrap());
+        let handshake = ClientHandshake::new(
+            &VmessIdentity::new(uuid::Uuid::from_bytes([7; 16])),
+            Command::Udp,
+            &peer,
+            BodyOptions::new(cipher, false, false).unwrap(),
+        )
+        .unwrap();
+        // Body encryption is independent of this genuine authenticated VMess
+        // response header; Body None must authenticate the header too.
+        let mut response = Vec::new();
+        for (mut data, key_salt, iv_salt) in [
+            (
+                4u16.to_be_bytes().to_vec(),
+                b"AEAD Resp Header Len Key".as_slice(),
+                b"AEAD Resp Header Len IV".as_slice(),
+            ),
+            (
+                vec![handshake.response_tag, 0, 0, 0],
+                b"AEAD Resp Header Key".as_slice(),
+                b"AEAD Resp Header IV".as_slice(),
+            ),
+        ] {
+            let key = kdf(&handshake.response_key, &[key_salt]);
+            let iv = kdf(&handshake.response_iv, &[iv_salt]);
+            seal(
+                &aead_key(BodyCipher::Aes128Gcm, key[..16].try_into().unwrap()),
+                iv[..12].try_into().unwrap(),
+                &[],
+                &mut data,
+            )
+            .unwrap();
+            response.extend_from_slice(&data);
+        }
+        let (io, peer_io) = tokio::io::duplex(capacity);
+        let stream = VmessStream::new(Box::new(io), handshake);
+        let budget = DatagramBudget::new(128, 128);
+        let datagram = if packetaddr {
+            VmessDatagram::packet_addr(stream, budget, ResolutionContext::default())
+        } else {
+            VmessDatagram::raw(stream, peer, budget)
+        };
+        (datagram, peer_io, response)
+    }
+
+    fn packet(remote: Destination, payload: &'static [u8]) -> Datagram {
+        Datagram {
+            remote,
+            payload: Bytes::from_static(payload),
+            sniffed_domain: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn vmess_packetaddr_memory_shares_multiple_targets_and_preserves_reply_addresses() {
+        let (mut client, mut peer, response) = fixture(1024, true);
+        assert!(client.supports_shared_destinations());
+        let targets = [
+            Destination::Ip("192.0.2.1:53".parse().unwrap()),
+            Destination::Ip("[2001:db8::2]:443".parse().unwrap()),
+        ];
+        peer.write_all(&response).await.unwrap();
+        for target in targets {
+            let datagram = packet(target.clone(), b"target-specific payload");
+            client.send(datagram.clone()).await.unwrap();
+            let mut expected = BytesMut::new();
+            encode_packet_addr(&target, &mut expected).unwrap();
+            expected.extend_from_slice(&datagram.payload);
+            let length = peer.read_u16().await.unwrap();
+            let mut body = vec![0; usize::from(length)];
+            peer.read_exact(&mut body).await.unwrap();
+            assert_eq!(body, expected);
+            peer.write_u16(length).await.unwrap();
+            peer.write_all(&body).await.unwrap();
+            let reply = client.receive().await.unwrap();
+            assert_eq!(reply.remote, target);
+            assert_eq!(reply.payload, datagram.payload);
+        }
+        client.close().await.unwrap();
+        assert_eq!(
+            peer.read_u8().await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(client.receive().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn vmess_raw_memory_keeps_fixed_target_without_poisoning_valid_send() {
+        let (mut client, mut peer, response) = fixture(1024, false);
+        assert!(!client.supports_shared_destinations());
+        let target = Destination::Ip("192.0.2.1:53".parse().unwrap());
+        assert!(
+            client
+                .send(packet(
+                    Destination::Ip("192.0.2.2:53".parse().unwrap()),
+                    b"wrong target"
+                ))
+                .await
+                .is_err()
+        );
+        client
+            .send(packet(target.clone(), b"fixed target"))
+            .await
+            .unwrap();
+        let length = peer.read_u16().await.unwrap();
+        let mut body = vec![0; usize::from(length)];
+        peer.read_exact(&mut body).await.unwrap();
+        assert_eq!(body, b"fixed target");
+        peer.write_all(&response).await.unwrap();
+        peer.write_u16(length).await.unwrap();
+        peer.write_all(&body).await.unwrap();
+        let reply = client.receive().await.unwrap();
+        assert_eq!(reply.remote, target);
+        assert_eq!(reply.payload, body);
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vmess_datagram_memory_cancelled_partial_send_closes_each_encoding() {
+        for cipher in [
+            BodyCipher::Auto,
+            BodyCipher::None,
+            BodyCipher::Aes128Gcm,
+            BodyCipher::Chacha20Poly1305,
+        ] {
+            for packetaddr in [false, true] {
+                let (mut client, mut peer, _) = fixture_with_cipher(1, packetaddr, cipher);
+                assert_eq!(
+                    client.supports_shared_destinations(),
+                    packetaddr && cipher == BodyCipher::None,
+                    "packetaddr={packetaddr}, cipher={cipher:?}",
+                );
+                {
+                    let sending = client.send(packet(
+                        Destination::Ip("192.0.2.1:53".parse().unwrap()),
+                        b"partial payload",
+                    ));
+                    tokio::pin!(sending);
+                    assert!(futures_util::poll!(sending.as_mut()).is_pending());
+                }
+                let mut partial = Vec::new();
+                peer.read_to_end(&mut partial).await.unwrap();
+                assert_eq!(partial.len(), 1);
+                assert!(
+                    client
+                        .send(packet(
+                            Destination::Ip("192.0.2.1:53".parse().unwrap()),
+                            b"must not replay"
+                        ))
+                        .await
+                        .is_err()
+                );
+                assert!(client.receive().await.is_err());
+                client.close().await.unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod delayed_response_memory_tests {
     use super::*;
     use crate::outbound::vmess::VmessStream;

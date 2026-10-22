@@ -230,6 +230,10 @@ impl MemoryPeer {
 }
 #[async_trait]
 impl DatagramTransport for MemoryPeer {
+    fn supports_shared_destinations(&self) -> bool {
+        // This Noise fixture binds its identity to the first outer endpoint.
+        false
+    }
     fn payload_budget(&self, _: &Destination) -> DatagramBudget {
         DatagramBudget::new(1440, 1440)
     }
@@ -321,7 +325,9 @@ impl Drop for MemoryPeer {
     }
 }
 
-fn outbound(silent: bool) -> (Arc<WireGuardOutbound>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+pub(super) fn outbound(
+    silent: bool,
+) -> (Arc<WireGuardOutbound>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     outbound_with_flood(silent, Arc::default())
 }
 
@@ -443,6 +449,94 @@ async fn wireguard_memory_noise_tcp_dual_stack_udp_and_stop_release() {
             assert_eq!(closes.load(Ordering::Relaxed), 1);
             assert!(weak.upgrade().is_none());
             assert_eq!(probe.snapshot().current(ResourceKind::Task), 0);
+            assert!(probe.snapshot().is_idle());
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn wireguard_memory_shared_udp_targets_cancel_and_close_independently() {
+    let probe = ResourceProbe::default();
+    probe
+        .scope(async {
+            let (outbound, _, closes) = outbound(false);
+            let context = EstablishContext::with_timeout(Duration::from_secs(2));
+            let source = "192.0.2.1:23000".parse().unwrap();
+            let request = || {
+                DatagramRequest::new(DatagramSession::new(InboundKind::Tun, source))
+                    .with_max_response_payload_size(1200)
+            };
+            let mut shared = outbound.open_datagram(request(), &context).await.unwrap();
+            assert!(shared.supports_shared_destinations());
+            let mut waiting = Box::pin(shared.receive());
+            assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+            drop(waiting);
+
+            let targets = ["10.0.0.1:53", "10.0.0.3:443", "[fd00::1]:443"];
+            for (index, target) in targets.into_iter().enumerate() {
+                shared
+                    .send(Datagram {
+                        remote: Destination::Ip(target.parse().unwrap()),
+                        payload: Bytes::from(vec![u8::try_from(index).unwrap()]),
+                        sniffed_domain: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            for (index, target) in targets.into_iter().enumerate() {
+                let reply = tokio::time::timeout(Duration::from_secs(2), shared.receive())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reply.remote, Destination::Ip(target.parse().unwrap()));
+                assert_eq!(reply.payload.as_ref(), &[u8::try_from(index).unwrap()]);
+            }
+
+            let mut sibling = outbound
+                .open_datagram(
+                    DatagramRequest::new(DatagramSession::new(
+                        InboundKind::Tun,
+                        "192.0.2.2:23000".parse().unwrap(),
+                    )),
+                    &context,
+                )
+                .await
+                .unwrap();
+            let send = |payload| Datagram {
+                remote: Destination::Ip(targets[0].parse().unwrap()),
+                payload: Bytes::from_static(payload),
+                sniffed_domain: None,
+            };
+            sibling.send(send(b"sibling")).await.unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(2), sibling.receive())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.payload.as_ref(), b"sibling");
+            let mut waiting = Box::pin(shared.receive());
+            assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+            drop(waiting);
+
+            shared.close().await.unwrap();
+            assert!(shared.send(send(b"closed")).await.is_err());
+            assert!(shared.receive().await.is_err());
+            let mut rebuilt = outbound.open_datagram(request(), &context).await.unwrap();
+            rebuilt.send(send(b"rebuilt")).await.unwrap();
+            sibling.send(send(b"still-live")).await.unwrap();
+            for (transport, payload) in [
+                (&mut rebuilt, b"rebuilt".as_slice()),
+                (&mut sibling, b"still-live".as_slice()),
+            ] {
+                let reply = tokio::time::timeout(Duration::from_secs(2), transport.receive())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reply.payload.as_ref(), payload);
+                transport.close().await.unwrap();
+            }
+            drop((shared, rebuilt, sibling));
+            outbound.shutdown().await;
+            assert_eq!(closes.load(Ordering::Relaxed), 1);
             assert!(probe.snapshot().is_idle());
         })
         .await;

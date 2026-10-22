@@ -662,6 +662,10 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl DatagramTransport for Sink {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, _: Datagram) -> Result<(), DispatchError> {
             self.sent.fetch_add(1, Ordering::AcqRel);
             self.changed.notify_one();
@@ -754,6 +758,10 @@ mod pending_waker_tests {
     }
     #[async_trait::async_trait]
     impl DatagramTransport for Carrier {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         fn supports_poll_receive(&self) -> bool {
             self.polled
         }

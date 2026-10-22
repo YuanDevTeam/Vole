@@ -125,6 +125,10 @@ struct Paced {
 }
 #[async_trait]
 impl DatagramTransport for Paced {
+    fn supports_shared_destinations(&self) -> bool {
+        self.inner.supports_shared_destinations()
+    }
+
     fn supports_poll_receive(&self) -> bool {
         self.inner.supports_poll_receive()
     }

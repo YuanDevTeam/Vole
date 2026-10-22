@@ -132,6 +132,11 @@ impl Gecko {
 }
 #[async_trait]
 impl DatagramTransport for Gecko {
+    fn supports_shared_destinations(&self) -> bool {
+        // Fragment IDs and reassembly belong to the immutable QUIC peer.
+        false
+    }
+
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         self.inner
             .payload_budget(peer)
@@ -274,6 +279,10 @@ mod tests {
     }
     #[async_trait]
     impl DatagramTransport for Packets {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         fn payload_budget(&self, _: &Destination) -> DatagramBudget {
             DatagramBudget::new(2048, 2048)
         }
@@ -327,6 +336,18 @@ mod tests {
     #[tokio::test]
     async fn gecko_memory_wire_reassembles_reordered_long_headers_and_preserves_short_headers() {
         let (mut gecko, mut sent, reply, closed) = setup();
+        assert!(!gecko.supports_shared_destinations());
+        assert!(
+            gecko
+                .send(Datagram {
+                    remote: Destination::Ip("192.0.2.2:443".parse().unwrap()),
+                    payload: Bytes::from_static(&[0x40, 1]),
+                    sniffed_domain: None,
+                })
+                .await
+                .is_err()
+        );
+        assert!(sent.try_recv().is_err());
         let mut plain = vec![7; 1400];
         plain[0] = 0xc0;
         gecko

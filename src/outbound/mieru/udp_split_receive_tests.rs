@@ -28,6 +28,10 @@ mod split_receive_tests {
 
     #[async_trait]
     impl DatagramTransport for Packets {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         fn payload_budget(&self, _: &Destination) -> DatagramBudget {
             DatagramBudget::new(MTU, MTU)
         }

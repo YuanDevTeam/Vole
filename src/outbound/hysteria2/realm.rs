@@ -350,6 +350,10 @@ mod cancellation_tests {
     struct Waiting(Arc<AtomicUsize>);
     #[async_trait::async_trait]
     impl DatagramTransport for Waiting {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, _: Datagram) -> Result<(), DispatchError> {
             Ok(())
         }
