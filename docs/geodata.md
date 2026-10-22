@@ -309,7 +309,7 @@ fallible Vec 扩容、合法 protobuf 帧/长度、code、选中匹配值的 UTF
 MMDB metadata/图校验状态未计入。因此账本**不包含正则内部编译状态、搜索缓存、
 动态 scratch、配置需求集合、allocator 开销或整个进程 footprint**。这些未计入的
 内存并不是零；accounted peak 不能作为加载或运行期峰值上界。
-进程 RSS 的硬上限与 1/2/3Gbps 分档压力标准统一见[验收边界](acceptance.md#性能采纳标准)，
+进程 RSS 的硬上限与默认 1 / 2 Gbps 分档压力标准统一见[验收边界](acceptance.md#性能采纳标准)，
 它们是压力测试标准，不是加载器保证。
 
 互通和内存/吞吐压力由独立容器测试工具维护，结果与结论统一保存在 benchmark 工程；

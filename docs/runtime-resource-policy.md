@@ -338,7 +338,7 @@ Stop 的同步释放屏障完成后，Apple 通过 malloc zone、GNU/Linux 通�
 
 - 未使用 TUN 时不配置 allocator、不启动周期采样或 Stop 回收。
 - 采样失败只记录一次警告，不写入 `lastError`。
-- 43/45 MiB 阈值分别对应 1 Gbps 与 3 Gbps 的预算，仅作诊断；Core 不推断负载档位，最终由 benchmark 按实际负载判定。这些观测不改变 prepare、start、running、stop 或 panic recovery。
+- 43/45 MiB 阈值分别对应默认 1 Gbps 与 2 Gbps 的预算，仅作诊断；Core 不推断负载档位，最终由 benchmark 按实际负载判定。这些观测不改变 prepare、start、running、stop 或 panic recovery。
 - Stop 后的 allocator 回收只执行一次且尽力而为，不保证立即降低进程内存。
 
 内存预算与真实设备范围见[验收边界](acceptance.md)。
