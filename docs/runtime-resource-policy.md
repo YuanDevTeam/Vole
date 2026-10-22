@@ -133,7 +133,7 @@ mux驱动，再等待底层协议。provider代际与node-only测速复用此屏
 - reader EOF、错误或取消时，先取消其 UDP 子作用域，再删除、取消并等待全部关联和 DNS 任务；父运行时统一取消并等待唯一 writer 与 netstack。UDP 子作用域停止不取消调用者令牌。
 
 开启 Controller 的业务 UDP 按目标独立统计、取消并固定出口。提供多目标与取消安全帧边界的
-XUDP、UoT、原生 SS2022、HY2 UDP 和 TUIC native/quic 在同一源关联、同一具体节点和资源代际内共享 transport；仅用于未改写的 IP 目标。
+SOCKS5 UDP、Trojan UDP、XUDP、UoT、原生 SS2022、HY2 UDP 和 TUIC native/quic 在同一源关联、同一具体节点和资源代际内共享 transport；仅用于未改写的 IP 目标。
 fake-IP、QUIC 目标改写、域名及其它未声明共享能力的协议保留独立 transport。
 共享路径只有一个接收者，按回复地址找到仍有效的目标，未请求或过期回复丢弃。
 目标退出后物理关联退役，继续服务既有目标，新目标另建关联；防止目标重建或 flow-id 更换后

@@ -287,6 +287,8 @@ QUIC 使用 20 字节 CID、初始 payload 1242 与受控预算交集、30 秒 k
 
 仅 SOCKS5 CONNECT / UDP ASSOCIATE；用户名密码成对配置，不支持 SOCKS4。
 TCP 保留域名交由上游解析；UDP 由控制连接拥有，校验 relay 来源并保留实际回包目标。
+Controller 跟踪的同源、同具体节点和同代际的未改写 IP 目标共享 UDP ASSOCIATE，
+逐目标统计与关闭保持独立；目标退出使关联退役，新目标使用新关联，旧回复不能进入重建目标。
 上游为 select 组时，控制连接和后续 UDP 数据报使用同次建链快照。
 `tls: true` 使用共享 TLS、`skip-cert-verify`、`name-cert-verify`、`fingerprint` 和
 成对的 `certificate/private-key`（PEM 或文件路径）。TLS 名称固定使用 server；不接受 sni、alpn

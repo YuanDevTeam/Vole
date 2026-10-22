@@ -452,6 +452,10 @@ struct Socks5DatagramTransport {
 
 #[async_trait]
 impl DatagramTransport for Socks5DatagramTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        true
+    }
+
     fn payload_budget(&self, peer: &Destination) -> crate::dispatch::DatagramBudget {
         let Ok(address) = crate::socks5::encoded_address_size(peer) else {
             return crate::dispatch::DatagramBudget::new(0, 0);
@@ -564,6 +568,8 @@ mod tests {
         close_control: bool,
         fragment_response: bool,
         opened_limit: Arc<AtomicU16>,
+        associates: Arc<AtomicUsize>,
+        udp_opens: Arc<AtomicUsize>,
         switch_after_handshake: Option<Arc<crate::routing::GroupSelection>>,
     }
 
@@ -576,6 +582,8 @@ mod tests {
                 close_control: false,
                 fragment_response: false,
                 opened_limit: Arc::new(AtomicU16::new(0)),
+                associates: Arc::new(AtomicUsize::new(0)),
+                udp_opens: Arc::new(AtomicUsize::new(0)),
                 switch_after_handshake: None,
             }
         }
@@ -594,6 +602,7 @@ mod tests {
             let auth = self.auth.clone();
             let relay = self.relay.clone();
             let close_control = self.close_control;
+            let associates = self.associates.clone();
             let switch_after_handshake = self.switch_after_handshake.clone();
             tokio::spawn(async move {
                 let mut greeting = [0_u8; 3];
@@ -631,6 +640,7 @@ mod tests {
                     .unwrap();
                 if command == COMMAND_UDP_ASSOCIATE {
                     assert_eq!(destination.port(), 0);
+                    associates.fetch_add(1, Ordering::Relaxed);
                 } else {
                     assert_eq!(
                         destination,
@@ -673,6 +683,7 @@ mod tests {
             request: DatagramRequest,
             _context: &EstablishContext,
         ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+            self.udp_opens.fetch_add(1, Ordering::Relaxed);
             self.opened_limit
                 .store(request.max_response_payload_size(), Ordering::Relaxed);
             Ok(Box::new(MockDatagrams {
@@ -906,6 +917,123 @@ mod tests {
             assert_eq!(response.remote, destination);
             assert_eq!(&response.payload[..], b"query");
         }
+    }
+
+    #[tokio::test]
+    async fn managed_udp_shares_socks_association_and_isolates_closed_members() {
+        use crate::{
+            connections::Registry,
+            dispatch::observe_sessions_with_stats,
+            outbound::{ConnectorDispatcher, RejectOutbound},
+            resources::RuntimeResourceStats,
+            routing::{
+                EmptyGeoMatcher, ProxyDispatchers, RoutingDispatcher, RuleSet,
+                diagnostics::Diagnostics,
+            },
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let upstream = MockUpstream::new(COMMAND_UDP_ASSOCIATE);
+            let associates = upstream.associates.clone();
+            let udp_opens = upstream.udp_opens.clone();
+            let opens = || {
+                (
+                    associates.load(Ordering::Relaxed),
+                    udp_opens.load(Ordering::Relaxed),
+                )
+            };
+            let node = Arc::new(
+                Socks5Outbound::new_with_upstream(&config(None), Arc::new(upstream)).unwrap(),
+            );
+            let leaf = observe_sessions_with_stats(
+                Arc::new(ConnectorDispatcher::new(node)),
+                RuntimeResourceStats::new("socks_managed_memory"),
+            );
+            let parsed = crate::config::Config::parse_yaml(
+                br#"
+proxies: [{name: edge, type: socks5, server: socks.example, port: 1080, udp: true}]
+rules: ["MATCH,edge"]
+"#,
+            )
+            .unwrap();
+            let rules = RuleSet::compile(parsed.rules.clone()).unwrap();
+            let registry = Arc::new(Registry::default());
+            let diagnostics = Arc::new(Diagnostics::new(&parsed, &rules, registry.clone()));
+            let router = RoutingDispatcher::new(
+                ProxyDispatchers::new(vec![leaf]).unwrap(),
+                Arc::new(ConnectorDispatcher::new(Arc::new(
+                    RejectOutbound::drop_connections(),
+                ))),
+                None,
+                rules,
+                Arc::new(EmptyGeoMatcher),
+            )
+            .with_diagnostics(diagnostics);
+            let mut first = router
+                .open_datagram(DatagramSession::for_tun(
+                    "127.0.0.1:10000".parse().unwrap(),
+                    1500,
+                ))
+                .await
+                .unwrap();
+            let mut second = router
+                .open_datagram(DatagramSession::for_tun(
+                    "127.0.0.1:10001".parse().unwrap(),
+                    1500,
+                ))
+                .await
+                .unwrap();
+            let a: std::net::SocketAddr = "198.51.100.1:443".parse().unwrap();
+            let b: std::net::SocketAddr = "198.51.100.2:53".parse().unwrap();
+            let packet = |remote: std::net::SocketAddr, body: &'static [u8]| Datagram {
+                remote: Destination::Ip(remote),
+                payload: Bytes::from_static(body),
+                sniffed_domain: None,
+            };
+            first.send(packet(a, b"stale")).await.unwrap();
+            first.send(packet(b, b"sibling")).await.unwrap();
+            assert_eq!(opens(), (1, 1), "same-source targets share one wire");
+            second.send(packet(a, b"separate")).await.unwrap();
+            assert_eq!(opens(), (2, 2), "different sources keep independent wires");
+
+            let snapshot = serde_json::to_value(registry.snapshot()).unwrap();
+            let closed = snapshot["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| {
+                    entry["metadata"]["sourcePort"] == "10000"
+                        && entry["metadata"]["destinationIP"] == "198.51.100.1"
+                        && entry["metadata"]["destinationPort"] == "443"
+                })
+                .unwrap();
+            registry.close(closed["id"].as_str().unwrap());
+            first.send(packet(a, b"fresh")).await.unwrap();
+            assert_eq!(opens(), (3, 3), "recreated target needs a new wire");
+
+            // Both old replies remain queued: the retired wire must deliver
+            // its sibling's frame while isolating the closed target's reply.
+            let mut replies = std::collections::HashMap::new();
+            for _ in 0..2 {
+                let reply = first.receive().await.unwrap();
+                assert!(replies.insert(reply.remote, reply.payload).is_none());
+            }
+            assert_eq!(replies[&Destination::Ip(a)].as_ref(), b"fresh");
+            assert_eq!(replies[&Destination::Ip(b)].as_ref(), b"sibling");
+            let reply = second.receive().await.unwrap();
+            assert_eq!(reply.remote, Destination::Ip(a));
+            assert_eq!(reply.payload.as_ref(), b"separate");
+            first.close().await.unwrap();
+            second.close().await.unwrap();
+            assert!(
+                serde_json::to_value(registry.snapshot()).unwrap()["connections"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        })
+        .await
+        .expect("managed SOCKS memory IO must not wait on network or shutdown");
     }
 
     #[tokio::test]
