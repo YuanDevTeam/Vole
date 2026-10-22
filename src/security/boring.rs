@@ -263,7 +263,19 @@ impl BoringTlsClient {
         stream: BoxStream,
         buffer_limit: usize,
     ) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
-        let tls = self.handshake(stream).await?;
+        self.connect_negotiated_with_policy(stream, buffer_limit, false)
+            .await
+    }
+
+    pub(super) async fn connect_negotiated_with_policy(
+        &self,
+        stream: BoxStream,
+        buffer_limit: usize,
+        allow_missing_alpn: bool,
+    ) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
+        let tls = self
+            .handshake_configured_with_policy(stream, |_| Ok(()), allow_missing_alpn)
+            .await?;
         let alpn = tls.ssl().selected_alpn_protocol().map(<[u8]>::to_vec);
         Ok((Box::new(BoringStream::new(tls, buffer_limit)), alpn))
     }
@@ -290,6 +302,16 @@ impl BoringTlsClient {
         &self,
         stream: S,
         configure: impl FnOnce(&mut ConnectConfiguration) -> io::Result<()>,
+    ) -> io::Result<tokio_boring::SslStream<KeepOpen<S>>> {
+        self.handshake_configured_with_policy(stream, configure, false)
+            .await
+    }
+
+    async fn handshake_configured_with_policy<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: S,
+        configure: impl FnOnce(&mut ConnectConfiguration) -> io::Result<()>,
+        allow_missing_alpn: bool,
     ) -> io::Result<tokio_boring::SslStream<KeepOpen<S>>> {
         let mut config = self
             .connector
@@ -349,16 +371,11 @@ impl BoringTlsClient {
         if self.ech.is_some() && !tls.ssl().ech_accepted() {
             return Err(io::Error::other("TLS ECH was not accepted"));
         }
-        if self
-            .required_alpn
-            .as_deref()
-            .is_some_and(|required| tls.ssl().selected_alpn_protocol() != Some(required))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "TLS server did not negotiate the required ALPN",
-            ));
-        }
+        super::tls::validate_alpn(
+            self.required_alpn.as_deref(),
+            tls.ssl().selected_alpn_protocol(),
+            allow_missing_alpn,
+        )?;
         // The HTTP drivers use on-wire SETTINGS and do not import ALPS into
         // their initial state. Never silently accept nonempty peer settings.
         if tls

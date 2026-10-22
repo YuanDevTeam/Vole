@@ -169,7 +169,8 @@ HTTP CONNECT 本身不提供 UDP，也不接受 `udp` 字段。公共 smux 可�
 quic 缺省 false 使用 TLS + HTTP/2；true 使用 QUIC v1/TLS1.3 + HTTP/3，无 0-RTT。
 username/password 默认空字符串，始终发送 Basic 认证；不增加非空限制。
 SNI 缺省/空串使用 server，ALPN 缺省/空列表随模式使用 h2/h3，自定义列表必须包含该值，
-实际握手必须协商选定版本。两模式使用共享证书策略、mTLS 和 ECH。
+H3 实际握手必须协商 h3；H2 接受协商 h2，或在对端未返回 ALPN 时使用 H2 prior knowledge，
+兼容 Mihomo listener。明确协商其他协议仍拒绝，不回退 HTTP/1。两模式使用共享证书策略、mTLS 和 ECH。
 client-fingerprint 仅 H2 消费；H3 接受该字符串但不校验模板名、不应用 TCP ClientHello 模板。
 
 三项 max-connections/min-streams/max-streams 全为 0 才应用 8/5/0。

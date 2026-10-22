@@ -56,7 +56,9 @@ impl ConnectionFactory {
             .connect_server(session, &self.server, context)
             .await
             .map_err(io::Error::other)?;
-        self.tls.connect_with_context(raw.io, context).await
+        // Mihomo's listener accepts an H2 preface over authenticated TLS
+        // without selecting ALPN. An explicit different protocol still fails.
+        self.tls.connect_h2_prior_knowledge(raw.io, context).await
     }
     async fn connect_quic(
         &self,

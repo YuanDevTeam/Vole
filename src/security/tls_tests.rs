@@ -29,6 +29,10 @@ mod named_wire;
 #[path = "tls_quiche_tests.rs"]
 mod quiche;
 
+#[cfg(feature = "outbound-trusttunnel")]
+#[path = "trusttunnel_alpn_tests.rs"]
+mod trusttunnel_alpn_memory;
+
 struct Chain {
     certificates: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,

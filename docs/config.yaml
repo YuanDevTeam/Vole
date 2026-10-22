@@ -305,7 +305,8 @@ sniffer:
 # TrustTunnel 支持 H2/H3 CONNECT TCP/UDP，type: trusttunnel；username/password 默认空串，
 # 始终发送 Basic 认证，不要求非空。quic 默认 false（TLS+H2），true 使用 QUIC/TLS1.3+H3。
 # sni 缺省/空串使用 server；alpn 缺省/[] 随模式使用 [h2]/[h3]，自定义列表须包含该值，
-# 实际协商也必须匹配。两模式共享证书策略、mTLS、ech-opts；client-fingerprint 仅 H2 消费，
+# H3 实际协商必须为 h3；H2 接受 h2，或在认证后无 ALPN 时使用 H2 prior knowledge；明确协商其他协议拒绝。
+# 两模式共享证书策略、mTLS、ech-opts；client-fingerprint 仅 H2 消费，
 # H3 将该字符串视为 no-op，不校验模板名。H3 外层始终需要双向至少1200字节UDP路径。
 # 逻辑客户端池 max-connections/min-streams/max-streams 全为 0 时采用 8/5/0；
 # 优先复用流数最少的客户端，max-connections > 0 时，达到客户端数上限或

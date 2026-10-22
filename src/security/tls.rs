@@ -701,6 +701,25 @@ impl StandardTlsClient {
         self.resolved(context).await?.connect(stream).await
     }
 
+    #[cfg(feature = "outbound-trusttunnel")]
+    pub(crate) async fn connect_h2_prior_knowledge(
+        &self,
+        stream: BoxStream,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<BoxStream> {
+        if self.required_alpn.as_deref() != Some(b"h2") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "H2 prior knowledge requires an H2 TLS policy",
+            ));
+        }
+        self.resolved(context)
+            .await?
+            .connect_negotiated_inner(stream, true)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
     #[cfg(any(
         feature = "outbound-vless",
         feature = "outbound-hysteria2",
@@ -726,6 +745,14 @@ impl StandardTlsClient {
         &self,
         stream: BoxStream,
     ) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
+        self.connect_negotiated_inner(stream, false).await
+    }
+
+    async fn connect_negotiated_inner(
+        &self,
+        stream: BoxStream,
+        allow_missing_alpn: bool,
+    ) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
         if self.dynamic_ech.is_some() {
             return Err(io::Error::other(
                 "dynamic ECH requires a node resolution context",
@@ -736,7 +763,9 @@ impl StandardTlsClient {
             StandardConnector::Rustls(connector) => connector,
             #[cfg(feature = "tls-fingerprint")]
             StandardConnector::Boring(client) => {
-                return client.connect_negotiated(stream, self.buffer_limit).await;
+                return client
+                    .connect_negotiated_with_policy(stream, self.buffer_limit, allow_missing_alpn)
+                    .await;
             }
         };
         let server_name = ServerName::try_from(self.server_name.clone())
@@ -752,14 +781,11 @@ impl StandardTlsClient {
             return Err(io::Error::other("TLS ECH was not accepted"));
         }
 
-        if let Some(required_alpn) = self.required_alpn.as_deref()
-            && tls.get_ref().1.alpn_protocol() != Some(required_alpn)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "TLS server did not negotiate the required ALPN",
-            ));
-        }
+        validate_alpn(
+            self.required_alpn.as_deref(),
+            tls.get_ref().1.alpn_protocol(),
+            allow_missing_alpn,
+        )?;
 
         let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
         Ok((Box::new(super::stream::TlsStream::new(tls)), alpn))
@@ -811,6 +837,22 @@ impl StandardTlsClient {
     pub(super) const fn buffer_limit(&self) -> usize {
         self.buffer_limit
     }
+}
+
+pub(super) fn validate_alpn(
+    required: Option<&[u8]>,
+    negotiated: Option<&[u8]>,
+    allow_missing: bool,
+) -> io::Result<()> {
+    if required.is_some_and(|required| {
+        negotiated != Some(required) && !(allow_missing && negotiated.is_none())
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS server did not negotiate the required ALPN",
+        ));
+    }
+    Ok(())
 }
 
 fn io_other(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
