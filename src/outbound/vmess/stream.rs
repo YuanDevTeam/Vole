@@ -337,7 +337,7 @@ impl VmessStream {
             .await?
             .ok_or(io::ErrorKind::UnexpectedEof.into())
     }
-    fn poll_packet(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
+    pub(super) fn poll_packet(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
         let result = ready!(self.poll_packet_inner(cx));
         Poll::Ready(self.fail(result))
     }
@@ -516,6 +516,201 @@ mod tests {
                     .encode(&vec![0; WRITE_CHUNK + 1])
                     .is_err()
             );
+        }
+    }
+
+    #[derive(Default)]
+    struct ReceiveWake(std::sync::atomic::AtomicUsize);
+
+    impl futures_util::task::ArcWake for ReceiveWake {
+        fn wake_by_ref(owner: &std::sync::Arc<Self>) {
+            owner.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Default)]
+    struct ByteGate {
+        permit: std::sync::atomic::AtomicBool,
+        reader: std::sync::Mutex<Option<std::task::Waker>>,
+    }
+
+    struct OneByteStream {
+        bytes: Bytes,
+        gate: std::sync::Arc<ByteGate>,
+    }
+
+    impl AsyncRead for OneByteStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            destination: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.bytes.is_empty() || destination.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            *self.gate.reader.lock().unwrap() = Some(context.waker().clone());
+            if !self
+                .gate
+                .permit
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return Poll::Pending;
+            }
+            destination.put_slice(&self.bytes.split_to(1));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for OneByteStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn vmess_datagram_polled_receive_keeps_frames_across_byte_gates_and_waker_changes() {
+        use crate::{
+            dispatch::{DatagramBudget, DatagramTransport},
+            dns::resolution::ResolutionContext,
+            outbound::{
+                address::encode_packet_addr,
+                vmess::{VmessDatagram, VmessIdentity},
+            },
+            session::Destination,
+        };
+        use std::sync::{Arc, atomic::Ordering};
+
+        for cipher in [BodyCipher::Aes128Gcm, BodyCipher::Chacha20Poly1305] {
+            for padding in [false, true] {
+                for authenticated_length in [false, true] {
+                    for packetaddr in [false, true] {
+                        let targets = [
+                            Destination::Ip("192.0.2.1:53".parse().unwrap()),
+                            Destination::Ip(if packetaddr {
+                                "[2001:db8::2]:443".parse().unwrap()
+                            } else {
+                                "192.0.2.1:53".parse().unwrap()
+                            }),
+                        ];
+                        let mut encoder = codec(cipher, padding, authenticated_length);
+                        let mut wire = Vec::new();
+                        // A discarded oversize packet must consume its complete
+                        // record once, then deliver two distinct authenticated
+                        // records with their original addresses and payloads.
+                        for (target, payload) in [
+                            (&targets[0], &[0x5a; 32][..]),
+                            (&targets[0], b"one".as_slice()),
+                            (&targets[1], b"two".as_slice()),
+                        ] {
+                            let mut packet = BytesMut::new();
+                            if packetaddr {
+                                encode_packet_addr(target, &mut packet).unwrap();
+                            }
+                            packet.extend_from_slice(payload);
+                            wire.extend_from_slice(&encoder.encode(&packet).unwrap());
+                        }
+                        wire.extend_from_slice(&encoder.encode(&[]).unwrap());
+                        let poll_bound = wire.len() + 1;
+                        let gate = Arc::new(ByteGate::default());
+                        let handshake = ClientHandshake::new(
+                            &VmessIdentity::new(uuid::Uuid::from_bytes([7; 16])),
+                            Command::Udp,
+                            &targets[0],
+                            BodyOptions::new(cipher, padding, authenticated_length).unwrap(),
+                        )
+                        .unwrap();
+                        let mut stream = VmessStream::new(
+                            Box::new(OneByteStream {
+                                bytes: wire.into(),
+                                gate: gate.clone(),
+                            }),
+                            handshake,
+                        );
+                        // This seam begins after response authentication. The
+                        // existing official-response tests cover that header;
+                        // no replacement body parser or cipher is used here.
+                        stream.read = codec(cipher, padding, authenticated_length);
+                        stream.stage = ReadStage::Length;
+                        stream.handshake = None;
+                        let budget = DatagramBudget::new(128, 8);
+                        let mut transport = if packetaddr {
+                            VmessDatagram::packet_addr(stream, budget, ResolutionContext::default())
+                        } else {
+                            VmessDatagram::raw(stream, targets[0].clone(), budget)
+                        };
+                        assert!(transport.supports_poll_receive());
+                        let owners = [
+                            Arc::new(ReceiveWake::default()),
+                            Arc::new(ReceiveWake::default()),
+                        ];
+                        let wakes = owners
+                            .each_ref()
+                            .map(|owner| futures_util::task::waker(owner.clone()));
+                        let mut scratch = Vec::new();
+                        let mut step = 0;
+                        for expected in 0..3 {
+                            let result = loop {
+                                assert!(step < poll_bound, "byte-gated receive made no progress");
+                                let old = step % 2;
+                                let fresh = 1 - old;
+                                assert!(
+                                    transport
+                                        .poll_receive(
+                                            &mut Context::from_waker(&wakes[old]),
+                                            &mut scratch,
+                                        )
+                                        .is_pending()
+                                );
+                                assert!(
+                                    transport
+                                        .poll_receive(
+                                            &mut Context::from_waker(&wakes[fresh]),
+                                            &mut scratch,
+                                        )
+                                        .is_pending()
+                                );
+                                let count = owners[fresh].0.load(Ordering::Relaxed);
+                                gate.permit.store(true, Ordering::Release);
+                                gate.reader.lock().unwrap().take().unwrap().wake();
+                                assert_eq!(owners[fresh].0.load(Ordering::Relaxed), count + 1);
+                                step += 1;
+                                match transport.poll_receive(
+                                    &mut Context::from_waker(&wakes[fresh]),
+                                    &mut scratch,
+                                ) {
+                                    Poll::Pending => {}
+                                    Poll::Ready(result) => break result,
+                                }
+                            };
+                            if expected < 2 {
+                                let packet = result.unwrap();
+                                assert_eq!(packet.remote, targets[expected]);
+                                assert_eq!(
+                                    &packet.payload[..],
+                                    if expected == 0 { b"one" } else { b"two" }
+                                );
+                            } else {
+                                assert!(result.is_err(), "UDP EOF must not remain Pending");
+                            }
+                        }
+                        assert!(matches!(
+                            transport
+                                .poll_receive(&mut Context::from_waker(&wakes[0]), &mut scratch,),
+                            Poll::Ready(Err(_))
+                        ));
+                    }
+                }
+            }
         }
     }
 }
