@@ -350,6 +350,8 @@ impl VmessStream {
             }
             self.output.advance(n);
         }
+        // advance() keeps the allocation owner even when no bytes remain.
+        self.output = Bytes::new();
         Poll::Ready(Ok(()))
     }
     pub async fn send_packet(&mut self, payload: &[u8]) -> io::Result<()> {
@@ -454,6 +456,86 @@ mod tests {
             &[7; 16],
             [9; 16],
         )
+    }
+
+    #[tokio::test]
+    async fn drained_output_releases_owner_only_after_all_partial_writes_complete() {
+        use super::super::VmessIdentity;
+        use crate::session::Destination;
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::Duration,
+        };
+        use tokio::io::AsyncReadExt;
+
+        struct WireOwner {
+            wire: Box<[u8]>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl AsRef<[u8]> for WireOwner {
+            fn as_ref(&self) -> &[u8] {
+                &self.wire
+            }
+        }
+        impl Drop for WireOwner {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let (raw, mut peer) = tokio::io::duplex(3);
+        let handshake = ClientHandshake::new(
+            &VmessIdentity::new(uuid::Uuid::from_bytes([7; 16])),
+            Command::Udp,
+            &Destination::Ip("192.0.2.1:53".parse().unwrap()),
+            BodyOptions::new(BodyCipher::Aes128Gcm, false, false).unwrap(),
+        )
+        .unwrap();
+        let mut stream = VmessStream::new(Box::new(raw), handshake);
+        let expected = stream.write.encode(b"owned framed datagram").unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        // The stream holds the only reference to this real allocation owner.
+        // expected is a separate allocation and cannot hide premature release.
+        stream.output = Bytes::from_owner(WireOwner {
+            wire: expected.to_vec().into_boxed_slice(),
+            dropped: dropped.clone(),
+        });
+        let mut context = Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(stream.drain(&mut context).is_pending());
+        assert_eq!(stream.output.len(), expected.len() - 3);
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            0,
+            "a partial write must retain its unsubmitted bytes"
+        );
+
+        let mut received = vec![0; expected.len()];
+        let (drained, read) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                std::future::poll_fn(|context| stream.drain(context)),
+                peer.read_exact(&mut received),
+            )
+        })
+        .await
+        .unwrap();
+        drained.unwrap();
+        read.unwrap();
+        assert_eq!(received.as_slice(), expected.as_ref());
+        assert!(stream.output.is_empty());
+        // This fails on the old drain: len is zero, but Bytes still owns WireOwner.
+        // Keep the stream alive so destruction cannot make the assertion pass.
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "a completely drained frame must release its last output owner"
+        );
+        assert!(matches!(stream.drain(&mut context), Poll::Ready(Ok(()))));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        drop(stream);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 
     #[test]
