@@ -27,7 +27,7 @@ struct BodyCodec {
     iv: [u8; 16],
     length_iv: [u8; 16],
     body: aead::LessSafeKey,
-    length: aead::LessSafeKey,
+    length: Option<Box<aead::LessSafeKey>>,
     mask: shake::Shake128Reader,
     counter: u32,
     framed: bool,
@@ -45,13 +45,18 @@ impl BodyCodec {
     ) -> Self {
         let mut mask = Shake128::default();
         mask.update(&iv);
-        let length_key = kdf(request_key, &[b"auth_len"]);
+        // Most streams do not authenticate lengths. Keep that expanded key
+        // out of each direction's resident codec unless it is actually used.
+        let length = options.authenticated_length.then(|| {
+            let key = kdf(request_key, &[b"auth_len"]);
+            Box::new(aead_key(options.cipher, key[..16].try_into().unwrap()))
+        });
         Self {
             options,
             iv,
             length_iv: request_iv,
             body: aead_key(options.cipher, key),
-            length: aead_key(options.cipher, length_key[..16].try_into().unwrap()),
+            length,
             mask: mask.finalize_xof(),
             counter: 0,
             framed: options.cipher != BodyCipher::None || command == Command::Udp,
@@ -113,14 +118,9 @@ impl BodyCodec {
             seal(&self.body, self.nonce(&self.iv)?, &[], &mut body)?;
         }
         let mut length = (body.len() + padding) as u16;
-        let mut wire = if self.options.authenticated_length {
+        let mut wire = if let Some(key) = self.length.as_deref() {
             let mut encoded = (length - 16).to_be_bytes().to_vec();
-            seal(
-                &self.length,
-                self.nonce(&self.length_iv)?,
-                &[],
-                &mut encoded,
-            )?;
+            seal(key, self.nonce(&self.length_iv)?, &[], &mut encoded)?;
             encoded
         } else {
             if self.options.cipher != BodyCipher::None {
@@ -137,8 +137,8 @@ impl BodyCodec {
     }
     fn decode_length(&mut self, wire: &mut [u8]) -> io::Result<(usize, usize)> {
         let padding = self.padding();
-        let length = if self.options.authenticated_length {
-            let plain = open(&self.length, self.nonce(&self.length_iv)?, &[], wire)?;
+        let length = if let Some(key) = self.length.as_deref() {
+            let plain = open(key, self.nonce(&self.length_iv)?, &[], wire)?;
             usize::from(u16::from_be_bytes(plain.try_into().map_err(|_| error())?)) + 16
         } else {
             let mut length = u16::from_be_bytes(wire.try_into().map_err(|_| error())?);
