@@ -12,7 +12,7 @@ Keep all development plans in the workspace's `references/plan/` directory outsi
 
 Read the relevant document completely before changing that area:
 
-- Mihomo compatibility, protocol interoperability, or compatibility/performance tradeoffs: `docs/mihomo-compatibility.md`. Apply its compatibility principles to implementation, tests, and reviews.
+- Mihomo compatibility, protocol interoperability, or compatibility/performance tradeoffs: `docs/mihomo-compatibility.md`. Apply its compatibility principles to implementation, tests, and reviews. For performance or defect fixes, first compare local Mihomo, clash-rs and official client source, then profile the matched workload to locate the bottleneck, and only then change Vole. Distinguish Core, peer and benchmark causes; retain confirmed peer failures instead of changing Core for them. Shared-layer changes require explicit regressions of affected previously passing windows; historical PASS does not sign off changed code.
 - Invoke, FFI, lifecycle, Android protect, or config delivery: `docs/invoke-api.md`, `src/invoke/`, and `src/ffi/`.
 - YAML, proxy graph, proxy groups, DNS, rules, or sniffer: `docs/config.yaml`, `docs/tun-icmp-dns.md`, and `src/config/`.
 - HTTP/SOCKS5 inbound, authentication, or listeners: `docs/inbounds.md` and `src/inbound/`.
