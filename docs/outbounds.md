@@ -47,7 +47,9 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   域名的编码地址不能通过转换取得新的回环例外；UWP 物理绑定下同样拒绝编码地址转为回环。
   显式普通回环节点保留原行为；解析查询仍遵循 DNS 的既有 IPv6 开关，不为 IP4P 自动增加 AAAA 查询。
 - gRPC/legacy H2 首次读取延迟响应头时先检查原建链期限，即使响应已就绪也不能绕过
-  超时；响应头已确认后的业务读取不再受该期限限制。
+  超时；响应头已确认后的业务读取不再受该期限限制。VMess gRPC 由外层在原期限内
+  等待对端 H2 SETTINGS、提交并 flush 完整认证请求，此后允许 client-first 业务等待响应，
+  不再沿用该期限；未完成 H2 握手或请求提交时仍受原期限限制。
 - HTTP、SOCKS5、TUN、DNS 选路及 node-only `measureDelay` 使用同一连接器。
   普通协议节点的业务 UDP 默认为 false；收发预算分别逐层扣封装开销，超限不截断交付。
 - UDP 关联复用由共享路由层管理。DIRECT、Mieru、TrustTunnel、WireGuard 内层 UDP、

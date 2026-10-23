@@ -25,6 +25,10 @@ Windows的UWP/Wintun feature互斥，应明确选择后端，不使用`--all-fea
 
 ## 定向回归
 
+VMess gRPC 延迟响应（纯内存 H2 duplex）：启用 `cli,interop-test` 后运行
+`--test grpc_protocol_pool`。覆盖认证请求提交后跨越原建链期限的继续上传、
+未收到响应时的活动 Stop、对端自然退出和资源释放；不代替真实 TUN 验证。
+
 客户端凭据与输入（纯内存）：`config::tests::client_uuid_`、
 `config::vmess::cipher_compatibility_tests::`、`config::hysteria2::p08_tests::hopping_`。
 实际映射凭据、端口跳跃和各协议数据面由真实 TUN 另验收。

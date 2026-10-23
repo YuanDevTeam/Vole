@@ -23,6 +23,13 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 const MAX_IDLE_CONNECTIONS: usize = crate::limits::GRPC_IDLE_CONNECTIONS;
 const PING_TIMEOUT: Duration = Duration::from_secs(crate::limits::GRPC_PING_TIMEOUT_SECONDS as u64);
 
+#[derive(Clone, Copy)]
+pub(super) enum ResponsePolicy {
+    SetupDeadline,
+    #[cfg(feature = "outbound-vmess")]
+    ClientFirst,
+}
+
 enum RequestKind<'a> {
     Grpc(&'a str),
     #[cfg(feature = "outbound-trusttunnel")]
@@ -33,6 +40,7 @@ enum RequestKind<'a> {
 
 pub struct GrpcPool {
     options: GrpcOptions,
+    response_policy: ResponsePolicy,
     half_close: bool,
     empty_data: bool,
     connections: Arc<SyncMutex<Vec<Connection>>>,
@@ -46,6 +54,7 @@ impl GrpcPool {
     pub fn new(options: GrpcOptions) -> Self {
         Self {
             options,
+            response_policy: ResponsePolicy::SetupDeadline,
             half_close: false,
             empty_data: false,
             connections: Arc::default(),
@@ -55,6 +64,14 @@ impl GrpcPool {
             cancellation: CancellationToken::new(),
             tasks: TaskTracker::new(),
         }
+    }
+    /// VMess bounds complete authentication submission in the caller. Keep
+    /// that client-first response policy fixed across every pooled connection.
+    #[cfg(feature = "outbound-vmess")]
+    pub(crate) fn new_client_first(options: GrpcOptions) -> Self {
+        let mut pool = Self::new(options);
+        pool.response_policy = ResponsePolicy::ClientFirst;
+        pool
     }
     #[cfg(feature = "outbound-trusttunnel")]
     pub(crate) fn connect_client() -> Self {
@@ -189,6 +206,7 @@ impl GrpcPool {
                         &self.options.user_agent,
                         self.half_close,
                         deadline,
+                        self.response_policy,
                         lease,
                     )
                     .await
@@ -267,14 +285,22 @@ impl GrpcPool {
         };
         let last_read = Arc::new(SyncMutex::new(Instant::now()));
         let (raw, writes) = Writes::wrap(raw);
-        let (sender, mut connection) = h2::client::Builder::new()
+        let mut builder = h2::client::Builder::new();
+        builder
             .enable_push(false)
             .initial_window_size(super::STREAM_BUFFER_BYTES as u32)
             .initial_connection_window_size((2 * super::STREAM_BUFFER_BYTES) as u32)
             .max_frame_size(super::STREAM_CHUNK_BYTES as u32)
             .max_header_list_size(super::STREAM_CHUNK_BYTES as u32)
             .max_concurrent_streams(0)
-            .max_send_buffer_size(super::STREAM_CHUNK_BYTES)
+            .max_send_buffer_size(super::STREAM_CHUNK_BYTES);
+        #[cfg(feature = "outbound-vmess")]
+        if matches!(self.response_policy, ResponsePolicy::ClientFirst) {
+            // A queued request is not a completed H2 handshake. Keep auth
+            // flush pending until peer SETTINGS, under the caller's deadline.
+            builder.initial_max_send_streams(0);
+        }
+        let (sender, mut connection) = builder
             .handshake(ActivityIo {
                 raw: Box::new(raw),
                 last_read: last_read.clone(),

@@ -256,6 +256,7 @@ pub(super) async fn pooled_stream(
     user_agent: &str,
     half_close: bool,
     deadline: Instant,
+    policy: super::grpc_pool::ResponsePolicy,
     lease: super::grpc_pool::Lease,
 ) -> io::Result<BoxStream> {
     let request = http::Request::builder()
@@ -274,7 +275,7 @@ pub(super) async fn pooled_stream(
     let (response, send) = sender
         .send_request(request, false)
         .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
-    Ok(Box::new(Grpc::new(
+    let mut stream = Grpc::new(
         response,
         send,
         Framing::Gun,
@@ -284,7 +285,11 @@ pub(super) async fn pooled_stream(
         None,
         Some(lease),
         writes,
-    )))
+    );
+    // VMess bounds complete authentication submission in its outer setup
+    // operation. A pending response is then established client-first IO.
+    stream.response_deadline = matches!(policy, super::grpc_pool::ResponsePolicy::SetupDeadline);
+    Ok(Box::new(stream))
 }
 
 impl Drop for Grpc {

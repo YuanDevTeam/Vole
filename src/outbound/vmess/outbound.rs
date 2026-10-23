@@ -92,7 +92,9 @@ impl VmessOutbound {
             }),
             encoding: config.packet_encoding,
             grpc_pool: match &config.transport {
-                VmessTransport::Grpc { options, .. } => Some(GrpcPool::new(options.clone())),
+                VmessTransport::Grpc { options, .. } => {
+                    Some(GrpcPool::new_client_first(options.clone()))
+                }
                 _ => None,
             },
             cancellation: CancellationToken::new(),
