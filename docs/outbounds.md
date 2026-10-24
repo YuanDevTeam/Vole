@@ -57,7 +57,7 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   开启逐目标连接追踪时，仅同一来源、同一具体出站实例和同一资源代际的未改写 IP 目标共享；
   逐目标路由、统计、关闭、关联退役和旧回复隔离见[资源策略](runtime-resource-policy.md#udp)。
   域名、fake-IP 和需要地址还原的目标保持独立。VLESS/VMess raw 的首目标约束不变；
-  VMess 加密 packetaddr 也保持独立，避免聚合流量提前耗尽 16 位 body nonce，且不削弱 nonce 防重复检查。
+  VMess 加密 packetaddr 也保持独立，保持已有按目标独立的关联所有权；它不限制单条关联的记录数量。
   Gecko 等固定对端的底层适配也不因此获得多目标能力，外层业务关联按自身能力处理。
   每层明确声明共享能力，透明包装传递底层声明，不根据外层协议或字段推断其内部载体可共享。
 - 所有普通节点都可启用公共 `smux` 包装，使用节点自己的正常 TCP 传输与独立 mux 池，
@@ -431,8 +431,12 @@ UDP body 最多 15,000 字节；packetaddr 另扣 IPv4 7 / IPv6 19 字节，未�
 预检；超限一字节即写前失败，不拆业务包。对端可能更小，V2Ray 部分返回路径总缓冲
 仅 2048 字节，不能当作 Vole 上限。body wire 解析最多 16 KiB，响应头/XUDP 元数据有界。
 三种 UDP 编码均不接受零长度业务包；HTTPUpgrade 不改变这个边界。
-TCP 写块最多 4 KiB 以适配 Mihomo 拷贝边界；UDP 不按此切块。16 位帧计数耗尽前关闭，
-不重复 nonce。raw/packetaddr 半帧发送取消关闭；XUDP 保留一个待写帧并在下次收发时完成，
+TCP 写块最多 4 KiB 以适配 Mihomo 拷贝边界；UDP 不按此切块。
+AES/ChaCha body 的收发记录计数各自按 16 位回绕，与 Mihomo/sing-vmess 和 V2Ray-core
+一致；跨越 65,536 条记录时不额外断开、重连、重放或更换 cipher。长度认证沿用同一记录索引。
+该协议行为会在同一密钥下重复 nonce，不提供回绕后的 nonce 唯一性保证；外层 TLS 不更新
+内层 body 密钥。认证标签、长度、地址及其它解析错误仍失败关闭。
+raw/packetaddr 半帧发送取消关闭；XUDP 保留一个待写帧并在下次收发时完成，
 遵循[VLESS 的 XUDP 取消边界](vless.md#udp)。接收取消保留进度；认证/地址/标签错误使关联失效。
 gRPC 池与 legacy H2 driver 由节点拥有并同步退出，无全局会话额度或历史表。
 

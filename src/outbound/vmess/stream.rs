@@ -29,7 +29,7 @@ struct BodyCodec {
     body: aead::LessSafeKey,
     length: Option<Box<aead::LessSafeKey>>,
     mask: shake::Shake128Reader,
-    counter: u32,
+    counter: u16,
     framed: bool,
     write_limit: usize,
 }
@@ -81,14 +81,12 @@ impl BodyCodec {
             2
         }
     }
-    fn nonce(&self, iv: &[u8; 16]) -> io::Result<[u8; 12]> {
-        // The wire counter is only 16 bits. Never reuse a nonce under the same
-        // key: an exhausted encrypted session must be re-established by caller.
-        let counter = u16::try_from(self.counter)
-            .map_err(|_| io::Error::other("VMess nonce sequence exhausted"))?;
+    fn nonce(&self, iv: &[u8; 16]) -> [u8; 12] {
+        // Match Mihomo/sing-vmess and V2Ray's 16-bit wire counter. VMess
+        // does not negotiate a larger counter or rekey at the wrap boundary.
         let mut nonce: [u8; 12] = iv[..12].try_into().unwrap();
-        nonce[..2].copy_from_slice(&counter.to_be_bytes());
-        Ok(nonce)
+        nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
+        nonce
     }
     fn next_mask(&mut self) -> u16 {
         let mut bytes = [0; 2];
@@ -115,12 +113,12 @@ impl BodyCodec {
         let padding = self.padding();
         let mut body = plain.to_vec();
         if self.overhead() != 0 {
-            seal(&self.body, self.nonce(&self.iv)?, &[], &mut body)?;
+            seal(&self.body, self.nonce(&self.iv), &[], &mut body)?;
         }
         let mut length = (body.len() + padding) as u16;
         let mut wire = if let Some(key) = self.length.as_deref() {
             let mut encoded = (length - 16).to_be_bytes().to_vec();
-            seal(key, self.nonce(&self.length_iv)?, &[], &mut encoded)?;
+            seal(key, self.nonce(&self.length_iv), &[], &mut encoded)?;
             encoded
         } else {
             if self.options.cipher != BodyCipher::None {
@@ -132,13 +130,13 @@ impl BodyCodec {
         let start = wire.len();
         wire.resize(start + padding, 0);
         random(&mut wire[start..])?;
-        self.counter += 1;
+        self.counter = self.counter.wrapping_add(1);
         Ok(wire.into())
     }
     fn decode_length(&mut self, wire: &mut [u8]) -> io::Result<(usize, usize)> {
         let padding = self.padding();
         let length = if let Some(key) = self.length.as_deref() {
-            let plain = open(key, self.nonce(&self.length_iv)?, &[], wire)?;
+            let plain = open(key, self.nonce(&self.length_iv), &[], wire)?;
             usize::from(u16::from_be_bytes(plain.try_into().map_err(|_| error())?)) + 16
         } else {
             let mut length = u16::from_be_bytes(wire.try_into().map_err(|_| error())?);
@@ -155,10 +153,10 @@ impl BodyCodec {
     fn decode_body(&mut self, mut wire: BytesMut, padding: usize) -> io::Result<Bytes> {
         wire.truncate(wire.len().checked_sub(padding).ok_or_else(error)?);
         if self.overhead() != 0 {
-            let length = open(&self.body, self.nonce(&self.iv)?, &[], &mut wire)?.len();
+            let length = open(&self.body, self.nonce(&self.iv), &[], &mut wire)?.len();
             wire.truncate(length);
         }
-        self.counter += 1;
+        self.counter = self.counter.wrapping_add(1);
         Ok(wire.freeze())
     }
 }
@@ -564,12 +562,10 @@ mod tests {
     }
 
     #[test]
-    fn tags_lengths_and_nonce_exhaustion_fail_closed() {
+    fn tags_and_lengths_fail_closed() {
         #[cfg(feature = "interop-test")]
-        let _evidence = crate::resources::case_events::Case::new(
-            "VMESS-CODEC",
-            "tags_lengths_and_nonce_exhaustion_fail_closed",
-        );
+        let _evidence =
+            crate::resources::case_events::Case::new("VMESS-CODEC", "tags_and_lengths_fail_closed");
         for cipher in [BodyCipher::Aes128Gcm, BodyCipher::Chacha20Poly1305] {
             let mut tx = codec(cipher, false, true);
             let wire = tx.encode(b"synthetic-payload").unwrap();
@@ -585,10 +581,6 @@ mod tests {
                     assert!(rx.decode_body(tampered, padding).is_err());
                 }
             }
-            let mut tx = codec(cipher, false, false);
-            tx.counter = u32::from(u16::MAX);
-            assert!(tx.encode(b"last-nonce").is_ok());
-            assert!(tx.encode(b"must-not-repeat").is_err());
             let mut rx = codec(cipher, false, false);
             let mask = rx.next_mask();
             let mut rx = codec(cipher, false, false);
@@ -598,6 +590,94 @@ mod tests {
                     .encode(&vec![0; WRITE_CHUNK + 1])
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn encrypted_records_continue_across_the_official_counter_wrap() {
+        for cipher in [BodyCipher::Aes128Gcm, BodyCipher::Chacha20Poly1305] {
+            for padding in [false, true] {
+                for authenticated_length in [false, true] {
+                    let mut tx = codec(cipher, padding, authenticated_length);
+                    let mut rx = codec(cipher, padding, authenticated_length);
+                    for record in 0..65538u32 {
+                        let payload = record.to_be_bytes();
+                        let mut wire = BytesMut::from(tx.encode(&payload).unwrap().as_ref());
+                        let mut header = wire.split_to(rx.length_size());
+                        let (length, pad) = rx.decode_length(&mut header).unwrap();
+                        assert_eq!(wire.len(), length);
+                        assert_eq!(rx.decode_body(wire, pad).unwrap().as_ref(), payload);
+                    }
+                    assert_eq!(u32::from(tx.counter), 2);
+                    assert_eq!(u32::from(rx.counter), 2);
+                    let mut eof = BytesMut::from(tx.encode(&[]).unwrap().as_ref());
+                    let mut header = eof.split_to(rx.length_size());
+                    let (_, pad) = rx.decode_length(&mut header).unwrap();
+                    assert!(rx.decode_body(eof, pad).unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_receives_the_wrapped_peer_record_and_closes_normally() {
+        use super::super::VmessIdentity;
+        use crate::session::Destination;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for cipher in [BodyCipher::Aes128Gcm, BodyCipher::Chacha20Poly1305] {
+            for padding in [false, true] {
+                for authenticated_length in [false, true] {
+                    let handshake = ClientHandshake::new(
+                        &VmessIdentity::new(uuid::Uuid::from_bytes([7; 16])),
+                        Command::Tcp,
+                        &Destination::Ip("192.0.2.1:443".parse().unwrap()),
+                        BodyOptions::new(cipher, padding, authenticated_length).unwrap(),
+                    )
+                    .unwrap();
+                    let (raw, mut peer) = tokio::io::duplex(4096);
+                    let mut stream = VmessStream::new(Box::new(raw), handshake).with_whole_close();
+                    // Post-response-authentication seam, with the production
+                    // parser/AEAD and the final pre-wrap record still intact.
+                    stream.read = codec(cipher, padding, authenticated_length);
+                    stream.read.counter = u16::MAX.into();
+                    stream.stage = ReadStage::Length;
+                    stream.handshake = None;
+                    let mut encoder = codec(cipher, padding, authenticated_length);
+                    encoder.counter = u16::MAX.into();
+                    peer.write_all(&encoder.encode(b"before wrap").unwrap())
+                        .await
+                        .unwrap();
+                    let mut before = [0; 11];
+                    stream.read_exact(&mut before).await.unwrap();
+                    assert_eq!(&before, b"before wrap");
+
+                    // Model the official peer's uint16 counter explicitly,
+                    // independently of the receiver's boundary handling.
+                    encoder.counter = 0;
+                    peer.write_all(&encoder.encode(b"after wrap").unwrap())
+                        .await
+                        .unwrap();
+                    let mut after = [0; 10];
+                    stream.read_exact(&mut after).await.unwrap();
+                    assert_eq!(&after, b"after wrap");
+                    assert_eq!(u32::from(stream.read.counter), 1);
+                    peer.write_all(&encoder.encode(&[]).unwrap()).await.unwrap();
+                    assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+                    stream.shutdown().await.unwrap();
+                    assert!(stream.io.is_none());
+                    assert_eq!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            peer.read(&mut [0; 1]),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                        0
+                    );
+                }
+            }
         }
     }
 

@@ -61,8 +61,6 @@ impl VmessDatagram {
 #[async_trait]
 impl DatagramTransport for VmessDatagram {
     fn supports_shared_destinations(&self) -> bool {
-        // Aggregating encrypted bodies exhausts the 16-bit nonce sequence
-        // sooner; no transparent UDP association migration is available.
         matches!(self.encoding, Encoding::PacketAddr(_))
             && self
                 .stream
