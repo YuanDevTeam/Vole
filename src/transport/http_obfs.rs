@@ -106,11 +106,11 @@ pub async fn http_obfs(
     .await
     .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
     let (mut reader, writer) = tokio::io::split(stream);
+    // The complete request prefix was submitted within the setup deadline.
+    // An official peer can wait for application output before its first reply.
     // No task or socket: the caller's first read drives the response header.
     let response = Box::pin(async move {
-        let (_, tail) = timeout_at(deadline, read_response(&mut reader))
-            .await
-            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        let (_, tail) = read_response(&mut reader).await?;
         Ok((reader, Bytes::from(tail)))
     });
     Ok(Box::new(HttpStream {

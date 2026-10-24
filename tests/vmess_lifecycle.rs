@@ -78,7 +78,10 @@ async fn vmess_all_handshakes_keep_the_original_deadline_and_join_cancelled_io()
         let ProxyProtocol::Vmess(node) = &parsed.proxies[0].protocol else {
             unreachable!()
         };
-        let (io, mut peer) = tokio::io::duplex(65536);
+        // HTTP's request prefix stays unsubmitted. The other transports still
+        // reach their original handshake-response or HTTP/2 SETTINGS wait.
+        let capacity = if mode == "http" { 1 } else { 65536 };
+        let (io, mut peer) = tokio::io::duplex(capacity);
         let outbound = VmessOutbound::new_with_path(
             node,
             UpstreamPath::proxy(Arc::new(SuppliedStream {
@@ -105,20 +108,18 @@ async fn vmess_all_handshakes_keep_the_original_deadline_and_join_cancelled_io()
                 assert!(connected.io.read(&mut [0; 1]).await.is_err());
             }
         };
-        tokio::time::timeout(Duration::from_millis(325), task)
-            .await
-            .expect("consumer reset the original deadline");
-        assert!(start.elapsed() >= Duration::from_millis(240));
-        tokio::time::timeout(Duration::from_secs(1), outbound.shutdown())
-            .await
-            .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(325), task).await;
+        let elapsed = start.elapsed();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), outbound.shutdown()).await;
         let mut observed = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut observed))
-            .await
-            .unwrap()
-            .unwrap();
+        let joined =
+            tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut observed)).await;
+        stopped.expect("Core Stop did not join");
+        joined.expect("memory peer did not finish").unwrap();
+        result.expect("consumer reset the original deadline");
+        assert!(elapsed >= Duration::from_millis(240));
         assert!(!observed.is_empty());
-        assert!(observed.len() <= 65536);
+        assert!(observed.len() <= capacity);
     }
 }
 

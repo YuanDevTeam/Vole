@@ -413,6 +413,8 @@ TLS 支持独立的 `name-cert-verify` 和成对内联 PEM 或文件路径 `cert
 - http 是 TCP 首包伪装：method 默认 GET，path 列表省略/空为 /，按 URL.Path 转义；
   头为字符串列表，每次握手独立选择路径/头值，Host 默认物理 server authority。
   仅首包封装一次，之后恢复原流；禁止 Content-Length/Transfer-Encoding。
+  完整 HTTP 首请求与认证前导写入、flush 沿用原建链期限；成功提交后，首个 HTTP
+  响应可等待业务下行，不再继承旧建链期限。头解析上限、取消和整流关闭保持。
 - h2 的 authority 列表省略/空时使用 www.example.com，path 省略/空时为 /，每流选一个 authority，通过 HTTP/2 PUT body
   双向传输；明文 prior knowledge、TLS h2，无 gRPC 帧。
 

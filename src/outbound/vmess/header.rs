@@ -492,6 +492,180 @@ mod delayed_response_memory_tests {
         assert!(!remaining_upload.is_empty());
     }
 
+    async fn expect_committed_http_request(peer: &mut tokio::io::DuplexStream, request: &[u8]) {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(peer.read_u8().await.unwrap());
+        }
+        assert!(
+            String::from_utf8(head)
+                .unwrap()
+                .contains(&format!("content-length: {}\r\n", request.len()))
+        );
+        let mut prefix = vec![0; request.len()];
+        peer.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(prefix, request);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn vmess_committed_http_request_accepts_official_response_after_setup_deadline() {
+        use crate::transport::{HttpObfsOptions, http_obfs};
+        use std::task::Poll;
+        use tokio::time::{Duration, Instant};
+
+        let (handshake, vector) = fixture();
+        let (raw, mut peer) = tokio::io::duplex(4096);
+        let options = HttpObfsOptions::new(
+            http::Method::GET,
+            "http://fixture.invalid/cover",
+            Default::default(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let transport = http_obfs(Box::new(raw), &options, handshake.request(), deadline)
+            .await
+            .unwrap();
+
+        // Observe the real HTTP header and complete authenticated request before
+        // advancing the clock. An unread or partial request is not this case.
+        expect_committed_http_request(&mut peer, &vector.request).await;
+
+        let stream = VmessStream::new(transport, handshake).with_whole_close();
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let before = b"upload before delayed HTTP response";
+        writer.write_all(before).await.unwrap();
+        writer.flush().await.unwrap();
+        // The fixture is AES-GCM, without padding or authenticated lengths:
+        // consume its actual two-byte length and tag-bearing encoded record.
+        let mut uploaded = vec![0; before.len() + 2 + 16];
+        peer.read_exact(&mut uploaded).await.unwrap();
+
+        let mut reply = vec![0; vector.payload.len()];
+        let mut pending = Box::pin(reader.read_exact(&mut reply));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let after_deadline = futures_util::poll!(pending.as_mut());
+        let remained_pending = after_deadline.is_pending();
+        let result = match after_deadline {
+            Poll::Ready(result) => result,
+            Poll::Pending => {
+                let after = b"upload continues after setup deadline";
+                writer.write_all(after).await.unwrap();
+                writer.flush().await.unwrap();
+                uploaded.resize(after.len() + 2 + 16, 0);
+                peer.read_exact(&mut uploaded).await.unwrap();
+                peer.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n",
+                )
+                .await
+                .unwrap();
+                peer.write_all(&vector.response).await.unwrap();
+                pending.as_mut().await
+            }
+        };
+        drop(pending);
+
+        // Clean up both outcomes before asserting the regression. Old code
+        // must report TimedOut here, rather than hanging the fixture or relying
+        // on a task abort to make its peer disappear.
+        let closed = writer.shutdown().await;
+        drop(reader);
+        drop(writer);
+        let mut byte = [0; 1];
+        let peer_eof = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer_eof, 0);
+        assert!(
+            remained_pending,
+            "committed HTTP request expired before the peer's first response: {:?}",
+            result.as_ref().err().map(std::io::Error::kind)
+        );
+        result.unwrap();
+        assert_eq!(reply, vector.payload);
+        closed.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn vmess_committed_http_response_wait_is_cancelled_by_node_stop() {
+        use crate::{
+            outbound::owned_stream::OwnedStream,
+            transport::{HttpObfsOptions, http_obfs},
+        };
+        use std::{
+            future::Future,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::{Context, Wake, Waker},
+        };
+        use tokio::time::{Duration, Instant};
+        use tokio_util::sync::CancellationToken;
+
+        #[derive(Default)]
+        struct ReaderWake(AtomicUsize);
+        impl Wake for ReaderWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (handshake, vector) = fixture();
+        let (raw, mut peer) = tokio::io::duplex(4096);
+        let node = CancellationToken::new();
+        let owned = OwnedStream::new(Box::new(raw), node.clone());
+        let options = HttpObfsOptions::new(
+            http::Method::GET,
+            "http://fixture.invalid/cover",
+            Default::default(),
+        )
+        .unwrap();
+        let transport = http_obfs(
+            Box::new(owned),
+            &options,
+            handshake.request(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        expect_committed_http_request(&mut peer, &vector.request).await;
+        let mut stream = VmessStream::new(transport, handshake).with_whole_close();
+        let mut pending = Box::pin(stream.read_u8());
+        let reader_wake = Arc::new(ReaderWake::default());
+        let waker = Waker::from(reader_wake.clone());
+        let mut context = Context::from_waker(&waker);
+        assert!(pending.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let waiting = pending.as_mut().poll(&mut context).is_pending();
+        reader_wake.0.store(0, Ordering::SeqCst);
+        node.cancel();
+        let reader_woken = reader_wake.0.load(Ordering::SeqCst) > 0;
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), pending.as_mut()).await;
+        drop(pending);
+        // Verify cancellation released the physical IO while its outer
+        // VmessStream remains alive; dropping it must not create this EOF.
+        let peer_eof = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut [0; 1])).await;
+        drop(stream);
+        assert_eq!(peer_eof.unwrap().unwrap(), 0);
+        assert!(
+            reader_woken,
+            "node Stop did not wake the pending HTTP reader"
+        );
+        assert!(
+            waiting,
+            "committed response wait still used the setup deadline"
+        );
+        assert_eq!(
+            cancelled.unwrap().unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn vmess_delayed_official_response_still_authenticates_before_delivery() {
         let (handshake, mut vector) = fixture();

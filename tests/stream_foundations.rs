@@ -352,8 +352,10 @@ async fn stalled_handshake(kind: &str, raw: Observed, deadline: Instant) -> io::
                 "http://fixture.invalid/",
                 Default::default(),
             )?;
+            // This fixture tests incomplete request submission, not a valid
+            // one-way upload whose first HTTP response legitimately arrives late.
             let mut stream =
-                vole::transport::http_obfs(Box::new(raw), &options, &[], deadline).await?;
+                vole::transport::http_obfs(Box::new(raw), &options, &[0; 4096], deadline).await?;
             stream.read_u8().await?;
         }
         _ => unreachable!(),
@@ -376,7 +378,13 @@ async fn setup_deadline_releases_supplied_io_in_stream_adapters() {
             shutdown: Arc::new(AtomicBool::new(false)),
             dropped: dropped.clone(),
         };
+        let (release, released) = tokio::sync::oneshot::channel();
         let peer = tokio::spawn(async move {
+            if kind == "http" {
+                // Hold the bounded pipe full until setup expires, then drain
+                // naturally to EOF so deadline ownership remains observable.
+                released.await.unwrap();
+            }
             let mut sink = Vec::new();
             incoming.read_to_end(&mut sink).await.unwrap();
             assert!(sink.len() < 4096);
@@ -387,6 +395,7 @@ async fn setup_deadline_releases_supplied_io_in_stream_adapters() {
         )
         .await
         .unwrap();
+        let _ = release.send(());
         assert_eq!(
             result.unwrap_err().kind(),
             io::ErrorKind::TimedOut,
