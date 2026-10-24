@@ -202,8 +202,25 @@ fn quic_fields_consume_defaults_and_reversed_fixed_windows() {
     assert_eq!(
         defaults.connection_window,
         QuicReceiveWindow {
-            initial: 64 * 1024 * 1024 / 10,
+            initial: 4 * 1024 * 1024,
             maximum: 64 * 1024 * 1024
+        }
+    );
+    let mut zero = node();
+    zero["recv-window-conn"] = json!(0);
+    zero["recv-window"] = json!(0);
+    let zero = extract(zero);
+    assert_eq!(zero.stream_window, defaults.stream_window);
+    assert_eq!(zero.connection_window, defaults.connection_window);
+    let mut larger = node();
+    larger["recv-window"] = json!(8 * 1024 * 1024);
+    let larger = extract(larger);
+    assert_eq!(larger.stream_window, defaults.stream_window);
+    assert_eq!(
+        larger.connection_window,
+        QuicReceiveWindow {
+            initial: 8 * 1024 * 1024,
+            maximum: 8 * 1024 * 1024
         }
     );
     assert_eq!(defaults.max_open_streams, 89);

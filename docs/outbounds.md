@@ -568,8 +568,9 @@ TCP shutdown 立即完成逻辑关闭，发送所有权保留到 FIN/数据确�
 `ip` 覆盖物理拨号地址，逻辑 server/SNI 保留。heartbeat-interval 单位毫秒，<=0 回落
 10000，同时控制 QUIC keepalive 与实际 v5 HEARTBEAT，两种 UDP relay 模式均用 DATAGRAM。
 recv-window-conn 实际为 stream，recv-window 实际为 connection；正值同时设 initial/max，
-零值分别按 15 MiB/10、64 MiB/10 初值与 15 MiB、64 MiB 最大值归一化，
-随后采用上述 Middle 策略，默认实际为固定 stream 4 MiB / connection 6.4 MiB。
+缺省或零值分别按 15 MiB/10、4 MiB 初值与 15 MiB、64 MiB 最大值归一化，
+随后采用上述 Middle 策略，默认实际为固定 stream 4 MiB / connection 4 MiB。
+窗口是信用额度，不预分配全部缓冲；显式正值不按默认窗口钳位。
 
 max-open-streams 控制客户端 TCP/UDP 所有者池，不扩大 Quinn 内部远端 stream 表；
 远端双向流信用固定为 0，单向流为 32。0 使用100；参考客户端100阈值转换90，入池计数必须严格小于阈值，所以

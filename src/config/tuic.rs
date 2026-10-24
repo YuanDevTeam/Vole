@@ -187,7 +187,7 @@ impl RawTuic {
                 self.recv_window,
                 self.recv_window,
                 super::QuicReceiveWindow {
-                    initial: 64 * 1024 * 1024 / 10,
+                    initial: 4 * 1024 * 1024,
                     maximum: 64 * 1024 * 1024,
                 },
             )?,

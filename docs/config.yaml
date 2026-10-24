@@ -433,8 +433,9 @@ proxies:
     udp-relay-mode: native # native（默认）/quic
     # ip: 192.0.2.1 # 仅覆盖物理入口，server/SNI 保留
     # heartbeat-interval: 10000 # 毫秒；<=0 回落 10000，同时控制 keepalive/HEARTBEAT
-    # recv-window-conn: 0 # 实际为 stream 窗口：0 初始 1.5MiB/上限15MiB；正数固定
-    # recv-window: 0 # 实际为 connection 窗口：0 初始6.4MiB/上限64MiB；正数固定
+    # recv-window-conn: 0 # 实际为 stream 窗口：缺省/0 初始1.5MiB/上限15MiB；正数固定
+    # recv-window: 0 # 实际为 connection 窗口：缺省/0 初始4MiB/上限64MiB；正数固定
+    # 固定 Middle 策略下，缺省实际 stream/connection 均为4MiB，不预分配全部信用。
     # max-open-streams: 100 # 0 同默认；参考阈值100=>90，实际同时所有者默认89，正N!=100为N-1
     # max-udp-relay-packet-size: 1252 # 仅在缺省 frame 上限时用于计算 frame=该值+29
     # max-datagram-frame-size: 1281 # 完整 QUIC DATAGRAM frame，参考限制到1400；与累计256KiB缓冲独立
