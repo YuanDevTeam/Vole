@@ -369,7 +369,7 @@ mod datagram_memory_tests {
                 let (mut client, mut peer, _) = fixture_with_cipher(1, packetaddr, cipher);
                 assert_eq!(
                     client.supports_shared_destinations(),
-                    packetaddr && cipher == BodyCipher::None,
+                    packetaddr,
                     "packetaddr={packetaddr}, cipher={cipher:?}",
                 );
                 {

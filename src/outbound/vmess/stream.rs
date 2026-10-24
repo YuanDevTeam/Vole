@@ -219,10 +219,6 @@ impl VmessStream {
             reader: futures_util::task::AtomicWaker::new(),
         }
     }
-    pub(super) fn uses_body_nonce(&self) -> bool {
-        self.write.options.cipher != BodyCipher::None
-    }
-
     /// Mihomo falls back to whole-connection Close for gRPC, HTTP camouflage
     /// and legacy H2. TCP/ordinary WS keep the underlying CloseWrite behavior.
     pub fn with_whole_close(mut self) -> Self {
@@ -454,6 +450,98 @@ mod tests {
             &[7; 16],
             [9; 16],
         )
+    }
+
+    #[tokio::test]
+    async fn encrypted_packetaddr_preserves_targets_and_reply_sources_on_one_wire() {
+        use super::super::{VmessDatagram, VmessIdentity};
+        use crate::{
+            dispatch::{DatagramBudget, DatagramTransport},
+            dns::resolution::ResolutionContext,
+            outbound::address::{decode_packet_addr, encode_packet_addr},
+            session::{Datagram, Destination},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut capabilities = Vec::new();
+        for cipher in [BodyCipher::Aes128Gcm, BodyCipher::Chacha20Poly1305] {
+            let targets = [
+                Destination::Ip("192.0.2.1:53".parse().unwrap()),
+                Destination::Ip("[2001:db8::2]:443".parse().unwrap()),
+            ];
+            let handshake = ClientHandshake::new(
+                &VmessIdentity::new(uuid::Uuid::from_bytes([7; 16])),
+                Command::Udp,
+                &Destination::domain("sp.packet-addr.v2fly.arpa", 443).unwrap(),
+                BodyOptions::new(cipher, false, false).unwrap(),
+            )
+            .unwrap();
+            let (raw, mut peer) = tokio::io::duplex(4096);
+            let mut stream = VmessStream::new(Box::new(raw), handshake);
+            // Existing post-response-authentication seam; actual frame parsing,
+            // AEAD, packetaddr encoding and per-packet source delivery remain.
+            stream.read = codec(cipher, false, false);
+            stream.write = codec(cipher, false, false);
+            stream.stage = ReadStage::Length;
+            stream.handshake = None;
+            let mut transport = VmessDatagram::packet_addr(
+                stream,
+                DatagramBudget::new(128, 128),
+                ResolutionContext::default(),
+            );
+            let shareable = transport.supports_shared_destinations();
+            let mut decoder = codec(cipher, false, false);
+            let mut received = Vec::new();
+            for (index, target) in targets.iter().enumerate() {
+                transport
+                    .send(Datagram {
+                        remote: target.clone(),
+                        payload: Bytes::from(vec![b'a' + u8::try_from(index).unwrap(); 3]),
+                        sniffed_domain: None,
+                    })
+                    .await
+                    .unwrap();
+                let mut header = [0; 2];
+                peer.read_exact(&mut header).await.unwrap();
+                let (length, padding) = decoder.decode_length(&mut header).unwrap();
+                let mut wire = BytesMut::new();
+                wire.resize(length, 0);
+                peer.read_exact(&mut wire).await.unwrap();
+                let plain = decoder.decode_body(wire, padding).unwrap();
+                let (target, offset) = decode_packet_addr(&plain).unwrap();
+                received.push((target, plain.slice(offset..)));
+            }
+            let mut encoder = codec(cipher, false, false);
+            for (index, target) in targets.iter().enumerate().rev() {
+                let mut plain = BytesMut::new();
+                encode_packet_addr(target, &mut plain).unwrap();
+                plain.extend_from_slice(if index == 0 { b"first" } else { b"second" });
+                peer.write_all(&encoder.encode(&plain).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let replies = [
+                transport.receive().await.unwrap(),
+                transport.receive().await.unwrap(),
+            ];
+            transport.close().await.unwrap();
+            let closed = peer.read(&mut [0; 1]).await.unwrap();
+            assert_eq!(received[0].0, targets[0]);
+            assert_eq!(received[0].1.as_ref(), b"aaa");
+            assert_eq!(received[1].0, targets[1]);
+            assert_eq!(received[1].1.as_ref(), b"bbb");
+            assert_eq!(replies[0].remote, targets[1]);
+            assert_eq!(replies[0].payload.as_ref(), b"second");
+            assert_eq!(replies[1].remote, targets[0]);
+            assert_eq!(replies[1].payload.as_ref(), b"first");
+            assert_eq!(closed, 0);
+            assert!(!transport.supports_shared_destinations());
+            capabilities.push((cipher, shareable));
+        }
+        assert!(
+            capabilities.iter().all(|(_, shareable)| *shareable),
+            "encrypted packetaddr must expose its multi-target wire: {capabilities:?}",
+        );
     }
 
     #[tokio::test]

@@ -61,11 +61,7 @@ impl VmessDatagram {
 #[async_trait]
 impl DatagramTransport for VmessDatagram {
     fn supports_shared_destinations(&self) -> bool {
-        matches!(self.encoding, Encoding::PacketAddr(_))
-            && self
-                .stream
-                .as_ref()
-                .is_some_and(|stream| !stream.uses_body_nonce())
+        matches!(self.encoding, Encoding::PacketAddr(_)) && self.stream.is_some()
     }
 
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {

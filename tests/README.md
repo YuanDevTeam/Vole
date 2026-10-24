@@ -146,7 +146,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | UDP 共享与隔离 | `managed_udp_connections_`、`fake_ip_routing_preserves_tcp_names_and_distinct_udp_reply_addresses`、`quic_override_resolves_new_domain_and_restores_udp_response_target` | 同源多目标、固定目标、逐目标关闭与旧回复隔离，支持共享的底层仍保留 Fake-IP/嗅探还原隔离 |
 | TUN 响应背压 | `tun_runtime::tests::backpressured_udp_response_handoff` | 满队列下每源至多暂持一包、双向推进及取消 |
 | UoT | `outbound::uot::tests::` | 半帧取消后继续、v2首部、原期限、单槽响应与Stop |
-| VMess 响应边界 | `outbound::vmess::header::delayed_response_memory_tests::`、`outbound::vmess::stream::tests::`、`outbound::vmess::outbound::polled_datagram_memory_tests::`、`--test vmess_lifecycle` | 官方延迟响应向量、HTTP迟到响应与节点取消、提交前期限、响应认证、收发计数回绕、跨回绕连续交付、认证错误关闭、逐字节轮询、读写交错取消与关闭 |
+| VMess 响应边界 | `outbound::vmess::header::delayed_response_memory_tests::`、`outbound::vmess::stream::tests::`、`outbound::vmess::outbound::polled_datagram_memory_tests::`、`--test vmess_lifecycle` | 官方延迟响应向量、HTTP迟到响应与节点取消、提交前期限、响应认证、收发计数回绕、加密 packetaddr 多目标帧与回包来源、跨回绕连续交付、认证错误关闭、逐字节轮询、读写交错取消与关闭 |
 | SS2022 | `outbound::shadowsocks::datagram::tests::` | 官方内存对端、三种 cipher、空 UDP/EIH、认证后 cipher 准入、取消与轮换 ID、重放边界 |
 | Trojan UDP | `routing::dispatcher::tests::managed_trojan_udp_`、`--test trojan` | 真实内存帧、同源多目标共享、来源及关闭后旧回复隔离、取消与流释放 |
 | SOCKS5 UDP | `outbound::socks5::tests::` | 真实内存握手与帧、同源多目标复用、异源隔离、关闭重建后旧回复隔离、relay 来源和嵌套预算 |

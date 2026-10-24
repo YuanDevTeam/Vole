@@ -512,6 +512,13 @@ mod polled_datagram_memory_tests {
     }
 
     fn prepared(capacity: usize) -> (PreparedStream, DuplexStream, CancellationToken) {
+        prepared_with_cipher(capacity, BodyCipher::None)
+    }
+
+    fn prepared_with_cipher(
+        capacity: usize,
+        cipher: BodyCipher,
+    ) -> (PreparedStream, DuplexStream, CancellationToken) {
         let (raw, peer) = tokio::io::duplex(capacity);
         // Match the node -> physical session hierarchy; the routing flow's
         // cancellation is deliberately a different token in the test below.
@@ -521,7 +528,7 @@ mod polled_datagram_memory_tests {
             raw: Box::new(OwnedStream::new(Box::new(raw), token.clone())),
             options: Arc::new(SessionOptions {
                 identity: VmessIdentity::new(uuid::Uuid::from_bytes([7; 16])),
-                body: BodyOptions::new(BodyCipher::None, false, false).unwrap(),
+                body: BodyOptions::new(cipher, false, false).unwrap(),
                 transport: VmessTransport::Tcp,
             }),
             deadline: Instant::now() + Duration::from_secs(10),
@@ -542,8 +549,10 @@ mod polled_datagram_memory_tests {
         )
     }
 
-    async fn installed_packetaddr() -> (SessionDatagram, DuplexStream, CancellationToken) {
-        let (prepared, peer, node) = prepared(4096);
+    async fn installed_packetaddr(
+        cipher: BodyCipher,
+    ) -> (SessionDatagram, DuplexStream, CancellationToken) {
+        let (prepared, peer, node) = prepared_with_cipher(4096, cipher);
         let token = prepared.token.clone();
         let budget = DatagramBudget::new(128, 128);
         let stream = prepared
@@ -575,9 +584,14 @@ mod polled_datagram_memory_tests {
 
     #[tokio::test]
     async fn vmess_polled_receive_keeps_reader_wake_after_write_and_node_cancellation() {
-        for packetaddr in [false, true] {
+        for (packetaddr, cipher) in [
+            (false, BodyCipher::None),
+            (true, BodyCipher::None),
+            (true, BodyCipher::Aes128Gcm),
+            (true, BodyCipher::Chacha20Poly1305),
+        ] {
             let (mut transport, mut peer, node) = if packetaddr {
-                installed_packetaddr().await
+                installed_packetaddr(cipher).await
             } else {
                 pending_raw(4096)
             };
@@ -587,6 +601,7 @@ mod polled_datagram_memory_tests {
             let writer_wake = waker(writer.clone());
             let mut scratch = Vec::new();
             assert!(transport.supports_poll_receive());
+            assert_eq!(transport.supports_shared_destinations(), packetaddr);
             if !packetaddr {
                 // A lazy raw association is polled before its authenticated
                 // destination exists, and must wake its latest reader on setup.
