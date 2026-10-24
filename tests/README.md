@@ -45,6 +45,13 @@ WS 查询和头预算：`config::vmess::websocket_query_tests::` 与内存 duple
 `--test stream_foundations websocket_early_data_and_remaining_frames_keep_the_original_byte_order`；
 XHTTP 输入和自定义上行方法：`--test xhttp_config`、
 `--test xhttp_requests packet_metadata_and_upload_methods_are_sent_in_each_supported_location`。
+VLESS packetaddr 自主写使用实际 PacketUp Writer 的纯内存 H2 duplex：
+`--test vless_transports packetaddr_xhttp_memory::packetaddr_xhttp_keeps_first_flush_and_drives_last_datagram_without_post_ack`。
+覆盖请求头／首 DATA 的 POST 确认，以及最后单帧的独立推进、确认前接收和同步 Stop。
+已建立关联的部分写取消使用库过滤器
+`outbound::vless::datagram::tests::established_packetaddr_partial_write_resumes_by_send_or_receive_without_replay`，
+检查越过原建链期限后由 send／receive 恢复同帧、无重放及回复来源。
+这些内存 seam 不代替 H3、真实 TUN、进程 RSS 或压力验收。
 
 规则输入与 selector 元数据（纯内存）：`config::name_regex::tests::`、
 `config::domain_regex::tests::`、`config::rule_provider::tests::classical_`、

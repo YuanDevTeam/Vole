@@ -627,3 +627,320 @@ async fn http_upgrade_consumes_early_prefix_and_requires_valid_101_even_fast_ope
         }
     }
 }
+
+mod packetaddr_xhttp_memory {
+    use super::*;
+    use std::{future::Future, io, pin::Pin, task::Poll};
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_util::sync::CancellationToken;
+    use vole::session::{Datagram, DatagramSession};
+
+    struct Post {
+        body: Vec<u8>,
+        acknowledge: oneshot::Sender<()>,
+    }
+
+    // Actual H2 request/response bodies drive the production PacketUp writer.
+    // Delaying this response is stronger than mocking poll_flush or a bool.
+    async fn peer(
+        raw: tokio::io::DuplexStream,
+        posts: mpsc::Sender<Post>,
+        mut replies: mpsc::Receiver<bytes::Bytes>,
+        mut stop: oneshot::Receiver<()>,
+    ) -> io::Result<()> {
+        let mut connection = h2::server::handshake(raw).await.map_err(io::Error::other)?;
+        let cancel = CancellationToken::new();
+        let mut handlers = tokio::task::JoinSet::new();
+        let mut download: Option<h2::SendStream<bytes::Bytes>> = None;
+        let result = async {
+            loop {
+                tokio::select! {
+                    _ = &mut stop => break,
+                    reply = replies.recv() => {
+                        let Some(reply) = reply else { break; };
+                        download.as_mut()
+                            .ok_or(io::ErrorKind::NotConnected)?
+                            .send_data(reply, false)
+                            .map_err(io::Error::other)?;
+                    }
+                    incoming = connection.accept() => {
+                        let Some(incoming) = incoming else { break; };
+                        let (request, mut response) = incoming.map_err(io::Error::other)?;
+                        if request.method() == http::Method::GET {
+                            if download.is_some() {
+                                return Err(io::ErrorKind::InvalidData.into());
+                            }
+                            download = Some(response
+                                .send_response(http::Response::new(()), false)
+                                .map_err(io::Error::other)?);
+                            continue;
+                        }
+                        if request.method() != http::Method::POST {
+                            return Err(io::ErrorKind::InvalidData.into());
+                        }
+                        let posts = posts.clone();
+                        let cancel = cancel.clone();
+                        handlers.spawn(async move {
+                            let mut input = request.into_body();
+                            let mut body = Vec::new();
+                            loop {
+                                let next = tokio::select! {
+                                    _ = cancel.cancelled() => return Ok::<(), io::Error>(()),
+                                    next = input.data() => next,
+                                };
+                                let Some(next) = next else { break; };
+                                let next = next.map_err(io::Error::other)?;
+                                if body.len() + next.len() > 8192 {
+                                    return Err(io::ErrorKind::InvalidData.into());
+                                }
+                                body.extend_from_slice(&next);
+                                input.flow_control().release_capacity(next.len())
+                                    .map_err(io::Error::other)?;
+                            }
+                            let (acknowledge, accepted) = oneshot::channel();
+                            tokio::select! {
+                                _ = cancel.cancelled() => return Ok(()),
+                                result = posts.send(Post {body, acknowledge}) => {
+                                    result.map_err(|_| io::ErrorKind::BrokenPipe)?;
+                                }
+                            }
+                            tokio::select! {
+                                _ = cancel.cancelled() => return Ok(()),
+                                result = accepted => {
+                                    if result.is_err() { return Ok(()); }
+                                }
+                            }
+                            response.send_response(http::Response::new(()), true)
+                                .map_err(io::Error::other)?;
+                            Ok(())
+                        });
+                    }
+                }
+            }
+            Ok::<(), io::Error>(())
+        }
+        .await;
+        cancel.cancel();
+        drop(download);
+        drop(connection);
+        while let Some(joined) = handlers.join_next().await {
+            joined.map_err(io::Error::other)??;
+        }
+        result
+    }
+
+    async fn next_post<F>(
+        send: &mut Pin<Box<F>>,
+        completed: &mut Option<Result<(), DispatchError>>,
+        posts: &mut mpsc::Receiver<Post>,
+    ) -> Result<Post, String>
+    where
+        F: Future<Output = Result<(), DispatchError>>,
+    {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            if completed.is_none() {
+                tokio::select! {
+                    result = send.as_mut() => {
+                        *completed = Some(result);
+                        posts.recv().await
+                    }
+                    post = posts.recv() => post,
+                }
+            } else {
+                posts.recv().await
+            }
+        })
+        .await
+        .map_err(|_| "actual packet-up POST did not arrive".to_owned())?
+        .ok_or_else(|| "memory HTTP peer ended".to_owned())
+    }
+
+    fn packet(port: u16, data: &'static [u8]) -> Datagram {
+        Datagram {
+            remote: Destination::Ip(std::net::SocketAddr::from(([192, 0, 2, 1], port))),
+            payload: bytes::Bytes::from_static(data),
+            sniffed_domain: None,
+        }
+    }
+
+    fn wire(packet: &Datagram) -> Vec<u8> {
+        use bytes::BufMut;
+        let mut frame = bytes::BytesMut::new();
+        frame.put_u16(0);
+        vole::outbound::address::encode_packet_addr(&packet.remote, &mut frame).unwrap();
+        frame.extend_from_slice(&packet.payload);
+        let length = (frame.len() - 2) as u16;
+        frame[..2].copy_from_slice(&length.to_be_bytes());
+        frame.to_vec()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn packetaddr_xhttp_keeps_first_flush_and_drives_last_datagram_without_post_ack() {
+        #[cfg(feature = "interop-test")]
+        let _case = vole::resources::case_events::Case::new(
+            "VLESS-UNIT",
+            "packetaddr_xhttp_keeps_first_flush_and_drives_last_datagram_without_post_ack",
+        );
+        let (io, raw_peer) = tokio::io::duplex(64 * 1024);
+        let outbound = node(
+            Box::new(io),
+            serde_json::json!({
+                "network":"xhttp", "packet-encoding":"packetaddr",
+                "xhttp-opts":{
+                    "path":"/packetaddr-memory", "mode":"packet-up",
+                    "sc-min-posts-interval-ms":"10", "x-padding-bytes":"64"
+                }
+            }),
+        );
+        let (post_tx, mut posts) = mpsc::channel(4);
+        let (replies, reply_rx) = mpsc::channel(1);
+        let (stop, stopped) = oneshot::channel();
+        let mut remote = tokio::spawn(peer(raw_peer, post_tx, reply_rx, stopped));
+        let mut transport = None;
+        let observed = async {
+            let request = DatagramRequest::new(DatagramSession::new(
+                InboundKind::InternalMeasure,
+                "127.0.0.1:1".parse().unwrap(),
+            ));
+            transport = Some(
+                outbound
+                    .open_datagram(
+                        request,
+                        &EstablishContext::with_timeout(Duration::from_secs(30)),
+                    )
+                    .await
+                    .map_err(|error| format!("open_datagram: {error:?}"))?,
+            );
+            let client = transport.as_mut().unwrap();
+            let first = packet(53, b"first");
+            let last = packet(54, b"last");
+            let mut first_send = Box::pin(client.send(first.clone()));
+            let mut first_done = None;
+            let header = next_post(&mut first_send, &mut first_done, &mut posts).await?;
+            let expected_header = vole::outbound::encode_request_header(
+                uuid::Uuid::from_bytes([7; 16]),
+                vole::outbound::VlessCommand::Udp,
+                Some(&Destination::domain("sp.packet-addr.v2fly.arpa", 443).unwrap()),
+            )
+            .unwrap();
+            let header_exact = header.body.as_slice() == expected_header.as_ref();
+            let waits_for_header_ack = first_done.is_none();
+            header
+                .acknowledge
+                .send(())
+                .map_err(|_| "header POST disappeared")?;
+
+            let first_data = next_post(&mut first_send, &mut first_done, &mut posts).await?;
+            if first_done.is_none()
+                && let Poll::Ready(done) = futures_util::poll!(first_send.as_mut())
+            {
+                first_done = Some(done);
+            }
+            let first_exact = first_data.body == wire(&first);
+            let waits_for_first_data_ack = first_done.is_none();
+            first_data
+                .acknowledge
+                .send(())
+                .map_err(|_| "first data POST disappeared")?;
+            if first_done.is_none() {
+                first_done = Some(first_send.as_mut().await);
+            }
+            first_done
+                .unwrap()
+                .map_err(|error| format!("first send: {error:?}"))?;
+            drop(first_send);
+
+            // Exactly one final datagram follows the established first frame.
+            // No subsequent send/flush may accidentally drive its last bytes.
+            let mut last_send = Box::pin(client.send(last.clone()));
+            let mut last_done = None;
+            let final_post = next_post(&mut last_send, &mut last_done, &mut posts).await?;
+            if last_done.is_none()
+                && let Poll::Ready(done) = futures_util::poll!(last_send.as_mut())
+            {
+                last_done = Some(done);
+            }
+            let last_admitted_before_ack = matches!(&last_done, Some(Ok(())));
+            let last_exact = final_post.body == wire(&last);
+            drop(last_send);
+
+            // The synthetic server replies on the real GET response only after
+            // its actual POST body has arrived, while withholding that POST's
+            // HTTP acknowledgement. This detects a receive-side flush stall.
+            let mut response = vec![0, 0];
+            response.extend(wire(&last));
+            replies
+                .send(bytes::Bytes::from(response))
+                .await
+                .map_err(|_| "download stream disappeared")?;
+            let received = tokio::time::timeout(Duration::from_millis(100), client.receive()).await;
+            let reply_before_post_ack = matches!(&received, Ok(Ok(packet))
+                if packet.remote == last.remote && packet.payload == last.payload);
+            // A cancelled send must resume its pending frame and consume
+            // the already-present reply after the acknowledgement.
+            final_post
+                .acknowledge
+                .send(())
+                .map_err(|_| "final POST disappeared")?;
+            let recovered = match received {
+                Ok(Ok(packet)) => Some(packet),
+                Ok(Err(error)) => return Err(format!("receive: {error:?}")),
+                Err(_) => Some(
+                    tokio::time::timeout(Duration::from_secs(1), client.receive())
+                        .await
+                        .map_err(|_| "pending frame could not resume after POST ack")?
+                        .map_err(|error| format!("resumed receive: {error:?}"))?,
+                ),
+            };
+            let recovery_exact = recovered.is_some_and(|packet| {
+                packet.remote == last.remote && packet.payload == last.payload
+            });
+            Ok::<_, String>((
+                header_exact,
+                waits_for_header_ack,
+                first_exact,
+                waits_for_first_data_ack,
+                last_exact,
+                last_admitted_before_ack,
+                reply_before_post_ack,
+                recovery_exact,
+            ))
+        }
+        .await;
+
+        // Finish owned tasks before asserting the observed IO guarantees.
+        let core_stopped = tokio::time::timeout(Duration::from_secs(1), outbound.shutdown()).await;
+        drop(transport);
+        let _ = stop.send(());
+        let joined = match tokio::time::timeout(Duration::from_secs(1), &mut remote).await {
+            Ok(result) => Some(result),
+            Err(_) => {
+                remote.abort();
+                let _ = remote.await;
+                None
+            }
+        };
+        assert!(
+            core_stopped.is_ok(),
+            "Core Stop did not join its real PacketUp tasks"
+        );
+        assert!(
+            matches!(joined, Some(Ok(Ok(())))),
+            "owned memory HTTP peer failed/joined late"
+        );
+        let (header, header_flush, first, first_flush, last, admitted, reply, recovered) =
+            observed.unwrap();
+        assert!(
+            header && first && last && recovered,
+            "actual packetaddr bytes/source changed"
+        );
+        assert!(
+            header_flush && first_flush,
+            "setup/first frame bypassed real POST acknowledgement"
+        );
+        assert!(
+            admitted && reply,
+            "real POST body was received; send_before_ack={admitted}, reply_before_ack={reply}; established packetaddr still waits for POST acknowledgement"
+        );
+    }
+}

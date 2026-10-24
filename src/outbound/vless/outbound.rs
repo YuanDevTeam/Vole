@@ -867,14 +867,17 @@ impl OutboundConnector for VlessOutbound {
                 transport
             })
         } else if self.encoding == VlessPacketEncoding::PacketAddr {
-            Box::new(
-                super::datagram::VlessDatagram::packet_addr(
-                    prepared,
-                    request.budget(),
-                    context.resolution(),
-                )
-                .await?,
+            let transport = super::datagram::VlessDatagram::packet_addr(
+                prepared,
+                request.budget(),
+                context.resolution(),
             )
+            .await?;
+            Box::new(if self.encryption.is_none() && self.xhttp.is_some() {
+                transport.with_autonomous_writes()
+            } else {
+                transport
+            })
         } else {
             Box::new(super::datagram::VlessDatagram::new(
                 prepared,

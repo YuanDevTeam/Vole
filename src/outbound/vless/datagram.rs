@@ -20,6 +20,7 @@ pub(super) struct VlessDatagram {
     pending_write: Option<PendingWrite>,
     pending: Option<PreparedStream>,
     packet_addr: bool,
+    autonomous_writes: bool,
     peer: Option<Destination>,
     initialized: bool,
     deadline: Instant,
@@ -47,6 +48,7 @@ impl VlessDatagram {
             pending_write: None,
             pending: Some(prepared),
             packet_addr: false,
+            autonomous_writes: false,
             peer: None,
             initialized: false,
             deadline,
@@ -73,6 +75,7 @@ impl VlessDatagram {
             pending_write: None,
             pending: None,
             packet_addr: true,
+            autonomous_writes: false,
             peer: None,
             initialized: false,
             deadline,
@@ -83,11 +86,17 @@ impl VlessDatagram {
         })
     }
 
+    pub(super) fn with_autonomous_writes(mut self) -> Self {
+        self.autonomous_writes = true;
+        self
+    }
+
     async fn flush_packet_addr_pending(&mut self) -> io::Result<()> {
         if self.pending_write.is_none() {
             return Ok(());
         }
         let first = !self.initialized;
+        let autonomous_writes = self.autonomous_writes;
         let deadline = self.deadline;
         if first && Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
@@ -108,7 +117,14 @@ impl VlessDatagram {
                 }
                 pending.offset += written;
             }
-            io.flush().await
+            // The first datagram retains its setup flush. On an independently
+            // driven transport, later complete frames are already owned by its
+            // bounded writer; waiting for each POST response prevents batching.
+            if first || !autonomous_writes {
+                io.flush().await
+            } else {
+                Ok(())
+            }
         };
         tokio::select! { biased;
             () = cancellation.cancelled() => return Err(io::ErrorKind::ConnectionAborted.into()),
@@ -517,42 +533,109 @@ mod tests {
         let first = packet("192.0.2.1:53", b"first");
         let second = packet("198.51.100.1:54", b"second");
         let header_len = magic_header().len();
-        for (write_bytes, flushes) in [
-            (1, usize::MAX),
-            (header_len + 3, usize::MAX),
-            (header_len + wire(&first).len() - 1, usize::MAX),
-            (usize::MAX, 1),
-        ] {
-            for resume_receive in [false, true] {
-                let (mut transport, mut peer, gates) = fixture(true).await;
-                gates.write_bytes.store(write_bytes, Ordering::SeqCst);
-                gates.flushes.store(flushes, Ordering::SeqCst);
-                assert!(futures_util::poll!(transport.send(first.clone())).is_pending());
-                assert!(transport.io.is_some() && transport.pending_write.is_some());
-                assert_eq!(gates.drops.load(Ordering::SeqCst), 0);
-                gates.release();
-                let mut expected = magic_header();
-                expected.extend(wire(&first));
-                if resume_receive {
-                    let mut response = vec![0, 0];
-                    response.extend(wire(&second));
-                    peer.write_all(&response).await.unwrap();
-                    let actual = transport.receive().await.unwrap();
-                    assert_eq!(actual.remote, second.remote);
-                    assert_eq!(actual.payload, second.payload);
-                } else {
-                    transport.send(second.clone()).await.unwrap();
-                    expected.extend(wire(&second));
+        for autonomous in [false, true] {
+            for (write_bytes, flushes) in [
+                (1, usize::MAX),
+                (header_len + 3, usize::MAX),
+                (header_len + wire(&first).len() - 1, usize::MAX),
+                // The header consumes this flush; first DATA must still wait
+                // for its own flush, including when autonomous is enabled.
+                (usize::MAX, 1),
+            ] {
+                for resume_receive in [false, true] {
+                    let (mut transport, mut peer, gates) = fixture(true).await;
+                    if autonomous {
+                        transport = transport.with_autonomous_writes();
+                    }
+                    gates.write_bytes.store(write_bytes, Ordering::SeqCst);
+                    gates.flushes.store(flushes, Ordering::SeqCst);
+                    assert!(futures_util::poll!(transport.send(first.clone())).is_pending());
+                    assert!(transport.io.is_some() && transport.pending_write.is_some());
+                    assert_eq!(gates.drops.load(Ordering::SeqCst), 0);
+                    gates.release();
+                    let mut expected = magic_header();
+                    expected.extend(wire(&first));
+                    if resume_receive {
+                        let mut response = vec![0, 0];
+                        response.extend(wire(&second));
+                        peer.write_all(&response).await.unwrap();
+                        let actual = transport.receive().await.unwrap();
+                        assert_eq!(actual.remote, second.remote);
+                        assert_eq!(actual.payload, second.payload);
+                    } else {
+                        transport.send(second.clone()).await.unwrap();
+                        expected.extend(wire(&second));
+                    }
+                    assert!(transport.pending_write.is_none());
+                    transport.close().await.unwrap();
+                    let mut actual = Vec::new();
+                    peer.read_to_end(&mut actual).await.unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "first-frame cancelled bytes must occur exactly once; autonomous={autonomous}, receive={resume_receive}",
+                    );
+                    assert_eq!(gates.drops.load(Ordering::SeqCst), 1);
                 }
-                assert!(transport.pending_write.is_none());
-                let mut actual = vec![0; expected.len()];
-                peer.read_exact(&mut actual).await.unwrap();
-                assert_eq!(
-                    actual, expected,
-                    "cancelled prefixes must occur exactly once"
-                );
-                transport.close().await.unwrap();
-                assert_eq!(gates.drops.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn established_packetaddr_partial_write_resumes_by_send_or_receive_without_replay() {
+        let first = packet("192.0.2.1:53", b"first");
+        let second = packet("[2001:db8::2]:54", b"second");
+        let third = packet("198.51.100.3:55", b"third");
+        let second_wire = wire(&second);
+        for autonomous in [false, true] {
+            // Each cancellation is inside an actually written frame, not an
+            // established flush barrier that autonomous mode intentionally skips.
+            for prefix_len in [1, second_wire.len() - 1] {
+                for resume_receive in [false, true] {
+                    let (mut transport, mut peer, gates) = fixture(true).await;
+                    if autonomous {
+                        transport = transport.with_autonomous_writes();
+                    }
+                    transport.send(first.clone()).await.unwrap();
+                    let mut established_wire = magic_header();
+                    established_wire.extend(wire(&first));
+                    let mut actual = vec![0; established_wire.len()];
+                    peer.read_exact(&mut actual).await.unwrap();
+                    assert_eq!(actual, established_wire);
+
+                    gates.write_bytes.store(prefix_len, Ordering::SeqCst);
+                    assert!(futures_util::poll!(transport.send(second.clone())).is_pending());
+                    assert!(transport.pending_write.is_some());
+                    assert_eq!(gates.drops.load(Ordering::SeqCst), 0);
+                    let mut prefix = vec![0; prefix_len];
+                    peer.read_exact(&mut prefix).await.unwrap();
+                    assert_eq!(prefix, second_wire[..prefix_len]);
+
+                    // Expiring the original first-frame deadline must not turn
+                    // an established frame's cancelled continuation into setup.
+                    tokio::time::advance(Duration::from_secs(6)).await;
+                    gates.release();
+                    let mut expected = second_wire[prefix_len..].to_vec();
+                    if resume_receive {
+                        let mut response = vec![0, 0];
+                        response.extend(wire(&third));
+                        peer.write_all(&response).await.unwrap();
+                        let actual = transport.receive().await.unwrap();
+                        assert_eq!(actual.remote, third.remote);
+                        assert_eq!(actual.payload, third.payload);
+                    } else {
+                        transport.send(third.clone()).await.unwrap();
+                        expected.extend(wire(&third));
+                    }
+                    assert!(transport.pending_write.is_none());
+                    transport.close().await.unwrap();
+                    let mut tail = Vec::new();
+                    peer.read_to_end(&mut tail).await.unwrap();
+                    assert_eq!(
+                        tail, expected,
+                        "established frame lost/replayed bytes; autonomous={autonomous}, receive={resume_receive}, prefix={prefix_len}",
+                    );
+                    assert_eq!(gates.drops.load(Ordering::SeqCst), 1);
+                }
             }
         }
     }
