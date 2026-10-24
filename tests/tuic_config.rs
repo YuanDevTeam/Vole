@@ -202,7 +202,7 @@ fn quic_fields_consume_defaults_and_reversed_fixed_windows() {
     assert_eq!(
         defaults.connection_window,
         QuicReceiveWindow {
-            initial: 4 * 1024 * 1024,
+            initial: 2 * 1024 * 1024,
             maximum: 64 * 1024 * 1024
         }
     );
