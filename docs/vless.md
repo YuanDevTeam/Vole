@@ -13,6 +13,7 @@
 - WS 的 ED 支持默认头、自定义头或路径。`path` 的 `?ed=N` 覆盖显式 ED 配置并删除 ed 参数；实际早数据按当前请求剩余的16KiB头预算限制，不按配置上限预分配。`v2ray-http-upgrade` 开启升级后裸流；`v2ray-http-upgrade-fast-open` 必须与前者一起启用，只允许默认 ED 头。fast-open 提前发协议首包但仍等待合法 101，拒绝不返回连接成功。
 - gRPC 与 Trojan/VMess 共用配置：省略或空 `grpc-service-name` 默认 `GunService`，普通名映射 `/name/Tun`，`/` 开头使用完整路径；省略或空 `grpc-user-agent` 默认 `grpc-go/1.36.0`。`ping-interval` 为带符号秒数，0 不主动 PING，负值明确拒绝；三项池阈值接受带符号整数，负阈值禁用相应分支。空闲连接总是复用；max-connections>0 时按连接上限/min-streams 扩容，否则按 max-streams 复用阈值扩容。三项字面全零归一 max-connections=1；正 max-connections 优先于 max-streams。阈值不是硬流数上限。物理连接归节点所有，关闭逻辑流不会杀死兄弟流；复用不重选上游组。
 - gRPC 不新增业务流/建链数量额度；每个物理连接一个自有驱动，每个等待调用只保留自身 future、取消与原期限，不派生队列任务。每节点最多保留 4 条空闲连接，多余空闲连接退役且不影响活动流。空闲 PING 等待 ACK 最多 15 秒，节点 Stop 取消并 join 所有驱动。
+- gRPC 在原建链期限内等待有效 HTTP/2 SETTINGS 并提交完整 VLESS 请求；提交后可持续上传，等待 HTTP 响应不再消耗建链期限。延迟响应仍须通过原状态、内容类型及协议校验，Stop 取消并唤醒活动读写。
 - gRPC authority 使用非空显式 `servername`，否则使用 server:port；`name-cert-verify` 只改变证书验证名称。legacy H2 的 host 省略或为空列表时使用 www.example.com，path 省略或为空时使用 `/`。
 - `network: xhttp` 支持 H1/H2 明文、TLS1.3、REALITY、JLS 或 ShadowTLS v3，H3 仅标准 TLS1.3。请求字段、独立下载腿、池与版本选择见 [XHTTP](xhttp.md)。H3 的物理 UDP 仍由原 Dialer/上游图创建。
 - 公共节点 `smux` 以独立的 h2mux/smux v1/yamux 承载逻辑 TCP/UDP；VLESS 只提供正常 TCP 到约定目标，不拥有第二个 mux 池。它不是 XUDP；only-tcp、调度及关闭边界见 [通用 sing-mux](xhttp.md#通用-sing-mux)。

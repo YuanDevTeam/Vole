@@ -286,8 +286,8 @@ pub(super) async fn pooled_stream(
         Some(lease),
         writes,
     );
-    // VMess bounds complete authentication submission in its outer setup
-    // operation. A pending response is then established client-first IO.
+    // Client-first protocol owners bound complete request submission separately.
+    // Waiting for HTTP response headers must not reuse that setup deadline.
     stream.response_deadline = matches!(policy, super::grpc_pool::ResponsePolicy::SetupDeadline);
     Ok(Box::new(stream))
 }

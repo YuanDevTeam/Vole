@@ -29,6 +29,11 @@ VMess gRPC 延迟响应（纯内存 H2 duplex）：启用 `cli,interop-test` 后
 `--test grpc_protocol_pool`。覆盖认证请求提交后跨越原建链期限的继续上传、
 未收到响应时的活动 Stop、对端自然退出和资源释放；不代替真实 TUN 验证。
 
+VLESS 的同类边界使用 `--test vless_transports grpc_committed_vless_request_outlives_delayed_http_response`，
+同 target 的 `grpc_unresponsive_peer_keeps_original_setup_deadline` 检查未收到 SETTINGS 时仍受原期限约束；
+另以 `--test vless_lifecycle vless_all_handshakes_keep_the_original_deadline_and_join_cancelled_io`
+保留未完成建链的原期限；VLESS-only 编译使用 `--no-default-features --features outbound-vless --lib`，不添加 `cli`。
+
 客户端凭据与输入（纯内存）：`config::tests::client_uuid_`、
 `config::vmess::cipher_compatibility_tests::`、`config::hysteria2::p08_tests::hopping_`。
 实际映射凭据、端口跳跃和各协议数据面由真实 TUN 另验收。

@@ -13,6 +13,139 @@ use vole::{
     },
     session::{Destination, InboundKind, StreamSession},
 };
+
+#[cfg(feature = "interop-test")]
+#[tokio::test(start_paused = true)]
+async fn grpc_unresponsive_peer_keeps_original_setup_deadline() {
+    use std::io;
+    use vole::resources::observation::ResourceProbe;
+
+    fn preface_only(wire: &[u8]) -> bool {
+        if !wire.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") {
+            return false;
+        }
+        let mut offset = 24;
+        while offset + 9 <= wire.len() {
+            let length = (usize::from(wire[offset]) << 16)
+                | (usize::from(wire[offset + 1]) << 8)
+                | usize::from(wire[offset + 2]);
+            let end = offset + 9 + length;
+            if end > wire.len() || matches!(wire[offset + 3], 0 | 1) {
+                return false;
+            }
+            offset = end;
+        }
+        offset == wire.len()
+    }
+
+    let _case = vole::resources::case_events::Case::new(
+        "VLESS-UNIT",
+        "grpc_unresponsive_peer_keeps_original_setup_deadline",
+    );
+    for first_operation in ["flush", "read"] {
+        let probe = ResourceProbe::default();
+        let (outcome, elapsed, deadline, stopped, joined) = probe
+            .scope(async {
+                let (io, mut peer) = tokio::io::duplex(4096);
+                let outbound = node(
+                    Box::new(io),
+                    serde_json::json!({"network":"grpc","grpc-opts":{"grpc-service-name":"service"}}),
+                );
+                // Consume continuously, but never send peer SETTINGS or EOF.
+                // Write backpressure cannot stand in for the H2 setup gate.
+                let mut remote = tokio::spawn(async move {
+                    let mut wire = Vec::new();
+                    let mut first_preface = None;
+                    let mut input = [0; 1024];
+                    loop {
+                        let count = peer.read(&mut input).await?;
+                        if count == 0 {
+                            return Ok::<_, io::Error>((wire, first_preface));
+                        }
+                        if wire.len() + count > 16 * 1024 {
+                            return Err(io::ErrorKind::InvalidData.into());
+                        }
+                        wire.extend_from_slice(&input[..count]);
+                        if wire.len() >= 24 && first_preface.is_none() {
+                            first_preface = Some(tokio::time::Instant::now());
+                        }
+                    }
+                });
+                let start = tokio::time::Instant::now();
+                let context = EstablishContext::with_timeout(Duration::from_secs(2));
+                let deadline = context.deadline();
+                let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+                    match outbound.connect_stream(session(), &context).await {
+                        Err(error) => (
+                            "connect",
+                            matches!(error, DispatchError::TimedOut),
+                            format!("{error:?}"),
+                        ),
+                        Ok(mut connected) => {
+                            let result = if first_operation == "flush" {
+                                connected.io.flush().await
+                            } else {
+                                connected.io.read(&mut [0; 1]).await.map(|_| ())
+                            };
+                            (
+                                first_operation,
+                                result.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::TimedOut),
+                                format!("{result:?}"),
+                            )
+                        }
+                    }
+                })
+                .await;
+                let elapsed = start.elapsed();
+                let stopped = tokio::time::timeout(Duration::from_secs(1), outbound.shutdown()).await;
+                let joined = match tokio::time::timeout(Duration::from_secs(1), &mut remote).await {
+                    Ok(result) => Some(result),
+                    Err(_) => {
+                        remote.abort();
+                        let _ = remote.await;
+                        None
+                    }
+                };
+                drop(outbound);
+                (outcome, elapsed, deadline, stopped, joined)
+            })
+            .await;
+        assert!(
+            stopped.is_ok(),
+            "{first_operation}: Core Stop watchdog expired"
+        );
+        assert!(
+            probe.snapshot().is_idle(),
+            "{first_operation}: resources retained after Stop: {:?}",
+            probe.snapshot()
+        );
+        assert!(
+            matches!(&joined, Some(Ok(Ok(_)))),
+            "{first_operation}: memory peer did not join naturally: {joined:?}"
+        );
+        let (wire, preface_at) = joined.unwrap().unwrap().unwrap();
+        assert!(
+            preface_at.is_some_and(|at| at < deadline),
+            "{first_operation}: peer did not drain the client preface before the deadline"
+        );
+        assert!(
+            preface_only(&wire),
+            "{first_operation}: logical request was sent without peer SETTINGS"
+        );
+        let (stage, timed_out, detail) =
+            outcome.expect("no-SETTINGS scenario reached its three-second watchdog");
+        assert!(
+            timed_out,
+            "{first_operation}: {stage} did not report the original setup timeout: {detail}"
+        );
+        assert_eq!(
+            elapsed,
+            Duration::from_secs(2),
+            "{first_operation}: setup deadline was changed; stage={stage}, outcome={detail}"
+        );
+    }
+}
+
 struct Supplied(Mutex<Option<BoxStream>>);
 #[async_trait::async_trait]
 impl OutboundConnector for Supplied {
@@ -181,6 +314,233 @@ async fn grpc_server_first_flushes_vless_request_without_an_application_write() 
         .expect("VLESS request was not flushed before waiting for the response");
     assert_eq!(&result.1, b"hello");
 }
+#[cfg(feature = "interop-test")]
+#[tokio::test(start_paused = true)]
+async fn grpc_committed_vless_request_outlives_delayed_http_response() {
+    use std::{
+        io,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, Wake, Waker},
+    };
+    use vole::resources::observation::ResourceProbe;
+
+    #[derive(Default)]
+    struct ReadWake(AtomicUsize);
+    impl Wake for ReadWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let _case = vole::resources::case_events::Case::new(
+        "VLESS-UNIT",
+        "grpc_committed_vless_request_outlives_delayed_http_response",
+    );
+    let probe = ResourceProbe::default();
+    let (result, core_stopped, peer_joined) = probe
+        .scope(async {
+            let (io, peer) = tokio::io::duplex(4096);
+            let outbound = node(
+                Box::new(io),
+                serde_json::json!({"network":"grpc","grpc-opts":{"grpc-service-name":"service"}}),
+            );
+            let (records, mut observed) = tokio::sync::mpsc::unbounded_channel();
+            let mut remote = tokio::spawn(async move {
+                let mut connection = h2::server::handshake(peer)
+                    .await
+                    .map_err(io::Error::other)?;
+                let (request, response) = connection
+                    .accept()
+                    .await
+                    .ok_or(io::ErrorKind::UnexpectedEof)?
+                    .map_err(io::Error::other)?;
+                let receive = async move {
+                    // Hold the HTTP response open without sending headers.
+                    let _response = response;
+                    let mut receive = request.into_body();
+                    let mut wire = Vec::new();
+                    while let Some(Ok(data)) = receive.data().await {
+                        receive
+                            .flow_control()
+                            .release_capacity(data.len())
+                            .map_err(io::Error::other)?;
+                        wire.extend_from_slice(&data);
+                        while wire.len() >= 5 {
+                            let length =
+                                u32::from_be_bytes(wire[1..5].try_into().unwrap()) as usize;
+                            // This fixture sends only small, one-byte protobuf lengths.
+                            if wire[0] != 0 || !(2..=256).contains(&length) {
+                                return Err(io::ErrorKind::InvalidData.into());
+                            }
+                            if wire.len() < 5 + length {
+                                break;
+                            }
+                            if wire[5] != 0x0a || wire[6] >= 128 || wire[6] as usize + 2 != length {
+                                return Err(io::ErrorKind::InvalidData.into());
+                            }
+                            records
+                                .send(wire[7..5 + length].to_vec())
+                                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+                            wire.drain(..5 + length);
+                        }
+                    }
+                    Ok::<_, io::Error>(())
+                };
+                tokio::pin!(receive);
+                // accept() drives H2 DATA while the handler waits for uploads.
+                tokio::select! {
+                    result = &mut receive => result,
+                    extra = connection.accept() => match extra {
+                        None | Some(Err(_)) => Ok(()),
+                        Some(Ok(_)) => Err(io::ErrorKind::InvalidData.into()),
+                    },
+                }
+            });
+            let context = EstablishContext::with_timeout(Duration::from_secs(2));
+            let result = tokio::time::timeout(Duration::from_secs(30), async {
+                let mut stream = outbound
+                    .connect_stream(session(), &context)
+                    .await
+                    .map_err(io::Error::other)?
+                    .io;
+                // The first operation commits the request, with no application payload.
+                stream.flush().await?;
+                let header = observed.recv().await.ok_or(io::ErrorKind::UnexpectedEof)?;
+                let expected = [
+                    b"\0".as_slice(),
+                    &[7; 16],
+                    b"\0\x01\0\x50\x01\xc0\0\x02\x01",
+                ]
+                .concat();
+                if header != expected {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                let (mut reader, mut writer) = tokio::io::split(stream);
+                writer.write_all(b"before").await?;
+                writer.flush().await?;
+                if observed.recv().await.as_deref() != Some(b"before".as_slice()) {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                let before_deadline = tokio::time::Instant::now() < context.deadline();
+                let mut byte = [0; 1];
+                let read = reader.read(&mut byte);
+                tokio::pin!(read);
+                let first = futures_util::poll!(read.as_mut());
+                let pending_before = matches!(first, Poll::Pending);
+                let after = if pending_before {
+                    tokio::time::advance(
+                        context
+                            .deadline()
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            + Duration::from_millis(1),
+                    )
+                    .await;
+                    futures_util::poll!(read.as_mut())
+                } else {
+                    first
+                };
+                let pending_after = after.is_pending();
+                let boundary = format!("{after:?}");
+                let continued = if pending_after {
+                    writer.write_all(b"after").await?;
+                    writer.flush().await?;
+                    observed.recv().await.as_deref() == Some(b"after".as_slice())
+                } else {
+                    false
+                };
+                // Retain this exact read future across Stop. A separate waker
+                // distinguishes notification from a fresh post-Stop poll.
+                let wakes = Arc::new(ReadWake::default());
+                let stop_pending = pending_after && {
+                    let wake = Waker::from(wakes.clone());
+                    let mut cx = Context::from_waker(&wake);
+                    std::future::Future::poll(read.as_mut(), &mut cx).is_pending()
+                };
+                let wake_before = wakes.0.load(Ordering::SeqCst);
+                // Run Stop before assertions, including the expected RED path.
+                outbound.shutdown().await;
+                let read_woken = wakes.0.load(Ordering::SeqCst) > wake_before;
+                // Never poll a future that already completed on the RED path.
+                let stopped_read = if stop_pending {
+                    matches!(read.as_mut().await, Ok(0) | Err(_))
+                } else {
+                    !pending_after
+                };
+                let stopped_write = writer.write_all(b"after Stop").await.is_err();
+                Ok::<_, io::Error>((
+                    before_deadline,
+                    pending_before,
+                    pending_after,
+                    continued,
+                    stop_pending,
+                    read_woken,
+                    stopped_read,
+                    stopped_write,
+                    boundary,
+                ))
+            })
+            .await;
+            let core_stopped = tokio::time::timeout(Duration::from_secs(1), outbound.shutdown())
+                .await
+                .is_ok();
+            let peer_joined = match tokio::time::timeout(Duration::from_secs(1), &mut remote).await
+            {
+                Ok(result) => Some(result),
+                Err(_) => {
+                    remote.abort();
+                    let _ = remote.await;
+                    None
+                }
+            };
+            drop(outbound);
+            (result, core_stopped, peer_joined)
+        })
+        .await;
+    assert!(core_stopped, "Core Stop did not join its drivers");
+    assert!(
+        matches!(peer_joined, Some(Ok(Ok(())))),
+        "memory H2 peer did not join naturally: {peer_joined:?}"
+    );
+    assert!(
+        probe.snapshot().is_idle(),
+        "resources retained after cleanup: {:?}",
+        probe.snapshot()
+    );
+    let (
+        before_deadline,
+        pending_before,
+        pending_after,
+        continued,
+        stop_pending,
+        read_woken,
+        stopped_read,
+        stopped_write,
+        boundary,
+    ) = result
+        .expect("memory exchange timed out")
+        .expect("memory exchange failed");
+    assert!(stopped_read && stopped_write, "Stop left active gRPC IO");
+    assert!(
+        !pending_after || stop_pending,
+        "gRPC read completed before Stop"
+    );
+    assert!(
+        !pending_after || read_woken,
+        "Stop did not notify the pending gRPC read"
+    );
+    assert!(
+        before_deadline && pending_before,
+        "request was not established before the original deadline"
+    );
+    assert!(
+        pending_after && continued,
+        "committed VLESS gRPC expired at delayed response: {boundary}"
+    );
+}
+
 #[tokio::test]
 async fn http_upgrade_consumes_early_prefix_and_requires_valid_101_even_fast_open() {
     #[cfg(feature = "interop-test")]

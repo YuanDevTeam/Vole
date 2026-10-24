@@ -69,7 +69,9 @@ async fn vless_all_handshakes_keep_the_original_deadline_and_join_cancelled_io()
         let ProxyProtocol::Vless(node) = &parsed.proxies[0].protocol else {
             unreachable!()
         };
-        let (io, mut peer) = tokio::io::duplex(65536);
+        // Keep request submission blocked; a fully committed request may wait
+        // for application data beyond the setup deadline.
+        let (io, mut peer) = tokio::io::duplex(1);
         let outbound = VlessOutbound::new_with_path(
             node,
             UpstreamPath::proxy(Arc::new(SuppliedStream {
@@ -93,23 +95,28 @@ async fn vless_all_handshakes_keep_the_original_deadline_and_join_cancelled_io()
             if let Ok(mut connected) = outbound.connect_stream(session, &context).await {
                 let _ = connected.io.write_all(b"first").await;
                 let _ = connected.io.flush().await;
-                assert!(connected.io.read(&mut [0; 1]).await.is_err());
+                connected.io.read(&mut [0; 1]).await.is_err()
+            } else {
+                true
             }
         };
-        tokio::time::timeout(Duration::from_millis(325), task)
-            .await
-            .expect("consumer reset the original deadline");
-        assert!(start.elapsed() >= Duration::from_millis(240));
-        tokio::time::timeout(Duration::from_secs(1), outbound.shutdown())
-            .await
-            .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(325), task).await;
+        let elapsed = start.elapsed();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), outbound.shutdown()).await;
         let mut observed = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut observed))
-            .await
-            .unwrap()
-            .unwrap();
+        let joined =
+            tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut observed)).await;
+        assert!(stopped.is_ok(), "{mode}: Core Stop did not join");
+        joined.expect("memory peer did not finish").unwrap();
+        let failed =
+            result.unwrap_or_else(|_| panic!("{mode}: consumer reset the original deadline"));
+        assert!(failed, "{mode}: unfinished setup accepted application data");
+        assert!(
+            elapsed >= Duration::from_millis(240),
+            "{mode}: setup ended early"
+        );
         assert!(!observed.is_empty());
-        assert!(observed.len() <= 65536);
+        assert!(observed.len() <= 1);
     }
 }
 

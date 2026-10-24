@@ -496,9 +496,9 @@ impl VlessOutbound {
             stream_options: config.stream_options.clone(),
             tasks: TaskTracker::new(),
             grpc_pool: match &transport {
-                StreamTransport::Grpc { options, .. } => {
-                    Some(crate::transport::GrpcPool::new(options.clone()))
-                }
+                StreamTransport::Grpc { options, .. } => Some(
+                    crate::transport::GrpcPool::new_client_first(options.clone()),
+                ),
                 _ => None,
             },
             transport,

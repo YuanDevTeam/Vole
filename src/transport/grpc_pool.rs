@@ -26,7 +26,7 @@ const PING_TIMEOUT: Duration = Duration::from_secs(crate::limits::GRPC_PING_TIME
 #[derive(Clone, Copy)]
 pub(super) enum ResponsePolicy {
     SetupDeadline,
-    #[cfg(feature = "outbound-vmess")]
+    #[cfg(any(feature = "outbound-vmess", feature = "outbound-vless"))]
     ClientFirst,
 }
 
@@ -65,9 +65,9 @@ impl GrpcPool {
             tasks: TaskTracker::new(),
         }
     }
-    /// VMess bounds complete authentication submission in the caller. Keep
-    /// that client-first response policy fixed across every pooled connection.
-    #[cfg(feature = "outbound-vmess")]
+    /// Callers bound complete protocol request submission with the setup deadline.
+    /// Keep the client-first response policy fixed across pooled connections.
+    #[cfg(any(feature = "outbound-vmess", feature = "outbound-vless"))]
     pub(crate) fn new_client_first(options: GrpcOptions) -> Self {
         let mut pool = Self::new(options);
         pool.response_policy = ResponsePolicy::ClientFirst;
@@ -294,9 +294,9 @@ impl GrpcPool {
             .max_header_list_size(super::STREAM_CHUNK_BYTES as u32)
             .max_concurrent_streams(0)
             .max_send_buffer_size(super::STREAM_CHUNK_BYTES);
-        #[cfg(feature = "outbound-vmess")]
+        #[cfg(any(feature = "outbound-vmess", feature = "outbound-vless"))]
         if matches!(self.response_policy, ResponsePolicy::ClientFirst) {
-            // A queued request is not a completed H2 handshake. Keep auth
+            // A queued request is not a completed H2 handshake. Keep request
             // flush pending until peer SETTINGS, under the caller's deadline.
             builder.initial_max_send_streams(0);
         }
