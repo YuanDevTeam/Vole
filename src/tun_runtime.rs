@@ -1019,6 +1019,7 @@ async fn relay_tcp(
         Err(error) => tracing::warn!(
             session_id,
             error_kind = ?error.kind(),
+            error = %error,
             "TUN TCP relay failed"
         ),
     }
