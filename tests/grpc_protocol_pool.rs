@@ -23,6 +23,8 @@ struct DelayedResponse {
     received: AtomicUsize,
     changed: tokio::sync::Notify,
     cancel: tokio_util::sync::CancellationToken,
+    reply: tokio::sync::Notify,
+    status: AtomicUsize,
 }
 
 struct MemoryUpstream {
@@ -30,6 +32,7 @@ struct MemoryUpstream {
     tasks: TaskTracker,
     requests: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     delayed: Option<Arc<DelayedResponse>>,
+    tls: Option<Arc<rustls::ServerConfig>>,
 }
 #[async_trait::async_trait]
 impl OutboundConnector for MemoryUpstream {
@@ -43,11 +46,23 @@ impl OutboundConnector for MemoryUpstream {
         let sessions = self.tasks.clone();
         let requests = self.requests.clone();
         let delayed = self.delayed.clone();
+        let tls = self.tls.clone();
         let cancel = delayed
             .as_ref()
             .map(|state| state.cancel.clone())
             .unwrap_or_default();
         self.tasks.spawn(async move {
+            let peer: vole::dispatch::BoxStream = if let Some(tls) = tls {
+                let accepted = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return,
+                    accepted = tokio_rustls::TlsAcceptor::from(tls).accept(peer) => accepted,
+                };
+                let Ok(peer) = accepted else { return };
+                Box::new(peer)
+            } else {
+                Box::new(peer)
+            };
             let mut connection = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return,
@@ -88,15 +103,33 @@ impl OutboundConnector for MemoryUpstream {
                 let delayed = delayed.clone();
                 let cancel = cancel.clone();
                 sessions.spawn(async move {
-                    // Keep SendResponse alive without sending headers. The H2
-                    // connection task continues to drive request DATA.
-                    let _response = (response, send);
+                    // A delayed response remains live while request DATA advances.
+                    let mut response = Some(response);
+                    let mut send = send;
                     let mut first = Vec::new();
                     let mut sent = false;
                     loop {
                         let next = tokio::select! {
                             biased;
                             () = cancel.cancelled() => return,
+                            () = async {
+                                if let Some(progress) = &delayed {
+                                    progress.reply.notified().await;
+                                } else {
+                                    std::future::pending::<()>().await;
+                                }
+                            }, if delayed.is_some() && response.is_some() => {
+                                let status = delayed.as_ref().unwrap().status.load(Ordering::Acquire);
+                                let Ok(body) = response.take().unwrap().send_response(
+                                    http::Response::builder()
+                                        .status(status as u16)
+                                        .header("content-type", "application/grpc")
+                                        .body(()).unwrap(),
+                                    false,
+                                ) else { return };
+                                send = Some(body);
+                                continue;
+                            }
                             next = receive.data() => next,
                         };
                         let Some(Ok(data)) = next else { break };
@@ -115,6 +148,16 @@ impl OutboundConnector for MemoryUpstream {
                                     requests.send(first.clone()).unwrap();
                                     sent = true;
                                 }
+                            }
+                        }
+                    }
+                    if delayed.is_some() {
+                        if let Some(mut send) = send {
+                            // The upload END_STREAM must not discard the response tail.
+                            if send.send_data(bytes::Bytes::from_static(b"\0\0\0\0\x06\x0a\x04tail"), false).is_ok() {
+                                let mut trailers = http::HeaderMap::new();
+                                trailers.insert("grpc-status", "0".parse().unwrap());
+                                let _ = send.send_trailers(trailers);
                             }
                         }
                     }
@@ -151,7 +194,7 @@ async fn vmess_grpc_reuses_per_node_transport_with_fresh_authentication_and_join
         let config=Config::parse_yaml(b"mixed-port: 1080\nproxies: [{name: edge, type: vmess, server: fixture.invalid, port: 443, uuid: 07070707-0707-0707-0707-070707070707, network: grpc, grpc-opts: {grpc-service-name: edge, grpc-user-agent: vmess-memory}}]\nrules: ['MATCH,edge']").unwrap();
         let ProxyProtocol::Vmess(node)=&config.proxies[0].protocol else { unreachable!() };
         let (requests,mut observed)=tokio::sync::mpsc::unbounded_channel();
-        let upstream=Arc::new(MemoryUpstream { physical:AtomicUsize::new(0), tasks:TaskTracker::new(), requests, delayed:None });
+        let upstream=Arc::new(MemoryUpstream { physical:AtomicUsize::new(0), tasks:TaskTracker::new(), requests, delayed:None, tls:None });
         let first=VmessOutbound::new_with_path(node,UpstreamPath::proxy(upstream.clone())).unwrap();
         let second=VmessOutbound::new_with_path(node,UpstreamPath::proxy(upstream.clone())).unwrap();
         let session=StreamSession { metadata:Default::default(), inbound:InboundKind::InternalMeasure, source:"127.0.0.1:1".parse().unwrap(), destination:"192.0.2.1:80".parse::<std::net::SocketAddr>().unwrap().into(), sniffed_domain:None };
@@ -221,6 +264,7 @@ rules: ['MATCH,edge']
                 tasks: TaskTracker::new(),
                 requests,
                 delayed: Some(progress.clone()),
+                tls: None,
             });
             let outbound =
                 VmessOutbound::new_with_path(node, UpstreamPath::proxy(upstream.clone())).unwrap();
@@ -369,4 +413,183 @@ rules: ['MATCH,edge']
         "Stop must end pending reads and reject later writes"
     );
     assert_eq!(physical, 1, "no reconnect or replay");
+}
+
+#[cfg(all(feature = "interop-test", feature = "outbound-trojan"))]
+#[tokio::test(start_paused = true)]
+async fn trojan_grpc_committed_auth_survives_setup_deadline_validates_late_status_and_stops() {
+    use std::{io, task::Poll};
+    use tokio::io::AsyncReadExt;
+    use vole::{outbound::trojan::TrojanOutbound, resources::observation::ResourceProbe};
+
+    async fn received_after(progress: &DelayedResponse, before: usize) {
+        loop {
+            let changed = progress.changed.notified();
+            if progress.received.load(Ordering::Acquire) > before {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    let probe = ResourceProbe::default();
+    let (result, core_stopped, naturally_joined, joined) = probe.scope(async {
+        let identity = rcgen::generate_simple_self_signed(vec!["fixture.invalid".into()]).unwrap();
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13]).unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![identity.cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()),
+            ),
+        ).unwrap();
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        let config = Config::parse_yaml(br#"proxies:
+  - name: edge
+    type: trojan
+    server: fixture.invalid
+    port: 443
+    password: password
+    skip-cert-verify: true
+    network: grpc
+    grpc-opts: {grpc-service-name: edge, grpc-user-agent: vmess-memory}
+rules: ['MATCH,edge']
+"#).unwrap();
+        let ProxyProtocol::Trojan(node) = &config.proxies[0].protocol else { unreachable!() };
+        let (requests, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let progress = Arc::new(DelayedResponse::default());
+        let upstream = Arc::new(MemoryUpstream {
+            physical: AtomicUsize::new(0), tasks: TaskTracker::new(), requests,
+            delayed: Some(progress.clone()), tls: Some(Arc::new(tls)),
+        });
+        let outbound = TrojanOutbound::new_with_path(node, UpstreamPath::proxy(upstream.clone())).unwrap();
+        let session = StreamSession {
+            metadata: Default::default(), inbound: InboundKind::InternalMeasure,
+            source: "127.0.0.1:1".parse().unwrap(),
+            destination: "192.0.2.1:80".parse::<std::net::SocketAddr>().unwrap().into(),
+            sniffed_domain: None,
+        };
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut checks = Vec::new();
+            // Reject a late error status; keep half-close; stop an unresolved read.
+            for status in [503u16, 200, 0] {
+                let context = EstablishContext::with_timeout(Duration::from_secs(2));
+                let stream = outbound.connect_stream(session.clone(), &context).await
+                    .map_err(io::Error::other)?.io;
+                let authentication = observed.recv().await.ok_or_else(|| io::Error::other("fixture auth event missing"))?;
+                // Independent Trojan password vector from tests/trojan.rs and IPv4 SOCKS address.
+                let mut expected = vec![0, 0, 0, 0, 70, 0x0a, 68];
+                expected.extend_from_slice(b"d63dc919e201d7bc4c825630d2cf25fdc93d4b2f0d46706d29038d01\r\n\x01\x01\xc0\x00\x02\x01\x00\x50\r\n");
+                if authentication != expected {
+                    return Err(io::Error::other("fixture did not observe the complete Trojan auth request"));
+                }
+                let (mut reader, mut writer) = tokio::io::split(stream);
+                let before = progress.received.load(Ordering::Acquire);
+                writer.write_all(b"before original setup deadline").await?;
+                writer.flush().await?;
+                received_after(&progress, before).await;
+                let mut byte = [0; 1];
+                let (pending_before, pending_after, boundary, check) = {
+                    let read = reader.read(&mut byte);
+                    tokio::pin!(read);
+                    if tokio::time::Instant::now() >= context.deadline() {
+                        return Err(io::Error::other("fixture first read started after setup deadline"));
+                    }
+                    let initial = futures_util::poll!(read.as_mut());
+                    let pending_before = initial.is_pending();
+                    let boundary = if pending_before {
+                        tokio::time::advance(context.deadline().saturating_duration_since(tokio::time::Instant::now()) + Duration::from_millis(1)).await;
+                        futures_util::poll!(read.as_mut())
+                    } else { initial };
+                    let pending_after = boundary.is_pending();
+                    let observed_boundary = match &boundary {
+                        Poll::Ready(Err(error)) => format!("Err({:?})", error.kind()),
+                        Poll::Ready(Ok(count)) => format!("Ok({count})"),
+                        Poll::Pending => "Pending".to_owned(),
+                    };
+                    let check = if pending_after {
+                        let before = progress.received.load(Ordering::Acquire);
+                        writer.write_all(b"upload after original setup deadline").await?;
+                        writer.flush().await?;
+                        received_after(&progress, before).await;
+                        if status == 0 {
+                            // Await the exact same read first polled before the deadline.
+                            tokio::time::timeout(Duration::from_secs(1), outbound.shutdown()).await
+                                .map_err(|_| io::Error::other("Core Stop watchdog"))?;
+                            let woke = matches!(read.await, Ok(0) | Err(_));
+                            woke && writer.write_all(b"after Stop").await.is_err()
+                        } else {
+                            progress.status.store(usize::from(status), Ordering::Release);
+                            progress.reply.notify_one();
+                            if status == 200 {
+                                writer.shutdown().await?;
+                                writer.shutdown().await?;
+                                let closed = writer.write_all(b"after upload shutdown").await.is_err();
+                                // Remaining bytes are read only after this pinned first-byte read ends.
+                                matches!(read.await, Ok(1)) && closed
+                            } else {
+                                matches!(read.await, Err(error) if error.kind() == io::ErrorKind::InvalidData)
+                            }
+                        }
+                    } else { false };
+                    (pending_before, pending_after, observed_boundary, check)
+                };
+                let check = if pending_after && status == 200 {
+                    let mut tail = Vec::new();
+                    reader.read_to_end(&mut tail).await?;
+                    check && byte == [b't'] && tail == b"ail"
+                } else { check };
+                checks.push((status, pending_before, pending_after, boundary, check));
+                drop((reader, writer));
+                if !pending_before || !pending_after || !check { break; }
+            }
+            Ok::<_, io::Error>(checks)
+        }).await;
+        let core_stopped = tokio::time::timeout(Duration::from_secs(1), outbound.shutdown()).await.is_ok();
+        drop(outbound);
+        upstream.tasks.close();
+        let naturally_joined = tokio::time::timeout(Duration::from_secs(1), upstream.tasks.wait()).await.is_ok();
+        progress.cancel.cancel();
+        let joined = tokio::time::timeout(Duration::from_secs(1), upstream.tasks.wait()).await.is_ok();
+        let physical = upstream.physical.load(Ordering::SeqCst);
+        (result.map(|io| io.map(|checks| (checks, physical))), core_stopped, naturally_joined, joined)
+    }).await;
+    assert!(joined, "memory TLS/H2 peer tasks must join even after RED");
+    assert!(
+        probe.snapshot().is_idle(),
+        "Core resources must be released before behavior assertions"
+    );
+    assert!(
+        core_stopped && naturally_joined,
+        "Core Stop must close the peer naturally without fallback cancellation"
+    );
+    let (checks, physical) = result
+        .expect("memory scenario watchdog")
+        .expect("memory fixture or scenario IO");
+    for (status, before, after, boundary, check) in &checks {
+        assert!(
+            before,
+            "HTTP response gate must be pending before deadline: status={status}, {boundary}"
+        );
+        assert!(
+            after,
+            "committed Trojan auth must outlive original setup deadline: status={status}, {boundary}"
+        );
+        assert!(
+            check,
+            "late status/half-close/same-read Stop contract: status={status}, {boundary}"
+        );
+    }
+    assert_eq!(
+        checks.len(),
+        3,
+        "all three response/lifecycle phases must complete"
+    );
+    assert_eq!(
+        physical, 1,
+        "the actual Trojan private pool must not reconnect or replay"
+    );
 }

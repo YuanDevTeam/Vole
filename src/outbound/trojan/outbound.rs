@@ -72,7 +72,7 @@ impl TrojanOutbound {
                 )),
                 TrojanTransport::Grpc { uri, options } => Transport::Grpc {
                     uri: uri.clone(),
-                    pool: GrpcPool::duplex(options.clone()),
+                    pool: GrpcPool::duplex_client_first(options.clone()),
                 },
             },
             server: server_destination(&config.address, config.port)?,

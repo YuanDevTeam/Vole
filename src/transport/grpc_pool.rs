@@ -26,7 +26,11 @@ const PING_TIMEOUT: Duration = Duration::from_secs(crate::limits::GRPC_PING_TIME
 #[derive(Clone, Copy)]
 pub(super) enum ResponsePolicy {
     SetupDeadline,
-    #[cfg(any(feature = "outbound-vmess", feature = "outbound-vless"))]
+    #[cfg(any(
+        feature = "outbound-vmess",
+        feature = "outbound-vless",
+        feature = "outbound-trojan"
+    ))]
     ClientFirst,
 }
 
@@ -98,6 +102,14 @@ impl GrpcPool {
     pub(crate) fn duplex(options: GrpcOptions) -> Self {
         let mut pool = Self::new(options);
         pool.half_close = true;
+        pool
+    }
+    /// Trojan bounds authentication submission separately and keeps receiving
+    /// after upload END_STREAM while waiting for the first HTTP response.
+    #[cfg(feature = "outbound-trojan")]
+    pub(crate) fn duplex_client_first(options: GrpcOptions) -> Self {
+        let mut pool = Self::duplex(options);
+        pool.response_policy = ResponsePolicy::ClientFirst;
         pool
     }
     /// The factory is invoked only for a new physical connection. A reused
@@ -294,7 +306,11 @@ impl GrpcPool {
             .max_header_list_size(super::STREAM_CHUNK_BYTES as u32)
             .max_concurrent_streams(0)
             .max_send_buffer_size(super::STREAM_CHUNK_BYTES);
-        #[cfg(any(feature = "outbound-vmess", feature = "outbound-vless"))]
+        #[cfg(any(
+            feature = "outbound-vmess",
+            feature = "outbound-vless",
+            feature = "outbound-trojan"
+        ))]
         if matches!(self.response_policy, ResponsePolicy::ClientFirst) {
             // A queued request is not a completed H2 handshake. Keep request
             // flush pending until peer SETTINGS, under the caller's deadline.

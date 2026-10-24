@@ -47,7 +47,7 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   域名的编码地址不能通过转换取得新的回环例外；UWP 物理绑定下同样拒绝编码地址转为回环。
   显式普通回环节点保留原行为；解析查询仍遵循 DNS 的既有 IPv6 开关，不为 IP4P 自动增加 AAAA 查询。
 - gRPC/legacy H2 首次读取延迟响应头时先检查原建链期限，即使响应已就绪也不能绕过
-  超时；响应头已确认后的业务读取不再受该期限限制。VMess gRPC 由外层在原期限内
+  超时；响应头已确认后的业务读取不再受该期限限制。VMess／Trojan gRPC 由外层在原期限内
   等待对端 H2 SETTINGS、提交并 flush 完整认证请求，此后允许 client-first 业务等待响应，
   不再沿用该期限；未完成 H2 握手或请求提交时仍受原期限限制。
 - HTTP、SOCKS5、TUN、DNS 选路及 node-only `measureDelay` 使用同一连接器。
@@ -372,6 +372,10 @@ gRPC 的 HTTP authority 使用非空 SNI，否则使用 server，不包含端口
 gRPC 选项与 VMess/VLESS 共用：省略或空 service-name 默认 GunService，普通名映射 /name/Tun，以 / 开头使用完整路径；省略或空 user-agent 默认 grpc-go/1.36.0。
 ping-interval 为秒，0 不主动 PING，负值明确拒绝；max-connections/min-streams/max-streams 接受带符号整数，负阈值禁用相应分支。三项字面全零归一 max-connections=1；正 max-connections 优先于 max-streams。
 每个节点独立拥有连接池，空闲连接总是复用；复用保留原上游选择、TLS 身份和认证策略，每条逻辑流仍单独发送 Trojan 认证头。
+
+Trojan 私有 gRPC 池在原绝对期限内等待 H2 SETTINGS、提交并 flush 完整认证请求，
+随后允许 client-first 上传等待迟到的 HTTP 响应，不把建链期限继续套用到业务。
+迟到的 HTTP/gRPC 状态仍完整校验；未完成认证提交、TLS 或 H2 握手继续受原期限约束。
 
 TCP 保留半关闭；gRPC duplex 发送 END_STREAM，不用 RST_STREAM 提前结束读侧。
 UDP 使用同一已认证流上的地址/长度/CRLF 帧，无额外 socket/读取泵/池。
