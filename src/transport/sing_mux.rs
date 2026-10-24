@@ -80,9 +80,11 @@ impl Pool {
             drained,
         }
     }
-    pub(crate) fn set_autonomous_writes(&mut self, enabled: bool) {
-        self.autonomous_writes =
-            enabled && self.options.protocol == SingMuxProtocol::Smux && !self.options.padding;
+    pub(crate) fn set_autonomous_writes(&mut self, enabled: bool, h2_packet_up: bool) {
+        self.autonomous_writes = enabled
+            && !self.options.padding
+            && (self.options.protocol == SingMuxProtocol::Smux
+                || (self.options.protocol == SingMuxProtocol::H2Mux && h2_packet_up));
     }
     pub(crate) fn autonomous_writes(&self) -> bool {
         self.autonomous_writes
@@ -175,7 +177,10 @@ impl Pool {
                         // This control stream consumes an actual transport ID
                         // even though it never becomes a business lease.
                         connection.issued.fetch_add(1, Ordering::AcqRel);
-                        let mut control = connection.sender.open(deadline).await?;
+                        let mut control = connection
+                            .sender
+                            .open(deadline, self.autonomous_writes)
+                            .await?;
                         let rate = brutal::exchange(&mut control, options.up, options.down).await?;
                         #[cfg(target_os = "linux")]
                         if let Some(physical) = supplied.control
@@ -195,7 +200,7 @@ impl Pool {
                     break pair;
                 }
             };
-            let mut raw = sender.open(deadline).await?;
+            let mut raw = sender.open(deadline, self.autonomous_writes).await?;
             let mut request = Vec::with_capacity(262);
             request.extend_from_slice(&(if udp { 3_u16 } else { 0 }).to_be_bytes());
             crate::socks5::encode_address(target, &mut request)?;
@@ -275,9 +280,9 @@ impl Drop for Pool {
     }
 }
 impl Sender {
-    async fn open(&self, deadline: Instant) -> io::Result<BoxStream> {
+    async fn open(&self, deadline: Instant, autonomous: bool) -> io::Result<BoxStream> {
         match self {
-            Self::H2(sender) => super::grpc::mux_stream(sender.clone(), deadline).await,
+            Self::H2(sender) => super::grpc::mux_stream(sender.clone(), deadline, autonomous).await,
             Self::Yamux(sender) => sender.open().await,
             Self::Smux(sender) => sender.open().await,
         }
@@ -561,7 +566,7 @@ mod tests {
         let mut short_receipt = None;
 
         for index in 0..3 {
-            let mut raw = sender.open(deadline).await.unwrap();
+            let mut raw = sender.open(deadline, false).await.unwrap();
             let metadata = [0, if index == 2 { 3 } else { 0 }, 1, 192, 0, 2, 1, 1, 187];
             raw.write_all(&metadata).await.unwrap();
             raw.flush().await.unwrap();
@@ -721,7 +726,7 @@ mod tests {
             let (sender, driver) = h2_driver::new(Box::new(raw)).await.unwrap();
             let client_driver = tokio::spawn(driver);
             let deadline = Instant::now() + std::time::Duration::from_secs(10);
-            let mut raw = Sender::H2(sender).open(deadline).await.unwrap();
+            let mut raw = Sender::H2(sender).open(deadline, false).await.unwrap();
             let metadata = [0, 0, 1, 192, 0, 2, 1, 1, 187];
             raw.write_all(&metadata).await.unwrap();
             raw.flush().await.unwrap();

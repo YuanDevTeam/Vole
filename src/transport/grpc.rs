@@ -21,6 +21,8 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+#[cfg(feature = "sing-mux")]
+use super::h2_write::CoalescedAck;
 use super::h2_write::{Payload, Receipt, Sender, Writes};
 use super::{STREAM_BUFFER_BYTES as LIMIT, STREAM_CHUNK_BYTES as CHUNK};
 use crate::dispatch::BoxStream;
@@ -238,6 +240,8 @@ struct Grpc {
     send: H2Send,
     writes: Writes,
     pending: Option<Receipt>,
+    #[cfg(feature = "sing-mux")]
+    coalesced: Option<Arc<CoalescedAck>>,
     deadline: Pin<Box<tokio::time::Sleep>>,
     frame: Bytes,
     wire: BytesMut,
@@ -294,6 +298,10 @@ pub(super) async fn pooled_stream(
 
 impl Drop for Grpc {
     fn drop(&mut self) {
+        #[cfg(feature = "sing-mux")]
+        if let Some(ack) = &self.coalesced {
+            ack.fail(io::ErrorKind::BrokenPipe);
+        }
         self.close.stop();
         if let Some(lease) = &self._lease {
             lease.close_stream();
@@ -446,7 +454,11 @@ pub(super) async fn pooled_connect_admitted(
 
 /// sing-mux uses plain HTTP/2 CONNECT streams, not gRPC records.
 #[cfg(feature = "sing-mux")]
-pub(super) async fn mux_stream(sender: Sender, deadline: Instant) -> io::Result<BoxStream> {
+pub(super) async fn mux_stream(
+    sender: Sender,
+    deadline: Instant,
+    autonomous: bool,
+) -> io::Result<BoxStream> {
     let writes = sender.writes;
     let mut sender = sender.request.ready().await.map_err(|_| invalid())?;
     let request = http::Request::builder()
@@ -466,6 +478,7 @@ pub(super) async fn mux_stream(sender: Sender, deadline: Instant) -> io::Result<
         None,
         writes,
     );
+    stream.coalesced = autonomous.then(|| Arc::new(CoalescedAck::default()));
     // sing-mux owns the logical setup deadline, including metadata and the
     // optional Brutal exchange. A valid upload can outlive delayed H2 headers;
     // do not hide a second response timer beneath its business-write boundary.
@@ -508,6 +521,8 @@ impl Grpc {
             deadline: Box::pin(tokio::time::sleep_until(deadline)),
             writes,
             pending: None,
+            #[cfg(feature = "sing-mux")]
+            coalesced: None,
             frame: Bytes::new(),
             wire: BytesMut::new(),
             payload: Bytes::new(),
@@ -528,6 +543,11 @@ impl Grpc {
         // queued DATA can remain owned by a SendStream after its driver stops.
         if self.send.poll_reset(cx).is_ready() {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        #[cfg(feature = "sing-mux")]
+        if let Some(ack) = &self.coalesced {
+            self.send.reserve_capacity(0);
+            return ack.poll_flushed(cx);
         }
         for _ in 0..crate::limits::IO_POLL_BUDGET {
             if let Some(pending) = &mut self.pending {
@@ -554,6 +574,45 @@ impl Grpc {
         }
         cx.waker().wake_by_ref();
         Poll::Pending
+    }
+
+    #[cfg(feature = "sing-mux")]
+    fn poll_coalesced_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let ack = self.coalesced.as_ref().expect("private h2mux writer");
+        ack.check(cx)?;
+        if self.send.poll_reset(cx).is_ready() {
+            ack.fail(io::ErrorKind::BrokenPipe);
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        if input.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let wanted = input.len().min(CHUNK);
+        self.send.reserve_capacity(wanted);
+        let count = ready!(self.send.poll_capacity(cx))
+            .ok_or(io::ErrorKind::BrokenPipe)?
+            .map_err(|_| io::ErrorKind::BrokenPipe)?;
+        let count = wanted.min(count);
+        if count == 0 {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        let payload = self
+            .writes
+            .coalesced_payload(Bytes::copy_from_slice(&input[..count]), ack)?;
+        if self.send.send_data(payload, false).is_err() {
+            ack.fail(io::ErrorKind::BrokenPipe);
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        // Retain demand for accepted buffered DATA, not the caller's unaccepted tail.
+        self.send.reserve_capacity(0);
+        // The existing h2 capacity includes max_send_buffer_size. No private
+        // tail/oneshot remains; its Connection owns every accepted byte.
+        Poll::Ready(Ok(count))
     }
 
     fn record(&mut self) -> io::Result<bool> {
@@ -726,6 +785,10 @@ impl AsyncWrite for Grpc {
         if self.stopped() || self.upload_closed {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
+        #[cfg(feature = "sing-mux")]
+        if self.coalesced.is_some() {
+            return self.poll_coalesced_write(cx, input);
+        }
         ready!(self.drain(cx))?;
         if input.is_empty() {
             return Poll::Ready(Ok(0));
@@ -782,5 +845,133 @@ impl AsyncWrite for Grpc {
             abort.abort();
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(all(test, feature = "sing-mux"))]
+mod coalesced_partial_memory_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn private_h2mux_partial_write_releases_unaccepted_reservation() {
+        let (raw, peer) = tokio::io::duplex(65536);
+        let (raw, writes) = Writes::wrap(Box::new(raw));
+        let (mut sender, connection) = h2::client::Builder::new()
+            .enable_push(false)
+            .max_send_buffer_size(CHUNK)
+            .handshake::<_, Payload>(raw)
+            .await
+            .unwrap();
+        let client = tokio::spawn(connection);
+        let (ready, ready_rx) = tokio::sync::oneshot::channel();
+        let (grown, grown_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut connection = h2::server::Builder::new()
+                .initial_window_size(1)
+                .handshake::<_, Bytes>(peer)
+                .await
+                .unwrap();
+            let (request, mut reply) = connection.accept().await.unwrap().unwrap();
+            let output = reply.send_response(http::Response::new(()), false).unwrap();
+            drop(reply);
+            let mut input = request.into_body();
+            let mut ping = connection.ping_pong().unwrap();
+            macro_rules! drive {
+                ($future:expr) => {{
+                    let future = $future;
+                    tokio::pin!(future);
+                    loop {
+                        tokio::select! { biased;
+                            result = &mut future => break result,
+                            next = connection.accept() => {
+                                assert!(matches!(next, Some(Ok(_))), "peer closed before fixture release");
+                            }
+                        }
+                    }
+                }};
+            }
+            drive!(ping.ping(h2::Ping::opaque())).unwrap();
+            drive!(ping.ping(h2::Ping::opaque())).unwrap();
+            ready.send(()).unwrap();
+            let prefix = drive!(input.data()).unwrap().unwrap().to_vec();
+            // Keep this one received byte's flow credit until cleanup. The
+            // new stream window adds CHUNK-1 genuine peer credit, no payload.
+            connection.set_initial_window_size(CHUNK as u32).unwrap();
+            // h2 polls pending user PING before local SETTINGS. The second
+            // PING is ordered after SETTINGS, making its ACK a real barrier.
+            drive!(ping.ping(h2::Ping::opaque())).unwrap();
+            drive!(ping.ping(h2::Ping::opaque())).unwrap();
+            grown.send(prefix).unwrap();
+            drive!(release_rx).unwrap();
+            drop((input, output, ping));
+            while let Some(result) = connection.accept().await {
+                result.unwrap();
+            }
+        });
+        let request = http::Request::builder()
+            .method("CONNECT")
+            .uri("https://fixture.invalid")
+            .body(())
+            .unwrap();
+        let (response, send) = sender.send_request(request, false).unwrap();
+        let mut stream = Grpc::new(
+            response,
+            send,
+            Framing::Plain,
+            true,
+            Instant::now() + Duration::from_secs(3),
+            Arc::default(),
+            None,
+            None,
+            writes,
+        );
+        stream.coalesced = Some(Arc::new(CoalescedAck::default()));
+        stream.response_deadline = false;
+        tokio::time::timeout(Duration::from_secs(1), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = [b'p'; CHUNK];
+        let accepted = tokio::time::timeout(Duration::from_secs(1), stream.write(&payload))
+            .await
+            .unwrap()
+            .unwrap();
+        // Caller stays idle: no second write, flush or capacity reservation.
+        let prefix = tokio::time::timeout(Duration::from_secs(1), grown_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let unused = match &stream.send {
+            H2Send::Direct(native) => Some(native.capacity()),
+            H2Send::Shared(_) => None,
+        };
+        release.send(()).unwrap();
+        drop((stream, sender));
+        let client_result = tokio::time::timeout(Duration::from_secs(1), client)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        // Both drivers naturally joined before the behavioral assertions.
+        assert!(
+            client_result.is_ok(),
+            "client cleanup failed: {client_result:?}"
+        );
+        assert_eq!(accepted, 1, "peer stream-window fixture failed");
+        assert_eq!(
+            prefix, b"p",
+            "the idle caller delivered an unaccepted suffix"
+        );
+        assert_eq!(
+            unused,
+            Some(0),
+            "private h2mux must return unaccepted partial-write credit before caller idle"
+        );
     }
 }

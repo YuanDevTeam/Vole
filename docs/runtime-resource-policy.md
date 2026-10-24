@@ -95,6 +95,10 @@ XUDP现在只拥有已认证流上的帧编码；VLESS响应头由VLESS包装层
 h2mux每流接收窗口64 KiB、连接接收窗口512 KiB，按实际读取量释放信用。
 连接额度允许少量未读取流占住各自窗口时，其他逻辑流继续接收；不预分配全部窗口。
 yamux单连接累计接纳64流后退役，连接接收窗口16 MiB；活动兄弟流继续。
+满足 XHTTP PacketUp 自主写条件的私有 h2mux，普通 DATA 仅在现有 h2 capacity
+范围内移交驱动后接纳，16 KiB 发送缓冲不变。每逻辑流固定一个确认状态，物理 flush
+列表每流至多一个弱引用登记；不按 DATA 保留 oneshot。显式 flush/END_STREAM 前仍确认
+真实 supplied IO flush，首帧期限、部分写取消、来源隔离和同步 Stop 不变；不新增任务或全局额度。
 h2mux/yamux上传半关闭保留读取与lease，smux v1关闭整条逻辑流。
 图只登记最终包装器；begin_shutdown同时关闭mux和底层准入，shutdown先join全部
 mux驱动，再等待底层协议。provider代际与node-only测速复用此屏障，没有全局池。

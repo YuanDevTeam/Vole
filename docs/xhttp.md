@@ -148,6 +148,11 @@ VLESS XHTTP、无 VLESS Encryption 且未启用 sing-mux padding 时，smux DATA
 等待真实底层 flush，shutdown 与 FIN 的顺序不变；其它路径保持逐批强 flush。
 该路径的 UDP 首帧保留原期限内的 setup flush，后续完整帧由 XHTTP 自有任务推进。
 最多仍保留一个待写 UDP 帧；取消后的偏移、首帧期限和 Stop 屏障保持。
+VLESS 的 PacketUp XHTTP、无 VLESS Encryption 且无 sing-mux padding 时，h2mux
+普通 DATA 先申请既有 h2 容量，实际移交 Connection 驱动后返回；不逐帧等待 POST 确认。
+每个逻辑写端以固定确认状态合并进度，每次物理 flush 前至多登记一次；不按 DATA 分配
+oneshot，也不增加 payload 队列。显式 flush、元数据与首 UDP 帧仍等待真实底层 flush；
+后续 UDP 尾帧无需额外 write 即可推进。其它 h2mux 和普通 gRPC/legacy H2/CONNECT 保持原行为。
 h2mux 和 yamux 关闭上传后保留读取与租约，允许对端继续发送尾部；h2mux 的上传
 数据须到达上游 IO 的 flush 边界再发送 END_STREAM。节点 Stop 或 Drop 可取消待写，
 不承诺异常终止交付。
