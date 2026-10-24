@@ -72,7 +72,7 @@ impl Fixture {
         });
         let owner = Arc::new(DriverOwner::default());
         let (sender, connection) =
-            super::super::h2_driver::connect(Box::new(client_io), 64 * 1024, -1, &owner)
+            super::super::h2_driver::connect(Box::new(client_io), 64 * 1024, -1, &owner, false)
                 .await
                 .unwrap();
         let request = RequestTemplate {

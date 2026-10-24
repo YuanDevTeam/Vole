@@ -26,6 +26,7 @@ pub(super) enum Policy {
 pub(super) struct Pool {
     options: Option<Arc<XHttpReuseConfig>>,
     share_active: bool,
+    private_active_h2: bool,
     concurrency: usize,
     connections: usize,
     state: Arc<Mutex<State>>,
@@ -60,6 +61,26 @@ struct Entry {
     _observation: Guard,
 }
 impl Entry {
+    // This is a conservative logical reservation check, not a fabricated
+    // "remaining stream credit" API. Only the private H2 pool calls it.
+    fn permits_private_h2_lease(&self) -> bool {
+        let Transport::Multiplexed(physical) = &self.transport else {
+            return false;
+        };
+        let SendRequest::H2(sender) = &physical.sender else {
+            return false;
+        };
+        if self.active >= sender.request.current_max_send_streams() {
+            return false;
+        }
+        // A clone has no pending request: this detects GOAWAY/connection
+        // errors without waiting or registering a capacity waiter. Capacity
+        // itself comes from the peer cap + logical reservations above.
+        let mut sender = sender.request.clone();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        matches!(sender.poll_ready(&mut cx), std::task::Poll::Ready(Ok(())))
+    }
+
     fn retired(&self) -> bool {
         matches!(&self.transport, Transport::Multiplexed(physical) if physical.driver.task.is_finished() || matches!(&physical.sender, SendRequest::H3(sender) if !sender.requests.can_open_request()))
             || self.remaining == Some(0)
@@ -117,11 +138,30 @@ impl State {
 }
 impl Pool {
     pub(super) fn new(options: Option<Arc<XHttpReuseConfig>>, version: XHttpVersion) -> Self {
-        let share_active = options.is_none() && version == XHttpVersion::Http3;
+        Self::build(options, version, false)
+    }
+    #[cfg(feature = "outbound-vless")]
+    pub(super) fn active_h2() -> Self {
+        Self::build(None, XHttpVersion::Http2, true)
+    }
+    #[cfg(feature = "outbound-vless")]
+    pub(super) fn shares_active(&self) -> bool {
+        self.share_active
+    }
+    fn build(
+        options: Option<Arc<XHttpReuseConfig>>,
+        version: XHttpVersion,
+        active_h2: bool,
+    ) -> Self {
+        let share_active = options.is_none() && (version == XHttpVersion::Http3 || active_h2);
         Self {
             concurrency: options.as_ref().map_or(
                 if share_active {
-                    crate::limits::XHTTP_ACTIVE_H3_LEASES
+                    if version == XHttpVersion::Http2 {
+                        crate::limits::XHTTP_ACTIVE_H2_LEASES
+                    } else {
+                        crate::limits::XHTTP_ACTIVE_H3_LEASES
+                    }
                 } else {
                     0
                 },
@@ -132,6 +172,7 @@ impl Pool {
                 .map_or(0, |options| options.connections.sample()),
             options,
             share_active,
+            private_active_h2: active_h2,
             state: Arc::new(Mutex::new(State {
                 idle_limit: if share_active { 0 } else { MAX_IDLE_ENTRIES },
                 ..State::default()
@@ -165,6 +206,7 @@ impl Pool {
                     .entries
                     .iter_mut()
                     .filter(|entry| self.concurrency == 0 || entry.active < self.concurrency)
+                    .filter(|entry| !self.private_active_h2 || entry.permits_private_h2_lease())
                     .min_by_key(|entry| entry.active)
                     .map(|entry| -> io::Result<_> {
                         Ok((entry.take(policy), entry.reserve(&self.state, true)?))

@@ -175,7 +175,8 @@ XHTTP 和 DoH/H3 通过 `quinn-h3-transport` 使用官方 h3/h3-quinn，共享�
 [XHTTP](xhttp.md) 与 [DNS](tun-icmp-dns.md)。
 
 未显式配置 reuse-settings 的 XHTTP H3 复用既有活动连接，每条最多 4 个逻辑租约；
-最后一个租约释放即移出候选池并按既有预算收尾，不缓存空闲连接。显式复用参数及 H1/H2 默认保持各自契约。
+最后一个租约释放即移出候选池并按既有预算收尾，不缓存空闲连接。
+满足 [XHTTP 固定出口与安全边界](xhttp.md#http-transport-复用) 的 VLESS 私有 H2 腿采用相同 active-only 模型，每条最多 4 个逻辑租约，上传/显式下载各自隔离；其它 H2 路径、H1 与显式复用参数保持原契约。阈值溢出创建新物理连接，不拒绝逻辑流，不改变每流窗口或缓冲。
 
 `quiche-h3-transport` 为 TrustTunnel/MASQUE 使用官方 quiche 的低层驱动，共享上述数据报适配器，不创建新的 socket。
 接收时移动既有队列中的数据报，独占存储直接交给 quiche 原地解密；共享或不可变存储

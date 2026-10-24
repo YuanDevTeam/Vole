@@ -53,6 +53,8 @@ VLESS packetaddr 自主写使用实际 PacketUp Writer 的纯内存 H2 duplex：
 检查越过原建链期限后由 send／receive 恢复同帧、无重放及回复来源。
 这些内存 seam 不代替 H3、真实 TUN、进程 RSS 或压力验收。
 
+VLESS 私有 H2 split 活动租约：`--lib outbound::vless::outbound::active_h2_memory_tests::private_split_h2_shares_four_active_leases_and_stops_both_legs -- --exact`，以真实 duplex H2 两腿验证四租约共享、阈值扩容、兄弟关闭、末租约释放和同步 Stop/join；它不是实际 TUN 或 TLS wire 互通验收。
+
 规则输入与 selector 元数据（纯内存）：`config::name_regex::tests::`、
 `config::domain_regex::tests::`、`config::rule_provider::tests::classical_`、
 `routing::tests::in_name_`。覆盖命名/数字捕获编号、IN-NAME 和混合 classical 条件。

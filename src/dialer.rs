@@ -462,6 +462,38 @@ impl Default for Dialer {
 }
 
 impl Dialer {
+    /// Only immutable direct egress may donate a private active H2 connection.
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn permits_static_h2_reuse(&self) -> bool {
+        if self.protector.is_some()
+            || self.dns_binding.is_some()
+            || self.source_binding.is_some()
+            || self.egress.interface.is_some()
+            || self.mptcp
+            || self.ip_version != crate::config::IpVersion::Dual
+        {
+            return false;
+        }
+        #[cfg(all(windows, feature = "windows-uwp"))]
+        if self.physical_adapter.is_some() || self.interface_binding.is_some() {
+            return false;
+        }
+        #[cfg(all(target_os = "linux", feature = "tun"))]
+        if self
+            .linux_policy
+            .as_ref()
+            .is_some_and(|policy| policy.detects_interface())
+        {
+            return false;
+        }
+        true
+    }
+
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn h2_reuse_cancellation(&self) -> CancellationToken {
+        self.initialization.cancellation.clone()
+    }
+
     pub(crate) fn with_egress(mut self, options: &crate::config::EgressOptions) -> Self {
         self.egress = self.egress.overlay(options);
         self

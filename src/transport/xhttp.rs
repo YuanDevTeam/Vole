@@ -149,6 +149,34 @@ impl XHttpClient {
         }
     }
 
+    /// Opt-in only after the VLESS leg proves immutable physical/security scope.
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn enable_active_h2_reuse(&mut self) {
+        if self.http_version == crate::config::XHttpVersion::Http2 && self.reuse.is_none() {
+            self.pool = Arc::new(pool::Pool::active_h2());
+        }
+    }
+
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn uses_active_h2_reuse(&self) -> bool {
+        self.http_version == crate::config::XHttpVersion::Http2
+            && self.reuse.is_none()
+            && self.pool.shares_active()
+    }
+
+    /// A context requesting a fresh physical socket keeps the original owner
+    /// and request template, but cannot read or populate the active candidate pool.
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn h2_lease(&self, allow_reuse: bool) -> std::borrow::Cow<'_, Self> {
+        if self.uses_active_h2_reuse() && !allow_reuse {
+            let mut independent = self.clone();
+            independent.pool = Arc::new(pool::Pool::new(None, self.http_version));
+            std::borrow::Cow::Owned(independent)
+        } else {
+            std::borrow::Cow::Borrowed(self)
+        }
+    }
+
     pub(crate) fn new_with_limits(
         config: XHttpConfig,
         send_buffer_size: usize,
@@ -455,6 +483,10 @@ impl XHttpClient {
                 .await
                 .map(|(sender, guard)| (sender, Arc::new(guard)));
         }
+        #[cfg(feature = "outbound-vless")]
+        let private_active_h2 = self.uses_active_h2_reuse();
+        #[cfg(not(feature = "outbound-vless"))]
+        let private_active_h2 = false;
         h2_driver::connect(
             stream,
             self.send_buffer_size,
@@ -462,6 +494,7 @@ impl XHttpClient {
                 .as_ref()
                 .map_or(0, |options| options.keep_alive_seconds),
             &self.owner,
+            private_active_h2,
         )
         .await
     }

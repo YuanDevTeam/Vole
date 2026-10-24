@@ -257,6 +257,18 @@ impl EstablishContext {
         context
     }
 
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn captures_tcp_control(&self) -> bool {
+        #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+        {
+            self.tcp_control.is_some()
+        }
+        #[cfg(not(all(target_os = "linux", feature = "sing-mux")))]
+        {
+            false
+        }
+    }
+
     /// MASQUE's positive timeout owns shared creation independently of a
     /// waiting caller. Preserve its selected upstreams and inbound identity.
     #[cfg(feature = "outbound-masque")]
@@ -736,6 +748,26 @@ impl UpstreamPath {
     #[must_use]
     pub fn proxy(connector: Arc<dyn OutboundConnector>) -> Self {
         Self::Proxy(connector)
+    }
+
+    /// Structural proof for one private VLESS leg; never resolves a group.
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn static_h2_dialer(&self, server: &Destination) -> Option<&Dialer> {
+        let Destination::Ip(address) = server else {
+            return None;
+        };
+        let dialer = match self {
+            Self::LazyDirect { dialer } => dialer,
+            Self::Direct { endpoint, dialer }
+                if endpoint.port == address.port()
+                    && endpoint.logical_host.parse::<IpAddr>().ok() == Some(address.ip())
+                    && endpoint.addresses.as_slice() == std::slice::from_ref(address) =>
+            {
+                dialer
+            }
+            _ => return None,
+        };
+        dialer.permits_static_h2_reuse().then_some(dialer)
     }
 
     pub(crate) fn is_direct(&self, context: &EstablishContext) -> Result<bool, DispatchError> {

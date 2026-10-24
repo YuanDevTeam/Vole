@@ -79,7 +79,11 @@ H1 编码保留正文 backing，不将整批正文再次拼入头部写缓冲；
 
 ## HTTP transport 复用
 
-`reuse-settings` 缺省时，H1/H2 不建立节点池；H3 只共享活动物理连接，每条最多承载 4 个活动逻辑租约。
+`reuse-settings` 缺省时，H1 和通用 H2 transport 构造保持独立物理连接；H3 只共享活动物理连接，每条最多承载 4 个活动逻辑租约。
+仅 VLESS packet-up 且存在显式 download-settings、上传和下载均为 H2 与静态普通 TLS 或 JLS 时，可按每腿的字面 IP、固定直接上游和固定物理出口证明共享活动连接，每条最多 4 个逻辑租约。上传与显式下载腿各有独立池，不跨节点或资源代复用；单腿、stream-one/stream-up、明文和其它版本组合保持原路径。
+实际租约同时受对端 HTTP/2 并发 stream 额度约束；收到 GOAWAY 后新逻辑请求另建物理连接，现有流继续排空，不重放已发送正文。
+域名、动态组/代理上游、文件客户端证书、动态 ECH、REALITY/ShadowTLS、opaque protect、DNS/source/interface binding、自动出口发现、非 dual IP-version、MPTCP 和 Windows adapter binding 保持原独立路径；请求 TCP-control 的逻辑建链也独立。它们仍受支持，不增加配置拒绝。
+每次逻辑租约保留原路径预检：LazyDirect 使用字面端点 resolver，预解析 Direct 保留其端点而不新增 resolver 依赖，两者均保留 deadline/cancellation/地址族/IP4P 检查；Dialer 停机、节点 Stop、物理连接退役及原建链期限也覆盖等待池创建与命中活动连接的路径。mark、TFO、TLS 参数、HTTP 请求模板及队列预算保持原腿配置，不通过新默认 Dialer 重拨。
 最后一个租约释放后立即移出候选池，并进入既有的有界传输收尾流程，不保留空闲候选。
 这限制了并行连接的重复开销，不是全节点业务准入额度。
 `{}` 启用显式复用池，使用下表默认值与有界空闲缓存。

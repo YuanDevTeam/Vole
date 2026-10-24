@@ -35,6 +35,11 @@ impl SocketPolicy {
         !self.detect
     }
 
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn detects_interface(&self) -> bool {
+        self.detect
+    }
+
     fn default_mark(&self, configured_mark: u32) -> Option<u32> {
         // Every capture rule matches only mark zero. A nonzero public mark
         // already bypasses this lease and must retain its own RPDB meaning.
