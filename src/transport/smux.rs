@@ -1,5 +1,5 @@
 //! Independent smux v1 client framing. One owned reader/writer pair, bounded
-//! physical write queue and per-stream receive queues; no detached workers.
+//! physical write queue and connection-budgeted receive queues; no detached workers.
 use crate::dispatch::BoxStream;
 use bytes::Buf;
 use bytes::Bytes;
@@ -37,7 +37,7 @@ impl Default for Options {
         Self {
             version: 1,
             frame_size: crate::limits::SING_MUX_CHUNK,
-            receive_buffer: 4 * 1024 * 1024,
+            receive_buffer: 2 * 1024 * 1024,
             stream_buffer: crate::limits::SMUX_RECEIVE_QUEUE * crate::limits::SING_MUX_CHUNK,
             keepalive: None,
         }
@@ -46,6 +46,12 @@ impl Default for Options {
 struct Packet {
     data: Bytes,
     _permit: tokio::sync::OwnedSemaphorePermit,
+}
+// Charge each queued frame for its payload and a conservative bookkeeping fee.
+// This is a connection admission budget, not a process RSS bound. A legal
+// quota-sized frame must still make progress when the configured quota is small.
+fn receive_charge(length: usize, budget: usize) -> usize {
+    (length + 128).min(budget)
 }
 struct Flow {
     written: AtomicU32,
@@ -114,8 +120,10 @@ impl Client {
             .reserve_owned()
             .await
             .map_err(|_| io::ErrorKind::ConnectionAborted)?;
-        let capacity =
-            (self.shared.options.stream_buffer / self.shared.options.frame_size).clamp(1, 256);
+        let budget = self.shared.options.receive_buffer;
+        // Allocation permits bound live frames, so no individual stream queue
+        // fills before the connection-wide byte budget is exhausted.
+        let capacity = budget / receive_charge(1, budget);
         let (tx, receive) = mpsc::channel(capacity);
         let flow = Arc::new(Flow::new());
         let close = CancellationToken::new();
@@ -152,7 +160,7 @@ impl Client {
             id,
             shared: self.shared.clone(),
             write: PollSender::new(self.write.clone()),
-            receive,
+            receive: Some(receive),
             close: close.clone(),
             cancelled: Box::pin(close.cancelled_owned()),
             remote_fin,
@@ -234,7 +242,13 @@ fn configure(
     let read_shared = shared.clone();
     let read_last = last_read.clone();
     let read = async move {
+        let mut processed = 0;
         loop {
+            if processed == crate::limits::IO_POLL_BUDGET {
+                processed = 0;
+                tokio::task::yield_now().await;
+            }
+            processed += 1;
             let mut header = [0; 8];
             reader.read_exact(&mut header).await?;
             let cmd = header[1];
@@ -286,7 +300,7 @@ fn configure(
             }
             let permit = receive_budget
                 .clone()
-                .acquire_many_owned(length as u32)
+                .acquire_many_owned(receive_charge(length, options.receive_buffer) as u32)
                 .await
                 .map_err(|_| io::ErrorKind::ConnectionAborted)?;
             let mut data = vec![0; length];
@@ -493,7 +507,7 @@ struct Stream {
     id: u32,
     shared: Arc<Shared>,
     write: PollSender<Command>,
-    receive: mpsc::Receiver<Packet>,
+    receive: Option<mpsc::Receiver<Packet>>,
     receive_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     flow: Arc<Flow>,
     since_update: u32,
@@ -511,12 +525,13 @@ impl Stream {
         self.shared.changed.notify_one();
         self.pending.take();
         self.write.abort_send();
-        self.receive.close();
+        self.receive.take();
         self.data = Bytes::new();
         self.receive_permit.take();
     }
     fn flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.cancelled.as_mut().poll(cx).is_ready() {
+            self.stop();
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
         if let Some(pending) = &mut self.pending {
@@ -555,11 +570,18 @@ impl AsyncRead for Stream {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if out.remaining() == 0 || self.cancelled.as_mut().poll(cx).is_ready() {
+        if out.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if self.cancelled.as_mut().poll(cx).is_ready() {
+            self.stop();
             return Poll::Ready(Ok(()));
         }
         if self.data.is_empty() {
-            match ready!(self.receive.poll_recv(cx)) {
+            let Some(receive) = self.receive.as_mut() else {
+                return Poll::Ready(Ok(()));
+            };
+            match ready!(receive.poll_recv(cx)) {
                 Some(packet) => {
                     self.data = packet.data;
                     self.receive_permit = Some(packet._permit);
@@ -570,10 +592,10 @@ impl AsyncRead for Stream {
         let n = out.remaining().min(self.data.len());
         out.put_slice(&self.data[..n]);
         self.data.advance(n);
-        if let Some(permit) = &mut self.receive_permit {
-            drop(permit.split(n));
-        }
         if self.data.is_empty() {
+            // Advancing Bytes does not release its backing allocation. Retain
+            // the whole admission permit until that allocation is dropped.
+            self.data = Bytes::new();
             self.receive_permit.take();
         }
         if self.shared.options.version == 2 {
@@ -634,6 +656,7 @@ impl AsyncWrite for Stream {
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.close.is_cancelled() {
+            self.stop();
             return Poll::Ready(Ok(()));
         }
         ready!(self.poll_flush_barrier(cx))?;
@@ -647,11 +670,491 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    fn metered_peer(
+        options: Options,
+    ) -> (
+        Client,
+        impl Future<Output = ()> + Send,
+        tokio::io::DuplexStream,
+        Arc<FlushGateState>,
+    ) {
+        let (raw, peer) = tokio::io::duplex(4096);
+        let meter = Arc::new(FlushGateState::default());
+        meter.mode.store(1, Ordering::Release);
+        let (client, driver) = with_options(
+            Box::new(FlushGate {
+                raw,
+                state: meter.clone(),
+            }),
+            options,
+        )
+        .expect("valid memory receive fixture options");
+        (client, driver, peer, meter)
+    }
+
+    async fn drive_ready_once<F: Future<Output = ()>>(mut driver: Pin<&mut F>) -> io::Result<()> {
+        let result = std::future::poll_fn(|cx| {
+            let mut ready = std::pin::pin!(tokio::task::unconstrained(driver.as_mut()));
+            Poll::Ready(ready.as_mut().poll(cx))
+        })
+        .await;
+        if result.is_pending() {
+            Ok(())
+        } else {
+            Err(io::Error::other("memory smux driver ended unexpectedly"))
+        }
+    }
+
+    async fn open_memory_stream<F: Future<Output = ()>>(
+        client: &Client,
+        driver: Pin<&mut F>,
+        peer: &mut tokio::io::DuplexStream,
+    ) -> io::Result<(BoxStream, u32)> {
+        let mut opening = Box::pin(client.open());
+        if !futures_util::poll!(opening.as_mut()).is_pending() {
+            return Err(io::Error::other("stream opened before its SYN was driven"));
+        }
+        drive_ready_once(driver).await?;
+        let stream = opening.await?;
+        let mut syn = [0; 8];
+        peer.read_exact(&mut syn).await?;
+        let id = u32::from_le_bytes(syn[4..].try_into().unwrap());
+        if syn[..4] != [1, 0, 0, 0] || id % 2 != 1 {
+            return Err(io::Error::other(
+                "memory receive fixture saw an invalid SYN",
+            ));
+        }
+        Ok((stream, id))
+    }
+
+    fn memory_frame(wire: &mut Vec<u8>, cmd: u8, id: u32, data: &[u8]) {
+        wire.extend_from_slice(&[1, cmd]);
+        wire.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        wire.extend_from_slice(&id.to_le_bytes());
+        wire.extend_from_slice(data);
+    }
+
+    async fn read_memory<F: Future<Output = ()>>(
+        stream: &mut BoxStream,
+        mut driver: Pin<&mut F>,
+        data: &mut [u8],
+    ) -> io::Result<()> {
+        let mut reading = Box::pin(stream.read_exact(data));
+        std::future::poll_fn(|cx| {
+            if let Poll::Ready(result) = reading.as_mut().poll(cx) {
+                return Poll::Ready(result.map(|_| ()));
+            }
+            let mut ready = std::pin::pin!(tokio::task::unconstrained(driver.as_mut()));
+            if ready.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(io::Error::other(
+                    "memory smux driver ended while reading",
+                )));
+            }
+            reading.as_mut().poll(cx).map(|result| result.map(|_| ()))
+        })
+        .await
+    }
+
+    async fn read_once(stream: &mut BoxStream, data: &mut [u8]) -> Poll<io::Result<usize>> {
+        let mut reading = Box::pin(stream.read(data));
+        futures_util::poll!(reading.as_mut())
+    }
+
+    async fn memory_peer_eof(peer: &mut tokio::io::DuplexStream) -> bool {
+        // Drain only a bounded amount of existing SYN/FIN control output.
+        let mut tail = Vec::new();
+        let mut bounded = peer.take(4097);
+        let ended =
+            tokio::time::timeout(Duration::from_secs(2), bounded.read_to_end(&mut tail)).await;
+        matches!(ended, Ok(Ok(_))) && tail.len() < 4097
+    }
+
+    #[tokio::test]
+    async fn ready_data_reader_yields_within_one_io_poll_budget() {
+        let (client, driver, mut peer, meter) = metered_peer(Options {
+            frame_size: 16 * 1024,
+            // Keep the legacy fixture wide enough not to mask missing fairness.
+            stream_buffer: 2 * 1024 * 1024,
+            ..Options::default()
+        });
+        let mut driver = Box::pin(driver);
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            let (stream, id) = open_memory_stream(&client, driver.as_mut(), &mut peer).await?;
+            let mut wire = Vec::new();
+            for value in 0..128_u8 {
+                memory_frame(&mut wire, 2, id, &[value]);
+            }
+            peer.write_all(&wire).await?;
+            let before = meter.read_bytes.load(Ordering::Acquire);
+            drive_ready_once(driver.as_mut()).await?;
+            let read_bytes = meter.read_bytes.load(Ordering::Acquire) - before;
+            drop(stream);
+            Ok::<_, io::Error>(read_bytes)
+        })
+        .await;
+        drop(driver);
+        let closed = client.shared.state.lock().unwrap().closed;
+        let eof = memory_peer_eof(&mut peer).await;
+        assert!(
+            closed && eof,
+            "reader fairness fixture did not close driver/peer"
+        );
+        let read_bytes = observed
+            .expect("reader fairness fixture watchdog expired")
+            .expect("reader fairness fixture failed before DATA observation");
+        assert!(
+            read_bytes >= 9,
+            "reader fairness fixture did not advance DATA"
+        );
+        let frames_read = read_bytes / 9;
+        assert!(
+            frames_read <= crate::limits::IO_POLL_BUDGET,
+            "ready smux DATA reader exceeded one IO poll budget: read {frames_read} complete frames"
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_stream_does_not_block_sibling_data_and_fin() {
+        let (client, driver, mut peer, _meter) = metered_peer(Options::default());
+        let mut driver = Box::pin(driver);
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            let (unread, first) = open_memory_stream(&client, driver.as_mut(), &mut peer).await?;
+            let (mut sibling, second) =
+                open_memory_stream(&client, driver.as_mut(), &mut peer).await?;
+            let mut wire = Vec::new();
+            for value in b"abcde" {
+                memory_frame(&mut wire, 2, first, &[*value]);
+            }
+            memory_frame(&mut wire, 2, second, b"z");
+            memory_frame(&mut wire, 1, second, &[]);
+            peer.write_all(&wire).await?;
+            drive_ready_once(driver.as_mut()).await?;
+            let mut byte = [0];
+            let progressed = match read_once(&mut sibling, &mut byte).await {
+                Poll::Pending => false,
+                Poll::Ready(Ok(1)) => true,
+                _ => return Err(io::Error::other("sibling ended before its queued DATA")),
+            };
+            let eof = if progressed {
+                matches!(read_once(&mut sibling, &mut [0]).await, Poll::Ready(Ok(0)))
+            } else {
+                false
+            };
+            drop((unread, sibling));
+            Ok::<_, io::Error>((progressed, byte, eof))
+        })
+        .await;
+        drop(driver);
+        let closed = client.shared.state.lock().unwrap().closed;
+        let eof = memory_peer_eof(&mut peer).await;
+        assert!(closed && eof, "sibling fixture did not close driver/peer");
+        let (progressed, byte, sibling_eof) = observed
+            .expect("sibling fixture watchdog expired")
+            .expect("sibling fixture failed before receive observation");
+        assert!(!progressed || byte == *b"z", "sibling DATA content changed");
+        assert!(
+            progressed && sibling_eof,
+            "unread smux stream blocked sibling DATA/FIN despite spare connection budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_storage_budget_bounds_tiny_frames_and_waits_for_full_consumption() {
+        let quota = 512;
+        let (client, driver, mut peer, meter) = metered_peer(Options {
+            frame_size: 128,
+            receive_buffer: quota,
+            stream_buffer: quota,
+            ..Options::default()
+        });
+        let mut driver = Box::pin(driver);
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut stream, id) = open_memory_stream(&client, driver.as_mut(), &mut peer).await?;
+            let mut wire = Vec::new();
+            for value in 0..256_usize {
+                memory_frame(&mut wire, 2, id, &[value as u8]);
+            }
+            peer.write_all(&wire).await?;
+            for _ in 0..16 {
+                drive_ready_once(driver.as_mut()).await?;
+            }
+            let before = meter.read_bytes.load(Ordering::Acquire);
+            drive_ready_once(driver.as_mut()).await?;
+            let idle = meter.read_bytes.load(Ordering::Acquire);
+            let mut byte = [0];
+            read_memory(&mut stream, driver.as_mut(), &mut byte).await?;
+            let mut valid = byte == [0];
+            drive_ready_once(driver.as_mut()).await?;
+            let after_one = meter.read_bytes.load(Ordering::Acquire);
+            for expected in 1..256_usize {
+                read_memory(&mut stream, driver.as_mut(), &mut byte).await?;
+                valid &= byte == [expected as u8];
+            }
+            let mut next = Vec::new();
+            memory_frame(&mut next, 2, id, &vec![b'p'; quota]);
+            memory_frame(&mut next, 2, id, b"q");
+            peer.write_all(&next).await?;
+            for _ in 0..4 {
+                drive_ready_once(driver.as_mut()).await?;
+            }
+            let before_partial = meter.read_bytes.load(Ordering::Acquire);
+            read_memory(&mut stream, driver.as_mut(), &mut byte).await?;
+            valid &= byte == *b"p";
+            for _ in 0..4 {
+                drive_ready_once(driver.as_mut()).await?;
+            }
+            let after_partial = meter.read_bytes.load(Ordering::Acquire);
+            let mut rest = vec![0; quota - 1];
+            read_memory(&mut stream, driver.as_mut(), &mut rest).await?;
+            valid &= rest.iter().all(|value| *value == b'p');
+            for _ in 0..4 {
+                drive_ready_once(driver.as_mut()).await?;
+            }
+            let after_full = meter.read_bytes.load(Ordering::Acquire);
+            read_memory(&mut stream, driver.as_mut(), &mut byte).await?;
+            valid &= byte == *b"q";
+            drop(stream);
+            Ok::<_, io::Error>((
+                valid,
+                before,
+                idle,
+                after_one,
+                wire.len(),
+                before_partial,
+                after_partial,
+                after_full,
+            ))
+        })
+        .await;
+        drop(driver);
+        let closed = client.shared.state.lock().unwrap().closed;
+        let eof = memory_peer_eof(&mut peer).await;
+        assert!(
+            closed && eof,
+            "receive budget fixture did not close driver/peer"
+        );
+        let (valid, before, idle, after_one, input, before_partial, after_partial, after_full) =
+            observed
+                .expect("receive budget fixture watchdog expired")
+                .expect("receive budget fixture failed before observations");
+        assert!(
+            valid && before >= 9,
+            "receive budget fixture changed or did not receive DATA"
+        );
+        let storage_floor = std::mem::size_of::<Packet>() + 1;
+        let retained_before = before / 9;
+        let retained_after = (after_one / 9).saturating_sub(1);
+        assert!(
+            before < input
+                && idle == before
+                && retained_before * storage_floor <= quota
+                && retained_after * storage_floor <= quota,
+            "small smux frames bypassed the connection receive storage budget"
+        );
+        assert!(
+            after_one > before,
+            "consuming a frame did not restore receive progress"
+        );
+        assert_eq!(
+            after_partial, before_partial,
+            "partially read smux frame returned its backing budget early"
+        );
+        assert!(
+            after_full > after_partial,
+            "draining a frame did not release its receive budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_shutdown_releases_queued_budget_while_remote_fin_preserves_data() {
+        let quota = 512;
+        let (client, driver, mut peer, meter) = metered_peer(Options {
+            frame_size: 128,
+            receive_buffer: quota,
+            stream_buffer: quota,
+            ..Options::default()
+        });
+        let mut driver = Box::pin(driver);
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut stopped, first) =
+                open_memory_stream(&client, driver.as_mut(), &mut peer).await?;
+            let (mut remote, second) =
+                open_memory_stream(&client, driver.as_mut(), &mut peer).await?;
+            let (mut next, third) = open_memory_stream(&client, driver.as_mut(), &mut peer).await?;
+            let mut wire = Vec::new();
+            memory_frame(&mut wire, 2, first, &vec![b'a'; quota]);
+            memory_frame(&mut wire, 2, second, &vec![b'b'; quota]);
+            memory_frame(&mut wire, 1, second, &[]);
+            memory_frame(&mut wire, 2, third, b"z");
+            peer.write_all(&wire).await?;
+            for _ in 0..4 {
+                drive_ready_once(driver.as_mut()).await?;
+            }
+            let before = meter.read_bytes.load(Ordering::Acquire);
+            stopped.shutdown().await?;
+            for _ in 0..4 {
+                drive_ready_once(driver.as_mut()).await?;
+            }
+            let after = meter.read_bytes.load(Ordering::Acquire);
+            let fin_seen = !client
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .streams
+                .contains_key(&second);
+            let mut byte = [0];
+            let next_blocked = matches!(read_once(&mut next, &mut byte).await, Poll::Pending);
+            let mut data_valid = false;
+            let mut remote_eof = false;
+            let mut next_ready = false;
+            if fin_seen {
+                let mut data = vec![0; quota];
+                read_memory(&mut remote, driver.as_mut(), &mut data).await?;
+                data_valid = data.iter().all(|value| *value == b'b');
+                remote_eof = matches!(read_once(&mut remote, &mut [0]).await, Poll::Ready(Ok(0)));
+                for _ in 0..4 {
+                    drive_ready_once(driver.as_mut()).await?;
+                }
+                next_ready = matches!(read_once(&mut next, &mut byte).await, Poll::Ready(Ok(1)))
+                    && byte == *b"z";
+            }
+            // Retain the shutdown stream throughout the release observation.
+            drop((stopped, remote, next));
+            Ok::<_, io::Error>((
+                after > before && fin_seen,
+                next_blocked,
+                data_valid,
+                remote_eof,
+                next_ready,
+            ))
+        })
+        .await;
+        drop(driver);
+        let closed = client.shared.state.lock().unwrap().closed;
+        let eof = memory_peer_eof(&mut peer).await;
+        assert!(
+            closed && eof,
+            "shutdown budget fixture did not close driver/peer"
+        );
+        let (released, blocked, valid, remote_eof, resumed) = observed
+            .expect("shutdown budget fixture watchdog expired")
+            .expect("shutdown budget fixture failed before observations");
+        assert!(
+            blocked,
+            "remote FIN returned queued DATA budget before consumption"
+        );
+        assert!(
+            released,
+            "local smux shutdown retained queued budget while its stream was held"
+        );
+        assert!(
+            valid && remote_eof,
+            "remote FIN discarded queued DATA or failed to end after draining"
+        );
+        assert!(
+            resumed,
+            "draining the remote FIN stream did not restore sibling progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_driver_exit_releases_a_retained_stream_receiver() {
+        let (client, driver, mut peer, _meter) = metered_peer(Options::default());
+        let mut driver = Box::pin(driver);
+        let setup = tokio::time::timeout(Duration::from_secs(2), async {
+            let (stream, id) = open_memory_stream(&client, driver.as_mut(), &mut peer).await?;
+            let sender = client.shared.state.lock().unwrap().streams[&id]
+                .receive
+                .clone();
+            let mut wire = Vec::new();
+            memory_frame(&mut wire, 2, id, b"queued");
+            peer.write_all(&wire).await?;
+            drive_ready_once(driver.as_mut()).await?;
+            Ok::<_, io::Error>((stream, sender))
+        })
+        .await;
+        drop(driver);
+        let closed = client.shared.state.lock().unwrap().closed;
+        let eof = memory_peer_eof(&mut peer).await;
+        let (mut stream, sender) = setup
+            .expect("driver-exit fixture watchdog expired")
+            .expect("driver-exit fixture failed before receive observation");
+        let shutdown = tokio::time::timeout(Duration::from_secs(2), stream.shutdown()).await;
+        let released = sender.is_closed();
+        drop((stream, sender));
+        assert!(
+            closed && eof,
+            "driver-exit fixture did not close driver/peer"
+        );
+        assert!(
+            matches!(shutdown, Ok(Ok(()))),
+            "cancelled stream shutdown did not complete"
+        );
+        assert!(
+            released,
+            "shutdown after driver exit retained its receive queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn small_legal_receive_quotas_allow_a_whole_frame_and_continue() {
+        for quota in [1, 63, 512] {
+            let (client, driver, mut peer, meter) = metered_peer(Options {
+                frame_size: quota,
+                receive_buffer: quota,
+                stream_buffer: quota,
+                ..Options::default()
+            });
+            let mut driver = Box::pin(driver);
+            let observed = tokio::time::timeout(Duration::from_secs(2), async {
+                let (mut stream, id) =
+                    open_memory_stream(&client, driver.as_mut(), &mut peer).await?;
+                let mut wire = Vec::new();
+                memory_frame(&mut wire, 2, id, &vec![b'a'; quota]);
+                memory_frame(&mut wire, 2, id, &vec![b'b'; quota]);
+                peer.write_all(&wire).await?;
+                for _ in 0..4 {
+                    drive_ready_once(driver.as_mut()).await?;
+                }
+                let before = meter.read_bytes.load(Ordering::Acquire);
+                let mut first = vec![0; quota];
+                read_memory(&mut stream, driver.as_mut(), &mut first).await?;
+                for _ in 0..4 {
+                    drive_ready_once(driver.as_mut()).await?;
+                }
+                let after = meter.read_bytes.load(Ordering::Acquire);
+                let mut second = vec![0; quota];
+                read_memory(&mut stream, driver.as_mut(), &mut second).await?;
+                let valid = first.iter().all(|value| *value == b'a')
+                    && second.iter().all(|value| *value == b'b');
+                drop(stream);
+                Ok::<_, io::Error>((before >= quota + 8, after > before, valid))
+            })
+            .await;
+            drop(driver);
+            let closed = client.shared.state.lock().unwrap().closed;
+            let eof = memory_peer_eof(&mut peer).await;
+            assert!(
+                closed && eof,
+                "small quota fixture did not close driver/peer"
+            );
+            let (received, resumed, valid) = observed
+                .expect("small quota fixture watchdog expired")
+                .expect("small quota fixture rejected or stalled a legal whole frame");
+            assert!(
+                received && resumed && valid,
+                "legal smux receive quota {quota} did not progress"
+            );
+        }
+    }
+
     #[derive(Default)]
     struct FlushGateState {
         // 0: blocked; 1: successful physical flush; 2: physical error.
         mode: std::sync::atomic::AtomicU8,
         flushes: std::sync::atomic::AtomicUsize,
+        read_bytes: std::sync::atomic::AtomicUsize,
         changed: AtomicWaker,
     }
     struct FlushGate {
@@ -664,7 +1167,13 @@ mod tests {
             cx: &mut Context<'_>,
             out: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.raw).poll_read(cx, out)
+            let before = out.filled().len();
+            let result = Pin::new(&mut self.raw).poll_read(cx, out);
+            let count = out.filled().len() - before;
+            if count != 0 {
+                self.state.read_bytes.fetch_add(count, Ordering::AcqRel);
+            }
+            result
         }
     }
     impl AsyncWrite for FlushGate {

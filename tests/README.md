@@ -25,6 +25,9 @@ Windows的UWP/Wintun feature互斥，应明确选择后端，不使用`--all-fea
 
 ## 定向回归
 
+smux 纯内存边界：`transport::smux::`，覆盖就绪 DATA 的单次 poll 预算、未读流与兄弟流、整帧分配预算、极小合法配额、本地关闭释放和远端 DATA→FIN 顺序。
+调度测试隔离 Tokio 的独立 cooperative allowance；这些测试不代替真实 TUN 性能验证。
+
 VMess gRPC 延迟响应（纯内存 H2 duplex）：启用 `cli,interop-test` 后运行
 `--test grpc_protocol_pool`。覆盖认证请求提交后跨越原建链期限的继续上传、
 未收到响应时的活动 Stop、对端自然退出和资源释放；不代替真实 TUN 验证。
