@@ -101,6 +101,8 @@ yamux单连接累计接纳64流后退役，连接接收窗口16 MiB；活动兄�
 范围内移交驱动后接纳，16 KiB 发送缓冲不变。每逻辑流固定一个确认状态，物理 flush
 列表每流至多一个弱引用登记；不按 DATA 保留 oneshot。显式 flush/END_STREAM 前仍确认
 真实 supplied IO flush，首帧期限、部分写取消、来源隔离和同步 Stop 不变；不新增任务或全局额度。
+私有 h2mux 的底层写入有正进度而 flush Pending 时，以一个布尔状态触发一次驱动重调度；
+没有后续写入便不再自唤醒。重调度不分配队列或确认状态，也不把 Pending 当作 flush 完成。
 h2mux/yamux上传半关闭保留读取与lease，smux v1关闭整条逻辑流。
 图只登记最终包装器；begin_shutdown同时关闭mux和底层准入，shutdown先join全部
 mux驱动，再等待底层协议。provider代际与node-only测速复用此屏障，没有全局池。

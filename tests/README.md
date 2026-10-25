@@ -64,6 +64,10 @@ private h2mux PacketUp 两阶段写（纯内存）：
 经过真实私有包装器与 duplex H2，覆盖末块自主移交、强 flush、半关闭尾读和活动 Stop/join；
 `transport::h2_write::tests::coalesced_writer_bounds_markers_and_never_flushes_unencoded_or_failed_payloads`
 检查固定确认登记、未编码兄弟隔离及取消/失败唤醒。另保留既有 datagram 首帧强 flush/部分写取消回归。
+`transport::sing_mux::h2_driver::prequeued_flush_memory_tests::already_queued_large_data_progresses_before_pending_raw_flush_completes`
+检查真实 H2 已排队 DATA 在底层强 flush Pending 时继续推进；
+`transport::h2_write::productive_repoll_memory_tests::` 检查仅有正写入进度且有存活私有确认所有者时
+才重调度一次，以及普通写、零进度、失败、Drop 和强 flush 确认边界。
 这些测试不代替 XHTTP/H3、真实 TUN、内存或容量验收。
 
 规则输入与 selector 元数据（纯内存）：`config::name_regex::tests::`、
