@@ -61,6 +61,7 @@ struct VlessTransportLeg {
 fn static_h2_security(config: &crate::config::SecurityConfig) -> bool {
     match config {
         crate::config::SecurityConfig::Jls(_) => true,
+        crate::config::SecurityConfig::Reality(_) => true,
         crate::config::SecurityConfig::Tls(tls) => {
             tls.identity
                 .as_ref()
@@ -1303,6 +1304,19 @@ mod active_h2_memory_tests {
 
     type Downloads = Arc<Mutex<HashMap<String, h2::SendStream<bytes::Bytes>>>>;
 
+    // Config -> production pool selection only. The memory peer below does
+    // not perform native REALITY authentication; real TUN verifies it separately.
+    fn with_static_reality(mut raw: serde_json::Value, reality: bool) -> serde_json::Value {
+        if reality {
+            raw["proxies"][0]["servername"] = serde_json::json!("memory.invalid");
+            raw["proxies"][0]["reality-opts"] = serde_json::json!({
+                "public-key": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+                "short-id": "00"
+            });
+        }
+        raw
+    }
+
     // The two physical legs share one synthetic handler, never a host socket.
     async fn peer(
         calls: &AtomicUsize,
@@ -1355,15 +1369,31 @@ mod active_h2_memory_tests {
     #[cfg(all(target_os = "linux", feature = "sing-mux"))]
     #[tokio::test]
     async fn private_split_h2_control_fallback_and_dialer_stop_do_not_take_cached_sender() {
+        run_private_split_h2_control_case(false).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    #[tokio::test]
+    async fn private_split_h2_reality_control_fallback_and_dialer_stop_do_not_take_cached_sender() {
+        run_private_split_h2_control_case(true).await;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    async fn run_private_split_h2_control_case(reality: bool) {
         #[cfg(feature = "interop-test")]
         let _case = crate::resources::case_events::Case::new(
             "XHTTP-UNIT",
-            "private_split_h2_control_fallback_and_dialer_stop_do_not_take_cached_sender",
+            if reality {
+                "private_split_h2_reality_control_fallback_and_dialer_stop_do_not_take_cached_sender"
+            } else {
+                "private_split_h2_control_fallback_and_dialer_stop_do_not_take_cached_sender"
+            },
         );
         tokio::time::timeout(Duration::from_secs(5), async {
             let probe = crate::resources::observation::ResourceProbe::default();
             let result = probe.scope(async {
                 let raw = serde_json::json!({"mixed-port":1080,"proxies":[{"name":"peer","type":"vless","server":"192.0.2.1","port":443,"uuid":"07070707-0707-0707-0707-070707070707","network":"xhttp","tls":true,"alpn":["h2"],"xhttp-opts":{"mode":"packet-up","path":"/x","download-settings":{"server":"192.0.2.2","path":"/x"}}}],"rules":["MATCH,peer"]});
+                let raw = with_static_reality(raw, reality);
                 let config = crate::config::Config::parse_yaml(raw.to_string().as_bytes()).unwrap();
                 let crate::config::ProxyProtocol::Vless(config) = &config.proxies[0].protocol else { unreachable!() };
                 let outbound = VlessOutbound::new_with_path(config, UpstreamPath::LazyDirect { dialer: Dialer::default() }).unwrap();
@@ -1430,10 +1460,24 @@ mod active_h2_memory_tests {
 
     #[tokio::test]
     async fn private_split_h2_shares_four_active_leases_and_stops_both_legs() {
+        run_private_split_h2_share_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn private_split_h2_reality_qualification_shares_four_active_leases_and_stops_both_legs()
+    {
+        run_private_split_h2_share_case(true).await;
+    }
+
+    async fn run_private_split_h2_share_case(reality: bool) {
         #[cfg(feature = "interop-test")]
         let _case = crate::resources::case_events::Case::new(
             "XHTTP-UNIT",
-            "private_split_h2_shares_four_active_leases_and_stops_both_legs",
+            if reality {
+                "private_split_h2_reality_qualification_shares_four_active_leases_and_stops_both_legs"
+            } else {
+                "private_split_h2_shares_four_active_leases_and_stops_both_legs"
+            },
         );
         tokio::time::timeout(Duration::from_secs(8), async {
             // Explicit reuse is the existing control; omitted reuse is the new behavior.
@@ -1447,6 +1491,7 @@ mod active_h2_memory_tests {
                         options["download-settings"]["reuse-settings"] = reuse;
                     }
                     let raw = serde_json::json!({"mixed-port":1080, "proxies":[{"name":"peer", "type":"vless", "server":"192.0.2.1", "port":443, "uuid":"07070707-0707-0707-0707-070707070707", "network":"xhttp", "tls":true, "alpn":["h2"], "xhttp-opts":options}], "rules":["MATCH,peer"]});
+                    let raw = with_static_reality(raw, reality);
                     let config = crate::config::Config::parse_yaml(raw.to_string().as_bytes()).unwrap();
                     let crate::config::ProxyProtocol::Vless(config) = &config.proxies[0].protocol else { unreachable!() };
                     let outbound = VlessOutbound::new_with_path(config, UpstreamPath::LazyDirect { dialer: Dialer::default() }).unwrap();
@@ -1514,10 +1559,23 @@ mod active_h2_memory_tests {
 
     #[tokio::test]
     async fn private_split_h2_peer_stream_credit_opens_new_download_physicals() {
+        run_private_split_h2_peer_credit_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn private_split_h2_reality_peer_stream_credit_opens_new_download_physicals() {
+        run_private_split_h2_peer_credit_case(true).await;
+    }
+
+    async fn run_private_split_h2_peer_credit_case(reality: bool) {
         #[cfg(feature = "interop-test")]
         let _case = crate::resources::case_events::Case::new(
             "XHTTP-UNIT",
-            "private_split_h2_peer_stream_credit_opens_new_download_physicals",
+            if reality {
+                "private_split_h2_reality_peer_stream_credit_opens_new_download_physicals"
+            } else {
+                "private_split_h2_peer_stream_credit_opens_new_download_physicals"
+            },
         );
         let probe = crate::resources::observation::ResourceProbe::default();
         let (business, before_stop, idle) = probe
@@ -1531,6 +1589,7 @@ mod active_h2_memory_tests {
                             "download-settings":{"server":"192.0.2.2","path":"/x"}}}],
                     "rules":["MATCH,peer"]
                 });
+                let raw = with_static_reality(raw, reality);
                 let config = crate::config::Config::parse_yaml(raw.to_string().as_bytes()).unwrap();
                 let crate::config::ProxyProtocol::Vless(config) = &config.proxies[0].protocol
                 else {

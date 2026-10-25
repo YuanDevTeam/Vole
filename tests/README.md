@@ -54,6 +54,10 @@ VLESS packetaddr 自主写使用实际 PacketUp Writer 的纯内存 H2 duplex：
 这些内存 seam 不代替 H3、真实 TUN、进程 RSS 或压力验收。
 
 VLESS 私有 H2 split 活动租约：`--lib outbound::vless::outbound::active_h2_memory_tests::private_split_h2_shares_four_active_leases_and_stops_both_legs -- --exact`，以真实 duplex H2 两腿验证四租约共享、阈值扩容、兄弟关闭、末租约释放和同步 Stop/join；它不是实际 TUN 或 TLS wire 互通验收。
+REALITY 资格使用同模块的 `private_split_h2_reality_qualification_shares_four_active_leases_and_stops_both_legs`；
+`private_split_h2_reality_peer_stream_credit_opens_new_download_physicals` 检查低对端信用，
+Linux 的 `private_split_h2_reality_control_fallback_and_dialer_stop_do_not_take_cached_sender` 检查独立 TCP-control 与 Dialer/节点 Stop。
+这些纯内存测试从公开 REALITY 配置进入池选择，但测试 peer 不执行 REALITY/TLS 认证；真实 TUN 认证与 RSS 必须单独验证。
 
 private h2mux PacketUp 两阶段写（纯内存）：
 `outbound::sing_mux::tests::private_packet_up_h2mux_hands_off_tail_and_keeps_strong_flush_fin_stop`
