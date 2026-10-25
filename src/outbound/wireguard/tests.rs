@@ -28,7 +28,7 @@ use vole_netstack::{
 
 const ENDPOINT: &str = "198.51.100.1:51820";
 const SECOND: &str = "198.51.100.2:51820";
-fn config() -> WireGuardOutboundConfig {
+pub(super) fn config() -> WireGuardOutboundConfig {
     config_with_peer(2)
 }
 fn config_with_peer(peer_secret: u8) -> WireGuardOutboundConfig {

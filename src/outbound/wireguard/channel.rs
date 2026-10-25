@@ -39,6 +39,24 @@ pub(super) struct Channel {
     stop: AsyncMutex<()>,
 }
 impl Channel {
+    #[cfg(test)]
+    pub(super) fn memory_ready(cancel: CancellationToken) -> (Arc<Self>, mpsc::Receiver<Packet>) {
+        let (tx, rx) = mpsc::channel(32);
+        let (_, ready) = watch::channel(Ready::Established);
+        let (commands, _) = mpsc::channel(1);
+        let channel = Arc::new(Self {
+            tx,
+            cancel,
+            ready,
+            commands,
+            initial: EstablishContext::default(),
+            updated: Arc::new(Mutex::new(Instant::now())),
+            refresh: AsyncMutex::new(()),
+            task: Mutex::new(None),
+            stop: AsyncMutex::new(()),
+        });
+        (channel, rx)
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         config: Arc<WireGuardOutboundConfig>,

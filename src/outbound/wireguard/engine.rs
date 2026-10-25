@@ -213,15 +213,271 @@ async fn pump_output(
         let Some(index) = routes.select(dst) else {
             continue;
         };
-        if let Some(channel) = slots[index]
-            .current
-            .lock()
-            .unwrap()
-            .as_ref()
-            .filter(|c| c.is_ready())
-        {
-            let _ = channel.tx.try_send(packet);
+        let pending = {
+            let current = slots[index].current.lock().unwrap();
+            let Some(channel) = current.as_ref().filter(|c| c.is_ready()) else {
+                continue;
+            };
+            match channel.tx.try_send(packet) {
+                Err(tokio::sync::mpsc::error::TrySendError::Full(packet)) => {
+                    Some((channel.clone(), packet))
+                }
+                _ => None,
+            }
+        };
+        if let Some((channel, packet)) = pending {
+            // Keep only this Full packet and its original peer generation.
+            // Poll the reservation before and after one cooperative yield.
+            let offer = async {
+                let send = channel.tx.send(packet);
+                tokio::pin!(send);
+                if futures_util::poll!(send.as_mut()).is_ready() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+                let _ = futures_util::poll!(send.as_mut());
+            };
+            tokio::select! { biased;
+                () = cancel.cancelled() => break,
+                () = channel.cancel.cancelled() => {},
+                () = offer => {},
+            }
         }
     }
     cancel.cancel();
+}
+
+#[cfg(test)]
+mod full_handoff_memory_tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures_util::task::noop_waker;
+    use std::{
+        future::Future,
+        net::SocketAddr,
+        task::{Context, Poll, Wake, Waker},
+        time::Duration,
+    };
+    use tokio::sync::Notify;
+    use vole_netstack::Packet;
+
+    #[derive(Default)]
+    struct PumpWake(Notify);
+    impl Wake for PumpWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.notify_one();
+        }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Case {
+        Release,
+        StillFull,
+        PeerStop,
+        GlobalStop,
+    }
+
+    fn is_syn(packet: &Packet, destination: SocketAddr) -> bool {
+        let bytes = packet.data();
+        if bytes.len() < 40 || bytes[0] >> 4 != 4 || bytes[9] != 6 {
+            return false;
+        }
+        let offset = usize::from(bytes[0] & 15) * 4;
+        offset >= 20
+            && bytes.len() >= offset + 20
+            && peer::addresses(bytes).is_some_and(|(_, dst)| dst == destination.ip())
+            && u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) == destination.port()
+            && bytes[offset + 13] & 0x17 == 2
+    }
+
+    async fn exercise(case: Case) -> usize {
+        let first: SocketAddr = "10.0.0.1:443".parse().unwrap();
+        let other: SocketAddr = "10.1.0.1:443".parse().unwrap();
+        let mut config = super::super::tests::config();
+        config.routes = vec![
+            (
+                crate::config::IpCidr {
+                    network: first.ip(),
+                    prefix_len: 32,
+                },
+                0,
+            ),
+            (
+                crate::config::IpCidr {
+                    network: other.ip(),
+                    prefix_len: 32,
+                },
+                1,
+            ),
+        ];
+        let routes = Arc::new(Routes::new(&config));
+        assert_eq!(routes.select(first.ip()), Some(0));
+        assert_eq!(routes.select(other.ip()), Some(1));
+        let cancel = CancellationToken::new();
+        let (a, mut a_rx) = Channel::memory_ready(cancel.child_token());
+        let (b, mut b_rx) = Channel::memory_ready(cancel.child_token());
+        let slots: Arc<[PeerSlot]> = vec![PeerSlot::default(), PeerSlot::default()].into();
+        *slots[0].current.lock().unwrap() = Some(a.clone());
+        *slots[1].current.lock().unwrap() = Some(b.clone());
+        let filler = Packet::new(Bytes::from_static(b"existing-queued-packet"));
+        for _ in 0..32 {
+            a.tx.try_send(filler.clone()).unwrap();
+        }
+        assert!(a.is_ready() && b.is_ready());
+        assert_eq!(
+            a.tx.capacity(),
+            0,
+            "fixture did not fill the actual 32-slot peer"
+        );
+        let ClientNetStackParts {
+            packet_sink,
+            packet_stream,
+            tcp_connector,
+            control,
+            stats,
+        } = NetStack::start_client(
+            NetStackConfig {
+                mtu: 1408,
+                packet_queue: 32,
+                ..Default::default()
+            },
+            ClientAddresses {
+                ipv4: config.ipv4,
+                ipv6: None,
+            },
+        )
+        .unwrap();
+        let wake = Arc::new(PumpWake::default());
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let caller = noop_waker();
+        let mut caller_cx = Context::from_waker(&caller);
+        let mut pump = Box::pin(pump_output(
+            packet_stream,
+            slots.clone(),
+            routes,
+            cancel.clone(),
+        ));
+        assert!(
+            pump.as_mut().poll(&mut cx).is_pending(),
+            "fixture empty pump ended"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut connect = Box::pin(tcp_connector.connect(first, deadline));
+        let mut connect_other = Box::pin(tcp_connector.connect(other, deadline));
+        assert!(
+            connect.as_mut().poll(&mut caller_cx).is_pending(),
+            "fixture TCP connect did not pend"
+        );
+        tokio::time::timeout(Duration::from_secs(2), wake.0.notified())
+            .await
+            .expect("fixture never emitted the first SYN into PacketStream");
+
+        // Current-thread runtime: no await from the packet-ready barrier through
+        // the captured result. The netstack cannot run again to retransmit here.
+        let single_socket = stats.snapshot().active_tcp == 1;
+        let first_pending = pump.as_mut().poll(&mut cx).is_pending();
+        let slot_unlocked = slots[0].current.try_lock().is_ok();
+        if case != Case::StillFull {
+            assert_eq!(a_rx.try_recv().unwrap(), filler);
+        }
+        if case == Case::PeerStop {
+            a.cancel.cancel();
+        }
+        if case == Case::GlobalStop {
+            cancel.cancel();
+        }
+        let after = if first_pending {
+            pump.as_mut().poll(&mut cx)
+        } else {
+            Poll::Ready(())
+        };
+        let already_joined = after.is_ready();
+        let continuing = case == Case::GlobalStop || after.is_pending();
+        let global_joined = case != Case::GlobalStop || already_joined;
+        let mut seen = Vec::new();
+        while let Ok(packet) = a_rx.try_recv() {
+            seen.push(packet);
+        }
+        let admitted = seen.iter().filter(|packet| is_syn(packet, first)).count();
+        let fifo = seen.iter().take_while(|packet| **packet == filler).count()
+            == if case == Case::StillFull { 32 } else { 31 };
+        let exact_packets = seen
+            .iter()
+            .all(|packet| *packet == filler || is_syn(packet, first));
+        // Do not free a Full peer and accidentally admit A while testing B.
+        if case == Case::StillFull {
+            for packet in seen.iter().cloned() {
+                a.tx.try_send(packet).unwrap();
+            }
+        }
+        let mut other_progress = true;
+        if matches!(case, Case::StillFull | Case::PeerStop) {
+            // Re-arm PacketStream with a fresh waker after A's offer ended;
+            // an old deferred yield wake cannot impersonate B's output barrier.
+            let sibling_wake = Arc::new(PumpWake::default());
+            let sibling_waker = Waker::from(sibling_wake.clone());
+            let mut sibling_cx = Context::from_waker(&sibling_waker);
+            assert!(
+                pump.as_mut().poll(&mut sibling_cx).is_pending(),
+                "fixture sibling re-arm ended pump"
+            );
+            assert!(
+                connect_other.as_mut().poll(&mut caller_cx).is_pending(),
+                "fixture sibling connect did not pend"
+            );
+            tokio::time::timeout(Duration::from_secs(2), sibling_wake.0.notified())
+                .await
+                .expect("fixture never emitted the sibling SYN");
+            for _ in 0..4 {
+                let _ = pump.as_mut().poll(&mut sibling_cx);
+            }
+            let mut sibling = Vec::new();
+            while let Ok(packet) = b_rx.try_recv() {
+                sibling.push(packet);
+            }
+            other_progress = sibling.iter().any(|packet| is_syn(packet, other));
+        }
+        cancel.cancel();
+        let joined = already_joined || pump.as_mut().poll(&mut cx).is_ready();
+        drop((pump, connect, connect_other));
+        a.stop().await;
+        b.stop().await;
+        control.stop().await;
+        let sockets_released = stats.snapshot().active_tcp == 0;
+        drop((a_rx, b_rx, slots, a, b, tcp_connector, packet_sink));
+        assert!(
+            joined && global_joined && sockets_released,
+            "fixture did not join/release: {case:?}"
+        );
+        assert!(
+            single_socket && first_pending && continuing && slot_unlocked && fifo && exact_packets,
+            "fixture/lock/FIFO boundary failed: {case:?}"
+        );
+        assert!(
+            other_progress,
+            "still-full/stopped peer blocked a sibling: {case:?}"
+        );
+        if case != Case::Release {
+            assert_eq!(
+                admitted, 0,
+                "full/cancelled peer unexpectedly admitted A: {case:?}"
+            );
+        }
+        admitted
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_packet_gets_one_cooperative_handoff_without_blocking_stop_or_sibling() {
+        let admitted = exercise(Case::Release).await;
+        for case in [Case::StillFull, Case::PeerStop, Case::GlobalStop] {
+            exercise(case).await;
+        }
+        assert_eq!(
+            admitted, 1,
+            "a ready WireGuard peer must retain its Full SYN for one cooperative handoff when one slot opens"
+        );
+    }
 }
