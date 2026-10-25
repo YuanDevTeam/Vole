@@ -7,17 +7,30 @@ use tokio::sync::mpsc;
 use crate::{
     Packet,
     pmtu::PathMtuHint,
-    segmentation::{PathMtu, PendingSegments, reverse},
+    segmentation::{PathMtu, PendingSegments, is_pure_tcp_ack, reverse},
     tcp::FlowKey,
 };
 
-/// A raw-IP device with one pending ingress and reserved bounded output slots.
+enum PendingTransmit {
+    Segments(PendingSegments),
+    Reply(Packet),
+}
+impl PendingTransmit {
+    fn flow(&self) -> Option<FlowKey> {
+        match self {
+            Self::Segments(segments) => Some(segments.flow()),
+            Self::Reply(packet) => PendingSegments::new(packet.clone()).map(|part| part.flow()),
+        }
+    }
+}
+
+/// A raw-IP device with one pending ingress and one bounded pending output.
 pub(crate) struct RawIpDevice {
     rx: Option<Packet>,
     output: mpsc::Sender<Packet>,
     emitted: u64,
     capabilities: DeviceCapabilities,
-    pending_tx: Option<PendingSegments>,
+    pending_tx: Option<PendingTransmit>,
     path_mtu: Option<PathMtu>,
 }
 
@@ -97,7 +110,7 @@ impl RawIpDevice {
         if self
             .pending_tx
             .as_ref()
-            .is_some_and(|pending| pending.flow() == outgoing)
+            .is_some_and(|pending| pending.flow() == Some(outgoing))
         {
             self.pending_tx = None;
         }
@@ -116,6 +129,20 @@ impl RawIpDevice {
         while let Some(pending) = &mut self.pending_tx {
             let Ok(permit) = self.output.try_reserve() else {
                 break;
+            };
+            if matches!(pending, PendingTransmit::Reply(_)) {
+                let Some(PendingTransmit::Reply(packet)) = self.pending_tx.take() else {
+                    unreachable!();
+                };
+                if let Some(paths) = &mut self.path_mtu {
+                    paths.emitted(&packet);
+                }
+                permit.send(packet);
+                self.emitted = self.emitted.wrapping_add(1);
+                continue;
+            }
+            let PendingTransmit::Segments(pending) = pending else {
+                unreachable!();
             };
             let budget = self
                 .path_mtu
@@ -149,7 +176,15 @@ impl Device for RawIpDevice {
         if self.pending_tx.is_some() {
             return None;
         }
-        let permit = self.output.try_reserve().ok()?;
+        let permit = match self.output.try_reserve() {
+            Ok(permit) => Some(permit),
+            Err(mpsc::error::TrySendError::Full(()))
+                if self.rx.as_ref().is_some_and(is_pure_tcp_ack) =>
+            {
+                None
+            }
+            Err(_) => return None,
+        };
         let packet = self.rx.take()?;
         Some((
             RawRxToken(packet),
@@ -168,7 +203,7 @@ impl Device for RawIpDevice {
             return None;
         }
         Some(RawTxToken {
-            permit: self.output.try_reserve().ok()?,
+            permit: Some(self.output.try_reserve().ok()?),
             emitted: &mut self.emitted,
             pending: &mut self.pending_tx,
             path_mtu: &mut self.path_mtu,
@@ -193,9 +228,9 @@ impl RxToken for RawRxToken {
 }
 
 pub(crate) struct RawTxToken<'a> {
-    permit: mpsc::Permit<'a, Packet>,
+    permit: Option<mpsc::Permit<'a, Packet>>,
     emitted: &'a mut u64,
-    pending: &'a mut Option<PendingSegments>,
+    pending: &'a mut Option<PendingTransmit>,
     path_mtu: &'a mut Option<PathMtu>,
     mtu: usize,
 }
@@ -208,6 +243,13 @@ impl TxToken for RawTxToken<'_> {
         let mut bytes = vec![0_u8; len];
         let result = f(&mut bytes);
         let mut packet = Packet::new(bytes);
+        let Some(permit) = self.permit else {
+            // A pure incoming ACK can still require a challenge ACK or RST.
+            // Preserve that response in the existing single pending slot;
+            // never acknowledge a generated reply by silently dropping it.
+            *self.pending = Some(PendingTransmit::Reply(packet));
+            return result;
+        };
         if let Some(paths) = self.path_mtu.as_mut() {
             // Metadata parsing is limited to trusted smoltcp output. Packets
             // within the path budget keep their allocation and byte contents.
@@ -219,7 +261,7 @@ impl TxToken for RawTxToken<'_> {
                     };
                     packet = first;
                     if !pending.is_finished() {
-                        *self.pending = Some(pending);
+                        *self.pending = Some(PendingTransmit::Segments(pending));
                     }
                 }
             } else if packet.len() > self.mtu {
@@ -228,7 +270,7 @@ impl TxToken for RawTxToken<'_> {
             }
             paths.emitted(&packet);
         }
-        self.permit.send(packet);
+        permit.send(packet);
         *self.emitted = self.emitted.wrapping_add(1);
         result
     }
@@ -237,6 +279,129 @@ impl TxToken for RawTxToken<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_tx_consumes_pure_ack_without_allocating_an_output_or_queue() {
+        use crate::segmentation::tests::tcp_packet;
+        let flow = FlowKey {
+            source: "10.23.0.2:4000".parse().unwrap(),
+            destination: "198.51.100.2:443".parse().unwrap(),
+        };
+        let (output, mut receiver) = mpsc::channel(1);
+        let mut device = RawIpDevice::new(1500, output.clone());
+        let occupied = Packet::new(vec![0x45; 40]);
+        output.try_send(occupied.clone()).unwrap();
+        for acknowledgment in 10..13 {
+            let ack = tcp_packet(flow, 1, acknowledgment, 16, 0);
+            device.push_rx(ack.clone()).unwrap();
+            let (rx, tx) = device
+                .receive(Instant::now())
+                .expect("full TX blocked pure TCP ACK");
+            rx.consume(|bytes| assert_eq!(bytes, ack.data()));
+            drop(tx); // Valid ordinary ACKs do not require an immediate reply.
+            assert!(device.rx_is_empty());
+            assert!(device.pending_tx.is_none());
+            assert_eq!(device.emitted(), 0);
+            assert_eq!(output.capacity(), 0);
+        }
+        assert_eq!(receiver.try_recv().unwrap(), occupied);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn full_tx_preserves_ack_or_reset_reply_in_the_existing_pending_slot() {
+        use crate::segmentation::tests::tcp_packet;
+        let flow = FlowKey {
+            source: "10.23.0.2:4000".parse().unwrap(),
+            destination: "198.51.100.2:443".parse().unwrap(),
+        };
+        for flags in [16, 20] {
+            let (output, mut receiver) = mpsc::channel(1);
+            let mut device = RawIpDevice::new(1500, output.clone());
+            device.enable_path_mtu();
+            let occupied = Packet::new(vec![0x45; 40]);
+            output.try_send(occupied.clone()).unwrap();
+            device.push_rx(tcp_packet(flow, 1, 10, 16, 0)).unwrap();
+            let (rx, tx) = device
+                .receive(Instant::now())
+                .expect("pure ACK did not enter");
+            rx.consume(|_| {});
+            let response = tcp_packet(reverse(flow), 10, 1, flags, 0);
+            tx.consume(response.len(), |bytes| {
+                bytes.copy_from_slice(response.data())
+            });
+            assert!(device.pending_tx.is_some());
+            assert_eq!(device.emitted(), 0);
+            assert!(device.transmit(Instant::now()).is_none());
+            device.flush_pending();
+            assert_eq!(device.emitted(), 0); // Never overwrite or bypass full output.
+            assert_eq!(receiver.try_recv().unwrap(), occupied);
+            device.flush_pending();
+            assert_eq!(receiver.try_recv().unwrap(), response);
+            assert_eq!(device.emitted(), 1);
+            assert!(device.pending_tx.is_none());
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn full_tx_keeps_syn_data_fin_urgent_and_invalid_ack_pending() {
+        use crate::segmentation::tests::tcp_packet;
+        let flow = FlowKey {
+            source: "10.23.0.2:4000".parse().unwrap(),
+            destination: "198.51.100.2:443".parse().unwrap(),
+        };
+        let mut inputs = vec![
+            tcp_packet(flow, 1, 0, 2, 0),
+            tcp_packet(flow, 1, 10, 16, 1),
+            tcp_packet(flow, 1, 10, 17, 0),
+            tcp_packet(flow, 1, 10, 20, 0),
+            tcp_packet(flow, 1, 10, 48, 0),
+        ];
+        let mut invalid = tcp_packet(flow, 1, 10, 16, 0).data().to_vec();
+        *invalid.last_mut().unwrap() ^= 1;
+        inputs.push(Packet::new(invalid));
+        for input in inputs {
+            let (output, _receiver) = mpsc::channel(1);
+            let mut device = RawIpDevice::new(1500, output.clone());
+            output.try_send(Packet::new(vec![0x45; 40])).unwrap();
+            device.push_rx(input).unwrap();
+            assert!(device.receive(Instant::now()).is_none());
+            assert!(!device.rx_is_empty());
+            assert!(device.pending_tx.is_none());
+        }
+    }
+
+    #[test]
+    fn full_tx_pending_reply_blocks_a_second_ack_and_clear_releases_both() {
+        use crate::segmentation::tests::tcp_packet;
+        let flow = FlowKey {
+            source: "10.23.0.2:4000".parse().unwrap(),
+            destination: "198.51.100.2:443".parse().unwrap(),
+        };
+        let (output, mut receiver) = mpsc::channel(1);
+        let mut device = RawIpDevice::new(1500, output.clone());
+        output.try_send(Packet::new(vec![0x45; 40])).unwrap();
+        device.push_rx(tcp_packet(flow, 1, 10, 16, 0)).unwrap();
+        let (rx, tx) = device
+            .receive(Instant::now())
+            .expect("pure ACK did not enter");
+        rx.consume(|_| {});
+        let response = tcp_packet(reverse(flow), 10, 1, 16, 0);
+        tx.consume(response.len(), |bytes| {
+            bytes.copy_from_slice(response.data())
+        });
+        device.push_rx(tcp_packet(flow, 1, 11, 16, 0)).unwrap();
+        assert!(device.receive(Instant::now()).is_none());
+        assert!(device.transmit(Instant::now()).is_none());
+        assert!(device.pending_tx.is_some() && !device.rx_is_empty());
+        device.clear();
+        assert!(device.pending_tx.is_none() && device.rx_is_empty());
+        receiver.try_recv().unwrap();
+        device.flush_pending();
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(device.emitted(), 0);
+    }
 
     #[test]
     fn full_tx_queue_does_not_consume_rx() {

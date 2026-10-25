@@ -68,6 +68,15 @@ impl TcpView {
     }
 }
 
+/// Only the queue-pressure fast path uses this classifier. The normal path
+/// still lets smoltcp validate every accepted packet. A rejected candidate is
+/// retained, not discarded, until ordinary output reservation can succeed.
+pub(crate) fn is_pure_tcp_ack(packet: &Packet) -> bool {
+    TcpView::parse(packet.data(), true).is_some_and(|view| {
+        view.payload_len == 0 && view.flags & 16 != 0 && view.flags & !(16 | 64 | 128) == 0
+    })
+}
+
 /// At most one original packet is retained while the bounded output drains.
 /// Options are copied unchanged; FIN/PSH belong to the last segment and CWR
 /// belongs to the first. IPv6 extensions and IP fragmentation are not split.

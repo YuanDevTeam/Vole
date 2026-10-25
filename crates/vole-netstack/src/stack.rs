@@ -1026,6 +1026,12 @@ impl Driver {
         if !self.device.tx_is_full() {
             self.interface
                 .poll(Instant::now(), &mut self.device, &mut self.sockets);
+        } else if !self.device.rx_is_empty() {
+            // ACK/window progress must not wait for outbound DATA capacity.
+            // Device::receive allows only a pure ACK on this path and keeps
+            // any immediate response in the same existing pending slot.
+            self.interface
+                .poll_ingress_single(Instant::now(), &mut self.device, &mut self.sockets);
         }
         self.drive_tcp_sockets();
         self.device.flush_pending();
@@ -1347,6 +1353,120 @@ mod tests {
         }
         ip.fill_checksum();
         Packet::new(ip.into_inner())
+    }
+
+    #[tokio::test]
+    async fn full_tx_pure_ack_releases_actual_smoltcp_send_queue() {
+        use tokio::io::AsyncWriteExt;
+        let config = NetStackConfig {
+            packet_queue: 1,
+            ..NetStackConfig::default()
+        };
+        let (_sender, inbound) = mpsc::channel(config.packet_queue);
+        let (outbound, mut packets) = mpsc::channel(config.packet_queue);
+        let (accept, mut streams) = mpsc::channel(config.tcp_accept_queue);
+        let (stopped, _) = watch::channel(false);
+        let mut driver = Driver::new(
+            config,
+            inbound,
+            outbound,
+            Some(accept),
+            None,
+            CancellationToken::new(),
+            Arc::new(Notify::new()),
+            NetStackStats::default(),
+            stopped,
+        );
+        driver.handle_packet_batch(tcp_handshake_packet(100, None));
+        driver.drive();
+        let syn_ack = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(syn_ack.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let acknowledged = tcp.seq_number().0.wrapping_add(1);
+        driver.handle_packet_batch(tcp_handshake_packet(101, Some(acknowledged)));
+        driver.drive();
+        let mut stream = streams.try_recv().unwrap();
+        let payload = b"unacknowledged-before-full-output";
+        stream.write_all(payload).await.unwrap();
+        driver.drive();
+        let data = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(data.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert_eq!(tcp.payload(), payload);
+        let ack = tcp
+            .seq_number()
+            .0
+            .wrapping_add(i32::try_from(payload.len()).unwrap());
+        assert_eq!(
+            driver
+                .sockets
+                .get::<tcp::Socket>(driver.tcp_entries.values().next().unwrap().socket)
+                .send_queue(),
+            payload.len()
+        );
+        driver.raw_outbound.try_send(packet(99)).unwrap();
+        assert!(driver.device.tx_is_full());
+        // A real ACK must reach the live smoltcp socket while the downstream
+        // packet consumer is blocked; no fabricated socket-state observation.
+        driver.handle_packet_batch(tcp_handshake_packet(101, Some(ack)));
+        assert!(
+            driver.device.rx_is_empty(),
+            "ACK remained blocked behind full TX"
+        );
+        assert_eq!(
+            driver
+                .sockets
+                .get::<tcp::Socket>(driver.tcp_entries.values().next().unwrap().socket)
+                .send_queue(),
+            0
+        );
+        assert_eq!(packets.try_recv().unwrap(), packet(99));
+        driver.shutdown();
+        assert!(driver.cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn full_tx_smoltcp_immediate_reset_is_retained_until_capacity_returns() {
+        let config = NetStackConfig {
+            packet_queue: 1,
+            ..NetStackConfig::default()
+        };
+        let (_sender, inbound) = mpsc::channel(config.packet_queue);
+        let (outbound, mut packets) = mpsc::channel(config.packet_queue);
+        let (accept, _streams) = mpsc::channel(config.tcp_accept_queue);
+        let (stopped, _) = watch::channel(false);
+        let mut driver = Driver::new(
+            config,
+            inbound,
+            outbound,
+            Some(accept),
+            None,
+            CancellationToken::new(),
+            Arc::new(Notify::new()),
+            NetStackStats::default(),
+            stopped,
+        );
+        driver.handle_packet_batch(tcp_handshake_packet(100, None));
+        driver.drive();
+        let syn_ack = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(syn_ack.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let wrong_ack = tcp.seq_number().0.wrapping_add(2);
+        driver.raw_outbound.try_send(packet(99)).unwrap();
+        driver.handle_packet_batch(tcp_handshake_packet(101, Some(wrong_ack)));
+        assert!(
+            driver.device.rx_is_empty(),
+            "full TX blocked the invalid-ACK response path"
+        );
+        assert_eq!(packets.try_recv().unwrap(), packet(99));
+        driver.drive();
+        let reset = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(reset.data()).unwrap();
+        assert!(TcpPacket::new_checked(ip.payload()).unwrap().rst());
+        assert!(packets.try_recv().is_err());
+        driver.shutdown();
+        assert!(driver.device.rx_is_empty());
+        assert!(driver.cancellation.is_cancelled());
     }
 
     #[tokio::test]
