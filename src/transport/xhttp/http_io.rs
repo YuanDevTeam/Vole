@@ -28,7 +28,7 @@ pub(super) type ResponseFuture =
 pub(super) enum Sender {
     H2(h2_write::Sender),
     H1 {
-        requests: mpsc::Sender<H1Request>,
+        requests: mpsc::Sender<Box<H1Request>>,
         writes: Writes,
     },
     H3(super::h3_driver::Sender),
@@ -70,13 +70,13 @@ impl Sender {
                     H1Upload::new(send)
                 };
                 requests
-                    .send((
+                    .send(Box::new((
                         request.map(|_| UploadBody {
                             receive,
                             empty: end,
                         }),
                         reply,
-                    ))
+                    )))
                     .await
                     .map_err(|_| connection_closed())?;
                 Ok((
@@ -168,12 +168,13 @@ pub(super) async fn http1(
         .handshake(hyper_util::rt::TokioIo::new(io))
         .await
         .map_err(h1_failure)?;
-    let (commands, mut requests) = mpsc::channel::<H1Request>(BODY_QUEUE);
+    let (commands, mut requests) = mpsc::channel::<Box<H1Request>>(BODY_QUEUE);
     // Dispatch eagerly, so an upload is not dependent on the caller polling reads.
     // Both futures belong to the same cancellation/join barrier as the physical IO.
     let guard = owner.spawn(async move {
         let dispatch = async move {
-            while let Some((request, reply)) = requests.recv().await {
+            while let Some(command) = requests.recv().await {
+                let (request, reply) = *command;
                 if reply.is_closed() {
                     continue;
                 }
