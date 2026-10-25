@@ -59,6 +59,10 @@ REALITY 资格使用同模块的 `private_split_h2_reality_qualification_shares_
 Linux 的 `private_split_h2_reality_control_fallback_and_dialer_stop_do_not_take_cached_sender` 检查独立 TCP-control 与 Dialer/节点 Stop。
 这些纯内存测试从公开 REALITY 配置进入池选择，但测试 peer 不执行 REALITY/TLS 认证；真实 TUN 认证与 RSS 必须单独验证。
 
+Gun 增量读取（纯内存）：`transport::grpc::streaming_read_memory_tests::`。
+实际H2/有界duplex覆盖已校验前缀在消息尾到达前交付、拆分头与varint、空消息、
+取消恢复、原有合法编码、截断与trailers，以及半关闭尾读和Stop/join；不代表TUN压力结果。
+
 private h2mux PacketUp 两阶段写（纯内存）：
 `outbound::sing_mux::tests::private_packet_up_h2mux_hands_off_tail_and_keeps_strong_flush_fin_stop`
 经过真实私有包装器与 duplex H2，覆盖末块自主移交、强 flush、半关闭尾读和活动 Stop/join；

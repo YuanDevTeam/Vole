@@ -245,7 +245,7 @@ struct Grpc {
     deadline: Pin<Box<tokio::time::Sleep>>,
     frame: Bytes,
     wire: BytesMut,
-    payload: Bytes,
+    remaining_payload: usize,
     queued: Bytes,
     eof: bool,
     data_eof: bool,
@@ -525,7 +525,7 @@ impl Grpc {
             coalesced: None,
             frame: Bytes::new(),
             wire: BytesMut::new(),
-            payload: Bytes::new(),
+            remaining_payload: 0,
             queued: Bytes::new(),
             eof: false,
             data_eof: false,
@@ -615,6 +615,8 @@ impl Grpc {
         Poll::Ready(Ok(count))
     }
 
+    // Validate the complete bounded header before exposing any payload. A
+    // later truncated body remains an error after its valid prefix was read.
     fn record(&mut self) -> io::Result<bool> {
         if self.wire.len() < 5 {
             return Ok(false);
@@ -623,28 +625,103 @@ impl Grpc {
         if self.wire[0] != 0 || !(2..=LIMIT + 4).contains(&length) {
             return Err(invalid());
         }
-        if self.wire.len() < length + 5 {
+        if self.wire.len() < 7 {
             return Ok(false);
         }
         if self.wire[5] != 0x0a {
             return Err(invalid());
         }
         let mut value = 0;
-        let mut start = None;
         for index in 0..3 {
-            let byte = *self.wire.get(6 + index).ok_or_else(invalid)?;
+            let Some(&byte) = self.wire.get(6 + index) else {
+                return Ok(false);
+            };
             value |= usize::from(byte & 0x7f) << (7 * index);
             if byte & 0x80 == 0 {
-                start = Some(7 + index);
-                break;
+                if value > LIMIT || 7 + index + value != length + 5 {
+                    return Err(invalid());
+                }
+                self.remaining_payload = value;
+                self.wire.clear();
+                return Ok(true);
             }
         }
-        let start = start.ok_or_else(invalid)?;
-        if value > LIMIT || start + value != length + 5 {
-            return Err(invalid());
+        Err(invalid())
+    }
+    fn poll_gun_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self;
+        for _ in 0..crate::limits::IO_POLL_BUDGET {
+            if this.remaining_payload != 0 && !this.frame.is_empty() {
+                let count = this
+                    .remaining_payload
+                    .min(this.frame.len())
+                    .min(output.remaining());
+                output.put_slice(&this.frame[..count]);
+                this.frame.advance(count);
+                this.remaining_payload -= count;
+                this.receive
+                    .as_mut()
+                    .unwrap()
+                    .flow_control()
+                    .release_capacity(count)
+                    .map_err(|_| invalid())?;
+                return Poll::Ready(Ok(()));
+            }
+            if this.remaining_payload == 0 {
+                if this.record()? {
+                    continue;
+                }
+                if !this.frame.is_empty() {
+                    // Only the five-byte gRPC prefix, tag and <=3 varint bytes
+                    // are staged; the declared payload stays in its h2 frame.
+                    let needed = match this.wire.len() {
+                        0..5 => 5,
+                        5..7 => 7,
+                        length => length + 1,
+                    };
+                    let count = (needed - this.wire.len()).min(this.frame.len());
+                    this.wire.extend_from_slice(&this.frame[..count]);
+                    this.frame.advance(count);
+                    this.receive
+                        .as_mut()
+                        .unwrap()
+                        .flow_control()
+                        .release_capacity(count)
+                        .map_err(|_| invalid())?;
+                    continue;
+                }
+            }
+            let receive = this.receive.as_mut().unwrap();
+            if !this.data_eof {
+                match ready!(receive.poll_data(cx)) {
+                    Some(Ok(frame)) => {
+                        this.frame = frame;
+                        continue;
+                    }
+                    Some(Err(_)) => return Poll::Ready(Err(invalid())),
+                    None => this.data_eof = true,
+                }
+            }
+            if this.remaining_payload != 0 || !this.wire.is_empty() {
+                return Poll::Ready(Err(invalid()));
+            }
+            let trailers = ready!(receive.poll_trailers(cx)).map_err(|_| invalid())?;
+            if trailers
+                .as_ref()
+                .and_then(|headers| headers.get("grpc-status"))
+                .is_some_and(|status| status != "0")
+            {
+                return Poll::Ready(Err(invalid()));
+            }
+            this.eof = true;
+            return Poll::Ready(Ok(()));
         }
-        self.payload = self.wire.split().freeze().slice(start..);
-        Ok(true)
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -719,59 +796,7 @@ impl AsyncRead for Grpc {
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
-        for _ in 0..crate::limits::IO_POLL_BUDGET {
-            if !this.payload.is_empty() {
-                let count = this.payload.len().min(output.remaining());
-                output.put_slice(&this.payload[..count]);
-                this.payload.advance(count);
-                return Poll::Ready(Ok(()));
-            }
-            if this.record()? {
-                continue;
-            }
-            let receive = this.receive.as_mut().unwrap();
-            if !this.frame.is_empty() {
-                let needed = if this.wire.len() < 5 {
-                    5
-                } else {
-                    5 + u32::from_be_bytes(this.wire[1..5].try_into().unwrap()) as usize
-                };
-                let count = (needed - this.wire.len()).min(this.frame.len());
-                this.wire.extend_from_slice(&this.frame[..count]);
-                this.frame.advance(count);
-                // Only consumed bytes replenish the peer's window.
-                receive
-                    .flow_control()
-                    .release_capacity(count)
-                    .map_err(|_| invalid())?;
-                continue;
-            }
-            if !this.data_eof {
-                match ready!(receive.poll_data(cx)) {
-                    Some(Ok(frame)) => {
-                        this.frame = frame;
-                        continue;
-                    }
-                    Some(Err(_)) => return Poll::Ready(Err(invalid())),
-                    None => this.data_eof = true,
-                }
-            }
-            if !this.wire.is_empty() {
-                return Poll::Ready(Err(invalid()));
-            }
-            let trailers = ready!(receive.poll_trailers(cx)).map_err(|_| invalid())?;
-            if trailers
-                .as_ref()
-                .and_then(|headers| headers.get("grpc-status"))
-                .is_some_and(|status| status != "0")
-            {
-                return Poll::Ready(Err(invalid()));
-            }
-            this.eof = true;
-            return Poll::Ready(Ok(()));
-        }
-        cx.waker().wake_by_ref();
-        Poll::Pending
+        this.poll_gun_read(cx, output)
     }
 }
 
@@ -975,3 +1000,7 @@ mod coalesced_partial_memory_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "grpc_gun_streaming_read_memory_tests.rs"]
+mod streaming_read_memory_tests;
