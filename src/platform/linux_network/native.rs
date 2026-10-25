@@ -35,7 +35,6 @@ impl SocketPolicy {
         !self.detect
     }
 
-    #[cfg(feature = "outbound-vless")]
     pub(crate) fn detects_interface(&self) -> bool {
         self.detect
     }

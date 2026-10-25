@@ -136,6 +136,12 @@ Dispatcher 和合成端点，不建立监听器或发送网络报文，不代替
 `dialer::tests::process_inspection_small_concurrency_preserves_identity_and_joins_stop`。
 共享 socket 初始化槽占满的身份查询截止：`dialer::tests::process_inspection_shared_socket_capacity_has_its_own_deadline`。
 
+Linux 原生 socket 初始化的许可、取消与 Stop（纯内存）：
+`dialer::native_init_memory_tests::typed_admission_bounds_cancelled_waiters_and_waits_for_stop`。
+`dialer::native_init_fd_tests::` 默认忽略，包含真实 socket 创建与 bind；仅在隔离 Linux
+容器内，借用真实 raw-IP TUN fd 后显式运行。它验证初始化调度、选项、回调与 fd 释放，
+不代表 TUN 业务或压力通过；后者使用普通 CLI 的独立真实 TUN 验证。
+
 对受影响范围选择过滤器，不逐次重跑整张表。下列库测试使用：
 
 ```sh

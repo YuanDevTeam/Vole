@@ -14,6 +14,9 @@ mod mptcp;
 #[cfg(all(target_os = "linux", test, feature = "tun"))]
 #[path = "dialer_mptcp_gate.rs"]
 mod mptcp_gate;
+#[cfg(target_os = "linux")]
+#[path = "dialer_native.rs"]
+mod native;
 #[path = "dialer_server_tcp.rs"]
 mod server_tcp;
 #[cfg(all(target_os = "linux", feature = "sing-mux"))]
@@ -275,7 +278,9 @@ pub trait SocketProtector: Send + Sync {
     fn protect(&self, socket: i32) -> io::Result<()>;
 }
 
-/// Owns synchronous socket setup independently of the async I/O workers.
+/// Owns synchronous socket setup and its shutdown barrier. Platform/custom
+/// work stays on blocking workers; verified Linux native setup may instead
+/// hold the same owner through a short, typed executor-local operation.
 /// A started syscall cannot be aborted; shutdown must wait for its result to
 /// be delivered or destroyed before releasing any platform callback lease.
 #[derive(Debug)]
@@ -379,6 +384,14 @@ fn socket_initialization_cancelled() -> io::Error {
         io::ErrorKind::Interrupted,
         "socket initialization cancelled",
     )
+}
+
+fn new_plain_tcp_socket(ipv6: bool) -> io::Result<TcpSocket> {
+    if ipv6 {
+        TcpSocket::new_v6()
+    } else {
+        TcpSocket::new_v4()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -995,45 +1008,64 @@ impl Dialer {
     ) -> io::Result<PhysicalDatagram> {
         self.require_permitted(destination)?;
         self.validate_egress()?;
-        let ipv6 = destination.is_ipv6();
         let bind_address = self
             .source_address_for(destination)?
-            .unwrap_or_else(|| wildcard_address(ipv6));
+            .unwrap_or_else(|| wildcard_address(destination.is_ipv6()));
+        #[cfg(target_os = "linux")]
+        if self.permits_plain_native_socket_setup() {
+            return self
+                .bind_plain_native_udp_socket(destination, bind_address, options)
+                .await;
+        }
         let dialer = self.clone();
         let (socket, guard) = self
             .initialization
             .run(move |check| {
-                let socket = Socket::new(
-                    if ipv6 { Domain::IPV6 } else { Domain::IPV4 },
-                    Type::DGRAM,
-                    Some(Protocol::UDP),
-                )?;
-                let guard = track(ResourceKind::Socket);
-                check()?;
-                #[cfg(all(windows, feature = "windows-uwp"))]
-                dialer.apply_interface_binding(socket.as_raw_socket(), destination)?;
-                #[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
-                dialer.apply_configured_interface(socket.as_raw_socket(), destination)?;
-                socket.bind(&bind_address.into())?;
-                // Buffer sizing is a performance hint. Keep this same
-                // owned socket and its platform policy if the OS refuses it.
-                // socket2 converts usize to c_int, so skip invalid hints.
-                if let Some(size) = options
-                    .receive_buffer
-                    .filter(|&size| size > 0 && size <= i32::MAX as usize)
-                {
-                    let _ = socket.set_recv_buffer_size(size);
-                }
-                socket.set_nonblocking(true)?;
-                check()?;
-                dialer.protect_socket(&socket)?;
-                #[cfg(unix)]
-                dialer.apply_socket_policy(&socket, destination)?;
-                check()?;
-                Ok((std::net::UdpSocket::from(socket), guard))
+                dialer.configure_udp_socket(destination, bind_address, options, check)
             })
             .await?;
         Ok(ObservedIo::with_guard(UdpSocket::from_std(socket)?, guard))
+    }
+
+    fn configure_udp_socket(
+        &self,
+        destination: SocketAddr,
+        bind_address: SocketAddr,
+        options: UdpSocketOptions,
+        check: &dyn Fn() -> io::Result<()>,
+    ) -> io::Result<(std::net::UdpSocket, crate::resources::observation::Guard)> {
+        let socket = Socket::new(
+            if destination.is_ipv6() {
+                Domain::IPV6
+            } else {
+                Domain::IPV4
+            },
+            Type::DGRAM,
+            Some(Protocol::UDP),
+        )?;
+        let guard = track(ResourceKind::Socket);
+        check()?;
+        #[cfg(all(windows, feature = "windows-uwp"))]
+        self.apply_interface_binding(socket.as_raw_socket(), destination)?;
+        #[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
+        self.apply_configured_interface(socket.as_raw_socket(), destination)?;
+        socket.bind(&bind_address.into())?;
+        // Buffer sizing is a performance hint. Keep this same
+        // owned socket and its platform policy if the OS refuses it.
+        // socket2 converts usize to c_int, so skip invalid hints.
+        if let Some(size) = options
+            .receive_buffer
+            .filter(|&size| size > 0 && size <= i32::MAX as usize)
+        {
+            let _ = socket.set_recv_buffer_size(size);
+        }
+        socket.set_nonblocking(true)?;
+        check()?;
+        self.protect_socket(&socket)?;
+        #[cfg(unix)]
+        self.apply_socket_policy(&socket, destination)?;
+        check()?;
+        Ok((std::net::UdpSocket::from(socket), guard))
     }
 
     fn source_address_for(&self, destination: SocketAddr) -> io::Result<Option<SocketAddr>> {
@@ -1160,17 +1192,17 @@ impl Dialer {
         address: SocketAddr,
     ) -> io::Result<(TcpSocket, crate::resources::observation::Guard, SocketAddr)> {
         #[cfg(target_os = "linux")]
+        if self.permits_plain_native_socket_setup() {
+            return self.prepare_plain_native_tcp_socket(address).await;
+        }
+        #[cfg(target_os = "linux")]
         let mptcp = self.permits_mptcp();
         self.prepare_tcp_socket_with(address, move |ipv6| {
             #[cfg(target_os = "linux")]
             if mptcp {
                 return mptcp::socket(ipv6);
             }
-            if ipv6 {
-                TcpSocket::new_v6()
-            } else {
-                TcpSocket::new_v4()
-            }
+            new_plain_tcp_socket(ipv6)
         })
         .await
     }
@@ -1192,25 +1224,35 @@ impl Dialer {
             .initialization
             .run(move |check| {
                 let socket = create(ipv6)?;
-                let guard = track(ResourceKind::Socket);
-                check()?;
-                dialer.connections.apply(&socket2::SockRef::from(&socket))?;
-                dialer.protect_socket(&socket)?;
-                #[cfg(unix)]
-                dialer.apply_socket_policy(&socket, address)?;
-                check()?;
-                #[cfg(all(windows, feature = "windows-uwp"))]
-                dialer.apply_interface_binding(socket.as_raw_socket(), address)?;
-                #[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
-                dialer.apply_configured_interface(socket.as_raw_socket(), address)?;
-                if let Some(source_address) = source_address {
-                    socket.bind(source_address)?;
-                }
-                check()?;
-                Ok((socket, guard))
+                dialer.configure_tcp_socket(socket, address, source_address, check)
             })
             .await?;
         Ok((socket, guard, address))
+    }
+
+    fn configure_tcp_socket(
+        &self,
+        socket: TcpSocket,
+        address: SocketAddr,
+        source_address: Option<SocketAddr>,
+        check: &dyn Fn() -> io::Result<()>,
+    ) -> io::Result<(TcpSocket, crate::resources::observation::Guard)> {
+        let guard = track(ResourceKind::Socket);
+        check()?;
+        self.connections.apply(&socket2::SockRef::from(&socket))?;
+        self.protect_socket(&socket)?;
+        #[cfg(unix)]
+        self.apply_socket_policy(&socket, address)?;
+        check()?;
+        #[cfg(all(windows, feature = "windows-uwp"))]
+        self.apply_interface_binding(socket.as_raw_socket(), address)?;
+        #[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
+        self.apply_configured_interface(socket.as_raw_socket(), address)?;
+        if let Some(source_address) = source_address {
+            socket.bind(source_address)?;
+        }
+        check()?;
+        Ok((socket, guard))
     }
 
     #[cfg(unix)]
@@ -2067,3 +2109,11 @@ mod tests {
         assert!(preserve_ip4p_loopback(original, "192.0.2.1:443".parse().unwrap(), false).is_ok());
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "dialer_native_init_memory_tests.rs"]
+mod native_init_memory_tests;
+
+#[cfg(all(test, target_os = "linux", feature = "tun"))]
+#[path = "dialer_native_init_fd_tests.rs"]
+mod native_init_fd_tests;
