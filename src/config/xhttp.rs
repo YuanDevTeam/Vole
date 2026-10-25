@@ -53,6 +53,8 @@ pub struct XHttpRequestOptions {
     pub(crate) data: DataPlacement,
     pub(crate) post_bytes: IntegerRange,
     pub(crate) post_interval_ms: IntegerRange,
+    // Preserve explicit intervals; only the internal default may flush a full batch early.
+    pub(crate) post_interval_explicit: bool,
 }
 
 impl Default for XHttpRequestOptions {
@@ -70,6 +72,7 @@ impl Default for XHttpRequestOptions {
                 max: 1_000_000,
             },
             post_interval_ms: IntegerRange { min: 10, max: 10 },
+            post_interval_explicit: false,
         }
     }
 }
@@ -148,6 +151,7 @@ impl XHttpRequestOptions {
             data,
             post_bytes,
             post_interval_ms,
+            post_interval_explicit: range_value(raw.sc_min_posts_interval_ms.as_deref()).is_some(),
         };
         options.validate_headers(headers, &raw.path)?;
         Ok(options)

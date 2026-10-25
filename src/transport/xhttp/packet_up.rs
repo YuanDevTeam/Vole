@@ -95,11 +95,12 @@ impl Writer {
             flush: AtomicWaker::new(),
             reader: AtomicWaker::new(),
         });
+        let eager_capacity = (!request.options.post_interval_explicit).then_some(capacity);
         let lifetime = Lifetime(shared.clone());
         let worker = shared.clone();
         let task = owner.spawn(async move {
             let _lifetime = lifetime;
-            if let Err(error) = transmit(&worker, sender, request, session).await {
+            if let Err(error) = transmit(&worker, sender, request, session, eager_capacity).await {
                 worker.state.lock().unwrap().error = Some(Arc::new(error));
             }
         })?;
@@ -181,6 +182,7 @@ async fn transmit(
     sender: SendRequest,
     request: RequestTemplate,
     session: Arc<str>,
+    eager_capacity: Option<usize>,
 ) -> io::Result<()> {
     let mut sequence = 0_u64;
     let mut last_post_started = None;
@@ -193,7 +195,7 @@ async fn transmit(
             changed.await;
         }
         let delay = || Duration::from_millis(request.options.post_interval_ms.sample() as u64);
-        wait_interval(shared, last_post_started, delay()).await;
+        wait_interval(shared, last_post_started, delay(), eager_capacity).await;
         // Only one bounded batch, including while HTTP owns its immutable body.
         // Keep writes backpressured until the POSTs have acknowledged this batch.
         let mut batch = {
@@ -213,7 +215,7 @@ async fn transmit(
             shared.state.lock().unwrap().committed += count as u64;
             shared.flush.wake();
             if !batch.is_empty() {
-                wait_interval(shared, last_post_started, delay()).await;
+                wait_interval(shared, last_post_started, delay(), None).await;
             }
         }
         // The consumed Bytes retains its backing. Recover it only if HTTP has
@@ -228,15 +230,28 @@ async fn transmit(
     }
 }
 
-async fn wait_interval(shared: &Shared, last_post_started: Option<Instant>, delay: Duration) {
-    let finish = shared.finish.notified();
-    if !shared.finishing.load(Ordering::Acquire) {
-        // The first batch retains its aggregation delay. Later POST starts are
-        // separated by the sampled interval, including the previous exchange.
-        let deadline = last_post_started.unwrap_or_else(Instant::now) + delay;
+async fn wait_interval(
+    shared: &Shared,
+    last_post_started: Option<Instant>,
+    delay: Duration,
+    eager_capacity: Option<usize>,
+) {
+    // A partial default batch keeps its original deadline; filling it need not
+    // pay another aggregation delay. Explicit user intervals remain unchanged.
+    let deadline = last_post_started.unwrap_or_else(Instant::now) + delay;
+    loop {
+        let finish = shared.finish.notified();
+        let changed = shared.changed.notified();
+        if shared.finishing.load(Ordering::Acquire)
+            || eager_capacity
+                .is_some_and(|capacity| shared.state.lock().unwrap().buffer.len() >= capacity)
+        {
+            return;
+        }
         tokio::select! { biased;
-            () = finish => {},
-            () = tokio::time::sleep_until(deadline) => {},
+            () = finish => return,
+            () = changed, if eager_capacity.is_some() => {},
+            () = tokio::time::sleep_until(deadline) => return,
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Packet-up scheduling against a memory HTTP/2 peer with paused Tokio time.
 use super::*;
-use crate::config::xhttp::{IntegerRange, XHttpRequestOptions};
+use crate::config::xhttp::XHttpRequestOptions;
 use bytes::Bytes;
 use http::{Method, Response, StatusCode};
 use tokio::{
@@ -31,6 +31,16 @@ impl Fixture {
     }
 
     async fn with_limit(interval_ms: usize, post_bytes: usize) -> Self {
+        Self::with_request_options(normalized_packet_options(
+            Some(&interval_ms.to_string()),
+            post_bytes,
+            false,
+        ))
+        .await
+    }
+
+    async fn with_request_options(options: XHttpRequestOptions) -> Self {
+        let chunk = options.post_bytes.max.min(crate::limits::XHTTP_BODY_CHUNK);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (packets, receiver) = mpsc::channel(2);
         let server = tokio::spawn(async move {
@@ -79,26 +89,9 @@ impl Fixture {
             host: Arc::from("example.com"),
             path: Arc::from("/x"),
             headers: Default::default(),
-            options: Arc::new(XHttpRequestOptions {
-                post_bytes: IntegerRange {
-                    min: post_bytes,
-                    max: post_bytes,
-                },
-                post_interval_ms: IntegerRange {
-                    min: interval_ms,
-                    max: interval_ms,
-                },
-                ..Default::default()
-            }),
+            options: Arc::new(options),
         };
-        let writer = Writer::new(
-            sender,
-            request,
-            Arc::from("session"),
-            post_bytes.min(crate::limits::XHTTP_BODY_CHUNK),
-            &owner,
-        )
-        .unwrap();
+        let writer = Writer::new(sender, request, Arc::from("session"), chunk, &owner).unwrap();
         Self {
             writer,
             owner,
@@ -323,4 +316,248 @@ async fn shutdown_skips_first_delay_and_stop_joins_pending_post() {
     assert_eq!(fixture.writer.shared.state.lock().unwrap().committed, 0);
     drop(first);
     fixture.close().await;
+}
+
+fn normalized_packet_options(
+    interval: Option<&str>,
+    post_bytes: usize,
+    download: bool,
+) -> XHttpRequestOptions {
+    let interval = interval
+        .map(|value| format!("      sc-min-posts-interval-ms: {value:?}\n"))
+        .unwrap_or_default();
+    let download = if download {
+        "      download-settings: {}\n"
+    } else {
+        ""
+    };
+    let yaml = format!(
+        "proxies:\n  - name: fixture\n    type: vless\n    server: 192.0.2.1\n    port: 443\n    uuid: 00000000-0000-0000-0000-000000000001\n    network: xhttp\n    xhttp-opts:\n      mode: packet-up\n      sc-max-each-post-bytes: {post_bytes}\n{interval}{download}rules: ['MATCH,DIRECT']\n"
+    );
+    let config = crate::config::Config::parse_yaml(yaml.as_bytes()).unwrap();
+    let crate::config::ProxyProtocol::Vless(node) = &config.proxies[0].protocol else {
+        panic!("fixture is not VLESS")
+    };
+    let xhttp = node.xhttp().unwrap();
+    if let Some(download) = &xhttp.download {
+        assert!(Arc::ptr_eq(&download.request, &xhttp.request));
+    }
+    (*xhttp.request).clone()
+}
+
+#[tokio::test(start_paused = true)]
+async fn default_full_batch_submits_without_timer_or_extra_buffer() {
+    const CAPACITY: usize = crate::limits::XHTTP_PACKET_BATCH_BYTES;
+    for interval in [None, Some("")] {
+        let options = normalized_packet_options(interval, 1_000_000, true);
+        let mut fixture = Fixture::with_request_options(options).await;
+        let began = Instant::now();
+        let payload = vec![0xa5; CAPACITY];
+        fixture.writer.write_all(&payload).await.unwrap();
+        let capacity = fixture
+            .writer
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .buffer
+            .capacity();
+        let mut first = fixture.next().await;
+        let first_arrived = first.arrived;
+        let first_payload = first.body == payload;
+        let committed_before_response = fixture.writer.shared.state.lock().unwrap().committed;
+        let blocked = std::future::poll_fn(|cx| {
+            Poll::Ready(
+                Pin::new(&mut fixture.writer)
+                    .poll_write(cx, b"next")
+                    .is_pending(),
+            )
+        })
+        .await;
+        acknowledge(&mut first, StatusCode::OK);
+        fixture.writer.flush().await.unwrap();
+        let committed_after_response = fixture.writer.shared.state.lock().unwrap().committed;
+        fixture.writer.write_all(&payload).await.unwrap();
+        let mut second = fixture.next().await;
+        let second_arrived = second.arrived;
+        let second_payload = second.body == payload;
+        acknowledge(&mut second, StatusCode::OK);
+        fixture.writer.flush().await.unwrap();
+        fixture.close().await;
+        assert_eq!(
+            first_arrived, began,
+            "a full default batch paid the aggregation timer"
+        );
+        assert_eq!(
+            second_arrived, first_arrived,
+            "consecutive full default batches were timer-limited"
+        );
+        assert!(first_payload && second_payload, "full POST payload changed");
+        assert!(
+            capacity <= CAPACITY,
+            "batch allocation exceeded the existing cap"
+        );
+        assert!(blocked, "an unresolved POST admitted a second batch");
+        assert_eq!(
+            committed_before_response, 0,
+            "admission was mistaken for a POST receipt"
+        );
+        assert_eq!(committed_after_response, CAPACITY as u64);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn default_partial_and_explicit_full_batches_keep_their_original_interval() {
+    for (interval, length, minimum_ms, maximum_ms) in [
+        (None, 3, 10, 10),
+        (Some(""), 3, 10, 10),
+        (Some("10"), crate::limits::XHTTP_PACKET_BATCH_BYTES, 10, 10),
+        (
+            Some("100-101"),
+            crate::limits::XHTTP_PACKET_BATCH_BYTES,
+            100,
+            101,
+        ),
+    ] {
+        let options = normalized_packet_options(interval, 1_000_000, true);
+        let mut fixture = Fixture::with_request_options(options).await;
+        let began = Instant::now();
+        let payload = vec![0x5a; length];
+        fixture.writer.write_all(&payload).await.unwrap();
+        let mut packet = fixture.next().await;
+        let elapsed = packet.arrived - began;
+        let correct = packet.body == payload;
+        acknowledge(&mut packet, StatusCode::OK);
+        fixture.writer.flush().await.unwrap();
+        fixture.close().await;
+        assert!(elapsed >= Duration::from_millis(minimum_ms));
+        assert!(elapsed <= Duration::from_millis(maximum_ms));
+        assert!(correct, "scheduled POST changed accepted bytes");
+    }
+}
+
+// Actual smux writes into the production PacketUp writer. Read remains pending:
+// this test observes upload scheduling, not a second protocol implementation.
+struct PacketUploadOnly(Writer);
+impl tokio::io::AsyncRead for PacketUploadOnly {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+impl AsyncWrite for PacketUploadOnly {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, bytes)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn autonomous_smux_really_fills_default_packet_batch_and_preserves_every_frame() {
+    let options = normalized_packet_options(None, 1_000_000, false);
+    let Fixture {
+        writer,
+        owner,
+        connection,
+        mut packets,
+        server,
+    } = Fixture::with_request_options(options).await;
+    let shared = writer.shared.clone();
+    let (client, driver) = crate::transport::smux::new_with_autonomous_writes(
+        Box::new(PacketUploadOnly(writer)),
+        true,
+    );
+    let driver = tokio::spawn(driver);
+    let mut opening = Box::pin(client.open());
+    assert!(futures_util::poll!(opening.as_mut()).is_pending());
+    let mut syn = timeout(Duration::from_secs(2), packets.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let stream_id = syn.body[4..8].to_vec();
+    assert_eq!(&syn.body[..4], &[1, 0, 0, 0]);
+    acknowledge(&mut syn, StatusCode::OK);
+    let mut stream = opening.await.unwrap();
+    let began = Instant::now();
+    let payload = vec![0x3c; crate::limits::XHTTP_PACKET_BATCH_BYTES];
+    stream.write_all(&payload).await.unwrap();
+    let mut flush = Box::pin(stream.flush());
+    assert!(futures_util::poll!(flush.as_mut()).is_pending());
+    let mut first = timeout(Duration::from_secs(2), packets.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let first_arrived = first.arrived;
+    let first_length = first.body.len();
+    let first_backpressure = shared.state.lock().unwrap().in_flight;
+    let mut wire = std::mem::take(&mut first.body);
+    acknowledge(&mut first, StatusCode::OK);
+    let mut tail = timeout(Duration::from_secs(2), packets.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    wire.append(&mut tail.body);
+    acknowledge(&mut tail, StatusCode::OK);
+    flush.await.unwrap();
+    let committed = shared.state.lock().unwrap().committed;
+    // Stop owns every task. Do not add a FIN contract to this throughput test.
+    drop(stream);
+    driver.abort();
+    let _ = driver.await;
+    owner.cancellation.cancel();
+    owner.tasks.close();
+    owner.tasks.wait().await;
+    assert!(owner.tasks.is_empty());
+    drop(client);
+    drop(connection);
+    drop(packets);
+    timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first_length,
+        crate::limits::XHTTP_PACKET_BATCH_BYTES,
+        "smux never filled the real batch"
+    );
+    assert_eq!(
+        first_arrived, began,
+        "a full smux batch still waited for the default timer"
+    );
+    assert!(
+        first_backpressure,
+        "the full POST lost single-batch backpressure"
+    );
+    let mut decoded = Vec::new();
+    let mut input = wire.as_slice();
+    while !input.is_empty() {
+        assert!(input.len() >= 8, "partial smux frame header");
+        assert_eq!(&input[..2], &[1, 2]);
+        assert_eq!(&input[4..8], stream_id.as_slice());
+        let length = u16::from_le_bytes(input[2..4].try_into().unwrap()) as usize;
+        assert!(input.len() >= 8 + length, "partial smux frame payload");
+        decoded.extend_from_slice(&input[8..8 + length]);
+        input = &input[8 + length..];
+    }
+    assert_eq!(
+        decoded, payload,
+        "smux accepted bytes were not fully committed"
+    );
+    assert_eq!(
+        committed as usize,
+        8 + wire.len(),
+        "POST accounting lost SYN or DATA"
+    );
 }
