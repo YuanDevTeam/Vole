@@ -125,7 +125,7 @@ flate2 = { version = "=1.1.10", default-features = false, features = ["rust_back
 brotli = { version = "=9.0.0", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", features = ["sink"] }
 getifaddrs = "=0.6.2"
-h2 = "0.4.19"
+h2 = "0.4.20"
 h3 = { version = "=0.0.8", default-features = false, optional = true }
 h3-quinn = { version = "=0.0.10", default-features = false, optional = true }
 hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "aes", "chacha", "x25519", "nistp", "mlkem", "shake"] }
