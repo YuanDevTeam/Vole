@@ -81,12 +81,12 @@ impl RawGrpc {
             return invalid("invalid gRPC options");
         }
         let positive = |value: isize| value.max(0) as usize;
-        // Two node-owned connections share bidirectional Gun traffic without
+        // Four node-owned connections share bidirectional Gun traffic without
         // increasing per-connection credit. Explicit and negative thresholds
         // retain their policies; only the literal all-zero YAML default changes.
         let max_connections =
             if self.max_connections == 0 && self.min_streams == 0 && self.max_streams == 0 {
-                2
+                4
             } else {
                 positive(self.max_connections)
             };

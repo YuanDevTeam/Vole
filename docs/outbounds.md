@@ -369,7 +369,7 @@ Upgrade 的 ED 仅允许默认 Sec-WebSocket-Protocol 头（大小写不敏感�
 这些选项同样适用于 VMess 的明文和标准 TLS；不改变各协议认证、UDP 编码或关闭责任。
 gRPC 的 HTTP authority 使用非空 SNI，否则使用 server，不包含端口；不改变物理拨号地址。
 gRPC 选项与 VMess/VLESS 共用：省略或空 service-name 默认 GunService，普通名映射 /name/Tun，以 / 开头使用完整路径；省略或空 user-agent 默认 grpc-go/1.36.0。
-ping-interval 为秒，0 不主动 PING，负值明确拒绝；max-connections/min-streams/max-streams 接受带符号整数，负阈值禁用相应分支。三项池阈值省略或字面全零时归一 max-connections=2；显式 max-connections=1 保留单连接策略。正 max-connections 优先于 max-streams。
+ping-interval 为秒，0 不主动 PING，负值明确拒绝；max-connections/min-streams/max-streams 接受带符号整数，负阈值禁用相应分支。三项池阈值省略或字面全零时归一为4/0/0，Mihomo为1/0/0；显式 max-connections=1 或2保留各自策略。正 max-connections 优先于 max-streams。
 每个节点独立拥有连接池，空闲连接总是复用；复用保留原上游选择、TLS 身份和认证策略，每条逻辑流仍单独发送 Trojan 认证头。
 
 Trojan 私有 gRPC 池在原绝对期限内等待 H2 SETTINGS、提交并 flush 完整认证请求，

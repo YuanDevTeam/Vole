@@ -90,8 +90,8 @@ TCP/UDP 共用 Dialer。Linux 普通 socket 的创建、原生选项和 bind 在
 
 共享的无池gRPC/legacy H2适配器每个实例仅拥有一条底层连接与一个逻辑流，不是全局并发许可。Trojan/VMess/VLESS共用节点级gRPC池，物理连接按节点实例隔离，复用保留原上游与安全策略，每条逻辑流独立认证。流窗口64 KiB、连接窗口128 KiB、最大HTTP/2帧和发送缓冲各16 KiB、解码负载64 KiB。读侧按实际消费量释放窗口；每poll最多处理32个片段/控制消息。Trojan池使用内部duplex模式，仅发送END_STREAM并保留读取和lease；VMess/VLESS只结束当前逻辑流。关闭前已接受的数据须到达所提供IO的flush边界，不能仅排入h2队列后立即reset/abort；每个逻辑写端最多一个待确认数据块，Stop可取消等待。节点池最多保留4条空闲连接，PING ACK期限15秒；节点Stop取消并join全部物理驱动。无池模式的owner.stop同样等待驱动任务退出；Drop只做取消兜底，不作为同步停止通过证据。WS/HTTP适配器按底层CloseWrite语义工作，协议包装层可以根据已声明的协议关闭契约结束整个逻辑流。所有握手使用调用方同一个绝对deadline。
 
-Trojan/VMess/VLESS 的 YAML gRPC 池阈值省略或三项字面全零时采用 2/0/0，Mihomo 为 1/0/0。显式
-`max-connections: 1` 保留单连接策略。连接按需建立，不预建两条，也不提高单连接的
+Trojan/VMess/VLESS 的 YAML gRPC 池阈值省略或三项字面全零时采用 4/0/0，Mihomo 为 1/0/0。显式
+`max-connections: 1` 或 `max-connections: 2` 保留各自策略。连接按需建立，不预建四条，也不提高单连接的
 窗口或缓冲上限；新增连接仍增加自身的驱动、协议状态及接收信用。内部无池传输与
 TrustTunnel/MASQUE 的 CONNECT 所有者不使用这项 YAML 默认值，保留原连接策略。
 
