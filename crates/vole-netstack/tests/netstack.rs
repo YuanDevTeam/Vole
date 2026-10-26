@@ -1207,7 +1207,11 @@ async fn dropping_the_only_output_consumer_stops_active_tcp_and_other_endpoints(
 
 #[tokio::test]
 async fn asymmetric_tcp_buffers_bound_each_direction_and_stop_unblocks_writes() {
-    for (recv_buffer, send_buffer) in [(4 * 1024, 16 * 1024), (16 * 1024, 4 * 1024)] {
+    for (recv_buffer, send_buffer) in [
+        (4 * 1024, 16 * 1024),
+        (16 * 1024, 4 * 1024),
+        (32 * 1024, 64 * 1024),
+    ] {
         for flow in [Flow::v4(13_500), Flow::v6(13_501)] {
             let mut parts = NetStack::start_tcp(NetStackConfig {
                 tcp_recv_buffer: recv_buffer,

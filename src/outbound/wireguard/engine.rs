@@ -61,6 +61,7 @@ impl Engine {
             NetStackConfig {
                 mtu: usize::from(config.mtu),
                 packet_queue: 32,
+                tcp_send_buffer: 64 * 1024,
                 ..Default::default()
             },
             ClientAddresses {
