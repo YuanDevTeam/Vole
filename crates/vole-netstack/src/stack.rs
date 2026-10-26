@@ -1086,7 +1086,7 @@ impl Driver {
                 socket.state(),
                 tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived
             );
-            if past_handshake {
+            if past_handshake && !self.half_open.is_empty() {
                 self.half_open.remove(flow);
             }
             if past_handshake && !socket.may_recv() && !socket.can_recv() {
