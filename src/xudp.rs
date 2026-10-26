@@ -32,13 +32,14 @@ pub struct XudpTransport {
     last_remote: Option<Destination>,
     multiple_remotes: bool,
     pending_write: Option<PendingWrite>,
+    send_buffer: BytesMut,
     receive_buffer: BytesMut,
     max_receive_buffer_size: usize,
     closed: bool,
 }
 
 struct PendingWrite {
-    frame: Bytes,
+    frame: BytesMut,
     offset: usize,
     remote: Destination,
 }
@@ -90,6 +91,7 @@ impl XudpTransport {
             last_remote: None,
             multiple_remotes: false,
             pending_write: None,
+            send_buffer: BytesMut::new(),
             receive_buffer: BytesMut::with_capacity(max_receive_buffer_size),
             max_receive_buffer_size,
             closed: false,
@@ -120,7 +122,13 @@ impl XudpTransport {
                 stream.flush().await?;
             }
             self.first_write = false;
-            let remote = self.pending_write.take().expect("pending frame").remote;
+            let PendingWrite {
+                mut frame, remote, ..
+            } = self.pending_write.take().expect("pending frame");
+            // No accepted frame shares this mutable backing. Keep one empty
+            // buffer only after the original flush boundary has completed.
+            frame.clear();
+            self.send_buffer = frame;
             self.multiple_remotes |= self
                 .last_remote
                 .as_ref()
@@ -133,6 +141,7 @@ impl XudpTransport {
     fn fail(&mut self) {
         self.closed = true;
         self.pending_write = None;
+        self.send_buffer = BytesMut::new();
         self.stream.take();
     }
 
@@ -332,7 +341,9 @@ impl DatagramTransport for XudpTransport {
         }
         let result = async {
             self.flush_pending().await?;
-            let frame = encode_data_frame(
+            let mut frame = std::mem::take(&mut self.send_buffer);
+            encode_data_frame_into(
+                &mut frame,
                 &datagram,
                 self.first_write,
                 if self.first_write && self.global_id != [0; 8] {
@@ -377,6 +388,7 @@ impl DatagramTransport for XudpTransport {
             return Ok(());
         }
         self.closed = true;
+        self.send_buffer = BytesMut::new();
         let mut stream = self.stream.take().expect("open XUDP stream");
         // A partial data frame cannot be followed by a mux END frame. Closing
         // the last owner may discard it and terminate the underlying stream.
@@ -391,11 +403,23 @@ impl DatagramTransport for XudpTransport {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn encode_data_frame(
     datagram: &Datagram,
     first: bool,
     global_id: Option<[u8; 8]>,
 ) -> io::Result<Bytes> {
+    let mut output = BytesMut::new();
+    encode_data_frame_into(&mut output, datagram, first, global_id)?;
+    Ok(output.freeze())
+}
+
+fn encode_data_frame_into(
+    output: &mut BytesMut,
+    datagram: &Datagram,
+    first: bool,
+    global_id: Option<[u8; 8]>,
+) -> io::Result<()> {
     if datagram.payload.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -423,20 +447,26 @@ pub(crate) fn encode_data_frame(
     let metadata_length = 2 + 1 + 1 + 1 + destination_length + global_id_length;
     let metadata_length = u16::try_from(metadata_length).expect("XUDP metadata is bounded");
 
-    let mut output =
-        BytesMut::with_capacity(2 + usize::from(metadata_length) + 2 + datagram.payload.len());
+    let required = 2 + usize::from(metadata_length) + 2 + datagram.payload.len();
+    output.clear();
+    if output.capacity() < required {
+        // Drop a smaller old backing before allocating the next exact frame.
+        // The caller already applies the unchanged request payload budget.
+        *output = BytesMut::new();
+        *output = BytesMut::with_capacity(required);
+    }
     output.put_u16(metadata_length);
     output.put_u16(0); // one XUDP association uses mux session zero
     output.put_u8(if first { STATUS_NEW } else { STATUS_KEEP });
     output.put_u8(OPTION_DATA);
     output.put_u8(NETWORK_UDP);
-    encode_destination(&datagram.remote, &mut output)?;
+    encode_destination(&datagram.remote, output)?;
     if let Some(global_id) = global_id {
         output.extend_from_slice(&global_id);
     }
     output.put_u16(payload_length);
     output.extend_from_slice(&datagram.payload);
-    Ok(output.freeze())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -483,6 +513,81 @@ mod tests {
         ) -> std::task::Poll<io::Result<()>> {
             std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
         }
+    }
+
+    #[tokio::test]
+    async fn reusable_send_backing_preserves_wire_budget_and_clears_on_close() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let budget = crate::dispatch::DatagramBudget::new(1400, 1452);
+        let mut transport = XudpTransport::with_budget(Box::new(client), [7; 8], budget);
+        assert_eq!(transport.send_buffer.capacity(), 0);
+        let first = Datagram {
+            remote: "192.0.2.1:53"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+            payload: Bytes::from(vec![0x5a; 1200]),
+            sniffed_domain: None,
+        };
+        let mut second = first.clone();
+        second.remote = "192.0.2.2:53"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into();
+        let mut expected = encode_data_frame(&first, true, Some([7; 8]))
+            .unwrap()
+            .to_vec();
+        expected.extend_from_slice(&encode_data_frame(&second, false, None).unwrap());
+        expected.extend_from_slice(&[0, 4, 0, 0, STATUS_END, 0]);
+
+        transport.send(first).await.unwrap();
+        assert!(transport.pending_write.is_none());
+        assert!(transport.send_buffer.is_empty());
+        let backing = transport.send_buffer.as_ptr();
+        let capacity = transport.send_buffer.capacity();
+        assert!(capacity >= 1200);
+        assert!(capacity <= 2 + MAX_METADATA_LENGTH + 2 + usize::from(budget.transmit()));
+        transport.send(second.clone()).await.unwrap();
+        assert_eq!(transport.send_buffer.as_ptr(), backing);
+        assert_eq!(transport.send_buffer.capacity(), capacity);
+
+        second.payload = Bytes::from(vec![0; 1401]);
+        assert!(transport.send(second).await.is_err());
+        assert!(!transport.closed);
+        assert!(transport.pending_write.is_none());
+        assert_eq!(transport.send_buffer.as_ptr(), backing);
+        transport.close().await.unwrap();
+        assert!(transport.pending_write.is_none());
+        assert_eq!(transport.send_buffer.capacity(), 0);
+        let mut actual = Vec::new();
+        server.read_to_end(&mut actual).await.unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn failed_send_releases_a_warmed_encode_backing() {
+        let (client, server) = tokio::io::duplex(4096);
+        let mut transport = XudpTransport::with_budget(
+            Box::new(client),
+            [0; 8],
+            crate::dispatch::DatagramBudget::new(1400, 1452),
+        );
+        let packet = Datagram {
+            remote: "192.0.2.1:53"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+            payload: Bytes::from(vec![0x5a; 1200]),
+            sniffed_domain: None,
+        };
+        transport.send(packet.clone()).await.unwrap();
+        assert!(transport.send_buffer.capacity() > 0);
+        drop(server);
+        assert!(transport.send(packet).await.is_err());
+        assert!(transport.closed);
+        assert!(transport.pending_write.is_none());
+        assert_eq!(transport.send_buffer.capacity(), 0);
+        assert!(transport.stream.is_none());
     }
 
     #[tokio::test]
