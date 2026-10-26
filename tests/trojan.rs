@@ -263,3 +263,82 @@ async fn cancelled_partial_send_poison_closes_without_replaying_or_waiting() {
     transport.close().await.unwrap();
     transport.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn receive_future_keeps_packet_scratch_out_of_its_dynamic_frame() {
+    #[cfg(feature = "interop-test")]
+    let _case = vole::resources::case_events::Case::new(
+        "TROJAN-CODEC",
+        "receive_future_keeps_packet_scratch_out_of_its_dynamic_frame",
+    );
+    use std::{
+        future::{Future, poll_fn},
+        io,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use vole::{
+        dispatch::{DatagramBudget, DatagramTransport},
+        outbound::trojan::TrojanDatagram,
+    };
+
+    struct PendingRead {
+        capacity: Arc<AtomicUsize>,
+    }
+    impl AsyncRead for PendingRead {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.capacity.store(output.remaining(), Ordering::Relaxed);
+            Poll::Pending
+        }
+    }
+    impl AsyncWrite for PendingRead {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            input: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(input.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let capacity = Arc::new(AtomicUsize::new(0));
+    let mut transport = TrojanDatagram::new(
+        Box::new(PendingRead {
+            capacity: capacity.clone(),
+        }),
+        DatagramBudget::new(8192, 8192),
+    );
+    let mut receive = transport.receive();
+    // Query the concrete async_trait future through its dynamic vtable, not
+    // the size of the Box/Pin pointer. The resource threshold is not a wire bug.
+    let frame_bytes = std::mem::size_of_val(receive.as_ref().get_ref());
+    poll_fn(|cx| {
+        assert!(receive.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(receive);
+    transport.close().await.unwrap();
+    assert!(transport.receive().await.is_err());
+    assert_eq!(capacity.load(Ordering::Relaxed), 2048);
+    eprintln!("TROJAN_RECEIVE_DYNAMIC_FRAME_BYTES={frame_bytes}");
+    assert!(
+        frame_bytes < 2048,
+        "TROJAN_RECEIVE_FUTURE_SCRATCH_FOOTPRINT: {frame_bytes}"
+    );
+}
