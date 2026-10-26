@@ -44,6 +44,7 @@ enum RequestKind<'a> {
 
 pub struct GrpcPool {
     options: GrpcOptions,
+    stream_receive_window: u32,
     response_policy: ResponsePolicy,
     half_close: bool,
     empty_data: bool,
@@ -58,6 +59,7 @@ impl GrpcPool {
     pub fn new(options: GrpcOptions) -> Self {
         Self {
             options,
+            stream_receive_window: super::STREAM_BUFFER_BYTES as u32,
             response_policy: ResponsePolicy::SetupDeadline,
             half_close: false,
             empty_data: false,
@@ -90,12 +92,15 @@ impl GrpcPool {
     }
     #[cfg(feature = "outbound-masque")]
     pub(crate) fn masque_ip() -> Self {
-        Self::new(GrpcOptions {
+        let mut pool = Self::new(GrpcOptions {
             max_connections: 1,
             min_streams: 0,
             ping_interval: 30,
             ..Default::default()
-        })
+        });
+        // One CONNECT-IP response carries the node's inner IP traffic.
+        pool.stream_receive_window = 128 * 1024;
+        pool
     }
     /// Trojan keeps its response and lease after upload END_STREAM.
     #[cfg(any(test, feature = "outbound-trojan"))]
@@ -300,7 +305,7 @@ impl GrpcPool {
         let mut builder = h2::client::Builder::new();
         builder
             .enable_push(false)
-            .initial_window_size(super::STREAM_BUFFER_BYTES as u32)
+            .initial_window_size(self.stream_receive_window)
             .initial_connection_window_size((2 * super::STREAM_BUFFER_BYTES) as u32)
             .max_frame_size(super::STREAM_CHUNK_BYTES as u32)
             .max_header_list_size(super::STREAM_CHUNK_BYTES as u32)
@@ -431,6 +436,92 @@ mod tests {
     use super::*;
     use crate::resources::observation::{ResourceKind, ResourceProbe};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(feature = "outbound-masque")]
+    #[tokio::test(start_paused = true)]
+    async fn masque_h2_scoped_receive_window_reaches_wire_and_joins_stop() {
+        let observation = ResourceProbe::default();
+        let advertised = observation
+            .scope(async {
+                let mut owners = vec![
+                    ("generic", GrpcPool::new(GrpcOptions::default()), 64 * 1024),
+                    ("masque-ip", GrpcPool::masque_ip(), 128 * 1024),
+                ];
+                #[cfg(feature = "outbound-trusttunnel")]
+                owners.push(("trusttunnel", GrpcPool::connect_client(), 64 * 1024));
+                #[cfg(any(feature = "outbound-vmess", feature = "outbound-vless"))]
+                owners.push((
+                    "client-first",
+                    GrpcPool::new_client_first(GrpcOptions::default()),
+                    64 * 1024,
+                ));
+                let mut advertised = Vec::new();
+                for (name, pool, expected) in owners {
+                    let (raw, mut peer) = tokio::io::duplex(65536);
+                    // Supply the peer's empty SETTINGS; inspect the real h2
+                    // client's preface, SETTINGS and connection WINDOW_UPDATE.
+                    peer.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
+                    let connection = pool.establish(Box::new(raw)).await.unwrap();
+                    let (window, connection_window) =
+                        timeout_at(Instant::now() + Duration::from_secs(5), async {
+                            let mut preface = [0; 24];
+                            peer.read_exact(&mut preface).await.unwrap();
+                            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+                            let mut window = None;
+                            let mut connection_window = None;
+                            while window.is_none() || connection_window.is_none() {
+                                let mut header = [0; 9];
+                                peer.read_exact(&mut header).await.unwrap();
+                                let len = (usize::from(header[0]) << 16)
+                                    | (usize::from(header[1]) << 8)
+                                    | usize::from(header[2]);
+                                assert!(len <= 16 * 1024);
+                                let stream = u32::from_be_bytes(header[5..9].try_into().unwrap())
+                                    & 0x7fff_ffff;
+                                let mut body = vec![0; len];
+                                peer.read_exact(&mut body).await.unwrap();
+                                match header[3] {
+                                    4 if stream == 0 && header[4] & 1 == 0 => {
+                                        assert_eq!(body.len() % 6, 0);
+                                        for setting in body.chunks_exact(6) {
+                                            if setting[..2] == [0, 4] {
+                                                window = Some(u32::from_be_bytes(
+                                                    setting[2..].try_into().unwrap(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    8 if stream == 0 => {
+                                        assert_eq!(body.len(), 4);
+                                        let increment =
+                                            u32::from_be_bytes(body.try_into().unwrap())
+                                                & 0x7fff_ffff;
+                                        connection_window = Some(65535 + increment);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            (window.unwrap(), connection_window.unwrap())
+                        })
+                        .await
+                        .unwrap();
+                    pool.shutdown().await;
+                    assert!(pool.tasks.is_empty());
+                    assert!(connection.closed.load(Ordering::Acquire));
+                    assert_eq!(observation.snapshot().current(ResourceKind::Task), 0);
+                    drop(connection);
+                    drop(peer);
+                    advertised.push((name, window, connection_window, expected));
+                }
+                advertised
+            })
+            .await;
+        assert!(observation.snapshot().is_idle());
+        for (name, window, connection_window, expected) in advertised {
+            assert_eq!(window, expected, "MASQUE_H2_SCOPED_STREAM_WINDOW: {name}");
+            assert_eq!(connection_window, 128 * 1024, "{name} connection window");
+        }
+    }
 
     #[cfg(feature = "outbound-masque")]
     struct MasqueRequest {
