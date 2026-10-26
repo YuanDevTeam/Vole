@@ -567,10 +567,10 @@ proxies:
     #   grpc-service-name: edge # 省略/空默认 GunService；普通名映射 /edge/Tun；/ 开头使用完整路径
     #   grpc-user-agent: grpc-go/1.36.0 # 省略/空使用此默认值
     #   ping-interval: 0       # 秒数；0 不主动 PING；负值明确拒绝
-    #   max-connections: 1     # 正值时优先按连接上限/min-streams 扩容
+    #   max-connections: 2     # 正值时优先按连接上限/min-streams 扩容；1 保留单连接策略
     #   min-streams: 0
     #   max-streams: 0         # max-connections 非正时按此复用阈值扩容
-    # 三阈值字面全零归一 max-connections=1；负阈值禁用分支。
+    # 三阈值省略或字面全零时归一 max-connections=2；负阈值禁用分支。
     # ws-opts / grpc-opts 仅可用于对应 network；grpc-opts 可省略。
 
   - name: vless-edge

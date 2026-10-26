@@ -81,11 +81,12 @@ impl RawGrpc {
             return invalid("invalid gRPC options");
         }
         let positive = |value: isize| value.max(0) as usize;
-        // Match the literal all-zero default before collapsing negative values:
-        // negative thresholds disable a branch rather than opting into defaults.
+        // Two node-owned connections share bidirectional Gun traffic without
+        // increasing per-connection credit. Explicit and negative thresholds
+        // retain their policies; only the literal all-zero YAML default changes.
         let max_connections =
             if self.max_connections == 0 && self.min_streams == 0 && self.max_streams == 0 {
-                1
+                2
             } else {
                 positive(self.max_connections)
             };

@@ -10,9 +10,17 @@ use vole::config::{Config, ProxyProtocol, StreamTransport, TrojanTransport, Vles
 fn grpc_protocols_share_defaults_signed_thresholds_and_normalization() {
     for protocol in ["trojan", "vmess", "vless"] {
         for (fields, path, ua, max, min, streams) in [
-            (json!({}), "/GunService/Tun", "grpc-go/1.36.0", 1, 0, 0),
+            (json!({}), "/GunService/Tun", "grpc-go/1.36.0", 2, 0, 0),
             (
                 json!({"grpc-opts":{"grpc-service-name":"","grpc-user-agent":""}}),
+                "/GunService/Tun",
+                "grpc-go/1.36.0",
+                2,
+                0,
+                0,
+            ),
+            (
+                json!({"grpc-opts":{"max-connections":1}}),
                 "/GunService/Tun",
                 "grpc-go/1.36.0",
                 1,

@@ -191,7 +191,7 @@ fn auth_id(record: &[u8]) -> &[u8] {
 #[tokio::test]
 async fn vmess_grpc_reuses_per_node_transport_with_fresh_authentication_and_joined_stop() {
     tokio::time::timeout(Duration::from_secs(3),async {
-        let config=Config::parse_yaml(b"mixed-port: 1080\nproxies: [{name: edge, type: vmess, server: fixture.invalid, port: 443, uuid: 07070707-0707-0707-0707-070707070707, network: grpc, grpc-opts: {grpc-service-name: edge, grpc-user-agent: vmess-memory}}]\nrules: ['MATCH,edge']").unwrap();
+        let config=Config::parse_yaml(b"mixed-port: 1080\nproxies: [{name: edge, type: vmess, server: fixture.invalid, port: 443, uuid: 07070707-0707-0707-0707-070707070707, network: grpc, grpc-opts: {grpc-service-name: edge, grpc-user-agent: vmess-memory, max-connections: 1}}]\nrules: ['MATCH,edge']").unwrap();
         let ProxyProtocol::Vmess(node)=&config.proxies[0].protocol else { unreachable!() };
         let (requests,mut observed)=tokio::sync::mpsc::unbounded_channel();
         let upstream=Arc::new(MemoryUpstream { physical:AtomicUsize::new(0), tasks:TaskTracker::new(), requests, delayed:None, tls:None });
