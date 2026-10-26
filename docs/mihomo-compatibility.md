@@ -2,7 +2,7 @@
 
 ## 兼容原则
 
-Vole Core 以**内存优化和吞吐达标为第一目标**。与 Mihomo 的兼容要求是：在 Vole 支持的协议和模式范围内，与 **Mihomo listener 和官方协议 server 端互通**，不寻求配置字段行为完全一致。
+Vole Core 的性能优化综合评估**吞吐、CPU、内存和丢包率的实测收益与代价**，所有指标都允许渐进式改进；优化采纳与最终验收分别遵循[验收边界](acceptance.md#性能采纳标准)。与 Mihomo 的兼容要求是：在 Vole 支持的协议和模式范围内，与 **Mihomo listener 和官方协议 server 端互通**，不寻求配置字段行为完全一致。
 
 TUIC v5 的服务端互通目标固定为 Mihomo，不以其他 TUIC 服务端的结果替代该范围验收。
 
