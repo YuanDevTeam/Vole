@@ -1370,17 +1370,16 @@ impl RoutedDatagramTransport {
             let _ = self.remove_managed(&key).await;
         }
         if !self.managed_flows.contains_key(&key) {
-            let mut decision = self
-                .router
-                .route(
-                    Network::Udp,
-                    (self.session.inbound, &self.session.metadata),
-                    self.session.source,
-                    &key,
-                    datagram.sniffed_domain.as_deref(),
-                    None,
-                )
-                .await?;
+            // Keep route setup state out of the future allocated for each cached send.
+            let mut decision = Box::pin(self.router.route(
+                Network::Udp,
+                (self.session.inbound, &self.session.metadata),
+                self.session.source,
+                &key,
+                datagram.sniffed_domain.as_deref(),
+                None,
+            ))
+            .await?;
             if matches!(decision.action, RuleAction::Reject | RuleAction::RejectDrop) {
                 return Ok(());
             }
@@ -1718,17 +1717,15 @@ impl RoutedDatagramTransport {
         mut datagram: Datagram,
     ) -> Result<(), DispatchError> {
         if !self.fake_flows.contains_key(&original) {
-            let mut decision = self
-                .router
-                .route(
-                    Network::Udp,
-                    (self.session.inbound, &self.session.metadata),
-                    self.session.source,
-                    &datagram.remote,
-                    datagram.sniffed_domain.as_deref(),
-                    None,
-                )
-                .await?;
+            let mut decision = Box::pin(self.router.route(
+                Network::Udp,
+                (self.session.inbound, &self.session.metadata),
+                self.session.source,
+                &datagram.remote,
+                datagram.sniffed_domain.as_deref(),
+                None,
+            ))
+            .await?;
             let (dispatcher, direct) = match decision.action {
                 RuleAction::Reject | RuleAction::RejectDrop => return Ok(()),
                 RuleAction::Direct => (self.router.direct.clone(), true),
@@ -1991,17 +1988,15 @@ impl DatagramTransport for RoutedDatagramTransport {
                 selected: None,
             }
         } else {
-            let decision = self
-                .router
-                .route(
-                    Network::Udp,
-                    (self.session.inbound, &self.session.metadata),
-                    self.session.source,
-                    &datagram.remote,
-                    datagram.sniffed_domain.as_deref(),
-                    Some(&mut self.route_transports),
-                )
-                .await?;
+            let decision = Box::pin(self.router.route(
+                Network::Udp,
+                (self.session.inbound, &self.session.metadata),
+                self.session.source,
+                &datagram.remote,
+                datagram.sniffed_domain.as_deref(),
+                Some(&mut self.route_transports),
+            ))
+            .await?;
             if let Some(destination) = flow {
                 self.flows.entries.insert(
                     destination,
