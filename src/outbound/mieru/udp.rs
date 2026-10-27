@@ -178,7 +178,17 @@ impl Reliable {
             // buffer a complete peer segment. While occupied, advertise zero.
             usize::from(partial_available && bytes > 0)
         } else {
-            bytes / self.receive_chunk
+            // New DATA must leave the same missing-head credit as input().
+            let reserve = if self
+                .reorder
+                .first_key_value()
+                .is_some_and(|(seq, _)| *seq > self.state.next_receive.load(Ordering::Acquire))
+            {
+                self.receive_chunk
+            } else {
+                0
+            };
+            bytes.saturating_sub(reserve) / self.receive_chunk
         };
         segment_space.min(byte_space).min(u16::MAX as usize) as u16
     }
@@ -1847,18 +1857,22 @@ mod tests {
             payload: Bytes::from(vec![sequence as u8; CHUNK]),
         };
         assert!(!reliable.small_budget());
+        assert_eq!(reliable.window(true), 3);
         // A missing seq1 followed by a burst of future DATA must not consume
         // the credit seq1 needs to unblock the actual receive queue.
         for sequence in 2..=4 {
             reliable.input(frame(sequence), Instant::now(), &mut partial);
         }
         assert_eq!(state.next_receive.load(Ordering::Acquire), 1);
+        assert_eq!(reliable.reorder_bytes.available_permits(), CHUNK);
+        assert_eq!(reliable.window(true), 0);
         reliable.input(frame(1), Instant::now(), &mut partial);
         assert_eq!(
             state.next_receive.load(Ordering::Acquire),
             4,
             "future DATA exhausted the missing segment's receive credit"
         );
+        assert_eq!(reliable.window(true), 3);
         let waker = futures_util::task::noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
         for sequence in 1..=3 {
