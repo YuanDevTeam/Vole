@@ -179,6 +179,7 @@ cargo test --locked --no-default-features --features cli,interop-test --lib <过
 | VMess 响应边界 | `outbound::vmess::header::delayed_response_memory_tests::`、`outbound::vmess::stream::tests::`、`outbound::vmess::outbound::polled_datagram_memory_tests::`、`--test vmess_lifecycle` | 官方延迟响应向量、HTTP迟到响应与节点取消、提交前期限、响应认证、收发计数回绕、加密 packetaddr 多目标帧与回包来源、跨回绕连续交付、认证错误关闭、逐字节轮询、读写交错取消与关闭 |
 | SS2022 | `outbound::shadowsocks::datagram::tests::` | 官方内存对端、三种 cipher、空 UDP/EIH、认证后 cipher 准入、取消与轮换 ID、重放边界 |
 | Trojan UDP | `routing::dispatcher::tests::managed_trojan_udp_`、`--test trojan` | 真实内存帧、同源多目标共享、来源及关闭后旧回复隔离、取消与流释放 |
+| TUIC UDP | `outbound::tuic::wire::tests::`、`outbound::tuic::datagram::tests::` | 按声明长度交付、分片满表下新包前进、资源界限和来源隔离 |
 | SOCKS5 UDP | `outbound::socks5::tests::` | 真实内存握手与帧、同源多目标复用、异源隔离、关闭重建后旧回复隔离、relay 来源和嵌套预算 |
 | HTTP 编译与执行 | `http_processing::` | 严格规则与 provider、URL/头/正文、压缩与 JSON Patch、选择性 TLS、H1/H2 和有界回退 |
 | HTTP Invoke | `invoke::http::`、`resource::http_control::tests::` | 有界私密输入、离线演算、来源未准备、下载 dispatcher 接线、单一准入、取消与 Stop 收尾 |

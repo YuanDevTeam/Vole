@@ -371,7 +371,17 @@ impl Reassembly {
         }
         if !self.packets.contains_key(&f.packet) {
             if self.packets.len() >= crate::limits::TUIC_PENDING_PACKETS {
-                return None;
+                // An abandoned partial must not block fresh packets until TTL.
+                // Expiry is fixed at admission, so its order also identifies
+                // the oldest retained partial without another queue or clock.
+                let oldest = self
+                    .packets
+                    .iter()
+                    .min_by_key(|(packet, pending)| (pending.expires, **packet))
+                    .map(|(&packet, _)| packet);
+                if let Some(packet) = oldest {
+                    self.remove(packet);
+                }
             }
             self.packets.insert(
                 f.packet,
@@ -550,6 +560,44 @@ mod tests {
         r.push(fragment(0, 1, Bytes::from_static(b"a")), now, 8);
         r.push(fragment(0, 1, Bytes::from_static(b"b")), now, 8);
         assert!(r.packets.is_empty());
+    }
+    #[test]
+    fn fresh_packet_progresses_when_old_partial_slots_are_full() {
+        let _case =
+            crate::resources::case_events::Case::new("TUIC-UNIT", "reassembly_fresh_progress");
+        let now = Instant::now();
+        let mut r = Reassembly::default();
+        for id in 0..crate::limits::TUIC_PENDING_PACKETS {
+            assert!(
+                r.push(
+                    fragment(id as u16, 0, Bytes::from_static(b"x")),
+                    now + Duration::from_nanos(id as u64),
+                    1200,
+                )
+                .is_none()
+            );
+        }
+        assert_eq!(r.packets.len(), crate::limits::TUIC_PENDING_PACKETS);
+        assert_eq!(r.bytes, crate::limits::TUIC_PENDING_PACKETS);
+        let id = crate::limits::TUIC_PENDING_PACKETS as u16;
+        let target = Destination::Ip("198.51.100.2:443".parse().unwrap());
+        let mut head = fragment(id, 0, Bytes::from_static(b"fresh-"));
+        head.peer = Some(target.clone());
+        assert!(r.push(head, now + Duration::from_millis(1), 1200).is_none());
+        let packet = r
+            .push(
+                fragment(id, 1, Bytes::from_static(b"payload")),
+                now + Duration::from_millis(2),
+                1200,
+            )
+            .expect("a fresh complete packet must progress before old partials expire");
+        assert_eq!(packet.remote, target);
+        assert_eq!(packet.payload, b"fresh-payload"[..]);
+        assert!(!r.packets.contains_key(&0));
+        assert!(r.packets.contains_key(&1));
+        assert!(!r.packets.contains_key(&id));
+        assert_eq!(r.packets.len(), crate::limits::TUIC_PENDING_PACKETS - 1);
+        assert_eq!(r.bytes, crate::limits::TUIC_PENDING_PACKETS - 1);
     }
     #[test]
     fn partial_packets_expire_and_both_resource_bounds_are_per_association() {

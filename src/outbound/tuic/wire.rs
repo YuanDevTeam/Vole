@@ -217,10 +217,8 @@ pub(super) async fn read_packet(
     let start = raw.len();
     raw.resize(start + size, 0);
     stream.read_exact(&mut raw[start..]).await?;
-    let mut extra = [0];
-    if stream.read(&mut extra).await? != 0 {
-        return Err(invalid());
-    }
+    // TUIC uni packets end at their declared payload size. Dropping the
+    // reader retires this packet without waiting for a separately delivered FIN.
     decode(raw.into())
 }
 
@@ -340,7 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uni_parser_rejects_unknown_owner_before_reading_body_and_requires_fin() {
+    async fn uni_parser_rejects_unknown_owner_before_reading_body_and_declared_limit() {
         let (client, mut peer) = tokio::io::duplex(64);
         peer.write_all(b"\x05\x02\xff\xff\x00\x00\x01\x00\xff\xff")
             .await
@@ -355,20 +353,45 @@ mod tests {
             .is_err()
         );
         let literal = &b"\x05\x02\x00\x01\x00\x00\x01\x00\x00\x01\x00\x01x\x00\x35a"[..];
-        for suffix in [&b""[..], &b"x"[..]] {
-            let (client, mut peer) = tokio::io::duplex(1);
-            let suffix = suffix.to_vec();
-            let invalid = !suffix.is_empty();
-            let sent = tokio::spawn(async move {
-                for byte in literal {
-                    peer.write_all(&[*byte]).await.unwrap();
-                }
-                let _ = peer.write_all(&suffix).await;
-            });
-            let result = read_packet(client, |id| if id == 1 { Some(1) } else { None }).await;
-            assert_eq!(result.is_err(), invalid);
-            sent.await.unwrap();
-        }
         assert!(read_packet(literal, |_| Some(0)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn uni_parser_delivers_declared_payload_without_fin() {
+        let literal = &b"\x05\x02\x00\x01\x00\x00\x01\x00\x00\x01\x00\x01x\x00\x35a"[..];
+        for suffix in [&b""[..], &b"x"[..]] {
+            let (client, mut peer) = tokio::io::duplex(64);
+            peer.write_all(literal).await.unwrap();
+            peer.write_all(suffix).await.unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_packet(client, |id| if id == 1 { Some(1) } else { None }),
+            )
+            .await;
+            // Keep the real writer open until parsing completes; no FIN or
+            // background task can make the old EOF-waiting parser pass.
+            drop(peer);
+            let fragment = result
+                .expect("declared UDP payload waited for FIN")
+                .unwrap();
+            assert_eq!(fragment.association, 1);
+            assert_eq!(fragment.packet, 0);
+            assert_eq!(fragment.count, 1);
+            assert_eq!(fragment.index, 0);
+            assert_eq!(
+                fragment.peer,
+                Some(Destination::Domain {
+                    host: "x".into(),
+                    port: 53,
+                })
+            );
+            assert_eq!(fragment.payload.as_ref(), b"a");
+        }
+    }
+
+    #[tokio::test]
+    async fn uni_parser_rejects_truncated_declared_payload() {
+        let truncated = &b"\x05\x02\x00\x01\x00\x00\x01\x00\x00\x01\x00\x01x\x00\x35"[..];
+        assert!(read_packet(truncated, |_| Some(1)).await.is_err());
     }
 }
