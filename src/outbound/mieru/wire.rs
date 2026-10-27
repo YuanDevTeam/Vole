@@ -286,14 +286,14 @@ pub(crate) struct PacketEncoder {
 }
 
 impl PacketEncoder {
-    pub(crate) fn new(key: Arc<Key>) -> Self {
-        Self {
-            cipher: PacketCipher::new(key),
-        }
+    pub(crate) fn new(key: &[u8; 32], low_entropy: bool) -> io::Result<Self> {
+        Ok(Self {
+            cipher: PacketCipher::new(key, low_entropy)?,
+        })
     }
 
     pub(crate) fn encode_frame<'a>(
-        &self,
+        &mut self,
         metadata: Metadata,
         payload: &[u8],
         encoding: impl Into<FrameEncoding<'a>>,
@@ -339,13 +339,13 @@ pub(crate) struct PacketDecoder {
 }
 
 impl PacketDecoder {
-    pub(crate) fn new(key: Arc<Key>) -> Self {
-        Self {
-            cipher: PacketCipher::new(key),
-        }
+    pub(crate) fn new(key: &[u8; 32], low_entropy: bool) -> io::Result<Self> {
+        Ok(Self {
+            cipher: PacketCipher::new(key, low_entropy)?,
+        })
     }
 
-    pub(crate) fn decode_frame(&self, packet: Bytes, unix_secs: u64) -> io::Result<Frame> {
+    pub(crate) fn decode_frame(&mut self, packet: Bytes, unix_secs: u64) -> io::Result<Frame> {
         if packet.len() < PACKET_HEADER_LEN {
             return Err(invalid_frame());
         }
@@ -661,6 +661,10 @@ mod tests {
         Arc::new(derive_key("vole", "fixture-password", TIME))
     }
 
+    fn packet_key() -> zeroize::Zeroizing<[u8; 32]> {
+        super::super::crypto::derive_packet_key("vole", "fixture-password", TIME)
+    }
+
     fn nonce() -> [u8; NONCE_LEN] {
         make_client_nonce("vole", std::array::from_fn(|index| index as u8))
     }
@@ -695,8 +699,8 @@ mod tests {
 
     #[test]
     fn mieru_low_entropy_packet_preserves_aead_tag_and_owned_buffer() {
-        let encoder = PacketEncoder::new(key());
-        let decoder = PacketDecoder::new(key());
+        let mut encoder = PacketEncoder::new(&packet_key(), true).unwrap();
+        let mut decoder = PacketDecoder::new(&packet_key(), true).unwrap();
         let plain = b"partial last chunk";
         let padding = Padding {
             prefix: &[0x42],
@@ -742,7 +746,7 @@ mod tests {
                         &packet[end..end + TAG_LEN],
                         &ordinary[start + plain.len()..start + plain.len() + TAG_LEN]
                     );
-                    let cipher = PacketCipher::new(key());
+                    let mut cipher = PacketCipher::new(&packet_key(), true).unwrap();
                     let mut metadata: [u8; METADATA_LEN] = packet
                         [NONCE_LEN..NONCE_LEN + METADATA_LEN]
                         .try_into()
@@ -838,7 +842,7 @@ mod tests {
     #[test]
     fn fixed_udp_vectors_reorder_and_repeated_datagrams() {
         let payload = hex("050100017f0000010050");
-        let encoder = PacketEncoder::new(key());
+        let mut encoder = PacketEncoder::new(&packet_key(), false).unwrap();
         let mut encoded = Vec::new();
         encoder
             .encode_frame(
@@ -868,7 +872,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(encoded, hex(UDP_ACK_HEX));
-        let decoder = PacketDecoder::new(key());
+        let mut decoder = PacketDecoder::new(&packet_key(), false).unwrap();
         let received = decoder.decode_frame(Bytes::from(encoded), TIME).unwrap();
         assert_eq!(received.metadata, ack());
         assert!(received.payload.is_empty());
@@ -884,7 +888,7 @@ mod tests {
 
     #[test]
     fn packet_errors_leave_decoder_available() {
-        let decoder = PacketDecoder::new(key());
+        let mut decoder = PacketDecoder::new(&packet_key(), false).unwrap();
         let valid = hex(UDP_OPEN_HEX);
         let mut bad_metadata_tag = valid.clone();
         bad_metadata_tag[PACKET_HEADER_LEN - 1] ^= 1;
@@ -925,7 +929,8 @@ mod tests {
     fn packet_key_survives_epoch_and_receiver_preserves_u16_bound() {
         let creation_time = 1_700_000_039;
         let reply_time = 1_700_000_160;
-        let key = Arc::new(derive_key("vole", "fixture-password", creation_time));
+        let key =
+            super::super::crypto::derive_packet_key("vole", "fixture-password", creation_time);
         let nonce = [0x5a; NONCE_LEN];
         let mut header = encode_metadata(ack(), 0, Padding::default().into(), reply_time).unwrap();
         header[0] = 7;
@@ -933,7 +938,7 @@ mod tests {
         header[22..24].copy_from_slice(&u16::MAX.to_be_bytes());
         header[25..].fill(0xff);
         let mut payload = vec![0x5a; usize::from(u16::MAX)];
-        let cipher = PacketCipher::new(key.clone());
+        let mut cipher = PacketCipher::new(&key, false).unwrap();
         let tag = cipher.seal(nonce, &mut header).unwrap();
         let mut packet = nonce.to_vec();
         packet.extend_from_slice(&header);
@@ -942,13 +947,17 @@ mod tests {
         packet.extend_from_slice(&payload);
         packet.extend_from_slice(&tag);
         let packet = Bytes::from(packet);
-        let received = PacketDecoder::new(key)
+        let received = PacketDecoder::new(&key, false)
+            .unwrap()
             .decode_frame(packet.clone(), reply_time)
             .unwrap();
         assert_eq!(received.payload.len(), usize::from(u16::MAX));
         assert!(received.payload.iter().all(|byte| *byte == 0x5a));
-        let new_carrier =
-            PacketDecoder::new(Arc::new(derive_key("vole", "fixture-password", reply_time)));
+        let mut new_carrier = PacketDecoder::new(
+            &super::super::crypto::derive_packet_key("vole", "fixture-password", reply_time),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             new_carrier
                 .decode_frame(packet, reply_time)

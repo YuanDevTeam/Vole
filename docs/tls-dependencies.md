@@ -16,7 +16,7 @@
 | 业务 HTTPS 处理 | rcgen + ring 使用宿主提供的 CA 签发短期叶证书；官方 x509-parser 校验 CA、密钥匹配与有效期，不生成根 CA 或安装信任，见 [HTTP 处理](http-processing.md) |
 | 命名 ClientHello、REALITY、JLS、ShadowTLS v3 | YuanDevTeam/boring，同一 fork 的本地 development path；发布门禁仍要求 release 分支及批准 revision |
 | SS 2022 | 官方 shadowsocks，仅 `aead-cipher-2022` |
-| Mieru 分段认证 | 官方 RustCrypto chacha20poly1305 0.11.0 + ring PBKDF2；不使用 TLS 或另一套 TLS provider |
+| Mieru 分段认证 | UDP 低熵编码及 TCP 保留官方 RustCrypto chacha20poly1305 0.11.0；其余 UDP 复用同一 boring/boring-sys 的安全可变 XChaCha20-Poly1305 原位 AEAD，均用 ring PBKDF2；Mieru 不使用 TLS，不引入另一套 TLS provider |
 | Encryption | 同一 boring 的 X25519、ML-KEM、AEAD、AES-CTR；官方 blake3 |
 | 静态/动态 ECH | rustls 使用官方 hpke + 公开 HPKE trait；命名模板及 quiche H3 使用同一 boring ECH selector |
 | Provider AGE | 官方 age/age-core 的 armor、MAC 和 STREAM；Hybrid 身份用官方 hpke XWing，关闭插件与 CLI |

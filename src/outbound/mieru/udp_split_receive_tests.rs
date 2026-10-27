@@ -90,17 +90,17 @@ mod split_receive_tests {
                 .unwrap()
                 .take()
                 .ok_or(DispatchError::NotAllowed)?;
-            let key = Arc::new(crypto::derive_key(
+            let key = crypto::derive_packet_key(
                 "vole",
                 "fixture-password",
                 super::super::tcp::now().map_err(|_| DispatchError::NotAllowed)?,
-            ));
+            );
             Ok(Box::new(Packets {
                 incoming,
                 sent: self.sent.clone(),
                 received: self.received.clone(),
                 closed: self.closed.clone(),
-                decoder: PacketDecoder::new(key),
+                decoder: PacketDecoder::new(&key, false).map_err(|_| DispatchError::NotAllowed)?,
             }))
         }
     }
@@ -158,11 +158,11 @@ mod split_receive_tests {
                 }
             };
             let state = raw.state.clone();
-            let key = Arc::new(crypto::derive_key(
+            let key = crypto::derive_packet_key(
                 "vole",
                 "fixture-password",
                 super::super::tcp::now()?,
-            ));
+            );
             Ok(Self {
                 node,
                 raw: Some(raw),
@@ -171,12 +171,12 @@ mod split_receive_tests {
                 incoming,
                 sent: observations,
                 closed,
-                encoder: PacketEncoder::new(key),
+                encoder: PacketEncoder::new(&key, false)?,
                 remote: Destination::Ip("192.0.2.1:2000".parse().unwrap()),
             })
         }
 
-        fn inject(&self, metadata: Metadata, payload: &[u8]) -> io::Result<()> {
+        fn inject(&mut self, metadata: Metadata, payload: &[u8]) -> io::Result<()> {
             let mut bytes = Vec::new();
             self.encoder.encode_frame(
                 metadata,
@@ -198,7 +198,7 @@ mod split_receive_tests {
                 .map_err(|_| failed("bounded test input is full or closed"))
         }
 
-        fn data(&self, sequence: u32) -> io::Result<()> {
+        fn data(&mut self, sequence: u32) -> io::Result<()> {
             self.inject(
                 Metadata::Data(DataMetadata {
                     kind: DataKind::ServerData,
@@ -273,7 +273,7 @@ mod split_receive_tests {
             Ok(())
         }
 
-        fn data_bytes(&self, sequence: u32, payload: &[u8]) -> io::Result<()> {
+        fn data_bytes(&mut self, sequence: u32, payload: &[u8]) -> io::Result<()> {
             self.inject(
                 Metadata::Data(DataMetadata {
                     kind: DataKind::ServerData,
@@ -303,7 +303,7 @@ mod split_receive_tests {
             }
             Ok(expected)
         }
-        fn remote_close(&self, sequence: u32) -> io::Result<()> {
+        fn remote_close(&mut self, sequence: u32) -> io::Result<()> {
             self.inject(
                 Metadata::Session(SessionMetadata {
                     kind: SessionKind::CloseRequest,
@@ -352,10 +352,10 @@ mod split_receive_tests {
     impl Wire {
         fn new() -> Self {
             let unix = super::super::tcp::now().unwrap();
-            let key = Arc::new(crypto::derive_key("vole", "fixture-password", unix));
+            let key = crypto::derive_packet_key("vole", "fixture-password", unix);
             Self {
-                encoder: PacketEncoder::new(key.clone()),
-                decoder: PacketDecoder::new(key),
+                encoder: PacketEncoder::new(&key, false).unwrap(),
+                decoder: PacketDecoder::new(&key, false).unwrap(),
                 unix,
                 nonce: 0,
             }

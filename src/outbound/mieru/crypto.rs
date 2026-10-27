@@ -1,6 +1,7 @@
 //! Mieru v3 wire cryptography, implemented from the public protocol specification.
 //! https://github.com/enfein/mieru/blob/v3.38.1/docs/protocol.md
 //! This module contains no translated Go implementation.
+use boring::aead::{AeadCtx, Algorithm};
 use chacha20poly1305::{AeadInOut, KeyInit, Tag, XChaCha20Poly1305, XNonce};
 use sha2::{Digest, Sha256};
 use std::{fmt, io, num::NonZeroU32, sync::Arc};
@@ -74,33 +75,65 @@ pub(crate) fn make_client_nonce(username: &str, mut random: [u8; NONCE_LEN]) -> 
     random
 }
 
-/// Stateless UDP encryption under a fixed physical-carrier key. Every datagram has an
-/// explicit nonce; its metadata and nonempty payload use that same nonce separately.
-/// The carrier generates a fresh nonce for every send, including retransmissions.
-pub(super) struct PacketCipher {
-    key: Arc<Key>,
+/// Derive one UDP physical-carrier key; the temporary material is erased after
+/// the two independently owned packet ciphers have copied it during setup.
+pub(super) fn derive_packet_key(
+    username: &str,
+    password: &str,
+    unix_secs: u64,
+) -> Zeroizing<[u8; 32]> {
+    key_material(username, password, unix_secs)
+}
+
+/// Stateless UDP encryption with an explicit nonce and a setup-selected backend.
+/// Low-entropy carriers keep RustCrypto; other UDP carriers share Boring.
+pub(super) enum PacketCipher {
+    Native(AeadCtx),
+    Rust(Key),
 }
 
 impl PacketCipher {
-    pub(super) fn new(key: Arc<Key>) -> Self {
-        Self { key }
+    pub(super) fn new(key: &[u8; 32], low_entropy: bool) -> io::Result<Self> {
+        if low_entropy {
+            Ok(Self::Rust(Key(XChaCha20Poly1305::new(&(*key).into()))))
+        } else {
+            AeadCtx::new(&Algorithm::xchacha20_poly1305(), key, TAG_LEN)
+                .map(Self::Native)
+                .map_err(io::Error::other)
+        }
     }
 
     pub(super) fn seal(
-        &self,
+        &mut self,
         nonce: [u8; NONCE_LEN],
         plaintext: &mut [u8],
     ) -> io::Result<[u8; TAG_LEN]> {
-        self.key.seal(&nonce.into(), plaintext)
+        match self {
+            Self::Rust(key) => key.seal(&nonce.into(), plaintext),
+            Self::Native(context) => {
+                let mut tag = [0; TAG_LEN];
+                context
+                    .seal_in_place_mut(&nonce, plaintext, &mut tag, b"")
+                    .map_err(|_| io::Error::other("Mieru encryption failed"))?;
+                Ok(tag)
+            }
+        }
     }
 
     pub(super) fn open(
-        &self,
+        &mut self,
         nonce: [u8; NONCE_LEN],
         ciphertext: &mut [u8],
         tag: [u8; TAG_LEN],
     ) -> io::Result<()> {
-        self.key.open(&nonce.into(), ciphertext, tag)
+        match self {
+            Self::Rust(key) => key.open(&nonce.into(), ciphertext, tag),
+            Self::Native(context) => context
+                .open_in_place_mut(&nonce, ciphertext, &tag, b"")
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Mieru authentication failed")
+                }),
+        }
     }
 }
 
@@ -198,6 +231,129 @@ mod tests {
         );
         let debug = format!("{:?}", derive_key("vole", "fixture-password", 60));
         assert_eq!(debug, "MieruKey(..)");
+    }
+
+    #[test]
+    fn udp_native_matches_reference_wire_and_rejects_bad_tags() {
+        use super::super::wire::{
+            DataKind, DataMetadata, METADATA_LEN, Metadata, PACKET_HEADER_LEN, PacketDecoder,
+            PacketEncoder, Padding, SessionKind, SessionMetadata,
+        };
+        use bytes::Bytes;
+
+        const TIME: u64 = 1_700_000_000;
+        let material = derive_packet_key("vole", "fixture-password", TIME);
+        let reference = derive_key("vole", "fixture-password", TIME);
+        for low_entropy in [false, true] {
+            let mut encoder = PacketEncoder::new(&material, low_entropy).unwrap();
+            let mut decoder = PacketDecoder::new(&material, low_entropy).unwrap();
+            for nonce in [[0; NONCE_LEN], [0xff; NONCE_LEN]] {
+                for payload in [b"".as_slice(), b"native/reference UDP body".as_slice()] {
+                    let metadata = if payload.is_empty() {
+                        Metadata::Session(SessionMetadata {
+                            kind: SessionKind::OpenResponse,
+                            session_id: 7,
+                            sequence: 0,
+                            status: 0,
+                        })
+                    } else {
+                        Metadata::Data(DataMetadata {
+                            kind: DataKind::ServerData,
+                            session_id: 7,
+                            sequence: 1,
+                            unack_sequence: 2,
+                            window: 16,
+                            fragment: 0,
+                        })
+                    };
+                    let mut native_wire = Vec::new();
+                    encoder
+                        .encode_frame(
+                            metadata,
+                            payload,
+                            Padding::default(),
+                            nonce,
+                            TIME,
+                            &mut native_wire,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        native_wire.len(),
+                        PACKET_HEADER_LEN
+                            + payload.len()
+                            + if payload.is_empty() { 0 } else { TAG_LEN }
+                    );
+                    let mut plain_header: [u8; METADATA_LEN] = native_wire
+                        [NONCE_LEN..NONCE_LEN + METADATA_LEN]
+                        .try_into()
+                        .unwrap();
+                    reference
+                        .open(
+                            &nonce.into(),
+                            &mut plain_header,
+                            native_wire[NONCE_LEN + METADATA_LEN..PACKET_HEADER_LEN]
+                                .try_into()
+                                .unwrap(),
+                        )
+                        .unwrap();
+                    let header_tag = reference.seal(&nonce.into(), &mut plain_header).unwrap();
+                    let mut reference_wire = nonce.to_vec();
+                    reference_wire.extend_from_slice(&plain_header);
+                    reference_wire.extend_from_slice(&header_tag);
+                    if !payload.is_empty() {
+                        let mut body = payload.to_vec();
+                        let body_tag = reference.seal(&nonce.into(), &mut body).unwrap();
+                        reference_wire.extend_from_slice(&body);
+                        reference_wire.extend_from_slice(&body_tag);
+                    }
+                    assert_eq!(native_wire, reference_wire);
+                    let received = decoder
+                        .decode_frame(Bytes::from(reference_wire.clone()), TIME)
+                        .unwrap();
+                    assert_eq!(received.metadata, metadata);
+                    assert_eq!(received.payload.as_ref(), payload);
+
+                    let mut bad_tag = reference_wire.clone();
+                    bad_tag[PACKET_HEADER_LEN - 1] ^= 1;
+                    assert_eq!(
+                        decoder
+                            .decode_frame(Bytes::from(bad_tag), TIME)
+                            .unwrap_err()
+                            .kind(),
+                        io::ErrorKind::InvalidData
+                    );
+                    let mut bad_nonce = reference_wire.clone();
+                    bad_nonce[0] ^= 1;
+                    assert_eq!(
+                        decoder
+                            .decode_frame(Bytes::from(bad_nonce), TIME)
+                            .unwrap_err()
+                            .kind(),
+                        io::ErrorKind::InvalidData
+                    );
+                    if !payload.is_empty() {
+                        let mut bad_body_tag = reference_wire.clone();
+                        *bad_body_tag.last_mut().unwrap() ^= 1;
+                        assert_eq!(
+                            decoder
+                                .decode_frame(Bytes::from(bad_body_tag), TIME)
+                                .unwrap_err()
+                                .kind(),
+                            io::ErrorKind::InvalidData
+                        );
+                    }
+                    // Packet authentication failure never poisons the fixed-key UDP context.
+                    assert_eq!(
+                        decoder
+                            .decode_frame(Bytes::from(reference_wire), TIME)
+                            .unwrap()
+                            .payload
+                            .as_ref(),
+                        payload
+                    );
+                }
+            }
+        }
     }
 
     #[test]

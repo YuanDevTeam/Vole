@@ -200,6 +200,9 @@ H2 不消费 congestion-controller。
 `type: mieru` 使用 `outbound-mieru`，底层 transport 必填 TCP 或 UDP，
 两者均承载 TCP 和 `udp: true` 的多目标 UDP Associate。用户名、密码各为1–64 UTF-8字节，
 不 trim；XChaCha20-Poly1305 分段认证使用物理连接建立时的时间派生密钥。
+UDP 载体根据已有低熵编码策略选择 AEAD：启用低熵编码时保留 RustCrypto，
+其余 UDP 载体复用既有 boring 的原位 AEAD；收发方向各独占一个选定的认证上下文。
+TCP 载体保留 RustCrypto，均使用原 ring PBKDF2 派生规则，不启用 TLS。
 业务目标通过协议内 SOCKS 请求传递，不进行 SOCKS 认证方法协商。
 
 port 与非空 port-range 互斥；范围完整匹配十进制 `起点-终点`，两端为1–65535且起点不大于终点。

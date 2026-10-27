@@ -541,29 +541,26 @@ pub(super) async fn drive(
         let chunk = pattern
             .plaintext_fragment_limit(MieruTransport::Udp, usize::from(budget.transmit()))?;
         shared.set_maximum_write((chunk * 255).min(32768));
-        let key = Arc::new(crypto::derive_key(
-            &config.username,
-            &config.password,
-            super::tcp::now()?,
-        ));
+        let key = crypto::derive_packet_key(&config.username, &config.password, super::tcp::now()?);
+        let low_entropy = pattern.low_entropy_enabled();
         Ok((
             transport,
             peer,
             budget,
-            PacketEncoder::new(key.clone()),
-            PacketDecoder::new(key),
+            PacketEncoder::new(&key, low_entropy)?,
+            PacketDecoder::new(&key, low_entropy)?,
         ))
     };
     let result = tokio::select! {biased;()=shared.cancel.cancelled()=>Err(closed()),result=timeout_at(context.deadline(),setup)=>result.map_err(|_|io::Error::from(io::ErrorKind::TimedOut)).and_then(|result|result)};
     match result {
-        Ok((mut transport, peer, budget, encoder, decoder)) => {
+        Ok((mut transport, peer, budget, mut encoder, mut decoder)) => {
             if ready.send(Ok(())).is_ok() {
                 let _ = run(
                     &mut *transport,
                     &peer,
                     budget,
-                    &encoder,
-                    &decoder,
+                    &mut encoder,
+                    &mut decoder,
                     &config.username,
                     pattern,
                     shared,
@@ -583,7 +580,7 @@ pub(super) async fn drive(
 async fn send(
     transport: &mut dyn DatagramTransport,
     peer: &Destination,
-    encoder: &PacketEncoder,
+    encoder: &mut PacketEncoder,
     username: &str,
     shared: &Shared,
     pattern: &mut PacketPattern<'_>,
@@ -619,7 +616,7 @@ async fn send(
 async fn output(
     transport: &mut dyn DatagramTransport,
     peer: &Destination,
-    encoder: &PacketEncoder,
+    encoder: &mut PacketEncoder,
     username: &str,
     shared: &Shared,
     pattern: &mut PacketPattern<'_>,
@@ -799,8 +796,8 @@ async fn input_packet(
     transport: &mut dyn DatagramTransport,
     peer: &Destination,
     budget: DatagramBudget,
-    encoder: &PacketEncoder,
-    decoder: &PacketDecoder,
+    encoder: &mut PacketEncoder,
+    decoder: &mut PacketDecoder,
     username: &str,
     shared: &Shared,
     pattern: &mut PacketPattern<'_>,
@@ -896,8 +893,8 @@ async fn run(
     transport: &mut dyn DatagramTransport,
     peer: &Destination,
     budget: DatagramBudget,
-    encoder: &PacketEncoder,
-    decoder: &PacketDecoder,
+    encoder: &mut PacketEncoder,
+    decoder: &mut PacketDecoder,
     username: &str,
     pattern: &EffectivePattern,
     shared: &Shared,
@@ -1267,7 +1264,7 @@ mod tests {
     }
     async fn emit(
         send: &mpsc::Sender<Datagram>,
-        encoder: &PacketEncoder,
+        encoder: &mut PacketEncoder,
         peer: &Destination,
         metadata: Metadata,
         payload: &[u8],
@@ -1317,7 +1314,7 @@ mod tests {
     async fn emit_server(
         peer: &Peer,
         send: &mpsc::Sender<Datagram>,
-        encoder: &PacketEncoder,
+        encoder: &mut PacketEncoder,
         remote: &Destination,
         metadata: Metadata,
         payload: &[u8],
@@ -1334,7 +1331,7 @@ mod tests {
     async fn emit_reliable(
         peer: &Peer,
         send: &mpsc::Sender<Datagram>,
-        encoder: &PacketEncoder,
+        encoder: &mut PacketEncoder,
         state: &mut ServerSession,
         metadata: Metadata,
         payload: &[u8],
@@ -1365,14 +1362,10 @@ mod tests {
         mut receive: mpsc::Receiver<Datagram>,
         send: mpsc::Sender<Datagram>,
     ) -> io::Result<()> {
-        let key = Arc::new(crypto::derive_key(
-            "vole",
-            "fixture-password",
-            super::super::tcp::now()?,
-        ));
-        let decoder = PacketDecoder::new(key.clone());
-        let header_cipher = crypto::PacketCipher::new(key.clone());
-        let encoder = PacketEncoder::new(key);
+        let key = crypto::derive_packet_key("vole", "fixture-password", super::super::tcp::now()?);
+        let mut decoder = PacketDecoder::new(&key, false)?;
+        let mut header_cipher = crypto::PacketCipher::new(&key, false)?;
+        let mut encoder = PacketEncoder::new(&key, false)?;
         let mut sessions = BTreeMap::<u32, ServerSession>::new();
         let mut dropped = false;
         loop {
@@ -1399,12 +1392,12 @@ mod tests {
                             if let Metadata::Data(ref mut metadata) = segment.metadata {
                                 metadata.unack_sequence = state.client_next;
                             }
-                            emit_server(peer, &send, &encoder, &state.peer, segment.metadata, &segment.payload, false).await?;
+                            emit_server(peer, &send, &mut encoder, &state.peer, segment.metadata, &segment.payload, false).await?;
                             segment.sent = Instant::now();
                             segment.transmissions += 1;
                         }
                         if state.ack_due.is_some_and(|due| now >= due) {
-                            emit_server(peer, &send, &encoder, &state.peer, Metadata::Data(DataMetadata {
+                            emit_server(peer, &send, &mut encoder, &state.peer, Metadata::Data(DataMetadata {
                                 kind: DataKind::ServerAck,
                                 session_id: id,
                                 sequence: state.next.saturating_sub(1),
@@ -1464,7 +1457,7 @@ mod tests {
                     emit_reliable(
                         peer,
                         &send,
-                        &encoder,
+                        &mut encoder,
                         sessions.get_mut(&id).unwrap(),
                         Metadata::Session(SessionMetadata {
                             kind: SessionKind::OpenResponse,
@@ -1488,7 +1481,7 @@ mod tests {
                 if m.kind == SessionKind::CloseRequest {
                     emit(
                         &send,
-                        &encoder,
+                        &mut encoder,
                         &packet.remote,
                         Metadata::Session(SessionMetadata {
                             kind: SessionKind::CloseResponse,
@@ -1557,14 +1550,14 @@ mod tests {
                         state.next += 1;
                         // A future small frame must not steal all credit from the
                         // preceding frame, which is larger than the app queue.
-                        emit_reliable(peer, &send, &encoder, state, future, &[0x92; 4], false)
+                        emit_reliable(peer, &send, &mut encoder, state, future, &[0x92; 4], false)
                             .await?;
                     }
                 }
                 emit_reliable(
                     peer,
                     &send,
-                    &encoder,
+                    &mut encoder,
                     state,
                     metadata,
                     &reply,
@@ -1574,7 +1567,7 @@ mod tests {
                 if peer.close_after_response {
                     emit(
                         &send,
-                        &encoder,
+                        &mut encoder,
                         &packet.remote,
                         Metadata::Session(SessionMetadata {
                             kind: SessionKind::CloseRequest,
@@ -1606,7 +1599,7 @@ mod tests {
                     frames.push((meta, part));
                 }
                 for (meta, part) in frames.into_iter().rev() {
-                    emit_reliable(peer, &send, &encoder, state, meta, part, true).await?;
+                    emit_reliable(peer, &send, &mut encoder, state, meta, part, true).await?;
                 }
             }
         }

@@ -36,7 +36,7 @@ mod balanced_driver_tests {
         invalid_first: bool,
     }
     impl Packets {
-        fn inject(&self, metadata: Metadata, payload: &[u8]) -> Result<(), DispatchError> {
+        fn inject(&mut self, metadata: Metadata, payload: &[u8]) -> Result<(), DispatchError> {
             let mut encoded = Vec::new();
             self.encoder
                 .encode_frame(
@@ -217,13 +217,13 @@ mod balanced_driver_tests {
                     });
                     writes.push(result);
                 }
-                let key = Arc::new(crypto::derive_key(
+                let key = crypto::derive_packet_key(
                     "vole",
                     "fixture-password",
                     super::super::tcp::now().unwrap(),
-                ));
-                let encoder = PacketEncoder::new(key.clone());
-                let decoder = PacketDecoder::new(key.clone());
+                );
+                let mut encoder = PacketEncoder::new(&key, false).unwrap();
+                let mut decoder = PacketDecoder::new(&key, false).unwrap();
                 let pattern = EffectivePattern::compile(
                     None,
                     super::super::pattern::HostProfile::capture(),
@@ -236,8 +236,8 @@ mod balanced_driver_tests {
                     inject: incoming,
                     commands: commands.clone(),
                     control: control.clone(),
-                    encoder: PacketEncoder::new(key.clone()),
-                    decoder: PacketDecoder::new(key),
+                    encoder: PacketEncoder::new(&key, false).unwrap(),
+                    decoder: PacketDecoder::new(&key, false).unwrap(),
                     peer: peer.clone(),
                     invalid_first,
                 };
@@ -257,8 +257,8 @@ mod balanced_driver_tests {
                         &mut transport,
                         &peer,
                         DatagramBudget::new(MTU, MTU),
-                        &encoder,
-                        &decoder,
+                        &mut encoder,
+                        &mut decoder,
                         "vole",
                         &pattern,
                         &shared,
