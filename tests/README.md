@@ -41,6 +41,9 @@ VLESS 的同类边界使用 `--test vless_transports grpc_committed_vless_reques
 客户端凭据与输入（纯内存）：`config::tests::client_uuid_`、
 `config::vmess::cipher_compatibility_tests::`、`config::hysteria2::p08_tests::hopping_`。
 实际映射凭据、端口跳跃和各协议数据面由真实 TUN 另验收。
+UDP 配置归一化（纯内存）：`config::mihomo_udp_tests::`，覆盖 VLESS `none` 使用
+XUDP 并保留 Vision、既有编码，以及 HY2/TUIC 的固有 UDP 能力和 SOCKS5 显式开启控制。
+仅经 `Config::parse_yaml` 检查公开配置与归一化结果，不初始化运行时，不代替真实 TUN 选路或协议互通。
 WS 查询和头预算：`config::vmess::websocket_query_tests::` 与内存 duplex 的
 `--test stream_foundations websocket_early_data_and_remaining_frames_keep_the_original_byte_order`；
 XHTTP 输入和自定义上行方法：`--test xhttp_config`、

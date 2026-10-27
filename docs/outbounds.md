@@ -51,12 +51,14 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
   等待对端 H2 SETTINGS、提交并 flush 完整认证请求，此后允许 client-first 业务等待响应，
   不再沿用该期限；未完成 H2 握手或请求提交时仍受原期限限制。
 - HTTP、SOCKS5、TUN、DNS 选路及 node-only `measureDelay` 使用同一连接器。
-  普通协议节点的业务 UDP 默认为 false；收发预算分别逐层扣封装开销，超限不截断交付。
+  除 Hysteria2/TUIC 的业务 UDP 始终可用外，普通协议节点的业务 UDP 默认为 false；
+  组 `disable-udp` 仍可禁用业务 UDP。收发预算分别逐层扣封装开销，超限不截断交付。
+  Hysteria2/TUIC 的固有能力声明不替代对端、上游和实际数据报预算的检查。
 - UDP 关联复用由共享路由层管理。DIRECT、Mieru、TrustTunnel、WireGuard 内层 UDP、
   MASQUE/IP 内层 UDP 和 VMess packetaddr 均提供逐包目标与实际回包来源，可复用多目标关联。
   开启逐目标连接追踪时，仅同一来源、同一具体出站实例和同一资源代际的未改写 IP 目标共享；
   逐目标路由、统计、关闭、关联退役和旧回复隔离见[资源策略](runtime-resource-policy.md#udp)。
-  域名、fake-IP 和需要地址还原的目标保持独立。VLESS/VMess raw 的首目标约束不变；
+  域名、fake-IP 和需要地址还原的目标保持独立。VMess raw 的首目标约束不变；
   Gecko 等固定对端的底层适配也不因此获得多目标能力，外层业务关联按自身能力处理。
   每层明确声明共享能力，透明包装传递底层声明，不根据外层协议或字段推断其内部载体可共享。
 - 所有普通节点都可启用公共 `smux` 包装，使用节点自己的正常 TCP 传输与独立 mux 池，
@@ -450,7 +452,8 @@ gRPC 池与 legacy H2 driver 由节点拥有并同步退出，无全局会话额
 port 为 1–65535，仅提供 ports 时可省略；显式非法 port 仍拒绝。password 默认空、
 保留原值，须为最长 8192 字节的合法 HTTP 头值。SNI 默认 server；ALPN 省略/空为 h3。
 支持共享证书 pin/skip、独立 `name-cert-verify` 和成对内联 PEM 或文件路径 mTLS；
-验证名不改变 SNI。udp 只控制业务 UDP，不关闭 QUIC 载体。
+验证名不改变 SNI。业务 UDP 始终可用；`udp` 可省略或填 true/false，均不禁用它，
+组 `disable-udp` 仍生效。外层 QUIC 始终需要数据报路径。
 
 - up/down 独立非负整数或十进制整数字符串，裸值 Mbit/s；单位 [KMGT]?[bB]ps 使用
   十进制倍率，bit 向下取整为 byte/s。省略/归一零为自动；拒绝小数、符号、溢出。
@@ -548,9 +551,10 @@ Authenticate 与 Connect 没有成功 ACK；本地 open 成功不是密码通过
 必须由最终拒绝和原站零业务验证。Connect 为双向 QUIC 流，不引入 HTTP/3 请求。
 流关闭结束该逻辑双向通道，与 Mihomo 对齐，不影响兄弟流。
 
-业务 udp 默认 false，但外层 QUIC 始终需要有效双向至少 1200 字节的数据报路径。
+业务 UDP 始终可用；`udp` 可省略或填 true/false，均不禁用它，组 `disable-udp` 仍生效。
+外层 QUIC 始终需要有效双向至少 1200 字节的数据报路径。
 未开放 DATAGRAM、预算不足、protect 失败或只支持 TCP 的上游均失败，不回退 TCP
-或 DIRECT。`udp` 业务路由开关不替代上游实际数据报能力和预算检查。
+或 DIRECT。业务 UDP 能力声明不替代上游实际数据报能力和预算检查。
 SS UoT、AnyTLS 与支持 UDP ASSOCIATE 的 SOCKS5 可作为上游；组快照绑定物理会话。
 
 `udp-relay-mode` 为 native（默认）或 quic。native 使用 DATAGRAM，按实际容量拆为

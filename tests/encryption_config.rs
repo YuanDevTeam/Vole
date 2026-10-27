@@ -56,9 +56,18 @@ fn vision_encryption_is_independent_of_outer_tls_but_keeps_transport_and_udp_lim
                 parse(node.clone()).is_ok(),
                 "Encryption must supply the Vision splice boundary"
             );
+            let mut alias = node.clone();
+            alias["packet-encoding"] = json!("none");
+            let config = parse(alias).expect("none must keep the Vision XUDP encoding");
+            let ProxyProtocol::Vless(vless) = &config.proxies[0].protocol else {
+                unreachable!()
+            };
+            assert_eq!(
+                vless.packet_encoding,
+                vole::config::VlessPacketEncoding::Xudp
+            );
             for (field, value) in [
                 ("network", json!("ws")),
-                ("packet-encoding", json!("none")),
                 ("packet-encoding", json!("packetaddr")),
                 ("smux", json!({"enabled":true})),
             ] {

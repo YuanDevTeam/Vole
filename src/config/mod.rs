@@ -118,6 +118,9 @@ pub use vmess::{StreamTransport, VmessCipher, VmessOutboundConfig, VmessPacketEn
 ))]
 mod tls_policy_tests;
 
+#[cfg(test)]
+mod mihomo_udp_tests;
+
 #[cfg(feature = "invoke")]
 mod measure;
 
@@ -890,6 +893,7 @@ pub enum VlessPacketEncoding {
     #[default]
     #[serde(rename = "xudp")]
     Xudp,
+    // Public VLESS YAML normalizes this input to XUDP; kept for the internal codec.
     #[serde(rename = "none")]
     Raw,
     #[serde(rename = "packetaddr", alias = "packet")]

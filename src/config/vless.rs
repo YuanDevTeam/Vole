@@ -157,6 +157,11 @@ impl RawVless {
         validate_host(&self.server, "VLESS server")?;
         validate_port(self.port, "VLESS")?;
         let id = parse_client_uuid(&self.uuid);
+        // Mihomo treats `none` as XUDP, including before Vision validation.
+        let packet_encoding = match self.packet_encoding {
+            VlessPacketEncoding::Raw => VlessPacketEncoding::Xudp,
+            encoding => encoding,
+        };
         let encryption = if matches!(self.encryption.as_str(), "" | "none") {
             VlessEncryption::None
         } else {
@@ -183,7 +188,7 @@ impl RawVless {
             || (vision
                 && (network != "tcp"
                     || (!self.tls && matches!(&encryption, VlessEncryption::None))
-                    || self.packet_encoding != VlessPacketEncoding::Xudp))
+                    || packet_encoding != VlessPacketEncoding::Xudp))
         {
             return invalid("VLESS Vision requires TCP, TLS or Encryption, and XUDP");
         }
@@ -376,7 +381,7 @@ impl RawVless {
                 flow,
                 security,
                 transport,
-                packet_encoding: self.packet_encoding,
+                packet_encoding,
                 stream_options,
             }),
         ))

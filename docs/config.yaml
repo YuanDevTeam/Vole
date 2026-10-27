@@ -234,14 +234,14 @@ sniffer:
 # - encryption 省略/空/none，或 mlkem768x25519plus.{native,xorpub,random}.{1rtt,0rtt}.<key>…；
 #   key/padding 链、上限和恢复规则见 vless.md；该层独立于外层 TLS/传输。
 #   flow 省略/null/空串/xtls-rprx-vision；Vision 仅 TCP + TLS1.3/REALITY 或 Encryption，
-#   packet-encoding 必须 xudp（即使 udp=false）；
+#   packet-encoding 省略、xudp 或 none 均使用 XUDP；packetaddr 不可与 Vision 组合（即使 udp=false）；
 # - servername 可省略（WS Host 去端口后优先于 server）；TCP alpn 默认空，
 #   WS 默认 [http/1.1]，gRPC/H2 默认 [h2]；XHTTP [http/1.1] 选择 H1，
 #   空或 H1/H2 列表选择 H2，仅 [h3] 选择 H3。H3 必须标准 TLS1.3 与受控 UDP，
 #   不回退 H2。明文 XHTTP 的 alpn 仅选择版本，其余 TLS 专属字段仍拒绝。
 #   详细语义见 docs/vless.md 和 docs/xhttp.md。
-# - packet-encoding 默认 xudp；none 是显式 raw，packetaddr/packet 为 IP-only
-#   地址帧。raw 固定首包目标；packetaddr 域名通过受控 DNS 解析。
+# - packet-encoding 省略、xudp 或 none 均使用 XUDP；packetaddr/packet 为 IP-only
+#   地址帧；packetaddr 域名通过受控 DNS 解析。
 # - REALITY 不用于 WS/HTTPUpgrade；该组合在配置期拒绝。
 # - TLS 省略 reality-opts；REALITY 必须提供 reality-opts.public-key，可选 short-id；
 #   support-x25519mlkem768 默认 false；true 允许同次握手协商真实混合或经典组。
@@ -429,7 +429,7 @@ proxies:
     # 文件对由既有资源工作器检查并用于新物理连接；失败保旧，边界见 docs/tls-client-fingerprint.md
     congestion-controller: cubic # cubic（默认）/new_reno/bbr
     disable-sni: false # true只关闭SNI，证书名称/pin验证保持
-    udp: true # 缺省 false；只控制业务 UDP，QUIC 首跳始终需要数据报
+    udp: true # 可省略或设 false，均保留业务 UDP；组 disable-udp 仍生效
     udp-relay-mode: native # native（默认）/quic
     # ip: 192.0.2.1 # 仅覆盖物理入口，server/SNI 保留
     # heartbeat-interval: 10000 # 毫秒；<=0 回落 10000，同时控制 keepalive/HEARTBEAT
@@ -445,7 +445,8 @@ proxies:
 
     # dialer-proxy: upstream-select # 所选上游必须实际支持双向至少 1200 字节数据报
 
-  # Hysteria2：固定 QUIC/TLS1.3，外层总是需要 UDP；业务 UDP 默认关闭。
+  # Hysteria2：固定 QUIC/TLS1.3，外层总是需要 UDP；业务 UDP 始终可用。
+  # udp 可省略或填 true/false，均不禁用业务 UDP；组 disable-udp 仍生效。
   # 完整字段/预算及开发验收边界见 outbounds.md#hysteria2。标准 TLS 证书策略与其他协议共用。
   - name: hysteria2-edge
     type: hysteria2

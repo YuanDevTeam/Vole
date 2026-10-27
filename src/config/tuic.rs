@@ -61,8 +61,9 @@ pub(super) struct RawTuic {
     uuid: String,
     #[serde(default)]
     password: String,
-    #[serde(default)]
-    udp: bool,
+    // Accepted for compatibility; Mihomo always advertises UDP for this protocol.
+    #[serde(rename = "udp", default)]
+    _udp: bool,
     #[serde(default, deserialize_with = "super::deserialize_present_option")]
     dialer_proxy: Option<String>,
     #[serde(default, deserialize_with = "super::deserialize_present_option")]
@@ -226,7 +227,7 @@ impl RawTuic {
         Ok((
             self.name,
             self.dialer_proxy,
-            self.udp,
+            true,
             ProxyProtocol::Tuic(config),
         ))
     }

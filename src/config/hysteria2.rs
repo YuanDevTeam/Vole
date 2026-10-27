@@ -63,8 +63,9 @@ pub(super) struct RawHysteria2 {
     port: Option<u16>,
     #[serde(default)]
     password: String,
-    #[serde(default)]
-    udp: bool,
+    // Accepted for compatibility; Mihomo always advertises UDP for this protocol.
+    #[serde(rename = "udp", default)]
+    _udp: bool,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     sni: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
@@ -276,7 +277,7 @@ impl RawHysteria2 {
         Ok((
             self.name,
             self.dialer_proxy,
-            self.udp,
+            true,
             ProxyProtocol::Hysteria2(Box::new(Hysteria2OutboundConfig {
                 address: self.server,
                 port,

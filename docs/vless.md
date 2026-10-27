@@ -17,7 +17,7 @@
 - gRPC authority 使用非空显式 `servername`，否则使用 server:port；`name-cert-verify` 只改变证书验证名称。legacy H2 的 host 省略或为空列表时使用 www.example.com，path 省略或为空时使用 `/`。
 - `network: xhttp` 支持 H1/H2 明文、TLS1.3、REALITY、JLS 或 ShadowTLS v3，H3 仅标准 TLS1.3。请求字段、独立下载腿、池与版本选择见 [XHTTP](xhttp.md)。H3 的物理 UDP 仍由原 Dialer/上游图创建。
 - 公共节点 `smux` 以独立的 h2mux/smux v1/yamux 承载逻辑 TCP/UDP；VLESS 只提供正常 TCP 到约定目标，不拥有第二个 mux 池。它不是 XUDP；only-tcp、调度及关闭边界见 [通用 sing-mux](xhttp.md#通用-sing-mux)。
-- Vision 仅允许 `network: tcp`，要求 TLS 1.3/REALITY 或 Encryption；UDP 仅 XUDP。启用 Encryption 后外层 TLS 可省略，存在时仍保持独立认证。配置阶段拒绝 WS/gRPC/HTTP/H2/XHTTP、raw/packetaddr、sing-mux 与 Vision 的组合，包括未启用业务 UDP 但显式选错编码。ECH 和附加安全封装仍拒绝。
+- Vision 仅允许 `network: tcp`，要求 TLS 1.3/REALITY 或 Encryption；UDP 仅 XUDP，`packet-encoding: none` 同样归一为 XUDP。启用 Encryption 后外层 TLS 可省略，存在时仍保持独立认证。配置阶段拒绝 WS/gRPC/HTTP/H2/XHTTP、packetaddr、sing-mux 与 Vision 的组合，包括未启用业务 UDP 但显式选错编码。ECH 和附加安全封装仍拒绝。
 - Vision 请求不自动降级；对端用户不支持 Vision 时业务失败。Mihomo 服务端允许为 Vision 用户显式配置空 flow，这属于普通 VLESS 模式，不是错误 flow 的拒绝用例。
 
 ## REALITY
@@ -159,23 +159,22 @@ Vision padding、TLS 记录过滤和读写切换状态独立管理。内层非 T
 
 ## UDP
 
-`packet-encoding` 默认 **xudp**，与既有 Vole 行为一致：
+`packet-encoding` 默认 **xudp**，`none` 与 `xudp` 使用相同编码：
 
 | 配置 | 线上语义 | 目标 |
 | --- | --- | --- |
-| 省略 / `xudp` | VLESS CommandMux + 共享 XUDP 帧 | 每包携带 IP / 域名 |
-| `none` | VLESS CommandUDP + 两字节长度 | 固定首包目标，后续换目标失败 |
+| 省略 / `xudp` / `none` | VLESS CommandMux + 共享 XUDP 帧 | 每包携带 IP / 域名 |
 | `packetaddr` / `packet` | CommandUDP 到原生约定地址，长度帧内再带地址 | IP-only，域名经受控 ResolutionContext 解析 |
 
-`none` 是 Vole 的显式 raw 拼写，不是对 Mihomo 同名字段的兼容承诺。原生约定地址不做本地 DNS。UDP 443 不额外过滤。
+packetaddr 的原生约定地址不做本地 DNS。UDP 443 不额外过滤。
 
 VLESS 不发送非零 XUDP GlobalID，不请求服务端跨载体继承 UDP 关联。同一来源可能同时拥有
 不同节点、资源代际、域名隔离或退役后仍服务兄弟目标的通道；这些通道保持独立，不能仅按
 来源生成相同 GlobalID。当前关联失败后关闭，不自动重连或恢复服务端原有 UDP 出口映射。
 
-raw/packetaddr 每关联只拥有一个已建流，首次发送前已固定物理上游选择和建链期限；等待首包不会重新选择组或重启期限。packetaddr 不调用系统 resolver：运行期使用本 Running Session DNS，独立测速使用受控 bootstrap。
+packetaddr 每关联只拥有一个已建流，首次发送前已固定物理上游选择和建链期限；等待首包不会重新选择组或重启期限。packetaddr 不调用系统 resolver：运行期使用本 Running Session DNS，独立测速使用受控 bootstrap。
 
-收发预算独立与调用方预算取交集。raw/XUDP payload 受 u16 上限约束，packetaddr 另扣 IPv4 7 / IPv6 19 字节地址头（未解析域名按较大开销预检）。raw/packetaddr 接收 wire 最多 65,537 字节，逐段读取，合法超接收预算的整包丢弃。对端可能有更小容量，原生夹具预算不能冒充生产协议上限。
+收发预算独立与调用方预算取交集。XUDP payload 受 u16 上限约束，packetaddr 另扣 IPv4 7 / IPv6 19 字节地址头（未解析域名按较大开销预检）。packetaddr 接收 wire 最多 65,537 字节，逐段读取，合法超接收预算的整包丢弃。对端可能有更小容量，原生夹具预算不能冒充生产协议上限。
 
 XUDP 在既有单帧字节预算内读取已就绪字节，消费当前帧后保留后续帧的尾部；不等待凑批，
 也不为每个长度或地址字段分别进入底层 TLS/HTTP 接收。
@@ -187,9 +186,9 @@ packetaddr 在同一适用范围保留 VLESS 请求头与首个 DATA 帧的强�
 packet-up 的 POST 响应；容量不足时仍沿原背压等待。timer／IO 驱动独立推进末帧，
 不依赖下一次收发。启用 VLESS Encryption 或非 XHTTP 路径仍逐帧 flush。
 返回成功表示接纳，不代表远端确认；显式 close／Stop 可以取消尚未确认的 UDP，
-不承诺排空这些帧。来源、固定目标、部分发送取消及原有 TCP FIN／XHTTP 整流关闭合同保持。
+不承诺排空这些帧。来源隔离、目标地址恢复、部分发送取消及原有 TCP FIN／XHTTP 整流关闭合同保持。
 
-raw 部分发送取消立即关闭 IO，不允许接着发送半帧。packetaddr 和 XUDP 在关联中最多保留一个待写帧及偏移；取消发送后，下次收发先完成该帧与必要的 flush，再处理新包，保持共享通道边界。packetaddr 在发布关联前完成固定魔法目的的传输准备，首次报文仍受原建链期限约束，不因取消重置。相同来源、相同具体节点且无需地址恢复的 IP 目标可共享一条 packetaddr wire；每包回包地址用于分发，域名、fake-IP 与嗅探覆盖路径仍保留独立 wire。最后所有者关闭可直接终止未完成帧，不在其中插入 END 帧。接收取消保留帧进度。非法帧或响应头关闭关联，不切换编码、不回退 DIRECT。显式 close 后不能恢复收发。
+packetaddr 和 XUDP 在关联中最多保留一个待写帧及偏移；取消发送后，下次收发先完成该帧与必要的 flush，再处理新包，保持共享通道边界。packetaddr 在发布关联前完成固定魔法目的的传输准备，首次报文仍受原建链期限约束，不因取消重置。相同来源、相同具体节点且无需地址恢复的 IP 目标可共享一条 packetaddr wire；每包回包地址用于分发，域名、fake-IP 与嗅探覆盖路径仍保留独立 wire。最后所有者关闭可直接终止未完成帧，不在其中插入 END 帧。接收取消保留帧进度。非法帧或响应头关闭关联，不切换编码、不回退 DIRECT。显式 close 后不能恢复收发。
 
 ## 关闭和期限
 

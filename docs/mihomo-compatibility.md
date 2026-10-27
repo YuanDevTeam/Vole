@@ -78,6 +78,8 @@ Vole 接受的字段与限制以 [config.yaml](config.yaml) 为准；兼容配�
   TCP 尝试本地设置，不解包代理 hop、共享 H2/gRPC、XHTTP 多腿或 QUIC 的逻辑流，
   `mptcp: true` 同样不设置本地 Brutal。Core 不加载模块或修改系统规则；单会话与
   退役等待保持有界，详见 [sing-mux 契约](xhttp.md#通用-sing-mux)。
+- VLESS `packet-encoding` 省略、`xudp` 或 `none` 均使用 XUDP；`packetaddr` / `packet` 保留逐包 IP 地址编码，Vision 可使用 `none`。
+- Hysteria2/TUIC 的业务 UDP 始终可用；节点 `udp` 可省略或填 true/false，均不禁用它，组 `disable-udp` 仍生效。
 - 节点 UDP 能力按 [出站契约](outbounds.md) 声明；rule 模式跳过不支持 UDP 的目标，继续匹配后续规则。
   global 模式和显式 DNS 出口不执行此跳过。负载均衡组按其声明能力参与规则匹配，实际选中成员仍须支持 UDP。
 - 未启用 mixed-port 或 TUN 时仍可运行 Controller 和资源任务。Controller 接受通配 IP、localhost 和空 host；secret 可选，见 [Controller API](controller-api.md)。

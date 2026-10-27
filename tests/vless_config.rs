@@ -56,7 +56,6 @@ fn vision_requires_tcp_tls13_and_xudp_before_any_io() {
     assert!(tls.tls13_only);
     for fields in [
         json!({"flow":"xtls-rprx-vision"}),
-        json!({"flow":"xtls-rprx-vision","tls":true,"packet-encoding":"none"}),
         json!({"flow":"xtls-rprx-vision","tls":true,"packet-encoding":"packetaddr"}),
         json!({"flow":"xtls-rprx-vision","tls":true,"network":"ws"}),
         json!({"flow":"xtls-rprx-vision","tls":true,"network":"grpc","grpc-opts":{"grpc-service-name":"test"}}),
@@ -68,11 +67,11 @@ fn vision_requires_tcp_tls13_and_xudp_before_any_io() {
 }
 
 #[test]
-fn default_tcp_and_three_udp_encodings_are_accepted_without_io() {
+fn default_tcp_and_supported_udp_encodings_are_accepted_without_io() {
     #[cfg(feature = "interop-test")]
     let _case = vole::resources::case_events::Case::new(
         "VLESS-UNIT",
-        "default_tcp_and_three_udp_encodings_are_accepted_without_io",
+        "default_tcp_and_supported_udp_encodings_are_accepted_without_io",
     );
     let config = Config::parse_yaml(&document(json!({}))).expect("default plaintext TCP");
     assert!(!config.proxies[0].udp);
