@@ -210,10 +210,13 @@ TCP 载体保留 RustCrypto，均使用原 ring PBKDF2 派生规则，不启用 
 port 与非空 port-range 互斥；范围完整匹配十进制 `起点-终点`，两端为1–65535且起点不大于终点。
 每次新物理连接随机选择范围内端口，通过共享 Dialer 建链，复用连接保留原上游选择。
 MULTIPLEXING_DEFAULT/LOW 对应因子1，MIDDLE/HIGH为2/3；按可复用连接数及因子随机选择
-复用或新建，OFF始终新建。TCP载体的 DEFAULT/LOW 将TCP CONNECT与UDP Associate分池：
-TCP CONNECT仅复用没有活动会话和建流预留的空闲连接，并发TCP会话使用独立载体，
-避免慢读会话阻塞兄弟流；UDP Associate保留活动连接的概率复用，不与TCP CONNECT共用载体。
-接收预算不扩大，但并发TCP仍会增加物理连接和驱动数量。MIDDLE/HIGH及UDP载体仍允许并发复用，
+复用或新建，OFF始终新建。DEFAULT/LOW 将TCP CONNECT与UDP Associate分池。
+TCP载体的TCP CONNECT仅复用没有活动会话和建流预留的空闲连接，并发TCP会话使用独立载体，
+避免慢读会话阻塞兄弟流；UDP Associate保留活动连接的概率复用。
+UDP载体的两类业务均保留各自池内的活动连接概率复用，分别持有原发送字节预算与命令队列。
+LOW的UDP载体在原复用桶内优先选择活动会话与建流预留合计较少的连接，同负载按原随机起点选择；
+新建桶概率不变。该合计是建流时的非原子调度估计，不作为容量准入或会话上限。
+接收预算不扩大，但分池和并发TCP仍可能增加物理连接和驱动数量。MIDDLE/HIGH保持两类业务共池，
 共享TCP载体仍可能发生慢读队头阻塞。因子不是业务流上限。空闲和累计传输量使连接停止接收新流，
 已有流继续工作；退休连接在空闲期限后回收。
 

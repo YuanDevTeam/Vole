@@ -204,6 +204,10 @@ SS2022 的严格官方 TCP codec 回归可单独选择 `official_tcp_codecs_all_
 Mieru回归保留TCP/UDP分池、慢读背压、单槽交接、终态传播、接收分配复用和未读响应下的Stop。
 `outbound::mieru::tcp::udp_admission_memory_tests::` 使用原命令通道、完成回执和字节许可，
 验证顺序 UDP 准入、首次发送屏障、空写、部分记录取消和 NoWait 收尾；TCP 写入保留原等待边界。
+`outbound::mieru::tcp::udp_pool_memory_tests::` 使用真实池预留、RawStream、原有界命令通道与字节许可，
+覆盖繁忙TCP载体与UDP业务隔离、UDP同业务活动复用、许可未退休时背压及Stop释放；不启动物理驱动。
+同模块的 `least_load_` 检查真实State与Reservation对两载体复用选择的影响，保留随机tie起点、
+原新建桶及非LOW/非UDP载体行为；不测量网络负载或RSS。
 新增多目标真实 codec 回归使用 `outbound::mieru::packet_routing_tests::`、
 `outbound::trusttunnel::packet::tests::`、`outbound::vmess::header::datagram_memory_tests::`、
 `wireguard_memory_shared_udp_targets_cancel_and_close_independently` 与

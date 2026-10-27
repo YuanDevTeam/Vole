@@ -1,5 +1,5 @@
 //! Carrier ownership, idle reuse and serialized AEAD framing.
-//! Framing follows Mieru; LOW TCP pooling isolates concurrent slow readers.
+//! LOW pools separate business types; TCP pooling isolates concurrent slow readers.
 use super::{
     crypto,
     pattern::{EffectivePattern, HostProfile, NonceState},
@@ -46,6 +46,9 @@ mod receive_memory_tests;
 #[cfg(test)]
 #[path = "udp_admission_memory_tests.rs"]
 mod udp_admission_memory_tests;
+#[cfg(test)]
+#[path = "udp_pool_memory_tests.rs"]
+mod udp_pool_memory_tests;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Business {
     TcpConnect,
@@ -84,7 +87,7 @@ pub(super) struct Shared {
     pub(super) volume: u64,
     created: Instant,
     udp: bool,
-    // Only LOW TCP separates business types; other modes keep a shared pool.
+    // LOW separates business types on either carrier; other modes share a pool.
     business: Option<Business>,
     maximum_write: AtomicUsize,
 }
@@ -343,7 +346,8 @@ impl Client {
         let pool = self.pool(business);
         // Isolate slow TCP readers without dedicating a carrier to every UDP target.
         // Reservations cover the gap before open publishes its session.
-        let idle_only = pool == Some(Business::TcpConnect);
+        let idle_only = self.factory.config.transport == MieruTransport::Tcp
+            && pool == Some(Business::TcpConnect);
         let registry = self.registry.lock().unwrap();
         let available: Vec<_> = registry
             .carriers
@@ -366,7 +370,27 @@ impl Client {
             .ok_or_else(closed)?;
         let choice = choose(weight);
         Ok(if choice < weight {
-            let carrier = available[choice / self.factor].clone();
+            let start = choice / self.factor;
+            let mut selected = start;
+            if self.factor == 1 && self.factory.config.transport == MieruTransport::Udp {
+                // A setup-time estimate only; release the session lock before
+                // reading pending reservations, without a second ownership ledger.
+                let load = |carrier: &Arc<Carrier>| {
+                    let active = carrier.shared.count();
+                    let pending = carrier.shared.schedule.lock().unwrap().pending;
+                    active.saturating_add(pending)
+                };
+                let mut selected_load = load(&available[start]);
+                for offset in 1..available.len() {
+                    let index = (start + offset) % available.len();
+                    let candidate_load = load(&available[index]);
+                    if candidate_load < selected_load {
+                        selected = index;
+                        selected_load = candidate_load;
+                    }
+                }
+            }
+            let carrier = available[selected].clone();
             if carrier.shared.reserve(idle_only) {
                 Some(Reservation(carrier))
             } else {
@@ -377,8 +401,7 @@ impl Client {
         })
     }
     fn pool(&self, business: Business) -> Option<Business> {
-        (self.factor == 1 && self.factory.config.transport == MieruTransport::Tcp)
-            .then_some(business)
+        (self.factor == 1).then_some(business)
     }
     pub async fn open(
         &self,
@@ -938,12 +961,20 @@ mod tests {
         let outcomes: io::Result<Vec<(String, bool, bool)>> = probe
             .scope(async {
                 let mut outcomes = Vec::new();
-                for (label, transport, multiplexing, business, active_reusable) in [
+                for (
+                    label,
+                    transport,
+                    multiplexing,
+                    business,
+                    active_reusable,
+                    other_business_reusable,
+                ) in [
                     (
                         "tcp-low",
                         MieruTransport::Tcp,
                         MieruMultiplexing::Low,
                         Business::TcpConnect,
+                        false,
                         false,
                     ),
                     (
@@ -952,12 +983,14 @@ mod tests {
                         MieruMultiplexing::Low,
                         Business::UdpAssociate,
                         true,
+                        false,
                     ),
                     (
                         "middle",
                         MieruTransport::Tcp,
                         MieruMultiplexing::Middle,
                         Business::TcpConnect,
+                        true,
                         true,
                     ),
                     (
@@ -966,6 +999,7 @@ mod tests {
                         MieruMultiplexing::High,
                         Business::TcpConnect,
                         true,
+                        true,
                     ),
                     (
                         "udp-carrier-low",
@@ -973,12 +1007,46 @@ mod tests {
                         MieruMultiplexing::Low,
                         Business::TcpConnect,
                         true,
+                        false,
+                    ),
+                    (
+                        "udp-carrier-low-associate",
+                        MieruTransport::Udp,
+                        MieruMultiplexing::Low,
+                        Business::UdpAssociate,
+                        true,
+                        false,
+                    ),
+                    (
+                        "udp-carrier-middle",
+                        MieruTransport::Udp,
+                        MieruMultiplexing::Middle,
+                        Business::TcpConnect,
+                        true,
+                        true,
+                    ),
+                    (
+                        "udp-carrier-high",
+                        MieruTransport::Udp,
+                        MieruMultiplexing::High,
+                        Business::TcpConnect,
+                        true,
+                        true,
+                    ),
+                    (
+                        "udp-carrier-off",
+                        MieruTransport::Udp,
+                        MieruMultiplexing::Off,
+                        Business::TcpConnect,
+                        false,
+                        false,
                     ),
                     (
                         "off",
                         MieruTransport::Tcp,
                         MieruMultiplexing::Off,
                         Business::TcpConnect,
+                        false,
                         false,
                     ),
                 ] {
@@ -1041,9 +1109,7 @@ mod tests {
                         observed.push((
                             format!("{label} other business"),
                             other.is_some(),
-                            multiplexing != MieruMultiplexing::Off
-                                && !(transport == MieruTransport::Tcp
-                                    && multiplexing == MieruMultiplexing::Low),
+                            other_business_reusable,
                         ));
                         drop(other);
                         let idle_again = client.reserve_reusable(business, |_| 0)?;
