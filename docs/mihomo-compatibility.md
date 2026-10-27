@@ -4,7 +4,8 @@
 
 Vole Core 的性能优化综合评估**吞吐、CPU、内存和丢包率的实测收益与代价**，所有指标都允许渐进式改进；优化采纳与最终验收分别遵循[验收边界](acceptance.md#性能采纳标准)。与 Mihomo 的兼容要求是：在 Vole 支持的协议和模式范围内，与 **Mihomo listener 和官方协议 server 端互通**，不寻求配置字段行为完全一致。
 
-TUIC v5 的服务端互通目标固定为 Mihomo，不以其他 TUIC 服务端的结果替代该范围验收。
+TUIC v5 的 native／quic 服务端互通目标为官方 [Itsusinn/tuic](https://github.com/Itsusinn/tuic)。
+官方服务端未提供的 UoT v2 与服务端 mTLS 客户端证书认证使用 Mihomo 验证，分别保留对应对端的验收范围。
 
 实现策略、默认值、窗口、缓冲区、定时器和资源生命周期可按 Vole 的性能目标取舍；差异必须在对应契约中明确说明，并保持协议数据正确性、认证和安全边界。字段名称继续参考 Mihomo，当前接受的配置仍以 Vole 文档为准。
 

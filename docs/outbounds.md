@@ -537,7 +537,8 @@ pacer；这是混淆不是认证，错误密钥由 QUIC 拒绝，短包有界丢
 ## TUIC v5
 
 固定 QUIC/TLS 1.3，复用官方 Quinn、rustls/ring 与共享受控数据报适配器。
-仅 v5，服务端互通目标固定为 Mihomo；必填标准 UUID。password 为原样 UTF-8，省略/空串为空密码，最长 65,535 字节。
+仅 v5，native／quic 服务端互通目标为官方 Itsusinn/tuic，UoT v2 与服务端 mTLS 使用 Mihomo；
+必填标准 UUID。password 为原样 UTF-8，省略/空串为空密码，最长 65,535 字节。
 SNI 缺省 server，ALPN 缺省 h3；显式空列表拒绝，非空有序列表必须实际协商命中。
 `disable-sni: true` 只关闭 ClientHello 的 SNI，仍验证原认证名/显式 name-cert-verify 和 pin，
 不隐式关闭证书验证。
