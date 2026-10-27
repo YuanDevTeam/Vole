@@ -198,10 +198,14 @@ impl State {
         }
     }
 }
+type WriteReady = (usize, Option<oneshot::Receiver<io::Result<()>>>);
+
 pub(super) struct RawStream {
     pub state: Arc<State>,
     carrier: Arc<Carrier>,
-    pending: Option<BoxFuture<'static, io::Result<usize>>>,
+    pending: Option<BoxFuture<'static, io::Result<WriteReady>>>,
+    queued_writes: bool,
+    latest: Option<oneshot::Receiver<io::Result<()>>>,
     chunk: usize,
     ended: bool,
 }
@@ -212,14 +216,35 @@ impl RawStream {
             state,
             carrier,
             pending: None,
+            queued_writes: false,
+            latest: None,
             chunk,
             ended: false,
         }
+    }
+    pub(super) fn with_queued_writes(mut self, queued: bool) -> Self {
+        self.queued_writes = queued;
+        self
+    }
+    fn poll_latest(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(latest) = self.latest.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        let result = ready!(std::future::Future::poll(Pin::new(latest), cx));
+        self.latest = None;
+        Poll::Ready(result.map_err(|_| closed()).and_then(|result| result))
+    }
+    fn accept_write(&mut self, result: io::Result<WriteReady>) -> io::Result<usize> {
+        let (count, latest) = result?;
+        // A later write's final first-send covers older same-SID FIFO writes.
+        self.latest = latest;
+        Ok(count)
     }
     fn end(&mut self) {
         self.ended = true;
         self.state.close();
         self.pending = None;
+        self.latest = None;
     }
 }
 impl Drop for RawStream {
@@ -249,15 +274,23 @@ impl AsyncWrite for RawStream {
         if self.ended || self.state.cancel.is_cancelled() {
             return Poll::Ready(Err(closed()));
         }
+        let latest = self.poll_latest(cx);
+        // Empty writes retain their original non-flushing behaviour.
+        if self.pending.is_none() && bytes.is_empty() {
+            return match latest {
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                _ => Poll::Ready(Ok(0)),
+            };
+        }
+        // Keep one first-send lookahead per source, within the existing budget.
+        ready!(latest)?;
         if self.pending.is_none() {
-            if bytes.is_empty() {
-                return Poll::Ready(Ok(0));
-            }
             let count = bytes.len().min(self.chunk);
             let data = Bytes::copy_from_slice(&bytes[..count]);
             let piggyback = bytes.len() <= 1024;
             let carrier = self.carrier.clone();
             let state = self.state.clone();
+            let queued = self.queued_writes;
             self.pending = Some(Box::pin(async move {
                 let operation = async {
                     let permit = carrier
@@ -278,21 +311,32 @@ impl AsyncWrite for RawStream {
                         })
                         .await
                         .map_err(|_| closed())?;
+                    if queued {
+                        // Ownership and the original byte permit are now in the
+                        // existing bounded command FIFO; keep only its done barrier.
+                        return Ok((count, Some(response)));
+                    }
                     response.await.map_err(|_| closed())??;
-                    Ok(count)
+                    Ok((count, None))
                 };
                 tokio::select! {biased;()=state.cancel.cancelled()=>Err(closed()),result=operation=>result}
             }));
         }
         let result = ready!(self.pending.as_mut().unwrap().as_mut().poll(cx));
         self.pending = None;
-        Poll::Ready(result)
+        Poll::Ready(self.accept_write(result))
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(pending) = self.pending.as_mut() {
-            ready!(pending.as_mut().poll(cx))?;
-            self.pending = None;
+        self.state.write.register(cx.waker());
+        if self.state.cancel.is_cancelled() {
+            return Poll::Ready(Err(closed()));
         }
+        if let Some(pending) = self.pending.as_mut() {
+            let result = ready!(pending.as_mut().poll(cx));
+            self.pending = None;
+            self.accept_write(result)?;
+        }
+        ready!(self.poll_latest(cx))?;
         if self.state.cancel.is_cancelled() {
             return Poll::Ready(Err(closed()));
         }
@@ -328,6 +372,7 @@ pub(super) struct Stream {
     request: Option<Bytes>,
     pending: Option<Handshake>,
     completed_write: Option<io::Result<usize>>,
+    queued_writes: bool,
     wake: Arc<HandshakeWake>,
     state: Arc<State>,
     chunk: usize,
@@ -355,11 +400,13 @@ impl Stream {
     fn ready(raw: RawStream) -> Self {
         let state = raw.state.clone();
         let chunk = raw.chunk;
+        let queued_writes = raw.queued_writes;
         Self {
             raw: Some(raw),
             request: None,
             pending: None,
             completed_write: None,
+            queued_writes,
             wake: Arc::default(),
             state,
             chunk,
@@ -469,7 +516,17 @@ impl AsyncWrite for Stream {
         }
         Pin::new(self.raw.as_mut().unwrap()).poll_flush(cx)
     }
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.queued_writes {
+            if self.raw.is_none() && self.pending.is_none() {
+                return Poll::Ready(Ok(()));
+            }
+            self.wake.write.register(cx.waker());
+            ready!(self.progress())?;
+            ready!(Pin::new(self.raw.as_mut().unwrap()).poll_shutdown(cx))?;
+            self.raw = None;
+            return Poll::Ready(Ok(()));
+        }
         self.state.close();
         self.pending = None;
         self.raw = None;

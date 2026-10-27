@@ -121,7 +121,8 @@ impl OutboundConnector for MieruOutbound {
             context,
             self.client.cancellation(),
             |reader| self.client.spawn(reader),
-        )?;
+        )?
+        .with_queued_sends(self.client.queues_datagrams());
         Ok(crate::dispatch::bound_datagram(
             Box::new(transport),
             request.budget(),

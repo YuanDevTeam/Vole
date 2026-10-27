@@ -43,6 +43,9 @@ const WRITER_COMMANDS: usize = 2;
 #[cfg(test)]
 #[path = "tcp_receive_memory_tests.rs"]
 mod receive_memory_tests;
+#[cfg(test)]
+#[path = "udp_admission_memory_tests.rs"]
+mod udp_admission_memory_tests;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Business {
     TcpConnect,
@@ -315,6 +318,9 @@ impl Client {
             idle,
         })
     }
+    pub(super) fn queues_datagrams(&self) -> bool {
+        self.factory.config.transport == MieruTransport::Udp
+    }
     pub fn cancellation(&self) -> CancellationToken {
         self.cancel.clone()
     }
@@ -428,7 +434,8 @@ impl Client {
                 state
             };
             drop(reservation);
-            Ok(RawStream::new(carrier, state, self.capacity))
+            Ok(RawStream::new(carrier, state, self.capacity)
+                .with_queued_writes(business == Business::UdpAssociate && self.queues_datagrams()))
         };
         tokio::select! {biased;()=self.cancel.cancelled()=>Err(closed()),result=timeout_at(context.deadline(),operation)=>result.map_err(|_|io::ErrorKind::TimedOut)?}
     }

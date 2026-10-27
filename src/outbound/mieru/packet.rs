@@ -37,6 +37,7 @@ pub(super) struct PacketTransport {
     resolution: ResolutionContext,
     budget: DatagramBudget,
     closed: bool,
+    flush_packets: bool,
     _observation: observation::Guard,
 }
 impl PacketTransport {
@@ -74,8 +75,13 @@ impl PacketTransport {
             resolution: context.resolution(),
             budget: request.budget(),
             closed: false,
+            flush_packets: true,
             _observation: observation::track(ResourceKind::Association),
         })
+    }
+    pub(super) fn with_queued_sends(mut self, queued: bool) -> Self {
+        self.flush_packets = !queued;
+        self
     }
     fn poll_response(
         &mut self,
@@ -158,12 +164,13 @@ impl DatagramTransport for PacketTransport {
         packet.extend_from_slice(&(body.len() as u16).to_be_bytes());
         packet.extend_from_slice(&body);
         packet.push(255);
+        let flush_packets = self.flush_packets;
         let mut guard = SendGuard {
             writer: &mut self.writer,
             cancel: self.cancel.clone(),
             committed: false,
         };
-        tokio::select! {biased;()=guard.cancel.cancelled()=>return Err(DispatchError::NotAllowed),result=async {let writer=guard.writer.as_mut().ok_or(io::ErrorKind::BrokenPipe)?;writer.write_all(&packet).await?;writer.flush().await}=>result?};
+        tokio::select! {biased;()=guard.cancel.cancelled()=>return Err(DispatchError::NotAllowed),result=async {let writer=guard.writer.as_mut().ok_or(io::ErrorKind::BrokenPipe)?;writer.write_all(&packet).await?;if flush_packets {writer.flush().await}else{Ok(())}}=>result?};
         guard.committed = true;
         Ok(())
     }
