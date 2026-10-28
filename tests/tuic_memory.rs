@@ -679,7 +679,19 @@ async fn association_id_exhaustion_retires_without_reuse_or_migrating_old_stream
 #[tokio::test]
 async fn quic_partial_control_streams_have_a_credit_bound_and_expire_without_blocking_tcp() {
     let _case = Case::new("TUIC-UNIT", "partial_control_expiry");
-    let (outbound, endpoint) = fixture_mode(1400, true, 8, "cubic", "quic");
+    let (mut config, udp_path, endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
+    let (_, tcp_path, tcp_endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
+    config.stream_window = vole::config::QuicReceiveWindow {
+        initial: 256 * 1024,
+        maximum: 256 * 1024,
+    };
+    config.connection_window = vole::config::QuicReceiveWindow {
+        initial: 1024 * 1024,
+        maximum: 1024 * 1024,
+    };
+    config.disable_mtu_discovery = true;
+    let paths = Arc::new(Paths(Mutex::new(VecDeque::from([udp_path, tcp_path]))));
+    let outbound = TuicOutbound::new_with_path(&config, UpstreamPath::proxy(paths)).unwrap();
     let ep = endpoint.clone();
     let (ready, wait) = tokio::sync::oneshot::channel();
     let peer = tokio::spawn(async move {
@@ -706,11 +718,6 @@ async fn quic_partial_control_streams_have_a_credit_bound_and_expire_without_blo
                 .is_err()
         );
         ready.send(()).unwrap();
-        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
-        let mut request = [0; 8];
-        recv.read_exact(&mut request).await.unwrap();
-        assert_eq!(request[7], b'a');
-        send.write_all(b"a").await.unwrap();
         for stream in &partial {
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(6), stream.stopped())
@@ -733,6 +740,16 @@ async fn quic_partial_control_streams_have_a_credit_bound_and_expire_without_blo
             .await
             .unwrap();
         available.finish().unwrap();
+        connection.closed().await;
+    });
+    let tcp_ep = tcp_endpoint.clone();
+    let tcp_peer = tokio::spawn(async move {
+        let connection = authenticated(&tcp_ep).await;
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+        let mut request = [0; 8];
+        recv.read_exact(&mut request).await.unwrap();
+        assert_eq!(request[7], b'a');
+        send.write_all(b"a").await.unwrap();
         connection.closed().await;
     });
     let probe = ResourceProbe::default();
@@ -781,12 +798,27 @@ async fn quic_partial_control_streams_have_a_credit_bound_and_expire_without_blo
         })
         .await;
     finish(endpoint, peer).await;
+    finish(tcp_endpoint, tcp_peer).await;
 }
 
 #[tokio::test]
 async fn cancelled_uni_credit_wait_does_not_replay_or_close_sibling_tcp() {
     let _case = Case::new("TUIC-UNIT", "udp_credit_cancel");
-    let (outbound, endpoint) = fixture_mode(1400, true, 8, "cubic", "quic");
+    let (mut config, udp_path, endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
+    let (_, tcp_path, tcp_endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
+    // Keep the original fixed windows, MTU policy and two unread uni credits.
+    config.stream_window = vole::config::QuicReceiveWindow {
+        initial: 256 * 1024,
+        maximum: 256 * 1024,
+    };
+    config.connection_window = vole::config::QuicReceiveWindow {
+        initial: 1024 * 1024,
+        maximum: 1024 * 1024,
+    };
+    config.disable_mtu_discovery = true;
+    let paths = Arc::new(Paths(Mutex::new(VecDeque::from([udp_path, tcp_path]))));
+    let outbound =
+        TuicOutbound::new_with_path(&config, UpstreamPath::proxy(paths.clone())).unwrap();
     let ep = endpoint.clone();
     let (ready, wait) = tokio::sync::oneshot::channel();
     let peer = tokio::spawn(async move {
@@ -797,13 +829,18 @@ async fn cancelled_uni_credit_wait_does_not_replay_or_close_sibling_tcp() {
             unread.push(connection.accept_uni().await.unwrap());
         }
         ready.send(()).unwrap();
+        connection.closed().await;
+        drop(unread);
+    });
+    let tcp_ep = tcp_endpoint.clone();
+    let tcp_peer = tokio::spawn(async move {
+        let connection = authenticated(&tcp_ep).await;
         let (mut send, mut recv) = connection.accept_bi().await.unwrap();
         let mut request = [0; 8];
         recv.read_exact(&mut request).await.unwrap();
         assert_eq!(request[7], b'a');
         send.write_all(b"a").await.unwrap();
         connection.closed().await;
-        drop(unread);
     });
     let probe = ResourceProbe::default();
     probe
@@ -845,6 +882,9 @@ async fn cancelled_uni_credit_wait_does_not_replay_or_close_sibling_tcp() {
                     .unwrap(),
                 b'a'
             );
+            // Both business lanes were established; the cancelled third UDP
+            // send must not redirect TCP to the old UDP peer.
+            assert!(paths.0.lock().unwrap().is_empty());
             let before = tokio::time::Instant::now();
             outbound.shutdown().await;
             assert!(before.elapsed() < Duration::from_secs(2));
@@ -854,6 +894,7 @@ async fn cancelled_uni_credit_wait_does_not_replay_or_close_sibling_tcp() {
         })
         .await;
     finish(endpoint, peer).await;
+    finish(tcp_endpoint, tcp_peer).await;
 }
 
 #[cfg(unix)]
@@ -1474,4 +1515,233 @@ async fn official_quinn_receive_budget_is_independent_of_send_frame_limit() {
             .await;
         finish(endpoint, peer).await;
     }
+}
+
+async fn echo_lane_udp(connection: &quinn::Connection, native: bool, payload: &[u8]) {
+    let raw = if native {
+        connection.read_datagram().await.unwrap().to_vec()
+    } else {
+        connection
+            .accept_uni()
+            .await
+            .unwrap()
+            .read_to_end(65535)
+            .await
+            .unwrap()
+    };
+    assert_eq!(&raw[raw.len() - payload.len()..], payload);
+    if native {
+        connection.send_datagram_wait(raw.into()).await.unwrap();
+    } else {
+        let mut send = connection.open_uni().await.unwrap();
+        send.write_all(&raw).await.unwrap();
+        send.finish().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn native_tcp_and_udp_keep_one_physical_session_and_stop() {
+    let _case = Case::new("TUIC-UNIT", "native_business_shared");
+    let (config, path, endpoint) = fixture_parts(1400, true, 8, "cubic", "native");
+    let paths = Arc::new(Paths(Mutex::new(VecDeque::from([path]))));
+    let outbound =
+        TuicOutbound::new_with_path(&config, UpstreamPath::proxy(paths.clone())).unwrap();
+    let ep = endpoint.clone();
+    let peer = tokio::spawn(async move {
+        let connection = authenticated(&ep).await;
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+        let mut header = [0; 7];
+        recv.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header, b"\x05\x01\x00\x01x\x00\x50");
+        assert_eq!(recv.read_u8().await.unwrap(), b'a');
+        send.write_all(b"a").await.unwrap();
+        echo_lane_udp(&connection, true, b"u").await;
+        assert_eq!(recv.read_u8().await.unwrap(), b'b');
+        send.write_all(b"b").await.unwrap();
+        connection.closed().await;
+    });
+    let probe = ResourceProbe::default();
+    probe
+        .scope(async {
+            let mut tcp = outbound
+                .connect_stream(request(), &EstablishContext::default())
+                .await
+                .unwrap()
+                .io;
+            tcp.write_all(b"a").await.unwrap();
+            assert_eq!(tcp.read_u8().await.unwrap(), b'a');
+            let mut udp = outbound
+                .open_datagram(udp_request(), &EstablishContext::default())
+                .await
+                .unwrap();
+            udp.send(Datagram {
+                remote: request().destination,
+                payload: bytes::Bytes::from_static(b"u"),
+                sniffed_domain: None,
+            })
+            .await
+            .unwrap();
+            assert_eq!(udp.receive().await.unwrap().payload, b"u"[..]);
+            assert!(paths.0.lock().unwrap().is_empty());
+            assert_eq!(probe.snapshot().current(ResourceKind::Pool), 1);
+            udp.close().await.unwrap();
+            drop(udp);
+            tcp.write_all(b"b").await.unwrap();
+            assert_eq!(tcp.read_u8().await.unwrap(), b'b');
+            outbound.shutdown().await;
+            assert!(tcp.read_u8().await.is_err());
+            drop(tcp);
+            assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+        })
+        .await;
+    finish(endpoint, peer).await;
+}
+
+#[tokio::test]
+async fn quic_business_lanes_retire_only_udp_while_tcp_is_held_and_stop_all() {
+    let _case = Case::new("TUIC-UNIT", "quic_business_lanes");
+    let (mut config, tcp_path, tcp_endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
+    let (_, udp_path, udp_endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
+    let (_, fresh_path, fresh_endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
+    config.max_open_streams = 2;
+    let paths = Arc::new(Paths(Mutex::new(VecDeque::from([
+        tcp_path, udp_path, fresh_path,
+    ]))));
+    let outbound =
+        TuicOutbound::new_with_path(&config, UpstreamPath::proxy(paths.clone())).unwrap();
+    let ep = tcp_endpoint.clone();
+    let tcp_peer = tokio::spawn(async move {
+        let connection = authenticated(&ep).await;
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+        let mut header = [0; 7];
+        recv.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header, b"\x05\x01\x00\x01x\x00\x50");
+        assert_eq!(recv.read_u8().await.unwrap(), b'a');
+        send.write_all(b"a").await.unwrap();
+        // The second stream must reuse this original TCP lane after UDP retires.
+        let (mut sibling_send, mut sibling_recv) = connection.accept_bi().await.unwrap();
+        sibling_recv.read_exact(&mut header).await.unwrap();
+        assert_eq!(sibling_recv.read_u8().await.unwrap(), b'x');
+        sibling_send.write_all(b"x").await.unwrap();
+        for expected in [b'b', b'c'] {
+            assert_eq!(recv.read_u8().await.unwrap(), expected);
+            send.write_all(&[expected]).await.unwrap();
+        }
+        connection.closed().await;
+    });
+    let ep = udp_endpoint.clone();
+    let udp_peer = tokio::spawn(async move {
+        let connection = authenticated(&ep).await;
+        for payload in [b"p".as_slice(), b"q".as_slice(), b"s".as_slice()] {
+            echo_lane_udp(&connection, false, payload).await;
+        }
+        connection.closed().await;
+    });
+    let ep = fresh_endpoint.clone();
+    let fresh_peer = tokio::spawn(async move {
+        let connection = authenticated(&ep).await;
+        echo_lane_udp(&connection, false, b"r").await;
+        connection.closed().await;
+    });
+    let probe = ResourceProbe::default();
+    probe
+        .scope(async {
+            let mut tcp = outbound
+                .connect_stream(request(), &EstablishContext::default())
+                .await
+                .unwrap()
+                .io;
+            tcp.write_all(b"a").await.unwrap();
+            assert_eq!(tcp.read_u8().await.unwrap(), b'a');
+            assert_eq!(outbound.datagram_buffer_space().await, None);
+            assert!(outbound.congestion_observation().await.is_some());
+            assert!(outbound.path_observation().await.is_some());
+            let mut first = outbound
+                .open_datagram(udp_request(), &EstablishContext::default())
+                .await
+                .unwrap();
+            first
+                .send(Datagram {
+                    remote: request().destination,
+                    payload: bytes::Bytes::from_static(b"p"),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(first.receive().await.unwrap().payload, b"p"[..]);
+            assert!(outbound.datagram_buffer_space().await.is_some());
+            assert_eq!(probe.snapshot().current(ResourceKind::Pool), 2);
+            let mut held = outbound
+                .open_datagram(udp_request(), &EstablishContext::default())
+                .await
+                .unwrap();
+            held.send(Datagram {
+                remote: request().destination,
+                payload: bytes::Bytes::from_static(b"q"),
+                sniffed_domain: None,
+            })
+            .await
+            .unwrap();
+            assert_eq!(held.receive().await.unwrap().payload, b"q"[..]);
+            assert_eq!(paths.0.lock().unwrap().len(), 1);
+            let mut fresh = outbound
+                .open_datagram(udp_request(), &EstablishContext::default())
+                .await
+                .unwrap();
+            fresh
+                .send(Datagram {
+                    remote: request().destination,
+                    payload: bytes::Bytes::from_static(b"r"),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(fresh.receive().await.unwrap().payload, b"r"[..]);
+            assert_eq!(probe.snapshot().current(ResourceKind::Pool), 3);
+            assert!(paths.0.lock().unwrap().is_empty());
+            let mut sibling = outbound
+                .connect_stream(request(), &EstablishContext::default())
+                .await
+                .unwrap()
+                .io;
+            sibling.write_all(b"x").await.unwrap();
+            assert_eq!(sibling.read_u8().await.unwrap(), b'x');
+            drop(sibling);
+            tcp.write_all(b"b").await.unwrap();
+            assert_eq!(tcp.read_u8().await.unwrap(), b'b');
+            first
+                .send(Datagram {
+                    remote: request().destination,
+                    payload: bytes::Bytes::from_static(b"s"),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(first.receive().await.unwrap().payload, b"s"[..]);
+            held.close().await.unwrap();
+            drop(held);
+            assert_eq!(probe.snapshot().current(ResourceKind::Pool), 3);
+            first.close().await.unwrap();
+            drop(first);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while probe.snapshot().current(ResourceKind::Pool) != 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            tcp.write_all(b"c").await.unwrap();
+            assert_eq!(tcp.read_u8().await.unwrap(), b'c');
+            let before = tokio::time::Instant::now();
+            outbound.shutdown().await;
+            assert!(before.elapsed() < Duration::from_secs(2));
+            assert!(fresh.receive().await.is_err());
+            assert!(tcp.read_u8().await.is_err());
+            drop((tcp, fresh));
+            assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+        })
+        .await;
+    finish(tcp_endpoint, tcp_peer).await;
+    finish(udp_endpoint, udp_peer).await;
+    finish(fresh_endpoint, fresh_peer).await;
 }

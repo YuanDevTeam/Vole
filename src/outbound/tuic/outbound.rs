@@ -33,7 +33,8 @@ pub struct TuicOutbound {
     server: Destination,
     upstream: UpstreamPath,
     tls: StandardTlsClient,
-    current: AsyncMutex<Option<Arc<Session>>>,
+    // Stream/shared lane plus a lazily-created quic UDP business lane.
+    current: AsyncMutex<[Option<Arc<Session>>; 2]>,
     cancel: CancellationToken,
     admission: Mutex<()>,
     tasks: TaskTracker,
@@ -86,12 +87,18 @@ impl std::fmt::Debug for TuicOutbound {
 }
 
 impl TuicOutbound {
+    fn datagram_lane(&self) -> usize {
+        usize::from(
+            self.config.udp_mode == crate::config::TuicUdpMode::Quic
+                && !self.config.udp_over_stream,
+        )
+    }
+
     /// Remaining actual Quinn datagram buffer, for bounded-backpressure checks.
     #[cfg(feature = "interop-test")]
     pub async fn datagram_buffer_space(&self) -> Option<usize> {
-        self.current
-            .lock()
-            .await
+        let current = self.current.lock().await;
+        current[self.datagram_lane()]
             .as_ref()
             .map(|s| s.connection.datagram_send_buffer_space())
     }
@@ -100,14 +107,17 @@ impl TuicOutbound {
     #[cfg(feature = "interop-test")]
     pub async fn congestion_observation(&self) -> Option<TuicCongestion> {
         let current = self.current.lock().await;
-        active_congestion(&current.as_ref()?.connection)
+        // Report one actual lane: prefer UDP if present, otherwise stream.
+        let session = current[1].as_ref().or(current[0].as_ref())?;
+        active_congestion(&session.connection)
     }
 
-    /// Actual native path state for memory acceptance; not configured defaults.
+    /// Actual path of UDP if present, otherwise stream; never a lane aggregate.
     #[cfg(feature = "interop-test")]
     pub async fn path_observation(&self) -> Option<quinn::PathStats> {
         let current = self.current.lock().await;
-        Some(current.as_ref()?.connection.stats().path)
+        let session = current[1].as_ref().or(current[0].as_ref())?;
+        Some(session.connection.stats().path)
     }
 
     pub fn new_with_path(config: &TuicOutboundConfig, upstream: UpstreamPath) -> io::Result<Self> {
@@ -152,7 +162,7 @@ impl TuicOutbound {
             )?,
             upstream,
             tls,
-            current: AsyncMutex::new(None),
+            current: AsyncMutex::new([None, None]),
             cancel: CancellationToken::new(),
             admission: Mutex::new(()),
             tasks: TaskTracker::new(),
@@ -163,6 +173,7 @@ impl TuicOutbound {
         &self,
         datagram: DatagramSession,
         context: &EstablishContext,
+        datagram_business: bool,
     ) -> Result<(Arc<Session>, Lease), DispatchError> {
         if tokio::time::Instant::now() >= context.deadline() {
             return Err(DispatchError::TimedOut);
@@ -172,11 +183,17 @@ impl TuicOutbound {
         if self.config.max_open_streams == 0 {
             return Err(DispatchError::NotAllowed);
         }
+        let lane = if datagram_business {
+            self.datagram_lane()
+        } else {
+            0
+        };
         let _waiter = observation::track(ResourceKind::Waiter);
         tokio::select! { biased;
             () = self.cancel.cancelled() => Err(DispatchError::NotAllowed),
             result = context.run("TUIC session", async {
-                let mut current = self.current.lock().await;
+                let mut lanes = self.current.lock().await;
+                let current = &mut lanes[lane];
                 if let Some(session) = current.as_ref().filter(|s| !s.cancel.is_cancelled() && s.connection.close_reason().is_none() && !s.datagrams.exhausted())
                     && let Some(lease) = session.activity.try_acquire(self.config.max_open_streams) { return Ok((session.clone(),lease)); }
                 if let Some(previous)=current.take() { previous.activity.retire(); }
@@ -219,6 +236,7 @@ impl OutboundConnector for TuicOutbound {
             .session(
                 DatagramSession::new(session.inbound, session.source),
                 context,
+                false,
             )
             .await?;
         tokio::select! { biased;
@@ -271,7 +289,7 @@ impl OutboundConnector for TuicOutbound {
             ));
         }
         loop {
-            let (shared, lease) = self.session(request.session.clone(), context).await?;
+            let (shared, lease) = self.session(request.session.clone(), context, true).await?;
             if let Some(transport) = shared.datagrams.open(
                 shared.connection.clone(),
                 shared.cancel.clone(),
@@ -294,7 +312,9 @@ impl OutboundConnector for TuicOutbound {
     async fn shutdown(&self) {
         self.begin_shutdown();
         self.tasks.wait().await;
-        self.current.lock().await.take();
+        for current in self.current.lock().await.iter_mut() {
+            let _ = current.take();
+        }
     }
 }
 impl Drop for TuicOutbound {
