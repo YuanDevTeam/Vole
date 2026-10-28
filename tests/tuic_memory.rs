@@ -570,6 +570,144 @@ fn udp_request() -> DatagramRequest {
 }
 
 #[tokio::test]
+async fn native_source_stripes_hold_64_owners_reuse_source_and_stop_both_paths() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _case = Case::new("TUIC-UNIT", "native_source_stripes");
+    // 65 held business owners fit the old configured threshold and these
+    // peer credits. RED must be actual path count, not blocked stream credit.
+    let (config, first_path, first_ep) = fixture_parts(1400, true, 128, "cubic", "native");
+    let (_, next_path, next_ep) = fixture_parts(1400, true, 128, "cubic", "native");
+    assert!(config.max_open_streams > 65);
+    let paths = Arc::new(Paths(Mutex::new(VecDeque::from([first_path, next_path]))));
+    let outbound =
+        TuicOutbound::new_with_path(&config, UpstreamPath::proxy(paths.clone())).unwrap();
+    let counts = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+    let (done, stop) = tokio::sync::watch::channel(false);
+    let serve = |endpoint: quinn::Endpoint,
+                 count: Arc<AtomicUsize>,
+                 tag: u8,
+                 mut stop: tokio::sync::watch::Receiver<bool>| {
+        tokio::spawn(async move {
+            let connection = tokio::select! {
+                biased;
+                _ = stop.wait_for(|done| *done) => return,
+                connection = authenticated(&endpoint) => connection,
+            };
+            let mut streams = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = connection.closed() => break,
+                    _ = stop.wait_for(|done| *done) => break,
+                    stream = connection.accept_bi() => {
+                        let Ok((mut send, mut recv)) = stream else { break; };
+                        assert!(count.fetch_add(1, Ordering::Relaxed) < 65);
+                        streams.spawn(async move {
+                            let mut header = [0; 7];
+                            if recv.read_exact(&mut header).await.is_err() { return; }
+                            assert_eq!(&header, b"\x05\x01\x00\x01x\x00\x50");
+                            let mut byte = [0; 1];
+                            while let Ok(Some(1)) = recv.read(&mut byte).await {
+                                if send.write_all(&[tag, byte[0]]).await.is_err() { break; }
+                            }
+                        });
+                    }
+                }
+            }
+            while let Some(result) = streams.join_next().await {
+                result.unwrap();
+            }
+        })
+    };
+    let first_peer = serve(first_ep.clone(), counts[0].clone(), 0, stop.clone());
+    let next_peer = serve(next_ep.clone(), counts[1].clone(), 1, stop);
+    let probe = ResourceProbe::default();
+    let evidence = probe
+        .scope(async {
+            let mut held = Vec::new();
+            let mut tags = Vec::new();
+            for index in 0..64_u8 {
+                let mut owner = request();
+                owner.source.set_port(10000 + u16::from(index));
+                let mut stream = outbound
+                    .connect_stream(
+                        owner,
+                        &EstablishContext::with_timeout(Duration::from_secs(2)),
+                    )
+                    .await
+                    .unwrap()
+                    .io;
+                stream.write_all(&[index]).await.unwrap();
+                let mut echo = [0; 2];
+                tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echo))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(echo[1], index);
+                assert!(echo[0] < 2);
+                tags.push(echo[0]);
+                held.push(stream);
+            }
+            let opened_before_reuse = 2 - paths.0.lock().unwrap().len();
+            let mut same_source = request();
+            same_source.source.set_port(10000);
+            let mut reused = outbound
+                .connect_stream(
+                    same_source,
+                    &EstablishContext::with_timeout(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap()
+                .io;
+            reused.write_all(b"r").await.unwrap();
+            let mut echo = [0; 2];
+            tokio::time::timeout(Duration::from_secs(2), reused.read_exact(&mut echo))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(echo, [tags[0], b'r']);
+            held.push(reused);
+            // Held old and new owners keep their actual peer and byte identity.
+            for index in [0, 63] {
+                held[index].write_all(b"z").await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), held[index].read_exact(&mut echo))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(echo, [tags[index], b'z']);
+            }
+            let evidence = (
+                opened_before_reuse,
+                2 - paths.0.lock().unwrap().len(),
+                counts[0].load(Ordering::Relaxed),
+                counts[1].load(Ordering::Relaxed),
+                probe.snapshot().current(ResourceKind::Pool),
+            );
+            outbound.shutdown().await;
+            assert!(held[0].read_u8().await.is_err());
+            assert!(held[64].read_u8().await.is_err());
+            drop(held);
+            assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+            evidence
+        })
+        .await;
+    let _ = done.send(true); // Release the unused second endpoint in old-code RED.
+    finish(first_ep, first_peer).await;
+    finish(next_ep, next_peer).await;
+    // All owners and both endpoint tasks are clean before the intended RED.
+    assert_eq!(
+        evidence.0, 2,
+        "native default kept all distinct sources on one path"
+    );
+    assert_eq!(
+        evidence.1, 2,
+        "same source opened an additional physical path"
+    );
+    assert!(evidence.2 > 0 && evidence.3 > 0);
+    assert_eq!(evidence.2 + evidence.3, 65);
+    assert_eq!(evidence.4, 2);
+}
+
+#[tokio::test]
 async fn association_id_exhaustion_retires_without_reuse_or_migrating_old_streams() {
     let _case = Case::new("TUIC-UNIT", "session_retirement");
     let (config, first_path, first_ep) = fixture_parts(1400, true, 8, "cubic", "native");

@@ -18,6 +18,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     io,
     sync::{Arc, Mutex},
     time::Duration,
@@ -33,7 +35,8 @@ pub struct TuicOutbound {
     server: Destination,
     upstream: UpstreamPath,
     tls: StandardTlsClient,
-    // Stream/shared lane plus a lazily-created quic UDP business lane.
+    // Lazy native source stripes, or isolated quic TCP/UDP business lanes.
+    // UoT keeps the original shared lane.
     current: AsyncMutex<[Option<Arc<Session>>; 2]>,
     cancel: CancellationToken,
     admission: Mutex<()>,
@@ -87,6 +90,10 @@ impl std::fmt::Debug for TuicOutbound {
 }
 
 impl TuicOutbound {
+    fn native_source_stripes(&self) -> bool {
+        self.config.udp_mode == crate::config::TuicUdpMode::Native && !self.config.udp_over_stream
+    }
+
     fn datagram_lane(&self) -> usize {
         usize::from(
             self.config.udp_mode == crate::config::TuicUdpMode::Quic
@@ -94,25 +101,29 @@ impl TuicOutbound {
         )
     }
 
-    /// Remaining actual Quinn datagram buffer, for bounded-backpressure checks.
+    /// One actual Quinn datagram buffer, never a native stripe aggregate.
     #[cfg(feature = "interop-test")]
     pub async fn datagram_buffer_space(&self) -> Option<usize> {
         let current = self.current.lock().await;
-        current[self.datagram_lane()]
-            .as_ref()
-            .map(|s| s.connection.datagram_send_buffer_space())
+        let session = if self.native_source_stripes() {
+            current[0].as_ref().or(current[1].as_ref())
+        } else {
+            // In quic mode a TCP lane is never a UDP-buffer witness.
+            current[self.datagram_lane()].as_ref()
+        };
+        session.map(|s| s.connection.datagram_send_buffer_space())
     }
 
     /// Actual Quinn controller identity for acceptance; no peer or credential data.
     #[cfg(feature = "interop-test")]
     pub async fn congestion_observation(&self) -> Option<TuicCongestion> {
         let current = self.current.lock().await;
-        // Report one actual lane: prefer UDP if present, otherwise stream.
+        // Report one actual lane/stripe, not an owner or aggregate observation.
         let session = current[1].as_ref().or(current[0].as_ref())?;
         active_congestion(&session.connection)
     }
 
-    /// Actual path of UDP if present, otherwise stream; never a lane aggregate.
+    /// One actual path; never an aggregate or a specified owner's stripe.
     #[cfg(feature = "interop-test")]
     pub async fn path_observation(&self) -> Option<quinn::PathStats> {
         let current = self.current.lock().await;
@@ -183,7 +194,13 @@ impl TuicOutbound {
         if self.config.max_open_streams == 0 {
             return Err(DispatchError::NotAllowed);
         }
-        let lane = if datagram_business {
+        let lane = if self.native_source_stripes() {
+            // Keep TCP and UDP from the same source on the same physical
+            // stripe without constraining the configured per-session owners.
+            let mut source = DefaultHasher::new();
+            datagram.source.hash(&mut source);
+            (source.finish() & 1) as usize
+        } else if datagram_business {
             self.datagram_lane()
         } else {
             0
