@@ -227,9 +227,18 @@ pub(super) async fn read_packet(
     let start = raw.len();
     raw.resize(start + size, 0);
     stream.read_exact(&mut raw[start..]).await?;
-    // TUIC uni packets end at their declared payload size. Dropping the
-    // reader retires this packet without waiting for a separately delivered FIN.
-    decode(raw.into())
+    let fragment = decode(raw.into())?;
+    // Consume an already-ready EOF so Quinn need not send STOP_SENDING for a
+    // completed stream. A pending FIN, extra byte or tail error never delays or
+    // revokes the complete declared payload; the original Drop path remains.
+    let mut tail = [0; 1];
+    std::future::poll_fn(|cx| {
+        let mut buffer = tokio::io::ReadBuf::new(&mut tail);
+        let _ = std::pin::Pin::new(&mut stream).poll_read(cx, &mut buffer);
+        std::task::Poll::Ready(())
+    })
+    .await;
+    Ok(fragment)
 }
 
 #[cfg(test)]

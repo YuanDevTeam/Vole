@@ -507,6 +507,113 @@ async fn both_udp_modes_preserve_empty_and_u16_packets_and_dissociate() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn quic_declared_payload_peeks_only_ready_fin_and_never_waits_for_it() {
+    let _case = Case::new("TUIC-UNIT", "ready_fin_probe");
+    let mut observed = Vec::new();
+    for finish_before_send in [true, false] {
+        let (outbound, endpoint) = fixture_mode(1400, true, 8, "cubic", "quic");
+        let ep = endpoint.clone();
+        let (reported, report) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let connection = authenticated(&ep).await;
+            // Echo the actual production encoder's Packet, not a test codec.
+            let response = connection
+                .accept_uni()
+                .await
+                .unwrap()
+                .read_to_end(64)
+                .await
+                .unwrap();
+            assert_eq!(&response[response.len() - 1..], b"a");
+            let before = connection.stats().frame_rx.stop_sending;
+            let mut send = connection.open_uni().await.unwrap();
+            let sent = connection.stats().frame_tx.stream;
+            send.write_all(&response).await.unwrap();
+            if finish_before_send {
+                send.finish().unwrap();
+            }
+            // This current-thread task has not let the endpoint driver send
+            // a STREAM frame before the small body and optional FIN are ready.
+            assert_eq!(connection.stats().frame_tx.stream, sent);
+            // A second production Packet is a return-path barrier: the first
+            // payload has already reached its owner before we inspect frames.
+            let barrier = connection
+                .accept_uni()
+                .await
+                .unwrap()
+                .read_to_end(64)
+                .await
+                .unwrap();
+            assert!(barrier.ends_with(b"barrier"));
+            let stopped = if finish_before_send {
+                None
+            } else {
+                // Keep FIN absent until payload delivery and the barrier. The
+                // original Drop must still request cancellation in this case.
+                Some(
+                    tokio::time::timeout(Duration::from_secs(2), send.stopped())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+            };
+            let stops = connection.stats().frame_rx.stop_sending - before;
+            drop(send);
+            reported.send((stops, stopped)).unwrap();
+            connection.closed().await;
+        });
+        let probe = ResourceProbe::default();
+        let result = probe
+            .scope(async {
+                let mut udp = outbound
+                    .open_datagram(udp_request(), &EstablishContext::default())
+                    .await
+                    .unwrap();
+                udp.send(Datagram {
+                    remote: request().destination,
+                    payload: bytes::Bytes::from_static(b"a"),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+                let response = tokio::time::timeout(Duration::from_secs(2), udp.receive())
+                    .await
+                    .expect("complete payload waited for FIN")
+                    .unwrap();
+                assert_eq!(response.remote, request().destination);
+                assert_eq!(response.payload, b"a"[..]);
+                udp.send(Datagram {
+                    remote: request().destination,
+                    payload: bytes::Bytes::from_static(b"barrier"),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(2), report)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                udp.close().await.unwrap();
+                drop(udp);
+                outbound.shutdown().await;
+                assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+                result
+            })
+            .await;
+        finish(endpoint, peer).await;
+        observed.push(result);
+    }
+    // Check the candidate's control-frame benefit only after both fixtures
+    // have shut down and joined, including the expected old-code RED run.
+    assert_eq!(observed[0].0, 0, "ready FIN still caused STOP_SENDING");
+    assert!(
+        observed[1].0 > 0,
+        "missing FIN bypassed the original stop path"
+    );
+    assert_eq!(observed[1].1, Some(Some(0_u8.into())));
+}
+
 #[tokio::test]
 async fn unused_association_close_does_not_create_peer_state_or_control_tasks() {
     let _case = Case::new("TUIC-UNIT", "unused_association");
