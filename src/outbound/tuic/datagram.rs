@@ -353,22 +353,34 @@ struct Pending {
 struct Reassembly {
     packets: HashMap<u16, Pending>,
     bytes: usize,
+    next_expiry: Option<Instant>,
 }
 impl Reassembly {
     fn remove(&mut self, id: u16) -> Option<Pending> {
         let p = self.packets.remove(&id)?;
         self.bytes -= p.bytes;
+        if self.packets.is_empty() {
+            self.next_expiry = None;
+        }
         Some(p)
     }
     fn expire(&mut self, now: Instant) {
+        // A removed earliest partial may leave a conservative earlier deadline.
+        // It can cause an extra scan, but must never postpone actual expiry.
+        if self.next_expiry.is_none_or(|deadline| now < deadline) {
+            return;
+        }
+        let mut next_expiry: Option<Instant> = None;
         self.packets.retain(|_, p| {
             if p.expires <= now {
                 self.bytes -= p.bytes;
                 false
             } else {
+                next_expiry = Some(next_expiry.map_or(p.expires, |next| next.min(p.expires)));
                 true
             }
         });
+        self.next_expiry = next_expiry;
     }
     fn push(&mut self, f: Fragment, now: Instant, budget: usize) -> Option<Datagram> {
         self.expire(now);
@@ -397,6 +409,8 @@ impl Reassembly {
                     self.remove(packet);
                 }
             }
+            let expires = now + TTL;
+            self.next_expiry = Some(self.next_expiry.map_or(expires, |next| next.min(expires)));
             self.packets.insert(
                 f.packet,
                 Pending {
@@ -404,7 +418,7 @@ impl Reassembly {
                     pieces: vec![None; f.count as usize],
                     bytes: 0,
                     received: 0,
-                    expires: now + TTL,
+                    expires,
                     _observation: observation::track(ResourceKind::Reassembly),
                 },
             );
@@ -756,6 +770,53 @@ mod tests {
         assert!(!other.packets.contains_key(&3));
         r.expire(now + TTL);
         assert_eq!(r.bytes, 0);
+        // Completing the earliest partial must not delay another partial's
+        // original deadline or let an expired ID borrow a later generation.
+        let mut staggered = Reassembly::default();
+        let later = now + Duration::from_secs(1);
+        assert!(
+            staggered
+                .push(fragment(10, 0, Bytes::from_static(b"old")), now, 8)
+                .is_none()
+        );
+        assert!(
+            staggered
+                .push(fragment(11, 0, Bytes::from_static(b"next")), later, 8)
+                .is_none()
+        );
+        let completed = staggered
+            .push(
+                fragment(10, 1, Bytes::from_static(b"-x")),
+                now + Duration::from_secs(2),
+                8,
+            )
+            .unwrap();
+        assert_eq!(completed.payload, b"old-x"[..]);
+        staggered.expire(now + TTL);
+        assert!(staggered.packets.contains_key(&11));
+        assert_eq!(staggered.bytes, 4);
+        staggered.expire(later + TTL - Duration::from_nanos(1));
+        assert!(staggered.packets.contains_key(&11));
+        staggered.expire(later + TTL);
+        assert!(staggered.packets.is_empty());
+        assert_eq!(staggered.bytes, 0);
+        let fresh = later + TTL;
+        assert!(
+            staggered
+                .push(fragment(11, 1, Bytes::from_static(b"tail")), fresh, 8)
+                .is_none()
+        );
+        let reused = staggered
+            .push(
+                fragment(11, 0, Bytes::from_static(b"new-")),
+                fresh + Duration::from_nanos(1),
+                8,
+            )
+            .unwrap();
+        assert_eq!(reused.payload, b"new-tail"[..]);
+        assert_eq!(reused.remote, Destination::domain("x", 80).unwrap());
+        assert!(staggered.packets.is_empty());
+        assert_eq!(staggered.bytes, 0);
     }
     #[test]
     fn unknown_associations_do_not_allocate_and_full_queues_drop_complete_packets() {
