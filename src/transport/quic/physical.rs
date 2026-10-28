@@ -19,7 +19,7 @@ use tokio_util::sync::ReusableBoxFuture;
 #[path = "physical_gate.rs"]
 mod gate;
 
-const MAX_SEGMENTS: usize = 8;
+const MAX_SEGMENTS: usize = 10;
 const MAX_BATCH_BYTES: usize = 65_507;
 type Io = Arc<crate::dialer::PhysicalDatagram>;
 pub(super) type Retirement = Arc<Lease<Io>>;
@@ -470,9 +470,9 @@ mod tests {
         };
         assert_eq!(validate_transmit(peer, 1200, 8, &packet).unwrap(), 2);
         assert!(validate_transmit(peer, 1200, 1, &packet).is_err());
-        packet.contents = &[1; 8 * 1200];
-        assert_eq!(validate_transmit(peer, 1200, 64, &packet).unwrap(), 8);
-        packet.contents = &[1; 8 * 1200 + 1];
+        packet.contents = &[1; 10 * 1200];
+        assert_eq!(validate_transmit(peer, 1200, 64, &packet).unwrap(), 10);
+        packet.contents = &[1; 10 * 1200 + 1];
         assert!(validate_transmit(peer, 1200, 64, &packet).is_err());
         packet.contents = &[1; 1200];
         packet.segment_size = None;

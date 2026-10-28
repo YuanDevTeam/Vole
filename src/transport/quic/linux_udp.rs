@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::net::UdpSocket;
 
-const MAX_SEGMENTS: usize = 8;
+const MAX_SEGMENTS: usize = 10;
 const UDP_SEGMENT: libc::c_int = 103;
 const UDP_GRO: libc::c_int = 104;
 
@@ -298,6 +298,15 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn physical_quic_memory_gso_segment_cap_is_ten_and_fallback_is_one() {
+        let state = SocketState {
+            gso: AtomicBool::new(true),
+        };
+        assert_eq!(state.max_gso_segments(), 10);
+        state.gso.store(false, Ordering::Relaxed);
+        assert_eq!(state.max_gso_segments(), 1);
+    }
     #[test]
     fn physical_quic_memory_linux_control_is_fixed_aligned_and_decodes_actual_ecn() {
         let mut control = Control::default();
