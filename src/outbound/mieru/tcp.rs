@@ -447,9 +447,10 @@ impl Client {
                         break id;
                     }
                 };
-                let state = State::new(
+                let state = State::new_for_business(
                     id,
                     receive_capacity,
+                    business,
                     &carrier.shared.cancel,
                     carrier.shared.activity.clone(),
                 );

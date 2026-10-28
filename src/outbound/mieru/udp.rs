@@ -41,6 +41,7 @@ const ACK_DELAY: Duration = Duration::from_millis(1);
 const FIRST_CHECK: Duration = Duration::from_millis(10);
 const RECEIVE_BATCH: u8 = 8;
 const OUTPUT_QUANTUM: usize = 8;
+const REORDER_SLACK: usize = 32768;
 
 struct WriteLease {
     _bytes: OwnedSemaphorePermit,
@@ -99,6 +100,8 @@ struct Reliable {
     // Authenticated pending DATA and application unread bytes own separate
     // bounded leases. A blocked reader must not spend the missing head's credit.
     reorder_bytes: Arc<Semaphore>,
+    // Fixed extra retention for normal windows; never advertised to the peer.
+    reorder_slack: usize,
     established: bool,
     remote_window: u32,
     rtt: Rtt,
@@ -140,10 +143,20 @@ impl Reliable {
     fn new(state: Arc<State>, receive_chunk: usize) -> Self {
         let now = Instant::now();
         let interval = heartbeat_interval();
-        let reorder_bytes = Arc::new(Semaphore::new(state.receive_capacity()));
+        let capacity = state.receive_capacity();
+        let reorder_slack = if state.business == super::tcp::Business::TcpConnect
+            && capacity >= REORDER_SLACK
+            && capacity >= receive_chunk
+        {
+            REORDER_SLACK
+        } else {
+            0
+        };
+        let reorder_bytes = Arc::new(Semaphore::new(capacity + reorder_slack));
         Self {
             state,
             reorder_bytes,
+            reorder_slack,
             pending: VecDeque::new(),
             outstanding: BTreeMap::new(),
             reorder: BTreeMap::new(),
@@ -188,7 +201,12 @@ impl Reliable {
             } else {
                 0
             };
-            bytes.saturating_sub(reserve) / self.receive_chunk
+            // Advertise only original capacity minus actual retained bytes.
+            // Taking min(bytes, capacity) would silently reuse the extra slack.
+            bytes
+                .saturating_sub(self.reorder_slack)
+                .saturating_sub(reserve)
+                / self.receive_chunk
         };
         segment_space.min(byte_space).min(u16::MAX as usize) as u16
     }
@@ -1900,6 +1918,185 @@ mod tests {
         assert!(partial.is_none());
         assert_eq!(state.receive_bytes.available_permits(), CAPACITY);
         state.close();
+    }
+
+    #[test]
+    fn mieru_udp_hidden_reorder_slack_preserves_original_credit_and_all_data() {
+        const CAPACITY: usize = 32768;
+        const CHUNK: usize = 1312;
+        let cancellation = CancellationToken::new();
+        let state = State::new(
+            1,
+            CAPACITY,
+            &cancellation,
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let mut reliable = Reliable::new(state.clone(), CHUNK);
+        let mut partial = None;
+        reliable.input(
+            Frame {
+                metadata: Metadata::Session(SessionMetadata {
+                    kind: SessionKind::OpenResponse,
+                    session_id: 1,
+                    sequence: 0,
+                    status: 0,
+                }),
+                payload: Bytes::new(),
+            },
+            Instant::now(),
+            &mut partial,
+        );
+        let frame = |sequence: u32| Frame {
+            metadata: Metadata::Data(DataMetadata {
+                kind: DataKind::ServerData,
+                session_id: 1,
+                sequence,
+                unack_sequence: 0,
+                window: 16,
+                fragment: 0,
+            }),
+            payload: Bytes::from(vec![sequence as u8; CHUNK]),
+        };
+        assert_eq!(reliable.window(true), 24);
+        // 40 future frames retain 52,480 payload bytes: beyond original
+        // credit, but below the bounded original + 32KiB reorder capacity.
+        for sequence in 2..=41 {
+            reliable.input(frame(sequence), Instant::now(), &mut partial);
+        }
+        assert_eq!(state.next_receive.load(Ordering::Acquire), 1);
+        assert_eq!(state.unread_bytes(), 0);
+        assert_eq!(state.receive_bytes.available_permits(), CAPACITY);
+        assert_eq!(
+            reliable.window(true),
+            0,
+            "hidden slack enlarged wire credit"
+        );
+        reliable.input(frame(1), Instant::now(), &mut partial);
+
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        for sequence in 1..=41 {
+            let mut bytes = [0; CHUNK];
+            let mut read = tokio::io::ReadBuf::new(&mut bytes);
+            assert!(
+                matches!(
+                    state.poll_read(&mut context, &mut read),
+                    std::task::Poll::Ready(Ok(()))
+                ),
+                "future frame {sequence} was not retained through the hole"
+            );
+            assert_eq!(read.filled(), &[sequence as u8; CHUNK]);
+            // This is the driver's original app-read recovery seam, not a
+            // second implementation of queue transfer or window arithmetic.
+            reliable.deliver_contiguous();
+            assert!(
+                reliable.window(true) <= 24,
+                "hidden slack enlarged wire credit"
+            );
+        }
+        assert_eq!(state.next_receive.load(Ordering::Acquire), 42);
+        assert!(reliable.reorder.is_empty());
+        assert!(partial.is_none());
+        assert_eq!(state.unread_bytes(), 0);
+        assert_eq!(state.receive_bytes.available_permits(), CAPACITY);
+        assert_eq!(reliable.reorder_bytes.available_permits(), CAPACITY + 32768);
+        assert_eq!(reliable.window(true), 24);
+        let mut bytes = [0; 1];
+        let mut read = tokio::io::ReadBuf::new(&mut bytes);
+        assert!(matches!(
+            state.poll_read(&mut context, &mut read),
+            std::task::Poll::Pending
+        ));
+        state.close();
+    }
+
+    #[test]
+    fn mieru_udp_associate_keeps_original_receive_budget() {
+        const CAPACITY: usize = 32768;
+        const CHUNK: usize = 1312;
+        let cancel = CancellationToken::new();
+        let state = State::new_for_business(
+            1,
+            CAPACITY,
+            super::super::tcp::Business::UdpAssociate,
+            &cancel,
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let mut reliable = Reliable::new(state.clone(), CHUNK);
+        assert_eq!(
+            state.business.command(),
+            crate::socks5::COMMAND_UDP_ASSOCIATE
+        );
+        assert_eq!(state.receive_bytes.available_permits(), CAPACITY);
+        assert_eq!(reliable.reorder_bytes.available_permits(), CAPACITY);
+        let mut partial = None;
+        reliable.input(
+            Frame {
+                metadata: Metadata::Session(SessionMetadata {
+                    kind: SessionKind::OpenResponse,
+                    session_id: 1,
+                    sequence: 0,
+                    status: 0,
+                }),
+                payload: Bytes::new(),
+            },
+            Instant::now(),
+            &mut partial,
+        );
+        let frame = |sequence: u32| Frame {
+            metadata: Metadata::Data(DataMetadata {
+                kind: DataKind::ServerData,
+                session_id: 1,
+                sequence,
+                unack_sequence: 0,
+                window: 16,
+                fragment: 0,
+            }),
+            payload: Bytes::from(vec![sequence as u8; CHUNK]),
+        };
+        assert_eq!(reliable.window(true), 24);
+        for sequence in 2..=41 {
+            reliable.input(frame(sequence), Instant::now(), &mut partial);
+        }
+        assert_eq!(state.unread_bytes(), 0);
+        assert_eq!(reliable.window(true), 0);
+        reliable.input(frame(1), Instant::now(), &mut partial);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        for sequence in 1..=41 {
+            // Beyond the original retention budget, peer DATA is retried.
+            if sequence >= 25 {
+                reliable.input(frame(sequence), Instant::now(), &mut partial);
+            }
+            let mut bytes = [0; CHUNK];
+            let mut read = tokio::io::ReadBuf::new(&mut bytes);
+            assert!(matches!(
+                state.poll_read(&mut cx, &mut read),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            assert_eq!(read.filled(), &[sequence as u8; CHUNK]);
+            reliable.deliver_contiguous();
+            assert!(reliable.window(true) <= 24);
+        }
+        assert_eq!(state.next_receive.load(Ordering::Acquire), 42);
+        assert!(reliable.reorder.is_empty());
+        assert_eq!(state.unread_bytes(), 0);
+        assert_eq!(state.receive_bytes.available_permits(), CAPACITY);
+        assert_eq!(reliable.reorder_bytes.available_permits(), CAPACITY);
+        state.close();
+
+        let connect = State::new_for_business(
+            2,
+            CAPACITY,
+            super::super::tcp::Business::TcpConnect,
+            &cancel,
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let reliable = Reliable::new(connect.clone(), CHUNK);
+        assert_eq!(reliable.reorder_bytes.available_permits(), 2 * CAPACITY);
+        assert_eq!(connect.receive_bytes.available_permits(), CAPACITY);
+        assert_eq!(reliable.window(true), 24);
+        connect.close();
     }
 
     #[test]

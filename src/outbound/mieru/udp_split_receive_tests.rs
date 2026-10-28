@@ -443,6 +443,7 @@ mod split_receive_tests {
         );
         let mut reliable = Reliable::new(state.clone(), CHUNK);
         let receive_pool = reliable.reorder_bytes.clone();
+        assert_eq!(receive_pool.available_permits(), 2 * CAPACITY);
         let mut partial = None;
         let mut wire = Wire::new();
         wire.input(
@@ -469,7 +470,9 @@ mod split_receive_tests {
         wire.data(&mut reliable, &mut partial, 25, &last);
         app_content.extend(last);
         assert_eq!(state.receive_bytes.available_permits(), 0);
-        for sequence in 50..72 {
+        // Fill the new 64KiB reorder pool up to its reserved head slot:
+        // 48 full future frames + one 1248-byte tail = 64,224 bytes.
+        for sequence in 50..=97 {
             wire.data(
                 &mut reliable,
                 &mut partial,
@@ -477,7 +480,14 @@ mod split_receive_tests {
                 &vec![sequence as u8; CHUNK],
             );
         }
-        let far_owner = wire.data(&mut reliable, &mut partial, 72, &[72; CHUNK]);
+        let far_owner = wire.data(&mut reliable, &mut partial, 98, &[98; 1248]);
+        assert_eq!(reliable.reorder.len(), 49);
+        assert_eq!(receive_pool.available_permits(), CHUNK);
+        assert_eq!(state.unread_bytes(), CAPACITY);
+        assert!(
+            (2 * CAPACITY - receive_pool.available_permits()) + state.unread_bytes()
+                <= 3 * CAPACITY
+        );
         wire.data(&mut reliable, &mut partial, 30, &[30; CHUNK]);
         let head_owner = wire.data(&mut reliable, &mut partial, 26, &[26; CHUNK]);
         // The authenticated head stays retained until app transfer can commit.
@@ -505,29 +515,55 @@ mod split_receive_tests {
                 &vec![sequence as u8; CHUNK],
             );
         }
-        assert_eq!(reliable.reorder.len(), 23);
-        assert_eq!(receive_pool.available_permits(), CAPACITY - 23 * CHUNK);
+        assert_eq!(reliable.reorder.len(), 48);
+        assert_eq!(receive_pool.available_permits(), 2 * CAPACITY - 48 * CHUNK);
+        for sequence in 26..=48 {
+            assert!(reliable.reorder.contains_key(&sequence));
+        }
+        for sequence in 50..=74 {
+            assert!(reliable.reorder.contains_key(&sequence));
+        }
+        assert!(!reliable.reorder.contains_key(&49));
+        let far_survivor = reliable.reorder.get(&50).unwrap().frame.payload.clone();
+        assert!(!far_survivor.is_unique());
         assert_eq!(state.next_receive.load(Ordering::Acquire), 26);
         let retained = reliable
             .reorder
             .values()
             .map(|inbound| inbound.frame.payload.len())
             .sum::<usize>();
-        assert!(retained + CAPACITY - state.receive_bytes.available_permits() <= 2 * CAPACITY);
+        assert!(retained <= 2 * CAPACITY);
+        assert!(retained + CAPACITY - state.receive_bytes.available_permits() <= 3 * CAPACITY);
         read_exact(&state, &app_content);
         assert_eq!(state.receive_bytes.available_permits(), CAPACITY);
         reliable.deliver_contiguous();
         assert_eq!(state.next_receive.load(Ordering::Acquire), 49);
-        assert!(reliable.reorder.is_empty());
-        assert_eq!(receive_pool.available_permits(), CAPACITY);
+        // The nearer prefix is committed, but seq49 still separates the
+        // retained far DATA from the app. It must survive without delivery.
+        assert_eq!(reliable.reorder.len(), 25);
+        assert_eq!(receive_pool.available_permits(), 2 * CAPACITY - 25 * CHUNK);
         read_exact(&state, &content(26, 49));
         assert_eq!(state.receive_bytes.available_permits(), CAPACITY);
+        assert!(!reliable.deliver_contiguous());
+        assert_eq!(state.next_receive.load(Ordering::Acquire), 49);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut storage = [0; CHUNK];
+        let mut read = tokio::io::ReadBuf::new(&mut storage);
+        assert!(matches!(
+            state.poll_read(&mut cx, &mut read),
+            std::task::Poll::Pending
+        ));
+        assert!(!far_survivor.is_unique());
         assert!(head_owner.is_unique());
         drop(head_owner);
         assert!(partial.is_none());
         state.close();
         drop(reliable);
-        assert_eq!(receive_pool.available_permits(), CAPACITY);
+        assert_eq!(state.receive_bytes.available_permits(), CAPACITY);
+        assert_eq!(receive_pool.available_permits(), 2 * CAPACITY);
+        assert!(far_survivor.is_unique());
+        drop(far_survivor);
     }
 
     #[tokio::test(start_paused = true)]

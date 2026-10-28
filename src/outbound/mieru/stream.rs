@@ -1,5 +1,5 @@
 //! Logical Mieru byte streams and the lazy SOCKS business handshake.
-use super::tcp::{Carrier, WriterCommand};
+use super::tcp::{Business, Carrier, WriterCommand};
 use crate::{
     resources::observation::{self, ResourceKind},
     session::Destination,
@@ -40,6 +40,7 @@ pub(super) struct ReceivedChunk {
 }
 pub(super) struct State {
     pub id: u32,
+    pub(super) business: Business,
     pub opened: AtomicBool,
     pub sequence: AtomicU32,
     pub next_receive: AtomicU32,
@@ -57,14 +58,25 @@ pub(super) struct State {
     _observation: observation::Guard,
 }
 impl State {
+    #[cfg(test)]
     pub fn new(
         id: u32,
         capacity: usize,
         cancellation: &CancellationToken,
         activity: Arc<Notify>,
     ) -> Arc<Self> {
+        Self::new_for_business(id, capacity, Business::TcpConnect, cancellation, activity)
+    }
+    pub fn new_for_business(
+        id: u32,
+        capacity: usize,
+        business: Business,
+        cancellation: &CancellationToken,
+        activity: Arc<Notify>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id,
+            business,
             opened: AtomicBool::new(false),
             sequence: AtomicU32::new(0),
             next_receive: AtomicU32::new(0),
