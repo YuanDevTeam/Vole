@@ -356,6 +356,8 @@ Linux 受控物理 QUIC 的纯内存过滤器：`physical_quic_memory_` 与
 检查分段的逐包/总字节预算、来源与显式源覆盖拒绝、完整接收边界、默认值与严格字段；
 不创建 socket，不证明真实 ECN/GSO、protect、RSS、吞吐或设备行为。
 `transport::quic::physical::tests::physical_quic_memory_revocation_releases_io_with_retained_broadcast_pollers`
-在纯内存中检查多等待者广播、注册交错与持有已退役句柄时释放 IO。显式 ignored 的
+在纯内存中检查多等待者广播、注册交错与持有已退役句柄时释放 IO。
+`physical_quic_memory_concurrent_read_leases_delay_retirement_until_both_release` 另验两个并发读者、
+退役等待双方释放及资源只析构一次。显式 ignored 的
 `transport::quic::physical::gate::real_tun_native_udp_retirement_gate` 仅供隔离 Linux
 容器以真实 TUN 验证适配器的 fd、资源计数和 Stop；常规内存回归不得执行该网络门禁。

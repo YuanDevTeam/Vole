@@ -9,7 +9,7 @@ use std::{
     io::{self, IoSliceMut},
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     task::{Context, Poll, Wake, Waker, ready},
 };
 use tokio::{io::Interest, sync::Notify};
@@ -27,7 +27,7 @@ pub(super) type Retirement = Arc<Lease<Io>>;
 // Every retained socket/poller owns this revocable slot, never the fd itself.
 // A generic value permits a memory-only destructor/registration regression.
 pub(super) struct Lease<T> {
-    value: Mutex<Option<T>>,
+    value: RwLock<Option<T>>,
     ready: Arc<Ready>,
 }
 struct Ready(Notify);
@@ -42,12 +42,12 @@ impl Wake for Ready {
 impl<T> Lease<T> {
     fn new(value: T) -> Arc<Self> {
         Arc::new(Self {
-            value: Mutex::new(Some(value)),
+            value: RwLock::new(Some(value)),
             ready: Arc::new(Ready(Notify::new())),
         })
     }
     pub(super) fn retire(&self) {
-        self.value.lock().unwrap().take();
+        self.value.write().unwrap().take();
         self.ready.0.notify_waiters();
     }
 }
@@ -107,7 +107,7 @@ impl Socket {
     pub(super) fn local_addr(&self) -> io::Result<SocketAddr> {
         self.io
             .value
-            .lock()
+            .read()
             .unwrap()
             .as_ref()
             .ok_or(io::ErrorKind::BrokenPipe)?
@@ -143,7 +143,7 @@ impl Socket {
         // PMTU probe failures and unambiguous GSO-capability failures are
         // accepted as packet losses for Quinn's normal ACK/retransmit logic.
         // Never replay a possibly accepted prefix or hide address/policy/ECN errors.
-        let lease = self.io.value.lock().unwrap();
+        let lease = self.io.value.read().unwrap();
         let io = lease.as_ref().ok_or(io::ErrorKind::BrokenPipe)?;
         match io.try_io(Interest::WRITABLE, || self.state.try_send(io, &transmit)) {
             Ok(()) => {}
@@ -172,7 +172,7 @@ impl Socket {
         self.shared.reader.register(cx.waker());
         for _ in 0..crate::limits::IO_POLL_BUDGET {
             self.check_open()?;
-            let lease = self.io.value.lock().unwrap();
+            let lease = self.io.value.read().unwrap();
             let io = lease.as_ref().ok_or(io::ErrorKind::BrokenPipe)?;
             ready!(io.poll_recv_ready(cx))?;
             let mut scratch = self.receive.lock().unwrap();
@@ -280,7 +280,7 @@ async fn writable<T: Send + Sync>(
         tokio::pin!(ready);
         ready.as_mut().enable();
         let result = {
-            let value = io.value.lock().unwrap();
+            let value = io.value.read().unwrap();
             let value = value.as_ref().ok_or(io::ErrorKind::BrokenPipe)?;
             let waker = Waker::from(io.ready.clone());
             poll(value, &mut Context::from_waker(&waker))
@@ -429,7 +429,7 @@ mod tests {
 
         // A retained real poller may be polled repeatedly after retirement.
         let retired = Arc::new(Lease::<Io> {
-            value: Mutex::new(None),
+            value: RwLock::new(None),
             ready: Arc::new(Ready(Notify::new())),
         });
         let mut poller = Box::pin(Writable {
@@ -458,6 +458,104 @@ mod tests {
         drop(driver);
         assert!(notification.as_mut().poll(&mut first_cx).is_ready());
     }
+    #[test]
+    fn physical_quic_memory_concurrent_read_leases_delay_retirement_until_both_release() {
+        use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+        const STILL_HELD: std::time::Duration = std::time::Duration::from_millis(25);
+        struct DropRecord {
+            _owner: Arc<()>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Drop for DropRecord {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let lease = Lease::new(DropRecord {
+            _owner: owner,
+            dropped: dropped.clone(),
+        });
+        std::thread::scope(|scope| {
+            let (entered_tx, entered_rx) = sync_channel(2);
+            let (left_tx, left_rx) = sync_channel(2);
+            let mut releases = Vec::with_capacity(2);
+            let mut readers = Vec::with_capacity(2);
+            for _ in 0..2 {
+                let held = lease.clone();
+                let entered = entered_tx.clone();
+                let left = left_tx.clone();
+                let (release_tx, release_rx) = sync_channel(1);
+                releases.push(release_tx);
+                readers.push(scope.spawn(move || {
+                    let guard = held.value.read().unwrap();
+                    assert!(guard.is_some());
+                    entered.try_send(()).unwrap();
+                    // A failed parent assertion drops the release sender;
+                    // timeout/disconnection also releases the actual guard.
+                    let release = release_rx.recv_timeout(DEADLINE);
+                    drop(guard);
+                    left.try_send(()).unwrap();
+                    release.expect("read lease release deadline");
+                }));
+            }
+            // Both notifications occur while the actual read guards are held.
+            // This would time out if the lease still serialized its readers.
+            entered_rx.recv_timeout(DEADLINE).unwrap();
+            entered_rx.recv_timeout(DEADLINE).unwrap();
+            assert!(matches!(
+                lease.value.try_write(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+
+            let (attempt_tx, attempt_rx) = sync_channel(1);
+            let (done_tx, done_rx) = sync_channel(1);
+            let retiring = lease.clone();
+            let writer = scope.spawn(move || {
+                attempt_tx.try_send(()).unwrap();
+                retiring.retire();
+                done_tx.try_send(()).unwrap();
+            });
+            attempt_rx.recv_timeout(DEADLINE).unwrap();
+            assert!(matches!(
+                done_rx.recv_timeout(STILL_HELD),
+                Err(RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+
+            releases[0].try_send(()).unwrap();
+            left_rx.recv_timeout(DEADLINE).unwrap();
+            assert!(matches!(
+                lease.value.try_write(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            assert!(matches!(
+                done_rx.recv_timeout(STILL_HELD),
+                Err(RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            assert_eq!(weak.strong_count(), 1);
+
+            releases[1].try_send(()).unwrap();
+            left_rx.recv_timeout(DEADLINE).unwrap();
+            done_rx.recv_timeout(DEADLINE).unwrap();
+            for reader in readers {
+                reader.join().unwrap();
+            }
+            writer.join().unwrap();
+        });
+        assert!(lease.value.read().unwrap().is_none());
+        assert!(weak.upgrade().is_none());
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        lease.retire();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn physical_quic_memory_transmit_limits_each_segment_peer_and_source_without_queues() {
         let peer = "192.0.2.1:443".parse().unwrap();

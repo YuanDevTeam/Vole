@@ -75,7 +75,7 @@ impl Dispatcher for Gate {
             attach_quinn(raw, self.peer, DatagramBudget::new(1500, 1500)).await?;
         let (fd, inode, weak) = {
             let native = socket.physical.as_ref().expect("native DIRECT socket");
-            let lease = native.io.value.lock().unwrap();
+            let lease = native.io.value.read().unwrap();
             let io = lease.as_ref().unwrap();
             let fd = io.as_raw_fd();
             let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();

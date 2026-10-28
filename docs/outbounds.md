@@ -85,9 +85,9 @@ VLESS/Vision/Encryption/JLS/ECH 见 [VLESS](vless.md)，XHTTP/sing-mux 见[专�
 `experimental.quic-go-disable-gso` 缺省 false，`quic-go-disable-ecn` 缺省 true。
 这两个会话配置只由 Linux 上 TUIC、XHTTP H3、DoQ/DoH H3 的 DIRECT 物理首跳消费，
 使用共享 Dialer 已保护、已绑定的同一 socket；不修改宿主进程环境。
-GSO 分段批次依实际路径与预算每次最多 8 段、整批最多 65,507 字节，每段保留原 UDP 预算。
+GSO 分段批次依实际路径与预算每次最多 10 段、整批最多 65,507 字节，每段保留原 UDP 预算。
 未分段的数据报沿用原方向预算，IPv6 可达 65,527 字节；关闭 GSO 后只发独立数据报。
-DoQ/DoH H3 的当前 DIRECT 预算为 IPv4 65,507、IPv6 65,527 字节，分段能力为 1；
+DoQ/DoH H3 的当前 DIRECT 发送预算为 IPv4 65,507、IPv6 65,527 字节，接收预算为 4 KiB，分段能力为 1；
 这些 DNS 路径使用同 socket 的原生收发与 ECN 元数据，不据此声称实际 GSO 批量发送。
 ECN 开启时传递实际发送标记和接收元数据；关闭时不发送/交付 ECN 标记。
 系统无法开启 ECN 接收元数据时，保留同一受保护 socket，沿用原单包、无元数据路径。

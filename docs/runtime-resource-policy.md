@@ -221,6 +221,9 @@ MASQUE 与其余 quiche H3 默认使用原生比例 1.0。
 
 QUIC双向可用payload至少1,200字节；endpoint必须显式把QUIC MTU限制在有效预算内。IPv4/IPv6路径MTU分别先扣除28/48字节IP+UDP头，边界和单字节不足均有定向测试。
 
+Linux 受控物理 UDP 的收发与就绪注册可并发借用同一 socket。借用不跨 Pending 或 await，
+不转移 socket 所有权；退役先关闭准入，再等待在途借用结束并取走资源，保留的 poller 不延长 fd 生命周期。
+
 QUIC owner.stop先取消并等待驱动，再关闭并释放上游；上游close最多1秒。H3 的关闭预算内停止新请求准入并执行关闭交换，XHTTP 和 quiche 物理连接退役还保留有界的传输收尾机会，不承诺逐流远端 ACK。Driver Drop仅为取消/abort兜底，不能作为同步Stop验收。队列容量是单连接局部界限，不是全局QUIC连接准入数。
 
 TUIC 与 Hysteria2 共用这一接点。接收窗口通过官方 Quinn API 固定设置：
