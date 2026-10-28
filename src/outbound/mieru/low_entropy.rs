@@ -68,7 +68,12 @@ impl LowEntropyEncoding {
             if self.padding_bit == 1 {
                 // A partial final source chunk has fewer data bits than its
                 // mask. Those remaining positions are uniform padding too.
-                encoded |= !deposit((1u64 << (len * 8)) - 1, mask);
+                let data_mask = if len == count {
+                    mask
+                } else {
+                    deposit((1u64 << (len * 8)) - 1, mask)
+                };
+                encoded |= !data_mask;
             }
             body[chunk * 8..chunk * 8 + 8].copy_from_slice(&encoded.to_be_bytes());
         }
@@ -88,7 +93,12 @@ impl LowEntropyEncoding {
             let len = (source_len - offset).min(count);
             let word = u64::from_be_bytes(body[chunk * 8..chunk * 8 + 8].try_into().unwrap());
             let mask = self.mask(chunk);
-            let padding_mask = !deposit((1u64 << (len * 8)) - 1, mask);
+            let data_mask = if len == count {
+                mask
+            } else {
+                deposit((1u64 << (len * 8)) - 1, mask)
+            };
+            let padding_mask = !data_mask;
             let padding = word & padding_mask;
             let bit = if padding == 0 {
                 false
