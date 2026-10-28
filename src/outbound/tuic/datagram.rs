@@ -24,6 +24,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const TTL: Duration = Duration::from_secs(crate::limits::TUIC_FRAGMENT_TTL_SECONDS as u64);
+const NATIVE_RECEIVE_EVENTS: usize = 512;
 
 pub(super) struct Registry {
     state: Mutex<State>,
@@ -63,6 +64,40 @@ impl Registry {
             mode,
             native_payload_limit,
             native_send_message_limit,
+        }
+    }
+    fn payload_budget(&self, address_len: usize, message_limit: usize) -> DatagramBudget {
+        let space = message_limit.saturating_sub(10 + address_len);
+        DatagramBudget::new(
+            space
+                .min(if self.mode == TuicUdpMode::Quic {
+                    usize::MAX
+                } else {
+                    self.native_payload_limit as usize
+                })
+                .saturating_mul(255)
+                .min(u16::MAX as usize) as u16,
+            u16::MAX,
+        )
+    }
+    fn payload_limit(
+        &self,
+        address_len: usize,
+        payload_size: usize,
+        message_limit: usize,
+    ) -> usize {
+        if self.mode == TuicUdpMode::Quic {
+            return usize::MAX;
+        }
+        let configured = self.native_payload_limit as usize;
+        if payload_size <= configured
+            && payload_size.saturating_add(10 + address_len) <= message_limit
+        {
+            configured
+        } else {
+            // A path-limited native retry reserves the IPv6 worst-case header,
+            // independently of the actual first packet destination family.
+            configured.min(message_limit.saturating_sub(29))
         }
     }
     pub fn open(
@@ -195,25 +230,6 @@ impl Transport {
             });
         }
     }
-    fn payload_limit(&self, peer: &Destination, payload_size: usize) -> usize {
-        if self.registry.mode == TuicUdpMode::Quic {
-            return usize::MAX;
-        }
-        let configured = self.registry.native_payload_limit as usize;
-        let mut address = Vec::new();
-        if wire::address(peer, &mut address).is_err() {
-            return 0;
-        }
-        let capacity = self.message_limit();
-        if payload_size <= configured && payload_size.saturating_add(10 + address.len()) <= capacity
-        {
-            configured
-        } else {
-            // A path-limited native retry reserves the IPv6 worst-case header,
-            // independently of the actual first packet destination family.
-            configured.min(capacity.saturating_sub(29))
-        }
-    }
     fn message_limit(&self) -> usize {
         match self.registry.mode {
             TuicUdpMode::Native => self
@@ -241,30 +257,27 @@ impl DatagramTransport for Transport {
     }
 
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
-        let mut address = Vec::new();
-        let space = if wire::address(peer, &mut address).is_ok() {
-            self.message_limit().saturating_sub(10 + address.len())
-        } else {
-            0
+        let budget = match wire::address_len(peer) {
+            Ok(address_len) => self
+                .registry
+                .payload_budget(address_len, self.message_limit()),
+            Err(_) => DatagramBudget::new(0, u16::MAX),
         };
-        DatagramBudget::new(
-            space
-                .min(if self.registry.mode == TuicUdpMode::Quic {
-                    usize::MAX
-                } else {
-                    self.registry.native_payload_limit as usize
-                })
-                .saturating_mul(255)
-                .min(u16::MAX as usize) as u16,
-            u16::MAX,
-        )
-        .intersect(self.budget)
+        budget.intersect(self.budget)
     }
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         if self.closed || self.cancel.is_cancelled() {
             return Err(DispatchError::NotAllowed);
         }
-        if datagram.payload.len() > self.payload_budget(&datagram.remote).transmit() as usize {
+        let address_len = wire::address_len(&datagram.remote)?;
+        // Snapshot this logical send once; Quinn still validates the current
+        // path when each fragment is sent. Never cache the limit across sends.
+        let message_limit = self.message_limit();
+        let budget = self
+            .registry
+            .payload_budget(address_len, message_limit)
+            .intersect(self.budget);
+        if datagram.payload.len() > budget.transmit() as usize {
             return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
         }
         let packets = wire::packets_with_payload_limit(
@@ -272,8 +285,9 @@ impl DatagramTransport for Transport {
             self.packet,
             &datagram.remote,
             &datagram.payload,
-            self.message_limit(),
-            self.payload_limit(&datagram.remote, datagram.payload.len()),
+            message_limit,
+            self.registry
+                .payload_limit(address_len, datagram.payload.len(), message_limit),
         )?;
         // Consume the ID before the first await: cancelling a partial send
         // never reuses that unfinished packet or replays its business bytes.
@@ -444,6 +458,11 @@ pub(super) async fn receive(
     let mut streams = FuturesUnordered::new();
     let mut expiry = tokio::time::interval(Duration::from_secs(1));
     expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let poll_budget = if registry.mode == TuicUdpMode::Native {
+        NATIVE_RECEIVE_EVENTS
+    } else {
+        crate::limits::IO_POLL_BUDGET
+    };
     let mut count = 0;
     loop {
         tokio::select! {
@@ -473,7 +492,7 @@ pub(super) async fn receive(
             },
         }
         count += 1;
-        if count % crate::limits::IO_POLL_BUDGET == 0 {
+        if count % poll_budget == 0 {
             tokio::task::yield_now().await;
         }
     }
@@ -482,6 +501,109 @@ pub(super) async fn receive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_snapshot_preserves_native_path_retry_and_configured_fragment_limits() {
+        let registry = Registry::with_limit(TuicUdpMode::Native, 1252, 1200);
+        for (peer, length, expected) in [
+            (
+                Destination::Ip("192.0.2.1:53".parse().unwrap()),
+                1183,
+                vec![1183],
+            ),
+            (
+                Destination::Ip("192.0.2.1:53".parse().unwrap()),
+                1184,
+                vec![1171, 13],
+            ),
+            (
+                Destination::Ip("[::1]:53".parse().unwrap()),
+                1171,
+                vec![1171],
+            ),
+            (
+                Destination::Ip("[::1]:53".parse().unwrap()),
+                1172,
+                vec![1171, 1],
+            ),
+        ] {
+            let address_len = wire::address_len(&peer).unwrap();
+            let payload = vec![0x5a; length];
+            let packets = wire::packets_with_payload_limit(
+                7,
+                u16::MAX,
+                &peer,
+                &payload,
+                1200,
+                registry.payload_limit(address_len, length, 1200),
+            )
+            .unwrap();
+            let decoded: Vec<_> = packets
+                .into_iter()
+                .map(|p| wire::decode(p).unwrap())
+                .collect();
+            assert_eq!(
+                decoded.iter().map(|p| p.payload.len()).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(decoded[0].peer.as_ref(), Some(&peer));
+            assert!(decoded.iter().skip(1).all(|p| p.peer.is_none()));
+            assert!(
+                decoded
+                    .iter()
+                    .all(|p| p.association == 7 && p.packet == u16::MAX)
+            );
+            assert_eq!(
+                decoded
+                    .iter()
+                    .flat_map(|p| p.payload.iter().copied())
+                    .collect::<Vec<_>>(),
+                payload
+            );
+        }
+        let configured = Registry::with_limit(TuicUdpMode::Native, 1000, 1200);
+        assert_eq!(configured.payload_limit(7, 1001, 1200), 1000);
+        let conservative = Registry::with_limit(TuicUdpMode::Native, 1252, 30);
+        assert_eq!(conservative.payload_limit(7, 13, 30), 1252);
+        assert_eq!(conservative.payload_limit(7, 14, 30), 1);
+    }
+
+    #[test]
+    fn message_snapshot_preserves_directional_budgets_empty_frames_and_quic_limit() {
+        let native = Registry::with_limit(TuicUdpMode::Native, 1, 1200);
+        assert_eq!(
+            native.payload_budget(7, 1200),
+            DatagramBudget::new(255, u16::MAX)
+        );
+        assert_eq!(
+            native.payload_budget(7, 17),
+            DatagramBudget::new(0, u16::MAX)
+        );
+        let caller = DatagramBudget::new(200, 1200);
+        assert_eq!(
+            native.payload_budget(7, 1200).intersect(caller),
+            DatagramBudget::new(200, 1200)
+        );
+        let peer = Destination::Ip("192.0.2.1:53".parse().unwrap());
+        let empty =
+            wire::packets_with_payload_limit(1, 2, &peer, &[], 17, native.payload_limit(7, 0, 17))
+                .unwrap();
+        assert_eq!(empty.len(), 1);
+        assert_eq!(
+            empty[0].as_ref(),
+            b"\x05\x02\x00\x01\x00\x02\x01\x00\x00\x00\x01\xc0\x00\x02\x01\x00\x35"
+        );
+        assert!(
+            wire::packets_with_payload_limit(1, 2, &peer, &[], 16, native.payload_limit(7, 0, 16),)
+                .is_err()
+        );
+        let quic = Registry::with_limit(TuicUdpMode::Quic, 1, 1200);
+        assert_eq!(
+            quic.payload_budget(259, u16::MAX as usize + 10 + 259),
+            DatagramBudget::new(u16::MAX, u16::MAX)
+        );
+        assert_eq!(quic.payload_limit(259, u16::MAX as usize, 1200), usize::MAX);
+    }
     fn fragment(id: u16, index: u8, payload: Bytes) -> Fragment {
         Fragment {
             association: 0,

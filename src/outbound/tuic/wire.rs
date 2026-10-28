@@ -4,12 +4,25 @@ use bytes::{Buf, Bytes};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub(super) fn address(peer: &Destination, out: &mut Vec<u8>) -> io::Result<()> {
+pub(super) fn address_len(peer: &Destination) -> io::Result<usize> {
     if peer.port() == 0
         && !matches!(peer, Destination::Domain { host, .. } if host == crate::outbound::uot::MAGIC_DESTINATION)
     {
         return Err(io::ErrorKind::InvalidInput.into());
     }
+    match peer {
+        Destination::Ip(peer) => Ok(if peer.is_ipv4() { 7 } else { 19 }),
+        Destination::Domain { host, .. } => {
+            if host.is_empty() || host.len() > 255 || host.bytes().any(|v| v.is_ascii_control()) {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            Ok(4 + host.len())
+        }
+    }
+}
+
+pub(super) fn address(peer: &Destination, out: &mut Vec<u8>) -> io::Result<()> {
+    address_len(peer)?;
     match peer {
         Destination::Ip(peer) => match peer.ip() {
             std::net::IpAddr::V4(ip) => {
@@ -22,9 +35,6 @@ pub(super) fn address(peer: &Destination, out: &mut Vec<u8>) -> io::Result<()> {
             }
         },
         Destination::Domain { host, .. } => {
-            if host.is_empty() || host.len() > 255 || host.bytes().any(|v| v.is_ascii_control()) {
-                return Err(io::ErrorKind::InvalidInput.into());
-            }
             out.extend_from_slice(&[0, host.len() as u8]);
             out.extend_from_slice(host.as_bytes());
         }
@@ -225,6 +235,73 @@ pub(super) async fn read_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_length_validates_the_existing_wire_peer_boundaries() {
+        for (peer, expected_len) in [
+            (Destination::Ip("192.0.2.1:53".parse().unwrap()), 7),
+            (Destination::Ip("[::1]:53".parse().unwrap()), 19),
+            (
+                Destination::Domain {
+                    host: "x".into(),
+                    port: 80,
+                },
+                5,
+            ),
+            (
+                Destination::Domain {
+                    host: "x".repeat(255),
+                    port: 80,
+                },
+                259,
+            ),
+            (
+                Destination::Domain {
+                    host: "é".into(),
+                    port: 80,
+                },
+                6,
+            ),
+            (crate::outbound::uot::magic_destination(), 27),
+        ] {
+            assert_eq!(address_len(&peer).unwrap(), expected_len);
+            let mut bytes = Vec::new();
+            address(&peer, &mut bytes).unwrap();
+            assert_eq!(bytes.len(), expected_len);
+        }
+        for peer in [
+            Destination::Domain {
+                host: "".into(),
+                port: 80,
+            },
+            Destination::Domain {
+                host: "x".repeat(256),
+                port: 80,
+            },
+            Destination::Domain {
+                host: "bad\0name".into(),
+                port: 80,
+            },
+            Destination::Domain {
+                host: "bad\x7fname".into(),
+                port: 80,
+            },
+            Destination::Domain {
+                host: "peer.invalid".into(),
+                port: 0,
+            },
+            Destination::Ip("192.0.2.1:0".parse().unwrap()),
+            Destination::Ip("[::1]:0".parse().unwrap()),
+        ] {
+            assert_eq!(
+                address_len(&peer).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            let mut unchanged = vec![0xa5];
+            assert!(address(&peer, &mut unchanged).is_err());
+            assert_eq!(unchanged, [0xa5]);
+        }
+    }
     use tokio::io::AsyncWriteExt;
     #[test]
     fn native_packet_has_one_address_and_exact_fragment_lengths() {
