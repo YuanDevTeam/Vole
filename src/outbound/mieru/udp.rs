@@ -124,6 +124,13 @@ struct Reliable {
     // Fixed in-flight DATA opportunity, never a reliable FIN or added credit.
     close_grace: Option<CloseGrace>,
 }
+impl Drop for Reliable {
+    fn drop(&mut self) {
+        // Publish before the original pending/outstanding fields release leases.
+        self.state.mark_ack_terminal();
+    }
+}
+
 fn heartbeat_interval() -> Duration {
     Duration::from_millis(4000 + rand::random_range(0..=2000u64))
 }
@@ -224,6 +231,7 @@ impl Reliable {
         self.ack_due = Some(self.ack_due.map_or(due, |old| old.min(due)));
     }
     fn enqueue(&mut self, command: WriterCommand, chunk: usize, allow_piggyback: bool) {
+        self.state.mark_ack_pending();
         let first = !self.state.opened.swap(true, Ordering::AcqRel);
         let piggyback = first
             && allow_piggyback
@@ -297,6 +305,11 @@ impl Reliable {
         self.remote_window = u32::from(window);
         if only_ack && let Some(segment) = self.outstanding.get_mut(&unack) {
             segment.ack_count = segment.ack_count.saturating_add(1);
+        }
+        // Only a real cumulative ACK may publish successful drain. First-send
+        // completion, lease drop, and terminal tree clearing are not ACKs.
+        if self.pending.is_empty() && self.outstanding.is_empty() {
+            self.state.mark_ack_drained();
         }
     }
     fn input(&mut self, frame: Frame, now: Instant, partial: &mut Option<Partial>) {
@@ -883,6 +896,7 @@ async fn input_packet(
                     SessionKind::CloseRequest | SessionKind::CloseResponse
                 ) =>
             {
+                state.state.mark_ack_terminal();
                 // Anchor before the original timely response send; never renew.
                 let received_at = Instant::now();
                 if meta.kind == SessionKind::CloseRequest {
@@ -1204,7 +1218,10 @@ mod tests {
         task::JoinHandle,
     };
     use tokio_util::{sync::CancellationToken, task::TaskTracker};
+    include!("udp_upload_shutdown_tests.rs");
+
     struct Peer {
+        upload: Option<Arc<UploadFixture>>,
         drop_open: bool,
         drop_response: bool,
         response_dropped: AtomicBool,
@@ -1267,6 +1284,7 @@ mod tests {
         }
         fn with_response_loss(drop_open: bool, drop_response: bool, stall: bool) -> Arc<Self> {
             Arc::new(Self {
+                upload: None,
                 drop_open,
                 drop_response,
                 response_dropped: AtomicBool::new(false),
@@ -1305,6 +1323,10 @@ mod tests {
         ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
             let (output, incoming) = mpsc::channel(64);
             let (outgoing, input) = mpsc::channel(64);
+            if let Some(upload) = &self.upload {
+                upload.physical_opens.fetch_add(1, Ordering::AcqRel);
+                *upload.outgoing.lock().unwrap() = Some(outgoing.clone());
+            }
             let cancel = self.cancel.child_token();
             let server_cancel = cancel.clone();
             let peer = self.clone();
@@ -1413,6 +1435,12 @@ mod tests {
         payload: &[u8],
         duplicate: bool,
     ) -> io::Result<()> {
+        if let Some(upload) = &peer.upload {
+            upload.observe_server(metadata);
+            if upload.withholds(metadata) {
+                return Ok(());
+            }
+        }
         if matches!(metadata, Metadata::Session(m) if m.kind == SessionKind::OpenResponse) {
             peer.response_transmissions.fetch_add(1, Ordering::Relaxed);
         }
@@ -1520,10 +1548,16 @@ mod tests {
             let id = session_id(frame.metadata);
             if matches!(frame.metadata,Metadata::Session(m) if m.kind==SessionKind::CloseResponse) {
                 peer.close_replied.notify_one();
+                if let Some(upload) = &peer.upload {
+                    upload.close_origin(id).await;
+                }
                 sessions.remove(&id);
                 continue;
             }
             if matches!(frame.metadata,Metadata::Session(m) if m.kind==SessionKind::OpenRequest) {
+                if let Some(upload) = &peer.upload {
+                    upload.select(id, &packet.remote);
+                }
                 peer.opens.fetch_add(1, Ordering::Relaxed);
                 if peer.stall {
                     continue;
@@ -1567,6 +1601,11 @@ mod tests {
             let Some(state) = sessions.get_mut(&id) else {
                 continue;
             };
+            if let Some(upload) = &peer.upload
+                && upload.drop_or_observe(id, &frame, state.ready)
+            {
+                continue;
+            }
             if let Metadata::Data(metadata) = frame.metadata {
                 state.acknowledge(metadata.unack_sequence, Instant::now());
             }
@@ -1586,6 +1625,9 @@ mod tests {
                         false,
                     )
                     .await?;
+                    if let Some(upload) = &peer.upload {
+                        upload.close_origin(id).await;
+                    }
                     sessions.remove(&id);
                     continue;
                 }
@@ -1677,6 +1719,12 @@ mod tests {
                 }
             }
             if !body.is_empty() {
+                if let Some(upload) = &peer.upload
+                    && upload.is_target(id)
+                {
+                    upload.write_origin(&body).await?;
+                    continue;
+                }
                 let parts: Vec<_> = body.chunks(1000).collect();
                 let mut frames = Vec::new();
                 for part in parts {

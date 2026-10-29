@@ -25,6 +25,10 @@ Windows的UWP/Wintun feature互斥，应明确选择后端，不使用`--all-fea
 
 ## 定向回归
 
+Mieru UDP载体的TCP上传收尾：`outbound::mieru::udp::tests::mieru_udp_upload_`。
+五项纯内存回归使用真实编解码、可靠驱动与有界origin流，覆盖尾包首发成功后丢失、重传后EOF，
+以及待ACK时的Stop、取消shutdown future、同载体兄弟、立即Drop与对端Close；不代签真实TUN交付或RSS。
+
 smux 纯内存边界：`transport::smux::`，覆盖就绪 DATA 的单次 poll 预算、未读流与兄弟流、整帧分配预算、极小合法配额、本地关闭释放和远端 DATA→FIN 顺序。
 调度测试隔离 Tokio 的独立 cooperative allowance；这些测试不代替真实 TUN 性能验证。
 

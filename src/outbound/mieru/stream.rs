@@ -13,7 +13,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
     },
     task::{Context, Poll, Wake, Waker, ready},
     time::Duration,
@@ -38,6 +38,10 @@ pub(super) struct ReceivedChunk {
     pub bytes: Bytes,
     pub permit: OwnedSemaphorePermit,
 }
+const ACK_DRAINED: u8 = 0;
+const ACK_PENDING: u8 = 1;
+const ACK_TERMINAL: u8 = 2;
+
 pub(super) struct State {
     pub id: u32,
     pub(super) business: Business,
@@ -51,6 +55,7 @@ pub(super) struct State {
     input: Mutex<Input>,
     read: AtomicWaker,
     pub write: AtomicWaker,
+    ack_drain: AtomicU8,
     space: Notify,
     pub activity: Arc<Notify>,
     capacity: usize,
@@ -58,6 +63,50 @@ pub(super) struct State {
     _observation: observation::Guard,
 }
 impl State {
+    pub(super) fn mark_ack_pending(&self) {
+        if self.business == Business::TcpConnect {
+            let _ = self.ack_drain.compare_exchange(
+                ACK_DRAINED,
+                ACK_PENDING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    pub(super) fn mark_ack_drained(&self) {
+        if self.business != Business::TcpConnect {
+            return;
+        }
+        if self
+            .ack_drain
+            .compare_exchange(
+                ACK_PENDING,
+                ACK_DRAINED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.write.wake();
+        }
+    }
+
+    pub(super) fn mark_ack_terminal(&self) {
+        if self.ack_drain.swap(ACK_TERMINAL, Ordering::AcqRel) != ACK_TERMINAL {
+            self.write.wake();
+        }
+    }
+
+    fn poll_ack_drain(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.write.register(cx.waker());
+        if self.ack_drain.load(Ordering::Acquire) == ACK_PENDING && !self.cancel.is_cancelled() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+
     #[cfg(test)]
     pub fn new(
         id: u32,
@@ -87,6 +136,7 @@ impl State {
             input: Mutex::new(Input::default()),
             read: AtomicWaker::new(),
             write: AtomicWaker::new(),
+            ack_drain: AtomicU8::new(ACK_DRAINED),
             space: Notify::new(),
             activity,
             capacity,
@@ -95,6 +145,7 @@ impl State {
         })
     }
     pub fn close(&self) {
+        self.mark_ack_terminal();
         self.local_closed.store(true, Ordering::Release);
         self.cancel.cancel();
         let mut input = self.input.lock().unwrap();
@@ -106,6 +157,7 @@ impl State {
         self.activity.notify_one();
     }
     pub fn finish(&self, failure: bool) {
+        self.mark_ack_terminal();
         self.remote_closed.store(true, Ordering::Release);
         let mut input = self.input.lock().unwrap();
         input.failure |= failure;
@@ -359,6 +411,8 @@ impl AsyncWrite for RawStream {
             return Poll::Ready(Ok(()));
         }
         ready!(self.as_mut().poll_flush(cx))?;
+        // Only UDP TCP-business enqueue can leave this per-SID state pending.
+        ready!(self.state.poll_ack_drain(cx));
         self.end();
         Poll::Ready(Ok(()))
     }

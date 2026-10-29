@@ -534,6 +534,41 @@ impl Client {
         setup.0.take(); // Published ownership now belongs to registry/streams.
         Ok(Reservation(carrier))
     }
+    #[cfg(test)]
+    pub(super) fn attach_tcp_stream_for_test(&self) -> io::Result<RawStream> {
+        // Use the real live carrier and production reservation/stream objects;
+        // never let a random new-carrier bucket make sibling isolation pass.
+        if self.registry.lock().unwrap().carriers.len() != 1 {
+            return Err(closed());
+        }
+        let reservation = self
+            .reserve_reusable(Business::TcpConnect, |_| 0)?
+            .ok_or_else(closed)?;
+        let carrier = reservation.0.clone();
+        let state = {
+            let _admission = self.admission.lock().unwrap();
+            if self.cancel.is_cancelled() || carrier.shared.cancel.is_cancelled() {
+                return Err(closed());
+            }
+            let mut sessions = carrier.shared.sessions.lock().unwrap();
+            let mut id = 1_u32;
+            while sessions.contains_key(&id) {
+                id = id.checked_add(1).ok_or_else(closed)?;
+            }
+            let state = State::new_for_business(
+                id,
+                self.capacity,
+                Business::TcpConnect,
+                &carrier.shared.cancel,
+                carrier.shared.activity.clone(),
+            );
+            sessions.insert(id, state.clone());
+            state
+        };
+        drop(reservation);
+        Ok(RawStream::new(carrier, state, self.capacity))
+    }
+
     pub fn begin_shutdown(&self) {
         let _admission = self.admission.lock().unwrap();
         self.cancel.cancel();

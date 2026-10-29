@@ -202,8 +202,8 @@ H2 不消费 congestion-controller。
 `type: mieru` 使用 `outbound-mieru`，底层 transport 必填 TCP 或 UDP，
 两者均承载 TCP 和 `udp: true` 的多目标 UDP Associate。用户名、密码各为1–64 UTF-8字节，
 不 trim；XChaCha20-Poly1305 分段认证使用物理连接建立时的时间派生密钥。
-UDP 载体根据已有低熵编码策略选择 AEAD：启用低熵编码时保留 RustCrypto，
-其余 UDP 载体复用既有 boring 的原位 AEAD；收发方向各独占一个选定的认证上下文。
+UDP 载体发送复用既有 boring 的原位 AEAD；接收在启用低熵编码时保留 RustCrypto，
+其余接收使用 boring。收发方向各独占认证上下文，后端选择不改变低熵编码或协议字节。
 TCP 载体保留 RustCrypto，均使用原 ring PBKDF2 派生规则，不启用 TLS。
 业务目标通过协议内 SOCKS 请求传递，不进行 SOCKS 认证方法协商。
 
@@ -232,7 +232,11 @@ UDP 包解析后由响应持有已验证的接收缓冲，仅移除 SOCKS 首部
 UDP 载体的 UDP Associate 写入在原字节预算与命令 FIFO 准入后返回，不逐包等待首次物理发送。
 同会话仅保留一笔尚未首次发送的逻辑写；下一笔非空写入先等待前一笔完成，空写不作发送屏障。
 显式 flush 和 shutdown 仍等待同会话最新写入的首次发送完成；准入不释放发送许可。
-TCP 业务与 TCP 载体保留原完成边界。
+TCP业务的写入和flush，以及TCP载体的完成边界保持不变。
+UDP 载体的标准握手 TCP CONNECT 流在显式 shutdown 时，先等原首次发送完成，再等本会话
+待确认数据的累计 ACK，随后发送原 Close。flush仍只等待首次发送，不等待整个物理载体。
+对端关闭或底层终止保留原结果；NoWait、UDP Associate、物理TCP、Drop和活动Stop沿原关闭边界，
+不新增ACK等待期限。
 UDP 底层使用可靠会话，提供累计 ACK、重传、有序交付、分片和窗口。
 密钥固定于物理载体，每包使用显式 nonce；重传保留明文，重新生成 nonce 和时间戳。
 收发分别取1400字节 MTU 与真实上游预算的交集。正常接收的应用未读队列与乱序缓存
