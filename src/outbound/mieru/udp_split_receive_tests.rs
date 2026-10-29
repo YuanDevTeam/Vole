@@ -24,6 +24,8 @@ mod split_receive_tests {
         received: Arc<AtomicUsize>,
         closed: Arc<AtomicBool>,
         decoder: PacketDecoder,
+        delay_after_close_reply: Duration,
+        hold_until: Option<Instant>,
     }
 
     #[async_trait]
@@ -41,12 +43,24 @@ mod split_receive_tests {
                 .decoder
                 .decode_frame(packet.payload, super::super::tcp::now().unwrap())
                 .map_err(|_| DispatchError::NotAllowed)?;
+            if matches!(frame.metadata, Metadata::Session(meta)
+                if meta.kind == SessionKind::CloseResponse)
+                && self.hold_until.is_none()
+                && !self.delay_after_close_reply.is_zero()
+            {
+                // First response alone activates the test physical Pending edge.
+                self.hold_until = Some(Instant::now() + self.delay_after_close_reply);
+            }
             self.sent
                 .try_send(frame.metadata)
                 .map_err(|_| DispatchError::NotAllowed)
         }
 
         async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            if let Some(until) = self.hold_until {
+                // Pending cancellation retains the same prequeued DATA.
+                tokio::time::sleep_until(until).await;
+            }
             let packet = self
                 .incoming
                 .recv()
@@ -67,6 +81,7 @@ mod split_receive_tests {
         sent: mpsc::Sender<Metadata>,
         received: Arc<AtomicUsize>,
         closed: Arc<AtomicBool>,
+        delay_after_close_reply: Duration,
     }
 
     #[async_trait]
@@ -101,6 +116,8 @@ mod split_receive_tests {
                 received: self.received.clone(),
                 closed: self.closed.clone(),
                 decoder: PacketDecoder::new(&key, false).map_err(|_| DispatchError::NotAllowed)?,
+                delay_after_close_reply: self.delay_after_close_reply,
+                hold_until: None,
             }))
         }
     }
@@ -119,6 +136,13 @@ mod split_receive_tests {
 
     impl Fixture {
         async fn new(capacity: usize) -> io::Result<Self> {
+            Self::with_close_gate(capacity, super::super::tcp::Business::TcpConnect, Duration::ZERO).await
+        }
+        async fn with_close_gate(
+            capacity: usize,
+            business: super::super::tcp::Business,
+            delay_after_close_reply: Duration,
+        ) -> io::Result<Self> {
             let (incoming, packets) = mpsc::channel(64);
             let (sent, observations) = mpsc::channel(128);
             let received = Arc::new(AtomicUsize::new(0));
@@ -128,6 +152,7 @@ mod split_receive_tests {
                 sent,
                 received: received.clone(),
                 closed: closed.clone(),
+                delay_after_close_reply,
             });
             let mut config = super::super::tests::config(MieruHandshake::NoWait);
             config.address = "192.0.2.1".into();
@@ -145,7 +170,7 @@ mod split_receive_tests {
                 .client
                 .open(
                     super::super::tests::session(),
-                    super::super::tcp::Business::TcpConnect,
+                    business,
                     None,
                     &context,
                 )
@@ -694,4 +719,161 @@ mod split_receive_tests {
         assert!(probe.snapshot().is_idle());
         result.unwrap();
     }
+    async fn grace_read_to_eof(mut fixture: Fixture) -> io::Result<(Vec<u8>, io::Result<usize>)> {
+        let mut raw = fixture.raw.take().unwrap();
+        let mut bytes = Vec::new();
+        let read = tokio::time::timeout(Duration::from_millis(200), raw.read_to_end(&mut bytes)).await;
+        drop(raw);
+        fixture.stop().await?;
+        let read = read.map_err(|_| failed("invalid RED: no real EOF before fixture guard"))?;
+        Ok((bytes, read))
+    }
+    fn grace_read_is_pending(raw: &mut super::super::stream::RawStream) -> io::Result<bool> {
+        let mut storage = [0u8; 16];
+        let mut buffer = tokio::io::ReadBuf::new(&mut storage);
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        match tokio::io::AsyncRead::poll_read(std::pin::Pin::new(raw), &mut cx, &mut buffer) {
+            std::task::Poll::Pending => Ok(true),
+            std::task::Poll::Ready(Ok(())) => Ok(false),
+            std::task::Poll::Ready(Err(error)) => Err(error),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mieru_close_grace_recovers_head_after_original_turn() {
+        let probe = ResourceProbe::default();
+        probe.scope(async {
+            let mut fixture = Fixture::with_close_gate(CAPACITY,
+                super::super::tcp::Business::TcpConnect, Duration::from_millis(10)).await?;
+            fixture.bootstrap().await?;
+            // All DATA exists before Close. Only physical readiness of the head
+            // is delayed, avoiding inject-after-closed errors as a fake RED.
+            fixture.data_bytes(2, b"FUTURE")?;
+            fixture.remote_close(3)?;
+            fixture.data_bytes(1, b"HEAD")?;
+            fixture.data_bytes(3, b"BEYOND-HINT")?;
+            fixture.close_reply().await?;
+            let (bytes, read) = grace_read_to_eof(fixture).await?;
+            read?;
+            // Only actual old-driver EOF/0B is expected assertion RED.
+            assert_eq!(bytes, b"HEADFUTURE");
+            Ok::<_, io::Error>(())
+        }).await.unwrap();
+        assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mieru_close_grace_first_deadline_is_hard_and_duplicates_do_not_extend() {
+        let probe = ResourceProbe::default();
+        probe.scope(async {
+            let mut fixture = Fixture::new(CAPACITY).await?;
+            fixture.bootstrap().await?;
+            fixture.data_bytes(2, b"FUTURE")?;
+            fixture.remote_close(3)?;
+            fixture.close_reply().await?;
+            let closed_at = Instant::now();
+            let mut raw = fixture.raw.take().unwrap();
+            let first_pending = grace_read_is_pending(&mut raw)?;
+            tokio::time::advance(Duration::from_millis(90)).await;
+            fixture.remote_close(3)?;
+            fixture.close_reply().await?;
+            tokio::time::advance(Duration::from_millis(9)).await;
+            let before_deadline_pending = grace_read_is_pending(&mut raw)?;
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let mut bytes = Vec::new();
+            let end = tokio::time::timeout(Duration::from_millis(1), raw.read_to_end(&mut bytes)).await;
+            let elapsed = Instant::now().saturating_duration_since(closed_at);
+            drop(raw);
+            fixture.stop().await?;
+            let end = end.map_err(|_| failed("first 100ms deadline was not observed"))?;
+            end?;
+            assert!(first_pending && before_deadline_pending);
+            assert!(bytes.is_empty());
+            assert!(elapsed >= Duration::from_millis(100) && elapsed < Duration::from_millis(102));
+            Ok::<_, io::Error>(())
+        }).await.unwrap();
+        assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mieru_close_grace_rejects_new_write_without_losing_read() {
+        let probe = ResourceProbe::default();
+        probe.scope(async {
+            let mut fixture = Fixture::with_close_gate(CAPACITY,
+                super::super::tcp::Business::TcpConnect, Duration::from_millis(10)).await?;
+            fixture.bootstrap().await?; // Prior write already physically first-sent.
+            fixture.data_bytes(2, b"FUTURE")?;
+            fixture.remote_close(3)?;
+            fixture.data_bytes(1, b"HEAD")?;
+            fixture.close_reply().await?;
+            let mut raw = fixture.raw.take().unwrap();
+            let write = raw.write_all(b"MUST-NOT-SEND").await;
+            let mut bytes = Vec::new();
+            let read = tokio::time::timeout(Duration::from_millis(200), raw.read_to_end(&mut bytes)).await;
+            drop(raw);
+            let mut new_client_data = false;
+            while let Ok(metadata) = fixture.sent.try_recv() {
+                new_client_data |= matches!(metadata, Metadata::Data(meta) if meta.kind == DataKind::ClientData);
+            }
+            fixture.stop().await?;
+            let read = read.map_err(|_| failed("read was cancelled by rejected write"))?;
+            read?;
+            assert_eq!(write.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            assert!(!new_client_data);
+            assert_eq!(bytes, b"HEADFUTURE");
+            Ok::<_, io::Error>(())
+        }).await.unwrap();
+        assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mieru_close_grace_stop_and_excluded_paths_keep_original_boundaries() {
+        let probe = ResourceProbe::default();
+        probe.scope(async {
+            let mut fixture = Fixture::with_close_gate(CAPACITY,
+                super::super::tcp::Business::TcpConnect, Duration::from_millis(10)).await?;
+            fixture.bootstrap().await?;
+            let _unread = fixture.fill_app().await?;
+            fixture.data_bytes(27, b"FUTURE")?;
+            fixture.remote_close(28)?;
+            fixture.data_bytes(26, b"HEAD")?;
+            fixture.close_reply().await?;
+            let stopped_at = Instant::now();
+            fixture.stop().await?;
+            assert!(Instant::now().saturating_duration_since(stopped_at) < Duration::from_millis(100));
+            for (business, capacity, kind, status) in [
+                (super::super::tcp::Business::TcpConnect, CAPACITY, SessionKind::CloseResponse, 0),
+                (super::super::tcp::Business::TcpConnect, CAPACITY, SessionKind::CloseRequest, 1),
+                (super::super::tcp::Business::UdpAssociate, CAPACITY, SessionKind::CloseRequest, 0),
+                (super::super::tcp::Business::TcpConnect, 64, SessionKind::CloseRequest, 0),
+            ] {
+                let mut fixture = Fixture::with_close_gate(capacity, business, Duration::ZERO).await?;
+                fixture.bootstrap().await?;
+                fixture.data_bytes(2, b"FUTURE")?;
+                fixture.inject(Metadata::Session(SessionMetadata {
+                    kind, session_id: fixture.state.id, sequence: 3, status,
+                }), &[])?;
+                fixture.data_bytes(1, b"HEAD")?;
+                if kind == SessionKind::CloseRequest { fixture.close_reply().await?; }
+                let (bytes, read) = grace_read_to_eof(fixture).await?;
+                assert!(bytes.is_empty());
+                if status != 0 { assert_eq!(read.unwrap_err().kind(), io::ErrorKind::BrokenPipe); }
+                else { read?; }
+            }
+            let mut fixture = Fixture::new(CAPACITY).await?;
+            fixture.bootstrap().await?;
+            fixture.inject(Metadata::Session(SessionMetadata {
+                kind: SessionKind::CloseRequest, session_id: fixture.state.id.wrapping_add(1), sequence: 3, status: 0,
+            }), &[])?;
+            fixture.data_bytes(1, b"HEAD")?;
+            fixture.remote_close(2)?;
+            fixture.close_reply().await?;
+            let (bytes, read) = grace_read_to_eof(fixture).await?;
+            read?;
+            assert_eq!(bytes, b"HEAD");
+            Ok::<_, io::Error>(())
+        }).await.unwrap();
+        assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
+    }
+
 }

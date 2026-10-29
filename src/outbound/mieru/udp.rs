@@ -39,6 +39,7 @@ const SEGMENTS: usize = 4096;
 const TX_LIMIT: u32 = 20;
 const ACK_DELAY: Duration = Duration::from_millis(1);
 const FIRST_CHECK: Duration = Duration::from_millis(10);
+const CLOSE_RECEIVE_GRACE: Duration = Duration::from_millis(100);
 const RECEIVE_BATCH: u8 = 8;
 const OUTPUT_QUANTUM: usize = 8;
 const REORDER_SLACK: usize = 32768;
@@ -92,6 +93,11 @@ struct PacketPattern<'a> {
     remaining: usize,
     truncated: bool,
 }
+#[derive(Clone, Copy)]
+struct CloseGrace {
+    end: u32,
+    until: Instant,
+}
 struct Reliable {
     state: Arc<State>,
     pending: VecDeque<Segment>,
@@ -115,6 +121,8 @@ struct Reliable {
     // A remote Close must not truncate the one already authenticated packet
     // being delivered through a smaller application byte budget.
     remote_close: Option<bool>,
+    // Fixed in-flight DATA opportunity, never a reliable FIN or added credit.
+    close_grace: Option<CloseGrace>,
 }
 fn heartbeat_interval() -> Duration {
     Duration::from_millis(4000 + rand::random_range(0..=2000u64))
@@ -171,6 +179,7 @@ impl Reliable {
             last_window: 0,
             receive_chunk,
             remote_close: None,
+            close_grace: None,
         }
     }
     fn small_budget(&self) -> bool {
@@ -291,7 +300,14 @@ impl Reliable {
         }
     }
     fn input(&mut self, frame: Frame, now: Instant, partial: &mut Option<Partial>) {
-        if self.remote_close.is_some() {
+        if self.remote_close.is_some()
+            && !(self.close_grace.is_some_and(|grace| {
+                now < grace.until
+                    && matches!(frame.metadata, Metadata::Data(meta)
+                        if meta.kind == DataKind::ServerData && meta.sequence < grace.end)
+            }) && !self.state.cancel.is_cancelled()
+                && !self.state.local_closed.load(Ordering::Acquire))
+        {
             return;
         }
         if let Metadata::Data(meta) = frame.metadata {
@@ -446,10 +462,23 @@ impl Reliable {
             true
         });
     }
+    fn converge_close_grace(&mut self, now: Instant) {
+        if self.close_grace.is_some_and(|grace| {
+            now >= grace.until
+                || self.state.next_receive.load(Ordering::Acquire) >= grace.end
+                || self.state.cancel.is_cancelled()
+                || self.state.local_closed.load(Ordering::Acquire)
+        }) {
+            // Clear before app-prefix draining: a blocked app may not keep
+            // choosing an expired deadline in a busy loop.
+            self.close_grace = None;
+            self.retain_contiguous_on_close();
+        }
+    }
     fn next_deadline(&self, now: Instant) -> Instant {
         let mut next = now + Duration::from_secs(5);
         if self.remote_close.is_some() {
-            return next;
+            return self.close_grace.map_or(next, |grace| next.min(grace.until));
         }
         if let Some(first) = self.first_check {
             next = next.min(first);
@@ -853,6 +882,8 @@ async fn input_packet(
                     SessionKind::CloseRequest | SessionKind::CloseResponse
                 ) =>
             {
+                // Anchor before the original timely response send; never renew.
+                let received_at = Instant::now();
                 if meta.kind == SessionKind::CloseRequest {
                     let metadata = close_metadata(&state.state, SessionKind::CloseResponse);
                     send(
@@ -878,13 +909,32 @@ async fn input_packet(
                     state.outstanding.clear();
                     state.reorder.clear();
                 } else if !state.small_budget() {
+                    let first_close = state.remote_close.is_none();
+                    let normal_tcp_request = meta.kind == SessionKind::CloseRequest
+                        && meta.status == 0
+                        && state.state.business == super::tcp::Business::TcpConnect
+                        && state.established
+                        && !state.state.cancel.is_cancelled()
+                        && !state.state.local_closed.load(Ordering::Acquire);
+                    // Keep the original TX gate closed during RX grace.
                     state.remote_close =
                         Some(state.remote_close.unwrap_or(false) || meta.status != 0);
                     state.pending.clear();
                     state.outstanding.clear();
-                    // Preserve only the accepted contiguous prefix. A gap
-                    // cannot be repaired after the peer has closed.
-                    state.retain_contiguous_on_close();
+                    if first_close
+                        && normal_tcp_request
+                        && meta.sequence > state.state.next_receive.load(Ordering::Acquire)
+                    {
+                        state.close_grace = Some(CloseGrace {
+                            end: meta.sequence,
+                            until: received_at + CLOSE_RECEIVE_GRACE,
+                        });
+                    } else if !normal_tcp_request {
+                        state.close_grace = None;
+                    }
+                    if state.close_grace.is_none() {
+                        state.retain_contiguous_on_close();
+                    }
                 } else {
                     state.state.finish(meta.status != 0);
                     sessions.remove(&id);
@@ -1033,7 +1083,17 @@ async fn run(
         if shared.clean() {
             return Ok(());
         }
-        let mut ids: Vec<_> = sessions.keys().copied().collect();
+        // Reuse the ID scan with fresh post-await time, before OUTPUT_QUANTUM
+        // can stop the following loop. No new timer task or receive budget.
+        let mut ids: Vec<_> = sessions
+            .iter_mut()
+            .map(|(id, state)| {
+                if state.close_grace.is_some() {
+                    state.converge_close_grace(Instant::now());
+                }
+                *id
+            })
+            .collect();
         if let Some(last) = last_output {
             let first = ids.partition_point(|id| *id <= last);
             ids.rotate_left(first);
@@ -1071,9 +1131,13 @@ async fn run(
                 state.request_ack(Instant::now());
             }
             if let Some(failure) = state.remote_close {
-                // finish cancels State and excludes it from carrier liveness.
-                // Defer it until retained normal DATA has entered the app queue.
-                if !state.small_budget() && state.reorder.is_empty() {
+                if state.close_grace.is_some() {
+                    // App space may have let deliver_contiguous reach the hint.
+                    state.converge_close_grace(Instant::now());
+                }
+                // Only the original accepted app prefix may outlive the grace.
+                if state.close_grace.is_none() && !state.small_budget() && state.reorder.is_empty()
+                {
                     state.state.finish(failure);
                     sessions.remove(&id);
                     shared.sessions.lock().unwrap().remove(&id);
