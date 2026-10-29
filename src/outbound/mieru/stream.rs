@@ -352,11 +352,11 @@ impl AsyncWrite for RawStream {
                 _ => Poll::Ready(Ok(0)),
             };
         }
-        // Admit at most two queued writes before observing the latest first-send.
+        // Admit at most four queued writes before observing the latest first-send.
         // Always propagate a ready error, including while the burst has room.
         match latest {
             Poll::Ready(result) => result?,
-            Poll::Pending if self.queued_writes && self.queued_admissions < 2 => {}
+            Poll::Pending if self.queued_writes && self.queued_admissions < 4 => {}
             Poll::Pending => return Poll::Pending,
         }
         if self.pending.is_none() {

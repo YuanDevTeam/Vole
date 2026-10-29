@@ -2516,6 +2516,7 @@ mod tests {
     struct LookaheadPackets {
         decoder: PacketDecoder,
         frames: Vec<Frame>,
+        latest: Option<oneshot::Receiver<io::Result<()>>>,
     }
     #[async_trait]
     impl DatagramTransport for LookaheadPackets {
@@ -2523,6 +2524,12 @@ mod tests {
             false
         }
         async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
+            if let Some(latest) = self.latest.as_mut() {
+                assert!(
+                    matches!(latest.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                    "latest cannot complete before its final physical fragment is sent"
+                );
+            }
             self.frames.push(
                 self.decoder
                     .decode_frame(packet.payload, super::super::tcp::now().unwrap())
@@ -2557,25 +2564,43 @@ mod tests {
             response,
         )
     }
+
     #[tokio::test(start_paused = true)]
-    async fn mieru_udp_admission_depth2_latest_first_send_covers_older_actual_fifo_fragments() {
+    async fn mieru_udp_admission_depth4_latest_first_send_covers_older_actual_fifo_fragments() {
         let shared = Shared::output_test_shared(CancellationToken::new());
         let state = State::new_for_business(
             7,
-            16,
+            32768,
             super::super::tcp::Business::UdpAssociate,
             &shared.cancel,
             shared.activity.clone(),
         );
         state.opened.store(true, Ordering::Release);
         shared.sessions.lock().unwrap().insert(7, state.clone());
-        let credit = Arc::new(Semaphore::new(16));
-        let (first, older) = lookahead_command(&state, &credit, b"AAAA");
-        let (second, mut latest) = lookahead_command(&state, &credit, b"BBBB");
-        drop(older); // RawStream depth2 replaces this witness after second admission.
+        let credit = Arc::new(Semaphore::new(32768));
+        let (writer, mut commands) = mpsc::channel(2);
+        assert_eq!(writer.max_capacity(), 2);
+        assert_eq!(OUTPUT_QUANTUM, 8);
+        const DATA: [&[u8]; 4] = [&[b'A'; 1214], &[b'B'; 1214], &[b'C'; 1214], &[b'D'; 1214]];
         let mut sessions = BTreeMap::new();
-        input_command(first, &mut sessions, 2, 4, false);
-        input_command(second, &mut sessions, 2, 4, false);
+        let mut latest = None;
+        for data in DATA {
+            let (command, completion) = lookahead_command(&state, &credit, data);
+            writer.try_send(command).unwrap();
+            latest = Some(completion); // Drop old witnesses, never their byte permits.
+            if writer.capacity() == 0 {
+                for _ in 0..2 {
+                    input_command(
+                        commands.try_recv().unwrap(),
+                        &mut sessions,
+                        656,
+                        1312,
+                        false,
+                    );
+                }
+            }
+        }
+        assert!(commands.try_recv().is_err());
         let reliable = sessions.get_mut(&7).unwrap();
         reliable.established = true;
         let key = crypto::derive_packet_key(
@@ -2587,6 +2612,7 @@ mod tests {
         let mut packets = LookaheadPackets {
             decoder: PacketDecoder::new(&key, false).unwrap(),
             frames: Vec::new(),
+            latest,
         };
         let pattern =
             EffectivePattern::compile(None, super::super::pattern::HostProfile::capture(), "vole")
@@ -2596,56 +2622,51 @@ mod tests {
             pattern: &pattern,
             nonce: NonceState::new(),
             wire_budget: usize::from(MTU),
-            remaining: 1,
+            remaining: OUTPUT_QUANTUM,
             truncated: false,
         };
-        let mut buffer = Vec::new();
-        for index in 0..4 {
-            patterned.remaining = 1;
-            patterned.truncated = false;
-            assert!(
-                output(
-                    &mut packets,
-                    &peer,
-                    &mut encoder,
-                    "vole",
-                    &shared,
-                    &mut patterned,
-                    reliable,
-                    true,
-                    &mut buffer
-                )
-                .await
-                .unwrap()
-            );
-            assert_eq!(packets.frames.len(), index + 1);
-            if index < 3 {
-                assert!(matches!(
-                    latest.try_recv(),
-                    Err(oneshot::error::TryRecvError::Empty)
-                ));
-            }
-        }
-        latest.try_recv().unwrap().unwrap();
+        assert!(
+            output(
+                &mut packets,
+                &peer,
+                &mut encoder,
+                "vole",
+                &shared,
+                &mut patterned,
+                reliable,
+                true,
+                &mut Vec::new()
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(packets.frames.len(), OUTPUT_QUANTUM);
+        assert_eq!(patterned.remaining, 0);
+        packets
+            .latest
+            .as_mut()
+            .unwrap()
+            .try_recv()
+            .unwrap()
+            .unwrap();
         let mut payload = Vec::new();
         for (sequence, frame) in packets.frames.iter().enumerate() {
-            assert!(
-                matches!(frame.metadata, Metadata::Data(meta) if meta.session_id == 7 && meta.sequence == sequence as u32)
-            );
+            assert!(matches!(frame.metadata, Metadata::Data(meta)
+                if meta.session_id == 7 && meta.sequence == sequence as u32 && meta.fragment == (1 - sequence % 2) as u8));
             payload.extend_from_slice(&frame.payload);
         }
-        assert_eq!(payload, b"AAAABBBB");
+        assert_eq!(payload, DATA.concat());
         assert_eq!(
             credit.available_permits(),
-            8,
-            "first-send is not ACK/credit release"
+            32768 - 4 * 1214,
+            "first-send does not release ACK-owned credit"
         );
-        reliable.acknowledge(4, 16, false, Instant::now());
-        assert_eq!(credit.available_permits(), 16);
+        reliable.acknowledge(8, 16, false, Instant::now());
+        assert_eq!(credit.available_permits(), 32768);
         state.close();
     }
     #[tokio::test(start_paused = true)]
-    async fn mieru_udp_admission_depth2_deferred_close_rejects_latest_without_immediate_state_cancel()
+    async fn mieru_udp_admission_depth4_deferred_close_rejects_latest_without_immediate_state_cancel()
      {
         let shared = Shared::output_test_shared(CancellationToken::new());
         let state = State::new_for_business(
@@ -2657,10 +2678,12 @@ mod tests {
         );
         state.opened.store(true, Ordering::Release);
         shared.sessions.lock().unwrap().insert(7, state.clone());
-        let credit = Arc::new(Semaphore::new(16));
+        let credit = Arc::new(Semaphore::new(32));
         let (first, older) = lookahead_command(&state, &credit, b"AAAA");
-        let (second, mut latest) = lookahead_command(&state, &credit, b"BBBB");
-        drop(older);
+        let (second, second_done) = lookahead_command(&state, &credit, b"BBBB");
+        let (third, third_done) = lookahead_command(&state, &credit, b"CCCC");
+        let (fourth, mut latest) = lookahead_command(&state, &credit, b"DDDD");
+        drop((older, second_done, third_done));
         let mut sessions = BTreeMap::new();
         input_command(first, &mut sessions, 2, 4, false);
         let mut partial = None;
@@ -2700,6 +2723,7 @@ mod tests {
         let mut packets = LookaheadPackets {
             decoder: PacketDecoder::new(&key, false).unwrap(),
             frames: Vec::new(),
+            latest: None,
         };
         let pattern =
             EffectivePattern::compile(None, super::super::pattern::HostProfile::capture(), "vole")
@@ -2766,6 +2790,12 @@ mod tests {
             Err(oneshot::error::TryRecvError::Empty)
         ));
         input_command(second, &mut sessions, 2, 4, false);
+        input_command(third, &mut sessions, 2, 4, false);
+        assert!(matches!(
+            latest.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        input_command(fourth, &mut sessions, 2, 4, false);
         assert!(
             matches!(latest.try_recv().unwrap(), Err(error) if error.kind() == io::ErrorKind::BrokenPipe)
         );
@@ -2773,7 +2803,7 @@ mod tests {
             !state.cancel.is_cancelled(),
             "the retained latest itself propagates this rejection"
         );
-        assert_eq!(credit.available_permits(), 16);
+        assert_eq!(credit.available_permits(), 32);
         state.close();
     }
 }
