@@ -370,9 +370,14 @@ async fn drive(
             crate::limits::TUIC_QUIC_PAYLOAD as u16,
             crate::limits::TUIC_QUIC_PAYLOAD as u16,
         );
-        let raw = upstream
-            .open_datagram(DatagramRequest::new(datagram).with_budget(budget), &context)
-            .await?;
+        let request = DatagramRequest::new(datagram).with_budget(budget);
+        let request =
+            if config.udp_mode == crate::config::TuicUdpMode::Native && !config.udp_over_stream {
+                request.with_udp_receive_buffer_size(512 * 1024)
+            } else {
+                request
+            };
+        let raw = upstream.open_datagram(request, &context).await?;
         let (socket, owned) = quic::attach_quinn(raw, peer, budget).await?;
         driver = Some(owned);
         let mtu = socket.budget().quic_payload_limit()?;

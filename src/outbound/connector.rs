@@ -503,7 +503,11 @@ impl DatagramRequest {
 
     /// Best-effort hint for a locally owned physical UDP socket.
     /// This is independent of logical payload and receive credit limits.
-    #[cfg(any(feature = "outbound-mieru", feature = "outbound-hysteria2"))]
+    #[cfg(any(
+        feature = "outbound-mieru",
+        feature = "outbound-hysteria2",
+        feature = "outbound-tuic"
+    ))]
     pub(crate) fn with_udp_receive_buffer_size(&self, size: usize) -> Self {
         let mut request = self.clone();
         request.udp_receive_buffer_size = Some(size);
@@ -1698,7 +1702,11 @@ proxy-groups:
         );
         let request = DatagramRequest::new(session);
         assert_eq!(request.udp_socket_options().receive_buffer, None);
-        #[cfg(any(feature = "outbound-mieru", feature = "outbound-hysteria2"))]
+        #[cfg(any(
+            feature = "outbound-mieru",
+            feature = "outbound-hysteria2",
+            feature = "outbound-tuic"
+        ))]
         {
             let request = request.with_udp_receive_buffer_size(512 * 1024);
             for adjusted in [
