@@ -270,6 +270,7 @@ pub(super) struct RawStream {
     pending: Option<BoxFuture<'static, io::Result<WriteReady>>>,
     queued_writes: bool,
     latest: Option<oneshot::Receiver<io::Result<()>>>,
+    queued_admissions: u8,
     chunk: usize,
     ended: bool,
 }
@@ -282,6 +283,7 @@ impl RawStream {
             pending: None,
             queued_writes: false,
             latest: None,
+            queued_admissions: 0,
             chunk,
             ended: false,
         }
@@ -296,11 +298,15 @@ impl RawStream {
         };
         let result = ready!(std::future::Future::poll(Pin::new(latest), cx));
         self.latest = None;
+        self.queued_admissions = 0;
         Poll::Ready(result.map_err(|_| closed()).and_then(|result| result))
     }
     fn accept_write(&mut self, result: io::Result<WriteReady>) -> io::Result<usize> {
         let (count, latest) = result?;
         // A later write's final first-send covers older same-SID FIFO writes.
+        if latest.is_some() {
+            self.queued_admissions += 1;
+        }
         self.latest = latest;
         Ok(count)
     }
@@ -346,8 +352,13 @@ impl AsyncWrite for RawStream {
                 _ => Poll::Ready(Ok(0)),
             };
         }
-        // Keep one first-send lookahead per source, within the existing budget.
-        ready!(latest)?;
+        // Admit at most two queued writes before observing the latest first-send.
+        // Always propagate a ready error, including while the burst has room.
+        match latest {
+            Poll::Ready(result) => result?,
+            Poll::Pending if self.queued_writes && self.queued_admissions < 2 => {}
+            Poll::Pending => return Poll::Pending,
+        }
         if self.pending.is_none() {
             let count = bytes.len().min(self.chunk);
             let data = Bytes::copy_from_slice(&bytes[..count]);

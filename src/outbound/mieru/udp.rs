@@ -2511,6 +2511,271 @@ mod tests {
         drop(reliable);
         drop(state);
     }
+    // These tests use the actual reliable writer/output and Close rejection paths.
+    // Replaced completion receivers own no payload credit and are not cancellation.
+    struct LookaheadPackets {
+        decoder: PacketDecoder,
+        frames: Vec<Frame>,
+    }
+    #[async_trait]
+    impl DatagramTransport for LookaheadPackets {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+        async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
+            self.frames.push(
+                self.decoder
+                    .decode_frame(packet.payload, super::super::tcp::now().unwrap())
+                    .map_err(|_| DispatchError::NotAllowed)?,
+            );
+            Ok(())
+        }
+        async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            std::future::pending().await
+        }
+        async fn close(&mut self) -> Result<(), DispatchError> {
+            Ok(())
+        }
+    }
+    fn lookahead_command(
+        state: &Arc<State>,
+        credit: &Arc<Semaphore>,
+        data: &'static [u8],
+    ) -> (WriterCommand, oneshot::Receiver<io::Result<()>>) {
+        let (done, response) = oneshot::channel();
+        (
+            WriterCommand {
+                state: state.clone(),
+                data: Bytes::from_static(data),
+                piggyback: false,
+                done,
+                _bytes: credit
+                    .clone()
+                    .try_acquire_many_owned(data.len() as u32)
+                    .unwrap(),
+            },
+            response,
+        )
+    }
+    #[tokio::test(start_paused = true)]
+    async fn mieru_udp_admission_depth2_latest_first_send_covers_older_actual_fifo_fragments() {
+        let shared = Shared::output_test_shared(CancellationToken::new());
+        let state = State::new_for_business(
+            7,
+            16,
+            super::super::tcp::Business::UdpAssociate,
+            &shared.cancel,
+            shared.activity.clone(),
+        );
+        state.opened.store(true, Ordering::Release);
+        shared.sessions.lock().unwrap().insert(7, state.clone());
+        let credit = Arc::new(Semaphore::new(16));
+        let (first, older) = lookahead_command(&state, &credit, b"AAAA");
+        let (second, mut latest) = lookahead_command(&state, &credit, b"BBBB");
+        drop(older); // RawStream depth2 replaces this witness after second admission.
+        let mut sessions = BTreeMap::new();
+        input_command(first, &mut sessions, 2, 4, false);
+        input_command(second, &mut sessions, 2, 4, false);
+        let reliable = sessions.get_mut(&7).unwrap();
+        reliable.established = true;
+        let key = crypto::derive_packet_key(
+            "vole",
+            "fixture-password",
+            super::super::tcp::now().unwrap(),
+        );
+        let mut encoder = PacketEncoder::new(&key, false).unwrap();
+        let mut packets = LookaheadPackets {
+            decoder: PacketDecoder::new(&key, false).unwrap(),
+            frames: Vec::new(),
+        };
+        let pattern =
+            EffectivePattern::compile(None, super::super::pattern::HostProfile::capture(), "vole")
+                .unwrap();
+        let peer = Destination::Ip("192.0.2.1:2000".parse().unwrap());
+        let mut patterned = PacketPattern {
+            pattern: &pattern,
+            nonce: NonceState::new(),
+            wire_budget: usize::from(MTU),
+            remaining: 1,
+            truncated: false,
+        };
+        let mut buffer = Vec::new();
+        for index in 0..4 {
+            patterned.remaining = 1;
+            patterned.truncated = false;
+            assert!(
+                output(
+                    &mut packets,
+                    &peer,
+                    &mut encoder,
+                    "vole",
+                    &shared,
+                    &mut patterned,
+                    reliable,
+                    true,
+                    &mut buffer
+                )
+                .await
+                .unwrap()
+            );
+            assert_eq!(packets.frames.len(), index + 1);
+            if index < 3 {
+                assert!(matches!(
+                    latest.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+            }
+        }
+        latest.try_recv().unwrap().unwrap();
+        let mut payload = Vec::new();
+        for (sequence, frame) in packets.frames.iter().enumerate() {
+            assert!(
+                matches!(frame.metadata, Metadata::Data(meta) if meta.session_id == 7 && meta.sequence == sequence as u32)
+            );
+            payload.extend_from_slice(&frame.payload);
+        }
+        assert_eq!(payload, b"AAAABBBB");
+        assert_eq!(
+            credit.available_permits(),
+            8,
+            "first-send is not ACK/credit release"
+        );
+        reliable.acknowledge(4, 16, false, Instant::now());
+        assert_eq!(credit.available_permits(), 16);
+        state.close();
+    }
+    #[tokio::test(start_paused = true)]
+    async fn mieru_udp_admission_depth2_deferred_close_rejects_latest_without_immediate_state_cancel()
+     {
+        let shared = Shared::output_test_shared(CancellationToken::new());
+        let state = State::new_for_business(
+            7,
+            8,
+            super::super::tcp::Business::UdpAssociate,
+            &shared.cancel,
+            shared.activity.clone(),
+        );
+        state.opened.store(true, Ordering::Release);
+        shared.sessions.lock().unwrap().insert(7, state.clone());
+        let credit = Arc::new(Semaphore::new(16));
+        let (first, older) = lookahead_command(&state, &credit, b"AAAA");
+        let (second, mut latest) = lookahead_command(&state, &credit, b"BBBB");
+        drop(older);
+        let mut sessions = BTreeMap::new();
+        input_command(first, &mut sessions, 2, 4, false);
+        let mut partial = None;
+        state
+            .deliver(Bytes::from_static(b"12345678"))
+            .await
+            .unwrap();
+        let reliable = sessions.get_mut(&7).unwrap();
+        reliable.established = true;
+        reliable.input(
+            Frame {
+                metadata: Metadata::Data(DataMetadata {
+                    kind: DataKind::ServerData,
+                    session_id: 7,
+                    sequence: 0,
+                    unack_sequence: 0,
+                    window: 16,
+                    fragment: 0,
+                }),
+                payload: Bytes::from_static(b"tail"),
+            },
+            Instant::now(),
+            &mut partial,
+        );
+        assert_eq!(
+            reliable.reorder.len(),
+            1,
+            "application credit forces the accepted tail to remain"
+        );
+        let key = crypto::derive_packet_key(
+            "vole",
+            "fixture-password",
+            super::super::tcp::now().unwrap(),
+        );
+        let mut encoder = PacketEncoder::new(&key, false).unwrap();
+        let mut decoder = PacketDecoder::new(&key, false).unwrap();
+        let mut packets = LookaheadPackets {
+            decoder: PacketDecoder::new(&key, false).unwrap(),
+            frames: Vec::new(),
+        };
+        let pattern =
+            EffectivePattern::compile(None, super::super::pattern::HostProfile::capture(), "vole")
+                .unwrap();
+        let peer = Destination::Ip("192.0.2.1:2000".parse().unwrap());
+        let mut patterned = PacketPattern {
+            pattern: &pattern,
+            nonce: NonceState::new(),
+            wire_budget: usize::from(MTU),
+            remaining: OUTPUT_QUANTUM,
+            truncated: false,
+        };
+        let mut wire = Vec::new();
+        PacketEncoder::new(&key, false)
+            .unwrap()
+            .encode_frame(
+                Metadata::Session(SessionMetadata {
+                    kind: SessionKind::CloseRequest,
+                    session_id: 7,
+                    sequence: 1,
+                    status: 0,
+                }),
+                &[],
+                Padding {
+                    prefix: &[],
+                    suffix: &[],
+                },
+                rand::random(),
+                super::super::tcp::now().unwrap(),
+                &mut wire,
+            )
+            .unwrap();
+        assert!(
+            input_packet(
+                Datagram {
+                    remote: peer.clone(),
+                    payload: Bytes::from(wire),
+                    sniffed_domain: None
+                },
+                &mut packets,
+                &peer,
+                DatagramBudget::new(MTU, MTU),
+                &mut encoder,
+                &mut decoder,
+                "vole",
+                &shared,
+                &mut patterned,
+                &mut sessions,
+                &mut partial,
+                &mut Vec::new()
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(sessions[&7].remote_close, Some(false));
+        assert_eq!(sessions[&7].reorder.len(), 1);
+        assert!(
+            !state.cancel.is_cancelled(),
+            "Close defers State.finish until the accepted tail is delivered"
+        );
+        assert!(sessions[&7].pending.is_empty());
+        assert!(matches!(
+            latest.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        input_command(second, &mut sessions, 2, 4, false);
+        assert!(
+            matches!(latest.try_recv().unwrap(), Err(error) if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+        assert!(
+            !state.cancel.is_cancelled(),
+            "the retained latest itself propagates this rejection"
+        );
+        assert_eq!(credit.available_permits(), 16);
+        state.close();
+    }
 }
 
 #[cfg(test)]

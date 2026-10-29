@@ -91,7 +91,18 @@ fn fixture_chunk(
     Arc<Semaphore>,
 ) {
     let shared = Shared::output_test_shared(CancellationToken::new());
-    let state = State::new(7, capacity, &shared.cancel, shared.activity.clone());
+    let business = if queued {
+        Business::UdpAssociate
+    } else {
+        Business::TcpConnect
+    };
+    let state = State::new_for_business(
+        7,
+        capacity,
+        business,
+        &shared.cancel,
+        shared.activity.clone(),
+    );
     shared.sessions.lock().unwrap().insert(7, state.clone());
     let (writer, commands) = mpsc::channel(WRITER_COMMANDS);
     let bytes = Arc::new(Semaphore::new(capacity));
@@ -119,49 +130,45 @@ async fn mieru_udp_admission_latest_first_send_barrier_and_byte_ownership() {
     let wake = Arc::new(WakeCount::default());
     let waker = Waker::from(wake.clone());
     let mut cx = Context::from_waker(&waker);
-    let mut writing = Box::pin(raw.write_all(b"AAAA"));
-    assert!(matches!(
-        writing.as_mut().poll(&mut cx),
-        Poll::Ready(Ok(()))
-    ));
-    drop(writing);
+    bounded(raw.write_all(b"AAAA")).await.unwrap();
     let first = commands.try_recv().unwrap();
+    bounded(raw.write_all(b"BBBB")).await.unwrap();
+    let second = commands.try_recv().unwrap();
     assert_eq!(&first.data[..], b"AAAA");
-    assert_eq!(credit.available_permits(), 12);
-    let mut next = Box::pin(raw.write_all(b"BBBB"));
-    assert!(
-        next.as_mut().poll(&mut cx).is_pending(),
-        "a second write must wait for the previous first-send"
-    );
+    assert_eq!(&second.data[..], b"BBBB");
+    assert_eq!(credit.available_permits(), 8);
+    let mut next = Box::pin(raw.write_all(b"CCCC"));
+    assert!(next.as_mut().poll(&mut cx).is_pending());
     assert!(matches!(
         commands.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
     assert_eq!(
         credit.available_permits(),
-        12,
-        "no new payload permit before the first-send boundary"
+        8,
+        "third write takes no extra credit before its barrier"
     );
-    let wakes = wake.0.load(Ordering::Relaxed);
     let first_permit = first_sent(first);
+    assert!(
+        next.as_mut().poll(&mut cx).is_pending(),
+        "burst gate conservatively waits for latest, not the replaced witness"
+    );
+    assert_eq!(credit.available_permits(), 8);
+    let wakes = wake.0.load(Ordering::Relaxed);
+    let second_permit = first_sent(second);
     assert!(wake.0.load(Ordering::Relaxed) > wakes);
     assert!(matches!(next.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
     drop(next);
-    let second = commands.try_recv().unwrap();
-    assert_eq!(&second.data[..], b"BBBB");
-    assert_eq!(credit.available_permits(), 8);
+    let third = commands.try_recv().unwrap();
+    assert_eq!(&third.data[..], b"CCCC");
+    assert_eq!(credit.available_permits(), 4);
     let mut flushing = Box::pin(raw.flush());
-    assert!(
-        flushing.as_mut().poll(&mut cx).is_pending(),
-        "flush still waits for the newly admitted write"
-    );
+    assert!(flushing.as_mut().poll(&mut cx).is_pending());
     drop(flushing);
     let mut shutdown = Box::pin(raw.shutdown());
     assert!(shutdown.as_mut().poll(&mut cx).is_pending());
     assert!(!state.local_closed.load(Ordering::Acquire));
-    let wakes = wake.0.load(Ordering::Relaxed);
-    let second_permit = first_sent(second);
-    assert!(wake.0.load(Ordering::Relaxed) > wakes);
+    let third_permit = first_sent(third);
     assert!(matches!(
         shutdown.as_mut().poll(&mut cx),
         Poll::Ready(Ok(()))
@@ -170,11 +177,66 @@ async fn mieru_udp_admission_latest_first_send_barrier_and_byte_ownership() {
     assert!(state.local_closed.load(Ordering::Acquire));
     assert_eq!(
         credit.available_permits(),
-        8,
-        "first-send and shutdown do not release actor-owned payload credit"
+        4,
+        "first-send and shutdown keep actor-owned payload credit"
     );
     bounded(raw.shutdown()).await.unwrap();
-    drop((first_permit, second_permit));
+    drop((first_permit, second_permit, third_permit));
+    assert_eq!(credit.available_permits(), 16);
+}
+
+#[tokio::test]
+async fn mieru_udp_admission_depth2_never_bypasses_a_ready_first_send_error() {
+    for dropped in [false, true] {
+        let (mut raw, mut commands, state, credit) = fixture(true, 16);
+        bounded(raw.write_all(b"AAAA")).await.unwrap();
+        let WriterCommand { done, _bytes, .. } = commands.try_recv().unwrap();
+        if dropped {
+            drop(done);
+        } else {
+            done.send(Err(io::ErrorKind::TimedOut.into())).unwrap();
+        }
+        let mut cx = Context::from_waker(Waker::noop());
+        let result = Pin::new(&mut raw).poll_write(&mut cx, b"B");
+        assert!(
+            matches!(result, Poll::Ready(Err(error)) if error.kind() == if dropped { io::ErrorKind::BrokenPipe } else { io::ErrorKind::TimedOut })
+        );
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(credit.available_permits(), 12);
+        state.close();
+        drop(_bytes);
+        assert_eq!(credit.available_permits(), 16);
+    }
+}
+
+#[tokio::test]
+async fn mieru_udp_admission_depth2_state_failure_wakes_without_releasing_actor_credit() {
+    let (mut raw, mut commands, state, credit) = fixture(true, 16);
+    bounded(raw.write_all(b"AAAA")).await.unwrap();
+    bounded(raw.write_all(b"BBBB")).await.unwrap();
+    let first = commands.try_recv().unwrap();
+    let second = commands.try_recv().unwrap();
+    let wake = Arc::new(WakeCount::default());
+    let waker = Waker::from(wake.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut third = Box::pin(raw.write_all(b"C"));
+    assert!(third.as_mut().poll(&mut cx).is_pending());
+    let before = wake.0.load(Ordering::Relaxed);
+    state.finish(true); // The actual Shared::fail / driver-failure State seam.
+    assert!(wake.0.load(Ordering::Relaxed) > before);
+    assert!(matches!(third.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+    drop(third);
+    assert!(bounded(raw.flush()).await.is_err());
+    assert!(bounded(raw.shutdown()).await.is_err());
+    assert!(matches!(
+        Pin::new(&mut raw).poll_write(&mut cx, &[]),
+        Poll::Ready(Err(_))
+    ));
+    assert_eq!(credit.available_permits(), 8);
+    drop((raw, first, second, commands));
     assert_eq!(credit.available_permits(), 16);
 }
 
@@ -203,13 +265,24 @@ async fn mieru_udp_admission_classic_write_and_budget_cancel_keep_original_bound
         let capacity = if complete_first { 4 } else { 16 };
         let (mut raw, mut commands, state, credit) = fixture(true, capacity);
         bounded(raw.write_all(b"AAAA")).await.unwrap();
-        let mut retained = Some(commands.try_recv().unwrap());
-        let retained_permit = complete_first.then(|| first_sent(retained.take().unwrap()));
-        assert_eq!(credit.available_permits(), capacity - 4);
+        let first = commands.try_recv().unwrap();
+        let (mut retained, retained_permit) = if complete_first {
+            (Vec::new(), Some(first_sent(first)))
+        } else {
+            (vec![first], None)
+        };
+        if !complete_first {
+            bounded(raw.write_all(b"BBBB")).await.unwrap();
+            retained.push(commands.try_recv().unwrap());
+        }
+        assert_eq!(
+            credit.available_permits(),
+            capacity - if complete_first { 4 } else { 8 }
+        );
         let mut blocked = Box::pin(raw.write_all(b"B"));
         assert!(
             blocked.as_mut().poll(&mut cx).is_pending(),
-            "block at latest with free bytes, or original budget after first-send"
+            "block at depth2 latest with free bytes, or original budget after first-send"
         );
         assert!(matches!(
             commands.try_recv(),
@@ -242,7 +315,7 @@ async fn mieru_udp_admission_packet_send_cancel_never_reuses_a_partial_record() 
     let credit = Arc::new(Semaphore::new(128));
     let (writer, mut commands) = mpsc::channel(WRITER_COMMANDS);
     // Another logical source fills the original FIFO, so our SID can cancel
-    // its first admission while waiting on mpsc, independently of depth1.
+    // its first admission while waiting on mpsc, independently of the first-send burst gate.
     for data in [b"AAAA", b"BBBB"] {
         let (done, _receiver) = oneshot::channel();
         writer
@@ -334,7 +407,7 @@ async fn mieru_udp_admission_no_wait_shutdown_retains_the_started_handshake_barr
 }
 
 #[tokio::test]
-async fn mieru_udp_admission_depth1_partial_packet_chunks_preserve_send_guard() {
+async fn mieru_udp_admission_depth2_partial_packet_chunks_preserve_send_guard() {
     for cancel in [false, true] {
         let (raw, mut commands, state, credit) = fixture_chunk(true, 128, 4);
         let request = DatagramRequest::new(DatagramSession::for_tun(
@@ -363,11 +436,13 @@ async fn mieru_udp_admission_depth1_partial_packet_chunks_preserve_send_guard() 
         assert!(result.is_pending());
         assert_eq!(
             credit.available_permits(),
-            124,
-            "only one 4B chunk is admitted before first-send"
+            120,
+            "only two 4B chunks are admitted before latest first-send"
         );
         let first = commands.try_recv().unwrap();
+        let second = commands.try_recv().unwrap();
         assert_eq!(first.data.len(), 4);
+        assert_eq!(second.data.len(), 4);
         assert!(matches!(
             commands.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -384,25 +459,27 @@ async fn mieru_udp_admission_depth1_partial_packet_chunks_preserve_send_guard() 
                 commands.try_recv().is_err(),
                 "cancelled next chunk is never admitted or replayed"
             );
-            assert_eq!(credit.available_permits(), 124);
-            drop((first, packet, commands));
+            assert_eq!(credit.available_permits(), 120);
+            drop((first, second, packet, commands));
             assert_eq!(credit.available_permits(), 128);
             continue;
         }
         let mut wire = first.data.to_vec();
-        let mut held = vec![first_sent(first)];
+        wire.extend_from_slice(&second.data);
+        let mut held = vec![first_sent(first), first_sent(second)];
         loop {
             let result = sending.as_mut().poll(&mut cx);
-            let command = commands.try_recv().unwrap();
-            assert!(command.data.len() <= 4);
-            assert!(matches!(
-                commands.try_recv(),
-                Err(mpsc::error::TryRecvError::Empty)
-            ));
-            wire.extend_from_slice(&command.data);
-            // Only the final chunk may return send at admission. Each next
-            // chunk before it requires the preceding existing done witness.
-            held.push(first_sent(command));
+            let mut admitted = 0;
+            while let Ok(command) = commands.try_recv() {
+                assert!(command.data.len() <= 4);
+                wire.extend_from_slice(&command.data);
+                held.push(first_sent(command));
+                admitted += 1;
+            }
+            assert!(
+                (1..=2).contains(&admitted),
+                "each burst keeps the two-write bound"
+            );
             if let Poll::Ready(value) = result {
                 value.unwrap();
                 break;
