@@ -86,7 +86,7 @@ pub(super) fn derive_packet_key(
 }
 
 /// Stateless UDP encryption with an explicit nonce and a setup-selected backend.
-/// Low-entropy carriers keep RustCrypto; other UDP carriers share Boring.
+/// Backend selection is independent of low-entropy wire encoding.
 pub(super) enum PacketCipher {
     Native(AeadCtx),
     Rust(Key),

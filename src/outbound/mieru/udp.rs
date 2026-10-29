@@ -604,7 +604,8 @@ pub(super) async fn drive(
             transport,
             peer,
             budget,
-            PacketEncoder::new(&key, low_entropy)?,
+            // BodyEncoding applies the pattern independently of the AEAD backend.
+            PacketEncoder::new(&key, false)?,
             PacketDecoder::new(&key, low_entropy)?,
         ))
     };

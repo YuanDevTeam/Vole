@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn mieru_low_entropy_packet_preserves_aead_tag_and_owned_buffer() {
-        let mut encoder = PacketEncoder::new(&packet_key(), true).unwrap();
+        let mut encoder = PacketEncoder::new(&packet_key(), false).unwrap();
         let mut decoder = PacketDecoder::new(&packet_key(), true).unwrap();
         let plain = b"partial last chunk";
         let padding = Padding {
