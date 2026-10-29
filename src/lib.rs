@@ -72,6 +72,7 @@ pub mod sniffing;
     feature = "outbound-shadowsocks",
     feature = "outbound-socks5",
     feature = "outbound-trojan",
+    feature = "outbound-tuic",
     feature = "outbound-vless"
 ))]
 mod socks5;
