@@ -300,6 +300,9 @@ impl Driver {
             .keepalive
             .map(|delay| tokio::time::Instant::now() + delay);
         loop {
+            // One native-pop allowance for the complete owner turn, including
+            // the outer H3 pass, inline RX and the publication pass below.
+            let mut datagram_work = WORK;
             if cancel.is_cancelled() && closing.is_none() {
                 closing = Some(tokio::time::Instant::now() + quic::CLOSE_TIMEOUT);
                 let mut state = self.shared.state.lock().unwrap();
@@ -344,7 +347,7 @@ impl Driver {
                     state.ready = true;
                     self.shared.status.notify_waiters();
                 }
-                process_h3(&mut state)?;
+                process_h3(&mut state, &mut datagram_work)?;
                 state.datagram_budget = state.connection.as_mut().unwrap().dgram_max_writable_len();
                 if closing.is_none()
                     && keepalive.is_some_and(|at| tokio::time::Instant::now() >= at)
@@ -451,8 +454,14 @@ impl Driver {
                 .min();
             let recv = poll_fn(|cx| {
                 let mut state = self.shared.state.lock().unwrap();
-                let connection = state.connection.as_mut().unwrap();
                 let mut received = false;
+                // A previous drain may have exhausted this turn's allowance.
+                // Return to control/send/timeout work even if no UDP arrives.
+                if self.options.datagrams
+                    && state.connection.as_ref().unwrap().dgram_recv_queue_len() != 0
+                {
+                    return Poll::Ready(Ok(()));
+                }
                 // Decode one ready burst before delivering H3 bodies and
                 // waking writers. Never wait for a batch to fill or retain
                 // additional packet buffers, and bound owner work per poll.
@@ -463,6 +472,7 @@ impl Driver {
                                 from: self.peer,
                                 to: self.local,
                             };
+                            let connection = state.connection.as_mut().unwrap();
                             let result = match payload.try_into_mut() {
                                 Ok(mut payload) => connection.recv(&mut payload, info),
                                 Err(payload) => {
@@ -475,17 +485,71 @@ impl Driver {
                             };
                             match result {
                                 Ok(_) | Err(quiche::Error::Done) => {}
-                                Err(error) => return Poll::Ready(Err(failure(error))),
+                                Err(error) => {
+                                    // Inline frames are still private under
+                                    // State; do not publish them on failure.
+                                    if self.options.datagrams {
+                                        state.closed = true;
+                                    }
+                                    return Poll::Ready(Err(failure(error)));
+                                }
                             }
                             received = true;
-                            // Deliver DATAGRAMs before another packet can
-                            // overflow their bounded native receive queue.
-                            if connection.dgram_recv_queue_len() != 0 {
+                            if self.options.datagrams {
+                                if state.connection.as_ref().unwrap().is_closed() {
+                                    // The next outer turn performs the usual
+                                    // finish/adapter stop. Readers must see
+                                    // native close before any batched frame.
+                                    state.closed = true;
+                                    break;
+                                }
+                                if state.h3.is_some()
+                                    && let Err(error) =
+                                        drain_datagrams(&mut state, &mut datagram_work)
+                                {
+                                    state.closed = true;
+                                    return Poll::Ready(Err(error));
+                                }
+                                if datagram_work == 0 {
+                                    break;
+                                }
+                            }
+                            // Before H3 is ready, keep the existing immediate
+                            // return so settings/control admission runs first.
+                            if state.connection.as_ref().unwrap().dgram_recv_queue_len() != 0 {
                                 break;
                             }
                         }
-                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Ready(Err(error)) => {
+                            if self.options.datagrams {
+                                state.closed = true;
+                            }
+                            return Poll::Ready(Err(error));
+                        }
                         Poll::Pending => break,
+                    }
+                }
+                if received && self.options.datagrams && !state.closed {
+                    let connection = state.connection.as_mut().unwrap();
+                    if connection.timeout().is_some_and(|delay| delay.is_zero()) {
+                        connection.on_timeout();
+                    }
+                    if connection.is_closed()
+                        || closing.is_some_and(|at| tokio::time::Instant::now() >= at)
+                    {
+                        state.closed = true;
+                    }
+                }
+                if received && self.options.datagrams && !state.closed {
+                    // State stays locked across RX, native insertion, H3
+                    // FIN/RESET and reliable-body delivery. Already-runnable
+                    // readers cannot observe a batch before its terminal
+                    // events; wake suppression alone would not ensure this.
+                    // This is one extra bounded H3 pass, not one per UDP.
+                    // Its native drain shares the same allowance above.
+                    if let Err(error) = process_h3(&mut state, &mut datagram_work) {
+                        state.closed = true;
+                        return Poll::Ready(Err(error));
                     }
                 }
                 if received {
@@ -523,7 +587,7 @@ fn retire_grace(connection: &NativeConnection) -> Duration {
         .saturating_add(Duration::from_millis(25))
         .min(quic::CLOSE_TIMEOUT)
 }
-fn process_h3(state: &mut State) -> io::Result<()> {
+fn process_h3(state: &mut State, datagram_work: &mut usize) -> io::Result<()> {
     let Some(h3) = state.h3.as_mut() else {
         return Ok(());
     };
@@ -613,10 +677,15 @@ fn process_h3(state: &mut State) -> io::Result<()> {
             }
         }
     }
-    // Unknown flow identifiers never allocate a map entry or an event.
-    for _ in 0..WORK {
+    drain_datagrams(state, datagram_work)
+}
+fn drain_datagrams(state: &mut State, remaining: &mut usize) -> io::Result<()> {
+    // Unknown, invalid-flow and full-Body frames consume the same allowance;
+    // moving existing Bytes never creates a new flow or intermediate queue.
+    while *remaining != 0 {
         match state.connection.as_mut().unwrap().dgram_recv_buf() {
             Ok(frame) => {
+                *remaining -= 1;
                 if frame.len() > CHUNK {
                     return Err(failure(quiche::Error::BufferTooShort));
                 }
@@ -1667,3 +1736,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "quiche_h3_native_ready_batch_memory_tests.rs"]
+mod native_ready_batch_memory_tests;

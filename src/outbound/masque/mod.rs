@@ -27,6 +27,7 @@ pub(super) struct ConnectionFactory {
     server_name: String,
     upstream: UpstreamPath,
     tls: MasqueTls,
+    udp_receive_buffer_size: Option<usize>,
 }
 impl ConnectionFactory {
     pub(super) async fn connect_h2(
@@ -76,6 +77,11 @@ impl ConnectionFactory {
             DatagramSession::new(session.inbound, session.source).with_metadata(session.metadata),
         )
         .with_budget(budget);
+        let request = if let Some(size) = self.udp_receive_buffer_size {
+            request.with_udp_receive_buffer_size(size)
+        } else {
+            request
+        };
         let transport = self
             .upstream
             .open_datagram(request, context)
@@ -129,6 +135,8 @@ impl MasqueOutbound {
                 server_name: config.server_name.clone(),
                 upstream,
                 tls,
+                udp_receive_buffer_size: (config.network == MasqueNetwork::Quic)
+                    .then_some(512 * 1024),
             }),
             pool: Arc::new(pool),
             h2_pool: Arc::new(GrpcPool::masque_ip()),
@@ -357,6 +365,8 @@ mod tests {
         entered: tokio::sync::Notify,
         calls: AtomicUsize,
         deadline: Mutex<Option<Instant>>,
+        datagram_requests: Mutex<Vec<(DatagramBudget, Option<usize>)>>,
+        reject_stream: bool,
     }
     #[async_trait]
     impl OutboundConnector for PendingUpstream {
@@ -368,18 +378,32 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             *self.deadline.lock().unwrap() = Some(context.deadline());
             self.entered.notify_one();
+            if self.reject_stream {
+                return Err(DispatchError::NotAllowed);
+            }
             std::future::pending().await
         }
         async fn open_datagram(
             &self,
-            _request: DatagramRequest,
+            request: DatagramRequest,
             _context: &EstablishContext,
         ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            self.datagram_requests.lock().unwrap().push((
+                request.budget(),
+                request.udp_socket_options().receive_buffer,
+            ));
             Err(DispatchError::NotAllowed)
         }
     }
     fn outbound(seconds: i64, upstream: Arc<PendingUpstream>) -> MasqueOutbound {
+        outbound_network(seconds, upstream, MasqueNetwork::H2)
+    }
+    fn outbound_network(
+        seconds: i64,
+        upstream: Arc<PendingUpstream>,
+        network: MasqueNetwork,
+    ) -> MasqueOutbound {
         use base64::Engine;
         let group =
             boring::ec::EcGroup::from_curve_name(boring::nid::Nid::X9_62_PRIME256V1).unwrap();
@@ -391,6 +415,7 @@ mod tests {
         config.public_key =
             base64::engine::general_purpose::STANDARD.encode(public.public_key_to_der().unwrap());
         config.handshake_timeout = seconds;
+        config.network = network;
         MasqueOutbound::with_shared_security(
             &config,
             UpstreamPath::proxy(upstream),
@@ -405,6 +430,40 @@ mod tests {
             destination: Destination::Ip("192.0.2.10:443".parse().unwrap()),
             sniffed_domain: None,
             metadata: Default::default(),
+        }
+    }
+    #[tokio::test]
+    async fn masque_memory_physical_receive_hint_is_ip_only_on_real_upstream_request() {
+        for (network, hint) in [
+            (MasqueNetwork::Quic, Some(512 * 1024)),
+            (MasqueNetwork::H3L4Proxy, None),
+            (MasqueNetwork::H2, None),
+        ] {
+            let upstream = Arc::new(PendingUpstream {
+                reject_stream: true,
+                ..Default::default()
+            });
+            let mut outbound = outbound_network(0, upstream.clone(), network);
+            let factory = Arc::get_mut(&mut outbound.connection).unwrap();
+            // Keep endpoint resolution pure memory; the mock rejects acquisition.
+            factory.server = Destination::Ip("192.0.2.10:443".parse().unwrap());
+            let context = EstablishContext::default();
+            let rejected = if network == MasqueNetwork::H2 {
+                factory.connect_h2(session(), &context).await.is_err()
+            } else {
+                factory.connect(session(), &context).await.is_err()
+            };
+            assert!(rejected);
+            assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+            if network == MasqueNetwork::H2 {
+                assert!(upstream.datagram_requests.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(
+                    *upstream.datagram_requests.lock().unwrap(),
+                    vec![(DatagramBudget::new(1400, 1400), hint)]
+                );
+            }
+            outbound.shutdown().await;
         }
     }
     #[tokio::test]

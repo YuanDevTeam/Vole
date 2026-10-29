@@ -506,7 +506,8 @@ impl DatagramRequest {
     #[cfg(any(
         feature = "outbound-mieru",
         feature = "outbound-hysteria2",
-        feature = "outbound-tuic"
+        feature = "outbound-tuic",
+        feature = "outbound-masque"
     ))]
     pub(crate) fn with_udp_receive_buffer_size(&self, size: usize) -> Self {
         let mut request = self.clone();
@@ -1705,7 +1706,8 @@ proxy-groups:
         #[cfg(any(
             feature = "outbound-mieru",
             feature = "outbound-hysteria2",
-            feature = "outbound-tuic"
+            feature = "outbound-tuic",
+            feature = "outbound-masque"
         ))]
         {
             let request = request.with_udp_receive_buffer_size(512 * 1024);

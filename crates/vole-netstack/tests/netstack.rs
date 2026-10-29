@@ -720,6 +720,152 @@ async fn active_tcp_uses_configured_sources_and_delivers_established_duplex_stre
 }
 
 #[tokio::test]
+async fn active_tcp_shutdown_drains_accepted_tail_before_fin_without_prior_acks() {
+    assert_active_accepted_tail(false).await;
+}
+
+#[tokio::test]
+async fn active_tcp_drop_drains_accepted_tail_before_fin_without_prior_acks() {
+    assert_active_accepted_tail(true).await;
+}
+
+async fn assert_active_accepted_tail(drop_after_write: bool) {
+    let config = NetStackConfig::default();
+    let payload: Vec<u8> = (0..24 * 1024)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    assert!(payload.len() > config.tcp_send_buffer / 2);
+    assert!(payload.len() < config.tcp_send_buffer);
+    let mut parts = NetStack::start_client(config, client_addresses()).unwrap();
+    let (mut stream, peer, sequence) =
+        active_connect(&mut parts, "198.51.100.20:443".parse().unwrap()).await;
+    tokio::time::timeout(WAIT, stream.write_all(&payload))
+        .await
+        .expect("accepted prefix did not fit the existing total send budget")
+        .unwrap();
+
+    // No DATA ACK was supplied. A real pending shutdown verifies that there
+    // is still an application tail, without observing private queue counters.
+    let mut stream = Some(stream);
+    let mut shutdown = Box::pin(stream.as_mut().unwrap().shutdown());
+    assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+    if drop_after_write {
+        drop(shutdown);
+        drop(stream.take());
+        receive_active_accepted_tail(&mut parts, &peer, sequence, &payload).await;
+    } else {
+        tokio::join!(
+            async {
+                tokio::time::timeout(WAIT, shutdown)
+                    .await
+                    .expect("ACK recovery did not complete shutdown")
+                    .unwrap();
+            },
+            receive_active_accepted_tail(&mut parts, &peer, sequence, &payload),
+        );
+        let mut byte = [0];
+        let mut read = Box::pin(stream.as_mut().unwrap().read(&mut byte));
+        assert!(
+            futures_util::poll!(read.as_mut()).is_pending(),
+            "local write shutdown closed the receive half before peer FIN"
+        );
+    }
+    assert_eq!(parts.stats.snapshot().active_tcp, 1);
+
+    // FIN has not been acknowledged yet. Close the peer with a real packet
+    // that cumulatively acknowledges the accepted DATA and the local FIN.
+    let fin_end = sequence
+        .wrapping_add(u32::try_from(payload.len()).unwrap())
+        .wrapping_add(1);
+    parts
+        .packet_sink
+        .send(build_tcp(&peer, 701, fin_end, TcpFlags::ACK | 1, &[]))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let packet = timeout_packet(&mut parts.packet_stream).await;
+            let offset = ip_header_len(packet.data());
+            assert_eq!(packet.data()[offset + 13] & 4, 0, "unexpected RST");
+            if tcp_acknowledgement(&packet) == 702 {
+                assert_eq!(tcp_sequence(&packet), fin_end);
+                assert!(tcp_payload(&packet).is_empty());
+                break;
+            }
+        }
+    })
+    .await
+    .expect("peer FIN was not acknowledged");
+    if let Some(stream) = stream.as_mut() {
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(WAIT, stream.read(&mut byte))
+                .await
+                .expect("peer FIN did not reach the application")
+                .unwrap(),
+            0
+        );
+    }
+    wait_no_tcp(&parts.stats).await;
+    parts.control.stop().await;
+    assert_eq!(parts.stats.snapshot().half_open_tcp, 0);
+    assert!(parts.packet_stream.recv().await.is_none());
+}
+
+async fn receive_active_accepted_tail(
+    parts: &mut vole_netstack::ClientNetStackParts,
+    peer: &Flow,
+    sequence: u32,
+    expected: &[u8],
+) {
+    tokio::time::timeout(WAIT, async {
+        let mut received = 0;
+        loop {
+            let packet = timeout_packet(&mut parts.packet_stream).await;
+            let flow = tcp_flow(&packet);
+            assert_eq!(flow.source, peer.destination);
+            assert_eq!(flow.destination, peer.source);
+            let offset = ip_header_len(packet.data());
+            let flags = packet.data()[offset + 13];
+            assert_eq!(flags & 4, 0, "accepted tail was reset");
+            let payload = tcp_payload(&packet);
+            let start = usize::try_from(tcp_sequence(&packet).wrapping_sub(sequence)).unwrap();
+            if !payload.is_empty() {
+                assert!(start <= received, "wire prefix contains a sequence hole");
+                let end = start + payload.len();
+                assert!(
+                    end <= expected.len(),
+                    "unexpected bytes beyond accepted tail"
+                );
+                assert_eq!(payload, &expected[start..end]);
+                received = received.max(end);
+            }
+            if flags & 1 != 0 {
+                assert_eq!(received, expected.len());
+                assert_eq!(start + payload.len(), expected.len(), "early FIN sequence");
+                assert_eq!(parts.stats.snapshot().active_tcp, 1);
+                return;
+            }
+            if !payload.is_empty() {
+                parts
+                    .packet_sink
+                    .send(build_tcp(
+                        peer,
+                        701,
+                        sequence.wrapping_add(u32::try_from(received).unwrap()),
+                        TcpFlags::ACK,
+                        &[],
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+    })
+    .await
+    .expect("accepted tail/FIN did not drain after real ACK recovery");
+}
+
+#[tokio::test]
 async fn active_tcp_refused_handshake_reclaims_its_socket() {
     let mut parts = NetStack::start_client(NetStackConfig::default(), client_addresses()).unwrap();
     let mut connect = Box::pin(parts.tcp_connector.connect(
