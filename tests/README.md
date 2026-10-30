@@ -376,3 +376,6 @@ MASQUE H2 capsule已就绪合批的纯内存过滤器：
 `transport::masque_codec::tests::masque_capsule_append_fit_and_rejection_preserve_the_existing_wire_prefix`。
 使用实际pump、内存PacketStream与codec验证合并、单包及时提交、大包与单溢出帧顺序、
 TTL、取消安全、强flush背压及错误；不创建网络socket，不代替真实TUN与RSS验收。
+
+WireGuard 路由表的纯内存过滤器：`outbound::wireguard::routes::tests::`。
+经实际配置校验和路由表构造检查空表、单前缀、主机边界、双栈隔离、最长前缀及同前缀最后声明的所有者。
