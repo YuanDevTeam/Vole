@@ -250,10 +250,19 @@ async fn run_peer(
                 {
                     continue;
                 }
-                network[..len].copy_from_slice(&datagram.payload);
-                network[1..4].fill(0);
-                let result = tunn.decapsulate(Some(endpoint.ip()), &network[..len], scratch);
-                let authenticated = matches!(network[0], 1 | 2)
+                // Standard packets already have zero reserved bytes. BoringTun
+                // borrows its input and returns only scratch-backed output.
+                let input: &[u8] = if datagram.payload[1..4] == [0, 0, 0] {
+                    datagram.payload.as_ref()
+                } else {
+                    // Preserve compatibility with a peer's nonzero reserved
+                    // bytes using the same existing normalization buffer.
+                    network[..len].copy_from_slice(&datagram.payload);
+                    network[1..4].fill(0);
+                    &network[..len]
+                };
+                let result = tunn.decapsulate(Some(endpoint.ip()), input, scratch);
+                let authenticated = matches!(input[0], 1 | 2)
                     && matches!(result, TunnResult::WriteToNetwork(_))
                     && tunn.time_since_last_handshake().is_some();
                 driver
