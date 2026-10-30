@@ -86,6 +86,11 @@ impl Engine {
             NetStackConfig {
                 mtu,
                 packet_queue: 32,
+                tcp_send_buffer: if config.network == MasqueNetwork::H2 {
+                    64 * 1024
+                } else {
+                    NetStackConfig::default().tcp_send_buffer
+                },
                 ..Default::default()
             },
             client,
