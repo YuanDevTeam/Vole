@@ -507,7 +507,8 @@ impl DatagramRequest {
         feature = "outbound-mieru",
         feature = "outbound-hysteria2",
         feature = "outbound-tuic",
-        feature = "outbound-masque"
+        feature = "outbound-masque",
+        feature = "outbound-wireguard"
     ))]
     pub(crate) fn with_udp_receive_buffer_size(&self, size: usize) -> Self {
         let mut request = self.clone();

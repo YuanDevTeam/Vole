@@ -70,8 +70,9 @@ impl Driver {
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         let size = self.config.mtu + 32;
-        let request =
-            DatagramRequest::new(self.session.clone()).with_budget(DatagramBudget::new(size, size));
+        let request = DatagramRequest::new(self.session.clone())
+            .with_budget(DatagramBudget::new(size, size))
+            .with_udp_receive_buffer_size(512 * 1024);
         let mut transport = path.open_datagram(request, context).await?;
         let budget = transport.payload_budget(&Destination::Ip(endpoint));
         if budget.transmit() < size || budget.receive() < size {
