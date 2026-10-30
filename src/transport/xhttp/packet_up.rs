@@ -74,11 +74,12 @@ impl Writer {
     ) -> io::Result<Self> {
         // Mihomo samples this maximum once per logical writer. Never allocate
         // the configurable (up to 16 MiB) maximum per connection.
-        let capacity = request
-            .options
-            .post_bytes
-            .sample()
-            .min(crate::limits::XHTTP_PACKET_BATCH_BYTES);
+        let batch_limit = if matches!(&sender, SendRequest::H3(_)) {
+            crate::limits::XHTTP_H3_PACKET_BATCH_BYTES
+        } else {
+            crate::limits::XHTTP_PACKET_BATCH_BYTES
+        };
+        let capacity = request.options.post_bytes.sample().min(batch_limit);
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 buffer: Vec::new(),

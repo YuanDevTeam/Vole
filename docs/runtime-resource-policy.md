@@ -31,7 +31,8 @@ Release 构建优先吞吐（`opt-level = 3`），保留 thin LTO 与现有缓�
 普通 UDP 响应                   256
 DNS 响应                        128
 每个 TUN TCP 方向缓冲区         4 KiB
-TLS / XHTTP 缓冲区              64 KiB
+TLS / 流式 XHTTP 缓冲区         64 KiB
+XHTTP packet-up 单批             H1/H2 64 KiB；H3 128 KiB
 DNS 结果总容量（每角色）         默认 4,096 项，dns.cache-max-size
 DNS 原始响应缓存                64 项 / 256 KiB
 TUN 域名提示                    256 项（按需）
@@ -59,7 +60,7 @@ MTU 由 `tun.mtu` 配置，默认值和平台限制统一见 [TUN 平台层](tun
   smoltcp 32 KiB 与按需应用队列 32 KiB。接收总预算仍为 32 KiB；
   MASQUE H3/IP、共享 TUN 与通用 netstack 默认值保持原样。
   节点业务与私有 DNS 的 TCP 共用该主动栈；此预算不改变内层 UDP、原始包队列或连接数量策略。
-- rustls/XHTTP 的配置缓冲区为 64 KiB；boring 每次应用写入最多 min(节点缓冲预算, 16 KiB)，原生 TLS 记录有界，命名模板证书消息/解压输出另限 128 KiB。
+- rustls/流式 XHTTP 的配置缓冲区为 64 KiB；boring 每次应用写入最多 min(节点缓冲预算, 16 KiB)，原生 TLS 记录有界，命名模板证书消息/解压输出另限 128 KiB。
 - 标准 TLS 恢复会话总预算为 4，按节点（含独立下载端点）分配；每个缓存绑定不可变的 SNI、ALPN 和证书策略，绝不跨节点复用。TLS 1.3 票据有界、一次性消费，TLS 1.2 会话占用同一额度；额度为 0 则禁用恢复。REALITY 不参与该缓存。
 - 共享 TLS 客户端的显式验证名、协议版本和 ClientHello profile 固定。内联客户端身份固定；文件身份整对校验后供新物理连接取快照，旧连接保留原身份。票据按节点和身份代隔离，换代后拒绝旧票据和旧连接晚到的票据，各代共用原节点总容量。boring 在应用层 ALPN 接受前不发布票据，失败或取消丢弃临时票据。标准 TLS 和 REALITY CloseWrite 只发送 close_notify，刷新最多5秒，保持读方向和底层传输；Drop 释放整个流。XHTTP 仍以逻辑连接整体关闭为准。
 - 半开连接、出站握手和活动会话只记录当前值和峰值，不触发资源错误。
@@ -218,6 +219,11 @@ XHTTP 和 DoH/H3 通过 `quinn-h3-transport` 使用官方 h3/h3-quinn，共享�
 未显式配置 reuse-settings 的 XHTTP H3 复用既有活动连接，每条最多 4 个逻辑租约；
 最后一个租约释放即移出候选池并按既有预算收尾，不缓存空闲连接。
 满足 [XHTTP 固定出口与安全边界](xhttp.md#http-transport-复用) 的 VLESS 私有 H2 腿采用相同 active-only 模型，每条最多 4 个逻辑租约，上传/显式下载各自隔离；其它 H2 路径、H1 与显式复用参数保持原契约。阈值溢出创建新物理连接，不拒绝逻辑流，不改变每流窗口或缓冲。
+
+XHTTP packet-up 的单批 backing（含正在发送的正文）上限为 H1/H2 64 KiB、H3 128 KiB，
+并与该 writer 采样的 POST 上限取较小值；按需扩容，不积累第二批。H3 仍等待完整
+POST 响应才释放写背压和确认 flush，QUIC 窗口、队列及停止语义不变。该 backing
+上限不是进程 RSS 上限；HTTP/QUIC codec、发送窗口和 allocator 的共同持有峰值需实测。
 
 `quiche-h3-transport` 为 TrustTunnel/MASQUE 使用官方 quiche 的低层驱动，共享上述数据报适配器，不创建新的 socket。
 接收时移动既有队列中的数据报，独占存储直接交给 quiche 原地解密；共享或不可变存储

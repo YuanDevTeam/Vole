@@ -17,7 +17,7 @@ use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 
 const LIMIT: Duration = Duration::from_secs(5);
-type Server = h3::server::Connection<h3_quinn::Connection, Bytes>;
+pub(crate) type Server = h3::server::Connection<h3_quinn::Connection, Bytes>;
 type ServerStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
 #[derive(Debug)]
@@ -88,19 +88,19 @@ impl quinn::AsyncUdpSocket for Socket {
     }
 }
 
-struct Pair {
-    client: quinn::Connection,
+pub(crate) struct Pair {
+    pub(crate) client: quinn::Connection,
     server: quinn::Connection,
     client_endpoint: quinn::Endpoint,
     server_endpoint: quinn::Endpoint,
-    client_runtime: Arc<OwnedRuntime>,
+    pub(crate) client_runtime: Arc<OwnedRuntime>,
     server_runtime: Arc<OwnedRuntime>,
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl Pair {
-    async fn new(server_stream_credit: u32) -> Self {
+    pub(crate) async fn new(server_stream_credit: u32) -> Self {
         let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut roots = rustls::RootCertStore::empty();
@@ -192,14 +192,14 @@ impl Pair {
         }
     }
 
-    fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static) {
+    pub(crate) fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static) {
         let cancel = self.cancel.clone();
         self.tasks.push(tokio::spawn(async move {
             tokio::select! { biased; () = cancel.cancelled() => {}, () = future => {} }
         }));
     }
 
-    async fn h3(&mut self) -> (Client, Server) {
+    pub(crate) async fn h3(&mut self) -> (Client, Server) {
         let (client, mut control) = attach(self.client.clone(), 16 * 1024).await.unwrap();
         let keep_client = client.clone();
         self.spawn(async move {
@@ -214,7 +214,7 @@ impl Pair {
         (client, server)
     }
 
-    async fn stop(mut self) {
+    pub(crate) async fn stop(mut self) {
         self.client_endpoint.close(0_u8.into(), b"");
         self.server_endpoint.close(0_u8.into(), b"");
         self.cancel.cancel();

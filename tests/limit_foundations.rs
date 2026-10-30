@@ -122,6 +122,10 @@ fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
         ("xhttp-padding", vole::limits::XHTTP_PADDING_BYTES),
         ("xhttp-post", vole::limits::XHTTP_POST_BYTES),
         ("xhttp-packet-batch", vole::limits::XHTTP_PACKET_BATCH_BYTES),
+        (
+            "xhttp-h3-packet-batch",
+            vole::limits::XHTTP_H3_PACKET_BATCH_BYTES,
+        ),
         ("xhttp-request-bytes", vole::limits::XHTTP_REQUEST_BYTES),
         ("xhttp-request-headers", vole::limits::XHTTP_REQUEST_HEADERS),
         ("xhttp-idle-entries", vole::limits::XHTTP_IDLE_ENTRIES),

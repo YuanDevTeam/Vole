@@ -163,7 +163,18 @@
       "value": 65536,
       "unit": "bytes-per-batch",
       "owner": "limits::XHTTP_PACKET_BATCH_BYTES",
-      "saturation": "backpressure one batch including the in-flight POST; never allocate the configured POST maximum",
+      "saturation": "H1/H2 backpressure one batch including the in-flight POST; never allocate the configured POST maximum",
+      "cancellation": "logical drop cancels the timer/upload; node Stop joins the owned driver",
+      "boundary_cases": [
+        "XHTTP-UNIT"
+      ]
+    },
+    {
+      "id": "xhttp-h3-packet-batch",
+      "value": 131072,
+      "unit": "bytes-per-batch",
+      "owner": "limits::XHTTP_H3_PACKET_BATCH_BYTES",
+      "saturation": "H3 backpressure one batch including the in-flight POST; use the smaller sampled POST limit without a second batch",
       "cancellation": "logical drop cancels the timer/upload; node Stop joins the owned driver",
       "boundary_cases": [
         "XHTTP-UNIT"
@@ -229,7 +240,7 @@
       "value": 16384,
       "unit": "bytes",
       "owner": "limits::XHTTP_BODY_CHUNK",
-      "saturation": "split streaming writes; a packet-up body uses the separately bounded xhttp-packet-batch limit",
+      "saturation": "split streaming writes; a packet-up body uses xhttp-packet-batch for H1/H2 or xhttp-h3-packet-batch for H3",
       "cancellation": "runtime Stop cancels and joins node-owned drivers; drops queues and retained IO",
       "boundary_cases": [
         "XHTTP-UNIT"

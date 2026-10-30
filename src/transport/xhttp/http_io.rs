@@ -361,7 +361,12 @@ impl Upload {
         }
     }
     pub(super) fn send_data(&mut self, data: Bytes, end: bool) -> io::Result<()> {
-        if data.len() > crate::limits::XHTTP_PACKET_BATCH_BYTES {
+        let batch_limit = if matches!(&self.inner, UploadKind::H3(_)) {
+            crate::limits::XHTTP_H3_PACKET_BATCH_BYTES
+        } else {
+            crate::limits::XHTTP_PACKET_BATCH_BYTES
+        };
+        if data.len() > batch_limit {
             return Err(super::request::invalid_request());
         }
         // Writers drain each receipt before accepting another chunk. Packet-up

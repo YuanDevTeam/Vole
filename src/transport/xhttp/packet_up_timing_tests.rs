@@ -1,7 +1,7 @@
 //! Packet-up scheduling against a memory HTTP/2 peer with paused Tokio time.
 use super::*;
 use crate::config::xhttp::XHttpRequestOptions;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use http::{Method, Response, StatusCode};
 use tokio::{
     io::AsyncWriteExt,
@@ -560,4 +560,135 @@ async fn autonomous_smux_really_fills_default_packet_batch_and_preserves_every_f
         8 + wire.len(),
         "POST accounting lost SYN or DATA"
     );
+}
+
+#[tokio::test]
+async fn h3_batch_boundary_keeps_eager_progress_receipts_and_owner_stop() {
+    use crate::transport::quinn_h3::tests::Pair;
+
+    for (post_limit, expected) in [
+        (1_000_000, crate::limits::XHTTP_H3_PACKET_BATCH_BYTES),
+        (5000, 5000),
+    ] {
+        let mut pair = Pair::new(128 * 1024).await;
+        let (requests, mut server) = pair.h3().await;
+        let (posts, mut packets) = mpsc::channel(2);
+        pair.spawn(async move {
+            while let Some(request) = server.accept().await.unwrap() {
+                let (headers, mut stream) = request.resolve_request().await.unwrap();
+                assert_eq!(headers.method(), Method::POST);
+                let path = headers.uri().path().to_owned();
+                let mut body = Vec::new();
+                while let Some(mut data) = stream.recv_data().await.unwrap() {
+                    body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                }
+                posts.send((path, body, stream)).await.unwrap();
+            }
+        });
+        let owner = Arc::new(DriverOwner::default());
+        let sender = SendRequest::H3(super::super::h3_driver::Sender {
+            requests,
+            runtime: pair.client_runtime.clone(),
+            #[cfg(feature = "interop-test")]
+            observation: pair.client.clone(),
+        });
+        let request = RequestTemplate {
+            host: Arc::from("example.com"),
+            path: Arc::from("/x"),
+            headers: Default::default(),
+            options: Arc::new(normalized_packet_options(None, post_limit, false)),
+        };
+        let mut writer = Writer::new(
+            sender,
+            request,
+            Arc::from("session"),
+            crate::limits::XHTTP_BODY_CHUNK,
+            &owner,
+        )
+        .unwrap();
+        assert_eq!(writer.capacity, expected);
+        let payload = vec![0xa5; expected];
+        // Pause only after the actual QUIC/H3 fixture exists. Observe the
+        // production aggregation boundary before letting native timers run.
+        tokio::time::pause();
+        let began = Instant::now();
+        writer.write_all(&payload).await.unwrap();
+        let allocated = writer.shared.state.lock().unwrap().buffer.capacity();
+        for _ in 0..64 {
+            if writer.shared.state.lock().unwrap().in_flight {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let eager = writer.shared.state.lock().unwrap().in_flight;
+        let no_aggregation_tick = Instant::now() == began;
+        tokio::time::resume();
+        assert!(
+            eager && no_aggregation_tick,
+            "full H3 batch paid the aggregation timer"
+        );
+        assert!(
+            allocated <= expected,
+            "H3 backing exceeded its selected cap"
+        );
+        let (path, body, mut first) = timeout(Duration::from_secs(5), packets.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, "/x/session/0");
+        assert_eq!(body, payload);
+        assert_eq!(writer.shared.state.lock().unwrap().committed, 0);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut writer).poll_write(cx, b"tail")))
+                .await
+                .is_pending()
+        );
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut writer).poll_flush(cx)))
+                .await
+                .is_pending()
+        );
+        first.send_response(Response::new(())).await.unwrap();
+        first.finish().await.unwrap();
+        timeout(Duration::from_secs(5), writer.flush())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            writer.shared.state.lock().unwrap().committed,
+            expected as u64
+        );
+        writer.write_all(&payload).await.unwrap();
+        let (path, body, second) = timeout(Duration::from_secs(5), packets.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, "/x/session/1");
+        assert_eq!(body, payload);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut writer).poll_shutdown(cx)))
+                .await
+                .is_pending()
+        );
+        writer.write_all(b"late").await.unwrap_err();
+        owner.cancellation.cancel();
+        owner.tasks.close();
+        timeout(Duration::from_secs(2), owner.tasks.wait())
+            .await
+            .unwrap();
+        assert!(owner.tasks.is_empty());
+        timeout(Duration::from_secs(5), writer.flush())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            writer.shared.state.lock().unwrap().committed,
+            expected as u64
+        );
+        drop(second);
+        drop(first);
+        drop(writer);
+        drop(packets);
+        pair.stop().await;
+    }
 }
