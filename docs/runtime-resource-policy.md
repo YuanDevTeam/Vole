@@ -102,7 +102,7 @@ MASQUE H2 CONNECT-IP 单独采用 128 KiB 流接收信用，连接接收信用�
 其它共享流传输的 64 KiB 流窗口、16 KiB 发送缓冲和最大帧保持原样；信用按实际消费
 释放，不预分配全部额度，也不改变 capsule、flush、FIN 或同步 Stop 语义。
 
-H2 CONNECT-IP 只合并已就绪的 capsule，每批最多8次出队／16 KiB编码字节，
+H2 CONNECT-IP 只合并已就绪的 capsule，每批最多16次出队／16 KiB编码字节，
 不等待凑批；无效包也计入扫描预算。每条隧道复用一个16 KiB聚合缓冲，最多暂存
 一个已编码的溢出 capsule。合法大包仍独立发送，不因聚合阈值拒绝。
 每批仍通过原IO完成 write_all 与强flush后才处理下一批；TTL只调整一次，

@@ -357,7 +357,7 @@ async fn pump_h2_output<W: tokio::io::AsyncWrite + Unpin>(
 ) -> io::Result<()> {
     use futures_util::FutureExt;
 
-    const PACKETS: usize = 8;
+    const PACKETS: usize = 16;
     const BYTES: usize = crate::transport::STREAM_CHUNK_BYTES;
     // One aggregate backing and at most one encoded spill per H2 IP tunnel.
     // The Plain writer and its supplied-IO flush confirmation stay unchanged.

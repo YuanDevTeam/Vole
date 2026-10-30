@@ -145,7 +145,7 @@ async fn ready_capsules_coalesce_and_flush_the_last_short_prefix_before_channel_
         groups.len() < input.len(),
         "ready packets were still flushed one-by-one"
     );
-    assert!(groups.iter().all(|group| group.len() <= 8));
+    assert!(groups.iter().all(|group| group.len() <= 16));
     assert!(state.writes.iter().all(|wire| wire.len() <= 16 * 1024));
     assert_eq!(groups.last().unwrap().len(), 1);
     assert_eq!(state.flushed, groups.len());
