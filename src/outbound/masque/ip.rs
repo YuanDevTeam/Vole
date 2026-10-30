@@ -340,20 +340,89 @@ async fn run(
     }
     Err(closed())
 }
+async fn next_h2_output(
+    packets: &mut PacketStream,
+    udp: &mut mpsc::Receiver<Packet>,
+) -> Option<Packet> {
+    tokio::select! {
+        packet = packets.recv() => packet,
+        packet = udp.recv() => packet,
+    }
+}
+
 async fn pump_h2_output<W: tokio::io::AsyncWrite + Unpin>(
     mut packets: PacketStream,
     mut udp: mpsc::Receiver<Packet>,
     mut writer: W,
 ) -> io::Result<()> {
+    use futures_util::FutureExt;
+
+    const PACKETS: usize = 8;
+    const BYTES: usize = crate::transport::STREAM_CHUNK_BYTES;
+    // One aggregate backing and at most one encoded spill per H2 IP tunnel.
+    // The Plain writer and its supplied-IO flush confirmation stay unchanged.
+    let mut batch = Vec::with_capacity(BYTES);
+    let mut spill: Option<Bytes> = None;
     loop {
-        let packet = tokio::select! {
-            packet=packets.recv()=>packet.ok_or_else(closed)?,
-            packet=udp.recv()=>packet.ok_or_else(closed)?,
-        };
-        if let Some(bytes) = packet::outgoing(packet.into_bytes()) {
-            let capsule = codec::encode_capsule(codec::DATAGRAM, &bytes, MAX_RECEIVE_PACKET_SIZE)?;
-            writer.write_all(&capsule).await?;
+        batch.clear();
+        let mut taken = 0;
+        let mut terminal = None;
+        if let Some(capsule) = spill.take() {
+            if capsule.len() > BYTES {
+                // Legal large capsules retain the original independent path.
+                writer.write_all(&capsule).await?;
+                writer.flush().await?;
+                continue;
+            }
+            batch.extend_from_slice(&capsule);
+            taken = 1;
+        }
+        while taken < PACKETS {
+            let next = if taken == 0 {
+                Some(next_h2_output(&mut packets, &mut udp).await)
+            } else {
+                // A single poll can be Pending due to readiness or coop budget.
+                // Never wait for another packet just to fill this batch.
+                next_h2_output(&mut packets, &mut udp).now_or_never()
+            };
+            let Some(next) = next else { break };
+            let Some(packet) = next else {
+                terminal = Some(closed());
+                break;
+            };
+            taken += 1; // Invalid packets also consume this batch's bounded scan.
+            let Some(bytes) = packet::outgoing(packet.into_bytes()) else {
+                continue;
+            };
+            match codec::try_append_capsule(
+                codec::DATAGRAM,
+                &bytes,
+                MAX_RECEIVE_PACKET_SIZE,
+                &mut batch,
+                BYTES,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Outgoing/TTL adjustment has already happened exactly once.
+                    spill = Some(codec::encode_capsule(
+                        codec::DATAGRAM,
+                        &bytes,
+                        MAX_RECEIVE_PACKET_SIZE,
+                    )?);
+                    break;
+                }
+                Err(error) => {
+                    terminal = Some(error);
+                    break;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            writer.write_all(&batch).await?;
             writer.flush().await?;
+        }
+        if let Some(error) = terminal {
+            return Err(error);
         }
     }
 }
@@ -480,6 +549,10 @@ async fn pump_capsules<R: tokio::io::AsyncRead + Unpin>(
 fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionAborted, "MASQUE IP tunnel stopped")
 }
+
+#[cfg(test)]
+#[path = "h2_output_batch_memory_tests.rs"]
+mod h2_output_batch_memory_tests;
 
 #[cfg(test)]
 pub(super) mod tests {

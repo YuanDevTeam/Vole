@@ -118,20 +118,48 @@ impl std::fmt::Debug for Capsule {
     }
 }
 
-pub(crate) fn encode_capsule(kind: u64, value: &[u8], max_value_len: usize) -> io::Result<Bytes> {
-    if value.len() > max_value_len {
+fn capsule_len(kind: u64, value_len: usize, max_value_len: usize) -> io::Result<usize> {
+    if value_len > max_value_len {
         return Err(invalid());
     }
-    let value_len = u64::try_from(value.len()).map_err(|_| invalid())?;
-    let len = varint_len(kind)?
-        .checked_add(varint_len(value_len)?)
-        .and_then(|header| header.checked_add(value.len()))
-        .ok_or_else(invalid)?;
+    let wire_len = u64::try_from(value_len).map_err(|_| invalid())?;
+    varint_len(kind)?
+        .checked_add(varint_len(wire_len)?)
+        .and_then(|header| header.checked_add(value_len))
+        .ok_or_else(invalid)
+}
+
+pub(crate) fn encode_capsule(kind: u64, value: &[u8], max_value_len: usize) -> io::Result<Bytes> {
+    let len = capsule_len(kind, value.len(), max_value_len)?;
     let mut output = Vec::with_capacity(len);
     encode_varint(kind, &mut output)?;
-    encode_varint(value_len, &mut output)?;
+    encode_varint(value.len() as u64, &mut output)?;
     output.extend_from_slice(value);
     Ok(Bytes::from(output))
+}
+
+/// Append one whole capsule only when it fits. Validation and a no-fit result
+/// leave an existing prefix untouched; callers can independently send big values.
+#[cfg(feature = "outbound-masque")]
+pub(crate) fn try_append_capsule(
+    kind: u64,
+    value: &[u8],
+    max_value_len: usize,
+    output: &mut Vec<u8>,
+    max_output_len: usize,
+) -> io::Result<bool> {
+    let len = capsule_len(kind, value.len(), max_value_len)?;
+    if output
+        .len()
+        .checked_add(len)
+        .is_none_or(|end| end > max_output_len)
+    {
+        return Ok(false);
+    }
+    encode_varint(kind, output)?;
+    encode_varint(value.len() as u64, output)?;
+    output.extend_from_slice(value);
+    Ok(true)
 }
 
 /// One incremental parser owns at most one capsule value and an eight-byte
@@ -467,5 +495,41 @@ mod tests {
         assert!(parse_routes(&routes[..8], 1).is_err());
         assert!(parse_routes(&[4, 192, 0, 2, 9, 192, 0, 2, 1, 0], 1).is_err());
         assert!(parse_routes(b"", 0).unwrap().is_empty());
+    }
+
+    #[cfg(feature = "outbound-masque")]
+    #[test]
+    fn masque_capsule_append_fit_and_rejection_preserve_the_existing_wire_prefix() {
+        let mut wire = vec![0, 1, 0xaa];
+        let prefix = wire.clone();
+        assert!(!try_append_capsule(DATAGRAM, &[0xbb, 0xcc], 2, &mut wire, 6).unwrap());
+        assert_eq!(wire, prefix);
+        assert!(try_append_capsule(DATAGRAM, &[0xbb, 0xcc], 2, &mut wire, 7).unwrap());
+        assert_eq!(wire, [0, 1, 0xaa, 0, 2, 0xbb, 0xcc]);
+        let prefix = wire.clone();
+        assert!(try_append_capsule(MAX_VARINT + 1, b"", 2, &mut wire, 64).is_err());
+        assert_eq!(wire, prefix);
+        assert!(try_append_capsule(DATAGRAM, &[0; 3], 2, &mut wire, 64).is_err());
+        assert_eq!(wire, prefix);
+        let mut decoder = CapsuleDecoder::new(2);
+        let mut input = wire.as_slice();
+        let mut values = Vec::new();
+        while !input.is_empty() {
+            let (consumed, capsule) = decoder.feed(input).unwrap();
+            assert!(consumed > 0);
+            input = &input[consumed..];
+            if let Some(capsule) = capsule {
+                assert_eq!(capsule.kind, DATAGRAM);
+                values.push(capsule.value);
+            }
+        }
+        decoder.finish().unwrap();
+        assert_eq!(
+            values,
+            [
+                Bytes::from_static(&[0xaa]),
+                Bytes::from_static(&[0xbb, 0xcc])
+            ]
+        );
     }
 }

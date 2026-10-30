@@ -370,3 +370,9 @@ Linux 受控物理 QUIC 的纯内存过滤器：`physical_quic_memory_` 与
 退役等待双方释放及资源只析构一次。显式 ignored 的
 `transport::quic::physical::gate::real_tun_native_udp_retirement_gate` 仅供隔离 Linux
 容器以真实 TUN 验证适配器的 fd、资源计数和 Stop；常规内存回归不得执行该网络门禁。
+
+MASQUE H2 capsule已就绪合批的纯内存过滤器：
+`outbound::masque::ip::h2_output_batch_memory_tests::` 与
+`transport::masque_codec::tests::masque_capsule_append_fit_and_rejection_preserve_the_existing_wire_prefix`。
+使用实际pump、内存PacketStream与codec验证合并、单包及时提交、大包与单溢出帧顺序、
+TTL、取消安全、强flush背压及错误；不创建网络socket，不代替真实TUN与RSS验收。
