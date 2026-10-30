@@ -49,6 +49,9 @@ mod udp_admission_memory_tests;
 #[cfg(test)]
 #[path = "udp_pool_memory_tests.rs"]
 mod udp_pool_memory_tests;
+#[cfg(test)]
+#[path = "udp_send_credit_memory_tests.rs"]
+mod udp_send_credit_memory_tests;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Business {
     TcpConnect,
@@ -491,10 +494,20 @@ impl Client {
             maximum_write: AtomicUsize::new(32768),
         });
         let (writer, commands) = mpsc::channel(WRITER_COMMANDS);
+        // Only the isolated LOW UDP-associate pool gets default TX headroom.
+        // Preserve non-default resource budgets and all per-session RX limits.
+        let send_capacity = if self.factory.config.transport == MieruTransport::Udp
+            && self.pool(business) == Some(Business::UdpAssociate)
+            && self.capacity == 32 * 1024
+        {
+            64 * 1024
+        } else {
+            self.capacity
+        };
         let carrier = Arc::new(Carrier {
             shared: shared.clone(),
             writer,
-            bytes: Arc::new(Semaphore::new(self.capacity)),
+            bytes: Arc::new(Semaphore::new(send_capacity)),
         });
         let id = {
             let mut registry = self.registry.lock().unwrap();

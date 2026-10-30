@@ -2832,6 +2832,114 @@ mod tests {
         assert_eq!(credit.available_permits(), 32);
         state.close();
     }
+    #[tokio::test(start_paused = true)]
+    async fn mieru_udp_send_credit64_two_sids_keep_fragment_leases_until_their_acks() {
+        let probe = ResourceProbe::default();
+        probe.scope(async {
+            let shared = Shared::output_test_shared(CancellationToken::new());
+            let credit = Arc::new(Semaphore::new(65536));
+            let (writer, mut commands) = mpsc::channel(2);
+            let mut states = Vec::new();
+            let mut completions = Vec::new();
+            for (id, data) in [(7, &[b'A'; 32768][..]), (8, &[b'B'; 32768][..])] {
+                let state = State::new_for_business(
+                    id, 32768, super::super::tcp::Business::UdpAssociate,
+                    &shared.cancel, shared.activity.clone(),
+                );
+                state.opened.store(true, Ordering::Release);
+                shared.sessions.lock().unwrap().insert(id, state.clone());
+                let (command, done) = lookahead_command(&state, &credit, data);
+                writer.try_send(command).unwrap();
+                states.push(state);
+                completions.push(done);
+            }
+            assert_eq!(credit.available_permits(), 0);
+            assert_eq!(writer.max_capacity(), 2);
+            let pattern = EffectivePattern::compile(
+                None, super::super::pattern::HostProfile::capture(), "vole",
+            ).unwrap();
+            let chunk = pattern.plaintext_fragment_limit(MieruTransport::Udp, MTU.into()).unwrap();
+            let fragments = 32768_usize.div_ceil(chunk);
+            assert!(fragments > 16 && fragments <= 32);
+            let mut sessions = BTreeMap::new();
+            for _ in 0..2 {
+                input_command(commands.try_recv().unwrap(), &mut sessions, chunk, 1312, false);
+            }
+            for reliable in sessions.values_mut() {
+                reliable.established = true;
+            }
+            let key = crypto::derive_packet_key("vole", "fixture-password", super::super::tcp::now().unwrap());
+            let mut encoder = PacketEncoder::new(&key, false).unwrap();
+            let mut packets = LookaheadPackets {
+                decoder: PacketDecoder::new(&key, false).unwrap(),
+                frames: Vec::new(), latest: None,
+            };
+            let peer = Destination::Ip("192.0.2.1:2000".parse().unwrap());
+            let mut patterned = PacketPattern {
+                pattern: &pattern, nonce: NonceState::new(), wire_budget: MTU.into(),
+                remaining: OUTPUT_QUANTUM, truncated: false,
+            };
+            let mut buffer = Vec::new();
+            for _ in 0..2 {
+                for id in [7, 8] {
+                    patterned.remaining = OUTPUT_QUANTUM;
+                    patterned.truncated = false;
+                    let before = packets.frames.len();
+                    assert!(output(&mut packets, &peer, &mut encoder, "vole", &shared,
+                        &mut patterned, sessions.get_mut(&id).unwrap(), true, &mut buffer)
+                        .await.unwrap());
+                    assert!(packets.frames.len() - before <= 8);
+                }
+            }
+            for done in &mut completions {
+                assert!(matches!(done.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+            }
+            for reliable in sessions.values_mut() {
+                assert_eq!(reliable.outstanding.len(), 16);
+                reliable.acknowledge(16, 16, true, Instant::now());
+                reliable.acknowledge(16, 16, true, Instant::now());
+            }
+            assert_eq!(credit.available_permits(), 0,
+                "partial and duplicate ACKs retain the shared whole-write leases");
+            for _ in 0..2 {
+                for id in [7, 8] {
+                    patterned.remaining = OUTPUT_QUANTUM;
+                    patterned.truncated = false;
+                    let before = packets.frames.len();
+                    assert!(output(&mut packets, &peer, &mut encoder, "vole", &shared,
+                        &mut patterned, sessions.get_mut(&id).unwrap(), true, &mut buffer)
+                        .await.unwrap());
+                    assert!(packets.frames.len() - before <= 8);
+                }
+            }
+            for done in &mut completions { done.try_recv().unwrap().unwrap(); }
+            assert_eq!(credit.available_permits(), 0, "first-send success is not an ACK");
+            for (id, expected) in [(7, b'A'), (8, b'B')] {
+                let mut payload = Vec::new();
+                let mut next = 0;
+                for frame in &packets.frames {
+                    if matches!(frame.metadata, Metadata::Data(meta) if meta.session_id == id) {
+                        assert!(matches!(frame.metadata, Metadata::Data(meta)
+                            if meta.sequence == next && meta.fragment as usize == fragments - 1 - next as usize));
+                        payload.extend_from_slice(&frame.payload);
+                        next += 1;
+                    }
+                }
+                assert_eq!(next as usize, fragments);
+                assert_eq!(payload, vec![expected; 32768]);
+            }
+            sessions.get_mut(&7).unwrap().acknowledge(fragments as u32, 16, true, Instant::now());
+            assert_eq!(credit.available_permits(), 32768,
+                "ACK for one SID retires only that SID's shared-carrier lease");
+            shared.cancel.cancel();
+            sessions.clear(); // Terminal clearing releases the unacked sibling, not a false ACK.
+            shared.sessions.lock().unwrap().clear();
+            for state in &states { state.close(); }
+            drop(states);
+            assert_eq!(credit.available_permits(), 65536);
+        }).await;
+        assert!(probe.snapshot().is_idle());
+    }
 }
 
 #[cfg(test)]

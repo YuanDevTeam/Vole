@@ -210,6 +210,13 @@ SS2022 的严格官方 TCP codec 回归可单独选择 `official_tcp_codecs_all_
 `tcp_response_header_time_salt_auth_and_fragmentation_follow_official_codec`；不要在宿主整体运行
 `outbound::shadowsocks::tests::`，其中还包含监听器用例。
 Mieru回归保留TCP/UDP分池、慢读背压、单槽交接、终态传播、接收分配复用和未读响应下的Stop。
+`outbound::mieru::tcp::udp_send_credit_memory_tests::` 用实际Client::create与有生命周期计数的
+内存DatagramTransport验证默认LOW UDP Associate载体共享64 KiB发送信用；非默认预算、
+其他业务/模式/载体不变，并组接两个真实RawStream验证共享信用、原FIFO2及取消/Stop回收。
+`outbound::mieru::udp::tests::mieru_udp_send_credit64_two_sids_keep_fragment_leases_until_their_acks`
+通过原可靠分片与真实codec输出验证部分/重复ACK、first-send与独立SID许可退休，原TX8不变。
+这些用例不创建socket、DNS、监听器或网络对端，不证明真实TUN性能或RSS。
+
 `outbound::mieru::tcp::udp_admission_memory_tests::` 使用原命令通道、完成回执和字节许可，
 验证保守四写 UDP 准入、第五笔发送屏障、就绪错误、空写、部分记录取消和 NoWait 收尾；TCP 写入保留原等待边界。
 `outbound::mieru::udp::tests::mieru_udp_admission_depth4_` 另通过实际编解码与可靠驱动，验证 FIFO 分片、累计ACK许可释放和延迟Close拒绝。
