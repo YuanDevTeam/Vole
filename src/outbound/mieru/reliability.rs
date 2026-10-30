@@ -47,9 +47,13 @@ impl Rtt {
     }
 
     pub fn retransmit_delay(&self, tx_count: u32) -> Duration {
+        Self::retransmit_delay_from_rto(self.rto(), tx_count)
+    }
+
+    pub fn retransmit_delay_from_rto(base_rto: Duration, tx_count: u32) -> Duration {
         // Count includes the first transmission. The legacy duration cast
         // truncates the exponential multiplier before it scales the RTO.
-        scale(self.rto(), 1.5_f64.powf(f64::from(tx_count)).floor()).min(Duration::from_secs(10))
+        scale(base_rto, 1.5_f64.powf(f64::from(tx_count)).floor()).min(Duration::from_secs(10))
     }
 }
 

@@ -496,11 +496,23 @@ impl Reliable {
         if let Some(first) = self.first_check {
             next = next.min(first);
         }
+        // RTT is unchanged within this read-only SID scan. Compute its base
+        // lazily, so empty scans and fast-ACK-only scans still do no RTO work.
+        let single_segment = self.outstanding.len() == 1;
+        let mut base_rto = None;
         for segment in self.outstanding.values() {
             let due = if segment.ack_count >= 3 && segment.tx_count <= 1 {
                 now
             } else {
-                segment.sent.unwrap() + self.rtt.retransmit_delay(segment.tx_count)
+                segment.sent.unwrap()
+                    + if single_segment {
+                        self.rtt.retransmit_delay(segment.tx_count)
+                    } else {
+                        Rtt::retransmit_delay_from_rto(
+                            *base_rto.get_or_insert_with(|| self.rtt.rto()),
+                            segment.tx_count,
+                        )
+                    }
             };
             next = next.min(due);
         }
@@ -732,9 +744,23 @@ async fn output(
         state.heartbeat_interval = heartbeat_interval();
         state.heartbeat = Instant::now() + state.heartbeat_interval;
     }
+    // This owner cannot process incoming ACKs while output holds the SID.
+    // Keep the base local to this scan, including across its physical sends.
+    let rtt = &state.rtt;
+    let single_segment = state.outstanding.len() == 1;
+    let mut base_rto = None;
     for segment in state.outstanding.values_mut() {
         let fast = segment.ack_count >= 3 && segment.tx_count <= 1;
-        let timeout = now >= segment.sent.unwrap() + state.rtt.retransmit_delay(segment.tx_count);
+        let timeout = now
+            >= segment.sent.unwrap()
+                + if single_segment {
+                    rtt.retransmit_delay(segment.tx_count)
+                } else {
+                    Rtt::retransmit_delay_from_rto(
+                        *base_rto.get_or_insert_with(|| rtt.rto()),
+                        segment.tx_count,
+                    )
+                };
         if !fast && !timeout {
             continue;
         }
