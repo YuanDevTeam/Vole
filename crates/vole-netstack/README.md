@@ -140,6 +140,10 @@ adapter splits later TCP output, including ordinary retransmissions. Recovery
 uses smoltcp's own retransmission/congestion timers; no immediate retransmission
 or Mihomo timer equality is promised.
 
+Active clients retain the engine's one-second initial retransmission timeout
+and use a 200 ms minimum after RTT sampling. Passive TUN sockets keep the
+engine defaults; RTT estimates and timeout backoff remain engine-owned.
+
 Passive TUN TCP enables this bounded fallback as well; an incoming error must
 identify an active intercepted flow. Active clients additionally require a
 configured local source address and explicitly enable PMTU discovery.

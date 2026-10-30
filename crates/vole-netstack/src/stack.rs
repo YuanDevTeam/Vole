@@ -880,6 +880,10 @@ impl Driver {
         socket.set_ack_delay(Some(smoltcp::time::Duration::from_millis(10)));
         socket.set_nagle_enabled(false);
         socket.set_congestion_control(tcp::CongestionControl::Cubic);
+        if self.client.is_some() {
+            // The initial SYN timeout stays unchanged; RTT samples set the lower floor.
+            socket.set_min_rto(smoltcp::time::Duration::from_millis(200));
+        }
         socket
     }
 
