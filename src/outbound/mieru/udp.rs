@@ -659,6 +659,17 @@ pub(super) async fn drive(
         }
     }
 }
+async fn receive_packet(
+    transport: &mut dyn DatagramTransport,
+    scratch: &mut Vec<u8>,
+) -> Result<Datagram, crate::dispatch::DispatchError> {
+    if transport.supports_poll_receive() {
+        std::future::poll_fn(|context| transport.poll_receive(context, scratch)).await
+    } else {
+        transport.receive().await
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send(
     transport: &mut dyn DatagramTransport,
@@ -1034,6 +1045,7 @@ async fn run(
     let mut sessions = BTreeMap::<u32, Reliable>::new();
     let mut partial = None;
     let mut buffer = Vec::with_capacity(usize::from(budget.transmit()));
+    let mut receive_scratch = Vec::new();
     // Give application readers a turn before a ready burst consumes their credit.
     let mut received_since_yield = 0u8;
     let mut has_output = false;
@@ -1059,7 +1071,7 @@ async fn run(
             command=commands.recv()=>{let Some(command)=command else{return Ok(());};input_command(command,&mut sessions,chunk,receive_chunk,!pattern.low_entropy_enabled());},
             ()=shared.activity.notified()=>{},
             ()=tokio::time::sleep_until(deadline)=>{},
-            packet=transport.receive(),if !sessions.is_empty()=>{received=Some(packet.map_err(|_|closed())?);}
+            packet=receive_packet(transport, &mut receive_scratch),if !sessions.is_empty()=>{received=Some(packet.map_err(|_|closed())?);}
         }
         let mut received_in_turn = 0u8;
         while received_in_turn < RECEIVE_BATCH {
@@ -1072,8 +1084,7 @@ async fn run(
             } else if has_output && !sessions.is_empty() {
                 // The receive contract permits dropping a pending future. A
                 // ready Datagram owns its complete payload before we borrow TX.
-                let Some(packet) = transport
-                    .receive()
+                let Some(packet) = receive_packet(transport, &mut receive_scratch)
                     .now_or_never()
                     .transpose()
                     .map_err(|_| closed())?
@@ -1246,7 +1257,15 @@ mod tests {
     use tokio_util::{sync::CancellationToken, task::TaskTracker};
     include!("udp_upload_shutdown_tests.rs");
 
+    #[derive(Default)]
+    struct ReceiveCalls {
+        polls: AtomicUsize,
+        boxed: AtomicUsize,
+    }
+
     struct Peer {
+        polled_receive: bool,
+        receive_calls: Arc<ReceiveCalls>,
         upload: Option<Arc<UploadFixture>>,
         drop_open: bool,
         drop_response: bool,
@@ -1264,6 +1283,8 @@ mod tests {
         received: Mutex<Vec<(u8, usize, usize)>>,
     }
     struct Memory {
+        polled_receive: bool,
+        receive_calls: Arc<ReceiveCalls>,
         input: mpsc::Receiver<Datagram>,
         output: mpsc::Sender<Datagram>,
         cancel: CancellationToken,
@@ -1276,6 +1297,21 @@ mod tests {
             false
         }
 
+        fn supports_poll_receive(&self) -> bool {
+            self.polled_receive
+        }
+
+        fn poll_receive(
+            &mut self,
+            context: &mut std::task::Context<'_>,
+            _: &mut Vec<u8>,
+        ) -> std::task::Poll<Result<Datagram, DispatchError>> {
+            self.receive_calls.polls.fetch_add(1, Ordering::Relaxed);
+            self.input
+                .poll_recv(context)
+                .map(|packet| packet.ok_or(DispatchError::NotAllowed))
+        }
+
         fn payload_budget(&self, _: &Destination) -> DatagramBudget {
             self.budget
         }
@@ -1286,6 +1322,7 @@ mod tests {
                 .map_err(|_| DispatchError::NotAllowed)
         }
         async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            self.receive_calls.boxed.fetch_add(1, Ordering::Relaxed);
             self.input.recv().await.ok_or(DispatchError::NotAllowed)
         }
         async fn close(&mut self) -> Result<(), DispatchError> {
@@ -1310,6 +1347,8 @@ mod tests {
         }
         fn with_response_loss(drop_open: bool, drop_response: bool, stall: bool) -> Arc<Self> {
             Arc::new(Self {
+                polled_receive: false,
+                receive_calls: Arc::default(),
                 upload: None,
                 drop_open,
                 drop_response,
@@ -1358,6 +1397,8 @@ mod tests {
             let peer = self.clone();
             let task=self.tasks.spawn(observation::task(async move{tokio::select!{()=server_cancel.cancelled()=>{},_=serve(&peer,incoming,outgoing)=>{}}}));
             Ok(Box::new(Memory {
+                polled_receive: self.polled_receive,
+                receive_calls: self.receive_calls.clone(),
                 input,
                 output,
                 cancel,
@@ -1777,6 +1818,71 @@ mod tests {
         c.transport = crate::config::MieruTransport::Udp;
         c
     }
+    #[tokio::test]
+    async fn mieru_udp_physical_poll_and_fallback_keep_reliability_and_stop() {
+        const PAYLOAD: &[u8] = b"physical carrier roundtrip";
+        for polled in [false, true] {
+            let probe = ResourceProbe::default();
+            let (result, calls, loss) = probe
+                .scope(async {
+                    let mut peer = Peer::with_response_loss(true, true, false);
+                    Arc::get_mut(&mut peer).unwrap().polled_receive = polled;
+                    let calls = peer.receive_calls.clone();
+                    let mut configuration = config();
+                    configuration.handshake_mode = crate::config::MieruHandshake::Standard;
+                    let node = super::super::MieruOutbound::new(
+                        &configuration,
+                        UpstreamPath::proxy(Arc::new(peer.clone())),
+                        32768,
+                    )
+                    .unwrap();
+                    let result = tokio::time::timeout(Duration::from_secs(10), async {
+                        let context = EstablishContext::with_timeout(Duration::from_secs(10));
+                        let mut stream = node
+                            .connect_stream(super::super::tests::session(), &context)
+                            .await
+                            .map_err(|_| closed())?
+                            .io;
+                        stream.write_all(PAYLOAD).await?;
+                        let mut echoed = [0; PAYLOAD.len()];
+                        stream.read_exact(&mut echoed).await?;
+                        Ok::<_, io::Error>(echoed)
+                    })
+                    .await;
+                    node.shutdown().await;
+                    drop(node);
+                    peer.stop().await;
+                    let loss = (
+                        peer.opens.load(Ordering::Acquire),
+                        peer.response_dropped.load(Ordering::Acquire),
+                        peer.response_transmissions.load(Ordering::Acquire),
+                    );
+                    (result, calls, loss)
+                })
+                .await;
+            // Validate business progress and joined ownership before path selection.
+            assert!(probe.snapshot().is_idle());
+            assert_eq!(
+                result
+                    .expect("memory physical carrier timed out")
+                    .expect("memory physical carrier failed"),
+                PAYLOAD
+            );
+            assert!(loss.0 >= 2, "first OPEN was not retried");
+            assert!(loss.1, "first response was not dropped");
+            assert!(loss.2 >= 2, "first response was not retried");
+            let polls = calls.polls.load(Ordering::Relaxed);
+            let boxed = calls.boxed.load(Ordering::Relaxed);
+            if polled {
+                assert!(polls > 0, "polled physical carrier was never polled");
+                assert_eq!(boxed, 0, "polled carrier used boxed async receive");
+            } else {
+                assert_eq!(polls, 0, "fallback unexpectedly used optional poll");
+                assert!(boxed > 0, "fallback never used its async receive");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn mieru_udp_pattern_consumes_nonce_low_entropy_and_actual_path_budget() {
         // Independently encoded MODE32 pattern with no padding/control
