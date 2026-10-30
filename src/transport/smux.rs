@@ -37,7 +37,7 @@ impl Default for Options {
         Self {
             version: 1,
             frame_size: crate::limits::SING_MUX_CHUNK,
-            receive_buffer: 2 * 1024 * 1024,
+            receive_buffer: 3 * 1024 * 1024,
             stream_buffer: crate::limits::SMUX_RECEIVE_QUEUE * crate::limits::SING_MUX_CHUNK,
             keepalive: None,
         }
