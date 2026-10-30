@@ -101,6 +101,7 @@ jobs:
           nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
           registry = {"registry+https://github.com/rust-lang/crates.io-index", "registry+https://index.crates.io/"}
           boring_source = "git+https://github.com/YuanDevTeam/boring?branch=release#43c1c1d5b9464b3f2d5204be8664778fada7dbaf"
+          smoltcp_source = "git+https://github.com/smoltcp-rs/smoltcp?rev=24bda3b4f982625d8453d4360172557d24921c76#24bda3b4f982625d8453d4360172557d24921c76"
 
           def require(condition, message):
               if not condition:
@@ -151,7 +152,7 @@ jobs:
           quiche = package("quiche", "0.30.0")
           require(features(quiche) == {"boring", "boring-sys", "boringssl-boring-crate", "foreign-types-shared"}, "quiche must use the shared Boring provider without FFI or qlog")
           require(quiche.get("license") == "BSD-2-Clause", "unapproved quiche license")
-          stack = package("smoltcp", "0.14.0")
+          stack = package("smoltcp", "0.14.0", {smoltcp_source})
           require(stack.get("license") == "0BSD", "unapproved raw IP stack license")
           rsa = package("rsa", "0.9.10")
           rcgen = package("rcgen", "0.14.10")

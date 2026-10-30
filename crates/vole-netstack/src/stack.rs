@@ -1355,6 +1355,152 @@ mod tests {
         Packet::new(ip.into_inner())
     }
 
+    // Keep both real handshakes and the failed-emit timeline in one regression.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn failed_fast_retransmit_survives_another_socket_filling_tx() {
+        use crate::segmentation::tests::tcp_packet;
+        use tokio::io::AsyncWriteExt;
+        let config = NetStackConfig {
+            packet_queue: 1,
+            ..NetStackConfig::default()
+        };
+        let (_inbound, receiver) = mpsc::channel(config.packet_queue);
+        let (outbound, mut packets) = mpsc::channel(config.packet_queue);
+        let (accept, mut streams) = mpsc::channel(config.tcp_accept_queue);
+        let (stopped, _) = watch::channel(false);
+        let mut driver = Driver::new(
+            config,
+            receiver,
+            outbound,
+            Some(accept),
+            None,
+            CancellationToken::new(),
+            Arc::new(Notify::new()),
+            NetStackStats::default(),
+            stopped,
+        );
+        let flows = [
+            FlowKey {
+                source: "10.0.0.2:12000".parse().unwrap(),
+                destination: "192.0.2.1:12001".parse().unwrap(),
+            },
+            FlowKey {
+                source: "10.0.0.3:12002".parse().unwrap(),
+                destination: "192.0.2.1:12001".parse().unwrap(),
+            },
+        ];
+        let mut sequences = [0; 2];
+        for (index, flow) in flows.into_iter().enumerate() {
+            let remote_sequence = 100 + u32::try_from(index).unwrap() * 100;
+            driver.handle_packet_batch(tcp_packet(flow, remote_sequence, 0, 2, 0));
+            driver.drive();
+            let syn_ack = packets.try_recv().expect("actual SYN-ACK missing");
+            let ip = Ipv4Packet::new_checked(syn_ack.data()).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert!(tcp.syn() && tcp.ack());
+            sequences[index] =
+                u32::from_be_bytes(ip.payload()[4..8].try_into().unwrap()).wrapping_add(1);
+            driver.handle_packet_batch(tcp_packet(
+                flow,
+                remote_sequence + 1,
+                sequences[index],
+                16,
+                0,
+            ));
+            driver.drive();
+            assert!(packets.try_recv().is_err());
+        }
+        let mut first_stream = streams.try_recv().unwrap();
+        let mut retry_stream = streams.try_recv().unwrap();
+        let first_handle = driver.tcp_entries[&flows[0]].socket;
+        let retry_handle = driver.tcp_entries[&flows[1]].socket;
+        let handles: Vec<_> = driver.sockets.iter().map(|(handle, _)| handle).collect();
+        assert!(
+            handles
+                .iter()
+                .position(|handle| *handle == first_handle)
+                .unwrap()
+                < handles
+                    .iter()
+                    .position(|handle| *handle == retry_handle)
+                    .unwrap(),
+            "fixture requires the output-filling socket before the retry socket"
+        );
+
+        let lost = b"actual-unacknowledged-DATA";
+        retry_stream.write_all(lost).await.unwrap();
+        driver.drive_tcp_sockets();
+        let now = Instant::now();
+        driver
+            .interface
+            .poll_egress(now, &mut driver.device, &mut driver.sockets);
+        let original = packets.try_recv().expect("actual original DATA missing");
+        let ip = Ipv4Packet::new_checked(original.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert_eq!(tcp.dst_port(), flows[1].source.port());
+        assert_eq!(tcp.payload(), lost);
+        let original_sequence = tcp.seq_number();
+        assert_eq!(
+            driver.sockets.get::<tcp::Socket>(retry_handle).send_queue(),
+            lost.len()
+        );
+
+        // The actual TCP ACK parser schedules fast retransmit. Do not poll
+        // egress until the earlier socket has an ordinary DATA packet ready.
+        let ack_at = now + smoltcp::time::Duration::from_millis(1);
+        for _ in 0..3 {
+            driver.handle_packet(tcp_packet(flows[1], 201, sequences[1], 16, 0));
+            driver
+                .interface
+                .poll_ingress_single(ack_at, &mut driver.device, &mut driver.sockets);
+            assert!(driver.device.rx_is_empty());
+        }
+        let filling = b"earlier-socket-occupies-the-only-output-slot";
+        first_stream.write_all(filling).await.unwrap();
+        driver.drive_tcp_sockets();
+        driver.interface.poll_egress(
+            now + smoltcp::time::Duration::from_millis(2),
+            &mut driver.device,
+            &mut driver.sockets,
+        );
+        let occupied = packets
+            .try_recv()
+            .expect("earlier socket did not emit DATA");
+        let ip = Ipv4Packet::new_checked(occupied.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert_eq!(tcp.dst_port(), flows[0].source.port());
+        assert_eq!(tcp.payload(), filling);
+        assert!(!driver.device.tx_is_full());
+
+        // Capacity is now free. No new peer ACK, application write or real-time
+        // wait follows the failed emit; only one public egress poll at +1ms.
+        driver.interface.poll_egress(
+            now + smoltcp::time::Duration::from_millis(3),
+            &mut driver.device,
+            &mut driver.sockets,
+        );
+        let retried = packets.try_recv().ok().is_some_and(|packet| {
+            let ip = Ipv4Packet::new_checked(packet.data()).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            tcp.dst_port() == flows[1].source.port()
+                && tcp.seq_number() == original_sequence
+                && tcp.payload() == lost
+                && !tcp.syn()
+                && !tcp.fin()
+                && !tcp.rst()
+        });
+        driver.shutdown();
+        drop((first_stream, retry_stream));
+        assert!(driver.cancellation.is_cancelled());
+        assert!(driver.tcp_entries.is_empty());
+        assert_eq!(driver.sockets.iter().count(), 0);
+        assert!(
+            retried,
+            "failed fast retransmit must remain immediately retryable after TX capacity returns"
+        );
+    }
+
     #[tokio::test]
     async fn full_tx_pure_ack_releases_actual_smoltcp_send_queue() {
         use tokio::io::AsyncWriteExt;

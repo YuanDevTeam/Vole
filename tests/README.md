@@ -204,6 +204,8 @@ cargo test --locked -p vole-blake3-raw --test derive
 内存QUIC/H3对端通过受控DatagramTransport交换真实包，不绑定宿主监听器。
 `transport::quiche_h3::native_ready_batch_memory_tests::` 验证真实wire帧的共享排空额度、已轮询FIN/RESET、兄弟流和可靠body前缀；不代替完整driver与TUN验收。
 netstack的`active_tcp_shutdown_drains_accepted_tail_before_fin_without_prior_acks`与`active_tcp_drop_drains_accepted_tail_before_fin_without_prior_acks`使用既有缓冲和真实ACK，验证未确认写入的前缀、FIN排序及最终释放。
+`stack::tests::failed_fast_retransmit_survives_another_socket_filling_tx`使用两个真实内存TCP socket与重复ACK，
+验证兄弟socket占满输出后，失败的快速重传在容量恢复时仍可立即重试；不启动网络对端或TUN。
 SS2022 的严格官方 TCP codec 回归可单独选择 `official_tcp_codecs_all_ciphers_` 和
 `tcp_response_header_time_salt_auth_and_fragmentation_follow_official_codec`；不要在宿主整体运行
 `outbound::shadowsocks::tests::`，其中还包含监听器用例。
