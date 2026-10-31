@@ -2948,11 +2948,11 @@ mod tests {
         state.close();
     }
     #[tokio::test(start_paused = true)]
-    async fn mieru_udp_send_credit64_two_sids_keep_fragment_leases_until_their_acks() {
+    async fn mieru_udp_send_credit96_two_sids_keep_fragment_leases_until_their_acks() {
         let probe = ResourceProbe::default();
         probe.scope(async {
             let shared = Shared::output_test_shared(CancellationToken::new());
-            let credit = Arc::new(Semaphore::new(65536));
+            let credit = Arc::new(Semaphore::new(98304));
             let (writer, mut commands) = mpsc::channel(2);
             let mut states = Vec::new();
             let mut completions = Vec::new();
@@ -2968,7 +2968,7 @@ mod tests {
                 states.push(state);
                 completions.push(done);
             }
-            assert_eq!(credit.available_permits(), 0);
+            assert_eq!(credit.available_permits(), 32768);
             assert_eq!(writer.max_capacity(), 2);
             let pattern = EffectivePattern::compile(
                 None, super::super::pattern::HostProfile::capture(), "vole",
@@ -3014,7 +3014,7 @@ mod tests {
                 reliable.acknowledge(16, 16, true, Instant::now());
                 reliable.acknowledge(16, 16, true, Instant::now());
             }
-            assert_eq!(credit.available_permits(), 0,
+            assert_eq!(credit.available_permits(), 32768,
                 "partial and duplicate ACKs retain the shared whole-write leases");
             for _ in 0..2 {
                 for id in [7, 8] {
@@ -3028,7 +3028,7 @@ mod tests {
                 }
             }
             for done in &mut completions { done.try_recv().unwrap().unwrap(); }
-            assert_eq!(credit.available_permits(), 0, "first-send success is not an ACK");
+            assert_eq!(credit.available_permits(), 32768, "first-send success is not an ACK");
             for (id, expected) in [(7, b'A'), (8, b'B')] {
                 let mut payload = Vec::new();
                 let mut next = 0;
@@ -3044,14 +3044,14 @@ mod tests {
                 assert_eq!(payload, vec![expected; 32768]);
             }
             sessions.get_mut(&7).unwrap().acknowledge(fragments as u32, 16, true, Instant::now());
-            assert_eq!(credit.available_permits(), 32768,
+            assert_eq!(credit.available_permits(), 65536,
                 "ACK for one SID retires only that SID's shared-carrier lease");
             shared.cancel.cancel();
             sessions.clear(); // Terminal clearing releases the unacked sibling, not a false ACK.
             shared.sessions.lock().unwrap().clear();
             for state in &states { state.close(); }
             drop(states);
-            assert_eq!(credit.available_permits(), 65536);
+            assert_eq!(credit.available_permits(), 98304);
         }).await;
         assert!(probe.snapshot().is_idle());
     }

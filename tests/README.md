@@ -29,6 +29,10 @@ Mieru UDP载体的TCP上传收尾：`outbound::mieru::udp::tests::mieru_udp_uplo
 五项纯内存回归使用真实编解码、可靠驱动与有界origin流，覆盖尾包首发成功后丢失、重传后EOF，
 以及待ACK时的Stop、取消shutdown future、同载体兄弟、立即Drop与对端Close；不代签真实TUN交付或RSS。
 
+关闭后的收包边界：`outbound::mieru::udp::tests::mieru_udp_closed_`，以实际首Close丢失、迟到ACK和origin EOF验证最后SID与同载体兄弟。
+`outbound::mieru::udp::balanced_driver_tests::mieru_udp_empty_sid_ready_invalid_preserves_idle_retirement_cancel_and_first_send_gate`
+覆盖首发前不收包、空会话持续无效输入下的原空闲退休及Stop；这些纯内存结果不替代真实TUN验收。
+
 smux 纯内存边界：`transport::smux::`，覆盖就绪 DATA 的单次 poll 预算、未读流与兄弟流、整帧分配预算、极小合法配额、本地关闭释放和远端 DATA→FIN 顺序。
 调度测试隔离 Tokio 的独立 cooperative allowance；这些测试不代替真实 TUN 性能验证。
 
@@ -216,9 +220,10 @@ SS2022 的严格官方 TCP codec 回归可单独选择 `official_tcp_codecs_all_
 `outbound::shadowsocks::tests::`，其中还包含监听器用例。
 Mieru回归保留TCP/UDP分池、慢读背压、单槽交接、终态传播、接收分配复用和未读响应下的Stop。
 `outbound::mieru::tcp::udp_send_credit_memory_tests::` 用实际Client::create与有生命周期计数的
-内存DatagramTransport验证默认LOW UDP Associate载体共享64 KiB发送信用；非默认预算、
+内存DatagramTransport验证默认LOW UDP Associate载体共享96 KiB发送信用；非默认预算、
 其他业务/模式/载体不变，并组接两个真实RawStream验证共享信用、原FIFO2及取消/Stop回收。
-`outbound::mieru::udp::tests::mieru_udp_send_credit64_two_sids_keep_fragment_leases_until_their_acks`
+两笔32 KiB写入后仍有32 KiB信用；第三笔写被原FIFO2阻塞，不冒充96 KiB已耗尽。
+`outbound::mieru::udp::tests::mieru_udp_send_credit96_two_sids_keep_fragment_leases_until_their_acks`
 通过原可靠分片与真实codec输出验证部分/重复ACK、first-send与独立SID许可退休，原TX8不变。
 这些用例不创建socket、DNS、监听器或网络对端，不证明真实TUN性能或RSS。
 

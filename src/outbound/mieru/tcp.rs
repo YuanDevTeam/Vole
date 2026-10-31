@@ -500,7 +500,7 @@ impl Client {
             && self.pool(business) == Some(Business::UdpAssociate)
             && self.capacity == 32 * 1024
         {
-            64 * 1024
+            96 * 1024
         } else {
             self.capacity
         };

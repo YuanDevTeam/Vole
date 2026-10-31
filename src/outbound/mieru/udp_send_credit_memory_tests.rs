@@ -85,13 +85,13 @@ fn assert_joined(counts: &Counts, expected: usize) {
 }
 
 #[tokio::test(start_paused = true)]
-async fn mieru_udp_send_credit64_actual_factory_preserves_scope_and_nondefault_budgets() {
+async fn mieru_udp_send_credit96_actual_factory_preserves_scope_and_nondefault_budgets() {
     let probe = ResourceProbe::default();
     probe
         .scope(async {
-            assert!(65536 <= Semaphore::MAX_PERMITS);
+            assert!(98304 <= Semaphore::MAX_PERMITS);
             for (mode, business, capacity, expected) in [
-                (MieruMultiplexing::Low, Business::UdpAssociate, 32768, 65536),
+                (MieruMultiplexing::Low, Business::UdpAssociate, 32768, 98304),
                 (MieruMultiplexing::Low, Business::TcpConnect, 32768, 32768),
                 (MieruMultiplexing::Low, Business::UdpAssociate, 1, 1),
                 (MieruMultiplexing::Low, Business::UdpAssociate, 16, 16),
@@ -153,7 +153,7 @@ async fn mieru_udp_send_credit64_actual_factory_preserves_scope_and_nondefault_b
 }
 
 #[tokio::test(start_paused = true)]
-async fn mieru_udp_send_credit64_actual_carrier_two_sids_share_credit_fifo_and_stop() {
+async fn mieru_udp_send_credit96_actual_carrier_two_sids_share_credit_fifo_and_stop() {
     let probe = ResourceProbe::default();
     probe
         .scope(async {
@@ -209,9 +209,9 @@ async fn mieru_udp_send_credit64_actual_carrier_two_sids_share_credit_fifo_and_s
                     Pin::new(&mut streams[1]).poll_write(&mut cx, &second),
                     Poll::Ready(Ok(32768))
                 ),
-                "a second SID must use the same carrier's extra half"
+                "a second SID must use the same carrier's shared credit"
             );
-            assert_eq!(credit.available_permits(), 0);
+            assert_eq!(credit.available_permits(), 32768);
             assert_eq!(carrier.writer.max_capacity(), 2);
             assert_eq!(carrier.writer.capacity(), 0);
             assert_eq!(states[0].receive_bytes.available_permits(), 32768);
@@ -221,6 +221,9 @@ async fn mieru_udp_send_credit64_actual_carrier_two_sids_share_credit_fifo_and_s
                     .poll_write(&mut cx, b"C")
                     .is_pending()
             );
+            // FIFO2, not byte-credit exhaustion, blocks this third write.
+            // Its one-byte permit remains owned inside the original pending send.
+            assert_eq!(credit.available_permits(), 32767);
             assert!(Pin::new(&mut streams[0]).poll_flush(&mut cx).is_pending());
             let selected = client
                 .reserve_reusable(Business::UdpAssociate, |_| 0)
@@ -241,7 +244,7 @@ async fn mieru_udp_send_credit64_actual_carrier_two_sids_share_credit_fifo_and_s
                 Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe));
             }
             drop((streams, states, carrier, client));
-            assert_eq!(credit.available_permits(), 65536);
+            assert_eq!(credit.available_permits(), 98304);
             assert_joined(&peer.counts, 1);
         })
         .await;
