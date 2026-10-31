@@ -218,7 +218,7 @@ pub(super) async fn transmit(
             .await?;
         // Shorten only this shared-H3 writer's default partial-batch deadline.
         let delay = if eager_capacity.is_some() {
-            Duration::from_millis(5)
+            Duration::from_millis(2)
         } else {
             Duration::from_millis(request.options.post_interval_ms.sample() as u64)
         };

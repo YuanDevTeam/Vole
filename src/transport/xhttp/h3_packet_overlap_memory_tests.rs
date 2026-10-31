@@ -388,16 +388,16 @@ async fn qualified_default_partial_post_reaches_h3_before_ten_ms_with_strong_rec
         writer.write_all(&payload_len(0, 64)).await.unwrap();
         let at = arrival.await.unwrap();
         // Real peer headers/body/FIN are observed, not the delay expression.
-        // Arrival may include transport service; the original 10 ms default
+        // Arrival may include transport service; the preceding 5 ms default
         // cannot pass this bound even when its transport service is immediate.
         let elapsed = at - began;
         assert!(
-            elapsed >= Duration::from_millis(5),
+            elapsed >= Duration::from_millis(2),
             "partial POST bypassed aggregation"
         );
         assert!(
-            elapsed < Duration::from_millis(10),
-            "qualified default still waited ten ms"
+            elapsed < Duration::from_millis(5),
+            "qualified default still waited five ms"
         );
         assert_eq!(writer.snapshot().accepted, 64);
         assert_eq!(writer.snapshot().committed, 0);
