@@ -61,7 +61,42 @@ impl LowEntropyEncoding {
         }
         let count = self.source_bytes()?;
         let plan = (source_len >= PLANNED_SOURCE_MIN).then(|| PackingPlan::new(self.half_mask));
-        for chunk in (0..source_len.div_ceil(count)).rev() {
+        let mut chunks = source_len.div_ceil(count);
+        while chunks != 0 {
+            #[cfg(all(
+                target_arch = "aarch64",
+                target_feature = "neon",
+                target_endian = "little"
+            ))]
+            if let Some(plan) = &plan {
+                // The highest partial chunk stays scalar. Read both complete
+                // source chunks before either overlapping in-place store.
+                if chunks >= 2 && chunks * count <= source_len {
+                    let lower = chunks - 2;
+                    let higher = chunks - 1;
+                    let source = [lower, higher].map(|chunk| {
+                        let offset = chunk * count;
+                        body[offset..offset + count]
+                            .iter()
+                            .fold(0u64, |word, byte| word << 8 | u64::from(*byte))
+                    });
+                    let right = [
+                        packing_phase(self.rotation, lower),
+                        packing_phase(self.rotation, higher),
+                    ];
+                    let mut encoded = plan.deposit_pair_neon(source, right);
+                    if self.padding_bit == 1 {
+                        encoded[0] |= !self.mask(lower);
+                        encoded[1] |= !self.mask(higher);
+                    }
+                    body[higher * 8..higher * 8 + 8].copy_from_slice(&encoded[1].to_be_bytes());
+                    body[lower * 8..lower * 8 + 8].copy_from_slice(&encoded[0].to_be_bytes());
+                    chunks -= 2;
+                    continue;
+                }
+            }
+            chunks -= 1;
+            let chunk = chunks;
             let offset = chunk * count;
             let len = (source_len - offset).min(count);
             let source = body[offset..offset + len]
@@ -205,6 +240,46 @@ impl PackingPlan {
             word = (word ^ value) | (value << distance);
         }
         word & self.mask
+    }
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    #[inline]
+    fn deposit_pair_neon(&self, words: [u64; 2], right: [u32; 2]) -> [u64; 2] {
+        use core::arch::aarch64::{
+            vandq_u64, vdupq_n_s64, vdupq_n_u64, veorq_u64, vgetq_lane_u64, vorrq_u64,
+            vsetq_lane_u64, vshlq_u64,
+        };
+
+        let width = u32::from(self.source_bits);
+        let packed = [0usize, 1].map(|lane| {
+            let wrap = u32::from(self.prefix_ones[right[lane] as usize]);
+            let word = words[lane] & low_bits(width);
+            ((word << wrap) | (word >> (width - wrap))) & low_bits(width)
+        });
+        // SAFETY: this helper is compiled only with AArch64 NEON enabled.
+        // All lanes are the valid constants 0/1; only local integers enter
+        // the vector operations, with no body pointers or memory accesses.
+        unsafe {
+            let mut words = vsetq_lane_u64::<1>(packed[1], vdupq_n_u64(packed[0]));
+            words = vandq_u64(words, vdupq_n_u64(low_bits(width)));
+            for (i, movement) in self.moves.iter().enumerate().rev() {
+                let distance = 1u32 << i;
+                let value = vandq_u64(words, vdupq_n_u64(*movement >> distance));
+                words = vorrq_u64(
+                    veorq_u64(words, value),
+                    vshlq_u64(value, vdupq_n_s64(i64::from(distance))),
+                );
+            }
+            words = vandq_u64(words, vdupq_n_u64(self.mask));
+            [
+                vgetq_lane_u64::<0>(words).rotate_right(right[0]),
+                vgetq_lane_u64::<1>(words).rotate_right(right[1]),
+            ]
+        }
     }
 
     #[inline]
@@ -726,6 +801,64 @@ mod tests {
             assert_eq!(body, expected);
             encoding.compact(&mut body, source.len()).unwrap();
             assert_eq!(&body[..source.len()], &source);
+        }
+    }
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little"
+    ))]
+    #[test]
+    fn mieru_low_entropy_neon_expand_pairs_tails_unaligned_canaries_match_frozen_oracle() {
+        for mode in 1..=4 {
+            let count = usize::from(mode) + 3;
+            let half_mask = ((1u32 << ((u32::from(mode) + 3) * 4)) - 1).rotate_left(11);
+            for rotation in planned_test_rotations() {
+                for padding_bit in 0..=1 {
+                    let encoding = LowEntropyEncoding {
+                        mode,
+                        half_mask,
+                        rotation,
+                        padding_bit,
+                    };
+                    // Threshold, odd/even pairs and the phase31->0 pair boundary.
+                    for full_chunks in [8usize, 9, 31, 32, 33, 34] {
+                        for tail in 0..count {
+                            let len = full_chunks * count + tail;
+                            let encoded_len = encoding.encoded_len(len).unwrap();
+                            let source = planned_test_payload(
+                                len,
+                                (u64::from(mode) << 48)
+                                    ^ ((full_chunks as u64) << 24)
+                                    ^ ((tail as u64) << 8)
+                                    ^ u64::from(rotation),
+                            );
+                            for residue in [1usize, 3, 7] {
+                                let mut actual = vec![0xa5; encoded_len + 32];
+                                let start = (1..=16)
+                                    .find(|offset| {
+                                        (actual.as_ptr() as usize + *offset) & 15 == residue
+                                    })
+                                    .unwrap();
+                                assert_eq!((actual.as_ptr() as usize + start) & 15, residue);
+                                let end = start + encoded_len;
+                                actual[start..start + len].copy_from_slice(&source);
+                                let mut expected = actual.clone();
+                                bit_oracle_expand(encoding, &mut expected[start..end], len)
+                                    .unwrap();
+                                encoding.expand(&mut actual[start..end], len).unwrap();
+                                assert_eq!(
+                                    actual, expected,
+                                    "mode={mode} rotation={rotation} pad={padding_bit} chunks={full_chunks} tail={tail} residue={residue}"
+                                );
+                                assert!(actual[..start].iter().all(|byte| *byte == 0xa5));
+                                assert!(actual[end..].iter().all(|byte| *byte == 0xa5));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
