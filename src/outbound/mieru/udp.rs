@@ -1238,6 +1238,10 @@ async fn run(
         if packet_pattern.truncated {
             shared.activity.notify_one();
         }
+        // Yield after actual TX budget exhaustion for cooperative task fairness.
+        if packet_pattern.remaining == 0 {
+            tokio::task::yield_now().await;
+        }
     }
 }
 #[cfg(test)]
