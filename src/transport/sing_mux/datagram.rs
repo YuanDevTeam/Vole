@@ -103,13 +103,13 @@ impl DatagramIo {
             return Err(io::ErrorKind::InvalidData.into());
         }
         let mut scratch = [0; 1024];
+        // Bounded read-ahead amortizes short address and length reads.
         while self.input.len() < length {
-            let count = (length - self.input.len()).min(scratch.len());
             let n = self
                 .io
                 .as_mut()
                 .ok_or(io::ErrorKind::BrokenPipe)?
-                .read(&mut scratch[..count])
+                .read(&mut scratch)
                 .await?;
             if n == 0 {
                 return Err(io::ErrorKind::UnexpectedEof.into());
@@ -135,8 +135,13 @@ impl DatagramIo {
         if length == 0 {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        self.fill(address_len + 2 + length).await?;
-        let payload = self.input.split().freeze().slice(address_len + 2..);
+        let frame_len = address_len + 2 + length;
+        self.fill(frame_len).await?;
+        let payload = self
+            .input
+            .split_to(frame_len)
+            .freeze()
+            .slice(address_len + 2..);
         Ok(Datagram {
             remote,
             payload,
@@ -236,6 +241,7 @@ mod tests {
     struct Gates {
         write_bytes: Arc<AtomicUsize>,
         flush_blocked: Arc<AtomicBool>,
+        read_calls: Arc<AtomicUsize>,
     }
     impl Gates {
         fn release(&self) {
@@ -253,6 +259,7 @@ mod tests {
             cx: &mut Context<'_>,
             out: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
+            self.gates.read_calls.fetch_add(1, Ordering::SeqCst);
             Pin::new(&mut self.raw).poll_read(cx, out)
         }
     }
@@ -291,6 +298,7 @@ mod tests {
         let gates = Gates {
             write_bytes: Arc::new(AtomicUsize::new(if partial_write { 3 } else { usize::MAX })),
             flush_blocked: Arc::new(AtomicBool::new(!partial_write)),
+            read_calls: Arc::new(AtomicUsize::new(0)),
         };
         (
             DatagramIo::new(
@@ -479,6 +487,53 @@ mod tests {
             peer.read_to_end(&mut actual).await.unwrap();
             assert_eq!(actual, wire(&first)[..3]);
             assert!(transport.send(first).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn scratch_read_ahead_amortizes_reads_and_keeps_cancelled_record_ownership() {
+        // Independent literal wire: IPv4 address, port, u16 length, payload.
+        let mut bytes = vec![1, 192, 0, 2, 1, 0, 53, 3, 232];
+        bytes.extend_from_slice(&[0x51; 1000]);
+        let first_length = bytes.len();
+        bytes.extend_from_slice(&[1, 198, 51, 100, 2, 0, 54, 0, 3, b'e', b'n', b'd']);
+        for cut in [0, 1, 8, 13, 1008] {
+            let (mut transport, mut peer, gates) = fixture(false);
+            if cut != 0 {
+                peer.write_all(&bytes[..cut]).await.unwrap();
+                {
+                    let mut receiving = transport.receive();
+                    assert!(futures_util::poll!(receiving.as_mut()).is_pending());
+                }
+                assert_eq!(transport.input.as_ref(), &bytes[..cut]);
+            }
+            peer.write_all(&bytes[cut..]).await.unwrap();
+            let before = gates.read_calls.load(Ordering::SeqCst);
+            let first = transport.receive().await.unwrap();
+            assert_eq!(
+                first.remote,
+                Destination::Ip("192.0.2.1:53".parse().unwrap())
+            );
+            assert_eq!(first.payload.as_ref(), &[0x51; 1000]);
+            assert_eq!(
+                gates.read_calls.load(Ordering::SeqCst) - before,
+                1,
+                "one available scratch read must cover the remaining first record and sibling"
+            );
+            assert_eq!(transport.input.as_ref(), &bytes[first_length..]);
+            let before_sibling = gates.read_calls.load(Ordering::SeqCst);
+            let sibling = transport.receive().await.unwrap();
+            assert_eq!(
+                sibling.remote,
+                Destination::Ip("198.51.100.2:54".parse().unwrap())
+            );
+            assert_eq!(sibling.payload.as_ref(), b"end");
+            assert_eq!(gates.read_calls.load(Ordering::SeqCst), before_sibling);
+            assert!(transport.input.is_empty());
+            // Keep the first payload live while consuming its shared sibling tail.
+            assert_eq!(first.payload.as_ref(), &[0x51; 1000]);
+            transport.close().await.unwrap();
+            assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
         }
     }
 }
