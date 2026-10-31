@@ -42,6 +42,8 @@ const FIRST_CHECK: Duration = Duration::from_millis(10);
 const CLOSE_RECEIVE_GRACE: Duration = Duration::from_millis(100);
 const RECEIVE_BATCH: u8 = 8;
 const OUTPUT_QUANTUM: usize = 8;
+const CLOSE_RETRY_CAPACITY: usize = 16;
+const CLOSE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const REORDER_SLACK: usize = 32768;
 
 struct WriteLease {
@@ -93,6 +95,78 @@ struct PacketPattern<'a> {
     remaining: usize,
     truncated: bool,
 }
+#[derive(Clone, Copy)]
+struct CloseRetry {
+    metadata: SessionMetadata,
+    due: Instant,
+    remaining: u8,
+}
+#[derive(Default)]
+struct CloseRetries {
+    entries: Option<Box<[Option<CloseRetry>; CLOSE_RETRY_CAPACITY]>>,
+}
+impl CloseRetries {
+    fn remove(&mut self, id: u32) {
+        let Some(entries) = self.entries.as_mut() else {
+            return;
+        };
+        if let Some(index) = entries
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.metadata.session_id == id))
+        {
+            entries[index..].rotate_left(1);
+            entries[CLOSE_RETRY_CAPACITY - 1] = None;
+        }
+    }
+    fn insert(&mut self, metadata: SessionMetadata, now: Instant) {
+        self.remove(metadata.session_id);
+        let entries = self
+            .entries
+            .get_or_insert_with(|| Box::new([None; CLOSE_RETRY_CAPACITY]));
+        let retry = Some(CloseRetry {
+            metadata,
+            due: now + CLOSE_RETRY_INTERVAL,
+            remaining: 2,
+        });
+        if let Some(slot) = entries.iter_mut().find(|entry| entry.is_none()) {
+            *slot = retry;
+        } else {
+            entries.rotate_left(1); // Evict only the oldest best-effort record.
+            entries[CLOSE_RETRY_CAPACITY - 1] = retry;
+        }
+    }
+    fn deadline(&self) -> Option<Instant> {
+        self.entries
+            .as_ref()?
+            .iter()
+            .flatten()
+            .map(|entry| entry.due)
+            .min()
+    }
+    fn due(&self, now: Instant) -> Option<(usize, CloseRetry)> {
+        self.entries
+            .as_ref()?
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.as_ref().map(|entry| (index, *entry)))
+            .filter(|(_, entry)| entry.due <= now)
+            .min_by_key(|(_, entry)| entry.due)
+    }
+    fn attempted(&mut self, index: usize, retry: CloseRetry, success: bool, now: Instant) {
+        if success && retry.remaining > 1 {
+            if let Some(entries) = self.entries.as_mut() {
+                entries[index] = Some(CloseRetry {
+                    due: now + CLOSE_RETRY_INTERVAL,
+                    remaining: retry.remaining - 1,
+                    ..retry
+                });
+            }
+        } else {
+            self.remove(retry.metadata.session_id);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CloseGrace {
     end: u32,
@@ -912,6 +986,7 @@ async fn input_packet(
     sessions: &mut BTreeMap<u32, Reliable>,
     partial: &mut Option<Partial>,
     buffer: &mut Vec<u8>,
+    close_retries: &mut CloseRetries,
 ) -> io::Result<bool> {
     if &packet.remote != peer || packet.payload.len() > usize::from(budget.receive()) {
         return Ok(false);
@@ -925,6 +1000,10 @@ async fn input_packet(
         return Ok(false);
     }
     let id = session_id(frame.metadata);
+    if matches!(frame.metadata, Metadata::Session(meta) if meta.kind == SessionKind::CloseResponse)
+    {
+        close_retries.remove(id); // Only after the original peer/auth/direction checks.
+    }
     if let Some(state) = sessions.get_mut(&id) {
         match frame.metadata {
             Metadata::Session(meta)
@@ -1043,6 +1122,7 @@ async fn run(
         .saturating_sub(DATA_OVERHEAD)
         .max(1);
     let mut sessions = BTreeMap::<u32, Reliable>::new();
+    let mut close_retries = CloseRetries::default();
     let mut partial = None;
     let mut buffer = Vec::with_capacity(usize::from(budget.transmit()));
     let mut receive_scratch = Vec::new();
@@ -1065,7 +1145,7 @@ async fn run(
         let mut received = None;
         tokio::select! {biased;
             ()=shared.cancel.cancelled()=>return Ok(()),
-            command=commands.recv()=>{let Some(command)=command else{return Ok(());};input_command(command,&mut sessions,chunk,receive_chunk,!pattern.low_entropy_enabled());},
+            command=commands.recv()=>{let Some(command)=command else{return Ok(());};close_retries.remove(command.state.id);input_command(command,&mut sessions,chunk,receive_chunk,!pattern.low_entropy_enabled());},
             ()=shared.activity.notified()=>{},
             ()=async {
                 let deadline = sessions
@@ -1074,6 +1154,7 @@ async fn run(
                     .min()
                     .unwrap_or(now + Duration::from_secs(5))
                     .min(now + Duration::from_secs(5));
+                let deadline = close_retries.deadline().map_or(deadline, |due| deadline.min(due));
                 tokio::time::sleep_until(deadline).await;
             }=>{},
             packet=receive_packet(transport, &mut receive_scratch),if has_output=>{received=Some(packet.map_err(|_|closed())?);}
@@ -1122,6 +1203,7 @@ async fn run(
                 &mut sessions,
                 &mut partial,
                 &mut buffer,
+                &mut close_retries,
             )
             .await?
             {
@@ -1139,6 +1221,36 @@ async fn run(
         shared.reap_unopened();
         if shared.clean() {
             return Ok(());
+        }
+        // One due retry gets one original TX opportunity after authenticated RX.
+        // This intentionally leaves at least seven slots when RX used none.
+        if packet_pattern.remaining != 0
+            && let Some((index, retry)) = close_retries.due(Instant::now())
+        {
+            let id = retry.metadata.session_id;
+            let live =
+                sessions.contains_key(&id) || shared.sessions.lock().unwrap().contains_key(&id);
+            if live {
+                close_retries.remove(id);
+            } else {
+                let result = send(
+                    transport,
+                    peer,
+                    encoder,
+                    username,
+                    shared,
+                    &mut packet_pattern,
+                    Metadata::Session(retry.metadata),
+                    &[],
+                    &mut buffer,
+                )
+                .await;
+                if shared.cancel.is_cancelled() {
+                    return Ok(());
+                }
+                // A failed best-effort retry must not fail healthy sibling SIDs.
+                close_retries.attempted(index, retry, result.is_ok(), Instant::now());
+            }
         }
         // Reuse the ID scan with fresh post-await time, before OUTPUT_QUANTUM
         // can stop the following loop. No new timer task or receive budget.
@@ -1163,6 +1275,7 @@ async fn run(
             last_output = Some(id);
             let state = sessions.get_mut(&id).unwrap();
             if state.state.cancel.is_cancelled() {
+                let mut retry = None;
                 if state.remote_close.is_none() && state.state.opened.load(Ordering::Acquire) {
                     let metadata = close_metadata(&state.state, SessionKind::CloseRequest);
                     send(
@@ -1177,9 +1290,17 @@ async fn run(
                         &mut buffer,
                     )
                     .await?;
+                    if state.state.business == super::tcp::Business::TcpConnect
+                        && let Metadata::Session(metadata) = metadata
+                    {
+                        retry = Some(metadata);
+                    }
                 }
                 sessions.remove(&id);
                 shared.sessions.lock().unwrap().remove(&id);
+                if let Some(metadata) = retry {
+                    close_retries.insert(metadata, Instant::now());
+                }
                 continue;
             }
             // App reads notify this driver. Retry delivery before every window
@@ -1299,6 +1420,25 @@ mod tests {
         cancel: CancellationToken,
         task: Option<JoinHandle<()>>,
         budget: DatagramBudget,
+        quiet_close: Option<(Arc<UploadFixture>, PacketDecoder)>,
+    }
+    impl Memory {
+        fn quiet_close_input(&self) -> bool {
+            self.quiet_close.as_ref().is_some_and(|(upload, _)| {
+                let sends = upload.physical_close_sends.load(Ordering::Acquire);
+                sends == 1 || (sends != 0 && upload.drop_all_close.load(Ordering::Acquire))
+            })
+        }
+        fn record_quiet_input(&self) {
+            if self.quiet_close_input() {
+                self.quiet_close
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .input_before_close_retry
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+        }
     }
     #[async_trait]
     impl DatagramTransport for Memory {
@@ -1316,23 +1456,59 @@ mod tests {
             _: &mut Vec<u8>,
         ) -> std::task::Poll<Result<Datagram, DispatchError>> {
             self.receive_calls.polls.fetch_add(1, Ordering::Relaxed);
-            self.input
+            if self.quiet_close_input() {
+                return std::task::Poll::Pending;
+            }
+            let result = self
+                .input
                 .poll_recv(context)
-                .map(|packet| packet.ok_or(DispatchError::NotAllowed))
+                .map(|packet| packet.ok_or(DispatchError::NotAllowed));
+            if matches!(&result, std::task::Poll::Ready(Ok(_))) {
+                self.record_quiet_input();
+            }
+            result
         }
 
         fn payload_budget(&self, _: &Destination) -> DatagramBudget {
             self.budget
         }
         async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
+            let close = if let Some((upload, decoder)) = &mut self.quiet_close {
+                let frame = decoder
+                    .decode_frame(
+                        packet.payload.clone(),
+                        super::super::tcp::now().map_err(|_| DispatchError::NotAllowed)?,
+                    )
+                    .map_err(|_| DispatchError::NotAllowed)?;
+                matches!(frame.metadata, Metadata::Session(meta)
+                    if meta.kind == SessionKind::CloseRequest && upload.is_target(meta.session_id))
+            } else {
+                false
+            };
             self.output
                 .send(packet)
                 .await
-                .map_err(|_| DispatchError::NotAllowed)
+                .map_err(|_| DispatchError::NotAllowed)?;
+            // Count only original transport Ready-OK, never an attempted poll.
+            if close {
+                self.quiet_close
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .physical_close_sends
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(())
         }
         async fn receive(&mut self) -> Result<Datagram, DispatchError> {
             self.receive_calls.boxed.fetch_add(1, Ordering::Relaxed);
-            self.input.recv().await.ok_or(DispatchError::NotAllowed)
+            if self.quiet_close_input() {
+                // Original driver timer/cancel may drop this unconsumed RX future.
+                std::future::pending::<()>().await;
+            }
+            let packet = self.input.recv().await.ok_or(DispatchError::NotAllowed)?;
+            self.record_quiet_input();
+            Ok(packet)
         }
         async fn close(&mut self) -> Result<(), DispatchError> {
             self.cancel.cancel();
@@ -1401,6 +1577,20 @@ mod tests {
                 upload.physical_opens.fetch_add(1, Ordering::AcqRel);
                 *upload.outgoing.lock().unwrap() = Some(outgoing.clone());
             }
+            let quiet_close =
+                if let Some(upload) = self.upload.as_ref().filter(|u| u.quiet_close_loss) {
+                    let key = crypto::derive_packet_key(
+                        "vole",
+                        "fixture-password",
+                        super::super::tcp::now().map_err(|_| DispatchError::NotAllowed)?,
+                    );
+                    Some((
+                        upload.clone(),
+                        PacketDecoder::new(&key, false).map_err(|_| DispatchError::NotAllowed)?,
+                    ))
+                } else {
+                    None
+                };
             let cancel = self.cancel.child_token();
             let server_cancel = cancel.clone();
             let peer = self.clone();
@@ -1413,6 +1603,7 @@ mod tests {
                 cancel,
                 task: Some(task),
                 budget: DatagramBudget::new(self.transmit_limit, MTU),
+                quiet_close,
             }))
         }
     }
@@ -2914,7 +3105,8 @@ mod tests {
                 &mut patterned,
                 &mut sessions,
                 &mut partial,
-                &mut Vec::new()
+                &mut Vec::new(),
+                &mut CloseRetries::default()
             )
             .await
             .unwrap()

@@ -12,6 +12,10 @@ struct UploadFixture {
     close_before_retry: AtomicBool,
     physical_opens: AtomicUsize,
     hold_ack: AtomicBool,
+    quiet_close_loss: bool,
+    drop_all_close: AtomicBool,
+    physical_close_sends: AtomicUsize,
+    input_before_close_retry: AtomicUsize,
     drop_first_close: AtomicBool,
     close_dropped: AtomicBool,
     target_close_count: AtomicUsize,
@@ -36,6 +40,10 @@ impl UploadFixture {
             close_before_retry: AtomicBool::new(false),
             physical_opens: AtomicUsize::new(0),
             hold_ack: AtomicBool::new(false),
+            quiet_close_loss: false,
+            drop_all_close: AtomicBool::new(false),
+            physical_close_sends: AtomicUsize::new(0),
+            input_before_close_retry: AtomicUsize::new(0),
             drop_first_close: AtomicBool::new(false),
             close_dropped: AtomicBool::new(false),
             target_close_count: AtomicUsize::new(0),
@@ -156,7 +164,12 @@ impl UploadFixture {
             if meta.kind == SessionKind::CloseRequest {
                 self.target_close_count.fetch_add(1, Ordering::AcqRel);
                 *self.last_target_close.lock().unwrap() = Some((meta, frame.payload.len()));
-                if self.drop_first_close.swap(false, Ordering::AcqRel) {
+                if self.drop_first_close.swap(false, Ordering::AcqRel)
+                    || self.drop_all_close.load(Ordering::Acquire)
+                {
+                    if self.quiet_close_loss {
+                        self.hold_ack.store(true, Ordering::Release);
+                    }
                     self.close_dropped.store(true, Ordering::Release);
                     self.close_dropped_notify.notify_one();
                     return true;
@@ -234,8 +247,14 @@ async fn faulted_upload() -> UploadHarness {
 }
 
 async fn upload_harness(drop_tail: bool) -> UploadHarness {
+    upload_harness_with_quiet_close_loss(drop_tail, false).await
+}
+
+async fn upload_harness_with_quiet_close_loss(drop_tail: bool, quiet: bool) -> UploadHarness {
     let (origin_writer, mut origin) = tokio::io::duplex(4096);
-    let fixture = Arc::new(UploadFixture::new(origin_writer));
+    let mut fixture = UploadFixture::new(origin_writer);
+    fixture.quiet_close_loss = quiet;
+    let fixture = Arc::new(fixture);
     let mut peer = Peer::new(false, false);
     Arc::get_mut(&mut peer).unwrap().upload = Some(fixture.clone());
     let mut settings = config();
@@ -559,4 +578,230 @@ async fn mieru_udp_closed_last_sid_accepts_late_ack_after_first_close_loss() {
 #[tokio::test(start_paused = true)]
 async fn mieru_udp_closed_sid_with_live_sibling_accepts_late_ack_after_first_close_loss() {
     close_loss_recovers_via_late_ack(true).await;
+}
+
+// A real Close loss must recover without any incoming DATA/ACK trigger.
+#[tokio::test(start_paused = true)]
+async fn mieru_udp_first_close_loss_recovers_with_silent_peer_before_origin_eof() {
+    let probe = ResourceProbe::default();
+    let outcome = probe
+        .scope(async {
+            let mut h = upload_harness_with_quiet_close_loss(false, true).await;
+            let result: io::Result<_> = async {
+                h.fixture.drop_first_close.store(true, Ordering::Release);
+                tokio::time::timeout(Duration::from_secs(5), h.stream.shutdown())
+                    .await
+                    .map_err(|_| io::Error::other("setup: DATA ACK drain did not complete"))??;
+                tokio::time::timeout(Duration::from_secs(5), h.fixture.wait_close_dropped())
+                    .await
+                    .map_err(|_| io::Error::other("setup: first real Close was not dropped"))?;
+                if h.fixture.physical_close_sends.load(Ordering::Acquire) == 0 {
+                    return Err(io::Error::other(
+                        "setup: Close transport never returned Ready-OK",
+                    ));
+                }
+                let mut actual = h.prefix.clone();
+                let read =
+                    tokio::time::timeout(Duration::from_secs(5), h.origin.read_to_end(&mut actual))
+                        .await;
+                // Snapshot before Stop: cleanup EOF cannot satisfy the assertion.
+                Ok((
+                    read,
+                    actual,
+                    h.fixture.physical_close_sends.load(Ordering::Acquire),
+                    h.fixture.target_close_count.load(Ordering::Acquire),
+                    h.fixture.input_before_close_retry.load(Ordering::Acquire),
+                    h.fixture.closed.load(Ordering::Acquire),
+                    h.fixture.physical_opens.load(Ordering::Acquire),
+                    h.peer.opens.load(Ordering::Acquire),
+                ))
+            }
+            .await;
+            h.stop().await;
+            result
+        })
+        .await;
+    assert!(
+        probe.snapshot().is_idle(),
+        "cleanup must complete before RED/GREEN assertions"
+    );
+    let (read, actual, sends, peer_closes, input, closed, physical_opens, opens) =
+        outcome.expect("invalid fixture/setup; not the intended Close-loss RED");
+    let mut expected = UPLOAD_PREFIX.to_vec();
+    expected.extend_from_slice(UPLOAD_TAIL);
+    assert_eq!(actual, expected);
+    assert_eq!(
+        <sha2::Sha256 as sha2::Digest>::digest(&actual),
+        <sha2::Sha256 as sha2::Digest>::digest(&expected)
+    );
+    assert_eq!(
+        input, 0,
+        "a later peer packet supplied an opportunistic Close trigger"
+    );
+    assert_eq!((physical_opens, opens), (1, 1));
+    assert!(
+        read.as_ref().is_ok_and(|r| r.is_ok()),
+        "no normal origin EOF before the original 5s guard: {read:?}; Close Ready-OK={sends}, peer Close={peer_closes}, input before retry={input}"
+    );
+    assert!(
+        sends >= 2 && peer_closes >= 2,
+        "EOF did not follow a real repeated Close"
+    );
+    assert!(
+        closed,
+        "origin was not closed by the original peer Close handler before Stop"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn mieru_udp_close_retry_without_response_stops_after_two_timer_resends() {
+    let probe = ResourceProbe::default();
+    let outcome = probe
+        .scope(async {
+            let mut h = upload_harness_with_quiet_close_loss(false, true).await;
+            let result: io::Result<_> = async {
+                h.fixture.drop_all_close.store(true, Ordering::Release);
+                let mut actual = h.prefix.clone();
+                let mut tail = [0; UPLOAD_TAIL.len()];
+                tokio::time::timeout(Duration::from_secs(5), h.origin.read_exact(&mut tail))
+                    .await
+                    .map_err(|_| {
+                        io::Error::other("setup: origin did not receive the DATA tail")
+                    })??;
+                actual.extend_from_slice(&tail);
+                tokio::time::timeout(Duration::from_secs(5), h.stream.shutdown())
+                    .await
+                    .map_err(|_| io::Error::other("setup: DATA ACK drain did not complete"))??;
+                tokio::time::timeout(Duration::from_secs(5), h.fixture.wait_close_dropped())
+                    .await
+                    .map_err(|_| io::Error::other("setup: no actual first Close drop"))?;
+                let first = *h.fixture.last_target_close.lock().unwrap();
+                let third = tokio::time::timeout(Duration::from_secs(5), async {
+                    while h.fixture.target_close_count.load(Ordering::Acquire) < 3 {
+                        h.fixture.close_dropped_notify.notified().await;
+                    }
+                })
+                .await;
+                // A second full fixture guard is an observation horizon, not a retry constant.
+                tokio::time::advance(Duration::from_secs(5)).await;
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+                let mut byte = [0];
+                let origin_pending = h.origin.read(&mut byte).now_or_never().is_none();
+                Ok((
+                    third.is_ok(),
+                    actual,
+                    h.fixture.physical_close_sends.load(Ordering::Acquire),
+                    h.fixture.target_close_count.load(Ordering::Acquire),
+                    h.fixture.input_before_close_retry.load(Ordering::Acquire),
+                    origin_pending,
+                    h.fixture.closed.load(Ordering::Acquire),
+                    first,
+                    *h.fixture.last_target_close.lock().unwrap(),
+                ))
+            }
+            .await;
+            h.stop().await;
+            result
+        })
+        .await;
+    assert!(probe.snapshot().is_idle());
+    let (third, actual, sends, seen, input, pending, closed, first, last) = outcome.unwrap();
+    let mut expected = UPLOAD_PREFIX.to_vec();
+    expected.extend_from_slice(UPLOAD_TAIL);
+    assert_eq!(actual, expected);
+    assert_eq!(
+        <sha2::Sha256 as sha2::Digest>::digest(&actual),
+        <sha2::Sha256 as sha2::Digest>::digest(&expected)
+    );
+    assert!(
+        third,
+        "two timer resends did not reach the real peer decoder"
+    );
+    assert_eq!(
+        (sends, seen),
+        (3, 3),
+        "original Close plus exactly two timer resends"
+    );
+    assert_eq!(
+        input, 0,
+        "a peer packet supplied an opportunistic resend trigger"
+    );
+    assert!(
+        pending && !closed,
+        "all Closes were dropped; Stop must not supply business EOF"
+    );
+    assert!(first.is_some());
+    assert_eq!(
+        first, last,
+        "retry changed the original Close metadata or payload length"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn mieru_udp_close_retry_active_stop_releases_driver_and_peer_owners() {
+    let probe = ResourceProbe::default();
+    let outcome = probe
+        .scope(async {
+            let mut h = upload_harness_with_quiet_close_loss(false, true).await;
+            let fixture = Arc::downgrade(&h.fixture);
+            let peer = Arc::downgrade(&h.peer);
+            let result: io::Result<_> = async {
+                h.fixture.drop_all_close.store(true, Ordering::Release);
+                tokio::time::timeout(Duration::from_secs(5), h.stream.shutdown())
+                    .await
+                    .map_err(|_| io::Error::other("setup: DATA ACK drain did not complete"))??;
+                tokio::time::timeout(Duration::from_secs(5), h.fixture.wait_close_dropped())
+                    .await
+                    .map_err(|_| io::Error::other("setup: no actual first Close drop"))?;
+                let before = (
+                    h.fixture.physical_close_sends.load(Ordering::Acquire),
+                    h.fixture.target_close_count.load(Ordering::Acquire),
+                );
+                let start = Instant::now();
+                let stopped = tokio::time::timeout(Duration::from_secs(1), h.node.shutdown()).await;
+                let elapsed = Instant::now().saturating_duration_since(start);
+                Ok((
+                    before,
+                    stopped.is_ok(),
+                    elapsed,
+                    h.fixture.physical_close_sends.load(Ordering::Acquire),
+                    h.fixture.target_close_count.load(Ordering::Acquire),
+                    h.fixture.input_before_close_retry.load(Ordering::Acquire),
+                    h.fixture.closed.load(Ordering::Acquire),
+                ))
+            }
+            .await;
+            h.stop().await;
+            (
+                result,
+                fixture.upgrade().is_none(),
+                peer.upgrade().is_none(),
+            )
+        })
+        .await;
+    assert!(probe.snapshot().is_idle());
+    let (result, fixture_gone, peer_gone) = outcome;
+    let (before, stopped, elapsed, sends, seen, input, closed) = result.unwrap();
+    assert_eq!(
+        before,
+        (1, 1),
+        "Stop did not begin with an active retry obligation"
+    );
+    assert!(stopped, "active Stop did not join the physical driver");
+    assert_eq!(
+        elapsed,
+        Duration::ZERO,
+        "paused-clock Stop waited for a retry timer"
+    );
+    assert_eq!((sends, seen, input), (1, 1, 0));
+    assert!(
+        !closed,
+        "peer logical Close was not allowed in this all-loss control"
+    );
+    assert!(
+        fixture_gone && peer_gone,
+        "driver/peer retained fixture ownership after Stop/drop"
+    );
 }
