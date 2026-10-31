@@ -228,9 +228,14 @@ async fn pump_output(
         };
         if let Some((channel, packet)) = pending {
             // Keep only this Full packet and its original peer generation.
-            // Poll the reservation before and after one cooperative yield.
+            // One peer can wait for space; multiple peers get one cooperative
+            // handoff so a full peer cannot block a sibling.
             let offer = async {
                 let send = channel.tx.send(packet);
+                if slots.len() == 1 {
+                    let _ = send.await;
+                    return;
+                }
                 tokio::pin!(send);
                 if futures_util::poll!(send.as_mut()).is_ready() {
                     return;
@@ -293,7 +298,7 @@ mod full_handoff_memory_tests {
             && bytes[offset + 13] & 0x17 == 2
     }
 
-    async fn exercise(case: Case) -> usize {
+    async fn exercise(case: Case, single_peer: bool) -> usize {
         let first: SocketAddr = "10.0.0.1:443".parse().unwrap();
         let other: SocketAddr = "10.1.0.1:443".parse().unwrap();
         let mut config = super::super::tests::config();
@@ -313,15 +318,24 @@ mod full_handoff_memory_tests {
                 1,
             ),
         ];
+        if single_peer {
+            config.routes.truncate(1);
+        }
         let routes = Arc::new(Routes::new(&config));
         assert_eq!(routes.select(first.ip()), Some(0));
-        assert_eq!(routes.select(other.ip()), Some(1));
+        assert_eq!(routes.select(other.ip()), (!single_peer).then_some(1));
         let cancel = CancellationToken::new();
         let (a, mut a_rx) = Channel::memory_ready(cancel.child_token());
         let (b, mut b_rx) = Channel::memory_ready(cancel.child_token());
-        let slots: Arc<[PeerSlot]> = vec![PeerSlot::default(), PeerSlot::default()].into();
+        let slots: Arc<[PeerSlot]> = if single_peer {
+            vec![PeerSlot::default()].into()
+        } else {
+            vec![PeerSlot::default(), PeerSlot::default()].into()
+        };
         *slots[0].current.lock().unwrap() = Some(a.clone());
-        *slots[1].current.lock().unwrap() = Some(b.clone());
+        if !single_peer {
+            *slots[1].current.lock().unwrap() = Some(b.clone());
+        }
         let filler = Packet::new(Bytes::from_static(b"existing-queued-packet"));
         for _ in 0..32 {
             a.tx.try_send(filler.clone()).unwrap();
@@ -380,8 +394,13 @@ mod full_handoff_memory_tests {
         // the captured result. The netstack cannot run again to retransmit here.
         let single_socket = stats.snapshot().active_tcp == 1;
         let first_pending = pump.as_mut().poll(&mut cx).is_pending();
+        // Keep the actual queue Full across more polls than the multi-peer
+        // cooperative offer permits. No await can let TCP retransmit the SYN.
+        let retained_pending =
+            !single_peer || (0..3).all(|_| pump.as_mut().poll(&mut cx).is_pending());
         let slot_unlocked = slots[0].current.try_lock().is_ok();
-        if case != Case::StillFull {
+        let release_slot = case != Case::StillFull && (!single_peer || case == Case::Release);
+        if release_slot {
             assert_eq!(a_rx.try_recv().unwrap(), filler);
         }
         if case == Case::PeerStop {
@@ -404,18 +423,18 @@ mod full_handoff_memory_tests {
         }
         let admitted = seen.iter().filter(|packet| is_syn(packet, first)).count();
         let fifo = seen.iter().take_while(|packet| **packet == filler).count()
-            == if case == Case::StillFull { 32 } else { 31 };
+            == if release_slot { 31 } else { 32 };
         let exact_packets = seen
             .iter()
             .all(|packet| *packet == filler || is_syn(packet, first));
         // Do not free a Full peer and accidentally admit A while testing B.
-        if case == Case::StillFull {
+        if case == Case::StillFull && !single_peer {
             for packet in seen.iter().cloned() {
                 a.tx.try_send(packet).unwrap();
             }
         }
         let mut other_progress = true;
-        if matches!(case, Case::StillFull | Case::PeerStop) {
+        if !single_peer && matches!(case, Case::StillFull | Case::PeerStop) {
             // Re-arm PacketStream with a fresh waker after A's offer ended;
             // an old deferred yield wake cannot impersonate B's output barrier.
             let sibling_wake = Arc::new(PumpWake::default());
@@ -454,7 +473,13 @@ mod full_handoff_memory_tests {
             "fixture did not join/release: {case:?}"
         );
         assert!(
-            single_socket && first_pending && continuing && slot_unlocked && fifo && exact_packets,
+            single_socket
+                && first_pending
+                && retained_pending
+                && continuing
+                && slot_unlocked
+                && fifo
+                && exact_packets,
             "fixture/lock/FIFO boundary failed: {case:?}"
         );
         assert!(
@@ -472,13 +497,25 @@ mod full_handoff_memory_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn full_packet_gets_one_cooperative_handoff_without_blocking_stop_or_sibling() {
-        let admitted = exercise(Case::Release).await;
+        let admitted = exercise(Case::Release, false).await;
         for case in [Case::StillFull, Case::PeerStop, Case::GlobalStop] {
-            exercise(case).await;
+            exercise(case, false).await;
         }
         assert_eq!(
             admitted, 1,
             "a ready WireGuard peer must retain its Full SYN for one cooperative handoff when one slot opens"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn single_peer_full_packet_waits_for_space_without_blocking_cancel_or_release() {
+        let admitted = exercise(Case::Release, true).await;
+        for case in [Case::StillFull, Case::PeerStop, Case::GlobalStop] {
+            exercise(case, true).await;
+        }
+        assert_eq!(
+            admitted, 1,
+            "a single WireGuard peer must retain the original Full SYN until a slot opens"
         );
     }
 }

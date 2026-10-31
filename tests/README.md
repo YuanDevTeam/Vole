@@ -389,5 +389,9 @@ MASQUE H2 capsule已就绪合批的纯内存过滤器：
 使用实际pump、内存PacketStream与codec验证合并、单包及时提交、大包与单溢出帧顺序、
 TTL、取消安全、强flush背压及错误；不创建网络socket，不代替真实TUN与RSS验收。
 
+WireGuard 输出准入的纯内存过滤器：`outbound::wireguard::engine::full_handoff_memory_tests::`。
+使用真实 netstack 和原 32 槽队列，检查单 peer 保留满队列包至释放一槽、取消后资源释放，
+以及多 peer 的有界交接与兄弟 peer 进展。
+
 WireGuard 路由表的纯内存过滤器：`outbound::wireguard::routes::tests::`。
 经实际配置校验和路由表构造检查空表、单前缀、主机边界、双栈隔离、最长前缀及同前缀最后声明的所有者。
