@@ -1059,18 +1059,20 @@ async fn run(
             shared.sessions.lock().unwrap().remove(&id);
         }
         let now = Instant::now();
-        let deadline = sessions
-            .values()
-            .map(|state| state.next_deadline(now))
-            .min()
-            .unwrap_or(now + Duration::from_secs(5))
-            .min(now + Duration::from_secs(5));
         let mut received = None;
         tokio::select! {biased;
             ()=shared.cancel.cancelled()=>return Ok(()),
             command=commands.recv()=>{let Some(command)=command else{return Ok(());};input_command(command,&mut sessions,chunk,receive_chunk,!pattern.low_entropy_enabled());},
             ()=shared.activity.notified()=>{},
-            ()=tokio::time::sleep_until(deadline)=>{},
+            ()=async {
+                let deadline = sessions
+                    .values()
+                    .map(|state| state.next_deadline(now))
+                    .min()
+                    .unwrap_or(now + Duration::from_secs(5))
+                    .min(now + Duration::from_secs(5));
+                tokio::time::sleep_until(deadline).await;
+            }=>{},
             packet=receive_packet(transport, &mut receive_scratch),if !sessions.is_empty()=>{received=Some(packet.map_err(|_|closed())?);}
         }
         let mut received_in_turn = 0u8;
