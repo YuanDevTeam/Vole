@@ -1051,6 +1051,9 @@ async fn run(
     let mut has_output = false;
     let mut last_output = None;
     'driver: loop {
+        if sessions.is_empty() && shared.clean() {
+            return Ok(());
+        }
         // Direct receive requires its first successful physical send.
         has_output |= packet_pattern.remaining < OUTPUT_QUANTUM;
         packet_pattern.remaining = OUTPUT_QUANTUM;
@@ -1073,7 +1076,7 @@ async fn run(
                     .min(now + Duration::from_secs(5));
                 tokio::time::sleep_until(deadline).await;
             }=>{},
-            packet=receive_packet(transport, &mut receive_scratch),if !sessions.is_empty()=>{received=Some(packet.map_err(|_|closed())?);}
+            packet=receive_packet(transport, &mut receive_scratch),if has_output=>{received=Some(packet.map_err(|_|closed())?);}
         }
         let mut received_in_turn = 0u8;
         while received_in_turn < RECEIVE_BATCH {
@@ -1083,7 +1086,7 @@ async fn run(
             let selected_receive = received.is_some();
             let packet = if let Some(packet) = received.take() {
                 packet
-            } else if has_output && !sessions.is_empty() {
+            } else if has_output {
                 // The receive contract permits dropping a pending future. A
                 // ready Datagram owns its complete payload before we borrow TX.
                 let Some(packet) = receive_packet(transport, &mut receive_scratch)

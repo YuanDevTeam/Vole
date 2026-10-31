@@ -12,6 +12,11 @@ struct UploadFixture {
     close_before_retry: AtomicBool,
     physical_opens: AtomicUsize,
     hold_ack: AtomicBool,
+    drop_first_close: AtomicBool,
+    close_dropped: AtomicBool,
+    target_close_count: AtomicUsize,
+    last_target_close: Mutex<Option<(SessionMetadata, usize)>>,
+    close_dropped_notify: tokio::sync::Notify,
     outgoing: Mutex<Option<mpsc::Sender<Datagram>>>,
     remote: Mutex<Option<Destination>>,
     server_next: std::sync::atomic::AtomicU32,
@@ -31,6 +36,11 @@ impl UploadFixture {
             close_before_retry: AtomicBool::new(false),
             physical_opens: AtomicUsize::new(0),
             hold_ack: AtomicBool::new(false),
+            drop_first_close: AtomicBool::new(false),
+            close_dropped: AtomicBool::new(false),
+            target_close_count: AtomicUsize::new(0),
+            last_target_close: Mutex::new(None),
+            close_dropped_notify: tokio::sync::Notify::new(),
             outgoing: Mutex::new(None),
             remote: Mutex::new(None),
             server_next: std::sync::atomic::AtomicU32::new(0),
@@ -94,12 +104,64 @@ impl UploadFixture {
             .map_err(|_| closed())
     }
 
+    async fn send_late_ack(&self, unack_sequence: u32) -> io::Result<()> {
+        let key = crypto::derive_packet_key("vole", "fixture-password", super::super::tcp::now()?);
+        let mut encoder = PacketEncoder::new(&key, false)?;
+        let mut bytes = Vec::new();
+        encoder.encode_frame(
+            Metadata::Data(DataMetadata {
+                kind: DataKind::ServerAck,
+                session_id: self.target.load(Ordering::Acquire),
+                sequence: self.server_next.load(Ordering::Acquire).saturating_sub(1),
+                unack_sequence,
+                window: 64,
+                fragment: 0,
+            }),
+            &[],
+            Padding {
+                prefix: &[],
+                suffix: &[],
+            },
+            rand::random(),
+            super::super::tcp::now()?,
+            &mut bytes,
+        )?;
+        let sender = self.outgoing.lock().unwrap().clone().ok_or_else(closed)?;
+        let remote = self.remote.lock().unwrap().clone().ok_or_else(closed)?;
+        sender
+            .send(Datagram {
+                remote,
+                payload: bytes.into(),
+                sniffed_domain: None,
+            })
+            .await
+            .map_err(|_| closed())
+    }
+
+    async fn wait_close_dropped(&self) {
+        while !self.close_dropped.load(Ordering::Acquire) {
+            self.close_dropped_notify.notified().await;
+        }
+    }
+
     fn is_target(&self, id: u32) -> bool {
         self.target.load(Ordering::Acquire) == id
     }
 
     fn drop_or_observe(&self, id: u32, frame: &Frame, ready: bool) -> bool {
         if !ready || !self.is_target(id) {
+            return false;
+        }
+        if let Metadata::Session(meta) = frame.metadata {
+            if meta.kind == SessionKind::CloseRequest {
+                self.target_close_count.fetch_add(1, Ordering::AcqRel);
+                *self.last_target_close.lock().unwrap() = Some((meta, frame.payload.len()));
+                if self.drop_first_close.swap(false, Ordering::AcqRel) {
+                    self.close_dropped.store(true, Ordering::Release);
+                    self.close_dropped_notify.notify_one();
+                    return true;
+                }
+            }
             return false;
         }
         let Metadata::Data(meta) = frame.metadata else {
@@ -168,6 +230,10 @@ impl UploadHarness {
 }
 
 async fn faulted_upload() -> UploadHarness {
+    upload_harness(true).await
+}
+
+async fn upload_harness(drop_tail: bool) -> UploadHarness {
     let (origin_writer, mut origin) = tokio::io::duplex(4096);
     let fixture = Arc::new(UploadFixture::new(origin_writer));
     let mut peer = Peer::new(false, false);
@@ -192,10 +258,12 @@ async fn faulted_upload() -> UploadHarness {
     let mut prefix = vec![0; UPLOAD_PREFIX.len()];
     origin.read_exact(&mut prefix).await.unwrap();
     assert_eq!(prefix, UPLOAD_PREFIX);
-    fixture.arm.store(true, Ordering::Release);
+    fixture.arm.store(drop_tail, Ordering::Release);
     stream.write_all(UPLOAD_TAIL).await.unwrap();
-    // The client first-send receipt succeeded, but the peer did not admit the tail.
-    fixture.wait_dropped().await;
+    if drop_tail {
+        // The client first-send receipt succeeded, but the peer did not admit the tail.
+        fixture.wait_dropped().await;
+    }
     UploadHarness {
         node,
         peer,
@@ -378,4 +446,117 @@ async fn mieru_udp_upload_peer_close_releases_ack_wait_with_original_close_resul
         })
         .await;
     assert!(probe.snapshot().is_idle());
+}
+
+// Both controls exercise the actual client, packet codecs, physical memory carrier,
+// and origin socket. No cleanup-induced EOF is credited as business progress.
+async fn close_loss_recovers_via_late_ack(with_sibling: bool) {
+    const LATE_ACK: u32 = 0x1357_2468;
+    let probe = ResourceProbe::default();
+    let outcome = probe
+        .scope(async {
+            let mut h = upload_harness(false).await;
+            let mut sibling: Option<crate::dispatch::BoxStream> = None;
+            let result: io::Result<_> = async {
+                if with_sibling {
+                    let raw = h.node.client.attach_tcp_stream_for_test()?;
+                    let session = super::super::tests::session();
+                    let context = EstablishContext::with_timeout(Duration::from_secs(5));
+                    sibling = Some(Box::new(
+                        super::super::stream::Stream::standard(
+                            raw,
+                            &session.destination,
+                            crate::socks5::COMMAND_CONNECT,
+                            context.deadline(),
+                        )
+                        .await?,
+                    ));
+                }
+                let expected_opens = if with_sibling { 2 } else { 1 };
+                if h.fixture.physical_opens.load(Ordering::Acquire) != 1
+                    || h.peer.opens.load(Ordering::Acquire) != expected_opens
+                {
+                    return Err(io::Error::other(
+                        "Close-loss controls did not share one physical carrier",
+                    ));
+                }
+                h.fixture.drop_first_close.store(true, Ordering::Release);
+                h.stream.shutdown().await?;
+                tokio::time::timeout(Duration::from_secs(5), h.fixture.wait_close_dropped())
+                    .await
+                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+                if h.fixture.target_close_count.load(Ordering::Acquire) != 1
+                    || h.fixture.closed.load(Ordering::Acquire)
+                {
+                    return Err(io::Error::other(
+                        "first real Close was not uniquely dropped before origin close",
+                    ));
+                }
+                h.fixture.send_late_ack(LATE_ACK).await?;
+                let mut actual = h.prefix.clone();
+                tokio::time::timeout(Duration::from_secs(5), h.origin.read_to_end(&mut actual))
+                    .await
+                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+                let observed = *h.fixture.last_target_close.lock().unwrap();
+                Ok((
+                    actual,
+                    observed,
+                    h.fixture.target_close_count.load(Ordering::Acquire),
+                    h.fixture.target.load(Ordering::Acquire),
+                    h.fixture.closed.load(Ordering::Acquire),
+                    h.fixture.physical_opens.load(Ordering::Acquire),
+                    h.peer.opens.load(Ordering::Acquire),
+                ))
+            }
+            .await;
+            drop(sibling);
+            h.stop().await;
+            result
+        })
+        .await;
+    assert!(
+        probe.snapshot().is_idle(),
+        "RED and GREEN must both join and release before assertions"
+    );
+    let (actual, observed, count, id, closed, physical_opens, opens) =
+        outcome.expect("late ACK did not reach the existing unknown-SID Close path before cleanup");
+    let mut expected = UPLOAD_PREFIX.to_vec();
+    expected.extend_from_slice(UPLOAD_TAIL);
+    assert_eq!(actual, expected);
+    assert_eq!(
+        <sha2::Sha256 as sha2::Digest>::digest(&actual),
+        <sha2::Sha256 as sha2::Digest>::digest(&expected)
+    );
+    assert_eq!(
+        observed,
+        Some((
+            SessionMetadata {
+                kind: SessionKind::CloseRequest,
+                session_id: id,
+                sequence: LATE_ACK,
+                status: 0,
+            },
+            0
+        ))
+    );
+    assert_eq!(
+        count, 2,
+        "only the injected late ACK should cause the second Close"
+    );
+    assert!(
+        closed,
+        "origin EOF must follow actual peer Close handling, before Stop"
+    );
+    assert_eq!(physical_opens, 1);
+    assert_eq!(opens, if with_sibling { 2 } else { 1 });
+}
+
+#[tokio::test(start_paused = true)]
+async fn mieru_udp_closed_last_sid_accepts_late_ack_after_first_close_loss() {
+    close_loss_recovers_via_late_ack(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn mieru_udp_closed_sid_with_live_sibling_accepts_late_ack_after_first_close_loss() {
+    close_loss_recovers_via_late_ack(true).await;
 }
