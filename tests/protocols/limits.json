@@ -291,6 +291,15 @@
       ]
     },
     {
+      "id": "xhttp-h3-udp-send-window",
+      "value": 196608,
+      "unit": "bytes",
+      "owner": "limits::XHTTP_H3_UDP_SEND_WINDOW",
+      "saturation": "qualified physical starts64KiB; successful local mux UDP metadata flush raises shared retained-write admission192KiB once",
+      "cancellation": "failed/cancelled metadata does not raise; Weak does not own native lifecycle; original Stop joins drivers",
+      "boundary_cases": ["XHTTP-UNIT"]
+    },
+    {
       "id": "sing-mux-idle",
       "value": 16,
       "unit": "connections",

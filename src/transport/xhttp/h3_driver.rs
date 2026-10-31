@@ -19,10 +19,42 @@ pub(crate) struct QuicTransport {
     pub server_name: String,
 }
 
+#[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+#[derive(Debug)]
+pub(crate) struct UdpAssociationControl {
+    connection: quinn::Connection,
+    cancel: CancellationToken,
+    raised: std::sync::atomic::AtomicBool,
+}
+#[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+impl UdpAssociationControl {
+    #[cfg(all(test, feature = "interop-test"))]
+    pub(super) fn was_raised(&self) -> bool {
+        self.raised.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn raise(&self) {
+        use std::sync::atomic::Ordering;
+        if self.cancel.is_cancelled() || self.connection.close_reason().is_some() {
+            return;
+        }
+        if self
+            .raised
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            && !self.cancel.is_cancelled()
+        {
+            self.connection
+                .set_send_window(crate::limits::XHTTP_H3_UDP_SEND_WINDOW as u64);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Sender {
     pub requests: quinn_h3::Client,
     pub runtime: Arc<OwnedRuntime>,
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    pub udp_control: Option<Arc<UdpAssociationControl>>,
     #[cfg(feature = "interop-test")]
     pub observation: quinn::Connection,
 }
@@ -30,6 +62,7 @@ pub(super) struct Sender {
 pub(super) async fn connect(
     raw: QuicTransport,
     keepalive: i32,
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))] udp_qualified: bool,
     owner: &DriverOwner,
 ) -> io::Result<(SendRequest, Arc<ConnectionGuard>)> {
     let cancel = owner.cancellation.child_token();
@@ -142,6 +175,14 @@ pub(super) async fn connect(
                         .send(Ok(Sender {
                             requests,
                             runtime: runtime.clone(),
+                            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+                            udp_control: udp_qualified.then(|| {
+                                Arc::new(UdpAssociationControl {
+                                    connection: connection.clone(),
+                                    cancel: stop.clone(),
+                                    raised: std::sync::atomic::AtomicBool::new(false),
+                                })
+                            }),
                             #[cfg(feature = "interop-test")]
                             observation: connection.clone(),
                         }))

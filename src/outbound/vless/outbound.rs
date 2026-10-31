@@ -680,10 +680,15 @@ impl VlessOutbound {
                 };
                 let Some(download) = &self.download else {
                     let connected = context
-                        .run_io(
-                            "VLESS XHTTP handshake",
-                            xhttp.open_transport(context.deadline(), upload),
-                        )
+                        .run_io("VLESS XHTTP handshake", async {
+                            #[cfg(feature = "sing-mux")]
+                            if let Some(capture) = context.h3_udp_capture() {
+                                return xhttp
+                                    .open_transport_captured(context.deadline(), upload, capture)
+                                    .await;
+                            }
+                            xhttp.open_transport(context.deadline(), upload).await
+                        })
                         .await?;
                     tracing::debug!(stage = "xhttp", "VLESS transport stage completed");
                     return Ok(connected);

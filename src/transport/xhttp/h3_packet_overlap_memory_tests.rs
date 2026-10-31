@@ -29,9 +29,23 @@ const LIMIT: Duration = Duration::from_secs(10);
 type Peer = h3::server::Connection<h3_quinn::Connection, Bytes>;
 type PeerStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
+#[derive(Default)]
+struct AckGate {
+    held: std::sync::atomic::AtomicBool,
+    changed: tokio::sync::Notify,
+}
+impl AckGate {
+    fn set(&self, held: bool) {
+        self.held.store(held, Ordering::SeqCst);
+        self.changed.notify_one();
+    }
+}
+
 struct Packets {
     send: mpsc::Sender<Bytes>,
     receive: mpsc::Receiver<Bytes>,
+    pending: Option<Bytes>,
+    gate: Arc<AckGate>,
     peer: SocketAddr,
     closed: Arc<AtomicUsize>,
 }
@@ -51,14 +65,25 @@ impl DatagramTransport for Packets {
             .map_err(|_| DispatchError::NotAllowed)
     }
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+        if self.pending.is_none() {
+            self.pending = Some(self.receive.recv().await.ok_or(DispatchError::NotAllowed)?);
+        }
+        loop {
+            let changed = self.gate.changed.notified();
+            if !self.gate.held.load(Ordering::SeqCst) {
+                break;
+            }
+            changed.await;
+        }
         Ok(Datagram {
             remote: self.peer.into(),
-            payload: self.receive.recv().await.ok_or(DispatchError::NotAllowed)?,
+            payload: self.pending.take().unwrap(),
             sniffed_domain: None,
         })
     }
     async fn close(&mut self) -> Result<(), DispatchError> {
         self.closed.fetch_add(1, Ordering::SeqCst);
+        self.pending = None;
         self.receive.close();
         Ok(())
     }
@@ -67,6 +92,8 @@ impl DatagramTransport for Packets {
 struct Fixture {
     client: XHttpClient,
     raw: Option<QuicTransport>,
+    gate: Arc<AckGate>,
+    native_peer: Option<quinn::Connection>,
     endpoint: quinn::Endpoint,
     runtime: Arc<OwnedRuntime>,
     sender: Option<SendRequest>,
@@ -122,8 +149,11 @@ impl Fixture {
         )
         .unwrap();
         let closed = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(AckGate::default());
         Self {
             client,
+            gate: gate.clone(),
+            native_peer: None,
             endpoint,
             runtime,
             download,
@@ -131,6 +161,8 @@ impl Fixture {
                 transport: Box::new(Packets {
                     send: to_server,
                     receive: from_server,
+                    pending: None,
+                    gate,
                     peer,
                     closed: closed.clone(),
                 }),
@@ -161,6 +193,7 @@ impl Fixture {
         );
         self.sender = Some(sender);
         self.lease = Some(lease);
+        self.native_peer = Some(accepted.clone());
         h3::server::builder()
             .max_field_section_size(16 * 1024)
             .build::<_, Bytes>(h3_quinn::Connection::new(accepted))
@@ -179,6 +212,7 @@ impl Fixture {
         }));
     }
     async fn stop(&mut self) {
+        self.gate.set(false);
         // Never abort the managed client driver: it owns nested endpoint,
         // runtime and DatagramTransport retirement. Re-await a timed-out barrier.
         let client_stop = timeout(Duration::from_secs(3), self.client.stop()).await;
@@ -686,6 +720,12 @@ async fn normalized_ineligible_factories_keep_one_unacknowledged_body() {
             let mut fixture = Fixture::new(client, is_download, 16, 256 * 1024);
             let result = AssertUnwindSafe(timeout(LIMIT, async {
                 let mut peer = fixture.initialize().await;
+                if let SendRequest::H3(sender) = fixture.sender.as_ref().unwrap() {
+                    assert!(
+                        sender.udp_control.is_none(),
+                        "excluded physical got a UDP raise control"
+                    );
+                }
                 let (first, arrived_first) = oneshot::channel();
                 let (release, released) = oneshot::channel();
                 fixture.spawn(async move {
@@ -728,3 +768,7 @@ async fn normalized_ineligible_factories_keep_one_unacknowledged_body() {
         node.shutdown().await;
     }
 }
+
+#[cfg(feature = "interop-test")]
+#[path = "h3_udp_budget_memory_tests.rs"]
+mod udp_budget;

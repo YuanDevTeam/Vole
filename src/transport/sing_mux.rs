@@ -34,6 +34,8 @@ pub(crate) struct SuppliedStream {
     pub io: BoxStream,
     #[cfg(target_os = "linux")]
     pub control: Option<crate::dialer::tcp_control::Control>,
+    #[cfg(feature = "outbound-vless")]
+    pub h3_udp: Option<Weak<super::xhttp::UdpAssociationControl>>,
 }
 pub(crate) struct Pool {
     options: SingMuxConfig,
@@ -55,6 +57,14 @@ struct Connection {
     issued: AtomicUsize,
     cancel: CancellationToken,
     _observation: observation::Guard,
+    #[cfg(feature = "outbound-vless")]
+    h3_udp: Option<Weak<super::xhttp::UdpAssociationControl>>,
+}
+struct Reservation {
+    sender: Sender,
+    lease: Lease,
+    #[cfg(feature = "outbound-vless")]
+    h3_udp: Option<Weak<super::xhttp::UdpAssociationControl>>,
 }
 #[derive(Clone)]
 enum Sender {
@@ -92,6 +102,12 @@ impl Pool {
     pub(crate) fn only_tcp(&self) -> bool {
         self.options.only_tcp
     }
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn captures_h3_udp(&self) -> bool {
+        self.options.protocol == SingMuxProtocol::H2Mux
+            && !self.options.only_tcp
+            && !self.options.padding
+    }
     #[cfg(target_os = "linux")]
     pub(crate) fn brutal_enabled(&self) -> bool {
         self.options.brutal.is_some()
@@ -109,7 +125,7 @@ impl Pool {
     {
         let operation = async {
             let mut connect = Some(connect);
-            let (sender, lease) = {
+            let reservation = {
                 let _opening = self.opening.lock().await;
                 loop {
                     // notify_one stores a permit if the final lease drains
@@ -173,6 +189,12 @@ impl Pool {
                         raw = Box::new(padding::Padding::new(raw));
                     }
                     let connection = self.establish(raw).await?;
+                    #[cfg(feature = "outbound-vless")]
+                    let connection = {
+                        let mut connection = connection;
+                        connection.h3_udp = supplied.h3_udp;
+                        connection
+                    };
                     if let Some(options) = self.options.brutal {
                         // This control stream consumes an actual transport ID
                         // even though it never becomes a business lease.
@@ -200,15 +222,23 @@ impl Pool {
                     break pair;
                 }
             };
-            let mut raw = sender.open(deadline, self.autonomous_writes).await?;
+            let mut raw = reservation
+                .sender
+                .open(deadline, self.autonomous_writes)
+                .await?;
             let mut request = Vec::with_capacity(262);
             request.extend_from_slice(&(if udp { 3_u16 } else { 0 }).to_be_bytes());
             crate::socks5::encode_address(target, &mut request)?;
             raw.write_all(&request).await?;
             raw.flush().await?;
+            #[cfg(feature = "outbound-vless")]
+            if udp && let Some(control) = reservation.h3_udp.and_then(|control| control.upgrade()) {
+                // Local metadata flush, not peer status or a transport ACK.
+                control.raise();
+            }
             Ok(Box::new(ResponseStream {
                 raw: Some(raw),
-                lease: Some(lease),
+                lease: Some(reservation.lease),
                 response: false,
                 half_close: self.options.protocol != SingMuxProtocol::Smux,
                 upload_closed: false,
@@ -260,6 +290,8 @@ impl Pool {
             issued: AtomicUsize::new(0),
             cancel,
             _observation: observation::track(ResourceKind::Pool),
+            #[cfg(feature = "outbound-vless")]
+            h3_udp: None,
         })
     }
     pub(crate) fn begin_stop(&self) {
@@ -297,7 +329,7 @@ impl Connection {
         &self,
         pool: &Arc<Mutex<State>>,
         drained: Option<&Arc<tokio::sync::Notify>>,
-    ) -> (Sender, Lease) {
+    ) -> Reservation {
         self.active.fetch_add(1, Ordering::AcqRel);
         // A dropped logical lease is not proof that yamux has processed its
         // reset. Its public poll_new_outbound closes the entire connection on
@@ -305,14 +337,16 @@ impl Connection {
         // number of issued streams; let existing ones drain on the old driver.
         // This is a per-transport retirement budget, never a node-wide quota.
         self.issued.fetch_add(1, Ordering::AcqRel);
-        (
-            self.sender.clone(),
-            Lease {
+        Reservation {
+            sender: self.sender.clone(),
+            lease: Lease {
                 active: self.active.clone(),
                 pool: Arc::downgrade(pool),
                 drained: drained.cloned(),
             },
-        )
+            #[cfg(feature = "outbound-vless")]
+            h3_udp: self.h3_udp.clone(),
+        }
     }
 }
 struct Lease {
@@ -841,6 +875,8 @@ rules: ['MATCH,DIRECT']
                         io: Box::new(raw),
                         #[cfg(target_os = "linux")]
                         control: None,
+                        #[cfg(feature = "outbound-vless")]
+                        h3_udp: None,
                     })
                 },
             )

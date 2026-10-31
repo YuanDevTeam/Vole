@@ -12,6 +12,8 @@ use http::{Method, Request, StatusCode, Uri};
 use http_io::{
     Download as RecvStream, ResponseFuture, Sender as SendRequest, Upload as SendStream,
 };
+#[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+use std::sync::{Mutex, Weak};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     task::JoinHandle,
@@ -93,6 +95,25 @@ impl XHttpConfig {
     }
 }
 
+#[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+pub(crate) use h3_driver::UdpAssociationControl;
+#[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UdpAssociationCapture {
+    slot: Arc<Mutex<Option<Option<Weak<UdpAssociationControl>>>>>,
+}
+#[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+impl UdpAssociationCapture {
+    fn report(&self, control: Option<Weak<UdpAssociationControl>>) {
+        let mut slot = self.slot.lock().unwrap();
+        let value = if slot.is_none() { control } else { None };
+        *slot = Some(value);
+    }
+    pub(crate) fn take(&self) -> Option<Weak<UdpAssociationControl>> {
+        self.slot.lock().unwrap().take().flatten()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct XHttpClient {
     mode: XHttpMode,
@@ -154,7 +175,24 @@ impl XHttpClient {
     /// Immutable upload purpose, established before the first pool acquisition.
     #[cfg(any(feature = "invoke", test))]
     pub(crate) fn set_shared_packet_up_transport(&mut self, shared: bool) {
+        #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+        let previous = self.udp_budget_qualified();
         self.shared_packet_up = shared;
+        #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+        if previous != self.udp_budget_qualified() {
+            // Eligibility isolates pools even while both initial budgets are64.
+            self.pool = Arc::new(pool::Pool::new(self.reuse.clone(), self.http_version));
+        }
+    }
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    fn udp_budget_qualified(&self) -> bool {
+        self.shared_packet_up
+            && self.http_version == crate::config::XHttpVersion::Http3
+            && self.mode == XHttpMode::PacketUp
+            && matches!(
+                &self.request.options.data,
+                crate::config::xhttp::DataPlacement::Body
+            )
     }
 
     /// Opt-in only after the VLESS leg proves immutable physical/security scope.
@@ -277,7 +315,42 @@ impl XHttpClient {
     pub(crate) async fn open_transport<F, Fut>(
         &self,
         deadline: tokio::time::Instant,
+        connect: F,
+    ) -> io::Result<BoxStream>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = io::Result<TransportIo>>,
+    {
+        self.open_transport_inner(
+            deadline,
+            connect,
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            None,
+        )
+        .await
+    }
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    pub(crate) async fn open_transport_captured<F, Fut>(
+        &self,
+        deadline: tokio::time::Instant,
+        connect: F,
+        capture: &UdpAssociationCapture,
+    ) -> io::Result<BoxStream>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = io::Result<TransportIo>>,
+    {
+        self.open_transport_inner(deadline, connect, Some(capture))
+            .await
+    }
+
+    async fn open_transport_inner<F, Fut>(
+        &self,
+        deadline: tokio::time::Instant,
         mut connect: F,
+        #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))] capture: Option<
+            &UdpAssociationCapture,
+        >,
     ) -> io::Result<BoxStream>
     where
         F: FnMut() -> Fut,
@@ -285,6 +358,11 @@ impl XHttpClient {
     {
         let operation = async {
             let (sender, driver) = self.acquire(false, &mut connect).await?;
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            let control = match &sender {
+                SendRequest::H3(sender) => sender.udp_control.as_ref().map(Arc::downgrade),
+                _ => None,
+            };
             if self.needs_separate_download() {
                 let (download, download_driver) =
                     self.handshake_transport(connect().await?).await?;
@@ -297,7 +375,12 @@ impl XHttpClient {
                     )
                     .await;
             }
-            self.connect_http(sender, driver).await
+            let connected = self.connect_http(sender, driver).await?;
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            if let Some(capture) = capture {
+                capture.report(control);
+            }
+            Ok(connected)
         };
         tokio::select! {biased;
             () = self.owner.cancellation.cancelled() => Err(connection_closed()),
@@ -474,7 +557,10 @@ impl XHttpClient {
                 result = async {
                     match transport {
                         TransportIo::Stream(stream) if self.http_version != crate::config::XHttpVersion::Http3 => self.handshake_active(stream).await,
-                        TransportIo::Quic(transport) if self.http_version == crate::config::XHttpVersion::Http3 => h3_driver::connect(*transport, self.reuse.as_ref().map_or(0, |r| r.keep_alive_seconds), &self.owner).await,
+                        TransportIo::Quic(transport) if self.http_version == crate::config::XHttpVersion::Http3 => h3_driver::connect(*transport, self.reuse.as_ref().map_or(0, |r| r.keep_alive_seconds),
+                            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+                            self.udp_budget_qualified(),
+                            &self.owner).await,
                         _ => Err(request::invalid_request()),
                     }
                 } => result,

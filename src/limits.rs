@@ -34,6 +34,8 @@ pub const XHTTP_H3_UNI_STREAMS: usize = 8;
 pub const XHTTP_H3_STREAM_WINDOW: usize = 64 * 1024;
 pub const XHTTP_H3_CONNECTION_WINDOW: usize = 128 * 1024;
 pub const XHTTP_H3_SEND_WINDOW: usize = 64 * 1024;
+/// Retained writes after a qualified physical connection's first local mux UDP association.
+pub const XHTTP_H3_UDP_SEND_WINDOW: usize = 192 * 1024;
 pub const SING_MUX_IDLE_CONNECTIONS: usize = 16;
 pub const SING_MUX_COMMAND_QUEUE: usize = 16;
 pub const SING_MUX_CHUNK: usize = 16 * 1024;

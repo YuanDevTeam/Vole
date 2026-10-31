@@ -213,6 +213,8 @@ pub struct EstablishContext {
     inbound: crate::session::InboundMetadata,
     #[cfg(all(target_os = "linux", feature = "sing-mux"))]
     tcp_control: Option<crate::dialer::tcp_control::Capture>,
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    h3_udp: Option<crate::transport::xhttp::UdpAssociationCapture>,
 }
 
 type SelectionSnapshot = HashMap<usize, (Arc<GroupSelection>, usize)>;
@@ -232,6 +234,8 @@ impl EstablishContext {
             inbound: Default::default(),
             #[cfg(all(target_os = "linux", feature = "sing-mux"))]
             tcp_control: None,
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            h3_udp: None,
         }
     }
 
@@ -269,6 +273,26 @@ impl EstablishContext {
         }
     }
 
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    pub(crate) fn capture_h3_udp(
+        &self,
+        capture: crate::transport::xhttp::UdpAssociationCapture,
+    ) -> Self {
+        let mut context = self.clone();
+        context.h3_udp = Some(capture);
+        context
+    }
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    pub(crate) fn h3_udp_capture(&self) -> Option<&crate::transport::xhttp::UdpAssociationCapture> {
+        self.h3_udp.as_ref()
+    }
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    fn without_h3_udp(&self) -> Self {
+        let mut context = self.clone();
+        context.h3_udp = None;
+        context
+    }
+
     /// MASQUE's positive timeout owns shared creation independently of a
     /// waiting caller. Preserve its selected upstreams and inbound identity.
     #[cfg(feature = "outbound-masque")]
@@ -292,6 +316,8 @@ impl EstablishContext {
             inbound: self.inbound.clone(),
             #[cfg(all(target_os = "linux", feature = "sing-mux"))]
             tcp_control: None,
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            h3_udp: None,
         }
     }
 
@@ -313,6 +339,8 @@ impl EstablishContext {
             inbound: self.inbound.clone(),
             #[cfg(all(target_os = "linux", feature = "sing-mux"))]
             tcp_control: None,
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            h3_udp: None,
         })
     }
 
@@ -349,6 +377,8 @@ impl EstablishContext {
             inbound: self.inbound.clone(),
             #[cfg(all(target_os = "linux", feature = "sing-mux"))]
             tcp_control: None,
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            h3_udp: None,
             selections: Arc::new(Mutex::new(
                 self.selections
                     .lock()
@@ -832,6 +862,10 @@ impl UpstreamPath {
                 connect_direct_server(dialer, &endpoint, context).await
             }
             ResolvedUpstream::Proxy(connector) => {
+                #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+                let unbound = context.without_h3_udp();
+                #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+                let context = &unbound;
                 #[cfg(all(target_os = "linux", feature = "sing-mux"))]
                 if context.tcp_control.is_some() {
                     return connector
@@ -856,7 +890,13 @@ impl UpstreamPath {
                 let direct = DirectOutbound::new(dialer.clone());
                 OutboundConnector::open_datagram(&direct, request, context).await
             }
-            ResolvedUpstream::Proxy(connector) => connector.open_datagram(request, context).await,
+            ResolvedUpstream::Proxy(connector) => {
+                #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+                let unbound = context.without_h3_udp();
+                #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+                let context = &unbound;
+                connector.open_datagram(request, context).await
+            }
         }
     }
 

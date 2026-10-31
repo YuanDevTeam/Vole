@@ -84,6 +84,17 @@ impl SingMuxConnector {
         session.destination = Destination::domain("sp.mux.sing-box.arpa", 444)?;
         session.sniffed_domain = None;
         let source = session.source;
+        #[cfg(feature = "outbound-vless")]
+        let h3_capture = self
+            .pool
+            .captures_h3_udp()
+            .then(crate::transport::xhttp::UdpAssociationCapture::default);
+        #[cfg(feature = "outbound-vless")]
+        let h3_context = h3_capture
+            .as_ref()
+            .map(|capture| context.capture_h3_udp(capture.clone()));
+        #[cfg(feature = "outbound-vless")]
+        let context = h3_context.as_ref().unwrap_or(context);
         #[cfg(target_os = "linux")]
         let capture = self
             .capture_tcp
@@ -129,6 +140,8 @@ impl SingMuxConnector {
             io,
             #[cfg(target_os = "linux")]
             control: capture.and_then(|capture| capture.finish()),
+            #[cfg(feature = "outbound-vless")]
+            h3_udp: h3_capture.and_then(|capture| capture.take()),
         })
     }
 }

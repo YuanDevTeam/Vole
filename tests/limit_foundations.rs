@@ -142,6 +142,10 @@ fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
             vole::limits::XHTTP_H3_CONNECTION_WINDOW,
         ),
         ("xhttp-h3-send-window", vole::limits::XHTTP_H3_SEND_WINDOW),
+        (
+            "xhttp-h3-udp-send-window",
+            vole::limits::XHTTP_H3_UDP_SEND_WINDOW,
+        ),
         ("sing-mux-idle", vole::limits::SING_MUX_IDLE_CONNECTIONS),
         (
             "sing-mux-command-queue",

@@ -589,6 +589,8 @@ async fn h3_batch_boundary_keeps_eager_progress_receipts_and_owner_stop() {
         let sender = SendRequest::H3(super::super::h3_driver::Sender {
             requests,
             runtime: pair.client_runtime.clone(),
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            udp_control: None,
             #[cfg(feature = "interop-test")]
             observation: pair.client.clone(),
         });
