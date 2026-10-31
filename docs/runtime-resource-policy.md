@@ -221,8 +221,11 @@ XHTTP 和 DoH/H3 通过 `quinn-h3-transport` 使用官方 h3/h3-quinn，共享�
 满足 [XHTTP 固定出口与安全边界](xhttp.md#http-transport-复用) 的 VLESS 私有 H2 腿采用相同 active-only 模型，每条最多 4 个逻辑租约，上传/显式下载各自隔离；其它 H2 路径、H1 与显式复用参数保持原契约。阈值溢出创建新物理连接，不拒绝逻辑流，不改变每流窗口或缓冲。
 
 XHTTP packet-up 的单批 backing（含正在发送的正文）上限为 H1/H2 64 KiB、H3 128 KiB，
-并与该 writer 采样的 POST 上限取较小值；按需扩容，不积累第二批。H3 仍等待完整
-POST 响应才释放写背压和确认 flush，QUIC 窗口、队列及停止语义不变。该 backing
+并与该 writer 采样的 POST 上限取较小值；按需扩容，不积累第二份正文。普通路径等待完整
+POST 响应才释放写背压和确认 flush。无 Encryption、无独立下载、无 padding 且 only-tcp=false
+的 VLESS h2mux，仅 H3 packet-up body/auto 上传保留最多两个未退役响应槽：发送 FIN 完成、
+最后正文引用释放并归还唯一 Vec，且槽未满后才能复用正文；flush 仍等待连续成功响应。
+每批只有一份有界 owner 元数据，不复制正文，也不增加 QUIC 窗口、队列或停止预算。该 backing
 上限不是进程 RSS 上限；HTTP/QUIC codec、发送窗口和 allocator 的共同持有峰值需实测。
 
 `quiche-h3-transport` 为 TrustTunnel/MASQUE 使用官方 quiche 的低层驱动，共享上述数据报适配器，不创建新的 socket。

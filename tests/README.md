@@ -81,6 +81,11 @@ private h2mux PacketUp 两阶段写（纯内存）：
 才重调度一次，以及普通写、零进度、失败、Drop 和强 flush 确认边界。
 这些测试不代替 XHTTP/H3、真实 TUN、内存或容量验收。
 
+共享 H3 PacketUp 有界响应重叠（纯内存）：`transport::xhttp::h3_packet_overlap_memory_tests::`，
+经过归一化节点和实际 factory／H3 driver，检查单正文回收、两响应槽、乱序确认缺口、低流信用、早错误、FIN／Drop 和同步 Stop。
+`transport::xhttp::packet_up::overlap::lease_memory_tests::` 检查真实 Bytes 最后引用释放的通知、同一 Vec 回收及 closed／Weak 所有权。
+这些检查不代替真实 TUN、RSS、吞吐或平台验收。
+
 规则输入与 selector 元数据（纯内存）：`config::name_regex::tests::`、
 `config::domain_regex::tests::`、`config::rule_provider::tests::classical_`、
 `routing::tests::in_name_`。覆盖命名/数字捕获编号、IN-NAME 和混合 classical 条件。

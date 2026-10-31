@@ -1392,7 +1392,7 @@ fn build_proxy_graph(
                                     )
                                 })
                                 .transpose()?;
-                            Arc::new(VlessOutbound::new_with_shared_security(
+                            let mut outbound = VlessOutbound::new_with_shared_security(
                                 config,
                                 upstream,
                                 download_upstream,
@@ -1405,7 +1405,9 @@ fn build_proxy_graph(
                                     limits.xhttp_send_buffer_size,
                                     limits.xhttp_upload_chunk_size,
                                 ),
-                            )?)
+                            )?;
+                            outbound.configure_shared_xhttp_transport(proxy.smux.as_ref());
+                            Arc::new(outbound)
                         }
                         #[cfg(not(feature = "outbound-vless"))]
                         {

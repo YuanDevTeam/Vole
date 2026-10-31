@@ -1,5 +1,7 @@
 //! Timer-driven bounded aggregation. Writes acknowledge admitted bytes; flush
 //! waits for their POST responses. The node owns and joins the timer/IO driver.
+#[path = "packet_up_overlap.rs"]
+mod overlap;
 use super::{ConnectionGuard, DriverOwner, RequestTemplate, SendRequest, connection_closed};
 use bytes::{Buf, Bytes};
 use futures_util::task::AtomicWaker;
@@ -22,6 +24,12 @@ struct State {
     error: Option<Arc<io::Error>>,
     closed: bool,
     in_flight: bool,
+    #[cfg(test)]
+    occupied_responses: usize,
+    #[cfg(test)]
+    ready_responses: usize,
+    #[cfg(test)]
+    ready_out_of_order: bool,
 }
 struct Shared {
     state: Mutex<State>,
@@ -58,6 +66,19 @@ impl Drop for Lifetime {
     }
 }
 
+#[cfg(test)]
+pub(super) struct Snapshot {
+    pub(super) buffer_ptr: usize,
+    pub(super) buffer_len: usize,
+    pub(super) buffer_capacity: usize,
+    pub(super) accepted: u64,
+    pub(super) committed: u64,
+    pub(super) in_flight: bool,
+    pub(super) occupied_responses: usize,
+    pub(super) ready_responses: usize,
+    pub(super) ready_out_of_order: bool,
+}
+
 pub(super) struct Writer {
     shared: Arc<Shared>,
     capacity: usize,
@@ -71,6 +92,27 @@ impl Writer {
         session: Arc<str>,
         chunk: usize,
         owner: &DriverOwner,
+    ) -> io::Result<Self> {
+        Self::with_responses(sender, request, session, chunk, owner, false)
+    }
+
+    pub(super) fn new_overlapping(
+        sender: SendRequest,
+        request: RequestTemplate,
+        session: Arc<str>,
+        chunk: usize,
+        owner: &DriverOwner,
+    ) -> io::Result<Self> {
+        Self::with_responses(sender, request, session, chunk, owner, true)
+    }
+
+    fn with_responses(
+        sender: SendRequest,
+        request: RequestTemplate,
+        session: Arc<str>,
+        chunk: usize,
+        owner: &DriverOwner,
+        overlap_responses: bool,
     ) -> io::Result<Self> {
         // Mihomo samples this maximum once per logical writer. Never allocate
         // the configurable (up to 16 MiB) maximum per connection.
@@ -88,6 +130,12 @@ impl Writer {
                 error: None,
                 closed: false,
                 in_flight: false,
+                #[cfg(test)]
+                occupied_responses: 0,
+                #[cfg(test)]
+                ready_responses: 0,
+                #[cfg(test)]
+                ready_out_of_order: false,
             }),
             changed: Notify::new(),
             finishing: AtomicBool::new(false),
@@ -99,12 +147,26 @@ impl Writer {
         let eager_capacity = (!request.options.post_interval_explicit).then_some(capacity);
         let lifetime = Lifetime(shared.clone());
         let worker = shared.clone();
-        let task = owner.spawn(async move {
-            let _lifetime = lifetime;
-            if let Err(error) = transmit(&worker, sender, request, session, eager_capacity).await {
-                worker.state.lock().unwrap().error = Some(Arc::new(error));
-            }
-        })?;
+        // Branch before spawning: ordinary writers keep the original future layout.
+        let task = if overlap_responses {
+            owner.spawn(async move {
+                let _lifetime = lifetime;
+                if let Err(error) =
+                    overlap::transmit(&worker, sender, request, session, eager_capacity).await
+                {
+                    worker.state.lock().unwrap().error = Some(Arc::new(error));
+                }
+            })?
+        } else {
+            owner.spawn(async move {
+                let _lifetime = lifetime;
+                if let Err(error) =
+                    transmit(&worker, sender, request, session, eager_capacity).await
+                {
+                    worker.state.lock().unwrap().error = Some(Arc::new(error));
+                }
+            })?
+        };
         Ok(Self {
             shared,
             capacity,
@@ -112,6 +174,22 @@ impl Writer {
             _task: task,
         })
     }
+    #[cfg(test)]
+    pub(super) fn snapshot(&self) -> Snapshot {
+        let state = self.shared.state.lock().unwrap();
+        Snapshot {
+            buffer_ptr: state.buffer.as_ptr() as usize,
+            buffer_len: state.buffer.len(),
+            buffer_capacity: state.buffer.capacity(),
+            accepted: state.accepted,
+            committed: state.committed,
+            in_flight: state.in_flight,
+            occupied_responses: state.occupied_responses,
+            ready_responses: state.ready_responses,
+            ready_out_of_order: state.ready_out_of_order,
+        }
+    }
+
     pub(super) fn check_read(&self, cx: &mut Context<'_>) -> io::Result<()> {
         self.shared.reader.register(cx.waker());
         self.shared.state.lock().unwrap().check()

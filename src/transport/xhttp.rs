@@ -99,6 +99,7 @@ pub struct XHttpClient {
     request: RequestTemplate,
     send_buffer_size: usize,
     upload_chunk_size: usize,
+    shared_packet_up: bool,
     http_version: crate::config::XHttpVersion,
     owner: Arc<DriverOwner>,
     reuse: Option<Arc<crate::config::XHttpReuseConfig>>,
@@ -142,11 +143,18 @@ impl XHttpClient {
             },
             send_buffer_size: DEFAULT_H2_SEND_BUFFER_SIZE,
             upload_chunk_size: DEFAULT_UPLOAD_CHUNK_SIZE,
+            shared_packet_up: false,
             http_version,
             owner: Arc::default(),
             pool: Arc::new(pool::Pool::new(reuse.clone(), http_version)),
             reuse,
         }
+    }
+
+    /// Immutable upload purpose, established before the first pool acquisition.
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn set_shared_packet_up_transport(&mut self, shared: bool) {
+        self.shared_packet_up = shared;
     }
 
     /// Opt-in only after the VLESS leg proves immutable physical/security scope.
@@ -533,6 +541,37 @@ impl XHttpClient {
         })))
     }
 
+    fn packet_up_writer(
+        &self,
+        sender: SendRequest,
+        session: Arc<str>,
+    ) -> io::Result<packet_up::Writer> {
+        let overlap = self.shared_packet_up
+            && self.mode == XHttpMode::PacketUp
+            && matches!(&sender, SendRequest::H3(_))
+            && matches!(
+                &self.request.options.data,
+                crate::config::xhttp::DataPlacement::Body
+            );
+        if overlap {
+            packet_up::Writer::new_overlapping(
+                sender,
+                self.request.clone(),
+                session,
+                self.upload_chunk_size,
+                &self.owner,
+            )
+        } else {
+            packet_up::Writer::new(
+                sender,
+                self.request.clone(),
+                session,
+                self.upload_chunk_size,
+                &self.owner,
+            )
+        }
+    }
+
     async fn connect_packet_up_with_download(
         &self,
         upload_sender: SendRequest,
@@ -547,13 +586,7 @@ impl XHttpClient {
         let (response, _) = download_sender.send_request(request, true).await?;
 
         Ok(Box::new(XHttpStream::new(PacketUp {
-            upload: packet_up::Writer::new(
-                upload_sender,
-                self.request.clone(),
-                session_id,
-                self.upload_chunk_size,
-                &self.owner,
-            )?,
+            upload: self.packet_up_writer(upload_sender, session_id)?,
             download: Downlink::pending(response, "packet-up download", false),
             closed: false,
             _connections: connections,
@@ -2154,3 +2187,7 @@ mod tests {
             .unwrap();
     }
 }
+
+#[cfg(all(test, feature = "outbound-vless", feature = "sing-mux"))]
+#[path = "xhttp/h3_packet_overlap_memory_tests.rs"]
+mod h3_packet_overlap_memory_tests;

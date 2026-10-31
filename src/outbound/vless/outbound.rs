@@ -313,6 +313,35 @@ impl VlessOutbound {
         )
     }
 
+    /// Set immutable carrier context before publishing the node or using its pool.
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn configure_shared_xhttp_transport(
+        &mut self,
+        smux: Option<&crate::config::SingMuxConfig>,
+    ) {
+        let shared = self.encryption.is_none()
+            && self.download.is_none()
+            && smux.is_some_and(|options| {
+                options.enabled
+                    && options.protocol == crate::config::SingMuxProtocol::H2Mux
+                    && !options.only_tcp
+                    && !options.padding
+            });
+        if let Some(upload) = &mut self.xhttp {
+            upload.set_shared_packet_up_transport(shared);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_xhttp_clients(&self) -> Option<(XHttpClient, Option<XHttpClient>)> {
+        self.xhttp.as_ref().map(|upload| {
+            (
+                upload.clone(),
+                self.download.as_ref().map(|leg| leg.xhttp.clone()),
+            )
+        })
+    }
+
     /// Builds a standard-TLS outbound with local interoperability-test roots.
     ///
     /// This constructor is absent from normal and release builds. It must only

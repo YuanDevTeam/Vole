@@ -88,6 +88,22 @@ impl quinn::AsyncUdpSocket for Socket {
     }
 }
 
+/// Reuse the existing bounded passive socket for production-driver fixtures.
+#[cfg(feature = "outbound-vless")]
+pub(crate) fn memory_socket(
+    send: mpsc::Sender<Bytes>,
+    receive: mpsc::Receiver<Bytes>,
+    local: SocketAddr,
+    peer: SocketAddr,
+) -> Arc<dyn quinn::AsyncUdpSocket> {
+    Arc::new(Socket {
+        send,
+        receive: Mutex::new(receive),
+        local,
+        peer,
+    })
+}
+
 pub(crate) struct Pair {
     pub(crate) client: quinn::Connection,
     server: quinn::Connection,
