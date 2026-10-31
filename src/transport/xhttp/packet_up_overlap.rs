@@ -216,7 +216,12 @@ pub(super) async fn transmit(
                 }
             })
             .await?;
-        let delay = Duration::from_millis(request.options.post_interval_ms.sample() as u64);
+        // Shorten only this shared-H3 writer's default partial-batch deadline.
+        let delay = if eager_capacity.is_some() {
+            Duration::from_millis(5)
+        } else {
+            Duration::from_millis(request.options.post_interval_ms.sample() as u64)
+        };
         responses
             .drive(shared, async {
                 wait_interval(shared, last_post_started, delay, eager_capacity).await;

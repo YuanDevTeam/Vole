@@ -365,6 +365,55 @@ fn finish(result: Result<Result<(), tokio::time::error::Elapsed>, Box<dyn std::a
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn qualified_default_partial_post_reaches_h3_before_ten_ms_with_strong_receipt() {
+    let node = shared_node("body");
+    let (client, _) = node.test_xhttp_clients().unwrap();
+    let mut fixture = Fixture::new(client, false, 16, 256 * 1024);
+    let result = AssertUnwindSafe(timeout(LIMIT, async {
+        let mut peer = fixture.initialize().await;
+        let (arrived, arrival) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        fixture.spawn(async move {
+            let mut first = accept(&mut peer, "default-five", 0).await;
+            let at = tokio::time::Instant::now();
+            body_len(&mut first, 0, 64).await;
+            arrived.send(at).unwrap();
+            released.await.unwrap();
+            respond(&mut first, 200).await;
+            let _ = peer.accept().await;
+        });
+        let mut writer = fixture.writer("default-five");
+        let began = tokio::time::Instant::now();
+        writer.write_all(&payload_len(0, 64)).await.unwrap();
+        let at = arrival.await.unwrap();
+        // Real peer headers/body/FIN are observed, not the delay expression.
+        // Arrival may include transport service; the original 10 ms default
+        // cannot pass this bound even when its transport service is immediate.
+        let elapsed = at - began;
+        assert!(
+            elapsed >= Duration::from_millis(5),
+            "partial POST bypassed aggregation"
+        );
+        assert!(
+            elapsed < Duration::from_millis(10),
+            "qualified default still waited ten ms"
+        );
+        assert_eq!(writer.snapshot().accepted, 64);
+        assert_eq!(writer.snapshot().committed, 0);
+        pending_flush(&mut writer).await;
+        release.send(()).unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(writer.snapshot().committed, 64);
+        writer.shutdown().await.unwrap();
+    }))
+    .catch_unwind()
+    .await;
+    fixture.stop().await;
+    node.shutdown().await;
+    finish(result);
+}
+
 #[tokio::test]
 async fn two_held_post_responses_reuse_one_body_backing_and_bound_the_third_write() {
     for placement in ["body", "auto"] {
