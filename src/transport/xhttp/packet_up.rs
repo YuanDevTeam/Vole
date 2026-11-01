@@ -122,6 +122,8 @@ impl Writer {
             } else {
                 crate::limits::XHTTP_H3_SERIAL_PACKET_BATCH_BYTES
             }
+        } else if matches!(&sender, SendRequest::H1 { .. }) {
+            crate::limits::XHTTP_H1_PACKET_BATCH_BYTES
         } else {
             crate::limits::XHTTP_PACKET_BATCH_BYTES
         };

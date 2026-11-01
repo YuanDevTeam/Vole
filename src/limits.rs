@@ -20,6 +20,8 @@ pub const XHTTP_CUSTOM_HEADERS: usize = 100;
 pub const XHTTP_PADDING_BYTES: usize = 4096;
 pub const XHTTP_POST_BYTES: usize = 16 * 1024 * 1024;
 pub const XHTTP_PACKET_BATCH_BYTES: usize = 64 * 1024;
+/// One HTTP/1 packet-up backing, including the in-flight body.
+pub const XHTTP_H1_PACKET_BATCH_BYTES: usize = 48 * 1024;
 /// One ordinary single-response H3 packet-up backing.
 pub const XHTTP_H3_SERIAL_PACKET_BATCH_BYTES: usize = 48 * 1024;
 /// One shared H3 packet-up backing, including the in-flight HTTP body.
