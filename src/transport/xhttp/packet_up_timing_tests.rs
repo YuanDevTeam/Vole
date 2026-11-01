@@ -563,11 +563,11 @@ async fn autonomous_smux_really_fills_default_packet_batch_and_preserves_every_f
 }
 
 #[tokio::test]
-async fn h3_batch_boundary_keeps_eager_progress_receipts_and_owner_stop() {
+async fn ordinary_h3_batch_boundary_keeps_eager_progress_receipts_and_owner_stop() {
     use crate::transport::quinn_h3::tests::Pair;
 
     for (post_limit, expected) in [
-        (1_000_000, crate::limits::XHTTP_H3_PACKET_BATCH_BYTES),
+        (1_000_000, crate::limits::XHTTP_H3_SERIAL_PACKET_BATCH_BYTES),
         (5000, 5000),
     ] {
         let mut pair = Pair::new(128 * 1024).await;

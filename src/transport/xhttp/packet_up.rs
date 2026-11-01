@@ -117,7 +117,11 @@ impl Writer {
         // Mihomo samples this maximum once per logical writer. Never allocate
         // the configurable (up to 16 MiB) maximum per connection.
         let batch_limit = if matches!(&sender, SendRequest::H3(_)) {
-            crate::limits::XHTTP_H3_PACKET_BATCH_BYTES
+            if overlap_responses {
+                crate::limits::XHTTP_H3_PACKET_BATCH_BYTES
+            } else {
+                crate::limits::XHTTP_H3_SERIAL_PACKET_BATCH_BYTES
+            }
         } else {
             crate::limits::XHTTP_PACKET_BATCH_BYTES
         };
