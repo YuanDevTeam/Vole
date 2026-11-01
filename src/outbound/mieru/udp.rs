@@ -186,6 +186,8 @@ struct Reliable {
     remote_window: u32,
     rtt: Rtt,
     cubic: Cubic,
+    // One timeout response for the pre-epoch flight across bounded TX slices.
+    timeout_epoch: Option<Instant>,
     ack_due: Option<Instant>,
     heartbeat: Instant,
     heartbeat_interval: Duration,
@@ -253,6 +255,7 @@ impl Reliable {
             remote_window: 16,
             rtt: Rtt::new(),
             cubic: Cubic::new(),
+            timeout_epoch: None,
             ack_due: None,
             heartbeat: now + interval,
             heartbeat_interval: interval,
@@ -794,6 +797,8 @@ async fn output(
 ) -> io::Result<bool> {
     let now = Instant::now();
     let mut had_timeout = false;
+    let mut new_timeout = false;
+    let timeout_epoch = state.timeout_epoch;
     let mut had_loss = false;
     let mut new_sent = 0u32;
     state.first_check = None;
@@ -836,8 +841,9 @@ async fn output(
     let mut base_rto = None;
     for segment in state.outstanding.values_mut() {
         let fast = segment.ack_count >= 3 && segment.tx_count <= 1;
+        let sent = segment.sent.unwrap();
         let timeout = now
-            >= segment.sent.unwrap()
+            >= sent
                 + if single_segment {
                     rtt.retransmit_delay(segment.tx_count)
                 } else {
@@ -874,13 +880,17 @@ async fn output(
         .await?;
         had_loss |= fast;
         had_timeout |= !fast;
+        new_timeout |= !fast && timeout_epoch.is_none_or(|epoch| sent >= epoch);
         segment.ack_count = 0;
         segment.tx_count += 1;
         segment.sent = Some(Instant::now());
         state.heartbeat = segment.sent.unwrap() + state.heartbeat_interval;
     }
     if had_timeout {
-        state.cubic.on_timeout();
+        if new_timeout {
+            state.cubic.on_timeout();
+            state.timeout_epoch = Some(now);
+        }
     } else if had_loss {
         state.cubic.on_loss(now);
     }
@@ -3139,6 +3149,458 @@ mod tests {
         assert_eq!(credit.available_permits(), 32);
         state.close();
     }
+    fn timeout_epoch_codec_ack(
+        reliable: &mut Reliable,
+        encoder: &mut PacketEncoder,
+        decoder: &mut PacketDecoder,
+        unack: u32,
+        nonce: u8,
+    ) {
+        let mut wire = Vec::new();
+        encoder
+            .encode_frame(
+                Metadata::Data(DataMetadata {
+                    kind: DataKind::ServerAck,
+                    session_id: 7,
+                    sequence: 0,
+                    unack_sequence: unack,
+                    window: 4096,
+                    fragment: 0,
+                }),
+                &[],
+                Padding {
+                    prefix: &[],
+                    suffix: &[],
+                },
+                [nonce; 24],
+                super::super::tcp::now().unwrap(),
+                &mut wire,
+            )
+            .unwrap();
+        let frame = decoder
+            .decode_frame(Bytes::from(wire), super::super::tcp::now().unwrap())
+            .unwrap();
+        reliable.input(frame, Instant::now(), &mut None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mieru_udp_timeout_epoch_preserves_cross_slice_ack_growth_and_repeated_loss() {
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let shared = Shared::output_test_shared(CancellationToken::new());
+                let state = State::new_for_business(
+                    7,
+                    64,
+                    super::super::tcp::Business::UdpAssociate,
+                    &shared.cancel,
+                    shared.activity.clone(),
+                );
+                state.opened.store(true, Ordering::Release);
+                shared.sessions.lock().unwrap().insert(7, state.clone());
+                let credit = Arc::new(Semaphore::new(64));
+                let mut reliable = Reliable::new(state.clone(), 1312);
+                reliable.established = true;
+                reliable.rtt.update(Duration::from_nanos(100_000_015));
+                let delay = Duration::from_nanos(451_500_064);
+                assert_eq!(reliable.rtt.retransmit_delay(1), delay);
+                let (command, mut completion) =
+                    lookahead_command(&state, &credit, b"ABCDEFGHIJKLMNOP");
+                reliable.enqueue(command, 1, false);
+                let pattern = EffectivePattern::compile(
+                    None,
+                    super::super::pattern::HostProfile::capture(),
+                    "vole",
+                )
+                .unwrap();
+                let mut patterned = PacketPattern {
+                    pattern: &pattern,
+                    nonce: NonceState::new(),
+                    wire_budget: MTU.into(),
+                    remaining: OUTPUT_QUANTUM,
+                    truncated: false,
+                };
+                let key = crypto::derive_packet_key(
+                    "vole",
+                    "fixture-password",
+                    super::super::tcp::now().unwrap(),
+                );
+                let mut encoder = PacketEncoder::new(&key, false).unwrap();
+                let mut packets = LookaheadPackets {
+                    decoder: PacketDecoder::new(&key, false).unwrap(),
+                    frames: Vec::new(),
+                    latest: None,
+                };
+                let mut ack_encoder = PacketEncoder::new(&key, false).unwrap();
+                let mut ack_decoder = PacketDecoder::new(&key, false).unwrap();
+                let peer = Destination::Ip("192.0.2.1:2000".parse().unwrap());
+                let mut wire = Vec::new();
+                for expected in [8, 16] {
+                    patterned.remaining = OUTPUT_QUANTUM;
+                    patterned.truncated = false;
+                    assert!(
+                        output(
+                            &mut packets,
+                            &peer,
+                            &mut encoder,
+                            "vole",
+                            &shared,
+                            &mut patterned,
+                            &mut reliable,
+                            true,
+                            &mut wire
+                        )
+                        .await
+                        .unwrap()
+                    );
+                    assert_eq!(packets.frames.len(), expected);
+                }
+                completion.try_recv().unwrap().unwrap();
+                assert_eq!(reliable.outstanding.len(), 16);
+                assert_eq!(credit.available_permits(), 48);
+                let first_sent = reliable.outstanding[&0].sent.unwrap();
+                tokio::time::advance(first_sent + delay - Instant::now()).await;
+                patterned.remaining = OUTPUT_QUANTUM;
+                patterned.truncated = false;
+                assert!(
+                    output(
+                        &mut packets,
+                        &peer,
+                        &mut encoder,
+                        "vole",
+                        &shared,
+                        &mut patterned,
+                        &mut reliable,
+                        true,
+                        &mut wire
+                    )
+                    .await
+                    .unwrap()
+                );
+                assert_eq!(packets.frames.len(), 24);
+                assert_eq!(patterned.remaining, 0);
+                assert!(patterned.truncated);
+                assert_eq!(reliable.cubic.window(), 16);
+                let epoch_send = Instant::now();
+                timeout_epoch_codec_ack(&mut reliable, &mut ack_encoder, &mut ack_decoder, 8, 1);
+                assert_eq!(reliable.outstanding.len(), 8);
+                assert_eq!(reliable.cubic.window(), 24);
+                assert_eq!(
+                    credit.available_permits(),
+                    48,
+                    "the unacked tail still owns the whole write"
+                );
+                patterned.remaining = OUTPUT_QUANTUM;
+                patterned.truncated = false;
+                assert!(
+                    output(
+                        &mut packets,
+                        &peer,
+                        &mut encoder,
+                        "vole",
+                        &shared,
+                        &mut patterned,
+                        &mut reliable,
+                        true,
+                        &mut wire
+                    )
+                    .await
+                    .unwrap()
+                );
+                assert_eq!(packets.frames.len(), 32);
+                // Declared oracle: DD resets again to 16; the old-flight continuation
+                // must retain the eight real ACK increments, not emulate CUBIC math.
+                assert_eq!(reliable.cubic.window(), 24);
+                assert!(
+                    reliable
+                        .outstanding
+                        .values()
+                        .all(|s| s.tx_count == 2 && s.sent == Some(epoch_send))
+                );
+                let repeated_due = epoch_send + reliable.rtt.retransmit_delay(2);
+                tokio::time::advance(repeated_due - Instant::now()).await;
+                patterned.remaining = OUTPUT_QUANTUM;
+                patterned.truncated = false;
+                assert!(
+                    output(
+                        &mut packets,
+                        &peer,
+                        &mut encoder,
+                        "vole",
+                        &shared,
+                        &mut patterned,
+                        &mut reliable,
+                        true,
+                        &mut wire
+                    )
+                    .await
+                    .unwrap()
+                );
+                assert_eq!(packets.frames.len(), 40);
+                assert_eq!(
+                    reliable.cubic.window(),
+                    16,
+                    "a genuinely repeated timeout still resets"
+                );
+                assert!(
+                    reliable
+                        .outstanding
+                        .values()
+                        .all(|s| s.tx_count == 3 && s.sent == Some(repeated_due))
+                );
+                for (index, frame) in packets.frames.iter().enumerate() {
+                    let expected_sequence = match index {
+                        0..=15 => index,
+                        16..=23 => index - 16,
+                        24..=31 => index - 16,
+                        _ => index - 24,
+                    };
+                    assert!(matches!(frame.metadata, Metadata::Data(meta)
+                    if meta.kind == DataKind::ClientData && meta.session_id == 7
+                    && meta.sequence == expected_sequence as u32
+                    && meta.fragment == 15 - expected_sequence as u8));
+                    assert_eq!(
+                        frame.payload.as_ref(),
+                        &b"ABCDEFGHIJKLMNOP"[expected_sequence..expected_sequence + 1]
+                    );
+                }
+                timeout_epoch_codec_ack(&mut reliable, &mut ack_encoder, &mut ack_decoder, 16, 2);
+                assert!(reliable.outstanding.is_empty());
+                assert_eq!(credit.available_permits(), 64);
+                shared.cancel.cancel();
+                state.close();
+                shared.sessions.lock().unwrap().clear();
+                drop((reliable, state));
+            })
+            .await;
+        assert!(probe.snapshot().is_idle());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mieru_udp_timeout_epoch_keeps_timeout_priority_fast_loss_and_stop_ownership() {
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let shared = Shared::output_test_shared(CancellationToken::new());
+                let state = State::new_for_business(
+                    7,
+                    64,
+                    super::super::tcp::Business::UdpAssociate,
+                    &shared.cancel,
+                    shared.activity.clone(),
+                );
+                state.opened.store(true, Ordering::Release);
+                shared.sessions.lock().unwrap().insert(7, state.clone());
+                let credit = Arc::new(Semaphore::new(64));
+                let mut reliable = Reliable::new(state.clone(), 1312);
+                reliable.established = true;
+                reliable.rtt.update(Duration::from_nanos(100_000_015));
+                let delay = Duration::from_nanos(451_500_064);
+                assert_eq!(reliable.rtt.retransmit_delay(1), delay);
+                let (command, mut completion) = lookahead_command(&state, &credit, b"ABC");
+                reliable.enqueue(command, 1, false);
+                let pattern = EffectivePattern::compile(
+                    None,
+                    super::super::pattern::HostProfile::capture(),
+                    "vole",
+                )
+                .unwrap();
+                let mut patterned = PacketPattern {
+                    pattern: &pattern,
+                    nonce: NonceState::new(),
+                    wire_budget: MTU.into(),
+                    remaining: OUTPUT_QUANTUM,
+                    truncated: false,
+                };
+                let key = crypto::derive_packet_key(
+                    "vole",
+                    "fixture-password",
+                    super::super::tcp::now().unwrap(),
+                );
+                let mut encoder = PacketEncoder::new(&key, false).unwrap();
+                let mut packets = LookaheadPackets {
+                    decoder: PacketDecoder::new(&key, false).unwrap(),
+                    frames: Vec::new(),
+                    latest: None,
+                };
+                let mut ack_encoder = PacketEncoder::new(&key, false).unwrap();
+                let mut ack_decoder = PacketDecoder::new(&key, false).unwrap();
+                let peer = Destination::Ip("192.0.2.1:2000".parse().unwrap());
+                let mut wire = Vec::new();
+                assert!(
+                    output(
+                        &mut packets,
+                        &peer,
+                        &mut encoder,
+                        "vole",
+                        &shared,
+                        &mut patterned,
+                        &mut reliable,
+                        true,
+                        &mut wire
+                    )
+                    .await
+                    .unwrap()
+                );
+                completion.try_recv().unwrap().unwrap();
+                assert_eq!(packets.frames.len(), 3);
+                let first_sent = reliable.outstanding[&0].sent.unwrap();
+                tokio::time::advance(first_sent + delay - Instant::now()).await;
+                // Seven earlier sends of the shared TX8 can leave this SID one slot.
+                patterned.remaining = 1;
+                patterned.truncated = false;
+                assert!(
+                    output(
+                        &mut packets,
+                        &peer,
+                        &mut encoder,
+                        "vole",
+                        &shared,
+                        &mut patterned,
+                        &mut reliable,
+                        true,
+                        &mut wire
+                    )
+                    .await
+                    .unwrap()
+                );
+                assert_eq!(packets.frames.len(), 4);
+                assert!(patterned.truncated);
+                for nonce in 1..=3 {
+                    timeout_epoch_codec_ack(
+                        &mut reliable,
+                        &mut ack_encoder,
+                        &mut ack_decoder,
+                        1,
+                        nonce,
+                    );
+                }
+                assert_eq!(reliable.cubic.window(), 17);
+                assert_eq!(reliable.outstanding[&1].ack_count, 3);
+                patterned.remaining = OUTPUT_QUANTUM;
+                patterned.truncated = false;
+                assert!(
+                    output(
+                        &mut packets,
+                        &peer,
+                        &mut encoder,
+                        "vole",
+                        &shared,
+                        &mut patterned,
+                        &mut reliable,
+                        true,
+                        &mut wire
+                    )
+                    .await
+                    .unwrap()
+                );
+                assert_eq!(packets.frames.len(), 6);
+                assert_eq!(patterned.remaining, 6);
+                // The old timeout on seq2 keeps priority over fast seq1 even when
+                // its repeated timeout response is coalesced; do not call OnLoss.
+                assert_eq!(reliable.cubic.window(), 17);
+                for (frame, sequence) in packets.frames[4..].iter().zip([1, 2]) {
+                    assert!(matches!(frame.metadata, Metadata::Data(meta)
+                    if meta.kind == DataKind::ClientData && meta.sequence == sequence));
+                    assert_eq!(reliable.outstanding[&sequence].tx_count, 2);
+                }
+                assert_eq!(credit.available_permits(), 61);
+                timeout_epoch_codec_ack(&mut reliable, &mut ack_encoder, &mut ack_decoder, 3, 4);
+                assert_eq!(reliable.cubic.window(), 19);
+                assert_eq!(credit.available_permits(), 64);
+                let (command, mut done) = lookahead_command(&state, &credit, b"D");
+                reliable.enqueue(command, 1, false);
+                patterned.remaining = OUTPUT_QUANTUM;
+                patterned.truncated = false;
+                assert!(
+                    output(
+                        &mut packets,
+                        &peer,
+                        &mut encoder,
+                        "vole",
+                        &shared,
+                        &mut patterned,
+                        &mut reliable,
+                        true,
+                        &mut wire
+                    )
+                    .await
+                    .unwrap()
+                );
+                done.try_recv().unwrap().unwrap();
+                for nonce in 5..=7 {
+                    timeout_epoch_codec_ack(
+                        &mut reliable,
+                        &mut ack_encoder,
+                        &mut ack_decoder,
+                        3,
+                        nonce,
+                    );
+                }
+                tokio::time::advance(Duration::from_millis(1)).await;
+                assert!(
+                    Instant::now()
+                        < reliable.outstanding[&3].sent.unwrap() + reliable.rtt.retransmit_delay(1)
+                );
+                patterned.remaining = OUTPUT_QUANTUM;
+                patterned.truncated = false;
+                assert!(
+                    output(
+                        &mut packets,
+                        &peer,
+                        &mut encoder,
+                        "vole",
+                        &shared,
+                        &mut patterned,
+                        &mut reliable,
+                        true,
+                        &mut wire
+                    )
+                    .await
+                    .unwrap()
+                );
+                assert_eq!(packets.frames.len(), 8);
+                assert_eq!(reliable.outstanding[&3].tx_count, 2);
+                assert_eq!(reliable.cubic.window(), 16);
+                timeout_epoch_codec_ack(&mut reliable, &mut ack_encoder, &mut ack_decoder, 4, 8);
+                assert_eq!(
+                    reliable.cubic.window(),
+                    16,
+                    "fast-only retains loss recovery; a timeout reset would ACK-grow to 17"
+                );
+                let (command, mut done) = lookahead_command(&state, &credit, b"E");
+                reliable.enqueue(command, 1, false);
+                patterned.remaining = OUTPUT_QUANTUM;
+                patterned.truncated = false;
+                assert!(
+                    output(
+                        &mut packets,
+                        &peer,
+                        &mut encoder,
+                        "vole",
+                        &shared,
+                        &mut patterned,
+                        &mut reliable,
+                        true,
+                        &mut wire
+                    )
+                    .await
+                    .unwrap()
+                );
+                done.try_recv().unwrap().unwrap();
+                assert_eq!(credit.available_permits(), 63);
+                assert_eq!(reliable.outstanding.len(), 1);
+                shared.cancel.cancel();
+                state.close();
+                drop(reliable);
+                shared.sessions.lock().unwrap().clear();
+                assert_eq!(credit.available_permits(), 64);
+                drop(state);
+            })
+            .await;
+        assert!(probe.snapshot().is_idle());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn mieru_udp_send_credit96_two_sids_keep_fragment_leases_until_their_acks() {
         let probe = ResourceProbe::default();
