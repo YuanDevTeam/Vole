@@ -38,6 +38,8 @@ Mieru UDP载体的TCP上传收尾：`outbound::mieru::udp::tests::mieru_udp_uplo
 同模块的 `mieru_udp_close_retry_` 使用实际驱动验证无响应时最多两次补发，以及补发等待中的活动Stop与owner回收。
 同模块的 `mieru_udp_timeout_epoch_` 以真实codec验证TX拆批间ACK增长、旧flight超时惩罚归并、
 实际重发再次超时、fast/timeout优先级及未ACK许可回收；不代替真实TUN的丢失恢复和性能验收。
+`outbound::mieru::udp::tests::mieru_udp_saved_rto_` 通过同一物理owner的两类业务与真实codec，验证
+UDP发送时期限、TCP动态期限、失败发送不发布状态、快速重传及整write许可回收。
 
 smux 纯内存边界：`transport::smux::`，覆盖就绪 DATA 的单次 poll 预算、未读流与兄弟流、整帧分配预算、极小合法配额、本地关闭释放和远端 DATA→FIN 顺序。
 调度测试隔离 Tokio 的独立 cooperative allowance；这些测试不代替真实 TUN 性能验证。

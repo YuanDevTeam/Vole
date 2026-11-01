@@ -72,6 +72,8 @@ struct Segment {
     payload: Bytes,
     lease: Option<Arc<WriteLease>>,
     sent: Option<Instant>,
+    // Used after successful UDP-associate sends; the <=10s value is exact in u64 ns.
+    timeout_nanos: u64,
     tx_count: u32,
     ack_count: u32,
 }
@@ -341,6 +343,7 @@ impl Reliable {
                 },
                 lease: if piggyback { Some(lease.clone()) } else { None },
                 sent: None,
+                timeout_nanos: 0,
                 tx_count: 0,
                 ack_count: 0,
             });
@@ -362,6 +365,7 @@ impl Reliable {
                     payload: command.data.slice(start..start + part.len()),
                     lease: Some(lease.clone()),
                     sent: None,
+                    timeout_nanos: 0,
                     tx_count: 0,
                     ack_count: 0,
                 });
@@ -575,6 +579,7 @@ impl Reliable {
         }
         // RTT is unchanged within this read-only SID scan. Compute its base
         // lazily, so empty scans and fast-ACK-only scans still do no RTO work.
+        let saved_timeout = self.state.business == super::tcp::Business::UdpAssociate;
         let single_segment = self.outstanding.len() == 1;
         let mut base_rto = None;
         for segment in self.outstanding.values() {
@@ -582,7 +587,9 @@ impl Reliable {
                 now
             } else {
                 segment.sent.unwrap()
-                    + if single_segment {
+                    + if saved_timeout {
+                        Duration::from_nanos(segment.timeout_nanos)
+                    } else if single_segment {
                         self.rtt.retransmit_delay(segment.tx_count)
                     } else {
                         Rtt::retransmit_delay_from_rto(
@@ -837,6 +844,7 @@ async fn output(
     // This owner cannot process incoming ACKs while output holds the SID.
     // Keep the base local to this scan, including across its physical sends.
     let rtt = &state.rtt;
+    let saved_timeout = state.state.business == super::tcp::Business::UdpAssociate;
     let single_segment = state.outstanding.len() == 1;
     let mut base_rto = None;
     for segment in state.outstanding.values_mut() {
@@ -844,7 +852,9 @@ async fn output(
         let sent = segment.sent.unwrap();
         let timeout = now
             >= sent
-                + if single_segment {
+                + if saved_timeout {
+                    Duration::from_nanos(segment.timeout_nanos)
+                } else if single_segment {
                     rtt.retransmit_delay(segment.tx_count)
                 } else {
                     Rtt::retransmit_delay_from_rto(
@@ -885,6 +895,9 @@ async fn output(
         segment.tx_count += 1;
         segment.sent = Some(Instant::now());
         state.heartbeat = segment.sent.unwrap() + state.heartbeat_interval;
+        if saved_timeout {
+            segment.timeout_nanos = rtt.retransmit_delay(segment.tx_count).as_nanos() as u64;
+        }
     }
     if had_timeout {
         if new_timeout {
@@ -936,6 +949,9 @@ async fn output(
         segment.sent = Some(Instant::now());
         state.heartbeat = segment.sent.unwrap() + state.heartbeat_interval;
         segment.tx_count = 1;
+        if saved_timeout {
+            segment.timeout_nanos = state.rtt.retransmit_delay(segment.tx_count).as_nanos() as u64;
+        }
         if let Metadata::Data(meta) = segment.metadata {
             state.last_window = meta.window;
         }
@@ -3149,6 +3165,320 @@ mod tests {
         assert_eq!(credit.available_permits(), 32);
         state.close();
     }
+
+    // Two business SIDs deliberately use the same output owner, wire codec and
+    // byte credit. Eligibility must come from each State, not Shared's creator.
+    struct QualifiedRtoPackets {
+        inner: LookaheadPackets,
+        delay: Duration,
+        fail: bool,
+    }
+    #[async_trait]
+    impl DatagramTransport for QualifiedRtoPackets {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+        async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            if self.fail {
+                return Err(DispatchError::ConnectionRefused);
+            }
+            self.inner.send(packet).await
+        }
+        async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            std::future::pending().await
+        }
+        async fn close(&mut self) -> Result<(), DispatchError> {
+            Ok(())
+        }
+    }
+    struct QualifiedRtoFixture {
+        shared: Arc<Shared>,
+        credit: Arc<Semaphore>,
+        encoder: PacketEncoder,
+        ack_encoder: PacketEncoder,
+        ack_decoder: PacketDecoder,
+        packets: QualifiedRtoPackets,
+        pattern: EffectivePattern,
+        wire: Vec<u8>,
+    }
+    impl QualifiedRtoFixture {
+        fn new() -> Self {
+            let key = crypto::derive_packet_key(
+                "vole",
+                "fixture-password",
+                super::super::tcp::now().unwrap(),
+            );
+            Self {
+                shared: Shared::output_test_shared(CancellationToken::new()),
+                credit: Arc::new(Semaphore::new(64)),
+                encoder: PacketEncoder::new(&key, false).unwrap(),
+                ack_encoder: PacketEncoder::new(&key, false).unwrap(),
+                ack_decoder: PacketDecoder::new(&key, false).unwrap(),
+                packets: QualifiedRtoPackets {
+                    inner: LookaheadPackets {
+                        decoder: PacketDecoder::new(&key, false).unwrap(),
+                        frames: Vec::new(),
+                        latest: None,
+                    },
+                    delay: Duration::ZERO,
+                    fail: false,
+                },
+                pattern: EffectivePattern::compile(
+                    None,
+                    super::super::pattern::HostProfile::capture(),
+                    "vole",
+                )
+                .unwrap(),
+                wire: Vec::new(),
+            }
+        }
+        fn session(
+            &self,
+            id: u32,
+            business: super::super::tcp::Business,
+            rtt: Duration,
+        ) -> Reliable {
+            let state = State::new_for_business(
+                id,
+                64,
+                business,
+                &self.shared.cancel,
+                self.shared.activity.clone(),
+            );
+            state.opened.store(true, Ordering::Release);
+            self.shared
+                .sessions
+                .lock()
+                .unwrap()
+                .insert(id, state.clone());
+            let mut reliable = Reliable::new(state, 1312);
+            reliable.established = true;
+            reliable.heartbeat_interval = Duration::from_secs(30);
+            reliable.heartbeat = Instant::now() + reliable.heartbeat_interval;
+            reliable.rtt.update(rtt);
+            reliable
+        }
+        fn enqueue(
+            &self,
+            reliable: &mut Reliable,
+            data: &'static [u8],
+            chunk: usize,
+        ) -> oneshot::Receiver<io::Result<()>> {
+            let (command, done) = lookahead_command(&reliable.state, &self.credit, data);
+            reliable.enqueue(command, chunk, false);
+            done
+        }
+        fn ack(&mut self, reliable: &mut Reliable, unack: u32, nonce: u8) {
+            timeout_epoch_codec_ack(
+                reliable,
+                &mut self.ack_encoder,
+                &mut self.ack_decoder,
+                unack,
+                nonce,
+            );
+        }
+        async fn output(&mut self, reliable: &mut Reliable) -> io::Result<bool> {
+            let mut pattern = PacketPattern {
+                pattern: &self.pattern,
+                nonce: NonceState::new(),
+                wire_budget: MTU.into(),
+                remaining: OUTPUT_QUANTUM,
+                truncated: false,
+            };
+            output(
+                &mut self.packets,
+                &Destination::Ip("192.0.2.1:2000".parse().unwrap()),
+                &mut self.encoder,
+                "vole",
+                &self.shared,
+                &mut pattern,
+                reliable,
+                true,
+                &mut self.wire,
+            )
+            .await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mieru_udp_saved_rto_qualifies_each_business_with_live_tcp_control() {
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                for (initial, sample, rises) in [(100, 1000, true), (1000, 800, false)] {
+                    let mut fixture = QualifiedRtoFixture::new();
+                    let mut udp = fixture.session(
+                        7,
+                        super::super::tcp::Business::UdpAssociate,
+                        Duration::from_millis(initial),
+                    );
+                    let mut tcp = fixture.session(
+                        9,
+                        super::super::tcp::Business::TcpConnect,
+                        Duration::from_millis(initial),
+                    );
+                    let mut completions = [
+                        fixture.enqueue(&mut udp, b"A", 1312),
+                        fixture.enqueue(&mut udp, b"B", 1312),
+                        fixture.enqueue(&mut tcp, b"A", 1312),
+                        fixture.enqueue(&mut tcp, b"B", 1312),
+                    ];
+                    assert!(fixture.output(&mut udp).await.unwrap());
+                    assert!(fixture.output(&mut tcp).await.unwrap());
+                    for done in &mut completions {
+                        done.try_recv().unwrap().unwrap();
+                    }
+                    let sent = udp.outstanding[&1].sent.unwrap();
+                    assert_eq!(tcp.outstanding[&1].sent, Some(sent));
+                    let frozen = udp.outstanding[&1].timeout_nanos;
+                    assert!(frozen > 0);
+                    assert!(
+                        tcp.outstanding
+                            .values()
+                            .all(|segment| segment.timeout_nanos == 0)
+                    );
+                    tokio::time::advance(FIRST_CHECK).await;
+                    assert!(fixture.output(&mut udp).await.unwrap());
+                    assert!(fixture.output(&mut tcp).await.unwrap());
+                    assert!(udp.first_check.is_none() && tcp.first_check.is_none());
+                    assert_eq!(fixture.packets.inner.frames.len(), 4);
+                    tokio::time::advance(sent + Duration::from_millis(sample) - Instant::now())
+                        .await;
+                    fixture.ack(&mut udp, 1, 1);
+                    fixture.ack(&mut tcp, 1, 2);
+                    assert_eq!(fixture.credit.available_permits(), 62);
+                    assert_eq!(udp.outstanding.len(), 1);
+                    assert_eq!(tcp.outstanding.len(), 1);
+                    assert_eq!(udp.rtt.rto(), tcp.rtt.rto());
+                    let frozen_due = sent + Duration::from_nanos(frozen);
+                    let live_due = sent + tcp.rtt.retransmit_delay(1);
+                    assert_eq!(live_due > frozen_due, rises);
+                    assert_eq!(udp.outstanding[&1].timeout_nanos, frozen);
+                    assert_eq!(udp.next_deadline(Instant::now()), frozen_due);
+                    assert_eq!(tcp.next_deadline(Instant::now()), live_due);
+                    let earlier = frozen_due.min(live_due).max(Instant::now());
+                    assert!(earlier < frozen_due.max(live_due));
+                    tokio::time::advance(earlier - Instant::now()).await;
+                    assert!(fixture.output(&mut udp).await.unwrap());
+                    assert!(fixture.output(&mut tcp).await.unwrap());
+                    assert_eq!(udp.outstanding[&1].tx_count, if rises { 2 } else { 1 });
+                    assert_eq!(tcp.outstanding[&1].tx_count, if rises { 1 } else { 2 });
+                    assert_eq!(fixture.packets.inner.frames.len(), 5);
+                    tokio::time::advance(frozen_due.max(live_due) - Instant::now()).await;
+                    assert!(fixture.output(&mut udp).await.unwrap());
+                    assert!(fixture.output(&mut tcp).await.unwrap());
+                    assert_eq!(udp.outstanding[&1].tx_count, 2);
+                    assert_eq!(tcp.outstanding[&1].tx_count, 2);
+                    assert_eq!(fixture.packets.inner.frames.len(), 6);
+                    let mut retry_ids: Vec<_> = fixture.packets.inner.frames[4..]
+                        .iter()
+                        .map(|frame| {
+                            assert!(matches!(frame.metadata, Metadata::Data(meta)
+                        if meta.kind == DataKind::ClientData && meta.sequence == 1));
+                            assert_eq!(frame.payload.as_ref(), b"B");
+                            session_id(frame.metadata)
+                        })
+                        .collect();
+                    retry_ids.sort_unstable();
+                    assert_eq!(retry_ids, [7, 9]);
+                    fixture.ack(&mut udp, 2, 3);
+                    fixture.ack(&mut tcp, 2, 4);
+                    assert_eq!(fixture.credit.available_permits(), 64);
+                    fixture.shared.cancel.cancel();
+                    udp.state.close();
+                    tcp.state.close();
+                    fixture.shared.sessions.lock().unwrap().clear();
+                    drop((udp, tcp));
+                }
+            })
+            .await;
+        assert!(probe.snapshot().is_idle());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mieru_udp_saved_rto_publishes_only_success_and_keeps_fast_retry_leases() {
+        let probe = ResourceProbe::default();
+        probe.scope(async {
+            let mut fixture = QualifiedRtoFixture::new();
+            let mut failed = fixture.session(11, super::super::tcp::Business::UdpAssociate, Duration::from_secs(1));
+            let mut failed_done = fixture.enqueue(&mut failed, b"X", 1);
+            let heartbeat = failed.heartbeat;
+            fixture.packets.fail = true;
+            fixture.packets.delay = Duration::from_millis(13);
+            assert!(fixture.output(&mut failed).await.is_err());
+            assert!(failed.outstanding.is_empty());
+            assert!(fixture.packets.inner.frames.is_empty());
+            assert_eq!(failed.heartbeat, heartbeat);
+            assert!(failed_done.try_recv().unwrap().is_err());
+            assert_eq!(fixture.credit.available_permits(), 64);
+            failed.state.close();
+            fixture.shared.sessions.lock().unwrap().remove(&11);
+            drop(failed);
+
+            fixture.packets.fail = false;
+            fixture.packets.delay = Duration::ZERO;
+            let mut reliable = fixture.session(7, super::super::tcp::Business::UdpAssociate, Duration::from_secs(1));
+            let mut done = fixture.enqueue(&mut reliable, b"AB", 1);
+            assert!(fixture.output(&mut reliable).await.unwrap());
+            done.try_recv().unwrap().unwrap();
+            assert_eq!(fixture.packets.inner.frames.len(), 2);
+            let sent = reliable.outstanding[&1].sent.unwrap();
+            let first_timeout = reliable.outstanding[&1].timeout_nanos;
+            tokio::time::advance(FIRST_CHECK).await;
+            assert!(fixture.output(&mut reliable).await.unwrap());
+            assert!(reliable.first_check.is_none());
+            tokio::time::advance(sent + Duration::from_millis(800) - Instant::now()).await;
+            fixture.ack(&mut reliable, 1, 1);
+            let rto = reliable.rtt.rto();
+            assert_eq!(fixture.credit.available_permits(), 62, "the retained tail owns the whole fragmented write");
+            assert_eq!(reliable.outstanding[&1].timeout_nanos, first_timeout);
+            fixture.ack(&mut reliable, 1, 2);
+            fixture.ack(&mut reliable, 1, 3);
+            assert_eq!(reliable.rtt.rto(), rto);
+            assert_eq!(reliable.outstanding[&1].ack_count, 3);
+            assert!(Instant::now() < sent + Duration::from_nanos(first_timeout));
+            assert_eq!(reliable.next_deadline(Instant::now()), Instant::now());
+            let old = &reliable.outstanding[&1];
+            let previous = (old.sent, old.timeout_nanos, old.tx_count, old.ack_count);
+            let heartbeat = reliable.heartbeat;
+            fixture.packets.delay = Duration::from_millis(13);
+            fixture.packets.fail = true;
+            assert!(fixture.output(&mut reliable).await.is_err());
+            let old = &reliable.outstanding[&1];
+            assert_eq!((old.sent, old.timeout_nanos, old.tx_count, old.ack_count), previous);
+            assert_eq!(reliable.heartbeat, heartbeat);
+            assert_eq!(fixture.packets.inner.frames.len(), 2);
+            assert_eq!(fixture.credit.available_permits(), 62);
+            fixture.packets.fail = false;
+            let before_send = Instant::now();
+            let refreshed = reliable.rtt.retransmit_delay(2);
+            assert_ne!(refreshed, Duration::from_nanos(first_timeout));
+            assert!(fixture.output(&mut reliable).await.unwrap());
+            let retried = &reliable.outstanding[&1];
+            assert_eq!(retried.sent, Some(Instant::now()));
+            assert!(retried.sent.unwrap() >= before_send + Duration::from_millis(13));
+            assert_eq!(Duration::from_nanos(retried.timeout_nanos), refreshed);
+            assert_eq!((retried.tx_count, retried.ack_count), (2, 0));
+            assert!(reliable.timeout_epoch.is_none(), "fast-only must remain loss, not timeout");
+            assert_eq!(fixture.packets.inner.frames.len(), 3);
+            let frame = fixture.packets.inner.frames.last().unwrap();
+            assert!(matches!(frame.metadata, Metadata::Data(meta)
+                if meta.kind == DataKind::ClientData && meta.session_id == 7 && meta.sequence == 1 && meta.fragment == 0));
+            assert_eq!(frame.payload.as_ref(), b"B");
+            assert_eq!(fixture.credit.available_permits(), 62);
+            fixture.ack(&mut reliable, 2, 4);
+            assert!(reliable.outstanding.is_empty());
+            assert_eq!(fixture.credit.available_permits(), 64);
+            fixture.shared.cancel.cancel(); reliable.state.close();
+            fixture.shared.sessions.lock().unwrap().clear();
+            drop(reliable);
+        }).await;
+        assert!(probe.snapshot().is_idle());
+    }
+
     fn timeout_epoch_codec_ack(
         reliable: &mut Reliable,
         encoder: &mut PacketEncoder,
@@ -3161,7 +3491,7 @@ mod tests {
             .encode_frame(
                 Metadata::Data(DataMetadata {
                     kind: DataKind::ServerAck,
-                    session_id: 7,
+                    session_id: reliable.state.id,
                     sequence: 0,
                     unack_sequence: unack,
                     window: 4096,
@@ -3259,7 +3589,9 @@ mod tests {
                 assert_eq!(reliable.outstanding.len(), 16);
                 assert_eq!(credit.available_permits(), 48);
                 let first_sent = reliable.outstanding[&0].sent.unwrap();
-                tokio::time::advance(first_sent + delay - Instant::now()).await;
+                let sent_delay = Duration::from_nanos(reliable.outstanding[&0].timeout_nanos);
+                assert_eq!(sent_delay, delay);
+                tokio::time::advance(first_sent + sent_delay - Instant::now()).await;
                 patterned.remaining = OUTPUT_QUANTUM;
                 patterned.truncated = false;
                 assert!(
@@ -3317,7 +3649,17 @@ mod tests {
                         .values()
                         .all(|s| s.tx_count == 2 && s.sent == Some(epoch_send))
                 );
-                let repeated_due = epoch_send + reliable.rtt.retransmit_delay(2);
+                let retried = &reliable.outstanding[&8];
+                let repeated_due =
+                    retried.sent.unwrap() + Duration::from_nanos(retried.timeout_nanos);
+                assert!(
+                    reliable
+                        .outstanding
+                        .values()
+                        .all(|segment| segment.timeout_nanos > 0
+                            && segment.sent.unwrap() + Duration::from_nanos(segment.timeout_nanos)
+                                == repeated_due)
+                );
                 tokio::time::advance(repeated_due - Instant::now()).await;
                 patterned.remaining = OUTPUT_QUANTUM;
                 patterned.truncated = false;
@@ -3445,7 +3787,9 @@ mod tests {
                 completion.try_recv().unwrap().unwrap();
                 assert_eq!(packets.frames.len(), 3);
                 let first_sent = reliable.outstanding[&0].sent.unwrap();
-                tokio::time::advance(first_sent + delay - Instant::now()).await;
+                let sent_delay = Duration::from_nanos(reliable.outstanding[&0].timeout_nanos);
+                assert_eq!(sent_delay, delay);
+                tokio::time::advance(first_sent + sent_delay - Instant::now()).await;
                 // Seven earlier sends of the shared TX8 can leave this SID one slot.
                 patterned.remaining = 1;
                 patterned.truncated = false;
