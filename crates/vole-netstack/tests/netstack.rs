@@ -789,7 +789,7 @@ async fn assert_active_accepted_tail(drop_after_write: bool) {
             assert_eq!(packet.data()[offset + 13] & 4, 0, "unexpected RST");
             if tcp_acknowledgement(&packet) == 702 {
                 assert_eq!(tcp_sequence(&packet), fin_end);
-                assert!(tcp_payload(&packet).is_empty());
+                assert_eq!(tcp_payload(&packet), []);
                 break;
             }
         }

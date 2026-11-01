@@ -328,7 +328,7 @@ mod tests {
             rx.consume(|_| {});
             let response = tcp_packet(reverse(flow), 10, 1, flags, 0);
             tx.consume(response.len(), |bytes| {
-                bytes.copy_from_slice(response.data())
+                bytes.copy_from_slice(response.data());
             });
             assert!(device.pending_tx.is_some());
             assert_eq!(device.emitted(), 0);
@@ -389,7 +389,7 @@ mod tests {
         rx.consume(|_| {});
         let response = tcp_packet(reverse(flow), 10, 1, 16, 0);
         tx.consume(response.len(), |bytes| {
-            bytes.copy_from_slice(response.data())
+            bytes.copy_from_slice(response.data());
         });
         device.push_rx(tcp_packet(flow, 1, 11, 16, 0)).unwrap();
         assert!(device.receive(Instant::now()).is_none());

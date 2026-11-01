@@ -1484,7 +1484,7 @@ mod tests {
             &mut driver.device,
             &mut driver.sockets,
         );
-        let retried = packets.try_recv().ok().is_some_and(|packet| {
+        let retried = packets.try_recv().is_ok_and(|packet| {
             let ip = Ipv4Packet::new_checked(packet.data()).unwrap();
             let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
             tcp.dst_port() == flows[1].source.port()
