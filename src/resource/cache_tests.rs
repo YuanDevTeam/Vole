@@ -91,6 +91,101 @@ fn commit_valid(cache: &mut ProviderCache, candidate: Candidate) {
 }
 
 #[tokio::test]
+async fn default_http_cache_paths_isolate_effective_requests_across_restart_and_fetch_failure() {
+    for rule in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let configured = |user_agent| {
+            let kind = if rule { "rule" } else { "proxy" };
+            let behavior = if rule { ", behavior: domain" } else { "" };
+            let usage = if rule {
+                "rules: ['RULE-SET,first,DIRECT', 'RULE-SET,second,REJECT']"
+            } else {
+                "proxy-groups: [{name: choice, type: select, use: [first, second]}]"
+            };
+            Config::parse_yaml(
+                format!(
+                    "global-ua: {user_agent}\n{kind}-providers:\n  first: {{type: http, url: 'http://subscription.invalid/shared', header: {{Authorization: ['Bearer first']}}{behavior}}}\n  second: {{type: http, url: 'http://subscription.invalid/shared', header: {{Authorization: ['Bearer second']}}{behavior}}}\n{usage}\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap()
+            .providers
+            .unwrap()
+        };
+        let template = configured("fixture-agent");
+        let mut cache = ProviderCache::open(root.path(), template.clone()).unwrap();
+        let paths = cache
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone().unwrap())
+            .collect::<Vec<_>>();
+        let payloads = if rule {
+            ["payload: [first.example]", "payload: [second.example]"]
+        } else {
+            [
+                "proxies: [{name: first-node, type: direct}]",
+                "proxies: [{name: second-node, type: direct}]",
+            ]
+        };
+        for (index, body) in payloads.iter().enumerate() {
+            let candidate = cache
+                .fetch(
+                    index,
+                    Arc::new(Responses(Mutex::new([response(200, "", body)].into()))),
+                    template.request_user_agent(),
+                    true,
+                    crate::security::SecurityContext::new(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            cache
+                .commit(index, candidate, &CancellationToken::new())
+                .unwrap();
+        }
+        template.materialize(&cache.contents).unwrap();
+        let expected = cache.contents.clone();
+        let mut restored = ProviderCache::open(root.path(), template.clone()).unwrap();
+        assert_eq!(restored.contents, expected);
+        assert_ne!(paths[0], paths[1]);
+        for (index, body) in payloads.iter().enumerate() {
+            let entry = &restored.entries[index];
+            assert_eq!(entry.path.as_ref(), Some(&paths[index]));
+            assert!(entry.state.downloaded);
+            assert_eq!(fs::read_to_string(&paths[index]).unwrap(), *body);
+            let metadata: Metadata =
+                serde_json::from_slice(&fs::read(metadata_path(&paths[index])).unwrap()).unwrap();
+            assert_eq!(
+                metadata.url,
+                source_key(&entry.spec, &template.request_user_agent()).unwrap()
+            );
+            assert!(
+                restored
+                    .fetch(
+                        index,
+                        Arc::new(Responses(Mutex::new([response(503, "", "")].into()))),
+                        template.request_user_agent(),
+                        true,
+                        crate::security::SecurityContext::new(),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(restored.contents, expected);
+        template.materialize(&restored.contents).unwrap();
+
+        let changed = ProviderCache::open(root.path(), configured("other-agent")).unwrap();
+        for (index, entry) in changed.entries.iter().enumerate() {
+            assert_ne!(entry.path.as_ref(), Some(&paths[index]));
+            assert!(!entry.state.available);
+        }
+    }
+}
+
+#[tokio::test]
 async fn file_candidate_keeps_read_mtime_when_source_is_replaced_before_commit() {
     for rules in [false, true] {
         let root = tempfile::tempdir().unwrap();

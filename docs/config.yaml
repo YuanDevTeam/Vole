@@ -787,7 +787,7 @@ proxy-groups:
     default-selected: vless-edge
 
 # 资源声明及使用示例。http 支持 HTTP(S)，file 读取本地文件，inline 使用 payload。
-# path 必须位于 dataDir 内；HTTP 缺省路径在 proxies/ 或 rules/ 下按 URL 分配。
+# path 必须位于 dataDir 内；HTTP 缺省路径在 proxies/ 或 rules/ 下按实际 URL/header/UA 请求摘要分配。
 # HTTP interval 单位秒，0 只获取一次；file 监测文件变化。下载失败退避重试。
 # proxy 指定当前运行配置中的出口；缺省按规则选路。不会等待新资源才能建立下载连接。
 # header 值为字符串数组；size-limit 单位字节，0 不设下载上限，解析仍有容量边界。

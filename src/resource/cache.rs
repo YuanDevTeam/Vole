@@ -165,10 +165,15 @@ impl ProviderCache {
                 failures: 0,
             };
             if spec.kind != ProviderType::Inline {
+                let cache_identity = if spec.kind == ProviderType::Http && spec.path.is_empty() {
+                    source_key(spec, &user_agent)?
+                } else {
+                    spec.url.clone()
+                };
                 let fallback = format!(
                     "{}/{}",
                     if rule { "rules" } else { "proxies" },
-                    hex(&Sha256::digest(spec.url.as_bytes()))
+                    hex(&Sha256::digest(cache_identity.as_bytes()))
                 );
                 let access = match spec.kind {
                     ProviderType::File => Access::FileRead,
