@@ -271,6 +271,7 @@ async fn start_session(
                     base_dir: snapshot.http_base_dir(),
                     data_dir: Some(local_folder.join("vole")),
                     config_path: None,
+                    ..Default::default()
                 },
             )?;
             Ok::<_, io::Error>(Arc::new(tokio::sync::Mutex::new(store)))

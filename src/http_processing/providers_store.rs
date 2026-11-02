@@ -5,6 +5,7 @@ use super::{Payload, ProviderSpec};
 use crate::{
     dispatch::Dispatcher,
     http_processing::config::{Document, PolicyCandidate, invalid},
+    resource::paths::{Access, ProviderPaths},
     security::SecurityContext,
 };
 use cache::{CacheEntry, PendingWrite, load_cache, prepare_download, publish};
@@ -23,6 +24,7 @@ pub(crate) struct SourceContext {
     pub(crate) base_dir: Option<PathBuf>,
     pub(crate) data_dir: Option<PathBuf>,
     pub(crate) config_path: Option<PathBuf>,
+    pub(crate) resource_paths: Arc<ProviderPaths>,
 }
 
 pub(crate) struct DownloadContext {
@@ -45,11 +47,31 @@ impl SourceContext {
         }
         hash.finalize().into()
     }
+
+    fn preparation_identity(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(self.identity());
+        if let Some(path) = &self.config_path {
+            let bytes = path.as_os_str().as_encoded_bytes();
+            hash.update([1]);
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        } else {
+            hash.update([0]);
+        }
+        for (path, private) in self.resource_paths.reserved_inputs() {
+            let bytes = path.as_os_str().as_encoded_bytes();
+            hash.update([u8::from(private)]);
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        }
+        hash.finalize().into()
+    }
 }
 
 struct Prepared {
     document: [u8; 32],
-    context: [u8; 32],
+    context: SourceContext,
     candidate: Arc<PolicyCandidate>,
 }
 
@@ -68,6 +90,16 @@ impl Store {
 
     pub(crate) fn notification(&self) -> Arc<tokio::sync::Notify> {
         self.notification.clone()
+    }
+
+    /// Public refresh/test payloads supply locations, not the foreground's
+    /// private input paths. Keep those inputs protected across such requests.
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn inherit_inputs(&self, context: &mut SourceContext) {
+        if let Some(prepared) = &self.prepared {
+            context.config_path = prepared.context.config_path.clone();
+            context.resource_paths = prepared.context.resource_paths.clone();
+        }
     }
 
     /// Restore actual content from a protected snapshot without touching its
@@ -103,7 +135,7 @@ impl Store {
         self.entries = entries;
         self.prepared = Some(Prepared {
             document: document.identity(),
-            context: context.identity(),
+            context: context.clone(),
             candidate,
         });
         self.retry_after = None;
@@ -122,7 +154,8 @@ impl Store {
             .prepared
             .as_ref()
             .filter(|ready| {
-                ready.document == document.identity() && ready.context == context.identity()
+                ready.document == document.identity()
+                    && ready.context.preparation_identity() == context.preparation_identity()
             })
             .map(|ready| ready.candidate.clone()))
     }
@@ -214,7 +247,7 @@ impl Store {
         self.entries = entries;
         self.prepared = Some(Prepared {
             document: document.identity(),
-            context: context.identity(),
+            context: context.clone(),
             candidate: candidate.clone(),
         });
         self.retry_after = None;
@@ -264,12 +297,13 @@ impl Store {
         }
         let prepared = self.prepared.as_ref().ok_or_else(invalid)?;
         let document = prepared.candidate.document.clone();
-        let context = prepared.context;
+        let context = prepared.context.clone();
+        self.retry_after = Some(Instant::now() + Duration::from_secs(60));
+        resolve_paths(&document, &context, true)?;
         let mut contents = prepared.candidate.payloads.clone();
         let mut entries = self.entries.clone();
         let mut writes = Vec::new();
         let now = unix_time();
-        self.retry_after = Some(Instant::now() + Duration::from_secs(60));
         for name in document.active_provider_names() {
             let spec = &document.providers[name];
             let ProviderSpec::Http { interval, .. } = spec else {
@@ -305,7 +339,7 @@ impl Store {
                 writes.push(write);
             }
         }
-        let candidate = document.compile(&contents)?.bind_source(context);
+        let candidate = document.compile(&contents)?.bind_source(context.identity());
         check_cancel(cancellation)?;
         publish(&mut writes, cancellation)?;
         self.entries = entries;
@@ -356,6 +390,11 @@ fn resolve_paths(
             ProviderSpec::Inline { .. } => (),
             ProviderSpec::File { path } => {
                 if let Some(path) = resolve(path, context.base_dir.as_deref(), required)? {
+                    context.resource_paths.check_reserved(
+                        &path,
+                        Access::FileRead,
+                        canonical && required,
+                    )?;
                     files.insert(if canonical && required {
                         std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone())
                     } else {
@@ -382,6 +421,13 @@ fn resolve_paths(
                     } else {
                         path
                     };
+                    for target in [&path, &cache::metadata_path(&path)] {
+                        context.resource_paths.check_reserved(
+                            target,
+                            Access::CacheWrite,
+                            canonical && required,
+                        )?;
+                    }
                     caches.push(path.clone());
                     paths.insert(name.clone(), path);
                 }

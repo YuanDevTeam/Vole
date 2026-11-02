@@ -58,10 +58,11 @@ pub(crate) fn evaluate(payload: TestPayload) -> Result<Value, InvokeFailure> {
     let initialized = lock(&registry().runtime_data)
         .as_ref()
         .map(|data| (data.directory.root().to_owned(), data.http.clone()));
-    let context = SourceContext {
+    let mut context = SourceContext {
         base_dir,
         data_dir: initialized.as_ref().map(|(root, _)| root.clone()),
         config_path: None,
+        ..Default::default()
     };
     let candidate = if document.unresolved_count() == 0 {
         Some(
@@ -70,9 +71,11 @@ pub(crate) fn evaluate(payload: TestPayload) -> Result<Value, InvokeFailure> {
                 .map_err(InvokeFailure::from)?,
         )
     } else if let Some((_, store)) = initialized {
-        store
+        let store = store
             .try_lock()
-            .map_err(|_| InvokeFailure::new("HTTP resource preparation is busy"))?
+            .map_err(|_| InvokeFailure::new("HTTP resource preparation is busy"))?;
+        store.inherit_inputs(&mut context);
+        store
             .prepared(&document, &context)
             .map_err(InvokeFailure::from)?
     } else {

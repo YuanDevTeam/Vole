@@ -185,6 +185,7 @@ impl ProviderRuntime {
                             base_dir,
                             data_dir: Some(directory.clone()),
                             config_path: None,
+                            ..Default::default()
                         };
                         if previous
                             .config

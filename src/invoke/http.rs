@@ -223,6 +223,7 @@ pub(crate) fn source_context(
             base_dir,
             data_dir: Some(data_dir),
             config_path,
+            ..Default::default()
         },
         ca,
     ))
@@ -300,6 +301,7 @@ pub(super) async fn attach(
     input: Option<&str>,
     context: Option<HttpContextInput>,
     config_path: Option<PathBuf>,
+    resource_paths: Option<Arc<crate::resource::paths::ProviderPaths>>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<(), InvokeFailure> {
     let Some(input) = input else {
@@ -316,8 +318,11 @@ pub(super) async fn attach(
         return Ok(());
     }
     let directory = registry().data_directory()?;
-    let (source, ca) = source_context(context, directory.root().to_owned(), config_path)
+    let (mut source, ca) = source_context(context, directory.root().to_owned(), config_path)
         .map_err(InvokeFailure::from)?;
+    source.resource_paths = resource_paths
+        .or_else(|| registry().provider_paths())
+        .unwrap_or_default();
     let dialer = {
         let platform = lock(&registry().platform);
         #[cfg(target_os = "android")]
@@ -353,6 +358,9 @@ pub(super) fn parse_reconnect(
     apply: &crate::resource::config_apply::ConfigApplyHandle,
 ) -> Result<Config, InvokeFailure> {
     let mut config = super::parse_config_yaml(&payload.config_yaml)?;
+    if let (Some(template), Some(paths)) = (&mut config.providers, &payload.provider_paths) {
+        Arc::make_mut(template).resource_paths = paths.clone();
+    }
     let Some(input) = payload.http_config_yaml.as_deref() else {
         if payload.http_context.is_some() {
             return Err(InvokeFailure::invalid_request(
@@ -362,12 +370,24 @@ pub(super) fn parse_reconnect(
         return Ok(config);
     };
     let directory = registry().data_directory()?;
-    let (context, ca) = source_context(
+    let (mut context, ca) = source_context(
         payload.http_context,
         directory.root().to_owned(),
         payload.source_file,
     )
     .map_err(InvokeFailure::from)?;
+    context.resource_paths = registry().provider_paths().unwrap_or_default();
+    let store = runtime_store()?;
+    let context = reconnect_source_context(
+        context,
+        payload.provider_paths,
+        &*store
+            .try_lock()
+            .map_err(|_| InvokeFailure::new("HTTP resource preparation is busy"))?,
+    );
+    if let Some(template) = &mut config.providers {
+        Arc::make_mut(template).resource_paths = context.resource_paths.clone();
+    }
     if input.is_empty() {
         return Ok(config);
     }
@@ -401,6 +421,21 @@ pub(super) fn parse_reconnect(
         .set_http_policy(Some(policy))
         .map_err(InvokeFailure::from)?;
     Ok(config)
+}
+
+fn reconnect_source_context(
+    mut context: SourceContext,
+    resource_paths: Option<Arc<crate::resource::paths::ProviderPaths>>,
+    store: &Store,
+) -> SourceContext {
+    if let Some(paths) = resource_paths {
+        context.resource_paths = paths;
+    } else {
+        // Public reconnect requests have no foreground-only path metadata.
+        // They still belong to the existing session and its original inputs.
+        store.inherit_inputs(&mut context);
+    }
+    context
 }
 
 #[derive(Deserialize)]
@@ -453,13 +488,17 @@ fn refresh_owned(
     controller: Option<&super::CoreController>,
 ) -> Result<serde_json::Value, InvokeFailure> {
     let directory = registry().data_directory()?;
-    let (context, ca) = source_context(payload.http_context, directory.root().to_owned(), None)
+    let (mut context, ca) = source_context(payload.http_context, directory.root().to_owned(), None)
         .map_err(InvokeFailure::from)?;
     if ca.is_some() {
         return Err(InvokeFailure::invalid_request(
             "this operation does not accept CA material",
         ));
     }
+    runtime_store()?
+        .try_lock()
+        .map_err(|_| InvokeFailure::new("HTTP resource preparation is busy"))?
+        .inherit_inputs(&mut context);
     if let Some(controller) = controller {
         let apply = {
             let mut inner = lock(&controller.inner);
@@ -579,6 +618,60 @@ pub(crate) async fn maintenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn public_reconnect_retains_foreground_inputs_without_changing_start_context() {
+        use crate::resource::paths::{Access, ProviderPaths};
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("config.yaml");
+        let ca = root.path().join("ca.json");
+        std::fs::write(&main, b"original config").unwrap();
+        std::fs::write(&ca, b"original CA").unwrap();
+        let mut paths = ProviderPaths::default();
+        paths.reserve_inputs([(main.clone(), false), (ca.clone(), true)]);
+        let context = SourceContext {
+            data_dir: Some(root.path().into()),
+            config_path: Some(root.path().join("http.yaml")),
+            resource_paths: Arc::new(paths),
+            ..Default::default()
+        };
+        let document = Document::parse("rewrite: {rules: []}").unwrap();
+        let mut store = Store::new();
+        store
+            .prepare(document, &context, None, &CancellationToken::new(), false)
+            .await
+            .unwrap();
+        let (fresh, _) = source_context(None, root.path().into(), None).unwrap();
+        assert!(
+            fresh
+                .resource_paths
+                .check_reserved(&main, Access::CacheWrite, true)
+                .is_ok()
+        );
+        let reconnect = reconnect_source_context(fresh.clone(), None, &store);
+        assert_eq!(reconnect.config_path, context.config_path);
+        for input in [&main, &ca] {
+            let path = serde_yaml_ng::to_string(&input.to_string_lossy().as_ref()).unwrap();
+            let document = Document::parse(&format!("rewrite-providers:\n  remote:\n    type: http\n    url: http://rules.example.test/rules.yaml\n    path: {}\nrewrite: {{enabled: true, rules: [{{rule-set: remote}}]}}\n", path.trim_end())).unwrap();
+            let error = store
+                .prepare(document, &reconnect, None, &CancellationToken::new(), false)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+        assert_eq!(std::fs::read(&main).unwrap(), b"original config");
+        assert_eq!(std::fs::read(&ca).unwrap(), b"original CA");
+        // An explicitly supplied internal context starts a new input scope;
+        // public reconnect alone cannot discard the foreground reservations.
+        let explicit = reconnect_source_context(fresh, Some(Arc::default()), &store);
+        assert!(
+            explicit
+                .resource_paths
+                .check_reserved(&main, Access::CacheWrite, true)
+                .is_ok()
+        );
+    }
+
     #[test]
     fn idle_refresh_admission_blocks_instance_creation_until_release() {
         let registry = super::super::RuntimeRegistry::default();

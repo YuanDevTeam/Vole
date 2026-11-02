@@ -1217,7 +1217,7 @@ impl CoreController {
             StartupConfig::Input(mut payload) => {
                 let mut config = parse_config_yaml(&payload.config_yaml)?;
                 if let (Some(template), Some(paths)) =
-                    (&mut config.providers, payload.provider_paths.take())
+                    (&mut config.providers, payload.provider_paths.clone())
                 {
                     Arc::make_mut(template).resource_paths = paths;
                 }
@@ -1275,6 +1275,7 @@ impl CoreController {
                         input.http_config_yaml.as_deref(),
                         input.http_context,
                         input.source_file,
+                        input.provider_paths,
                         input.cancellation.as_ref(),
                     )
                     .await?;

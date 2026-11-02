@@ -73,11 +73,202 @@ fn response(status: u16, body: &str) -> Vec<u8> {
 fn document(authorization: &str) -> Arc<Document> {
     Document::parse(&format!("rewrite-providers:\n  remote:\n    type: http\n    url: http://rules.example.test/rules.yaml\n    path: remote.yaml\n    header: {{Authorization: ['{authorization}']}}\nrewrite: {{enabled: true, rules: [{{rule-set: remote}}]}}\n")).unwrap()
 }
+fn document_with_cache(path: &Path) -> Arc<Document> {
+    let quoted = serde_yaml_ng::to_string(&path.to_string_lossy().as_ref()).unwrap();
+    Document::parse(&format!(
+        "rewrite-providers:\n  remote:\n    type: http\n    url: http://rules.example.test/rules.yaml\n    path: {}\nrewrite: {{enabled: true, rules: [{{rule-set: remote}}]}}\n",
+        quoted.trim_end()
+    ))
+    .unwrap()
+}
 fn network(dispatcher: Arc<Responses>) -> DownloadContext {
     DownloadContext {
         dispatcher,
         security: SecurityContext::new(),
     }
+}
+
+#[tokio::test]
+async fn http_cache_body_and_metadata_cannot_overwrite_foreground_inputs() {
+    for private in [false, true] {
+        for metadata in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let body = directory
+                .path()
+                .join(if private { "ca.pem" } else { "config.yaml" });
+            let input = if metadata {
+                cache::metadata_path(&body)
+            } else {
+                body.clone()
+            };
+            std::fs::write(&input, b"original foreground input").unwrap();
+            let mut paths = ProviderPaths::default();
+            paths.reserve_inputs([(input.clone(), private)]);
+            let context = SourceContext {
+                data_dir: Some(directory.path().into()),
+                resource_paths: Arc::new(paths),
+                ..Default::default()
+            };
+            let dispatcher = Responses::new([response(200, "payload: []")]);
+            let network = network(dispatcher.clone());
+            let document = document_with_cache(&body);
+            let mut store = Store::new();
+            let error = store
+                .prepare(
+                    document.clone(),
+                    &context,
+                    Some(&network),
+                    &CancellationToken::new(),
+                    false,
+                )
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(dispatcher.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(std::fs::read(&input).unwrap(), b"original foreground input");
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+            assert!(store.prepared(&document, &context).unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_file_resources_keep_public_reads_but_reject_private_inputs() {
+    for private in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.yaml");
+        std::fs::write(&input, b"payload: []").unwrap();
+        let mut paths = ProviderPaths::default();
+        paths.reserve_inputs([(input.clone(), private)]);
+        let context = SourceContext {
+            base_dir: Some(directory.path().into()),
+            resource_paths: Arc::new(paths),
+            ..Default::default()
+        };
+        let document = Document::parse("rewrite-providers: {local: {type: file, path: input.yaml}}\nrewrite: {enabled: true, rules: [{rule-set: local}]}\n").unwrap();
+        let mut store = Store::new();
+        let result = store
+            .prepare(document, &context, None, &CancellationToken::new(), false)
+            .await;
+        if private {
+            assert_eq!(
+                result.err().unwrap().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        } else {
+            assert!(result.is_ok());
+        }
+        assert_eq!(std::fs::read(&input).unwrap(), b"payload: []");
+    }
+}
+
+#[tokio::test]
+async fn absolute_http_cache_paths_work_without_borrowing_another_input_context() {
+    let directory = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let input = directory.path().join("config.yaml");
+    std::fs::write(&input, b"original foreground input").unwrap();
+    let mut paths = ProviderPaths::default();
+    paths.reserve_inputs([(input.clone(), false)]);
+    let context = SourceContext {
+        data_dir: Some(directory.path().into()),
+        resource_paths: Arc::new(paths),
+        ..Default::default()
+    };
+    let body = external.path().join("remote.yaml");
+    let document = document_with_cache(&body);
+    let dispatcher = Responses::new([response(200, "payload: []")]);
+    let network = network(dispatcher.clone());
+    let mut store = Store::new();
+    let candidate = store
+        .prepare(
+            document.clone(),
+            &context,
+            Some(&network),
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(body.is_file());
+    assert!(cache::metadata_path(&body).is_file());
+    assert!(store.prepared(&document, &context).unwrap().is_some());
+
+    let mut changed = context.clone();
+    let mut paths = ProviderPaths::default();
+    paths.reserve_inputs([(body.clone(), false)]);
+    changed.resource_paths = Arc::new(paths);
+    // The location stays the same for live-update compatibility. Its protected
+    // inputs still distinguish prepared candidates and snapshot adoption.
+    assert_eq!(context.identity(), changed.identity());
+    assert!(store.prepared(&document, &changed).unwrap().is_none());
+    assert!(Store::new().adopt(candidate, &changed).is_err());
+    changed = context.clone();
+    changed.config_path = Some(input.clone());
+    assert!(store.prepared(&document, &changed).unwrap().is_none());
+
+    let mut refresh = SourceContext {
+        data_dir: context.data_dir.clone(),
+        ..Default::default()
+    };
+    store.inherit_inputs(&mut refresh);
+    let error = store
+        .prepare(
+            document_with_cache(&input),
+            &refresh,
+            Some(&network),
+            &CancellationToken::new(),
+            true,
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(dispatcher.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(std::fs::read(&input).unwrap(), b"original foreground input");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn periodic_http_refresh_rechecks_reserved_input_aliases_before_download() {
+    use std::os::unix::fs::symlink;
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("config.yaml");
+    std::fs::write(&input, b"original foreground input").unwrap();
+    let mut paths = ProviderPaths::default();
+    paths.reserve_inputs([(input.clone(), false)]);
+    let context = SourceContext {
+        data_dir: Some(directory.path().into()),
+        resource_paths: Arc::new(paths),
+        ..Default::default()
+    };
+    let body = directory.path().join("remote.yaml");
+    let dispatcher = Responses::new([response(200, "payload: []")]);
+    let network = network(dispatcher.clone());
+    let mut store = Store::new();
+    store
+        .prepare(
+            document_with_cache(&body),
+            &context,
+            Some(&network),
+            &CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+    std::fs::remove_file(&body).unwrap();
+    symlink(&input, &body).unwrap();
+    store.entries.get_mut("remote").unwrap().checked = 0;
+    let error = store
+        .refresh_due(&network, &CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(store.next_due().is_some_and(|delay| !delay.is_zero()));
+    assert_eq!(dispatcher.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(std::fs::read(&input).unwrap(), b"original foreground input");
 }
 
 #[tokio::test]
@@ -211,6 +402,7 @@ async fn disabled_sources_skip_fifo_and_unresolvable_cache_parent_without_io() {
         base_dir: Some(directory.path().into()),
         data_dir: Some(directory.path().into()),
         config_path: None,
+        ..Default::default()
     };
     let mut store = Store::new();
     let candidate = store

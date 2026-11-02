@@ -88,6 +88,39 @@ impl ProviderPaths {
             .collect::<Vec<_>>()
             .into();
     }
+    pub(crate) fn reserved_inputs(&self) -> impl Iterator<Item = (&Path, bool)> {
+        self.reserved
+            .iter()
+            .map(|reserved| (reserved.path.as_path(), reserved.private))
+    }
+    /// Share input protection with resources whose absolute paths have their
+    /// own authorization contract. A snapshot adoption only checks spelling;
+    /// every operation that can touch files also checks canonical aliases.
+    pub(crate) fn check_reserved(
+        &self,
+        target: &Path,
+        access: Access,
+        canonical: bool,
+    ) -> io::Result<()> {
+        let actual = if canonical && !self.reserved.is_empty() {
+            Some(canonical_target(target)?)
+        } else {
+            None
+        };
+        for (path, _) in self
+            .reserved_inputs()
+            .filter(|(_, private)| *private || matches!(access, Access::CacheWrite))
+        {
+            if path == target
+                || actual
+                    .as_ref()
+                    .is_some_and(|actual| canonical_target(path).is_ok_and(|path| path == *actual))
+            {
+                return Err(denied());
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn resolve(
         &self,
         data_dir: &Path,
@@ -129,20 +162,7 @@ impl ProviderPaths {
         if !fs::canonicalize(ancestor)?.starts_with(&root) {
             return Err(denied());
         }
-        if !self.reserved.is_empty() {
-            let actual = canonical_target(&target)?;
-            for reserved in self
-                .reserved
-                .iter()
-                .filter(|reserved| reserved.private || matches!(access, Access::CacheWrite))
-            {
-                if reserved.path == target
-                    || canonical_target(&reserved.path).is_ok_and(|path| path == actual)
-                {
-                    return Err(denied());
-                }
-            }
-        }
+        self.check_reserved(&target, access, true)?;
         if matches!(access, Access::CacheWrite) {
             fs::create_dir_all(parent)?;
             if !fs::canonicalize(parent)?.starts_with(&root) {
