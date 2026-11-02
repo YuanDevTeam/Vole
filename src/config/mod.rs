@@ -4369,8 +4369,9 @@ rules:
         };
         assert_eq!(result.action, RuleAction::Reject);
         context.set_source("192.0.2.2:1500".parse().unwrap());
-        let RuleEvaluation::Matched(result) = rules.evaluate(&context) else {
-            panic!("regex match")
+        let evaluation = rules.evaluate(&context);
+        let RuleEvaluation::Matched(result) = evaluation else {
+            panic!("regex match: {evaluation:?}")
         };
         assert_eq!(
             result.action,
