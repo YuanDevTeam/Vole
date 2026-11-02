@@ -20,7 +20,8 @@ secret: "vole-runtime-secret"
 - 空 host、`0.0.0.0` 和 `[::]` 均优先使用允许 IPv4 映射连接的双栈通配监听，仅地址族不可用时改用 IPv4。Controller 的地址族选择独立于顶层 `ipv6`。
 - `external-controller-tls` 使用相同地址格式、绑定与端口范围。HTTP/HTTPS 共享当前会话、API handler、选择状态和 Bearer 认证；HTTPS 按实际 ALPN 提供 H2/H1，无 ALPN 使用 H1；明文 HTTP 仅 H1。
 - `external-controller-unix` 是 Linux 文件系统路径，空串关闭；相对路径从 dataDir 解析，不自动创建父目录。
-  绑定后在 listen 前设置当前用户 0600 权限；已有文件、目录、符号链接或 socket 都使绑定失败，不接管旧对象。
+  bind 前通过实际 socket fd 限制创建权限，绑定后在 listen 前恢复当前用户 0600 权限并复验捕获的 dev+ino；
+  已有文件、目录、符号链接或 socket 都使绑定失败，不接管旧对象。
   本地 HTTP/1 与 WebSocket 共用现有 API、CORS、资源和订阅限额，通过文件权限授权，不要求 Bearer 或 token。
   网络 HTTP/HTTPS 保留原 secret；本地访问不会修改它。Stop 和启动失败只清理本次创建且 dev+ino 仍一致的 socket，
   也覆盖绑定后尚未 serve 就丢弃的情况；其它平台启动该入口返回不支持。

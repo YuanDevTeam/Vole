@@ -136,6 +136,8 @@ Linux Unix Controller 的配置与共享鉴权（不绑定 socket）：
 `invoke::foreground::overrides::tests::unix_override_`、
 二进制 `cli::tests::unix_controller_flag_only_transports_the_explicit_text_value`。
 实际文件权限、绑定冲突、对象替换、drop/Stop 清理在隔离 Linux 真实 TUN 夹具验收。
+Linux socket 创建权限、路径替换与严格 umask 的内核回归使用 `controller::unix::tests:: -- --ignored --test-threads=1`，
+仅在隔离 Linux 容器运行；它们检查实际 Unix socket 与本地 IPC，不代替真实 TUN 或完整 Controller 业务验收。
 管理 mark 另选 `config::controller::tests::controller_mark_`、
 `invoke::foreground::overrides::tests::mark_override_` 和二进制
 `cli::tests::controller_mark_flag_`；实际管理回复包 mark 在同一 Linux 夹具核对。
