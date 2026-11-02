@@ -22,7 +22,7 @@ Read the relevant document completely before changing that area:
 - XHTTP request fields, download legs, H1/H2/H3 or sing-mux: `docs/xhttp.md`.
 - Runtime Controller, proxy-group selection, or TUN traffic metrics: `docs/controller-api.md` and `src/controller.rs`.
 - GeoData: `docs/geodata.md`.
-- TLS profiles, certificate policy or TLS dependencies: `docs/tls-client-fingerprint.md` and `docs/tls-dependencies.md`; REALITY also requires `docs/reality-wire-protocol.md`. Before local boring development or opening/updating a PR, follow the dependency-source workflow in `docs/tls-dependencies.md`. Keep dependency auditing in CI rather than duplicating it in platform build scripts.
+- TLS profiles, certificate policy or TLS dependencies: `docs/tls-client-fingerprint.md` and `docs/tls-dependencies.md`; REALITY also requires `docs/reality-wire-protocol.md`. Before local Boring development or opening/updating a Vole PR, follow the path-to-commit workflow and Boring PR prerequisite in `docs/tls-dependencies.md`. Keep dependency auditing in CI rather than duplicating it in platform build scripts.
 - TUN fields, resource acquisition, fd ownership, packet I/O, MTU, or UDP idle policy: `docs/config.yaml`, `docs/tun-platform.md`, and `docs/tun-icmp-dns.md`.
 - Windows VPN/TUN, outbound binding, AppContainer packet buffers, or package lifecycle: `docs/windows-vpn.md` and `docs/tun-platform.md`.
 - CLI, foreground file/environment/path/signal behavior, or tag releases: `docs/cli.md`, `docs/invoke-api.md`, `scripts/README.md`, `src/cli.rs`, `src/invoke/foreground.rs`, and `.github/workflows/release.yml`; distinguish configured workflows from executed release validation.

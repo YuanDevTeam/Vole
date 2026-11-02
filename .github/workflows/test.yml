@@ -93,14 +93,15 @@ jobs:
           cargo metadata --locked --all-features --format-version 1 > "$RUNNER_TEMP/vole-metadata.json"
           uv run --project scripts --locked python - "$RUNNER_TEMP/vole-metadata.json" <<'PY'
           import json
+          import re
           import sys
+          import tomllib
           from pathlib import Path
 
           metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           packages = metadata["packages"]
           nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
           registry = {"registry+https://github.com/rust-lang/crates.io-index", "registry+https://index.crates.io/"}
-          boring_source = "git+https://github.com/YuanDevTeam/boring?branch=release#43c1c1d5b9464b3f2d5204be8664778fada7dbaf"
           smoltcp_source = "git+https://github.com/smoltcp-rs/smoltcp?rev=24bda3b4f982625d8453d4360172557d24921c76#24bda3b4f982625d8453d4360172557d24921c76"
 
           def require(condition, message):
@@ -121,6 +122,16 @@ jobs:
 
           require(not any("watfaq" in (item.get("source") or "").lower() for item in packages), "retired dependency source is forbidden")
           workspace_root = Path(metadata["workspace_root"])
+          manifest = tomllib.loads((workspace_root / "Cargo.toml").read_text(encoding="utf-8"))
+          boring_repository = "https://github.com/YuanDevTeam/boring"
+          boring_revision = manifest["dependencies"]["boring"].get("rev")
+          require(isinstance(boring_revision, str) and re.fullmatch(r"[0-9a-f]{40}", boring_revision), "Boring PR dependencies must pin a complete commit SHA")
+          boring_specs = [manifest["dependencies"][name] for name in ("boring", "tokio-boring")]
+          boring_specs.append(manifest["dev-dependencies"]["boring-sys"])
+          boring_specs.extend(manifest["patch"]["crates-io"][name] for name in ("boring", "boring-sys"))
+          for spec in boring_specs:
+              require(spec.get("git") == boring_repository and spec.get("rev") == boring_revision and not {"path", "branch", "tag"} & spec.keys(), "Boring dependencies and patches must share one Git commit source")
+          boring_source = f"git+{boring_repository}?rev={boring_revision}#{boring_revision}"
           require(not (workspace_root / "vendor").exists(), "Core vendor sources are forbidden")
           require(not (workspace_root / "crates" / "vole-blake3-raw" / "vendor").exists(), "BLAKE3 must use the installed official C library")
           native_manifest = json.loads((workspace_root / "scripts" / "native" / "blake3" / "vcpkg.json").read_text(encoding="utf-8"))
@@ -185,7 +196,7 @@ jobs:
           package("ml-kem", "0.3.2")
           native = {}
           for name, required in (("boring", {"reality", "client-fingerprint", "shadow-tls-v3", "jls"}), ("boring-sys", {"reality", "shadow-tls-v3", "jls"}), ("tokio-boring", set())):
-              item = package(name, "5.2.0", {boring_source})
+              item = package(name, "5.4.0", {boring_source})
               native[name] = item
               require(required <= features(item), f"{name} is missing required TLS features")
               require(not features(item) & {"fips", "fips-precompiled", "rpk", "pq-experimental", "restls"}, f"{name} enables an unapproved TLS mode")

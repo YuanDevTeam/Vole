@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "boring"
-version = "5.2.0"
+version = "5.4.0"
 dependencies = [
  "bitflags 2.13.2",
  "boring-sys",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "boring-sys"
-version = "5.2.0"
+version = "5.4.0"
 dependencies = [
  "bindgen",
  "cmake",
@@ -3763,7 +3763,7 @@ dependencies = [
 
 [[package]]
 name = "tokio-boring"
-version = "5.2.0"
+version = "5.4.0"
 dependencies = [
  "boring",
  "boring-sys",
