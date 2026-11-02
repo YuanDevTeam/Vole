@@ -987,7 +987,9 @@ impl RuntimeDns {
     }
     pub(crate) fn with_mapping_from(mut self, previous: Option<&Self>) -> Self {
         if let Some(previous) = previous {
-            self.hints = previous.hints.clone();
+            if previous.hints.is_some() {
+                self.hints = previous.hints.clone();
+            }
             self.sources = previous.sources.clone();
             self.share_cache_epoch(previous.cache_epoch.clone());
             if self.fake_config.enabled == previous.fake_config.enabled
@@ -6885,6 +6887,64 @@ dns:
         }
         assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), domains.len());
         assert_eq!(dispatcher.tcp_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn configuration_replacement_retains_new_hint_map_and_existing_mappings() {
+        let old_address = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 140));
+        let new_address = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 141));
+        for (old_capacity, new_capacity) in [(0, 4), (4, 4), (0, 0), (4, 0)] {
+            let dispatcher = Arc::new(MockDispatcher::with_replies(
+                vec![
+                    MockReply::Response(ResponseSpec::answer(old_address)),
+                    MockReply::Response(ResponseSpec::answer(new_address)),
+                ],
+                vec![],
+            ));
+            let configuration = config(false, vec![nameserver(1, DnsTransport::Udp)]);
+            let assemble = |capacity| {
+                RuntimeDns::assemble(
+                    &configuration,
+                    DnsEgress::Single(dispatcher.clone()),
+                    Arc::new(EmptyGeoMatcher),
+                    MAX_CACHE_ENTRIES,
+                    capacity,
+                    crate::security::SecurityContext::new(),
+                )
+            };
+            let previous = assemble(old_capacity);
+            previous
+                .exchange(&build_query(891, "before.example", QueryType::A).unwrap())
+                .await
+                .unwrap();
+            let replacement = assemble(new_capacity);
+            let newly_allocated = replacement.hints.clone();
+            let current = replacement.with_mapping_from(Some(&previous));
+
+            current
+                .exchange(&build_query(892, "after.example", QueryType::A).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                current.domain_hint(new_address).await.as_deref(),
+                (old_capacity != 0 || new_capacity != 0).then_some("after.example")
+            );
+            assert_eq!(
+                current.domain_hint(old_address).await.as_deref(),
+                (old_capacity != 0).then_some("before.example")
+            );
+            if let Some(expected) = previous.hints.as_ref().or(newly_allocated.as_ref()) {
+                assert!(
+                    current
+                        .hints
+                        .as_ref()
+                        .is_some_and(|hints| Arc::ptr_eq(hints, expected))
+                );
+            } else {
+                assert!(current.hints.is_none());
+            }
+            assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 2);
+        }
     }
 
     #[tokio::test]
