@@ -15,7 +15,7 @@ use std::{
 use tokio::{io::Interest, sync::Notify};
 use tokio_util::sync::ReusableBoxFuture;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tun"))]
 #[path = "physical_gate.rs"]
 mod gate;
 

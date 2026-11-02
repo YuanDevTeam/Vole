@@ -438,7 +438,9 @@ async fn default_partial_and_explicit_full_batches_keep_their_original_interval(
 
 // Actual smux writes into the production PacketUp writer. Read remains pending:
 // this test observes upload scheduling, not a second protocol implementation.
+#[cfg(any(feature = "sing-mux", feature = "outbound-shadowsocks"))]
 struct PacketUploadOnly(Writer);
+#[cfg(any(feature = "sing-mux", feature = "outbound-shadowsocks"))]
 impl tokio::io::AsyncRead for PacketUploadOnly {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -448,6 +450,7 @@ impl tokio::io::AsyncRead for PacketUploadOnly {
         Poll::Pending
     }
 }
+#[cfg(any(feature = "sing-mux", feature = "outbound-shadowsocks"))]
 impl AsyncWrite for PacketUploadOnly {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -464,6 +467,7 @@ impl AsyncWrite for PacketUploadOnly {
     }
 }
 
+#[cfg(any(feature = "sing-mux", feature = "outbound-shadowsocks"))]
 #[tokio::test(start_paused = true)]
 async fn autonomous_smux_really_fills_default_packet_batch_and_preserves_every_frame() {
     let options = normalized_packet_options(None, 1_000_000, false);
