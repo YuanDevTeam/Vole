@@ -996,6 +996,7 @@ impl RuntimeDns {
                 && self.fake_config.range == previous.fake_config.range
                 && self.fake_config.range6 == previous.fake_config.range6
                 && self.ipv6 == previous.ipv6
+                && previous.fake_pools.is_some()
             {
                 self.fake_pools = previous.fake_pools.clone();
             }
@@ -8615,6 +8616,198 @@ dns:
         drop(response);
         assert_eq!(resolver.resource_stats.snapshot().dns_current, 0);
     }
+    fn fake_ip_replacement_yaml(enabled: bool) -> String {
+        format!(
+            "ipv6: true\nprofile: {{store-fake-ip: false}}\ndns:\n  enable: {enabled}\n  ipv6: true\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/24\n  fake-ip-range6: fd00:1::1/120\n  use-hosts: false\n  use-system-hosts: false\n  nameserver: [192.0.2.1]\n"
+        )
+    }
+
+    async fn fake_ip_replacement_answers(
+        resolver: &RuntimeDns,
+        host: &str,
+        query_type: QueryType,
+    ) -> Vec<IpAddr> {
+        let response = resolver
+            .exchange(&build_query(904, host, query_type).unwrap())
+            .await
+            .unwrap();
+        let response = parse_response(&response).unwrap();
+        assert_eq!(response.id, 904);
+        matching_answer_set(&response).unwrap().addresses
+    }
+
+    #[tokio::test]
+    async fn configuration_replacement_retains_new_fake_ip_pool_and_existing_mappings() {
+        let before = [
+            (QueryType::A, "198.18.0.4".parse::<IpAddr>().unwrap()),
+            (QueryType::Aaaa, "fd00:1::4".parse().unwrap()),
+        ];
+        for (old_enabled, new_enabled) in
+            [(false, true), (true, true), (false, false), (true, false)]
+        {
+            let old_config =
+                crate::config::Config::parse_yaml(fake_ip_replacement_yaml(old_enabled).as_bytes())
+                    .unwrap();
+            let new_config =
+                crate::config::Config::parse_yaml(fake_ip_replacement_yaml(new_enabled).as_bytes())
+                    .unwrap();
+            assert!(crate::config::live_update::startup_compatible(
+                &old_config,
+                &new_config
+            ));
+            // Real upstream replies make the old None-overwrite fail on the
+            // actual wire answer rather than an exhausted mock response list.
+            let dispatcher = Arc::new(MockDispatcher::with_replies(
+                vec![
+                    MockReply::Response(ResponseSpec::answer("203.0.113.7".parse().unwrap())),
+                    MockReply::Response(ResponseSpec::answer("2001:db8::7".parse().unwrap())),
+                ],
+                vec![],
+            ));
+            let previous = RuntimeDns::new(&old_config.dns, dispatcher.clone());
+            if old_enabled {
+                for (query_type, address) in before {
+                    assert_eq!(
+                        fake_ip_replacement_answers(&previous, "before.example", query_type).await,
+                        [address]
+                    );
+                }
+            }
+            let replacement = RuntimeDns::new(&new_config.dns, dispatcher.clone());
+            let newly_allocated = replacement.fake_pools.clone();
+            let current = replacement.with_mapping_from(Some(&previous));
+            if new_enabled {
+                let after = if old_enabled {
+                    ["198.18.0.5", "fd00:1::5"]
+                } else {
+                    ["198.18.0.4", "fd00:1::4"]
+                };
+                for ((query_type, _), address) in before.into_iter().zip(after) {
+                    assert_eq!(
+                        fake_ip_replacement_answers(&current, "after.example", query_type).await,
+                        [address.parse::<IpAddr>().unwrap()],
+                        "DNS enable transition {old_enabled} -> {new_enabled}"
+                    );
+                }
+            } else {
+                let query = build_query(905, "after.example", QueryType::A).unwrap();
+                assert!(matches!(
+                    current.exchange(&query).await,
+                    Err(RuntimeDnsError::Disabled)
+                ));
+            }
+            if let Some(expected) = previous.fake_pools.as_ref().or(newly_allocated.as_ref()) {
+                assert!(
+                    current
+                        .fake_pools
+                        .as_ref()
+                        .is_some_and(|pool| Arc::ptr_eq(pool, expected))
+                );
+            } else {
+                assert!(current.fake_pools.is_none());
+            }
+            if old_enabled {
+                for (_, address) in before {
+                    assert_eq!(
+                        current.recover_fake_ip(address).unwrap().as_deref(),
+                        Some("before.example")
+                    );
+                }
+            }
+            assert_eq!(dispatcher.udp_calls.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn configuration_replacement_keeps_incompatible_fake_ip_pools_separate() {
+        let yaml = fake_ip_replacement_yaml(true);
+        let old_config = crate::config::Config::parse_yaml(yaml.as_bytes()).unwrap();
+        let before = [
+            (QueryType::A, "198.18.0.4".parse::<IpAddr>().unwrap()),
+            (QueryType::Aaaa, "fd00:1::4".parse().unwrap()),
+        ];
+        for (old, new, expected_v4, expected_v6) in [
+            (
+                "enhanced-mode: fake-ip",
+                "enhanced-mode: redir-host",
+                "203.0.113.7",
+                Some("2001:db8::7"),
+            ),
+            (
+                "fake-ip-range: 198.18.0.1/24",
+                "fake-ip-range: 198.19.0.1/24",
+                "198.19.0.4",
+                Some("fd00:1::4"),
+            ),
+            (
+                "fake-ip-range6: fd00:1::1/120",
+                "fake-ip-range6: fd00:2::1/120",
+                "198.18.0.4",
+                Some("fd00:2::4"),
+            ),
+            ("  ipv6: true", "  ipv6: false", "198.18.0.4", None),
+        ] {
+            let configuration =
+                crate::config::Config::parse_yaml(yaml.replace(old, new).as_bytes()).unwrap();
+            assert!(!crate::config::live_update::startup_compatible(
+                &old_config,
+                &configuration
+            ));
+            let dispatcher = Arc::new(MockDispatcher::with_replies(
+                vec![
+                    MockReply::Response(ResponseSpec::answer("203.0.113.7".parse().unwrap())),
+                    MockReply::Response(ResponseSpec::answer("2001:db8::7".parse().unwrap())),
+                ],
+                vec![],
+            ));
+            let previous = RuntimeDns::new(&old_config.dns, dispatcher.clone());
+            for (query_type, address) in before {
+                assert_eq!(
+                    fake_ip_replacement_answers(&previous, "before.example", query_type).await,
+                    [address]
+                );
+            }
+            let replacement = RuntimeDns::new(&configuration.dns, dispatcher.clone());
+            let newly_allocated = replacement.fake_pools.clone();
+            let current = replacement.with_mapping_from(Some(&previous));
+            assert_eq!(
+                fake_ip_replacement_answers(&current, "after.example", QueryType::A).await,
+                [expected_v4.parse::<IpAddr>().unwrap()]
+            );
+            assert_eq!(
+                fake_ip_replacement_answers(&current, "after.example", QueryType::Aaaa).await,
+                expected_v6
+                    .map(|ip| ip.parse::<IpAddr>().unwrap())
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+            if let Some(expected) = newly_allocated {
+                let current_pool = current.fake_pools.as_ref().unwrap();
+                assert!(Arc::ptr_eq(current_pool, &expected));
+                assert!(!Arc::ptr_eq(
+                    current_pool,
+                    previous.fake_pools.as_ref().unwrap()
+                ));
+            } else {
+                assert!(current.fake_pools.is_none());
+            }
+            for (_, address) in before {
+                assert_eq!(
+                    previous.recover_fake_ip(address).unwrap().as_deref(),
+                    Some("before.example")
+                );
+            }
+            assert_eq!(
+                dispatcher.udp_calls.load(Ordering::Acquire),
+                if configuration.dns.fake_ip.enabled {
+                    0
+                } else {
+                    2
+                }
+            );
+        }
+    }
+
     #[tokio::test]
     async fn fake_ip_answers_recover_names_and_keep_internal_resolution_real() {
         let config = crate::config::Config::parse_yaml(
