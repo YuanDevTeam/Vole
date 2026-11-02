@@ -1,9 +1,11 @@
 """Check target/SDK selection and package acquisition without native builds."""
 
+import io
 import json
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -117,13 +119,14 @@ class Blake3DependencyTests(unittest.TestCase):
 
     def test_windows_keeps_static_crt_and_separate_app_api_family(self):
         for architecture in ("aarch64", "x86_64"):
-            for backend, system in (("wintun", "Windows"), ("uwp", "WindowsStore")):
+            for backend, system in (("wintun", '""'), ("uwp", "WindowsStore")):
                 with self.subTest(architecture=architecture, backend=backend):
                     text, _ = blake3._triplet(
                         f"{architecture}-pc-windows-msvc", {}, backend
                     )
                     self.assertIn("set(VCPKG_CRT_LINKAGE static)", text)
                     self.assertIn(f"set(VCPKG_CMAKE_SYSTEM_NAME {system})", text)
+                    self.assertIn("set(VCPKG_LOAD_VCVARS_ENV ON)", text)
                     if backend == "uwp":
                         self.assertIn("-DVCPKG_MSVC_CXX_WINRT_EXTENSIONS=OFF", text)
                         self.assertIn(
@@ -131,6 +134,49 @@ class Blake3DependencyTests(unittest.TestCase):
                             "VCPKG_MSVC_CXX_WINRT_EXTENSIONS",
                             text,
                         )
+
+    def test_failed_install_reports_target_cmake_log_and_preserves_failure(self):
+        manifest = json.loads((blake3.CONFIG_DIR / "vcpkg.json").read_text())
+        registry = manifest["builtin-baseline"]
+        checkout = self.root / ("vcpkg-" + registry)
+        (checkout / ".git").mkdir(parents=True)
+        (checkout / "vcpkg.exe").touch()
+
+        def fail_install(command, environment):
+            triplet = next(
+                item.split("=", 1)[1]
+                for item in command
+                if item.startswith("--triplet=")
+            )
+            logs = checkout / "buildtrees/detect_compiler"
+            logs.mkdir(parents=True)
+            (logs / f"config-{triplet}-out.log").write_text(
+                "outside diagnostic tail\n" + "x" * 20_000 + "\nSDK rc.exe missing\n"
+            )
+            (logs / "config-other-triplet-out.log").write_text("unrelated build")
+            raise subprocess.CalledProcessError(29, command)
+
+        output = io.StringIO()
+        with (
+            patch.object(blake3.platform, "system", return_value="Windows"),
+            patch.object(blake3, "_run", side_effect=fail_install),
+            patch.object(
+                blake3.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, registry + "\n"),
+            ),
+            redirect_stdout(output),
+            self.assertRaises(subprocess.CalledProcessError) as caught,
+        ):
+            blake3.environment(
+                "x86_64-pc-windows-msvc",
+                "x86_64-pc-windows-msvc",
+                {"VOLE_NATIVE_CACHE_DIR": str(self.root)},
+            )
+        self.assertEqual(caught.exception.returncode, 29)
+        self.assertIn("SDK rc.exe missing", output.getvalue())
+        self.assertNotIn("outside diagnostic tail", output.getvalue())
+        self.assertNotIn("unrelated build", output.getvalue())
 
     def test_normal_install_uses_official_locked_registry_and_target_package(self):
         manifest = json.loads((blake3.CONFIG_DIR / "vcpkg.json").read_text())

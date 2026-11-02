@@ -99,10 +99,13 @@ def _triplet(target: str, env: dict[str, str], backend: str) -> tuple[str, list[
     elif windows:
         if backend not in {"wintun", "uwp"}:
             raise ValueError("Windows BLAKE3 backend must be wintun or uwp")
-        lines.append(
-            "set(VCPKG_CMAKE_SYSTEM_NAME "
-            f"{'WindowsStore' if backend == 'uwp' else 'Windows'})"
-        )
+        # vcpkg identifies desktop Windows with an empty system name, unlike
+        # CMake. A chainloaded Clang toolchain still needs the native SDK env.
+        system = "WindowsStore" if backend == "uwp" else '""'
+        lines += [
+            f"set(VCPKG_CMAKE_SYSTEM_NAME {system})",
+            "set(VCPKG_LOAD_VCVARS_ENV ON)",
+        ]
         # This is a C library, with no C++/CX or WinRT types. UWP still uses
         # the official WindowsStore toolchain and its API-family definitions.
         lines.append("set(VCPKG_MSVC_CXX_WINRT_EXTENSIONS OFF)")
@@ -227,19 +230,32 @@ def environment(
         platform.system()
     ]
     installed = cache / "installed" / triplet
-    _run(
-        [
-            str(executable),
-            "install",
-            f"--triplet={triplet}",
-            f"--host-triplet={host_architecture}-{host_system}",
-            f"--x-manifest-root={CONFIG_DIR}",
-            f"--overlay-triplets={overlay}",
-            f"--x-install-root={installed}",
-            "--disable-metrics",
-            "--x-wait-for-lock",
-        ],
-        env,
-    )
+    command = [
+        str(executable),
+        "install",
+        f"--triplet={triplet}",
+        f"--host-triplet={host_architecture}-{host_system}",
+        f"--x-manifest-root={CONFIG_DIR}",
+        f"--overlay-triplets={overlay}",
+        f"--x-install-root={installed}",
+        "--disable-metrics",
+        "--x-wait-for-lock",
+    ]
+    try:
+        _run(command, env)
+    except subprocess.CalledProcessError:
+        for stage in ("detect_compiler", "blake3"):
+            logs = (checkout / "buildtrees" / stage).glob(f"config-{triplet}*-out.log")
+            for log in sorted(logs)[-2:]:
+                try:
+                    with log.open("rb") as stream:
+                        stream.seek(0, 2)
+                        stream.seek(max(0, stream.tell() - 16_384))
+                        detail = stream.read(16_384).decode(errors="replace")
+                except OSError:
+                    continue
+                print(f"\n{stage}/{log.name}:\n", flush=True)
+                print(detail, flush=True)
+        raise
     package = installed / triplet
     return env | _paths(target, str(package / "include"), str(package / "lib"))
