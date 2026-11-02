@@ -84,7 +84,10 @@ impl HttpContext {
                         Some(Ok((request,mut response)))=>{
                             idle.as_mut().reset(Instant::now()+IDLE);
                             if requests.len()>=STREAMS {response.send_reset(h2::Reason::REFUSED_STREAM);} else {
-                                requests.push(self.h2_request(request,response,session.clone()));
+                                // The ready queue also owns an empty sentinel
+                                // with the same future type. Keep its storage
+                                // small on every downstream connection.
+                                requests.push(Box::pin(self.h2_request(request,response,session.clone())));
                             }
                         },
                         Some(Err(_))=>return Err(failed()),
