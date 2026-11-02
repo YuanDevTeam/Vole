@@ -3494,6 +3494,6 @@ rules:
         let (host, peer) = UnixDatagram::pair().unwrap();
         host.set_nonblocking(true).unwrap();
         let fd = crate::platform::TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-        (TunIo::new(fd, crate::TunFraming::RawIp).unwrap(), peer)
+        (TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap(), peer)
     }
 }

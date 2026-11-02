@@ -71,6 +71,33 @@ impl TunRsIo {
         })
     }
 
+    // Socketpair fixtures share the production packet algorithms without
+    // presenting an ordinary socket as a Linux TUN. This entry does not exist
+    // in production; Apple still uses SyncDevice for actual PI handling.
+    #[cfg(test)]
+    pub(crate) fn new_mock(fd: TunFd, framing: TunFraming) -> Result<Self> {
+        Self::new_mock_with_mtu(fd, framing, 1500)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_mock_with_mtu(fd: TunFd, framing: TunFraming, mtu: u16) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            validate_mtu(mtu)?;
+            assert_eq!(framing, TunFraming::RawIp);
+            Ok(Self {
+                // SAFETY: the fixture owns the duplicate without changing its
+                // shared nonblocking status; AsyncFd owns it until drop.
+                device: unsafe { AsyncFd::register(Device::SocketPair(fd)) }
+                    .map_err(io::Error::from)?,
+                framing,
+                mtu: usize::from(mtu),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        Self::new_with_mtu(fd, framing, mtu)
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn interface_name(&self) -> io::Result<String> {
         self.device.get_ref().name()
@@ -437,23 +464,6 @@ mod tests {
         }
     }
 
-    fn packet_io(fd: TunFd, framing: TunFraming) -> Result<TunRsIo> {
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(framing, TunFraming::RawIp);
-            Ok(TunRsIo {
-                // SAFETY: this fixture owns the duplicate without changing its
-                // shared nonblocking status; AsyncFd owns it until drop.
-                device: unsafe { AsyncFd::register(Device::SocketPair(fd)) }
-                    .map_err(io::Error::from)?,
-                framing,
-                mtu: TUN_MTU,
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        TunRsIo::new(fd, framing)
-    }
-
     const IPV4: [u8; 20] = [
         0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 127, 0, 0, 1, 127, 0, 0, 1,
     ];
@@ -495,7 +505,7 @@ mod tests {
         let (host, peer) = UnixDatagram::pair().unwrap();
         host.set_nonblocking(true).unwrap();
         let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-        let io = packet_io(fd, TunFraming::RawIp).unwrap();
+        let io = TunRsIo::new_mock(fd, TunFraming::RawIp).unwrap();
 
         let mut packet = Vec::with_capacity(1500);
         for (expected, version) in [(&IPV4[..], IpVersion::V4), (&IPV6[..], IpVersion::V6)] {
@@ -510,7 +520,7 @@ mod tests {
     async fn batch_read_preserves_valid_neighbours_of_an_invalid_packet() {
         let (host, peer) = UnixDatagram::pair().unwrap();
         host.set_nonblocking(true).unwrap();
-        let io = packet_io(
+        let io = TunRsIo::new_mock(
             TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
             TunFraming::RawIp,
         )
@@ -538,7 +548,7 @@ mod tests {
         let (host, peer) = UnixDatagram::pair().unwrap();
         host.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
-        let io = packet_io(
+        let io = TunRsIo::new_mock(
             TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
             TunFraming::RawIp,
         )
@@ -565,7 +575,7 @@ mod tests {
     async fn batch_read_waits_for_first_packet_and_can_be_cancelled() {
         let (host, peer) = UnixDatagram::pair().unwrap();
         host.set_nonblocking(true).unwrap();
-        let io = packet_io(
+        let io = TunRsIo::new_mock(
             TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
             TunFraming::RawIp,
         )
@@ -591,7 +601,7 @@ mod tests {
     async fn batch_read_preserves_consumed_prefix_on_eof() {
         let (host, mut peer) = UnixStream::pair().unwrap();
         host.set_nonblocking(true).unwrap();
-        let io = packet_io(
+        let io = TunRsIo::new_mock(
             TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
             TunFraming::RawIp,
         )
@@ -614,7 +624,7 @@ mod tests {
         let (host, peer) = UnixDatagram::pair().unwrap();
         host.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
-        let io = packet_io(
+        let io = TunRsIo::new_mock(
             TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
             TunFraming::RawIp,
         )
@@ -647,7 +657,7 @@ mod tests {
         // SAFETY: host remains open for both flag reads.
         let before = unsafe { libc::fcntl(host.as_raw_fd(), libc::F_GETFL) };
         let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-        let io = packet_io(fd, TunFraming::RawIp).unwrap();
+        let io = TunRsIo::new_mock(fd, TunFraming::RawIp).unwrap();
         let duplicate = io.device.get_ref().as_raw_fd();
         assert_ne!(duplicate, host.as_raw_fd());
         // SAFETY: both descriptors are open while the adapter is alive.
@@ -676,7 +686,7 @@ mod tests {
         let (host, peer) = UnixDatagram::pair().unwrap();
         host.set_nonblocking(true).unwrap();
         let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-        let io = packet_io(fd, TunFraming::RawIp).unwrap();
+        let io = TunRsIo::new_mock(fd, TunFraming::RawIp).unwrap();
 
         peer.send(&[0x70]).unwrap();
         assert!(matches!(
@@ -696,7 +706,7 @@ mod tests {
         let (host, peer) = UnixStream::pair().unwrap();
         host.set_nonblocking(true).unwrap();
         let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-        let io = packet_io(fd, TunFraming::RawIp).unwrap();
+        let io = TunRsIo::new_mock(fd, TunFraming::RawIp).unwrap();
         drop(peer);
 
         let error = io.read_packet(&mut Vec::new()).await.unwrap_err();
@@ -712,7 +722,7 @@ mod tests {
         let (host, peer) = UnixDatagram::pair().unwrap();
         host.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
-        let io = packet_io(
+        let io = TunRsIo::new_mock(
             TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
             TunFraming::Utun,
         )
@@ -790,7 +800,7 @@ mod tests {
         let (host, peer) = UnixDatagram::pair().unwrap();
         host.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
-        let io = packet_io(
+        let io = TunRsIo::new_mock(
             TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
             TunFraming::Utun,
         )
@@ -845,7 +855,7 @@ mod tests {
     async fn utun_batches_keep_each_packet_information_header_independent() {
         let (host, peer) = UnixDatagram::pair().unwrap();
         host.set_nonblocking(true).unwrap();
-        let io = packet_io(
+        let io = TunRsIo::new_mock(
             TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
             TunFraming::Utun,
         )
@@ -876,7 +886,7 @@ mod tests {
         let (host, peer) = UnixDatagram::pair().unwrap();
         host.set_nonblocking(true).unwrap();
         let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-        let io = packet_io(fd, TunFraming::Utun).unwrap();
+        let io = TunRsIo::new_mock(fd, TunFraming::Utun).unwrap();
 
         for (packet, family, version) in [
             (&IPV4[..], 2_u32, IpVersion::V4),
@@ -896,7 +906,7 @@ mod tests {
         let (host, peer) = UnixDatagram::pair().unwrap();
         host.set_nonblocking(true).unwrap();
         let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-        let io = packet_io(fd, TunFraming::Utun).unwrap();
+        let io = TunRsIo::new_mock(fd, TunFraming::Utun).unwrap();
 
         let mut packet = Vec::new();
         for (expected, family, version) in [

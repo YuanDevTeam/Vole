@@ -76,7 +76,7 @@ async fn batch_tun_runtime_preserves_order_stats_and_invalid_packet_isolation() 
     let (host, peer) = UnixDatagram::pair().unwrap();
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
-    let tun = TunIo::new(
+    let tun = TunIo::new_mock(
         TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
         crate::TunFraming::RawIp,
     )
@@ -138,7 +138,7 @@ async fn batch_tun_read_loop_counts_consumed_prefix_before_eof() {
 
     let (host, mut peer) = UnixStream::pair().unwrap();
     host.set_nonblocking(true).unwrap();
-    let tun = TunIo::new(
+    let tun = TunIo::new_mock(
         TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
         crate::TunFraming::RawIp,
     )
@@ -188,7 +188,7 @@ async fn assert_effective_mtu_drops_oversized_udp(dns_query: bool) {
     let (host, peer) = UnixDatagram::pair().unwrap();
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
-    let tun = TunIo::new(
+    let tun = TunIo::new_mock(
         TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
         crate::TunFraming::RawIp,
     )
@@ -2476,7 +2476,7 @@ async fn synthetic_fd_with_dns_disabled_dispatches_tcp_and_reuses_udp_associatio
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let dispatcher = Arc::new(MockDispatcher::default());
     let limits = ResourceLimits {
@@ -2582,7 +2582,16 @@ async fn synthetic_fd_with_dns_disabled_dispatches_tcp_and_reuses_udp_associatio
     assert_eq!(
         dispatcher.tcp_sessions.lock().unwrap()[0],
         StreamSession {
-            metadata: crate::session::InboundMetadata::new(tcp_destination.port()),
+            metadata: crate::session::InboundMetadata {
+                original: Some(Arc::new(crate::session::InboundSnapshot {
+                    source: tcp_source,
+                    destination: Destination::Ip(tcp_destination),
+                    socket_destination: Some(tcp_destination),
+                    inbound: InboundKind::Tun,
+                    user: None,
+                })),
+                ..crate::session::InboundMetadata::new(tcp_destination.port())
+            },
             inbound: InboundKind::Tun,
             source: tcp_source,
             destination: Destination::Ip(tcp_destination),
@@ -2623,7 +2632,7 @@ async fn unconfigured_tls_port_dispatches_without_reading_a_prefix() {
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let dispatcher = Arc::new(MockDispatcher::default());
     let limits = ResourceLimits {
@@ -2688,10 +2697,20 @@ async fn unconfigured_tls_port_dispatches_without_reading_a_prefix() {
     })
     .await
     .expect("unconfigured TLS port delayed dispatch for a prefix read");
+    // The sniff plan captures original ingress facts even when it reads no prefix.
     assert_eq!(
         dispatcher.tcp_sessions.lock().unwrap()[0],
         StreamSession {
-            metadata: crate::session::InboundMetadata::new(destination.port()),
+            metadata: crate::session::InboundMetadata {
+                original: Some(Arc::new(crate::session::InboundSnapshot {
+                    source,
+                    destination: Destination::Ip(destination),
+                    socket_destination: Some(destination),
+                    inbound: InboundKind::Tun,
+                    user: None,
+                })),
+                ..crate::session::InboundMetadata::new(destination.port())
+            },
             inbound: InboundKind::Tun,
             source,
             destination: Destination::Ip(destination),
@@ -2713,7 +2732,7 @@ async fn enabled_dns_fast_path_replies_without_opening_a_tun_udp_association() {
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let dispatcher = Arc::new(MockDispatcher::default());
     let dns_dispatcher = Arc::new(DnsReplyDispatcher::default());
@@ -2932,7 +2951,7 @@ async fn dns_fast_path_allows_sixteen_concurrent_sources_and_keeps_udp_responsiv
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let dispatcher = Arc::new(MockDispatcher::default());
     let send_started = Arc::new(Notify::new());
@@ -3074,7 +3093,7 @@ async fn cancellation_interrupts_a_blocked_udp_send_and_completes_the_stop_barri
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let send_started = Arc::new(Notify::new());
     let dispatcher = Arc::new(BlockingDispatcher {
@@ -3122,7 +3141,7 @@ async fn fresh_udp_source_beyond_the_old_sixty_four_limit_is_accepted() {
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let send_started = Arc::new(Notify::new());
     let send_count = Arc::new(AtomicUsize::new(0));
@@ -3245,7 +3264,7 @@ async fn full_udp_association_queue_does_not_block_other_sources() {
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let blocked_source: SocketAddr = "192.0.2.10:12000".parse().unwrap();
     let responsive_source: SocketAddr = "192.0.2.11:12001".parse().unwrap();
@@ -3313,7 +3332,7 @@ async fn blocked_udp_response_does_not_block_ingress_or_stop() {
     let (host, peer) = UnixDatagram::pair().unwrap();
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
-    let tun = TunIo::new(
+    let tun = TunIo::new_mock(
         TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
         crate::TunFraming::RawIp,
     )
@@ -3461,7 +3480,7 @@ async fn full_tcp_ingress_drops_only_that_packet_and_keeps_udp_and_dns_responsiv
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let tun = Arc::new(
-        TunIo::new(
+        TunIo::new_mock(
             TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
             crate::TunFraming::RawIp,
         )
@@ -3596,7 +3615,7 @@ async fn tun_writer_drains_remaining_lanes_and_drops_only_invalid_datagrams() {
         host.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
         let tun = Arc::new(
-            TunIo::new(
+            TunIo::new_mock(
                 TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
                 crate::TunFraming::RawIp,
             )
@@ -3663,7 +3682,7 @@ async fn tun_writer_services_ready_raw_ordinary_and_dns_lanes_fairly_across_batc
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let tun = Arc::new(
-        TunIo::new(
+        TunIo::new_mock(
             TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
             crate::TunFraming::RawIp,
         )
@@ -3772,7 +3791,7 @@ async fn tun_writer_retains_dns_permit_until_platform_completion_or_cancelled_se
         host.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
         let tun = Arc::new(
-            TunIo::new(
+            TunIo::new_mock(
                 TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
                 crate::TunFraming::RawIp,
             )
@@ -4087,7 +4106,7 @@ async fn configured_jumbo_mtu_reaches_platform_io_and_udp_response_budget() {
         tun_max_datagram_size: 9000,
         ..ResourceLimits::default()
     };
-    let tun = TunIo::new_with_mtu(
+    let tun = TunIo::new_mock_with_mtu(
         TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
         crate::TunFraming::RawIp,
         config.mtu,
