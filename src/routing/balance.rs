@@ -116,10 +116,10 @@ impl Balance {
             entry.used = self.clock;
             return entry.index;
         }
-        let index = (0..4)
-            .map(|_| jump(key.wrapping_add(rand::random::<u64>()), count))
-            .find(|&i| self.healthy[i])
-            .unwrap_or(0);
+        let index = healthy_candidate(
+            &self.healthy,
+            (0..4).map(|_| jump(key.wrapping_add(rand::random::<u64>()), count)),
+        );
         if self.sticky.len() >= 1000
             && !self.sticky.contains_key(&key)
             && let Some(oldest) = self
@@ -146,6 +146,12 @@ impl Balance {
         }
     }
 }
+fn healthy_candidate(healthy: &[bool], mut candidates: impl Iterator<Item = usize>) -> usize {
+    candidates
+        .find(|&i| healthy[i])
+        .or_else(|| healthy.iter().position(|&alive| alive))
+        .unwrap_or(0)
+}
 fn destination_key(destination: Option<&Destination>) -> String {
     match destination {
         Some(Destination::Ip(address)) => address.ip().to_string(),
@@ -171,6 +177,74 @@ fn jump(mut key: u64, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sticky_sampling_keeps_healthy_hits_and_falls_back_after_four_misses() {
+        let mut attempts = 0;
+        assert_eq!(
+            healthy_candidate(
+                &[false, false, true],
+                [0, 1, 0, 1].into_iter().inspect(|_| attempts += 1),
+            ),
+            2
+        );
+        assert_eq!(attempts, 4);
+        assert_eq!(
+            healthy_candidate(&[false, true, true], [2, 1, 0, 0].into_iter()),
+            2
+        );
+        assert_eq!(
+            healthy_candidate(&[false, true, true], [0, 0, 0, 0].into_iter()),
+            1
+        );
+        assert_eq!(
+            healthy_candidate(&[false, false, false], [2, 1, 0, 2].into_iter()),
+            0
+        );
+    }
+
+    #[test]
+    fn sticky_cache_replaces_unhealthy_and_out_of_range_members() {
+        let source = Some("192.0.2.1:1234".parse().unwrap());
+        let destination = Destination::domain("example.com", 443).unwrap();
+        let mut sticky = Balance::new(BalanceStrategy::StickySessions, 3);
+        sticky.health(&[Some(10), None, None]);
+        assert_eq!(sticky.choose(source, Some(&destination), None), 0);
+
+        sticky.health(&[None, None, Some(20)]);
+        assert_eq!(sticky.choose(source, Some(&destination), None), 2);
+        assert_eq!(sticky.sticky.len(), 1);
+        assert_eq!(sticky.sticky.values().next().unwrap().index, 2);
+
+        sticky.health(&[Some(10), Some(15), Some(20)]);
+        assert_eq!(sticky.choose(source, Some(&destination), None), 2);
+
+        // A stale cache index must never index the current member list.
+        sticky.sticky.values_mut().next().unwrap().index = 3;
+        sticky.health(&[None, Some(15), None]);
+        assert_eq!(sticky.choose(source, Some(&destination), None), 1);
+        assert_eq!(sticky.sticky.len(), 1);
+        assert_eq!(sticky.sticky.values().next().unwrap().index, 1);
+    }
+
+    #[test]
+    fn sticky_member_boundaries_keep_empty_and_all_unhealthy_fallbacks() {
+        let mut empty = Balance::new(BalanceStrategy::StickySessions, 0);
+        assert_eq!(empty.choose(None, None, None), 0);
+        assert!(empty.sticky.is_empty());
+
+        let mut single = Balance::new(BalanceStrategy::StickySessions, 1);
+        assert_eq!(single.choose(None, None, None), 0);
+        single.health(&[None]);
+        assert_eq!(single.choose(None, None, None), 0);
+        assert_eq!(single.sticky.len(), 1);
+
+        let mut unhealthy = Balance::new(BalanceStrategy::StickySessions, 3);
+        unhealthy.health(&[None, None, None]);
+        assert_eq!(unhealthy.choose(None, None, None), 0);
+        assert_eq!(unhealthy.sticky.values().next().unwrap().index, 0);
+    }
+
     #[test]
     fn ingress_hash_uses_only_authenticated_user_and_keeps_address_fallback() {
         let a = Destination::domain("first.example.com", 443).unwrap();
