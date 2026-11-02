@@ -37,7 +37,7 @@ fn options(protocol: &str, value: Value) -> WebSocketOptions {
 fn httpupgrade_rejects_ambiguous_modes_and_early_data_before_io() {
     for &protocol in PROTOCOLS {
         for fast in [false, true] {
-            for early in [0, 1, 2048] {
+            for early in [0, 1, 2048, 2049, 4096, u16::MAX] {
                 let opts = json!({"v2ray-http-upgrade":true,"v2ray-http-upgrade-fast-open":fast,"max-early-data":early});
                 assert!(Config::parse_yaml(&document(protocol, opts.clone())).is_ok());
                 if early > 0 {
@@ -53,7 +53,7 @@ fn httpupgrade_rejects_ambiguous_modes_and_early_data_before_io() {
             json!({"v2ray-http-upgrade":"true"}),
             json!({"v2ray-http-upgrade-fast-open":null}),
             json!({"v2ray-http-upgrade-fast-open":1}),
-            json!({"max-early-data":2049}),
+            json!({"max-early-data":65536}),
             json!({"max-early-data":-1}),
             json!({"max-early-data":null}),
             json!({"max-early-data":1,"early-data-header-name":""}),
@@ -63,7 +63,7 @@ fn httpupgrade_rejects_ambiguous_modes_and_early_data_before_io() {
             json!({"headers":{"Sec-WebSocket-Protocol":"override"}}),
             json!({"headers":{"Upgrade":"override"}}),
             json!({"headers":{"Host":"one.invalid","host":"two.invalid"}}),
-            json!({"path":"/bad#fragment"}),
+            json!({"path":"relative"}),
             json!({"unexpected":true}),
         ] {
             let mut opts = json!({"v2ray-http-upgrade":true});
@@ -92,7 +92,7 @@ async fn httpupgrade_configuration_selects_raw_upgrade_and_commits_prefix_once()
             let options = options(
                 protocol,
                 json!({
-                    "path":"/upgrade?q=1","headers":{"Host":"cover.invalid:443"},
+                    "path":"/upgrade?q=1#client-only","headers":{"Host":"cover.invalid:443"},
                     "v2ray-http-upgrade":true,"v2ray-http-upgrade-fast-open":fast
                 }),
             );

@@ -79,9 +79,9 @@ jobs:
           python-version: "3.x"
           check-latest: true
           architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: "0.12"
+          version: "0.13.6"
       - name: Linux native dependencies
         if: matrix.platform == 'linux'
         run: |
@@ -193,9 +193,9 @@ jobs:
           python-version: "3.x"
           check-latest: true
           architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: "0.12"
+          version: "0.13.6"
       - name: Locked source
         run: cargo fetch --locked
       - name: Linux native dependencies
@@ -295,9 +295,9 @@ jobs:
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: "0.12"
+          version: "0.13.6"
       - name: Cache native Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -335,9 +335,9 @@ jobs:
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: "0.12"
+          version: "0.13.6"
       - uses: actions/download-artifact@v8
         with:
           pattern: vole-apple-*-${{ github.sha }}
@@ -368,9 +368,9 @@ jobs:
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: "0.12"
+          version: "0.13.6"
       - uses: actions/download-artifact@v8
         with:
           pattern: vole-release-build-*-${{ github.sha }}

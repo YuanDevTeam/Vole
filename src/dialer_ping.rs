@@ -95,7 +95,9 @@ impl Dialer {
             })
             .await?;
         Ok(PhysicalPing {
-            socket: AsyncFd::new(socket)?,
+            // SAFETY: Socket owns this descriptor and keeps it open and
+            // unchanged until AsyncFd releases the socket.
+            socket: unsafe { AsyncFd::register(socket) }?,
             _guard: guard,
             identifier,
         })

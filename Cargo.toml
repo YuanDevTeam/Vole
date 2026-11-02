@@ -107,7 +107,7 @@ tun = [
 [dependencies]
 age = { version = "=0.11.5", default-features = false, features = ["armor"] }
 age-core = "=0.11.0"
-aes = { version = "0.9.3", optional = true, features = ["zeroize"] }
+aes = { version = "0.9.4", optional = true, features = ["zeroize"] }
 arc-swap = "1"
 async-trait = "0.1"
 base64 = "0.23"
@@ -115,24 +115,24 @@ bech32 = "=0.12.0"
 blake2 = { version = "=0.11.0", optional = true }
 blake3 = { version = "=1.8.7", optional = true }
 boringtun = { version = "=0.7.1", default-features = false, optional = true }
-boring = { path = "../boring/boring", version = "=5.4.0", features = ["client-fingerprint"], optional = true }
+boring = { git = "https://github.com/YuanDevTeam/boring", rev = "c717137e6c794a0b069f64686a375858ffc80818", version = "=5.4.0", features = ["client-fingerprint"], optional = true }
 bytes = "1"
 chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["zeroize"], optional = true }
-crc32fast = "=1.5.2"
+crc32fast = "=1.5.4"
 domain = { version = "=0.12.3", default-features = false, features = ["std"] }
-fancy-regex = { version = "=0.19.2", default-features = false, features = ["std", "unicode"] }
+fancy-regex = { version = "=0.20.0", default-features = false, features = ["std", "unicode"] }
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
-brotli = { version = "=9.0.0", default-features = false, features = ["std"] }
+brotli = { version = "=9.1.1", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", features = ["sink"] }
 getifaddrs = "=0.6.2"
 h2 = "0.4.20"
 h3 = { version = "=0.0.8", default-features = false, optional = true }
 h3-quinn = { version = "=0.0.10", default-features = false, optional = true }
-hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "aes", "chacha", "x25519", "nistp", "mlkem", "shake"] }
+hpke = { version = "=0.15.1", default-features = false, features = ["alloc", "aes", "chacha", "x25519", "nistp", "mlkem", "shake"] }
 hostname = { version = "=0.4.2", default-features = false, optional = true }
 http = "1"
-hyper = { version = "=1.11.1", default-features = false, features = ["client", "http1"], optional = true }
-hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio"], optional = true }
+hyper = { version = "=1.12.0", default-features = false, features = ["client", "http1"], optional = true }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio"], optional = true }
 httparse = { version = "1.10", optional = true }
 httlib-hpack = "=0.1.3"
 idna = "1.1"
@@ -146,18 +146,18 @@ rand = "0.10"
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"], optional = true }
 rsa = { version = "=0.9.10", default-features = false, features = ["std"], optional = true }
 ring = { version = "0.17.14", optional = true }
-redb = "=4.3.0"
-psl = "=2.1.241"
+redb = "=4.4.0"
+psl = "=2.1.246"
 prost = { version = "=0.14.4", default-features = false, features = ["derive", "std"], optional = true }
 regex = "1.13"
 regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode-case"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-native-certs = "=0.8.4"
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "=0.8.5"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml_ng = "0.10"
 yaml-rust2 = { version = "=0.13.0", default-features = false }
-sevenz-rust2 = { version = "=0.23.0", default-features = false }
+sevenz-rust2 = { version = "=0.24.2", default-features = false }
 sha2 = "0.11"
 shake = { version = "0.1.0", optional = true }
 shadowsocks = { version = "=1.25.0", optional = true, default-features = false, features = ["aead-cipher-2022"] }
@@ -165,21 +165,21 @@ socket2 = { version = "0.6", features = ["all"] }
 thiserror = "2"
 time = { version = "=0.3.55", features = ["formatting"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
-tokio-boring = { path = "../boring/tokio-boring", version = "=5.4.0", optional = true }
-tokio-rustls = { version = "=0.26.5", default-features = false, features = ["ring", "tls12"] }
+tokio-boring = { git = "https://github.com/YuanDevTeam/boring", rev = "c717137e6c794a0b069f64686a375858ffc80818", version = "=5.4.0", optional = true }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"], optional = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-core = "0.1.36"
 url = "2"
-uuid = { version = "=1.28.0", features = ["serde", "v5"] }
+uuid = { version = "=1.29.0", features = ["serde", "v5"] }
 vole-netstack = { path = "crates/vole-netstack", optional = true }
 vole-blake3-raw = { path = "crates/vole-blake3-raw", optional = true }
 webpki-roots = "1"
 x509-parser = { version = "=0.18.1", default-features = false, optional = true }
 yamux = { version = "=0.14.1", optional = true }
 zeroize = { version = "=1.9.1" }
-zstd = { version = "0.14.0", default-features = false }
+zstd = { version = "0.14.3", default-features = false }
 
 [target.'cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))'.dependencies]
 oslog = { version = "0.2", default-features = false }
@@ -187,14 +187,16 @@ oslog = { version = "0.2", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 # Public socket adapter; shared Dialer retains protection, deadlines and Stop.
 tokio-tfo = "=0.4.3"
+# Core-owned Linux TUN setup uses tun-rs's opt-in address management API.
+tun-rs = { version = "=2.8.16", default-features = false, features = ["address-management"] }
 
 [target.'cfg(unix)'.dependencies]
 # Keep one Cargo dependency name across target tables. Unix compiles this small
 # adapter dependency; platform I/O remains gated by the tun feature.
-tun-rs = { version = "=2.8.11", default-features = false }
+tun-rs = { version = "=2.8.16", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-tun-rs = { version = "=2.8.11", default-features = false, optional = true, features = ["interruptible"] }
+tun-rs = { version = "=2.8.16", default-features = false, optional = true, features = ["interruptible"] }
 windows = { version = "=0.62.2", optional = true, features = [
     "ApplicationModel_Background",
     "ApplicationModel_Core",
@@ -230,9 +232,9 @@ windows-core = { version = "=0.62.2", optional = true }
 [dev-dependencies]
 h3 = { version = "=0.0.8", default-features = false }
 h3-quinn = { version = "=0.0.10", default-features = false }
-sevenz-rust2 = { version = "=0.23.0", default-features = false, features = ["compress"] }
+sevenz-rust2 = { version = "=0.24.2", default-features = false, features = ["compress"] }
 # Native peer controls for bounded in-memory ALPS tests; same source as boring.
-boring-sys = { path = "../boring/boring-sys", version = "=5.4.0" }
+boring-sys = { git = "https://github.com/YuanDevTeam/boring", rev = "c717137e6c794a0b069f64686a375858ffc80818", version = "=5.4.0" }
 foreign-types = "=0.5.0"
 tokio = { version = "1", features = ["test-util"] }
 # Independent EIH relay fixture only; production crypto remains the official SS crate.
@@ -264,7 +266,6 @@ all = "warn"
 pedantic = "allow"
 
 [patch.crates-io]
-# quiche and Vole share the approved local Boring provider during development.
-# Switch these patches and the direct dependencies to one Git rev before a PR.
-boring = { path = "../boring/boring" }
-boring-sys = { path = "../boring/boring-sys" }
+# quiche and Vole share the same approved Boring commit.
+boring = { git = "https://github.com/YuanDevTeam/boring", rev = "c717137e6c794a0b069f64686a375858ffc80818" }
+boring-sys = { git = "https://github.com/YuanDevTeam/boring", rev = "c717137e6c794a0b069f64686a375858ffc80818" }

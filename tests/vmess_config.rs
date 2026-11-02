@@ -24,6 +24,27 @@ fn vmess_default_node_and_explicit_cipher_aliases_are_accepted_without_io() {
         );
     }
     assert!(!format!("{parsed:?}").contains("07070707"));
+    for (input, expected) in [
+        (
+            "07070707070707070707070707070707",
+            "07070707-0707-0707-0707-070707070707",
+        ),
+        (
+            "{07070707-0707-0707-0707-070707070707}",
+            "07070707-0707-0707-0707-070707070707",
+        ),
+        (
+            "urn:uuid:07070707-0707-0707-0707-070707070707",
+            "07070707-0707-0707-0707-070707070707",
+        ),
+        ("invalid-secret", "29a5f9ec-d914-56e3-a82c-19b9150f2a91"),
+    ] {
+        let parsed = Config::parse_yaml(&document(json!({"uuid":input}))).unwrap();
+        let vole::config::ProxyProtocol::Vmess(node) = &parsed.proxies[0].protocol else {
+            unreachable!()
+        };
+        assert_eq!(node.id.hyphenated().to_string(), expected);
+    }
 }
 
 #[test]
@@ -58,7 +79,6 @@ fn vmess_transport_and_security_combinations_are_strict() {
     }
     for fields in [
         json!({"alterId":1}),
-        json!({"uuid":"invalid-secret"}),
         json!({"cipher":"none","global-padding":true}),
         json!({"cipher":"zero","authenticated-length":true}),
         json!({"network":"bogus"}),
@@ -71,7 +91,7 @@ fn vmess_transport_and_security_combinations_are_strict() {
         json!({"network":"http","http-opts":{"method":"GET\r\n"}}),
         json!({"network":"http","http-opts":{"headers":{"Content-Length":["1"]}}}),
         json!({"network":"http","http-opts":{"headers":{"X-Test":[]}}}),
-        json!({"network":"ws","ws-opts":{"max-early-data":2049}}),
+        json!({"network":"ws","ws-opts":{"max-early-data":65536}}),
         json!({"network":"ws","tls":true,"alpn":["h2"]}),
     ] {
         assert!(
@@ -117,7 +137,6 @@ async fn vmess_field_boundaries_and_normalized_transport_values() {
         json!({"server":""}),
         json!({"port":0}),
         json!({"port":65536}),
-        json!({"uuid":"07070707070707070707070707070707"}),
         json!({"network":"ws","ws-opts":{"headers":{"Host":"cover.example:bogus"}}}),
         json!({"network":"h2","h2-opts":{"host":["cover.example:"]}}),
         json!({"network":"http","http-opts":{"headers":{"Host":["cover.example:65536"]}}}),
@@ -219,6 +238,7 @@ async fn vmess_normalized_websocket_fields_preserve_headers_and_early_data_order
         (0, None),
         (1, None),
         (2048, None),
+        (2049, None),
         (2048, Some("X-Early")),
         (2048, Some("")),
     ] {

@@ -352,12 +352,14 @@ async fn configured_handshake_timeout_bounds_quic_and_auth_but_not_ready_session
 
     // Field seconds are parsed from actual configuration. Tokio and Quinn use
     // the same controlled monotonic clock; no socket or alternate TLS provider.
-    for (phase, timeout, parent_ms, expected_ms) in [
-        ("quic", 0, 2000, 1800),
-        ("quic", 1, 3000, 1000),
-        ("quic", 1, 500, 300),
-        ("auth", 1, 3000, 1000),
-        ("ready", 1, 3000, 0),
+    // Failed offers publish after the bounded QUIC close barrier. An accepted
+    // peer can acknowledge close early; a shorter caller deadline is independent.
+    for (phase, timeout, parent_ms, minimum_ms, maximum_ms) in [
+        ("quic", 0, 2000, 1800, 1800),
+        ("quic", 1, 3000, 2000, 2000),
+        ("quic", 1, 500, 300, 300),
+        ("auth", 1, 3000, 1000, 2000),
+        ("ready", 1, 3000, 0, 0),
     ] {
         let (client_io, endpoint, client_link) = memory_fixture();
         let initial_observed = Arc::new(AtomicBool::new(false));
@@ -466,9 +468,20 @@ async fn configured_handshake_timeout_bounds_quic_and_auth_but_not_ready_session
             assert!(reused.receive().await.is_err());
             drop((first, reused));
         } else {
-            assert!(matches!(result, Err(DispatchError::TimedOut)));
-            assert_eq!(elapsed, Duration::from_millis(expected_ms));
-            assert_eq!(auth_observed.load(Ordering::Acquire), phase == "auth");
+            assert!(
+                matches!(result, Err(DispatchError::TimedOut)),
+                "{phase}: handshake={timeout}s caller={parent_ms}ms"
+            );
+            assert!(
+                (Duration::from_millis(minimum_ms)..=Duration::from_millis(maximum_ms))
+                    .contains(&elapsed),
+                "{phase}: handshake={timeout}s caller={parent_ms}ms elapsed={elapsed:?}"
+            );
+            assert_eq!(
+                auth_observed.load(Ordering::Acquire),
+                phase == "auth",
+                "{phase}: handshake={timeout}s caller={parent_ms}ms"
+            );
             outbound.shutdown().await;
         }
         assert!(

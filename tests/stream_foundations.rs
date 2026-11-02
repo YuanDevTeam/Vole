@@ -614,11 +614,11 @@ async fn dropping_an_established_ws_releases_its_only_io_owner() {
 
 #[tokio::test]
 async fn grpc_rejects_oversized_truncated_and_invalid_records() {
-    for wire in [
-        b"\x00\x00\x10\x00\x00".to_vec(),
-        b"\x00\x00\x00\x00\x06\x0a\x04x".to_vec(),
-        b"\x01\x00\x00\x00\x02\x0a\x00".to_vec(),
-        b"\x00\x00\x00\x00\x02\x0b\x00".to_vec(),
+    for (wire, prefix) in [
+        (b"\x00\x00\x10\x00\x00".to_vec(), &b""[..]),
+        (b"\x00\x00\x00\x00\x06\x0a\x04x".to_vec(), &b"x"[..]),
+        (b"\x01\x00\x00\x00\x02\x0a\x00".to_vec(), &b""[..]),
+        (b"\x00\x00\x00\x00\x02\x0b\x00".to_vec(), &b""[..]),
     ] {
         let (outgoing, incoming) = tokio::io::duplex(128);
         let peer = tokio::spawn(async move {
@@ -643,14 +643,16 @@ async fn grpc_rejects_oversized_truncated_and_invalid_records() {
         )
         .await
         .unwrap();
+        let mut received = Vec::new();
         assert_eq!(
-            timeout(Duration::from_secs(1), stream.read_u8())
+            timeout(Duration::from_secs(1), stream.read_to_end(&mut received))
                 .await
                 .unwrap()
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData
         );
+        assert_eq!(received, prefix);
         drop(stream);
         owner.stop().await.unwrap();
         timeout(Duration::from_secs(1), peer)

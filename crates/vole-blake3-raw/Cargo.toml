@@ -7,7 +7,7 @@ publish = false
 links = "blake3"
 
 [build-dependencies]
-cc = "=1.8.0"
+cc = "=1.11.0"
 
 [dev-dependencies]
 blake3 = "=1.8.7"

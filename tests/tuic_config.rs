@@ -15,14 +15,19 @@ fn parse(node: Value) -> vole::Result<Config> {
 }
 
 #[test]
-fn v5_identity_defaults_password_without_enabling_business_udp() {
+fn v5_identity_defaults_password_and_keeps_business_udp_enabled() {
     if !cfg!(feature = "outbound-tuic") {
         assert!(parse(node()).is_err());
         return;
     }
     let c = parse(node()).unwrap();
-    assert!(!c.proxies[0].udp);
+    assert!(c.proxies[0].udp);
     assert_eq!(c.proxies[0].server_endpoint(), Some(("peer.invalid", 443)));
+    for enabled in [false, true] {
+        let mut n = node();
+        n["udp"] = json!(enabled);
+        assert!(parse(n).unwrap().proxies[0].udp);
+    }
     let mut n = node();
     n.as_object_mut().unwrap().remove("password");
     let c = parse(n).unwrap();
@@ -30,7 +35,7 @@ fn v5_identity_defaults_password_without_enabling_business_udp() {
         panic!("protocol");
     };
     assert_eq!(t.password, "");
-    assert!(!c.proxies[0].udp);
+    assert!(c.proxies[0].udp);
     let mut n = node();
     n.as_object_mut().unwrap().remove("uuid");
     assert!(parse(n).is_err());

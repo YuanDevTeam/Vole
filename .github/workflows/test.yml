@@ -41,9 +41,9 @@ jobs:
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: "0.12"
+          version: "0.13.6"
       - name: Linux native dependencies
         run: |
           sudo apt-get update
@@ -135,7 +135,7 @@ jobs:
           require(not (workspace_root / "vendor").exists(), "Core vendor sources are forbidden")
           require(not (workspace_root / "crates" / "vole-blake3-raw" / "vendor").exists(), "BLAKE3 must use the installed official C library")
           native_manifest = json.loads((workspace_root / "scripts" / "native" / "blake3" / "vcpkg.json").read_text(encoding="utf-8"))
-          require(native_manifest.get("builtin-baseline") == "e456309491fd875487bf02b8a0dca76c1b1b00cc", "unapproved official BLAKE3 C registry baseline")
+          require(native_manifest.get("builtin-baseline") == "9eec002df1cd109f8f104cd966a763daf9751489", "unapproved official BLAKE3 C registry baseline")
           require(native_manifest.get("dependencies") == [{"name": "blake3", "default-features": False}], "BLAKE3 C must use the reviewed static-only package")
           require(native_manifest.get("overrides") == [{"name": "blake3", "version": "1.8.7", "port-version": 0}], "unapproved official BLAKE3 C version")
           for name, version in (("idna", "1.1.0"), ("url", "2.5.8")):
@@ -145,9 +145,9 @@ jobs:
                   require(item.get("source") in registry, f"{item['name']} must use official registry Unicode data")
           rust_blake3 = package("blake3", "1.8.7")
           require(rust_blake3.get("license") == "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception", "unapproved Rust BLAKE3 license")
-          rustls = package("rustls", "0.23.45")
-          package("tokio-rustls", "0.26.5")
-          package("rustls-native-certs", "0.8.4")
+          rustls = package("rustls", "0.23.46")
+          package("tokio-rustls", "0.26.6")
+          package("rustls-native-certs", "0.8.5")
           ring = package("ring")
           quinn = package("quinn", "0.11.12")
           proto = package("quinn-proto", "0.11.19")
@@ -187,13 +187,13 @@ jobs:
           require(mieru_aead.get("source") in registry and "zeroize" in features(mieru_aead), "Mieru must use official zeroizing XChaCha20-Poly1305")
           mieru_proto = package("prost", "0.14.4")
           require(mieru_proto.get("license") == "Apache-2.0" and mieru_proto.get("source") in registry, "Mieru protobuf must use official Apache-2.0 prost")
-          hpke = package("hpke", "0.14.1")
+          hpke = package("hpke", "0.15.1")
           require(features(hpke) == {"alloc", "aes", "chacha", "x25519", "hkdfsha2", "nistp", "mlkem", "shake"}, "unapproved HPKE algorithms")
           age = package("age", "0.11.5")
           require(features(age) == {"armor"}, "AGE must use only native armored-file decoding")
           package("age-core", "0.11.0")
           package("x-wing", "0.1.1")
-          package("ml-kem", "0.3.2")
+          package("ml-kem", "0.3.4")
           native = {}
           for name, required in (("boring", {"reality", "client-fingerprint", "shadow-tls-v3", "jls"}), ("boring-sys", {"reality", "shadow-tls-v3", "jls"}), ("tokio-boring", set())):
               item = package(name, "5.4.0", {boring_source})

@@ -24,7 +24,7 @@ Stop 关闭自有句柄，不承诺删除宿主已有接口。创建失败没有
 
 1. 验证文件描述符有效且已设置 `O_NONBLOCK`；
 2. 通过 `F_DUPFD_CLOEXEC` 创建 Vole 持有的副本；
-3. 把副本交给 `tun-rs::SyncDevice::from_fd`，并用 Tokio `AsyncFd` 驱动；
+3. 把副本交给 `tun-rs::SyncDevice::from_fd`，再用 Tokio `AsyncFd::register` 驱动；
 4. 停止时只关闭副本。
 
 借用路径不调用会修改共享 open-file-description 标志的异步构造器，也不重配置接口。

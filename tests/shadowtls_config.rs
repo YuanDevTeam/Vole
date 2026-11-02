@@ -105,6 +105,9 @@ fn shadowtls_preserves_policy_values_and_shared_profiles() {
             alpn.into_iter().map(String::into_bytes).collect::<Vec<_>>()
         );
     }
+    let mut null_alpn = node();
+    null_alpn["plugin-opts"]["alpn"] = Value::Null;
+    assert!(policy(null_alpn).alpn.is_empty());
     for host in ["cover.invalid", "192.0.2.7", "2001:db8::7"] {
         let mut n = node();
         let o = &mut n["plugin-opts"];
@@ -133,27 +136,26 @@ fn shadowtls_preserves_policy_values_and_shared_profiles() {
 #[cfg(feature = "shadow-tls-v3")]
 #[test]
 fn shadowtls_rejects_invalid_types_bounds_unknown_fields_and_nulls_without_secrets() {
-    let assert_rejected = |n| {
-        let error = parse(n).expect_err("must reject before IO").to_string();
+    let assert_rejected = |n, case: &str| {
+        let error = parse(n).expect_err(case).to_string();
         assert!(!error.contains("synthetic-private-marker"), "{error}");
     };
     for key in ["plugin", "plugin-opts", "client-fingerprint"] {
         let mut n = node();
         n[key] = Value::Null;
-        assert_rejected(n);
+        assert_rejected(n, &format!("{key}: null must reject before IO"));
     }
     for key in [
         "version",
         "host",
         "password",
-        "alpn",
         "skip-cert-verify",
         "fingerprint",
         "name-cert-verify",
     ] {
         let mut n = node();
         n["plugin-opts"][key] = Value::Null;
-        assert_rejected(n);
+        assert_rejected(n, &format!("plugin-opts.{key}: null must reject before IO"));
     }
     for (key, values) in [
         (
@@ -201,8 +203,9 @@ fn shadowtls_rejects_invalid_types_bounds_unknown_fields_and_nulls_without_secre
     ] {
         for value in values {
             let mut n = node();
+            let case = format!("plugin-opts.{key}: {value} must reject before IO");
             n["plugin-opts"][key] = value;
-            assert_rejected(n);
+            assert_rejected(n, &case);
         }
     }
     for value in [
@@ -212,13 +215,14 @@ fn shadowtls_rejects_invalid_types_bounds_unknown_fields_and_nulls_without_secre
         json!([]),
     ] {
         let mut n = node();
+        let case = format!("client-fingerprint: {value} must reject before IO");
         n["client-fingerprint"] = value;
-        assert_rejected(n);
+        assert_rejected(n, &case);
     }
     for key in ["plugin", "plugin-opts"] {
         let mut n = node();
         n.as_object_mut().unwrap().remove(key);
-        assert_rejected(n);
+        assert_rejected(n, &format!("missing {key} must reject before IO"));
     }
 }
 

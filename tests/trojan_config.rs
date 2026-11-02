@@ -173,15 +173,20 @@ fn trojan_empty_defaults_and_grpc_authority_match_the_reference() {
     };
     assert!(matches!(node.transport, TrojanTransport::Tcp));
     assert_eq!(node.server_name, "localhost");
-    let config =
-        Config::parse_yaml(&document(json!({"network":"ws","ws-opts":{"path":""}}))).unwrap();
-    let ProxyProtocol::Trojan(node) = &config.proxies[0].protocol else {
-        unreachable!()
-    };
-    let TrojanTransport::WebSocket { uri, .. } = &node.transport else {
-        unreachable!()
-    };
-    assert_eq!(uri, "wss://localhost/");
+    for (path, expected) in [
+        ("", "wss://localhost/"),
+        ("/bad#fragment", "wss://localhost/bad"),
+    ] {
+        let config =
+            Config::parse_yaml(&document(json!({"network":"ws","ws-opts":{"path":path}}))).unwrap();
+        let ProxyProtocol::Trojan(node) = &config.proxies[0].protocol else {
+            unreachable!()
+        };
+        let TrojanTransport::WebSocket { uri, .. } = &node.transport else {
+            unreachable!()
+        };
+        assert_eq!(uri, expected);
+    }
     for (server, sni, authority) in [
         ("127.0.0.1", "", "127.0.0.1"),
         ("::1", "", "[::1]"),
@@ -245,7 +250,6 @@ fn trojan_transport_boundaries_fail_before_runtime_io() {
         json!({"path":"relative"}),
         json!({"path":null}),
         json!({"path":"/bad\r\nheader"}),
-        json!({"path":"/bad#fragment"}),
         json!({"path":"/".repeat(16385)}),
         json!({"headers":null}),
         json!({"headers":{"Host":"user:secret@example.com"}}),
@@ -257,7 +261,7 @@ fn trojan_transport_boundaries_fail_before_runtime_io() {
         json!({"headers":{"Sec-WebSocket-Key":"override"}}),
         json!({"headers":{"Sec-WebSocket-Protocol":"override"}}),
         json!({"headers":{"Content-Length":"1"}}),
-        json!({"max-early-data":2049}),
+        json!({"max-early-data":65536}),
         json!({"max-early-data":-1}),
         json!({"max-early-data":null}),
         json!({"early-data-header-name":"x-ed"}),
@@ -273,7 +277,7 @@ fn trojan_transport_boundaries_fail_before_runtime_io() {
             "accepted WS options {opts}"
         );
     }
-    for max in [0, 1, 2048] {
+    for max in [0, 1, 2048, 2049] {
         for header in [None, Some("x-vole-ed"), Some("")] {
             if max == 0 && header.is_some() {
                 continue;

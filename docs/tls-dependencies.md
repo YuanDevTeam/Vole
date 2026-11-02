@@ -29,7 +29,7 @@ AWS-LC 只用于 `shadowsocks → shadowsocks-crypto → aws-lc-rs → aws-lc-sy
 BoringSSL 子模块保持原样，fork 补丁通过 feature 控制。
 
 AGE 使用获准的官方兼容稳定版本 `age 0.11.5` 与 `age-core 0.11.0`。
-其 0.12 系列强制依赖的旧 ML-KEM 与当前 `hpke 0.14.1` 的正式 KEM 依赖不兼容；
+其 0.12 系列强制依赖的旧 ML-KEM 与当前 `hpke 0.15.1` 的正式 KEM 依赖不兼容；
 此版本例外仅限上述两项，Hybrid 保持最新稳定 HPKE/RustCrypto 路径。
 
 ## 开发与升级

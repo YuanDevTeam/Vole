@@ -10,7 +10,7 @@ fn hysteria2_configuration_follows_its_protocol_feature() {
             config.proxies[0].server_endpoint(),
             Some(("localhost", 443))
         );
-        assert!(!config.proxies[0].udp);
+        assert!(config.proxies[0].udp);
     }
 }
 
@@ -55,6 +55,18 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         let mut raw = base.clone();
         raw[field] = json!("");
         assert_eq!(normalized(raw), defaults, "empty {field} uses defaults");
+    }
+    let mut wildcard = base.clone();
+    wildcard["ports"] = json!("*");
+    assert_eq!(normalized(wildcard), defaults);
+    for (ports, expected) in [
+        ("1,,2", vec![1, 2]),
+        ("2-1", vec![1, 2]),
+        ("8445-8443/443,,8444", vec![443, 8443, 8444, 8445]),
+    ] {
+        let mut raw = base.clone();
+        raw["ports"] = json!(ports);
+        assert_eq!(normalized(raw).hopping.unwrap().ports, expected);
     }
     for field in [
         "name",
@@ -136,9 +148,17 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
     assert_eq!((hopping.min_seconds, hopping.max_seconds), (5, 7));
     raw.as_object_mut().unwrap().remove("port");
     assert!(parse(raw.clone()).is_ok());
-    for interval in [json!(5), json!("5"), json!("4294967295")] {
+    for (interval, expected) in [
+        (json!(0), (30, 30)),
+        (json!(4), (5, 5)),
+        (json!("7-5"), (5, 7)),
+        (json!(5), (5, 5)),
+        (json!("5"), (5, 5)),
+        (json!("4294967295"), (u32::MAX, u32::MAX)),
+    ] {
         raw["hop-interval"] = interval;
-        assert!(parse(raw.clone()).is_ok());
+        let hopping = normalized(raw.clone()).hopping.unwrap();
+        assert_eq!((hopping.min_seconds, hopping.max_seconds), expected);
     }
     for mtu in [64, 65535] {
         let mut raw = base.clone();
@@ -164,15 +184,7 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         ),
         (
             "ports",
-            vec![
-                json!("1,,2"),
-                json!("2-1"),
-                json!("0"),
-                json!("65536"),
-                json!("*"),
-                json!([443]),
-                Value::Null,
-            ],
+            vec![json!("0"), json!("65536"), json!([443]), Value::Null],
         ),
         (
             "alpn",
@@ -215,14 +227,7 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         raw[field] = value;
         assert!(parse(raw).is_err(), "{field}");
     }
-    for value in [
-        json!(0),
-        json!(4),
-        json!("7-5"),
-        json!("5s"),
-        json!("4294967296"),
-        Value::Null,
-    ] {
+    for value in [json!("5s"), json!("4294967296"), Value::Null] {
         let mut raw = base.clone();
         raw["ports"] = json!("443");
         raw["hop-interval"] = value;

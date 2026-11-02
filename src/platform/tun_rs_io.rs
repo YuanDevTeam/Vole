@@ -52,7 +52,9 @@ impl TunRsIo {
         let device = unsafe { tun_rs::SyncDevice::from_fd(fd.into_raw_fd()) }?;
         configure_platform_framing(&device, framing);
         Ok(Self {
-            device: AsyncFd::new(device)?,
+            // SAFETY: SyncDevice owns this fd and keeps it open and unchanged
+            // until AsyncFd releases the device.
+            device: unsafe { AsyncFd::register(device) }.map_err(io::Error::from)?,
             framing,
             mtu: usize::from(mtu),
         })
@@ -101,7 +103,9 @@ impl TunRsIo {
         device.set_mtu(mtu)?;
         device.set_nonblocking(true)?;
         Ok(Self {
-            device: AsyncFd::new(device)?,
+            // SAFETY: SyncDevice owns this fd and keeps it open and unchanged
+            // until AsyncFd releases the device.
+            device: unsafe { AsyncFd::register(device) }.map_err(io::Error::from)?,
             framing: TunFraming::RawIp,
             mtu: usize::from(mtu),
         })
@@ -133,7 +137,9 @@ impl TunRsIo {
             let framing = TunFraming::RawIp;
             configure_platform_framing(&device, framing);
             Ok(Self {
-                device: AsyncFd::new(device)?,
+                // SAFETY: SyncDevice owns this fd and keeps it open and unchanged
+                // until AsyncFd releases the device.
+                device: unsafe { AsyncFd::register(device) }.map_err(io::Error::from)?,
                 framing,
                 mtu: usize::from(mtu),
             })
