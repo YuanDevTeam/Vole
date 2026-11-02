@@ -58,7 +58,7 @@ pub(super) struct Sample {
     #[serde(skip)]
     order: u64,
     #[serde(skip)]
-    expected_matches: bool,
+    status: Option<u16>,
 }
 struct Job {
     spec: HealthCheckConfig,
@@ -212,7 +212,7 @@ impl HealthRuntime {
         Sample {
             alive: result.is_ok(),
             delay: result.as_ref().map_or(0, |sample| sample.delay),
-            expected_matches: result.as_ref().is_ok_and(|sample| sample.expected_matches),
+            status: result.as_ref().ok().map(|sample| sample.status),
             time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -426,15 +426,26 @@ impl HealthRuntime {
         let samples = self.samples.lock().unwrap();
         for job in self.jobs.lock().unwrap().iter() {
             if let Some(index) = job.group {
+                // A shared member/URL probe must retain each group's status policy.
+                let expected =
+                    status_ranges(&job.spec.expected_status).expect("validated health status");
                 let values = job
                     .members
                     .iter()
                     .map(|name| {
-                        samples
-                            .get(&(name.clone(), job.spec.url.clone()))
-                            .map_or(Some(u16::MAX.into()), |s| {
-                                (s.alive && s.expected_matches).then_some(s.delay)
-                            })
+                        samples.get(&(name.clone(), job.spec.url.clone())).map_or(
+                            Some(u16::MAX.into()),
+                            |s| {
+                                (s.alive
+                                    && s.status.is_some_and(|status| {
+                                        expected.is_empty()
+                                            || expected.iter().any(|(start, end)| {
+                                                (*start..=*end).contains(&status)
+                                            })
+                                    }))
+                                .then_some(s.delay)
+                            },
+                        )
                     })
                     .collect::<Vec<_>>();
                 self.groups.apply_health(index, &values);
@@ -522,6 +533,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct MemoryProbe {
+        status: u16,
         peers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     }
     #[async_trait::async_trait]
@@ -532,15 +544,18 @@ mod tests {
                 crate::session::InboundKind::InternalMeasure
             );
             let (client, mut peer) = tokio::io::duplex(1024);
+            let status = self.status;
             let task = tokio::spawn(async move {
                 let mut bytes = Vec::new();
                 while !bytes.ends_with(b"\r\n\r\n") {
                     bytes.push(peer.read_u8().await.unwrap());
                 }
                 tokio::time::sleep(Duration::from_millis(2)).await;
-                peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                    .await
-                    .unwrap();
+                peer.write_all(
+                    format!("HTTP/1.1 {status} Response\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
             });
             self.peers.lock().unwrap().push(task);
             Ok(Box::new(client))
@@ -553,10 +568,141 @@ mod tests {
         }
     }
 
+    fn shared_status_runtime() -> (Arc<HealthRuntime>, [Arc<MemoryProbe>; 2]) {
+        let config = Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxies:
+  - {name: a, type: socks5, server: 192.0.2.1, port: 1080}
+  - {name: b, type: socks5, server: 192.0.2.2, port: 1080}
+proxy-groups:
+  - {name: any, type: fallback, proxies: [a,b], url: 'http://example.test/health', interval: 60, lazy: false, expected-status: '*'}
+  - {name: strict, type: fallback, proxies: [a,b], url: 'http://example.test/health', interval: 60, lazy: false, expected-status: 204}
+  - {name: strict-copy, type: fallback, proxies: [a,b], url: 'http://example.test/health', interval: 60, lazy: false, expected-status: 204}
+"#,
+        )
+        .unwrap();
+        let nodes = [500, 204].map(|status| {
+            Arc::new(MemoryProbe {
+                status,
+                peers: Mutex::new(Vec::new()),
+            })
+        });
+        let proxies: Vec<Arc<dyn Dispatcher>> = vec![nodes[0].clone(), nodes[1].clone()];
+        let groups =
+            ProxyGroups::new(&config.proxy_groups, proxies.clone(), nodes[1].clone()).unwrap();
+        let targets = RouteTargetDispatchers::with_proxy_groups(proxies, &groups).unwrap();
+        let runtime = HealthRuntime::new(
+            &config,
+            groups,
+            targets,
+            nodes[1].clone(),
+            vec![],
+            None,
+            SecurityContext::new(),
+        );
+        (runtime, nodes)
+    }
+
+    fn assert_status_selections(runtime: &HealthRuntime, any: &str) {
+        assert_eq!(runtime.groups.state("any").unwrap().now, any);
+        assert_eq!(runtime.groups.state("strict").unwrap().now, "b");
+        assert_eq!(runtime.groups.state("strict-copy").unwrap().now, "b");
+    }
+
+    async fn finish_peers(nodes: &[Arc<MemoryProbe>]) {
+        for node in nodes {
+            let tasks = std::mem::take(&mut *node.peers.lock().unwrap());
+            for task in tasks {
+                task.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_probes_apply_each_group_status_policy_and_refresh_failed_samples() {
+        let (runtime, nodes) = shared_status_runtime();
+        let cancel = CancellationToken::new();
+        runtime.tick(&cancel).await;
+        assert_status_selections(&runtime, "a");
+        assert_eq!(runtime.samples.lock().unwrap().len(), 2);
+        for node in &nodes {
+            assert_eq!(node.peers.lock().unwrap().len(), 1);
+        }
+
+        runtime.tick(&cancel).await;
+        for node in &nodes {
+            assert_eq!(node.peers.lock().unwrap().len(), 1);
+        }
+        let failed = runtime.sample(&Err(ProbeError::Timeout));
+        assert_eq!(failed.status, None);
+        runtime.samples.lock().unwrap().insert(
+            ("a".to_owned(), "http://example.test/health".to_owned()),
+            failed,
+        );
+        runtime.apply_group_health();
+        assert_status_selections(&runtime, "b");
+
+        runtime.jobs.lock().unwrap().reverse();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        runtime.tick(&cancel).await;
+        assert_status_selections(&runtime, "a");
+        assert_eq!(runtime.samples.lock().unwrap().len(), 2);
+        for node in &nodes {
+            assert_eq!(node.peers.lock().unwrap().len(), 2);
+        }
+        finish_peers(&nodes).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_and_provider_probes_do_not_replace_group_status_policies() {
+        let (runtime, nodes) = shared_status_runtime();
+        let cancel = CancellationToken::new();
+        runtime.tick(&cancel).await;
+        let mut request = DelayRequest {
+            url: "http://example.test/health".to_owned(),
+            timeout: Duration::from_secs(1),
+            expected: vec![(204, 204)],
+        };
+        runtime.node_delay("a", &request, &cancel).await.unwrap();
+        assert_status_selections(&runtime, "a");
+        assert!(runtime.states()["a"]["alive"].as_bool().unwrap());
+
+        request.expected = vec![(500, 500)];
+        assert_eq!(
+            runtime
+                .group_delay("any", &request, &cancel)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_status_selections(&runtime, "a");
+
+        let mut spec = runtime.jobs.lock().unwrap()[0].spec.clone();
+        spec.expected_status = "500".to_owned();
+        runtime.jobs.lock().unwrap().push(Job {
+            spec,
+            members: vec!["a".to_owned(), "b".to_owned()],
+            group: None,
+            last: None,
+            provider: Some("fixture".to_owned()),
+        });
+        runtime
+            .provider_healthcheck("fixture", &cancel)
+            .await
+            .unwrap();
+        assert_status_selections(&runtime, "a");
+        assert_eq!(runtime.samples.lock().unwrap().len(), 2);
+        assert_eq!(runtime.manual_samples.lock().unwrap().len(), 2);
+        finish_peers(&nodes).await;
+    }
+
     #[tokio::test]
     async fn manual_probes_keep_one_history_per_node_and_cancel_queued_work() {
         let config = Config::parse_yaml(b"mixed-port: 1080\nrules:\n  - MATCH,DIRECT\n").unwrap();
         let direct = Arc::new(MemoryProbe {
+            status: 204,
             peers: Mutex::new(Vec::new()),
         });
         let groups = ProxyGroups::new(&config.proxy_groups, vec![], direct.clone()).unwrap();
@@ -602,7 +748,7 @@ mod tests {
         {
             let samples = runtime.manual_samples.lock().unwrap();
             assert!(samples["DIRECT"].alive);
-            assert!(!samples["DIRECT"].expected_matches);
+            assert_eq!(samples["DIRECT"].status, Some(204));
         }
         assert_eq!(
             runtime.states()["DIRECT"]["history"]

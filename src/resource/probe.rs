@@ -177,6 +177,7 @@ pub(crate) async fn probe_once(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Observation {
     pub delay: u64,
+    pub status: u16,
     pub expected_matches: bool,
 }
 
@@ -222,6 +223,7 @@ pub(crate) async fn observe(
         }
         Ok(Observation {
             delay: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            status,
             expected_matches: expected.is_empty()
                 || expected
                     .iter()
@@ -319,6 +321,42 @@ mod tests {
             Err(DispatchError::NotAllowed)
         }
     }
+
+    #[tokio::test]
+    async fn observation_retains_final_status_independently_of_expected_policy() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let dispatcher = Arc::new(Memory(Mutex::new(Some(Box::new(client)))));
+        let peer = tokio::spawn(async move {
+            for status in [204, 500] {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(server.read_u8().await.unwrap());
+                }
+                server
+                    .write_all(
+                        format!("HTTP/1.1 {status} Response\r\nContent-Length: 0\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let observation = observe(
+            &Target::parse("http://example.test/").unwrap(),
+            dispatcher,
+            Duration::from_secs(1),
+            true,
+            &[(204, 204)],
+            &CancellationToken::new(),
+            &SecurityContext::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(observation.status, 500);
+        assert!(!observation.expected_matches);
+        peer.await.unwrap();
+    }
+
     #[tokio::test]
     async fn unified_probe_reuses_stream_checks_status_and_cancels() {
         let (client, mut server) = tokio::io::duplex(4096);
