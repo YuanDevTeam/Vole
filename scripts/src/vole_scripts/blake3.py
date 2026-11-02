@@ -112,6 +112,7 @@ def _triplet(target: str, env: dict[str, str], backend: str) -> tuple[str, list[
         if backend == "uwp":
             lines.append(
                 "list(APPEND VCPKG_CMAKE_CONFIGURE_OPTIONS "
+                '"-DCMAKE_TRY_COMPILE_CONFIGURATION=Release" '
                 '"-DVCPKG_MSVC_CXX_WINRT_EXTENSIONS=OFF" '
                 '"-DCMAKE_TRY_COMPILE_PLATFORM_VARIABLES='
                 'VCPKG_MSVC_CXX_WINRT_EXTENSIONS")'

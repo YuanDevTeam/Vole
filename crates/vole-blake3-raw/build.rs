@@ -16,8 +16,9 @@ fn dependency_dir(name: &str, target: &str, host: &str) -> PathBuf {
     let path = PathBuf::from(value);
     assert!(path.is_absolute(), "{scoped} must be an absolute path");
     assert!(path.is_dir(), "{scoped} must name an existing directory");
-    path.canonicalize()
-        .expect("canonicalize dependency directory")
+    // Preserve the native path spelling for MSVC's include and linker flags.
+    // Windows canonicalization adds a verbatim prefix that cl.exe rejects.
+    path
 }
 
 fn main() {

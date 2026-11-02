@@ -128,6 +128,7 @@ class Blake3DependencyTests(unittest.TestCase):
                     self.assertIn(f"set(VCPKG_CMAKE_SYSTEM_NAME {system})", text)
                     self.assertIn("set(VCPKG_LOAD_VCVARS_ENV ON)", text)
                     if backend == "uwp":
+                        self.assertIn("-DCMAKE_TRY_COMPILE_CONFIGURATION=Release", text)
                         self.assertIn("-DVCPKG_MSVC_CXX_WINRT_EXTENSIONS=OFF", text)
                         self.assertIn(
                             "-DCMAKE_TRY_COMPILE_PLATFORM_VARIABLES="
