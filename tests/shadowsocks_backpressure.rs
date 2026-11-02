@@ -178,9 +178,6 @@ async fn empty_writes_after_first_payload_emit_no_extra_encrypted_chunks() {
 
 #[tokio::test]
 async fn growing_caller_buffer_after_backpressure_never_loses_plaintext() {
-    #[cfg(feature = "interop-test")]
-    let _case =
-        vole::resources::case_events::Case::new("INTEGRATION-ADAPTER", "growing_caller_buffer");
     for (cipher, initial) in [
         ShadowsocksCipher::Aes128Gcm,
         ShadowsocksCipher::Aes256Gcm,
@@ -263,11 +260,6 @@ async fn growing_caller_buffer_after_backpressure_never_loses_plaintext() {
 
 #[tokio::test]
 async fn read_first_flushes_the_official_header_over_a_buffered_upstream() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "INTEGRATION-ADAPTER",
-        "server_first_buffered_upstream",
-    );
     for cipher in [
         ShadowsocksCipher::Aes128Gcm,
         ShadowsocksCipher::Aes256Gcm,

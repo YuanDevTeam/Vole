@@ -38,10 +38,6 @@ async fn grpc_unresponsive_peer_keeps_original_setup_deadline() {
         offset == wire.len()
     }
 
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "grpc_unresponsive_peer_keeps_original_setup_deadline",
-    );
     for first_operation in ["flush", "read"] {
         let probe = ResourceProbe::default();
         let (outcome, elapsed, deadline, stopped, joined) = probe
@@ -200,11 +196,6 @@ fn session() -> StreamSession {
 
 #[tokio::test]
 async fn http_camouflage_shutdown_releases_both_directions_without_waiting_for_peer_eof() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "http_camouflage_shutdown_releases_both_directions_without_waiting_for_peer_eof",
-    );
     tokio::time::timeout(Duration::from_secs(2), async {
         let (io, mut peer) = tokio::io::duplex(4096);
         let node = node(Box::new(io), serde_json::json!({"network":"http"}));
@@ -252,11 +243,6 @@ async fn http_camouflage_shutdown_releases_both_directions_without_waiting_for_p
 
 #[tokio::test]
 async fn grpc_server_first_flushes_vless_request_without_an_application_write() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "grpc_server_first_flushes_vless_request_without_an_application_write",
-    );
     let (io, peer) = tokio::io::duplex(4096);
     let node = node(
         Box::new(io),
@@ -335,10 +321,6 @@ async fn grpc_committed_vless_request_outlives_delayed_http_response() {
         }
     }
 
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "grpc_committed_vless_request_outlives_delayed_http_response",
-    );
     let probe = ResourceProbe::default();
     let (result, core_stopped, peer_joined) = probe
         .scope(async {
@@ -543,11 +525,6 @@ async fn grpc_committed_vless_request_outlives_delayed_http_response() {
 
 #[tokio::test]
 async fn http_upgrade_consumes_early_prefix_and_requires_valid_101_even_fast_open() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "http_upgrade_consumes_early_prefix_and_requires_valid_101_even_fast_open",
-    );
     use base64::Engine as _;
     for fast in [false, true] {
         for accept in [false, true] {
@@ -776,11 +753,6 @@ mod packetaddr_xhttp_memory {
 
     #[tokio::test(start_paused = true)]
     async fn packetaddr_xhttp_keeps_first_flush_and_drives_last_datagram_without_post_ack() {
-        #[cfg(feature = "interop-test")]
-        let _case = vole::resources::case_events::Case::new(
-            "VLESS-UNIT",
-            "packetaddr_xhttp_keeps_first_flush_and_drives_last_datagram_without_post_ack",
-        );
         let (io, raw_peer) = tokio::io::duplex(64 * 1024);
         let outbound = node(
             Box::new(io),

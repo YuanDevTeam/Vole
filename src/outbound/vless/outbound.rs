@@ -1207,11 +1207,6 @@ mod connector_composition_tests {
 
     #[test]
     fn all_two_hop_protocol_combinations_build_as_connector_graphs() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "VLESS-REGRESSION",
-            "all_two_hop_protocol_combinations_build_as_connector_graphs",
-        );
         let physical: Arc<dyn OutboundConnector> = Arc::new(NeverConnector);
         let vless_leaf: Arc<dyn OutboundConnector> = Arc::new(
             VlessOutbound::new_with_upstream(&vless_config("vless-leaf.example"), physical.clone())
@@ -1257,11 +1252,6 @@ mod connector_composition_tests {
 
     #[test]
     fn direct_download_constructor_reuses_or_requires_the_precise_prepared_endpoint() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "VLESS-REGRESSION",
-            "direct_download_constructor_reuses_or_requires_the_precise_prepared_endpoint",
-        );
         let same = split_vless_config("same.example", "same.example", 443);
         let outbound =
             VlessOutbound::new(&same, endpoint("same.example", 443), Dialer::default()).unwrap();
@@ -1303,11 +1293,6 @@ mod connector_composition_tests {
 
     #[test]
     fn split_node_over_a_proxy_automatically_reuses_its_parent_for_both_legs() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "VLESS-REGRESSION",
-            "split_node_over_a_proxy_automatically_reuses_its_parent_for_both_legs",
-        );
         let parent: Arc<dyn OutboundConnector> = Arc::new(NeverConnector);
         let config = split_vless_config("upload.example", "download.example", 8443);
         let outbound = VlessOutbound::new_with_upstream(&config, parent).unwrap();
@@ -1414,15 +1399,6 @@ mod active_h2_memory_tests {
 
     #[cfg(all(target_os = "linux", feature = "sing-mux"))]
     async fn run_private_split_h2_control_case(reality: bool) {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "XHTTP-UNIT",
-            if reality {
-                "private_split_h2_reality_control_fallback_and_dialer_stop_do_not_take_cached_sender"
-            } else {
-                "private_split_h2_control_fallback_and_dialer_stop_do_not_take_cached_sender"
-            },
-        );
         tokio::time::timeout(Duration::from_secs(5), async {
             let probe = crate::resources::observation::ResourceProbe::default();
             let result = probe.scope(async {
@@ -1504,15 +1480,6 @@ mod active_h2_memory_tests {
     }
 
     async fn run_private_split_h2_share_case(reality: bool) {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "XHTTP-UNIT",
-            if reality {
-                "private_split_h2_reality_qualification_shares_four_active_leases_and_stops_both_legs"
-            } else {
-                "private_split_h2_shares_four_active_leases_and_stops_both_legs"
-            },
-        );
         tokio::time::timeout(Duration::from_secs(8), async {
             // Explicit reuse is the existing control; omitted reuse is the new behavior.
             for explicit in [true, false] {
@@ -1602,15 +1569,6 @@ mod active_h2_memory_tests {
     }
 
     async fn run_private_split_h2_peer_credit_case(reality: bool) {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "XHTTP-UNIT",
-            if reality {
-                "private_split_h2_reality_peer_stream_credit_opens_new_download_physicals"
-            } else {
-                "private_split_h2_peer_stream_credit_opens_new_download_physicals"
-            },
-        );
         let probe = crate::resources::observation::ResourceProbe::default();
         let (business, before_stop, idle) = probe
             .scope(async {

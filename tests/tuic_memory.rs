@@ -16,10 +16,7 @@ use vole::{
         ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector, UpstreamPath,
         tuic::TuicOutbound,
     },
-    resources::{
-        case_events::Case,
-        observation::{ResourceKind, ResourceProbe},
-    },
+    resources::observation::{ResourceKind, ResourceProbe},
     session::{Datagram, DatagramSession, Destination, InboundKind, StreamSession},
 };
 #[path = "support/memory_quic.rs"]
@@ -192,7 +189,6 @@ async fn finish(endpoint: quinn::Endpoint, peer: tokio::task::JoinHandle<()>) {
 
 #[tokio::test]
 async fn authenticates_current_session_without_ack_and_preserves_stream_isolation() {
-    let _case = Case::new("TUIC-UNIT", "tcp_owner");
     for (algorithm, expected) in [
         ("cubic", TuicCongestion::Cubic),
         ("new_reno", TuicCongestion::NewReno),
@@ -264,7 +260,6 @@ async fn authenticates_current_session_without_ack_and_preserves_stream_isolatio
 
 #[tokio::test]
 async fn stream_credit_wait_keeps_original_deadline_and_leaves_sibling_alive() {
-    let _case = Case::new("TUIC-UNIT", "credit_deadline");
     let (outbound, endpoint) = fixture(1400, true, 1, "cubic");
     let ep = endpoint.clone();
     let peer = tokio::spawn(async move {
@@ -299,7 +294,6 @@ async fn stream_credit_wait_keeps_original_deadline_and_leaves_sibling_alive() {
 
 #[tokio::test]
 async fn insufficient_path_budget_and_missing_datagrams_never_fall_back() {
-    let _case = Case::new("TUIC-UNIT", "path_requirements");
     for (budget, datagrams) in [(1199, true), (1400, false)] {
         let (outbound, endpoint) = fixture(budget, datagrams, 8, "cubic");
         let ep = endpoint.clone();
@@ -332,7 +326,6 @@ async fn insufficient_path_budget_and_missing_datagrams_never_fall_back() {
 
 #[tokio::test]
 async fn stalled_quic_handshake_obeys_setup_deadline_and_stop_barrier() {
-    let _case = Case::new("TUIC-UNIT", "handshake_stop");
     for stop in [false, true] {
         // Do not accept the QUIC handshake. It can never reach TUIC auth.
         let (outbound, endpoint) = fixture(1400, true, 8, "cubic");
@@ -375,7 +368,6 @@ fn udp_wire_target(index: usize) -> (Destination, &'static [u8]) {
 
 #[tokio::test]
 async fn both_udp_modes_preserve_empty_and_u16_packets_and_dissociate() {
-    let _case = Case::new("TUIC-UNIT", "udp_wire");
     const SIZES: &[usize] = &[0, 1, 1400, 4096, 65535];
     for mode in ["native", "quic"] {
         let (outbound, endpoint) = fixture_mode(1400, true, 8, "cubic", mode);
@@ -509,7 +501,6 @@ async fn both_udp_modes_preserve_empty_and_u16_packets_and_dissociate() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn quic_declared_payload_peeks_only_ready_fin_and_never_waits_for_it() {
-    let _case = Case::new("TUIC-UNIT", "ready_fin_probe");
     let mut observed = Vec::new();
     for finish_before_send in [true, false] {
         let (outbound, endpoint) = fixture_mode(1400, true, 8, "cubic", "quic");
@@ -616,7 +607,6 @@ async fn quic_declared_payload_peeks_only_ready_fin_and_never_waits_for_it() {
 
 #[tokio::test]
 async fn unused_association_close_does_not_create_peer_state_or_control_tasks() {
-    let _case = Case::new("TUIC-UNIT", "unused_association");
     let (outbound, endpoint) = fixture(1400, true, 8, "cubic");
     let ep = endpoint.clone();
     let peer = tokio::spawn(async move {
@@ -679,7 +669,6 @@ fn udp_request() -> DatagramRequest {
 #[tokio::test]
 async fn native_source_stripes_hold_64_owners_reuse_source_and_stop_both_paths() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let _case = Case::new("TUIC-UNIT", "native_source_stripes");
     // 65 held business owners fit the old configured threshold and these
     // peer credits. RED must be actual path count, not blocked stream credit.
     let (config, first_path, first_ep) = fixture_parts(1400, true, 128, "cubic", "native");
@@ -816,7 +805,6 @@ async fn native_source_stripes_hold_64_owners_reuse_source_and_stop_both_paths()
 
 #[tokio::test]
 async fn association_id_exhaustion_retires_without_reuse_or_migrating_old_streams() {
-    let _case = Case::new("TUIC-UNIT", "session_retirement");
     let (config, first_path, first_ep) = fixture_parts(1400, true, 8, "cubic", "native");
     let (_, next_path, next_ep) = fixture_parts(1400, true, 8, "cubic", "native");
     let paths = Arc::new(Paths(Mutex::new(VecDeque::from([first_path, next_path]))));
@@ -923,7 +911,6 @@ async fn association_id_exhaustion_retires_without_reuse_or_migrating_old_stream
 
 #[tokio::test]
 async fn quic_partial_control_streams_have_a_credit_bound_and_expire_without_blocking_tcp() {
-    let _case = Case::new("TUIC-UNIT", "partial_control_expiry");
     let (mut config, udp_path, endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
     let (_, tcp_path, tcp_endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
     config.stream_window = vole::config::QuicReceiveWindow {
@@ -1048,7 +1035,6 @@ async fn quic_partial_control_streams_have_a_credit_bound_and_expire_without_blo
 
 #[tokio::test]
 async fn cancelled_uni_credit_wait_does_not_replay_or_close_sibling_tcp() {
-    let _case = Case::new("TUIC-UNIT", "udp_credit_cancel");
     let (mut config, udp_path, endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
     let (_, tcp_path, tcp_endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
     // Keep the original fixed windows, MTU policy and two unread uni credits.
@@ -1157,7 +1143,6 @@ async fn physical_protection_failure_stops_before_udp_or_tcp_fallback() {
             ))
         }
     }
-    let _case = Case::new("TUIC-UNIT", "protect_fail_closed");
     let (config, _, endpoint) = fixture_parts(1400, true, 8, "cubic", "native");
     let reject = Arc::new(Reject(AtomicUsize::new(0)));
     let path = UpstreamPath::direct(
@@ -1189,7 +1174,6 @@ async fn physical_protection_failure_stops_before_udp_or_tcp_fallback() {
 
 #[tokio::test]
 async fn heartbeat_and_full_delivery_queue_remain_owned_until_synchronous_stop() {
-    let _case = Case::new("TUIC-UNIT", "heartbeat_full_queue_stop");
     for mode in ["native", "quic"] {
         let (outbound, endpoint) = fixture_mode(1400, true, 8, "cubic", mode);
         let ep = endpoint.clone();
@@ -1268,7 +1252,6 @@ async fn heartbeat_and_full_delivery_queue_remain_owned_until_synchronous_stop()
 
 #[tokio::test]
 async fn receive_flow_control_bounds_unread_streams_and_connection_then_stop_releases_them() {
-    let _case = Case::new("TUIC-UNIT", "receive_windows");
     for streams in [1, 8] {
         let (outbound, endpoint) = fixture(1400, true, 8, "cubic");
         let ep = endpoint.clone();
@@ -1366,7 +1349,6 @@ async fn blocked_outer_path_bounds_stream_and_datagram_send_buffers_and_stop() {
             self.0.close().await
         }
     }
-    let _case = Case::new("TUIC-UNIT", "send_buffers");
     let (config, packets, endpoint) = fixture_parts(1400, true, 8, "cubic", "native");
     let blocked = Arc::new(AtomicBool::new(false));
     let outbound = TuicOutbound::new_with_path(
@@ -1445,7 +1427,6 @@ async fn blocked_outer_path_bounds_stream_and_datagram_send_buffers_and_stop() {
 
 #[tokio::test]
 async fn configured_ip_sni_millisecond_heartbeat_and_uot_v2_are_consumed() {
-    let _case = Case::new("TUIC-UNIT", "configured_uot");
     let (mut config, packets, endpoint) = fixture_parts(1400, true, 8, "cubic", "native");
     config.address = "logical.invalid".into();
     config.ip = Some("192.0.2.1".into());
@@ -1518,7 +1499,6 @@ async fn configured_ip_sni_millisecond_heartbeat_and_uot_v2_are_consumed() {
 
 #[tokio::test(start_paused = true)]
 async fn configured_mtu_discovery_changes_native_probes_and_path_mtu() {
-    let _case = Case::new("TUIC-UNIT", "native_mtu_discovery");
     for disabled in [false, true] {
         let (mut config, packets, endpoint) = fixture_parts(1400, true, 8, "cubic", "native");
         config.disable_mtu_discovery = disabled;
@@ -1590,7 +1570,6 @@ async fn configured_mtu_discovery_changes_native_probes_and_path_mtu() {
 
 #[tokio::test]
 async fn official_quinn_credit_is_bounded_and_replenished_independent_of_owner_threshold() {
-    let _case = Case::new("TUIC-UNIT", "official_quinn_credit");
     let (mut config, packets, endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
     config.max_open_streams = i64::MAX as usize - 1;
     let outbound = TuicOutbound::new_with_path(
@@ -1689,7 +1668,6 @@ async fn official_quinn_credit_is_bounded_and_replenished_independent_of_owner_t
 
 #[tokio::test]
 async fn official_quinn_receive_budget_is_independent_of_send_frame_limit() {
-    let _case = Case::new("TUIC-UNIT", "official_quinn_receive_budget");
     for receive_budget in [60, 64] {
         let (mut config, packets, endpoint) = fixture_parts(1400, true, 8, "cubic", "native");
         config.max_datagram_frame_size = 80;
@@ -1786,7 +1764,6 @@ async fn echo_lane_udp(connection: &quinn::Connection, native: bool, payload: &[
 
 #[tokio::test]
 async fn native_tcp_and_udp_keep_one_physical_session_and_stop() {
-    let _case = Case::new("TUIC-UNIT", "native_business_shared");
     let (config, path, endpoint) = fixture_parts(1400, true, 8, "cubic", "native");
     let paths = Arc::new(Paths(Mutex::new(VecDeque::from([path]))));
     let outbound =
@@ -1844,7 +1821,6 @@ async fn native_tcp_and_udp_keep_one_physical_session_and_stop() {
 
 #[tokio::test]
 async fn quic_business_lanes_retire_only_udp_while_tcp_is_held_and_stop_all() {
-    let _case = Case::new("TUIC-UNIT", "quic_business_lanes");
     let (mut config, tcp_path, tcp_endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
     let (_, udp_path, udp_endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
     let (_, fresh_path, fresh_endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");

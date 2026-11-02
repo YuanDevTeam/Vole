@@ -1,9 +1,8 @@
-//! Capture the public configuration's real TLS adapter over bounded memory IO.
+//! Verify the public configuration's real TLS adapter over bounded memory IO.
 //! The observer aborts before authentication; proxy interoperability is separate.
 #![cfg(all(feature = "tls-fingerprint", feature = "outbound-vless"))]
 
-use base64::{Engine, engine::general_purpose::STANDARD};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use vole::{
@@ -100,7 +99,7 @@ async fn capture(client: &SecurityClient) -> Vec<u8> {
 
 #[tokio::test]
 async fn selected_public_profiles_emit_bounded_client_hellos() {
-    let mut cases: Vec<Value> = Vec::new();
+    let mut cases = 0;
     for profile in ["chrome", "firefox", "safari", "ios"] {
         for context in [
             "tcp", "ws", "grpc", "reality", "vision", "xhttp-h1", "xhttp-h2",
@@ -110,15 +109,12 @@ async fn selected_public_profiles_emit_bounded_client_hellos() {
                 format!("{}.fingerprint.test", "f".repeat(63)),
             ] {
                 let client = configuration(profile, context, &sni);
-                for attempt in 0..2 {
-                    cases.push(json!({"profile": profile, "context": context, "sni": sni,
-                        "attempt": attempt, "records_b64": STANDARD.encode(capture(&client).await)}));
+                for _ in 0..2 {
+                    drop(capture(&client).await);
+                    cases += 1;
                 }
             }
         }
     }
-    assert_eq!(cases.len(), 112);
-    if let Ok(path) = std::env::var("VOLE_FINGERPRINT_CAPTURE") {
-        std::fs::write(path, serde_json::to_vec_pretty(&cases).unwrap()).unwrap();
-    }
+    assert_eq!(cases, 112);
 }

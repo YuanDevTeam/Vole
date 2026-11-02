@@ -18,11 +18,6 @@ fn parse(options: serde_json::Value, vision: bool) -> bool {
 
 #[test]
 fn sing_mux_accepts_three_protocols_and_rejects_invalid_or_ignored_options() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "sing_mux_accepts_three_protocols_and_rejects_invalid_or_ignored_options",
-    );
     for protocol in ["", "h2mux", "smux", "yamux"] {
         for enabled in [false, true] {
             assert!(parse(

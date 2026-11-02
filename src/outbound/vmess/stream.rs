@@ -626,11 +626,6 @@ mod tests {
 
     #[test]
     fn chunks_preserve_boundaries_masks_padding_and_authenticated_eof() {
-        #[cfg(feature = "interop-test")]
-        let _evidence = crate::resources::case_events::Case::new(
-            "VMESS-CODEC",
-            "chunks_preserve_boundaries_masks_padding_and_authenticated_eof",
-        );
         for cipher in [BodyCipher::Aes128Gcm, BodyCipher::Chacha20Poly1305] {
             for padding in [false, true] {
                 for length in [false, true] {
@@ -651,9 +646,6 @@ mod tests {
 
     #[test]
     fn tags_and_lengths_fail_closed() {
-        #[cfg(feature = "interop-test")]
-        let _evidence =
-            crate::resources::case_events::Case::new("VMESS-CODEC", "tags_and_lengths_fail_closed");
         for cipher in [BodyCipher::Aes128Gcm, BodyCipher::Chacha20Poly1305] {
             let mut tx = codec(cipher, false, true);
             let wire = tx.encode(b"synthetic-payload").unwrap();

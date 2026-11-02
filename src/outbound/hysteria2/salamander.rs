@@ -290,11 +290,6 @@ mod tests {
 
     #[test]
     fn salamander_matches_independent_blake2b256_vector_and_rejects_short_packets() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "salamander_matches_independent_blake2b256_vector_and_rejects_short_packets",
-        );
         // Python hashlib.blake2b(digest_size=32), password || salt; not a
         // truncated BLAKE2b-512 and not a keyed BLAKE2 MAC.
         let literal = "0001020304050607c4df23f89a88b3e3c7615199d4aaa6d88c9d92aa39a1914b372f674df11d4745e4ff03d8baa893c3";

@@ -4,11 +4,6 @@ use vole::config::Config;
 
 #[test]
 fn inline_client_identity_is_validated_and_redacted_before_io() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "inline_client_identity_is_validated_and_redacted_before_io",
-    );
     use base64::Engine as _;
     let pem = |kind: &str, der: &[u8]| {
         format!(
@@ -39,11 +34,6 @@ fn document(extra: Value) -> Vec<u8> {
 
 #[test]
 fn vision_requires_tcp_tls13_and_xudp_before_any_io() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "vision_requires_tcp_tls13_and_xudp_before_any_io",
-    );
     use vole::config::{ProxyProtocol, SecurityConfig};
     let config =
         Config::parse_yaml(&document(json!({"flow":"xtls-rprx-vision","tls":true}))).unwrap();
@@ -68,11 +58,6 @@ fn vision_requires_tcp_tls13_and_xudp_before_any_io() {
 
 #[test]
 fn default_tcp_and_supported_udp_encodings_are_accepted_without_io() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "default_tcp_and_supported_udp_encodings_are_accepted_without_io",
-    );
     let config = Config::parse_yaml(&document(json!({}))).expect("default plaintext TCP");
     assert!(!config.proxies[0].udp);
     assert!(!format!("{config:?}").contains("07070707"));
@@ -127,11 +112,6 @@ rules: ['MATCH,edge']
 
 #[test]
 fn tcp_and_existing_xhttp_reject_mismatched_and_future_options() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "tcp_and_existing_xhttp_reject_mismatched_and_future_options",
-    );
     for fields in [
         json!({"network":"tcp","xhttp-opts":{}}),
         json!({"network":"xhttp","tls":false,"fingerprint":"ab".repeat(32)}),
@@ -175,11 +155,6 @@ fn tcp_and_existing_xhttp_reject_mismatched_and_future_options() {
 
 #[test]
 fn stream_transports_and_explicit_tls_policy_have_strict_public_fields() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "stream_transports_and_explicit_tls_policy_have_strict_public_fields",
-    );
     for transport in [
         json!({"network":"ws","ws-opts":{"path":"/vless","headers":{"Host":"localhost:443"},"max-early-data":64}}),
         json!({"network":"grpc","grpc-opts":{"grpc-service-name":"vless"}}),
@@ -283,11 +258,6 @@ fn empty_network_and_servername_keep_transport_fallbacks_and_grpc_authority() {
 
 #[test]
 fn extended_ws_and_grpc_fields_are_scoped_and_bounded() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "extended_ws_and_grpc_fields_are_scoped_and_bounded",
-    );
     for fields in [
         json!({"network":"ws","ws-opts":{"v2ray-http-upgrade":true,"v2ray-http-upgrade-fast-open":true,"max-early-data":1}}),
         json!({"network":"grpc","grpc-opts":{"grpc-service-name":"test","grpc-user-agent":"probe","ping-interval":1,"max-connections":2,"min-streams":3}}),

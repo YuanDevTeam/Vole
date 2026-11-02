@@ -10,11 +10,6 @@ use vole::{
 
 #[tokio::test(start_paused = true)]
 async fn packet_up_coalesces_small_writes_and_flushes_without_more_caller_io() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "packet_up_coalesces_small_writes_and_flushes_without_more_caller_io",
-    );
     use std::{pin::Pin, task::Poll};
     use tokio::io::AsyncWrite;
     let client =
@@ -84,11 +79,6 @@ async fn packet_up_coalesces_small_writes_and_flushes_without_more_caller_io() {
 
 #[tokio::test(start_paused = true)]
 async fn packet_up_backpressures_bounded_batches_and_stop_cancels_the_timer() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "packet_up_backpressures_bounded_batches_and_stop_cancels_the_timer",
-    );
     use std::{pin::Pin, task::Poll};
     use tokio::io::AsyncWrite;
     let client =
@@ -132,11 +122,6 @@ async fn packet_up_backpressures_bounded_batches_and_stop_cancels_the_timer() {
 
 #[tokio::test]
 async fn first_vless_read_never_acknowledges_or_replays_a_concurrent_packet_write() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "first_vless_read_never_acknowledges_or_replays_a_concurrent_packet_write",
-    );
     use std::{pin::Pin, task::Poll};
     use tokio::io::AsyncWrite;
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -209,11 +194,6 @@ async fn first_vless_read_never_acknowledges_or_replays_a_concurrent_packet_writ
 
 #[tokio::test]
 async fn response_codes_follow_mihomo_streaming_and_packet_rules() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "response_codes_follow_mihomo_streaming_and_packet_rules",
-    );
     tokio::time::timeout(Duration::from_secs(3), async {
         for (mode, get_status, post_status, read_ok, write_ok) in [
             (XHttpMode::StreamOne, 200, 201, true, true),
@@ -314,11 +294,6 @@ async fn observe_stream_request(options: serde_json::Value) -> http::Request<()>
 
 #[tokio::test]
 async fn streaming_content_type_can_be_disabled_without_disabling_padding() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "streaming_content_type_can_be_disabled_without_disabling_padding",
-    );
     let request =
         observe_stream_request(serde_json::json!({"mode":"stream-one","no-grpc-header":true}))
             .await;
@@ -333,11 +308,6 @@ async fn streaming_content_type_can_be_disabled_without_disabling_padding() {
 
 #[tokio::test]
 async fn custom_semantic_headers_are_allowed_when_no_generated_field_overwrites_them() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "custom_semantic_headers_are_allowed_when_no_generated_field_overwrites_them",
-    );
     let request = observe_stream_request(serde_json::json!({
         "mode":"stream-one", "no-grpc-header":true,
         "headers":{"Content-Type":"application/octet-stream","Referer":"https://example.com/custom"},
@@ -352,11 +322,6 @@ async fn custom_semantic_headers_are_allowed_when_no_generated_field_overwrites_
 
 #[tokio::test]
 async fn padding_uses_the_configured_http_location_and_encoding() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "padding_uses_the_configured_http_location_and_encoding",
-    );
     for placement in ["queryInHeader", "header", "query", "cookie"] {
         for method in ["repeat-x", "tokenish"] {
             let mut options = serde_json::json!({"mode":"stream-one", "x-padding-obfs-mode":true,
@@ -478,11 +443,6 @@ async fn observe_packet(
 
 #[tokio::test]
 async fn packet_metadata_and_upload_methods_are_sent_in_each_supported_location() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "packet_metadata_and_upload_methods_are_sent_in_each_supported_location",
-    );
     for (placement, method) in [
         ("path", "POST"),
         ("query", "PUT"),
@@ -541,11 +501,6 @@ async fn packet_metadata_and_upload_methods_are_sent_in_each_supported_location(
 
 #[tokio::test]
 async fn packet_upload_can_move_payload_into_bounded_header_or_cookie_chunks() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "packet_upload_can_move_payload_into_bounded_header_or_cookie_chunks",
-    );
     use base64::Engine as _;
     for placement in ["body", "auto", "header", "cookie"] {
         let mut options = serde_json::json!({"mode":"packet-up","uplink-data-placement":placement,
@@ -601,11 +556,6 @@ async fn packet_upload_can_move_payload_into_bounded_header_or_cookie_chunks() {
 
 #[tokio::test]
 async fn http1_stream_one_is_chunked_duplex_and_shutdown_closes_both_directions() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "http1_stream_one_is_chunked_duplex_and_shutdown_closes_both_directions",
-    );
     tokio::time::timeout(Duration::from_secs(2), async {
         let (io, mut peer) = tokio::io::duplex(4096);
         let peer = tokio::spawn(async move {
@@ -657,11 +607,6 @@ async fn http1_stream_one_is_chunked_duplex_and_shutdown_closes_both_directions(
 
 #[tokio::test]
 async fn http1_packet_up_shares_a_session_across_two_connections() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "http1_packet_up_shares_a_session_across_two_connections",
-    );
     tokio::time::timeout(Duration::from_secs(2), async {
         async fn head(peer: &mut tokio::io::DuplexStream) -> String {
             let mut head = Vec::new();
@@ -752,11 +697,6 @@ async fn http1_packet_up_shares_a_session_across_two_connections() {
 
 #[tokio::test]
 async fn http1_response_body_can_arrive_after_the_response_headers() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "http1_response_body_can_arrive_after_the_response_headers",
-    );
     tokio::time::timeout(Duration::from_secs(2), async {
         let (io, mut peer) = tokio::io::duplex(4096);
         let peer = tokio::spawn(async move {
@@ -790,11 +730,6 @@ async fn http1_response_body_can_arrive_after_the_response_headers() {
 
 #[tokio::test]
 async fn custom_request_headers_reach_the_http_peer_without_changing_body() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "custom_request_headers_reach_the_http_peer_without_changing_body",
-    );
     tokio::time::timeout(Duration::from_secs(2), async {
         let document = serde_json::json!({"mixed-port":1080,"proxies":[{
             "name":"edge","type":"vless","server":"example.com","port":443,

@@ -12,11 +12,6 @@ fn document(extra: Value) -> Vec<u8> {
 
 #[test]
 fn vmess_default_node_and_explicit_cipher_aliases_are_accepted_without_io() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CFG",
-        "vmess_default_node_and_explicit_cipher_aliases_are_accepted_without_io",
-    );
     let parsed = Config::parse_yaml(&document(json!({}))).expect("VMess default node");
     assert_eq!(
         parsed.proxies[0].server_endpoint(),
@@ -33,11 +28,6 @@ fn vmess_default_node_and_explicit_cipher_aliases_are_accepted_without_io() {
 
 #[test]
 fn vmess_transport_and_security_combinations_are_strict() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CFG",
-        "vmess_transport_and_security_combinations_are_strict",
-    );
     for tls in [false, true] {
         for (network, options) in [
             ("tcp", json!({})),
@@ -122,11 +112,6 @@ fn vmess_transport_and_security_combinations_are_strict() {
 
 #[tokio::test]
 async fn vmess_field_boundaries_and_normalized_transport_values() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CFG",
-        "vmess_field_boundaries_and_normalized_transport_values",
-    );
     use vole::config::{ProxyProtocol, VmessTransport};
     for fields in [
         json!({"server":""}),
@@ -227,11 +212,6 @@ async fn vmess_field_boundaries_and_normalized_transport_values() {
 
 #[tokio::test]
 async fn vmess_normalized_websocket_fields_preserve_headers_and_early_data_order() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CFG",
-        "vmess_normalized_websocket_fields_preserve_headers_and_early_data_order",
-    );
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;

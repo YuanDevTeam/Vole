@@ -12,11 +12,6 @@ use vole::{
 
 #[tokio::test]
 async fn quic_minimum_budget_is_checked_before_io_and_exact_minimum_connects() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-QUIC",
-        "quic_minimum_budget_is_checked_before_io_and_exact_minimum_connects",
-    );
     use std::sync::Arc;
     tokio::time::timeout(Duration::from_secs(10), async {
         let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -128,11 +123,6 @@ impl vole::dispatch::DatagramTransport for PendingSend {
 
 #[tokio::test]
 async fn pending_send_is_not_restarted_and_stop_cancels_without_waiting_for_writable() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-QUIC",
-        "pending_send_is_not_restarted_and_stop_cancels_without_waiting_for_writable",
-    );
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -180,11 +170,6 @@ async fn pending_send_is_not_restarted_and_stop_cancels_without_waiting_for_writ
 
 #[tokio::test]
 async fn controlled_quic_datagram_seam_roundtrips_and_stop_closes_owned_io() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-QUIC",
-        "controlled_quic_datagram_seam_roundtrips_and_stop_closes_owned_io",
-    );
     tokio::time::timeout(Duration::from_secs(3), async {
         let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let address = peer.local_addr().unwrap();
@@ -241,11 +226,6 @@ async fn controlled_quic_datagram_seam_roundtrips_and_stop_closes_owned_io() {
 }
 #[tokio::test]
 async fn mapped_peer_sends_to_one_physical_port_and_reports_the_logical_peer() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-QUIC",
-        "mapped_peer_sends_to_one_physical_port_and_reports_the_logical_peer",
-    );
     tokio::time::timeout(Duration::from_secs(5), async {
         let logical = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let physical = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -301,11 +281,6 @@ async fn mapped_peer_sends_to_one_physical_port_and_reports_the_logical_peer() {
 
 #[tokio::test]
 async fn incoming_queue_backpressures_without_discarding_a_controlled_burst() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-QUIC",
-        "incoming_queue_backpressures_without_discarding_a_controlled_burst",
-    );
     tokio::time::timeout(Duration::from_secs(5), async {
         let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer = echo.local_addr().unwrap();
@@ -355,11 +330,6 @@ async fn incoming_queue_backpressures_without_discarding_a_controlled_burst() {
 
 #[tokio::test]
 async fn controlled_direct_datagrams_roundtrip_and_stop() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-QUIC",
-        "controlled_direct_datagrams_roundtrip_and_stop",
-    );
     tokio::time::timeout(Duration::from_secs(5), async {
         let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer = echo.local_addr().unwrap();

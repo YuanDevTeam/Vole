@@ -2,11 +2,6 @@ use vole::config::Config;
 
 #[test]
 fn hysteria2_configuration_follows_its_protocol_feature() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "HYSTERIA2-CFG",
-        "hysteria2_configuration_follows_its_protocol_feature",
-    );
     let yaml = b"mixed-port: 1080\nproxies: [{name: edge, type: hysteria2, server: localhost, port: 443}]\nrules: ['MATCH,edge']\n";
     let result = Config::parse_yaml(yaml);
     assert_eq!(result.is_ok(), cfg!(feature = "outbound-hysteria2"));
@@ -22,11 +17,6 @@ fn hysteria2_configuration_follows_its_protocol_feature() {
 #[cfg(feature = "outbound-hysteria2")]
 #[test]
 fn hysteria2_accepts_the_approved_tls_bandwidth_obfs_and_hopping_configuration() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "HYSTERIA2-CFG",
-        "hysteria2_accepts_the_approved_tls_bandwidth_obfs_and_hopping_configuration",
-    );
     let yaml = b"mixed-port: 1080\nproxies:\n  - name: edge\n    type: hysteria2\n    server: localhost\n    ports: 443,8443-8445,8443\n    password: ' credential '\n    udp: true\n    up: 2 Mbps\n    down: 125 KBps\n    udp-mtu: 1200\n    hop-interval: 5-7\n    obfs: salamander\n    obfs-password: ' independent secret '\n    sni: tls.example.com\n    alpn: [custom-h3]\n    skip-cert-verify: true\n    dialer-proxy: upstream\nproxy-groups: [{name: upstream, type: select, proxies: [DIRECT, REJECT]}]\nrules: ['MATCH,edge']\n";
     let config = Config::parse_yaml(yaml).expect("approved Hysteria2 fields");
     assert_eq!(
@@ -42,11 +32,6 @@ fn hysteria2_accepts_the_approved_tls_bandwidth_obfs_and_hopping_configuration()
 #[cfg(feature = "outbound-hysteria2")]
 #[test]
 fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "HYSTERIA2-CFG",
-        "hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed",
-    );
     use serde_json::{Value, json};
     use vole::config::ProxyProtocol;
     let base = json!({"name":"edge", "type":"hysteria2", "server":"localhost", "port":443});

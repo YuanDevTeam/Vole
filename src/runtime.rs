@@ -2302,7 +2302,6 @@ mod tests {
             ),
         ];
         for (protocol, fields, enabled) in variants {
-            let _case = crate::resources::case_events::Case::new("INTEGRATION-FEATURE", protocol);
             let yaml = format!(
                 "mixed-port: 1080\nproxies:\n  - {{name: peer, type: {protocol}, server: 127.0.0.1, port: 443{fields}}}\nrules: ['MATCH,peer']\n"
             );

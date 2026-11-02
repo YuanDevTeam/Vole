@@ -129,10 +129,6 @@ mod tests {
 
     #[test]
     fn measurement_rejects_oversized_documents() {
-        let _case = crate::resources::case_events::Case::new(
-            "FOUNDATIONS-SCHEMA",
-            "measurement_rejects_oversized_documents",
-        );
         assert!(
             super::MeasureConfig::parse_yaml(&vec![b'x'; super::super::MAX_CONFIG_BYTES + 1])
                 .is_err()

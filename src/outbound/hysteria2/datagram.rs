@@ -483,11 +483,6 @@ mod tests {
 
     #[test]
     fn udp_wire_round_trips_at_budget_and_bounds_malformed_fragments() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "udp_wire_round_trips_at_budget_and_bounds_malformed_fragments",
-        );
         let peer = Destination::domain("x", 1).unwrap();
         let literal = Bytes::from_static(b"\0\0\0\x01\0\x02\0\x01\x03x:1payload");
         assert_eq!(
@@ -530,11 +525,6 @@ mod tests {
 
     #[test]
     fn udp_missing_fragments_cannot_block_fresh_complete_packets_until_expiry() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "udp_missing_fragments_cannot_block_fresh_complete_packets_until_expiry",
-        );
         let now = Instant::now();
         let peer = Destination::domain("x", 1).unwrap();
         let mut state = Reassembly::default();
@@ -581,11 +571,6 @@ mod tests {
 
     #[test]
     fn udp_reassembly_isolates_sources_duplicates_counts_bytes_and_expiry() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "udp_reassembly_isolates_sources_duplicates_counts_bytes_and_expiry",
-        );
         let now = Instant::now();
         let peer = Destination::domain("x", 1).unwrap();
         let frames = encode(1, 2, &peer, &[5; 100], 64).unwrap();

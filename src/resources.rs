@@ -1,5 +1,3 @@
-#[cfg(any(test, feature = "interop-test"))]
-pub mod case_events;
 pub mod observation;
 
 use std::sync::{

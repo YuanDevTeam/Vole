@@ -1166,11 +1166,6 @@ mod tests {
     #[cfg(feature = "outbound-hysteria2")]
     #[tokio::test]
     async fn authenticated_continuation_keeps_group_choice_but_has_a_new_io_deadline() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "authenticated_continuation_keeps_group_choice_but_has_a_new_io_deadline",
-        );
         let selection = Arc::new(GroupSelection::new(0));
         let path = selected_path(
             selection.clone(),

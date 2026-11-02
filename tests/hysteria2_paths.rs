@@ -52,11 +52,6 @@ impl DatagramTransport for Packets {
 
 #[tokio::test]
 async fn controlled_path_maps_only_its_authorized_source_and_stops_without_replay() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "HYSTERIA2-UNIT",
-        "controlled_path_maps_only_its_authorized_source_and_stops_without_replay",
-    );
     let logical = "192.0.2.1:443".parse().unwrap();
     let physical = "192.0.2.1:8443".parse().unwrap();
     let packet = |remote, payload| Datagram {

@@ -35,8 +35,6 @@ fn options(protocol: &str, value: Value) -> WebSocketOptions {
 
 #[test]
 fn httpupgrade_rejects_ambiguous_modes_and_early_data_before_io() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("HTTPUPGRADE-UNIT", "config_bounds");
     for &protocol in PROTOCOLS {
         for fast in [false, true] {
             for early in [0, 1, 2048] {
@@ -89,8 +87,6 @@ fn httpupgrade_rejects_ambiguous_modes_and_early_data_before_io() {
 
 #[tokio::test]
 async fn httpupgrade_configuration_selects_raw_upgrade_and_commits_prefix_once() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("HTTPUPGRADE-UNIT", "config_dispatch");
     for &protocol in PROTOCOLS {
         for fast in [false, true] {
             let options = options(

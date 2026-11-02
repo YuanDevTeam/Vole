@@ -1461,11 +1461,6 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_smux_headers_close_the_owned_driver_before_reading_a_body() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "XHTTP-UNIT",
-            "malformed_smux_headers_close_the_owned_driver_before_reading_a_body",
-        );
         for (version, command, length) in [(2, 2, 0), (1, 0, 0), (1, 4, 0), (1, 1, 1), (1, 3, 1)] {
             tokio::time::timeout(Duration::from_secs(1), async {
                 let (raw, mut peer) = tokio::io::duplex(64);

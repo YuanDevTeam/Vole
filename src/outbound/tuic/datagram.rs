@@ -672,7 +672,6 @@ mod tests {
 
     #[test]
     fn reassembly_releases_completed_ids_and_orders_duplicates_without_cross_packet_mix() {
-        let _case = crate::resources::case_events::Case::new("TUIC-UNIT", "reassembly_order");
         let mut r = Reassembly::default();
         let now = Instant::now();
         for id in [65535, 0, 65535] {
@@ -699,8 +698,6 @@ mod tests {
     }
     #[test]
     fn fresh_packet_progresses_when_old_partial_slots_are_full() {
-        let _case =
-            crate::resources::case_events::Case::new("TUIC-UNIT", "reassembly_fresh_progress");
         let now = Instant::now();
         let mut r = Reassembly::default();
         for id in 0..crate::limits::TUIC_PENDING_PACKETS {
@@ -737,7 +734,6 @@ mod tests {
     }
     #[test]
     fn partial_packets_expire_and_both_resource_bounds_are_per_association() {
-        let _case = crate::resources::case_events::Case::new("TUIC-UNIT", "reassembly_limits");
         let now = Instant::now();
         let mut r = Reassembly::default();
         for id in 0..65 {
@@ -820,7 +816,6 @@ mod tests {
     }
     #[test]
     fn unknown_associations_do_not_allocate_and_full_queues_drop_complete_packets() {
-        let _case = crate::resources::case_events::Case::new("TUIC-UNIT", "delivery_limits");
         let probe = observation::ResourceProbe::default();
         probe.scope_sync(|| {
             let registry = Registry::new(TuicUdpMode::Native);

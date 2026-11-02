@@ -670,11 +670,6 @@ mod tests {
 
     #[tokio::test]
     async fn shared_xudp_receives_frames_without_a_vless_response_header() {
-        #[cfg(any(test, feature = "interop-test"))]
-        let mut _case = crate::resources::case_events::Case::new(
-            "FOUNDATIONS-XUDP",
-            "shared_xudp_receives_frames_without_a_vless_response_header",
-        );
         let (client, mut peer) = tokio::io::duplex(64);
         peer.write_all(&[
             0, 12, 0, 0, 2, 1, 2, 0, 53, 1, 1, 2, 3, 4, 0, 3, b'a', b'b', b'c',
@@ -745,11 +740,6 @@ mod tests {
 
     #[test]
     fn first_frame_matches_xray_mux_wire_format() {
-        #[cfg(any(test, feature = "interop-test"))]
-        let mut _case = crate::resources::case_events::Case::new(
-            "FOUNDATIONS-XUDP",
-            "first_frame_matches_xray_mux_wire_format",
-        );
         let datagram = Datagram {
             remote: "1.2.3.4:53".parse::<std::net::SocketAddr>().unwrap().into(),
             payload: Bytes::from_static(b"abc"),
@@ -771,11 +761,6 @@ mod tests {
 
     #[test]
     fn followup_frame_carries_each_datagrams_destination() {
-        #[cfg(any(test, feature = "interop-test"))]
-        let mut _case = crate::resources::case_events::Case::new(
-            "FOUNDATIONS-XUDP",
-            "followup_frame_carries_each_datagrams_destination",
-        );
         let cases: [(Destination, &[u8]); 2] = [
             (
                 Destination::domain("dns.example", 53).unwrap(),
@@ -849,11 +834,6 @@ mod tests {
 
     #[test]
     fn destination_codec_round_trips_all_address_families() {
-        #[cfg(any(test, feature = "interop-test"))]
-        let mut _case = crate::resources::case_events::Case::new(
-            "FOUNDATIONS-XUDP",
-            "destination_codec_round_trips_all_address_families",
-        );
         for destination in [
             Destination::from("192.0.2.1:80".parse::<std::net::SocketAddr>().unwrap()),
             Destination::from("[2001:db8::1]:443".parse::<std::net::SocketAddr>().unwrap()),
@@ -869,11 +849,6 @@ mod tests {
 
     #[tokio::test]
     async fn normal_and_error_end_frames_are_distinguishable() {
-        #[cfg(any(test, feature = "interop-test"))]
-        let mut _case = crate::resources::case_events::Case::new(
-            "FOUNDATIONS-XUDP",
-            "normal_and_error_end_frames_are_distinguishable",
-        );
         let normal = receive_frame_error(&[0, 4, 0, 0, STATUS_END, 0]).await;
         let failed = receive_frame_error(&[0, 4, 0, 0, STATUS_END, OPTION_ERROR]).await;
 
@@ -891,11 +866,6 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_response_is_rejected_before_payload_read() {
-        #[cfg(any(test, feature = "interop-test"))]
-        let mut _case = crate::resources::case_events::Case::new(
-            "FOUNDATIONS-XUDP",
-            "oversized_response_is_rejected_before_payload_read",
-        );
         let (client, mut server) = tokio::io::duplex(64);
         server
             .write_all(&response_data_prefix(u16::MAX))
@@ -931,11 +901,6 @@ mod tests {
 
     #[tokio::test]
     async fn fragmented_receive_survives_cancellation_and_resumes() {
-        #[cfg(any(test, feature = "interop-test"))]
-        let mut _case = crate::resources::case_events::Case::new(
-            "FOUNDATIONS-XUDP",
-            "fragmented_receive_survives_cancellation_and_resumes",
-        );
         let (client, mut server) = tokio::io::duplex(64);
         let mut frame = response_data_prefix(3);
         frame.extend_from_slice(b"abc");
@@ -1028,11 +993,6 @@ mod tests {
 
     #[tokio::test]
     async fn keepalive_data_is_consumed_without_becoming_an_udp_response() {
-        #[cfg(any(test, feature = "interop-test"))]
-        let mut _case = crate::resources::case_events::Case::new(
-            "FOUNDATIONS-XUDP",
-            "keepalive_data_is_consumed_without_becoming_an_udp_response",
-        );
         let (client, mut server) = tokio::io::duplex(128);
         let mut wire = vec![
             0,
@@ -1059,11 +1019,6 @@ mod tests {
 
     #[tokio::test]
     async fn full_wire_payload_remains_available_to_proxy_inbounds() {
-        #[cfg(any(test, feature = "interop-test"))]
-        let mut _case = crate::resources::case_events::Case::new(
-            "FOUNDATIONS-XUDP",
-            "full_wire_payload_remains_available_to_proxy_inbounds",
-        );
         let (client, mut server) = tokio::io::duplex(66_000);
         let mut frame = response_data_prefix(u16::MAX);
         frame.resize(frame.len() + usize::from(u16::MAX), 0x5a);

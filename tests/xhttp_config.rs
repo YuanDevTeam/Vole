@@ -52,11 +52,6 @@ fn xhttp_authorities_reject_userinfo_on_both_legs_without_echoing_it() {
 
 #[test]
 fn xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io",
-    );
     let fields = [
         "host",
         "path",
@@ -342,11 +337,6 @@ fn xhttp_empty_request_and_pool_fields_restore_their_defaults() {
 
 #[test]
 fn empty_http_authority_falls_back_to_each_legs_authentication_name() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "empty_http_authority_falls_back_to_each_legs_authentication_name",
-    );
     for (host, down_host, up, down) in [
         ("", None, "example.com", "download.example.com"),
         (
@@ -378,11 +368,6 @@ fn empty_http_authority_falls_back_to_each_legs_authentication_name() {
 
 #[test]
 fn download_security_changes_do_not_silently_discard_inherited_certificate_policy() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "download_security_changes_do_not_silently_discard_inherited_certificate_policy",
-    );
     for download in [
         json!({"tls":false}),
         json!({"reality-opts":{"public-key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}),
@@ -409,11 +394,6 @@ fn download_security_changes_do_not_silently_discard_inherited_certificate_polic
 
 #[test]
 fn h3_requires_exclusive_alpn_and_standard_tls_on_each_leg() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "h3_requires_exclusive_alpn_and_standard_tls_on_each_leg",
-    );
     let mut value: Value =
         serde_json::from_slice(&document(json!({"download-settings":{"alpn":["h3"]}}))).unwrap();
     value["proxies"][0]["alpn"] = json!(["h3"]);
@@ -445,11 +425,6 @@ fn h3_requires_exclusive_alpn_and_standard_tls_on_each_leg() {
 
 #[test]
 fn custom_headers_inherit_replace_clear_and_do_not_leak_values() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "custom_headers_inherit_replace_clear_and_do_not_leak_values",
-    );
     for (download, expected) in [
         (json!({}), Some("private-upload-value")),
         (
@@ -487,11 +462,6 @@ fn custom_headers_inherit_replace_clear_and_do_not_leak_values() {
 
 #[test]
 fn conflicting_request_fields_are_rejected_on_both_legs_before_io() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "conflicting_request_fields_are_rejected_on_both_legs_before_io",
-    );
     for options in [
         json!({"session-placement":"header","download-settings":{"headers":{"x-session":"override"}}}),
         json!({"x-padding-obfs-mode":true,"x-padding-placement":"header","x-padding-header":"X-Pad","download-settings":{"headers":{"x-pad":"override"}}}),
@@ -510,11 +480,6 @@ fn conflicting_request_fields_are_rejected_on_both_legs_before_io() {
 
 #[test]
 fn http_version_selects_h1_only_for_its_single_alpn_and_supports_plaintext() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "http_version_selects_h1_only_for_its_single_alpn_and_supports_plaintext",
-    );
     use vole::config::{SecurityConfig, XHttpVersion};
     for tls in [true, false] {
         for (alpn, version) in [
@@ -551,11 +516,6 @@ fn http_version_selects_h1_only_for_its_single_alpn_and_supports_plaintext() {
 
 #[test]
 fn download_certificate_policy_inherits_and_explicit_false_or_empty_clears() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "download_certificate_policy_inherits_and_explicit_false_or_empty_clears",
-    );
     use vole::config::SecurityConfig;
     for clear in [false, true] {
         let download = if clear {
@@ -599,11 +559,6 @@ fn download_certificate_policy_inherits_and_explicit_false_or_empty_clears() {
 
 #[test]
 fn download_mtls_identity_is_inherited_or_replaced_and_cleared_as_a_pair() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "download_mtls_identity_is_inherited_or_replaced_and_cleared_as_a_pair",
-    );
     use base64::Engine as _;
     use vole::config::SecurityConfig;
     let identity = |name: &str| {
@@ -659,11 +614,6 @@ fn download_mtls_identity_is_inherited_or_replaced_and_cleared_as_a_pair() {
 
 #[test]
 fn download_reality_object_replaces_inherits_or_clears_without_merging_keys() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "download_reality_object_replaces_inherits_or_clears_without_merging_keys",
-    );
     use base64::Engine as _;
     use vole::config::SecurityConfig;
     let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7; 32]);
@@ -712,11 +662,6 @@ fn download_reality_object_replaces_inherits_or_clears_without_merging_keys() {
 
 #[test]
 fn reuse_object_presence_and_download_whole_object_replacement_are_preserved() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "reuse_object_presence_and_download_whole_object_replacement_are_preserved",
-    );
     for (options, upload, down) in [
         (json!({"download-settings":{}}), false, false),
         (

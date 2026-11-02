@@ -114,9 +114,6 @@ fn plain_native_tcp_udp_do_not_wait_for_the_blocking_worker() {
         assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
         (tcp_ready, udp_ready)
     }));
-    println!(
-        "native FD first-poll progress: TCP={tcp_ready}, UDP={udp_ready}; all sockets and jobs closed"
-    );
     assert!(
         tcp_ready && udp_ready,
         "plain native socket setup waited for an unrelated blocking worker"

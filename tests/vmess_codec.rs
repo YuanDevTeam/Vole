@@ -9,11 +9,6 @@ use vole::{
 
 #[tokio::test]
 async fn xudp_explicit_close_after_cancel_and_bad_frame_release_io() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CODEC",
-        "xudp_explicit_close_after_cancel_and_bad_frame_release_io",
-    );
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use vole::{dispatch::DatagramTransport, session::Datagram, xudp::XudpTransport};
     let (io, mut peer) = tokio::io::duplex(1);
@@ -111,11 +106,6 @@ async fn xudp_explicit_close_after_cancel_and_bad_frame_release_io() {
 
 #[tokio::test]
 async fn xudp_zero_global_id_omits_the_optional_extension_like_mihomo() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CODEC",
-        "xudp_zero_global_id_omits_the_optional_extension_like_mihomo",
-    );
     use tokio::io::AsyncReadExt;
     use vole::{dispatch::DatagramTransport, session::Datagram, xudp::XudpTransport};
     let (io, mut peer) = tokio::io::duplex(128);
@@ -135,11 +125,6 @@ async fn xudp_zero_global_id_omits_the_optional_extension_like_mihomo() {
 
 #[test]
 fn packetaddr_has_ip_only_address_first_wire_and_rejects_truncation() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CODEC",
-        "packetaddr_has_ip_only_address_first_wire_and_rejects_truncation",
-    );
     use vole::outbound::address::{decode_packet_addr, encode_packet_addr};
     let peer = Destination::Ip("1.2.3.4:53".parse().unwrap());
     let mut wire = bytes::BytesMut::new();
@@ -170,11 +155,6 @@ fn packetaddr_has_ip_only_address_first_wire_and_rejects_truncation() {
 
 #[test]
 fn vmess_aead_requests_are_fresh_bounded_and_redacted() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CODEC",
-        "vmess_aead_requests_are_fresh_bounded_and_redacted",
-    );
     let identity = VmessIdentity::new(uuid::Uuid::from_bytes([7; 16]));
     let target = Destination::domain("fixture.invalid", 443).unwrap();
     let options = BodyOptions::new(BodyCipher::None, false, false).unwrap();
@@ -191,11 +171,6 @@ fn vmess_aead_requests_are_fresh_bounded_and_redacted() {
 
 #[tokio::test]
 async fn vmess_response_authentication_cannot_be_skipped_by_none_cipher() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CODEC",
-        "vmess_response_authentication_cannot_be_skipped_by_none_cipher",
-    );
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let identity = VmessIdentity::new(uuid::Uuid::from_bytes([7; 16]));
     let target = Destination::domain("fixture.invalid", 443).unwrap();
@@ -219,11 +194,6 @@ async fn vmess_response_authentication_cannot_be_skipped_by_none_cipher() {
 
 #[tokio::test]
 async fn vmess_whole_close_wakes_reader_and_releases_io_before_response() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CODEC",
-        "vmess_whole_close_wakes_reader_and_releases_io_before_response",
-    );
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let handshake = ClientHandshake::new(
         &VmessIdentity::new(uuid::Uuid::from_bytes([7; 16])),
@@ -253,11 +223,6 @@ async fn vmess_whole_close_wakes_reader_and_releases_io_before_response() {
 }
 #[tokio::test]
 async fn xudp_explicit_budget_rejects_max_plus_one_before_writing() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CODEC",
-        "xudp_explicit_budget_rejects_max_plus_one_before_writing",
-    );
     use vole::{
         dispatch::{DatagramBudget, DatagramTransport},
         session::Datagram,

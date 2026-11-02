@@ -303,11 +303,6 @@ pub(super) fn negotiate(up: u64, server: &[u8]) -> io::Result<u64> {
 mod tests {
     #[tokio::test(start_paused = true)]
     async fn sibling_connections_share_one_wire_credit_bucket() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "sibling_connections_share_one_wire_credit_bucket",
-        );
         let pacer = std::sync::Arc::new(super::Pacer::default());
         let first = super::Bandwidth::with_pacer(pacer.clone());
         let second = super::Bandwidth::with_pacer(pacer.clone());
@@ -329,11 +324,6 @@ mod tests {
 
     #[test]
     fn pacer_limits_actual_bytes_after_one_bounded_burst() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "pacer_limits_actual_bytes_after_one_bounded_burst",
-        );
         use std::time::{Duration, Instant};
         let now = Instant::now();
         let mut bucket = super::Bucket::default();
@@ -355,11 +345,6 @@ mod tests {
     }
     #[test]
     fn bandwidth_negotiation_obeys_auto_and_the_lower_positive_limit() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "bandwidth_negotiation_obeys_auto_and_the_lower_positive_limit",
-        );
         for (up, response, expected) in [
             (0, "0", 0),
             (0, "100000", 0),

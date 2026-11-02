@@ -16,8 +16,6 @@ fn parse(node: Value) -> vole::Result<Config> {
 
 #[test]
 fn ss_uot_is_opt_in_and_accepts_only_explicit_or_default_v2() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("UOT-CFG", "strict_v2");
     if !cfg!(feature = "outbound-shadowsocks") {
         let mut n = node();
         n["udp-over-tcp"] = json!(true);

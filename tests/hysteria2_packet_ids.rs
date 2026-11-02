@@ -113,11 +113,6 @@ fn memory_fixture() -> (MemoryPackets, quinn::Endpoint, mpsc::Sender<Bytes>) {
 
 #[tokio::test]
 async fn completed_fragment_id_can_be_reused_without_losing_the_next_datagram() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "INTEGRATION-ADAPTER",
-        "hysteria2_fragment_id_reuse",
-    );
     let client_address = "192.0.2.2:1234".parse().unwrap();
     let (client_io, endpoint, _) = memory_fixture();
     let queued_packets = Arc::new(AtomicUsize::new(0));
@@ -501,11 +496,6 @@ async fn authenticated_sessions_preserve_source_budget_and_join_together() {
         outbound::ConnectedStream,
         session::StreamSession,
     };
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "INTEGRATION-ADAPTER",
-        "hysteria2_authenticated_session_pool",
-    );
     struct Links(Mutex<VecDeque<MemoryPackets>>);
     #[async_trait::async_trait]
     impl OutboundConnector for Links {

@@ -61,11 +61,6 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_wire_matches_the_protocol_and_preserves_server_first_bytes() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "tcp_wire_matches_the_protocol_and_preserves_server_first_bytes",
-        );
         let destination = Destination::domain("x", 1).unwrap();
         assert_eq!(tcp_request(&destination).unwrap(), b"\x44\x01\x03x:1\x00");
         let mut response = &b"\0\x02ok\x03padserver-first"[..];

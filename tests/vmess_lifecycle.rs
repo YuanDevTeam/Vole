@@ -41,11 +41,6 @@ impl OutboundConnector for SuppliedStream {
 
 #[tokio::test]
 async fn vmess_all_handshakes_keep_the_original_deadline_and_join_cancelled_io() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CANCEL",
-        "vmess_all_handshakes_keep_the_original_deadline_and_join_cancelled_io",
-    );
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // Plain TCP has already submitted its request before business IO;
     // a delayed VMess response is not an unfinished transport handshake.
@@ -133,11 +128,6 @@ impl SocketProtector for RejectProtect {
 
 #[tokio::test]
 async fn vmess_expired_deadline_and_protect_failure_never_fall_back() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CANCEL",
-        "vmess_expired_deadline_and_protect_failure_never_fall_back",
-    );
     let parsed = Config::parse_yaml(b"mixed-port: 1080\nproxies: [{name: edge, type: vmess, server: 192.0.2.1, port: 443, uuid: 07070707-0707-0707-0707-070707070707}]\nrules: ['MATCH,edge']").unwrap();
     let ProxyProtocol::Vmess(config) = &parsed.proxies[0].protocol else {
         unreachable!()

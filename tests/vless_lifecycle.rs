@@ -41,11 +41,6 @@ impl OutboundConnector for SuppliedStream {
 
 #[tokio::test]
 async fn vless_all_handshakes_keep_the_original_deadline_and_join_cancelled_io() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VLESS-CANCEL",
-        "vless_all_handshakes_keep_the_original_deadline_and_join_cancelled_io",
-    );
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     for mode in ["tcp", "tls", "ws", "grpc", "http", "h2", "vision", "xhttp"] {
         let mut node = serde_json::json!({"name":"edge","type":"vless","server":"fixture.invalid","port":443,"uuid":"07070707-0707-0707-0707-070707070707","network":if mode=="tls" || mode=="vision" {"tcp"}else{mode}});
@@ -152,11 +147,6 @@ fn split_xhttp_construction_uses_default_stack_and_protect_failure_has_no_fallba
 
 #[tokio::test]
 async fn vless_expired_deadline_and_protect_failure_never_fall_back() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VLESS-CANCEL",
-        "vless_expired_deadline_and_protect_failure_never_fall_back",
-    );
     let parsed = Config::parse_yaml(b"mixed-port: 1080\nproxies: [{name: edge, type: vless, server: 192.0.2.1, port: 443, uuid: 07070707-0707-0707-0707-070707070707}]\nrules: ['MATCH,edge']").unwrap();
     let ProxyProtocol::Vless(config) = &parsed.proxies[0].protocol else {
         unreachable!()

@@ -436,11 +436,6 @@ async fn shared_mux_preserves_h2mux_yamux_tail_and_smux_whole_close() {
 }
 #[tokio::test]
 async fn yamux_replacing_dropped_streams_at_capacity_keeps_the_sibling_alive() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "yamux_replacing_dropped_streams_at_capacity_keeps_the_sibling_alive",
-    );
     tokio::time::timeout(Duration::from_secs(10), async {
         let peer = Arc::new(MemoryPeer {
             count: AtomicUsize::new(0),
@@ -478,11 +473,6 @@ async fn yamux_replacing_dropped_streams_at_capacity_keeps_the_sibling_alive() {
 
 #[tokio::test]
 async fn sing_mux_scheduling_uses_the_selected_branch_not_a_global_stream_quota() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "sing_mux_scheduling_uses_the_selected_branch_not_a_global_stream_quota",
-    );
     tokio::time::timeout(Duration::from_secs(5), async {
         for (protocol, wire) in [("h2mux", 2), ("smux", 0), ("yamux", 1)] {
             for (settings, counts) in [
@@ -554,11 +544,6 @@ impl OutboundConnector for CapturePeer {
 
 #[tokio::test]
 async fn h2mux_sends_idle_ping_and_retires_a_peer_that_never_acknowledges() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "h2mux_sends_idle_ping_and_retires_a_peer_that_never_acknowledges",
-    );
     let raw = serde_json::json!({"mixed-port":1080,"proxies":[{"name":"edge","type":"vless","server":"example.com","port":443,"uuid":"07070707-0707-0707-0707-070707070707","smux":{"enabled":true,"max-connections":1}}],"rules":["MATCH,edge"]});
     let config = Config::parse_yaml(raw.to_string().as_bytes()).unwrap();
     let options = config.proxies[0].smux.clone().unwrap();
@@ -625,11 +610,6 @@ async fn h2mux_sends_idle_ping_and_retires_a_peer_that_never_acknowledges() {
 
 #[tokio::test]
 async fn only_tcp_preserves_all_three_vless_udp_wire_commands() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "only_tcp_preserves_all_three_vless_udp_wire_commands",
-    );
     use vole::session::{Datagram, DatagramSession};
     tokio::time::timeout(Duration::from_secs(3), async {
         for protocol in ["h2mux", "smux", "yamux"] {
@@ -661,29 +641,14 @@ async fn only_tcp_preserves_all_three_vless_udp_wire_commands() {
 }
 #[tokio::test]
 async fn h2mux_reuses_physical_vless_and_cancels_only_one_logical_stream() -> io::Result<()> {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "h2mux_reuses_physical_vless_and_cancels_only_one_logical_stream",
-    );
     siblings("h2mux", 2).await
 }
 #[tokio::test]
 async fn yamux_reuses_physical_vless_and_cancels_only_one_logical_stream() -> io::Result<()> {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "yamux_reuses_physical_vless_and_cancels_only_one_logical_stream",
-    );
     siblings("yamux", 1).await
 }
 #[tokio::test]
 async fn smux_reuses_physical_vless_and_cancels_only_one_logical_stream() -> io::Result<()> {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "smux_reuses_physical_vless_and_cancels_only_one_logical_stream",
-    );
     siblings("smux", 0).await
 }
 async fn siblings(protocol: &str, wire: u8) -> io::Result<()> {
@@ -724,11 +689,6 @@ async fn siblings(protocol: &str, wire: u8) -> io::Result<()> {
 
 #[tokio::test]
 async fn sing_mux_udp_preserves_addresses_and_cancellation_safe_partial_frames() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "sing_mux_udp_preserves_addresses_and_cancellation_safe_partial_frames",
-    );
     use vole::{
         dispatch::DatagramBudget,
         session::{Datagram, DatagramSession},

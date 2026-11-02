@@ -71,11 +71,6 @@ fn packet() -> Datagram {
 
 #[tokio::test]
 async fn stopping_before_first_udp_send_wakes_receive_and_releases_io() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "stopping_before_first_udp_send_wakes_receive_and_releases_io",
-    );
     for encoding in [
         None,
         Some("none"),
@@ -123,11 +118,6 @@ async fn stopping_before_first_udp_send_wakes_receive_and_releases_io() {
 
 #[tokio::test]
 async fn raw_and_packetaddr_consume_wire_and_keep_cancelled_receive_progress() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "raw_and_packetaddr_consume_wire_and_keep_cancelled_receive_progress",
-    );
     // None selects the typed internal codec; the YAML value `none` uses XUDP.
     for encoding in [None, Some("packetaddr"), Some("packet")] {
         let (io, mut peer) = tokio::io::duplex(1024);
@@ -196,11 +186,6 @@ async fn raw_and_packetaddr_consume_wire_and_keep_cancelled_receive_progress() {
 
 #[tokio::test]
 async fn none_and_xudp_keep_mux_wire_targets_and_cancelled_receive_progress() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "none_and_xudp_keep_mux_wire_targets_and_cancelled_receive_progress",
-    );
     for encoding in ["none", "xudp"] {
         let (io, mut peer) = tokio::io::duplex(1024);
         let outbound = node(Box::new(io), encoding);
@@ -280,11 +265,6 @@ async fn none_and_xudp_keep_mux_wire_targets_and_cancelled_receive_progress() {
 
 #[tokio::test]
 async fn udp_send_cancellation_and_bad_header_ownership() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "udp_send_cancellation_and_bad_header_ownership",
-    );
     for encoding in [
         None,
         Some("none"),
@@ -362,11 +342,6 @@ async fn udp_send_cancellation_and_bad_header_ownership() {
 
 #[tokio::test(start_paused = true)]
 async fn tcp_bad_header_fails_closed_and_committed_request_outlives_setup_deadline() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "VLESS-UNIT",
-        "tcp_bad_header_fails_closed_and_committed_request_outlives_setup_deadline",
-    );
     for invalid_header in [true, false] {
         let (io, mut peer) = tokio::io::duplex(1024);
         let outbound = node(Box::new(io), "xudp");

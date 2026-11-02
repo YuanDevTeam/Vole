@@ -159,10 +159,6 @@ mod tests {
     }
     #[test]
     fn fragmented_server_hello_distinguishes_tls12_tls13_and_non_tls() {
-        let _case = crate::resources::case_events::Case::new(
-            "VLESS-UNIT",
-            "fragmented_server_hello_distinguishes_tls12_tls13_and_non_tls",
-        );
         for tls13 in [false, true] {
             for chunk in [1, 3, 8192] {
                 let mut filter = Filter::default();

@@ -9,11 +9,6 @@ use std::collections::BTreeMap;
 
 #[test]
 fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-LIMITS",
-        "registry_matches_live_production_constants_and_has_owned_boundary_cases",
-    );
     use vole::{ResourceLimits, dispatch, transport};
     let defaults = ResourceLimits::default();
     let expected = BTreeMap::from([

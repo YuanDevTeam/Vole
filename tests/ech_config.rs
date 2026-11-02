@@ -41,11 +41,6 @@ fn parse(node: serde_json::Value) -> vole::Result<VlessOutboundConfig> {
 
 #[test]
 fn static_ech_builds_both_tls_backends_without_dns_or_io() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "static_ech_builds_both_tls_backends_without_dns_or_io",
-    );
     for profile in ["none", "chrome", "firefox", "safari", "ios", "random"] {
         let mut input = node();
         input["client-fingerprint"] = json!(profile);
@@ -57,11 +52,6 @@ fn static_ech_builds_both_tls_backends_without_dns_or_io() {
 
 #[test]
 fn ech_options_validate_types_and_static_configuration_takes_priority() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "ech_options_validate_types_and_static_configuration_takes_priority",
-    );
     for ech in [
         json!(null),
         json!([]),
@@ -110,11 +100,6 @@ fn ech_options_validate_types_and_static_configuration_takes_priority() {
 
 #[test]
 fn unsupported_ech_configs_fail_at_parse_before_a_client_can_emit_inner_sni() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "unsupported_ech_configs_fail_at_parse_before_a_client_can_emit_inner_sni",
-    );
     let valid = ech_list();
     let mut invalid = vec![vec![0, 0], vec![0, 1, 0], vec![0; 65_538]];
     for length in 1..valid.len() {
@@ -149,11 +134,6 @@ fn unsupported_ech_configs_fail_at_parse_before_a_client_can_emit_inner_sni() {
 
 #[test]
 fn ech_selection_skips_unknown_or_mandatory_configs_and_keeps_exact_supported_bytes() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "ech_selection_skips_unknown_or_mandatory_configs_and_keeps_exact_supported_bytes",
-    );
     use vole::config::StaticEchConfig;
     let valid = ech_list();
     let expected = StaticEchConfig::from_config_list(&valid).unwrap();
@@ -192,11 +172,6 @@ fn ech_selection_skips_unknown_or_mandatory_configs_and_keeps_exact_supported_by
 
 #[test]
 fn download_ech_inherits_replaces_or_clears_as_a_whole() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "download_ech_inherits_replaces_or_clears_as_a_whole",
-    );
     let mut input = node();
     input["network"] = json!("xhttp");
     input["xhttp-opts"] = json!({"mode":"stream-up", "download-settings":{}});
@@ -225,11 +200,6 @@ fn download_ech_inherits_replaces_or_clears_as_a_whole() {
 
 #[test]
 fn ech_is_standard_tls_only_with_explicit_download_clear_and_dns_inner_name() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "ech_is_standard_tls_only_with_explicit_download_clear_and_dns_inner_name",
-    );
     for extra in [
         json!({"tls":false}),
         json!({"server":"127.0.0.1"}),

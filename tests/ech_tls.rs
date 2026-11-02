@@ -83,11 +83,6 @@ fn client_with(profile: &str, list: &[u8], pin: &str, extra: serde_json::Value) 
 
 #[tokio::test]
 async fn rejected_or_wrong_key_ech_never_reaches_application_data_even_with_a_matching_pin() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "rejected_or_wrong_key_ech_never_reaches_application_data_even_with_a_matching_pin",
-    );
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["inner.invalid".into(), "public.invalid".into()])
             .unwrap();
@@ -184,11 +179,6 @@ fn outer_sni(hello: &[u8]) -> &[u8] {
 
 #[tokio::test]
 async fn client_identity_is_sent_only_after_ech_acceptance() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "client_identity_is_sent_only_after_ech_acceptance",
-    );
     use boring::ssl::SslVerifyMode;
     use std::sync::{
         Arc,
@@ -272,11 +262,6 @@ async fn client_identity_is_sent_only_after_ech_acceptance() {
 
 #[tokio::test]
 async fn cancelled_ech_emits_only_public_sni_and_releases_io_for_every_backend() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "cancelled_ech_emits_only_public_sni_and_releases_io_for_every_backend",
-    );
     let (config, _) = material(1);
     let mut list = (config.len() as u16).to_be_bytes().to_vec();
     list.extend_from_slice(&config);
@@ -316,11 +301,6 @@ async fn cancelled_ech_emits_only_public_sni_and_releases_io_for_every_backend()
 
 #[tokio::test]
 async fn each_backend_and_hpke_suite_requires_real_ech_acceptance_before_data() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "each_backend_and_hpke_suite_requires_real_ech_acceptance_before_data",
-    );
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["inner.invalid".into(), "public.invalid".into()])
             .unwrap();

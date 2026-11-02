@@ -275,10 +275,6 @@ mod tests {
 
     #[tokio::test]
     async fn vision_fragmented_headers_content_padding_and_cancelled_reads_keep_raw_tail() {
-        let _case = crate::resources::case_events::Case::new(
-            "VLESS-UNIT",
-            "vision_fragmented_headers_content_padding_and_cancelled_reads_keep_raw_tail",
-        );
         let mut wire = frame(true, 0, b"abc", 7);
         wire.extend(frame(false, 2, b"def", 3));
         wire.extend(b"raw-tail");
@@ -305,10 +301,6 @@ mod tests {
 
     #[tokio::test]
     async fn vision_invalid_uuid_command_and_truncation_poison_the_stream() {
-        let _case = crate::resources::case_events::Case::new(
-            "VLESS-UNIT",
-            "vision_invalid_uuid_command_and_truncation_poison_the_stream",
-        );
         let good = frame(true, 0, b"content", 4);
         let mut invalid_uuid = good.clone();
         invalid_uuid[0] ^= 1;
@@ -334,10 +326,6 @@ mod tests {
 
     #[tokio::test]
     async fn vision_bounded_partial_writes_flush_and_close_preserve_all_plaintext() {
-        let _case = crate::resources::case_events::Case::new(
-            "VLESS-UNIT",
-            "vision_bounded_partial_writes_flush_and_close_preserve_all_plaintext",
-        );
         let (io, mut peer) = tokio::io::duplex(31);
         let mut stream = VisionStream::new(
             Box::new(io),

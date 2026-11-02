@@ -44,8 +44,6 @@ fn policy(node: Value) -> ShadowTlsConfig {
 #[cfg(feature = "shadow-tls-v3")]
 #[test]
 fn shadowtls_preserves_policy_values_and_shared_profiles() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("SHADOWTLS-CFG", "policy");
     let config = policy(node());
     let mut disabled = node();
     disabled.as_object_mut().unwrap().remove("plugin-opts");
@@ -135,8 +133,6 @@ fn shadowtls_preserves_policy_values_and_shared_profiles() {
 #[cfg(feature = "shadow-tls-v3")]
 #[test]
 fn shadowtls_rejects_invalid_types_bounds_unknown_fields_and_nulls_without_secrets() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("SHADOWTLS-CFG", "reject");
     let assert_rejected = |n| {
         let error = parse(n).expect_err("must reject before IO").to_string();
         assert!(!error.contains("synthetic-private-marker"), "{error}");
@@ -228,8 +224,6 @@ fn shadowtls_rejects_invalid_types_bounds_unknown_fields_and_nulls_without_secre
 
 #[test]
 fn shadowtls_requires_explicit_v3_and_a_complete_plugin_policy() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("SHADOWTLS-CFG", "feature");
     let fields = "    plugin: shadow-tls\n    plugin-opts: {version: 3, host: cover.invalid, password: ' secret '}";
     let result = Config::parse_yaml(yaml(fields).as_bytes());
     // This protocol is independently removable even when boring is present.

@@ -101,7 +101,6 @@ impl rustls::sign::Signer for ForgedKey {
 
 #[tokio::test]
 async fn certificate_policy_and_native_signature_must_succeed_before_a_shadowtls_stream_exists() {
-    let _case = crate::resources::case_events::Case::new("SHADOWTLS-UNIT", "native_signature");
     for profile in super::test_profiles() {
         for failure in [
             "name",
@@ -364,7 +363,6 @@ impl FinishedFault {
 
 #[tokio::test]
 async fn a_forged_finished_is_rejected_even_when_record_aead_relay_mac_and_pin_are_valid() {
-    let _case = crate::resources::case_events::Case::new("SHADOWTLS-UNIT", "native_finished");
     for profile in super::test_profiles() {
         for policy in ["webpki", "skip", "pin"] {
             let mut material = material();
@@ -403,7 +401,6 @@ async fn a_forged_finished_is_rejected_even_when_record_aead_relay_mac_and_pin_a
 
 #[tokio::test]
 async fn authenticated_stream_ignores_residual_cover_and_preserves_partial_io_flush_and_eof() {
-    let _case = crate::resources::case_events::Case::new("SHADOWTLS-UNIT", "stream_io");
     for profile in super::test_profiles() {
         let mut material = material();
         material.options.client_fingerprint = *profile;
@@ -462,7 +459,6 @@ async fn authenticated_stream_ignores_residual_cover_and_preserves_partial_io_fl
 
 #[tokio::test]
 async fn cancelling_a_partial_authenticated_record_read_preserves_it_for_the_next_reader() {
-    let _case = crate::resources::case_events::Case::new("SHADOWTLS-UNIT", "read_cancel");
     let material = material();
     let client = ShadowTlsClient::new(&material.context, &material.options).unwrap();
     let (raw, mut peer) = tokio::io::duplex(73);
@@ -538,7 +534,6 @@ impl tokio::io::AsyncWrite for WriteGate {
 
 #[tokio::test(start_paused = true)]
 async fn shutdown_has_a_five_second_bound_even_when_the_caller_transport_never_becomes_writable() {
-    let _case = crate::resources::case_events::Case::new("SHADOWTLS-UNIT", "close_deadline");
     let material = material();
     let client = ShadowTlsClient::new(&material.context, &material.options).unwrap();
     let (raw, mut peer) = tokio::io::duplex(73);

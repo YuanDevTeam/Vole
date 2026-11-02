@@ -70,11 +70,6 @@ async fn response_followed_by_reset(end_stream: bool) -> std::io::Result<Vec<u8>
 
 #[tokio::test]
 async fn xhttp_keeps_complete_response_when_peer_resets_after_end_stream() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-REGRESSION",
-        "xhttp_keeps_complete_response_when_peer_resets_after_end_stream",
-    );
     let response = response_followed_by_reset(true)
         .await
         .expect("END_STREAM must retain complete DATA despite a subsequent reset");
@@ -83,11 +78,6 @@ async fn xhttp_keeps_complete_response_when_peer_resets_after_end_stream() {
 
 #[tokio::test]
 async fn xhttp_does_not_hide_reset_before_end_stream() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-REGRESSION",
-        "xhttp_does_not_hide_reset_before_end_stream",
-    );
     let error = response_followed_by_reset(false)
         .await
         .expect_err("a reset before END_STREAM must not become successful EOF");
