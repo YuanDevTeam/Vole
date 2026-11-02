@@ -25,6 +25,8 @@ Windows的UWP/Wintun feature互斥，应明确选择后端，不使用`--all-fea
 
 ## 定向回归
 
+Unix TUN 适配器：`platform::tun_rs_io::tests::` 使用 Unix socketpair 检查包边界、批量收发、取消与描述符所有权。Linux 仅在 `cfg(test)` 使用描述符适配，真实构造器仍拒绝非 TUN；Apple 保留 tun-rs 的包信息头路径。这些回归不代替真实 TUN 验收。
+
 Mieru UDP载体的TCP上传收尾：`outbound::mieru::udp::tests::mieru_udp_upload_`。
 五项纯内存回归使用真实编解码、可靠驱动与有界origin流，覆盖尾包首发成功后丢失、重传后EOF，
 以及待ACK时的Stop、取消shutdown future、同载体兄弟、立即Drop与对端Close；不代签真实TUN交付或RSS。
