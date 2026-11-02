@@ -254,6 +254,8 @@ HY2 透明混淆/pacer 传递使用
 `salamander_memory_and_pacer_preserve_address_sharing_owned_send_and_close`。
 它们覆盖逐包地址、取消与独立关闭，不以能力布尔断言替代真实帧和所有权验证。
 GeoData、AGE、Provider和缓存测试使用合成输入、公开固定向量、内存流及临时文件。
+fake-IP 热更新使用 `runtime::tests::live_dns_`，经实际运行时组装检查 DNS 停用／重开、
+A/AAAA 内存 wire，以及临时 redb 的映射、游标加载和持久 owner 复用，不创建网络 socket。
 这些局部预算与行为检查不证明进程RSS、网络吞吐或真机内存达标。
 命名指纹准入使用 `config::fingerprint_tests::`；标准 H2 SETTINGS/ACK 与 ALPS 可选性使用
 `selected_profiles_use_standard_h2_settings_when_the_server_supports_alps`（内存 TLS/H2）。

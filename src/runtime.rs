@@ -852,13 +852,11 @@ impl GraphBuilder {
                 },
             )
             .with_mapping_from(self.previous_dns.as_deref())
-            .with_fake_ip_store(
-                if self.config.profile.store_fake_ip && self.previous_dns.is_none() {
-                    self.data_dir.as_deref()
-                } else {
-                    None
-                },
-            )?,
+            .with_fake_ip_store(if self.config.profile.store_fake_ip {
+                self.data_dir.as_deref()
+            } else {
+                None
+            })?,
         ));
         if let Some(dns) = &dns {
             dns.enable_refresh(self.previous_dns.as_deref());
@@ -2180,6 +2178,204 @@ mod tests {
     use crate::dialer::ResolvedEndpoint;
     #[cfg(all(windows, feature = "tun"))]
     use crate::platform::TunIo;
+
+    fn live_fake_ip_configuration(enabled: bool, persistent: bool) -> Config {
+        Config::parse_yaml(
+            format!(
+                "ipv6: true\nprofile: {{store-fake-ip: {persistent}}}\ndns:\n  enable: {enabled}\n  ipv6: false\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/24\n  use-hosts: false\n  use-system-hosts: false\n  nameserver: [rcode://success]\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn build_live_fake_ip_parts(
+        config: &Config,
+        previous_dns: Option<Arc<RuntimeDns>>,
+        directory: Option<&std::path::Path>,
+    ) -> BuiltRuntimeParts {
+        let mut config = config.clone();
+        let rules = RuleSet::compile_config(&mut config).unwrap();
+        assert!(config.proxies.is_empty());
+        assert!(config.inbounds.is_empty());
+        assert!(config.external_controller.is_none());
+        GraphBuilder {
+            security: SecurityContext::new(),
+            connections: Arc::default(),
+            config,
+            endpoints: Vec::new(),
+            limits: ResourceLimits::default(),
+            rules,
+            geo_matcher: Arc::new(crate::routing::EmptyGeoMatcher),
+            previous_dns,
+            data_dir: directory.map(std::path::Path::to_path_buf),
+        }
+        .build(Dialer::default())
+        .unwrap()
+    }
+
+    async fn live_fake_ip_answers(
+        parts: &BuiltRuntimeParts,
+        host: &str,
+        query_type: crate::dns::QueryType,
+    ) -> Vec<IpAddr> {
+        let query = crate::dns::build_query(947, host, query_type).unwrap();
+        let response = parts.dns.as_ref().unwrap().exchange(&query).await.unwrap();
+        let response = crate::dns::parse_response(&response).unwrap();
+        assert_eq!(response.id, 947);
+        assert_eq!(response.rcode, 0);
+        assert_eq!(response.question.name, host);
+        assert_eq!(response.question.query_type, query_type);
+        response
+            .answers
+            .into_iter()
+            .filter_map(|record| match record.data {
+                crate::dns::RecordData::A(ip) => Some(IpAddr::V4(ip)),
+                crate::dns::RecordData::Aaaa(ip) => Some(IpAddr::V6(ip)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn stop_live_fake_ip_parts(parts: BuiltRuntimeParts) {
+        parts.dns.as_ref().unwrap().shutdown().await;
+        parts.proxy_graph.begin_shutdown();
+        parts.proxy_graph.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn live_dns_toggle_preserves_fake_ip_pool_with_distinct_system_ipv6() {
+        let enabled = live_fake_ip_configuration(true, false);
+        let disabled = live_fake_ip_configuration(false, false);
+        assert!(crate::config::live_update::startup_compatible(
+            &enabled, &disabled
+        ));
+        assert!(crate::config::live_update::startup_compatible(
+            &disabled, &enabled
+        ));
+        let first: IpAddr = "198.18.0.4".parse().unwrap();
+        let second: IpAddr = "198.18.0.5".parse().unwrap();
+        let before = build_live_fake_ip_parts(&enabled, None, None);
+        assert_eq!(
+            live_fake_ip_answers(&before, "first.example", crate::dns::QueryType::A).await,
+            [first]
+        );
+        assert_eq!(
+            live_fake_ip_answers(&before, "second.example", crate::dns::QueryType::A).await,
+            [second]
+        );
+        let paused = build_live_fake_ip_parts(&disabled, before.dns.clone(), None);
+        assert!(!paused.dns.as_ref().unwrap().is_enabled());
+        let resumed = build_live_fake_ip_parts(&enabled, paused.dns.clone(), None);
+        // Ask in reverse allocation order: a fresh pool would incorrectly
+        // assign the first address to the second name after the toggle.
+        assert_eq!(
+            live_fake_ip_answers(&resumed, "second.example", crate::dns::QueryType::A).await,
+            [second]
+        );
+        assert_eq!(
+            live_fake_ip_answers(&resumed, "first.example", crate::dns::QueryType::A).await,
+            [first]
+        );
+        assert!(
+            live_fake_ip_answers(&resumed, "second.example", crate::dns::QueryType::Aaaa)
+                .await
+                .is_empty()
+        );
+        for parts in [&before, &paused, &resumed] {
+            assert_eq!(
+                parts
+                    .dns
+                    .as_ref()
+                    .unwrap()
+                    .recover_fake_ip(second)
+                    .unwrap()
+                    .as_deref(),
+                Some("second.example")
+            );
+        }
+        stop_live_fake_ip_parts(resumed).await;
+        stop_live_fake_ip_parts(paused).await;
+        stop_live_fake_ip_parts(before).await;
+    }
+
+    #[tokio::test]
+    async fn live_dns_enable_loads_and_persists_fake_ip_store() {
+        let directory = tempdir().unwrap();
+        let enabled = live_fake_ip_configuration(true, true);
+        let disabled = live_fake_ip_configuration(false, true);
+        assert!(crate::config::live_update::startup_compatible(
+            &disabled, &enabled
+        ));
+        let first: IpAddr = "198.18.0.4".parse().unwrap();
+        let second: IpAddr = "198.18.0.5".parse().unwrap();
+        let third: IpAddr = "198.18.0.6".parse().unwrap();
+        let seed = build_live_fake_ip_parts(&enabled, None, Some(directory.path()));
+        for (name, address) in [("first.example", first), ("second.example", second)] {
+            assert_eq!(
+                live_fake_ip_answers(&seed, name, crate::dns::QueryType::A).await,
+                [address]
+            );
+        }
+        stop_live_fake_ip_parts(seed).await;
+        assert!(directory.path().join("fake-ip.redb").is_file());
+
+        let paused = build_live_fake_ip_parts(&disabled, None, Some(directory.path()));
+        assert!(!paused.dns.as_ref().unwrap().is_enabled());
+        let active = build_live_fake_ip_parts(&enabled, paused.dns.clone(), Some(directory.path()));
+        // The pre-existing durable second binding must load before allocating
+        // anything; a newly empty in-memory pool would return the first IP.
+        assert_eq!(
+            live_fake_ip_answers(&active, "second.example", crate::dns::QueryType::A).await,
+            [second]
+        );
+        assert_eq!(
+            live_fake_ip_answers(&active, "third.example", crate::dns::QueryType::A).await,
+            [third]
+        );
+
+        // A later compatible replacement must retain the open store instead
+        // of trying to open its locked path for a second database owner.
+        let replaced =
+            build_live_fake_ip_parts(&enabled, active.dns.clone(), Some(directory.path()));
+        assert_eq!(
+            live_fake_ip_answers(&replaced, "first.example", crate::dns::QueryType::A).await,
+            [first]
+        );
+        assert_eq!(
+            live_fake_ip_answers(&replaced, "fourth.example", crate::dns::QueryType::A).await,
+            ["198.18.0.7".parse::<IpAddr>().unwrap()]
+        );
+        stop_live_fake_ip_parts(replaced).await;
+        stop_live_fake_ip_parts(active).await;
+        stop_live_fake_ip_parts(paused).await;
+
+        let restarted = build_live_fake_ip_parts(&enabled, None, Some(directory.path()));
+        assert_eq!(
+            live_fake_ip_answers(&restarted, "third.example", crate::dns::QueryType::A).await,
+            [third]
+        );
+        assert_eq!(
+            live_fake_ip_answers(&restarted, "fifth.example", crate::dns::QueryType::A).await,
+            ["198.18.0.8".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            restarted
+                .dns
+                .as_ref()
+                .unwrap()
+                .recover_fake_ip(second)
+                .unwrap()
+                .as_deref(),
+            Some("second.example")
+        );
+        assert!(
+            live_fake_ip_answers(&restarted, "third.example", crate::dns::QueryType::Aaaa)
+                .await
+                .is_empty()
+        );
+        stop_live_fake_ip_parts(restarted).await;
+    }
 
     struct FixedResolver;
 

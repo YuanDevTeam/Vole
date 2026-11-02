@@ -995,10 +995,13 @@ impl RuntimeDns {
             if self.fake_config.enabled == previous.fake_config.enabled
                 && self.fake_config.range == previous.fake_config.range
                 && self.fake_config.range6 == previous.fake_config.range6
-                && self.ipv6 == previous.ipv6
-                && previous.fake_pools.is_some()
+                && let Some(previous_pools) = previous.fake_pools.as_ref()
+                && self
+                    .fake_pools
+                    .as_ref()
+                    .is_none_or(|pools| pools.same_address_families(previous_pools))
             {
-                self.fake_pools = previous.fake_pools.clone();
+                self.fake_pools = Some(previous_pools.clone());
             }
         }
         self
@@ -1325,6 +1328,15 @@ impl RuntimeDns {
             && self.fake_config.enabled
             && let Some(root) = root
         {
+            if self
+                .fake_pools
+                .as_ref()
+                .map(|pools| pools.has_persistent_store())
+                .transpose()?
+                .unwrap_or(false)
+            {
+                return Ok(self);
+            }
             self.fake_pools = Some(Arc::new(super::fake_ip::FakePools::open(
                 &self.fake_config,
                 self.ipv6,

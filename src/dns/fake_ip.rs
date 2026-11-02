@@ -175,6 +175,18 @@ impl FakePools {
                 .map(Mutex::new),
         })
     }
+
+    pub(crate) fn same_address_families(&self, other: &Self) -> bool {
+        self.v4.is_some() == other.v4.is_some() && self.v6.is_some() == other.v6.is_some()
+    }
+
+    pub(crate) fn has_persistent_store(&self) -> io::Result<bool> {
+        let Some(pool) = self.v4.as_ref().or(self.v6.as_ref()) else {
+            return Ok(false);
+        };
+        Ok(pool.lock().map_err(storage_error)?.database.is_some())
+    }
+
     /// Forget forward bindings without immediately reusing addresses that may
     /// still be present in a client's active flow. Reverse maps and cursor keep
     /// their normal bounded lifetime; database commit precedes memory mutation.
