@@ -66,6 +66,8 @@ OPTIONS 携带 Origin 和非空 `Access-Control-Request-Method` 时为预检，�
 
 `allow-private-network` 缺省 true；只对成功预检且请求 `Access-Control-Request-Private-Network: true` 返回相应允许头，显式 false 禁止返回该头。CORS 不改变 Controller 地址、secret 或 API 支持范围。
 
+与 Mihomo 一致，`allow-origins` 只控制 CORS 响应头，不按 `Origin` 拒绝 WebSocket Upgrade。浏览器 WebSocket 不受 Fetch CORS 约束；订阅访问仍由独立的 secret/token 鉴权决定，空 secret 不要求认证。
+
 ## 请求预算与停止
 
 HTTP/HTTPS/Unix 合计最多 8 条活动连接。普通 H1 每连接处理一个请求后关闭，WebSocket 升级后保持当前订阅；H2 每连接最多 8 条并发请求，超出准入复位 stream，接收窗口每流 1 KiB、连接 8 KiB，发送缓冲每流 16 KiB。头部上限 32 KiB/100 字段，H2 target 上限 8 KiB，组选择与 PATCH body 上限 1 KiB，内联配置 PUT body 上限 8 MiB；握手、H1 读头、body 与写响应各有 5 秒期限。停止取消活动请求与订阅、关闭协议 driver，并等待所有 H2 请求和文件候选读取完成。
