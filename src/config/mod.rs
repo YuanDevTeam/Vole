@@ -4368,6 +4368,9 @@ rules:
             panic!("rule match")
         };
         assert_eq!(result.action, RuleAction::Reject);
+        // A completed flow's budget must not be reused by another source tuple.
+        context.decision().set_deadline(std::time::Instant::now());
+        let mut context = RoutingContext::new(Network::Tcp, &destination).unwrap();
         context.set_source("192.0.2.2:1500".parse().unwrap());
         let evaluation = rules.evaluate(&context);
         let RuleEvaluation::Matched(result) = evaluation else {
