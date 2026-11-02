@@ -289,7 +289,7 @@ jobs:
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
             outbound::trusttunnel:: outbound::mieru:: outbound::masque:: security::masque:: config::masque::
             transport::quic:: transport::quinn_h3:: transport::quiche_h3:: transport::masque_codec:: transport::h3_connect::
-            transport::sing_mux::smux_driver::tests:: transport::sing_mux::tests::
+            transport::smux::tests:: transport::sing_mux::tests::
             grpc_duplex_pool_keeps_response
             outbound::sing_mux::tests::
             platform::linux_network::tests:: platform::tun_rs_io::tests:: platform::windows_tun_io::tests::
