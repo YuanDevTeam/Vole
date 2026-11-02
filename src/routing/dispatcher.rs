@@ -507,10 +507,16 @@ impl RoutingDispatcher {
                 .as_deref_mut()
                 .and_then(|cached| cached.get(&key))
                 .map(|cached| cached.leaf.clone());
+            if let Some(leaf) = cached {
+                // Existing UDP transports retain their selected leaf even if
+                // the group's next member cannot carry UDP.
+                selected = Some(Ok(leaf));
+                return RuleTargetEffect::Accept;
+            }
             match self.route_targets.inspect_rule_target(
                 id,
                 network == Network::Udp,
-                cached.is_none(),
+                true,
                 Some(source),
                 Some(&metadata),
                 candidate.authenticated_user(),
@@ -526,7 +532,7 @@ impl RoutingDispatcher {
                 }
                 Ok(InspectedRuleTarget::Control(control)) => RuleTargetEffect::Control(control),
                 Ok(InspectedRuleTarget::Egress(leaf)) => {
-                    selected = Some(Ok(cached.unwrap_or(leaf)));
+                    selected = Some(Ok(leaf));
                     RuleTargetEffect::Accept
                 }
                 Ok(InspectedRuleTarget::Unavailable) if self.rules.filters_udp() => {
@@ -3658,6 +3664,92 @@ sub-rules:
         assert_eq!(first.datagrams.lock().unwrap().len(), 2);
         assert_eq!(second.udp_opens.load(Ordering::Relaxed), 1);
         assert_eq!(second.datagrams.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_udp_leaf_survives_selection_of_a_tcp_only_member() {
+        for kind in ["select", "fallback", "url-test", "load-balance"] {
+            for fallback in ["DIRECT", "REJECT"] {
+                let mut config = crate::config::Config::parse_yaml(
+                    format!(
+                        r#"
+mixed-port: 1080
+proxies:
+  - {{name: first, type: socks5, server: 192.0.2.1, port: 1080, udp: true}}
+  - {{name: next, type: socks5, server: 192.0.2.2, port: 1080, udp: false}}
+proxy-groups:
+  - {{name: route, type: {kind}, proxies: [first, next]}}
+rules: ["DST-PORT,443,route", "MATCH,{fallback}"]
+"#
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+                let first = Arc::new(RecordingDispatcher::default());
+                let next = Arc::new(RecordingDispatcher {
+                    tcp_only: true,
+                    ..Default::default()
+                });
+                let direct = Arc::new(RecordingDispatcher::default());
+                let nodes: Vec<Arc<dyn Dispatcher>> = vec![first.clone(), next.clone()];
+                let groups =
+                    ProxyGroups::new(&config.proxy_groups, nodes.clone(), direct.clone()).unwrap();
+                groups.apply_health(0, &[Some(10), None]);
+                let router = RoutingDispatcher::new(
+                    RouteTargetDispatchers::with_proxy_groups(nodes, &groups).unwrap(),
+                    direct.clone(),
+                    None,
+                    RuleSet::compile_config(&mut config).unwrap(),
+                    Arc::new(EmptyGeoMatcher),
+                );
+                assert!(router.diagnostics.is_none());
+                let remote = "198.51.100.1:443".parse().unwrap();
+                let mut established = router
+                    .open_datagram(association(InboundKind::Socks5))
+                    .await
+                    .unwrap();
+                established.send(datagram(remote, b"first")).await.unwrap();
+                if kind == "select" {
+                    groups.select("route", "next").unwrap();
+                } else {
+                    groups.apply_health(0, &[None, Some(10)]);
+                }
+                established
+                    .send(datagram(remote, b"still-first"))
+                    .await
+                    .unwrap();
+                assert_eq!(first.datagrams.lock().unwrap().len(), 2, "{kind}");
+                assert_eq!(direct.udp_opens.load(Ordering::Relaxed), 0, "{kind}");
+                for payload in [b"first".as_slice(), b"still-first"] {
+                    let reply = established.receive().await.unwrap();
+                    assert_eq!(reply.remote, Destination::Ip(remote));
+                    assert_eq!(reply.payload.as_ref(), payload);
+                }
+
+                // Another source owns a separate association and must evaluate the
+                // current group, rather than borrowing this source's cached leaf.
+                let mut fresh = router
+                    .open_datagram(DatagramSession::new(
+                        InboundKind::Socks5,
+                        "192.0.2.20:10001".parse().unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                fresh.send(datagram(remote, b"fresh-direct")).await.unwrap();
+                let forwarded = usize::from(fallback == "DIRECT");
+                assert_eq!(direct.datagrams.lock().unwrap().len(), forwarded, "{kind}");
+                assert_eq!(first.udp_opens.load(Ordering::Relaxed), 1, "{kind}");
+                assert_eq!(next.udp_opens.load(Ordering::Relaxed), 0, "{kind}");
+                fresh.close().await.unwrap();
+                established.close().await.unwrap();
+                assert_eq!(first.udp_closes.load(Ordering::Relaxed), 1, "{kind}");
+                assert_eq!(
+                    direct.udp_closes.load(Ordering::Relaxed),
+                    forwarded,
+                    "{kind}"
+                );
+            }
+        }
     }
 
     fn stream(destination: SocketAddr, inbound: InboundKind) -> StreamSession {
