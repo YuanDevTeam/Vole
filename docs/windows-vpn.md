@@ -187,7 +187,7 @@ vole-windows-vpn-host.exe
 vole-windows-session-host.exe
 ```
 
-- manifest 只有一个主 Application，三个可执行参与者相互独立；产物架构一致，Rust 使用静态 CRT；
+- manifest 只有一个主 Application，三个可执行参与者相互独立；产物架构一致，UWP 的 Rust 和原生依赖统一使用动态 CRT，安装包负责声明并部署对应架构的 Visual C++ Runtime 依赖；
 - Session Host 是 `windows.fullTrustProcess` extension，不显示在应用列表，也不注册 StartupTask 或 URI；
 - Provider 的 `windows.backgroundTasks` extension 显式使用 `windowsApp + appContainer`；
 - Provider activation class 来自 `vole.dll`；
@@ -367,6 +367,7 @@ Stopped { version, packetCounters }
 - [`VpnManagementAgent`](https://learn.microsoft.com/uwp/api/windows.networking.vpn.vpnmanagementagent)
 - [`FullTrustProcessLauncher`](https://learn.microsoft.com/uwp/api/windows.applicationmodel.fulltrustprocesslauncher)
 - [Package identity](https://learn.microsoft.com/windows/apps/desktop/modernize/package-identity-overview)
+- [UWP 与 C Runtime](https://learn.microsoft.com/cpp/c-runtime-library/windows-store-apps-the-windows-runtime-and-the-c-run-time)
 - [`RoInitialize`](https://learn.microsoft.com/windows/win32/api/roapi/nf-roapi-roinitialize)
 - [`CoIncrementMTAUsage`](https://learn.microsoft.com/windows/win32/api/combaseapi/nf-combaseapi-coincrementmtausage)
 

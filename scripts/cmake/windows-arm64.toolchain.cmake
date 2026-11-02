@@ -11,4 +11,12 @@ set(CMAKE_ASM_COMPILER "$ENV{CC_aarch64_pc_windows_msvc}")
 set(CMAKE_C_COMPILER_TARGET aarch64-pc-windows-msvc)
 set(CMAKE_CXX_COMPILER_TARGET aarch64-pc-windows-msvc)
 set(CMAKE_ASM_COMPILER_TARGET aarch64-pc-windows-msvc)
-set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
+# Match Cargo's selected CRT, including UWP's dynamic CRT. An explicit setting
+# from a native build script takes precedence over this toolchain default.
+if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+  if("$ENV{CARGO_CFG_TARGET_FEATURE}" MATCHES "(^|,)crt-static(,|$)")
+    set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
+  else()
+    set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
+  endif()
+endif()

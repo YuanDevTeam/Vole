@@ -117,14 +117,16 @@ class Blake3DependencyTests(unittest.TestCase):
                 self.assertIn(str(self.root), text)
                 self.assertIn("-DCMAKE_POSITION_INDEPENDENT_CODE=ON", text)
 
-    def test_windows_keeps_static_crt_and_separate_app_api_family(self):
+    def test_windows_static_library_matches_backend_crt_and_app_api_family(self):
         for architecture in ("aarch64", "x86_64"):
             for backend, system in (("wintun", '""'), ("uwp", "WindowsStore")):
                 with self.subTest(architecture=architecture, backend=backend):
                     text, _ = blake3._triplet(
                         f"{architecture}-pc-windows-msvc", {}, backend
                     )
-                    self.assertIn("set(VCPKG_CRT_LINKAGE static)", text)
+                    runtime = "dynamic" if backend == "uwp" else "static"
+                    self.assertIn(f"set(VCPKG_CRT_LINKAGE {runtime})", text)
+                    self.assertIn("set(VCPKG_LIBRARY_LINKAGE static)", text)
                     self.assertIn(f"set(VCPKG_CMAKE_SYSTEM_NAME {system})", text)
                     self.assertIn("set(VCPKG_LOAD_VCVARS_ENV ON)", text)
                     if backend == "uwp":

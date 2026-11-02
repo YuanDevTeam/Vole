@@ -112,6 +112,26 @@ def _production_features(features: str) -> str:
     return features
 
 
+def _windows_runtime_environment(
+    target: str, env: dict[str, str], backend: str
+) -> dict[str, str]:
+    if not target.endswith("-pc-windows-msvc") or backend != "uwp":
+        return env
+    # UWP supports the dynamic CRT. Preserve Cargo's environment flag priority,
+    # then override this checkout's desktop static-CRT default for all crates.
+    if "CARGO_ENCODED_RUSTFLAGS" in env:
+        encoded = env["CARGO_ENCODED_RUSTFLAGS"]
+        flags = encoded.split("\x1f") if encoded else []
+    else:
+        target_flags = "CARGO_TARGET_" + target.upper().replace("-", "_") + "_RUSTFLAGS"
+        flags = env.get("RUSTFLAGS", env.get(target_flags, "")).split()
+    return env | {
+        "CARGO_ENCODED_RUSTFLAGS": "\x1f".join(
+            [*flags, "-C", "target-feature=-crt-static"]
+        )
+    }
+
+
 def _cargo_build(
     target: str,
     profile_flags: list[str],
@@ -120,11 +140,13 @@ def _cargo_build(
     artifacts: tuple[str, ...] = ("--lib",),
 ) -> Path:
     _production_features(features)
+    backend = "uwp" if "windows-uwp" in re.split(r"[,\s]+", features) else "wintun"
+    env = _windows_runtime_environment(target, env, backend)
     env = blake3.environment(
         target,
         native_target(),
         env,
-        "uwp" if "windows-uwp" in re.split(r"[,\s]+", features) else "wintun",
+        backend,
     )
     _run(
         [
@@ -171,11 +193,14 @@ def prepare_native_dependencies(
         raise ValueError("Linux and Windows dependencies require the native target")
     if platform.system() == "Windows":
         env = _windows_msvc_environment(CLI_TARGETS[host][1])
+    env = _windows_runtime_environment(target, env, backend)
     env = blake3.environment(target, host, env, backend)
     suffix = "_" + target.upper().replace("-", "_")
     entries = [
         f"{name + suffix}={env[name + suffix]}" for name in blake3.DEPENDENCY_NAMES
     ]
+    if target.endswith("-pc-windows-msvc") and backend == "uwp":
+        entries.append("CARGO_ENCODED_RUSTFLAGS=" + env["CARGO_ENCODED_RUSTFLAGS"])
     if github_env is not None:
         with github_env.open("a", encoding="utf-8") as stream:
             stream.write("\n".join(entries) + "\n")

@@ -50,11 +50,12 @@ def _triplet(target: str, env: dict[str, str], backend: str) -> tuple[str, list[
     except KeyError as error:
         raise ValueError("unsupported BLAKE3 target architecture") from error
     windows = target.endswith("-pc-windows-msvc")
+    runtime = "static" if windows and backend != "uwp" else "dynamic"
     lines = [
         f"set(VCPKG_TARGET_ARCHITECTURE {architecture})",
         "set(VCPKG_LIBRARY_LINKAGE static)",
         "set(VCPKG_BUILD_TYPE release)",
-        f"set(VCPKG_CRT_LINKAGE {'static' if windows else 'dynamic'})",
+        f"set(VCPKG_CRT_LINKAGE {runtime})",
         "list(APPEND VCPKG_CMAKE_CONFIGURE_OPTIONS "
         '"-DCMAKE_POSITION_INDEPENDENT_CODE=ON")',
     ]

@@ -1,8 +1,10 @@
 """Check platform outputs around the external compiler boundary."""
 
+import io
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -117,6 +119,85 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(
             [command[command.index("--features") + 1] for command, _ in self.commands],
             ["cli", "ffi"],
+        )
+
+    def test_uwp_build_selects_dynamic_crt_and_preserves_cargo_flag_precedence(self):
+        target_flags = "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS"
+        cases = (
+            ({}, []),
+            ({target_flags: "-C debuginfo=1"}, ["-C", "debuginfo=1"]),
+            (
+                {target_flags: "--cfg ignored", "RUSTFLAGS": "-C opt-level=2"},
+                ["-C", "opt-level=2"],
+            ),
+            (
+                {
+                    target_flags: "--cfg ignored",
+                    "RUSTFLAGS": "--cfg ignored_too",
+                    "CARGO_ENCODED_RUSTFLAGS": '--cfg\x1fvalue="with space"',
+                },
+                ["--cfg", 'value="with space"'],
+            ),
+            ({"CARGO_ENCODED_RUSTFLAGS": "", "RUSTFLAGS": "--cfg ignored"}, []),
+        )
+        for overrides, expected in cases:
+            original = dict(os.environ) | overrides
+            with (
+                self.subTest(overrides=overrides),
+                patch.object(builds.platform, "system", return_value="Windows"),
+                patch.object(builds, "_windows_architecture", return_value="arm64"),
+                patch.object(
+                    builds, "_windows_msvc_environment", return_value=original
+                ),
+            ):
+                builds.build_windows("uwp")
+                self.assertEqual(
+                    self.commands[-1][1]
+                    .get("CARGO_ENCODED_RUSTFLAGS", "")
+                    .split("\x1f"),
+                    [*expected, "-C", "target-feature=-crt-static"],
+                )
+                self.assertEqual(original, dict(os.environ) | overrides)
+        with (
+            patch.object(builds.platform, "system", return_value="Windows"),
+            patch.object(builds, "_windows_architecture", return_value="arm64"),
+            patch.object(
+                builds, "_windows_msvc_environment", return_value=dict(os.environ)
+            ),
+        ):
+            builds.build_windows("wintun")
+        self.assertNotIn("CARGO_ENCODED_RUSTFLAGS", self.commands[-1][1])
+
+    def test_direct_uwp_dependencies_export_matching_cargo_crt_flags(self):
+        output = io.StringIO()
+        github_env = self.root / "github.env"
+
+        def dependency_environment(target, host, env, backend):
+            self.assertEqual((target, host), ("aarch64-pc-windows-msvc",) * 2)
+            self.assertEqual(backend, "uwp")
+            suffix = "_AARCH64_PC_WINDOWS_MSVC"
+            return env | {
+                name + suffix: str(self.root / name)
+                for name in builds.blake3.DEPENDENCY_NAMES
+            }
+
+        with (
+            patch.object(builds.platform, "system", return_value="Windows"),
+            patch.object(builds, "_windows_architecture", return_value="arm64"),
+            patch.object(
+                builds, "_windows_msvc_environment", return_value=dict(os.environ)
+            ),
+            patch.object(
+                builds.blake3, "environment", side_effect=dependency_environment
+            ),
+            redirect_stdout(output),
+        ):
+            builds.prepare_native_dependencies(backend="uwp", github_env=github_env)
+        self.assertEqual(output.getvalue(), github_env.read_text())
+        self.assertEqual(output.getvalue().count("\n"), 3)
+        self.assertIn(
+            "CARGO_ENCODED_RUSTFLAGS=-C\x1ftarget-feature=-crt-static\n",
+            output.getvalue(),
         )
 
     def test_windows_requires_native_python(self):
