@@ -91,6 +91,75 @@ fn commit_valid(cache: &mut ProviderCache, candidate: Candidate) {
 }
 
 #[tokio::test]
+async fn file_candidate_keeps_read_mtime_when_source_is_replaced_before_commit() {
+    for rules in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("provider.yaml");
+        let template = Config::parse_yaml(
+            if rules {
+                "rule-providers: {remote: {type: file, path: provider.yaml, behavior: domain}}\nrules: ['RULE-SET,remote,DIRECT']\n"
+            } else {
+                "proxy-providers: {remote: {type: file, path: provider.yaml}}\nproxy-groups: [{name: choice, type: select, use: [remote]}]\n"
+            }
+            .as_bytes(),
+        )
+        .unwrap()
+        .providers
+        .unwrap();
+        let write = |file: &Path, count, seconds| {
+            let items = (0..count)
+                .map(|index| {
+                    if rules {
+                        format!("domain{index}.example")
+                    } else {
+                        format!("{{name: node{index}, type: direct}}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            fs::write(
+                file,
+                format!("{}: [{items}]", if rules { "payload" } else { "proxies" }),
+            )
+            .unwrap();
+            let modified = UNIX_EPOCH + Duration::from_secs(seconds);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            assert_eq!(fs::metadata(file).unwrap().modified().unwrap(), modified);
+            modified
+        };
+        let initial_time = write(&path, 1, 1000);
+        let mut cache = ProviderCache::open(root.path(), template).unwrap();
+        assert_eq!(cache.entries[0].modified, Some(initial_time));
+        let fetched_time = write(&path, 2, 2000);
+        let candidate = fetch(&mut cache, Vec::new()).await.unwrap().unwrap();
+        assert_eq!(content_len(&candidate.content), 2);
+
+        // Graph preparation can yield while an editor atomically replaces the file.
+        let replacement = root.path().join("replacement.yaml");
+        let replacement_time = write(&replacement, 3, 3000);
+        fs::rename(&replacement, &path).unwrap();
+        commit_valid(&mut cache, candidate);
+        assert_eq!(content_len(&cache.contents[&cache.entries[0].key]), 2);
+        assert_eq!(cache.entries[0].modified, Some(fetched_time));
+
+        let replacement = fetch(&mut cache, Vec::new())
+            .await
+            .unwrap()
+            .expect("the replacement must remain detectable after the older candidate commits");
+        assert_eq!(content_len(&replacement.content), 3);
+        commit_valid(&mut cache, replacement);
+        assert_eq!(cache.entries[0].modified, Some(replacement_time));
+        assert_eq!(content_len(&cache.contents[&cache.entries[0].key]), 3);
+        assert!(fetch(&mut cache, Vec::new()).await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
 async fn uri_provider_candidate_keeps_filters_override_and_authenticated_cache_identity() {
     let root = tempfile::tempdir().unwrap();
     let configured = |password: &str| {
@@ -783,6 +852,7 @@ fn authorized_provider_roots_read_file_sources_and_write_only_http_caches() {
             Candidate {
                 content,
                 temporary: Some(temporary),
+                modified: None,
                 metadata: Metadata {
                     url: source_key(&cache.entries[index].spec, &template.request_user_agent())
                         .unwrap(),

@@ -91,6 +91,7 @@ pub(crate) struct Candidate {
     pub content: ProviderContent,
     temporary: Option<PathBuf>,
     metadata: Metadata,
+    modified: Option<SystemTime>,
 }
 impl Drop for Candidate {
     fn drop(&mut self) {
@@ -196,18 +197,16 @@ impl ProviderCache {
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<Metadata>(&bytes).ok())
                     .unwrap_or_default();
-                if let Ok(bytes) = read_bounded(&path, spec.size_limit, &control) {
+                if let Ok((bytes, modified)) =
+                    read_bounded_with_modified(&path, spec.size_limit, &control)
+                {
                     match template.parse_content_with_control(spec, &bytes, &control) {
                         Ok(content) => {
                             entry.state.available = true;
                             entry.state.downloaded = spec.kind == ProviderType::Http;
                             entry.state.count = content_len(&content);
-                            entry.state.updated_at = fs::metadata(&path)
-                                .ok()
-                                .and_then(|m| m.modified().ok())
-                                .map(unix_time);
-                            entry.modified =
-                                fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+                            entry.state.updated_at = modified.map(unix_time);
+                            entry.modified = modified;
                             let source_identity = source_key(spec, &user_agent)?;
                             if metadata.url == source_identity
                                 && metadata.hash == hex(&Sha256::digest(&bytes))
@@ -425,14 +424,16 @@ impl ProviderCache {
                 let template = self.template.clone();
                 let path = path.clone();
                 let parse_cancellation = cancellation.clone();
-                let content = tokio::task::spawn_blocking(move || {
+                let (content, modified) = tokio::task::spawn_blocking(move || {
                     let control = super::age_provider::DecodeControl::new(
                         Some(&parse_cancellation),
                         deadline,
                     );
-                    let bytes = read_bounded(&path, spec.size_limit, &control)?;
+                    let (bytes, modified) =
+                        read_bounded_with_modified(&path, spec.size_limit, &control)?;
                     template
                         .parse_content_with_control(&spec, &bytes, &control)
+                        .map(|content| (content, modified))
                         .map_err(|_| {
                             io::Error::new(io::ErrorKind::InvalidData, "invalid provider content")
                         })
@@ -443,6 +444,7 @@ impl ProviderCache {
                     content,
                     temporary: None,
                     metadata: Metadata::default(),
+                    modified,
                 }));
             }
             let temporary = temporary_path(&path);
@@ -534,6 +536,7 @@ impl ProviderCache {
                                         subscription_info.or(previous_subscription)
                                     },
                                 },
+                                modified: None,
                             }))
                         }
                         Err(error) => {
@@ -587,11 +590,17 @@ impl ProviderCache {
             entry.state.downloaded = true;
             entry.state.subscription_info = entry.metadata.subscription_info;
         }
-        entry.modified = entry
-            .path
-            .as_ref()
-            .and_then(|path| fs::metadata(path).ok())
-            .and_then(|m| m.modified().ok());
+        // A file can be replaced while the candidate graph is being built.
+        // Retain the timestamp of the bytes we read, so the new file stays due.
+        entry.modified = if entry.spec.kind == ProviderType::File {
+            candidate.modified
+        } else {
+            entry
+                .path
+                .as_ref()
+                .and_then(|path| fs::metadata(path).ok())
+                .and_then(|m| m.modified().ok())
+        };
         entry.state.available = true;
         entry.state.updated_at = Some(unix_time(SystemTime::now()));
         entry.state.error = None;
@@ -649,6 +658,13 @@ fn read_bounded(
     limit: u64,
     control: &super::age_provider::DecodeControl<'_>,
 ) -> io::Result<Vec<u8>> {
+    read_bounded_with_modified(path, limit, control).map(|(bytes, _)| bytes)
+}
+fn read_bounded_with_modified(
+    path: &Path,
+    limit: u64,
+    control: &super::age_provider::DecodeControl<'_>,
+) -> io::Result<(Vec<u8>, Option<SystemTime>)> {
     let limit = if limit == 0 {
         MAX_PARSE_BYTES
     } else {
@@ -665,9 +681,11 @@ fn read_bounded(
         options.custom_flags(libc::O_NONBLOCK);
     }
     let mut file = options.open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(io::Error::other("provider path must be a regular file"));
     }
+    let modified = metadata.modified().ok();
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -698,7 +716,7 @@ fn read_bounded(
     control
         .check()
         .map_err(|_| io::Error::other("provider read stopped"))?;
-    Ok(bytes)
+    Ok((bytes, modified))
 }
 fn metadata_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
