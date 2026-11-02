@@ -1,10 +1,6 @@
 //! Windows owner-PID tables and ordinary limited-information process handles.
 use super::*;
-use std::{
-    mem::size_of,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-};
-use windows::{
+use ::windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE},
         NetworkManagement::IpHelper::*,
@@ -14,6 +10,10 @@ use windows::{
         },
     },
     core::PWSTR,
+};
+use std::{
+    mem::size_of,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
 struct Process(HANDLE);
