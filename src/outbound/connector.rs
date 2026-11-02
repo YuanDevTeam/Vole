@@ -6,7 +6,7 @@ use std::{
     fmt::{self, Write as _},
     future::Future,
     io,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -211,6 +211,7 @@ pub struct EstablishContext {
     resolution: ResolutionContext,
     selections: Arc<Mutex<SelectionSnapshot>>,
     inbound: crate::session::InboundMetadata,
+    source: Option<SocketAddr>,
     #[cfg(all(target_os = "linux", feature = "sing-mux"))]
     tcp_control: Option<crate::dialer::tcp_control::Capture>,
     #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
@@ -232,6 +233,7 @@ impl EstablishContext {
             resolution,
             selections: Arc::new(Mutex::new(HashMap::new())),
             inbound: Default::default(),
+            source: None,
             #[cfg(all(target_os = "linux", feature = "sing-mux"))]
             tcp_control: None,
             #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
@@ -314,6 +316,7 @@ impl EstablishContext {
                     .clone(),
             )),
             inbound: self.inbound.clone(),
+            source: self.source,
             #[cfg(all(target_os = "linux", feature = "sing-mux"))]
             tcp_control: None,
             #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
@@ -337,6 +340,7 @@ impl EstablishContext {
                     .clone(),
             )),
             inbound: self.inbound.clone(),
+            source: self.source,
             #[cfg(all(target_os = "linux", feature = "sing-mux"))]
             tcp_control: None,
             #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
@@ -375,6 +379,7 @@ impl EstablishContext {
             deadline: Instant::now() + DEFAULT_ESTABLISH_TIMEOUT,
             resolution: self.resolution.clone(),
             inbound: self.inbound.clone(),
+            source: self.source,
             #[cfg(all(target_os = "linux", feature = "sing-mux"))]
             tcp_control: None,
             #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
@@ -403,7 +408,11 @@ impl EstablishContext {
             .or_insert_with(|| {
                 (
                     selection.clone(),
-                    selection.choose_for(None, Some(destination), self.inbound.user.as_deref()),
+                    selection.choose_for(
+                        self.source,
+                        Some(destination),
+                        self.inbound.user.as_deref(),
+                    ),
                 )
             })
             .1
@@ -1114,10 +1123,15 @@ impl ConnectorDispatcher {
         self
     }
 
-    fn context(&self, metadata: &crate::session::InboundMetadata) -> EstablishContext {
+    fn context(
+        &self,
+        source: SocketAddr,
+        metadata: &crate::session::InboundMetadata,
+    ) -> EstablishContext {
         let mut context =
             EstablishContext::with_resolution(DEFAULT_ESTABLISH_TIMEOUT, self.resolution.clone());
         context.inbound = metadata.clone();
+        context.source = Some(source);
         context
     }
 }
@@ -1129,7 +1143,7 @@ impl Dispatcher for ConnectorDispatcher {
     }
 
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
-        let context = self.context(&session.metadata);
+        let context = self.context(session.source, &session.metadata);
         let result = self.inner.connect_stream(session, &context).await;
         if !matches!(result, Err(DispatchError::NotAllowed)) {
             context.report_group_outcome(result.is_ok());
@@ -1144,7 +1158,7 @@ impl Dispatcher for ConnectorDispatcher {
         if !self.allow_udp {
             return Err(DispatchError::NotAllowed);
         }
-        let context = self.context(&session.metadata);
+        let context = self.context(session.source, &session.metadata);
         self.inner
             .open_datagram(DatagramRequest::new(session), &context)
             .await
@@ -1313,6 +1327,117 @@ mod tests {
             group: Arc::new(SelectUpstream::new(selection, members)),
             endpoint: None,
             dialer: Dialer::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ingress_sticky_upstream_keeps_source_ip_and_authenticated_user_precedence() {
+        struct Carrier(UpstreamPath);
+        #[async_trait]
+        impl OutboundConnector for Carrier {
+            async fn connect_stream(
+                &self,
+                session: StreamSession,
+                context: &EstablishContext,
+            ) -> Result<ConnectedStream, DispatchError> {
+                assert_eq!(context.source, Some(session.source));
+                self.0
+                    .connect_server(
+                        session,
+                        &Destination::domain("server.example", 443).unwrap(),
+                        context,
+                    )
+                    .await
+            }
+            async fn open_datagram(
+                &self,
+                request: DatagramRequest,
+                context: &EstablishContext,
+            ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+                assert_eq!(context.source, Some(request.session.source));
+                let continuation = context.authenticated_continuation();
+                assert_eq!(continuation.source, context.source);
+                #[cfg(feature = "outbound-hysteria2")]
+                assert_eq!(
+                    context.hysteria2_handshake(Duration::from_secs(1))?.source,
+                    context.source
+                );
+                #[cfg(feature = "outbound-masque")]
+                assert_eq!(context.masque_handshake(1).source, context.source);
+                self.0.open_datagram(request, &continuation).await
+            }
+        }
+
+        for hash_key in ["", "in-user"] {
+            let config = crate::config::Config::parse_yaml(
+                format!(
+                    "mixed-port: 1080\nproxy-groups:\n  - {{name: balance, type: load-balance, strategy: sticky-sessions, hash-key: '{hash_key}', proxies: [DIRECT,REJECT]}}\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let selection = Arc::new(GroupSelection::new(0));
+            selection.configure_balance(&config.proxy_groups[0]);
+            let server = Destination::domain("server.example", 443).unwrap();
+            let sources: [SocketAddr; 3] = [
+                "198.51.100.1:10000".parse().unwrap(),
+                "198.51.100.2:10000".parse().unwrap(),
+                "198.51.100.1:20000".parse().unwrap(),
+            ];
+            // Pin two address keys to different members without depending on
+            // the strategy's random first choice. Restore health afterwards.
+            for (index, source) in sources[..2].iter().enumerate() {
+                let mut healthy = [None; 2];
+                healthy[index] = Some(10);
+                selection.balance_health(&healthy);
+                assert_eq!(
+                    selection.choose_for(Some(*source), Some(&server), None),
+                    index
+                );
+            }
+            selection.balance_health(&[Some(10), Some(10)]);
+            let path = selected_path(
+                selection.clone(),
+                [1, 2]
+                    .map(|marker| {
+                        SelectUpstreamMember::Proxy(Arc::new(MarkedConnector {
+                            marker,
+                            ..Default::default()
+                        }))
+                    })
+                    .into(),
+            );
+            let dispatcher = ConnectorDispatcher::new(Arc::new(Carrier(path)));
+            for (source, expected) in sources.into_iter().zip([1, 2, 1]) {
+                let mut session = test_session();
+                session.source = source;
+                let mut stream = dispatcher.connect_tcp(session).await.unwrap();
+                assert_eq!(stream.read_u8().await.unwrap(), expected);
+                let mut udp = dispatcher
+                    .open_datagram(DatagramSession::new(InboundKind::Socks5, source))
+                    .await
+                    .unwrap();
+                assert_eq!(udp.receive().await.unwrap().payload[0], expected);
+            }
+            if hash_key == "in-user" {
+                selection.balance_health(&[None, Some(10)]);
+                assert_eq!(
+                    selection.choose_for(Some(sources[0]), Some(&server), Some("verified")),
+                    1
+                );
+                selection.balance_health(&[Some(10), Some(10)]);
+                for source in sources {
+                    let mut session = test_session();
+                    session.source = source;
+                    session.metadata.user = Some(Arc::from("verified"));
+                    let udp_session = DatagramSession::new(InboundKind::Socks5, source)
+                        .with_metadata(session.metadata.clone());
+                    let mut stream = dispatcher.connect_tcp(session).await.unwrap();
+                    assert_eq!(stream.read_u8().await.unwrap(), 2);
+                    let mut udp = dispatcher.open_datagram(udp_session).await.unwrap();
+                    assert_eq!(udp.receive().await.unwrap().payload[0], 2);
+                }
+            }
         }
     }
 
