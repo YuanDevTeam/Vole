@@ -5,24 +5,27 @@
 
 ## 配置与传输
 
-`type: vless`，`server`、非零 `port` 和标准格式 `uuid` 必填。`udp` 默认 false；`network` 默认 `tcp`，`tls` 默认 false。`encryption` 省略、空或 `none` 关闭该层；其他值见下文。`flow` 省略、空或 `xtls-rprx-vision`。未知字段、null、错型或不匹配的传输选项失败，不隐式迁移配置。
+`type: vless`，`server`、非零 `port` 和字符串 `uuid` 必填。UUID 接受标准、紧凑、花括号或 URN 表示；其他字符串按 UUIDv5(nil, 原始 UTF-8) 映射，不 trim，与 VMess 共用转换。`udp` 默认 false；`network` 默认 `tcp`，`tls` 默认 false。`encryption` 省略、空或 `none` 关闭该层；其他值见下文。`flow` 省略、null 或空串时关闭，也接受 `xtls-rprx-vision`。其余不接受 null 的字段、未知字段、错型或不匹配的传输选项失败，不隐式迁移配置。
 
 - TCP/WS/gRPC/HTTP 首包伪装/legacy H2 可明文或标准 TLS。TLS 支持 1.2/1.3，TCP 默认不发送 ALPN，WS 默认 `[http/1.1]`，gRPC/H2 默认 `[h2]`。有序 ALPN 保留且必须包含传输要求值；标准 TLS 检查协商结果。`servername` 优先显式值、WS Host 去端口、server；不会改变拨号地址。TLS 关闭时禁止安全选项。
-- 标准 TLS 支持 `skip-cert-verify`、SHA-256 `fingerprint`、独立 `name-cert-verify`；沿用共享证书验证器的叶 pin / 非叶信任锚优先级。`certificate` / `private-key` 是配对的内联 PEM，解析或密钥不匹配在 IO 前失败，禁止文件路径。REALITY 不能混用这些标准证书策略。
-- `client-fingerprint` 使用 [TLS 指纹](tls-client-fingerprint.md)的七值/四模板，适用于 TCP 上的标准 TLS/REALITY（含 Vision 和 XHTTP H1/H2），与证书 pin 独立；`none` / 空串关闭，H3 拒绝已启用的 profile。
-- WS 的 ED 支持默认头、自定义头或路径（上限 2048 字节）。`v2ray-http-upgrade` 开启升级后裸流；`v2ray-http-upgrade-fast-open` 必须与前者一起启用，只允许默认 ED 头。fast-open 提前发协议首包但仍等待合法 101，拒绝不返回连接成功。
-- gRPC 接入 `grpc-user-agent`（默认 `grpc-go/1.36.0`）、非负秒数 `ping-interval`（0 不主动 PING），以及三项池阈值。空闲连接总是复用；max-connections>0 时按连接上限/min-streams 扩容，否则按 max-streams 复用阈值扩容。三项全零归一 max-connections=1；显式正 max-connections 与正 max-streams 互斥。阈值不是硬流数上限。物理连接归节点所有，关闭逻辑流不会杀死兄弟流；复用不重选上游组。
+- 标准 TLS 支持 `skip-cert-verify`、SHA-256 `fingerprint`、独立 `name-cert-verify`；沿用共享证书验证器的叶 pin / 非叶信任锚优先级。`certificate` / `private-key` 接受配对的内联 PEM 或文件路径，相对路径从数据目录解析，解析或密钥不匹配在网络 IO 前失败。REALITY 不能混用这些标准证书策略。
+- `client-fingerprint` 使用 [TLS 指纹](tls-client-fingerprint.md)的命名模板，适用于 TCP 上的标准 TLS/REALITY（含 Vision 和 XHTTP H1/H2），与证书 pin 独立；`none` / 空串关闭，H3 拒绝已启用的 profile。
+- WS 的 ED 支持默认头、自定义头或路径。`path` 的 `?ed=N` 覆盖显式 ED 配置并删除 ed 参数；实际早数据按当前请求剩余的16KiB头预算限制，不按配置上限预分配。`v2ray-http-upgrade` 开启升级后裸流；`v2ray-http-upgrade-fast-open` 必须与前者一起启用，只允许默认 ED 头。fast-open 提前发协议首包但仍等待合法 101，拒绝不返回连接成功。
+- gRPC 与 Trojan/VMess 共用配置：省略或空 `grpc-service-name` 默认 `GunService`，普通名映射 `/name/Tun`，`/` 开头使用完整路径；省略或空 `grpc-user-agent` 默认 `grpc-go/1.36.0`。`ping-interval` 为带符号秒数，0 不主动 PING，负值明确拒绝；三项池阈值接受带符号整数，负阈值禁用相应分支。空闲连接总是复用；max-connections>0 时按连接上限/min-streams 扩容，否则按 max-streams 复用阈值扩容。三项池阈值省略或字面全零时归一为4/0/0，Mihomo为1/0/0；显式 max-connections=1 或2保留各自策略。正 max-connections 优先于 max-streams。阈值不是硬流数上限。物理连接归节点所有，关闭逻辑流不会杀死兄弟流；复用不重选上游组。
 - gRPC 不新增业务流/建链数量额度；每个物理连接一个自有驱动，每个等待调用只保留自身 future、取消与原期限，不派生队列任务。每节点最多保留 4 条空闲连接，多余空闲连接退役且不影响活动流。空闲 PING 等待 ACK 最多 15 秒，节点 Stop 取消并 join 所有驱动。
-- `network: xhttp` 支持 H1/H2 明文、TLS1.3 或 REALITY，H3 仅标准 TLS1.3。请求字段、独立下载腿、池与版本选择见 [XHTTP](xhttp.md)。H3 的物理 UDP 仍由原 Dialer/上游图创建。
-- `smux` 以独立的 h2mux/smux v1/yamux 承载逻辑 TCP/UDP；不是 XUDP。only-tcp、调度及关闭边界见 [XHTTP 与 sing-mux](xhttp.md)。
-- Vision 仅允许 `network: tcp`，要求 TLS 1.3/REALITY 或 Encryption；UDP 仅 XUDP。启用 Encryption 后外层 TLS 可省略，存在时仍保持独立认证。配置阶段拒绝 WS/gRPC/HTTP/H2/XHTTP、raw/packetaddr、sing-mux 与 Vision 的组合，包括未启用业务 UDP 但显式选错编码。ECH 和附加安全封装仍拒绝。
+- gRPC 在原建链期限内等待有效 HTTP/2 SETTINGS 并提交完整 VLESS 请求；提交后可持续上传，等待 HTTP 响应不再消耗建链期限。延迟响应仍须通过原状态、内容类型及协议校验，Stop 取消并唤醒活动读写。
+- gRPC authority 使用非空显式 `servername`，否则使用 server:port；`name-cert-verify` 只改变证书验证名称。legacy H2 的 host 省略或为空列表时使用 www.example.com，path 省略或为空时使用 `/`。
+- `network: xhttp` 支持 H1/H2 明文、TLS1.3、REALITY、JLS 或 ShadowTLS v3，H3 仅标准 TLS1.3。请求字段、独立下载腿、池与版本选择见 [XHTTP](xhttp.md)。H3 的物理 UDP 仍由原 Dialer/上游图创建。
+- 公共节点 `smux` 以独立的 h2mux/smux v1/yamux 承载逻辑 TCP/UDP；VLESS 只提供正常 TCP 到约定目标，不拥有第二个 mux 池。它不是 XUDP；only-tcp、调度及关闭边界见 [通用 sing-mux](xhttp.md#通用-sing-mux)。
+- Vision 仅允许 `network: tcp`，要求 TLS 1.3/REALITY 或 Encryption；UDP 仅 XUDP，`packet-encoding: none` 同样归一为 XUDP。启用 Encryption 后外层 TLS 可省略，存在时仍保持独立认证。配置阶段拒绝 WS/gRPC/HTTP/H2/XHTTP、packetaddr、sing-mux 与 Vision 的组合，包括未启用业务 UDP 但显式选错编码。ECH 和附加安全封装仍拒绝。
 - Vision 请求不自动降级；对端用户不支持 Vision 时业务失败。Mihomo 服务端允许为 Vision 用户显式配置空 flow，这属于普通 VLESS 模式，不是错误 flow 的拒绝用例。
 
 ## REALITY
 
-`reality-opts.support-x25519mlkem768` 为非 null 布尔值，默认 false。true 强制真实混合
-TLS 密钥交换，服务端选择经典组时失败；可用于主连接和 XHTTP 独立下载连接。
-仅 `chrome` 或未命名 profile 兼容，模板及下载继承约束见 [TLS 指纹](tls-client-fingerprint.md)。
+`reality-opts.support-x25519mlkem768` 为非 null 布尔值，默认 false。true 允许同次握手
+协商真实混合或经典 TLS 密钥交换，可用于主连接和 XHTTP 独立下载连接。
+`chrome` 和未命名 profile 提供混合/X25519 双 share，其余 TLS1.3 模板保留真实经典 share；
+不改写模板、重试握手或放宽 REALITY 认证。模板及下载继承约束见 [TLS 指纹](tls-client-fingerprint.md)。
 
 ## JLS
 
@@ -34,7 +37,7 @@ TLS 密钥交换，服务端选择经典组时失败；可用于主连接和 XHT
   主连接不接受空对象；未知字段、null、错型、缺项及超限在 IO 前拒绝。
 - 必须 `tls: true`。同一腿不能混用 REALITY、标准证书策略或客户端证书；
   ECH、其他安全封装、Vision 和 HTTP/3 也不属于此组合。
-- `servername`、有序 ALPN、传输必需 ALPN 与已支持的七值/四模板
+- `servername`、有序 ALPN、传输必需 ALPN 与具备 TLS1.3 能力的命名模板
   `client-fingerprint` 沿用共享配置，不增加全局默认或别名。
 - `download-settings.jls-opts` 缺省继承整个身份；非空对象必须完整替换两项，
   `{}` 清除，不能按叶继承另一个身份的密码。其他下载字段独立覆盖。
@@ -57,32 +60,38 @@ TLS 1.2 和 HRR 都不能满足 JLS；失败不发伪装 HTTP 探测、不重发
 JLS 继续承载 TLS 记录，CloseWrite 沿用共享 TLS 有界关闭；XHTTP 保持整流关闭。
 Encryption 位于外层传输内，身份彼此独立，不能由单层成功推断组合验收。
 
-## 静态 ECH
+## ECH
 
-仅显式静态 ECHConfigList；保护内层 ClientHello 名称，不隐藏 IP、外层名称或流量形态。
-无动态 HTTPS RR/bootstrap、公共 DNS 后备或自动更新。
+静态 ECHConfigList 或运行时 HTTPS 记录来源保护内层 ClientHello 名称，
+不隐藏 IP、外层名称或流量形态。VMess/Trojan/AnyTLS/Hysteria2 共用此配置和失败契约。
 
 ### 配置
 
 ```yaml
 ech-opts:
   enable: true
-  config: "<服务端提供的标准 Base64 ECHConfigList>"
+  # config: "<服务端提供的标准 Base64 ECHConfigList>" # 非空时优先，不查询 DNS
+  # query-server-name: query.example # 只覆盖 DNS 查询名；省略时查询 servername
 ```
 
 - 仅标准 TLS，内层 `servername` 必须是 DNS 名，实际只协商 TLS 1.3。
   同腿不能与 REALITY、JLS 或 Vision 混用；可与 VLESS Encryption、证书策略、
   mTLS 和既有传输组合。命名指纹仍只用于 TCP TLS，H3 仍拒绝命名指纹。
-- `enable` 默认 false。启用必须同时提供非空 `config`；不查询 HTTPS RR，
-  不接收 `query-server-name`，没有公共 DNS 后备或自动更新配置。
+- `enable` 默认 false，关闭时忽略 config/query-server-name。启用且 config 为空或省略时，
+  每条新物理 TLS/QUIC 连接通过节点 DNS 角色查询 HTTPS (65)，消费第一个含二进制
+  ECH key 5 参数的有效记录；沿用有界 wire cache 和 singleflight。静态 config 优先。
+- `query-server-name` 只覆盖查询名，不改实际拨号目标、SNI、证书验证名、ALPN 或端口。
+  不查询 SVCB (64) 后备，不按服务优先级重排，不自行跟随 AliasMode。
+  DNS 启用时使用 proxy-server-nameserver 角色；关闭 DNS 和 node-only measureDelay 时
+  使用原 Dialer 的物理 system DNS 元数据。平台来源不可用则失败，无额外公共 DNS 后备。
 - `config` 是标准带填充 Base64，不是 URL、文件路径或 PEM。解码后的完整
-  ECHConfigList 最多 65,537 字节，仍受整份配置 256 KiB 上限限制。
-- 支持 ECH 版本 `0xfe0d`、X25519/HKDF-SHA256，以及 AES-128-GCM、
-  AES-256-GCM、ChaCha20-Poly1305。预检选取第一个双方后端均支持的条目，
-  保留其原始编码；未知版本或不兼容条目可跳过，无兼容条目、畸形长度、非法
-  public_name 或不支持的必需扩展在 IO 前失败。不能依赖 BoringSSL 静默忽略。
-- `{}` / `{enable: false}` 清除 ECH。关闭时不允许携带非空 config，以免
-  用户认为给出的隐私配置已经生效。null、未知字段、错型均拒绝；诊断不回显配置。
+  ECHConfigList 最多 65,537 字节，仍受整份配置 8 MiB 上限限制。
+- ECH 版本为 `0xfe0d`。按实际 [后端算法](tls-dependencies.md) 选取第一个兼容条目，
+  保留其原始编码；下载腿切换后端时按完整来源重新选择。未知版本或不兼容条目可跳过，
+  无兼容条目、畸形长度、非法 public_name 或不支持的必需扩展失败，不能依赖 BoringSSL 静默忽略。
+- public_name 要求多标签 LDH 名称；Rustls 的名称类型另限制每标签 63 字节并拒绝纯数值末段，
+  Boring 命名指纹还拒绝十六进制 IP lookalike。这里保留真实后端限制，不能宣称任意 Go DNS 名称均兼容。
+- `{}` / `{enable: false}` 清除 ECH。null、未知字段、错型均拒绝；诊断不回显配置或查询名。
 
 `xhttp-opts.download-settings.ech-opts` 缺省继承整个主腿对象；出现时整对象替换，
 不逐字段合并，替换密钥须同时写 `enable: true`。显式 `{}` 可仅清除下载腿 ECH。
@@ -91,18 +100,22 @@ ech-opts:
 
 ### 后端与失败边界
 
-无指纹 TCP TLS 与 H3 使用官方 rustls + ring，通过公开 HPKE trait 接入官方
-`hpke`；命名指纹使用锁定的自有 boring fork 既有 ECH 接口。本次不修改
-第三方 TLS 实现，不恢复 rustls fork，也不扩展 Shadowsocks 的 AWS-LC 例外。
+无指纹 TCP TLS 与 XHTTP H3 的 Quinn 使用官方 rustls + ring，通过公开 HPKE trait 接入官方
+`hpke`；命名指纹使用锁定的同一 boring ECH 接口。XHTTP H3 保留 rustls 的完整 ECH
+算法范围；Boring 命名指纹限定 X25519/HKDF-SHA256，加 AES128/256-GCM 或 ChaCha20-Poly1305。
+切换下载腿时按完整静态来源和实际后端重新选择，动态来源也按实际后端解析；
+没有兼容配置就失败。动态来源只获取配置，不扩大后端算法范围。
 
 两后端都必须真正接受 ECH 才交出业务连接。rustls QUIC 的 ECH 拒绝作为原生
-握手错误传播，H3 在握手完成前不发送 HTTP 请求；TCP 另检查 accepted 状态。
+握手错误传播，XHTTP H3 还检查实际 ALPN，通过前不发送 HTTP 请求。
+TCP 同样检查 accepted 状态。
 不把 GREASE 当真实 ECH，不自动采用 retry config，不重拨、不回放业务，也不
-降级为未加密 ClientHello 的成功连接。错误或轮换后的旧密钥需要宿主更新配置。
+降级为未加密 ClientHello 的成功连接。静态旧密钥需宿主更新配置；动态新连接随 DNS 缓存有效期取得来源。
 
-静态 ECH 连接禁用 TLS 会话恢复和 0-RTT；XHTTP/gRPC 的已认证物理连接仍可在
+ECH 连接禁用 TLS 会话恢复和 0-RTT；XHTTP/gRPC 的已认证物理连接仍可在
 原节点内复用。不同节点、主/下载腿、配置替换和后续运行实例不会共享 TLS 票据。
-本层只包装调用方提供的 IO，不创建 resolver、socket、后台任务或全局缓存。
+本层只包装调用方提供的 IO；DNS 查询由原建链期限和解析上下文取消拥有，
+只弱引用运行时 DNS，不创建独立 resolver、socket、后台刷新任务或全局可变缓存。
 
 正常 ECH 接受后沿用内层证书名称、pin 和 mTLS 策略。拒绝分支不返回业务成功，
 也不能发送客户端证书。boring 使用原生 outer-name override，按外层名称和默认
@@ -146,27 +159,45 @@ Vision padding、TLS 记录过滤和读写切换状态独立管理。内层非 T
 
 ## UDP
 
-`packet-encoding` 默认 **xudp**，与既有 Vole 行为一致：
+`packet-encoding` 默认 **xudp**，`none` 与 `xudp` 使用相同编码：
 
 | 配置 | 线上语义 | 目标 |
 | --- | --- | --- |
-| 省略 / `xudp` | VLESS CommandMux + 共享 XUDP 帧 | 每包携带 IP / 域名 |
-| `none` | VLESS CommandUDP + 两字节长度 | 固定首包目标，后续换目标失败 |
+| 省略 / `xudp` / `none` | VLESS CommandMux + 共享 XUDP 帧 | 每包携带 IP / 域名 |
 | `packetaddr` / `packet` | CommandUDP 到原生约定地址，长度帧内再带地址 | IP-only，域名经受控 ResolutionContext 解析 |
 
-`none` 是 Vole 的显式 raw 拼写，不是对 Mihomo 同名字段的兼容承诺。原生约定地址不做本地 DNS。UDP 443 不额外过滤。
+packetaddr 的原生约定地址不做本地 DNS。UDP 443 不额外过滤。
 
-raw/packetaddr 每关联只拥有一个已建流，首次发送前已固定物理上游选择和建链期限；等待首包不会重新选择组或重启期限。packetaddr 不调用系统 resolver：运行期使用本 Running Session DNS，独立测速使用受控 bootstrap。
+VLESS 不发送非零 XUDP GlobalID，不请求服务端跨载体继承 UDP 关联。同一来源可能同时拥有
+不同节点、资源代际、域名隔离或退役后仍服务兄弟目标的通道；这些通道保持独立，不能仅按
+来源生成相同 GlobalID。当前关联失败后关闭，不自动重连或恢复服务端原有 UDP 出口映射。
 
-收发预算独立与调用方预算取交集。raw/XUDP payload 受 u16 上限约束，packetaddr 另扣 IPv4 7 / IPv6 19 字节地址头（未解析域名按较大开销预检）。raw/packetaddr 接收 wire 最多 65,537 字节，逐段读取，合法超接收预算的整包丢弃。对端可能有更小容量，原生夹具预算不能冒充生产协议上限。
+packetaddr 每关联只拥有一个已建流，首次发送前已固定物理上游选择和建链期限；等待首包不会重新选择组或重启期限。packetaddr 不调用系统 resolver：运行期使用本 Running Session DNS，独立测速使用受控 bootstrap。
 
-部分发送取消立即关闭 IO，不允许接着发送半帧；接收取消保留帧进度。非法帧或响应头关闭关联，不切换编码、不回退 DIRECT。显式 close 后不能恢复收发。
+收发预算独立与调用方预算取交集。XUDP payload 受 u16 上限约束，packetaddr 另扣 IPv4 7 / IPv6 19 字节地址头（未解析域名按较大开销预检）。packetaddr 接收 wire 最多 65,537 字节，逐段读取，合法超接收预算的整包丢弃。对端可能有更小容量，原生夹具预算不能冒充生产协议上限。
+
+XUDP 在既有单帧字节预算内读取已就绪字节，消费当前帧后保留后续帧的尾部；不等待凑批，
+也不为每个长度或地址字段分别进入底层 TLS/HTTP 接收。
+省略回复目标仅在关联始终使用同一目标时可恢复；多目标关联收到无目标回复会关闭，避免串流交付。
+无 VLESS Encryption 的 H1/H2/H3 XHTTP 由自有驱动独立推进已接受的写入，XUDP 首包保留建链 flush，
+后续帧交给既有有界发送队列；其它传输仍逐帧 flush。
+packetaddr 在同一适用范围保留 VLESS 请求头与首个 DATA 帧的强制 flush，首个 DATA
+仍受原建链绝对期限约束。后续完整帧被既有有界 writer 接纳后即可返回，不额外逐帧等待
+packet-up 的 POST 响应；容量不足时仍沿原背压等待。timer／IO 驱动独立推进末帧，
+不依赖下一次收发。启用 VLESS Encryption 或非 XHTTP 路径仍逐帧 flush。
+返回成功表示接纳，不代表远端确认；显式 close／Stop 可以取消尚未确认的 UDP，
+不承诺排空这些帧。来源隔离、目标地址恢复、部分发送取消及原有 TCP FIN／XHTTP 整流关闭合同保持。
+
+packetaddr 和 XUDP 在关联中最多保留一个待写帧及偏移；取消发送后，下次收发先完成该帧与必要的 flush，再处理新包，保持共享通道边界。packetaddr 在发布关联前完成固定魔法目的的传输准备，首次报文仍受原建链期限约束，不因取消重置。相同来源、相同具体节点且无需地址恢复的 IP 目标可共享一条 packetaddr wire；每包回包地址用于分发，域名、fake-IP 与嗅探覆盖路径仍保留独立 wire。最后所有者关闭可直接终止未完成帧，不在其中插入 END 帧。接收取消保留帧进度。非法帧或响应头关闭关联，不切换编码、不回退 DIRECT。显式 close 后不能恢复收发。
 
 ## 关闭和期限
 
-VLESS 响应头允许延迟到业务响应前；TCP 不等待它才允许发送请求。读取、首次响应和传输握手共用原建链期限，错误或超时释放 IO。UUID 和业务目标不进入 Debug/诊断。
+VLESS 响应头允许延迟到业务响应前；TCP 不等待它才允许发送请求。传输握手及请求头写入、flush 共用原建链期限，请求头成功提交后结束该期限；响应头随后按需读取、校验，持续上传不因缺少下行响应被原建链期限中断。业务等待由调用者期限、取消、EOF及运行时停止控制，格式错误仍释放IO。UUID 和业务目标不进入 Debug/诊断。
 
-普通 TCP/TLS 按底层 CloseWrite 语义工作；HTTP 首包伪装没有 Mihomo CloseWrite，shutdown 释放整个逻辑流并唤醒读侧。gRPC/H2 结束当前逻辑流，gRPC 的兄弟流与节点池不受影响。XHTTP 上传 EOF/shutdown 关闭整条逻辑连接，包括下载腿；需要完整响应时在关闭前读完。验收分别检查正常完整性和对齐 Mihomo 的关闭行为，不要求所有传输半关闭后都收到尾包。
+HTTP 首包伪装在完整请求前导提交后按需解析首响应，不为该响应保留旧建链期限；
+VLESS Encryption 等仍未完成的协议握手继续受原建链期限约束，不从 HTTP 前导提交推定完成。
+
+普通 TCP/TLS 按底层 CloseWrite 语义工作；HTTP 首包伪装没有 Mihomo CloseWrite，shutdown 释放整个逻辑流并唤醒读侧。gRPC/H2 结束当前逻辑流，gRPC 的兄弟流与节点池不受影响。XHTTP 上传 EOF/shutdown 关闭整条逻辑连接，包括下载腿；需要完整响应时在关闭前读完。验收检查正常数据完整性、与支持对端的互通，以及 Vole 声明的关闭、取消和 Stop 契约，不要求所有传输半关闭后都收到尾包。
 
 ## 验证边界
 
@@ -179,6 +210,8 @@ HTTP/H2/扩展 WS 可用 Xray TLS 网关 → V2Ray transport；需 UDP/Encryptio
 Mihomo 解码。网关使用官方 XRAY_BUF_SPLICE=disable，避免下行 raw splice 绕过 TLS；
 不代表 V2Ray 直接支持 ECH。无指纹 JLS/gRPC 及 Safari ECH/gRPC 的官方对照缺口采用
 明确标注的 Chrome 关闭参照；Vole 原配置的数据面单独验证，不声称同配置差分。
-VLESS 不接受动态 ECH、ShadowTLS 或 Restls 配置；ShadowTLS v3 仅用于 SS2022 插件。
+VLESS 的 `shadow-tls-opts` 仅接已有 TCP 承载传输及 XHTTP H1/H2，包含独立下载腿；
+须 `tls: true`、显式 version 3 和 password，不能与 Vision/JLS/REALITY/ECH 同腿混用。
+cover 的证书策略与 mTLS 独立于业务身份，行为见 [流式安全身份](outbounds.md#流式安全身份)。
 
-WS + REALITY（普通 WS、HTTPUpgrade、fast-open）的数据及认证使用真实 Mihomo listener；关闭验证采用明确标注的分层参照。当前 Mihomo WS 客户端分支未接入 REALITY，不能作为同组合对照，因此使用标准 TLS 的同种传输客户端关闭基线，并独立验证 REALITY。不得将该结果写成 Mihomo WS + REALITY 客户端互通或同组合差分通过。
+REALITY 只接流式 TLS 消费路径；普通 WS、HTTPUpgrade 及其 fast-open 与 REALITY 的组合在配置期拒绝。

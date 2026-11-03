@@ -1,6 +1,17 @@
 use vole_blake3_raw::derive_key;
 
 #[test]
+fn links_the_required_official_c_library_version() {
+    unsafe extern "C" {
+        #[link_name = "vole_c_blake3_version"]
+        fn blake3_version() -> *const std::ffi::c_char;
+    }
+    // SAFETY: the public API returns a static NUL-terminated version string.
+    let version = unsafe { std::ffi::CStr::from_ptr(blake3_version()) };
+    assert_eq!(version.to_bytes(), b"1.8.7");
+}
+
+#[test]
 fn derives_binary_context_without_utf8_conversion() {
     // Independent github.com/metacubex/blake3 v0.1.0 DeriveKey result.
     let context: Vec<u8> = (0..16).map(|i| (i * 37 + 255) as u8).collect();

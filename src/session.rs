@@ -103,20 +103,97 @@ impl fmt::Display for Destination {
 pub enum InboundKind {
     Tun,
     Http,
+    Https,
     Socks5,
     /// Core-originated DNS traffic sent through the raw proxy dispatcher.
     /// This context must never be passed back through the routing dispatcher.
     InternalDns,
-    /// Core-owned GeoData HTTPS traffic sent through the raw default proxy.
-    /// This context must never be passed through routing or fall back to direct.
+    /// Core-owned GeoData HTTPS traffic routed by the current mode and rules.
     InternalGeoData,
     /// Core-owned latency probe sent through a node-only default proxy graph.
     /// This context never enters the public inbound or routing pipeline.
     InternalMeasure,
 }
 
+/// Authenticated ingress identity owned by a request or authorized association.
+/// Debug never exposes usernames; the Arc does not retain credential/config state.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct InboundMetadata {
+    pub local_port: u16,
+    pub user: Option<Arc<str>>,
+    /// Actual accepted socket address, distinct from its proxy request target.
+    pub local_address: Option<SocketAddr>,
+    pub(crate) original: Option<Arc<InboundSnapshot>>,
+}
+/// Immutable ingress facts, captured before sniffing/routing/upstream rewrites.
+/// It owns only small values, never a runtime/configuration generation.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct InboundSnapshot {
+    pub source: SocketAddr,
+    pub destination: Destination,
+    pub socket_destination: Option<SocketAddr>,
+    pub inbound: InboundKind,
+    pub user: Option<Arc<str>>,
+}
+impl fmt::Debug for InboundSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("InboundSnapshot { .. }")
+    }
+}
+impl fmt::Debug for InboundMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InboundMetadata")
+            .field("local_port", &self.local_port)
+            .field("authenticated", &self.user.is_some())
+            .finish()
+    }
+}
+impl InboundMetadata {
+    pub const fn new(local_port: u16) -> Self {
+        Self {
+            local_port,
+            user: None,
+            local_address: None,
+            original: None,
+        }
+    }
+    pub(crate) fn snapshot(
+        &self,
+        source: SocketAddr,
+        inbound: InboundKind,
+        destination: &Destination,
+    ) -> Arc<InboundSnapshot> {
+        self.original
+            .clone()
+            .unwrap_or_else(|| Arc::new(self.facts(source, inbound, destination)))
+    }
+    pub(crate) fn facts(
+        &self,
+        source: SocketAddr,
+        inbound: InboundKind,
+        destination: &Destination,
+    ) -> InboundSnapshot {
+        InboundSnapshot {
+            source,
+            destination: destination.clone(),
+            inbound,
+            user: self.user.clone(),
+            socket_destination: if inbound == InboundKind::Tun {
+                match destination {
+                    Destination::Ip(address) => Some(*address),
+                    _ => None,
+                }
+            } else {
+                self.local_address
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamSession {
+    pub metadata: InboundMetadata,
     pub inbound: InboundKind,
     pub source: SocketAddr,
     pub destination: Destination,
@@ -126,9 +203,21 @@ pub struct StreamSession {
     /// `destination`, which preserves the original TUN IP target.
     pub sniffed_domain: Option<String>,
 }
+impl StreamSession {
+    pub(crate) fn capture_original(&mut self) {
+        if self.metadata.original.is_none() {
+            self.metadata.original = Some(self.metadata.snapshot(
+                self.source,
+                self.inbound,
+                &self.destination,
+            ));
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatagramSession {
+    pub metadata: InboundMetadata,
     pub inbound: InboundKind,
     pub source: SocketAddr,
     max_response_payload_size: u16,
@@ -148,10 +237,11 @@ impl DatagramSession {
             InboundKind::InternalDns => INTERNAL_DNS_XUDP_MAX_RESPONSE_PAYLOAD_SIZE,
             InboundKind::InternalGeoData => XUDP_MAX_RESPONSE_PAYLOAD_SIZE,
             InboundKind::InternalMeasure => XUDP_MAX_RESPONSE_PAYLOAD_SIZE,
-            InboundKind::Http => XUDP_MAX_RESPONSE_PAYLOAD_SIZE,
+            InboundKind::Http | InboundKind::Https => XUDP_MAX_RESPONSE_PAYLOAD_SIZE,
             InboundKind::Socks5 => SOCKS5_UDP_PAYLOAD_LIMIT,
         };
         Self {
+            metadata: InboundMetadata::new(0),
             inbound,
             source,
             max_response_payload_size,
@@ -163,6 +253,7 @@ impl DatagramSession {
     pub(crate) const fn for_tun(source: SocketAddr, mtu: usize) -> Self {
         let payload_size = mtu.saturating_sub(IPV6_UDP_OVERHEAD);
         Self {
+            metadata: InboundMetadata::new(0),
             inbound: InboundKind::Tun,
             source,
             max_response_payload_size: if payload_size > u16::MAX as usize {
@@ -171,6 +262,12 @@ impl DatagramSession {
                 payload_size as u16
             },
         }
+    }
+
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: InboundMetadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     #[must_use]

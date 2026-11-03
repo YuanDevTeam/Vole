@@ -25,6 +25,7 @@ mod tests {
         let context = SecurityContext {
             provider: provider.clone(),
             tls_roots: Arc::new(roots),
+            identities: Arc::default(),
         };
         let client = StandardTlsClient::with_options(
             &context,
@@ -87,10 +88,6 @@ mod tests {
     }
     #[tokio::test]
     async fn record_boundary_preserves_buffered_plaintext_and_coalesced_raw_tail_and_flush_order() {
-        let _case = crate::resources::case_events::Case::new(
-            "VLESS-UNIT",
-            "record_boundary_preserves_buffered_plaintext_and_coalesced_raw_tail_and_flush_order",
-        );
         for &profile in crate::security::test_profiles() {
             for limit in [1, 3, 65536] {
                 tokio::time::timeout(Duration::from_secs(3), async {

@@ -10,7 +10,9 @@
       "owner": "limits::TUIC_FIN_GRACE_SECONDS",
       "saturation": "retain TCP send ownership until FIN acknowledgement or bounded grace before retiring the physical connection",
       "cancellation": "node Stop cancels and joins the owned FIN waiter without waiting out the grace",
-      "boundary_cases": ["TUIC-MEMORY"]
+      "boundary_cases": [
+        "TUIC-MEMORY"
+      ]
     },
     {
       "id": "tuic-quic-payload",
@@ -24,33 +26,22 @@
       ]
     },
     {
-      "id": "tuic-uni-streams",
+      "id": "tuic-control-readers",
       "value": 32,
       "unit": "streams",
-      "owner": "limits::TUIC_UNI_STREAMS",
-      "saturation": "withhold incoming credit and expire partial parsers after five seconds",
+      "owner": "limits::TUIC_CONTROL_READERS",
+      "saturation": "limit active control decoders independently of fixed incoming QUIC credit; expire admitted partial parsers after five seconds",
       "cancellation": "node Stop cancels and joins all owned QUIC, parser, heartbeat and upstream tasks",
       "boundary_cases": [
         "TUIC-MEMORY"
       ]
     },
     {
-      "id": "tuic-stream-window",
-      "value": 262144,
-      "unit": "bytes",
-      "owner": "limits::TUIC_STREAM_WINDOW",
-      "saturation": "QUIC receive flow control applies backpressure to unread logical streams",
-      "cancellation": "node Stop cancels and joins all owned QUIC, parser, heartbeat and upstream tasks",
-      "boundary_cases": [
-        "TUIC-MEMORY"
-      ]
-    },
-    {
-      "id": "tuic-connection-window",
+      "id": "tuic-send-window",
       "value": 1048576,
-      "unit": "bytes-per-direction",
-      "owner": "limits::TUIC_CONNECTION_WINDOW",
-      "saturation": "bound QUIC receive credit and unacknowledged send buffering per connection",
+      "unit": "bytes",
+      "owner": "limits::TUIC_SEND_WINDOW",
+      "saturation": "bound retained unacknowledged send bytes per physical connection; receive credit follows configured initial/max",
       "cancellation": "node Stop cancels and joins all owned QUIC, parser, heartbeat and upstream tasks",
       "boundary_cases": [
         "TUIC-MEMORY"
@@ -118,7 +109,10 @@
       "owner": "limits::SHADOWSOCKS_WRITE_CHUNK",
       "saturation": "partial write then backpressure while the bounded owned chunk drains",
       "cancellation": "stream drop releases plaintext and codec; flush and shutdown drain the exact accepted chunk",
-      "boundary_cases": ["INTEGRATION-DEBUG", "INTEGRATION-RELEASE"]
+      "boundary_cases": [
+        "INTEGRATION-DEBUG",
+        "INTEGRATION-RELEASE"
+      ]
     },
     {
       "id": "xhttp-custom-header-bytes",
@@ -169,7 +163,18 @@
       "value": 65536,
       "unit": "bytes-per-batch",
       "owner": "limits::XHTTP_PACKET_BATCH_BYTES",
-      "saturation": "backpressure one filling batch and one in-flight batch; never allocate the configured POST maximum",
+      "saturation": "H1/H2 backpressure one batch including the in-flight POST; never allocate the configured POST maximum",
+      "cancellation": "logical drop cancels the timer/upload; node Stop joins the owned driver",
+      "boundary_cases": [
+        "XHTTP-UNIT"
+      ]
+    },
+    {
+      "id": "xhttp-h3-packet-batch",
+      "value": 131072,
+      "unit": "bytes-per-batch",
+      "owner": "limits::XHTTP_H3_PACKET_BATCH_BYTES",
+      "saturation": "H3 backpressure one batch including the in-flight POST; use the smaller sampled POST limit without a second batch",
       "cancellation": "logical drop cancels the timer/upload; node Stop joins the owned driver",
       "boundary_cases": [
         "XHTTP-UNIT"
@@ -235,7 +240,7 @@
       "value": 16384,
       "unit": "bytes",
       "owner": "limits::XHTTP_BODY_CHUNK",
-      "saturation": "split streaming writes; a packet-up body uses the separately bounded xhttp-packet-batch limit",
+      "saturation": "split streaming writes; a packet-up body uses xhttp-packet-batch for H1/H2 or xhttp-h3-packet-batch for H3",
       "cancellation": "runtime Stop cancels and joins node-owned drivers; drops queues and retained IO",
       "boundary_cases": [
         "XHTTP-UNIT"
@@ -284,6 +289,15 @@
       "boundary_cases": [
         "XHTTP-UNIT"
       ]
+    },
+    {
+      "id": "xhttp-h3-udp-send-window",
+      "value": 196608,
+      "unit": "bytes",
+      "owner": "limits::XHTTP_H3_UDP_SEND_WINDOW",
+      "saturation": "qualified physical starts64KiB; successful local mux UDP metadata flush raises shared retained-write admission192KiB once",
+      "cancellation": "failed/cancelled metadata does not raise; Weak does not own native lifecycle; original Stop joins drivers",
+      "boundary_cases": ["XHTTP-UNIT"]
     },
     {
       "id": "sing-mux-idle",
@@ -367,7 +381,7 @@
     },
     {
       "id": "config-bytes",
-      "value": 262144,
+      "value": 8388608,
       "unit": "bytes",
       "owner": "config::MAX_CONFIG_BYTES",
       "saturation": "reject oversized YAML",
@@ -467,10 +481,10 @@
     },
     {
       "id": "ws-early-data",
-      "value": 2048,
+      "value": 11904,
       "unit": "bytes",
       "owner": "transport::MAX_EARLY_DATA_BYTES",
-      "saturation": "reject invalid option, put excess initial bytes in data frames",
+      "saturation": "cap initial bytes by the actual HTTP head budget and this maximum; put excess bytes in data frames",
       "cancellation": "no separate task",
       "boundary_cases": [
         "FOUNDATIONS-STREAM"
@@ -634,10 +648,10 @@
     },
     {
       "id": "tun-udp-response",
-      "value": 4096,
+      "value": 256,
       "unit": "items",
       "owner": "ResourceLimits::tun_udp_response_queue_capacity",
-      "saturation": "drop only the current ordinary UDP response without refreshing association activity",
+      "saturation": "one pending response per source pauses that association until writeback capacity; cancellation discards pending data",
       "cancellation": "existing runtime-owned cancellation and Stop barrier",
       "boundary_cases": [
         "FOUNDATIONS-REGRESSION"
@@ -803,11 +817,33 @@
       ]
     },
     {
+      "id": "hy2-submission-queue",
+      "value": 32,
+      "unit": "messages-per-connection",
+      "owner": "limits::HY2_SUBMISSION_QUEUE",
+      "saturation": "wait before reserving a Packet ID or encoding fragments",
+      "cancellation": "cancel pending admission; connection Stop drops queued messages and joins its existing owner",
+      "boundary_cases": [
+        "INTEGRATION-ADAPTER"
+      ]
+    },
+    {
+      "id": "hy2-auth-sessions",
+      "value": 2,
+      "unit": "current-connections-per-node",
+      "owner": "limits::HY2_AUTH_SESSIONS",
+      "saturation": "reuse the source-selected slot; replace only a closed session",
+      "cancellation": "close admission and cancel/join every authenticated session",
+      "boundary_cases": [
+        "INTEGRATION-ADAPTER"
+      ]
+    },
+    {
       "id": "hy2-pending-packets",
       "value": 64,
       "unit": "partial-packets-per-connection",
       "owner": "limits::HY2_PENDING_PACKETS",
-      "saturation": "drop excess partial packets; retain bounded completion tombstones",
+      "saturation": "evict oldest incomplete packet to admit new fragments; completed IDs are immediately released",
       "cancellation": "owned logical close or physical session Stop releases retained state and joins drivers",
       "boundary_cases": [
         "HYSTERIA2-UNIT",
@@ -875,23 +911,11 @@
       ]
     },
     {
-      "id": "hy2-stream-window",
-      "value": 262144,
-      "unit": "bytes",
-      "owner": "limits::HY2_STREAM_WINDOW",
-      "saturation": "QUIC receive flow control",
-      "cancellation": "owned logical close or physical session Stop releases retained state and joins drivers",
-      "boundary_cases": [
-        "HYSTERIA2-UNIT",
-        "HYSTERIA2-OWNED"
-      ]
-    },
-    {
-      "id": "hy2-connection-window",
+      "id": "hy2-send-window",
       "value": 1048576,
       "unit": "bytes",
-      "owner": "limits::HY2_CONNECTION_WINDOW",
-      "saturation": "QUIC aggregate send and receive flow control",
+      "owner": "limits::HY2_SEND_WINDOW",
+      "saturation": "bound retained unacknowledged send bytes per physical connection; receive credit follows configured initial/max",
       "cancellation": "owned logical close or physical session Stop releases retained state and joins drivers",
       "boundary_cases": [
         "HYSTERIA2-UNIT",
@@ -899,11 +923,23 @@
       ]
     },
     {
-      "id": "hy2-datagram-buffer",
-      "value": 262144,
-      "unit": "bytes-per-direction",
-      "owner": "limits::HY2_DATAGRAM_BUFFER",
-      "saturation": "QUIC bounds retained datagram queues",
+      "id": "hy2-datagram-send-buffer",
+      "value": 4194304,
+      "unit": "bytes-per-node",
+      "owner": "limits::HY2_DATAGRAM_SEND_BUFFER",
+      "saturation": "bound retained outgoing QUIC datagrams; sends wait for capacity",
+      "cancellation": "owned logical close or physical session Stop releases retained state and joins drivers",
+      "boundary_cases": [
+        "HYSTERIA2-UNIT",
+        "HYSTERIA2-OWNED"
+      ]
+    },
+    {
+      "id": "hy2-datagram-receive-buffer",
+      "value": 2097152,
+      "unit": "bytes-per-node",
+      "owner": "limits::HY2_DATAGRAM_RECEIVE_BUFFER",
+      "saturation": "bound retained incoming QUIC datagrams; Quinn drops old frames when full",
       "cancellation": "owned logical close or physical session Stop releases retained state and joins drivers",
       "boundary_cases": [
         "HYSTERIA2-UNIT",

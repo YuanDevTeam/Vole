@@ -11,19 +11,20 @@ TunRuntime -> TunRsIo -> 宿主持有的 TUN fd 副本
 - iOS/tvOS/macOS：宿主提供 utun 文件描述符，适配器处理四字节 packet-information 头。
 - Android：`VpnService` 提供 raw-IP 文件描述符。
 - Linux：真实单队列 TUN，使用 `IFF_TUN | IFF_NO_PI`、无 VNET header；接口实际 MTU
-  必须与 `tun.mtu` 一致。宿主负责地址、网络命名空间和路由，Vole 不自动接管系统网络。
+  必须与 `tun.mtu` 一致。借用 fd 的地址、网络命名空间和路由由宿主负责。
 
 `tun.file-descriptor` 缺省或 0 时，Linux / macOS 由 core 打开本机 TUN，Android / iOS /
 tvOS 仍需宿主提供 fd。`tun.device` 控制原生打开的接口名：空值在 Linux 使用 `Vole`，
-macOS 自动选择 utun。core 只设置自有接口的 MTU 和自有 fd 的 nonblocking，不配置地址、
-DNS 或路由；Stop 关闭自有句柄，不承诺删除宿主已有接口。创建失败没有备用数据面。
+macOS 自动选择 utun。macOS 只设置自有接口的 MTU 和 nonblocking，网络配置仍由宿主负责。
+Linux 自建接口的自动网络配置见下节；关闭自动路由时只设置 MTU/nonblocking。
+Stop 关闭自有句柄，不承诺删除宿主已有接口。创建失败没有备用数据面。
 正数 file-descriptor 选择下述借用路径；fd 数字必须对当前进程有效，CLI 不增加专用 fd 参数。
 
 宿主始终拥有原始文件描述符。Vole 启动时：
 
 1. 验证文件描述符有效且已设置 `O_NONBLOCK`；
 2. 通过 `F_DUPFD_CLOEXEC` 创建 Vole 持有的副本；
-3. 把副本交给 `tun-rs::SyncDevice::from_fd`，并用 Tokio `AsyncFd` 驱动；
+3. 把副本交给 `tun-rs::SyncDevice::from_fd`，再用 Tokio `AsyncFd::register` 驱动；
 4. 停止时只关闭副本。
 
 借用路径不调用会修改共享 open-file-description 标志的异步构造器，也不重配置接口。
@@ -47,16 +48,16 @@ Linux 压测可以把 TUN 创建在客户端 namespace，再把借用 fd 交给�
 首轮验证为 GNU/glibc 原生构建与容器真实 TUN；musl、其他架构、安装交付和设备验收
 不由一次 Linux 容器压测推导。Linux RSS/VmHWM 与 Apple physical footprint 分开报告。
 
-tvOS 首版为 17.0+、ARM64 真机和 Apple Silicon 模拟器，共用原有 TunIo、netstack 和
-Dialer；不新增低内存数量上限，不改变其他平台默认行为。iOS/tvOS 的 TUN 生命周期接入
-Apple Unified Logging、TASK_VM_INFO 当前/进程峰值观察及停止后的 allocator pressure relief。
-既有 35/40/45 MiB 阈值仅发出诊断，不是系统限额或业务准入条件；macOS 不启用这组
-移动扩展周期采样。tvOS 事件使用 tvos_memory_*，iOS 保留 ios_memory_*。
+tvOS 首版为 17.0+、ARM64 真机和 Apple Silicon 模拟器，共用 TunIo、netstack 和
+Dialer。所有平台使用统一的 TUN 内存诊断、allocator 配置和 Stop 后回收策略，
+缓冲、队列和线程策略也不按平台或内存模式切换。内存按默认压力负载统一验收：1 Gbps 不超过 43 MiB，
+2 Gbps 不超过 45 MiB；真实 iOS/tvOS 扩展按整个进程的 physical footprint
+验收，完整口径见[验收边界](acceptance.md)。
 
 Apple 公开 NEPacketTunnelFlow API 是 packetFlow 的包读写，不承诺可取得 raw fd。
-Vole 的借用 fd 契约不能证明宿主 KVC 提取 fd 是稳定公开方案。模拟器 socketpair 只验证
-合成 utun 数据面；真实宿主的 fd 获取/桥接、签名与 entitlement、系统路由、设备生命周期
-及物理内存须独立验收。当前没有新增 packetFlow 回调 ABI，也不暗中回退其他接入路径。
+Vole 的借用 fd 契约不能证明宿主 KVC 提取 fd 是稳定公开方案。真实宿主的 fd 获取/桥接、
+签名与 entitlement、系统路由、设备生命周期及物理内存须独立验收。
+当前没有新增 packetFlow 回调 ABI，也不暗中回退其他接入路径。
 
 包 I/O 规则：
 
@@ -84,7 +85,7 @@ Unix 读缓冲区和公共批次容器复用；非法包只丢该槽位，不丢
 共享 UDP 入站中转队列。TCP/ICMP 使用独立有界 ingress；满时丢当前完整 IP 包并
 计数，TCP 可重传，不等待容量而阻塞其他来源的 UDP/DNS。
 
-唯一 writer 公平轮转 TCP/ICMP raw、普通 UDP 响应和 DNS 响应三个独立通道。
+唯一 writer 公平轮转 TCP/ICMP raw、普通 UDP 响应和 DNS 响应；Linux 真实 Echo 另有独立有界通道。
 UDP 直接在复用的 MTU frame 中构包，不再经过 response writer 和 raw output
 的二次交接；每批最多处理 8 个已就绪项目，非法响应也消耗工作预算。DNS permit
 保留到对应包被平台接受、最终丢弃或取消，ENOBUFS 待重试时不释放；Windows
@@ -105,15 +106,107 @@ token 归还容量。满输出保留尚未处理的 TCP 包和协议状态，低
 丢当前请求。writer 消费包会显式唤醒 Driver；满输出不以零延迟 timer 忙重试，
 输出端关闭则停止 Driver、释放 socket 并唤醒全部等待者。
 
-netstack 的 TCP 接收与发送缓冲可独立配置，各方向的容量包含 smoltcp 与应用
-缓冲，两层各占一半。生产 TUN 仍从现有资源策略取得每方向 32 KiB，合计每流
-64 KiB 数据缓冲；不扩大默认容量、不新增用户 YAML 参数，也不改变其他协议
-的缓冲策略。该容量不包含代理 relay、包队列或 allocator 的内存。
+netstack 的 TCP 接收与发送缓冲可独立配置，各方向的容量包含 smoltcp 缓冲与应用
+队列，两层上限各占一半。生产 TUN 仍使用每方向 32 KiB、合计每流 64 KiB 的数据
+容量上限。应用队列从空分配开始，按实际写入有界增长，分配请求不超过该队列的
+逻辑上限；排空后保留已分配空间直到连接释放。smoltcp 缓冲容量、背压、唤醒、
+flush 与关闭语义保持不变。该容量不包含代理 relay、包队列或 allocator 的内存，
+也不保证进程 RSS 与数据容量相同。
 
 Linux 目前不启用 GRO/GSO：`tun-rs` 的 Linux offload 示例通过 builder 创建并
 配置带 VNET header 的设备，而 Vole 的原生和借用路径均不启用该模式。对现有 raw-IP
 设备调用 `recv_multiple` 不会自动合并读取或启用 offload。Vole 保留宿主
 MTU/格式与 fd 标志，原生 builder 只打开 raw-IP TUN，不暗中启用 offload 或改变借用接口。
+
+## Linux 自建 TUN 的系统网络
+
+`tun.file-descriptor: 0` 的 Linux 路径支持 `auto-route` 和 `auto-detect-interface`，
+两者缺省 true。其他平台缺省 false；借用 fd 路径不修改宿主网络，无论这两个字段的值。
+
+- `auto-detect-interface` 从主路由表检测每个地址族的默认物理出口，最多缓存一秒。
+  新建 TCP/UDP socket 绑定该接口，所有协议、DNS、资源下载共用 Dialer；没有出口时失败。
+  已有 socket 不迁移，下一次建链重新检测。回环目标保持本机访问。
+  全局/节点 `interface-name` 的显式非空值优先于自动识别，DNS `#接口` 优先于全局接口；
+  system/DHCP 来源保留自己的物理接口约束。显式接口不存在或绑定失败不会回退自动识别。
+- `auto-route` 独占创建配置命名的 raw-IP TUN，已有同名接口失败。IPv4 使用
+  `dns.fake-ip-range` 的原始 IPv4 地址（默认 `198.18.0.1`），前缀固定 /30；IPv6 地址从 `inet6-address` 读取。
+  路由表 `iproute2-table-index`（缺省/0 为 2022）、规则优先级
+  `iproute2-rule-index` 到 `+8`（缺省/0 从 9000 开始）必须空闲；保留主表的非默认路由，
+  缺省仅本机未标记流量经 TUN，显式输入接口作用域见下节。物理 socket 保留全局/节点
+  继承后的非零 `routing-mark`；只有零 mark 才注入内部防环值，两者均绕过本会话捕获。
+  不依靠 source IP 避免递归，也不新增覆盖用户策略路由的旁路规则。配置接口与路由直接
+  通过内核接口完成，不调用 ip 子进程。动态 Provider 候选沿用相同 socket 策略。
+  回环物理目标继续忽略公开 mark/接口并使用私有隔离；system/DHCP 保留其精确物理绑定。
+  借用 fd 和关闭 auto-route 的路径不注入私有 mark，保留原配置 mark。
+- 自动路由启用，且 `dns.enable: true`、`dns-hijack` 匹配接口 IPv4 下一地址的 53 端口时，
+  通过 systemd-resolved 给新接口设置 DNS（默认 `198.18.0.2`）、路由域 `~.` 和 default-route。
+  系统须使用 systemd-resolved；调用 `/usr/bin/resolvectl --no-ask-password`，
+  每次最多五秒并收回子进程。未启用 DNS 或关闭匹配劫持时保留系统 DNS 行为。
+  不覆盖 `/etc/resolv.conf` 或其他接口设置，也不新增 DNS 配置字段。
+- 启动失败逆序撤销已应用的操作；正常 Stop 先停止业务，再恢复 DNS、规则与路由，
+  最后释放自建接口。清理期间额外持有接口 fd，避免接口索引被提前复用。
+  已被外部移除的自有路由视为完成，其他清理错误作为停止错误返回。
+
+安装包负责权限：`packaging/linux/post-install` 为 `/usr/bin/vole` 设置
+`CAP_NET_ADMIN`，并把执行权限限制给 `vole` 组。安装器为获授权用户添加组成员关系，
+将 `50-vole-resolved.rules` 安装到 `/usr/share/polkit-1/rules.d/`，并依赖 systemd-resolved、
+polkit 与提供 setcap 的包。deb postinst / rpm %post 每次更新二进制后执行该脚本。
+运行时不弹出提权请求，不使用 sudo，也不把 capability 传给 resolvectl 子进程；
+后者使用已安装的 [resolve1 授权](https://github.com/systemd/systemd/blob/main/src/resolve/org.freedesktop.resolve1.policy)。
+CLI 的进程启动、后台管理及用户授权仍由调用方负责。
+
+### Linux 捕获范围
+
+`inet6-address` 是接口地址列表，保留地址的 host bits，缺省为
+`fdfe:dcba:9876::1/126`；显式 `[]` 不配置 IPv6 捕获，顶层 `ipv6: false`
+也不配置该地址族。IPv4 地址仍从有效 fake-IP 范围导出 `/30`，不新增独立 IPv4 地址字段。
+
+`route-address` 与 `route-exclude-address` 接受统一的 IPv4/IPv6 CIDR。
+每个可用地址族没有指定捕获网段时使用默认网段；排除网段优先，先做精确 CIDR 相减，
+再安装本会话独占表中的路由。保留 main 表的非默认路由；53 端口先尝试捕获表，
+排除网段仍可绕过。捕获作用域内的未标记流量进入规则，Core 的非零公开或私有出口 mark 不进入捕获。
+
+`include-interface/exclude-interface` 是 Linux RPDB 的输入接口名称筛选，不是物理出口。
+本机 output 使用 `lo`。非空 include 仅捕获所列输入，优先于 exclude（此时不使用 exclude）；
+要同时捕获本机须列出 `lo`。include 为空、exclude 非空时捕获未排除的输入和本机；
+两者均空保留仅本机的缺省作用域。TUN 自身输入与 Core 的带标记物理 socket 始终绕过。
+接口名在配置阶段按 Linux 名称语法与 15 字节上限验证，不要求接口已存在；
+缺失或消失的名称不匹配其他输入，之后出现或恢复同名接口可再次匹配，无需监视任务或重建规则。
+IPv4/IPv6 使用相同接口筛选；只改变本会话的捕获，不设置 forwarding、NAT 或防火墙。
+
+`include-uid/include-uid-range` 限定本机 UID 捕获范围；省略时为全部 UID。
+`exclude-uid/exclude-uid-range` 优先排除，端口排除使用
+`exclude-src-port/exclude-src-port-range/exclude-dst-port/exclude-dst-port-range`。
+范围格式为 `start:end`，不枚举范围内每个 UID 或端口。排除流量跳过本会话捕获规则，
+由后续系统路由决定去向。UID 仅排除本机应用，端口排除作用于所选输入流量；这些选项不改变出口的 protect/物理绑定。
+
+`strict-route: true` 在自动路由中拒绝所选输入使用没有 TUN 地址的 IPv6 族，
+UID/端口的显式旁路仍生效。它不代替宿主防火墙、权限设置或网络故障时的独立 kill switch。
+配置最多 256 项网络输入、派生最多 4096 条 CIDR 路由；超过预算在创建接口前失败。
+路由索引、输入接口、UID、端口和 CIDR 改动需要重建捕获计划，运行期应用会返回需要重连。
+
+这些自动设置仅用于 Core 自建 Linux TUN 且 `auto-route: true` 的路径。
+借用 fd 与 Apple/Android/UWP/Wintun 的接口地址、捕获范围、DNS 和权限由宿主应用；
+Core 不修改借用接口或将跨平台解析成功视为系统网络配置完成。
+
+## Linux 物理 ICMP Echo
+
+Linux 的真实 Echo 在公共 TUN reader 进入 netstack 前分流，复用共享 Dialer 的受控物理出口，
+只走 DIRECT，不解释 TCP/UDP 代理图。`tun.icmp-timeout` 缺省或 0 为 10 秒；
+`disable-icmp-forwarding` 缺省 false。两个字段只在 Linux 配置中存在，其他平台拒绝未知字段并保留原本地合成行为。
+归一化后的 timeout 或 disable 变化由整个 TunConfig 的现有重连门禁处理。
+
+真实 TUN 地址前缀在启动时从实际接口及其 network namespace 读取；这些前缀、启用的 fake-IP 池
+及禁用转发的合法 Echo 使用原本地回应。物理失败、权限不足或容量不足不合成成功。
+Linux 通过普通 DGRAM ping socket 收发 IPv4/IPv6，安装器或宿主须预先用
+`net.ipv4.ping_group_range` 授权运行组；现有 TUN 所需 CAP_NET_ADMIN 不替代此授权。
+Core 不改 sysctl、不运行提权命令、不回退 IP raw socket，也不修改借用 TUN 的地址、路由或 fd 标志。
+
+一个驱动最多持有每族一个物理 ping socket、合计 64 个请求许可，入站/响应队列各 8 项；
+真实包上限为 `min(tun.mtu, 2048)`，发送后的 pending 只留元数据与摘要。
+答复验证实际物理源地址、校验和、标识、长度、摘要和期限后，由现有唯一 TUN writer 公平写回。
+Stop 取消并等待全部所有者，清理 pending、队列、许可和 ping socket；停止后不得再回包。
+详细输入和合成边界见 [ICMP 契约](tun-icmp-dns.md#icmp-echo)。
 
 ## Windows Wintun
 
@@ -125,7 +218,7 @@ TunRuntime、netstack、DNS、规则和出站图。启用 TUN 的普通 Windows 
 宿主提供与程序架构一致的官方 `wintun.dll`。加载路径固定为进程可执行文件所在目录下的
 `wintun.dll`；适配器名由 `tun.device` 控制，空值为 `Vole`，启动可打开已有同名适配器或创建新适配器。
 Vole 不下载或打包该动态库，不搜索 PATH 或启动工作目录。
-系统接口地址、DNS、路由与防递归出口配置由宿主完成；YAML 不提供 DLL 路径或路由字段。
+系统接口地址、DNS、路由与防递归出口配置由宿主完成；YAML 不提供 DLL 路径，网络字段由宿主应用。
 Wintun 使用配置的 MTU，共享原始包校验、IPv6 政策、局部队列预算和同步停止屏障。
 UWP 的 1400 MTU 上限只适用于该安装包路径；超过上限明确拒绝，不静默截断。
 Windows 不接受 Unix file-descriptor 借用路径。
@@ -178,14 +271,16 @@ UWP 因 `StartWithMainTransport` 平台上限要求配置不超过 1400；packet
 包队列                        256
 普通事件 / TCP accept         128
 每关联 UDP 入站               64
-普通 UDP 响应                 4,096
+普通 UDP 响应                 256
 DNS 响应                      128
 ```
 
 TCP 会话、普通 UDP 关联、半开连接和出站握手不设固定业务数量上限。结构安全由有界队列、每流缓冲区、解析大小、超时、空闲清理和缓存提供。
 
 每关联入站、普通响应和 DNS 响应是独立内部队列预算，不扩大 TCP accept。
-满时只丢当前数据报；容量不构成公开配置或活动业务数量上限。TUN 使用 TCP-only
+入站或 DNS 响应队列满时只丢当前数据报；普通响应队列满时，每源关联最多暂持一个
+已接收响应并暂停继续接收，等待容量期间仍可发送请求或取消。取消或错误时丢弃未提交响应。
+容量不构成公开配置或活动业务数量上限。TUN 使用 TCP-only
 netstack 端点及纯 UDP codec，独立 crate 的通用 UDP endpoint 不在生产 TUN 路径上。
 写回受阻时 reader 仍可处理新请求。停止会取消并等待唯一 writer、reader 所有的
 关联/DNS 任务和 netstack，不依赖输出队列腾出容量。
@@ -196,8 +291,8 @@ netstack 端点及纯 UDP codec，独立 crate 的通用 UDP endpoint 不在生�
 
 ## 物理出口
 
-- Linux：宿主负责网络命名空间或等效路由隔离，确保被捕获的客户端流量进入 TUN，
-  Vole 出站绕过 TUN；不能把仅绑定 source IP 当作绕路保证。没有自动路由配置或降级路径。
+- Linux：自建接口使用上述自动出口与内部路由隔离；借用 fd 继续由宿主负责命名空间
+  或等效路由隔离。仅绑定 source IP 不能作为绕路保证。
 - Android：每个出站 TCP/UDP socket 在 connect 前调用宿主 protect；失败则当前连接失败关闭。
 - Windows WinRT：Provider 为当前会话选择不可变的物理网络绑定；每个地址族只从非 link-local 地址中选择一个源 IP 和接口索引交给 Session Host，同时独立保留物理适配器全部去重的 on-link prefixes（包括 link-local）用于 VPN 路由。普通出站 socket 必须同时绑定源地址和 WinSock 接口索引。
 - Windows WinRT 只有配置中显式使用 `127.0.0.0/8` 范围内的 IPv4 字面量或 `::1` 的本地出站可以跳过物理绑定；物理代理服务器的域名解析到任何回环地址都会失败关闭。

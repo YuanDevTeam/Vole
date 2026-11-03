@@ -5,7 +5,7 @@ use crate::{
 use async_trait::async_trait;
 use quinn_proto::{
     RttEstimator,
-    congestion::{BbrConfig, Controller, ControllerFactory},
+    congestion::{Controller, ControllerFactory, CubicConfig},
 };
 use std::{
     io,
@@ -57,24 +57,31 @@ impl Bucket {
     }
 }
 
-/// Rate zero uses Quinn BBR. A positive negotiated rate installs Brutal's
+/// Rate zero uses official Quinn CUBIC. A positive negotiated rate installs Brutal's
 /// fixed-rate window policy and a separate wire-byte pacer. Quinn's own cwnd
 /// pacer is retained, but is not relied on as a configured bandwidth limit.
 pub(super) struct Bandwidth {
     pub rate: AtomicU64,
     ratio: AtomicU64,
+    pacer: Arc<Pacer>,
+}
+#[derive(Default)]
+pub(super) struct Pacer {
     bucket: Mutex<Bucket>,
 }
 impl Default for Bandwidth {
     fn default() -> Self {
-        Self {
-            rate: AtomicU64::new(0),
-            ratio: AtomicU64::new(1_000_000),
-            bucket: Mutex::new(Bucket::default()),
-        }
+        Self::with_pacer(Arc::new(Pacer::default()))
     }
 }
 impl Bandwidth {
+    pub fn with_pacer(pacer: Arc<Pacer>) -> Self {
+        Self {
+            rate: AtomicU64::new(0),
+            ratio: AtomicU64::new(1_000_000),
+            pacer,
+        }
+    }
     pub fn wrap(
         self: &Arc<Self>,
         inner: Box<dyn DatagramTransport>,
@@ -93,10 +100,14 @@ impl Bandwidth {
     }
     pub async fn pace(&self, bytes: usize, mtu: u16) {
         loop {
-            let delay = self.bucket.lock().unwrap().claim(
+            let rate = self.compensated();
+            if rate == 0 {
+                return;
+            }
+            let delay = self.pacer.bucket.lock().unwrap().claim(
                 tokio::time::Instant::now().into_std(),
                 bytes,
-                self.compensated(),
+                rate,
                 mtu,
             );
             if delay.is_zero() {
@@ -114,8 +125,35 @@ struct Paced {
 }
 #[async_trait]
 impl DatagramTransport for Paced {
+    fn supports_shared_destinations(&self) -> bool {
+        self.inner.supports_shared_destinations()
+    }
+
+    fn supports_poll_receive(&self) -> bool {
+        self.inner.supports_poll_receive()
+    }
+    fn poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+        scratch: &mut Vec<u8>,
+    ) -> std::task::Poll<Result<Datagram, DispatchError>> {
+        self.inner.poll_receive(context, scratch)
+    }
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         self.inner.payload_budget(peer)
+    }
+    fn send_owned(
+        &mut self,
+        packet: Datagram,
+    ) -> Result<crate::dispatch::OwnedDatagramSend, Datagram> {
+        let bytes = packet.payload.len();
+        let send = self.inner.send_owned(packet)?;
+        let bandwidth = self.bandwidth.clone();
+        let mtu = self.mtu;
+        Ok(Box::pin(async move {
+            bandwidth.pace(bytes, mtu).await;
+            send.await
+        }))
     }
     async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
         self.bandwidth.pace(packet.payload.len(), self.mtu).await;
@@ -131,7 +169,7 @@ impl DatagramTransport for Paced {
 impl ControllerFactory for Bandwidth {
     fn build(self: Arc<Self>, now: Instant, mtu: u16) -> Box<dyn Controller> {
         Box::new(Switchable {
-            bbr: Arc::new(BbrConfig::default()).build(now, mtu),
+            automatic: Arc::new(CubicConfig::default()).build(now, mtu),
             shared: self,
             start: now,
             slots: [Slot::default(); 5],
@@ -147,7 +185,7 @@ struct Slot {
     lost: u64,
 }
 struct Switchable {
-    bbr: Box<dyn Controller>,
+    automatic: Box<dyn Controller>,
     shared: Arc<Bandwidth>,
     start: Instant,
     slots: [Slot; 5],
@@ -187,7 +225,7 @@ impl Switchable {
 }
 impl Controller for Switchable {
     fn on_sent(&mut self, now: Instant, bytes: u64, packet: u64) {
-        self.bbr.on_sent(now, bytes, packet);
+        self.automatic.on_sent(now, bytes, packet);
     }
     fn on_ack(
         &mut self,
@@ -197,24 +235,25 @@ impl Controller for Switchable {
         limited: bool,
         rtt: &RttEstimator,
     ) {
-        self.bbr.on_ack(now, sent, bytes, limited, rtt);
+        self.automatic.on_ack(now, sent, bytes, limited, rtt);
         self.rtt = rtt.get();
         self.sample(now, u64::from(bytes > 0), 0);
     }
     fn on_end_acks(&mut self, now: Instant, flight: u64, limited: bool, largest: Option<u64>) {
-        self.bbr.on_end_acks(now, flight, limited, largest);
+        self.automatic.on_end_acks(now, flight, limited, largest);
     }
     fn on_congestion_event(&mut self, now: Instant, sent: Instant, persistent: bool, lost: u64) {
-        self.bbr.on_congestion_event(now, sent, persistent, lost);
+        self.automatic
+            .on_congestion_event(now, sent, persistent, lost);
         self.sample(now, 0, lost.div_ceil(u64::from(self.mtu)));
     }
     fn on_mtu_update(&mut self, mtu: u16) {
         self.mtu = mtu;
-        self.bbr.on_mtu_update(mtu);
+        self.automatic.on_mtu_update(mtu);
     }
     fn window(&self) -> u64 {
         if self.shared.rate.load(Ordering::Relaxed) == 0 {
-            return self.bbr.window();
+            return self.automatic.window();
         }
         // Keep enough flight space for Quinn's delayed ACKs at very low RTT.
         // The independent wire pacer, not this floor, enforces the exact rate.
@@ -223,11 +262,11 @@ impl Controller for Switchable {
             .max(u64::from(self.mtu) * 2)
     }
     fn initial_window(&self) -> u64 {
-        self.bbr.initial_window()
+        self.automatic.initial_window()
     }
     fn clone_box(&self) -> Box<dyn Controller> {
         Box::new(Self {
-            bbr: self.bbr.clone_box(),
+            automatic: self.automatic.clone_box(),
             shared: self.shared.clone(),
             start: self.start,
             slots: self.slots,
@@ -262,13 +301,29 @@ pub(super) fn negotiate(up: u64, server: &[u8]) -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn sibling_connections_share_one_wire_credit_bucket() {
+        let pacer = std::sync::Arc::new(super::Pacer::default());
+        let first = super::Bandwidth::with_pacer(pacer.clone());
+        let second = super::Bandwidth::with_pacer(pacer.clone());
+        for connection in [&first, &second] {
+            connection
+                .rate
+                .store(125000, std::sync::atomic::Ordering::Relaxed);
+            for _ in 0..5 {
+                connection.pace(1400, 1400).await;
+            }
+        }
+        // An automatic connection must not reset the fixed-rate budget.
+        super::Bandwidth::with_pacer(pacer).pace(1400, 1400).await;
+        let mut pending = Box::pin(first.pace(1400, 1400));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        tokio::time::advance(std::time::Duration::from_millis(12)).await;
+        assert!(futures_util::poll!(pending.as_mut()).is_ready());
+    }
+
     #[test]
     fn pacer_limits_actual_bytes_after_one_bounded_burst() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "pacer_limits_actual_bytes_after_one_bounded_burst",
-        );
         use std::time::{Duration, Instant};
         let now = Instant::now();
         let mut bucket = super::Bucket::default();
@@ -290,11 +345,6 @@ mod tests {
     }
     #[test]
     fn bandwidth_negotiation_obeys_auto_and_the_lower_positive_limit() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "bandwidth_negotiation_obeys_auto_and_the_lower_positive_limit",
-        );
         for (up, response, expected) in [
             (0, "0", 0),
             (0, "100000", 0),

@@ -13,9 +13,170 @@ use std::{
 use futures_util::task::AtomicWaker;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::{Notify, mpsc},
+    sync::{Notify, mpsc, oneshot},
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
+
+use crate::ClientConfig;
+
+pub(crate) struct ConnectRequest {
+    pub(crate) destination: SocketAddr,
+    pub(crate) deadline: Instant,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) response: oneshot::Sender<std::io::Result<TcpStream>>,
+}
+
+pub(crate) struct InitialMtuRequest {
+    pub(crate) mtu: usize,
+    pub(crate) deadline: Instant,
+    pub(crate) response: oneshot::Sender<std::io::Result<()>>,
+}
+
+pub(crate) enum ClientRequest {
+    Connect(ConnectRequest),
+    InitialMtu(InitialMtuRequest),
+}
+
+struct ConnectGuard {
+    cancellation: CancellationToken,
+    notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl Drop for ConnectGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+            self.notify.notify_one();
+        }
+    }
+}
+
+/// Active TCP connections driven entirely by the stack's raw-IP endpoints.
+#[derive(Clone)]
+pub struct TcpConnector {
+    pub(crate) sender: mpsc::Sender<ClientRequest>,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) notify: Arc<Notify>,
+    pub(crate) addresses: ClientConfig,
+}
+
+impl TcpConnector {
+    /// Reduces the initial transmit MTU to a known packet-transport budget.
+    ///
+    /// This must complete before the first TCP connection. Receive packet
+    /// limits and source prefixes remain unchanged. Admission and completion
+    /// share the supplied deadline, and Stop never waits on this command.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for an increase or invalid family MTU,
+    /// `AlreadyExists` once TCP output or a flow exists, `TimedOut` at the
+    /// deadline, and `ConnectionAborted` when the stack stops.
+    pub async fn set_initial_mtu(&self, mtu: usize, deadline: Instant) -> std::io::Result<()> {
+        if Instant::now() >= deadline {
+            return Err(connect_timeout());
+        }
+        let (response, received) = oneshot::channel();
+        let request = ClientRequest::InitialMtu(InitialMtuRequest {
+            mtu,
+            deadline,
+            response,
+        });
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => return Err(connect_stopped()),
+            () = tokio::time::sleep_until(deadline) => return Err(connect_timeout()),
+            result = self.sender.send(request) => result.map_err(|_| connect_stopped())?,
+        }
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => Err(connect_stopped()),
+            () = tokio::time::sleep_until(deadline) => Err(connect_timeout()),
+            result = received => result.unwrap_or_else(|_| Err(connect_stopped())),
+        }
+    }
+
+    /// Connects to an IP endpoint and returns only after TCP is established.
+    ///
+    /// Queue admission and handshake share the supplied absolute deadline.
+    /// Dropping this future cancels its pending request and socket; no background
+    /// connect task survives the caller. The stack performs no DNS or host I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AddrNotAvailable` for an unconfigured address family,
+    /// `InvalidInput` for a non-unicast/zero-port peer, `TimedOut` at the
+    /// deadline, or an I/O error when TCP fails or the stack stops.
+    pub async fn connect(
+        &self,
+        mut destination: SocketAddr,
+        deadline: Instant,
+    ) -> std::io::Result<TcpStream> {
+        if let std::net::IpAddr::V6(ip) = destination.ip()
+            && let Some(ip) = ip.to_ipv4_mapped()
+        {
+            destination = SocketAddr::new(ip.into(), destination.port());
+        }
+        let invalid_ip = match destination.ip() {
+            std::net::IpAddr::V4(ip) => {
+                ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast()
+            }
+            std::net::IpAddr::V6(ip) => ip.is_unspecified() || ip.is_multicast(),
+        };
+        if invalid_ip || destination.port() == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid active TCP peer",
+            ));
+        }
+        self.addresses.source_for(destination.ip())?;
+        if Instant::now() >= deadline {
+            return Err(connect_timeout());
+        }
+        let cancellation = CancellationToken::new();
+        let mut guard = ConnectGuard {
+            cancellation: cancellation.clone(),
+            notify: self.notify.clone(),
+            armed: true,
+        };
+        let (response, received) = oneshot::channel();
+        let request = ConnectRequest {
+            destination,
+            deadline,
+            cancellation,
+            response,
+        };
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => return Err(connect_stopped()),
+            () = tokio::time::sleep_until(deadline) => return Err(connect_timeout()),
+            result = self.sender.send(ClientRequest::Connect(request)) => result.map_err(|_| connect_stopped())?,
+        }
+        let result = tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => Err(connect_stopped()),
+            () = tokio::time::sleep_until(deadline) => Err(connect_timeout()),
+            result = received => result.unwrap_or_else(|_| Err(connect_stopped())),
+        };
+        if result.is_ok() {
+            guard.armed = false;
+        }
+        result
+    }
+}
+
+pub(crate) fn connect_stopped() -> Error {
+    Error::new(
+        ErrorKind::ConnectionAborted,
+        "netstack is stopping or stopped",
+    )
+}
+
+pub(crate) fn connect_timeout() -> Error {
+    Error::new(ErrorKind::TimedOut, "netstack TCP connect deadline elapsed")
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct FlowKey {
@@ -23,7 +184,7 @@ pub(crate) struct FlowKey {
     pub(crate) destination: SocketAddr,
 }
 
-/// A bounded queue whose allocation is made once when a flow is accepted.
+/// A bounded queue whose storage grows with use and is retained until drop.
 pub(crate) struct ByteQueue {
     bytes: Mutex<VecDeque<u8>>,
     capacity: usize,
@@ -32,7 +193,7 @@ pub(crate) struct ByteQueue {
 impl ByteQueue {
     fn new(capacity: usize) -> Self {
         Self {
-            bytes: Mutex::new(VecDeque::with_capacity(capacity)),
+            bytes: Mutex::new(VecDeque::new()),
             capacity,
         }
     }
@@ -46,6 +207,16 @@ impl ByteQueue {
     pub(crate) fn write(&self, source: &[u8]) -> usize {
         let mut bytes = self.lock();
         let count = source.len().min(self.capacity - bytes.len());
+        let needed = bytes.len() + count;
+        if needed > bytes.capacity() {
+            // Amortized VecDeque growth can overshoot even a power-of-two
+            // limit when the first write is an arbitrary-sized TCP segment.
+            let target = needed
+                .max(bytes.capacity().saturating_mul(2))
+                .min(self.capacity);
+            let additional = target - bytes.len();
+            bytes.reserve_exact(additional);
+        }
         bytes.extend(&source[..count]);
         count
     }
@@ -58,10 +229,6 @@ impl ByteQueue {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.lock().is_empty()
-    }
-
-    pub(crate) fn is_full(&self) -> bool {
-        self.lock().len() == self.capacity
     }
 
     #[cfg(test)]
@@ -119,7 +286,7 @@ impl TcpStreamHandle {
     }
 }
 
-/// One TCP flow intercepted from the raw-IP side.
+/// One intercepted or actively established userspace TCP flow.
 pub struct TcpStream {
     flow: FlowKey,
     pub(crate) handle: Arc<TcpStreamHandle>,
@@ -130,13 +297,13 @@ impl TcpStream {
         Self { flow, handle }
     }
 
-    /// Address of the application that wrote the original TUN packet.
+    /// Intercepted application address, or local source of an active connection.
     #[must_use]
     pub const fn source_addr(&self) -> SocketAddr {
         self.flow.source
     }
 
-    /// Original destination that the outbound dispatcher must dial.
+    /// Original intercepted destination, or remote peer of an active connection.
     #[must_use]
     pub const fn destination_addr(&self) -> SocketAddr {
         self.flow.destination
@@ -321,6 +488,68 @@ mod tests {
         let mut bytes = [0_u8; 8];
         assert_eq!(queue.read(&mut bytes), 4);
         assert_eq!(&bytes[..4], b"abcd");
+    }
+
+    #[test]
+    fn byte_queue_grows_with_use_without_exceeding_its_storage_limit() {
+        for limit in [16 * 1024, 16 * 1024 - 3] {
+            let queue = ByteQueue::new(limit);
+            assert_eq!(queue.lock().capacity(), 0);
+            assert_eq!(queue.write(&[]), 0);
+            assert_eq!(queue.lock().capacity(), 0);
+
+            assert_eq!(queue.write(&[42]), 1);
+            assert!(queue.lock().capacity() < limit);
+            let mut hello = [0];
+            assert_eq!(queue.read(&mut hello), 1);
+            assert_eq!(hello, [42]);
+
+            let payload: Vec<_> = (0_u8..=250).cycle().take(limit).collect();
+            for chunk in payload.chunks(1460) {
+                assert_eq!(queue.write(chunk), chunk.len());
+                assert!(queue.lock().capacity() <= limit);
+            }
+            let full_capacity = queue.lock().capacity();
+            assert_eq!(queue.len(), limit);
+            assert_eq!(queue.write(b"full"), 0);
+            assert_eq!(queue.lock().capacity(), full_capacity);
+
+            let mut prefix = vec![0; 6 * 1024];
+            assert_eq!(queue.read(&mut prefix), prefix.len());
+            assert_eq!(prefix, payload[..prefix.len()]);
+            let suffix = vec![7; prefix.len()];
+            assert_eq!(queue.write(&suffix), suffix.len());
+            let mut remaining = vec![0; limit];
+            let mut received = 0;
+            while received < limit {
+                let count = queue.read(&mut remaining[received..]);
+                assert!(count > 0);
+                received += count;
+            }
+            assert_eq!(&remaining[..limit - suffix.len()], &payload[prefix.len()..]);
+            assert_eq!(&remaining[limit - suffix.len()..], &suffix);
+            assert!(queue.is_empty());
+            assert_eq!(queue.lock().capacity(), full_capacity);
+        }
+
+        let queue = ByteQueue::new(13);
+        assert_eq!(queue.write(b"abcdef"), 6);
+        let mut prefix = [0; 4];
+        assert_eq!(queue.read(&mut prefix), 4);
+        assert_eq!(&prefix, b"abcd");
+        assert_eq!(queue.write(b"ghijkl"), 6);
+        assert!(queue.lock().capacity() <= 13);
+        assert_eq!(queue.write(b"mnopq"), 5);
+        assert_eq!(queue.write(b"full"), 0);
+        assert!(queue.lock().capacity() <= 13);
+        let mut remaining = [0; 13];
+        let mut received = 0;
+        while received < remaining.len() {
+            let count = queue.read(&mut remaining[received..]);
+            assert!(count > 0);
+            received += count;
+        }
+        assert_eq!(&remaining, b"efghijklmnopq");
     }
 
     #[tokio::test]

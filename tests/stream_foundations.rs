@@ -2,11 +2,6 @@
 
 #[test]
 fn transport_options_reject_ambiguous_headers_before_io() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "transport_options_reject_ambiguous_headers_before_io",
-    );
     use vole::transport::{HttpObfsOptions, WebSocketEarlyData, WebSocketOptions};
     for name in ["host", "x-custom"] {
         let mut headers = http::HeaderMap::new();
@@ -15,7 +10,7 @@ fn transport_options_reject_ambiguous_headers_before_io() {
         assert!(WebSocketOptions::new("ws://example.com/", headers.clone(), None).is_err());
         assert!(HttpObfsOptions::new(http::Method::GET, "http://example.com/", headers).is_err());
     }
-    for maximum in [0, 2049] {
+    for maximum in [0] {
         assert!(
             WebSocketOptions::new(
                 "ws://example.com/",
@@ -49,11 +44,6 @@ fn transport_options_reject_ambiguous_headers_before_io() {
 
 #[tokio::test]
 async fn http_first_header_preserves_prefix_raw_continuation_and_half_close_tail() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "http_first_header_preserves_prefix_raw_continuation_and_half_close_tail",
-    );
     timeout(Duration::from_secs(3), async {
         let (client, mut peer) = tokio::io::duplex(128);
         let peer = tokio::spawn(async move {
@@ -111,11 +101,6 @@ async fn http_first_header_preserves_prefix_raw_continuation_and_half_close_tail
 
 #[tokio::test]
 async fn legacy_h2_keeps_unframed_bytes_server_first_and_owned_whole_close() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "legacy_h2_keeps_unframed_bytes_server_first_and_owned_whole_close",
-    );
     timeout(Duration::from_secs(3), async {
         let (client, peer) = tokio::io::duplex(128);
         let peer = tokio::spawn(async move {
@@ -178,11 +163,6 @@ async fn legacy_h2_keeps_unframed_bytes_server_first_and_owned_whole_close() {
 
 #[tokio::test]
 async fn websocket_rejects_invalid_upgrade_responses_and_bounded_header_overflows() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "websocket_rejects_invalid_upgrade_responses_and_bounded_header_overflows",
-    );
     for change in [
         "version",
         "accept",
@@ -253,17 +233,12 @@ async fn websocket_rejects_invalid_upgrade_responses_and_bounded_header_overflow
 // The official handshake callback fixes its error type to Response<Option<String>>.
 #[allow(clippy::result_large_err)]
 async fn websocket_early_data_and_remaining_frames_keep_the_original_byte_order() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "websocket_early_data_and_remaining_frames_keep_the_original_byte_order",
-    );
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use vole::transport::{WebSocketEarlyData, WebSocketOptions, connect_websocket};
-    for maximum in [1, 2048] {
+    for maximum in [1, 2048, 4096] {
         timeout(Duration::from_secs(3), async {
             let (client, peer) = tokio::io::duplex(128);
-            let input: Vec<u8> = (0..3000).map(|value| (value % 251) as u8).collect();
+            let input: Vec<u8> = (0..6000).map(|value| (value % 251) as u8).collect();
             let expected = input.clone();
             let peer = tokio::spawn(async move {
                 let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -286,7 +261,7 @@ async fn websocket_early_data_and_remaining_frames_keep_the_original_byte_order(
                 .unwrap();
                 let mut received = observed.lock().unwrap().clone();
                 assert_eq!(received.len(), maximum);
-                while received.len() < 3000 {
+                while received.len() < 6000 {
                     if let Message::Binary(data) = ws.next().await.unwrap().unwrap() {
                         received.extend_from_slice(&data);
                     }
@@ -352,8 +327,10 @@ async fn stalled_handshake(kind: &str, raw: Observed, deadline: Instant) -> io::
                 "http://fixture.invalid/",
                 Default::default(),
             )?;
+            // This fixture tests incomplete request submission, not a valid
+            // one-way upload whose first HTTP response legitimately arrives late.
             let mut stream =
-                vole::transport::http_obfs(Box::new(raw), &options, &[], deadline).await?;
+                vole::transport::http_obfs(Box::new(raw), &options, &[0; 4096], deadline).await?;
             stream.read_u8().await?;
         }
         _ => unreachable!(),
@@ -363,11 +340,6 @@ async fn stalled_handshake(kind: &str, raw: Observed, deadline: Instant) -> io::
 
 #[tokio::test]
 async fn setup_deadline_releases_supplied_io_in_stream_adapters() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "setup_deadline_releases_supplied_io_in_stream_adapters",
-    );
     for kind in ["ws", "grpc", "h2", "http"] {
         let (outgoing, mut incoming) = tokio::io::duplex(128);
         let dropped = Arc::new(AtomicBool::new(false));
@@ -376,7 +348,13 @@ async fn setup_deadline_releases_supplied_io_in_stream_adapters() {
             shutdown: Arc::new(AtomicBool::new(false)),
             dropped: dropped.clone(),
         };
+        let (release, released) = tokio::sync::oneshot::channel();
         let peer = tokio::spawn(async move {
+            if kind == "http" {
+                // Hold the bounded pipe full until setup expires, then drain
+                // naturally to EOF so deadline ownership remains observable.
+                released.await.unwrap();
+            }
             let mut sink = Vec::new();
             incoming.read_to_end(&mut sink).await.unwrap();
             assert!(sink.len() < 4096);
@@ -387,6 +365,7 @@ async fn setup_deadline_releases_supplied_io_in_stream_adapters() {
         )
         .await
         .unwrap();
+        let _ = release.send(());
         assert_eq!(
             result.unwrap_err().kind(),
             io::ErrorKind::TimedOut,
@@ -509,11 +488,6 @@ async fn http2_lazy_response_obeys_setup_deadline_but_established_reads_do_not()
 
 #[tokio::test]
 async fn cancelled_setup_releases_supplied_io_without_a_detached_task() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "cancelled_setup_releases_supplied_io_without_a_detached_task",
-    );
     for kind in ["ws", "grpc", "h2", "http"] {
         let (outgoing, mut incoming) = tokio::io::duplex(128);
         let dropped = Arc::new(AtomicBool::new(false));
@@ -544,11 +518,6 @@ async fn cancelled_setup_releases_supplied_io_without_a_detached_task() {
 
 #[tokio::test]
 async fn ws_rejects_oversized_and_truncated_frames_instead_of_reporting_eof() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "ws_rejects_oversized_and_truncated_frames_instead_of_reporting_eof",
-    );
     for frame in [
         vec![0x82, 0x7f, 0, 0, 0, 0, 0, 1, 0, 1],
         vec![0x82, 3, b'x'],
@@ -583,11 +552,6 @@ async fn ws_rejects_oversized_and_truncated_frames_instead_of_reporting_eof() {
 
 #[tokio::test]
 async fn ws_accepts_mihomo_clean_underlay_eof_only_at_complete_message_boundaries() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "ws_accepts_mihomo_clean_underlay_eof_only_at_complete_message_boundaries",
-    );
     for frame in [
         b"\x82\x04tail".as_slice(),
         b"\x02\x02ta\x80\x02il".as_slice(),
@@ -617,11 +581,6 @@ async fn ws_accepts_mihomo_clean_underlay_eof_only_at_complete_message_boundarie
 
 #[tokio::test]
 async fn dropping_an_established_ws_releases_its_only_io_owner() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "dropping_an_established_ws_releases_its_only_io_owner",
-    );
     let (outgoing, incoming) = tokio::io::duplex(128);
     let dropped = Arc::new(AtomicBool::new(false));
     let raw = Observed {
@@ -655,16 +614,11 @@ async fn dropping_an_established_ws_releases_its_only_io_owner() {
 
 #[tokio::test]
 async fn grpc_rejects_oversized_truncated_and_invalid_records() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "grpc_rejects_oversized_truncated_and_invalid_records",
-    );
-    for wire in [
-        b"\x00\x00\x10\x00\x00".to_vec(),
-        b"\x00\x00\x00\x00\x06\x0a\x04x".to_vec(),
-        b"\x01\x00\x00\x00\x02\x0a\x00".to_vec(),
-        b"\x00\x00\x00\x00\x02\x0b\x00".to_vec(),
+    for (wire, prefix) in [
+        (b"\x00\x00\x10\x00\x00".to_vec(), &b""[..]),
+        (b"\x00\x00\x00\x00\x06\x0a\x04x".to_vec(), &b"x"[..]),
+        (b"\x01\x00\x00\x00\x02\x0a\x00".to_vec(), &b""[..]),
+        (b"\x00\x00\x00\x00\x02\x0b\x00".to_vec(), &b""[..]),
     ] {
         let (outgoing, incoming) = tokio::io::duplex(128);
         let peer = tokio::spawn(async move {
@@ -689,14 +643,16 @@ async fn grpc_rejects_oversized_truncated_and_invalid_records() {
         )
         .await
         .unwrap();
+        let mut received = Vec::new();
         assert_eq!(
-            timeout(Duration::from_secs(1), stream.read_u8())
+            timeout(Duration::from_secs(1), stream.read_to_end(&mut received))
                 .await
                 .unwrap()
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData
         );
+        assert_eq!(received, prefix);
         drop(stream);
         owner.stop().await.unwrap();
         timeout(Duration::from_secs(1), peer)
@@ -708,11 +664,6 @@ async fn grpc_rejects_oversized_truncated_and_invalid_records() {
 
 #[tokio::test]
 async fn grpc_large_writes_obey_small_http2_windows_and_keep_byte_integrity() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "grpc_large_writes_obey_small_http2_windows_and_keep_byte_integrity",
-    );
     let (outgoing, incoming) = tokio::io::duplex(128);
     let expected: Vec<_> = (0..65536).map(|n| (n % 251) as u8).collect();
     let peer = tokio::spawn(async move {
@@ -788,11 +739,6 @@ async fn grpc_large_writes_obey_small_http2_windows_and_keep_byte_integrity() {
 
 #[tokio::test]
 async fn ws_partial_writes_empty_frames_ping_and_half_close_preserve_every_byte() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "ws_partial_writes_empty_frames_ping_and_half_close_preserve_every_byte",
-    );
     let (outgoing, incoming) = tokio::io::duplex(128);
     let expected: Vec<_> = (0..65536).map(|n| (n % 251) as u8).collect();
     let request = expected.clone();
@@ -897,11 +843,6 @@ impl AsyncWrite for Observed {
 
 #[tokio::test]
 async fn grpc_handles_response_after_upload_fragmented_records_and_owned_stop() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "grpc_handles_response_after_upload_fragmented_records_and_owned_stop",
-    );
     let (outgoing, incoming) = tokio::io::duplex(128);
     let dropped = Arc::new(AtomicBool::new(false));
     let raw = Observed {
@@ -992,11 +933,6 @@ use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
 async fn websocket_supplied_io_preserves_server_first_and_partial_writes() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-STREAM",
-        "websocket_supplied_io_preserves_server_first_and_partial_writes",
-    );
     let (client, peer) = tokio::io::duplex(128);
     let task = tokio::spawn(async move {
         let mut ws = tokio_tungstenite::accept_async(peer).await.unwrap();

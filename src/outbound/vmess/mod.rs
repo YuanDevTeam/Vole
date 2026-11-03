@@ -76,11 +76,6 @@ mod tests {
     use super::*;
     #[test]
     fn auto_uses_detected_hardware_not_architecture_name() {
-        #[cfg(feature = "interop-test")]
-        let _evidence = crate::resources::case_events::Case::new(
-            "VMESS-CODEC",
-            "auto_uses_detected_hardware_not_architecture_name",
-        );
         assert_eq!(
             BodyCipher::Auto.with_aes_hardware(true),
             BodyCipher::Aes128Gcm

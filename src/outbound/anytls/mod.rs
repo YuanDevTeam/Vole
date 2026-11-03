@@ -24,12 +24,40 @@ pub use stream::AnyTlsStream;
 #[async_trait]
 pub trait AnyTlsTlsConnector: Send + Sync {
     async fn connect(&self, stream: BoxStream) -> io::Result<BoxStream>;
+    async fn connect_with_context(
+        &self,
+        stream: BoxStream,
+        _context: &EstablishContext,
+    ) -> io::Result<BoxStream> {
+        self.connect(stream).await
+    }
 }
 
 #[async_trait]
 impl AnyTlsTlsConnector for crate::security::StandardTlsClient {
     async fn connect(&self, stream: BoxStream) -> io::Result<BoxStream> {
         crate::security::StandardTlsClient::connect(self, stream).await
+    }
+    async fn connect_with_context(
+        &self,
+        stream: BoxStream,
+        context: &EstablishContext,
+    ) -> io::Result<BoxStream> {
+        crate::security::StandardTlsClient::connect_with_context(self, stream, context).await
+    }
+}
+
+#[async_trait]
+impl AnyTlsTlsConnector for crate::security::SecurityClient {
+    async fn connect(&self, stream: BoxStream) -> io::Result<BoxStream> {
+        crate::security::SecurityClient::connect(self, stream).await
+    }
+    async fn connect_with_context(
+        &self,
+        stream: BoxStream,
+        context: &EstablishContext,
+    ) -> io::Result<BoxStream> {
+        crate::security::SecurityClient::connect_with_context(self, stream, context).await
     }
 }
 
@@ -51,7 +79,10 @@ impl SessionDialer for OutboundSessionDialer {
             .connect_server(session, &self.server, context)
             .await?;
         context
-            .run_io("AnyTLS TLS handshake", self.tls.connect(raw.io))
+            .run_io(
+                "AnyTLS TLS handshake",
+                self.tls.connect_with_context(raw.io, context),
+            )
             .await
     }
 }
@@ -101,6 +132,24 @@ impl AnyTlsOutbound {
         tls: Arc<dyn AnyTlsTlsConnector>,
         stream_buffer_capacity: usize,
     ) -> io::Result<Self> {
+        Self::with_session_options(
+            server,
+            upstream,
+            password,
+            tls,
+            stream_buffer_capacity,
+            crate::config::AnyTlsSessionOptions::default(),
+        )
+    }
+
+    pub fn with_session_options(
+        server: Destination,
+        upstream: UpstreamPath,
+        password: impl Into<String>,
+        tls: Arc<dyn AnyTlsTlsConnector>,
+        stream_buffer_capacity: usize,
+        options: crate::config::AnyTlsSessionOptions,
+    ) -> io::Result<Self> {
         if server.port() == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -114,7 +163,7 @@ impl AnyTlsOutbound {
         });
         let password = password.into();
         Ok(Self {
-            client: AnyTlsClient::new(dialer, &password, stream_buffer_capacity)?,
+            client: AnyTlsClient::with_options(dialer, &password, stream_buffer_capacity, options)?,
         })
     }
 
@@ -157,6 +206,7 @@ impl OutboundConnector for AnyTlsOutbound {
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         let stream_session = StreamSession {
+            metadata: request.session.metadata.clone(),
             inbound: request.session.inbound,
             source: request.session.source,
             destination: magic_destination(),

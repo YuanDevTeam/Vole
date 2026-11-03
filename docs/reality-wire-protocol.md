@@ -1,6 +1,6 @@
 # REALITY V1 客户端协议
 
-本文定义 Vole 的 REALITY V1 客户端线上行为。它不是通用 REALITY 规范。经典模式为默认，可显式要求混合密钥交换。可选的四套 ClientHello 模板及混合兼容边界见 [TLS 指纹](tls-client-fingerprint.md)。
+本文定义 Vole 的 REALITY V1 客户端线上行为。它不是通用 REALITY 规范。经典模式为默认，可显式允许混合密钥交换。命名 ClientHello 模板及版本边界见 [TLS 指纹](tls-client-fingerprint.md)。
 
 ## 版本边界
 
@@ -10,7 +10,7 @@ V1 只支持：
 
 - 客户端模式；
 - TLS 1.3；
-- 经典 X25519，或显式要求 X25519MLKEM768 的 TLS 密钥交换；
+- 经典 X25519，或显式允许 X25519MLKEM768 的 TLS 密钥交换；
 - classic Ed25519 临时证书认证；
 - 0–8 字节 short ID，在线上右侧补零到 8 字节；
 - BoringSSL 原生握手和加密实现。
@@ -28,11 +28,12 @@ Vole 不能读取该私钥，也不能为两个用途生成不同密钥。
 
 原生封装按实际 GroupID 找到唯一 X25519 share，不依赖 share 下标。Firefox 可保留
 额外 P-256 share，但认证始终绑定同一 X25519 临时私钥。Chrome133 的普通 TLS
-ML-KEM group/share 在 classic REALITY 中裁剪。显式混合模式保留模板中的真实混合 share；
-无命名指纹时只提供混合 share。若同时存在独立 X25519，优先用它派生认证，否则使用
+ML-KEM group/share 在 classic REALITY 中裁剪。显式允许混合时保留模板中的真实 share；
+Chrome133 与无命名指纹提供 X25519MLKEM768/X25519 双 share，其他 TLS1.3 模板保留
+各自经典 share。若同时存在独立 X25519，优先用它派生认证，否则使用
 实际混合 share 内的 X25519 分量，与 Mihomo 的认证取值一致。
-重复/缺失认证 share、低阶点均失败。显式混合模式还在 ServerHello 处理时要求
-实际选择 group 4588，经典组或 HRR 立即失败，不重新发起经典握手。REALITY 身份
+重复/缺失认证 share、低阶点均失败。服务端可在本次握手选择允许的经典或混合组，
+不因此重试；HRR 仍立即失败。Android/360 模板仅有 TLS1.2，不能用于 REALITY。REALITY 身份
 认证仍是经典 X25519/Ed25519，不能将混合 TLS 密钥交换称为后量子身份认证。
 
 ClientHello 的 legacy session ID 固定为 32 字节。生成密文前先把该字段清零，再编码完整 TLS Handshake `ClientHello`，将其作为 AES-GCM 的 AAD。

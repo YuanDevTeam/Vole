@@ -1,11 +1,14 @@
 # Vole 配置的完整示例。
 #
-# 配置只接受本文列出的结构；未知或已移除的字段、anchor、alias 和自定义 tag 都会失败。
+# 配置只接受本文列出的结构；未知或已移除的字段和自定义 tag 都会失败。支持 anchor、alias 和 YAML merge。
+# 原始配置上限 8 MiB，展开预算 32 MiB，嵌套最多 64 层；递归 alias 失败。
 # 顶层 port、socks-port、udp 和 listeners 都不接受；代理节点的 port / udp 仍有效。
 #
 # 库宿主先通过 Invoke API 调用 initialize({dataDir})，再通过 configYaml 内联
 # 传入配置；CLI 使用 -f 指定文件，-d 指定数据目录，省略时读取数据目录下的 config.yaml。
-# GeoData 固定由 Vole 管理在 dataDir/geodata 中；CLI 的 -t 只校验，不创建目录或联网。
+# GeoSite/DAT/ASN 由 Vole 管理在 dataDir/geodata 中；国家 MMDB 位于 dataDir 根目录。
+# CLI 的 -t 只校验，不创建目录或联网。
+# certificate/private-key 可为成对 PEM 或文件路径；相对路径从 dataDir 解析，校验时读取并验证。
 # 所有平台均不设 GeoData 条数上限，不按数量截断，也不设总内存预算；
 # 仅加载当前业务规则和 DNS policy 引用的分类/属性交集，详见 docs/geodata.md。
 
@@ -14,16 +17,80 @@
 # IPv6 包。dns.ipv6 只有与本项同时为 true 时才生效。
 ipv6: true
 
-# GeoData 下载配置可省略；出现时三项必须齐全。URL 必须是以域名为主机、无
-# userinfo/fragment 的绝对 HTTPS URL，更新周期固定为 24 小时。validateConfig 和
-# measureDelay 不下载。公共实例启动后，只有实际规则需要资产且自动更新已启用时
-# 才后台检查。下载使用最终 MATCH route target 在创建新物理 transport 时解析到的
-# 当前节点、DIRECT 或 REJECT；代理组不自动故障转移，也不回退 DIRECT。
+# mode 缺省 rule：顺序规则首条命中，未命中 DIRECT；global 使用 GLOBAL 组，direct 直连。
+# log-level 缺省 info，还支持 debug、warning、error、silent；两字段值不区分大小写。
+mode: rule
+log-level: info
+
+# unified-delay 默认 false；true 时复用探测连接再次发送 HEAD，成功时记录第二次耗时。
+# profile.store-selected 默认 true，将 Controller 的显式选择保存到 dataDir/selected.json。
+# 启动时缓存中的有效选择优先于 default-selected；成员已删除时使用配置默认/首成员。
+# 文件损坏时使用配置；写入失败保留已生效选择，并在 Controller 状态中报告。
+unified-delay: false
+find-process-mode: strict # strict 按实际身份谓词惰性查询；always 每业务决策一次；off 不查询
+# 物理 TCP 与 mixed 接入连接的探活。单位秒；0 使用 15 秒，负数保留对应 OS 值。
+# Android 始终禁用 TCP keep-alive；Windows 保留系统探测次数，其余平台为 9 次。
+# tcp-concurrent=true 同时尝试解析结果，首次成功取消其余尝试；ip-version 的偏好
+# 给首选地址族最多 300ms 优先窗口。已建立的复用连接保留创建时的设置。
+# IP4P 仅用于受控物理端点：2001:0000::/32 的 octets[10..12] 为网络序端口，
+# octets[12..16] 为IPv4；普通地址保持。逻辑server/SNI与认证身份不改变。
+experimental:
+  dialer-ip4p-convert: false
+  # Quinn 的 Linux DIRECT 物理首跳：TUIC/XHTTP H3/DoQ/DoH H3。
+  # GSO 开启时依 OS 能力每次最多8段；ECN 缺省关闭，不改变进程环境。
+  quic-go-disable-gso: false
+  quic-go-disable-ecn: true
+# 开启时转换物理TCP和SS2022/SOCKS5/WireGuard UDP节点端点；不转换DIRECT无连接UDP或DNS答复。
+
+tcp-concurrent: false
+keep-alive-idle: 0
+keep-alive-interval: 0
+disable-keep-alive: false
+# 物理 TCP/UDP 的默认出口；空接口/零 mark 使用平台默认或 TUN 自动识别。
+# 节点的非空 interface-name / 非零 routing-mark 分别覆盖全局值，空/0 继续继承。
+# 接口支持 Linux、Apple 和 Windows，名称在建 socket 时校验；失败不回退其他出口。
+# 回环物理目标保留本机路径，不应用公开接口/mark；UWP 回环目标的现有安全门禁不变。
+# Android 显式接口绑定尚不可用，保留原 protect；非零 mark 仅 Linux 可用。
+# Linux 自建 TUN auto-route 仅捕获未标记流量；物理首跳保留有效的非零公开 mark，
+# 未配置 mark 时注入私有防环值。全局/节点与动态 Provider 使用同一继承与 socket 策略。
+# UWP 仅允许选择 Provider 当前物理适配器，不改变其源地址/接口索引；Wintun 不继承该绑定。
+interface-name: ""
+routing-mark: 0
+profile:
+  store-selected: true
+  store-fake-ip: false # true：dataDir/fake-ip.redb 持久化双向映射与分配位置
+
+# 资源下载使用 global-ua（缺省 Vole/ 加 Core 版本）；etag-support 缺省 true。
+# geodata-mode 默认 false，使用国家 MMDB；true 使用 GeoIP DAT。此示例显式选择 DAT。
+# URL 缺省 MetaCubeX meta-rules-dat latest DAT / 国家 MMDB / ASN MMDB。
+# URL 以域名为主机、无 fragment，生产构建使用 HTTPS；userinfo 用于 HTTP Basic。
+# HTTP 资源自动流式解压 gzip，状态只保存来源摘要与脱敏 origin。
+# 自动更新默认 false；启动后仍获取缺失的必需资产。周期单位小时，默认 24，0 关闭周期检查。
+global-ua: "Vole/0.1.0"
+etag-support: true
+geodata-mode: true
 geox-url:
   geoip: https://assets.example.com/geoip.dat
+  mmdb: https://assets.example.com/geoip.metadb
   geosite: https://assets.example.com/geosite.dat
+  asn: https://assets.example.com/ASN.mmdb
 geo-auto-update: true
 geo-update-interval: 24
+
+# 客户端共享信任根：内置 WebPKI + 启动时可读系统根 + 此处证书内容。
+# 字段沿用 Mihomo 的真实拼写 custom-certifactes；内容为 PEM（或可表示的 DER），不是路径。
+# 不设置本项仍使用基础信任；pure validate 不读取系统根。平台读取限制见 tls-client-fingerprint.md。
+# tls:
+#   custom-certifactes:
+#     - |-
+#       -----BEGIN CERTIFICATE-----
+#       <CA certificate content>
+#       -----END CERTIFICATE-----
+# 同一 tls 对象的 certificate/private-key 仅用于 HTTPS Controller，可用配对 PEM 或 dataDir 文件；
+# 均空时生成随机 RSA 2048 自签证书。内联固定，文件证书对热更新失败保留旧值。
+# client-auth-type: request/require-any/verify-if-given/require-and-verify，其它字符串为默认不请求证书；
+# 非空 client-auth-cert 在默认模式时提升为 require-and-verify，CA 内容/文件仅启动加载。
+# 上述服务端字段不改变 custom-certifactes 的客户端根库，也不用于独立 measureDelay 配置。
 
 # 可选的 HTTP/SOCKS5 混合入口；mixed-port 省略或 0 时关闭，1–65535 时启用。
 # TCP 在同端口接入 HTTP 转发 / CONNECT / Upgrade 和 SOCKS5 CONNECT / UDP ASSOCIATE。
@@ -31,28 +98,52 @@ geo-update-interval: 24
 # 构建必须同时包含 inbound-http 和 inbound-socks5；缺少任一 feature 则拒绝启用入口。
 # allow-lan 默认 false，绑定回环；true 时绑定通配地址，与 authentication 独立。
 # ipv6: true 时同时绑定同端口 IPv6（v6-only）；false 时只监听 IPv4。
-# authentication 省略或 [] 表示任何绑定地址均免认证；非空时必须恰好包含一项 user:password，
-# 按首个冒号分隔，用户名 / 密码各 1–255 UTF-8 字节，HTTP/SOCKS5 共用。
-# 共享或非空认证要求 mixed-port 启用。
+# authentication 省略、null 或 [] 表示任何绑定地址均免认证；非空支持多个 user:password，
+# 按首个冒号分隔，不 trim，允许空用户名或密码。HTTP 受 32 KiB 总头预算约束；SOCKS5 各字段最多 255 字节。
+# mixed-port 关闭时可以保留合法的 allow-lan 和 authentication，供之后启用入口使用。
 # HTTP 逐请求认证、选路，支持流式正文 / 分块、Keep-Alive、CONNECT 与 Upgrade。
 # 共享只适合可信网络，Basic 不加密链路；详细边界见 docs/inbounds.md#http。
 # UDP 必须属于有效的 TCP 控制连接，源 IP/端口校验和资源上限见 inbounds.md#socks5。
 mixed-port: 1080
 allow-lan: false
+bind-address: "*" # allow-lan=true 时可指定单个 IP；localhost 始终绑定回环
+lan-allowed-ips: [0.0.0.0/0, "::/0"]
+lan-disallowed-ips: [] # 拒绝优先
+skip-auth-prefixes: [] # 仅跳过认证，仍执行来源访问控制
 authentication:
   - "probe-user:probe-password"
 
-# 可选的运行时 Controller，地址必须是回环 IP 和显式非零端口。它可服务于启用
-# TUN 的配置或含 proxy-groups 的配置；运行配置仍需开启 mixed-port 或 TUN。
-# 只要 Controller 管理 proxy-groups，secret 就必填；仅有 TUN 流量接口时可省略。
-# secret 出现时必须为 1–255 UTF-8 字节，并作为全部 Controller 路由的 Bearer token。
+# 可选的运行时 Controller，接受 IP:port、localhost:port 或 :port；端口 0 由系统分配。
+# 静态节点、纯 DIRECT 及未启用代理入口的配置也可使用。
+# secret 省略或空串时免认证；非空时保护 Controller 业务路由，CORS 预检先于认证。
+# external-controller-tls 可单独启用，或与 HTTP 同时启用；HTTPS 实际提供 H2/H1，明文仅 H1。
+# CORS origins 缺省/[]/含 * 时允许所有来源；精确/单 * 匹配忽略大小写，无匹配不返回允许头。
+# 允许 GET/POST/PUT/PATCH/DELETE 与 OPTIONS；Content-Type/Authorization/Origin，max-age 300，
+# 不允许 credentials；allow-private-network 缺省 true，只在成功预检且请求 true 时返回允许头。
 # Controller 提供 GET /traffic、GET /group、GET /group/{name}、
-# GET /proxies/{name} 和 PUT /proxies/{name}，不属于 Invoke API。
+# GET /proxies/{name} 和 PUT /proxies/{name}；另含连接查询/关闭、有效配置、规则
+# 与有界原始 DNS 记录查询、节点/组 delay、Provider healthcheck、实际进程内存；
+# 完整接口见 controller-api.md；不属于 Invoke API。
 external-controller: 127.0.0.1:9090
+# external-controller-tls: 127.0.0.1:9443
+# Linux 本地 HTTP/1 / WebSocket 管理入口；空串关闭，相对路径从 dataDir 解析。
+# 父目录须已存在；0600 在 listen 前设置，已有文件/目录/链接/socket 均不接管。
+# 本地入口依赖文件权限，不要求 secret；并行网络 HTTP/HTTPS 仍使用原 Bearer。
+external-controller-unix: ""
+# 仅 Linux 管理 HTTP/HTTPS TCP listener 及已接受 socket 使用 SO_MARK；0 不设置。
+# 与业务 routing-mark 独立，不用于 Unix socket；非零值在其它系统启动网络入口时不支持。
+external-controller-routing-mark: 0
+external-controller-cors:
+  allow-origins: ["*"]
+  allow-private-network: true
 secret: "vole-runtime-secret"
 
-# TUN 使用 Mihomo 同名字段；未实现的 auto-route、auto-redirect、
-# auto-detect-interface、地址/路由、stack、offload 等字段仍严格拒绝。
+# TUN 使用 Mihomo 同名字段；auto-route/auto-detect-interface 仅供 Linux 自建 TUN。
+# Linux 缺省均为 true，其他平台缺省 false；借用 fd 的网络配置始终由宿主负责。
+# Linux 自建 auto-route 消费 inet6-address、route-address/route-exclude-address、
+# iproute2-table-index/iproute2-rule-index、strict-route、输入接口和 UID/端口排除。
+# 借用 fd、Apple/Android/Windows 仍由宿主应用这些网络设置；改动需要宿主重配/重连。
+# auto-redirect、stack、offload 等字段仍严格拒绝。
 # file-descriptor 缺省或 0 时由 core 打开本机平台 TUN；正数为当前进程已有 fd。
 # Unix 借用 fd 必须已 nonblocking，核心仅复制并关闭副本；帧格式由平台固定处理。
 # Linux / macOS 支持原生打开；Android / iOS / tvOS 仍要求宿主提供 fd。
@@ -67,8 +158,34 @@ secret: "vole-runtime-secret"
 # dns-hijack 缺省 [0.0.0.0:53]；[] 关闭。只在 dns.enable:true 的 TUN TCP/UDP 上生效。
 # 精确 IP:port 匹配指定目标；any/未指定地址匹配任何地址族的 53 端口。
 # udp-timeout 单位秒，缺省或 0 为 300；控制源关联及各目的流的空闲失效。
-# 配置必须启用 mixed-port 或 TUN。
+# Linux 专属 ICMP：真实 Echo 走共享 Dialer 的 DIRECT；真实 TUN 前缀、启用的 fake-IP 池或
+# disable-icmp-forwarding:true 使用本地合成，不代表真实 RTT。其他平台拒绝这两个字段。
+# icmp-timeout 为非负 int64 秒，缺省/0 为 10；超出本机单调时钟范围明确拒绝。
+# 运行组须由安装器/宿主在出口 namespace 预先授权 ping_group_range；Core 不改 sysctl、不提权、无 IP raw fallback。
+# 最多两个物理 ping socket、64 个许可、入/出各 8 项，真实包限 min(mtu,2048)；Stop 清理全部所有者。
+# 这些值变化须显式重连；详细合同见 tun-icmp-dns.md 与 tun-platform.md。
+# mixed-port 与 TUN 均关闭时仍可运行 Controller 和资源任务。
 tun:
+  # icmp-timeout: 10 # 仅 Linux；0 同缺省，其他平台不要填写
+  # disable-icmp-forwarding: false # 仅 Linux；true 保留本地合成回应
+  # auto-route: true # Linux：自动路由；DNS 启用且劫持网关时接管 systemd-resolved
+  # auto-detect-interface: true # Linux：出站自动绑定物理接口
+  # inet6-address: ["fdfe:dcba:9876::1/126"] # 顶层 ipv6 关闭时不添加；[] 关闭 IPv6 捕获
+  # route-address: [] # 各地址族省略时捕获其默认网段
+  # route-exclude-address: ["192.168.0.0/16", "fc00::/7"]
+  # iproute2-table-index: 2022 # 0 使用缺省值；不得占用系统表
+  # iproute2-rule-index: 9000 # 0 使用缺省值；本会话使用该值到 +8
+  # strict-route: false # 自动路由时，阻止所选输入绕过未捕获的 IPv6 地址族
+  # include-interface: [lo, veth-client] # Linux ingress接口；本机output为lo；非空时忽略exclude-interface
+  # exclude-interface: [veth-bypass] # 仅include为空时使用；两者均空保持仅本机捕获
+  # include-uid: [1001] # Linux 本机应用捕获范围；不解析 Android 包名
+  # include-uid-range: ["1001:1010"]
+  # exclude-uid: [1005] # exclude 优先于 include
+  # exclude-uid-range: ["2000:2010"]
+  # exclude-src-port: [5353]
+  # exclude-src-port-range: ["30000:30010"]
+  # exclude-dst-port: [22]
+  # exclude-dst-port-range: ["6000:6010"]
   enable: true
   device: ""
   file-descriptor: 0
@@ -77,49 +194,58 @@ tun:
     - any:53
   udp-timeout: 300
 
-# 可选的 TUN TCP/UDP 嗅探器。省略或 enable: false 表示关闭。启用时至少配置
-# HTTP、TLS、QUIC 之一；协议值为空或省略 ports 时分别使用 80/443/443。每种协议
-# 最多 64 个单端口或升序闭区间；HTTP 与 TLS 的 TCP 端口不能重叠，QUIC 使用
-# UDP，可与二者使用相同端口。嗅探结果只参与选路，不改写实际目标。
+# TCP 嗅探用于 TUN 和 mixed；QUIC 多包嗅探用于 TUN UDP。
+# 省略或 enable: false 关闭；未列出协议时不嗅探。协议 ports 省略/为空表示全部端口。
+# HTTP/TLS 重叠端口共享有界预读，按 TLS、HTTP 顺序识别；每协议最多 64 个端口/区间。
 sniffer:
   enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  force-domain: [] # Clash 通配、geosite:、rule-set:；可强制嗅探已知域名/fake-IP
+  skip-domain: [] # 对识别出的域名生效
+  skip-src-address: [] # CIDR、geoip:、rule-set:
+  skip-dst-address: []
+  override-destination: true # false 只提供选路域名；true 同时替换实际目标
   sniff:
     HTTP:
       ports: [80, 8080-8380]
+      override-destination: false # 协议项覆盖全局值
     TLS:
       ports: [443, 8443]
     QUIC:
       ports: [443, 8443]
 
-# 至少配置一个具体代理节点。节点和代理组定义名共享同一大小写敏感的命名空间，
-# 引用精确匹配且不做 Unicode normalization 或大小写折叠。名称必须为 1–64 UTF-8
-# 字节，首尾不能是任何 Unicode 空白字符，不能含控制字符，也不能包含逗号、井号、
-# 斜杠、问号、`&`、`=`、`%`、反斜杠，或使用 `.`、`..`、`DIRECT`、`REJECT`、
-# `RULES`；内部普通空格、CJK 和 emoji 可用。dialer-proxy 可引用具体节点或 select
-# 组。所有节点上游和全部组成员（包括未选成员）组成同一张无环图；未知引用、自引用
-# 和混合环均失败。代理数量和链深没有独立上限，仍受 YAML 256 KiB 和名称唯一约束。
-# 节点没有上游，或上游组经纯组成员链能到达 DIRECT 时，prepare 预解析该节点及其
-# 独立下载端点，即使 DIRECT 尚未选中；纯代理路径保留逻辑域名。候选首跳 DNS 失败
-# 则 prepare 失败，切换 DIRECT 不临时调用系统 DNS。物理首跳连接本机服务时，server 必须使用 127.0.0.0/8
-# 范围内的 IPv4 字面量或 ::1；域名解析到回环地址会失败关闭。
+# proxies 可省略或设为 []，允许仅使用 DIRECT、REJECT 或只包含内置动作的代理组。
+# VLESS/VMess uuid 支持标准、紧凑、花括号和 URN；其他字符串按 UUIDv5(nil, 原始UTF-8)映射。
+# 引用的节点和代理组必须存在。节点和代理组定义名共享同一大小写敏感的命名空间，
+# 引用精确匹配且不做 Unicode normalization 或大小写折叠。名称必须为非空字符串；
+# DIRECT、REJECT、REJECT-DROP、COMPATIBLE、PASS、PASS-RULE 为保留定义名。
+# 路径与 URL 中的保留字符由调用方按相应协议编码，不限制节点本身的名称。
+# dialer-proxy 可指定 DIRECT、COMPATIBLE 或引用具体节点、策略组。全部上游和组成员（包括未选成员）须无环。
+# 代理数量和链深没有独立上限，仍受 YAML 大小与名称唯一约束。
+# 实际建立物理首跳时才通过节点 resolver 解析主端点和独立下载端点。
+# 未选节点的 DNS 失败不阻塞准备；DNS 关闭时才使用系统 resolver。
+# DNS 开启时可通过 hosts 配置本机端点；关闭 DNS 或独立测速的系统 resolver
+# 仍拒绝解析到回环的服务器域名，本机服务器可使用 IP 字面量。
 #
 # VLESS 子集：
 # - type 固定 vless，network 默认 tcp，支持 tcp/ws/grpc/http/h2/xhttp，tls 默认 false；
 #   TCP 支持明文或 TLS 1.2/1.3；XHTTP H1/H2 支持明文、TLS1.3 或 REALITY。
 # - encryption 省略/空/none，或 mlkem768x25519plus.{native,xorpub,random}.{1rtt,0rtt}.<key>…；
 #   key/padding 链、上限和恢复规则见 vless.md；该层独立于外层 TLS/传输。
-#   flow 省略/空/xtls-rprx-vision；Vision 仅 TCP + TLS1.3/REALITY 或 Encryption，
-#   packet-encoding 必须 xudp（即使 udp=false）；
+#   flow 省略/null/空串/xtls-rprx-vision；Vision 仅 TCP + TLS1.3/REALITY 或 Encryption，
+#   packet-encoding 省略、xudp 或 none 均使用 XUDP；packetaddr 不可与 Vision 组合（即使 udp=false）；
 # - servername 可省略（WS Host 去端口后优先于 server）；TCP alpn 默认空，
 #   WS 默认 [http/1.1]，gRPC/H2 默认 [h2]；XHTTP [http/1.1] 选择 H1，
 #   空或 H1/H2 列表选择 H2，仅 [h3] 选择 H3。H3 必须标准 TLS1.3 与受控 UDP，
 #   不回退 H2。明文 XHTTP 的 alpn 仅选择版本，其余 TLS 专属字段仍拒绝。
 #   详细语义见 docs/vless.md 和 docs/xhttp.md。
-# - packet-encoding 默认 xudp；none 是显式 raw，packetaddr/packet 为 IP-only
-#   地址帧。raw 固定首包目标；packetaddr 域名通过受控 DNS 解析。
+# - packet-encoding 省略、xudp 或 none 均使用 XUDP；packetaddr/packet 为 IP-only
+#   地址帧；packetaddr 域名通过受控 DNS 解析。
+# - REALITY 不用于 WS/HTTPUpgrade；该组合在配置期拒绝。
 # - TLS 省略 reality-opts；REALITY 必须提供 reality-opts.public-key，可选 short-id；
-#   support-x25519mlkem768 默认 false；true 强制真实混合协商、不回退经典组。
-#   true 只允许 client-fingerprint chrome 或未命名（省略/none/空串）；不改写模板。
+#   support-x25519mlkem768 默认 false；true 允许同次握手协商真实混合或经典组。
+#   chrome 和未命名模板提供混合/X25519 双 share；其余 TLS1.3 模板保留真实经典 share。
 # - xhttp-opts 请求字段与值域详见 docs/xhttp.md；mode 只接受
 #   auto/packet-up/stream-up/stream-one；stream-one 不能与 download-settings 同用；
 # - download-settings 一旦出现（包括 {}），就为下行 GET 创建独立的
@@ -127,7 +253,7 @@ sniffer:
 #   XHTTP session ID，不进行第二次 VLESS 握手。两条请求最终必须由 CDN 或
 #   反向代理汇聚到同一个服务端 XHTTP 处理器和会话存储。
 # - download-settings 缺省叶字段继承；headers/reuse-settings/reality-opts/jls-opts/ech-opts 整对象
-#   替换，{} 分别清空请求头、重置复用默认、清除 REALITY/JLS/ECH。false/空串不等同缺省；
+#   替换，{} 分别清空请求头、重置复用默认、清除 REALITY/JLS/ShadowTLS/ECH。false/空串不等同缺省；
 #   certificate/private-key 成对替换或同时空串清除。改变安全类型须显式清除冲突
 #   策略。两个独立 listener 不能组成共享会话。
 #   auto 为 TLS -> packet-up、REALITY +
@@ -136,26 +262,158 @@ sniffer:
 #   同时关闭下载腿，不提供 TCP 半关闭后继续读取尾包的保证；packet-up 的待完成
 #   上传最多等待 1 秒。需要完整响应的应用须在关闭前读完响应。
 # - 标准 TLS 支持 skip-cert-verify/fingerprint/name-cert-verify，以及配对的
-#   内联 PEM certificate/private-key；不能混用 REALITY。完整策略见 vless.md。
+#   内联 PEM 或文件路径 certificate/private-key；不能混用 REALITY。完整策略见 vless.md。
 # - WS/gRPC/HTTP/H2 复用共享传输。WS 可 v2ray-http-upgrade 及其 fast-open；
-#   gRPC 可 UA、空闲 PING、max-connections/min-streams/max-streams 池阈值。
-# - smux 支持 h2mux/smux/yamux、padding/only-tcp 与池阈值；与 Vision 互斥。
-# - client-fingerprint 接受 none/chrome/chrome120/firefox/firefox120/safari/safari16；
-#   chrome=Chrome133，firefox=Firefox120，safari=Safari16.0；节点缺省关闭。
+#   gRPC 与 Trojan/VMess 共用 UA、空闲 PING、max-connections/min-streams/max-streams 池阈值。
+# - 公共节点 smux 支持 h2mux/smux/yamux、padding/only-tcp 与池阈值；与 Vision 互斥。
+# - random 在进程首次按 Chrome/Safari/iOS/Firefox = 6:3:2:1 选定后稳定复用。
+# - client-fingerprint 接受 none/chrome/firefox/safari/ios/android/edge/"360"/qq/random；
+#   chrome=Chrome133，firefox=Firefox120，safari=Safari16.0；android/360只有TLS1.2能力；节点缺省关闭。
 #   适用于标准 TCP TLS/REALITY，不改变证书 fingerprint；下载腿缺省继承、
 #   显式名称覆盖、none/空串清除，转 H3/明文必须清除指纹。
-#   非空 ALPS 服务端设置暂拒绝；边界见 docs/tls-client-fingerprint.md。
+#   不声明TLS ALPS，H2沿标准SETTINGS/ACK；意外协商的非空设置仍拒绝，见docs/tls-client-fingerprint.md。
 # - jls-opts.username/password 必须成对非空，各 1–65535 UTF-8 字节，要求 tls: true；
 #   与同腿 REALITY/证书策略/mTLS、Vision/H3 互斥。下载对象缺省继承、整体替换、
 #   {} 清除，主腿空对象拒绝。保持完整 TLS1.3 认证，无恢复；详见 vless.md#jls。
-# - 静态 ech-opts 只用于标准 TLS，详见下方示意与 docs/vless.md#静态-ech。
-#   不接受动态 query-server-name、shadow-tls-opts 或已移除的 restls-opts。
+# - ech-opts 的静态/动态来源只用于标准 TLS，详见下方示意与 docs/vless.md#ech。
+#   query-server-name 只覆盖动态 HTTPS 记录查询名，不改变拨号、SNI 或证书验证名。
+#   shadow-tls-opts 必须 {version: 3, password: 非空密码}，与 REALITY/JLS/ECH、Vision 互斥；
+#   使用既有 servername/SNI 与证书策略，只用于 TCP 承载和 XHTTP H1/H2。
 #
 # 下方 vless-edge 通过 upstream-select 当前选择的 socks-hop 建链：
 # 客户端 -> socks-hop -> vless-edge -> 目标。
+# 普通协议节点和具名 direct 可声明 tfo: false（默认）。Linux 单个可用物理 TCP 地址启用
+# TCP Fast Open；多地址沿普通 eager TCP 选择，其他系统沿普通受控 TCP。原生 UDP 不受影响。
+# 仅真实物理首跳消费；经代理使用上游节点自己的 tfo，组落到 DIRECT 时使用当前节点 tfo。
+# 普通协议节点和具名 direct 可声明 mptcp: false（默认，非 null 布尔值）。仅 Linux
+# 无 socket protector、显式/自动接口、专用 DNS binding 或源 IP 约束的物理 TCP 路径尝试 MPTCP。
+# 系统路径管理器与额外路径由宿主管理，Core 不配置接口/子流；routing-mark 仍沿现有防环策略。
+# 受约束路径、其他系统或本机/对端不支持时使用普通受控 TCP，不绕过保护或绑定失败。
+# 代理链只消费实际首跳自己的值，组落到 DIRECT 时使用当前节点值；原生 UDP/QUIC 不受影响。
+# 普通协议节点和具名 direct 支持 ip-version: dual/ipv4/ipv6/ipv4-prefer/ipv6-prefer；默认 dual。
+# 普通协议节点和具名 direct 可声明 interface-name / routing-mark，仅物理首跳消费；经 dialer-proxy 时
+# 使用真正上游节点的出口策略，组落到 DIRECT 时保留当前节点策略。XHTTP 两腿使用相同策略。
+# 普通协议节点支持 smux 包装，要求对端提供 sing-mux 解码；普通 HTTP/SOCKS listener 不自动解码。
+# only-tcp: false 提供 mux UDP，即使底层 udp 为 false；true 保留底层 UDP 能力与编码。
+# smux.brutal-opts 启用后，每条新会话先与支持 TCP Brutal 的对端协商；远端下行协商不限定客户端平台。
+# Linux 本地上行只在可确认独占的直连物理 TCP 上尝试；代理 hop、共享/多腿传输与 mptcp:true 不设置本地算法。
+# Core 不安装/加载模块；本地不可用保留有效远端协商。池保持单会话，退役等待旧流释放；详见 xhttp.md。
+# HTTP(S) CONNECT 示例：type: http，必填 name/server/port，tls 默认 false。
+# username/password 均非空才认证；headers 为字符串映射；仅 TCP，不支持 udp: true。
+# tls: true 时支持 sni/skip-cert-verify/name-cert-verify/fingerprint，
+# 以及成对的 certificate/private-key（PEM 或文件路径）。支持 dialer-proxy；详见 outbounds.md。
+# TrustTunnel 支持 H2/H3 CONNECT TCP/UDP，type: trusttunnel；username/password 默认空串，
+# 始终发送 Basic 认证，不要求非空。quic 默认 false（TLS+H2），true 使用 QUIC/TLS1.3+H3。
+# sni 缺省/空串使用 server；alpn 缺省/[] 随模式使用 [h2]/[h3]，自定义列表须包含该值，
+# H3 实际协商必须为 h3；H2 接受 h2，或在认证后无 ALPN 时使用 H2 prior knowledge；明确协商其他协议拒绝。
+# 两模式共享证书策略、mTLS、ech-opts；client-fingerprint 仅 H2 消费，
+# H3 将该字符串视为 no-op，不校验模板名。H3 外层始终需要双向至少1200字节UDP路径。
+# 逻辑客户端池 max-connections/min-streams/max-streams 全为 0 时采用 8/5/0；
+# 优先复用流数最少的客户端，max-connections > 0 时，达到客户端数上限或
+# 当前流数 < min-streams 即复用；max-connections <= 0 时，按
+# max-streams > 0 且当前流数 < max-streams 复用；未满足条件则增加客户端。
+# 零活跃流始终复用，混合填写不报互斥，阈值不限制业务总连接数。物理连接空闲30秒关闭。
+# udp: true 启用 _udp2 多目标数据报；health-check: true 启用 _check 协议探测，
+# 成功CONNECT响应重置7秒计时，单次探测期限7秒；二者缺省false。UDP业务在两模式均走可靠流。
+# congestion-controller 仅H3消费：cubic/new_reno 使用 quiche 原生 CUBIC/Reno；
+# bbr/bbr_meta_v1/bbr_meta_v2 均映射到 quiche 原生 Bbr2Gcongestion，省略/未知使用 cubic。
+# H2 不消费 congestion-controller。
 proxies:
-  # TUIC v5：固定 QUIC/TLS1.3；必填 UUID 和原样 password（可空，最多 65535 UTF-8 字节）。
-  # 不接受 v4、token、0-RTT、client-fingerprint、mTLS、ECH 或其他 TLS 后端选项。
+  # 功能出站没有 server/port；不接受 udp、smux 或 dialer-proxy。
+  # direct 另接受 interface-name/routing-mark/ip-version/tfo/mptcp，域名使用 direct-nameserver。
+  - {name: direct-local, type: direct}
+  # dns 仅接受 name/type，复用当前会话解析器，可由普通规则接管任意端口的 TCP/UDP DNS。
+  - {name: dns-local, type: dns}
+  # reject 仅接受 name/type；立即结束，不增加 action 字段。
+  - {name: reject-local, type: reject}
+  # rematch 是规则控制，不建立连接。两个 target 至少出现一个，省略保留原值；
+  # target-rematch-name: '' 清标记；target-sub-rule: '' 或未知名称回主规则。
+  # 已存在的空子列表耗尽后 DIRECT；省略 target-sub-rule 保留当前根列表。
+  # 仅业务 rule 模式和 DNS #RULES 消费，不能用于 node-only 测速或物理上游。
+  - {name: mark-blue, type: rematch, target-rematch-name: blue}
+  - name: trusttunnel-edge
+    type: trusttunnel
+    server: trusttunnel.example.com
+    port: 443
+    quic: false # true 改为H3，其余业务配置不变
+    username: synthetic-user
+    password: synthetic-password
+    udp: true
+    health-check: true
+
+  # Mieru：transport 必填 TCP 或 UDP；二者均承载 TCP 和 udp: true 的 UDP Associate。
+  # username/password 各为 1–64 UTF-8 字节，保留原值。port 与非空 port-range 互斥，
+  # 范围如 "24810-24812"，每次新物理连接随机选择包含两端的端口。
+  # multiplexing 为 MULTIPLEXING_DEFAULT/OFF/LOW/MIDDLE/HIGH，默认 LOW；
+  # handshake-mode 为 HANDSHAKE_DEFAULT/STANDARD/NO_WAIT，默认 STANDARD。
+  # 枚举须携带上述完整前缀。UDP 底层提供 ACK/重传/排序/窗口，不是裸 UDP 转发。
+  # traffic-pattern：可选的标准 Base64 Mieru protobuf；省略/空值使用协议默认策略。
+  - name: mieru-edge
+    type: mieru
+    server: mieru.example.com
+    port: 24810
+    transport: TCP
+    username: synthetic-user
+    password: synthetic-password
+    udp: true
+    multiplexing: MULTIPLEXING_LOW
+    handshake-mode: HANDSHAKE_STANDARD
+
+  # MASQUE L4：标准Base64 SEC1 ECDSA私钥与SPKI服务端公钥；独立客户端证书。
+  # 仅TCP，udp: true仍关闭基础UDP；SNI缺省为consumer-masque-proxy.cloudflareclient.com。
+  # ip/ipv6/uri/mtu及正handshake-timeout在L4不消费；负超时拒绝。
+  # name-cert-verify占位不消费；skip-cert-verify关闭公钥固定但仍验证握手签名。
+  # - name: masque-l4
+  #   type: masque
+  #   server: masque.example.com
+  #   port: 443
+  #   network: h3-l4proxy
+  #   # IP tunnel: network: quic 或 h2, ip: 192.0.2.2, ipv6: 2001:db8::2, udp: true
+  #   # IP mode MTU defaults to 1280; IPv4-only permits 68..65535.
+  #   # uri: https://cloudflareaccess.com # IP tunnel CONNECT authority
+  #   # handshake-timeout: 5 # 整数秒；0 沿创建调用期限；正值由节点持有
+  #   remote-dns-resolve: false # true 且 dns 非空时经本节点解析业务域名
+  #   dns: [] # IP 模式支持 UDP/TCP 等；L4 需要 tcp:// 或其它 TCP DNS 传输
+  #   private-key: "<Base64 SEC1 DER>"
+  #   public-key: "<Base64 ECDSA SPKI DER>"
+  #   congestion-controller: bbr # 同 TrustTunnel H3 的算法映射
+  #   ip-stack: {mode: auto, congestion-controller: cubic}
+
+  # 标准 WireGuard：用户态内层 TCP/UDP，不创建系统接口/路由/NAT。
+  # 密钥为公开测试值，不可用于真实连接。外层始终需要双向 UDP；业务 udp 默认 false。
+  # ip/ipv6 接受 IP 或 CIDR，按实际地址族选择，每族最多一个；至少配置一个。
+  # MTU 缺省/0 为 1408，范围 1280–65503；实际上游双向预算须至少 MTU+32。
+  # 与 Mihomo 一致，单 peer 顶层 allowed-ips 接受但忽略。完整行为见 outbounds.md#wireguard。
+  - name: wireguard-edge
+    type: wireguard
+    server: wireguard.example.com
+    port: 51820
+    ip: 10.84.0.2/24
+    # ipv6: fd84::2/64
+    private-key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+    public-key: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+    # pre-shared-key: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM="
+    mtu: 1408
+    persistent-keepalive: 0 # uint16 秒；0 不定期保活
+    allowed-ips: [] # 无 peers 时忽略；各本地地址族使用全地址路由
+    reserved: [] # 空、三字节数组或标准 Base64 字符串（如 "U4An"）；peer 缺省继承顶层值
+    remote-dns-resolve: false # true 且 dns 非空时，业务域名通过本节点查询
+    # 支持 Core DNS 上游；fragment 出口 token 忽略，键值参数保留且只解码一次。
+    # 不继承全局 prefer-h3，HTTPS h3=true 仍生效；上游域名仍由 Core 代理 DNS bootstrap。
+    dns: []
+    refresh-server-ip-interval: 0 # 秒；0 不更新，新业务触发到期检查
+    # peers 非空时忽略顶层 server/port/public-key；每项 allowed-ips 必须非空。
+    # peers:
+    #   - server: wireguard.example.com
+    #     port: 51820
+    #     public-key: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+    #     allowed-ips: ["0.0.0.0/0"]
+    #     reserved: [0, 0, 0]
+    udp: true
+    # dialer-proxy: upstream-select # 上游必须提供足够的双向 UDP 预算
+
+  # TUIC v5：固定 QUIC/TLS1.3；UUID 必填，password 缺省为空，原样使用（最多 65535 UTF-8 字节）。
+  # 支持成对 PEM/文件 certificate/private-key 客户端身份；不接受 v4、token、0-RTT、client-fingerprint、ECH。
   - name: tuic-edge
     type: tuic
     server: tuic.example.com
@@ -167,12 +425,28 @@ proxies:
     skip-cert-verify: false
     # fingerprint: "<SHA-256 certificate pin, 64 hex digits>"
     # name-cert-verify: verified.example.com
+    # certificate/private-key: 成对内联 PEM 或文件路径；不改变服务端信任根
+    # 文件对由既有资源工作器检查并用于新物理连接；失败保旧，边界见 docs/tls-client-fingerprint.md
     congestion-controller: cubic # cubic（默认）/new_reno/bbr
-    udp: true # 缺省 false；只控制业务 UDP，QUIC 首跳始终需要数据报
+    disable-sni: false # true只关闭SNI，证书名称/pin验证保持
+    udp: true # 可省略或设 false，均保留业务 UDP；组 disable-udp 仍生效
     udp-relay-mode: native # native（默认）/quic
+    # ip: 192.0.2.1 # 仅覆盖物理入口，server/SNI 保留
+    # heartbeat-interval: 10000 # 毫秒；<=0 回落 10000，同时控制 keepalive/HEARTBEAT
+    # recv-window-conn: 0 # 实际为 stream 窗口：缺省/0 初始1.5MiB/上限15MiB；正数固定
+    # recv-window: 0 # 实际为 connection 窗口：缺省/0 初始2MiB/上限64MiB；正数固定
+    # 固定 Middle 策略下，缺省实际 stream4MiB/connection2MiB，不预分配全部信用。
+    # max-open-streams: 100 # 0 同默认；参考阈值100=>90，实际同时所有者默认89，正N!=100为N-1
+    # max-udp-relay-packet-size: 1252 # 仅在缺省 frame 上限时用于计算 frame=该值+29
+    # max-datagram-frame-size: 1281 # 完整 QUIC DATAGRAM frame，参考限制到1400；与累计256KiB缓冲独立
+    # disable-mtu-discovery: false # 发现受实际上游双向预算限制
+    # udp-over-stream: false # QUIC可靠流承载业务UDP；QUIC物理入口仍须数据报
+    # udp-over-stream-version: 2 # 省略同2；仅接受整数2
+
     # dialer-proxy: upstream-select # 所选上游必须实际支持双向至少 1200 字节数据报
 
-  # Hysteria2：固定 QUIC/TLS1.3，外层总是需要 UDP；业务 UDP 默认关闭。
+  # Hysteria2：固定 QUIC/TLS1.3，外层总是需要 UDP；业务 UDP 始终可用。
+  # udp 可省略或填 true/false，均不禁用业务 UDP；组 disable-udp 仍生效。
   # 完整字段/预算及开发验收边界见 outbounds.md#hysteria2。标准 TLS 证书策略与其他协议共用。
   - name: hysteria2-edge
     type: hysteria2
@@ -182,16 +456,38 @@ proxies:
     sni: hysteria2.example.com
     alpn: [h3] # 缺省或 [] 都归一为 h3
     skip-cert-verify: false
+    # name-cert-verify: verified.example.com # 独立证书验证名，不改变 SNI
     # fingerprint: "<SHA-256 certificate pin, 64 hex digits>"
-    # certificate/private-key: 成对内联 PEM 客户端身份
+    # certificate/private-key: 成对内联 PEM 或文件路径 客户端身份
     udp: true
     up: 0 # 裸数单位 Mbps；0 自动，也可 "125 KBps"，b=bit/B=byte
     down: 0
-    udp-mtu: 1197 # 单个协议分片预算；0 同默认，范围 64–65535
-    # obfs: salamander
+    udp-mtu: 1400 # 单个协议分片预算；0 同默认，范围 64–65535
+    # initial-stream-receive-window: 65536 # byte，0/省略为64KiB
+    # max-stream-receive-window: 65536 # 固定信用=max(initial,min(maximum,4MiB))，不预分配缓冲
+    # initial-connection-receive-window: 4194304 # 固定连接信用；0/省略为4MiB，可显式增大
+    # max-connection-receive-window: 4194304 # 接受独立上限；Middle策略仍使用连接initial，不自适应增长
+    # handshake-timeout: 0 # 秒；正值由节点独立持有共享握手，各调用保留自己的期限
+
+    # obfs: gecko # 或 salamander
+    # obfs-min-packet-size: 512 # 仅 Gecko，正值且 min≤max≤2048
+    # obfs-max-packet-size: 1200 # 填充目标，仍受真实物理UDP预算限制
     # obfs-password: "independent-synthetic-password"
-    # ports: "443,8443-8445" # 非空集合控制初始及后续入口；出现时 port 可省略
-    # hop-interval: "5-7" # 仅与 ports 配套，默认 30 秒，最小 5 秒
+    # realm-opts: # enable true 时不能启用 ports/hop-interval
+    #   enable: true
+    #   server-url: https://realm.example.com # HTTP(S) base，无userinfo/query/fragment
+    #   token: synthetic-token
+    #   realm-id: synthetic-zone
+    #   stun-servers: [stun.example.com:3478]
+    #   sni: realm.example.com # 以下仅HTTPS控制面，独立于业务QUIC身份
+    #   alpn: [h2, http/1.1]
+    #   skip-cert-verify: false
+    #   name-cert-verify: realm.example.com
+    #   fingerprint: ""
+    #   certificate: ./client.crt # 与private-key成对，或内联PEM
+    #   private-key: ./client.key
+    # ports: "443/8443-8445" # 逗号或斜线；有效集合控制初始/后续入口，port可省略或0
+    # hop-interval: "5-7" # 随 ports；0使用30秒，正数小于5归一为5，范围归一
     # dialer-proxy: upstream-select
 
   # VMess AEAD：alterId 仅 0；cipher 默认 auto（实际 AES 硬件检测），还支持
@@ -200,7 +496,12 @@ proxies:
   # network 默认 tcp，支持 tcp/ws/grpc/http/h2。tls 默认 false；关闭时
   # 禁止 servername/alpn/fingerprint/skip-cert-verify 等 TLS 专属字段。
   # servername 优先显式值，其次 WS Host 去端口，否则 server。
+  # TLS 支持 name-cert-verify 和成对的内联 PEM 或文件路径 certificate/private-key；
+  # 验证名不改变 servername，客户端身份不增加服务端信任根。
   # ws-opts/grpc-opts 与下面 Trojan 的结构相同；HTTP/H2 选项见示例注释。
+  # tls: true 时可选 shadow-tls-opts: {version: 3, password: cover-password} 或
+  # jls-opts: {username: user, password: password}；身份单选。REALITY 仅 TCP/HTTP/H2/gRPC，
+  # 必须有效 client-fingerprint，不用于 WS/HTTPUpgrade。
   # UDP 默认 false；packet-encoding 默认为空（raw），或 xudp/packetaddr。
   # raw transport 固定首包目标；packetaddr 域名由受控 Vole DNS 解析为 IP。
   # TCP/WS 保留下载侧；gRPC/HTTP/H2 上传 EOF 关闭逻辑流，详见 outbounds.md#vmess-aead。
@@ -225,11 +526,12 @@ proxies:
     #   headers: {Host: [cover.example:443], X-Custom: [one, two]}
     # 每次握手各选一个路径与每个头的一个值；禁止 Content-Length/Transfer-Encoding。
     # network: h2
-    # h2-opts:
-    #   host: [cover.example:443] # 必填、非空；每流选一个，不改变 TLS 认证名
+    # h2-opts: # 省略/host: [] 使用 www.example.com；path 省略/空为 /
+    #   host: [cover.example:443] # 每流选一个；缺省/空列表用 www.example.com，不改变 TLS 认证名
     #   path: /cover              # 默认 /；普通 PUT body，不使用 gRPC framing
 
   # Trojan（outbound-trojan feature）：固定 TLS，不接受 tls 开关。
+  # 可选通用 ShadowTLS v3/JLS；TCP/gRPC 另支持 REALITY，须有效 client-fingerprint。
   # password 必须非空，按原始 UTF-8 字节认证，不 trim。
   # network 接受 tcp（默认）、ws、grpc。sni 默认 server，不回退 WS Host；
   # alpn 默认 tcp=[]、ws=[http/1.1]、grpc=[h2]。显式列表保留顺序，WS/gRPC
@@ -237,6 +539,7 @@ proxies:
   # Stop / 取消仍关闭全部会话及自有 driver，不更改 XHTTP 的全关闭约定。
   # skip-cert-verify 默认 false；fingerprint 沿用 AnyTLS 的证书 SHA-256
   # pin 语义，pin 与 skip 同时存在仍必须匹配 pin。udp 默认 false。
+  # name-cert-verify 只改变证书验证名；certificate/private-key 为成对内联 PEM 或文件路径 客户端身份。
   # UDP 在 TLS 流内传输；单包负载最多 8192 字节并与入口预算取较小值，
   # 不拆包或截断。域名地址保持域名交由服务端处理；Mihomo v1.19.31 的
   # Trojan listener 不接收域名 UDP 帧，使用该对端时需要 IP 业务目标。
@@ -252,7 +555,7 @@ proxies:
     # ws-opts:
     #   path: /edge?query=1       # 默认 /，必须绝对路径
     #   headers: {Host: cover.example:443, X-Custom: value}
-    #   max-early-data: 2048    # 0–2048，默认 0
+    #   max-early-data: 4096    # 默认0；发送按实际HTTP头预算钳位，不预分配此上限
     #   early-data-header-name: Sec-WebSocket-Protocol
     #   v2ray-http-upgrade: true # 默认 false；原始流，不发送 WebSocket 帧
     #   v2ray-http-upgrade-fast-open: false # 仅 upgrade=true 可开启
@@ -262,8 +565,14 @@ proxies:
     # 不接受保留握手头、重复大小写头、CR/LF、userinfo 或超限 HTTP 头。
     # network: grpc
     # grpc-opts:
-    #   grpc-service-name: edge # 必填；普通名映射 /edge/Tun；/ 开头使用完整路径
-    # ws-opts / grpc-opts 仅可用于对应 network；不提供 gRPC 连接池。
+    #   grpc-service-name: edge # 省略/空默认 GunService；普通名映射 /edge/Tun；/ 开头使用完整路径
+    #   grpc-user-agent: grpc-go/1.36.0 # 省略/空使用此默认值
+    #   ping-interval: 0       # 秒数；0 不主动 PING；负值明确拒绝
+    #   max-connections: 4     # 正值时优先按连接上限/min-streams 扩容；显式1/2保留各自策略
+    #   min-streams: 0
+    #   max-streams: 0         # max-connections 非正时按此复用阈值扩容
+    # 三阈值省略或字面全零时为4/0/0（Mihomo为1/0/0）；负阈值禁用分支。
+    # ws-opts / grpc-opts 仅可用于对应 network；grpc-opts 可省略。
 
   - name: vless-edge
     type: vless
@@ -281,11 +590,11 @@ proxies:
       path: /onev
       mode: auto
       headers: {X-Transport: edge}
-      # 以下范围均为字符串 N 或 N-M。所有请求字段与合法配套见 docs/xhttp.md。
+      # 范围用字符串 N 或 N-M；uplink-chunk-size/sc-max-each-post-bytes/sc-min-posts-interval-ms 也接受整数。
       x-padding-bytes: "100-1000"
       sc-max-each-post-bytes: "1000000" # packet-up，最多16MiB，非预分配大小
-      sc-min-posts-interval-ms: "30"    # packet-up，0–60000且最大值为正
-      reuse-settings: # 省略无额外池；{} 启用默认池，阈值不是全节点数量上限
+      sc-min-posts-interval-ms: "10"    # packet-up，0–60000且最大值为正
+      reuse-settings: # 省略时仅 H3 共享活动连接（每条 4 个租约、无空闲缓存）；{} 启用显式池
         max-concurrency: "0"
         max-connections: "0"
         c-max-reuse-times: "0"
@@ -307,18 +616,24 @@ proxies:
         fingerprint: ""     # 清除继承的 pin
         client-fingerprint: "" # 清除继承的 ClientHello profile
         name-cert-verify: "" # 恢复下载认证名
-        # certificate: <inline PEM> # 与 private-key 成对；禁止文件路径
-        # private-key: <inline PEM>
+        # certificate: ./client.crt # 与 private-key 成对，或两者都使用内联 PEM
+        # private-key: ./client.key
         # reality-opts: {} # 清除继承的 REALITY；非空对象必须提供 public-key
         # jls-opts: {} # 清除继承的 JLS；非空对象必须提供 username/password
+        # shadow-tls-opts: {} # 清除继承的 ShadowTLS；非空须 version: 3 和 password
     smux:
       enabled: false
-      protocol: h2mux # h2mux/smux/yamux
-      max-connections: 1 # 0–i32::MAX；正值与正 max-streams 互斥
+      protocol: h2mux # 缺省/空为 h2mux，另支持 smux/yamux
+      max-connections: 1 # 带符号平台整数；负阈值禁用；正值优先于 max-streams
       min-streams: 0
       max-streams: 0
       padding: false
-      only-tcp: false # true 保留 packet-encoding；false 使用 sing-mux UDP
+      only-tcp: false # true 委托底层 UDP；false 提供 sing-mux UDP
+      statistic: false # true 记录真实 Inner 连接，可由 Controller 关闭，不重复计入业务总字节
+      brutal-opts:
+        enabled: false # true 要求服务端支持并启用 TCP Brutal；失败不回退普通 mux
+        up: 100 Mbps # 客户端发送能力；裸整数/纯数字字符串单位为 Mbps，b=bit、B=byte
+        down: 100 Mbps # 客户端接收能力；接受十进制 K/M/G/T bps/Bps，缺省为 0
     dialer-proxy: upstream-select
 
   # REALITY 写法示意：在 VLESS 节点中保留 tls: true，并增加以下 mapping；不要与
@@ -328,35 +643,47 @@ proxies:
   #   short-id: "0123"
   #   support-x25519mlkem768: false # 主腿/下载腿均可配置，必须为非 null 布尔值
 
-  # 标准 TLS 的可选静态 ECH；主腿与 download-settings 使用相同字段。
-  # 启用时 config 必填标准 Base64 ECHConfigList，不能只填写 enable。
-  # 实际只协商 TLS1.3，servername 必须是 DNS 名；不查询 DNS 或自动明文回落。
-  # {} 清除；不能与同腿 REALITY/JLS、Vision 混用，详细契约见 docs/vless.md#静态-ech。
+  # 标准 TLS 的可选静态/动态 ECH；主腿与 download-settings 使用相同字段。
+  # 非空 config 是标准 Base64 ECHConfigList；省略/空串时通过节点 DNS 查询 HTTPS key 5。
+  # 实际只协商 TLS1.3，servername 必须是 DNS 名；静态 config 不查询 DNS，失败不自动明文回落。
+  # {} 清除；不能与同腿 REALITY/JLS、Vision 混用，详细契约见 docs/vless.md#ech。
   # ech-opts:
   #   enable: true
+  #   query-server-name: query.example # 省略则查询 servername，静态 config 优先
   #   config: "<server-provided Base64 ECHConfigList>"
 
   # SOCKS5 出站支持 CONNECT 和 UDP ASSOCIATE。username/password 必须同时省略
-  # 或同时出现；tls 只能省略或为 false。udp 控制 UDP ASSOCIATE。
+  # 或同时出现；tls 默认 false，true 使用 server 作为 TLS 名称，不接受 sni/alpn/client-fingerprint。
+  # TLS 支持 skip-cert-verify/name-cert-verify/fingerprint 和成对内联 PEM 或文件路径 certificate/private-key。
+  # TLS 只保护 TCP 控制连接，UDP relay 数据不经 TLS；udp 控制 UDP ASSOCIATE。
   - name: socks-hop
     type: socks5
     server: socks.example.com
     port: 1080
+    mptcp: false # true 仅在上述 Linux 宿主管理的无接口/源地址约束路径尝试
     username: user
     password: password
     udp: true
 
-  # AnyTLS 只提供客户端出站，配置只接受以下字段和可选 dialer-proxy。
+  # AnyTLS 只提供客户端出站，接受以下协议字段和节点通用字段。
   # sni 省略时使用 server。TLS 1.3/1.2 默认 WebPKI，alpn 省略/[] 时不发送。
   # skip-cert-verify 不能覆盖 fingerprint；pin 是证书 SHA-256，不是客户端伪造指纹。
   # 叶 pin 直接决定信任；非叶 pin 作为根继续验证链和名称。所有策略均验证握手签名。
-  # 不支持 REALITY、fp、ECH、mTLS 或 session/padding 调参字段，详见 outbounds.md#anytls。
+  # name-cert-verify 只改变证书验证名；certificate/private-key 为成对内联 PEM 或文件路径 客户端身份。
+  # 支持共享 client-fingerprint 和静态/动态 ech-opts；普通TLS、ShadowTLS v3或JLS身份单选。
+  # 不支持 REALITY 或 padding 调参，详见 outbounds.md#anytls。
+  # 两个 idle 时间字段为整数秒，<=5 回落30秒；min-idle-session 只保留现有空闲会话。
   # TCP 使用 AnyTLS session；udp: true 使用 UoT v2 datagram mode。
   - name: anytls-edge
     type: anytls
     server: anytls.example.com
     port: 443
     password: "private-anytls-password"
+    idle-session-check-interval: 30
+    idle-session-timeout: 30
+    min-idle-session: 0
+    disable-reuse: false
+    client-metadata: "" # 原样进入 Settings.client，不自动生成设备或产品标识
     sni: anytls.example.com
     # alpn: [h2, http/1.1]
     skip-cert-verify: false
@@ -370,7 +697,7 @@ proxies:
   # AES password 可用 iPSK1:...:iPSKn:uPSK 身份链，其他算法仅单一 Base64 PSK。
   # 以下仅为公开测试 key，不可用于真实服务。UDP 默认 false。
   # 上游 padding 风险和验收边界见 outbounds.md#shadowsocks-2022；
-  # 完整互通尚未签收。dialer-proxy 可引用具体节点或 select 组。
+  # dialer-proxy 可指定 DIRECT 或引用具体节点、策略组。互通范围见 acceptance.md。
   - name: ss-edge
     type: ss
     server: ss.example.com
@@ -378,7 +705,14 @@ proxies:
     cipher: 2022-blake3-aes-128-gcm
     password: "BwcHBwcHBwcHBwcHBwcHBw=="
     udp: true
-    # 可选 TCP 包装，两字段必须成对。仅 strict ShadowTLS v3 / TLS1.3。
+    # 可选流式插件，plugin/plugin-opts成对且只选一种：
+    # obfs: {mode: http 或 tls, host: bing.com}
+    # v2ray-plugin/gost-plugin: {mode: websocket, host: bing.com, path: /, mux: true, tls: false}
+    # v2ray-plugin另接受v2ray-http-upgrade/v2ray-http-upgrade-fast-open。
+    # TLS开启后才接受plugin-opts内的skip-cert-verify/name-cert-verify/fingerprint、
+    # 配对certificate/private-key与ech-opts；Host头同时确定SNI。
+    # jls: {host: cover.invalid, username: jls-user, password: jls-password, alpn: [h2, http/1.1]}
+    # ShadowTLS仅显式v3，使用完整TLS1.3认证。
     # UoT 默认关闭。开启须 udp: true，UDP 经 SS TCP（含可选插件），不回退原生 UDP。
     # udp-over-tcp: true
     # udp-over-tcp-version: 2 # 开启时省略或整数 2；关闭时不得配置版本
@@ -392,24 +726,47 @@ proxies:
     #   skip-cert-verify: false
     #   fingerprint: "<SHA-256 certificate pin, 64 hex digits>"
     #   name-cert-verify: verified.example.com # 可选独立证书验证名
-    # client-fingerprint: chrome # 仅有插件时允许；共享七值，缺省/none/空串关闭命名模板
+    # client-fingerprint: chrome # 仅有插件时允许；共享命名模板（须具备TLS1.3能力），缺省/none/空串关闭命名模板
 
-# 可选的静态 `select` 代理组。字段外形是严格 Mihomo 子集：每组只接受 name、
-# type、proxies 和可选 default-selected，type 只能是 select，proxies 至少一项。
-# 成员可精确引用具体节点、另一个 select 组、DIRECT 或 REJECT；RULES 不是成员。
-# 组声明顺序、成员顺序和重复成员全部保留，节点与组的完整混合图必须无环；组数、成员数和嵌套
-# 深度没有独立上限，仍受 256 KiB 配置总大小和 O(V+E) 无环校验约束。
+# select/url-test/fallback/load-balance 组支持静态 proxies 与动态 use；include-all 同时包含静态节点和所有 providers，
+# 也可分别使用 include-all-proxies / include-all-providers。后者启用时忽略 use。
+# filter 筛选动态成员；exclude-filter / exclude-type 同时排除显式成员。
+# 名称正则区分大小写；支持 lookahead、定长 lookbehind、数字/ASCII命名 backreference。
+# 命名组接受 (?<name>...) / (?'name'...)，引用接受 \k<name> / \k'name'；注释接受 (?#...)。
+# 混合捕获按 .NET 规则先给未命名组编号，再给命名组编号；数字回引、$1 / ${1} / $+ 使用该编号。
+# 反引号分隔的多表达式按匹配顺序排列。节点改名另支持 ${name} / $$ 等 .NET replacement。
+# 重复命名、显式数字组和递归/条件/平衡组不支持，不宣称完整.NET方言。
+# 复杂表达式有内部编译/执行预算；失败候选保留旧资源，不静默当不匹配。
+# 静态成员保留顺序与重复项。
+# 过滤后组成员为空时使用 empty-fallback（缺省 COMPATIBLE，即 DIRECT），可指定节点或内置目标。
+# disable-udp 缺省 false；true 禁用该组的业务 UDP。规则模式跳过不支持 UDP 的目标，
+# 继续匹配后续规则；global 模式及显式 DNS 出口仍会拒绝。hidden/icon 为 Controller 元数据。
+# 节点与组的完整混合图必须无环。资源更新后保留仍存在的当前选择，否则使用默认/首成员。
+# 未显式定义 GLOBAL 时，自动追加一个 select 组；成员依次为 DIRECT、REJECT、
+# 所有节点和声明的组，默认 DIRECT。可显式声明 GLOBAL 覆盖其成员及初始选择。
 #
-# default-selected 省略时选中第一项；显式值必须是当前组的直接成员。重复名称按
-# 第一项命中。没有 Controller 时，该初始选择在本次 session 内固定；有 Controller
-# 时可实时切换。选择只存于 Vole 当前 session 内存，Vole 不写回 YAML；宿主若需
-# 跨 session 保留，必须持久化选择并在下次配置中注入 default-selected。
-#
-# 切换只影响之后新建的物理 TCP 连接、UDP association/transport 和 DNS transport；
-# 既有 TCP 连接、UDP association、DNS cache/singleflight、DNS TCP pool 和其中的
-# transport 不迁移、不清空。选中成员失败时原样失败，代理组不自动换成员。
+# select 的 default-selected 省略、null、空串或未命中时选中第一项；有效缓存选择优先。名称精确匹配。
+# url-test 按 URL 探测延迟选择，tolerance（毫秒，默认 0）抑制小幅切换；fallback
+# 按声明顺序选择首个健康成员，恢复后可回到前面的成员。全部失败时返回首成员。
+# 四种组均接受 url/interval/timeout/lazy/expected-status/max-failed-times。
+# url 缺省使用首个 provider 的健康 URL，否则 https://www.gstatic.com/generate_204。
+# interval 单位秒，自动组缺省/0 为 300；select 缺省 0，不主动周期探测。
+# timeout 单位毫秒，缺省/0 为 5000；lazy 默认 true，无近期使用时跳过周期探测。
+# expected-status 省略/空/* 接受所有最终 HTTP 状态；单值可写整数 204 或字符串 "204"，区间用 "200-299"。
+# max-failed-times 缺省/0 为 5，建链失败达到阈值后触发探测，不重试同一次业务连接。
+# HTTP 探测结果不代表 UDP 可用性，业务 UDP 仍检查节点能力与 disable-udp。
+# Controller 可手动固定 url-test/fallback 成员，成员不可用时恢复自动选择。
+# load-balance 的 strategy 为 consistent-hashing（缺省）、round-robin、sticky-sessions。
+# 一致性哈希按目标可注册主域名或 IP 分桶；轮询跳过不健康成员；粘滞会话按来源 IP
+# 与目标主域名/IP 缓存 10 分钟，最多 1000 项。哈希种子属于当前进程，不承诺重启后相同。
+# hash-key 仅接受空字符串（缺省）或 in-user；in-user 仅用于一致性哈希/粘滞策略，
+# 使用已认证用户名单独分桶，无用户名时回退地址策略。业务路由和 dialer-proxy 都保留此身份。
+# load-balance 没有 now/手动选择；UDP 按目标会话固定叶节点，健康变化不迁移旧会话。
+# 自动或手动切换只影响新连接；既有连接、认证会话及其中复用的流仍保留原路径。
 # 组作为 dialer-proxy 时，与路由共用当前选择，但不重新执行业务规则；DIRECT 连接
-# 当前节点的服务器而不是业务目标，REJECT 在建链时失败且不回退。单次建链对每个组
+# 当前节点的服务器而不是业务目标，REJECT 在建链时失败且不回退。成员也可为 PASS/
+# PASS-RULE；仅 rule 模式消费控制，global、dialer-proxy 或显式 DNS 出口选中时拒绝。
+# 单次建链对每个组
 # 只读一次选择，SOCKS5 UDP 控制流与 relay 路径共用该快照和期限；不同组没有原子
 # 快照保证。复用旧 AnyTLS 会话的新业务流仍沿用该会话路径，只有新建底层 transport
 # 才读取新选择。Hysteria2/TUIC 已建立会话的新逻辑流、Hysteria2 跳端口 socket
@@ -429,32 +786,228 @@ proxy-groups:
     proxies: [vless-edge, fallback-select, DIRECT, REJECT, vless-edge]
     default-selected: vless-edge
 
-# 运行时 DNS 可省略；enable: true 时主 nameserver 必须有 1–4 项。ipv6 省略时
-# 默认为 true；false 时直接 AAAA 查询返回空结果，域名解析不查询 AAAA。nameserver
-# 只接受裸 IP、udp://IP[:port] 或 tcp://IP[:port]。没有 fragment 时固定 DIRECT；
-# fragment 只接受 DIRECT、RULES、实际节点名或代理组名。`PROXY`/`#PROXY` 没有
-# 默认出口含义，只有存在同名 route target 时才有效。DNS route 选中代理组后，
-# 仅新建物理 transport 解析当前成员；cache 与既有 TCP pool 不随切换清空。
-# nameserver-policy 按顺序匹配
-# `geosite:<selector>[,<selector>...]`，逗号项为 OR，命中后只在当前组内故障转移。
-# selector 可为 cn、cn@ads@cn、!cn@ads；多个属性为 key 存在性 AND（忽略 bool/int 值），
-# 前置 ! 取反整个匹配结果，@!cn 是字面 key。相同归一 selector 不能跨项重复，
-# 但相同基础分类的不同交集/正反选可共存；资产不可用不因反选变成全匹配。
+# 资源声明及使用示例。http 支持 HTTP(S)，file 读取本地文件，inline 使用 payload。
+# path 必须位于 dataDir 内；HTTP 缺省路径在 proxies/ 或 rules/ 下按实际 URL/header/UA 请求摘要分配。
+# HTTP interval 单位秒，0 只获取一次；file 监测文件变化。下载失败退避重试。
+# proxy 指定当前运行配置中的出口；缺省按规则选路。不会等待新资源才能建立下载连接。
+# header 值为字符串数组；size-limit 单位字节，0 不设下载上限，解析仍有容量边界。
+# proxy provider 支持 {proxies: [...]} YAML、URI 列表及标准 Base64 编码的 URI 列表。
+# URI 转换后仍执行原名称过滤、override 与完整严格节点/依赖图校验。
+# 支持当前协议范围内的 vless/vmess/trojan/ss/anytls/hy2/hysteria2/tuic/mierus，
+# 以及 socks/socks5/socks5h/http/https；SS 仍只允许 SS2022，TUIC 仅 v5。
+# URI HTTPS 节点保持默认验证证书，不复制参考转换器的隐式 skip-cert-verify。
+# 可用 filter/exclude-filter/exclude-type。URI 转换失败保留旧资源，不记录原始 URI。
+# HTTP 来源 URL 的 userinfo 使用 Basic；跨 origin 跳转不转发原认证/Cookie。
+# gzip 流式解压后写缓存；size-limit、hash 与后续解析针对解压内容，gzip 损坏或超限不发布。
+# 来源摘要绑定精确 URL、实际 header/UA；旧 URL-only 元数据保留可用内容但不复用 ETag。
+# provider 的 dialer-proxy 覆盖每个节点的同名字段，override 最后应用；
+# 它只控制节点上游，资源下载仍使用独立的 proxy 字段。
+# override 支持 tfo、mptcp、udp、udp-over-tcp、up/down、dialer-proxy、ip-version、interface-name、routing-mark、skip-cert-verify、name-cert-verify、
+# additional-prefix/suffix、proxy-name: [{pattern: '表达式', target: '替换文本'}]、override-expr 字符串数组；
+# 协议专属覆盖只用于支持该字段的节点。未实现的覆盖字段严格拒绝。
+# override-expr 为原生有限 yq 方言，校验时预编译：原名称过滤 → 结构化 override / 改名 / 前后缀
+# → 表达式按列表顺序执行 → 严格节点及引用图校验。每项须产出一个 mapping，失败保留旧资源。
+# 支持根/字段/引号字段、正负数组索引、[] 通配、select 目标、= / |= / += / -= / *=、del、
+# pipeline / 逗号流 / 数组收集 / mapping / 插值、标量、算术/比较/and/or/默认值 //。
+# 函数：length/keys/has/contains/select；reverse/sort/unique/flatten/any/all；
+# map/map_values/filter/to_entries/from_entries/with_entries/any_c/all_c；
+# test/sub/split/join/upcase/downcase/trim/tostring/tonumber/type/not。
+# transform 函数允许分号分隔的独立参数流；any_c/all_c 按成员短路，from_entries 要求 key/value。
+# upcase/downcase 使用 Rust 标准 Unicode 全映射，单字符可扩展为多个字符；trim 独立处理空白。
+# 整数 literal 为有符号 64 位，含 -9223372036854775808；超出该范围的整数 literal 拒绝。
+# = 右侧读取根，|= 读取旧目标；赋值右侧的 pipeline/and/or 须带括号，多结果须收集。
+# mapping 值取最后结果，无结果省略；插值取首结果。sub 全局替换，使用 Go 的 $capture。
+# 每项最多 16 KiB/4096 tokens 与节点、深度 32；整份配置编译最多 512 KiB/65536 tokens
+# 与节点/1 秒。整份候选共享取消、20 万步、100ms、32 MiB 累积值分配估算、值深度 64
+# 与 32 个有界线性正则预算。无 shell/yq、变量、reduce、动态路径、递归下降、文件/环境或文档流。
+# 最终节点仍须符合本文协议范围；表达式不提供任意脚本或额外配置字段。
+# proxy providers 的 health-check 接受 enable/url/interval/timeout/lazy/expected-status；
+# enable 默认 false，开启后 interval 缺省/0 为 300 秒。空 URL 不发起探测。
+# 相同节点/URL 的检查共享结果，每批最多 10 个并发，超时与停止均取消 I/O。
+# 更新先解析并校验整个依赖图，成功才替换；失败保留旧配置与 HTTP 缓存。
+# HTTP proxy provider 的订阅用量来自 Subscription-Userinfo 响应头，成功更新和 304 后
+# 随缓存保存；缺少该头保留旧值，失败候选不更新。Controller 不用本地流量填充订阅用量。
+# proxy providers 的 age-secret-key 可含多行 X25519/Hybrid AGE 私钥，空行和 # 注释跳过。
+# HTTP/file 来源写法：age-secret-key: |，下方缩进填写私钥；不用于 rule providers。
+# 配置期验证私钥；仅精确 AGE armor 前缀触发原生解密，之后识别 YAML/URI/Base64。
+# file、初始缓存和 HTTP 更新共用解密；缓存/hash/ETag 保留原密文，解密失败不发布候选。
+# 私钥最多 16 KiB/128 个，AGE 头最多 64 KiB/1024 次身份尝试；解密输出限 8 MiB，
+# URI、JSON 选项和多端口节点转换共用 32 MiB 内部展开计费；不是整进程 RSS 保证。
+# 读取/解密共享 90 秒期限，并在读块和密钥操作之间检查取消。
+# 新连接使用新资源，旧 TCP/UDP 会话保留原资源；停止等待下载、解析和资源释放。
+# rule providers 支持 domain/ipcidr/classical，format 为 yaml/text/mrs；MRS 仅 domain/ipcidr。
+# YAML 规则文件为 {payload: [...]}，text 每行一条，支持空行和 # 注释。
+# classical 接受已支持的无动作规则，不接受 MATCH、RULE-SET、SUB-RULE。
+# 文本/MRS 解压上限 64 MiB；YAML 沿用 8 MiB 输入和 32 MiB 展开预算。
+# 非inline规则provider可设置path-in-bundle（例如rules/cn.mrs），从dataDir/BundleMRS.7z读取成员。
+# 有效缓存优先，其次bundle，再用原file/http来源；坏缓存同样可以回退bundle。
+# bundle只读取指定压缩块，支持COPY/LZMA1/LZMA2及已列入资源契约的filter；超预算/坏成员回退原来源。
+# inline忽略path-in-bundle；proxy-providers不接受此字段。
+proxy-providers:
+  local-nodes:
+    type: inline
+    # override:
+    #   override-expr: ['.name |= (trim | upcase)', '.udp = true']
+    payload: []
+    health-check:
+      enable: false
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+      timeout: 5000
+      lazy: true
+      expected-status: "204"
+rule-providers:
+  local-domains:
+    type: inline
+    behavior: domain
+    payload: ["+.internal.example"]
+# 动态组写法：{name: automatic-members, type: select, use: [local-nodes]}
+# 规则写法：RULE-SET,local-domains,DIRECT；ipcidr/classical 可追加 no-resolve。
+# DNS policy 支持 rule-set:local-domains（逗号分隔多个集合）；只接受 domain/classical，
+# classical 在 DNS 场景使用域名与 GeoSite 条件，支持仅由这些条件组成的 AND/OR/NOT。
+# 混合 IP、端口、来源或网络条件的逻辑项不参与域名 selector。
+
+# hosts 支持单 IP、IP 数组、域名别名与 Clash 域名通配。
+# 值恰好为 lan 或 [lan] 时，启动准备捕获接口 IP，排除回环和 link-local；空快照使启动失败。
+# 校验不读取网卡；快照不随地址变化或 Provider 更新刷新，不限于私有网段。
+hosts:
+  "internal.example": [192.0.2.10]
+  "alias.example": internal.example
+
+# DNS 的 enable、ipv6 默认 false，use-hosts/use-system-hosts 默认 true。
+# enable 关闭时不接管 TUN DNS，内部解析使用系统 resolver；配置中的 hosts 仍可用于内部解析。
+# enable 开启时使用配置的 resolver，不因上游失败回退到系统 DNS。
+# nameserver 默认 [https://doh.pub/dns-query, tls://223.5.5.5:853]，不能显式留空。
+# 支持裸 IP、UDP/TCP、tls://、http(s)://、quic://（DoQ 默认 853），允许上游域名。
+# DoH GET 使用 ID 0 与无 padding
+# Base64URL dns=；清除原 query/fragment，URL userinfo 转 Basic，不进入 Host/path 或日志。
+# HTTPS 实际 ALPN 协商 H2/H1，无 ALPN 回退 H1；明文 HTTP 仅 H1，无 h2c。
+# prefer-h3: true 让 HTTPS 首次建连竞争已认证 H3 与 TCP TLS，第一条成功胜出；失败允许另一条继续。
+# HTTPS #h3=true 强制实际 H3，不降级 H2/H1；明文 HTTP 的 h3/prefer-h3 不改变 H1 行为。
+# DoT、DoH、DoQ 使用共享 TLS 信任根，校验证书与名称；QUIC 使用受控 UDP，不绕过 DNS 出口/平台绑定。
+# default-nameserver 接受 IP 上游或显式 system，用于 bootstrap。
+# system、system://、dhcp://system 使用物理系统 DNS；dhcp://<精确接口名> 使用该接口的 DHCP DNS。
+# 各角色、policy、fallback 均支持；DHCP 接口不能用于 default-nameserver。来源始终物理直连，
+# fragment/代理规则不改变物理出口，但 ECS/类型过滤包装仍适用。
+# 只读现有网络来源；缺失、加密要求无法满足或物理绑定失败时不可用。
+# rcode://success/format_error/server_failure/name_error/not_implemented/refused 返回本地 RCODE 0–5，
+# 可用于各 nameserver 列表与 policy（default-nameserver 除外）；不建立网络连接或额外设置 RA。
+# 无 fragment 时默认 DIRECT；respect-rules: true 时默认 RULES，且必须配置
+# proxy-server-nameserver。显式 fragment 可选 DIRECT、COMPATIBLE、REJECT、REJECT-DROP、RULES 或已配置的节点/组名；
+# fragment 使用 #出口或接口&参数=值，整个 fragment 先百分号解码，再拆分；重复项以后者为准。
+# 出口名优先；没有同名节点/组时按接口直接连接，覆盖全局接口并沿用全局 mark。
+# 接口身份隔离 DoT/DoH/DoQ 的连接复用；system/DHCP、RCODE 和节点私有 DNS 保持自身出口语义。
+# ecs=IP/CIDR 与 ecs-override=true 控制 ECS，保留其他 EDNS 参数。
+# disable-ipv4=true、disable-ipv6=true、disable-qtype-N=true 抑制相应 question 并过滤全部响应 sections；
+# ECS/过滤适用于 system、DHCP、RCODE 及各 resolver 角色，DHCP 接口名不含 fragment。
+# skip-cert-verify=true、name-cert-verify 用于 DoT/DoH/DoQ；显式名称验证优先且不改变 SNI。
+# disable-reuse=true 仅禁用指定 DoT 复用；HTTPS 仍可复用，未知键值参数拒绝。
+# proxy-server-nameserver 专门解析节点，direct-nameserver
+# 专门解析 DIRECT 业务目标；未配置时复用 nameserver。两者不隐式开启 respect-rules。
+# direct-nameserver-follow-policy 默认 false；true 让直连解析遵循 nameserver-policy。
+# 新建 DNS 连接采用当前组选择，cache 和已有连接不随选择改变而清空。
+# nameserver-policy 接受域名、Clash 通配域名和 geosite；值为单个 nameserver 字符串
+# 或非空数组。域名可用逗号连接；* 匹配一层，.example.com 仅匹配子域，
+# +.example.com 匹配本域及所有子域。连续域名项优先匹配字面标签，其次 *，最后 .；
+# 相同归一域名模式以后项为准。GeoSite 项隔开域名区块，区块与 GeoSite 按声明顺序匹配。
+# `geosite:<selector>[,<selector>...]` 的逗号项为 OR，selector 可为 cn、cn@ads@cn、
+# !cn@ads；多个属性为 key 存在性 AND（忽略 bool/int 值），前置 ! 取反整个匹配结果，
+# @!cn 是字面 key。资产不可用不因反选变成全匹配。命中后仅使用当前策略的上游。
 dns:
   enable: true
   ipv6: true
+  prefer-h3: false
+  ipv6-timeout: 100 # 毫秒；内部 A/AAAA 并发，A 完成后最多等待 AAAA；0 同缺省 100
+  cache-max-size: 4096 # 每个 DNS 角色的结果总条目数；0 同缺省 4096，A/AAAA 和 wire 共用
+  cache-algorithm: lru # 精确 arc 使用 ARC；缺省与其他字符串使用 LRU，与 Mihomo 一致
+  fallback: [] # A/AAAA 的备用解析组；不是 nameserver 内部的故障转移
+  fallback-lazy-query: false # false：与主组同时查询；true：确定需要时才查询
+  fallback-filter:
+    geoip: true # 非本地地址且不属于 geoip-code 时使用 fallback
+    geoip-code: CN
+    ipcidr: [] # 任意返回地址命中时使用 fallback
+    domain: [] # Clash 域名通配，匹配后只查询 fallback
+  enhanced-mode: redir-host # 或 fake-ip；内部节点/直连解析始终取得真实地址
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-range6: "" # 设置 IPv6 CIDR 且启用 IPv6 后分配 AAAA
+  fake-ip-ttl: 1 # 秒；运行时最小为 1，不决定映射寿命
+  fake-ip-filter-mode: blacklist # blacklist / whitelist / rule
+  fake-ip-filter: [dns.msftnsci.com, www.msftnsci.com, www.msftconnecttest.com]
+  # blacklist：命中返回真实地址；whitelist：只有命中才分配 fake-IP。
+  # 普通过滤项支持 Clash 域名通配、geosite: 和 rule-set:。
+  # rule：使用 DOMAIN-SUFFIX,example.com,real-ip 等域名规则；动作 real-ip/fake-ip。
+  # rule 未命中分配 fake-IP；两种地址池均保留网络地址后的前三个地址及广播地址。
+  use-hosts: true
+  use-system-hosts: true
+  respect-rules: false
+  default-nameserver: [114.114.114.114, 223.5.5.5, 8.8.8.8, 1.0.0.1]
+  proxy-server-nameserver: [223.5.5.5]
+  proxy-server-nameserver-policy:
+    "+.internal.example": 192.0.2.53
+  direct-nameserver: [223.5.5.5]
+  direct-nameserver-follow-policy: true
   nameserver:
     - "tcp://1.1.1.1:53#main-select"
   nameserver-policy:
+    "blocked.example": "rcode://refused"
+    "internal.example": "223.5.5.5"
+    "+.example.com": ["tcp://1.1.1.1:53#DIRECT"]
     "geosite:private,cn,apple":
       - "tcp://223.5.5.5:53#DIRECT"
       - "tcp://1.1.1.1:53#main-select"
 
-# rules 是运行配置必填项，按顺序首条命中。DIRECT 与 REJECT 是内置动作，其他
-# 动作必须精确使用实际节点名或代理组名。`PROXY` 没有特殊别名。rules 不能为空，
-# 必须恰好以一个指向实际节点或代理组的 MATCH 结束；不存在隐式 MATCH 或 DIRECT
-# 回退。选中组时使用当前成员，组本身不做 health check、测速或自动 failover。
+# rules 可省略或为空；rule 模式按顺序首条命中，未命中 DIRECT。MATCH 可放在任意
+# 位置，普通目标命中后其后规则不再执行。内置 DIRECT/COMPATIBLE 直连，REJECT 拒绝，
+# REJECT-DROP 的 TCP 等待 60 秒或 Stop（期间不发往远端），UDP 逐包丢弃。其他出口精确引用节点或组。
+# 支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、DOMAIN-WILDCARD、DOMAIN-REGEX、
+# GEOSITE、GEOIP、SRC-GEOIP、IP-ASN、SRC-IP-ASN、IP-CIDR、IP-CIDR6、SRC-IP-CIDR、
+# IP-SUFFIX、SRC-IP-SUFFIX、DST-PORT、SRC-PORT、NETWORK、
+# IN-TYPE、IN-NAME、IN-USER、IN-PORT、REMATCH-NAME、RULE-SET、SUB-RULE、AND/OR/NOT 和 MATCH。来源信息来自实际入站会话。
+# PROCESS-NAME、PROCESS-PATH 及各自 -WILDCARD/-REGEX 支持已确认的本机 socket owner，忽略大小写。
+# Linux/Android 还接受 UID（uint32 单值/范围，/ 分隔，最多 28 段）；UID 0 不匹配。
+# 进程路径保留 Unicode，最多 32 KiB；正则沿同一编译/决策预算，不当作域名处理。
+# Linux 查询当前网络 namespace 的完整源/目标元组，再以 inode 找进程；macOS 使用公开 libproc，
+# Windows 使用 owner-PID 表与普通 limited-information 句柄。权限不足、LAN/跨 namespace、
+# wildcard/复用归属不明确或查询预算耗尽时身份未知，不提权；iOS/tvOS 无跨 App 进程信息。
+# Android 不新增宿主回调；受平台 /proc 权限约束，不承诺包名或任意应用身份可得。
+# 同时最多四个扫描，许可最多等待 100 ms，每扫描最多 100 ms/16384 项/1 MiB 表。
+# strict 无身份条件及 off 不扫描；一次决策不重试，Stop 等待已开始的系统查询结束。
+# CIDR 两种别名都按 payload 实际地址族解析；GEOIP/IP-ASN/CIDR/IP-SUFFIX/RULE-SET 可追加 src，自动禁止 DNS。
+# IP-SUFFIX 的 address/bits 比较低 bits 位，保留原地址，按 IPv4/IPv6 分族；0 位匹配同族全部。
+# SRC-IP-SUFFIX 只使用真实来源地址；目的后缀支持 no-resolve，并复用既有惰性 DNS 结果。
+# RULE-SET 的 src 在局部视图交换源/目标 IP 与端口，保留域名、入口类型和身份。
+# IN-TYPE 为 / 分隔的 Mihomo 类型名，大小写无关，SOCKS 展开为 SOCKS4/SOCKS5；
+# IN-NAME 为 / 分隔、区分大小写的入口名：TUN为DEFAULT-TUN，mixed的HTTP/SOCKS5为DEFAULT-MIXED；内部请求为空。
+# IN-USER 为 / 分隔、区分大小写的已认证用户名。三种列表逐项 trim，空项报错。
+# IN-PORT/DST-PORT/SRC-PORT 为 uint16 端口或范围，/ 分隔，含 0，逆序范围归一，
+# 最多 28 段；分隔中的空段跳过。真实入口和服务器端口仍须非零。
+# 通配符 * 匹配任意长度、? 匹配一个字符；DOMAIN-REGEX 默认忽略大小写，普通表达式走线性引擎。
+# 有限复杂语法支持前向正/负断言、固定宽度后向断言、数字及 ASCII 命名 backreference、原子组，
+# 命名捕获支持 (?<name>...) 与 (?'name'...)；引用支持 \k<name> 与 \k'name'。
+# 混合命名/未命名捕获的数字引用沿 .NET 编号；每模式最多512个捕获，转译仅改变编号。
+# 不支持重复命名、显式数字组、递归、条件/平衡组、possessive quantifier或变长后向断言；
+# 此有限方言不保证全部 regexp2/.NET Unicode、锚点或捕获语义等价。无法编译或越界明确报错。
+# 每模式限制 4 KiB、512 AST 节点/32 层、有限重复 1024，委托编译/搜索缓存有近似大小边界。
+# 一次决策跨逻辑/子规则、classical provider、候选地址和 DNS 续跑共享 sticky 执行预算：
+# 每次复杂匹配预留 2049 回溯额度，总共 65536；所有谓词及正则共同消费 64 Mi work units；
+# 累计实际正则调用耗时上限 2 ms，DNS 等待不计入。时间/取消仅在同步引擎调用前后检查，
+# 不能中途抢占或保证严格 2 ms/Stop 上界。执行失败终止当前决策，不视作未匹配或 DIRECT。
+# 逻辑规则例如 AND,((DOMAIN-SUFFIX,example.com),(SRC-PORT,1000-2000)),DIRECT；
+# NOT 恰好一个子规则，逻辑最多嵌套 32 层。主列表与所有 sub-rules 共用 65536 条、
+# 单条 16 KiB、文本合计 8 MiB 的预算；子规则名计入文本。子规则调用最多 32 层，
+# 名称必须存在且全图无环；定义共享存储，不按调用次数复制。
+# SUB-RULE,(纯条件),名称 在条件匹配时进入指定列表；子列表耗尽则继续调用者。
+# PASS（含组选择为 PASS）退出所有子调用并继续主列表下一条；PASS-RULE 仅继续
+# 当前子列表，出现在主列表时为 REJECT。两者不能出现在逻辑谓词或 classical 集合中。
+# REMATCH-NAME,blue/Green,DIRECT 按 / 分隔、逐项 trim，名称非空且区分大小写。
+# rematch 节点更新本次决策标记或根列表，从首条重新求值，不创建连接或回到调用位置。
+# 重入保留已完成 DNS/process、来源/目标及原期限、取消、预算、规则禁用快照。
+# 同次决策最多 32 个 rematch 节点，节点名重复即失败；不增加可调递归参数。
+# 组的控制目标先于 disable-udp/节点 UDP 检查；跳过不推进轮询。实际出口只选择一次。
 # GEOSITE 支持 [!]<code>[@<attr>...]，GEOIP 支持 [!]<code> 和可选 no-resolve。
+# SRC-GEOIP 与 GEOIP,...,src 等价，来源规则不触发 DNS；lan 为无需资产的内置 GeoIP。
+# IP-ASN 按实际目标 IP 查询 ASN.mmdb，可带 no-resolve；SRC-IP-ASN 使用实际来源 IP。
+# ASN payload 逐字匹配，不转换 AS 前缀或补零；仅引用时加载，数值型数据库无记录匹配 0。
 # 例如 GEOSITE,google@ads,REJECT / GEOSITE,!cn@ads,main-select / GEOIP,!CN,DIRECT。
 # geolocation-!cn 为字面分类名；GeoIP DAT reverse_match 接受但忽略，取反由 ! 控制。
 # GEOSITE 没有域名不匹配；分类缺失不匹配，而有效空属性交集的反选匹配非空域名。
@@ -463,15 +1016,20 @@ rules:
   - GEOSITE,cn,DIRECT
   - GEOIP,CN,DIRECT,no-resolve
   - DOMAIN-SUFFIX,anytls.example,anytls-edge
-  - NETWORK,UDP,anytls-edge
+  - SUB-RULE,(NETWORK,UDP),udp-policy
   - MATCH,main-select
 
-# measureDelay 使用独立的 node-only 配置：顶层只能包含 proxies，不能包含
+sub-rules:
+  udp-policy:
+    - DOMAIN-SUFFIX,example.com,PASS-RULE
+    - NETWORK,UDP,anytls-edge
+
+# measureDelay 使用独立的 node-only 配置：顶层只接受 proxies 和 tls.custom-certifactes，不能包含
 # proxy-groups。节点字段和代理图校验与上文一致，但不能出现 mixed-port/authentication、
-# tun、sniffer、Controller、DNS、rules 或 GeoData；此接口的 dialer-proxy 只能引用具体
+# tun、sniffer、Controller、DNS、rules 或 GeoData；此接口的 dialer-proxy 可指定 DIRECT 或具体
 # 节点。Vole 从“未被任何 dialer-proxy 引用”的节点推导唯一链头，且该链必须覆盖
 # 全部节点。测速不创建监听器、公共实例、TUN/protect 租约、DNS、规则引擎、代理组
-# 或 GeoData 注册。
+# 或 GeoData 注册。rematch 是路由控制，不属于可测量的具体节点，测速配置拒绝它。
 #
 # 最小测速示例：
 # proxies:

@@ -99,8 +99,6 @@ const CIPHERS: [&str; 3] = [
 
 #[tokio::test]
 async fn never_sent_close_drop_and_stop_release_io_without_an_empty_ss_write() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("UOT-SS", "never_sent");
     for cipher in CIPHERS {
         for ending in ["close", "drop", "stop"] {
             let (outbound, mut peer) = fixture(cipher, 64);
@@ -137,8 +135,6 @@ async fn never_sent_close_drop_and_stop_release_io_without_an_empty_ss_write() {
 
 #[tokio::test(start_paused = true)]
 async fn late_first_packet_uses_original_deadline_but_established_io_does_not() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("UOT-SS", "deadline");
     let (outbound, mut peer) = fixture(CIPHERS[0], 4096);
     let context = EstablishContext::with_timeout(Duration::from_secs(2));
     let mut association = outbound.open_datagram(request(), &context).await.unwrap();
@@ -173,43 +169,70 @@ async fn late_first_packet_uses_original_deadline_but_established_io_does_not() 
 }
 
 #[tokio::test]
-async fn cancelled_partial_send_poisoning_and_stop_release_a_blocked_writer() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("UOT-SS", "cancel_write");
+async fn cancelled_partial_send_resumes_and_stop_releases_a_blocked_writer() {
     for stop in [false, true] {
-        let (outbound, mut peer) = fixture(CIPHERS[0], 64);
+        let (outbound, peer) = fixture(CIPHERS[0], 64);
         let mut association = outbound
             .open_datagram(request(), &EstablishContext::default())
             .await
             .unwrap();
+        assert!(association.supports_shared_destinations());
         if stop {
             let (sent, ()) = tokio::join!(association.send(packet(65_535)), async {
                 tokio::task::yield_now().await;
                 outbound.shutdown().await;
             });
             assert!(sent.is_err());
+            let mut peer = peer;
+            let mut bytes = Vec::new();
+            tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(bytes.len() <= 64);
         } else {
             assert!(
                 tokio::time::timeout(Duration::from_millis(10), association.send(packet(65_535)))
                     .await
                     .is_err()
             );
-            assert!(association.send(packet(0)).await.is_err());
+            let decoding = tokio::spawn(async move {
+                let mut decoded = decoder(peer, CIPHERS[0]);
+                assert_eq!(
+                    decoded.handshake().await.unwrap(),
+                    ("sp.v2.udp-over-tcp.arpa".to_owned(), 0).into()
+                );
+                let mut header = [0; 17];
+                decoded.read_exact(&mut header).await.unwrap();
+                assert_eq!(
+                    header,
+                    [0, 1, 127, 0, 0, 1, 0, 53, 0, 127, 0, 0, 1, 0, 53, 255, 255]
+                );
+                let mut payload = vec![0; 65_535];
+                decoded.read_exact(&mut payload).await.unwrap();
+                assert!(payload.iter().all(|byte| *byte == 7));
+                let mut next = [0; 9];
+                decoded.read_exact(&mut next).await.unwrap();
+                assert_eq!(next, [0, 127, 0, 0, 2, 0, 54, 0, 0]);
+                assert_eq!(decoded.read(&mut [0]).await.unwrap(), 0);
+            });
+            let mut next = packet(0);
+            next.remote = Destination::Ip("127.0.0.2:54".parse().unwrap());
+            tokio::time::timeout(Duration::from_secs(2), association.send(next))
+                .await
+                .unwrap()
+                .unwrap();
             outbound.shutdown().await;
+            tokio::time::timeout(Duration::from_secs(1), decoding)
+                .await
+                .unwrap()
+                .unwrap();
         }
-        let mut bytes = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut bytes))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(bytes.len() <= 64);
     }
 }
 
 #[tokio::test]
 async fn all_ciphers_preserve_budget_edges_and_fragmented_receive_cancellation() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("UOT-SS", "budget_read_cancel");
     for cipher in CIPHERS {
         let (outbound, peer) = fixture(cipher, 4096);
         let mut association = outbound
@@ -219,6 +242,7 @@ async fn all_ciphers_preserve_budget_edges_and_fragmented_receive_cancellation()
             )
             .await
             .unwrap();
+        assert!(association.supports_shared_destinations());
         assert!(association.send(packet(65_536)).await.is_err());
         let (ready, arrived) = tokio::sync::oneshot::channel();
         let (resume, proceed) = tokio::sync::oneshot::channel();
@@ -305,8 +329,6 @@ impl vole::dialer::Resolver for ControlledResolver {
 
 #[tokio::test]
 async fn domains_use_only_the_supplied_resolver_and_stop_cancels_pending_dns() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("UOT-SS", "dns");
     use std::sync::atomic::{AtomicUsize, Ordering};
     use vole::dns::resolution::ResolutionContext;
     let mut datagram = packet(0);
@@ -365,7 +387,6 @@ async fn domains_use_only_the_supplied_resolver_and_stop_cancels_pending_dns() {
 #[cfg(feature = "interop-test")]
 #[tokio::test]
 async fn stop_joins_a_full_receiver_and_releases_io_with_the_association_retained() {
-    let _case = vole::resources::case_events::Case::new("UOT-SS", "stop_full_queue");
     let probe = vole::resources::observation::ResourceProbe::default();
     let (outbound, peer) = fixture(CIPHERS[0], 4096);
     let mut association = probe
@@ -420,8 +441,6 @@ async fn stop_joins_a_full_receiver_and_releases_io_with_the_association_retaine
 
 #[tokio::test]
 async fn zero_length_first_datagram_initializes_ss_once_without_an_empty_write() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("UOT-SS", "first_packet");
     let config = Config::parse_yaml(br#"
 mixed-port: 1080
 proxies:

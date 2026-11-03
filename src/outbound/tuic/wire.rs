@@ -4,10 +4,25 @@ use bytes::{Buf, Bytes};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub(super) fn address(peer: &Destination, out: &mut Vec<u8>) -> io::Result<()> {
-    if peer.port() == 0 {
+pub(super) fn address_len(peer: &Destination) -> io::Result<usize> {
+    if peer.port() == 0
+        && !matches!(peer, Destination::Domain { host, .. } if host == crate::outbound::uot::MAGIC_DESTINATION)
+    {
         return Err(io::ErrorKind::InvalidInput.into());
     }
+    match peer {
+        Destination::Ip(peer) => Ok(if peer.is_ipv4() { 7 } else { 19 }),
+        Destination::Domain { host, .. } => {
+            if host.is_empty() || host.len() > 255 || host.bytes().any(|v| v.is_ascii_control()) {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            Ok(4 + host.len())
+        }
+    }
+}
+
+pub(super) fn address(peer: &Destination, out: &mut Vec<u8>) -> io::Result<()> {
+    address_len(peer)?;
     match peer {
         Destination::Ip(peer) => match peer.ip() {
             std::net::IpAddr::V4(ip) => {
@@ -20,9 +35,6 @@ pub(super) fn address(peer: &Destination, out: &mut Vec<u8>) -> io::Result<()> {
             }
         },
         Destination::Domain { host, .. } => {
-            if host.is_empty() || host.len() > 255 || host.bytes().any(|v| v.is_ascii_control()) {
-                return Err(io::ErrorKind::InvalidInput.into());
-            }
             out.extend_from_slice(&[0, host.len() as u8]);
             out.extend_from_slice(host.as_bytes());
         }
@@ -37,12 +49,24 @@ pub(super) fn connect(peer: &Destination) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 pub(super) fn packets(
     association: u16,
     packet: u16,
     peer: &Destination,
     payload: &[u8],
     limit: usize,
+) -> io::Result<Vec<Bytes>> {
+    packets_with_payload_limit(association, packet, peer, payload, limit, usize::MAX)
+}
+
+pub(super) fn packets_with_payload_limit(
+    association: u16,
+    packet: u16,
+    peer: &Destination,
+    payload: &[u8],
+    limit: usize,
+    payload_limit: usize,
 ) -> io::Result<Vec<Bytes>> {
     if payload.len() > u16::MAX as usize {
         return Err(io::ErrorKind::InvalidInput.into());
@@ -51,7 +75,8 @@ pub(super) fn packets(
     address(peer, &mut target)?;
     let space = limit
         .checked_sub(10 + target.len())
-        .ok_or(io::ErrorKind::InvalidInput)?;
+        .ok_or(io::ErrorKind::InvalidInput)?
+        .min(payload_limit);
     if space == 0 && !payload.is_empty() {
         return Err(io::ErrorKind::InvalidInput.into());
     }
@@ -202,16 +227,90 @@ pub(super) async fn read_packet(
     let start = raw.len();
     raw.resize(start + size, 0);
     stream.read_exact(&mut raw[start..]).await?;
-    let mut extra = [0];
-    if stream.read(&mut extra).await? != 0 {
-        return Err(invalid());
-    }
-    decode(raw.into())
+    let fragment = decode(raw.into())?;
+    // Consume an already-ready EOF so Quinn need not send STOP_SENDING for a
+    // completed stream. A pending FIN, extra byte or tail error never delays or
+    // revokes the complete declared payload; the original Drop path remains.
+    let mut tail = [0; 1];
+    std::future::poll_fn(|cx| {
+        let mut buffer = tokio::io::ReadBuf::new(&mut tail);
+        let _ = std::pin::Pin::new(&mut stream).poll_read(cx, &mut buffer);
+        std::task::Poll::Ready(())
+    })
+    .await;
+    Ok(fragment)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_length_validates_the_existing_wire_peer_boundaries() {
+        for (peer, expected_len) in [
+            (Destination::Ip("192.0.2.1:53".parse().unwrap()), 7),
+            (Destination::Ip("[::1]:53".parse().unwrap()), 19),
+            (
+                Destination::Domain {
+                    host: "x".into(),
+                    port: 80,
+                },
+                5,
+            ),
+            (
+                Destination::Domain {
+                    host: "x".repeat(255),
+                    port: 80,
+                },
+                259,
+            ),
+            (
+                Destination::Domain {
+                    host: "é".into(),
+                    port: 80,
+                },
+                6,
+            ),
+            (crate::outbound::uot::magic_destination(), 27),
+        ] {
+            assert_eq!(address_len(&peer).unwrap(), expected_len);
+            let mut bytes = Vec::new();
+            address(&peer, &mut bytes).unwrap();
+            assert_eq!(bytes.len(), expected_len);
+        }
+        for peer in [
+            Destination::Domain {
+                host: "".into(),
+                port: 80,
+            },
+            Destination::Domain {
+                host: "x".repeat(256),
+                port: 80,
+            },
+            Destination::Domain {
+                host: "bad\0name".into(),
+                port: 80,
+            },
+            Destination::Domain {
+                host: "bad\x7fname".into(),
+                port: 80,
+            },
+            Destination::Domain {
+                host: "peer.invalid".into(),
+                port: 0,
+            },
+            Destination::Ip("192.0.2.1:0".parse().unwrap()),
+            Destination::Ip("[::1]:0".parse().unwrap()),
+        ] {
+            assert_eq!(
+                address_len(&peer).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            let mut unchanged = vec![0xa5];
+            assert!(address(&peer, &mut unchanged).is_err());
+            assert_eq!(unchanged, [0xa5]);
+        }
+    }
     use tokio::io::AsyncWriteExt;
     #[test]
     fn native_packet_has_one_address_and_exact_fragment_lengths() {
@@ -272,8 +371,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_uot_v2_connect_allows_a_zero_port() {
+        assert_eq!(
+            connect(&crate::outbound::uot::magic_destination()).unwrap(),
+            b"\x05\x01\x00\x17sp.v2.udp-over-tcp.arpa\x00\x00"
+        );
+        for peer in [
+            Destination::Domain {
+                host: "sp.udp-over-tcp.arpa".into(),
+                port: 0,
+            },
+            Destination::Domain {
+                host: "peer.invalid".into(),
+                port: 0,
+            },
+            Destination::Ip("192.0.2.1:0".parse().unwrap()),
+        ] {
+            assert!(connect(&peer).is_err());
+        }
+    }
+
+    #[test]
+    fn configured_native_fragment_payload_and_quic_unfragmented_packet() {
+        let peer = Destination::Ip("[::1]:53".parse().unwrap());
+        for message_limit in [1200, 65535 + 512] {
+            let packets =
+                packets_with_payload_limit(1, 2, &peer, b"abcdefgh", message_limit, 3).unwrap();
+            assert_eq!(packets.len(), 3);
+            let pieces: Vec<_> = packets
+                .into_iter()
+                .map(|packet| decode(packet).unwrap())
+                .collect();
+            assert_eq!(
+                pieces
+                    .iter()
+                    .map(|piece| piece.payload.as_ref())
+                    .collect::<Vec<_>>(),
+                vec![&b"abc"[..], &b"def"[..], &b"gh"[..]]
+            );
+            assert!(pieces.iter().all(|piece| piece.count == 3));
+            assert_eq!(pieces[0].peer, Some(peer.clone()));
+            assert!(pieces[1].peer.is_none());
+            let quic =
+                packets_with_payload_limit(1, 2, &peer, b"abcdefgh", 65535 + 512, usize::MAX)
+                    .unwrap();
+            assert_eq!(quic.len(), 1);
+            let packet = decode(quic.into_iter().next().unwrap()).unwrap();
+            assert_eq!(packet.payload.as_ref(), b"abcdefgh");
+            assert_eq!(packet.count, 1);
+        }
+    }
+
     #[tokio::test]
-    async fn uni_parser_rejects_unknown_owner_before_reading_body_and_requires_fin() {
+    async fn uni_parser_rejects_unknown_owner_before_reading_body_and_declared_limit() {
         let (client, mut peer) = tokio::io::duplex(64);
         peer.write_all(b"\x05\x02\xff\xff\x00\x00\x01\x00\xff\xff")
             .await
@@ -288,20 +439,45 @@ mod tests {
             .is_err()
         );
         let literal = &b"\x05\x02\x00\x01\x00\x00\x01\x00\x00\x01\x00\x01x\x00\x35a"[..];
-        for suffix in [&b""[..], &b"x"[..]] {
-            let (client, mut peer) = tokio::io::duplex(1);
-            let suffix = suffix.to_vec();
-            let invalid = !suffix.is_empty();
-            let sent = tokio::spawn(async move {
-                for byte in literal {
-                    peer.write_all(&[*byte]).await.unwrap();
-                }
-                let _ = peer.write_all(&suffix).await;
-            });
-            let result = read_packet(client, |id| if id == 1 { Some(1) } else { None }).await;
-            assert_eq!(result.is_err(), invalid);
-            sent.await.unwrap();
-        }
         assert!(read_packet(literal, |_| Some(0)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn uni_parser_delivers_declared_payload_without_fin() {
+        let literal = &b"\x05\x02\x00\x01\x00\x00\x01\x00\x00\x01\x00\x01x\x00\x35a"[..];
+        for suffix in [&b""[..], &b"x"[..]] {
+            let (client, mut peer) = tokio::io::duplex(64);
+            peer.write_all(literal).await.unwrap();
+            peer.write_all(suffix).await.unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                read_packet(client, |id| if id == 1 { Some(1) } else { None }),
+            )
+            .await;
+            // Keep the real writer open until parsing completes; no FIN or
+            // background task can make the old EOF-waiting parser pass.
+            drop(peer);
+            let fragment = result
+                .expect("declared UDP payload waited for FIN")
+                .unwrap();
+            assert_eq!(fragment.association, 1);
+            assert_eq!(fragment.packet, 0);
+            assert_eq!(fragment.count, 1);
+            assert_eq!(fragment.index, 0);
+            assert_eq!(
+                fragment.peer,
+                Some(Destination::Domain {
+                    host: "x".into(),
+                    port: 53,
+                })
+            );
+            assert_eq!(fragment.payload.as_ref(), b"a");
+        }
+    }
+
+    #[tokio::test]
+    async fn uni_parser_rejects_truncated_declared_payload() {
+        let truncated = &b"\x05\x02\x00\x01\x00\x00\x01\x00\x00\x01\x00\x01x\x00\x35"[..];
+        assert!(read_packet(truncated, |_| Some(1)).await.is_err());
     }
 }

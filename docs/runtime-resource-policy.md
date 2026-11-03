@@ -28,11 +28,12 @@ Release 构建优先吞吐（`opt-level = 3`），保留 thin LTO 与现有缓�
 包队列                          256
 普通事件 / TCP accept           128
 每关联 UDP 入站                 64
-普通 UDP 响应                   4,096
+普通 UDP 响应                   256
 DNS 响应                        128
-每个 TCP 方向缓冲区             32 KiB
-TLS / XHTTP 缓冲区              64 KiB
-DNS 类型化缓存                  256 项
+每个 TUN TCP 方向缓冲区         4 KiB
+TLS / 流式 XHTTP 缓冲区         64 KiB
+XHTTP packet-up 单批             H1/H2 64 KiB；H3 128 KiB
+DNS 结果总容量（每角色）         默认 4,096 项，dns.cache-max-size
 DNS 原始响应缓存                64 项 / 256 KiB
 TUN 域名提示                    256 项（按需）
 ```
@@ -41,6 +42,7 @@ MTU 由 `tun.mtu` 配置，默认值和平台限制统一见 [TUN 平台层](tun
 
 - 普通 UDP 在 reader 同步分流并直接提交到每源关联，不经过 TCP Driver 或共享 UDP 入站队列；DNS 查询独立提交受跟踪任务。
 - 每关联请求、普通响应和 DNS 响应使用独立内部容量，不扩大 128 项的 TCP accept，也不增加公开配置字段。
+- netstack 每轮维护 socket 与连接请求后，优先处理已就绪的原始入站批次，再处理内部通知；停止保持最高优先级。原始入站暂满时，当前包最多保留一个协作调度回合并重试，持续满时丢弃；UDP、DNS 和停止继续独立推进，队列容量保持原值。
 - TUN 域名提示只在 TUN 配置实际包含域名规则时创建，并从空容量按需增长。
 - 域名提示的读写使用短同步锁，临界区内不等待 IO 或执行异步操作；新 TUN IP 流读取当前提示，活动 UDP 五元组保持既定 action。
 - ICMP 响应复用原始包出站队列，不创建独立任务或长期状态。
@@ -52,41 +54,92 @@ MTU 由 `tun.mtu` 配置，默认值和平台限制统一见 [TUN 平台层](tun
 
 ## TCP 与握手
 
-- TCP 流按需创建任务，每方向缓冲区固定为 32 KiB。
-- rustls/XHTTP 的配置缓冲区为 64 KiB；boring 每次应用写入最多 min(节点缓冲预算, 16 KiB)，原生 TLS 记录有界，命名模板证书消息/解压输出另限 128 KiB。
+- TCP 流按需创建任务；TUN 转发每方向缓冲区为 4 KiB。
+- netstack 的 TCP 应用队列从空分配按实际写入有界增长，保留每方向 16 KiB 逻辑上限；排空不收缩，连接释放时销毁。smoltcp 收发缓冲仍各为 16 KiB，不用进程内存或连接总数改变容量。
+- WireGuard 与 MASQUE H2/IP 的私有主动栈使用 64 KiB TCP 发送总预算：
+  smoltcp 32 KiB 与按需应用队列 32 KiB。接收总预算仍为 32 KiB；
+  MASQUE H3/IP、共享 TUN 与通用 netstack 默认值保持原样。
+  节点业务与私有 DNS 的 TCP 共用该主动栈；此预算不改变内层 UDP、原始包队列或连接数量策略。
+- rustls/流式 XHTTP 的配置缓冲区为 64 KiB；boring 每次应用写入最多 min(节点缓冲预算, 16 KiB)，原生 TLS 记录有界，命名模板证书消息/解压输出另限 128 KiB。
 - 标准 TLS 恢复会话总预算为 4，按节点（含独立下载端点）分配；每个缓存绑定不可变的 SNI、ALPN 和证书策略，绝不跨节点复用。TLS 1.3 票据有界、一次性消费，TLS 1.2 会话占用同一额度；额度为 0 则禁用恢复。REALITY 不参与该缓存。
-- 共享 TLS 客户端的显式验证名、协议版本、客户端证书身份和 ClientHello profile 也属于不可变策略，单独构造缓存，不跨身份共享。boring 只保存当前节点/SSL 上下文产生的票据，应用层 ALPN 接受前不发布，失败或取消丢弃临时票据。标准 TLS 和 REALITY CloseWrite 只发送 close_notify，刷新最多5秒，保持读方向和底层传输；Drop 释放整个流。XHTTP 仍以逻辑连接整体关闭为准。
+- 共享 TLS 客户端的显式验证名、协议版本和 ClientHello profile 固定。内联客户端身份固定；文件身份整对校验后供新物理连接取快照，旧连接保留原身份。票据按节点和身份代隔离，换代后拒绝旧票据和旧连接晚到的票据，各代共用原节点总容量。boring 在应用层 ALPN 接受前不发布票据，失败或取消丢弃临时票据。标准 TLS 和 REALITY CloseWrite 只发送 close_notify，刷新最多5秒，保持读方向和底层传输；Drop 释放整个流。XHTTP 仍以逻辑连接整体关闭为准。
 - 半开连接、出站握手和活动会话只记录当前值和峰值，不触发资源错误。
 - 超时、取消、EOF 和协议错误负责回收；停止必须等待全部已跟踪任务结束。
 - 引导解析器最多使用四个工作线程；全部忙时在调用方既有期限内等待，不返回人为容量错误。
 
 ### 物理 socket 初始化
 
-TCP/UDP 共用 Dialer：创建 socket、nonblocking、源地址/Windows 接口绑定与 protect
-在当前 Tokio runtime 的受跟踪阻塞任务中完成，避免 FD 表扩容等同步系统调用占满
-业务 worker。异步 connect、reactor 注册与收发仍在原 runtime，不新增独立线程池、
-CPU 数判断、业务数量配额、FD 预热或 DNS socket 复用。
+TCP/UDP 共用 Dialer。Linux 普通 socket 的创建、原生选项和 bind 在当前异步任务中
+完成，使用同一初始化许可、取消令牌和停止跟踪；此路径不执行宿主回调、名称解析或
+接口发现。配置 TFO、MPTCP、protect、源地址、显式接口、DNS binding 或自动接口发现
+时，继续使用原受跟踪阻塞任务；其他平台也保留该路径。异步 connect、reactor 注册与
+收发仍在原 runtime，不新增线程池、CPU 数判断、业务数量配额、FD 预热或 DNS socket 复用。
 
-每个初始化作用域最多持有 64 个未完成的阻塞提交，TCP/UDP 共用内部许可。
-在登记任务、创建 socket 和 `spawn_blocking` 前异步等待许可，不因繁忙返回容量错误；
-等待继承调用方期限和取消，Stop 关闭准入并唤醒等待者。许可由阻塞任务持有到真正
-完成或被丢弃，调用方提前取消不会释放已开始工作的许可。它不限制已建立连接，
+每个初始化作用域最多持有 4 个未完成的初始化操作，TCP/UDP 共用内部许可。
+在登记、创建 socket 或提交阻塞任务前异步等待许可，不因繁忙返回容量错误；
+等待继承调用方期限和取消，Stop 关闭准入并唤醒等待者。许可持有到初始化真正
+完成或被丢弃，调用方提前取消不会释放已开始阻塞工作的许可。它不限制已建立连接，
 不增加独立线程池或公开配置；也不把等待调用的数量或整进程内存变成有界保证。
 
-取消关闭结果接收器并跳过尚未开始的初始化；已开始的系统调用或同步 protect 不能
-强制中断，完成后丢弃未交付的 socket。每个 Running Session/测速图拥有独立的
+WireGuard 物理 UDP 路径通过原上游请求和共享 Dialer，尽力申请 512 KiB 接收缓冲。
+系统可以拒绝、放大或限制该提示；继续使用同一受保护 socket，不改变逻辑包预算、
+队列、初始化或停止契约。Linux 内核 socket 缓冲通常不计入进程 RSS，增加提示并不
+等于没有内存成本，也不能替代 Apple physical footprint 或真机验证。
+
+阻塞路径取消时关闭结果接收器并跳过尚未开始的初始化；原生路径在创建前、策略执行后
+和返回前检查同一取消令牌。已开始的系统调用或同步 protect 不能强制中断，完成后
+丢弃未交付的 socket。每个 Running Session/测速图拥有独立的
 初始化作用域。Stop 先关闭 admission，再取消并等待业务/协议任务，最后等待已登记
-初始化任务完成，才释放平台回调租约。测速 runtime 的销毁也使用完整 join，不能
+初始化操作完成，才释放平台回调租约。测速 runtime 的销毁也使用完整 join，不能
 以有限 shutdown timeout 脱离在途初始化。protect 仍必须快速、同步、非阻塞；
 线程位置变化不放宽宿主回调契约，也不改变保护失败关闭或 Windows 双绑定策略。
 
 ## 共享流传输基础
 
-`stream-transport` 仅包装传入 IO，不创建 socket 或 DNS。WS/HTTP响应首部最多16 KiB、100字段；WS用户请求头最多100字段，额外固定升级头和early-data仍计入16 KiB总预算。WS early-data最多2,048原始字节，头名称/路径后缀由类型化选项区分。WS消息和单帧最多64 KiB，写入切块16 KiB；HTTP首包正文直接写入，不整体复制或持续按HTTP正文定界。
+`stream-transport` 仅包装传入 IO，不创建 socket 或 DNS。WS/HTTP响应首部最多16 KiB、100字段；WS用户请求头最多100字段，额外固定升级头和early-data仍计入16 KiB总预算。WS early-data最多11,904原始字节，并按当前请求的实际剩余首部预算进一步缩小；头名称/路径后缀由类型化选项区分。WS消息和单帧最多64 KiB，写入切块16 KiB；HTTP首包正文直接写入，不整体复制或持续按HTTP正文定界。
 
-共享的无池gRPC/legacy H2适配器每个实例仅拥有一条底层连接与一个逻辑流，不是全局并发许可；VLESS另有下文描述的节点级gRPC池。流窗口64 KiB、连接窗口128 KiB、最大HTTP/2帧和发送缓冲各16 KiB、解码负载64 KiB。读侧按实际消费量释放窗口；每poll最多处理32个片段/控制消息。原有gRPC和legacy H2的shutdown关闭整个逻辑连接；Trojan使用独立duplex模式，仅发送END_STREAM并保留读取。关闭前已接受的数据须到达所提供IO的flush边界，不能仅排入h2队列后立即reset/abort；每个逻辑写端最多一个待确认数据块，Stop可取消等待。两种模式的owner.stop都等待驱动任务退出；Drop只做取消兜底，不作为同步停止通过证据。WS/HTTP适配器按底层CloseWrite语义工作，协议包装层可以根据Mihomo契约结束整个逻辑流。所有握手使用调用方同一个绝对deadline。
+共享的无池gRPC/legacy H2适配器每个实例仅拥有一条底层连接与一个逻辑流，不是全局并发许可。Trojan/VMess/VLESS共用节点级gRPC池，物理连接按节点实例隔离，复用保留原上游与安全策略，每条逻辑流独立认证。流窗口64 KiB、连接窗口128 KiB、最大HTTP/2帧和发送缓冲各16 KiB、解码负载64 KiB。读侧按实际消费量释放窗口；每poll最多处理32个片段/控制消息。Trojan池使用内部duplex模式，仅发送END_STREAM并保留读取和lease；VMess/VLESS只结束当前逻辑流。关闭前已接受的数据须到达所提供IO的flush边界，不能仅排入h2队列后立即reset/abort；每个逻辑写端最多一个待确认数据块，Stop可取消等待。节点池最多保留4条空闲连接，PING ACK期限15秒；节点Stop取消并join全部物理驱动。无池模式的owner.stop同样等待驱动任务退出；Drop只做取消兜底，不作为同步停止通过证据。WS/HTTP适配器按底层CloseWrite语义工作，协议包装层可以根据已声明的协议关闭契约结束整个逻辑流。所有握手使用调用方同一个绝对deadline。
 
-XUDP现在只拥有已认证流上的帧编码；VLESS响应头由VLESS包装层处理。元数据仍最多512字节，单payload仍受调用方预算和u16 wire上限约束，不新增全局会话额度。
+Trojan/VMess/VLESS 的 YAML gRPC 池阈值省略或三项字面全零时采用 4/0/0，Mihomo 为 1/0/0。显式
+`max-connections: 1` 或 `max-connections: 2` 保留各自策略。连接按需建立，不预建四条，也不提高单连接的
+窗口或缓冲上限；新增连接仍增加自身的驱动、协议状态及接收信用。内部无池传输与
+TrustTunnel/MASQUE 的 CONNECT 所有者不使用这项 YAML 默认值，保留原连接策略。
+
+MASQUE H2 CONNECT-IP 单独采用 128 KiB 流接收信用，连接接收信用仍为 128 KiB。
+其它共享流传输的 64 KiB 流窗口、16 KiB 发送缓冲和最大帧保持原样；信用按实际消费
+释放，不预分配全部额度，也不改变 capsule、flush、FIN 或同步 Stop 语义。
+
+H2 CONNECT-IP 只合并已就绪的 capsule，每批最多16次出队／16 KiB编码字节，
+不等待凑批；无效包也计入扫描预算。每条隧道复用一个16 KiB聚合缓冲，最多暂存
+一个已编码的溢出 capsule。合法大包仍独立发送，不因聚合阈值拒绝。
+每批仍通过原IO完成 write_all 与强flush后才处理下一批；TTL只调整一次，
+结束前提交已取得的前缀，取消与Stop仍由原所有者回收，不增加后台发送任务。
+
+Gun 读侧只暂存最多9字节的gRPC/protobuf头；校验后直接从当前H2帧交付负载前缀，
+不累计完整消息或复制到第二份正文缓存。头部移入解析状态、负载交付给调用方后才释放
+对应H2信用；未读帧尾继续持有信用。取消保留头、帧与剩余长度；合法前缀交付后发现
+正文截断仍返回原协议错误。负载上限、空消息、trailers及写侧flush/FIN/Stop边界保持。
+
+XUDP现在只拥有已认证流上的帧编码；VLESS响应头由VLESS包装层处理。元数据仍最多512字节，单payload仍受调用方预算和u16 wire上限约束，不新增全局会话额度。接收直接填充既有的单帧有界缓冲，保留合并到同次读取中的后续帧与取消后的解析进度，不增加固定暂存区。
+
+Trojan UDP 接收直接读入既有的有界帧缓存，每次最多读取 2 KiB，不在等待中的
+异步接收状态内另留 2 KiB 临时区。开始读取时按需预留缓存，取消保留已接收的
+帧前缀；帧上限、包预算和关闭语义保持不变，关联释放时销毁缓存。
+
+公共 sing-mux 包装器按节点拥有独立池，只消费底层协议到约定目标的 TCP IO。
+每池最多保留16条闲连接；命令/物理写队列16项、写块16 KiB。smux接收帧共享每物理连接的字节预算，单流队列槽数由该预算推导；当前默认值见[XHTTP/sing-mux](xhttp.md#通用-sing-mux)。
+h2mux每流接收窗口64 KiB、连接接收窗口512 KiB，按实际读取量释放信用。
+连接额度允许少量未读取流占住各自窗口时，其他逻辑流继续接收；不预分配全部窗口。
+yamux单连接累计接纳64流后退役，连接接收窗口16 MiB；活动兄弟流继续。
+满足 XHTTP PacketUp 自主写条件的私有 h2mux，普通 DATA 仅在现有 h2 capacity
+范围内移交驱动后接纳，16 KiB 发送缓冲不变。每逻辑流固定一个确认状态，物理 flush
+列表每流至多一个弱引用登记；不按 DATA 保留 oneshot。显式 flush/END_STREAM 前仍确认
+真实 supplied IO flush，首帧期限、部分写取消、来源隔离和同步 Stop 不变；不新增任务或全局额度。
+私有 h2mux 的底层写入有正进度而 flush Pending 时，以一个布尔状态触发一次驱动重调度；
+没有后续写入便不再自唤醒。重调度不分配队列或确认状态，也不把 Pending 当作 flush 完成。
+h2mux/yamux上传半关闭保留读取与lease，smux v1关闭整条逻辑流。
+图只登记最终包装器；begin_shutdown同时关闭mux和底层准入，shutdown先join全部
+mux驱动，再等待底层协议。provider代际与node-only测速复用此屏障，没有全局池。
 
 ## 协议局部预算
 
@@ -98,9 +151,15 @@ XUDP现在只拥有已认证流上的帧编码；VLESS响应头由VLESS包装层
 
 普通 TUN UDP 关联：
 
+- 共享已发布代际的不可变节点和策略组注册表，不为每个关联复制指针数组；旧会话保留原代际直到释放；
 - 关联表不设固定项数；
 - 每个关联的入站队列最多 64 项，满时只丢当前数据报，不等待慢关联并阻塞其他来源；
-- 普通响应队列最多 4,096 项，满时只丢当前响应；没有共享 UDP 入站中转队列；
+- 普通响应队列最多 256 项；满时每源关联最多暂持一个已接收响应，暂停该关联继续接收，
+  同时等待写回容量、处理请求和取消，不增加队列或任务。取消或错误时丢弃未提交响应；
+  没有共享 UDP 入站中转队列；
+- 每源关联每处理 32 个实际响应显式退让；共享响应队列占用达到四分之一时提前退让，
+  让唯一 writer 与其他关联推进。不等待凑批、不预取包、不按忙碌情况拒绝关联。
+  接收的原生合作预算继续保留。
 - reader 拥有关联表和入站分发，唯一 TUN writer 直接、公平消费普通/DNS/TCP raw 三个通道；写回等待不阻塞 reader，不增加逐关联写回任务；
 - TCP/ICMP ingress 满时非阻塞丢当前完整 IP 包，避免阻塞 UDP/DNS，记录 packet queue drop；TCP 重传恢复，不引入 pending FIFO；
 - 使用代次感知所有权和子取消令牌；
@@ -115,28 +174,101 @@ XUDP现在只拥有已认证流上的帧编码；VLESS响应头由VLESS包装层
   响应队列满不会延长源关联所有者的生命周期。
 - reader EOF、错误或取消时，先取消其 UDP 子作用域，再删除、取消并等待全部关联和 DNS 任务；父运行时统一取消并等待唯一 writer 与 netstack。UDP 子作用域停止不取消调用者令牌。
 
+开启 Controller 的业务 UDP 按目标独立统计、取消并固定出口。`DatagramTransport` 必须显式声明
+多目标共享能力，没有默认值；透明包装传递底层能力，不能在包装时退回隐式独占。
+公共路由层统一决定复用，仅允许同一源关联、同一具体节点和资源代际内的未改写 IP 目标。
+支持路径包括 DIRECT、SOCKS5 UDP、Trojan UDP、XUDP、VLESS/VMess packetaddr、UoT、
+原生 SS2022、HY2 UDP、TUIC native/quic、Mieru、TrustTunnel，以及 WireGuard/MASQUE/IP 的内层 UDP。
+内层复用只合并端口租约、逻辑会话或响应交接；底层物理隧道的已有池化保持原状。
+raw VLESS/VMess、Gecko、固定物理 peer、尚未确定具体出站的路由包装保留独立传输。
+VMess packetaddr 的 AES/ChaCha 与 none/zero body 沿用相同共享门禁；body cipher 不改变逐包目标编码。
+fake-IP、QUIC 目标改写、域名及其它需要地址还原的请求始终隔离，即使底层支持多目标；
+两个原目标可能解析到同一个真实端点，不能仅靠回包源地址区分。
+共享路径只有一个接收者，按回复地址找到仍有效的目标，未请求或过期回复丢弃。
+帧写入中途取消时，不能重试已损坏的可靠流：整条关联失败关闭，其成员按关联错误退出。
+目标正常退出后物理关联退役，继续服务既有目标，新目标另建关联；防止目标重建或 flow-id 更换后
+旧回复串入新会话，不保留历史目标墓碑。最后目标退出关闭关联，Stop 同步释放全部关联。
+每目标只登记取消通知，不分配逐目标接收 future、任务或负载队列。
+DIRECT 在源关联内共用一个延迟分配的接收暂存缓冲，保留预算加一字节的超长包检测；
+交付包只持有实际负载。持续的就绪队列每目标最多一个通知，接收只轮询被唤醒的目标，
+不新增逐目标任务或负载队列。Mieru 通过私有单槽响应交接提供相同的就绪轮询，
+容量仍为一项，满槽使后台完整包解析器等待；取消、关闭及 reader join 保留。
+未提供轮询接口的协议继续使用取消安全的异步接收。
+成功接收后的本地 FIFO 重排不唤醒正在运行的接收者；外部就绪、取消和工作预算耗尽仍保留唤醒。
+目标访问时检查自身过期，整个表每 10 秒清理并回收多余容量；流量不会推迟该期限。
+DELETE 通过取消令牌立即唤醒等待中的接收，关闭与 flow-id 替换移除旧就绪注册。
+
 ### 定向数据报预算与受控 QUIC
 
 `DatagramBudget` 分别表达当前层的发送和接收 payload 上限。嵌套协议先为下层申请有界 envelope 空间，再按实际协议/地址族开销扣除下层能力，与调用方预算取交集；不能把接收上限直接当作发送能力。DIRECT、SOCKS5、SS 2022、SS/AnyTLS UoT 和 VLESS XUDP 保留对端/地址校验。超出发送预算在写入前失败，超出接收预算丢当前包并有界让出执行权，close 后不能恢复收发。UoT 的流头不从 UDP payload 预算扣除；SS 首包门控、读取任务与单响应队列的局部上限见[出站](outbounds.md#udp-over-tcp-v2)。
 
-`quic-transport` 只把已有 `DatagramTransport` 适配成 Quinn 的受控 UDP 接口，没有内部 bind、DNS 或 DIRECT 回落。每个连接双向各最多32个排队数据报，另允许一个正在发送的包；TX满返回WouldBlock，RX满暂停读取。接收等待不会持有发送队列锁；Pending发送不会重复提交。单逻辑peer/物理peer映射和来源校验独立保留，不接受未请求的目标、GSO或源地址覆盖。物理 socket 仍只能来自 Dialer。
+UoT 写入最多暂持一帧及偏移；取消单次发送后，后续收发先完成它，原建链期限不重置。
+实际写入失败或超时使关联失效；关闭丢弃未提交帧，并取消、等待既有读取任务。
+
+`quic-transport` 只把已有 `DatagramTransport` 适配成 Quinn/quiche 共用的受控 UDP 接口，没有内部 bind、DNS 或 DIRECT 回落。每个连接双向各最多32个排队数据报，另允许一个正在发送的包；TX满返回WouldBlock，RX满暂停读取。接收等待不会持有发送队列锁；Pending发送不会重复提交。单逻辑peer/物理peer映射和来源校验独立保留，不接受未请求的目标、GSO或源地址覆盖。物理 socket 仍只能来自 Dialer。
+已打开且受保护的 UDP 路径可借出一个在途发送操作；驱动等待发送或 pacing 时继续接收，保持32包队列与一个发送中的包。首次发送仍由原路径完成初始化；上游不支持此能力时沿用原发送。停止先释放在途操作，再关闭并释放上游。
+立即就绪的读取、发送容量与发送完成检查不登记新的等待者；仅在同一状态锁内确认 Pending 后登记唤醒，保留后续数据、容量恢复、取消与 Stop 的通知。
+队列通知采用边沿：TX由空变非空、RX由满变为有容量时通知驱动；已排队TX由就绪条件继续推进。
+普通RX消费保持底层已有的接收等待，避免逐包取消并重建同一等待。
+
+XHTTP 和 DoH/H3 通过 `quinn-h3-transport` 使用官方 h3/h3-quinn，共享取消安全的请求包装与
+非 DATA 帧编码预算；它不创建 socket、查询池或额外业务 body 队列。未完成发送的请求丢弃时 reset，
+成功提交 FIN 后不因丢弃发送半而 reset，也不等待逐请求 QUIC ACK。各协议窗口和并发边界见
+[XHTTP](xhttp.md) 与 [DNS](tun-icmp-dns.md)。
+
+未显式配置 reuse-settings 的 XHTTP H3 复用既有活动连接，每条最多 4 个逻辑租约；
+最后一个租约释放即移出候选池并按既有预算收尾，不缓存空闲连接。
+满足 [XHTTP 固定出口与安全边界](xhttp.md#http-transport-复用) 的 VLESS 私有 H2 腿采用相同 active-only 模型，每条最多 4 个逻辑租约，上传/显式下载各自隔离；其它 H2 路径、H1 与显式复用参数保持原契约。阈值溢出创建新物理连接，不拒绝逻辑流，不改变每流窗口或缓冲。
+
+XHTTP packet-up 的单批 backing（含正在发送的正文）上限为 H1/H2 64 KiB、H3 128 KiB，
+并与该 writer 采样的 POST 上限取较小值；按需扩容，不积累第二份正文。普通路径等待完整
+POST 响应才释放写背压和确认 flush。无 Encryption、无独立下载、无 padding 且 only-tcp=false
+的 VLESS h2mux，仅 H3 packet-up body/auto 上传保留最多两个未退役响应槽：发送 FIN 完成、
+最后正文引用释放并归还唯一 Vec，且槽未满后才能复用正文；flush 仍等待连续成功响应。
+每批只有一份有界 owner 元数据，不复制正文，也不增加 QUIC 窗口、队列或停止预算。该 backing
+上限不是进程 RSS 上限；HTTP/QUIC codec、发送窗口和 allocator 的共同持有峰值需实测。
+
+`quiche-h3-transport` 为 TrustTunnel/MASQUE 使用官方 quiche 的低层驱动，共享上述数据报适配器，不创建新的 socket。
+接收时移动既有队列中的数据报，独占存储直接交给 quiche 原地解密；共享或不可变存储
+使用按接收预算延迟分配的复用暂存缓冲。Quinn 的借用接收接口和两端队列上限保持不变。
+每个 quiche H3 stream 的已读取 body 最多保留 64 KiB，每次业务写入最多 16 KiB；
+只有本地主动请求创建业务状态，未知 DATAGRAM flow 丢弃，已注册 flow 的交付队列最多 64 项。
+这些是局部缓存界限，不宣称 QUIC 库内部总内存固定，也不限制活动业务流总数。
+TrustTunnel H3 使用 quiche 的本地发送容量比例 0.5，按当前可用拥塞窗口与对端信用
+折算应用写入额度，不足时沿原异步背压等待；不改变拥塞控制算法、接收窗口或协议帧，也不是固定字节或 RSS 上限。
+容量不足不能单独证明对端流控信用耗尽，不据此丢弃业务 UDP 帧。
+帧开始写入后必须完成；部分写入失败或被取消时关闭该来源关联，不丢弃帧尾后继续发送下一帧。
+MASQUE 与其余 quiche H3 默认使用原生比例 1.0。
 
 QUIC双向可用payload至少1,200字节；endpoint必须显式把QUIC MTU限制在有效预算内。IPv4/IPv6路径MTU分别先扣除28/48字节IP+UDP头，边界和单字节不足均有定向测试。
 
-QUIC owner.stop先取消并等待驱动，再关闭并释放上游；上游close最多1秒。Driver Drop仅为取消/abort兜底，不能作为同步Stop验收。队列容量是单连接局部界限，不是全局QUIC连接准入数。
+Linux 受控物理 UDP 的收发与就绪注册可并发借用同一 socket。借用不跨 Pending 或 await，
+不转移 socket 所有权；退役先关闭准入，再等待在途借用结束并取走资源，保留的 poller 不延长 fd 生命周期。
 
-TUIC 与 Hysteria2 共用这一接点；TUIC 的独立会话、关联 ID 退役、控制流、分片负载
+QUIC owner.stop先取消并等待驱动，再关闭并释放上游；上游close最多1秒。H3 的关闭预算内停止新请求准入并执行关闭交换，XHTTP 和 quiche 物理连接退役还保留有界的传输收尾机会，不承诺逐流远端 ACK。Driver Drop仅为取消/abort兜底，不能作为同步Stop验收。队列容量是单连接局部界限，不是全局QUIC连接准入数。
+
+TUIC 与 Hysteria2 共用这一接点。接收窗口通过官方 Quinn API 固定设置：
+每流 max(initial, min(maximum, 4 MiB))，
+连接 initial；默认 TUIC 4 / 2 MiB，HY2 64 KiB / 4 MiB，不预分配全部信用额度。
+DoQ 初始及最小发送 payload 为 1200 字节，接收预算独立保留，允许较大的合法对端包。
+
+TUIC 的独立会话、关联 ID 退役、控制流、分片负载
 及交付队列边界见 [TUIC v5](outbounds.md#tuic-v5)。旧池的待建流也持有所有权，
 不能在等待 credit 时被当成空闲池回收。TUIC 业务 UDP 队列使用独立观测类别。
+native 接收循环每处理最多 512 个就绪事件主动让出执行权，quic relay 保持 32 个；
+底层异步等待和协作式调度可更早让出，不增加接收或交付队列。
 
 ## DNS
 
+- 生产运行时从归一化的`dns.cache-max-size`构造缓存，缺省或零值为4,096项。主、bootstrap及已配置的节点/直连解析角色各拥有独立结果容量；A/AAAA类型化结果与原始响应共用每个角色的这份条目数。原始响应另受64项/256KiB预算约束，TUN域名提示独立为256项。
+- `ResourceLimits::dns_address_cache_entries`默认256，只是显式低层构造可传入的容量，生产启动不会用它覆盖`dns.cache-max-size`。WireGuard/MASQUE的私有节点resolver通过独立`DnsConfig::default()`构造，当前默认同为4,096项，不继承用户全局缓存容量覆盖；DNS关闭时的系统ECH metadata resolver另固定64项。这些局部容量不构成进程RSS上限。
 - 不设置固定的活动请求或活动传输总许可数。
 - 相同 key 的 cache miss 使用 singleflight；leader 取消后 follower 重新选举。
 - UDP 传输属于单次请求，同一尝试的重发复用当前传输。
-- 显式 TCP nameserver 按 endpoint 和配置的 route target 复用；一条连接同时只处理一个查询。
+- 上游尝试仅在选择 TCP/TLS 或 DoQ 后分配对应的异步状态；普通 UDP 不内嵌未使用的握手状态。装箱不创建额外任务，取消仍直接丢弃该尝试及其拥有的状态。
+- TCP、DoT、DoH 按上游身份、endpoint 和 route target 复用；TCP、DoT、HTTP/1.1 一条连接同时只处理一个查询，HTTP/2 和 HTTP/3 每连接最多 32 个并发查询。DNS TLS 不保留恢复票据，复用已认证连接。
 - 活动 TCP 不设固定数量上限；空闲连接总数最多 4，同 key 最多 2，空闲超时 30 秒。
-- 查询、单次尝试和 UDP 重发期限分别为 5 秒、3 秒和 1 秒。
+- 查询、单次尝试和 UDP 重发期限分别为 5 秒、3 秒和 1 秒。每次查询最多并发 4 个上游，胜出后取消其余尝试；UDP TC 转同一上游 TCP。
 - 响应最多扫描 64 条记录，类型化缓存和提示最多保留 16 个唯一 IP。
 - 停止取消打开、发送、接收、重试和响应发送，并释放全部传输。
 
@@ -146,21 +278,75 @@ IP-only协议接点持有`ResolutionContext`，runtime DNS通过Weak绑定，不
 
 ## 代理组与 Controller
 
-- 静态 `select` 组只拥有不可变的有序成员和每组一个可原子替换的当前索引，不拥有协议连接、后台任务、队列、缓存或独立 worker。
-- 组数、每组成员数、重复成员数和嵌套深度没有独立固定上限，统一受 256 KiB YAML 上限约束；配置期使用 O(V+E) 的迭代 DAG 校验，运行时也以迭代方式解析当前叶节点。
+- 每个资源代际内的组成员保持有序且不可变；组保存当前选择、健康与策略状态，协议连接仍由节点拥有。健康探测由该资源代际统一调度，最多并发 10 项，停止时取消并等待完成。
+- provider 候选整体验证后发布，既有会话保留原资源代际；不再被使用的旧代际停止探测并释放资源。选择与 fake-IP 持久化由各自的存储所有者管理。
+- 组数、每组成员数、重复成员数和嵌套深度没有独立固定上限，统一受 8 MiB YAML 输入与 32 MiB 展开计费上限约束；配置期使用 O(V+E) 的迭代 DAG 校验，运行时也以迭代方式解析当前叶节点。
 - 节点上游和全部组成员在同一 DAG 中校验；组连接器只持有声明依赖，按逆依赖顺序释放。建链快照只按需记录本次遇到的组，不成为全局缓存。Hysteria2 的已认证连接为后续端口跳跃保留该快照，直到此物理会话退出；它不再读取实时选择，也不延长原建链期限。
 - 同组成功选择是线性化的，不同组独立；选择失败不改变状态，也不创建重试或自动 failover 任务。
 - 切换不扫描或迁移现有 TCP、UDP、DNS transport，不刷新 DNS cache/singleflight 或 TCP pool；资源仍由原所有者按既有 timeout、EOF、取消和 stop 语义回收。
-- Controller 同时最多跟踪 8 个连接任务。请求 header 和 PUT body 各有 5 秒读取期限，PUT body 最大 1 KiB；超时、超限和解析失败只终止当前请求。
+- Controller 同时最多跟踪 8 个连接任务，包含最多 4 个 WebSocket 订阅。header、body 和输出各有 5 秒 I/O 期限；普通 PUT body 最大 1 KiB，`PUT /configs` 在取得独立配置应用许可后允许最多 8 MiB，并使用配置候选的 90 秒总期限。超时、超限和解析失败只终止当前请求。
+- WebSocket 按需采样，不为每个订阅保存历史快照；输出 JSON 在扩容前限制 256 KiB，连接快照先限制 512 个引用。客户端缓冲/消息/帧各 1 KiB，慢写取消当前订阅。日志总线仅在订阅时保留 64 条共享事件，不截断事件内容或另设每秒条数限制；无订阅不格式化或轮询，Stop join 连接并释放订阅。
 
 完整接口见 [运行时 Controller](controller-api.md)。
+
+## Provider 与 HTTP 资源
+
+Provider 在现有 AGE 解密后读取 YAML、URI 列表或标准 Base64 URI 订阅，转换结果继续走
+名称过滤、override、完整节点与依赖图校验及资源代次发布。输入和解密结果最多 8 MiB，
+URI 转换使用 32 MiB 保守空间计费，单行最多 64 KiB，嵌套最多 64 层。
+URL/query、凭据解码、JSON/YAML 转换和选项 clone 前按单行最坏结构预留临时空间；
+展开节点及名称索引单独保留计费，多端口来源逐个加入候选。外层 Base64 清理与解码
+先检查并存空间。JSON 先做不构建值树的语法检查，再复用有界 YAML visitor。
+这份估算不包含调用者已持有的源文件，不代表 allocator 精确容量或进程 RSS 上界；
+不足时整个候选失败，不增加业务数量准入或新的配置字段。
+
+HTTP(S) 资源共用流式 gzip 解码与 URL Basic。压缩 framing 与解压内容分别计数，
+size-limit 作用于解压内容；完整 gzip 校验和落盘成功后才返回候选，坏流或取消删除暂存。
+解码输出块检查同一取消与期限，不整包缓冲解压结果。跨 origin 不转发原认证或 Cookie。
+Provider 来源身份摘要绑定精确 URL 和实际请求 header/UA；GeoData 用精确 URL 摘要。
+来源元数据和 Debug 不保存或输出明文凭据，GeoData 的来源显示仅保留 origin。
+Provider 旧 URL-only 身份须无条件刷新；旧内容可用与其 ETag/订阅元信息可信度分别判断，
+来源身份不符时保留内容但无条件重新获取，不用旧身份授权 304。
+
+## 离线规则 bundle
+
+`rule-providers.*.path-in-bundle` 使用 `dataDir/BundleMRS.7z` 中的精确成员名；
+不展开到目录、不预置资产、不对其他 Provider 生效。初始化依次尝试有效缓存、bundle、
+原 file/http 来源；缺失或无效 bundle 沿用原来源。有效成员按原格式解析，原始字节与
+无 ETag 的本地来源标识原子写入缓存；本地来源不算已完成 HTTP 获取，重启也保留这一语义。
+
+单次初始化按顺序读取各资源，同一读取只有一个单线程解码器。先检查签名与 CRC、
+128 KiB header/decoded header、单 encoded-header packed stream（16 MiB）及至多8个 coder，
+再让官方 `sevenz-rust2` 读取 metadata。拒绝加密、外置 metadata 与未审核 codec；
+支持 COPY、LZMA1/2、Delta 及 x86/ARM/ARM Thumb BCJ。随后检查所选压缩块的单输入链、
+4096项文件表、128 MiB压缩输入和256 MiB解码总量；仅保留目标成员，最多64 MiB，
+并受 size-limit 进一步约束。solid前置成员流式丢弃，目标读至EOF后才接受校验结果。
+
+字典、输出和保守metadata计费共享96 MiB准入估计；该估计不包括allocator、解析后的规则
+及整个进程其他资源，不能当RSS上界。检查在官方 decoder分配之前执行，metadata中的
+计数由受限header长度约束。超过局部边界的bundle使用原来源，不静默截断成员。
+读取与解码检查取消、30秒局部期限、累计256 MiB来源读取和65536次I/O操作。
+使用同一个打开的文件句柄，异步调用者等待阻塞任务完成，不以丢弃JoinHandle替代停止。
+
+## Provider 名称表达式
+
+普通筛选表达式继续使用线性时间的 `regex`。必要的 lookaround/backreference 使用
+`fancy-regex`，限制复杂源码 4 KiB、AST 512 节点/32 层、有限重复数 4096、委托编译和
+DFA 缓存各 512 KiB；不接受递归、条件式和控制动词。每次复杂匹配最多 10,000 回溯，
+输入名称最多 4 KiB。一次候选共享最多 10,000 次复杂匹配/改名匹配和 100 ms 执行窗口；
+改名输出最多 64 KiB，后续表达式继续计费。单次库调用不能中途抢占，调用间检查取消。
+编译、预算、运行错误与取消均使候选失败，保留当前资源和 HTTP 缓存，不静默漏选节点。
+这些边界仅用于名称表达式，不改变 GeoData/DOMAIN-REGEX 或业务连接准入。
 
 ## GeoData
 
 - 所有平台完整加载被引用分类的所选记录，不设记录条数硬上限或截断；GeoIP 与 GeoSite 没有优先额度分配。
 - 同种基础 code 按 ASCII 大小写归一，业务规则与 DNS policy 共用分类和值存储。属性取交集；正反选择器共享匹配器，多种属性筛选共享值及已编译正则，不重复解码同一分类。未引用分类不构建匹配器。
 - 各平台均不设独立 GeoData 分类、引用、文件大小、累计源码/值字节或总加载内存预算；DNS GeoSite policy 也不保留独立项数/引用数上限。
-- Loader 只解析被引用的分类，其他分类按 wire 长度跳过。
+- DAT Loader 只解析被引用的分类，其他分类按 wire 长度跳过。默认国家 MMDB 与 DAT 二选一；
+  Meta 国家库在完整校验后优先将配置引用的分类编为紧凑 CIDR，并释放原始文件缓冲；
+  投影不更省或不适合时保留原 Reader。其他国家 schema 与 ASN 保留拥有字节的 Reader，
+  按索引借用查询。各路径均不建立逐地址缓存，不截断记录或增加 GeoData 内存准入。
 - Domain/Full 匹配器使用紧凑连续存储，运行期查找不分配。Regex 使用共享的
   `regex::bytes::Regex` 并关闭 Unicode 匹配模式；库管理编译状态和搜索缓存，搜索可能
   分配 scratch、增长缓存或竞争共享缓存，不能将 Domain/Full 的无分配性质扩展到 Regex。
@@ -183,22 +369,34 @@ IP-only协议接点持有`ResolutionContext`，runtime DNS通过Weak绑定，不
   排空响应间隔不等于整体 Stop 时限，释放存储也不保证 allocator 立即归还 RSS。
 - 卸载后的加载失败只使对应种类不可用，健康另一类仍发布；不恢复旧整体快照。
   卸载前的下载/结构失败保留当前匹配器，失败更新均保留旧磁盘资产并按现有调度重试。
+  国家 MMDB 与 ASN 先借用候选校验，再排空旧快照，构建投影或移动候选字节，失败保留/恢复旧代。
   304 在 matcher 已可用时只调度，不可用时重载本地资产。既有 TCP 选路与 TUN UDP
   固定 action 不回溯；没有新增公开 API、业务数量配额或 GeoData 内存预算。
 
-GeoData 行为见 [规则与资产](geodata.md)。性能与压力测试由
-[container-benchmark](https://github.com/YuanDevTeam/container-benchmark) 维护，
-测试结果记录在对应运行中。
+GeoData 行为见 [规则与资产](geodata.md)。性能与压力测试由独立容器测试工具执行，
+结果与结论统一保存在 benchmark 工程。
 
-## Apple 内存遥测
+## 统一内存策略
 
-iOS/tvOS TUN 通过 `TASK_VM_INFO` 尽力记录当前 physical footprint、进程生命周期峰值和限频阈值事件，运行期间最多每 30 秒采样一次。macOS 不启用该周期任务；平台接入与事件标识见 [TUN 平台层](tun-platform.md)。
+所有平台与构建共享上述队列、缓冲、缓存、QUIC 窗口与线程策略。
+CLI 和 FFI 使用同一 Invoke 启动路径，无独立内存编译开关、YAML 字段或 Invoke 参数。
 
-- 采样失败只记录一次警告；
-- 遥测不写入 `lastError`；
-- 读数和阈值越界不改变 prepare、start、running、stop 或 panic recovery；
-- 停止后的 allocator pressure relief 同样是尽力而为；
-- 固定阈值只是诊断信号，不是产品内存承诺或 admission gate。
+TUN 在生命周期边界及运行期间每 30 秒尽力记录进程内存和限频阈值事件。
+Apple 使用 `TASK_VM_INFO` 的当前与生命周期峰值 physical footprint；Linux 使用
+procfs 的 VmRSS/VmHWM。其他平台的采样不可用时只报告一次诊断，不伪造读数。
+
+GNU/Linux 的 TUN 在工作线程启动前，进程内一次性尝试设置 glibc arena 为 1、
+mmap 阈值为 32 KiB；显式 `MALLOC_ARENA_MAX`、`MALLOC_MMAP_THRESHOLD_` 或
+`GLIBC_TUNABLES` 覆盖优先。这是进程级 allocator 设置，可能影响同进程中的宿主分配。
+Stop 的同步释放屏障完成后，Apple 通过 malloc zone、GNU/Linux 通过 `malloc_trim`
+尽力归还空闲内存；不支持该接口的平台保留原 allocator 行为。
+
+- 未使用 TUN 时不配置 allocator、不启动周期采样或 Stop 回收。
+- 采样失败只记录一次警告，不写入 `lastError`。
+- 43/45 MiB 阈值分别对应默认 1 Gbps 与 2 Gbps 的预算，仅作诊断；Core 不推断负载档位，最终由 benchmark 按实际负载判定。这些观测不改变 prepare、start、running、stop 或 panic recovery。
+- Stop 后的 allocator 回收只执行一次且尽力而为，不保证立即降低进程内存。
+
+内存预算与真实设备范围见[验收边界](acceptance.md)。
 
 ## 日志与观测
 
@@ -207,10 +405,11 @@ iOS/tvOS TUN 通过 `TASK_VM_INFO` 尽力记录当前 physical footprint、进�
 独立 netstack 的 `udp_drops` 只记录通用 UDP endpoint 的入站丢弃；生产 TUN 使用
 TCP-only netstack，因此该值为零不代表 UDP 无丢包。运行时记录
 `udp_association_queue_drops` 和 `udp_response_queue_drops`，保留两者合计的
-`udp_queue_drops`；TCP/ICMP ingress Full 记录 `packet_queue_drops`。这些计数
+`udp_queue_drops`。普通响应暂持等待容量不计丢包，取消或错误后实际丢弃才计数；
+TCP/ICMP ingress Full 记录 `packet_queue_drops`。这些计数
 不包含物理 socket、内核 TUN 或对端设施中的丢包。
 
-日志必须有界且脱敏，不记录目标、DNS question、UUID、凭据、密钥、负载或完整配置。
+CLI 与 Controller 按日志级别完整输出事件的 target、message 和字段，不按敏感内容脱敏或删减。Controller 的订阅队列、WebSocket 消息与写入期限仍按上文限制；超过消息预算时关闭订阅，不发送截断事件。
 
 仅`cfg(test)`/`interop-test`启用的`ResourceProbe`按测试作用域记录RAII当前值/峰值；子任务显式继承作用域，不使用进程全局reset或更换生产allocator。当前接入物理TCP/UDP、共享流/QUIC驱动与session、数据报association、DNS池/等待者及既有运行时活动guard。Hysteria2 的待完成分片通过 `Reassembly` 登记，交付后释放 Packet ID 和重组资源；零计数必须与实际执行过的重组路径一起解释。
 
@@ -225,3 +424,13 @@ TCP-only netstack，因此该值为零不代表 UDP 无丢包。运行时记录
 4. 记录主机和对应物理平台证据。
 
 没有测量证据时不增加新的资源控制层。实际验证范围见 [验收矩阵](acceptance.md)。
+
+
+## 在线配置候选
+
+Controller 与 Invoke 共用每实例一个候选许可，在完整请求 body／JSON 分配前准入；队列仅一项。候选复用 provider 代际 worker，所有已启动阻塞解析、图准备、路径准备与 GeoData 注册操作均由该 worker join。失败不发布新图，不覆盖活动 provider body／metadata；完成图验证后可以创建受 dataDir 约束的缓存目录。配置替换原子发布模板、图、DNS、组和可用资源快照，退休代际由活动业务持有。此局部准入不限制正常业务连接数，也不将 YAML 上限描述为整进程 RSS 限制。
+
+
+SS2022 插件复用受控 TCP、原有 TLS 预算和 Stop 所有者。obfs/V2Ray mux 每次最多保留
+一个 16 KiB 输出帧；HTTP 头最大16 KiB，mux元数据最大512字节。裸smux的物理命令队列和
+聚合接收字节数均有界；取消/Stop等待全部自有驱动结束。

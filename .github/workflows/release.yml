@@ -79,9 +79,9 @@ jobs:
           python-version: "3.x"
           check-latest: true
           architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: "0.12"
+          version: "0.13.6"
       - name: Linux native dependencies
         if: matrix.platform == 'linux'
         run: |
@@ -90,9 +90,9 @@ jobs:
       - name: Cache native Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.name }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**') }}
+          key: release-${{ matrix.name }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
           workspaces: ". -> target"
-          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR BORING AWS_LC LIBCLANG BINDGEN
+          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR VOLE BORING AWS_LC LIBCLANG BINDGEN
           cache-bin: "false"
       - name: Build and package production CLI
         shell: bash
@@ -193,9 +193,9 @@ jobs:
           python-version: "3.x"
           check-latest: true
           architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: "0.12"
+          version: "0.13.6"
       - name: Locked source
         run: cargo fetch --locked
       - name: Linux native dependencies
@@ -222,7 +222,7 @@ jobs:
       - name: Cache native Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.name }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**') }}
+          key: release-${{ matrix.name }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
           workspaces: ". -> target"
           env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR ANDROID_NDK_HOME VOLE BORING AWS_LC LIBCLANG BINDGEN
           cache-bin: "false"
@@ -295,13 +295,13 @@ jobs:
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: "0.12"
+          version: "0.13.6"
       - name: Cache native Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-ffi-apple-${{ matrix.target }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**') }}
+          key: release-ffi-apple-${{ matrix.target }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
           workspaces: ". -> target"
           env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR VOLE BORING AWS_LC LIBCLANG BINDGEN
           cache-bin: "false"
@@ -335,9 +335,9 @@ jobs:
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: "0.12"
+          version: "0.13.6"
       - uses: actions/download-artifact@v8
         with:
           pattern: vole-apple-*-${{ github.sha }}
@@ -368,9 +368,9 @@ jobs:
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: "0.12"
+          version: "0.13.6"
       - uses: actions/download-artifact@v8
         with:
           pattern: vole-release-build-*-${{ github.sha }}

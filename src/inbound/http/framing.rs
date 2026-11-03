@@ -9,19 +9,19 @@ use tokio::time::timeout;
 use super::parser::{RequestHead, is_token_byte, parse_headers};
 use crate::session::Destination;
 
-pub(super) const COPY_BUFFER: usize = 8 * 1024;
+pub(crate) const COPY_BUFFER: usize = 8 * 1024;
 const MAX_CHUNK_LINE: usize = 1024;
 const MAX_TRAILERS: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Body {
+pub(crate) enum Body {
     Empty,
     Length(u64),
     Chunked,
     UntilEof,
 }
 
-pub(super) struct RequestPlan {
+pub(crate) struct RequestPlan {
     pub destination: Destination,
     pub head: Vec<u8>,
     pub body: Body,
@@ -31,8 +31,41 @@ pub(super) struct RequestPlan {
 }
 
 impl RequestPlan {
+    pub(crate) fn edit_headers(
+        &mut self,
+        edit: impl FnOnce(&mut Vec<(String, String)>),
+    ) -> io::Result<()> {
+        let bytes = self
+            .head
+            .strip_suffix(b"\r\n\r\n")
+            .ok_or_else(|| invalid("incomplete generated HTTP header"))?;
+        let mut request = super::parser::parse_request_head(bytes, Vec::new())?;
+        edit(&mut request.headers);
+        let keep_alive = self.keep_alive;
+        let blocklist = self.trailer_blocklist.clone();
+        let origin = request.target.clone();
+        *self = Self::for_target(&request, self.destination.clone(), origin, false)?;
+        self.keep_alive = keep_alive;
+        self.trailer_blocklist.extend(blocklist);
+        Ok(())
+    }
     pub fn new(request: &RequestHead) -> io::Result<Self> {
-        let framing = Framing::parse(&request.headers)?;
+        let (destination, origin) = request.forward_target()?;
+        Self::for_target(request, destination, origin, false)
+    }
+    pub(crate) fn for_target(
+        request: &RequestHead,
+        destination: Destination,
+        origin: String,
+        strip_origin_credentials: bool,
+    ) -> io::Result<Self> {
+        let mut framing = Framing::parse(&request.headers)?;
+        if strip_origin_credentials {
+            framing.connection.insert("cookie".into());
+            framing
+                .trailers
+                .retain(|name| !name.eq_ignore_ascii_case("cookie"));
+        }
         let body = framing.body.unwrap_or(Body::Empty);
         if request.version == "HTTP/1.0" && body == Body::Chunked {
             return Err(invalid("HTTP/1.0 cannot use chunked framing"));
@@ -57,9 +90,13 @@ impl RequestPlan {
         {
             return Err(invalid("unsupported HTTP expectation"));
         }
-        let (destination, origin) = request.forward_target()?;
         let mut head = format!("{} {} HTTP/1.1\r\n", request.method, origin).into_bytes();
-        append_headers(&mut head, &request.headers, &framing.connection);
+        append_headers(
+            &mut head,
+            &request.headers,
+            &framing.connection,
+            strip_origin_credentials,
+        );
         append(&mut head, "Host", &destination.authority());
         append_framing(&mut head, &framing);
         if upgrade.is_empty() {
@@ -83,7 +120,7 @@ impl RequestPlan {
 }
 
 #[derive(Debug)]
-pub(super) struct ResponseHead {
+pub(crate) struct ResponseHead {
     pub status: u16,
     line: String,
     headers: Vec<(String, String)>,
@@ -91,6 +128,20 @@ pub(super) struct ResponseHead {
 }
 
 impl ResponseHead {
+    pub(crate) fn headers(&self) -> &Vec<(String, String)> {
+        &self.headers
+    }
+    pub(crate) fn edit_headers(
+        &mut self,
+        edit: impl FnOnce(&mut Vec<(String, String)>),
+    ) -> io::Result<()> {
+        let mut candidate = self.headers.clone();
+        edit(&mut candidate);
+        let framing = Framing::parse(&candidate)?;
+        self.headers = candidate;
+        self.framing = framing;
+        Ok(())
+    }
     pub fn parse(bytes: &[u8]) -> io::Result<Self> {
         let text =
             std::str::from_utf8(bytes).map_err(|_| invalid("invalid response head encoding"))?;
@@ -164,7 +215,7 @@ impl ResponseHead {
             self.line.clone()
         };
         let mut head = format!("{line}\r\n").into_bytes();
-        append_headers(&mut head, &self.headers, &self.framing.connection);
+        append_headers(&mut head, &self.headers, &self.framing.connection, false);
         if !legacy || self.framing.body != Some(Body::Chunked) {
             append_framing(&mut head, &self.framing);
         }
@@ -267,7 +318,7 @@ impl Framing {
     }
 }
 
-pub(super) fn validate_connect(request: &RequestHead) -> io::Result<()> {
+pub(crate) fn validate_connect(request: &RequestHead) -> io::Result<()> {
     let framing = Framing::parse(&request.headers)?;
     let hosts = values(&request.headers, "host").count();
     if !matches!(framing.body, None | Some(Body::Length(0)))
@@ -340,7 +391,7 @@ fn stripped(name: &str, connection: &HashSet<String>) -> bool {
         "transfer-encoding",
     ]
     .contains(&name.as_str())
-        || name.starts_with("x-vole-")
+        || name == "x-vole-measure-diagnostic"
         || connection.contains(&name)
 }
 
@@ -348,8 +399,15 @@ fn append_headers(
     output: &mut Vec<u8>,
     headers: &[(String, String)],
     connection: &HashSet<String>,
+    strip_origin_credentials: bool,
 ) {
     for (name, value) in headers {
+        if strip_origin_credentials
+            && (name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie"))
+        {
+            continue;
+        }
+
         if !stripped(name, connection) {
             append(output, name, value);
         }
@@ -370,7 +428,7 @@ fn append_framing(output: &mut Vec<u8>, framing: &Framing) {
 }
 
 /// Consume exactly one head; BufReader retains any body or pipelined request.
-pub(super) async fn read_head<R: AsyncBufRead + Unpin>(
+pub(crate) async fn read_head<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     maximum: usize,
 ) -> io::Result<Vec<u8>> {
@@ -388,7 +446,10 @@ pub(super) async fn read_head<R: AsyncBufRead + Unpin>(
     }
 }
 
-async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R, maximum: usize) -> io::Result<Vec<u8>> {
+pub(crate) async fn read_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    maximum: usize,
+) -> io::Result<Vec<u8>> {
     let mut line = Vec::with_capacity(maximum.min(128));
     loop {
         let buffer = reader.fill_buf().await?;
@@ -420,7 +481,7 @@ async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R, maximum: usize) -> i
     }
 }
 
-pub(super) async fn transfer_body<R, W>(
+pub(crate) async fn transfer_body<R, W>(
     reader: &mut R,
     writer: &mut W,
     body: Body,
@@ -486,7 +547,7 @@ where
     timeout_io(idle, writer.flush()).await
 }
 
-fn forbidden_trailer(name: &str, connection: &HashSet<String>) -> bool {
+pub(crate) fn forbidden_trailer(name: &str, connection: &HashSet<String>) -> bool {
     stripped(name, connection)
         || [
             "authorization",
@@ -499,7 +560,7 @@ fn forbidden_trailer(name: &str, connection: &HashSet<String>) -> bool {
         .any(|field| name.eq_ignore_ascii_case(field))
 }
 
-fn chunk_size(line: &[u8]) -> io::Result<u64> {
+pub(crate) fn chunk_size(line: &[u8]) -> io::Result<u64> {
     let text = line
         .strip_suffix(b"\r\n")
         .ok_or_else(|| invalid("invalid chunk line"))?;
@@ -600,7 +661,7 @@ where
     Ok(())
 }
 
-pub(super) async fn timeout_io<T>(
+pub(crate) async fn timeout_io<T>(
     duration: Duration,
     future: impl std::future::Future<Output = io::Result<T>>,
 ) -> io::Result<T> {
@@ -609,7 +670,7 @@ pub(super) async fn timeout_io<T>(
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP I/O timed out"))?
 }
 
-pub(super) async fn write_timed<W: AsyncWrite + Unpin>(
+pub(crate) async fn write_timed<W: AsyncWrite + Unpin>(
     writer: &mut W,
     bytes: &[u8],
     idle: Duration,

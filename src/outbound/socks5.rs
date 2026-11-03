@@ -8,6 +8,9 @@ use crate::{
     config::Socks5OutboundConfig,
     dialer::{Dialer, ResolvedEndpoint},
     dispatch::{BoxStream, DatagramTransport, DispatchError, Dispatcher},
+    security::{
+        SecurityContext, StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsClientOptions,
+    },
     session::{Datagram, DatagramSession, Destination, StreamSession},
     socks5::{
         COMMAND_CONNECT, COMMAND_UDP_ASSOCIATE, MAX_UDP_HEADER_SIZE, VERSION, decode_udp_packet,
@@ -62,6 +65,7 @@ pub struct Socks5Outbound {
     server: Destination,
     auth: Option<Socks5Auth>,
     upstream: UpstreamPath,
+    tls: Option<StandardTlsClient>,
 }
 
 impl std::fmt::Debug for Socks5Outbound {
@@ -70,6 +74,7 @@ impl std::fmt::Debug for Socks5Outbound {
             .debug_struct("Socks5Outbound")
             .field("server", &self.server)
             .field("has_auth", &self.auth.is_some())
+            .field("tls", &self.tls.is_some())
             .field("upstream", &self.upstream)
             .finish()
     }
@@ -96,6 +101,23 @@ impl Socks5Outbound {
         config: &Socks5OutboundConfig,
         upstream: UpstreamPath,
     ) -> io::Result<Self> {
+        let security = config.tls.as_ref().map(|_| SecurityContext::new());
+        Self::with_shared_security(
+            config,
+            upstream,
+            security.as_ref(),
+            TLS_RESUMPTION_SESSION_BUDGET,
+            64 * 1024,
+        )
+    }
+
+    pub(crate) fn with_shared_security(
+        config: &Socks5OutboundConfig,
+        upstream: UpstreamPath,
+        security: Option<&SecurityContext>,
+        sessions: usize,
+        buffer_limit: usize,
+    ) -> io::Result<Self> {
         let auth = match (&config.username, &config.password) {
             (None, None) => None,
             (Some(username), Some(password)) => {
@@ -112,6 +134,33 @@ impl Socks5Outbound {
             server: server_destination(&config.address, config.port)?,
             auth,
             upstream,
+            tls: config
+                .tls
+                .as_ref()
+                .map(|policy| {
+                    StandardTlsClient::with_options(
+                        security.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "SOCKS5 TLS requires security context",
+                            )
+                        })?,
+                        &config.address,
+                        TlsClientOptions::from_policy(
+                            policy,
+                            None,
+                            security.ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "SOCKS5 TLS requires security context",
+                                )
+                            })?,
+                        )?,
+                        sessions,
+                        buffer_limit,
+                    )
+                })
+                .transpose()?,
         })
     }
 
@@ -120,9 +169,16 @@ impl Socks5Outbound {
         session: StreamSession,
         context: &EstablishContext,
     ) -> Result<ConnectedStream, DispatchError> {
-        self.upstream
+        let mut control = self
+            .upstream
             .connect_server(session, &self.server, context)
-            .await
+            .await?;
+        if let Some(tls) = &self.tls {
+            control.io = context
+                .run_io("SOCKS5 TLS handshake", tls.connect(control.io))
+                .await?;
+        }
+        Ok(control)
     }
 
     async fn establish_tcp(
@@ -152,6 +208,7 @@ impl Socks5Outbound {
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         let control_session = StreamSession {
+            metadata: request_parameters.session.metadata.clone(),
             inbound: request_parameters.session.inbound,
             source: request_parameters.session.source,
             destination: self.server.clone(),
@@ -171,6 +228,8 @@ impl Socks5Outbound {
             &self.server,
             self.upstream.is_direct(context)?,
         )?;
+
+        let relay = self.upstream.ip4p_datagram_relay(relay, context)?;
 
         let upstream_limit = request_parameters
             .max_response_payload_size()
@@ -393,6 +452,10 @@ struct Socks5DatagramTransport {
 
 #[async_trait]
 impl DatagramTransport for Socks5DatagramTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        true
+    }
+
     fn payload_budget(&self, peer: &Destination) -> crate::dispatch::DatagramBudget {
         let Ok(address) = crate::socks5::encoded_address_size(peer) else {
             return crate::dispatch::DatagramBudget::new(0, 0);
@@ -505,7 +568,9 @@ mod tests {
         close_control: bool,
         fragment_response: bool,
         opened_limit: Arc<AtomicU16>,
-        switch_after_handshake: Option<Arc<AtomicUsize>>,
+        associates: Arc<AtomicUsize>,
+        udp_opens: Arc<AtomicUsize>,
+        switch_after_handshake: Option<Arc<crate::routing::GroupSelection>>,
     }
 
     impl MockUpstream {
@@ -517,6 +582,8 @@ mod tests {
                 close_control: false,
                 fragment_response: false,
                 opened_limit: Arc::new(AtomicU16::new(0)),
+                associates: Arc::new(AtomicUsize::new(0)),
+                udp_opens: Arc::new(AtomicUsize::new(0)),
                 switch_after_handshake: None,
             }
         }
@@ -535,6 +602,7 @@ mod tests {
             let auth = self.auth.clone();
             let relay = self.relay.clone();
             let close_control = self.close_control;
+            let associates = self.associates.clone();
             let switch_after_handshake = self.switch_after_handshake.clone();
             tokio::spawn(async move {
                 let mut greeting = [0_u8; 3];
@@ -572,6 +640,7 @@ mod tests {
                     .unwrap();
                 if command == COMMAND_UDP_ASSOCIATE {
                     assert_eq!(destination.port(), 0);
+                    associates.fetch_add(1, Ordering::Relaxed);
                 } else {
                     assert_eq!(
                         destination,
@@ -614,6 +683,7 @@ mod tests {
             request: DatagramRequest,
             _context: &EstablishContext,
         ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+            self.udp_opens.fetch_add(1, Ordering::Relaxed);
             self.opened_limit
                 .store(request.max_response_payload_size(), Ordering::Relaxed);
             Ok(Box::new(MockDatagrams {
@@ -734,6 +804,10 @@ mod tests {
 
     #[async_trait]
     impl DatagramTransport for MockDatagrams {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
             if self.fragment_response {
                 let mut payload = datagram.payload.to_vec();
@@ -754,6 +828,7 @@ mod tests {
 
     fn config(auth: Option<(&str, &str)>) -> Socks5OutboundConfig {
         Socks5OutboundConfig {
+            tls: None,
             address: "socks.example".to_owned(),
             port: 1080,
             username: auth.map(|(username, _)| username.to_owned()),
@@ -763,6 +838,7 @@ mod tests {
 
     fn stream_session() -> StreamSession {
         StreamSession {
+            metadata: Default::default(),
             inbound: crate::session::InboundKind::Http,
             source: "127.0.0.1:10000".parse().unwrap(),
             destination: Destination::domain("target.example", 443).unwrap(),
@@ -848,10 +924,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_udp_shares_socks_association_and_isolates_closed_members() {
+        use crate::{
+            connections::Registry,
+            dispatch::observe_sessions_with_stats,
+            outbound::{ConnectorDispatcher, RejectOutbound},
+            resources::RuntimeResourceStats,
+            routing::{
+                EmptyGeoMatcher, ProxyDispatchers, RoutingDispatcher, RuleSet,
+                diagnostics::Diagnostics,
+            },
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let upstream = MockUpstream::new(COMMAND_UDP_ASSOCIATE);
+            let associates = upstream.associates.clone();
+            let udp_opens = upstream.udp_opens.clone();
+            let opens = || {
+                (
+                    associates.load(Ordering::Relaxed),
+                    udp_opens.load(Ordering::Relaxed),
+                )
+            };
+            let node = Arc::new(
+                Socks5Outbound::new_with_upstream(&config(None), Arc::new(upstream)).unwrap(),
+            );
+            let leaf = observe_sessions_with_stats(
+                Arc::new(ConnectorDispatcher::new(node)),
+                RuntimeResourceStats::new("socks_managed_memory"),
+            );
+            let parsed = crate::config::Config::parse_yaml(
+                br#"
+proxies: [{name: edge, type: socks5, server: socks.example, port: 1080, udp: true}]
+rules: ["MATCH,edge"]
+"#,
+            )
+            .unwrap();
+            let rules = RuleSet::compile(parsed.rules.clone()).unwrap();
+            let registry = Arc::new(Registry::default());
+            let diagnostics = Arc::new(Diagnostics::new(&parsed, &rules, registry.clone()));
+            let router = RoutingDispatcher::new(
+                ProxyDispatchers::new(vec![leaf]).unwrap(),
+                Arc::new(ConnectorDispatcher::new(Arc::new(
+                    RejectOutbound::drop_connections(),
+                ))),
+                None,
+                rules,
+                Arc::new(EmptyGeoMatcher),
+            )
+            .with_diagnostics(diagnostics);
+            let mut first = router
+                .open_datagram(DatagramSession::for_tun(
+                    "127.0.0.1:10000".parse().unwrap(),
+                    1500,
+                ))
+                .await
+                .unwrap();
+            let mut second = router
+                .open_datagram(DatagramSession::for_tun(
+                    "127.0.0.1:10001".parse().unwrap(),
+                    1500,
+                ))
+                .await
+                .unwrap();
+            let a: std::net::SocketAddr = "198.51.100.1:443".parse().unwrap();
+            let b: std::net::SocketAddr = "198.51.100.2:53".parse().unwrap();
+            let packet = |remote: std::net::SocketAddr, body: &'static [u8]| Datagram {
+                remote: Destination::Ip(remote),
+                payload: Bytes::from_static(body),
+                sniffed_domain: None,
+            };
+            first.send(packet(a, b"stale")).await.unwrap();
+            first.send(packet(b, b"sibling")).await.unwrap();
+            assert_eq!(opens(), (1, 1), "same-source targets share one wire");
+            second.send(packet(a, b"separate")).await.unwrap();
+            assert_eq!(opens(), (2, 2), "different sources keep independent wires");
+
+            let snapshot = serde_json::to_value(registry.snapshot()).unwrap();
+            let closed = snapshot["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| {
+                    entry["metadata"]["sourcePort"] == "10000"
+                        && entry["metadata"]["destinationIP"] == "198.51.100.1"
+                        && entry["metadata"]["destinationPort"] == "443"
+                })
+                .unwrap();
+            registry.close(closed["id"].as_str().unwrap());
+            first.send(packet(a, b"fresh")).await.unwrap();
+            assert_eq!(opens(), (3, 3), "recreated target needs a new wire");
+
+            // Both old replies remain queued: the retired wire must deliver
+            // its sibling's frame while isolating the closed target's reply.
+            let mut replies = std::collections::HashMap::new();
+            for _ in 0..2 {
+                let reply = first.receive().await.unwrap();
+                assert!(replies.insert(reply.remote, reply.payload).is_none());
+            }
+            assert_eq!(replies[&Destination::Ip(a)].as_ref(), b"fresh");
+            assert_eq!(replies[&Destination::Ip(b)].as_ref(), b"sibling");
+            let reply = second.receive().await.unwrap();
+            assert_eq!(reply.remote, Destination::Ip(a));
+            assert_eq!(reply.payload.as_ref(), b"separate");
+            first.close().await.unwrap();
+            second.close().await.unwrap();
+            assert!(
+                serde_json::to_value(registry.snapshot()).unwrap()["connections"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        })
+        .await
+        .expect("managed SOCKS memory IO must not wait on network or shutdown");
+    }
+
+    #[tokio::test]
     async fn group_switch_during_udp_handshake_keeps_control_and_relay_on_one_upstream() {
         use crate::outbound::{SelectUpstream, SelectUpstreamMember};
 
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(crate::routing::GroupSelection::new(0));
         let mut first = MockUpstream::new(COMMAND_UDP_ASSOCIATE);
         first.switch_after_handshake = Some(selection.clone());
         let first_budget = first.opened_limit.clone();
@@ -866,12 +1059,13 @@ mod tests {
             ],
         ));
         let group = Arc::new(SelectUpstream::new(
-            Arc::new(AtomicUsize::new(0)),
+            Arc::new(crate::routing::GroupSelection::new(0)),
             vec![SelectUpstreamMember::Group(child)],
         ));
         let outbound = Socks5Outbound::new_with_path(
             &config(None),
             UpstreamPath::Group {
+                server: crate::session::Destination::domain("server.example", 443).unwrap(),
                 group,
                 endpoint: None,
                 dialer: Dialer::default(),
@@ -999,6 +1193,7 @@ mod tests {
     async fn socks_over_socks_udp_nests_control_relay_and_wire_budgets() {
         let physical = Arc::new(NestedSocksUpstream::new());
         let outer_config = Socks5OutboundConfig {
+            tls: None,
             address: "outer.example".to_owned(),
             port: 1080,
             username: None,
@@ -1007,6 +1202,7 @@ mod tests {
         let outer =
             Arc::new(Socks5Outbound::new_with_upstream(&outer_config, physical.clone()).unwrap());
         let inner_config = Socks5OutboundConfig {
+            tls: None,
             address: "inner.example".to_owned(),
             port: 1080,
             username: None,
@@ -1140,6 +1336,34 @@ mod tests {
         assert!(!relay_source_matches(
             &relay,
             &Destination::domain("other.example", 53_000).unwrap()
+        ));
+    }
+    #[test]
+    fn ip4p_udp_relay_source_check_uses_the_actual_endpoint() {
+        let encoded: std::net::SocketAddr = "[2001:0::1bb:c000:201]:8443".parse().unwrap();
+        let dialer = Dialer::default().with_connections(crate::config::ConnectionSettings {
+            dialer_ip4p_convert: true,
+            ..Default::default()
+        });
+        let path = UpstreamPath::direct(
+            ResolvedEndpoint {
+                logical_host: encoded.ip().to_string(),
+                port: 8443,
+                addresses: vec![encoded],
+            },
+            dialer,
+        );
+        let expected = path
+            .ip4p_datagram_relay(Destination::Ip(encoded), &EstablishContext::default())
+            .unwrap();
+        assert!(relay_source_matches(
+            &expected,
+            &Destination::Ip("192.0.2.1:443".parse().unwrap())
+        ));
+        assert!(!relay_source_matches(&expected, &Destination::Ip(encoded)));
+        assert!(!relay_source_matches(
+            &expected,
+            &Destination::Ip("192.0.2.2:443".parse().unwrap())
         ));
     }
 }

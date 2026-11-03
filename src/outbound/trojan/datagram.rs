@@ -1,7 +1,7 @@
 use std::io;
 
 use async_trait::async_trait;
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
@@ -93,6 +93,10 @@ fn invalid_frame() -> io::Error {
 
 #[async_trait]
 impl DatagramTransport for TrojanDatagram {
+    fn supports_shared_destinations(&self) -> bool {
+        true
+    }
+
     fn payload_budget(&self, _: &Destination) -> DatagramBudget {
         self.budget
     }
@@ -141,17 +145,18 @@ impl DatagramTransport for TrojanDatagram {
                     return Err(error.into());
                 }
             }
-            let mut buffer = [0; 2048];
-            let remaining = (MAX_FRAME_BYTES - self.wire.len()).min(buffer.len());
+            let remaining = (MAX_FRAME_BYTES - self.wire.len()).min(2048);
             if remaining == 0 {
                 self.stream.take();
                 return Err(invalid_frame().into());
             }
+            self.wire.reserve(remaining);
+            let mut output = (&mut self.wire).limit(remaining);
             match self
                 .stream
                 .as_mut()
                 .expect("checked open")
-                .read(&mut buffer[..remaining])
+                .read_buf(&mut output)
                 .await
             {
                 Ok(0) => {
@@ -162,7 +167,7 @@ impl DatagramTransport for TrojanDatagram {
                     )
                     .into());
                 }
-                Ok(length) => self.wire.extend_from_slice(&buffer[..length]),
+                Ok(_) => {}
                 Err(error) => {
                     self.stream.take();
                     return Err(error.into());

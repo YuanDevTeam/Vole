@@ -81,20 +81,104 @@ control.stop().await;
 smoltcp sockets and woken pending TCP operations. Dropping the sole
 `PacketStream` also stops the driver and releases all endpoints.
 
+## Active TCP client
+
+`NetStack::start_client(config, addresses)` returns `ClientNetStackParts` with
+the same raw packet endpoints, control and statistics, plus a cloneable
+`TcpConnector`. `ClientAddresses` supplies optional IPv4/IPv6 source addresses;
+at least one must be unicast. An omitted family fails with `AddrNotAvailable`.
+The client mode does not create a passive accept or UDP datagram queue, and
+discards incoming TCP packets that do not belong to a requested connection.
+
+An optional `ClientConfig` retains up to two real `ClientPrefix` candidates,
+including two addresses in one family, and selects the source for each peer.
+It separates the bounded receive packet size from the TX MTU and can opt into
+per-flow ICMP PMTU feedback in the packet adapter. Mapped IPv4 and duplicate candidates normalize
+before startup. IPv4-only clients permit MTU 68..65535; a real IPv6 candidate
+requires at least 1280. Passive TUN validation still requires 1280.
+`ClientAddresses` converts with the former receive bound and PMTU disabled.
+
+```rust,ignore
+let parts = vole_netstack::NetStack::start_client(config, addresses)?;
+// The owner must concurrently pump packet_sink and packet_stream.
+let stream = parts.tcp_connector.connect(peer, deadline).await?;
+assert_eq!(stream.destination_addr(), peer);
+parts.control.stop().await;
+```
+
+`connect` takes an IP `SocketAddr` and an absolute Tokio `Instant`; bounded
+command admission and the handshake use that one deadline. It returns only
+after the socket reaches Established, with `source_addr` representing the
+configured local IP and allocated ephemeral port. `destination_addr` is the
+remote peer. The driver alone owns socket state and allocates source ports;
+there is no host socket, DNS resolver, system interface, route or NAT setup.
+
+The command queue holds at most 32 requests, independently of active socket
+count. Waiting for queue space remains cancellable and deadline-bound. Future
+Drop, deadline or handshake failure aborts the pending socket and reclaims its
+flow after any reset reaches the existing output queue; a full output never
+blocks Stop. Successful streams retain the existing direction buffers and TCP
+half-close behavior. Stop closes admission, wakes queued/in-flight connects
+and releases every socket before returning. Passive `start`/`start_tcp` TUN
+uses the same configured data buffers and admits validated TCP PMTU feedback
+without changing connection admission or adding packet queues.
+
+An active owner may call `tcp_connector.set_initial_mtu(mtu, deadline)` after
+its transport handshake and before any TCP connection. The same bounded
+command queue confirms a valid reduction before the first SYN is exposed.
+The driver rebuilds smoltcp's device-capability snapshot with unchanged source
+prefixes and routes; the independent receive packet limit is retained. Invalid
+budgets, increases, expired deadlines or an already started TCP flow fail.
+
 ## Driver buffering and scheduling
+
+TCP uses the official unmodified smoltcp engine. Active clients initialize its
+device with the known transport MTU; callers should use their actual packet
+budget when available. ICMP feedback cannot change smoltcp's socket MSS.
+Instead, validated feedback reduces that flow's output budget, and the packet
+adapter splits later TCP output, including ordinary retransmissions. Recovery
+uses smoltcp's own retransmission/congestion timers; no immediate retransmission
+or Mihomo timer equality is promised.
+
+Active clients retain the engine's one-second initial retransmission timeout
+and use a 200 ms minimum after RTT sampling. Passive TUN sockets keep the
+engine defaults; RTT estimates and timeout backoff remain engine-owned.
+
+Passive TUN TCP enables this bounded fallback as well; an incoming error must
+identify an active intercepted flow. Active clients additionally require a
+configured local source address and explicitly enable PMTU discovery.
+The adapter validates the local/remote tuple, outer destination and quoted
+sequence against output actually placed in the raw queue and not acknowledged.
+Sent ranges, ACK watermarks and path budgets each hold at most 64 metadata
+entries, with no payload history. Exhaustion forgets old optimization metadata;
+it cannot authorize a quote for unsent bytes. Partial ACKs trim references,
+sequence arithmetic handles wrap, and flow reclamation removes its metadata.
+
+Software segmentation supports non-fragmented IPv4 and plain IPv6 TCP. IP/TCP
+options, sequence, checksums and flags are preserved; FIN/PSH appear only on
+the last segment and CWR only on the first. Oversized SYN/RST/URG or packets
+requiring unsupported IP fragmentation/IPv6 extension handling are dropped;
+UDP message boundaries are never split. IPv6 budgets below 1280 are ignored.
+Continual software segmentation creates more packets and allocations than a
+correct initial device MTU, so it is a fallback for later path reductions.
 
 Device ingress holds at most one pending packet, not another packet queue.
 smoltcp TX tokens reserve capacity in the existing bounded raw output queue
 before consuming ingress or allocating an output packet. Consuming a token
 sends directly into that queue; dropping an unused token returns its permit.
-There is no intermediate device TX backlog. TCP protocol state retains pending
-output, including resets, until a token is available. Low-priority ICMP echo
+During segmentation, at most one original output packet and its offset remain
+in the device; each generated segment reserves its raw queue slot before
+allocation. No additional packet queue exists. A pending original prevents
+further smoltcp TX tokens until its segments drain. TCP protocol state retains
+pending output, including resets, until a token is available. Low-priority ICMP echo
 replies are dropped when output is full, without waiting or retaining a reply.
 
 `PacketStream::recv`, `recv_batch` and `try_recv` wake the driver when they
 restore output capacity. An immediate protocol timer is deferred while output
 is full, avoiding a zero-delay retry loop; the wakeup resumes it promptly.
 Bounded periodic polling still performs lifecycle maintenance.
+Stop releases the pending original and all PMTU metadata before reporting
+completion; it never waits for a blocked output consumer.
 
 The driver consumes at most eight already-ready ingress packets before full
 socket maintenance. TCP ingress still advances packet by packet; cancellation

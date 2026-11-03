@@ -19,10 +19,16 @@ impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub type BoxStream = Box<dyn AsyncStream>;
 
+/// One owned send operation; its owner must cancel or complete it before close.
+pub type OwnedDatagramSend =
+    Pin<Box<dyn std::future::Future<Output = Result<(), DispatchError>> + Send + 'static>>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
     #[error("connection is not allowed")]
     NotAllowed,
+    #[error("rule evaluation failed: {0}")]
+    RuleEvaluation(#[from] crate::config::MatchFailure),
     #[error("network is unreachable")]
     NetworkUnreachable,
     #[error("host is unreachable")]
@@ -40,6 +46,7 @@ impl DispatchError {
     pub const fn diagnostic_code(&self) -> &'static str {
         match self {
             Self::NotAllowed => "not_allowed",
+            Self::RuleEvaluation(_) => "rule_evaluation",
             Self::NetworkUnreachable => "network_unreachable",
             Self::HostUnreachable => "host_unreachable",
             Self::ConnectionRefused => "connection_refused",
@@ -72,12 +79,44 @@ impl From<io::Error> for DispatchError {
 
 #[async_trait]
 pub trait DatagramTransport: Send {
+    /// Whether one source association may share this transport across distinct
+    /// unmodified IP destinations routed to the same concrete dispatcher.
+    /// Replies must retain their source destination, and cancelled sends must
+    /// preserve framing for the next send/receive. Fixed-target codecs and
+    /// ambiguous address restoration must retain independent transports.
+    /// Every implementation must declare this capability explicitly; transparent
+    /// wrappers forward the underlying transport's decision.
+    fn supports_shared_destinations(&self) -> bool;
+
     /// Payload budget for packets sent to and received from this logical peer.
     /// Encapsulating transports subtract their headers from the upstream cap.
     /// The default is the u16 wire ceiling; narrower paths must override it.
     /// This never resolves a domain or opens IO.
     fn payload_budget(&self, _peer: &crate::session::Destination) -> DatagramBudget {
         DatagramBudget::new(u16::MAX, u16::MAX)
+    }
+
+    /// Lease an already-open path without borrowing this transport during IO.
+    /// Unsupported paths return the untouched datagram for ordinary `send`.
+    /// This never binds, resolves, or creates an alternative physical path.
+    /// The caller must drop or complete this lease before closing the transport.
+    fn send_owned(&mut self, datagram: Datagram) -> Result<OwnedDatagramSend, Datagram> {
+        Err(datagram)
+    }
+
+    /// A dedicated QUIC endpoint may initialize this same DIRECT physical
+    /// socket through Dialer and retain a lease until endpoint retirement.
+    /// Codecs, proxy hops and pacers do not forward this capability.
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    #[doc(hidden)]
+    async fn lease_quic_socket(
+        &mut self,
+        _peer: std::net::SocketAddr,
+    ) -> Result<Option<crate::transport::quic::PhysicalQuicLease>, DispatchError> {
+        Ok(None)
     }
 
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError>;
@@ -103,6 +142,21 @@ pub trait DatagramTransport: Send {
     /// when another datagram path becomes ready.
     async fn receive(&mut self) -> Result<Datagram, DispatchError>;
 
+    /// Optional cancellation-safe receive seam for readiness multiplexers.
+    /// The caller owns one reusable scratch buffer; it must never be retained
+    /// across polls. Returned datagrams own only their complete payload.
+    fn supports_poll_receive(&self) -> bool {
+        false
+    }
+
+    fn poll_receive(
+        &mut self,
+        _context: &mut Context<'_>,
+        _scratch: &mut Vec<u8>,
+    ) -> Poll<Result<Datagram, DispatchError>> {
+        Poll::Ready(Err(DispatchError::NotAllowed))
+    }
+
     async fn close(&mut self) -> Result<(), DispatchError> {
         Ok(())
     }
@@ -110,6 +164,25 @@ pub trait DatagramTransport: Send {
 
 #[async_trait]
 pub trait Dispatcher: Send + Sync {
+    #[cfg(feature = "inbound-http")]
+    #[doc(hidden)]
+    fn http_context(&self) -> Option<crate::http_processing::HttpContext> {
+        None
+    }
+
+    /// Configured datagram capability, independent of reachability or health.
+    fn supports_udp(&self) -> bool {
+        true
+    }
+
+    async fn sniff_plan(
+        &self,
+        _source: std::net::SocketAddr,
+        _destination: &crate::session::Destination,
+    ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
+        Ok(None)
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError>;
 
     async fn open_datagram(
@@ -138,6 +211,18 @@ impl SessionObservedDispatcher {
 
 #[async_trait]
 impl Dispatcher for SessionObservedDispatcher {
+    fn supports_udp(&self) -> bool {
+        self.inner.supports_udp()
+    }
+
+    async fn sniff_plan(
+        &self,
+        source: std::net::SocketAddr,
+        destination: &crate::session::Destination,
+    ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
+        self.inner.sniff_plan(source, destination).await
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         let stream = self.inner.connect_tcp(session).await?;
         Ok(Box::new(ObservedStream {
@@ -178,6 +263,18 @@ impl HandshakeObservedDispatcher {
 
 #[async_trait]
 impl Dispatcher for HandshakeObservedDispatcher {
+    fn supports_udp(&self) -> bool {
+        self.inner.supports_udp()
+    }
+
+    async fn sniff_plan(
+        &self,
+        source: std::net::SocketAddr,
+        destination: &crate::session::Destination,
+    ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
+        self.inner.sniff_plan(source, destination).await
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         let _activity = self.resource_stats.begin(ResourceActivity::Handshake);
         self.inner.connect_tcp(session).await
@@ -251,8 +348,39 @@ struct ObservedDatagramTransport {
 
 #[async_trait]
 impl DatagramTransport for ObservedDatagramTransport {
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    async fn lease_quic_socket(
+        &mut self,
+        peer: std::net::SocketAddr,
+    ) -> Result<Option<crate::transport::quic::PhysicalQuicLease>, DispatchError> {
+        self.inner.lease_quic_socket(peer).await
+    }
+
+    fn supports_shared_destinations(&self) -> bool {
+        self.inner.supports_shared_destinations()
+    }
+
+    fn supports_poll_receive(&self) -> bool {
+        self.inner.supports_poll_receive()
+    }
+
+    fn poll_receive(
+        &mut self,
+        context: &mut Context<'_>,
+        scratch: &mut Vec<u8>,
+    ) -> Poll<Result<Datagram, DispatchError>> {
+        self.inner.poll_receive(context, scratch)
+    }
+
     fn payload_budget(&self, peer: &crate::session::Destination) -> DatagramBudget {
         self.inner.payload_budget(peer)
+    }
+
+    fn send_owned(&mut self, datagram: Datagram) -> Result<OwnedDatagramSend, Datagram> {
+        self.inner.send_owned(datagram)
     }
 
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
@@ -318,6 +446,10 @@ mod tests {
 
     #[async_trait]
     impl DatagramTransport for NullDatagrams {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
             Ok(())
         }
@@ -352,6 +484,7 @@ mod tests {
 
     fn stream_session(port: u16) -> StreamSession {
         StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::Tun,
             source: "127.0.0.1:10000".parse().unwrap(),
             destination: Destination::Ip(format!("192.0.2.1:{port}").parse().unwrap()),
@@ -371,6 +504,10 @@ mod tests {
         struct InitialTransport(Arc<AtomicUsize>);
         #[async_trait]
         impl DatagramTransport for InitialTransport {
+            fn supports_shared_destinations(&self) -> bool {
+                false
+            }
+
             async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
                 panic!("observer must preserve first-flow metadata");
             }
@@ -405,6 +542,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sends.load(Ordering::Relaxed), 1);
+        drop(observed);
+        assert_eq!(stats.snapshot().udp_current, 0);
+    }
+
+    #[test]
+    fn polled_datagram_observer_forwards_scratch_readiness_and_retains_activity() {
+        struct PolledTransport {
+            scratch_pointer: usize,
+            parent: std::task::Waker,
+            polls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl DatagramTransport for PolledTransport {
+            fn supports_shared_destinations(&self) -> bool {
+                true
+            }
+            fn supports_poll_receive(&self) -> bool {
+                true
+            }
+            fn poll_receive(
+                &mut self,
+                context: &mut Context<'_>,
+                scratch: &mut Vec<u8>,
+            ) -> Poll<Result<Datagram, DispatchError>> {
+                assert!(context.waker().will_wake(&self.parent));
+                assert_eq!(scratch.as_ptr() as usize, self.scratch_pointer);
+                assert_eq!(scratch.as_slice(), b"supplied");
+                scratch.clear();
+                scratch.extend_from_slice(b"used");
+                self.polls.fetch_add(1, Ordering::Relaxed);
+                Poll::Ready(Ok(Datagram {
+                    remote: Destination::Ip("198.51.100.1:443".parse().unwrap()),
+                    payload: bytes::Bytes::from_static(b"ready"),
+                    sniffed_domain: None,
+                }))
+            }
+            async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
+                Ok(())
+            }
+            async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+                panic!("polled observer must not use asynchronous receive")
+            }
+        }
+        let polls = Arc::new(AtomicUsize::new(0));
+        let stats = RuntimeResourceStats::new("polled_observer_test");
+        let parent = futures_util::task::noop_waker();
+        let mut scratch = b"supplied".to_vec();
+        let mut observed = ObservedDatagramTransport {
+            inner: Box::new(PolledTransport {
+                scratch_pointer: scratch.as_ptr() as usize,
+                parent: parent.clone(),
+                polls: polls.clone(),
+            }),
+            _activity: stats.begin(ResourceActivity::UdpAssociation),
+        };
+        assert_eq!(stats.snapshot().udp_current, 1);
+        assert!(observed.supports_poll_receive());
+        assert!(observed.supports_shared_destinations());
+        let mut context = Context::from_waker(&parent);
+        let Poll::Ready(Ok(datagram)) = observed.poll_receive(&mut context, &mut scratch) else {
+            panic!("observer must forward the ready datagram")
+        };
+        assert_eq!(datagram.payload, bytes::Bytes::from_static(b"ready"));
+        assert_eq!(scratch.as_slice(), b"used");
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.snapshot().udp_current, 1);
         drop(observed);
         assert_eq!(stats.snapshot().udp_current, 0);
     }

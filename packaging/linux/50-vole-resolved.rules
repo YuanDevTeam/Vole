@@ -1,0 +1,12 @@
+// Installed authorization for the group allowed to execute the VPN binary.
+polkit.addRule(function(action, subject) {
+    var actions = [
+        "org.freedesktop.resolve1.set-dns-servers",
+        "org.freedesktop.resolve1.set-domains",
+        "org.freedesktop.resolve1.set-default-route",
+        "org.freedesktop.resolve1.revert"
+    ];
+    if (subject.isInGroup("vole") && actions.indexOf(action.id) !== -1) {
+        return polkit.Result.YES;
+    }
+});

@@ -106,6 +106,7 @@ rules: ['MATCH,path']
                 geodata_updater,
                 prepared.geodata_registration,
                 proxy_graph,
+                None,
             )
             .await
             .unwrap();

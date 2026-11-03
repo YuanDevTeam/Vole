@@ -9,7 +9,8 @@ description = "Bounded userspace IPv4/IPv6 TCP and UDP netstack for Vole"
 [dependencies]
 bytes = "1"
 futures-util = "0.3"
-smoltcp = { version = "0.14", default-features = false, features = [
+# Upstream recovery fixes preserve retries when bounded packet output is full.
+smoltcp = { git = "https://github.com/smoltcp-rs/smoltcp", rev = "24bda3b4f982625d8453d4360172557d24921c76", default-features = false, features = [
     "std",
     "medium-ip",
     "auto-icmp-echo-reply",

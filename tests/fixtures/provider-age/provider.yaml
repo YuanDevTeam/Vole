@@ -1,0 +1,6 @@
+proxies:
+  - name: age-node
+    type: socks5
+    server: 192.0.2.9
+    port: 1080
+    udp: true

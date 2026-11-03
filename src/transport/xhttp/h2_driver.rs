@@ -18,13 +18,21 @@ pub(super) async fn connect(
     send_buffer: usize,
     period: i32,
     owner: &DriverOwner,
+    private_active_h2: bool,
 ) -> io::Result<(SendRequest, Arc<ConnectionGuard>)> {
     let last_read = Arc::new(Mutex::new(Instant::now()));
     let (raw, writes) = Writes::wrap(raw);
-    let (sender, mut connection) = h2::client::Builder::new()
+    let mut builder = h2::client::Builder::new();
+    builder
         .max_header_list_size(super::MAX_H2_HEADER_LIST_SIZE)
         .max_send_buffer_size(send_buffer)
-        .enable_push(false)
+        .enable_push(false);
+    if private_active_h2 {
+        // Until the first peer SETTINGS is processed, do not borrow four
+        // logical streams against an unknown remote concurrency limit.
+        builder.initial_max_send_streams(1);
+    }
+    let (sender, mut connection) = builder
         .handshake(ActivityIo {
             raw: Box::new(raw),
             last_read: last_read.clone(),

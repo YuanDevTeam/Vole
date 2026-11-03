@@ -1,9 +1,21 @@
-//! Static ECH configuration admission shared by both TLS backends. In
-//! particular, BoringSSL otherwise silently skips unsupported configurations.
+//! Bounded static or DNS-sourced ECH admission for the selected TLS backend.
+//! Admission precedes handshake setup so no backend silently skips ECH.
 use super::*;
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct StaticEchConfig(Vec<u8>);
+#[derive(Clone)]
+pub struct StaticEchConfig {
+    wire: Vec<u8>,
+    source: std::sync::Arc<[u8]>,
+    query: Option<Option<String>>,
+    named: bool,
+}
+
+impl PartialEq for StaticEchConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.wire == other.wire && self.query == other.query && self.named == other.named
+    }
+}
+impl Eq for StaticEchConfig {}
 
 impl std::fmt::Debug for StaticEchConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -15,6 +27,10 @@ impl StaticEchConfig {
     /// Keeps the first mutually supported config's exact wire encoding. No
     /// backend can skip an earlier unsupported entry and expose the inner SNI.
     pub fn from_config_list(bytes: &[u8]) -> Result<Self> {
+        Self::from_config_list_for_backend(bytes, true)
+    }
+
+    pub(crate) fn from_config_list_for_backend(bytes: &[u8], named: bool) -> Result<Self> {
         if bytes.len() > 65_537 {
             return invalid("ECH config list exceeds the wire bound");
         }
@@ -27,7 +43,7 @@ impl StaticEchConfig {
             let start = configs.0;
             let version = configs.u16()?;
             let contents = configs.vector16()?;
-            if version == 0xfe0d && supported(contents)? && selected.is_none() {
+            if version == 0xfe0d && supported(contents, named)? && selected.is_none() {
                 selected = Some(&start[..4 + contents.len()]);
             }
         }
@@ -36,16 +52,56 @@ impl StaticEchConfig {
         })?;
         let mut wire = (selected.len() as u16).to_be_bytes().to_vec();
         wire.extend_from_slice(selected);
-        Ok(Self(wire))
+        Ok(Self {
+            wire,
+            source: bytes.into(),
+            query: None,
+            named,
+        })
     }
 
-    #[cfg(feature = "tls-fingerprint")]
+    #[cfg(any(feature = "tls-fingerprint", feature = "ech"))]
     pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.0
+        assert!(
+            self.query.is_none(),
+            "dynamic ECH must resolve before TLS setup"
+        );
+        &self.wire
+    }
+    pub(crate) fn for_backend(&self, named: bool) -> Result<Self> {
+        if self.named == named {
+            return Ok(self.clone());
+        }
+        if self.is_dynamic() {
+            return Ok(Self {
+                named,
+                ..self.clone()
+            });
+        }
+        Self::from_config_list_for_backend(&self.source, named)
+    }
+
+    pub(crate) fn is_dynamic(&self) -> bool {
+        self.query.is_some()
+    }
+    pub(crate) async fn resolve(
+        &self,
+        server_name: &str,
+        context: &crate::outbound::EstablishContext,
+    ) -> std::io::Result<Self> {
+        let Some(query) = &self.query else {
+            return Ok(self.clone());
+        };
+        let wire = context
+            .resolution()
+            .resolve_ech(query.as_deref().unwrap_or(server_name), context.deadline())
+            .await?;
+        Self::from_config_list_for_backend(&wire, self.named)
+            .map_err(|_| std::io::Error::other("DNS has no compatible ECH configuration"))
     }
 }
 
-fn supported(bytes: &[u8]) -> Result<bool> {
+fn supported(bytes: &[u8], named: bool) -> Result<bool> {
     let mut r = Reader(bytes);
     r.take(1)?; // config_id
     let kem = r.u16()?;
@@ -55,7 +111,12 @@ fn supported(bytes: &[u8]) -> Result<bool> {
         return invalid("invalid ECH cipher suites");
     }
     let compatible_suite = suites.as_chunks::<4>().0.iter().any(|suite| {
-        suite[..2] == [0, 1] && matches!(u16::from_be_bytes([suite[2], suite[3]]), 1..=3)
+        matches!(u16::from_be_bytes([suite[2], suite[3]]), 1..=3)
+            && if named {
+                suite[..2] == [0, 1]
+            } else {
+                matches!(u16::from_be_bytes([suite[0],suite[1]]), 1..=3 | 0x10..=0x11)
+            }
     });
     r.take(1)?; // maximum_name_length
     let name_len = usize::from(r.take(1)?[0]);
@@ -69,16 +130,28 @@ fn supported(bytes: &[u8]) -> Result<bool> {
         extensions.vector16()?;
         compatible_extensions &= kind & 0x8000 == 0 && seen.insert(kind);
     }
-    Ok(kem == 0x0020
-        && key.len() == 32
+    let compatible_key = if named {
+        kem == 0x0020 && key.len() == 32
+    } else {
+        #[cfg(feature = "ech")]
+        {
+            crate::security::ech::valid_public_key(kem, key)
+        }
+        #[cfg(not(feature = "ech"))]
+        {
+            false
+        }
+    };
+    Ok(compatible_key
         && compatible_suite
         && compatible_extensions
-        && valid_public_name(name))
+        && valid_public_name(name, named))
 }
 
-fn valid_public_name(name: &[u8]) -> bool {
-    // Match the stricter fixed BoringSSL LDH/IP-lookalike admission rules.
-    if name.is_empty() || name.len() > 253 {
+fn valid_public_name(name: &[u8], named: bool) -> bool {
+    // The reference requires a multi-label LDH name. The selected backend
+    // must also represent it; BoringSSL rejects hexadecimal IP lookalikes.
+    if name.is_empty() || name.len() > 253 || !name.contains(&b'.') {
         return false;
     }
     if name.split(|b| *b == b'.').any(|label| {
@@ -94,7 +167,8 @@ fn valid_public_name(name: &[u8]) -> bool {
     }
     let last = name.rsplit(|b| *b == b'.').next().unwrap_or_default();
     !last.iter().all(u8::is_ascii_digit)
-        && !(last.len() >= 2
+        && !(named
+            && last.len() >= 2
             && last[0] == b'0'
             && matches!(last[1], b'x' | b'X')
             && last[2..].iter().all(u8::is_ascii_hexdigit))
@@ -132,6 +206,12 @@ pub(super) struct RawEch {
     enable: bool,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     config: Option<String>,
+    #[serde(
+        rename = "query-server-name",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    query_server_name: Option<String>,
 }
 
 impl std::fmt::Debug for RawEch {
@@ -141,23 +221,34 @@ impl std::fmt::Debug for RawEch {
 }
 
 impl RawEch {
-    pub(super) fn normalize(self) -> Result<Option<StaticEchConfig>> {
+    pub(super) fn normalize(self, named: bool) -> Result<Option<StaticEchConfig>> {
         if !self.enable {
-            if self.config.as_ref().is_some_and(|value| !value.is_empty()) {
-                return invalid("ECH config requires enable=true");
-            }
             return Ok(None);
         }
-        let encoded = self.config.ok_or_else(|| {
-            VoleError::InvalidConfig("static ECH requires an explicit config".into())
-        })?;
+        if !cfg!(feature = "ech") {
+            return invalid("ECH is not compiled in");
+        }
+        let encoded = self.config.unwrap_or_default();
+        if encoded.is_empty() {
+            let query = self.query_server_name.filter(|name| !name.is_empty());
+            if let Some(name) = &query {
+                crate::dns::canonicalize_name(name)
+                    .map_err(|_| VoleError::InvalidConfig("invalid ECH query name".into()))?;
+            }
+            return Ok(Some(StaticEchConfig {
+                wire: Vec::new(),
+                source: std::sync::Arc::from([]),
+                query: Some(query),
+                named,
+            }));
+        }
         if encoded.len() > 87_384 {
             return invalid("ECH config exceeds the wire bound");
         }
         let wire = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|_| VoleError::InvalidConfig("invalid ECH Base64 config".into()))?;
-        StaticEchConfig::from_config_list(&wire).map(Some)
+        StaticEchConfig::from_config_list_for_backend(&wire, named).map(Some)
     }
 }
 
@@ -166,5 +257,5 @@ where
     D: Deserializer<'de>,
 {
     deserialize_present_map(deserializer)
-        .map_err(|_| serde::de::Error::custom("invalid static ECH options"))
+        .map_err(|_| serde::de::Error::custom("invalid ECH options"))
 }

@@ -1,4 +1,7 @@
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{Arc, Mutex},
+};
 
 use rustls::{
     ClientConfig,
@@ -11,6 +14,7 @@ use tokio_rustls::TlsConnector;
 use crate::dispatch::BoxStream;
 
 use super::SecurityContext;
+use super::identity::{ClientIdentitySource, IdentityEpoch, IdentityMaterial, IdentitySnapshot};
 
 pub(crate) const DEFAULT_TLS_BUFFER_LIMIT: usize = 64 * 1024;
 
@@ -29,7 +33,7 @@ pub enum TlsVersions {
 
 /// Immutable per-node, per-transport TLS options. Constructing another client
 /// always creates an independent resumption store, even for the same SNI.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TlsClientOptions {
     pub ech: Option<crate::config::StaticEchConfig>,
     pub client_fingerprint: Option<crate::config::ClientFingerprint>,
@@ -54,12 +58,78 @@ impl std::fmt::Debug for TlsClientOptions {
     }
 }
 
-/// A node-owned certificate chain and matching key. The provider validates the
-/// key pair while constructing the client, before any supplied stream is used.
-/// No file loading, environment key logging or dynamic identity reload occurs.
+impl TlsClientOptions {
+    #[cfg(any(
+        test,
+        feature = "outbound-anytls",
+        feature = "outbound-trojan",
+        feature = "outbound-vmess",
+        feature = "outbound-socks5"
+    ))]
+    pub(crate) fn from_policy(
+        policy: &crate::config::TlsClientPolicy,
+        required_alpn: Option<&[u8]>,
+        context: &SecurityContext,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            ech: policy.ech.clone(),
+            client_fingerprint: policy.client_fingerprint,
+            alpn: policy.alpn.clone(),
+            required_alpn: required_alpn.map(<[u8]>::to_vec),
+            certificate: policy.certificate.clone(),
+            identity: policy
+                .identity
+                .as_ref()
+                .map(|identity| TlsClientIdentity::from_config(identity, context))
+                .transpose()?,
+            ..Default::default()
+        })
+    }
+}
+
+/// Parsed inline material or an explicitly registered file-backed identity.
+/// Handshakes only snapshot published material; they never read a file.
+#[derive(Clone)]
 pub struct TlsClientIdentity {
-    pub(super) certificates: Vec<CertificateDer<'static>>,
-    pub(super) key: PrivateKeyDer<'static>,
+    storage: IdentityStorage,
+    #[cfg(any(feature = "tls-fingerprint", feature = "quiche-h3-transport"))]
+    native: Option<Arc<NativeIdentityClient>>,
+}
+
+#[derive(Clone)]
+enum IdentityStorage {
+    Inline(Arc<IdentityMaterial>),
+    Files(Arc<ClientIdentitySource>),
+}
+
+#[cfg(any(feature = "tls-fingerprint", feature = "quiche-h3-transport"))]
+struct NativeIdentityClient {
+    identity: TlsClientIdentity,
+    current: Mutex<Option<(u64, Arc<super::identity::NativeIdentity>)>>,
+    _lease: Option<Arc<()>>,
+}
+
+#[cfg(any(feature = "tls-fingerprint", feature = "quiche-h3-transport"))]
+impl NativeIdentityClient {
+    fn snapshot(&self) -> io::Result<IdentitySnapshot> {
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| io::Error::other("TLS identity unavailable"))?;
+        let mut snapshot = self.identity.snapshot();
+        let native = match current.as_ref() {
+            Some((generation, native)) if *generation == snapshot.epoch.generation() => {
+                native.clone()
+            }
+            _ => {
+                let native = snapshot.material.native()?;
+                *current = Some((snapshot.epoch.generation(), native.clone()));
+                native
+            }
+        };
+        snapshot.native = Some(native);
+        Ok(snapshot)
+    }
 }
 
 impl TlsClientIdentity {
@@ -77,20 +147,87 @@ impl TlsClientIdentity {
         if keys.next().is_some() || certificates.is_empty() {
             return Err(invalid());
         }
-        rustls::sign::CertifiedKey::from_der(
-            certificates.clone(),
-            key.clone_key(),
-            &rustls::crypto::ring::default_provider(),
-        )
-        .map_err(|_| invalid())?;
-        Ok(Self { certificates, key })
+        let identity = Self::from_der(certificates, key);
+        identity.snapshot().material.validate()?;
+        Ok(identity)
     }
 
     pub fn from_der(
         certificates: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Self {
-        Self { certificates, key }
+        Self {
+            storage: IdentityStorage::Inline(Arc::new(IdentityMaterial::new(certificates, key))),
+            #[cfg(any(feature = "tls-fingerprint", feature = "quiche-h3-transport"))]
+            native: None,
+        }
+    }
+
+    pub(crate) fn from_config(
+        identity: &crate::config::TlsIdentityPem,
+        context: &SecurityContext,
+    ) -> io::Result<Self> {
+        let initial = Self::from_pem(&identity.certificate, &identity.private_key)?;
+        let Some(origin) = &identity.origin else {
+            return Ok(initial);
+        };
+        let material = initial.snapshot().material;
+        material.validate()?;
+        let source = context.identities.register(
+            origin,
+            material,
+            identity
+                .certificate
+                .len()
+                .saturating_add(identity.private_key.len()),
+        )?;
+        Ok(Self {
+            storage: IdentityStorage::Files(source),
+            #[cfg(any(feature = "tls-fingerprint", feature = "quiche-h3-transport"))]
+            native: None,
+        })
+    }
+
+    pub(super) fn snapshot(&self) -> IdentitySnapshot {
+        match &self.storage {
+            IdentityStorage::Inline(material) => IdentitySnapshot {
+                material: material.clone(),
+                epoch: IdentityEpoch::default(),
+                #[cfg(any(feature = "tls-fingerprint", feature = "quiche-h3-transport"))]
+                native: None,
+            },
+            IdentityStorage::Files(source) => source.snapshot(),
+        }
+    }
+
+    #[cfg(any(feature = "tls-fingerprint", feature = "quiche-h3-transport"))]
+    pub(super) fn native_snapshot(&self) -> io::Result<IdentitySnapshot> {
+        self.for_native()?.native.as_ref().unwrap().snapshot()
+    }
+
+    #[cfg(any(feature = "tls-fingerprint", feature = "quiche-h3-transport"))]
+    pub(super) fn for_native(&self) -> io::Result<Self> {
+        if self.native.is_some() {
+            return Ok(self.clone());
+        }
+        let lease = match &self.storage {
+            IdentityStorage::Files(source) => Some(source.native_lease()?),
+            IdentityStorage::Inline(_) => None,
+        };
+        let client = Arc::new(NativeIdentityClient {
+            identity: self.clone(),
+            current: Mutex::new(None),
+            _lease: lease,
+        });
+        client.snapshot()?;
+        Ok(Self {
+            storage: self.storage.clone(),
+            native: Some(client),
+        })
+    }
+
+    fn reloadable(&self) -> bool {
+        matches!(self.storage, IdentityStorage::Files(_))
     }
 }
 
@@ -111,21 +248,66 @@ pub(crate) enum StandardTlsProfile {
 /// Reusable standard TLS client shared by protocol-specific outbound code.
 ///
 /// REALITY remains in [`super::SecurityClient`] with a distinct authentication
-/// and session policy. Ordinary unprofiled TLS and QUIC continue to use rustls.
+/// and session policy. Unprofiled stream TLS and Quinn continue to use rustls.
 #[derive(Clone)]
 pub struct StandardTlsClient {
-    connector: StandardConnector,
+    connector: Option<StandardConnector>,
+    rustls_identity: Option<Arc<RustlsIdentityClient>>,
     server_name: String,
     required_alpn: Option<Vec<u8>>,
     buffer_limit: usize,
     require_ech: bool,
+    dynamic_ech: Option<Arc<DynamicEchTls>>,
+    #[cfg(feature = "quiche-h3-transport")]
+    quiche_source: Option<Arc<QuicheSource>>,
+}
+
+struct RustlsIdentityClient {
+    identity: TlsClientIdentity,
+    current: Mutex<(u64, Arc<ClientConfig>)>,
+    sessions: Option<Arc<super::resumption::NodeSessionStore>>,
+}
+
+impl RustlsIdentityClient {
+    fn connector(&self) -> io::Result<TlsConnector> {
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| io::Error::other("TLS identity unavailable"))?;
+        let snapshot = self.identity.snapshot();
+        if current.0 != snapshot.epoch.generation() {
+            let mut config = (*current.1).clone();
+            config.client_auth_cert_resolver = Arc::new(rustls::sign::SingleCertAndKey::from(
+                snapshot.material.certified_key()?,
+            ));
+            config.resumption = self
+                .sessions
+                .as_ref()
+                .map_or_else(Resumption::disabled, |store| {
+                    Resumption::store(store.for_epoch(snapshot.epoch.clone()))
+                });
+            *current = (snapshot.epoch.generation(), Arc::new(config));
+        }
+        Ok(TlsConnector::from(current.1.clone()))
+    }
+}
+
+#[cfg(feature = "quiche-h3-transport")]
+struct QuicheSource {
+    context: SecurityContext,
+    options: Mutex<TlsClientOptions>,
+}
+
+struct DynamicEchTls {
+    context: SecurityContext,
+    options: TlsClientOptions,
 }
 
 #[derive(Clone)]
 enum StandardConnector {
     Rustls(TlsConnector),
     #[cfg(feature = "tls-fingerprint")]
-    Boring(super::boring::BoringTlsClient),
+    Boring(Arc<super::boring::BoringTlsClient>),
 }
 
 impl std::fmt::Debug for StandardTlsClient {
@@ -139,13 +321,82 @@ impl std::fmt::Debug for StandardTlsClient {
 }
 
 impl StandardTlsClient {
-    #[cfg(any(
-        feature = "outbound-vless",
-        feature = "outbound-hysteria2",
-        feature = "outbound-tuic"
-    ))]
+    #[cfg(feature = "quiche-h3-transport")]
+    pub(crate) fn prepare_quiche_identity(&self) -> io::Result<()> {
+        if let Some(source) = &self.quiche_source {
+            let mut options = source
+                .options
+                .lock()
+                .map_err(|_| io::Error::other("TLS identity unavailable"))?;
+            options.identity = options
+                .identity
+                .as_ref()
+                .map(TlsClientIdentity::for_native)
+                .transpose()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "quiche-h3-transport")]
+    pub(crate) fn quiche_config(&self) -> io::Result<super::QuicheTls> {
+        if self.dynamic_ech.is_some() {
+            return Err(io::Error::other(
+                "dynamic ECH requires a node resolution context",
+            ));
+        }
+        let source = self
+            .quiche_source
+            .as_ref()
+            .ok_or_else(|| io::Error::other("HTTP/3 requires H3 ALPN"))?;
+        self.prepare_quiche_identity()?;
+        let options = source
+            .options
+            .lock()
+            .map_err(|_| io::Error::other("TLS identity unavailable"))?
+            .clone();
+        super::QuicheTls::standard(&source.context, &self.server_name, &options)
+    }
+
+    #[cfg(feature = "quiche-h3-transport")]
+    pub(crate) async fn quiche_config_with_context(
+        &self,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<super::QuicheTls> {
+        let Some(dynamic) = &self.dynamic_ech else {
+            return self.quiche_config();
+        };
+        self.prepare_quiche_identity()?;
+        let source = self
+            .quiche_source
+            .as_ref()
+            .ok_or_else(|| io::Error::other("HTTP/3 requires H3 ALPN"))?;
+        let mut options = source
+            .options
+            .lock()
+            .map_err(|_| io::Error::other("TLS identity unavailable"))?
+            .clone();
+        options.ech = Some(
+            dynamic
+                .options
+                .ech
+                .as_ref()
+                .expect("dynamic ECH source")
+                .for_backend(true)
+                .map_err(|_| io::Error::other("ECH has no compatible QUIC configuration"))?
+                .resolve(&self.server_name, context)
+                .await?,
+        );
+        super::QuicheTls::standard(&dynamic.context, &self.server_name, &options)
+    }
+
+    #[cfg(feature = "quic-transport")]
     pub(crate) fn quic_config(&self) -> io::Result<(Arc<ClientConfig>, String)> {
-        match &self.connector {
+        if self.dynamic_ech.is_some() {
+            return Err(io::Error::other(
+                "dynamic ECH requires a node resolution context",
+            ));
+        }
+        match &self.current_connector()? {
             StandardConnector::Rustls(connector) => {
                 // XHTTP validates its exclusive h3 policy before construction.
                 // Hysteria2 also uses H3 but permits a custom negotiated ALPN.
@@ -190,32 +441,6 @@ impl StandardTlsClient {
         )
     }
 
-    #[cfg(feature = "outbound-anytls")]
-    pub(crate) fn for_anytls(
-        context: &SecurityContext,
-        server_name: impl Into<String>,
-        policy: &crate::config::AnyTlsCertificatePolicy,
-        resumption_sessions: usize,
-        buffer_limit: usize,
-    ) -> io::Result<Self> {
-        Self::with_options(
-            context,
-            server_name,
-            TlsClientOptions {
-                alpn: policy.alpn.clone(),
-                client_fingerprint: policy.client_fingerprint,
-                certificate: TlsCertificatePolicy {
-                    verification_name: None,
-                    skip_cert_verify: policy.skip_cert_verify,
-                    fingerprint: policy.fingerprint,
-                },
-                ..Default::default()
-            },
-            resumption_sessions,
-            buffer_limit,
-        )
-    }
-
     /// Wraps caller-supplied streams only: no socket, resolver, background task
     /// or unbounded shared cache is created here. The graph allocates ticket
     /// capacity from its existing aggregate budget; zero disables resumption.
@@ -229,6 +454,16 @@ impl StandardTlsClient {
         let server_name = server_name.into();
         let name = ServerName::try_from(server_name.clone())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid TLS server name"))?;
+        let mut options = options;
+        if let Some(identity) = &options.identity {
+            identity.snapshot().material.validate()?;
+        }
+        options.ech = options
+            .ech
+            .as_ref()
+            .map(|ech| ech.for_backend(options.client_fingerprint.is_some()))
+            .transpose()
+            .map_err(|_| io::Error::other("ECH has no compatible configuration"))?;
         let require_ech = options.ech.is_some();
         if require_ech && !matches!(name, ServerName::DnsName(_)) {
             return Err(io::Error::new(
@@ -236,12 +471,38 @@ impl StandardTlsClient {
                 "ECH requires a DNS server name",
             ));
         }
-        #[cfg(not(feature = "outbound-vless"))]
+        #[cfg(not(feature = "ech"))]
         if require_ech {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "ECH is not compiled in",
             ));
+        }
+        if options
+            .ech
+            .as_ref()
+            .is_some_and(crate::config::StaticEchConfig::is_dynamic)
+        {
+            #[cfg(feature = "tls-fingerprint")]
+            if options.client_fingerprint.is_some() {
+                // DNS resolution rebuilds only ECH's physical TLS context.
+                // The node's native identity owner/cache survives those builds.
+                options.identity = options
+                    .identity
+                    .as_ref()
+                    .map(TlsClientIdentity::for_native)
+                    .transpose()?;
+            }
+            let mut plain = options.clone();
+            plain.ech = None;
+            plain.versions = TlsVersions::Tls13;
+            let mut client = Self::with_options(context, server_name, plain, 0, buffer_limit)?;
+            client.require_ech = true;
+            client.dynamic_ech = Some(Arc::new(DynamicEchTls {
+                context: context.clone(),
+                options,
+            }));
+            return Ok(client);
         }
         if buffer_limit == 0 {
             return Err(io::Error::new(
@@ -274,6 +535,18 @@ impl StandardTlsClient {
             ));
         }
 
+        #[cfg(feature = "quiche-h3-transport")]
+        let quiche_source = options
+            .alpn
+            .iter()
+            .any(|protocol| protocol == b"h3")
+            .then(|| {
+                Arc::new(QuicheSource {
+                    context: context.clone(),
+                    options: Mutex::new(options.clone()),
+                })
+            });
+
         if options.client_fingerprint.is_some() {
             #[cfg(not(feature = "tls-fingerprint"))]
             return Err(io::Error::new(
@@ -289,11 +562,15 @@ impl StandardTlsClient {
                     resumption_sessions,
                 )?;
                 return Ok(Self {
-                    connector: StandardConnector::Boring(client),
+                    connector: Some(StandardConnector::Boring(Arc::new(client))),
+                    rustls_identity: None,
                     server_name,
                     required_alpn: options.required_alpn,
                     buffer_limit,
                     require_ech,
+                    dynamic_ech: None,
+                    #[cfg(feature = "quiche-h3-transport")]
+                    quiche_source,
                 });
             }
         }
@@ -304,7 +581,7 @@ impl StandardTlsClient {
             TlsVersions::Tls12And13 => &[&TLS13, &TLS12],
         };
         let builder = ClientConfig::builder_with_provider(context.provider.clone());
-        #[cfg(feature = "outbound-vless")]
+        #[cfg(feature = "ech")]
         let builder = if let Some(ech) = &options.ech {
             let ech = rustls::client::EchConfig::new(ech.as_bytes().into(), super::ech::SUITES)
                 .map_err(|_| {
@@ -316,61 +593,179 @@ impl StandardTlsClient {
                 .with_protocol_versions(protocol_versions)
                 .map_err(io_other)?
         };
-        #[cfg(not(feature = "outbound-vless"))]
+        #[cfg(not(feature = "ech"))]
         let builder = builder
             .with_protocol_versions(protocol_versions)
             .map_err(io_other)?;
         let builder = builder.with_root_certificates(context.tls_roots.clone());
-        let mut config = if let Some(identity) = options.identity {
-            let identity_size = identity
-                .certificates
-                .iter()
-                .try_fold(identity.key.secret_der().len(), |size, cert| {
-                    size.checked_add(cert.len())
-                });
-            if identity_size.is_none_or(|size| size > crate::config::MAX_CONFIG_BYTES) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "TLS client identity exceeds the configuration bound",
-                ));
-            }
-            builder
-                .with_client_auth_cert(identity.certificates, identity.key)
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid TLS client identity")
-                })?
+        let identity_snapshot = options.identity.as_ref().map(TlsClientIdentity::snapshot);
+        let mut config = if let Some(identity) = &identity_snapshot {
+            builder.with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+                identity.material.certified_key()?,
+            )))
         } else {
             builder.with_no_client_auth()
         };
-        config.resumption = if resumption_sessions == 0 || require_ech {
-            Resumption::disabled()
-        } else {
-            Resumption::store(Arc::new(super::resumption::NodeSessionStore::new(
+        let sessions = (resumption_sessions != 0 && !require_ech).then(|| {
+            Arc::new(super::resumption::NodeSessionStore::new(
                 name,
                 resumption_sessions,
-            )))
-        };
+            ))
+        });
+        config.resumption = sessions
+            .as_ref()
+            .map_or_else(Resumption::disabled, |store| {
+                Resumption::store(
+                    store.for_epoch(
+                        identity_snapshot
+                            .as_ref()
+                            .map(|identity| identity.epoch.clone())
+                            .unwrap_or_default(),
+                    ),
+                )
+            });
 
         config.alpn_protocols = options.alpn;
         config.dangerous().set_certificate_verifier(Arc::new(
             super::verifier::CertificateVerifier::new(context, options.certificate)?,
         ));
 
+        let config = Arc::new(config);
+        let rustls_identity =
+            options
+                .identity
+                .filter(TlsClientIdentity::reloadable)
+                .map(|identity| {
+                    Arc::new(RustlsIdentityClient {
+                        identity,
+                        current: Mutex::new((
+                            identity_snapshot.as_ref().unwrap().epoch.generation(),
+                            config.clone(),
+                        )),
+                        sessions,
+                    })
+                });
         Ok(Self {
-            connector: StandardConnector::Rustls(TlsConnector::from(Arc::new(config))),
+            connector: rustls_identity
+                .is_none()
+                .then(|| StandardConnector::Rustls(TlsConnector::from(config))),
+            rustls_identity,
             server_name,
             required_alpn: options.required_alpn,
             buffer_limit,
             require_ech,
+            dynamic_ech: None,
+            #[cfg(feature = "quiche-h3-transport")]
+            quiche_source,
         })
     }
 
+    fn current_connector(&self) -> io::Result<StandardConnector> {
+        self.rustls_identity.as_ref().map_or_else(
+            || {
+                self.connector
+                    .clone()
+                    .ok_or_else(|| io::Error::other("TLS connector unavailable"))
+            },
+            |identity| identity.connector().map(StandardConnector::Rustls),
+        )
+    }
+
+    async fn resolved(&self, context: &crate::outbound::EstablishContext) -> io::Result<Self> {
+        let Some(dynamic) = &self.dynamic_ech else {
+            return Ok(self.clone());
+        };
+        let mut options = dynamic.options.clone();
+        options.ech = Some(
+            options
+                .ech
+                .as_ref()
+                .expect("dynamic ECH source")
+                .resolve(&self.server_name, context)
+                .await?,
+        );
+        Self::with_options(
+            &dynamic.context,
+            &self.server_name,
+            options,
+            0,
+            self.buffer_limit,
+        )
+    }
+
+    pub(crate) async fn connect_with_context(
+        &self,
+        stream: BoxStream,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<BoxStream> {
+        self.resolved(context).await?.connect(stream).await
+    }
+
+    #[cfg(feature = "outbound-trusttunnel")]
+    pub(crate) async fn connect_h2_prior_knowledge(
+        &self,
+        stream: BoxStream,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<BoxStream> {
+        if self.required_alpn.as_deref() != Some(b"h2") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "H2 prior knowledge requires an H2 TLS policy",
+            ));
+        }
+        self.resolved(context)
+            .await?
+            .connect_negotiated_inner(stream, true)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    #[cfg(any(
+        feature = "outbound-vless",
+        feature = "outbound-hysteria2",
+        feature = "outbound-tuic",
+        feature = "outbound-trusttunnel"
+    ))]
+    pub(crate) async fn quic_config_with_context(
+        &self,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<(Arc<ClientConfig>, String)> {
+        self.resolved(context).await?.quic_config()
+    }
+
     pub async fn connect(&self, stream: BoxStream) -> io::Result<BoxStream> {
-        let connector = match &self.connector {
+        self.connect_negotiated(stream)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    /// Returns the authenticated stream and the server's actual ALPN choice.
+    /// Existing required-ALPN/ECH checks apply before either becomes visible.
+    pub async fn connect_negotiated(
+        &self,
+        stream: BoxStream,
+    ) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
+        self.connect_negotiated_inner(stream, false).await
+    }
+
+    async fn connect_negotiated_inner(
+        &self,
+        stream: BoxStream,
+        allow_missing_alpn: bool,
+    ) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
+        if self.dynamic_ech.is_some() {
+            return Err(io::Error::other(
+                "dynamic ECH requires a node resolution context",
+            ));
+        }
+        let current = self.current_connector()?;
+        let connector = match &current {
             StandardConnector::Rustls(connector) => connector,
             #[cfg(feature = "tls-fingerprint")]
             StandardConnector::Boring(client) => {
-                return client.connect(stream, self.buffer_limit).await;
+                return client
+                    .connect_negotiated_with_policy(stream, self.buffer_limit, allow_missing_alpn)
+                    .await;
             }
         };
         let server_name = ServerName::try_from(self.server_name.clone())
@@ -386,16 +781,14 @@ impl StandardTlsClient {
             return Err(io::Error::other("TLS ECH was not accepted"));
         }
 
-        if let Some(required_alpn) = self.required_alpn.as_deref()
-            && tls.get_ref().1.alpn_protocol() != Some(required_alpn)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "TLS server did not negotiate the required ALPN",
-            ));
-        }
+        validate_alpn(
+            self.required_alpn.as_deref(),
+            tls.get_ref().1.alpn_protocol(),
+            allow_missing_alpn,
+        )?;
 
-        Ok(Box::new(super::stream::TlsStream::new(tls)))
+        let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        Ok((Box::new(super::stream::TlsStream::new(tls)), alpn))
     }
 
     #[cfg(feature = "outbound-vless")]
@@ -410,7 +803,8 @@ impl StandardTlsClient {
                 "Vision with ECH is not supported",
             ));
         }
-        let connector = match &self.connector {
+        let current = self.current_connector()?;
+        let connector = match &current {
             StandardConnector::Rustls(connector) => connector,
             StandardConnector::Boring(client) => {
                 return client
@@ -443,6 +837,22 @@ impl StandardTlsClient {
     pub(super) const fn buffer_limit(&self) -> usize {
         self.buffer_limit
     }
+}
+
+pub(super) fn validate_alpn(
+    required: Option<&[u8]>,
+    negotiated: Option<&[u8]>,
+    allow_missing: bool,
+) -> io::Result<()> {
+    if required.is_some_and(|required| {
+        negotiated != Some(required) && !(allow_missing && negotiated.is_none())
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TLS server did not negotiate the required ALPN",
+        ));
+    }
+    Ok(())
 }
 
 fn io_other(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {

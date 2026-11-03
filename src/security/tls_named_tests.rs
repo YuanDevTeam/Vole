@@ -59,7 +59,7 @@ async fn alps_exchange(
     let (io, peer) = tokio::io::duplex(16384);
     tokio::time::timeout(Duration::from_secs(3), async {
         let server = async {
-            let Ok(mut tls) = tokio_boring::SslStreamBuilder::new(ssl, peer)
+            let Ok(tls) = tokio_boring::SslStreamBuilder::new(ssl, peer)
                 .accept()
                 .await
             else {
@@ -67,21 +67,72 @@ async fn alps_exchange(
             };
             let negotiated = tls.ssl().peer_application_settings().is_some();
             let resumed = tls.ssl().session_reused();
-            let mut request = [0; 4];
-            let count = tls.read(&mut request).await.unwrap_or(0);
-            if count != 0 {
-                assert_eq!(&request[..count], &b"ping"[..count]);
-                tls.write_all(b"pong").await.unwrap();
-            }
+            let mut connection = h2::server::Builder::new()
+                .max_concurrent_streams(7)
+                .initial_window_size(32768)
+                .handshake::<_, bytes::Bytes>(tls)
+                .await
+                .unwrap();
+            let Some(Ok((mut request, mut respond))) = connection.accept().await else {
+                return (negotiated, 0, resumed);
+            };
+            let exchange = async {
+                let data = request.body_mut().data().await.unwrap().unwrap();
+                assert_eq!(data.as_ref(), b"ping");
+                request
+                    .body_mut()
+                    .flow_control()
+                    .release_capacity(data.len())
+                    .unwrap();
+                let mut response = respond
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                response
+                    .send_data(bytes::Bytes::from_static(b"pong"), true)
+                    .unwrap();
+                data.len()
+            };
+            let count = tokio::select! {
+                count = exchange => count,
+                _ = std::future::poll_fn(|cx| connection.poll_closed(cx)) => 0,
+            };
+            connection.graceful_shutdown();
+            let _ = std::future::poll_fn(|cx| connection.poll_closed(cx)).await;
             (negotiated, count, resumed)
         };
         let consumer = async {
-            let mut tls = client.connect(Box::new(io)).await?;
-            tls.write_all(b"ping").await?;
-            let mut response = [0; 4];
-            tls.read_exact(&mut response).await?;
-            assert_eq!(&response, b"pong");
-            Ok(())
+            let tls = client.connect(Box::new(io)).await?;
+            let (mut sender, connection) = h2::client::handshake(tls).await.map_err(io_other)?;
+            let exchange = async {
+                let (response, mut body) = sender
+                    .send_request(
+                        http::Request::builder()
+                            .uri("https://fixture.invalid/")
+                            .body(())
+                            .unwrap(),
+                        false,
+                    )
+                    .map_err(io_other)?;
+                body.send_data(bytes::Bytes::from_static(b"ping"), true)
+                    .map_err(io_other)?;
+                let mut response = response.await.map_err(io_other)?;
+                let data = response
+                    .body_mut()
+                    .data()
+                    .await
+                    .ok_or_else(|| io::Error::other("missing H2 response"))?
+                    .map_err(io_other)?;
+                assert_eq!(data.as_ref(), b"pong");
+                response
+                    .body_mut()
+                    .flow_control()
+                    .release_capacity(data.len())
+                    .map_err(io_other)?;
+                Ok::<(), io::Error>(())
+            };
+            let (business, driver) = tokio::join!(exchange, connection);
+            business?;
+            driver.map_err(io_other)
         };
         let (result, (negotiated, bytes, resumed)) = tokio::join!(consumer, server);
         (result, negotiated, bytes, resumed)
@@ -91,48 +142,41 @@ async fn alps_exchange(
 }
 
 #[tokio::test]
-async fn selected_profiles_enforce_alps_before_business_and_ticket_publication() {
+async fn selected_profiles_use_standard_h2_settings_when_the_server_supports_alps() {
     use crate::config::ClientFingerprint;
     let chain = chain(false);
-    for profile in crate::security::test_profiles().iter().copied().flatten() {
-        let chrome = matches!(
-            profile,
-            ClientFingerprint::Chrome120 | ClientFingerprint::Chrome133
-        );
-        let new_codepoint = profile == ClientFingerprint::Chrome133;
-        for settings in [
-            None,
-            Some(b"".as_slice()),
-            Some(b"\0\x03\0\0\0\x64".as_slice()),
-        ] {
-            let peer = native_peer(&chain);
-            let client = StandardTlsClient::with_options(
-                &trusted(&chain),
-                "fixture.invalid",
-                TlsClientOptions {
-                    client_fingerprint: Some(profile),
-                    alpn: vec![b"h2".to_vec()],
-                    required_alpn: Some(b"h2".to_vec()),
-                    ..Default::default()
-                },
-                4,
-                65536,
-            )
-            .unwrap();
-            let rejected = chrome && settings.is_some_and(|bytes| !bytes.is_empty());
-            let (result, negotiated, bytes, _) =
-                alps_exchange(&client, &peer, new_codepoint, settings).await;
-            assert_eq!(negotiated, chrome && settings.is_some());
-            if rejected {
-                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
-                assert_eq!(bytes, 0, "nonempty ALPS cannot admit application data");
-                let (result, _, bytes, resumed) =
-                    alps_exchange(&client, &peer, new_codepoint, Some(b"")).await;
+    for profile in [
+        ClientFingerprint::Chrome133,
+        ClientFingerprint::Firefox120,
+        ClientFingerprint::Safari16,
+        ClientFingerprint::Ios14,
+        ClientFingerprint::Edge85,
+        ClientFingerprint::Qq111,
+    ] {
+        for new_codepoint in [false, true] {
+            for settings in [
+                None,
+                Some(b"".as_slice()),
+                Some(b"\0\x03\0\0\0\x64".as_slice()),
+            ] {
+                let peer = native_peer(&chain);
+                let client = StandardTlsClient::with_options(
+                    &trusted(&chain),
+                    "fixture.invalid",
+                    TlsClientOptions {
+                        client_fingerprint: Some(profile),
+                        alpn: vec![b"h2".to_vec()],
+                        required_alpn: Some(b"h2".to_vec()),
+                        ..Default::default()
+                    },
+                    4,
+                    65536,
+                )
+                .unwrap();
+                let (result, negotiated, bytes, _) =
+                    alps_exchange(&client, &peer, new_codepoint, settings).await;
                 result.unwrap();
-                assert_eq!(bytes, 4);
-                assert!(!resumed, "rejected ALPS cannot publish tickets");
-            } else {
-                result.unwrap();
+                assert!(!negotiated, "the H2 consumer did not declare TLS ALPS");
                 assert_eq!(bytes, 4);
             }
         }

@@ -2,8 +2,9 @@
 use super::{bandwidth::Bandwidth, salamander, socket::WindowSocket};
 use crate::{
     config::Hysteria2OutboundConfig,
-    dispatch::{DatagramBudget, DispatchError},
+    dispatch::{DatagramBudget, DatagramTransport, DispatchError},
     outbound::{DatagramRequest, EstablishContext, UpstreamPath},
+    security::StandardTlsClient,
     session::{DatagramSession, Destination},
     transport::quic::{self, DatagramDriver, DatagramSocket},
 };
@@ -12,6 +13,12 @@ use tokio::time::Instant;
 
 const QUIC_PAYLOAD: u16 = crate::limits::HY2_QUIC_PAYLOAD as u16;
 const RETIRE_AFTER: Duration = Duration::from_secs(crate::limits::HY2_PATH_RETIRE_SECONDS as u64);
+
+/// Borrow Realm preparation state without moving its cancellation/Stop owner.
+pub(super) struct RealmSetup<'a> {
+    pub tls: Option<&'a StandardTlsClient>,
+    pub pending: &'a mut super::realm::Pending,
+}
 
 pub(super) struct Paths {
     config: Arc<Hysteria2OutboundConfig>,
@@ -33,9 +40,14 @@ impl Paths {
         datagram: DatagramSession,
         context: EstablishContext,
         bandwidth: Arc<Bandwidth>,
+        realm: RealmSetup<'_>,
     ) -> Result<(Self, Arc<WindowSocket>), DispatchError> {
-        let destination = upstream.datagram_server(server, &context)?;
-        let peer = context.resolve_ip(&destination).await?;
+        let peer = if config.realm.is_some() {
+            SocketAddr::from(([0, 0, 0, 0], config.port))
+        } else {
+            let destination = upstream.datagram_server(server, &context).await?;
+            context.resolve_ip(&destination).await?
+        };
         let mut paths = Self {
             config,
             upstream,
@@ -48,7 +60,24 @@ impl Paths {
             retiring: None,
             current_socket: None,
         };
-        let (socket, driver) = paths.attach(&paths.context).await?;
+        let (socket, driver) = if let Some(options) = &paths.config.realm {
+            let wire_mtu = paths.wire_mtu();
+            let (raw, peer) = realm
+                .pending
+                .open(
+                    options,
+                    realm.tls,
+                    &paths.upstream,
+                    &paths.datagram,
+                    &paths.context,
+                    DatagramBudget::new(wire_mtu, wire_mtu),
+                )
+                .await?;
+            paths.peer = peer;
+            paths.attach_transport(raw, peer)?
+        } else {
+            paths.attach(&paths.context).await?
+        };
         paths.current = Some(driver);
         paths.mtu = socket.budget().quic_payload_limit()?;
         paths.current_socket = Some(socket.clone());
@@ -71,18 +100,39 @@ impl Paths {
         &self,
         context: &EstablishContext,
     ) -> Result<(Arc<DatagramSocket>, DatagramDriver), DispatchError> {
-        let wire_mtu = QUIC_PAYLOAD
-            + if self.config.obfs_password.is_some() {
-                salamander::OVERHEAD
-            } else {
-                0
-            };
+        let wire_mtu = self.wire_mtu();
         let request = DatagramRequest::new(self.datagram.clone())
-            .with_budget(DatagramBudget::new(wire_mtu, wire_mtu));
+            .with_budget(DatagramBudget::new(wire_mtu, wire_mtu))
+            .with_udp_receive_buffer_size(2 * 1024 * 1024);
         let raw = self.upstream.open_datagram(request, context).await?;
-        // Pace the encrypted wire packet, including the optional salt.
-        let raw = self.bandwidth.wrap(raw, wire_mtu);
-        let raw = if let Some(password) = &self.config.obfs_password {
+        self.attach_transport(raw, self.physical_peer())
+    }
+    fn wire_mtu(&self) -> u16 {
+        if let Some(gecko) = &self.config.gecko {
+            (QUIC_PAYLOAD + salamander::OVERHEAD).max(gecko.max_packet_size)
+        } else {
+            QUIC_PAYLOAD
+                + if self.config.obfs_password.is_some() {
+                    salamander::OVERHEAD
+                } else {
+                    0
+                }
+        }
+    }
+    fn attach_transport(
+        &self,
+        raw: Box<dyn DatagramTransport>,
+        physical_peer: SocketAddr,
+    ) -> Result<(Arc<DatagramSocket>, DatagramDriver), DispatchError> {
+        let raw = self.bandwidth.wrap(raw, self.wire_mtu());
+        let raw = if let Some(options) = &self.config.gecko {
+            super::gecko::wrap(
+                raw,
+                options.clone(),
+                Destination::Ip(physical_peer),
+                QUIC_PAYLOAD,
+            )
+        } else if let Some(password) = &self.config.obfs_password {
             salamander::wrap(raw, password)
         } else {
             raw
@@ -90,7 +140,7 @@ impl Paths {
         Ok(quic::attach_mapped(
             raw,
             self.peer,
-            self.physical_peer(),
+            physical_peer,
             DatagramBudget::new(QUIC_PAYLOAD, QUIC_PAYLOAD),
         )?)
     }

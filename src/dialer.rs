@@ -1,3 +1,31 @@
+#[path = "dialer_connections.rs"]
+mod connections;
+#[cfg(all(feature = "tun", target_os = "linux"))]
+#[path = "dialer_ping.rs"]
+mod ping;
+#[cfg(all(feature = "tun", target_os = "linux"))]
+pub(crate) use ping::{PhysicalPing, PingReceipt};
+#[cfg(target_os = "linux")]
+#[path = "dialer_fast_open.rs"]
+mod fast_open;
+#[cfg(target_os = "linux")]
+#[path = "dialer_mptcp.rs"]
+mod mptcp;
+#[cfg(all(target_os = "linux", test, feature = "tun"))]
+#[path = "dialer_mptcp_gate.rs"]
+mod mptcp_gate;
+#[cfg(target_os = "linux")]
+#[path = "dialer_native.rs"]
+mod native;
+#[path = "dialer_server_tcp.rs"]
+mod server_tcp;
+#[cfg(all(target_os = "linux", feature = "sing-mux"))]
+#[path = "dialer_tcp_control.rs"]
+pub(crate) mod tcp_control;
+#[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
+#[path = "dialer_windows.rs"]
+mod windows_egress;
+pub(crate) use connections::race_connections;
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs as _},
@@ -12,7 +40,7 @@ use std::{
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(all(windows, feature = "windows-uwp"))]
+#[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
 use std::{
     num::NonZeroU32,
     os::windows::io::{AsRawSocket, RawSocket},
@@ -26,7 +54,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-#[cfg(all(windows, feature = "windows-uwp"))]
+#[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
 use windows::Win32::Networking::WinSock::{
     IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET, SOCKET_ERROR,
     WSAGetLastError, setsockopt,
@@ -37,6 +65,10 @@ use crate::resources::observation::{ObservedIo, ResourceKind, track};
 
 pub type PhysicalStream = ObservedIo<tokio::net::TcpStream>;
 pub type PhysicalDatagram = ObservedIo<UdpSocket>;
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct UdpSocketOptions {
+    pub receive_buffer: Option<usize>,
+}
 
 const MAX_RESOLVED_ADDRESSES: usize = 8;
 
@@ -246,7 +278,9 @@ pub trait SocketProtector: Send + Sync {
     fn protect(&self, socket: i32) -> io::Result<()>;
 }
 
-/// Owns synchronous socket setup independently of the async I/O workers.
+/// Owns synchronous socket setup and its shutdown barrier. Platform/custom
+/// work stays on blocking workers; verified Linux native setup may instead
+/// hold the same owner through a short, typed executor-local operation.
 /// A started syscall cannot be aborted; shutdown must wait for its result to
 /// be delivered or destroyed before releasing any platform callback lease.
 #[derive(Debug)]
@@ -255,6 +289,7 @@ struct SocketInitialization {
     cancellation: CancellationToken,
     tasks: TaskTracker,
     submissions: Arc<Semaphore>,
+    process_submissions: Arc<Semaphore>,
 }
 
 impl Default for SocketInitialization {
@@ -264,6 +299,7 @@ impl Default for SocketInitialization {
             cancellation: CancellationToken::new(),
             tasks: TaskTracker::new(),
             submissions: Arc::new(Semaphore::new(MAX_SOCKET_INITIALIZATIONS)),
+            process_submissions: Arc::new(Semaphore::new(4)),
         }
     }
 }
@@ -350,6 +386,14 @@ fn socket_initialization_cancelled() -> io::Error {
     )
 }
 
+fn new_plain_tcp_socket(ipv6: bool) -> io::Result<TcpSocket> {
+    if ipv6 {
+        TcpSocket::new_v6()
+    } else {
+        TcpSocket::new_v4()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SourceBinding {
     ipv4: Option<Ipv4Addr>,
@@ -365,6 +409,18 @@ struct InterfaceBinding {
 
 #[derive(Clone)]
 pub struct Dialer {
+    tfo: bool,
+    mptcp: bool,
+    egress: crate::config::EgressOptions,
+    dns_sources: Arc<crate::dns::source::NetworkSources>,
+    dns_binding: Option<crate::dns::source::DnsBinding>,
+    dns_tun_interface: Option<Arc<str>>,
+    #[cfg(all(windows, feature = "windows-uwp"))]
+    physical_adapter: Option<Arc<str>>,
+    #[cfg(all(target_os = "linux", feature = "tun"))]
+    linux_policy: Option<Arc<crate::platform::linux_network::SocketPolicy>>,
+    ip_version: crate::config::IpVersion,
+    connections: crate::config::ConnectionSettings,
     initialization: Arc<SocketInitialization>,
     protector: Option<Arc<dyn SocketProtector>>,
     source_binding: Option<SourceBinding>,
@@ -378,11 +434,14 @@ impl std::fmt::Debug for Dialer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = formatter.debug_struct("Dialer");
         debug
+            .field("has_dns_binding", &self.dns_binding.is_some())
             .field("has_protector", &self.protector.is_some())
             .field("source_binding", &self.source_binding);
         #[cfg(all(windows, feature = "windows-uwp"))]
         debug.field("interface_binding", &self.interface_binding);
         debug
+            .field("tfo", &self.tfo)
+            .field("mptcp", &self.mptcp)
             .field("ipv6", &self.ipv6)
             .field("connect_timeout", &self.connect_timeout)
             .finish()
@@ -392,6 +451,18 @@ impl std::fmt::Debug for Dialer {
 impl Default for Dialer {
     fn default() -> Self {
         Self {
+            tfo: false,
+            mptcp: false,
+            egress: Default::default(),
+            dns_sources: Arc::new(crate::dns::source::NetworkSources::default()),
+            dns_binding: None,
+            dns_tun_interface: None,
+            #[cfg(all(windows, feature = "windows-uwp"))]
+            physical_adapter: None,
+            #[cfg(all(target_os = "linux", feature = "tun"))]
+            linux_policy: None,
+            ip_version: crate::config::IpVersion::Dual,
+            connections: crate::config::ConnectionSettings::default(),
             initialization: Arc::new(SocketInitialization::default()),
             protector: None,
             source_binding: None,
@@ -404,6 +475,367 @@ impl Default for Dialer {
 }
 
 impl Dialer {
+    /// Only immutable direct egress may donate a private active H2 connection.
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn permits_static_h2_reuse(&self) -> bool {
+        if self.protector.is_some()
+            || self.dns_binding.is_some()
+            || self.source_binding.is_some()
+            || self.egress.interface.is_some()
+            || self.mptcp
+            || self.ip_version != crate::config::IpVersion::Dual
+        {
+            return false;
+        }
+        #[cfg(all(windows, feature = "windows-uwp"))]
+        if self.physical_adapter.is_some() || self.interface_binding.is_some() {
+            return false;
+        }
+        #[cfg(all(target_os = "linux", feature = "tun"))]
+        if self
+            .linux_policy
+            .as_ref()
+            .is_some_and(|policy| policy.detects_interface())
+        {
+            return false;
+        }
+        true
+    }
+
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn h2_reuse_cancellation(&self) -> CancellationToken {
+        self.initialization.cancellation.clone()
+    }
+
+    pub(crate) fn with_egress(mut self, options: &crate::config::EgressOptions) -> Self {
+        self.egress = self.egress.overlay(options);
+        self
+    }
+
+    pub(crate) fn validate_egress(&self) -> io::Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        if self.egress.routing_mark != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "routing-mark requires Linux",
+            ));
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            all(windows, any(feature = "windows-uwp", feature = "windows-wintun"))
+        )))]
+        if self.egress.interface.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "interface-name binding is unavailable on this target",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn with_dns_sources(
+        mut self,
+        sources: Arc<crate::dns::source::NetworkSources>,
+    ) -> Self {
+        self.dns_sources = sources;
+        self
+    }
+    pub(crate) fn dns_sources(&self) -> Arc<crate::dns::source::NetworkSources> {
+        self.dns_sources.clone()
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn with_dns_tun_interface(mut self, interface: Option<Arc<str>>) -> Self {
+        self.dns_tun_interface = interface;
+        self
+    }
+    pub(crate) fn dns_tun_interface(&self) -> Option<Arc<str>> {
+        self.dns_tun_interface.clone()
+    }
+    pub(crate) fn for_dns_source(
+        &self,
+        binding: crate::dns::source::DnsBinding,
+        endpoint: SocketAddr,
+    ) -> io::Result<Self> {
+        #[cfg(all(windows, feature = "windows-uwp"))]
+        if self.physical_adapter.as_deref() != Some(binding.interface.as_ref())
+            || self.interface_binding.is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "DNS source is outside the physical network binding",
+            ));
+        }
+        #[cfg(all(windows, feature = "windows-uwp"))]
+        if let SocketAddr::V6(endpoint) = endpoint
+            && endpoint.scope_id() != 0
+            && self
+                .interface_binding
+                .and_then(|binding| binding.ipv6.map(|(_, index)| index.get()))
+                != Some(endpoint.scope_id())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DNS source scope does not match its binding",
+            ));
+        }
+        let _ = endpoint;
+        #[cfg(any(target_os = "android", all(windows, not(feature = "windows-uwp"))))]
+        let _ = binding;
+        #[cfg(any(target_os = "android", all(windows, not(feature = "windows-uwp"))))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "exact physical DNS interface binding is unavailable",
+        ));
+        #[cfg(not(any(target_os = "android", all(windows, not(feature = "windows-uwp")))))]
+        {
+            let mut dialer = self.clone();
+            dialer.dns_binding = Some(binding);
+            Ok(dialer)
+        }
+    }
+    #[cfg(all(windows, feature = "windows-uwp"))]
+    pub(crate) fn with_physical_adapter(mut self, adapter: Arc<str>) -> Self {
+        self.physical_adapter = Some(adapter);
+        self
+    }
+    #[cfg(all(windows, feature = "windows-uwp"))]
+    pub(crate) fn physical_dns_adapter(&self) -> Option<Arc<str>> {
+        self.physical_adapter.clone()
+    }
+    #[cfg(any(target_os = "linux", all(windows, feature = "windows-uwp")))]
+    pub(crate) async fn run_dns_discovery<T, F>(&self, operation: F) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn Fn() -> io::Result<()>) -> io::Result<T> + Send + 'static,
+    {
+        self.initialization.run(operation).await
+    }
+    #[cfg(unix)]
+    fn apply_socket_policy(
+        &self,
+        socket: &impl AsRawFd,
+        destination: SocketAddr,
+    ) -> io::Result<()> {
+        self.validate_egress()?;
+        if destination.ip().is_loopback() && self.dns_binding.is_none() {
+            // Local proxies must remain reachable when a physical default
+            // interface is selected. Keep native TUN's private isolation.
+            #[cfg(all(target_os = "linux", feature = "tun"))]
+            if let Some(policy) = &self.linux_policy {
+                return policy.apply(socket, destination, 0);
+            }
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if self.egress.routing_mark != 0 {
+            let value = self.egress.routing_mark;
+            // SAFETY: the live socket and u32 match Linux SO_MARK.
+            if unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_MARK,
+                    (&raw const value).cast(),
+                    std::mem::size_of_val(&value) as libc::socklen_t,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let binding = self.dns_binding.clone().or_else(|| {
+            self.egress
+                .interface
+                .clone()
+                .map(|interface| crate::dns::source::DnsBinding {
+                    interface,
+                    interface_index: None,
+                })
+        });
+        let Some(binding) = binding else {
+            #[cfg(all(target_os = "linux", feature = "tun"))]
+            if let Some(policy) = &self.linux_policy {
+                return policy.apply(socket, destination, self.egress.routing_mark);
+            }
+            return Ok(());
+        };
+        let name = std::ffi::CString::new(binding.interface.as_ref())
+            .map_err(|_| io::ErrorKind::InvalidInput)?;
+        // SAFETY: `name` is terminated and only inspected by the kernel.
+        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        if index == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "outbound interface is unavailable",
+            ));
+        }
+        if binding
+            .interface_index
+            .is_some_and(|expected| expected.get() != index)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "DNS source interface generation changed",
+            ));
+        }
+        if let SocketAddr::V6(address) = destination
+            && address.scope_id() != 0
+            && address.scope_id() != index
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DNS source scope does not match its interface",
+            ));
+        }
+        #[cfg(all(target_os = "linux", feature = "tun"))]
+        if let Some(policy) = &self.linux_policy {
+            return policy.apply_with_interface(
+                socket,
+                destination,
+                self.egress.routing_mark,
+                Some(binding.interface.as_ref()),
+            );
+        }
+        #[cfg(target_os = "linux")]
+        let status = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                name.as_ptr().cast(),
+                name.as_bytes_with_nul().len() as libc::socklen_t,
+            )
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        let status = {
+            let (level, option) = if destination.is_ipv6() {
+                (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
+            } else {
+                (libc::IPPROTO_IP, libc::IP_BOUND_IF)
+            };
+            // SAFETY: the option is a live u32 and socket is initialized here.
+            unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    level,
+                    option,
+                    (&raw const index).cast(),
+                    std::mem::size_of_val(&index) as libc::socklen_t,
+                )
+            }
+        };
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos"
+        )))]
+        return Err(io::ErrorKind::Unsupported.into());
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos"
+        ))]
+        if status < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn with_connections(mut self, settings: crate::config::ConnectionSettings) -> Self {
+        self.connections = settings;
+        self
+    }
+    pub(crate) fn connections(&self) -> crate::config::ConnectionSettings {
+        self.connections
+    }
+    #[cfg(all(target_os = "linux", feature = "tun"))]
+    pub(crate) fn with_linux_policy(
+        mut self,
+        policy: Arc<crate::platform::linux_network::SocketPolicy>,
+    ) -> Self {
+        self.linux_policy = Some(policy);
+        self
+    }
+
+    /// Exact node policy: false does not inherit another node's TFO setting.
+    pub(crate) fn with_tfo(mut self, tfo: bool) -> Self {
+        self.tfo = tfo;
+        self
+    }
+
+    pub(crate) fn with_mptcp(mut self, mptcp: bool) -> Self {
+        self.mptcp = mptcp;
+        self
+    }
+
+    pub(crate) fn with_ip_version(mut self, version: crate::config::IpVersion) -> Self {
+        self.ip_version = version;
+        self
+    }
+    pub(crate) fn ip_version(&self) -> crate::config::IpVersion {
+        self.ip_version
+    }
+    pub(crate) fn ordered_addresses(&self, addresses: &[SocketAddr]) -> Vec<SocketAddr> {
+        let mut addresses = addresses
+            .iter()
+            .copied()
+            .filter(|address| self.ipv6 || address.is_ipv4())
+            .collect();
+        self.ip_version.order(&mut addresses);
+        addresses
+    }
+
+    /// Connected TCP and explicitly opted-in UDP node endpoints use physical
+    /// IP4P addresses before family/source/interface selection. Generic UDP
+    /// ordering and bind_udp_for deliberately retain their original addresses.
+    pub(crate) fn ordered_connected_addresses(&self, addresses: &[SocketAddr]) -> Vec<SocketAddr> {
+        let mut addresses = addresses
+            .iter()
+            .filter_map(|address| self.connected_address(*address).ok())
+            .collect();
+        self.ip_version.order(&mut addresses);
+        addresses
+    }
+    pub(crate) fn ip4p_loopback_restricted(&self) -> bool {
+        #[cfg(all(windows, feature = "windows-uwp"))]
+        {
+            self.interface_binding.is_some()
+        }
+        #[cfg(not(all(windows, feature = "windows-uwp")))]
+        {
+            false
+        }
+    }
+    pub(crate) fn connected_address(&self, original: SocketAddr) -> io::Result<SocketAddr> {
+        let actual = self.connections.convert_ip4p_endpoint(original);
+        preserve_ip4p_loopback(original, actual, !self.ip4p_loopback_restricted())?;
+        self.require_permitted(actual)?;
+        Ok(actual)
+    }
+
+    pub(crate) fn validate_connected_endpoint(
+        &self,
+        endpoint: &ResolvedEndpoint,
+    ) -> io::Result<()> {
+        if !self.connections.dialer_ip4p_convert {
+            return Ok(());
+        }
+        let allow_loopback =
+            endpoint.logical_host.parse::<IpAddr>().is_ok() && !self.ip4p_loopback_restricted();
+        for original in &endpoint.addresses {
+            preserve_ip4p_loopback(
+                *original,
+                self.connections.convert_ip4p_endpoint(*original),
+                allow_loopback,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Start a new owner for a Running Session or private measurement. Policy
     /// is retained, but stopping one graph must not close another session.
     pub(crate) fn with_fresh_initialization(mut self) -> Self {
@@ -417,6 +849,47 @@ impl Dialer {
 
     pub(crate) async fn shutdown(&self) {
         self.initialization.shutdown().await;
+    }
+    pub(crate) async fn process_identity(
+        &self,
+        query: crate::process::Query,
+    ) -> io::Result<crate::process::Identity> {
+        self.inspect_process(move |check| crate::process::lookup(query, check))
+            .await
+    }
+    async fn inspect_process<F>(&self, operation: F) -> io::Result<crate::process::Identity>
+    where
+        F: FnOnce(&dyn Fn() -> io::Result<()>) -> io::Result<crate::process::Identity>
+            + Send
+            + 'static,
+    {
+        // Four ordinary simultaneous lookups wait briefly instead of silently
+        // losing identity due to a single busy scanner. No detached waiter/task.
+        let capacity = self.initialization.process_submissions.clone();
+        let permit = tokio::select! {
+            biased;
+            () = self.initialization.cancellation.cancelled() => return Err(socket_initialization_cancelled()),
+            permit = tokio::time::timeout(crate::process::LOOKUP_TIME, capacity.acquire_owned()) => {
+                match permit { Ok(Ok(permit)) => permit, _ => return Ok(Default::default()) }
+            }
+        };
+        let result = tokio::time::timeout(
+            crate::process::LOOKUP_TIME,
+            self.initialization.run(move |check| {
+                let _permit = permit;
+                operation(check)
+            }),
+        )
+        .await;
+        result
+            .unwrap_or_else(|_| Ok(Default::default()))
+            .or_else(|error| {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    Err(error)
+                } else {
+                    Ok(Default::default())
+                }
+            })
     }
 
     #[must_use]
@@ -469,12 +942,23 @@ impl Dialer {
     }
 
     pub async fn connect(&self, endpoint: &ResolvedEndpoint) -> io::Result<PhysicalStream> {
+        // DNS resolution may precede physical conversion; keep the resolver's
+        // hostname -> loopback denial after decoding too. Literal loopback
+        // nodes retain their existing exemption.
+        self.validate_connected_endpoint(endpoint)?;
+        let addresses = self.ordered_connected_addresses(&endpoint.addresses);
+        if self.connections.tcp_concurrent && !addresses.is_empty() {
+            let preferred = match self.ip_version {
+                crate::config::IpVersion::Ipv4Prefer => Some(false),
+                crate::config::IpVersion::Ipv6Prefer => Some(true),
+                _ => None,
+            };
+            return race_connections(&addresses, preferred, |address| self.connect_one(address))
+                .await;
+        }
         let mut last_error = None;
-        for address in &endpoint.addresses {
-            if !self.ipv6 && address.is_ipv6() {
-                continue;
-            }
-            match self.connect_one(*address).await {
+        for address in addresses {
+            match self.connect_one(address).await {
                 Ok(stream) => return Ok(stream),
                 Err(error) => last_error = Some(error),
             }
@@ -500,33 +984,88 @@ impl Dialer {
     /// Creates a direct UDP socket for one destination and applies the
     /// platform protect or binding policy before exposing it to the caller.
     pub async fn bind_udp_for(&self, destination: SocketAddr) -> io::Result<PhysicalDatagram> {
+        self.bind_udp_for_with_receive_buffer(destination, None)
+            .await
+    }
+
+    pub(crate) async fn bind_udp_for_with_receive_buffer(
+        &self,
+        destination: SocketAddr,
+        receive_buffer_size: Option<usize>,
+    ) -> io::Result<PhysicalDatagram> {
+        self.bind_udp_for_with_options(
+            destination,
+            UdpSocketOptions {
+                receive_buffer: receive_buffer_size,
+            },
+        )
+        .await
+    }
+    pub(crate) async fn bind_udp_for_with_options(
+        &self,
+        destination: SocketAddr,
+        options: UdpSocketOptions,
+    ) -> io::Result<PhysicalDatagram> {
         self.require_permitted(destination)?;
-        let ipv6 = destination.is_ipv6();
+        self.validate_egress()?;
         let bind_address = self
             .source_address_for(destination)?
-            .unwrap_or_else(|| wildcard_address(ipv6));
+            .unwrap_or_else(|| wildcard_address(destination.is_ipv6()));
+        #[cfg(target_os = "linux")]
+        if self.permits_plain_native_socket_setup() {
+            return self
+                .bind_plain_native_udp_socket(destination, bind_address, options)
+                .await;
+        }
         let dialer = self.clone();
         let (socket, guard) = self
             .initialization
             .run(move |check| {
-                let socket = Socket::new(
-                    if ipv6 { Domain::IPV6 } else { Domain::IPV4 },
-                    Type::DGRAM,
-                    Some(Protocol::UDP),
-                )?;
-                let guard = track(ResourceKind::Socket);
-                check()?;
-                #[cfg(all(windows, feature = "windows-uwp"))]
-                dialer.apply_interface_binding(socket.as_raw_socket(), destination)?;
-                socket.bind(&bind_address.into())?;
-                socket.set_nonblocking(true)?;
-                check()?;
-                dialer.protect_socket(&socket)?;
-                check()?;
-                Ok((std::net::UdpSocket::from(socket), guard))
+                dialer.configure_udp_socket(destination, bind_address, options, check)
             })
             .await?;
         Ok(ObservedIo::with_guard(UdpSocket::from_std(socket)?, guard))
+    }
+
+    fn configure_udp_socket(
+        &self,
+        destination: SocketAddr,
+        bind_address: SocketAddr,
+        options: UdpSocketOptions,
+        check: &dyn Fn() -> io::Result<()>,
+    ) -> io::Result<(std::net::UdpSocket, crate::resources::observation::Guard)> {
+        let socket = Socket::new(
+            if destination.is_ipv6() {
+                Domain::IPV6
+            } else {
+                Domain::IPV4
+            },
+            Type::DGRAM,
+            Some(Protocol::UDP),
+        )?;
+        let guard = track(ResourceKind::Socket);
+        check()?;
+        #[cfg(all(windows, feature = "windows-uwp"))]
+        self.apply_interface_binding(socket.as_raw_socket(), destination)?;
+        #[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
+        self.apply_configured_interface(socket.as_raw_socket(), destination)?;
+        socket.bind(&bind_address.into())?;
+        // Buffer sizing is a performance hint. Keep this same
+        // owned socket and its platform policy if the OS refuses it.
+        // socket2 converts usize to c_int, so skip invalid hints.
+        if let Some(size) = options
+            .receive_buffer
+            .filter(|&size| size > 0 && size <= i32::MAX as usize)
+        {
+            let _ = socket.set_recv_buffer_size(size);
+        }
+        socket.set_nonblocking(true)?;
+        check()?;
+        self.protect_socket(&socket)?;
+        #[cfg(unix)]
+        self.apply_socket_policy(&socket, destination)?;
+        check()?;
+        Ok((std::net::UdpSocket::from(socket), guard))
     }
 
     fn source_address_for(&self, destination: SocketAddr) -> io::Result<Option<SocketAddr>> {
@@ -614,37 +1153,106 @@ impl Dialer {
         Ok(())
     }
 
+    // Returns explicitly pending single-address I/O and the converted physical
+    // address. Ordinary connect()/address races keep their eager TCP contract.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn prepare_tcp_fast_open(
+        &self,
+        address: SocketAddr,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<(ObservedIo<fast_open::PendingFastOpen>, SocketAddr)> {
+        let deadline = deadline.min(tokio::time::Instant::now() + self.connect_timeout);
+        let operation = async {
+            let (socket, guard, address) = self.prepare_tcp_socket(address).await?;
+            let stream = tokio_tfo::TfoStream::connect_with_socket(socket, address).await?;
+            stream.set_nodelay(true)?;
+            let stream = fast_open::PendingFastOpen::new(stream, deadline, &self.initialization)?;
+            Ok((ObservedIo::with_guard(stream, guard), address))
+        };
+        tokio::select! {
+            biased;
+            () = self.initialization.cancellation.cancelled() => Err(socket_initialization_cancelled()),
+            result = tokio::time::timeout_at(deadline, operation) => {
+                result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))?
+            }
+        }
+    }
+
     async fn connect_one(&self, address: SocketAddr) -> io::Result<PhysicalStream> {
-        self.require_permitted(address)?;
+        let (socket, guard, address) = self.prepare_tcp_socket(address).await?;
+        let stream = timeout(self.connect_timeout, socket.connect(address))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
+        stream.set_nodelay(true)?;
+        Ok(ObservedIo::with_guard(stream, guard))
+    }
+
+    async fn prepare_tcp_socket(
+        &self,
+        address: SocketAddr,
+    ) -> io::Result<(TcpSocket, crate::resources::observation::Guard, SocketAddr)> {
+        #[cfg(target_os = "linux")]
+        if self.permits_plain_native_socket_setup() {
+            return self.prepare_plain_native_tcp_socket(address).await;
+        }
+        #[cfg(target_os = "linux")]
+        let mptcp = self.permits_mptcp();
+        self.prepare_tcp_socket_with(address, move |ipv6| {
+            #[cfg(target_os = "linux")]
+            if mptcp {
+                return mptcp::socket(ipv6);
+            }
+            new_plain_tcp_socket(ipv6)
+        })
+        .await
+    }
+
+    async fn prepare_tcp_socket_with<F>(
+        &self,
+        address: SocketAddr,
+        create: F,
+    ) -> io::Result<(TcpSocket, crate::resources::observation::Guard, SocketAddr)>
+    where
+        F: FnOnce(bool) -> io::Result<TcpSocket> + Send + 'static,
+    {
+        let address = self.connected_address(address)?;
+        self.validate_egress()?;
         let ipv6 = address.is_ipv6();
         let source_address = self.source_address_for(address)?;
         let dialer = self.clone();
         let (socket, guard) = self
             .initialization
             .run(move |check| {
-                let socket = if ipv6 {
-                    TcpSocket::new_v6()?
-                } else {
-                    TcpSocket::new_v4()?
-                };
-                let guard = track(ResourceKind::Socket);
-                check()?;
-                dialer.protect_socket(&socket)?;
-                check()?;
-                #[cfg(all(windows, feature = "windows-uwp"))]
-                dialer.apply_interface_binding(socket.as_raw_socket(), address)?;
-                if let Some(source_address) = source_address {
-                    socket.bind(source_address)?;
-                }
-                check()?;
-                Ok((socket, guard))
+                let socket = create(ipv6)?;
+                dialer.configure_tcp_socket(socket, address, source_address, check)
             })
             .await?;
-        let stream = timeout(self.connect_timeout, socket.connect(address))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
-        stream.set_nodelay(true)?;
-        Ok(ObservedIo::with_guard(stream, guard))
+        Ok((socket, guard, address))
+    }
+
+    fn configure_tcp_socket(
+        &self,
+        socket: TcpSocket,
+        address: SocketAddr,
+        source_address: Option<SocketAddr>,
+        check: &dyn Fn() -> io::Result<()>,
+    ) -> io::Result<(TcpSocket, crate::resources::observation::Guard)> {
+        let guard = track(ResourceKind::Socket);
+        check()?;
+        self.connections.apply(&socket2::SockRef::from(&socket))?;
+        self.protect_socket(&socket)?;
+        #[cfg(unix)]
+        self.apply_socket_policy(&socket, address)?;
+        check()?;
+        #[cfg(all(windows, feature = "windows-uwp"))]
+        self.apply_interface_binding(socket.as_raw_socket(), address)?;
+        #[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
+        self.apply_configured_interface(socket.as_raw_socket(), address)?;
+        if let Some(source_address) = source_address {
+            socket.bind(source_address)?;
+        }
+        check()?;
+        Ok((socket, guard))
     }
 
     #[cfg(unix)]
@@ -667,12 +1275,29 @@ impl Dialer {
     }
 
     fn require_permitted(&self, address: SocketAddr) -> io::Result<()> {
-        if !self.ipv6 && address.is_ipv6() {
+        if (!self.ipv6 && address.is_ipv6()) || !self.ip_version.permits(address.ip()) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "IPv6 is disabled",
+                "address family is disabled",
             ));
         }
+        Ok(())
+    }
+}
+
+/// Conversion cannot grant a loopback exemption forbidden by the original
+/// logical/source policy. This runs before any physical socket acquisition.
+pub(crate) fn preserve_ip4p_loopback(
+    original: SocketAddr,
+    actual: SocketAddr,
+    allow: bool,
+) -> io::Result<()> {
+    if !allow && actual.ip().is_loopback() && !original.ip().is_loopback() {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "IP4P endpoint violates loopback policy",
+        ))
+    } else {
         Ok(())
     }
 }
@@ -694,7 +1319,7 @@ fn loopback_address(ipv6: bool) -> SocketAddr {
     }
 }
 
-#[cfg(all(windows, feature = "windows-uwp"))]
+#[cfg(all(windows, any(feature = "windows-uwp", feature = "windows-wintun")))]
 fn interface_option_value(index: NonZeroU32, ipv6: bool) -> [u8; 4] {
     if ipv6 {
         index.get().to_ne_bytes()
@@ -713,6 +1338,33 @@ mod tests {
     };
 
     use tokio::net::TcpListener;
+
+    #[test]
+    fn egress_clones_keep_the_protection_and_stop_owner() {
+        struct UncalledProtector;
+        impl SocketProtector for UncalledProtector {
+            fn protect(&self, _: i32) -> io::Result<()> {
+                unreachable!("memory-only test");
+            }
+        }
+        let initial = Dialer::default().with_protector(Arc::new(UncalledProtector));
+        let node = initial.clone().with_egress(&crate::config::EgressOptions {
+            interface: Some("Ethernet 网络 2".into()),
+            routing_mark: 0,
+        });
+        assert_eq!(node.egress.interface.as_deref(), Some("Ethernet 网络 2"));
+        assert!(Arc::ptr_eq(&initial.initialization, &node.initialization));
+        assert!(Arc::ptr_eq(&initial.dns_sources, &node.dns_sources));
+        assert!(Arc::ptr_eq(
+            initial.protector.as_ref().unwrap(),
+            node.protector.as_ref().unwrap()
+        ));
+        node.begin_shutdown();
+        assert!(*initial.initialization.closed.lock().unwrap());
+        let fresh = node.with_fresh_initialization();
+        assert!(!Arc::ptr_eq(&initial.initialization, &fresh.initialization));
+        assert_eq!(fresh.egress.interface.as_deref(), Some("Ethernet 网络 2"));
+    }
 
     use super::*;
 
@@ -1004,6 +1656,99 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn process_inspection_small_concurrency_preserves_identity_and_joins_stop() {
+        let dialer = Dialer::default();
+        let mut work = tokio::task::JoinSet::new();
+        for uid in 1..=4 {
+            let dialer = dialer.clone();
+            work.spawn(async move {
+                dialer
+                    .inspect_process(move |check| {
+                        check()?;
+                        Ok(crate::process::Identity {
+                            uid: Some(uid),
+                            ..Default::default()
+                        })
+                    })
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(identity) = work.join_next().await {
+            seen.insert(identity.unwrap().uid.unwrap());
+        }
+        assert_eq!(seen, [1, 2, 3, 4].into_iter().collect());
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let owned = dialer.clone();
+        let caller = tokio::spawn(async move {
+            owned
+                .inspect_process(move |_check| {
+                    let _ = entered.send(());
+                    let _ = released.recv_timeout(Duration::from_secs(2));
+                    Ok(Default::default())
+                })
+                .await
+        });
+        entering.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+        let mut stopped = Box::pin(dialer.shutdown());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut stopped)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped)
+            .await
+            .unwrap();
+        assert!(
+            dialer
+                .inspect_process(|_| Ok(Default::default()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn process_inspection_shared_socket_capacity_has_its_own_deadline() {
+        let dialer = Dialer::default();
+        // Hold capacity directly: no socket/protect callback or OS lookup.
+        let occupied = dialer
+            .initialization
+            .submissions
+            .clone()
+            .acquire_many_owned(MAX_SOCKET_INITIALIZATIONS as u32)
+            .await
+            .unwrap();
+        let called = Arc::new(AtomicUsize::new(0));
+        let calls = called.clone();
+        let result = dialer
+            .inspect_process(move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(crate::process::Identity {
+                    uid: Some(1001),
+                    ..Default::default()
+                })
+            })
+            .await
+            .unwrap();
+        assert!(result.uid.is_none());
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            dialer
+                .initialization
+                .process_submissions
+                .available_permits(),
+            4
+        );
+        drop(occupied);
+        dialer.shutdown().await;
+    }
+
     #[cfg(all(unix, feature = "ffi"))]
     #[test]
     fn socket_initialization_churn_reclaims_completed_work() {
@@ -1040,9 +1785,8 @@ mod tests {
             }
             dialer.shutdown().await;
             assert_eq!(protector.0.load(Ordering::Relaxed), 8192);
-            assert!(probe.snapshot().peak(ResourceKind::Task) <= 64);
+            assert!(probe.snapshot().peak(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
             assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
-            println!("socket initialization churn: {:?}", probe.snapshot());
         }));
     }
 
@@ -1120,7 +1864,7 @@ mod tests {
             }
             timeout(Duration::from_secs(3), async {
                 while callers_started.load(Ordering::Acquire) != 4096
-                    || probe.snapshot().current(ResourceKind::Task) < 64
+                    || probe.snapshot().current(ResourceKind::Task) < MAX_SOCKET_INITIALIZATIONS
                     || protector.entered.load(Ordering::Acquire) < 4
                 {
                     tokio::task::yield_now().await;
@@ -1128,18 +1872,13 @@ mod tests {
             })
             .await
             .unwrap();
-            assert!(probe.snapshot().current(ResourceKind::Task) <= 64);
-            assert!(probe.snapshot().peak(ResourceKind::Task) <= 64);
-            println!("socket initialization backlog: {:?}", probe.snapshot());
+            assert!(probe.snapshot().current(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
+            assert!(probe.snapshot().peak(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
 
             attempts.abort_all();
             while let Some(result) = attempts.join_next().await {
                 assert!(result.unwrap_err().is_cancelled());
             }
-            println!(
-                "socket initialization backlog after caller cancellation: {:?}",
-                probe.snapshot()
-            );
             let mut stopped = Box::pin(dialer.shutdown());
             assert!(
                 timeout(Duration::from_millis(20), &mut stopped)
@@ -1147,13 +1886,8 @@ mod tests {
                     .is_err(),
                 "Stop must not detach a started protect callback"
             );
-            let release_started = std::time::Instant::now();
             protector.release();
             timeout(Duration::from_secs(3), &mut stopped).await.unwrap();
-            println!(
-                "socket initialization release-to-join: {:?}",
-                release_started.elapsed()
-            );
             drop(stopped);
             assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
             assert_eq!(protector.entered.load(Ordering::Acquire), 4);
@@ -1168,7 +1902,6 @@ mod tests {
             drop(fresh.bind_udp_for(destination).await.unwrap());
             fresh.shutdown().await;
             assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
-            println!("socket initialization reclaimed: {:?}", probe.snapshot());
         }));
     }
 
@@ -1269,7 +2002,7 @@ mod tests {
                 }
                 timeout(Duration::from_secs(3), async {
                     while callers_started.load(Ordering::Acquire) != submitted
-                        || probe.snapshot().current(ResourceKind::Task) < 64
+                        || probe.snapshot().current(ResourceKind::Task) < MAX_SOCKET_INITIALIZATIONS
                     {
                         tokio::task::yield_now().await;
                     }
@@ -1277,41 +2010,40 @@ mod tests {
                 .await
                 .unwrap();
                 let before_cancel = probe.snapshot();
-                assert!(before_cancel.current(ResourceKind::Task) <= 64);
-                assert!(before_cancel.peak(ResourceKind::Task) <= 64);
+                assert!(before_cancel.current(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
+                assert!(before_cancel.peak(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
                 assert_eq!(before_cancel.current(ResourceKind::Socket), 0);
                 assert_eq!(protector.0.load(Ordering::Relaxed), 0);
-                println!(
-                    "socket initialization shared-pool submitted={submitted} before cancel: {before_cancel:?}"
-                );
 
                 // Scope Stop must wake permit waiters without waiting for
                 // unrelated blocking jobs or requiring caller aborts.
                 dialer.begin_shutdown();
                 timeout(Duration::from_secs(3), async {
                     while let Some(result) = attempts.join_next().await {
-                        assert_eq!(result.unwrap().unwrap_err().kind(), io::ErrorKind::Interrupted);
+                        assert_eq!(
+                            result.unwrap().unwrap_err().kind(),
+                            io::ErrorKind::Interrupted
+                        );
                     }
                 })
                 .await
                 .unwrap();
                 let after_cancel = probe.snapshot();
-                assert!(after_cancel.current(ResourceKind::Task) <= 64);
-                assert!(after_cancel.peak(ResourceKind::Task) <= 64);
+                assert!(after_cancel.current(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
+                assert!(after_cancel.peak(ResourceKind::Task) <= MAX_SOCKET_INITIALIZATIONS);
                 assert_eq!(after_cancel.current(ResourceKind::Socket), 0);
                 assert_eq!(protector.0.load(Ordering::Relaxed), 0);
-                println!(
-                    "socket initialization shared-pool submitted={submitted} after Stop cancellation: {after_cancel:?}"
-                );
-
-                let release_started = std::time::Instant::now();
                 gate.release();
                 timeout(Duration::from_secs(3), dialer.shutdown())
                     .await
                     .unwrap();
-                let release_to_join = release_started.elapsed();
                 for blocker in blockers {
-                    assert!(timeout(Duration::from_secs(3), blocker).await.unwrap().unwrap());
+                    assert!(
+                        timeout(Duration::from_secs(3), blocker)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    );
                 }
                 assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
                 assert_eq!(protector.0.load(Ordering::Relaxed), 0);
@@ -1338,11 +2070,50 @@ mod tests {
                 drop(dialer);
                 drop(protector);
                 assert!(protector_lease.upgrade().is_none());
-                println!(
-                    "socket initialization shared-pool submitted={submitted} release-to-join={release_to_join:?} reclaimed: {:?}",
-                    probe.snapshot()
-                );
             }
         });
     }
+    #[test]
+    fn connected_ip4p_conversion_precedes_family_and_source_binding_only_at_opted_in_seams() {
+        let encoded: SocketAddr = "[2001:0::1bb:c000:201]:8443".parse().unwrap();
+        let physical: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let dialer = Dialer::default()
+            .with_ipv6(false)
+            .with_ip_version(crate::config::IpVersion::Ipv4)
+            .with_connections(crate::config::ConnectionSettings {
+                dialer_ip4p_convert: true,
+                ..Default::default()
+            })
+            .with_source_ip("192.0.2.2".parse().unwrap());
+        assert_eq!(dialer.ordered_connected_addresses(&[encoded]), [physical]);
+        assert_eq!(
+            dialer.source_address_for(physical).unwrap(),
+            Some("192.0.2.2:0".parse().unwrap())
+        );
+        assert!(dialer.require_permitted(physical).is_ok());
+        assert!(dialer.ordered_addresses(&[encoded]).is_empty());
+        assert!(dialer.require_permitted(encoded).is_err());
+        assert!(dialer.source_address_for(encoded).is_err());
+        assert_eq!(
+            Dialer::default().ordered_connected_addresses(&[encoded]),
+            [encoded]
+        );
+    }
+    #[test]
+    fn ip4p_loopback_mapping_cannot_acquire_a_new_literal_exemption() {
+        let original: SocketAddr = "[2001:0::1bb:7f00:1]:8443".parse().unwrap();
+        let actual: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        assert!(preserve_ip4p_loopback(original, actual, false).is_err());
+        assert!(preserve_ip4p_loopback(original, actual, true).is_ok());
+        assert!(preserve_ip4p_loopback(actual, actual, false).is_ok());
+        assert!(preserve_ip4p_loopback(original, "192.0.2.1:443".parse().unwrap(), false).is_ok());
+    }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "dialer_native_init_memory_tests.rs"]
+mod native_init_memory_tests;
+
+#[cfg(all(test, target_os = "linux", feature = "tun"))]
+#[path = "dialer_native_init_fd_tests.rs"]
+mod native_init_fd_tests;

@@ -3,11 +3,6 @@ use vole::{dispatch::DatagramBudget, packet::IpVersion};
 #[cfg(feature = "outbound-shadowsocks")]
 #[tokio::test]
 async fn shadowsocks_budget_accounts_for_cipher_headers_and_identity_chain() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-DATAGRAM",
-        "shadowsocks_budget_accounts_for_cipher_headers_and_identity_chain",
-    );
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use bytes::Bytes;
     use vole::{
@@ -36,7 +31,7 @@ async fn shadowsocks_budget_accounts_for_cipher_headers_and_identity_chain() {
                 port: address.port(),
                 cipher,
                 password,
-                shadow_tls: None,
+                plugin: None,
                 udp_over_tcp: false,
             },
             UpstreamPath::direct(
@@ -85,11 +80,6 @@ async fn shadowsocks_budget_accounts_for_cipher_headers_and_identity_chain() {
 #[cfg(feature = "outbound-socks5")]
 #[tokio::test]
 async fn socks5_budget_retains_distinct_payload_and_envelope_limits() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-DATAGRAM",
-        "socks5_budget_retains_distinct_payload_and_envelope_limits",
-    );
     use bytes::Bytes;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use vole::{
@@ -126,6 +116,7 @@ async fn socks5_budget_retains_distinct_payload_and_envelope_limits() {
         });
         let outbound = Socks5Outbound::new(
             &Socks5OutboundConfig {
+                tls: None,
                 address: "127.0.0.1".into(),
                 port: endpoint.port(),
                 username: None,
@@ -177,11 +168,6 @@ async fn socks5_budget_retains_distinct_payload_and_envelope_limits() {
 
 #[tokio::test]
 async fn direct_budget_rejects_large_sends_and_drops_oversize_responses() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-DATAGRAM",
-        "direct_budget_rejects_large_sends_and_drops_oversize_responses",
-    );
     use bytes::Bytes;
     use vole::{
         dialer::Dialer,
@@ -224,11 +210,6 @@ async fn direct_budget_rejects_large_sends_and_drops_oversize_responses() {
 
 #[test]
 fn layered_directional_budgets_account_for_ip_headers_and_exact_minima() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-DATAGRAM",
-        "layered_directional_budgets_account_for_ip_headers_and_exact_minima",
-    );
     let ipv4 = DatagramBudget::from_path_mtu(1500, IpVersion::V4).unwrap();
     let ipv6 = DatagramBudget::from_path_mtu(1500, IpVersion::V6).unwrap();
     assert_eq!((ipv4.transmit(), ipv4.receive()), (1472, 1472));

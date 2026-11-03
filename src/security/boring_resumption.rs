@@ -12,6 +12,8 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
+use super::identity::IdentityEpoch;
+
 type SessionIndex = Index<Ssl, Arc<SessionSink>>;
 // Only the slot number is global, never the tickets or a verification policy.
 static SESSION_INDEX: LazyLock<Result<SessionIndex, boring::error::ErrorStack>> =
@@ -19,9 +21,28 @@ static SESSION_INDEX: LazyLock<Result<SessionIndex, boring::error::ErrorStack>> 
 
 #[derive(Clone)]
 pub(super) struct Sessions {
-    queue: Arc<Mutex<VecDeque<SslSession>>>,
+    queue: Arc<Mutex<Cache>>,
     capacity: usize,
     index: SessionIndex,
+}
+
+#[derive(Default)]
+struct Cache {
+    generation: u64,
+    tickets: VecDeque<SslSession>,
+}
+
+impl Cache {
+    fn select_epoch(&mut self, epoch: &IdentityEpoch) -> bool {
+        if !epoch.is_current() || epoch.generation() < self.generation {
+            return false;
+        }
+        if epoch.generation() != self.generation {
+            self.tickets.clear();
+            self.generation = epoch.generation();
+        }
+        true
+    }
 }
 
 impl Sessions {
@@ -55,9 +76,11 @@ impl Sessions {
     pub(super) fn configure(
         &self,
         config: &mut ConnectConfiguration,
+        epoch: IdentityEpoch,
     ) -> io::Result<Arc<SessionSink>> {
         let sink = Arc::new(SessionSink {
             cache: self.clone(),
+            epoch: epoch.clone(),
             state: Mutex::new(State {
                 accepted: false,
                 pending: VecDeque::new(),
@@ -66,8 +89,11 @@ impl Sessions {
         config.set_ex_data(self.index, sink.clone());
         let session = {
             let now = UnixTime::now().as_secs();
-            let mut queue = self.queue.lock().map_err(|_| cache_error())?;
-            queue.retain(|session| {
+            let mut cache = self.queue.lock().map_err(|_| cache_error())?;
+            if !cache.select_epoch(&epoch) {
+                return Ok(sink);
+            }
+            cache.tickets.retain(|session| {
                 let hint = session.ticket_lifetime_hint();
                 let lifetime = if hint == 0 {
                     session.timeout()
@@ -76,20 +102,21 @@ impl Sessions {
                 };
                 now < session.time().saturating_add(u64::from(lifetime))
             });
-            if queue
+            if cache
+                .tickets
                 .back()
                 .is_some_and(|s| s.protocol_version() == SslVersion::TLS1_2)
             {
                 // TLS 1.2 abbreviated handshakes need not issue another ticket.
-                queue.back().cloned()
+                cache.tickets.back().cloned()
             } else {
                 // A TLS 1.3 ticket is consumed once.
-                queue.pop_back()
+                cache.tickets.pop_back()
             }
         };
         if let Some(session) = session {
-            // SAFETY: Only this immutable client's SSL_CTX can populate its
-            // cache. A cloned client shares that exact context and policy.
+            // SAFETY: Only this client's SSL_CTX and the same current identity
+            // generation populate its node-owned cache. Clone shares policy.
             unsafe { config.set_session(&session) }.map_err(|_| cache_error())?;
         }
         Ok(sink)
@@ -103,6 +130,7 @@ struct State {
 
 pub(super) struct SessionSink {
     cache: Sessions,
+    epoch: IdentityEpoch,
     state: Mutex<State>,
 }
 
@@ -112,9 +140,15 @@ impl SessionSink {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        if !self.epoch.is_current() {
+            state.pending.clear();
+            return;
+        }
         if state.accepted {
-            if let Ok(mut queue) = self.cache.queue.lock() {
-                bounded_push(&mut queue, session, self.cache.capacity);
+            if let Ok(mut cache) = self.cache.queue.lock()
+                && cache.select_epoch(&self.epoch)
+            {
+                bounded_push(&mut cache.tickets, session, self.cache.capacity);
             }
         } else {
             bounded_push(&mut state.pending, session, self.cache.capacity);
@@ -123,10 +157,14 @@ impl SessionSink {
 
     pub(super) fn accept(&self) -> io::Result<()> {
         let mut state = self.state.lock().map_err(|_| cache_error())?;
-        let mut queue = self.cache.queue.lock().map_err(|_| cache_error())?;
+        let mut cache = self.cache.queue.lock().map_err(|_| cache_error())?;
         state.accepted = true;
+        if !cache.select_epoch(&self.epoch) {
+            state.pending.clear();
+            return Ok(());
+        }
         for session in state.pending.drain(..) {
-            bounded_push(&mut queue, session, self.cache.capacity);
+            bounded_push(&mut cache.tickets, session, self.cache.capacity);
         }
         Ok(())
     }

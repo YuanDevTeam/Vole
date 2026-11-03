@@ -9,21 +9,12 @@ use std::collections::BTreeMap;
 
 #[test]
 fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-LIMITS",
-        "registry_matches_live_production_constants_and_has_owned_boundary_cases",
-    );
     use vole::{ResourceLimits, dispatch, transport};
     let defaults = ResourceLimits::default();
     let expected = BTreeMap::from([
         ("tuic-quic-payload", vole::limits::TUIC_QUIC_PAYLOAD),
-        ("tuic-uni-streams", vole::limits::TUIC_UNI_STREAMS),
-        ("tuic-stream-window", vole::limits::TUIC_STREAM_WINDOW),
-        (
-            "tuic-connection-window",
-            vole::limits::TUIC_CONNECTION_WINDOW,
-        ),
+        ("tuic-control-readers", vole::limits::TUIC_CONTROL_READERS),
+        ("tuic-send-window", vole::limits::TUIC_SEND_WINDOW),
         ("tuic-datagram-buffer", vole::limits::TUIC_DATAGRAM_BUFFER),
         ("tuic-udp-queue", vole::limits::TUIC_UDP_QUEUE),
         ("tuic-pending-packets", vole::limits::TUIC_PENDING_PACKETS),
@@ -36,15 +27,23 @@ fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
         ),
         ("hy2-udp-payload", vole::limits::HY2_UDP_PAYLOAD),
         ("hy2-udp-queue", vole::limits::HY2_UDP_QUEUE),
+        ("hy2-submission-queue", vole::limits::HY2_SUBMISSION_QUEUE),
+        ("hy2-auth-sessions", vole::limits::HY2_AUTH_SESSIONS),
         ("hy2-pending-packets", vole::limits::HY2_PENDING_PACKETS),
         ("hy2-pending-bytes", vole::limits::HY2_PENDING_BYTES),
         ("hy2-fragment-ttl", vole::limits::HY2_FRAGMENT_TTL_SECONDS),
         ("hy2-path-retire", vole::limits::HY2_PATH_RETIRE_SECONDS),
         ("hy2-quic-payload", vole::limits::HY2_QUIC_PAYLOAD),
         ("hy2-uni-streams", vole::limits::HY2_UNI_STREAMS),
-        ("hy2-stream-window", vole::limits::HY2_STREAM_WINDOW),
-        ("hy2-connection-window", vole::limits::HY2_CONNECTION_WINDOW),
-        ("hy2-datagram-buffer", vole::limits::HY2_DATAGRAM_BUFFER),
+        ("hy2-send-window", vole::limits::HY2_SEND_WINDOW),
+        (
+            "hy2-datagram-send-buffer",
+            vole::limits::HY2_DATAGRAM_SEND_BUFFER,
+        ),
+        (
+            "hy2-datagram-receive-buffer",
+            vole::limits::HY2_DATAGRAM_RECEIVE_BUFFER,
+        ),
         ("hy2-auth-headers", vole::limits::HY2_AUTH_HEADERS),
         ("hy2-response-message", vole::limits::HY2_RESPONSE_MESSAGE),
         ("hy2-response-padding", vole::limits::HY2_RESPONSE_PADDING),
@@ -118,6 +117,10 @@ fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
         ("xhttp-padding", vole::limits::XHTTP_PADDING_BYTES),
         ("xhttp-post", vole::limits::XHTTP_POST_BYTES),
         ("xhttp-packet-batch", vole::limits::XHTTP_PACKET_BATCH_BYTES),
+        (
+            "xhttp-h3-packet-batch",
+            vole::limits::XHTTP_H3_PACKET_BATCH_BYTES,
+        ),
         ("xhttp-request-bytes", vole::limits::XHTTP_REQUEST_BYTES),
         ("xhttp-request-headers", vole::limits::XHTTP_REQUEST_HEADERS),
         ("xhttp-idle-entries", vole::limits::XHTTP_IDLE_ENTRIES),
@@ -134,6 +137,10 @@ fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
             vole::limits::XHTTP_H3_CONNECTION_WINDOW,
         ),
         ("xhttp-h3-send-window", vole::limits::XHTTP_H3_SEND_WINDOW),
+        (
+            "xhttp-h3-udp-send-window",
+            vole::limits::XHTTP_H3_UDP_SEND_WINDOW,
+        ),
         ("sing-mux-idle", vole::limits::SING_MUX_IDLE_CONNECTIONS),
         (
             "sing-mux-command-queue",

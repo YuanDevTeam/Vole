@@ -1,6 +1,5 @@
 //! Independent rustls memory peers for warm-wire/expiry and version rejection.
 use super::*;
-use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -87,7 +86,6 @@ async fn observed_handshake(
 #[derive(Debug)]
 struct ShortTickets {
     inner: Arc<dyn rustls::server::ProducesTickets>,
-    issued: Arc<Mutex<Vec<usize>>>,
 }
 impl rustls::server::ProducesTickets for ShortTickets {
     fn enabled(&self) -> bool {
@@ -97,9 +95,7 @@ impl rustls::server::ProducesTickets for ShortTickets {
         2
     }
     fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
-        let ticket = self.inner.encrypt(plain)?;
-        self.issued.lock().unwrap().push(ticket.len());
-        Some(ticket)
+        self.inner.encrypt(plain)
     }
     fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
         self.inner.decrypt(cipher)
@@ -108,23 +104,20 @@ impl rustls::server::ProducesTickets for ShortTickets {
 
 #[tokio::test]
 async fn selected_profiles_warm_wire_and_expired_tickets_use_real_handshakes() {
-    let mut observations = Vec::new();
     let mut clients = Vec::new();
     for (name, profile) in [
-        ("chrome120", crate::config::ClientFingerprint::Chrome120),
         ("chrome", crate::config::ClientFingerprint::Chrome133),
         ("firefox", crate::config::ClientFingerprint::Firefox120),
         ("safari", crate::config::ClientFingerprint::Safari16),
+        ("ios", crate::config::ClientFingerprint::Ios14),
     ] {
         for version in [&TLS12, &TLS13] {
             let chain = chain(false);
             let mut peer = server(&chain, version, false);
             // Only the advertised lifetime is short. The real ticket key stays
             // valid so full renegotiation proves the client's own expiry rule.
-            let issued = Arc::new(Mutex::new(Vec::new()));
             Arc::get_mut(&mut peer).unwrap().ticketer = Arc::new(ShortTickets {
                 inner: rustls::crypto::ring::Ticketer::new().unwrap(),
-                issued: issued.clone(),
             });
             let client = StandardTlsClient::with_options(
                 &trusted(&chain),
@@ -139,30 +132,24 @@ async fn selected_profiles_warm_wire_and_expired_tickets_use_real_handshakes() {
             )
             .unwrap();
             for (phase, expected) in [("cold", false), ("warm", true)] {
-                let prior_ticket_bytes = issued.lock().unwrap().last().copied();
-                let (resumed, bytes) = observed_handshake(&client, peer.clone()).await;
+                let (resumed, _) = observed_handshake(&client, peer.clone()).await;
                 assert_eq!(resumed, expected, "{name}/{version:?}/{phase}");
-                observations.push(serde_json::json!({"profile": name, "version": format!("{:?}", version.version), "phase": phase, "resumed": resumed, "prior_ticket_bytes": prior_ticket_bytes, "records_b64": STANDARD.encode(bytes)}));
             }
-            clients.push((name, version, client, peer, issued));
+            clients.push((name, version, client, peer));
         }
     }
     // Native ticket timestamps use real UNIX time, not Tokio's paused clock.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    for (name, version, client, peer, issued) in clients {
-        let prior_ticket_bytes = issued.lock().unwrap().last().copied();
-        let (resumed, bytes) = observed_handshake(&client, peer).await;
-        // Safari16 does not offer the TLS1.2 session-ticket extension. Its
-        // stateful session ID has no server ticket-lifetime hint to expire.
-        let stateful_id = name == "safari" && version.version == rustls::ProtocolVersion::TLSv1_2;
+    for (name, version, client, peer) in clients {
+        let (resumed, _) = observed_handshake(&client, peer).await;
+        // Safari16/iOS14 do not offer the TLS1.2 session-ticket extension.
+        // Their stateful session IDs have no ticket-lifetime hint to expire.
+        let stateful_id =
+            matches!(name, "safari" | "ios") && version.version == rustls::ProtocolVersion::TLSv1_2;
         assert_eq!(
             resumed, stateful_id,
             "{name}/{version:?}: ticket hint expiry"
         );
-        observations.push(serde_json::json!({"profile": name, "version": format!("{:?}", version.version), "phase": "after-hint", "resumed": resumed, "prior_ticket_bytes": prior_ticket_bytes, "records_b64": STANDARD.encode(bytes)}));
-    }
-    if let Ok(path) = std::env::var("VOLE_FINGERPRINT_WARM_CAPTURE") {
-        std::fs::write(path, serde_json::to_vec_pretty(&observations).unwrap()).unwrap();
     }
 }
 
@@ -175,7 +162,7 @@ async fn named_reality_retains_browser_offer_but_rejects_tls12_server_hello() {
         let ordinary = client(
             &trusted(&chain),
             "fixture.invalid",
-            AnyTlsCertificatePolicy {
+            TlsClientPolicy {
                 client_fingerprint: profile,
                 ..Default::default()
             },

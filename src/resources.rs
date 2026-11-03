@@ -1,5 +1,3 @@
-#[cfg(any(test, feature = "interop-test"))]
-pub mod case_events;
 pub mod observation;
 
 use std::sync::{
@@ -228,6 +226,7 @@ impl RuntimeResourceStats {
                     event = "runtime_dns_response_drop",
                     scope = self.inner.scope,
                     limit,
+                    dns_queue_drops = counter.load(Ordering::Relaxed),
                     "runtime queue dropped an item for the first time"
                 ),
             }

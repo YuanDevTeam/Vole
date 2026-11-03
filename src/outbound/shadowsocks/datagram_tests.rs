@@ -1,5 +1,7 @@
+use super::super::packet_io::PacketIo;
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use shadowsocks::relay::udprelay::{ProxySocket, proxy_socket::UdpSocketType};
 use shadowsocks::{config::ServerType, context::Context, crypto::CipherKind};
 use std::sync::{
     Arc,
@@ -22,6 +24,10 @@ struct MockTransport {
 
 #[async_trait]
 impl DatagramTransport for MockTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
         self.permits.acquire().await.unwrap().forget();
         self.sent.send(packet).await.unwrap();
@@ -58,6 +64,11 @@ impl Fixture {
             method,
         )
         .unwrap();
+        let config = Arc::new(config);
+        Self::with_configs(config.clone(), &config, maximum)
+    }
+
+    fn with_configs(config: Arc<ServerConfig>, server_config: &ServerConfig, maximum: u16) -> Self {
         let (tx, sent) = mpsc::channel(32);
         let (replies, rx) = mpsc::channel(32);
         let permits = Arc::new(Semaphore::new(0));
@@ -72,7 +83,7 @@ impl Fixture {
             Box::new(inner),
             Destination::Ip("127.0.0.1:12345".parse().unwrap()),
             Context::new_shared(ServerType::Local),
-            &config,
+            config,
             maximum,
             maximum.saturating_add(MAX_RESPONSE_HEADER),
         );
@@ -80,7 +91,7 @@ impl Fixture {
         let server = ProxySocket::from_socket(
             UdpSocketType::Server,
             Context::new_shared(ServerType::Server),
-            &config,
+            server_config,
             io.clone(),
         );
         Self {
@@ -136,6 +147,251 @@ fn request(payload: &'static [u8]) -> Datagram {
 }
 
 #[tokio::test]
+async fn udp_authenticated_invalid_headers_do_not_advance_the_replay_window() {
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
+    use bytes::{BufMut, BytesMut};
+    use shadowsocks::crypto::v2::udp::UdpCipher;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    for name in CIPHERS {
+        let method: CipherKind = name.parse().unwrap();
+        let mut f = Fixture::new(name, 1500);
+        let key = vec![7; method.key_len()];
+        let nonce_len = if name == CIPHERS[2] { 24 } else { 0 };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (index, (role, time, padding)) in [
+            (0, now, 0),
+            (1, now - 3600, 0),
+            (1, now + 3600, 0),
+            (1, now, u16::MAX),
+            (1, now, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut wire = BytesMut::new();
+            if nonce_len != 0 {
+                let mut nonce = [0u8; 24];
+                nonce[23] = index as u8;
+                wire.extend_from_slice(&nonce);
+            }
+            wire.put_u64(1);
+            wire.put_u64(1);
+            wire.put_u8(role);
+            wire.put_u64(time);
+            wire.put_u64(f.client.control.client_session_id);
+            wire.put_u16(padding);
+            super::super::address(&target()).write_to_buf(&mut wire);
+            wire.extend_from_slice(b"invalid-header");
+            if index == 4 {
+                wire.truncate(nonce_len + 27);
+            }
+            wire.resize(wire.len() + 16, 0);
+            let cipher = UdpCipher::new(method, &key, 1);
+            if nonce_len != 0 {
+                let (nonce, message) = wire.split_at_mut(nonce_len);
+                cipher.encrypt_packet(nonce, message);
+            } else {
+                let nonce: [u8; 12] = wire[4..16].try_into().unwrap();
+                cipher.encrypt_packet(&nonce, &mut wire[16..]);
+                let block = <&mut aes::Block>::try_from(&mut wire[..16]).unwrap();
+                if name == CIPHERS[0] {
+                    aes::Aes128::new_from_slice(&key)
+                        .unwrap()
+                        .encrypt_block(block);
+                } else {
+                    aes::Aes256::new_from_slice(&key)
+                        .unwrap()
+                        .encrypt_block(block);
+                }
+            }
+            f.replies
+                .send(Datagram {
+                    remote: f.client.server.clone(),
+                    payload: wire.freeze(),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+        }
+        let valid = f.response(&f.control(1, 1), b"valid-after-rejection").await;
+        f.replies.send(valid).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(1), f.client.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.remote, target());
+        assert_eq!(received.payload, &b"valid-after-rejection"[..]);
+        assert_eq!(f.client.sessions.len(), 1);
+        f.client.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn udp_empty_payload_preserves_cancellation_ids_and_official_decoding() {
+    for name in CIPHERS {
+        let mut f = Fixture::new(name, 1500);
+        let session_id = f.client.control.client_session_id;
+        let mut pending = Box::pin(f.client.send(request(b"")));
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        drop(pending);
+        assert_eq!(f.client.control.packet_id, 1);
+        assert!(f.sent.try_recv().is_err());
+
+        f.permits.add_permits(2);
+        f.client.send(request(b"")).await.unwrap();
+        let wire = f.sent.recv().await.unwrap();
+        let minimum = f.client.request_header + super::super::address(&target()).serialized_len();
+        assert!((minimum..=minimum + 900).contains(&wire.payload.len()));
+        let (body, control) = f.decode_request(wire).await;
+        assert!(body.is_empty());
+        assert_eq!(control.client_session_id, session_id);
+        assert_eq!(control.packet_id, 2);
+
+        // Switching back to the ordinary nonempty codec keeps one association
+        // and never replays the cancelled empty packet or a stale handoff.
+        f.client.send(request(b"after-empty")).await.unwrap();
+        let wire = f.sent.recv().await.unwrap();
+        let (body, control) = f.decode_request(wire).await;
+        assert_eq!(body, b"after-empty");
+        assert_eq!(control.client_session_id, session_id);
+        assert_eq!(control.packet_id, 3);
+        assert!(f.sent.try_recv().is_err());
+        f.client.close().await.unwrap();
+        assert!(f.closed.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn udp_empty_payload_keeps_aes_eih_authentication() {
+    use shadowsocks::config::{ServerUser, ServerUserManager};
+
+    for name in &CIPHERS[..2] {
+        let method: CipherKind = name.parse().unwrap();
+        let identity = vec![3; method.key_len()];
+        let user_key = vec![7; method.key_len()];
+        let password = format!(
+            "{}:{}",
+            STANDARD.encode(&identity),
+            STANDARD.encode(&user_key)
+        );
+        let config = Arc::new(ServerConfig::new(("127.0.0.1", 12345), password, method).unwrap());
+        let mut server_config =
+            ServerConfig::new(("127.0.0.1", 12345), STANDARD.encode(&identity), method).unwrap();
+        let mut users = ServerUserManager::new();
+        users.add_user(ServerUser::new("fixture", user_key.clone()));
+        server_config.set_user_manager(users);
+        let mut f = Fixture::with_configs(config, &server_config, 1500);
+        f.permits.add_permits(1);
+        f.client.send(request(b"")).await.unwrap();
+        let wire = f.sent.recv().await.unwrap();
+        let minimum = f.client.request_header + super::super::address(&target()).serialized_len();
+        assert!((minimum..=minimum + 900).contains(&wire.payload.len()));
+        let (body, control) = f.decode_request(wire).await;
+        assert!(body.is_empty());
+        assert_eq!(
+            control.client_session_id,
+            f.client.control.client_session_id
+        );
+        assert_eq!(control.packet_id, 1);
+        assert_eq!(control.user.unwrap().key(), user_key);
+        f.client.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn udp_busy_sender_yields_before_accepting_another_wire_packet() {
+    for name in CIPHERS {
+        let mut f = Fixture::new(name, 1500);
+        f.permits.add_permits(2 * SEND_BURST + 1);
+        for _ in 0..SEND_BURST {
+            f.client.send(request(b"burst")).await.unwrap();
+        }
+        // With writable IO, a new send must give other ready tasks a turn
+        // before adding another packet to the physical peer's burst.
+        let mut sending = Box::pin(f.client.send(request(b"after-burst")));
+        assert!(futures_util::poll!(&mut sending).is_pending());
+        assert_eq!(f.sent.len(), SEND_BURST);
+        drop(sending);
+        // Cancellation at that scheduling boundary has not encoded or sent
+        // the new packet, and must not poison its nonce/control ownership.
+        f.client.send(request(b"resumed")).await.unwrap();
+        assert_eq!(f.sent.len(), SEND_BURST + 1);
+        assert_eq!(f.client.control.packet_id, SEND_BURST as u64 + 1);
+        let progressed = Arc::new(AtomicBool::new(false));
+        let sibling = {
+            let progressed = progressed.clone();
+            tokio::spawn(async move { progressed.store(true, Ordering::SeqCst) })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for _ in 0..SEND_BURST {
+                f.client.send(request(b"more")).await.unwrap();
+            }
+        })
+        .await
+        .expect("writable packets must continue after yielding");
+        assert!(
+            progressed.load(Ordering::SeqCst),
+            "busy sending starved a ready sibling"
+        );
+        sibling.await.unwrap();
+        assert_eq!(f.sent.len(), 2 * SEND_BURST + 1);
+        f.client.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn udp_one_session_preserves_multiple_ip_targets_across_receive_cancellation() {
+    for name in CIPHERS {
+        let mut f = Fixture::new(name, 1500);
+        let shareable = f.client.supports_shared_destinations();
+        let id = f.client.control.client_session_id;
+        for (index, address) in ["192.0.2.1:53", "[2001:db8::1]:443", "192.0.2.1:54"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(futures_util::poll!(f.client.receive()).is_pending());
+            let target = Destination::Ip(address.parse().unwrap());
+            let packet = Datagram {
+                remote: target.clone(),
+                payload: Bytes::from_static(b"multi-target"),
+                sniffed_domain: None,
+            };
+            f.permits.add_permits(1);
+            f.client.send(packet.clone()).await.unwrap();
+            f.io.put(f.sent.recv().await.unwrap().payload).unwrap();
+            let mut buffer = [0; 2048];
+            let (size, actual, _, control) = f.server.recv_with_ctrl(&mut buffer).await.unwrap();
+            assert_eq!(actual, super::super::address(&target));
+            assert_eq!(&buffer[..size], packet.payload);
+            assert_eq!(control.unwrap().client_session_id, id);
+            f.server
+                .send_with_ctrl(&actual, &f.control(7, index as u64 + 1), &buffer[..size])
+                .await
+                .unwrap();
+            f.replies
+                .send(Datagram {
+                    remote: f.client.server.clone(),
+                    payload: f.io.take().unwrap(),
+                    sniffed_domain: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(f.client.receive().await.unwrap(), packet);
+        }
+        f.client.close().await.unwrap();
+        assert!(f.closed.load(Ordering::SeqCst));
+        assert!(
+            shareable,
+            "multi-target SS must not allocate a transport per IP target"
+        );
+    }
+}
+
+#[tokio::test]
 async fn udp_three_ciphers_pending_cancel_exactly_once_and_close() {
     for name in CIPHERS {
         let mut f = Fixture::new(name, 1500);
@@ -150,7 +406,6 @@ async fn udp_three_ciphers_pending_cancel_exactly_once_and_close() {
         );
         assert_eq!(f.client.control.packet_id, 1);
         assert!(f.sent.try_recv().is_err());
-        assert!(f.client.io.take().is_err());
         f.permits.add_permits(1);
         f.client.send(request(b"once")).await.unwrap();
         let wire = f.sent.recv().await.unwrap();
@@ -275,7 +530,6 @@ async fn udp_invalid_packets_and_limits_do_not_poison_replay_state() {
             assert_eq!(actual.payload.len(), usize::from(maximum));
             assert!(actual.payload.iter().all(|byte| *byte == 0x5a));
             assert_eq!(f.client.sessions.len(), 1);
-            assert!(f.client.io.take().is_err());
         }
     }
 }
@@ -316,7 +570,6 @@ async fn udp_encoded_wire_exact_limit_and_one_over_never_reach_inner_io() {
                 .is_err()
         );
         assert!(f.sent.try_recv().is_err());
-        assert!(f.client.io.take().is_err());
         // A rejected oversized send neither poisons the slot nor reuses its ID.
         f.client.send(request(b"after-limit")).await.unwrap();
         let sent = f.sent.recv().await.unwrap();
@@ -328,5 +581,113 @@ async fn udp_encoded_wire_exact_limit_and_one_over_never_reach_inner_io() {
             f.client.control.client_session_id,
             other.client.control.client_session_id
         );
+    }
+}
+
+#[tokio::test]
+async fn udp_session_owned_codec_keeps_nonempty_eih_cancel_ids_and_encoded_limit() {
+    use shadowsocks::config::{ServerUser, ServerUserManager};
+
+    for name in &CIPHERS[..2] {
+        let method: CipherKind = name.parse().unwrap();
+        let identity = vec![3; method.key_len()];
+        let user_key = vec![7; method.key_len()];
+        let password = format!(
+            "{}:{}",
+            STANDARD.encode(&identity),
+            STANDARD.encode(&user_key)
+        );
+        let config = Arc::new(ServerConfig::new(("127.0.0.1", 12345), password, method).unwrap());
+        assert_eq!(config.identity_keys().len(), 1);
+        let mut server_config =
+            ServerConfig::new(("127.0.0.1", 12345), STANDARD.encode(&identity), method).unwrap();
+        let mut users = ServerUserManager::new();
+        users.add_user(ServerUser::new("fixture", user_key.clone()));
+        server_config.set_user_manager(users);
+        let mut f = Fixture::with_configs(config, &server_config, MAX_WIRE_PACKET as u16);
+        let session_id = f.client.control.client_session_id;
+
+        let mut cancelled = Box::pin(f.client.send(request(b"cancelled-EIH")));
+        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        drop(cancelled);
+        assert_eq!(f.client.control.packet_id, 1);
+        assert!(f.sent.try_recv().is_err());
+
+        f.permits.add_permits(3);
+        let payload = b"nonempty-EIH-body";
+        f.client.send(request(payload)).await.unwrap();
+        let wire = f.sent.recv().await.unwrap();
+        let overhead = 43 + 16 + super::super::address(&target()).serialized_len();
+        assert_eq!(wire.payload.len(), overhead + payload.len());
+        let (body, control) = f.decode_request(wire).await;
+        assert_eq!(body, payload);
+        assert_eq!(control.client_session_id, session_id);
+        assert_eq!(control.packet_id, 2);
+        assert_eq!(control.user.unwrap().key(), user_key);
+
+        let packet = |length| Datagram {
+            remote: target(),
+            payload: Bytes::from(vec![0x5a; length]),
+            sniffed_domain: None,
+        };
+        f.client
+            .send(packet(MAX_WIRE_PACKET - overhead))
+            .await
+            .unwrap();
+        let wire = f.sent.recv().await.unwrap();
+        assert_eq!(wire.payload.len(), MAX_WIRE_PACKET);
+        let (body, control) = f.decode_request(wire).await;
+        assert_eq!(body.len(), MAX_WIRE_PACKET - overhead);
+        assert!(body.iter().all(|byte| *byte == 0x5a));
+        assert_eq!(control.client_session_id, session_id);
+        assert_eq!(control.packet_id, 3);
+        assert_eq!(control.user.unwrap().key(), user_key);
+
+        assert!(
+            f.client
+                .send(packet(MAX_WIRE_PACKET - overhead + 1))
+                .await
+                .is_err()
+        );
+        assert!(f.sent.try_recv().is_err());
+        f.client.send(request(b"after-limit")).await.unwrap();
+        let wire = f.sent.recv().await.unwrap();
+        let (body, control) = f.decode_request(wire).await;
+        assert_eq!(body, b"after-limit");
+        assert_eq!(control.client_session_id, session_id);
+        assert_eq!(control.packet_id, 5);
+        assert_eq!(control.user.unwrap().key(), user_key);
+        f.client.close().await.unwrap();
+        assert!(f.closed.load(Ordering::SeqCst));
+        assert!(f.client.send(request(b"closed")).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn udp_unauthenticated_session_ids_never_fill_retained_cipher_slots() {
+    for name in CIPHERS {
+        let mut f = Fixture::new(name, 1500);
+        for id in 100..116 {
+            let mut rejected = f.response(&f.control(id, 1), b"unauthenticated").await;
+            let mut bytes = rejected.payload.to_vec();
+            *bytes.last_mut().unwrap() ^= 1;
+            rejected.payload = bytes.into();
+            f.replies.send(rejected).await.unwrap();
+        }
+        let valid = f.response(&f.control(1, 1), b"first-valid-session").await;
+        f.replies.send(valid).await.unwrap();
+        let actual = tokio::time::timeout(Duration::from_secs(1), f.client.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.payload, &b"first-valid-session"[..]);
+        assert_eq!(f.client.sessions.len(), 1);
+        assert_eq!(f.client.sessions[0].id, 1);
+        assert_eq!(f.client.sessions[0].cipher.is_some(), name != CIPHERS[2]);
+        assert!(f.client.tx_cipher.is_some());
+        f.client.close().await.unwrap();
+        assert!(f.client.tx_cipher.is_none());
+        assert!(f.client.sessions.is_empty());
+        assert!(f.closed.load(Ordering::SeqCst));
     }
 }

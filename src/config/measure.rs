@@ -1,20 +1,17 @@
 use serde::Deserialize;
-use serde_yaml_ng::Value as YamlValue;
 
 use crate::{Result, VoleError};
 
-use super::{
-    MAX_CONFIG_BYTES, ProxyConfig, ProxyId, RawOutbound, RouteTargetId, normalize_proxy_graph,
-    reject_yaml_anchors_and_aliases, validate_json_compatible_yaml,
-};
+use super::{ProxyConfig, ProxyId, RawOutbound, RouteTargetId, normalize_proxy_graph};
 
-/// Strict node-only configuration accepted by the built-in latency runner.
+/// Strict node graph and client trust accepted by the built-in latency runner.
 ///
 /// A measurement never owns an inbound, routing rules, DNS, sniffer state, or
 /// GeoData. Keeping a separate deserializer makes those fields unknown rather
 /// than silently ignoring runtime-only behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MeasureConfig {
+    pub(crate) tls: super::TlsTrustConfig,
     pub(crate) proxies: Vec<ProxyConfig>,
     pub(crate) default_proxy: ProxyId,
 }
@@ -22,23 +19,33 @@ pub(crate) struct MeasureConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMeasureConfig {
+    #[serde(
+        default,
+        deserialize_with = "super::tls_trust::deserialize_client_only"
+    )]
+    tls: super::TlsTrustConfig,
     proxies: Vec<RawOutbound>,
 }
 
 impl MeasureConfig {
     pub(crate) fn parse_yaml(input: &[u8]) -> Result<Self> {
-        if input.len() > MAX_CONFIG_BYTES {
-            return Err(VoleError::InvalidConfig(format!(
-                "configuration exceeds the {MAX_CONFIG_BYTES}-byte limit"
-            )));
-        }
-        let input = std::str::from_utf8(input)
-            .map_err(|_| VoleError::InvalidConfig("configuration is not UTF-8".to_owned()))?;
+        Self::parse_yaml_with_directory(input, None)
+    }
 
-        reject_yaml_anchors_and_aliases(input)?;
-        let yaml: YamlValue = serde_yaml_ng::from_str(input)
-            .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
-        validate_json_compatible_yaml(&yaml)?;
+    pub(crate) fn parse_yaml_with_directory(
+        input: &[u8],
+        directory: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        let mut yaml = super::yaml::parse(input)?;
+        if let Some(nodes) = yaml
+            .get_mut("proxies")
+            .and_then(serde_yaml_ng::Value::as_sequence_mut)
+        {
+            let mut identities = super::identity_files::IdentityFiles::new(directory);
+            for node in nodes {
+                identities.inline_node(node)?;
+            }
+        }
         let raw: RawMeasureConfig = serde_yaml_ng::from_value(yaml)
             .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
         raw.normalize()
@@ -48,6 +55,14 @@ impl MeasureConfig {
 impl RawMeasureConfig {
     fn normalize(self) -> Result<MeasureConfig> {
         let (proxies, _) = normalize_proxy_graph(self.proxies)?;
+        if proxies
+            .iter()
+            .any(|node| matches!(&node.protocol, super::ProxyProtocol::Rematch(_)))
+        {
+            return Err(VoleError::InvalidConfig(
+                "measurement requires concrete proxy nodes, not rematch controls".into(),
+            ));
+        }
         let mut referenced_as_parent = vec![false; proxies.len()];
         for proxy in &proxies {
             if let Some(RouteTargetId::Proxy(parent)) = proxy.dialer_proxy {
@@ -93,6 +108,7 @@ impl RawMeasureConfig {
         }
 
         Ok(MeasureConfig {
+            tls: self.tls,
             proxies,
             default_proxy,
         })
@@ -102,16 +118,20 @@ impl RawMeasureConfig {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn measurement_rejects_future_protocols_and_oversized_documents() {
-        let _case = crate::resources::case_events::Case::new(
-            "FOUNDATIONS-SCHEMA",
-            "measurement_rejects_future_protocols_and_oversized_documents",
-        );
-        let yaml =
-            b"proxies:\n  - name: node\n    type: wireguard\n    server: example.com\n    port: 443\n";
-        assert!(super::MeasureConfig::parse_yaml(yaml).is_err());
+    fn measurement_rejects_routing_only_rematch_nodes() {
         assert!(
-            super::MeasureConfig::parse_yaml(&vec![b'x'; super::MAX_CONFIG_BYTES + 1]).is_err()
+            super::MeasureConfig::parse_yaml(
+                b"proxies: [{name: mark, type: rematch, target-rematch-name: blue}]\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn measurement_rejects_oversized_documents() {
+        assert!(
+            super::MeasureConfig::parse_yaml(&vec![b'x'; super::super::MAX_CONFIG_BYTES + 1])
+                .is_err()
         );
     }
 
@@ -180,6 +200,27 @@ proxies:
     }
 
     #[test]
+    fn measurement_accepts_client_trust_without_accepting_tls_server_settings() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let certificate = rcgen::generate_simple_self_signed(vec!["measure.example".into()])
+            .unwrap()
+            .cert;
+        let yaml = format!(
+            "tls:\n  custom-certifactes:\n    - |\n      -----BEGIN CERTIFICATE-----\n      {}\n      -----END CERTIFICATE-----\n{NODE}",
+            STANDARD.encode(certificate.der())
+        );
+        let config = MeasureConfig::parse_yaml(yaml.as_bytes()).unwrap();
+        assert_eq!(config.tls.certificates.len(), 1);
+        assert_eq!(config.proxies.len(), 1);
+        assert!(
+            MeasureConfig::parse_yaml(
+                format!("tls: {{ certificate: cert.pem }}\n{NODE}").as_bytes()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn reuses_proxy_graph_validation() {
         let chain = NODE.replace(
             "  - name: proxy\n",
@@ -214,10 +255,10 @@ proxies:
     }
 
     #[test]
-    fn rejects_non_json_yaml() {
+    fn accepts_bounded_yaml_templates() {
         assert!(
             MeasureConfig::parse_yaml(NODE.replace("name: proxy", "name: &tag proxy").as_bytes())
-                .is_err()
+                .is_ok()
         );
     }
 

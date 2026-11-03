@@ -16,24 +16,28 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     io,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
     io::AsyncWriteExt,
-    sync::{Mutex as AsyncMutex, oneshot},
+    sync::{Mutex as AsyncMutex, watch},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-/// A node owns its authenticated connection and every driver used by that
-/// connection. Individual streams never own the shared cancellation token.
+/// A node owns its authenticated sessions and all their drivers. Individual
+/// streams never own a shared session's cancellation token.
 pub struct Hysteria2Outbound {
     config: Arc<Hysteria2OutboundConfig>,
     server: Destination,
     upstream: UpstreamPath,
-    tls: Arc<rustls::ClientConfig>,
-    current: AsyncMutex<Option<Arc<Session>>>,
+    tls: StandardTlsClient,
+    realm_tls: Option<StandardTlsClient>,
+    current: Box<[AsyncMutex<Option<Arc<Handshake>>>]>,
+    pacer: Arc<super::bandwidth::Pacer>,
     cancel: CancellationToken,
     admission: Mutex<()>,
     tasks: TaskTracker,
@@ -48,6 +52,76 @@ struct Session {
     bandwidth: Arc<super::bandwidth::Bandwidth>,
 }
 
+#[derive(Clone)]
+enum Ready {
+    Pending,
+    Open(Arc<Session>),
+    Failed(Arc<DispatchError>),
+}
+
+/// A slot retains its offer even when every waiting call has gone away. The
+/// driver owns publication and holds no Handshake Arc, so there is no cycle.
+struct Handshake {
+    cancel: CancellationToken,
+    ready: watch::Receiver<Ready>,
+}
+
+impl Handshake {
+    fn initializing(&self) -> bool {
+        matches!(*self.ready.borrow(), Ready::Pending)
+    }
+
+    fn finished(&self) -> bool {
+        matches!(*self.ready.borrow(), Ready::Failed(_))
+    }
+
+    async fn wait_ready(&self) -> Result<Arc<Session>, DispatchError> {
+        let mut ready = self.ready.clone();
+        loop {
+            let state = ready.borrow_and_update().clone();
+            match state {
+                Ready::Open(session) => {
+                    if session.cancel.is_cancelled() || session.connection.close_reason().is_some()
+                    {
+                        return Err(DispatchError::ConnectionRefused);
+                    }
+                    return Ok(session);
+                }
+                Ready::Failed(error) => return Err(copy_failure(&error)),
+                Ready::Pending => {}
+            }
+            if ready.changed().await.is_err() {
+                return Err(DispatchError::ConnectionRefused);
+            }
+        }
+    }
+}
+
+struct CreationGuard<'a> {
+    handshake: &'a Handshake,
+    armed: bool,
+}
+
+impl Drop for CreationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed && self.handshake.initializing() {
+            self.handshake.cancel.cancel();
+        }
+    }
+}
+
+fn copy_failure(error: &DispatchError) -> DispatchError {
+    match error {
+        DispatchError::NotAllowed => DispatchError::NotAllowed,
+        DispatchError::RuleEvaluation(failure) => DispatchError::RuleEvaluation(*failure),
+        DispatchError::NetworkUnreachable => DispatchError::NetworkUnreachable,
+        DispatchError::HostUnreachable => DispatchError::HostUnreachable,
+        DispatchError::ConnectionRefused => DispatchError::ConnectionRefused,
+        DispatchError::TimedOut => DispatchError::TimedOut,
+        DispatchError::Other(message) => DispatchError::Other(message.clone()),
+    }
+}
+
 impl std::fmt::Debug for Hysteria2Outbound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Hysteria2Outbound").finish_non_exhaustive()
@@ -58,15 +132,21 @@ impl Hysteria2Outbound {
     /// Test-only controller/path evidence; no configuration or traffic addresses.
     #[cfg(feature = "interop-test")]
     pub async fn congestion_observation(&self) -> Option<(u64, quinn::ConnectionStats)> {
-        self.current.lock().await.as_ref().map(|session| {
-            (
-                session
-                    .bandwidth
-                    .rate
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                session.connection.stats(),
-            )
-        })
+        for slot in &self.current {
+            let slot = slot.lock().await;
+            if let Some(handshake) = slot.as_ref()
+                && let Ready::Open(session) = &*handshake.ready.borrow()
+            {
+                return Some((
+                    session
+                        .bandwidth
+                        .rate
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    session.connection.stats(),
+                ));
+            }
+        }
+        None
     }
     pub fn new_with_path(
         config: &Hysteria2OutboundConfig,
@@ -92,6 +172,7 @@ impl Hysteria2Outbound {
             security,
             &config.tls.server_name,
             TlsClientOptions {
+                ech: config.tls.ech.clone(),
                 versions: TlsVersions::Tls13,
                 alpn: config.tls.alpn.clone(),
                 certificate: config.tls.certificate.clone(),
@@ -99,23 +180,55 @@ impl Hysteria2Outbound {
                     .tls
                     .identity
                     .as_ref()
-                    .map(|identity| {
-                        TlsClientIdentity::from_pem(&identity.certificate, &identity.private_key)
-                    })
+                    .map(|identity| TlsClientIdentity::from_config(identity, security))
                     .transpose()?,
                 ..Default::default()
             },
             resumption_sessions,
             buffer_limit,
-        )?
-        .quic_config()?
-        .0;
+        )?;
+        let realm_tls = config
+            .realm
+            .as_ref()
+            .and_then(|options| options.tls.as_ref())
+            .map(|policy| {
+                StandardTlsClient::with_options(
+                    security,
+                    &policy.server_name,
+                    TlsClientOptions {
+                        versions: TlsVersions::Tls12And13,
+                        alpn: policy.alpn.clone(),
+                        certificate: policy.certificate.clone(),
+                        identity: policy
+                            .identity
+                            .as_ref()
+                            .map(|identity| TlsClientIdentity::from_config(identity, security))
+                            .transpose()?,
+                        ..Default::default()
+                    },
+                    0,
+                    buffer_limit,
+                )
+            })
+            .transpose()?;
+        // Spread UDP receive/forward work across a small lazy pool. A one-byte
+        // receive declaration cannot be divided.
+        let count = if config.down != 1 {
+            crate::limits::HY2_AUTH_SESSIONS
+        } else {
+            1
+        };
         Ok(Self {
             config: Arc::new(config.clone()),
             server: server_destination(&config.address, config.port)?,
             upstream,
             tls,
-            current: AsyncMutex::new(None),
+            realm_tls,
+            current: (0..count)
+                .map(|_| AsyncMutex::new(None))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            pacer: Arc::new(super::bandwidth::Pacer::default()),
             cancel: CancellationToken::new(),
             admission: Mutex::new(()),
             tasks: TaskTracker::new(),
@@ -131,38 +244,89 @@ impl Hysteria2Outbound {
             return Err(DispatchError::TimedOut);
         }
         let _waiter = observation::track(ResourceKind::Waiter);
+        let mut hash = DefaultHasher::new();
+        datagram.source.hash(&mut hash);
+        let index = (hash.finish() % self.current.len() as u64) as usize;
         tokio::select! {biased;
             () = self.cancel.cancelled() => Err(DispatchError::NotAllowed),
             result = context.run("Hysteria2 session", async {
-                let mut current = self.current.lock().await;
-                if let Some(session) = current.as_ref().filter(|session|
-                    !session.cancel.is_cancelled() && session.connection.close_reason().is_none()) {
-                    return Ok(session.clone());
-                }
-                current.take();
-                let (ready, reply) = oneshot::channel();
-                let cancel = self.cancel.child_token();
-                let guard = cancel.clone().drop_guard();
-                {
-                    let _admission = self.admission.lock().unwrap();
-                    if self.cancel.is_cancelled() { return Err(DispatchError::NotAllowed); }
-                    let config = self.config.clone();
-                    let upstream = self.upstream.clone();
-                    let server = self.server.clone();
-                    let tls = self.tls.clone();
-                    let context = context.clone();
-                    let task = observation::track(ResourceKind::Task);
-                    self.tasks.spawn(observation::bind(async move {
-                        let _task = task;
-                        drive(config, upstream, server, tls, datagram, context, cancel, ready).await;
-                    }));
-                }
-                let session = reply.await.map_err(|_| DispatchError::ConnectionRefused)??;
-                guard.disarm();
-                *current = Some(session.clone());
-                Ok(session)
+                let mut current = self.current[index].lock().await;
+                // A failed offer becomes replaceable only after its driver has
+                // finished cleanup. Repeated calls cannot stack retiring tasks.
+                let (handshake, created) = match current.as_ref().filter(|offer| !offer.finished()) {
+                    Some(handshake) => (handshake.clone(), false),
+                    None => {
+                        let handshake = self.start_handshake(index, datagram, context)?;
+                        *current = Some(handshake.clone());
+                        (handshake, true)
+                    }
+                };
+                let independent = !self.config.handshake_timeout.is_zero();
+                // Default offers retain the creator's serialization and
+                // cancellation semantics. Positive timeouts share a pending
+                // offer without keeping its first waiter or the slot lock.
+                if independent { drop(current); }
+                let mut guard = CreationGuard {
+                    handshake: &handshake,
+                    armed: created && !independent,
+                };
+                let result = handshake.wait_ready().await;
+                guard.armed = false;
+                result
             }) => result,
         }
+    }
+
+    fn start_handshake(
+        &self,
+        index: usize,
+        datagram: DatagramSession,
+        context: &EstablishContext,
+    ) -> Result<Arc<Handshake>, DispatchError> {
+        let _admission = self.admission.lock().unwrap();
+        if self.cancel.is_cancelled() {
+            return Err(DispatchError::NotAllowed);
+        }
+        let context = if self.config.handshake_timeout.is_zero() {
+            context.clone()
+        } else {
+            context.hysteria2_handshake(self.config.handshake_timeout)?
+        };
+        let cancel = self.cancel.child_token();
+        let (ready, receive) = watch::channel(Ready::Pending);
+        let handshake = Arc::new(Handshake {
+            cancel: cancel.clone(),
+            ready: receive,
+        });
+        let config = self.config.clone();
+        let upstream = self.upstream.clone();
+        let server = self.server.clone();
+        let tls = self.tls.clone();
+        let realm_tls = self.realm_tls.clone();
+        let bandwidth = Arc::new(super::bandwidth::Bandwidth::with_pacer(self.pacer.clone()));
+        let count = self.current.len() as u64;
+        let receive_rate =
+            self.config.down / count + u64::from((index as u64) < self.config.down % count);
+        let task = observation::track(ResourceKind::Task);
+        self.tasks.spawn(observation::bind(async move {
+            let _task = task;
+            drive(
+                config,
+                upstream,
+                server,
+                tls,
+                realm_tls,
+                datagram,
+                context,
+                cancel,
+                ready,
+                bandwidth,
+                receive_rate,
+                count as usize,
+            )
+            .await;
+        }));
+        Ok(handshake)
     }
 }
 
@@ -176,7 +340,8 @@ impl OutboundConnector for Hysteria2Outbound {
         let request = super::wire::tcp_request(&session.destination)?;
         let shared = self
             .session(
-                DatagramSession::new(session.inbound, session.source),
+                DatagramSession::new(session.inbound, session.source)
+                    .with_metadata(session.metadata.clone()),
                 context,
             )
             .await?;
@@ -186,7 +351,7 @@ impl OutboundConnector for Hysteria2Outbound {
                 let (mut send, recv) = shared.connection.open_bi().await.map_err(failure)?;
                 tokio::io::AsyncWriteExt::write_all(&mut send, &request).await?;
                 send.flush().await?;
-                let stream = super::stream::TcpStream::new(recv, send, context.deadline());
+                let stream = super::stream::TcpStream::new(recv, send);
                 Ok(ConnectedStream {
                     io: Box::new(OwnedStream::new(Box::new(stream), shared.cancel.child_token())),
                     effective_peer: session.destination,
@@ -221,7 +386,9 @@ impl OutboundConnector for Hysteria2Outbound {
     async fn shutdown(&self) {
         self.begin_shutdown();
         self.tasks.wait().await;
-        self.current.lock().await.take();
+        for slot in &self.current {
+            slot.lock().await.take();
+        }
     }
 }
 
@@ -236,21 +403,31 @@ async fn drive(
     config: Arc<Hysteria2OutboundConfig>,
     upstream: UpstreamPath,
     server: Destination,
-    tls: Arc<rustls::ClientConfig>,
+    tls: StandardTlsClient,
+    realm_tls: Option<StandardTlsClient>,
     datagram: DatagramSession,
     context: EstablishContext,
     cancel: CancellationToken,
-    ready: oneshot::Sender<Result<Arc<Session>, DispatchError>>,
+    ready: watch::Sender<Ready>,
+    bandwidth: Arc<super::bandwidth::Bandwidth>,
+    receive_rate: u64,
+    session_count: usize,
 ) {
     let runtime = Arc::new(OwnedRuntime::new(CancellationToken::new()));
-    let mut ready = Some(ready);
     let mut endpoint = None;
     let mut paths = None;
-    let datagrams = Arc::new(super::datagram::Registry::default());
-    let bandwidth = Arc::new(super::bandwidth::Bandwidth::default());
+    let mut realm_pending = super::realm::Pending::default();
+    let (datagrams, submissions) = super::datagram::Registry::new();
+    let datagrams = Arc::new(datagrams);
     let _pool = observation::track(ResourceKind::Pool);
+    let established = CancellationToken::new();
+    let deadline = context.deadline();
     let operation = async {
         let _handshake = observation::track(ResourceKind::Handshake);
+        let (tls, _) = tls
+            .quic_config_with_context(&context)
+            .await
+            .map_err(failure)?;
         let (path, socket) = super::paths::Paths::open(
             config.clone(),
             upstream,
@@ -258,23 +435,33 @@ async fn drive(
             datagram,
             context,
             bandwidth.clone(),
+            super::paths::RealmSetup {
+                tls: realm_tls.as_ref(),
+                pending: &mut realm_pending,
+            },
         )
         .await?;
         let peer = path.peer;
         let mtu = path.mtu;
         paths = Some(path);
         let mut limits = quinn::TransportConfig::default();
+        quic::configure_receive_windows(
+            &mut limits,
+            config.stream_window,
+            config.connection_window,
+            quic::RECEIVE_WINDOW_POLICY,
+        )?;
         limits
             .initial_mtu(mtu)
             .min_mtu(mtu)
             .mtu_discovery_config(None)
             .max_concurrent_bidi_streams(0_u8.into())
             .max_concurrent_uni_streams((crate::limits::HY2_UNI_STREAMS as u32).into())
-            .stream_receive_window((crate::limits::HY2_STREAM_WINDOW as u32).into())
-            .receive_window((crate::limits::HY2_CONNECTION_WINDOW as u32).into())
-            .send_window(crate::limits::HY2_CONNECTION_WINDOW as u64)
-            .datagram_receive_buffer_size(Some(crate::limits::HY2_DATAGRAM_BUFFER))
-            .datagram_send_buffer_size(crate::limits::HY2_DATAGRAM_BUFFER)
+            .send_window((crate::limits::HY2_SEND_WINDOW / session_count) as u64)
+            .datagram_receive_buffer_size(Some(
+                crate::limits::HY2_DATAGRAM_RECEIVE_BUFFER / session_count,
+            ))
+            .datagram_send_buffer_size(crate::limits::HY2_DATAGRAM_SEND_BUFFER / session_count)
             .max_idle_timeout(Some(Duration::from_secs(30).try_into().map_err(failure)?))
             .keep_alive_interval(Some(Duration::from_secs(10)))
             .congestion_controller_factory(bandwidth.clone());
@@ -306,7 +493,7 @@ async fn drive(
                 "Hysteria-Auth",
                 http::HeaderValue::from_bytes(config.password.as_bytes()).map_err(failure)?,
             )
-            .header("Hysteria-CC-RX", config.down.to_string())
+            .header("Hysteria-CC-RX", receive_rate.to_string())
             .header("Hysteria-Padding", "padding")
             .body(())
             .map_err(failure)?;
@@ -346,15 +533,16 @@ async fn drive(
             #[cfg(feature = "interop-test")]
             bandwidth: bandwidth.clone(),
         });
-        ready
-            .take()
-            .unwrap()
-            .send(Ok(session))
-            .map_err(|_| DispatchError::ConnectionRefused)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DispatchError::TimedOut);
+        }
+        established.cancel();
+        ready.send_replace(Ready::Open(session));
         tokio::select! {
             _ = connection.closed() => {},
             _ = control.wait_idle() => {},
             _ = super::datagram::receive(&connection, &datagrams) => {},
+            _ = super::datagram::transmit(&connection, &datagrams, submissions) => {},
             _ = paths.as_mut().unwrap().hopping(endpoint.as_ref().unwrap()) => {},
         }
         drop(requests);
@@ -362,25 +550,198 @@ async fn drive(
     };
     let result = tokio::select! {biased;
         () = cancel.cancelled() => Err(DispatchError::NotAllowed),
+        () = async { tokio::select! { biased; () = established.cancelled() => std::future::pending::<()>().await, () = tokio::time::sleep_until(deadline) => {} } } => Err(DispatchError::TimedOut),
         result = operation => result,
     };
     cancel.cancel();
     datagrams.close();
-    if let Some(ready) = ready {
-        let _ = ready.send(Err(result
-            .err()
-            .unwrap_or(DispatchError::ConnectionRefused)));
-    }
     if let Some(endpoint) = endpoint {
         endpoint.close(0_u8.into(), b"");
         let _ = tokio::time::timeout(quic::CLOSE_TIMEOUT, endpoint.wait_idle()).await;
     }
     runtime.stop().await;
+    realm_pending.stop().await;
     if let Some(mut paths) = paths {
         paths.stop().await;
     }
+    ready.send_replace(Ready::Failed(Arc::new(
+        result.err().unwrap_or(DispatchError::ConnectionRefused),
+    )));
 }
 
 fn failure(_: impl std::fmt::Display) -> io::Error {
     io::Error::other("Hysteria2 QUIC exchange failed")
+}
+
+#[cfg(test)]
+mod shared_handshake_memory_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::{sync::Notify, time::Instant};
+
+    #[derive(Default)]
+    struct PendingUpstream {
+        entered: Notify,
+        fail: Notify,
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        deadline: Mutex<Option<Instant>>,
+    }
+
+    struct Active<'a>(&'a AtomicUsize);
+
+    impl Drop for Active<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait]
+    impl OutboundConnector for PendingUpstream {
+        async fn connect_stream(
+            &self,
+            _session: StreamSession,
+            _context: &EstablishContext,
+        ) -> Result<ConnectedStream, DispatchError> {
+            panic!("memory fixture does not create a stream")
+        }
+
+        async fn open_datagram(
+            &self,
+            _request: DatagramRequest,
+            context: &EstablishContext,
+        ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.active.fetch_add(1, Ordering::Relaxed);
+            let _active = Active(&self.active);
+            *self.deadline.lock().unwrap() = Some(context.deadline());
+            self.entered.notify_one();
+            // Stop before creating any socket, QUIC endpoint or peer. The
+            // actual production owner/driver/cancellation path remains in use.
+            self.fail.notified().await;
+            Err(DispatchError::ConnectionRefused)
+        }
+    }
+
+    fn outbound(seconds: u64, upstream: Arc<PendingUpstream>) -> Hysteria2Outbound {
+        let config = crate::config::Config::parse_yaml(
+            format!(
+                "proxies: [{{name: synthetic, type: hysteria2, server: 192.0.2.10, port: 443, password: synthetic, handshake-timeout: {seconds}}}]"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let crate::config::ProxyProtocol::Hysteria2(config) = &config.proxies[0].protocol else {
+            panic!("Hysteria2 configuration")
+        };
+        Hysteria2Outbound::new_with_path(config, UpstreamPath::proxy(upstream)).unwrap()
+    }
+
+    fn datagram() -> DatagramSession {
+        DatagramSession::new(
+            crate::session::InboundKind::Tun,
+            "192.0.2.1:1000".parse().unwrap(),
+        )
+    }
+
+    async fn current(outbound: &Hysteria2Outbound) -> Arc<Handshake> {
+        for slot in &outbound.current {
+            if let Some(handshake) = slot.lock().await.as_ref() {
+                return handshake.clone();
+            }
+        }
+        panic!("an offer was admitted")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn positive_offer_survives_waiter_timeout_and_last_waiter_drop() {
+        let upstream = Arc::new(PendingUpstream::default());
+        let outbound = outbound(5, upstream.clone());
+        let short = EstablishContext::with_timeout(Duration::from_millis(10));
+        let long = EstablishContext::with_timeout(Duration::from_secs(10));
+        let mut creator = Box::pin(outbound.session(datagram(), &short));
+        assert!(futures_util::poll!(creator.as_mut()).is_pending());
+        upstream.entered.notified().await;
+        let handshake = current(&outbound).await;
+        let weak = Arc::downgrade(&handshake);
+        let mut waiter = Box::pin(outbound.session(datagram(), &long));
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert!(matches!(creator.await, Err(DispatchError::TimedOut)));
+        assert!(!handshake.cancel.is_cancelled());
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        drop(waiter);
+        assert!(!handshake.cancel.is_cancelled());
+        assert!(handshake.initializing());
+        assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(upstream.active.load(Ordering::Relaxed), 1);
+        assert!(*upstream.deadline.lock().unwrap().as_ref().unwrap() > short.deadline());
+        outbound.shutdown().await;
+        assert!(handshake.finished());
+        assert_eq!(upstream.active.load(Ordering::Relaxed), 0);
+        assert!(outbound.tasks.is_empty());
+        drop(handshake);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_offer_keeps_creator_cancellation_and_one_serialized_attempt() {
+        let upstream = Arc::new(PendingUpstream::default());
+        let outbound = outbound(0, upstream.clone());
+        let context = EstablishContext::with_timeout(Duration::from_secs(5));
+        let mut creator = Box::pin(outbound.session(datagram(), &context));
+        assert!(futures_util::poll!(creator.as_mut()).is_pending());
+        upstream.entered.notified().await;
+        let mut waiter = Box::pin(outbound.session(datagram(), &context));
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        drop(waiter);
+        assert_eq!(upstream.active.load(Ordering::Relaxed), 1);
+        assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(*upstream.deadline.lock().unwrap(), Some(context.deadline()));
+        drop(creator);
+        outbound.shutdown().await;
+        assert_eq!(upstream.active.load(Ordering::Relaxed), 0);
+        assert!(outbound.tasks.is_empty());
+        for slot in &outbound.current {
+            assert!(slot.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_offer_finishes_before_one_replacement_and_stop_joins_it() {
+        for deadline_failure in [false, true] {
+            let upstream = Arc::new(PendingUpstream::default());
+            let outbound = outbound(1, upstream.clone());
+            let context = EstablishContext::with_timeout(Duration::from_secs(10));
+            let mut first = Box::pin(outbound.session(datagram(), &context));
+            assert!(futures_util::poll!(first.as_mut()).is_pending());
+            upstream.entered.notified().await;
+            let old = current(&outbound).await;
+            if deadline_failure {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                assert!(matches!(first.await, Err(DispatchError::TimedOut)));
+            } else {
+                upstream.fail.notify_one();
+                assert!(matches!(first.await, Err(DispatchError::ConnectionRefused)));
+            }
+            assert!(old.finished());
+            assert_eq!(upstream.active.load(Ordering::Relaxed), 0);
+            let mut retry = Box::pin(outbound.session(datagram(), &context));
+            assert!(futures_util::poll!(retry.as_mut()).is_pending());
+            upstream.entered.notified().await;
+            let next = current(&outbound).await;
+            assert!(!Arc::ptr_eq(&old, &next));
+            assert_eq!(upstream.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(upstream.active.load(Ordering::Relaxed), 1);
+            outbound.shutdown().await;
+            assert!(matches!(retry.await, Err(DispatchError::NotAllowed)));
+            assert!(next.finished());
+            assert_eq!(upstream.active.load(Ordering::Relaxed), 0);
+            assert!(outbound.tasks.is_empty());
+            assert!(matches!(
+                outbound.session(datagram(), &context).await,
+                Err(DispatchError::NotAllowed)
+            ));
+        }
+    }
 }

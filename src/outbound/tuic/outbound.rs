@@ -18,6 +18,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     io,
     sync::{Arc, Mutex},
     time::Duration,
@@ -32,8 +34,10 @@ pub struct TuicOutbound {
     config: Arc<TuicOutboundConfig>,
     server: Destination,
     upstream: UpstreamPath,
-    tls: Arc<rustls::ClientConfig>,
-    current: AsyncMutex<Option<Arc<Session>>>,
+    tls: StandardTlsClient,
+    // Lazy native source stripes, or isolated quic TCP/UDP business lanes.
+    // UoT keeps the original shared lane.
+    current: AsyncMutex<[Option<Arc<Session>>; 2]>,
     cancel: CancellationToken,
     admission: Mutex<()>,
     tasks: TaskTracker,
@@ -47,6 +51,38 @@ struct Session {
     activity: Arc<Activity>,
 }
 
+fn active_congestion(connection: &quinn::Connection) -> Option<TuicCongestion> {
+    let controller = connection.congestion_state().into_any();
+    if controller.is::<quinn::congestion::Cubic>() {
+        Some(TuicCongestion::Cubic)
+    } else if controller.is::<quinn::congestion::NewReno>() {
+        Some(TuicCongestion::NewReno)
+    } else if controller.is::<quinn::congestion::Bbr>() {
+        Some(TuicCongestion::Bbr)
+    } else {
+        None
+    }
+}
+
+fn log_active_congestion(connection: &quinn::Connection) {
+    // Fixed targets survive the CLI's restricted field renderer without
+    // exposing peer, credential or traffic metadata.
+    match active_congestion(connection) {
+        Some(TuicCongestion::Cubic) => {
+            tracing::debug!(target: "vole::outbound::tuic::congestion::cubic", "TUIC controller ready");
+        }
+        Some(TuicCongestion::NewReno) => {
+            tracing::debug!(target: "vole::outbound::tuic::congestion::new_reno", "TUIC controller ready");
+        }
+        Some(TuicCongestion::Bbr) => {
+            tracing::debug!(target: "vole::outbound::tuic::congestion::bbr", "TUIC controller ready");
+        }
+        None => {
+            tracing::debug!(target: "vole::outbound::tuic::congestion::unknown", "TUIC controller ready");
+        }
+    }
+}
+
 impl std::fmt::Debug for TuicOutbound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TuicOutbound").finish_non_exhaustive()
@@ -54,30 +90,45 @@ impl std::fmt::Debug for TuicOutbound {
 }
 
 impl TuicOutbound {
-    /// Remaining actual Quinn datagram buffer, for bounded-backpressure checks.
+    fn native_source_stripes(&self) -> bool {
+        self.config.udp_mode == crate::config::TuicUdpMode::Native && !self.config.udp_over_stream
+    }
+
+    fn datagram_lane(&self) -> usize {
+        usize::from(
+            self.config.udp_mode == crate::config::TuicUdpMode::Quic
+                && !self.config.udp_over_stream,
+        )
+    }
+
+    /// One actual Quinn datagram buffer, never a native stripe aggregate.
     #[cfg(feature = "interop-test")]
     pub async fn datagram_buffer_space(&self) -> Option<usize> {
-        self.current
-            .lock()
-            .await
-            .as_ref()
-            .map(|s| s.connection.datagram_send_buffer_space())
+        let current = self.current.lock().await;
+        let session = if self.native_source_stripes() {
+            current[0].as_ref().or(current[1].as_ref())
+        } else {
+            // In quic mode a TCP lane is never a UDP-buffer witness.
+            current[self.datagram_lane()].as_ref()
+        };
+        session.map(|s| s.connection.datagram_send_buffer_space())
     }
 
     /// Actual Quinn controller identity for acceptance; no peer or credential data.
     #[cfg(feature = "interop-test")]
     pub async fn congestion_observation(&self) -> Option<TuicCongestion> {
         let current = self.current.lock().await;
-        let controller = current.as_ref()?.connection.congestion_state().into_any();
-        if controller.is::<quinn::congestion::Cubic>() {
-            Some(TuicCongestion::Cubic)
-        } else if controller.is::<quinn::congestion::NewReno>() {
-            Some(TuicCongestion::NewReno)
-        } else if controller.is::<quinn::congestion::Bbr>() {
-            Some(TuicCongestion::Bbr)
-        } else {
-            None
-        }
+        // Report one actual lane/stripe, not an owner or aggregate observation.
+        let session = current[1].as_ref().or(current[0].as_ref())?;
+        active_congestion(&session.connection)
+    }
+
+    /// One actual path; never an aggregate or a specified owner's stripe.
+    #[cfg(feature = "interop-test")]
+    pub async fn path_observation(&self) -> Option<quinn::PathStats> {
+        let current = self.current.lock().await;
+        let session = current[1].as_ref().or(current[0].as_ref())?;
+        Some(session.connection.stats().path)
     }
 
     pub fn new_with_path(config: &TuicOutboundConfig, upstream: UpstreamPath) -> io::Result<Self> {
@@ -98,19 +149,31 @@ impl TuicOutbound {
                 versions: TlsVersions::Tls13,
                 alpn: config.tls.alpn.clone(),
                 certificate: config.tls.certificate.clone(),
+                identity: config
+                    .tls
+                    .identity
+                    .as_ref()
+                    .map(|identity| {
+                        crate::security::TlsClientIdentity::from_config(identity, security)
+                    })
+                    .transpose()?,
                 ..Default::default()
             },
             0,
             buffer_limit,
-        )?
-        .quic_config()?
-        .0;
+        )?;
+        // Validate the QUIC policy now, but snapshot the current file identity
+        // only when a new physical connection is constructed.
+        tls.quic_config()?;
         Ok(Self {
             config: Arc::new(config.clone()),
-            server: server_destination(&config.address, config.port)?,
+            server: server_destination(
+                config.ip.as_deref().unwrap_or(&config.address),
+                config.port,
+            )?,
             upstream,
             tls,
-            current: AsyncMutex::new(None),
+            current: AsyncMutex::new([None, None]),
             cancel: CancellationToken::new(),
             admission: Mutex::new(()),
             tasks: TaskTracker::new(),
@@ -121,18 +184,35 @@ impl TuicOutbound {
         &self,
         datagram: DatagramSession,
         context: &EstablishContext,
+        datagram_business: bool,
     ) -> Result<(Arc<Session>, Lease), DispatchError> {
         if tokio::time::Instant::now() >= context.deadline() {
             return Err(DispatchError::TimedOut);
         }
+        // The reference admits only counters strictly below its threshold.
+        // A configured threshold of one is valid, but permits no logical owner.
+        if self.config.max_open_streams == 0 {
+            return Err(DispatchError::NotAllowed);
+        }
+        let lane = if self.native_source_stripes() {
+            // Keep TCP and UDP from the same source on the same physical
+            // stripe without constraining the configured per-session owners.
+            let mut source = DefaultHasher::new();
+            datagram.source.hash(&mut source);
+            (source.finish() & 1) as usize
+        } else if datagram_business {
+            self.datagram_lane()
+        } else {
+            0
+        };
         let _waiter = observation::track(ResourceKind::Waiter);
         tokio::select! { biased;
             () = self.cancel.cancelled() => Err(DispatchError::NotAllowed),
             result = context.run("TUIC session", async {
-                let mut current = self.current.lock().await;
-                if let Some(session) = current.as_ref().filter(|s| !s.cancel.is_cancelled() && s.connection.close_reason().is_none() && !s.datagrams.exhausted()) {
-                    return Ok((session.clone(),session.activity.acquire()));
-                }
+                let mut lanes = self.current.lock().await;
+                let current = &mut lanes[lane];
+                if let Some(session) = current.as_ref().filter(|s| !s.cancel.is_cancelled() && s.connection.close_reason().is_none() && !s.datagrams.exhausted())
+                    && let Some(lease) = session.activity.try_acquire(self.config.max_open_streams) { return Ok((session.clone(),lease)); }
                 if let Some(previous)=current.take() { previous.activity.retire(); }
                 let cancel = self.cancel.child_token();
                 let guard = cancel.clone().drop_guard();
@@ -173,6 +253,7 @@ impl OutboundConnector for TuicOutbound {
             .session(
                 DatagramSession::new(session.inbound, session.source),
                 context,
+                false,
             )
             .await?;
         tokio::select! { biased;
@@ -192,8 +273,40 @@ impl OutboundConnector for TuicOutbound {
         request: DatagramRequest,
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        if self.config.udp_over_stream {
+            let connected = self
+                .connect_stream(
+                    StreamSession {
+                        metadata: request.session.metadata.clone(),
+                        inbound: request.session.inbound,
+                        source: request.session.source,
+                        destination: crate::outbound::uot::magic_destination(),
+                        sniffed_domain: None,
+                    },
+                    context,
+                )
+                .await?;
+            let _admission = self.admission.lock().unwrap();
+            if self.cancel.is_cancelled() {
+                return Err(DispatchError::NotAllowed);
+            }
+            let (reader, writer) = tokio::io::split(connected.io);
+            return Ok(crate::dispatch::bound_datagram(
+                Box::new(
+                    crate::outbound::uot::UotTransport::new(
+                        reader,
+                        writer,
+                        request.max_response_payload_size(),
+                        self.cancel.clone(),
+                        &self.tasks,
+                    )
+                    .with_initial_deadline(context.deadline()),
+                ),
+                request.budget(),
+            ));
+        }
         loop {
-            let (shared, lease) = self.session(request.session.clone(), context).await?;
+            let (shared, lease) = self.session(request.session.clone(), context, true).await?;
             if let Some(transport) = shared.datagrams.open(
                 shared.connection.clone(),
                 shared.cancel.clone(),
@@ -216,7 +329,9 @@ impl OutboundConnector for TuicOutbound {
     async fn shutdown(&self) {
         self.begin_shutdown();
         self.tasks.wait().await;
-        self.current.lock().await.take();
+        for current in self.current.lock().await.iter_mut() {
+            let _ = current.take();
+        }
     }
 }
 impl Drop for TuicOutbound {
@@ -230,7 +345,7 @@ async fn drive(
     config: Arc<TuicOutboundConfig>,
     upstream: UpstreamPath,
     server: Destination,
-    tls: Arc<rustls::ClientConfig>,
+    tls: StandardTlsClient,
     datagram: DatagramSession,
     context: EstablishContext,
     cancel: CancellationToken,
@@ -241,42 +356,69 @@ async fn drive(
     let mut endpoint = None;
     let mut driver = None;
     let _pool = observation::track(ResourceKind::Pool);
-    let datagrams = Arc::new(super::datagram::Registry::new(config.udp_mode));
+    let datagrams = Arc::new(super::datagram::Registry::with_limit(
+        config.udp_mode,
+        config.max_udp_relay_packet_size,
+        quic::datagram_payload_limit(config.max_datagram_frame_size),
+    ));
     let activity = Arc::new(Activity::default());
     let operation = async {
         let handshake = observation::track(ResourceKind::Handshake);
-        let destination = upstream.datagram_server(&server, &context)?;
+        let destination = upstream.datagram_server(&server, &context).await?;
         let peer = context.resolve_ip(&destination).await?;
         let budget = DatagramBudget::new(
             crate::limits::TUIC_QUIC_PAYLOAD as u16,
             crate::limits::TUIC_QUIC_PAYLOAD as u16,
         );
-        let raw = upstream
-            .open_datagram(DatagramRequest::new(datagram).with_budget(budget), &context)
-            .await?;
-        let (socket, owned) = quic::attach(raw, peer, budget)?;
+        let request = DatagramRequest::new(datagram).with_budget(budget);
+        let request =
+            if config.udp_mode == crate::config::TuicUdpMode::Native && !config.udp_over_stream {
+                request.with_udp_receive_buffer_size(512 * 1024)
+            } else {
+                request
+            };
+        let raw = upstream.open_datagram(request, &context).await?;
+        let (socket, owned) = quic::attach_quinn(raw, peer, budget).await?;
         driver = Some(owned);
         let mtu = socket.budget().quic_payload_limit()?;
         let mut limits = quinn::TransportConfig::default();
+        socket.configure_transport(&mut limits);
+        quic::configure_receive_windows(
+            &mut limits,
+            config.stream_window,
+            config.connection_window,
+            quic::RECEIVE_WINDOW_POLICY,
+        )?;
+        let discovery = if config.disable_mtu_discovery {
+            None
+        } else {
+            let mut discovery = quinn::MtuDiscoveryConfig::default();
+            discovery.upper_bound(mtu);
+            Some(discovery)
+        };
+        let initial_mtu = if discovery.is_some() { 1200 } else { mtu };
         limits
-            .initial_mtu(mtu)
-            .min_mtu(mtu)
-            .mtu_discovery_config(None)
+            .initial_mtu(initial_mtu)
+            .min_mtu(1200)
+            .mtu_discovery_config(discovery)
+            // Business owner thresholds never flow into Quinn's eager maps.
+            // The decoder already bounds concurrent remote uni streams to 32.
             .max_concurrent_bidi_streams(0_u8.into())
-            .max_concurrent_uni_streams((crate::limits::TUIC_UNI_STREAMS as u32).into())
-            .stream_receive_window((crate::limits::TUIC_STREAM_WINDOW as u32).into())
-            .receive_window((crate::limits::TUIC_CONNECTION_WINDOW as u32).into())
-            .send_window(crate::limits::TUIC_CONNECTION_WINDOW as u64)
+            .max_concurrent_uni_streams((crate::limits::TUIC_CONTROL_READERS as u32).into())
+            .send_window(crate::limits::TUIC_SEND_WINDOW as u64)
             .datagram_receive_buffer_size(Some(crate::limits::TUIC_DATAGRAM_BUFFER))
             .datagram_send_buffer_size(crate::limits::TUIC_DATAGRAM_BUFFER)
             .max_idle_timeout(Some(Duration::from_secs(30).try_into().map_err(failure)?))
-            .keep_alive_interval(Some(Duration::from_secs(10)))
+            .keep_alive_interval(Some(config.heartbeat_interval))
             .congestion_controller_factory(match config.congestion {
                 TuicCongestion::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
                 TuicCongestion::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
                 TuicCongestion::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
             });
-        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(failure)?;
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(
+            current_tls(&tls, config.disable_sni).map_err(failure)?,
+        )
+        .map_err(failure)?;
         let mut client = quinn::ClientConfig::new(Arc::new(crypto));
         client.transport_config(Arc::new(limits));
         let mut options = quinn::EndpointConfig::default();
@@ -318,6 +460,7 @@ async fn drive(
             .map_err(failure)?;
         send.finish().map_err(failure)?;
         auth.fill(0);
+        log_active_congestion(&connection);
         drop(handshake);
         let session = Arc::new(Session {
             connection: connection.clone(),
@@ -331,7 +474,8 @@ async fn drive(
             .unwrap()
             .send(Ok(session))
             .map_err(|_| DispatchError::ConnectionRefused)?;
-        let mut beat = tokio::time::interval(Duration::from_secs(10));
+        let mut beat = tokio::time::interval(config.heartbeat_interval);
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         beat.tick().await;
         tokio::select! {
             _=connection.closed()=>{},
@@ -359,5 +503,130 @@ async fn drive(
     runtime.stop().await;
     if let Some(driver) = driver {
         let _ = driver.stop().await;
+    }
+}
+
+fn current_tls(
+    tls: &StandardTlsClient,
+    disable_sni: bool,
+) -> io::Result<Arc<rustls::ClientConfig>> {
+    let (mut config, _) = tls.quic_config()?;
+    // The verifier still receives Quinn's immutable server name.
+    if disable_sni {
+        Arc::make_mut(&mut config).enable_sni = false;
+    }
+    Ok(config)
+}
+
+#[cfg(test)]
+mod p08_tests {
+    use super::*;
+    #[tokio::test]
+    async fn tuic_cold_connection_cannot_publish_an_early_quinn_handle_without_resumption() {
+        struct Discard;
+        #[async_trait]
+        impl DatagramTransport for Discard {
+            fn supports_shared_destinations(&self) -> bool {
+                false
+            }
+
+            async fn send(&mut self, _: crate::session::Datagram) -> Result<(), DispatchError> {
+                Ok(())
+            }
+            async fn receive(&mut self) -> Result<crate::session::Datagram, DispatchError> {
+                std::future::pending().await
+            }
+        }
+        let parsed = crate::config::Config::parse_yaml(
+            br#"proxies: [{name: edge, type: tuic, server: peer.invalid, port: 443, uuid: 01234567-89ab-cdef-0123-456789abcdef}]"#,
+        ).unwrap();
+        let crate::config::ProxyProtocol::Tuic(config) = &parsed.proxies[0].protocol else {
+            panic!("TUIC");
+        };
+        let node = TuicOutbound::new_with_path(
+            config,
+            UpstreamPath::LazyDirect {
+                dialer: crate::dialer::Dialer::default(),
+            },
+        )
+        .unwrap();
+        // A request for early data alone cannot make a cold client connection
+        // available. No sockets, system resolver, peers, or ticket cache exist.
+        let mut tls = (*current_tls(&node.tls, config.disable_sni).unwrap()).clone();
+        tls.enable_early_data = true;
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+        let peer = "192.0.2.1:443".parse().unwrap();
+        let (socket, driver) =
+            quic::attach(Box::new(Discard), peer, DatagramBudget::new(1400, 1400)).unwrap();
+        let runtime = Arc::new(OwnedRuntime::new(CancellationToken::new()));
+        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime.clone(),
+        )
+        .unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+        let connecting = endpoint.connect(peer, "peer.invalid").unwrap();
+        assert!(
+            connecting.into_0rtt().is_err(),
+            "a cold client obtained an early handle"
+        );
+        endpoint.close(0_u8.into(), b"");
+        runtime.stop().await;
+        drop(endpoint);
+        driver.stop().await.unwrap();
+    }
+
+    fn sni_extension(hello: &[u8]) -> bool {
+        assert_eq!(hello[0], 1);
+        let mut at = 4 + 2 + 32;
+        at += 1 + usize::from(hello[at]);
+        let ciphers = usize::from(u16::from_be_bytes([hello[at], hello[at + 1]]));
+        at += 2 + ciphers;
+        at += 1 + usize::from(hello[at]);
+        let end = at + 2 + usize::from(u16::from_be_bytes([hello[at], hello[at + 1]]));
+        at += 2;
+        while at < end {
+            let kind = u16::from_be_bytes([hello[at], hello[at + 1]]);
+            let len = usize::from(u16::from_be_bytes([hello[at + 2], hello[at + 3]]));
+            if kind == 0 {
+                return true;
+            }
+            at += 4 + len;
+        }
+        false
+    }
+    #[test]
+    fn tuic_disable_sni_changes_real_quic_hello_without_changing_verification_policy() {
+        for disable in [false, true] {
+            let config=crate::config::Config::parse_yaml(serde_json::json!({"proxies":[{"name":"edge","type":"tuic","server":"peer.invalid","port":443,"uuid":"01234567-89ab-cdef-0123-456789abcdef","disable-sni":disable,"name-cert-verify":"identity.example","fingerprint":"12".repeat(32)}]}).to_string().as_bytes()).unwrap();
+            let crate::config::ProxyProtocol::Tuic(config) = &config.proxies[0].protocol else {
+                panic!("TUIC")
+            };
+            assert!(!config.tls.certificate.skip_cert_verify);
+            assert_eq!(
+                config.tls.certificate.verification_name.as_deref(),
+                Some("identity.example")
+            );
+            assert_eq!(config.tls.certificate.fingerprint, Some([0x12; 32]));
+            let node = TuicOutbound::new_with_path(
+                config,
+                UpstreamPath::LazyDirect {
+                    dialer: crate::dialer::Dialer::default(),
+                },
+            )
+            .unwrap();
+            let mut connection = rustls::quic::ClientConnection::new(
+                current_tls(&node.tls, config.disable_sni).unwrap(),
+                rustls::quic::Version::V1,
+                rustls::pki_types::ServerName::try_from(config.tls.server_name.clone()).unwrap(),
+                Vec::new(),
+            )
+            .unwrap();
+            let mut hello = Vec::new();
+            connection.write_hs(&mut hello);
+            assert_eq!(sni_extension(&hello), !disable);
+        }
     }
 }

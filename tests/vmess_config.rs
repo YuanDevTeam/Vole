@@ -12,14 +12,11 @@ fn document(extra: Value) -> Vec<u8> {
 
 #[test]
 fn vmess_default_node_and_explicit_cipher_aliases_are_accepted_without_io() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CFG",
-        "vmess_default_node_and_explicit_cipher_aliases_are_accepted_without_io",
-    );
     let parsed = Config::parse_yaml(&document(json!({}))).expect("VMess default node");
-    assert_eq!(parsed.proxies[0].address(), "example.com");
-    assert_eq!(parsed.proxies[0].port(), 443);
+    assert_eq!(
+        parsed.proxies[0].server_endpoint(),
+        Some(("example.com", 443))
+    );
     assert!(!parsed.proxies[0].udp);
     for cipher in ["auto", "aes-128-gcm", "chacha20-poly1305", "none", "zero"] {
         assert!(
@@ -27,15 +24,31 @@ fn vmess_default_node_and_explicit_cipher_aliases_are_accepted_without_io() {
         );
     }
     assert!(!format!("{parsed:?}").contains("07070707"));
+    for (input, expected) in [
+        (
+            "07070707070707070707070707070707",
+            "07070707-0707-0707-0707-070707070707",
+        ),
+        (
+            "{07070707-0707-0707-0707-070707070707}",
+            "07070707-0707-0707-0707-070707070707",
+        ),
+        (
+            "urn:uuid:07070707-0707-0707-0707-070707070707",
+            "07070707-0707-0707-0707-070707070707",
+        ),
+        ("invalid-secret", "29a5f9ec-d914-56e3-a82c-19b9150f2a91"),
+    ] {
+        let parsed = Config::parse_yaml(&document(json!({"uuid":input}))).unwrap();
+        let vole::config::ProxyProtocol::Vmess(node) = &parsed.proxies[0].protocol else {
+            unreachable!()
+        };
+        assert_eq!(node.id.hyphenated().to_string(), expected);
+    }
 }
 
 #[test]
 fn vmess_transport_and_security_combinations_are_strict() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CFG",
-        "vmess_transport_and_security_combinations_are_strict",
-    );
     for tls in [false, true] {
         for (network, options) in [
             ("tcp", json!({})),
@@ -66,25 +79,20 @@ fn vmess_transport_and_security_combinations_are_strict() {
     }
     for fields in [
         json!({"alterId":1}),
-        json!({"uuid":"invalid-secret"}),
         json!({"cipher":"none","global-padding":true}),
         json!({"cipher":"zero","authenticated-length":true}),
         json!({"network":"bogus"}),
-        json!({"network":"h2"}),
-        json!({"network":"grpc"}),
         json!({"tls":false,"servername":"secret.invalid"}),
         json!({"tls":false,"skip-cert-verify":false}),
         json!({"tls":false,"alpn":[]}),
         json!({"packet-encoding":"packet"}),
         json!({"ws-opts":{}}),
         json!({"http-opts":{}}),
-        json!({"network":"h2","h2-opts":{"host":[]}}),
         json!({"network":"http","http-opts":{"method":"GET\r\n"}}),
         json!({"network":"http","http-opts":{"headers":{"Content-Length":["1"]}}}),
         json!({"network":"http","http-opts":{"headers":{"X-Test":[]}}}),
-        json!({"network":"ws","ws-opts":{"max-early-data":2049}}),
+        json!({"network":"ws","ws-opts":{"max-early-data":65536}}),
         json!({"network":"ws","tls":true,"alpn":["h2"]}),
-        json!({"network":"grpc","grpc-opts":{"grpc-service-name":""}}),
     ] {
         assert!(
             Config::parse_yaml(&document(fields.clone())).is_err(),
@@ -124,17 +132,11 @@ fn vmess_transport_and_security_combinations_are_strict() {
 
 #[tokio::test]
 async fn vmess_field_boundaries_and_normalized_transport_values() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CFG",
-        "vmess_field_boundaries_and_normalized_transport_values",
-    );
     use vole::config::{ProxyProtocol, VmessTransport};
     for fields in [
         json!({"server":""}),
         json!({"port":0}),
         json!({"port":65536}),
-        json!({"uuid":"07070707070707070707070707070707"}),
         json!({"network":"ws","ws-opts":{"headers":{"Host":"cover.example:bogus"}}}),
         json!({"network":"h2","h2-opts":{"host":["cover.example:"]}}),
         json!({"network":"http","http-opts":{"headers":{"Host":["cover.example:65536"]}}}),
@@ -229,11 +231,6 @@ async fn vmess_field_boundaries_and_normalized_transport_values() {
 
 #[tokio::test]
 async fn vmess_normalized_websocket_fields_preserve_headers_and_early_data_order() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CFG",
-        "vmess_normalized_websocket_fields_preserve_headers_and_early_data_order",
-    );
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -241,6 +238,7 @@ async fn vmess_normalized_websocket_fields_preserve_headers_and_early_data_order
         (0, None),
         (1, None),
         (2048, None),
+        (2049, None),
         (2048, Some("X-Early")),
         (2048, Some("")),
     ] {
@@ -309,5 +307,68 @@ async fn vmess_normalized_websocket_fields_preserve_headers_and_early_data_order
         stream.write_all(b"continuation").await.unwrap();
         stream.flush().await.unwrap();
         reader.await.unwrap();
+    }
+}
+
+#[test]
+fn stream_defaults_and_grpc_authority_match_the_reference() {
+    use vole::config::{ProxyProtocol, StreamTransport};
+    for tls in [false, true] {
+        for options in [
+            json!({}),
+            json!({"h2-opts":{}}),
+            json!({"h2-opts":{"host":[],"path":""}}),
+        ] {
+            let mut fields = options;
+            fields["network"] = json!("h2");
+            fields["tls"] = json!(tls);
+            let config = Config::parse_yaml(&document(fields)).unwrap();
+            let ProxyProtocol::Vmess(node) = &config.proxies[0].protocol else {
+                unreachable!()
+            };
+            let StreamTransport::H2 { uris } = &node.transport else {
+                unreachable!()
+            };
+            assert_eq!(
+                uris,
+                &[format!(
+                    "{}://www.example.com/",
+                    if tls { "https" } else { "http" }
+                )]
+            );
+        }
+    }
+    for (name, authority) in [
+        (None, "example.com:443"),
+        (Some(""), "example.com:443"),
+        (Some("cover.example"), "cover.example"),
+        (Some("2001:db8::1"), "[2001:db8::1]"),
+    ] {
+        let mut fields = json!({"network":"grpc","tls":true,"name-cert-verify":"verified.example"});
+        if let Some(name) = name {
+            fields["servername"] = json!(name);
+        }
+        let config = Config::parse_yaml(&document(fields)).unwrap();
+        let ProxyProtocol::Vmess(node) = &config.proxies[0].protocol else {
+            unreachable!()
+        };
+        let StreamTransport::Grpc { uri, .. } = &node.transport else {
+            unreachable!()
+        };
+        assert_eq!(
+            uri.parse::<http::Uri>()
+                .unwrap()
+                .authority()
+                .unwrap()
+                .as_str(),
+            authority
+        );
+    }
+    for fields in [
+        json!({"network":""}),
+        json!({"network":"ws","ws-opts":{"path":""}}),
+        json!({"network":"http","http-opts":{"method":""}}),
+    ] {
+        Config::parse_yaml(&document(fields)).unwrap();
     }
 }

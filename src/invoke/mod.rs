@@ -28,6 +28,7 @@ use crate::{
     data_dir::DataDirectory,
     dialer::{Dialer, SocketProtector, SystemResolver},
     geodata::{GeoDataManager, GeoDataStatus, GeoResourceState},
+    resource::config_apply::{ConfigApplyHandle, ConfigUpdate},
     runtime::PreparedCore,
 };
 
@@ -61,13 +62,12 @@ type InvokeTun = (TunFd, TunFraming, u16);
 type InvokeTun = ();
 
 mod foreground;
+pub(crate) mod http;
 mod measure_delay;
 pub use foreground::InvokePath;
 
-// A measureDelay request may inline five independently valid 256 KiB YAML
-// documents. JSON escaping can double common YAML bytes such as backslashes,
-// quotes, and newlines, so the wire envelope needs a larger aggregate bound.
-pub(crate) const MAX_INVOKE_BYTES: usize = 3 * 1024 * 1024;
+// Five YAML documents, worst-case JSON escaping, and a bounded envelope.
+pub(crate) const MAX_INVOKE_BYTES: usize = 30 * crate::config::MAX_CONFIG_BYTES + 64 * 1024;
 const MAX_ERROR_BYTES: usize = 4096;
 static REGISTRY: OnceLock<RuntimeRegistry> = OnceLock::new();
 
@@ -78,6 +78,7 @@ thread_local! {
 #[derive(Default)]
 struct RegistryInner {
     instance: Option<Arc<CoreController>>,
+    idle_http_refresh: bool,
 }
 
 #[derive(Default)]
@@ -97,6 +98,9 @@ struct RuntimeRegistry {
 struct RuntimeData {
     directory: Arc<DataDirectory>,
     geodata: Arc<GeoDataManager>,
+    dns_sources: Arc<crate::dns::source::NetworkSources>,
+    http: Arc<tokio::sync::Mutex<crate::http_processing::providers::Store>>,
+    provider_paths: Arc<crate::resource::paths::ProviderPaths>,
 }
 
 impl Default for RuntimeRegistry {
@@ -130,6 +134,13 @@ impl CoreController {
     }
 }
 
+enum StartupConfig {
+    #[cfg(test)]
+    Yaml(String),
+    Input(Box<http::StartPayload>),
+    Resolved(Box<crate::runtime::RecoverySnapshot>),
+}
+
 #[derive(Default)]
 struct CoreInner {
     lifecycle: Lifecycle,
@@ -137,7 +148,7 @@ struct CoreInner {
     engine: Option<Engine>,
     last_error: String,
     tun_lease: Option<TunLease>,
-    apple_tun_allocator_relief: Option<AppleTunAllocatorRelief>,
+    tun_allocator_relief: Option<TunAllocatorRelief>,
 }
 
 struct PreparedState {
@@ -149,6 +160,7 @@ struct Engine {
     stop: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<io::Result<()>>>,
     completion: tokio::sync::watch::Receiver<bool>,
+    config_apply: Option<ConfigApplyHandle>,
 }
 
 struct EngineCompletion(tokio::sync::watch::Sender<bool>);
@@ -174,40 +186,43 @@ impl Drop for TunLease {
 }
 
 #[derive(Clone)]
-struct AppleTunAllocatorRelief {
-    state: Arc<AppleTunAllocatorReliefState>,
+struct TunAllocatorRelief {
+    state: Arc<TunAllocatorReliefState>,
 }
 
-struct AppleTunAllocatorReliefState {
+struct TunAllocatorReliefState {
     relieved: AtomicBool,
 }
 
-impl AppleTunAllocatorRelief {
+impl TunAllocatorRelief {
     fn new(has_tun: bool) -> Option<Self> {
-        #[cfg(any(target_os = "ios", target_os = "tvos"))]
         if has_tun {
-            return Some(Self {
-                state: Arc::new(AppleTunAllocatorReliefState {
+            Some(Self {
+                state: Arc::new(TunAllocatorReliefState {
                     relieved: AtomicBool::new(false),
                 }),
-            });
+            })
+        } else {
+            None
         }
-        let _ = has_tun;
-        None
     }
 
     fn relieve(&self) {
-        if !self.state.relieved.swap(true, Ordering::AcqRel) {
-            relieve_apple_tun_allocator();
+        self.state.relieve_with(relieve_tun_allocator);
+    }
+}
+
+impl TunAllocatorReliefState {
+    fn relieve_with(&self, relief: impl FnOnce()) {
+        if !self.relieved.swap(true, Ordering::AcqRel) {
+            relief();
         }
     }
 }
 
-impl Drop for AppleTunAllocatorReliefState {
+impl Drop for TunAllocatorReliefState {
     fn drop(&mut self) {
-        if !self.relieved.swap(true, Ordering::AcqRel) {
-            relieve_apple_tun_allocator();
-        }
+        self.relieve_with(relieve_tun_allocator);
     }
 }
 
@@ -347,7 +362,7 @@ impl From<io::Error> for InvokeFailure {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RequestEnvelope {
     method: String,
@@ -369,10 +384,25 @@ where
     String::deserialize(deserializer).map(Some)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ConfigYamlPayload {
     config_yaml: String,
+    #[serde(default)]
+    http_config_yaml: Option<String>,
+    #[serde(default)]
+    http_context: Option<http::HttpContextInput>,
+}
+impl std::fmt::Debug for ConfigYamlPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigYamlPayload")
+            .field("config_bytes", &self.config_yaml.len())
+            .field(
+                "http_config_bytes",
+                &self.http_config_yaml.as_ref().map(String::len),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,6 +456,13 @@ impl RuntimeRegistry {
     }
 
     fn initialize_path(&self, path: &Path) -> Result<Arc<DataDirectory>, InvokeFailure> {
+        self.initialize_path_with_provider_paths(path, None)
+    }
+    fn initialize_path_with_provider_paths(
+        &self,
+        path: &Path,
+        provider_paths: Option<Arc<crate::resource::paths::ProviderPaths>>,
+    ) -> Result<Arc<DataDirectory>, InvokeFailure> {
         let initialized = Arc::new(DataDirectory::initialize(path).map_err(|error| {
             InvokeFailure::new(format!("failed to initialize dataDir: {error}"))
         })?);
@@ -437,6 +474,14 @@ impl RuntimeRegistry {
         let mut current = lock(&self.runtime_data);
         if let Some(current) = current.as_ref() {
             if current.directory.root() == initialized.root() {
+                if provider_paths
+                    .as_ref()
+                    .is_some_and(|next| next.as_ref() != current.provider_paths.as_ref())
+                {
+                    return Err(InvokeFailure::invalid_state(
+                        "provider path authorization is already initialized differently",
+                    ));
+                }
                 return Ok(current.directory.clone());
             }
             return Err(InvokeFailure::invalid_state(
@@ -445,11 +490,21 @@ impl RuntimeRegistry {
         }
         *current = Some(RuntimeData {
             directory: initialized.clone(),
+            provider_paths: provider_paths.unwrap_or_default(),
             geodata,
+            dns_sources: Arc::new(crate::dns::source::NetworkSources::default()),
+            http: Arc::new(tokio::sync::Mutex::new(
+                crate::http_processing::providers::Store::new(),
+            )),
         });
         Ok(initialized)
     }
 
+    fn provider_paths(&self) -> Option<Arc<crate::resource::paths::ProviderPaths>> {
+        lock(&self.runtime_data)
+            .as_ref()
+            .map(|data| data.provider_paths.clone())
+    }
     fn data_directory(&self) -> Result<Arc<DataDirectory>, InvokeFailure> {
         lock(&self.runtime_data)
             .as_ref()
@@ -472,8 +527,19 @@ impl RuntimeRegistry {
             })
     }
 
+    fn dns_sources(&self) -> Result<Arc<crate::dns::source::NetworkSources>, InvokeFailure> {
+        lock(&self.runtime_data)
+            .as_ref()
+            .map(|data| data.dns_sources.clone())
+            .ok_or_else(|| InvokeFailure::invalid_state("Vole dataDir is not initialized"))
+    }
     fn create_instance(&self) -> Result<Arc<CoreController>, InvokeFailure> {
         let mut inner = lock(&self.inner);
+        if inner.idle_http_refresh {
+            return Err(InvokeFailure::invalid_state(
+                "HTTP resource preparation is busy",
+            ));
+        }
         if inner.instance.is_some() {
             return Err(InvokeFailure::invalid_state(
                 "a public lifecycle instance already exists; destroy it before creating another",
@@ -606,6 +672,23 @@ pub fn invoke_bytes(request: &[u8]) -> Vec<u8> {
     invoke_bytes_admitted(request)
 }
 
+/// Executes an owned JSON request through the same dispatcher. The CLI uses
+/// this to clear and release serialized configuration/key text before a long
+/// foreground session; borrowed FFI callers retain ownership of their input.
+pub fn invoke_owned_bytes(request: Vec<u8>) -> Vec<u8> {
+    let request = zeroize::Zeroizing::new(request);
+    if is_runtime_thread() {
+        return runtime_thread_response();
+    }
+    #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+    let _logging = crate::platform::apple_logging::enter();
+    invoke_guarded(move || {
+        let decoded = decode_request(&request)?;
+        drop(request);
+        dispatch_request(decoded)
+    })
+}
+
 /// Shared byte-oriented dispatcher used by C and Android JNI.
 /// It intentionally returns bytes so JNI never routes arbitrary JSON through
 /// Modified UTF-8 strings.
@@ -653,7 +736,257 @@ fn invoke_instance_guarded<T>(
     }
 }
 
+// Borrow the envelope to enforce the small network-metadata admission bound
+// before materializing its JSON Value. Other methods retain their own schema.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRequestEnvelope<'a> {
+    #[serde(borrow)]
+    method: &'a serde_json::value::RawValue,
+    #[serde(borrow)]
+    payload: &'a serde_json::value::RawValue,
+    #[serde(rename = "instanceId", default, borrow)]
+    _instance_id: Option<&'a serde_json::value::RawValue>,
+}
+
+fn check_dns_network_envelope(request: &str) -> Result<(), InvokeFailure> {
+    let raw: RawRequestEnvelope<'_> =
+        serde_json::from_str(request).map_err(InvokeFailure::invalid_request)?;
+    // An ASCII method's JSON spelling can use at most six bytes per letter.
+    // Decode only that bounded scalar; never search request/config contents.
+    if raw.method.get().len() > 6 * "updateDnsNetwork".len() + 2 {
+        return Ok(());
+    }
+    let is_update = serde_json::from_str::<String>(raw.method.get())
+        .is_ok_and(|method| method == "updateDnsNetwork");
+    if !is_update {
+        return Ok(());
+    }
+    let bytes = raw.payload.get().len();
+    if bytes > crate::dns::source::MAX_METADATA_BYTES {
+        return Err(InvokeFailure::invalid_request(
+            "DNS network metadata exceeds 64 KiB",
+        ));
+    }
+    const MAX_DNS_ENVELOPE_OVERHEAD: usize = 64 * 1024;
+    if request.len() - bytes > MAX_DNS_ENVELOPE_OVERHEAD {
+        return Err(InvokeFailure::invalid_request(
+            "DNS network envelope overhead exceeds 64 KiB",
+        ));
+    }
+    Ok(())
+}
+
+// Admit configuration work before allocating a JSON Value or decoded YAML.
+// Both Controller and Invoke use the one runtime candidate worker.
+fn dispatch_config_update(request: &str) -> Result<Option<InvokeResponse>, InvokeFailure> {
+    let raw: RawRequestEnvelope<'_> = serde_json::from_str(request)
+        .map_err(|_| InvokeFailure::invalid_request("invalid request envelope"))?;
+    if raw.method.get().len() > 6 * "updateConfig".len() + 2
+        || !serde_json::from_str::<String>(raw.method.get())
+            .is_ok_and(|method| method == "updateConfig")
+    {
+        return Ok(None);
+    }
+    if request.len() - raw.payload.get().len() > 64 * 1024 {
+        return Err(InvokeFailure::invalid_request(
+            "configuration envelope overhead exceeds 64 KiB",
+        ));
+    }
+    let id = raw._instance_id.ok_or_else(|| {
+        InvokeFailure::invalid_request("instanceId is required for method `updateConfig`")
+    })?;
+    if id.get().len() > 128 {
+        return Err(InvokeFailure::invalid_request("invalid instanceId"));
+    }
+    let id: String = serde_json::from_str(id.get())
+        .map_err(|_| InvokeFailure::invalid_request("invalid instanceId"))?;
+    let controller = registry().instance(&id)?;
+    invoke_instance_guarded(&controller, || {
+        let _command = controller.try_command()?;
+        let apply = {
+            let mut inner = lock(&controller.inner);
+            refresh_runtime_status(&mut inner);
+            if inner.lifecycle.state() != LifecycleState::Running {
+                return Err(InvokeFailure::invalid_state(
+                    "instance must be running before updateConfig",
+                ));
+            }
+            inner
+                .engine
+                .as_ref()
+                .and_then(|engine| engine.config_apply.clone())
+                .ok_or_else(|| {
+                    InvokeFailure::invalid_state(
+                        "runtime does not support configuration application",
+                    )
+                })?
+        };
+        let admission = apply
+            .try_admit()
+            .map_err(|e| InvokeFailure::new(e.message()))?;
+        let input = decode_update_input(raw.payload.get())?;
+        let base_dir = input
+            .http_context
+            .map(|context| {
+                if context.ca.is_some() {
+                    return Err(InvokeFailure::invalid_request(
+                        "updateConfig does not accept CA material",
+                    ));
+                }
+                let base = context.base_dir.map(InvokePath::into_path);
+                if base.as_ref().is_some_and(|path| !path.is_absolute()) {
+                    return Err(InvokeFailure::invalid_request(
+                        "HTTP baseDir must be absolute",
+                    ));
+                }
+                Ok(base)
+            })
+            .transpose()?;
+        if input.http_config_yaml.is_none() && base_dir.is_some() {
+            return Err(InvokeFailure::invalid_request(
+                "httpContext requires httpConfigYaml",
+            ));
+        }
+        let update = match input.http_config_yaml {
+            Some(http) => ConfigUpdate::ReplaceWithHttp {
+                yaml: input.config_yaml,
+                http,
+                base_dir,
+            },
+            None => ConfigUpdate::Replace(input.config_yaml),
+        };
+        admission
+            .submit(update)
+            .map_err(|e| InvokeFailure::new(e.message()))?
+            .wait_blocking()
+            .map_err(|e| InvokeFailure::new(e.message()))?;
+        Ok(Some(InvokeResponse::success(json!({}))))
+    })
+}
+
+fn decode_update_input(payload: &str) -> Result<ConfigYamlPayload, InvokeFailure> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawConfig<'a> {
+        #[serde(rename = "configYaml", borrow)]
+        yaml: &'a serde_json::value::RawValue,
+        #[serde(rename = "httpConfigYaml", default, borrow)]
+        http: Option<&'a serde_json::value::RawValue>,
+        #[serde(rename = "httpContext", default, borrow)]
+        context: Option<&'a serde_json::value::RawValue>,
+    }
+    let raw: RawConfig<'_> = serde_json::from_str(payload)
+        .map_err(|_| InvokeFailure::invalid_request("invalid configuration update payload"))?;
+    check_json_string_limit(raw.yaml.get(), crate::config::MAX_CONFIG_BYTES)?;
+    if let Some(http) = raw.http {
+        check_json_string_limit(http.get(), crate::http_processing::MAX_ADDENDUM)?;
+    }
+    if raw.context.is_some_and(|raw| raw.get().len() > 8192) {
+        return Err(InvokeFailure::invalid_request(
+            "HTTP context exceeds input limit",
+        ));
+    }
+    Ok(ConfigYamlPayload {
+        config_yaml: serde_json::from_str(raw.yaml.get())
+            .map_err(|_| InvokeFailure::invalid_request("invalid configYaml string"))?,
+        http_config_yaml: raw
+            .http
+            .map(|http| serde_json::from_str(http.get()))
+            .transpose()
+            .map_err(|_| InvokeFailure::invalid_request("invalid httpConfigYaml string"))?,
+        http_context: raw
+            .context
+            .map(|raw| serde_json::from_str(raw.get()))
+            .transpose()
+            .map_err(|_| InvokeFailure::invalid_request("invalid HTTP context"))?,
+    })
+}
+#[cfg(test)]
+fn decode_update_yaml(payload: &str) -> Result<String, InvokeFailure> {
+    decode_update_input(payload).map(|input| input.config_yaml)
+}
+
+// RawValue validates JSON syntax without decoding strings. Count decoded UTF-8
+// first, including surrogate pairs, so escaped input cannot allocate >8 MiB.
+fn check_json_string_limit(raw: &str, limit: usize) -> Result<(), InvokeFailure> {
+    let bad = || InvokeFailure::invalid_request("configYaml must be a valid string");
+    let bytes = raw.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' || *bytes.last().unwrap() != b'"' {
+        return Err(bad());
+    }
+    let hex = |slice: &[u8]| -> Option<u16> {
+        slice.iter().try_fold(0_u16, |n, c| {
+            let digit = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                _ => return None,
+            };
+            Some((n << 4) | u16::from(digit))
+        })
+    };
+    let mut i = 1;
+    let mut decoded = 0;
+    while i < bytes.len() - 1 {
+        let width = if bytes[i] != b'\\' {
+            i += 1;
+            1
+        } else {
+            i += 1;
+            match bytes.get(i).copied().ok_or_else(bad)? {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                    i += 1;
+                    1
+                }
+                b'u' => {
+                    let code = hex(bytes.get(i + 1..i + 5).ok_or_else(bad)?).ok_or_else(bad)?;
+                    i += 5;
+                    match code {
+                        0..=0x7f => 1,
+                        0x80..=0x7ff => 2,
+                        0xd800..=0xdbff => {
+                            if bytes.get(i..i + 2) != Some(b"\\u") {
+                                return Err(bad());
+                            }
+                            let low =
+                                hex(bytes.get(i + 2..i + 6).ok_or_else(bad)?).ok_or_else(bad)?;
+                            if !(0xdc00..=0xdfff).contains(&low) {
+                                return Err(bad());
+                            }
+                            i += 6;
+                            4
+                        }
+                        0xdc00..=0xdfff => return Err(bad()),
+                        _ => 3,
+                    }
+                }
+                _ => return Err(bad()),
+            }
+        };
+        decoded += width;
+        if decoded > limit {
+            return Err(InvokeFailure::invalid_request(
+                "configuration string exceeds its input limit",
+            ));
+        }
+    }
+    if i != bytes.len() - 1 {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+enum DecodedRequest {
+    Complete(InvokeResponse),
+    Envelope(RequestEnvelope),
+}
+
 fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
+    dispatch_request(decode_request(request)?)
+}
+
+fn decode_request(request: &[u8]) -> Result<DecodedRequest, InvokeFailure> {
     if request.len() > MAX_INVOKE_BYTES {
         return Err(InvokeFailure::invalid_request(format!(
             "Invoke envelope exceeds the {MAX_INVOKE_BYTES}-byte limit"
@@ -661,18 +994,46 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
     }
     let request = str::from_utf8(request)
         .map_err(|_| InvokeFailure::invalid_request("request is not valid UTF-8"))?;
+    check_dns_network_envelope(request)?;
+    http::check_envelope(request)?;
+    foreground::check_envelope(request)?;
+    if let Some(response) = dispatch_config_update(request)? {
+        return Ok(DecodedRequest::Complete(response));
+    }
     let envelope: RequestEnvelope =
         serde_json::from_str(request).map_err(InvokeFailure::invalid_request)?;
     if !envelope.payload.is_object() {
         return Err(InvokeFailure::invalid_request("payload must be an object"));
     }
 
+    Ok(DecodedRequest::Envelope(envelope))
+}
+
+fn dispatch_request(request: DecodedRequest) -> Result<InvokeResponse, InvokeFailure> {
+    let envelope = match request {
+        DecodedRequest::Complete(response) => return Ok(response),
+        DecodedRequest::Envelope(envelope) => envelope,
+    };
     let data = match envelope.method.as_str() {
         "initialize" => {
             require_instance_omitted(&envelope)?;
             let payload: InitializePayload = decode_payload(envelope.payload)?;
             let directory = registry().initialize_data_directory(&payload.data_dir)?;
             json!({"dataDir": directory.root().to_string_lossy()})
+        }
+        "updateDnsNetwork" => {
+            require_instance_omitted(&envelope)?;
+            crate::dns::source::check_metadata_size(&envelope.payload)
+                .map_err(InvokeFailure::from)?;
+            let update: crate::dns::source::DnsNetworkUpdate = decode_payload(envelope.payload)?;
+            let sources = registry().dns_sources()?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .map_err(InvokeFailure::from)?;
+            runtime
+                .block_on(sources.replace(update))
+                .map_err(InvokeFailure::from)?;
+            json!({})
         }
         "createInstance" => {
             require_instance_omitted(&envelope)?;
@@ -690,8 +1051,32 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
         "validateConfig" => {
             require_instance_omitted(&envelope)?;
             let payload: ConfigYamlPayload = decode_payload(envelope.payload)?;
-            validate_config(payload.config_yaml)?;
-            json!({})
+            if let Some(context) = payload.http_context {
+                if context.ca.is_some() {
+                    return Err(InvokeFailure::invalid_request(
+                        "validateConfig does not accept CA material",
+                    ));
+                }
+                if context
+                    .base_dir
+                    .map(InvokePath::into_path)
+                    .is_some_and(|path| !path.is_absolute())
+                {
+                    return Err(InvokeFailure::invalid_request(
+                        "HTTP baseDir must be absolute",
+                    ));
+                }
+            }
+            let resources_ready = payload
+                .http_config_yaml
+                .as_deref()
+                .filter(|input| !input.is_empty())
+                .map(crate::http_processing::config::Document::parse)
+                .transpose()
+                .map_err(|_| InvokeFailure::new("invalid HTTP processing configuration"))?
+                .is_none_or(|document| document.unresolved_count() == 0);
+            validate_config_with_http(payload.config_yaml, payload.http_config_yaml)?;
+            json!({"httpResourcesValidated":resources_ready,"httpsReady":false})
         }
         "measureDelay" => {
             require_instance_omitted(&envelope)?;
@@ -699,13 +1084,26 @@ fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
             let results = measure_delay::measure_delay(payload)?;
             json!({"results": results})
         }
-        "start" => {
+        "start" | "reconnect" => {
             let controller = require_instance(&envelope)?;
-            let payload: ConfigYamlPayload = decode_payload(envelope.payload)?;
+            let reconnect = envelope.method == "reconnect";
+            let payload: http::StartPayload = decode_payload(envelope.payload)?;
             invoke_instance_guarded(&controller, || {
-                controller.start(payload.config_yaml)?;
+                if reconnect {
+                    controller.reconnect(payload)?;
+                } else {
+                    controller.start_config(StartupConfig::Input(Box::new(payload)))?;
+                }
                 Ok(json!({}))
             })?
+        }
+        "refreshHttpProviders" => {
+            require_instance_omitted(&envelope)?;
+            http::refresh(decode_payload(envelope.payload)?)?
+        }
+        "testHttp" => {
+            require_instance_omitted(&envelope)?;
+            http::evaluate(decode_payload::<http::TestPayload>(envelope.payload)?)?
         }
         "foreground" => {
             require_instance_omitted(&envelope)?;
@@ -798,7 +1196,7 @@ impl CoreController {
         Ok(())
     }
 
-    fn prepare_locked(&self, config_yaml: String) -> Result<(), InvokeFailure> {
+    fn prepare_locked(&self, input: StartupConfig) -> Result<(), InvokeFailure> {
         {
             let mut inner = lock(&self.inner);
             refresh_runtime_status(&mut inner);
@@ -813,8 +1211,25 @@ impl CoreController {
         // protect controller for a configuration that actually contains TUN;
         // non-TUN configurations do not depend on controller registration.
         let _data_directory = registry().data_directory()?;
-        let config = parse_config_yaml(&config_yaml)?;
-        drop(config_yaml);
+        let (mut config, http_input, resolved_cache) = match input {
+            #[cfg(test)]
+            StartupConfig::Yaml(yaml) => (parse_config_yaml(&yaml)?, None, None),
+            StartupConfig::Input(mut payload) => {
+                let mut config = parse_config_yaml(&payload.config_yaml)?;
+                if let (Some(template), Some(paths)) =
+                    (&mut config.providers, payload.provider_paths.clone())
+                {
+                    Arc::make_mut(template).resource_paths = paths;
+                }
+                std::mem::take(&mut payload.foreground_overrides).apply(&mut config);
+                (config, Some(payload), None)
+            }
+            StartupConfig::Resolved(snapshot) => {
+                (snapshot.config, None, Some(snapshot.provider_cache))
+            }
+        };
+        let dispatch = crate::logging::dispatch(config.log_level);
+        let _logging = tracing::dispatcher::set_default(&dispatch);
         let has_tun = config
             .inbounds
             .iter()
@@ -827,7 +1242,10 @@ impl CoreController {
             tun_lease,
             protector,
         } = acquisition;
-        let allocator_relief = AppleTunAllocatorRelief::new(has_tun);
+        if has_tun {
+            crate::platform::process_memory::configure_allocator();
+        }
+        let allocator_relief = TunAllocatorRelief::new(has_tun);
         {
             let mut inner = lock(&self.inner);
             inner.last_error.clear();
@@ -836,7 +1254,7 @@ impl CoreController {
                 .transition(LifecycleState::Preparing)
                 .map_err(InvokeFailure::from)?;
             inner.tun_lease = tun_lease;
-            inner.apple_tun_allocator_relief = allocator_relief;
+            inner.tun_allocator_relief = allocator_relief;
         }
 
         let prepared = (|| {
@@ -847,14 +1265,48 @@ impl CoreController {
                 .enable_time()
                 .build()
                 .map_err(InvokeFailure::from)?;
-            let prepared = runtime
-                .block_on(PreparedCore::prepare_config(
-                    config,
-                    geodata_manager,
-                    &SystemResolver,
-                    limits,
-                ))
-                .map_err(InvokeFailure::from);
+            let prepared = runtime.block_on(async {
+                let cancellation = http_input
+                    .as_ref()
+                    .and_then(|input| input.cancellation.clone());
+                if let Some(input) = http_input {
+                    http::attach(
+                        &mut config,
+                        input.http_config_yaml.as_deref(),
+                        input.http_context,
+                        input.source_file,
+                        input.provider_paths,
+                        input.cancellation.as_ref(),
+                    )
+                    .await?;
+                }
+                let prepared = match resolved_cache {
+                    Some(cache) => {
+                        PreparedCore::prepare_resolved(
+                            config,
+                            cache,
+                            geodata_manager,
+                            &SystemResolver,
+                            limits,
+                        )
+                        .await
+                    }
+                    None => {
+                        PreparedCore::prepare_config(
+                            config,
+                            geodata_manager,
+                            &SystemResolver,
+                            limits,
+                        )
+                        .await
+                    }
+                }
+                .map_err(InvokeFailure::from)?;
+                if cancellation.is_some_and(|token| token.is_cancelled()) {
+                    return Err(InvokeFailure::new("core preparation was cancelled"));
+                }
+                Ok(prepared)
+            });
             // Bootstrap DNS runs on the runtime-shared bounded worker. Keep a
             // finite shutdown boundary so future prepare-only tasks cannot
             // turn Runtime::drop into an unbounded synchronous wait.
@@ -875,7 +1327,7 @@ impl CoreController {
                     .map_err(InvokeFailure::from)
                 {
                     Ok(()) => {
-                        observe_apple_tun_memory(has_tun, "prepare-complete");
+                        observe_tun_memory(has_tun, "prepare-complete");
                         Ok(())
                     }
                     Err(error) => reset_failed_operation(&mut inner, "prepare-transition-failed")
@@ -886,14 +1338,72 @@ impl CoreController {
         }
     }
 
-    fn start(&self, config_yaml: String) -> Result<(), InvokeFailure> {
+    fn start_config(&self, config: StartupConfig) -> Result<(), InvokeFailure> {
         let _command = self.try_command()?;
-        self.prepare_locked(config_yaml)?;
+        self.prepare_locked(config)?;
         let result = self.start_prepared_locked();
         if result.is_err() {
             reset_failed_operation(&mut lock(&self.inner), "start-failed")?;
         }
         result
+    }
+
+    fn reconnect(&self, input: http::StartPayload) -> Result<(), InvokeFailure> {
+        let _command = self.try_command()?;
+        let apply = {
+            let mut inner = lock(&self.inner);
+            refresh_runtime_status(&mut inner);
+            if inner.lifecycle.state() != LifecycleState::Running {
+                return Err(InvokeFailure::invalid_state(
+                    "instance must be running before reconnect",
+                ));
+            }
+            inner
+                .engine
+                .as_ref()
+                .and_then(|engine| engine.config_apply.clone())
+                .ok_or_else(|| {
+                    InvokeFailure::invalid_state("runtime cannot capture a recovery snapshot")
+                })?
+        };
+        // Resolve external sources while the old engine and its platform lease
+        // are still usable. GeoData registration and TUN binding happen only
+        // after the synchronous old-engine stop barrier.
+        let config = http::parse_reconnect(input, &apply)?;
+        let manager = registry().geodata_manager()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(InvokeFailure::from)?;
+        let next = runtime.block_on(PreparedCore::resolve_config(config, &manager));
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        let (config, provider_cache) = next.map_err(InvokeFailure::from)?;
+        let next = Box::new(crate::runtime::RecoverySnapshot {
+            config,
+            provider_cache,
+        });
+        let previous = apply
+            .recovery_snapshot()
+            .map_err(|error| InvokeFailure::new(error.message()))?;
+        self.stop_locked()?;
+        let result = self
+            .prepare_locked(StartupConfig::Resolved(next))
+            .and_then(|()| self.start_prepared_locked());
+        if let Err(error) = result {
+            reset_failed_operation(&mut lock(&self.inner), "reconnect-failed")?;
+            if self
+                .prepare_locked(StartupConfig::Resolved(previous))
+                .and_then(|()| self.start_prepared_locked())
+                .is_err()
+            {
+                reset_failed_operation(&mut lock(&self.inner), "reconnect-recovery-failed")?;
+                return Err(InvokeFailure::new(
+                    "reconnect failed and previous session could not be restored",
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn start_prepared_locked(&self) -> Result<(), InvokeFailure> {
@@ -921,7 +1431,7 @@ impl CoreController {
                 .lifecycle
                 .transition(LifecycleState::Starting)
                 .map_err(InvokeFailure::from)?;
-            let allocator_relief = inner.apple_tun_allocator_relief.clone();
+            let allocator_relief = inner.tun_allocator_relief.clone();
             (prepared, tun, has_tun, allocator_relief)
         };
 
@@ -930,7 +1440,8 @@ impl CoreController {
             .clone()
             .map_or_else(Dialer::default, |protector| {
                 Dialer::default().with_protector(protector)
-            });
+            })
+            .with_dns_sources(registry().dns_sources()?);
         let (stop_tx, stop_rx) = oneshot::channel();
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
         let (completed_tx, completed_rx) = tokio::sync::watch::channel(false);
@@ -940,7 +1451,7 @@ impl CoreController {
             has_tun,
             allocator_relief,
         };
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let dispatch = crate::logging::dispatch(prepared.core.log_level());
         let spawned = thread::Builder::new()
             .name(format!("vole-runtime-{instance_id}"))
             .spawn(crate::resources::observation::inherit_thread(move || {
@@ -961,10 +1472,12 @@ impl CoreController {
             stop: Some(stop_tx),
             thread: Some(runtime_thread),
             completion: completed_rx,
+            config_apply: None,
         };
 
         match startup_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(())) => {
+            Ok(Ok(config_apply)) => {
+                engine.config_apply = config_apply;
                 let mut inner = lock(&self.inner);
                 if let Err(error) = inner
                     .lifecycle
@@ -978,7 +1491,7 @@ impl CoreController {
                         .and(Err(error));
                 }
                 inner.engine = Some(engine);
-                observe_apple_tun_memory(has_tun, "start-complete");
+                observe_tun_memory(has_tun, "start-complete");
                 Ok(())
             }
             Ok(Err(error)) => {
@@ -1018,7 +1531,7 @@ impl CoreController {
                 LifecycleState::Stopped => {
                     let had_tun = inner.tun_lease.is_some();
                     inner.last_error.clear();
-                    observe_apple_tun_memory(had_tun, "stop-complete");
+                    observe_tun_memory(had_tun, "stop-complete");
                     clear_instance_leases(&mut inner);
                     return Ok(());
                 }
@@ -1030,7 +1543,7 @@ impl CoreController {
                         .lifecycle
                         .transition(LifecycleState::Stopped)
                         .map_err(InvokeFailure::from);
-                    observe_apple_tun_memory(had_tun, "stop-complete");
+                    observe_tun_memory(had_tun, "stop-complete");
                     clear_instance_leases(&mut inner);
                     return transitioned;
                 }
@@ -1135,7 +1648,7 @@ impl CoreController {
         let mut inner = lock(&self.inner);
         inner.lifecycle = Lifecycle::default();
         inner.engine = None;
-        observe_apple_tun_memory(had_tun, "panic-recovery");
+        observe_tun_memory(had_tun, "panic-recovery");
         clear_instance_leases(&mut inner);
         Ok(())
     }
@@ -1144,20 +1657,17 @@ impl CoreController {
 fn clear_instance_leases(inner: &mut CoreInner) {
     // Prepared-only paths own the final allocator-relief handle here. Running
     // paths share it with the engine, whose completion performs relief first.
-    inner.apple_tun_allocator_relief = None;
+    inner.tun_allocator_relief = None;
     inner.tun_lease = None;
 }
 
-fn observe_apple_tun_memory(has_tun: bool, stage: &'static str) {
-    #[cfg(any(target_os = "ios", target_os = "tvos"))]
+fn observe_tun_memory(has_tun: bool, stage: &'static str) {
     if has_tun {
         crate::platform::process_memory::observe(stage);
     }
-    let _ = (has_tun, stage);
 }
 
-fn relieve_apple_tun_allocator() {
-    #[cfg(any(target_os = "ios", target_os = "tvos"))]
+fn relieve_tun_allocator() {
     crate::platform::process_memory::relieve_allocator_pressure();
 }
 
@@ -1168,23 +1678,48 @@ pub(crate) fn replace_android_socket_protector(
     registry().replace_android_socket_protector(protector)
 }
 
-fn validate_config(config_yaml: String) -> Result<(), InvokeFailure> {
-    let config = parse_config_yaml(&config_yaml)?;
+fn validate_config_with_http(
+    config_yaml: String,
+    http_config_yaml: Option<String>,
+) -> Result<(), InvokeFailure> {
+    let config = parse_config_yaml_with_http(&config_yaml, http_config_yaml.as_deref())?;
     drop(config_yaml);
     PreparedCore::validate_config(config).map_err(InvokeFailure::from)
 }
 
 fn parse_config_yaml(config_yaml: &str) -> Result<Config, InvokeFailure> {
+    parse_config_yaml_with_http(config_yaml, None)
+}
+fn parse_config_yaml_with_http(
+    config_yaml: &str,
+    http: Option<&str>,
+) -> Result<Config, InvokeFailure> {
+    let directory = registry().data_directory().ok();
+    let mut config =
+        parse_config_yaml_with_directory(config_yaml, directory.as_ref().map(|dir| dir.root()))?;
+    if let (Some(template), Some(paths)) = (&mut config.providers, registry().provider_paths()) {
+        Arc::make_mut(template).resource_paths = paths;
+    }
+    config.set_http_config(http).map_err(InvokeFailure::from)?;
+    Ok(config)
+}
+
+fn parse_config_yaml_with_directory(
+    config_yaml: &str,
+    directory: Option<&Path>,
+) -> Result<Config, InvokeFailure> {
     if config_yaml.is_empty() {
         return Err(InvokeFailure::invalid_request("configYaml is empty"));
     }
-    Config::parse_yaml(config_yaml.as_bytes()).map_err(InvokeFailure::from)
+    Config::parse_yaml_with_directory(config_yaml.as_bytes(), directory)
+        .map_err(InvokeFailure::from)
 }
 
 fn geodata_status_data(status: GeoDataStatus) -> Value {
     json!({
         "geosite": geodata_resource_data(status.geosite),
         "geoip": geodata_resource_data(status.geoip),
+        "asn": geodata_resource_data(status.asn),
     })
 }
 
@@ -1246,7 +1781,7 @@ fn acquire_start_tun(
 struct EngineContext {
     instance_id: u64,
     has_tun: bool,
-    allocator_relief: Option<AppleTunAllocatorRelief>,
+    allocator_relief: Option<TunAllocatorRelief>,
 }
 
 fn run_engine(
@@ -1255,7 +1790,7 @@ fn run_engine(
     tun: Option<InvokeTun>,
     dialer: Dialer,
     stop: oneshot::Receiver<()>,
-    startup: SyncSender<Result<(), InvokeFailure>>,
+    startup: SyncSender<Result<Option<ConfigApplyHandle>, InvokeFailure>>,
 ) -> io::Result<()> {
     let EngineContext {
         instance_id,
@@ -1264,7 +1799,7 @@ fn run_engine(
     } = context;
     tracing::info!(instance_id, has_tun, "Vole runtime engine starting");
     let result = run_engine_inner(instance_id, has_tun, prepared, tun, dialer, stop, startup);
-    observe_apple_tun_memory(has_tun, "stop-complete");
+    observe_tun_memory(has_tun, "stop-complete");
     if let Some(relief) = allocator_relief {
         relief.relieve();
     }
@@ -1288,7 +1823,7 @@ fn run_engine_inner(
     tun: Option<InvokeTun>,
     dialer: Dialer,
     stop: oneshot::Receiver<()>,
-    startup: SyncSender<Result<(), InvokeFailure>>,
+    startup: SyncSender<Result<Option<ConfigApplyHandle>, InvokeFailure>>,
 ) -> io::Result<()> {
     let runtime = match engine_runtime_builder().enable_io().enable_time().build() {
         Ok(runtime) => runtime,
@@ -1312,10 +1847,24 @@ fn run_engine_inner(
                 Err(error) => Err(io::Error::other(error)),
             },
             None if has_tun => {
-                let config = prepared.tun_config().expect("validated TUN configuration");
-                match TunIo::open(&config.device, config.mtu) {
-                    Ok(tun) => prepared.start_tun(tun, dialer).await,
-                    Err(error) => Err(io::Error::other(error)),
+                #[cfg(target_os = "linux")]
+                {
+                    prepared.start_native_tun(dialer).await
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let config = prepared.tun_config().expect("validated TUN configuration");
+                    if config.auto_route || config.auto_detect_interface {
+                        Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "automatic TUN networking is only available on Linux",
+                        ))
+                    } else {
+                        match TunIo::open(&config.device, config.mtu) {
+                            Ok(tun) => prepared.start_tun(tun, dialer).await,
+                            Err(error) => Err(io::Error::other(error)),
+                        }
+                    }
                 }
             }
             None => prepared.start_local(dialer).await,
@@ -1341,7 +1890,7 @@ fn run_engine_inner(
             debug_assert!(tun.is_none());
             prepared.start_local(dialer).await
         };
-        let running = match started {
+        let mut running = match started {
             Ok(running) => running,
             Err(error) => {
                 let kind = error.kind();
@@ -1350,8 +1899,11 @@ fn run_engine_inner(
                 return Err(io::Error::new(kind, message));
             }
         };
+        running.maintain_http(
+            http::runtime_store().map_err(|_| io::Error::other("HTTP runtime store is missing"))?,
+        );
         tracing::info!(instance_id, has_tun, "Vole runtime engine started");
-        if startup.send(Ok(())).is_err() {
+        if startup.send(Ok(running.config_apply_handle())).is_err() {
             return running.stop().await;
         }
         running
@@ -1360,10 +1912,10 @@ fn run_engine_inner(
     })
 }
 
-async fn wait_for_engine_shutdown(stop: oneshot::Receiver<()>, has_tun: bool) -> io::Result<()> {
-    #[cfg(any(target_os = "ios", target_os = "tvos"))]
-    let mut stop = stop;
-    #[cfg(any(target_os = "ios", target_os = "tvos"))]
+async fn wait_for_engine_shutdown(
+    mut stop: oneshot::Receiver<()>,
+    has_tun: bool,
+) -> io::Result<()> {
     if has_tun {
         let interval = crate::platform::process_memory::TELEMETRY_INTERVAL;
         let first_tick = tokio::time::Instant::now() + interval;
@@ -1372,11 +1924,10 @@ async fn wait_for_engine_shutdown(stop: oneshot::Receiver<()>, has_tun: bool) ->
         loop {
             tokio::select! {
                 _ = &mut stop => return Ok(()),
-                _ = telemetry.tick() => observe_apple_tun_memory(true, "running"),
+                _ = telemetry.tick() => observe_tun_memory(true, "running"),
             }
         }
     }
-    let _ = has_tun;
     let _ = stop.await;
     Ok(())
 }
@@ -1427,7 +1978,7 @@ fn reset_failed_operation(
         }
         LifecycleState::Stopped => {}
     }
-    observe_apple_tun_memory(had_tun, telemetry_stage);
+    observe_tun_memory(had_tun, telemetry_stage);
     clear_instance_leases(inner);
     Ok(())
 }
@@ -1460,6 +2011,36 @@ fn bounded_error(mut message: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owned_invoke_uses_the_shared_strict_and_runtime_thread_boundaries() {
+        let version = br#"{"method":"version","payload":{}}"#;
+        assert_eq!(
+            super::invoke_bytes(version),
+            super::invoke_owned_bytes(version.to_vec())
+        );
+        for invalid in [
+            br#"{"method":"version","payload":{},"extra":true}"#.as_slice(),
+            br#"{"method":"version","payload":{"secret":"private-fixture"}}"#,
+            br#"{"method":"foreground","payload":{"action":"help","extra":true}}"#,
+        ] {
+            assert_eq!(
+                super::invoke_bytes(invalid),
+                super::invoke_owned_bytes(invalid.to_vec())
+            );
+        }
+        let oversized_key = serde_json::json!({"method":"foreground","payload":{"action":"help","ageSecretKey":"x".repeat(16 * 1024 + 1)}}).to_string();
+        assert_eq!(
+            super::invoke_bytes(oversized_key.as_bytes()),
+            super::invoke_owned_bytes(oversized_key.into_bytes())
+        );
+        super::IS_RUNTIME_THREAD.with(|flag| {
+            let old = flag.replace(true);
+            let response = super::invoke_owned_bytes(version.to_vec());
+            flag.set(old);
+            assert_eq!(response, super::runtime_thread_response());
+        });
+    }
+
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},
@@ -1476,6 +2057,42 @@ mod tests {
     use std::{ffi::CStr, ptr};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn allocator_relief_requires_tun() {
+        assert!(TunAllocatorRelief::new(false).is_none());
+        let relief = TunAllocatorRelief::new(true).expect("TUN owns allocator relief");
+        // Claim with a pure hook so this regression never trims the test
+        // process's allocator as a side effect of dropping the handle.
+        relief.state.relieve_with(|| {});
+    }
+
+    #[test]
+    fn shared_allocator_relief_is_claimed_exactly_once() {
+        let state = Arc::new(TunAllocatorReliefState {
+            relieved: AtomicBool::new(false),
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts: Vec<_> = (0..8)
+            .map(|_| {
+                let state = state.clone();
+                let calls = calls.clone();
+                thread::spawn(move || {
+                    state.relieve_with(|| {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                    });
+                })
+            })
+            .collect();
+        for attempt in attempts {
+            attempt.join().unwrap();
+        }
+        state.relieve_with(|| {
+            calls.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(state.relieved.load(Ordering::Relaxed));
+    }
 
     struct TestDataDirectory {
         _temporary: tempfile::TempDir,
@@ -1525,7 +2142,7 @@ mod tests {
         let controller = registry().instance(instance_id).unwrap();
         let payload: ConfigYamlPayload = decode_payload(payload).unwrap();
         let _command = controller.try_command().unwrap();
-        let result = controller.prepare_locked(payload.config_yaml);
+        let result = controller.prepare_locked(StartupConfig::Yaml(payload.config_yaml));
         json!({"success": result.is_ok()})
     }
 
@@ -1978,6 +2595,171 @@ rules:
         .unwrap();
         unsafe { VoleFree(oversized_response) };
         assert_failure(&oversized_json);
+    }
+
+    #[test]
+    fn update_config_invoke_shares_admission_and_keeps_lifecycle_command_serial() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_registry();
+        let id = create_instance();
+        let controller = registry().instance(&id).unwrap();
+        assert_failure(&request(
+            "updateConfig",
+            Some(&id),
+            json!({"configYaml":"rules: [MATCH,DIRECT]"}),
+        ));
+        let (handle, mut receiver) =
+            ConfigApplyHandle::channel(tokio_util::sync::CancellationToken::new());
+        let (_sent, completion) = tokio::sync::watch::channel(false);
+        {
+            let mut inner = lock(&controller.inner);
+            for state in [
+                LifecycleState::Preparing,
+                LifecycleState::Prepared,
+                LifecycleState::Starting,
+                LifecycleState::Running,
+            ] {
+                inner.lifecycle.transition(state).unwrap();
+            }
+            inner.engine = Some(Engine {
+                stop: None,
+                thread: None,
+                completion,
+                config_apply: Some(handle.clone()),
+            });
+        }
+        let occupied = handle.try_admit().unwrap();
+        let busy = request(
+            "updateConfig",
+            Some(&id),
+            json!({"extra":"invalid schema must not be decoded"}),
+        );
+        assert_eq!(busy["error"], "configuration application is busy");
+        drop(occupied);
+        let id2 = id.clone();
+        let caller = thread::spawn(move || {
+            request(
+                "updateConfig",
+                Some(&id2),
+                json!({"configYaml":"rules: [MATCH,DIRECT]"}),
+            )
+        });
+        let mut candidate = receiver.blocking_recv().unwrap();
+        assert!(
+            matches!(candidate.take_update(), ConfigUpdate::Replace(yaml) if yaml == "rules: [MATCH,DIRECT]")
+        );
+        let stopped = request("stop", Some(&id), json!({}));
+        assert_failure(&stopped);
+        assert!(stopped["error"].as_str().unwrap().contains("busy"));
+        candidate.complete(Ok(()));
+        assert_eq!(caller.join().unwrap()["success"], true);
+        destroy_instance(&id);
+        assert_registry_is_idle();
+    }
+
+    #[test]
+    fn update_config_raw_string_budget_and_strict_shape_precede_decoding() {
+        for value in ["", "plain", "界", "\\", "\n", "😀"] {
+            let encoded = serde_json::to_string(value).unwrap();
+            assert!(check_json_string_limit(&encoded, value.len()).is_ok());
+            if !value.is_empty() {
+                assert!(check_json_string_limit(&encoded, value.len() - 1).is_err());
+            }
+            assert_eq!(
+                decode_update_yaml(&format!(r#"{{"configYaml":{encoded}}}"#)).unwrap(),
+                value
+            );
+        }
+        assert!(check_json_string_limit(r#""\u754c""#, 3).is_ok());
+        assert!(check_json_string_limit(r#""\uD83D\uDE00""#, 4).is_ok());
+        assert!(check_json_string_limit(r#""\uD83D\uDE00""#, 3).is_err());
+        for invalid in [r#""\uD800""#, r#""\uDC00""#, "null", "1"] {
+            assert!(check_json_string_limit(invalid, 32).is_err());
+        }
+        for payload in [
+            r#"{"configYaml":"a","extra":1}"#,
+            r#"{"configYaml":"a","configYaml":"b"}"#,
+            r#"{"configYaml":null}"#,
+            "{}",
+        ] {
+            assert!(decode_update_yaml(payload).is_err());
+        }
+        let max = crate::config::MAX_CONFIG_BYTES;
+        let escaped = format!(r#"{{"configYaml":"{}"}}"#, r"\u0061".repeat(max + 1));
+        assert!(decode_update_yaml(&escaped).is_err());
+        // A raw input of arbitrary JSON shape cannot bypass method matching.
+        assert!(
+            dispatch_config_update(r#"{"method":"version","payload":{}}"#)
+                .unwrap()
+                .is_none()
+        );
+        assert!(dispatch_config_update(r#"{"method":"updateConfig","payload":{}}"#).is_err());
+    }
+
+    #[test]
+    fn update_dns_network_raw_admission_is_bounded_before_value_or_registry_work() {
+        let padded = format!(
+            "{{{}\"generation\":1,\"system\":[],\"dhcp\":[]}}",
+            " ".repeat(crate::dns::source::MAX_METADATA_BYTES)
+        );
+        for method in ["updateDnsNetwork", r"\u0075pdateDnsNetwork"] {
+            let envelope = format!(r#"{{"payload":{padded},"method":"{method}"}}"#);
+            let response = invoke(&envelope);
+            assert_failure(&response);
+            assert_eq!(
+                response["error"],
+                "invalid request: DNS network metadata exceeds 64 KiB"
+            );
+        }
+        let overhead = format!(
+            r#"{{"method":"updateDnsNetwork","payload":{{}},"instanceId":"{}"}}"#,
+            "x".repeat(64 * 1024)
+        );
+        assert!(check_dns_network_envelope(&overhead).is_err());
+        let unrelated = json!({"method":"validateConfig","payload":{"configYaml":"updateDnsNetwork".repeat(8192)}}).to_string();
+        assert!(check_dns_network_envelope(&unrelated).is_ok());
+    }
+
+    #[test]
+    fn update_dns_network_is_runtime_local_strict_and_monotonic() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_registry();
+        let payload = json!({"generation":1,"system":[{"address":"203.0.113.53","interface":"physical0"}],"dhcp":[]});
+        assert_failure(&request("updateDnsNetwork", None, payload.clone()));
+        let _data = initialize_test_data_directory();
+        assert_eq!(
+            request("updateDnsNetwork", None, payload.clone())["success"],
+            true
+        );
+        assert_eq!(
+            request("updateDnsNetwork", None, payload.clone())["success"],
+            true
+        );
+        assert_failure(&request("updateDnsNetwork", Some("1"), payload));
+        assert_failure(&request(
+            "updateDnsNetwork",
+            None,
+            json!({"generation":1,"system":[],"dhcp":[]}),
+        ));
+        assert_eq!(
+            request(
+                "updateDnsNetwork",
+                None,
+                json!({"generation":2,"system":[],"dhcp":[]})
+            )["success"],
+            true
+        );
+        assert_failure(&request(
+            "updateDnsNetwork",
+            None,
+            json!({"generation":1,"system":[],"dhcp":[]}),
+        ));
+        assert_failure(&request(
+            "updateDnsNetwork",
+            None,
+            json!({"generation":3,"system":[],"dhcp":[],"extra":true}),
+        ));
+        reset_registry();
     }
 
     #[test]
@@ -2514,6 +3296,7 @@ rules:
                 stop: Some(stop),
                 thread: Some(worker),
                 completion,
+                config_apply: None,
             });
         }
         let result = invoke_instance_guarded(&controller, || {
@@ -2570,6 +3353,7 @@ rules:
             stop: None,
             thread: Some(worker),
             completion: received,
+            config_apply: None,
         };
         assert!(engine.stop().is_err());
     }
@@ -2585,5 +3369,27 @@ rules:
         assert!(lock(&registry().inner).instance.is_none());
         let platform = lock(&registry().platform);
         assert_eq!(platform.tun_owner, None);
+    }
+
+    #[test]
+    fn update_http_addendum_preserves_optional_clear_and_its_separate_byte_limit() {
+        let input = decode_update_input(
+            r#"{"configYaml":"rules: ['MATCH,DIRECT']","httpConfigYaml":"rewrite: []"}"#,
+        )
+        .unwrap();
+        assert_eq!(input.http_config_yaml.as_deref(), Some("rewrite: []"));
+        assert_eq!(
+            decode_update_input(r#"{"configYaml":"x","httpConfigYaml":""}"#)
+                .unwrap()
+                .http_config_yaml
+                .as_deref(),
+            Some("")
+        );
+        assert!(decode_update_input(r#"{"configYaml":"x","httpConfigYaml":1}"#).is_err());
+        let input = format!(
+            r#"{{"configYaml":"x","httpConfigYaml":"{}"}}"#,
+            "x".repeat(crate::http_processing::MAX_ADDENDUM + 1)
+        );
+        assert!(decode_update_input(&input).is_err());
     }
 }

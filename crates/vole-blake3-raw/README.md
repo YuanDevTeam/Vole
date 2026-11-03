@@ -4,57 +4,70 @@ Private workspace crate for the byte-string DeriveKey used on the VLESS
 Encryption wire. One public function accepts two byte slices and returns a
 32-byte key. It performs no allocation, IO, runtime loading, or TLS operation.
 Callers own input/output secrets and their erasure policy. The C adapter clears
-its hasher; it cannot guarantee erasure of upstream internal temporaries.
+its hasher with volatile stores; it cannot guarantee erasure of upstream
+internal temporaries.
 
-The official Rust API takes `&str`; arbitrary binary protocol contexts cannot be
-converted to UTF-8, hex, or base64 without changing the derivation. The official
-C `blake3_hasher_init_derive_key_raw` is used directly. Rust does not mirror the
-C hasher layout or implement a compression/KDF algorithm.
+The official Rust 1.8.7 derive API takes `&str`. Arbitrary binary protocol
+contexts may contain invalid UTF-8, so conversion to UTF-8, hex or base64 would
+change the derivation. NUL itself is valid UTF-8 and can occur in a Rust string.
+The official C `blake3_hasher_init_derive_key_raw` accepts a pointer and length.
+Rust does not mirror the C hasher layout or implement a compression/KDF algorithm.
 
-This reproduces an existing protocol, not a new cryptographic recommendation:
-BLAKE3's authors recommend a fixed, globally unique application-specific context,
-and caution against dynamic contexts. Compatibility does not establish the
-security of VLESS Encryption's protocol design.
+This reproduces an existing protocol. BLAKE3's authors recommend a fixed,
+globally unique application-specific context; wire compatibility alone does
+not establish the security of VLESS Encryption's protocol design.
 
-## Source and build
+## Dependency and build
 
-The five `vendor/blake3*` files are byte-for-byte copies from official
-[BLAKE3 1.8.7](https://github.com/BLAKE3-team/BLAKE3/tree/1.8.7/c), commit
-`f3149ec5bb5449af877ba20377a11008ff499fa2` (latest stable checked 2026-09-26).
-Archive SHA-256: `c6782a28842b1c0478524ac06a4f2ede784038ee298d6e2162c0b089c4306a3c`.
-Upstream offers CC0-1.0, Apache-2.0, or Apache-2.0 WITH LLVM-exception; all three
-license texts are preserved in `vendor/`. Vendored source is used under
-Apache-2.0 WITH LLVM-exception. Vole-owned adapter/build/Rust code is MIT.
+The implementation is official [BLAKE3 1.8.7](https://github.com/BLAKE3-team/BLAKE3/tree/1.8.7/c),
+installed as a static library through the official
+[vcpkg port](https://github.com/microsoft/vcpkg/tree/e456309491fd875487bf02b8a0dca76c1b1b00cc/ports/blake3).
+[The manifest](../../scripts/native/blake3/vcpkg.json) locks the registry commit
+and exact port version. vcpkg manages release acquisition, checksum verification,
+its official Windows ARM patch and upstream license texts in the dependency cache.
+Vole-owned adapter/build/Rust code and package configuration are MIT.
 
-| File | SHA-256 |
-| --- | --- |
-| blake3.c | b118ddf7cf9e6e5ef3fded72dcb1acf9dfdc4ea923cbe4605900ad6ee9afe1af |
-| blake3.h | 81bbb11ad1909341565dce4914cc0e5c29718eca27e6950b28f9226a91aaf8c5 |
-| blake3_impl.h | d388dca3574602c8849805ea3c8c0a12d082ac0e428756f305e111942f099af4 |
-| blake3_dispatch.c | 134f21550138c0af6312925c988aeee35df287e4119e8ad1d206fccdb2238fe3 |
-| blake3_portable.c | 2bc25b0dad67b4329d0b49cfa075ab2b0d04e424addbddc4e9c389c52a192524 |
+There is no bundled BLAKE3 source. `build.rs` compiles only `src/derive.c` and
+links the supplied static archive. It never downloads dependencies or searches
+Cargo source caches. Platform build scripts prepare the dependency automatically;
+see [build instructions](../../scripts/README.md).
 
-`build.rs` compiles these local files with official portable-only switches and
-compile-time symbol prefixes. It never accesses research checkouts, Cargo source
-caches, or the network. No bindgen, SIMD implementation, or fork is introduced.
-Latest stable `cc` 1.5.1 is selected explicitly. Upgrades require rechecking the
-official release, replacing unchanged files, updating provenance and hashes,
-and rerunning vectors and target builds.
+The Vole-owned package triplet sets compile-time `vole_c_blake3_*` names for all
+C symbols, keeping the official source and port unchanged. This prevents
+collisions with the official Rust crate's native SIMD callbacks in the same
+Core or test executable. ARM retains official NEON; x86 uses the official C
+intrinsics mode so compiler macros also rename SIMD exports. Package upgrades
+require reviewing the upstream symbol set and rerunning vectors and target builds.
 
-## Check
+For direct Cargo use, provide absolute public include and static library directories:
 
 ```sh
+export VOLE_BLAKE3_INCLUDE_DIR=/absolute/native-package/include
+export VOLE_BLAKE3_LIB_DIR=/absolute/native-package/lib
 cargo test --locked -p vole-blake3-raw
 ```
 
-This checks a primitive, not the Encryption handshake, ticket authentication,
-runtime ownership, platform integration, or end-to-end Encryption acceptance.
+Native builds accept those two variables. Cross builds require target-specific
+pairs such as `VOLE_BLAKE3_INCLUDE_DIR_AARCH64_APPLE_IOS` and
+`VOLE_BLAKE3_LIB_DIR_AARCH64_APPLE_IOS`; target-specific paths take precedence.
+The archive must be the matching namespaced static package, built for the same
+architecture, SDK/API and CRT; Unix shared-library consumers require PIC.
+The public header must declare version 1.8.7. Missing paths, a wrong header
+version or a missing archive fail closed. Cargo declares this native identity
+with `links = "blake3"`.
 
-The binary-context fixture has 52 values generated with the independent
+## Check
+
+The four memory-only tests verify the linked C library version, arbitrary binary
+contexts, independent vectors and coexistence with the official Rust crate.
+They check a primitive; Encryption handshake, ticket authentication, runtime
+ownership and platform behavior need their own tests.
+
+The fixture has 52 values generated with the independent
 `github.com/metacubex/blake3 v0.1.0` implementation used by Mihomo, using Go 1.27.1.
 Its SHA-256 is `16fa3198a0a6adad7de4df74010f1625b72a445991e8554842c0b12bd070b08d`.
-The generator and Go module lock are in `tests/generator/`; run `go run .` there
-to reproduce the JSON on stdout (not part of the Rust build). Inputs contain
-invalid UTF-8 and NUL and cover 64/1024-byte boundaries and protocol contexts up
-to 17005 bytes. UTF-8 cases also link and compare the official Rust crate in the
-same test executable.
+The generator and Go module lock are in `tests/generator/`; `go run .` reproduces
+the JSON on stdout and is not part of the Rust build. Inputs contain invalid
+UTF-8 and NUL and cover 64/1024-byte boundaries and wire contexts up to 17005
+bytes. UTF-8 cases also compare the official Rust derive interface in the same
+test executable.

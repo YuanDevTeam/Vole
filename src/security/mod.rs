@@ -6,11 +6,16 @@ mod boring;
 mod boring_resumption;
 #[cfg(feature = "tls-fingerprint")]
 mod boring_stream;
-#[cfg(feature = "outbound-vless")]
+#[cfg(feature = "stream-security")]
 mod client;
 mod context;
-#[cfg(feature = "outbound-vless")]
-mod ech;
+#[cfg(feature = "ech")]
+pub(crate) mod ech;
+mod identity;
+#[cfg(feature = "outbound-masque")]
+pub(crate) mod masque;
+#[cfg(feature = "quiche-h3-transport")]
+mod quiche_tls;
 mod resumption;
 #[cfg(feature = "shadow-tls-v3")]
 mod shadow_tls;
@@ -24,14 +29,19 @@ pub use shadow_tls::ShadowTlsClient;
 #[cfg(feature = "outbound-vless")]
 pub(crate) mod vision;
 
-#[cfg(feature = "outbound-vless")]
+#[cfg(feature = "stream-security")]
 pub use client::{REALITY_CLIENT_VERSION, SecurityClient};
 pub use context::SecurityContext;
+#[cfg(feature = "quiche-h3-transport")]
+pub(crate) use quiche_tls::QuicheTls;
 pub use stream::CLOSE_NOTIFY_TIMEOUT;
 pub use tls::{
     StandardTlsClient, TLS_RESUMPTION_SESSION_BUDGET, TlsCertificatePolicy, TlsClientIdentity,
     TlsClientOptions, TlsVersions,
 };
+
+#[cfg(all(test, feature = "stream-security"))]
+mod client_identity_tests;
 
 #[cfg(test)]
 fn test_profiles() -> &'static [Option<crate::config::ClientFingerprint>] {
@@ -40,10 +50,10 @@ fn test_profiles() -> &'static [Option<crate::config::ClientFingerprint>] {
         use crate::config::ClientFingerprint::*;
         &[
             None,
-            Some(Chrome120),
             Some(Chrome133),
             Some(Firefox120),
             Some(Safari16),
+            Some(Ios14),
         ]
     }
     #[cfg(not(feature = "tls-fingerprint"))]
@@ -51,3 +61,7 @@ fn test_profiles() -> &'static [Option<crate::config::ClientFingerprint>] {
         &[None]
     }
 }
+
+#[cfg(all(test, feature = "outbound-vless", feature = "tls-fingerprint"))]
+#[path = "ech_dynamic_tests.rs"]
+mod ech_dynamic_tests;

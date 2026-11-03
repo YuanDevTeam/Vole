@@ -1,12 +1,11 @@
-use std::io;
+use std::{io, net::IpAddr, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-/// One client-proxy credential shared by the HTTP and SOCKS5 frontends.
+/// Client-proxy credentials shared by the HTTP and SOCKS5 frontends.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProxyCredentials {
-    username: String,
-    password: String,
+    entries: Vec<(Arc<str>, String)>,
 }
 
 impl std::fmt::Debug for ProxyCredentials {
@@ -21,78 +20,181 @@ impl ProxyCredentials {
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> io::Result<Self> {
         let username = username.into();
         let password = password.into();
-        for (kind, value) in [("user", &username), ("password", &password)] {
-            if !(1..=255).contains(&value.len()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("authentication {kind} must contain between 1 and 255 UTF-8 bytes"),
-                ));
-            }
-        }
         if username.contains(':') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "authentication user must not contain `:`",
             ));
         }
-        Ok(Self { username, password })
+        Ok(Self {
+            entries: vec![(Arc::from(username), password)],
+        })
     }
 
     #[must_use]
     pub fn matches(&self, username: &[u8], password: &[u8]) -> bool {
-        // Always compare both fixed-size credential slots; never expose the
-        // matching prefix or short-circuit after a successful username check.
-        let mut difference = username.len() ^ self.username.len();
-        difference |= password.len() ^ self.password.len();
-        for index in 0..255 {
-            difference |= usize::from(
-                username.get(index).copied().unwrap_or(0)
-                    ^ self.username.as_bytes().get(index).copied().unwrap_or(0),
-            );
-            difference |= usize::from(
-                password.get(index).copied().unwrap_or(0)
-                    ^ self.password.as_bytes().get(index).copied().unwrap_or(0),
-            );
+        self.authenticate(username, password).is_some()
+    }
+
+    pub(crate) fn authenticate(&self, username: &[u8], password: &[u8]) -> Option<Arc<str>> {
+        let mut matched = None;
+        for (expected_user, expected_password) in &self.entries {
+            let mut difference = username.len() ^ expected_user.len();
+            difference |= password.len() ^ expected_password.len();
+            // Cover both complete fields without an early exit on content.
+            // HTTP credentials are not limited by SOCKS5's one-byte lengths.
+            let length = username
+                .len()
+                .max(expected_user.len())
+                .max(password.len())
+                .max(expected_password.len());
+            for index in 0..length {
+                difference |= usize::from(
+                    username.get(index).copied().unwrap_or(0)
+                        ^ expected_user.as_bytes().get(index).copied().unwrap_or(0),
+                );
+                difference |= usize::from(
+                    password.get(index).copied().unwrap_or(0)
+                        ^ expected_password
+                            .as_bytes()
+                            .get(index)
+                            .copied()
+                            .unwrap_or(0),
+                );
+            }
+            if difference == 0 {
+                matched = Some(expected_user.clone());
+            }
         }
-        difference == 0
+        matched
+    }
+    pub(crate) fn multiple(values: Vec<Self>) -> Self {
+        let mut entries = std::collections::BTreeMap::new();
+        for (username, password) in values.into_iter().flat_map(|value| value.entries) {
+            entries.insert(username, password);
+        }
+        Self {
+            entries: entries.into_iter().collect(),
+        }
     }
 
     #[must_use]
     pub fn authorization_header_value(&self) -> String {
         format!(
             "Basic {}",
-            STANDARD.encode(format!("{}:{}", self.username, self.password))
+            STANDARD.encode(format!("{}:{}", self.entries[0].0, self.entries[0].1))
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn verifies(&self, headers: &[(String, String)]) -> bool {
+        self.authenticate_headers(headers).is_some()
+    }
+
+    pub(crate) fn authenticate_headers(&self, headers: &[(String, String)]) -> Option<Arc<str>> {
         let mut values = headers
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("proxy-authorization"))
             .map(|(_, value)| value.as_str());
         let (Some(value), None) = (values.next(), values.next()) else {
-            return false;
+            return None;
         };
         let mut parts = value.split_ascii_whitespace();
         let (Some(scheme), Some(encoded), None) = (parts.next(), parts.next(), parts.next()) else {
-            return false;
+            return None;
         };
-        if !scheme.eq_ignore_ascii_case("basic") || encoded.len() > 684 {
-            return false;
+        if !scheme.eq_ignore_ascii_case("basic")
+            || encoded.len() > crate::inbound::DEFAULT_HEADER_LIMIT
+        {
+            return None;
         }
         let Ok(decoded) = STANDARD.decode(encoded) else {
-            return false;
+            return None;
         };
-        let Some(separator) = decoded.iter().position(|&byte| byte == b':') else {
-            return false;
-        };
-        self.matches(&decoded[..separator], &decoded[separator + 1..])
+        let separator = decoded.iter().position(|&byte| byte == b':')?;
+        self.authenticate(&decoded[..separator], &decoded[separator + 1..])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_credentials_cover_empty_values_and_complete_long_fields() {
+        for (user, password) in [("", ""), ("", "secret"), ("user", "")] {
+            let auth = ProxyCredentials::new(user, password).unwrap();
+            assert!(auth.verifies(&[(
+                "Proxy-Authorization".into(),
+                auth.authorization_header_value(),
+            )]));
+        }
+        let user = "u".repeat(600);
+        let password = "p".repeat(600);
+        let auth = ProxyCredentials::new(&user, &password).unwrap();
+        assert!(auth.verifies(&[(
+            "Proxy-Authorization".into(),
+            auth.authorization_header_value(),
+        )]));
+        let mut wrong_user = user.into_bytes();
+        let mut wrong_password = password.into_bytes();
+        wrong_user[599] = b'x';
+        assert!(!auth.matches(&wrong_user, &wrong_password));
+        wrong_user[599] = b'u';
+        wrong_password[599] = b'x';
+        assert!(!auth.matches(&wrong_user, &wrong_password));
+        assert!(!auth.matches(&wrong_user, &wrong_password[..599]));
+    }
+
+    #[test]
+    fn http_authentication_keeps_the_shared_header_budget() {
+        let auth = ProxyCredentials::new("user", "p".repeat(crate::inbound::DEFAULT_HEADER_LIMIT))
+            .unwrap();
+        assert!(!auth.verifies(&[(
+            "Proxy-Authorization".into(),
+            auth.authorization_header_value(),
+        )]));
     }
 }
 
 /// A fixed client-oriented listener policy, not an arbitrary address list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProxyAccess {
+    pub bind_address: Option<IpAddr>,
     pub allow_lan: bool,
     pub ipv6: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyAccessRules {
+    pub allowed: Vec<super::IpCidr>,
+    pub denied: Vec<super::IpCidr>,
+    pub skip_auth: Vec<super::IpCidr>,
+}
+impl Default for ProxyAccessRules {
+    fn default() -> Self {
+        Self {
+            allowed: vec![
+                super::IpCidr {
+                    network: "0.0.0.0".parse().unwrap(),
+                    prefix_len: 0,
+                },
+                super::IpCidr {
+                    network: "::".parse().unwrap(),
+                    prefix_len: 0,
+                },
+            ],
+            denied: Vec::new(),
+            skip_auth: Vec::new(),
+        }
+    }
+}
+impl ProxyAccessRules {
+    pub fn permits(&self, address: IpAddr) -> bool {
+        self.allowed.iter().any(|cidr| cidr.contains(address))
+            && !self.denied.iter().any(|cidr| cidr.contains(address))
+    }
+    pub fn skips_auth(&self, address: IpAddr) -> bool {
+        self.skip_auth.iter().any(|cidr| cidr.contains(address))
+    }
 }

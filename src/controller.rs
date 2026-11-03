@@ -1,16 +1,31 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
+#[cfg(any(feature = "invoke", test))]
+mod configs;
+mod cors;
+mod dns;
+mod rules;
+mod tls;
+mod transport;
+#[cfg(target_os = "linux")]
+mod unix;
+mod websocket;
+use transport::{ControllerIo, H1Io};
+
+#[cfg(test)]
+#[path = "controller/tests_secure.rs"]
+mod secure_tests;
+
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    task::JoinSet,
-    time::timeout,
-};
+use socket2::{Domain, Protocol, Socket, Type};
+use tokio::{io::AsyncReadExt, net::TcpListener, task::JoinSet, time::timeout};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use tokio::{io::AsyncWriteExt, net::TcpStream};
+
 use crate::{
-    config::{ExternalControllerConfig, MAX_CONTROLLER_SECRET_BYTES, validate_route_target_name},
+    config::{ExternalControllerConfig, validate_route_target_name},
     routing::{ProxyGroupError, ProxyGroupState, ProxyGroups},
     traffic::TunTrafficStats,
 };
@@ -20,102 +35,276 @@ const CONTROLLER_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONTROLLER_CONNECTIONS: usize = 8;
 const MAX_CONTROLLER_BODY_BYTES: usize = 1024;
 
-pub(crate) struct RuntimeController {
-    listener: TcpListener,
+#[derive(Clone)]
+struct RequestContext {
     secret: Option<Arc<str>>,
     traffic: Option<Arc<TunTrafficStats>>,
     proxy_groups: Arc<ProxyGroups>,
+    resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
+    cors: Arc<cors::Policy>,
+    requests: tokio_util::task::TaskTracker,
+    subscriptions: Arc<tokio::sync::Semaphore>,
+    logs: Option<Arc<crate::logging::RuntimeLog>>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl RequestContext {
+    fn for_local_transport(&self) -> Self {
+        Self {
+            secret: None,
+            ..self.clone()
+        }
+    }
+}
+
+enum AcceptedController {
+    Http(tokio::net::TcpStream),
+    Tls(tokio::net::TcpStream),
+    #[cfg(target_os = "linux")]
+    Unix(tokio::net::UnixStream),
+}
+
+pub(crate) struct RuntimeController {
+    #[cfg(target_os = "linux")]
+    unix_listener: Option<unix::Listener>,
+    listener: Option<TcpListener>,
+    tls_listener: Option<TcpListener>,
+    tls: Option<Arc<tls::ServerTls>>,
+    routing_mark: u32,
+    context: RequestContext,
 }
 
 impl std::fmt::Debug for RuntimeController {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("RuntimeController")
-            .field("local_addr", &self.listener.local_addr().ok())
-            .field("authenticated", &self.secret.is_some())
-            .field("has_traffic", &self.traffic.is_some())
+            .field("authenticated", &self.context.secret.is_some())
+            .field("https", &self.tls.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl RuntimeController {
+    #[cfg(test)]
     pub(crate) async fn bind(
         config: &ExternalControllerConfig,
         traffic: Option<Arc<TunTrafficStats>>,
         proxy_groups: Arc<ProxyGroups>,
     ) -> io::Result<Self> {
+        Self::bind_at(config, traffic, proxy_groups, std::path::Path::new(".")).await
+    }
+
+    pub(crate) async fn bind_at(
+        config: &ExternalControllerConfig,
+        traffic: Option<Arc<TunTrafficStats>>,
+        proxy_groups: Arc<ProxyGroups>,
+        root: &std::path::Path,
+    ) -> io::Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        if config.unix_path.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "external-controller-unix requires Linux",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let unix_listener = config
+            .unix_path
+            .as_deref()
+            .map(|path| unix::Listener::bind(path, root))
+            .transpose()?;
+        let listener = config
+            .http_enabled
+            .then(|| bind_controller(config))
+            .transpose()?;
+        let (tls_listener, tls) = if let Some(listen) = config.tls_listen {
+            let tls_options = config.server_tls.clone();
+            let root = root.to_owned();
+            let tls =
+                tokio::task::spawn_blocking(move || tls::ServerTls::load(&tls_options, &root))
+                    .await
+                    .map_err(io::Error::other)??;
+            let listener = bind_controller(&ExternalControllerConfig {
+                listen,
+                routing_mark: config.routing_mark,
+                ..ExternalControllerConfig::default()
+            })?;
+            (Some(listener), Some(Arc::new(tls)))
+        } else {
+            (None, None)
+        };
         Ok(Self {
-            listener: TcpListener::bind(config.listen).await?,
-            secret: config.secret.as_deref().map(Arc::from),
-            traffic,
-            proxy_groups,
+            #[cfg(target_os = "linux")]
+            unix_listener,
+            listener,
+            tls_listener,
+            tls,
+            routing_mark: config.routing_mark,
+            context: RequestContext {
+                secret: config.secret.as_deref().map(Arc::from),
+                traffic,
+                proxy_groups,
+                resources: None,
+                cors: Arc::new(cors::Policy::new(&config.cors)),
+                requests: tokio_util::task::TaskTracker::new(),
+                subscriptions: Arc::new(tokio::sync::Semaphore::new(websocket::MAX_SUBSCRIPTIONS)),
+                logs: crate::logging::current(),
+            },
         })
+    }
+
+    pub(crate) fn with_resources(
+        mut self,
+        resources: Option<Arc<dyn crate::resource::control::RuntimeResources>>,
+    ) -> Self {
+        self.context.resources = resources;
+        self
     }
 
     #[cfg(test)]
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        self.listener
+            .as_ref()
+            .or(self.tls_listener.as_ref())
+            .expect("controller listener")
+            .local_addr()
+    }
+
+    async fn accept(&self) -> io::Result<AcceptedController> {
+        let network = async {
+            tokio::select! {
+                accepted = async { self.listener.as_ref().unwrap().accept().await }, if self.listener.is_some() => {
+                    accepted.and_then(|(stream, _)| mark_accepted_tcp(stream, self.routing_mark)).map(AcceptedController::Http)
+                }
+                accepted = async { self.tls_listener.as_ref().unwrap().accept().await }, if self.tls_listener.is_some() => {
+                    accepted.and_then(|(stream, _)| mark_accepted_tcp(stream, self.routing_mark)).map(AcceptedController::Tls)
+                }
+                else => std::future::pending().await,
+            }
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(listener) = &self.unix_listener {
+            return tokio::select! {
+                result = network => result,
+                result = listener.accept() => result.map(AcceptedController::Unix),
+            };
+        }
+        network.await
     }
 
     pub(crate) async fn serve(self, cancellation: CancellationToken) -> io::Result<()> {
+        let watcher = self
+            .tls
+            .as_ref()
+            .filter(|tls| tls.watches_files())
+            .map(|tls| {
+                let tls = tls.clone();
+                let child = cancellation.clone();
+                tokio::spawn(crate::resources::observation::task(tls.watch(child)))
+            });
         let mut tasks = JoinSet::new();
-        loop {
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => break,
+        let result = loop {
+            tokio::select! { biased;
+                () = cancellation.cancelled() => break Ok(()),
                 joined = tasks.join_next(), if !tasks.is_empty() => {
-                    if let Some(Err(error)) = joined {
-                        tracing::warn!(
-                            cancelled = error.is_cancelled(),
-                            panicked = error.is_panic(),
-                            "controller connection task failed"
-                        );
-                    }
+                    if let Some(Err(error)) = joined { break Err(io::Error::other(error)); }
                 }
-                accepted = self.listener.accept(), if tasks.len() < MAX_CONTROLLER_CONNECTIONS => {
-                    let (stream, peer) = accepted?;
-                    let secret = self.secret.clone();
-                    let traffic = self.traffic.clone();
-                    let proxy_groups = self.proxy_groups.clone();
-                    let child = cancellation.clone();
+                accepted = self.accept(), if tasks.len() < MAX_CONTROLLER_CONNECTIONS => {
+                    let accepted = match accepted { Ok(value) => value, Err(error) => break Err(error) };
+                    let context = self.context.clone(); let child = cancellation.clone();
+                    let tls = self.tls.clone();
                     tasks.spawn(crate::resources::observation::task(async move {
-                        if let Err(error) = handle_connection(
-                            stream,
-                            peer,
-                            secret,
-                            traffic,
-                            proxy_groups,
-                            child,
-                        )
-                        .await
-                        {
-                            tracing::debug!(
-                                error_kind = ?error.kind(),
-                                "controller request failed"
-                            );
+                        match accepted {
+                            AcceptedController::Http(stream) => { let _ = handle_connection(H1Io(stream), context, child).await; }
+                            AcceptedController::Tls(stream) => { let _ = transport::serve_tls(stream, tls.expect("TLS listener owns TLS config"), context, child).await; }
+                            #[cfg(target_os = "linux")]
+                            AcceptedController::Unix(stream) => { let _ = handle_connection(H1Io(stream), context.for_local_transport(), child).await; }
                         }
                     }));
                 }
             }
-        }
+        };
+        cancellation.cancel();
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
-        Ok(())
+        self.context.requests.close();
+        self.context.requests.wait().await;
+        if let Some(watcher) = watcher {
+            watcher.await.map_err(io::Error::other)?;
+        }
+        result
     }
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
-    peer: SocketAddr,
-    secret: Option<Arc<str>>,
-    traffic: Option<Arc<TunTrafficStats>>,
-    proxy_groups: Arc<ProxyGroups>,
+fn bind_controller(config: &ExternalControllerConfig) -> io::Result<TcpListener> {
+    let listen = if config.listen.ip().is_unspecified() {
+        SocketAddr::from(([0u16; 8], config.listen.port()))
+    } else {
+        config.listen
+    };
+    match bind_controller_tcp(listen, config.routing_mark) {
+        Err(error)
+            if config.listen.ip().is_unspecified()
+                && crate::inbound::listen::address_family_unavailable(&error) =>
+        {
+            bind_controller_tcp(
+                SocketAddr::from(([0, 0, 0, 0], config.listen.port())),
+                config.routing_mark,
+            )
+        }
+        result => result,
+    }
+}
+
+fn bind_controller_tcp(address: SocketAddr, routing_mark: u32) -> io::Result<TcpListener> {
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    if address.is_ipv6() {
+        // Go's tcp listener allows IPv4-mapped peers on an IPv6 wildcard.
+        socket.set_only_v6(false)?;
+    }
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    set_controller_mark(&socket, routing_mark)?;
+    socket.bind(&address.into())?;
+    socket.listen(128)?;
+    TcpListener::from_std(socket.into())
+}
+
+fn set_controller_mark(socket: &Socket, mark: u32) -> io::Result<()> {
+    if mark == 0 {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        socket.set_mark(mark)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = socket;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "external-controller-routing-mark requires Linux",
+        ))
+    }
+}
+fn mark_accepted_tcp(
+    stream: tokio::net::TcpStream,
+    mark: u32,
+) -> io::Result<tokio::net::TcpStream> {
+    set_controller_mark(&socket2::SockRef::from(&stream), mark)?;
+    Ok(stream)
+}
+
+async fn handle_connection<S: ControllerIo>(
+    mut stream: S,
+    context: RequestContext,
     cancellation: CancellationToken,
 ) -> io::Result<()> {
-    if !peer.ip().is_loopback() {
-        return write_error(&mut stream, 403, "Forbidden", &[]).await;
-    }
-
     let request = tokio::select! {
         biased;
         () = cancellation.cancelled() => return Ok(()),
@@ -141,6 +330,32 @@ async fn handle_connection(
         },
     };
 
+    handle_request(stream, request, context, cancellation).await
+}
+
+async fn handle_request<S: ControllerIo>(
+    stream: S,
+    request: crate::inbound::http::RequestHead,
+    context: RequestContext,
+    cancellation: CancellationToken,
+) -> io::Result<()> {
+    let subscription = websocket::requested(&request).then(|| context.clone());
+    let RequestContext {
+        secret,
+        traffic,
+        proxy_groups,
+        resources,
+        cors,
+        ..
+    } = context;
+    let outcome = cors.evaluate(&request.method, &request.headers);
+    let mut stream = transport::CorsIo::new(stream, outcome.headers);
+    if outcome.preflight {
+        return write_response(&mut stream, 200, &[], &[]).await;
+    }
+    if let Some(context) = subscription {
+        return websocket::handle(&mut stream, request, context, cancellation).await;
+    }
     if !authorized(&request.headers, secret.as_deref()) {
         return write_error(
             &mut stream,
@@ -151,8 +366,167 @@ async fn handle_connection(
         .await;
     }
 
+    if request.target == "/version" {
+        if request.method != "GET" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
+        }
+        return write_json(
+            &mut stream,
+            200,
+            &serde_json::json!({"meta":false,"version":env!("CARGO_PKG_VERSION")}),
+            &[],
+        )
+        .await;
+    }
+    if request.target == "/memory" {
+        if request.method != "GET" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
+        }
+        let value = serde_json::json!({"inuse":crate::memory::resident_bytes(),"oslimit":null});
+        return write_json(&mut stream, 200, &value, &[]).await;
+    }
+    let route_path = request
+        .target
+        .split_once('?')
+        .map_or(request.target.as_str(), |(path, _)| path);
+    let probe_route = route_path.strip_suffix("/delay").and_then(|base| {
+        base.strip_prefix("/proxies/")
+            .map(|name| (false, name))
+            .or_else(|| base.strip_prefix("/group/").map(|name| (true, name)))
+    });
+    if let Some((group, raw_name)) = probe_route {
+        if request.method != "GET" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
+        }
+        return delay_query(
+            &mut stream,
+            group,
+            raw_name,
+            &request.target,
+            resources.as_deref(),
+            &cancellation,
+        )
+        .await;
+    }
+    if let Some(raw_name) = route_path
+        .strip_prefix("/providers/proxies/")
+        .and_then(|tail| tail.strip_suffix("/healthcheck"))
+    {
+        if request.method != "GET" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
+        }
+        let Ok(name) = decode_group_name(raw_name) else {
+            return write_error(&mut stream, 400, "Bad request", &[]).await;
+        };
+        let Some(resources) = resources.as_deref() else {
+            return write_error(&mut stream, 404, "Resource not found", &[]).await;
+        };
+        let result = tokio::select! { biased;
+            () = cancellation.cancelled() => return Ok(()),
+            result = resources.provider_healthcheck(&name, &cancellation) => result,
+        };
+        return match result {
+            Ok(()) => write_response(&mut stream, 204, &[], &[]).await,
+            Err(error) => probe_error(&mut stream, error).await,
+        };
+    }
+
+    if request.target == "/dns/query" || request.target.starts_with("/dns/query?") {
+        if request.method != "GET" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
+        }
+        return dns::query(
+            &mut stream,
+            &request.target,
+            resources.as_deref(),
+            cancellation,
+        )
+        .await;
+    }
+
     if request.target.contains(['?', '#']) {
         return write_error(&mut stream, 400, "Bad request", &[]).await;
+    }
+
+    #[cfg(any(feature = "invoke", test))]
+    if matches!(
+        request.target.as_str(),
+        "/cache/fakeip/flush" | "/configs/geo"
+    ) {
+        return configs::maintenance(&mut stream, request, resources.as_deref(), cancellation)
+            .await;
+    }
+
+    if request.target == "/rules/disable" {
+        return rules::disable(&mut stream, request, resources.as_deref(), cancellation).await;
+    }
+
+    if request.target == "/cache/dns/flush" {
+        if request.method != "POST" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "POST")]).await;
+        }
+        if let Some(snapshot) = resources.as_ref().and_then(|resources| resources.dns()) {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Ok(()),
+                () = snapshot.dns.flush_cache() => {}
+            }
+        }
+        return write_response(&mut stream, 204, &[], &[]).await;
+    }
+
+    #[cfg(any(feature = "invoke", test))]
+    if request.target == "/configs" && matches!(request.method.as_str(), "PATCH" | "PUT") {
+        return configs::apply(&mut stream, request, resources.as_deref(), cancellation).await;
+    }
+    if matches!(request.target.as_str(), "/configs" | "/rules") {
+        if request.method != "GET" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
+        }
+        let Some(resources) = &resources else {
+            return write_error(&mut stream, 404, "Resource not found", &[]).await;
+        };
+        let value = if request.target == "/configs" {
+            resources.configs()
+        } else {
+            resources.rules()
+        };
+        return write_json(&mut stream, 200, &value, &[]).await;
+    }
+    if request.target == "/connections" || request.target.starts_with("/connections/") {
+        let Some(resources) = &resources else {
+            return write_error(&mut stream, 404, "Resource not found", &[]).await;
+        };
+        let registry = resources.connections();
+        if request.method == "GET" && request.target == "/connections" {
+            let snapshot = registry.snapshot();
+            return write_json(&mut stream, 200, &snapshot, &[]).await;
+        }
+        if request.method == "DELETE" {
+            if let Some(raw_id) = request.target.strip_prefix("/connections/") {
+                let Ok(id) = decode_group_name(raw_id) else {
+                    return write_error(&mut stream, 400, "Bad request", &[]).await;
+                };
+                registry.close(&id);
+            } else {
+                registry.close_all();
+            }
+            return write_response(&mut stream, 204, &[], &[]).await;
+        }
+        return write_error(
+            &mut stream,
+            405,
+            "Method not allowed",
+            &[(
+                "Allow",
+                if request.target == "/connections" {
+                    "GET, DELETE"
+                } else {
+                    "DELETE"
+                },
+            )],
+        )
+        .await;
     }
 
     if request.target == "/traffic" {
@@ -163,6 +537,75 @@ async fn handle_connection(
             Some(traffic) => write_json(&mut stream, 200, &traffic.snapshot(), &[]).await,
             None => write_error(&mut stream, 404, "Resource not found", &[]).await,
         };
+    }
+
+    if let Some(tail) = request.target.strip_prefix("/providers/") {
+        let (kind, raw_name) = tail
+            .split_once('/')
+            .map_or((tail, None), |(kind, name)| (kind, Some(name)));
+        let rules = match kind {
+            "rules" => true,
+            "proxies" => false,
+            _ => return write_error(&mut stream, 404, "Resource not found", &[]).await,
+        };
+        let name = match raw_name {
+            Some(raw) => match decode_group_name(raw) {
+                Ok(name) => Some(name),
+                Err(()) => return write_error(&mut stream, 400, "Bad request", &[]).await,
+            },
+            None => None,
+        };
+        let state = resources.as_ref().map_or_else(
+            || serde_json::json!({"providers":{}}),
+            |resources| resources.providers(rules),
+        );
+        if request.method == "GET" {
+            if let Some(name) = name {
+                return match state["providers"].get(&name) {
+                    Some(value) => write_json(&mut stream, 200, value, &[]).await,
+                    None => write_error(&mut stream, 404, "Resource not found", &[]).await,
+                };
+            }
+            return write_json(&mut stream, 200, &state, &[]).await;
+        }
+        if request.method == "PUT"
+            && let (Some(resources), Some(name)) = (&resources, name)
+        {
+            if state["providers"].get(&name).is_none() {
+                return write_error(&mut stream, 404, "Resource not found", &[]).await;
+            }
+            let result = tokio::select! { biased; ()=cancellation.cancelled()=>return Ok(()), result=resources.refresh(rules,&name)=>result };
+            return match result {
+                Ok(()) => write_response(&mut stream, 204, &[], &[]).await,
+                Err(_) => write_error(&mut stream, 503, "Provider update failed", &[]).await,
+            };
+        }
+        return write_error(
+            &mut stream,
+            405,
+            "Method not allowed",
+            &[("Allow", "GET, PUT")],
+        )
+        .await;
+    }
+    let proxy_groups = resources
+        .as_ref()
+        .map_or(proxy_groups, |resources| resources.groups());
+
+    if request.target == "/proxies" {
+        if request.method != "GET" {
+            return write_error(&mut stream, 405, "Method not allowed", &[("Allow", "GET")]).await;
+        }
+        let mut health = resources.as_ref().map_or_else(
+            || serde_json::json!({"proxies":{}}),
+            |resources| resources.health(),
+        );
+        for state in proxy_groups.list_states() {
+            let name = state.name.clone();
+            health["proxies"][name] =
+                serde_json::to_value(GroupResponse::from(state)).expect("group status");
+        }
+        return write_json(&mut stream, 200, &health, &[]).await;
     }
 
     if request.target == "/group" {
@@ -190,7 +633,9 @@ async fn handle_connection(
             Err(ProxyGroupError::UnknownGroup) => {
                 write_error(&mut stream, 404, "Resource not found", &[]).await
             }
-            Err(ProxyGroupError::UnknownMember) => unreachable!("state does not select a member"),
+            Err(ProxyGroupError::UnknownMember | ProxyGroupError::NotSelectable) => {
+                unreachable!("state does not select a member")
+            }
         };
     }
 
@@ -202,8 +647,40 @@ async fn handle_connection(
         return match request.method.as_str() {
             "GET" => match proxy_groups.state(&name) {
                 Ok(state) => write_json(&mut stream, 200, &GroupResponse::from(state), &[]).await,
-                Err(_) => write_error(&mut stream, 404, "Resource not found", &[]).await,
+                Err(_) => {
+                    let health = resources.as_ref().map(|resources| resources.health());
+                    match health
+                        .as_ref()
+                        .and_then(|state| state["proxies"].get(&name))
+                    {
+                        Some(node) => write_json(&mut stream, 200, node, &[]).await,
+                        None => write_error(&mut stream, 404, "Resource not found", &[]).await,
+                    }
+                }
             },
+            "DELETE" => {
+                let result = resources.as_ref().map_or_else(
+                    || proxy_groups.clear_fixed(&name),
+                    |resources| resources.clear_fixed(&name),
+                );
+                match result {
+                    Ok(()) => write_response(&mut stream, 204, &[], &[]).await,
+                    Err(ProxyGroupError::UnknownGroup) => {
+                        if resources
+                            .as_ref()
+                            .is_some_and(|r| r.health()["proxies"].get(&name).is_some())
+                        {
+                            write_error(&mut stream, 400, "Proxy is not an automatic group", &[])
+                                .await
+                        } else {
+                            write_error(&mut stream, 404, "Resource not found", &[]).await
+                        }
+                    }
+                    Err(_) => {
+                        write_error(&mut stream, 400, "Proxy is not an automatic group", &[]).await
+                    }
+                }
+            }
             "PUT" => {
                 handle_select(
                     &mut stream,
@@ -211,6 +688,7 @@ async fn handle_connection(
                     request.buffered,
                     &name,
                     &proxy_groups,
+                    resources.as_deref(),
                     cancellation,
                 )
                 .await
@@ -220,7 +698,7 @@ async fn handle_connection(
                     &mut stream,
                     405,
                     "Method not allowed",
-                    &[("Allow", "GET, PUT")],
+                    &[("Allow", "GET, PUT, DELETE")],
                 )
                 .await
             }
@@ -230,16 +708,98 @@ async fn handle_connection(
     write_error(&mut stream, 404, "Resource not found", &[]).await
 }
 
-async fn handle_select(
-    stream: &mut TcpStream,
+fn parse_delay(target: &str, group: bool) -> Result<crate::resource::control::DelayRequest, ()> {
+    if target.contains('#') {
+        return Err(());
+    }
+    let (_, raw) = target.split_once('?').ok_or(())?;
+    let mut values = std::collections::BTreeMap::new();
+    for (key, value) in url::form_urlencoded::parse(raw.as_bytes()) {
+        values.entry(key).or_insert(value);
+    }
+    let url = values.get("url").ok_or(())?.to_string();
+    crate::resource::probe::Target::parse(&url).map_err(|_| ())?;
+    let raw_timeout = values.get("timeout").ok_or(())?;
+    let millis = if group {
+        raw_timeout.parse::<i32>().map(i64::from)
+    } else {
+        raw_timeout.parse::<i16>().map(i64::from)
+    }
+    .map_err(|_| ())?;
+    let expected =
+        crate::config::status_ranges(values.get("expected").map_or("", |value| value.as_ref()))
+            .map_err(|_| ())?;
+    Ok(crate::resource::control::DelayRequest {
+        url,
+        timeout: Duration::from_millis(millis.max(0) as u64),
+        expected,
+    })
+}
+
+async fn probe_error<S: ControllerIo>(
+    stream: &mut S,
+    error: crate::resource::control::ProbeError,
+) -> io::Result<()> {
+    use crate::resource::control::ProbeError;
+    match error {
+        ProbeError::NotFound => write_error(stream, 404, "Resource not found", &[]).await,
+        ProbeError::Timeout => write_error(stream, 504, "Delay test timed out", &[]).await,
+        ProbeError::Failed => write_error(stream, 503, "Delay test failed", &[]).await,
+        ProbeError::Stopped => Ok(()),
+    }
+}
+
+async fn delay_query<S: ControllerIo>(
+    stream: &mut S,
+    group: bool,
+    raw_name: &str,
+    target: &str,
+    resources: Option<&dyn crate::resource::control::RuntimeResources>,
+    cancellation: &CancellationToken,
+) -> io::Result<()> {
+    let (Ok(name), Ok(request)) = (decode_group_name(raw_name), parse_delay(target, group)) else {
+        return write_error(stream, 400, "Bad request", &[]).await;
+    };
+    let Some(resources) = resources else {
+        return write_error(stream, 404, "Resource not found", &[]).await;
+    };
+    let operation = async {
+        if group {
+            resources
+                .group_delay(&name, &request, cancellation)
+                .await
+                .map(|value| serde_json::json!(value))
+        } else {
+            let delay = resources.node_delay(&name, &request, cancellation).await?;
+            if delay == 0 {
+                Err(crate::resource::control::ProbeError::Failed)
+            } else {
+                Ok(serde_json::json!({"delay":delay}))
+            }
+        }
+    };
+    let result = tokio::select! { biased;
+        () = cancellation.cancelled() => return Ok(()),
+        result = operation => result,
+    };
+    match result {
+        Ok(value) => write_json(stream, 200, &value, &[]).await,
+        Err(error) => probe_error(stream, error).await,
+    }
+}
+
+/// Small authenticated management writes share the existing 1 KiB envelope.
+/// None means a rejection response was written or the read was cancelled.
+async fn read_small_json_body<S: ControllerIo>(
+    stream: &mut S,
     headers: &[(String, String)],
     mut body: Vec<u8>,
-    group: &str,
-    proxy_groups: &ProxyGroups,
     cancellation: CancellationToken,
-) -> io::Result<()> {
+) -> io::Result<Option<Vec<u8>>> {
     if header_values(headers, "transfer-encoding").next().is_some() {
-        return write_error(stream, 400, "Body invalid", &[]).await;
+        return write_error(stream, 400, "Body invalid", &[])
+            .await
+            .map(|()| None);
     }
 
     let mut content_types = header_values(headers, "content-type");
@@ -248,27 +808,39 @@ async fn handle_select(
         .is_some_and(|value| value.eq_ignore_ascii_case("application/json"))
         && content_types.next().is_none();
     if !valid_content_type {
-        return write_error(stream, 415, "Unsupported media type", &[]).await;
+        return write_error(stream, 415, "Unsupported media type", &[])
+            .await
+            .map(|()| None);
     }
 
     let mut content_lengths = header_values(headers, "content-length");
     let Some(content_length) = content_lengths.next() else {
-        return write_error(stream, 411, "Length required", &[]).await;
+        return write_error(stream, 411, "Length required", &[])
+            .await
+            .map(|()| None);
     };
     if content_lengths.next().is_some()
         || content_length.is_empty()
         || !content_length.bytes().all(|byte| byte.is_ascii_digit())
     {
-        return write_error(stream, 400, "Body invalid", &[]).await;
+        return write_error(stream, 400, "Body invalid", &[])
+            .await
+            .map(|()| None);
     }
     let Ok(content_length) = content_length.parse::<usize>() else {
-        return write_error(stream, 400, "Body invalid", &[]).await;
+        return write_error(stream, 400, "Body invalid", &[])
+            .await
+            .map(|()| None);
     };
     if content_length > MAX_CONTROLLER_BODY_BYTES {
-        return write_error(stream, 413, "Payload too large", &[]).await;
+        return write_error(stream, 413, "Payload too large", &[])
+            .await
+            .map(|()| None);
     }
     if body.len() > content_length {
-        return write_error(stream, 400, "Body invalid", &[]).await;
+        return write_error(stream, 400, "Body invalid", &[])
+            .await
+            .map(|()| None);
     }
 
     let buffered = body.len();
@@ -276,7 +848,7 @@ async fn handle_select(
     if buffered != content_length {
         let read = tokio::select! {
             biased;
-            () = cancellation.cancelled() => return Ok(()),
+            () = cancellation.cancelled() => return Ok(None),
             result = timeout(
                 CONTROLLER_BODY_TIMEOUT,
                 stream.read_exact(&mut body[buffered..]),
@@ -298,16 +870,35 @@ async fn handle_select(
         }
     }
 
+    Ok(Some(body))
+}
+
+async fn handle_select<S: ControllerIo>(
+    stream: &mut S,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+    group: &str,
+    proxy_groups: &ProxyGroups,
+    resources: Option<&dyn crate::resource::control::RuntimeResources>,
+    cancellation: CancellationToken,
+) -> io::Result<()> {
+    let Some(body) = read_small_json_body(stream, headers, body, cancellation).await? else {
+        return Ok(());
+    };
+
     let request = match serde_json::from_slice::<SelectRequest>(&body) {
         Ok(request) => request,
         Err(_) => return write_error(stream, 400, "Body invalid", &[]).await,
     };
-    match proxy_groups.select(group, &request.name) {
+    match resources.map_or_else(
+        || proxy_groups.select(group, &request.name),
+        |resources| resources.select(group, &request.name),
+    ) {
         Ok(()) => write_response(stream, 204, &[], b"").await,
         Err(ProxyGroupError::UnknownGroup) => {
             write_error(stream, 404, "Resource not found", &[]).await
         }
-        Err(ProxyGroupError::UnknownMember) => {
+        Err(ProxyGroupError::UnknownMember | ProxyGroupError::NotSelectable) => {
             write_error(
                 stream,
                 400,
@@ -346,8 +937,12 @@ fn authorized(headers: &[(String, String)], secret: Option<&str>) -> bool {
 }
 
 fn controller_token_eq(candidate: &[u8], secret: &[u8]) -> bool {
+    let limit = crate::inbound::DEFAULT_HEADER_LIMIT;
+    if candidate.len() > limit || secret.len() > limit {
+        return false;
+    }
     let mut difference = candidate.len() ^ secret.len();
-    for index in 0..MAX_CONTROLLER_SECRET_BYTES {
+    for index in 0..limit {
         let candidate = candidate.get(index).copied().unwrap_or_default();
         let secret = secret.get(index).copied().unwrap_or_default();
         difference |= usize::from(candidate ^ secret);
@@ -412,22 +1007,30 @@ struct GroupResponse {
     #[serde(rename = "type")]
     kind: &'static str,
     all: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
     now: String,
+    hidden: bool,
+    icon: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fixed: Option<String>,
 }
 
 impl From<ProxyGroupState> for GroupResponse {
     fn from(state: ProxyGroupState) -> Self {
         Self {
             name: state.name,
-            kind: "Selector",
+            kind: state.kind.controller_type(),
             all: state.all,
             now: state.now,
+            hidden: state.hidden,
+            icon: state.icon,
+            fixed: state.fixed,
         }
     }
 }
 
-async fn write_json<T: Serialize>(
-    stream: &mut TcpStream,
+async fn write_json<T: Serialize, S: ControllerIo>(
+    stream: &mut S,
     status: u16,
     value: &T,
     headers: &[(&str, &str)],
@@ -439,8 +1042,8 @@ async fn write_json<T: Serialize>(
     write_response(stream, status, &response_headers, &body).await
 }
 
-async fn write_error(
-    stream: &mut TcpStream,
+async fn write_error<S: ControllerIo>(
+    stream: &mut S,
     status: u16,
     message: &'static str,
     headers: &[(&str, &str)],
@@ -452,41 +1055,13 @@ async fn write_error(
     write_json(stream, status, &ErrorResponse { message }, headers).await
 }
 
-async fn write_response(
-    stream: &mut TcpStream,
+async fn write_response<S: ControllerIo>(
+    stream: &mut S,
     status: u16,
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        411 => "Length Required",
-        413 => "Payload Too Large",
-        415 => "Unsupported Media Type",
-        500 => "Internal Server Error",
-        _ => "Error",
-    };
-    let mut response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n",
-        body.len()
-    );
-    for (name, value) in headers {
-        response.push_str(name);
-        response.push_str(": ");
-        response.push_str(value);
-        response.push_str("\r\n");
-    }
-    response.push_str("\r\n");
-    stream.write_all(response.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.shutdown().await
+    stream.respond(status, headers, body).await
 }
 
 #[cfg(test)]
@@ -520,10 +1095,19 @@ mod tests {
         }
     }
 
-    fn test_groups() -> Arc<ProxyGroups> {
+    pub(super) fn test_groups() -> Arc<ProxyGroups> {
         let dispatcher: Arc<dyn Dispatcher> = Arc::new(UnusedDispatcher);
         ProxyGroups::new(
             &[SelectProxyGroupConfig {
+                kind: crate::config::GroupKind::Select,
+                strategy: crate::config::BalanceStrategy::default(),
+                hash_key: crate::config::BalanceHashKey::default(),
+                health: crate::config::HealthCheckConfig::default(),
+                tolerance: 0,
+                max_failed_times: 5,
+                disable_udp: false,
+                hidden: false,
+                icon: String::new(),
                 name: "主线路".to_owned(),
                 members: vec![
                     ProxyGroupMemberConfig {
@@ -559,6 +1143,192 @@ mod tests {
         response.split_once("\r\n\r\n").unwrap().1
     }
 
+    fn small_body_headers(length: usize) -> Vec<(String, String)> {
+        vec![
+            ("Content-Type".into(), "application/json".into()),
+            ("Content-Length".into(), length.to_string()),
+        ]
+    }
+
+    async fn small_select_memory(
+        headers: Vec<(String, String)>,
+        prefix: Vec<u8>,
+        tail: &[u8],
+        close_write: bool,
+        cancellation: CancellationToken,
+    ) -> (io::Result<()>, String, Arc<ProxyGroups>) {
+        let groups = test_groups();
+        let selected = groups.clone();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let serve = tokio::spawn(async move {
+            let mut stream = H1Io(server);
+            handle_select(
+                &mut stream,
+                &headers,
+                prefix,
+                "主线路",
+                &selected,
+                None,
+                cancellation,
+            )
+            .await
+        });
+        client.write_all(tail).await.unwrap();
+        if close_write {
+            client.shutdown().await.unwrap();
+        }
+        let result = serve.await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        (result, String::from_utf8(response).unwrap(), groups)
+    }
+
+    #[tokio::test]
+    async fn small_json_body_keeps_group_selection_and_header_budget() {
+        let mut body = br#"{"name":"node-b"}"#.to_vec();
+        body.resize(MAX_CONTROLLER_BODY_BYTES, b' ');
+        let (result, response, groups) = small_select_memory(
+            small_body_headers(body.len()),
+            body[..5].to_vec(),
+            &body[5..],
+            false,
+            CancellationToken::new(),
+        )
+        .await;
+        result.unwrap();
+        assert!(response.starts_with("HTTP/1.1 204"));
+        assert_eq!(groups.state("主线路").unwrap().now, "node-b");
+
+        for (status, headers) in [
+            (400, {
+                let mut headers = small_body_headers(body.len());
+                headers.push(("Transfer-Encoding".into(), "chunked".into()));
+                headers
+            }),
+            (415, {
+                let mut headers = small_body_headers(body.len());
+                headers[0].1 = "application/json; charset=utf-8".into();
+                headers
+            }),
+            (
+                411,
+                vec![("Content-Type".into(), "application/json".into())],
+            ),
+            (400, {
+                let mut headers = small_body_headers(body.len());
+                headers.push(("Content-Length".into(), body.len().to_string()));
+                headers
+            }),
+            (413, small_body_headers(MAX_CONTROLLER_BODY_BYTES + 1)),
+            (400, small_body_headers(body.len() - 1)),
+        ] {
+            let (result, response, groups) =
+                small_select_memory(headers, body.to_vec(), &[], false, CancellationToken::new())
+                    .await;
+            result.unwrap();
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}")));
+            assert_eq!(groups.state("主线路").unwrap().now, "node-a");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn small_json_body_keeps_group_eof_timeout_and_cancel_semantics() {
+        for (close_write, kind, status) in [
+            (true, io::ErrorKind::UnexpectedEof, 400),
+            (false, io::ErrorKind::TimedOut, 408),
+        ] {
+            let (result, response, groups) = small_select_memory(
+                small_body_headers(17),
+                b"{".to_vec(),
+                &[],
+                close_write,
+                CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(result.unwrap_err().kind(), kind);
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}")));
+            assert_eq!(groups.state("主线路").unwrap().now, "node-a");
+        }
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let (result, response, groups) = small_select_memory(
+            small_body_headers(17),
+            b"{".to_vec(),
+            &[],
+            false,
+            cancellation,
+        )
+        .await;
+        result.unwrap();
+        assert!(response.is_empty());
+        assert_eq!(groups.state("主线路").unwrap().now, "node-a");
+    }
+
+    #[tokio::test]
+    async fn local_context_shares_limits_and_bypasses_only_local_rest_and_websocket_auth() {
+        let network = RequestContext {
+            secret: Some(Arc::from("network-token")),
+            traffic: None,
+            proxy_groups: test_groups(),
+            resources: None,
+            cors: Arc::new(cors::Policy::new(&Default::default())),
+            requests: tokio_util::task::TaskTracker::new(),
+            subscriptions: Arc::new(tokio::sync::Semaphore::new(websocket::MAX_SUBSCRIPTIONS)),
+            logs: None,
+        };
+        let local = network.for_local_transport();
+        assert!(network.secret.is_some());
+        assert!(local.secret.is_none());
+        assert!(Arc::ptr_eq(&network.proxy_groups, &local.proxy_groups));
+        assert!(Arc::ptr_eq(&network.subscriptions, &local.subscriptions));
+        let websocket = "GET /memory?token=wrong HTTP/1.1\r\nHost: controller\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        for (context, request, status) in [
+            (network.clone(), "GET /version HTTP/1.1\r\n\r\n", 401),
+            (local.clone(), "GET /version HTTP/1.1\r\n\r\n", 200),
+            (network.clone(), websocket, 401),
+            (local.clone(), websocket, 101),
+        ] {
+            let (mut client, stream) = tokio::io::duplex(4096);
+            let cancel = CancellationToken::new();
+            let child = cancel.clone();
+            let task = tokio::spawn(handle_connection(H1Io(stream), context, child));
+            client.write_all(request.as_bytes()).await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                assert!(head.len() < 2048);
+                head.push(client.read_u8().await.unwrap());
+            }
+            assert!(
+                head.starts_with(format!("HTTP/1.1 {status}").as_bytes()),
+                "unexpected response status: {}",
+                String::from_utf8_lossy(&head).lines().next().unwrap_or("")
+            );
+            cancel.cancel();
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            network.subscriptions.available_permits(),
+            websocket::MAX_SUBSCRIPTIONS
+        );
+    }
+
+    #[test]
+    fn delay_query_preserves_reference_timeout_width_and_expected_ranges() {
+        let base = "/proxies/edge/delay?url=http%3A%2F%2Fexample.test%2F&timeout=30000&expected=200-204%2F302";
+        let request = parse_delay(base, false).unwrap();
+        assert_eq!(request.timeout, Duration::from_secs(30));
+        assert_eq!(request.expected, [(200, 204), (302, 302)]);
+        assert!(parse_delay(&base.replace("30000", "40000"), false).is_err());
+        assert!(parse_delay(&base.replace("30000", "40000"), true).is_ok());
+        assert_eq!(
+            parse_delay(&base.replace("30000", "-1"), false)
+                .unwrap()
+                .timeout,
+            Duration::ZERO
+        );
+        assert!(parse_delay("/proxies/edge/delay?timeout=1", false).is_err());
+    }
+
     #[test]
     fn bearer_auth_is_strict_and_duplicate_safe() {
         let valid = vec![("Authorization".to_owned(), "Bearer token".to_owned())];
@@ -578,8 +1348,16 @@ mod tests {
         ));
         assert!(!controller_token_eq(b"toke", b"token"));
         assert!(!controller_token_eq(b"token-longer", b"token"));
-        let longest = vec![b'x'; MAX_CONTROLLER_SECRET_BYTES];
-        assert!(controller_token_eq(&longest, &longest));
+        let long_secret = "x".repeat(512);
+        assert!(authorized(
+            &[("Authorization".to_owned(), format!("Bearer {long_secret}"))],
+            Some(&long_secret),
+        ));
+        let mut different = long_secret.as_bytes().to_vec();
+        *different.last_mut().unwrap() = b'y';
+        assert!(!controller_token_eq(&different, long_secret.as_bytes()));
+        let oversized = vec![b'x'; crate::inbound::DEFAULT_HEADER_LIMIT + 1];
+        assert!(!controller_token_eq(&oversized, &oversized));
     }
 
     #[test]
@@ -589,12 +1367,12 @@ mod tests {
             "主线路"
         );
         assert_eq!(decode_group_name("a+b").unwrap(), "a+b");
-        assert!(decode_group_name("%252F").is_err());
-        assert!(decode_group_name("%2F").is_err());
+        assert_eq!(decode_group_name("%252F").unwrap(), "%2F");
+        assert_eq!(decode_group_name("%2F").unwrap(), "/");
         assert!(decode_group_name("%GG").is_err());
         assert!(decode_group_name("%A").is_err());
         assert!(decode_group_name("%FF").is_err());
-        assert!(decode_group_name("..").is_err());
+        assert_eq!(decode_group_name("..").unwrap(), "..");
     }
 
     #[tokio::test]
@@ -604,6 +1382,7 @@ mod tests {
             &ExternalControllerConfig {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 secret: Some("secret".to_owned()),
+                ..ExternalControllerConfig::default()
             },
             None,
             groups.clone(),
@@ -663,6 +1442,7 @@ mod tests {
             &ExternalControllerConfig {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 secret: Some("secret".to_owned()),
+                ..ExternalControllerConfig::default()
             },
             None,
             groups.clone(),

@@ -18,52 +18,65 @@ pub mod error;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 pub mod geodata;
+#[doc(hidden)]
+pub mod http_processing;
 pub mod inbound;
 #[cfg(feature = "invoke")]
 pub mod invoke;
 pub mod lifecycle;
 pub mod limits;
+#[cfg(any(
+    feature = "invoke",
+    feature = "inbound-http",
+    feature = "inbound-socks5",
+    test
+))]
+mod logging;
 pub mod outbound;
 pub mod packet;
 pub mod platform;
-#[cfg(any(feature = "tun", test))]
+mod process;
+#[cfg(any(feature = "tun", feature = "inbound-socks5", test))]
 mod quic_sniffer;
+pub(crate) mod resource;
 pub mod resources;
 pub mod routing;
 #[cfg(all(
     any(
+        feature = "outbound-http",
         feature = "outbound-anytls",
         feature = "outbound-socks5",
         feature = "outbound-shadowsocks",
         feature = "outbound-vless",
         feature = "outbound-trojan",
+        feature = "outbound-trusttunnel",
+        feature = "outbound-mieru",
+        feature = "outbound-masque",
         feature = "outbound-vmess",
         feature = "outbound-hysteria2",
-        feature = "outbound-tuic"
+        feature = "outbound-tuic",
+        feature = "outbound-wireguard"
     ),
     any(feature = "invoke", test)
 ))]
 mod runtime;
-#[cfg(any(
-    feature = "outbound-anytls",
-    feature = "outbound-vless",
-    feature = "stream-transport",
-    feature = "outbound-hysteria2",
-    feature = "outbound-tuic",
-    feature = "shadow-tls-v3"
-))]
 pub mod security;
 pub mod session;
+#[doc(hidden)]
+pub mod sniffing;
 #[cfg(any(
+    feature = "sing-mux",
     feature = "inbound-socks5",
+    feature = "outbound-mieru",
+    feature = "outbound-http",
     feature = "outbound-anytls",
     feature = "outbound-shadowsocks",
     feature = "outbound-socks5",
     feature = "outbound-trojan",
+    feature = "outbound-tuic",
     feature = "outbound-vless"
 ))]
 mod socks5;
-#[cfg(any(feature = "tun", test))]
 mod tcp_sniffer;
 #[cfg(any(
     feature = "inbound-http",
@@ -86,6 +99,8 @@ pub mod transport;
     )
 ))]
 mod tun_runtime;
+#[cfg(any(feature = "tun", feature = "inbound-socks5", test))]
+mod udp_sniffing;
 #[cfg(all(windows, feature = "windows-uwp"))]
 #[doc(hidden)]
 pub mod windows;
@@ -103,3 +118,6 @@ pub const ENGINE: &str = "rust";
 /// Implementation identity embedded in every native artifact.
 pub const BUILD_IDENTITY: &str =
     concat!("Vole;engine=rust;coreVersion=", env!("CARGO_PKG_VERSION"));
+
+mod connections;
+mod memory;

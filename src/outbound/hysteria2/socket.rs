@@ -138,11 +138,6 @@ mod tests {
     }
     #[tokio::test]
     async fn a_new_path_packet_does_not_end_the_old_receive_window() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "a_new_path_packet_does_not_end_the_old_receive_window",
-        );
         let (old_tx, old) = memory_socket();
         let (new_tx, new) = memory_socket();
         let socket = WindowSocket::new(new, Some(old));

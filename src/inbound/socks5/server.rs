@@ -1,7 +1,7 @@
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::VecDeque, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, copy_bidirectional_with_sizes},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::mpsc,
     task::JoinSet,
@@ -14,7 +14,7 @@ use crate::{
     dispatch::{DispatchError, Dispatcher},
     inbound::listen::{bind_proxy_tcp, bind_udp},
     session::{
-        Datagram, DatagramSession, Destination, InboundKind, SOCKS5_UDP_PACKET_LIMIT, StreamSession,
+        Datagram, Destination, InboundKind, InboundMetadata, SOCKS5_UDP_PACKET_LIMIT, StreamSession,
     },
     socks5::{COMMAND_CONNECT, encode_udp_packet},
 };
@@ -135,6 +135,11 @@ pub(crate) struct Socks5Handler {
 pub(crate) const UDP_CLEANUP_INTERVAL: Duration = CLEANUP_INTERVAL;
 
 impl Socks5Handler {
+    pub(crate) fn without_auth(mut self) -> Self {
+        self.config.auth = None;
+        self
+    }
+
     pub(crate) fn new(config: Socks5InboundConfig, dispatcher: Arc<dyn Dispatcher>) -> Self {
         Self {
             config,
@@ -181,7 +186,11 @@ impl Socks5Handler {
         let config = &self.config;
         let dispatcher = self.dispatcher.clone();
         let registry = self.registry.clone();
-        let (command, destination) = timeout_at(
+        let handshake::Negotiated {
+            command,
+            destination,
+            user,
+        } = timeout_at(
             deadline,
             handshake::negotiate(&mut stream, config.auth.as_ref()),
         )
@@ -194,18 +203,43 @@ impl Socks5Handler {
             return Ok(());
         }
         if command == COMMAND_CONNECT {
-            let session = StreamSession {
+            let mut session = StreamSession {
+                metadata: InboundMetadata {
+                    local_port: relay.port(),
+                    local_address: Some(relay),
+                    user,
+                    ..Default::default()
+                },
                 inbound: InboundKind::Socks5,
                 source: peer,
                 destination,
                 sniffed_domain: None,
+            };
+            let sniff = dispatcher
+                .sniff_plan(peer, &session.destination)
+                .await
+                .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?
+                .filter(|plan| plan.tcp_enabled());
+            let acknowledged = sniff.is_some();
+            let prefix = if let Some(plan) = sniff {
+                timed(handshake::reply(&mut stream, 0, None)).await?;
+                plan.sniff(&mut stream, &mut session)
+                    .await
+                    .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?
+            } else {
+                Vec::new()
             };
             let connected = timeout(IO_TIMEOUT, dispatcher.connect_tcp(session))
                 .await
                 .unwrap_or(Err(DispatchError::TimedOut));
             match connected {
                 Ok(mut upstream) => {
-                    timed(handshake::reply(&mut stream, 0, None)).await?;
+                    if !acknowledged {
+                        timed(handshake::reply(&mut stream, 0, None)).await?;
+                    }
+                    if !prefix.is_empty() {
+                        timed(upstream.write_all(&prefix)).await?;
+                    }
                     copy_bidirectional_with_sizes(
                         &mut stream,
                         &mut upstream,
@@ -215,6 +249,9 @@ impl Socks5Handler {
                     .await?;
                 }
                 Err(error) => {
+                    if acknowledged {
+                        return Err(io::Error::other(error));
+                    }
                     timed(handshake::reply(
                         &mut stream,
                         handshake::status(&error),
@@ -240,12 +277,18 @@ impl Socks5Handler {
                 return Ok(());
             }
         };
-        let (lease, receiver) = match registry.register(peer, requested.port(), &cancellation) {
+        let (mut lease, receiver) = match registry.register(peer, requested.port(), &cancellation) {
             Ok(value) => value,
             Err(_) => {
                 timed(handshake::reply(&mut stream, 2, None)).await?;
                 return Ok(());
             }
+        };
+        lease.metadata = InboundMetadata {
+            local_port: socket.local_addr()?.port(),
+            local_address: Some(relay),
+            user,
+            ..Default::default()
         };
         // The accepted socket's concrete local IP is reachable even when the
         // listener was bound to a wildcard. TCP and UDP share this exact port.
@@ -277,25 +320,42 @@ async fn relay_datagrams(
     let Some(first) = receiver.recv().await else {
         return Ok(());
     };
-    let source = *lease.source.lock().unwrap();
-    let session = DatagramSession::new(InboundKind::Socks5, source);
+    let session = lease.session();
     let response_limit = usize::from(session.max_response_payload_size());
     let mut transport = timeout(IO_TIMEOUT, dispatcher.open_datagram(session))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 UDP open timed out"))?
         .map_err(|_| io::Error::other("SOCKS5 UDP open failed"))?;
-    timeout(IO_TIMEOUT, transport.send(first))
-        .await
-        .map_err(|_| io::ErrorKind::TimedOut)?
-        .map_err(|_| io::Error::other("SOCKS5 UDP send failed"))?;
+    let mut sniff = None;
+    let mut ready = VecDeque::new();
+    let mut pending = None;
+    queue_udp_result(
+        prepare_udp_datagram(first, lease, dispatcher.as_ref(), &mut sniff).await?,
+        &mut pending,
+        &mut ready,
+    )?;
+    let mut sent = false;
     loop {
+        if let Some(prepared) = pending.take().or_else(|| ready.pop_front()) {
+            send_udp_datagram(prepared, lease, dispatcher.as_ref(), transport.as_mut()).await?;
+            sent = true;
+            continue;
+        }
+        let deadline = sniff.as_ref().and_then(UdpSniffState::next_deadline);
         tokio::select! {
+            () = lease.cancellation.cancelled() => return Ok(()),
+            () = wait_sniff_deadline(deadline), if deadline.is_some() => {
+                append_udp_replay(&mut ready, sniff.as_mut().unwrap().expire(Instant::now()))?;
+            }
             datagram = receiver.recv() => {
                 let Some(datagram) = datagram else { return Ok(()); };
-                timeout(IO_TIMEOUT, transport.send(datagram)).await.map_err(|_| io::ErrorKind::TimedOut)?
-                    .map_err(|_| io::Error::other("SOCKS5 UDP send failed"))?;
+                queue_udp_result(
+                    prepare_udp_datagram(datagram, lease, dispatcher.as_ref(), &mut sniff).await?,
+                    &mut pending,
+                    &mut ready,
+                )?;
             }
-            response = transport.receive() => {
+            response = transport.receive(), if sent => {
                 let response = response.map_err(|_| io::Error::other("SOCKS5 UDP receive failed"))?;
                 if response.payload.len() > response_limit { continue; }
                 let Ok(packet) = encode_udp_packet(&response.remote, &response.payload, SOCKS5_UDP_PACKET_LIMIT) else { continue; };
@@ -311,4 +371,110 @@ async fn relay_datagrams(
             }
         }
     }
+}
+
+type PreparedUdp = crate::udp_sniffing::PreparedDatagram<Datagram>;
+type UdpSniffState = crate::udp_sniffing::SniffState<
+    crate::quic_sniffer::QuicSniffer,
+    fn() -> crate::quic_sniffer::QuicSniffer,
+    Datagram,
+>;
+
+async fn wait_sniff_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn append_udp_replay(
+    ready: &mut VecDeque<PreparedUdp>,
+    mut replay: VecDeque<PreparedUdp>,
+) -> io::Result<()> {
+    if ready
+        .len()
+        .checked_add(replay.len())
+        .is_none_or(|length| length > crate::udp_sniffing::QUIC_SNIFF_READY_DATAGRAM_MAX)
+    {
+        return Err(io::Error::other(
+            "SOCKS5 UDP sniff replay exceeded its bound",
+        ));
+    }
+    ready.append(&mut replay);
+    Ok(())
+}
+
+fn queue_udp_result(
+    result: crate::udp_sniffing::IngressResult<Datagram>,
+    pending: &mut Option<PreparedUdp>,
+    ready: &mut VecDeque<PreparedUdp>,
+) -> io::Result<()> {
+    match result {
+        crate::udp_sniffing::IngressResult::Buffered => Ok(()),
+        crate::udp_sniffing::IngressResult::Forward(datagram) => {
+            // Ordinary UDP retains its original single-packet fast path. The
+            // replay queue is allocated only when QUIC actually buffers bytes.
+            debug_assert!(pending.is_none() && ready.is_empty());
+            *pending = Some(datagram);
+            Ok(())
+        }
+        crate::udp_sniffing::IngressResult::Replay(replay) => append_udp_replay(ready, replay),
+    }
+}
+
+async fn prepare_udp_datagram(
+    datagram: Datagram,
+    lease: &Lease,
+    dispatcher: &dyn Dispatcher,
+    sniff: &mut Option<UdpSniffState>,
+) -> io::Result<crate::udp_sniffing::IngressResult<Datagram>> {
+    let plan = dispatcher
+        .sniff_plan(lease.session().source, &datagram.remote)
+        .await
+        .map_err(|_| io::Error::other("SOCKS5 UDP sniff policy failed"))?;
+    if plan.is_some_and(|plan| plan.quic_enabled()) {
+        let sniff = sniff.get_or_insert_with(|| {
+            UdpSniffState::with_idle_timeout(
+                crate::quic_sniffer::QuicSniffer::new,
+                super::association::IDLE_TIMEOUT,
+            )
+        });
+        Ok(sniff.ingest_datagram(datagram, Instant::now()))
+    } else {
+        Ok(crate::udp_sniffing::IngressResult::Forward(
+            PreparedUdp::without_domain(datagram),
+        ))
+    }
+}
+
+async fn send_udp_datagram(
+    mut prepared: PreparedUdp,
+    lease: &Lease,
+    dispatcher: &dyn Dispatcher,
+    transport: &mut dyn crate::dispatch::DatagramTransport,
+) -> io::Result<()> {
+    if let Some(host) = prepared.sniffed_domain.as_deref()
+        && let Some(plan) = dispatcher
+            .sniff_plan(lease.session().source, &prepared.datagram.remote)
+            .await
+            .map_err(|_| io::Error::other("SOCKS5 UDP sniff policy failed"))?
+        && !plan.accepts(host).map_err(io::Error::other)?
+    {
+        prepared.sniffed_domain = None;
+    }
+    prepared.datagram.sniffed_domain = prepared.sniffed_domain;
+    let send = async {
+        match prepared.flow_id {
+            Some(identity) => {
+                transport
+                    .send_with_flow_id(prepared.datagram, &identity.routing_identity())
+                    .await
+            }
+            None => transport.send(prepared.datagram).await,
+        }
+    };
+    timeout(IO_TIMEOUT, send)
+        .await
+        .map_err(|_| io::ErrorKind::TimedOut)?
+        .map_err(|_| io::Error::other("SOCKS5 UDP send failed"))
 }

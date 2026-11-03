@@ -1,4 +1,4 @@
-/* Vole-owned one-shot adapter. The BLAKE3 implementation is unmodified. */
+/* Vole-owned one-shot adapter to the installed official BLAKE3 C API. */
 #include "blake3.h"
 
 void vole_blake3_raw_derive(const unsigned char *context, size_t context_len,

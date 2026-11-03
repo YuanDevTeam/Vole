@@ -1,7 +1,7 @@
 #![cfg(feature = "outbound-vless")]
 
 use serde_json::{Value, json};
-use vole::config::{Config, ProxyProtocol};
+use vole::config::{Config, ProxyProtocol, XHttpMode};
 
 fn document(options: Value) -> Vec<u8> {
     serde_json::to_vec(&json!({
@@ -52,11 +52,6 @@ fn xhttp_authorities_reject_userinfo_on_both_legs_without_echoing_it() {
 
 #[test]
 fn xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io",
-    );
     let fields = [
         "host",
         "path",
@@ -85,7 +80,7 @@ fn xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io() {
         "download-settings",
     ];
     for field in fields {
-        for value in [Value::Null, json!([]), json!(42)] {
+        for value in [Value::Null, json!([]), json!(42.5)] {
             assert!(
                 Config::parse_yaml(&document(json!({field:value}))).is_err(),
                 "accepted invalid type for {field}: {value}"
@@ -131,7 +126,13 @@ fn xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io() {
         ),
         ("session-length", 10, 128, json!({"session-table":"number"})),
     ] {
-        for value in [low.to_string(), high.to_string(), format!("{low}-{high}")] {
+        for value in [
+            low.to_string(),
+            high.to_string(),
+            format!("{low}-{high}"),
+            format!(" +{low} "),
+            format!(" +{low} - +{high} "),
+        ] {
             let mut options = extra.clone();
             options[field] = json!(value);
             assert!(
@@ -144,9 +145,7 @@ fn xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io() {
             "-1".into(),
             "1-0".into(),
             "1.0".into(),
-            " 1".into(),
             "1-2-3".into(),
-            String::new(),
         ] {
             let mut options = extra.clone();
             options[field] = json!(value);
@@ -201,12 +200,143 @@ fn xhttp_fields_reject_wrong_types_null_and_every_range_boundary_before_io() {
 }
 
 #[test]
-fn empty_http_authority_falls_back_to_each_legs_authentication_name() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "empty_http_authority_falls_back_to_each_legs_authentication_name",
+fn xhttp_numeric_upload_fields_match_strings_and_retain_bounds() {
+    let numeric = json!({
+        "uplink-data-placement": "header", "uplink-data-key": "data",
+        "uplink-chunk-size": 1024,
+        "sc-max-each-post-bytes": 4096,
+        "sc-min-posts-interval-ms": 1
+    });
+    let fields = [
+        "uplink-chunk-size",
+        "sc-max-each-post-bytes",
+        "sc-min-posts-interval-ms",
+    ];
+    let mut quoted = numeric.clone();
+    for field in fields {
+        quoted[field] = json!(quoted[field].as_u64().unwrap().to_string());
+    }
+    let numeric_config = Config::parse_yaml(&document(numeric.clone())).unwrap();
+    let quoted_config = Config::parse_yaml(&document(quoted)).unwrap();
+    assert_eq!(
+        numeric_config.proxies[0].protocol,
+        quoted_config.proxies[0].protocol
     );
+
+    for (field, low, high) in [
+        ("uplink-chunk-size", 0, 8192),
+        ("sc-max-each-post-bytes", 1, 16 * 1024 * 1024),
+        ("sc-min-posts-interval-ms", 1, 60000),
+    ] {
+        for value in [low, high] {
+            let mut options = numeric.clone();
+            options[field] = json!(value);
+            assert!(Config::parse_yaml(&document(options)).is_ok());
+        }
+        for value in [
+            json!(low - 1),
+            json!(high + 1),
+            json!(-1),
+            json!(u64::MAX),
+            json!(true),
+        ] {
+            let mut options = numeric.clone();
+            options[field] = value;
+            assert!(Config::parse_yaml(&document(options)).is_err());
+        }
+    }
+    let mut adaptive = numeric;
+    adaptive["uplink-chunk-size"] = json!(0);
+    assert!(Config::parse_yaml(&document(adaptive)).is_ok());
+}
+
+#[test]
+fn xhttp_empty_mode_path_and_download_name_use_each_legs_defaults() {
+    let config = Config::parse_yaml(&document(json!({"mode":"", "path":""}))).unwrap();
+    let ProxyProtocol::Vless(node) = &config.proxies[0].protocol else {
+        unreachable!()
+    };
+    assert_eq!(node.xhttp().unwrap().mode, XHttpMode::PacketUp);
+    assert_eq!(node.xhttp().unwrap().path, "/");
+
+    let mut input: Value = serde_json::from_slice(&document(json!({
+        "path":"/upload",
+        "download-settings":{"server":"download.example.com", "path":"", "servername":""}
+    })))
+    .unwrap();
+    input["proxies"][0]["servername"] = json!("parent.invalid");
+    let config = Config::parse_yaml(&serde_json::to_vec(&input).unwrap()).unwrap();
+    let ProxyProtocol::Vless(node) = &config.proxies[0].protocol else {
+        unreachable!()
+    };
+    assert_eq!(node.xhttp().unwrap().path, "/upload");
+    assert_eq!(node.xhttp().unwrap().host, "parent.invalid");
+    let download = node.download().unwrap();
+    assert_eq!(download.path, "/");
+    assert_eq!(download.security.server_name(), "download.example.com");
+    assert_eq!(download.host, "download.example.com");
+}
+
+#[test]
+fn xhttp_empty_request_and_pool_fields_restore_their_defaults() {
+    let expected = Config::parse_yaml(&document(json!({}))).unwrap();
+    let ProxyProtocol::Vless(expected_node) = &expected.proxies[0].protocol else {
+        unreachable!()
+    };
+    let actual = Config::parse_yaml(&document(json!({
+        "uplink-http-method":"",
+        "session-placement":"", "session-key":"", "session-length":" \t ",
+        "seq-placement":"", "seq-key":"",
+        "uplink-data-placement":"", "uplink-data-key":"", "uplink-chunk-size":" \t ",
+        "x-padding-bytes":" \t ", "x-padding-key":"", "x-padding-header":"",
+        "x-padding-placement":"", "x-padding-method":"",
+        "sc-max-each-post-bytes":" \t ", "sc-min-posts-interval-ms":""
+    })))
+    .unwrap();
+    let ProxyProtocol::Vless(actual_node) = &actual.proxies[0].protocol else {
+        unreachable!()
+    };
+    assert_eq!(
+        expected_node.xhttp().unwrap().request,
+        actual_node.xhttp().unwrap().request
+    );
+    for download in [false, true] {
+        let expected_options = if download {
+            json!({"download-settings":{"reuse-settings":{}}})
+        } else {
+            json!({"reuse-settings":{}})
+        };
+        let mut options = json!({"reuse-settings":{
+            "max-concurrency":"", "max-connections":" \t ", "c-max-reuse-times":"",
+            "h-max-request-times":"", "h-max-reusable-secs":" \t "
+        }});
+        if download {
+            options = json!({"download-settings":options});
+        }
+        let expected = Config::parse_yaml(&document(expected_options)).unwrap();
+        let actual = Config::parse_yaml(&document(options)).unwrap();
+        let (ProxyProtocol::Vless(expected), ProxyProtocol::Vless(actual)) =
+            (&expected.proxies[0].protocol, &actual.proxies[0].protocol)
+        else {
+            unreachable!()
+        };
+        let (expected, actual) = if download {
+            (
+                &expected.download().unwrap().reuse,
+                &actual.download().unwrap().reuse,
+            )
+        } else {
+            (
+                &expected.xhttp().unwrap().reuse,
+                &actual.xhttp().unwrap().reuse,
+            )
+        };
+        assert_eq!(expected, actual);
+    }
+}
+
+#[test]
+fn empty_http_authority_falls_back_to_each_legs_authentication_name() {
     for (host, down_host, up, down) in [
         ("", None, "example.com", "download.example.com"),
         (
@@ -238,11 +368,6 @@ fn empty_http_authority_falls_back_to_each_legs_authentication_name() {
 
 #[test]
 fn download_security_changes_do_not_silently_discard_inherited_certificate_policy() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "download_security_changes_do_not_silently_discard_inherited_certificate_policy",
-    );
     for download in [
         json!({"tls":false}),
         json!({"reality-opts":{"public-key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}),
@@ -269,11 +394,6 @@ fn download_security_changes_do_not_silently_discard_inherited_certificate_polic
 
 #[test]
 fn h3_requires_exclusive_alpn_and_standard_tls_on_each_leg() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "h3_requires_exclusive_alpn_and_standard_tls_on_each_leg",
-    );
     let mut value: Value =
         serde_json::from_slice(&document(json!({"download-settings":{"alpn":["h3"]}}))).unwrap();
     value["proxies"][0]["alpn"] = json!(["h3"]);
@@ -305,11 +425,6 @@ fn h3_requires_exclusive_alpn_and_standard_tls_on_each_leg() {
 
 #[test]
 fn custom_headers_inherit_replace_clear_and_do_not_leak_values() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "custom_headers_inherit_replace_clear_and_do_not_leak_values",
-    );
     for (download, expected) in [
         (json!({}), Some("private-upload-value")),
         (
@@ -347,11 +462,6 @@ fn custom_headers_inherit_replace_clear_and_do_not_leak_values() {
 
 #[test]
 fn conflicting_request_fields_are_rejected_on_both_legs_before_io() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "conflicting_request_fields_are_rejected_on_both_legs_before_io",
-    );
     for options in [
         json!({"session-placement":"header","download-settings":{"headers":{"x-session":"override"}}}),
         json!({"x-padding-obfs-mode":true,"x-padding-placement":"header","x-padding-header":"X-Pad","download-settings":{"headers":{"x-pad":"override"}}}),
@@ -370,11 +480,6 @@ fn conflicting_request_fields_are_rejected_on_both_legs_before_io() {
 
 #[test]
 fn http_version_selects_h1_only_for_its_single_alpn_and_supports_plaintext() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "http_version_selects_h1_only_for_its_single_alpn_and_supports_plaintext",
-    );
     use vole::config::{SecurityConfig, XHttpVersion};
     for tls in [true, false] {
         for (alpn, version) in [
@@ -411,11 +516,6 @@ fn http_version_selects_h1_only_for_its_single_alpn_and_supports_plaintext() {
 
 #[test]
 fn download_certificate_policy_inherits_and_explicit_false_or_empty_clears() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "download_certificate_policy_inherits_and_explicit_false_or_empty_clears",
-    );
     use vole::config::SecurityConfig;
     for clear in [false, true] {
         let download = if clear {
@@ -459,11 +559,6 @@ fn download_certificate_policy_inherits_and_explicit_false_or_empty_clears() {
 
 #[test]
 fn download_mtls_identity_is_inherited_or_replaced_and_cleared_as_a_pair() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "download_mtls_identity_is_inherited_or_replaced_and_cleared_as_a_pair",
-    );
     use base64::Engine as _;
     use vole::config::SecurityConfig;
     let identity = |name: &str| {
@@ -519,11 +614,6 @@ fn download_mtls_identity_is_inherited_or_replaced_and_cleared_as_a_pair() {
 
 #[test]
 fn download_reality_object_replaces_inherits_or_clears_without_merging_keys() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "download_reality_object_replaces_inherits_or_clears_without_merging_keys",
-    );
     use base64::Engine as _;
     use vole::config::SecurityConfig;
     let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7; 32]);
@@ -572,11 +662,6 @@ fn download_reality_object_replaces_inherits_or_clears_without_merging_keys() {
 
 #[test]
 fn reuse_object_presence_and_download_whole_object_replacement_are_preserved() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "reuse_object_presence_and_download_whole_object_replacement_are_preserved",
-    );
     for (options, upload, down) in [
         (json!({"download-settings":{}}), false, false),
         (

@@ -46,6 +46,10 @@ fn test_sniffer(
         http_ports: http_ports.into(),
         tls_ports: tls_ports.into(),
         quic_ports: quic_ports.into(),
+        http_override: false,
+        tls_override: false,
+        quic_override: false,
+        ..SnifferConfig::disabled()
     })
 }
 
@@ -72,7 +76,7 @@ async fn batch_tun_runtime_preserves_order_stats_and_invalid_packet_isolation() 
     let (host, peer) = UnixDatagram::pair().unwrap();
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
-    let tun = TunIo::new(
+    let tun = TunIo::new_mock(
         TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
         crate::TunFraming::RawIp,
     )
@@ -134,7 +138,7 @@ async fn batch_tun_read_loop_counts_consumed_prefix_before_eof() {
 
     let (host, mut peer) = UnixStream::pair().unwrap();
     host.set_nonblocking(true).unwrap();
-    let tun = TunIo::new(
+    let tun = TunIo::new_mock(
         TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
         crate::TunFraming::RawIp,
     )
@@ -184,7 +188,7 @@ async fn assert_effective_mtu_drops_oversized_udp(dns_query: bool) {
     let (host, peer) = UnixDatagram::pair().unwrap();
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
-    let tun = TunIo::new(
+    let tun = TunIo::new_mock(
         TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
         crate::TunFraming::RawIp,
     )
@@ -734,6 +738,10 @@ async fn quic_prepared_datagrams_forward_flow_identity_only_on_the_marked_send()
 
     #[async_trait]
     impl DatagramTransport for RecordingFlowTransport {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
             self.sent.push((datagram, None));
             Ok(())
@@ -1654,7 +1662,7 @@ fn quic_flow_state_is_isolated_by_destination_and_unconfigured_ports_are_skipped
 #[test]
 fn tun_response_capacities_are_independent_of_tcp_accept_and_each_other() {
     let tun = ResourceLimits::default();
-    assert_eq!(tun.tun_udp_response_queue_capacity, 4_096);
+    assert_eq!(tun.tun_udp_response_queue_capacity, 256);
     assert_eq!(tun.tun_dns_response_queue_capacity, 128);
     let altered = ResourceLimits {
         event_queue_capacity: 3,
@@ -1671,11 +1679,193 @@ fn tun_response_capacities_are_independent_of_tcp_accept_and_each_other() {
 }
 
 #[tokio::test]
+async fn ready_udp_receive_bursts_let_the_response_writer_run_without_drops() {
+    assert_ready_udp_receive_bursts(1, UdpBurstConsumer::Ready).await;
+}
+
+#[tokio::test]
+async fn concurrent_ready_udp_sources_let_the_response_writer_run_without_drops() {
+    assert_ready_udp_receive_bursts(8, UdpBurstConsumer::Ready).await;
+}
+
+#[tokio::test]
+async fn backpressured_udp_response_handoff_retains_one_packet_and_duplex_progress() {
+    assert_ready_udp_receive_bursts(8, UdpBurstConsumer::Delayed).await;
+}
+
+#[tokio::test]
+async fn backpressured_udp_response_handoff_stops_without_waiting_for_the_writer() {
+    assert_ready_udp_receive_bursts(8, UdpBurstConsumer::Stopped).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UdpBurstConsumer {
+    Ready,
+    Delayed,
+    Stopped,
+}
+
+async fn assert_ready_udp_receive_bursts(sources: usize, consumer: UdpBurstConsumer) {
+    const PACKETS: u32 = 512;
+    struct BurstDispatcher(SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>);
+    struct BurstDatagrams {
+        remote: SocketAddr,
+        sequence: u32,
+        received: Arc<AtomicUsize>,
+        sent: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Dispatcher for BurstDispatcher {
+        async fn connect_tcp(&self, _: StreamSession) -> Result<BoxStream, DispatchError> {
+            Err(DispatchError::Other("unused memory TCP path".into()))
+        }
+        async fn open_datagram(
+            &self,
+            _: DatagramSession,
+        ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+            Ok(Box::new(BurstDatagrams {
+                remote: self.0,
+                sequence: 0,
+                received: self.1.clone(),
+                sent: self.2.clone(),
+            }))
+        }
+    }
+    #[async_trait]
+    impl DatagramTransport for BurstDatagrams {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
+        async fn send(&mut self, _: Datagram) -> Result<(), DispatchError> {
+            self.sent.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            if self.sequence == PACKETS {
+                std::future::pending::<()>().await;
+            }
+            // A real Tokio UDP readiness operation also charges cooperation.
+            // The native quantum alone can exceed this writer handoff queue.
+            tokio::task::consume_budget().await;
+            let payload = Bytes::copy_from_slice(&self.sequence.to_be_bytes());
+            self.sequence += 1;
+            self.received.fetch_add(1, Ordering::Relaxed);
+            Ok(Datagram {
+                remote: Destination::Ip(self.remote),
+                payload,
+                sniffed_domain: None,
+            })
+        }
+    }
+    let remote = "198.51.100.20:443".parse().unwrap();
+    let (responses, mut output) = mpsc::channel(64);
+    let cancellation = CancellationToken::new();
+    let stats = RuntimeResourceStats::new("udp_receive_burst_test");
+    let mut inbound = Vec::new();
+    let mut producers = Vec::new();
+    let read_count = Arc::new(AtomicUsize::new(0));
+    let send_count = Arc::new(AtomicUsize::new(0));
+    for index in 0..sources {
+        let source = SocketAddr::new("192.0.2.10".parse().unwrap(), 12000 + index as u16);
+        let (sender, mut input) = mpsc::channel(1);
+        inbound.push(sender);
+        let context = UdpAssociationTaskContext {
+            association_id: index as u64 + 1,
+            source,
+            responses: responses.clone(),
+            dispatcher: Arc::new(BurstDispatcher(
+                remote,
+                read_count.clone(),
+                send_count.clone(),
+            )),
+            resource_stats: stats.clone(),
+            association_clock: AssociationClock::realtime(),
+            last_activity: Arc::new(AtomicU64::new(0)),
+            tun_mtu: TUN_MTU,
+            udp_timeout: Duration::from_secs(30),
+            sniffer: None,
+            cancellation: cancellation.clone(),
+        };
+        producers.push(tokio::spawn(async move {
+            run_udp_association_inner(&mut input, &context).await
+        }));
+    }
+    if consumer != UdpBurstConsumer::Ready {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(output.len(), output.max_capacity());
+        assert!(
+            read_count.load(Ordering::Relaxed) <= output.max_capacity() + sources,
+            "a blocked writer must retain at most one extra response per source"
+        );
+        for (index, sender) in inbound.iter().enumerate() {
+            let source = SocketAddr::new("192.0.2.10".parse().unwrap(), 12000 + index as u16);
+            sender
+                .try_send(UdpDatagram::new(source, remote, b"uplink".as_slice()))
+                .unwrap();
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(send_count.load(Ordering::Relaxed), sources);
+    }
+    let received = if consumer == UdpBurstConsumer::Stopped {
+        Ok(true)
+    } else {
+        timeout(Duration::from_millis(200), async {
+            let mut next = vec![0_u32; sources];
+            for _ in 0..PACKETS as usize * sources {
+                let response = output.recv().await.expect("memory UDP producer closed");
+                let index = usize::from(response.destination.port().saturating_sub(12000));
+                if response.source != remote
+                    || response.destination
+                        != SocketAddr::new("192.0.2.10".parse().unwrap(), 12000 + index as u16)
+                    || index >= sources
+                    || response.payload[..] != next[index].to_be_bytes()
+                {
+                    return false;
+                }
+                next[index] += 1;
+                // The real writer charges each emitted packet in addition to
+                // channel reception, even when all producers remain ready.
+                tokio::task::consume_budget().await;
+            }
+            true
+        })
+        .await
+    };
+    cancellation.cancel();
+    for producer in producers {
+        timeout(Duration::from_secs(1), producer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    drop(inbound);
+    assert!(
+        matches!(received, Ok(true)),
+        "ready receive burst starved the response writer"
+    );
+    assert_eq!(
+        stats.snapshot().udp_response_queue_drops,
+        if consumer == UdpBurstConsumer::Stopped {
+            sources as u64
+        } else {
+            0
+        }
+    );
+}
+
+#[tokio::test]
 async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns() {
     let stats = RuntimeResourceStats::new("tun_response_capacity_test");
     let cancellation = CancellationToken::new();
     let (mut ingress, mut ordinary, mut dns) = UdpIngress::new(
         UdpIngressContext {
+            resources: None,
             config: test_tun_config(),
             dispatcher: Arc::new(MockDispatcher::default()),
             dns: None,
@@ -1685,43 +1875,37 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
         },
         cancellation.clone(),
     );
-    assert_eq!(ordinary.max_capacity(), 4_096);
+    assert_eq!(ordinary.max_capacity(), 256);
     assert_eq!(dns.max_capacity(), 128);
     let source: SocketAddr = "192.0.2.10:12000".parse().unwrap();
     let server: SocketAddr = "198.51.100.20:443".parse().unwrap();
     let response =
         |sequence: u32| UdpDatagram::new(server, source, sequence.to_be_bytes().to_vec());
     let last_activity = AtomicU64::new(5);
-    for sequence in 0..4_096 {
+    for sequence in 0..256 {
         assert!(matches!(
             try_queue_tun_udp_response(
                 &ingress.responses,
                 response(sequence),
                 &last_activity,
                 u64::from(sequence) + 100,
-                &stats,
             ),
             ResponseQueueResult::Queued
         ));
     }
-    assert_eq!(ordinary.len(), 4_096);
-    assert!(matches!(
-        try_queue_tun_udp_response(
-            &ingress.responses,
-            response(4_096),
-            &last_activity,
-            5_000,
-            &stats,
-        ),
-        ResponseQueueResult::Dropped
-    ));
-    assert_eq!(last_activity.load(Ordering::Acquire), 4_195);
-    assert_eq!(stats.snapshot().udp_response_queue_drops, 1);
+    assert_eq!(ordinary.len(), 256);
+    let ResponseQueueResult::Pending(pending) =
+        try_queue_tun_udp_response(&ingress.responses, response(256), &last_activity, 5_000)
+    else {
+        panic!("full queue must return its uncommitted response")
+    };
+    assert_eq!(last_activity.load(Ordering::Acquire), 355);
+    assert_eq!(stats.snapshot().udp_response_queue_drops, 0);
     assert_eq!(stats.snapshot().udp_association_queue_drops, 0);
     assert_eq!(stats.snapshot().dns_queue_drops, 0);
 
     // Saturating the ordinary channel neither consumes DNS capacity nor
-    // overwrites any accepted response. Freeing one slot admits only new work.
+    // overwrites any accepted response. Freeing one slot admits the held packet.
     try_queue_tun_dns_response(&ingress.dns_responses, response(7), None, &stats);
     assert_eq!(&dns.try_recv().unwrap().payload[..], 7_u32.to_be_bytes());
     assert_eq!(
@@ -1729,16 +1913,10 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
         0_u32.to_be_bytes()
     );
     assert!(matches!(
-        try_queue_tun_udp_response(
-            &ingress.responses,
-            response(4_097),
-            &last_activity,
-            5_001,
-            &stats,
-        ),
+        try_queue_tun_udp_response(&ingress.responses, pending, &last_activity, 5_001,),
         ResponseQueueResult::Queued
     ));
-    for sequence in 1_u32..4_096 {
+    for sequence in 1_u32..256 {
         assert_eq!(
             &ordinary.try_recv().unwrap().payload[..],
             sequence.to_be_bytes()
@@ -1746,7 +1924,7 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
     }
     assert_eq!(
         &ordinary.try_recv().unwrap().payload[..],
-        4_097_u32.to_be_bytes()
+        256_u32.to_be_bytes()
     );
     assert!(matches!(
         ordinary.try_recv(),
@@ -1754,17 +1932,11 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
     ));
     ordinary.close();
     assert!(matches!(
-        try_queue_tun_udp_response(
-            &ingress.responses,
-            response(4_098),
-            &last_activity,
-            6_000,
-            &stats,
-        ),
+        try_queue_tun_udp_response(&ingress.responses, response(258), &last_activity, 6_000,),
         ResponseQueueResult::Closed
     ));
     assert_eq!(last_activity.load(Ordering::Acquire), 5_001);
-    assert_eq!(stats.snapshot().udp_queue_drops, 1);
+    assert_eq!(stats.snapshot().udp_queue_drops, 0);
     assert_eq!(stats.snapshot().dns_queue_drops, 0);
     ingress.stop().await;
     assert!(!cancellation.is_cancelled());
@@ -1997,6 +2169,10 @@ impl Dispatcher for RecordingUdpDispatcher {
 
 #[async_trait]
 impl DatagramTransport for RecordingUdpTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         self.datagrams.lock().unwrap().push(datagram);
         self.sent.notify_one();
@@ -2028,6 +2204,10 @@ impl Dispatcher for ReplayFairDispatcher {
 
 #[async_trait]
 impl DatagramTransport for ReplayFairDatagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
         let send_index = self.send_count.fetch_add(1, Ordering::Relaxed);
         if send_index == 0 {
@@ -2104,6 +2284,10 @@ impl DnsReplyDatagrams {
 
 #[async_trait]
 impl DatagramTransport for DnsReplyDatagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
         let query = classify_query(&datagram.payload)
             .map_err(|error| DispatchError::Other(error.to_string()))?;
@@ -2176,6 +2360,10 @@ struct ResponseFirstDatagrams {
 
 #[async_trait]
 impl DatagramTransport for ResponseFirstDatagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
         std::future::pending().await
     }
@@ -2190,6 +2378,10 @@ impl DatagramTransport for ResponseFirstDatagrams {
 
 #[async_trait]
 impl DatagramTransport for BlockingDatagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
         if let Some(send_count) = &self.send_count {
             send_count.fetch_add(1, Ordering::Relaxed);
@@ -2216,6 +2408,10 @@ impl EchoDatagrams {
 
 #[async_trait]
 impl DatagramTransport for EchoDatagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
         if datagram.payload.as_ref() == b"oversize-response" {
             datagram.payload = Bytes::from(vec![0_u8; TUN_MTU]);
@@ -2244,12 +2440,16 @@ fn test_runtime_dns(dispatcher: Arc<dyn Dispatcher>) -> Arc<RuntimeDns> {
         enable: true,
         ipv6: true,
         nameservers: vec![DnsNameserver {
+            path: None,
+            http_auth: None,
+            options: Default::default(),
             transport: DnsTransport::Udp,
             address: Ipv4Addr::new(198, 51, 100, 53).into(),
             port: 53,
             route: DnsRoute::Direct,
         }],
         nameserver_policies: Vec::new(),
+        ..DnsConfig::default()
     };
     let proxies = ProxyDispatchers::new(vec![dispatcher.clone()]).unwrap();
     let rules = RuleSet::compile(vec![RuleSpec {
@@ -2276,7 +2476,7 @@ async fn synthetic_fd_with_dns_disabled_dispatches_tcp_and_reuses_udp_associatio
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let dispatcher = Arc::new(MockDispatcher::default());
     let limits = ResourceLimits {
@@ -2382,6 +2582,16 @@ async fn synthetic_fd_with_dns_disabled_dispatches_tcp_and_reuses_udp_associatio
     assert_eq!(
         dispatcher.tcp_sessions.lock().unwrap()[0],
         StreamSession {
+            metadata: crate::session::InboundMetadata {
+                original: Some(Arc::new(crate::session::InboundSnapshot {
+                    source: tcp_source,
+                    destination: Destination::Ip(tcp_destination),
+                    socket_destination: Some(tcp_destination),
+                    inbound: InboundKind::Tun,
+                    user: None,
+                })),
+                ..crate::session::InboundMetadata::new(tcp_destination.port())
+            },
             inbound: InboundKind::Tun,
             source: tcp_source,
             destination: Destination::Ip(tcp_destination),
@@ -2422,7 +2632,7 @@ async fn unconfigured_tls_port_dispatches_without_reading_a_prefix() {
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let dispatcher = Arc::new(MockDispatcher::default());
     let limits = ResourceLimits {
@@ -2487,9 +2697,20 @@ async fn unconfigured_tls_port_dispatches_without_reading_a_prefix() {
     })
     .await
     .expect("unconfigured TLS port delayed dispatch for a prefix read");
+    // The sniff plan captures original ingress facts even when it reads no prefix.
     assert_eq!(
         dispatcher.tcp_sessions.lock().unwrap()[0],
         StreamSession {
+            metadata: crate::session::InboundMetadata {
+                original: Some(Arc::new(crate::session::InboundSnapshot {
+                    source,
+                    destination: Destination::Ip(destination),
+                    socket_destination: Some(destination),
+                    inbound: InboundKind::Tun,
+                    user: None,
+                })),
+                ..crate::session::InboundMetadata::new(destination.port())
+            },
             inbound: InboundKind::Tun,
             source,
             destination: Destination::Ip(destination),
@@ -2511,7 +2732,7 @@ async fn enabled_dns_fast_path_replies_without_opening_a_tun_udp_association() {
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let dispatcher = Arc::new(MockDispatcher::default());
     let dns_dispatcher = Arc::new(DnsReplyDispatcher::default());
@@ -2688,10 +2909,9 @@ async fn ordinary_and_dns_responses_have_independent_queue_capacity() {
 }
 
 #[tokio::test]
-async fn full_ordinary_response_queue_drops_without_refreshing_activity() {
+async fn full_ordinary_response_queue_returns_data_without_refreshing_activity() {
     let source: SocketAddr = "192.0.2.10:12000".parse().unwrap();
     let server: SocketAddr = "198.51.100.20:443".parse().unwrap();
-    let stats = RuntimeResourceStats::new("tun_runtime_test");
     let last_activity = AtomicU64::new(5);
     let (responses, mut queued) = mpsc::channel(1);
 
@@ -2701,26 +2921,26 @@ async fn full_ordinary_response_queue_drops_without_refreshing_activity() {
             UdpDatagram::new(server, source, b"queued".as_slice()),
             &last_activity,
             100,
-            &stats,
         ),
         ResponseQueueResult::Queued
     ));
     assert_eq!(last_activity.load(Ordering::Acquire), 100);
-    assert!(matches!(
-        try_queue_tun_udp_response(
-            &responses,
-            UdpDatagram::new(server, source, b"dropped".as_slice()),
-            &last_activity,
-            110,
-            &stats,
-        ),
-        ResponseQueueResult::Dropped
-    ));
+    let ResponseQueueResult::Pending(pending) = try_queue_tun_udp_response(
+        &responses,
+        UdpDatagram::new(server, source, b"held".as_slice()),
+        &last_activity,
+        110,
+    ) else {
+        panic!("full queue must return its uncommitted response")
+    };
     assert_eq!(last_activity.load(Ordering::Acquire), 100);
-    assert_eq!(stats.snapshot().udp_queue_drops, 1);
-    assert_eq!(stats.snapshot().udp_association_queue_drops, 0);
-    assert_eq!(stats.snapshot().udp_response_queue_drops, 1);
     assert_eq!(&queued.recv().await.unwrap().payload[..], b"queued");
+    assert!(matches!(
+        try_queue_tun_udp_response(&responses, pending, &last_activity, 120),
+        ResponseQueueResult::Queued
+    ));
+    assert_eq!(last_activity.load(Ordering::Acquire), 120);
+    assert_eq!(&queued.recv().await.unwrap().payload[..], b"held");
 }
 
 #[tokio::test]
@@ -2731,7 +2951,7 @@ async fn dns_fast_path_allows_sixteen_concurrent_sources_and_keeps_udp_responsiv
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let dispatcher = Arc::new(MockDispatcher::default());
     let send_started = Arc::new(Notify::new());
@@ -2873,7 +3093,7 @@ async fn cancellation_interrupts_a_blocked_udp_send_and_completes_the_stop_barri
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let send_started = Arc::new(Notify::new());
     let dispatcher = Arc::new(BlockingDispatcher {
@@ -2921,7 +3141,7 @@ async fn fresh_udp_source_beyond_the_old_sixty_four_limit_is_accepted() {
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let send_started = Arc::new(Notify::new());
     let send_count = Arc::new(AtomicUsize::new(0));
@@ -3044,7 +3264,7 @@ async fn full_udp_association_queue_does_not_block_other_sources() {
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
-    let tun = TunIo::new(fd, crate::TunFraming::RawIp).unwrap();
+    let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
     let blocked_source: SocketAddr = "192.0.2.10:12000".parse().unwrap();
     let responsive_source: SocketAddr = "192.0.2.11:12001".parse().unwrap();
@@ -3112,7 +3332,7 @@ async fn blocked_udp_response_does_not_block_ingress_or_stop() {
     let (host, peer) = UnixDatagram::pair().unwrap();
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
-    let tun = TunIo::new(
+    let tun = TunIo::new_mock(
         TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
         crate::TunFraming::RawIp,
     )
@@ -3206,12 +3426,61 @@ fn fill_tun_egress(host: &UnixDatagram, packet: &[u8]) -> usize {
 }
 
 #[tokio::test]
+async fn transient_tcp_ingress_pressure_yields_once_and_retains_the_packet() {
+    let limits = ResourceLimits {
+        packet_queue_capacity: 1,
+        ..ResourceLimits::default()
+    };
+    let mut parts = NetStack::start_tcp(tun_netstack_config(limits, false)).unwrap();
+    let destination = "198.51.100.20:443".parse().unwrap();
+    let first = "192.0.2.20:13000".parse().unwrap();
+    let second = "192.0.2.21:13001".parse().unwrap();
+    parts
+        .packet_sink
+        .try_send(build_tcp_syn(first, destination))
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let mut offer = Box::pin(offer_netstack_packet(
+        &parts.packet_sink,
+        Packet::new(build_tcp_syn(second, destination)),
+        &cancellation,
+    ));
+    // No await has allowed the current-thread driver to drain the only slot.
+    let first_poll = futures_util::poll!(offer.as_mut());
+    let first_poll_pending = first_poll.is_pending();
+    let first_reply = timeout(Duration::from_secs(1), parts.packet_stream.recv()).await;
+    let sent = match first_poll {
+        Poll::Ready(result) => result,
+        Poll::Pending => offer.await,
+    };
+    let second_reply = if sent.is_ok() {
+        timeout(Duration::from_secs(1), parts.packet_stream.recv())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    parts.control.stop().await;
+    assert!(
+        first_poll_pending,
+        "transient Full dropped the packet before yielding"
+    );
+    let first_reply = first_reply.unwrap().unwrap();
+    assert_eq!(first_reply.data()[22..24], first.port().to_be_bytes());
+    sent.unwrap();
+    let second_reply = second_reply.expect("retained SYN never reached the stack");
+    assert_eq!(second_reply.data()[22..24], second.port().to_be_bytes());
+    assert_eq!(second_reply.data()[33] & 0x12, 0x12);
+}
+
+#[tokio::test]
 async fn full_tcp_ingress_drops_only_that_packet_and_keeps_udp_and_dns_responsive() {
     let (host, peer) = UnixDatagram::pair().unwrap();
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let tun = Arc::new(
-        TunIo::new(
+        TunIo::new_mock(
             TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
             crate::TunFraming::RawIp,
         )
@@ -3251,6 +3520,7 @@ async fn full_tcp_ingress_drops_only_that_packet_and_keeps_udp_and_dns_responsiv
     let cancellation = CancellationToken::new();
     let (udp, mut ordinary_rx, mut dns_rx) = UdpIngress::new(
         UdpIngressContext {
+            resources: None,
             config: test_tun_config(),
             dispatcher: dispatcher.clone(),
             dns: Some(test_runtime_dns(dns_dispatcher.clone())),
@@ -3270,6 +3540,11 @@ async fn full_tcp_ingress_drops_only_that_packet_and_keeps_udp_and_dns_responsiv
     ));
     let pending =
         std::future::poll_fn(|cx| Poll::Ready(reader.as_mut().poll(cx).is_pending())).await;
+    // Keep the driver unscheduled through the one allowed yield. Persistent
+    // Full must still leave ordinary UDP and DNS free to make progress.
+    let still_pending =
+        std::future::poll_fn(|cx| Poll::Ready(reader.as_mut().poll(cx).is_pending())).await;
+    assert!(still_pending);
     let dropped_packets = resources.snapshot().packet_queue_drops;
     let consumed_bytes = traffic.snapshot().up_total;
     let task = tokio::spawn(reader);
@@ -3340,7 +3615,7 @@ async fn tun_writer_drains_remaining_lanes_and_drops_only_invalid_datagrams() {
         host.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
         let tun = Arc::new(
-            TunIo::new(
+            TunIo::new_mock(
                 TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
                 crate::TunFraming::RawIp,
             )
@@ -3407,7 +3682,7 @@ async fn tun_writer_services_ready_raw_ordinary_and_dns_lanes_fairly_across_batc
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let tun = Arc::new(
-        TunIo::new(
+        TunIo::new_mock(
             TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
             crate::TunFraming::RawIp,
         )
@@ -3516,7 +3791,7 @@ async fn tun_writer_retains_dns_permit_until_platform_completion_or_cancelled_se
         host.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
         let tun = Arc::new(
-            TunIo::new(
+            TunIo::new_mock(
                 TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
                 crate::TunFraming::RawIp,
             )
@@ -3628,6 +3903,7 @@ async fn udp_ingress_stop_releases_associations_without_cancelling_caller() {
     let probe = observation::ResourceProbe::default();
     let (mut udp, ordinary, dns) = UdpIngress::new(
         UdpIngressContext {
+            resources: None,
             config: test_tun_config(),
             dispatcher,
             dns: None,
@@ -3830,7 +4106,7 @@ async fn configured_jumbo_mtu_reaches_platform_io_and_udp_response_budget() {
         tun_max_datagram_size: 9000,
         ..ResourceLimits::default()
     };
-    let tun = TunIo::new_with_mtu(
+    let tun = TunIo::new_mock_with_mtu(
         TunFd::duplicate_mock(host.as_raw_fd()).unwrap(),
         crate::TunFraming::RawIp,
         config.mtu,
@@ -3901,6 +4177,7 @@ async fn configured_udp_idle_timeout_controls_real_association_cleanup() {
         let cancellation = CancellationToken::new();
         let (mut ingress, _ordinary, _dns) = UdpIngress::new(
             UdpIngressContext {
+                resources: None,
                 dispatcher: Arc::new(MockDispatcher::default()),
                 dns: None,
                 sniffer: None,
@@ -3936,6 +4213,7 @@ async fn configured_udp_dns_targets_match_exact_endpoints_and_empty_disables_hij
     let target = "192.0.2.53:5353".parse().unwrap();
     let (mut ingress, _ordinary, _dns) = UdpIngress::new(
         UdpIngressContext {
+            resources: None,
             dispatcher,
             dns: Some(dns),
             sniffer: None,

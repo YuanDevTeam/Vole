@@ -39,6 +39,7 @@ impl Dispatcher for Peers {
 
 fn connection(peers: Arc<Peers>, auth: Option<ProxyCredentials>) -> MixedConnection {
     let access = ProxyAccess {
+        bind_address: None,
         allow_lan: true,
         ipv6: false,
     };
@@ -53,6 +54,7 @@ fn connection(peers: Arc<Peers>, auth: Option<ProxyCredentials>) -> MixedConnect
         peers.clone(),
     );
     MixedConnection {
+        access_rules: Default::default(),
         peer: "192.0.2.1:20000".parse().unwrap(),
         relay: "192.0.2.2:1080".parse().unwrap(),
         udp: None,
@@ -115,7 +117,7 @@ async fn memory_mixed_protocols_preserve_first_byte_and_pipelined_tunnel_bytes_w
             if socks {
                 InboundKind::Socks5
             } else {
-                InboundKind::Http
+                InboundKind::Https
             }
         );
         assert_eq!(
@@ -251,4 +253,191 @@ async fn memory_mixed_eof_and_cancellation_release_pending_protocol_reads() {
         }
         assert!(peers.sessions.lock().unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn memory_mixed_acl_multiple_users_and_auth_bypass() {
+    for (skip, denied) in [(false, false), (true, false), (true, true)] {
+        let yaml = format!(
+            r#"mixed-port: 1080
+allow-lan: true
+bind-address: 192.0.2.2
+authentication: [first:old, second:pass, first:new]
+lan-allowed-ips: [192.0.2.0/24]
+lan-disallowed-ips: [{}]
+skip-auth-prefixes: [{}]
+"#,
+            if denied {
+                "192.0.2.1/32"
+            } else {
+                "192.0.2.9/32"
+            },
+            if skip {
+                "192.0.2.0/24"
+            } else {
+                "198.51.100.0/24"
+            }
+        );
+        let config = crate::config::Config::parse_yaml(yaml.as_bytes()).unwrap();
+        let crate::config::InboundConfig::Mixed(mixed) = &config.inbounds[0] else {
+            panic!()
+        };
+        assert_eq!(
+            mixed.access.bind_address,
+            Some("192.0.2.2".parse().unwrap())
+        );
+        assert!(mixed.auth.as_ref().unwrap().matches(b"first", b"new"));
+        assert!(!mixed.auth.as_ref().unwrap().matches(b"first", b"old"));
+        let peers = Arc::new(Peers::default());
+        let (upstream, mut remote) = tokio::io::duplex(1024);
+        peers.streams.lock().unwrap().push_back(upstream);
+        let mut connection = connection(peers.clone(), mixed.auth.clone());
+        connection.access_rules = mixed.access_rules.clone();
+        let cancellation = connection.cancellation.clone();
+        let (mut client, inbound) = tokio::io::duplex(1024);
+        let request = format!(
+            "CONNECT 192.0.2.3:80 HTTP/1.1\r\nHost: 192.0.2.3:80\r\n{}\r\n",
+            if skip {
+                "Proxy-Authorization: Basic Y2xhaW1lZDp1bnRydXN0ZWQ=\r\n".into()
+            } else {
+                format!(
+                    "Proxy-Authorization: {}\r\n",
+                    ProxyCredentials::new("second", "pass")
+                        .unwrap()
+                        .authorization_header_value()
+                )
+            }
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let task = tokio::spawn(connection.serve(inbound));
+        if denied {
+            assert!(task.await.unwrap().is_err());
+            assert!(peers.sessions.lock().unwrap().is_empty());
+        } else {
+            exact(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+            client.write_all(b"body").await.unwrap();
+            exact(&mut remote, b"body").await;
+            cancellation.cancel();
+            task.await.unwrap().unwrap();
+            let sessions = peers.sessions.lock().unwrap();
+            assert_eq!(sessions[0].metadata.local_port, 1080);
+            assert_eq!(sessions[0].inbound, InboundKind::Https);
+            assert_eq!(
+                sessions[0].metadata.user.as_deref(),
+                if skip { None } else { Some("second") }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn ingress_memory_mixed_verified_http_socks_identity_and_unauthenticated_claims() {
+    for (socks, authenticate) in [(false, true), (true, true), (false, false)] {
+        let peers = Arc::new(Peers::default());
+        let (upstream, mut remote) = tokio::io::duplex(1024);
+        peers.streams.lock().unwrap().push_back(upstream);
+        let credentials = ProxyCredentials::new("Alice", "pass").unwrap();
+        let connection = connection(peers.clone(), authenticate.then(|| credentials.clone()));
+        let cancellation = connection.cancellation.clone();
+        let (mut client, inbound) = tokio::io::duplex(1024);
+        let task = tokio::spawn(connection.serve(inbound));
+        if socks {
+            client.write_all(&[5, 1, 2]).await.unwrap();
+            exact(&mut client, &[5, 2]).await;
+            client.write_all(b"\x01\x05Alice\x04pass").await.unwrap();
+            exact(&mut client, &[1, 0]).await;
+            client
+                .write_all(&[5, 1, 0, 1, 192, 0, 2, 3, 0, 80])
+                .await
+                .unwrap();
+            exact(&mut client, &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+        } else {
+            client.write_all(format!("CONNECT 192.0.2.3:80 HTTP/1.1\r\nHost: 192.0.2.3:80\r\nProxy-Authorization: {}\r\n\r\n", credentials.authorization_header_value()).as_bytes()).await.unwrap();
+            exact(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+        }
+        client.write_all(b"body").await.unwrap();
+        exact(&mut remote, b"body").await;
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+        let sessions = peers.sessions.lock().unwrap();
+        assert_eq!(
+            sessions[0].inbound,
+            if socks {
+                InboundKind::Socks5
+            } else {
+                InboundKind::Https
+            }
+        );
+        assert_eq!(sessions[0].metadata.local_port, 1080);
+        assert_eq!(
+            sessions[0].metadata.user.as_deref(),
+            authenticate.then_some("Alice")
+        );
+    }
+}
+
+#[tokio::test]
+async fn ingress_memory_http_keepalive_authenticates_each_request() {
+    let peers = Arc::new(Peers::default());
+    let credentials = ProxyCredentials::multiple(vec![
+        ProxyCredentials::new("Alice", "pass").unwrap(),
+        ProxyCredentials::new("Bob", "other").unwrap(),
+    ]);
+    let connection = connection(peers.clone(), Some(credentials));
+    let cancellation = connection.cancellation.clone();
+    let (mut client, inbound) = tokio::io::duplex(2048);
+    let task = tokio::spawn(connection.serve(inbound));
+    for (user, password) in [("Alice", "pass"), ("Bob", "other")] {
+        let (upstream, mut origin) = tokio::io::duplex(2048);
+        peers.streams.lock().unwrap().push_back(upstream);
+        let header = ProxyCredentials::new(user, password)
+            .unwrap()
+            .authorization_header_value();
+        client.write_all(format!("GET http://192.0.2.3/test HTTP/1.1\r\nHost: 192.0.2.3\r\nProxy-Authorization: {header}\r\n\r\n").as_bytes()).await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(
+                tokio::time::timeout(Duration::from_secs(2), origin.read_u8())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert!(
+            !String::from_utf8(request)
+                .unwrap()
+                .to_lowercase()
+                .contains("proxy-authorization")
+        );
+        origin
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\nx") {
+            response.push(
+                tokio::time::timeout(Duration::from_secs(2), client.read_u8())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+    }
+    cancellation.cancel();
+    task.await.unwrap().unwrap();
+    let sessions = peers.sessions.lock().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session.inbound == InboundKind::Http
+                && session.metadata.local_port == 1080)
+    );
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.metadata.user.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("Alice"), Some("Bob")]
+    );
 }

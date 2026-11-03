@@ -1,12 +1,14 @@
-//! HTTP/3 over the shared controlled datagram seam. No socket or DNS fallback.
+//! HTTP/3 over caller-owned Quinn and the controlled datagram seam.
 use super::{ConnectionGuard, DriverOwner, SendRequest, connection_closed};
 use crate::{
     dispatch::{DatagramBudget, DatagramTransport},
-    transport::quic,
+    transport::{
+        quic::{self, OwnedRuntime},
+        quinn_h3,
+    },
 };
-use bytes::Bytes;
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct QuicTransport {
@@ -17,24 +19,50 @@ pub(crate) struct QuicTransport {
     pub server_name: String,
 }
 
-#[derive(Clone)]
-pub(super) struct Sender {
-    pub requests: h3::client::SendRequest<super::h3_upload::OpenStreams, Bytes>,
-    pub runtime: Arc<OwnedRuntime>,
-    #[cfg(feature = "interop-test")]
-    pub observation: quinn::Connection,
+#[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+#[derive(Debug)]
+pub(crate) struct UdpAssociationControl {
+    connection: quinn::Connection,
+    cancel: CancellationToken,
+    raised: std::sync::atomic::AtomicBool,
 }
-impl std::fmt::Debug for Sender {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Http3Sender").finish_non_exhaustive()
+#[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+impl UdpAssociationControl {
+    #[cfg(all(test, feature = "interop-test"))]
+    pub(super) fn was_raised(&self) -> bool {
+        self.raised.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn raise(&self) {
+        use std::sync::atomic::Ordering;
+        if self.cancel.is_cancelled() || self.connection.close_reason().is_some() {
+            return;
+        }
+        if self
+            .raised
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            && !self.cancel.is_cancelled()
+        {
+            self.connection
+                .set_send_window(crate::limits::XHTTP_H3_UDP_SEND_WINDOW as u64);
+        }
     }
 }
 
-use crate::transport::quic::OwnedRuntime;
+#[derive(Clone, Debug)]
+pub(super) struct Sender {
+    pub requests: quinn_h3::Client,
+    pub runtime: Arc<OwnedRuntime>,
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    pub udp_control: Option<Arc<UdpAssociationControl>>,
+    #[cfg(feature = "interop-test")]
+    pub observation: quinn::Connection,
+}
 
 pub(super) async fn connect(
     raw: QuicTransport,
     keepalive: i32,
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))] udp_qualified: bool,
     owner: &DriverOwner,
 ) -> io::Result<(SendRequest, Arc<ConnectionGuard>)> {
     let cancel = owner.cancellation.child_token();
@@ -42,23 +70,47 @@ pub(super) async fn connect(
     let (ready, response) = oneshot::channel();
     let guard = owner.spawn_managed(
         async move {
-            // Keep QUIC alive for the bounded close exchange after logical
-            // cancellation. Cancelling its runtime first loses CONNECTION_CLOSE.
+            // Native IO remains alive during retirement; only its owner cancels
+            // and joins it after the bounded close exchange.
             let runtime = Arc::new(OwnedRuntime::new(CancellationToken::new()));
+            let QuicTransport {
+                transport,
+                peer,
+                budget,
+                tls,
+                server_name,
+            } = raw;
+            let mut upstream = Some(transport);
             let mut ready = Some(ready);
-            let mut driver = None;
+            let mut datagram = None;
             let mut endpoint = None;
-            let connection = async {
+            let mut close_deadline = None;
+            let prepared = async {
+                let mut tls = (*tls).clone();
+                tls.resumption = rustls::client::Resumption::disabled();
+                tls.enable_early_data = false;
                 let crypto =
-                    quinn::crypto::rustls::QuicClientConfig::try_from(raw.tls).map_err(failure)?;
-                let (socket, datagram) = quic::attach(raw.transport, raw.peer, raw.budget)?;
-                driver = Some(datagram);
-                let mtu = socket.budget().quic_payload_limit()?;
+                    quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(failure)?;
+                if peer.port() == 0 || peer.ip().is_unspecified() || peer.ip().is_multicast() {
+                    return Err(io::ErrorKind::InvalidInput.into());
+                }
+                // Validate before transferring upstream ownership to attach.
+                budget
+                    .intersect(upstream.as_ref().unwrap().payload_budget(&peer.into()))
+                    .quic_payload_limit()?;
+                let (socket, driver) =
+                    quic::attach_quinn(upstream.take().unwrap(), peer, budget).await?;
+                datagram = Some(driver);
+                let path = socket.budget();
+                path.quic_payload_limit()?;
+                let mut discovery = quinn::MtuDiscoveryConfig::default();
+                discovery.upper_bound(path.transmit());
                 let mut limits = quinn::TransportConfig::default();
+                socket.configure_transport(&mut limits);
                 limits
-                    .initial_mtu(mtu)
-                    .min_mtu(mtu)
-                    .mtu_discovery_config(None)
+                    .initial_mtu(crate::dispatch::QUIC_MIN_PAYLOAD_BYTES)
+                    .min_mtu(crate::dispatch::QUIC_MIN_PAYLOAD_BYTES)
+                    .mtu_discovery_config(Some(discovery))
                     .max_concurrent_bidi_streams(0_u8.into())
                     .max_concurrent_uni_streams((crate::limits::XHTTP_H3_UNI_STREAMS as u32).into())
                     .stream_receive_window((crate::limits::XHTTP_H3_STREAM_WINDOW as u32).into())
@@ -73,59 +125,100 @@ pub(super) async fn connect(
                 let mut client = quinn::ClientConfig::new(Arc::new(crypto));
                 client.transport_config(Arc::new(limits));
                 let mut config = quinn::EndpointConfig::default();
-                config.max_udp_payload_size(mtu).map_err(failure)?;
-                let mut peer = quinn::Endpoint::new_with_abstract_socket(
+                config
+                    .max_udp_payload_size(path.receive())
+                    .map_err(failure)?;
+                let mut native = quinn::Endpoint::new_with_abstract_socket(
                     config,
                     None,
-                    socket,
+                    socket.clone(),
                     runtime.clone(),
                 )?;
-                peer.set_default_client_config(client);
-                endpoint = Some(peer);
-                let connected = endpoint
+                native.set_default_client_config(client);
+                endpoint = Some(native);
+                let connection = endpoint
                     .as_ref()
                     .unwrap()
-                    .connect(raw.peer, &raw.server_name)
+                    .connect(peer, &server_name)
                     .map_err(failure)?
                     .await
                     .map_err(failure)?;
-                let (mut control, requests) = h3::client::builder()
-                    .max_field_section_size(u64::from(super::MAX_H2_HEADER_LIST_SIZE))
-                    .build(super::h3_upload::Connection::new(connected.clone()))
-                    .await
-                    .map_err(failure)?;
-                // h3 closes the connection when its last request sender is dropped,
-                // even while response/upload streams still exist. Keep one sender
-                // with the physical driver, whose lease owns the connection lifetime.
-                let keep_requests = requests.clone();
-                ready
-                    .take()
-                    .unwrap()
-                    .send(Ok(Sender {
-                        requests,
-                        runtime: runtime.clone(),
-                        #[cfg(feature = "interop-test")]
-                        observation: connected,
-                    }))
+                let handshake = connection
+                    .handshake_data()
+                    .ok_or_else(connection_closed)?
+                    .downcast::<quinn::crypto::rustls::HandshakeData>()
                     .map_err(|_| connection_closed())?;
-                let _ = control.wait_idle().await;
-                drop(keep_requests);
-                Ok::<_, io::Error>(())
+                if handshake.protocol.as_deref() != Some(b"h3") {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                // rustls rejects an unaccepted ECH offer at Finished processing.
+                let (requests, control) = quinn_h3::attach(
+                    connection.clone(),
+                    u64::from(super::MAX_H2_HEADER_LIST_SIZE),
+                )
+                .await
+                .map_err(failure)?;
+                Ok::<_, io::Error>((connection, requests, control, socket))
             };
-            let result = tokio::select! {biased;
+            let prepared = tokio::select! {biased;
                 () = stop.cancelled() => Err(connection_closed()),
-                result = connection => result,
+                result = prepared => result,
             };
-            if let Some(ready) = ready {
-                let _ = ready.send(Err(result.err().unwrap_or_else(connection_closed)));
-            }
+            let error = match prepared {
+                Ok((connection, requests, mut control, socket)) => {
+                    // h3 closes native QUIC when its last sender is dropped.
+                    // Keep a sender until retirement IO has finished.
+                    let keep_requests = requests.clone();
+                    let published = ready
+                        .take()
+                        .unwrap()
+                        .send(Ok(Sender {
+                            requests,
+                            runtime: runtime.clone(),
+                            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+                            udp_control: udp_qualified.then(|| {
+                                Arc::new(UdpAssociationControl {
+                                    connection: connection.clone(),
+                                    cancel: stop.clone(),
+                                    raised: std::sync::atomic::AtomicBool::new(false),
+                                })
+                            }),
+                            #[cfg(feature = "interop-test")]
+                            observation: connection.clone(),
+                        }))
+                        .is_ok();
+                    if published {
+                        let retiring = tokio::select! {biased;
+                            () = stop.cancelled() => true,
+                            _ = control.wait_idle() => false,
+                        };
+                        if retiring {
+                            keep_requests.retire();
+                            let deadline = Instant::now() + quic::CLOSE_TIMEOUT;
+                            close_deadline = Some(deadline);
+                            retire_io(&mut control, &connection, &socket, deadline).await;
+                        }
+                    }
+                    drop(keep_requests);
+                    None
+                }
+                Err(error) => Some(error),
+            };
             if let Some(endpoint) = endpoint {
+                let deadline =
+                    close_deadline.unwrap_or_else(|| Instant::now() + quic::CLOSE_TIMEOUT);
                 endpoint.close(0_u8.into(), b"");
-                let _ = tokio::time::timeout(quic::CLOSE_TIMEOUT, endpoint.wait_idle()).await;
+                let _ = tokio::time::timeout_at(deadline, endpoint.wait_idle()).await;
             }
             runtime.stop().await;
-            if let Some(driver) = driver {
+            if let Some(driver) = datagram {
                 let _ = driver.stop().await;
+            }
+            if let Some(mut upstream) = upstream {
+                let _ = tokio::time::timeout(quic::CLOSE_TIMEOUT, upstream.close()).await;
+            }
+            if let Some(ready) = ready {
+                let _ = ready.send(Err(error.unwrap_or_else(connection_closed)));
             }
         },
         cancel,
@@ -136,4 +229,43 @@ pub(super) async fn connect(
 
 pub(super) fn failure(_: impl std::fmt::Display) -> io::Error {
     io::Error::other("XHTTP HTTP/3 exchange failed")
+}
+
+// Follow real upstream TX progress while retaining native/H3 ownership. Keep
+// room for CONNECTION_CLOSE within the original deadline; no ACK is inferred
+// from quiet time, and stalled/continuously busy paths still stop at that bound.
+async fn retire_io(
+    control: &mut quinn_h3::ControlDriver,
+    connection: &quinn::Connection,
+    socket: &quic::DatagramSocket,
+    deadline: Instant,
+) {
+    let grace = || {
+        connection
+            .rtt()
+            .saturating_mul(2)
+            .saturating_add(Duration::from_millis(25))
+            .min(quic::CLOSE_TIMEOUT)
+    };
+    let mut sent = socket.stats().sent;
+    let mut quiet = (Instant::now() + grace()).min(deadline);
+    loop {
+        let now = Instant::now();
+        let actual = socket.stats().sent;
+        if actual != sent {
+            sent = actual;
+            quiet = (now + grace()).min(deadline);
+        }
+        if now >= quiet || now >= deadline {
+            return;
+        }
+        // A local timer avoids replacing Quinn's writer AtomicWaker with a
+        // second poll_transmitted waiter; no extra task or packet queue.
+        let check = (now + Duration::from_millis(10)).min(quiet).min(deadline);
+        tokio::select! {biased;
+            _ = control.wait_idle() => return,
+            _ = connection.closed() => return,
+            () = tokio::time::sleep_until(check) => {},
+        }
+    }
 }

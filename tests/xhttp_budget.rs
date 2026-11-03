@@ -26,6 +26,10 @@ struct Transport {
 }
 #[async_trait::async_trait]
 impl DatagramTransport for Transport {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, _: Datagram) -> Result<(), DispatchError> {
         self.sends.fetch_add(1, Ordering::SeqCst);
         Err(io::Error::from(io::ErrorKind::NotConnected).into())
@@ -67,11 +71,6 @@ impl OutboundConnector for Upstream {
 }
 #[tokio::test]
 async fn h3_rejects_incapable_or_small_budget_upstreams_before_any_datagram() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "h3_rejects_incapable_or_small_budget_upstreams_before_any_datagram",
-    );
     let config=Config::parse_yaml(b"mixed-port: 1080\nproxies: [{name: edge, type: vless, server: 192.0.2.1, port: 443, uuid: 07070707-0707-0707-0707-070707070707, tls: true, network: xhttp, alpn: [h3]}]\nrules: ['MATCH,edge']").unwrap();
     let ProxyProtocol::Vless(config) = &config.proxies[0].protocol else {
         unreachable!()
@@ -86,6 +85,7 @@ async fn h3_rejects_incapable_or_small_budget_upstreams_before_any_datagram() {
         let result = outbound
             .connect_stream(
                 StreamSession {
+                    metadata: Default::default(),
                     inbound: InboundKind::InternalMeasure,
                     source: "127.0.0.1:1".parse().unwrap(),
                     destination: "192.0.2.2:80"

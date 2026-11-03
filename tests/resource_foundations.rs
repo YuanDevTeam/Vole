@@ -12,13 +12,7 @@ use vole::{
 
 #[tokio::test]
 async fn twenty_quic_lifetimes_return_owned_resources_to_zero_then_remain_quiet() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-RESOURCES",
-        "twenty_quic_lifetimes_return_owned_resources_to_zero_then_remain_quiet",
-    );
     let probe = ResourceProbe::default();
-    _case.checkpoint("baseline", probe.snapshot());
     for _ in 0..20 {
         probe
             .scope(async {
@@ -58,22 +52,13 @@ async fn twenty_quic_lifetimes_return_owned_resources_to_zero_then_remain_quiet(
     let stopped = probe.snapshot();
     assert_eq!(stopped.peak(ResourceKind::Task), 1);
     assert_eq!(stopped.peak(ResourceKind::Socket), 1);
-    _case.checkpoint("after-stop", stopped.clone());
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(probe.snapshot(), stopped);
-    _case.checkpoint("quiet", probe.snapshot());
-    _case.resources(stopped);
 }
 
 #[tokio::test]
 async fn physical_tcp_guard_survives_connect_and_releases_on_stream_drop() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-RESOURCES",
-        "physical_tcp_guard_survives_connect_and_releases_on_stream_drop",
-    );
     let probe = Arc::new(ResourceProbe::default());
-    _case.checkpoint("baseline", probe.snapshot());
     probe
         .scope(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -89,20 +74,13 @@ async fn physical_tcp_guard_survives_connect_and_releases_on_stream_drop() {
             assert!(probe.snapshot().is_idle());
         })
         .await;
-    _case.checkpoint("after-stop", probe.snapshot());
-    _case.resources(probe.snapshot());
 }
 
 #[cfg(feature = "stream-transport")]
 #[tokio::test]
 async fn twenty_stream_lifetimes_and_cancelled_setups_remain_quiet() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-RESOURCES",
-        "twenty_stream_lifetimes_and_cancelled_setups_remain_quiet",
-    );
     let probe = ResourceProbe::default();
-    case.checkpoint("baseline", probe.snapshot());
     for _ in 0..20 {
         for is_grpc in [true, false] {
             tokio::time::timeout(
@@ -179,9 +157,6 @@ async fn twenty_stream_lifetimes_and_cancelled_setups_remain_quiet() {
     let stopped = probe.snapshot();
     assert_eq!(stopped.peak(ResourceKind::Task), 1);
     assert_eq!(stopped.peak(ResourceKind::Session), 1);
-    case.checkpoint("after-stop", stopped.clone());
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(probe.snapshot(), stopped);
-    case.checkpoint("quiet", probe.snapshot());
-    case.resources(stopped);
 }

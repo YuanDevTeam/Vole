@@ -36,12 +36,12 @@ pub(super) struct TcpStream<R, W> {
 }
 
 impl<R: AsyncRead + Unpin + Send + 'static, W> TcpStream<R, W> {
-    pub fn new(mut reader: R, writer: W, deadline: tokio::time::Instant) -> Self {
+    pub fn new(mut reader: R, writer: W) -> Self {
         Self {
             response: Some(Box::pin(async move {
-                tokio::time::timeout_at(deadline, super::wire::tcp_response(&mut reader))
-                    .await
-                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+                // Setup has already committed the request. A peer can defer
+                // success until origin data arrives, beyond the setup budget.
+                super::wire::tcp_response(&mut reader).await?;
                 Ok(reader)
             })),
             reader: None,
@@ -102,8 +102,8 @@ impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for TcpStream<R, W> {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // Opportunistically consume an already available response/failure and
-        // enforce the original deadline, but never wait for target-first data.
+        // Consume an available response/failure without blocking client-first
+        // upload or imposing a setup deadline on an established stream.
         self.wakeups.writer.register(cx.waker());
         if let Poll::Ready(Err(error)) = self.poll_response() {
             return Poll::Ready(Err(error));
@@ -140,20 +140,37 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[tokio::test]
-    async fn a_client_first_write_does_not_steal_a_pending_read_wakeup() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "a_client_first_write_does_not_steal_a_pending_read_wakeup",
-        );
+    #[tokio::test(start_paused = true)]
+    async fn admitted_upload_survives_setup_deadline_before_delayed_response() {
         let (client, mut peer) = tokio::io::duplex(128);
         let (reader, writer) = tokio::io::split(client);
-        let stream = TcpStream::new(
-            reader,
-            writer,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-        );
+        let stream = TcpStream::new(reader, writer);
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let reading = tokio::spawn(async move {
+            let mut reply = [0; 5];
+            reader.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+        writer.write_all(b"start").await.unwrap();
+        let mut request = [0; 5];
+        peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"start");
+        // A Mihomo peer may defer success until the origin has response data.
+        // Established upload must remain writable beyond its setup budget.
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        writer.write_all(b"tail!").await.unwrap();
+        peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"tail!");
+        peer.write_all(b"\0\0\0reply").await.unwrap();
+        assert_eq!(&reading.await.unwrap(), b"reply");
+        writer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_client_first_write_does_not_steal_a_pending_read_wakeup() {
+        let (client, mut peer) = tokio::io::duplex(128);
+        let (reader, writer) = tokio::io::split(client);
+        let stream = TcpStream::new(reader, writer);
         let (mut reader, mut writer) = tokio::io::split(stream);
         let reading = tokio::spawn(async move { reader.read_u8().await });
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -172,18 +189,9 @@ mod tests {
 
     #[tokio::test]
     async fn application_eof_closes_both_directions_without_consuming_a_tail() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "application_eof_closes_both_directions_without_consuming_a_tail",
-        );
         let (client, mut peer) = tokio::io::duplex(128);
         let (reader, writer) = tokio::io::split(client);
-        let mut stream = TcpStream::new(
-            reader,
-            writer,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-        );
+        let mut stream = TcpStream::new(reader, writer);
         peer.write_all(b"\0\0\0hello").await.unwrap();
         let mut hello = [0; 5];
         stream.read_exact(&mut hello).await.unwrap();
@@ -202,18 +210,9 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_wakes_an_already_pending_logical_reader() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "shutdown_wakes_an_already_pending_logical_reader",
-        );
         let (client, mut peer) = tokio::io::duplex(128);
         let (reader, writer) = tokio::io::split(client);
-        let mut stream = TcpStream::new(
-            reader,
-            writer,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-        );
+        let mut stream = TcpStream::new(reader, writer);
         peer.write_all(b"\0\0\0a").await.unwrap();
         assert_eq!(stream.read_u8().await.unwrap(), b'a');
         let (mut reader, mut writer) = tokio::io::split(stream);

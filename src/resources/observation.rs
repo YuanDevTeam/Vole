@@ -243,11 +243,13 @@ where
 }
 
 pub(crate) fn task<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    use tracing::instrument::WithSubscriber;
     let guard = track(ResourceKind::Task);
     bind(async move {
         let _guard = guard;
         future.await
     })
+    .with_current_subscriber()
 }
 
 /// IO plus a test-only lifetime guard. In release builds the guard is a ZST;

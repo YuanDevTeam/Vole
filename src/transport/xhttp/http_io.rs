@@ -28,7 +28,7 @@ pub(super) type ResponseFuture =
 pub(super) enum Sender {
     H2(h2_write::Sender),
     H1 {
-        requests: mpsc::Sender<H1Request>,
+        requests: mpsc::Sender<Box<H1Request>>,
         writes: Writes,
     },
     H3(super::h3_driver::Sender),
@@ -70,13 +70,13 @@ impl Sender {
                     H1Upload::new(send)
                 };
                 requests
-                    .send((
+                    .send(Box::new((
                         request.map(|_| UploadBody {
                             receive,
                             empty: end,
                         }),
                         reply,
-                    ))
+                    )))
                     .await
                     .map_err(|_| connection_closed())?;
                 Ok((
@@ -98,7 +98,10 @@ impl Sender {
                     .send_request(request)
                     .await
                     .map_err(super::h3_driver::failure)?;
-                let (mut send, mut receive) = request.split();
+                let (mut send, mut receive): (
+                    crate::transport::quinn_h3::SendStream,
+                    crate::transport::quinn_h3::RecvStream,
+                ) = request.split();
                 let cancel = sender.runtime.cancel.child_token();
                 let (upload, mut data) = mpsc::channel::<H3Chunk>(BODY_QUEUE);
                 let (finish, finished) = oneshot::channel();
@@ -135,7 +138,7 @@ impl Sender {
                             .recv_response()
                             .await
                             .map_err(super::h3_driver::failure)?;
-                        Ok(response.map(|_| Download::H3(H3Download(receive))))
+                        Ok(response.map(|_| Download::H3(Box::new(receive))))
                     }),
                     Upload {
                         inner: UploadKind::H3(H3Upload {
@@ -159,16 +162,19 @@ pub(super) async fn http1(
     let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
         .max_headers(super::request::MAX_REQUEST_HEADERS)
         .max_buf_size(super::request::MAX_REQUEST_BYTES)
-        .writev(false)
+        // Keep body backings instead of flattening a full POST into the header
+        // buffer. Scalar TLS writers consume the queued slices incrementally.
+        .writev(true)
         .handshake(hyper_util::rt::TokioIo::new(io))
         .await
         .map_err(h1_failure)?;
-    let (commands, mut requests) = mpsc::channel::<H1Request>(BODY_QUEUE);
+    let (commands, mut requests) = mpsc::channel::<Box<H1Request>>(BODY_QUEUE);
     // Dispatch eagerly, so an upload is not dependent on the caller polling reads.
     // Both futures belong to the same cancellation/join barrier as the physical IO.
     let guard = owner.spawn(async move {
         let dispatch = async move {
-            while let Some((request, reply)) = requests.recv().await {
+            while let Some(command) = requests.recv().await {
+                let (request, reply) = *command;
                 if reply.is_closed() {
                     continue;
                 }
@@ -355,7 +361,12 @@ impl Upload {
         }
     }
     pub(super) fn send_data(&mut self, data: Bytes, end: bool) -> io::Result<()> {
-        if data.len() > crate::limits::XHTTP_PACKET_BATCH_BYTES {
+        let batch_limit = if matches!(&self.inner, UploadKind::H3(_)) {
+            crate::limits::XHTTP_H3_PACKET_BATCH_BYTES
+        } else {
+            crate::limits::XHTTP_PACKET_BATCH_BYTES
+        };
+        if data.len() > batch_limit {
             return Err(super::request::invalid_request());
         }
         // Writers drain each receipt before accepting another chunk. Packet-up
@@ -424,13 +435,12 @@ impl Upload {
 pub(super) enum Download {
     H2(h2::RecvStream),
     H1(Incoming),
-    H3(H3Download),
+    H3(Box<crate::transport::quinn_h3::RecvStream>),
 }
-pub(super) struct H3Download(h3::client::RequestStream<super::h3_upload::RecvStream, Bytes>);
 impl Download {
     pub(super) fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Bytes>>> {
         match self {
-            Self::H3(stream) => stream.0.poll_recv_data(cx).map(|result| match result {
+            Self::H3(stream) => stream.poll_recv_data(cx).map(|result| match result {
                 Ok(Some(mut data)) => Some(Ok(data.copy_to_bytes(data.remaining()))),
                 Ok(None) => None,
                 Err(error) => Some(Err(super::h3_driver::failure(error))),
@@ -465,3 +475,7 @@ impl Download {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "http1_memory_tests.rs"]
+mod memory_tests;

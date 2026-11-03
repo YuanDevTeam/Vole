@@ -41,11 +41,6 @@ impl OutboundConnector for SuppliedStream {
 
 #[tokio::test]
 async fn vless_all_handshakes_keep_the_original_deadline_and_join_cancelled_io() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VLESS-CANCEL",
-        "vless_all_handshakes_keep_the_original_deadline_and_join_cancelled_io",
-    );
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     for mode in ["tcp", "tls", "ws", "grpc", "http", "h2", "vision", "xhttp"] {
         let mut node = serde_json::json!({"name":"edge","type":"vless","server":"fixture.invalid","port":443,"uuid":"07070707-0707-0707-0707-070707070707","network":if mode=="tls" || mode=="vision" {"tcp"}else{mode}});
@@ -69,7 +64,9 @@ async fn vless_all_handshakes_keep_the_original_deadline_and_join_cancelled_io()
         let ProxyProtocol::Vless(node) = &parsed.proxies[0].protocol else {
             unreachable!()
         };
-        let (io, mut peer) = tokio::io::duplex(65536);
+        // Keep request submission blocked; a fully committed request may wait
+        // for application data beyond the setup deadline.
+        let (io, mut peer) = tokio::io::duplex(1);
         let outbound = VlessOutbound::new_with_path(
             node,
             UpstreamPath::proxy(Arc::new(SuppliedStream {
@@ -78,6 +75,7 @@ async fn vless_all_handshakes_keep_the_original_deadline_and_join_cancelled_io()
         )
         .unwrap();
         let session = StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::InternalMeasure,
             source: "127.0.0.1:1".parse().unwrap(),
             destination: "192.0.2.2:80"
@@ -92,23 +90,28 @@ async fn vless_all_handshakes_keep_the_original_deadline_and_join_cancelled_io()
             if let Ok(mut connected) = outbound.connect_stream(session, &context).await {
                 let _ = connected.io.write_all(b"first").await;
                 let _ = connected.io.flush().await;
-                assert!(connected.io.read(&mut [0; 1]).await.is_err());
+                connected.io.read(&mut [0; 1]).await.is_err()
+            } else {
+                true
             }
         };
-        tokio::time::timeout(Duration::from_millis(325), task)
-            .await
-            .expect("consumer reset the original deadline");
-        assert!(start.elapsed() >= Duration::from_millis(240));
-        tokio::time::timeout(Duration::from_secs(1), outbound.shutdown())
-            .await
-            .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(325), task).await;
+        let elapsed = start.elapsed();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), outbound.shutdown()).await;
         let mut observed = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut observed))
-            .await
-            .unwrap()
-            .unwrap();
+        let joined =
+            tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut observed)).await;
+        assert!(stopped.is_ok(), "{mode}: Core Stop did not join");
+        joined.expect("memory peer did not finish").unwrap();
+        let failed =
+            result.unwrap_or_else(|_| panic!("{mode}: consumer reset the original deadline"));
+        assert!(failed, "{mode}: unfinished setup accepted application data");
+        assert!(
+            elapsed >= Duration::from_millis(240),
+            "{mode}: setup ended early"
+        );
         assert!(!observed.is_empty());
-        assert!(observed.len() <= 65536);
+        assert!(observed.len() <= 1);
     }
 }
 
@@ -133,7 +136,7 @@ fn split_xhttp_construction_uses_default_stack_and_protect_failure_has_no_fallba
                 let protect=Arc::new(RejectProtect(AtomicUsize::new(0)));
                 let endpoint=ResolvedEndpoint {logical_host:"192.0.2.1".into(),port:443,addresses:vec!["192.0.2.1:443".parse().unwrap()]};
                 let outbound=VlessOutbound::new(config, endpoint, Dialer::default().with_protector(protect.clone())).unwrap();
-                let session=StreamSession {inbound:InboundKind::InternalMeasure,source:"127.0.0.1:1".parse().unwrap(),destination:"192.0.2.2:80".parse::<std::net::SocketAddr>().unwrap().into(),sniffed_domain:None};
+                let session=StreamSession {metadata: Default::default(),inbound:InboundKind::InternalMeasure,source:"127.0.0.1:1".parse().unwrap(),destination:"192.0.2.2:80".parse::<std::net::SocketAddr>().unwrap().into(),sniffed_domain:None};
                 assert!(outbound.connect_stream(session, &EstablishContext::default()).await.is_err());
                 assert!((1..=2).contains(&protect.0.load(Ordering::SeqCst)));
                 outbound.shutdown().await;
@@ -144,11 +147,6 @@ fn split_xhttp_construction_uses_default_stack_and_protect_failure_has_no_fallba
 
 #[tokio::test]
 async fn vless_expired_deadline_and_protect_failure_never_fall_back() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VLESS-CANCEL",
-        "vless_expired_deadline_and_protect_failure_never_fall_back",
-    );
     let parsed = Config::parse_yaml(b"mixed-port: 1080\nproxies: [{name: edge, type: vless, server: 192.0.2.1, port: 443, uuid: 07070707-0707-0707-0707-070707070707}]\nrules: ['MATCH,edge']").unwrap();
     let ProxyProtocol::Vless(config) = &parsed.proxies[0].protocol else {
         unreachable!()
@@ -165,6 +163,7 @@ async fn vless_expired_deadline_and_protect_failure_never_fall_back() {
     )
     .unwrap();
     let session = StreamSession {
+        metadata: Default::default(),
         inbound: InboundKind::InternalMeasure,
         source: "127.0.0.1:1".parse().unwrap(),
         destination: "192.0.2.2:80"

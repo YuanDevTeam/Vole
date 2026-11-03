@@ -67,11 +67,6 @@ async fn peer(
 
 #[tokio::test]
 async fn enabled_reuse_shares_physical_h2_without_one_close_killing_its_sibling() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "enabled_reuse_shares_physical_h2_without_one_close_killing_its_sibling",
-    );
     tokio::time::timeout(Duration::from_secs(3), async {
         let probe = vole::resources::observation::ResourceProbe::default();
         probe
@@ -116,11 +111,6 @@ async fn enabled_reuse_shares_physical_h2_without_one_close_killing_its_sibling(
 
 #[tokio::test]
 async fn reuse_thresholds_expand_and_retire_without_closing_active_sessions() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "reuse_thresholds_expand_and_retire_without_closing_active_sessions",
-    );
     use serde_json::json;
     tokio::time::timeout(Duration::from_secs(5), async {
         for (settings, counts) in [
@@ -166,11 +156,6 @@ async fn reuse_thresholds_expand_and_retire_without_closing_active_sessions() {
 
 #[tokio::test]
 async fn expired_transport_is_not_assigned_again_while_old_session_stays_live() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "expired_transport_is_not_assigned_again_while_old_session_stays_live",
-    );
     tokio::time::timeout(Duration::from_secs(3), async {
         let tasks = TaskTracker::new();
         let calls = AtomicUsize::new(0);
@@ -205,11 +190,6 @@ async fn expired_transport_is_not_assigned_again_while_old_session_stays_live() 
 
 #[tokio::test]
 async fn pooled_packet_posts_do_not_each_consume_a_transport_lease() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "pooled_packet_posts_do_not_each_consume_a_transport_lease",
-    );
     tokio::time::timeout(Duration::from_secs(3), async {
         let tasks = TaskTracker::new();
         let calls = AtomicUsize::new(0);
@@ -290,11 +270,6 @@ async fn pooled_packet_posts_do_not_each_consume_a_transport_lease() {
 
 #[tokio::test(start_paused = true)]
 async fn h2_keepalive_uses_default_explicit_and_disabled_idle_periods() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "h2_keepalive_uses_default_explicit_and_disabled_idle_periods",
-    );
     for (seconds, expected) in [(0, Some(45)), (2, Some(2)), (-1, None)] {
         let (io, mut remote) = tokio::io::duplex(16384);
         let (sent, received) = tokio::sync::oneshot::channel();
@@ -350,11 +325,6 @@ async fn h2_keepalive_uses_default_explicit_and_disabled_idle_periods() {
 
 #[tokio::test]
 async fn download_uses_its_own_reuse_counters_and_keeps_shared_sessions_alive() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "download_uses_its_own_reuse_counters_and_keeps_shared_sessions_alive",
-    );
     tokio::time::timeout(Duration::from_secs(3), async {
         let tasks = TaskTracker::new();
         let uploads = AtomicUsize::new(0);
@@ -393,11 +363,6 @@ async fn download_uses_its_own_reuse_counters_and_keeps_shared_sessions_alive() 
 
 #[tokio::test]
 async fn h1_packet_upload_reuses_its_idle_connection_but_reopens_the_cancelled_get() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "h1_packet_upload_reuses_its_idle_connection_but_reopens_the_cancelled_get",
-    );
     tokio::time::timeout(Duration::from_secs(3), async {
         let tasks = TaskTracker::new();
         let calls = AtomicUsize::new(0);
@@ -477,11 +442,6 @@ async fn h1_packet_upload_reuses_its_idle_connection_but_reopens_the_cancelled_g
 
 #[tokio::test]
 async fn stopping_during_handshake_prevents_late_driver_admission() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "stopping_during_handshake_prevents_late_driver_admission",
-    );
     tokio::time::timeout(Duration::from_secs(2), async {
         let client =
             XHttpClient::new(XHttpConfig::new("example.com", "/x", XHttpMode::StreamOne).unwrap());
@@ -513,11 +473,6 @@ async fn stopping_during_handshake_prevents_late_driver_admission() {
 
 #[tokio::test]
 async fn stop_wakes_a_handshake_even_when_the_peer_never_responds() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "XHTTP-UNIT",
-        "stop_wakes_a_handshake_even_when_the_peer_never_responds",
-    );
     let client =
         XHttpClient::new(XHttpConfig::new("example.com", "/x", XHttpMode::StreamOne).unwrap());
     let (io, _remote) = tokio::io::duplex(1);

@@ -1,4 +1,4 @@
-//! Selective Xray GeoData loading with compact, shared category matchers.
+//! Selective DAT matchers and shared country/ASN MMDB readers.
 //!
 //! The loader deliberately scans protobuf wire framing itself. It indexes only
 //! category ranges during the first pass and decodes records only for codes
@@ -23,14 +23,20 @@ use crate::{
     routing::GeoMatcher,
 };
 
+mod asn;
+#[cfg(test)]
+mod asn_tests;
+mod country;
+#[cfg(test)]
+mod country_tests;
 mod manager;
 mod selectors;
 pub(crate) mod service;
-pub(crate) mod updater;
 
 pub(crate) use selectors::normalize_selector;
 use selectors::{fold_attribute, selector_attributes, selector_code};
 
+pub(crate) use manager::GeoDataRegistrationLease;
 pub use manager::{
     DynamicGeoData, GeoDataLoadReport, GeoDataManager, GeoDataManagerError, GeoDataRegistration,
     GeoDataReloadReport, GeoDataResourceReport, GeoDataStatus, GeoResourceState, GeoUpdateSession,
@@ -38,22 +44,26 @@ pub use manager::{
 
 pub const GEOSITE_FILE_NAME: &str = "geosite.dat";
 pub const GEOIP_FILE_NAME: &str = "geoip.dat";
+pub const ASN_FILE_NAME: &str = "ASN.mmdb";
 
 const MAX_CODE_BYTES: usize = 64;
 
-/// The two supported Xray GeoData assets.
+/// Logical assets; GeoIP selects a DAT or country MMDB per registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeoDataKind {
     GeoSite,
     GeoIp,
+    Asn,
 }
 
 impl GeoDataKind {
+    pub const ALL: [Self; 3] = [Self::GeoSite, Self::GeoIp, Self::Asn];
     #[must_use]
     pub const fn file_name(self) -> &'static str {
         match self {
             Self::GeoSite => GEOSITE_FILE_NAME,
             Self::GeoIp => GEOIP_FILE_NAME,
+            Self::Asn => ASN_FILE_NAME,
         }
     }
 }
@@ -63,6 +73,7 @@ impl std::fmt::Display for GeoDataKind {
         formatter.write_str(match self {
             Self::GeoSite => "GeoSite",
             Self::GeoIp => "GeoIP",
+            Self::Asn => "ASN",
         })
     }
 }
@@ -91,6 +102,10 @@ pub enum GeoDataError {
     InvalidRegex { code: String, detail: String },
     #[error("invalid GeoIP CIDR in `{code}`: {detail}")]
     InvalidCidr { code: String, detail: String },
+    #[error("invalid ASN MMDB: {0}")]
+    InvalidAsn(String),
+    #[error("invalid country MMDB: {0}")]
+    InvalidCountry(String),
     #[error("GeoData resource `{resource}` is {actual}; limit is {maximum}")]
     ResourceLimit {
         resource: &'static str,
@@ -110,9 +125,11 @@ impl From<GeoDataError> for VoleError {
 /// Diagnostic capacity accounting, never a memory admission policy.
 ///
 /// Includes Vole-owned matcher/index vectors and arenas, with old/new buffer
-/// overlap during growth. Compiled regex programs and search caches are opaque
-/// third-party allocations and are not counted, nor are allocator overhead or
-/// the process peak; those require independent measurements.
+/// overlap during growth. Owned MMDB file bytes are included, but candidate
+/// validation overlap and MMDB metadata/verification allocations are excluded.
+/// Compiled regex programs and search caches are opaque third-party allocations
+/// and are not counted, nor are allocator overhead or the process peak; those
+/// require independent measurements.
 #[derive(Debug, Default)]
 struct AllocationLedger {
     used: usize,
@@ -140,6 +157,8 @@ impl AllocationLedger {
 pub struct GeoData {
     sites: Vec<SiteCategory>,
     ips: Vec<IpCategory>,
+    country: Option<country::CountryDb>,
+    asn: Option<asn::AsnDb>,
     allocation_capacity: usize,
     peak_allocation_capacity: usize,
     // Fields drop in declaration order: signal only after matcher storage is
@@ -153,6 +172,8 @@ impl std::fmt::Debug for GeoData {
             .debug_struct("GeoData")
             .field("site_categories", &self.sites.len())
             .field("ip_categories", &self.ips.len())
+            .field("country_available", &self.country.is_some())
+            .field("asn_available", &self.asn.is_some())
             .field("allocation_capacity", &self.allocation_capacity)
             .field("peak_allocation_capacity", &self.peak_allocation_capacity)
             .finish()
@@ -169,12 +190,14 @@ impl GeoData {
     pub const EMPTY: Self = Self {
         sites: Vec::new(),
         ips: Vec::new(),
+        country: None,
+        asn: None,
         allocation_capacity: 0,
         peak_allocation_capacity: 0,
         release: None,
     };
 
-    /// Loads only categories referenced by `rules` from the two fixed sibling
+    /// Loads referenced DAT categories and the ASN MMDB from fixed sibling
     /// assets in `config_dir`.
     pub fn load(config_dir: &Path, rules: &[RuleSpec]) -> Result<Self, GeoDataError> {
         Self::load_with_dns_policies(config_dir, rules, &[])
@@ -205,12 +228,28 @@ impl GeoData {
         if !requested.sites.values.is_empty() {
             load_site_file(config_dir, &requested.sites, &mut sites, &mut ledger)?;
         }
-        Ok(Self::from_loaded(sites, ips, ledger.used, ledger.peak))
+        let asn = if requested.asn {
+            let database = asn::AsnDb::load(config_dir)?;
+            ledger.reserve(database.capacity())?;
+            Some(database)
+        } else {
+            None
+        };
+        Ok(Self::from_loaded(
+            sites,
+            ips,
+            None,
+            asn,
+            ledger.used,
+            ledger.peak,
+        ))
     }
 
     fn from_loaded(
         mut sites: Vec<SiteCategory>,
         mut ips: Vec<IpCategory>,
+        country: Option<country::CountryDb>,
+        asn: Option<asn::AsnDb>,
         allocation_capacity: usize,
         peak_allocation_capacity: usize,
     ) -> Self {
@@ -218,10 +257,13 @@ impl GeoData {
         // manager reloads share this allocation-free indexing step.
         sites.sort_unstable_by_key(|category| category.code);
         ips.sort_unstable_by_key(|category| category.code);
-        let release = (!sites.is_empty() || !ips.is_empty()).then(manager::SnapshotRelease::new);
+        let release = (!sites.is_empty() || !ips.is_empty() || country.is_some() || asn.is_some())
+            .then(manager::SnapshotRelease::new);
         Self {
             sites,
             ips,
+            country,
+            asn,
             allocation_capacity,
             peak_allocation_capacity,
             release,
@@ -244,7 +286,7 @@ impl GeoData {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.sites.is_empty() && self.ips.is_empty()
+        self.sites.is_empty() && self.ips.is_empty() && self.country.is_none() && self.asn.is_none()
     }
 
     #[must_use]
@@ -254,7 +296,14 @@ impl GeoData {
 
     #[must_use]
     pub fn geoip_available(&self, code: &str) -> bool {
-        self.ip_category(code).is_some()
+        lan_selector(code)
+            || self.country.as_ref().is_some_and(|db| db.available(code))
+            || self.ip_category(code).is_some()
+    }
+
+    #[must_use]
+    pub fn asn_available(&self) -> bool {
+        self.asn.is_some()
     }
 
     fn site_category(&self, code: &str) -> Option<&SiteCategory> {
@@ -274,7 +323,42 @@ impl GeoData {
     }
 }
 
+pub(crate) fn lan_selector(code: &str) -> bool {
+    code.strip_prefix('!')
+        .unwrap_or(code)
+        .eq_ignore_ascii_case("lan")
+}
+pub(crate) fn matches_lan(code: &str, ip: IpAddr) -> Option<bool> {
+    if !lan_selector(code) {
+        return None;
+    }
+    // netip's LAN predicates unmap IPv4 except IsUnspecified.
+    let canonical = match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        IpAddr::V4(_) => ip,
+    };
+    let local = ip.is_unspecified()
+        || canonical.is_loopback()
+        || canonical.is_multicast()
+        || match canonical {
+            IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+            IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
+        };
+    Some(local != code.starts_with('!'))
+}
+
 impl GeoMatcher for GeoData {
+    fn asn_available(&self) -> bool {
+        GeoData::asn_available(self)
+    }
+    fn matches_asn(&self, payload: &str, address: IpAddr) -> bool {
+        self.asn
+            .as_ref()
+            .is_some_and(|database| database.matches(payload, address))
+    }
     fn geosite_available(&self, code: &str) -> bool {
         GeoData::geosite_available(self, code)
     }
@@ -288,9 +372,31 @@ impl GeoMatcher for GeoData {
             .is_some_and(|category| !domain.is_empty() && category.matches_selector(code, domain))
     }
 
+    fn matches_geosite_bounded(
+        &self,
+        code: &str,
+        domain: &str,
+        decision: &crate::config::RuleDecision,
+    ) -> Result<bool, crate::config::MatchFailure> {
+        decision.visit()?;
+        match self.site_category(code) {
+            Some(category) if !domain.is_empty() => {
+                category.matches_selector_bounded(code, domain, Some(decision))
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn matches_geoip(&self, code: &str, address: IpAddr) -> bool {
-        self.ip_category(code)
-            .is_some_and(|category| category.matches(address) != code.starts_with('!'))
+        matches_lan(code, address).unwrap_or_else(|| {
+            self.country.as_ref().map_or_else(
+                || {
+                    self.ip_category(code)
+                        .is_some_and(|category| category.matches(address) != code.starts_with('!'))
+                },
+                |db| db.matches(code, address),
+            )
+        })
     }
 }
 
@@ -352,6 +458,9 @@ impl CodeSet {
 
     fn insert(&mut self, kind: GeoDataKind, raw: &str) -> Result<(), GeoDataError> {
         let selector = normalize_selector(kind, raw)?;
+        if kind == GeoDataKind::GeoIp && lan_selector(&selector) {
+            return Ok(());
+        }
         if self.selectors.contains(&selector) {
             return Ok(());
         }
@@ -379,30 +488,64 @@ impl CodeSet {
     }
 }
 
+static EMPTY_CODE_SET: CodeSet = CodeSet::EMPTY;
+
 #[derive(Debug)]
 struct RequestedCodes {
     sites: CodeSet,
     ips: CodeSet,
+    asn: bool,
 }
 
 impl RequestedCodes {
-    fn collect(
-        rules: &[RuleSpec],
+    fn collect<'a>(
+        rules: impl IntoIterator<Item = &'a RuleSpec>,
         dns_policies: &[DnsNameserverPolicy],
     ) -> Result<Self, GeoDataError> {
         let mut requested = Self {
             sites: CodeSet::EMPTY,
             ips: CodeSet::EMPTY,
+            asn: false,
         };
-        for rule in rules {
+        let mut pending: Vec<_> = rules.into_iter().collect();
+        while let Some(rule) = pending.pop() {
             match &rule.kind {
+                RuleKind::And(children) | RuleKind::Or(children) => pending.extend(children),
+                RuleKind::RuleSet {
+                    content: Some(content),
+                    ..
+                } => pending.extend(&content.classical),
+                RuleKind::Not(child)
+                | RuleKind::Flow {
+                    predicate: child, ..
+                }
+                | RuleKind::SubRule {
+                    predicate: child, ..
+                } => pending.push(child),
+                RuleKind::IpAsn(_) | RuleKind::SrcIpAsn(_) => requested.asn = true,
                 RuleKind::GeoSite(code) => requested.sites.insert(GeoDataKind::GeoSite, code)?,
-                RuleKind::GeoIp(code) => requested.ips.insert(GeoDataKind::GeoIp, code)?,
+                RuleKind::GeoIp(code) | RuleKind::SrcGeoIp(code) => {
+                    requested.ips.insert(GeoDataKind::GeoIp, code)?
+                }
                 _ => (),
             }
         }
         for policy in dns_policies {
-            for code in &policy.geosite_codes {
+            if let crate::config::DnsPolicySelector::RuleSets { sets, .. } = &policy.selector {
+                let rules = sets
+                    .iter()
+                    .flat_map(|set| set.classical.iter().cloned())
+                    .collect::<Vec<_>>();
+                let nested = Self::collect(&rules, &[])?;
+                requested.asn |= nested.asn;
+                for code in nested.sites.selectors {
+                    requested.sites.insert(GeoDataKind::GeoSite, &code)?;
+                }
+                for code in nested.ips.selectors {
+                    requested.ips.insert(GeoDataKind::GeoIp, &code)?;
+                }
+            }
+            for code in policy.geosite_codes() {
                 requested.sites.insert(GeoDataKind::GeoSite, code)?;
             }
         }
@@ -410,7 +553,7 @@ impl RequestedCodes {
     }
 
     const fn total(&self) -> usize {
-        self.sites.selectors.len() + self.ips.selectors.len()
+        self.sites.selectors.len() + self.ips.selectors.len() + self.asn as usize
     }
 }
 
@@ -425,9 +568,103 @@ impl RequestedCodes {
 pub struct GeoRequirements {
     sites: CodeSet,
     ips: CodeSet,
+    asn: bool,
+    geodata_mode: bool,
 }
 
 impl GeoRequirements {
+    pub(crate) fn for_config(config: &crate::config::Config) -> Result<Self, GeoDataError> {
+        Self::for_rules(
+            config,
+            config
+                .rules
+                .iter()
+                .chain(config.sub_rules.iter().flat_map(|sub| &sub.rules)),
+        )
+    }
+
+    pub(crate) fn for_rules<'a>(
+        config: &crate::config::Config,
+        rules: impl IntoIterator<Item = &'a RuleSpec>,
+    ) -> Result<Self, GeoDataError> {
+        let mut policies: Vec<_> = config
+            .dns
+            .nameserver_policies
+            .iter()
+            .chain(&config.dns.proxy_policies)
+            .map(|policy| DnsNameserverPolicy {
+                selector: policy.selector.clone(),
+                nameservers: Box::new([]),
+            })
+            .collect();
+        if config.dns.enable && config.dns.fake_ip.enabled {
+            policies.extend(config.dns.fake_ip.filter.iter().cloned().map(|selector| {
+                DnsNameserverPolicy {
+                    selector,
+                    nameservers: Box::new([]),
+                }
+            }));
+        }
+        if config.dns.enable && !config.dns.fallback.nameservers.is_empty() {
+            policies.extend(config.dns.fallback.domains.iter().cloned().map(|selector| {
+                DnsNameserverPolicy {
+                    selector,
+                    nameservers: Box::new([]),
+                }
+            }));
+        }
+        if config.sniffer.enable {
+            policies.extend(
+                config
+                    .sniffer
+                    .force_domain
+                    .iter()
+                    .chain(&config.sniffer.skip_domain)
+                    .cloned()
+                    .map(|selector| DnsNameserverPolicy {
+                        selector,
+                        nameservers: Box::new([]),
+                    }),
+            );
+        }
+        let requested = RequestedCodes::collect(rules, &policies)?;
+        let mut result = Self {
+            sites: requested.sites,
+            ips: requested.ips,
+            asn: requested.asn,
+            geodata_mode: config
+                .geodata_update
+                .as_ref()
+                .is_some_and(|update| update.geodata_mode),
+        };
+        if config.sniffer.enable {
+            result.extend(&Self::collect(&config.sniffer.skip_src_address, &[])?)?;
+            result.extend(&Self::collect(&config.sniffer.skip_dst_address, &[])?)?;
+        }
+        if config.dns.enable
+            && !config.dns.fallback.nameservers.is_empty()
+            && let Some(code) = &config.dns.fallback.geoip
+            && code != "lan"
+        {
+            result.ips.insert(GeoDataKind::GeoIp, code)?;
+        }
+        if config.dns.enable && config.dns.fake_ip.enabled {
+            result.extend(&Self::collect(&config.dns.fake_ip.rules, &[])?)?;
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn extend(&mut self, other: &Self) -> Result<(), GeoDataError> {
+        self.asn |= other.asn;
+        for selector in &other.sites.selectors {
+            self.sites.insert(GeoDataKind::GeoSite, selector)?;
+        }
+        for selector in &other.ips.selectors {
+            self.ips.insert(GeoDataKind::GeoIp, selector)?;
+        }
+        Ok(())
+    }
+
     /// Collects all GeoSite and GeoIP selectors used by business rules and DNS
     /// nameserver policies. Each underlying category is decoded only once.
     pub fn collect(
@@ -438,12 +675,21 @@ impl GeoRequirements {
         Ok(Self {
             sites: requested.sites,
             ips: requested.ips,
+            asn: requested.asn,
+            geodata_mode: false,
         })
+    }
+
+    /// Selects DAT (true) or country MMDB (false, the YAML default).
+    #[must_use]
+    pub fn with_geodata_mode(mut self, enabled: bool) -> Self {
+        self.geodata_mode = enabled;
+        self
     }
 
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.sites.values.is_empty() && self.ips.values.is_empty()
+        self.sites.values.is_empty() && self.ips.values.is_empty() && !self.asn
     }
 
     #[must_use]
@@ -451,6 +697,7 @@ impl GeoRequirements {
         match kind {
             GeoDataKind::GeoSite => !self.sites.values.is_empty(),
             GeoDataKind::GeoIp => !self.ips.values.is_empty(),
+            GeoDataKind::Asn => self.asn,
         }
     }
 
@@ -464,6 +711,7 @@ impl GeoRequirements {
         let set = match kind {
             GeoDataKind::GeoSite => &self.sites,
             GeoDataKind::GeoIp => &self.ips,
+            GeoDataKind::Asn => &EMPTY_CODE_SET,
         };
         set.selectors.iter().map(String::as_str)
     }
@@ -472,6 +720,7 @@ impl GeoRequirements {
         match kind {
             GeoDataKind::GeoSite => &self.sites,
             GeoDataKind::GeoIp => &self.ips,
+            GeoDataKind::Asn => &EMPTY_CODE_SET,
         }
     }
 }
@@ -517,6 +766,9 @@ fn load_ips_for_requirements(
 }
 
 fn validate_asset_structure(asset_dir: &Path, kind: GeoDataKind) -> Result<(), GeoDataError> {
+    if kind == GeoDataKind::Asn {
+        return asn::AsnCandidate::load(asset_dir).map(drop);
+    }
     let (mut file, len) = open_asset(asset_dir, kind)?;
     let mut ledger = AllocationLedger::default();
     let _ = index_selected(&mut file, len, kind, &CodeSet::EMPTY, &mut ledger)?;
@@ -609,6 +861,11 @@ fn load_selected_file<T>(
 
 fn open_asset(config_dir: &Path, kind: GeoDataKind) -> Result<(File, u64), GeoDataError> {
     let path = config_dir.join(kind.file_name());
+    open_asset_path(&path)
+}
+
+fn open_asset_path(path: &Path) -> Result<(File, u64), GeoDataError> {
+    let path = path.to_path_buf();
     let symlink_metadata = fs::symlink_metadata(&path).map_err(|source| GeoDataError::Io {
         path: path.clone(),
         source,
@@ -823,23 +1080,38 @@ impl SiteCategory {
     }
 
     fn matches_selector(&self, selector: &str, domain: &str) -> bool {
+        self.matches_selector_bounded(selector, domain, None)
+            .expect("unbounded linear matching")
+    }
+
+    fn matches_selector_bounded(
+        &self,
+        selector: &str,
+        domain: &str,
+        decision: Option<&crate::config::RuleDecision>,
+    ) -> Result<bool, crate::config::MatchFailure> {
         let attributes = selector_attributes(selector);
         let filter = self
             .filters
             .iter()
             .find(|filter| filter.attributes.eq_ignore_ascii_case(attributes));
         let matched = if attributes.is_empty() {
-            self.matches(domain, &self.patterns, None)
+            self.matches(domain, &self.patterns, None, decision)?
         } else if let Some(filter) = filter {
             if filter.all_records {
-                self.matches(domain, &self.patterns, None)
+                self.matches(domain, &self.patterns, None, decision)?
             } else {
-                self.matches(domain, &filter.patterns, Some(&filter.regex_indices))
+                self.matches(
+                    domain,
+                    &filter.patterns,
+                    Some(&filter.regex_indices),
+                    decision,
+                )?
             }
         } else {
-            return false;
+            return Ok(false);
         };
-        matched != selector.starts_with('!')
+        Ok(matched != selector.starts_with('!'))
     }
 
     fn matches(
@@ -847,18 +1119,22 @@ impl SiteCategory {
         domain: &str,
         patterns: &[SitePattern],
         regex_indices: Option<&[usize]>,
-    ) -> bool {
+        decision: Option<&crate::config::RuleDecision>,
+    ) -> Result<bool, crate::config::MatchFailure> {
         // The loader validates/normalizes each value once. Reuse the compact
         // ranges as a sorted index; a miss must not scan all Domain/Full records
         // for every UDP packet. Category membership is a union, not rule order.
+        if let Some(decision) = decision {
+            decision.visit()?;
+        }
         let bytes = domain.as_bytes();
         if self.contains(patterns, SitePatternKind::Full, bytes) {
-            return true;
+            return Ok(true);
         }
         let mut suffix = bytes;
         loop {
             if self.contains(patterns, SitePatternKind::Domain, suffix) {
-                return true;
+                return Ok(true);
             }
             let Some(dot) = suffix.iter().position(|byte| *byte == b'.') else {
                 break;
@@ -869,20 +1145,36 @@ impl SiteCategory {
             .iter()
             .take_while(|pattern| pattern.kind == SitePatternKind::Substr)
         {
+            if let Some(decision) = decision {
+                decision.visit()?;
+            }
             let value = pattern.value(&self.values);
             if bytes.windows(value.len()).any(|window| window == value) {
-                return true;
+                return Ok(true);
             }
         }
         // The regex library owns its compiled representation and search cache;
         // matching is not guaranteed to be allocation-free on first use.
-        let matches_regex = |regex: &Regex| regex.is_match(domain.as_bytes());
-        match regex_indices {
-            Some(indices) => indices
-                .iter()
-                .any(|&index| matches_regex(&self.regexes[index])),
-            None => self.regexes.iter().any(matches_regex),
+        let matches_regex = |regex: &Regex| match decision {
+            Some(decision) => decision.linear(regex.as_str().len(), domain.len(), || {
+                regex.is_match(domain.as_bytes())
+            }),
+            None => Ok(regex.is_match(domain.as_bytes())),
+        };
+        if let Some(indices) = regex_indices {
+            for &index in indices {
+                if matches_regex(&self.regexes[index])? {
+                    return Ok(true);
+                }
+            }
+        } else {
+            for regex in &self.regexes {
+                if matches_regex(regex)? {
+                    return Ok(true);
+                }
+            }
         }
+        Ok(false)
     }
 }
 
@@ -1052,7 +1344,7 @@ fn parse_site_category<'a>(
     release_vec(&present, ledger);
     release_vec(&filter_matches, ledger);
     match result {
-        Ok(regexes) => {
+        Ok(mut regexes) => {
             // In-place sort does not duplicate the arena or retain a second
             // index. Keep every record, including overlapping types/duplicates.
             patterns.sort_unstable_by(|left, right| {
@@ -1066,7 +1358,12 @@ fn parse_site_category<'a>(
                         .cmp(&right.kind)
                         .then_with(|| left.value(&values).cmp(right.value(&values)))
                 });
+                compact_vec(&mut filter.patterns, ledger)?;
+                compact_vec(&mut filter.regex_indices, ledger)?;
             }
+            compact_vec(&mut patterns, ledger)?;
+            compact_vec(&mut values, ledger)?;
+            compact_vec(&mut regexes, ledger)?;
             Ok(SiteCategory {
                 code: range.code,
                 patterns,
@@ -1604,6 +1901,8 @@ fn parse_ip_category(
         }
         compact_v4(&mut v4);
         compact_v6(&mut v6);
+        compact_vec(&mut v4, ledger)?;
+        compact_vec(&mut v6, ledger)?;
         Ok(())
     })();
     match result {
@@ -1849,6 +2148,21 @@ fn ensure_vec_capacity<T>(
 
 fn release_vec<T>(values: &Vec<T>, ledger: &mut AllocationLedger) {
     ledger.release(values.capacity().saturating_mul(mem::size_of::<T>()));
+}
+
+fn compact_vec<T>(values: &mut Vec<T>, ledger: &mut AllocationLedger) -> Result<(), GeoDataError> {
+    if values.capacity() == values.len() || mem::size_of::<T>() == 0 {
+        return Ok(());
+    }
+    let old = values.capacity() * mem::size_of::<T>();
+    let desired = values.len() * mem::size_of::<T>();
+    // Account for a possible moved allocation, including its overlap. The
+    // allocator may keep capacity; charge the actual retained size afterwards.
+    ledger.reserve(desired)?;
+    values.shrink_to_fit();
+    ledger.release(old);
+    ledger.reserve(values.capacity() * mem::size_of::<T>() - desired)?;
+    Ok(())
 }
 
 fn read_key(file: &mut File, end: u64, kind: GeoDataKind) -> Result<(u32, u8), GeoDataError> {

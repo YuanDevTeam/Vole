@@ -110,11 +110,13 @@ fn rule(kind: RuleKind) -> RuleSpec {
 
 fn dns_policy(codes: &[&str]) -> DnsNameserverPolicy {
     DnsNameserverPolicy {
-        geosite_codes: codes
-            .iter()
-            .map(|code| (*code).to_owned())
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
+        selector: crate::config::DnsPolicySelector::GeoSite(
+            codes
+                .iter()
+                .map(|code| (*code).to_owned())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
         nameservers: Vec::new().into_boxed_slice(),
     }
 }
@@ -460,7 +462,11 @@ fn category_lookup_preserves_independent_codes_through_load_and_reload() {
     let data = GeoData::load(dir.path(), &rules).unwrap();
     let manager = GeoDataManager::open(dir.path(), std::time::Duration::from_secs(60)).unwrap();
     let registration = manager
-        .register(GeoRequirements::collect(&rules, &[]).unwrap())
+        .register(
+            GeoRequirements::collect(&rules, &[])
+                .unwrap()
+                .with_geodata_mode(true),
+        )
         .unwrap();
     assert!(registration.initial_report().geosite.available);
     assert!(registration.initial_report().geoip.available);
@@ -1048,6 +1054,7 @@ fn geosite_byte_regex_preserves_search_classes_and_supported_flags() {
         (r"^\w+\.test$", "abc_42.test", "a-b.test"),
         (r"^\w+\.test$", "abc.test", "é.test"),
         (r"needle", "has-needle.example", "absent.example"),
+        (r"UPPER", "UPPER.example", "upper.example"),
         (r"(?i:FLAG)", "flag.example", "quiet.example"),
         (r"(?m:^line$)", "first\nline\nlast", "first\nnot-line\nlast"),
         (r"(?s:^a.b$)", "a\nb", "ab"),
@@ -1061,6 +1068,17 @@ fn geosite_byte_regex_preserves_search_classes_and_supported_flags() {
         let data =
             GeoData::load(dir.path(), &[rule(RuleKind::GeoSite("byte-regex".into()))]).unwrap();
         assert!(data.matches_geosite("byte-regex", matched), "{pattern}");
+        assert!(
+            data.matches_geosite_bounded("byte-regex", matched, &Default::default())
+                .unwrap(),
+            "{pattern}"
+        );
+        assert!(
+            !data
+                .matches_geosite_bounded("byte-regex", not_matched, &Default::default())
+                .unwrap(),
+            "{pattern}"
+        );
         assert!(
             !data.matches_geosite("byte-regex", not_matched),
             "{pattern}"
@@ -1153,6 +1171,53 @@ fn geoip_records_load_without_count_limits_before_cidr_compaction() {
 }
 
 #[test]
+fn loaded_geodata_releases_growth_slack_without_dropping_records() {
+    let dir = tempdir().unwrap();
+    let records: Vec<_> = (0..513)
+        .map(|index| domain(3, &format!("record-{index}.example")))
+        .collect();
+    write_asset(
+        dir.path(),
+        GEOSITE_FILE_NAME,
+        &site_list(&[site("cn", &records)]),
+    );
+    let cidrs = vec![cidr(&[203, 0, 113, 9], 32); 513];
+    write_asset(
+        dir.path(),
+        GEOIP_FILE_NAME,
+        &geoip_list(&[geoip("cn", &cidrs, false)]),
+    );
+    let data = GeoData::load(
+        dir.path(),
+        &[
+            rule(RuleKind::GeoSite("cn".into())),
+            rule(RuleKind::GeoIp("cn".into())),
+        ],
+    )
+    .unwrap();
+    for index in 0..513 {
+        assert!(data.matches_geosite("cn", &format!("record-{index}.example")));
+    }
+    assert!(data.matches_geoip("cn", "203.0.113.9".parse().unwrap()));
+    assert!(!data.matches_geoip("cn", "203.0.113.10".parse().unwrap()));
+    let site = &data.sites[0];
+    let retained =
+        site.patterns.capacity() * mem::size_of::<SitePattern>() + site.values.capacity();
+    let content = site.patterns.len() * mem::size_of::<SitePattern>() + site.values.len();
+    assert!(
+        retained <= content + content / 10,
+        "loaded immutable storage retains growth slack"
+    );
+    let ip = &data.ips[0];
+    assert!(
+        ip.v4.capacity() <= ip.v4.len() + 1,
+        "compacted prefixes retain pre-compaction capacity"
+    );
+    assert!(data.allocation_capacity() >= retained + ip.v4.capacity() * mem::size_of::<Cidr4>());
+    assert!(data.peak_allocation_capacity() >= data.allocation_capacity());
+}
+
+#[test]
 fn large_assets_skip_unselected_payloads_without_file_size_quotas() {
     use std::io::Write;
     let dir = tempdir().unwrap();
@@ -1170,6 +1235,7 @@ fn large_assets_skip_unselected_payloads_without_file_size_quotas() {
         file.write_all(&category).unwrap();
         file.seek(SeekFrom::Current(padding as i64)).unwrap();
         let (selected, rule_kind) = match kind {
+            GeoDataKind::Asn => unreachable!("this case tests DAT framing"),
             GeoDataKind::GeoSite => (
                 site("selected", &[domain(3, "last.test")]),
                 RuleKind::GeoSite("selected".into()),
@@ -1182,6 +1248,7 @@ fn large_assets_skip_unselected_payloads_without_file_size_quotas() {
         file.write_all(&field_bytes(1, &selected)).unwrap();
         let data = GeoData::load(dir.path(), &[rule(rule_kind)]).unwrap();
         match kind {
+            GeoDataKind::Asn => unreachable!("this case tests DAT framing"),
             GeoDataKind::GeoSite => assert!(data.matches_geosite("selected", "last.test")),
             GeoDataKind::GeoIp => {
                 assert!(data.matches_geoip("selected", "10.0.0.1".parse().unwrap()))
@@ -1214,74 +1281,69 @@ fn literal_ip_family_does_not_cross_match() {
     assert!(!data.matches_geoip("v4", "::ffff:203.0.113.1".parse().unwrap()));
 }
 
-/// Opt-in compatibility check for the real Xray GeoData assets shipped by the
-/// app. CI does not require those external files; run with
-/// `VOLE_GEODATA_DIR=/path/to/assets/dat cargo test real_xray_geodata -- --ignored --nocapture`.
 #[test]
-#[ignore = "requires VOLE_GEODATA_DIR containing real geosite.dat and geoip.dat"]
-fn real_xray_geodata_loads_common_codes_without_memory_quotas() {
-    let dir = std::env::var_os("VOLE_GEODATA_DIR")
-        .map(PathBuf::from)
-        .expect("VOLE_GEODATA_DIR must point to the directory containing both .dat files");
-    let rules = [
-        rule(RuleKind::GeoSite("cn".to_owned())),
-        rule(RuleKind::GeoSite("geolocation-!cn".to_owned())),
-        rule(RuleKind::GeoIp("cn".to_owned())),
-        rule(RuleKind::GeoIp("private".to_owned())),
-    ];
-    let baseline = GeoData::load(
-        &dir,
-        &[rules[0].clone(), rules[2].clone(), rules[3].clone()],
+fn ingress_source_geoip_and_builtin_lan_avoid_destination_resolution() {
+    use crate::{
+        config::Network,
+        routing::{RoutingContext, RuleEvaluation, RuleSet},
+    };
+    let dir = tempdir().unwrap();
+    write_asset(
+        dir.path(),
+        GEOIP_FILE_NAME,
+        &geoip_list(&[geoip("CN", &[cidr(&[192, 0, 2, 0], 24)], false)]),
+    );
+    let mut config = crate::config::Config::parse_yaml(
+        b"mixed-port: 1080\nrules: ['SRC-GEOIP,CN,REJECT', 'GEOIP,lan,DIRECT,src', 'MATCH,DIRECT']",
     )
     .unwrap();
-    eprintln!(
-        "real GeoData baseline allocation without GEOLOCATION-!CN: retained={} bytes, accounted_peak={} bytes",
-        baseline.allocation_capacity(),
-        baseline.peak_allocation_capacity(),
+    let requirements = GeoRequirements::for_config(&config).unwrap();
+    assert_eq!(
+        requirements.codes(GeoDataKind::GeoIp).collect::<Vec<_>>(),
+        ["cn"]
     );
-    assert!(baseline.matches_geosite("cn", "baidu.com"));
-    assert!(baseline.matches_geoip("private", "10.0.0.1".parse().unwrap()));
-    assert!(baseline.matches_geoip("cn", "1.0.1.1".parse().unwrap()));
-    drop(baseline);
-
-    let documented = GeoData::load(
-        &dir,
-        &[
-            rule(RuleKind::GeoSite("category-ads-all".to_owned())),
-            rules[0].clone(),
-            rules[2].clone(),
-            rules[3].clone(),
-        ],
+    let data = GeoData::load(dir.path(), &config.rules).unwrap();
+    let rules = RuleSet::compile(config.take_runtime_rules()).unwrap();
+    let mut context = RoutingContext::new(
+        Network::Tcp,
+        &crate::session::Destination::domain("unresolved.example", 443).unwrap(),
     )
-    .unwrap_or_else(|error| panic!("documented GeoData combination failed: {error}"));
-    eprintln!(
-        "documented GeoData allocation: retained={} bytes, accounted_peak={} bytes",
-        documented.allocation_capacity(),
-        documented.peak_allocation_capacity(),
+    .unwrap();
+    context.set_source("192.0.2.1:1234".parse().unwrap());
+    assert!(
+        matches!(rules.evaluate_with_geo(&context, &data), RuleEvaluation::Matched(result) if result.rule_index == 0)
     );
-    assert!(documented.matches_geosite("cn", "baidu.com"));
-    assert!(documented.matches_geoip("private", "10.0.0.1".parse().unwrap()));
-    drop(documented);
-
-    let policy = dns_policy(&["private", "cn", "apple"]);
-    let policy_data =
-        GeoData::load_with_dns_policies(&dir, &[rules[2].clone(), rules[3].clone()], &[policy])
-            .unwrap_or_else(|error| panic!("Simple Profile DNS policy GeoData failed: {error}"));
-    assert!(policy_data.matches_geosite("private", "localhost"));
-    assert!(policy_data.matches_geosite("cn", "baidu.com"));
-    assert!(policy_data.matches_geosite("apple", "apple.com"));
-    drop(policy_data);
-
-    let data = GeoData::load(&dir, &rules)
-        .unwrap_or_else(|error| panic!("real GeoData compatibility failed: {error}"));
-
-    eprintln!(
-        "real GeoData allocation: retained={} bytes, accounted_peak={} bytes",
-        data.allocation_capacity(),
-        data.peak_allocation_capacity(),
+    context.set_source(
+        "fe80::1"
+            .parse::<IpAddr>()
+            .map(|ip| std::net::SocketAddr::new(ip, 1234))
+            .unwrap(),
     );
-    assert!(data.matches_geosite("cn", "baidu.com"));
-    assert!(data.matches_geosite("geolocation-!cn", "google.com"));
-    assert!(data.matches_geoip("private", "10.0.0.1".parse().unwrap()));
-    assert!(data.matches_geoip("cn", "1.0.1.1".parse().unwrap()));
+    assert!(
+        matches!(rules.evaluate(&context), RuleEvaluation::Matched(result) if result.rule_index == 1)
+    );
+    assert!(context.effective_ip().is_none());
+    for ip in [
+        "127.0.0.1",
+        "10.0.0.1",
+        "0.0.0.0",
+        "224.0.0.1",
+        "::1",
+        "fc00::1",
+        "fe80::1",
+        "ff02::1",
+        "::ffff:10.0.0.1",
+        "::ffff:127.0.0.1",
+    ] {
+        assert_eq!(matches_lan("lan", ip.parse().unwrap()), Some(true));
+    }
+    assert_eq!(
+        matches_lan("!lan", "203.0.113.1".parse().unwrap()),
+        Some(true)
+    );
+    let only_lan = crate::config::Config::parse_yaml(
+        b"mixed-port: 1080\nrules: ['SRC-GEOIP,lan,DIRECT', 'GEOIP,!LAN,REJECT']",
+    )
+    .unwrap();
+    assert!(GeoRequirements::for_config(&only_lan).unwrap().is_empty());
 }

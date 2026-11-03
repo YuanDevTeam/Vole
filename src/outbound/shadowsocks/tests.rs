@@ -5,81 +5,8 @@ use crate::{
     session::InboundKind,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use shadowsocks::relay::tcprelay::proxy_stream::{ProxyServerStream, protocol::TcpRequestHeader};
+use shadowsocks::relay::tcprelay::proxy_stream::ProxyServerStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-// A lower-level codec peer, deliberately not a conforming SS server. It keeps
-// adapter scheduling/half-close checks independent of upstream's randomized
-// zero-padding rejection. Strict acceptance and rejection have separate,
-// deterministic fixtures in tests/shadowsocks_backpressure.rs.
-struct CodecPeer {
-    stream: shadowsocks::relay::tcprelay::crypto_io::CryptoStream<tokio::io::DuplexStream>,
-    context: Arc<Context>,
-}
-impl CodecPeer {
-    fn new(
-        raw: tokio::io::DuplexStream,
-        method: shadowsocks::crypto::CipherKind,
-        key: &[u8],
-    ) -> Self {
-        let context = Context::new_shared(ServerType::Server);
-        Self {
-            stream: shadowsocks::relay::tcprelay::crypto_io::CryptoStream::from_stream(
-                &context,
-                raw,
-                shadowsocks::relay::tcprelay::crypto_io::StreamType::Server,
-                method,
-                key,
-            ),
-            context,
-        }
-    }
-    async fn header(&mut self) -> shadowsocks::relay::socks5::Address {
-        let header = TcpRequestHeader::read_from(self.stream.method(), self)
-            .await
-            .unwrap();
-        let nonce = self.stream.received_nonce().unwrap().to_vec();
-        self.stream.set_request_nonce(&nonce);
-        header.addr()
-    }
-}
-impl tokio::io::AsyncRead for CodecPeer {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        out: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        use shadowsocks::relay::tcprelay::crypto_io::CryptoRead;
-        let this = self.get_mut();
-        std::pin::Pin::new(&mut this.stream)
-            .poll_read_decrypted(cx, &this.context, out)
-            .map_err(Into::into)
-    }
-}
-impl tokio::io::AsyncWrite for CodecPeer {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        data: &[u8],
-    ) -> std::task::Poll<io::Result<usize>> {
-        use shadowsocks::relay::tcprelay::crypto_io::CryptoWrite;
-        std::pin::Pin::new(&mut self.stream)
-            .poll_write_encrypted(cx, data)
-            .map_err(Into::into)
-    }
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        self.stream.poll_flush(cx).map_err(Into::into)
-    }
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        self.stream.poll_shutdown(cx).map_err(Into::into)
-    }
-}
 
 fn config(cipher: ShadowsocksCipher) -> ShadowsocksOutboundConfig {
     ShadowsocksOutboundConfig {
@@ -87,7 +14,7 @@ fn config(cipher: ShadowsocksCipher) -> ShadowsocksOutboundConfig {
         port: 12345,
         cipher,
         password: STANDARD.encode(vec![7; cipher.key_len()]),
-        shadow_tls: None,
+        plugin: None,
         udp_over_tcp: false,
     }
 }
@@ -99,7 +26,7 @@ async fn official_tcp_codecs_all_ciphers_first_payload_read_first_and_backpressu
         ShadowsocksCipher::Aes256Gcm,
         ShadowsocksCipher::Chacha20Poly1305,
     ] {
-        for server_first in [false, true] {
+        for start in ["payload", "read", "empty-write"] {
             let config = config(cipher);
             let method = cipher.as_str().parse().unwrap();
             let key = vec![7; cipher.key_len()];
@@ -107,18 +34,25 @@ async fn official_tcp_codecs_all_ciphers_first_payload_read_first_and_backpressu
                 ServerConfig::new(("127.0.0.1", 12345), config.password, method).unwrap();
             let target = Destination::domain("fixture.invalid", 443).unwrap();
             let (client, server) = tokio::io::duplex(4096);
-            let inner = shadowsocks::ProxyClientStream::from_stream(
+            let mut client = stream::SsStream::new(
                 Context::new_shared(ServerType::Local),
                 Box::new(client) as BoxStream,
                 &server_config,
                 address(&target),
             );
-            let mut client = stream::SsStream::new(inner);
-            let mut server = CodecPeer::new(server, method, &key);
+            let mut server = ProxyServerStream::from_stream(
+                Context::new_shared(ServerType::Server),
+                server,
+                method,
+                &key,
+            );
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 tokio::join!(
                     async {
-                        if server_first {
+                        if start == "empty-write" {
+                            assert_eq!(client.write(&[]).await.unwrap(), 0);
+                        }
+                        if start != "payload" {
                             let mut hello = [0; 5];
                             client.read_exact(&mut hello).await.unwrap();
                             assert_eq!(&hello, b"hello");
@@ -132,8 +66,8 @@ async fn official_tcp_codecs_all_ciphers_first_payload_read_first_and_backpressu
                         assert_eq!(result, b"response");
                     },
                     async {
-                        assert_eq!(server.header().await, address(&target));
-                        if server_first {
+                        assert_eq!(server.handshake().await.unwrap(), address(&target));
+                        if start != "payload" {
                             server.write_all(b"hello").await.unwrap();
                         }
                         let mut payload = Vec::new();
@@ -173,13 +107,12 @@ async fn official_tcp_codecs_all_ciphers_empty_half_close_keeps_response() {
             if start != "fresh" {
                 socket.write_all(&prefill).await.unwrap();
             }
-            let inner = shadowsocks::ProxyClientStream::from_stream(
+            let mut client = stream::SsStream::new(
                 Context::new_shared(ServerType::Local),
                 Box::new(socket) as BoxStream,
                 &server_config,
                 address(&target),
             );
-            let mut client = stream::SsStream::new(inner);
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 if start != "fresh" {
                     // Cancel after one poll, then let shutdown resume the same
@@ -199,7 +132,12 @@ async fn official_tcp_codecs_all_ciphers_empty_half_close_keeps_response() {
                     assert_eq!(prefill, [0x5a; 4095]);
                 }
                 client.shutdown().await.unwrap();
-                let mut server = CodecPeer::new(peer, method, &vec![7; cipher.key_len()]);
+                let mut server = ProxyServerStream::from_stream(
+                    Context::new_shared(ServerType::Server),
+                    peer,
+                    method,
+                    &vec![7; cipher.key_len()],
+                );
                 tokio::join!(
                     async {
                         let mut response = Vec::new();
@@ -207,7 +145,7 @@ async fn official_tcp_codecs_all_ciphers_empty_half_close_keeps_response() {
                         assert_eq!(response, b"hello");
                     },
                     async {
-                        assert_eq!(server.header().await, address(&target));
+                        assert_eq!(server.handshake().await.unwrap(), address(&target));
                         let mut payload = Vec::new();
                         server.read_to_end(&mut payload).await.unwrap();
                         assert!(payload.is_empty());
@@ -242,6 +180,7 @@ async fn ss_physical_tcp_uses_shared_dialer_and_logical_target() {
     .unwrap();
     let target = Destination::domain("fixture.invalid", 443).unwrap();
     let session = StreamSession {
+        metadata: Default::default(),
         inbound: InboundKind::Http,
         source: "127.0.0.1:10000".parse().unwrap(),
         destination: target.clone(),
@@ -280,7 +219,6 @@ async fn ss_physical_tcp_uses_shared_dialer_and_logical_target() {
     })
     .await
     .unwrap();
-    assert_eq!(log::STATIC_MAX_LEVEL, log::LevelFilter::Off);
     assert!(!format!("{outbound:?}").contains(&config.password));
 }
 
@@ -325,6 +263,8 @@ async fn tcp_response_header_time_salt_auth_and_fragmentation_follow_official_co
             "future",
             "wrong-type",
             "wrong-request-salt",
+            "wrong-request-salt-empty-response",
+            "wrong-request-salt-header-only",
             "corrupt",
             "short-fixed-header",
         ] {
@@ -333,17 +273,16 @@ async fn tcp_response_header_time_salt_auth_and_fragmentation_follow_official_co
             let server =
                 ServerConfig::new(("127.0.0.1", 12345), STANDARD.encode(&key), cipher).unwrap();
             let (client, mut peer) = tokio::io::duplex(4096);
-            let inner = shadowsocks::ProxyClientStream::from_stream(
+            let mut client = stream::SsStream::new(
                 Context::new_shared(ServerType::Local),
                 Box::new(client) as BoxStream,
                 &server,
-                ("private-target.invalid".to_owned(), 80),
+                ("private-target.invalid".to_owned(), 80).into(),
             );
-            let mut client = stream::SsStream::new(inner);
             client.write_all(b"private-payload").await.unwrap();
             let mut request_salt = vec![0; method.key_len()];
             peer.read_exact(&mut request_salt).await.unwrap();
-            if case == "wrong-request-salt" {
+            if case.starts_with("wrong-request-salt") {
                 request_salt[0] ^= 1;
             }
             let response_salt = vec![9; method.key_len()];
@@ -359,7 +298,8 @@ async fn tcp_response_header_time_salt_auth_and_fragmentation_follow_official_co
             let mut header = vec![if case == "wrong-type" { 0 } else { 1 }];
             header.extend_from_slice(&timestamp.to_be_bytes());
             header.extend_from_slice(&request_salt);
-            header.extend_from_slice(&1u16.to_be_bytes());
+            let body_length = u16::from(case != "wrong-request-salt-empty-response");
+            header.extend_from_slice(&body_length.to_be_bytes());
             header.extend_from_slice(&[0; 16]);
             let mut codec = TcpCipher::new(cipher, &key, &response_salt);
             codec.encrypt_packet(&mut header);
@@ -372,7 +312,7 @@ async fn tcp_response_header_time_salt_auth_and_fragmentation_follow_official_co
                 wire.truncate(wire.len() - 1);
             }
             peer.write_all(&wire).await.unwrap();
-            let mut body = vec![0x5a; 1];
+            let mut body = vec![0x5a; usize::from(body_length)];
             body.extend_from_slice(&[0; 16]);
             codec.encrypt_packet(&mut body);
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -390,7 +330,13 @@ async fn tcp_response_header_time_salt_auth_and_fragmentation_follow_official_co
                             }
                         }
                     );
+                } else if case == "wrong-request-salt-header-only" {
+                    let error = client.read(&mut [0; 1]).await.unwrap_err();
+                    assert_eq!(error.to_string(), "Shadowsocks stream operation failed");
                 } else {
+                    if case == "wrong-request-salt-empty-response" {
+                        peer.write_all(&body).await.unwrap();
+                    }
                     peer.shutdown().await.unwrap();
                     let error = client.read(&mut [0; 1]).await.unwrap_err();
                     assert_eq!(error.to_string(), "Shadowsocks stream operation failed");
@@ -446,6 +392,7 @@ async fn physical_tcp_udp_protection_is_shared_and_fails_closed() {
         )
         .unwrap();
         let session = StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::Socks5,
             source: "127.0.0.1:10000".parse().unwrap(),
             destination: Destination::domain("private-target.invalid", 443).unwrap(),

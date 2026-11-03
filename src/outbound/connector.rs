@@ -1,13 +1,13 @@
+use crate::routing::GroupSelection;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::HashMap,
     fmt::{self, Write as _},
     future::Future,
     io,
-    net::IpAddr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -210,9 +210,15 @@ pub struct EstablishContext {
     deadline: Instant,
     resolution: ResolutionContext,
     selections: Arc<Mutex<SelectionSnapshot>>,
+    inbound: crate::session::InboundMetadata,
+    source: Option<SocketAddr>,
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    tcp_control: Option<crate::dialer::tcp_control::Capture>,
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    h3_udp: Option<crate::transport::xhttp::UdpAssociationCapture>,
 }
 
-type SelectionSnapshot = HashMap<usize, (Arc<AtomicUsize>, usize)>;
+type SelectionSnapshot = HashMap<usize, (Arc<GroupSelection>, usize)>;
 
 impl EstablishContext {
     #[must_use]
@@ -226,7 +232,126 @@ impl EstablishContext {
             deadline: inherited_deadline(Instant::now() + duration),
             resolution,
             selections: Arc::new(Mutex::new(HashMap::new())),
+            inbound: Default::default(),
+            source: None,
+            #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+            tcp_control: None,
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            h3_udp: None,
         }
+    }
+
+    #[cfg(any(feature = "outbound-wireguard", feature = "outbound-masque"))]
+    pub(crate) fn with_metadata(mut self, metadata: &crate::session::InboundMetadata) -> Self {
+        self.inbound = metadata.clone();
+        self
+    }
+
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    pub(crate) fn capture_tcp_control(&self, capture: crate::dialer::tcp_control::Capture) -> Self {
+        let mut context = self.clone();
+        context.tcp_control = Some(capture);
+        context
+    }
+
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    fn without_tcp_control(&self) -> Self {
+        let mut context = self.clone();
+        if let Some(capture) = context.tcp_control.take() {
+            capture.report(None);
+        }
+        context
+    }
+
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn captures_tcp_control(&self) -> bool {
+        #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+        {
+            self.tcp_control.is_some()
+        }
+        #[cfg(not(all(target_os = "linux", feature = "sing-mux")))]
+        {
+            false
+        }
+    }
+
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    pub(crate) fn capture_h3_udp(
+        &self,
+        capture: crate::transport::xhttp::UdpAssociationCapture,
+    ) -> Self {
+        let mut context = self.clone();
+        context.h3_udp = Some(capture);
+        context
+    }
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    pub(crate) fn h3_udp_capture(&self) -> Option<&crate::transport::xhttp::UdpAssociationCapture> {
+        self.h3_udp.as_ref()
+    }
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    fn without_h3_udp(&self) -> Self {
+        let mut context = self.clone();
+        context.h3_udp = None;
+        context
+    }
+
+    /// MASQUE's positive timeout owns shared creation independently of a
+    /// waiting caller. Preserve its selected upstreams and inbound identity.
+    #[cfg(feature = "outbound-masque")]
+    pub(crate) fn masque_handshake(&self, seconds: i64) -> Self {
+        // Go's time.Duration multiplication wraps at signed nanoseconds.
+        let nanos = seconds.wrapping_mul(1_000_000_000);
+        let now = Instant::now();
+        Self {
+            deadline: if nanos > 0 {
+                now + Duration::from_nanos(nanos as u64)
+            } else {
+                now
+            },
+            resolution: self.resolution.clone(),
+            selections: Arc::new(Mutex::new(
+                self.selections
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            )),
+            inbound: self.inbound.clone(),
+            source: self.source,
+            #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+            tcp_control: None,
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            h3_udp: None,
+        }
+    }
+
+    /// A positive Hysteria2 timeout belongs to its shared offer, not to the
+    /// first caller waiting for it. Preserve already selected upstreams.
+    #[cfg(feature = "outbound-hysteria2")]
+    pub(crate) fn hysteria2_handshake(&self, timeout: Duration) -> Result<Self, DispatchError> {
+        Ok(Self {
+            deadline: Instant::now()
+                .checked_add(timeout)
+                .ok_or(DispatchError::TimedOut)?,
+            resolution: self.resolution.clone(),
+            selections: Arc::new(Mutex::new(
+                self.selections
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            )),
+            inbound: self.inbound.clone(),
+            source: self.source,
+            #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+            tcp_control: None,
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            h3_udp: None,
+        })
+    }
+
+    #[cfg(feature = "outbound-wireguard")]
+    pub(crate) fn capped_by(mut self, deadline: Instant) -> Self {
+        self.deadline = self.deadline.min(inherited_deadline(deadline));
+        self
     }
 
     #[must_use]
@@ -248,11 +373,17 @@ impl EstablishContext {
     /// Only for a new physical path of an already authenticated session, never
     /// for extending an in-progress setup. Freeze its group choices and give
     /// this socket's complete upstream establishment a new absolute deadline.
-    #[cfg(feature = "outbound-hysteria2")]
+    #[cfg(any(test, feature = "outbound-hysteria2", feature = "outbound-wireguard"))]
     pub(crate) fn authenticated_continuation(&self) -> Self {
         Self {
             deadline: Instant::now() + DEFAULT_ESTABLISH_TIMEOUT,
             resolution: self.resolution.clone(),
+            inbound: self.inbound.clone(),
+            source: self.source,
+            #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+            tcp_control: None,
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            h3_udp: None,
             selections: Arc::new(Mutex::new(
                 self.selections
                     .lock()
@@ -265,7 +396,8 @@ impl EstablishContext {
     /// One read per group for the entire setup, including both legs of a
     /// SOCKS5 UDP association. Retaining the atomic prevents address reuse;
     /// unrelated groups are not an atomic cross-group snapshot.
-    fn selected_member(&self, selection: &Arc<AtomicUsize>) -> usize {
+    fn selected_member(&self, selection: &Arc<GroupSelection>, destination: &Destination) -> usize {
+        selection.touch();
         let key = Arc::as_ptr(selection) as usize;
         let mut selections = self
             .selections
@@ -273,8 +405,23 @@ impl EstablishContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         selections
             .entry(key)
-            .or_insert_with(|| (selection.clone(), selection.load(Ordering::Acquire)))
+            .or_insert_with(|| {
+                (
+                    selection.clone(),
+                    selection.choose_for(
+                        self.source,
+                        Some(destination),
+                        self.inbound.user.as_deref(),
+                    ),
+                )
+            })
             .1
+    }
+
+    fn report_group_outcome(&self, success: bool) {
+        for (selection, _) in self.selections.lock().unwrap().values() {
+            selection.outcome(success);
+        }
     }
 
     pub async fn run<T, F>(&self, operation: &'static str, future: F) -> Result<T, DispatchError>
@@ -352,6 +499,7 @@ impl std::fmt::Debug for ConnectedStream {
 pub struct DatagramRequest {
     pub session: DatagramSession,
     budget: crate::dispatch::DatagramBudget,
+    udp_receive_buffer_size: Option<usize>,
 }
 
 impl DatagramRequest {
@@ -361,6 +509,7 @@ impl DatagramRequest {
         Self {
             session,
             budget: crate::dispatch::DatagramBudget::new(u16::MAX, max_response_payload_size),
+            udp_receive_buffer_size: None,
         }
     }
 
@@ -374,6 +523,7 @@ impl DatagramRequest {
         Self {
             session: self.session.clone(),
             budget: crate::dispatch::DatagramBudget::new(self.budget.transmit(), maximum),
+            udp_receive_buffer_size: self.udp_receive_buffer_size,
         }
     }
 
@@ -386,9 +536,30 @@ impl DatagramRequest {
         Self {
             session: self.session.clone(),
             budget,
+            udp_receive_buffer_size: self.udp_receive_buffer_size,
         }
     }
 
+    /// Best-effort hint for a locally owned physical UDP socket.
+    /// This is independent of logical payload and receive credit limits.
+    #[cfg(any(
+        feature = "outbound-mieru",
+        feature = "outbound-hysteria2",
+        feature = "outbound-tuic",
+        feature = "outbound-masque",
+        feature = "outbound-wireguard"
+    ))]
+    pub(crate) fn with_udp_receive_buffer_size(&self, size: usize) -> Self {
+        let mut request = self.clone();
+        request.udp_receive_buffer_size = Some(size);
+        request
+    }
+
+    pub(crate) fn udp_socket_options(&self) -> crate::dialer::UdpSocketOptions {
+        crate::dialer::UdpSocketOptions {
+            receive_buffer: self.udp_receive_buffer_size,
+        }
+    }
     /// Budget the wire envelope independently in each direction. A larger
     /// requested envelope can never increase a lower transport's real cap.
     pub fn with_envelope(&self, transmit: usize, receive: usize) -> Self {
@@ -438,8 +609,9 @@ pub trait OutboundConnector: Send + Sync {
 /// never a registry of all nodes, so a validated DAG cannot form an Arc cycle.
 /// The atomic is shared with the route/Controller view of the same group.
 pub struct SelectUpstream {
-    selection: Arc<AtomicUsize>,
+    selection: Arc<GroupSelection>,
     members: Box<[SelectUpstreamMember]>,
+    disable_udp: bool,
 }
 
 pub(crate) enum SelectUpstreamMember {
@@ -447,20 +619,51 @@ pub(crate) enum SelectUpstreamMember {
     Group(Arc<SelectUpstream>),
     Direct,
     Reject,
+    Control,
 }
 
 impl SelectUpstream {
-    pub(crate) fn new(selection: Arc<AtomicUsize>, members: Vec<SelectUpstreamMember>) -> Self {
+    pub(crate) fn new(selection: Arc<GroupSelection>, members: Vec<SelectUpstreamMember>) -> Self {
         Self {
             selection,
             members: members.into_boxed_slice(),
+            disable_udp: false,
         }
     }
 
-    fn resolve(&self, context: &EstablishContext) -> Result<&SelectUpstreamMember, DispatchError> {
+    pub(crate) fn with_udp_disabled(mut self, disabled: bool) -> Self {
+        self.disable_udp = disabled;
+        self
+    }
+    fn check_udp(
+        &self,
+        context: &EstablishContext,
+        destination: &Destination,
+    ) -> Result<(), DispatchError> {
         let mut group = self;
         loop {
-            let selected = context.selected_member(&group.selection);
+            if group.disable_udp {
+                return Err(DispatchError::NotAllowed);
+            }
+            match group
+                .members
+                .get(context.selected_member(&group.selection, destination))
+            {
+                Some(SelectUpstreamMember::Group(next)) => group = next,
+                Some(_) => return Ok(()),
+                None => return Err(DispatchError::NotAllowed),
+            }
+        }
+    }
+
+    fn resolve(
+        &self,
+        context: &EstablishContext,
+        destination: &Destination,
+    ) -> Result<&SelectUpstreamMember, DispatchError> {
+        let mut group = self;
+        loop {
+            let selected = context.selected_member(&group.selection, destination);
             match group.members.get(selected) {
                 Some(SelectUpstreamMember::Group(next)) => group = next,
                 Some(leaf) => return Ok(leaf),
@@ -474,14 +677,45 @@ impl SelectUpstream {
     }
 }
 
+async fn connect_direct_server(
+    dialer: &Dialer,
+    endpoint: &ResolvedEndpoint,
+    context: &EstablishContext,
+) -> Result<ConnectedStream, DispatchError> {
+    let stream = context
+        .run_io("physical proxy-server connect", async {
+            #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+            if context.tcp_control.is_some() {
+                return dialer
+                    .connect_server_tcp_controlled(endpoint, context.deadline())
+                    .await;
+            }
+            dialer
+                .connect_server_tcp(endpoint, context.deadline())
+                .await
+        })
+        .await?;
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    if let Some(capture) = &context.tcp_control {
+        capture.report(stream.control);
+    }
+    Ok(ConnectedStream {
+        io: stream.io,
+        effective_peer: Destination::Ip(stream.address),
+    })
+}
+
 enum ResolvedUpstream<'a> {
     Direct(&'a ResolvedEndpoint, &'a Dialer),
+    LazyDirect(&'a Dialer),
     Proxy(&'a Arc<dyn OutboundConnector>),
 }
 
 /// The path used by one configured proxy to reach its own server.
 #[derive(Clone)]
 pub enum UpstreamPath {
+    /// Physical endpoint resolution belongs to the current runtime DNS role.
+    LazyDirect { dialer: Dialer },
     /// The physical first hop. Its endpoint was resolved during prepare.
     Direct {
         endpoint: ResolvedEndpoint,
@@ -493,6 +727,7 @@ pub enum UpstreamPath {
     /// A runtime select group. DIRECT is relative to this node's prepared
     /// server, not the business destination or the ordinary routing engine.
     Group {
+        server: Destination,
         group: Arc<SelectUpstream>,
         endpoint: Option<ResolvedEndpoint>,
         dialer: Dialer,
@@ -507,6 +742,7 @@ impl std::fmt::Debug for UpstreamPath {
                 .field("endpoint", endpoint)
                 .field("dialer", dialer)
                 .finish(),
+            Self::LazyDirect { .. } => formatter.write_str("LazyDirectUpstream(..)"),
             Self::Proxy(_) => formatter.write_str("ProxyUpstream(..)"),
             Self::Group { .. } => formatter.write_str("GroupUpstream(..)"),
         }
@@ -514,6 +750,41 @@ impl std::fmt::Debug for UpstreamPath {
 }
 
 impl UpstreamPath {
+    /// A multi-endpoint node shares the declared graph, while each
+    /// physical peer has its own server and may refresh a previously pinned IP.
+    #[cfg(any(
+        feature = "outbound-wireguard",
+        feature = "outbound-mieru",
+        feature = "outbound-hysteria2"
+    ))]
+    pub(crate) fn for_server(&self, server: &Destination, refresh: bool) -> Self {
+        match self {
+            Self::Direct { endpoint, dialer }
+                if refresh || validate_prepared_endpoint(server, endpoint).is_err() =>
+            {
+                Self::LazyDirect {
+                    dialer: dialer.clone(),
+                }
+            }
+            Self::Group {
+                server: original,
+                group,
+                endpoint,
+                dialer,
+            } => Self::Group {
+                server: server.clone(),
+                group: group.clone(),
+                endpoint: if refresh || original != server {
+                    None
+                } else {
+                    endpoint.clone()
+                },
+                dialer: dialer.clone(),
+            },
+            _ => self.clone(),
+        }
+    }
+
     #[must_use]
     pub const fn direct(endpoint: ResolvedEndpoint, dialer: Dialer) -> Self {
         Self::Direct { endpoint, dialer }
@@ -524,30 +795,52 @@ impl UpstreamPath {
         Self::Proxy(connector)
     }
 
+    /// Structural proof for one private VLESS leg; never resolves a group.
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn static_h2_dialer(&self, server: &Destination) -> Option<&Dialer> {
+        let Destination::Ip(address) = server else {
+            return None;
+        };
+        let dialer = match self {
+            Self::LazyDirect { dialer } => dialer,
+            Self::Direct { endpoint, dialer }
+                if endpoint.port == address.port()
+                    && endpoint.logical_host.parse::<IpAddr>().ok() == Some(address.ip())
+                    && endpoint.addresses.as_slice() == std::slice::from_ref(address) =>
+            {
+                dialer
+            }
+            _ => return None,
+        };
+        dialer.permits_static_h2_reuse().then_some(dialer)
+    }
+
     pub(crate) fn is_direct(&self, context: &EstablishContext) -> Result<bool, DispatchError> {
         Ok(matches!(
             self.resolve(context)?,
-            ResolvedUpstream::Direct(..)
+            ResolvedUpstream::Direct(..) | ResolvedUpstream::LazyDirect(..)
         ))
     }
 
     fn resolve(&self, context: &EstablishContext) -> Result<ResolvedUpstream<'_>, DispatchError> {
         match self {
             Self::Direct { endpoint, dialer } => Ok(ResolvedUpstream::Direct(endpoint, dialer)),
+            Self::LazyDirect { dialer } => Ok(ResolvedUpstream::LazyDirect(dialer)),
             Self::Proxy(connector) => Ok(ResolvedUpstream::Proxy(connector)),
             Self::Group {
                 group,
                 endpoint,
                 dialer,
-            } => match group.resolve(context)? {
+                server,
+            } => match group.resolve(context, server)? {
                 SelectUpstreamMember::Proxy(connector) => Ok(ResolvedUpstream::Proxy(connector)),
                 SelectUpstreamMember::Direct => endpoint
                     .as_ref()
                     .map(|endpoint| ResolvedUpstream::Direct(endpoint, dialer))
-                    .ok_or_else(|| {
-                        DispatchError::Other("DIRECT upstream has no prepared endpoint".to_owned())
-                    }),
-                SelectUpstreamMember::Reject => Err(DispatchError::NotAllowed),
+                    .map_or_else(|| Ok(ResolvedUpstream::LazyDirect(dialer)), Ok),
+                SelectUpstreamMember::Reject | SelectUpstreamMember::Control => {
+                    Err(DispatchError::NotAllowed)
+                }
                 SelectUpstreamMember::Group(_) => {
                     unreachable!("upstream resolution returns a leaf")
                 }
@@ -565,17 +858,31 @@ impl UpstreamPath {
         match self.resolve(context)? {
             ResolvedUpstream::Direct(endpoint, dialer) => {
                 validate_prepared_endpoint(server, endpoint)?;
-                let stream = context
-                    .run_io("physical proxy-server connect", dialer.connect(endpoint))
-                    .await?;
-                let effective_peer =
-                    Destination::Ip(stream.peer_addr().map_err(DispatchError::from)?);
-                Ok(ConnectedStream {
-                    io: Box::new(stream),
-                    effective_peer,
-                })
+                connect_direct_server(dialer, endpoint, context).await
             }
-            ResolvedUpstream::Proxy(connector) => connector.connect_stream(session, context).await,
+            ResolvedUpstream::LazyDirect(dialer) => {
+                let endpoint = context
+                    .resolution
+                    .clone()
+                    .with_ip_version(dialer.ip_version())
+                    .with_physical_dialer(dialer)
+                    .resolve_proxy(server, context.deadline)
+                    .await?;
+                connect_direct_server(dialer, &endpoint, context).await
+            }
+            ResolvedUpstream::Proxy(connector) => {
+                #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+                let unbound = context.without_h3_udp();
+                #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+                let context = &unbound;
+                #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+                if context.tcp_control.is_some() {
+                    return connector
+                        .connect_stream(session, &context.without_tcp_control())
+                        .await;
+                }
+                connector.connect_stream(session, context).await
+            }
         }
     }
 
@@ -584,32 +891,119 @@ impl UpstreamPath {
         request: DatagramRequest,
         context: &EstablishContext,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        if let Self::Group { group, server, .. } = self {
+            group.check_udp(context, server)?;
+        }
         match self.resolve(context)? {
-            ResolvedUpstream::Direct(_, dialer) => {
+            ResolvedUpstream::Direct(_, dialer) | ResolvedUpstream::LazyDirect(dialer) => {
                 let direct = DirectOutbound::new(dialer.clone());
                 OutboundConnector::open_datagram(&direct, request, context).await
             }
-            ResolvedUpstream::Proxy(connector) => connector.open_datagram(request, context).await,
+            ResolvedUpstream::Proxy(connector) => {
+                #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+                let unbound = context.without_h3_udp();
+                #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+                let context = &unbound;
+                connector.open_datagram(request, context).await
+            }
         }
     }
 
-    /// Pins a native UDP proxy server without performing DNS after prepare.
+    /// Pins a native UDP server using the node resolver when first needed.
     /// Resolving here and opening IO below share the context's group snapshot.
     #[cfg(any(
-        feature = "outbound-shadowsocks",
+        feature = "outbound-vmess",
         feature = "outbound-vless",
         feature = "outbound-hysteria2",
-        feature = "outbound-tuic"
+        feature = "outbound-tuic",
+        feature = "outbound-trusttunnel",
+        feature = "outbound-mieru",
+        feature = "outbound-masque"
     ))]
-    pub(crate) fn datagram_server(
+    pub(crate) async fn datagram_server(
         &self,
         server: &Destination,
         context: &EstablishContext,
     ) -> Result<Destination, DispatchError> {
+        self.resolve_datagram_server(server, context, false).await
+    }
+
+    /// Only SS2022/WireGuard use IP4P when resolving their native UDP server.
+    #[cfg(any(feature = "outbound-shadowsocks", feature = "outbound-wireguard"))]
+    pub(crate) async fn ip4p_datagram_server(
+        &self,
+        server: &Destination,
+        context: &EstablishContext,
+    ) -> Result<Destination, DispatchError> {
+        self.resolve_datagram_server(server, context, true).await
+    }
+
+    #[cfg(feature = "outbound-socks5")]
+    pub(crate) fn ip4p_datagram_relay(
+        &self,
+        relay: Destination,
+        context: &EstablishContext,
+    ) -> Result<Destination, DispatchError> {
+        Ok(match (self.resolve(context)?, relay) {
+            (
+                ResolvedUpstream::Direct(_, dialer) | ResolvedUpstream::LazyDirect(dialer),
+                Destination::Ip(address),
+            ) => Destination::Ip(
+                dialer
+                    .connected_address(address)
+                    .map_err(DispatchError::from)?,
+            ),
+            (_, relay) => relay,
+        })
+    }
+
+    #[cfg(any(
+        feature = "outbound-vmess",
+        feature = "outbound-shadowsocks",
+        feature = "outbound-vless",
+        feature = "outbound-hysteria2",
+        feature = "outbound-tuic",
+        feature = "outbound-trusttunnel",
+        feature = "outbound-mieru",
+        feature = "outbound-masque",
+        feature = "outbound-wireguard"
+    ))]
+    async fn resolve_datagram_server(
+        &self,
+        server: &Destination,
+        context: &EstablishContext,
+        ip4p: bool,
+    ) -> Result<Destination, DispatchError> {
         match self.resolve(context)? {
-            ResolvedUpstream::Direct(endpoint, _) => {
+            ResolvedUpstream::Direct(endpoint, dialer) => {
                 validate_prepared_endpoint(server, endpoint)?;
-                endpoint
+                if ip4p {
+                    dialer
+                        .validate_connected_endpoint(endpoint)
+                        .map_err(DispatchError::from)?;
+                }
+                let addresses = if ip4p {
+                    dialer.ordered_connected_addresses(&endpoint.addresses)
+                } else {
+                    dialer.ordered_addresses(&endpoint.addresses)
+                };
+                addresses
+                    .first()
+                    .copied()
+                    .map(Destination::Ip)
+                    .ok_or(DispatchError::HostUnreachable)
+            }
+            ResolvedUpstream::LazyDirect(dialer) => {
+                let mut resolution = context
+                    .resolution
+                    .clone()
+                    .with_ip_version(dialer.ip_version());
+                if ip4p {
+                    resolution = resolution.with_physical_dialer(dialer);
+                }
+                resolution
+                    .resolve_proxy(server, context.deadline)
+                    .await?
                     .addresses
                     .first()
                     .copied()
@@ -618,6 +1012,38 @@ impl UpstreamPath {
             }
             ResolvedUpstream::Proxy(_) => Ok(server.clone()),
         }
+    }
+}
+
+pub(crate) struct IpVersionConnector {
+    pub inner: Arc<dyn OutboundConnector>,
+    pub version: crate::config::IpVersion,
+}
+#[async_trait]
+impl OutboundConnector for IpVersionConnector {
+    async fn connect_stream(
+        &self,
+        session: StreamSession,
+        context: &EstablishContext,
+    ) -> Result<ConnectedStream, DispatchError> {
+        let mut context = context.clone();
+        context.resolution = context.resolution.with_ip_version(self.version);
+        self.inner.connect_stream(session, &context).await
+    }
+    async fn open_datagram(
+        &self,
+        request: DatagramRequest,
+        context: &EstablishContext,
+    ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        let mut context = context.clone();
+        context.resolution = context.resolution.with_ip_version(self.version);
+        self.inner.open_datagram(request, &context).await
+    }
+    fn begin_shutdown(&self) {
+        self.inner.begin_shutdown();
+    }
+    async fn shutdown(&self) {
+        self.inner.shutdown().await;
     }
 }
 
@@ -697,18 +1123,32 @@ impl ConnectorDispatcher {
         self
     }
 
-    fn context(&self) -> EstablishContext {
-        EstablishContext::with_resolution(DEFAULT_ESTABLISH_TIMEOUT, self.resolution.clone())
+    fn context(
+        &self,
+        source: SocketAddr,
+        metadata: &crate::session::InboundMetadata,
+    ) -> EstablishContext {
+        let mut context =
+            EstablishContext::with_resolution(DEFAULT_ESTABLISH_TIMEOUT, self.resolution.clone());
+        context.inbound = metadata.clone();
+        context.source = Some(source);
+        context
     }
 }
 
 #[async_trait]
 impl Dispatcher for ConnectorDispatcher {
+    fn supports_udp(&self) -> bool {
+        self.allow_udp
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
-        self.inner
-            .connect_stream(session, &self.context())
-            .await
-            .map(|connected| connected.io)
+        let context = self.context(session.source, &session.metadata);
+        let result = self.inner.connect_stream(session, &context).await;
+        if !matches!(result, Err(DispatchError::NotAllowed)) {
+            context.report_group_outcome(result.is_ok());
+        }
+        result.map(|connected| connected.io)
     }
 
     async fn open_datagram(
@@ -718,8 +1158,9 @@ impl Dispatcher for ConnectorDispatcher {
         if !self.allow_udp {
             return Err(DispatchError::NotAllowed);
         }
+        let context = self.context(session.source, &session.metadata);
         self.inner
-            .open_datagram(DatagramRequest::new(session), &self.context())
+            .open_datagram(DatagramRequest::new(session), &context)
             .await
     }
 }
@@ -739,12 +1180,7 @@ mod tests {
     #[cfg(feature = "outbound-hysteria2")]
     #[tokio::test]
     async fn authenticated_continuation_keeps_group_choice_but_has_a_new_io_deadline() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "authenticated_continuation_keeps_group_choice_but_has_a_new_io_deadline",
-        );
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(GroupSelection::new(0));
         let path = selected_path(
             selection.clone(),
             vec![
@@ -847,6 +1283,10 @@ mod tests {
 
     #[async_trait]
     impl DatagramTransport for MarkedDatagrams {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
             self.sends.fetch_add(1, Ordering::Relaxed);
             Ok(())
@@ -862,6 +1302,7 @@ mod tests {
 
     fn test_session() -> StreamSession {
         StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::Http,
             source: "127.0.0.1:10000".parse().unwrap(),
             destination: Destination::domain("business.invalid", 443).unwrap(),
@@ -878,14 +1319,218 @@ mod tests {
     }
 
     fn selected_path(
-        selection: Arc<AtomicUsize>,
+        selection: Arc<GroupSelection>,
         members: Vec<SelectUpstreamMember>,
     ) -> UpstreamPath {
         UpstreamPath::Group {
+            server: Destination::domain("server.example", 443).unwrap(),
             group: Arc::new(SelectUpstream::new(selection, members)),
             endpoint: None,
             dialer: Dialer::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn ingress_sticky_upstream_keeps_source_ip_and_authenticated_user_precedence() {
+        struct Carrier(UpstreamPath);
+        #[async_trait]
+        impl OutboundConnector for Carrier {
+            async fn connect_stream(
+                &self,
+                session: StreamSession,
+                context: &EstablishContext,
+            ) -> Result<ConnectedStream, DispatchError> {
+                assert_eq!(context.source, Some(session.source));
+                self.0
+                    .connect_server(
+                        session,
+                        &Destination::domain("server.example", 443).unwrap(),
+                        context,
+                    )
+                    .await
+            }
+            async fn open_datagram(
+                &self,
+                request: DatagramRequest,
+                context: &EstablishContext,
+            ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+                assert_eq!(context.source, Some(request.session.source));
+                let continuation = context.authenticated_continuation();
+                assert_eq!(continuation.source, context.source);
+                #[cfg(feature = "outbound-hysteria2")]
+                assert_eq!(
+                    context.hysteria2_handshake(Duration::from_secs(1))?.source,
+                    context.source
+                );
+                #[cfg(feature = "outbound-masque")]
+                assert_eq!(context.masque_handshake(1).source, context.source);
+                self.0.open_datagram(request, &continuation).await
+            }
+        }
+
+        for hash_key in ["", "in-user"] {
+            let config = crate::config::Config::parse_yaml(
+                format!(
+                    "mixed-port: 1080\nproxy-groups:\n  - {{name: balance, type: load-balance, strategy: sticky-sessions, hash-key: '{hash_key}', proxies: [DIRECT,REJECT]}}\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let selection = Arc::new(GroupSelection::new(0));
+            selection.configure_balance(&config.proxy_groups[0]);
+            let server = Destination::domain("server.example", 443).unwrap();
+            let sources: [SocketAddr; 3] = [
+                "198.51.100.1:10000".parse().unwrap(),
+                "198.51.100.2:10000".parse().unwrap(),
+                "198.51.100.1:20000".parse().unwrap(),
+            ];
+            // Pin two address keys to different members without depending on
+            // the strategy's random first choice. Restore health afterwards.
+            for (index, source) in sources[..2].iter().enumerate() {
+                let mut healthy = [None; 2];
+                healthy[index] = Some(10);
+                selection.balance_health(&healthy);
+                assert_eq!(
+                    selection.choose_for(Some(*source), Some(&server), None),
+                    index
+                );
+            }
+            selection.balance_health(&[Some(10), Some(10)]);
+            let path = selected_path(
+                selection.clone(),
+                [1, 2]
+                    .map(|marker| {
+                        SelectUpstreamMember::Proxy(Arc::new(MarkedConnector {
+                            marker,
+                            ..Default::default()
+                        }))
+                    })
+                    .into(),
+            );
+            let dispatcher = ConnectorDispatcher::new(Arc::new(Carrier(path)));
+            for (source, expected) in sources.into_iter().zip([1, 2, 1]) {
+                let mut session = test_session();
+                session.source = source;
+                let mut stream = dispatcher.connect_tcp(session).await.unwrap();
+                assert_eq!(stream.read_u8().await.unwrap(), expected);
+                let mut udp = dispatcher
+                    .open_datagram(DatagramSession::new(InboundKind::Socks5, source))
+                    .await
+                    .unwrap();
+                assert_eq!(udp.receive().await.unwrap().payload[0], expected);
+            }
+            if hash_key == "in-user" {
+                selection.balance_health(&[None, Some(10)]);
+                assert_eq!(
+                    selection.choose_for(Some(sources[0]), Some(&server), Some("verified")),
+                    1
+                );
+                selection.balance_health(&[Some(10), Some(10)]);
+                for source in sources {
+                    let mut session = test_session();
+                    session.source = source;
+                    session.metadata.user = Some(Arc::from("verified"));
+                    let udp_session = DatagramSession::new(InboundKind::Socks5, source)
+                        .with_metadata(session.metadata.clone());
+                    let mut stream = dispatcher.connect_tcp(session).await.unwrap();
+                    assert_eq!(stream.read_u8().await.unwrap(), 2);
+                    let mut udp = dispatcher.open_datagram(udp_session).await.unwrap();
+                    assert_eq!(udp.receive().await.unwrap().payload[0], 2);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ingress_connector_dispatcher_preserves_user_for_dialer_proxy_and_continuations() {
+        struct Carrier {
+            path: UpstreamPath,
+            user: Arc<str>,
+        }
+        #[async_trait]
+        impl OutboundConnector for Carrier {
+            async fn connect_stream(
+                &self,
+                session: StreamSession,
+                context: &EstablishContext,
+            ) -> Result<ConnectedStream, DispatchError> {
+                assert_eq!(context.inbound.user.as_deref(), Some(self.user.as_ref()));
+                assert_eq!(session.metadata, context.inbound);
+                self.path
+                    .connect_server(
+                        session,
+                        &Destination::domain("server.example", 443).unwrap(),
+                        context,
+                    )
+                    .await
+            }
+            async fn open_datagram(
+                &self,
+                request: DatagramRequest,
+                context: &EstablishContext,
+            ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+                assert_eq!(context.inbound, request.session.metadata);
+                let continuation = context.authenticated_continuation();
+                assert_eq!(continuation.inbound, context.inbound);
+                self.path.open_datagram(request, &continuation).await
+            }
+        }
+        let config = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxies:
+  - {name: a, type: socks5, server: 192.0.2.10, port: 1080, udp: true}
+  - {name: b, type: socks5, server: 192.0.2.11, port: 1080, udp: true}
+proxy-groups:
+  - {name: balance, type: load-balance, proxies: [a,b], hash-key: in-user}
+"#,
+        )
+        .unwrap();
+        let selection = Arc::new(GroupSelection::new(0));
+        selection.configure_balance(&config.proxy_groups[0]);
+        let server = Destination::domain("server.example", 443).unwrap();
+        let fallback = selection.choose_for(None, Some(&server), None);
+        let user: Arc<str> = Arc::from(
+            (0..256)
+                .map(|i| format!("verified-{i}"))
+                .find(|user| selection.choose_for(None, Some(&server), Some(user)) != fallback)
+                .unwrap(),
+        );
+        let expected = selection.choose_for(None, Some(&server), Some(&user)) as u8 + 1;
+        let path = selected_path(
+            selection,
+            vec![
+                SelectUpstreamMember::Proxy(Arc::new(MarkedConnector {
+                    marker: 1,
+                    ..Default::default()
+                })),
+                SelectUpstreamMember::Proxy(Arc::new(MarkedConnector {
+                    marker: 2,
+                    ..Default::default()
+                })),
+            ],
+        );
+        let dispatcher = ConnectorDispatcher::new(Arc::new(Carrier {
+            path,
+            user: user.clone(),
+        }));
+        let metadata = crate::session::InboundMetadata {
+            local_port: 1080,
+            user: Some(user),
+            ..Default::default()
+        };
+        let mut session = test_session();
+        session.metadata = metadata.clone();
+        let mut stream = dispatcher.connect_tcp(session).await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), expected);
+        let mut udp = dispatcher
+            .open_datagram(
+                DatagramSession::new(InboundKind::Socks5, test_session().source)
+                    .with_metadata(metadata),
+            )
+            .await
+            .unwrap();
+        assert_eq!(udp.receive().await.unwrap().payload[0], expected);
     }
 
     #[tokio::test]
@@ -898,7 +1543,7 @@ mod tests {
             marker: 2,
             ..Default::default()
         });
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(GroupSelection::new(0));
         let nested = Arc::new(SelectUpstream::new(
             selection.clone(),
             vec![
@@ -906,7 +1551,7 @@ mod tests {
                 SelectUpstreamMember::Proxy(second.clone()),
             ],
         ));
-        let outer_selection = Arc::new(AtomicUsize::new(0));
+        let outer_selection = Arc::new(GroupSelection::new(0));
         let path = selected_path(
             outer_selection.clone(),
             vec![
@@ -966,7 +1611,7 @@ mod tests {
             marker: 2,
             ..Default::default()
         });
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(GroupSelection::new(0));
         let path = selected_path(
             selection.clone(),
             vec![
@@ -1015,7 +1660,7 @@ mod tests {
             gate: Some(Arc::new(Semaphore::new(0))),
             ..Default::default()
         });
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(GroupSelection::new(0));
         let connector_weak = Arc::downgrade(&connector);
         let selection_weak = Arc::downgrade(&selection);
         let path = selected_path(selection, vec![SelectUpstreamMember::Proxy(connector)]);
@@ -1035,8 +1680,9 @@ mod tests {
     async fn upstream_direct_connects_prepared_node_server_and_reject_never_falls_back() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(GroupSelection::new(0));
         let path = UpstreamPath::Group {
+            server: Destination::domain("server.example", 443).unwrap(),
             group: Arc::new(SelectUpstream::new(
                 selection.clone(),
                 vec![SelectUpstreamMember::Direct, SelectUpstreamMember::Reject],
@@ -1102,8 +1748,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let protector = Arc::new(RejectProtector(AtomicUsize::new(0)));
         let path = UpstreamPath::Group {
+            server: Destination::domain("server.example", 443).unwrap(),
             group: Arc::new(SelectUpstream::new(
-                Arc::new(AtomicUsize::new(0)),
+                Arc::new(GroupSelection::new(0)),
                 vec![SelectUpstreamMember::Direct],
             )),
             endpoint: Some(ResolvedEndpoint {
@@ -1140,7 +1787,7 @@ mod tests {
             reject_udp: true,
             ..Default::default()
         });
-        let selection = Arc::new(AtomicUsize::new(0));
+        let selection = Arc::new(GroupSelection::new(0));
         let path = selected_path(
             selection.clone(),
             vec![
@@ -1216,6 +1863,26 @@ mod tests {
             "127.0.0.1:10000".parse().unwrap(),
         );
         let request = DatagramRequest::new(session);
+        assert_eq!(request.udp_socket_options().receive_buffer, None);
+        #[cfg(any(
+            feature = "outbound-mieru",
+            feature = "outbound-hysteria2",
+            feature = "outbound-tuic",
+            feature = "outbound-masque"
+        ))]
+        {
+            let request = request.with_udp_receive_buffer_size(512 * 1024);
+            for adjusted in [
+                request.with_budget(crate::dispatch::DatagramBudget::new(1_200, 1_400)),
+                request.with_max_response_payload_size(1_714),
+                request.with_envelope(32, 64),
+            ] {
+                assert_eq!(
+                    adjusted.udp_socket_options().receive_buffer,
+                    Some(512 * 1024)
+                );
+            }
+        }
         assert_eq!(request.max_response_payload_size(), 1_452);
         assert_eq!(
             request
@@ -1288,5 +1955,88 @@ mod tests {
         assert_eq!(diagnostic.stage(), "physical-connect");
         assert_eq!(diagnostic.kind(), "timed_out");
         assert_eq!(diagnostic.message(), "outbound setup deadline expired");
+    }
+    #[cfg(any(feature = "outbound-shadowsocks", feature = "outbound-wireguard"))]
+    #[tokio::test]
+    async fn ip4p_udp_node_endpoint_retains_chain_identity_and_uses_actual_reply_peer() {
+        let encoded: std::net::SocketAddr = "[2001:0::1bb:c000:201]:8443".parse().unwrap();
+        let server = Destination::Ip(encoded);
+        let endpoint = ResolvedEndpoint {
+            logical_host: encoded.ip().to_string(),
+            port: encoded.port(),
+            addresses: vec![encoded],
+        };
+        let dialer = Dialer::default()
+            .with_ipv6(false)
+            .with_ip_version(crate::config::IpVersion::Ipv4)
+            .with_connections(crate::config::ConnectionSettings {
+                dialer_ip4p_convert: true,
+                ..Default::default()
+            });
+        let path = UpstreamPath::direct(endpoint.clone(), dialer);
+        let context = EstablishContext::default();
+        let actual = path.ip4p_datagram_server(&server, &context).await.unwrap();
+        assert_eq!(actual, Destination::Ip("192.0.2.1:443".parse().unwrap()));
+        assert_eq!(server, Destination::Ip(encoded));
+        assert_eq!(endpoint.logical_host, encoded.ip().to_string());
+        assert_eq!(endpoint.port, 8443);
+        let remote = UpstreamPath::proxy(Arc::new(UnreachableConnector));
+        assert_eq!(
+            remote
+                .ip4p_datagram_server(&server, &context)
+                .await
+                .unwrap(),
+            server
+        );
+        #[cfg(feature = "outbound-socks5")]
+        {
+            assert_eq!(
+                path.ip4p_datagram_relay(server.clone(), &context).unwrap(),
+                actual
+            );
+            assert_eq!(
+                remote
+                    .ip4p_datagram_relay(server.clone(), &context)
+                    .unwrap(),
+                server
+            );
+        }
+    }
+    #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+    #[tokio::test]
+    async fn brutal_capture_does_not_cross_a_proxy_hop() {
+        struct Check;
+        #[async_trait]
+        impl OutboundConnector for Check {
+            async fn connect_stream(
+                &self,
+                session: StreamSession,
+                context: &EstablishContext,
+            ) -> Result<ConnectedStream, DispatchError> {
+                assert!(context.tcp_control.is_none());
+                let (io, _) = tokio::io::duplex(1);
+                Ok(ConnectedStream {
+                    io: Box::new(io),
+                    effective_peer: session.destination,
+                })
+            }
+            async fn open_datagram(
+                &self,
+                _: DatagramRequest,
+                _: &EstablishContext,
+            ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+                panic!("no datagram IO in physical TCP policy test")
+            }
+        }
+        let capture = crate::dialer::tcp_control::Capture::default();
+        let context = EstablishContext::default().capture_tcp_control(capture.clone());
+        let path = UpstreamPath::proxy(Arc::new(Check));
+        let server = Destination::domain("proxy.invalid", 443).unwrap();
+        let io = path
+            .connect_server(test_session(), &server, &context)
+            .await
+            .unwrap();
+        assert!(capture.finish().is_none());
+        assert_eq!(io.effective_peer, server);
     }
 }

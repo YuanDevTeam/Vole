@@ -1,0 +1,367 @@
+//! Concrete foreground overrides; immutable YAML and native Invoke are unchanged.
+use super::{InvokeFailure, failure, input};
+use crate::config::{Config, ExternalControllerConfig};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use zeroize::{Zeroize, Zeroizing};
+
+#[derive(Clone, Default)]
+pub(in crate::invoke) struct ControllerOverrides {
+    http: Option<SocketAddr>,
+    tls: Option<SocketAddr>,
+    unix: Option<String>,
+    mark: u32,
+    secret: Option<Zeroizing<String>>,
+}
+impl ControllerOverrides {
+    pub(in crate::invoke) fn read(
+        http: Option<Zeroizing<String>>,
+        tls: Option<Zeroizing<String>>,
+        unix: Option<Zeroizing<String>>,
+        mark: Option<i64>,
+        secret: Option<Zeroizing<String>>,
+    ) -> Result<Self, InvokeFailure> {
+        let limit = crate::config::MAX_CONFIG_BYTES;
+        Self::from_values(
+            input::option_text(http, "VOLE_OVERRIDE_EXTERNAL_CONTROLLER", limit)?,
+            input::option_text(tls, "VOLE_OVERRIDE_EXTERNAL_CONTROLLER_TLS", limit)?,
+            input::option_text(secret, "VOLE_OVERRIDE_SECRET", limit)?,
+        )?
+        .with_unix(input::option_text(
+            unix,
+            "VOLE_OVERRIDE_EXTERNAL_CONTROLLER_UNIX",
+            limit,
+        )?)?
+        .with_mark(mark.unwrap_or_else(|| {
+            std::env::var("VOLE_OVERRIDE_EXTERNAL_CONTROLLER_ROUTING_MARK")
+                .ok()
+                .map(|value| environment_mark(&value))
+                .unwrap_or(0)
+        }))
+    }
+    fn from_values(
+        http: Option<Zeroizing<String>>,
+        tls: Option<Zeroizing<String>>,
+        secret: Option<Zeroizing<String>>,
+    ) -> Result<Self, InvokeFailure> {
+        fn listener(value: Option<Zeroizing<String>>) -> Result<Option<SocketAddr>, InvokeFailure> {
+            crate::config::normalize_external_controller(
+                value.map(|mut value| std::mem::take(&mut *value)),
+                None,
+            )
+            .map(|value| value.map(|value| value.listen))
+            .map_err(|_| failure("invalid foreground Controller address"))
+        }
+        Ok(Self {
+            http: listener(http)?,
+            tls: listener(tls)?,
+            unix: None,
+            mark: 0,
+            secret: secret.filter(|value| !value.is_empty()),
+        })
+    }
+    fn with_unix(mut self, value: Option<Zeroizing<String>>) -> Result<Self, InvokeFailure> {
+        self.unix = crate::config::normalize_controller_unix(
+            value.map(|mut value| std::mem::take(&mut *value)),
+        )
+        .map_err(|_| failure("invalid foreground Controller Unix path"))?;
+        Ok(self)
+    }
+    fn with_mark(mut self, value: i64) -> Result<Self, InvokeFailure> {
+        self.mark = crate::config::normalize_controller_mark(value)
+            .map_err(|_| failure("invalid foreground Controller routing mark"))?;
+        Ok(self)
+    }
+    pub(in crate::invoke) fn apply_template(
+        &self,
+        template: &mut crate::config::providers::ProviderTemplate,
+    ) {
+        template.override_controller(
+            self.http,
+            self.tls,
+            self.unix.as_deref(),
+            (self.mark != 0).then_some(self.mark),
+            self.secret.as_ref().map(|value| value.as_str()),
+        );
+    }
+    pub(in crate::invoke) fn apply(&self, config: &mut Config) {
+        if let Some(template) = &mut config.providers {
+            self.apply_template(Arc::make_mut(template));
+        }
+        if (self.http.is_some() || self.tls.is_some() || self.unix.is_some())
+            && config.external_controller.is_none()
+        {
+            config.external_controller = Some(ExternalControllerConfig {
+                http_enabled: false,
+                routing_mark: config
+                    .providers
+                    .as_ref()
+                    .map_or(0, |template| template.controller_routing_mark()),
+                secret: config
+                    .providers
+                    .as_ref()
+                    .and_then(|template| template.controller_secret().map(str::to_owned)),
+                cors: config
+                    .providers
+                    .as_ref()
+                    .map_or_else(Default::default, |template| template.controller_cors()),
+                server_tls: config.tls.server.clone(),
+                ..ExternalControllerConfig::default()
+            });
+        }
+        let Some(controller) = &mut config.external_controller else {
+            return;
+        };
+        if let Some(http) = self.http {
+            controller.listen = http;
+            controller.http_enabled = true;
+        }
+        if let Some(tls) = self.tls {
+            if !controller.http_enabled {
+                controller.listen = tls;
+            }
+            controller.tls_listen = Some(tls);
+        }
+        if let Some(unix) = &self.unix {
+            controller.unix_path = Some(unix.clone());
+        }
+        if self.mark != 0 {
+            controller.routing_mark = self.mark;
+        }
+        if let Some(secret) = &self.secret {
+            if let Some(mut old) = controller.secret.take() {
+                old.zeroize();
+            }
+            controller.secret = Some(secret.as_str().to_owned());
+        }
+    }
+}
+
+// Mihomo's getIntEnv discards Atoi's error, including its saturated range value.
+fn environment_mark(value: &str) -> i64 {
+    match value.parse::<isize>() {
+        Ok(value) => value as i64,
+        Err(error) => match error.kind() {
+            std::num::IntErrorKind::PosOverflow => isize::MAX as i64,
+            std::num::IntErrorKind::NegOverflow => isize::MIN as i64,
+            _ => 0,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn text(value: &str) -> Option<Zeroizing<String>> {
+        Some(Zeroizing::new(value.to_owned()))
+    }
+    #[test]
+    fn activating_controller_preserves_validated_secret_cors_and_tls_across_materialization() {
+        let mut config = Config::parse_yaml(
+            br#"
+secret: yaml-token
+external-controller-cors: {allow-origins: ['https://ui.example'], allow-private-network: false}
+tls: {certificate: cert-material, private-key: key-material, client-auth-type: require-any}
+rules: ['MATCH,DIRECT']
+"#,
+        )
+        .unwrap();
+        assert!(config.external_controller.is_none());
+        let tls = config.tls.server.clone();
+        ControllerOverrides::from_values(text("localhost:9000"), None, text(""))
+            .unwrap()
+            .apply(&mut config);
+        let controller = config.external_controller.as_ref().unwrap();
+        assert_eq!(controller.secret.as_deref(), Some("yaml-token"));
+        assert_eq!(controller.cors.allow_origins, ["https://ui.example"]);
+        assert!(!controller.cors.allow_private_network);
+        assert_eq!(controller.server_tls, tls);
+        let materialized = config
+            .providers
+            .as_ref()
+            .unwrap()
+            .materialize(&Default::default())
+            .unwrap();
+        assert_eq!(materialized.external_controller, config.external_controller);
+        ControllerOverrides::from_values(None, None, text("explicit-token"))
+            .unwrap()
+            .apply(&mut config);
+        let materialized = config
+            .providers
+            .as_ref()
+            .unwrap()
+            .materialize(&Default::default())
+            .unwrap();
+        assert_eq!(
+            config
+                .external_controller
+                .as_ref()
+                .unwrap()
+                .secret
+                .as_deref(),
+            Some("explicit-token")
+        );
+        assert_eq!(materialized.external_controller, config.external_controller);
+    }
+
+    #[test]
+    fn mark_override_preserves_zero_yaml_and_materialized_values() {
+        assert_eq!(environment_mark("+42"), 42);
+        assert_eq!(environment_mark("0x2a"), 0);
+        assert_eq!(
+            environment_mark("999999999999999999999999999"),
+            isize::MAX as i64
+        );
+
+        let mut config = Config::parse_yaml(b"external-controller: ':9000'\nexternal-controller-routing-mark: 7\nrules: ['MATCH,DIRECT']\n").unwrap();
+        ControllerOverrides::default()
+            .with_mark(0)
+            .unwrap()
+            .apply(&mut config);
+        assert_eq!(config.external_controller.as_ref().unwrap().routing_mark, 7);
+        ControllerOverrides::default()
+            .with_mark(42)
+            .unwrap()
+            .apply(&mut config);
+        assert_eq!(
+            config.external_controller.as_ref().unwrap().routing_mark,
+            42
+        );
+        assert_eq!(
+            config
+                .providers
+                .as_ref()
+                .unwrap()
+                .materialize(&Default::default())
+                .unwrap()
+                .external_controller,
+            config.external_controller
+        );
+        assert!(ControllerOverrides::default().with_mark(i64::MAX).is_err());
+
+        let mut inactive =
+            Config::parse_yaml(b"external-controller-routing-mark: -1\nrules: ['MATCH,DIRECT']\n")
+                .unwrap();
+        assert!(inactive.external_controller.is_none());
+        ControllerOverrides::from_values(text("localhost:9000"), None, None)
+            .unwrap()
+            .with_mark(0)
+            .unwrap()
+            .apply(&mut inactive);
+        assert_eq!(
+            inactive.external_controller.as_ref().unwrap().routing_mark,
+            u32::MAX
+        );
+        assert_eq!(
+            inactive
+                .providers
+                .as_ref()
+                .unwrap()
+                .materialize(&Default::default())
+                .unwrap()
+                .external_controller,
+            inactive.external_controller
+        );
+    }
+    #[test]
+    fn unix_override_survives_materialization_without_creating_a_network_listener() {
+        let mut config =
+            Config::parse_yaml(b"secret: yaml-token\nrules: ['MATCH,DIRECT']\n").unwrap();
+        ControllerOverrides::default()
+            .with_unix(text("local.sock"))
+            .unwrap()
+            .apply(&mut config);
+        let controller = config.external_controller.as_ref().unwrap();
+        assert_eq!(controller.unix_path.as_deref(), Some("local.sock"));
+        assert!(!controller.http_enabled);
+        assert!(controller.tls_listen.is_none());
+        let expected = controller.clone();
+        let fresh = config
+            .providers
+            .as_ref()
+            .unwrap()
+            .materialize(&Default::default())
+            .unwrap();
+        assert_eq!(fresh.external_controller, Some(expected));
+        ControllerOverrides::default()
+            .with_unix(text(""))
+            .unwrap()
+            .apply(&mut config);
+        assert_eq!(
+            config.external_controller.unwrap().unix_path.as_deref(),
+            Some("local.sock")
+        );
+        assert!(
+            ControllerOverrides::default()
+                .with_unix(text("bad\0path"))
+                .is_err()
+        );
+    }
+    #[test]
+    fn concrete_overrides_preserve_yaml_and_only_replace_nonempty_values() {
+        let mut config = Config::parse_yaml(b"external-controller: localhost:9000\nexternal-controller-tls: ':9443'\nsecret: yaml-token\n").unwrap();
+        ControllerOverrides::from_values(text(""), text(""), text(""))
+            .unwrap()
+            .apply(&mut config);
+        let controller = config.external_controller.as_ref().unwrap();
+        assert_eq!(controller.listen, "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(controller.tls_listen, Some("[::]:9443".parse().unwrap()));
+        assert_eq!(controller.secret.as_deref(), Some("yaml-token"));
+        ControllerOverrides::from_values(text("[::1]:9100"), None, text("runtime-token"))
+            .unwrap()
+            .apply(&mut config);
+        let controller = config.external_controller.as_ref().unwrap();
+        assert_eq!(controller.listen, "[::1]:9100".parse().unwrap());
+        assert_eq!(controller.tls_listen, Some("[::]:9443".parse().unwrap()));
+        assert_eq!(controller.secret.as_deref(), Some("runtime-token"));
+        let mut absent = Config::parse_yaml(b"rules: ['MATCH,DIRECT']").unwrap();
+        ControllerOverrides::from_values(None, None, text("unused-token"))
+            .unwrap()
+            .apply(&mut absent);
+        assert!(absent.external_controller.is_none());
+        ControllerOverrides::from_values(None, text("localhost:9443"), text("tls-token"))
+            .unwrap()
+            .apply(&mut absent);
+        let controller = absent.external_controller.unwrap();
+        assert!(!controller.http_enabled);
+        assert_eq!(
+            controller.tls_listen,
+            Some("127.0.0.1:9443".parse().unwrap())
+        );
+        assert_eq!(controller.secret.as_deref(), Some("tls-token"));
+    }
+    #[test]
+    fn concrete_overrides_survive_provider_materialization_and_content_updates() {
+        use crate::config::providers::{ProviderContent, ProviderContents};
+        let mut config = Config::parse_yaml(b"proxy-providers: {nodes: {type: inline, payload: [{name: edge, type: direct}]}}\nproxy-groups: [{name: choice, type: select, use: [nodes]}]\nrules: ['MATCH,choice']\n").unwrap();
+        ControllerOverrides::from_values(
+            text("localhost:9000"),
+            text("[::1]:9443"),
+            text("private-token"),
+        )
+        .unwrap()
+        .apply(&mut config);
+        let expected = config.external_controller.clone();
+        let template = config.providers.unwrap();
+        let materialized = template.materialize(&ProviderContents::new()).unwrap();
+        assert_eq!(materialized.external_controller, expected);
+        let mut contents = ProviderContents::new();
+        contents.insert(
+            "proxies/nodes".into(),
+            ProviderContent::Proxies(vec![
+                serde_yaml_ng::from_str("{name: next, type: direct}").unwrap(),
+            ]),
+        );
+        let updated = template.materialize(&contents).unwrap();
+        assert_eq!(updated.external_controller, expected);
+        assert!(updated.proxies.iter().any(|node| node.tag == "next"));
+    }
+    #[test]
+    fn concrete_override_addresses_reuse_the_existing_controller_parser() {
+        assert!(
+            ControllerOverrides::from_values(text("private-fixture.invalid:80"), None, None)
+                .is_err()
+        );
+        assert!(ControllerOverrides::from_values(None, text("127.0.0.1:65536"), None).is_err());
+    }
+}

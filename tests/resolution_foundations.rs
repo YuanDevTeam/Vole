@@ -49,11 +49,6 @@ impl vole::outbound::OutboundConnector for IpBoundary {
 
 #[tokio::test]
 async fn measurement_domain_resolution_reaches_both_final_and_upstream_ip_boundaries() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-RESOLUTION",
-        "measurement_domain_resolution_reaches_both_final_and_upstream_ip_boundaries",
-    );
     use vole::{
         dispatch::Dispatcher,
         outbound::{ConnectorDispatcher, UpstreamPath},
@@ -67,6 +62,7 @@ async fn measurement_domain_resolution_reaches_both_final_and_upstream_ip_bounda
         ConnectorDispatcher::new(connector.clone()).with_resolution(resolution.clone());
     let target = Destination::domain("controlled.example", 443).unwrap();
     let session = StreamSession {
+        metadata: Default::default(),
         inbound: InboundKind::InternalMeasure,
         source: "127.0.0.1:0".parse().unwrap(),
         destination: target.clone(),
@@ -112,11 +108,6 @@ impl Resolver for ChainedBootstrap {
 
 #[tokio::test]
 async fn resolver_dependency_depth_is_bounded_independently_of_concurrent_lookups() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-RESOLUTION",
-        "resolver_dependency_depth_is_bounded_independently_of_concurrent_lookups",
-    );
     let calls = Arc::new(AtomicUsize::new(0));
     let resolution =
         ResolutionContext::measurement(Arc::new(ChainedBootstrap(calls.clone())), true);
@@ -147,11 +138,6 @@ impl Resolver for Bootstrap {
 
 #[tokio::test]
 async fn runtime_uses_configured_dns_and_weak_binding_releases_owner() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-RESOLUTION",
-        "runtime_uses_configured_dns_and_weak_binding_releases_owner",
-    );
     use vole::{
         config::{DnsConfig, DnsNameserver, DnsRoute, DnsTransport},
         dialer::Dialer,
@@ -180,12 +166,16 @@ async fn runtime_uses_configured_dns_and_weak_binding_releases_owner() {
         enable: true,
         ipv6: false,
         nameservers: vec![DnsNameserver {
+            path: None,
+            http_auth: None,
+            options: Default::default(),
             transport: DnsTransport::Udp,
-            address: address.ip(),
+            address: address.ip().into(),
             port: address.port(),
             route: DnsRoute::Direct,
         }],
         nameserver_policies: vec![],
+        ..DnsConfig::default()
     };
     let dns = Arc::new(RuntimeDns::new(
         &config,
@@ -244,11 +234,6 @@ impl vole::dispatch::Dispatcher for RecursiveEgress {
 
 #[tokio::test]
 async fn recursive_dns_dependency_fails_before_connecting_or_joining_its_own_flight() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-RESOLUTION",
-        "recursive_dns_dependency_fails_before_connecting_or_joining_its_own_flight",
-    );
     use vole::{
         config::{DnsConfig, DnsNameserver, DnsRoute, DnsTransport},
         dns::runtime::RuntimeDns,
@@ -263,12 +248,16 @@ async fn recursive_dns_dependency_fails_before_connecting_or_joining_its_own_fli
         enable: true,
         ipv6: false,
         nameservers: vec![DnsNameserver {
+            path: None,
+            http_auth: None,
+            options: Default::default(),
             transport: DnsTransport::Udp,
             address: "192.0.2.1".parse().unwrap(),
             port: 53,
             route: DnsRoute::Direct,
         }],
         nameserver_policies: vec![],
+        ..DnsConfig::default()
     };
     let dns = Arc::new(RuntimeDns::new(&config, egress));
     resolution.bind_runtime(Some(&dns)).unwrap();
@@ -305,11 +294,6 @@ impl Resolver for PendingBootstrap {
 
 #[tokio::test]
 async fn lookup_deadline_and_stop_cancel_pending_resolver_without_retaining_waiters() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-RESOLUTION",
-        "lookup_deadline_and_stop_cancel_pending_resolver_without_retaining_waiters",
-    );
     let active = Arc::new(AtomicUsize::new(0));
     let entered = Arc::new(tokio::sync::Notify::new());
     let resolution = ResolutionContext::measurement(
@@ -339,11 +323,6 @@ async fn lookup_deadline_and_stop_cancel_pending_resolver_without_retaining_wait
 
 #[tokio::test]
 async fn standalone_measurement_resolves_only_at_ip_boundary_with_address_policy_and_stop() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-RESOLUTION",
-        "standalone_measurement_resolves_only_at_ip_boundary_with_address_policy_and_stop",
-    );
     let bootstrap = Arc::new(Bootstrap(AtomicUsize::new(0)));
     let resolution = ResolutionContext::measurement(bootstrap.clone(), false);
     let context = EstablishContext::with_resolution(Duration::from_secs(10), resolution.clone());
@@ -365,11 +344,6 @@ async fn standalone_measurement_resolves_only_at_ip_boundary_with_address_policy
 
 #[tokio::test]
 async fn unbound_and_disabled_runtime_resolution_never_fall_back_to_system_dns() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-RESOLUTION",
-        "unbound_and_disabled_runtime_resolution_never_fall_back_to_system_dns",
-    );
     let resolution = ResolutionContext::runtime(false);
     let context = EstablishContext::with_resolution(Duration::from_secs(10), resolution.clone());
     let target = Destination::domain("localhost", 443).unwrap();

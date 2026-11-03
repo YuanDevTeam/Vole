@@ -14,9 +14,9 @@ fn yaml(protocol: &str, fields: &str) -> String {
 
 fn profile(config: &Config) -> Option<ClientFingerprint> {
     match &config.proxies[0].protocol {
-        ProxyProtocol::AnyTls(p) => p.tls.client_fingerprint,
-        ProxyProtocol::Trojan(p) => p.tls.client_fingerprint,
-        ProxyProtocol::Vmess(p) => p.tls.as_ref().unwrap().client_fingerprint,
+        ProxyProtocol::AnyTls(p) => p.security.client_fingerprint(),
+        ProxyProtocol::Trojan(p) => p.security.client_fingerprint(),
+        ProxyProtocol::Vmess(p) => p.security.client_fingerprint(),
         ProxyProtocol::Vless(p) => match &p.security {
             SecurityConfig::Tls(tls) => tls.client_fingerprint,
             SecurityConfig::Reality(reality) => reality.client_fingerprint,
@@ -30,7 +30,7 @@ fn profile(config: &Config) -> Option<ClientFingerprint> {
 fn named_fingerprint_is_strict_and_independent_of_certificate_pins() {
     for protocol in ["anytls", "trojan", "vmess", "vless"] {
         for (value, expected) in [
-            ("chrome120", Some(ClientFingerprint::Chrome120)),
+            ("chrome", Some(ClientFingerprint::Chrome133)),
             ("none", None),
             ("\"\"", None),
         ] {
@@ -52,15 +52,18 @@ fn named_fingerprint_is_strict_and_independent_of_certificate_pins() {
             None
         );
         for value in [
+            "chrome120",
+            "firefox120",
+            "safari16",
             "Chrome120",
             "Chrome",
             "NONE",
             "chrome133",
             "safari16.0",
-            "ios",
-            "android",
-            "edge",
-            "random",
+            "android11",
+            "edge85",
+            "3607.5",
+            "qq11.1",
             "randomized",
             "chrome_psk",
             "chrome_pq",
@@ -93,27 +96,30 @@ fn named_fingerprint_is_strict_and_independent_of_certificate_pins() {
 }
 
 #[test]
-fn selected_names_resolve_to_four_distinct_templates_and_only_documented_aliases() {
+fn selected_names_resolve_to_eight_distinct_fixed_templates() {
     for protocol in ["anytls", "trojan", "vmess", "vless"] {
         let mut templates = Vec::new();
-        for name in ["chrome", "chrome120", "firefox", "safari"] {
+        for (name, expected) in [
+            ("chrome", ClientFingerprint::Chrome133),
+            ("firefox", ClientFingerprint::Firefox120),
+            ("safari", ClientFingerprint::Safari16),
+            ("ios", ClientFingerprint::Ios14),
+            ("android", ClientFingerprint::Android11),
+            ("edge", ClientFingerprint::Edge85),
+            ("360", ClientFingerprint::ThreeSixty75),
+            ("qq", ClientFingerprint::Qq111),
+        ] {
             let config = Config::parse_yaml(
-                yaml(protocol, &format!("client-fingerprint: {name}")).as_bytes(),
+                yaml(protocol, &format!("client-fingerprint: {name:?}")).as_bytes(),
             )
             .unwrap();
             let selected = profile(&config).expect("enabled profile");
+            assert_eq!(selected, expected);
             assert!(
                 !templates.contains(&selected),
                 "{name} cannot reuse another template"
             );
             templates.push(selected);
-        }
-        for (alias, template) in [("firefox120", templates[2]), ("safari16", templates[3])] {
-            let config = Config::parse_yaml(
-                yaml(protocol, &format!("client-fingerprint: {alias}")).as_bytes(),
-            )
-            .unwrap();
-            assert_eq!(profile(&config), Some(template));
         }
     }
 }
@@ -121,7 +127,6 @@ fn selected_names_resolve_to_four_distinct_templates_and_only_documented_aliases
 #[test]
 fn download_fingerprint_inherits_and_can_be_cleared_independently() {
     for (name, template) in [
-        ("chrome120", ClientFingerprint::Chrome120),
         ("chrome", ClientFingerprint::Chrome133),
         ("firefox", ClientFingerprint::Firefox120),
         ("safari", ClientFingerprint::Safari16),
@@ -141,15 +146,11 @@ fn download_fingerprint_inherits_and_can_be_cleared_independently() {
                 Some(ClientFingerprint::Chrome133),
             ),
             (
-                "\n        client-fingerprint: chrome120",
-                Some(ClientFingerprint::Chrome120),
-            ),
-            (
-                "\n        client-fingerprint: firefox120",
+                "\n        client-fingerprint: firefox",
                 Some(ClientFingerprint::Firefox120),
             ),
             (
-                "\n        client-fingerprint: safari16",
+                "\n        client-fingerprint: safari",
                 Some(ClientFingerprint::Safari16),
             ),
         ] {
@@ -196,6 +197,9 @@ fn download_fingerprint_inherits_and_can_be_cleared_independently() {
             "[]",
             "{}",
             "Chrome",
+            "chrome120",
+            "firefox120",
+            "safari16",
             "chrome133",
             "safari16.0",
         ] {
@@ -213,7 +217,6 @@ fn download_fingerprint_inherits_and_can_be_cleared_independently() {
 #[test]
 fn reality_accepts_named_profile_without_admitting_certificate_policy() {
     for (name, expected) in [
-        ("chrome120", Some(ClientFingerprint::Chrome120)),
         ("chrome", Some(ClientFingerprint::Chrome133)),
         ("firefox", Some(ClientFingerprint::Firefox120)),
         ("safari", Some(ClientFingerprint::Safari16)),
@@ -232,5 +235,51 @@ fn reality_accepts_named_profile_without_admitting_certificate_policy() {
             )
             .is_err()
         );
+    }
+}
+
+#[test]
+fn ios_and_process_random_fingerprint_use_the_shared_entries() {
+    let selected = process_random_fingerprint();
+    for protocol in ["anytls", "trojan", "vmess", "vless"] {
+        for (value, expected) in [("ios", ClientFingerprint::Ios14), ("random", selected)] {
+            let config = Config::parse_yaml(
+                yaml(protocol, &format!("client-fingerprint: {value}")).as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(profile(&config), Some(expected));
+        }
+    }
+    assert_eq!(process_random_fingerprint(), selected);
+    let mut counts = [0; 4];
+    for value in 0..12 {
+        counts[match weighted_fingerprint(value) {
+            ClientFingerprint::Chrome133 => 0,
+            ClientFingerprint::Safari16 => 1,
+            ClientFingerprint::Ios14 => 2,
+            ClientFingerprint::Firefox120 => 3,
+            _ => unreachable!("random keeps its four-template weights"),
+        }] += 1;
+    }
+    assert_eq!(counts, [6, 3, 2, 1]);
+}
+
+#[test]
+fn tls12_profiles_reject_only_transports_that_require_tls13() {
+    for profile in ["android", "360"] {
+        for transport in [
+            "network: xhttp",
+            "flow: xtls-rprx-vision",
+            "jls-opts: {username: fixture, password: fixture}",
+            "shadow-tls-opts: {version: 3, password: fixture}",
+            "ech-opts: {enable: true}",
+        ] {
+            let fields = format!("client-fingerprint: {profile:?}\n    {transport}");
+            assert!(Config::parse_yaml(yaml("vless", &fields).as_bytes()).is_err());
+        }
+        let fields = format!(
+            "network: xhttp\n    client-fingerprint: chrome\n    xhttp-opts:\n      mode: stream-up\n      download-settings:\n        client-fingerprint: {profile:?}"
+        );
+        assert!(Config::parse_yaml(yaml("vless", &fields).as_bytes()).is_err());
     }
 }

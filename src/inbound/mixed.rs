@@ -23,6 +23,8 @@ use super::{
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct MixedServer {
+    connections: crate::config::ConnectionSettings,
+    access_rules: Arc<crate::config::ProxyAccessRules>,
     listeners: Vec<TcpListener>,
     sockets: Vec<Arc<UdpSocket>>,
     http: HttpServerConfig,
@@ -31,6 +33,10 @@ pub struct MixedServer {
 }
 
 impl MixedServer {
+    pub(crate) fn with_connections(mut self, settings: crate::config::ConnectionSettings) -> Self {
+        self.connections = settings;
+        self
+    }
     pub fn bind(config: MixedInboundConfig, dispatcher: Arc<dyn Dispatcher>) -> io::Result<Self> {
         let http = HttpServerConfig::proxy(config.port, config.access, config.auth.clone())?;
         let listeners = bind_proxy_tcp(config.port, config.access)?;
@@ -50,6 +56,8 @@ impl MixedServer {
             dispatcher.clone(),
         );
         Ok(Self {
+            connections: crate::config::ConnectionSettings::default(),
+            access_rules: config.access_rules,
             listeners,
             sockets,
             http,
@@ -101,11 +109,13 @@ impl MixedServer {
                         Ok(value) => value,
                         Err(error) => break Err(error),
                     };
+                    if self.connections.apply(&socket2::SockRef::from(&stream)).is_err() { continue; }
                     let relay = match stream.local_addr() {
                         Ok(address) => address,
                         Err(error) => break Err(error),
                     };
                     let connection = MixedConnection {
+                        access_rules:self.access_rules.clone(),
                         peer,
                         relay,
                         udp: Some(self.sockets[index].clone()),
@@ -129,6 +139,7 @@ impl MixedServer {
 }
 
 struct MixedConnection {
+    access_rules: Arc<crate::config::ProxyAccessRules>,
     peer: SocketAddr,
     relay: SocketAddr,
     udp: Option<Arc<UdpSocket>>,
@@ -142,7 +153,7 @@ struct MixedConnection {
 impl MixedConnection {
     async fn serve<S>(self, stream: S) -> io::Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let cancellation = self.cancellation.clone();
         tokio::select! {
@@ -152,10 +163,17 @@ impl MixedConnection {
         }
     }
 
-    async fn serve_inner<S>(self, stream: S) -> io::Result<()>
+    async fn serve_inner<S>(mut self, stream: S) -> io::Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        if !self.access_rules.permits(self.peer.ip()) {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        if self.access_rules.skips_auth(self.peer.ip()) {
+            self.http.auth = None;
+            self.socks = self.socks.without_auth();
+        }
         // Keep the probed byte in the reader. Both real protocol handlers
         // consume this same reader, so fragmented and pipelined bytes survive.
         let mut stream = BufReader::with_capacity(1, stream);
@@ -182,6 +200,7 @@ impl MixedConnection {
                 handle_connection_with_deadline(
                     stream,
                     self.peer,
+                    self.relay,
                     self.dispatcher,
                     self.http,
                     self.cancellation,

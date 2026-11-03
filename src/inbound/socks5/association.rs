@@ -11,7 +11,7 @@ use tokio::{net::UdpSocket, sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    session::{Datagram, SOCKS5_UDP_PACKET_LIMIT},
+    session::{Datagram, DatagramSession, InboundKind, InboundMetadata, SOCKS5_UDP_PACKET_LIMIT},
     socks5::decode_udp_packet,
 };
 
@@ -41,9 +41,17 @@ impl Entry {
 pub(super) struct Associations(Mutex<HashMap<SocketAddr, Entry>>);
 
 pub(super) struct Lease {
+    pub(super) metadata: InboundMetadata,
     registry: Arc<Associations>,
     pub(super) cancellation: CancellationToken,
     pub(super) source: Arc<Mutex<SocketAddr>>,
+}
+
+impl Lease {
+    pub(super) fn session(&self) -> DatagramSession {
+        DatagramSession::new(InboundKind::Socks5, *self.source.lock().unwrap())
+            .with_metadata(self.metadata.clone())
+    }
 }
 
 impl Drop for Lease {
@@ -99,6 +107,7 @@ impl Associations {
         );
         Ok((
             Lease {
+                metadata: InboundMetadata::new(0),
                 registry: self.clone(),
                 cancellation,
                 source: learned_source,
@@ -199,6 +208,46 @@ impl Associations {
 mod tests {
     use super::*;
     use crate::{session::Destination, socks5::encode_udp_packet};
+
+    #[tokio::test]
+    async fn ingress_udp_lease_retains_verified_user_and_learned_source() {
+        let registry = Arc::new(Associations::default());
+        let credentials = crate::config::ProxyCredentials::new("Alice", "pass").unwrap();
+        let user = credentials.authenticate(b"Alice", b"pass").unwrap();
+        let weak = Arc::downgrade(&user);
+        let (mut lease, mut receiver) = registry
+            .register(
+                "192.0.2.1:1234".parse().unwrap(),
+                0,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        lease.metadata = InboundMetadata {
+            local_port: 1080,
+            user: Some(user),
+            ..Default::default()
+        };
+        drop(credentials);
+        let source = "192.0.2.1:4321".parse().unwrap();
+        let packet = encode_udp_packet(
+            &Destination::Ip("203.0.113.1:53".parse().unwrap()),
+            b"data",
+            65507,
+        )
+        .unwrap();
+        registry.enqueue(source, &packet, Instant::now());
+        assert_eq!(receiver.recv().await.unwrap().payload.as_ref(), b"data");
+        let session = lease.session();
+        assert_eq!(session.source, source);
+        assert_eq!(session.metadata.local_port, 1080);
+        assert_eq!(session.metadata.user.as_deref(), Some("Alice"));
+        assert!(!format!("{:?}", session.metadata).contains("Alice"));
+        drop(lease);
+        assert!(registry.0.lock().unwrap().is_empty());
+        assert!(weak.upgrade().is_some());
+        drop(session);
+        assert!(weak.upgrade().is_none());
+    }
 
     #[tokio::test]
     async fn bounded_queue_idle_expiry_and_old_generation_cannot_remove_replacement() {

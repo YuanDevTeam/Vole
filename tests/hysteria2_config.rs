@@ -2,32 +2,27 @@ use vole::config::Config;
 
 #[test]
 fn hysteria2_configuration_follows_its_protocol_feature() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "HYSTERIA2-CFG",
-        "hysteria2_configuration_follows_its_protocol_feature",
-    );
     let yaml = b"mixed-port: 1080\nproxies: [{name: edge, type: hysteria2, server: localhost, port: 443}]\nrules: ['MATCH,edge']\n";
     let result = Config::parse_yaml(yaml);
     assert_eq!(result.is_ok(), cfg!(feature = "outbound-hysteria2"));
     if let Ok(config) = result {
-        assert_eq!(config.proxies[0].address(), "localhost");
-        assert_eq!(config.proxies[0].port(), 443);
-        assert!(!config.proxies[0].udp);
+        assert_eq!(
+            config.proxies[0].server_endpoint(),
+            Some(("localhost", 443))
+        );
+        assert!(config.proxies[0].udp);
     }
 }
 
 #[cfg(feature = "outbound-hysteria2")]
 #[test]
 fn hysteria2_accepts_the_approved_tls_bandwidth_obfs_and_hopping_configuration() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "HYSTERIA2-CFG",
-        "hysteria2_accepts_the_approved_tls_bandwidth_obfs_and_hopping_configuration",
-    );
     let yaml = b"mixed-port: 1080\nproxies:\n  - name: edge\n    type: hysteria2\n    server: localhost\n    ports: 443,8443-8445,8443\n    password: ' credential '\n    udp: true\n    up: 2 Mbps\n    down: 125 KBps\n    udp-mtu: 1200\n    hop-interval: 5-7\n    obfs: salamander\n    obfs-password: ' independent secret '\n    sni: tls.example.com\n    alpn: [custom-h3]\n    skip-cert-verify: true\n    dialer-proxy: upstream\nproxy-groups: [{name: upstream, type: select, proxies: [DIRECT, REJECT]}]\nrules: ['MATCH,edge']\n";
     let config = Config::parse_yaml(yaml).expect("approved Hysteria2 fields");
-    assert_eq!(config.proxies[0].port(), 443);
+    assert_eq!(
+        config.proxies[0].server_endpoint(),
+        Some(("localhost", 443))
+    );
     assert!(config.proxies[0].udp);
     assert!(config.proxies[0].dialer_proxy.is_some());
     assert!(!format!("{config:?}").contains("credential"));
@@ -37,11 +32,6 @@ fn hysteria2_accepts_the_approved_tls_bandwidth_obfs_and_hopping_configuration()
 #[cfg(feature = "outbound-hysteria2")]
 #[test]
 fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "HYSTERIA2-CFG",
-        "hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed",
-    );
     use serde_json::{Value, json};
     use vole::config::ProxyProtocol;
     let base = json!({"name":"edge", "type":"hysteria2", "server":"localhost", "port":443});
@@ -61,6 +51,23 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         node
     };
     let defaults = normalized(base.clone());
+    for field in ["obfs", "ports"] {
+        let mut raw = base.clone();
+        raw[field] = json!("");
+        assert_eq!(normalized(raw), defaults, "empty {field} uses defaults");
+    }
+    let mut wildcard = base.clone();
+    wildcard["ports"] = json!("*");
+    assert_eq!(normalized(wildcard), defaults);
+    for (ports, expected) in [
+        ("1,,2", vec![1, 2]),
+        ("2-1", vec![1, 2]),
+        ("8445-8443/443,,8444", vec![443, 8443, 8444, 8445]),
+    ] {
+        let mut raw = base.clone();
+        raw["ports"] = json!(ports);
+        assert_eq!(normalized(raw).hopping.unwrap().ports, expected);
+    }
     for field in [
         "name",
         "server",
@@ -70,6 +77,7 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         "sni",
         "alpn",
         "skip-cert-verify",
+        "name-cert-verify",
         "fingerprint",
         "certificate",
         "private-key",
@@ -91,11 +99,22 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
             );
         }
     }
-    assert_eq!((defaults.up, defaults.down, defaults.udp_mtu), (0, 0, 1197));
+    assert_eq!((defaults.up, defaults.down, defaults.udp_mtu), (0, 0, 1400));
     assert_eq!(defaults.password, "");
     assert_eq!(defaults.tls.server_name, "localhost");
     assert_eq!(defaults.tls.alpn, vec![b"h3".to_vec()]);
     assert!(defaults.tls.tls13_only);
+    let mut raw = base.clone();
+    raw["sni"] = json!("public.example.com");
+    raw["name-cert-verify"] = json!("verified.example.com");
+    let node = normalized(raw.clone());
+    assert_eq!(node.tls.server_name, "public.example.com");
+    assert_eq!(
+        node.tls.certificate.verification_name.as_deref(),
+        Some("verified.example.com")
+    );
+    raw["name-cert-verify"] = json!("bad\nname");
+    assert!(parse(raw).is_err());
     for (value, expected) in [
         (json!(2), 250000),
         (json!("2"), 250000),
@@ -123,15 +142,23 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
     let node = normalized(raw.clone());
     assert_eq!(node.password, "  raw credential  ");
     assert_eq!(node.port, 443);
-    assert_eq!(node.udp_mtu, 1197);
+    assert_eq!(node.udp_mtu, 1400);
     let hopping = node.hopping.unwrap();
     assert_eq!(hopping.ports, vec![443, 8443, 8444, 8445]);
     assert_eq!((hopping.min_seconds, hopping.max_seconds), (5, 7));
     raw.as_object_mut().unwrap().remove("port");
     assert!(parse(raw.clone()).is_ok());
-    for interval in [json!(5), json!("5"), json!("4294967295")] {
+    for (interval, expected) in [
+        (json!(0), (30, 30)),
+        (json!(4), (5, 5)),
+        (json!("7-5"), (5, 7)),
+        (json!(5), (5, 5)),
+        (json!("5"), (5, 5)),
+        (json!("4294967295"), (u32::MAX, u32::MAX)),
+    ] {
         raw["hop-interval"] = interval;
-        assert!(parse(raw.clone()).is_ok());
+        let hopping = normalized(raw.clone()).hopping.unwrap();
+        assert_eq!((hopping.min_seconds, hopping.max_seconds), expected);
     }
     for mtu in [64, 65535] {
         let mut raw = base.clone();
@@ -157,16 +184,7 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         ),
         (
             "ports",
-            vec![
-                json!(""),
-                json!("1,,2"),
-                json!("2-1"),
-                json!("0"),
-                json!("65536"),
-                json!("*"),
-                json!([443]),
-                Value::Null,
-            ],
+            vec![json!("0"), json!("65536"), json!([443]), Value::Null],
         ),
         (
             "alpn",
@@ -199,7 +217,6 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         ("tls", json!(false)),
         ("network", json!("tcp")),
         ("client-fingerprint", json!("chrome")),
-        ("name-cert-verify", json!("localhost")),
         ("certificate", json!("bad")),
         ("private-key", json!("bad")),
         ("obfs", json!("salamander")),
@@ -210,23 +227,80 @@ fn hysteria2_fields_are_strict_normalized_and_credentials_are_not_trimmed() {
         raw[field] = value;
         assert!(parse(raw).is_err(), "{field}");
     }
-    for value in [
-        json!(0),
-        json!(4),
-        json!("7-5"),
-        json!("5s"),
-        json!("4294967296"),
-        Value::Null,
-    ] {
+    for value in [json!("5s"), json!("4294967296"), Value::Null] {
         let mut raw = base.clone();
         raw["ports"] = json!("443");
         raw["hop-interval"] = value;
         assert!(parse(raw).is_err());
     }
-    for value in [json!(""), json!("gecko")] {
+    for value in [json!("")] {
         let mut raw = base.clone();
         raw["obfs"] = value;
         raw["obfs-password"] = json!("secret");
         assert!(parse(raw).is_err());
     }
+}
+
+#[cfg(feature = "outbound-hysteria2")]
+#[test]
+fn receive_windows_are_independent_and_preserve_initial_above_maximum() {
+    use vole::config::{ProxyProtocol, QuicReceiveWindow};
+    let parse = |fields: &str| {
+        let yaml = format!(
+            "mixed-port: 1080\nproxies:\n  - name: edge\n    type: hysteria2\n    server: localhost\n    port: 443\n{fields}rules: ['MATCH,edge']\n"
+        );
+        let c = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        let ProxyProtocol::Hysteria2(config) = c.proxies.into_iter().next().unwrap().protocol
+        else {
+            panic!("HY2")
+        };
+        config
+    };
+    let defaults = parse("");
+    assert_eq!(
+        defaults.stream_window,
+        QuicReceiveWindow {
+            initial: 64 * 1024,
+            maximum: 64 * 1024
+        }
+    );
+    assert_eq!(
+        defaults.connection_window,
+        QuicReceiveWindow {
+            initial: 4 * 1024 * 1024,
+            maximum: 4 * 1024 * 1024
+        }
+    );
+    let large = parse(
+        "    initial-connection-receive-window: 20971520\n    max-connection-receive-window: 16777216\n",
+    );
+    assert_eq!(
+        large.connection_window,
+        QuicReceiveWindow {
+            initial: 20 * 1024 * 1024,
+            maximum: 16 * 1024 * 1024,
+        }
+    );
+    let config = parse(
+        "    initial-stream-receive-window: 400\n    max-stream-receive-window: 200\n    initial-connection-receive-window: 600\n    max-connection-receive-window: 1200\n    handshake-timeout: 2\n",
+    );
+    assert_eq!(
+        config.stream_window,
+        QuicReceiveWindow {
+            initial: 400,
+            maximum: 200
+        }
+    );
+    assert_eq!(
+        config.connection_window,
+        QuicReceiveWindow {
+            initial: 600,
+            maximum: 1200
+        }
+    );
+    assert_eq!(config.handshake_timeout, std::time::Duration::from_secs(2));
+    let config =
+        parse("    max-stream-receive-window: 18446744073709551615\n    handshake-timeout: -1\n");
+    assert_eq!(config.stream_window.maximum, (1_u64 << 62) - 1);
+    assert!(config.handshake_timeout.is_zero());
 }

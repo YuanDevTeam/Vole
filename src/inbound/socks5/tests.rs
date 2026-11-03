@@ -63,6 +63,10 @@ struct Echo {
 
 #[async_trait]
 impl DatagramTransport for Echo {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         if self.block_send {
             self.blocked.fetch_add(1, Ordering::SeqCst);
@@ -129,6 +133,7 @@ impl Fixture {
             tag: "socks".into(),
             port: 0,
             access: ProxyAccess {
+                bind_address: None,
                 allow_lan: lan,
                 ipv6,
             },
@@ -137,6 +142,7 @@ impl Fixture {
         #[cfg(feature = "inbound-http")]
         let server = MixedServer::bind(
             MixedInboundConfig {
+                access_rules: Default::default(),
                 tag: config.tag,
                 port: config.port,
                 access: config.access,
@@ -475,6 +481,7 @@ async fn dual_stack_udp_and_tcp_share_port_and_failed_udp_bind_releases_tcp() {
         tag: "test".into(),
         port: address.port(),
         access: ProxyAccess {
+            bind_address: None,
             allow_lan: false,
             ipv6: false,
         },

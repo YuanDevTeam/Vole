@@ -26,10 +26,16 @@ const PENDING_PACKETS: usize = crate::limits::HY2_PENDING_PACKETS;
 const PENDING_BYTES: usize = crate::limits::HY2_PENDING_BYTES;
 const TTL: Duration = Duration::from_secs(crate::limits::HY2_FRAGMENT_TTL_SECONDS as u64);
 
-#[derive(Default)]
 pub(super) struct Registry {
     next: AtomicU32,
     entries: Mutex<HashMap<u32, Registration>>,
+    outgoing: mpsc::Sender<Submission>,
+}
+pub(super) struct Submission {
+    session: u32,
+    packet: u16,
+    datagram: Datagram,
+    mtu: u16,
 }
 struct Registration {
     sender: mpsc::Sender<Datagram>,
@@ -38,6 +44,17 @@ struct Registration {
 }
 
 impl Registry {
+    pub fn new() -> (Self, mpsc::Receiver<Submission>) {
+        let (outgoing, submissions) = mpsc::channel(crate::limits::HY2_SUBMISSION_QUEUE);
+        (
+            Self {
+                next: AtomicU32::new(0),
+                entries: Mutex::new(HashMap::new()),
+                outgoing,
+            },
+            submissions,
+        )
+    }
     pub fn open(
         self: &Arc<Self>,
         connection: quinn::Connection,
@@ -114,6 +131,12 @@ impl Drop for Transport {
 
 #[async_trait]
 impl DatagramTransport for Transport {
+    fn supports_shared_destinations(&self) -> bool {
+        // A session ID owns a multi-target UDP socket, not one destination.
+        // Each complete message carries the reply source for demultiplexing.
+        true
+    }
+
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         let space = self.message_budget().saturating_sub(header(peer).len());
         DatagramBudget::new((space * 255).min(MAX_PAYLOAD) as u16, MAX_PAYLOAD as u16)
@@ -123,30 +146,28 @@ impl DatagramTransport for Transport {
         if self.closed || self.cancel.is_cancelled() {
             return Err(DispatchError::NotAllowed);
         }
-        if datagram.payload.len() > usize::from(self.payload_budget(&datagram.remote).transmit()) {
+        if datagram.remote.port() == 0
+            || self.message_budget() <= header(&datagram.remote).len()
+            || datagram.payload.len()
+                > usize::from(self.payload_budget(&datagram.remote).transmit())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Hysteria2 datagram exceeds payload budget",
             )
             .into());
         }
-        let packets = encode(
-            self.id,
-            self.packet,
-            &datagram.remote,
-            &datagram.payload,
-            self.message_budget(),
-        )?;
+        let permit = tokio::select! {biased;
+            () = self.cancel.cancelled() => return Err(DispatchError::NotAllowed),
+            permit = self.registry.outgoing.reserve() => permit.map_err(|_| DispatchError::ConnectionRefused)?,
+        };
+        permit.send(Submission {
+            session: self.id,
+            packet: self.packet,
+            datagram,
+            mtu: self.mtu,
+        });
         self.packet = self.packet.wrapping_add(1);
-        for (index, packet) in packets.into_iter().enumerate() {
-            tokio::select! {biased;
-                () = self.cancel.cancelled() => return Err(DispatchError::NotAllowed),
-                result = self.connection.send_datagram_wait(packet) => result.map_err(|_| DispatchError::ConnectionRefused)?,
-            }
-            if (index + 1) % crate::limits::IO_POLL_BUDGET == 0 {
-                tokio::task::yield_now().await;
-            }
-        }
         Ok(())
     }
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
@@ -162,6 +183,52 @@ impl DatagramTransport for Transport {
         self.close_local();
         Ok(())
     }
+}
+
+/// Driven beside receive in the connection's existing owner. Queue raw payloads
+/// so only this one active message retains encoded fragments under backpressure.
+pub(super) async fn transmit(
+    connection: &quinn::Connection,
+    registry: &Registry,
+    mut submissions: mpsc::Receiver<Submission>,
+) -> Result<(), DispatchError> {
+    let mut processed = 0;
+    while let Some(submission) = submissions.recv().await {
+        if registry
+            .entries
+            .lock()
+            .unwrap()
+            .contains_key(&submission.session)
+        {
+            let mtu = connection
+                .max_datagram_size()
+                .unwrap_or(0)
+                .min(usize::from(submission.mtu));
+            // A path/peer limit can shrink after admission. Drop the whole
+            // message instead of truncating or closing sibling associations.
+            if let Ok(packets) = encode(
+                submission.session,
+                submission.packet,
+                &submission.datagram.remote,
+                &submission.datagram.payload,
+                mtu,
+            ) {
+                for packet in packets {
+                    match connection.send_datagram_wait(packet).await {
+                        Ok(()) => {}
+                        Err(quinn::SendDatagramError::TooLarge) => break,
+                        Err(_) => return Err(DispatchError::ConnectionRefused),
+                    }
+                    processed += 1;
+                    if processed == crate::limits::IO_POLL_BUDGET {
+                        processed = 0;
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        }
+    }
+    Err(DispatchError::ConnectionRefused)
 }
 
 fn header(peer: &Destination) -> Vec<u8> {
@@ -304,7 +371,15 @@ impl Reassembly {
         }
         if !self.packets.contains_key(&key) {
             if self.packets.len() >= PENDING_PACKETS {
-                return None;
+                // Keep the same bound while making progress after UDP loss.
+                // Otherwise one missing fragment per slot rejects every new
+                // packet until the full TTL expires.
+                let oldest = self
+                    .packets
+                    .iter()
+                    .min_by_key(|(_, packet)| packet.expires)
+                    .map(|(key, _)| *key)?;
+                self.remove(&oldest);
             }
             self.packets.insert(
                 key,
@@ -408,11 +483,6 @@ mod tests {
 
     #[test]
     fn udp_wire_round_trips_at_budget_and_bounds_malformed_fragments() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "udp_wire_round_trips_at_budget_and_bounds_malformed_fragments",
-        );
         let peer = Destination::domain("x", 1).unwrap();
         let literal = Bytes::from_static(b"\0\0\0\x01\0\x02\0\x01\x03x:1payload");
         assert_eq!(
@@ -454,12 +524,53 @@ mod tests {
     }
 
     #[test]
-    fn udp_reassembly_isolates_sources_duplicates_counts_bytes_and_expiry() {
-        #[cfg(feature = "interop-test")]
-        let _case = crate::resources::case_events::Case::new(
-            "HYSTERIA2-UNIT",
-            "udp_reassembly_isolates_sources_duplicates_counts_bytes_and_expiry",
+    fn udp_missing_fragments_cannot_block_fresh_complete_packets_until_expiry() {
+        let now = Instant::now();
+        let peer = Destination::domain("x", 1).unwrap();
+        let mut state = Reassembly::default();
+        // Missing suffixes fill the existing global capacity. UDP loss must
+        // not make every subsequent fragmented packet wait the whole TTL.
+        for session in 0..PENDING_PACKETS as u32 {
+            let frames = encode(session, 1, &peer, &[7; 128], 96).unwrap();
+            assert!(
+                state
+                    .push(
+                        decode(frames[0].clone()).unwrap(),
+                        now + Duration::from_nanos(u64::from(session)),
+                        4096
+                    )
+                    .is_none()
+            );
+        }
+        assert_eq!(state.packets.len(), PENDING_PACKETS);
+        let frames = encode(100, 3, &peer, &[9; 128], 96).unwrap();
+        assert!(
+            state
+                .push(
+                    decode(frames[0].clone()).unwrap(),
+                    now + Duration::from_millis(1),
+                    4096
+                )
+                .is_none()
         );
+        let delivered = state
+            .push(
+                decode(frames[1].clone()).unwrap(),
+                now + Duration::from_millis(2),
+                4096,
+            )
+            .expect("fresh complete packet must displace an old missing fragment");
+        assert_eq!(delivered.payload, [9; 128][..]);
+        assert_eq!(state.packets.len(), PENDING_PACKETS - 1);
+        assert!(!state.packets.contains_key(&(0, 1)));
+        assert!(state.bytes <= PENDING_BYTES);
+        state.expire(now + TTL + Duration::from_secs(1), |_| true);
+        assert!(state.packets.is_empty());
+        assert_eq!(state.bytes, 0);
+    }
+
+    #[test]
+    fn udp_reassembly_isolates_sources_duplicates_counts_bytes_and_expiry() {
         let now = Instant::now();
         let peer = Destination::domain("x", 1).unwrap();
         let frames = encode(1, 2, &peer, &[5; 100], 64).unwrap();
@@ -560,7 +671,9 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state.packets.len(), 64);
-        state.expire(now + Duration::from_secs(4), |session| session != 0);
+        assert!(state.packets.contains_key(&(65, 9)));
+        assert_eq!(state.bytes, 63 * 4096 + 1);
+        state.expire(now + Duration::from_secs(4), |session| session != 65);
         assert_eq!(state.packets.len(), 63);
         assert_eq!(state.bytes, 63 * 4096);
         state.expire(now + TTL, |_| true);

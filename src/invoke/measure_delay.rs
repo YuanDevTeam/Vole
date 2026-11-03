@@ -2,35 +2,38 @@
 
 use std::{
     future::Future,
-    io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
     panic::AssertUnwindSafe,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use futures_util::{FutureExt, StreamExt, stream};
-use rustls::{ClientConfig, RootCertStore, client::Resumption, pki_types::ServerName};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_rustls::TlsConnector;
-use url::{Host, Url};
 
 use crate::{
     ResourceLimits,
     config::MeasureConfig,
     dialer::{Dialer, SystemResolver},
-    dispatch::{BoxStream, DispatchError, Dispatcher},
-    inbound::DEFAULT_HEADER_LIMIT,
-    outbound::{OutboundDiagnostic, capture_outbound_diagnostic},
+    dispatch::Dispatcher,
     runtime::PreparedMeasurement,
-    session::{Destination, InboundKind, StreamSession},
 };
 
 use super::{InvokeFailure, registry};
+use crate::resource::probe::Target;
+#[cfg(test)]
+use crate::resource::probe::{parse_status, probe_once, read_response_status};
+#[cfg(test)]
+use crate::{
+    dispatch::BoxStream,
+    session::{Destination, InboundKind},
+};
+#[cfg(test)]
+use std::io;
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MIN_TIMEOUT_SECONDS: u32 = 1;
 const MAX_TIMEOUT_SECONDS: u32 = 30;
@@ -55,27 +58,6 @@ pub(super) struct MeasureDelayResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     delay: Option<u64>,
     error: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TargetScheme {
-    Http,
-    Https,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TargetHost {
-    Domain(String),
-    Ip(IpAddr),
-}
-
-#[derive(Debug, Clone)]
-struct Target {
-    scheme: TargetScheme,
-    destination: Destination,
-    authority: String,
-    origin_form: String,
-    tls_server_name: String,
 }
 
 struct MeasureRequest {
@@ -141,7 +123,7 @@ impl MeasureRequest {
         Ok(Self {
             config_yamls: payload.config_yamls,
             timeout: Duration::from_secs(u64::from(payload.timeout)),
-            target: Target::parse(&payload.url)?,
+            target: Target::parse(&payload.url).map_err(InvokeFailure::from)?,
         })
     }
 }
@@ -165,75 +147,6 @@ impl MeasureDelayResult {
 
     fn panic() -> Self {
         Self::failure("internal error: panic caught in a measureDelay worker")
-    }
-}
-
-impl Target {
-    fn parse(raw: &str) -> Result<Self, InvokeFailure> {
-        let url = Url::parse(raw)
-            .map_err(|_| InvokeFailure::invalid_request("url is not a valid absolute URL"))?;
-        let scheme = match url.scheme() {
-            "http" => TargetScheme::Http,
-            "https" => TargetScheme::Https,
-            _ => {
-                return Err(InvokeFailure::invalid_request(
-                    "url scheme must be http or https",
-                ));
-            }
-        };
-        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
-            return Err(InvokeFailure::invalid_request(
-                "url must not contain authentication or a fragment",
-            ));
-        }
-        let host = match url.host() {
-            Some(Host::Domain(domain)) => {
-                if domain.len() > u8::MAX as usize {
-                    return Err(InvokeFailure::invalid_request("url host is too long"));
-                }
-                TargetHost::Domain(domain.to_owned())
-            }
-            Some(Host::Ipv4(address)) => TargetHost::Ip(IpAddr::V4(address)),
-            Some(Host::Ipv6(address)) => TargetHost::Ip(IpAddr::V6(address)),
-            None => return Err(InvokeFailure::invalid_request("url must contain a host")),
-        };
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| InvokeFailure::invalid_request("url must contain a port"))?;
-        let destination = match &host {
-            TargetHost::Domain(domain) => {
-                Destination::domain(domain.clone(), port).map_err(InvokeFailure::invalid_request)?
-            }
-            TargetHost::Ip(address) => Destination::Ip(SocketAddr::new(*address, port)),
-        };
-        let authority = authority(&host, port);
-        let mut origin_form = url.path().to_owned();
-        if origin_form.is_empty() {
-            origin_form.push('/');
-        }
-        if let Some(query) = url.query() {
-            origin_form.push('?');
-            origin_form.push_str(query);
-        }
-        let tls_server_name = match &host {
-            TargetHost::Domain(domain) => domain.clone(),
-            TargetHost::Ip(address) => address.to_string(),
-        };
-        Ok(Self {
-            scheme,
-            destination,
-            authority,
-            origin_form,
-            tls_server_name,
-        })
-    }
-}
-
-fn authority(host: &TargetHost, port: u16) -> String {
-    match host {
-        TargetHost::Domain(domain) => format!("{domain}:{port}"),
-        TargetHost::Ip(IpAddr::V4(address)) => format!("{address}:{port}"),
-        TargetHost::Ip(IpAddr::V6(address)) => format!("[{address}]:{port}"),
     }
 }
 
@@ -275,7 +188,14 @@ async fn measure_one(
     target: &Target,
     timeout: Duration,
 ) -> Result<u64, InvokeFailure> {
-    let config = MeasureConfig::parse_yaml(config_yaml.as_bytes()).map_err(InvokeFailure::from)?;
+    let directory = super::registry().data_directory().ok();
+    let config = match directory {
+        Some(directory) => {
+            MeasureConfig::parse_yaml_with_directory(config_yaml.as_bytes(), Some(directory.root()))
+        }
+        None => MeasureConfig::parse_yaml(config_yaml.as_bytes()),
+    }
+    .map_err(InvokeFailure::from)?;
     drop(config_yaml);
     let prepared =
         PreparedMeasurement::prepare_config(config, &SystemResolver, ResourceLimits::default())
@@ -284,7 +204,7 @@ async fn measure_one(
     let runtime = prepared
         .into_runtime(Dialer::default())
         .map_err(InvokeFailure::from)?;
-    let result = run_probe(target, runtime.dispatcher(), timeout).await;
+    let result = run_probe(target, runtime.dispatcher(), timeout, runtime.security()).await;
     runtime.shutdown().await;
     result
 }
@@ -293,170 +213,19 @@ async fn run_probe(
     target: &Target,
     dispatcher: Arc<dyn Dispatcher>,
     timeout: Duration,
+    security: &crate::security::SecurityContext,
 ) -> Result<u64, InvokeFailure> {
-    let connector = (target.scheme == TargetScheme::Https)
-        .then(build_tls_connector)
-        .transpose()
-        .map_err(InvokeFailure::from)?;
-    let started = Instant::now();
-    match tokio::time::timeout(timeout, probe_once(target, dispatcher, connector.as_ref())).await {
-        Ok(Ok(())) => u64::try_from(started.elapsed().as_millis())
-            .map_err(|_| InvokeFailure::internal("measureDelay duration overflow")),
-        Ok(Err(error)) => Err(InvokeFailure::new(format!(
-            "measureDelay probe failed: {error}"
-        ))),
-        Err(_) => Err(InvokeFailure::new(format!(
-            "measureDelay timed out after {} seconds",
-            timeout.as_secs()
-        ))),
-    }
-}
-
-fn build_tls_connector() -> io::Result<TlsConnector> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let roots: RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
-    let mut config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(io::Error::other)?
-        .with_root_certificates(Arc::new(roots))
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    config.resumption = Resumption::disabled();
-    Ok(TlsConnector::from(Arc::new(config)))
-}
-
-async fn probe_once(
-    target: &Target,
-    dispatcher: Arc<dyn Dispatcher>,
-    tls_connector: Option<&TlsConnector>,
-) -> io::Result<()> {
-    let session = StreamSession {
-        inbound: InboundKind::InternalMeasure,
-        source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-        destination: target.destination.clone(),
-        sniffed_domain: None,
-    };
-    let (stream, diagnostic) = capture_outbound_diagnostic(dispatcher.connect_tcp(session)).await;
-    let stream = stream.map_err(|error| outbound_connect_error(error, diagnostic.as_ref()))?;
-    let stream = if target.scheme == TargetScheme::Https {
-        let connector = tls_connector
-            .ok_or_else(|| io::Error::other("HTTPS probe is missing its TLS connector"))?;
-        connect_target_tls(connector, stream, &target.tls_server_name).await?
-    } else {
-        stream
-    };
-    send_head_and_read_response(stream, &target.origin_form, &target.authority).await
-}
-
-fn outbound_connect_error(
-    error: DispatchError,
-    diagnostic: Option<&OutboundDiagnostic>,
-) -> io::Error {
-    let diagnostic = diagnostic.map_or_else(String::new, |diagnostic| {
-        format!(
-            " (Vole outbound stage={} kind={} error={:?})",
-            diagnostic.stage(),
-            diagnostic.kind(),
-            diagnostic.message()
-        )
-    });
-    io::Error::other(format!("outbound connect failed: {error}{diagnostic}"))
-}
-
-async fn connect_target_tls(
-    connector: &TlsConnector,
-    stream: BoxStream,
-    server_name: &str,
-) -> io::Result<BoxStream> {
-    let server_name = ServerName::try_from(server_name.to_owned())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    connector
-        .connect(server_name, stream)
-        .await
-        .map(|stream| Box::new(stream) as BoxStream)
-        .map_err(io::Error::other)
-}
-
-async fn send_head_and_read_response(
-    mut stream: BoxStream,
-    request_target: &str,
-    authority: &str,
-) -> io::Result<()> {
-    stream
-        .write_all(
-            format!(
-                "HEAD {request_target} HTTP/1.1\r\nHost: {authority}\r\nAccept: */*\r\nUser-Agent: Vole/{}\r\nConnection: close\r\n\r\n",
-                env!("CARGO_PKG_VERSION")
-            )
-            .as_bytes(),
-        )
-        .await?;
-    stream.flush().await?;
-    read_response_status(&mut stream).await.map(drop)
-}
-
-async fn read_response_status<R>(reader: &mut R) -> io::Result<u16>
-where
-    R: tokio::io::AsyncRead + Unpin + ?Sized,
-{
-    let mut input = Vec::with_capacity(1024);
-    let mut total_read = 0_usize;
-    loop {
-        if let Some(end) = input.windows(4).position(|window| window == b"\r\n\r\n") {
-            let status = parse_status(&input[..end])?;
-            if (100..200).contains(&status) && status != 101 {
-                input.drain(..end + 4);
-                continue;
-            }
-            return Ok(status);
-        }
-        if total_read >= DEFAULT_HEADER_LIMIT {
-            return Err(io::Error::new(
-                io::ErrorKind::FileTooLarge,
-                "HTTP response heads exceed their aggregate limit",
-            ));
-        }
-        let mut chunk = [0_u8; 1024];
-        let remaining = DEFAULT_HEADER_LIMIT - total_read;
-        let max_read = remaining.min(chunk.len());
-        let length = reader.read(&mut chunk[..max_read]).await?;
-        if length == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "HTTP connection closed before the response head",
-            ));
-        }
-        total_read += length;
-        input.extend_from_slice(&chunk[..length]);
-    }
-}
-
-fn parse_status(head: &[u8]) -> io::Result<u16> {
-    let line_end = head
-        .windows(2)
-        .position(|window| window == b"\r\n")
-        .unwrap_or(head.len());
-    let line = &head[..line_end];
-    let mut fields = line.splitn(3, |byte| *byte == b' ');
-    let version = fields.next().unwrap_or_default();
-    let status = fields.next().unwrap_or_default();
-    if (version != b"HTTP/1.0" && version != b"HTTP/1.1")
-        || status.len() != 3
-        || !status.iter().all(u8::is_ascii_digit)
-    {
-        return Err(invalid_data("invalid HTTP response status line"));
-    }
-    let status = u16::from(status[0] - b'0') * 100
-        + u16::from(status[1] - b'0') * 10
-        + u16::from(status[2] - b'0');
-    if !(100..=599).contains(&status) {
-        return Err(invalid_data("HTTP response status is out of range"));
-    }
-    Ok(status)
-}
-
-fn invalid_data(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+    crate::resource::probe::probe(
+        target,
+        dispatcher,
+        timeout,
+        false,
+        &[],
+        &tokio_util::sync::CancellationToken::new(),
+        security,
+    )
+    .await
+    .map_err(InvokeFailure::from)
 }
 
 fn truncate_utf8(value: &str, maximum: usize) -> String {
@@ -672,7 +441,7 @@ mod tests {
         probe_once(
             &Target::parse("http://example.test/path?q=1").unwrap(),
             dispatcher.clone(),
-            None,
+            &crate::security::SecurityContext::new(),
         )
         .await
         .unwrap();

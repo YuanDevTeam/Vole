@@ -1,4 +1,34 @@
 //! Strict parsing for the current Vole YAML configuration.
+mod anytls;
+mod fake_ip;
+mod tun_network;
+pub use tun_network::{TunAddress6, TunNetworkConfig};
+#[cfg(any(feature = "invoke", test))]
+pub(crate) mod live_update;
+pub use anytls::AnyTlsSessionOptions;
+mod fallback;
+mod grpc;
+mod sing_mux;
+mod sniffer;
+pub use fake_ip::{FakeIpConfig, FakeIpFilterMode, FakeIpRange};
+pub use fallback::DnsFallbackConfig;
+pub use grpc::GrpcOptions;
+pub use sing_mux::{SingMuxConfig, SingMuxProtocol};
+mod http_proxy;
+mod ip4p;
+mod ip_version;
+mod masque;
+mod mieru;
+mod trusttunnel;
+pub use http_proxy::HttpOutboundConfig;
+pub use ip_version::IpVersion;
+pub use masque::{MasqueIpStackOptions, MasqueNetwork, MasqueOutboundConfig};
+pub use mieru::{MieruHandshake, MieruMultiplexing, MieruOutboundConfig, MieruTransport};
+pub use trusttunnel::{TrustTunnelOutboundConfig, TrustTunnelPoolOptions};
+
+mod groups;
+pub(crate) use groups::status_ranges;
+pub use groups::{BalanceHashKey, BalanceStrategy, GroupKind, HealthCheckConfig, ProfileConfig};
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -12,33 +42,84 @@ use serde::{
     Deserialize, Deserializer,
     de::{MapAccess, Visitor},
 };
-use serde_yaml_ng::Value as YamlValue;
 use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::{Result, VoleError};
 
+mod dns;
+mod egress;
+pub use egress::EgressOptions;
+mod domain_regex;
+mod functional;
+pub use functional::RematchConfig;
+pub(crate) mod identity_files;
+mod ip_suffix;
+mod process;
+mod security;
+pub use process::{FindProcessMode, ProcessField, ProcessRule, UidRange};
+mod name_regex;
+mod override_expr;
+pub mod providers;
+mod rule_provider;
+pub(crate) mod rules;
+pub use domain_regex::{DomainRegex, MatchFailure, RuleDecision};
+pub use ip_suffix::IpSuffix;
+mod scalar;
+pub use rule_provider::RuleCollection;
+pub(crate) mod yaml;
+pub use rules::RuleInboundType;
+use rules::parse_rule;
+
 mod credentials;
-pub use credentials::{ProxyAccess, ProxyCredentials};
+pub use credentials::{ProxyAccess, ProxyAccessRules, ProxyCredentials};
+mod controller;
+pub use controller::{ControllerCors, ControllerTls};
+pub(crate) use controller::{
+    normalize_mark as normalize_controller_mark, normalize_unix as normalize_controller_unix,
+};
 mod ech;
 pub use ech::StaticEchConfig;
+mod quic;
+pub use quic::QuicReceiveWindow;
 mod hysteria2;
-pub use hysteria2::{Hysteria2Hopping, Hysteria2OutboundConfig};
+mod hysteria2_realm;
+pub use hysteria2::{Hysteria2Gecko, Hysteria2Hopping, Hysteria2OutboundConfig};
+pub use hysteria2_realm::Hysteria2Realm;
+mod wireguard;
+pub use wireguard::{WireGuardKey, WireGuardOutboundConfig, WireGuardPeerConfig};
 mod tuic;
 pub use tuic::{TuicCongestion, TuicOutboundConfig, TuicUdpMode};
 mod jls;
 pub use jls::JlsConfig;
+mod tls_trust;
+pub use tls_trust::TlsTrustConfig;
 mod shadowsocks;
+mod shadowsocks_plugin;
 pub use shadowsocks::{ShadowTlsConfig, ShadowsocksCipher, ShadowsocksOutboundConfig};
+pub use shadowsocks_plugin::ShadowsocksPlugin;
 mod trojan;
 pub use trojan::{TrojanOutboundConfig, TrojanTransport, WebSocketHandshake};
 mod vless;
-pub use vless::{GrpcOptions, SingMuxConfig, SingMuxProtocol, VlessStreamOptions};
+pub use vless::VlessStreamOptions;
 pub(crate) mod xhttp;
 pub use xhttp::{XHttpHeaders, XHttpRequestOptions, XHttpReuseConfig, XHttpVersion};
 mod vmess;
 pub use vmess::StreamTransport as VmessTransport;
 pub use vmess::{StreamTransport, VmessCipher, VmessOutboundConfig, VmessPacketEncoding};
+#[cfg(all(
+    test,
+    feature = "outbound-anytls",
+    feature = "outbound-trojan",
+    feature = "outbound-vmess",
+    feature = "outbound-socks5",
+    feature = "inbound-http",
+    feature = "inbound-socks5"
+))]
+mod tls_policy_tests;
+
+#[cfg(test)]
+mod mihomo_udp_tests;
 
 #[cfg(feature = "invoke")]
 mod measure;
@@ -46,23 +127,30 @@ mod measure;
 #[cfg(feature = "invoke")]
 pub(crate) use measure::MeasureConfig;
 
-pub const MAX_CONFIG_BYTES: usize = 256 * 1024;
-pub const MAX_RULES: usize = 1_024;
-pub const MAX_RULE_BYTES: usize = 1_024;
-pub const MAX_RULES_TOTAL_BYTES: usize = 128 * 1024;
-pub const MAX_DNS_NAMESERVERS: usize = 4;
+pub const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_RULES: usize = 65_536;
+pub const MAX_RULE_BYTES: usize = 16 * 1024;
+pub const MAX_RULES_TOTAL_BYTES: usize = MAX_CONFIG_BYTES;
 pub const MAX_SNIFFER_PORT_ITEMS: usize = 64;
 pub const MAX_GEOX_URL_BYTES: usize = 4_096;
-pub const MAX_CONTROLLER_SECRET_BYTES: usize = 255;
 pub const MAX_ANYTLS_PASSWORD_BYTES: usize = 1_024;
 pub const GEO_UPDATE_INTERVAL_HOURS: u64 = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    pub tls: TlsTrustConfig,
     pub ipv6: bool,
     pub proxies: Vec<ProxyConfig>,
     pub proxy_groups: Vec<SelectProxyGroupConfig>,
-    pub default_route_target: RouteTargetId,
+    pub mode: Mode,
+    pub log_level: LogLevel,
+    pub global_ua: String,
+    pub etag_support: bool,
+    pub unified_delay: bool,
+    pub connections: ConnectionSettings,
+    pub find_process_mode: FindProcessMode,
+    pub egress: EgressOptions,
+    pub profile: ProfileConfig,
     pub geodata_update: Option<GeoDataUpdateConfig>,
     pub external_controller: Option<ExternalControllerConfig>,
     pub inbounds: Vec<InboundConfig>,
@@ -71,12 +159,82 @@ pub struct Config {
     pub sniffer: SnifferConfig,
     pub dns: DnsConfig,
     pub rules: Vec<RuleSpec>,
+    pub sub_rules: Vec<NamedRuleProgram>,
+    pub provider_members: HashMap<String, Vec<String>>,
+    pub providers: Option<std::sync::Arc<providers::ProviderTemplate>>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum Mode {
+    #[default]
+    Rule,
+    Global,
+    Direct,
+}
+
+impl TryFrom<String> for Mode {
+    type Error = &'static str;
+    fn try_from(value: String) -> std::result::Result<Self, &'static str> {
+        match value.to_ascii_lowercase().as_str() {
+            "rule" => Ok(Self::Rule),
+            "global" => Ok(Self::Global),
+            "direct" => Ok(Self::Direct),
+            _ => Err("mode must be rule, global, or direct"),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum LogLevel {
+    Silent,
+    Error,
+    Warning,
+    #[default]
+    Info,
+    Debug,
+}
+
+impl TryFrom<String> for LogLevel {
+    type Error = &'static str;
+    fn try_from(value: String) -> std::result::Result<Self, &'static str> {
+        match value.to_ascii_lowercase().as_str() {
+            "silent" => Ok(Self::Silent),
+            "error" => Ok(Self::Error),
+            "warning" => Ok(Self::Warning),
+            "info" => Ok(Self::Info),
+            "debug" => Ok(Self::Debug),
+            _ => Err("log-level must be silent, error, warning, info, or debug"),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ExternalControllerConfig {
     pub listen: SocketAddr,
     pub secret: Option<String>,
+    pub http_enabled: bool,
+    pub tls_listen: Option<SocketAddr>,
+    pub unix_path: Option<String>,
+    pub routing_mark: u32,
+    pub cors: ControllerCors,
+    pub server_tls: ControllerTls,
+}
+
+impl Default for ExternalControllerConfig {
+    fn default() -> Self {
+        Self {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            secret: None,
+            http_enabled: true,
+            tls_listen: None,
+            unix_path: None,
+            routing_mark: 0,
+            cors: ControllerCors::default(),
+            server_tls: ControllerTls::default(),
+        }
+    }
 }
 
 impl std::fmt::Debug for ExternalControllerConfig {
@@ -91,36 +249,66 @@ impl std::fmt::Debug for ExternalControllerConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeoDataUpdateConfig {
+    pub geodata_mode: bool,
     pub urls: GeoDataUrls,
     pub auto_update: bool,
     pub interval_hours: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GeoDataUrls {
     pub geoip: String,
+    pub mmdb: String,
     pub geosite: String,
+    pub asn: String,
+}
+impl std::fmt::Debug for GeoDataUrls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeoDataUrls")
+            .field("geoip", &crate::resource::http::source_origin(&self.geoip))
+            .field("mmdb", &crate::resource::http::source_origin(&self.mmdb))
+            .field(
+                "geosite",
+                &crate::resource::http::source_origin(&self.geosite),
+            )
+            .field("asn", &crate::resource::http::source_origin(&self.asn))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunConfig {
+    pub network: TunNetworkConfig,
+    pub auto_route: bool,
+    pub auto_detect_interface: bool,
     pub enable: bool,
     pub mtu: u16,
     pub file_descriptor: i32,
     pub device: String,
     pub dns_hijack: Vec<SocketAddr>,
     pub udp_timeout: Duration,
+    #[cfg(target_os = "linux")]
+    pub icmp_timeout: Duration,
+    #[cfg(target_os = "linux")]
+    pub disable_icmp_forwarding: bool,
 }
 
 impl Default for TunConfig {
     fn default() -> Self {
         Self {
+            network: TunNetworkConfig::default(),
+            auto_route: cfg!(target_os = "linux"),
+            auto_detect_interface: cfg!(target_os = "linux"),
             enable: false,
             mtu: default_mtu(),
             file_descriptor: 0,
             device: String::new(),
             dns_hijack: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 53))],
             udp_timeout: Duration::from_secs(300),
+            #[cfg(target_os = "linux")]
+            icmp_timeout: Duration::from_secs(10),
+            #[cfg(target_os = "linux")]
+            disable_icmp_forwarding: false,
         }
     }
 }
@@ -139,6 +327,15 @@ impl TunConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnifferConfig {
     pub enable: bool,
+    pub force_dns_mapping: bool,
+    pub parse_pure_ip: bool,
+    pub force_domain: Vec<DnsPolicySelector>,
+    pub skip_domain: Vec<DnsPolicySelector>,
+    pub skip_src_address: Vec<RuleSpec>,
+    pub skip_dst_address: Vec<RuleSpec>,
+    pub http_override: bool,
+    pub tls_override: bool,
+    pub quic_override: bool,
     pub http_ports: Box<[PortRange]>,
     pub tls_ports: Box<[PortRange]>,
     pub quic_ports: Box<[PortRange]>,
@@ -149,6 +346,15 @@ impl SnifferConfig {
     pub fn disabled() -> Self {
         Self {
             enable: false,
+            force_dns_mapping: true,
+            parse_pure_ip: true,
+            force_domain: Vec::new(),
+            skip_domain: Vec::new(),
+            skip_src_address: Vec::new(),
+            skip_dst_address: Vec::new(),
+            http_override: true,
+            tls_override: true,
+            quic_override: true,
             http_ports: Box::new([]),
             tls_ports: Box::new([]),
             quic_ports: Box::new([]),
@@ -173,35 +379,193 @@ impl SnifferConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsConfig {
+    pub fake_ip: FakeIpConfig,
+    pub fallback: DnsFallbackConfig,
     pub enable: bool,
     pub ipv6: bool,
+    pub prefer_h3: bool,
+    pub ipv6_timeout: Duration,
+    pub cache_max_size: usize,
+    pub cache_algorithm: DnsCacheAlgorithm,
     pub nameservers: Vec<DnsNameserver>,
     pub nameserver_policies: Vec<DnsNameserverPolicy>,
+    pub default_nameservers: Vec<DnsNameserver>,
+    pub proxy_nameservers: Vec<DnsNameserver>,
+    pub proxy_policies: Vec<DnsNameserverPolicy>,
+    pub direct_nameservers: Vec<DnsNameserver>,
+    pub direct_follow_policy: bool,
+    pub use_hosts: bool,
+    pub use_system_hosts: bool,
+    pub hosts: Vec<HostEntry>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DnsCacheAlgorithm {
+    #[default]
+    Lru,
+    Arc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEntry {
+    pub pattern: String,
+    pub value: HostValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostValue {
+    Addresses(Vec<IpAddr>),
+    Alias(String),
+    /// Interface addresses are captured during runtime preparation, never validation.
+    Lan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DnsAddress {
+    Ip(IpAddr),
+    Domain(String),
+    Source(DnsSource),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DnsSource {
+    System,
+    Dhcp(Box<str>),
+}
+
+impl std::str::FromStr for DnsAddress {
+    type Err = std::convert::Infallible;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(value
+            .parse()
+            .map(Self::Ip)
+            .unwrap_or_else(|_| Self::Domain(value.to_owned())))
+    }
+}
+
+impl From<IpAddr> for DnsAddress {
+    fn from(value: IpAddr) -> Self {
+        Self::Ip(value)
+    }
+}
+
+impl From<Ipv4Addr> for DnsAddress {
+    fn from(ip: Ipv4Addr) -> Self {
+        Self::Ip(ip.into())
+    }
+}
+impl From<Ipv6Addr> for DnsAddress {
+    fn from(ip: Ipv6Addr) -> Self {
+        Self::Ip(ip.into())
+    }
+}
+
+impl std::fmt::Display for DnsAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ip(ip) => ip.fmt(f),
+            Self::Domain(host) => host.fmt(f),
+            Self::Source(DnsSource::System) => f.write_str("system"),
+            Self::Source(DnsSource::Dhcp(_)) => f.write_str("dhcp"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DnsNameserver {
     pub transport: DnsTransport,
-    pub address: IpAddr,
+    pub address: DnsAddress,
     pub port: u16,
     pub route: DnsRoute,
+    pub path: Option<String>,
+    pub http_auth: Option<DnsHttpAuth>,
+    pub options: DnsNameserverOptions,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct DnsHttpAuth(pub(crate) Box<str>);
+
+impl std::fmt::Debug for DnsHttpAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DnsHttpAuth([redacted])")
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct DnsNameserverOptions {
+    pub interface: Option<std::sync::Arc<str>>,
+    pub ecs: Option<DnsEcs>,
+    pub ecs_override: bool,
+    pub disabled_types: Box<[u16]>,
+    pub skip_cert_verify: bool,
+    pub verification_name: Option<String>,
+    pub disable_reuse: bool,
+    pub force_h3: bool,
+}
+
+impl std::fmt::Debug for DnsNameserverOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsNameserverOptions")
+            .field("has_interface", &self.interface.is_some())
+            .field("ecs", &self.ecs.is_some())
+            .field("ecs_override", &self.ecs_override)
+            .field("disabled_type_count", &self.disabled_types.len())
+            .field("skip_cert_verify", &self.skip_cert_verify)
+            .field("explicit_name", &self.verification_name.is_some())
+            .field("disable_reuse", &self.disable_reuse)
+            .field("force_h3", &self.force_h3)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DnsEcs {
+    pub address: IpAddr,
+    pub prefix_len: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsNameserverPolicy {
-    pub geosite_codes: Box<[String]>,
+    pub selector: DnsPolicySelector,
     pub nameservers: Box<[DnsNameserver]>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DnsTransport {
-    Udp,
-    Tcp,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsPolicySelector {
+    GeoSite(Box<[String]>),
+    Domains(Box<[String]>),
+    RuleSets {
+        names: Box<[String]>,
+        sets: Vec<std::sync::Arc<RuleCollection>>,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl DnsNameserverPolicy {
+    pub fn geosite_codes(&self) -> &[String] {
+        match &self.selector {
+            DnsPolicySelector::GeoSite(codes) => codes,
+            DnsPolicySelector::Domains(_) | DnsPolicySelector::RuleSets { .. } => &[],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DnsTransport {
+    /// A local response with a Mihomo RCODE name, without network I/O.
+    Rcode(u8),
+    Udp,
+    Tcp,
+    Tls,
+    Https,
+    Http,
+    Quic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DnsRoute {
     Direct,
+    Reject,
+    RejectDrop,
     Rules,
     Route(RouteTargetId),
 }
@@ -213,14 +577,91 @@ pub struct RuleSpec {
     pub no_resolve: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleControl {
+    Pass,
+    PassRule,
+}
+
+impl RuleControl {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::PassRule => "PASS-RULE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubRuleId(usize);
+
+impl SubRuleId {
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedRuleProgram {
+    pub name: String,
+    pub rules: Vec<RuleSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRuleProgram {
+    pub main: Vec<RuleSpec>,
+    pub sub_rules: Vec<NamedRuleProgram>,
+}
+
+impl From<Vec<RuleSpec>> for RuntimeRuleProgram {
+    fn from(main: Vec<RuleSpec>) -> Self {
+        Self {
+            main,
+            sub_rules: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleKind {
+    Flow {
+        predicate: Box<RuleSpec>,
+        control: RuleControl,
+    },
+    SubRule {
+        predicate: Box<RuleSpec>,
+        target: SubRuleId,
+    },
+    RuleSet {
+        name: String,
+        content: Option<std::sync::Arc<RuleCollection>>,
+        source: bool,
+    },
     Domain(String),
     DomainSuffix(String),
     DomainKeyword(String),
+    DomainWildcard(String),
+    DomainRegex(DomainRegex),
+    And(Vec<RuleSpec>),
+    Or(Vec<RuleSpec>),
+    Not(Box<RuleSpec>),
+    SrcIpCidr(IpCidr),
+    SrcIpSuffix(IpSuffix),
+    SrcPorts(Vec<PortRange>),
     GeoSite(String),
     GeoIp(String),
+    SrcGeoIp(String),
+    IpAsn(String),
+    SrcIpAsn(String),
+    InTypes(Vec<RuleInboundType>),
+    InNames(Vec<String>),
+    InUsers(Vec<String>),
+    RematchNames(Vec<String>),
+    Process(ProcessRule),
+    Uid(Vec<UidRange>),
+    InPorts(Vec<PortRange>),
     IpCidr(IpCidr),
+    IpSuffix(IpSuffix),
     DstPorts(Vec<PortRange>),
     Network(Network),
     Match,
@@ -231,6 +672,7 @@ pub enum RuleAction {
     Route(RouteTargetId),
     Direct,
     Reject,
+    RejectDrop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -286,6 +728,8 @@ pub enum ProxyGroupMemberTarget {
     Route(RouteTargetId),
     Direct,
     Reject,
+    RejectDrop,
+    Control(RuleControl),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,15 +740,42 @@ pub struct ProxyGroupMemberConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectProxyGroupConfig {
+    pub kind: GroupKind,
+    pub strategy: BalanceStrategy,
+    pub hash_key: BalanceHashKey,
+    pub health: HealthCheckConfig,
+    pub tolerance: u16,
+    pub max_failed_times: u32,
     pub name: String,
     pub members: Vec<ProxyGroupMemberConfig>,
     pub initial_member: usize,
+    pub disable_udp: bool,
+    pub hidden: bool,
+    pub icon: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpCidr {
     pub network: IpAddr,
     pub prefix_len: u8,
+}
+
+impl IpCidr {
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.network, ip) {
+            (IpAddr::V4(a), IpAddr::V4(b)) => {
+                self.prefix_len == 0
+                    || u32::from(a) >> (32 - self.prefix_len)
+                        == u32::from(b) >> (32 - self.prefix_len)
+            }
+            (IpAddr::V6(a), IpAddr::V6(b)) => {
+                self.prefix_len == 0
+                    || u128::from(a) >> (128 - self.prefix_len)
+                        == u128::from(b) >> (128 - self.prefix_len)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,6 +792,11 @@ pub enum Network {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyConfig {
+    pub tfo: bool,
+    pub mptcp: bool,
+    pub egress: EgressOptions,
+    pub ip_version: IpVersion,
+    pub smux: Option<SingMuxConfig>,
     pub tag: String,
     pub dialer_proxy: Option<RouteTargetId>,
     pub udp: bool,
@@ -329,8 +805,17 @@ pub struct ProxyConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyProtocol {
+    Direct,
+    Rematch(RematchConfig),
+    Dns,
+    Reject,
+    Masque(MasqueOutboundConfig),
+    TrustTunnel(TrustTunnelOutboundConfig),
+    Mieru(MieruOutboundConfig),
+    Http(HttpOutboundConfig),
+    WireGuard(WireGuardOutboundConfig),
     Tuic(TuicOutboundConfig),
-    Hysteria2(Hysteria2OutboundConfig),
+    Hysteria2(Box<Hysteria2OutboundConfig>),
     Vmess(VmessOutboundConfig),
     Trojan(TrojanOutboundConfig),
     Vless(VlessOutboundConfig),
@@ -340,32 +825,28 @@ pub enum ProxyProtocol {
 }
 
 impl ProxyConfig {
+    /// Functional route targets have no proxy-server endpoint.
     #[must_use]
-    pub fn address(&self) -> &str {
-        match &self.protocol {
-            ProxyProtocol::Tuic(config) => &config.address,
-            ProxyProtocol::Hysteria2(config) => &config.address,
-            ProxyProtocol::Vmess(config) => &config.address,
-            ProxyProtocol::Trojan(config) => &config.address,
-            ProxyProtocol::Vless(config) => &config.address,
-            ProxyProtocol::Socks5(config) => &config.address,
-            ProxyProtocol::AnyTls(config) => &config.address,
-            ProxyProtocol::Shadowsocks(config) => &config.address,
-        }
-    }
-
-    #[must_use]
-    pub const fn port(&self) -> u16 {
-        match &self.protocol {
-            ProxyProtocol::Tuic(config) => config.port,
-            ProxyProtocol::Hysteria2(config) => config.port,
-            ProxyProtocol::Vmess(config) => config.port,
-            ProxyProtocol::Trojan(config) => config.port,
-            ProxyProtocol::Vless(config) => config.port,
-            ProxyProtocol::Socks5(config) => config.port,
-            ProxyProtocol::AnyTls(config) => config.port,
-            ProxyProtocol::Shadowsocks(config) => config.port,
-        }
+    pub fn server_endpoint(&self) -> Option<(&str, u16)> {
+        Some(match &self.protocol {
+            ProxyProtocol::Direct
+            | ProxyProtocol::Dns
+            | ProxyProtocol::Reject
+            | ProxyProtocol::Rematch(_) => return None,
+            ProxyProtocol::Masque(config) => (&config.address, config.port),
+            ProxyProtocol::TrustTunnel(config) => (&config.address, config.port),
+            ProxyProtocol::Mieru(config) => (&config.address, config.port),
+            ProxyProtocol::WireGuard(config) => (&config.address, config.port),
+            ProxyProtocol::Http(config) => (&config.address, config.port),
+            ProxyProtocol::Tuic(config) => (&config.address, config.port),
+            ProxyProtocol::Hysteria2(config) => (&config.address, config.port),
+            ProxyProtocol::Vmess(config) => (&config.address, config.port),
+            ProxyProtocol::Trojan(config) => (&config.address, config.port),
+            ProxyProtocol::Vless(config) => (&config.address, config.port),
+            ProxyProtocol::Socks5(config) => (&config.address, config.port),
+            ProxyProtocol::AnyTls(config) => (&config.address, config.port),
+            ProxyProtocol::Shadowsocks(config) => (&config.address, config.port),
+        })
     }
 }
 
@@ -412,6 +893,7 @@ pub enum VlessPacketEncoding {
     #[default]
     #[serde(rename = "xudp")]
     Xudp,
+    // Public VLESS YAML normalizes this input to XUDP; kept for the internal codec.
     #[serde(rename = "none")]
     Raw,
     #[serde(rename = "packetaddr", alias = "packet")]
@@ -424,6 +906,7 @@ pub struct Socks5OutboundConfig {
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub tls: Option<TlsClientPolicy>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -432,24 +915,58 @@ pub struct AnyTlsOutboundConfig {
     pub port: u16,
     pub password: String,
     pub server_name: String,
-    pub tls: AnyTlsCertificatePolicy,
+    pub security: SecurityConfig,
+    pub session: AnyTlsSessionOptions,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AnyTlsCertificatePolicy {
+pub struct TlsClientPolicy {
+    pub ech: Option<StaticEchConfig>,
     pub client_fingerprint: Option<ClientFingerprint>,
     pub alpn: Vec<Vec<u8>>,
-    pub skip_cert_verify: bool,
-    pub fingerprint: Option<[u8; 32]>,
+    pub certificate: TlsCertificatePolicy,
+    pub identity: Option<TlsIdentityPem>,
 }
 
 /// A version-pinned ClientHello profile, independent of certificate pins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientFingerprint {
-    Chrome120,
     Chrome133,
     Firefox120,
     Safari16,
+    Ios14,
+    Android11,
+    Edge85,
+    ThreeSixty75,
+    Qq111,
+}
+impl ClientFingerprint {
+    pub(crate) const fn supports_tls13(self) -> bool {
+        !matches!(self, Self::Android11 | Self::ThreeSixty75)
+    }
+}
+fn validate_tls13_fingerprint(profile: Option<ClientFingerprint>) -> Result<()> {
+    if profile.is_some_and(|profile| !profile.supports_tls13()) {
+        return invalid("client-fingerprint only supports TLS1.2 for this transport");
+    }
+    Ok(())
+}
+
+// Only the immutable template value is process-shared. Selection precedes all
+// node/REALITY/download-leg compatibility checks; Stop does not redraw it.
+fn process_random_fingerprint() -> ClientFingerprint {
+    static SELECTED: std::sync::OnceLock<ClientFingerprint> = std::sync::OnceLock::new();
+    *SELECTED.get_or_init(|| weighted_fingerprint(rand::random_range(0..12)))
+}
+
+fn weighted_fingerprint(value: u8) -> ClientFingerprint {
+    match value {
+        0..=5 => ClientFingerprint::Chrome133,
+        6..=8 => ClientFingerprint::Safari16,
+        9..=10 => ClientFingerprint::Ios14,
+        11 => ClientFingerprint::Firefox120,
+        _ => unreachable!("fingerprint weight outside its bounded random range"),
+    }
 }
 
 fn parse_client_fingerprint(value: Option<&str>) -> Result<Option<ClientFingerprint>> {
@@ -459,9 +976,14 @@ fn parse_client_fingerprint(value: Option<&str>) -> Result<Option<ClientFingerpr
             invalid("client-fingerprint is not compiled in")
         }
         Some("chrome") => Ok(Some(ClientFingerprint::Chrome133)),
-        Some("chrome120") => Ok(Some(ClientFingerprint::Chrome120)),
-        Some("firefox" | "firefox120") => Ok(Some(ClientFingerprint::Firefox120)),
-        Some("safari" | "safari16") => Ok(Some(ClientFingerprint::Safari16)),
+        Some("firefox") => Ok(Some(ClientFingerprint::Firefox120)),
+        Some("safari") => Ok(Some(ClientFingerprint::Safari16)),
+        Some("ios") => Ok(Some(ClientFingerprint::Ios14)),
+        Some("android") => Ok(Some(ClientFingerprint::Android11)),
+        Some("edge") => Ok(Some(ClientFingerprint::Edge85)),
+        Some("360") => Ok(Some(ClientFingerprint::ThreeSixty75)),
+        Some("qq") => Ok(Some(ClientFingerprint::Qq111)),
+        Some("random") => Ok(Some(process_random_fingerprint())),
         Some(_) => invalid("unsupported client-fingerprint"),
     }
 }
@@ -506,15 +1028,24 @@ pub enum SecurityConfig {
     Tls(TlsConfig),
     Reality(RealityConfig),
     Jls(JlsConfig),
+    ShadowTls(ShadowTlsConfig),
 }
 
 impl SecurityConfig {
+    #[must_use]
+    pub fn as_tls(&self) -> Option<&TlsConfig> {
+        match self {
+            Self::Tls(config) => Some(config),
+            _ => None,
+        }
+    }
     fn client_fingerprint(&self) -> Option<ClientFingerprint> {
         match self {
             Self::None => None,
             Self::Tls(config) => config.client_fingerprint,
             Self::Reality(config) => config.client_fingerprint,
             Self::Jls(config) => config.tls.client_fingerprint,
+            Self::ShadowTls(config) => config.client_fingerprint,
         }
     }
     #[must_use]
@@ -524,6 +1055,7 @@ impl SecurityConfig {
             Self::Tls(config) => &config.server_name,
             Self::Reality(config) => &config.server_name,
             Self::Jls(config) => &config.tls.server_name,
+            Self::ShadowTls(config) => &config.server_name,
         }
     }
 }
@@ -564,6 +1096,7 @@ impl std::fmt::Debug for TlsCertificatePolicy {
 pub struct TlsIdentityPem {
     pub certificate: String,
     pub private_key: String,
+    pub(crate) origin: Option<std::sync::Arc<identity_files::IdentityFileOrigin>>,
 }
 impl std::fmt::Debug for TlsIdentityPem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -598,16 +1131,7 @@ pub struct RealityConfig {
 
 impl RealityConfig {
     pub(crate) fn validate_fingerprint(&self) -> Result<()> {
-        if self.support_x25519mlkem768
-            && !matches!(
-                self.client_fingerprint,
-                None | Some(ClientFingerprint::Chrome133)
-            )
-        {
-            return invalid(
-                "hybrid REALITY requires client-fingerprint chrome or no named fingerprint",
-            );
-        }
+        validate_tls13_fingerprint(self.client_fingerprint)?;
         Ok(())
     }
 }
@@ -668,6 +1192,7 @@ pub struct TunInboundConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixedInboundConfig {
+    pub access_rules: std::sync::Arc<ProxyAccessRules>,
     pub tag: String,
     pub port: u16,
     pub access: ProxyAccess,
@@ -705,6 +1230,49 @@ impl std::fmt::Debug for HttpInboundConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVoleConfig {
+    #[serde(rename = "find-process-mode", default)]
+    find_process_mode: FindProcessMode,
+    #[serde(rename = "interface-name", default)]
+    interface: String,
+    #[serde(rename = "routing-mark", default)]
+    routing_mark: i64,
+    #[serde(default)]
+    tls: TlsTrustConfig,
+    #[serde(rename = "bind-address", default)]
+    bind_address: Option<String>,
+    #[serde(rename = "lan-allowed-ips", default)]
+    lan_allowed_ips: Option<Vec<String>>,
+    #[serde(rename = "lan-disallowed-ips", default)]
+    lan_disallowed_ips: Vec<String>,
+    #[serde(rename = "skip-auth-prefixes", default)]
+    skip_auth_prefixes: Vec<String>,
+
+    #[serde(default)]
+    experimental: RawExperimental,
+
+    #[serde(rename = "tcp-concurrent", default)]
+    tcp_concurrent: bool,
+    #[serde(rename = "keep-alive-idle", default)]
+    keep_alive_idle: i32,
+    #[serde(rename = "keep-alive-interval", default)]
+    keep_alive_interval: i32,
+    #[serde(rename = "disable-keep-alive", default)]
+    disable_keep_alive: bool,
+
+    #[serde(rename = "unified-delay", default)]
+    unified_delay: bool,
+    #[serde(default)]
+    profile: ProfileConfig,
+    #[serde(default)]
+    mode: Mode,
+    #[serde(rename = "log-level", default)]
+    log_level: LogLevel,
+    #[serde(rename = "global-ua", default = "default_global_ua")]
+    global_ua: String,
+    #[serde(rename = "etag-support", default = "default_true")]
+    etag_support: bool,
+    #[serde(default)]
+    hosts: std::collections::BTreeMap<String, RawPolicyNameservers>,
     #[serde(default = "default_true")]
     ipv6: bool,
     #[serde(
@@ -713,6 +1281,8 @@ struct RawVoleConfig {
         deserialize_with = "deserialize_present_option"
     )]
     geox_url: Option<RawGeoDataUrls>,
+    #[serde(rename = "geodata-mode", default)]
+    geodata_mode: bool,
     #[serde(
         rename = "geo-auto-update",
         default,
@@ -731,6 +1301,22 @@ struct RawVoleConfig {
         deserialize_with = "deserialize_present_option"
     )]
     external_controller: Option<String>,
+    #[serde(
+        rename = "external-controller-tls",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    external_controller_tls: Option<String>,
+    #[serde(
+        rename = "external-controller-unix",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    external_controller_unix: Option<String>,
+    #[serde(rename = "external-controller-routing-mark", default)]
+    external_controller_routing_mark: i64,
+    #[serde(rename = "external-controller-cors", default)]
+    external_controller_cors: ControllerCors,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     secret: Option<String>,
     #[serde(
@@ -747,6 +1333,7 @@ struct RawVoleConfig {
     tun: Option<RawTunConfig>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     sniffer: Option<RawSnifferConfig>,
+    #[serde(default, deserialize_with = "deserialize_non_null_vec")]
     proxies: Vec<RawOutbound>,
     #[serde(
         rename = "proxy-groups",
@@ -756,34 +1343,158 @@ struct RawVoleConfig {
     proxy_groups: Vec<RawProxyGroup>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     dns: Option<RawDnsConfig>,
+    #[serde(default)]
     rules: Vec<String>,
+    #[serde(rename = "sub-rules", default)]
+    sub_rules: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExperimental {
+    #[serde(rename = "dialer-ip4p-convert", default)]
+    dialer_ip4p_convert: bool,
+    #[serde(rename = "quic-go-disable-gso", default)]
+    quic_disable_gso: bool,
+    #[serde(rename = "quic-go-disable-ecn", default = "default_true")]
+    quic_disable_ecn: bool,
+}
+impl Default for RawExperimental {
+    fn default() -> Self {
+        Self {
+            dialer_ip4p_convert: false,
+            quic_disable_gso: false,
+            quic_disable_ecn: true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProxyGroup {
+    #[serde(default)]
+    strategy: BalanceStrategy,
+    #[serde(rename = "hash-key", default)]
+    hash_key: BalanceHashKey,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    interval: u64,
+    #[serde(default)]
+    timeout: u64,
+    #[serde(default = "default_true")]
+    lazy: bool,
+    #[serde(
+        rename = "expected-status",
+        default,
+        deserialize_with = "scalar::string_or_integer"
+    )]
+    expected_status: String,
+    #[serde(default)]
+    tolerance: u16,
+    #[serde(rename = "max-failed-times", default)]
+    max_failed_times: u32,
+
+    #[serde(rename = "disable-udp", default)]
+    disable_udp: bool,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    icon: String,
     name: String,
     #[serde(rename = "type")]
-    kind: String,
+    kind: GroupKind,
     proxies: Vec<String>,
-    #[serde(
-        rename = "default-selected",
-        default,
-        deserialize_with = "deserialize_present_option"
-    )]
+    #[serde(rename = "default-selected", default)]
     default_selected: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawGeoDataUrls {
+    #[serde(default = "default_geoip_url")]
     geoip: String,
+    #[serde(default = "default_mmdb_url")]
+    mmdb: String,
+    #[serde(default = "default_geosite_url")]
     geosite: String,
+    #[serde(default = "default_asn_url")]
+    asn: String,
+}
+impl std::fmt::Debug for RawGeoDataUrls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawGeoDataUrls").finish_non_exhaustive()
+    }
+}
+fn default_global_ua() -> String {
+    concat!("Vole/", env!("CARGO_PKG_VERSION")).into()
+}
+fn default_geoip_url() -> String {
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat".into()
+}
+fn default_mmdb_url() -> String {
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb".into()
+}
+fn default_geosite_url() -> String {
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat".into()
+}
+fn default_asn_url() -> String {
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb".into()
+}
+impl Default for RawGeoDataUrls {
+    fn default() -> Self {
+        Self {
+            geoip: default_geoip_url(),
+            mmdb: default_mmdb_url(),
+            geosite: default_geosite_url(),
+            asn: default_asn_url(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTunConfig {
+    #[serde(
+        rename = "inet6-address",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    inet6_address: Option<Vec<String>>,
+    #[serde(rename = "route-address", default)]
+    route_address: Vec<String>,
+    #[serde(rename = "route-exclude-address", default)]
+    route_exclude_address: Vec<String>,
+    #[serde(rename = "iproute2-table-index", default)]
+    table_index: u32,
+    #[serde(rename = "iproute2-rule-index", default)]
+    rule_index: u32,
+    #[serde(rename = "strict-route", default)]
+    strict_route: bool,
+    #[serde(rename = "include-interface", default)]
+    include_interface: Vec<String>,
+    #[serde(rename = "exclude-interface", default)]
+    exclude_interface: Vec<String>,
+    #[serde(rename = "include-uid", default)]
+    include_uid: Vec<u32>,
+    #[serde(rename = "include-uid-range", default)]
+    include_uid_range: Vec<String>,
+    #[serde(rename = "exclude-uid", default)]
+    exclude_uid: Vec<u32>,
+    #[serde(rename = "exclude-uid-range", default)]
+    exclude_uid_range: Vec<String>,
+    #[serde(rename = "exclude-src-port", default)]
+    exclude_src_port: Vec<u16>,
+    #[serde(rename = "exclude-src-port-range", default)]
+    exclude_src_port_range: Vec<String>,
+    #[serde(rename = "exclude-dst-port", default)]
+    exclude_dst_port: Vec<u16>,
+    #[serde(rename = "exclude-dst-port-range", default)]
+    exclude_dst_port_range: Vec<String>,
+    #[serde(rename = "auto-route", default)]
+    auto_route: Option<bool>,
+    #[serde(rename = "auto-detect-interface", default)]
+    auto_detect_interface: Option<bool>,
     #[serde(default)]
     enable: bool,
     #[serde(default)]
@@ -800,6 +1511,12 @@ struct RawTunConfig {
     dns_hijack: Vec<String>,
     #[serde(rename = "udp-timeout", default)]
     udp_timeout: u64,
+    #[cfg(target_os = "linux")]
+    #[serde(rename = "icmp-timeout", default)]
+    icmp_timeout: i64,
+    #[cfg(target_os = "linux")]
+    #[serde(rename = "disable-icmp-forwarding", default)]
+    disable_icmp_forwarding: bool,
 }
 
 impl RawTunConfig {
@@ -838,13 +1555,51 @@ impl RawTunConfig {
         } else {
             self.udp_timeout
         });
+        #[cfg(target_os = "linux")]
+        let icmp_timeout = {
+            let seconds = u64::try_from(self.icmp_timeout).map_err(|_| {
+                VoleError::InvalidConfig("tun.icmp-timeout must be nonnegative seconds".into())
+            })?;
+            let timeout = Duration::from_secs(if seconds == 0 { 10 } else { seconds });
+            if std::time::Instant::now().checked_add(timeout).is_none() {
+                return invalid("tun.icmp-timeout exceeds the clock range");
+            }
+            timeout
+        };
         Ok(TunConfig {
+            network: tun_network::RawTunNetworkConfig {
+                inet6_address: self.inet6_address,
+                route_address: self.route_address,
+                route_exclude_address: self.route_exclude_address,
+                table_index: self.table_index,
+                rule_index: self.rule_index,
+                strict_route: self.strict_route,
+                include_interface: self.include_interface,
+                exclude_interface: self.exclude_interface,
+                include_uid: self.include_uid,
+                include_uid_range: self.include_uid_range,
+                exclude_uid: self.exclude_uid,
+                exclude_uid_range: self.exclude_uid_range,
+                exclude_src_port: self.exclude_src_port,
+                exclude_src_port_range: self.exclude_src_port_range,
+                exclude_dst_port: self.exclude_dst_port,
+                exclude_dst_port_range: self.exclude_dst_port_range,
+            }
+            .normalize()?,
+            auto_route: self.auto_route.unwrap_or(cfg!(target_os = "linux")),
+            auto_detect_interface: self
+                .auto_detect_interface
+                .unwrap_or(cfg!(target_os = "linux")),
             enable: self.enable,
             mtu,
             file_descriptor: self.file_descriptor,
             device: self.device,
             dns_hijack,
             udp_timeout,
+            #[cfg(target_os = "linux")]
+            icmp_timeout,
+            #[cfg(target_os = "linux")]
+            disable_icmp_forwarding: self.disable_icmp_forwarding,
         })
     }
 }
@@ -852,37 +1607,57 @@ impl RawTunConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSnifferConfig {
+    #[serde(default)]
     enable: bool,
+    #[serde(rename = "force-dns-mapping", default = "default_true")]
+    force_dns_mapping: bool,
+    #[serde(rename = "parse-pure-ip", default = "default_true")]
+    parse_pure_ip: bool,
+    #[serde(rename = "force-domain", default)]
+    force_domain: Vec<String>,
+    #[serde(rename = "skip-domain", default)]
+    skip_domain: Vec<String>,
+    #[serde(rename = "skip-src-address", default)]
+    skip_src_address: Vec<String>,
+    #[serde(rename = "skip-dst-address", default)]
+    skip_dst_address: Vec<String>,
+    #[serde(rename = "override-destination", default = "default_true")]
+    override_destination: bool,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     sniff: Option<RawSniffConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default)]
 struct RawSniffConfig {
-    #[serde(
-        rename = "HTTP",
-        default,
-        deserialize_with = "deserialize_present_option"
-    )]
     http: Option<Option<RawSniffProtocolConfig>>,
-    #[serde(
-        rename = "TLS",
-        default,
-        deserialize_with = "deserialize_present_option"
-    )]
     tls: Option<Option<RawSniffProtocolConfig>>,
-    #[serde(
-        rename = "QUIC",
-        default,
-        deserialize_with = "deserialize_present_option"
-    )]
     quic: Option<Option<RawSniffProtocolConfig>>,
+}
+impl<'de> Deserialize<'de> for RawSniffConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let entries = serde_yaml_ng::Mapping::deserialize(deserializer)?;
+        let mut result = Self::default();
+        for (name, value) in entries {
+            let name = name.as_str().ok_or_else(|| {
+                serde::de::Error::custom("sniffer protocol name must be a string")
+            })?;
+            let field = match name.to_ascii_uppercase().as_str() {
+                "HTTP" => &mut result.http,
+                "TLS" => &mut result.tls,
+                "QUIC" => &mut result.quic,
+                _ => return Err(serde::de::Error::custom("unsupported sniffer protocol")),
+            };
+            *field = Some(serde_yaml_ng::from_value(value).map_err(serde::de::Error::custom)?);
+        }
+        Ok(result)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSniffProtocolConfig {
+    #[serde(rename = "override-destination", default)]
+    override_destination: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     ports: Option<Vec<RawSnifferPort>>,
 }
@@ -897,23 +1672,77 @@ enum RawSnifferPort {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDnsConfig {
-    enable: bool,
-    #[serde(default = "default_true")]
-    ipv6: bool,
     #[serde(default)]
+    fallback: Vec<String>,
+    #[serde(rename = "fallback-filter", default)]
+    fallback_filter: fallback::RawFallbackFilter,
+    #[serde(rename = "fallback-lazy-query", default)]
+    fallback_lazy_query: bool,
+    #[serde(rename = "fake-ip-range", default = "fake_ip::default_fake_range")]
+    fake_ip_range: String,
+    #[serde(rename = "fake-ip-range6", default)]
+    fake_ip_range6: String,
+    #[serde(rename = "fake-ip-filter", default = "fake_ip::default_fake_filter")]
+    fake_ip_filter: Vec<String>,
+    #[serde(rename = "fake-ip-filter-mode", default)]
+    fake_ip_filter_mode: FakeIpFilterMode,
+    #[serde(rename = "fake-ip-ttl", default = "fake_ip::default_fake_ttl")]
+    fake_ip_ttl: i64,
+    #[serde(default)]
+    enable: bool,
+    #[serde(default)]
+    ipv6: bool,
+    #[serde(rename = "prefer-h3", default)]
+    prefer_h3: bool,
+    #[serde(rename = "ipv6-timeout", default = "dns::default_ipv6_timeout")]
+    ipv6_timeout: u64,
+    #[serde(rename = "cache-max-size", default)]
+    cache_max_size: usize,
+    #[serde(rename = "cache-algorithm", default)]
+    cache_algorithm: String,
+    #[serde(default = "dns::default_nameservers")]
     nameserver: Vec<String>,
+    #[serde(rename = "default-nameserver", default = "dns::default_bootstrap")]
+    default_nameserver: Vec<String>,
+    #[serde(rename = "proxy-server-nameserver", default)]
+    proxy_nameserver: Vec<String>,
+    #[serde(rename = "direct-nameserver", default)]
+    direct_nameserver: Vec<String>,
+    #[serde(rename = "direct-nameserver-follow-policy", default)]
+    direct_follow_policy: bool,
+    #[serde(rename = "use-hosts", default = "default_true")]
+    use_hosts: bool,
+    #[serde(rename = "use-system-hosts", default = "default_true")]
+    use_system_hosts: bool,
+    #[serde(rename = "respect-rules", default)]
+    respect_rules: bool,
+    #[serde(rename = "enhanced-mode", default = "dns::redir_host")]
+    enhanced_mode: String,
     #[serde(
         rename = "nameserver-policy",
         default,
         deserialize_with = "deserialize_dns_nameserver_policies"
     )]
     nameserver_policies: Vec<RawDnsNameserverPolicy>,
+    #[serde(
+        rename = "proxy-server-nameserver-policy",
+        default,
+        deserialize_with = "deserialize_dns_nameserver_policies"
+    )]
+    proxy_policies: Vec<RawDnsNameserverPolicy>,
 }
 
 #[derive(Debug)]
 struct RawDnsNameserverPolicy {
     selector: String,
     nameservers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawPolicyNameservers {
+    One(String),
+    Many(Vec<String>),
 }
 
 fn deserialize_dns_nameserver_policies<'de, D>(
@@ -939,10 +1768,15 @@ where
             A: MapAccess<'de>,
         {
             let mut policies = Vec::with_capacity(mapping.size_hint().unwrap_or(0));
-            while let Some((selector, nameservers)) = mapping.next_entry::<String, Vec<String>>()? {
+            while let Some((selector, nameservers)) =
+                mapping.next_entry::<String, RawPolicyNameservers>()?
+            {
                 policies.push(RawDnsNameserverPolicy {
                     selector,
-                    nameservers,
+                    nameservers: match nameservers {
+                        RawPolicyNameservers::One(nameserver) => vec![nameserver],
+                        RawPolicyNameservers::Many(nameservers) => nameservers,
+                    },
                 });
             }
             Ok(policies)
@@ -952,12 +1786,111 @@ where
     deserializer.deserialize_map(OrderedPoliciesVisitor)
 }
 
+#[derive(Debug)]
+struct RawOutbound {
+    tfo: bool,
+    mptcp: bool,
+    egress: EgressOptions,
+    ip_version: IpVersion,
+    smux: Option<sing_mux::RawSingMux>,
+    protocol: RawProtocol,
+}
+impl<'de> Deserialize<'de> for RawOutbound {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let mut value = serde_yaml_ng::Value::deserialize(deserializer)?;
+        let mapping = value
+            .as_mapping_mut()
+            .ok_or_else(|| serde::de::Error::custom("proxy requires a mapping"))?;
+        functional::validate_fields(mapping).map_err(serde::de::Error::custom)?;
+        let interface = mapping
+            .remove("interface-name")
+            .map(serde_yaml_ng::from_value::<String>)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_default();
+        let mark = mapping
+            .remove("routing-mark")
+            .map(serde_yaml_ng::from_value::<i64>)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_default();
+        let egress = EgressOptions::normalize(interface, mark).map_err(serde::de::Error::custom)?;
+        let tfo = value
+            .as_mapping_mut()
+            .expect("mapping checked")
+            .remove("tfo")
+            .map(serde_yaml_ng::from_value::<bool>)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_default();
+        let mptcp = value
+            .as_mapping_mut()
+            .expect("mapping checked")
+            .remove("mptcp")
+            .map(serde_yaml_ng::from_value::<bool>)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_default();
+        let ip_version = value
+            .as_mapping_mut()
+            .ok_or_else(|| serde::de::Error::custom("proxy requires a mapping"))?
+            .remove("ip-version")
+            .map(serde_yaml_ng::from_value)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_default();
+        let smux = value
+            .as_mapping_mut()
+            .expect("mapping checked")
+            .remove("smux")
+            .map(|value| {
+                if !value.is_mapping() {
+                    return Err("smux requires a mapping".to_owned());
+                }
+                serde_yaml_ng::from_value(value).map_err(|error| error.to_string())
+            })
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        let protocol = serde_yaml_ng::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            tfo,
+            mptcp,
+            egress,
+            ip_version,
+            smux,
+            protocol,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 // This enum exists only while deserializing a configuration. Keeping the
 // protocol fields inline avoids extra heap allocations in the startup path.
 #[allow(clippy::large_enum_variant)]
-enum RawOutbound {
+enum RawProtocol {
+    #[serde(rename = "direct")]
+    Direct(functional::RawFunctional),
+    #[serde(rename = "dns")]
+    Dns(functional::RawFunctional),
+    #[serde(rename = "rematch")]
+    Rematch(functional::RawRematch),
+    #[serde(rename = "reject")]
+    Reject(functional::RawFunctional),
+    #[serde(rename = "masque")]
+    Masque(#[serde(deserialize_with = "masque::deserialize")] masque::RawMasque),
+    #[serde(rename = "trusttunnel")]
+    TrustTunnel(
+        #[serde(deserialize_with = "trusttunnel::deserialize")] trusttunnel::RawTrustTunnel,
+    ),
+    #[serde(rename = "mieru")]
+    Mieru(#[serde(deserialize_with = "mieru::deserialize")] mieru::RawMieru),
+    #[serde(rename = "wireguard")]
+    WireGuard(#[serde(deserialize_with = "wireguard::deserialize")] wireguard::RawWireGuard),
+    #[serde(rename = "http")]
+    Http(http_proxy::RawHttp),
     #[serde(rename = "tuic")]
     Tuic(#[serde(deserialize_with = "tuic::deserialize")] tuic::RawTuic),
     #[serde(rename = "hysteria2")]
@@ -978,9 +1911,9 @@ enum RawOutbound {
         #[serde(
             rename = "plugin-opts",
             default,
-            deserialize_with = "shadowsocks::deserialize_plugin"
+            deserialize_with = "shadowsocks_plugin::deserialize"
         )]
-        plugin_opts: Option<shadowsocks::RawShadowTls>,
+        plugin_opts: Option<serde_yaml_ng::Value>,
         #[serde(
             rename = "client-fingerprint",
             default,
@@ -1015,6 +1948,28 @@ enum RawOutbound {
         udp: bool,
         #[serde(default)]
         tls: bool,
+        #[serde(
+            rename = "skip-cert-verify",
+            default,
+            deserialize_with = "deserialize_present_option"
+        )]
+        skip_cert_verify: Option<bool>,
+        #[serde(
+            rename = "name-cert-verify",
+            default,
+            deserialize_with = "deserialize_present_option"
+        )]
+        name_cert_verify: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_present_option")]
+        fingerprint: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_present_option")]
+        certificate: Option<String>,
+        #[serde(
+            rename = "private-key",
+            default,
+            deserialize_with = "deserialize_present_option"
+        )]
+        private_key: Option<String>,
         #[serde(default, deserialize_with = "deserialize_present_option")]
         username: Option<String>,
         #[serde(default, deserialize_with = "deserialize_present_option")]
@@ -1032,22 +1987,60 @@ enum RawOutbound {
         server: String,
         port: u16,
         password: String,
+        #[serde(rename = "idle-session-check-interval", default)]
+        idle_session_check_interval: i64,
+        #[serde(rename = "idle-session-timeout", default)]
+        idle_session_timeout: i64,
+        #[serde(rename = "min-idle-session", default)]
+        min_idle_session: i64,
+        #[serde(rename = "disable-reuse", default)]
+        disable_reuse: bool,
+        #[serde(rename = "client-metadata", default)]
+        client_metadata: String,
         #[serde(default)]
         udp: bool,
         #[serde(default, deserialize_with = "deserialize_present_option")]
         sni: Option<String>,
         #[serde(default, deserialize_with = "deserialize_present_option")]
         alpn: Option<Vec<String>>,
-        #[serde(rename = "skip-cert-verify", default)]
-        skip_cert_verify: bool,
+        #[serde(
+            rename = "skip-cert-verify",
+            default,
+            deserialize_with = "deserialize_present_option"
+        )]
+        skip_cert_verify: Option<bool>,
         #[serde(default, deserialize_with = "deserialize_present_option")]
         fingerprint: Option<String>,
+        #[serde(
+            rename = "name-cert-verify",
+            default,
+            deserialize_with = "deserialize_present_option"
+        )]
+        name_cert_verify: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_present_option")]
+        certificate: Option<String>,
+        #[serde(
+            rename = "private-key",
+            default,
+            deserialize_with = "deserialize_present_option"
+        )]
+        private_key: Option<String>,
         #[serde(
             rename = "client-fingerprint",
             default,
             deserialize_with = "deserialize_present_option"
         )]
         client_fingerprint: Option<String>,
+        #[serde(
+            rename = "shadow-tls-opts",
+            default,
+            deserialize_with = "security::deserialize_shadow_tls"
+        )]
+        shadow_tls_opts: Option<security::RawShadowTlsMode>,
+        #[serde(rename = "jls-opts", default, deserialize_with = "jls::deserialize")]
+        jls_opts: Option<jls::RawJls>,
+        #[serde(rename = "ech-opts", default, deserialize_with = "ech::deserialize")]
+        ech_opts: Option<ech::RawEch>,
         #[serde(
             rename = "dialer-proxy",
             default,
@@ -1165,19 +2158,19 @@ struct RawXHttpSettings {
     #[serde(
         rename = "uplink-chunk-size",
         default,
-        deserialize_with = "deserialize_present_option"
+        deserialize_with = "scalar::optional_string_or_integer"
     )]
     uplink_chunk_size: Option<String>,
     #[serde(
         rename = "sc-max-each-post-bytes",
         default,
-        deserialize_with = "deserialize_present_option"
+        deserialize_with = "scalar::optional_string_or_integer"
     )]
     sc_max_each_post_bytes: Option<String>,
     #[serde(
         rename = "sc-min-posts-interval-ms",
         default,
-        deserialize_with = "deserialize_present_option"
+        deserialize_with = "scalar::optional_string_or_integer"
     )]
     sc_min_posts_interval_ms: Option<String>,
     #[serde(
@@ -1273,6 +2266,12 @@ struct RawXHttpDownloadSettings {
         deserialize_with = "deserialize_present_map"
     )]
     reality_opts: Option<RawXHttpDownloadReality>,
+    #[serde(
+        rename = "shadow-tls-opts",
+        default,
+        deserialize_with = "security::deserialize_shadow_tls"
+    )]
+    shadow_tls_opts: Option<security::RawShadowTlsMode>,
     #[serde(rename = "jls-opts", default, deserialize_with = "jls::deserialize")]
     jls_opts: Option<jls::RawJls>,
     #[serde(rename = "ech-opts", default, deserialize_with = "ech::deserialize")]
@@ -1321,6 +2320,11 @@ struct RawRealitySettings {
 
 #[derive(Debug)]
 struct PendingProxyConfig {
+    tfo: bool,
+    mptcp: bool,
+    egress: EgressOptions,
+    ip_version: IpVersion,
+    smux: Option<SingMuxConfig>,
     tag: String,
     dialer_proxy: Option<String>,
     udp: bool,
@@ -1396,97 +2400,216 @@ fn deserialize_present_credentials<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    deserialize_non_null_vec(deserializer)
-        .map(Some)
-        .map_err(|_| {
-            serde::de::Error::custom(
-                "authentication must be a non-null sequence of credential strings",
-            )
-        })
+    Option::<Vec<String>>::deserialize(deserializer).map_err(|_| {
+        serde::de::Error::custom("authentication must be a sequence of credential strings or null")
+    })
 }
 
 impl Config {
-    pub fn parse_yaml(input: &[u8]) -> Result<Self> {
-        if input.len() > MAX_CONFIG_BYTES {
-            return invalid(format!(
-                "configuration exceeds the {MAX_CONFIG_BYTES}-byte limit"
-            ));
-        }
-        let input = std::str::from_utf8(input)
-            .map_err(|_| VoleError::InvalidConfig("configuration is not UTF-8".to_owned()))?;
+    pub(crate) fn http_policy(&self) -> Option<std::sync::Arc<crate::http_processing::Policy>> {
+        self.providers
+            .as_ref()
+            .and_then(|template| template.http_policy.clone())
+    }
+    pub(crate) fn set_http_config(&mut self, input: Option<&str>) -> Result<()> {
+        let policy = crate::http_processing::Policy::compile_optional(input)?;
+        self.set_http_policy(policy)
+    }
+    pub(crate) fn set_http_policy(
+        &mut self,
+        policy: Option<std::sync::Arc<crate::http_processing::Policy>>,
+    ) -> Result<()> {
+        let template = self
+            .providers
+            .as_mut()
+            .ok_or_else(|| VoleError::InvalidConfig("configuration template is missing".into()))?;
+        std::sync::Arc::make_mut(template).http_policy = policy;
+        Ok(())
+    }
 
-        reject_yaml_anchors_and_aliases(input)?;
-        let yaml: YamlValue = serde_yaml_ng::from_str(input)
-            .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
-        validate_json_compatible_yaml(&yaml)?;
-        // Deserialize from the YAML value directly. Mapping order is part of
-        // nameserver-policy semantics and would be lost by the intermediate
-        // serde_json map representation.
-        let raw: RawVoleConfig = serde_yaml_ng::from_value(yaml)
-            .map_err(|error| VoleError::InvalidConfig(error.to_string()))?;
-        raw.normalize()
+    pub fn parse_yaml(input: &[u8]) -> Result<Self> {
+        Self::parse_yaml_with_directory(input, None)
+    }
+
+    pub(crate) fn parse_yaml_with_directory(
+        input: &[u8],
+        directory: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        let yaml = yaml::parse(input)?;
+        let mut template = providers::ProviderTemplate::extract(yaml)?;
+        template.identity_directory = directory.map(std::path::Path::to_path_buf);
+        let template = std::sync::Arc::new(template);
+        template.materialize(&providers::ProviderContents::new())
+    }
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn take_runtime_rules(&mut self) -> RuntimeRuleProgram {
+        match self.mode {
+            Mode::Rule => RuntimeRuleProgram {
+                main: std::mem::take(&mut self.rules),
+                sub_rules: std::mem::take(&mut self.sub_rules),
+            },
+            Mode::Direct | Mode::Global => {
+                let action = if self.mode == Mode::Direct {
+                    RuleAction::Direct
+                } else {
+                    RuleAction::Route(RouteTargetId::Group(ProxyGroupId::from_index(
+                        self.proxy_groups
+                            .iter()
+                            .position(|group| group.name == "GLOBAL")
+                            .expect("GLOBAL group exists"),
+                    )))
+                };
+                RuntimeRuleProgram::from(vec![RuleSpec {
+                    kind: RuleKind::Match,
+                    action,
+                    no_resolve: false,
+                }])
+            }
+        }
     }
 }
 
 impl RawVoleConfig {
     fn normalize(self) -> Result<Config> {
+        if self.global_ua.len() > 1024
+            || !self
+                .global_ua
+                .bytes()
+                .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
+        {
+            return invalid("global-ua must be a bounded HTTP header value");
+        }
         let geodata_update = normalize_geodata_update(
+            self.geodata_mode,
             self.geox_url,
             self.geo_auto_update,
             self.geo_update_interval,
         )?;
 
         let mixed_port = self.mixed_port.filter(|port| *port != 0);
+        let allow_lan = self.allow_lan && self.bind_address.as_deref() != Some("localhost");
+        let bind_address = match self.bind_address.as_deref() {
+            None | Some("" | "*" | "localhost") => None,
+            Some(value) => Some(value.trim_matches(['[', ']']).parse::<IpAddr>().map_err(
+                |_| {
+                    VoleError::InvalidConfig(
+                        "bind-address must be an IP address, localhost or *".into(),
+                    )
+                },
+            )?),
+        };
+        let cidrs = |values: Vec<String>| {
+            values
+                .into_iter()
+                .map(|value| parse_ip_cidr(&value, value.contains(':')))
+                .collect::<Result<Vec<_>>>()
+        };
+        let access_rules = std::sync::Arc::new(ProxyAccessRules {
+            allowed: self
+                .lan_allowed_ips
+                .map(cidrs)
+                .transpose()?
+                .unwrap_or_else(|| ProxyAccessRules::default().allowed),
+            denied: cidrs(self.lan_disallowed_ips)?,
+            skip_auth: cidrs(self.skip_auth_prefixes)?,
+        });
         let authentication = normalize_proxy_authentication(self.authentication)?;
-        if mixed_port.is_none() && (authentication.is_some() || self.allow_lan) {
-            return invalid("authentication or allow-lan requires an enabled mixed-port");
-        }
 
         let tun = self
             .tun
             .map_or_else(|| Ok(TunConfig::default()), RawTunConfig::normalize)?;
-        if mixed_port.is_none() && !tun.enable {
-            return invalid("configuration requires mixed-port or tun.enable: true");
-        }
         let sniffer = self.sniffer.map_or_else(
             || Ok(SnifferConfig::disabled()),
             RawSnifferConfig::normalize,
         )?;
 
-        if self.proxies.is_empty() {
-            return invalid("proxies must contain at least 1 entry");
+        let mut raw_groups = self.proxy_groups;
+        let generated_global = !raw_groups.iter().any(|group| group.name == "GLOBAL");
+        if generated_global {
+            raw_groups.push(RawProxyGroup {
+                strategy: BalanceStrategy::default(),
+                hash_key: BalanceHashKey::default(),
+                disable_udp: false,
+                hidden: false,
+                icon: String::new(),
+                name: "GLOBAL".into(),
+                kind: GroupKind::Select,
+                url: String::new(),
+                interval: 0,
+                timeout: 0,
+                lazy: true,
+                expected_status: String::new(),
+                tolerance: 0,
+                max_failed_times: 0,
+                proxies: vec!["DIRECT".into(), "REJECT".into()],
+                default_selected: None,
+            });
         }
-        let (raw_proxy_groups, proxy_group_ids) =
-            normalize_proxy_group_declarations(self.proxy_groups)?;
+        let (mut raw_proxy_groups, proxy_group_ids) =
+            normalize_proxy_group_declarations(raw_groups)?;
         let (proxies, proxy_ids) =
             normalize_proxy_graph_with_groups(self.proxies, &proxy_group_ids)?;
+        // The generated GLOBAL selector lists built-ins, nodes, then declared groups.
+        if generated_global {
+            let last = raw_proxy_groups.len() - 1;
+            let mut members = vec!["DIRECT".into(), "REJECT".into()];
+            members.extend(proxies.iter().map(|proxy| proxy.tag.clone()));
+            members.extend(
+                raw_proxy_groups[..last]
+                    .iter()
+                    .map(|group| group.name.clone()),
+            );
+            raw_proxy_groups[last].proxies = members;
+        }
         let route_targets = collect_route_targets(&proxy_ids, &proxy_group_ids);
         let proxy_groups = normalize_proxy_groups(raw_proxy_groups, &route_targets)?;
         proxy_graph_order(&proxies, &proxy_groups)?;
-        let default_route_target =
-            derive_default_route_target_from_rules(&self.rules, &route_targets)?;
-        let external_controller = normalize_external_controller(
-            self.external_controller,
-            self.secret,
-            tun.enable,
-            !proxy_groups.is_empty(),
-        )?;
+        let unix_path = normalize_controller_unix(self.external_controller_unix)?;
+        let routing_mark = normalize_controller_mark(self.external_controller_routing_mark)?;
+        let mut external_controller =
+            normalize_external_controller(self.external_controller, self.secret.clone())?;
+        let tls_controller =
+            normalize_external_controller(self.external_controller_tls, self.secret.clone())?;
+        if let Some(tls) = tls_controller {
+            let controller = external_controller.get_or_insert_with(|| ExternalControllerConfig {
+                http_enabled: false,
+                ..tls.clone()
+            });
+            controller.tls_listen = Some(tls.listen);
+        }
+        if unix_path.is_some() && external_controller.is_none() {
+            external_controller = Some(ExternalControllerConfig {
+                http_enabled: false,
+                secret: self.secret.filter(|secret| !secret.is_empty()),
+                ..ExternalControllerConfig::default()
+            });
+        }
+        if let Some(controller) = &mut external_controller {
+            controller.unix_path = unix_path;
+            controller.routing_mark = routing_mark;
+            controller.cors = self.external_controller_cors;
+            controller.server_tls = self.tls.server.clone();
+        }
 
         let mut dns = self
             .dns
             .map_or_else(DnsConfig::disabled, |dns| dns.normalize(&route_targets))?;
         dns.ipv6 &= self.ipv6;
-        let rules = normalize_rules(self.rules, &route_targets)?;
+        dns.hosts = dns::normalize_hosts(self.hosts)?;
+        let (rules, sub_rules) =
+            normalize_rule_program(self.rules, self.sub_rules, &route_targets)?;
         drop(proxy_ids);
         drop(route_targets);
 
         let mut inbounds = Vec::with_capacity(2);
         if let Some(port) = mixed_port {
             inbounds.push(InboundConfig::Mixed(MixedInboundConfig {
+                access_rules,
                 tag: "mixed-in".to_owned(),
                 port,
                 access: ProxyAccess {
-                    allow_lan: self.allow_lan,
+                    bind_address,
+                    allow_lan,
                     ipv6: self.ipv6,
                 },
                 auth: authentication,
@@ -1500,10 +2623,29 @@ impl RawVoleConfig {
         }
 
         Ok(Config {
+            egress: EgressOptions::normalize(self.interface, self.routing_mark)?,
+            tls: self.tls,
             ipv6: self.ipv6,
             proxies,
             proxy_groups,
-            default_route_target,
+            mode: self.mode,
+            log_level: self.log_level,
+            global_ua: self.global_ua,
+            etag_support: self.etag_support,
+            unified_delay: self.unified_delay,
+            find_process_mode: self.find_process_mode,
+            connections: ConnectionSettings {
+                dialer_ip4p_convert: self.experimental.dialer_ip4p_convert,
+                quic: QuicSocketSettings {
+                    disable_gso: self.experimental.quic_disable_gso,
+                    disable_ecn: self.experimental.quic_disable_ecn,
+                },
+                tcp_concurrent: self.tcp_concurrent,
+                keep_alive_idle: self.keep_alive_idle,
+                keep_alive_interval: self.keep_alive_interval,
+                disable_keep_alive: self.disable_keep_alive,
+            },
+            profile: self.profile,
             geodata_update,
             external_controller,
             inbounds,
@@ -1512,75 +2654,72 @@ impl RawVoleConfig {
             sniffer,
             dns,
             rules,
+            sub_rules,
+            providers: None,
+            provider_members: HashMap::new(),
         })
     }
 }
 
-fn normalize_external_controller(
+pub(crate) fn normalize_external_controller(
     listen: Option<String>,
     secret: Option<String>,
-    tun_enabled: bool,
-    has_proxy_groups: bool,
 ) -> Result<Option<ExternalControllerConfig>> {
-    let Some(listen) = listen else {
-        if secret.is_some() {
-            return invalid("secret requires external-controller");
-        }
+    let Some(listen) = listen.filter(|listen| !listen.is_empty()) else {
         return Ok(None);
     };
-    if !tun_enabled && !has_proxy_groups {
-        return invalid("external-controller requires tun.enable: true or proxy-groups");
-    }
-    if has_proxy_groups && secret.is_none() {
-        return invalid("secret is required when external-controller manages proxy-groups");
-    }
-    let listen = listen.parse::<SocketAddr>().map_err(|_| {
-        VoleError::InvalidConfig(
-            "external-controller must be an IP socket address with an explicit port".to_owned(),
-        )
-    })?;
-    if !listen.ip().is_loopback() {
-        return invalid("external-controller must listen on a loopback address");
-    }
-    if listen.port() == 0 {
-        return invalid("external-controller port must be between 1 and 65535");
-    }
-    if let Some(secret) = &secret
-        && !(1..=MAX_CONTROLLER_SECRET_BYTES).contains(&secret.len())
-    {
-        return invalid(format!(
-            "secret must contain between 1 and {MAX_CONTROLLER_SECRET_BYTES} UTF-8 bytes"
-        ));
-    }
-    Ok(Some(ExternalControllerConfig { listen, secret }))
+    // Mihomo's tcp preResolve accepts literal IPs, localhost and an empty host
+    // without consulting DNS.
+    let listen = if let Ok(address) = listen.parse::<SocketAddr>() {
+        address
+    } else {
+        let address = listen
+            .strip_prefix("localhost:")
+            .map(|port| (IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+            .or_else(|| {
+                listen
+                    .strip_prefix(':')
+                    .map(|port| (IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))
+            });
+        let Some((host, port)) = address else {
+            return invalid(
+                "external-controller requires an IP, localhost or empty host and a numeric port",
+            );
+        };
+        let port = port.parse::<u16>().map_err(|_| {
+            VoleError::InvalidConfig("external-controller port must be between 0 and 65535".into())
+        })?;
+        SocketAddr::new(host, port)
+    };
+    Ok(Some(ExternalControllerConfig {
+        listen,
+        secret: secret.filter(|secret| !secret.is_empty()),
+        ..ExternalControllerConfig::default()
+    }))
 }
 
 fn normalize_geodata_update(
+    geodata_mode: bool,
     urls: Option<RawGeoDataUrls>,
     auto_update: Option<bool>,
     interval_hours: Option<u64>,
 ) -> Result<Option<GeoDataUpdateConfig>> {
-    match (urls, auto_update, interval_hours) {
-        (None, None, None) => Ok(None),
-        (Some(urls), Some(auto_update), Some(interval_hours)) => {
-            if interval_hours != GEO_UPDATE_INTERVAL_HOURS {
-                return invalid(format!(
-                    "geo-update-interval must be {GEO_UPDATE_INTERVAL_HOURS}"
-                ));
-            }
-            Ok(Some(GeoDataUpdateConfig {
-                urls: GeoDataUrls {
-                    geoip: normalize_geox_url(urls.geoip, "geox-url.geoip")?,
-                    geosite: normalize_geox_url(urls.geosite, "geox-url.geosite")?,
-                },
-                auto_update,
-                interval_hours,
-            }))
-        }
-        _ => invalid(
-            "geox-url, geo-auto-update, and geo-update-interval must be configured together",
-        ),
+    let urls = urls.unwrap_or_default();
+    let interval_hours = interval_hours.unwrap_or(GEO_UPDATE_INTERVAL_HOURS);
+    if interval_hours.checked_mul(3600).is_none() {
+        return invalid("geo-update-interval is too large");
     }
+    Ok(Some(GeoDataUpdateConfig {
+        geodata_mode,
+        urls: GeoDataUrls {
+            geoip: normalize_geox_url(urls.geoip, "geox-url.geoip")?,
+            mmdb: normalize_geox_url(urls.mmdb, "geox-url.mmdb")?,
+            geosite: normalize_geox_url(urls.geosite, "geox-url.geosite")?,
+            asn: normalize_geox_url(urls.asn, "geox-url.asn")?,
+        },
+        auto_update: auto_update.unwrap_or(false),
+        interval_hours,
+    }))
 }
 
 fn normalize_geox_url(raw: String, field: &str) -> Result<String> {
@@ -1591,20 +2730,11 @@ fn normalize_geox_url(raw: String, field: &str) -> Result<String> {
     }
     let url = Url::parse(&raw)
         .map_err(|error| VoleError::InvalidConfig(format!("{field} is invalid: {error}")))?;
-    let allowed_scheme = url.scheme() == "https";
-    #[cfg(feature = "benchmark-geodata-http")]
-    let allowed_scheme = allowed_scheme || url.scheme() == "http";
-    if !allowed_scheme {
+    if url.scheme() != "https" {
         return invalid(format!("{field} must use HTTPS"));
     }
-    let authority = raw
-        .split_once("://")
-        .map(|(_, suffix)| suffix)
-        .and_then(|suffix| suffix.split(['/', '?', '#']).next())
-        .unwrap_or_default();
-    if !url.username().is_empty() || url.password().is_some() || authority.contains('@') {
-        return invalid(format!("{field} must not contain credentials"));
-    }
+    crate::resource::http::parse_url(&raw, &Default::default())
+        .map_err(|_| VoleError::InvalidConfig(format!("{field} has invalid URL authentication")))?;
     if !matches!(url.host(), Some(Host::Domain(_))) {
         return invalid(format!("{field} must contain a domain host"));
     }
@@ -1617,35 +2747,35 @@ fn normalize_geox_url(raw: String, field: &str) -> Result<String> {
 impl RawSnifferConfig {
     fn normalize(self) -> Result<SnifferConfig> {
         let sniff = self.sniff.unwrap_or_default();
-        let http = normalize_sniffer_protocol(sniff.http, 80, "HTTP")?;
-        let tls = normalize_sniffer_protocol(sniff.tls, 443, "TLS")?;
-        let quic = normalize_sniffer_protocol(sniff.quic, 443, "QUIC")?;
-
-        if self.enable && http.is_none() && tls.is_none() && quic.is_none() {
-            return invalid(
-                "sniffer.enable: true requires at least one HTTP, TLS, or QUIC sniffer",
-            );
-        }
-
-        let http_ports = http.unwrap_or_default();
-        let tls_ports = tls.unwrap_or_default();
-        let quic_ports = quic.unwrap_or_default();
-        if port_ranges_overlap(&http_ports, &tls_ports) {
-            return invalid("sniffer HTTP and TLS port ranges must not overlap");
-        }
-
+        let override_for = |raw: &Option<Option<RawSniffProtocolConfig>>| {
+            raw.as_ref()
+                .and_then(Option::as_ref)
+                .and_then(|raw| raw.override_destination)
+                .unwrap_or(self.override_destination)
+        };
+        let http_override = override_for(&sniff.http);
+        let tls_override = override_for(&sniff.tls);
+        let quic_override = override_for(&sniff.quic);
         Ok(SnifferConfig {
             enable: self.enable,
-            http_ports,
-            tls_ports,
-            quic_ports,
+            force_dns_mapping: self.force_dns_mapping,
+            parse_pure_ip: self.parse_pure_ip,
+            force_domain: sniffer::domains(self.force_domain)?,
+            skip_domain: sniffer::domains(self.skip_domain)?,
+            skip_src_address: sniffer::addresses(self.skip_src_address)?,
+            skip_dst_address: sniffer::addresses(self.skip_dst_address)?,
+            http_override,
+            tls_override,
+            quic_override,
+            http_ports: normalize_sniffer_protocol(sniff.http, "HTTP")?.unwrap_or_default(),
+            tls_ports: normalize_sniffer_protocol(sniff.tls, "TLS")?.unwrap_or_default(),
+            quic_ports: normalize_sniffer_protocol(sniff.quic, "QUIC")?.unwrap_or_default(),
         })
     }
 }
 
 fn normalize_sniffer_protocol(
     raw: Option<Option<RawSniffProtocolConfig>>,
-    default_port: u16,
     protocol: &str,
 ) -> Result<Option<Box<[PortRange]>>> {
     let Some(raw) = raw else {
@@ -1654,12 +2784,18 @@ fn normalize_sniffer_protocol(
     let raw = raw.unwrap_or_default();
     let ranges = match raw.ports {
         None => vec![PortRange {
-            start: default_port,
-            end: default_port,
+            start: 0,
+            end: u16::MAX,
         }],
         Some(items) => {
             if items.is_empty() {
-                return invalid(format!("sniffer.sniff.{protocol}.ports must not be empty"));
+                return Ok(Some(
+                    vec![PortRange {
+                        start: 0,
+                        end: u16::MAX,
+                    }]
+                    .into_boxed_slice(),
+                ));
             }
             if items.len() > MAX_SNIFFER_PORT_ITEMS {
                 return invalid(format!(
@@ -1725,14 +2861,11 @@ fn parse_sniffer_port_string(value: &str, protocol: &str) -> Result<u16> {
 }
 
 fn parse_sniffer_port_number(value: u64, protocol: &str) -> Result<u16> {
-    u16::try_from(value)
-        .ok()
-        .filter(|port| *port != 0)
-        .ok_or_else(|| {
-            VoleError::InvalidConfig(format!(
-                "sniffer.sniff.{protocol}.ports values must be between 1 and 65535"
-            ))
-        })
+    u16::try_from(value).ok().ok_or_else(|| {
+        VoleError::InvalidConfig(format!(
+            "sniffer.sniff.{protocol}.ports values must be between 1 and 65535"
+        ))
+    })
 }
 
 fn merge_port_ranges(mut ranges: Vec<PortRange>) -> Vec<PortRange> {
@@ -1748,20 +2881,6 @@ fn merge_port_ranges(mut ranges: Vec<PortRange>) -> Vec<PortRange> {
         merged.push(range);
     }
     merged
-}
-
-fn port_ranges_overlap(left: &[PortRange], right: &[PortRange]) -> bool {
-    let (mut left_index, mut right_index) = (0, 0);
-    while let (Some(left), Some(right)) = (left.get(left_index), right.get(right_index)) {
-        if left.end < right.start {
-            left_index += 1;
-        } else if right.end < left.start {
-            right_index += 1;
-        } else {
-            return true;
-        }
-    }
-    false
 }
 
 fn port_ranges_contain(ranges: &[PortRange], port: u16) -> bool {
@@ -1784,17 +2903,17 @@ fn normalize_proxy_authentication(
     match authentication {
         None => Ok(None),
         Some(entries) if entries.is_empty() => Ok(None),
-        Some(entries) => {
-            let [credential] = entries.as_slice() else {
-                return invalid("authentication must contain exactly one user:password entry");
-            };
-            let (username, password) = credential.split_once(':').ok_or_else(|| {
-                VoleError::InvalidConfig("authentication entry must use user:password".to_owned())
-            })?;
-            ProxyCredentials::new(username, password)
-                .map(Some)
-                .map_err(|error| VoleError::InvalidConfig(error.to_string()))
-        }
+        Some(entries) => entries
+            .into_iter()
+            .map(|credential| {
+                let (username, password) = credential.split_once(':').ok_or_else(|| {
+                    VoleError::InvalidConfig("authentication entry must use user:password".into())
+                })?;
+                ProxyCredentials::new(username, password)
+                    .map_err(|error| VoleError::InvalidConfig(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|values| Some(ProxyCredentials::multiple(values))),
     }
 }
 
@@ -1811,9 +2930,6 @@ fn normalize_proxy_graph_with_groups(
     raw_proxies: Vec<RawOutbound>,
     proxy_group_ids: &HashMap<String, ProxyGroupId>,
 ) -> Result<(Vec<ProxyConfig>, ProxyIdsByTag)> {
-    if raw_proxies.is_empty() {
-        return invalid("proxies must contain at least 1 entry");
-    }
     let pending = raw_proxies
         .into_iter()
         .map(RawOutbound::normalize)
@@ -1839,13 +2955,14 @@ fn normalize_proxy_graph_with_groups(
             proxy
                 .dialer_proxy
                 .as_deref()
+                .filter(|tag| !matches!(*tag, "DIRECT" | "COMPATIBLE"))
                 .map(|tag| {
                     if let Some(id) = proxy_group_ids.get(tag) {
                         return Ok(RouteTargetId::Group(*id));
                     }
                     proxy_ids.get(tag).copied().map(RouteTargetId::Proxy).ok_or_else(|| {
                         VoleError::InvalidConfig(format!(
-                            "proxy `{}` dialer-proxy `{tag}` does not reference a configured proxy or group name",
+                            "proxy `{}` dialer-proxy `{tag}` does not reference DIRECT or a configured proxy or group name",
                             proxy.tag
                         ))
                     })
@@ -1857,6 +2974,11 @@ fn normalize_proxy_graph_with_groups(
         .into_iter()
         .zip(dialer_proxies)
         .map(|(proxy, dialer_proxy)| ProxyConfig {
+            tfo: proxy.tfo,
+            mptcp: proxy.mptcp,
+            egress: proxy.egress,
+            ip_version: proxy.ip_version,
+            smux: proxy.smux,
             tag: proxy.tag,
             dialer_proxy,
             udp: proxy.udp,
@@ -1871,12 +2993,6 @@ fn normalize_proxy_group_declarations(
 ) -> Result<(Vec<RawProxyGroup>, HashMap<String, ProxyGroupId>)> {
     let mut group_ids = HashMap::with_capacity(raw_groups.len());
     for (index, group) in raw_groups.iter().enumerate() {
-        if group.kind != "select" {
-            return invalid(format!(
-                "proxy group `{}` type must be exactly `select`",
-                group.name
-            ));
-        }
         validate_route_target_definition_name(&group.name, "proxy group name")?;
         if group.proxies.is_empty() {
             return invalid(format!(
@@ -1919,27 +3035,29 @@ fn normalize_proxy_groups(
     let groups = raw_groups
         .into_iter()
         .map(|group| {
+            if group.hash_key != BalanceHashKey::Default
+                && (group.kind != GroupKind::LoadBalance || group.strategy == BalanceStrategy::RoundRobin)
+            {
+                return invalid("hash-key requires consistent-hashing or sticky-sessions load-balance");
+            }
             let members = group
                 .proxies
                 .into_iter()
                 .map(|name| {
                     validate_route_target_name(&name, "proxy group member")?;
                     let target = match name.as_str() {
-                        "DIRECT" => ProxyGroupMemberTarget::Direct,
+                        "DIRECT" | "COMPATIBLE" => ProxyGroupMemberTarget::Direct,
                         "REJECT" => ProxyGroupMemberTarget::Reject,
-                        "RULES" => {
-                            return invalid(format!(
-                                "proxy group `{}` cannot use reserved DNS target `RULES` as a member",
-                                group.name
-                            ));
-                        }
+                        "REJECT-DROP" => ProxyGroupMemberTarget::RejectDrop,
+                        "PASS" => ProxyGroupMemberTarget::Control(RuleControl::Pass),
+                        "PASS-RULE" => ProxyGroupMemberTarget::Control(RuleControl::PassRule),
                         _ => route_targets
                             .get(&name)
                             .copied()
                             .map(ProxyGroupMemberTarget::Route)
                             .ok_or_else(|| {
                                 VoleError::InvalidConfig(format!(
-                                    "proxy group `{}` member `{name}` does not reference a configured proxy, proxy group, DIRECT, or REJECT",
+                                    "proxy group `{}` member `{name}` does not reference a configured proxy, proxy group, DIRECT, COMPATIBLE, REJECT, REJECT-DROP, PASS, or PASS-RULE",
                                     group.name
                                 ))
                             })?,
@@ -1947,22 +3065,28 @@ fn normalize_proxy_groups(
                     Ok(ProxyGroupMemberConfig { name, target })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let initial_member = match group.default_selected {
-                Some(default) => members
-                    .iter()
-                    .position(|member| member.name == default)
-                    .ok_or_else(|| {
-                        VoleError::InvalidConfig(format!(
-                            "proxy group `{}` default-selected `{default}` must name a direct member",
-                            group.name
-                        ))
-                    })?,
-                None => 0,
+            let initial_member = group
+                .default_selected
+                .and_then(|default| members.iter().position(|member| member.name == default))
+                .unwrap_or(0);
+            let health = HealthCheckConfig {
+                enable: true,
+                url: if group.url.is_empty() { "https://www.gstatic.com/generate_204".into() } else { group.url },
+                interval: if group.interval == 0 && group.kind != GroupKind::Select { 300 } else { group.interval },
+                timeout: if group.timeout == 0 { 5000 } else { group.timeout },
+                lazy: group.lazy,
+                expected_status: group.expected_status,
             };
+            health.validate()?;
             Ok(SelectProxyGroupConfig {
+                kind: group.kind, strategy: group.strategy, hash_key: group.hash_key, health, tolerance: group.tolerance,
+                max_failed_times: if group.max_failed_times == 0 { 5 } else { group.max_failed_times },
                 name: group.name,
                 members,
                 initial_member,
+                disable_udp: group.disable_udp,
+                hidden: group.hidden,
+                icon: group.icon,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2031,12 +3155,21 @@ pub(crate) fn proxy_graph_order(
 
 impl RawOutbound {
     fn normalize(self) -> Result<PendingProxyConfig> {
-        let (tag, dialer_proxy, udp, protocol) = match self {
-            Self::Hysteria2(raw) => raw.normalize()?,
-            Self::Tuic(raw) => raw.normalize()?,
-            Self::Vmess(raw) => raw.normalize()?,
-            Self::Trojan(raw) => raw.normalize()?,
-            Self::Shadowsocks {
+        let (tag, dialer_proxy, udp, protocol) = match self.protocol {
+            RawProtocol::Direct(raw) => raw.normalize(ProxyProtocol::Direct)?,
+            RawProtocol::Dns(raw) => raw.normalize(ProxyProtocol::Dns)?,
+            RawProtocol::Reject(raw) => raw.normalize(ProxyProtocol::Reject)?,
+            RawProtocol::Rematch(raw) => raw.normalize()?,
+            RawProtocol::Masque(raw) => raw.normalize()?,
+            RawProtocol::TrustTunnel(raw) => raw.normalize()?,
+            RawProtocol::Mieru(raw) => raw.normalize()?,
+            RawProtocol::WireGuard(raw) => raw.normalize()?,
+            RawProtocol::Http(raw) => raw.normalize()?,
+            RawProtocol::Hysteria2(raw) => raw.normalize()?,
+            RawProtocol::Tuic(raw) => raw.normalize()?,
+            RawProtocol::Vmess(raw) => raw.normalize()?,
+            RawProtocol::Trojan(raw) => raw.normalize()?,
+            RawProtocol::Shadowsocks {
                 name,
                 server,
                 port,
@@ -2051,7 +3184,8 @@ impl RawOutbound {
                 dialer_proxy,
             } => {
                 let mut config = shadowsocks::normalize(server, port, cipher, password)?;
-                config.shadow_tls = shadowsocks::plugin(plugin, plugin_opts, client_fingerprint)?;
+                config.plugin =
+                    shadowsocks_plugin::normalize(plugin, plugin_opts, client_fingerprint, port)?;
                 if udp_over_tcp && !cfg!(feature = "outbound-shadowsocks") {
                     return invalid("Shadowsocks UoT support is not enabled in this build");
                 }
@@ -2064,54 +3198,135 @@ impl RawOutbound {
                 config.udp_over_tcp = udp_over_tcp;
                 (name, dialer_proxy, udp, ProxyProtocol::Shadowsocks(config))
             }
-            Self::Vless(raw) => raw.normalize()?,
-            Self::Socks5 {
+            RawProtocol::Vless(raw) => raw.normalize()?,
+            RawProtocol::Socks5 {
                 name,
                 server,
                 port,
                 udp,
                 tls,
+                skip_cert_verify,
+                name_cert_verify,
+                fingerprint,
+                certificate,
+                private_key,
                 username,
                 password,
                 dialer_proxy,
-            } => (
-                name,
-                dialer_proxy,
-                udp,
-                ProxyProtocol::Socks5(normalize_socks5(server, port, tls, username, password)?),
-            ),
-            Self::AnyTls {
+            } => {
+                let mut config = normalize_socks5(server, port, username, password)?;
+                if !tls
+                    && (skip_cert_verify.is_some()
+                        || name_cert_verify.is_some()
+                        || fingerprint.is_some()
+                        || certificate.is_some()
+                        || private_key.is_some())
+                {
+                    return invalid("SOCKS5 TLS options require tls: true");
+                }
+                if tls {
+                    config.tls = Some(TlsClientPolicy {
+                        certificate: TlsCertificatePolicy {
+                            skip_cert_verify: skip_cert_verify.unwrap_or(false),
+                            fingerprint: normalize_certificate_fingerprint(fingerprint.as_deref())?,
+                            verification_name: normalize_verification_name(name_cert_verify)?,
+                        },
+                        identity: normalize_client_identity(certificate, private_key)?,
+                        ..Default::default()
+                    });
+                }
+                (name, dialer_proxy, udp, ProxyProtocol::Socks5(config))
+            }
+            RawProtocol::AnyTls {
                 name,
                 server,
                 port,
                 password,
+                idle_session_check_interval,
+                idle_session_timeout,
+                min_idle_session,
+                disable_reuse,
+                client_metadata,
                 udp,
                 sni,
                 alpn,
                 skip_cert_verify,
                 fingerprint,
+                name_cert_verify,
+                certificate,
+                private_key,
                 client_fingerprint,
+                ech_opts,
+                shadow_tls_opts,
+                jls_opts,
                 dialer_proxy,
             } => {
+                let certificate_options = skip_cert_verify.is_some()
+                    || fingerprint.is_some()
+                    || name_cert_verify.is_some()
+                    || certificate.is_some()
+                    || private_key.is_some();
                 let mut config = normalize_anytls(
                     server,
                     port,
                     password,
                     sni,
                     alpn,
-                    skip_cert_verify,
+                    skip_cert_verify.unwrap_or(false),
                     fingerprint,
                 )?;
-                config.tls.client_fingerprint =
-                    parse_client_fingerprint(client_fingerprint.as_deref())?;
+                let SecurityConfig::Tls(mut tls) = config.security else {
+                    unreachable!()
+                };
+                tls.certificate.verification_name = normalize_verification_name(name_cert_verify)?;
+                tls.identity = normalize_client_identity(certificate, private_key)?;
+                tls.client_fingerprint = parse_client_fingerprint(client_fingerprint.as_deref())?;
+                config.session = AnyTlsSessionOptions::normalize(
+                    idle_session_check_interval,
+                    idle_session_timeout,
+                    min_idle_session,
+                    disable_reuse,
+                    client_metadata,
+                )?;
+                tls.ech = ech_opts
+                    .map(|raw| raw.normalize(tls.client_fingerprint.is_some()))
+                    .transpose()?
+                    .flatten();
+                if tls.ech.is_some() && config.server_name.parse::<IpAddr>().is_ok() {
+                    return invalid("AnyTLS ECH requires DNS sni");
+                }
+                config.security = security::RawSecurityModes {
+                    reality: None,
+                    jls: jls_opts,
+                    shadow_tls: shadow_tls_opts,
+                }
+                .normalize(tls, certificate_options)?;
+
                 (name, dialer_proxy, udp, ProxyProtocol::AnyTls(config))
             }
         };
+        let smux = self
+            .smux
+            .map(sing_mux::RawSingMux::normalize)
+            .transpose()?
+            .flatten();
+        if smux.is_some()
+            && matches!(&protocol, ProxyProtocol::Vless(node) if node.flow == "xtls-rprx-vision")
+        {
+            return invalid("VLESS Vision cannot use sing-mux");
+        }
+        let udp = udp || smux.as_ref().is_some_and(|options| !options.only_tcp);
         validate_route_target_definition_name(&tag, "proxy name")?;
+        let dialer_proxy = dialer_proxy.filter(|tag| !tag.is_empty());
         if let Some(dialer_proxy) = &dialer_proxy {
             validate_route_target_name(dialer_proxy, "dialer-proxy")?;
         }
         Ok(PendingProxyConfig {
+            tfo: self.tfo,
+            mptcp: self.mptcp,
+            egress: self.egress,
+            ip_version: self.ip_version,
+            smux,
             tag,
             dialer_proxy,
             udp,
@@ -2157,15 +3372,11 @@ impl RawRealitySettings {
 fn normalize_socks5(
     server: String,
     port: u16,
-    tls: bool,
     username: Option<String>,
     password: Option<String>,
 ) -> Result<Socks5OutboundConfig> {
     validate_host(&server, "SOCKS5 server")?;
     validate_port(port, "SOCKS5")?;
-    if tls {
-        return invalid("SOCKS5 tls must be false");
-    }
     match (&username, &password) {
         (None, None) => {}
         (Some(username), Some(password)) => {
@@ -2186,6 +3397,7 @@ fn normalize_socks5(
         port,
         username,
         password,
+        tls: None,
     })
 }
 
@@ -2205,7 +3417,9 @@ fn normalize_anytls(
             "AnyTLS password must contain between 1 and {MAX_ANYTLS_PASSWORD_BYTES} UTF-8 bytes"
         ));
     }
-    let server_name = sni.unwrap_or_else(|| server.clone());
+    let server_name = sni
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| server.clone());
     validate_host(&server_name, "AnyTLS sni")?;
     let alpn = alpn
         .unwrap_or_default()
@@ -2225,29 +3439,65 @@ fn normalize_anytls(
             "AnyTLS alpn names must be 1..255 bytes and the encoded list at most 65533 bytes",
         );
     }
-    let fingerprint = fingerprint.map(|value| {
-        let hex = value.trim().bytes().filter(|byte| *byte != b':').collect::<Vec<_>>();
-        let mut pin = [0; 32];
-        if hex.len() != 64 || hex.iter().any(|byte| !byte.is_ascii_hexdigit()) {
-            return invalid("AnyTLS fingerprint must be a SHA-256 certificate digest in hex or colon-separated hex");
-        }
-        for (index, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
-            pin[index] = ((pair[0] as char).to_digit(16).unwrap() * 16 + (pair[1] as char).to_digit(16).unwrap()) as u8;
-        }
-        Ok(pin)
-    }).transpose()?;
+    let fingerprint = normalize_certificate_fingerprint(fingerprint.as_deref())?;
     Ok(AnyTlsOutboundConfig {
         address: server,
         port,
         password,
-        server_name,
-        tls: AnyTlsCertificatePolicy {
+        server_name: server_name.clone(),
+        session: AnyTlsSessionOptions::default(),
+        security: SecurityConfig::Tls(TlsConfig {
+            server_name,
+            tls13_only: false,
+            required_alpn: None,
+            ech: None,
+            identity: None,
             client_fingerprint: None,
             alpn,
-            skip_cert_verify,
-            fingerprint,
-        },
+            certificate: TlsCertificatePolicy {
+                skip_cert_verify,
+                fingerprint,
+                ..Default::default()
+            },
+        }),
     })
+}
+
+fn normalize_certificate_fingerprint(fingerprint: Option<&str>) -> Result<Option<[u8; 32]>> {
+    fingerprint
+        .filter(|value| !value.is_empty())
+        .map(vless::parse_pin)
+        .transpose()
+}
+
+fn normalize_verification_name(name: Option<String>) -> Result<Option<String>> {
+    let name = name.filter(|name| !name.is_empty());
+    if let Some(name) = &name {
+        validate_host(name, "TLS certificate verification name")?;
+    }
+    Ok(name)
+}
+
+fn normalize_client_identity(
+    certificate: Option<String>,
+    private_key: Option<String>,
+) -> Result<Option<TlsIdentityPem>> {
+    match (
+        certificate.filter(|pem| !pem.is_empty()),
+        private_key.filter(|pem| !pem.is_empty()),
+    ) {
+        (None, None) => Ok(None),
+        (Some(certificate), Some(private_key)) => {
+            crate::security::TlsClientIdentity::from_pem(&certificate, &private_key)
+                .map_err(|_| VoleError::InvalidConfig("invalid TLS client identity".into()))?;
+            Ok(Some(TlsIdentityPem {
+                certificate,
+                private_key,
+                origin: None,
+            }))
+        }
+        _ => invalid("TLS certificate and private-key must be provided together"),
+    }
 }
 
 impl RawXHttpSettings {
@@ -2266,11 +3516,11 @@ impl RawXHttpSettings {
         let headers = XHttpHeaders::normalize(self.headers.clone())?;
         let has_download = self.download_settings.is_some();
         let mode = match self.mode.as_str() {
-            "auto" if matches!(security, SecurityConfig::Reality(_)) && has_download => {
+            "" | "auto" if matches!(security, SecurityConfig::Reality(_)) && has_download => {
                 XHttpMode::StreamUp
             }
-            "auto" if matches!(security, SecurityConfig::Reality(_)) => XHttpMode::StreamOne,
-            "auto" | "packet-up" => XHttpMode::PacketUp,
+            "" | "auto" if matches!(security, SecurityConfig::Reality(_)) => XHttpMode::StreamOne,
+            "" | "auto" | "packet-up" => XHttpMode::PacketUp,
             "stream-one" if !has_download => XHttpMode::StreamOne,
             "stream-one" => {
                 return invalid("xhttp mode `stream-one` cannot be used with download-settings");
@@ -2291,8 +3541,8 @@ impl RawXHttpSettings {
             ..
         } = self;
         let host = host.filter(|value| !value.is_empty());
-        if path.is_empty()
-            || path.len() > 2_048
+        let path = if path.is_empty() { "/".into() } else { path };
+        if path.len() > 2_048
             || !path.starts_with('/')
             || path.parse::<http::uri::PathAndQuery>().is_err()
         {
@@ -2386,6 +3636,7 @@ impl RawXHttpDownloadSettings {
             private_key,
             reality_opts,
             jls_opts,
+            shadow_tls_opts,
             ech_opts,
             path,
             host,
@@ -2431,6 +3682,7 @@ impl RawXHttpDownloadSettings {
 
         let server_name = servername
             .or_else(|| default_explicit_server_name.map(str::to_owned))
+            .filter(|name| !name.is_empty())
             .unwrap_or_else(|| address.clone());
         validate_host(&server_name, "XHTTP download servername")?;
         let host = host
@@ -2481,6 +3733,7 @@ impl RawXHttpDownloadSettings {
         let mut config = match default_security {
             SecurityConfig::Tls(config) => config.clone(),
             SecurityConfig::Jls(config) => config.tls.clone(),
+            SecurityConfig::ShadowTls(config) => config.tls_config(),
             _ => TlsConfig::xhttp(server_name.clone()),
         };
         config.server_name = server_name;
@@ -2488,8 +3741,13 @@ impl RawXHttpDownloadSettings {
         config.alpn = vec![http_version.alpn().to_vec()];
         config.required_alpn = Some(http_version.alpn().to_vec());
         if let Some(raw) = ech_opts {
-            config.ech = raw.normalize()?;
+            config.ech = raw.normalize(config.client_fingerprint.is_some())?;
         }
+        config.ech = config
+            .ech
+            .as_ref()
+            .map(|ech| ech.for_backend(config.client_fingerprint.is_some()))
+            .transpose()?;
         if config.ech.is_some() && config.server_name.parse::<IpAddr>().is_ok() {
             return invalid("XHTTP download ECH requires a DNS servername");
         }
@@ -2523,6 +3781,7 @@ impl RawXHttpDownloadSettings {
                 config.identity = Some(TlsIdentityPem {
                     certificate,
                     private_key,
+                    origin: None,
                 });
             }
             _ => {
@@ -2543,10 +3802,24 @@ impl RawXHttpDownloadSettings {
                 _ => None,
             },
         };
-        if reality.is_some() && jls.is_some() {
-            return invalid("XHTTP download JLS and REALITY are mutually exclusive");
+        let shadow_tls = match shadow_tls_opts {
+            Some(raw) if raw.is_empty() => None,
+            Some(raw) => Some(raw.normalize(config.clone())?),
+            None => match default_security {
+                SecurityConfig::ShadowTls(config) => Some(config.clone()),
+                _ => None,
+            },
+        };
+        if usize::from(reality.is_some())
+            + usize::from(jls.is_some())
+            + usize::from(shadow_tls.is_some())
+            > 1
+        {
+            return invalid("XHTTP download transport identities are mutually exclusive");
         }
-        if config.ech.is_some() && (reality.is_some() || jls.is_some() || !tls) {
+        if config.ech.is_some()
+            && (reality.is_some() || jls.is_some() || shadow_tls.is_some() || !tls)
+        {
             return invalid(
                 "XHTTP download ECH requires standard TLS; clear inherited ECH before changing security mode",
             );
@@ -2555,6 +3828,9 @@ impl RawXHttpDownloadSettings {
             return invalid(
                 "XHTTP download must explicitly clear inherited certificate policy before changing security mode",
             );
+        }
+        if tls {
+            validate_tls13_fingerprint(client_fingerprint)?;
         }
         let security = if let Some(mut reality) = reality {
             if !tls {
@@ -2571,6 +3847,18 @@ impl RawXHttpDownloadSettings {
             jls.tls = config;
             jls.validate()?;
             SecurityConfig::Jls(jls)
+        } else if let Some(mut shadow_tls) = shadow_tls {
+            if !tls {
+                return invalid("XHTTP download ShadowTLS requires TLS");
+            }
+            shadow_tls.server_name = config.server_name;
+            shadow_tls.client_fingerprint = config.client_fingerprint;
+            shadow_tls.alpn = config.alpn;
+            shadow_tls.required_alpn = config.required_alpn;
+            shadow_tls.certificate = config.certificate;
+            shadow_tls.identity = config.identity;
+            shadow_tls.validate()?;
+            SecurityConfig::ShadowTls(shadow_tls)
         } else if tls {
             SecurityConfig::Tls(config)
         } else {
@@ -2580,9 +3868,10 @@ impl RawXHttpDownloadSettings {
             return invalid("XHTTP HTTP/3 download requires standard TLS");
         }
 
-        let path = path.unwrap_or_else(|| default_path.to_owned());
-        if path.is_empty()
-            || path.len() > 2_048
+        let path = path
+            .map(|path| if path.is_empty() { "/".into() } else { path })
+            .unwrap_or_else(|| default_path.to_owned());
+        if path.len() > 2_048
             || !path.starts_with('/')
             || path.parse::<http::uri::PathAndQuery>().is_err()
         {
@@ -2604,101 +3893,18 @@ impl RawXHttpDownloadSettings {
     }
 }
 
-impl DnsConfig {
-    fn disabled() -> Result<Self> {
-        Ok(Self {
-            enable: false,
-            ipv6: true,
-            nameservers: Vec::new(),
-            nameserver_policies: Vec::new(),
-        })
-    }
-}
-
-impl RawDnsConfig {
-    fn normalize(self, route_targets: &RouteTargetsByName) -> Result<DnsConfig> {
-        if !self.enable {
-            if !self.nameserver.is_empty() || !self.nameserver_policies.is_empty() {
-                return invalid(
-                    "dns.nameserver and dns.nameserver-policy must be empty when dns.enable is false",
-                );
-            }
-            return Ok(DnsConfig {
-                enable: false,
-                ipv6: self.ipv6,
-                nameservers: Vec::new(),
-                nameserver_policies: Vec::new(),
-            });
-        }
-
-        if self.nameserver.is_empty() || self.nameserver.len() > MAX_DNS_NAMESERVERS {
-            return invalid(format!(
-                "dns.nameserver must contain between 1 and {MAX_DNS_NAMESERVERS} entries when enabled"
-            ));
-        }
-        let default_route = DnsRoute::Direct;
-        let nameservers = self
-            .nameserver
-            .iter()
-            .map(|nameserver| parse_dns_nameserver(nameserver, route_targets, default_route))
-            .collect::<Result<Vec<_>>>()?;
-        let nameserver_policies = normalize_dns_nameserver_policies(
-            self.nameserver_policies,
-            route_targets,
-            default_route,
-        )?;
-
-        Ok(DnsConfig {
-            enable: true,
-            ipv6: self.ipv6,
-            nameservers,
-            nameserver_policies,
-        })
-    }
-}
-
 fn normalize_dns_nameserver_policies(
     raw_policies: Vec<RawDnsNameserverPolicy>,
     route_targets: &RouteTargetsByName,
     default_route: DnsRoute,
 ) -> Result<Vec<DnsNameserverPolicy>> {
     let mut normalized = Vec::with_capacity(raw_policies.len());
-    let mut seen_codes = Vec::<String>::new();
     for raw_policy in raw_policies {
-        let selector = raw_policy
-            .selector
-            .strip_prefix("geosite:")
-            .ok_or_else(|| {
-                VoleError::InvalidConfig(format!(
-                    "invalid dns.nameserver-policy selector `{}`; expected geosite:<code>[,<code>...]",
-                    raw_policy.selector
-                ))
-            })?;
-        if selector.is_empty() {
-            return invalid("dns.nameserver-policy geosite selector must not be empty");
-        }
+        let selector = normalize_dns_policy_selector(&raw_policy.selector)?;
 
-        let mut geosite_codes = Vec::new();
-        for raw_code in selector.split(',') {
-            if raw_code.is_empty() || trim_ascii_whitespace(raw_code) != raw_code {
-                return invalid(format!(
-                    "invalid dns.nameserver-policy selector `{}`; GeoSite codes must be non-empty and contain no surrounding whitespace",
-                    raw_policy.selector
-                ));
-            }
-            let code = normalize_geo_code(raw_code, "dns.nameserver-policy GeoSite")?;
-            if seen_codes.contains(&code) {
-                return invalid(format!(
-                    "dns.nameserver-policy contains duplicate GeoSite code `{code}`"
-                ));
-            }
-            seen_codes.push(code.clone());
-            geosite_codes.push(code);
-        }
-
-        if raw_policy.nameservers.is_empty() || raw_policy.nameservers.len() > MAX_DNS_NAMESERVERS {
+        if raw_policy.nameservers.is_empty() {
             return invalid(format!(
-                "dns.nameserver-policy `{}` must contain between 1 and {MAX_DNS_NAMESERVERS} nameservers",
+                "dns.nameserver-policy `{}` must contain at least one nameserver",
                 raw_policy.selector
             ));
         }
@@ -2708,281 +3914,138 @@ fn normalize_dns_nameserver_policies(
             .map(|nameserver| parse_dns_nameserver(nameserver, route_targets, default_route))
             .collect::<Result<Vec<_>>>()?;
         normalized.push(DnsNameserverPolicy {
-            geosite_codes: geosite_codes.into_boxed_slice(),
+            selector,
             nameservers: nameservers.into_boxed_slice(),
         });
     }
     Ok(normalized)
 }
 
-fn parse_dns_nameserver(
-    input: &str,
-    route_targets: &RouteTargetsByName,
-    default_route: DnsRoute,
-) -> Result<DnsNameserver> {
-    let (endpoint, route) = match input.split_once('#') {
-        Some((endpoint, fragment)) => (
-            endpoint,
-            parse_dns_route_fragment(input, fragment, route_targets)?,
-        ),
-        None => (input, default_route),
-    };
-
-    if let Ok(address) = endpoint.parse::<IpAddr>() {
-        return Ok(DnsNameserver {
-            transport: DnsTransport::Udp,
-            address,
-            port: 53,
-            route,
+fn normalize_dns_policy_selector(input: &str) -> Result<DnsPolicySelector> {
+    let lower = input.to_lowercase();
+    if let Some(selector) = lower.strip_prefix("geosite:") {
+        let codes = selector
+            .split(',')
+            .map(|code| {
+                if code.is_empty() || trim_ascii_whitespace(code) != code {
+                    return invalid("DNS policy GeoSite selectors must be non-empty without surrounding whitespace");
+                }
+                normalize_geo_code(code, "dns.nameserver-policy GeoSite")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(DnsPolicySelector::GeoSite(codes.into_boxed_slice()));
+    }
+    if let Some(selector) = input.strip_prefix("rule-set:") {
+        let names = selector.split(',').map(str::to_owned).collect::<Vec<_>>();
+        if names.iter().any(|name| name.is_empty()) {
+            return invalid("DNS policy rule-set requires provider names");
+        }
+        return Ok(DnsPolicySelector::RuleSets {
+            names: names.into_boxed_slice(),
+            sets: Vec::new(),
         });
     }
-
-    let (transport, endpoint) = if let Some(endpoint) = endpoint.strip_prefix("udp://") {
-        (DnsTransport::Udp, endpoint)
-    } else if let Some(endpoint) = endpoint.strip_prefix("tcp://") {
-        (DnsTransport::Tcp, endpoint)
-    } else {
-        return invalid(format!(
-            "invalid DNS nameserver `{input}`; expected IP, udp://IP[:port], or tcp://IP[:port], optionally followed by a route fragment"
-        ));
-    };
-
-    let (address, port) = parse_dns_endpoint(endpoint).ok_or_else(|| {
-        VoleError::InvalidConfig(format!(
-            "invalid DNS nameserver `{input}`; hostnames and URL paths are not supported"
-        ))
-    })?;
-    validate_port(port, "DNS nameserver")?;
-    Ok(DnsNameserver {
-        transport,
-        address,
-        port,
-        route,
-    })
-}
-
-fn parse_dns_route_fragment(
-    input: &str,
-    fragment: &str,
-    route_targets: &RouteTargetsByName,
-) -> Result<DnsRoute> {
-    if fragment.is_empty() {
-        return invalid(format!(
-            "invalid DNS nameserver `{input}`; route fragment must not be empty"
-        ));
-    }
-    if fragment.contains(['=', '&']) {
-        return invalid(format!(
-            "invalid DNS nameserver `{input}`; route fragment parameters and multiple tokens are not supported"
-        ));
-    }
-    match fragment {
-        "DIRECT" => Ok(DnsRoute::Direct),
-        "RULES" => Ok(DnsRoute::Rules),
-        fragment => route_targets
-            .get(fragment)
-            .copied()
-            .map(DnsRoute::Route)
-            .ok_or_else(|| {
-                VoleError::InvalidConfig(format!(
-                    "invalid DNS nameserver `{input}`; route fragment must be exactly DIRECT, RULES, or a configured proxy or proxy group name"
-                ))
-            }),
-    }
-}
-
-fn parse_dns_endpoint(endpoint: &str) -> Option<(IpAddr, u16)> {
-    if endpoint.is_empty()
-        || endpoint.contains(['/', '?', '#', '@'])
-        || endpoint.as_bytes().contains(&b'%')
-    {
-        return None;
-    }
-    if let Ok(address) = endpoint.parse::<IpAddr>() {
-        return Some((address, 53));
-    }
-    if endpoint.starts_with('[') {
-        let close = endpoint.find(']')?;
-        let address = endpoint.get(1..close)?.parse::<Ipv6Addr>().ok()?;
-        let suffix = endpoint.get(close + 1..)?;
-        let port = if suffix.is_empty() {
-            53
-        } else {
-            suffix.strip_prefix(':')?.parse::<u16>().ok()?
-        };
-        return Some((IpAddr::V6(address), port));
-    }
-    let endpoint = endpoint.parse::<SocketAddr>().ok()?;
-    Some((endpoint.ip(), endpoint.port()))
-}
-
-fn derive_default_route_target_from_rules(
-    rules: &[String],
-    route_targets: &RouteTargetsByName,
-) -> Result<RouteTargetId> {
-    let final_rule = rules.last().ok_or_else(|| {
-        VoleError::InvalidConfig(
-            "rules must end with MATCH targeting an exact proxy or proxy group name".to_owned(),
-        )
-    })?;
-    let fields = final_rule
+    let domains = lower
         .split(',')
-        .map(trim_ascii_whitespace)
-        .collect::<Vec<_>>();
-    if fields.len() != 2 || !fields[0].eq_ignore_ascii_case("MATCH") {
-        return invalid("rules must end with MATCH targeting an exact proxy or proxy group name");
-    }
-    route_targets.get(fields[1]).copied().ok_or_else(|| {
-        VoleError::InvalidConfig(format!(
-            "final MATCH target must be an exact configured proxy or proxy group name; found `{}`",
-            fields[1]
-        ))
-    })
+        .map(|domain| {
+            if domain.is_empty() || domain.ends_with('.') || domain.trim() != domain {
+                return invalid("invalid DNS policy domain pattern");
+            }
+            for (index, label) in domain.split('.').enumerate() {
+                if (label.is_empty() && index != 0)
+                    || (label.contains('+') && (index != 0 || label != "+" || domain == "+"))
+                    || (label.contains('*') && label != "*")
+                {
+                    return invalid("invalid DNS policy domain pattern");
+                }
+            }
+            Ok(domain.to_owned())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(DnsPolicySelector::Domains(domains.into_boxed_slice()))
 }
 
-fn normalize_rules(
-    rules: Vec<String>,
+use dns::parse_dns_nameserver;
+
+fn normalize_rule_program(
+    main: Vec<String>,
+    definitions: std::collections::BTreeMap<String, Vec<String>>,
     route_targets: &RouteTargetsByName,
-) -> Result<Vec<RuleSpec>> {
-    if rules.is_empty() {
-        return invalid("rules must not be empty");
+) -> Result<(Vec<RuleSpec>, Vec<NamedRuleProgram>)> {
+    let mut count = main.len();
+    let mut bytes = 0_usize;
+    let mut ids = HashMap::with_capacity(definitions.len());
+    for (index, (name, rules)) in definitions.iter().enumerate() {
+        if name.is_empty() {
+            return invalid("sub-rule name must not be empty");
+        }
+        count = count
+            .checked_add(rules.len())
+            .ok_or_else(|| VoleError::InvalidConfig("rules count overflowed".into()))?;
+        bytes = bytes
+            .checked_add(name.len())
+            .ok_or_else(|| VoleError::InvalidConfig("rules byte length overflowed".into()))?;
+        ids.insert(name.clone(), SubRuleId(index));
     }
-    if rules.len() > MAX_RULES {
+    if count > MAX_RULES {
         return invalid(format!("rules exceeds the {MAX_RULES}-entry limit"));
     }
-
-    let mut total_bytes = 0_usize;
-    let mut normalized = Vec::with_capacity(rules.len());
-    for rule in rules {
-        if rule.len() > MAX_RULE_BYTES {
-            return invalid(format!(
-                "rule exceeds the {MAX_RULE_BYTES}-byte per-entry limit"
-            ));
-        }
-        total_bytes = total_bytes
-            .checked_add(rule.len())
-            .ok_or_else(|| VoleError::InvalidConfig("rules byte length overflowed".to_owned()))?;
-        if total_bytes > MAX_RULES_TOTAL_BYTES {
-            return invalid(format!(
-                "rules exceeds the {MAX_RULES_TOTAL_BYTES}-byte cumulative limit"
-            ));
-        }
-        normalized.push(parse_rule(&rule, route_targets)?);
+    if bytes > MAX_RULES_TOTAL_BYTES {
+        return invalid(format!(
+            "rules exceeds the {MAX_RULES_TOTAL_BYTES}-byte cumulative limit"
+        ));
     }
-
-    let match_count = normalized
-        .iter()
-        .filter(|rule| matches!(rule.kind, RuleKind::Match))
-        .count();
-    if match_count != 1
-        || !matches!(
-            normalized.last().map(|rule| &rule.kind),
-            Some(RuleKind::Match)
-        )
-    {
-        return invalid("explicit rules must contain exactly one MATCH as the final rule");
-    }
-    Ok(normalized)
-}
-
-fn parse_rule(input: &str, route_targets: &RouteTargetsByName) -> Result<RuleSpec> {
-    if input.is_empty() {
-        return invalid("rule must not be empty");
-    }
-    let fields = input
-        .split(',')
-        .map(trim_ascii_whitespace)
-        .collect::<Vec<_>>();
-    let rule_type = fields
-        .first()
-        .filter(|field| !field.is_empty())
-        .ok_or_else(|| VoleError::InvalidConfig("rule type must not be empty".to_owned()))?
-        .to_ascii_uppercase();
-
-    match rule_type.as_str() {
-        "MATCH" => {
-            require_rule_field_count(&fields, 2, "MATCH")?;
-            Ok(RuleSpec {
-                kind: RuleKind::Match,
-                action: parse_rule_action(fields[1], route_targets)?,
-                no_resolve: false,
-            })
-        }
-        "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" | "GEOSITE" | "DST-PORT" | "NETWORK" => {
-            require_rule_field_count(&fields, 3, &rule_type)?;
-            let kind = match rule_type.as_str() {
-                "DOMAIN" => RuleKind::Domain(normalize_rule_domain(fields[1], "DOMAIN")?),
-                "DOMAIN-SUFFIX" => {
-                    RuleKind::DomainSuffix(normalize_rule_domain(fields[1], "DOMAIN-SUFFIX")?)
-                }
-                "DOMAIN-KEYWORD" => RuleKind::DomainKeyword(normalize_rule_keyword(fields[1])?),
-                "GEOSITE" => RuleKind::GeoSite(normalize_geo_code(fields[1], "GEOSITE")?),
-                "DST-PORT" => RuleKind::DstPorts(parse_port_ranges(fields[1])?),
-                "NETWORK" => RuleKind::Network(parse_network(fields[1])?),
-                _ => unreachable!("matched rule type"),
-            };
-            Ok(RuleSpec {
-                kind,
-                action: parse_rule_action(fields[2], route_targets)?,
-                no_resolve: false,
-            })
-        }
-        "GEOIP" | "IP-CIDR" | "IP-CIDR6" => {
-            if fields.len() != 3 && fields.len() != 4 {
-                return invalid(format!(
-                    "{rule_type} rule must contain 3 fields, or 4 fields with no-resolve"
-                ));
-            }
-            let kind = match rule_type.as_str() {
-                "GEOIP" => RuleKind::GeoIp(normalize_geo_code(fields[1], "GEOIP")?),
-                "IP-CIDR" => RuleKind::IpCidr(parse_ip_cidr(fields[1], false)?),
-                "IP-CIDR6" => RuleKind::IpCidr(parse_ip_cidr(fields[1], true)?),
-                _ => unreachable!("matched rule type"),
-            };
-            let no_resolve = if fields.len() == 4 {
-                if fields[3] != "no-resolve" {
+    let mut normalize = |rules: Vec<String>| -> Result<Vec<RuleSpec>> {
+        rules
+            .into_iter()
+            .map(|rule| {
+                if rule.len() > MAX_RULE_BYTES {
                     return invalid(format!(
-                        "{rule_type} fourth field must be exactly `no-resolve`"
+                        "rule exceeds the {MAX_RULE_BYTES}-byte per-entry limit"
                     ));
                 }
-                true
-            } else {
-                false
-            };
-            Ok(RuleSpec {
-                kind,
-                action: parse_rule_action(fields[2], route_targets)?,
-                no_resolve,
+                bytes = bytes.checked_add(rule.len()).ok_or_else(|| {
+                    VoleError::InvalidConfig("rules byte length overflowed".into())
+                })?;
+                if bytes > MAX_RULES_TOTAL_BYTES {
+                    return invalid(format!(
+                        "rules exceeds the {MAX_RULES_TOTAL_BYTES}-byte cumulative limit"
+                    ));
+                }
+                rules::parse_program_rule(&rule, route_targets, &ids)
             })
-        }
-        _ => invalid(format!("unsupported rule type `{}`", fields[0])),
-    }
+            .collect()
+    };
+    let main = normalize(main)?;
+    let sub_rules = definitions
+        .into_iter()
+        .map(|(name, rules)| {
+            Ok(NamedRuleProgram {
+                name,
+                rules: normalize(rules)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    rules::validate_subrule_calls(&main, &sub_rules)?;
+    Ok((main, sub_rules))
 }
 
 fn trim_ascii_whitespace(input: &str) -> &str {
     input.trim_matches(|character: char| character.is_ascii_whitespace())
 }
 
-fn require_rule_field_count(fields: &[&str], expected: usize, rule_type: &str) -> Result<()> {
-    if fields.len() != expected {
-        return invalid(format!(
-            "{rule_type} rule must contain exactly {expected} fields"
-        ));
-    }
-    Ok(())
-}
-
 fn parse_rule_action(action: &str, route_targets: &RouteTargetsByName) -> Result<RuleAction> {
     match action {
-        "DIRECT" => Ok(RuleAction::Direct),
+        "DIRECT" | "COMPATIBLE" => Ok(RuleAction::Direct),
         "REJECT" => Ok(RuleAction::Reject),
+        "REJECT-DROP" => Ok(RuleAction::RejectDrop),
         tag => route_targets
             .get(tag)
             .copied()
             .map(RuleAction::Route)
             .ok_or_else(|| {
                 VoleError::InvalidConfig(format!(
-                    "rule target must be exactly DIRECT, REJECT, or a configured proxy or proxy group name; found `{action}`"
+                    "rule target must be exactly DIRECT, COMPATIBLE, REJECT, REJECT-DROP, or a configured proxy or proxy group name; found `{action}`"
                 ))
             }),
     }
@@ -3058,37 +4121,37 @@ fn parse_ip_cidr(input: &str, require_v6: bool) -> Result<IpCidr> {
 }
 
 fn parse_port_ranges(input: &str) -> Result<Vec<PortRange>> {
-    if input.is_empty() {
-        return invalid("DST-PORT value must not be empty");
+    let input = input.trim();
+    if input.split('/').count() > 28 {
+        return invalid("port rule exceeds 28 ranges");
     }
-    input
-        .split('/')
-        .map(|item| {
-            if item.is_empty() {
-                return invalid("DST-PORT contains an empty port range");
+    let mut ranges = Vec::new();
+    for item in input.split('/').filter(|item| !item.is_empty()) {
+        let item = item.trim();
+        if item.is_empty() {
+            ranges.push(PortRange { start: 0, end: 0 });
+            continue;
+        }
+        let (start, end) = item.split_once('-').unwrap_or((item, item));
+        let parse = |value: &str| -> Result<u16> {
+            let value = value.trim_matches(['[', ']', ' ']);
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return invalid("invalid rule port");
             }
-            let (start, end) = item.split_once('-').unwrap_or((item, item));
-            if end.contains('-') {
-                return invalid("DST-PORT range must contain at most one `-`");
-            }
-            let start = parse_destination_port(start)?;
-            let end = parse_destination_port(end)?;
-            if start > end {
-                return invalid("DST-PORT range start must not exceed its end");
-            }
-            Ok(PortRange { start, end })
-        })
-        .collect()
-}
-
-fn parse_destination_port(input: &str) -> Result<u16> {
-    let port = input
-        .parse::<u16>()
-        .map_err(|_| VoleError::InvalidConfig(format!("invalid destination port `{input}`")))?;
-    if port == 0 {
-        return invalid("destination port must be between 1 and 65535");
+            value
+                .parse()
+                .map_err(|_| VoleError::InvalidConfig("invalid rule port".into()))
+        };
+        let (start, end) = (parse(start)?, parse(end)?);
+        ranges.push(PortRange {
+            start: start.min(end),
+            end: start.max(end),
+        });
     }
-    Ok(port)
+    if ranges.is_empty() {
+        return invalid("port rule requires at least one range");
+    }
+    Ok(ranges)
 }
 
 fn parse_network(input: &str) -> Result<Network> {
@@ -3102,29 +4165,18 @@ fn parse_network(input: &str) -> Result<Network> {
 }
 
 pub(crate) fn validate_route_target_name(name: &str, field: &str) -> Result<()> {
-    let mut characters = name.chars();
-    let first = characters.next();
-    let last = characters.next_back().or(first);
-    if name.is_empty()
-        || name.len() > 64
-        || first.is_some_and(char::is_whitespace)
-        || last.is_some_and(char::is_whitespace)
-        || name.chars().any(|character| {
-            character.is_control()
-                || matches!(character, ',' | '#' | '/' | '?' | '&' | '=' | '%' | '\\')
-        })
-        || matches!(name, "." | "..")
-    {
-        return invalid(format!(
-            "{field} must be 1-64 UTF-8 bytes without surrounding whitespace, control characters, path separators, or reserved delimiters"
-        ));
+    if name.is_empty() {
+        return invalid(format!("{field} must not be empty"));
     }
     Ok(())
 }
 
 fn validate_route_target_definition_name(name: &str, field: &str) -> Result<()> {
     validate_route_target_name(name, field)?;
-    if matches!(name, "DIRECT" | "REJECT" | "RULES") {
+    if matches!(
+        name,
+        "DIRECT" | "REJECT" | "REJECT-DROP" | "COMPATIBLE" | "PASS" | "PASS-RULE"
+    ) {
         return invalid(format!("{field} `{name}` is reserved"));
     }
     Ok(())
@@ -3160,6 +4212,10 @@ fn validate_port(port: u16, kind: &str) -> Result<()> {
     Ok(())
 }
 
+fn parse_client_uuid(input: &str) -> Uuid {
+    Uuid::parse_str(input).unwrap_or_else(|_| Uuid::new_v5(&Uuid::nil(), input.as_bytes()))
+}
+
 fn parse_standard_uuid(input: &str) -> Result<Uuid> {
     let id = Uuid::parse_str(input)
         .map_err(|_| VoleError::InvalidConfig("invalid VLESS settings.id UUID".to_owned()))?;
@@ -3169,102 +4225,6 @@ fn parse_standard_uuid(input: &str) -> Result<Uuid> {
     Ok(id)
 }
 
-fn validate_json_compatible_yaml(value: &YamlValue) -> Result<()> {
-    match value {
-        YamlValue::Null | YamlValue::Bool(_) | YamlValue::Number(_) | YamlValue::String(_) => {
-            Ok(())
-        }
-        YamlValue::Sequence(values) => {
-            for value in values {
-                validate_json_compatible_yaml(value)?;
-            }
-            Ok(())
-        }
-        YamlValue::Mapping(mapping) => {
-            for (key, value) in mapping {
-                let YamlValue::String(key) = key else {
-                    return invalid("YAML map keys must be strings");
-                };
-                if key == "<<" {
-                    return invalid("YAML merge keys are not supported");
-                }
-                validate_json_compatible_yaml(value)?;
-            }
-            Ok(())
-        }
-        YamlValue::Tagged(_) => invalid("custom YAML tags are not supported"),
-    }
-}
-
-/// Anchors and aliases disappear when `serde_yaml_ng` materializes a value, so
-/// reject their node-property syntax before parsing. Quoted text and comments
-/// are intentionally ignored by this small lexical pass.
-fn reject_yaml_anchors_and_aliases(input: &str) -> Result<()> {
-    let bytes = input.as_bytes();
-    let mut index = 0;
-    let mut single_quoted = false;
-    let mut double_quoted = false;
-    let mut comment = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if comment {
-            if byte == b'\n' {
-                comment = false;
-            }
-            index += 1;
-            continue;
-        }
-        if single_quoted {
-            if byte == b'\'' {
-                if bytes.get(index + 1) == Some(&b'\'') {
-                    index += 2;
-                    continue;
-                }
-                single_quoted = false;
-            }
-            index += 1;
-            continue;
-        }
-        if double_quoted {
-            if byte == b'\\' {
-                index = (index + 2).min(bytes.len());
-                continue;
-            }
-            if byte == b'"' {
-                double_quoted = false;
-            }
-            index += 1;
-            continue;
-        }
-
-        match byte {
-            b'#' if index == 0 || bytes[index - 1].is_ascii_whitespace() => comment = true,
-            b'\'' => single_quoted = true,
-            b'"' => double_quoted = true,
-            b'&' | b'*' if is_yaml_node_boundary(bytes, index) => {
-                return invalid("YAML anchors and aliases are not supported");
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    Ok(())
-}
-
-fn is_yaml_node_boundary(bytes: &[u8], index: usize) -> bool {
-    let previous_is_boundary = index == 0
-        || bytes[index - 1].is_ascii_whitespace()
-        || b"[{,:?-".contains(&bytes[index - 1]);
-    let Some(next) = bytes.get(index + 1) else {
-        return false;
-    };
-    previous_is_boundary
-        && !next.is_ascii_whitespace()
-        && !b"[]{}:,#".contains(next)
-        && *next != b'\n'
-        && *next != b'\r'
-}
-
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(VoleError::InvalidConfig(message.into()))
 }
@@ -3272,6 +4232,158 @@ fn invalid<T>(message: impl Into<String>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_uuid_preserves_uuid_bytes_and_maps_named_credentials() {
+        let expected = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        for input in [
+            "00000000-0000-4000-8000-000000000001",
+            "00000000000040008000000000000001",
+            "{00000000-0000-4000-8000-000000000001}",
+            "urn:uuid:00000000-0000-4000-8000-000000000001",
+        ] {
+            assert_eq!(parse_client_uuid(input), expected);
+        }
+        assert_eq!(
+            parse_client_uuid("synthetic-user").hyphenated().to_string(),
+            "d17c2bfe-ad7e-5a4e-8ea9-f3158f5f8aec"
+        );
+        assert_ne!(
+            parse_client_uuid("synthetic-user"),
+            parse_client_uuid(" synthetic-user")
+        );
+    }
+
+    #[test]
+    fn modes_and_global_group_work_without_a_final_match() {
+        use crate::routing::{RoutingContext, RuleEvaluation, RuleSet};
+        let destination = crate::session::Destination::Ip("192.0.2.1:443".parse().unwrap());
+        let context = RoutingContext::new(Network::Tcp, &destination).unwrap();
+        for mode in ["rule", "DIRECT", "global"] {
+            let mut config = Config::parse_yaml(
+                format!("mixed-port: 1080\nmode: {mode}\nlog-level: Warning\n").as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(config.log_level, LogLevel::Warning);
+            assert_eq!(config.proxy_groups[0].name, "GLOBAL");
+            assert_eq!(config.proxy_groups[0].members[0].name, "DIRECT");
+            let expected = if config.mode == Mode::Global {
+                RuleAction::Route(RouteTargetId::Group(ProxyGroupId::from_index(0)))
+            } else {
+                RuleAction::Direct
+            };
+            let RuleEvaluation::Matched(result) = RuleSet::compile(config.take_runtime_rules())
+                .unwrap()
+                .evaluate(&context)
+            else {
+                panic!("mode must select an action")
+            };
+            assert_eq!(result.action, expected);
+        }
+        let config = Config::parse_yaml(b"mixed-port: 1080\nproxy-groups: [{name: GLOBAL, type: select, proxies: [REJECT, DIRECT]}]\n").unwrap();
+        assert_eq!(config.proxy_groups.len(), 1);
+        assert_eq!(config.proxy_groups[0].members[0].name, "REJECT");
+    }
+
+    #[test]
+    fn ingress_source_params_types_users_ports_and_hash_schema() {
+        let mut config = Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxy-groups: [{name: pool, type: load-balance, proxies: [DIRECT], hash-key: in-user}]
+rules:
+  - SRC-GEOIP,CN,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve,src
+  - GEOIP,CN,DIRECT,src,no-resolve
+  - IP-CIDR,2001:db8::/32,DIRECT,src
+  - IP-CIDR6,192.0.2.0/24,DIRECT,src
+  - IN-TYPE,HTTP / https / SOCKS / TUN / INNER,DIRECT
+  - IN-USER, Alice / Bob ,DIRECT
+  - IN-PORT,0/1081-1080//65535,DIRECT
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.proxy_groups[0].hash_key, BalanceHashKey::InUser);
+        assert!(config.rules[..5].iter().all(|rule| rule.no_resolve));
+        assert_eq!(config.rules[0].kind, RuleKind::SrcGeoIp("cn".into()));
+        assert_eq!(config.rules[1], config.rules[2]);
+        assert!(matches!(
+            config.rules[3].kind,
+            RuleKind::SrcIpCidr(IpCidr {
+                network: IpAddr::V6(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            config.rules[4].kind,
+            RuleKind::SrcIpCidr(IpCidr {
+                network: IpAddr::V4(_),
+                ..
+            })
+        ));
+        assert_eq!(
+            config.rules[7].kind,
+            RuleKind::InPorts(vec![
+                PortRange { start: 0, end: 0 },
+                PortRange {
+                    start: 1080,
+                    end: 1081
+                },
+                PortRange {
+                    start: 65535,
+                    end: 65535
+                }
+            ])
+        );
+        crate::routing::RuleSet::compile(config.take_runtime_rules()).unwrap();
+        // Authentication hashing has no meaning for round robin.
+        assert!(Config::parse_yaml(b"mixed-port: 1080\nproxy-groups: [{name: pool, type: load-balance, strategy: round-robin, hash-key: in-user, proxies: [DIRECT]}]").is_err());
+    }
+
+    #[test]
+    fn yaml_templates_feed_logical_domain_and_source_rules() {
+        use crate::routing::{RoutingContext, RuleEvaluation, RuleSet};
+        let yaml = r#"
+mixed-port: 0
+allow-lan: true
+authentication: [user:password]
+tun: {enable: true}
+proxies:
+  - &base {name: "first/#%", type: socks5, server: 192.0.2.1, port: 1080}
+  - {<<: *base, name: second, port: 1081}
+rules:
+  - AND,((DOMAIN-WILDCARD,*.example.com),(SRC-IP-CIDR,10.0.0.0/8),(SRC-PORT,1000-2000),(NOT,((NETWORK,UDP)))),REJECT
+  - 'DOMAIN-REGEX,^a{1,2}\.example\.com$,second'
+"#;
+        let mut config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        assert_eq!(
+            config.proxies[1].server_endpoint(),
+            Some(("192.0.2.1", 1081))
+        );
+        let rules = RuleSet::compile(config.take_runtime_rules()).unwrap();
+        let destination = crate::session::Destination::domain("AA.example.com", 443).unwrap();
+        let mut context = RoutingContext::new(Network::Tcp, &destination).unwrap();
+        context.set_source("10.1.2.3:1500".parse().unwrap());
+        let RuleEvaluation::Matched(result) = rules.evaluate(&context) else {
+            panic!("rule match")
+        };
+        assert_eq!(result.action, RuleAction::Reject);
+        // A completed flow's budget must not be reused by another source tuple.
+        context.decision().set_deadline(std::time::Instant::now());
+        let mut context = RoutingContext::new(Network::Tcp, &destination).unwrap();
+        context.set_source("192.0.2.2:1500".parse().unwrap());
+        let evaluation = rules.evaluate(&context);
+        let RuleEvaluation::Matched(result) = evaluation else {
+            panic!("regex match: {evaluation:?}")
+        };
+        assert_eq!(
+            result.action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::from_index(1)))
+        );
+        assert!(
+            Config::parse_yaml(b"mixed-port: 1080\nproxies: &recursive [*recursive]\n").is_err()
+        );
+    }
 
     const CURRENT_TLS: &str = r#"mixed-port: 1080
 authentication:
@@ -3345,7 +4457,7 @@ proxies:
     fn current_yaml(fields: &str) -> String {
         let default_rules = if fields
             .lines()
-            .any(|line| line.trim_ascii_start() == "rules:")
+            .any(|line| line.trim_ascii_start().starts_with("rules:"))
         {
             ""
         } else {
@@ -3360,7 +4472,7 @@ proxies:
 
     fn with_geodata(fields: &str) -> String {
         current_yaml(&format!(
-            "{fields}\nmixed-port: 1080\nauthentication:\n  - measure:secret"
+            "geodata-mode: true\n{fields}\nmixed-port: 1080\nauthentication:\n  - measure:secret"
         ))
     }
 
@@ -3456,8 +4568,8 @@ proxies:
         assert_eq!(config.proxies[0].tag, "proxy");
         assert!(config.proxies[0].udp);
         assert_eq!(
-            config.default_route_target,
-            RouteTargetId::Proxy(ProxyId::new(0).unwrap())
+            config.rules.last().unwrap().action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(0).unwrap()))
         );
         assert_eq!(first_vless(&config).address, "203.0.113.1");
         assert!(matches!(
@@ -3515,31 +4627,42 @@ geo-update-interval: 24"#,
                 .expect("disabled updater remains explicit configuration")
                 .auto_update
         );
-        assert!(
-            Config::parse_yaml(CURRENT_TLS.as_bytes())
-                .unwrap()
-                .geodata_update
-                .is_none()
-        );
+        let defaults = Config::parse_yaml(CURRENT_TLS.as_bytes()).unwrap();
+        assert!(!defaults.geodata_update.unwrap().auto_update);
+        assert!(defaults.etag_support);
     }
 
     #[test]
-    fn geodata_update_fields_are_all_present_or_all_absent() {
-        let urls = "geox-url:\n  geoip: https://geo.example.test/geoip.dat\n  geosite: https://geo.example.test/geosite.dat";
-        for fields in [
-            urls.to_owned(),
-            "geo-auto-update: true".to_owned(),
-            "geo-update-interval: 24".to_owned(),
-            format!("{urls}\ngeo-auto-update: true"),
-            format!("{urls}\ngeo-update-interval: 24"),
-            "geo-auto-update: true\ngeo-update-interval: 24".to_owned(),
-        ] {
-            let error = Config::parse_yaml(with_geodata(&fields).as_bytes()).unwrap_err();
-            assert!(
-                error.to_string().contains("must be configured together"),
-                "{fields}: {error}"
-            );
-        }
+    fn geodata_mode_defaults_to_mmdb_and_urls_remain_independent() {
+        let default = Config::parse_yaml(b"rules: ['GEOIP,CN,DIRECT']").unwrap();
+        let update = default.geodata_update.unwrap();
+        assert!(!update.geodata_mode);
+        assert_eq!(update.urls.mmdb, default_mmdb_url());
+        let explicit = Config::parse_yaml(b"geodata-mode: true\ngeox-url: {mmdb: https://assets.example.test/country}\nrules: ['GEOIP,CN,DIRECT']").unwrap();
+        let update = explicit.geodata_update.unwrap();
+        assert!(update.geodata_mode);
+        assert_eq!(update.urls.mmdb, "https://assets.example.test/country");
+        assert_eq!(update.urls.geoip, default_geoip_url());
+    }
+
+    #[test]
+    fn geodata_fields_have_independent_defaults_and_configurable_intervals() {
+        let config = Config::parse_yaml(with_geodata("geo-auto-update: true\ngeo-update-interval: 6\netag-support: false\nglobal-ua: custom-agent\ngeox-url:\n  geosite: https://rules.example.test/site.dat").as_bytes()).unwrap();
+        assert!(!config.etag_support);
+        assert_eq!(config.global_ua, "custom-agent");
+        let update = config.geodata_update.unwrap();
+        assert!(update.auto_update);
+        assert_eq!(update.interval_hours, 6);
+        assert_eq!(update.urls.geoip, default_geoip_url());
+        assert_eq!(update.urls.geosite, "https://rules.example.test/site.dat");
+        assert_eq!(
+            Config::parse_yaml(with_geodata("geo-update-interval: 0").as_bytes())
+                .unwrap()
+                .geodata_update
+                .unwrap()
+                .interval_hours,
+            0
+        );
     }
 
     #[test]
@@ -3550,11 +4673,6 @@ geo-update-interval: 24"#,
             ))
         };
         for yaml in [
-            complete(
-                "https://geo.example.test/geoip.dat",
-                "https://geo.example.test/geosite.dat",
-                "23",
-            ),
             complete(
                 "https://geo.example.test/geoip.dat",
                 "https://geo.example.test/geosite.dat",
@@ -3576,12 +4694,12 @@ geo-update-interval: 24"#,
                 "24",
             ),
             complete(
-                "https://user:password@geo.example.test/geoip.dat",
+                "https://user%GG:password@geo.example.test/geoip.dat",
                 "https://geo.example.test/geosite.dat",
                 "24",
             ),
             complete(
-                "https://@geo.example.test/geoip.dat",
+                "https://user%3Aname:password@geo.example.test/geoip.dat",
                 "https://geo.example.test/geosite.dat",
                 "24",
             ),
@@ -3612,15 +4730,12 @@ geo-update-interval: 24"#,
     }
 
     #[test]
-    fn geodata_update_http_is_benchmark_only() {
+    fn geodata_update_requires_https() {
         for url in [
             "http://geo.example.test/geoip.dat",
             "http://geo.example.test:8080/geosite.dat",
         ] {
-            assert_eq!(
-                normalize_geox_url(url.to_owned(), "geox-url.geoip").is_ok(),
-                cfg!(feature = "benchmark-geodata-http")
-            );
+            assert!(normalize_geox_url(url.to_owned(), "geox-url.geoip").is_err());
         }
         for url in [
             "http://127.0.0.1/geoip.dat",
@@ -3634,28 +4749,20 @@ geo-update-interval: 24"#,
     }
 
     #[test]
-    fn rejects_incomplete_or_extended_geox_url_maps() {
-        for fields in [
-            r#"geox-url:
-  geoip: https://geo.example.test/geoip.dat
-geo-auto-update: true
-geo-update-interval: 24"#,
-            r#"geox-url:
-  geosite: https://geo.example.test/geosite.dat
-geo-auto-update: true
-geo-update-interval: 24"#,
-            r#"geox-url:
-  geoip: https://geo.example.test/geoip.dat
-  geosite: https://geo.example.test/geosite.dat
-  mmdb: https://geo.example.test/country.mmdb
-geo-auto-update: true
-geo-update-interval: 24"#,
-        ] {
-            assert!(
-                Config::parse_yaml(with_geodata(fields).as_bytes()).is_err(),
-                "{fields}"
-            );
+    fn geodata_url_basic_auth_keeps_validation_and_debug_private() {
+        let yaml = with_geodata(
+            "geox-url: {geoip: 'https://subscriber:password@geo.example.test/private-path?token=private-query'}",
+        );
+        let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        let debug = format!("{:?}", config.geodata_update.as_ref().unwrap());
+        for secret in ["subscriber", "password", "private-path", "private-query"] {
+            assert!(!debug.contains(secret));
         }
+        assert!(debug.contains("https://geo.example.test"));
+        let raw: RawGeoDataUrls=serde_yaml_ng::from_str("geoip: 'https://subscriber:password@geo.example.test/private-path?token=private-query'").unwrap();
+        let debug = format!("{raw:?}");
+        assert!(!debug.contains("password"));
+        assert!(!debug.contains("private-query"));
     }
 
     #[test]
@@ -3700,7 +4807,10 @@ geo-update-interval: 24"#,
         assert!(config.sniffer.enable);
         assert_eq!(
             config.sniffer.http_ports.as_ref(),
-            &[PortRange { start: 80, end: 80 }]
+            &[PortRange {
+                start: 0,
+                end: u16::MAX
+            }]
         );
         assert_eq!(
             config.sniffer.tls_ports.as_ref(),
@@ -3716,18 +4826,18 @@ geo-update-interval: 24"#,
             ]
         );
         assert!(config.sniffer.matches_http_port(80));
-        assert!(!config.sniffer.matches_http_port(8080));
+        assert!(config.sniffer.matches_http_port(8080));
         assert!(config.sniffer.matches_tls_port(8445));
         assert!(!config.sniffer.matches_tls_port(8448));
         assert_eq!(
             config.sniffer.quic_ports.as_ref(),
             &[PortRange {
-                start: 443,
-                end: 443
+                start: 0,
+                end: u16::MAX
             }]
         );
         assert!(config.sniffer.matches_quic_port(443));
-        assert!(!config.sniffer.matches_quic_port(8443));
+        assert!(config.sniffer.matches_quic_port(8443));
 
         let http_only =
             Config::parse_yaml(with_sniffer("  enable: true\n  sniff:\n    HTTP: {}").as_bytes())
@@ -3793,21 +4903,13 @@ geo-update-interval: 24"#,
     }
 
     #[test]
-    fn rejects_invalid_sniffer_shapes_ports_and_overlap() {
+    fn rejects_invalid_sniffer_shapes_and_ports() {
         let too_many_ports = (1..=MAX_SNIFFER_PORT_ITEMS + 1)
             .map(|port| port.to_string())
             .collect::<Vec<_>>()
             .join(", ");
         for yaml in [
-            with_sniffer("  enable: true"),
-            with_sniffer("  enable: true\n  sniff: {}"),
-            with_sniffer("  sniff:\n    HTTP: {}"),
             with_sniffer("  enable: \"true\"\n  sniff:\n    HTTP: {}"),
-            CURRENT_TLS.replacen("tun:\n", "sniffer:\ntun:\n", 1),
-            with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: []"),
-            with_sniffer("  enable: true\n  sniff:\n    QUIC:\n      ports: []"),
-            with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: [0]"),
-            with_sniffer("  enable: true\n  sniff:\n    QUIC:\n      ports: [0]"),
             with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: [65536]"),
             with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: [\"\"]"),
             with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: [\"+80\"]"),
@@ -3817,9 +4919,6 @@ geo-update-interval: 24"#,
             with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: [\"443-\"]"),
             with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      ports: [\"444-443\"]"),
             with_sniffer("  enable: true\n  sniff:\n    QUIC:\n      ports: [\"444-443\"]"),
-            with_sniffer(
-                "  enable: true\n  sniff:\n    HTTP:\n      ports: [\"80-90\"]\n    TLS:\n      ports: [90]",
-            ),
             with_sniffer(&format!(
                 "  enable: true\n  sniff:\n    HTTP:\n      ports: [{too_many_ports}]"
             )),
@@ -4076,12 +5175,7 @@ geo-update-interval: 24"#,
 
     #[test]
     fn rejects_unsupported_xhttp_download_fields_fail_closed() {
-        for fields in [
-            "shadow-tls-opts: {}",
-            "restls-opts: {}",
-            "mode: stream-up",
-            "typo: true",
-        ] {
+        for fields in ["restls-opts: {}", "mode: stream-up", "typo: true"] {
             let yaml = with_xhttp_download(CURRENT_TLS, fields);
             let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
             assert!(
@@ -4090,7 +5184,7 @@ geo-update-interval: 24"#,
             );
         }
 
-        for unsupported in ["    shadow-tls-opts: {}\n", "    restls-opts: {}\n"] {
+        for unsupported in ["    restls-opts: {}\n"] {
             let yaml = CURRENT_TLS.replace(
                 "    xhttp-opts:\n",
                 &format!("{unsupported}    xhttp-opts:\n"),
@@ -4114,22 +5208,6 @@ geo-update-interval: 24"#,
             ),
             CURRENT_TLS.replace("tun:\n", "tun:\n  typo: true\n"),
             with_sniffer("  enable: true\n  typo: true\n  sniff:\n    HTTP: {}"),
-            with_sniffer("  enable: true\n  override-destination: false\n  sniff:\n    HTTP: {}"),
-            with_sniffer("  enable: true\n  force-dns-mapping: true\n  sniff:\n    HTTP: {}"),
-            with_sniffer("  enable: true\n  parse-pure-ip: true\n  sniff:\n    HTTP: {}"),
-            with_sniffer("  enable: true\n  force-domain: [example.com]\n  sniff:\n    HTTP: {}"),
-            with_sniffer(
-                "  enable: true\n  skip-src-address: [192.0.2.1/32]\n  sniff:\n    HTTP: {}",
-            ),
-            with_sniffer(
-                "  enable: true\n  skip-dst-address: [192.0.2.1/32]\n  sniff:\n    HTTP: {}",
-            ),
-            with_sniffer("  enable: true\n  skip-domain: [example.com]\n  sniff:\n    HTTP: {}"),
-            with_sniffer("  enable: true\n  sniffing: [http]"),
-            with_sniffer("  enable: true\n  port-whitelist: [80]"),
-            with_sniffer("  enable: true\n  sniff:\n    http: {}"),
-            with_sniffer("  enable: true\n  sniff:\n    quic: {}"),
-            with_sniffer("  enable: true\n  sniff:\n    HTTP:\n      override-destination: false"),
             CURRENT_TLS.replace("  - name: proxy\n", "  - typo: true\n    name: proxy\n"),
             CURRENT_TLS.replace("    server: ", "    vnext: []\n    server: "),
             CURRENT_TLS.replace("    network: xhttp", "    typo: true\n    network: xhttp"),
@@ -4175,27 +5253,18 @@ outbounds: []
 
     #[test]
     fn validates_listener_and_tun_constraints() {
-        for yaml in [
-            CURRENT_TLS.replace("mtu: 1500", "mtu: 1279"),
-            CURRENT_TLS.replace(
-                "mixed-port: 1080
-authentication:
-  - measure:secret",
-                "mixed-port: 0
-authentication:
-  - measure:secret",
-            ),
-            CURRENT_TLS
-                .replace("enable: true", "enable: false")
-                .replace(
-                    "mixed-port: 1080
-authentication:
-  - measure:secret\n",
-                    "",
-                ),
-        ] {
-            assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");
-        }
+        assert!(
+            Config::parse_yaml(CURRENT_TLS.replace("mtu: 1500", "mtu: 1279").as_bytes()).is_err()
+        );
+        let disabled = CURRENT_TLS
+            .replace("enable: true", "enable: false")
+            .replace(
+                "mixed-port: 1080\nauthentication:\n  - measure:secret\n",
+                "",
+            );
+        let config = Config::parse_yaml(disabled.as_bytes()).unwrap();
+        assert!(config.inbounds.is_empty());
+        assert!(!config.tun.enable);
     }
 
     #[test]
@@ -4231,11 +5300,34 @@ tun:
         assert_eq!(controller.listen, "[::1]:19091".parse().unwrap());
         assert!(controller.secret.is_none());
 
+        for (address, expected) in [
+            ("0.0.0.0:9090", "0.0.0.0:9090"),
+            ("[::]:9090", "[::]:9090"),
+            ("192.0.2.1:9090", "192.0.2.1:9090"),
+            ("127.0.0.1:0", "127.0.0.1:0"),
+            ("localhost:0", "127.0.0.1:0"),
+            (":0", "[::]:0"),
+        ] {
+            let fields = format!("external-controller: '{address}'\nsecret: ''");
+            let config = Config::parse_yaml(current_yaml(&fields).as_bytes()).unwrap();
+            let controller = config.external_controller.unwrap();
+            assert_eq!(controller.listen, expected.parse().unwrap());
+            assert!(controller.secret.is_none());
+        }
+        let secret = "s".repeat(crate::inbound::DEFAULT_HEADER_LIMIT + 1);
+        let fields = format!("external-controller: '127.0.0.1:0'\nsecret: '{secret}'");
+        let config = Config::parse_yaml(current_yaml(&fields).as_bytes()).unwrap();
+        assert_eq!(
+            config.external_controller.unwrap().secret.as_deref(),
+            Some(secret.as_str())
+        );
+
         let debug = format!(
             "{:?}",
             ExternalControllerConfig {
                 listen: "127.0.0.1:19090".parse().unwrap(),
                 secret: Some("private-token".to_owned()),
+                ..ExternalControllerConfig::default()
             }
         );
         assert!(debug.contains("authenticated: true"));
@@ -4243,45 +5335,37 @@ tun:
     }
 
     #[test]
-    fn rejects_unsafe_or_misplaced_traffic_controller_config() {
-        for (fields, expected) in [
-            (
-                "mixed-port: 1080\nauthentication:\n  - measure:secret\nsecret: token",
-                "secret requires external-controller",
-            ),
-            (
-                "mixed-port: 1080\nauthentication:\n  - measure:secret\nexternal-controller: \"127.0.0.1:19090\"",
-                "external-controller requires tun.enable",
-            ),
-            (
-                "external-controller: \"0.0.0.0:19090\"\ntun:\n  enable: true",
-                "loopback",
-            ),
-            (
-                "external-controller: \"127.0.0.1:0\"\ntun:\n  enable: true",
-                "between 1 and 65535",
-            ),
-            (
-                "external-controller: localhost:19090\ntun:\n  enable: true",
-                "IP socket address",
-            ),
-            (
-                "external-controller: \"127.0.0.1:19090\"\nsecret: \"\"\ntun:\n  enable: true",
-                "between 1 and 255",
-            ),
+    fn admits_mixed_only_direct_controller() {
+        let config = Config::parse_yaml(
+            b"mixed-port: 1080\nexternal-controller: 127.0.0.1:19090\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        assert!(config.external_controller.is_some());
+        assert!(config.proxies.is_empty());
+        for controller in ["", "external-controller: \"\"\n"] {
+            let yaml = format!("{controller}secret: token\nrules: ['MATCH,DIRECT']\n");
+            let disabled = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            assert!(disabled.external_controller.is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_traffic_controller_addresses() {
+        for address in [
+            "127.0.0.1",
+            "127.0.0.1:65536",
+            "localhost:not-a-port",
+            "controller.example:9090",
+            "::1:9090",
         ] {
-            let error = Config::parse_yaml(current_yaml(fields).as_bytes()).unwrap_err();
+            let fields = format!("external-controller: '{address}'");
+            let error = Config::parse_yaml(current_yaml(&fields).as_bytes()).unwrap_err();
             assert!(
-                error.to_string().contains(expected),
-                "unexpected error for {fields:?}: {error}"
+                error.to_string().contains("external-controller"),
+                "unexpected error for {address:?}: {error}"
             );
         }
 
-        let oversized = current_yaml(&format!(
-            "external-controller: \"127.0.0.1:19090\"\nsecret: \"{}\"\ntun:\n  enable: true",
-            "s".repeat(MAX_CONTROLLER_SECRET_BYTES + 1)
-        ));
-        assert!(Config::parse_yaml(oversized.as_bytes()).is_err());
         assert!(
             Config::parse_yaml(
                 current_yaml("external-controller: null\ntun:\n  enable: true").as_bytes()
@@ -4309,56 +5393,66 @@ authentication:
                 .matches("用户".as_bytes(), "密:码".as_bytes())
         );
 
-        let max_user = "u".repeat(usize::from(u8::MAX));
-        let max_password = "p".repeat(usize::from(u8::MAX));
-        let max = current_yaml(&format!(
-            "mixed-port: 1080\nauthentication:\n  - \"{max_user}:{max_password}\""
-        ));
-        assert!(Config::parse_yaml(max.as_bytes()).is_ok());
-
-        for (fields, expected) in [
-            (
-                "authentication:\n  - measure:secret\ntun:\n  enable: true",
-                "authentication or allow-lan requires an enabled mixed-port",
-            ),
-            (
-                "mixed-port: 1080\nauthentication:\n  - one:secret\n  - two:secret",
-                "authentication must contain exactly one",
-            ),
-            (
-                "mixed-port: 1080\nauthentication:\n  - missing-separator",
-                "authentication entry must use user:password",
-            ),
-            (
-                "mixed-port: 1080\nauthentication:\n  - \":secret\"",
-                "authentication user must contain between 1 and 255",
-            ),
-            (
-                "mixed-port: 1080\nauthentication:\n  - \"measure:\"",
-                "authentication password must contain between 1 and 255",
-            ),
+        for (user, password) in [
+            ("", ""),
+            ("", "secret"),
+            ("user", ""),
+            (&"u".repeat(600), &"p".repeat(600)),
         ] {
-            let error = Config::parse_yaml(current_yaml(fields).as_bytes()).unwrap_err();
+            let config = Config::parse_yaml(
+                current_yaml(&format!(
+                    "mixed-port: 1080\nauthentication: ['{user}:{password}']"
+                ))
+                .as_bytes(),
+            )
+            .unwrap();
+            let [InboundConfig::Mixed(mixed)] = config.inbounds.as_slice() else {
+                panic!("missing mixed inbound");
+            };
             assert!(
-                error.to_string().contains(expected),
-                "unexpected error for {fields:?}: {error}"
+                mixed
+                    .auth
+                    .as_ref()
+                    .unwrap()
+                    .matches(user.as_bytes(), password.as_bytes())
             );
         }
+        let error = Config::parse_yaml(
+            current_yaml("mixed-port: 1080\nauthentication: [missing-separator]").as_bytes(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("authentication entry must use user:password")
+        );
+        assert!(
+            Config::parse_yaml(
+                current_yaml("mixed-port: 1080\nauthentication: measure:secret").as_bytes()
+            )
+            .is_err()
+        );
+    }
 
-        for yaml in [
-            current_yaml("mixed-port: 1080\nauthentication: null"),
-            current_yaml("mixed-port: 1080\nauthentication: measure:secret"),
-            current_yaml(&format!(
-                "mixed-port: 1080\nauthentication:\n  - \"{}:secret\"",
-                "u".repeat(usize::from(u8::MAX) + 1)
-            )),
-            current_yaml(&format!(
-                "mixed-port: 1080\nauthentication:\n  - \"measure:{}\"",
-                "p".repeat(usize::from(u8::MAX) + 1)
-            )),
-        ] {
-            assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");
+    #[test]
+    fn mixed_localhost_and_null_inputs_keep_reference_defaults() {
+        for authentication in ["null", "[]"] {
+            let config = Config::parse_yaml(current_yaml(&format!(
+                "mixed-port: 1080\nallow-lan: true\nbind-address: localhost\nauthentication: {authentication}"
+            )).as_bytes()).unwrap();
+            let [InboundConfig::Mixed(mixed)] = config.inbounds.as_slice() else {
+                panic!("missing mixed inbound");
+            };
+            assert!(!mixed.access.allow_lan);
+            assert!(mixed.access.bind_address.is_none());
+            assert!(mixed.auth.is_none());
         }
+        let yaml = with_proxy_groups(
+            "  - name: choice\n    type: select\n    proxies: [DIRECT, proxy]\n    default-selected: null",
+            "rules: ['MATCH,choice']",
+        );
+        let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        assert_eq!(config.proxy_groups[0].initial_member, 0);
     }
 
     #[test]
@@ -4433,7 +5527,13 @@ authentication:
             assert!(!mixed.access.allow_lan);
             assert!(mixed.access.ipv6);
         }
-        for fields in ["tun: {enable: true}", "mixed-port: 0\ntun: {enable: true}"] {
+        for fields in [
+            "",
+            "mixed-port: 0",
+            "tun: {enable: false}",
+            "tun: {enable: true}",
+            "mixed-port: 0\ntun: {enable: true}",
+        ] {
             let config = Config::parse_yaml(current_yaml(fields).as_bytes()).unwrap();
             assert_eq!(config.mixed_port, None);
             assert!(
@@ -4453,6 +5553,7 @@ authentication:
         assert_eq!(
             mixed.access,
             ProxyAccess {
+                bind_address: None,
                 allow_lan: true,
                 ipv6: false
             }
@@ -4465,13 +5566,10 @@ authentication:
                 .matches("用户".as_bytes(), "密:码".as_bytes())
         );
         for fields in [
-            "mixed-port: 0",
             "mixed-port: -1",
             "mixed-port: 65536",
             "mixed-port: 1.0",
             "mixed-port: null",
-            "allow-lan: true\ntun: {enable: true}",
-            "mixed-port: 0\nauthentication: [u:p]\ntun: {enable: true}",
             "mixed-port: 1080\nallow-lan: null",
         ] {
             assert!(
@@ -4485,16 +5583,18 @@ authentication:
                 "用".repeat(length),
                 "密".repeat(length)
             ));
-            assert_eq!(Config::parse_yaml(yaml.as_bytes()).is_ok(), length == 85);
+            assert!(Config::parse_yaml(yaml.as_bytes()).is_ok());
         }
     }
 
     #[test]
     fn mixed_inbound_debug_redacts_credentials() {
         let inbound = MixedInboundConfig {
+            access_rules: Default::default(),
             tag: "mixed-in".to_owned(),
             port: 1080,
             access: ProxyAccess {
+                bind_address: None,
                 allow_lan: false,
                 ipv6: true,
             },
@@ -4528,14 +5628,13 @@ authentication:
     fn parses_the_strict_anytls_subset() {
         let config = Config::parse_yaml(CURRENT_ANYTLS.as_bytes()).unwrap();
         assert_eq!(
-            config.default_route_target,
-            RouteTargetId::Proxy(ProxyId::new(0).unwrap())
+            config.rules.last().unwrap().action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(0).unwrap()))
         );
         let proxy = &config.proxies[0];
         assert_eq!(proxy.tag, "anytls-node");
         assert!(!proxy.udp);
-        assert_eq!(proxy.address(), "anytls.example.com");
-        assert_eq!(proxy.port(), 443);
+        assert_eq!(proxy.server_endpoint(), Some(("anytls.example.com", 443)));
         let ProxyProtocol::AnyTls(anytls) = &proxy.protocol else {
             panic!("expected AnyTLS proxy");
         };
@@ -4568,8 +5667,8 @@ authentication:
             );
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         assert_eq!(
-            config.default_route_target,
-            RouteTargetId::Proxy(ProxyId::new(1).unwrap())
+            config.rules.last().unwrap().action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(1).unwrap()))
         );
         assert_eq!(
             config.proxies[1].dialer_proxy,
@@ -4608,26 +5707,12 @@ authentication:
 
     #[test]
     fn rejects_anytls_fields_outside_the_locked_subset() {
-        for field in [
-            "tls: true",
-            "ech-opts: {}",
-            "certificate: client.crt",
-            "private-key: client.key",
-            "idle-session-check-interval: 30",
-            "idle-session-timeout: 30",
-            "min-idle-session: 1",
-            "disable-reuse: false",
-        ] {
-            let yaml = CURRENT_ANYTLS.replace(
-                "    password: private-anytls-password",
-                &format!("    password: private-anytls-password\n    {field}"),
-            );
-            let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
-            assert!(
-                error.to_string().contains("unknown field"),
-                "unexpected error for {field}: {error}"
-            );
-        }
+        let yaml = CURRENT_ANYTLS.replace(
+            "    password: private-anytls-password",
+            "    password: private-anytls-password\n    tls: true",
+        );
+        let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -4638,12 +5723,17 @@ authentication:
                 &format!("    password: private-anytls-password\n    {fields}"),
             )
         };
-        for fields in ["alpn: []", "skip-cert-verify: false"] {
+        for fields in ["alpn: []", "skip-cert-verify: false", "fingerprint: ''"] {
             let config = Config::parse_yaml(configured(fields).as_bytes()).unwrap();
             let ProxyProtocol::AnyTls(anytls) = &config.proxies[0].protocol else {
                 panic!()
             };
-            assert_eq!(anytls.tls, AnyTlsCertificatePolicy::default());
+            let tls = anytls.security.as_tls().unwrap();
+            assert!(tls.alpn.is_empty());
+            assert_eq!(tls.certificate, TlsCertificatePolicy::default());
+            assert!(
+                tls.identity.is_none() && tls.ech.is_none() && tls.client_fingerprint.is_none()
+            );
         }
         let plain = "aB".repeat(32);
         let colon = std::iter::repeat_n("AB", 32).collect::<Vec<_>>().join(":");
@@ -4659,11 +5749,21 @@ authentication:
                 panic!()
             };
             assert_eq!(
-                anytls.tls.alpn,
+                anytls.security.as_tls().unwrap().alpn,
                 [b"h2".to_vec(), b"http/1.1".to_vec(), b"h2".to_vec()]
             );
-            assert!(anytls.tls.skip_cert_verify);
-            assert_eq!(anytls.tls.fingerprint, Some([0xab; 32]));
+            assert!(
+                anytls
+                    .security
+                    .as_tls()
+                    .unwrap()
+                    .certificate
+                    .skip_cert_verify
+            );
+            assert_eq!(
+                anytls.security.as_tls().unwrap().certificate.fingerprint,
+                Some([0xab; 32])
+            );
         }
         for fields in [
             "alpn: null",
@@ -4672,7 +5772,6 @@ authentication:
             "skip-cert-verify: null",
             "skip-cert-verify: 'true'",
             "fingerprint: null",
-            "fingerprint: ''",
             "fingerprint: chrome",
             "fingerprint: aa:bb",
         ] {
@@ -4702,10 +5801,6 @@ authentication:
         for yaml in [
             CURRENT_TLS.replace("server: 203.0.113.1", "server: 'bad host'"),
             CURRENT_TLS.replace("port: 443", "port: 0"),
-            CURRENT_TLS.replace(
-                "uuid: 00000000-0000-4000-8000-000000000001",
-                "uuid: 00000000000040008000000000000001",
-            ),
             CURRENT_TLS.replace("encryption: none", "encryption: auto"),
             CURRENT_TLS.replace("flow: \"\"", "flow: xtls-rprx-vision"),
         ] {
@@ -4776,9 +5871,7 @@ authentication:
         for yaml in [
             CURRENT_TLS.replacen("proxies:\n", "1: value\nproxies:\n", 1),
             CURRENT_TLS.replace("name: proxy", "name: !custom proxy"),
-            CURRENT_TLS.replace("    xhttp-opts:\n", "    xhttp-opts: &defaults\n"),
             CURRENT_TLS.replace("    xhttp-opts:\n", "    xhttp-opts: *defaults\n"),
-            CURRENT_TLS.replacen("proxies:\n", "<<: {}\nproxies:\n", 1),
             CURRENT_TLS.replacen("proxies:\n", "proxies: []\nproxies:\n", 1),
             format!("{CURRENT_TLS}\n---\n{CURRENT_TLS}"),
         ] {
@@ -4833,6 +5926,7 @@ rules:
             [
                 InboundConfig::Mixed(MixedInboundConfig {
                     access: ProxyAccess {
+                        bind_address: None,
                         allow_lan: false,
                         ipv6: true
                     },
@@ -4861,24 +5955,36 @@ rules:
             config.dns.nameservers,
             [
                 DnsNameserver {
+                    path: None,
+                    http_auth: None,
+                    options: Default::default(),
                     transport: DnsTransport::Udp,
                     address: "1.1.1.1".parse().unwrap(),
                     port: 53,
                     route: DnsRoute::Direct,
                 },
                 DnsNameserver {
+                    path: None,
+                    http_auth: None,
+                    options: Default::default(),
                     transport: DnsTransport::Udp,
                     address: "2001:db8::1".parse().unwrap(),
                     port: 5353,
                     route: DnsRoute::Direct,
                 },
                 DnsNameserver {
+                    path: None,
+                    http_auth: None,
+                    options: Default::default(),
                     transport: DnsTransport::Tcp,
                     address: "8.8.8.8".parse().unwrap(),
                     port: 53,
                     route: DnsRoute::Direct,
                 },
                 DnsNameserver {
+                    path: None,
+                    http_auth: None,
+                    options: Default::default(),
                     transport: DnsTransport::Tcp,
                     address: "::1".parse().unwrap(),
                     port: 53,
@@ -4960,6 +6066,14 @@ authentication:
     }
 
     #[test]
+    fn linux_network_options_keep_borrowed_descriptor_ownership() {
+        let config = Config::parse_yaml(b"tun:\n  enable: true\n  file-descriptor: 9\n  auto-route: false\n  auto-detect-interface: false\n").unwrap();
+        assert_eq!(config.tun.file_descriptor, 9);
+        assert!(!config.tun.auto_route);
+        assert!(!config.tun.auto_detect_interface);
+    }
+
+    #[test]
     fn tun_config_uses_mihomo_defaults_and_zero_sentinels() {
         for fields in ["", "  mtu: 0\n  udp-timeout: 0"] {
             let yaml = current_yaml(&format!("tun:\n  enable: true\n{fields}"));
@@ -4973,6 +6087,54 @@ authentication:
             );
             assert_eq!(config.tun.mtu, 9000);
             assert_eq!(config.tun.udp_timeout, Duration::from_secs(300));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_icmp_options_normalize_and_use_the_existing_reconnect_boundary() {
+        let baseline = Config::parse_yaml(b"tun: {enable: true}").unwrap();
+        assert_eq!(baseline.tun.icmp_timeout, Duration::from_secs(10));
+        assert!(!baseline.tun.disable_icmp_forwarding);
+        for (fields, seconds, disabled, compatible) in [
+            ("icmp-timeout: 0", 10, false, true),
+            ("icmp-timeout: 7", 7, false, false),
+            ("disable-icmp-forwarding: true", 10, true, false),
+        ] {
+            let yaml = format!("tun:\n  enable: true\n  {fields}\n");
+            let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            assert_eq!(config.tun.icmp_timeout, Duration::from_secs(seconds));
+            assert_eq!(config.tun.disable_icmp_forwarding, disabled);
+            assert_eq!(
+                live_update::startup_compatible(&baseline, &config),
+                compatible
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tun_icmp_options_reject_negative_and_unrepresentable_timeouts() {
+        for (seconds, reason) in [
+            ("-1", "nonnegative"),
+            ("9223372036854775807", "clock range"),
+            ("9223372036854775808", ""),
+        ] {
+            let yaml = format!("tun:\n  icmp-timeout: {seconds}\n");
+            let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
+            if !reason.is_empty() {
+                assert!(error.to_string().contains(reason), "{error}");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn tun_icmp_options_are_unknown_without_the_linux_consumer() {
+        for fields in ["icmp-timeout: 0", "disable-icmp-forwarding: false"] {
+            let yaml = format!("tun:\n  {fields}\n");
+            let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
         }
     }
 
@@ -5009,14 +6171,9 @@ authentication:
             "dns-hijack: [name.example:53]",
             "dns-hijack: null",
             "framing: rawIp",
-            "auto-route: false",
             "auto-redirect: false",
-            "auto-detect-interface: false",
             "stack: mips",
             "inet4-address: [198.18.0.1/30]",
-            "inet6-address: ['fd00::1/126']",
-            "route-address: [0.0.0.0/1]",
-            "strict-route: false",
             "gso: false",
         ] {
             let yaml = current_yaml(&format!("tun:\n  enable: true\n  {fields}"));
@@ -5086,16 +6243,55 @@ authentication:
     }
 
     #[test]
-    fn current_config_requires_listener_rules_and_nonempty_proxies() {
+    fn dns_ipv6_timeout_uses_milliseconds_and_zero_retains_the_default() {
+        for (field, milliseconds) in [
+            ("", 100),
+            ("  ipv6-timeout: 0\n", 100),
+            ("  ipv6-timeout: 37\n", 37),
+        ] {
+            let config = Config::parse_yaml(
+                format!("mixed-port: 1080\ndns:\n  ipv6: true\n{field}").as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(config.dns.ipv6_timeout, Duration::from_millis(milliseconds));
+        }
+        assert!(Config::parse_yaml(b"mixed-port: 1080\ndns:\n  ipv6-timeout: -1\n").is_err());
+    }
+
+    #[test]
+    fn dns_cache_max_size_uses_entries_and_zero_retains_the_default() {
+        for (field, entries) in [
+            ("", 4096),
+            ("  cache-max-size: 0\n", 4096),
+            ("  cache-max-size: 2\n", 2),
+            ("  cache-max-size: 8192\n", 8192),
+        ] {
+            let config =
+                Config::parse_yaml(format!("mixed-port: 1080\ndns:\n{field}").as_bytes()).unwrap();
+            assert_eq!(config.dns.cache_max_size, entries);
+        }
+        assert!(Config::parse_yaml(b"mixed-port: 1080\ndns:\n  cache-max-size: -1\n").is_err());
+    }
+
+    #[test]
+    fn dns_cache_algorithm_activates_arc_only_for_the_exact_name() {
+        for (field, algorithm) in [
+            ("", DnsCacheAlgorithm::Lru),
+            ("  cache-algorithm: lru\n", DnsCacheAlgorithm::Lru),
+            ("  cache-algorithm: arc\n", DnsCacheAlgorithm::Arc),
+            ("  cache-algorithm: ARC\n", DnsCacheAlgorithm::Lru),
+            ("  cache-algorithm: other\n", DnsCacheAlgorithm::Lru),
+        ] {
+            let config =
+                Config::parse_yaml(format!("mixed-port: 1080\ndns:\n{field}").as_bytes()).unwrap();
+            assert_eq!(config.dns.cache_algorithm, algorithm);
+        }
+    }
+
+    #[test]
+    fn current_config_requires_valid_references() {
         for yaml in [
-            current_yaml("mixed-port: 0\nauthentication:\n  - measure:secret"),
-            current_yaml("tun:\n  enable: false"),
             current_yaml("tun:\n  enable: true\n  mtu: 1279"),
-            current_yaml(
-                "mixed-port: 1080
-authentication:
-  - measure:secret\nrules: []",
-            ),
             current_yaml(
                 "mixed-port: 1080
 authentication:
@@ -5144,8 +6340,8 @@ authentication:
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         assert_eq!(config.proxies.len(), 2);
         assert_eq!(
-            config.default_route_target,
-            RouteTargetId::Proxy(ProxyId::new(1).unwrap())
+            config.rules.last().unwrap().action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(1).unwrap()))
         );
         let ProxyProtocol::Socks5(socks5) = &config.proxies[1].protocol else {
             panic!("expected SOCKS5 proxy");
@@ -5264,12 +6460,6 @@ authentication:
                 "    server: socks.example.com",
                 "    streamSettings: {}\n    server: socks.example.com",
             ),
-            two_proxy_yaml(
-                "mixed-port: 1080
-authentication:
-  - measure:secret",
-            )
-            .replace("    type: socks5", "    type: socks5\n    tls: true"),
         ] {
             assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");
         }
@@ -5290,12 +6480,27 @@ authentication:
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         let first = ProxyId::new(0).unwrap();
         let second = ProxyId::new(1).unwrap();
-        assert_eq!(config.default_route_target, RouteTargetId::Proxy(second));
+        assert_eq!(
+            config.rules.last().unwrap().action,
+            RuleAction::Route(RouteTargetId::Proxy(second))
+        );
         assert_eq!(
             config.proxies[0].dialer_proxy,
             Some(RouteTargetId::Proxy(second))
         );
         assert_eq!(config.proxies[1].dialer_proxy, None);
+        let direct = Config::parse_yaml(
+            yaml.replace("dialer-proxy: socks-hop", "dialer-proxy: DIRECT")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(direct.proxies[0].dialer_proxy, None);
+        let default = Config::parse_yaml(
+            yaml.replace("dialer-proxy: socks-hop", "dialer-proxy: \"\"")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(default.proxies[0].dialer_proxy, None);
         assert_eq!(
             config.rules[0].action,
             RuleAction::Route(RouteTargetId::Proxy(first))
@@ -5350,7 +6555,7 @@ rules:
         let main = ProxyGroupId::new(0).unwrap();
         let backup = ProxyGroupId::new(1).unwrap();
 
-        assert_eq!(config.proxy_groups.len(), 2);
+        assert_eq!(config.proxy_groups.len(), 3);
         assert_eq!(config.proxy_groups[0].name, "主线路");
         assert_eq!(config.proxy_groups[0].initial_member, 1);
         assert_eq!(
@@ -5382,7 +6587,10 @@ rules:
                 .collect::<Vec<_>>(),
             ["proxy", "proxy", "DIRECT"]
         );
-        assert_eq!(config.default_route_target, RouteTargetId::Group(main));
+        assert_eq!(
+            config.rules.last().unwrap().action,
+            RuleAction::Route(RouteTargetId::Group(main))
+        );
         assert_eq!(
             config.rules[0].action,
             RuleAction::Route(RouteTargetId::Group(backup))
@@ -5399,29 +6607,14 @@ rules:
             "mixed-port: 1080\nauthentication:\n  - measure:secret\nrules:\n  - MATCH,主线路";
         for groups in [
             r#"  - name: 主线路
-    type: url-test
-    proxies: [proxy]"#,
-            r#"  - name: 主线路
     type: select
     proxies: []"#,
-            r#"  - name: 主线路
-    type: select
-    proxies: [proxy]
-    default-selected: missing"#,
             r#"  - name: 主线路
     type: select
     proxies: [missing]"#,
             r#"  - name: 主线路
     type: select
     proxies: [RULES]"#,
-            r#"  - name: 主线路
-    type: select
-    proxies: [proxy]
-    url: https://example.com"#,
-            r#"  - name: 主线路
-    type: select
-    proxies: [proxy]
-    default-selected: null"#,
         ] {
             let yaml = with_proxy_groups(groups, fields);
             assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");
@@ -5501,8 +6694,8 @@ rules:
         assert!(Config::parse_yaml(controller.as_bytes()).is_ok());
 
         let missing_secret = controller.replace("secret: token\n", "");
-        let error = Config::parse_yaml(missing_secret.as_bytes()).unwrap_err();
-        assert!(error.to_string().contains("secret is required"), "{error}");
+        let config = Config::parse_yaml(missing_secret.as_bytes()).unwrap();
+        assert!(config.external_controller.unwrap().secret.is_none());
     }
 
     #[test]
@@ -5530,8 +6723,8 @@ proxies:
 
         assert_eq!(config.proxies.len(), 4);
         assert_eq!(
-            config.default_route_target,
-            RouteTargetId::Proxy(ProxyId::from_index(3))
+            config.rules.last().unwrap().action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::from_index(3)))
         );
         assert_eq!(
             config
@@ -5572,8 +6765,8 @@ proxies:
         let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
         assert_eq!(config.proxies.len(), 300);
         assert_eq!(
-            config.default_route_target,
-            RouteTargetId::Proxy(ProxyId::from_index(299))
+            config.rules.last().unwrap().action,
+            RuleAction::Route(RouteTargetId::Proxy(ProxyId::from_index(299)))
         );
         assert_eq!(
             config.proxies[299].dialer_proxy,
@@ -5601,32 +6794,28 @@ proxies:
         for tag in [
             "DIRECT",
             "REJECT",
-            "RULES",
-            "edge,one",
-            "edge#one",
-            "edge/one",
-            "edge?one",
-            "edge&one",
-            "edge=one",
-            "edge%one",
-            "edge\\one",
-            ".",
-            "..",
-            " edge",
-            "edge ",
+            "REJECT-DROP",
+            "COMPATIBLE",
+            "PASS",
+            "PASS-RULE",
         ] {
             let yaml = CURRENT_TLS.replace("name: proxy", &format!("name: '{tag}'"));
-            assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");
+            assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
         }
-        for tag in ["PROXY", "-edge", "节点", "♻️ 自动选择", "+"] {
+        for tag in [
+            "RULES", "edge,one", "edge#one", "edge/one", "edge?one", "edge%one", ".", "..",
+            " edge", "edge ",
+        ] {
             let yaml = CURRENT_TLS
                 .replace("name: proxy", &format!("name: '{tag}'"))
-                .replace("MATCH,proxy", &format!("MATCH,{tag}"));
-            assert!(Config::parse_yaml(yaml.as_bytes()).is_ok(), "{yaml}");
+                .replace("MATCH,proxy", "MATCH,DIRECT");
+            assert!(Config::parse_yaml(yaml.as_bytes()).is_ok(), "{tag}");
         }
-        let long_tag = "a".repeat(65);
-        let yaml = CURRENT_TLS.replace("name: proxy", &format!("name: {long_tag}"));
-        assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
+        let tag = "a".repeat(256);
+        let yaml = CURRENT_TLS
+            .replace("name: proxy", &format!("name: '{tag}'"))
+            .replace("MATCH,proxy", &format!("MATCH,{tag}"));
+        assert!(Config::parse_yaml(yaml.as_bytes()).is_ok());
 
         let duplicate = two_proxy_yaml(
             "mixed-port: 1080
@@ -5648,7 +6837,7 @@ authentication:
         );
         assert!(Config::parse_yaml(unknown.as_bytes()).is_err());
 
-        for invalid_reference in ["''", "null", "'bad#name'"] {
+        for invalid_reference in ["null", "'bad#name'"] {
             let yaml = two_proxy_yaml(
                 "mixed-port: 1080
 authentication:
@@ -5748,49 +6937,102 @@ authentication:
     }
 
     #[test]
-    fn current_config_validates_dns_schema_and_fixed_ip_nameservers() {
-        let valid = current_yaml(
-            r#"mixed-port: 1080
-authentication:
-  - measure:secret
-dns:
-  enable: true
-  nameserver: [udp://1.1.1.1:53]"#,
+    fn current_config_validates_dns_upstreams_and_roles() {
+        let config = Config::parse_yaml(b"mixed-port: 1080\ndns: {enable: true}\n").unwrap();
+        assert!(!config.dns.ipv6);
+        assert_eq!(config.dns.nameservers[0].transport, DnsTransport::Https);
+        assert_eq!(
+            config.dns.nameservers[1].address,
+            DnsAddress::Ip("223.5.5.5".parse().unwrap())
         );
-        let config = Config::parse_yaml(valid.as_bytes()).unwrap();
-        let dns = &config.dns;
-        assert!(dns.ipv6);
-        assert_eq!(dns.nameservers[0].route, DnsRoute::Direct);
-
-        for fields in [
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  nameserver: []",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  nameserver: []",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: false\n  nameserver: [1.1.1.1]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  nameserver: [udp://dns.example:53]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  nameserver: [https://1.1.1.1/dns-query]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  nameserver: [tcp://1.1.1.1:0]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  nameserver: [1.1.1.1, 8.8.8.8, 9.9.9.9, 4.4.4.4, 208.67.222.222]",
+        for dns in [
+            "{enable: true, nameserver: []}",
+            "{default-nameserver: [dns.example]}",
+            "{nameserver: ['tls://1.1.1.1:0']}",
+            "{respect-rules: true}",
         ] {
-            let yaml = current_yaml(fields);
-            assert!(Config::parse_yaml(yaml.as_bytes()).is_err(), "{yaml}");
+            assert!(
+                Config::parse_yaml(format!("mixed-port: 1080\ndns: {dns}\n").as_bytes()).is_err()
+            );
         }
+        let config = Config::parse_yaml(b"mixed-port: 1080\ndns: {enable: false, nameserver: ['udp://dns.example', 'https://dns.example/query'], enhanced-mode: redir-host}\n").unwrap();
+        assert!(!config.dns.enable);
+    }
+
+    #[test]
+    fn dns_source_aliases_preserve_mihomo_roles_and_bootstrap_rules() {
+        for alias in ["system", "system://", "dhcp://system"] {
+            let yaml = format!(
+                "mixed-port: 1080\ndns:\n  enable: true\n  default-nameserver: ['{alias}']\n  nameserver: ['{alias}#unknown']\n  fallback: ['{alias}']\n  proxy-server-nameserver: ['{alias}']\n  direct-nameserver: ['{alias}']\n  nameserver-policy: {{example.com: '{alias}'}}\n"
+            );
+            let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            for server in config
+                .dns
+                .default_nameservers
+                .iter()
+                .chain(&config.dns.nameservers)
+                .chain(&config.dns.fallback.nameservers)
+                .chain(&config.dns.proxy_nameservers)
+                .chain(&config.dns.direct_nameservers)
+                .chain(config.dns.nameserver_policies[0].nameservers.iter())
+            {
+                assert_eq!(server.address, DnsAddress::Source(DnsSource::System));
+                assert_eq!(server.route, DnsRoute::Direct);
+            }
+        }
+        let parsed = Config::parse_yaml(
+            b"mixed-port: 1080\ndns: {nameserver: ['dhcp://physical0#unknown']}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.dns.nameservers[0].address,
+            DnsAddress::Source(DnsSource::Dhcp("physical0".into()))
+        );
+        for invalid in ["dhcp://", "dhcp://physical0/", "system://physical0"] {
+            let yaml = format!("mixed-port: 1080\ndns: {{nameserver: ['{invalid}']}}\n");
+            assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
+        }
+        assert!(
+            Config::parse_yaml(
+                b"mixed-port: 1080\ndns: {default-nameserver: ['dhcp://physical0']}\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn dns_rcode_nameserver_uses_the_mihomo_names_and_existing_policy_schema() {
+        for (name, rcode) in [
+            ("success", 0),
+            ("format_error", 1),
+            ("server_failure", 2),
+            ("name_error", 3),
+            ("not_implemented", 4),
+            ("refused", 5),
+        ] {
+            let yaml = format!(
+                "mixed-port: 1080\ndns:\n  enable: true\n  nameserver: [rcode://{name}]\n  nameserver-policy:\n    example.com: rcode://{name}\n"
+            );
+            let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+            assert_eq!(
+                config.dns.nameservers[0].transport,
+                DnsTransport::Rcode(rcode)
+            );
+            assert_eq!(
+                config.dns.nameserver_policies[0].nameservers[0].transport,
+                DnsTransport::Rcode(rcode)
+            );
+        }
+        for endpoint in ["rcode://NXDOMAIN", "rcode://6", "rcode://success:53"] {
+            let yaml = format!("mixed-port: 1080\ndns:\n  nameserver: [{endpoint}]\n");
+            assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
+        }
+        assert!(
+            Config::parse_yaml(
+                b"mixed-port: 1080\ndns:\n  default-nameserver: [rcode://success]\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5827,7 +7069,12 @@ dns:
 authentication:
   - measure:secret\ndns:\n  enable: true\n  nameserver: [udp://1.1.1.1:53#PROXY]",
         );
-        assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
+        let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+        assert_eq!(config.dns.nameservers[0].route, DnsRoute::Direct);
+        assert_eq!(
+            config.dns.nameservers[0].options.interface.as_deref(),
+            Some("PROXY")
+        );
 
         let yaml = current_yaml(
             "mixed-port: 1080
@@ -5841,6 +7088,7 @@ authentication:
             config.dns.nameservers[0].route,
             DnsRoute::Route(RouteTargetId::Proxy(ProxyId::new(0).unwrap()))
         );
+        assert!(config.dns.nameservers[0].options.interface.is_none());
 
         let yaml = two_proxy_yaml(
             "mixed-port: 1080
@@ -5864,6 +7112,39 @@ authentication:
     }
 
     #[test]
+    fn accepts_builtin_final_actions_without_static_proxies() {
+        for proxies in ["", "proxies: []\n"] {
+            for (target, action) in [
+                ("DIRECT", RuleAction::Direct),
+                ("REJECT", RuleAction::Reject),
+            ] {
+                let yaml = format!("mixed-port: 1080\n{proxies}rules: ['MATCH,{target}']\n");
+                let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
+                assert!(config.proxies.is_empty());
+                assert_eq!(config.rules.last().unwrap().action, action);
+                assert_eq!(config.rules[0].action, action);
+            }
+        }
+        let config = Config::parse_yaml(b"mixed-port: 1080\nproxy-groups:\n  - name: local\n    type: select\n    proxies: [DIRECT, REJECT]\nrules: ['MATCH,local']\n").unwrap();
+        assert!(config.proxies.is_empty());
+        assert_eq!(
+            config.proxy_groups[0].members[0].target,
+            ProxyGroupMemberTarget::Direct
+        );
+    }
+
+    #[test]
+    fn rejects_deprecated_fallback_filter_geosite() {
+        for enable in [false, true] {
+            let yaml = format!(
+                "rules: ['MATCH,DIRECT']\ndns:\n  enable: {enable}\n  fallback-filter:\n    geosite: []\n"
+            );
+            let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("geosite"), "{error}");
+        }
+    }
+
+    #[test]
     fn current_config_parses_ordered_geosite_nameserver_policies() {
         let yaml = current_yaml(
             r#"mixed-port: 1080
@@ -5883,20 +7164,23 @@ dns:
         let dns = config.dns;
         assert_eq!(
             dns.nameservers[0].route,
-            DnsRoute::Route(config.default_route_target)
+            DnsRoute::Route(RouteTargetId::Proxy(ProxyId::new(0).unwrap()))
         );
         assert_eq!(dns.nameserver_policies.len(), 2);
-        assert_eq!(&*dns.nameserver_policies[0].geosite_codes, ["apple", "cn"]);
+        assert_eq!(dns.nameserver_policies[0].geosite_codes(), ["apple", "cn"]);
         assert_eq!(
             dns.nameserver_policies[0].nameservers.as_ref(),
             [DnsNameserver {
+                path: None,
+                http_auth: None,
+                options: Default::default(),
                 transport: DnsTransport::Tcp,
                 address: "223.5.5.5".parse().unwrap(),
                 port: 53,
                 route: DnsRoute::Direct,
             }]
         );
-        assert_eq!(&*dns.nameserver_policies[1].geosite_codes, ["private"]);
+        assert_eq!(dns.nameserver_policies[1].geosite_codes(), ["private"]);
         assert_eq!(
             dns.nameserver_policies[1]
                 .nameservers
@@ -5939,7 +7223,7 @@ rules:
         assert_eq!(config.rules[2].kind, RuleKind::GeoIp("!cn".to_owned()));
         assert!(config.rules[2].no_resolve);
         assert_eq!(
-            &*config.dns.nameserver_policies[0].geosite_codes,
+            config.dns.nameserver_policies[0].geosite_codes(),
             ["google@ads@cn", "!google@ads"]
         );
     }
@@ -5947,15 +7231,19 @@ rules:
     #[test]
     fn current_config_strictly_validates_nameserver_policy_schema_and_limits() {
         for policy in [
-            r#"    "geosite:cn": "tcp://223.5.5.5""#,
-            r#"    "geoip:cn": ["tcp://223.5.5.5"]"#,
-            r#"    "GEOSITE:cn": ["tcp://223.5.5.5"]"#,
+            r#"    "rule-set:cn": ["tcp://223.5.5.5"]"#,
+            r#"    "example.com": null"#,
+            r#"    "example.com": {server: 1.1.1.1}"#,
+            r#"    "example.com": [false]"#,
+            r#"    "foo..example": "1.1.1.1""#,
+            r#"    "foo.*bar.example": "1.1.1.1""#,
+            r#"    "foo.+.example": "1.1.1.1""#,
+            r#"    "example.com.": "1.1.1.1""#,
+            r#"    "example.com,": "1.1.1.1""#,
             r#"    "geosite:": ["tcp://223.5.5.5"]"#,
             r#"    "geosite:cn,": ["tcp://223.5.5.5"]"#,
             r#"    "geosite:cn, apple": ["tcp://223.5.5.5"]"#,
             r#"    "geosite:cn": []"#,
-            r#"    "geosite:cn": [1.1.1.1, 8.8.8.8, 9.9.9.9, 4.4.4.4, 223.5.5.5]"#,
-            r#"    "geosite:cn": ["tcp://dns.example"]"#,
         ] {
             let yaml = current_yaml(&format!(
                 "mixed-port: 1080
@@ -5976,7 +7264,14 @@ dns:
     "geosite:CN": ["tcp://223.5.5.5"]
     "geosite:cn": ["tcp://8.8.8.8"]"#,
         );
-        assert!(Config::parse_yaml(duplicate.as_bytes()).is_err());
+        assert_eq!(
+            Config::parse_yaml(duplicate.as_bytes())
+                .unwrap()
+                .dns
+                .nameserver_policies
+                .len(),
+            2
+        );
 
         let many_codes = (0..=16)
             .map(|index| format!("code{index}"))
@@ -5992,7 +7287,7 @@ authentication:
                 .unwrap()
                 .dns
                 .nameserver_policies[0]
-                .geosite_codes
+                .geosite_codes()
                 .len(),
             17
         );
@@ -6024,7 +7319,7 @@ dns:
   nameserver-policy:
     "geosite:cn": ["tcp://223.5.5.5"]"#,
         );
-        assert!(Config::parse_yaml(disabled.as_bytes()).is_err());
+        assert!(Config::parse_yaml(disabled.as_bytes()).is_ok());
 
         let missing_main = current_yaml(
             r#"mixed-port: 1080
@@ -6035,18 +7330,14 @@ dns:
   nameserver-policy:
     "geosite:cn": ["tcp://223.5.5.5"]"#,
         );
-        assert!(Config::parse_yaml(missing_main.as_bytes()).is_err());
+        assert!(Config::parse_yaml(missing_main.as_bytes()).is_ok());
     }
 
     #[test]
     fn current_config_strictly_rejects_invalid_dns_route_fragments() {
         for nameserver in [
-            "udp://1.1.1.1:53#",
-            "udp://1.1.1.1:53#direct",
-            "udp://1.1.1.1:53#unknown",
-            "udp://1.1.1.1:53#DIRECT&RULES",
-            "udp://1.1.1.1:53#h3=true",
-            "udp://1.1.1.1:53#DIRECT#RULES",
+            "udp://1.1.1.1:53#bad%00interface",
+            "udp://1.1.1.1:53#unknown-option=true",
         ] {
             let yaml = current_yaml(&format!(
                 "mixed-port: 1080
@@ -6075,12 +7366,6 @@ authentication:
   - measure:secret\ndns:\n  enable: true\n  enhanced-mode: normal\n  nameserver: [1.1.1.1]",
             "mixed-port: 1080
 authentication:
-  - measure:secret\ndns:\n  enable: true\n  enhanced-mode: redir-host\n  nameserver: [1.1.1.1]",
-            "mixed-port: 1080
-authentication:
-  - measure:secret\ndns:\n  enable: true\n  respect-rules: false\n  nameserver: [1.1.1.1]",
-            "mixed-port: 1080
-authentication:
   - measure:secret\ndns:\n  enable: true\n  respect-rules: true\n  nameserver: [1.1.1.1]",
             "mixed-port: 1080
 authentication:
@@ -6101,15 +7386,10 @@ authentication:
             "  - GEOIP,CN@ads,DIRECT\n  - MATCH,proxy",
             "  - GEOSITE,!,DIRECT\n  - MATCH,proxy",
             "  - GEOSITE,@ads,DIRECT\n  - MATCH,proxy",
-            "  - IP-CIDR,2001:db8::/32,DIRECT\n  - MATCH,proxy",
-            "  - IP-CIDR6,192.0.2.0/24,DIRECT\n  - MATCH,proxy",
             "  - IP-CIDR,192.0.2.0/33,DIRECT\n  - MATCH,proxy",
-            "  - DST-PORT,0,REJECT\n  - MATCH,proxy",
-            "  - DST-PORT,100-10,REJECT\n  - MATCH,proxy",
             "  - NETWORK,ICMP,REJECT\n  - MATCH,proxy",
             "  - MATCH,PROXY\n  - DOMAIN,example.com,DIRECT",
             "  - MATCH,PROXY\n  - MATCH,DIRECT",
-            "  - DOMAIN,example.com,DIRECT",
         ] {
             let yaml = current_yaml(&format!(
                 "mixed-port: 1080
@@ -6124,7 +7404,7 @@ authentication:
 authentication:
   - measure:secret\nrules: []",
         );
-        assert!(Config::parse_yaml(explicit_empty.as_bytes()).is_err());
+        assert!(Config::parse_yaml(explicit_empty.as_bytes()).is_ok());
 
         let non_ascii_whitespace = current_yaml(
             "mixed-port: 1080
@@ -6163,7 +7443,33 @@ authentication:
 authentication:
   - measure:secret\nrules:\n{many_rules}  - MATCH,proxy"
         ));
-        let error = Config::parse_yaml(yaml.as_bytes()).unwrap_err();
-        assert!(error.to_string().contains("cumulative limit"), "{error}");
+        assert!(Config::parse_yaml(yaml.as_bytes()).is_ok());
+    }
+}
+
+/// Shared physical connection policy. TCP settings keep Mihomo's top-level
+/// names; IP4P is separately gated by experimental.dialer-ip4p-convert.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectionSettings {
+    pub dialer_ip4p_convert: bool,
+    pub quic: QuicSocketSettings,
+    pub tcp_concurrent: bool,
+    pub keep_alive_idle: i32,
+    pub keep_alive_interval: i32,
+    pub disable_keep_alive: bool,
+}
+
+/// Per-session capabilities of an unchanged physical QUIC UDP path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuicSocketSettings {
+    pub disable_gso: bool,
+    pub disable_ecn: bool,
+}
+impl Default for QuicSocketSettings {
+    fn default() -> Self {
+        Self {
+            disable_gso: false,
+            disable_ecn: true,
+        }
     }
 }

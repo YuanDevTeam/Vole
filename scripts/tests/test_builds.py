@@ -1,12 +1,14 @@
 """Check platform outputs around the external compiler boundary."""
 
+import io
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from vole_scripts import builds
+from vole_scripts import builds, cli
 
 
 class BuildTests(unittest.TestCase):
@@ -25,6 +27,13 @@ class BuildTests(unittest.TestCase):
         )
         self.commands = []
         self.enterContext(patch.object(builds, "_run", side_effect=self.compile))
+        self.enterContext(
+            patch.object(
+                builds.blake3,
+                "environment",
+                side_effect=lambda target, host, env, backend: env,
+            )
+        )
 
     def write(self, relative, data=b"library"):
         path = self.root / relative
@@ -39,6 +48,7 @@ class BuildTests(unittest.TestCase):
         elif command[:2] == ["cargo", "build"]:
             target = command[command.index("--target") + 1]
             for name in (
+                "vole",
                 "vole.exe",
                 "vole.dll",
                 "vole.dll.lib",
@@ -97,6 +107,98 @@ class BuildTests(unittest.TestCase):
                 command[command.index("--features") + 1], f"ffi,windows-{backend}"
             )
             self.assertEqual("--bins" in command, backend == "uwp")
+
+    def test_linux_cli_and_ffi_preserve_transport_features(self):
+        target = "aarch64-unknown-linux-gnu"
+        with (
+            patch.object(builds.platform, "system", return_value="Linux"),
+            patch.object(builds, "native_target", return_value=target),
+        ):
+            builds.build_cli()
+            builds.build_linux()
+        self.assertEqual(
+            [command[command.index("--features") + 1] for command, _ in self.commands],
+            ["cli", "ffi"],
+        )
+
+    def test_uwp_build_selects_dynamic_crt_and_preserves_cargo_flag_precedence(self):
+        target_flags = "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS"
+        cases = (
+            ({}, []),
+            ({target_flags: "-C debuginfo=1"}, ["-C", "debuginfo=1"]),
+            (
+                {target_flags: "--cfg ignored", "RUSTFLAGS": "-C opt-level=2"},
+                ["-C", "opt-level=2"],
+            ),
+            (
+                {
+                    target_flags: "--cfg ignored",
+                    "RUSTFLAGS": "--cfg ignored_too",
+                    "CARGO_ENCODED_RUSTFLAGS": '--cfg\x1fvalue="with space"',
+                },
+                ["--cfg", 'value="with space"'],
+            ),
+            ({"CARGO_ENCODED_RUSTFLAGS": "", "RUSTFLAGS": "--cfg ignored"}, []),
+        )
+        for overrides, expected in cases:
+            original = dict(os.environ) | overrides
+            with (
+                self.subTest(overrides=overrides),
+                patch.object(builds.platform, "system", return_value="Windows"),
+                patch.object(builds, "_windows_architecture", return_value="arm64"),
+                patch.object(
+                    builds, "_windows_msvc_environment", return_value=original
+                ),
+            ):
+                builds.build_windows("uwp")
+                self.assertEqual(
+                    self.commands[-1][1]
+                    .get("CARGO_ENCODED_RUSTFLAGS", "")
+                    .split("\x1f"),
+                    [*expected, "-C", "target-feature=-crt-static"],
+                )
+                self.assertEqual(original, dict(os.environ) | overrides)
+        with (
+            patch.object(builds.platform, "system", return_value="Windows"),
+            patch.object(builds, "_windows_architecture", return_value="arm64"),
+            patch.object(
+                builds, "_windows_msvc_environment", return_value=dict(os.environ)
+            ),
+        ):
+            builds.build_windows("wintun")
+        self.assertNotIn("CARGO_ENCODED_RUSTFLAGS", self.commands[-1][1])
+
+    def test_direct_uwp_dependencies_export_matching_cargo_crt_flags(self):
+        output = io.StringIO()
+        github_env = self.root / "github.env"
+
+        def dependency_environment(target, host, env, backend):
+            self.assertEqual((target, host), ("aarch64-pc-windows-msvc",) * 2)
+            self.assertEqual(backend, "uwp")
+            suffix = "_AARCH64_PC_WINDOWS_MSVC"
+            return env | {
+                name + suffix: str(self.root / name)
+                for name in builds.blake3.DEPENDENCY_NAMES
+            }
+
+        with (
+            patch.object(builds.platform, "system", return_value="Windows"),
+            patch.object(builds, "_windows_architecture", return_value="arm64"),
+            patch.object(
+                builds, "_windows_msvc_environment", return_value=dict(os.environ)
+            ),
+            patch.object(
+                builds.blake3, "environment", side_effect=dependency_environment
+            ),
+            redirect_stdout(output),
+        ):
+            builds.prepare_native_dependencies(backend="uwp", github_env=github_env)
+        self.assertEqual(output.getvalue(), github_env.read_text())
+        self.assertEqual(output.getvalue().count("\n"), 3)
+        self.assertIn(
+            "CARGO_ENCODED_RUSTFLAGS=-C\x1ftarget-feature=-crt-static\n",
+            output.getvalue(),
+        )
 
     def test_windows_requires_native_python(self):
         registry = MagicMock()
@@ -212,6 +314,10 @@ class BuildTests(unittest.TestCase):
             target = command[command.index("--target") + 1]
             abi = env["VOLE_CMAKE_ANDROID_ABI"]
             self.assertEqual(
+                command[command.index("--features") + 1],
+                "ffi",
+            )
+            self.assertEqual(
                 env[f"BINDGEN_EXTRA_CLANG_ARGS_{target}"], f"--target={target}28"
             )
             self.assertEqual(env["VOLE_CMAKE_ANDROID_API"], "28")
@@ -244,6 +350,13 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(
             sum(command[:2] == ["cargo", "build"] for command, _ in self.commands), 6
         )
+        self.assertTrue(
+            all(
+                command[command.index("--features") + 1] == "ffi"
+                for command, _ in self.commands
+                if command[:2] == ["cargo", "build"]
+            )
+        )
         self.assertEqual(
             self.commands[-1][0][:2], ["xcodebuild", "-create-xcframework"]
         )
@@ -264,6 +377,23 @@ class BuildTests(unittest.TestCase):
             (work / "ios-simulator/libvole.a").read_bytes(), b"aarch64-apple-ios-sim"
         )
 
+    def test_apple_preserves_production_override_and_rejects_test_features(self):
+        with (
+            patch.object(builds.platform, "system", return_value="Darwin"),
+            patch.dict(os.environ, {"VOLE_FEATURES": "ffi,controller"}),
+        ):
+            builds.build_apple_target("aarch64-apple-ios")
+        command = self.commands[-1][0]
+        self.assertEqual(command[command.index("--features") + 1], "ffi,controller")
+        self.commands.clear()
+        with (
+            patch.object(builds.platform, "system", return_value="Darwin"),
+            patch.dict(os.environ, {"VOLE_FEATURES": "ffi,interop-test"}),
+            self.assertRaisesRegex(RuntimeError, "test-only features"),
+        ):
+            builds.build_apple_target("aarch64-apple-ios")
+        self.assertEqual(self.commands, [])
+
     def test_ndk_selection_uses_latest_installed_stable_revision(self):
         for version in ("30.2.9", "30.2.10", "30.10.1", "30.99.1-beta1"):
             folder = version.removesuffix("-beta1")
@@ -273,3 +403,22 @@ class BuildTests(unittest.TestCase):
             )
         with patch.dict(os.environ, {"ANDROID_HOME": str(self.root / "sdk")}):
             self.assertEqual(builds._android_ndk_home(), self.root / "sdk/ndk/30.10.1")
+
+
+class BuildCliTests(unittest.TestCase):
+    def test_arguments_reach_each_platform_builder(self):
+        for platform in ("cli", "apple", "android", "windows", "linux"):
+            args = ["build", platform]
+            positional = ()
+            if platform == "cli":
+                args += ["--target", "aarch64-apple-darwin", "--profile", "debug"]
+                positional = ("aarch64-apple-darwin", "debug")
+            elif platform == "windows":
+                args += ["--backend", "wintun"]
+                positional = ("wintun",)
+            with (
+                self.subTest(platform=platform),
+                patch.object(cli, "build_" + platform) as build,
+            ):
+                self.assertEqual(cli.main(args), 0)
+            build.assert_called_once_with(*positional)

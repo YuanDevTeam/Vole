@@ -1,0 +1,978 @@
+//! Transactional provider generations. Existing sessions pin their original graph.
+mod apply;
+use super::*;
+use crate::config::ProxyId;
+use crate::resource::config_apply::{ApplyRequest, ConfigApplyHandle};
+use crate::{
+    config::{RuleAction, RuleKind, RuleSpec},
+    dispatch::{BoxStream, DatagramBudget, DatagramTransport, DispatchError},
+    resource::{
+        cache::{ProviderCache, ProviderState},
+        control::{DelayRequest, DnsSnapshot, ProbeError, RuleUpdateError, RuntimeResources},
+    },
+    routing::ProxyGroupError,
+    session::{Datagram, DatagramSession, Destination, StreamSession},
+};
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use std::{
+    collections::BTreeMap,
+    pin::Pin,
+    sync::{Mutex, RwLock},
+    task::{Context, Poll},
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::{mpsc, oneshot},
+};
+
+struct Generation {
+    connections: Arc<crate::connections::Registry>,
+    diagnostics: Option<Arc<diagnostics::Diagnostics>>,
+    health: Arc<health::HealthRuntime>,
+    requirements: GeoRequirements,
+    config: Config,
+    dispatcher: Arc<dyn Dispatcher>,
+    dns: Option<Arc<RuntimeDns>>,
+    groups: Arc<ProxyGroups>,
+    graph: Arc<BuiltProxyGraph>,
+    targets: RouteTargetDispatchers,
+    direct: Arc<dyn Dispatcher>,
+}
+impl Generation {
+    fn from_parts(
+        config: Config,
+        parts: &BuiltRuntimeParts,
+        requirements: GeoRequirements,
+    ) -> Self {
+        Self {
+            connections: parts.connections.clone(),
+            diagnostics: parts.diagnostics.clone(),
+            health: parts.health.clone(),
+            requirements,
+            config,
+            dispatcher: parts.dispatcher.clone(),
+            dns: parts.dns.clone(),
+            groups: parts.proxy_groups.clone(),
+            graph: parts.proxy_graph.clone(),
+            targets: parts.resource_targets.clone(),
+            direct: parts.direct.clone(),
+        }
+    }
+}
+struct Refresh {
+    rules: bool,
+    name: String,
+    reply: oneshot::Sender<Result<(), &'static str>>,
+}
+pub(super) struct ProviderRuntime {
+    security: SecurityContext,
+    store: crate::resource::profile::SelectionStore,
+    persistence_error: RwLock<Option<&'static str>>,
+    current: ArcSwap<Generation>,
+    retired: Mutex<Vec<Arc<Generation>>>,
+    publication: Mutex<()>,
+    cache: tokio::sync::Mutex<ProviderCache>,
+    states: RwLock<Vec<ProviderState>>,
+    requests: mpsc::Sender<Refresh>,
+    receiver: tokio::sync::Mutex<Option<mpsc::Receiver<Refresh>>>,
+    cancellation: CancellationToken,
+    config_apply: ConfigApplyHandle,
+    config_receiver: tokio::sync::Mutex<Option<mpsc::Receiver<ApplyRequest>>>,
+    logs: Option<Arc<crate::logging::RuntimeLog>>,
+    dialer: Dialer,
+    limits: ResourceLimits,
+    manager: Arc<GeoDataManager>,
+    lease: crate::geodata::GeoDataRegistrationLease,
+    geo: Arc<dyn GeoMatcher>,
+}
+impl ProviderRuntime {
+    pub(super) fn http_download_context(
+        &self,
+    ) -> crate::http_processing::providers::DownloadContext {
+        let generation = self.current.load_full();
+        let dispatcher = Arc::new(
+            ConnectorDispatcher::new(Arc::new(crate::outbound::NamedDirectOutbound::new(
+                generation.graph.dialer.clone(),
+            )))
+            .with_resolution(generation.graph.resolution.clone()),
+        );
+        crate::http_processing::providers::DownloadContext {
+            dispatcher: Arc::new(PinnedDispatcher {
+                generation,
+                dispatcher,
+            }),
+            security: self.security.clone(),
+        }
+    }
+    pub(super) fn new(
+        cache: ProviderCache,
+        prepared: &PreparedCore,
+        parts: &BuiltRuntimeParts,
+        dialer: Dialer,
+    ) -> Arc<Self> {
+        let (requests, receiver) = mpsc::channel(16);
+        let cancellation = CancellationToken::new();
+        let (config_apply, config_receiver) = ConfigApplyHandle::channel(cancellation.clone());
+        let requirements = GeoRequirements::for_rules(&prepared.config, prepared.rules.all_rules())
+            .expect("prepared requirements");
+        let root = prepared
+            .geodata_manager
+            .store_dir()
+            .parent()
+            .expect("dataDir");
+        let store = crate::resource::profile::SelectionStore::open(
+            root,
+            prepared.config.profile.store_selected,
+        );
+        store.restore(&parts.proxy_groups);
+        Arc::new(Self {
+            security: prepared.security.clone(),
+            store,
+            persistence_error: RwLock::new(None),
+            current: ArcSwap::from_pointee(Generation::from_parts(
+                prepared.config.clone(),
+                parts,
+                requirements,
+            )),
+            retired: Mutex::new(Vec::new()),
+            publication: Mutex::new(()),
+            states: RwLock::new(
+                cache
+                    .entries
+                    .iter()
+                    .map(|entry| entry.state.clone())
+                    .collect(),
+            ),
+            cache: tokio::sync::Mutex::new(cache),
+            requests,
+            receiver: tokio::sync::Mutex::new(Some(receiver)),
+            cancellation,
+            config_apply,
+            config_receiver: tokio::sync::Mutex::new(Some(config_receiver)),
+            logs: crate::logging::current(),
+            dialer,
+            limits: prepared.limits,
+            manager: prepared.geodata_manager.clone(),
+            lease: prepared.geodata_registration.updater_lease(),
+            geo: prepared.geodata_registration.matcher(),
+        })
+    }
+    pub(super) fn config_apply_handle(&self) -> ConfigApplyHandle {
+        self.config_apply.clone()
+    }
+    pub(super) fn begin_shutdown(&self) {
+        let _publication = self.publication.lock().unwrap();
+        self.security.identities.begin_shutdown();
+        self.cancellation.cancel();
+        self.current.load().connections.shutdown();
+        self.current.load().graph.begin_shutdown();
+        for generation in self.retired.lock().unwrap().iter() {
+            generation.graph.begin_shutdown();
+        }
+    }
+    pub(super) async fn shutdown(&self) {
+        self.begin_shutdown();
+        let current = self.current.load_full();
+        current.graph.shutdown().await;
+        let retired = std::mem::take(&mut *self.retired.lock().unwrap());
+        for generation in retired {
+            generation.graph.shutdown().await;
+        }
+    }
+    async fn reap(&self) {
+        let expired = {
+            let mut retired = self.retired.lock().unwrap();
+            let mut expired = Vec::new();
+            let mut i = 0;
+            while i < retired.len() {
+                if Arc::strong_count(&retired[i]) == 1 {
+                    expired.push(retired.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            expired
+        };
+        let changed = !expired.is_empty();
+        for generation in expired {
+            generation.graph.begin_shutdown();
+            generation.graph.shutdown().await;
+        }
+        if changed && !self.cancellation.is_cancelled() {
+            let current = self.current.load_full();
+            if let Ok(requirements) = self.combined_requirements(&current.requirements) {
+                let manager = self.manager.clone();
+                let lease = self.lease.clone();
+                let cancellation = self.cancellation.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    manager.replace_requirements(&lease, requirements, &cancellation)
+                })
+                .await;
+            }
+        }
+    }
+
+    async fn maintain(&self) {
+        self.reap().await;
+        if !self.security.identities.has_sources() || self.cancellation.is_cancelled() {
+            return;
+        }
+        let identities = self.security.identities.clone();
+        let cancellation = self.cancellation.clone();
+        // Await even during Stop: no file read or candidate publication may
+        // outlive the existing resource worker's synchronous join barrier.
+        let _ = tokio::task::spawn_blocking(move || identities.refresh(&cancellation)).await;
+    }
+    fn combined_requirements(
+        &self,
+        next: &GeoRequirements,
+    ) -> Result<GeoRequirements, &'static str> {
+        let mut requirements = next.clone();
+        requirements
+            .extend(&self.current.load().requirements)
+            .map_err(|_| "invalid resource requirements")?;
+        for old in self.retired.lock().unwrap().iter() {
+            requirements
+                .extend(&old.requirements)
+                .map_err(|_| "invalid resource requirements")?;
+        }
+        Ok(requirements)
+    }
+    pub(super) async fn run(self: Arc<Self>, parent: CancellationToken) -> io::Result<()> {
+        let health = async {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {biased;
+                    ()=parent.cancelled()=>{self.begin_shutdown();break;},
+                    ()=self.cancellation.cancelled()=>break,
+                    _=tick.tick()=>{let current=self.current.load_full(); current.health.tick(&self.cancellation).await;}
+                }
+            }
+        };
+        let worker = self.provider_loop(parent.clone());
+        let (result, ()) = tokio::join!(worker, health);
+        result
+    }
+    async fn provider_loop(self: &Arc<Self>, parent: CancellationToken) -> io::Result<()> {
+        let mut receiver = self
+            .receiver
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| io::Error::other("provider worker already running"))?;
+        let mut config_receiver = self
+            .config_receiver
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| io::Error::other("configuration worker already running"))?;
+        let mut maintenance = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            let deadline = self.cache.lock().await.next_refresh().map(|(_, at)| at);
+            let refresh = async {
+                if let Some(deadline) = deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                biased;
+                ()=parent.cancelled()=>{self.begin_shutdown();return Ok(());}
+                ()=self.cancellation.cancelled()=>return Ok(()),
+                request=config_receiver.recv()=>if let Some(request)=request {self.apply_request(request).await;},
+                request=receiver.recv()=>if let Some(request)=request {
+                    let index=self.cache.lock().await.entries.iter().position(|entry|entry.state.rule==request.rules && entry.state.name==request.name);
+                    let result=match index {Some(index)=>self.update(index).await,None=>Err("unknown provider")};
+                    let _=request.reply.send(result);
+                },
+                ()=refresh=>{
+                    let due=self.cache.lock().await.next_due();
+                    if let Some(index)=due { let _=self.update(index).await; }
+                },
+                _=maintenance.tick()=>self.maintain().await,
+            }
+        }
+    }
+    async fn update(self: &Arc<Self>, index: usize) -> Result<(), &'static str> {
+        let result = self.update_inner(index).await;
+        if result.is_err() && !self.cancellation.is_cancelled() {
+            let mut cache = self.cache.lock().await;
+            // Fetch/parse and ordinary candidate failures already schedule
+            // backoff. Cover later preparation/publication errors that left an
+            // expired deadline so the exact timer cannot spin immediately.
+            if cache.entries[index].next <= tokio::time::Instant::now() {
+                cache.reject(index);
+                self.record_states(&cache);
+            }
+        }
+        result
+    }
+    async fn update_inner(self: &Arc<Self>, index: usize) -> Result<(), &'static str> {
+        let mut cache = self.cache.lock().await;
+        let proxy = cache.entries[index].spec.proxy.clone();
+        let generation = self.current.load_full();
+        let dispatcher = match self.download_dispatcher(generation.clone(), &proxy) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => {
+                cache.reject(index);
+                self.record_states(&cache);
+                return Err(error);
+            }
+        };
+        cache.entries[index].state.updating = true;
+        self.record_states(&cache);
+        let user_agent = generation.config.global_ua.clone();
+        let etag = generation.config.etag_support;
+        let candidate = cache
+            .fetch(
+                index,
+                dispatcher,
+                user_agent,
+                etag,
+                self.security.clone(),
+                self.cancellation.clone(),
+            )
+            .await;
+        self.record_states(&cache);
+        let Some(candidate) = candidate.map_err(|_| "resource fetch failed")? else {
+            return Ok(());
+        };
+        let mut contents = cache.contents.clone();
+        contents.insert(cache.entries[index].key.clone(), candidate.content.clone());
+        let template = cache.template.clone();
+        let limits = self.limits;
+        let dialer = self.dialer.clone();
+        let geo = self.geo.clone();
+        let previous_dns = generation.dns.clone();
+        let hosts = generation.config.dns.hosts.clone();
+        let connections = generation.connections.clone();
+        let data_dir = self
+            .manager
+            .store_dir()
+            .parent()
+            .map(std::path::Path::to_path_buf);
+        let security = self.security.clone();
+        let expression_cancellation = self.cancellation.clone();
+        let prepared = tokio::task::spawn_blocking(
+            move || -> io::Result<(Config, BuiltRuntimeParts, GeoRequirements)> {
+                let mut config = template
+                    .materialize_with_cancel(&contents, Some(&expression_cancellation))
+                    .map_err(io::Error::other)?;
+                // Provider refreshes do not refresh the session's startup LAN snapshot.
+                config.dns.hosts = hosts;
+                let requirements =
+                    GeoRequirements::for_config(&config).map_err(io::Error::other)?;
+                let rules = RuleSet::compile_config(&mut config).map_err(io::Error::other)?;
+                let endpoints = vec![PreparedProxyEndpoints::default(); config.proxies.len()];
+                let parts = GraphBuilder {
+                    security,
+                    connections,
+                    config: config.clone(),
+                    endpoints,
+                    limits,
+                    rules,
+                    geo_matcher: geo,
+                    previous_dns,
+                    data_dir,
+                }
+                .build(dialer)?;
+                Ok((config, parts, requirements))
+            },
+        )
+        .await
+        .map_err(|_| "provider preparation failed")?;
+        let (config, parts, requirements) = match prepared {
+            Ok(value) => value,
+            Err(_) => {
+                cache.reject(index);
+                self.record_states(&cache);
+                return Err("provider candidate rejected");
+            }
+        };
+        let next = Arc::new(Generation::from_parts(config, &parts, requirements.clone()));
+        let requirements = self.combined_requirements(&requirements)?;
+        let manager = self.manager.clone();
+        let lease = self.lease.clone();
+        let cancellation = self.cancellation.clone();
+        let updated = tokio::task::spawn_blocking(move || {
+            manager.replace_requirements(&lease, requirements, &cancellation)
+        })
+        .await;
+        if !matches!(updated, Ok(Ok(()))) || self.cancellation.is_cancelled() {
+            next.graph.begin_shutdown();
+            next.graph.shutdown().await;
+            return Err("provider update cancelled");
+        }
+        let result: io::Result<()> = {
+            let _publication = self.publication.lock().unwrap();
+            if self.cancellation.is_cancelled() {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                cache
+                    .commit(index, candidate, &self.cancellation)
+                    .map(|()| {
+                        for (index, state) in self
+                            .current
+                            .load()
+                            .groups
+                            .list_states()
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let forced = self
+                                .current
+                                .load()
+                                .groups
+                                .selection(index)
+                                .forced()
+                                .is_some();
+                            let _ = next
+                                .groups
+                                .inherit_selection(&state.name, &state.now, forced);
+                        }
+                        let old = self.current.swap(next.clone());
+                        self.retired.lock().unwrap().push(old);
+                    })
+            }
+        };
+        if result.is_err() {
+            next.graph.begin_shutdown();
+            next.graph.shutdown().await;
+            cache.reject(index);
+        }
+        self.record_states(&cache);
+        result.map_err(|_| "provider cache commit failed")
+    }
+    fn record_states(&self, cache: &ProviderCache) {
+        *self.states.write().unwrap() = cache
+            .entries
+            .iter()
+            .map(|entry| entry.state.clone())
+            .collect();
+    }
+    fn download_dispatcher(
+        &self,
+        generation: Arc<Generation>,
+        name: &str,
+    ) -> Result<Arc<dyn Dispatcher>, &'static str> {
+        let dispatcher = if name.is_empty() {
+            generation.dispatcher.clone()
+        } else {
+            let action = match name {
+                "DIRECT" | "COMPATIBLE" => RuleAction::Direct,
+                "REJECT" => RuleAction::Reject,
+                "REJECT-DROP" => RuleAction::RejectDrop,
+                _ => {
+                    if let Some(index) = generation
+                        .config
+                        .proxies
+                        .iter()
+                        .position(|proxy| proxy.tag == name)
+                    {
+                        RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(index).unwrap()))
+                    } else if let Some(index) = generation
+                        .config
+                        .proxy_groups
+                        .iter()
+                        .position(|group| group.name == name)
+                    {
+                        RuleAction::Route(RouteTargetId::Group(
+                            crate::config::ProxyGroupId::new(index).unwrap(),
+                        ))
+                    } else {
+                        return Err("unknown provider download proxy");
+                    }
+                }
+            };
+            let rules = RuleSet::compile(vec![RuleSpec {
+                kind: RuleKind::Match,
+                action,
+                no_resolve: false,
+            }])
+            .map_err(|_| "invalid resource route")?;
+            Arc::new(RoutingDispatcher::new_with_ipv6(
+                generation.targets.clone(),
+                generation.direct.clone(),
+                generation.dns.clone(),
+                generation.config.ipv6,
+                rules,
+                self.geo.clone(),
+            )) as Arc<dyn Dispatcher>
+        };
+        Ok(Arc::new(PinnedDispatcher {
+            generation,
+            dispatcher,
+        }))
+    }
+}
+#[async_trait]
+impl RuntimeResources for ProviderRuntime {
+    fn connections(&self) -> Arc<crate::connections::Registry> {
+        self.current.load().connections.clone()
+    }
+    fn config_apply(&self) -> Option<ConfigApplyHandle> {
+        Some(self.config_apply.clone())
+    }
+    fn configs(&self) -> serde_json::Value {
+        self.current
+            .load()
+            .diagnostics
+            .as_ref()
+            .map_or(serde_json::Value::Null, |diagnostics| diagnostics.config())
+    }
+    fn rules(&self) -> serde_json::Value {
+        self.current.load().diagnostics.as_ref().map_or_else(
+            || serde_json::json!({"rules": []}),
+            |diagnostics| diagnostics.rules(),
+        )
+    }
+
+    fn disable_rules(&self, changes: &[(usize, bool)]) -> Result<(), RuleUpdateError> {
+        // A replacement uses this same outer lock, so validation and mutation
+        // cannot accidentally target the previous generation after publication.
+        let _publication = self.publication.lock().unwrap();
+        let current = self.current.load();
+        current
+            .diagnostics
+            .as_ref()
+            .ok_or(RuleUpdateError::NotFound)?
+            .disable_rules(changes)
+            .map_err(|()| RuleUpdateError::InvalidIndex)
+    }
+    fn groups(&self) -> Arc<ProxyGroups> {
+        self.current.load().groups.clone()
+    }
+    fn select(&self, group: &str, member: &str) -> Result<(), ProxyGroupError> {
+        let _publication = self.publication.lock().unwrap();
+        self.current.load().groups.select(group, member)?;
+        *self.persistence_error.write().unwrap() = self
+            .store
+            .save(group, member)
+            .err()
+            .map(|_| "selection cache write failed");
+        Ok(())
+    }
+    fn clear_fixed(&self, group: &str) -> Result<(), ProxyGroupError> {
+        let _publication = self.publication.lock().unwrap();
+        let current = self.current.load();
+        current.groups.clear_fixed(group)?;
+        current.health.apply_group_health();
+        *self.persistence_error.write().unwrap() = self
+            .store
+            .save(group, "")
+            .err()
+            .map(|_| "selection cache write failed");
+        Ok(())
+    }
+    fn health(&self) -> serde_json::Value {
+        serde_json::json!({"proxies":self.current.load().health.states(),"selectionError":*self.persistence_error.read().unwrap()})
+    }
+    fn providers(&self, rules: bool) -> serde_json::Value {
+        let providers = self
+            .states
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|state| state.rule == rules)
+            .map(|state| {
+                let mut value = serde_json::to_value(state).expect("provider status");
+                value["type"] = serde_json::json!(if rules { "Rule" } else { "Proxy" });
+                if !rules {
+                    let current = self.current.load_full();
+                    let health = current.health.states();
+                    value["proxies"] = serde_json::json!(
+                        current
+                            .config
+                            .provider_members
+                            .get(&state.name)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|name| health.get(name))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                (state.name.clone(), value)
+            })
+            .collect::<BTreeMap<_, _>>();
+        serde_json::json!({"providers":providers})
+    }
+    fn dns(&self) -> Option<DnsSnapshot> {
+        let generation = self.current.load_full();
+        generation.dns.clone().map(|dns| DnsSnapshot {
+            dns,
+            _generation: Some(generation),
+        })
+    }
+    async fn node_delay(
+        &self,
+        name: &str,
+        request: &DelayRequest,
+        cancel: &CancellationToken,
+    ) -> Result<u64, ProbeError> {
+        let generation = self.current.load_full();
+        tokio::select! { biased;
+            () = self.cancellation.cancelled() => Err(ProbeError::Stopped),
+            result = generation.health.node_delay(name, request, cancel) => result,
+        }
+    }
+    async fn group_delay(
+        &self,
+        name: &str,
+        request: &DelayRequest,
+        cancel: &CancellationToken,
+    ) -> Result<BTreeMap<String, u64>, ProbeError> {
+        let generation = {
+            // Reset and persist under the same publication lock as manual selection.
+            // Release it before any probe waits or network I/O.
+            let _publication = self.publication.lock().unwrap();
+            let generation = self.current.load_full();
+            if let Ok(state) = generation.groups.state(name)
+                && matches!(
+                    state.kind,
+                    crate::config::GroupKind::UrlTest | crate::config::GroupKind::Fallback
+                )
+            {
+                if let Some(index) = generation
+                    .config
+                    .proxy_groups
+                    .iter()
+                    .position(|group| group.name == name)
+                {
+                    generation.groups.selection(index).clear_forced();
+                }
+                *self.persistence_error.write().unwrap() = self
+                    .store
+                    .save(name, "")
+                    .err()
+                    .map(|_| "selection cache write failed");
+            }
+            generation
+        };
+        tokio::select! { biased;
+            () = self.cancellation.cancelled() => Err(ProbeError::Stopped),
+            result = generation.health.group_delay(name, request, cancel) => result,
+        }
+    }
+    async fn provider_healthcheck(
+        &self,
+        name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), ProbeError> {
+        let generation = self.current.load_full();
+        tokio::select! { biased;
+            () = self.cancellation.cancelled() => Err(ProbeError::Stopped),
+            result = generation.health.provider_healthcheck(name, cancel) => result,
+        }
+    }
+    async fn refresh(&self, rules: bool, name: &str) -> Result<(), &'static str> {
+        if self.cancellation.is_cancelled() {
+            return Err("runtime stopped");
+        }
+        let (reply, response) = oneshot::channel();
+        tokio::select! {biased; ()=self.cancellation.cancelled()=>Err("runtime stopped"),result=async {self.requests.send(Refresh{rules,name:name.to_owned(),reply}).await.map_err(|_|"runtime stopped")?;response.await.map_err(|_|"runtime stopped")?}=>result}
+    }
+}
+#[async_trait]
+impl Dispatcher for ProviderRuntime {
+    #[cfg(feature = "inbound-http")]
+    fn http_context(&self) -> Option<crate::http_processing::HttpContext> {
+        if self.cancellation.is_cancelled() {
+            return None;
+        }
+        let generation = self.current.load();
+        let policy = generation.config.http_policy()?;
+        let generation = Arc::clone(&generation);
+        let dispatcher = Arc::new(PinnedDispatcher {
+            dispatcher: generation.dispatcher.clone(),
+            generation,
+        });
+        Some(crate::http_processing::HttpContext::new(
+            policy,
+            dispatcher,
+            self.security.clone(),
+        ))
+    }
+
+    fn supports_udp(&self) -> bool {
+        self.current.load().dispatcher.supports_udp()
+    }
+
+    async fn sniff_plan(
+        &self,
+        source: SocketAddr,
+        destination: &Destination,
+    ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
+        if self.cancellation.is_cancelled() {
+            return Err(DispatchError::NotAllowed);
+        }
+        self.current
+            .load_full()
+            .dispatcher
+            .sniff_plan(source, destination)
+            .await
+    }
+
+    async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
+        if self.cancellation.is_cancelled() {
+            return Err(DispatchError::NotAllowed);
+        }
+        let generation = self.current.load_full();
+        let io = generation.dispatcher.connect_tcp(session).await?;
+        Ok(Box::new(GenerationStream {
+            io,
+            _generation: generation,
+        }))
+    }
+    async fn open_datagram(
+        &self,
+        session: DatagramSession,
+    ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        if self.cancellation.is_cancelled() {
+            return Err(DispatchError::NotAllowed);
+        }
+        let generation = self.current.load_full();
+        let io = generation.dispatcher.open_datagram(session).await?;
+        Ok(Box::new(GenerationDatagram {
+            io,
+            _generation: generation,
+        }))
+    }
+}
+struct PinnedDispatcher {
+    generation: Arc<Generation>,
+    dispatcher: Arc<dyn Dispatcher>,
+}
+#[async_trait]
+impl Dispatcher for PinnedDispatcher {
+    fn supports_udp(&self) -> bool {
+        self.dispatcher.supports_udp()
+    }
+
+    async fn sniff_plan(
+        &self,
+        source: SocketAddr,
+        destination: &Destination,
+    ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
+        self.dispatcher.sniff_plan(source, destination).await
+    }
+
+    async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
+        let io = self.dispatcher.connect_tcp(session).await?;
+        Ok(Box::new(GenerationStream {
+            io,
+            _generation: self.generation.clone(),
+        }))
+    }
+    async fn open_datagram(
+        &self,
+        session: DatagramSession,
+    ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        let io = self.dispatcher.open_datagram(session).await?;
+        Ok(Box::new(GenerationDatagram {
+            io,
+            _generation: self.generation.clone(),
+        }))
+    }
+}
+struct GenerationStream {
+    io: BoxStream,
+    _generation: Arc<Generation>,
+}
+impl AsyncRead for GenerationStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for GenerationStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+struct GenerationDatagram {
+    io: Box<dyn DatagramTransport>,
+    _generation: Arc<Generation>,
+}
+#[async_trait]
+impl DatagramTransport for GenerationDatagram {
+    fn supports_shared_destinations(&self) -> bool {
+        self.io.supports_shared_destinations()
+    }
+
+    fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
+        self.io.payload_budget(peer)
+    }
+    async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
+        self.io.send(datagram).await
+    }
+    async fn send_with_flow_id(
+        &mut self,
+        datagram: Datagram,
+        id: &[u8],
+    ) -> Result<(), DispatchError> {
+        self.io.send_with_flow_id(datagram, id).await
+    }
+    async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+        self.io.receive().await
+    }
+    async fn close(&mut self) -> Result<(), DispatchError> {
+        self.io.close().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dialer::SystemResolver;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn file_refresh_publishes_valid_members_and_preserves_old_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("nodes.yaml");
+        let payload = |name: &str| {
+            format!("proxies: [{{name: {name}, type: socks5, server: 192.0.2.1, port: 1080}}]\n")
+        };
+        std::fs::write(&file, payload("old")).unwrap();
+        let mut config = Config::parse_yaml(
+            br#"
+mixed-port: 1080
+external-controller: 127.0.0.1:0
+proxy-providers:
+  remote:
+    type: file
+    path: nodes.yaml
+    filter: '(?=.)'
+    override:
+      override-expr:
+        - '.name |= sub("^old$", "old-renamed")'
+        - '(select(.name == "bad-expr") | .port) = ("private-expression-value" | tonumber)'
+proxy-groups:
+  - {name: choice, type: select, use: [remote]}
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver: [192.0.2.53]
+profile: {store-fake-ip: true}
+rules: ['MATCH,choice']
+"#,
+        )
+        .unwrap();
+        Arc::make_mut(config.providers.as_mut().unwrap()).proxies[0]
+            .1
+            .age_identities =
+            crate::resource::age_provider::Identities::from_value(serde_yaml_ng::Value::String(
+                include_str!("../../tests/fixtures/provider-age/x25519.key").into(),
+            ))
+            .unwrap();
+        let manager =
+            GeoDataManager::open(&root.path().join("geodata"), Duration::from_secs(86400)).unwrap();
+        let prepared = PreparedCore::prepare_config(
+            config,
+            manager,
+            &SystemResolver,
+            ResourceLimits::default(),
+        )
+        .await
+        .unwrap();
+        let parts = prepared.build_dispatcher(Dialer::default()).unwrap();
+        let live = parts.resources.clone().unwrap();
+        let generation = live.current.load_full();
+        live.disable_rules(&[(0, true)]).unwrap();
+        assert!(matches!(
+            live.disable_rules(&[(0, false), (1, true)]),
+            Err(RuleUpdateError::InvalidIndex)
+        ));
+        assert_eq!(live.rules()["rules"][0]["extra"]["disabled"], true);
+        let old_rule_view = generation.diagnostics.clone().unwrap();
+        let query = crate::dns::build_query(1, "example.com", crate::dns::QueryType::A).unwrap();
+        let wire = generation
+            .dns
+            .as_ref()
+            .unwrap()
+            .exchange(&query)
+            .await
+            .unwrap();
+        assert!(
+            !crate::dns::parse_response(&wire)
+                .unwrap()
+                .answers
+                .is_empty()
+        );
+        let registry = live.connections();
+        let weak = Arc::downgrade(&generation);
+        let (io, mut peer) = tokio::io::duplex(32);
+        let mut old_session = GenerationStream {
+            io: Box::new(io),
+            _generation: generation,
+        };
+        assert_eq!(live.groups().state("choice").unwrap().now, "old-renamed");
+        std::fs::write(&file, payload("new-node")).unwrap();
+        live.update(0).await.unwrap();
+        assert_eq!(live.rules()["rules"][0]["extra"]["disabled"], false);
+        assert_eq!(old_rule_view.rules()["rules"][0]["extra"]["disabled"], true);
+        drop(old_rule_view);
+        assert_eq!(live.groups().state("choice").unwrap().now, "new-node");
+        assert!(Arc::ptr_eq(&registry, &live.connections()));
+        std::fs::write(&file, payload("bad-expr")).unwrap();
+        assert!(live.update(0).await.is_err());
+        assert_eq!(live.groups().state("choice").unwrap().now, "new-node");
+        assert!(
+            !live
+                .providers(false)
+                .to_string()
+                .contains("private-expression-value")
+        );
+        peer.write_all(b"active").await.unwrap();
+        let mut buffer = [0; 6];
+        old_session.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(&buffer, b"active");
+        live.reap().await;
+        assert!(weak.upgrade().is_some());
+        let encrypted = include_bytes!("../../tests/fixtures/provider-age/x25519.age");
+        std::fs::write(&file, encrypted).unwrap();
+        live.update(0).await.unwrap();
+        assert_eq!(live.groups().state("choice").unwrap().now, "age-node");
+        for bad_encrypted in [
+            include_bytes!("../../tests/fixtures/provider-age/hybrid.age").as_slice(),
+            &encrypted[..encrypted.len() - 40],
+        ] {
+            std::fs::write(&file, bad_encrypted).unwrap();
+            assert!(live.update(0).await.is_err());
+            assert_eq!(live.groups().state("choice").unwrap().now, "age-node");
+        }
+        std::fs::write(
+            &file,
+            b"proxies: [{name: bad, type: socks5, server: missing}]\n",
+        )
+        .unwrap();
+        assert!(live.update(0).await.is_err());
+        assert_eq!(live.groups().state("choice").unwrap().now, "age-node");
+        assert!(live.providers(false)["providers"]["remote"]["error"].is_string());
+        std::fs::write(&file, payload(&"x".repeat(4097))).unwrap();
+        assert!(live.update(0).await.is_err());
+        assert_eq!(live.groups().state("choice").unwrap().now, "age-node");
+        drop(old_session);
+        live.reap().await;
+        assert!(weak.upgrade().is_none());
+        let worker = tokio::spawn(live.clone().run(CancellationToken::new()));
+        live.begin_shutdown();
+        worker.await.unwrap().unwrap();
+        live.shutdown().await;
+        assert!(live.refresh(false, "remote").await.is_err());
+    }
+}

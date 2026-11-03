@@ -12,6 +12,8 @@ use http::{Method, Request, StatusCode, Uri};
 use http_io::{
     Download as RecvStream, ResponseFuture, Sender as SendRequest, Upload as SendStream,
 };
+#[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+use std::sync::{Mutex, Weak};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     task::JoinHandle,
@@ -21,7 +23,6 @@ use tokio::{
 use crate::dispatch::BoxStream;
 mod h2_driver;
 mod h3_driver;
-mod h3_upload;
 pub(crate) use h3_driver::QuicTransport;
 mod http_io;
 mod packet_up;
@@ -94,12 +95,32 @@ impl XHttpConfig {
     }
 }
 
+#[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+pub(crate) use h3_driver::UdpAssociationControl;
+#[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UdpAssociationCapture {
+    slot: Arc<Mutex<Option<Option<Weak<UdpAssociationControl>>>>>,
+}
+#[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+impl UdpAssociationCapture {
+    fn report(&self, control: Option<Weak<UdpAssociationControl>>) {
+        let mut slot = self.slot.lock().unwrap();
+        let value = if slot.is_none() { control } else { None };
+        *slot = Some(value);
+    }
+    pub(crate) fn take(&self) -> Option<Weak<UdpAssociationControl>> {
+        self.slot.lock().unwrap().take().flatten()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct XHttpClient {
     mode: XHttpMode,
     request: RequestTemplate,
     send_buffer_size: usize,
     upload_chunk_size: usize,
+    shared_packet_up: bool,
     http_version: crate::config::XHttpVersion,
     owner: Arc<DriverOwner>,
     reuse: Option<Arc<crate::config::XHttpReuseConfig>>,
@@ -143,10 +164,62 @@ impl XHttpClient {
             },
             send_buffer_size: DEFAULT_H2_SEND_BUFFER_SIZE,
             upload_chunk_size: DEFAULT_UPLOAD_CHUNK_SIZE,
+            shared_packet_up: false,
             http_version,
             owner: Arc::default(),
-            pool: Arc::new(pool::Pool::new(reuse.clone())),
+            pool: Arc::new(pool::Pool::new(reuse.clone(), http_version)),
             reuse,
+        }
+    }
+
+    /// Immutable upload purpose, established before the first pool acquisition.
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn set_shared_packet_up_transport(&mut self, shared: bool) {
+        #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+        let previous = self.udp_budget_qualified();
+        self.shared_packet_up = shared;
+        #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+        if previous != self.udp_budget_qualified() {
+            // Eligibility isolates pools even while both initial budgets are64.
+            self.pool = Arc::new(pool::Pool::new(self.reuse.clone(), self.http_version));
+        }
+    }
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    fn udp_budget_qualified(&self) -> bool {
+        self.shared_packet_up
+            && self.http_version == crate::config::XHttpVersion::Http3
+            && self.mode == XHttpMode::PacketUp
+            && matches!(
+                &self.request.options.data,
+                crate::config::xhttp::DataPlacement::Body
+            )
+    }
+
+    /// Opt-in only after the VLESS leg proves immutable physical/security scope.
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn enable_active_h2_reuse(&mut self) {
+        if self.http_version == crate::config::XHttpVersion::Http2 && self.reuse.is_none() {
+            self.pool = Arc::new(pool::Pool::active_h2());
+        }
+    }
+
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn uses_active_h2_reuse(&self) -> bool {
+        self.http_version == crate::config::XHttpVersion::Http2
+            && self.reuse.is_none()
+            && self.pool.shares_active()
+    }
+
+    /// A context requesting a fresh physical socket keeps the original owner
+    /// and request template, but cannot read or populate the active candidate pool.
+    #[cfg(feature = "outbound-vless")]
+    pub(crate) fn h2_lease(&self, allow_reuse: bool) -> std::borrow::Cow<'_, Self> {
+        if self.uses_active_h2_reuse() && !allow_reuse {
+            let mut independent = self.clone();
+            independent.pool = Arc::new(pool::Pool::new(None, self.http_version));
+            std::borrow::Cow::Owned(independent)
+        } else {
+            std::borrow::Cow::Borrowed(self)
         }
     }
 
@@ -242,7 +315,42 @@ impl XHttpClient {
     pub(crate) async fn open_transport<F, Fut>(
         &self,
         deadline: tokio::time::Instant,
+        connect: F,
+    ) -> io::Result<BoxStream>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = io::Result<TransportIo>>,
+    {
+        self.open_transport_inner(
+            deadline,
+            connect,
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            None,
+        )
+        .await
+    }
+    #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+    pub(crate) async fn open_transport_captured<F, Fut>(
+        &self,
+        deadline: tokio::time::Instant,
+        connect: F,
+        capture: &UdpAssociationCapture,
+    ) -> io::Result<BoxStream>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = io::Result<TransportIo>>,
+    {
+        self.open_transport_inner(deadline, connect, Some(capture))
+            .await
+    }
+
+    async fn open_transport_inner<F, Fut>(
+        &self,
+        deadline: tokio::time::Instant,
         mut connect: F,
+        #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))] capture: Option<
+            &UdpAssociationCapture,
+        >,
     ) -> io::Result<BoxStream>
     where
         F: FnMut() -> Fut,
@@ -250,6 +358,11 @@ impl XHttpClient {
     {
         let operation = async {
             let (sender, driver) = self.acquire(false, &mut connect).await?;
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            let control = match &sender {
+                SendRequest::H3(sender) => sender.udp_control.as_ref().map(Arc::downgrade),
+                _ => None,
+            };
             if self.needs_separate_download() {
                 let (download, download_driver) =
                     self.handshake_transport(connect().await?).await?;
@@ -262,7 +375,12 @@ impl XHttpClient {
                     )
                     .await;
             }
-            self.connect_http(sender, driver).await
+            let connected = self.connect_http(sender, driver).await?;
+            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+            if let Some(capture) = capture {
+                capture.report(control);
+            }
+            Ok(connected)
         };
         tokio::select! {biased;
             () = self.owner.cancellation.cancelled() => Err(connection_closed()),
@@ -439,7 +557,10 @@ impl XHttpClient {
                 result = async {
                     match transport {
                         TransportIo::Stream(stream) if self.http_version != crate::config::XHttpVersion::Http3 => self.handshake_active(stream).await,
-                        TransportIo::Quic(transport) if self.http_version == crate::config::XHttpVersion::Http3 => h3_driver::connect(*transport, self.reuse.as_ref().map_or(0, |r| r.keep_alive_seconds), &self.owner).await,
+                        TransportIo::Quic(transport) if self.http_version == crate::config::XHttpVersion::Http3 => h3_driver::connect(*transport, self.reuse.as_ref().map_or(0, |r| r.keep_alive_seconds),
+                            #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
+                            self.udp_budget_qualified(),
+                            &self.owner).await,
                         _ => Err(request::invalid_request()),
                     }
                 } => result,
@@ -456,6 +577,10 @@ impl XHttpClient {
                 .await
                 .map(|(sender, guard)| (sender, Arc::new(guard)));
         }
+        #[cfg(feature = "outbound-vless")]
+        let private_active_h2 = self.uses_active_h2_reuse();
+        #[cfg(not(feature = "outbound-vless"))]
+        let private_active_h2 = false;
         h2_driver::connect(
             stream,
             self.send_buffer_size,
@@ -463,6 +588,7 @@ impl XHttpClient {
                 .as_ref()
                 .map_or(0, |options| options.keep_alive_seconds),
             &self.owner,
+            private_active_h2,
         )
         .await
     }
@@ -501,6 +627,37 @@ impl XHttpClient {
         })))
     }
 
+    fn packet_up_writer(
+        &self,
+        sender: SendRequest,
+        session: Arc<str>,
+    ) -> io::Result<packet_up::Writer> {
+        let overlap = self.shared_packet_up
+            && self.mode == XHttpMode::PacketUp
+            && matches!(&sender, SendRequest::H3(_))
+            && matches!(
+                &self.request.options.data,
+                crate::config::xhttp::DataPlacement::Body
+            );
+        if overlap {
+            packet_up::Writer::new_overlapping(
+                sender,
+                self.request.clone(),
+                session,
+                self.upload_chunk_size,
+                &self.owner,
+            )
+        } else {
+            packet_up::Writer::new(
+                sender,
+                self.request.clone(),
+                session,
+                self.upload_chunk_size,
+                &self.owner,
+            )
+        }
+    }
+
     async fn connect_packet_up_with_download(
         &self,
         upload_sender: SendRequest,
@@ -515,13 +672,7 @@ impl XHttpClient {
         let (response, _) = download_sender.send_request(request, true).await?;
 
         Ok(Box::new(XHttpStream::new(PacketUp {
-            upload: packet_up::Writer::new(
-                upload_sender,
-                self.request.clone(),
-                session_id,
-                self.upload_chunk_size,
-                &self.owner,
-            )?,
+            upload: self.packet_up_writer(upload_sender, session_id)?,
             download: Downlink::pending(response, "packet-up download", false),
             closed: false,
             _connections: connections,
@@ -2122,3 +2273,7 @@ mod tests {
             .unwrap();
     }
 }
+
+#[cfg(all(test, feature = "outbound-vless", feature = "sing-mux"))]
+#[path = "xhttp/h3_packet_overlap_memory_tests.rs"]
+mod h3_packet_overlap_memory_tests;

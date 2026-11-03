@@ -1,15 +1,12 @@
 use vole::config::Config;
 
 #[test]
-fn feature_skeletons_do_not_open_unimplemented_yaml_or_measurement_protocols() {
-    // Keep the stable FOUNDATIONS assertion ID as a regression for the retired protocol.
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-SCHEMA",
-        "feature_skeletons_do_not_open_unimplemented_yaml_or_measurement_protocols",
+fn wireguard_yaml_follows_its_own_feature() {
+    let yaml = b"mixed-port: 1080\nproxies: [{name: wg, type: wireguard, server: 192.0.2.1, port: 51820, ip: 10.84.0.2, private-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=, public-key: AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=}]\nrules: ['MATCH,wg']\n";
+    assert_eq!(
+        Config::parse_yaml(yaml).is_ok(),
+        cfg!(feature = "outbound-wireguard")
     );
-    let yaml = "proxies:\n  - name: node\n    type: wireguard\n    server: example.com\n    port: 443\nrules:\n  - MATCH,node\n";
-    assert!(Config::parse_yaml(yaml.as_bytes()).is_err());
 }
 
 #[test]
@@ -37,16 +34,10 @@ fn selected_fingerprints_follow_protocol_feature_admission() {
         ),
     ] {
         for name in [
-            "none",
-            "chrome",
-            "chrome120",
-            "firefox",
-            "firefox120",
-            "safari",
-            "safari16",
+            "none", "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random",
         ] {
             let yaml = format!(
-                "mixed-port: 1080\nproxies: [{{name: node, type: {protocol}, server: localhost, port: 443, {authentication}, client-fingerprint: {name}}}]\nrules: ['MATCH,node']\n"
+                "mixed-port: 1080\nproxies: [{{name: node, type: {protocol}, server: localhost, port: 443, {authentication}, client-fingerprint: {name:?}}}]\nrules: ['MATCH,node']\n"
             );
             assert_eq!(
                 Config::parse_yaml(yaml.as_bytes()).is_ok(),
@@ -92,11 +83,6 @@ fn trojan_yaml_follows_its_own_feature() {
 
 #[test]
 fn future_fields_and_over_limit_documents_remain_rejected() {
-    #[cfg(feature = "interop-test")]
-    let mut _case = vole::resources::case_events::Case::new(
-        "FOUNDATIONS-SCHEMA",
-        "future_fields_and_over_limit_documents_remain_rejected",
-    );
     assert!(Config::parse_yaml(&vec![b'x'; vole::config::MAX_CONFIG_BYTES + 1]).is_err());
     assert!(Config::parse_yaml(b"listeners: []\n").is_err());
     assert!(Config::parse_yaml(b"proxies:\n  - name: s\n    type: socks4\n    server: example.com\n    port: 1080\nrules: [MATCH,s]\n").is_err());

@@ -22,8 +22,25 @@ pub struct MemoryPackets {
 }
 #[async_trait]
 impl DatagramTransport for MemoryPackets {
+    fn supports_shared_destinations(&self) -> bool {
+        false
+    }
+
     fn payload_budget(&self, _: &Destination) -> DatagramBudget {
         DatagramBudget::new(1400, 1400)
+    }
+    fn send_owned(
+        &mut self,
+        packet: Datagram,
+    ) -> Result<vole::dispatch::OwnedDatagramSend, Datagram> {
+        assert_eq!(packet.remote, self.remote.into());
+        let sender = self.send.clone();
+        Ok(Box::pin(async move {
+            sender
+                .send(packet.payload)
+                .await
+                .map_err(|_| DispatchError::NotAllowed)
+        }))
     }
     async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
         assert_eq!(packet.remote, self.remote.into());

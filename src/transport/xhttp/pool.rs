@@ -1,7 +1,7 @@
 //! Node-owned transport leases. Thresholds choose candidates, not admission.
 use super::{ConnectionGuard, ConnectionLease, SendRequest, connection_closed};
 use crate::{
-    config::XHttpReuseConfig,
+    config::{XHttpReuseConfig, XHttpVersion},
     resources::observation::{Guard, ResourceKind, track},
 };
 use std::{
@@ -25,6 +25,8 @@ pub(super) enum Policy {
 #[derive(Debug)]
 pub(super) struct Pool {
     options: Option<Arc<XHttpReuseConfig>>,
+    share_active: bool,
+    private_active_h2: bool,
     concurrency: usize,
     connections: usize,
     state: Arc<Mutex<State>>,
@@ -35,6 +37,7 @@ struct State {
     entries: Vec<Entry>,
     next_id: u64,
     closed: bool,
+    idle_limit: usize,
 }
 #[derive(Clone, Debug)]
 struct Physical {
@@ -58,8 +61,28 @@ struct Entry {
     _observation: Guard,
 }
 impl Entry {
+    // This is a conservative logical reservation check, not a fabricated
+    // "remaining stream credit" API. Only the private H2 pool calls it.
+    fn permits_private_h2_lease(&self) -> bool {
+        let Transport::Multiplexed(physical) = &self.transport else {
+            return false;
+        };
+        let SendRequest::H2(sender) = &physical.sender else {
+            return false;
+        };
+        if self.active >= sender.request.current_max_send_streams() {
+            return false;
+        }
+        // A clone has no pending request: this detects GOAWAY/connection
+        // errors without waiting or registering a capacity waiter. Capacity
+        // itself comes from the peer cap + logical reservations above.
+        let mut sender = sender.request.clone();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        matches!(sender.poll_ready(&mut cx), std::task::Poll::Ready(Ok(())))
+    }
+
     fn retired(&self) -> bool {
-        matches!(&self.transport, Transport::Multiplexed(physical) if physical.driver.task.is_finished())
+        matches!(&self.transport, Transport::Multiplexed(physical) if physical.driver.task.is_finished() || matches!(&physical.sender, SendRequest::H3(sender) if !sender.requests.can_open_request()))
             || self.remaining == Some(0)
             || self.max_reuses > 0 && self.reuses >= self.max_reuses
             || self.expires.is_some_and(|at| Instant::now() >= at)
@@ -109,21 +132,51 @@ impl State {
                 return true;
             }
             idle += 1;
-            idle <= MAX_IDLE_ENTRIES
+            idle <= self.idle_limit
         });
     }
 }
 impl Pool {
-    pub(super) fn new(options: Option<Arc<XHttpReuseConfig>>) -> Self {
+    pub(super) fn new(options: Option<Arc<XHttpReuseConfig>>, version: XHttpVersion) -> Self {
+        Self::build(options, version, false)
+    }
+    #[cfg(feature = "outbound-vless")]
+    pub(super) fn active_h2() -> Self {
+        Self::build(None, XHttpVersion::Http2, true)
+    }
+    #[cfg(feature = "outbound-vless")]
+    pub(super) fn shares_active(&self) -> bool {
+        self.share_active
+    }
+    fn build(
+        options: Option<Arc<XHttpReuseConfig>>,
+        version: XHttpVersion,
+        active_h2: bool,
+    ) -> Self {
+        let share_active = options.is_none() && (version == XHttpVersion::Http3 || active_h2);
         Self {
-            concurrency: options
-                .as_ref()
-                .map_or(0, |options| options.concurrency.sample()),
+            concurrency: options.as_ref().map_or(
+                if share_active {
+                    if version == XHttpVersion::Http2 {
+                        crate::limits::XHTTP_ACTIVE_H2_LEASES
+                    } else {
+                        crate::limits::XHTTP_ACTIVE_H3_LEASES
+                    }
+                } else {
+                    0
+                },
+                |options| options.concurrency.sample(),
+            ),
             connections: options
                 .as_ref()
                 .map_or(0, |options| options.connections.sample()),
             options,
-            state: Arc::default(),
+            share_active,
+            private_active_h2: active_h2,
+            state: Arc::new(Mutex::new(State {
+                idle_limit: if share_active { 0 } else { MAX_IDLE_ENTRIES },
+                ..State::default()
+            })),
             opening: tokio::sync::Mutex::default(),
         }
     }
@@ -136,10 +189,11 @@ impl Pool {
         F: FnOnce() -> Fut,
         Fut: Future<Output = io::Result<(SendRequest, Arc<ConnectionGuard>)>>,
     {
-        let Some(options) = &self.options else {
+        if self.options.is_none() && !self.share_active {
             let (sender, driver) = make().await?;
             return Ok((sender, driver.into()));
-        };
+        }
+        let options = self.options.as_deref();
         let _opening = self.opening.lock().await;
         let existing = {
             let mut state = self.state.lock().unwrap();
@@ -152,6 +206,7 @@ impl Pool {
                     .entries
                     .iter_mut()
                     .filter(|entry| self.concurrency == 0 || entry.active < self.concurrency)
+                    .filter(|entry| !self.private_active_h2 || entry.permits_private_h2_lease())
                     .min_by_key(|entry| entry.active)
                     .map(|entry| -> io::Result<_> {
                         Ok((entry.take(policy), entry.reserve(&self.state, true)?))
@@ -187,11 +242,15 @@ impl Pool {
                 },
                 active: 0,
                 reuses: 0,
-                max_reuses: options.reuse_times.sample(),
-                remaining: (options.requests.max > 0).then(|| options.requests.sample()),
-                expires: (options.age_seconds.max > 0).then(|| {
-                    Instant::now() + Duration::from_secs(options.age_seconds.sample() as u64)
-                }),
+                max_reuses: options.map_or(0, |options| options.reuse_times.sample()),
+                remaining: options
+                    .filter(|options| options.requests.max > 0)
+                    .map(|options| options.requests.sample()),
+                expires: options
+                    .filter(|options| options.age_seconds.max > 0)
+                    .map(|options| {
+                        Instant::now() + Duration::from_secs(options.age_seconds.sample() as u64)
+                    }),
                 _observation: track(ResourceKind::Pool),
             };
             let usage = entry.reserve(&self.state, false)?;
@@ -265,5 +324,83 @@ impl Drop for Usage {
             }
             state.cleanup();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::XHttpVersion,
+        transport::xhttp::{XHttpClient, XHttpConfig, XHttpMode},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_util::task::TaskTracker;
+
+    #[tokio::test]
+    async fn implicit_h3_shares_four_active_leases_and_reconnects_after_idle() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut config = XHttpConfig::new("example.com", "/x", XHttpMode::StreamOne).unwrap();
+            config.http_version = XHttpVersion::Http3;
+            let client = XHttpClient::new(config);
+            let transport = XHttpClient::new(
+                XHttpConfig::new("example.com", "/x", XHttpMode::StreamOne).unwrap(),
+            );
+            let calls = AtomicUsize::new(0);
+            let peers = TaskTracker::new();
+            // Admission and leases are transport-independent. Real memory H2
+            // drivers expose factory calls and cleanup without QUIC scheduling.
+            let make = || async {
+                calls.fetch_add(1, Ordering::Relaxed);
+                let (io, remote) = tokio::io::duplex(8192);
+                peers.spawn(async move {
+                    let mut connection = h2::server::handshake(remote).await.unwrap();
+                    while let Some(request) = connection.accept().await {
+                        request.unwrap();
+                    }
+                });
+                transport.handshake(Box::new(io)).await
+            };
+            let mut leases = Vec::new();
+            for _ in 0..4 {
+                let (_, lease) = client
+                    .pool
+                    .acquire(Policy::Multiplexed, &make)
+                    .await
+                    .unwrap();
+                leases.push(lease);
+            }
+            let shared_calls = calls.load(Ordering::Relaxed);
+            let (_, fifth) = client
+                .pool
+                .acquire(Policy::Multiplexed, &make)
+                .await
+                .unwrap();
+            let overflow_calls = calls.load(Ordering::Relaxed);
+            drop(fifth);
+            drop(leases);
+            let (_, fresh) = client
+                .pool
+                .acquire(Policy::Multiplexed, &make)
+                .await
+                .unwrap();
+            let fresh_calls = calls.load(Ordering::Relaxed);
+            drop(fresh);
+            client.stop().await;
+            transport.stop().await;
+            peers.close();
+            peers.wait().await;
+            assert_eq!(
+                shared_calls, 1,
+                "active streams opened redundant transports"
+            );
+            assert_eq!(
+                overflow_calls, 2,
+                "active sharing threshold was not bounded"
+            );
+            assert_eq!(fresh_calls, 3, "idle physical transport was retained");
+        })
+        .await
+        .expect("active transport leases did not stop");
     }
 }

@@ -1,5 +1,8 @@
 use super::*;
-use crate::config::AnyTlsCertificatePolicy;
+
+#[path = "identity_rotation_tests.rs"]
+mod identity_rotation_memory_tests;
+use crate::config::TlsClientPolicy;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, date_time_ymd,
@@ -22,9 +25,40 @@ mod named;
 #[path = "tls_named_wire_tests.rs"]
 mod named_wire;
 
+#[cfg(feature = "quiche-h3-transport")]
+#[path = "tls_quiche_tests.rs"]
+mod quiche;
+
+#[cfg(feature = "outbound-trusttunnel")]
+#[path = "trusttunnel_alpn_tests.rs"]
+mod trusttunnel_alpn_memory;
+
 struct Chain {
     certificates: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+}
+
+impl Chain {
+    fn identity_pem(&self) -> crate::config::TlsIdentityPem {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        crate::config::TlsIdentityPem {
+            certificate: self
+                .certificates
+                .iter()
+                .map(|cert| {
+                    format!(
+                        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                        STANDARD.encode(cert.as_ref())
+                    )
+                })
+                .collect(),
+            private_key: format!(
+                "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+                STANDARD.encode(self.key.secret_der())
+            ),
+            origin: None,
+        }
+    }
 }
 
 fn ca(name: &str) -> CertificateParams {
@@ -78,27 +112,15 @@ fn trusted(chain: &Chain) -> SecurityContext {
     SecurityContext {
         provider: Arc::new(rustls::crypto::ring::default_provider()),
         tls_roots: Arc::new(roots),
+        identities: Arc::default(),
     }
 }
 
-fn client(
-    context: &SecurityContext,
-    name: &str,
-    policy: AnyTlsCertificatePolicy,
-) -> StandardTlsClient {
+fn client(context: &SecurityContext, name: &str, policy: TlsClientPolicy) -> StandardTlsClient {
     StandardTlsClient::with_options(
         context,
         name,
-        TlsClientOptions {
-            client_fingerprint: policy.client_fingerprint,
-            certificate: TlsCertificatePolicy {
-                verification_name: None,
-                skip_cert_verify: policy.skip_cert_verify,
-                fingerprint: policy.fingerprint,
-            },
-            alpn: policy.alpn,
-            ..Default::default()
-        },
+        TlsClientOptions::from_policy(&policy, None, context).unwrap(),
         4,
         DEFAULT_TLS_BUFFER_LIMIT,
     )
@@ -224,6 +246,41 @@ async fn named_fingerprint_uses_the_shared_webpki_policy_and_transport_alpn() {
             assert_eq!(accepted, expected);
             assert_eq!(seen.alpn, [b"h2".to_vec()]);
             assert_eq!(seen.name.as_deref(), Some("fixture.invalid"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn configured_roots_authenticate_standard_and_named_tls_without_relaxing_names() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let chain = chain(false);
+    let pem = format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        STANDARD.encode(&chain.certificates[2])
+    );
+    let config = crate::config::Config::parse_yaml(
+        &serde_json::to_vec(&serde_json::json!({
+            "tls": {"custom-certifactes": [pem]},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let context = SecurityContext::with_certificates(&config.tls, Vec::new());
+    let server = server(&chain, &TLS13, false);
+    for profile in crate::security::test_profiles() {
+        for (name, expected) in [("fixture.invalid", true), ("different.invalid", false)] {
+            let client = StandardTlsClient::with_options(
+                &context,
+                name,
+                TlsClientOptions {
+                    client_fingerprint: *profile,
+                    ..Default::default()
+                },
+                0,
+                DEFAULT_TLS_BUFFER_LIMIT,
+            )
+            .unwrap();
+            assert_eq!(handshake(&client, server.clone()).await.0, expected);
         }
     }
 }
@@ -370,7 +427,7 @@ async fn named_fingerprint_close_notify_has_a_five_second_bound() {
         let client = client(
             &trusted(&chain),
             "fixture.invalid",
-            AnyTlsCertificatePolicy {
+            TlsClientPolicy {
                 client_fingerprint: Some(profile),
                 ..Default::default()
             },
@@ -395,11 +452,6 @@ async fn named_fingerprint_close_notify_has_a_five_second_bound() {
 
 #[tokio::test]
 async fn webpki_rejects_untrusted_wrong_name_and_expired_unless_explicitly_skipped() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "webpki_rejects_untrusted_wrong_name_and_expired_unless_explicitly_skipped",
-    );
     for &profile in crate::security::test_profiles() {
         for expired in [false, true] {
             let chain = chain(expired);
@@ -414,7 +466,7 @@ async fn webpki_rejects_untrusted_wrong_name_and_expired_unless_explicitly_skipp
                         &client(
                             &context,
                             name,
-                            AnyTlsCertificatePolicy {
+                            TlsClientPolicy {
                                 client_fingerprint: profile,
                                 ..Default::default()
                             }
@@ -425,9 +477,12 @@ async fn webpki_rejects_untrusted_wrong_name_and_expired_unless_explicitly_skipp
                     .0,
                     expected
                 );
-                let insecure = AnyTlsCertificatePolicy {
+                let insecure = TlsClientPolicy {
+                    certificate: TlsCertificatePolicy {
+                        skip_cert_verify: true,
+                        ..Default::default()
+                    },
                     client_fingerprint: profile,
-                    skip_cert_verify: true,
                     ..Default::default()
                 };
                 assert!(
@@ -442,11 +497,6 @@ async fn webpki_rejects_untrusted_wrong_name_and_expired_unless_explicitly_skipp
 
 #[tokio::test]
 async fn leaf_pin_is_trust_but_nonleaf_pin_checks_chain_name_and_expiry() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "leaf_pin_is_trust_but_nonleaf_pin_checks_chain_name_and_expiry",
-    );
     for &profile in crate::security::test_profiles() {
         for expired in [false, true] {
             let chain = chain(expired);
@@ -454,10 +504,13 @@ async fn leaf_pin_is_trust_but_nonleaf_pin_checks_chain_name_and_expiry() {
             for index in 0..3 {
                 for name in ["fixture.invalid", "wrong.invalid"] {
                     for skip in [false, true] {
-                        let policy = AnyTlsCertificatePolicy {
+                        let policy = TlsClientPolicy {
+                            certificate: TlsCertificatePolicy {
+                                fingerprint: Some(pin(&chain, index)),
+                                skip_cert_verify: skip,
+                                ..Default::default()
+                            },
                             client_fingerprint: profile,
-                            fingerprint: Some(pin(&chain, index)),
-                            skip_cert_verify: skip,
                             ..Default::default()
                         };
                         let expected = index == 0 || (!expired && name == "fixture.invalid");
@@ -474,10 +527,13 @@ async fn leaf_pin_is_trust_but_nonleaf_pin_checks_chain_name_and_expiry() {
                     }
                 }
             }
-            let policy = AnyTlsCertificatePolicy {
+            let policy = TlsClientPolicy {
+                certificate: TlsCertificatePolicy {
+                    fingerprint: Some([0; 32]),
+                    skip_cert_verify: true,
+                    ..Default::default()
+                },
                 client_fingerprint: profile,
-                fingerprint: Some([0; 32]),
-                skip_cert_verify: true,
                 ..Default::default()
             };
             assert!(
@@ -496,10 +552,13 @@ async fn leaf_pin_is_trust_but_nonleaf_pin_checks_chain_name_and_expiry() {
                 key: chain.key.clone_key(),
             };
             unrelated.certificates.push(other.certificates[2].clone());
-            let policy = AnyTlsCertificatePolicy {
+            let policy = TlsClientPolicy {
+                certificate: TlsCertificatePolicy {
+                    fingerprint: Some(pin(&other, 2)),
+                    skip_cert_verify: true,
+                    ..Default::default()
+                },
                 client_fingerprint: profile,
-                fingerprint: Some(pin(&other, 2)),
-                skip_cert_verify: true,
                 ..Default::default()
             };
             assert!(
@@ -524,13 +583,7 @@ fn super_server(chain: &Chain) -> Arc<ServerConfig> {
 
 #[tokio::test]
 async fn ticket_storage_obeys_exact_node_budget_and_consumes_each_ticket_once() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "ticket_storage_obeys_exact_node_budget_and_consumes_each_ticket_once",
-    );
     use crate::security::resumption::NodeSessionStore;
-    use rustls::client::ClientSessionStore;
     let chain = chain(false);
     let context = trusted(&chain);
     let name = ServerName::try_from("fixture.invalid").unwrap().to_owned();
@@ -538,12 +591,15 @@ async fn ticket_storage_obeys_exact_node_budget_and_consumes_each_ticket_once() 
         for capacity in [0, 1, 4] {
             let store = Arc::new(NodeSessionStore::new(name.clone(), capacity));
             let mut client = client(&context, "fixture.invalid", Default::default());
-            let StandardConnector::Rustls(connector) = &client.connector else {
+            let Some(StandardConnector::Rustls(connector)) = &client.connector else {
                 panic!("unprofiled TLS uses rustls")
             };
             let mut config = connector.config().as_ref().clone();
-            config.resumption = Resumption::store(store.clone());
-            client.connector = StandardConnector::Rustls(TlsConnector::from(Arc::new(config)));
+            let epoch_store = store.for_epoch(Default::default());
+            config.resumption = Resumption::store(epoch_store.clone());
+            client.connector = Some(StandardConnector::Rustls(TlsConnector::from(Arc::new(
+                config,
+            ))));
             let mut server = server(&chain, version, false);
             Arc::get_mut(&mut server).unwrap().send_tls13_tickets = 8;
             assert!(handshake(&client, server.clone()).await.0);
@@ -554,19 +610,19 @@ async fn ticket_storage_obeys_exact_node_budget_and_consumes_each_ticket_once() 
             };
             assert_eq!(store.stored_sessions(), expected);
             let wrong = ServerName::try_from("wrong.invalid").unwrap();
-            assert!(store.take_tls13_ticket(&wrong).is_none());
-            assert!(store.tls12_session(&wrong).is_none());
+            assert!(epoch_store.take_tls13_ticket(&wrong).is_none());
+            assert!(epoch_store.tls12_session(&wrong).is_none());
             if version == &TLS13 {
                 for _ in 0..expected {
-                    assert!(store.take_tls13_ticket(&name).is_some());
+                    assert!(epoch_store.take_tls13_ticket(&name).is_some());
                 }
-                assert!(store.take_tls13_ticket(&name).is_none());
+                assert!(epoch_store.take_tls13_ticket(&name).is_none());
             } else {
                 assert_eq!(
                     handshake(&client, server.clone()).await.1.resumed,
                     capacity > 0
                 );
-                store.remove_tls12_session(&name);
+                epoch_store.remove_tls12_session(&name);
             }
             assert_eq!(store.stored_sessions(), 0);
         }
@@ -575,19 +631,17 @@ async fn ticket_storage_obeys_exact_node_budget_and_consumes_each_ticket_once() 
 
 #[tokio::test]
 async fn every_certificate_policy_verifies_tls12_and_tls13_handshake_signatures() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "every_certificate_policy_verifies_tls12_and_tls13_handshake_signatures",
-    );
     for &profile in crate::security::test_profiles() {
         let chain = chain(false);
         for version in [&TLS12, &TLS13] {
             for fingerprint in [None, Some(pin(&chain, 0)), Some(pin(&chain, 1))] {
-                let policy = AnyTlsCertificatePolicy {
+                let policy = TlsClientPolicy {
+                    certificate: TlsCertificatePolicy {
+                        skip_cert_verify: true,
+                        fingerprint,
+                        ..Default::default()
+                    },
                     client_fingerprint: profile,
-                    skip_cert_verify: true,
-                    fingerprint,
                     ..Default::default()
                 };
                 let client = client(&SecurityContext::new(), "fixture.invalid", policy);
@@ -600,19 +654,17 @@ async fn every_certificate_policy_verifies_tls12_and_tls13_handshake_signatures(
 
 #[tokio::test]
 async fn vless_keeps_webpki_tls13_and_required_h2_after_anytls_connections() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "vless_keeps_webpki_tls13_and_required_h2_after_anytls_connections",
-    );
     let chain = chain(false);
     let mut endpoint = server(&chain, &TLS13, false);
     Arc::get_mut(&mut endpoint).unwrap().alpn_protocols = vec![b"h2".to_vec()];
     let insecure = client(
         &SecurityContext::new(),
         "fixture.invalid",
-        AnyTlsCertificatePolicy {
-            skip_cert_verify: true,
+        TlsClientPolicy {
+            certificate: TlsCertificatePolicy {
+                skip_cert_verify: true,
+                ..Default::default()
+            },
             alpn: vec![b"h2".to_vec()],
             ..Default::default()
         },
@@ -643,18 +695,16 @@ async fn vless_keeps_webpki_tls13_and_required_h2_after_anytls_connections() {
 
 #[tokio::test]
 async fn alpn_and_tls_resumption_are_isolated_between_node_policies() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "alpn_and_tls_resumption_are_isolated_between_node_policies",
-    );
     let chain = chain(false);
     let server = server(&chain, &TLS13, false);
     let context = trusted(&chain);
     let alpn = vec![b"custom".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
-    let policy = AnyTlsCertificatePolicy {
+    let policy = TlsClientPolicy {
+        certificate: TlsCertificatePolicy {
+            fingerprint: Some(pin(&chain, 2)),
+            ..Default::default()
+        },
         alpn: alpn.clone(),
-        fingerprint: Some(pin(&chain, 2)),
         ..Default::default()
     };
     let first = client(&context, "fixture.invalid", policy.clone());
@@ -682,9 +732,12 @@ async fn alpn_and_tls_resumption_are_isolated_between_node_policies() {
         .await
         .0
     );
-    let wrong = AnyTlsCertificatePolicy {
-        fingerprint: Some([0; 32]),
-        skip_cert_verify: true,
+    let wrong = TlsClientPolicy {
+        certificate: TlsCertificatePolicy {
+            fingerprint: Some([0; 32]),
+            skip_cert_verify: true,
+            ..Default::default()
+        },
         ..policy
     };
     assert!(
@@ -708,11 +761,6 @@ async fn alpn_and_tls_resumption_are_isolated_between_node_policies() {
 
 #[tokio::test]
 async fn explicit_verification_name_does_not_change_sni_or_allow_skip_to_override_it() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "explicit_verification_name_does_not_change_sni_or_allow_skip_to_override_it",
-    );
     for &profile in crate::security::test_profiles() {
         let chain = chain(false);
         let context = trusted(&chain);
@@ -724,7 +772,7 @@ async fn explicit_verification_name_does_not_change_sni_or_allow_skip_to_overrid
             ("wrong.invalid", true, Some(pin(&chain, 1)), false),
             ("fixture.invalid", true, Some([0; 32]), false),
         ] {
-            let options = TlsClientOptions {
+            let policy = TlsClientPolicy {
                 client_fingerprint: profile,
                 certificate: TlsCertificatePolicy {
                     verification_name: Some(name.into()),
@@ -736,7 +784,7 @@ async fn explicit_verification_name_does_not_change_sni_or_allow_skip_to_overrid
             let client = StandardTlsClient::with_options(
                 &context,
                 "sni.invalid",
-                options,
+                TlsClientOptions::from_policy(&policy, None, &context).unwrap(),
                 1,
                 DEFAULT_TLS_BUFFER_LIMIT,
             )
@@ -750,11 +798,6 @@ async fn explicit_verification_name_does_not_change_sni_or_allow_skip_to_overrid
 
 #[tokio::test]
 async fn mutual_tls_identity_is_required_verified_and_not_shared_between_clients() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "mutual_tls_identity_is_required_verified_and_not_shared_between_clients",
-    );
     for &profile in crate::security::test_profiles() {
         let chain = chain(false);
         let identity = chain_with_usage(false, ExtendedKeyUsagePurpose::ClientAuth);
@@ -782,17 +825,15 @@ async fn mutual_tls_identity_is_required_verified_and_not_shared_between_clients
                 (Some(&unknown), false),
                 (Some(&identity), true),
             ] {
-                let options = TlsClientOptions {
+                let policy = TlsClientPolicy {
                     client_fingerprint: profile,
-                    identity: cert.map(|cert| {
-                        TlsClientIdentity::from_der(cert.certificates.clone(), cert.key.clone_key())
-                    }),
+                    identity: cert.map(Chain::identity_pem),
                     ..Default::default()
                 };
                 let client = StandardTlsClient::with_options(
                     &trusted(&chain),
                     "fixture.invalid",
-                    options,
+                    TlsClientOptions::from_policy(&policy, None, &trusted(&chain)).unwrap(),
                     1,
                     DEFAULT_TLS_BUFFER_LIMIT,
                 )
@@ -813,11 +854,6 @@ async fn mutual_tls_identity_is_required_verified_and_not_shared_between_clients
 
 #[test]
 fn tls_options_reject_invalid_alpn_identity_and_budget_before_using_a_stream() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "tls_options_reject_invalid_alpn_identity_and_budget_before_using_a_stream",
-    );
     let context = SecurityContext::new();
     for options in [
         TlsClientOptions {
@@ -868,11 +904,6 @@ fn tls_options_reject_invalid_alpn_identity_and_budget_before_using_a_stream() {
 
 #[tokio::test]
 async fn certificate_rejection_delivers_no_business_bytes_and_diagnostics_are_redacted() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "certificate_rejection_delivers_no_business_bytes_and_diagnostics_are_redacted",
-    );
     for fingerprint in [None, Some([0; 32])] {
         let chain = chain(false);
         let client = StandardTlsClient::with_options(
@@ -924,11 +955,6 @@ async fn certificate_rejection_delivers_no_business_bytes_and_diagnostics_are_re
 
 #[tokio::test]
 async fn tls_close_write_sends_notify_without_closing_the_supplied_transport() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "tls_close_write_sends_notify_without_closing_the_supplied_transport",
-    );
     for &profile in crate::security::test_profiles() {
         let chain = chain(false);
         let client = StandardTlsClient::with_options(
@@ -984,11 +1010,6 @@ async fn tls_close_write_sends_notify_without_closing_the_supplied_transport() {
 
 #[tokio::test]
 async fn tls_close_notify_flush_has_a_five_second_bound() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "tls_close_notify_flush_has_a_five_second_bound",
-    );
     let chain = chain(false);
     let client = client(&trusted(&chain), "fixture.invalid", Default::default());
     let (client_io, server_io) = tokio::io::duplex(128);
@@ -1018,18 +1039,13 @@ async fn tls_close_notify_flush_has_a_five_second_bound() {
 
 #[tokio::test]
 async fn cancelling_tls_handshake_releases_the_caller_supplied_stream() {
-    #[cfg(any(test, feature = "interop-test"))]
-    let mut _case = crate::resources::case_events::Case::new(
-        "FOUNDATIONS-SECURITY",
-        "cancelling_tls_handshake_releases_the_caller_supplied_stream",
-    );
     for &profile in crate::security::test_profiles() {
         let (client_io, mut peer) = tokio::io::duplex(4096);
         let chain = chain(false);
         let client = client(
             &trusted(&chain),
             "fixture.invalid",
-            AnyTlsCertificatePolicy {
+            TlsClientPolicy {
                 client_fingerprint: profile,
                 ..Default::default()
             },

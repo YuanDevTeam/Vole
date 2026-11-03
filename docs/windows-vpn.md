@@ -151,7 +151,14 @@ Session Host 的每个非回环出站 socket 必须同时应用：
 
 只绑定其中一项不满足契约。只有配置中显式使用 `127.0.0.0/8` 范围内的 IPv4 字面量或 `::1` 的本地出站可以跳过；物理代理服务器的域名在准备阶段解析到任何回环地址都会失败关闭。局域网和私有地址不属于例外。缺少地址族、源地址绑定或接口设置失败时，当前连接失败关闭。
 
+全局/节点 `interface-name` 和普通 DNS `#接口` 只允许选择同一个 Provider 物理适配器。
+友好名、系统接口名和 GUID 由 Windows SDK 转换为实际接口身份；不匹配时当前连接失败，
+不改变绑定源地址、接口索引或会话快照。非零 `routing-mark` 在 Windows 上不可用。
+桌面 Wintun 的显式接口选择仅设置普通出站 socket，不取得 Provider 绑定或代替宿主路由配置。
+
 `AssociateTransport` 只用于 Provider 的受管理唤醒传输，不用于普通代理流。Session Host 不持有 `VpnChannel`，不能给逐流 socket 获取同类豁免。
+
+显式 `system` DNS 仅由实际 Session Host 在显式查询按需读取既有物理适配器 GUID 的 DNS 数据（metadata 缓存 20 秒），继续执行同一 `(源 IP, 接口索引)` 绑定；不读取前台 Invoke registry，也不改变控制协议。`GetInterfaceDnsSettings` v3 不可用或存在无法满足的加密要求时来源不可用。原生 IPv6 DNS 的加密策略无法通过该只读查询确认，也保持不可用。无法确认 DHCP option 6 来源时 `dhcp://<接口>` 不可用。系统 DNS 发现不配置或恢复系统网络，App 仍负责原有网络设置和生命周期。
 
 ## 网络变化
 
@@ -180,7 +187,7 @@ vole-windows-vpn-host.exe
 vole-windows-session-host.exe
 ```
 
-- manifest 只有一个主 Application，三个可执行参与者相互独立；产物架构一致，Rust 使用静态 CRT；
+- manifest 只有一个主 Application，三个可执行参与者相互独立；产物架构一致，UWP 的 Rust 和原生依赖统一使用动态 CRT，安装包负责声明并部署对应架构的 Visual C++ Runtime 依赖；
 - Session Host 是 `windows.fullTrustProcess` extension，不显示在应用列表，也不注册 StartupTask 或 URI；
 - Provider 的 `windows.backgroundTasks` extension 显式使用 `windowsApp + appContainer`；
 - Provider activation class 来自 `vole.dll`；
@@ -337,10 +344,10 @@ Stopped { version, packetCounters }
 
 ## Controller 与本地 SOCKS
 
-- Controller 由 Session Host 监听完全信任的回环地址；
+- Controller 由 Session Host 按 YAML 的 `external-controller` 地址监听；
 - `RuntimeReady` 前必须完成绑定，失败则连接失败；
 - 前台宿主持有配置中的端口和 secret，并调用 `GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 或 `PUT /proxies/{name}`；
-- 配置代理组与 Controller 时 secret 必填并保护全部路由；仅有 TUN 流量 Controller 时 secret 仍可省略；
+- `secret` 可省略或为空；配置非空 `secret` 时保护全部路由，与是否配置代理组无关；
 - 代理组选择属于 Session Host 中实际 Running Session 的内存状态，不经过 Windows bridge、Provider 控制管道或 Session Snapshot 写回；
 - 成功切换只影响之后新建的物理 TCP、UDP 和 DNS transport，不迁移既有连接、UDP association、DNS 状态或 TCP pool，也不执行自动 failover；
 - 宿主如需跨 VPN session 保留选择，必须自行持久化，并在下次 `startVpn` 的 YAML 中注入对应 `default-selected`；
@@ -360,5 +367,13 @@ Stopped { version, packetCounters }
 - [`VpnManagementAgent`](https://learn.microsoft.com/uwp/api/windows.networking.vpn.vpnmanagementagent)
 - [`FullTrustProcessLauncher`](https://learn.microsoft.com/uwp/api/windows.applicationmodel.fulltrustprocesslauncher)
 - [Package identity](https://learn.microsoft.com/windows/apps/desktop/modernize/package-identity-overview)
+- [UWP 与 C Runtime](https://learn.microsoft.com/cpp/c-runtime-library/windows-store-apps-the-windows-runtime-and-the-c-run-time)
 - [`RoInitialize`](https://learn.microsoft.com/windows/win32/api/roapi/nf-roapi-roinitialize)
 - [`CoIncrementMTAUsage`](https://learn.microsoft.com/windows/win32/api/combaseapi/nf-combaseapi-coincrementmtausage)
+
+
+`startVpn` 可选 `httpConfigYaml` 和 `httpContext` 接收[独立 HTTP 规则](http-processing.md)与 baseDir／私密 CA。断开状态可准备来源；活动前台不使用默认 socket 获取资源。canonical Session Snapshot 固定主设置、实际 payload、原生基目录和公开 CA 指纹，参与 token；私钥仅在当前用户 DPAPI sidecar 中，entropy 绑定 package family 与 token，先发布 sidecar 再发布普通快照。随机密文不参与 token。
+
+Session Host 完成 token 握手后才读取并解密 sidecar，复验 token、CA 身份和证私匹配；恢复实际规则不重读源文件。运行中的周期更新使用原 PhysicalBinding 的直接出口，只产生 pending；Stop 等待更新结束。私密 sidecar 随当前／上一份快照保留并同步清理，不进入普通缓存、Controller、日志或包通道。
+
+主配置保持 8 MiB 上限，独立 HTTP 输入与实际来源合计保持 1 MiB；内部展开 HTTP 快照最多 8 MiB。普通 Session Snapshot 在写出前精确计算 JSON 转义后的大小，只预留实际所需字节；读取上限同时计入这两份内容、原生基目录和有界 backend 元数据。bridge 请求仍最多 1 MiB。公开 CA 身份使用证书 DER 的 SHA-256，不依赖 PEM 排版；真正使用 CA 时仍验证有效期、CA 约束和证私匹配。编译不代替实际 Windows DPAPI／VPN 验证。

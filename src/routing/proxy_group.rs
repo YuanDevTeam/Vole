@@ -1,10 +1,10 @@
+use super::GroupSelection;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::HashMap,
     fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
 };
 
 use async_trait::async_trait;
@@ -17,15 +17,20 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProxyGroupState {
+    pub kind: crate::config::GroupKind,
     pub(crate) name: String,
     pub(crate) all: Vec<String>,
     pub(crate) now: String,
+    pub(crate) hidden: bool,
+    pub(crate) icon: String,
+    pub(crate) fixed: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProxyGroupError {
     UnknownGroup,
     UnknownMember,
+    NotSelectable,
 }
 
 impl fmt::Display for ProxyGroupError {
@@ -33,6 +38,7 @@ impl fmt::Display for ProxyGroupError {
         formatter.write_str(match self {
             Self::UnknownGroup => "unknown proxy group",
             Self::UnknownMember => "unknown proxy group member",
+            Self::NotSelectable => "load-balance does not support manual selection",
         })
     }
 }
@@ -40,9 +46,13 @@ impl fmt::Display for ProxyGroupError {
 impl std::error::Error for ProxyGroupError {}
 
 struct SelectProxyGroup {
+    config: SelectProxyGroupConfig,
     name: String,
     members: Box<[ProxyGroupMember]>,
-    selected: Arc<AtomicUsize>,
+    selected: Arc<GroupSelection>,
+    disable_udp: bool,
+    hidden: bool,
+    icon: String,
 }
 
 struct ProxyGroupMember {
@@ -50,9 +60,29 @@ struct ProxyGroupMember {
     target: ProxyGroupMemberTarget,
 }
 
+#[derive(Clone)]
 pub(crate) struct ResolvedProxyGroupLeaf {
+    pub(crate) chain: Vec<String>,
+    pub(crate) selections: Vec<Arc<GroupSelection>>,
     pub(crate) dispatcher: Arc<dyn Dispatcher>,
     pub(crate) direct: bool,
+}
+
+pub(crate) enum InspectedRuleTarget {
+    Control(crate::config::RuleControl),
+    Rematch(Arc<super::rematch::RematchTarget>),
+    Egress(ResolvedProxyGroupLeaf),
+    Unavailable,
+}
+
+impl ResolvedProxyGroupLeaf {
+    pub(crate) fn report(&self, result: &Result<BoxStream, DispatchError>) {
+        if !self.direct && !matches!(result, Err(DispatchError::NotAllowed)) {
+            for selection in &self.selections {
+                selection.outcome(result.is_ok());
+            }
+        }
+    }
 }
 
 /// Immutable select-group graph with one atomically replaceable member index
@@ -62,8 +92,10 @@ pub(crate) struct ProxyGroups {
     proxies: Box<[Arc<dyn Dispatcher>]>,
     direct: Arc<dyn Dispatcher>,
     reject: Arc<dyn Dispatcher>,
+    reject_drop: Arc<dyn Dispatcher>,
     groups: Box<[SelectProxyGroup]>,
     ids_by_name: HashMap<String, ProxyGroupId>,
+    rematches: super::RematchTargets,
 }
 
 impl fmt::Debug for ProxyGroups {
@@ -85,16 +117,37 @@ impl ProxyGroups {
     ) -> Result<Arc<Self>, DispatchError> {
         let selections = configs
             .iter()
-            .map(|config| Arc::new(AtomicUsize::new(config.initial_member)))
+            .map(|config| Arc::new(GroupSelection::new(config.initial_member)))
             .collect::<Vec<_>>();
         Self::with_selections(configs, proxies, direct, &selections)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_selections(
         configs: &[SelectProxyGroupConfig],
         proxies: Vec<Arc<dyn Dispatcher>>,
         direct: Arc<dyn Dispatcher>,
-        selections: &[Arc<AtomicUsize>],
+        selections: &[Arc<GroupSelection>],
+    ) -> Result<Arc<Self>, DispatchError> {
+        Self::with_selections_and_drop(
+            configs,
+            proxies,
+            direct,
+            selections,
+            Arc::new(crate::outbound::ConnectorDispatcher::new(Arc::new(
+                crate::outbound::RejectOutbound::drop_connections(),
+            ))),
+            super::RematchTargets::default(),
+        )
+    }
+
+    pub(crate) fn with_selections_and_drop(
+        configs: &[SelectProxyGroupConfig],
+        proxies: Vec<Arc<dyn Dispatcher>>,
+        direct: Arc<dyn Dispatcher>,
+        selections: &[Arc<GroupSelection>],
+        reject_drop: Arc<dyn Dispatcher>,
+        rematches: super::RematchTargets,
     ) -> Result<Arc<Self>, DispatchError> {
         if selections.len() != configs.len() {
             return Err(DispatchError::Other(
@@ -146,24 +199,41 @@ impl ProxyGroups {
             proxies: proxies.into_boxed_slice(),
             direct,
             reject: Arc::new(RejectDispatcher),
+            reject_drop,
             groups: configs
                 .iter()
                 .zip(selections)
-                .map(|(config, selection)| SelectProxyGroup {
-                    name: config.name.clone(),
-                    members: config
-                        .members
-                        .iter()
-                        .map(|member| ProxyGroupMember {
-                            name: member.name.clone(),
-                            target: member.target,
-                        })
-                        .collect(),
-                    selected: selection.clone(),
+                .map(|(config, selection)| {
+                    selection.configure(config.max_failed_times, config.health.timeout);
+                    selection.configure_balance(config);
+                    SelectProxyGroup {
+                        config: config.clone(),
+                        name: config.name.clone(),
+                        members: config
+                            .members
+                            .iter()
+                            .map(|member| ProxyGroupMember {
+                                name: member.name.clone(),
+                                target: member.target,
+                            })
+                            .collect(),
+                        selected: selection.clone(),
+                        disable_udp: config.disable_udp,
+                        hidden: config.hidden,
+                        icon: config.icon.clone(),
+                    }
                 })
                 .collect(),
             ids_by_name,
+            rematches,
         }))
+    }
+
+    pub(super) fn rematch(
+        &self,
+        id: crate::config::ProxyId,
+    ) -> Option<&Arc<super::rematch::RematchTarget>> {
+        self.rematches.get(id)
     }
 
     #[must_use]
@@ -185,30 +255,80 @@ impl ProxyGroups {
     }
 
     pub(crate) fn select(&self, group: &str, member: &str) -> Result<(), ProxyGroupError> {
+        self.inherit_selection(group, member, true)
+    }
+    pub(crate) fn clear_fixed(&self, name: &str) -> Result<(), ProxyGroupError> {
+        let id = self
+            .ids_by_name
+            .get(name)
+            .copied()
+            .ok_or(ProxyGroupError::UnknownGroup)?;
+        let group = &self.groups[id.index()];
+        if !matches!(
+            group.config.kind,
+            crate::config::GroupKind::UrlTest | crate::config::GroupKind::Fallback
+        ) {
+            return Err(ProxyGroupError::NotSelectable);
+        }
+        group.selected.clear_forced();
+        Ok(())
+    }
+    pub(crate) fn inherit_selection(
+        &self,
+        group: &str,
+        member: &str,
+        forced: bool,
+    ) -> Result<(), ProxyGroupError> {
         let id = self
             .ids_by_name
             .get(group)
             .copied()
             .ok_or(ProxyGroupError::UnknownGroup)?;
         let group = &self.groups[id.index()];
+        if group.config.kind == crate::config::GroupKind::LoadBalance {
+            return Err(ProxyGroupError::NotSelectable);
+        }
         let selected = group
             .members
             .iter()
             .position(|candidate| candidate.name == member)
             .ok_or(ProxyGroupError::UnknownMember)?;
-        group.selected.store(selected, Ordering::Release);
+        if forced {
+            group.selected.force(selected);
+        } else {
+            group.selected.store(selected, Ordering::Release);
+        }
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_leaf(
         &self,
-        mut group_id: ProxyGroupId,
+        group_id: ProxyGroupId,
     ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
+        self.resolve_leaf_for(group_id, false, None, None, None)
+    }
+
+    pub(crate) fn resolve_leaf_for(
+        &self,
+        mut group_id: ProxyGroupId,
+        udp: bool,
+        source: Option<std::net::SocketAddr>,
+        destination: Option<&crate::session::Destination>,
+        user: Option<&str>,
+    ) -> Result<ResolvedProxyGroupLeaf, DispatchError> {
+        let mut chain = Vec::new();
+        let mut selections = Vec::new();
         for _ in 0..=self.groups.len() {
             let group = self.groups.get(group_id.index()).ok_or_else(|| {
                 DispatchError::Other(format!("unknown proxy group id {}", group_id.index()))
             })?;
-            let selected = group.selected.load(Ordering::Acquire);
+            chain.push(group.name.clone());
+            selections.push(group.selected.clone());
+            if udp && group.disable_udp {
+                return Err(DispatchError::NotAllowed);
+            }
+            let selected = group.selected.choose_for(source, destination, user);
             let member = group.members.get(selected).ok_or_else(|| {
                 DispatchError::Other(format!(
                     "proxy group {} has invalid selected index {selected}",
@@ -217,11 +337,18 @@ impl ProxyGroups {
             })?;
             match member.target {
                 ProxyGroupMemberTarget::Route(RouteTargetId::Proxy(id)) => {
+                    if self.rematches.get(id).is_some() {
+                        return Err(DispatchError::NotAllowed);
+                    }
+                    chain.push(member.name.clone());
+                    chain.reverse();
                     return self
                         .proxies
                         .get(id.index())
                         .cloned()
                         .map(|dispatcher| ResolvedProxyGroupLeaf {
+                            chain,
+                            selections,
                             dispatcher,
                             direct: false,
                         })
@@ -231,14 +358,33 @@ impl ProxyGroups {
                 }
                 ProxyGroupMemberTarget::Route(RouteTargetId::Group(id)) => group_id = id,
                 ProxyGroupMemberTarget::Direct => {
+                    chain.push(member.name.clone());
+                    chain.reverse();
                     return Ok(ResolvedProxyGroupLeaf {
+                        chain,
+                        selections,
                         dispatcher: self.direct.clone(),
                         direct: true,
                     });
                 }
+                ProxyGroupMemberTarget::Control(_) => return Err(DispatchError::NotAllowed),
                 ProxyGroupMemberTarget::Reject => {
+                    chain.push("REJECT".into());
+                    chain.reverse();
                     return Ok(ResolvedProxyGroupLeaf {
+                        chain,
+                        selections,
                         dispatcher: self.reject.clone(),
+                        direct: false,
+                    });
+                }
+                ProxyGroupMemberTarget::RejectDrop => {
+                    chain.push(member.name.clone());
+                    chain.reverse();
+                    return Ok(ResolvedProxyGroupLeaf {
+                        chain,
+                        selections,
+                        dispatcher: self.reject_drop.clone(),
                         direct: false,
                     });
                 }
@@ -247,6 +393,154 @@ impl ProxyGroups {
         Err(DispatchError::Other(
             "proxy group nesting exceeded the runtime hop ceiling".to_owned(),
         ))
+    }
+
+    /// The validated DAG gives group locks one traversal order. No lock is held
+    /// across IO; controls and ineligible UDP leaves never advance round robin.
+    pub(crate) fn inspect_rule_target(
+        &self,
+        mut group_id: ProxyGroupId,
+        udp: bool,
+        commit: bool,
+        source: Option<std::net::SocketAddr>,
+        destination: Option<&crate::session::Destination>,
+        user: Option<&str>,
+    ) -> Result<InspectedRuleTarget, DispatchError> {
+        let mut inspected = Vec::new();
+        let mut chain = Vec::new();
+        let mut selections = Vec::new();
+        let mut disabled = false;
+        for _ in 0..=self.groups.len() {
+            let group = self
+                .groups
+                .get(group_id.index())
+                .ok_or(DispatchError::NotAllowed)?;
+            // Defend the public constructor as well as the validated config path.
+            if selections
+                .iter()
+                .any(|selection| Arc::ptr_eq(selection, &group.selected))
+            {
+                return Err(DispatchError::NotAllowed);
+            }
+            let selected = group.selected.inspect(source, destination, user);
+            let member = group
+                .members
+                .get(selected.index)
+                .ok_or(DispatchError::NotAllowed)?;
+            inspected.push(selected);
+            selections.push(group.selected.clone());
+            chain.push(group.name.clone());
+            disabled |= group.disable_udp;
+            let (dispatcher, direct) = match member.target {
+                ProxyGroupMemberTarget::Control(control) => {
+                    return Ok(InspectedRuleTarget::Control(control));
+                }
+                ProxyGroupMemberTarget::Route(RouteTargetId::Group(id)) => {
+                    group_id = id;
+                    continue;
+                }
+                ProxyGroupMemberTarget::Route(RouteTargetId::Proxy(id)) => {
+                    if let Some(target) = self.rematches.get(id) {
+                        return Ok(InspectedRuleTarget::Rematch(target.clone()));
+                    }
+                    (
+                        self.proxies
+                            .get(id.index())
+                            .ok_or(DispatchError::NotAllowed)?
+                            .clone(),
+                        false,
+                    )
+                }
+                ProxyGroupMemberTarget::Direct => (self.direct.clone(), true),
+                ProxyGroupMemberTarget::Reject => (self.reject.clone(), false),
+                ProxyGroupMemberTarget::RejectDrop => (self.reject_drop.clone(), false),
+            };
+            if udp && (disabled || !dispatcher.supports_udp()) {
+                return Ok(InspectedRuleTarget::Unavailable);
+            }
+            if commit {
+                for selected in inspected {
+                    selected.commit();
+                }
+            }
+            chain.push(member.name.clone());
+            chain.reverse();
+            return Ok(InspectedRuleTarget::Egress(ResolvedProxyGroupLeaf {
+                chain,
+                selections,
+                dispatcher,
+                direct,
+            }));
+        }
+        Err(DispatchError::NotAllowed)
+    }
+
+    pub(crate) fn has_balance(&self) -> bool {
+        self.groups
+            .iter()
+            .any(|g| g.config.kind == crate::config::GroupKind::LoadBalance)
+    }
+    pub(crate) fn contains_balance(&self, id: ProxyGroupId) -> bool {
+        let mut pending = vec![id];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let group = &self.groups[id.index()];
+            if group.config.kind == crate::config::GroupKind::LoadBalance {
+                return true;
+            }
+            pending.extend(group.members.iter().filter_map(|m| match m.target {
+                ProxyGroupMemberTarget::Route(RouteTargetId::Group(id)) => Some(id),
+                _ => None,
+            }));
+        }
+        false
+    }
+
+    pub(crate) fn selection(&self, index: usize) -> Arc<GroupSelection> {
+        self.groups[index].selected.clone()
+    }
+    pub(crate) fn apply_health(&self, index: usize, samples: &[Option<u64>]) {
+        let group = &self.groups[index];
+        if group.config.kind == crate::config::GroupKind::Select
+            || samples.len() != group.members.len()
+        {
+            return;
+        }
+        if group.config.kind == crate::config::GroupKind::LoadBalance {
+            group.selected.balance_health(samples);
+            return;
+        }
+        if let Some(forced) = group.selected.forced() {
+            if samples[forced].is_some() {
+                group.selected.store(forced, Ordering::Release);
+                return;
+            }
+            group.selected.clear_forced();
+        }
+        let old = group.selected.load(Ordering::Acquire);
+        let next = if group.config.kind == crate::config::GroupKind::Fallback {
+            samples.iter().position(Option::is_some).unwrap_or(0)
+        } else {
+            let fastest = samples
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| d.map(|d| (i, d)))
+                .min_by_key(|(_, d)| *d)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            if samples[old]
+                .zip(samples[fastest])
+                .is_some_and(|(a, b)| a <= b.saturating_add(u64::from(group.config.tolerance)))
+            {
+                old
+            } else {
+                fastest
+            }
+        };
+        group.selected.store(next, Ordering::Release);
     }
 
     pub(super) fn dispatcher(self: &Arc<Self>, id: ProxyGroupId) -> Arc<dyn Dispatcher> {
@@ -261,13 +555,29 @@ impl SelectProxyGroup {
     fn state(&self) -> ProxyGroupState {
         let selected = self.selected.load(Ordering::Acquire);
         ProxyGroupState {
+            kind: self.config.kind,
             name: self.name.clone(),
             all: self
                 .members
                 .iter()
                 .map(|member| member.name.clone())
                 .collect(),
-            now: self.members[selected].name.clone(),
+            now: if self.config.kind == crate::config::GroupKind::LoadBalance {
+                String::new()
+            } else {
+                self.members[selected].name.clone()
+            },
+            hidden: self.hidden,
+            icon: self.icon.clone(),
+            fixed: matches!(
+                self.config.kind,
+                crate::config::GroupKind::UrlTest | crate::config::GroupKind::Fallback
+            )
+            .then(|| {
+                self.selected
+                    .forced()
+                    .map_or_else(String::new, |index| self.members[index].name.clone())
+            }),
         }
     }
 }
@@ -279,23 +589,123 @@ struct SelectProxyGroupDispatcher {
 
 #[async_trait]
 impl Dispatcher for SelectProxyGroupDispatcher {
+    fn supports_udp(&self) -> bool {
+        let mut id = self.id;
+        for _ in 0..=self.groups.groups.len() {
+            let Some(group) = self.groups.groups.get(id.index()) else {
+                return false;
+            };
+            if group.disable_udp {
+                return false;
+            }
+            // Mihomo advertises balance-group UDP independently of the next
+            // selected leaf. Capability queries must not advance round-robin.
+            if group.config.kind == crate::config::GroupKind::LoadBalance {
+                return true;
+            }
+            let Some(member) = group.members.get(group.selected.load(Ordering::Acquire)) else {
+                return false;
+            };
+            match member.target {
+                ProxyGroupMemberTarget::Route(RouteTargetId::Proxy(id)) => {
+                    return self
+                        .groups
+                        .proxies
+                        .get(id.index())
+                        .is_some_and(|d| d.supports_udp());
+                }
+                ProxyGroupMemberTarget::Route(RouteTargetId::Group(nested)) => id = nested,
+                ProxyGroupMemberTarget::Direct
+                | ProxyGroupMemberTarget::Reject
+                | ProxyGroupMemberTarget::RejectDrop => return true,
+                ProxyGroupMemberTarget::Control(_) => return false,
+            }
+        }
+        false
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
-        self.groups
-            .resolve_leaf(self.id)?
-            .dispatcher
-            .connect_tcp(session)
-            .await
+        let leaf = self.groups.resolve_leaf_for(
+            self.id,
+            false,
+            Some(session.source),
+            Some(&session.destination),
+            session.metadata.user.as_deref(),
+        )?;
+        let result = leaf.dispatcher.connect_tcp(session).await;
+        leaf.report(&result);
+        result
     }
 
     async fn open_datagram(
         &self,
         session: DatagramSession,
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        if self.groups.contains_balance(self.id) {
+            return Ok(Box::new(BalancedDatagrams {
+                groups: self.groups.clone(),
+                id: self.id,
+                session,
+                transport: None,
+            }));
+        }
         self.groups
-            .resolve_leaf(self.id)?
+            .resolve_leaf_for(
+                self.id,
+                true,
+                Some(session.source),
+                None,
+                session.metadata.user.as_deref(),
+            )?
             .dispatcher
             .open_datagram(session)
             .await
+    }
+}
+
+// Core-originated DNS/probes also enter groups without a first destination.
+// Resolve their leaf on first send and retain it through the association.
+struct BalancedDatagrams {
+    groups: Arc<ProxyGroups>,
+    id: ProxyGroupId,
+    session: DatagramSession,
+    transport: Option<Box<dyn DatagramTransport>>,
+}
+#[async_trait]
+impl DatagramTransport for BalancedDatagrams {
+    fn supports_shared_destinations(&self) -> bool {
+        // The first destination selects a leaf whose framing is not known yet.
+        false
+    }
+
+    async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
+        if self.transport.is_none() {
+            let leaf = self.groups.resolve_leaf_for(
+                self.id,
+                true,
+                Some(self.session.source),
+                Some(&datagram.remote),
+                self.session.metadata.user.as_deref(),
+            )?;
+            self.transport = Some(leaf.dispatcher.open_datagram(self.session.clone()).await?);
+        }
+        self.transport
+            .as_mut()
+            .expect("group association opened")
+            .send(datagram)
+            .await
+    }
+    async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+        match &mut self.transport {
+            Some(transport) => transport.receive().await,
+            None => std::future::pending().await,
+        }
+    }
+    async fn close(&mut self) -> Result<(), DispatchError> {
+        match self.transport.take() {
+            Some(mut transport) => transport.close().await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -319,6 +729,10 @@ struct RejectDatagramTransport;
 
 #[async_trait]
 impl DatagramTransport for RejectDatagramTransport {
+    fn supports_shared_destinations(&self) -> bool {
+        true
+    }
+
     async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
         Ok(())
     }
@@ -330,11 +744,7 @@ impl DatagramTransport for RejectDatagramTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::SocketAddr,
-        sync::atomic::{AtomicUsize, Ordering},
-        time::Duration,
-    };
+    use std::{net::SocketAddr, sync::atomic::Ordering, time::Duration};
 
     use bytes::Bytes;
     use tokio::sync::Semaphore;
@@ -377,6 +787,10 @@ mod tests {
 
     #[async_trait]
     impl DatagramTransport for RecordingDatagramTransport {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
         async fn send(&mut self, _datagram: Datagram) -> Result<(), DispatchError> {
             self.sends.fetch_add(1, Ordering::Relaxed);
             Ok(())
@@ -450,6 +864,15 @@ mod tests {
         initial_member: usize,
     ) -> SelectProxyGroupConfig {
         SelectProxyGroupConfig {
+            kind: crate::config::GroupKind::Select,
+            strategy: crate::config::BalanceStrategy::default(),
+            hash_key: crate::config::BalanceHashKey::default(),
+            health: crate::config::HealthCheckConfig::default(),
+            tolerance: 0,
+            max_failed_times: 5,
+            disable_udp: false,
+            hidden: false,
+            icon: String::new(),
             name: name.to_owned(),
             members,
             initial_member,
@@ -458,6 +881,7 @@ mod tests {
 
     fn stream_session() -> StreamSession {
         StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::Http,
             source: "127.0.0.1:10000".parse().unwrap(),
             destination: Destination::Ip("192.0.2.1:443".parse().unwrap()),
@@ -475,6 +899,55 @@ mod tests {
             payload: Bytes::from_static(b"payload"),
             sniffed_domain: None,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_groups_apply_tolerance_recover_and_restore_selection() {
+        let config = crate::config::Config::parse_yaml(
+            br#"
+mixed-port: 1080
+proxies:
+  - {name: a, type: socks5, server: 192.0.2.1, port: 1080}
+  - {name: b, type: socks5, server: 192.0.2.2, port: 1080}
+proxy-groups:
+  - {name: fastest, type: url-test, proxies: [a,b], tolerance: 20, max-failed-times: 2}
+  - {name: backup, type: fallback, proxies: [a,b]}
+  - {name: manual, type: select, proxies: [a,b], default-selected: a}
+"#,
+        )
+        .unwrap();
+        let node = Arc::new(FailingDispatcher);
+        let groups = ProxyGroups::new(
+            &config.proxy_groups,
+            vec![node.clone(), node.clone()],
+            node.clone(),
+        )
+        .unwrap();
+        groups.apply_health(0, &[Some(100), Some(90)]);
+        assert_eq!(groups.state("fastest").unwrap().now, "a");
+        groups.apply_health(0, &[Some(100), Some(60)]);
+        assert_eq!(groups.state("fastest").unwrap().now, "b");
+        groups.apply_health(1, &[None, Some(60)]);
+        assert_eq!(groups.state("backup").unwrap().now, "b");
+        groups.apply_health(1, &[Some(100), Some(60)]);
+        assert_eq!(groups.state("backup").unwrap().now, "a");
+        groups.select("fastest", "a").unwrap();
+        groups.apply_health(0, &[None, Some(60)]);
+        assert_eq!(groups.state("fastest").unwrap().now, "b");
+        let selection = groups.selection(0);
+        selection.outcome(false);
+        selection.outcome(false);
+        assert!(selection.take_urgent());
+        tokio::time::advance(std::time::Duration::from_secs(301)).await;
+        assert!(!selection.active(std::time::Duration::from_secs(300)));
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::resource::profile::SelectionStore::open(root.path(), true);
+        groups.select("manual", "b").unwrap();
+        store.save("manual", "b").unwrap();
+        let restarted =
+            ProxyGroups::new(&config.proxy_groups, vec![node.clone(), node.clone()], node).unwrap();
+        crate::resource::profile::SelectionStore::open(root.path(), true).restore(&restarted);
+        assert_eq!(restarted.state("manual").unwrap().now, "b");
     }
 
     #[tokio::test]
@@ -534,14 +1007,22 @@ mod tests {
             groups.list_states(),
             vec![
                 ProxyGroupState {
+                    kind: crate::config::GroupKind::Select,
                     name: "child".to_owned(),
                     all: vec!["first".to_owned(), "first".to_owned(), "second".to_owned()],
                     now: "second".to_owned(),
+                    hidden: false,
+                    icon: String::new(),
+                    fixed: None,
                 },
                 ProxyGroupState {
+                    kind: crate::config::GroupKind::Select,
                     name: "parent".to_owned(),
                     all: vec!["child".to_owned(), "DIRECT".to_owned(), "REJECT".to_owned()],
                     now: "child".to_owned(),
+                    hidden: false,
+                    icon: String::new(),
+                    fixed: None,
                 },
             ]
         );
@@ -711,5 +1192,52 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("hop ceiling"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_fixed_clear_uses_existing_health_without_probe() {
+        let mut automatic = group(
+            "automatic",
+            vec![
+                member("first", ProxyGroupMemberTarget::Direct),
+                member("second", ProxyGroupMemberTarget::Reject),
+            ],
+            0,
+        );
+        automatic.kind = crate::config::GroupKind::UrlTest;
+        let manual = group(
+            "manual",
+            vec![member("first", ProxyGroupMemberTarget::Direct)],
+            0,
+        );
+        let node = Arc::new(FailingDispatcher);
+        let groups = ProxyGroups::new(&[automatic, manual], Vec::new(), node).unwrap();
+        assert_eq!(
+            groups.state("automatic").unwrap().fixed.as_deref(),
+            Some("")
+        );
+        assert_eq!(groups.state("manual").unwrap().fixed, None);
+        groups.select("automatic", "first").unwrap();
+        groups.apply_health(0, &[Some(100), Some(10)]);
+        assert_eq!(groups.state("automatic").unwrap().now, "first");
+        assert_eq!(
+            groups.state("automatic").unwrap().fixed.as_deref(),
+            Some("first")
+        );
+        groups.clear_fixed("automatic").unwrap();
+        groups.apply_health(0, &[Some(100), Some(10)]);
+        assert_eq!(groups.state("automatic").unwrap().now, "second");
+        assert_eq!(
+            groups.state("automatic").unwrap().fixed.as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            groups.clear_fixed("manual"),
+            Err(ProxyGroupError::NotSelectable)
+        );
+        assert_eq!(
+            groups.clear_fixed("missing"),
+            Err(ProxyGroupError::UnknownGroup)
+        );
     }
 }

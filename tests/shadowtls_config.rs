@@ -35,35 +35,64 @@ fn policy(node: Value) -> ShadowTlsConfig {
     let ProxyProtocol::Shadowsocks(ss) = &config.proxies[0].protocol else {
         panic!()
     };
-    ss.shadow_tls.clone().unwrap()
+    match ss.plugin.clone().unwrap() {
+        vole::config::ShadowsocksPlugin::ShadowTls(config) => config,
+        _ => panic!("expected ShadowTLS"),
+    }
 }
 
 #[cfg(feature = "shadow-tls-v3")]
 #[test]
-fn shadowtls_preserves_policy_values_and_shared_profile_aliases() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("SHADOWTLS-CFG", "policy");
+fn shadowtls_preserves_policy_values_and_shared_profiles() {
     let config = policy(node());
+    let mut disabled = node();
+    disabled.as_object_mut().unwrap().remove("plugin-opts");
+    disabled["plugin"] = json!("");
+    let disabled = parse(disabled).unwrap();
+    let ProxyProtocol::Shadowsocks(plain) = &disabled.proxies[0].protocol else {
+        panic!()
+    };
+    assert!(plain.plugin.is_none());
+    assert_eq!(plain.address, "fixture.invalid");
+    assert_eq!(plain.port, 443);
     assert_eq!(config.password, " synthetic-private-marker ");
     assert_eq!(config.alpn, [b"h2".to_vec(), b"http/1.1".to_vec()]);
     assert!(!config.certificate.skip_cert_verify);
     assert!(config.certificate.fingerprint.is_none());
     assert!(config.certificate.verification_name.is_none());
     assert_eq!(config.client_fingerprint, None);
+    let mut empty_overrides = node();
+    empty_overrides["plugin-opts"]["fingerprint"] = json!("");
+    empty_overrides["plugin-opts"]["name-cert-verify"] = json!("");
+    let defaults = policy(empty_overrides);
+    assert_eq!(defaults.certificate, config.certificate);
+    assert_eq!(defaults.server_name, config.server_name);
+    assert_eq!(defaults.password, config.password);
     for (name, expected) in [
         ("", None),
         ("none", None),
         ("chrome", Some(ClientFingerprint::Chrome133)),
-        ("chrome120", Some(ClientFingerprint::Chrome120)),
         ("firefox", Some(ClientFingerprint::Firefox120)),
-        ("firefox120", Some(ClientFingerprint::Firefox120)),
         ("safari", Some(ClientFingerprint::Safari16)),
-        ("safari16", Some(ClientFingerprint::Safari16)),
+        ("ios", Some(ClientFingerprint::Ios14)),
     ] {
         let mut n = node();
         n["client-fingerprint"] = json!(name);
         assert_eq!(policy(n).client_fingerprint, expected);
     }
+    let mut random = node();
+    random["client-fingerprint"] = json!("random");
+    let selected = policy(random.clone()).client_fingerprint;
+    assert!(matches!(
+        selected,
+        Some(
+            ClientFingerprint::Chrome133
+                | ClientFingerprint::Safari16
+                | ClientFingerprint::Ios14
+                | ClientFingerprint::Firefox120
+        )
+    ));
+    assert_eq!(policy(random).client_fingerprint, selected);
     for alpn in [
         vec![],
         vec!["custom".to_owned(), "h2".to_owned()],
@@ -76,6 +105,9 @@ fn shadowtls_preserves_policy_values_and_shared_profile_aliases() {
             alpn.into_iter().map(String::into_bytes).collect::<Vec<_>>()
         );
     }
+    let mut null_alpn = node();
+    null_alpn["plugin-opts"]["alpn"] = Value::Null;
+    assert!(policy(null_alpn).alpn.is_empty());
     for host in ["cover.invalid", "192.0.2.7", "2001:db8::7"] {
         let mut n = node();
         let o = &mut n["plugin-opts"];
@@ -104,29 +136,26 @@ fn shadowtls_preserves_policy_values_and_shared_profile_aliases() {
 #[cfg(feature = "shadow-tls-v3")]
 #[test]
 fn shadowtls_rejects_invalid_types_bounds_unknown_fields_and_nulls_without_secrets() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("SHADOWTLS-CFG", "reject");
-    let assert_rejected = |n| {
-        let error = parse(n).expect_err("must reject before IO").to_string();
+    let assert_rejected = |n, case: &str| {
+        let error = parse(n).expect_err(case).to_string();
         assert!(!error.contains("synthetic-private-marker"), "{error}");
     };
     for key in ["plugin", "plugin-opts", "client-fingerprint"] {
         let mut n = node();
         n[key] = Value::Null;
-        assert_rejected(n);
+        assert_rejected(n, &format!("{key}: null must reject before IO"));
     }
     for key in [
         "version",
         "host",
         "password",
-        "alpn",
         "skip-cert-verify",
         "fingerprint",
         "name-cert-verify",
     ] {
         let mut n = node();
         n["plugin-opts"][key] = Value::Null;
-        assert_rejected(n);
+        assert_rejected(n, &format!("plugin-opts.{key}: null must reject before IO"));
     }
     for (key, values) in [
         (
@@ -166,37 +195,39 @@ fn shadowtls_rejects_invalid_types_bounds_unknown_fields_and_nulls_without_secre
         ("skip-cert-verify", vec![json!(1), json!("true")]),
         (
             "fingerprint",
-            vec![json!(""), json!("ff"), json!("z".repeat(64)), json!(true)],
+            vec![json!("ff"), json!("z".repeat(64)), json!(true)],
         ),
-        (
-            "name-cert-verify",
-            vec![json!(""), json!("bad name"), json!(false)],
-        ),
+        ("name-cert-verify", vec![json!("bad name"), json!(false)]),
         ("strict-mode", vec![json!(true), json!(false)]),
         ("unknown", vec![json!("synthetic-private-marker")]),
     ] {
         for value in values {
             let mut n = node();
+            let case = format!("plugin-opts.{key}: {value} must reject before IO");
             n["plugin-opts"][key] = value;
-            assert_rejected(n);
+            assert_rejected(n, &case);
         }
     }
-    for value in [json!("chrome133"), json!("random"), json!(true), json!([])] {
+    for value in [
+        json!("chrome133"),
+        json!("randomized"),
+        json!(true),
+        json!([]),
+    ] {
         let mut n = node();
+        let case = format!("client-fingerprint: {value} must reject before IO");
         n["client-fingerprint"] = value;
-        assert_rejected(n);
+        assert_rejected(n, &case);
     }
     for key in ["plugin", "plugin-opts"] {
         let mut n = node();
         n.as_object_mut().unwrap().remove(key);
-        assert_rejected(n);
+        assert_rejected(n, &format!("missing {key} must reject before IO"));
     }
 }
 
 #[test]
 fn shadowtls_requires_explicit_v3_and_a_complete_plugin_policy() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("SHADOWTLS-CFG", "feature");
     let fields = "    plugin: shadow-tls\n    plugin-opts: {version: 3, host: cover.invalid, password: ' secret '}";
     let result = Config::parse_yaml(yaml(fields).as_bytes());
     // This protocol is independently removable even when boring is present.

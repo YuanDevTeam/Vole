@@ -7,11 +7,6 @@ use vole::{
 
 #[test]
 fn request_matches_the_official_sha224_and_socks_address_wire_format() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "TROJAN-CODEC",
-        "request_matches_the_official_sha224_and_socks_address_wire_format",
-    );
     // SHA-224 independently checked with OpenSSL, not the production codec.
     let auth = TrojanAuth::new("password").unwrap();
     let destination = Destination::domain("example.com", 443).unwrap();
@@ -24,11 +19,6 @@ fn request_matches_the_official_sha224_and_socks_address_wire_format() {
 
 #[test]
 fn authentication_and_requests_are_strict_and_never_debug_credentials() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "TROJAN-CODEC",
-        "authentication_and_requests_are_strict_and_never_debug_credentials",
-    );
     assert!(TrojanAuth::new("").is_err());
     let auth = TrojanAuth::new(" password ").unwrap();
     let plain = TrojanAuth::new("password").unwrap();
@@ -55,11 +45,6 @@ fn authentication_and_requests_are_strict_and_never_debug_credentials() {
 
 #[tokio::test]
 async fn invalid_truncated_and_oversized_frames_fail_closed_without_payload_leaks() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "TROJAN-CODEC",
-        "invalid_truncated_and_oversized_frames_fail_closed_without_payload_leaks",
-    );
     use tokio::io::AsyncWriteExt;
     use vole::{
         dispatch::{DatagramBudget, DatagramTransport},
@@ -87,11 +72,6 @@ async fn invalid_truncated_and_oversized_frames_fail_closed_without_payload_leak
 
 #[tokio::test]
 async fn datagram_limits_preserve_messages_and_drain_over_budget_responses() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "TROJAN-CODEC",
-        "datagram_limits_preserve_messages_and_drain_over_budget_responses",
-    );
     use bytes::Bytes;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use vole::{
@@ -140,11 +120,6 @@ async fn datagram_limits_preserve_messages_and_drain_over_budget_responses() {
 
 #[tokio::test]
 async fn datagram_sends_one_frame_and_receives_fragmented_consecutive_frames() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "TROJAN-CODEC",
-        "datagram_sends_one_frame_and_receives_fragmented_consecutive_frames",
-    );
     use bytes::Bytes;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use vole::{
@@ -185,11 +160,6 @@ async fn datagram_sends_one_frame_and_receives_fragmented_consecutive_frames() {
 
 #[tokio::test]
 async fn cancelled_receive_preserves_partial_frames_and_does_not_block_send() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "TROJAN-CODEC",
-        "cancelled_receive_preserves_partial_frames_and_does_not_block_send",
-    );
     use bytes::Bytes;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use vole::{
@@ -229,11 +199,6 @@ async fn cancelled_receive_preserves_partial_frames_and_does_not_block_send() {
 
 #[tokio::test]
 async fn cancelled_partial_send_poison_closes_without_replaying_or_waiting() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "TROJAN-CODEC",
-        "cancelled_partial_send_poison_closes_without_replaying_or_waiting",
-    );
     use bytes::Bytes;
     use tokio::io::AsyncReadExt;
     use vole::{
@@ -262,4 +227,77 @@ async fn cancelled_partial_send_poison_closes_without_replaying_or_waiting() {
     assert_eq!(remaining, [1]);
     transport.close().await.unwrap();
     transport.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn receive_future_keeps_packet_scratch_out_of_its_dynamic_frame() {
+    use std::{
+        future::poll_fn,
+        io,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use vole::{
+        dispatch::{DatagramBudget, DatagramTransport},
+        outbound::trojan::TrojanDatagram,
+    };
+
+    struct PendingRead {
+        capacity: Arc<AtomicUsize>,
+    }
+    impl AsyncRead for PendingRead {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.capacity.store(output.remaining(), Ordering::Relaxed);
+            Poll::Pending
+        }
+    }
+    impl AsyncWrite for PendingRead {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            input: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(input.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let capacity = Arc::new(AtomicUsize::new(0));
+    let mut transport = TrojanDatagram::new(
+        Box::new(PendingRead {
+            capacity: capacity.clone(),
+        }),
+        DatagramBudget::new(8192, 8192),
+    );
+    let mut receive = transport.receive();
+    // Query the concrete async_trait future through its dynamic vtable, not
+    // the size of the Box/Pin pointer. The resource threshold is not a wire bug.
+    let frame_bytes = std::mem::size_of_val(receive.as_ref().get_ref());
+    poll_fn(|cx| {
+        assert!(receive.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(receive);
+    transport.close().await.unwrap();
+    assert!(transport.receive().await.is_err());
+    assert_eq!(capacity.load(Ordering::Relaxed), 2048);
+    assert!(
+        frame_bytes < 2048,
+        "TROJAN_RECEIVE_FUTURE_SCRATCH_FOOTPRINT: {frame_bytes}"
+    );
 }

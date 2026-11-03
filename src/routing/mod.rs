@@ -1,19 +1,35 @@
-//! Allocation-free runtime matching for Vole routing rules.
+//! Bounded runtime matching for Vole routing rules.
 //!
 //! Rule parsing and structural validation belong to [`crate::config`]. This
 //! module performs a second, deliberately small compilation step: textual
 //! match values are normalized once and the resulting ordered rule set can be
 //! evaluated without allocating for each rule.
 
-use std::{fmt, net::IpAddr, sync::Arc};
-
-use crate::{
-    config::{IpCidr, Network, RuleAction, RuleKind, RuleSpec},
-    session::Destination,
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
 };
 
+use crate::{
+    config::{IpCidr, Network, RuleAction, RuleKind, RuleSpec, RuntimeRuleProgram},
+    session::{Destination, InboundKind, InboundMetadata},
+};
+
+mod program;
+mod rematch;
+mod rule_disable;
+use program::CompiledProgram;
+pub(crate) use program::{ProgramEvaluation, RuleTargetEffect};
+pub(crate) use rematch::RematchTargets;
+mod balance;
+pub(super) mod datagram_ready;
+mod selection;
+pub(crate) use selection::GroupSelection;
+
+pub(crate) mod diagnostics;
 mod dispatcher;
-mod proxy_group;
+pub(crate) mod proxy_group;
 
 pub(crate) use dispatcher::RouteTargetDispatchers;
 pub use dispatcher::{ProxyDispatchers, RoutingDispatcher};
@@ -27,18 +43,40 @@ pub const MAX_ROUTING_RULES: usize = crate::config::MAX_RULES;
 pub const MAX_RULE_TEXT_BYTES: usize = crate::config::MAX_RULES_TOTAL_BYTES;
 
 /// A prepared routing context. Domain normalization happens only while this
-/// value is built; matching the context does not allocate.
+/// value is built; clones and lazy-DNS continuations share its execution budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingContext {
     network: Network,
     destination_port: u16,
-    normalized_domain: Option<Box<str>>,
+    source_ip: Option<IpAddr>,
+    source_port: u16,
+    inbound: InboundKind,
+    selector_metadata: bool,
+    metadata: InboundMetadata,
+    process: Option<crate::process::Identity>,
+    process_lookup_enabled: bool,
+    normalized_domain: Option<Arc<str>>,
+    rematch_name: Option<Arc<str>>,
     destination_ip: Option<IpAddr>,
     pinned_ip: Option<IpAddr>,
     ip_resolution_unavailable: bool,
+    decision: crate::config::RuleDecision,
 }
 
 impl RoutingContext {
+    pub(crate) fn with_decision(mut self, decision: &crate::config::RuleDecision) -> Self {
+        self.decision = decision.clone();
+        self
+    }
+    pub(crate) fn decision(&self) -> &crate::config::RuleDecision {
+        &self.decision
+    }
+    pub(crate) fn set_sniffed_domain(&mut self, host: &str) {
+        if let Ok(host) = normalize_domain_name(host) {
+            self.normalized_domain = Some(Arc::from(host));
+        }
+    }
+
     /// Builds a context from the original destination without a redir-host
     /// domain hint.
     pub fn new(network: Network, destination: &Destination) -> Result<Self, DomainNameError> {
@@ -55,7 +93,7 @@ impl RoutingContext {
     ) -> Result<Self, DomainNameError> {
         let (normalized_domain, destination_ip) = match destination {
             Destination::Domain { host, .. } => {
-                (Some(normalize_domain_name(host)?.into_boxed_str()), None)
+                (Some(Arc::from(normalize_domain_name(host)?)), None)
             }
             Destination::Ip(address) => (
                 domain_hint
@@ -65,7 +103,7 @@ impl RoutingContext {
                     // contain `_`), so an unusable hint must not turn the
                     // literal IP itself into an unreachable destination.
                     .and_then(|hint| normalize_domain_name(hint).ok())
-                    .map(String::into_boxed_str),
+                    .map(Arc::from),
                 Some(address.ip()),
             ),
         };
@@ -73,11 +111,91 @@ impl RoutingContext {
         Ok(Self {
             network,
             destination_port: destination.port(),
+            source_ip: None,
+            source_port: 0,
+            inbound: InboundKind::InternalDns,
+            selector_metadata: false,
+            metadata: InboundMetadata::new(0),
+            process: None,
+            process_lookup_enabled: false,
             normalized_domain,
+            rematch_name: None,
             destination_ip,
             pinned_ip: None,
             ip_resolution_unavailable: false,
+            decision: Default::default(),
         })
+    }
+
+    pub(crate) fn disable_ip_resolution(&mut self) {
+        self.ip_resolution_unavailable = true;
+    }
+
+    pub fn set_source(&mut self, source: SocketAddr) {
+        self.source_ip = Some(source.ip());
+        self.source_port = source.port();
+    }
+
+    pub(crate) fn set_inbound(&mut self, kind: InboundKind, metadata: &InboundMetadata) {
+        self.inbound = kind;
+        self.selector_metadata = false;
+        self.metadata = metadata.clone();
+    }
+
+    fn inbound_name(&self) -> &'static str {
+        if self.selector_metadata {
+            return "";
+        }
+        match self.inbound {
+            InboundKind::Tun => "DEFAULT-TUN",
+            InboundKind::Http | InboundKind::Https | InboundKind::Socks5 => "DEFAULT-MIXED",
+            InboundKind::InternalDns
+            | InboundKind::InternalGeoData
+            | InboundKind::InternalMeasure => "",
+        }
+    }
+
+    /// A reference selector receives only Host or DstIP. Other fields keep the
+    /// zero values of Mihomo Metadata (TCP/HTTP, port 0 and no ingress name).
+    /// It is not a business HTTP connection and must never acquire an identity.
+    pub(crate) fn selector(destination: &Destination) -> Result<Self, DomainNameError> {
+        let mut context = Self::new(Network::Tcp, destination)?;
+        context.destination_port = 0;
+        context.inbound = InboundKind::Http;
+        context.selector_metadata = true;
+        context.disable_ip_resolution();
+        Ok(context)
+    }
+    pub(crate) fn source_ip(&self) -> Option<IpAddr> {
+        self.source_ip
+    }
+    pub(crate) fn authenticated_user(&self) -> Option<&str> {
+        self.metadata.user.as_deref()
+    }
+    pub(crate) fn enable_process_lookup(&mut self, enabled: bool) {
+        self.process_lookup_enabled = enabled;
+    }
+    pub(crate) fn set_process(&mut self, identity: crate::process::Identity) {
+        self.process = Some(identity);
+    }
+    pub(crate) fn process(&self) -> Option<&crate::process::Identity> {
+        self.process.as_ref()
+    }
+    fn process_identity(&self) -> Result<Option<&crate::process::Identity>, PredicateFailure> {
+        match &self.process {
+            Some(identity) => Ok(Some(identity)),
+            None if self.process_lookup_enabled => Err(PredicateFailure::NeedsProcessLookup),
+            None => Ok(None),
+        }
+    }
+    /// A local rule-provider view only. Host and ingress identity are unchanged.
+    pub(crate) fn swap_source_destination(&mut self) {
+        let source = self.source_ip;
+        self.source_ip = self.effective_ip();
+        self.destination_ip = source;
+        self.pinned_ip = None;
+        std::mem::swap(&mut self.source_port, &mut self.destination_port);
+        self.disable_ip_resolution();
     }
 
     #[must_use]
@@ -120,7 +238,7 @@ impl RoutingContext {
     }
 
     #[must_use]
-    fn should_request_ip_resolution(&self) -> bool {
+    pub(crate) fn should_request_ip_resolution(&self) -> bool {
         self.destination_ip.is_none() && self.pinned_ip.is_none() && !self.ip_resolution_unavailable
     }
 }
@@ -211,7 +329,23 @@ pub trait GeoMatcher: Send + Sync {
         true
     }
 
+    fn asn_available(&self) -> bool {
+        false
+    }
+    fn matches_asn(&self, _payload: &str, _address: IpAddr) -> bool {
+        false
+    }
+
     fn matches_geosite(&self, code: &str, domain: &str) -> bool;
+    fn matches_geosite_bounded(
+        &self,
+        code: &str,
+        domain: &str,
+        decision: &crate::config::RuleDecision,
+    ) -> Result<bool, crate::config::MatchFailure> {
+        decision.visit()?;
+        Ok(self.matches_geosite(code, domain))
+    }
     fn matches_geoip(&self, code: &str, address: IpAddr) -> bool;
 }
 
@@ -248,12 +382,17 @@ pub struct RuleMatch {
 pub enum RuleEvaluation {
     Matched(RuleMatch),
     NeedsIpResolution { rule_index: usize },
+    NeedsProcessLookup { rule_index: usize },
     NoMatch,
+    Failed(crate::config::MatchFailure),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleSetError {
-    Empty,
+    InvalidProgram,
+    InvalidInboundRule {
+        rule_index: usize,
+    },
     TooManyRules {
         count: usize,
         maximum: usize,
@@ -278,16 +417,16 @@ pub enum RuleSetError {
     InvalidPortRange {
         rule_index: usize,
     },
-    MatchNotFinal {
-        rule_index: usize,
-    },
-    MissingFinalMatch,
 }
 
 impl fmt::Display for RuleSetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Empty => formatter.write_str("routing rules are empty"),
+            Self::InvalidProgram => formatter.write_str("invalid sub-rule program graph"),
+            Self::InvalidInboundRule { rule_index } => write!(
+                formatter,
+                "routing rule {rule_index} has an invalid inbound predicate"
+            ),
             Self::TooManyRules { count, maximum } => {
                 write!(formatter, "routing rule count {count} exceeds {maximum}")
             }
@@ -324,10 +463,6 @@ impl fmt::Display for RuleSetError {
                     "routing rule {rule_index} has an invalid destination port"
                 )
             }
-            Self::MatchNotFinal { rule_index } => {
-                write!(formatter, "MATCH rule {rule_index} is not the final rule")
-            }
-            Self::MissingFinalMatch => formatter.write_str("routing rules do not end in MATCH"),
         }
     }
 }
@@ -337,116 +472,84 @@ impl std::error::Error for RuleSetError {}
 /// An immutable ordered rule set.
 #[derive(Debug, Clone)]
 pub struct RuleSet {
-    rules: Box<[RuleSpec]>,
-    uses_domain_routing: bool,
+    graph: Arc<CompiledProgram>,
+    filter_udp: bool,
 }
 
 impl RuleSet {
     /// Validates and normalizes the ordered rules. This is the only rule-set
-    /// construction path that allocates.
-    pub fn compile(mut rules: Vec<RuleSpec>) -> Result<Self, RuleSetError> {
-        if rules.is_empty() {
-            return Err(RuleSetError::Empty);
-        }
-        if rules.len() > MAX_ROUTING_RULES {
+    /// construction path that allocates during normal routing. Controller
+    /// switches may publish their own bounded snapshot separately.
+    pub fn compile(program: impl Into<RuntimeRuleProgram>) -> Result<Self, RuleSetError> {
+        let mut program = program.into();
+        let count = program
+            .sub_rules
+            .iter()
+            .fold(program.main.len(), |count, sub| {
+                count.saturating_add(sub.rules.len())
+            });
+        if count > MAX_ROUTING_RULES {
             return Err(RuleSetError::TooManyRules {
-                count: rules.len(),
+                count,
                 maximum: MAX_ROUTING_RULES,
             });
         }
-
-        let final_index = rules.len() - 1;
-        let mut text_bytes = 0_usize;
+        let mut text_bytes = 0;
         let mut uses_domain_routing = false;
-        for (index, rule) in rules.iter_mut().enumerate() {
-            uses_domain_routing |= matches!(
-                &rule.kind,
-                RuleKind::Domain(_)
-                    | RuleKind::DomainSuffix(_)
-                    | RuleKind::DomainKeyword(_)
-                    | RuleKind::GeoSite(_)
-            );
-            match &mut rule.kind {
-                RuleKind::Domain(value) | RuleKind::DomainSuffix(value) => {
-                    *value = normalize_domain_name(value).map_err(|source| {
-                        RuleSetError::InvalidDomain {
-                            rule_index: index,
-                            source,
-                        }
-                    })?;
-                    text_bytes = checked_text_bytes(text_bytes, value.len())?;
-                }
-                RuleKind::DomainKeyword(value) => {
-                    if value.is_empty() || !value.is_ascii() {
-                        return Err(RuleSetError::InvalidKeyword { rule_index: index });
-                    }
-                    value.make_ascii_lowercase();
-                    text_bytes = checked_text_bytes(text_bytes, value.len())?;
-                }
-                RuleKind::GeoSite(selector) => {
-                    *selector = crate::geodata::normalize_selector(
-                        crate::geodata::GeoDataKind::GeoSite,
-                        selector,
-                    )
-                    .map_err(|_| RuleSetError::InvalidGeoCode { rule_index: index })?;
-                    text_bytes = checked_text_bytes(text_bytes, selector.len())?;
-                }
-                RuleKind::GeoIp(selector) => {
-                    *selector = crate::geodata::normalize_selector(
-                        crate::geodata::GeoDataKind::GeoIp,
-                        selector,
-                    )
-                    .map_err(|_| RuleSetError::InvalidGeoCode { rule_index: index })?;
-                    text_bytes = checked_text_bytes(text_bytes, selector.len())?;
-                }
-                RuleKind::IpCidr(cidr) => {
-                    if !valid_cidr(cidr) {
-                        return Err(RuleSetError::InvalidCidr { rule_index: index });
-                    }
-                }
-                RuleKind::DstPorts(ranges) => {
-                    if ranges.is_empty()
-                        || ranges
-                            .iter()
-                            .any(|range| range.start == 0 || range.start > range.end)
-                    {
-                        return Err(RuleSetError::InvalidPortRange { rule_index: index });
-                    }
-                }
-                RuleKind::Network(_) => {}
-                RuleKind::Match => {
-                    if index != final_index {
-                        return Err(RuleSetError::MatchNotFinal { rule_index: index });
-                    }
-                }
-            }
+        for sub in &program.sub_rules {
+            text_bytes = checked_text_bytes(text_bytes, sub.name.len())?;
         }
-
-        if !matches!(rules.last().map(|rule| &rule.kind), Some(RuleKind::Match)) {
-            return Err(RuleSetError::MissingFinalMatch);
+        for (index, rule) in program
+            .main
+            .iter_mut()
+            .chain(program.sub_rules.iter_mut().flat_map(|sub| &mut sub.rules))
+            .enumerate()
+        {
+            normalize_rule(rule, index, 0, &mut text_bytes, &mut uses_domain_routing)?;
         }
-
+        crate::config::rules::validate_subrule_calls(&program.main, &program.sub_rules)
+            .map_err(|_| RuleSetError::InvalidProgram)?;
         Ok(Self {
-            rules: rules.into_boxed_slice(),
-            uses_domain_routing,
+            graph: Arc::new(CompiledProgram {
+                disabled: Arc::new(rule_disable::RuleDisable::new(program.main.len())),
+                main: program.main.into_boxed_slice(),
+                sub_rules: program.sub_rules.into_boxed_slice(),
+                uses_domain_routing,
+            }),
+            filter_udp: true,
         })
+    }
+
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn compile_config(config: &mut crate::config::Config) -> Result<Self, RuleSetError> {
+        let mut rules = Self::compile(config.take_runtime_rules())?;
+        rules.filter_udp = config.mode == crate::config::Mode::Rule;
+        Ok(rules)
+    }
+
+    pub(crate) fn disable_state(&self) -> &Arc<rule_disable::RuleDisable> {
+        &self.graph.disabled
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.rules.len()
+        self.graph.main.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+        self.graph.main.is_empty()
+    }
+
+    pub(crate) const fn filters_udp(&self) -> bool {
+        self.filter_udp
     }
 
     /// Whether an IP-based TUN flow can benefit from a sniffed or DNS-derived
     /// domain routing hint.
     #[must_use]
-    pub const fn uses_domain_routing(&self) -> bool {
-        self.uses_domain_routing
+    pub fn uses_domain_routing(&self) -> bool {
+        self.graph.uses_domain_routing
     }
 
     /// Exposes one immutable compiled rule so the asynchronous router can
@@ -454,7 +557,7 @@ impl RuleSet {
     /// [`RuleEvaluation::NeedsIpResolution`].
     #[must_use]
     pub fn rule(&self, index: usize) -> Option<&RuleSpec> {
-        self.rules.get(index)
+        self.graph.main.get(index)
     }
 
     /// Evaluates with no loaded GeoData. GEOSITE and GEOIP never match.
@@ -463,69 +566,53 @@ impl RuleSet {
         self.evaluate_with_geo(context, &EmptyGeoMatcher)
     }
 
-    /// Evaluates from top to bottom and stops at the first match. Rule traversal
-    /// does not allocate; GeoSite regexes may allocate internal search caches.
+    /// Evaluates from top to bottom and stops at the first match. Regular-expression
+    /// engines may allocate internal search state; execution failure is explicit.
     #[must_use]
     pub fn evaluate_with_geo(
         &self,
         context: &RoutingContext,
         geo_matcher: &dyn GeoMatcher,
     ) -> RuleEvaluation {
-        for (index, rule) in self.rules.iter().enumerate() {
-            let matched = match &rule.kind {
-                RuleKind::Domain(expected) => context.domain() == Some(expected.as_str()),
-                RuleKind::DomainSuffix(suffix) => context
-                    .domain()
-                    .is_some_and(|domain| domain_suffix_matches(domain, suffix)),
-                RuleKind::DomainKeyword(keyword) => context
-                    .domain()
-                    .is_some_and(|domain| domain.contains(keyword)),
-                RuleKind::GeoSite(code) => {
-                    geo_matcher.geosite_available(code)
-                        && context
-                            .domain()
-                            .is_some_and(|domain| geo_matcher.matches_geosite(code, domain))
-                }
-                RuleKind::GeoIp(code) => {
-                    if !geo_matcher.geoip_available(code) {
-                        false
-                    } else if let Some(address) = context.effective_ip() {
-                        geo_matcher.matches_geoip(code, address)
-                    } else if !rule.no_resolve && context.should_request_ip_resolution() {
-                        return RuleEvaluation::NeedsIpResolution { rule_index: index };
-                    } else {
-                        false
-                    }
-                }
-                RuleKind::IpCidr(cidr) => {
-                    if let Some(address) = context.effective_ip() {
-                        cidr_contains(cidr, address)
-                    } else if !rule.no_resolve && context.should_request_ip_resolution() {
-                        return RuleEvaluation::NeedsIpResolution { rule_index: index };
-                    } else {
-                        false
-                    }
-                }
-                RuleKind::DstPorts(ranges) => ranges.iter().any(|range| {
-                    range.start <= context.destination_port && context.destination_port <= range.end
-                }),
-                RuleKind::Network(network) => *network == context.network,
-                RuleKind::Match => true,
-            };
+        self.evaluate_with_egress(context, geo_matcher, |_| true)
+    }
 
-            if matched {
-                return RuleEvaluation::Matched(RuleMatch {
-                    action: rule.action,
-                    rule_index: index,
-                });
-            }
-        }
-        RuleEvaluation::NoMatch
+    pub(crate) fn evaluate_with_egress(
+        &self,
+        context: &RoutingContext,
+        geo: &dyn GeoMatcher,
+        supports_udp: impl Fn(RuleAction) -> bool,
+    ) -> RuleEvaluation {
+        self.evaluate_program(
+            &mut context.clone(),
+            geo,
+            None,
+            None,
+            |action, candidate| {
+                if self.accepts_egress(candidate, action, &supports_udp) {
+                    RuleTargetEffect::Accept
+                } else {
+                    RuleTargetEffect::Skip
+                }
+            },
+        )
+        .into_public()
+    }
+
+    pub(crate) fn all_rules(&self) -> impl Iterator<Item = &RuleSpec> {
+        self.graph
+            .main
+            .iter()
+            .chain(self.graph.sub_rules.iter().flat_map(|sub| &sub.rules))
+    }
+    pub(crate) fn subrule_name(&self, id: crate::config::SubRuleId) -> &str {
+        &self.graph.sub_rules[id.index()].name
     }
 
     /// Continues evaluation at the IP rule which requested a bounded
     /// runtime-DNS result. Rules before `resolution_rule_index` have already
-    /// failed and are not revisited. This matches Mihomo's `no-resolve`
+    /// failed and are not revisited. Retain the original context to share the
+    /// remaining execution budget across this continuation. This matches Mihomo's `no-resolve`
     /// semantics: the flag prevents a rule from initiating DNS, while later
     /// `no-resolve` rules may still consume an address resolved by an earlier
     /// rule.
@@ -546,61 +633,375 @@ impl RuleSet {
         resolution_rule_index: usize,
         addresses: &[IpAddr],
     ) -> RuleEvaluation {
-        for (index, rule) in self.rules.iter().enumerate().skip(resolution_rule_index) {
-            let mut selected_address = None;
-            let matched = match &rule.kind {
-                RuleKind::Domain(expected) => context.domain() == Some(expected.as_str()),
-                RuleKind::DomainSuffix(suffix) => context
-                    .domain()
-                    .is_some_and(|domain| domain_suffix_matches(domain, suffix)),
-                RuleKind::DomainKeyword(keyword) => context
-                    .domain()
-                    .is_some_and(|domain| domain.contains(keyword)),
-                RuleKind::GeoSite(code) => {
-                    geo_matcher.geosite_available(code)
-                        && context
-                            .domain()
-                            .is_some_and(|domain| geo_matcher.matches_geosite(code, domain))
-                }
-                RuleKind::GeoIp(code) => {
-                    if !geo_matcher.geoip_available(code) {
-                        false
-                    } else if let Some(address) = context.effective_ip() {
-                        geo_matcher.matches_geoip(code, address)
-                    } else {
-                        selected_address = preferred_addresses(addresses)
-                            .find(|address| geo_matcher.matches_geoip(code, *address));
-                        selected_address.is_some()
-                    }
-                }
-                RuleKind::IpCidr(cidr) => {
-                    if let Some(address) = context.effective_ip() {
-                        cidr_contains(cidr, address)
-                    } else {
-                        selected_address = preferred_addresses(addresses)
-                            .find(|address| cidr_contains(cidr, *address));
-                        selected_address.is_some()
-                    }
-                }
-                RuleKind::DstPorts(ranges) => ranges.iter().any(|range| {
-                    range.start <= context.destination_port && context.destination_port <= range.end
-                }),
-                RuleKind::Network(network) => *network == context.network,
-                RuleKind::Match => true,
-            };
+        self.evaluate_with_resolved_egress(
+            context,
+            geo_matcher,
+            resolution_rule_index,
+            addresses,
+            |_| true,
+        )
+    }
 
-            if matched {
-                if let Some(address) = selected_address {
-                    context.pin_ip(address);
-                }
-                return RuleEvaluation::Matched(RuleMatch {
-                    action: rule.action,
+    pub(crate) fn evaluate_with_resolved_egress(
+        &self,
+        context: &mut RoutingContext,
+        geo: &dyn GeoMatcher,
+        index: usize,
+        addresses: &[IpAddr],
+        supports_udp: impl Fn(RuleAction) -> bool,
+    ) -> RuleEvaluation {
+        self.flat_resolved(context, geo, index, addresses, |action, candidate| {
+            if self.accepts_egress(candidate, action, &supports_udp) {
+                RuleTargetEffect::Accept
+            } else {
+                RuleTargetEffect::Skip
+            }
+        })
+    }
+
+    fn accepts_egress(
+        &self,
+        context: &RoutingContext,
+        action: RuleAction,
+        supports_udp: &impl Fn(RuleAction) -> bool,
+    ) -> bool {
+        !self.filter_udp || context.network != Network::Udp || supports_udp(action)
+    }
+}
+
+fn normalize_rule(
+    rule: &mut RuleSpec,
+    index: usize,
+    depth: usize,
+    bytes: &mut usize,
+    domain: &mut bool,
+) -> Result<(), RuleSetError> {
+    if depth > 32 {
+        return Err(RuleSetError::TooManyRules {
+            count: depth,
+            maximum: 32,
+        });
+    }
+    match &mut rule.kind {
+        RuleKind::RuleSet { content, .. } => {
+            *domain |= content.as_ref().is_some_and(|set| set.uses_domain());
+        }
+        RuleKind::Domain(value) | RuleKind::DomainSuffix(value) => {
+            *value =
+                normalize_domain_name(value).map_err(|source| RuleSetError::InvalidDomain {
                     rule_index: index,
-                });
+                    source,
+                })?;
+            *bytes = checked_text_bytes(*bytes, value.len())?;
+            *domain = true;
+        }
+        RuleKind::DomainKeyword(value) | RuleKind::DomainWildcard(value) => {
+            if value.is_empty() {
+                return Err(RuleSetError::InvalidKeyword { rule_index: index });
+            }
+            value.make_ascii_lowercase();
+            *bytes = checked_text_bytes(*bytes, value.len())?;
+            *domain = true;
+        }
+        RuleKind::DomainRegex(value) => {
+            *bytes = checked_text_bytes(*bytes, value.as_str().len())?;
+            *domain = true;
+        }
+        RuleKind::GeoSite(value) => {
+            *value =
+                crate::geodata::normalize_selector(crate::geodata::GeoDataKind::GeoSite, value)
+                    .map_err(|_| RuleSetError::InvalidGeoCode { rule_index: index })?;
+            *bytes = checked_text_bytes(*bytes, value.len())?;
+            *domain = true;
+        }
+        RuleKind::GeoIp(value) | RuleKind::SrcGeoIp(value) => {
+            *value = crate::geodata::normalize_selector(crate::geodata::GeoDataKind::GeoIp, value)
+                .map_err(|_| RuleSetError::InvalidGeoCode { rule_index: index })?;
+            *bytes = checked_text_bytes(*bytes, value.len())?;
+        }
+        RuleKind::IpAsn(value) | RuleKind::SrcIpAsn(value) => {
+            *bytes = checked_text_bytes(*bytes, value.len())?;
+        }
+        RuleKind::IpSuffix(value) | RuleKind::SrcIpSuffix(value) => {
+            *bytes = checked_text_bytes(*bytes, value.as_str().len())?;
+        }
+        RuleKind::IpCidr(cidr) | RuleKind::SrcIpCidr(cidr) => {
+            if !valid_cidr(cidr) {
+                return Err(RuleSetError::InvalidCidr { rule_index: index });
             }
         }
-        RuleEvaluation::NoMatch
+        RuleKind::DstPorts(ranges) | RuleKind::SrcPorts(ranges) | RuleKind::InPorts(ranges) => {
+            if ranges.is_empty()
+                || ranges.len() > 28
+                || ranges.iter().any(|range| range.start > range.end)
+            {
+                return Err(RuleSetError::InvalidPortRange { rule_index: index });
+            }
+        }
+        RuleKind::InNames(users) | RuleKind::InUsers(users) | RuleKind::RematchNames(users) => {
+            if users.is_empty() || users.iter().any(|user| user.is_empty()) {
+                return Err(RuleSetError::InvalidInboundRule { rule_index: index });
+            }
+            for user in users {
+                *bytes = checked_text_bytes(*bytes, user.len())?;
+            }
+        }
+        RuleKind::Process(value) => {
+            *bytes = checked_text_bytes(*bytes, value.pattern.len())?;
+        }
+        RuleKind::Uid(ranges) => {
+            if ranges.is_empty()
+                || ranges.len() > 28
+                || ranges.iter().any(|range| range.start > range.end)
+            {
+                return Err(RuleSetError::InvalidInboundRule { rule_index: index });
+            }
+        }
+        RuleKind::InTypes(types) => {
+            if types.is_empty() {
+                return Err(RuleSetError::InvalidInboundRule { rule_index: index });
+            }
+            for kind in types {
+                *bytes = checked_text_bytes(*bytes, kind.name().len())?;
+            }
+        }
+        RuleKind::And(children) | RuleKind::Or(children) => {
+            for child in children {
+                normalize_rule(child, index, depth + 1, bytes, domain)?;
+            }
+        }
+        RuleKind::Not(child) => normalize_rule(child, index, depth + 1, bytes, domain)?,
+        RuleKind::Flow { predicate, .. } | RuleKind::SubRule { predicate, .. } => {
+            normalize_rule(predicate, index, depth, bytes, domain)?
+        }
+        RuleKind::Network(_) | RuleKind::Match => {}
     }
+    Ok(())
+}
+
+pub(crate) fn uses_destination_ip(rule: &RuleSpec) -> bool {
+    match &rule.kind {
+        RuleKind::RuleSet {
+            content, source, ..
+        } => !source && content.as_ref().is_some_and(|set| set.uses_ip()),
+        RuleKind::IpCidr(_) | RuleKind::IpSuffix(_) | RuleKind::GeoIp(_) | RuleKind::IpAsn(_) => {
+            true
+        }
+        RuleKind::And(children) | RuleKind::Or(children) => {
+            children.iter().any(uses_destination_ip)
+        }
+        RuleKind::Not(child)
+        | RuleKind::Flow {
+            predicate: child, ..
+        }
+        | RuleKind::SubRule {
+            predicate: child, ..
+        } => uses_destination_ip(child),
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PredicateFailure {
+    NeedsIpResolution,
+    NeedsProcessLookup,
+    Evaluation(crate::config::MatchFailure),
+}
+impl From<crate::config::MatchFailure> for PredicateFailure {
+    fn from(error: crate::config::MatchFailure) -> Self {
+        Self::Evaluation(error)
+    }
+}
+
+// NeedsIpResolution means this exact traversal requires one lazy DNS resolution. Short
+// circuiting keeps later IP predicates from triggering unnecessary queries.
+pub(crate) fn matches_rule(
+    rule: &RuleSpec,
+    context: &RoutingContext,
+    geo: &dyn GeoMatcher,
+) -> Result<bool, PredicateFailure> {
+    context.decision.visit()?;
+    let port_matches = |ranges: &[crate::config::PortRange], port| {
+        ranges
+            .iter()
+            .any(|range| range.start <= port && port <= range.end)
+    };
+    Ok(match &rule.kind {
+        RuleKind::RuleSet {
+            content, source, ..
+        } => match content {
+            Some(set) => set.matches(context, geo, rule.no_resolve, *source)?,
+            None => false,
+        },
+        RuleKind::Domain(value) => context.domain() == Some(value.as_str()),
+        RuleKind::DomainSuffix(value) => context
+            .domain()
+            .is_some_and(|domain| domain_suffix_matches(domain, value)),
+        RuleKind::DomainKeyword(value) => context
+            .domain()
+            .is_some_and(|domain| domain.contains(value)),
+        RuleKind::DomainWildcard(value) => context
+            .domain()
+            .is_some_and(|domain| wildcard_matches(value, domain)),
+        RuleKind::DomainRegex(value) => match context.domain() {
+            Some(domain) => value.is_match(domain, &context.decision)?,
+            None => false,
+        },
+        RuleKind::GeoSite(code) => {
+            if geo.geosite_available(code)
+                && let Some(domain) = context.domain()
+            {
+                geo.matches_geosite_bounded(code, domain, &context.decision)?
+            } else {
+                false
+            }
+        }
+        RuleKind::GeoIp(code) => {
+            if !geoip_available(geo, code) {
+                false
+            } else if let Some(address) = context.effective_ip() {
+                matches_geoip(geo, code, address)
+            } else if !rule.no_resolve && context.should_request_ip_resolution() {
+                return Err(PredicateFailure::NeedsIpResolution);
+            } else {
+                false
+            }
+        }
+        RuleKind::IpAsn(payload) => {
+            if !geo.asn_available() {
+                false
+            } else if let Some(address) = context.effective_ip() {
+                geo.matches_asn(payload, address)
+            } else if !rule.no_resolve && context.should_request_ip_resolution() {
+                return Err(PredicateFailure::NeedsIpResolution);
+            } else {
+                false
+            }
+        }
+        RuleKind::SrcIpAsn(payload) => {
+            geo.asn_available()
+                && context
+                    .source_ip
+                    .is_some_and(|address| geo.matches_asn(payload, address))
+        }
+        RuleKind::IpCidr(cidr) => {
+            if let Some(address) = context.effective_ip() {
+                cidr_contains(cidr, address)
+            } else if !rule.no_resolve && context.should_request_ip_resolution() {
+                return Err(PredicateFailure::NeedsIpResolution);
+            } else {
+                false
+            }
+        }
+        RuleKind::IpSuffix(value) => {
+            if let Some(address) = context.effective_ip() {
+                value.matches(address)
+            } else if !rule.no_resolve && context.should_request_ip_resolution() {
+                return Err(PredicateFailure::NeedsIpResolution);
+            } else {
+                false
+            }
+        }
+        RuleKind::SrcIpSuffix(value) => context
+            .source_ip
+            .is_some_and(|address| value.matches(address)),
+        RuleKind::SrcGeoIp(code) => {
+            geoip_available(geo, code)
+                && context
+                    .source_ip
+                    .is_some_and(|address| matches_geoip(geo, code, address))
+        }
+        RuleKind::SrcIpCidr(cidr) => context.source_ip.is_some_and(|ip| cidr_contains(cidr, ip)),
+        RuleKind::SrcPorts(ranges) => port_matches(ranges, context.source_port),
+        RuleKind::InTypes(types) => types.contains(&crate::config::RuleInboundType::for_inbound(
+            context.inbound,
+        )),
+        RuleKind::InNames(names) => names.iter().any(|name| name == context.inbound_name()),
+        RuleKind::InUsers(users) => context
+            .authenticated_user()
+            .is_some_and(|user| users.iter().any(|expected| expected == user)),
+        RuleKind::Process(rule) => match context.process_identity()? {
+            Some(identity) => match match rule.field {
+                crate::config::ProcessField::Name => identity.name.as_deref(),
+                crate::config::ProcessField::Path => identity.path.as_deref(),
+            } {
+                Some(value) => rule.matches(value, context.decision())?,
+                None => false,
+            },
+            None => false,
+        },
+        RuleKind::Uid(ranges) => context
+            .process_identity()?
+            .and_then(|identity| identity.uid)
+            .filter(|uid| *uid != 0)
+            .is_some_and(|uid| {
+                ranges
+                    .iter()
+                    .any(|range| range.start <= uid && uid <= range.end)
+            }),
+        RuleKind::InPorts(ranges) => port_matches(ranges, context.metadata.local_port),
+        RuleKind::DstPorts(ranges) => port_matches(ranges, context.destination_port),
+        RuleKind::Network(network) => *network == context.network,
+        RuleKind::And(children) => {
+            for child in children {
+                if !matches_rule(child, context, geo)? {
+                    return Ok(false);
+                }
+            }
+            true
+        }
+        RuleKind::Or(children) => {
+            for child in children {
+                if matches_rule(child, context, geo)? {
+                    return Ok(true);
+                }
+            }
+            false
+        }
+        RuleKind::Not(child) => !matches_rule(child, context, geo)?,
+        RuleKind::RematchNames(names) => context
+            .rematch_name
+            .as_deref()
+            .is_some_and(|mark| names.iter().any(|name| name == mark)),
+        RuleKind::Match => true,
+        RuleKind::Flow { predicate, .. } | RuleKind::SubRule { predicate, .. } => {
+            matches_rule(predicate, context, geo)?
+        }
+    })
+}
+
+fn geoip_available(geo: &dyn GeoMatcher, code: &str) -> bool {
+    crate::geodata::lan_selector(code) || geo.geoip_available(code)
+}
+fn matches_geoip(geo: &dyn GeoMatcher, code: &str, ip: IpAddr) -> bool {
+    crate::geodata::matches_lan(code, ip).unwrap_or_else(|| geo.matches_geoip(code, ip))
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let (pattern, value) = (pattern.as_bytes(), value.as_bytes());
+    let (mut p, mut v) = (0, 0);
+    let mut retry = None;
+    while v < value.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                retry = Some((p + 1, v));
+                p += 1;
+            }
+            Some(byte) if *byte == b'?' || *byte == value[v] => {
+                p += 1;
+                v += 1;
+            }
+            _ => match retry {
+                Some((after_star, consumed)) => {
+                    v = consumed + 1;
+                    p = after_star;
+                    retry = Some((p, v));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|byte| *byte == b'*')
 }
 
 fn preferred_addresses(addresses: &[IpAddr]) -> impl Iterator<Item = IpAddr> + '_ {
@@ -687,6 +1088,83 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn in_name_uses_actual_tun_or_mixed_ingress_without_naming_internal_requests() {
+        let mut config = crate::config::Config::parse_yaml(
+            b"rules: ['IN-NAME, ignored / DEFAULT-TUN ,DIRECT', 'IN-NAME,DEFAULT-MIXED,REJECT-DROP', 'MATCH,REJECT']\n",
+        )
+        .unwrap();
+        let rules = RuleSet::compile_config(&mut config).unwrap();
+        let destination = Destination::domain("example.test", 443).unwrap();
+        for (kind, expected) in [
+            (InboundKind::Tun, RuleAction::Direct),
+            (InboundKind::Http, RuleAction::RejectDrop),
+            (InboundKind::Https, RuleAction::RejectDrop),
+            (InboundKind::Socks5, RuleAction::RejectDrop),
+            (InboundKind::InternalDns, RuleAction::Reject),
+            (InboundKind::InternalGeoData, RuleAction::Reject),
+            (InboundKind::InternalMeasure, RuleAction::Reject),
+        ] {
+            for network in [Network::Tcp, Network::Udp] {
+                let mut context = RoutingContext::new(network, &destination).unwrap();
+                context.set_inbound(kind, &InboundMetadata::new(0));
+                assert!(
+                    matches!(rules.evaluate(&context), RuleEvaluation::Matched(found) if found.action == expected)
+                );
+            }
+        }
+        let lower_case = crate::config::Config::parse_yaml(
+            b"rules: ['IN-NAME,default-tun,DIRECT', 'MATCH,REJECT']\n",
+        )
+        .unwrap();
+        let rules = RuleSet::compile(lower_case.rules).unwrap();
+        let mut context = RoutingContext::new(Network::Tcp, &destination).unwrap();
+        context.set_inbound(InboundKind::Tun, &InboundMetadata::new(0));
+        assert!(
+            matches!(rules.evaluate(&context), RuleEvaluation::Matched(found) if found.action == RuleAction::Reject)
+        );
+        assert!(
+            crate::config::Config::parse_yaml(b"rules: ['IN-NAME,DEFAULT-TUN / ,DIRECT']\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rematch_name_predicate_is_trimmed_nonempty_and_case_sensitive() {
+        let mut config = crate::config::Config::parse_yaml(
+            b"rules: ['REMATCH-NAME, blue / Green ,DIRECT', 'MATCH,REJECT']\n",
+        )
+        .unwrap();
+        let rules = RuleSet::compile_config(&mut config).unwrap();
+        let mut context = domain_context(Network::Tcp, "example.com", 443);
+        assert!(matches!(
+            rules.evaluate(&context),
+            RuleEvaluation::Matched(RuleMatch {
+                action: RuleAction::Reject,
+                ..
+            })
+        ));
+        for (name, action) in [
+            ("blue", RuleAction::Direct),
+            ("Green", RuleAction::Direct),
+            ("Blue", RuleAction::Reject),
+            ("", RuleAction::Reject),
+        ] {
+            context.rematch_name = Some(Arc::from(name));
+            assert!(
+                matches!(rules.evaluate(&context), RuleEvaluation::Matched(found) if found.action == action)
+            );
+        }
+        for names in ["blue/", "/blue", "blue/ /Green"] {
+            assert!(
+                crate::config::Config::parse_yaml(
+                    format!("rules: ['REMATCH-NAME,{names},DIRECT']").as_bytes()
+                )
+                .is_err()
+            );
+        }
+    }
+
     fn domain_context(network: Network, host: &str, port: u16) -> RoutingContext {
         let destination = Destination::domain(host, port).unwrap();
         RoutingContext::new(network, &destination).unwrap()
@@ -711,16 +1189,47 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            rules.rules[0].kind,
+            rules.graph.main[0].kind,
             RuleKind::GeoSite("!google@ads@cn".to_owned())
         );
-        assert_eq!(rules.rules[1].kind, RuleKind::GeoIp("!cn".to_owned()));
+        assert_eq!(rules.graph.main[1].kind, RuleKind::GeoIp("!cn".to_owned()));
         assert!(
             RuleSet::compile(vec![
                 spec(RuleKind::GeoIp("cn@ads".to_owned()), RuleAction::Direct),
                 spec(RuleKind::Match, proxy_action(0)),
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn udp_capability_filter_continues_after_ip_resolution() {
+        let rules = RuleSet::compile(vec![
+            spec(
+                RuleKind::IpCidr(IpCidr {
+                    network: "192.0.2.0".parse().unwrap(),
+                    prefix_len: 24,
+                }),
+                proxy_action(0),
+            ),
+            spec(RuleKind::Match, RuleAction::Reject),
+        ])
+        .unwrap();
+        let mut context = domain_context(Network::Udp, "example.com", 53);
+        let available = |action| action != proxy_action(0);
+        assert!(matches!(
+            rules.evaluate_with_egress(&context, &EmptyGeoMatcher, available),
+            RuleEvaluation::NeedsIpResolution { rule_index: 0 }
+        ));
+        assert_eq!(
+            action(rules.evaluate_with_resolved_egress(
+                &mut context,
+                &EmptyGeoMatcher,
+                0,
+                &["192.0.2.1".parse().unwrap()],
+                available
+            )),
+            RuleAction::Reject
         );
     }
 
@@ -862,13 +1371,23 @@ mod tests {
             action(rules.evaluate(&domain_context(Network::Tcp, "example.com", 443))),
             RuleAction::Direct
         );
-        assert!(matches!(
-            RuleSet::compile(vec![spec(
-                RuleKind::Domain("example.com".to_owned()),
-                RuleAction::Direct,
-            )]),
-            Err(RuleSetError::MissingFinalMatch)
-        ));
+        let rules = RuleSet::compile(vec![spec(
+            RuleKind::Domain("example.com".to_owned()),
+            RuleAction::Reject,
+        )])
+        .unwrap();
+        assert_eq!(
+            action(rules.evaluate(&domain_context(Network::Tcp, "other.example", 443))),
+            RuleAction::Direct
+        );
+        assert_eq!(
+            action(RuleSet::compile(vec![]).unwrap().evaluate(&domain_context(
+                Network::Tcp,
+                "other.example",
+                443
+            ))),
+            RuleAction::Direct
+        );
     }
 
     #[test]

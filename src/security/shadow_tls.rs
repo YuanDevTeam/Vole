@@ -46,6 +46,12 @@ impl ShadowTlsClient {
                 &TlsClientOptions {
                     versions: TlsVersions::Tls13,
                     alpn: config.alpn.clone(),
+                    required_alpn: config.required_alpn.clone(),
+                    identity: config
+                        .identity
+                        .as_ref()
+                        .map(|identity| super::TlsClientIdentity::from_config(identity, context))
+                        .transpose()?,
                     certificate: config.certificate.clone(),
                     client_fingerprint: config.client_fingerprint,
                     ..Default::default()

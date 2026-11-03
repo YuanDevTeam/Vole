@@ -1,8 +1,10 @@
 # Vole Invoke API
 
-业务实例通过内联的 `configYaml` 启动，测速通过 `configYamls` 传入节点配置；前台 `foreground` 操作负责从文件或标准输入加载同一配置。每份已加载的 Vole 运行时最多拥有一个公共实例。业务代理入口仅通过 `mixed-port` 配置，HTTP/SOCKS5 TCP 与 SOCKS5 UDP 共用端口；顶层 `port`、`socks-port`、`udp` 和 `listeners` 都会失败。代理组实时选择沿用 Controller。静态 ECH 只使用节点内联配置，不新增 bootstrap DNS 入参。
+业务实例通过内联的 `configYaml` 启动，测速通过 `configYamls` 传入节点配置；前台 `foreground` 操作负责从明确的 Base64、文件或标准输入加载同一配置。每份已加载的 Vole 运行时最多拥有一个公共实例。业务代理入口仅通过 `mixed-port` 配置，HTTP/SOCKS5 TCP 与 SOCKS5 UDP 共用端口；顶层 `port`、`socks-port`、`udp` 和 `listeners` 都会失败。代理组实时选择沿用 Controller。ECH 使用节点内联静态配置或运行时节点 DNS 角色；measureDelay 的动态 ECH 使用原 Dialer 的 system-source 原始 HTTPS 记录叶服务，平台物理来源不可用时失败，不增加 DNS 或宿主元数据入参。
 
-共享请求处理位于 `src/invoke/`。Rust 调用方使用 `vole::invoke::invoke_bytes(&[u8]) -> Vec<u8>`；CLI 和 C ABI 都调用该入口。`invoke` feature 提供共享操作，`cli` 和 `ffi` 分别添加命令行与原生传输适配。
+共享请求处理位于 `src/invoke/`。Rust 调用方使用 `vole::invoke::invoke_bytes(&[u8]) -> Vec<u8>`；C ABI 使用同一入口。
+CLI 使用共用解析、准入、派发和 panic 边界的 `invoke_owned_bytes(Vec<u8>)`，
+将序列化输入的所有权交给 Invoke，使其在进入长驻前台操作前清零并释放原始 JSON；不增加 JSON 方法。`invoke` feature 提供共享操作，`cli` 和 `ffi` 分别添加命令行与原生传输适配。
 
 ## C ABI
 
@@ -53,7 +55,7 @@ void VoleFree(char *response);
 - 运行时级方法必须省略 `instanceId`；实例级方法必须携带 Vole 返回的非空 ID。
 - 未知或已移除的 envelope 字段和 payload 字段都会失败，不静默忽略。
 - 无业务数据的方法成功时返回空对象，不返回 `null`。
-- Invoke envelope 最大 3 MiB，单份 YAML 最大 256 KiB。
+- Invoke envelope 上限为 240 MiB + 64 KiB（五份 YAML 的 JSON 最坏转义及 envelope），单份 YAML 最大 8 MiB。
 
 ## 初始化与生命周期
 
@@ -90,7 +92,7 @@ stopped -> preparing -> prepared -> starting -> running
 - `validateConfig` 是可并发的纯校验方法，不要求或执行 `initialize`。
 - `measureDelay` 使用独立批次和私有工作器，不进入公共实例表。
 - 公开生命周期为 `initialize -> createInstance -> start(configYaml) -> stop -> destroyInstance`。`preparing`、`prepared` 和 `starting` 是 `start` 内部阶段，没有公共 `prepare` 方法。
-- 不支持配置热重载；切换配置需要 `stop -> start(新 configYaml)`。唯一的运行期路由变更是通过 Controller 修改静态 `select` 组的当前选择，它不修改启动配置。
+- `updateConfig` 与 Controller 共用一个候选应用器；路由、节点、provider 和允许的 DNS/连接策略更新只影响新连接。TUN、监听器、系统网络等启动资源变更需要 `stop -> start(新 configYaml)`。既有连接保留原资源和路径。
 - `stop` 在 stopped 状态幂等；`destroyInstance` 是最终同步清理屏障。
 
 ## 方法
@@ -119,6 +121,29 @@ stopped -> preparing -> prepared -> starting -> running
 
 参数和幂等语义见“初始化与生命周期”。成功时返回规范化后的 `dataDir`。
 
+### `updateDnsNetwork`
+
+初始化后的运行时级方法，不带 `instanceId`。宿主提供完整、只读的物理网络 DNS 快照；不改变 `start(configYaml)`，不配置接口、路由、DNS 或 App 生命周期。
+
+```json
+{
+  "method": "updateDnsNetwork",
+  "payload": {
+    "generation": 1,
+    "system": [
+      {"address": "192.0.2.53", "interface": "en0", "scopeId": 0, "requiresEncryption": false}
+    ],
+    "dhcp": [
+      {"interface": "en0", "servers": [{"address": "192.0.2.54", "scopeId": 0}], "requiresEncryption": false}
+    ]
+  }
+}
+```
+
+`generation` 必须是正整数并单调增加；相同代次的相同内容幂等，不同内容或较旧代次失败。system/dhcp 必填，空数组撤销来源；一个 DHCP 接口只能出现一次。所有层级拒绝未知字段，metadata 原始 JSON（含内部空白）及规范化快照各限 64 KiB；在完整 JSON Value 解析前通过借用 RawValue 准入，额外 envelope 字节（含外部空白）独立限 64 KiB。这与其他方法沿用的全 envelope 上限不同。地址只接受非回环的单播字面 IP；IPv6 link-local 必须提供匹配物理接口的非零 scopeId，IPv4 scopeId 必须为 0。interface 是 1–256 字节的精确名称或 UWP 的绑定 GUID，不允许控制字符、路径分隔符或首尾空白。scopeId 默认 0，requiresEncryption 默认 false，宿主必须如实标记加密要求，不能将无法确认的数据描述为明文来源。
+
+成功返回 `{}`。快照在同一运行时内共享，优先于 OS 发现，并与全部仍活跃资源代次的 DNS cache/hints 清理共用 epoch 屏障；旧查询不能回填，fake-IP 和活跃流保留。Windows 前台进程和 Session Host 的 runtime registry 各自独立，本方法不提供 IPC。平台可用性和物理绑定见 [DNS 来源](tun-icmp-dns.md#显式系统与-dhcp-来源)。
+
 ### `getGeoDataState`
 
 运行时级只读方法，要求已经初始化：
@@ -127,7 +152,7 @@ stopped -> preparing -> prepared -> starting -> running
 {"method":"getGeoDataState","payload":{}}
 ```
 
-返回 `geosite` 和 `geoip` 两项：
+返回 `geosite`、`geoip` 和 `asn` 三项；三种资产分别报告需求与可用性：
 
 ```json
 {
@@ -150,10 +175,22 @@ stopped -> preparing -> prepared -> starting -> running
     "lastError": null,
     "etag": null,
     "hash": null
+  },
+  "asn": {
+    "required": false,
+    "available": false,
+    "updating": false,
+    "lastSuccess": null,
+    "nextCheck": null,
+    "lastError": null,
+    "etag": null,
+    "hash": null
   }
 }
 ```
 
+`asn` 使用相同的 `required`、`available`、`updating`、`lastSuccess`、`nextCheck`、
+`lastError`、`etag` 和 `hash` 字段。
 时间使用 Unix 秒，hash 为小写 SHA-256。调用不会创建实例、联网或改变更新调度。
 
 ### `createInstance`
@@ -191,11 +228,11 @@ stopped -> preparing -> prepared -> starting -> running
 }
 ```
 
-无需 `initialize`，完成大小、YAML、结构、共享 route-target 命名空间、引用和字段组合校验。节点的 `dialer-proxy` 可引用节点或组；全部上游和组成员边（包括未选成员）统一做无环校验。不创建实例、不解析远端域名、不联网，也不读取 GeoData。资产缺失不影响纯配置校验。
+无需 `initialize`，完成大小、YAML、结构、共享 route-target 命名空间、引用和字段组合校验。节点的 `dialer-proxy` 可指定 DIRECT 或引用节点、组；全部上游和组成员边（包括未选成员）统一做无环校验。不创建实例、不解析远端域名、不联网，也不读取 GeoData。资产缺失不影响纯配置校验。显式引用的客户端证书与密钥文件在校验时读取；相对路径使用已初始化的 dataDir，未初始化时使用当前工作目录。
 
 ### `start`
 
-实例级方法，只允许 stopped 状态。唯一 payload 字段是内联配置：
+实例级方法，只允许 stopped 状态。`configYaml` 必填，独立 HTTP 设置与私密上下文可选：
 
 ```json
 {
@@ -211,8 +248,8 @@ TUN 资源参数来自 YAML 的 `tun`，平台包格式由内核选择。
 同一命令内先准备配置，再获取平台资源并启动：
 
 - 读取当时可用的本地 GeoData，不启动或等待下载。
-- 为所有潜在物理首跳执行引导 DNS：节点无上游，或其上游组经纯组成员链能选到 DIRECT 时，预解析节点服务器及独立 VLESS 下载端点，包括尚未选中的 DIRECT 路径。候选解析失败则启动失败；仅经代理访问的域名交给下一跳。切换 DIRECT 不新增系统 DNS。
-- 校验每个静态 `select` 组的初始选择；省略 `default-selected` 时使用第一项，显式值必须是直接成员。启动时创建本次 session 的可变选择状态。
+- 准备阶段只构建并校验代理图；实际建立物理首跳时，通过运行时节点 resolver 解析服务器及独立 VLESS 下载端点。未选中的备用节点不会因 DNS 故障阻塞启动。仅经代理访问的域名交给下一跳；系统解析仅用于 DNS 关闭的配置。
+- 按当前资源构建代理组。`profile.store-selected` 开启时优先恢复仍有效的缓存选择，否则使用有效的 `default-selected` 或首成员；动态空组使用 `empty-fallback`。自动组随后依据健康探测选择成员。
 - 含 TUN 的配置从内部 preparing 阶段起持有运行时本地的 TUN/protect 租约，直到停止或销毁。Android 必须在 `start` 前注册 protect controller。
 - 所有监听器和关键数据面成功后才进入 running。准备、资源获取或启动失败均清理本次临时资源并回到 stopped；重试需要再次提交完整 `configYaml`。
 - GeoData 更新只在启动后按需后台运行，不属于启动关键路径。
@@ -223,9 +260,15 @@ Apple 使用 utun 包头，Android 与 Linux 使用 raw-IP。Linux 要求真实�
 PI/VNET header，并验证实际 MTU 与 `tun.mtu` 相同；跨网络命名空间的校验需要宿主提供权限。
 
 `tun.file-descriptor` 省略或为 0 时，Linux 与 macOS 根据 `tun.device` 创建或打开原生
-TUN；移动平台仍需要宿主描述符。接口地址、DNS、路由和物理出口隔离由宿主配置，Vole
-不自动管理系统路由。`tun.mtu` 省略或为 0 使用 9000；完整六字段契约及借用 fd 边界见
+TUN；移动平台仍需要宿主描述符。Linux 自建 TUN 的 IPv6 地址、CIDR 捕获/排除、
+UID/端口范围、路由索引和 strict-route 从同一配置读取；借用 fd 与 App 管理的平台
+由宿主应用，运行期变更需要重配/重连。Linux 自建 TUN 支持 `auto-route`、
+`auto-detect-interface` 与 systemd-resolved 接管；其他平台和借用 fd 的系统网络由宿主配置。
+`tun.mtu` 省略或为 0 使用 9000；字段契约及借用 fd 边界见
 [配置参考](config.yaml)与 [TUN 平台层](tun-platform.md)。
+
+物理出口来自同一 YAML 的全局/节点 `interface-name/routing-mark` 与普通 DNS `#接口`，
+不增加 Invoke 参数。平台能力、继承和 auto-route 共存边界见[出站契约](outbounds.md)。
 
 Windows 编译时选择互斥的 `windows-wintun` 或 `windows-uwp`：
 
@@ -239,6 +282,24 @@ Windows 编译时选择互斥的 `windows-wintun` 或 `windows-uwp`：
 
 Stop 关闭本次持有的 fd、session 和原生句柄；Wintun 不承诺移除宿主已有的同名接口
 或卸载驱动。平台启动失败不切换另一种 Windows 后端。
+
+### `updateConfig`
+
+实例级方法，只允许 running 状态。接受 `configYaml`、可选 `httpConfigYaml` 与只含 `baseDir` 的 `httpContext`；不接受 CA：
+
+```json
+{"method":"updateConfig","instanceId":"1","payload":{"configYaml":"rules: [MATCH,DIRECT]"}}
+```
+
+共享 Controller 的单候选许可、解析、完整图准备与原子发布，不建立第二个运行时。
+先取得许可，再解码最多 8 MiB 的 YAML；并发应用返回 busy。无效候选或准备失败保留旧代，
+改变启动资源返回 reconnect required。成功仅表示候选配置及当前可用资源已经发布；HTTP provider
+继续沿原更新流程刷新，不表示所有远端订阅已下载。Controller GET `/configs` 可确认当前有效值。
+
+沿用实例命令锁：调用完成前，同实例 Stop/getState/其他命令返回 busy；候选等待上限 90 秒。
+超时或取消会阻止未发布候选继续提交；工作器保留许可并回收已开始的准备任务，Stop 仍等待其完成。如超时与发布同时发生，
+通过 Controller 查询确认当前值。既有连接仍持有旧代至结束；新连接使用新代。Provider 身份和
+Windows Session Snapshot 不由此重建；Windows UWP 的活动 Provider 配置仍由宿主管理和重连。
 
 ### `foreground`
 
@@ -270,8 +331,32 @@ Stop 关闭本次持有的 fd、session 和原生句柄；Wintun 不承诺移除
 若定义 `XDG_CONFIG_HOME`，使用 `<XDG_CONFIG_HOME>/vole`。相对数据目录和显式
 配置路径分别从启动工作目录解析并折叠 `.`/`..`，绝对路径原样保留；
 配置默认 `<dataDir>/config.yaml`。
-`configPath: "-"` 从标准输入读取。文件必须是普通文件，文件和标准输入均最多 256 KiB；
-不会下载、创建模板或改写配置。详细命令行映射见 [CLI](cli.md)。
+`configPath: "-"` 从标准输入读取。文件必须是普通文件，文件和标准输入均最多 8 MiB；
+证书/密钥相对路径从选定 dataDir 解析，validate 也读取身份文件但不初始化目录。
+不会下载、创建模板或改写配置。
+可选 `configString` 和 `ageSecretKey` 是 UTF-8 文本，分别取 `VOLE_CONFIG_STRING`、
+`VOLE_AGE_SECRET_KEY` 的环境默认；显式空值清除该默认。非空 `configString` 按带 padding 的
+标准 Base64 解码（允许 CR/LF），优先于配置路径，因此即使路径为 `-` 也不打开或锁定标准输入。
+没有非空 Base64 时才使用明确选择的 `-`（含 `VOLE_CONFIG_FILE=-`）或文件，不探测输入。
+编码文本最多 11,184,812 字节，解码后的内容、主文件和标准输入均最多 8 MiB。
+输入以标准 AGE armor 开头时复用资源层的认证解密，身份最多 16 KiB，解密后 YAML 最多 8 MiB；
+解密受 30 秒处理期限约束，运行模式的退出信号取消并 join 解码工作器后返回。
+临时身份与私密请求缓冲清零，编码／密文在后续阶段及时释放。配置仍只解析一次后交给共享启动路径。
+运行模式可选 `externalController`、`externalControllerTls`、`externalControllerUnix` 和 `secret` 文本覆盖，
+分别对应 `VOLE_OVERRIDE_EXTERNAL_CONTROLLER`、`VOLE_OVERRIDE_EXTERNAL_CONTROLLER_TLS`、
+`VOLE_OVERRIDE_EXTERNAL_CONTROLLER_UNIX`、`VOLE_OVERRIDE_SECRET` 的环境默认。显式参数优先，空串仅清除环境默认，不清空原 YAML 字段。
+地址复用主配置的既有严格解析器，覆盖在 foreground 解析／校验后应用到同一启动配置；没有任意 map 合并。
+`validate` 保持 Mihomo 的配置测试语义，不读取这些环境值或解析／应用覆盖。`help` 也不读取。
+另有可选数值 `externalControllerRoutingMark`，对应 `VOLE_OVERRIDE_EXTERNAL_CONTROLLER_ROUTING_MARK` 的十进制环境默认；
+非零值才覆盖，显式 0 不读环境且不清除 YAML mark。仅 Linux 网络 Controller 消费，沿用既有 socket mark 范围；
+它不更改业务 mark 或本地 Unix 入口。CLI 先执行 Go flag 整数语法检查，`validate` 仍不读取该环境默认或应用运行期覆盖。
+覆盖元数据不进入普通 `start` payload 或 Mihomo YAML schema；Controller 的 TLS 身份仍由主配置提供。新激活的入口保留主配置中的 secret/CORS；Unix 本地入口另依文件权限授权，不改变网络鉴权。
+前台运行可通过 `VOLE_SAFE_PATHS` 的系统原生路径列表扩展 provider 授权根；仅用于主配置 file provider 读取、
+HTTP provider 缓存正文及 sidecar 写入。目录在初始化时 canonicalize 并冻结，沿普通候选、HUP 和恢复快照继承；
+重复初始化不得改变已明确设置的授权上下文。空项不授权工作目录，读取不创建目录，路径 traversal 与符号链接逃逸拒绝。
+本次显式主配置／独立 HTTP 输入禁止被缓存覆盖，显式私密 CA 路径禁止 provider 读写。
+它不扩展主配置写回、客户端身份／私密 CA、独立 HTTP 设置或 Controller 清理权限，也不进入 YAML／普通 initialize payload。
+详细命令行映射见 [CLI](cli.md)。
 
 普通 Unicode 路径使用 JSON 字符串。需要保留平台原生编码时，Unix 可使用
 `{"unixBytes":[47,116,109,112,255]}`，Windows 可使用
@@ -281,9 +366,21 @@ Stop 关闭本次持有的 fd、session 和原生句柄；Wintun 不承诺移除
 `run` 同步占用当前调用直到会话结束；同一运行时只允许一个前台运行操作。它消费进程的
 标准输入和退出信号，并安装有界 stderr 诊断，适用于前台进程宿主。嵌入式、服务或 VPN
 宿主继续用普通业务生命周期方法和自身的退出机制。
+解析后的配置直接交给同一启动路径，不重复读取或解析。
+CLI 与普通 `start` 共用统一的 TUN allocator 策略、内存诊断和 Stop 后回收；
+无 TUN 的会话不修改 allocator。
+GNU/Linux 的设置是进程级、一次性的，显式 allocator 环境覆盖仍优先，
+完整语义见[运行时资源策略](runtime-resource-policy.md#统一内存策略)。
 Unix 等待 SIGINT/SIGTERM，Windows 等待 Ctrl+C/Ctrl+Break；标准输入先读取，之后在
 内部准备和启动前注册信号。启动中收到信号仍等待启动工作器结束，再停止和销毁；运行期
-通过引擎完成通知等待结束，随后 join 确认结果，不持有命令锁等待信号。启动、关键数据面、
+通过引擎完成通知等待结束，随后 join 确认结果，不持有命令锁等待信号。
+Unix SIGHUP 只通过已有候选许可与工作器热更新主配置：文件源有界重读，Base64／stdin 复用首次有效 YAML。
+后者不保留 Base64、AGE 密文或原始 JSON；文件 AGE 仅保留已解析身份，不重读密钥环境或独立 HTTP 私密 CA 文件。
+同一请求启动时的具体 Controller 覆盖继续应用于新候选。错误候选保留当前配置；启动资源变化返回
+reconnect required 的本地摘要并保留当前会话，HUP 不自动 Stop/start，也不关闭或替换宿主 fd。
+候选继承活动 HTTP policy 的同一实际 payload／CA，普通 provider 更新继续正常执行；独立 HTTP 文件和
+HTTP pending 不由 HUP 读取或应用。退出信号／引擎结束取消并等待重载的已开始工作，Stop 保留原同步屏障。
+启动、关键数据面、
 信号或清理失败返回失败响应，错误保留有界摘要；操作返回前完成本次清理。
 
 ### `stop`
@@ -336,10 +433,11 @@ Unix 等待 SIGINT/SIGTERM，Windows 等待 Ctrl+C/Ctrl+Break；标准输入先�
 
 - `configYamls` 接受 1–5 份非空节点配置，`timeout` 为 1–30 秒。
 - 同一运行时一次只允许一个测速批次，最多并发五个私有工作器。
-- 节点配置顶层只允许 `proxies`，不接受 `proxy-groups`；`dialer-proxy` 也只能引用具体节点。Vole 推导唯一链头，且该链必须覆盖全部节点。
+- 节点配置顶层只允许 `proxies` 和客户端信任 `tls.custom-certifactes`，不接受服务端 TLS 字段或 `proxy-groups`；`dialer-proxy` 可指定 DIRECT 或引用具体节点。Vole 推导唯一链头，且该链必须覆盖全部节点。
+- `type: rematch` 是运行时规则控制，不属于具体可测节点，测速配置拒绝它。
 - 工作器只准备出站图并执行 TCP、可选 TLS 和 HTTP/1.1 HEAD；不创建公共实例、监听器、TUN、DNS、规则、嗅探器或 GeoData。
 - 宿主测量组成员时，按当前选择快照展开具体链后提交；上游选到 DIRECT 时移除相应 `dialer-proxy`，选到 REJECT 时不发起该项测量。该快照不改变运行中的组选择。
-- URL 必须是无 userinfo 和 fragment 的绝对 HTTP/HTTPS URL；HTTPS 使用发布信任根。
+- URL 必须是无 userinfo 和 fragment 的绝对 HTTP/HTTPS URL；HTTPS 与本次节点握手共享内置、可读系统及配置自定义信任根；各测量工作器的信任互相隔离。
 - 任意合法 HTTP 状态都表示探测成功；不跟随重定向、不读取正文。
 - 单项失败不取消其他项；方法返回前释放全部私有任务。
 
@@ -379,7 +477,7 @@ ProtectFd(fd) -> bool
 - 每个出站 TCP/UDP socket 在 connect 前同步调用 protect。
 - socket 初始化和 protect 可以在受跟踪的 Tokio 阻塞线程执行；不保证回调来自某个
   固定业务线程。取消不能中断已经开始的同步回调，Stop 返回前必须等待其完成。
-- TCP/UDP 共用每初始化作用域 64 个未完成提交的内部许可；提交前异步等待并继承
+- TCP/UDP 共用每初始化作用域 4 个未完成提交的内部许可；提交前异步等待并继承
   调用方取消/期限，不因繁忙拒绝业务连接。许可直到阻塞任务实际结束才释放。
 - 返回 false、抛出异常或 controller 失效都会使当前连接失败关闭。
 - 回调必须快速、同步、非阻塞，且不能重入 Invoke 或注册接口。
@@ -388,9 +486,9 @@ ProtectFd(fd) -> bool
 
 ## Controller
 
-配置 `external-controller` 后，运行时可提供回环 `GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}`。代理组 Controller 可以在非 TUN 的 `mixed-port` 配置中运行；此时 `/traffic` 不存在。只要 Controller 管理代理组，`secret` 就必填并保护全部路由。
+配置 `external-controller` 后，运行时可提供 HTTP `GET /traffic`、`GET /group`、`GET /group/{name}`、`GET /proxies/{name}` 和 `PUT /proxies/{name}`。代理组 Controller 可以在非 TUN 的 `mixed-port` 配置中运行；此时 `/traffic` 不存在。`secret` 省略或空串时免认证；非空时保护全部路由，监听地址由配置决定。
 
-组成员列表是配置期固定的，选择只存于当前 Running Session。成功切换只影响之后新建的物理 TCP、UDP 和 DNS transport，不迁移既有连接、UDP association、DNS 状态或 TCP pool，也不触发 failover。已认证 Hysteria2 会话的后续逻辑流和跳端口 socket 保留初始上游选择；新的认证会话才读取新选择。Controller 查询不携带 `instanceId`，不进入 Invoke 命令锁；完整语义见 [Controller API](controller-api.md)。
+静态成员来自配置，动态成员随 provider 成功更新；显式选择按 `profile.store-selected` 保存。成功切换只影响之后新建的物理 TCP、UDP 和 DNS transport，不迁移既有连接、UDP association、DNS 状态或 TCP pool。自动组根据健康状态处理后续连接的选择与恢复；select 的连接失败按原样返回。已认证 Hysteria2 会话的后续逻辑流和跳端口 socket 保留初始上游选择；新的认证会话才读取新选择。Controller 查询不携带 `instanceId`，不进入 Invoke 命令锁；完整语义见 [Controller API](controller-api.md)。
 
 ## Windows 安装包桥接
 
@@ -473,10 +571,72 @@ ProtectFd(fd) -> bool
 ## 编码与安全边界
 
 - 所有 JSON DTO 拒绝未知字段。
-- 配置、错误和日志按 UTF-8 字节计数并受固定上限约束。
+- 配置和错误按 UTF-8 字节计数并受固定上限约束；CLI 与 Controller 日志完整输出已生成的事件，级别与订阅预算见各自契约。
 - TUN 原始数据包按 `tun.mtu` 限制；最终代理 UDP 响应最多为该 MTU 减去 48 字节。默认 9000 对应 8952 字节；显式 1500 对应 1452 字节，Windows UWP 的最高 1400 对应 1352 字节。
 - 嵌套 UDP 协议可以增加有界帧头，但解封装后的最终负载仍受该平台响应上限限制。
-- 节点和代理组定义名共享大小写敏感的严格 UTF-8 命名空间；`DIRECT`、`REJECT` 和 `RULES` 不能用作定义名。
-- Secret、password、UUID、REALITY key、short ID、目标地址和完整配置不得进入日志。
+- 节点和代理组定义名共享大小写敏感的严格 UTF-8 命名空间；内置动作名称保留，具体名称与编码规则见 [Controller](controller-api.md#名称与路径)。
+- Invoke 不额外记录完整配置或凭据；CLI 与 Controller 不对已生成的日志消息或字段进行二次脱敏。
 - Apple Unified Logging 的 subsystem 固定为 `io.github.yuandevteam.vole`，category 为
   `vole`，不继承宿主应用的 bundle identifier；Console 或 `log stream` 应按该标识筛选。
+
+
+## 独立 HTTP 设置与私密上下文
+
+`validateConfig`、`start`、`reconnect` 可选 `httpConfigYaml`。HTTP YAML 不承载 CA；旧数组规则、字符串域名项和共享 PEM 字段均拒绝。字段、动作与 provider 见 [HTTP 处理](http-processing.md)。
+
+```json
+{
+  "method": "start",
+  "instanceId": "1",
+  "payload": {
+    "configYaml": "rules: ['MATCH,DIRECT']",
+    "httpConfigYaml": "mitm: {enabled: true, domains: [{pattern: example.com}]}",
+    "httpContext": {
+      "baseDir": "/absolute/http-settings",
+      "ca": {"certificate": "...PEM...", "privateKey": "...PEM..."}
+    }
+  }
+}
+```
+
+baseDir 使用原生路径元数据并且必须绝对；相对 file 来源必须有该上下文。HTTP 缓存使用已初始化 dataDir。CA 仅由 start／reconnect 和 Windows startVpn 接受；私密 DTO 不可普通序列化、Debug 脱敏，临时密钥输入在释放时零化。关闭 MITM 不要求 CA。
+
+validateConfig 只静态校验，不读取外部 HTTP provider 或 CA。返回 `httpResourcesValidated` 表示外部资源是否全部可在输入中校验，`httpsReady` 固定 false；静态通过不代表真实 HTTPS 就绪。foreground 的 validate 也不读取 `httpCaPath`。
+
+### `reconnect`
+
+实例级、只允许 running，payload 与 start 相同。先准备新资源候选，再执行停止屏障并启动。后续启动失败时用临时保留的旧主配置、实际 provider 内容及原 HTTP／CA 快照恢复，方法仍报告失败。新候选准备失败不停止旧引擎。恢复也失败则回到 stopped 并明确报告；普通 Stop 不长期保留恢复密钥。
+
+updateConfig 省略 HTTP 时继承 active；同设置可继续使用 active。显式改变 HTTP（包括空串关闭）或来源基目录返回 reconnect required，整个 routing 更新失败；不把待应用候选混入当前会话。节点切换与普通 provider 更新也不应用 pending HTTP。
+
+### `refreshHttpProviders`
+
+运行时级，要求 initialize，无须创建或启动实例。只接受 `httpConfigYaml` 与可选只含 baseDir 的 httpContext：
+
+```json
+{"method":"refreshHttpProviders","payload":{"httpConfigYaml":"...","httpContext":{"baseDir":"/absolute/http-settings"}}}
+```
+
+完整准备与缓存提交成功返回 `{"resourcesReady":true,"applied":false}`。未运行时只执行一轮；运行时与现有资源更新共用受保护出口、候选许可、取消和 Stop 屏障。周期 HTTP 更新只发布待应用候选；file 不 watch，interval 0 不周期刷新。Windows UWP 的物理更新由已绑定的 Session Host 承担，普通前台 Invoke 不回退到未绑定 socket。
+
+### `testHttp`
+
+运行时级离线演算，不初始化、不联网、不读文件、不读取 CA。输入必填 httpConfigYaml 和 url，可选只含 baseDir 的 httpContext、request／response 样本：
+
+```json
+{
+  "method":"testHttp",
+  "payload":{
+    "httpConfigYaml":"rewrite: {rules: [{url: '.', action: reject}]}",
+    "url":"https://example.com/path",
+    "request":{"method":"POST","headers":[["Content-Type","application/json"]],"bodyBase64":"e30="},
+    "response":{"status":200,"headers":[["Content-Type","application/json"]],"bodyBase64":"e30="}
+  }
+}
+```
+
+method 默认 GET，response.status 必填；headers 是保留顺序与重复项的二元数组，bodyBase64 表示原始编码实体。外部资源只取同来源已准备内存候选；缺少则返回 resourcesReady false／unprepared，不伪装为未命中。总开关关闭仍可演算启用规则；没有样本只报告被选中。结果包含 U0/U1、来源索引、URL 结果、各阶段执行或旁路与样本输出，httpsReady 不宣称真实信任就绪。结果不含 CA，也不持久化正文。
+
+### foreground 私密文件
+
+可选 httpConfigPath、httpCaPath 都是明确的普通文件路径，不自动搜索、不从环境获取；HTTP 文件最多 1 MiB。私密文件格式为 `{"certificate":"...PEM...","privateKey":"...PEM..."}`，Unix 要求当前用户所有、group／other 权限全关闭，并拒绝符号链接。foreground 保留 HTTP 文件目录作为 baseDir。CLI 只传路径，读取仍归 Invoke；空路径与 `-` 拒绝。

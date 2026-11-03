@@ -3,6 +3,20 @@
 mod runtime;
 pub(crate) use runtime::OwnedRuntime;
 
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+))]
+mod linux_udp;
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+))]
+mod physical;
+mod policy;
+pub(crate) use policy::datagram_payload_limit;
+pub use policy::{RECEIVE_WINDOW_POLICY, ReceiveWindowPolicy, configure_receive_windows};
+
 use std::{
     collections::VecDeque,
     io::{self, IoSliceMut},
@@ -63,6 +77,7 @@ impl Shared {
         drop(state);
         self.reader.wake();
         self.writer.wake();
+        self.changed.notify_waiters();
     }
 }
 
@@ -71,6 +86,11 @@ pub struct DatagramSocket {
     peer: SocketAddr,
     budget: DatagramBudget,
     shared: Arc<Shared>,
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    physical: Option<Box<physical::Socket>>,
 }
 
 impl std::fmt::Debug for DatagramSocket {
@@ -82,6 +102,24 @@ impl std::fmt::Debug for DatagramSocket {
 }
 
 impl DatagramSocket {
+    #[cfg(any(feature = "outbound-tuic", feature = "quinn-h3-transport"))]
+    pub(crate) fn configure_transport(&self, limits: &mut quinn::TransportConfig) {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        let enabled = self
+            .physical
+            .as_ref()
+            .is_some_and(|socket| socket.transmit_segments() > 1);
+        #[cfg(not(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        )))]
+        let enabled = false;
+        limits.enable_segmentation_offload(enabled);
+    }
+
     /// The endpoint must configure its QUIC MTU no larger than this budget.
     pub fn budget(&self) -> DatagramBudget {
         self.budget
@@ -90,12 +128,58 @@ impl DatagramSocket {
     pub fn stats(&self) -> Stats {
         self.shared.state.lock().unwrap().stats
     }
+
+    /// Transfers one validated packet to an owner which can consume storage.
+    /// The borrowed AsyncUdpSocket path remains available to other engines.
+    #[cfg(feature = "quiche-h3-transport")]
+    pub(crate) fn poll_recv_owned(&self, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
+        let mut state = self.shared.state.lock().unwrap();
+        if state.closed {
+            return Poll::Ready(Err(state.error.unwrap_or(io::ErrorKind::BrokenPipe).into()));
+        }
+        let was_full = state.incoming.len() == QUEUE_LIMIT;
+        let Some(payload) = state.incoming.pop_front() else {
+            self.shared.reader.register(cx.waker());
+            return Poll::Pending;
+        };
+        drop(state);
+        if was_full {
+            self.shared.changed.notify_one();
+        }
+        Poll::Ready(Ok(payload))
+    }
+
+    /// Waits for previously enqueued packets to pass the controlled transport.
+    /// This is local IO progress, not acknowledgement by the QUIC peer.
+    pub(crate) fn poll_transmitted(
+        &self,
+        cx: &mut Context<'_>,
+        count: usize,
+    ) -> Poll<io::Result<()>> {
+        let state = self.shared.state.lock().unwrap();
+        if state.closed {
+            return Poll::Ready(Err(state.error.unwrap_or(io::ErrorKind::BrokenPipe).into()));
+        }
+        if state.stats.sent >= count {
+            Poll::Ready(Ok(()))
+        } else {
+            // Progress is published under the same lock, so register only
+            // the blocked operation without a gap for a lost notification.
+            self.shared.writer.register(cx.waker());
+            Poll::Pending
+        }
+    }
 }
 
 pub struct DatagramDriver {
     shared: Arc<Shared>,
     cancel: CancellationToken,
     task: Option<JoinHandle<io::Result<()>>>,
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    physical: Option<physical::Retirement>,
 }
 
 impl DatagramDriver {
@@ -120,10 +204,101 @@ impl Drop for DatagramDriver {
     fn drop(&mut self) {
         self.cancel.cancel();
         self.shared.finish(None);
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(physical) = &self.physical {
+            physical.retire();
+        }
         if let Some(task) = self.task.take() {
             task.abort();
         }
     }
+}
+
+/// Protected physical IO remains owned by its original transport and Dialer.
+/// This lease does not provide another socket factory or expose descriptor IO.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+))]
+#[doc(hidden)]
+pub struct PhysicalQuicLease {
+    pub(crate) socket: Arc<crate::dialer::PhysicalDatagram>,
+    pub(crate) settings: crate::config::QuicSocketSettings,
+}
+
+#[cfg(any(feature = "outbound-tuic", feature = "quinn-h3-transport"))]
+pub(crate) async fn attach_quinn(
+    transport: Box<dyn DatagramTransport>,
+    peer: SocketAddr,
+    budget: DatagramBudget,
+) -> io::Result<(Arc<DatagramSocket>, DatagramDriver)> {
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    let mut transport = transport;
+    if peer.port() == 0 || peer.ip().is_unspecified() || peer.ip().is_multicast() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let budget = budget.intersect(transport.payload_budget(&Destination::Ip(peer)));
+    budget.quic_payload_limit()?;
+    #[cfg(all(
+        target_os = "linux",
+        any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+    ))]
+    if let Some(lease) = transport
+        .lease_quic_socket(peer)
+        .await
+        .map_err(dispatch_error)?
+    {
+        let shared = Arc::new(Shared::default());
+        let physical = match physical::Socket::new(lease, peer, budget, shared.clone()) {
+            Ok(Some(socket)) => socket,
+            // Optional receive-ECN metadata is unavailable. Retain this same
+            // protected transport and its original bounded packet path.
+            Ok(None) => return attach(transport, peer, budget),
+            Err(error) => {
+                let _ = tokio::time::timeout(CLOSE_TIMEOUT, transport.close()).await;
+                return Err(error);
+            }
+        };
+        let retirement = physical.retirement();
+        let task_retirement = retirement.clone();
+        let socket = Arc::new(DatagramSocket {
+            peer,
+            budget,
+            shared: shared.clone(),
+            physical: Some(Box::new(physical)),
+        });
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task_shared = shared.clone();
+        let task = crate::resources::observation::spawn(async move {
+            // The native endpoint directly polls the same protected socket;
+            // no packet queue, auxiliary receive pump, or keepalive is added.
+            task_cancel.cancelled().await;
+            task_shared.finish(None);
+            task_retirement.retire();
+            let result = tokio::time::timeout(CLOSE_TIMEOUT, transport.close()).await;
+            drop(transport);
+            result
+                .map_err(|_| io::ErrorKind::TimedOut)?
+                .map_err(dispatch_error)
+        });
+        return Ok((
+            socket,
+            DatagramDriver {
+                shared,
+                cancel,
+                task: Some(task),
+                physical: Some(retirement),
+            },
+        ));
+    }
+    attach(transport, peer, budget)
 }
 
 pub fn attach(
@@ -155,6 +330,11 @@ pub fn attach_mapped(
         peer: logical_peer,
         budget,
         shared: shared.clone(),
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        physical: None,
     });
     let cancel = CancellationToken::new();
     let task_shared = shared.clone();
@@ -183,6 +363,11 @@ pub fn attach_mapped(
             shared,
             cancel,
             task: Some(task),
+            #[cfg(all(
+                target_os = "linux",
+                any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+            ))]
+            physical: None,
         },
     ))
 }
@@ -195,12 +380,31 @@ async fn drive(
     cancel: &CancellationToken,
 ) -> io::Result<()> {
     let mut has_sent = false;
+    let mut receive_scratch = Vec::new();
+    let mut pending_send: Option<crate::dispatch::OwnedDatagramSend> = None;
     loop {
-        let can_receive = shared.state.lock().unwrap().incoming.len() < QUEUE_LIMIT;
+        let (can_receive, can_send) = {
+            let state = shared.state.lock().unwrap();
+            (
+                state.incoming.len() < QUEUE_LIMIT,
+                pending_send.is_none() && !state.outgoing.is_empty(),
+            )
+        };
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
             _ = shared.changed.notified() => {},
-            received = transport.receive(), if has_sent && can_receive => {
+            sent = async { pending_send.as_mut().expect("owned send branch").as_mut().await }, if pending_send.is_some() => {
+                sent.map_err(dispatch_error)?;
+                pending_send.take();
+                has_sent = true;
+                let mut state = shared.state.lock().unwrap();
+                state.stats.sent += 1;
+                shared.writer.wake();
+            },
+            // Notify permits coalesce. A producer may have queued several
+            // packets before this owner runs, so queued TX is itself ready.
+            _ = std::future::ready(()), if can_send => {},
+            received = receive_packet(transport, &mut receive_scratch), if has_sent && can_receive => {
                 let datagram = received.map_err(dispatch_error)?;
                 let mut state = shared.state.lock().unwrap();
                 if datagram.remote != Destination::Ip(peer) {
@@ -223,20 +427,43 @@ async fn drive(
                 }
             }
         }
-        let payload = shared.state.lock().unwrap().outgoing.pop_front();
-        if let Some(payload) = payload {
-            shared.writer.wake();
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                sent = transport.send(Datagram { remote: Destination::Ip(peer), payload, sniffed_domain: None }) => sent.map_err(dispatch_error)?,
-            }
-            has_sent = true;
-            let mut state = shared.state.lock().unwrap();
-            state.stats.sent += 1;
-            if !state.outgoing.is_empty() {
-                shared.changed.notify_one();
+        if pending_send.is_none() {
+            let payload = shared.state.lock().unwrap().outgoing.pop_front();
+            if let Some(payload) = payload {
+                shared.writer.wake();
+                let packet = Datagram {
+                    remote: Destination::Ip(peer),
+                    payload,
+                    sniffed_domain: None,
+                };
+                match transport.send_owned(packet) {
+                    Ok(send) => pending_send = Some(send),
+                    Err(packet) => {
+                        // An upstream without an owned path keeps its existing
+                        // cancellation-safe send; never open another socket.
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Ok(()),
+                            sent = transport.send(packet) => sent.map_err(dispatch_error)?,
+                        }
+                        has_sent = true;
+                        let mut state = shared.state.lock().unwrap();
+                        state.stats.sent += 1;
+                        shared.writer.wake();
+                    }
+                }
             }
         }
+    }
+}
+
+async fn receive_packet(
+    transport: &mut dyn DatagramTransport,
+    scratch: &mut Vec<u8>,
+) -> Result<Datagram, DispatchError> {
+    if transport.supports_poll_receive() {
+        std::future::poll_fn(|context| transport.poll_receive(context, scratch)).await
+    } else {
+        transport.receive().await
     }
 }
 
@@ -259,7 +486,6 @@ impl std::fmt::Debug for PacketPoller {
 
 impl UdpPoller for PacketPoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.0.writer.register(cx.waker());
         let state = self.0.state.lock().unwrap();
         if state.closed {
             return Poll::Ready(Err(state.error.unwrap_or(io::ErrorKind::BrokenPipe).into()));
@@ -267,6 +493,7 @@ impl UdpPoller for PacketPoller {
         if state.outgoing.len() < QUEUE_LIMIT {
             Poll::Ready(Ok(()))
         } else {
+            self.0.writer.register(cx.waker());
             Poll::Pending
         }
     }
@@ -274,10 +501,24 @@ impl UdpPoller for PacketPoller {
 
 impl AsyncUdpSocket for DatagramSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(socket) = &self.physical {
+            return socket.create_io_poller();
+        }
         Box::pin(PacketPoller(self.shared.clone()))
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(socket) = &self.physical {
+            return socket.try_send(transmit);
+        }
         if transmit.destination != self.peer
             || transmit.contents.len() > usize::from(self.budget.transmit())
             || transmit.segment_size.is_some()
@@ -292,6 +533,7 @@ impl AsyncUdpSocket for DatagramSocket {
         if state.outgoing.len() == QUEUE_LIMIT {
             return Err(io::ErrorKind::WouldBlock.into());
         }
+        let was_empty = state.outgoing.is_empty();
         state
             .outgoing
             .push_back(Bytes::copy_from_slice(transmit.contents));
@@ -302,7 +544,9 @@ impl AsyncUdpSocket for DatagramSocket {
             QUEUE_LIMIT,
         );
         drop(state);
-        self.shared.changed.notify_one();
+        if was_empty {
+            self.shared.changed.notify_one();
+        }
         Ok(())
     }
 
@@ -312,32 +556,63 @@ impl AsyncUdpSocket for DatagramSocket {
         buffers: &mut [IoSliceMut<'_>],
         meta: &mut [quinn::udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        self.shared.reader.register(cx.waker());
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(socket) = &self.physical {
+            return socket.poll_recv(cx, buffers, meta);
+        }
         let mut state = self.shared.state.lock().unwrap();
         if state.closed {
             return Poll::Ready(Err(state.error.unwrap_or(io::ErrorKind::BrokenPipe).into()));
         }
         let Some(payload) = state.incoming.front() else {
+            self.shared.reader.register(cx.waker());
             return Poll::Pending;
         };
         if buffers.is_empty() || meta.is_empty() || buffers[0].len() < payload.len() {
             return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
         }
-        buffers[0][..payload.len()].copy_from_slice(payload);
-        meta[0] = quinn::udp::RecvMeta {
-            addr: self.peer,
-            len: payload.len(),
-            stride: payload.len(),
-            ecn: None,
-            dst_ip: None,
-        };
-        state.incoming.pop_front();
-        // Resume the single transport owner when the consumer frees capacity.
-        self.shared.changed.notify_one();
-        Poll::Ready(Ok(1))
+        let was_full = state.incoming.len() == QUEUE_LIMIT;
+        let mut received = 0;
+        for (buffer, metadata) in buffers.iter_mut().zip(meta.iter_mut()) {
+            let Some(payload) = state.incoming.front() else {
+                break;
+            };
+            // A short later buffer must not discard a packet or hide the
+            // packets already copied into the caller's batch.
+            if buffer.len() < payload.len() {
+                break;
+            }
+            buffer[..payload.len()].copy_from_slice(payload);
+            *metadata = quinn::udp::RecvMeta {
+                addr: self.peer,
+                len: payload.len(),
+                stride: payload.len(),
+                ecn: None,
+                dst_ip: None,
+            };
+            state.incoming.pop_front();
+            received += 1;
+        }
+        drop(state);
+        // Only a full queue suppresses the owner's physical receive. Other
+        // consumption must leave its already pending receive undisturbed.
+        if was_full {
+            self.shared.changed.notify_one();
+        }
+        Poll::Ready(Ok(received))
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(socket) = &self.physical {
+            return socket.local_addr();
+        }
         // Logical socket metadata only. Vole's public datagram transport owns
         // physical sockets and intentionally does not expose their bound ports.
         Ok(if self.peer.is_ipv4() {
@@ -350,6 +625,796 @@ impl AsyncUdpSocket for DatagramSocket {
     }
 
     fn may_fragment(&self) -> bool {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(socket) = &self.physical {
+            return socket.may_fragment();
+        }
         false
+    }
+    fn max_transmit_segments(&self) -> usize {
+        #[cfg(all(
+            target_os = "linux",
+            any(feature = "outbound-tuic", feature = "quinn-h3-transport")
+        ))]
+        if let Some(socket) = &self.physical {
+            return socket.transmit_segments();
+        }
+        1
+    }
+    // GRO is explicitly disabled on the native owned socket. Keep the same
+    // per-datagram receive allocation and packet boundaries on every path.
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Sink {
+        sent: Arc<AtomicUsize>,
+        changed: Arc<Notify>,
+    }
+    #[async_trait::async_trait]
+    impl DatagramTransport for Sink {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
+        async fn send(&mut self, _: Datagram) -> Result<(), DispatchError> {
+            self.sent.fetch_add(1, Ordering::AcqRel);
+            self.changed.notify_one();
+            Ok(())
+        }
+        async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            std::future::pending().await
+        }
+    }
+    #[tokio::test]
+    async fn quic_memory_coalesced_notifications_drain_all_queued_packets_without_rx() {
+        let sent = Arc::new(AtomicUsize::new(0));
+        let changed = Arc::new(Notify::new());
+        let peer = "192.0.2.1:443".parse().unwrap();
+        let (socket, driver) = attach(
+            Box::new(Sink {
+                sent: sent.clone(),
+                changed: changed.clone(),
+            }),
+            peer,
+            DatagramBudget::new(1400, 1400),
+        )
+        .unwrap();
+        // No await until all notifications have coalesced. The peer never
+        // replies, so queued output must itself keep the owner runnable.
+        for _ in 0..16 {
+            socket
+                .try_send(&quinn::udp::Transmit {
+                    destination: peer,
+                    ecn: None,
+                    contents: b"packet",
+                    segment_size: None,
+                    src_ip: None,
+                })
+                .unwrap();
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while sent.load(Ordering::Acquire) < 16 {
+                changed.notified().await;
+            }
+        })
+        .await;
+        driver.stop().await.unwrap();
+        assert!(result.is_ok());
+        assert_eq!(sent.load(Ordering::Acquire), 16);
+    }
+}
+
+#[cfg(test)]
+mod pending_waker_tests {
+    use super::*;
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Wake, Waker},
+        time::Duration,
+    };
+    use tokio::sync::{Semaphore, mpsc};
+
+    #[derive(Default)]
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    impl Count {
+        fn get(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+    struct Carrier {
+        input: mpsc::Receiver<Datagram>,
+        credit: Arc<Semaphore>,
+        starts: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+        leases: Arc<AtomicUsize>,
+        owned: bool,
+        polled: bool,
+    }
+    struct SendLease(Arc<AtomicUsize>);
+    impl Drop for SendLease {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    #[async_trait::async_trait]
+    impl DatagramTransport for Carrier {
+        fn supports_shared_destinations(&self) -> bool {
+            false
+        }
+
+        fn supports_poll_receive(&self) -> bool {
+            self.polled
+        }
+        fn poll_receive(
+            &mut self,
+            context: &mut Context<'_>,
+            _: &mut Vec<u8>,
+        ) -> Poll<Result<Datagram, DispatchError>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.input
+                .poll_recv(context)
+                .map(|packet| packet.ok_or(DispatchError::ConnectionRefused))
+        }
+        fn send_owned(
+            &mut self,
+            datagram: Datagram,
+        ) -> Result<crate::dispatch::OwnedDatagramSend, Datagram> {
+            if !self.owned {
+                return Err(datagram);
+            }
+            let starts = self.starts.clone();
+            let credit = self.credit.clone();
+            self.leases.fetch_add(1, Ordering::Relaxed);
+            let lease = SendLease(self.leases.clone());
+            Ok(Box::pin(async move {
+                let _lease = lease;
+                starts.fetch_add(1, Ordering::Relaxed);
+                credit
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| DispatchError::ConnectionRefused)?
+                    .forget();
+                Ok(())
+            }))
+        }
+        async fn send(&mut self, _: Datagram) -> Result<(), DispatchError> {
+            self.starts.fetch_add(1, Ordering::Relaxed);
+            self.credit
+                .acquire()
+                .await
+                .map_err(|_| DispatchError::ConnectionRefused)?
+                .forget();
+            Ok(())
+        }
+        async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+            assert!(
+                !self.polled,
+                "polled carrier used boxed asynchronous receive"
+            );
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.input
+                .recv()
+                .await
+                .ok_or(DispatchError::ConnectionRefused)
+        }
+        async fn close(&mut self) -> Result<(), DispatchError> {
+            assert_eq!(
+                self.leases.load(Ordering::Relaxed),
+                0,
+                "physical send survived close"
+            );
+            self.closed.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    struct Fixture {
+        socket: Arc<DatagramSocket>,
+        driver: DatagramDriver,
+        input: mpsc::Sender<Datagram>,
+        credit: Arc<Semaphore>,
+        starts: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+        leases: Arc<AtomicUsize>,
+        peer: SocketAddr,
+    }
+    fn fixture(gated: bool) -> io::Result<Fixture> {
+        fixture_mode(gated, false)
+    }
+    fn fixture_mode(gated: bool, owned: bool) -> io::Result<Fixture> {
+        fixture_polled(gated, owned, false)
+    }
+    fn fixture_polled(gated: bool, owned: bool, polled: bool) -> io::Result<Fixture> {
+        let (input, receive) = mpsc::channel(64);
+        let credit = Arc::new(Semaphore::new(if gated { 0 } else { 64 }));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let leases = Arc::new(AtomicUsize::new(0));
+        let peer = "192.0.2.1:443".parse().unwrap();
+        let (socket, driver) = attach(
+            Box::new(Carrier {
+                input: receive,
+                credit: credit.clone(),
+                starts: starts.clone(),
+                reads: reads.clone(),
+                closed: closed.clone(),
+                leases: leases.clone(),
+                owned,
+                polled,
+            }),
+            peer,
+            DatagramBudget::new(1400, 1400),
+        )?;
+        Ok(Fixture {
+            socket,
+            driver,
+            input,
+            credit,
+            starts,
+            reads,
+            closed,
+            leases,
+            peer,
+        })
+    }
+    fn send(fixture: &Fixture) -> io::Result<()> {
+        fixture.socket.try_send(&quinn::udp::Transmit {
+            destination: fixture.peer,
+            ecn: None,
+            contents: b"outbound",
+            segment_size: None,
+            src_ip: None,
+        })
+    }
+    fn inject(fixture: &Fixture, payload: &'static [u8]) -> io::Result<()> {
+        fixture
+            .input
+            .try_send(Datagram {
+                remote: Destination::Ip(fixture.peer),
+                payload: Bytes::from_static(payload),
+                sniffed_domain: None,
+            })
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+    async fn wait_for(mut condition: impl FnMut() -> bool) -> io::Result<()> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| io::ErrorKind::TimedOut.into())
+    }
+    fn ready<T>(poll: Poll<io::Result<T>>) -> io::Result<T> {
+        match poll {
+            Poll::Ready(result) => result,
+            Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
+        }
+    }
+    #[tokio::test]
+    async fn quic_memory_owned_send_keeps_receive_live_while_physical_write_waits() {
+        let fixture = fixture_mode(true, true).unwrap();
+        let result = async {
+            fixture.credit.add_permits(1);
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            send(&fixture)?;
+            wait_for(|| fixture.starts.load(Ordering::Relaxed) == 2).await?;
+            inject(&fixture, b"reply while write waits")?;
+            wait_for(|| fixture.socket.stats().received == 1).await?;
+            let completed_while_blocked = fixture.socket.stats().sent;
+            fixture.credit.add_permits(1);
+            wait_for(|| fixture.socket.stats().sent == 2).await?;
+            Ok::<_, io::Error>(completed_while_blocked)
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.leases.load(Ordering::Relaxed), 0);
+        assert_eq!(fixture.starts.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            result.expect("blocked physical send hid a ready receive"),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn quic_memory_uses_polled_carrier_without_boxed_receive() {
+        let fixture = fixture_polled(false, true, true).unwrap();
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            inject(&fixture, b"polled reply")?;
+            wait_for(|| fixture.socket.stats().received == 1).await
+        }
+        .await;
+        let stopped = fixture.driver.stop().await;
+        result.unwrap();
+        stopped.unwrap();
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        assert!(fixture.reads.load(Ordering::Relaxed) > 0);
+    }
+    #[tokio::test]
+    async fn quic_memory_receive_batches_ready_packets_in_order() {
+        let fixture = fixture(false).unwrap();
+        let waker = Waker::from(Arc::new(Count::default()));
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            inject(&fixture, b"first")?;
+            inject(&fixture, b"second")?;
+            wait_for(|| fixture.socket.stats().received == 2).await?;
+            let mut first = [0; 1400];
+            let mut second = [0; 1400];
+            let mut meta = [quinn::udp::RecvMeta::default(); 2];
+            let received = ready(fixture.socket.poll_recv(
+                &mut Context::from_waker(&waker),
+                &mut [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)],
+                &mut meta,
+            ))?;
+            Ok::<_, io::Error>((received, first, second, meta))
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        let (received, first, second, meta) = result.unwrap();
+        assert_eq!(
+            received, 2,
+            "ready packet batch was split into separate polls"
+        );
+        for (bytes, expected, metadata) in [
+            (&first[..], b"first".as_slice(), meta[0]),
+            (&second[..], b"second".as_slice(), meta[1]),
+        ] {
+            assert_eq!(&bytes[..metadata.len], expected);
+            assert_eq!(metadata.addr, fixture.peer);
+            assert_eq!(metadata.stride, metadata.len);
+        }
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+    }
+    #[tokio::test]
+    async fn quic_memory_stop_drops_owned_send_before_closing_carrier() {
+        let fixture = fixture_mode(true, true).unwrap();
+        send(&fixture).unwrap();
+        let result = wait_for(|| fixture.starts.load(Ordering::Relaxed) == 1).await;
+        let leases = fixture.leases.load(Ordering::Relaxed);
+        fixture.driver.stop().await.unwrap();
+        result.unwrap();
+        assert_eq!(leases, 1);
+        assert_eq!(fixture.leases.load(Ordering::Relaxed), 0);
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.socket.stats().sent, 0);
+    }
+    #[tokio::test]
+    async fn quic_memory_nonfull_receive_keeps_the_pending_carrier_read() {
+        let fixture = fixture(false).unwrap();
+        let waker = Waker::from(Arc::new(Count::default()));
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            inject(&fixture, b"first")?;
+            wait_for(|| fixture.socket.stats().received == 1).await?;
+            let before = fixture.reads.load(Ordering::Relaxed);
+            let mut bytes = [0; 1400];
+            let mut meta = [quinn::udp::RecvMeta::default()];
+            ready(fixture.socket.poll_recv(
+                &mut Context::from_waker(&waker),
+                &mut [IoSliceMut::new(&mut bytes)],
+                &mut meta,
+            ))?;
+            assert_eq!(&bytes[..meta[0].len], b"first");
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            let after = fixture.reads.load(Ordering::Relaxed);
+            inject(&fixture, b"second")?;
+            wait_for(|| fixture.socket.stats().received == 2).await?;
+            Ok::<_, io::Error>((before, after))
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        let (before, after) = result.unwrap();
+        assert_eq!(after, before, "consumption restarted an unblocked read");
+    }
+    // These three RED cases exercise the real attached carrier and owner. No
+    // setter manufactures queue/credit/readiness, and no AtomicWaker is taken
+    // or cleared by the assertion. Stop is awaited before each failing assert.
+    #[tokio::test]
+    async fn quic_memory_ready_receive_does_not_register_for_next_packet() {
+        let fixture = fixture(false).unwrap();
+        let count = Arc::new(Count::default());
+        let waker = Waker::from(count.clone());
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            inject(&fixture, b"first")?;
+            wait_for(|| fixture.socket.stats().received == 1).await?;
+            let mut bytes = [0; 1400];
+            let mut meta = [quinn::udp::RecvMeta::default()];
+            let received = ready(fixture.socket.poll_recv(
+                &mut Context::from_waker(&waker),
+                &mut [IoSliceMut::new(&mut bytes)],
+                &mut meta,
+            ))?;
+            let first = bytes[..meta[0].len].to_vec();
+            inject(&fixture, b"second")?;
+            wait_for(|| fixture.socket.stats().received == 2).await?;
+            Ok::<_, io::Error>((received, first, count.get()))
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        let (received, payload, wakes) = result.unwrap();
+        assert_eq!(received, 1);
+        assert_eq!(payload, b"first");
+        assert_eq!(
+            wakes, 0,
+            "Ready receive retained a registration for later ingress"
+        );
+    }
+    #[tokio::test]
+    async fn quic_memory_ready_writable_does_not_register_for_later_send() {
+        let fixture = fixture(false).unwrap();
+        let count = Arc::new(Count::default());
+        let waker = Waker::from(count.clone());
+        let mut poller = fixture.socket.clone().create_io_poller();
+        let result = async {
+            ready(
+                poller
+                    .as_mut()
+                    .poll_writable(&mut Context::from_waker(&waker)),
+            )?;
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            Ok::<_, io::Error>(count.get())
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "Ready writable retained a registration for later egress"
+        );
+    }
+    #[tokio::test]
+    async fn quic_memory_ready_transmitted_does_not_register_for_later_send() {
+        let fixture = fixture(false).unwrap();
+        let count = Arc::new(Count::default());
+        let waker = Waker::from(count.clone());
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            ready(
+                fixture
+                    .socket
+                    .poll_transmitted(&mut Context::from_waker(&waker), 1),
+            )?;
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 2).await?;
+            Ok::<_, io::Error>(count.get())
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "Ready transmission barrier retained a registration"
+        );
+    }
+    // Cancellation drops only the waiting future; the carrier/driver stays
+    // owned. A subsequent Pending caller gets the next real progress wake.
+    #[tokio::test]
+    async fn quic_memory_cancelled_receive_wait_replaced_by_pending_reader_is_woken() {
+        let fixture = fixture(false).unwrap();
+        let cancelled = Arc::new(Count::default());
+        let count = Arc::new(Count::default());
+        let first_waker = Waker::from(cancelled);
+        let waker = Waker::from(count.clone());
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            let mut bytes = [0; 1400];
+            let mut meta = [quinn::udp::RecvMeta::default()];
+            let mut wait = Box::pin(std::future::poll_fn(|cx| {
+                fixture
+                    .socket
+                    .poll_recv(cx, &mut [IoSliceMut::new(&mut bytes)], &mut meta)
+            }));
+            let first_pending = wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&first_waker))
+                .is_pending();
+            drop(wait);
+            let pending = fixture
+                .socket
+                .poll_recv(
+                    &mut Context::from_waker(&waker),
+                    &mut [IoSliceMut::new(&mut bytes)],
+                    &mut meta,
+                )
+                .is_pending();
+            inject(&fixture, b"resumed")?;
+            wait_for(|| count.get() > 0).await?;
+            let delivered = ready(fixture.socket.poll_recv(
+                &mut Context::from_waker(&waker),
+                &mut [IoSliceMut::new(&mut bytes)],
+                &mut meta,
+            ))?;
+            Ok::<_, io::Error>((
+                first_pending,
+                pending,
+                delivered,
+                bytes[..meta[0].len].to_vec(),
+            ))
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        let (first_pending, pending, delivered, payload) = result.unwrap();
+        assert!(first_pending && pending);
+        assert_eq!(delivered, 1);
+        assert_eq!(payload, b"resumed");
+    }
+    #[tokio::test]
+    async fn quic_memory_pending_writable_wakes_on_real_queue_capacity() {
+        let fixture = fixture(true).unwrap();
+        let count = Arc::new(Count::default());
+        let waker = Waker::from(count.clone());
+        let mut poller = fixture.socket.clone().create_io_poller();
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.starts.load(Ordering::Relaxed) == 1).await?;
+            for _ in 0..QUEUE_LIMIT {
+                send(&fixture)?;
+            }
+            let overflow = send(&fixture).err().map(|error| error.kind());
+            let pending = poller
+                .as_mut()
+                .poll_writable(&mut Context::from_waker(&waker))
+                .is_pending();
+            fixture.credit.add_permits(1);
+            wait_for(|| fixture.starts.load(Ordering::Relaxed) >= 2 && count.get() > 0).await?;
+            ready(
+                poller
+                    .as_mut()
+                    .poll_writable(&mut Context::from_waker(&waker)),
+            )?;
+            Ok::<_, io::Error>((overflow, pending))
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        let (overflow, pending) = result.unwrap();
+        assert_eq!(overflow, Some(io::ErrorKind::WouldBlock));
+        assert!(pending);
+    }
+    #[tokio::test]
+    async fn quic_memory_pending_transmission_wakes_on_real_send_completion() {
+        let fixture = fixture(true).unwrap();
+        let count = Arc::new(Count::default());
+        let waker = Waker::from(count.clone());
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.starts.load(Ordering::Relaxed) == 1).await?;
+            let pending = fixture
+                .socket
+                .poll_transmitted(&mut Context::from_waker(&waker), 1)
+                .is_pending();
+            fixture.credit.add_permits(1);
+            wait_for(|| fixture.socket.stats().sent == 1 && count.get() > 0).await?;
+            ready(
+                fixture
+                    .socket
+                    .poll_transmitted(&mut Context::from_waker(&waker), 1),
+            )?;
+            Ok::<_, io::Error>(pending)
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        assert!(result.unwrap());
+    }
+
+    #[cfg(feature = "quiche-h3-transport")]
+    fn inject_payload(fixture: &Fixture, payload: Bytes) -> io::Result<()> {
+        fixture
+            .input
+            .try_send(Datagram {
+                remote: Destination::Ip(fixture.peer),
+                payload,
+                sniffed_domain: None,
+            })
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+
+    #[cfg(feature = "quiche-h3-transport")]
+    #[tokio::test]
+    async fn quic_memory_owned_receive_keeps_unique_storage_and_real_wakes() {
+        let fixture = fixture(false).unwrap();
+        let count = Arc::new(Count::default());
+        let waker = Waker::from(count.clone());
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            let pending = fixture
+                .socket
+                .poll_recv_owned(&mut Context::from_waker(&waker))
+                .is_pending();
+            let payload = Bytes::copy_from_slice(b"owned allocation");
+            let pointer = payload.as_ptr() as usize;
+            inject_payload(&fixture, payload)?;
+            wait_for(|| fixture.socket.stats().received == 1 && count.get() > 0).await?;
+            let payload = ready(
+                fixture
+                    .socket
+                    .poll_recv_owned(&mut Context::from_waker(&waker)),
+            )?;
+            let same_storage = payload.as_ptr() as usize == pointer;
+            let bytes = payload.to_vec();
+            let mutable = payload
+                .try_into_mut()
+                .map_err(|_| io::Error::other("owned input lost uniqueness"))?;
+            let same_mutable_storage = mutable.as_ptr() as usize == pointer;
+            drop(mutable);
+            let before = count.get();
+            inject(&fixture, b"next")?;
+            wait_for(|| fixture.socket.stats().received == 2).await?;
+            let next = ready(
+                fixture
+                    .socket
+                    .poll_recv_owned(&mut Context::from_waker(&waker)),
+            )?;
+            let quiet_after_ready = count.get() == before;
+            let stopped_pending = fixture
+                .socket
+                .poll_recv_owned(&mut Context::from_waker(&waker))
+                .is_pending();
+            Ok::<_, io::Error>((
+                pending,
+                same_storage,
+                same_mutable_storage,
+                bytes,
+                next,
+                quiet_after_ready,
+                stopped_pending,
+                count.get(),
+            ))
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        let stopped = fixture
+            .socket
+            .poll_recv_owned(&mut Context::from_waker(&waker));
+        let state = fixture.socket.shared.state.lock().unwrap();
+        assert!(state.closed && state.incoming.is_empty() && state.outgoing.is_empty());
+        drop(state);
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        let (
+            pending,
+            same_storage,
+            same_mutable_storage,
+            bytes,
+            next,
+            quiet_after_ready,
+            stopped_pending,
+            before_stop,
+        ) = result.unwrap();
+        assert!(pending && stopped_pending && quiet_after_ready);
+        assert!(
+            same_storage && same_mutable_storage,
+            "owned receive copied the real carrier allocation"
+        );
+        assert_eq!(bytes, b"owned allocation");
+        assert_eq!(next.as_ref(), b"next");
+        assert!(
+            count.get() > before_stop,
+            "Stop did not wake the actual pending reader"
+        );
+        assert!(
+            matches!(stopped, Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+    }
+
+    #[cfg(feature = "quiche-h3-transport")]
+    #[tokio::test]
+    async fn quic_memory_owned_receive_resumes_full_carrier_and_preserves_shared_inputs() {
+        let fixture = fixture(false).unwrap();
+        let count = Arc::new(Count::default());
+        let waker = Waker::from(count);
+        let result = async {
+            send(&fixture)?;
+            wait_for(|| fixture.socket.stats().sent == 1).await?;
+            let shared = Bytes::copy_from_slice(b"shared input");
+            inject_payload(&fixture, shared.clone())?;
+            inject(&fixture, b"static input")?;
+            inject_payload(&fixture, Bytes::from_owner(vec![0x42; 17]))?;
+            for _ in 3..=QUEUE_LIMIT {
+                inject(&fixture, b"queued")?;
+            }
+            wait_for(|| fixture.socket.stats().received == QUEUE_LIMIT).await?;
+            let full = fixture.socket.shared.state.lock().unwrap().incoming.len();
+            let first = ready(
+                fixture
+                    .socket
+                    .poll_recv_owned(&mut Context::from_waker(&waker)),
+            )?;
+            let same_shared_storage = first.as_ptr() == shared.as_ptr();
+            let shared_bytes = first.to_vec();
+            let shared_is_readonly = first.try_into_mut().is_err();
+            wait_for(|| fixture.socket.stats().received == QUEUE_LIMIT + 1).await?;
+            let second = ready(
+                fixture
+                    .socket
+                    .poll_recv_owned(&mut Context::from_waker(&waker)),
+            )?;
+            let static_bytes = second.to_vec();
+            let static_is_readonly = second.try_into_mut().is_err();
+            let third = ready(
+                fixture
+                    .socket
+                    .poll_recv_owned(&mut Context::from_waker(&waker)),
+            )?;
+            let owner_bytes = third.to_vec();
+            let owner_is_readonly = third.try_into_mut().is_err();
+            Ok::<_, io::Error>((
+                full,
+                same_shared_storage,
+                shared_bytes,
+                shared.to_vec(),
+                shared_is_readonly,
+                static_bytes,
+                static_is_readonly,
+                owner_bytes,
+                owner_is_readonly,
+            ))
+        }
+        .await;
+        fixture.driver.stop().await.unwrap();
+        let state = fixture.socket.shared.state.lock().unwrap();
+        assert!(state.closed && state.incoming.is_empty() && state.outgoing.is_empty());
+        drop(state);
+        assert_eq!(fixture.closed.load(Ordering::Relaxed), 1);
+        let (
+            full,
+            same_shared_storage,
+            shared_bytes,
+            original_bytes,
+            shared_is_readonly,
+            static_bytes,
+            static_is_readonly,
+            owner_bytes,
+            owner_is_readonly,
+        ) = result.unwrap();
+        assert_eq!(full, QUEUE_LIMIT);
+        assert_eq!(fixture.socket.stats().received, QUEUE_LIMIT + 1);
+        assert!(
+            same_shared_storage && shared_is_readonly && static_is_readonly && owner_is_readonly
+        );
+        assert_eq!(shared_bytes, b"shared input");
+        assert_eq!(original_bytes, b"shared input");
+        assert_eq!(static_bytes, b"static input");
+        assert_eq!(owner_bytes, [0x42; 17]);
     }
 }

@@ -1,57 +1,43 @@
 use std::{
-    ffi::c_void,
-    io, mem, ptr,
+    io,
     sync::atomic::{AtomicBool, AtomicU8, Ordering},
     time::Duration,
 };
 
-use crate::limits::{
-    IOS_TUN_PEAK_OBSERVATION_TARGET_BYTES, IOS_TUN_START_OBSERVATION_TARGET_BYTES,
-};
+#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+use std::{ffi::c_void, mem, ptr};
+
+use crate::limits::{MEMORY_OBSERVATION_1GBPS_BYTES, MEMORY_OBSERVATION_CEILING_BYTES};
 
 pub(crate) const TELEMETRY_INTERVAL: Duration = Duration::from_secs(30);
 
+#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
 const TASK_VM_INFO: libc::task_flavor_t = 22;
-const FORTY_MIB: u64 = 40 * 1024 * 1024;
-const THRESHOLDS: [MemoryThreshold; 3] = [
+const THRESHOLDS: [MemoryThreshold; 2] = [
     MemoryThreshold {
-        bytes: IOS_TUN_START_OBSERVATION_TARGET_BYTES,
+        bytes: MEMORY_OBSERVATION_1GBPS_BYTES,
         bit: 1 << 0,
-        mib: 35,
+        mib: 43,
     },
     MemoryThreshold {
-        bytes: FORTY_MIB,
+        bytes: MEMORY_OBSERVATION_CEILING_BYTES,
         bit: 1 << 1,
-        mib: 40,
-    },
-    MemoryThreshold {
-        bytes: IOS_TUN_PEAK_OBSERVATION_TARGET_BYTES,
-        bit: 1 << 2,
         mib: 45,
     },
 ];
 
 static TELEMETRY_POLICY: MemoryTelemetryPolicy = MemoryTelemetryPolicy::new();
 
-// Preserve existing iOS event identifiers for consumers, without labelling
-// tvOS samples as iOS. These are diagnostics, not platform memory quotas.
-const MEMORY_EVENTS: [&str; 3] = if cfg!(target_os = "tvos") {
-    [
-        "tvos_memory_snapshot",
-        "tvos_memory_observation_target_crossed",
-        "tvos_memory_measurement_failed",
-    ]
-} else {
-    [
-        "ios_memory_snapshot",
-        "ios_memory_observation_target_crossed",
-        "ios_memory_measurement_failed",
-    ]
-};
+const MEMORY_EVENTS: [&str; 3] = [
+    "memory_snapshot",
+    "memory_observation_threshold_crossed",
+    "memory_measurement_failed",
+];
 
 /// Public `TASK_VM_INFO` layout through revision 3. Revision 3 is the first
 /// revision that contains `ledger_phys_footprint_peak`; using that fixed,
 /// documented prefix avoids depending on newer SDK-only tail fields.
+#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 struct TaskVmInfoRev3 {
@@ -83,8 +69,9 @@ struct TaskVmInfoRev3 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcessMemorySnapshot {
-    pub current_phys_footprint: u64,
-    pub lifetime_peak_phys_footprint: u64,
+    pub current_bytes: u64,
+    pub lifetime_peak_bytes: u64,
+    pub metric: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,8 +81,8 @@ struct MemoryThreshold {
     mib: u8,
 }
 
-/// Platform-neutral decision state. The Mach provider is intentionally kept
-/// outside this type so host tests can inject arbitrary snapshots and errors.
+/// The platform measurement provider is kept outside the policy so memory
+/// observation stays non-fatal and can be tested without process sampling.
 struct MemoryTelemetryPolicy {
     crossed_thresholds: AtomicU8,
     measurement_failure_warned: AtomicBool,
@@ -114,7 +101,7 @@ impl MemoryTelemetryPolicy {
             Ok(snapshot) => {
                 let crossed = THRESHOLDS
                     .iter()
-                    .filter(|threshold| snapshot.current_phys_footprint >= threshold.bytes)
+                    .filter(|threshold| snapshot.current_bytes >= threshold.bytes)
                     .fold(0_u8, |mask, threshold| mask | threshold.bit);
                 let already_crossed = self.crossed_thresholds.fetch_or(crossed, Ordering::Relaxed);
                 TelemetryObservation::Snapshot {
@@ -155,9 +142,10 @@ pub(crate) fn observe(stage: &'static str) {
                 event = MEMORY_EVENTS[0],
                 platform = std::env::consts::OS,
                 stage,
-                current_phys_footprint_bytes = snapshot.current_phys_footprint,
-                process_lifetime_peak_phys_footprint_bytes = snapshot.lifetime_peak_phys_footprint,
-                "Apple TUN memory telemetry"
+                metric = snapshot.metric,
+                current_bytes = snapshot.current_bytes,
+                process_lifetime_peak_bytes = snapshot.lifetime_peak_bytes,
+                "TUN memory telemetry"
             );
             for threshold in THRESHOLDS
                 .iter()
@@ -167,12 +155,12 @@ pub(crate) fn observe(stage: &'static str) {
                     event = MEMORY_EVENTS[1],
                     platform = std::env::consts::OS,
                     stage,
-                    current_phys_footprint_bytes = snapshot.current_phys_footprint,
-                    process_lifetime_peak_phys_footprint_bytes =
-                        snapshot.lifetime_peak_phys_footprint,
+                    metric = snapshot.metric,
+                    current_bytes = snapshot.current_bytes,
+                    process_lifetime_peak_bytes = snapshot.lifetime_peak_bytes,
                     threshold_bytes = threshold.bytes,
                     threshold_mib = threshold.mib,
-                    "Apple TUN current memory crossed an observation threshold"
+                    "TUN current memory crossed an observation threshold"
                 );
             }
         }
@@ -183,7 +171,7 @@ pub(crate) fn observe(stage: &'static str) {
                     platform = std::env::consts::OS,
                     stage,
                     error = %error,
-                    "unable to sample Apple TUN memory telemetry"
+                    "unable to sample TUN memory telemetry"
                 );
             }
         }
@@ -192,6 +180,7 @@ pub(crate) fn observe(stage: &'static str) {
 
 /// Reads current and process-lifetime physical footprint using public
 /// `TASK_VM_INFO` fields. Callers must treat failure as telemetry loss only.
+#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
 #[allow(deprecated)] // libc recommends mach2 for the thin mach_task_self accessor.
 pub(crate) fn snapshot() -> io::Result<ProcessMemorySnapshot> {
     let mut info = TaskVmInfoRev3::default();
@@ -226,21 +215,114 @@ pub(crate) fn snapshot() -> io::Result<ProcessMemorySnapshot> {
     }
     let peak = u64::try_from(info.ledger_phys_footprint_peak).unwrap_or(0);
     Ok(ProcessMemorySnapshot {
-        current_phys_footprint: info.phys_footprint,
-        lifetime_peak_phys_footprint: peak,
+        current_bytes: info.phys_footprint,
+        lifetime_peak_bytes: peak,
+        metric: "physical_footprint",
     })
 }
 
-/// Best-effort release of free pages held by Apple's malloc zones after a TUN
-/// consumer has stopped. It has no bearing on lifecycle success.
+/// Best-effort release after the TUN consumer stops; never a lifecycle result.
+#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
 pub(crate) fn relieve_allocator_pressure() {
     unsafe extern "C" {
         fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
     }
     // SAFETY: a null zone asks the allocator to inspect all zones; goal zero
-    // requests best-effort pressure relief. Available on supported iOS/tvOS targets.
+    // requests best-effort pressure relief. Available on supported Apple targets.
     let _released = unsafe { malloc_zone_pressure_relief(ptr::null_mut(), 0) };
 }
+
+/// Apply GNU allocator hints once, after TUN lifecycle admission and before
+/// Core workers start. Existing allocator overrides retain all system defaults.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn configure_allocator() {
+    static CONFIGURED: std::sync::Once = std::sync::Once::new();
+    CONFIGURED.call_once(|| {
+        if allocator_hints_allowed(
+            std::env::var_os("MALLOC_ARENA_MAX").is_some(),
+            std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_some(),
+            std::env::var_os("GLIBC_TUNABLES").is_some(),
+        ) {
+            // SAFETY: glibc's process-wide hint interface takes integer values
+            // and retains no caller-owned memory. Failure preserves defaults.
+            let _ = unsafe { libc::mallopt(libc::M_ARENA_MAX, 1) };
+            let _ = unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 32 * 1024) };
+        }
+    });
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn allocator_hints_allowed(
+    arena_override: bool,
+    mmap_override: bool,
+    tunables_override: bool,
+) -> bool {
+    !(arena_override || mmap_override || tunables_override)
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub(crate) fn configure_allocator() {}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn snapshot() -> io::Result<ProcessMemorySnapshot> {
+    parse_linux_status(&std::fs::read_to_string("/proc/self/status")?)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_status(status: &str) -> io::Result<ProcessMemorySnapshot> {
+    fn bytes(status: &str, field: &str) -> io::Result<u64> {
+        status
+            .lines()
+            .find_map(|line| {
+                let value = line.strip_prefix(field)?;
+                let mut words = value.split_ascii_whitespace();
+                let kib = words.next()?.parse::<u64>().ok()?;
+                if words.next()? != "kB" || words.next().is_some() {
+                    return None;
+                }
+                kib.checked_mul(1024)
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "procfs memory metric is unavailable",
+                )
+            })
+    }
+    Ok(ProcessMemorySnapshot {
+        current_bytes: bytes(status, "VmRSS:")?,
+        lifetime_peak_bytes: bytes(status, "VmHWM:")?,
+        metric: "resident_set",
+    })
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "macos"
+)))]
+pub(crate) fn snapshot() -> io::Result<ProcessMemorySnapshot> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process memory measurement is unavailable on this target",
+    ))
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn relieve_allocator_pressure() {
+    // SAFETY: glibc's public allocator trim takes no caller-owned pointers;
+    // refusing or releasing no pages does not affect lifecycle completion.
+    let _ = unsafe { libc::malloc_trim(0) };
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", target_env = "gnu"),
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "macos"
+)))]
+pub(crate) fn relieve_allocator_pressure() {}
 
 #[cfg(test)]
 mod tests {
@@ -250,8 +332,9 @@ mod tests {
 
     fn snapshot_at(current: u64, lifetime_peak: u64) -> io::Result<ProcessMemorySnapshot> {
         Ok(ProcessMemorySnapshot {
-            current_phys_footprint: current,
-            lifetime_peak_phys_footprint: lifetime_peak,
+            current_bytes: current,
+            lifetime_peak_bytes: lifetime_peak,
+            metric: "injected",
         })
     }
 
@@ -272,16 +355,16 @@ mod tests {
     #[test]
     fn thresholds_use_current_and_are_reported_only_once() {
         let policy = MemoryTelemetryPolicy::new();
-        let (snapshot, crossed) = sampled(&policy, 35 * 1024 * 1024 - 1, 100 * 1024 * 1024);
-        assert_eq!(snapshot.lifetime_peak_phys_footprint, 100 * 1024 * 1024);
+        let (snapshot, crossed) = sampled(&policy, 43 * 1024 * 1024 - 1, 100 * 1024 * 1024);
+        assert_eq!(snapshot.lifetime_peak_bytes, 100 * 1024 * 1024);
         assert_eq!(crossed, 0);
         assert_eq!(
-            sampled(&policy, 35 * 1024 * 1024, 100 * 1024 * 1024).1,
+            sampled(&policy, 43 * 1024 * 1024, 100 * 1024 * 1024).1,
             1 << 0
         );
         assert_eq!(
-            sampled(&policy, 46 * 1024 * 1024, 100 * 1024 * 1024).1,
-            (1 << 1) | (1 << 2)
+            sampled(&policy, 45 * 1024 * 1024, 100 * 1024 * 1024).1,
+            1 << 1
         );
         assert_eq!(sampled(&policy, 46 * 1024 * 1024, 101 * 1024 * 1024).1, 0);
     }
@@ -320,9 +403,10 @@ mod tests {
                 assert_eq!(mask & crossed, 0);
                 mask | crossed
             });
-        assert_eq!(newly_crossed, (1 << 0) | (1 << 1) | (1 << 2));
+        assert_eq!(newly_crossed, (1 << 0) | (1 << 1));
     }
 
+    #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
     #[test]
     fn apple_process_snapshot_is_nonzero() {
         assert_eq!(mem::size_of::<TaskVmInfoRev3>(), 336);
@@ -332,10 +416,41 @@ mod tests {
             168
         );
         let snapshot = snapshot().unwrap();
-        assert!(snapshot.current_phys_footprint > 0);
+        assert!(snapshot.current_bytes > 0);
         assert!(
-            snapshot.lifetime_peak_phys_footprint == 0
-                || snapshot.lifetime_peak_phys_footprint >= snapshot.current_phys_footprint
+            snapshot.lifetime_peak_bytes == 0
+                || snapshot.lifetime_peak_bytes >= snapshot.current_bytes
         );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_status_reports_rss_without_relabelling_footprint() {
+        let snapshot = parse_linux_status("VmRSS:\t123 kB\nVmHWM:\t456 kB\n").unwrap();
+        assert_eq!(snapshot.current_bytes, 123 * 1024);
+        assert_eq!(snapshot.lifetime_peak_bytes, 456 * 1024);
+        assert_eq!(snapshot.metric, "resident_set");
+        assert!(parse_linux_status("VmRSS: 12 kB\n").is_err());
+        assert!(parse_linux_status("VmRSS: 12 B\nVmHWM: 13 kB\n").is_err());
+        assert!(parse_linux_status("VmRSS: 18446744073709551615 kB\nVmHWM: 13 kB\n").is_err());
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn explicit_allocator_overrides_preserve_system_policy() {
+        assert!(allocator_hints_allowed(false, false, false));
+        assert!(!allocator_hints_allowed(true, false, false));
+        assert!(!allocator_hints_allowed(false, true, false));
+        assert!(!allocator_hints_allowed(false, false, true));
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "macos"
+    )))]
+    #[test]
+    fn unsupported_memory_provider_is_non_fatal() {
+        assert_eq!(snapshot().unwrap_err().kind(), io::ErrorKind::Unsupported);
     }
 }

@@ -41,22 +41,10 @@ impl OutboundConnector for SuppliedStream {
 
 #[tokio::test]
 async fn vmess_all_handshakes_keep_the_original_deadline_and_join_cancelled_io() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CANCEL",
-        "vmess_all_handshakes_keep_the_original_deadline_and_join_cancelled_io",
-    );
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    for mode in [
-        "tcp",
-        "tls",
-        "ws",
-        "grpc",
-        "http",
-        "h2",
-        "upgrade",
-        "upgrade-fast",
-    ] {
+    // Plain TCP has already submitted its request before business IO;
+    // a delayed VMess response is not an unfinished transport handshake.
+    for mode in ["tls", "ws", "grpc", "http", "h2", "upgrade", "upgrade-fast"] {
         let network = if mode == "tls" {
             "tcp"
         } else if mode.starts_with("upgrade") {
@@ -85,7 +73,10 @@ async fn vmess_all_handshakes_keep_the_original_deadline_and_join_cancelled_io()
         let ProxyProtocol::Vmess(node) = &parsed.proxies[0].protocol else {
             unreachable!()
         };
-        let (io, mut peer) = tokio::io::duplex(65536);
+        // HTTP's request prefix stays unsubmitted. The other transports still
+        // reach their original handshake-response or HTTP/2 SETTINGS wait.
+        let capacity = if mode == "http" { 1 } else { 65536 };
+        let (io, mut peer) = tokio::io::duplex(capacity);
         let outbound = VmessOutbound::new_with_path(
             node,
             UpstreamPath::proxy(Arc::new(SuppliedStream {
@@ -94,6 +85,7 @@ async fn vmess_all_handshakes_keep_the_original_deadline_and_join_cancelled_io()
         )
         .unwrap();
         let session = StreamSession {
+            metadata: Default::default(),
             inbound: InboundKind::InternalMeasure,
             source: "127.0.0.1:1".parse().unwrap(),
             destination: "192.0.2.2:80"
@@ -111,20 +103,18 @@ async fn vmess_all_handshakes_keep_the_original_deadline_and_join_cancelled_io()
                 assert!(connected.io.read(&mut [0; 1]).await.is_err());
             }
         };
-        tokio::time::timeout(Duration::from_millis(325), task)
-            .await
-            .expect("consumer reset the original deadline");
-        assert!(start.elapsed() >= Duration::from_millis(240));
-        tokio::time::timeout(Duration::from_secs(1), outbound.shutdown())
-            .await
-            .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(325), task).await;
+        let elapsed = start.elapsed();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), outbound.shutdown()).await;
         let mut observed = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut observed))
-            .await
-            .unwrap()
-            .unwrap();
+        let joined =
+            tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut observed)).await;
+        stopped.expect("Core Stop did not join");
+        joined.expect("memory peer did not finish").unwrap();
+        result.expect("consumer reset the original deadline");
+        assert!(elapsed >= Duration::from_millis(240));
         assert!(!observed.is_empty());
-        assert!(observed.len() <= 65536);
+        assert!(observed.len() <= capacity);
     }
 }
 
@@ -138,11 +128,6 @@ impl SocketProtector for RejectProtect {
 
 #[tokio::test]
 async fn vmess_expired_deadline_and_protect_failure_never_fall_back() {
-    #[cfg(feature = "interop-test")]
-    let _evidence = vole::resources::case_events::Case::new(
-        "VMESS-CANCEL",
-        "vmess_expired_deadline_and_protect_failure_never_fall_back",
-    );
     let parsed = Config::parse_yaml(b"mixed-port: 1080\nproxies: [{name: edge, type: vmess, server: 192.0.2.1, port: 443, uuid: 07070707-0707-0707-0707-070707070707}]\nrules: ['MATCH,edge']").unwrap();
     let ProxyProtocol::Vmess(config) = &parsed.proxies[0].protocol else {
         unreachable!()
@@ -159,6 +144,7 @@ async fn vmess_expired_deadline_and_protect_failure_never_fall_back() {
     )
     .unwrap();
     let session = StreamSession {
+        metadata: Default::default(),
         inbound: InboundKind::InternalMeasure,
         source: "127.0.0.1:1".parse().unwrap(),
         destination: "192.0.2.2:80"
@@ -192,4 +178,55 @@ async fn vmess_expired_deadline_and_protect_failure_never_fall_back() {
             .is_err()
     );
     assert_eq!(protect.0.load(Ordering::SeqCst), 1);
+}
+
+// This tests the actual outbound call site and complete-request submission,
+// rather than retaining a post-establishment response-header timeout.
+#[tokio::test(start_paused = true)]
+async fn vmess_unsubmitted_request_keeps_original_deadline_and_releases_partial_io() {
+    use tokio::io::AsyncReadExt;
+
+    let parsed = Config::parse_yaml(br#"proxies:
+  - {name: edge, type: vmess, server: fixture.invalid, port: 443, uuid: 07070707-0707-0707-0707-070707070707}
+rules: ['MATCH,edge']
+"#).unwrap();
+    let ProxyProtocol::Vmess(node) = &parsed.proxies[0].protocol else {
+        unreachable!()
+    };
+    // A complete authenticated VMess request cannot fit this unread pipe.
+    let (io, mut peer) = tokio::io::duplex(1);
+    let outbound = VmessOutbound::new_with_path(
+        node,
+        UpstreamPath::proxy(Arc::new(SuppliedStream {
+            io: std::sync::Mutex::new(Some(io)),
+        })),
+    )
+    .unwrap();
+    let session = StreamSession {
+        metadata: Default::default(),
+        inbound: InboundKind::InternalMeasure,
+        source: "127.0.0.1:1".parse().unwrap(),
+        destination: "192.0.2.2:80"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into(),
+        sniffed_domain: None,
+    };
+    let context = EstablishContext::with_timeout(Duration::from_millis(250));
+    {
+        let connect = outbound.connect_stream(session, &context);
+        tokio::pin!(connect);
+        assert!(futures_util::poll!(connect.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(151)).await;
+        assert!(futures_util::poll!(connect.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(
+            connect.await.is_err(),
+            "request-prefix timeout cannot be released before successful submission"
+        );
+    }
+    outbound.shutdown().await;
+    let mut prefix = Vec::new();
+    peer.read_to_end(&mut prefix).await.unwrap();
+    assert_eq!(prefix.len(), 1);
 }

@@ -1,4 +1,7 @@
-use std::io;
+use std::{
+    io,
+    task::{Context, Poll, ready},
+};
 
 use super::{MAX_PACKET_BYTES, VmessStream};
 use crate::{
@@ -57,6 +60,10 @@ impl VmessDatagram {
 
 #[async_trait]
 impl DatagramTransport for VmessDatagram {
+    fn supports_shared_destinations(&self) -> bool {
+        matches!(self.encoding, Encoding::PacketAddr(_)) && self.stream.is_some()
+    }
+
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         let overhead = match (&self.encoding, peer) {
             (Encoding::Raw(_), _) => 0,
@@ -103,21 +110,32 @@ impl DatagramTransport for VmessDatagram {
         Ok(())
     }
 
-    async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+    fn supports_poll_receive(&self) -> bool {
+        true
+    }
+
+    fn poll_receive(
+        &mut self,
+        context: &mut Context<'_>,
+        _scratch: &mut Vec<u8>,
+    ) -> Poll<Result<Datagram, DispatchError>> {
         self.check()?;
-        let mut discarded = 0;
-        loop {
-            let received = self
-                .stream
-                .as_mut()
-                .expect("checked open")
-                .receive_packet()
-                .await;
+        for _ in 0..crate::limits::IO_POLL_BUDGET {
+            let received = ready!(
+                self.stream
+                    .as_mut()
+                    .expect("checked open")
+                    .poll_packet(context)
+            );
             let packet = match received {
-                Ok(packet) => packet,
+                Ok(Some(packet)) => packet,
+                Ok(None) => {
+                    self.stream.take();
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()));
+                }
                 Err(error) => {
                     self.stream.take();
-                    return Err(error.into());
+                    return Poll::Ready(Err(error.into()));
                 }
             };
             let (remote, consumed) = match &self.encoding {
@@ -126,24 +144,26 @@ impl DatagramTransport for VmessDatagram {
                     Ok(address) => address,
                     Err(error) => {
                         self.stream.take();
-                        return Err(error.into());
+                        return Poll::Ready(Err(error.into()));
                     }
                 },
             };
             let payload = packet.slice(consumed..);
             if payload.len() <= usize::from(self.payload_budget(&remote).receive()) {
-                return Ok(Datagram {
+                return Poll::Ready(Ok(Datagram {
                     remote,
                     payload,
                     sniffed_domain: None,
-                });
-            }
-            discarded += 1;
-            if discarded == crate::limits::IO_POLL_BUDGET {
-                tokio::task::yield_now().await;
-                discarded = 0;
+                }));
             }
         }
+        context.waker().wake_by_ref();
+        Poll::Pending
+    }
+
+    async fn receive(&mut self) -> Result<Datagram, DispatchError> {
+        let mut scratch = Vec::new();
+        std::future::poll_fn(|context| self.poll_receive(context, &mut scratch)).await
     }
 
     async fn close(&mut self) -> Result<(), DispatchError> {

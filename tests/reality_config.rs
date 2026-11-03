@@ -25,12 +25,17 @@ fn parse(proxy: Value) -> vole::Result<Config> {
 
 #[test]
 fn public_reality_accepts_explicit_hybrid_without_replacing_the_fingerprint() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "public_reality_accepts_explicit_hybrid_without_replacing_the_fingerprint",
-    );
-    for profile in [None, Some("none"), Some(""), Some("chrome")] {
+    for profile in [
+        None,
+        Some("none"),
+        Some(""),
+        Some("chrome"),
+        Some("firefox"),
+        Some("safari"),
+        Some("ios"),
+        Some("edge"),
+        Some("qq"),
+    ] {
         let mut node = proxy();
         if let Some(profile) = profile {
             node["client-fingerprint"] = json!(profile);
@@ -43,13 +48,8 @@ fn public_reality_accepts_explicit_hybrid_without_replacing_the_fingerprint() {
 }
 
 #[test]
-fn public_reality_rejects_profiles_without_the_required_hybrid_share() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "public_reality_rejects_profiles_without_the_required_hybrid_share",
-    );
-    for profile in ["chrome120", "firefox", "firefox120", "safari", "safari16"] {
+fn public_reality_rejects_profiles_that_cannot_negotiate_tls13() {
+    for profile in ["android", "360"] {
         let mut node = proxy();
         node["client-fingerprint"] = json!(profile);
         assert!(
@@ -79,11 +79,6 @@ fn split_proxy() -> Value {
 
 #[test]
 fn download_inherits_or_replaces_the_entire_reality_object_without_leaf_merging() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "download_inherits_or_replaces_the_entire_reality_object_without_leaf_merging",
-    );
     let node = split_proxy();
     let (main, download) = securities(node.clone());
     assert_eq!(main, download);
@@ -116,11 +111,6 @@ fn download_inherits_or_replaces_the_entire_reality_object_without_leaf_merging(
 
 #[test]
 fn hybrid_flag_is_a_strict_nonnullable_boolean_on_both_legs() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "hybrid_flag_is_a_strict_nonnullable_boolean_on_both_legs",
-    );
     for value in [Value::Null, json!("true"), json!(1), json!([]), json!({})] {
         let mut main = proxy();
         main["reality-opts"]["support-x25519mlkem768"] = value.clone();
@@ -145,19 +135,8 @@ fn hybrid_flag_is_a_strict_nonnullable_boolean_on_both_legs() {
 
 #[test]
 fn classic_default_and_explicit_false_preserve_all_existing_profiles() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "classic_default_and_explicit_false_preserve_all_existing_profiles",
-    );
     for profile in [
-        "none",
-        "chrome",
-        "chrome120",
-        "firefox",
-        "firefox120",
-        "safari",
-        "safari16",
+        "none", "chrome", "firefox", "safari", "ios", "edge", "qq", "random",
     ] {
         for explicit in [false, true] {
             let mut node = split_proxy();
@@ -183,31 +162,23 @@ fn classic_default_and_explicit_false_preserve_all_existing_profiles() {
 
 #[test]
 fn inherited_profile_is_validated_after_download_reality_replacement() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "inherited_profile_is_validated_after_download_reality_replacement",
-    );
     let mut node = split_proxy();
     node["client-fingerprint"] = json!("firefox");
     node["reality-opts"]["support-x25519mlkem768"] = json!(false);
     node["xhttp-opts"]["download-settings"]["reality-opts"] = proxy()["reality-opts"].clone();
-    assert!(parse(node.clone()).is_err());
+    assert!(parse(node.clone()).is_ok());
     node["xhttp-opts"]["download-settings"]["client-fingerprint"] = json!("chrome");
     assert!(parse(node).is_ok());
 
     let mut inherited = split_proxy();
     inherited["xhttp-opts"]["download-settings"]["client-fingerprint"] = json!("safari");
+    assert!(parse(inherited.clone()).is_ok());
+    inherited["xhttp-opts"]["download-settings"]["client-fingerprint"] = json!("android");
     assert!(parse(inherited).is_err());
 }
 
 #[test]
 fn hybrid_reality_cannot_be_combined_with_h3_or_plaintext_on_either_leg() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new(
-        "SECURITY-CONFIG-TLS",
-        "hybrid_reality_cannot_be_combined_with_h3_or_plaintext_on_either_leg",
-    );
     for download in [false, true] {
         for patch in [json!({"tls":false}), json!({"alpn":["h3"]})] {
             let mut node = split_proxy();

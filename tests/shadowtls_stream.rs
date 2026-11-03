@@ -16,6 +16,8 @@ fn options(profile: Option<ClientFingerprint>) -> ShadowTlsConfig {
         server_name: "cover.invalid".into(),
         password: PASSWORD.into(),
         alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        required_alpn: None,
+        identity: None,
         certificate: Default::default(),
         client_fingerprint: profile,
     }
@@ -23,17 +25,15 @@ fn options(profile: Option<ClientFingerprint>) -> ShadowTlsConfig {
 
 #[tokio::test]
 async fn cancelled_shadowtls_handshakes_release_io_and_never_reuse_authenticated_hellos() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("SHADOWTLS-STREAM", "cancelled_hello");
     use ClientFingerprint::*;
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut seen = HashSet::new();
         for profile in [
             None,
-            Some(Chrome120),
             Some(Chrome133),
             Some(Firefox120),
             Some(Safari16),
+            Some(Ios14),
         ] {
             let client = ShadowTlsClient::new(&SecurityContext::new(), &options(profile)).unwrap();
             for _ in 0..4 {
@@ -68,8 +68,6 @@ async fn cancelled_shadowtls_handshakes_release_io_and_never_reuse_authenticated
 
 #[tokio::test]
 async fn truncated_or_oversized_shadowtls_handshake_records_never_create_a_business_stream() {
-    #[cfg(feature = "interop-test")]
-    let _case = vole::resources::case_events::Case::new("SHADOWTLS-STREAM", "invalid_record");
     tokio::time::timeout(Duration::from_secs(10), async {
         for record in [
             vec![],

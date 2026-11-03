@@ -1,12 +1,24 @@
-use std::time::Duration;
+use std::{
+    net::{Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 use thiserror::Error;
+
+/// Configured source addresses for an active raw-IP client stack.
+///
+/// An omitted family is unavailable; the driver never invents a source address.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClientAddresses {
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+}
 
 /// Finite buffering and timing configuration for one netstack instance.
 ///
 /// Queue counts are hard limits. Each TCP buffer includes both the smoltcp
 /// socket buffer and the application-facing queue for one flow in that
-/// direction. Each layer reserves half of the configured total.
+/// direction. Each layer is bounded to half of the configured total.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetStackConfig {
     /// Maximum raw IP packet size and the IP-medium MTU advertised to smoltcp.
@@ -59,6 +71,24 @@ impl NetStackConfig {
         if !(1_280..=65_535).contains(&self.mtu) {
             return Err(ConfigError::Mtu(self.mtu));
         }
+        self.validate_resources()
+    }
+
+    pub(crate) fn validate_client(
+        &self,
+        client: &crate::client::ClientConfig,
+    ) -> Result<(), ConfigError> {
+        let minimum = if client.has_ipv6() { 1_280 } else { 68 };
+        if !(minimum..=65_535).contains(&self.mtu) {
+            return Err(ConfigError::ClientMtu {
+                value: self.mtu,
+                minimum,
+            });
+        }
+        self.validate_resources()
+    }
+
+    fn validate_resources(&self) -> Result<(), ConfigError> {
         for (name, value) in [
             ("packet_queue", self.packet_queue),
             ("tcp_accept_queue", self.tcp_accept_queue),
@@ -96,6 +126,18 @@ impl NetStackConfig {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ConfigError {
+    #[error("active netstack requires at least one configured source address")]
+    NoClientAddress,
+    #[error("active netstack {0} source address must be unicast")]
+    ClientAddress(&'static str),
+    #[error("active netstack source prefix is invalid")]
+    ClientPrefix,
+    #[error("active netstack source address is a subnet broadcast")]
+    ClientBroadcast,
+    #[error("active netstack MTU must be between {minimum} and 65535 bytes, got {value}")]
+    ClientMtu { value: usize, minimum: usize },
+    #[error("active netstack receive packet limit must be between 1 and 65575 bytes, got {0}")]
+    ReceivePacketLimit(usize),
     #[error("MTU must be between 1280 and 65535 bytes, got {0}")]
     Mtu(usize),
     #[error("resource limit `{0}` must be greater than zero")]

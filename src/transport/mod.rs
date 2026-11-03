@@ -1,6 +1,20 @@
 //! Outbound wire transports.
+#[cfg(any(feature = "sing-mux", feature = "outbound-shadowsocks"))]
+pub(crate) mod smux;
+#[cfg(feature = "outbound-shadowsocks")]
+pub(crate) mod ss_framed;
 
-#[cfg(feature = "outbound-vless")]
+#[cfg(feature = "quinn-h3-transport")]
+pub(crate) mod quinn_h3;
+
+#[cfg(feature = "quiche-h3-transport")]
+pub(crate) mod quiche_h3;
+
+#[cfg(any(feature = "outbound-trusttunnel", feature = "outbound-masque"))]
+pub(crate) mod h3_connect;
+#[cfg(feature = "outbound-masque")]
+pub(crate) mod masque_codec;
+#[cfg(feature = "sing-mux")]
 pub(crate) mod sing_mux;
 #[cfg(feature = "outbound-vless")]
 pub mod xhttp;
@@ -25,6 +39,8 @@ pub use http_head::{HTTP_HEAD_BYTES, HTTP_HEADER_COUNT};
 mod grpc;
 #[cfg(feature = "stream-transport")]
 mod grpc_pool;
+#[cfg(feature = "stream-transport")]
+mod h2_empty;
 #[cfg(feature = "stream-transport")]
 mod h2_write;
 #[cfg(feature = "stream-transport")]

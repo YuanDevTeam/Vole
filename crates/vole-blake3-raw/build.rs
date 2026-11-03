@@ -1,46 +1,76 @@
-fn main() {
-    let mut build = cc::Build::new();
-    build
-        .include("vendor")
-        .file("src/derive.c")
-        .file("vendor/blake3.c")
-        .file("vendor/blake3_dispatch.c")
-        .file("vendor/blake3_portable.c")
-        .std("c11")
-        .define("BLAKE3_NO_SSE2", None)
-        .define("BLAKE3_NO_SSE41", None)
-        .define("BLAKE3_NO_AVX2", None)
-        .define("BLAKE3_NO_AVX512", None)
-        .define("BLAKE3_USE_NEON", "0")
-        .define("BLAKE3_API", "")
-        .define("BLAKE3_PRIVATE", "")
-        .flag_if_supported("-fvisibility=hidden");
+use std::{env, fs, path::PathBuf};
 
-    // Prefix at compilation, never by modifying the vendored official source.
-    // The regular Rust blake3 crate can link into the same final executable.
+const VERSION: &str = "1.8.7";
+
+fn dependency_dir(name: &str, target: &str, host: &str) -> PathBuf {
+    let scoped = format!("{name}_{}", target.to_uppercase().replace('-', "_"));
+    println!("cargo:rerun-if-env-changed={scoped}");
+    println!("cargo:rerun-if-env-changed={name}");
+    let value = env::var_os(&scoped)
+        .or_else(|| (target == host).then(|| env::var_os(name)).flatten())
+        .unwrap_or_else(|| {
+            panic!(
+                "set {scoped} to the absolute directory of the target's installed official BLAKE3 {VERSION} static package; native builds also accept {name}"
+            )
+        });
+    let path = PathBuf::from(value);
+    assert!(path.is_absolute(), "{scoped} must be an absolute path");
+    assert!(path.is_dir(), "{scoped} must name an existing directory");
+    // Preserve the native path spelling for MSVC's include and linker flags.
+    // Windows canonicalization adds a verbatim prefix that cl.exe rejects.
+    path
+}
+
+fn main() {
+    let target = env::var("TARGET").expect("Cargo TARGET");
+    let host = env::var("HOST").expect("Cargo HOST");
+    let include = dependency_dir("VOLE_BLAKE3_INCLUDE_DIR", &target, &host);
+    let lib = dependency_dir("VOLE_BLAKE3_LIB_DIR", &target, &host);
+    let header = include.join("blake3.h");
+    let header_text = fs::read_to_string(&header).expect("read installed public blake3.h");
+    let expected_version = format!("\"{VERSION}\"");
+    assert!(
+        header_text.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next() == Some("#define")
+                && fields.next() == Some("BLAKE3_VERSION_STRING")
+                && fields.next() == Some(expected_version.as_str())
+        }),
+        "installed blake3.h must declare BLAKE3_VERSION_STRING {VERSION}"
+    );
+    let archive_name = if target.ends_with("-msvc") {
+        "blake3.lib"
+    } else {
+        "libblake3.a"
+    };
+    let archive = lib.join(archive_name);
+    assert!(
+        archive.is_file(),
+        "missing static BLAKE3 archive {archive_name}"
+    );
+
+    // Only this Vole-owned adapter is compiled here. Package management owns
+    // the public header and archive; this build never discovers or downloads C.
+    let mut adapter = cc::Build::new();
+    adapter
+        .include(&include)
+        .file("src/derive.c")
+        .std("c11")
+        .flag_if_supported("-fvisibility=hidden");
+    // Match the external package's compile-time namespace without changing
+    // upstream's public header or implementation. This is required when the
+    // official Rust crate also contributes its native SIMD callbacks.
     for symbol in [
-        "blake3_version",
-        "blake3_hasher_init",
-        "blake3_hasher_init_keyed",
-        "blake3_hasher_init_derive_key",
         "blake3_hasher_init_derive_key_raw",
         "blake3_hasher_update",
         "blake3_hasher_finalize",
-        "blake3_hasher_finalize_seek",
-        "blake3_hasher_reset",
-        "blake3_compress_subtree_wide",
-        "blake3_compress_in_place",
-        "blake3_compress_xof",
-        "blake3_xof_many",
-        "blake3_hash_many",
-        "blake3_simd_degree",
-        "blake3_compress_in_place_portable",
-        "blake3_compress_xof_portable",
-        "blake3_hash_many_portable",
     ] {
-        build.define(symbol, format!("vole_raw_{symbol}").as_str());
+        adapter.define(symbol, format!("vole_c_{symbol}").as_str());
     }
-    build.compile("vole_blake3_raw");
+    adapter.compile("vole_blake3_raw");
+    println!("cargo:rustc-link-search=native={}", lib.display());
+    println!("cargo:rustc-link-lib=static=blake3");
     println!("cargo:rerun-if-changed=src/derive.c");
-    println!("cargo:rerun-if-changed=vendor");
+    println!("cargo:rerun-if-changed={}", header.display());
+    println!("cargo:rerun-if-changed={}", archive.display());
 }

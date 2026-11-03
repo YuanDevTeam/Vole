@@ -1,9 +1,9 @@
+use super::grpc::RawGrpc;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use super::{
-    AnyTlsCertificatePolicy, ProxyProtocol, deserialize_present_option, invalid, validate_host,
-    validate_port,
+    GrpcOptions, ProxyProtocol, deserialize_present_option, invalid, validate_host, validate_port,
 };
 use crate::Result;
 
@@ -13,7 +13,7 @@ pub struct TrojanOutboundConfig {
     pub port: u16,
     pub password: String,
     pub server_name: String,
-    pub tls: AnyTlsCertificatePolicy,
+    pub security: super::SecurityConfig,
     pub transport: TrojanTransport,
 }
 
@@ -29,6 +29,7 @@ pub enum TrojanTransport {
     },
     Grpc {
         uri: String,
+        options: GrpcOptions,
     },
 }
 
@@ -166,21 +167,14 @@ struct RawWebSocket {
     early_data_header_name: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawGrpc {
-    #[serde(rename = "grpc-service-name")]
-    service: String,
-}
-
-fn uri(scheme: &str, server: &str, port: u16, path: &str) -> Result<String> {
+fn uri(scheme: &str, server: &str, path: &str) -> Result<String> {
     if !path.starts_with('/') || path.contains(['\r', '\n', '#']) {
         return invalid("invalid Trojan transport path");
     }
     let authority = if server.parse::<std::net::Ipv6Addr>().is_ok() {
-        format!("[{server}]:{port}")
+        format!("[{server}]")
     } else {
-        format!("{server}:{port}")
+        server.to_owned()
     };
     let uri = http::Uri::builder()
         .scheme(scheme)
@@ -229,16 +223,58 @@ pub(super) struct RawTrojan {
     sni: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     alpn: Option<Vec<String>>,
-    #[serde(rename = "skip-cert-verify", default)]
-    skip_cert_verify: bool,
+    #[serde(
+        rename = "skip-cert-verify",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    skip_cert_verify: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     fingerprint: Option<String>,
+    #[serde(
+        rename = "name-cert-verify",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    name_cert_verify: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    certificate: Option<String>,
+    #[serde(
+        rename = "private-key",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    private_key: Option<String>,
     #[serde(
         rename = "client-fingerprint",
         default,
         deserialize_with = "deserialize_present_option"
     )]
     client_fingerprint: Option<String>,
+    #[serde(
+        rename = "ech-opts",
+        default,
+        deserialize_with = "super::ech::deserialize"
+    )]
+    ech_opts: Option<super::ech::RawEch>,
+    #[serde(
+        rename = "shadow-tls-opts",
+        default,
+        deserialize_with = "super::security::deserialize_shadow_tls"
+    )]
+    shadow_tls_opts: Option<super::security::RawShadowTlsMode>,
+    #[serde(
+        rename = "jls-opts",
+        default,
+        deserialize_with = "super::jls::deserialize"
+    )]
+    jls_opts: Option<super::jls::RawJls>,
+    #[serde(
+        rename = "reality-opts",
+        default,
+        deserialize_with = "super::deserialize_present_map"
+    )]
+    reality_opts: Option<super::RawRealitySettings>,
     #[serde(
         rename = "dialer-proxy",
         default,
@@ -263,13 +299,28 @@ impl RawTrojan {
         if self.password.is_empty() {
             return invalid("Trojan password must not be empty");
         }
-        let transport = match (self.network.as_deref().unwrap_or("tcp"), self.ws, self.grpc) {
+        let server_name = self
+            .sni
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.server.clone());
+        validate_host(&server_name, "Trojan sni")?;
+        let transport = match (
+            self.network
+                .as_deref()
+                .filter(|network| !network.is_empty())
+                .unwrap_or("tcp"),
+            self.ws,
+            self.grpc,
+        ) {
             ("tcp", None, None) => TrojanTransport::Tcp,
             ("ws", ws, None) => {
-                let ws = ws.unwrap_or_default();
-                if ws.max_early_data > 2048
-                    || (ws.max_early_data == 0 && ws.early_data_header_name.is_some())
-                {
+                let mut ws = ws.unwrap_or_default();
+                super::vmess::normalize_ws_early_data(
+                    &mut ws.path,
+                    &mut ws.max_early_data,
+                    &mut ws.early_data_header_name,
+                )?;
+                if ws.max_early_data == 0 && ws.early_data_header_name.is_some() {
                     return invalid("invalid Trojan WebSocket early-data options");
                 }
                 let transport = TrojanTransport::WebSocket {
@@ -280,9 +331,11 @@ impl RawTrojan {
                     )?,
                     uri: uri(
                         "wss",
-                        &self.server,
-                        self.port,
-                        ws.path.as_deref().unwrap_or("/"),
+                        &server_name,
+                        ws.path
+                            .as_deref()
+                            .filter(|path| !path.is_empty())
+                            .unwrap_or("/"),
                     )?,
                     headers: ws.headers,
                     max_early_data: ws.max_early_data,
@@ -296,23 +349,15 @@ impl RawTrojan {
                 }
                 transport
             }
-            ("grpc", None, Some(grpc)) if !grpc.service.is_empty() => {
-                let path = if grpc.service.starts_with('/') {
-                    grpc.service
-                } else {
-                    format!("/{}/Tun", grpc.service)
-                };
-                if path.contains('?') {
-                    return invalid("invalid Trojan gRPC service path");
-                }
+            ("grpc", None, grpc) => {
+                let (path, options) = grpc.unwrap_or_default().normalize()?;
                 TrojanTransport::Grpc {
-                    uri: uri("https", &self.server, self.port, &path)?,
+                    uri: uri("https", &server_name, &path)?,
+                    options,
                 }
             }
             _ => return invalid("Trojan requires tcp, ws with ws-opts, or grpc with grpc-opts"),
         };
-        let server_name = self.sni.unwrap_or_else(|| self.server.clone());
-        validate_host(&server_name, "Trojan sni")?;
         let alpn: Vec<Vec<u8>> = self
             .alpn
             .unwrap_or_else(|| {
@@ -337,22 +382,50 @@ impl RawTrojan {
         {
             return invalid("Trojan ALPN does not include the selected transport");
         }
-        let fingerprint = self
-            .fingerprint
-            .map(|value| {
-                let hex: Vec<u8> = value.trim().bytes().filter(|byte| *byte != b':').collect();
-                if hex.len() != 64 || !hex.iter().all(u8::is_ascii_hexdigit) {
-                    return invalid("Trojan fingerprint must be a SHA-256 certificate digest");
-                }
-                let mut pin = [0; 32];
-                for (byte, pair) in pin.iter_mut().zip(hex.as_chunks::<2>().0) {
-                    *byte = ((pair[0] as char).to_digit(16).unwrap() * 16
-                        + (pair[1] as char).to_digit(16).unwrap())
-                        as u8;
-                }
-                Ok(pin)
-            })
-            .transpose()?;
+        let certificate_options = self.skip_cert_verify.is_some()
+            || self.fingerprint.is_some()
+            || self.name_cert_verify.is_some()
+            || self.certificate.is_some()
+            || self.private_key.is_some();
+        let fingerprint = super::normalize_certificate_fingerprint(self.fingerprint.as_deref())?;
+        let client_fingerprint =
+            super::parse_client_fingerprint(self.client_fingerprint.as_deref())?;
+        let ech = self
+            .ech_opts
+            .map(|raw| raw.normalize(client_fingerprint.is_some()))
+            .transpose()?
+            .flatten();
+        if ech.is_some() && server_name.parse::<std::net::IpAddr>().is_ok() {
+            return invalid("Trojan ECH requires DNS sni");
+        }
+        if self.reality_opts.is_some() && matches!(transport, TrojanTransport::WebSocket { .. }) {
+            return invalid("Trojan REALITY requires a stream TLS transport");
+        }
+        if self.reality_opts.is_some() && client_fingerprint.is_none() {
+            return invalid("Trojan REALITY requires a named client-fingerprint");
+        }
+        let security = super::security::RawSecurityModes {
+            reality: self.reality_opts,
+            jls: self.jls_opts,
+            shadow_tls: self.shadow_tls_opts,
+        }
+        .normalize(
+            super::TlsConfig {
+                server_name: server_name.clone(),
+                required_alpn: transport.required_alpn().map(<[u8]>::to_vec),
+                tls13_only: ech.is_some(),
+                ech,
+                client_fingerprint,
+                alpn,
+                certificate: super::TlsCertificatePolicy {
+                    skip_cert_verify: self.skip_cert_verify.unwrap_or(false),
+                    fingerprint,
+                    verification_name: super::normalize_verification_name(self.name_cert_verify)?,
+                },
+                identity: super::normalize_client_identity(self.certificate, self.private_key)?,
+            },
+            certificate_options,
+        )?;
         Ok((
             self.name,
             self.dialer_proxy,
@@ -363,14 +436,7 @@ impl RawTrojan {
                 password: self.password,
                 server_name,
                 transport,
-                tls: AnyTlsCertificatePolicy {
-                    client_fingerprint: super::parse_client_fingerprint(
-                        self.client_fingerprint.as_deref(),
-                    )?,
-                    alpn,
-                    skip_cert_verify: self.skip_cert_verify,
-                    fingerprint,
-                },
+                security,
             }),
         ))
     }

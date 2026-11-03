@@ -1,7 +1,4 @@
-use super::{
-    packet_io::{MAX_WIRE_PACKET, PacketIo},
-    packet_window::PacketWindowFilter,
-};
+use super::{datagram_codec, packet_window::PacketWindowFilter};
 use crate::{
     dispatch::{DatagramTransport, DispatchError},
     session::{Datagram, Destination},
@@ -9,12 +6,13 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use shadowsocks::{
-    ServerConfig,
-    context::SharedContext,
-    relay::udprelay::{ProxySocket, options::UdpSocketControlData, proxy_socket::UdpSocketType},
+    ServerConfig, context::SharedContext, crypto::v2::udp::UdpCipher,
+    relay::udprelay::options::UdpSocketControlData,
 };
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::time::Instant;
+
+pub(super) const MAX_WIRE_PACKET: usize = 65_507;
 
 // Largest response: XChaCha nonce, IDs/type/time/length, optional padding,
 // maximum SOCKS address and AEAD tag. The payload is separately bounded.
@@ -33,18 +31,21 @@ fn nonce_size(config: &ServerConfig) -> usize {
     }
 }
 const SESSION_RETENTION: Duration = Duration::from_secs(60);
+const SEND_BURST: usize = 1;
 
 struct ServerSession {
     id: u64,
     last: Instant,
     window: PacketWindowFilter,
+    cipher: Option<UdpCipher>,
 }
 
 pub(super) struct SsDatagram {
     inner: Box<dyn DatagramTransport>,
     server: Destination,
-    socket: ProxySocket<PacketIo>,
-    io: PacketIo,
+    context: SharedContext,
+    config: Arc<ServerConfig>,
+    tx_cipher: Option<UdpCipher>,
     control: UdpSocketControlData,
     sessions: VecDeque<ServerSession>,
     maximum: usize,
@@ -53,6 +54,7 @@ pub(super) struct SsDatagram {
     closed: bool,
     request_header: usize,
     response_header: usize,
+    sent_in_burst: usize,
 }
 
 impl SsDatagram {
@@ -60,30 +62,39 @@ impl SsDatagram {
         inner: Box<dyn DatagramTransport>,
         server: Destination,
         context: SharedContext,
-        config: &ServerConfig,
+        config: Arc<ServerConfig>,
         maximum: u16,
         wire_maximum: u16,
     ) -> Self {
-        let io = PacketIo::default();
         let mut control = UdpSocketControlData::default();
         control.client_session_id = rand::random();
         Self {
             inner,
             server,
-            socket: ProxySocket::from_socket(UdpSocketType::Client, context, config, io.clone()),
-            io,
+            tx_cipher: Some(UdpCipher::new(
+                config.method(),
+                config.key(),
+                control.client_session_id,
+            )),
+            context,
             control,
             sessions: VecDeque::with_capacity(2),
             maximum: usize::from(maximum),
             wire_maximum: usize::from(wire_maximum).min(MAX_WIRE_PACKET),
             buffer: vec![0; usize::from(wire_maximum).min(MAX_WIRE_PACKET)],
             closed: false,
-            request_header: request_header(config),
-            response_header: nonce_size(config) + 51,
+            request_header: request_header(&config),
+            response_header: nonce_size(&config) + 51,
+            config,
+            sent_in_burst: 0,
         }
     }
 
-    fn accept_control(&mut self, control: &UdpSocketControlData) -> bool {
+    fn accept_control(
+        &mut self,
+        control: &UdpSocketControlData,
+        cipher: Option<UdpCipher>,
+    ) -> bool {
         if control.client_session_id != self.control.client_session_id
             || control.packet_id == u64::MAX
         {
@@ -109,6 +120,7 @@ impl SsDatagram {
                 id: control.server_session_id,
                 last: now,
                 window: PacketWindowFilter::new(),
+                cipher,
             });
             self.sessions.len() - 1
         };
@@ -132,6 +144,12 @@ impl SsDatagram {
 
 #[async_trait]
 impl DatagramTransport for SsDatagram {
+    fn supports_shared_destinations(&self) -> bool {
+        // SIP022 authenticates an address in every packet. The source owner
+        // keeps one replay window; the router demultiplexes live IP targets.
+        true
+    }
+
     fn payload_budget(&self, peer: &Destination) -> crate::dispatch::DatagramBudget {
         let address = super::address(peer).serialized_len();
         let response_address = if matches!(peer, Destination::Domain { .. }) {
@@ -164,6 +182,12 @@ impl DatagramTransport for SsDatagram {
                 "Shadowsocks UDP payload exceeds wire limit".into(),
             ));
         }
+        if self.sent_in_burst == SEND_BURST {
+            self.sent_in_burst = 0;
+            // Give sibling IO a turn before encoding another packet. A
+            // cancellation here cannot leave an accepted wire packet behind.
+            tokio::task::yield_now().await;
+        }
         // Reserve the ID before any cancellable write; an abandoned send must
         // never cause the next packet to reuse an ID/session combination.
         if self.control.packet_id == u64::MAX - 1 {
@@ -176,24 +200,33 @@ impl DatagramTransport for SsDatagram {
             }
             self.control.packet_id = 0;
             self.sessions.clear();
+            self.tx_cipher = Some(UdpCipher::new(
+                self.config.method(),
+                self.config.key(),
+                self.control.client_session_id,
+            ));
         }
         self.control.packet_id += 1;
-        self.socket
-            .send_with_ctrl(
-                &super::address(&datagram.remote),
-                &self.control,
-                &datagram.payload,
-            )
-            .await
-            .map_err(|_| DispatchError::Other("Shadowsocks UDP encoding failed".into()))?;
-        let payload = self.io.take().map_err(DispatchError::from)?;
+        let target = super::address(&datagram.remote);
+        let payload = datagram_codec::encode_request(
+            &self.context,
+            &self.config,
+            self.tx_cipher.as_ref().expect("open SS association"),
+            &target,
+            &self.control,
+            &datagram.payload,
+        )
+        .map_err(|_| DispatchError::Other("Shadowsocks UDP encoding failed".into()))?
+        .freeze();
         self.inner
             .send(Datagram {
                 remote: self.server.clone(),
                 payload,
                 sniffed_domain: None,
             })
-            .await
+            .await?;
+        self.sent_in_burst += 1;
+        Ok(())
     }
 
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
@@ -202,14 +235,40 @@ impl DatagramTransport for SsDatagram {
         }
         loop {
             let wire = self.inner.receive().await?;
-            if !self.peer_matches(&wire.remote) || wire.payload.len() > self.wire_maximum {
+            if !self.peer_matches(&wire.remote)
+                || wire.payload.len() < self.response_header
+                || wire.payload.len() > self.wire_maximum
+            {
                 continue;
             }
-            self.io.put(wire.payload).map_err(DispatchError::from)?;
-            // The handoff is always Ready. The only cancellable receive is
-            // the shared transport above, so partial packets cannot survive.
-            let Ok((size, source, _, Some(control))) =
-                self.socket.recv_with_ctrl(&mut self.buffer).await
+            let length = wire.payload.len();
+            self.buffer[..length].copy_from_slice(&wire.payload);
+            drop(wire);
+            let Ok(server_id) =
+                datagram_codec::prepare_response(&self.config, &mut self.buffer[..length])
+            else {
+                continue;
+            };
+            let mut candidate = None;
+            let cipher = if let Some(id) = server_id {
+                if let Some(session) = self.sessions.iter().find(|session| session.id == id) {
+                    session.cipher.as_ref().expect("AES session cipher")
+                } else {
+                    if self.sessions.len() == 2
+                        && Instant::now().duration_since(self.sessions[0].last) < SESSION_RETENTION
+                    {
+                        continue;
+                    }
+                    // A tentative unauthenticated ID never enters retained state.
+                    candidate = Some(UdpCipher::new(self.config.method(), self.config.key(), id));
+                    candidate.as_ref().unwrap()
+                }
+            } else {
+                // ChaCha's cipher depends only on PSK; the nonce is per packet.
+                self.tx_cipher.as_ref().expect("open SS association")
+            };
+            let Ok((size, source, control)) =
+                datagram_codec::decode_response(&self.config, cipher, &mut self.buffer[..length])
             else {
                 continue;
             };
@@ -219,7 +278,7 @@ impl DatagramTransport for SsDatagram {
             let Ok(remote) = super::destination(source) else {
                 continue;
             };
-            if !self.accept_control(&control) {
+            if !self.accept_control(&control, candidate) {
                 continue;
             }
             return Ok(Datagram {
@@ -233,6 +292,7 @@ impl DatagramTransport for SsDatagram {
     async fn close(&mut self) -> Result<(), DispatchError> {
         self.closed = true;
         self.sessions.clear();
+        self.tx_cipher.take();
         self.inner.close().await
     }
 }

@@ -1,11 +1,11 @@
 # HTTP 与 SOCKS5 混合入站
 
-HTTP 与 SOCKS5 共用一个混合入口，并和 TUN 共用 Dispatcher、规则、DNS、静态 select 组及出站图。
+HTTP 与 SOCKS5 共用一个混合入口，并和 TUN 共用 Dispatcher、规则、DNS、动态策略组及出站图。
 字段全集见[配置协议](config.yaml)，Controller 另见[接口](controller-api.md)。
 
 ## 监听与认证
 
-- `mixed-port` 省略或 0 关闭，启用时为 1–65535；混合入口和 TUN 至少启用一个。
+- `mixed-port` 省略或 0 关闭，启用时为 1–65535；关闭混合入口和 TUN 的配置仍可启动。
   同一 TCP 端口接入 HTTP 转发、CONNECT、Upgrade 和 SOCKS5 CONNECT、UDP ASSOCIATE。
   SOCKS5 UDP 随入口启用并绑定同地址、同端口，不提供独立入站 UDP 开关。
 - 顶层 `port`、`socks-port`、`udp` 和 `listeners` 均拒绝，不迁移或忽略旧字段。
@@ -15,15 +15,37 @@ HTTP 与 SOCKS5 共用一个混合入口，并和 TUN 共用 Dispatcher、规则
 - `allow-lan: false` 绑定 IPv4 回环，true 绑定通配地址。`ipv6: true` 增加独立
   IPv6-only 回环/通配 socket。仅系统明确不支持地址族时可省略 IPv6，其余绑定错误
   整体回滚。取得 Controller 和全部业务 socket 后才启动接收任务。
+- `bind-address` 默认为 `*`；`allow-lan: true` 时可指定单个 IPv4/IPv6 地址，false 仍绑定回环。
+  `localhost` 始终使用回环策略，并随 `ipv6` 控制 IPv6 回环 socket。
+  `lan-allowed-ips` 默认允许全部 IPv4/IPv6，`lan-disallowed-ips` 的拒绝规则优先。
+  两者作用于 TCP 来源；SOCKS5 UDP 必须属于已获准的 TCP 关联。
+  `skip-auth-prefixes` 只跳过匹配来源的认证，不跳过来源访问控制。
 - `allow-lan` 与 `authentication` 独立；通配绑定不强制认证。
-  `authentication` 省略或空列表时，HTTP/SOCKS5 在任何绑定地址均免认证；
-  非空必须恰好一项 `user:password`，
-  按第一个冒号拆分，两项各 1–255 UTF-8 字节，不 trim。null 不视为省略。
-  配置凭据后 HTTP/SOCKS5 均校验凭据；共享或非空凭据须有启用的混合入口消费。
-- Basic / SOCKS 用户密码没有链路加密，只适合可信网络。Controller 仍独立回环监听，
-  使用自己的 Bearer 认证，不随共享开关开放。
+  `authentication` 省略、null 或空列表时，HTTP/SOCKS5 在任何绑定地址均免认证；
+  非空接受多个 `user:password`，相同用户名以最后一项为准，
+  按第一个冒号拆分，不 trim，允许空用户名或密码。配置和 HTTP 不套用 SOCKS5 的
+  长度限制；HTTP 凭据受整个 32 KiB 请求头预算约束，SOCKS5 各字段仍使用一字节 wire 长度。
+  配置凭据后 HTTP/SOCKS5 均校验凭据；混合入口关闭时允许保留合法的共享和认证配置。
+- Basic / SOCKS 用户密码没有链路加密，只适合可信网络。Controller 按 external-controller 独立监听，
+  使用自己的可选 Bearer 认证，不随共享开关改变地址或认证。
 - 不设置全局业务连接/关联准入数。Stop 取消并等待全部连接、relay 和接收任务，
   返回后端口可重新绑定。
+- 接收的 TCP 连接启用 `TCP_NODELAY`，小包应答不等待 Nagle 聚合。
+
+## 选路元数据
+
+`IN-TYPE` 使用实际入口类型：普通 HTTP/Upgrade 为 HTTP，CONNECT 为 HTTPS，
+SOCKS5 为 SOCKS5；HTTPS 类型只表示 CONNECT，不检查目标 TLS。`IN-PORT` 读取
+接收连接或授权 UDP socket 的真实本地端口。
+
+`IN-USER` 与 load-balance 的 `hash-key: in-user` 只使用验证成功的配置用户名。
+HTTP 每个请求重新验证，SOCKS TCP 和 UDP 授权关联保留握手身份。无认证或
+`skip-auth-prefixes` 旁路时身份为空，即使请求声称一个 Proxy-Authorization 用户。
+身份随请求/关联保存，只持有用户名，不保存密码、请求头或完整配置代际；Debug 不输出用户名。
+业务路由和 dialer-proxy 共用该身份，内部 DNS、资源下载及主动测速没有入口用户。
+
+Mihomo 当前实现不把 SOCKS TCP 身份传给独立 UDP 接收；Vole 的授权 UDP 保留
+真实握手身份。Mihomo HTTP 在无认证时也可能记录请求声称的用户，Vole 保持为空。
 
 ## HTTP
 
@@ -51,7 +73,8 @@ HTTP/1.0 和 HTTP/1.1 使用绝对 `http://host[:port]/path?query` URI。每个�
 
 ### 隧道
 
-CONNECT 在上游成功后才返回 200，保留头后的预读数据。Upgrade 只接受无正文请求；
+CONNECT 通常在上游成功后返回 200，保留头后的预读数据。匹配 TCP 嗅探策略时先返回 200，
+再读取有界业务前缀并按嗅探结果建链；此后建链失败直接关闭隧道。Upgrade 只接受无正文请求；
 合法 101、Connection/Upgrade 一致且选中请求协议时才切隧道，保留双方预读和 TCP
 半关闭。非 101 按普通响应处理，非法切换返回 502。
 
@@ -62,13 +85,15 @@ CONNECT 在上游成功后才返回 200，保留头后的预读数据。Upgrade 
 
 头 32 KiB/100 字段、读头/建链 10 秒；每方向预读/复制 8 KiB。chunk 行 1 KiB，
 trailer 8 KiB/100 字段，每个最终响应前最多 16 个临时响应。正文逐次读写空闲期限
-30 秒；响应开始后独立计算读头总期限，上传结束后等待响应最多 10 秒。正文长度不
-决定分配大小，Stop 覆盖认证、建链、正文及隧道。
+30 秒。上传与响应读取并行；上传完成后，当前完整响应头的总等待上限为 30 秒，
+观察到首字节后另受 10 秒绝对读头期限约束，两者取较早者。每个临时响应转发后
+重新开始下一响应头的等待。正文长度不决定分配大小，Stop 覆盖认证、建链、正文及隧道。
 
 ## SOCKS5
 
 仅支持 RFC 1928/1929 的 SOCKS5 CONNECT、UDP ASSOCIATE 和用户名密码协商。
-不降级绕过已配置认证。精确读取握手并保留 CONNECT 后业务字节；上游成功才回复成功。
+不降级绕过已配置认证。精确读取握手并保留 CONNECT 后业务字节；通常在上游成功后回复成功。匹配 TCP 嗅探策略
+时先确认 CONNECT，取得业务前缀后建链，失败关闭已确认的连接。
 目标保留 IPv4、IPv6 或域名交给 Dispatcher，入站不提前解析。TCP 每方向复制 4 KiB，
 保留半关闭。
 
@@ -92,3 +117,6 @@ wire 最大 65,507 字节，额外 sentinel 识别截断，自有 UDP socket 请
 TUN 使用独立 MTU；SOCKS5 数据不计入 Controller 的 TUN 流量。
 
 [验收边界](acceptance.md)区分容器双栈与真实 LAN/物理 IPv6，不能相互替代。
+
+
+显式启用独立 HTTP 配置时，mixed HTTP/CONNECT 与 TUN 共用[URL rewrite](http-processing.md)和同代 Dispatcher。规则先确定最终 URL，再选路；本地动作不连接旧目标。请求正文与 Upgrade 继续复用本文件的流式 framing／relay；入口认证和用户名语义保持。

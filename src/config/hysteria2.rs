@@ -1,8 +1,9 @@
 use serde::Deserialize;
 
 use super::{
-    ProxyProtocol, TlsCertificatePolicy, TlsConfig, TlsIdentityPem, deserialize_present_option,
-    invalid, validate_host, validate_port,
+    ProxyProtocol, TlsCertificatePolicy, TlsConfig, deserialize_present_option, invalid,
+    normalize_certificate_fingerprint, normalize_client_identity, normalize_verification_name,
+    validate_host, validate_port,
 };
 use crate::Result;
 
@@ -16,7 +17,27 @@ pub struct Hysteria2OutboundConfig {
     pub down: u64,
     pub udp_mtu: u16,
     pub obfs_password: Option<String>,
+    pub gecko: Option<Hysteria2Gecko>,
+    pub realm: Option<super::Hysteria2Realm>,
     pub hopping: Option<Hysteria2Hopping>,
+    pub stream_window: super::QuicReceiveWindow,
+    pub connection_window: super::QuicReceiveWindow,
+    pub handshake_timeout: std::time::Duration,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct Hysteria2Gecko {
+    pub password: String,
+    pub min_packet_size: u16,
+    pub max_packet_size: u16,
+}
+impl std::fmt::Debug for Hysteria2Gecko {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hysteria2Gecko")
+            .field("min_packet_size", &self.min_packet_size)
+            .field("max_packet_size", &self.max_packet_size)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,16 +63,29 @@ pub(super) struct RawHysteria2 {
     port: Option<u16>,
     #[serde(default)]
     password: String,
-    #[serde(default)]
-    udp: bool,
+    // Accepted for compatibility; Mihomo always advertises UDP for this protocol.
+    #[serde(rename = "udp", default)]
+    _udp: bool,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     sni: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     alpn: Option<Vec<String>>,
     #[serde(rename = "skip-cert-verify", default)]
     skip_cert_verify: bool,
+    #[serde(
+        rename = "name-cert-verify",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    name_cert_verify: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     fingerprint: Option<String>,
+    #[serde(
+        rename = "ech-opts",
+        default,
+        deserialize_with = "super::ech::deserialize"
+    )]
+    ech_opts: Option<super::ech::RawEch>,
     #[serde(
         rename = "certificate",
         default,
@@ -84,6 +118,26 @@ pub(super) struct RawHysteria2 {
         deserialize_with = "deserialize_present_option"
     )]
     obfs_password: Option<String>,
+    #[serde(rename = "obfs-min-packet-size", default)]
+    obfs_min_packet_size: i64,
+    #[serde(rename = "obfs-max-packet-size", default)]
+    obfs_max_packet_size: i64,
+    #[serde(
+        rename = "realm-opts",
+        default,
+        deserialize_with = "deserialize_present_option"
+    )]
+    realm: Option<super::hysteria2_realm::RawRealm>,
+    #[serde(rename = "initial-stream-receive-window", default)]
+    initial_stream_receive_window: u64,
+    #[serde(rename = "max-stream-receive-window", default)]
+    max_stream_receive_window: u64,
+    #[serde(rename = "initial-connection-receive-window", default)]
+    initial_connection_receive_window: u64,
+    #[serde(rename = "max-connection-receive-window", default)]
+    max_connection_receive_window: u64,
+    #[serde(rename = "handshake-timeout", default)]
+    handshake_timeout: i64,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     ports: Option<String>,
     #[serde(
@@ -113,13 +167,13 @@ impl RawHysteria2 {
             return invalid("Hysteria2 outbound support is disabled at build time");
         }
         validate_host(&self.server, "Hysteria2 server")?;
-        if let Some(port) = self.port {
-            validate_port(port, "Hysteria2")?;
-        }
         let hopping = self
             .ports
+            .filter(|ports| !ports.is_empty())
+            .map(|ports| parse_ports(&ports))
+            .transpose()?
+            .filter(|ports| !ports.is_empty())
             .map(|ports| {
-                let ports = parse_ports(&ports)?;
                 let (min_seconds, max_seconds) = parse_interval(self.hop_interval.as_ref())?;
                 Ok::<_, crate::VoleError>(Hysteria2Hopping {
                     ports,
@@ -137,6 +191,7 @@ impl RawHysteria2 {
                 crate::VoleError::InvalidConfig("Hysteria2 requires port or ports".into())
             })?,
         };
+        validate_port(port, "Hysteria2")?;
         // The complete auth header section is bounded to 16 KiB. Validate the
         // raw value, without trimming credentials or printing them on failure.
         if self.password.len() > 8192
@@ -144,12 +199,53 @@ impl RawHysteria2 {
         {
             return invalid("invalid or over-limit Hysteria2 authentication header");
         }
-        let obfs_password = match (self.obfs.as_deref(), self.obfs_password) {
-            (None, None) => None,
-            (Some("salamander"), Some(password)) if !password.is_empty() => Some(password),
-            _ => return invalid("Hysteria2 Salamander requires obfs and a nonempty obfs-password"),
+        let realm = self.realm.map(|raw| raw.normalize()).transpose()?.flatten();
+        if realm.is_some() && hopping.is_some() {
+            return invalid("Hysteria2 Realm and ports are mutually exclusive");
+        }
+        let (obfs_password, gecko) = match (
+            self.obfs.as_deref().filter(|value| !value.is_empty()),
+            self.obfs_password,
+        ) {
+            (None, None) if self.obfs_min_packet_size == 0 && self.obfs_max_packet_size == 0 => {
+                (None, None)
+            }
+            (Some("salamander"), Some(password))
+                if !password.is_empty()
+                    && self.obfs_min_packet_size == 0
+                    && self.obfs_max_packet_size == 0 =>
+            {
+                (Some(password), None)
+            }
+            (Some("gecko"), Some(password)) if !password.is_empty() => {
+                let min = if self.obfs_min_packet_size == 0 {
+                    512
+                } else {
+                    self.obfs_min_packet_size
+                };
+                let max = if self.obfs_max_packet_size == 0 {
+                    1200
+                } else {
+                    self.obfs_max_packet_size
+                };
+                if min <= 0 || min > max || max > 2048 {
+                    return invalid("invalid Hysteria2 Gecko packet size range");
+                }
+                (
+                    None,
+                    Some(Hysteria2Gecko {
+                        password,
+                        min_packet_size: min as u16,
+                        max_packet_size: max as u16,
+                    }),
+                )
+            }
+            _ => return invalid("invalid Hysteria2 obfuscation options"),
         };
-        let server_name = self.sni.unwrap_or_else(|| self.server.clone());
+        let server_name = self
+            .sni
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.server.clone());
         validate_host(&server_name, "Hysteria2 sni")?;
         let mut alpn = self.alpn.unwrap_or_default();
         if alpn.is_empty() {
@@ -160,32 +256,18 @@ impl RawHysteria2 {
         {
             return invalid("invalid Hysteria2 ALPN list");
         }
-        let identity = match (self.certificate, self.private_key) {
-            (None, None) => None,
-            (Some(certificate), Some(private_key)) => {
-                #[cfg(feature = "outbound-hysteria2")]
-                crate::security::TlsClientIdentity::from_pem(&certificate, &private_key).map_err(
-                    |_| crate::VoleError::InvalidConfig("invalid Hysteria2 client identity".into()),
-                )?;
-                Some(TlsIdentityPem {
-                    certificate,
-                    private_key,
-                })
-            }
-            _ => return invalid("Hysteria2 certificate and private-key must be paired"),
-        };
-        let fingerprint = self
-            .fingerprint
-            .map(|pin| {
-                super::vless::parse_pin(&pin).map_err(|_| {
-                    crate::VoleError::InvalidConfig(
-                        "invalid Hysteria2 certificate fingerprint".into(),
-                    )
-                })
-            })
-            .transpose()?;
+        let ech = self
+            .ech_opts
+            .map(|raw| raw.normalize(false))
+            .transpose()?
+            .flatten();
+        if ech.is_some() && server_name.parse::<std::net::IpAddr>().is_ok() {
+            return invalid("Hysteria2 ECH requires DNS sni");
+        }
+        let identity = normalize_client_identity(self.certificate, self.private_key)?;
+        let fingerprint = normalize_certificate_fingerprint(self.fingerprint.as_deref())?;
         let udp_mtu = if self.udp_mtu == 0 {
-            1197
+            crate::limits::HY2_QUIC_PAYLOAD as u16
         } else {
             self.udp_mtu
         };
@@ -195,13 +277,13 @@ impl RawHysteria2 {
         Ok((
             self.name,
             self.dialer_proxy,
-            self.udp,
-            ProxyProtocol::Hysteria2(Hysteria2OutboundConfig {
+            true,
+            ProxyProtocol::Hysteria2(Box::new(Hysteria2OutboundConfig {
                 address: self.server,
                 port,
                 password: self.password,
                 tls: TlsConfig {
-                    ech: None,
+                    ech,
                     client_fingerprint: None,
                     server_name,
                     alpn: alpn.into_iter().map(String::into_bytes).collect(),
@@ -210,7 +292,7 @@ impl RawHysteria2 {
                     certificate: TlsCertificatePolicy {
                         skip_cert_verify: self.skip_cert_verify,
                         fingerprint,
-                        verification_name: None,
+                        verification_name: normalize_verification_name(self.name_cert_verify)?,
                     },
                     identity,
                 },
@@ -218,8 +300,29 @@ impl RawHysteria2 {
                 down: parse_rate(self.down)?,
                 udp_mtu,
                 obfs_password,
+                gecko,
+                realm,
                 hopping,
-            }),
+                stream_window: super::QuicReceiveWindow::normalize(
+                    self.initial_stream_receive_window,
+                    self.max_stream_receive_window,
+                    super::QuicReceiveWindow {
+                        initial: 64 * 1024,
+                        maximum: 64 * 1024,
+                    },
+                )?,
+                connection_window: super::QuicReceiveWindow::normalize(
+                    self.initial_connection_receive_window,
+                    self.max_connection_receive_window,
+                    super::QuicReceiveWindow {
+                        initial: 4 * 1024 * 1024,
+                        maximum: 4 * 1024 * 1024,
+                    },
+                )?,
+                handshake_timeout: std::time::Duration::from_secs(
+                    self.handshake_timeout.max(0) as u64
+                ),
+            })),
         ))
     }
 }
@@ -264,12 +367,19 @@ fn decimal(value: &str) -> Result<u32> {
 }
 
 fn parse_ports(value: &str) -> Result<Vec<u16>> {
+    if matches!(value.trim(), "" | "*") {
+        return Ok(Vec::new());
+    }
     let mut ports = std::collections::BTreeSet::new();
-    for item in value.split(',') {
+    for item in value.split([',', '/']).filter(|item| !item.is_empty()) {
         let item = item.trim();
         let (start, end) = item.split_once('-').unwrap_or((item, item));
-        let (start, end) = (decimal(start)?, decimal(end)?);
-        if start == 0 || start > end || end > 65535 {
+        let (start, end) = (
+            decimal(start.trim_matches(['[', ']', ' ']))?,
+            decimal(end.trim_matches(['[', ']', ' ']))?,
+        );
+        let (start, end) = (start.min(end), start.max(end));
+        if start == 0 || end > 65535 {
             return invalid("invalid Hysteria2 ports");
         }
         ports.extend((start..=end).map(|port| port as u16));
@@ -283,10 +393,80 @@ fn parse_interval(value: Option<&NumberOrText>) -> Result<(u32, u32)> {
         Some(NumberOrText::Number(value)) => value.to_string(),
         Some(NumberOrText::Text(value)) => value.clone(),
     };
-    let (start, end) = text.split_once('-').unwrap_or((&text, &text));
-    let (start, end) = (decimal(start)?, decimal(end)?);
-    if start < 5 || start > end {
-        return invalid("Hysteria2 hop-interval requires 5 <= min <= max <= 4294967295 seconds");
+    let text = text.trim();
+    let (start, end) = text.split_once('-').unwrap_or((text, text));
+    let (start, end) = if text.is_empty() {
+        (0, 0)
+    } else {
+        (
+            decimal(start.trim_matches(['[', ']', ' ']))?,
+            decimal(end.trim_matches(['[', ']', ' ']))?,
+        )
+    };
+    let (start, end) = (start.min(end), start.max(end));
+    let start = if start == 0 { 30 } else { start.max(5) };
+    Ok((start, end.max(start)))
+}
+
+#[cfg(all(test, feature = "outbound-hysteria2"))]
+mod p08_tests {
+    use super::*;
+
+    #[test]
+    fn hopping_accepts_reference_ranges_and_ignores_unused_zero_port() {
+        let config =
+            parse(serde_json::json!({"port":0,"ports":"8445-8443/443,,8444","hop-interval":"1-3"}))
+                .unwrap();
+        assert_eq!(config.port, 443);
+        let hopping = config.hopping.unwrap();
+        assert_eq!(hopping.ports, vec![443, 8443, 8444, 8445]);
+        assert_eq!((hopping.min_seconds, hopping.max_seconds), (5, 5));
+        let hopping = parse(serde_json::json!({"ports":"443","hop-interval":0}))
+            .unwrap()
+            .hopping
+            .unwrap();
+        assert_eq!((hopping.min_seconds, hopping.max_seconds), (30, 30));
+        assert!(
+            parse(serde_json::json!({"ports":"*"}))
+                .unwrap()
+                .hopping
+                .is_none()
+        );
     }
-    Ok((start, end))
+
+    #[test]
+    fn hopping_keeps_invalid_ports_and_overflow_out_of_the_socket_path() {
+        for fields in [
+            serde_json::json!({"port":0}),
+            serde_json::json!({"ports":"0/443"}),
+            serde_json::json!({"ports":"65536"}),
+            serde_json::json!({"ports":"443","hop-interval":"4294967296"}),
+        ] {
+            assert!(parse(fields).is_err());
+        }
+    }
+    fn parse(extra: serde_json::Value) -> Result<Hysteria2OutboundConfig> {
+        let mut raw = serde_json::json!({"name":"edge","server":"peer.invalid","port":443});
+        raw.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let raw: RawHysteria2 = serde_json::from_value(raw).unwrap();
+        let (_, _, _, ProxyProtocol::Hysteria2(config)) = raw.normalize()? else {
+            panic!("HY2")
+        };
+        Ok(*config)
+    }
+    #[test]
+    fn gecko_options_consume_actual_min_max_and_realm_excludes_hopping() {
+        let gecko=parse(serde_json::json!({"obfs":"gecko","obfs-password":"private","obfs-min-packet-size":600,"obfs-max-packet-size":1400})).unwrap().gecko.unwrap();
+        assert_eq!((gecko.min_packet_size, gecko.max_packet_size), (600, 1400));
+        assert!(!format!("{gecko:?}").contains("private"));
+        for fields in [
+            serde_json::json!({"obfs":"gecko","obfs-password":"private","obfs-min-packet-size":1401,"obfs-max-packet-size":1400}),
+            serde_json::json!({"obfs":"salamander","obfs-password":"private","obfs-max-packet-size":1200}),
+            serde_json::json!({"ports":"443,8443","realm-opts":{"enable":true,"server-url":"https://control.example","realm-id":"zone","stun-servers":["192.0.2.1"]}}),
+        ] {
+            assert!(parse(fields).is_err());
+        }
+    }
 }

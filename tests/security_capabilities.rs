@@ -1,4 +1,4 @@
-//! Public configuration must produce the required REALITY shares on both legs.
+//! Public configuration preserves real REALITY key shares on both legs.
 //! Pure memory IO; no protocol peer or host listener.
 #![cfg(all(feature = "tls-fingerprint", feature = "outbound-vless"))]
 
@@ -61,14 +61,14 @@ fn key_shares(records: &[u8]) -> Vec<(u16, usize)> {
 }
 
 #[tokio::test]
-async fn public_hybrid_reality_emits_required_shares_on_both_transport_legs() {
+async fn public_hybrid_reality_preserves_real_shares_on_both_transport_legs() {
     use serde_json::json;
     use vole::{
         config::{Config, ProxyProtocol},
         security::SecurityClient,
     };
 
-    for profile in ["none", "chrome"] {
+    for profile in ["none", "chrome", "firefox", "safari", "ios", "edge", "qq"] {
         let yaml = serde_json::to_vec(&json!({
             "mixed-port": 1080,
             "proxies": [{
@@ -110,10 +110,10 @@ async fn public_hybrid_reality_emits_required_shares_on_both_transport_legs() {
             let shares = key_shares(&wire);
             handshake.abort();
             assert!(matches!(handshake.await, Err(error) if error.is_cancelled()));
-            let expected = if profile == "chrome" {
-                vec![(X25519_MLKEM768, 1216), (X25519, 32)]
-            } else {
-                vec![(X25519_MLKEM768, 1216)]
+            let expected = match profile {
+                "none" | "chrome" => vec![(X25519_MLKEM768, 1216), (X25519, 32)],
+                "firefox" => vec![(X25519, 32), (23, 65)],
+                _ => vec![(X25519, 32)],
             };
             assert_eq!(shares, expected, "public {profile} REALITY");
             assert_eq!(

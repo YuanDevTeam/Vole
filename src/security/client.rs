@@ -1,13 +1,14 @@
-use std::{io, sync::Arc};
+use std::io;
+#[cfg(any(feature = "outbound-vless", feature = "quinn-h3-transport"))]
+use std::sync::Arc;
 
-use rustls::ClientConfig;
 #[cfg(feature = "interop-test")]
 use rustls::RootCertStore;
 
-use crate::{
-    config::{SecurityConfig, VlessOutboundConfig},
-    dispatch::BoxStream,
-};
+use crate::{config::SecurityConfig, dispatch::BoxStream};
+
+#[cfg(feature = "outbound-vless")]
+use crate::config::VlessOutboundConfig;
 
 use super::{
     SecurityContext,
@@ -26,6 +27,8 @@ pub const REALITY_CLIENT_VERSION: [u8; 3] = [26, 7, 11];
 #[derive(Clone)]
 enum SecurityBackend {
     Plain,
+    #[cfg(feature = "shadow-tls-v3")]
+    ShadowTls(super::ShadowTlsClient),
     Standard(StandardTlsClient),
     Reality {
         client: super::boring::BoringTlsClient,
@@ -46,6 +49,11 @@ impl std::fmt::Debug for SecurityClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.backend {
             SecurityBackend::Plain => formatter.write_str("SecurityClient::Plain"),
+            #[cfg(feature = "shadow-tls-v3")]
+            SecurityBackend::ShadowTls(client) => formatter
+                .debug_tuple("SecurityClient::ShadowTls")
+                .field(client)
+                .finish(),
             SecurityBackend::Standard(client) => formatter
                 .debug_tuple("SecurityClient::Standard")
                 .field(client)
@@ -63,13 +71,25 @@ impl std::fmt::Debug for SecurityClient {
 }
 
 impl SecurityClient {
-    pub(crate) fn quic_config(&self) -> io::Result<(Arc<ClientConfig>, String)> {
+    #[cfg(feature = "quinn-h3-transport")]
+    pub(crate) async fn quic_config_with_context(
+        &self,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<(Arc<rustls::ClientConfig>, String)> {
         match &self.backend {
-            SecurityBackend::Standard(client) => client.quic_config(),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "HTTP/3 requires standard TLS",
-            )),
+            SecurityBackend::Standard(client) => client.quic_config_with_context(context).await,
+            _ => Err(io::Error::other("HTTP/3 requires standard TLS")),
+        }
+    }
+
+    pub(crate) async fn connect_with_context(
+        &self,
+        stream: BoxStream,
+        context: &crate::outbound::EstablishContext,
+    ) -> io::Result<BoxStream> {
+        match &self.backend {
+            SecurityBackend::Standard(client) => client.connect_with_context(stream, context).await,
+            _ => self.connect(stream).await,
         }
     }
 
@@ -86,6 +106,7 @@ impl SecurityClient {
     }
 
     /// Backwards-compatible primary-leg constructor.
+    #[cfg(feature = "outbound-vless")]
     pub fn from_proxy(config: &VlessOutboundConfig) -> io::Result<Self> {
         Self::from_security(&config.security)
     }
@@ -95,6 +116,7 @@ impl SecurityClient {
     /// nodes; zero disables resumption when the fixed four-session runtime
     /// budget cannot provide a slot for every node. REALITY and JLS ignore the
     /// budget because their resumption policies are disabled.
+    #[cfg(feature = "outbound-vless")]
     pub(crate) fn from_proxy_with_context(
         config: &VlessOutboundConfig,
         context: &SecurityContext,
@@ -127,7 +149,7 @@ impl SecurityClient {
     ///
     /// This entry point does not exist unless the `interop-test` feature is
     /// enabled. Production builds always use the bundled WebPKI roots.
-    #[cfg(feature = "interop-test")]
+    #[cfg(all(feature = "interop-test", feature = "outbound-vless"))]
     pub(crate) fn from_proxy_with_test_tls_roots(
         config: &VlessOutboundConfig,
         roots_der: impl IntoIterator<Item = Vec<u8>>,
@@ -180,6 +202,20 @@ impl SecurityClient {
         }
         let backend = match config {
             SecurityConfig::None => SecurityBackend::Plain,
+            SecurityConfig::ShadowTls(config) => {
+                #[cfg(feature = "shadow-tls-v3")]
+                {
+                    SecurityBackend::ShadowTls(super::ShadowTlsClient::new(context, config)?)
+                }
+                #[cfg(not(feature = "shadow-tls-v3"))]
+                {
+                    let _ = config;
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "ShadowTLS v3 is not compiled in",
+                    ));
+                }
+            }
             SecurityConfig::Tls(tls) => SecurityBackend::Standard(StandardTlsClient::with_options(
                 context,
                 &tls.server_name,
@@ -197,12 +233,7 @@ impl SecurityClient {
                     identity: tls
                         .identity
                         .as_ref()
-                        .map(|identity| {
-                            super::TlsClientIdentity::from_pem(
-                                &identity.certificate,
-                                &identity.private_key,
-                            )
-                        })
+                        .map(|identity| super::TlsClientIdentity::from_config(identity, context))
                         .transpose()?,
                 },
                 resumption_sessions,
@@ -224,6 +255,8 @@ impl SecurityClient {
     pub async fn connect(&self, stream: BoxStream) -> io::Result<BoxStream> {
         match &self.backend {
             SecurityBackend::Plain => Ok(stream),
+            #[cfg(feature = "shadow-tls-v3")]
+            SecurityBackend::ShadowTls(client) => client.connect(stream).await,
             SecurityBackend::Standard(client) => client.connect(stream).await,
             SecurityBackend::Reality {
                 client,
@@ -236,6 +269,7 @@ impl SecurityClient {
         }
     }
 
+    #[cfg(feature = "outbound-vless")]
     pub(crate) async fn connect_vision(
         &self,
         stream: BoxStream,
@@ -245,6 +279,11 @@ impl SecurityClient {
             SecurityBackend::Plain => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Vision requires TLS",
+            )),
+            #[cfg(feature = "shadow-tls-v3")]
+            SecurityBackend::ShadowTls(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Vision cannot use ShadowTLS",
             )),
             SecurityBackend::Jls { .. } => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -258,10 +297,12 @@ impl SecurityClient {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "outbound-vless"))]
     const fn buffer_limit(&self) -> usize {
         match &self.backend {
             SecurityBackend::Plain => 0,
+            #[cfg(feature = "shadow-tls-v3")]
+            SecurityBackend::ShadowTls(_) => 0,
             SecurityBackend::Standard(client) => client.buffer_limit(),
             SecurityBackend::Reality { buffer_limit, .. }
             | SecurityBackend::Jls { buffer_limit, .. } => *buffer_limit,
@@ -269,7 +310,7 @@ impl SecurityClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "outbound-vless"))]
 mod tests {
     use super::*;
     use crate::config::{SecurityConfig, TlsConfig, VlessEncryption, XHttpConfig, XHttpMode};

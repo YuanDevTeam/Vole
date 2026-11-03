@@ -19,7 +19,7 @@ env:
 jobs:
   client-contracts:
     name: ${{ matrix.name }}
-    runs-on: macos-26
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -41,16 +41,23 @@ jobs:
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
-          version: "0.12"
+          version: "0.13.6"
+      - name: Linux native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake ninja-build perl pkg-config
+      - name: Prepare official BLAKE3 static dependency
+        shell: bash
+        run: uv run --project scripts --locked vole-scripts deps --github-env "$GITHUB_ENV"
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: tests-${{ matrix.profile }}
+          key: tests-${{ matrix.profile }}-${{ hashFiles('scripts/native/**', 'scripts/src/vole_scripts/*.py') }}
           workspaces: ". -> target"
           # Native TLS artifacts must not cross runner SDK/image changes.
-          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR BORING AWS_LC LIBCLANG BINDGEN
+          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR BORING AWS_LC LIBCLANG BINDGEN VOLE_BLAKE3
           cache-bin: "false"
       - name: Format and scripts
         if: matrix.profile == 'features'
@@ -86,14 +93,16 @@ jobs:
           cargo metadata --locked --all-features --format-version 1 > "$RUNNER_TEMP/vole-metadata.json"
           uv run --project scripts --locked python - "$RUNNER_TEMP/vole-metadata.json" <<'PY'
           import json
+          import re
           import sys
+          import tomllib
           from pathlib import Path
 
           metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           packages = metadata["packages"]
           nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
           registry = {"registry+https://github.com/rust-lang/crates.io-index", "registry+https://index.crates.io/"}
-          boring_source = "git+https://github.com/YuanDevTeam/boring?branch=release#43c1c1d5b9464b3f2d5204be8664778fada7dbaf"
+          smoltcp_source = "git+https://github.com/smoltcp-rs/smoltcp?rev=24bda3b4f982625d8453d4360172557d24921c76#24bda3b4f982625d8453d4360172557d24921c76"
 
           def require(condition, message):
               if not condition:
@@ -112,21 +121,89 @@ jobs:
               return set(nodes[item["id"]]["features"])
 
           require(not any("watfaq" in (item.get("source") or "").lower() for item in packages), "retired dependency source is forbidden")
-          rustls = package("rustls", "0.23.45")
-          package("tokio-rustls", "0.26.5")
-          package("ring")
+          workspace_root = Path(metadata["workspace_root"])
+          manifest = tomllib.loads((workspace_root / "Cargo.toml").read_text(encoding="utf-8"))
+          boring_repository = "https://github.com/YuanDevTeam/boring"
+          boring_revision = manifest["dependencies"]["boring"].get("rev")
+          require(isinstance(boring_revision, str) and re.fullmatch(r"[0-9a-f]{40}", boring_revision), "Boring PR dependencies must pin a complete commit SHA")
+          boring_specs = [manifest["dependencies"][name] for name in ("boring", "tokio-boring")]
+          boring_specs.append(manifest["dev-dependencies"]["boring-sys"])
+          boring_specs.extend(manifest["patch"]["crates-io"][name] for name in ("boring", "boring-sys"))
+          for spec in boring_specs:
+              require(spec.get("git") == boring_repository and spec.get("rev") == boring_revision and not {"path", "branch", "tag"} & spec.keys(), "Boring dependencies and patches must share one Git commit source")
+          boring_source = f"git+{boring_repository}?rev={boring_revision}#{boring_revision}"
+          require(not (workspace_root / "vendor").exists(), "Core vendor sources are forbidden")
+          require(not (workspace_root / "crates" / "vole-blake3-raw" / "vendor").exists(), "BLAKE3 must use the installed official C library")
+          native_manifest = json.loads((workspace_root / "scripts" / "native" / "blake3" / "vcpkg.json").read_text(encoding="utf-8"))
+          require(native_manifest.get("builtin-baseline") == "9eec002df1cd109f8f104cd966a763daf9751489", "unapproved official BLAKE3 C registry baseline")
+          require(native_manifest.get("dependencies") == [{"name": "blake3", "default-features": False}], "BLAKE3 C must use the reviewed static-only package")
+          require(native_manifest.get("overrides") == [{"name": "blake3", "version": "1.8.7", "port-version": 0}], "unapproved official BLAKE3 C version")
+          for name, version in (("idna", "1.1.0"), ("url", "2.5.8")):
+              require(package(name, version).get("license") == "MIT OR Apache-2.0", f"unapproved {name} license")
+          for item in packages:
+              if item["name"].startswith(("icu_", "unicode-")):
+                  require(item.get("source") in registry, f"{item['name']} must use official registry Unicode data")
+          rust_blake3 = package("blake3", "1.8.7")
+          require(rust_blake3.get("license") == "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception", "unapproved Rust BLAKE3 license")
+          rustls = package("rustls", "0.23.46")
+          package("tokio-rustls", "0.26.6")
+          package("rustls-native-certs", "0.8.5")
+          ring = package("ring")
+          quinn = package("quinn", "0.11.12")
+          proto = package("quinn-proto", "0.11.19")
+          require(proto.get("license") == "MIT OR Apache-2.0", "unapproved QUIC protocol license")
+          require({"rustls-ring", "ring"} <= features(proto), "QUIC protocol must use rustls/ring")
+          require("rustls-ring" in features(quinn), "Quinn wrapper must use rustls/ring")
+          require(not (features(proto) | features(quinn)) & {"aws-lc-rs", "aws-lc-rs-fips", "rustls-aws-lc-rs", "rustls-aws-lc-rs-fips"}, "Quinn must keep the approved ring TLS provider")
+          require(proto["id"] in {dependency["pkg"] for dependency in nodes[quinn["id"]]["deps"]}, "Quinn wrapper must resolve the official protocol source")
+          h3 = package("h3", "0.0.8")
+          require(h3.get("license") == "MIT", "unapproved Quinn HTTP/3 license")
+          h3_quinn = package("h3-quinn", "0.0.10")
+          require(h3["id"] in {dependency["pkg"] for dependency in nodes[h3_quinn["id"]]["deps"]}, "Quinn HTTP/3 adapter must resolve the official source")
+          quiche = package("quiche", "0.30.0")
+          require(features(quiche) == {"boring", "boring-sys", "boringssl-boring-crate", "foreign-types-shared"}, "quiche must use the shared Boring provider without FFI or qlog")
+          require(quiche.get("license") == "BSD-2-Clause", "unapproved quiche license")
+          stack = package("smoltcp", "0.14.0", {smoltcp_source})
+          require(stack.get("license") == "0BSD", "unapproved raw IP stack license")
+          rsa = package("rsa", "0.9.10")
+          rcgen = package("rcgen", "0.14.10")
+          require(features(rsa) == {"std"}, "RSA is restricted to controller key generation")
+          require(features(rcgen) == {"crypto", "ring", "x509-parser"}, "certificate generation must use ring and the reviewed CA parser")
+          x509 = package("x509-parser", "0.18.1")
+          require(x509.get("license") == "MIT OR Apache-2.0", "unapproved X.509 parser license")
+          require(features(x509) == {"default", "ring", "verify"}, "X.509 verification must use ring")
+          x509_parents = {node["id"] for node in nodes.values() if any(dependency["pkg"] == x509["id"] for dependency in node.get("deps", []))}
+          require(x509_parents == {metadata["resolve"]["root"], rcgen["id"]}, "X.509 parsing is restricted to Vole and rcgen")
+          for item in (rsa, rcgen):
+              require(item.get("license") == "MIT OR Apache-2.0", f"unapproved {item['name']} license")
+              parents = {node["id"] for node in nodes.values() if any(dependency["pkg"] == item["id"] for dependency in node.get("deps", []))}
+              require(parents == {metadata["resolve"]["root"]}, f"{item['name']} must be consumed only by Vole")
+          require(ring["id"] in {dependency["pkg"] for dependency in nodes[rcgen["id"]]["deps"]}, "rcgen must use the approved ring package")
+          wireguard = package("boringtun", "0.7.1")
+          require(wireguard.get("license") == "BSD-3-Clause", "unapproved WireGuard license")
+          require(not features(wireguard) & {"device", "ffi-bindings", "jni-bindings"}, "WireGuard must use only the userspace protocol")
           require("ring" in features(rustls) and not features(rustls) & {"reality", "aws_lc_rs", "fips"}, "rustls must use only the ring TLS provider")
-          hpke = package("hpke", "0.14.1")
-          require(features(hpke) == {"alloc", "aes", "chacha", "x25519", "hkdfsha2"}, "unapproved ECH algorithms")
+          mieru_aead = next(item for item in packages if item["name"] == "chacha20poly1305" and item["version"] == "0.11.0")
+          require(mieru_aead.get("source") in registry and "zeroize" in features(mieru_aead), "Mieru must use official zeroizing XChaCha20-Poly1305")
+          mieru_proto = package("prost", "0.14.4")
+          require(mieru_proto.get("license") == "Apache-2.0" and mieru_proto.get("source") in registry, "Mieru protobuf must use official Apache-2.0 prost")
+          hpke = package("hpke", "0.15.1")
+          require(features(hpke) == {"alloc", "aes", "chacha", "x25519", "hkdfsha2", "nistp", "mlkem", "shake"}, "unapproved HPKE algorithms")
+          age = package("age", "0.11.5")
+          require(features(age) == {"armor"}, "AGE must use only native armored-file decoding")
+          package("age-core", "0.11.0")
+          package("x-wing", "0.1.1")
+          package("ml-kem", "0.3.4")
           native = {}
           for name, required in (("boring", {"reality", "client-fingerprint", "shadow-tls-v3", "jls"}), ("boring-sys", {"reality", "shadow-tls-v3", "jls"}), ("tokio-boring", set())):
-              item = package(name, "5.2.0", {boring_source})
+              item = package(name, "5.4.0", {boring_source})
               native[name] = item
               require(required <= features(item), f"{name} is missing required TLS features")
               require(not features(item) & {"fips", "fips-precompiled", "rpk", "pq-experimental", "restls"}, f"{name} enables an unapproved TLS mode")
           for parent, children in (("boring", {"boring-sys"}), ("tokio-boring", {"boring", "boring-sys"})):
               dependencies = {dependency["pkg"] for dependency in nodes[native[parent]["id"]]["deps"]}
               require(all(native[child]["id"] in dependencies for child in children), f"{parent} must use the approved native TLS packages")
+          require(native["boring"]["id"] in {dependency["pkg"] for dependency in nodes[quiche["id"]]["deps"]}, "quiche must share Vole's approved Boring package")
           aws = [item for item in packages if item["name"].lower().startswith("aws-lc")]
           if aws:
               require({item["name"] for item in aws} == {"aws-lc-rs", "aws-lc-sys"}, "unapproved AWS-LC package")
@@ -140,8 +217,17 @@ jobs:
               for name, required in (("shadowsocks", {"aead-cipher-2022"}), ("shadowsocks-crypto", {"v2", "aws-lc"})):
                   require(required <= features(chain[name]), f"{name} must enable SS 2022")
               require(not any(features(item) & {"fips", "aead-cipher-2022-extra", "v2-extra"} for item in chain.values()), "unapproved SS 2022 or AWS-LC mode")
-          print("Locked TLS sources, providers, ECH algorithms and SS 2022 dependency chain passed")
+          print("Locked TLS/Unicode/BLAKE3 sources, controller generation, HPKE/AGE algorithms and SS 2022 dependency chain passed")
           PY
+      - name: Official BLAKE3 raw memory vectors
+        if: matrix.profile == 'features'
+        run: |
+          cargo test --locked -p vole-blake3-raw
+      - name: H3 memory fixtures
+        if: matrix.profile == 'features'
+        run: |
+          cargo test --locked --features cli --lib transport::quiche_h3::tests::
+          cargo test --locked --features cli --lib transport::quinn_h3::tests::
       - name: Production and netstack clippy
         if: matrix.profile == 'features'
         run: |
@@ -177,6 +263,8 @@ jobs:
             xhttp_h3_shutdown hysteria2_paths hysteria2_config shadowsocks_backpressure
             shadowtls_config shadowtls_stream uot_config shadowsocks_uot hysteria2_packet_ids
             tuic_config tuic_memory httpupgrade_config httpupgrade_memory vmess_lifecycle
+            grpc_config grpc_pool grpc_protocol_pool
+            sing_mux_config sing_mux
           )
           target_flags=()
           for target in "${targets[@]}"; do target_flags+=(--test "$target"); done
@@ -184,14 +272,29 @@ jobs:
           # Keep this explicit allowlist: unfiltered legacy tests may open host listeners.
           filters=(
             geodata:: routing:: security:: outbound::vless::encryption config::
-            inbound::mixed::tests:: inbound::socks5::association::tests::
+            connections::tests:: routing::diagnostics::tests:: dialer::connections::tests::
+            polled_datagram_
+            resource::http::tests:: fake_ip_ sniffing::tests:: tcp_sniffer::tests::
+            resource::age_provider::tests:: resource::bundle::tests:: resource::bundle_limits::tests::
+            resource::cache::tests:: resource::subscription::tests::
+            dns::fallback::tests:: dns::runtime::tests::dns_fallback_
+            dns::runtime::tests::resolve_ipv6_
+            dns::source::tests:: dns::runtime::tests::dns_source_
+            dns::runtime::encrypted_tests::
+            dns::options::tests:: dns::runtime::quic_tests:: dns::runtime::ech_tests::
+            controller_secure_
+            outbound::http::tests:: outbound::wireguard::tests:: inbound::mixed::tests:: inbound::socks5::association::tests::
             inbound::http::parser::tests:: inbound::http::framing::tests::
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
-            transport::sing_mux::smux_driver::tests:: transport::sing_mux::tests::
-            platform::tun_rs_io::tests:: platform::windows_tun_io::tests::
+            outbound::trusttunnel:: outbound::mieru:: outbound::masque:: security::masque:: config::masque::
+            transport::quic:: transport::quinn_h3:: transport::quiche_h3:: transport::masque_codec:: transport::h3_connect::
+            transport::smux::tests:: transport::sing_mux::tests::
+            grpc_duplex_pool_keeps_response
+            outbound::sing_mux::tests::
+            platform::linux_network::tests:: platform::tun_rs_io::tests:: platform::windows_tun_io::tests::
             platform::windows_wintun_io::tests:: tun_runtime::tests::
-            invoke::foreground::tests:: runtime::shutdown_tests::
+            invoke::foreground::tests:: runtime::shutdown_tests:: runtime::providers::tests:: resource::probe::tests:: invoke::measure_delay::tests::
           )
           for filter in "${filters[@]}"; do run_test 1 --lib "$filter"; done
           run_test 1 --bin vole cli::tests::
@@ -200,14 +303,28 @@ jobs:
             dialer::tests::socket_initialization_cancellation_joins_started_and_queued_work
             dialer::tests::socket_initialization_shared_pool_contention_reclaims_cancelled_work
             outbound::connector::tests::authenticated_continuation_keeps_group_choice_but_has_a_new_io_deadline
+            outbound::connector::tests::ingress_connector_dispatcher_preserves_user_for_dialer_proxy_and_continuations
             runtime::tests::integration_feature_admission_is_explicit_without_opening_sockets
             invoke::tests::version_and_state_use_the_fixed_response_envelope
             invoke::tests::initialize_is_idempotent_only_for_the_same_data_directory
             invoke::tests::envelope_and_payload_are_strict
             invoke::tests::runtime_thread_cannot_reenter_invoke
             invoke::tests::engine_workers_preserve_invoke_admission_and_shutdown
+            invoke::tests::update_dns_network_raw_admission_is_bounded_before_value_or_registry_work
+            invoke::tests::update_dns_network_is_runtime_local_strict_and_monotonic
             invoke::tests::engine_completion_notifies_after_panic_and_join_reports_failure
+            dns::runtime::tests::subrule_dns_rules_keep_round_robin_for_new_physical_connections
+            dns::runtime::tests::runtime_dns_separates_bootstrap_proxy_direct_and_hosts
+            dns::runtime::tests::udp_truncation_retries_the_same_upstream_over_tcp
             dns::runtime::tests::concurrent_redir_host_hint_reads_and_dns_updates_complete
+            dns::runtime::tests::domain_policies_use_specificity_and_preserve_geosite_order
+            dns::runtime::tests::dns_policy_selection_is_consistent_across_snapshot_swaps
+            dns::runtime::tests::classical_logical_selectors_drive_dns_policy_and_sniffing_without_egress
+            dns::runtime::tests::rule_budget_propagates_through_fake_ip_policy_and_sniffer_without_egress
+            runtime::tests::prepares_builtin_routes_without_static_nodes_or_bootstrap
+            runtime::tests::prepares_udp_capabilities_through_runtime_wrappers
+            runtime::tests::prepares_shared_mux_capabilities_and_registers_only_final_graph_nodes
+            runtime::tests::controller_diagnostics_are_opt_in_for_business_routes
             invoke::tests::null_invalid_utf8_and_oversized_input_return_json_failures
             invoke::tests::same_instance_command_is_fail_fast
             invoke::tests::android_protector_is_required_only_for_tun
@@ -231,15 +348,22 @@ jobs:
             test "$(grep -Ec '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$test_log")" -eq "$expected_summaries"
             rm -f "$test_log"
           }
-          protocols=(socks5 anytls shadowsocks trojan vmess vless hysteria2 tuic)
+          protocols=(socks5 anytls shadowsocks trojan trusttunnel mieru masque vmess vless hysteria2 tuic wireguard)
           cargo check --locked --no-default-features --lib
           for protocol in "${protocols[@]}"; do
             cargo check --locked --no-default-features --features "outbound-$protocol" --lib
             run_test 1 --features "outbound-$protocol" --lib runtime::tests::integration_feature_admission_is_explicit_without_opening_sockets -- --exact
           done
-          for feature in inbound-http inbound-socks5 stream-transport quic-transport shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
+          for feature in outbound-http inbound-http inbound-socks5 stream-transport quic-transport quinn-h3-transport quiche-h3-transport dns-quic sing-mux shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
             cargo check --locked --no-default-features --features "$feature" --lib
           done
+          dns_graph="$(mktemp "$RUNNER_TEMP/vole-dns-graph.XXXXXX")"
+          cargo tree --locked --no-default-features --features dns-quic --target all --edges normal,build --prefix none | tee "$dns_graph"
+          if grep -Eq '^(quiche|boring|boring-sys|tokio-boring) v' "$dns_graph"; then
+            echo "The production DNS feature must use Quinn/rustls without quiche or Boring"
+            exit 1
+          fi
+          rm -f "$dns_graph"
           cargo check --locked --no-default-features --features cli --bin vole
           run_test 2 --test feature_foundations --test hysteria2_config
           cargo check --locked --lib

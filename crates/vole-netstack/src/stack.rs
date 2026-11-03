@@ -22,15 +22,21 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    NetStackConfig, Packet,
+    ClientConfig, NetStackConfig, Packet,
     config::ConfigError,
     device::RawIpDevice,
     icmp::{IcmpIngress, classify as classify_icmp},
-    tcp::{FlowKey, TcpListener, TcpStream, TcpStreamHandle},
+    pmtu::parse_path_mtu_hint,
+    tcp::{
+        ClientRequest, ConnectRequest, FlowKey, InitialMtuRequest, TcpConnector, TcpListener,
+        TcpStream, TcpStreamHandle, connect_stopped, connect_timeout,
+    },
     udp::{UdpDatagram, UdpSocket, parse_udp_packet},
 };
 
 const RAW_INGRESS_BATCH: usize = 8;
+const TCP_CONNECT_QUEUE: usize = 32;
+const EPHEMERAL_PORT_START: u16 = 49_152;
 
 /// Running stack and all of its application-facing endpoints.
 pub struct NetStack {
@@ -56,6 +62,60 @@ pub struct TcpNetStackParts {
     pub stats: NetStackStats,
 }
 
+/// Active TCP endpoints with configured sources and no passive accept/UDP queue.
+pub struct ClientNetStackParts {
+    pub packet_sink: PacketSink,
+    pub packet_stream: PacketStream,
+    pub tcp_connector: TcpConnector,
+    pub control: NetStackControl,
+    pub stats: NetStackStats,
+}
+
+struct DriverParts {
+    packet_sink: PacketSink,
+    packet_stream: PacketStream,
+    tcp_listener: Option<TcpListener>,
+    tcp_connector: Option<TcpConnector>,
+    udp_socket: Option<UdpSocket>,
+    control: NetStackControl,
+    stats: NetStackStats,
+}
+
+impl DriverParts {
+    fn into_stack(self) -> NetStack {
+        NetStack {
+            parts: NetStackParts {
+                packet_sink: self.packet_sink,
+                packet_stream: self.packet_stream,
+                tcp_listener: self.tcp_listener.expect("passive endpoints requested"),
+                udp_socket: self.udp_socket.expect("UDP endpoints requested"),
+                control: self.control,
+                stats: self.stats,
+            },
+        }
+    }
+
+    fn into_tcp(self) -> TcpNetStackParts {
+        TcpNetStackParts {
+            packet_sink: self.packet_sink,
+            packet_stream: self.packet_stream,
+            tcp_listener: self.tcp_listener.expect("passive endpoints requested"),
+            control: self.control,
+            stats: self.stats,
+        }
+    }
+
+    fn into_client(self) -> ClientNetStackParts {
+        ClientNetStackParts {
+            packet_sink: self.packet_sink,
+            packet_stream: self.packet_stream,
+            tcp_connector: self.tcp_connector.expect("active endpoints requested"),
+            control: self.control,
+            stats: self.stats,
+        }
+    }
+}
+
 impl NetStack {
     /// Starts one netstack driver on the current Tokio runtime.
     ///
@@ -64,20 +124,7 @@ impl NetStack {
     /// Returns [`NetStackError::Config`] for inconsistent bounds and
     /// [`NetStackError::NoRuntime`] when called outside a Tokio runtime.
     pub fn start(config: NetStackConfig) -> Result<Self, NetStackError> {
-        Self::start_parts(config, true).map(|(parts, udp_socket)| Self::with_udp(parts, udp_socket))
-    }
-
-    fn with_udp(parts: TcpNetStackParts, udp_socket: Option<UdpSocket>) -> Self {
-        Self {
-            parts: NetStackParts {
-                packet_sink: parts.packet_sink,
-                packet_stream: parts.packet_stream,
-                tcp_listener: parts.tcp_listener,
-                udp_socket: udp_socket.expect("UDP endpoints requested"),
-                control: parts.control,
-                stats: parts.stats,
-            },
-        }
+        Self::start_parts(config, true, None).map(DriverParts::into_stack)
     }
 
     /// Starts only the TCP/ICMP driver; callers handle UDP with the pure codec.
@@ -86,14 +133,36 @@ impl NetStack {
     ///
     /// Returns the same configuration and runtime errors as [`Self::start`].
     pub fn start_tcp(config: NetStackConfig) -> Result<TcpNetStackParts, NetStackError> {
-        Self::start_parts(config, false).map(|(parts, _)| parts)
+        Self::start_parts(config, false, None).map(DriverParts::into_tcp)
+    }
+
+    /// Starts active TCP using only the supplied local IP addresses.
+    ///
+    /// UDP remains caller-owned through the pure packet codec. Unsolicited
+    /// incoming TCP flows are discarded; passive TUN behavior is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::start`] and a configuration error when
+    /// no local address is supplied or a supplied address is not unicast.
+    pub fn start_client(
+        config: NetStackConfig,
+        addresses: impl Into<ClientConfig>,
+    ) -> Result<ClientNetStackParts, NetStackError> {
+        let addresses = addresses.into().validate(config.mtu)?;
+        Self::start_parts(config, false, Some(addresses)).map(DriverParts::into_client)
     }
 
     fn start_parts(
         config: NetStackConfig,
         with_udp: bool,
-    ) -> Result<(TcpNetStackParts, Option<UdpSocket>), NetStackError> {
-        config.validate()?;
+        addresses: Option<ClientConfig>,
+    ) -> Result<DriverParts, NetStackError> {
+        if let Some(client) = &addresses {
+            config.validate_client(client)?;
+        } else {
+            config.validate()?;
+        }
         tokio::runtime::Handle::try_current().map_err(|_| NetStackError::NoRuntime)?;
 
         let cancellation = CancellationToken::new();
@@ -101,7 +170,36 @@ impl NetStack {
         let stats = NetStackStats::default();
         let (raw_inbound_tx, raw_inbound_rx) = mpsc::channel(config.packet_queue);
         let (raw_outbound_tx, raw_outbound_rx) = mpsc::channel(config.packet_queue);
-        let (tcp_accept_tx, tcp_accept_rx) = mpsc::channel(config.tcp_accept_queue);
+        let (tcp_accept_tx, tcp_listener, client, tcp_connector) =
+            if let Some(addresses) = addresses {
+                let (sender, receiver) = mpsc::channel(TCP_CONNECT_QUEUE);
+                (
+                    None,
+                    None,
+                    Some(ClientDriver {
+                        addresses,
+                        requests: receiver,
+                        next_port: EPHEMERAL_PORT_START,
+                    }),
+                    Some(TcpConnector {
+                        sender,
+                        addresses,
+                        cancellation: cancellation.clone(),
+                        notify: notify.clone(),
+                    }),
+                )
+            } else {
+                let (sender, receiver) = mpsc::channel(config.tcp_accept_queue);
+                (
+                    Some(sender),
+                    Some(TcpListener {
+                        receiver,
+                        cancellation: cancellation.clone(),
+                    }),
+                    None,
+                    None,
+                )
+            };
         let (udp_tx, udp_socket) = if with_udp {
             let (sender, receiver) = mpsc::channel(config.udp_queue);
             (
@@ -118,8 +216,9 @@ impl NetStack {
         };
         let (stopped_tx, stopped_rx) = watch::channel(false);
 
-        let mtu = config.mtu;
-        let driver = Driver::new(
+        let receive_packet_limit =
+            addresses.map_or(config.mtu, |client| client.receive_packet_limit);
+        let mut driver = Driver::new(
             config,
             raw_inbound_rx,
             raw_outbound_tx.clone(),
@@ -130,32 +229,32 @@ impl NetStack {
             stats.clone(),
             stopped_tx,
         );
+        if let Some(client) = client {
+            driver.configure_client(&client.addresses);
+            driver.client = Some(client);
+        }
         tokio::spawn(driver.run());
 
-        Ok((
-            TcpNetStackParts {
-                packet_sink: PacketSink {
-                    sender: raw_inbound_tx,
-                    cancellation: cancellation.clone(),
-                    mtu,
-                },
-                packet_stream: PacketStream {
-                    receiver: raw_outbound_rx,
-                    cancellation: cancellation.clone(),
-                    notify,
-                },
-                tcp_listener: TcpListener {
-                    receiver: tcp_accept_rx,
-                    cancellation: cancellation.clone(),
-                },
-                control: NetStackControl {
-                    cancellation,
-                    stopped: stopped_rx,
-                },
-                stats,
+        Ok(DriverParts {
+            packet_sink: PacketSink {
+                sender: raw_inbound_tx,
+                cancellation: cancellation.clone(),
+                mtu: receive_packet_limit,
             },
+            packet_stream: PacketStream {
+                receiver: raw_outbound_rx,
+                cancellation: cancellation.clone(),
+                notify,
+            },
+            tcp_listener,
+            tcp_connector,
             udp_socket,
-        ))
+            control: NetStackControl {
+                cancellation,
+                stopped: stopped_rx,
+            },
+            stats,
+        })
     }
 
     #[must_use]
@@ -400,13 +499,22 @@ fn validate_raw_packet(packet: &Packet, mtu: usize) -> Result<(), NetStackError>
 struct TcpEntry {
     socket: SocketHandle,
     handle: Arc<TcpStreamHandle>,
+    connecting: Option<ConnectRequest>,
+    connect_cancellation: Option<CancellationToken>,
+}
+
+struct ClientDriver {
+    addresses: ClientConfig,
+    requests: mpsc::Receiver<ClientRequest>,
+    next_port: u16,
 }
 
 struct Driver {
     config: NetStackConfig,
     raw_inbound: mpsc::Receiver<Packet>,
     raw_outbound: mpsc::Sender<Packet>,
-    tcp_accept: mpsc::Sender<TcpStream>,
+    tcp_accept: Option<mpsc::Sender<TcpStream>>,
+    client: Option<ClientDriver>,
     udp_outbound: Option<mpsc::Sender<UdpDatagram>>,
     cancellation: CancellationToken,
     notify: Arc<Notify>,
@@ -425,7 +533,7 @@ impl Driver {
         config: NetStackConfig,
         raw_inbound: mpsc::Receiver<Packet>,
         raw_outbound: mpsc::Sender<Packet>,
-        tcp_accept: mpsc::Sender<TcpStream>,
+        tcp_accept: Option<mpsc::Sender<TcpStream>>,
         udp_outbound: Option<mpsc::Sender<UdpDatagram>>,
         cancellation: CancellationToken,
         notify: Arc<Notify>,
@@ -435,6 +543,10 @@ impl Driver {
         let mut interface_config = InterfaceConfig::new(HardwareAddress::Ip);
         interface_config.random_seed = 0x4f_6e_65_56_43_6f_72_65;
         let mut device = RawIpDevice::new(config.mtu, raw_outbound.clone());
+        // Passive TUN TCP uses the same bounded, body-free PMTU metadata as
+        // IP-carrier clients. A quote still needs the exact live socket and
+        // an emitted, unacknowledged sequence before it can lower its budget.
+        device.enable_path_mtu();
         let mut interface = Interface::new(interface_config, &mut device, Instant::now());
         interface.set_any_ip(true);
         interface.update_ip_addrs(|addresses| {
@@ -462,6 +574,7 @@ impl Driver {
             raw_inbound,
             raw_outbound,
             tcp_accept,
+            client: None,
             udp_outbound,
             cancellation,
             notify,
@@ -475,33 +588,100 @@ impl Driver {
         }
     }
 
+    fn configure_client(&mut self, addresses: &ClientConfig) {
+        if !addresses.path_mtu_discovery {
+            self.device.disable_path_mtu();
+        }
+        self.interface.set_any_ip(false);
+        self.interface.update_ip_addrs(|configured| {
+            configured.clear();
+            for prefix in addresses.prefixes() {
+                configured
+                    .push(IpCidr::new(prefix.address.into(), prefix.prefix_len))
+                    .expect("client IP address capacity");
+            }
+        });
+        self.interface.routes_mut().remove_default_ipv4_route();
+        self.interface.routes_mut().remove_default_ipv6_route();
+        // The IP-medium device emits every destination into the caller's
+        // packet path; these routes never configure a system interface.
+        if let Some(ip) = addresses
+            .prefixes()
+            .find_map(|prefix| match prefix.address {
+                IpAddr::V4(ip) => Some(ip),
+                IpAddr::V6(_) => None,
+            })
+        {
+            self.interface
+                .routes_mut()
+                .add_default_ipv4_route(ip)
+                .expect("IPv4 route capacity");
+        }
+        if let Some(ip) = addresses
+            .prefixes()
+            .find_map(|prefix| match prefix.address {
+                IpAddr::V6(ip) => Some(ip),
+                IpAddr::V4(_) => None,
+            })
+        {
+            self.interface
+                .routes_mut()
+                .add_default_ipv6_route(ip)
+                .expect("IPv6 route capacity");
+        }
+    }
+
+    async fn next_request(client: &mut Option<ClientDriver>) -> Option<ClientRequest> {
+        match client {
+            Some(client) => client.requests.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+
     async fn run(mut self) {
         loop {
             self.drive();
-            if self.cancellation.is_cancelled() {
+            if self.cancellation.is_cancelled() || !self.wait_for_work().await {
                 break;
             }
+        }
+    }
 
-            let delay = self.next_delay();
-            tokio::select! {
-                biased;
-                () = self.cancellation.cancelled() => break,
-                () = self.notify.notified() => {}
-                // A full output still allows one ingress classification:
-                // low-priority ICMP drops immediately, while TCP retains its
-                // one pending packet until output capacity returns.
-                packet = self.raw_inbound.recv(), if self.device.rx_is_empty() => {
-                    let Some(packet) = packet else { break; };
-                    let batch_count = self.handle_packet_batch(packet);
-                    // recv() already charges the first packet. try_recv()
-                    // does not, so retain the old per-packet cooperative
-                    // accounting without repeating socket maintenance.
-                    for _ in 1..batch_count {
-                        tokio::task::consume_budget().await;
-                    }
+    async fn wait_for_work(&mut self) -> bool {
+        let delay = self.next_delay();
+        let has_connect_requests = self
+            .client
+            .as_ref()
+            .is_some_and(|client| !client.requests.is_closed());
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => false,
+            // A full output still allows one ingress classification:
+            // low-priority ICMP drops immediately, while TCP retains its
+            // one pending packet until output capacity returns.
+            packet = self.raw_inbound.recv(), if self.device.rx_is_empty() => {
+                let Some(packet) = packet else { return false; };
+                let batch_count = self.handle_packet_batch(packet);
+                // recv() already charges the first packet. try_recv()
+                // does not, so retain the old per-packet cooperative
+                // accounting without repeating socket maintenance.
+                for _ in 1..batch_count {
+                    tokio::task::consume_budget().await;
                 }
-                () = tokio::time::sleep(delay) => {}
+                true
             }
+            // Socket maintenance runs before this wait on every iteration.
+            // Its own notifications must not outrank an already-ready packet,
+            // especially TCP ACKs which release the relay's bounded buffers.
+            () = self.notify.notified() => true,
+            request = Self::next_request(&mut self.client), if has_connect_requests => {
+                if let Some(request) = request {
+                    self.handle_client_request(request);
+                    tokio::task::consume_budget().await;
+                }
+                true
+            }
+            () = tokio::time::sleep(delay) => true,
         }
     }
 
@@ -544,6 +724,27 @@ impl Driver {
     }
 
     fn handle_packet(&mut self, packet: Packet) {
+        if self
+            .client
+            .as_ref()
+            .is_none_or(|client| client.addresses.path_mtu_discovery)
+            && let Some(hint) = parse_path_mtu_hint(packet.data())
+        {
+            let local_address = self
+                .client
+                .as_ref()
+                .is_none_or(|client| client.addresses.contains_address(hint.local.ip()));
+            if hint.outer_destination == hint.local.ip()
+                && local_address
+                && self.tcp_entries.contains_key(&FlowKey {
+                    source: hint.remote,
+                    destination: hint.local,
+                })
+            {
+                self.device.apply_path_mtu(hint);
+            }
+            return;
+        }
         if self.config.fake_icmp_echo {
             match classify_icmp(&packet) {
                 IcmpIngress::NotIcmp => {}
@@ -579,7 +780,8 @@ impl Driver {
     }
 
     fn handle_icmp_packet(&mut self, packet: Packet) {
-        if !self.device.rx_is_empty() || self.device.tx_is_full() {
+        if packet.len() > self.config.mtu || !self.device.rx_is_empty() || self.device.tx_is_full()
+        {
             self.stats.0.icmp_dropped.fetch_add(1, Ordering::AcqRel);
             return;
         }
@@ -609,9 +811,18 @@ impl Driver {
             return;
         };
 
-        if !self.tcp_entries.contains_key(&flow) && (!syn || ack || !self.admit_tcp(flow)) {
-            return;
+        if !self.tcp_entries.contains_key(&flow) {
+            if self.client.is_some() {
+                if syn && !ack {
+                    self.stats.0.rejected_tcp.fetch_add(1, Ordering::AcqRel);
+                }
+                return;
+            }
+            if !syn || ack || !self.admit_tcp(flow) {
+                return;
+            }
         }
+        self.device.acknowledge(&packet);
         if self.device.push_rx(packet).is_err() {
             // A pending ingress packet must never be overwritten.
             self.stats.0.rejected_tcp.fetch_add(1, Ordering::AcqRel);
@@ -619,35 +830,28 @@ impl Driver {
     }
 
     fn admit_tcp(&mut self, flow: FlowKey) -> bool {
-        if self.tcp_accept.capacity() == 0 {
+        let Some(accept) = self.tcp_accept.as_ref() else {
+            return false;
+        };
+        if accept.capacity() == 0 {
             self.stats.0.rejected_tcp.fetch_add(1, Ordering::AcqRel);
             return false;
         }
 
-        let recv_layer_buffer = self.config.recv_layer_buffer_size();
-        let send_layer_buffer = self.config.send_layer_buffer_size();
-        let mut socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0_u8; recv_layer_buffer]),
-            tcp::SocketBuffer::new(vec![0_u8; send_layer_buffer]),
-        );
-        socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(28)));
-        socket.set_timeout(Some(self.config.tcp_idle_timeout.into()));
-        socket.set_ack_delay(Some(smoltcp::time::Duration::from_millis(10)));
-        socket.set_nagle_enabled(false);
-        socket.set_congestion_control(tcp::CongestionControl::Cubic);
+        let mut socket = self.new_tcp_socket();
         if socket.listen(flow.destination).is_err() {
             self.stats.0.rejected_tcp.fetch_add(1, Ordering::AcqRel);
             return false;
         }
 
         let handle = Arc::new(TcpStreamHandle::new(
-            recv_layer_buffer,
-            send_layer_buffer,
+            self.config.recv_layer_buffer_size(),
+            self.config.send_layer_buffer_size(),
             self.notify.clone(),
         ));
         let socket_handle = self.sockets.add(socket);
         let stream = TcpStream::new(flow, handle.clone());
-        if self.tcp_accept.try_send(stream).is_err() {
+        if accept.try_send(stream).is_err() {
             self.sockets.remove(socket_handle);
             self.stats.0.rejected_tcp.fetch_add(1, Ordering::AcqRel);
             return false;
@@ -657,6 +861,8 @@ impl Driver {
             TcpEntry {
                 socket: socket_handle,
                 handle,
+                connecting: None,
+                connect_cancellation: None,
             },
         );
         self.half_open.insert(flow);
@@ -664,20 +870,180 @@ impl Driver {
         true
     }
 
+    fn new_tcp_socket(&self) -> tcp::Socket<'static> {
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; self.config.recv_layer_buffer_size()]),
+            tcp::SocketBuffer::new(vec![0; self.config.send_layer_buffer_size()]),
+        );
+        socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(28)));
+        socket.set_timeout(Some(self.config.tcp_idle_timeout.into()));
+        socket.set_ack_delay(Some(smoltcp::time::Duration::from_millis(10)));
+        socket.set_nagle_enabled(false);
+        socket.set_congestion_control(tcp::CongestionControl::Cubic);
+        if self.client.is_some() {
+            // The initial SYN timeout stays unchanged; RTT samples set the lower floor.
+            socket.set_min_rto(smoltcp::time::Duration::from_millis(200));
+        }
+        socket
+    }
+
+    fn connect_tcp(&mut self, request: ConnectRequest) {
+        if request.cancellation.is_cancelled() || request.response.is_closed() {
+            return;
+        }
+        if self.cancellation.is_cancelled() {
+            let _ = request.response.send(Err(connect_stopped()));
+            return;
+        }
+        if tokio::time::Instant::now() >= request.deadline {
+            let _ = request.response.send(Err(connect_timeout()));
+            return;
+        }
+        let client = self.client.as_mut().expect("active request has a driver");
+        let source = match client.addresses.source_for(request.destination.ip()) {
+            Ok(source) => source,
+            Err(error) => {
+                let _ = request.response.send(Err(error));
+                return;
+            }
+        };
+        let mut selected = None;
+        for _ in EPHEMERAL_PORT_START..=u16::MAX {
+            let port = client.next_port;
+            client.next_port = if port == u16::MAX {
+                EPHEMERAL_PORT_START
+            } else {
+                port + 1
+            };
+            let incoming = FlowKey {
+                source: request.destination,
+                destination: SocketAddr::new(source, port),
+            };
+            if !self.tcp_entries.contains_key(&incoming) {
+                selected = Some(incoming);
+                break;
+            }
+        }
+        let Some(flow) = selected else {
+            let _ = request.response.send(Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "active TCP source ports exhausted for peer",
+            )));
+            return;
+        };
+        let mut socket = self.new_tcp_socket();
+        if socket
+            .connect(self.interface.context(), flow.source, flow.destination)
+            .is_err()
+        {
+            let _ = request.response.send(Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "active TCP endpoint is unavailable",
+            )));
+            return;
+        }
+        let handle = Arc::new(TcpStreamHandle::new(
+            self.config.recv_layer_buffer_size(),
+            self.config.send_layer_buffer_size(),
+            self.notify.clone(),
+        ));
+        let socket = self.sockets.add(socket);
+        let connect_cancellation = Some(request.cancellation.clone());
+        self.tcp_entries.insert(
+            flow,
+            TcpEntry {
+                socket,
+                handle,
+                connecting: Some(request),
+                connect_cancellation,
+            },
+        );
+        self.half_open.insert(flow);
+        self.update_flow_stats();
+    }
+
+    fn handle_client_request(&mut self, request: ClientRequest) {
+        match request {
+            ClientRequest::Connect(request) => self.connect_tcp(request),
+            ClientRequest::InitialMtu(request) => self.set_initial_mtu(request),
+        }
+    }
+
+    fn set_initial_mtu(&mut self, request: InitialMtuRequest) {
+        if request.response.is_closed() {
+            return;
+        }
+        let result = if self.cancellation.is_cancelled() {
+            Err(connect_stopped())
+        } else if tokio::time::Instant::now() >= request.deadline {
+            Err(connect_timeout())
+        } else if !self.tcp_entries.is_empty() || self.device.emitted() != 0 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "initial TCP MTU is already in use",
+            ))
+        } else {
+            let addresses = self
+                .client
+                .as_ref()
+                .expect("active command has a client")
+                .addresses;
+            if request.mtu > self.config.mtu || addresses.validate(request.mtu).is_err() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid initial TCP packet budget",
+                ))
+            } else {
+                self.config.mtu = request.mtu;
+                self.device.set_initial_mtu(request.mtu);
+                // smoltcp snapshots DeviceCapabilities when Interface is
+                // created. Before the first flow, rebuild that snapshot and
+                // restore the same sources/routes without replacing sockets.
+                let mut config = InterfaceConfig::new(HardwareAddress::Ip);
+                config.random_seed = 0x4f_6e_65_56_43_6f_72_65;
+                self.interface = Interface::new(config, &mut self.device, Instant::now());
+                self.configure_client(&addresses);
+                Ok(())
+            }
+        };
+        let _ = request.response.send(result);
+    }
+
     fn drive(&mut self) {
         if self.raw_outbound.is_closed() {
             self.cancellation.cancel();
             return;
         }
+        self.device.flush_pending();
+        // Busy packet traffic must not starve command admission. The same
+        // bounded prefix as raw ingress avoids draining an unbounded burst.
+        for _ in 0..RAW_INGRESS_BATCH {
+            let request = self
+                .client
+                .as_mut()
+                .and_then(|client| client.requests.try_recv().ok());
+            let Some(request) = request else {
+                break;
+            };
+            self.handle_client_request(request);
+        }
         if !self.device.tx_is_full() {
             self.interface
                 .poll(Instant::now(), &mut self.device, &mut self.sockets);
+        } else if !self.device.rx_is_empty() {
+            // ACK/window progress must not wait for outbound DATA capacity.
+            // Device::receive allows only a pure ACK on this path and keeps
+            // any immediate response in the same existing pending slot.
+            self.interface
+                .poll_ingress_single(Instant::now(), &mut self.device, &mut self.sockets);
         }
         self.drive_tcp_sockets();
+        self.device.flush_pending();
         if !self.device.tx_is_full() {
             self.interface
                 .poll(Instant::now(), &mut self.device, &mut self.sockets);
         }
+        self.device.flush_pending();
     }
 
     fn drive_tcp_sockets(&mut self) {
@@ -687,12 +1053,13 @@ impl Driver {
             .and_then(parse_tcp_flow)
             .map(|(flow, _, _)| flow);
         let mut inactive = Vec::new();
-        for (flow, entry) in &self.tcp_entries {
+        for (flow, entry) in &mut self.tcp_entries {
             let socket = self.sockets.get_mut::<tcp::Socket>(entry.socket);
+            Self::finish_connect(*flow, entry, socket);
             let handle = &entry.handle;
 
             let mut received = false;
-            while socket.can_recv() && !handle.app_recv.is_full() {
+            while socket.can_recv() {
                 match socket.recv(|bytes| {
                     let count = handle.app_recv.write(bytes);
                     (count, count)
@@ -706,7 +1073,7 @@ impl Driver {
             }
 
             let mut sent = false;
-            while socket.can_send() && !handle.app_send.is_empty() {
+            while socket.can_send() {
                 match socket.send(|bytes| {
                     let count = handle.app_send.read(bytes);
                     (count, count)
@@ -723,7 +1090,7 @@ impl Driver {
                 socket.state(),
                 tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived
             );
-            if past_handshake {
+            if past_handshake && !self.half_open.is_empty() {
                 self.half_open.remove(flow);
             }
             if past_handshake && !socket.may_recv() && !socket.can_recv() {
@@ -766,6 +1133,7 @@ impl Driver {
 
         for flow in inactive {
             if let Some(entry) = self.tcp_entries.remove(&flow) {
+                self.device.forget_flow(flow);
                 self.sockets.remove(entry.socket);
                 self.half_open.remove(&flow);
                 entry.handle.socket_closed.store(true, Ordering::Release);
@@ -776,6 +1144,55 @@ impl Driver {
         self.update_flow_stats();
     }
 
+    fn finish_connect(incoming: FlowKey, entry: &mut TcpEntry, socket: &mut tcp::Socket<'_>) {
+        let handle = &entry.handle;
+        if entry
+            .connect_cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            // Covers cancellation after the response was queued but before
+            // the caller accepted its stream, including an established race.
+            socket.abort();
+            handle.dropped.store(true, Ordering::Release);
+        }
+        let request = entry.connecting.take_if(|request| {
+            request.response.is_closed()
+                || request.cancellation.is_cancelled()
+                || tokio::time::Instant::now() >= request.deadline
+                || matches!(
+                    socket.state(),
+                    tcp::State::Established | tcp::State::CloseWait | tcp::State::Closed
+                )
+        });
+        let Some(request) = request else {
+            return;
+        };
+        let result = if request.response.is_closed() || request.cancellation.is_cancelled() {
+            Err(connect_stopped())
+        } else if tokio::time::Instant::now() >= request.deadline {
+            Err(connect_timeout())
+        } else if socket.state() == tcp::State::Closed {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "active TCP handshake was closed",
+            ))
+        } else {
+            Ok(TcpStream::new(
+                FlowKey {
+                    source: incoming.destination,
+                    destination: incoming.source,
+                },
+                handle.clone(),
+            ))
+        };
+        if result.is_err() {
+            socket.abort();
+            handle.dropped.store(true, Ordering::Release);
+        }
+        let _ = request.response.send(result);
+    }
+
     fn next_delay(&mut self) -> Duration {
         let smoltcp_delay = self
             .interface
@@ -784,11 +1201,21 @@ impl Driver {
         // A ready egress timer cannot make progress while output is full.
         // PacketStream notifies on capacity recovery; retain a bounded timer
         // for lifecycle maintenance instead of repeatedly sleeping for zero.
-        if smoltcp_delay.is_zero() && self.device.tx_is_full() {
+        let delay = if smoltcp_delay.is_zero() && self.device.tx_is_full() {
             self.config.max_poll_interval
         } else {
             smoltcp_delay.min(self.config.max_poll_interval)
-        }
+        };
+        self.tcp_entries
+            .values()
+            .filter_map(|entry| entry.connecting.as_ref())
+            .fold(delay, |delay, request| {
+                delay.min(
+                    request
+                        .deadline
+                        .saturating_duration_since(tokio::time::Instant::now()),
+                )
+            })
     }
 
     fn update_flow_stats(&self) {
@@ -811,9 +1238,25 @@ impl Driver {
 
     fn shutdown(&mut self) {
         self.cancellation.cancel();
-        self.device.discard_rx();
-        for entry in self.tcp_entries.values() {
+        self.device.clear();
+        if let Some(client) = &mut self.client {
+            client.requests.close();
+            while let Ok(request) = client.requests.try_recv() {
+                match request {
+                    ClientRequest::Connect(request) => {
+                        let _ = request.response.send(Err(connect_stopped()));
+                    }
+                    ClientRequest::InitialMtu(request) => {
+                        let _ = request.response.send(Err(connect_stopped()));
+                    }
+                }
+            }
+        }
+        for entry in self.tcp_entries.values_mut() {
             entry.handle.mark_stopped();
+            if let Some(request) = entry.connecting.take() {
+                let _ = request.response.send(Err(connect_stopped()));
+            }
         }
         self.tcp_entries.clear();
         self.half_open.clear();
@@ -916,6 +1359,312 @@ mod tests {
         Packet::new(ip.into_inner())
     }
 
+    // Keep both real handshakes and the failed-emit timeline in one regression.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn failed_fast_retransmit_survives_another_socket_filling_tx() {
+        use crate::segmentation::tests::tcp_packet;
+        use tokio::io::AsyncWriteExt;
+        let config = NetStackConfig {
+            packet_queue: 1,
+            ..NetStackConfig::default()
+        };
+        let (_inbound, receiver) = mpsc::channel(config.packet_queue);
+        let (outbound, mut packets) = mpsc::channel(config.packet_queue);
+        let (accept, mut streams) = mpsc::channel(config.tcp_accept_queue);
+        let (stopped, _) = watch::channel(false);
+        let mut driver = Driver::new(
+            config,
+            receiver,
+            outbound,
+            Some(accept),
+            None,
+            CancellationToken::new(),
+            Arc::new(Notify::new()),
+            NetStackStats::default(),
+            stopped,
+        );
+        let flows = [
+            FlowKey {
+                source: "10.0.0.2:12000".parse().unwrap(),
+                destination: "192.0.2.1:12001".parse().unwrap(),
+            },
+            FlowKey {
+                source: "10.0.0.3:12002".parse().unwrap(),
+                destination: "192.0.2.1:12001".parse().unwrap(),
+            },
+        ];
+        let mut sequences = [0; 2];
+        for (index, flow) in flows.into_iter().enumerate() {
+            let remote_sequence = 100 + u32::try_from(index).unwrap() * 100;
+            driver.handle_packet_batch(tcp_packet(flow, remote_sequence, 0, 2, 0));
+            driver.drive();
+            let syn_ack = packets.try_recv().expect("actual SYN-ACK missing");
+            let ip = Ipv4Packet::new_checked(syn_ack.data()).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert!(tcp.syn() && tcp.ack());
+            sequences[index] =
+                u32::from_be_bytes(ip.payload()[4..8].try_into().unwrap()).wrapping_add(1);
+            driver.handle_packet_batch(tcp_packet(
+                flow,
+                remote_sequence + 1,
+                sequences[index],
+                16,
+                0,
+            ));
+            driver.drive();
+            assert!(packets.try_recv().is_err());
+        }
+        let mut first_stream = streams.try_recv().unwrap();
+        let mut retry_stream = streams.try_recv().unwrap();
+        let first_handle = driver.tcp_entries[&flows[0]].socket;
+        let retry_handle = driver.tcp_entries[&flows[1]].socket;
+        let handles: Vec<_> = driver.sockets.iter().map(|(handle, _)| handle).collect();
+        assert!(
+            handles
+                .iter()
+                .position(|handle| *handle == first_handle)
+                .unwrap()
+                < handles
+                    .iter()
+                    .position(|handle| *handle == retry_handle)
+                    .unwrap(),
+            "fixture requires the output-filling socket before the retry socket"
+        );
+
+        let lost = b"actual-unacknowledged-DATA";
+        retry_stream.write_all(lost).await.unwrap();
+        driver.drive_tcp_sockets();
+        let now = Instant::now();
+        driver
+            .interface
+            .poll_egress(now, &mut driver.device, &mut driver.sockets);
+        let original = packets.try_recv().expect("actual original DATA missing");
+        let ip = Ipv4Packet::new_checked(original.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert_eq!(tcp.dst_port(), flows[1].source.port());
+        assert_eq!(tcp.payload(), lost);
+        let original_sequence = tcp.seq_number();
+        assert_eq!(
+            driver.sockets.get::<tcp::Socket>(retry_handle).send_queue(),
+            lost.len()
+        );
+
+        // The actual TCP ACK parser schedules fast retransmit. Do not poll
+        // egress until the earlier socket has an ordinary DATA packet ready.
+        let ack_at = now + smoltcp::time::Duration::from_millis(1);
+        for _ in 0..3 {
+            driver.handle_packet(tcp_packet(flows[1], 201, sequences[1], 16, 0));
+            driver
+                .interface
+                .poll_ingress_single(ack_at, &mut driver.device, &mut driver.sockets);
+            assert!(driver.device.rx_is_empty());
+        }
+        let filling = b"earlier-socket-occupies-the-only-output-slot";
+        first_stream.write_all(filling).await.unwrap();
+        driver.drive_tcp_sockets();
+        driver.interface.poll_egress(
+            now + smoltcp::time::Duration::from_millis(2),
+            &mut driver.device,
+            &mut driver.sockets,
+        );
+        let occupied = packets
+            .try_recv()
+            .expect("earlier socket did not emit DATA");
+        let ip = Ipv4Packet::new_checked(occupied.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert_eq!(tcp.dst_port(), flows[0].source.port());
+        assert_eq!(tcp.payload(), filling);
+        assert!(!driver.device.tx_is_full());
+
+        // Capacity is now free. No new peer ACK, application write or real-time
+        // wait follows the failed emit; only one public egress poll at +1ms.
+        driver.interface.poll_egress(
+            now + smoltcp::time::Duration::from_millis(3),
+            &mut driver.device,
+            &mut driver.sockets,
+        );
+        let retried = packets.try_recv().is_ok_and(|packet| {
+            let ip = Ipv4Packet::new_checked(packet.data()).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            tcp.dst_port() == flows[1].source.port()
+                && tcp.seq_number() == original_sequence
+                && tcp.payload() == lost
+                && !tcp.syn()
+                && !tcp.fin()
+                && !tcp.rst()
+        });
+        driver.shutdown();
+        drop((first_stream, retry_stream));
+        assert!(driver.cancellation.is_cancelled());
+        assert!(driver.tcp_entries.is_empty());
+        assert_eq!(driver.sockets.iter().count(), 0);
+        assert!(
+            retried,
+            "failed fast retransmit must remain immediately retryable after TX capacity returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_tx_pure_ack_releases_actual_smoltcp_send_queue() {
+        use tokio::io::AsyncWriteExt;
+        let config = NetStackConfig {
+            packet_queue: 1,
+            ..NetStackConfig::default()
+        };
+        let (_sender, inbound) = mpsc::channel(config.packet_queue);
+        let (outbound, mut packets) = mpsc::channel(config.packet_queue);
+        let (accept, mut streams) = mpsc::channel(config.tcp_accept_queue);
+        let (stopped, _) = watch::channel(false);
+        let mut driver = Driver::new(
+            config,
+            inbound,
+            outbound,
+            Some(accept),
+            None,
+            CancellationToken::new(),
+            Arc::new(Notify::new()),
+            NetStackStats::default(),
+            stopped,
+        );
+        driver.handle_packet_batch(tcp_handshake_packet(100, None));
+        driver.drive();
+        let syn_ack = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(syn_ack.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let acknowledged = tcp.seq_number().0.wrapping_add(1);
+        driver.handle_packet_batch(tcp_handshake_packet(101, Some(acknowledged)));
+        driver.drive();
+        let mut stream = streams.try_recv().unwrap();
+        let payload = b"unacknowledged-before-full-output";
+        stream.write_all(payload).await.unwrap();
+        driver.drive();
+        let data = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(data.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert_eq!(tcp.payload(), payload);
+        let ack = tcp
+            .seq_number()
+            .0
+            .wrapping_add(i32::try_from(payload.len()).unwrap());
+        assert_eq!(
+            driver
+                .sockets
+                .get::<tcp::Socket>(driver.tcp_entries.values().next().unwrap().socket)
+                .send_queue(),
+            payload.len()
+        );
+        driver.raw_outbound.try_send(packet(99)).unwrap();
+        assert!(driver.device.tx_is_full());
+        // A real ACK must reach the live smoltcp socket while the downstream
+        // packet consumer is blocked; no fabricated socket-state observation.
+        driver.handle_packet_batch(tcp_handshake_packet(101, Some(ack)));
+        assert!(
+            driver.device.rx_is_empty(),
+            "ACK remained blocked behind full TX"
+        );
+        assert_eq!(
+            driver
+                .sockets
+                .get::<tcp::Socket>(driver.tcp_entries.values().next().unwrap().socket)
+                .send_queue(),
+            0
+        );
+        assert_eq!(packets.try_recv().unwrap(), packet(99));
+        driver.shutdown();
+        assert!(driver.cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn full_tx_smoltcp_immediate_reset_is_retained_until_capacity_returns() {
+        let config = NetStackConfig {
+            packet_queue: 1,
+            ..NetStackConfig::default()
+        };
+        let (_sender, inbound) = mpsc::channel(config.packet_queue);
+        let (outbound, mut packets) = mpsc::channel(config.packet_queue);
+        let (accept, _streams) = mpsc::channel(config.tcp_accept_queue);
+        let (stopped, _) = watch::channel(false);
+        let mut driver = Driver::new(
+            config,
+            inbound,
+            outbound,
+            Some(accept),
+            None,
+            CancellationToken::new(),
+            Arc::new(Notify::new()),
+            NetStackStats::default(),
+            stopped,
+        );
+        driver.handle_packet_batch(tcp_handshake_packet(100, None));
+        driver.drive();
+        let syn_ack = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(syn_ack.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let wrong_ack = tcp.seq_number().0.wrapping_add(2);
+        driver.raw_outbound.try_send(packet(99)).unwrap();
+        driver.handle_packet_batch(tcp_handshake_packet(101, Some(wrong_ack)));
+        assert!(
+            driver.device.rx_is_empty(),
+            "full TX blocked the invalid-ACK response path"
+        );
+        assert_eq!(packets.try_recv().unwrap(), packet(99));
+        driver.drive();
+        let reset = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(reset.data()).unwrap();
+        assert!(TcpPacket::new_checked(ip.payload()).unwrap().rst());
+        assert!(packets.try_recv().is_err());
+        driver.shutdown();
+        assert!(driver.device.rx_is_empty());
+        assert!(driver.cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn ready_ingress_progresses_before_repeated_app_notifications() {
+        for cancelled in [false, true] {
+            let config = NetStackConfig::default();
+            let (sender, inbound) = mpsc::channel(config.packet_queue);
+            let (outbound, _packets) = mpsc::channel(config.packet_queue);
+            let (accept, _streams) = mpsc::channel(config.tcp_accept_queue);
+            let (stopped, _) = watch::channel(false);
+            let cancellation = CancellationToken::new();
+            let notify = Arc::new(Notify::new());
+            let mut driver = Driver::new(
+                config,
+                inbound,
+                outbound,
+                Some(accept),
+                None,
+                cancellation.clone(),
+                notify.clone(),
+                NetStackStats::default(),
+                stopped,
+            );
+            sender.try_send(tcp_handshake_packet(100, None)).unwrap();
+            // Application writes and output capacity recovery can make this
+            // notification ready on every iteration of a busy duplex relay.
+            for _ in 0..3 {
+                notify.notify_one();
+                if cancelled {
+                    cancellation.cancel();
+                }
+                let running = driver.wait_for_work().await;
+                assert_eq!(running, !cancelled);
+                if cancelled {
+                    assert_eq!(driver.raw_inbound.len(), 1);
+                    assert!(driver.tcp_entries.is_empty());
+                    break;
+                }
+                assert!(
+                    driver.raw_inbound.is_empty(),
+                    "ready IP input lost to app notification"
+                );
+                assert_eq!(driver.tcp_entries.len(), 1);
+                sender.try_send(tcp_handshake_packet(100, None)).unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn driver_batch_preserves_queued_suffix_when_tcp_ingress_fills_tx() {
         let config = NetStackConfig {
@@ -931,7 +1680,7 @@ mod tests {
             config,
             inbound,
             outbound,
-            accept,
+            Some(accept),
             Some(udp),
             CancellationToken::new(),
             Arc::new(Notify::new()),
@@ -1001,7 +1750,7 @@ mod tests {
             config,
             inbound,
             outbound,
-            accept,
+            Some(accept),
             Some(udp),
             CancellationToken::new(),
             Arc::new(Notify::new()),
@@ -1073,7 +1822,7 @@ mod tests {
             config,
             inbound,
             outbound,
-            accept,
+            Some(accept),
             None,
             CancellationToken::new(),
             Arc::new(Notify::new()),

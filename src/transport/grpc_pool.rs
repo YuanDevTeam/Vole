@@ -1,6 +1,6 @@
 //! Node-owned gRPC physical connections. Policy matches Mihomo's two threshold
 //! branches; bounded idle retention does not impose a business-flow quota.
-use super::h2_write::{Sender, Writes};
+use super::h2_write::{Payload, Sender, Writes};
 use crate::{config::GrpcOptions, dispatch::BoxStream};
 use std::{
     future::Future,
@@ -23,10 +23,35 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 const MAX_IDLE_CONNECTIONS: usize = crate::limits::GRPC_IDLE_CONNECTIONS;
 const PING_TIMEOUT: Duration = Duration::from_secs(crate::limits::GRPC_PING_TIMEOUT_SECONDS as u64);
 
+#[derive(Clone, Copy)]
+pub(super) enum ResponsePolicy {
+    SetupDeadline,
+    #[cfg(any(
+        feature = "outbound-vmess",
+        feature = "outbound-vless",
+        feature = "outbound-trojan"
+    ))]
+    ClientFirst,
+}
+
+enum RequestKind<'a> {
+    Grpc(&'a str),
+    #[cfg(feature = "outbound-trusttunnel")]
+    Connect(http::Request<()>, Option<Arc<dyn Fn() + Send + Sync>>),
+    #[cfg(feature = "outbound-masque")]
+    ConnectAdmitted(http::Request<()>),
+}
+
 pub struct GrpcPool {
     options: GrpcOptions,
+    stream_receive_window: u32,
+    response_policy: ResponsePolicy,
+    half_close: bool,
+    empty_data: bool,
     connections: Arc<SyncMutex<Vec<Connection>>>,
     opening: Mutex<()>,
+    admission: SyncMutex<()>,
+    idle_timeout: Option<Duration>,
     cancellation: CancellationToken,
     tasks: TaskTracker,
 }
@@ -34,11 +59,63 @@ impl GrpcPool {
     pub fn new(options: GrpcOptions) -> Self {
         Self {
             options,
+            stream_receive_window: super::STREAM_BUFFER_BYTES as u32,
+            response_policy: ResponsePolicy::SetupDeadline,
+            half_close: false,
+            empty_data: false,
             connections: Arc::default(),
             opening: Mutex::default(),
+            admission: SyncMutex::default(),
+            idle_timeout: None,
             cancellation: CancellationToken::new(),
             tasks: TaskTracker::new(),
         }
+    }
+    /// Callers bound complete protocol request submission with the setup deadline.
+    /// Keep the client-first response policy fixed across pooled connections.
+    #[cfg(any(feature = "outbound-vmess", feature = "outbound-vless"))]
+    pub(crate) fn new_client_first(options: GrpcOptions) -> Self {
+        let mut pool = Self::new(options);
+        pool.response_policy = ResponsePolicy::ClientFirst;
+        pool
+    }
+    #[cfg(feature = "outbound-trusttunnel")]
+    pub(crate) fn connect_client() -> Self {
+        let mut pool = Self::new(GrpcOptions {
+            max_connections: 1,
+            min_streams: 0,
+            ..Default::default()
+        });
+        pool.idle_timeout = Some(Duration::from_secs(30));
+        pool.empty_data = true;
+        pool
+    }
+    #[cfg(feature = "outbound-masque")]
+    pub(crate) fn masque_ip() -> Self {
+        let mut pool = Self::new(GrpcOptions {
+            max_connections: 1,
+            min_streams: 0,
+            ping_interval: 30,
+            ..Default::default()
+        });
+        // One CONNECT-IP response carries the node's inner IP traffic.
+        pool.stream_receive_window = 128 * 1024;
+        pool
+    }
+    /// Trojan keeps its response and lease after upload END_STREAM.
+    #[cfg(any(test, feature = "outbound-trojan"))]
+    pub(crate) fn duplex(options: GrpcOptions) -> Self {
+        let mut pool = Self::new(options);
+        pool.half_close = true;
+        pool
+    }
+    /// Trojan bounds authentication submission separately and keeps receiving
+    /// after upload END_STREAM while waiting for the first HTTP response.
+    #[cfg(feature = "outbound-trojan")]
+    pub(crate) fn duplex_client_first(options: GrpcOptions) -> Self {
+        let mut pool = Self::duplex(options);
+        pool.response_policy = ResponsePolicy::ClientFirst;
+        pool
     }
     /// The factory is invoked only for a new physical connection. A reused
     /// transport keeps its original upstream selection and TLS identity.
@@ -52,60 +129,199 @@ impl GrpcPool {
         F: FnOnce() -> Fut,
         Fut: Future<Output = io::Result<BoxStream>>,
     {
+        self.open_request(RequestKind::Grpc(uri), deadline, connect)
+            .await
+    }
+    /// An unframed CONNECT stream shares the same physical-IO ownership and
+    /// pool policy as gRPC, without importing gRPC headers or record framing.
+    #[cfg(feature = "outbound-trusttunnel")]
+    pub(crate) async fn open_connect<F, Fut>(
+        &self,
+        request: http::Request<()>,
+        deadline: Instant,
+        connect: F,
+    ) -> io::Result<BoxStream>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<BoxStream>>,
+    {
+        self.open_request(RequestKind::Connect(request, None), deadline, connect)
+            .await
+    }
+    #[cfg(feature = "outbound-trusttunnel")]
+    pub(crate) async fn open_connect_observed<F, Fut>(
+        &self,
+        request: http::Request<()>,
+        deadline: Instant,
+        observer: Arc<dyn Fn() + Send + Sync>,
+        connect: F,
+    ) -> io::Result<BoxStream>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<BoxStream>>,
+    {
+        self.open_request(
+            RequestKind::Connect(request, Some(observer)),
+            deadline,
+            connect,
+        )
+        .await
+    }
+    #[cfg(feature = "outbound-masque")]
+    pub(crate) async fn open_connect_admitted<F, Fut>(
+        &self,
+        request: http::Request<()>,
+        deadline: Instant,
+        connect: F,
+    ) -> io::Result<BoxStream>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<BoxStream>>,
+    {
+        self.open_request(RequestKind::ConnectAdmitted(request), deadline, connect)
+            .await
+    }
+    #[cfg(feature = "outbound-trusttunnel")]
+    pub(crate) async fn probe<F, Fut>(
+        &self,
+        request: http::Request<()>,
+        deadline: Instant,
+        connect: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<BoxStream>>,
+    {
         let operation = async {
-            // Only physical creation is serialized; waiting callers own their
-            // deadline/cancellation and no detached queue or worker is created.
-            let (sender, lease) = {
-                let _opening = self.opening.lock().await;
-                let existing = {
-                    let mut connections = self.connections.lock().unwrap();
-                    connections.retain(|connection| !connection.closed.load(Ordering::Acquire));
-                    connections
-                        .iter()
-                        .min_by_key(|connection| connection.active.load(Ordering::Acquire))
-                        .filter(|connection| {
-                            let active = connection.active.load(Ordering::Acquire);
-                            active == 0
-                                || if self.options.max_connections > 0 {
-                                    connections.len() >= self.options.max_connections
-                                        || active < self.options.min_streams
-                                } else {
-                                    self.options.max_streams > 0
-                                        && active < self.options.max_streams
-                                }
-                        })
-                        .map(|connection| connection.reserve(&self.connections))
-                        .transpose()?
-                };
-                match existing {
-                    Some(pair) => pair,
-                    None => {
-                        let raw = connect().await?;
-                        let connection = self.establish(raw).await?;
-                        let pair = connection.reserve(&self.connections)?;
-                        self.connections.lock().unwrap().push(connection);
-                        pair
-                    }
-                }
-            };
-            super::grpc::pooled_stream(sender, uri, &self.options.user_agent, deadline, lease).await
+            let (sender, lease) = self.acquire(connect).await?;
+            super::grpc::connect_probe(sender, request, deadline, lease).await
         };
         tokio::select! {biased;
             ()=self.cancellation.cancelled()=>Err(io::ErrorKind::ConnectionAborted.into()),
             result=timeout_at(deadline,operation)=>result.map_err(|_|io::Error::from(io::ErrorKind::TimedOut))?,
         }
     }
+    async fn open_request<F, Fut>(
+        &self,
+        request: RequestKind<'_>,
+        deadline: Instant,
+        connect: F,
+    ) -> io::Result<BoxStream>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<BoxStream>>,
+    {
+        let operation = async {
+            // Only physical creation is serialized; waiting callers own their
+            // deadline/cancellation and no detached queue or worker is created.
+            let (sender, lease) = self.acquire(connect).await?;
+            match request {
+                RequestKind::Grpc(uri) => {
+                    super::grpc::pooled_stream(
+                        sender,
+                        uri,
+                        &self.options.user_agent,
+                        self.half_close,
+                        deadline,
+                        self.response_policy,
+                        lease,
+                    )
+                    .await
+                }
+                #[cfg(feature = "outbound-trusttunnel")]
+                RequestKind::Connect(request, observer) => {
+                    let (stream, response) =
+                        super::grpc::pooled_connect(sender, request, deadline, lease, observer)
+                            .await?;
+                    let _admission = self.admission.lock().unwrap();
+                    if self.cancellation.is_cancelled() {
+                        return Err(io::ErrorKind::ConnectionAborted.into());
+                    }
+                    let cancellation = self.cancellation.clone();
+                    self.tasks.spawn(crate::resources::observation::task(async move {
+                        tokio::select! {biased; ()=cancellation.cancelled()=>{}, ()=response=>{}}
+                    }));
+                    Ok(stream)
+                }
+                #[cfg(feature = "outbound-masque")]
+                RequestKind::ConnectAdmitted(request) => {
+                    super::grpc::pooled_connect_admitted(sender, request, deadline, lease).await
+                }
+            }
+        };
+        tokio::select! {biased;
+            ()=self.cancellation.cancelled()=>Err(io::ErrorKind::ConnectionAborted.into()),
+            result=timeout_at(deadline,operation)=>result.map_err(|_|io::Error::from(io::ErrorKind::TimedOut))?,
+        }
+    }
+    async fn acquire<F, Fut>(&self, connect: F) -> io::Result<(Sender, Lease)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<BoxStream>>,
+    {
+        let _opening = self.opening.lock().await;
+        let existing = {
+            let mut connections = self.connections.lock().unwrap();
+            connections.retain(|connection| !connection.closed.load(Ordering::Acquire));
+            connections
+                .iter()
+                .min_by_key(|connection| connection.active.load(Ordering::Acquire))
+                .filter(|connection| {
+                    let active = connection.active.load(Ordering::Acquire);
+                    active == 0
+                        || if self.options.max_connections > 0 {
+                            connections.len() >= self.options.max_connections
+                                || active < self.options.min_streams
+                        } else {
+                            self.options.max_streams > 0 && active < self.options.max_streams
+                        }
+                })
+                .map(|connection| connection.reserve(&self.connections))
+                .transpose()?
+        };
+        match existing {
+            Some(pair) => Ok(pair),
+            None => {
+                let raw = connect().await?;
+                let connection = self.establish(raw).await?;
+                let pair = connection.reserve(&self.connections)?;
+                let _admission = self.admission.lock().unwrap();
+                if self.cancellation.is_cancelled() {
+                    return Err(io::ErrorKind::ConnectionAborted.into());
+                }
+                self.connections.lock().unwrap().push(connection);
+                Ok(pair)
+            }
+        }
+    }
     async fn establish(&self, raw: BoxStream) -> io::Result<Connection> {
+        let empty = self.empty_data.then(super::h2_empty::Registry::default);
+        let raw = match &empty {
+            Some(registry) => registry.wrap(raw),
+            None => raw,
+        };
         let last_read = Arc::new(SyncMutex::new(Instant::now()));
         let (raw, writes) = Writes::wrap(raw);
-        let (sender, mut connection) = h2::client::Builder::new()
+        let mut builder = h2::client::Builder::new();
+        builder
             .enable_push(false)
-            .initial_window_size(super::STREAM_BUFFER_BYTES as u32)
+            .initial_window_size(self.stream_receive_window)
             .initial_connection_window_size((2 * super::STREAM_BUFFER_BYTES) as u32)
             .max_frame_size(super::STREAM_CHUNK_BYTES as u32)
             .max_header_list_size(super::STREAM_CHUNK_BYTES as u32)
             .max_concurrent_streams(0)
-            .max_send_buffer_size(super::STREAM_CHUNK_BYTES)
+            .max_send_buffer_size(super::STREAM_CHUNK_BYTES);
+        #[cfg(any(
+            feature = "outbound-vmess",
+            feature = "outbound-vless",
+            feature = "outbound-trojan"
+        ))]
+        if matches!(self.response_policy, ResponsePolicy::ClientFirst) {
+            // A queued request is not a completed H2 handshake. Keep request
+            // flush pending until peer SETTINGS, under the caller's deadline.
+            builder.initial_max_send_streams(0);
+        }
+        let (sender, mut connection) = builder
             .handshake(ActivityIo {
                 raw: Box::new(raw),
                 last_read: last_read.clone(),
@@ -114,19 +330,48 @@ impl GrpcPool {
             .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?;
         let mut ping = connection.ping_pong().expect("single PING owner");
         let closed = Arc::new(AtomicBool::new(false));
-        let lifetime = Lifetime(closed.clone());
+        let lifetime = Lifetime(closed.clone(), empty.clone());
         let token = self.cancellation.child_token();
         let cancellation = token.clone();
         let interval = self.options.ping_interval;
+        let active = Arc::new(AtomicUsize::new(0));
+        let idle_since = Arc::new(SyncMutex::new(Some(Instant::now())));
+        let activity = Arc::new(tokio::sync::Notify::new());
+        let idle = idle_since.clone();
+        let idle_timeout = self.idle_timeout;
+        let registry = Arc::downgrade(&self.connections);
+        let driver_closed = closed.clone();
+        let driver_active = active.clone();
         let observation =
             crate::resources::observation::track(crate::resources::observation::ResourceKind::Task);
+        let _admission = self.admission.lock().unwrap();
+        if self.cancellation.is_cancelled() {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        let driver_activity = activity.clone();
         self.tasks.spawn(crate::resources::observation::bind(async move {
             let _observation=observation;
             let _lifetime=lifetime;
             if interval==0 {
-                tokio::select! {biased;
-                    ()=cancellation.cancelled()=>{},
-                    _=&mut connection=>{},
+                loop {
+                    let notified = driver_activity.notified();
+                    let expires = idle_timeout.and_then(|timeout| idle.lock().unwrap().map(|since| since + timeout));
+                    tokio::select! {biased;
+                        ()=cancellation.cancelled()=>break,
+                        _=&mut connection=>break,
+                        ()=notified=>{},
+                        ()=async { match expires { Some(deadline)=>tokio::time::sleep_until(deadline).await, None=>std::future::pending().await } }=>{
+                            // Reserve and retire share the registry barrier.
+                            // Publish retirement before a caller can reserve
+                            // this connection after the idle decision.
+                            let Some(registry) = registry.upgrade() else { break; };
+                            let _connections = registry.lock().unwrap();
+                            if driver_active.load(Ordering::Acquire)==0 && idle_timeout.zip(*idle.lock().unwrap()).is_some_and(|(timeout,since)|Instant::now()>=since+timeout) {
+                                driver_closed.store(true, Ordering::Release);
+                                break;
+                            }
+                        }
+                    }
                 }
                 return;
             }
@@ -153,8 +398,11 @@ impl GrpcPool {
                 request: sender,
                 writes,
             },
+            empty,
             closed,
-            active: Arc::default(),
+            active,
+            idle_since,
+            activity,
             token,
             _observation: crate::resources::observation::track(
                 crate::resources::observation::ResourceKind::Pool,
@@ -162,25 +410,667 @@ impl GrpcPool {
         })
     }
     pub fn begin_shutdown(&self) {
+        let _admission = self.admission.lock().unwrap();
+        for connection in self.connections.lock().unwrap().iter() {
+            if let Some(registry) = &connection.empty {
+                registry.stop();
+            }
+        }
         self.cancellation.cancel();
+        self.tasks.close();
     }
     pub async fn shutdown(&self) {
         self.begin_shutdown();
-        self.tasks.close();
         self.tasks.wait().await;
         self.connections.lock().unwrap().clear();
     }
 }
 impl Drop for GrpcPool {
     fn drop(&mut self) {
-        self.cancellation.cancel();
+        self.begin_shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resources::observation::{ResourceKind, ResourceProbe};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(feature = "outbound-masque")]
+    #[tokio::test(start_paused = true)]
+    async fn masque_h2_scoped_receive_window_reaches_wire_and_joins_stop() {
+        let observation = ResourceProbe::default();
+        let advertised = observation
+            .scope(async {
+                let mut owners = vec![
+                    ("generic", GrpcPool::new(GrpcOptions::default()), 64 * 1024),
+                    ("masque-ip", GrpcPool::masque_ip(), 128 * 1024),
+                ];
+                #[cfg(feature = "outbound-trusttunnel")]
+                owners.push(("trusttunnel", GrpcPool::connect_client(), 64 * 1024));
+                #[cfg(any(feature = "outbound-vmess", feature = "outbound-vless"))]
+                owners.push((
+                    "client-first",
+                    GrpcPool::new_client_first(GrpcOptions::default()),
+                    64 * 1024,
+                ));
+                let mut advertised = Vec::new();
+                for (name, pool, expected) in owners {
+                    let (raw, mut peer) = tokio::io::duplex(65536);
+                    // Supply the peer's empty SETTINGS; inspect the real h2
+                    // client's preface, SETTINGS and connection WINDOW_UPDATE.
+                    peer.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
+                    let connection = pool.establish(Box::new(raw)).await.unwrap();
+                    let (window, connection_window) =
+                        timeout_at(Instant::now() + Duration::from_secs(5), async {
+                            let mut preface = [0; 24];
+                            peer.read_exact(&mut preface).await.unwrap();
+                            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+                            let mut window = None;
+                            let mut connection_window = None;
+                            while window.is_none() || connection_window.is_none() {
+                                let mut header = [0; 9];
+                                peer.read_exact(&mut header).await.unwrap();
+                                let len = (usize::from(header[0]) << 16)
+                                    | (usize::from(header[1]) << 8)
+                                    | usize::from(header[2]);
+                                assert!(len <= 16 * 1024);
+                                let stream = u32::from_be_bytes(header[5..9].try_into().unwrap())
+                                    & 0x7fff_ffff;
+                                let mut body = vec![0; len];
+                                peer.read_exact(&mut body).await.unwrap();
+                                match header[3] {
+                                    4 if stream == 0 && header[4] & 1 == 0 => {
+                                        assert_eq!(body.len() % 6, 0);
+                                        for setting in body.chunks_exact(6) {
+                                            if setting[..2] == [0, 4] {
+                                                window = Some(u32::from_be_bytes(
+                                                    setting[2..].try_into().unwrap(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    8 if stream == 0 => {
+                                        assert_eq!(body.len(), 4);
+                                        let increment =
+                                            u32::from_be_bytes(body.try_into().unwrap())
+                                                & 0x7fff_ffff;
+                                        connection_window = Some(65535 + increment);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            (window.unwrap(), connection_window.unwrap())
+                        })
+                        .await
+                        .unwrap();
+                    pool.shutdown().await;
+                    assert!(pool.tasks.is_empty());
+                    assert!(connection.closed.load(Ordering::Acquire));
+                    assert_eq!(observation.snapshot().current(ResourceKind::Task), 0);
+                    drop(connection);
+                    drop(peer);
+                    advertised.push((name, window, connection_window, expected));
+                }
+                advertised
+            })
+            .await;
+        assert!(observation.snapshot().is_idle());
+        for (name, window, connection_window, expected) in advertised {
+            assert_eq!(window, expected, "MASQUE_H2_SCOPED_STREAM_WINDOW: {name}");
+            assert_eq!(connection_window, 128 * 1024, "{name} connection window");
+        }
+    }
+
+    #[cfg(feature = "outbound-masque")]
+    struct MasqueRequest {
+        receive: h2::RecvStream,
+        response: h2::server::SendResponse<bytes::Bytes>,
+    }
+
+    #[cfg(feature = "outbound-masque")]
+    fn masque_request(authority: &str) -> http::Request<()> {
+        http::Request::builder()
+            .method("CONNECT")
+            .uri(http::Uri::builder().authority(authority).build().unwrap())
+            .header("cf-connect-proto", "cf-connect-ip")
+            .header("pq-enabled", "false")
+            .header("user-agent", "")
+            .body(())
+            .unwrap()
+    }
+
+    #[cfg(feature = "outbound-masque")]
+    async fn masque_peer(
+        peer: tokio::io::DuplexStream,
+        requests: tokio::sync::mpsc::Sender<MasqueRequest>,
+    ) {
+        let mut connection = h2::server::handshake(peer).await.unwrap();
+        while let Some(Ok((request, response))) = connection.accept().await {
+            assert_eq!(request.method(), "CONNECT");
+            assert!(request.uri().scheme().is_none());
+            assert!(request.extensions().get::<h2::ext::Protocol>().is_none());
+            assert_eq!(request.headers()["cf-connect-proto"], "cf-connect-ip");
+            assert_eq!(request.headers()["pq-enabled"], "false");
+            assert_eq!(request.headers()["user-agent"], "");
+            assert!(!request.headers().contains_key("capsule-protocol"));
+            if requests
+                .send(MasqueRequest {
+                    receive: request.into_body(),
+                    response,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    #[cfg(feature = "outbound-masque")]
+    #[tokio::test(start_paused = true)]
+    async fn masque_h2_admission_preserves_data_and_sibling_until_joined_stop() {
+        let observation = ResourceProbe::default();
+        observation
+            .scope(async {
+                let peers = TaskTracker::new();
+                let pool = GrpcPool::masque_ip();
+                let count = AtomicUsize::new(0);
+                let (requests, mut accepted) = tokio::sync::mpsc::channel(4);
+                let factory = || async {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let (raw, peer) = tokio::io::duplex(65536);
+                    peers.spawn(masque_peer(peer, requests.clone()));
+                    Ok(Box::new(raw) as BoxStream)
+                };
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("first.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let mut first_peer = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                std::future::poll_fn(|cx| {
+                    assert!(opening.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                let mut first_send = first_peer
+                    .response
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                first_send
+                    .send_data(bytes::Bytes::from_static(b"server-first"), false)
+                    .unwrap();
+                let mut first = opening.await.unwrap();
+                tokio::time::advance(Duration::from_secs(6)).await;
+                let mut prefix = [0; 12];
+                first.read_exact(&mut prefix).await.unwrap();
+                assert_eq!(&prefix, b"server-first");
+
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("sibling.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let mut sibling_peer = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                let mut sibling_send = sibling_peer
+                    .response
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                let mut sibling = opening.await.unwrap();
+
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("reject.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let mut rejected = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                let _rejected_send = rejected
+                    .response
+                    .send_response(
+                        http::Response::builder().status(201).body(()).unwrap(),
+                        false,
+                    )
+                    .unwrap();
+                assert_eq!(opening.await.err().unwrap().kind(), io::ErrorKind::InvalidData);
+                assert!(rejected.receive.data().await.unwrap().is_err());
+
+                first.write_all(b"past-deadline").await.unwrap();
+                first.flush().await.unwrap();
+                let upload = first_peer.receive.data().await.unwrap().unwrap();
+                assert_eq!(upload.as_ref(), b"past-deadline");
+                first_peer
+                    .receive
+                    .flow_control()
+                    .release_capacity(upload.len())
+                    .unwrap();
+                first.shutdown().await.unwrap();
+                assert!(first_peer.receive.data().await.unwrap().is_err());
+                sibling_send
+                    .send_data(bytes::Bytes::from_static(b"alive"), false)
+                    .unwrap();
+                let mut echo = [0; 5];
+                sibling.read_exact(&mut echo).await.unwrap();
+                assert_eq!(&echo, b"alive");
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+                assert_eq!(observation.snapshot().current(ResourceKind::Task), 1);
+                pool.shutdown().await;
+                assert!(pool.tasks.is_empty());
+                assert_eq!(observation.snapshot().current(ResourceKind::Task), 0);
+                assert!(sibling.write_all(b"stopped").await.is_err());
+                drop(first);
+                drop(sibling);
+                drop(first_send);
+                drop(sibling_send);
+                peers.close();
+                peers.wait().await;
+            })
+            .await;
+        assert!(observation.snapshot().is_idle());
+    }
+
+    #[cfg(feature = "outbound-masque")]
+    #[tokio::test(start_paused = true)]
+    async fn masque_h2_cancel_timeout_and_stop_reset_pending_admission() {
+        let observation = ResourceProbe::default();
+        observation
+            .scope(async {
+                let peers = TaskTracker::new();
+                let pool = GrpcPool::masque_ip();
+                let count = AtomicUsize::new(0);
+                let (requests, mut accepted) = tokio::sync::mpsc::channel(4);
+                let factory = || async {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let (raw, peer) = tokio::io::duplex(65536);
+                    peers.spawn(masque_peer(peer, requests.clone()));
+                    Ok(Box::new(raw) as BoxStream)
+                };
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("cancel.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let mut cancelled = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                drop(opening);
+                assert!(cancelled.receive.data().await.unwrap().is_err());
+
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("timeout.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let mut expired = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                tokio::time::advance(Duration::from_secs(6)).await;
+                assert_eq!(opening.await.err().unwrap().kind(), io::ErrorKind::TimedOut);
+                assert!(expired.receive.data().await.unwrap().is_err());
+
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("late-ready.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let mut late = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                let _late_send = late
+                    .response
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                // Let the independent driver process an accepted response,
+                // but do not poll admission again until setup has expired.
+                tokio::time::advance(Duration::from_secs(6)).await;
+                assert_eq!(opening.await.err().unwrap().kind(), io::ErrorKind::TimedOut);
+                assert!(late.receive.data().await.unwrap().is_err());
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+
+                let mut opening = Box::pin(pool.open_connect_admitted(
+                    masque_request("stop.invalid:443"),
+                    Instant::now() + Duration::from_secs(5),
+                    factory,
+                ));
+                let _stopped = tokio::select! {
+                    request=accepted.recv()=>request.unwrap(),
+                    result=&mut opening=>panic!("CONNECT returned before response: {}", result.is_ok()),
+                };
+                pool.shutdown().await;
+                assert_eq!(
+                    opening.await.err().unwrap().kind(),
+                    io::ErrorKind::ConnectionAborted
+                );
+                assert!(pool.tasks.is_empty());
+                assert_eq!(observation.snapshot().current(ResourceKind::Task), 0);
+                peers.close();
+                peers.wait().await;
+            })
+            .await;
+        assert!(observation.snapshot().is_idle());
+    }
+
+    #[cfg(feature = "outbound-trusttunnel")]
+    #[tokio::test]
+    async fn trusttunnel_rejected_headers_wake_a_flow_control_blocked_writer() {
+        let pool = GrpcPool::connect_client();
+        let peers = TaskTracker::new();
+        let reject = Arc::new(tokio::sync::Notify::new());
+        let (accepted, ready) = tokio::sync::oneshot::channel();
+        let (raw, peer) = tokio::io::duplex(65536);
+        let signal = reject.clone();
+        let streams = peers.clone();
+        peers.spawn(async move {
+            let mut connection = h2::server::Builder::new()
+                .initial_window_size(0)
+                .handshake::<_, bytes::Bytes>(peer)
+                .await
+                .unwrap();
+            let (request, mut response) = connection.accept().await.unwrap().unwrap();
+            streams.spawn(async move {
+                accepted.send(()).unwrap();
+                signal.notified().await;
+                let send = response
+                    .send_response(
+                        http::Response::builder().status(403).body(()).unwrap(),
+                        false,
+                    )
+                    .unwrap();
+                let _send = send;
+                let mut receive = request.into_body();
+                while receive.data().await.is_some_and(|data| data.is_ok()) {}
+            });
+            while connection.accept().await.is_some() {}
+        });
+        let request = http::Request::builder()
+            .method("CONNECT")
+            .uri(
+                http::Uri::builder()
+                    .authority("example.invalid:443")
+                    .build()
+                    .unwrap(),
+            )
+            .body(())
+            .unwrap();
+        let mut stream = pool
+            .open_connect(request, Instant::now() + Duration::from_secs(5), || async {
+                Ok(Box::new(raw) as BoxStream)
+            })
+            .await
+            .unwrap();
+        ready.await.unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        stream.write_all(b"blocked").await.unwrap();
+        let (pending, reached) = tokio::sync::oneshot::channel();
+        let mut pending = Some(pending);
+        let writer = tokio::spawn(async move {
+            let mut flush = Box::pin(stream.flush());
+            std::future::poll_fn(|cx| {
+                let result = flush.as_mut().poll(cx);
+                if result.is_pending()
+                    && let Some(signal) = pending.take()
+                {
+                    let _ = signal.send(());
+                }
+                result
+            })
+            .await
+        });
+        reached.await.unwrap();
+        reject.notify_one();
+        // Timeout observes the child join; its wake cannot re-poll the blocked
+        // flush and hide a missing Close writer notification.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), writer)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        pool.shutdown().await;
+        peers.close();
+        peers.wait().await;
+    }
+
+    #[cfg(feature = "outbound-trusttunnel")]
+    #[tokio::test(start_paused = true)]
+    async fn trusttunnel_h2_probe_idle_retirement_and_stop_admission() {
+        let observation = ResourceProbe::default();
+        observation
+            .scope(async {
+                let peers = TaskTracker::new();
+                let count = AtomicUsize::new(0);
+                let pool = GrpcPool::connect_client();
+                let factory = || async {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let (raw, peer) = tokio::io::duplex(65536);
+                    let streams = peers.clone();
+                    peers.spawn(async move {
+                        let mut connection = h2::server::handshake(peer).await.unwrap();
+                        while let Some(Ok((request, mut response))) = connection.accept().await {
+                            if request.uri().authority().unwrap().as_str() == "_check" {
+                                assert!(request.body().is_end_stream());
+                                response
+                                    .send_response(http::Response::new(()), true)
+                                    .unwrap();
+                            } else {
+                                let mut send = response
+                                    .send_response(http::Response::new(()), false)
+                                    .unwrap();
+                                streams.spawn(async move {
+                                    let mut receive = request.into_body();
+                                    while let Some(Ok(data)) = receive.data().await {
+                                        receive
+                                            .flow_control()
+                                            .release_capacity(data.len())
+                                            .unwrap();
+                                        if send.send_data(data, false).is_err() {
+                                            return;
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+                    Ok(Box::new(raw) as BoxStream)
+                };
+                let request = |target| {
+                    http::Request::builder()
+                        .method("CONNECT")
+                        .uri(http::Uri::builder().authority(target).build().unwrap())
+                        .body(())
+                        .unwrap()
+                };
+                let mut first = pool
+                    .open_connect(
+                        request("example.invalid:443"),
+                        Instant::now() + Duration::from_secs(5),
+                        factory,
+                    )
+                    .await
+                    .unwrap();
+                first.write_all(b"first").await.unwrap();
+                first.flush().await.unwrap();
+                tokio::time::advance(Duration::from_secs(6)).await;
+                // Headers arrived before the read: an expired setup deadline must
+                // not invalidate an established CONNECT response.
+                let mut echo = [0; 5];
+                first.read_exact(&mut echo).await.unwrap();
+                assert_eq!(&echo, b"first");
+                first.shutdown().await.unwrap();
+                drop(first);
+                pool.probe(
+                    request("_check"),
+                    Instant::now() + Duration::from_secs(7),
+                    factory,
+                )
+                .await
+                .unwrap();
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+                tokio::time::advance(Duration::from_secs(31)).await;
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                let mut second = pool
+                    .open_connect(
+                        request("example.invalid:443"),
+                        Instant::now() + Duration::from_secs(5),
+                        factory,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(count.load(Ordering::SeqCst), 2);
+                second.write_all(b"again").await.unwrap();
+                second.flush().await.unwrap();
+                second.read_exact(&mut echo).await.unwrap();
+                assert_eq!(&echo, b"again");
+                pool.shutdown().await;
+                assert!(second.write_all(b"stopped").await.is_err());
+                drop(second);
+                let (raw, _peer) = tokio::io::duplex(65536);
+                assert!(pool.establish(Box::new(raw)).await.is_err());
+                assert!(pool.tasks.is_empty());
+                assert!(
+                    pool.open_connect(
+                        request("example.invalid:443"),
+                        Instant::now() + Duration::from_secs(5),
+                        factory
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(count.load(Ordering::SeqCst), 2);
+                peers.close();
+                peers.wait().await;
+            })
+            .await;
+        assert!(observation.snapshot().is_idle());
+    }
+
+    #[tokio::test]
+    async fn grpc_duplex_pool_keeps_response_and_sibling_after_end_stream_and_joins_stop() {
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    let tasks = TaskTracker::new();
+                    let count = Arc::new(AtomicUsize::new(0));
+                    let pool = GrpcPool::duplex(GrpcOptions::default());
+                    let factory = || async {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let (io, peer) = tokio::io::duplex(65536);
+                        let sessions = tasks.clone();
+                        tasks.spawn(async move {
+                            let mut connection = h2::server::handshake(peer).await.unwrap();
+                            while let Some(Ok((request, mut response))) = connection.accept().await
+                            {
+                                assert_eq!(request.headers()["user-agent"], "grpc-go/1.36.0");
+                                let mut send = response
+                                    .send_response(
+                                        http::Response::builder()
+                                            .status(200)
+                                            .header("content-type", "application/grpc")
+                                            .body(())
+                                            .unwrap(),
+                                        false,
+                                    )
+                                    .unwrap();
+                                let mut receive = request.into_body();
+                                sessions.spawn(async move {
+                                    while let Some(data) = receive.data().await {
+                                        let Ok(data) = data else {
+                                            return;
+                                        };
+                                        receive
+                                            .flow_control()
+                                            .release_capacity(data.len())
+                                            .unwrap();
+                                        if send.send_data(data, false).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    send.send_data(
+                                        bytes::Bytes::from_static(b"\0\0\0\0\x06\x0a\x04tail"),
+                                        false,
+                                    )
+                                    .unwrap();
+                                    let mut trailers = http::HeaderMap::new();
+                                    trailers.insert("grpc-status", "0".parse().unwrap());
+                                    send.send_trailers(trailers).unwrap();
+                                });
+                            }
+                        });
+                        Ok(Box::new(io) as BoxStream)
+                    };
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let mut first = pool
+                        .open("http://example.com/GunService/Tun", deadline, factory)
+                        .await
+                        .unwrap();
+                    let mut sibling = pool
+                        .open("http://example.com/GunService/Tun", deadline, factory)
+                        .await
+                        .unwrap();
+                    assert_eq!(count.load(Ordering::SeqCst), 1);
+                    first.write_all(b"first").await.unwrap();
+                    first.shutdown().await.unwrap();
+                    first.shutdown().await.unwrap();
+                    // Upload is closed, but its response and physical lease survive.
+                    assert!(first.write_all(b"closed").await.is_err());
+                    assert_eq!(
+                        pool.connections.lock().unwrap()[0]
+                            .active
+                            .load(Ordering::Acquire),
+                        2
+                    );
+                    let mut response = Vec::new();
+                    first.read_to_end(&mut response).await.unwrap();
+                    assert_eq!(response, b"firsttail");
+                    sibling.write_all(b"alive").await.unwrap();
+                    sibling.flush().await.unwrap();
+                    let mut echo = [0; 5];
+                    sibling.read_exact(&mut echo).await.unwrap();
+                    assert_eq!(&echo, b"alive");
+                    assert_eq!(probe.snapshot().current(ResourceKind::Task), 1);
+                    pool.shutdown().await;
+                    assert_eq!(probe.snapshot().current(ResourceKind::Task), 0);
+                    assert_eq!(probe.snapshot().current(ResourceKind::Pool), 0);
+                    assert!(sibling.write_all(b"stopped").await.is_err());
+                    drop(first);
+                    drop(sibling);
+                    tasks.close();
+                    tasks.wait().await;
+                })
+                .await
+                .unwrap();
+            })
+            .await;
+        assert!(probe.snapshot().is_idle());
     }
 }
 struct Connection {
     sender: Sender,
+    empty: Option<super::h2_empty::Registry>,
     active: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
     token: CancellationToken,
+    idle_since: Arc<SyncMutex<Option<Instant>>>,
+    activity: Arc<tokio::sync::Notify>,
     _observation: crate::resources::observation::Guard,
 }
 impl Connection {
@@ -190,24 +1080,36 @@ impl Connection {
                 count.checked_add(1)
             })
             .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        *self.idle_since.lock().unwrap() = None;
+        self.activity.notify_one();
         Ok((
             self.sender.clone(),
             Lease {
                 active: self.active.clone(),
                 closed: self.closed.clone(),
                 pool: Arc::downgrade(pool),
+                idle_since: self.idle_since.clone(),
+                activity: self.activity.clone(),
+                empty: self.empty.clone(),
+                ticket: None,
             },
         ))
     }
 }
 impl Drop for Connection {
     fn drop(&mut self) {
+        if let Some(registry) = &self.empty {
+            registry.stop();
+        }
         self.token.cancel();
     }
 }
-struct Lifetime(Arc<AtomicBool>);
+struct Lifetime(Arc<AtomicBool>, Option<super::h2_empty::Registry>);
 impl Drop for Lifetime {
     fn drop(&mut self) {
+        if let Some(registry) = &self.1 {
+            registry.stop();
+        }
         self.0.store(true, Ordering::Release);
     }
 }
@@ -216,19 +1118,53 @@ pub(super) struct Lease {
     active: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
     pool: std::sync::Weak<SyncMutex<Vec<Connection>>>,
+    idle_since: Arc<SyncMutex<Option<Instant>>>,
+    activity: Arc<tokio::sync::Notify>,
+    empty: Option<super::h2_empty::Registry>,
+    ticket: Option<super::h2_empty::Ticket>,
 }
 impl Lease {
+    pub(super) fn request(
+        &mut self,
+        sender: &mut h2::client::SendRequest<Payload>,
+        request: http::Request<()>,
+        end: bool,
+    ) -> Result<(h2::client::ResponseFuture, super::h2_empty::Send), h2::Error> {
+        if let Some(registry) = &self.empty {
+            let (response, send, ticket) = registry.request(sender, request, end)?;
+            self.ticket = Some(ticket);
+            Ok((response, send))
+        } else {
+            sender
+                .send_request(request, end)
+                .map(|(response, send)| (response, send.into()))
+        }
+    }
+    pub(super) fn admission(&self) -> Option<super::h2_empty::Admission> {
+        self.ticket.as_ref().map(super::h2_empty::Ticket::admission)
+    }
+    pub(super) fn close_stream(&self) {
+        if let Some(ticket) = &self.ticket {
+            ticket.close();
+        }
+    }
     pub(super) fn stopped(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if self.active.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(pool) = self.pool.upgrade()
-        {
+        self.ticket.take();
+        let pool = self.pool.upgrade();
+        let mut connections = pool.as_ref().map(|pool| pool.lock().unwrap());
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            *self.idle_since.lock().unwrap() = Some(Instant::now());
+            self.activity.notify_one();
+            let Some(connections) = &mut connections else {
+                return;
+            };
             let mut idle = 0;
-            pool.lock().unwrap().retain(|connection| {
+            connections.retain(|connection| {
                 if connection.closed.load(Ordering::Acquire) {
                     return false;
                 }

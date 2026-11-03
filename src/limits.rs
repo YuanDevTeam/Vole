@@ -20,16 +20,26 @@ pub const XHTTP_CUSTOM_HEADERS: usize = 100;
 pub const XHTTP_PADDING_BYTES: usize = 4096;
 pub const XHTTP_POST_BYTES: usize = 16 * 1024 * 1024;
 pub const XHTTP_PACKET_BATCH_BYTES: usize = 64 * 1024;
+/// One HTTP/1 packet-up backing, including the in-flight body.
+pub const XHTTP_H1_PACKET_BATCH_BYTES: usize = 48 * 1024;
+/// One ordinary single-response H3 packet-up backing.
+pub const XHTTP_H3_SERIAL_PACKET_BATCH_BYTES: usize = 48 * 1024;
+/// One shared H3 packet-up backing, including the in-flight HTTP body.
+pub const XHTTP_H3_PACKET_BATCH_BYTES: usize = 128 * 1024;
 pub const XHTTP_REQUEST_BYTES: usize = 16 * 1024;
 pub const XHTTP_REQUEST_HEADERS: usize = 128;
 pub const XHTTP_IDLE_ENTRIES: usize = 64;
 pub const XHTTP_IDLE_H1_CONNECTIONS: usize = 4;
+pub const XHTTP_ACTIVE_H2_LEASES: usize = 4;
+pub const XHTTP_ACTIVE_H3_LEASES: usize = 4;
 pub const XHTTP_BODY_QUEUE: usize = 2;
 pub const XHTTP_BODY_CHUNK: usize = 16 * 1024;
 pub const XHTTP_H3_UNI_STREAMS: usize = 8;
 pub const XHTTP_H3_STREAM_WINDOW: usize = 64 * 1024;
 pub const XHTTP_H3_CONNECTION_WINDOW: usize = 128 * 1024;
 pub const XHTTP_H3_SEND_WINDOW: usize = 64 * 1024;
+/// Retained writes after a qualified physical connection's first local mux UDP association.
+pub const XHTTP_H3_UDP_SEND_WINDOW: usize = 192 * 1024;
 pub const SING_MUX_IDLE_CONNECTIONS: usize = 16;
 pub const SING_MUX_COMMAND_QUEUE: usize = 16;
 pub const SING_MUX_CHUNK: usize = 16 * 1024;
@@ -42,22 +52,23 @@ pub const YAMUX_CONNECTION_WINDOW: usize = YAMUX_CONNECTION_ADMISSIONS * 256 * 1
 /// Hysteria2 per-packet, per-association and per-connection retained bounds.
 pub const HY2_UDP_PAYLOAD: usize = 4096;
 pub const HY2_UDP_QUEUE: usize = 32;
+pub const HY2_SUBMISSION_QUEUE: usize = 32;
+pub const HY2_AUTH_SESSIONS: usize = 2;
 pub const HY2_PENDING_PACKETS: usize = 64;
 pub const HY2_PENDING_BYTES: usize = 256 * 1024;
 pub const HY2_FRAGMENT_TTL_SECONDS: usize = 5;
 pub const HY2_PATH_RETIRE_SECONDS: usize = 1;
 pub const HY2_QUIC_PAYLOAD: usize = 1400;
 pub const HY2_UNI_STREAMS: usize = 8;
-pub const HY2_STREAM_WINDOW: usize = 256 * 1024;
-pub const HY2_CONNECTION_WINDOW: usize = 1024 * 1024;
-pub const HY2_DATAGRAM_BUFFER: usize = 256 * 1024;
+pub const HY2_SEND_WINDOW: usize = 1024 * 1024;
+pub const HY2_DATAGRAM_SEND_BUFFER: usize = 4 * 1024 * 1024;
+pub const HY2_DATAGRAM_RECEIVE_BUFFER: usize = 2 * 1024 * 1024;
 pub const HY2_AUTH_HEADERS: usize = 16384;
 pub const HY2_RESPONSE_MESSAGE: usize = 2048;
 pub const HY2_RESPONSE_PADDING: usize = 4096;
 pub const TUIC_QUIC_PAYLOAD: usize = 1400;
-pub const TUIC_UNI_STREAMS: usize = 32;
-pub const TUIC_STREAM_WINDOW: usize = 256 * 1024;
-pub const TUIC_CONNECTION_WINDOW: usize = 1024 * 1024;
+pub const TUIC_CONTROL_READERS: usize = 32;
+pub const TUIC_SEND_WINDOW: usize = 1024 * 1024;
 pub const TUIC_DATAGRAM_BUFFER: usize = 256 * 1024;
 pub const TUIC_UDP_QUEUE: usize = 32;
 pub const TUIC_PENDING_PACKETS: usize = 64;
@@ -65,14 +76,11 @@ pub const TUIC_PENDING_BYTES: usize = 256 * 1024;
 pub const TUIC_FRAGMENT_TTL_SECONDS: usize = 5;
 pub const TUIC_FIN_GRACE_SECONDS: usize = 5;
 
-/// Historical iOS TUN footprint target retained for best-effort telemetry.
-///
-/// Crossing this value never changes a runtime lifecycle result.
-pub const IOS_TUN_PEAK_OBSERVATION_TARGET_BYTES: u64 = 45 * 1024 * 1024;
+/// Process observation ceiling, never lifecycle admission.
+pub const MEMORY_OBSERVATION_CEILING_BYTES: u64 = 45 * 1024 * 1024;
 
-/// Historical iOS TUN start-footprint target retained for best-effort
-/// telemetry. Crossing this value never prevents the runtime from starting.
-pub const IOS_TUN_START_OBSERVATION_TARGET_BYTES: u64 = 35 * 1024 * 1024;
+/// 1 Gbps process observation threshold, never lifecycle admission.
+pub const MEMORY_OBSERVATION_1GBPS_BYTES: u64 = 43 * 1024 * 1024;
 
 /// Fixed stack used by each bootstrap resolver worker.
 pub(crate) const DNS_WORKER_STACK_BYTES: usize = 512 * 1024;
@@ -82,7 +90,7 @@ pub(crate) const MAX_DNS_WORKERS: usize = 4;
 /// Unfinished physical socket setup jobs per lifecycle owner, shared by TCP
 /// and UDP. Callers wait for submission capacity; established connections are
 /// not counted and receive no business-concurrency quota.
-pub(crate) const MAX_SOCKET_INITIALIZATIONS: usize = 64;
+pub(crate) const MAX_SOCKET_INITIALIZATIONS: usize = 4;
 
 /// Retained-memory, queue and per-object safety boundaries.
 ///
@@ -100,7 +108,8 @@ pub struct ResourceLimits {
     /// Maximum raw IP packet accepted by a TUN netstack.
     pub tun_max_datagram_size: usize,
     pub tcp_buffer_per_direction: usize,
-    /// Retained A/AAAA cache entries. A and AAAA share this one capacity.
+    /// Explicit low-level DNS constructor override. Production sessions use
+    /// dns.cache-max-size for the shared typed/opaque result capacity instead.
     pub dns_address_cache_entries: usize,
     /// Retained address-to-domain hints used by redir-host routing.
     pub dns_redir_host_entries: usize,
@@ -128,7 +137,7 @@ impl Default for ResourceLimits {
             dns_address_cache_entries: 256,
             dns_redir_host_entries: 256,
             tun_udp_association_queue_capacity: 64,
-            tun_udp_response_queue_capacity: 4_096,
+            tun_udp_response_queue_capacity: 256,
             tun_dns_response_queue_capacity: 128,
             tls_buffer_limit: 64 * 1024,
             xhttp_send_buffer_size: 64 * 1024,
@@ -240,7 +249,7 @@ mod tests {
         assert_eq!(limits.dns_address_cache_entries, 256);
         assert_eq!(limits.dns_redir_host_entries, 256);
         assert_eq!(limits.tun_udp_association_queue_capacity, 64);
-        assert_eq!(limits.tun_udp_response_queue_capacity, 4_096);
+        assert_eq!(limits.tun_udp_response_queue_capacity, 256);
         assert_eq!(limits.tun_dns_response_queue_capacity, 128);
         assert_eq!(limits.tls_buffer_limit, 64 * 1024);
         assert_eq!(limits.xhttp_send_buffer_size, 64 * 1024);
