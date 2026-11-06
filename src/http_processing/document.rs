@@ -4,6 +4,7 @@ use crate::http_processing::{
     mitm::RawMitm,
     providers::{Payload, ProviderSpec},
     rules::{MAX_RULES, RawRule, Rule},
+    script_config::RawScripts,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,6 +39,8 @@ pub(crate) struct Document {
     pub(crate) providers: BTreeMap<String, ProviderSpec>,
     #[serde(default, deserialize_with = "nonnull")]
     pub(crate) rewrite: Rewrite,
+    #[serde(default, deserialize_with = "nonnull")]
+    pub(crate) http_scripts: RawScripts,
     #[serde(default, deserialize_with = "nonnull")]
     pub(crate) mitm: RawMitm,
     #[serde(skip)]
@@ -93,6 +96,7 @@ impl Document {
         validate_ports(&self.http_ports)?;
         validate_ports(&self.mitm.ports)?;
         self.mitm.validate_static()?;
+        self.http_scripts.compile()?;
         if self.providers.len() > MAX_RULES || self.rewrite.rules.len() > MAX_RULES {
             return Err(invalid());
         }
@@ -225,6 +229,7 @@ impl Document {
         Ok(Arc::new(PolicyCandidate {
             document: self.clone(),
             rules: rules.into(),
+            scripts: self.http_scripts.compile()?.into(),
             payloads,
             identity: hash.finalize().into(),
             origins: origins.into(),

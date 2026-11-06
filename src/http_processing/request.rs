@@ -20,7 +20,7 @@ impl HttpContext {
     pub(super) fn plan(
         &self,
         original: Url,
-        mut session: StreamSession,
+        session: StreamSession,
         scheme: Scheme,
         apply_url_actions: bool,
     ) -> io::Result<Decision> {
@@ -32,17 +32,6 @@ impl HttpContext {
                 "HTTPS authority is not permitted",
             ));
         }
-        let original_matches_tls = scheme != Scheme::Https
-            || (session.sniffed_domain.as_deref().is_some_and(|sni| {
-                original
-                    .host_str()
-                    .is_some_and(|host| host.eq_ignore_ascii_case(sni))
-            }) && original.port_or_known_default() == Some(session.destination.port()));
-        let origin = (
-            original.scheme() == "https",
-            original.host_str().unwrap_or_default().to_owned(),
-            original.port_or_known_default(),
-        );
         let action = if apply_url_actions {
             self.policy().evaluate(original.clone())?
         } else {
@@ -53,9 +42,28 @@ impl HttpContext {
             Action::Redirect { status, url } => return Ok(Decision::Redirect { status, url }),
             Action::Forward(url) => url,
         };
-        let strip_origin_credentials = origin.0 != (url.scheme() == "https")
-            || origin.1 != url.host_str().unwrap_or_default()
-            || origin.2 != url.port_or_known_default();
+        self.final_target(original, url, session, scheme)
+            .map(|target| Decision::Forward(Box::new(target)))
+    }
+
+    /// Rebuild only the final physical target, without re-running URL rules.
+    /// Callers already performed credential cleaning at each accepted origin.
+    pub(super) fn final_target(
+        &self,
+        original: Url,
+        url: Url,
+        mut session: StreamSession,
+        scheme: Scheme,
+    ) -> io::Result<Target> {
+        let original_matches_tls = scheme != Scheme::Https
+            || (session.sniffed_domain.as_deref().is_some_and(|sni| {
+                original
+                    .host_str()
+                    .is_some_and(|host| host.eq_ignore_ascii_case(sni))
+            }) && original.port_or_known_default() == Some(session.destination.port()));
+        let strip_origin_credentials = original.scheme() != url.scheme()
+            || original.host_str() != url.host_str()
+            || original.port_or_known_default() != url.port_or_known_default();
         let host = url.host_str().ok_or_else(invalid)?.trim_matches(['[', ']']);
         let port = url.port_or_known_default().ok_or_else(invalid)?;
         let destination = match host.parse::<IpAddr>() {
@@ -72,13 +80,13 @@ impl HttpContext {
             // Retain the fixed SNI's selected IP only for its own authority.
             session.sniffed_domain = Some(host.to_owned());
         }
-        Ok(Decision::Forward(Box::new(Target {
+        Ok(Target {
             original,
             url,
             session,
             logical_destination: destination,
             strip_origin_credentials,
-        })))
+        })
     }
 }
 fn invalid() -> io::Error {

@@ -169,6 +169,7 @@ impl Store {
         force_refresh: bool,
     ) -> io::Result<Arc<PolicyCandidate>> {
         check_cancel(cancellation)?;
+        document.http_scripts.ensure_available()?;
         let paths = resolve_paths(&document, context, true)?;
         if force_refresh {
             self.retry_after = Some(Instant::now() + Duration::from_secs(60));

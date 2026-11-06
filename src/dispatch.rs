@@ -19,6 +19,54 @@ impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub type BoxStream = Box<dyn AsyncStream>;
 
+/// Opaque, owned equality evidence from a completed routing decision.
+/// No public configuration/API field and no transport or cache owner.
+#[cfg(feature = "inbound-http")]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct HttpTcpReuseKey {
+    value: Arc<dyn std::any::Any + Send + Sync>,
+    equal: fn(&dyn std::any::Any, &dyn std::any::Any) -> bool,
+    generation: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+#[cfg(feature = "inbound-http")]
+impl HttpTcpReuseKey {
+    pub(crate) fn new<T: Eq + Send + Sync + 'static>(value: T) -> Self {
+        fn equal<T: Eq + 'static>(a: &dyn std::any::Any, b: &dyn std::any::Any) -> bool {
+            a.downcast_ref::<T>()
+                .zip(b.downcast_ref::<T>())
+                .is_some_and(|(a, b)| a == b)
+        }
+        Self {
+            value: Arc::new(value),
+            equal: equal::<T>,
+            generation: None,
+        }
+    }
+    pub(crate) fn with_generation<T: Send + Sync + 'static>(mut self, generation: Arc<T>) -> Self {
+        self.generation = Some(generation);
+        self
+    }
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        let generation = match (&self.generation, &other.generation) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        generation && (self.equal)(self.value.as_ref(), other.value.as_ref())
+    }
+}
+
+/// An already selected route. Opening consumes this plan, never selects twice.
+#[cfg(feature = "inbound-http")]
+#[doc(hidden)]
+#[async_trait]
+pub trait HttpTcpPlan: Send {
+    fn reuse_key(&self) -> Option<&HttpTcpReuseKey>;
+    async fn connect(self: Box<Self>) -> Result<BoxStream, DispatchError>;
+}
+
 /// One owned send operation; its owner must cancel or complete it before close.
 pub type OwnedDatagramSend =
     Pin<Box<dyn std::future::Future<Output = Result<(), DispatchError>> + Send + 'static>>;
@@ -164,6 +212,23 @@ pub trait DatagramTransport: Send {
 
 #[async_trait]
 pub trait Dispatcher: Send + Sync {
+    /// Structural proof of immutable physical DIRECT egress. Opaque nodes,
+    /// proxy connectors and dynamic bindings keep the conservative default.
+    #[cfg(feature = "inbound-http")]
+    #[doc(hidden)]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        false
+    }
+    /// None means this dispatcher does not implement owned planning. Errors
+    /// are real decision failures, never permission to select a second route.
+    #[cfg(feature = "inbound-http")]
+    #[doc(hidden)]
+    async fn prepare_http_tcp(
+        &self,
+        _session: StreamSession,
+    ) -> Result<Option<Box<dyn HttpTcpPlan>>, DispatchError> {
+        Ok(None)
+    }
     #[cfg(feature = "inbound-http")]
     #[doc(hidden)]
     fn http_context(&self) -> Option<crate::http_processing::HttpContext> {
@@ -211,6 +276,23 @@ impl SessionObservedDispatcher {
 
 #[async_trait]
 impl Dispatcher for SessionObservedDispatcher {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        self.inner.permits_http_tcp_reuse()
+    }
+    #[cfg(feature = "inbound-http")]
+    async fn prepare_http_tcp(
+        &self,
+        session: StreamSession,
+    ) -> Result<Option<Box<dyn HttpTcpPlan>>, DispatchError> {
+        Ok(self.inner.prepare_http_tcp(session).await?.map(|inner| {
+            Box::new(ObservedHttpTcpPlan {
+                inner,
+                resource_stats: self.resource_stats.clone(),
+                handshake: false,
+            }) as Box<dyn HttpTcpPlan>
+        }))
+    }
     fn supports_udp(&self) -> bool {
         self.inner.supports_udp()
     }
@@ -263,6 +345,23 @@ impl HandshakeObservedDispatcher {
 
 #[async_trait]
 impl Dispatcher for HandshakeObservedDispatcher {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        self.inner.permits_http_tcp_reuse()
+    }
+    #[cfg(feature = "inbound-http")]
+    async fn prepare_http_tcp(
+        &self,
+        session: StreamSession,
+    ) -> Result<Option<Box<dyn HttpTcpPlan>>, DispatchError> {
+        Ok(self.inner.prepare_http_tcp(session).await?.map(|inner| {
+            Box::new(ObservedHttpTcpPlan {
+                inner,
+                resource_stats: self.resource_stats.clone(),
+                handshake: true,
+            }) as Box<dyn HttpTcpPlan>
+        }))
+    }
     fn supports_udp(&self) -> bool {
         self.inner.supports_udp()
     }
@@ -286,6 +385,37 @@ impl Dispatcher for HandshakeObservedDispatcher {
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         let _activity = self.resource_stats.begin(ResourceActivity::Handshake);
         self.inner.open_datagram(session).await
+    }
+}
+
+#[cfg(feature = "inbound-http")]
+struct ObservedHttpTcpPlan {
+    inner: Box<dyn HttpTcpPlan>,
+    resource_stats: RuntimeResourceStats,
+    handshake: bool,
+}
+#[cfg(feature = "inbound-http")]
+#[async_trait]
+impl HttpTcpPlan for ObservedHttpTcpPlan {
+    fn reuse_key(&self) -> Option<&HttpTcpReuseKey> {
+        self.inner.reuse_key()
+    }
+    async fn connect(self: Box<Self>) -> Result<BoxStream, DispatchError> {
+        let Self {
+            inner,
+            resource_stats,
+            handshake,
+        } = *self;
+        if handshake {
+            let _activity = resource_stats.begin(ResourceActivity::Handshake);
+            inner.connect().await
+        } else {
+            let inner = inner.connect().await?;
+            Ok(Box::new(ObservedStream {
+                inner,
+                _activity: resource_stats.begin(ResourceActivity::TcpSession),
+            }))
+        }
     }
 }
 

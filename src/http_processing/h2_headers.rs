@@ -69,9 +69,13 @@ pub(super) fn response_body(
     if (status.is_informational() || status == StatusCode::NO_CONTENT) && length.is_some() {
         return Err(invalid());
     }
+    if status == StatusCode::RESET_CONTENT && length.is_some_and(|length| length != 0) {
+        return Err(invalid());
+    }
     if method == Method::HEAD
         || status.is_informational()
         || status == StatusCode::NO_CONTENT
+        || status == StatusCode::RESET_CONTENT
         || status == StatusCode::NOT_MODIFIED
     {
         Ok(Some(0))
@@ -150,6 +154,29 @@ pub(super) fn trailers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reset_content_has_no_entity_and_does_not_reject_head_representation_lengths() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            response_body(&headers, StatusCode::RESET_CONTENT, &Method::GET).unwrap(),
+            Some(0)
+        );
+        headers.insert("content-length", "0".parse().unwrap());
+        assert_eq!(
+            response_body(&headers, StatusCode::RESET_CONTENT, &Method::GET).unwrap(),
+            Some(0)
+        );
+        headers.insert("content-length", "12".parse().unwrap());
+        assert!(response_body(&headers, StatusCode::RESET_CONTENT, &Method::GET).is_err());
+        assert_eq!(
+            response_body(&headers, StatusCode::NOT_MODIFIED, &Method::GET).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            response_body(&headers, StatusCode::OK, &Method::HEAD).unwrap(),
+            Some(0)
+        );
+    }
     #[test]
     fn h2_headers_and_trailers_are_bounded_before_conversion() {
         let mut headers = HeaderMap::new();

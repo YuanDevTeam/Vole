@@ -29,7 +29,7 @@ Read the relevant document completely before changing that area:
 - Builds: `scripts/README.md`; `vole-scripts build` compiles platform outputs, and `vole_scripts.release` packages them for CI.
 - Offline regressions: `tests/README.md`. Rust memory/configuration tests remain in Vole; run explicit pure-memory filters, with all-target coverage limited to `--no-run`.
 - Protocol interoperability or pressure: isolated benchmark tooling owns container orchestration and fixtures. Supply the checkout explicitly with `--source vole=PATH`; Vole builds do not import it or infer workspace paths. Keep benchmark results, comparisons and conclusions in the benchmark project; Vole documents implementation contracts and acceptance criteria. Keep tooling repository addresses and raw runs outside Vole.
-- Server-side tests: `docs/testing-isolation.md`. Use isolated benchmark containers for every server peer and network origin; container failure is not permission for a host fallback.
+- Server-side tests: `docs/testing-isolation.md`. Use isolated benchmark containers for ordinary peers and origins; use its explicit native-Mac origin and socketpair diagnosis scopes only for the authorized Apple benchmark. Container failure does not expand those scopes.
 - Claims that something passed: `docs/acceptance.md`. Record only commands and environments actually executed; host tests and cross-builds do not prove physical-device data paths.
 
 # Architecture Boundaries

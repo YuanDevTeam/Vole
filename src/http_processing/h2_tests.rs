@@ -19,6 +19,360 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 const PAYLOAD: usize = 96 * 1024;
 
+#[cfg(target_vendor = "apple")]
+async fn script_memory_response(
+    context: HttpContext,
+    request: Request<()>,
+    payload: Bytes,
+) -> Response<Vec<u8>> {
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let (client, mut server) = tokio::io::duplex(8192);
+    let worker = tokio::spawn(async move {
+        context
+            .serve_h2(&mut server, session(), stop)
+            .await
+            .unwrap();
+    });
+    let (mut sender, connection) = wire::client::handshake(client).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let (response, mut upload) = sender.send_request(request, payload.is_empty()).unwrap();
+    let sending = async {
+        if !payload.is_empty() {
+            super::h2_body::send_data(&mut upload, payload)
+                .await
+                .unwrap();
+            upload.send_data(Bytes::new(), true).unwrap();
+        }
+    };
+    let receiving = async {
+        let response = response.await.unwrap();
+        let (parts, mut body) = response.into_parts();
+        let mut bytes = Vec::new();
+        while let Some(frame) = body.data().await {
+            let frame = frame.unwrap();
+            body.flow_control().release_capacity(frame.len()).unwrap();
+            bytes.extend_from_slice(&frame);
+        }
+        Response::from_parts(parts, bytes)
+    };
+    let (_, response) = timeout(Duration::from_secs(5), async {
+        tokio::join!(sending, receiving)
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    timeout(Duration::from_secs(1), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(sender);
+    driver.abort();
+    let _ = driver.await;
+    response
+}
+
+#[cfg(target_vendor = "apple")]
+#[tokio::test]
+async fn h2_scripts_only_local_response_skips_upstream_and_response_hooks() {
+    let scripts = r#"
+http-scripts:
+  enabled: true
+  scripts:
+    - name: local
+      phase: request
+      url: https://a.test/local
+      match: exact
+      source: 'function rewrite(input) { return {type:"respond",status:201,headers:[{name:"Set-Cookie",value:"a=1"},{name:"Set-Cookie",value:"b=2"}],body:{kind:"bytes",data:Uint8Array.from([1,2,3])}}; }'
+    - name: unreachable-request
+      phase: request
+      url: https://a.test/local
+      match: exact
+      source: 'function rewrite(input) { return {type:"abort"}; }'
+    - name: unreachable-response
+      phase: response
+      url: https://a.test/local
+      match: exact
+      source: 'function rewrite(input) { return {type:"abort"}; }'
+"#;
+    let (context, origin) = prepared_origin_rules(true, false, false, OriginMode::None, scripts);
+    let response = script_memory_response(
+        context,
+        Request::builder()
+            .uri("https://a.test/local")
+            .body(())
+            .unwrap(),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.body(), &[1, 2, 3]);
+    assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+    assert!(origin.sessions.lock().unwrap().is_empty());
+    origin.join().await;
+}
+
+#[cfg(target_vendor = "apple")]
+#[tokio::test]
+async fn h2_script_local_response_preserves_unfinished_upload_and_sibling_stream() {
+    let settings = r#"
+http-scripts:
+  enabled: true
+  scripts:
+    - name: local
+      phase: request
+      url: https://a.test/local
+      match: exact
+      source: 'function rewrite(input) { return {type:"respond",status:201,body:{kind:"text",data:"local"}}; }'
+"#;
+    let (context, origin) = prepared_origin_rules(true, false, false, OriginMode::None, settings);
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
+    let (client, mut server) = tokio::io::duplex(8192);
+    let worker = tokio::spawn(async move {
+        context
+            .serve_h2(&mut server, session(), stop)
+            .await
+            .unwrap();
+    });
+    let (mut sender, connection) = wire::client::handshake(client).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let (first, mut unfinished) = sender
+        .send_request(
+            Request::builder()
+                .method("POST")
+                .uri("https://a.test/local")
+                .header("content-length", 100)
+                .body(())
+                .unwrap(),
+            false,
+        )
+        .unwrap();
+    unfinished
+        .send_data(Bytes::from_static(b"part"), false)
+        .unwrap();
+    for response in [Some(first), None] {
+        let response = if let Some(response) = response {
+            response
+        } else {
+            sender = sender.ready().await.unwrap();
+            sender
+                .send_request(
+                    Request::builder()
+                        .uri("https://a.test/local")
+                        .body(())
+                        .unwrap(),
+                    true,
+                )
+                .unwrap()
+                .0
+        };
+        let response = timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(frame) = timeout(Duration::from_secs(2), body.data()).await.unwrap() {
+            let frame = frame.unwrap();
+            body.flow_control().release_capacity(frame.len()).unwrap();
+            bytes.extend_from_slice(&frame);
+        }
+        assert_eq!(bytes, b"local");
+    }
+    assert!(origin.sessions.lock().unwrap().is_empty());
+    drop(unfinished);
+    cancel.cancel();
+    timeout(Duration::from_secs(1), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(sender);
+    driver.abort();
+    let _ = driver.await;
+    origin.join().await;
+}
+
+#[cfg(target_vendor = "apple")]
+#[tokio::test]
+async fn h2_scripts_mix_native_results_u0_selection_and_per_call_rollback() {
+    let settings = r#"
+rewrite:
+  enabled: true
+  rules:
+    - {url: 'https://a.test/upload', match: exact, action: replace, replacement: 'https://b.test/rewritten'}
+    - {url: 'https://a.test/upload', match: exact, action: request-header-set, header: X-Request, value: rewritten}
+    - {url: 'https://a.test/upload', match: exact, action: request-header-set, header: Authorization, value: 'Bearer explicit'}
+    - {url: 'https://a.test/upload', match: exact, action: request-header-set, header: Cookie, value: 'new=explicit'}
+    - {url: 'https://a.test/upload', match: exact, action: request-body-replace, search: old, replacement: new}
+    - {url: 'https://a.test/upload', match: exact, action: response-header-remove, header: Server}
+    - {url: 'https://a.test/upload', match: exact, action: response-body-json-patch, patch: [{op: replace, path: /token, value: native}]}
+http-scripts:
+  enabled: true
+  scripts:
+    - name: request-view
+      phase: request
+      url: https://a.test/upload
+      match: exact
+      body: text
+      source: 'function rewrite(input) { if (input.request.url !== "https://b.test/rewritten" || input.body.data !== "new request") { return {type:"abort"}; } return {type:"modify",headers:[{op:"set",name:"x-js",values:["accepted"]}]}; }'
+    - name: invalid-request
+      phase: request
+      url: https://a.test/upload
+      match: exact
+      source: 'function rewrite(input) { return {type:"modify",url:"https://invalid host/",headers:[{op:"remove",name:"authorization"}]}; }'
+    - name: effective-url-is-not-selector
+      phase: request
+      url: https://b.test/rewritten
+      match: exact
+      source: 'function rewrite(input) { return {type:"abort"}; }'
+    - name: response-body
+      phase: response
+      url: https://a.test/upload
+      match: exact
+      body: text
+      source: 'function rewrite(input) { if (input.request.url !== "https://b.test/rewritten" || input.original.url !== "https://a.test/upload") { return {type:"abort"}; } let value=JSON.parse(input.body.data); if (value.token !== "native") { return {type:"abort"}; } value.token="script"; return {type:"modify",status:201,headers:[{op:"add",name:"set-cookie",values:["a=1","b=2"]}],body:{kind:"text",data:JSON.stringify(value)}}; }'
+    - name: invalid-response
+      phase: response
+      url: https://a.test/upload
+      match: exact
+      source: 'function rewrite(input) { return {type:"modify",status:204,headers:[{op:"remove",name:"set-cookie"}]}; }'
+"#;
+    for upstream_h2 in [true, false] {
+        let (context, origin) =
+            prepared_origin_rules(upstream_h2, false, false, OriginMode::Rewrite, settings);
+        let response = script_memory_response(
+            context,
+            Request::builder()
+                .method("POST")
+                .uri("https://a.test/upload")
+                .header("content-length", 11)
+                .header("authorization", "original")
+                .header("cookie", "old=original")
+                .body(())
+                .unwrap(),
+            Bytes::from_static(b"old request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(!response.headers().contains_key("server"));
+        assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(response.body()).unwrap(),
+            serde_json::json!({"ads":[1],"token":"script"})
+        );
+        assert_eq!(origin.received.lock().unwrap()[0], b"new request");
+        assert_eq!(
+            origin.sessions.lock().unwrap()[0].destination,
+            Destination::domain("b.test", 443).unwrap()
+        );
+        origin.join().await;
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+#[tokio::test]
+async fn h2_scripts_do_not_erase_obs_text_to_make_an_input_snapshot() {
+    let settings = r#"
+http-scripts:
+  enabled: true
+  scripts:
+    - name: should-skip
+      phase: request
+      url: https://a.test/upload
+      match: exact
+      source: 'function rewrite(input) { return {type:"respond",status:201}; }'
+    - name: response-must-also-have-representable-request
+      phase: response
+      url: https://a.test/upload
+      match: exact
+      source: 'function rewrite(input) { return {type:"abort"}; }'
+"#;
+    let (context, origin) = prepared_origin_rules(true, false, false, OriginMode::None, settings);
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("https://a.test/upload")
+        .header("content-length", PAYLOAD)
+        .body(())
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("x-opaque", http::HeaderValue::from_bytes(&[0xff]).unwrap());
+    let response = script_memory_response(context, request, Bytes::from(vec![7; PAYLOAD])).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.body(), &vec![9; PAYLOAD]);
+    assert_eq!(origin.received.lock().unwrap()[0], vec![7; PAYLOAD]);
+    origin.join().await;
+}
+
+#[cfg(target_vendor = "apple")]
+#[tokio::test]
+async fn h2_script_body_collection_preserves_early_response_while_upload_is_unfinished() {
+    let settings = r#"
+http-scripts:
+  enabled: true
+  scripts:
+    - name: complete-response-only
+      phase: response
+      url: https://a.test/upload
+      match: exact
+      body: bytes
+      source: 'function rewrite(input) { if (input.body.data.length !== 98304) { return {type:"abort"}; } return {type:"modify",headers:[{op:"set",name:"x-js-complete",values:["yes"]}]}; }'
+"#;
+    for upstream_h2 in [true, false] {
+        let (context, origin) =
+            prepared_origin_rules(upstream_h2, true, false, OriginMode::None, settings);
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let (client, mut server) = tokio::io::duplex(8192);
+        let worker = tokio::spawn(async move {
+            context
+                .serve_h2(&mut server, session(), stop)
+                .await
+                .unwrap();
+        });
+        let (mut sender, connection) = wire::client::handshake(client).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let (response, mut upload) = sender
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri("https://a.test/upload")
+                    .header("content-length", PAYLOAD)
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        upload
+            .send_data(Bytes::from(vec![7; PAYLOAD / 2]), false)
+            .unwrap();
+        let response = timeout(Duration::from_secs(3), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(response.headers()["x-js-complete"], "yes");
+        timeout(
+            Duration::from_secs(3),
+            require_early_body(response.into_body()),
+        )
+        .await
+        .unwrap();
+        drop(upload);
+        cancel.cancel();
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(sender);
+        driver.abort();
+        let _ = driver.await;
+        origin.join().await;
+    }
+}
+
 #[tokio::test]
 async fn h2_rewrite_stages_use_original_url_for_h2_and_h1_origins() {
     let rules = r#"

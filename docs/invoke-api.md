@@ -637,6 +637,8 @@ updateConfig 省略 HTTP 时继承 active；同设置可继续使用 active。�
 
 method 默认 GET，response.status 必填；headers 是保留顺序与重复项的二元数组，bodyBase64 表示原始编码实体。外部资源只取同来源已准备内存候选；缺少则返回 resourcesReady false／unprepared，不伪装为未命中。总开关关闭仍可演算启用规则；没有样本只报告被选中。结果包含 U0/U1、来源索引、URL 结果、各阶段执行或旁路与样本输出，httpsReady 不宣称真实信任就绪。结果不含 CA，也不持久化正文。
 
+当前 `testHttp` 只演算原生规则，不执行 JS。`http-scripts.enabled: true` 且脚本列表非空时明确返回不支持错误，不静默跳过脚本后报告演算成功；脚本总开关关闭时仍做源码 AST 静态校验，然后只演算原生规则。`validateConfig` 的源码校验同样不初始化脚本后端。
+
 ### foreground 私密文件
 
 可选 httpConfigPath、httpCaPath 都是明确的普通文件路径，不自动搜索、不从环境获取；HTTP 文件最多 1 MiB。私密文件格式为 `{"certificate":"...PEM...","privateKey":"...PEM..."}`，Unix 要求当前用户所有、group／other 权限全关闭，并拒绝符号链接。foreground 保留 HTTP 文件目录作为 baseDir。CLI 只传路径，读取仍归 Invoke；空路径与 `-` 拒绝。

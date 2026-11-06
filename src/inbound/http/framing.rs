@@ -31,6 +31,25 @@ pub(crate) struct RequestPlan {
 }
 
 impl RequestPlan {
+    /// Called after request processing; downstream persistence is independent.
+    pub(crate) fn enable_origin_persistence(&mut self) -> io::Result<()> {
+        if !matches!(self.body, Body::Empty | Body::Length(0))
+            || !self.upgrade.is_empty()
+            || !self.keep_alive
+        {
+            return Err(invalid("request is not eligible for origin persistence"));
+        }
+        let suffix = b"Connection: close\r\n\r\n";
+        let prefix = self
+            .head
+            .strip_suffix(suffix)
+            .ok_or_else(|| invalid("invalid generated persistence field"))?;
+        let length = prefix.len();
+        self.head.truncate(length);
+        self.head
+            .extend_from_slice(b"Connection: keep-alive\r\n\r\n");
+        Ok(())
+    }
     pub(crate) fn edit_headers(
         &mut self,
         edit: impl FnOnce(&mut Vec<(String, String)>),
@@ -125,9 +144,36 @@ pub(crate) struct ResponseHead {
     line: String,
     headers: Vec<(String, String)>,
     framing: Framing,
+    wire_http11: bool,
+    wire_close: bool,
+    wire_body: Body,
+    wire_reusable_status: bool,
+    wire_trailers: bool,
 }
 
 impl ResponseHead {
+    pub(crate) fn replace(
+        &mut self,
+        status: u16,
+        headers: Vec<(String, String)>,
+    ) -> io::Result<()> {
+        let status_code =
+            http::StatusCode::from_u16(status).map_err(|_| invalid("invalid response status"))?;
+        let framing = Framing::parse(&headers)?;
+        if (status < 200 || status == 204) && framing.body.is_some()
+            || status == 205 && !matches!(framing.body, None | Some(Body::Empty | Body::Length(0)))
+        {
+            return Err(invalid("body framing is forbidden for this response"));
+        }
+        self.status = status;
+        self.line = format!(
+            "HTTP/1.1 {status} {}",
+            status_code.canonical_reason().unwrap_or("Response")
+        );
+        self.headers = headers;
+        self.framing = framing;
+        Ok(())
+    }
     pub(crate) fn headers(&self) -> &Vec<(String, String)> {
         &self.headers
     }
@@ -178,16 +224,38 @@ impl ResponseHead {
         if (status < 200 || status == 204) && framing.body.is_some() {
             return Err(invalid("body framing is forbidden for this response"));
         }
+        if status == 205 && !matches!(framing.body, None | Some(Body::Empty | Body::Length(0))) {
+            return Err(invalid("205 response must have an empty entity"));
+        }
+        let wire_reusable_status = status >= 200
+            && !matches!(status, 204 | 205 | 206 | 304)
+            && !headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("content-range"));
         Ok(Self {
             status,
             line: format!("HTTP/1.1 {} {}", status, reason),
             headers,
+            wire_http11: version == "HTTP/1.1",
+            wire_close: framing.connection.contains("close"),
+            wire_body: framing.body.unwrap_or(Body::UntilEof),
+            wire_reusable_status,
+            wire_trailers: !framing.trailers.is_empty(),
             framing,
         })
     }
 
+    pub(crate) fn origin_reusable(&self, method: &str) -> bool {
+        method == "GET"
+            && self.wire_http11
+            && !self.wire_close
+            && self.wire_reusable_status
+            && !self.wire_trailers
+            && matches!(self.wire_body, Body::Length(_))
+    }
+
     pub fn body(&self, method: &str) -> Body {
-        if method == "HEAD" || self.status < 200 || matches!(self.status, 204 | 304) {
+        if method == "HEAD" || self.status < 200 || matches!(self.status, 204 | 205 | 304) {
             Body::Empty
         } else {
             self.framing.body.unwrap_or(Body::UntilEof)
@@ -684,6 +752,37 @@ fn invalid(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reset_content_never_advertises_an_unsent_entity() {
+        use super::*;
+        let empty =
+            ResponseHead::parse(b"HTTP/1.1 205 Reset Content\r\nContent-Length: 0").unwrap();
+        assert_eq!(empty.body("GET"), Body::Empty);
+        assert!(ResponseHead::parse(b"HTTP/1.1 205 Reset Content\r\nContent-Length: 12").is_err());
+        assert!(
+            ResponseHead::parse(b"HTTP/1.1 205 Reset Content\r\nTransfer-Encoding: chunked")
+                .is_err()
+        );
+        let mut ordinary = ResponseHead::parse(b"HTTP/1.1 200 OK\r\nContent-Length: 2").unwrap();
+        assert!(
+            ordinary
+                .replace(205, vec![("Content-Length".into(), "2".into())])
+                .is_err()
+        );
+        ordinary
+            .replace(205, vec![("Content-Length".into(), "0".into())])
+            .unwrap();
+        assert_eq!(ordinary.body("GET"), Body::Empty);
+        let cached =
+            ResponseHead::parse(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 20").unwrap();
+        assert_eq!(cached.body("GET"), Body::Empty);
+        assert!(
+            cached
+                .encode(false, false, false)
+                .windows(18)
+                .any(|w| w == b"Content-Length: 20")
+        );
+    }
     use super::*;
     use tokio::io::BufReader;
 

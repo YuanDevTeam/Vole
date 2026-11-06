@@ -57,6 +57,20 @@ impl Search {
         })
     }
 
+    /// Preallocate the actual body owner at a proven byte upper bound.
+    /// Literal matches are nonempty and nonoverlapping, so replacing each with
+    /// no more bytes cannot increase any output prefix beyond the input size.
+    /// Regex/templates and potentially growing literals retain the full limit.
+    pub(crate) fn output_capacity(&self, input_bytes: usize, limit: usize) -> usize {
+        match &self.pattern {
+            Pattern::Literal {
+                search,
+                replacement,
+            } if replacement.len() <= search.len() => input_bytes.min(limit),
+            _ => limit,
+        }
+    }
+
     /// The caller owns the input and output workspace permits. Allocation is
     /// checked before every append, including unmatched portions and captures.
     pub(crate) fn apply(&self, input: &str, limit: usize) -> io::Result<String> {

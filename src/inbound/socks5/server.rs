@@ -181,7 +181,7 @@ impl Socks5Handler {
         deadline: Instant,
     ) -> io::Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let config = &self.config;
         let dispatcher = self.dispatcher.clone();
@@ -215,14 +215,47 @@ impl Socks5Handler {
                 destination,
                 sniffed_domain: None,
             };
+            let mut acknowledged = false;
+            #[cfg(feature = "inbound-http")]
+            let (mut stream, dispatcher) = {
+                let mut selected = dispatcher;
+                let mut prefix = Vec::new();
+                if let Some(http) = selected.http_context() {
+                    // Pin this connection even when its port is not a
+                    // candidate; interception and fallback use one generation.
+                    selected = http.dispatcher().clone();
+                    if http.candidate_port(session.destination.port()) {
+                        // The client must receive CONNECT success before
+                        // sending HTTP or its TLS ClientHello. Later failures
+                        // close it instead of writing a second SOCKS reply.
+                        timed(handshake::reply(&mut stream, 0, None)).await?;
+                        acknowledged = true;
+                        match http
+                            .try_intercept(&mut stream, session.clone(), cancellation.clone())
+                            .await?
+                        {
+                            crate::http_processing::Intercept::Handled => return Ok(()),
+                            crate::http_processing::Intercept::Transparent { prefix: bytes } => {
+                                prefix = bytes;
+                            }
+                        }
+                    }
+                }
+                (
+                    crate::http_processing::io::Replay::new(prefix, stream),
+                    selected,
+                )
+            };
             let sniff = dispatcher
                 .sniff_plan(peer, &session.destination)
                 .await
                 .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?
                 .filter(|plan| plan.tcp_enabled());
-            let acknowledged = sniff.is_some();
             let prefix = if let Some(plan) = sniff {
-                timed(handshake::reply(&mut stream, 0, None)).await?;
+                if !acknowledged {
+                    timed(handshake::reply(&mut stream, 0, None)).await?;
+                    acknowledged = true;
+                }
                 plan.sniff(&mut stream, &mut session)
                     .await
                     .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?
@@ -303,6 +336,10 @@ impl Socks5Handler {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "inbound-http"))]
+#[path = "http_processing_memory_tests.rs"]
+mod http_processing_memory_tests;
 
 async fn read_control<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<()> {
     let mut buffer = [0; 1024];

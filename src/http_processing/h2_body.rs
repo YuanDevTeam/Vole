@@ -1,6 +1,6 @@
 //! One native frame at a time, with credit returned after bounded forwarding.
 use super::{
-    body::{Bypass, Transaction},
+    body::{Bypass, Entity, Transaction},
     h2_headers, headers,
 };
 use bytes::Bytes;
@@ -57,7 +57,7 @@ impl Source {
             pending_credit: 0,
         }
     }
-    fn buffered(data: Bytes, trailers: Option<HeaderMap>) -> Self {
+    pub(super) fn buffered(data: Bytes, trailers: Option<HeaderMap>) -> Self {
         Self {
             kind: Kind::Buffered {
                 data: Some(data),
@@ -186,6 +186,73 @@ pub(super) struct Prepared {
     pub(super) expected: Option<u64>,
 }
 
+pub(super) struct SharedPrepared {
+    pub(super) source: Source,
+    pub(super) expected: Option<u64>,
+    pub(super) entity: Option<Entity>,
+}
+
+pub(super) async fn prepare_shared(
+    mut source: Source,
+    mut transaction: Transaction<'_>,
+    expected: Option<u64>,
+    strip_credentials: bool,
+    fields: &mut headers::Fields,
+) -> io::Result<SharedPrepared> {
+    let mut length = Length::new(expected);
+    let mut trailers = None;
+    while let Some(frame) = timeout(
+        IDLE,
+        futures_util::future::poll_fn(|cx| Pin::new(&mut source).poll_frame(cx)),
+    )
+    .await
+    .map_err(|_| io::ErrorKind::TimedOut)?
+    {
+        let frame = frame?;
+        match frame.into_data() {
+            Ok(mut data) => {
+                length.consume(data.len())?;
+                let count = transaction.remaining().min(data.len());
+                let prefix = data.split_to(count);
+                let result = transaction.push(&prefix);
+                if result.is_err() || !data.is_empty() {
+                    if result.is_ok() {
+                        super::diagnostics::body_bypass(
+                            super::diagnostics::BodyPoint::Collection,
+                            Bypass::Size,
+                        );
+                    }
+                    source.rewind(transaction.into_raw().into_bytes(), data)?;
+                    return Ok(SharedPrepared {
+                        source,
+                        expected,
+                        entity: None,
+                    });
+                }
+            }
+            Err(frame) => {
+                if let Ok(headers) = frame.into_trailers() {
+                    trailers = Some(h2_headers::trailers(headers, strip_credentials)?);
+                    break;
+                }
+            }
+        }
+    }
+    length.finish()?;
+    let entity = transaction.finish_shared(trailers.is_some(), fields);
+    let expected = if entity.changed() {
+        Some(entity.wire().len() as u64)
+    } else {
+        expected
+    };
+    let source = Source::buffered(entity.wire().clone(), trailers);
+    Ok(SharedPrepared {
+        source,
+        expected,
+        entity: Some(entity),
+    })
+}
+
 pub(super) async fn prepare(
     mut source: Source,
     mut transaction: Transaction<'_>,
@@ -210,6 +277,12 @@ pub(super) async fn prepare(
                 let prefix = data.split_to(count);
                 let result = transaction.push(&prefix);
                 if result.is_err() || !data.is_empty() {
+                    if result.is_ok() {
+                        super::diagnostics::body_bypass(
+                            super::diagnostics::BodyPoint::Collection,
+                            Bypass::Size,
+                        );
+                    }
                     source.rewind(transaction.into_raw().into_bytes(), data)?;
                     return Ok(Prepared { source, expected });
                 }

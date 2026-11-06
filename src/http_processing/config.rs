@@ -7,6 +7,7 @@ use super::{
     private_context::CaMaterial,
     providers::Payload,
     rules::{self, Rule, UrlAction},
+    script_config::CompiledScript,
 };
 #[cfg(any(test, all(windows, feature = "windows-uwp")))]
 use serde::Deserialize;
@@ -43,6 +44,7 @@ pub(super) fn require_http_adapter() -> io::Result<()> {
 pub(crate) struct PolicyCandidate {
     pub(crate) document: Arc<Document>,
     pub(super) rules: Arc<[Rule]>,
+    pub(crate) scripts: Arc<[CompiledScript]>,
     pub(super) payloads: BTreeMap<String, Arc<Payload>>,
     pub(super) identity: [u8; 32],
     pub(super) origins: Box<[SourceLocation]>,
@@ -84,6 +86,7 @@ impl PolicyCandidate {
         material: Option<&CaMaterial>,
     ) -> io::Result<Arc<Policy>> {
         require_http_adapter()?;
+        self.document.http_scripts.ensure_available()?;
         #[cfg(feature = "inbound-http")]
         let mitm = super::mitm::Mitm::compile(self.document.mitm.clone(), material)?;
         #[cfg(not(feature = "inbound-http"))]
@@ -98,6 +101,7 @@ impl PolicyCandidate {
             identity: hash.finalize().into(),
             document: self.document.clone(),
             candidate: Some(self.clone()),
+            scripts_backend_ready: true,
             #[cfg(feature = "inbound-http")]
             mitm,
         }))
@@ -188,6 +192,7 @@ pub(crate) struct Policy {
     identity: [u8; 32],
     document: Arc<Document>,
     candidate: Option<Arc<PolicyCandidate>>,
+    scripts_backend_ready: bool,
     #[cfg(feature = "inbound-http")]
     mitm: Option<Arc<super::mitm::Mitm>>,
 }
@@ -196,6 +201,7 @@ impl fmt::Debug for Policy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpPolicy")
             .field("rules", &self.all_rules().len())
+            .field("scripts", &self.all_scripts().len())
             .field("prepared", &self.is_prepared())
             .finish_non_exhaustive()
     }
@@ -247,6 +253,7 @@ impl Policy {
             .map_or_else(|| document.identity(), |candidate| candidate.identity());
         Self {
             identity,
+            scripts_backend_ready: !document.http_scripts.is_active(),
             document,
             candidate,
             #[cfg(feature = "inbound-http")]
@@ -262,6 +269,7 @@ impl Policy {
     }
     pub(crate) fn is_prepared(&self) -> bool {
         self.candidate.is_some()
+            && self.scripts_backend_ready
             && (!self.document.mitm.enabled || {
                 #[cfg(feature = "inbound-http")]
                 {
@@ -274,7 +282,8 @@ impl Policy {
             })
     }
     pub(crate) fn plain_port(&self, port: u16) -> bool {
-        !self.rules().is_empty() && self.document.http_ports.contains(&port)
+        (!self.rules().is_empty() || !self.scripts().is_empty())
+            && self.document.http_ports.contains(&port)
     }
     pub(crate) fn rules(&self) -> &[Rule] {
         if self.document.rewrite.enabled {
@@ -287,6 +296,18 @@ impl Policy {
         self.candidate
             .as_ref()
             .map_or(&[], |candidate| &candidate.rules)
+    }
+    pub(crate) fn scripts(&self) -> &[CompiledScript] {
+        if self.document.http_scripts.enabled {
+            self.all_scripts()
+        } else {
+            &[]
+        }
+    }
+    pub(crate) fn all_scripts(&self) -> &[CompiledScript] {
+        self.candidate
+            .as_ref()
+            .map_or(&[], |candidate| &candidate.scripts)
     }
     #[cfg(feature = "inbound-http")]
     pub(crate) fn body_budget(&self) -> &super::body_budget::Budget {

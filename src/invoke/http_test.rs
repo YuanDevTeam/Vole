@@ -41,6 +41,13 @@ struct ResponseSample {
 pub(crate) fn evaluate(payload: TestPayload) -> Result<Value, InvokeFailure> {
     let document = Document::parse(&payload.http_config_yaml)
         .map_err(|_| InvokeFailure::new("invalid HTTP processing configuration"))?;
+    if document.http_scripts.is_active() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "testHttp does not execute enabled HTTP scripts",
+        )
+        .into());
+    }
     let (base, ca) = payload
         .http_context
         .map_or((None, None), |input| (input.base_dir, input.ca));
@@ -288,5 +295,23 @@ mod tests {
         );
         assert_eq!(result["resourcesReady"], false);
         assert_eq!(result["outcome"], "unprepared");
+    }
+
+    #[test]
+    fn offline_http_rejects_enabled_scripts_before_resource_lookup() {
+        let input = json!({"httpConfigYaml": "rewrite-providers: {missing: {type: file, path: no-io.yaml}}\nrewrite: {rules: [{rule-set: missing}]}\nhttp-scripts:\n  enabled: true\n  scripts:\n    - {name: example, phase: request, url: '.', source: \"function rewrite(input) { return {type:'pass'}; }\"}\n", "url":"https://example.com/"});
+        let failure = evaluate(serde_json::from_value(input).unwrap()).unwrap_err();
+        assert_eq!(
+            failure.message,
+            "testHttp does not execute enabled HTTP scripts"
+        );
+    }
+
+    #[test]
+    fn offline_http_keeps_native_evaluation_with_disabled_scripts() {
+        let input = json!({"httpConfigYaml": "rewrite: {rules: [{url: '.', action: reject}]}\nhttp-scripts:\n  enabled: false\n  scripts:\n    - {name: example, phase: request, url: '.', source: \"function rewrite(input) { while(true) {} }\"}\n", "url":"https://example.com/"});
+        let result = run(input);
+        assert_eq!(result["url"]["outcome"], "reject");
+        assert_eq!(result["url"]["status"], 403);
     }
 }

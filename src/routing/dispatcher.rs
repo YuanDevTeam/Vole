@@ -781,6 +781,73 @@ fn preferred_address(addresses: &[IpAddr]) -> Option<IpAddr> {
 
 #[async_trait]
 impl Dispatcher for RoutingDispatcher {
+    #[cfg(feature = "inbound-http")]
+    async fn prepare_http_tcp(
+        &self,
+        mut session: StreamSession,
+    ) -> Result<Option<Box<dyn crate::dispatch::HttpTcpPlan>>, DispatchError> {
+        if business(session.inbound) {
+            session.capture_original();
+        }
+        self.ensure_destination_allowed(&session.destination)?;
+        // DNS-over-TCP's special stream remains on the original entry point.
+        if session.inbound == InboundKind::Tun
+            && matches!(&session.destination, Destination::Ip(a) if self.tun_config.hijacks_dns(*a))
+            && self.dns.as_ref().is_some_and(|dns| dns.is_enabled())
+        {
+            return Ok(None);
+        }
+        let traced = self.diagnostics.is_some() && business(session.inbound);
+        let (prepared, trace) = if traced {
+            crate::dns::trace::capture(self.prepare_tcp_route(&session)).await
+        } else {
+            (self.prepare_tcp_route(&session).await, Vec::new())
+        };
+        let (decision, selected) = prepared?;
+        let direct =
+            decision.action == RuleAction::Direct || selected.as_ref().is_some_and(|s| s.direct);
+        let static_physical = selected
+            .as_ref()
+            .map_or(&self.direct, |s| &s.dispatcher)
+            .permits_http_tcp_reuse();
+        let key = if direct
+            && static_physical
+            && matches!(decision.destination, Destination::Ip(_))
+            && !(self.tcp_concurrent
+                && decision
+                    .resolved_addresses
+                    .as_ref()
+                    .is_some_and(|a| a.len() > 1))
+        {
+            Some(crate::dispatch::HttpTcpReuseKey::new(HttpDirectIdentity {
+                rules: self.rules.clone(),
+                leaf: selected
+                    .as_ref()
+                    .map_or_else(|| self.direct.clone(), |s| s.dispatcher.clone()),
+                session: session.clone(),
+                action: decision.action,
+                rule_index: decision.rule_index,
+                endpoint: decision.destination.clone(),
+                resolved: decision.resolved_addresses.clone(),
+                metadata: decision.metadata.clone(),
+                process: decision.process.clone(),
+                dns_mode: decision.dns_mode,
+                chain: selected.as_ref().map_or_else(Vec::new, |s| s.chain.clone()),
+            }))
+        } else {
+            None
+        };
+        Ok(Some(Box::new(RoutingHttpTcpPlan {
+            router: self.clone_parts(),
+            session,
+            decision,
+            selected,
+            key,
+            trace,
+            traced,
+        })))
+    }
+
     async fn sniff_plan(
         &self,
         source: SocketAddr,
@@ -789,6 +856,17 @@ impl Dispatcher for RoutingDispatcher {
         let Some(policy) = self.sniffer.as_ref() else {
             return Ok(None);
         };
+        // A SOCKS domain address can contain a numeric host. Normalize only
+        // sniff admission so it shares IP mapping/exclusion rules without
+        // changing the session destination or its original ingress facts.
+        let numeric_destination = match destination {
+            Destination::Domain { host, port } => host
+                .parse::<IpAddr>()
+                .ok()
+                .map(|ip| Destination::Ip(SocketAddr::new(ip, *port))),
+            Destination::Ip(_) => None,
+        };
+        let destination = numeric_destination.as_ref().unwrap_or(destination);
         let (host, mapped) = match destination {
             Destination::Domain { host, .. } => (Some(host.clone()), false),
             Destination::Ip(address) => {
@@ -835,6 +913,83 @@ impl Dispatcher for RoutingDispatcher {
     }
 }
 
+#[cfg(feature = "inbound-http")]
+struct HttpDirectIdentity {
+    rules: Arc<RuleSet>,
+    leaf: Arc<dyn Dispatcher>,
+    session: StreamSession,
+    action: RuleAction,
+    rule_index: usize,
+    endpoint: Destination,
+    resolved: Option<Vec<IpAddr>>,
+    metadata: Destination,
+    process: crate::process::Identity,
+    dns_mode: &'static str,
+    chain: Vec<String>,
+}
+#[cfg(feature = "inbound-http")]
+impl PartialEq for HttpDirectIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.rules, &other.rules)
+            && Arc::ptr_eq(&self.leaf, &other.leaf)
+            && self.session == other.session
+            && self.action == other.action
+            && self.rule_index == other.rule_index
+            && self.endpoint == other.endpoint
+            && self.resolved == other.resolved
+            && self.metadata == other.metadata
+            && self.process == other.process
+            && self.dns_mode == other.dns_mode
+            && self.chain == other.chain
+    }
+}
+#[cfg(feature = "inbound-http")]
+impl Eq for HttpDirectIdentity {}
+#[cfg(feature = "inbound-http")]
+struct RoutingHttpTcpPlan {
+    router: RoutingDispatcher,
+    session: StreamSession,
+    decision: RouteDecision,
+    selected: Option<ResolvedProxyGroupLeaf>,
+    key: Option<crate::dispatch::HttpTcpReuseKey>,
+    trace: Vec<&'static str>,
+    traced: bool,
+}
+#[cfg(feature = "inbound-http")]
+#[async_trait]
+impl crate::dispatch::HttpTcpPlan for RoutingHttpTcpPlan {
+    fn reuse_key(&self) -> Option<&crate::dispatch::HttpTcpReuseKey> {
+        self.key.as_ref()
+    }
+    async fn connect(self: Box<Self>) -> Result<BoxStream, DispatchError> {
+        let Self {
+            router,
+            session,
+            decision,
+            selected,
+            trace,
+            traced,
+            ..
+        } = *self;
+        if traced {
+            crate::dns::trace::capture(async {
+                for step in trace {
+                    crate::dns::trace::record(step);
+                }
+                router
+                    .connect_tcp_decision(session, decision, selected)
+                    .await
+            })
+            .await
+            .0
+        } else {
+            router
+                .connect_tcp_decision(session, decision, selected)
+                .await
+        }
+    }
+}
+
 impl RoutingDispatcher {
     fn routed_datagrams(&self, session: DatagramSession) -> RoutedDatagramTransport {
         let managed_ready = (self.diagnostics.is_some() && business(session.inbound))
@@ -872,6 +1027,15 @@ impl RoutingDispatcher {
             return Ok(self.dns_tcp_stream(dns.clone()));
         }
 
+        let (decision, resolved_target) = self.prepare_tcp_route(&session).await?;
+        self.connect_tcp_decision(session, decision, resolved_target)
+            .await
+    }
+
+    async fn prepare_tcp_route(
+        &self,
+        session: &StreamSession,
+    ) -> Result<(RouteDecision, Option<ResolvedProxyGroupLeaf>), DispatchError> {
         let mut decision = self
             .route(
                 Network::Tcp,
@@ -887,6 +1051,15 @@ impl RoutingDispatcher {
             self.resolve_direct_destination(&mut decision).await?;
         }
         log_route_decision(Network::Tcp, &decision);
+        Ok((decision, resolved_target))
+    }
+
+    async fn connect_tcp_decision(
+        &self,
+        mut session: StreamSession,
+        decision: RouteDecision,
+        resolved_target: Option<ResolvedProxyGroupLeaf>,
+    ) -> Result<BoxStream, DispatchError> {
         let chain = resolved_target
             .as_ref()
             .map_or_else(Vec::new, |target| target.chain.clone());
@@ -2196,6 +2369,8 @@ mod tests {
         routing::EmptyGeoMatcher,
     };
     use bytes::Bytes;
+
+    include!("numeric_host_sniff_tests.rs");
 
     #[derive(Default)]
     struct RecordingDispatcher {

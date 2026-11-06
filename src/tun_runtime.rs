@@ -898,19 +898,19 @@ async fn relay_tcp(
     let (mut inbound, dispatcher) = {
         let mut prefix = Vec::new();
         let mut selected = dispatcher;
-        if let Some(http) = selected.http_context()
-            && http.candidate_port(destination_port)
-        {
-            match http
-                .try_intercept(&mut inbound, session.clone(), cancellation.clone())
-                .await
-            {
-                Ok(crate::http_processing::Intercept::Handled) => return,
-                Ok(crate::http_processing::Intercept::Transparent { prefix: bytes }) => {
-                    prefix = bytes;
-                    selected = http.dispatcher().clone();
+        if let Some(http) = selected.http_context() {
+            selected = http.dispatcher().clone();
+            if http.candidate_port(destination_port) {
+                match http
+                    .try_intercept(&mut inbound, session.clone(), cancellation.clone())
+                    .await
+                {
+                    Ok(crate::http_processing::Intercept::Handled) => return,
+                    Ok(crate::http_processing::Intercept::Transparent { prefix: bytes }) => {
+                        prefix = bytes;
+                    }
+                    Err(_) => return,
                 }
-                Err(_) => return,
             }
         }
         (

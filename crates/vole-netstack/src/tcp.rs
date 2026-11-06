@@ -290,11 +290,30 @@ impl TcpStreamHandle {
 pub struct TcpStream {
     flow: FlowKey,
     pub(crate) handle: Arc<TcpStreamHandle>,
+    #[cfg(test)]
+    read_empty_probe: Option<Box<dyn FnMut(usize) + Send + Sync>>,
+    #[cfg(test)]
+    empty_reads: usize,
 }
 
 impl TcpStream {
     pub(crate) fn new(flow: FlowKey, handle: Arc<TcpStreamHandle>) -> Self {
-        Self { flow, handle }
+        Self {
+            flow,
+            handle,
+            #[cfg(test)]
+            read_empty_probe: None,
+            #[cfg(test)]
+            empty_reads: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn after_empty_read(&mut self) {
+        self.empty_reads += 1;
+        if let Some(probe) = &mut self.read_empty_probe {
+            probe(self.empty_reads);
+        }
     }
 
     /// Intercepted application address, or local source of an active connection.
@@ -324,6 +343,16 @@ impl TcpStream {
             || self.handle.write_shutdown.load(Ordering::Acquire)
             || self.handle.stopped.load(Ordering::Acquire)
     }
+
+    fn read_ended_and_drained(&self) -> bool {
+        // The driver can publish its final bytes and terminal flag after an
+        // earlier read observed the queue empty. Observe publication first,
+        // then recheck the actual queue before allowing that read to be EOF.
+        (self.handle.read_closed.load(Ordering::Acquire)
+            || self.handle.socket_closed.load(Ordering::Acquire)
+            || self.handle.stopped.load(Ordering::Acquire))
+            && self.handle.app_recv.is_empty()
+    }
 }
 
 impl std::fmt::Debug for TcpStream {
@@ -352,31 +381,32 @@ impl AsyncRead for TcpStream {
         context: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
         let target = buffer.initialize_unfilled();
-        let count = self.handle.app_recv.read(target);
+        let count = this.handle.app_recv.read(target);
         if count > 0 {
             buffer.advance(count);
-            self.notify_driver();
+            this.notify_driver();
             return Poll::Ready(Ok(()));
         }
 
-        if self.handle.read_closed.load(Ordering::Acquire)
-            || self.handle.socket_closed.load(Ordering::Acquire)
-            || self.handle.stopped.load(Ordering::Acquire)
-        {
+        #[cfg(test)]
+        this.after_empty_read();
+        if this.read_ended_and_drained() {
             return Poll::Ready(Ok(()));
         }
 
-        self.handle.recv_waker.register(context.waker());
-        let count = self.handle.app_recv.read(buffer.initialize_unfilled());
+        this.handle.recv_waker.register(context.waker());
+        let count = this.handle.app_recv.read(buffer.initialize_unfilled());
+        #[cfg(test)]
+        if count == 0 {
+            this.after_empty_read();
+        }
         if count > 0 {
             buffer.advance(count);
-            self.notify_driver();
+            this.notify_driver();
             Poll::Ready(Ok(()))
-        } else if self.handle.read_closed.load(Ordering::Acquire)
-            || self.handle.socket_closed.load(Ordering::Acquire)
-            || self.handle.stopped.load(Ordering::Acquire)
-        {
+        } else if this.read_ended_and_drained() {
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
@@ -473,11 +503,114 @@ impl TcpListener {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::atomic::AtomicUsize,
+        task::{Wake, Waker},
+        time::Duration,
+    };
 
     use tokio::io::AsyncWriteExt as _;
 
     use super::*;
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadEnd {
+        PeerFin,
+        SocketClosed,
+        Stopped,
+    }
+
+    impl ReadEnd {
+        fn publish(self, handle: &TcpStreamHandle) {
+            match self {
+                Self::PeerFin => handle.read_closed.store(true, Ordering::Release),
+                Self::SocketClosed => handle.socket_closed.store(true, Ordering::Release),
+                Self::Stopped => {
+                    handle.mark_stopped();
+                    return;
+                }
+            }
+            handle.recv_waker.wake();
+        }
+    }
+
+    struct ReadWake(AtomicUsize);
+    impl Wake for ReadWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn assert_published_tail_precedes_eof(empty_probe: usize, ending: ReadEnd) {
+        let handle = Arc::new(TcpStreamHandle::new(1024, 16, Arc::new(Notify::new())));
+        let mut stream = TcpStream::new(
+            FlowKey {
+                source: "192.0.2.1:12000".parse().unwrap(),
+                destination: "198.51.100.1:443".parse().unwrap(),
+            },
+            handle.clone(),
+        );
+        // Publish exactly where the concurrent driver can deliver its final
+        // bytes: after a consumer observed the real queue empty, before its
+        // terminal-state decision. There is no global hook or scheduler race.
+        let publisher = handle.clone();
+        stream.read_empty_probe = Some(Box::new(move |probe| {
+            if probe == empty_probe {
+                assert_eq!(publisher.app_recv.write(&[0x5a; 730]), 730);
+                ending.publish(&publisher);
+            }
+        }));
+        let notifications = Arc::new(ReadWake(AtomicUsize::new(0)));
+        let waker = Waker::from(notifications.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut bytes = [0; 1024];
+        let mut buffer = ReadBuf::new(&mut bytes);
+        let first = Pin::new(&mut stream).poll_read(&mut context, &mut buffer);
+        if first.is_pending() {
+            assert!(
+                notifications.0.load(Ordering::Relaxed) > 0,
+                "{ending:?}: registered consumer lost the final publication wake"
+            );
+            assert!(matches!(
+                Pin::new(&mut stream).poll_read(&mut context, &mut buffer),
+                Poll::Ready(Ok(()))
+            ));
+        } else {
+            assert!(matches!(first, Poll::Ready(Ok(()))));
+        }
+        assert_eq!(
+            buffer.filled().len(),
+            730,
+            "{ending:?}: empty probe {empty_probe} returned EOF before its accepted tail"
+        );
+        assert!(buffer.filled().iter().all(|byte| *byte == 0x5a));
+        assert!(handle.app_recv.is_empty());
+        let mut final_byte = [0];
+        let mut eof = ReadBuf::new(&mut final_byte);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut context, &mut eof),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(eof.filled(), []);
+    }
+
+    #[test]
+    fn tcp_read_publication_after_initial_empty_probe_drains_before_eof() {
+        for ending in [ReadEnd::PeerFin, ReadEnd::SocketClosed, ReadEnd::Stopped] {
+            assert_published_tail_precedes_eof(1, ending);
+        }
+    }
+
+    #[test]
+    fn tcp_read_publication_after_registered_empty_probe_drains_before_eof() {
+        for ending in [ReadEnd::PeerFin, ReadEnd::SocketClosed, ReadEnd::Stopped] {
+            assert_published_tail_precedes_eof(2, ending);
+        }
+    }
 
     #[test]
     fn byte_queue_never_exceeds_capacity() {

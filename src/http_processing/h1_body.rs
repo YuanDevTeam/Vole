@@ -5,10 +5,15 @@ use super::{
     headers::Fields,
     rules::Phase,
 };
+use super::{
+    script_config::BodyMode,
+    script_message::{self, OriginalSnapshot, Outcome, RequestSnapshot, ResponseSnapshot},
+};
 use crate::inbound::http::{
     HttpServerConfig, RequestHead,
     framing::{self, Body, RequestPlan, ResponseHead},
 };
+use bytes::Bytes;
 use std::{
     collections::HashSet,
     io,
@@ -16,7 +21,14 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 use url::Url;
+
+pub(crate) struct ScriptContext {
+    pub(crate) original: OriginalSnapshot,
+    pub(crate) request: RequestSnapshot,
+    pub(crate) cancellation: CancellationToken,
+}
 
 pub(crate) struct Message<'a> {
     pub(crate) policy: &'a Policy,
@@ -24,6 +36,8 @@ pub(crate) struct Message<'a> {
     pub(crate) request: &'a RequestHead,
     pub(crate) meta: OriginalRequestMeta,
     pub(crate) continued: AtomicBool,
+    pub(crate) prepared: std::sync::Mutex<Option<PreparedBody>>,
+    pub(crate) scripts: Option<ScriptContext>,
 }
 
 impl Message<'_> {
@@ -37,6 +51,14 @@ impl Message<'_> {
         plan: &mut RequestPlan,
         config: &HttpServerConfig,
     ) -> io::Result<PreparedBody> {
+        if let Some(prepared) = self
+            .prepared
+            .lock()
+            .map_err(|_| io::Error::other("HTTP upload owner poisoned"))?
+            .take()
+        {
+            return Ok(prepared);
+        }
         let wire = WireBodyMeta::new(
             &self.request.headers,
             &self.meta,
@@ -101,7 +123,84 @@ impl Message<'_> {
             length(body),
             response.status == 101,
         );
+        let original_fields = self.scripts.as_ref().map(|_| response.headers().clone());
         self.response_headers(response)?;
+        if let Some(script) = &self.scripts {
+            let wants_body = self.policy.scripts().iter().any(|s| {
+                s.phase == Phase::Response && s.body != BodyMode::None && s.matches(self.original)
+            });
+            let transaction = Transaction::begin_shared(
+                self.policy.body_budget(),
+                self.policy.rules(),
+                self.original,
+                Phase::Response,
+                &wire,
+                wants_body,
+            )
+            .ok();
+            let mut fields = response.headers().clone();
+            let (mut prepared, entity) = prepare_shared(
+                reader,
+                body,
+                response.trailer_blocklist(),
+                config.body_idle_timeout,
+                transaction,
+                &mut fields,
+            )
+            .await?;
+            let mut message = script_message::Message::response(
+                script.original.clone(),
+                script.request.clone(),
+                ResponseSnapshot {
+                    status: response.status,
+                    headers: fields,
+                },
+                entity,
+                original_fields.as_ref().expect("script wire headers"),
+            );
+            let outcome = match script_message::run(
+                self.policy,
+                self.original,
+                &mut message,
+                &script.cancellation,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error)
+                    if script.cancellation.is_cancelled()
+                        || error.kind() == io::ErrorKind::Interrupted =>
+                {
+                    return Err(error);
+                }
+                Err(_) => {
+                    response.replace(502, vec![("Content-Length".into(), "0".into())])?;
+                    return Ok(PreparedBody::from_bytes(Bytes::new()));
+                }
+            };
+            match outcome {
+                Outcome::Forward => {
+                    let current = message.response.take().expect("response message");
+                    response.replace(current.status, current.headers)?;
+                    if let Some(entity) = message.body {
+                        prepared.install_entity(entity);
+                    }
+                    return Ok(prepared);
+                }
+                Outcome::Respond(local) => {
+                    drop(message);
+                    drop(prepared);
+                    response.replace(local.status, local.headers)?;
+                    return Ok(PreparedBody::from_bytes(local.body));
+                }
+                Outcome::Abort => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "HTTP script aborted exchange",
+                    ));
+                }
+            }
+        }
         let transaction = Transaction::begin(
             self.policy.body_budget(),
             self.policy.rules(),
@@ -146,8 +245,26 @@ pub(crate) struct PreparedBody {
     cursor: Option<Cursor>,
     prefix: Option<BudgetedBytes>,
     result: Option<body::ResultBody>,
+    buffered: Option<Bytes>,
+    origin_replaced: bool,
 }
 impl PreparedBody {
+    pub(crate) fn from_bytes(bytes: Bytes) -> Self {
+        Self {
+            framing: Body::Length(bytes.len() as u64),
+            cursor: Some(Cursor::new(Body::Empty)),
+            prefix: None,
+            result: None,
+            buffered: Some(bytes),
+            origin_replaced: true,
+        }
+    }
+    pub(crate) fn install_entity(&mut self, entity: body::Entity) {
+        if entity.changed() {
+            self.framing = Body::Length(entity.wire().len() as u64);
+        }
+        self.buffered = Some(entity.into_wire());
+    }
     fn finalize_headers(&mut self, fields: &mut Fields) {
         if let Some(mut result) = self.result.take() {
             result.finalize_headers(fields);
@@ -163,6 +280,8 @@ impl PreparedBody {
             cursor: None,
             prefix: None,
             result: None,
+            buffered: None,
+            origin_replaced: false,
         }
     }
     pub(crate) async fn transfer<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
@@ -173,11 +292,36 @@ impl PreparedBody {
         blocklist: &HashSet<String>,
         dechunk: bool,
     ) -> io::Result<()> {
+        self.transfer_with_origin(reader, writer, idle, blocklist, dechunk)
+            .await
+            .map(|_| ())
+    }
+    pub(crate) async fn transfer_with_origin<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+        self,
+        reader: &mut R,
+        writer: &mut W,
+        idle: Duration,
+        blocklist: &HashSet<String>,
+        dechunk: bool,
+    ) -> io::Result<bool> {
         let Some(mut cursor) = self.cursor else {
-            return framing::transfer_body(reader, writer, self.framing, idle, blocklist, dechunk)
-                .await;
+            framing::transfer_body(reader, writer, self.framing, idle, blocklist, dechunk).await?;
+            return Ok(!self.origin_replaced && matches!(self.framing, Body::Length(_)));
         };
+        // A later request script may have changed origin after collection.
+        // Recheck against the final credential blocklist before any replay.
+        for (name, _) in &cursor.trailers {
+            if framing::forbidden_trailer(name, blocklist) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP trailer became forbidden after rewriting",
+                ));
+            }
+        }
         let chunked = self.framing == Body::Chunked && !dechunk;
+        if let Some(bytes) = self.buffered {
+            send(writer, &bytes, chunked, idle).await?;
+        }
         if let Some(prefix) = self.prefix {
             send(writer, prefix.as_ref(), chunked, idle).await?;
             // Keep the reservation until write_all actually completes.
@@ -191,15 +335,102 @@ impl PreparedBody {
             }
             send(writer, &bytes[..count], chunked, idle).await?;
         }
+        let consumed =
+            !self.origin_replaced && cursor.done && matches!(cursor.body, Body::Length(0));
         if chunked {
             framing::write_timed(writer, b"0\r\n", idle).await?;
             for (name, value) in cursor.trailers {
+                if framing::forbidden_trailer(&name, blocklist) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "forbidden HTTP trailer",
+                    ));
+                }
                 framing::write_timed(writer, format!("{name}: {value}\r\n").as_bytes(), idle)
                     .await?;
             }
             framing::write_timed(writer, b"\r\n", idle).await?;
         }
-        framing::timeout_io(idle, writer.flush()).await
+        framing::timeout_io(idle, writer.flush()).await?;
+        Ok(consumed)
+    }
+}
+
+/// The cursor reads the wire once and keeps every over-limit prefix for replay.
+pub(crate) async fn prepare_shared<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    framing: Body,
+    blocklist: &HashSet<String>,
+    idle: Duration,
+    transaction: Option<Transaction<'_>>,
+    fields: &mut Fields,
+) -> io::Result<(PreparedBody, Option<body::Entity>)> {
+    let Some(mut transaction) = transaction else {
+        return Ok((PreparedBody::original(framing), None));
+    };
+    let mut cursor = Cursor::new(framing);
+    let mut bytes = [0u8; framing::COPY_BUFFER];
+    loop {
+        if cursor.done || matches!(cursor.body, Body::Empty | Body::Length(0)) {
+            let entity = transaction.finish_shared(!cursor.trailers.is_empty(), fields);
+            let mut prepared = PreparedBody {
+                framing,
+                cursor: Some(cursor),
+                prefix: None,
+                result: None,
+                buffered: None,
+                origin_replaced: false,
+            };
+            prepared.install_entity(entity.clone());
+            return Ok((prepared, Some(entity)));
+        }
+        let available = transaction.remaining().min(bytes.len());
+        if available == 0 {
+            super::diagnostics::body_bypass(
+                super::diagnostics::BodyPoint::Collection,
+                body::Bypass::Size,
+            );
+            return Ok((
+                PreparedBody {
+                    framing,
+                    cursor: Some(cursor),
+                    prefix: Some(transaction.into_raw()),
+                    result: None,
+                    buffered: None,
+                    origin_replaced: false,
+                },
+                None,
+            ));
+        }
+        let count = cursor
+            .read(reader, &mut bytes[..available], idle, blocklist)
+            .await?;
+        if count == 0 {
+            let entity = transaction.finish_shared(!cursor.trailers.is_empty(), fields);
+            let mut prepared = PreparedBody {
+                framing,
+                cursor: Some(cursor),
+                prefix: None,
+                result: None,
+                buffered: None,
+                origin_replaced: false,
+            };
+            prepared.install_entity(entity.clone());
+            return Ok((prepared, Some(entity)));
+        }
+        if transaction.push(&bytes[..count]).is_err() {
+            return Ok((
+                PreparedBody {
+                    framing,
+                    cursor: Some(cursor),
+                    prefix: Some(transaction.into_raw()),
+                    result: None,
+                    buffered: None,
+                    origin_replaced: false,
+                },
+                None,
+            ));
+        }
     }
 }
 
@@ -242,15 +473,23 @@ async fn probe<R: AsyncBufRead + Unpin>(
                 cursor: Some(cursor),
                 prefix: None,
                 result: Some(result),
+                buffered: None,
+                origin_replaced: false,
             });
         }
         let available = transaction.remaining().min(bytes.len());
         if available == 0 {
+            super::diagnostics::body_bypass(
+                super::diagnostics::BodyPoint::Collection,
+                body::Bypass::Size,
+            );
             return Ok(PreparedBody {
                 framing: body,
                 cursor: Some(cursor),
                 prefix: Some(transaction.into_raw()),
                 result: None,
+                buffered: None,
+                origin_replaced: false,
             });
         }
         let count = cursor
@@ -263,6 +502,8 @@ async fn probe<R: AsyncBufRead + Unpin>(
                 cursor: Some(cursor),
                 prefix: None,
                 result: Some(result),
+                buffered: None,
+                origin_replaced: false,
             });
         }
         if transaction.push(&bytes[..count]).is_err() {
@@ -271,6 +512,8 @@ async fn probe<R: AsyncBufRead + Unpin>(
                 cursor: Some(cursor),
                 prefix: Some(transaction.into_raw()),
                 result: None,
+                buffered: None,
+                origin_replaced: false,
             });
         }
     }
@@ -367,6 +610,50 @@ impl Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn collected_cookie_trailer_cannot_cross_a_later_script_origin_change() {
+        let budget = body::Budget::default();
+        let original = Url::parse("http://a.example/").unwrap();
+        let meta = OriginalRequestMeta::new("POST", &vec![]);
+        let wire = WireBodyMeta::new(&vec![], &meta, Phase::Request, None, None, false);
+        let transaction =
+            Transaction::begin_shared(&budget, &[], &original, Phase::Request, &wire, true)
+                .unwrap();
+        let mut reader = b"3\r\nold\r\n0\r\nCookie: old-secret\r\n\r\n".as_slice();
+        let mut fields = vec![];
+        let (prepared, entity) = prepare_shared(
+            &mut reader,
+            Body::Chunked,
+            &HashSet::new(),
+            Duration::from_secs(1),
+            Some(transaction),
+            &mut fields,
+        )
+        .await
+        .unwrap();
+        assert!(
+            entity
+                .as_ref()
+                .is_some_and(|entity| entity.logical().is_none())
+        );
+        let mut final_blocklist = HashSet::new();
+        final_blocklist.insert("cookie".into());
+        let mut sent = Vec::new();
+        let error = prepared
+            .transfer(
+                &mut reader,
+                &mut sent,
+                Duration::from_secs(1),
+                &final_blocklist,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(sent.is_empty());
+        drop(entity);
+        assert_eq!(budget.used(), 0);
+    }
     fn rules() -> Vec<super::super::rules::Rule> {
         let value: serde_yaml_ng::Value =
             serde_yaml_ng::from_str("{url: '.', action: response-body-set, value: changed}")

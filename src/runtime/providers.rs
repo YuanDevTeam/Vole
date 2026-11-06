@@ -677,6 +677,28 @@ impl RuntimeResources for ProviderRuntime {
 #[async_trait]
 impl Dispatcher for ProviderRuntime {
     #[cfg(feature = "inbound-http")]
+    async fn prepare_http_tcp(
+        &self,
+        session: StreamSession,
+    ) -> Result<Option<Box<dyn crate::dispatch::HttpTcpPlan>>, DispatchError> {
+        if self.cancellation.is_cancelled() {
+            return Err(DispatchError::NotAllowed);
+        }
+        let generation = self.current.load_full();
+        let inner = generation.dispatcher.prepare_http_tcp(session).await?;
+        Ok(inner.map(|inner| {
+            let key = inner
+                .reuse_key()
+                .cloned()
+                .map(|k| k.with_generation(generation.clone()));
+            Box::new(GenerationHttpTcpPlan {
+                inner,
+                generation,
+                key,
+            }) as Box<dyn crate::dispatch::HttpTcpPlan>
+        }))
+    }
+    #[cfg(feature = "inbound-http")]
     fn http_context(&self) -> Option<crate::http_processing::HttpContext> {
         if self.cancellation.is_cancelled() {
             return None;
@@ -746,6 +768,25 @@ struct PinnedDispatcher {
 }
 #[async_trait]
 impl Dispatcher for PinnedDispatcher {
+    #[cfg(feature = "inbound-http")]
+    async fn prepare_http_tcp(
+        &self,
+        session: StreamSession,
+    ) -> Result<Option<Box<dyn crate::dispatch::HttpTcpPlan>>, DispatchError> {
+        let generation = self.generation.clone();
+        let inner = self.dispatcher.prepare_http_tcp(session).await?;
+        Ok(inner.map(|inner| {
+            let key = inner
+                .reuse_key()
+                .cloned()
+                .map(|k| k.with_generation(generation.clone()));
+            Box::new(GenerationHttpTcpPlan {
+                inner,
+                generation,
+                key,
+            }) as Box<dyn crate::dispatch::HttpTcpPlan>
+        }))
+    }
     fn supports_udp(&self) -> bool {
         self.dispatcher.supports_udp()
     }
@@ -776,6 +817,30 @@ impl Dispatcher for PinnedDispatcher {
         }))
     }
 }
+#[cfg(feature = "inbound-http")]
+struct GenerationHttpTcpPlan {
+    inner: Box<dyn crate::dispatch::HttpTcpPlan>,
+    generation: Arc<Generation>,
+    key: Option<crate::dispatch::HttpTcpReuseKey>,
+}
+#[cfg(feature = "inbound-http")]
+#[async_trait]
+impl crate::dispatch::HttpTcpPlan for GenerationHttpTcpPlan {
+    fn reuse_key(&self) -> Option<&crate::dispatch::HttpTcpReuseKey> {
+        self.key.as_ref()
+    }
+    async fn connect(self: Box<Self>) -> Result<BoxStream, DispatchError> {
+        let Self {
+            inner, generation, ..
+        } = *self;
+        let io = inner.connect().await?;
+        Ok(Box::new(GenerationStream {
+            io,
+            _generation: generation,
+        }))
+    }
+}
+
 struct GenerationStream {
     io: BoxStream,
     _generation: Arc<Generation>,

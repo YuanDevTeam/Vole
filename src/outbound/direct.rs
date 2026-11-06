@@ -33,6 +33,10 @@ impl DirectOutbound {
 
 #[async_trait]
 impl Dispatcher for DirectOutbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        self.dialer.permits_static_http_reuse() && !self.dialer.http_reuse_cancelled()
+    }
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         OutboundConnector::connect_stream(self, session, &EstablishContext::default())
             .await

@@ -328,17 +328,24 @@ TUIC ClientHello 使用 `tuic_disable_sni_changes_real_quic_hello_without_changi
 ## HTTP 处理与 Invoke
 
 `http_processing::` 使用合成规则、临时文件、内存 dispatcher 和 duplex，不创建宿主监听器。
-规则入口采用 `http-ports`、`mitm`、`rewrite-providers`、`rewrite` 四个顶层字段，
+规则入口采用 `http-ports`、`mitm`、`rewrite-providers`、`rewrite`、`http-scripts` 五个顶层字段，
 覆盖严格类型与数值、URL 捕获与替换、请求／响应头、文本与 JSON Patch、压缩、正文预算及整阶段回退。
 provider 回归覆盖启用引用的有序展开、关闭引用零 I/O、来源身份、实际 payload 快照、
 失败保留、缓存原子发布与取消。规则与私密 CA 的完整合同见 [HTTP 处理](../docs/http-processing.md)。
 
-H1/H2 内存对端覆盖共享 TUN/mixed/CONNECT 适配、预读、最终目标单次选路、
+H1/H2 内存对端覆盖共享 TUN/mixed HTTP/SOCKS5/CONNECT 适配、预读、最终目标单次选路、
 原始 URL 选择、跨 origin 凭据隔离、Expect 早响应、流式背压、半关闭、截断拒绝与取消。
 选择性 TLS 同时检查 CA/私钥匹配、叶证书 AKI、证书缓存计费与逐 authority 授权。
 未命中正文规则时不收集完整正文；命中后只在有界工作区完成处理，失败恢复原始阶段内容。
 
 `invoke::http::` 检查私密输入在 JSON Value 分配前的准入与 `testHttp` 离线演算。
+脚本的纯静态语法/配置检查位于 `http_processing::scripts::frontend::tests::` 与
+`http_processing::config::tests::`；Apple 实际 JSC 求值、安全预算与取消位于
+`http_processing::scripts::tests::` 和 frontend 的 Apple prelude 定向回归。
+`http_processing::script_message::tests::` 检查候选原子性、原始 URL、凭据、headers/状态类别和共享正文 owner；
+`http_processing::tests::script_h1_tests::` 与 `http_processing::h2_tests::h2_script`
+通过内存双端和实际 JSC 验证共存、只脚本本地响应、终止/回退及早响应，不创建宿主原站。
+这些检查不替代真实 NE fd、设备业务、完整进程内存或吞吐验收。
 离线演算不下载、不读 provider、不生成证书；没有实际来源时报告未准备，
 没有方向样本时仅报告规则被选中，不声称正文已验证。重写总开关关闭仍可演算启用规则，
 真实 HTTPS 授权与 CA 条件单独判断。
@@ -375,6 +382,12 @@ Windows 平台另编译 `snapshot_identity_and_readback_include_the_http_addendu
 
 HTTP/1 早响应与空正文 Upgrade 的定向内存回归：`inbound::http::server::early_final_memory_tests::`；不运行包含宿主 socket 的整个入站测试模块。
 上传完成后的响应等待、静默上限与首字节后绝对读头期限：`inbound::http::server::response_deadline_memory_tests::`；使用 paused Tokio clock 和内存 duplex。
+
+统一入口的纯内存回归：`http_processing::tests::ingress_memory_tests::` 检查普通 HTTP
+非处理端口仍完整转发、固定代际、同下游退出处理路径时旧上游退役，以及普通 HTTP/CONNECT
+共用 force/skip/端口/目标覆盖策略。
+`inbound::socks5::server::http_processing_memory_tests::` 使用真实 SOCKS5 握手和 duplex
+验证独立 HTTP/MITM 接线、透明回放、入口身份、原生/JS 与取消；不运行包含 socket 的整个入站模块。
 
 这些回归不证明真实 TUN 互通、进程 RSS、吞吐、设备信任安装、系统 VPN 或平台真机行为；
 对应验收分别由容器夹具、平台构建和设备测试完成。

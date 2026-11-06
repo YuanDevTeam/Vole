@@ -169,10 +169,3 @@ impl Body for Upload {
         hint
     }
 }
-pub(super) async fn download(
-    body: h2_body::Source,
-    target: h2::SendStream<Bytes>,
-    expected: Option<u64>,
-) -> io::Result<()> {
-    h2_body::relay(body, target, expected, false).await
-}
