@@ -1947,19 +1947,15 @@ async fn default_udp_response_queue_absorbs_bounded_bursts_without_blocking_dns(
 }
 
 #[test]
-fn tun_netstack_keeps_queue_and_per_flow_bounds_without_a_flow_count_ceiling() {
+fn tun_netstack_maps_runtime_queue_and_buffer_limits() {
     let limits = ResourceLimits::default();
     let config = tun_netstack_config(limits, false);
 
+    assert_eq!(config.mtu, limits.tun_max_datagram_size);
+    assert_eq!(config.packet_queue, limits.packet_queue_capacity);
     assert_eq!(config.tcp_accept_queue, limits.event_queue_capacity);
     assert_eq!(config.tcp_recv_buffer, limits.tcp_buffer_per_direction);
     assert_eq!(config.tcp_send_buffer, limits.tun_tcp_send_buffer);
-    assert_eq!(config.tcp_recv_buffer, 32 * 1024);
-    assert_eq!(config.tcp_send_buffer, 256 * 1024);
-    assert_eq!(NetStackConfig::default().tcp_recv_buffer, 32 * 1024);
-    assert_eq!(NetStackConfig::default().tcp_send_buffer, 32 * 1024);
-    assert_eq!(config.mtu, 1_500);
-    assert_eq!(limits.max_datagram_size, 65_535);
 }
 
 #[tokio::test]

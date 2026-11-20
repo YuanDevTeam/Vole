@@ -368,10 +368,7 @@ pub(crate) fn evaluation_finished(
     ticks: usize,
     succeeded: bool,
 ) {
-    #[cfg(feature = "http-diagnostics")]
     enabled::STATS.evaluation_finished(stages, seen, overall, ticks, succeeded);
-    #[cfg(not(feature = "http-diagnostics"))]
-    let _ = (stages, seen, overall, ticks, succeeded);
 }
 
 /// Diagnostic-build-only, process-lifetime counters. No URL, script identity,
@@ -659,6 +656,7 @@ mod enabled {
         pub(super) fn body_bypass(&self, point: BodyPoint, reason: Bypass) {
             add(&self.bypasses[point as usize][reason_index(reason)], 1);
         }
+        #[cfg(any(test, target_vendor = "apple"))]
         pub(super) fn evaluation_finished(
             &self,
             stages: [u128; 6],
