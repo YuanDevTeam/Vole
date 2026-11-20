@@ -209,11 +209,11 @@ async fn completed_post_h2_upload_error_after_final_headers_preserves_reply_and_
             let first_io = origins.pop_front().ok_or_else(failed)?;
             let open_count = &opens;
             phase.store(20, Ordering::Release);
-            let lease = match sessions.acquire(identity(), Instant::now()+SETUP, move || async move {
+            let (lease, sender) = match sessions.acquire(identity(), Instant::now()+SETUP, move || async move {
                 open_count.fetch_add(1, Ordering::AcqRel);
                 Ok((first_io, Some(b"h2".to_vec())))
             }).await? {
-                h2_reuse::Acquired::Shared(lease)=>lease,
+                h2_reuse::Acquired::Shared { lease, sender }=>(lease, sender),
                 _=>return Err(failed()),
             };
             phase.store(21, Ordering::Release);
@@ -249,7 +249,7 @@ async fn completed_post_h2_upload_error_after_final_headers_preserves_reply_and_
             let target = Target { original:url.clone(), url:url.clone(), session:session(), logical_destination:Destination::domain("a.test",443).map_err(error)?, strip_origin_credentials:false };
             let metadata = MessageMeta { original:OriginalRequestMeta::new("POST", &vec![]), length:Some(8), asterisk:false, script:None };
             let request = Request::builder().method("POST").uri(url.as_str()).header("content-length",8).body(source).map_err(error)?;
-            let exchange = UPLOAD_ERROR_WITNESS.scope(witness.clone(), context.h2_exchange(UpstreamSender::Shared(&lease), request, &response, target, metadata));
+            let exchange = UPLOAD_ERROR_WITNESS.scope(witness.clone(), context.h2_exchange(UpstreamSender::Shared { lease: &lease, sender }, request, &response, target, metadata));
             phase.store(40, Ordering::Release);
             let observe = async {
                 phase.store(41, Ordering::Release);
@@ -475,13 +475,13 @@ async fn completed_post_h2_dropped_exchange_retires_admission_without_cancelling
                 let io = origins.pop_front();
                 async move { Ok((io.ok_or_else(failed)?,Some(b"h2".to_vec()))) }
             }).await?;
-            let h2_reuse::Acquired::Shared(first_lease) = first else {return Err(failed());};
+            let h2_reuse::Acquired::Shared { lease: first_lease, sender: first_sender } = first else {return Err(failed());};
             let sibling = sessions.acquire(identity(),Instant::now()+SETUP,|| {
                 opens.fetch_add(1,Ordering::AcqRel);
                 let io = origins.pop_front();
                 async move { Ok((io.ok_or_else(failed)?,Some(b"h2".to_vec()))) }
             }).await?;
-            let h2_reuse::Acquired::Shared(sibling_lease) = sibling else {return Err(failed());};
+            let h2_reuse::Acquired::Shared { lease: sibling_lease, sender: sibling_sender } = sibling else {return Err(failed());};
             if opens.load(Ordering::Acquire)!=1 {return Err(io::Error::other("sibling did not acquire the same initial physical owner"));}
 
             let (client,server) = tokio::io::duplex(8192);
@@ -509,8 +509,14 @@ async fn completed_post_h2_dropped_exchange_retires_admission_without_cancelling
             let context = HttpContext::new(policy,Arc::new(UnusedDispatcher),SecurityContext::default());
             let first_request = Request::builder().method("POST").uri("https://a.test/drop").header("content-length",8).body(h2_body::Source::h2(first_request.into_body())).map_err(error)?;
             let sibling_request = Request::builder().uri("https://a.test/sibling").body(h2_body::Source::h2(sibling_request.into_body())).map_err(error)?;
-            let mut first_exchange = Box::pin(context.h2_exchange(UpstreamSender::Shared(&first_lease),first_request,&first_slot,drop_target("drop")?,drop_metadata("POST",Some(8))));
-            let mut sibling_exchange = Box::pin(context.h2_exchange(UpstreamSender::Shared(&sibling_lease),sibling_request,&sibling_slot,drop_target("sibling")?,drop_metadata("GET",None)));
+            let mut first_exchange = Box::pin(context.h2_exchange(
+                UpstreamSender::Shared { lease: &first_lease, sender: first_sender },
+                first_request, &first_slot, drop_target("drop")?, drop_metadata("POST",Some(8))
+            ));
+            let mut sibling_exchange = Box::pin(context.h2_exchange(
+                UpstreamSender::Shared { lease: &sibling_lease, sender: sibling_sender },
+                sibling_request, &sibling_slot, drop_target("sibling")?, drop_metadata("GET",None)
+            ));
             phase.store(20,Ordering::Release);
             tokio::select! {biased;
                 _=&mut first_exchange=>return Err(io::Error::other("first exchange completed before Drop")),

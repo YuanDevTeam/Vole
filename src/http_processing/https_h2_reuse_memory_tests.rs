@@ -52,6 +52,13 @@ enum PostReply {
     Wait,
     FailSecond,
 }
+#[derive(Default)]
+struct GoAwayProbe {
+    observed: CancellationToken,
+    release_response: CancellationToken,
+    requests: Mutex<Vec<(usize, String)>>,
+}
+
 #[derive(Clone)]
 struct Origin(Arc<Inner>);
 struct Inner {
@@ -70,6 +77,7 @@ struct Inner {
     uploads: Arc<Mutex<Vec<Vec<u8>>>>,
     post_heads: Arc<AtomicUsize>,
     post_started: Arc<tokio::sync::Notify>,
+    go_away: Option<Arc<GoAwayProbe>>,
     #[cfg(feature = "outbound-shadowsocks")]
     obfs: Mutex<Option<Arc<crate::outbound::MemoryObfsFactory>>>,
     #[cfg(feature = "outbound-vmess")]
@@ -188,7 +196,7 @@ fn plain_memory_pair(live: &Arc<AtomicUsize>) -> (BoxStream, AcceptedMemoryPeer)
 
 impl Origin {
     async fn open(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
-        self.0.opens.fetch_add(1, Ordering::AcqRel);
+        let connection_index = self.0.opens.fetch_add(1, Ordering::AcqRel) + 1;
         let name = match &session.destination {
             Destination::Domain { host, .. } => host.clone(),
             _ => session.sniffed_domain.clone().unwrap(),
@@ -246,6 +254,7 @@ impl Origin {
         let uploads = self.0.uploads.clone();
         let post_heads = self.0.post_heads.clone();
         let post_started = self.0.post_started.clone();
+        let go_away = self.0.go_away.clone();
         let task = tokio::spawn(async move {
             let peer = peer
                 .await
@@ -267,13 +276,33 @@ impl Origin {
                     .unwrap();
                 let mut exchanges = FuturesUnordered::new();
                 let mut sequence = 0;
+                let mut go_away_ping: Option<h2::PingPong> = None;
                 loop {
                     tokio::select! {biased;
                         _=exchanges.next(),if !exchanges.is_empty()=>{},
+                        pong=std::future::poll_fn(|cx| {
+                            go_away_ping.as_mut().unwrap().poll_pong(cx)
+                        }),if go_away_ping.is_some()=>{
+                            pong.expect("upstream PING after GOAWAY acknowledged");
+                            go_away_ping = None;
+                            go_away.as_ref().unwrap().observed.cancel();
+                        },
                         accepted=connection.accept()=>{
                             let Some(Ok((request, mut response))) = accepted else { break; };
                             sequence += 1;
                             assert_eq!(request.headers()["x-request"], "native");
+                            if let Some(probe) = &go_away {
+                                probe.requests.lock().unwrap().push((connection_index, request.uri().path().to_owned()));
+                            }
+                            let held = go_away.clone().filter(|_| connection_index == 1 && sequence == 1);
+                            if held.is_some() {
+                                connection.graceful_shutdown();
+                                // h2 queues its NO_ERROR GOAWAY before sending PING.
+                                // The peer's PONG proves the ordered frame was processed.
+                                let mut ping = connection.ping_pong().unwrap();
+                                ping.send_ping(h2::Ping::opaque()).unwrap();
+                                go_away_ping = Some(ping);
+                            }
                             let uploads = uploads.clone();
                             let post_heads = post_heads.clone();
                             let post_started = post_started.clone();
@@ -312,6 +341,9 @@ impl Origin {
                                     uploads.lock().unwrap().push(bytes);
                                 } else {
                                     assert!(request.body().is_end_stream());
+                                }
+                                if let Some(probe) = held {
+                                    probe.release_response.cancelled().await;
                                 }
                                 let Ok(mut body) = response.send_response(Response::builder().header("content-length", PAYLOAD.len()).header("content-type", "text/plain").body(()).unwrap(), false) else { return; };
                                 let _ = body.send_data(Bytes::from_static(PAYLOAD), true);
@@ -418,6 +450,15 @@ fn fixture(h2: bool, extra: &str) -> (HttpContext, Origin) {
     fixture_post(h2, extra, PostReply::Complete)
 }
 fn fixture_post(h2: bool, extra: &str, post_reply: PostReply) -> (HttpContext, Origin) {
+    fixture_with_probe(h2, extra, post_reply, None)
+}
+
+fn fixture_with_probe(
+    h2: bool,
+    extra: &str,
+    post_reply: PostReply,
+    go_away: Option<Arc<GoAwayProbe>>,
+) -> (HttpContext, Origin) {
     let mut params = rcgen::CertificateParams::default();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
@@ -453,6 +494,7 @@ fn fixture_post(h2: bool, extra: &str, post_reply: PostReply) -> (HttpContext, O
         uploads: Arc::default(),
         post_heads: Arc::default(),
         post_started: Arc::new(tokio::sync::Notify::new()),
+        go_away,
         #[cfg(feature = "outbound-shadowsocks")]
         obfs: Mutex::new(None),
         #[cfg(feature = "outbound-vmess")]
@@ -698,6 +740,67 @@ async fn send_post(sender: h2::client::SendRequest<Bytes>, path: &str) -> Result
         .send_data(Bytes::from_static(b"original"), true)
         .map_err(|_| "POST send body")?;
     post_response(response, false).await
+}
+
+#[tokio::test]
+async fn h2_remote_goaway_moves_unsent_post_to_fresh_origin_without_interrupting_inflight_get() {
+    let probe = Arc::new(GoAwayProbe::default());
+    let (context, origin) = fixture_with_probe(true, "", PostReply::Complete, Some(probe.clone()));
+    let stop = CancellationToken::new();
+    let cancel = stop.clone();
+    let (client, mut server) = tokio::io::duplex(8192);
+    let owner = tokio::spawn(async move { context.serve_h2(&mut server, session(), cancel).await });
+    let mut driver_owner = None;
+    let result = AssertUnwindSafe(timeout(WAIT * 3, async {
+        let (sender, driver) = h2::client::handshake(client)
+            .await
+            .map_err(|error| error.to_string())?;
+        driver_owner = Some(tokio::spawn(driver));
+        let first = reply(sender.clone(), "held");
+        tokio::pin!(first);
+        tokio::select! {
+            () = probe.observed.cancelled() => {},
+            result = &mut first => return Err(format!("first response ended before GOAWAY was acknowledged: {result:?}")),
+        }
+        if origin.0.live.load(Ordering::Acquire) != 2 {
+            return Err("original upstream closed before the replacement request".into());
+        }
+        send_post(sender, "replacement").await?;
+        if origin.0.live.load(Ordering::Acquire) != 4 {
+            return Err("original and replacement upstream were not both live".into());
+        }
+        probe.release_response.cancel();
+        if first.await? != b"from_origin" {
+            return Err("original response bytes differ after GOAWAY".into());
+        }
+        Ok::<_, String>(())
+    }))
+    .catch_unwind()
+    .await;
+    probe.release_response.cancel();
+    stop.cancel();
+    let owner_join = join_owned(owner).await;
+    let driver_join = match driver_owner {
+        Some(driver) => join_owned(driver).await.map(|_| ()),
+        None => Err("downstream driver never started".into()),
+    };
+    let peers_join = origin.join().await;
+    match result {
+        Ok(result) => result.expect("GOAWAY exchange deadline").unwrap(),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+    assert!(matches!(owner_join, Ok(Ok(()))), "{owner_join:?}");
+    assert!(driver_join.is_ok(), "{driver_join:?}");
+    assert!(peers_join.is_ok(), "{peers_join:?}");
+    assert_eq!(origin.0.prepares.load(Ordering::Acquire), 2);
+    assert_eq!(origin.0.opens.load(Ordering::Acquire), 2);
+    assert_eq!(origin.0.accepts.load(Ordering::Acquire), 2);
+    assert_eq!(origin.0.post_heads.load(Ordering::Acquire), 1);
+    assert_eq!(*origin.0.uploads.lock().unwrap(), [b"original".to_vec()]);
+    assert_eq!(
+        *probe.requests.lock().unwrap(),
+        [(1, "/held".to_owned()), (2, "/replacement".to_owned())]
+    );
 }
 
 async fn wait_post_released(origin: &Origin) -> Result<(), String> {

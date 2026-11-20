@@ -38,7 +38,10 @@ const STREAMS: usize = 8;
 const SETUP: Duration = h2_reuse::SETUP;
 enum UpstreamSender<'a> {
     OneShot(h2::client::SendRequest<Bytes>),
-    Shared(&'a h2_reuse::Lease),
+    Shared {
+        lease: &'a h2_reuse::Lease,
+        sender: h2::client::SendRequest<Bytes>,
+    },
 }
 
 // A valid response may finish before its upload, or survive a late upload
@@ -362,10 +365,13 @@ impl HttpContext {
                 })
                 .await?;
             return match acquired {
-                h2_reuse::Acquired::Shared(lease) => {
+                h2_reuse::Acquired::Shared { lease, sender } => {
                     let result = self
                         .h2_exchange(
-                            UpstreamSender::Shared(&lease),
+                            UpstreamSender::Shared {
+                                lease: &lease,
+                                sender,
+                            },
                             request,
                             response,
                             target,
@@ -642,7 +648,7 @@ impl HttpContext {
         metadata: MessageMeta,
     ) -> io::Result<()> {
         let mut shared = match &sender {
-            UpstreamSender::Shared(lease) => Some(SharedExchangeGuard {
+            UpstreamSender::Shared { lease, .. } => Some(SharedExchangeGuard {
                 lease,
                 completed: false,
             }),
@@ -679,7 +685,7 @@ impl HttpContext {
         *outgoing.headers_mut() = headers;
         let mut sender = match sender {
             UpstreamSender::OneShot(sender) => sender.ready().await.map_err(|_| failed())?,
-            UpstreamSender::Shared(lease) => lease.ready().await?,
+            UpstreamSender::Shared { sender, .. } => sender,
         };
         let (mut incoming, uploaded, upload) = h2_body::start_request(
             &mut sender,

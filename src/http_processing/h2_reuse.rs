@@ -132,6 +132,25 @@ struct Slot {
     sender: h2::client::SendRequest<Bytes>,
     state: Arc<State>,
 }
+impl Slot {
+    async fn admit(&self, deadline: Instant) -> io::Result<Option<Acquired>> {
+        let result = match timeout_at(deadline, self.sender.clone().ready()).await {
+            Ok(Ok(sender)) => {
+                return Ok(Some(Acquired::Shared {
+                    lease: Lease::new(&self.state)?,
+                    sender,
+                }));
+            }
+            // The peer can finish existing streams after GOAWAY. Retire this
+            // slot before leasing it and let the caller open a replacement.
+            Ok(Err(error)) if error.is_go_away() && error.is_remote() => Ok(None),
+            Ok(Err(_)) => Err(failed()),
+            Err(_) => Err(io::ErrorKind::TimedOut.into()),
+        };
+        self.state.retire();
+        result
+    }
+}
 impl Drop for Slot {
     fn drop(&mut self) {
         self.state.retire();
@@ -140,32 +159,18 @@ impl Drop for Slot {
 
 /// The lease is held through complete body relay, not merely send_request.
 pub(super) struct Lease {
-    sender: h2::client::SendRequest<Bytes>,
     state: Arc<State>,
-    deadline: Instant,
 }
 impl Lease {
-    fn new(slot: &Slot, deadline: Instant) -> io::Result<Self> {
-        slot.state.leases.fetch_add(1, Ordering::SeqCst);
-        if !slot.state.usable() {
-            slot.state.release_lease();
+    fn new(state: &Arc<State>) -> io::Result<Self> {
+        state.leases.fetch_add(1, Ordering::SeqCst);
+        if !state.usable() {
+            state.release_lease();
             return Err(failed());
         }
         Ok(Self {
-            sender: slot.sender.clone(),
-            state: slot.state.clone(),
-            deadline,
+            state: state.clone(),
         })
-    }
-    pub(super) async fn ready(&self) -> io::Result<h2::client::SendRequest<Bytes>> {
-        let result = match timeout_at(self.deadline, self.sender.clone().ready()).await {
-            Ok(result) => result.map_err(|_| failed()),
-            Err(_) => Err(io::ErrorKind::TimedOut.into()),
-        };
-        if result.is_err() {
-            self.retire();
-        }
-        result
     }
     pub(super) fn retire(&self) {
         self.state.retire();
@@ -177,7 +182,10 @@ impl Drop for Lease {
     }
 }
 pub(super) enum Acquired {
-    Shared(Lease),
+    Shared {
+        lease: Lease,
+        sender: h2::client::SendRequest<Bytes>,
+    },
     H1(BoxStream),
 }
 
@@ -223,8 +231,9 @@ impl Sessions {
         if let Some(current) = slot.as_ref()
             && current.identity.same(&identity)
             && current.state.usable()
+            && let Some(acquired) = current.admit(connect_deadline).await?
         {
-            return Ok(Acquired::Shared(Lease::new(current, connect_deadline)?));
+            return Ok(acquired);
         }
         // Drop the root sender immediately. Existing leases keep their stream
         // driver until they finish; a silent peer cannot retain an empty one.
@@ -265,12 +274,12 @@ impl Sessions {
             sender,
             state,
         };
-        let lease = Lease::new(&current, deadline)?;
+        let acquired = current.admit(deadline).await?.ok_or_else(failed)?;
         *slot = Some(current);
         // Only this initial guard must be disarmed; do not mark the published
         // slot retired. No fallible operation or await separates publication.
         drop(provisional.0.take());
-        Ok(Acquired::Shared(lease))
+        Ok(acquired)
     }
 }
 impl Parent {

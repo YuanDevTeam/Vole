@@ -287,6 +287,7 @@ jobs:
             outbound::http::tests:: outbound::wireguard::tests:: inbound::mixed::tests:: inbound::socks5::association::tests::
             inbound::http::parser::tests:: inbound::http::framing::tests::
             http_processing::h2_frame_validation::
+            h2_remote_goaway_moves_unsent_post_to_fresh_origin_without_interrupting_inflight_get
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
             outbound::trusttunnel:: outbound::mieru:: outbound::masque:: security::masque:: config::masque::

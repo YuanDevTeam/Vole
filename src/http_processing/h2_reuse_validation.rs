@@ -147,8 +147,7 @@ impl Fixture {
     }
 }
 
-async fn read_response(lease: &Lease) -> io::Result<()> {
-    let mut sender = lease.ready().await?;
+async fn read_response(mut sender: h2::client::SendRequest<Bytes>) -> io::Result<()> {
     let (response, _) = sender
         .send_request(
             Request::builder()
@@ -187,27 +186,33 @@ async fn shared_idle_retire() -> io::Result<Value> {
     let mut peer = Box::pin(fixture.peer(2));
     let (sessions, mut parent) = new();
     let operation = async {
-        let Acquired::Shared(first) = sessions
+        let Acquired::Shared {
+            lease: first,
+            sender,
+        } = sessions
             .acquire(identity(), Instant::now() + SETUP, || fixture.open())
             .await?
         else {
             return Err(failed());
         };
-        read_response(&first).await?;
+        read_response(sender).await?;
         let state = first.state.clone();
         drop(first);
         let idle =
             state.leases.load(Ordering::Acquire) == 0 && !state.closed.load(Ordering::Acquire);
         fixture.ping.cancel();
         fixture.pong.cancelled().await;
-        let Acquired::Shared(second) = sessions
+        let Acquired::Shared {
+            lease: second,
+            sender,
+        } = sessions
             .acquire(identity(), Instant::now() + SETUP, || fixture.open())
             .await?
         else {
             return Err(failed());
         };
         let same = Arc::ptr_eq(&state, &second.state);
-        read_response(&second).await?;
+        read_response(sender).await?;
         drop(sessions.slot.lock().await.take());
         let retained = state.retired.load(Ordering::Acquire)
             && !state.closed.load(Ordering::Acquire)
@@ -253,14 +258,13 @@ async fn cancel_active() -> io::Result<Value> {
     let headers = CancellationToken::new();
     let state = StdMutex::new(None::<Arc<State>>);
     let operation = async {
-        let Acquired::Shared(lease) = sessions
+        let Acquired::Shared { lease, mut sender } = sessions
             .acquire(identity(), Instant::now() + SETUP, || fixture.open())
             .await?
         else {
             return Err(failed());
         };
         *state.lock().map_err(io_error)? = Some(lease.state.clone());
-        let mut sender = lease.ready().await?;
         let (response, _) = sender
             .send_request(
                 Request::builder()
