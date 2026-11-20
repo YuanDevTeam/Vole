@@ -41,7 +41,7 @@ jobs:
           - name: cli-windows-wintun-amd64
             label: Windows amd64
             target: x86_64-pc-windows-msvc
-            runner: windows-2025
+            runner: windows-latest
             platform: windows
             archive: vole-windows-amd64.zip
           - name: cli-windows-wintun-arm64
@@ -50,18 +50,6 @@ jobs:
             runner: windows-11-arm
             platform: windows
             archive: vole-windows-arm64.zip
-          - name: cli-darwin-amd64
-            label: macOS amd64
-            target: x86_64-apple-darwin
-            runner: macos-26-intel
-            platform: darwin
-            archive: vole-darwin-amd64.gz
-          - name: cli-darwin-arm64
-            label: macOS arm64
-            target: aarch64-apple-darwin
-            runner: macos-26
-            platform: darwin
-            archive: vole-darwin-arm64.gz
     steps:
       - uses: actions/checkout@v7
         with:
@@ -75,9 +63,7 @@ jobs:
           python-version: "3.x"
           check-latest: true
           architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-      - uses: astral-sh/setup-uv@v10.3.3
-        with:
-          version: "0.13.6"
+      - uses: astral-sh/setup-uv@v10.4.0
       - name: Linux native dependencies
         if: matrix.platform == 'linux'
         run: |
@@ -146,7 +132,7 @@ jobs:
           - name: ffi-windows-wintun-amd64
             label: Windows amd64 (Wintun)
             platform: windows
-            runner: windows-2025
+            runner: windows-latest
             targets: x86_64-pc-windows-msvc
             target: x86_64-pc-windows-msvc
             backend: wintun
@@ -162,7 +148,7 @@ jobs:
           - name: ffi-windows-uwp-amd64
             label: Windows amd64 (UWP)
             platform: windows
-            runner: windows-2025
+            runner: windows-latest
             targets: x86_64-pc-windows-msvc
             target: x86_64-pc-windows-msvc
             backend: uwp
@@ -189,9 +175,7 @@ jobs:
           python-version: "3.x"
           check-latest: true
           architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-      - uses: astral-sh/setup-uv@v10.3.3
-        with:
-          version: "0.13.6"
+      - uses: astral-sh/setup-uv@v10.4.0
       - name: Locked source
         run: cargo fetch --locked
       - name: Audit the official h2 dependency
@@ -263,80 +247,110 @@ jobs:
           retention-days: 14
 
   apple_build:
-    name: FFI ${{ matrix.label }}
-    runs-on: macos-26
-    timeout-minutes: 90
+    name: Apple ${{ matrix.platform }}
+    runs-on: xcode-27
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - label: iOS
-            target: aarch64-apple-ios
-          - label: iOS simulator
-            target: aarch64-apple-ios-sim
-          - label: macOS arm64
-            target: aarch64-apple-darwin
-          - label: macOS amd64
-            target: x86_64-apple-darwin
-          - label: tvOS
-            target: aarch64-apple-tvos
-          - label: tvOS simulator
-            target: aarch64-apple-tvos-sim
+          - platform: macOS
+            primary: aarch64-apple-darwin
+            secondary: x86_64-apple-darwin
+          - platform: iOS
+            primary: aarch64-apple-ios
+            secondary: aarch64-apple-ios-sim
+          - platform: tvOS
+            primary: aarch64-apple-tvos
+            secondary: aarch64-apple-tvos-sim
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: maxim-lobanov/setup-xcode@v1
+        id: xcode
+        with:
+          xcode-version: latest-stable
+      - name: Verify Rosetta for the macOS amd64 CLI
+        if: matrix.platform == 'macOS'
+        run: /usr/bin/arch -x86_64 /usr/bin/true
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.primary }},${{ matrix.secondary }}
       - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.3.3
-        with:
-          version: "0.13.6"
+          architecture: arm64
+      - uses: astral-sh/setup-uv@v10.4.0
       - name: Cache native Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-ffi-apple-${{ matrix.target }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
+          key: release-apple-${{ matrix.platform }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
           workspaces: ". -> target"
           env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR VOLE BORING AWS_LC LIBCLANG BINDGEN
           cache-bin: "false"
-      - name: Build Apple static library
-        shell: bash
-        env:
-          VOLE_TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          args=(build-apple-target --target "$VOLE_TARGET"
-            --output "dist/apple-targets/$VOLE_TARGET")
-          if [[ -n "$VOLE_RELEASE_TAG" ]]; then args+=(--tag "$VOLE_RELEASE_TAG"); fi
-          uv run --project scripts --locked python -m vole_scripts.release "${args[@]}"
-      - uses: actions/upload-artifact@v7
+      - name: Build and package the macOS arm64 CLI
+        if: matrix.platform == 'macOS'
+        run: >-
+          uv run --project scripts --locked python -m vole_scripts.release build-cli
+          --target ${{ matrix.primary }} --output dist/release/cli-darwin-arm64
+      - name: Build the primary static library
+        run: >-
+          uv run --project scripts --locked python -m vole_scripts.release build-apple-target
+          --target ${{ matrix.primary }} --output dist/apple-targets/${{ matrix.primary }}
+      - name: Build and package the macOS amd64 CLI
+        if: matrix.platform == 'macOS'
+        run: >-
+          uv run --project scripts --locked python -m vole_scripts.release build-cli
+          --target ${{ matrix.secondary }} --output dist/release/cli-darwin-amd64
+      - name: Build the secondary static library
+        run: >-
+          uv run --project scripts --locked python -m vole_scripts.release build-apple-target
+          --target ${{ matrix.secondary }} --output dist/apple-targets/${{ matrix.secondary }}
+      - name: Upload Apple static libraries
+        uses: actions/upload-artifact@v7
         with:
-          name: vole-apple-${{ matrix.target }}-${{ github.sha }}
+          name: vole-apple-${{ matrix.platform }}-${{ github.sha }}
           path: dist/apple-targets
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload macOS arm64 CLI
+        if: matrix.platform == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: vole-release-build-cli-darwin-arm64-${{ github.sha }}
+          path: dist/release/cli-darwin-arm64/vole-darwin-arm64.gz
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload macOS amd64 CLI
+        if: matrix.platform == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: vole-release-build-cli-darwin-amd64-${{ github.sha }}
+          path: dist/release/cli-darwin-amd64/vole-darwin-amd64.gz
           if-no-files-found: error
           retention-days: 14
 
   apple:
     name: FFI Apple
     needs: apple_build
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
       - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.3.3
-        with:
-          version: "0.13.6"
+          architecture: arm64
+      - uses: astral-sh/setup-uv@v10.4.0
       - uses: actions/download-artifact@v8
         with:
           pattern: vole-apple-*-${{ github.sha }}
@@ -367,9 +381,7 @@ jobs:
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.3.3
-        with:
-          version: "0.13.6"
+      - uses: astral-sh/setup-uv@v10.4.0
       - uses: actions/download-artifact@v8
         with:
           pattern: vole-release-build-*-${{ github.sha }}

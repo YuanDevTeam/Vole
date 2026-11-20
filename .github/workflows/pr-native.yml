@@ -17,7 +17,7 @@ defaults:
 jobs:
   macos:
     name: macOS arm64
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 90
     outputs:
       apple-mobile: ${{ steps.scope.outputs['apple-mobile'] }}
@@ -27,6 +27,10 @@ jobs:
         with:
           fetch-depth: 2
           persist-credentials: false
+      - uses: maxim-lobanov/setup-xcode@v1
+        id: xcode
+        with:
+          xcode-version: latest-stable
       - name: Select mobile build targets
         id: scope
         run: |
@@ -63,12 +67,10 @@ jobs:
           python-version: "3.x"
           check-latest: true
           architecture: arm64
-      - uses: astral-sh/setup-uv@v10.3.3
-        with:
-          version: "0.13.6"
+      - uses: astral-sh/setup-uv@v10.4.0
       - uses: Swatinem/rust-cache@v2
         with:
-          key: pr-native-macos-arm64-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
+          key: pr-native-macos-arm64-${{ steps.xcode.outputs.version }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
           workspaces: ". -> target"
           env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR VOLE BORING AWS_LC LIBCLANG BINDGEN
           cache-bin: "false"
@@ -97,9 +99,7 @@ jobs:
           python-version: "3.x"
           check-latest: true
           architecture: arm64
-      - uses: astral-sh/setup-uv@v10.3.3
-        with:
-          version: "0.13.6"
+      - uses: astral-sh/setup-uv@v10.4.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: pr-native-windows-arm64-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
@@ -125,7 +125,7 @@ jobs:
     name: ${{ matrix.name }}
     needs: macos
     if: needs.macos.outputs['apple-mobile'] == 'true'
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -139,6 +139,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - uses: maxim-lobanov/setup-xcode@v1
+        id: xcode
+        with:
+          xcode-version: latest-stable
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -147,12 +151,10 @@ jobs:
           python-version: "3.x"
           check-latest: true
           architecture: arm64
-      - uses: astral-sh/setup-uv@v10.3.3
-        with:
-          version: "0.13.6"
+      - uses: astral-sh/setup-uv@v10.4.0
       - uses: Swatinem/rust-cache@v2
         with:
-          key: pr-native-${{ matrix.target }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
+          key: pr-native-${{ matrix.target }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
           workspaces: ". -> target"
           env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR VOLE BORING AWS_LC LIBCLANG BINDGEN
           cache-bin: "false"
@@ -186,9 +188,7 @@ jobs:
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.3.3
-        with:
-          version: "0.13.6"
+      - uses: astral-sh/setup-uv@v10.4.0
       - name: Install stable Android NDK r30
         run: |
           set -euo pipefail

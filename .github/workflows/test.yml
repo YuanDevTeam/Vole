@@ -37,9 +37,7 @@ jobs:
         with:
           python-version: "3.x"
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.3.3
-        with:
-          version: "0.13.6"
+      - uses: astral-sh/setup-uv@v10.4.0
       - name: Linux native dependencies
         run: |
           sudo apt-get update

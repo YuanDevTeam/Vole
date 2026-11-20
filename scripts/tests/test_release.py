@@ -2,6 +2,7 @@
 
 import gzip
 import os
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -30,17 +31,32 @@ class ReleaseTests(unittest.TestCase):
         return path
 
     def test_cli_packages_a_single_binary(self):
-        for target in builds.CLI_TARGETS:
+        native = [(target, target) for target in builds.CLI_TARGETS]
+        for host, target in [*native, ("aarch64-apple-darwin", "x86_64-apple-darwin")]:
             binary = self.write(
                 "build/vole.exe" if "windows" in target else "build/vole"
             )
             with (
-                self.subTest(target=target),
-                patch.object(builds, "native_target", return_value=target),
+                self.subTest(host=host, target=target),
+                patch.object(builds, "native_target", return_value=host),
                 patch.object(builds, "build_cli", return_value=binary),
-                patch.object(release, "_smoke"),
+                patch.object(release.subprocess, "run") as run,
             ):
                 archive = release.build_cli(target, None, Path("dist/cli"))
+            command = [str(binary)]
+            if host != target:
+                command = ["/usr/bin/arch", "-x86_64", *command]
+            config = run.call_args.kwargs["cwd"] / "config.yaml"
+            self.assertEqual(
+                [call.args[0] for call in run.call_args_list],
+                [
+                    [*command, "-h"],
+                    [*command, "-v"],
+                    [*command, "-t", "-f", str(config)],
+                    [*command, "-t", "-f", "-"],
+                ],
+            )
+            self.assertEqual(run.call_args.kwargs["input"], release.SMOKE_CONFIG)
             if archive.suffix == ".zip":
                 with zipfile.ZipFile(archive) as stream:
                     self.assertEqual(stream.namelist(), ["vole.exe"])
@@ -50,6 +66,43 @@ class ReleaseTests(unittest.TestCase):
                     content = stream.read()
             self.assertEqual(content, binary.read_bytes())
             self.assertEqual(list(archive.parent.iterdir()), [archive])
+
+    def test_cli_rejects_unsupported_cross_architecture(self):
+        for host, target in (
+            ("x86_64-apple-darwin", "aarch64-apple-darwin"),
+            ("aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"),
+            ("aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc"),
+        ):
+            with (
+                self.subTest(host=host, target=target),
+                patch.object(builds, "native_target", return_value=host),
+                patch.object(builds, "build_cli") as build,
+                self.assertRaisesRegex(ValueError, "require the native target"),
+            ):
+                release.build_cli(target, None, Path("dist/cli"))
+            build.assert_not_called()
+
+    def test_cli_tag_uses_workflow_environment_by_default(self):
+        target = "aarch64-apple-darwin"
+        for environment_tag, arguments, expected in (
+            ("", [], None),
+            ("v1.2.3", [], "v1.2.3"),
+            ("v1.2.3", ["--tag", "v1.2.4"], "v1.2.4"),
+        ):
+            with (
+                self.subTest(environment_tag=environment_tag, arguments=arguments),
+                patch.dict(os.environ, {"VOLE_RELEASE_TAG": environment_tag}),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["release", "build-cli", "--target", target, *arguments],
+                ),
+                patch.object(release, "build_cli") as build,
+            ):
+                release.main()
+            build.assert_called_once_with(
+                target, expected, Path("dist/release") / f"cli-{target}"
+            )
 
     def test_ffi_packages_platform_libraries_headers_and_uwp_hosts(self):
         files = {

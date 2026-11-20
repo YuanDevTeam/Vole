@@ -29,8 +29,9 @@ Windows 需先安装本架构的 Python 并加入 `PATH`；为上述 `uv run` �
 | Linux FFI | 原生 GNU 工具链；`dist/linux/<architecture>` 的静态库、动态库和头文件 |
 | Windows FFI | 原生 Visual Studio C++；`dist/windows/<architecture>/<backend>` 的 DLL/import library 和头文件；UWP 另含两个 host 程序 |
 
-Apple 最低版本为 iOS 13、macOS 10.15、tvOS 17；ARM64 iOS 模拟器/macOS 分别至少
-14/11。原生消费者需链接 libc++，module map 已声明。Windows ARM64 还需要 LLVM 与 Ninja。
+Apple 构建的部署目标为 iOS 13、macOS 10.15、tvOS 17。ARM64 iOS 模拟器和 macOS 的部署目标
+分别为 14 和 11。旧系统运行支持需用相应系统版本验证。原生消费者需链接 libc++，module map
+已声明。Windows ARM64 还需要 LLVM 与 Ninja。
 Android 优先使用 `ANDROID_NDK_HOME`，否则在 `ANDROID_HOME/ndk` 中选择 NDK 30 的最新已安装正式版。
 `VOLE_ANDROID_NDK_VERSION` 可指定版本，`VOLE_ANDROID_API` 默认 24。
 `CARGO_TARGET_DIR` 按 Cargo 约定覆盖中间产物目录；其余本地覆盖见 `builds.py`。
@@ -73,14 +74,16 @@ Cargo 包版本完全匹配，全部归档通过校验后发布到 GitHub Releas
 
 [PR workflow](../.github/workflows/test.yml) 运行 Linux Debug 和 Quality，并在 macOS ARM64 和
 Windows ARM64 上构建原生 CLI 和 FFI。iOS、tvOS 和 Android 按相关文件改动触发。
-CI 中的 Python 均由 `actions/setup-python` 安装，选择最新稳定 Python 3；uv 仅使用系统解释器，
-禁止自动下载 Python，不使用脚本安装或特定解释器发行版请求。
+CI 使用最新稳定 Python 3 和 uv。`actions/setup-python` 安装系统解释器，
+`astral-sh/setup-uv` 使用默认版本选择。脚本通过系统解释器运行锁定的项目依赖。
 CLI 构建后执行 `-h/-v/-t` 检查。发布矩阵的 Windows CLI、Wintun FFI、UWP FFI 分别使用独立的
 x64/ARM64 job，每个 job 的 runner、Python、工具链和验证产物必须同架构；
 UWP 的 COM 回归只加载当前 job 构建的 DLL。ARM64 MSVC 使用原生 `vcvarsall arm64`，
 不使用 `amd64_arm64` 交叉工具链。
-Apple FFI 的六个 Rust 目标分别在独立 job 并行编译并缓存；`FFI Apple` 等待全部目标
-成功后合并 macOS 双架构、生成五切片 XCFramework 并打包。
+Apple 发布使用四个 Apple Silicon job。macOS job 按架构相邻编译 CLI 和 FFI，共享依赖缓存，
+其中 x86_64 CLI 通过 Rosetta 执行冒烟检查。iOS 和 tvOS 各自在一个 job 内编译真机与模拟器
+目标。`FFI Apple` 汇总六个静态库，将 macOS 两个架构合并为一个切片，生成并打包五切片
+XCFramework。Apple CI 通过 `setup-xcode` 在 `xcode-27` 镜像上选择最新正式版。
 CI 的依赖来源检查见 [TLS 依赖](../docs/tls-dependencies.md)。
 
 | 归档 | 内容 |
@@ -108,6 +111,7 @@ chmod +x vole
 发布入口为 `python -m vole_scripts.release`，参数见 `--help`；
 `build-apple-target` 构建单个 Apple 静态库，`assemble-apple --inputs <目录> --output <目录>`
 从 `<inputs>/<Rust target>/libvole.a` 汇总六个目标并打包，不重复编译。
-省略 `--tag` 可在本地验证打包。`builds.py` 负责平台编译，`release.py` 负责打包与汇总。
+`--tag` 省略时读取 `VOLE_RELEASE_TAG`。本地可在不设置 tag 的情况下验证打包。
+`builds.py` 负责平台编译，`release.py` 负责打包与汇总。
 
 CLI 参数见 [CLI](../docs/cli.md)，测试命令见 [tests](../tests/README.md)。

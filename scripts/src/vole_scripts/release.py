@@ -129,15 +129,16 @@ def _reset_output(output: Path) -> None:
     output.mkdir(parents=True)
 
 
-def _smoke(binary: Path) -> None:
+def _smoke(binary: Path, *, rosetta: bool = False) -> None:
+    command = ["/usr/bin/arch", "-x86_64", str(binary)] if rosetta else [str(binary)]
     with tempfile.TemporaryDirectory(prefix="vole-cli-smoke-") as directory:
         cwd = Path(directory)
         config = cwd / "config.yaml"
         config.write_text(SMOKE_CONFIG, encoding="utf-8")
         for arguments in (("-h",), ("-v",), ("-t", "-f", str(config))):
-            subprocess.run([str(binary), *arguments], cwd=cwd, check=True, timeout=30)
+            subprocess.run([*command, *arguments], cwd=cwd, check=True, timeout=30)
         subprocess.run(
-            [str(binary), "-t", "-f", "-"],
+            [*command, "-t", "-f", "-"],
             input=SMOKE_CONFIG,
             text=True,
             cwd=cwd,
@@ -150,11 +151,13 @@ def build_cli(target: str, tag: str | None, output: Path) -> Path:
     output = builds.CORE_DIR / output
     _guard_output(output)
     _check_build_settings()
-    if target != builds.native_target():
+    host = builds.native_target()
+    rosetta = (host, target) == ("aarch64-apple-darwin", "x86_64-apple-darwin")
+    if target != host and not rosetta:
         raise ValueError("CLI release builds require the native target")
     release_info(tag)
     binary = builds.build_cli(target)
-    _smoke(binary)
+    _smoke(binary, rosetta=rosetta)
     _reset_output(output)
     archive = output / cli_archive(target)
     if archive.suffix == ".zip":
@@ -378,7 +381,9 @@ def main() -> None:
     assemble.add_argument("--output", type=Path, required=True)
     assemble.add_argument("--notes", type=Path, required=True)
     for command in (cli, ffi, apple_target, assemble):
-        command.add_argument("--tag")
+        command.add_argument(
+            "--tag", default=os.environ.get("VOLE_RELEASE_TAG") or None
+        )
     assemble.add_argument("--repository", default="YuanDevTeam/Vole")
     args = parser.parse_args()
     if args.command == "build-cli":
