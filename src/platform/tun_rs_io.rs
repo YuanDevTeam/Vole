@@ -2,7 +2,10 @@ use std::{fmt, io, os::fd::IntoRawFd};
 
 use tokio::io::unix::AsyncFd;
 
-use crate::{IpVersion, Result, TunFraming, VoleError};
+use crate::{
+    IpVersion, Result, TunFraming, VoleError,
+    http_processing::diagnostics::{Counter, increment},
+};
 
 use super::{TUN_PACKET_BATCH_SIZE, TunFd};
 
@@ -286,17 +289,25 @@ impl TunRsIo {
                     Some(ready) => ready,
                     None => readiness.insert(self.device.writable().await?),
                 };
-                match ready.try_io(|inner| inner.get_ref().send(packet)) {
+                match ready.try_io(|inner| {
+                    increment(Counter::TunWriteBatchSendAttempts);
+                    inner.get_ref().send(packet)
+                }) {
                     #[cfg(target_vendor = "apple")]
                     Ok(Err(error)) if error.raw_os_error() == Some(libc::ENOBUFS) => {
                         // Only this unaccepted packet is retried. Drop the
                         // guard across the same cancellable Darwin backoff
                         // used by the single-packet path.
+                        increment(Counter::TunWriteBatchEnobufsErrors);
                         readiness = None;
+                        increment(Counter::TunWriteBatchSleep1msRequests);
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
                     Ok(result) => break result?,
-                    Err(_would_block) => readiness = None,
+                    Err(_would_block) => {
+                        increment(Counter::TunWriteBatchWouldBlock);
+                        readiness = None;
+                    }
                 }
             };
             if written != packet.len() {
@@ -304,6 +315,7 @@ impl TunRsIo {
                     io::Error::new(io::ErrorKind::WriteZero, "partial TUN packet write").into(),
                 );
             }
+            increment(Counter::TunWriteBatchAcceptedPackets);
             outcomes.push(Ok(version));
         }
         Ok(())
@@ -315,18 +327,26 @@ impl TunRsIo {
         let version = validate_write_packet(packet, self.mtu)?;
         let written = loop {
             let mut ready = self.device.writable().await?;
-            match ready.try_io(|inner| inner.get_ref().send(packet)) {
+            match ready.try_io(|inner| {
+                increment(Counter::TunWriteSingleSendAttempts);
+                inner.get_ref().send(packet)
+            }) {
                 #[cfg(target_vendor = "apple")]
                 Ok(Err(error)) if error.raw_os_error() == Some(libc::ENOBUFS) => {
                     // Darwin can exhaust packet/mbuf space after a cached
                     // writable event. No packet was accepted: retain this one
                     // packet, yield without spinning, and let Stop cancel the
                     // future. Do not resize the host's shared socket buffers.
+                    increment(Counter::TunWriteSingleEnobufsErrors);
                     drop(ready);
+                    increment(Counter::TunWriteSingleSleep1msRequests);
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
                 Ok(result) => break result?,
-                Err(_would_block) => continue,
+                Err(_would_block) => {
+                    increment(Counter::TunWriteSingleWouldBlock);
+                    continue;
+                }
             }
         };
         if written != packet.len() {
@@ -335,6 +355,7 @@ impl TunRsIo {
                 "partial TUN packet write",
             )));
         }
+        increment(Counter::TunWriteSingleAcceptedPackets);
         Ok(version)
     }
 }

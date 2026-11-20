@@ -205,6 +205,85 @@ impl Drop for StringRef {
         }
     }
 }
+/// Initialize trusted platform/prelude state on a joined owner thread. No user
+/// source is evaluated. No prelude, callback, execution TLS, body view or VM
+/// survives this function; the process only retains the joined Ready marker.
+pub(super) fn initialize_platform() -> io::Result<()> {
+    struct PlatformContext(Context);
+    impl Drop for PlatformContext {
+        fn drop(&mut self) {
+            unsafe { JSGlobalContextRelease(self.0) };
+            diagnostics::increment(Counter::PlatformWarmupContextReleased);
+        }
+    }
+    let raw = unsafe { JSGlobalContextCreate(ptr::null()) };
+    if raw.is_null() {
+        return Err(io::ErrorKind::OutOfMemory.into());
+    }
+    diagnostics::increment(Counter::PlatformWarmupContextCreated);
+    let context = PlatformContext(raw);
+    let global = unsafe { JSContextGetGlobalObject(context.0) };
+    if global.is_null() {
+        return Err(io::ErrorKind::OutOfMemory.into());
+    }
+    // These callbacks exist only in this disposable, trusted context. They do
+    // not inspect args, touch EXECUTION, acquire body credit or count business
+    // ticks. Known small constants bound every prelude path exercised below.
+    for name in ["__voleTick", "__voleIsASCII", "__voleReplaceASCIIAll"] {
+        let key = StringRef::new(name)?;
+        let function = unsafe {
+            JSObjectMakeFunctionWithCallback(context.0, key.0, Some(platform_warmup_noop))
+        };
+        if function.is_null() {
+            return Err(io::ErrorKind::OutOfMemory.into());
+        }
+        set(context.0, global, name, function.cast_const())?;
+    }
+    if script(context.0, include_str!("runtime.js"))?.is_null()
+        || script(context.0, PLATFORM_TRUSTED_WARMUP)?.is_null()
+    {
+        return Err(io::ErrorKind::OutOfMemory.into());
+    }
+    drop(context);
+    Ok(())
+}
+
+unsafe extern "C" fn platform_warmup_noop(
+    ctx: Context,
+    _: Object,
+    _: Object,
+    _: usize,
+    _: *const Value,
+    _: *mut Value,
+) -> Value {
+    unsafe { JSValueMakeUndefined(ctx) }
+}
+
+// Fixed trusted code, not generated from configuration or passed user source.
+// No source enumeration, callback arguments, network, metadata/body input or
+// rewrite() invocation is available here. Each helper receives only the small
+// constants below, and both synthetic results die with PlatformContext.
+const PLATFORM_TRUSTED_WARMUP: &str = r#"
+(function () {
+    const input = {body: {data: "warmup:text:text"}};
+    const text = __voleGet(__voleGet(input, "body"), "data");
+    const changed = __voleCall(text, "replaceAll", [":", "_"]);
+    if (changed !== "warmup_text_text") throw new Error("trusted warmup mismatch");
+    __voleFinish(__voleValue({
+        type: "modify",
+        headers: __voleValue([__voleValue({
+            op: "set", name: "x-vole-warmup", values: __voleValue(["ready"])
+        })]),
+        body: __voleValue({kind: "text", data: changed})
+    }));
+    __voleExportTextUnits(changed);
+    const bytes = __voleCall(Uint8Array, "from", [[0, 1, 127, 255]]);
+    __voleFinish(__voleValue({
+        type: "modify", body: __voleValue({kind: "bytes", data: bytes})
+    }));
+})();
+"#;
+
 struct ContextRef(Context);
 impl Drop for ContextRef {
     fn drop(&mut self) {
@@ -213,6 +292,12 @@ impl Drop for ContextRef {
         #[cfg(feature = "http-diagnostics")]
         let started = Instant::now();
         unsafe { JSGlobalContextRelease(self.0) };
+        #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+        VALIDATION_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow_mut().as_mut() {
+                trace.context_released = true;
+            }
+        });
         #[cfg(test)]
         CONTEXT_RELEASE_FOR_TEST.with(|slot| {
             if let Some(observer) = slot.borrow_mut().take() {
@@ -358,6 +443,14 @@ impl Drop for ExecutionGuard {
             #[cfg(test)]
             LAST_TICKS_FOR_TEST.with(|ticks| {
                 ticks.set(s.borrow().as_ref().map(|state| state.ticks));
+            });
+            #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+            VALIDATION_TRACE.with(|slot| {
+                if let (Some(trace), Some(state)) =
+                    (slot.borrow_mut().as_mut(), s.borrow().as_ref())
+                {
+                    trace.ticks = Some(state.ticks);
+                }
             });
             s.replace(None);
         });
@@ -962,6 +1055,14 @@ pub(super) fn evaluate(
         return Err(io::ErrorKind::OutOfMemory.into());
     }
     super::super::diagnostics::context_created();
+    #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+    let _validation_context = ValidationContextProbe(ctx.0);
+    #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+    VALIDATION_TRACE.with(|slot| {
+        if let Some(trace) = slot.borrow_mut().as_mut() {
+            trace.context_created = true;
+        }
+    });
     let failure = StringRef::new("script execution cancelled or budget exceeded")?;
     let failure = Rooted::new(ctx.0, unsafe { JSValueMakeString(ctx.0, failure.0) })?;
     EXECUTION.with(|s| {
@@ -993,6 +1094,12 @@ pub(super) fn evaluate(
     )?;
     execution_phase("prelude");
     script(ctx.0, include_str!("runtime.js"))?;
+    #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+    VALIDATION_TRACE.with(|slot| {
+        if let Some(trace) = slot.borrow_mut().as_mut() {
+            trace.prelude_loaded = true;
+        }
+    });
     execution_phase("program");
     script(ctx.0, &program.code)?;
     execution_phase("input");
@@ -1331,4 +1438,108 @@ fn export_body(
         }
     }
     Ok(())
+}
+
+// Explicit tvOS diagnostic only. Normal evaluations never evaluate this probe.
+#[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ValidationTrace {
+    pub(super) ticks: Option<usize>,
+    pub(super) allocation_work: Option<usize>,
+    pub(super) context_created: bool,
+    pub(super) prelude_loaded: bool,
+    pub(super) context_released: bool,
+}
+#[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+thread_local! {
+    static VALIDATION_TRACE: RefCell<Option<ValidationTrace>> = const { RefCell::new(None) };
+}
+#[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+struct ValidationContextProbe(Context);
+#[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+impl Drop for ValidationContextProbe {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let enabled = VALIDATION_TRACE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|trace| trace.prelude_loaded)
+        });
+        if !enabled {
+            return;
+        }
+        // __voleAllocated is a trusted global lexical, not a global-object
+        // property. No tick/Charge/user source runs; probe errors never replace
+        // the original result. Missing/failed reads remain explicitly None.
+        let work = (|| -> Option<usize> {
+            let value = script(self.0, "__voleAllocated").ok()?;
+            if !unsafe { JSValueIsNumber(self.0, value) } {
+                return None;
+            }
+            let mut exception = ptr::null();
+            let number = unsafe { JSValueToNumber(self.0, value, &mut exception) };
+            if !exception.is_null()
+                || !number.is_finite()
+                || number.fract() != 0.0
+                || !(0.0..=2097152.0).contains(&number)
+            {
+                return None;
+            }
+            Some(number as usize)
+        })();
+        VALIDATION_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow_mut().as_mut() {
+                trace.allocation_work = work;
+            }
+        });
+    }
+}
+#[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+pub(super) fn evaluate_for_validation(
+    program: &CompiledSource,
+    metadata: &serde_json::Value,
+    input: Option<&[u8]>,
+    output: &mut BudgetedBytes,
+    bridge: Option<&Reservation>,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> (io::Result<serde_json::Value>, ValidationTrace) {
+    struct Capture;
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            VALIDATION_TRACE.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    let occupied = VALIDATION_TRACE.with(|slot| {
+        let occupied = slot.borrow().is_some();
+        if !occupied {
+            slot.replace(Some(ValidationTrace::default()));
+        }
+        occupied
+    });
+    if occupied {
+        return (
+            Err(io::ErrorKind::WouldBlock.into()),
+            ValidationTrace::default(),
+        );
+    }
+    let _capture = Capture;
+    let result = evaluate(
+        program,
+        metadata,
+        input,
+        output,
+        bridge,
+        cancellation,
+        deadline,
+    );
+    let trace = VALIDATION_TRACE
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_default();
+    (result, trace)
 }

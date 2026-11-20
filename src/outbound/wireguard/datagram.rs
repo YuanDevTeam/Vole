@@ -48,6 +48,13 @@ pub(super) struct Slot {
     _observation: observation::Guard,
 }
 impl Registry {
+    #[cfg(test)]
+    pub(super) fn memory_open(
+        self: &Arc<Self>,
+        maximum: u16,
+    ) -> Result<(Arc<Slot>, mpsc::Receiver<Datagram>), DispatchError> {
+        self.open(maximum)
+    }
     fn open(
         self: &Arc<Self>,
         maximum: u16,

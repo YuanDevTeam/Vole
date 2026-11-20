@@ -49,8 +49,8 @@ default = [
     "shadow-tls-v3",
     "sing-mux",
 ]
-inbound-http = ["dep:rcgen", "rcgen/x509-parser", "dep:rsa", "dep:tokio-tungstenite", "dep:hyper", "dep:hyper-util", "dep:x509-parser", "dep:oxc_allocator", "dep:oxc_ast", "dep:oxc_parser", "dep:oxc_span", "tokio/rt-multi-thread"]
-http-diagnostics = ["inbound-http"]
+inbound-http = ["dep:memmap2", "dep:rcgen", "rcgen/x509-parser", "dep:rsa", "dep:tokio-tungstenite", "dep:hyper", "dep:hyper-util", "dep:x509-parser", "dep:oxc_allocator", "dep:oxc_ast", "dep:oxc_parser", "dep:oxc_span", "tokio/rt-multi-thread"]
+http-diagnostics = ["inbound-http", "vole-netstack?/diagnostics"]
 inbound-socks5 = ["dep:rcgen", "dep:rsa", "dep:ring", "dep:tokio-tungstenite"]
 outbound-anytls = ["dep:md-5", "stream-security", "ech"]
 outbound-socks5 = []
@@ -196,6 +196,8 @@ tokio-tfo = "=0.4.3"
 tun-rs = { version = "=2.8.16", default-features = false, features = ["address-management"] }
 
 [target.'cfg(unix)'.dependencies]
+# Safe anonymous backing for selected large, fixed-bound byte outputs.
+memmap2 = { version = "=0.9.12", optional = true }
 # Keep one Cargo dependency name across target tables. Unix compiles this small
 # adapter dependency; platform I/O remains gated by the tun feature.
 tun-rs = { version = "=2.8.16", default-features = false }

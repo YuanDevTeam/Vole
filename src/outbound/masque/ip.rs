@@ -86,6 +86,13 @@ impl Engine {
             NetStackConfig {
                 mtu,
                 packet_queue: 32,
+                tcp_recv_buffer: if config.network == MasqueNetwork::H2 {
+                    96 * 1024
+                } else {
+                    128 * 1024
+                },
+                map_tcp_recv_buffer: cfg!(target_os = "macos")
+                    && config.network == MasqueNetwork::Quic,
                 tcp_send_buffer: if config.network == MasqueNetwork::H2 {
                     64 * 1024
                 } else {
@@ -295,7 +302,14 @@ async fn run(
         let request = request(&config.uri)?;
         let mut tunnel = pool
             .open_ip_connect(request, context.deadline(), move || async move {
-                factory.connect(session, &setup).await
+                #[cfg(target_os = "macos")]
+                {
+                    factory.connect_ip(session, &setup).await
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    factory.connect(session, &setup).await
+                }
             })
             .await?;
         tunnel.capsules.write_all(&routes()?).await?;

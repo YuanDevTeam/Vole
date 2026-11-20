@@ -45,6 +45,17 @@ impl Client {
         Handshake::start(&self.settings, self.cache.clone(), self.suite)
     }
 
+    #[cfg(feature = "inbound-http")]
+    pub(crate) fn permits_http_tcp_reuse(&self) -> bool {
+        !self.cache.cancellation.is_cancelled()
+            && matches!(
+                self.settings.appearance,
+                config::Appearance::Native
+                    | config::Appearance::XorPublic
+                    | config::Appearance::Random
+            )
+    }
+
     /// Exercise the non-AES hardware branch against an independent peer.
     /// Never compiled into production, and never a public YAML cipher option.
     #[cfg(feature = "interop-test")]

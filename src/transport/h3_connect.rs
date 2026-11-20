@@ -6,7 +6,7 @@ use crate::{
     transport::{quic, quiche_h3},
 };
 use bytes::{Buf, Bytes};
-use futures_util::task::AtomicWaker;
+use futures_util::task::{ArcWake, AtomicWaker, waker_ref};
 use std::{
     future::Future,
     io,
@@ -700,6 +700,12 @@ struct Close {
     writer: AtomicWaker,
     cancel: CancellationToken,
 }
+impl ArcWake for Close {
+    fn wake_by_ref(this: &Arc<Self>) {
+        this.reader.wake();
+        this.writer.wake();
+    }
+}
 impl Close {
     fn stop(&self, failed: bool) {
         if failed {
@@ -748,14 +754,21 @@ impl Stream {
         self.close.writer.register(cx.waker());
         self.progress(cx)
     }
-    fn progress(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn progress(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.stopped() {
             return Poll::Ready(Err(closed()));
         }
         if let Some(pending) = &mut self.pending {
-            let (send, result) = ready!(pending.as_mut().poll(cx));
+            // Both halves can advance this one operation. Native write readiness
+            // must retain both callers even when the reader stops polling it.
+            let wake = waker_ref(&self.close);
+            let mut context = Context::from_waker(&wake);
+            let (send, result) = ready!(pending.as_mut().poll(&mut context));
             self.pending = None;
             self.send = Some(send);
+            // A reader can finish the operation without another native wake.
+            // Re-poll the waiting writer even when both halves share a task.
+            self.close.writer.wake();
             if result.is_err() {
                 self.close.stop(true);
             }
@@ -907,6 +920,8 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         sync::mpsc,
     };
+
+    include!("h3_connect_write_waker_memory_tests.rs");
 
     #[cfg(feature = "outbound-masque")]
     #[tokio::test(start_paused = true)]
@@ -1159,7 +1174,14 @@ mod tests {
                                 _=>break,
                             }
                         };
-                        let (request,mut stream)=request.resolve_request().await.unwrap();
+                        let (request,mut stream)=match request.resolve_request().await {
+                            Ok(request)=>request,
+                            // A cancelled client may reset before headers resolve.
+                            // Keep the memory peer alive to join its native owner.
+                            Err(h3::error::StreamError::RemoteTerminate {code})
+                                if code==h3::error::Code::H3_REQUEST_CANCELLED=>continue,
+                            Err(error)=>panic!("memory peer request resolution failed: {error:?}"),
+                        };
                         assert_eq!(request.method(),http::Method::CONNECT);
                         assert!(request.uri().scheme().is_none());
                         assert!(request.uri().path_and_query().is_none());

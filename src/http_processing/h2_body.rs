@@ -69,6 +69,14 @@ impl Source {
             pending_credit: 0,
         }
     }
+    fn can_end_request_on_headers(&self, expected: Option<u64>) -> bool {
+        // No frame/trailer remains, no receive-credit release can still fail,
+        // and the same Length::finish check as relay already succeeds.
+        expected.is_none_or(|length| length == 0)
+            && self.credit == 0
+            && self.pending_credit == 0
+            && self.is_end_stream()
+    }
     fn release(&mut self) -> io::Result<()> {
         let credit = std::mem::take(&mut self.credit);
         if credit != 0
@@ -413,9 +421,89 @@ pub(super) async fn relay(
     finish(&mut target, None, strip_credentials)
 }
 
+struct PendingUpload {
+    source: Source,
+    target: h2::SendStream<Bytes>,
+    expected: Option<u64>,
+    strip_credentials: bool,
+    finished: tokio::sync::oneshot::Sender<()>,
+}
+
+pub(super) struct RequestUpload(Option<PendingUpload>);
+impl RequestUpload {
+    /// True only when start_request already committed END_STREAM in HEADERS.
+    pub(super) fn ended_in_headers(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub(super) async fn run(self) -> io::Result<()> {
+        let Some(upload) = self.0 else {
+            return Ok(());
+        };
+        let result = relay(
+            upload.source,
+            upload.target,
+            upload.expected,
+            upload.strip_credentials,
+        )
+        .await;
+        if result.is_ok() {
+            let _ = upload.finished.send(());
+        }
+        result
+    }
+}
+
+/// Shared by both one-shot and leased upstream H2 exchanges. Only an already
+/// ended source may finish in HEADERS; all other uploads keep the old relay.
+pub(super) fn start_request(
+    sender: &mut h2::client::SendRequest<Bytes>,
+    request: http::Request<()>,
+    source: Source,
+    expected: Option<u64>,
+    strip_credentials: bool,
+) -> io::Result<(
+    h2::client::ResponseFuture,
+    tokio::sync::oneshot::Receiver<()>,
+    RequestUpload,
+)> {
+    let end_stream = source.can_end_request_on_headers(expected);
+    let (response, target) = sender.send_request(request, end_stream).map_err(|_| {
+        io::Error::new(io::ErrorKind::ConnectionAborted, "HTTP proxy stream failed")
+    })?;
+    let (finished, uploaded) = tokio::sync::oneshot::channel();
+    let pending = if end_stream {
+        drop(source);
+        drop(target);
+        // HEADERS already closed the upload. Start the unchanged response-head
+        // idle gate now, without waiting for an empty relay future to be polled.
+        let _ = finished.send(());
+        None
+    } else {
+        Some(PendingUpload {
+            source,
+            target,
+            expected,
+            strip_credentials,
+            finished,
+        })
+    };
+    Ok((response, uploaded, RequestUpload(pending)))
+}
+
+#[cfg(any(test, all(target_os = "tvos", feature = "http-diagnostics")))]
+#[path = "h2_request_upload_validation.rs"]
+pub(super) mod request_upload_validation;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(unix, feature = "inbound-http"))]
+    #[forbid(unsafe_code)]
+    mod shared_collector_mapping_tests {
+        include!("shared_collector_h2_memory_tests.rs");
+    }
     use crate::http_processing::{
         body::{Budget, MAX_BODY, OriginalRequestMeta, WireBodyMeta},
         rules::{Phase, RawRule, Rule},

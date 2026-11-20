@@ -19,6 +19,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 const PAYLOAD: usize = 96 * 1024;
 
+#[path = "h2_receive_credit_memory_tests.rs"]
+mod receive_credit_memory_tests;
+
 #[cfg(target_vendor = "apple")]
 async fn script_memory_response(
     context: HttpContext,

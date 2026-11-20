@@ -70,6 +70,11 @@ impl MieruOutbound {
 }
 #[async_trait]
 impl OutboundConnector for MieruOutbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        self.client.permits_http_tcp_reuse()
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,
@@ -135,6 +140,8 @@ impl OutboundConnector for MieruOutbound {
         self.client.shutdown().await;
     }
 }
+#[cfg(all(test, feature = "inbound-http"))]
+mod http_reuse_memory_tests;
 #[cfg(test)]
 mod packet_routing_tests;
 #[cfg(test)]

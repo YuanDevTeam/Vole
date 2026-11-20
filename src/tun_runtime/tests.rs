@@ -28,6 +28,10 @@ use crate::{
     routing::{EmptyGeoMatcher, ProxyDispatchers, RuleSet},
 };
 
+#[cfg(target_os = "macos")]
+#[path = "cancel_prepare_memory_tests.rs"]
+mod cancel_prepare_memory_tests;
+
 fn test_tun_config() -> TunConfig {
     TunConfig {
         mtu: 1500,
@@ -1949,9 +1953,57 @@ fn tun_netstack_keeps_queue_and_per_flow_bounds_without_a_flow_count_ceiling() {
 
     assert_eq!(config.tcp_accept_queue, limits.event_queue_capacity);
     assert_eq!(config.tcp_recv_buffer, limits.tcp_buffer_per_direction);
-    assert_eq!(config.tcp_send_buffer, limits.tcp_buffer_per_direction);
+    assert_eq!(config.tcp_send_buffer, limits.tun_tcp_send_buffer);
+    assert_eq!(config.tcp_recv_buffer, 32 * 1024);
+    assert_eq!(config.tcp_send_buffer, 256 * 1024);
+    assert_eq!(NetStackConfig::default().tcp_recv_buffer, 32 * 1024);
+    assert_eq!(NetStackConfig::default().tcp_send_buffer, 32 * 1024);
     assert_eq!(config.mtu, 1_500);
     assert_eq!(limits.max_datagram_size, 65_535);
+}
+
+#[tokio::test]
+async fn tun_tcp_send_budget_preserves_independent_explicit_limits() {
+    for (recv, send) in [(8194, 4096), (4096, 8194), (32 * 1024, 32 * 1024)] {
+        let limits = ResourceLimits {
+            tcp_buffer_per_direction: recv,
+            tun_tcp_send_buffer: send,
+            ..ResourceLimits::default()
+        }
+        .validate()
+        .unwrap();
+        let config = tun_netstack_config(limits, false);
+        assert_eq!(config.tcp_recv_buffer, recv);
+        assert_eq!(config.tcp_send_buffer, send);
+        let parts = NetStack::start_tcp(config).unwrap();
+        parts.control.stop().await;
+        assert!(parts.control.is_stopped());
+        assert_eq!(parts.stats.snapshot().active_tcp, 0);
+    }
+}
+
+#[test]
+fn tun_tcp_send_budget_keeps_invalid_explicit_values_for_netstack_validation() {
+    for send in [1, 4095, 4097, usize::MAX] {
+        let limits = ResourceLimits {
+            tun_tcp_send_buffer: send,
+            ..ResourceLimits::default()
+        }
+        .validate()
+        .unwrap();
+        let config = tun_netstack_config(limits, false);
+        assert_eq!(config.tcp_recv_buffer, 32 * 1024);
+        assert_eq!(config.tcp_send_buffer, send);
+        assert!(matches!(
+            NetStack::start_tcp(config),
+            Err(vole_netstack::NetStackError::Config(
+                vole_netstack::ConfigError::TcpBuffer {
+                    name: "tcp_send_buffer",
+                    value,
+                }
+            )) if value == send
+        ));
+    }
 }
 
 fn test_association(
@@ -2082,6 +2134,7 @@ fn periodic_cleanup_removes_expired_and_closed_but_preserves_active_entries() {
 
 #[derive(Default)]
 struct MockDispatcher {
+    buffered_tcp: bool,
     tcp_sessions: Mutex<Vec<StreamSession>>,
     udp_sessions: Mutex<Vec<DatagramSession>>,
     tcp_called: Notify,
@@ -2102,7 +2155,11 @@ impl Dispatcher for MockDispatcher {
                 }
             }
         });
-        Ok(Box::new(client))
+        if self.buffered_tcp {
+            Ok(Box::new(tokio::io::BufWriter::new(client)))
+        } else {
+            Ok(Box::new(client))
+        }
     }
 
     async fn open_datagram(
@@ -2472,13 +2529,20 @@ fn test_runtime_dns(dispatcher: Arc<dyn Dispatcher>) -> Arc<RuntimeDns> {
 
 #[tokio::test]
 async fn synthetic_fd_with_dns_disabled_dispatches_tcp_and_reuses_udp_association() {
+    #[cfg(feature = "http-diagnostics")]
+    let observer_before = crate::http_processing::diagnostics::snapshot();
     let (host, peer) = UnixDatagram::pair().unwrap();
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     let fd = TunFd::duplicate_mock(host.as_raw_fd()).unwrap();
     let tun = TunIo::new_mock(fd, crate::TunFraming::RawIp).unwrap();
     let peer = tokio::net::UnixDatagram::from_std(peer).unwrap();
-    let dispatcher = Arc::new(MockDispatcher::default());
+    // A sniffed request must reach a buffered protocol writer before the
+    // client sends another byte or closes its write half.
+    let dispatcher = Arc::new(MockDispatcher {
+        buffered_tcp: true,
+        ..MockDispatcher::default()
+    });
     let limits = ResourceLimits {
         packet_queue_capacity: 8,
         event_queue_capacity: 4,
@@ -2624,6 +2688,30 @@ async fn synthetic_fd_with_dns_disabled_dispatches_tcp_and_reuses_udp_associatio
         .expect("TUN runtime stop timed out")
         .unwrap()
         .unwrap();
+    #[cfg(feature = "http-diagnostics")]
+    {
+        let after = crate::http_processing::diagnostics::snapshot();
+        for (name, minimum) in [
+            ("tunNetstackDriverDrivePasses", 1_u64),
+            ("tunNetstackDriverTcpEntryVisits", 1),
+            (
+                "tunNetstackDriverAppRxBytes",
+                u64::try_from(request.len()).unwrap(),
+            ),
+            (
+                "tunNetstackDriverAppTxBytes",
+                u64::try_from(request.len()).unwrap(),
+            ),
+            ("tunNetstackDriverWaitIngress", 1),
+        ] {
+            let before = observer_before["counters"][name].as_u64().unwrap();
+            let after = after["counters"][name].as_u64().unwrap();
+            assert!(
+                after >= before + minimum,
+                "real TUN relay observer missing {name}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

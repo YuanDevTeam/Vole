@@ -7,6 +7,7 @@
 | 用途 | 来源与约束 |
 | --- | --- |
 | 普通流 TLS、WebPKI | 官方 rustls/tokio-rustls，ring provider；rustls-native-certs 只读取可用平台根，不替换验证器 |
+| HTTP/2 | 官方 registry h2；使用公开 Builder、流量控制和取消 API，保留官方编码缓冲默认值 |
 | Quinn QUIC | HY2、TUIC、DoQ、XHTTP H3 和 DoH/H3 使用官方 registry Quinn 0.11.12 / quinn-proto 0.11.19、rustls/ring；窗口与数据报预算通过公开 API 和 Core 包装处理；Linux DIRECT 的有限 GSO/ECN 使用同一受保护 fd 的 Linux ancillary API，不另建 socket |
 | Quinn HTTP/3 | HY2 认证、XHTTP 和 DoH/H3 使用 registry h3 0.0.8 + h3-quinn 0.0.10，MIT；HY2 认证与业务共用同一 Quinn 连接，XHTTP/DNS 的取消和帧预算由 Core 公开 trait 包装处理，不修改上游源码 |
 | quiche HTTP/3 | TrustTunnel 和 MASQUE 使用 registry quiche 0.30.0，BSD-2-Clause；自有低层驱动使用公开 API，共用同一 boring/boring-sys，不启用 quiche FFI、qlog 或另一套 TLS 来源 |

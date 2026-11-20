@@ -3,11 +3,12 @@ use super::crypto::{Aead, Ctr, Suite, failure};
 use super::header_xor::HeaderXor;
 use crate::dispatch::BoxStream;
 use crate::security::vision::{SpliceControl, SpliceStats};
+use futures_util::task::AtomicWaker;
 use std::sync::Arc;
 use std::{
     io,
     pin::Pin,
-    task::{Context, Poll, ready},
+    task::{Context, Poll, Wake, Waker, ready},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use zeroize::{Zeroize, Zeroizing};
@@ -22,6 +23,8 @@ pub(super) struct Records {
     rx_ctr: Option<Ctr>,
     pending: Vec<u8>,
     sent: usize,
+    prefix_pending: bool,
+    io_wake: Arc<IoWake>,
     input: Vec<u8>,
     filled: usize,
     reading: Reading,
@@ -36,6 +39,42 @@ pub(super) struct Records {
     pending_direct: bool,
     direct_tx: HeaderXor,
     direct_rx: HeaderXor,
+}
+
+// Raw IO and its cancellation guard can share one latest-waker slot. Keep
+// both Records owners behind the same stable waker for every raw operation.
+struct IoWake {
+    reader: AtomicWaker,
+    writer: AtomicWaker,
+}
+
+impl IoWake {
+    fn new() -> Self {
+        Self {
+            reader: AtomicWaker::new(),
+            writer: AtomicWaker::new(),
+        }
+    }
+
+    fn wake_all(&self) {
+        self.reader.wake();
+        self.writer.wake();
+    }
+}
+
+impl Wake for IoWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_all();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wake_all();
+    }
+}
+
+enum DrainSide {
+    Read,
+    Write,
 }
 
 enum Reading {
@@ -70,6 +109,8 @@ impl Records {
             rx_ctr,
             pending: Vec::new(),
             sent: 0,
+            prefix_pending: false,
+            io_wake: Arc::new(IoWake::new()),
             input: vec![0; padding],
             filled: 0,
             reading: Reading::Padding,
@@ -99,6 +140,7 @@ impl Records {
         cache: Arc<Cache>,
         ticket: Arc<Ticket>,
     ) -> Self {
+        let prefix_pending = !prefix.is_empty();
         Self {
             raw: Some(raw),
             key,
@@ -109,6 +151,8 @@ impl Records {
             rx_ctr: None,
             pending: prefix,
             sent: 0,
+            prefix_pending,
+            io_wake: Arc::new(IoWake::new()),
             input: vec![0; 16],
             filled: 0,
             reading: Reading::Random,
@@ -153,17 +197,23 @@ impl Records {
         self.key.zeroize();
         self.plain.zeroize();
         self.pending.clear();
+        self.prefix_pending = false;
         self.input.clear();
+        self.io_wake.wake_all();
         error
     }
 
-    fn drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn drain(&mut self, side: DrainSide) -> Poll<io::Result<()>> {
         if let Err(error) = self.open() {
             return Poll::Ready(Err(self.fail(error)));
         }
+        let had_pending = self.sent < self.pending.len();
+        let waker = Waker::from(self.io_wake.clone());
+        let mut io_cx = Context::from_waker(&waker);
         while self.sent < self.pending.len() {
             let result = ready!(
-                Pin::new(self.raw.as_mut().unwrap()).poll_write(cx, &self.pending[self.sent..])
+                Pin::new(self.raw.as_mut().unwrap())
+                    .poll_write(&mut io_cx, &self.pending[self.sent..])
             );
             let count = match result {
                 Ok(0) => {
@@ -182,15 +232,30 @@ impl Records {
         }
         self.pending.clear();
         self.sent = 0;
+        self.prefix_pending = false;
+        if had_pending {
+            // Another owner can be parked on the exact frame just completed.
+            match side {
+                DrainSide::Read => self.io_wake.writer.wake(),
+                DrainSide::Write => self.io_wake.reader.wake(),
+            }
+        }
         Poll::Ready(Ok(()))
     }
 
     fn receive(&mut self, cx: &mut Context<'_>, output: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         self.open()?;
+        self.io_wake.reader.register(cx.waker());
         if output.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        ready!(self.drain(cx))?;
+        match self.drain(DrainSide::Read) {
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending if self.prefix_pending => return Poll::Pending,
+            Poll::Pending | Poll::Ready(Ok(())) => {}
+        }
+        let waker = Waker::from(self.io_wake.clone());
+        let mut io_cx = Context::from_waker(&waker);
         loop {
             if self.consumed < self.plain.len() {
                 let count = output.remaining().min(self.plain.len() - self.consumed);
@@ -208,7 +273,7 @@ impl Records {
                     return Poll::Ready(Err(failure()));
                 }
                 let before = output.filled().len();
-                ready!(Pin::new(self.raw.as_mut().unwrap()).poll_read(cx, output))?;
+                ready!(Pin::new(self.raw.as_mut().unwrap()).poll_read(&mut io_cx, output))?;
                 if let Some(ctr) = &mut self.rx_ctr {
                     self.direct_rx
                         .apply(ctr, &mut output.filled_mut()[before..], true)?;
@@ -221,7 +286,7 @@ impl Records {
             }
             while self.filled < self.input.len() {
                 let mut buf = ReadBuf::new(&mut self.input[self.filled..]);
-                ready!(Pin::new(self.raw.as_mut().unwrap()).poll_read(cx, &mut buf))?;
+                ready!(Pin::new(self.raw.as_mut().unwrap()).poll_read(&mut io_cx, &mut buf))?;
                 let count = buf.filled().len();
                 if count == 0 {
                     if self.filled == 0 && matches!(self.reading, Reading::Header) {
@@ -292,10 +357,14 @@ impl AsyncRead for Records {
         cx: &mut Context<'_>,
         output: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.receive(cx, output) {
+        let result = match self.receive(cx, output) {
             Poll::Ready(Err(error)) => Poll::Ready(Err(self.fail(error))),
             result => result,
+        };
+        if result.is_ready() {
+            drop(self.io_wake.reader.take());
         }
+        result
     }
 }
 
@@ -305,105 +374,141 @@ impl AsyncWrite for Records {
         cx: &mut Context<'_>,
         input: &[u8],
     ) -> Poll<io::Result<usize>> {
-        ready!(self.drain(cx))?;
-        if self.write_closed {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "VLESS Encryption write side closed",
-            )));
-        }
-        if input.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let count = input.len().min(8192);
-        if self
-            .vision
-            .as_ref()
-            .is_some_and(|(control, _)| control.writing_direct())
-        {
-            if !self.direct_write {
-                let result = ready!(Pin::new(self.raw.as_mut().unwrap()).poll_flush(cx));
-                if let Err(error) = result {
-                    return Poll::Ready(Err(self.fail(error)));
-                }
-                self.direct_write = true;
-            }
-            self.pending.extend_from_slice(&input[..count]);
-            let this = &mut *self;
-            if let Some(ctr) = &mut this.tx_ctr
-                && let Err(error) = this.direct_tx.apply(ctr, &mut this.pending, false)
-            {
-                return Poll::Ready(Err(this.fail(error)));
-            }
-            self.pending_direct = true;
-            return Poll::Ready(Ok(count));
-        }
-        let length = (count + 16) as u16;
-        let mut header = [23, 3, 3, (length >> 8) as u8, length as u8];
-        let rekey = self.tx.exhausted();
+        self.io_wake.writer.register(cx.waker());
+        let waker = Waker::from(self.io_wake.clone());
+        let mut io_cx = Context::from_waker(&waker);
         let result = (|| {
-            let sealed = self.tx.seal(&input[..count], &header, None)?;
-            if rekey {
-                let mut context = header.to_vec();
-                context.extend_from_slice(&sealed);
-                self.tx = Aead::new(&context, self.key.as_ref(), self.suite)?;
+            ready!(self.drain(DrainSide::Write))?;
+            if self.write_closed {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "VLESS Encryption write side closed",
+                )));
             }
-            if let Some(ctr) = self.tx_ctr.as_mut() {
-                ctr.apply(&mut header)?;
+            if input.is_empty() {
+                return Poll::Ready(Ok(0));
             }
-            self.pending.extend_from_slice(&header);
-            self.pending.extend_from_slice(&sealed);
-            Ok(count)
+            let count = input.len().min(8192);
+            if self
+                .vision
+                .as_ref()
+                .is_some_and(|(control, _)| control.writing_direct())
+            {
+                if !self.direct_write {
+                    let result =
+                        ready!(Pin::new(self.raw.as_mut().unwrap()).poll_flush(&mut io_cx));
+                    if let Err(error) = result {
+                        return Poll::Ready(Err(self.fail(error)));
+                    }
+                    self.direct_write = true;
+                }
+                self.pending.extend_from_slice(&input[..count]);
+                let this = &mut *self;
+                if let Some(ctr) = &mut this.tx_ctr
+                    && let Err(error) = this.direct_tx.apply(ctr, &mut this.pending, false)
+                {
+                    return Poll::Ready(Err(this.fail(error)));
+                }
+                self.pending_direct = true;
+                return Poll::Ready(Ok(count));
+            }
+            let length = (count + 16) as u16;
+            let mut header = [23, 3, 3, (length >> 8) as u8, length as u8];
+            let rekey = self.tx.exhausted();
+            let result = (|| {
+                let sealed = self.tx.seal(&input[..count], &header, None)?;
+                if rekey {
+                    let mut context = header.to_vec();
+                    context.extend_from_slice(&sealed);
+                    self.tx = Aead::new(&context, self.key.as_ref(), self.suite)?;
+                }
+                if let Some(ctr) = self.tx_ctr.as_mut() {
+                    ctr.apply(&mut header)?;
+                }
+                self.pending.extend_from_slice(&header);
+                self.pending.extend_from_slice(&sealed);
+                Ok(count)
+            })();
+            Poll::Ready(result.map_err(|error| self.fail(error)))
         })();
-        Poll::Ready(result.map_err(|error| self.fail(error)))
+        if result.is_ready() {
+            drop(self.io_wake.writer.take());
+        }
+        result
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        ready!(self.drain(cx))?;
-        match Pin::new(self.raw.as_mut().unwrap()).poll_flush(cx) {
-            Poll::Ready(Err(error)) => Poll::Ready(Err(self.fail(error))),
-            result => result,
+        self.io_wake.writer.register(cx.waker());
+        let waker = Waker::from(self.io_wake.clone());
+        let mut io_cx = Context::from_waker(&waker);
+        let result = (|| {
+            ready!(self.drain(DrainSide::Write))?;
+            match Pin::new(self.raw.as_mut().unwrap()).poll_flush(&mut io_cx) {
+                Poll::Ready(Err(error)) => Poll::Ready(Err(self.fail(error))),
+                result => result,
+            }
+        })();
+        if result.is_ready() {
+            drop(self.io_wake.writer.take());
         }
+        result
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.write_closed {
-            return Poll::Ready(Ok(()));
-        }
-        ready!(self.drain(cx))?;
-        if self.tx_ctr.is_none()
-            && self
-                .vision
-                .as_ref()
-                .is_some_and(|(control, _)| control.writing_direct() || control.reading_direct())
-        {
-            // Vision exposes the underlying transport after direct switching.
-            // Native/xorpub therefore inherit its CloseWrite (TCP FIN or TLS
-            // close_notify). Random's XorConn is not replaceable in Mihomo and
-            // still has whole-connection close semantics.
-            return match Pin::new(self.raw.as_mut().unwrap()).poll_shutdown(cx) {
+        self.io_wake.writer.register(cx.waker());
+        let waker = Waker::from(self.io_wake.clone());
+        let mut io_cx = Context::from_waker(&waker);
+        let result = (|| {
+            if self.write_closed {
+                return Poll::Ready(Ok(()));
+            }
+            ready!(self.drain(DrainSide::Write))?;
+            if self.tx_ctr.is_none()
+                && self.vision.as_ref().is_some_and(|(control, _)| {
+                    control.writing_direct() || control.reading_direct()
+                })
+            {
+                // Vision exposes the underlying transport after direct switching.
+                // Native/xorpub therefore inherit its CloseWrite (TCP FIN or TLS
+                // close_notify). Random's XorConn is not replaceable in Mihomo and
+                // still has whole-connection close semantics.
+                return match Pin::new(self.raw.as_mut().unwrap()).poll_shutdown(&mut io_cx) {
+                    Poll::Ready(Ok(())) => {
+                        self.write_closed = true;
+                        Poll::Ready(Ok(()))
+                    }
+                    Poll::Ready(Err(error)) => Poll::Ready(Err(self.fail(error))),
+                    result => result,
+                };
+            }
+            // Mihomo CommonConn does not expose CloseWrite/replaceable upstream.
+            // Flush pending records then release this whole logical transport.
+            // A normal close must not invalidate a reusable node-local ticket.
+            match Pin::new(self.raw.as_mut().unwrap()).poll_flush(&mut io_cx) {
                 Poll::Ready(Ok(())) => {
                     self.write_closed = true;
+                    self.raw.take();
+                    self.key.zeroize();
+                    self.plain.zeroize();
+                    self.io_wake.wake_all();
                     Poll::Ready(Ok(()))
                 }
                 Poll::Ready(Err(error)) => Poll::Ready(Err(self.fail(error))),
                 result => result,
-            };
-        }
-        // Mihomo CommonConn does not expose CloseWrite/replaceable upstream.
-        // Flush pending records then release this whole logical transport.
-        // A normal close must not invalidate a reusable node-local ticket.
-        match Pin::new(self.raw.as_mut().unwrap()).poll_flush(cx) {
-            Poll::Ready(Ok(())) => {
-                self.write_closed = true;
-                self.raw.take();
-                self.key.zeroize();
-                self.plain.zeroize();
-                Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(self.fail(error))),
-            result => result,
+        })();
+        if result.is_ready() {
+            drop(self.io_wake.writer.take());
         }
+        result
+    }
+}
+
+impl Drop for Records {
+    fn drop(&mut self) {
+        // Raw transports can retain the fanout waker after their last poll.
+        // Release task references even when an owner cancels without repolling.
+        self.io_wake.wake_all();
     }
 }
 
@@ -745,6 +850,8 @@ mod tests {
             );
         }
     }
+
+    include!("records_duplex_memory_tests.rs");
 
     struct DropProbe(Arc<AtomicBool>);
     impl Drop for DropProbe {

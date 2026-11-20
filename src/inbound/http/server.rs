@@ -615,10 +615,10 @@ async fn forward_on_stream<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     };
     // Processing may rebuild request framing. Persistence is enabled only now.
     let origin_requested = enable_reuse
-        && request.method == "GET"
+        && !matches!(request.method.as_str(), "HEAD" | "CONNECT")
         && plan.keep_alive
         && plan.upgrade.is_empty()
-        && matches!(plan.body, Body::Empty | Body::Length(0))
+        && matches!(plan.body, Body::Empty | Body::Length(_))
         && !request
             .headers
             .iter()
@@ -632,12 +632,14 @@ async fn forward_on_stream<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     // Some protocol transports accept the head into an internal frame. Empty
     // requests never poll the body sender, so publish the head before reading.
     timeout_io(config.connect_timeout, remote_write.flush()).await?;
-    let mut uploading = Box::pin(upload.transfer(
+    let final_flush_only = std::sync::atomic::AtomicBool::new(false);
+    let mut uploading = Box::pin(upload.transfer_observing_final_flush(
         reader,
         &mut remote_write,
         config.body_idle_timeout,
         &plan.trailer_blocklist,
         false,
+        &final_flush_only,
     ));
     // Empty bodies are already complete. Reading a ready 101 first must not
     // turn an otherwise valid Upgrade into an apparent early response.
@@ -725,8 +727,24 @@ async fn forward_on_stream<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         }
         break response;
     };
-    // An early final response cancels the upload and closes this client
-    // connection. Unread request bytes can never become a second request.
+    if !uploaded
+        && origin_requested
+        && response.status >= 200
+        && final_flush_only.load(std::sync::atomic::Ordering::Acquire)
+    {
+        // The real body transfer has reached its final flush. Recheck that same
+        // future once in case response-first selection hid an already-ready
+        // completion. Never await Pending or read/write another body byte.
+        let result = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(uploading.as_mut(), cx))
+        })
+        .await;
+        if matches!(result, std::task::Poll::Ready(Ok(()))) {
+            uploaded = true;
+        }
+    }
+    // Genuine early/Pending/error final responses keep the original close path.
+    // Unread request bytes can never become a second request.
     drop(uploading);
     if response.status == 101 {
         if !uploaded || !response.valid_upgrade(&plan.upgrade).unwrap_or(false) {
@@ -1604,4 +1622,9 @@ mod response_deadline_memory_tests {
 #[cfg(test)]
 mod upstream_memory_tests {
     include!("upstream_memory_tests.rs");
+}
+
+#[cfg(test)]
+mod final_flush_repoll_memory_tests {
+    include!("final_flush_repoll_memory_tests.rs");
 }

@@ -37,6 +37,11 @@ impl std::fmt::Debug for ShadowTlsClient {
 }
 
 impl ShadowTlsClient {
+    #[cfg(all(feature = "inbound-http", feature = "outbound-shadowsocks"))]
+    pub(super) fn permits_ss_http_reuse(&self) -> bool {
+        self.tls.has_fixed_shadowtls_http_identity()
+    }
+
     pub fn new(context: &SecurityContext, config: &ShadowTlsConfig) -> io::Result<Self> {
         config.validate().map_err(|_| invalid())?;
         Ok(Self {
@@ -458,3 +463,7 @@ impl AsyncWrite for Verified {
         result
     }
 }
+
+#[cfg(all(test, feature = "outbound-shadowsocks"))]
+#[path = "shadow_tls_ss_stack_memory_tests.rs"]
+mod ss_stack_memory_tests;

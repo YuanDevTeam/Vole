@@ -6,9 +6,14 @@ publish = false
 license = "MIT"
 description = "Bounded userspace IPv4/IPv6 TCP and UDP netstack for Vole"
 
+[features]
+default = []
+diagnostics = []
+
 [dependencies]
 bytes = "1"
 futures-util = "0.3"
+memmap2 = "=0.9.12"
 # Upstream recovery fixes preserve retries when bounded packet output is full.
 smoltcp = { git = "https://github.com/smoltcp-rs/smoltcp", rev = "24bda3b4f982625d8453d4360172557d24921c76", default-features = false, features = [
     "std",

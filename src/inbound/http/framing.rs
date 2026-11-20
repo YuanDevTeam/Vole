@@ -33,7 +33,7 @@ pub(crate) struct RequestPlan {
 impl RequestPlan {
     /// Called after request processing; downstream persistence is independent.
     pub(crate) fn enable_origin_persistence(&mut self) -> io::Result<()> {
-        if !matches!(self.body, Body::Empty | Body::Length(0))
+        if !matches!(self.body, Body::Empty | Body::Length(_))
             || !self.upgrade.is_empty()
             || !self.keep_alive
         {
@@ -246,7 +246,7 @@ impl ResponseHead {
     }
 
     pub(crate) fn origin_reusable(&self, method: &str) -> bool {
-        method == "GET"
+        !matches!(method, "HEAD" | "CONNECT")
             && self.wire_http11
             && !self.wire_close
             && self.wire_reusable_status

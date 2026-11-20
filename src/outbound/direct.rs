@@ -17,6 +17,21 @@ use crate::{
 
 use super::{ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector};
 
+#[cfg(target_os = "macos")]
+#[path = "direct_macos_batch.rs"]
+mod macos_batch;
+
+#[cfg(all(
+    target_os = "macos",
+    any(
+        feature = "outbound-masque",
+        feature = "outbound-wireguard",
+        feature = "outbound-tuic"
+    )
+))]
+#[path = "direct_fixed_peer.rs"]
+mod fixed_peer;
+
 /// Built-in DIRECT action. Domain destinations must be resolved and pinned by
 /// the routing layer before they reach this dispatcher.
 #[derive(Debug, Clone)]
@@ -28,6 +43,32 @@ impl DirectOutbound {
     #[must_use]
     pub const fn new(dialer: Dialer) -> Self {
         Self { dialer }
+    }
+
+    /// Prepare one dedicated fixed-peer UDP path, without opening a socket.
+    #[cfg(all(
+        target_os = "macos",
+        any(
+            feature = "outbound-masque",
+            feature = "outbound-wireguard",
+            feature = "outbound-tuic"
+        )
+    ))]
+    pub(super) fn open_fixed_datagram(
+        &self,
+        request: DatagramRequest,
+        peer: SocketAddr,
+    ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        let mut transport = DirectDatagramTransport::new(
+            self.dialer.clone(),
+            usize::from(request.max_response_payload_size()),
+            request.udp_socket_options(),
+        );
+        transport.fixed_peer = Some(fixed_peer::Path::new(peer)?);
+        Ok(crate::dispatch::bound_datagram(
+            Box::new(transport),
+            request.budget(),
+        ))
     }
 }
 
@@ -99,6 +140,15 @@ struct DirectDatagramTransport {
     socket_options: crate::dialer::UdpSocketOptions,
     receive_buffer: Vec<u8>,
     receive_cursor: usize,
+    #[cfg(all(
+        target_os = "macos",
+        any(
+            feature = "outbound-masque",
+            feature = "outbound-wireguard",
+            feature = "outbound-tuic"
+        )
+    ))]
+    fixed_peer: Option<fixed_peer::Path<UdpSocket>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +170,15 @@ impl DirectDatagramTransport {
             socket_options,
             receive_buffer: Vec::new(),
             receive_cursor: 0,
+            #[cfg(all(
+                target_os = "macos",
+                any(
+                    feature = "outbound-masque",
+                    feature = "outbound-wireguard",
+                    feature = "outbound-tuic"
+                )
+            ))]
+            fixed_peer: None,
         }
     }
 
@@ -149,11 +208,27 @@ impl DirectDatagramTransport {
         payload: &[u8],
         address: SocketAddr,
     ) -> Result<(), DispatchError> {
-        let written = socket
-            .send_to(payload, address)
-            .await
-            .map_err(DispatchError::from)?;
-        if written != payload.len() {
+        Self::finish_send(payload.len(), socket.send_to(payload, address)).await
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        any(
+            feature = "outbound-masque",
+            feature = "outbound-wireguard",
+            feature = "outbound-tuic"
+        )
+    ))]
+    async fn send_connected(socket: &UdpSocket, payload: &[u8]) -> Result<(), DispatchError> {
+        Self::finish_send(payload.len(), socket.send(payload)).await
+    }
+
+    async fn finish_send(
+        expected: usize,
+        send: impl std::future::Future<Output = io::Result<usize>>,
+    ) -> Result<(), DispatchError> {
+        let written = send.await.map_err(DispatchError::from)?;
+        if written != expected {
             return Err(DispatchError::Other(
                 "direct UDP socket truncated a datagram".to_owned(),
             ));
@@ -216,6 +291,17 @@ impl DirectDatagramTransport {
 #[async_trait]
 impl DatagramTransport for DirectDatagramTransport {
     fn supports_shared_destinations(&self) -> bool {
+        #[cfg(all(
+            target_os = "macos",
+            any(
+                feature = "outbound-masque",
+                feature = "outbound-wireguard",
+                feature = "outbound-tuic"
+            )
+        ))]
+        if self.fixed_peer.is_some() {
+            return false;
+        }
         // Unconnected sockets preserve each send target and actual reply source.
         true
     }
@@ -260,6 +346,22 @@ impl DatagramTransport for DirectDatagramTransport {
             return Err(datagram);
         };
         let address = *address;
+        #[cfg(all(
+            target_os = "macos",
+            any(
+                feature = "outbound-masque",
+                feature = "outbound-wireguard",
+                feature = "outbound-tuic"
+            )
+        ))]
+        if let Some(path) = &self.fixed_peer {
+            let Ok(Some(socket)) = path.ready(address) else {
+                return Err(datagram);
+            };
+            return Ok(Box::pin(async move {
+                Self::send_connected(&socket, &datagram.payload).await
+            }));
+        }
         let class = UdpSocketClass {
             ipv6: address.is_ipv6(),
             loopback: address.ip().is_loopback(),
@@ -274,10 +376,81 @@ impl DatagramTransport for DirectDatagramTransport {
         }))
     }
 
+    #[cfg(target_os = "macos")]
+    fn send_batch_owned(
+        &mut self,
+        datagrams: Vec<Datagram>,
+    ) -> Result<crate::dispatch::OwnedDatagramBatchSend, Vec<Datagram>> {
+        let Some(peer) = crate::dispatch::datagram_batch_peer(&datagrams) else {
+            return Err(datagrams);
+        };
+        #[cfg(any(
+            feature = "outbound-masque",
+            feature = "outbound-wireguard",
+            feature = "outbound-tuic"
+        ))]
+        if let Some(path) = &self.fixed_peer {
+            let Ok(Some(socket)) = path.ready(peer) else {
+                return Err(datagrams);
+            };
+            return macos_batch::send_connected_owned(socket, peer, datagrams);
+        }
+        let class = UdpSocketClass {
+            ipv6: peer.is_ipv6(),
+            loopback: peer.ip().is_loopback(),
+        };
+        let Some((_, socket)) = self.sockets.iter().find(|(key, _)| *key == class) else {
+            // Only the existing ordinary first send may initialize protected IO.
+            return Err(datagrams);
+        };
+        macos_batch::send_owned(socket.clone(), datagrams)
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         let Destination::Ip(address) = datagram.remote else {
             return Err(DispatchError::HostUnreachable);
         };
+        #[cfg(all(
+            target_os = "macos",
+            any(
+                feature = "outbound-masque",
+                feature = "outbound-wireguard",
+                feature = "outbound-tuic"
+            )
+        ))]
+        if let Some(path) = &mut self.fixed_peer {
+            let dialer = self.dialer.clone();
+            let options = self.socket_options;
+            let socket = path
+                .initialize_with(
+                    address,
+                    move |peer| async move {
+                        // This existing Dialer call completes bind, protect,
+                        // interface policy and its cancellation checks first.
+                        dialer
+                            .bind_udp_for_with_options(peer, options)
+                            .await
+                            .map_err(DispatchError::from)
+                    },
+                    |socket, peer| async move {
+                        socket.connect(peer).await.map_err(DispatchError::from)?;
+                        Ok(socket)
+                    },
+                )
+                .await?;
+            if self.sockets.is_empty() {
+                // Retain the original recv_from path and its source/oversize
+                // checks on this exact connected, protected socket.
+                self.sockets.push((
+                    UdpSocketClass {
+                        ipv6: address.is_ipv6(),
+                        loopback: address.ip().is_loopback(),
+                    },
+                    socket.clone(),
+                ));
+            }
+            return Self::send_connected(&socket, &datagram.payload).await;
+        }
         let socket = self.socket_for(address).await?;
         Self::send_on(socket, &datagram.payload, address).await
     }
@@ -314,6 +487,17 @@ impl DatagramTransport for DirectDatagramTransport {
     }
 
     async fn close(&mut self) -> Result<(), DispatchError> {
+        #[cfg(all(
+            target_os = "macos",
+            any(
+                feature = "outbound-masque",
+                feature = "outbound-wireguard",
+                feature = "outbound-tuic"
+            )
+        ))]
+        if let Some(path) = &mut self.fixed_peer {
+            path.close();
+        }
         self.sockets.clear();
         Ok(())
     }

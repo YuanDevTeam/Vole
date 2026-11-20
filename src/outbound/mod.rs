@@ -35,6 +35,11 @@ mod shadowsocks;
 mod uot;
 #[cfg(feature = "outbound-shadowsocks")]
 pub use shadowsocks::ShadowsocksOutbound;
+
+#[cfg(all(test, feature = "outbound-shadowsocks", feature = "shadow-tls-v3"))]
+pub(crate) use shadowsocks::memory_test_ss_stack_stream;
+#[cfg(all(test, feature = "inbound-http", feature = "outbound-shadowsocks"))]
+pub(crate) use shadowsocks::testing::{MemoryObfsFactory, MemoryObfsReceipt};
 mod direct;
 mod dns;
 mod named_direct;
@@ -89,3 +94,8 @@ pub mod hysteria2;
 mod owned_stream;
 #[cfg(feature = "outbound-tuic")]
 pub mod tuic;
+
+#[cfg(all(test, feature = "inbound-http", feature = "outbound-vmess"))]
+pub(crate) use vmess::{
+    MemoryVmessAcceptedPeer, MemoryVmessHttpCoverFactory, MemoryVmessHttpCoverReceipt,
+};

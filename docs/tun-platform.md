@@ -107,11 +107,27 @@ token 归还容量。满输出保留尚未处理的 TCP 包和协议状态，低
 输出端关闭则停止 Driver、释放 socket 并唤醒全部等待者。
 
 netstack 的 TCP 接收与发送缓冲可独立配置，各方向的容量包含 smoltcp 缓冲与应用
-队列，两层上限各占一半。生产 TUN 仍使用每方向 32 KiB、合计每流 64 KiB 的数据
-容量上限。应用队列从空分配开始，按实际写入有界增长，分配请求不超过该队列的
-逻辑上限；排空后保留已分配空间直到连接释放。smoltcp 缓冲容量、背压、唤醒、
-flush 与关闭语义保持不变。该容量不包含代理 relay、包队列或 allocator 的内存，
-也不保证进程 RSS 与数据容量相同。
+队列，两层上限各占一半。所有平台的生产 TUN 默认接收总预算为 32 KiB（每层 16 KiB），
+发送总预算为 128 KiB（每层 64 KiB），合计每流 160 KiB。Rust `ResourceLimits` 的
+`tcp_buffer_per_direction` 与独立的 `tun_tcp_send_buffer` 分别映射到 TUN 接收与发送，
+保留调用者显式容量，不倍乘或钳制；通用 netstack 默认收发仍各 32 KiB，不新增 YAML 或
+Invoke 字段。资源入口拒绝零值，netstack 启动时继续要求每方向总预算为至少 4 KiB 的偶数。
+应用接收队列及小于 64 KiB 的应用发送队列保持原有按需有界 VecDeque，排空后保留空间。
+仅 Unix 的较大应用发送队列在首次非零写入时使用 safe memmap2 匿名映射 ring，请求长度为原逻辑容量；
+显式容量不倍乘或钳制，页 padding 不对读写暴露。Windows 与其他非 Unix 目标继续原有
+有界 VecDeque，不调用匿名映射 backend。Unix 映射失败或 Driver 已关闭/失效时，该队列
+永久回退原有有界 VecDeque，写入仍按剩余容量正常前进，不因映射失败变成永久 Pending。
+每个 Driver 拥有最多四槽空映射缓存，保留的请求长度合计不超过该栈 TCP 发送总预算；
+默认 64 KiB 应用发送映射在 128 KiB 缓存预算下最多缓存两个。仅在 ring 完全排空后归还，
+只复用请求长度与当前队列逻辑容量相同的项；满槽、预算满、竞争或关闭时，真实 owner 在
+队列/缓存锁外销毁并走 memmap2 的 unmap Drop。未读 tail、FIN 前数据和接收队列不转移。
+Driver 持长期强 Arc，句柄只持 Weak；停止先关闭并清空缓存，再唤醒流与发布完成，晚到归还
+不能复活缓存。映射按操作系统页粒度可能多占小于一页的末页，四槽 padding 合计小于四页，
+不属于逻辑容量也不是 RSS 保证；固定缓存/队列元数据另计。smoltcp 数组仍按各层容量创建，
+背压、唤醒、flush 与关闭语义保持不变。
+HTTP 正文信用仍由真实发送 owner 持有到最后引用释放，不因容量变大提前退款。该容量不包含
+代理 relay、包队列或 allocator 的内存，也不保证进程 RSS 与数据容量相同；整个进程仍独立
+遵循统一的 ≤45 MiB 验收门槛。
 
 Linux 目前不启用 GRO/GSO：`tun-rs` 的 Linux offload 示例通过 builder 创建并
 配置带 VNET header 的设备，而 Vole 的原生和借用路径均不启用该模式。对现有 raw-IP

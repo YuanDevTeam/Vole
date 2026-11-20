@@ -107,6 +107,7 @@ impl Registry {
         runtime: Arc<OwnedRuntime>,
         budget: DatagramBudget,
         lease: super::activity::Lease,
+        _tun_owned_send: bool,
     ) -> Result<Option<Box<dyn DatagramTransport>>, DispatchError> {
         let mut state = self.state.lock().unwrap();
         if state.closed || cancel.is_cancelled() {
@@ -140,6 +141,8 @@ impl Registry {
             sent: false,
             closed: false,
             closing: None,
+            #[cfg(target_os = "macos")]
+            tun_owned_send: _tun_owned_send,
         })))
     }
     pub fn exhausted(&self) -> bool {
@@ -193,6 +196,8 @@ struct Transport {
     sent: bool,
     closed: bool,
     closing: Option<oneshot::Receiver<()>>,
+    #[cfg(target_os = "macos")]
+    tun_owned_send: bool,
 }
 
 impl Transport {
@@ -240,6 +245,34 @@ impl Transport {
             TuicUdpMode::Quic => u16::MAX as usize + 10 + 259,
         }
     }
+
+    fn prepare_send(&mut self, datagram: Datagram) -> Result<Vec<Bytes>, DispatchError> {
+        if self.closed || self.cancel.is_cancelled() {
+            return Err(DispatchError::NotAllowed);
+        }
+        let address_len = wire::address_len(&datagram.remote)?;
+        let message_limit = self.message_limit();
+        let budget = self
+            .registry
+            .payload_budget(address_len, message_limit)
+            .intersect(self.budget);
+        if datagram.payload.len() > budget.transmit() as usize {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
+        }
+        let packets = wire::packets_with_payload_limit(
+            self.id,
+            self.packet,
+            &datagram.remote,
+            &datagram.payload,
+            message_limit,
+            self.registry
+                .payload_limit(address_len, datagram.payload.len(), message_limit),
+        )?;
+        // The next logical ID is consumed before any operation can be polled.
+        self.packet = self.packet.wrapping_add(1);
+        self.sent = true;
+        Ok(packets)
+    }
 }
 impl Drop for Transport {
     fn drop(&mut self) {
@@ -266,53 +299,25 @@ impl DatagramTransport for Transport {
         budget.intersect(self.budget)
     }
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
-        if self.closed || self.cancel.is_cancelled() {
-            return Err(DispatchError::NotAllowed);
+        let packets = self.prepare_send(datagram)?;
+        send_packets(&self.connection, &self.cancel, self.registry.mode, packets).await
+    }
+
+    #[cfg(target_os = "macos")]
+    fn try_begin_tun_send(
+        &mut self,
+        datagram: Datagram,
+        _flow_id: Option<&[u8]>,
+    ) -> Result<crate::dispatch::TunPendingSend, Datagram> {
+        if !self.tun_owned_send || self.registry.mode != TuicUdpMode::Quic {
+            return Err(datagram);
         }
-        let address_len = wire::address_len(&datagram.remote)?;
-        // Snapshot this logical send once; Quinn still validates the current
-        // path when each fragment is sent. Never cache the limit across sends.
-        let message_limit = self.message_limit();
-        let budget = self
-            .registry
-            .payload_budget(address_len, message_limit)
-            .intersect(self.budget);
-        if datagram.payload.len() > budget.transmit() as usize {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
-        }
-        let packets = wire::packets_with_payload_limit(
-            self.id,
-            self.packet,
-            &datagram.remote,
-            &datagram.payload,
-            message_limit,
-            self.registry
-                .payload_limit(address_len, datagram.payload.len(), message_limit),
-        )?;
-        // Consume the ID before the first await: cancelling a partial send
-        // never reuses that unfinished packet or replays its business bytes.
-        self.packet = self.packet.wrapping_add(1);
-        self.sent = true;
-        for (index, packet) in packets.into_iter().enumerate() {
-            tokio::select! { biased;
-                ()=self.cancel.cancelled()=>return Err(DispatchError::NotAllowed),
-                result=async {
-                    match self.registry.mode {
-                        TuicUdpMode::Native=>self.connection.send_datagram_wait(packet).await.map_err(super::failure),
-                        TuicUdpMode::Quic=>{
-                            let stream=self.connection.open_uni().await.map_err(super::failure)?;
-                            let mut stream=UniSend(Some(stream));
-                            AsyncWriteExt::write_all(stream.0.as_mut().unwrap(),&packet).await.map_err(super::failure)?;
-                            stream.0.take().unwrap().finish().map_err(super::failure)
-                        }
-                    }
-                } => result?,
-            }
-            if (index + 1) % crate::limits::IO_POLL_BUDGET == 0 {
-                tokio::task::yield_now().await;
-            }
-        }
-        Ok(())
+        let packets = self.prepare_send(datagram);
+        let connection = self.connection.clone();
+        let cancel = self.cancel.clone();
+        Ok(crate::dispatch::TunPendingSend::new(Box::pin(async move {
+            send_packets(&connection, &cancel, TuicUdpMode::Quic, packets?).await
+        })))
     }
     async fn receive(&mut self) -> Result<Datagram, DispatchError> {
         if self.closed {
@@ -331,6 +336,33 @@ impl DatagramTransport for Transport {
         self.closing = None;
         Ok(())
     }
+}
+async fn send_packets(
+    connection: &quinn::Connection,
+    cancel: &CancellationToken,
+    mode: TuicUdpMode,
+    packets: Vec<Bytes>,
+) -> Result<(), DispatchError> {
+    for (index, packet) in packets.into_iter().enumerate() {
+        tokio::select! { biased;
+            ()=cancel.cancelled()=>return Err(DispatchError::NotAllowed),
+            result=async {
+                match mode {
+                    TuicUdpMode::Native=>connection.send_datagram_wait(packet).await.map_err(super::failure),
+                    TuicUdpMode::Quic=>{
+                        let stream=connection.open_uni().await.map_err(super::failure)?;
+                        let mut stream=UniSend(Some(stream));
+                        AsyncWriteExt::write_all(stream.0.as_mut().unwrap(),&packet).await.map_err(super::failure)?;
+                        stream.0.take().unwrap().finish().map_err(super::failure)
+                    }
+                }
+            } => result?,
+        }
+        if (index + 1) % crate::limits::IO_POLL_BUDGET == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
 }
 struct UniSend(Option<quinn::SendStream>);
 impl Drop for UniSend {

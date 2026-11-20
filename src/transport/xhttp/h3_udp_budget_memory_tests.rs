@@ -272,6 +272,19 @@ fn native(fixture: &Fixture) -> quinn::Connection {
     sender.observation.clone()
 }
 async fn native_prefix(fixture: &Fixture, native: &quinn::Connection, raised: bool) {
+    let accepted = if raised {
+        // Native retained bytes must exceed the previous 192 KiB cap.
+        (192 * 1024 + 1)..=(256 * 1024)
+    } else {
+        1..=(64 * 1024)
+    };
+    native_prefix_in(fixture, native, accepted).await;
+}
+async fn native_prefix_in(
+    fixture: &Fixture,
+    native: &quinn::Connection,
+    accepted: std::ops::RangeInclusive<usize>,
+) {
     let server = fixture.native_peer.as_ref().unwrap();
     let mut warm = native.open_bi().await.unwrap().0;
     warm.write_all(b"warm").await.unwrap();
@@ -281,16 +294,13 @@ async fn native_prefix(fixture: &Fixture, native: &quinn::Connection, raised: bo
     assert_eq!(warm.stopped().await.unwrap(), None);
     fixture.gate.set(true);
     let (mut send, _) = native.open_bi().await.unwrap();
-    let bytes = vec![0xa5; 256 * 1024];
+    // Offer more than the candidate cap; the ACK gate must bound acceptance.
+    let bytes = vec![0xa5; 384 * 1024];
     let prefix = send.write(&bytes).await.unwrap();
-    if raised {
-        assert!(
-            prefix > 160 * 1024 && prefix <= 192 * 1024,
-            "raised prefix={prefix}"
-        );
-    } else {
-        assert!(prefix > 0 && prefix <= 64 * 1024, "initial prefix={prefix}");
-    }
+    assert!(
+        accepted.contains(&prefix),
+        "native send prefix {prefix} outside {accepted:?}"
+    );
     assert!(
         std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut send).poll_write(cx, b"blocked")))
             .await
@@ -311,11 +321,20 @@ async fn native_prefix(fixture: &Fixture, native: &quinn::Connection, raised: bo
     assert_eq!(finished, None);
     assert_eq!(delivered, bytes);
 }
+pub(super) async fn assert_default_send_retention(fixture: &Fixture) {
+    let SendRequest::H3(sender) = fixture.sender.as_ref().unwrap() else {
+        panic!("not H3")
+    };
+    assert!(sender.udp_control.is_none());
+    native_prefix(fixture, &native(fixture), false).await;
+}
 #[tokio::test]
 async fn udp_metadata_flush_raises_only_its_live_carrier_after_outer_retirement() {
     let (mux, client, upstream) = configured();
-    let mut a = Fixture::new(client.clone(), false, 32, 256 * 1024);
-    let mut b = Fixture::new(client.clone(), false, 32, 256 * 1024);
+    // Peer stream credit exceeds the local cap, so 256 KiB is not a
+    // peer receive-window artefact. Connection receive credit remains 1 MiB.
+    let mut a = Fixture::new(client.clone(), false, 32, 512 * 1024);
+    let mut b = Fixture::new(client.clone(), false, 32, 512 * 1024);
     let result = AssertUnwindSafe(timeout(LIMIT, async {
         let peer = a.initialize().await;
         let service = bridge(&mut a, peer);
@@ -466,4 +485,211 @@ async fn proxy_hops_clear_the_carrier_h3_capture_for_tcp_and_datagrams() {
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
     assert!(context.h3_udp_capture().is_some());
     assert!(capture.take().is_none());
+}
+
+#[tokio::test]
+async fn yamux_fixed_send_retention_has_no_adaptive_udp_control_or_raise() {
+    let node = shared_node("yamux", "body");
+    let (client, download) = node.test_xhttp_clients().unwrap();
+    assert!(download.is_none());
+    assert!(!client.udp_budget_qualified());
+    let mut fixture = Fixture::new(client, false, 16, 256 * 1024);
+    let result = AssertUnwindSafe(timeout(LIMIT, async {
+        let peer = fixture.initialize().await;
+        let SendRequest::H3(sender) = fixture.sender.as_ref().unwrap() else {
+            panic!("not H3")
+        };
+        assert!(sender.udp_control.is_none());
+        // The HTTP acceptor is deliberately unpolled during the native probe.
+        let physical = native(&fixture);
+        native_prefix_in(&fixture, &physical, (96 * 1024 + 1)..=(128 * 1024)).await;
+        assert!(fixture.sender.as_ref().is_some_and(|sender| {
+            matches!(sender, SendRequest::H3(sender) if sender.udp_control.is_none())
+        }));
+        drop(peer);
+    }))
+    .catch_unwind()
+    .await;
+    fixture.stop().await;
+    node.shutdown().await;
+    finish(result);
+}
+
+#[tokio::test]
+async fn yamux_h3_stream_modes_keep_the_native_64k_send_retention() {
+    for mode in ["stream-up", "stream-one"] {
+        let node = overlap_version_mode_node("yamux", "h3", mode);
+        let (client, _) = node.test_xhttp_clients().unwrap();
+        let mut fixture = Fixture::new(client, false, 16, 256 * 1024);
+        let result = AssertUnwindSafe(timeout(LIMIT, async {
+            let peer = fixture.initialize().await;
+            assert_default_send_retention(&fixture).await;
+            drop(peer);
+        }))
+        .catch_unwind()
+        .await;
+        fixture.stop().await;
+        node.shutdown().await;
+        finish(result);
+    }
+}
+
+#[tokio::test]
+async fn response_geometry_alone_keeps_native_send_retention_at_64k() {
+    let node = node(None, "body", false);
+    let (mut client, _) = node.test_xhttp_clients().unwrap();
+    client.set_packet_up_response_overlap(true);
+    let mut fixture = Fixture::new(client, false, 16, 256 * 1024);
+    let result = AssertUnwindSafe(timeout(LIMIT, async {
+        let peer = fixture.initialize().await;
+        assert_default_send_retention(&fixture).await;
+        drop(peer);
+    }))
+    .catch_unwind()
+    .await;
+    fixture.stop().await;
+    node.shutdown().await;
+    finish(result);
+}
+
+#[tokio::test]
+async fn fixed_yamux_budget_changes_isolate_live_clone_pools_in_both_directions() {
+    let node = shared_node("yamux", "body");
+    let (client, _) = node.test_xhttp_clients().unwrap();
+    let mut a = Fixture::new(client.clone(), false, 16, 256 * 1024);
+    let mut ordinary = client.clone();
+    ordinary.set_yamux_packet_up_send_retention(false);
+    let mut b = Fixture::new(ordinary.clone(), false, 16, 256 * 1024);
+    let mut enabled = ordinary.clone();
+    enabled.set_yamux_packet_up_send_retention(true);
+    let mut c = Fixture::new(enabled.clone(), false, 16, 256 * 1024);
+    let result = AssertUnwindSafe(timeout(LIMIT, async {
+        let peer_a = a.initialize().await;
+        let physical_a = native(&a);
+        native_prefix_in(&a, &physical_a, (96 * 1024 + 1)..=(128 * 1024)).await;
+
+        // A stays live in its active-only pool. The changed clone must dial
+        // instead of inheriting that existing 128 KiB physical.
+        let called = AtomicUsize::new(0);
+        assert!(
+            ordinary
+                .acquire(false, || async {
+                    called.fetch_add(1, Ordering::SeqCst);
+                    Err(io::Error::other("ordinary clone must dial"))
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+        let peer_b = b.initialize().await;
+        let physical_b = native(&b);
+        native_prefix(&b, &physical_b, false).await;
+
+        // The reverse change must not inherit B's live 64 KiB physical either.
+        let called = AtomicUsize::new(0);
+        assert!(
+            enabled
+                .acquire(false, || async {
+                    called.fetch_add(1, Ordering::SeqCst);
+                    Err(io::Error::other("enabled clone must dial"))
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+        let peer_c = c.initialize().await;
+        let physical_c = native(&c);
+        native_prefix_in(&c, &physical_c, (96 * 1024 + 1)..=(128 * 1024)).await;
+        assert_ne!(physical_a.stable_id(), physical_b.stable_id());
+        assert_ne!(physical_b.stable_id(), physical_c.stable_id());
+        for fixture in [&a, &b, &c] {
+            assert!(matches!(fixture.sender.as_ref().unwrap(),
+                SendRequest::H3(sender) if sender.udp_control.is_none()));
+        }
+        drop((peer_a, peer_b, peer_c));
+        node.shutdown().await;
+        assert!(physical_a.open_bi().await.is_err());
+        assert!(physical_b.open_bi().await.is_err());
+        assert!(physical_c.open_bi().await.is_err());
+        assert!(
+            client
+                .open_transport(tokio::time::Instant::now() + LIMIT, || async {
+                    panic!("stopped original owner dialed")
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            ordinary
+                .open_transport(tokio::time::Instant::now() + LIMIT, || async {
+                    panic!("stopped ordinary owner dialed")
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            enabled
+                .open_transport(tokio::time::Instant::now() + LIMIT, || async {
+                    panic!("stopped enabled owner dialed")
+                })
+                .await
+                .is_err()
+        );
+    }))
+    .catch_unwind()
+    .await;
+    node.shutdown().await;
+    a.stop().await;
+    b.stop().await;
+    c.stop().await;
+    finish(result);
+}
+
+#[tokio::test]
+async fn shared_h2_budget_context_clears_fixed_yamux_retention_and_isolates_its_pool() {
+    let node = shared_node("yamux", "body");
+    let (client, _) = node.test_xhttp_clients().unwrap();
+    let mut a = Fixture::new(client.clone(), false, 16, 256 * 1024);
+    let mut shared = client.clone();
+    shared.set_shared_packet_up_transport(true);
+    // Snapshot after shared(true), before any fixed setter can hide a latent
+    // flag. Returning to ordinary must build a real 64 KiB physical.
+    let mut restored = shared.clone();
+    restored.set_shared_packet_up_transport(false);
+    // A fixed-budget request cannot override the independent H2Mux context.
+    shared.set_yamux_packet_up_send_retention(true);
+    let mut b = Fixture::new(shared.clone(), false, 16, 256 * 1024);
+    let mut c = Fixture::new(restored.clone(), false, 16, 256 * 1024);
+    let result = AssertUnwindSafe(timeout(LIMIT, async {
+        let peer_a = a.initialize().await;
+        native_prefix_in(&a, &native(&a), (96 * 1024 + 1)..=(128 * 1024)).await;
+        let called = AtomicUsize::new(0);
+        assert!(
+            shared
+                .acquire(false, || async {
+                    called.fetch_add(1, Ordering::SeqCst);
+                    Err(io::Error::other("shared context must dial"))
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+        let peer_b = b.initialize().await;
+        let SendRequest::H3(sender) = b.sender.as_ref().unwrap() else {
+            panic!("not H3")
+        };
+        assert!(!sender.udp_control.as_ref().unwrap().was_raised());
+        native_prefix(&b, &native(&b), false).await;
+        assert!(!sender.udp_control.as_ref().unwrap().was_raised());
+        let peer_c = c.initialize().await;
+        assert_default_send_retention(&c).await;
+        drop((peer_a, peer_b, peer_c));
+    }))
+    .catch_unwind()
+    .await;
+    node.shutdown().await;
+    a.stop().await;
+    b.stop().await;
+    c.stop().await;
+    finish(result);
 }

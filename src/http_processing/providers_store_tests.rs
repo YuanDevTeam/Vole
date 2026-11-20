@@ -412,3 +412,55 @@ async fn disabled_sources_skip_fifo_and_unresolvable_cache_parent_without_io() {
     assert!(candidate.payloads.is_empty());
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
 }
+
+#[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+#[tokio::test]
+async fn platform_warmup_is_requested_only_by_active_actual_preparation() {
+    use crate::http_processing::{config::Policy, scripts};
+    // An infinite user program is valid finite-language source; actual prepare
+    // must not execute it, nor load the trusted prelude as a substitute.
+    let active_yaml = "http-scripts:\n  enabled: true\n  scripts:\n    - name: warmup-path\n      phase: response\n      url: 'http://example.test/'\n      match: prefix\n      source: 'function rewrite(input){while(true){}}'\n";
+    let requests = scripts::platform_prepare_requests_for_test();
+    scripts::validate_source("function rewrite(input){return {type:'pass'};}").unwrap();
+    let active = Document::parse(active_yaml).unwrap();
+    Policy::compile(active_yaml).unwrap();
+    active.http_scripts.ensure_available().unwrap();
+    assert_eq!(scripts::platform_prepare_requests_for_test(), requests);
+
+    let disabled =
+        Document::parse(&active_yaml.replace("enabled: true", "enabled: false")).unwrap();
+    let empty = Document::parse("http-scripts: {enabled: true, scripts: []}\n").unwrap();
+    let context = SourceContext::default();
+    let mut store = Store::new();
+    for document in [disabled, empty] {
+        store
+            .prepare(document, &context, None, &CancellationToken::new(), false)
+            .await
+            .unwrap();
+    }
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert_eq!(
+        store
+            .prepare(active.clone(), &context, None, &cancelled, false)
+            .await
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(scripts::platform_prepare_requests_for_test(), requests);
+    for expected in [requests + 1, requests + 2] {
+        store
+            .prepare(
+                active.clone(),
+                &context,
+                None,
+                &CancellationToken::new(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(scripts::platform_prepare_requests_for_test(), expected);
+    }
+}

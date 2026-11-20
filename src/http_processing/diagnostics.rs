@@ -55,6 +55,92 @@ pub(crate) enum Counter {
     LiteralReplaceBudgetFallback,
     LiteralReplaceSemanticFallback,
     LiteralReplaceApiFallback,
+    PlatformWarmupRequested,
+    PlatformWarmupStarted,
+    PlatformWarmupSucceeded,
+    PlatformWarmupFailed,
+    PlatformWarmupContextCreated,
+    PlatformWarmupContextReleased,
+    JscSelected,
+    PlanSelected,
+    PlanInputFallback,
+    PlanAstFallback,
+    PlanBuffersRejected,
+    PlanEntered,
+    PlanSucceeded,
+    PlanTimedOut,
+    PlanCancelled,
+    PlanFailed,
+    JscOwnerStarted,
+    JscOwnerJoined,
+    PlanOwnerStarted,
+    PlanOwnerJoined,
+    PlanFinalRecipeEntered,
+    PlanFinalDagEntered,
+    PlanInlineEntered,
+    PlanInlineReturned,
+    PlanInlinePanicked,
+    PlanInlineCpuUnavailable,
+    PlanHeaderGuardEntered,
+    PlanHeaderGuardTail,
+    PlanHeaderGuardPass,
+    PlanHeaderGuardAbort,
+    PlanFinalSingleStepEntered,
+    PlanOutputPendingAdmitted,
+    PlanOutputQueueFailed,
+    PlanOutputPayloadBudgetRejected,
+    // Platform TUN write observations share the existing diagnostic no-op.
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunWriteSingleSendAttempts,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunWriteSingleEnobufsErrors,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunWriteSingleSleep1msRequests,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunWriteSingleAcceptedPackets,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunWriteSingleWouldBlock,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunWriteBatchSendAttempts,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunWriteBatchEnobufsErrors,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunWriteBatchSleep1msRequests,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunWriteBatchAcceptedPackets,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunWriteBatchWouldBlock,
+    // Read outcomes and netstack handoff are different packet boundaries.
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunIngressReadOkPackets,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunIngressReadInvalidPacketOutcomes,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunIngressMtuExceededDrops,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunIngressNetstackAcceptedPackets,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunIngressNetstackBackpressureDrops,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunIngressIpv4DeclaredLengthExceedsReadSlice,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunIngressIpv6DeclaredLengthExceedsReadSlice,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunNetstackDriverDrivePasses,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunNetstackDriverTcpEntryVisits,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunNetstackDriverAppRxBytes,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunNetstackDriverAppTxBytes,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunNetstackDriverNoDataProgressPasses,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunNetstackDriverWaitIngress,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunNetstackDriverWaitNotify,
+    #[cfg_attr(not(feature = "tun"), allow(dead_code))]
+    TunNetstackDriverWaitTimer,
 }
 
 #[derive(Clone, Copy)]
@@ -67,6 +153,12 @@ pub(crate) enum Timing {
     Evaluation,
     ContextRelease,
     FinalParse,
+    ScopedOwner,
+    JscScopedOwner,
+    PlanScopedOwner,
+    PlanInlineDispatchWall,
+    PlanInlineWall,
+    PlanInlineThreadCpu,
 }
 
 #[derive(Clone, Copy)]
@@ -86,6 +178,44 @@ pub(crate) fn increment(counter: Counter) {
     enabled::STATS.increment(counter);
     #[cfg(not(feature = "http-diagnostics"))]
     let _ = counter;
+}
+
+#[cfg(feature = "http-diagnostics")]
+#[cfg_attr(not(feature = "tun"), allow(dead_code))]
+#[inline]
+pub(crate) fn add_counter(counter: Counter, value: u64) {
+    enabled::STATS.add_counter(counter, value);
+}
+
+// Observation only: a complete base header's declared length exceeds the
+// actual read slice. This is not an IP validator or proof of transport loss.
+#[inline]
+#[cfg_attr(not(feature = "tun"), allow(dead_code))]
+pub(crate) fn record_tun_ingress_header(packet: &[u8]) {
+    #[cfg(feature = "http-diagnostics")]
+    if let Some(counter) = tun_ingress_header_length_counter(packet) {
+        increment(counter);
+    }
+    #[cfg(not(feature = "http-diagnostics"))]
+    let _ = packet;
+}
+
+#[cfg(feature = "http-diagnostics")]
+#[cfg_attr(not(feature = "tun"), allow(dead_code))]
+fn tun_ingress_header_length_counter(packet: &[u8]) -> Option<Counter> {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) if packet.len() >= 20 => {
+            let declared = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+            (declared > packet.len())
+                .then_some(Counter::TunIngressIpv4DeclaredLengthExceedsReadSlice)
+        }
+        Some(6) if packet.len() >= 40 => {
+            let declared = 40 + usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+            (declared > packet.len())
+                .then_some(Counter::TunIngressIpv6DeclaredLengthExceedsReadSlice)
+        }
+        _ => None,
+    }
 }
 
 #[inline]
@@ -248,7 +378,17 @@ pub(crate) fn evaluation_finished(
 /// configuration, headers, body, certificate or private key is retained.
 #[cfg(feature = "http-diagnostics")]
 pub fn snapshot() -> serde_json::Value {
-    enabled::STATS.snapshot()
+    let value = enabled::STATS.snapshot();
+    #[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+    {
+        let mut value = value;
+        value["scopedScriptOwner"] = super::scripts::scoped_owner_qos_snapshot();
+        value
+    }
+    #[cfg(not(all(feature = "inbound-http", target_vendor = "apple")))]
+    {
+        value
+    }
 }
 
 #[cfg(feature = "http-diagnostics")]
@@ -258,7 +398,7 @@ mod enabled {
     use serde_json::{Map, Value, json};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    const COUNTERS: [&str; 45] = [
+    const COUNTERS: [&str; 104] = [
         "scriptMatched",
         "skipAsteriskBody",
         "skipBodyUnavailable",
@@ -304,8 +444,78 @@ mod enabled {
         "literalReplaceBudgetFallback",
         "literalReplaceSemanticFallback",
         "literalReplaceApiFallback",
+        "platformWarmupRequested",
+        "platformWarmupStarted",
+        "platformWarmupSucceeded",
+        "platformWarmupFailed",
+        "platformWarmupContextCreated",
+        "platformWarmupContextReleased",
+        "jscSelected",
+        "planSelected",
+        "planInputFallback",
+        "planAstFallback",
+        "planBuffersRejected",
+        "planEntered",
+        "planSucceeded",
+        "planTimedOut",
+        "planCancelled",
+        "planFailed",
+        "jscOwnerStarted",
+        "jscOwnerJoined",
+        "planOwnerStarted",
+        "planOwnerJoined",
+        "planFinalRecipeEntered",
+        "planFinalDagEntered",
+        "planInlineEntered",
+        "planInlineReturned",
+        "planInlinePanicked",
+        "planInlineCpuUnavailable",
+        "planHeaderGuardEntered",
+        "planHeaderGuardTail",
+        "planHeaderGuardPass",
+        "planHeaderGuardAbort",
+        "planFinalSingleStepEntered",
+        "planOutputPendingAdmitted",
+        "planOutputQueueFailed",
+        "planOutputPayloadBudgetRejected",
+        "tunWriteSingleSendAttempts",
+        "tunWriteSingleEnobufsErrors",
+        "tunWriteSingleSleep1msRequests",
+        "tunWriteSingleAcceptedPackets",
+        "tunWriteSingleWouldBlock",
+        "tunWriteBatchSendAttempts",
+        "tunWriteBatchEnobufsErrors",
+        "tunWriteBatchSleep1msRequests",
+        "tunWriteBatchAcceptedPackets",
+        "tunWriteBatchWouldBlock",
+        "tunIngressReadOkPackets",
+        "tunIngressReadInvalidPacketOutcomes",
+        "tunIngressMtuExceededDrops",
+        "tunIngressNetstackAcceptedPackets",
+        "tunIngressNetstackBackpressureDrops",
+        "tunIngressIpv4DeclaredLengthExceedsReadSlice",
+        "tunIngressIpv6DeclaredLengthExceedsReadSlice",
+        "tunNetstackDriverDrivePasses",
+        "tunNetstackDriverTcpEntryVisits",
+        "tunNetstackDriverAppRxBytes",
+        "tunNetstackDriverAppTxBytes",
+        "tunNetstackDriverNoDataProgressPasses",
+        "tunNetstackDriverWaitIngress",
+        "tunNetstackDriverWaitNotify",
+        "tunNetstackDriverWaitTimer",
     ];
-    const TIMINGS: [&str; 4] = ["queue", "evaluation", "contextRelease", "finalParse"];
+    const TIMINGS: [&str; 10] = [
+        "queue",
+        "evaluation",
+        "contextRelease",
+        "finalParse",
+        "scopedOwner",
+        "jscScopedOwner",
+        "planScopedOwner",
+        "planInlineDispatchWall",
+        "planInlineWall",
+        "planInlineThreadCpu",
+    ];
     const STAGES: [&str; 6] = [
         "contextAndCallback",
         "prelude",
@@ -423,6 +633,9 @@ mod enabled {
                 queue_current: AtomicU64::new(0),
                 queue_peak: AtomicU64::new(0),
             }
+        }
+        pub(super) fn add_counter(&self, counter: Counter, value: u64) {
+            add(&self.counters[counter as usize], value);
         }
         pub(super) fn increment(&self, counter: Counter) {
             add(&self.counters[counter as usize], 1);
@@ -546,6 +759,156 @@ mod enabled {
             let total = AtomicU64::new(u64::MAX - 1);
             add(&total, 3);
             assert_eq!(load(&total), u64::MAX);
+        }
+
+        #[test]
+        fn tun_ingress_ipv4_declared_length_is_observational_only() {
+            let mut packet = [0u8; 24];
+            packet[0] = 0x45;
+            for declared in [0u16, 19, 20, 23, 24] {
+                packet[2..4].copy_from_slice(&declared.to_be_bytes());
+                assert!(matches!(
+                    super::super::tun_ingress_header_length_counter(&packet),
+                    None
+                ));
+            }
+            packet[2..4].copy_from_slice(&25u16.to_be_bytes());
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&packet),
+                Some(super::super::Counter::TunIngressIpv4DeclaredLengthExceedsReadSlice)
+            ));
+            // IHL/options validity is outside this observation. Only the complete
+            // twenty-byte base and version select the declared-length comparison.
+            packet[0] = 0x4f;
+            packet[2..4].copy_from_slice(&24u16.to_be_bytes());
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&packet),
+                None
+            ));
+            packet[2..4].copy_from_slice(&25u16.to_be_bytes());
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&packet),
+                Some(super::super::Counter::TunIngressIpv4DeclaredLengthExceedsReadSlice)
+            ));
+        }
+
+        #[test]
+        fn tun_ingress_length_uses_read_slice_not_vec_capacity_or_backing() {
+            let mut ipv4 = Vec::with_capacity(4096);
+            ipv4.resize(20, 0u8);
+            ipv4[0] = 0x45;
+            ipv4[2..4].copy_from_slice(&21u16.to_be_bytes());
+            assert!(ipv4.capacity() > ipv4.len());
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&ipv4),
+                Some(super::super::Counter::TunIngressIpv4DeclaredLengthExceedsReadSlice)
+            ));
+            ipv4.resize(32, 0);
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&ipv4),
+                None
+            ));
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&ipv4[..20]),
+                Some(super::super::Counter::TunIngressIpv4DeclaredLengthExceedsReadSlice)
+            ));
+
+            let mut ipv6 = Vec::with_capacity(4096);
+            ipv6.resize(40, 0u8);
+            ipv6[0] = 0x60;
+            ipv6[4..6].copy_from_slice(&1u16.to_be_bytes());
+            assert!(ipv6.capacity() > ipv6.len());
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&ipv6),
+                Some(super::super::Counter::TunIngressIpv6DeclaredLengthExceedsReadSlice)
+            ));
+            ipv6.resize(41, 0);
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&ipv6),
+                None
+            ));
+        }
+
+        #[test]
+        fn tun_ingress_length_requires_complete_base_headers_and_known_version() {
+            for len in 0..20 {
+                let mut packet = vec![0u8; len];
+                if let Some(first) = packet.first_mut() {
+                    *first = 0x45;
+                }
+                if len >= 4 {
+                    packet[2..4].copy_from_slice(&u16::MAX.to_be_bytes());
+                }
+                assert!(matches!(
+                    super::super::tun_ingress_header_length_counter(&packet),
+                    None
+                ));
+            }
+            for len in 0..40 {
+                let mut packet = vec![0u8; len];
+                if let Some(first) = packet.first_mut() {
+                    *first = 0x60;
+                }
+                if len >= 6 {
+                    packet[4..6].copy_from_slice(&u16::MAX.to_be_bytes());
+                }
+                assert!(matches!(
+                    super::super::tun_ingress_header_length_counter(&packet),
+                    None
+                ));
+            }
+            for version in [0u8, 1, 5, 7, 15] {
+                let mut packet = [0xffu8; 40];
+                packet[0] = version << 4;
+                assert!(matches!(
+                    super::super::tun_ingress_header_length_counter(&packet),
+                    None
+                ));
+            }
+        }
+
+        #[test]
+        fn tun_ingress_ipv6_declared_length_adds_base_without_u16_wrap_or_jumbo_guess() {
+            let mut packet = [0u8; 48];
+            packet[0] = 0x60;
+            for payload in [0u16, 1, 7, 8] {
+                packet[4..6].copy_from_slice(&payload.to_be_bytes());
+                assert!(matches!(
+                    super::super::tun_ingress_header_length_counter(&packet),
+                    None
+                ));
+            }
+            packet[4..6].copy_from_slice(&9u16.to_be_bytes());
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&packet),
+                Some(super::super::Counter::TunIngressIpv6DeclaredLengthExceedsReadSlice)
+            ));
+            packet[4..6].copy_from_slice(&u16::MAX.to_be_bytes());
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&packet),
+                Some(super::super::Counter::TunIngressIpv6DeclaredLengthExceedsReadSlice)
+            ));
+
+            // Zero-filled synthetic storage; declared length is 65535 + 40 in usize,
+            // not u16 arithmetic. Equality and one-byte-short remain distinct.
+            let mut maximum = vec![0u8; usize::from(u16::MAX) + 40];
+            maximum[0] = 0x60;
+            maximum[4..6].copy_from_slice(&u16::MAX.to_be_bytes());
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&maximum),
+                None
+            ));
+            maximum.truncate(maximum.len() - 1);
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&maximum),
+                Some(super::super::Counter::TunIngressIpv6DeclaredLengthExceedsReadSlice)
+            ));
+            // payload_length = 0 does not inspect or infer a Jumbo Payload option.
+            maximum[4..6].copy_from_slice(&0u16.to_be_bytes());
+            assert!(matches!(
+                super::super::tun_ingress_header_length_counter(&maximum),
+                None
+            ));
         }
     }
 }

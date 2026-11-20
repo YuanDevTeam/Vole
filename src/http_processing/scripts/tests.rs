@@ -1714,7 +1714,7 @@ async fn apple_bounded_bridge_retained_slices_and_extra_live_through_actual_cont
     let length = 4096;
     // Trusted ABI-only vector forces four outputs past the small slot. The
     // production proof does not come from this raw initializer.
-    let code=CompiledSource{code:"function rewrite(input){let flags='';for(let i=0;i<5;i++){const v=__voleReplaceASCIIAll(input.body.data,input.body.data.length,113,122);flags+=v===undefined?'0':'1';}return {type:'modify',headers:[{op:'set',name:'x-native',values:[flags]}],body:{kind:'text',data:input.body.data}};}".into(),output_bound:OutputBound::InputOrConstant{maximum_literal_bytes:0}};
+    let code=CompiledSource{code:"function rewrite(input){let flags='';for(let i=0;i<5;i++){const v=__voleReplaceASCIIAll(input.body.data,input.body.data.length,113,122);flags+=v===undefined?'0':'1';}return {type:'modify',headers:[{op:'set',name:'x-native',values:[flags]}],body:{kind:'text',data:input.body.data}};}".into(),output_bound:OutputBound::InputOrConstant{maximum_literal_bytes:0},..Default::default()};
     let plan = BridgePlan::new(length, true, length).unwrap();
     let budget = Budget::default();
     let mut output = BudgetedBytes::new(&budget, length).unwrap();

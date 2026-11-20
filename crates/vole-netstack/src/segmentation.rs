@@ -182,6 +182,11 @@ pub(crate) struct PathMtu {
 }
 
 impl PathMtu {
+    /// With no learned path, every flow still uses the interface MTU.
+    pub(crate) fn has_reductions(&self) -> bool {
+        !self.paths.is_empty()
+    }
+
     pub(crate) fn emitted(&mut self, packet: &Packet) {
         let Some(view) = TcpView::parse(packet.data(), false) else {
             return;

@@ -140,6 +140,7 @@ Vole builds on and learns from public dependencies, protocol implementations and
 
 - TUN dependencies: the local [`vole-netstack`](crates/vole-netstack/README.md) uses [smoltcp](https://github.com/smoltcp-rs/smoltcp); Unix and Windows Wintun packet I/O use [tun-rs](https://github.com/tun-rs/tun-rs) (Apache-2.0).
 - Provider case mapping uses Rust's standard Unicode case conversion through a bounded adapter.
+- HTTP/2 uses a reviewed local copy of [h2](https://github.com/hyperium/h2) 0.4.20 (MIT), with a per-instance initial-write allocation hint. The unchanged [upstream notice](vendor/h2/LICENSE), [source provenance and patch](scripts/native/h2/README.md) accompany the modified source; the default remains 16 KiB.
 - WireGuard: [boringtun](https://github.com/cloudflare/boringtun) (BSD-3-Clause), without host-device, FFI or JNI features.
 - [Wintun](https://www.wintun.net/): the runtime DLL is supplied by the host, not bundled. The upstream [API header](https://github.com/tun-rs/tun-rs/blob/2.8.11/src/platform/windows/tun/wintun.h) included by tun-rs is copyright 2018–2021 WireGuard LLC, licensed `GPL-2.0 OR MIT`; distribution of the linked API bindings must retain its copyright and MIT alternative license notice.
 - Offline archives: [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2) and [lzma-rust2](https://github.com/hasenbanck/lzma-rust2) (Apache-2.0), used through a bounded member reader.

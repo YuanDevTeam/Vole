@@ -332,6 +332,15 @@ impl Hysteria2Outbound {
 
 #[async_trait]
 impl OutboundConnector for Hysteria2Outbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        !self.cancel.is_cancelled()
+            && self.config.hopping.is_none()
+            && self.config.realm.is_none()
+            && self.tls.permits_static_http_reuse()
+            && self.upstream.permits_static_direct_http_reuse(&self.server)
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,

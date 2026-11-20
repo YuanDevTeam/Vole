@@ -18,6 +18,7 @@ mod datagram_codec;
 mod packet_io;
 mod packet_window;
 mod plugin;
+mod response_header;
 mod stream;
 mod uot;
 
@@ -105,6 +106,14 @@ impl ShadowsocksOutbound {
 
 #[async_trait]
 impl OutboundConnector for ShadowsocksOutbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        self.plugin
+            .as_ref()
+            .is_none_or(|owner| owner.permits_http_tcp_reuse())
+            && self.upstream.permits_static_http_reuse(&self.server)
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,
@@ -121,10 +130,19 @@ impl OutboundConnector for ShadowsocksOutbound {
                 .await?
                 .io
         };
+        let io = match &self.plugin {
+            Some(owner) => owner.prepare_ss_response(io, self.config.method())?,
+            None => io,
+        };
         let stream =
             stream::SsStream::new(self.context.clone(), io, &self.config, address(&target));
+        let stream: BoxStream = Box::new(stream);
+        let stream = match &self.plugin {
+            Some(owner) => owner.bind_stream(stream),
+            None => stream,
+        };
         Ok(ConnectedStream {
-            io: Box::new(stream),
+            io: stream,
             effective_peer: target,
         })
     }
@@ -187,6 +205,11 @@ impl OutboundConnector for ShadowsocksOutbound {
 
 #[async_trait]
 impl Dispatcher for ShadowsocksOutbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        OutboundConnector::permits_http_tcp_reuse(self)
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         OutboundConnector::connect_stream(self, session, &EstablishContext::default())
             .await
@@ -233,3 +256,20 @@ fn safe_io(error: io::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "inbound-http"))]
+pub(super) mod testing;
+
+#[cfg(all(test, feature = "shadow-tls-v3"))]
+pub(crate) fn memory_test_ss_stack_stream(
+    io: BoxStream,
+    config: &ServerConfig,
+    target: &Destination,
+) -> BoxStream {
+    Box::new(stream::SsStream::new(
+        Context::new_shared(ServerType::Local),
+        io,
+        config,
+        address(target),
+    ))
+}

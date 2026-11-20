@@ -132,7 +132,8 @@ jobs:
           for spec in boring_specs:
               require(spec.get("git") == boring_repository and spec.get("rev") == boring_revision and not {"path", "branch", "tag"} & spec.keys(), "Boring dependencies and patches must share one Git commit source")
           boring_source = f"git+{boring_repository}?rev={boring_revision}#{boring_revision}"
-          require(not (workspace_root / "vendor").exists(), "Core vendor sources are forbidden")
+          from vole_scripts.h2_source import audit_h2_source
+          audit_h2_source(workspace_root, metadata)
           require(not (workspace_root / "crates" / "vole-blake3-raw" / "vendor").exists(), "BLAKE3 must use the installed official C library")
           native_manifest = json.loads((workspace_root / "scripts" / "native" / "blake3" / "vcpkg.json").read_text(encoding="utf-8"))
           require(native_manifest.get("builtin-baseline") == "9eec002df1cd109f8f104cd966a763daf9751489", "unapproved official BLAKE3 C registry baseline")
@@ -285,6 +286,7 @@ jobs:
             controller_secure_
             outbound::http::tests:: outbound::wireguard::tests:: inbound::mixed::tests:: inbound::socks5::association::tests::
             inbound::http::parser::tests:: inbound::http::framing::tests::
+            http_processing::h2_frame_validation::
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
             outbound::trusttunnel:: outbound::mieru:: outbound::masque:: security::masque:: config::masque::

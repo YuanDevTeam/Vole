@@ -869,6 +869,29 @@ impl AsyncWrite for GenerationStream {
         Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
+
+#[cfg(target_os = "macos")]
+fn pin_tun_send_generation<T: Send + Sync + 'static>(
+    pending: crate::dispatch::TunPendingSend,
+    generation: Arc<T>,
+) -> crate::dispatch::TunPendingSend {
+    let crate::dispatch::TunPendingSend {
+        operation,
+        completion,
+    } = pending;
+    crate::dispatch::TunPendingSend {
+        operation: Box::pin(async move {
+            let _generation = generation;
+            operation.await
+        }),
+        completion,
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "providers_tun_send_memory_tests.rs"]
+mod tun_send_memory_tests;
+
 struct GenerationDatagram {
     io: Box<dyn DatagramTransport>,
     _generation: Arc<Generation>,
@@ -882,6 +905,27 @@ impl DatagramTransport for GenerationDatagram {
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         self.io.payload_budget(peer)
     }
+
+    #[cfg(target_os = "macos")]
+    fn try_begin_tun_send(
+        &mut self,
+        datagram: Datagram,
+        flow_id: Option<&[u8]>,
+    ) -> Result<crate::dispatch::TunPendingSend, Datagram> {
+        self.io
+            .try_begin_tun_send(datagram, flow_id)
+            .map(|pending| pin_tun_send_generation(pending, self._generation.clone()))
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn finish_tun_send(
+        &mut self,
+        completion: crate::dispatch::TunSendToken,
+        outcome: crate::dispatch::TunSendOutcome,
+    ) -> Result<(), DispatchError> {
+        self.io.finish_tun_send(completion, outcome).await
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         self.io.send(datagram).await
     }

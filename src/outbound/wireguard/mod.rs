@@ -2,6 +2,8 @@
 mod channel;
 mod datagram;
 mod engine;
+#[cfg(all(test, feature = "inbound-http"))]
+mod http_reuse_memory_tests;
 mod peer;
 mod resolver;
 mod routes;
@@ -89,6 +91,38 @@ impl WireGuardOutbound {
 }
 #[async_trait]
 impl OutboundConnector for WireGuardOutbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        if self.cancel.is_cancelled() || self.config.peers.is_empty() {
+            return false;
+        }
+        // The validated private config fixes all keys, routes and actual peers.
+        // Follow Driver::endpoint for each peer, not the representative address.
+        let fixed = self.config.peers.iter().all(|peer| {
+            let Ok(server) = super::server_destination(&peer.address, peer.port) else {
+                return false;
+            };
+            if !matches!(server, Destination::Ip(_)) {
+                return false;
+            }
+            if !self
+                .upstream
+                .for_server(&server, false)
+                .permits_static_direct_http_reuse(&server)
+            {
+                return false;
+            }
+            // Literal refresh uses the same immutable physical Dialer/IP4P
+            // policy; equal endpoints retain their existing carrier and Noise.
+            self.config.refresh_server_ip_interval == 0
+                || self
+                    .upstream
+                    .for_server(&server, true)
+                    .permits_static_direct_http_reuse(&server)
+        });
+        fixed && !self.cancel.is_cancelled()
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,

@@ -490,7 +490,8 @@ impl Dialer {
             || self.dns_binding.is_some()
             || self.source_binding.is_some()
             || self.egress.interface.is_some()
-            || self.mptcp
+            // macOS currently keeps this preference on ordinary TCP sockets.
+            || (self.mptcp && !cfg!(target_os = "macos"))
             || self.ip_version != crate::config::IpVersion::Dual
         {
             return false;

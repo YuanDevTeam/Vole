@@ -191,23 +191,39 @@ impl Drop for Lifetime {
 pub(crate) fn new(raw: BoxStream) -> (Client, impl Future<Output = ()> + Send) {
     with_options(raw, Options::default()).expect("valid default smux options")
 }
-#[cfg(any(feature = "sing-mux", test))]
+#[cfg(test)]
 pub(crate) fn new_with_autonomous_writes(
     raw: BoxStream,
     autonomous_writes: bool,
 ) -> (Client, impl Future<Output = ()> + Send) {
-    configure(raw, Options::default(), autonomous_writes).expect("valid default smux options")
+    configure(raw, Options::default(), autonomous_writes, false)
+        .expect("valid default smux options")
+}
+#[cfg(any(feature = "sing-mux", test))]
+pub(crate) fn new_with_queued_flush_coalescing(
+    raw: BoxStream,
+    autonomous_writes: bool,
+    coalesce_queued_flush: bool,
+) -> (Client, impl Future<Output = ()> + Send) {
+    configure(
+        raw,
+        Options::default(),
+        autonomous_writes,
+        coalesce_queued_flush,
+    )
+    .expect("valid default smux options")
 }
 pub(crate) fn with_options(
     raw: BoxStream,
     options: Options,
 ) -> io::Result<(Client, impl Future<Output = ()> + Send)> {
-    configure(raw, options, false)
+    configure(raw, options, false, false)
 }
 fn configure(
     raw: BoxStream,
     options: Options,
     autonomous_writes: bool,
+    coalesce_queued_flush: bool,
 ) -> io::Result<(Client, impl Future<Output = ()> + Send)> {
     if !(1..=2).contains(&options.version)
         || !(1..=65535).contains(&options.frame_size)
@@ -219,6 +235,8 @@ fn configure(
     {
         return Err(io::ErrorKind::InvalidInput.into());
     }
+    // The typed VLESS factory grants this only before the pool is used.
+    let coalesce_queued_flush = coalesce_queued_flush && autonomous_writes;
     let receive_budget = Arc::new(tokio::sync::Semaphore::new(options.receive_buffer));
     let epoch = tokio::time::Instant::now();
     let last_read = Arc::new(AtomicU64::new(0));
@@ -428,7 +446,10 @@ fn configure(
                                     && entry.flow.update.load(Ordering::Acquire))
                         })
                     };
-                    if flush_barrier
+                    // A queued strong ticket may share one later real flush
+                    // with already queued commands. No write crosses a Pending
+                    // flush and no receipt is completed before that real flush.
+                    if (flush_barrier && !coalesce_queued_flush)
                         || result.is_err()
                         || count == crate::limits::SING_MUX_COMMAND_QUEUE
                         || processed + count >= crate::limits::IO_POLL_BUDGET
@@ -1482,6 +1503,197 @@ mod tests {
             })
             .await
             .unwrap();
+        }
+    }
+    #[cfg(all(feature = "sing-mux", feature = "outbound-vless"))]
+    mod h3_queued_flush_memory_tests {
+        use super::*;
+        use crate::{
+            dispatch::{DatagramTransport, DispatchError},
+            outbound::{
+                ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector,
+                SingMuxConnector,
+            },
+            session::{Destination, InboundKind, StreamSession},
+        };
+        use futures_util::FutureExt;
+        use std::panic::{AssertUnwindSafe, resume_unwind};
+
+        struct MemoryCarrier(Mutex<Option<BoxStream>>);
+        #[async_trait::async_trait]
+        impl OutboundConnector for MemoryCarrier {
+            async fn connect_stream(
+                &self,
+                session: StreamSession,
+                _: &EstablishContext,
+            ) -> Result<ConnectedStream, DispatchError> {
+                let io = self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| io::Error::other("second physical carrier"))?;
+                Ok(ConnectedStream {
+                    io,
+                    effective_peer: session.destination,
+                })
+            }
+            async fn open_datagram(
+                &self,
+                _: DatagramRequest,
+                _: &EstablishContext,
+            ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+                panic!("memory Smux fixture must use its supplied TCP carrier")
+            }
+            async fn shutdown(&self) {}
+        }
+
+        fn proxy(
+            alpn: &str,
+            mode: &str,
+            placement: &str,
+            split: bool,
+            only_tcp: bool,
+        ) -> crate::config::ProxyConfig {
+            let mut xhttp = serde_json::json!({"path":"/x", "mode":mode});
+            if placement != "body" {
+                xhttp["uplink-data-placement"] = placement.into();
+                if placement != "auto" {
+                    xhttp["uplink-data-key"] = "payload".into();
+                }
+            }
+            if split {
+                xhttp["download-settings"] = serde_json::json!({});
+            }
+            let raw = serde_json::json!({
+                "proxies":[{"name":"memory", "type":"vless", "server":"192.0.2.1", "port":443,
+                    "uuid":"00000000-0000-0000-0000-000000000001", "tls":true, "alpn":[alpn],
+                    "network":"xhttp", "xhttp-opts":xhttp,
+                    "smux":{"enabled":true,"protocol":"smux","max-connections":1,
+                        "padding":false,"only-tcp":only_tcp}}],
+                "rules":["MATCH,DIRECT"]
+            });
+            crate::config::Config::parse_yaml(raw.to_string().as_bytes())
+                .unwrap()
+                .proxies
+                .remove(0)
+        }
+
+        async fn observe(proxy: crate::config::ProxyConfig, outcome: u8) -> usize {
+            let (raw, peer) = tokio::io::duplex(65536);
+            let gate = Arc::new(FlushGateState::default());
+            gate.mode.store(1, Ordering::Release);
+            let carrier = Arc::new(MemoryCarrier(Mutex::new(Some(Box::new(FlushGate {
+                raw,
+                state: gate.clone(),
+            })))));
+            let node = SingMuxConnector::new(carrier, proxy.smux.as_ref().unwrap().clone())
+                .with_autonomous_xhttp(&proxy);
+            let observed = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(2), async {
+                let session = StreamSession {
+                    metadata: Default::default(),
+                    inbound: InboundKind::Socks5,
+                    source: "192.0.2.3:40001".parse().unwrap(),
+                    destination: Destination::domain("memory.invalid", 443).unwrap(),
+                    sniffed_domain: None,
+                };
+                let context = EstablishContext::default();
+                let mut first = node
+                    .connect_stream(session.clone(), &context)
+                    .await
+                    .unwrap();
+                let mut second = node.connect_stream(session, &context).await.unwrap();
+                first.io.write_all(b"first").await.unwrap();
+                second.io.write_all(b"second").await.unwrap();
+                // Empty writes observe both actual autonomous DATA receipts;
+                // no extra DATA or strong flush is introduced by this setup.
+                assert_eq!(first.io.write(b"").await.unwrap(), 0);
+                assert_eq!(second.io.write(b"").await.unwrap(), 0);
+                let before = gate.flushes.load(Ordering::Acquire);
+                gate.mode.store(0, Ordering::Release);
+                let mut a = Box::pin(first.io.flush());
+                let mut b = Box::pin(second.io.flush());
+                // On the current-thread runtime both tickets are queued before
+                // the owned real Smux driver can run.
+                assert!(futures_util::poll!(a.as_mut()).is_pending());
+                assert!(futures_util::poll!(b.as_mut()).is_pending());
+                tokio::task::yield_now().await;
+                assert!(futures_util::poll!(a.as_mut()).is_pending());
+                assert!(futures_util::poll!(b.as_mut()).is_pending());
+                assert_eq!(gate.flushes.load(Ordering::Acquire), before);
+                // Cancellation retains the real Stream's pending receiver;
+                // the retry must not enqueue another strong ticket.
+                drop(a);
+                let mut a = Box::pin(first.io.flush());
+                assert!(futures_util::poll!(a.as_mut()).is_pending());
+                if outcome == 3 {
+                    node.begin_shutdown();
+                } else {
+                    gate.mode.store(outcome, Ordering::Release);
+                    gate.changed.wake();
+                }
+                let (a_result, b_result) = tokio::join!(a, b);
+                if outcome == 1 {
+                    assert!(a_result.is_ok() && b_result.is_ok());
+                } else {
+                    assert!(
+                        a_result.is_err() && b_result.is_err(),
+                        "failed/Stopped flush acknowledged bytes"
+                    );
+                }
+                gate.flushes.load(Ordering::Acquire) - before
+            }))
+            .catch_unwind()
+            .await;
+            // Every assertion/error/timeout is reported only after Stop joins
+            // the actual factory-owned driver and the memory peer is dropped.
+            node.shutdown().await;
+            drop(node);
+            drop(peer);
+            match observed {
+                Ok(result) => result.expect("bounded factory Smux fixture timed out"),
+                Err(panic) => resume_unwind(panic),
+            }
+        }
+
+        #[tokio::test]
+        async fn qualified_factory_coalesces_queued_flushes_without_early_success() {
+            for placement in ["body", "auto"] {
+                let successful =
+                    observe(proxy("h3", "packet-up", placement, false, false), 1).await;
+                assert_eq!(
+                    successful, 1,
+                    "two already queued tickets used separate real flushes"
+                );
+            }
+            assert_eq!(
+                observe(proxy("h3", "packet-up", "body", false, false), 2).await,
+                0
+            );
+            assert_eq!(
+                observe(proxy("h3", "packet-up", "body", false, false), 3).await,
+                0
+            );
+        }
+
+        #[tokio::test]
+        async fn excluded_factories_keep_separate_queued_flush_boundaries() {
+            for (alpn, mode, placement, split, only_tcp) in [
+                ("http/1.1", "packet-up", "body", false, false),
+                ("h2", "packet-up", "body", false, false),
+                ("h3", "stream-up", "body", false, false),
+                ("h3", "stream-one", "body", false, false),
+                ("h3", "packet-up", "header", false, false),
+                ("h3", "packet-up", "cookie", false, false),
+                ("h3", "packet-up", "body", true, false),
+                ("h3", "packet-up", "body", false, true),
+            ] {
+                assert_eq!(
+                    observe(proxy(alpn, mode, placement, split, only_tcp), 1).await,
+                    2,
+                    "excluded {alpn}/{mode}/{placement}/{split}/{only_tcp} coalesced"
+                );
+            }
         }
     }
 }

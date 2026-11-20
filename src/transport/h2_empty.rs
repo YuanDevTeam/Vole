@@ -15,6 +15,10 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+// Keep recently cancelled TrustTunnel streams through a burst of CONNECTs
+// so the h2 client can discard responses already in flight.
+pub(super) const RECENT_RESET_STREAMS: usize = 256;
+
 #[derive(Clone, Default)]
 pub(super) struct Registry(Arc<RegistryInner>);
 
@@ -481,7 +485,7 @@ impl AsyncWrite for EmptyIo {
 #[cfg(test)]
 mod tests {
     use super::super::h2_write::{Payload, Writes};
-    use super::{Registry, Send, Ticket};
+    use super::{RECENT_RESET_STREAMS, Registry, Send, Ticket};
     use crate::{
         dispatch::BoxStream,
         resources::observation::{self, ResourceKind, ResourceProbe},
@@ -517,6 +521,7 @@ mod tests {
                 .enable_push(false)
                 .initial_window_size(64 * 1024)
                 .initial_connection_window_size(128 * 1024)
+                .max_concurrent_reset_streams(RECENT_RESET_STREAMS)
                 .handshake::<_, Payload>(registry.wrap(Box::new(raw)))
                 .await
                 .unwrap();
@@ -721,6 +726,85 @@ mod tests {
         assert_eq!(response.status(), 200);
         ticket.admission().activate();
         response.into_body()
+    }
+
+    #[tokio::test]
+    async fn recently_cancelled_connect_retains_late_response_state() {
+        let probe = ResourceProbe::default();
+        let result = timeout(
+            DEADLINE,
+            probe.scope(async {
+                let (mut client, mut peer) = raw_peer().await;
+                let (response, send, ticket, sibling_id) = client.request().await;
+                let mut sibling = admit_raw(&mut peer, response, &ticket, sibling_id, false).await;
+
+                let mut cancelled = 0;
+                for _ in 0..192 {
+                    let (response, mut send, ticket, id) = client.request().await;
+                    request_reached_peer(&mut peer, id).await;
+                    ticket.close();
+                    send.send_reset(h2::Reason::CANCEL);
+                    drop((response, send, ticket));
+                    loop {
+                        let (kind, _, incoming, payload) = read_frame(&mut peer).await;
+                        if kind == 3 && incoming == id {
+                            assert_eq!(payload, u32::from(h2::Reason::CANCEL).to_be_bytes());
+                            break;
+                        }
+                    }
+                    cancelled = id;
+                }
+
+                // The last CONNECT closes before its response reaches the
+                // client. Its already-sent headers and final DATA arrive
+                // together with the sibling's response on the same carrier.
+                let marker = *b"retained";
+                let mut batch = frame(1, 4, cancelled, &[0x88]);
+                batch.extend(frame(0, 1, cancelled, b"late"));
+                batch.extend(frame(0, 1, sibling_id, b"alive"));
+                batch.extend(frame(6, 0, 0, &marker));
+                peer.write_all(&batch).await.unwrap();
+
+                let mut redundant_resets = Vec::new();
+                loop {
+                    let (kind, flags, id, payload) = read_frame(&mut peer).await;
+                    if kind == 3 && id == cancelled {
+                        redundant_resets
+                            .push(u32::from_be_bytes(payload.as_slice().try_into().unwrap()));
+                    }
+                    if (kind, flags, id) == (6, 1, 0) && payload == marker {
+                        break;
+                    }
+                }
+                // PONG bypasses the stream output queue. A subsequently
+                // submitted request observes earlier stream output before Stop.
+                let (next_response, next_send, next_ticket, next_id) = client.request().await;
+                loop {
+                    let (kind, _, id, payload) = read_frame(&mut peer).await;
+                    if kind == 3 && id == cancelled {
+                        redundant_resets
+                            .push(u32::from_be_bytes(payload.as_slice().try_into().unwrap()));
+                    }
+                    if kind == 1 && id == next_id {
+                        break;
+                    }
+                }
+                let received = body(&mut sibling).await;
+                client.stop().await;
+                drop((next_response, next_send, next_ticket));
+                drop((sibling, send, ticket, client, peer));
+                (redundant_resets, received)
+            }),
+        )
+        .await
+        .expect("cancelled CONNECT fixture failed to complete");
+        assert!(probe.snapshot().is_idle());
+        assert!(
+            result.0.is_empty(),
+            "late response reset the closed CONNECT again: {:?}",
+            result.0
+        );
+        assert_eq!(result.1, b"alive");
     }
 
     #[tokio::test]

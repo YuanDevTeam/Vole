@@ -149,6 +149,13 @@ impl TrojanOutbound {
 
 #[async_trait]
 impl OutboundConnector for TrojanOutbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        !self.cancellation.is_cancelled()
+            && self.security.permits_static_http_reuse()
+            && self.upstream.permits_static_http_reuse(&self.server)
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,

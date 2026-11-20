@@ -54,10 +54,20 @@ Read the relevant document completely before changing that area:
 5. Packaged Windows VPN uses official `Windows.Networking.Vpn` through `windows-rs`. `VpnPacketBuffer` bytes are copied within callbacks. After acquiring a framework buffer, return it to Windows before propagating any later local error; a return-API failure propagates the platform error and fails closed. Every framework buffer is returned exactly once. Network changes stop this path; they do not silently rebind or reconnect.
 6. Reuse the existing raw-IP netstack, runtime and outbound graph. Windows WinRT VPN and desktop Wintun use separate platform adapters with the shared Dialer and synchronous stop barrier; Wintun's DLL and first-release network configuration are host-owned. Add no second Windows proxy core, per-protocol socket factory or fake fd layer.
 7. Keep optional protocol/platform code feature- and target-gated. Default non-TUN builds must continue to compile.
-8. When copying or modifying third-party source, record the upstream project and preserve all applicable license terms. Audit linked dependencies against the resolved release graph. Do not describe independent rewrites, protocol interoperability, or architectural references as derived source without evidence; Credits provide context and attribution, not a substitute for release license review.
+8. Use official third-party releases through supported public APIs. Do not vendor, copy or embed third-party source in Vole, or modify or patch third-party source, without the user's explicit approval for that dependency and scope. The existing Boring exception is limited to the scope in `docs/tls-dependencies.md`; it does not authorize other dependencies or broader changes. Preserve upstream attribution and applicable license terms, and audit linked dependencies against the resolved release graph. Do not describe independent rewrites, protocol interoperability, or architectural references as derived source without evidence; Credits provide context and attribution, not a substitute for release license review.
 9. Keep every public surface—code, documentation, tests, examples, commits, issues, pull requests, reviews, CI output, and releases—limited to Vole and public dependencies. Keep private downstream repository or product identities, links, implementation details, status, artifacts, and roadmaps outside this repository and its GitHub surfaces. Before publishing, search the staged diff and proposed GitHub text for downstream identifiers.
 10. Make changes on a separate branch, never directly on `main`.
-11. Use the official latest stable third-party dependencies, including test-only experiments. Check current non-prerelease, non-yanked releases when selecting or upgrading them; reference projects' old pins are not a version policy. Keep lockfiles for reproducible validation, refresh affected dependency audits, and rerun applicable tests. If freshness conflicts with the approved fork/provider or a platform's compatible dependency set, report the conflict and obtain an explicit exception or scope decision instead of silently retaining an old version or changing the security architecture.
+11. Use the latest stable versions of third-party dependencies, including test-only experiments. Check current non-prerelease, non-yanked releases when selecting or upgrading them; reference projects' old pins are not a version policy. Keep lockfiles for reproducible validation, refresh affected dependency audits, and rerun applicable tests. If freshness conflicts with an explicitly approved dependency scope or a platform's compatible dependency set, report the conflict and obtain an explicit version exception or scope decision instead of silently retaining an old version or changing the security architecture. Version exceptions do not expand the source-change approvals in rule 8.
+
+## Commit messages
+
+- Write one English imperative sentence on a single line, without a body or final punctuation.
+- Aim for 50 characters and keep the entire message within 72 characters.
+- State the concrete change with a verb and its object; use one commit for one purpose.
+- Keep type prefixes, ticket IDs, test results and benchmark numbers in their own records rather than the message.
+- Commit each independent optimization after its relevant checks; preserve unsuccessful measurements in the benchmark records.
+
+Examples: `Reuse HTTP2 upstream connections`; `End empty HTTP2 requests in headers`.
 
 # Validation
 

@@ -56,6 +56,18 @@ impl SingMuxConnector {
                     if config.xhttp().is_some_and(|xhttp| xhttp.mode == crate::config::XHttpMode::PacketUp)
             );
         self.pool.set_autonomous_writes(enabled, h2_packet_up);
+        let h3_packet_body = enabled
+            && matches!(
+                &proxy.protocol,
+                crate::config::ProxyProtocol::Vless(config)
+                    if config.xhttp().is_some_and(|xhttp|
+                        xhttp.http_version == crate::config::XHttpVersion::Http3
+                        && xhttp.mode == crate::config::XHttpMode::PacketUp
+                        && xhttp.download.is_none()
+                        && matches!(&xhttp.request.data, crate::config::xhttp::DataPlacement::Body))
+            );
+        self.pool.set_h3_queued_flush_coalescing(h3_packet_body);
+        self.pool.set_h3_udp_lane(h3_packet_body);
         self
     }
     #[cfg(target_os = "linux")]
@@ -176,6 +188,11 @@ fn exclusive_tcp(proxy: &crate::config::ProxyConfig) -> bool {
 }
 #[async_trait]
 impl OutboundConnector for SingMuxConnector {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        !self.cancellation.is_cancelled() && self.inner.permits_http_tcp_reuse()
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,
@@ -309,6 +326,9 @@ mod tests {
             });
             let node = SingMuxConnector::new(inner, proxy.smux.as_ref().unwrap().clone())
                 .with_autonomous_xhttp(proxy);
+            if protocol == "yamux" {
+                assert!(!node.pool.captures_h3_udp());
+            }
             assert_eq!(
                 node.pool.autonomous_writes(),
                 expected,
@@ -740,5 +760,425 @@ mod tests {
             before_flush.is_some(),
             "private h2mux must hand the final DATA to its driver before a later flush"
         );
+    }
+}
+
+#[cfg(all(test, feature = "outbound-vless"))]
+mod h3_udp_lane_memory_tests {
+    use super::*;
+    use crate::{
+        dispatch::{BoxStream, DatagramBudget},
+        resources::observation::ResourceProbe,
+        session::{Datagram, DatagramSession, InboundKind},
+    };
+    use bytes::Bytes;
+    use futures_util::{FutureExt, task::AtomicWaker};
+    use std::{
+        collections::HashMap,
+        panic::{AssertUnwindSafe, resume_unwind},
+        pin::Pin,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+    use tokio::sync::Notify;
+
+    const TCP_PAYLOAD: &[u8] = b"tcp-owned-lane";
+    const UDP_PAYLOAD: &[u8] = b"udp-first-strong-frame";
+
+    #[derive(Default)]
+    struct FlushGate {
+        blocked: AtomicBool,
+        reached: AtomicBool,
+        writer: AtomicWaker,
+        changed: Notify,
+    }
+    impl FlushGate {
+        fn release(&self) {
+            self.blocked.store(false, Ordering::Release);
+            self.writer.wake();
+        }
+        async fn wait_reached(&self) {
+            loop {
+                let changed = self.changed.notified();
+                if self.reached.load(Ordering::Acquire) {
+                    return;
+                }
+                changed.await;
+            }
+        }
+    }
+    struct GatedIo {
+        raw: DuplexStream,
+        gate: Arc<FlushGate>,
+    }
+    impl AsyncRead for GatedIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            out: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.raw).poll_read(cx, out)
+        }
+    }
+    impl AsyncWrite for GatedIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.raw).poll_write(cx, bytes)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.gate.writer.register(cx.waker());
+            if self.gate.blocked.load(Ordering::Acquire) {
+                self.gate.reached.store(true, Ordering::Release);
+                self.gate.changed.notify_waiters();
+                if self.gate.blocked.load(Ordering::Acquire) {
+                    return Poll::Pending;
+                }
+            }
+            Pin::new(&mut self.raw).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.raw).poll_shutdown(cx)
+        }
+    }
+    #[derive(Default)]
+    struct Carriers {
+        opened: AtomicUsize,
+        peers: Mutex<Vec<DuplexStream>>,
+        tcp_gate: Arc<FlushGate>,
+    }
+    #[async_trait]
+    impl OutboundConnector for Carriers {
+        async fn connect_stream(
+            &self,
+            session: StreamSession,
+            _: &EstablishContext,
+        ) -> Result<ConnectedStream, DispatchError> {
+            let index = self.opened.fetch_add(1, Ordering::AcqRel);
+            let (raw, peer) = tokio::io::duplex(65536);
+            self.peers.lock().unwrap().push(peer);
+            let io: BoxStream = if index == 0 {
+                Box::new(GatedIo {
+                    raw,
+                    gate: self.tcp_gate.clone(),
+                })
+            } else {
+                Box::new(raw)
+            };
+            Ok(ConnectedStream {
+                io,
+                effective_peer: session.destination,
+            })
+        }
+        async fn open_datagram(
+            &self,
+            _: DatagramRequest,
+            _: &EstablishContext,
+        ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+            panic!("Smux UDP must use the supplied stream carrier")
+        }
+        async fn shutdown(&self) {}
+    }
+    fn proxy(mode: &str) -> crate::config::ProxyConfig {
+        let raw = serde_json::json!({
+            "proxies":[{"name":"memory", "type":"vless", "server":"192.0.2.1", "port":443,
+                "uuid":"00000000-0000-0000-0000-000000000001", "tls":true, "alpn":["h3"],
+                "network":"xhttp", "xhttp-opts":{"path":"/x", "mode":mode},
+                "smux":{"enabled":true,"protocol":"smux","max-connections":1,
+                    "padding":false,"only-tcp":false}}],
+            "rules":["MATCH,DIRECT"]
+        });
+        crate::config::Config::parse_yaml(raw.to_string().as_bytes())
+            .unwrap()
+            .proxies
+            .remove(0)
+    }
+    // Decode actual Smux wire bytes after the gate opens. Reading to each FIN
+    // also proves that logical closure can reach the peer before node Stop.
+    async fn read_peer(mut peer: DuplexStream, expected_fins: usize) -> (usize, usize) {
+        let mut preface = [0; 2];
+        peer.read_exact(&mut preface).await.unwrap();
+        assert_eq!(preface, [0, 0]);
+        let mut streams = HashMap::new();
+        let (mut fins, mut tcp, mut udp) = (0, 0, 0);
+        while fins < expected_fins {
+            let mut header = [0; 8];
+            peer.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0], 1);
+            let command = header[1];
+            let length = u16::from_le_bytes(header[2..4].try_into().unwrap()) as usize;
+            let id = u32::from_le_bytes(header[4..8].try_into().unwrap());
+            let mut body = vec![0; length];
+            peer.read_exact(&mut body).await.unwrap();
+            match command {
+                0 => {
+                    assert!(streams.insert(id, None::<u16>).is_none());
+                }
+                1 => {
+                    assert!(streams.contains_key(&id));
+                    fins += 1;
+                }
+                2 => {
+                    let kind = streams.get_mut(&id).expect("SYN before DATA");
+                    if let Some(kind) = *kind {
+                        if kind == 0 {
+                            assert_eq!(body, TCP_PAYLOAD);
+                            tcp += 1;
+                        } else {
+                            assert_eq!(kind, 3);
+                            let remote =
+                                crate::session::Destination::Ip("192.0.2.9:25001".parse().unwrap());
+                            let mut expected = Vec::new();
+                            crate::socks5::encode_address(&remote, &mut expected).unwrap();
+                            expected.extend_from_slice(&(UDP_PAYLOAD.len() as u16).to_be_bytes());
+                            expected.extend_from_slice(UDP_PAYLOAD);
+                            assert_eq!(body, expected);
+                            udp += 1;
+                        }
+                    } else {
+                        assert!(body.len() >= 3);
+                        let flags = u16::from_be_bytes(body[..2].try_into().unwrap());
+                        assert!(matches!(flags, 0 | 3));
+                        *kind = Some(flags);
+                    }
+                }
+                _ => panic!("unexpected Smux memory peer control frame"),
+            }
+        }
+        (tcp, udp)
+    }
+    async fn observe(mode: &str) -> (bool, usize) {
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let carrier = Arc::new(Carriers::default());
+                let proxy = proxy(mode);
+                // Only old-source APIs are used: this test must compile before the fix.
+                let node = SingMuxConnector::new(carrier.clone(), proxy.smux.clone().unwrap())
+                    .with_autonomous_xhttp(&proxy);
+                let result =
+                    AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(3), async {
+                        let context = EstablishContext::default();
+                        let mut tcp = node
+                            .connect_stream(
+                                StreamSession {
+                                    metadata: Default::default(),
+                                    inbound: InboundKind::Tun,
+                                    source: "192.0.2.3:40001".parse().unwrap(),
+                                    destination: crate::session::Destination::Ip(
+                                        "192.0.2.9:443".parse().unwrap(),
+                                    ),
+                                    sniffed_domain: None,
+                                },
+                                &context,
+                            )
+                            .await
+                            .unwrap();
+                        tcp.io.write_all(TCP_PAYLOAD).await.unwrap();
+                        // Await the actual autonomous DATA receipt without a strong flush.
+                        assert_eq!(tcp.io.write(&[]).await.unwrap(), 0);
+                        carrier.tcp_gate.blocked.store(true, Ordering::Release);
+                        let mut flushing = Box::pin(tcp.io.flush());
+                        assert!(futures_util::poll!(flushing.as_mut()).is_pending());
+                        carrier.tcp_gate.wait_reached().await;
+                        let udp = async {
+                            let request = DatagramRequest::new(DatagramSession::new(
+                                InboundKind::Tun,
+                                "192.0.2.3:40002".parse().unwrap(),
+                            ))
+                            .with_budget(DatagramBudget::new(1400, 1400));
+                            let mut transport =
+                                node.open_datagram(request, &context).await.unwrap();
+                            transport
+                                .send(Datagram {
+                                    remote: crate::session::Destination::Ip(
+                                        "192.0.2.9:25001".parse().unwrap(),
+                                    ),
+                                    payload: Bytes::from_static(UDP_PAYLOAD),
+                                    sniffed_domain: None,
+                                })
+                                .await
+                                .unwrap();
+                            transport.close().await.unwrap();
+                        };
+                        let mut udp = Box::pin(udp);
+                        // Retain the original future on timeout; do not cancel/retry Open.
+                        let early = tokio::time::timeout(Duration::from_millis(40), udp.as_mut())
+                            .await
+                            .is_ok();
+                        carrier.tcp_gate.release();
+                        flushing.as_mut().await.unwrap();
+                        drop(flushing);
+                        if !early {
+                            udp.as_mut().await;
+                        }
+                        drop(udp);
+                        tcp.io.shutdown().await.unwrap();
+                        drop(tcp);
+                        let physical = carrier.opened.load(Ordering::Acquire);
+                        assert!(matches!(physical, 1 | 2));
+                        let peers = std::mem::take(&mut *carrier.peers.lock().unwrap());
+                        assert_eq!(peers.len(), physical);
+                        let (mut tcp_frames, mut udp_frames) = (0, 0);
+                        for peer in peers {
+                            let (a, b) = read_peer(peer, if physical == 1 { 2 } else { 1 }).await;
+                            tcp_frames += a;
+                            udp_frames += b;
+                        }
+                        assert_eq!((tcp_frames, udp_frames), (1, 1));
+                        (early, physical)
+                    }))
+                    .catch_unwind()
+                    .await;
+                // Semantic RED is asserted by the caller only after all real Core
+                // drivers Stop/join. A panic/timeout also releases the gate first.
+                carrier.tcp_gate.release();
+                node.shutdown().await;
+                drop(node);
+                carrier.peers.lock().unwrap().clear();
+                assert!(probe.snapshot().is_idle());
+                match result {
+                    Ok(result) => result.expect("owned Smux memory fixture timed out"),
+                    Err(panic) => resume_unwind(panic),
+                }
+            })
+            .await
+    }
+    #[tokio::test]
+    async fn qualified_h3_udp_first_frame_progresses_while_tcp_flush_is_pending() {
+        let (early, physical) = observe("packet-up").await;
+        assert!(early, "UDP waited for the unrelated TCP strong flush");
+        assert_eq!(physical, 2, "qualified TCP and UDP shared a Smux writer");
+    }
+    #[tokio::test]
+    async fn excluded_h3_stream_up_keeps_the_original_shared_smux_writer() {
+        let (early, physical) = observe("stream-up").await;
+        assert!(!early, "excluded factory acquired a private UDP writer");
+        assert_eq!(physical, 1);
+    }
+    #[tokio::test]
+    async fn active_tcp_flush_and_udp_receive_stop_before_gate_or_lease_release() {
+        let probe = ResourceProbe::default();
+        probe
+            .scope(async {
+                let carrier = Arc::new(Carriers::default());
+                let proxy = proxy("packet-up");
+                let node = SingMuxConnector::new(carrier.clone(), proxy.smux.clone().unwrap())
+                    .with_autonomous_xhttp(&proxy);
+                let outcome =
+                    AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(3), async {
+                        let context = EstablishContext::default();
+                        let mut tcp = node
+                            .connect_stream(
+                                StreamSession {
+                                    metadata: Default::default(),
+                                    inbound: InboundKind::Tun,
+                                    source: "192.0.2.3:40003".parse().unwrap(),
+                                    destination: crate::session::Destination::Ip(
+                                        "192.0.2.9:443".parse().unwrap(),
+                                    ),
+                                    sniffed_domain: None,
+                                },
+                                &context,
+                            )
+                            .await
+                            .unwrap();
+                        tcp.io.write_all(TCP_PAYLOAD).await.unwrap();
+                        assert_eq!(tcp.io.write(&[]).await.unwrap(), 0);
+                        let request = DatagramRequest::new(DatagramSession::new(
+                            InboundKind::Tun,
+                            "192.0.2.3:40004".parse().unwrap(),
+                        ))
+                        .with_budget(DatagramBudget::new(1400, 1400));
+                        let mut udp = node.open_datagram(request, &context).await.unwrap();
+                        // The actual first strong UDP flush succeeds before TCP is gated.
+                        udp.send(Datagram {
+                            remote: crate::session::Destination::Ip(
+                                "192.0.2.9:25001".parse().unwrap(),
+                            ),
+                            payload: Bytes::from_static(UDP_PAYLOAD),
+                            sniffed_domain: None,
+                        })
+                        .await
+                        .unwrap();
+                        let physical = carrier.opened.load(Ordering::Acquire);
+                        assert!(matches!(physical, 1 | 2));
+                        assert_eq!(carrier.peers.lock().unwrap().len(), physical);
+                        carrier.tcp_gate.blocked.store(true, Ordering::Release);
+                        let mut flushing = Box::pin(tcp.io.flush());
+                        assert!(futures_util::poll!(flushing.as_mut()).is_pending());
+                        carrier.tcp_gate.wait_reached().await;
+                        // No peer response/status is supplied: this polls the real
+                        // DatagramIo/ResponseStream/Smux read path to Pending.
+                        let mut receiving = Box::pin(udp.receive());
+                        assert!(futures_util::poll!(receiving.as_mut()).is_pending());
+                        // Keep both client leases and every peer endpoint alive. Stop
+                        // must cancel/join; EOF or an opened flush gate cannot rescue it.
+                        let stopped = tokio::time::timeout(Duration::from_secs(1), node.shutdown())
+                            .await
+                            .is_ok();
+                        let gate_was_blocked = carrier.tcp_gate.blocked.load(Ordering::Acquire);
+                        let peers_held = carrier.peers.lock().unwrap().len() == physical;
+                        if !stopped {
+                            carrier.tcp_gate.release();
+                            node.shutdown().await;
+                        }
+                        let task_count = probe
+                            .snapshot()
+                            .current(crate::resources::observation::ResourceKind::Task);
+                        let tcp_failed = flushing.as_mut().await.is_err();
+                        let udp_failed = receiving.as_mut().await.is_err();
+                        drop(flushing);
+                        drop(receiving);
+                        // Actual application handles release only after Stop and both
+                        // pending waiters have observed their cancellation/failure.
+                        drop((tcp, udp));
+                        (
+                            stopped,
+                            gate_was_blocked,
+                            peers_held,
+                            task_count,
+                            tcp_failed,
+                            udp_failed,
+                        )
+                    }))
+                    .catch_unwind()
+                    .await;
+                // Failure cleanup is exact and occurs before any semantic assertion.
+                carrier.tcp_gate.release();
+                node.shutdown().await;
+                drop(node);
+                carrier.peers.lock().unwrap().clear();
+                assert!(probe.snapshot().is_idle());
+                let observed = match outcome {
+                    Ok(result) => result.expect("active Smux Stop fixture timed out"),
+                    Err(panic) => resume_unwind(panic),
+                };
+                assert!(
+                    observed.0,
+                    "Stop waited for a gated TCP flush or a held lease"
+                );
+                assert!(
+                    observed.1,
+                    "the raw flush gate was released before Stop completed"
+                );
+                assert!(
+                    observed.2,
+                    "a peer endpoint was dropped before Stop completed"
+                );
+                assert_eq!(observed.3, 0, "Stop returned before its owned tasks joined");
+                assert!(
+                    observed.4 && observed.5,
+                    "a pending waiter survived or succeeded after Stop"
+                );
+            })
+            .await;
     }
 }

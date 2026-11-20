@@ -582,6 +582,15 @@ impl DatagramRequest {
 /// protocols adjust their upstream response budget.
 #[async_trait]
 pub trait OutboundConnector: Send + Sync {
+    /// Structural proof that the complete configured TCP path and security
+    /// identity are immutable. This query neither selects a group nor opens IO.
+    /// Unknown connectors and dynamic dependencies remain one-shot HTTP paths.
+    #[cfg(feature = "inbound-http")]
+    #[doc(hidden)]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        false
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,
@@ -750,6 +759,61 @@ impl std::fmt::Debug for UpstreamPath {
 }
 
 impl UpstreamPath {
+    /// A retained HTTP stream must not hide a new physical path selection.
+    /// Only exact literal endpoints and recursively proven connectors qualify;
+    /// groups are rejected even when their current member happens to be DIRECT.
+    #[cfg(feature = "inbound-http")]
+    pub(crate) fn permits_static_http_reuse(&self, server: &Destination) -> bool {
+        let Destination::Ip(address) = server else {
+            return false;
+        };
+        let dialer = match self {
+            Self::LazyDirect { dialer } => dialer,
+            Self::Direct { endpoint, dialer }
+                if endpoint.port == address.port()
+                    && endpoint.logical_host.parse::<IpAddr>().ok() == Some(address.ip())
+                    && endpoint.addresses.as_slice() == std::slice::from_ref(address) =>
+            {
+                dialer
+            }
+            Self::Proxy(connector) => return connector.permits_http_tcp_reuse(),
+            _ => return false,
+        };
+        dialer.permits_static_http_reuse() && !dialer.http_reuse_cancelled()
+    }
+
+    /// A UDP carrier may retain a business TCP stream only on a proven
+    /// physical first hop. A proxy's TCP proof says nothing about its datagram
+    /// relay, so Proxy and Group never inherit permission here.
+    #[cfg(all(
+        feature = "inbound-http",
+        any(
+            feature = "outbound-hysteria2",
+            feature = "outbound-tuic",
+            feature = "outbound-vless",
+            feature = "outbound-mieru",
+            feature = "outbound-wireguard",
+            feature = "outbound-masque"
+        )
+    ))]
+    pub(crate) fn permits_static_direct_http_reuse(&self, server: &Destination) -> bool {
+        let Destination::Ip(address) = server else {
+            return false;
+        };
+        let dialer = match self {
+            Self::LazyDirect { dialer } => dialer,
+            Self::Direct { endpoint, dialer }
+                if endpoint.port == address.port()
+                    && endpoint.logical_host.parse::<IpAddr>().ok() == Some(address.ip())
+                    && endpoint.addresses.as_slice() == std::slice::from_ref(address) =>
+            {
+                dialer
+            }
+            _ => return false,
+        };
+        dialer.permits_static_http_reuse() && !dialer.http_reuse_cancelled()
+    }
+
     /// A multi-endpoint node shares the declared graph, while each
     /// physical peer has its own server and may refresh a previously pinned IP.
     #[cfg(any(
@@ -909,6 +973,30 @@ impl UpstreamPath {
         }
     }
 
+    /// Only directly declared physical paths may prepare one immutable UDP peer.
+    /// Groups and codecs keep their original selection and datagram behavior.
+    #[cfg(all(
+        target_os = "macos",
+        any(
+            feature = "outbound-masque",
+            feature = "outbound-wireguard",
+            feature = "outbound-tuic"
+        )
+    ))]
+    pub(crate) async fn open_fixed_peer_datagram(
+        &self,
+        request: DatagramRequest,
+        peer: SocketAddr,
+        context: &EstablishContext,
+    ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+        match self {
+            Self::Direct { dialer, .. } | Self::LazyDirect { dialer } => {
+                DirectOutbound::new(dialer.clone()).open_fixed_datagram(request, peer)
+            }
+            Self::Group { .. } | Self::Proxy(_) => self.open_datagram(request, context).await,
+        }
+    }
+
     /// Pins a native UDP server using the node resolver when first needed.
     /// Resolving here and opening IO below share the context's group snapshot.
     #[cfg(any(
@@ -1021,6 +1109,11 @@ pub(crate) struct IpVersionConnector {
 }
 #[async_trait]
 impl OutboundConnector for IpVersionConnector {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        self.version == crate::config::IpVersion::Dual && self.inner.permits_http_tcp_reuse()
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,
@@ -1138,6 +1231,11 @@ impl ConnectorDispatcher {
 
 #[async_trait]
 impl Dispatcher for ConnectorDispatcher {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        self.inner.permits_http_tcp_reuse()
+    }
+
     fn supports_udp(&self) -> bool {
         self.allow_udp
     }
@@ -1164,6 +1262,14 @@ impl Dispatcher for ConnectorDispatcher {
             .await
     }
 }
+
+#[cfg(all(test, feature = "inbound-http"))]
+#[path = "http_reuse_memory_tests.rs"]
+mod http_reuse_memory_tests;
+
+#[cfg(all(test, feature = "inbound-http", feature = "outbound-hysteria2"))]
+#[path = "hysteria2_http_reuse_memory_tests.rs"]
+mod hysteria2_http_reuse_memory_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1328,6 +1434,87 @@ mod tests {
             endpoint: None,
             dialer: Dialer::default(),
         }
+    }
+
+    #[cfg(all(
+        target_os = "macos",
+        any(
+            feature = "outbound-masque",
+            feature = "outbound-wireguard",
+            feature = "outbound-tuic"
+        )
+    ))]
+    #[tokio::test]
+    async fn fixed_udp_memory_upstream_scope_keeps_groups_proxies_and_snapshots_original() {
+        let peer = "192.0.2.1:443".parse().unwrap();
+        for path in [
+            UpstreamPath::LazyDirect {
+                dialer: Dialer::default(),
+            },
+            UpstreamPath::Direct {
+                endpoint: ResolvedEndpoint {
+                    logical_host: "192.0.2.1".to_owned(),
+                    port: 443,
+                    addresses: vec![peer],
+                },
+                dialer: Dialer::default(),
+            },
+        ] {
+            let context = EstablishContext::default();
+            let mut ordinary = path.open_datagram(test_request(), &context).await.unwrap();
+            assert!(ordinary.supports_shared_destinations());
+            ordinary.close().await.unwrap();
+            let mut fixed = path
+                .open_fixed_peer_datagram(test_request(), peer, &context)
+                .await
+                .unwrap();
+            assert!(!fixed.supports_shared_destinations());
+            assert_eq!(fixed.payload_budget(&Destination::Ip(peer)).receive(), 1714);
+            fixed.close().await.unwrap();
+        }
+        let proxy = Arc::new(MarkedConnector {
+            marker: 17,
+            ..Default::default()
+        });
+        let path = UpstreamPath::Proxy(proxy.clone());
+        let mut transport = path
+            .open_fixed_peer_datagram(test_request(), peer, &EstablishContext::default())
+            .await
+            .unwrap();
+        assert_eq!(transport.receive().await.unwrap().payload[0], 17);
+        assert_eq!(*proxy.budgets.lock().unwrap(), [1714]);
+        transport.close().await.unwrap();
+
+        let selection = Arc::new(GroupSelection::new(0));
+        let path = selected_path(
+            selection.clone(),
+            vec![SelectUpstreamMember::Direct, SelectUpstreamMember::Reject],
+        );
+        let context = EstablishContext::default();
+        let mut first = path
+            .open_fixed_peer_datagram(test_request(), peer, &context)
+            .await
+            .unwrap();
+        assert!(
+            first.supports_shared_destinations(),
+            "a group currently choosing DIRECT must stay unconnected"
+        );
+        first.close().await.unwrap();
+        selection.store(1, Ordering::Release);
+        let mut pinned = path
+            .open_fixed_peer_datagram(test_request(), peer, &context)
+            .await
+            .unwrap();
+        assert!(
+            pinned.supports_shared_destinations(),
+            "same context keeps its original group snapshot"
+        );
+        pinned.close().await.unwrap();
+        assert!(matches!(
+            path.open_fixed_peer_datagram(test_request(), peer, &EstablishContext::default())
+                .await,
+            Err(DispatchError::NotAllowed)
+        ));
     }
 
     #[tokio::test]

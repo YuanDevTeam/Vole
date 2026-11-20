@@ -79,6 +79,12 @@ thread_local! {
 struct RegistryInner {
     instance: Option<Arc<CoreController>>,
     idle_http_refresh: bool,
+    #[cfg(all(
+        feature = "http-diagnostics",
+        feature = "inbound-http",
+        target_os = "tvos"
+    ))]
+    script_plan_validation_process: bool,
 }
 
 #[derive(Default)]
@@ -283,11 +289,17 @@ thread_local! {
 pub(crate) fn engine_runtime_builder() -> tokio::runtime::Builder {
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let mut builder = tokio::runtime::Builder::new_multi_thread();
+    #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+    builder.event_interval(16);
     builder
         .on_thread_start(move || {
             RUNTIME_WORKER_SCOPE.with(|scope| {
                 *scope.borrow_mut() = Some(RuntimeWorkerScope::enter(&dispatch));
             });
+            #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+            crate::platform::apple_runtime_qos::request(
+                crate::platform::apple_runtime_qos::Role::Tokio,
+            );
         })
         .on_thread_stop(|| {
             let scope = RUNTIME_WORKER_SCOPE.with(|scope| scope.borrow_mut().take());
@@ -535,6 +547,16 @@ impl RuntimeRegistry {
     }
     fn create_instance(&self) -> Result<Arc<CoreController>, InvokeFailure> {
         let mut inner = lock(&self.inner);
+        #[cfg(all(
+            feature = "http-diagnostics",
+            feature = "inbound-http",
+            target_os = "tvos"
+        ))]
+        if inner.script_plan_validation_process {
+            return Err(InvokeFailure::invalid_state(
+                "JS plan validation requires this process to exit before any business instance",
+            ));
+        }
         if inner.idle_http_refresh {
             return Err(InvokeFailure::invalid_state(
                 "HTTP resource preparation is busy",
@@ -1131,6 +1153,48 @@ fn dispatch_request(request: DecodedRequest) -> Result<InvokeResponse, InvokeFai
                 Ok(json!({}))
             })?
         }
+        #[cfg(all(
+            feature = "http-diagnostics",
+            feature = "inbound-http",
+            target_os = "tvos"
+        ))]
+        "runHttpScriptPlanValidation" => {
+            require_instance_omitted(&envelope)?;
+            let _: EmptyPayload = decode_payload(envelope.payload)?;
+            {
+                let mut inner = lock(&registry().inner);
+                if inner.instance.is_some()
+                    || inner.idle_http_refresh
+                    || inner.script_plan_validation_process
+                {
+                    return Err(InvokeFailure::invalid_state(
+                        "JS plan validation requires a fresh, idle, dedicated process",
+                    ));
+                }
+                if lock(&registry().runtime_data).is_some() {
+                    return Err(InvokeFailure::invalid_state(
+                        "JS plan validation must precede Core initialization",
+                    ));
+                }
+                // Irreversible even on panic/failure: subsequent createInstance
+                // (also foreground) fails under this same registry lock.
+                inner.script_plan_validation_process = true;
+            }
+            crate::http_processing::scripts::plan_validation::run()?
+        }
+        #[cfg(feature = "http-diagnostics")]
+        "getHttpDiagnostics" => {
+            require_instance_omitted(&envelope)?;
+            let _: EmptyPayload = decode_payload(envelope.payload)?;
+            #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+            {
+                let mut snapshot = crate::http_processing::diagnostics::snapshot();
+                snapshot["runtimeThreadQoS"] = crate::platform::apple_runtime_qos::snapshot();
+                snapshot
+            }
+            #[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "macos")))]
+            crate::http_processing::diagnostics::snapshot()
+        }
         "version" => {
             require_instance_omitted(&envelope)?;
             let _: EmptyPayload = decode_payload(envelope.payload)?;
@@ -1458,6 +1522,10 @@ impl CoreController {
                 let _logging = tracing::dispatcher::set_default(&dispatch);
                 let _completion = EngineCompletion(completed_tx);
                 let _runtime_thread = RuntimeThreadGuard::enter();
+                #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+                crate::platform::apple_runtime_qos::request(
+                    crate::platform::apple_runtime_qos::Role::EngineOwner,
+                );
                 run_engine(context, prepared.core, tun, dialer, stop_rx, startup_tx)
             }));
         let runtime_thread = match spawned {
@@ -2057,6 +2125,8 @@ mod tests {
     use std::{ffi::CStr, ptr};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    include!("http_diagnostics_tests.rs");
 
     #[test]
     fn allocator_relief_requires_tun() {

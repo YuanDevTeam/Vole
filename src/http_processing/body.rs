@@ -324,7 +324,8 @@ impl<'a> Transaction<'a> {
             let capacity = wire.length.map_or(MAX_BODY + 1, |length| length as usize);
             Ok(Self {
                 budget: budget.clone(),
-                raw: BudgetedBytes::new(budget, capacity).ok_or(Bypass::Budget)?,
+                raw: BudgetedBytes::new_shared_collector(budget, capacity, wire.length.is_some())
+                    .ok_or(Bypass::Budget)?,
                 rules,
                 original,
                 phase,
@@ -431,6 +432,7 @@ impl<'a> Transaction<'a> {
             Ok(decoded) => Entity {
                 logical: Some(decoded.map_or_else(|| wire.clone(), BudgetedBytes::into_bytes)),
                 wire,
+                budget: self.budget.clone(),
                 bypass: None,
                 changed: false,
                 original_text: self.text_allowed,
@@ -440,6 +442,7 @@ impl<'a> Transaction<'a> {
                 return Entity {
                     wire,
                     logical: None,
+                    budget: self.budget.clone(),
                     bypass: Some(reason),
                     changed: false,
                     original_text: self.text_allowed,
@@ -468,14 +471,9 @@ impl<'a> Transaction<'a> {
             &self.budget,
         ) {
             Ok(Some(output)) if output.as_ref() != baseline => {
-                let mut candidate = fields.clone();
-                repair_metadata(&mut candidate, output.as_ref().len());
-                if super::headers::check(&candidate).is_ok() {
-                    *fields = candidate;
-                    entity.replace(output.into_bytes());
-                } else {
-                    diagnostics::body_bypass(BodyPoint::HeaderFinalize, Bypass::Budget);
-                    entity.bypass = Some(Bypass::Budget);
+                if let Err(reason) = commit_shared_body(&mut entity, fields, output) {
+                    diagnostics::body_bypass(BodyPoint::HeaderFinalize, reason);
+                    entity.bypass = Some(reason);
                 }
             }
             Ok(_) => {}
@@ -485,23 +483,60 @@ impl<'a> Transaction<'a> {
     }
 }
 
+/// A read-only body view tied to its actual Entity or BudgetedBytes owner.
+/// Private fields prevent pairing arbitrary bytes with a different ledger.
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(all(feature = "inbound-http", target_os = "tvos")),
+    allow(dead_code)
+)]
+pub(crate) struct BorrowedBody<'a> {
+    bytes: &'a [u8],
+    budget: &'a Budget,
+}
+#[cfg_attr(
+    not(all(feature = "inbound-http", target_os = "tvos")),
+    allow(dead_code)
+)]
+impl<'a> BorrowedBody<'a> {
+    pub(crate) fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+    pub(crate) fn same_ledger_as(&self, output: &BudgetedBytes) -> bool {
+        self.budget.same_ledger(output.budget())
+    }
+}
+impl BudgetedBytes {
+    #[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
+    pub(crate) fn borrowed_body(&self) -> BorrowedBody<'_> {
+        BorrowedBody {
+            bytes: self.as_ref(),
+            budget: self.budget(),
+        }
+    }
+}
+
 /// Complete wire representation and its decoded logical view. `Bytes` keeps
 /// the original allocation's workspace permit through clones and send queues.
 #[derive(Clone)]
 pub(crate) struct Entity {
     wire: Bytes,
     logical: Option<Bytes>,
+    // Provenance only: the reservation still belongs to the actual Bytes owner.
+    budget: Budget,
     pub(crate) bypass: Option<Bypass>,
     changed: bool,
     original_text: bool,
 }
 impl Entity {
-    #[cfg(test)]
+    #[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
     pub(crate) fn identity(bytes: BudgetedBytes) -> Self {
+        let budget = bytes.budget().clone();
         let wire = bytes.into_bytes();
         Self {
             logical: Some(wire.clone()),
             wire,
+            budget,
             bypass: None,
             changed: false,
             original_text: true,
@@ -513,6 +548,16 @@ impl Entity {
     pub(crate) fn logical(&self) -> Option<&[u8]> {
         self.logical.as_deref()
     }
+    #[cfg_attr(
+        not(all(feature = "inbound-http", target_os = "tvos")),
+        allow(dead_code)
+    )]
+    pub(crate) fn borrowed_body(&self) -> Option<BorrowedBody<'_>> {
+        Some(BorrowedBody {
+            bytes: self.logical.as_deref()?,
+            budget: &self.budget,
+        })
+    }
     pub(crate) fn into_wire(self) -> Bytes {
         self.wire
     }
@@ -522,12 +567,32 @@ impl Entity {
     pub(crate) fn original_text_allowed(&self) -> bool {
         self.original_text
     }
-    pub(crate) fn replace(&mut self, bytes: Bytes) {
+    /// Reject a foreign owner before changing any part of this Entity.
+    pub(crate) fn replace(&mut self, bytes: BudgetedBytes) -> Result<(), BudgetedBytes> {
+        if !self.budget.same_ledger(bytes.budget()) {
+            return Err(bytes);
+        }
+        let bytes = bytes.into_bytes();
         self.wire = bytes.clone();
         self.logical = Some(bytes);
         self.bypass = None;
         self.changed = true;
+        Ok(())
     }
+}
+
+/// Commit only after both header validation and owner provenance have passed.
+fn commit_shared_body(
+    entity: &mut Entity,
+    fields: &mut Fields,
+    output: BudgetedBytes,
+) -> Result<(), Bypass> {
+    let mut candidate = fields.clone();
+    repair_metadata(&mut candidate, output.as_ref().len());
+    super::headers::check(&candidate).map_err(|_| Bypass::Budget)?;
+    entity.replace(output).map_err(|_| Bypass::Budget)?;
+    *fields = candidate;
+    Ok(())
 }
 
 fn apply_operations(
@@ -562,10 +627,14 @@ fn apply_operations(
                         .map_or(baseline, |value: &BudgetedBytes| value.as_ref());
                     let input = std::str::from_utf8(input).map_err(|_| Bypass::InvalidText)?;
                     let capacity = search.output_capacity(input.len(), MAX_BODY);
-                    let mut output = BudgetedBytes::new(budget, capacity).ok_or(Bypass::Budget)?;
-                    output
-                        .write_text(|output| search.apply_into(input, output, MAX_BODY))
-                        .map_err(|_| Bypass::Transform)?;
+                    let mut output =
+                        if search.ascii_literal_byte_map().is_some() && capacity == input.len() {
+                            BudgetedBytes::new_fixed_output(budget, capacity)
+                        } else {
+                            BudgetedBytes::new(budget, capacity)
+                        }
+                        .ok_or(Bypass::Budget)?;
+                    fill_replacement(input, search, &mut output)?;
                     candidate = Some(output);
                 }
                 BodyOperation::JsonPatch(patch) if patch.is_empty() => {}
@@ -585,6 +654,41 @@ fn apply_operations(
         diagnostics::body_bypass(BodyPoint::NativeTransform, *reason);
     }
     result
+}
+
+/// Caller has validated UTF-8 and admitted the unchanged independent output.
+fn fill_replacement(
+    input: &str,
+    search: &super::rules::Search,
+    output: &mut BudgetedBytes,
+) -> Result<(), Bypass> {
+    if let Some((search, replacement, occurrences)) = search.ascii_literal_byte_map() {
+        // Admission is unchanged, including no-match/same-byte. ASCII bytes
+        // cannot occur within multibyte UTF-8 units. Dollar/NUL are literal data.
+        output
+            .write_initialized_output(input.len(), |output| {
+                if occurrences == super::rules::Occurrences::First {
+                    output.copy_from_slice(input.as_bytes());
+                    if let Some(index) = input.find(char::from(search)) {
+                        output[index] = replacement;
+                    }
+                } else {
+                    for (output, input) in output.iter_mut().zip(input.as_bytes()) {
+                        *output = if *input == search {
+                            replacement
+                        } else {
+                            *input
+                        };
+                    }
+                }
+                Ok(input.len())
+            })
+            .map_err(|_| Bypass::Transform)
+    } else {
+        output
+            .write_text(|output| search.apply_into(input, output, MAX_BODY))
+            .map_err(|_| Bypass::Transform)
+    }
 }
 
 /// Final representation repair follows successful content changes and therefore
@@ -632,9 +736,160 @@ pub(crate) fn repair_metadata_kind(fields: &mut Fields, length: usize, text: boo
     fields.push(("Content-Length".into(), length.to_string()));
 }
 
+#[cfg(all(
+    feature = "inbound-http",
+    feature = "http-diagnostics",
+    target_os = "tvos"
+))]
+#[path = "native_byte_map_validation.rs"]
+mod native_byte_map_validation;
+#[cfg(all(
+    feature = "inbound-http",
+    feature = "http-diagnostics",
+    target_os = "tvos"
+))]
+pub(crate) fn validate_native_byte_map() -> std::io::Result<serde_json::Value> {
+    native_byte_map_validation::run()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(unix, feature = "inbound-http"))]
+    #[forbid(unsafe_code)]
+    mod shared_collector_mapping_tests {
+        include!("shared_collector_body_memory_tests.rs");
+    }
+
+    #[test]
+    fn borrowed_body_factories_borrow_the_same_allocation_and_actual_ledger() {
+        let budget = Budget::default();
+        let input = BudgetedBytes::copy(&budget, b"paid\0input").unwrap();
+        let local_output = BudgetedBytes::empty(&budget);
+        let foreign_output = BudgetedBytes::empty(&Budget::default());
+        let original_charge = budget.used();
+        {
+            let view = input.borrowed_body();
+            assert_eq!(view.as_bytes().as_ptr(), input.as_ref().as_ptr());
+            assert_eq!(view.as_bytes(), b"paid\0input");
+            assert!(view.same_ledger_as(&local_output));
+            assert!(!view.same_ledger_as(&foreign_output));
+            assert_eq!(budget.used(), original_charge);
+        }
+        let entity = Entity::identity(input);
+        let clone = entity.clone();
+        {
+            let view = entity.borrowed_body().unwrap();
+            assert_eq!(view.as_bytes().as_ptr(), clone.logical().unwrap().as_ptr());
+            assert!(view.same_ledger_as(&local_output));
+            assert!(!view.same_ledger_as(&foreign_output));
+            assert_eq!(budget.used(), original_charge);
+        }
+        drop(entity);
+        assert_eq!(budget.used(), original_charge);
+        drop(clone);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn entity_replacement_returns_foreign_owner_without_changing_input() {
+        let budget = Budget::default();
+        let foreign = Budget::default();
+        let mut entity = Entity::identity(BudgetedBytes::copy(&budget, b"original").unwrap());
+        let original_wire = entity.wire().clone();
+        let foreign_owner = BudgetedBytes::copy(&foreign, b"foreign").unwrap();
+        let foreign_cost = foreign.used();
+        let rejected = entity.replace(foreign_owner).err().expect("foreign ledger");
+        assert_eq!(rejected.as_ref(), b"foreign");
+        assert_eq!(foreign.used(), foreign_cost);
+        assert_eq!(entity.wire().as_ptr(), original_wire.as_ptr());
+        assert_eq!(entity.logical().unwrap(), b"original");
+        assert!(!entity.changed());
+        assert_eq!(entity.bypass, None);
+        drop(rejected);
+        assert_eq!(foreign.used(), 0);
+        drop(entity);
+        assert!(budget.used() > 0);
+        drop(original_wire);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn shared_native_commit_keeps_body_and_metadata_atomic_on_foreign_owner() {
+        let budget = Budget::default();
+        let foreign = Budget::default();
+        let mut entity = Entity::identity(BudgetedBytes::copy(&budget, b"original").unwrap());
+        let original_wire = entity.wire().clone();
+        let mut fields = vec![
+            ("Content-Length".into(), "8".into()),
+            ("ETag".into(), "original-tag".into()),
+            ("Content-Type".into(), "text/plain".into()),
+        ];
+        let before = fields.clone();
+        let output = BudgetedBytes::copy(&foreign, b"foreign-longer").unwrap();
+        assert_eq!(
+            commit_shared_body(&mut entity, &mut fields, output),
+            Err(Bypass::Budget)
+        );
+        assert_eq!(fields, before);
+        assert_eq!(entity.wire().as_ptr(), original_wire.as_ptr());
+        assert_eq!(entity.logical().unwrap(), b"original");
+        assert!(!entity.changed());
+        assert_eq!(foreign.used(), 0);
+
+        // The same production helper really commits a correctly paid owner.
+        let output = BudgetedBytes::copy(&budget, b"accepted-longer").unwrap();
+        assert_eq!(commit_shared_body(&mut entity, &mut fields, output), Ok(()));
+        assert_eq!(entity.logical().unwrap(), b"accepted-longer");
+        assert!(entity.changed());
+        assert!(
+            fields
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("content-length") && v == "15")
+        );
+        assert!(!fields.iter().any(|(k, _)| k.eq_ignore_ascii_case("etag")));
+        drop(entity);
+        assert_eq!(budget.used(), BudgetedBytes::allocation_cost(8).unwrap());
+        drop(original_wire);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[cfg(feature = "inbound-http")]
+    #[tokio::test]
+    async fn borrowed_entity_owner_stays_charged_during_the_actual_blocked_sender() {
+        let budget = Budget::default();
+        let entity = Entity::identity(BudgetedBytes::copy(&budget, &vec![b'x'; 4096]).unwrap());
+        let cost = budget.used();
+        {
+            let view = entity.borrowed_body().unwrap();
+            assert_eq!(view.as_bytes(), &vec![b'x'; 4096]);
+            assert_eq!(budget.used(), cost);
+        }
+        let wire = entity.into_wire();
+        let last_slice = wire.slice(17..18);
+        let prepared = super::super::h1_body::PreparedBody::from_bytes(wire);
+        let mut reader = tokio::io::BufReader::new(tokio::io::empty());
+        let (mut writer, peer) = tokio::io::duplex(8);
+        let blocklist = std::collections::HashSet::new();
+        let mut sending = Box::pin(prepared.transfer(
+            &mut reader,
+            &mut writer,
+            std::time::Duration::from_secs(1),
+            &blocklist,
+            false,
+        ));
+        // An 8-byte duplex cannot finish the real 4096-byte write_all. No
+        // spawned task needs cleanup if an assertion unwinds this test.
+        assert!(futures_util::poll!(sending.as_mut()).is_pending());
+        assert_eq!(budget.used(), cost);
+        drop(sending);
+        drop(peer);
+        assert_eq!(budget.used(), cost);
+        assert_eq!(last_slice.as_ref(), b"x");
+        drop(last_slice);
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn literal_capacity_uses_real_input_sized_allocations_for_every_literal_shape() {
@@ -705,6 +960,155 @@ mod tests {
         assert_eq!(last_owner.len(), 65536 - 17);
         drop(last_owner);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[cfg(all(unix, feature = "inbound-http"))]
+    #[test]
+    fn native_fixed_outputs_select_backing_and_keep_source_and_sender_owners_paid() {
+        const SUFFIX: &[u8] = "é😀中\0$".as_bytes();
+        let url = Url::parse("https://fixed-output.invalid/body").unwrap();
+        for capacity in [64 * 1024 - 1, 64 * 1024, MAX_BODY] {
+            for occurrences in ["first", "all"] {
+                let budget = Budget::default();
+                let mut source = BudgetedBytes::new(&budget, capacity).unwrap();
+                source
+                    .write_initialized_output(capacity, |bytes| {
+                        bytes.fill(b'q');
+                        bytes[capacity - SUFFIX.len()..].copy_from_slice(SUFFIX);
+                        Ok(capacity)
+                    })
+                    .unwrap();
+                assert!(!source.is_mapped_for_test());
+                let mut entity = Entity::identity(source);
+                let original = std::str::from_utf8(entity.logical().unwrap()).unwrap();
+                let expected = if occurrences == "first" {
+                    original.replacen('q', "z", 1)
+                } else {
+                    original.replace('q', "z")
+                };
+                let selected = rules(&format!(
+                    "- {{url: '.', action: response-body-replace, search: q, replacement: z, occurrences: {occurrences}}}"
+                ));
+                let output = apply_operations(
+                    &selected,
+                    &url,
+                    Phase::Response,
+                    entity.logical().unwrap(),
+                    &budget,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(output.is_mapped_for_test(), capacity >= 64 * 1024);
+                assert_eq!(output.as_ref(), expected.as_bytes());
+                assert!(std::str::from_utf8(output.as_ref()).is_ok());
+                assert_ne!(output.as_ref().as_ptr(), entity.logical().unwrap().as_ptr());
+                let cost = BudgetedBytes::allocation_cost(capacity).unwrap();
+                assert_eq!(budget.used(), 2 * cost);
+                let source_sender = entity.wire().slice(..1);
+                let mut fields = vec![("ETag".into(), "old".into())];
+                commit_shared_body(&mut entity, &mut fields, output).unwrap();
+                assert!(entity.changed());
+                assert_eq!(budget.used(), 2 * cost);
+                let sender = entity.into_wire();
+                let last_output = sender.slice(capacity - 1..);
+                drop(sender);
+                assert_eq!(last_output.as_ref(), &expected.as_bytes()[capacity - 1..]);
+                assert_eq!(source_sender.as_ref(), b"q");
+                assert_eq!(budget.used(), 2 * cost);
+                drop(source_sender);
+                assert_eq!(budget.used(), cost);
+                drop(last_output);
+                assert_eq!(budget.used(), 0);
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "inbound-http"))]
+    #[test]
+    fn native_fixed_output_keeps_noop_representation_and_whole_stage_rollback() {
+        let url = Url::parse("https://fixed-output.invalid/body").unwrap();
+        let original = vec![b'q'; 64 * 1024];
+        for (yaml, bypass) in [
+            (
+                "- {url: '.', action: request-body-replace, search: q, replacement: q}",
+                None,
+            ),
+            (
+                "- {url: '.', action: request-body-replace, search: x, replacement: z}",
+                None,
+            ),
+            (
+                "- {url: '.', action: request-body-replace, search: q, replacement: z}\n- {url: '.', action: request-body-json-patch, patch: [{op: test, path: /ok, value: false}]}",
+                Some(Bypass::Transform),
+            ),
+        ] {
+            let budget = Budget::default();
+            let selected = rules(yaml);
+            let mut fields = vec![
+                ("ETag".into(), "old".into()),
+                ("X-Independent".into(), "kept".into()),
+            ];
+            let before = fields.clone();
+            let request = OriginalRequestMeta::new("POST", &fields);
+            let wire = WireBodyMeta::new(
+                &fields,
+                &request,
+                Phase::Request,
+                None,
+                Some(original.len() as u64),
+                false,
+            );
+            let mut transaction =
+                Transaction::begin_shared(&budget, &selected, &url, Phase::Request, &wire, true)
+                    .unwrap();
+            transaction.push(&original).unwrap();
+            let entity = transaction.finish_shared(false, &mut fields);
+            assert!(!entity.changed());
+            assert_eq!(entity.bypass, bypass);
+            assert_eq!(entity.logical().unwrap(), original.as_slice());
+            assert_eq!(entity.wire().as_ref(), original.as_slice());
+            assert_eq!(fields, before);
+            assert_eq!(
+                budget.used(),
+                BudgetedBytes::allocation_cost(original.len()).unwrap()
+            );
+            drop(entity);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[cfg(all(unix, feature = "inbound-http"))]
+    #[test]
+    fn other_native_string_replacements_keep_vector_backing() {
+        let url = Url::parse("https://fixed-output.invalid/body").unwrap();
+        let mut original = vec![b'q'; 64 * 1024];
+        let length = original.len();
+        original[length - 2..].copy_from_slice("é".as_bytes());
+        for yaml in [
+            "- {url: '.', action: response-body-replace, search: qq, replacement: zz}",
+            "- {url: '.', action: response-body-replace, search: é, replacement: ø}",
+            "- {url: '.', action: response-body-replace, search: q, search-mode: regex, replacement: z}",
+            "- {url: '.', action: response-body-replace, search: q, replacement: qq}",
+        ] {
+            let budget = Budget::default();
+            let source = BudgetedBytes::copy(&budget, &original).unwrap();
+            let source_cost = budget.used();
+            let output = apply_operations(
+                &rules(yaml),
+                &url,
+                Phase::Response,
+                source.as_ref(),
+                &budget,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!output.is_mapped_for_test());
+            assert!(std::str::from_utf8(output.as_ref()).is_ok());
+            drop(output);
+            assert_eq!(budget.used(), source_cost);
+            drop(source);
+            assert_eq!(budget.used(), 0);
+        }
     }
 
     #[test]

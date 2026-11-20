@@ -200,6 +200,7 @@ impl HttpContext {
         let original_url = target.original.clone();
         let original_meta =
             super::body::OriginalRequestMeta::new(&request.method, &request.headers);
+        let mut crossed_origin = target.strip_origin_credentials;
         let mut continued = false;
         let mut prepared_upload = None;
         let mut script_context = None;
@@ -338,6 +339,7 @@ impl HttpContext {
                 }
                 Outcome::Forward => {}
             }
+            crossed_origin |= message.crossed_origin;
             if let Some(entity) = message.body.take() {
                 prepared.install_entity(entity);
             }
@@ -386,25 +388,22 @@ impl HttpContext {
             prepared: std::sync::Mutex::new(prepared_upload),
             scripts: script_context,
         };
-        // Request scripts have finished. Native request-body rules remain on
-        // the original path, including rules whose empty GET becomes nonempty.
-        let request_body_rules = self.policy().rules().iter().any(|r| {
-            matches!(
-                r.action,
-                super::rules::RuleAction::Body {
-                    phase: super::rules::Phase::Request,
-                    ..
-                }
-            )
-        });
-        let eligible = scheme == Scheme::Http
-            && target.url.scheme() == "http"
-            && outgoing.method == "GET"
+        // The slot never leaves this downstream's fixed HttpContext. HTTPS
+        // additionally requires an unchanged origin throughout request actions;
+        // an A -> B -> A script chain must not recover reuse eligibility.
+        let reusable_transport = (scheme == Scheme::Http && target.url.scheme() == "http")
+            || (scheme == Scheme::Https
+                && target.url.scheme() == "https"
+                && !crossed_origin
+                && !target.strip_origin_credentials);
+        let eligible = reusable_transport
+            && !matches!(request.method.as_str(), "HEAD" | "CONNECT")
+            && !matches!(outgoing.method.as_str(), "HEAD" | "CONNECT")
+            && !asterisk
             && request.version == "HTTP/1.1"
             && plan.keep_alive
             && plan.upgrade.is_empty()
-            && matches!(plan.body, framing::Body::Empty | framing::Body::Length(0))
-            && !request_body_rules
+            && matches!(plan.body, framing::Body::Empty | framing::Body::Length(_))
             && !outgoing
                 .headers
                 .iter()
@@ -473,12 +472,22 @@ impl HttpContext {
                 0,
                 64 * 1024,
             )?;
-            outbound = timeout_at(deadline, tls.connect(outbound))
+            let (authenticated, alpn) = timeout_at(deadline, tls.connect_negotiated(outbound))
                 .await
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::TimedOut, "HTTP upstream TLS timed out")
                 })?
                 .map_err(|_| io::Error::other("HTTP upstream TLS failed"))?;
+            if alpn
+                .as_deref()
+                .is_some_and(|protocol| protocol != b"http/1.1")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP upstream TLS did not negotiate HTTP/1.1",
+                ));
+            }
+            outbound = authenticated;
         }
         if let Some(key) = key {
             let mut io = server::UpstreamIo::new(outbound);

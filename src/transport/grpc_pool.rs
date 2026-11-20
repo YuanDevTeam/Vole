@@ -99,7 +99,8 @@ impl GrpcPool {
             ..Default::default()
         });
         // One CONNECT-IP response carries the node's inner IP traffic.
-        pool.stream_receive_window = 128 * 1024;
+        // Match its stream and connection receive credit at establishment.
+        pool.stream_receive_window = 512 * 1024;
         pool
     }
     /// Trojan keeps its response and lease after upload END_STREAM.
@@ -306,11 +307,17 @@ impl GrpcPool {
         builder
             .enable_push(false)
             .initial_window_size(self.stream_receive_window)
-            .initial_connection_window_size((2 * super::STREAM_BUFFER_BYTES) as u32)
+            .initial_connection_window_size(
+                self.stream_receive_window
+                    .max((2 * super::STREAM_BUFFER_BYTES) as u32),
+            )
             .max_frame_size(super::STREAM_CHUNK_BYTES as u32)
             .max_header_list_size(super::STREAM_CHUNK_BYTES as u32)
             .max_concurrent_streams(0)
             .max_send_buffer_size(super::STREAM_CHUNK_BYTES);
+        if empty.is_some() {
+            builder.max_concurrent_reset_streams(super::h2_empty::RECENT_RESET_STREAMS);
+        }
         #[cfg(any(
             feature = "outbound-vmess",
             feature = "outbound-vless",
@@ -445,7 +452,7 @@ mod tests {
             .scope(async {
                 let mut owners = vec![
                     ("generic", GrpcPool::new(GrpcOptions::default()), 64 * 1024),
-                    ("masque-ip", GrpcPool::masque_ip(), 128 * 1024),
+                    ("masque-ip", GrpcPool::masque_ip(), 512 * 1024),
                 ];
                 #[cfg(feature = "outbound-trusttunnel")]
                 owners.push(("trusttunnel", GrpcPool::connect_client(), 64 * 1024));
@@ -519,7 +526,11 @@ mod tests {
         assert!(observation.snapshot().is_idle());
         for (name, window, connection_window, expected) in advertised {
             assert_eq!(window, expected, "MASQUE_H2_SCOPED_STREAM_WINDOW: {name}");
-            assert_eq!(connection_window, 128 * 1024, "{name} connection window");
+            assert_eq!(
+                connection_window,
+                expected.max(128 * 1024),
+                "{name} connection window"
+            );
         }
     }
 

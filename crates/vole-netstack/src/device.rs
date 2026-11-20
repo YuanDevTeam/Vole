@@ -253,20 +253,25 @@ impl TxToken for RawTxToken<'_> {
         if let Some(paths) = self.path_mtu.as_mut() {
             // Metadata parsing is limited to trusted smoltcp output. Packets
             // within the path budget keep their allocation and byte contents.
-            if let Some(mut pending) = PendingSegments::new(packet.clone()) {
-                let budget = paths.budget(pending.flow(), self.mtu);
-                if packet.len() > budget {
-                    let Some(first) = pending.next(budget) else {
-                        return result;
-                    };
-                    packet = first;
-                    if !pending.is_finished() {
-                        *self.pending = Some(PendingTransmit::Segments(pending));
+            // Before a path reduction, an in-MTU packet cannot need splitting.
+            // Avoid promoting its Bytes owner to shared just to inspect it.
+            // The emitted metadata below still authorizes the first real hint.
+            if packet.len() > self.mtu || paths.has_reductions() {
+                if let Some(mut pending) = PendingSegments::new(packet.clone()) {
+                    let budget = paths.budget(pending.flow(), self.mtu);
+                    if packet.len() > budget {
+                        let Some(first) = pending.next(budget) else {
+                            return result;
+                        };
+                        packet = first;
+                        if !pending.is_finished() {
+                            *self.pending = Some(PendingTransmit::Segments(pending));
+                        }
                     }
+                } else if packet.len() > self.mtu {
+                    // No UDP boundary splitting or implicit IP fragmentation.
+                    return result;
                 }
-            } else if packet.len() > self.mtu {
-                // No UDP boundary splitting or implicit IP fragmentation.
-                return result;
             }
             paths.emitted(&packet);
         }
@@ -555,5 +560,73 @@ mod tests {
             .unwrap()
             .consume(packet.len(), |bytes| bytes.copy_from_slice(packet.data()));
         assert_eq!(receiver.try_recv().unwrap().len(), packet.len());
+    }
+
+    #[test]
+    fn no_learned_path_still_enforces_initial_mtu_and_drops_unsupported_oversize() {
+        use crate::segmentation::tests::tcp_packet;
+        for ipv6 in [false, true] {
+            let flow = if ipv6 {
+                FlowKey {
+                    source: "[2001:db8::2]:4000".parse().unwrap(),
+                    destination: "[2001:db8:1::2]:443".parse().unwrap(),
+                }
+            } else {
+                FlowKey {
+                    source: "10.23.0.2:4000".parse().unwrap(),
+                    destination: "198.51.100.2:443".parse().unwrap(),
+                }
+            };
+            let (output, mut receiver) = mpsc::channel(1);
+            let mut device = RawIpDevice::new(1500, output);
+            device.enable_path_mtu();
+            let original = tcp_packet(flow, 1000, 91, 16, 4000);
+            device
+                .transmit(Instant::now())
+                .unwrap()
+                .consume(original.len(), |bytes| {
+                    bytes.copy_from_slice(original.data());
+                });
+            let header_length = (if ipv6 { 40 } else { 24 }) + 32;
+            let mut observed = Vec::new();
+            let mut emitted_packets = 0_u64;
+            for _ in 0..8 {
+                let packet = receiver.try_recv().unwrap();
+                assert!(packet.len() <= 1500);
+                assert!(packet.len() > header_length);
+                observed.extend_from_slice(&packet.data()[header_length..]);
+                emitted_packets += 1;
+                if device.pending_tx.is_none() {
+                    break;
+                }
+                device.flush_pending();
+            }
+            assert!(device.pending_tx.is_none(), "bounded split did not finish");
+            assert!(emitted_packets >= 3);
+            assert_eq!(observed, original.data()[header_length..]);
+            assert!(!device.path_mtu.as_ref().unwrap().has_reductions());
+
+            let mut unsupported = original.data().to_vec();
+            if ipv6 {
+                unsupported[6] = 17; // Not TCP; no UDP/IP fragmentation is invented.
+            } else {
+                unsupported[9] = 17;
+                smoltcp::wire::Ipv4Packet::new_unchecked(&mut unsupported).fill_checksum();
+            }
+            device
+                .transmit(Instant::now())
+                .unwrap()
+                .consume(unsupported.len(), |bytes| {
+                    bytes.copy_from_slice(&unsupported);
+                });
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(device.pending_tx.is_none());
+            assert_eq!(device.emitted(), emitted_packets);
+            device.clear();
+            assert!(device.path_mtu.is_none());
+        }
     }
 }

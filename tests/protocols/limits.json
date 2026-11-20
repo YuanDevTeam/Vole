@@ -614,6 +614,17 @@
       ]
     },
     {
+      "id": "tun-tcp-send-buffer",
+      "value": 262144,
+      "unit": "bytes-per-flow",
+      "owner": "ResourceLimits::tun_tcp_send_buffer",
+      "saturation": "split equally between smoltcp TX and app-send queue; full app queue returns Pending until the driver can drain it",
+      "cancellation": "existing runtime-owned cancellation and Stop barrier",
+      "boundary_cases": [
+        "FOUNDATIONS-REGRESSION"
+      ]
+    },
+    {
       "id": "dns-cache",
       "value": 256,
       "unit": "entries",

@@ -35,8 +35,8 @@ pub struct TuicOutbound {
     server: Destination,
     upstream: UpstreamPath,
     tls: StandardTlsClient,
-    // Lazy native source stripes, or isolated quic TCP/UDP business lanes.
-    // UoT keeps the original shared lane.
+    // Lazy native source stripes, or private TCP/UDP business lanes.
+    // UoT enters the UDP lane only through its internal magic stream.
     current: AsyncMutex<[Option<Arc<Session>>; 2]>,
     cancel: CancellationToken,
     admission: Mutex<()>,
@@ -96,8 +96,7 @@ impl TuicOutbound {
 
     fn datagram_lane(&self) -> usize {
         usize::from(
-            self.config.udp_mode == crate::config::TuicUdpMode::Quic
-                && !self.config.udp_over_stream,
+            self.config.udp_mode == crate::config::TuicUdpMode::Quic || self.config.udp_over_stream,
         )
     }
 
@@ -228,7 +227,7 @@ impl TuicOutbound {
                     let task = observation::track(ResourceKind::Task);
                     self.tasks.spawn(observation::bind(async move {
                         let _task = task;
-                        drive(config, upstream, server, tls, datagram, context, cancel, ready).await;
+                        drive(config, upstream, server, tls, datagram, datagram_business, context, cancel, ready).await;
                     }));
                 }
                 let session = reply.await.map_err(|_|DispatchError::ConnectionRefused)??;
@@ -239,21 +238,19 @@ impl TuicOutbound {
             }) => result,
         }
     }
-}
 
-#[async_trait]
-impl OutboundConnector for TuicOutbound {
-    async fn connect_stream(
+    async fn connect_stream_in_lane(
         &self,
         session: StreamSession,
         context: &EstablishContext,
+        datagram_business: bool,
     ) -> Result<ConnectedStream, DispatchError> {
         let header = wire::connect(&session.destination)?;
         let (shared, lease) = self
             .session(
                 DatagramSession::new(session.inbound, session.source),
                 context,
-                false,
+                datagram_business,
             )
             .await?;
         tokio::select! { biased;
@@ -267,6 +264,24 @@ impl OutboundConnector for TuicOutbound {
             }) => result,
         }
     }
+}
+
+#[async_trait]
+impl OutboundConnector for TuicOutbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        !self.cancel.is_cancelled()
+            && self.tls.permits_static_http_reuse()
+            && self.upstream.permits_static_direct_http_reuse(&self.server)
+    }
+
+    async fn connect_stream(
+        &self,
+        session: StreamSession,
+        context: &EstablishContext,
+    ) -> Result<ConnectedStream, DispatchError> {
+        self.connect_stream_in_lane(session, context, false).await
+    }
 
     async fn open_datagram(
         &self,
@@ -275,7 +290,7 @@ impl OutboundConnector for TuicOutbound {
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         if self.config.udp_over_stream {
             let connected = self
-                .connect_stream(
+                .connect_stream_in_lane(
                     StreamSession {
                         metadata: request.session.metadata.clone(),
                         inbound: request.session.inbound,
@@ -284,6 +299,7 @@ impl OutboundConnector for TuicOutbound {
                         sniffed_domain: None,
                     },
                     context,
+                    true,
                 )
                 .await?;
             let _admission = self.admission.lock().unwrap();
@@ -294,7 +310,7 @@ impl OutboundConnector for TuicOutbound {
             return Ok(crate::dispatch::bound_datagram(
                 Box::new(
                     crate::outbound::uot::UotTransport::new(
-                        reader,
+                        uot_receive_reader(reader),
                         writer,
                         request.max_response_payload_size(),
                         self.cancel.clone(),
@@ -313,6 +329,12 @@ impl OutboundConnector for TuicOutbound {
                 shared.runtime.clone(),
                 request.budget(),
                 lease,
+                tun_pending_send_enabled(
+                    cfg!(target_os = "macos"),
+                    request.session.inbound,
+                    self.config.udp_mode,
+                    self.config.udp_over_stream,
+                ),
             )? {
                 return Ok(transport);
             }
@@ -347,6 +369,7 @@ async fn drive(
     server: Destination,
     tls: StandardTlsClient,
     datagram: DatagramSession,
+    datagram_business: bool,
     context: EstablishContext,
     cancel: CancellationToken,
     ready: oneshot::Sender<Result<Arc<Session>, DispatchError>>,
@@ -377,6 +400,18 @@ async fn drive(
             } else {
                 request
             };
+        #[cfg(target_os = "macos")]
+        let raw = if config.udp_mode == crate::config::TuicUdpMode::Quic && !config.udp_over_stream
+        {
+            // Both business lanes keep this one authenticated physical peer.
+            // Groups and proxy codecs retain the original datagram factory.
+            upstream
+                .open_fixed_peer_datagram(request, peer, &context)
+                .await?
+        } else {
+            upstream.open_datagram(request, &context).await?
+        };
+        #[cfg(not(target_os = "macos"))]
         let raw = upstream.open_datagram(request, &context).await?;
         let (socket, owned) = quic::attach_quinn(raw, peer, budget).await?;
         driver = Some(owned);
@@ -397,14 +432,25 @@ async fn drive(
             Some(discovery)
         };
         let initial_mtu = if discovery.is_some() { 1200 } else { mtu };
+        // Only the actual UDP business lane receives per-packet remote UNI
+        // streams. This permission is separate from the 32 active decoders.
+        let advertised_uni_credit = if cfg!(target_os = "macos")
+            && datagram_business
+            && config.udp_mode == crate::config::TuicUdpMode::Quic
+            && !config.udp_over_stream
+        {
+            128_u32
+        } else {
+            crate::limits::TUIC_CONTROL_READERS as u32
+        };
         limits
             .initial_mtu(initial_mtu)
             .min_mtu(1200)
             .mtu_discovery_config(discovery)
             // Business owner thresholds never flow into Quinn's eager maps.
-            // The decoder already bounds concurrent remote uni streams to 32.
+            // The receive loop still bounds active decoders to 32.
             .max_concurrent_bidi_streams(0_u8.into())
-            .max_concurrent_uni_streams((crate::limits::TUIC_CONTROL_READERS as u32).into())
+            .max_concurrent_uni_streams(advertised_uni_credit.into())
             .send_window(crate::limits::TUIC_SEND_WINDOW as u64)
             .datagram_receive_buffer_size(Some(crate::limits::TUIC_DATAGRAM_BUFFER))
             .datagram_send_buffer_size(crate::limits::TUIC_DATAGRAM_BUFFER)
@@ -505,6 +551,35 @@ async fn drive(
         let _ = driver.stop().await;
     }
 }
+
+fn tun_pending_send_enabled(
+    macos: bool,
+    inbound: crate::session::InboundKind,
+    mode: crate::config::TuicUdpMode,
+    uot: bool,
+) -> bool {
+    macos
+        && inbound == crate::session::InboundKind::Tun
+        && mode == crate::config::TuicUdpMode::Quic
+        && !uot
+}
+
+#[cfg(test)]
+#[path = "tun_send_selector_tests.rs"]
+mod tun_send_selector_tests;
+
+// Only actual TUIC UoT associations retain this bounded read-ahead buffer.
+// Coalesce their small frame-header reads before acquiring the shared QUIC IO.
+fn uot_receive_reader<R>(reader: R) -> impl tokio::io::AsyncRead + Unpin + Send + 'static
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::io::BufReader::with_capacity(8 * 1024, reader)
+}
+
+#[cfg(test)]
+#[path = "uot_read_memory_tests.rs"]
+mod uot_read_memory_tests;
 
 fn current_tls(
     tls: &StandardTlsClient,

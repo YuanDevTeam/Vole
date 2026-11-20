@@ -806,20 +806,26 @@ impl Dispatcher for RoutingDispatcher {
         let (decision, selected) = prepared?;
         let direct =
             decision.action == RuleAction::Direct || selected.as_ref().is_some_and(|s| s.direct);
-        let static_physical = selected
+        let static_connector = selected
             .as_ref()
             .map_or(&self.direct, |s| &s.dispatcher)
             .permits_http_tcp_reuse();
-        let key = if direct
-            && static_physical
-            && matches!(decision.destination, Destination::Ip(_))
-            && !(self.tcp_concurrent
-                && decision
-                    .resolved_addresses
-                    .as_ref()
-                    .is_some_and(|a| a.len() > 1))
-        {
-            Some(crate::dispatch::HttpTcpReuseKey::new(HttpDirectIdentity {
+        // DIRECT still needs a fixed selected IP without address racing. A
+        // proven proxy has its own immutable physical path; its business
+        // destination may remain a remotely resolved name. No route is rerun
+        // here, and a rejected/keyless leaf cannot borrow DIRECT's permission.
+        let stable_route = if direct {
+            matches!(decision.destination, Destination::Ip(_))
+                && !(self.tcp_concurrent
+                    && decision
+                        .resolved_addresses
+                        .as_ref()
+                        .is_some_and(|a| a.len() > 1))
+        } else {
+            selected.as_ref().is_some_and(|s| !s.direct)
+        };
+        let key = if static_connector && stable_route {
+            Some(crate::dispatch::HttpTcpReuseKey::new(HttpRouteIdentity {
                 rules: self.rules.clone(),
                 leaf: selected
                     .as_ref()
@@ -914,7 +920,7 @@ impl Dispatcher for RoutingDispatcher {
 }
 
 #[cfg(feature = "inbound-http")]
-struct HttpDirectIdentity {
+struct HttpRouteIdentity {
     rules: Arc<RuleSet>,
     leaf: Arc<dyn Dispatcher>,
     session: StreamSession,
@@ -928,7 +934,7 @@ struct HttpDirectIdentity {
     chain: Vec<String>,
 }
 #[cfg(feature = "inbound-http")]
-impl PartialEq for HttpDirectIdentity {
+impl PartialEq for HttpRouteIdentity {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.rules, &other.rules)
             && Arc::ptr_eq(&self.leaf, &other.leaf)
@@ -944,7 +950,7 @@ impl PartialEq for HttpDirectIdentity {
     }
 }
 #[cfg(feature = "inbound-http")]
-impl Eq for HttpDirectIdentity {}
+impl Eq for HttpRouteIdentity {}
 #[cfg(feature = "inbound-http")]
 struct RoutingHttpTcpPlan {
     router: RoutingDispatcher,
@@ -1009,6 +1015,8 @@ impl RoutingDispatcher {
             flows: DatagramRoutes::new(self.tun_config.udp_timeout),
             logged_route_actions: HashSet::new(),
             receive_wakeup: Arc::new(Notify::new()),
+            #[cfg(target_os = "macos")]
+            pending_tun_send: None,
         }
     }
 
@@ -1239,6 +1247,26 @@ struct RoutedDatagramTransport {
     flows: DatagramRoutes,
     logged_route_actions: HashSet<LoggedRouteAction>,
     receive_wakeup: Arc<Notify>,
+    #[cfg(target_os = "macos")]
+    pending_tun_send: Option<PendingRouteSend>,
+}
+
+#[cfg(target_os = "macos")]
+enum PendingTunRoute {
+    Managed {
+        key: Destination,
+        shared: Option<usize>,
+        size: usize,
+    },
+    Cached((RouteTargetId, Option<Destination>)),
+}
+
+#[cfg(target_os = "macos")]
+struct PendingRouteSend {
+    route: PendingTunRoute,
+    completion: crate::dispatch::TunSendToken,
+    cancel: tokio_util::sync::CancellationToken,
+    deferred_remove: bool,
 }
 
 // Each synthetic target owns an association: two names may resolve to the same
@@ -1428,7 +1456,24 @@ impl RoutedDatagramTransport {
         self.router.diagnostics.is_some() && business(self.session.inbound)
     }
 
+    #[cfg(target_os = "macos")]
+    fn tun_send_removal_deferred(&self) -> bool {
+        self.pending_tun_send
+            .as_ref()
+            .is_some_and(|pending| pending.deferred_remove)
+    }
+
     async fn remove_managed(&mut self, key: &Destination) -> Result<(), DispatchError> {
+        #[cfg(target_os = "macos")]
+        if let Some(pending) = self.pending_tun_send.as_mut()
+            && matches!(&pending.route, PendingTunRoute::Managed { key: sending, .. } if sending == key)
+        {
+            // Receive/controller cleanup cannot close a still-leased wire.
+            // One flag suffices: normal completion performs original removal.
+            pending.deferred_remove = true;
+            pending.cancel.cancel();
+            return Ok(());
+        }
         let Some(mut flow) = self.managed_flows.remove(key) else {
             return Ok(());
         };
@@ -1773,6 +1818,12 @@ impl RoutedDatagramTransport {
     async fn receive_managed(&mut self) -> Result<Datagram, DispatchError> {
         loop {
             self.clean_managed().await;
+            #[cfg(target_os = "macos")]
+            if self.tun_send_removal_deferred() {
+                // Yield to the TUN owner even under an unconstrained poll.
+                // It must drop IO before completing the deferred removal.
+                return Err(DispatchError::NotAllowed);
+            }
             let idle_timeout = self.router.tun_config.udp_timeout;
             let result = {
                 let polled = std::future::poll_fn(|context| {
@@ -1834,6 +1885,10 @@ impl RoutedDatagramTransport {
                         flow.connection.failed(&error);
                     }
                     let _ = self.remove_managed(&key).await;
+                    #[cfg(target_os = "macos")]
+                    if self.tun_send_removal_deferred() {
+                        return Err(DispatchError::NotAllowed);
+                    }
                 }
                 Some(ManagedDatagramEvent::Shared(id, Ok(datagram))) => {
                     let key = &datagram.remote;
@@ -1842,6 +1897,10 @@ impl RoutedDatagramTransport {
                     {
                         if flow.connection.cancelled() || flow.last_used.elapsed() >= idle_timeout {
                             let _ = self.remove_managed(key).await;
+                            #[cfg(target_os = "macos")]
+                            if self.tun_send_removal_deferred() {
+                                return Err(DispatchError::NotAllowed);
+                            }
                         } else {
                             flow.connection.download(datagram.payload.len());
                             flow.last_used = Instant::now();
@@ -1850,7 +1909,11 @@ impl RoutedDatagramTransport {
                     }
                 }
                 Some(ManagedDatagramEvent::Shared(id, Err(error))) => {
-                    self.fail_managed_shared(id, &error).await
+                    self.fail_managed_shared(id, &error).await;
+                    #[cfg(target_os = "macos")]
+                    if self.tun_send_removal_deferred() {
+                        return Err(error);
+                    }
                 }
                 None => {}
             }
@@ -1869,6 +1932,14 @@ impl RoutedDatagramTransport {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in expired {
+            #[cfg(target_os = "macos")]
+            if let Some(pending) = self.pending_tun_send.as_mut()
+                && matches!(&pending.route, PendingTunRoute::Cached(sending) if sending == &key)
+            {
+                pending.deferred_remove = true;
+                pending.cancel.cancel();
+                continue;
+            }
             if let Some(mut cached) = self.route_transports.remove(&key) {
                 let _ = cached.transport.close().await;
             }
@@ -2116,6 +2187,219 @@ impl DatagramTransport for RoutedDatagramTransport {
     fn supports_shared_destinations(&self) -> bool {
         // Owns routing and address restoration; it is not a transparent codec.
         false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn try_begin_tun_send(
+        &mut self,
+        datagram: Datagram,
+        flow_id: Option<&[u8]>,
+    ) -> Result<crate::dispatch::TunPendingSend, Datagram> {
+        if self.pending_tun_send.is_some()
+            || self.session.inbound != InboundKind::Tun
+            || datagram.sniffed_domain.is_some()
+            || flow_id.is_some_and(|id| id.is_empty() || id.len() > 25)
+            || !matches!(datagram.remote, Destination::Ip(_))
+        {
+            return Err(datagram);
+        }
+        let now = Instant::now();
+        let key = datagram.remote.clone();
+        let size = datagram.payload.len();
+        let (mut operation, route, connection_cancel) = if self.tracked() {
+            if now >= self.managed_next_cleanup {
+                return Err(datagram);
+            }
+            let Some(flow) = self.managed_flows.get_mut(&key) else {
+                return Err(datagram);
+            };
+            if flow.connection.cancelled()
+                || flow.last_used.elapsed() >= self.router.tun_config.udp_timeout
+                || flow.restore
+                || flow.destination != key
+                || flow_id.is_some_and(|id| flow.flow_id.as_deref() != Some(id))
+            {
+                return Err(datagram);
+            }
+            let connection_cancel = flow.connection.token();
+            let (transport, shared) = match &mut flow.transport {
+                ManagedTransport::Dedicated(transport) => (transport, None),
+                ManagedTransport::Shared(id) => (
+                    &mut self
+                        .managed_shared
+                        .get_mut(id)
+                        .expect("shared flow owner")
+                        .transport,
+                    Some(*id),
+                ),
+            };
+            let operation = transport.try_begin_tun_send(datagram, None)?;
+            // Unsupported admission above changes no routing/accounting state.
+            flow.last_used = now;
+            (
+                operation,
+                PendingTunRoute::Managed { key, shared, size },
+                Some(connection_cancel),
+            )
+        } else {
+            let Destination::Ip(destination) = key else {
+                return Err(datagram);
+            };
+            if now >= self.flows.next_cleanup
+                || self.route_transports.iter().any(|((_, target), cached)| {
+                    target.is_some()
+                        && cached.last_used.elapsed() >= self.router.tun_config.udp_timeout
+                })
+                || self
+                    .fake_flows
+                    .values()
+                    .any(|flow| flow.last_used.elapsed() >= self.router.tun_config.udp_timeout)
+                || self.fake_flows.contains_key(&destination)
+                || self
+                    .router
+                    .dns
+                    .as_ref()
+                    .is_some_and(|dns| !matches!(dns.recover_fake_ip(destination.ip()), Ok(None)))
+            {
+                return Err(datagram);
+            }
+            let Some(flow) = self.flows.entries.get(&destination) else {
+                return Err(datagram);
+            };
+            if now.duration_since(flow.last_used) >= self.flows.idle_timeout
+                || flow_id.is_some_and(|id| flow.flow_id.as_deref() != Some(id))
+            {
+                return Err(datagram);
+            }
+            let RuleAction::Route(id) = flow.action else {
+                return Err(datagram);
+            };
+            let cache_key = (
+                id,
+                self.router
+                    .route_targets
+                    .per_flow(id)
+                    .then_some(Destination::Ip(destination)),
+            );
+            let Some(cached) = self.route_transports.get_mut(&cache_key) else {
+                return Err(datagram);
+            };
+            if cached.direct || cached.last_used.elapsed() >= self.router.tun_config.udp_timeout {
+                return Err(datagram);
+            }
+            let operation = cached.transport.try_begin_tun_send(datagram, None)?;
+            cached.last_used = now;
+            self.flows
+                .entries
+                .get_mut(&destination)
+                .expect("cached flow")
+                .last_used = now;
+            (operation, PendingTunRoute::Cached(cache_key), None)
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let abort = cancel.clone();
+        let io = operation.operation;
+        operation.operation = Box::pin(async move {
+            let connection_cancelled = async {
+                match connection_cancel {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                biased;
+                () = abort.cancelled() => Err(DispatchError::NotAllowed),
+                () = connection_cancelled => Err(DispatchError::NotAllowed),
+                result = io => result,
+            }
+        });
+        self.pending_tun_send = Some(PendingRouteSend {
+            route,
+            completion: operation.completion.clone(),
+            cancel,
+            deferred_remove: false,
+        });
+        Ok(operation)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn finish_tun_send(
+        &mut self,
+        completion: crate::dispatch::TunSendToken,
+        outcome: crate::dispatch::TunSendOutcome,
+    ) -> Result<(), DispatchError> {
+        use crate::dispatch::TunSendOutcome;
+        if !self
+            .pending_tun_send
+            .as_ref()
+            .is_some_and(|pending| pending.completion.same(&completion))
+        {
+            return Err(DispatchError::NotAllowed);
+        }
+        let pending = self
+            .pending_tun_send
+            .take()
+            .expect("verified TUN send identity");
+        // The caller has already dropped IO; take the sole pin before awaits.
+        let completed = matches!(&outcome, TunSendOutcome::Completed(_));
+        match pending.route {
+            PendingTunRoute::Managed { key, shared, size } => {
+                let result = match self.managed_flows.get_mut(&key) {
+                    Some(flow) => match &mut flow.transport {
+                        ManagedTransport::Dedicated(transport) => {
+                            transport.finish_tun_send(completion, outcome).await
+                        }
+                        ManagedTransport::Shared(id) => match self.managed_shared.get_mut(id) {
+                            Some(owner) => {
+                                owner.transport.finish_tun_send(completion, outcome).await
+                            }
+                            None => Err(DispatchError::NotAllowed),
+                        },
+                    },
+                    None => Err(DispatchError::NotAllowed),
+                };
+                if !completed || pending.deferred_remove {
+                    // External cancellation/timeout never impersonates IO failure.
+                    let _ = self.remove_managed(&key).await;
+                    return result;
+                }
+                if let Some(flow) = self.managed_flows.get(&key) {
+                    match &result {
+                        Ok(()) => flow.connection.upload(size),
+                        Err(error) if shared.is_none() && !flow.connection.cancelled() => {
+                            flow.connection.failed(error)
+                        }
+                        Err(_) => {}
+                    }
+                }
+                if let Err(error) = &result {
+                    let cancelled = self
+                        .managed_flows
+                        .get(&key)
+                        .is_none_or(|flow| flow.connection.cancelled());
+                    if let Some(id) = shared
+                        && !cancelled
+                    {
+                        self.fail_managed_shared(id, error).await;
+                    } else {
+                        let _ = self.remove_managed(&key).await;
+                    }
+                }
+                result
+            }
+            PendingTunRoute::Cached(key) => {
+                let result = match self.route_transports.get_mut(&key) {
+                    Some(cached) => cached.transport.finish_tun_send(completion, outcome).await,
+                    None => Err(DispatchError::NotAllowed),
+                };
+                if pending.deferred_remove
+                    && let Some(mut cached) = self.route_transports.remove(&key)
+                {
+                    let _ = cached.transport.close().await;
+                }
+                result
+            }
+        }
     }
 
     async fn send(&mut self, mut datagram: Datagram) -> Result<(), DispatchError> {
@@ -2371,6 +2655,9 @@ mod tests {
     use bytes::Bytes;
 
     include!("numeric_host_sniff_tests.rs");
+    include!("http_reuse_memory_tests.rs");
+    #[cfg(target_os = "macos")]
+    include!("dispatcher_tun_send_green_tests.rs");
 
     #[derive(Default)]
     struct RecordingDispatcher {

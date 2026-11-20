@@ -39,6 +39,10 @@ use tokio_util::sync::CancellationToken;
 pub const QUEUE_LIMIT: usize = 32;
 pub const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "quic/send_batch_memory_tests.rs"]
+mod send_batch_memory_tests;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
     pub sent: usize,
@@ -372,6 +376,67 @@ pub fn attach_mapped(
     ))
 }
 
+enum PendingSend {
+    Single(crate::dispatch::OwnedDatagramSend),
+    #[cfg(target_os = "macos")]
+    Batch {
+        operation: crate::dispatch::OwnedDatagramBatchSend,
+        submitted: usize,
+    },
+}
+enum SendCompletion {
+    Single,
+    #[cfg(target_os = "macos")]
+    Batch(usize),
+}
+impl PendingSend {
+    async fn complete(&mut self) -> io::Result<SendCompletion> {
+        match self {
+            Self::Single(operation) => {
+                operation.as_mut().await.map_err(dispatch_error)?;
+                Ok(SendCompletion::Single)
+            }
+            #[cfg(target_os = "macos")]
+            Self::Batch {
+                operation,
+                submitted,
+            } => {
+                let accepted = operation.as_mut().await?;
+                if accepted == 0 || accepted > *submitted {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid physical datagram batch completion",
+                    ));
+                }
+                Ok(SendCompletion::Batch(accepted))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ready_send_batch(shared: &Shared, peer: SocketAddr) -> Vec<Datagram> {
+    let state = shared.state.lock().unwrap();
+    if state.closed || state.outgoing.len() < 2 {
+        return Vec::new();
+    }
+    let mut bytes = 0usize;
+    state
+        .outgoing
+        .iter()
+        .take(crate::dispatch::DATAGRAM_SEND_BATCH_LIMIT)
+        .take_while(|payload| {
+            bytes += payload.len();
+            bytes <= crate::dispatch::DATAGRAM_SEND_BATCH_BYTES
+        })
+        .map(|payload| Datagram {
+            remote: peer.into(),
+            payload: payload.clone(),
+            sniffed_domain: None,
+        })
+        .collect()
+}
+
 async fn drive(
     transport: &mut dyn DatagramTransport,
     peer: SocketAddr,
@@ -381,7 +446,9 @@ async fn drive(
 ) -> io::Result<()> {
     let mut has_sent = false;
     let mut receive_scratch = Vec::new();
-    let mut pending_send: Option<crate::dispatch::OwnedDatagramSend> = None;
+    let mut pending_send: Option<PendingSend> = None;
+    #[cfg(target_os = "macos")]
+    let mut batch_available = true;
     loop {
         let (can_receive, can_send) = {
             let state = shared.state.lock().unwrap();
@@ -393,12 +460,25 @@ async fn drive(
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
             _ = shared.changed.notified() => {},
-            sent = async { pending_send.as_mut().expect("owned send branch").as_mut().await }, if pending_send.is_some() => {
-                sent.map_err(dispatch_error)?;
+            sent = async { pending_send.as_mut().expect("owned send branch").complete().await }, if pending_send.is_some() => {
+                let sent = sent?;
                 pending_send.take();
                 has_sent = true;
                 let mut state = shared.state.lock().unwrap();
-                state.stats.sent += 1;
+                match sent {
+                    SendCompletion::Single => state.stats.sent += 1,
+                    #[cfg(target_os = "macos")]
+                    SendCompletion::Batch(accepted) => {
+                        // Driver Drop may have cleared the queue while IO completed.
+                        if state.closed { return Ok(()); }
+                        if state.outgoing.len() < accepted {
+                            return Err(io::ErrorKind::InvalidData.into());
+                        }
+                        drop(state.outgoing.drain(..accepted));
+                        state.stats.sent += accepted;
+                    }
+                }
+                drop(state);
                 shared.writer.wake();
             },
             // Notify permits coalesce. A producer may have queued several
@@ -428,6 +508,32 @@ async fn drive(
             }
         }
         if pending_send.is_none() {
+            #[cfg(target_os = "macos")]
+            {
+                // Clone handles only. The original FIFO remains the capacity
+                // ledger until a positive physical completion consumes a prefix.
+                let packets = if batch_available {
+                    ready_send_batch(shared, peer)
+                } else {
+                    Vec::new()
+                };
+                if packets.len() >= 2 {
+                    let submitted = packets.len();
+                    match transport.send_batch_owned(packets) {
+                        Ok(operation) => {
+                            pending_send = Some(PendingSend::Batch {
+                                operation,
+                                submitted,
+                            });
+                            continue;
+                        }
+                        // DIRECT may become eligible after its ordinary first
+                        // send initializes IO. Later refusal is stable here.
+                        Err(_) if has_sent => batch_available = false,
+                        Err(_) => {}
+                    }
+                }
+            }
             let payload = shared.state.lock().unwrap().outgoing.pop_front();
             if let Some(payload) = payload {
                 shared.writer.wake();
@@ -437,7 +543,7 @@ async fn drive(
                     sniffed_domain: None,
                 };
                 match transport.send_owned(packet) {
-                    Ok(send) => pending_send = Some(send),
+                    Ok(send) => pending_send = Some(PendingSend::Single(send)),
                     Err(packet) => {
                         // An upstream without an owned path keeps its existing
                         // cancellation-safe send; never open another socket.

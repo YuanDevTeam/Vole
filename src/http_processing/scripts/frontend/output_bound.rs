@@ -33,15 +33,21 @@ pub(super) fn analyze(function: &Function<'_>) -> OutputBound {
         declared: BTreeSet::new(),
         bindings: BTreeMap::new(),
         writes: BTreeSet::new(),
+        root_strings: BTreeSet::new(),
+        audited_writes: BTreeSet::new(),
+        other_writes: BTreeSet::new(),
         returns: Vec::new(),
     };
-    let always_returns = analysis.statements(&body.statements);
+    let always_returns = analysis.statements(&body.statements, true);
     if !analysis.safe || !always_returns || analysis.returns.is_empty() {
         return OutputBound::Maximum;
     }
     let mut maximum_literal_bytes = 0;
     for proof in &analysis.returns {
-        if !proof.dependencies.is_disjoint(&analysis.writes) {
+        if proof.dependencies.iter().any(|name| {
+            analysis.writes.contains(name)
+                && (!analysis.audited_writes.contains(name) || analysis.other_writes.contains(name))
+        }) {
             return OutputBound::Maximum;
         }
         maximum_literal_bytes = maximum_literal_bytes.max(proof.literal_bytes);
@@ -61,6 +67,9 @@ struct Analysis {
     declared: BTreeSet<String>,
     bindings: BTreeMap<String, StringProof>,
     writes: BTreeSet<String>,
+    root_strings: BTreeSet<String>,
+    audited_writes: BTreeSet<String>,
+    other_writes: BTreeSet<String>,
     returns: Vec<StringProof>,
 }
 
@@ -71,29 +80,29 @@ impl Analysis {
         self.safe
     }
 
-    fn statements(&mut self, statements: &[Statement<'_>]) -> bool {
+    fn statements(&mut self, statements: &[Statement<'_>], root: bool) -> bool {
         let mut always_returns = false;
         for statement in statements {
             // Do not prune dead/unreachable statements: their unknown effects
             // must also force the whole optional proof back to Maximum.
-            always_returns |= self.statement(statement);
+            always_returns |= self.statement(statement, root);
         }
         always_returns
     }
 
-    fn statement(&mut self, statement: &Statement<'_>) -> bool {
+    fn statement(&mut self, statement: &Statement<'_>, root: bool) -> bool {
         if !self.enter() {
             return false;
         }
         match statement {
-            Statement::BlockStatement(block) => self.statements(&block.body),
+            Statement::BlockStatement(block) => self.statements(&block.body, false),
             Statement::EmptyStatement(_) => false,
             Statement::VariableDeclaration(declaration) => {
-                self.declaration(declaration);
+                self.declaration(declaration, root);
                 false
             }
             Statement::ExpressionStatement(statement) => {
-                self.expression(&statement.expression);
+                self.expression_at(&statement.expression, root);
                 false
             }
             Statement::ReturnStatement(statement) => {
@@ -114,20 +123,20 @@ impl Analysis {
             }
             Statement::IfStatement(statement) => {
                 self.expression(&statement.test);
-                let consequent = self.statement(&statement.consequent);
+                let consequent = self.statement(&statement.consequent, false);
                 let alternate = statement
                     .alternate
                     .as_ref()
-                    .is_some_and(|s| self.statement(s));
+                    .is_some_and(|s| self.statement(s, false));
                 consequent && alternate
             }
             Statement::WhileStatement(statement) => {
                 self.expression(&statement.test);
-                self.statement(&statement.body);
+                self.statement(&statement.body, false);
                 false
             }
             Statement::DoWhileStatement(statement) => {
-                self.statement(&statement.body);
+                self.statement(&statement.body, false);
                 self.expression(&statement.test);
                 false
             }
@@ -135,7 +144,7 @@ impl Analysis {
                 if let Some(init) = &statement.init {
                     match init {
                         ForStatementInit::VariableDeclaration(declaration) => {
-                            self.declaration(declaration)
+                            self.declaration(declaration, false)
                         }
                         _ => match init.as_expression() {
                             Some(expression) => self.expression(expression),
@@ -149,7 +158,7 @@ impl Analysis {
                 if let Some(update) = &statement.update {
                     self.expression(update);
                 }
-                self.statement(&statement.body);
+                self.statement(&statement.body, false);
                 false
             }
             Statement::BreakStatement(statement) if statement.label.is_none() => false,
@@ -161,7 +170,7 @@ impl Analysis {
         }
     }
 
-    fn declaration(&mut self, declaration: &VariableDeclaration<'_>) {
+    fn declaration(&mut self, declaration: &VariableDeclaration<'_>, root: bool) {
         for binding in &declaration.declarations {
             let BindingPattern::BindingIdentifier(identifier) = &binding.id else {
                 self.safe = false;
@@ -181,6 +190,9 @@ impl Analysis {
                     return;
                 }
                 if let Some(proof) = self.string_proof(init) {
+                    if root && matches!(declaration.kind, VariableDeclarationKind::Let) {
+                        self.root_strings.insert(name.to_owned());
+                    }
                     self.bindings.insert(name.to_owned(), proof);
                 }
             }
@@ -188,6 +200,10 @@ impl Analysis {
     }
 
     fn expression(&mut self, expression: &Expression<'_>) {
+        self.expression_at(expression, false);
+    }
+
+    fn expression_at(&mut self, expression: &Expression<'_>, root_statement: bool) {
         if !self.enter() {
             return;
         }
@@ -243,10 +259,10 @@ impl Analysis {
                 match &value.left {
                     AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
                         let name = identifier.name.as_str();
-                        self.writes.insert(name.to_owned());
-                        if name == self.parameter {
-                            self.safe = false;
-                        }
+                        let audited = root_statement
+                            && self.root_strings.contains(name)
+                            && ascii_self_assignment(value, name);
+                        self.record_write(name, audited);
                     }
                     // Includes writes through aliases, computed keys, argument
                     // expressions and unreachable branches.
@@ -257,10 +273,7 @@ impl Analysis {
             Expression::UpdateExpression(value) => match &value.argument {
                 SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) => {
                     let name = identifier.name.as_str();
-                    self.writes.insert(name.to_owned());
-                    if name == self.parameter {
-                        self.safe = false;
-                    }
+                    self.record_write(name, false);
                 }
                 _ => self.safe = false,
             },
@@ -278,6 +291,19 @@ impl Analysis {
             }
             _ => self.safe = false,
         }
+    }
+
+    fn record_write(&mut self, name: &str, audited: bool) {
+        self.writes.insert(name.to_owned());
+        if audited {
+            self.audited_writes.insert(name.to_owned());
+        } else {
+            self.other_writes.insert(name.to_owned());
+        }
+        self.safe &= name != self.parameter
+            && self.writes.len() <= MAX_PROOF_BINDINGS
+            && self.audited_writes.len() <= MAX_PROOF_BINDINGS
+            && self.other_writes.len() <= MAX_PROOF_BINDINGS;
     }
 
     fn return_proof(&self, expression: &Expression<'_>) -> Option<StringProof> {
@@ -347,6 +373,44 @@ impl Analysis {
             _ => None,
         }
     }
+}
+
+// A constant-size syntax check inside the existing counted AST walk. The
+// initial proof is never replaced: every successful string version has the
+// same byte bound, including aliases and returns before a later assignment.
+fn ascii_self_assignment(assignment: &AssignmentExpression<'_>, name: &str) -> bool {
+    if assignment.operator.as_str() != "=" {
+        return false;
+    }
+    let Expression::CallExpression(call) = &assignment.right else {
+        return false;
+    };
+    let Expression::StaticMemberExpression(member) = &call.callee else {
+        return false;
+    };
+    if call.optional
+        || member.optional
+        || member.property.name != "replaceAll"
+        || call.arguments.len() != 2
+        || !matches!(&member.object, Expression::Identifier(receiver) if receiver.name == name)
+    {
+        return false;
+    }
+    let Some(Expression::StringLiteral(search)) = call.arguments[0].as_expression() else {
+        return false;
+    };
+    let Some(Expression::StringLiteral(replacement)) = call.arguments[1].as_expression() else {
+        return false;
+    };
+    let (Some(search), Some(replacement)) = (search.value.as_str(), replacement.value.as_str())
+    else {
+        return false;
+    };
+    search.len() == 1
+        && search.is_ascii()
+        && replacement.len() == 1
+        && replacement.is_ascii()
+        && replacement != "$"
 }
 
 fn constant_proof(literal_bytes: usize) -> StringProof {
@@ -482,6 +546,196 @@ mod tests {
 
     fn hint(source: &str) -> OutputBound {
         super::super::compile_with_output_bound(source).unwrap().1
+    }
+
+    #[test]
+    fn top_level_ascii_self_assignment_bounds_output_without_changing_emitted_js() {
+        let source = "function rewrite(input){let payload=input.body.data;payload=payload.replaceAll('q','z');return {type:'modify',body:{kind:'text',data:payload}};}";
+        let prepared = super::super::compile_prepared(source).unwrap();
+        assert_eq!(
+            prepared.code,
+            r#"function rewrite(input){"use strict";__voleTick();let payload=__voleGet(__voleGet(input,"body"),"data");(payload=__voleCall(payload,"replaceAll",["q","z"]));return __voleValue({"type":"modify","body":__voleValue({"kind":"text","data":payload})});}"#
+        );
+        #[cfg(target_vendor = "apple")]
+        assert!(
+            prepared.plan.is_some(),
+            "the independent closed Plan proof now accepts this source"
+        );
+        assert_eq!(
+            prepared.output_bound,
+            OutputBound::InputOrConstant {
+                maximum_literal_bytes: 0
+            }
+        );
+    }
+
+    #[test]
+    fn frozen_guarded_pressure_sources_keep_input_sized_output_and_closed_plans() {
+        // Freeze the actual pure/request and mixed/response source shapes.
+        // No guard, witness, assignment or body workload is simplified here.
+        for source in [
+            r#"function rewrite(input) { if (!input.body || input.body.kind !== "text" || typeof input.body.data !== "string" || input.body.data.length !== 65536) { return {type: "abort"}; } let data = input.body.data; data = data.replaceAll("a", "c"); return {type: "modify", headers: [{op: "set", name: "X-Benchmark-Request-JS", values: ["js-v1"]}], body: {kind: "text", data: data}}; }"#,
+            r#"function rewrite(input) { let found = false; for (let i = 0; i < input.response.headers.length; i++) { if (input.response.headers[i].name === "x-benchmark-native" && input.response.headers[i].value === "native-v1") { found = true; } } if (!found) { return {type: "abort"}; } if (!input.body || input.body.kind !== "text" || typeof input.body.data !== "string" || input.body.data.length !== 65536) { return {type: "abort"}; } let data = input.body.data; data = data.replaceAll("b", "c"); return {type: "modify", headers: [{op: "set", name: "X-Benchmark-JS", values: ["native-v1>js-v1"]}], body: {kind: "text", data: data}}; }"#,
+        ] {
+            let prepared = super::super::compile_prepared(source).unwrap();
+            #[cfg(target_vendor = "apple")]
+            assert!(
+                prepared.plan.is_some(),
+                "complete guard and tail proof required"
+            );
+            assert_eq!(
+                prepared.output_bound,
+                OutputBound::InputOrConstant {
+                    maximum_literal_bytes: 0
+                },
+                "self assignment lost a complete output bound for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn audited_self_writes_are_generic_in_names_and_decoded_ascii_literals() {
+        for name in ["result", "_copy9", "$payload", "a"] {
+            for (search, replacement) in [("q", "z"), ("A", "B"), ("\0", "\x7f"), ("$", "!")] {
+                let source = format!(
+                    "function rewrite(input){{let {name}=input.body.data;{name}={name}.replaceAll({},{});return {{type:'modify',body:{{kind:'text',data:{name}}}}};}}",
+                    serde_json::to_string(search).unwrap(),
+                    serde_json::to_string(replacement).unwrap(),
+                );
+                let prepared = super::super::compile_prepared(&source).unwrap();
+                #[cfg(target_vendor = "apple")]
+                assert!(prepared.plan.is_some());
+                assert_eq!(
+                    prepared.output_bound,
+                    OutputBound::InputOrConstant {
+                        maximum_literal_bytes: 0
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_string_versions_aliases_and_early_returns_keep_the_initial_bound() {
+        for (index, source) in [
+            "function rewrite(input){let s=input.body.data;const old=s;s=s.replaceAll('a','b');s=s.replaceAll('b','c');return {type:'modify',body:{kind:'text',data:old}};}",
+            "function rewrite(input){let s=input.body.data;s=s.replaceAll('a','c');const after=s;return {type:'modify',body:{kind:'text',data:after}};}",
+            "function rewrite(input){let s=input.body.data;if(input.phase==='request')return {type:'modify',body:{kind:'text',data:s}};s=s.replaceAll('a','c');return {type:'modify',body:{kind:'text',data:s}};}",
+            "function rewrite(input){let s=input.body.data;return {type:'modify',body:{kind:'text',data:s}};s=s.replaceAll('a','c');}",
+            "function rewrite(input){let a=input.body.data;a=a.replaceAll('a','b');let s=a;s=s.replaceAll('b','c');return {type:'modify',body:{kind:'text',data:s}};}",
+            "function rewrite(input){const initial=input.body.data;let s=initial;s=s.replaceAll('a','c');return {type:'modify',body:{kind:'text',data:s}};}",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let prepared = super::super::compile_prepared(source).unwrap();
+            #[cfg(target_vendor = "apple")]
+            assert_eq!(
+                prepared.plan.is_some(),
+                !matches!(index, 2 | 3),
+                "arbitrary branches and statements after return remain unproved"
+            );
+            assert_eq!(
+                prepared.output_bound,
+                OutputBound::InputOrConstant {
+                    maximum_literal_bytes: 0
+                },
+                "{source}"
+            );
+        }
+        // ASCII substitution preserves UTF-8 bytes even in a Unicode/NUL
+        // literal. The proof retains the full initial bound at every return.
+        assert_eq!(
+            hint(
+                "function rewrite(input){let s='é😀\\u0000';s=s.replaceAll('\\u0000','!');return {type:'modify',body:{kind:'text',data:s}};}"
+            ),
+            OutputBound::InputOrConstant {
+                maximum_literal_bytes: 7
+            }
+        );
+    }
+
+    #[test]
+    fn an_audited_write_never_hides_other_contexts_shapes_or_effects() {
+        for mutation in [
+            "s='EXPANDED';",
+            "s+='EXPANDED';",
+            "s++;",
+            "if(false)s=s.replaceAll('b','c');",
+            "while(false){s=s.replaceAll('b','c');}",
+            "do{s=s.replaceAll('b','c');}while(false);",
+            "for(s=s.replaceAll('b','c');false;){}",
+            "for(let i=0;i<0;s=s.replaceAll('b','c')){}",
+            "{s=s.replaceAll('b','c');}",
+            "false&&(s=s.replaceAll('b','c'));",
+            "false?(s=s.replaceAll('b','c')):s;",
+            "String(s=s.replaceAll('b','c'));",
+            "(s=s.replaceAll('b','c'));",
+            "s=input.body.data.replaceAll('b','c');",
+            "s=s.replaceAll('b','c').replaceAll('c','d');",
+            "s=s.replaceAll('b','cc');",
+            "s=s.replaceAll('bb','cc');",
+            "s=s.replaceAll('é','c');",
+            "s=s.replaceAll('b','界');",
+            "s=s.replaceAll('b','$');",
+            "s=s.replaceAll('b','$&');",
+            "s=s.replaceAll('','c');",
+            "let replacement='c';s=s.replaceAll('b',replacement);",
+            "input.body.data='EXPANDED';",
+            "if(false)input.body['data']='EXPANDED';",
+            "const body=input.body;body.data='EXPANDED';",
+            "{let s='EXPANDED';}",
+        ] {
+            let source = format!(
+                "function rewrite(input){{let s=input.body.data;s=s.replaceAll('a','b');{mutation}return {{type:'modify',body:{{kind:'text',data:s}}}};}}"
+            );
+            assert_eq!(hint(&source), OutputBound::Maximum, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn audited_locals_keep_all_initial_dependencies_and_unreachable_writes() {
+        for source in [
+            "function rewrite(input){let a=input.body.data;a='EXPANDED';let s=a;s=s.replaceAll('x','y');return {type:'modify',body:{kind:'text',data:s}};}",
+            "function rewrite(input){let a=input.body.data;let s=a;a='EXPANDED';s=s.replaceAll('x','y');return {type:'modify',body:{kind:'text',data:s}};}",
+            "function rewrite(input){let a=input.body.data;let s=a;a=a.replaceAll('a','b');a='EXPANDED';s=s.replaceAll('x','y');return {type:'modify',body:{kind:'text',data:s}};}",
+            "function rewrite(input){let s=input.body.data;let alias=s;s=s.replaceAll('a','b');alias='EXPANDED';return {type:'modify',body:{kind:'text',data:alias}};}",
+            "function rewrite(input){let s=input.body.data;s=s.replaceAll('a','b');return {type:'modify',body:{kind:'text',data:s}};s='EXPANDED';}",
+            "function rewrite(input){let s;s=s.replaceAll('a','b');return {type:'modify',body:{kind:'text',data:s}};}",
+            "function rewrite(input){let s=3;s=s.replaceAll('a','b');return {type:'modify',body:{kind:'text',data:s}};}",
+        ] {
+            assert_eq!(hint(source), OutputBound::Maximum, "{source}");
+        }
+    }
+
+    #[test]
+    fn audited_writes_cannot_bypass_binding_node_or_dependency_caps() {
+        let mut bindings = String::from("function rewrite(input){let s=input.body.data;");
+        for index in 0..MAX_PROOF_BINDINGS {
+            bindings.push_str(&format!("let unused{index};"));
+        }
+        bindings
+            .push_str("s=s.replaceAll('a','c');return {type:'modify',body:{kind:'text',data:s}};}");
+        assert_eq!(hint(&bindings), OutputBound::Maximum);
+
+        let mut nodes = String::from(
+            "function rewrite(input){let s=input.body.data;s=s.replaceAll('a','c');return {type:'modify',body:{kind:'text',data:s}};",
+        );
+        for _ in 0..=MAX_PROOF_NODES / 2 {
+            nodes.push_str("0;");
+        }
+        nodes.push('}');
+        assert_eq!(hint(&nodes), OutputBound::Maximum);
+
+        let mut dependencies = String::from("function rewrite(input){let seed=input.body.data;");
+        let mut previous = "seed".to_owned();
+        for index in 0..=MAX_PROOF_DEPENDENCIES {
+            let name = format!("alias{index}");
+            dependencies.push_str(&format!("let {name}={previous};"));
+            previous = name;
+        }
+        dependencies.push_str(&format!("{previous}={previous}.replaceAll('a','c');return {{type:'modify',body:{{kind:'text',data:{previous}}}}};}}"));
+        assert_eq!(hint(&dependencies), OutputBound::Maximum);
     }
 
     #[test]

@@ -58,6 +58,15 @@ fragment or IPv6 extension-header validation. Encoding emits checksums, reuses
 the caller's `Vec`, and leaves it unchanged on address-family or MTU errors.
 UDP mistakenly sent into the TCP-only driver is ignored.
 
+The default-off `diagnostics` feature adds `NetStack::start_tcp_observed` with
+a synchronous, nonblocking, nonpanicking `fn(DriverObservation)` callback.
+It reports completed drive passes, entry visits, application bytes moved in
+each direction and selected ingress/notify/timer wake sources. No-data passes
+may still advance protocol state; wake counts are not wait durations. Ordinary
+constructors install no callback, though enabling the feature still computes
+local observations. Feature-off builds exclude the instrumentation. The callback
+carries no packet content, adds no queue or runtime owner and leaves stop unchanged.
+
 ## Generic TCP and UDP API
 
 ```rust,ignore
@@ -131,6 +140,13 @@ prefixes and routes; the independent receive packet limit is retained. Invalid
 budgets, increases, expired deadlines or an already started TCP flow fail.
 
 ## Driver buffering and scheduling
+
+On macOS, a TCP write or flush that remains pending after registering its
+waker and rechecking the queue does not request another driver pass. Successful
+reads and writes, shutdown, Drop, packet ingress, output-capacity recovery and
+protocol timers retain their existing wakeups. Flush still completes when the
+application send queue is empty, without waiting for remote acknowledgement.
+Other targets retain their existing pending-write and pending-flush wakeups.
 
 TCP uses the official unmodified smoltcp engine. Active clients initialize its
 device with the known transport MTU; callers should use their actual packet

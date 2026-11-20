@@ -9,7 +9,7 @@ use std::{
 };
 
 pub(crate) const MAX_BODY: usize = 256 * 1024;
-pub(crate) const WORKSPACE: usize = 2 * 1024 * 1024;
+pub(crate) const WORKSPACE: usize = 4 * 1024 * 1024;
 
 // A public JSC string view can own an N-byte 8-bit copy plus a 2N-byte
 // UTF-16 expansion. This is bridge admission, not a VM heap bound.
@@ -92,6 +92,11 @@ impl Default for Budget {
 }
 
 impl Budget {
+    /// Identity of the actual shared ledger, independent of its current charge.
+    pub(super) fn same_ledger(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub(crate) fn reserve(&self, bytes: usize) -> Option<Reservation> {
         let previous = match self
             .0
@@ -167,13 +172,93 @@ impl Reservation {
 /// A fixed-capacity allocation. Its reservation follows every Bytes slice and
 /// is released only when the last sender/driver has dropped the actual owner.
 pub(crate) struct BudgetedBytes {
-    bytes: Vec<u8>,
+    // Fields drop in declaration order. The real backing owner must finish its
+    // destruction (including an anonymous map's unmap Drop) before refunding.
+    bytes: Backing,
     _reservation: Reservation,
 }
 
+enum Backing {
+    Vector(Vec<u8>),
+    #[cfg(all(unix, feature = "inbound-http"))]
+    Mapped(MappedOutput),
+}
+
+#[cfg(all(unix, feature = "inbound-http"))]
+const MAPPED_FIXED_OUTPUT_MINIMUM: usize = 64 * 1024;
+
+#[cfg(all(unix, feature = "inbound-http"))]
+struct MappedOutput {
+    bytes: memmap2::MmapMut,
+    length: usize,
+    // Test-only observation runs after the real mapping destructor, before
+    // BudgetedBytes refunds. It does not assert OS unmap success or RSS.
+    #[cfg(test)]
+    after_unmap: Option<MappedDropWitness>,
+}
+
+#[cfg(all(test, unix, feature = "inbound-http"))]
+struct MappedDropWitness {
+    budget: Budget,
+    observed_used: Arc<AtomicUsize>,
+}
+
+#[cfg(all(test, unix, feature = "inbound-http"))]
+impl Drop for MappedDropWitness {
+    fn drop(&mut self) {
+        self.observed_used
+            .store(self.budget.used(), Ordering::Release);
+    }
+}
+
+impl Backing {
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Vector(bytes) => bytes.capacity(),
+            #[cfg(all(unix, feature = "inbound-http"))]
+            Self::Mapped(mapped) => mapped.bytes.len(),
+        }
+    }
+
+    fn initialized(&mut self, length: usize) -> &mut [u8] {
+        match self {
+            Self::Vector(bytes) => {
+                bytes.resize(length, 0);
+                bytes
+            }
+            #[cfg(all(unix, feature = "inbound-http"))]
+            Self::Mapped(mapped) => {
+                mapped.length = length;
+                let bytes = &mut mapped.bytes[..length];
+                // Match Vec::resize even when an earlier failed callback left
+                // scratch contents in this still-owned, fully paid mapping.
+                bytes.fill(0);
+                bytes
+            }
+        }
+    }
+
+    fn truncate(&mut self, length: usize) {
+        match self {
+            Self::Vector(bytes) => bytes.truncate(length),
+            #[cfg(all(unix, feature = "inbound-http"))]
+            Self::Mapped(mapped) => mapped.length = mapped.length.min(length),
+        }
+    }
+}
+
+impl AsRef<[u8]> for Backing {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Vector(bytes) => bytes,
+            #[cfg(all(unix, feature = "inbound-http"))]
+            Self::Mapped(mapped) => &mapped.bytes[..mapped.length],
+        }
+    }
+}
+
 impl BudgetedBytes {
-    /// Same ledger for a private API view when no prepaid slot is available.
-    #[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+    /// The allocation's actual ledger; borrowing this handle does not refund it.
     pub(crate) fn budget(&self) -> &Budget {
         &self._reservation.budget
     }
@@ -188,7 +273,7 @@ impl BudgetedBytes {
     /// A backend exporting a nonempty result must call `prepare_output` first.
     pub(crate) fn empty(budget: &Budget) -> Self {
         Self {
-            bytes: Vec::new(),
+            bytes: Backing::Vector(Vec::new()),
             _reservation: Reservation {
                 budget: budget.clone(),
                 bytes: 0,
@@ -205,10 +290,33 @@ impl BudgetedBytes {
         Self::from_reserved(reservation, capacity)
     }
 
+    /// All known shared entities keep original one-shot admission/capacity.
+    /// Apple may map them, also with native body plus metadata-only scripts.
+    /// Unknown lengths keep the original MAX_BODY + 1 Vec sentinel.
+    pub(crate) fn new_shared_collector(
+        budget: &Budget,
+        capacity: usize,
+        known_length: bool,
+    ) -> Option<Self> {
+        let reservation = budget.reserve(Self::allocation_cost(capacity)?)?;
+        if cfg!(target_vendor = "apple") && known_length && capacity <= MAX_BODY {
+            Self::from_reserved_fixed_capacity(reservation, capacity)
+        } else {
+            Self::from_reserved(reservation, capacity)
+        }
+    }
+
     pub(crate) fn from_reserved(reservation: Reservation, capacity: usize) -> Option<Self> {
         if reservation.bytes != Self::allocation_cost(capacity)? {
             return None;
         }
+        Some(Self {
+            bytes: Backing::Vector(Self::allocate_vector(capacity)?),
+            _reservation: reservation,
+        })
+    }
+
+    fn allocate_vector(capacity: usize) -> Option<Vec<u8>> {
         let mut buffer = Vec::new();
         buffer.try_reserve_exact(capacity).ok()?;
         // Vec's allocation policy is allowed to return more than requested.
@@ -216,10 +324,89 @@ impl BudgetedBytes {
         if buffer.capacity() > capacity {
             return None;
         }
+        Some(buffer)
+    }
+
+    /// Independently admit a proven fixed-bound byte output before its fill.
+    /// Closed Plans and native ASCII byte maps use this allocation policy.
+    pub(crate) fn new_fixed_output(budget: &Budget, capacity: usize) -> Option<Self> {
+        if capacity > MAX_BODY {
+            return None;
+        }
+        let reservation = budget.reserve(Self::allocation_cost(capacity)?)?;
+        Self::from_reserved_fixed_output(reservation, capacity)
+    }
+
+    /// Reuse a complete reservation for a proven fixed-bound byte output.
+    /// Native String/JSC outputs and the separate native-only entry keep Vec.
+    pub(crate) fn from_reserved_fixed_output(
+        reservation: Reservation,
+        capacity: usize,
+    ) -> Option<Self> {
+        Self::from_reserved_fixed_capacity(reservation, capacity)
+    }
+
+    // Physical fixed-capacity byte backing only: this does not initialize an
+    // output, infer a body length, or create another workspace reservation.
+    fn from_reserved_fixed_capacity(reservation: Reservation, capacity: usize) -> Option<Self> {
+        if capacity > MAX_BODY {
+            return None;
+        }
+        #[cfg(all(unix, feature = "inbound-http"))]
+        {
+            Self::from_reserved_fixed_output_with(
+                reservation,
+                capacity,
+                memmap2::MmapMut::map_anon,
+                Self::allocate_vector,
+            )
+        }
+        #[cfg(not(all(unix, feature = "inbound-http")))]
+        {
+            Self::from_reserved(reservation, capacity)
+        }
+    }
+
+    #[cfg(all(unix, feature = "inbound-http"))]
+    fn from_reserved_fixed_output_with(
+        reservation: Reservation,
+        capacity: usize,
+        map: impl FnOnce(usize) -> io::Result<memmap2::MmapMut>,
+        vector: impl FnOnce(usize) -> Option<Vec<u8>>,
+    ) -> Option<Self> {
+        if capacity > MAX_BODY || reservation.bytes != Self::allocation_cost(capacity)? {
+            return None;
+        }
+        let mapping = if capacity >= MAPPED_FIXED_OUTPUT_MINIMUM {
+            map(capacity).ok().filter(|bytes| bytes.len() == capacity)
+        } else {
+            None
+        };
+        let bytes = if let Some(bytes) = mapping {
+            Backing::Mapped(MappedOutput {
+                bytes,
+                length: 0,
+                #[cfg(test)]
+                after_unmap: None,
+            })
+        } else {
+            // Mapping failure does not consume or reacquire the reservation.
+            // Only one successful backing allocation is ever retained.
+            let bytes = vector(capacity)?;
+            if !bytes.is_empty() || bytes.capacity() != capacity {
+                return None;
+            }
+            Backing::Vector(bytes)
+        };
         Some(Self {
-            bytes: buffer,
+            bytes,
             _reservation: reservation,
         })
+    }
+
+    #[cfg(all(test, unix, feature = "inbound-http"))]
+    pub(crate) fn is_mapped_for_test(&self) -> bool {
+        matches!(self.bytes, Backing::Mapped(_))
     }
 
     /// Admit a known result before copying it out of an engine. Body-less calls
@@ -237,7 +424,7 @@ impl BudgetedBytes {
         let replacement = Self::new(&self._reservation.budget, length).ok_or_else(|| {
             io::Error::new(io::ErrorKind::OutOfMemory, "HTTP body workspace exceeded")
         })?;
-        if !self.bytes.is_empty() {
+        if !self.bytes.as_ref().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "HTTP script output is not empty",
@@ -260,21 +447,27 @@ impl BudgetedBytes {
                 "HTTP body workspace exceeded",
             ));
         }
-        self.bytes.extend_from_slice(value);
+        match &mut self.bytes {
+            Backing::Vector(bytes) => bytes.extend_from_slice(value),
+            #[cfg(all(unix, feature = "inbound-http"))]
+            Backing::Mapped(mapped) => {
+                let end = mapped.length + value.len();
+                mapped.bytes[mapped.length..end].copy_from_slice(value);
+                mapped.length = end;
+            }
+        }
         Ok(())
     }
 
-    /// Let a C API fill initialized bytes inside an existing admitted allocation.
+    /// Fill initialized bytes inside an existing, independently admitted allocation.
     /// The callback returns the retained length; scratch bytes remain charged
     /// through this owner's unchanged capacity and are never exposed as body.
-    #[cfg(feature = "inbound-http")]
-    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn write_initialized_output(
         &mut self,
         length: usize,
         operation: impl FnOnce(&mut [u8]) -> io::Result<usize>,
     ) -> io::Result<()> {
-        if !self.bytes.is_empty() || length > MAX_BODY || length > self.remaining() {
+        if !self.bytes.as_ref().is_empty() || length > MAX_BODY || length > self.remaining() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "HTTP script output scratch is not available",
@@ -282,28 +475,28 @@ impl BudgetedBytes {
         }
         // The capacity check above prevents resize from allocating. Every byte
         // passed to the callback is initialized, including terminator scratch.
-        self.bytes.resize(length, 0);
-        match operation(&mut self.bytes) {
+        let result = operation(self.bytes.initialized(length));
+        match result {
             Ok(retained) if retained <= length => {
                 self.bytes.truncate(retained);
                 Ok(())
             }
             Ok(_) => {
-                self.bytes.clear();
+                self.bytes.truncate(0);
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "HTTP script output scratch length is invalid",
                 ))
             }
             Err(error) => {
-                self.bytes.clear();
+                self.bytes.truncate(0);
                 Err(error)
             }
         }
     }
 
     pub(crate) fn remaining(&self) -> usize {
-        self.bytes.capacity() - self.bytes.len()
+        self.bytes.capacity() - self.bytes.as_ref().len()
     }
 
     pub(crate) fn into_bytes(self) -> Bytes {
@@ -314,17 +507,30 @@ impl BudgetedBytes {
         &mut self,
         operation: impl FnOnce(&mut String) -> io::Result<()>,
     ) -> io::Result<()> {
-        let mut text = String::from_utf8(std::mem::take(&mut self.bytes))
+        // Mapped backing is private to bounded byte writers/collectors. Do not
+        // silently allocate an unpaid String copy if that internal boundary is
+        // accidentally crossed; all existing String-capable constructors use Vec.
+        let bytes = match &mut self.bytes {
+            Backing::Vector(bytes) => bytes,
+            #[cfg(all(unix, feature = "inbound-http"))]
+            Backing::Mapped(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "HTTP direct output does not use String storage",
+                ));
+            }
+        };
+        let mut text = String::from_utf8(std::mem::take(bytes))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HTTP body text is invalid"))?;
         let result = operation(&mut text);
-        self.bytes = text.into_bytes();
+        *bytes = text.into_bytes();
         result
     }
 }
 
 impl AsRef<[u8]> for BudgetedBytes {
     fn as_ref(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_ref()
     }
 }
 impl io::Write for BudgetedBytes {
@@ -367,6 +573,29 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn ledger_identity_tracks_the_owner_not_equal_limits_or_charges() {
+        let left = Budget::default();
+        let right = Budget::default();
+        let left_alias = left.clone();
+        let bytes = BudgetedBytes::copy(&left, b"same").unwrap();
+        let other = BudgetedBytes::copy(&right, b"same").unwrap();
+        assert_eq!(left.used(), right.used());
+        assert!(bytes.budget().same_ledger(&left_alias));
+        assert!(!bytes.budget().same_ledger(other.budget()));
+        let cost = left.used();
+        let wire = bytes.into_bytes();
+        let slice = wire.slice(1..2);
+        drop(wire);
+        assert_eq!(left.used(), cost);
+        drop(slice);
+        // The ledger alias itself owns no payload reservation.
+        assert_eq!(left.used(), 0);
+        drop(other);
+        assert_eq!(right.used(), 0);
+        drop(left_alias);
+    }
+
     #[cfg(feature = "inbound-http")]
     #[test]
     fn initialized_output_scratch_never_allocates_and_keeps_capacity_charged() {
@@ -483,3 +712,7 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 }
+
+#[cfg(all(test, unix, feature = "inbound-http"))]
+#[path = "body_budget/mapped_output_tests.rs"]
+mod mapped_output_tests;

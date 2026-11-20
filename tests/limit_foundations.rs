@@ -99,6 +99,7 @@ fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
         ("udp-payload", defaults.max_datagram_size),
         ("tun-packet", defaults.tun_max_datagram_size),
         ("tcp-buffer", defaults.tcp_buffer_per_direction),
+        ("tun-tcp-send-buffer", defaults.tun_tcp_send_buffer),
         ("dns-cache", defaults.dns_address_cache_entries),
         ("dns-hints", defaults.dns_redir_host_entries),
         (

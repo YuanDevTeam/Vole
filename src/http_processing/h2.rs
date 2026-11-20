@@ -4,7 +4,7 @@ use super::{
     body::{Entity, OriginalRequestMeta, Transaction, WireBodyMeta},
     config::checked_url,
     h2_body::{self, IDLE},
-    h2_h1, h2_headers, headers,
+    h2_h1, h2_headers, h2_reuse, headers,
     request::{Decision, Target},
     rules::Phase,
     script_config::BodyMode,
@@ -13,13 +13,14 @@ use super::{
     },
 };
 use crate::{
-    dispatch::BoxStream,
+    dispatch::{BoxStream, HttpTcpPlan},
     security::{StandardTlsClient, TlsClientOptions},
     session::StreamSession,
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, future::poll_fn, stream::FuturesUnordered};
 use http::{HeaderValue, Method, Request, Response, StatusCode, Version};
+use hyper::body::Body as _;
 use std::{
     future::Future,
     io,
@@ -34,7 +35,27 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 const STREAMS: usize = 8;
-const SETUP: Duration = Duration::from_secs(10);
+const SETUP: Duration = h2_reuse::SETUP;
+enum UpstreamSender<'a> {
+    OneShot(h2::client::SendRequest<Bytes>),
+    Shared(&'a h2_reuse::Lease),
+}
+
+// A valid response may finish before its upload, or survive a late upload
+// error. Neither proves that this shared session may admit another request.
+// Retire admission on every uncertain exit, including cancellation/unwind;
+// the existing lease still owns this response and any sibling exchanges.
+struct SharedExchangeGuard<'a> {
+    lease: &'a h2_reuse::Lease,
+    completed: bool,
+}
+impl Drop for SharedExchangeGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.lease.retire();
+        }
+    }
+}
 struct MessageMeta {
     original: OriginalRequestMeta,
     length: Option<u64>,
@@ -68,12 +89,12 @@ impl HttpContext {
         let operation = async {
             let mut builder = h2::server::Builder::new();
             builder
-                .initial_window_size(32 * 1024)
+                .initial_window_size(64 * 1024)
                 .initial_connection_window_size(64 * 1024)
                 .header_table_size(0)
                 .max_header_list_size(32 * 1024)
                 .max_frame_size(16 * 1024)
-                .max_send_buffer_size(16 * 1024)
+                .max_send_buffer_size(64 * 1024)
                 .max_concurrent_streams(STREAMS as u32)
                 .max_concurrent_reset_streams(16)
                 .max_local_error_reset_streams(Some(16));
@@ -81,6 +102,7 @@ impl HttpContext {
                 .await
                 .map_err(|_| io::ErrorKind::TimedOut)?
                 .map_err(|_| failed())?;
+            let (sessions, mut upstreams) = h2_reuse::new();
             let mut requests = FuturesUnordered::new();
             let idle = tokio::time::sleep(IDLE);
             tokio::pin!(idle);
@@ -88,6 +110,9 @@ impl HttpContext {
                 // accept also drives DATA, SETTINGS, WINDOW_UPDATE and resets.
                 // It stays polled while all eight request slots are occupied.
                 tokio::select! {biased;
+                    // Also drive idle sessions and drain ready retirees before
+                    // admitting another request/registered physical owner.
+                    ()=upstreams.progress()=>{},
                     ()=&mut idle,if requests.is_empty()=>return Ok(()),
                     result=requests.next(),if !requests.is_empty()=>{
                         let _=result;idle.as_mut().reset(Instant::now()+IDLE);
@@ -99,7 +124,7 @@ impl HttpContext {
                                 // The ready queue also owns an empty sentinel
                                 // with the same future type. Keep its storage
                                 // small on every downstream connection.
-                                requests.push(Box::pin(self.h2_request(request,response,session.clone(),cancellation.clone())));
+                                requests.push(Box::pin(self.h2_request(request,response,session.clone(),cancellation.clone(),&sessions)));
                             }
                         },
                         Some(Err(_))=>return Err(failed()),
@@ -117,6 +142,7 @@ impl HttpContext {
         response: h2::server::SendResponse<Bytes>,
         session: StreamSession,
         cancellation: CancellationToken,
+        sessions: &h2_reuse::Sessions,
     ) {
         let response = ResponseSlot(Arc::new(Mutex::new(ResponseState {
             response,
@@ -125,7 +151,7 @@ impl HttpContext {
             upstream_final_received: false,
         })));
         if self
-            .h2_forward(request, &response, session, cancellation)
+            .h2_forward(request, &response, session, cancellation, sessions)
             .await
             .is_err()
         {
@@ -138,6 +164,7 @@ impl HttpContext {
         response: &ResponseSlot,
         session: StreamSession,
         cancellation: CancellationToken,
+        sessions: &h2_reuse::Sessions,
     ) -> io::Result<()> {
         if request.method() == Method::CONNECT {
             return local(response, StatusCode::METHOD_NOT_ALLOWED, None);
@@ -146,6 +173,10 @@ impl HttpContext {
             Ok(length) => length,
             Err(_) => return local(response, StatusCode::BAD_REQUEST, None),
         };
+        let reusable_original = request.method() != Method::HEAD
+            && request.method() != Method::CONNECT
+            && (length.is_some() || request.body().is_end_stream())
+            && !request.headers().contains_key("expect");
         let original_fields = headers::from_map(request.headers());
         let mut original_meta = OriginalRequestMeta::new(
             request.method().as_str(),
@@ -302,7 +333,61 @@ impl HttpContext {
                 cancellation,
             }),
         };
-        let (io, protocol) = self.http_upstream(&target).await?;
+        let eligible = reusable_original
+            && request.method() != Method::HEAD
+            && request.method() != Method::CONNECT
+            && (metadata.length.is_some() || request.body().is_end_stream())
+            && !metadata.asterisk
+            && !request.headers().contains_key("expect")
+            && target.url.scheme() == "https"
+            && target.original.origin() == target.url.origin()
+            && !target.strip_origin_credentials;
+        let deadline = Instant::now() + SETUP;
+        let prepared = if eligible {
+            timeout_at(
+                deadline,
+                self.dispatcher().prepare_http_tcp(target.session.clone()),
+            )
+            .await
+            .map_err(|_| io::ErrorKind::TimedOut)?
+            .map_err(|_| failed())?
+        } else {
+            None
+        };
+        if let Some(key) = prepared.as_ref().and_then(|plan| plan.reuse_key()).cloned() {
+            let identity = h2_reuse::Identity::new(key, &target.url);
+            let acquired = sessions
+                .acquire(identity, deadline, || {
+                    self.http_upstream_prepared(&target, prepared, deadline)
+                })
+                .await?;
+            return match acquired {
+                h2_reuse::Acquired::Shared(lease) => {
+                    let result = self
+                        .h2_exchange(
+                            UpstreamSender::Shared(&lease),
+                            request,
+                            response,
+                            target,
+                            metadata,
+                        )
+                        .await;
+                    // Retire admission on an uncertain exchange, while sibling
+                    // leases retain their real response/driver to completion.
+                    if result.is_err() {
+                        lease.retire();
+                    }
+                    result
+                }
+                h2_reuse::Acquired::H1(io) => {
+                    self.h1_upstream(io, request, response, target, metadata)
+                        .await
+                }
+            };
+        }
+        let (io, protocol) = self
+            .http_upstream_prepared(&target, prepared, deadline)
+            .await?;
         if protocol.as_deref() == Some(b"h2") {
             self.h2_upstream(io, request, response, target, metadata)
                 .await
@@ -489,12 +574,19 @@ impl HttpContext {
         let downstream = response.final_response(Response::from_parts(parts, ()), false)?;
         h2_body::relay(source, downstream, expected, false).await
     }
-    async fn http_upstream(&self, target: &Target) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
-        let deadline = Instant::now() + SETUP;
-        let stream = timeout_at(
-            deadline,
-            self.dispatcher().connect_tcp(target.session.clone()),
-        )
+    async fn http_upstream_prepared(
+        &self,
+        target: &Target,
+        prepared: Option<Box<dyn HttpTcpPlan>>,
+        deadline: Instant,
+    ) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
+        let stream = timeout_at(deadline, async {
+            if let Some(prepared) = prepared {
+                prepared.connect().await
+            } else {
+                self.dispatcher().connect_tcp(target.session.clone()).await
+            }
+        })
         .await
         .map_err(|_| io::ErrorKind::TimedOut)?
         .map_err(|_| failed())?;
@@ -528,129 +620,158 @@ impl HttpContext {
         target: Target,
         metadata: MessageMeta,
     ) -> io::Result<()> {
+        let (sender, driver) = h2_reuse::handshake(io, Instant::now() + SETUP).await?;
+        inline_driver(
+            driver,
+            self.h2_exchange(
+                UpstreamSender::OneShot(sender),
+                request,
+                response,
+                target,
+                metadata,
+            ),
+        )
+        .await
+    }
+    async fn h2_exchange(
+        &self,
+        sender: UpstreamSender<'_>,
+        request: Request<h2_body::Source>,
+        response: &ResponseSlot,
+        target: Target,
+        metadata: MessageMeta,
+    ) -> io::Result<()> {
+        let mut shared = match &sender {
+            UpstreamSender::Shared(lease) => Some(SharedExchangeGuard {
+                lease,
+                completed: false,
+            }),
+            UpstreamSender::OneShot(_) => None,
+        };
         let MessageMeta {
             original: original_meta,
             length,
             asterisk,
             script,
         } = metadata;
-        let mut builder = h2::client::Builder::new();
-        builder
-            .initial_window_size(32 * 1024)
-            .initial_connection_window_size(64 * 1024)
-            .header_table_size(0)
-            .max_header_list_size(32 * 1024)
-            .max_frame_size(16 * 1024)
-            .max_send_buffer_size(16 * 1024)
-            .enable_push(false)
-            .max_concurrent_streams(1);
-        let (sender, driver) = timeout(SETUP, builder.handshake::<_, Bytes>(io))
-            .await
-            .map_err(|_| io::ErrorKind::TimedOut)?
+        let (parts, body) = request.into_parts();
+        let method = parts.method.clone();
+        // Original credentials were removed before request-header actions.
+        // A second origin cleanup must not erase explicitly supplied ones.
+        let mut headers = h2_headers::clean(parts.headers, false, true)?;
+        headers.remove("expect");
+        let uri = if asterisk {
+            http::Uri::builder()
+                .scheme("https")
+                .authority(target.logical_destination.authority())
+                .path_and_query("*")
+                .build()
+                .map_err(|_| failed())?
+        } else {
+            target.url.as_str().parse().map_err(|_| failed())?
+        };
+        let mut outgoing = Request::builder()
+            .method(parts.method)
+            .uri(uri)
+            .version(Version::HTTP_2)
+            .body(())
             .map_err(|_| failed())?;
-        let exchange = Box::pin(async {
-            let (parts, body) = request.into_parts();
-            let method = parts.method.clone();
-            // Original credentials were removed before request-header actions.
-            // A second origin cleanup must not erase explicitly supplied ones.
-            let mut headers = h2_headers::clean(parts.headers, false, true)?;
-            headers.remove("expect");
-            let uri = if asterisk {
-                http::Uri::builder()
-                    .scheme("https")
-                    .authority(target.logical_destination.authority())
-                    .path_and_query("*")
-                    .build()
-                    .map_err(|_| failed())?
-            } else {
-                target.url.as_str().parse().map_err(|_| failed())?
-            };
-            let mut outgoing = Request::builder()
-                .method(parts.method)
-                .uri(uri)
-                .version(Version::HTTP_2)
-                .body(())
-                .map_err(|_| failed())?;
-            *outgoing.headers_mut() = headers;
-            let mut sender = sender.ready().await.map_err(|_| failed())?;
-            let (mut incoming, upload) =
-                sender.send_request(outgoing, false).map_err(|_| failed())?;
-            let (upload_finished, uploaded) = tokio::sync::oneshot::channel();
-            let upload = async move {
-                let result =
-                    h2_body::relay(body, upload, length, target.strip_origin_credentials).await;
+        *outgoing.headers_mut() = headers;
+        let mut sender = match sender {
+            UpstreamSender::OneShot(sender) => sender.ready().await.map_err(|_| failed())?,
+            UpstreamSender::Shared(lease) => lease.ready().await?,
+        };
+        let (mut incoming, uploaded, upload) = h2_body::start_request(
+            &mut sender,
+            outgoing,
+            body,
+            length,
+            target.strip_origin_credentials,
+        )?;
+        let download = async {
+            let incoming = response_after_upload(uploaded, async {
+                let mut infos = 0;
+                loop {
+                    let event = poll_fn(|cx| {
+                        if let Poll::Ready(Some(info)) = incoming.poll_informational(cx) {
+                            return Poll::Ready(info.map(Head::Informational));
+                        }
+                        Pin::new(&mut incoming)
+                            .poll(cx)
+                            .map(|value| value.map(Head::Final))
+                    })
+                    .await
+                    .map_err(|_| failed())?;
+                    match event {
+                        Head::Informational(info) => {
+                            infos += 1;
+                            if infos > 16 {
+                                return Err(failed());
+                            }
+                            if info.status() != StatusCode::CONTINUE {
+                                let (mut parts, ()) = info.into_parts();
+                                parts.headers = h2_headers::clean(parts.headers, false, false)?;
+                                response
+                                    .informational(Response::from_parts(parts, ()))
+                                    .map_err(|_| failed())?;
+                            }
+                        }
+                        Head::Final(incoming) => {
+                            response.received_final()?;
+                            break Ok(incoming);
+                        }
+                    }
+                }
+            })
+            .await?;
+            let (parts, body) = incoming.into_parts();
+            self.forward_response(
+                parts,
+                h2_body::Source::h2(body),
+                &method,
+                &target,
+                &original_meta,
+                script.as_ref(),
+                response,
+            )
+            .await
+        };
+        // A complete final response ends this exchange even when the
+        // client has not finished uploading. Dropping the inline upload
+        // returns its receive owner; h2 closes that half with NO_ERROR
+        // after the final response, without blocking sibling streams.
+        let mut upload_completed = upload.ended_in_headers();
+        let result = {
+            let uploading = async {
+                let result = upload.run().await;
                 if result.is_ok() {
-                    let _ = upload_finished.send(());
+                    upload_completed = true;
                 }
                 result
             };
-            let download = async {
-                let incoming = response_after_upload(uploaded, async {
-                    let mut infos = 0;
-                    loop {
-                        let event = poll_fn(|cx| {
-                            if let Poll::Ready(Some(info)) = incoming.poll_informational(cx) {
-                                return Poll::Ready(info.map(Head::Informational));
-                            }
-                            Pin::new(&mut incoming)
-                                .poll(cx)
-                                .map(|value| value.map(Head::Final))
-                        })
-                        .await
-                        .map_err(|_| failed())?;
-                        match event {
-                            Head::Informational(info) => {
-                                infos += 1;
-                                if infos > 16 {
-                                    return Err(failed());
-                                }
-                                if info.status() != StatusCode::CONTINUE {
-                                    let (mut parts, ()) = info.into_parts();
-                                    parts.headers = h2_headers::clean(parts.headers, false, false)?;
-                                    response
-                                        .informational(Response::from_parts(parts, ()))
-                                        .map_err(|_| failed())?;
-                                }
-                            }
-                            Head::Final(incoming) => {
-                                response.received_final()?;
-                                break Ok(incoming);
-                            }
-                        }
-                    }
-                })
-                .await?;
-                let (parts, body) = incoming.into_parts();
-                self.forward_response(
-                    parts,
-                    h2_body::Source::h2(body),
-                    &method,
-                    &target,
-                    &original_meta,
-                    script.as_ref(),
-                    response,
-                )
-                .await
-            };
-            // A complete final response ends this exchange even when the
-            // client has not finished uploading. Dropping the inline upload
-            // returns its receive owner; h2 closes that half with NO_ERROR
-            // after the final response, without blocking sibling streams.
-            tokio::pin!(upload);
+            tokio::pin!(uploading);
             tokio::pin!(download);
             tokio::select! {biased;
                 result=&mut download=>result,
-                result=&mut upload=>{
-                    // An early final response may reset the upstream's input
-                    // before its nonempty response has crossed the downstream
-                    // window. Once headers were committed, finish that bounded
-                    // response rather than replacing it with a reset.
-                    if result.is_err() && !response.upstream_final_received() { result?; }
-                    download.await
+                result=&mut uploading=>{
+                    // Preserve a valid final response after a late upload
+                    // failure, while separately retiring future admission.
+                    #[cfg(test)]
+                    if result.is_err() && response.upstream_final_received() {
+                        completed_post_upload_error_memory_tests::observe_late_upload_error();
+                    }
+                    if result.is_err() && !response.upstream_final_received() {
+                        result
+                    } else {
+                        download.await
+                    }
                 }
             }
-        });
-        inline_driver(driver, exchange).await
+        };
+        if let Some(shared) = &mut shared {
+            shared.completed = upload_completed && result.is_ok();
+        }
+        result
     }
     async fn h1_upstream(
         &self,
@@ -928,3 +1049,7 @@ fn original_url(request: &Request<h2::RecvStream>) -> io::Result<(url::Url, bool
     }
     Ok((url, asterisk))
 }
+
+#[cfg(test)]
+#[path = "completed_post_upload_error_memory_tests.rs"]
+mod completed_post_upload_error_memory_tests;

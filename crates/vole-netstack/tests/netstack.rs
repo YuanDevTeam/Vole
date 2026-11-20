@@ -721,17 +721,24 @@ async fn active_tcp_uses_configured_sources_and_delivers_established_duplex_stre
 
 #[tokio::test]
 async fn active_tcp_shutdown_drains_accepted_tail_before_fin_without_prior_acks() {
-    assert_active_accepted_tail(false).await;
+    for send_total in [32 * 1024, 128 * 1024, 256 * 1024] {
+        assert_active_accepted_tail(false, send_total).await;
+    }
 }
 
 #[tokio::test]
 async fn active_tcp_drop_drains_accepted_tail_before_fin_without_prior_acks() {
-    assert_active_accepted_tail(true).await;
+    for send_total in [32 * 1024, 128 * 1024, 256 * 1024] {
+        assert_active_accepted_tail(true, send_total).await;
+    }
 }
 
-async fn assert_active_accepted_tail(drop_after_write: bool) {
-    let config = NetStackConfig::default();
-    let payload: Vec<u8> = (0..24 * 1024)
+async fn assert_active_accepted_tail(drop_after_write: bool, send_total: usize) {
+    let config = NetStackConfig {
+        tcp_send_buffer: send_total,
+        ..NetStackConfig::default()
+    };
+    let payload: Vec<u8> = (0..send_total * 3 / 4)
         .map(|index| u8::try_from(index % 251).unwrap())
         .collect();
     assert!(payload.len() > config.tcp_send_buffer / 2);
@@ -1357,6 +1364,8 @@ async fn asymmetric_tcp_buffers_bound_each_direction_and_stop_unblocks_writes() 
         (4 * 1024, 16 * 1024),
         (16 * 1024, 4 * 1024),
         (32 * 1024, 64 * 1024),
+        (32 * 1024, 128 * 1024),
+        (32 * 1024, 256 * 1024),
     ] {
         for flow in [Flow::v4(13_500), Flow::v6(13_501)] {
             let mut parts = NetStack::start_tcp(NetStackConfig {
@@ -1445,55 +1454,57 @@ async fn asymmetric_tcp_buffers_bound_each_direction_and_stop_unblocks_writes() 
 
 #[tokio::test]
 async fn tcp_write_applies_backpressure_and_stop_unblocks_it() {
-    let config = NetStackConfig {
-        packet_queue: 1,
-        tcp_accept_queue: 1,
-        udp_queue: 1,
-        tcp_recv_buffer: 8 * 1024,
-        tcp_send_buffer: 8 * 1024,
-        max_poll_interval: Duration::from_millis(5),
-        ..NetStackConfig::default()
-    };
-    let stack = NetStack::start(config).unwrap();
-    let mut parts = stack.into_parts();
-    let flow = Flow::v4(14_000);
-    parts
-        .packet_sink
-        .send(build_tcp(&flow, 10, 0, TcpFlags::SYN, &[]))
-        .await
-        .unwrap();
-    let syn_ack = timeout_packet(&mut parts.packet_stream).await;
-    let server_sequence = tcp_sequence(&syn_ack);
-    let mut stream = parts.tcp_listener.accept().await.unwrap();
-    parts
-        .packet_sink
-        .send(build_tcp(
-            &flow,
-            11,
-            server_sequence.wrapping_add(1),
-            TcpFlags::ACK,
-            &[],
-        ))
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let payload = vec![0x5a; 128 * 1024];
-    let mut write = Box::pin(stream.write_all(&payload));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), &mut write)
+    for send_total in [8 * 1024, 128 * 1024, 256 * 1024] {
+        let config = NetStackConfig {
+            packet_queue: 1,
+            tcp_accept_queue: 1,
+            udp_queue: 1,
+            tcp_recv_buffer: 8 * 1024,
+            tcp_send_buffer: send_total,
+            max_poll_interval: Duration::from_millis(5),
+            ..NetStackConfig::default()
+        };
+        let stack = NetStack::start(config).unwrap();
+        let mut parts = stack.into_parts();
+        let flow = Flow::v4(14_000);
+        parts
+            .packet_sink
+            .send(build_tcp(&flow, 10, 0, TcpFlags::SYN, &[]))
             .await
-            .is_err(),
-        "write unexpectedly bypassed bounded TCP buffers"
-    );
+            .unwrap();
+        let syn_ack = timeout_packet(&mut parts.packet_stream).await;
+        let server_sequence = tcp_sequence(&syn_ack);
+        let mut stream = parts.tcp_listener.accept().await.unwrap();
+        parts
+            .packet_sink
+            .send(build_tcp(
+                &flow,
+                11,
+                server_sequence.wrapping_add(1),
+                TcpFlags::ACK,
+                &[],
+            ))
+            .await
+            .unwrap();
 
-    parts.control.stop().await;
-    let write_result = tokio::time::timeout(WAIT, write)
-        .await
-        .expect("blocked TCP write was not woken by stop");
-    assert!(write_result.is_err());
-    assert!(stream.is_stopped());
-    assert_eq!(parts.stats.snapshot().active_tcp, 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let payload = vec![0x5a; (send_total * 2).max(128 * 1024)];
+        let mut write = Box::pin(stream.write_all(&payload));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut write)
+                .await
+                .is_err(),
+            "write unexpectedly bypassed bounded TCP buffers"
+        );
+
+        parts.control.stop().await;
+        let write_result = tokio::time::timeout(WAIT, write)
+            .await
+            .expect("blocked TCP write was not woken by stop");
+        assert!(write_result.is_err());
+        assert!(stream.is_stopped());
+        assert_eq!(parts.stats.snapshot().active_tcp, 0);
+    }
 }
 
 #[tokio::test]

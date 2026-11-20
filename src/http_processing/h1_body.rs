@@ -17,7 +17,9 @@ use bytes::Bytes;
 use std::{
     collections::HashSet,
     io,
+    pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -240,6 +242,43 @@ fn length(body: Body) -> Option<u64> {
     }
 }
 
+// This wrapper belongs only to PreparedBody's body transfer, never the head.
+// Both transfer paths call flush only after successful source/framing reads
+// and all body/framing writes. Keep that invariant if intermediate flushes are added.
+struct FinalFlushProbe<'a, W> {
+    writer: &'a mut W,
+    observed: &'a AtomicBool,
+    eligible: bool,
+}
+impl<W: AsyncWrite + Unpin> AsyncWrite for FinalFlushProbe<'_, W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.writer).poll_write(cx, bytes)
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.writer).poll_write_vectored(cx, bytes)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.writer.is_write_vectored()
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.eligible {
+            self.observed.store(true, Ordering::Release);
+        }
+        Pin::new(&mut *self.writer).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.writer).poll_shutdown(cx)
+    }
+}
+
 pub(crate) struct PreparedBody {
     framing: Body,
     cursor: Option<Cursor>,
@@ -284,6 +323,37 @@ impl PreparedBody {
             origin_replaced: false,
         }
     }
+    pub(crate) async fn transfer_observing_final_flush<
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    >(
+        self,
+        reader: &mut R,
+        writer: &mut W,
+        idle: Duration,
+        blocklist: &HashSet<String>,
+        dechunk: bool,
+        observed: &AtomicBool,
+    ) -> io::Result<()> {
+        // Cursor framing is the real source, not the rewritten output length.
+        // Unknown/generated sources and chunked/trailer paths gain no proof.
+        let fixed_source = match self.cursor.as_ref() {
+            Some(cursor) => matches!(cursor.body, Body::Empty | Body::Length(_)),
+            None => self.buffered.is_none() && self.prefix.is_none() && self.result.is_none(),
+        };
+        let eligible = fixed_source
+            && !self.origin_replaced
+            && !dechunk
+            && matches!(self.framing, Body::Empty | Body::Length(_));
+        let mut writer = FinalFlushProbe {
+            writer,
+            observed,
+            eligible,
+        };
+        self.transfer(reader, &mut writer, idle, blocklist, dechunk)
+            .await
+    }
+
     pub(crate) async fn transfer<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         self,
         reader: &mut R,
@@ -610,6 +680,18 @@ impl Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(unix, feature = "inbound-http"))]
+    #[forbid(unsafe_code)]
+    mod shared_collector_mapping_tests {
+        include!("shared_collector_h1_memory_tests.rs");
+    }
+
+    #[cfg(all(unix, feature = "inbound-http"))]
+    #[forbid(unsafe_code)]
+    mod shared_collector_c15_gap_tests {
+        include!("shared_collector_c15_cancel_metadata_memory_tests.rs");
+    }
     #[tokio::test]
     async fn collected_cookie_trailer_cannot_cross_a_later_script_origin_change() {
         let budget = body::Budget::default();

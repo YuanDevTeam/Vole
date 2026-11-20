@@ -390,7 +390,7 @@ async fn upstream_reuse_same_ip_different_authority_never_coalesces() {
     end(client, task, &origin).await;
 }
 #[tokio::test]
-async fn upstream_reuse_native_request_body_set_retains_the_one_shot_path() {
+async fn upstream_reuse_native_request_body_set_reuses_after_complete_upload() {
     let origin = MemoryOrigin::new(Reply::Persistent);
     let (context, _) = context(
         origin.clone(),
@@ -402,7 +402,8 @@ async fn upstream_reuse_native_request_body_set_retains_the_one_shot_path() {
         send(&mut client, path).await;
         assert_eq!(read_response(&mut client).await.unwrap(), b"ok");
     }
-    assert_eq!(origin.opened.load(Ordering::SeqCst), 2);
+    end(client, task, &origin).await;
+    assert_eq!(origin.opened.load(Ordering::SeqCst), 1);
     assert_eq!(
         *origin.bodies.lock().unwrap(),
         vec![b"x".to_vec(), b"x".to_vec()]
@@ -413,9 +414,8 @@ async fn upstream_reuse_native_request_body_set_retains_the_one_shot_path() {
             .lock()
             .unwrap()
             .iter()
-            .all(|h| h.to_ascii_lowercase().contains("connection: close"))
+            .all(|h| h.to_ascii_lowercase().contains("connection: keep-alive"))
     );
-    end(client, task, &origin).await;
 }
 #[tokio::test]
 async fn upstream_reuse_ambiguous_upstream_framing_remains_failure() {
@@ -463,7 +463,7 @@ fn upstream_reuse_builtin_direct_rejects_mutable_or_special_egress() {
     assert!(!plain.permits_http_tcp_reuse());
     let mptcp =
         crate::outbound::DirectOutbound::new(crate::dialer::Dialer::default().with_mptcp(true));
-    assert!(!mptcp.permits_http_tcp_reuse());
+    assert_eq!(mptcp.permits_http_tcp_reuse(), cfg!(target_os = "macos"));
 }
 #[cfg(target_vendor = "apple")]
 #[tokio::test]

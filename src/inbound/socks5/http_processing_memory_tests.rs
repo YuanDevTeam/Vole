@@ -44,6 +44,7 @@ enum PeerMode {
     Http,
     Echo,
     SniffingEcho,
+    BufferedSniffingEcho,
     Tls(Arc<rustls::ServerConfig>),
     Refused,
 }
@@ -94,7 +95,10 @@ impl Dispatcher for Origin {
         source: std::net::SocketAddr,
         destination: &Destination,
     ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
-        if !matches!(self.mode, PeerMode::SniffingEcho) {
+        if !matches!(
+            self.mode,
+            PeerMode::SniffingEcho | PeerMode::BufferedSniffingEcho
+        ) {
             return Ok(None);
         }
         let config = crate::config::Config::parse_yaml(
@@ -138,6 +142,16 @@ impl Dispatcher for Origin {
                         peer.write_all(&bytes).await?;
                         peer.shutdown().await
                     }
+                    PeerMode::BufferedSniffingEcho => {
+                        let mut bytes = [0_u8; 1024];
+                        loop {
+                            let count = peer.read(&mut bytes).await?;
+                            if count == 0 {
+                                return peer.shutdown().await;
+                            }
+                            peer.write_all(&bytes[..count]).await?;
+                        }
+                    }
                     PeerMode::Refused => unreachable!(),
                 }
             };
@@ -147,7 +161,11 @@ impl Dispatcher for Origin {
                 result = operation => result,
             }
         }));
-        Ok(Box::new(client))
+        if matches!(self.mode, PeerMode::BufferedSniffingEcho) {
+            Ok(Box::new(tokio::io::BufWriter::new(client)))
+        } else {
+            Ok(Box::new(client))
+        }
     }
     async fn open_datagram(
         &self,
@@ -192,6 +210,13 @@ struct Entry {
 impl Dispatcher for Entry {
     fn http_context(&self) -> Option<HttpContext> {
         self.context.clone()
+    }
+    async fn sniff_plan(
+        &self,
+        source: std::net::SocketAddr,
+        destination: &Destination,
+    ) -> Result<Option<crate::sniffing::Plan>, DispatchError> {
+        self.origin.sniff_plan(source, destination).await
     }
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         self.outer_connects.fetch_add(1, Ordering::SeqCst);
@@ -405,6 +430,29 @@ async fn socks_http_transparent_boundaries_preserve_bytes_and_fixed_context() {
         );
         assert_eq!(origin.requests.lock().unwrap()[0].0, payload);
     }
+}
+
+#[tokio::test]
+async fn socks_sniffed_prefix_is_flushed_before_the_client_sends_more() {
+    let origin = Origin::new(PeerMode::BufferedSniffingEcho);
+    let mut fixture = Fixture::new(None, origin.clone(), false);
+    let exchange = timeout(WAIT, async {
+        handshake(&mut fixture.client, 80, false).await?;
+        fixture.client.write_all(REQUEST).await?;
+        let mut response = vec![0; REQUEST.len()];
+        // The client deliberately keeps its write half open and sends no
+        // second flight until the buffered outbound has replied.
+        fixture.client.read_exact(&mut response).await?;
+        Ok::<_, io::Error>(response)
+    })
+    .await;
+    let cleanup = fixture.finish(&origin).await;
+    cleanup.unwrap();
+    assert_eq!(exchange.unwrap().unwrap(), REQUEST);
+    assert_eq!(
+        origin.sessions.lock().unwrap()[0].sniffed_domain.as_deref(),
+        Some("target.test")
+    );
 }
 
 #[tokio::test]

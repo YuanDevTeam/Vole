@@ -54,6 +54,19 @@ impl Connector {
 }
 
 impl BoringTlsClient {
+    #[cfg(all(
+        feature = "inbound-http",
+        feature = "outbound-shadowsocks",
+        feature = "shadow-tls-v3"
+    ))]
+    pub(super) fn has_fixed_shadowtls_http_identity(&self) -> bool {
+        self.ech.is_none()
+            && self
+                .identity
+                .as_ref()
+                .is_none_or(TlsClientIdentity::has_inline_http_identity)
+    }
+
     pub(super) fn standard(
         context: &SecurityContext,
         server_name: &str,

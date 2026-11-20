@@ -1,2 +1,7 @@
 # The same lockfile bytes identify production artifacts on every build host.
 Cargo.lock text eol=lf
+
+# Preserve the reviewed third-party package and patch byte identities.
+/vendor/h2/** -text
+# Unified diff context lines contain a required leading space.
+/scripts/native/h2/initial-write-buffer.patch -text whitespace=-blank-at-eol

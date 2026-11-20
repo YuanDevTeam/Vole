@@ -86,3 +86,8 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "inbound-http"))]
+pub(crate) use stream::http_cover_reuse_memory_tests::{
+    MemoryVmessAcceptedPeer, MemoryVmessHttpCoverFactory, MemoryVmessHttpCoverReceipt,
+};

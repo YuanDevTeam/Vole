@@ -18,6 +18,8 @@ pub struct HttpOutbound {
     tls: Option<StandardTlsClient>,
     headers: BTreeMap<String, String>,
     authorization: Option<String>,
+    #[cfg(feature = "inbound-http")]
+    http_reuse_security_static: bool,
 }
 impl HttpOutbound {
     pub(crate) fn with_shared_security(
@@ -58,6 +60,13 @@ impl HttpOutbound {
                 .auth
                 .as_ref()
                 .map(|auth| auth.authorization_header_value()),
+            #[cfg(feature = "inbound-http")]
+            http_reuse_security_static: config.tls.as_ref().is_none_or(|tls| {
+                tls.identity
+                    .as_ref()
+                    .is_none_or(|identity| identity.origin.is_none())
+                    && tls.ech.as_ref().is_none_or(|ech| !ech.is_dynamic())
+            }),
         })
     }
 }
@@ -123,6 +132,11 @@ async fn handshake(
 }
 #[async_trait]
 impl OutboundConnector for HttpOutbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        self.http_reuse_security_static && self.upstream.permits_static_http_reuse(&self.server)
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,

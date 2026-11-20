@@ -207,12 +207,19 @@ impl Message {
             "phase": if self.phase() == Phase::Request { "request" } else { "response" },
             "original": {"url":self.original.url.as_str(),"method":self.original.method},
             "request": {"url":self.request.url.as_str(),"method":self.request.method,
-                "headers":snapshot(&self.request.headers)},
+                "headers":null},
             "body": {"kind":match mode { BodyMode::None=>"not-requested",BodyMode::Text=>"text",BodyMode::Bytes=>"bytes"}},
         });
+        *input
+            .get_mut("request")
+            .and_then(|request| request.get_mut("headers"))
+            .expect("request header slot is constructed above") = snapshot(&self.request.headers);
         if let Some(response) = &self.response {
-            input["response"] =
-                json!({"status":response.status,"headers":snapshot(&response.headers)});
+            input["response"] = json!({"status":response.status,"headers":null});
+            *input
+                .get_mut("response")
+                .and_then(|response| response.get_mut("headers"))
+                .expect("response header slot is constructed above") = snapshot(&response.headers);
         }
         Ok(input)
     }
@@ -321,12 +328,21 @@ impl Message {
                             output_body.as_ref().len(),
                             body.kind == BodyKind::Text,
                         );
-                        replacement = Some(output_body.into_bytes());
+                        replacement = Some(output_body);
                     }
                 } else if !output_body.as_ref().is_empty() {
                     return Err(invalid());
                 }
                 headers::check(&fields)?;
+                // This is the first commit. Every validation above is complete;
+                // rejecting a foreign owner leaves body and metadata intact.
+                if let Some(bytes) = replacement {
+                    self.body
+                        .as_mut()
+                        .expect("validated body input")
+                        .replace(bytes)
+                        .map_err(|_| invalid())?;
+                }
                 if let Some(response) = &mut self.response {
                     response.headers = fields;
                     if let Some(status) = status {
@@ -341,12 +357,6 @@ impl Message {
                         self.request.method = method;
                     }
                     self.crossed_origin |= origin_changed;
-                }
-                if let Some(bytes) = replacement {
-                    self.body
-                        .as_mut()
-                        .expect("validated body input")
-                        .replace(bytes);
                 }
                 Ok(Outcome::Forward)
             }
@@ -516,12 +526,113 @@ fn readable_text(fields: &Fields, bytes: &[u8]) -> bool {
     })
 }
 
+// Preserve the existing per-invocation output-owner charge while queued;
+// only its not-yet-allocated payload is deferred until the same lane is held.
+#[cfg(target_vendor = "apple")]
+struct PendingPlanOutput<'a> {
+    budget: &'a Budget,
+    reservation: super::body_budget::Reservation,
+    bound: usize,
+}
+#[cfg(target_vendor = "apple")]
+const _: () = assert!(
+    std::mem::size_of::<PendingPlanOutput<'static>>() <= std::mem::size_of::<BudgetedBytes>()
+);
+#[cfg(target_vendor = "apple")]
+impl<'a> PendingPlanOutput<'a> {
+    fn new(
+        budget: &'a Budget,
+        bytes: Option<&[u8]>,
+        mode: BodyMode,
+        backend: super::scripts::Backend<'_>,
+    ) -> io::Result<Self> {
+        let bound = backend.output_bound(bytes.map_or(0, <[u8]>::len));
+        if !backend.is_plan()
+            || mode != BodyMode::Text
+            || bytes.is_none_or(|bytes| bytes.len() > MAX_BODY)
+            || bound > MAX_BODY
+        {
+            return Err(invalid());
+        }
+        let output_cost = BudgetedBytes::allocation_cost(bound).ok_or_else(exhausted)?;
+        let bookkeeping = BudgetedBytes::allocation_cost(0).ok_or_else(exhausted)?;
+        super::diagnostics::call_buffers_requested(0, output_cost, 0);
+        let reservation = budget.reserve(bookkeeping).ok_or_else(|| {
+            super::diagnostics::increment(super::diagnostics::Counter::CallBuffersBudgetRejected);
+            exhausted()
+        })?;
+        super::diagnostics::increment(super::diagnostics::Counter::PlanOutputPendingAdmitted);
+        Ok(Self {
+            budget,
+            reservation,
+            bound,
+        })
+    }
+    // The caller already owns InvocationLane. No wait and no second queue.
+    fn materialize(mut self) -> io::Result<CallBuffers> {
+        let payload = self.budget.reserve(self.bound).ok_or_else(|| {
+            super::diagnostics::increment(
+                super::diagnostics::Counter::PlanOutputPayloadBudgetRejected,
+            );
+            super::diagnostics::increment(super::diagnostics::Counter::CallBuffersBudgetRejected);
+            exhausted()
+        })?;
+        self.reservation.merge(payload).map_err(|_| invalid())?;
+        let output = BudgetedBytes::from_reserved_fixed_output(self.reservation, self.bound)
+            .ok_or_else(|| {
+                super::diagnostics::increment(
+                    super::diagnostics::Counter::CallBuffersAllocationRejected,
+                );
+                exhausted()
+            })?;
+        super::diagnostics::increment(super::diagnostics::Counter::CallBuffersAdmitted);
+        Ok(CallBuffers {
+            output,
+            bridge_workspace: None,
+        })
+    }
+}
+
 struct CallBuffers {
-    input: Option<BudgetedBytes>,
     output: BudgetedBytes,
     bridge_workspace: Option<super::body_budget::Reservation>,
 }
 impl CallBuffers {
+    fn for_backend(
+        budget: &Budget,
+        bytes: Option<&[u8]>,
+        mode: BodyMode,
+        backend: super::scripts::Backend<'_>,
+    ) -> io::Result<Self> {
+        let bound = backend.output_bound(bytes.map_or(0, <[u8]>::len));
+        if !backend.is_plan() {
+            return Self::with_output_bound(budget, bytes, mode, bound);
+        }
+        // Selection is final: a refusal skips this invocation, never JSC.
+        if mode != BodyMode::Text
+            || bytes.is_none_or(|bytes| bytes.len() > MAX_BODY)
+            || bound > MAX_BODY
+        {
+            return Err(invalid());
+        }
+        let output_cost = BudgetedBytes::allocation_cost(bound).ok_or_else(exhausted)?;
+        super::diagnostics::call_buffers_requested(0, output_cost, 0);
+        let permit = budget.reserve(output_cost).ok_or_else(|| {
+            super::diagnostics::increment(super::diagnostics::Counter::CallBuffersBudgetRejected);
+            exhausted()
+        })?;
+        let output = BudgetedBytes::from_reserved(permit, bound).ok_or_else(|| {
+            super::diagnostics::increment(
+                super::diagnostics::Counter::CallBuffersAllocationRejected,
+            );
+            exhausted()
+        })?;
+        super::diagnostics::increment(super::diagnostics::Counter::CallBuffersAdmitted);
+        Ok(Self {
+            output,
+            bridge_workspace: None,
+        })
+    }
     #[cfg(test)]
     fn new(budget: &Budget, bytes: Option<&[u8]>, mode: BodyMode) -> io::Result<Self> {
         Self::with_output_bound(budget, bytes, mode, MAX_BODY)
@@ -536,7 +647,6 @@ impl CallBuffers {
             super::diagnostics::call_buffers_requested(0, 0, 0);
             super::diagnostics::increment(super::diagnostics::Counter::CallBuffersAdmitted);
             return Ok(Self {
-                input: None,
                 output: BudgetedBytes::empty(budget),
                 bridge_workspace: None,
             });
@@ -544,7 +654,8 @@ impl CallBuffers {
         if bytes.len() > MAX_BODY || output_bound > MAX_BODY {
             return Err(invalid());
         }
-        let input_cost = BudgetedBytes::allocation_cost(bytes.len()).ok_or_else(exhausted)?;
+        // The immutable Entity remains borrowed through the real owner join.
+        // JSC still creates its independently paid string/typed-array copy.
         // One prepaid terminator byte preserves the ASCII public export API.
         // Actual result bytes remain limited by output_bound in the adapter.
         let output_capacity =
@@ -554,14 +665,9 @@ impl CallBuffers {
             super::body_budget::BridgePlan::new(bytes.len(), mode == BodyMode::Text, output_bound)
                 .and_then(super::body_budget::BridgePlan::cost)
                 .ok_or_else(exhausted)?;
-        super::diagnostics::call_buffers_requested(input_cost, output_cost, bridge_cost);
+        super::diagnostics::call_buffers_requested(0, output_cost, bridge_cost);
         let mut all = budget
-            .reserve(
-                input_cost
-                    .checked_add(output_cost)
-                    .and_then(|n| n.checked_add(bridge_cost))
-                    .ok_or_else(exhausted)?,
-            )
+            .reserve(output_cost.checked_add(bridge_cost).ok_or_else(exhausted)?)
             .ok_or_else(|| {
                 super::diagnostics::increment(
                     super::diagnostics::Counter::CallBuffersBudgetRejected,
@@ -575,17 +681,10 @@ impl CallBuffers {
             );
             exhausted()
         };
-        let output = BudgetedBytes::from_reserved(
-            all.split(output_cost).ok_or_else(exhausted)?,
-            output_capacity,
-        )
-        .ok_or_else(allocation_failed)?;
-        let mut input =
-            BudgetedBytes::from_reserved(all, bytes.len()).ok_or_else(allocation_failed)?;
-        input.extend(bytes)?;
+        let output =
+            BudgetedBytes::from_reserved(all, output_capacity).ok_or_else(allocation_failed)?;
         super::diagnostics::increment(super::diagnostics::Counter::CallBuffersAdmitted);
         Ok(Self {
-            input: Some(input),
             output,
             bridge_workspace,
         })
@@ -606,6 +705,24 @@ pub(crate) async fn run(
         Instant::now() + Duration::from_secs(1),
     )
     .await
+}
+
+fn report_backend_error(error: io::Error, script_name: &str, phase: Phase) -> io::Result<()> {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::Unsupported
+    ) {
+        super::diagnostics::increment(super::diagnostics::Counter::BackendFatal);
+        tracing::warn!(target: "vole::http_processing::script", script = %script_name, phase = ?phase, error_kind = ?error.kind(), error = %error, "HTTP script backend failed");
+        Err(error)
+    } else {
+        tracing::warn!(target: "vole::http_processing::script", script = %script_name, phase = ?phase, error_kind = ?error.kind(), error = %error, "HTTP script failed");
+        Ok(())
+    }
 }
 
 fn check_stage(cancellation: &CancellationToken, deadline: Instant) -> io::Result<()> {
@@ -672,49 +789,104 @@ async fn run_until(
             tracing::debug!(target: "vole::http_processing::script", script = %script.name, phase = ?phase, reason = "input-unrepresentable", "HTTP script skipped");
             continue;
         };
-        let Ok(mut buffers) = CallBuffers::with_output_bound(
-            policy.body_budget(),
-            bytes,
-            script.body,
-            script
-                .compiled
-                .maximum_output_bytes(bytes.map_or(0, <[u8]>::len)),
-        ) else {
+        // Both references borrow the same immutable Entity owner. The witness
+        // adds ledger identity, never another input copy or reservation.
+        let borrowed = bytes.and_then(|_| message.body.as_ref().and_then(Entity::borrowed_body));
+        let backend = script.compiled.backend(&metadata, borrowed);
+        #[cfg(target_vendor = "apple")]
+        let mut acquired_lane = None;
+        let prepared_buffers = {
+            #[cfg(target_vendor = "apple")]
+            if backend.is_plan() {
+                match PendingPlanOutput::new(policy.body_budget(), bytes, script.body, backend) {
+                    Err(error) => Err(error),
+                    Ok(pending) => {
+                        let lane =
+                            match super::scripts::InvocationLane::acquire(cancellation, deadline)
+                                .await
+                            {
+                                Ok(lane) => lane,
+                                Err(error) => {
+                                    super::diagnostics::increment(
+                                        super::diagnostics::Counter::PlanOutputQueueFailed,
+                                    );
+                                    check_stage(cancellation, deadline)?;
+                                    report_backend_error(error, &script.name, phase)?;
+                                    continue;
+                                }
+                            };
+                        acquired_lane = Some(lane);
+                        pending.materialize()
+                    }
+                }
+            } else {
+                CallBuffers::for_backend(policy.body_budget(), bytes, script.body, backend)
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                CallBuffers::for_backend(policy.body_budget(), bytes, script.body, backend)
+            }
+        };
+        let Ok(mut buffers) = prepared_buffers else {
+            if backend.is_plan() {
+                super::diagnostics::increment(super::diagnostics::Counter::PlanBuffersRejected);
+            }
             super::diagnostics::increment(super::diagnostics::Counter::SkipCallBuffers);
             tracing::debug!(target: "vole::http_processing::script", script = %script.name, phase = ?phase, reason = "body-budget", "HTTP script skipped");
             continue;
         };
-        let result = super::scripts::evaluate_until(
-            &script.compiled,
-            &metadata,
-            buffers.input.as_ref().map(AsRef::as_ref),
-            &mut buffers.output,
-            buffers.bridge_workspace.as_ref(),
-            cancellation,
-            deadline,
-        )
-        .await;
-        drop(buffers.input);
+        let result = {
+            #[cfg(target_vendor = "apple")]
+            if let Some(lane) = acquired_lane {
+                if super::scripts::plan_can_run_direct() {
+                    // Keep this exact paid output and acquired lane/deadline.
+                    // One scheduling opportunity, not an IO-poll guarantee.
+                    tokio::task::yield_now().await;
+                }
+                super::scripts::evaluate_plan_in_lane(
+                    backend,
+                    &metadata,
+                    borrowed,
+                    &mut buffers.output,
+                    cancellation,
+                    lane,
+                )
+            } else {
+                super::scripts::evaluate_backend_until(
+                    backend,
+                    &metadata,
+                    // The typed witness borrows the actual sender-owned Bytes, through
+                    // the same actual backend owner/TLS join. No raw slice retagging.
+                    borrowed,
+                    &mut buffers.output,
+                    buffers.bridge_workspace.as_ref(),
+                    cancellation,
+                    deadline,
+                )
+                .await
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                super::scripts::evaluate_backend_until(
+                    backend,
+                    &metadata,
+                    // The typed witness borrows the actual sender-owned Bytes, through
+                    // the same actual backend owner/TLS join. No raw slice retagging.
+                    borrowed,
+                    &mut buffers.output,
+                    buffers.bridge_workspace.as_ref(),
+                    cancellation,
+                    deadline,
+                )
+                .await
+            }
+        };
         drop(buffers.bridge_workspace.take());
         check_stage(cancellation, deadline)?;
         let metadata = match result {
             Ok(metadata) => metadata,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::BrokenPipe
-                        | io::ErrorKind::ConnectionAborted
-                        | io::ErrorKind::ConnectionReset
-                        | io::ErrorKind::NotConnected
-                        | io::ErrorKind::Unsupported
-                ) =>
-            {
-                super::diagnostics::increment(super::diagnostics::Counter::BackendFatal);
-                tracing::warn!(target: "vole::http_processing::script", script = %script.name, phase = ?phase, error_kind = ?error.kind(), error = %error, "HTTP script backend failed");
-                return Err(error);
-            }
             Err(error) => {
-                tracing::warn!(target: "vole::http_processing::script", script = %script.name, phase = ?phase, error_kind = ?error.kind(), error = %error, "HTTP script failed");
+                report_backend_error(error, &script.name, phase)?;
                 continue;
             }
         };
@@ -1292,26 +1464,45 @@ mod tests {
     }
 
     #[test]
-    fn bounded_call_buffers_admit_two_64k_copies_without_an_unbounded_queue() {
+    fn bounded_call_buffers_admit_two_distinct_64k_owners_without_an_unbounded_queue() {
         let budget = Budget::default();
+        // Keep a finite two-MiB headroom for this combined-credit boundary,
+        // independently of the process default. The occupied credit remains
+        // owned until every input, output and bridge reservation is released.
+        let pressure_bytes = super::super::body_budget::WORKSPACE - 2 * 1024 * 1024;
+        let pressure = budget.reserve(pressure_bytes).unwrap();
         let body = vec![b'q'; 65536];
-        let a = CallBuffers::with_output_bound(&budget, Some(&body), BodyMode::Text, body.len())
-            .unwrap();
-        let one = budget.used();
-        let b = CallBuffers::with_output_bound(&budget, Some(&body), BodyMode::Text, body.len())
-            .unwrap();
-        assert_eq!(budget.used(), 2 * one);
+        // Three genuinely independent collected inputs keep their own permits;
+        // borrowing them never turns them into uncharged Vec fixtures.
+        let inputs = [
+            BudgetedBytes::copy(&budget, &body).unwrap().into_bytes(),
+            BudgetedBytes::copy(&budget, &body).unwrap().into_bytes(),
+            BudgetedBytes::copy(&budget, &body).unwrap().into_bytes(),
+        ];
+        let originals = budget.used();
+        let a =
+            CallBuffers::with_output_bound(&budget, Some(&inputs[0]), BodyMode::Text, body.len())
+                .unwrap();
+        let one = budget.used() - originals;
+        let b =
+            CallBuffers::with_output_bound(&budget, Some(&inputs[1]), BodyMode::Text, body.len())
+                .unwrap();
+        assert_eq!(budget.used(), originals + 2 * one);
         assert!(
-            CallBuffers::with_output_bound(&budget, Some(&body), BodyMode::Text, body.len())
+            CallBuffers::with_output_bound(&budget, Some(&inputs[2]), BodyMode::Text, body.len())
                 .is_err()
         );
-        assert_eq!(budget.used(), 2 * one);
+        assert_eq!(budget.used(), originals + 2 * one);
         drop(b);
         drop(a);
-        assert_eq!(budget.used(), 0);
-        let old = CallBuffers::new(&budget, Some(&body), BodyMode::Text).unwrap();
+        assert_eq!(budget.used(), originals);
+        drop(inputs);
+        assert_eq!(budget.used(), pressure_bytes);
+        let unknown = CallBuffers::new(&budget, Some(&body), BodyMode::Text).unwrap();
         assert!(CallBuffers::new(&budget, Some(&body), BodyMode::Text).is_err());
-        drop(old);
+        drop(unknown);
+        assert_eq!(budget.used(), pressure_bytes);
+        drop(pressure);
         assert_eq!(budget.used(), 0);
     }
 
@@ -1319,8 +1510,7 @@ mod tests {
     fn bridge_api_input_and_export_are_included_in_the_combined_admission() {
         let budget = Budget::default();
         let body = vec![b'a'; 64 * 1024];
-        let legacy_cost = BudgetedBytes::allocation_cost(body.len()).unwrap()
-            + BudgetedBytes::allocation_cost(MAX_BODY).unwrap()
+        let legacy_cost = BudgetedBytes::allocation_cost(MAX_BODY).unwrap()
             + body.len() * 2
             + std::mem::size_of::<Vec<u16>>();
         let occupied = budget
@@ -1344,9 +1534,7 @@ mod tests {
                 };
             assert_eq!(
                 budget.used(),
-                BudgetedBytes::allocation_cost(body.len()).unwrap()
-                    + BudgetedBytes::allocation_cost(MAX_BODY).unwrap()
-                    + bridge
+                BudgetedBytes::allocation_cost(MAX_BODY).unwrap() + bridge
             );
             drop(buffers);
             assert_eq!(budget.used(), 0);
@@ -1354,7 +1542,7 @@ mod tests {
     }
 
     #[test]
-    fn call_buffers_admit_input_and_maximum_output_together_and_release_owners() {
+    fn call_buffers_admit_output_and_bridge_together_without_copying_input() {
         let budget = Budget::default();
         let occupied = budget
             .reserve(super::super::body_budget::WORKSPACE - 2 * MAX_BODY)
@@ -1365,13 +1553,16 @@ mod tests {
             super::super::body_budget::WORKSPACE - 2 * MAX_BODY
         );
         drop(occupied);
-        let buffers = CallBuffers::new(
-            &budget,
-            Some(b"independent writable input"),
-            BodyMode::Bytes,
-        )
-        .unwrap();
-        assert!(budget.used() >= MAX_BODY + 26);
+        let input = b"independent writable input";
+        let buffers = CallBuffers::new(&budget, Some(input), BodyMode::Bytes).unwrap();
+        assert_eq!(
+            budget.used(),
+            BudgetedBytes::allocation_cost(MAX_BODY).unwrap()
+                + super::super::body_budget::BridgePlan::new(input.len(), false, MAX_BODY)
+                    .unwrap()
+                    .cost()
+                    .unwrap()
+        );
         drop(buffers);
         assert_eq!(budget.used(), 0);
     }
@@ -1492,3 +1683,19 @@ mod tests {
         assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Interrupted));
     }
 }
+
+#[cfg(test)]
+#[path = "script_message/borrowed_input_tests.rs"]
+mod borrowed_input_tests;
+
+#[cfg(all(test, target_vendor = "apple"))]
+#[path = "script_message/guard_coverage_tests.rs"]
+mod guard_coverage_tests;
+
+#[cfg(all(test, unix))]
+#[path = "script_message/mapped_output_tests.rs"]
+mod mapped_output_tests;
+
+#[cfg(all(test, target_vendor = "apple"))]
+#[path = "script_message/plan_yield_tests.rs"]
+mod plan_yield_tests;

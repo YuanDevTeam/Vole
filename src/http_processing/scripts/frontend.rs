@@ -26,7 +26,20 @@ pub(super) fn compile(source: &str) -> io::Result<String> {
     compile_with_output_bound(source).map(|(code, _)| code)
 }
 
+#[cfg(test)]
 pub(super) fn compile_with_output_bound(source: &str) -> io::Result<(String, super::OutputBound)> {
+    let prepared = compile_prepared(source)?;
+    Ok((prepared.code, prepared.output_bound))
+}
+
+pub(super) struct PreparedSource {
+    pub(super) code: String,
+    pub(super) output_bound: super::OutputBound,
+    #[cfg(target_vendor = "apple")]
+    pub(super) plan: Option<super::static_literal_plan::Plan>,
+}
+
+pub(super) fn compile_prepared(source: &str) -> io::Result<PreparedSource> {
     if source.len() > super::super::config::MAX_ADDENDUM {
         return Err(invalid());
     }
@@ -93,7 +106,12 @@ pub(super) fn compile_with_output_bound(source: &str) -> io::Result<(String, sup
     let code = emitter.bounded(output)?;
     // Analyze the same already accepted AST. An inconclusive/capped proof
     // returns Maximum and never changes JavaScript or public acceptance.
-    Ok((code, output_bound::analyze(function)))
+    Ok(PreparedSource {
+        code,
+        output_bound: output_bound::analyze(function),
+        #[cfg(target_vendor = "apple")]
+        plan: super::static_literal_plan::analyze(function),
+    })
 }
 
 struct Emitter {

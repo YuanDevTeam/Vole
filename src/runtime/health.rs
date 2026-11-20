@@ -32,6 +32,11 @@ pub(super) struct ActiveDispatcher {
 }
 #[async_trait::async_trait]
 impl Dispatcher for ActiveDispatcher {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        self.dispatcher.permits_http_tcp_reuse()
+    }
+
     fn supports_udp(&self) -> bool {
         self.dispatcher.supports_udp()
     }

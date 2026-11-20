@@ -8,7 +8,7 @@ pub(crate) mod config;
 #[doc(hidden)]
 pub mod diagnostics;
 #[cfg(not(feature = "http-diagnostics"))]
-mod diagnostics;
+pub(crate) mod diagnostics;
 pub(crate) mod headers;
 mod mitm;
 mod numeric_input;
@@ -32,6 +32,8 @@ mod h2_body;
 mod h2_h1;
 #[cfg(feature = "inbound-http")]
 mod h2_headers;
+#[cfg(feature = "inbound-http")]
+mod h2_reuse;
 #[cfg(all(test, feature = "inbound-http"))]
 mod h2_tests;
 #[cfg(feature = "inbound-http")]
@@ -112,3 +114,6 @@ pub(crate) enum Intercept {
 mod h1_boundary_tests;
 #[cfg(all(test, feature = "inbound-http"))]
 mod tests;
+
+#[cfg(test)]
+mod h2_frame_validation;

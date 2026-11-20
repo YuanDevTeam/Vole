@@ -271,7 +271,11 @@ impl Socks5Handler {
                         timed(handshake::reply(&mut stream, 0, None)).await?;
                     }
                     if !prefix.is_empty() {
-                        timed(upstream.write_all(&prefix)).await?;
+                        timed(async {
+                            upstream.write_all(&prefix).await?;
+                            upstream.flush().await
+                        })
+                        .await?;
                     }
                     copy_bidirectional_with_sizes(
                         &mut stream,
