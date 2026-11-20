@@ -408,9 +408,9 @@ impl BoringTlsClient {
 
 fn profile(value: crate::config::ClientFingerprint) -> ClientFingerprint {
     match value {
-        crate::config::ClientFingerprint::Chrome133 => ClientFingerprint::Chrome133,
-        crate::config::ClientFingerprint::Firefox120 => ClientFingerprint::Firefox120,
-        crate::config::ClientFingerprint::Safari16 => ClientFingerprint::Safari16,
+        crate::config::ClientFingerprint::Chrome155 => ClientFingerprint::Chrome155,
+        crate::config::ClientFingerprint::Firefox148 => ClientFingerprint::Firefox148,
+        crate::config::ClientFingerprint::Safari263 => ClientFingerprint::Safari263,
         crate::config::ClientFingerprint::Ios14 => ClientFingerprint::Ios14,
         crate::config::ClientFingerprint::Android11 => ClientFingerprint::Android11,
         crate::config::ClientFingerprint::Edge85 => ClientFingerprint::Edge85,

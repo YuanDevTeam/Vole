@@ -10,15 +10,15 @@
 | 公开值 | 实际模板 |
 | --- | --- |
 | `none` | 关闭命名指纹，不关闭 TLS 或 REALITY 认证 |
-| `chrome` | Chrome133 |
-| `firefox` | Firefox120 |
-| `safari` | Safari16.0 |
+| `chrome` | Chrome155 |
+| `firefox` | Firefox148 |
+| `safari` | Safari26.3 |
 | `ios` | iOS14 |
 | `android` | Android11 OkHttp，TLS1.2 |
 | `edge` | Edge85 |
 | `360` | 360 Browser7.5 的已实现能力子集，TLS1.2；YAML 中写为字符串 |
 | `qq` | QQ11.1 |
-| `random` | 进程首次按 Chrome133/Safari16/iOS14/Firefox120 = 6:3:2:1 选中一个模板 |
+| `random` | 进程首次按 Chrome155/Safari26.3/iOS14/Firefox148 = 6:3:2:1 选中一个模板 |
 
 节点省略时关闭，显式启用推荐 `chrome`；这是节点级选项，无全局默认。
 大小写敏感，未知名称、`null`、错型全部拒绝；不接受带版本号的名称、
@@ -103,9 +103,9 @@ Windows UWP/AppContainer 的真实根读取仍需独立设备验证；交叉编�
 
 | 模板 | 主要差异 |
 | --- | --- |
-| Chrome133 | 普通 TLS 与显式混合 REALITY 使用原生 X25519MLKEM768 和 X25519 双 share，无 padding |
-| Firefox120 | 自有 cipher 顺序、固定扩展顺序、X25519/P-256 双 share，无 GREASE/ALPS/证书压缩 |
-| Safari16.0 | 固定扩展和签名顺序、GREASE、条件 padding、真实 Zlib 解压，模板本身不加 ECH/ALPS |
+| Chrome155 | 原生 X25519MLKEM768 和 X25519 双 share，含 ML-DSA 签名声明和 Chrome 信任锚标识 |
+| Firefox148 | 固定扩展顺序，混合组及独立 X25519 share 复用同一密钥，另含 P-256 share 和 Zlib、Brotli、Zstd 解压 |
+| Safari26.3 | 固定扩展和签名顺序、GREASE、原生混合及 X25519 双 share、Zlib 解压 |
 | iOS14 | 独立套件与扩展顺序、GREASE、条件 padding，无证书压缩；真实 c023/c027/003c CBC-SHA256 协商 |
 | Android11 OkHttp | 独立套件与扩展顺序，无 GREASE、证书压缩或 TLS1.3 声明 |
 | Edge85 | 固定扩展顺序、GREASE、X25519 share、Brotli 证书解压 |
@@ -115,18 +115,20 @@ Windows UWP/AppContainer 的真实根读取仍需独立设备验证；交叉编�
 TLS 版本范围、SNI、ALPN、证书策略、身份和恢复预算仍由节点及传输决定。
 Android/360 的参考模板只有 TLS1.2 能力；要求 TLS1.3 的身份与传输拒绝此组合，不伪造 share 或改名。
 因此名称表示版本固定的 TLS 模板，不承诺完整浏览器行为或所有上下文的逐字节相同。
-最低 TLS1.2；Safari/iOS 的 TLS1.0/1.1 声明裁剪，Vision/XHTTP/REALITY 继续强制 TLS1.3。
+最低 TLS1.2，iOS 的 TLS1.0/1.1 声明裁剪。Vision/XHTTP/REALITY 继续强制 TLS1.3。
 普通 Vision/XHTTP 的版本约束同时省略 TLS1.2 cipher 及仅用于旧握手的
 EC point formats、extended master secret、session ticket、renegotiation info 扩展。
 命名 REALITY 则保留模板的 TLS1.2 声明与字段，由原生 REALITY 在 ServerHello 阶段
 拒绝非 TLS1.3 协商；这与关闭命名指纹时的 TLS1.3-only 默认 offer 分开。
 Core 使用标准 H2 SETTINGS，不声明 TLS ALPS，也不复制 Mihomo 某些 WS 调用中的额外 h2 ALPS。
-classic REALITY 移除 Chrome133 的 ML-KEM group/share，并绑定实际 X25519 私钥；
+classic REALITY 移除混合组及其 share，并绑定实际 X25519 私钥；
 Firefox 的额外经典 share 不产生第二份 REALITY 身份。REALITY 仍拒绝 HRR、恢复和 0-RTT。
 
 `reality-opts.support-x25519mlkem768`：默认 false，true 允许在同次握手中协商
-真实 X25519MLKEM768（4588）或经典组。Chrome133 与未命名 profile 提供混合/X25519
-双 share，其余 TLS1.3 模板保留各自真实经典 share，不伪造混合能力或自动改成 Chrome。
+真实 X25519MLKEM768（4588）或经典组。Chrome155、Firefox148、Safari26.3 和未命名 profile
+提供混合与 X25519 share，其余 TLS1.3 模板保留各自的经典 share。
+Xray-core v26.11.9 的 REALITY 入站要求实际提供混合 share，即使对端最终选中 X25519。
+对这类节点需显式启用混合选项并使用能提供混合 share 的模板。
 Android/360 的模板只有 TLS1.2，不能用于 REALITY；这项限制来自实际模板版本，
 并非新增协议限制。下载腿继承/整体替换 REALITY 后独立验证最终 profile。
 服务端选择允许的经典组不触发重试；HRR、认证失败仍终止，不降级为普通 WebPKI。
@@ -141,8 +143,10 @@ iOS 的 c024/c028/003d 与 Safari/iOS 的 c008 仅声明，对端选中会失败
 VLESS/VMess/Trojan/AnyTLS/Hysteria2 可另行显式配置 [ECH](vless.md#ech)：具备 TLS1.3 能力的六种模板可使用，届时强制 TLS1.3、
 加入真实 ECH 并关闭恢复；不再声称与未启用 ECH 的历史浏览器模板逐字节相同。
 当前 HTTP 驱动不导入 TLS ALPS 中的应用设置，握手时不声明该可选扩展，
-由标准 SETTINGS/ACK 初始化。意外协商的非空 ALPS 仍失败，不能静默忽略设置。Brotli/Zlib 解压输出和原生证书消息上限均为 128 KiB；
+由标准 SETTINGS/ACK 初始化。意外协商的非空 ALPS 仍失败，不能静默忽略设置。证书解压输出和原生证书消息上限均为 128 KiB；
 超限、截断、错误算法和损坏压缩流失败，不能绕过证书认证。
+Chrome155 的信任锚扩展可以影响对端选择的证书链，实际信任根和证书验证仍由 Core 配置。
+Firefox148 的首次握手省略 PSK 模式。若对端因此不签发 TLS1.3 ticket，后续连接继续进行完整握手。
 
 ## 所有权与关闭
 
@@ -156,8 +160,8 @@ quiche 在该条物理连接的上下文中安装身份，均不修改进行中�
 各代共享原节点的固定容量，不随轮换次数增加缓存。身份检查工作器随资源工作器同步停止。
 TLS 1.3 票据只消费一次，TLS 1.2 会话也计入预算，过期票据清除，零预算关闭恢复。
 非零 TLS1.2 ticket lifetime hint 与原生 session timeout 取较短者；零提示不扩大原生期限。
-Safari16/iOS14 不声明 TLS1.2 session-ticket 扩展，该版本的恢复使用会话 ID，不能把不存在的
-票据提示当作它的过期时间。TLS1.3 的票据期限已由原生握手收敛。
+Safari26.3、iOS14 和 Firefox148 的 TLS1.2 冷握手省略 session-ticket 扩展，可通过会话 ID 恢复。
+会话 ID 采用原生会话期限。TLS1.3 的票据期限已由原生握手收敛。
 握手及应用层 ALPN 策略通过前，暂存票据不会进入节点缓存。REALITY 始终不恢复。
 同一模板的使用不扩大节点/下载腿缓存归属。冷连接和恢复连接分开验收；Vole 的
 票据策略不同于 Mihomo，恢复 hello 不宣称逐字段相同，也不伪造 PSK/binder。

@@ -106,9 +106,9 @@ impl rustls::server::ProducesTickets for ShortTickets {
 async fn selected_profiles_warm_wire_and_expired_tickets_use_real_handshakes() {
     let mut clients = Vec::new();
     for (name, profile) in [
-        ("chrome", crate::config::ClientFingerprint::Chrome133),
-        ("firefox", crate::config::ClientFingerprint::Firefox120),
-        ("safari", crate::config::ClientFingerprint::Safari16),
+        ("chrome", crate::config::ClientFingerprint::Chrome155),
+        ("firefox", crate::config::ClientFingerprint::Firefox148),
+        ("safari", crate::config::ClientFingerprint::Safari263),
         ("ios", crate::config::ClientFingerprint::Ios14),
     ] {
         for version in [&TLS12, &TLS13] {
@@ -131,7 +131,8 @@ async fn selected_profiles_warm_wire_and_expired_tickets_use_real_handshakes() {
                 65536,
             )
             .unwrap();
-            for (phase, expected) in [("cold", false), ("warm", true)] {
+            let has_resumption = name != "firefox" || version == &TLS12;
+            for (phase, expected) in [("cold", false), ("warm", has_resumption)] {
                 let (resumed, _) = observed_handshake(&client, peer.clone()).await;
                 assert_eq!(resumed, expected, "{name}/{version:?}/{phase}");
             }
@@ -142,10 +143,10 @@ async fn selected_profiles_warm_wire_and_expired_tickets_use_real_handshakes() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     for (name, version, client, peer) in clients {
         let (resumed, _) = observed_handshake(&client, peer).await;
-        // Safari16/iOS14 do not offer the TLS1.2 session-ticket extension.
-        // Their stateful session IDs have no ticket-lifetime hint to expire.
-        let stateful_id =
-            matches!(name, "safari" | "ios") && version.version == rustls::ProtocolVersion::TLSv1_2;
+        // These TLS1.2 cold offers use session IDs with a stateful peer.
+        // They have no ticket-lifetime hint to expire.
+        let stateful_id = matches!(name, "firefox" | "safari" | "ios")
+            && version.version == rustls::ProtocolVersion::TLSv1_2;
         assert_eq!(
             resumed, stateful_id,
             "{name}/{version:?}: ticket hint expiry"

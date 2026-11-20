@@ -30,7 +30,7 @@ fn profile(config: &Config) -> Option<ClientFingerprint> {
 fn named_fingerprint_is_strict_and_independent_of_certificate_pins() {
     for protocol in ["anytls", "trojan", "vmess", "vless"] {
         for (value, expected) in [
-            ("chrome", Some(ClientFingerprint::Chrome133)),
+            ("chrome", Some(ClientFingerprint::Chrome155)),
             ("none", None),
             ("\"\"", None),
         ] {
@@ -100,9 +100,9 @@ fn selected_names_resolve_to_eight_distinct_fixed_templates() {
     for protocol in ["anytls", "trojan", "vmess", "vless"] {
         let mut templates = Vec::new();
         for (name, expected) in [
-            ("chrome", ClientFingerprint::Chrome133),
-            ("firefox", ClientFingerprint::Firefox120),
-            ("safari", ClientFingerprint::Safari16),
+            ("chrome", ClientFingerprint::Chrome155),
+            ("firefox", ClientFingerprint::Firefox148),
+            ("safari", ClientFingerprint::Safari263),
             ("ios", ClientFingerprint::Ios14),
             ("android", ClientFingerprint::Android11),
             ("edge", ClientFingerprint::Edge85),
@@ -127,9 +127,9 @@ fn selected_names_resolve_to_eight_distinct_fixed_templates() {
 #[test]
 fn download_fingerprint_inherits_and_can_be_cleared_independently() {
     for (name, template) in [
-        ("chrome", ClientFingerprint::Chrome133),
-        ("firefox", ClientFingerprint::Firefox120),
-        ("safari", ClientFingerprint::Safari16),
+        ("chrome", ClientFingerprint::Chrome155),
+        ("firefox", ClientFingerprint::Firefox148),
+        ("safari", ClientFingerprint::Safari263),
     ] {
         let base = yaml(
             "vless",
@@ -143,15 +143,15 @@ fn download_fingerprint_inherits_and_can_be_cleared_independently() {
             ("\n        client-fingerprint: none", None),
             (
                 "\n        client-fingerprint: chrome",
-                Some(ClientFingerprint::Chrome133),
+                Some(ClientFingerprint::Chrome155),
             ),
             (
                 "\n        client-fingerprint: firefox",
-                Some(ClientFingerprint::Firefox120),
+                Some(ClientFingerprint::Firefox148),
             ),
             (
                 "\n        client-fingerprint: safari",
-                Some(ClientFingerprint::Safari16),
+                Some(ClientFingerprint::Safari263),
             ),
         ] {
             let text = format!("{}{extra}\n", base.trim_end());
@@ -217,9 +217,9 @@ fn download_fingerprint_inherits_and_can_be_cleared_independently() {
 #[test]
 fn reality_accepts_named_profile_without_admitting_certificate_policy() {
     for (name, expected) in [
-        ("chrome", Some(ClientFingerprint::Chrome133)),
-        ("firefox", Some(ClientFingerprint::Firefox120)),
-        ("safari", Some(ClientFingerprint::Safari16)),
+        ("chrome", Some(ClientFingerprint::Chrome155)),
+        ("firefox", Some(ClientFingerprint::Firefox148)),
+        ("safari", Some(ClientFingerprint::Safari263)),
         ("none", None),
         ("\"\"", None),
     ] {
@@ -254,10 +254,10 @@ fn ios_and_process_random_fingerprint_use_the_shared_entries() {
     let mut counts = [0; 4];
     for value in 0..12 {
         counts[match weighted_fingerprint(value) {
-            ClientFingerprint::Chrome133 => 0,
-            ClientFingerprint::Safari16 => 1,
+            ClientFingerprint::Chrome155 => 0,
+            ClientFingerprint::Safari263 => 1,
             ClientFingerprint::Ios14 => 2,
-            ClientFingerprint::Firefox120 => 3,
+            ClientFingerprint::Firefox148 => 3,
             _ => unreachable!("random keeps its four-template weights"),
         }] += 1;
     }

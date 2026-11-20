@@ -146,9 +146,9 @@ async fn selected_profiles_use_standard_h2_settings_when_the_server_supports_alp
     use crate::config::ClientFingerprint;
     let chain = chain(false);
     for profile in [
-        ClientFingerprint::Chrome133,
-        ClientFingerprint::Firefox120,
-        ClientFingerprint::Safari16,
+        ClientFingerprint::Chrome155,
+        ClientFingerprint::Firefox148,
+        ClientFingerprint::Safari263,
         ClientFingerprint::Ios14,
         ClientFingerprint::Edge85,
         ClientFingerprint::Qq111,
@@ -210,9 +210,17 @@ async fn selected_profiles_consume_tickets_once_under_concurrent_handshakes() {
             )
             .await;
             assert!(results.iter().all(|(ok, _)| *ok));
+            // Firefox 148's cold offer omits PSK modes, so this rustls peer
+            // does not issue a TLS 1.3 ticket for that connection.
+            let expected_resumed = if profile == crate::config::ClientFingerprint::Firefox148 {
+                0
+            } else {
+                capacity
+            };
             assert_eq!(
                 results.iter().filter(|(_, seen)| seen.resumed).count(),
-                capacity
+                expected_resumed,
+                "{profile:?}"
             );
             let (ok, seen) = handshake(&client, quiet_peer).await;
             assert!(ok);
@@ -240,7 +248,10 @@ async fn selected_profiles_fall_back_to_authenticated_full_handshake_on_ticket_r
             .unwrap();
             assert!(handshake(&client, peer.clone()).await.0);
             let (ok, seen) = handshake(&client, peer).await;
-            assert!(ok && seen.resumed);
+            let resumed =
+                profile != crate::config::ClientFingerprint::Firefox148 || version == &TLS12;
+            assert!(ok);
+            assert_eq!(seen.resumed, resumed, "{profile:?}/{version:?}");
             let (ok, seen) = handshake(&client, server(&chain, version, false)).await;
             assert!(ok);
             assert!(

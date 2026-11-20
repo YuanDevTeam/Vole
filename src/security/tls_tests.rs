@@ -313,7 +313,9 @@ async fn named_fingerprint_resumption_is_node_owned_and_disabled_at_zero_budget(
                 for _ in 0..2 {
                     let next = handshake(&client.clone(), peer.clone()).await;
                     assert!(next.0);
-                    assert_eq!(next.1.resumed, capacity != 0);
+                    let offers_tickets = profile != crate::config::ClientFingerprint::Firefox148
+                        || version == &TLS12;
+                    assert_eq!(next.1.resumed, capacity != 0 && offers_tickets);
                 }
                 let different_node = handshake(&make_client(), peer.clone()).await;
                 assert!(different_node.0);
@@ -354,7 +356,12 @@ async fn named_fingerprint_tickets_are_bounded_single_use_and_not_published_on_a
                 assert!(ok);
                 resumed += usize::from(seen.resumed);
             }
-            assert_eq!(resumed, capacity);
+            let expected_resumed = if profile == crate::config::ClientFingerprint::Firefox148 {
+                0
+            } else {
+                capacity
+            };
+            assert_eq!(resumed, expected_resumed, "{profile:?}");
         }
         for version in [&TLS12, &TLS13] {
             let endpoint = server(&chain, version, false);

@@ -931,9 +931,9 @@ pub struct TlsClientPolicy {
 /// A version-pinned ClientHello profile, independent of certificate pins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientFingerprint {
-    Chrome133,
-    Firefox120,
-    Safari16,
+    Chrome155,
+    Firefox148,
+    Safari263,
     Ios14,
     Android11,
     Edge85,
@@ -961,10 +961,10 @@ fn process_random_fingerprint() -> ClientFingerprint {
 
 fn weighted_fingerprint(value: u8) -> ClientFingerprint {
     match value {
-        0..=5 => ClientFingerprint::Chrome133,
-        6..=8 => ClientFingerprint::Safari16,
+        0..=5 => ClientFingerprint::Chrome155,
+        6..=8 => ClientFingerprint::Safari263,
         9..=10 => ClientFingerprint::Ios14,
-        11 => ClientFingerprint::Firefox120,
+        11 => ClientFingerprint::Firefox148,
         _ => unreachable!("fingerprint weight outside its bounded random range"),
     }
 }
@@ -975,9 +975,9 @@ fn parse_client_fingerprint(value: Option<&str>) -> Result<Option<ClientFingerpr
         Some(_) if !cfg!(feature = "tls-fingerprint") => {
             invalid("client-fingerprint is not compiled in")
         }
-        Some("chrome") => Ok(Some(ClientFingerprint::Chrome133)),
-        Some("firefox") => Ok(Some(ClientFingerprint::Firefox120)),
-        Some("safari") => Ok(Some(ClientFingerprint::Safari16)),
+        Some("chrome") => Ok(Some(ClientFingerprint::Chrome155)),
+        Some("firefox") => Ok(Some(ClientFingerprint::Firefox148)),
+        Some("safari") => Ok(Some(ClientFingerprint::Safari263)),
         Some("ios") => Ok(Some(ClientFingerprint::Ios14)),
         Some("android") => Ok(Some(ClientFingerprint::Android11)),
         Some("edge") => Ok(Some(ClientFingerprint::Edge85)),

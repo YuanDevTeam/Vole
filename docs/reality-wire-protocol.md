@@ -4,7 +4,7 @@
 
 ## 版本边界
 
-当前 REALITY 实现基于自有 boring 5.2.0 fork 的原生 BoringSSL 扩展。线上行为由本文和 fork 内的确定性测试向量共同约束。升级 TLS 后端、加密提供方或握手字节时，必须重新验证普通 TLS、REALITY、并发、取消和目标平台构建。
+当前 REALITY 实现基于自有 boring fork 的原生 BoringSSL 扩展。线上行为由本文和 fork 内的确定性测试向量共同约束。升级 TLS 后端、加密提供方或握手字节时，必须重新验证普通 TLS、REALITY、并发、取消和目标平台构建。
 
 V1 只支持：
 
@@ -27,10 +27,9 @@ V1 只支持：
 Vole 不能读取该私钥，也不能为两个用途生成不同密钥。
 
 原生封装按实际 GroupID 找到唯一 X25519 share，不依赖 share 下标。Firefox 可保留
-额外 P-256 share，但认证始终绑定同一 X25519 临时私钥。Chrome133 的普通 TLS
-ML-KEM group/share 在 classic REALITY 中裁剪。显式允许混合时保留模板中的真实 share；
-Chrome133 与无命名指纹提供 X25519MLKEM768/X25519 双 share，其他 TLS1.3 模板保留
-各自经典 share。若同时存在独立 X25519，优先用它派生认证，否则使用
+额外 P-256 share，但认证始终绑定同一 X25519 临时私钥。classic REALITY 中裁剪混合 group/share。
+显式允许混合时保留模板中的真实 share。Chrome155、Firefox148、Safari26.3 和无命名指纹提供
+X25519MLKEM768/X25519 share，其他 TLS1.3 模板保留各自经典 share。若同时存在独立 X25519，优先用它派生认证，否则使用
 实际混合 share 内的 X25519 分量，与 Mihomo 的认证取值一致。
 重复/缺失认证 share、低阶点均失败。服务端可在本次握手选择允许的经典或混合组，
 不因此重试；HRR 仍立即失败。Android/360 模板仅有 TLS1.2，不能用于 REALITY。REALITY 身份
@@ -40,7 +39,7 @@ ClientHello 的 legacy session ID 固定为 32 字节。生成密文前先把该
 
 `signature_algorithms` 保留所选模板的列表；REALITY 不强行加入 Ed25519。原生实现仅在临时证书先通过 REALITY HMAC 认证后，允许它的 Ed25519 CertificateVerify，并仍验证签名。该局部例外不放宽普通 TLS 的签名算法检查。
 
-命名指纹保留 TLS1.2 的版本/cipher/扩展声明（Safari 的 TLS1.0/1.1 仍裁剪），
+命名指纹保留 TLS1.2 的版本/cipher/扩展声明，
 而非先用 TLS1.3-only 的通用编码过滤模板。原生 REALITY 在 ServerHello 阶段独立拒绝
 TLS1.2，且仍禁止恢复、0-RTT 和普通证书兜底；声明并不代表允许降级协商。
 

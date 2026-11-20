@@ -1038,7 +1038,7 @@ mod http_reuse_security_memory_tests {
         let profiles = [
             None,
             #[cfg(feature = "tls-fingerprint")]
-            Some(crate::config::ClientFingerprint::Chrome133),
+            Some(crate::config::ClientFingerprint::Chrome155),
         ];
         for profile in profiles {
             let inline = constructed_tls(Some(identity.clone()), None, profile);

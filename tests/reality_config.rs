@@ -101,7 +101,7 @@ fn download_inherits_or_replaces_the_entire_reality_object_without_leaf_merging(
     assert!(download.short_id.is_empty());
     assert_eq!(
         download.client_fingerprint,
-        Some(ClientFingerprint::Chrome133)
+        Some(ClientFingerprint::Chrome155)
     );
 
     let mut cleared = node;

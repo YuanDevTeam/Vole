@@ -268,7 +268,7 @@ sniffer:
 # - 公共节点 smux 支持 h2mux/smux/yamux、padding/only-tcp 与池阈值；与 Vision 互斥。
 # - random 在进程首次按 Chrome/Safari/iOS/Firefox = 6:3:2:1 选定后稳定复用。
 # - client-fingerprint 接受 none/chrome/firefox/safari/ios/android/edge/"360"/qq/random；
-#   chrome=Chrome133，firefox=Firefox120，safari=Safari16.0；android/360只有TLS1.2能力；节点缺省关闭。
+#   chrome=Chrome155，firefox=Firefox148，safari=Safari26.3；android/360只有TLS1.2能力；节点缺省关闭。
 #   适用于标准 TCP TLS/REALITY，不改变证书 fingerprint；下载腿缺省继承、
 #   显式名称覆盖、none/空串清除，转 H3/明文必须清除指纹。
 #   不声明TLS ALPS，H2沿标准SETTINGS/ACK；意外协商的非空设置仍拒绝，见docs/tls-client-fingerprint.md。

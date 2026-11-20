@@ -50,9 +50,9 @@ fn test_profiles() -> &'static [Option<crate::config::ClientFingerprint>] {
         use crate::config::ClientFingerprint::*;
         &[
             None,
-            Some(Chrome133),
-            Some(Firefox120),
-            Some(Safari16),
+            Some(Chrome155),
+            Some(Firefox148),
+            Some(Safari263),
             Some(Ios14),
         ]
     }

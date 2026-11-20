@@ -71,9 +71,9 @@ fn shadowtls_preserves_policy_values_and_shared_profiles() {
     for (name, expected) in [
         ("", None),
         ("none", None),
-        ("chrome", Some(ClientFingerprint::Chrome133)),
-        ("firefox", Some(ClientFingerprint::Firefox120)),
-        ("safari", Some(ClientFingerprint::Safari16)),
+        ("chrome", Some(ClientFingerprint::Chrome155)),
+        ("firefox", Some(ClientFingerprint::Firefox148)),
+        ("safari", Some(ClientFingerprint::Safari263)),
         ("ios", Some(ClientFingerprint::Ios14)),
     ] {
         let mut n = node();
@@ -86,10 +86,10 @@ fn shadowtls_preserves_policy_values_and_shared_profiles() {
     assert!(matches!(
         selected,
         Some(
-            ClientFingerprint::Chrome133
-                | ClientFingerprint::Safari16
+            ClientFingerprint::Chrome155
+                | ClientFingerprint::Safari263
                 | ClientFingerprint::Ios14
-                | ClientFingerprint::Firefox120
+                | ClientFingerprint::Firefox148
         )
     ));
     assert_eq!(policy(random).client_fingerprint, selected);

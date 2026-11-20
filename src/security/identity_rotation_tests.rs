@@ -174,7 +174,7 @@ async fn consecutive_rotations_preserve_old_transports_and_reject_late_old_ticke
     #[cfg(not(feature = "tls-fingerprint"))]
     let profiles = [None];
     #[cfg(feature = "tls-fingerprint")]
-    let profiles = [None, Some(crate::config::ClientFingerprint::Chrome133)];
+    let profiles = [None, Some(crate::config::ClientFingerprint::Chrome155)];
     for profile in profiles {
         let files = Files::new(&a);
         let context = trusted(&peer);
@@ -375,7 +375,7 @@ fn dynamic_ech_rebuilds_share_the_native_owner_without_resolving_dns() {
         "fixture.invalid",
         TlsClientOptions {
             ech: vless.security.as_tls().unwrap().ech.clone(),
-            client_fingerprint: Some(crate::config::ClientFingerprint::Chrome133),
+            client_fingerprint: Some(crate::config::ClientFingerprint::Chrome155),
             identity: Some(identity),
             ..Default::default()
         },
@@ -441,7 +441,7 @@ fn discarded_native_candidate_releases_its_requirement_and_cached_representation
     let candidate = rotating_client(
         &context,
         identity.clone(),
-        Some(crate::config::ClientFingerprint::Chrome133),
+        Some(crate::config::ClientFingerprint::Chrome155),
     );
     assert!(source.native_required());
     let cached = Arc::downgrade(&identity.snapshot().material.native().unwrap());
