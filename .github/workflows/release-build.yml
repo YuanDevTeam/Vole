@@ -1,0 +1,394 @@
+name: Build release artifacts
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Version tag to validate for a tagged release
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  UV_PYTHON_PREFERENCE: only-system
+  UV_PYTHON_DOWNLOADS: never
+  VOLE_RELEASE_TAG: ${{ inputs.tag }}
+  VOLE_RELEASE_REPOSITORY: ${{ github.repository }}
+
+jobs:
+  cli:
+    name: CLI ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cli-linux-amd64
+            label: Linux amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            platform: linux
+            archive: vole-linux-amd64.gz
+          - name: cli-linux-arm64
+            label: Linux arm64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            platform: linux
+            archive: vole-linux-arm64.gz
+          - name: cli-windows-wintun-amd64
+            label: Windows amd64
+            target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            platform: windows
+            archive: vole-windows-amd64.zip
+          - name: cli-windows-wintun-arm64
+            label: Windows arm64
+            target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            platform: windows
+            archive: vole-windows-arm64.zip
+          - name: cli-darwin-amd64
+            label: macOS amd64
+            target: x86_64-apple-darwin
+            runner: macos-26-intel
+            platform: darwin
+            archive: vole-darwin-amd64.gz
+          - name: cli-darwin-arm64
+            label: macOS arm64
+            target: aarch64-apple-darwin
+            runner: macos-26
+            platform: darwin
+            archive: vole-darwin-arm64.gz
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+          check-latest: true
+          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+      - name: Linux native dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake ninja-build perl pkg-config
+      - name: Cache native Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
+          workspaces: ". -> target"
+          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR VOLE BORING AWS_LC LIBCLANG BINDGEN
+          cache-bin: "false"
+      - name: Build and package production CLI
+        shell: bash
+        env:
+          VOLE_TARGET: ${{ matrix.target }}
+          VOLE_GROUP: ${{ matrix.name }}
+          VOLE_ARCHIVE: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          args=(build-cli --target "$VOLE_TARGET" --output "dist/release/$VOLE_GROUP")
+          if [[ -n "$VOLE_RELEASE_TAG" ]]; then args+=(--tag "$VOLE_RELEASE_TAG"); fi
+          # The CLI helper selects windows-wintun on MSVC, never UWP or FFI.
+          uv run --project scripts --locked python -m vole_scripts.release "${args[@]}"
+          test -f "dist/release/$VOLE_GROUP/$VOLE_ARCHIVE"
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: vole-release-build-${{ matrix.name }}-${{ github.sha }}
+          path: dist/release/${{ matrix.name }}/${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  ffi:
+    name: FFI ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ffi-android
+            label: Android
+            platform: android
+            runner: ubuntu-24.04
+            targets: aarch64-linux-android,x86_64-linux-android
+            target: ""
+            backend: ""
+            archive: vole-ffi-android.tar.gz
+          - name: ffi-linux-amd64
+            label: Linux amd64
+            platform: linux
+            runner: ubuntu-24.04
+            targets: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-gnu
+            backend: ""
+            archive: vole-ffi-linux-amd64.tar.gz
+          - name: ffi-linux-arm64
+            label: Linux arm64
+            platform: linux
+            runner: ubuntu-24.04-arm
+            targets: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-gnu
+            backend: ""
+            archive: vole-ffi-linux-arm64.tar.gz
+          - name: ffi-windows-wintun-amd64
+            label: Windows amd64 (Wintun)
+            platform: windows
+            runner: windows-2025
+            targets: x86_64-pc-windows-msvc
+            target: x86_64-pc-windows-msvc
+            backend: wintun
+            archive: vole-ffi-windows-wintun-amd64.zip
+          - name: ffi-windows-wintun-arm64
+            label: Windows arm64 (Wintun)
+            platform: windows
+            runner: windows-11-arm
+            targets: aarch64-pc-windows-msvc
+            target: aarch64-pc-windows-msvc
+            backend: wintun
+            archive: vole-ffi-windows-wintun-arm64.zip
+          - name: ffi-windows-uwp-amd64
+            label: Windows amd64 (UWP)
+            platform: windows
+            runner: windows-2025
+            targets: x86_64-pc-windows-msvc
+            target: x86_64-pc-windows-msvc
+            backend: uwp
+            archive: vole-ffi-windows-uwp-amd64.zip
+          - name: ffi-windows-uwp-arm64
+            label: Windows arm64 (UWP)
+            platform: windows
+            runner: windows-11-arm
+            targets: aarch64-pc-windows-msvc
+            target: aarch64-pc-windows-msvc
+            backend: uwp
+            archive: vole-ffi-windows-uwp-arm64.zip
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.targets }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+          check-latest: true
+          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+      - name: Locked source
+        run: cargo fetch --locked
+      - name: Audit the official h2 dependency
+        if: matrix.name == 'ffi-linux-amd64'
+        run: uv run --project scripts --locked python -m vole_scripts.h2_source
+      - name: Linux native dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake ninja-build perl pkg-config
+      - name: Android toolchain
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          ndk_package="$("$sdkmanager" --list --channel=0 | awk -F '|' '
+            NF == 1 { split($0, fields, " "); $1 = fields[1]; $2 = fields[2] }
+            { gsub(/[[:space:]]/, "", $1); gsub(/[[:space:]]/, "", $2) }
+            $1 ~ /^ndk[;\/]30\.[0-9]+\.[0-9]+$/ &&
+              $2 ~ /^30\.[0-9]+\.[0-9]+$/ {
+                sub(/^ndk\//, "ndk;", $1); print $1
+              }
+          ' | sort -Vu | tail -n 1)"
+          test -n "$ndk_package" || { echo "Stable NDK r30 is unavailable" >&2; exit 1; }
+          "$sdkmanager" --channel=0 "$ndk_package"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ndk_package#ndk;}" >> "$GITHUB_ENV"
+      - name: Cache native Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
+          workspaces: ". -> target"
+          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR ANDROID_NDK_HOME VOLE BORING AWS_LC LIBCLANG BINDGEN
+          cache-bin: "false"
+      - name: Build and package production FFI
+        shell: bash
+        env:
+          VOLE_PLATFORM: ${{ matrix.platform }}
+          VOLE_TARGET: ${{ matrix.target }}
+          VOLE_BACKEND: ${{ matrix.backend }}
+          VOLE_GROUP: ${{ matrix.name }}
+          VOLE_ARCHIVE: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          args=(build-ffi --platform "$VOLE_PLATFORM" --output "dist/release/$VOLE_GROUP")
+          if [[ -n "$VOLE_TARGET" ]]; then args+=(--target "$VOLE_TARGET"); fi
+          if [[ -n "$VOLE_BACKEND" ]]; then args+=(--backend "$VOLE_BACKEND"); fi
+          if [[ -n "$VOLE_RELEASE_TAG" ]]; then args+=(--tag "$VOLE_RELEASE_TAG"); fi
+          uv run --project scripts --locked python -m vole_scripts.release "${args[@]}"
+          test -f "dist/release/$VOLE_GROUP/$VOLE_ARCHIVE"
+      - name: Check unpackaged Windows COM lifecycle
+        if: matrix.platform == 'windows' && matrix.backend == 'uwp'
+        shell: bash
+        env:
+          VOLE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$VOLE_TARGET" in
+            x86_64-pc-windows-msvc) architecture=x64 ;;
+            aarch64-pc-windows-msvc) architecture=arm64 ;;
+            *) exit 1 ;;
+          esac
+          python scripts/check_windows_com.py --dll "dist/windows/$architecture/uwp/vole.dll"
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: vole-release-build-${{ matrix.name }}-${{ github.sha }}
+          path: dist/release/${{ matrix.name }}/${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  apple_build:
+    name: FFI ${{ matrix.label }}
+    runs-on: macos-26
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: iOS
+            target: aarch64-apple-ios
+          - label: iOS simulator
+            target: aarch64-apple-ios-sim
+          - label: macOS arm64
+            target: aarch64-apple-darwin
+          - label: macOS amd64
+            target: x86_64-apple-darwin
+          - label: tvOS
+            target: aarch64-apple-tvos
+          - label: tvOS simulator
+            target: aarch64-apple-tvos-sim
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+          check-latest: true
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+      - name: Cache native Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-ffi-apple-${{ matrix.target }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
+          workspaces: ". -> target"
+          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR VOLE BORING AWS_LC LIBCLANG BINDGEN
+          cache-bin: "false"
+      - name: Build Apple static library
+        shell: bash
+        env:
+          VOLE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          args=(build-apple-target --target "$VOLE_TARGET"
+            --output "dist/apple-targets/$VOLE_TARGET")
+          if [[ -n "$VOLE_RELEASE_TAG" ]]; then args+=(--tag "$VOLE_RELEASE_TAG"); fi
+          uv run --project scripts --locked python -m vole_scripts.release "${args[@]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vole-apple-${{ matrix.target }}-${{ github.sha }}
+          path: dist/apple-targets
+          if-no-files-found: error
+          retention-days: 14
+
+  apple:
+    name: FFI Apple
+    needs: apple_build
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+          check-latest: true
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: vole-apple-*-${{ github.sha }}
+          path: dist/apple-targets
+          merge-multiple: true
+      - name: Assemble and package XCFramework
+        run: |
+          uv run --project scripts --locked python -m vole_scripts.release assemble-apple \
+            --inputs dist/apple-targets --output dist/release/ffi-apple
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vole-release-build-ffi-apple-${{ github.sha }}
+          path: dist/release/ffi-apple/vole-ffi-apple.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    name: Assemble
+    needs: [cli, ffi, apple]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+          check-latest: true
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: vole-release-build-*-${{ github.sha }}
+          path: dist/release-incoming
+      - name: Collect archives and write release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(assemble --inputs dist/release-incoming --output dist/release-ready/assets
+            --notes dist/release-ready/notes.md --repository "$VOLE_RELEASE_REPOSITORY")
+          if [[ -n "$VOLE_RELEASE_TAG" ]]; then args+=(--tag "$VOLE_RELEASE_TAG"); fi
+          uv run --project scripts --locked python -m vole_scripts.release "${args[@]}"
+      - name: Upload release archives and notes
+        uses: actions/upload-artifact@v7
+        with:
+          name: vole-release-ready-${{ github.sha }}
+          path: |
+            dist/release-ready/assets/*.gz
+            dist/release-ready/assets/*.zip
+            dist/release-ready/notes.md
+          if-no-files-found: error
+          retention-days: 14

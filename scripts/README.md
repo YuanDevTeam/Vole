@@ -64,8 +64,13 @@ CI 使用 `deps --github-env "$GITHUB_ENV"` 自动传给后续步骤。
 
 ## 发布
 
-[Release workflow](../.github/workflows/release.yml) 在 `vX.Y.Z` tag push 时构建并发布，
-tag 必须匹配 Cargo 版本。`main`、手动运行和标签使用完整构建矩阵，成功后汇总十四个归档。
+`main` 上的 [Tests workflow](../.github/workflows/test.yml) 直接调用只读的
+[Release build](../.github/workflows/release-build.yml)，构建和汇总全部十四个归档。
+
+[Release workflow](../.github/workflows/release.yml) 在手动运行或推送 `vX.Y.Z` 标签时
+也调用 Release build。手动运行完成后可从该运行的 Artifacts 下载同一套归档。标签必须与
+Cargo 包版本完全匹配，全部归档通过校验后发布到 GitHub Releases。
+
 [PR workflow](../.github/workflows/test.yml) 运行 Linux Debug 和 Quality，并在 macOS ARM64 和
 Windows ARM64 上构建原生 CLI 和 FFI。iOS、tvOS 和 Android 按相关文件改动触发。
 CI 中的 Python 均由 `actions/setup-python` 安装，选择最新稳定 Python 3；uv 仅使用系统解释器，
