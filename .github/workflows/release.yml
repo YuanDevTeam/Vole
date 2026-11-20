@@ -199,6 +199,7 @@ jobs:
       - name: Locked source
         run: cargo fetch --locked
       - name: Audit the official h2 dependency
+        if: matrix.name == 'ffi-linux-amd64'
         run: uv run --project scripts --locked python -m vole_scripts.h2_source
       - name: Linux native dependencies
         if: matrix.platform == 'linux'

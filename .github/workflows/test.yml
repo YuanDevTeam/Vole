@@ -18,19 +18,15 @@ env:
 
 jobs:
   client-contracts:
-    name: ${{ matrix.name }}
+    name: ${{ fromJSON('{"debug":"Core (Debug)","release":"Core (Release)","features":"Quality"}')[matrix.profile] }}
     runs-on: ubuntu-26.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Core (Debug)
-            profile: debug
-          - name: Core (Release)
-            profile: release
-          - name: Quality
-            profile: features
+        profile: >-
+          ${{ fromJSON(github.event_name == 'pull_request'
+            && '["debug","features"]' || '["debug","release","features"]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -224,11 +220,6 @@ jobs:
         if: matrix.profile == 'features'
         run: |
           cargo test --locked -p vole-blake3-raw
-      - name: H3 memory fixtures
-        if: matrix.profile == 'features'
-        run: |
-          cargo test --locked --features cli --lib transport::quiche_h3::tests::
-          cargo test --locked --features cli --lib transport::quinn_h3::tests::
       - name: Production and netstack clippy
         if: matrix.profile == 'features'
         run: |
@@ -236,7 +227,7 @@ jobs:
           cargo clippy --locked --no-default-features --features cli --lib --bin vole -- -D warnings
           cargo clippy --locked --all-features --lib --bins -- -D warnings
           cargo clippy --locked --manifest-path crates/vole-netstack/Cargo.toml --all-targets -- -D warnings
-      - name: Run memory-only ${{ matrix.name }}
+      - name: Run memory-only core tests
         if: matrix.profile != 'features'
         shell: bash
         env:
@@ -273,7 +264,7 @@ jobs:
           # Keep this explicit allowlist: unfiltered legacy tests may open host listeners.
           filters=(
             geodata:: routing:: security:: outbound::vless::encryption config::
-            connections::tests:: routing::diagnostics::tests:: dialer::connections::tests::
+            connections::tests::
             polled_datagram_
             resource::http::tests:: fake_ip_ sniffing::tests:: tcp_sniffer::tests::
             resource::age_provider::tests:: resource::bundle::tests:: resource::bundle_limits::tests::
@@ -290,7 +281,7 @@ jobs:
             h2_remote_goaway_moves_unsent_post_to_fresh_origin_without_interrupting_inflight_get
             outbound::hysteria2:: outbound::shadowsocks::tests::official_tcp_
             outbound::anytls:: outbound::uot:: outbound::tuic:: transport::h2_write::tests::
-            outbound::trusttunnel:: outbound::mieru:: outbound::masque:: security::masque:: config::masque::
+            outbound::trusttunnel:: outbound::mieru:: outbound::masque::
             transport::quic:: transport::quinn_h3:: transport::quiche_h3:: transport::masque_codec:: transport::h3_connect::
             transport::smux::tests:: transport::sing_mux::tests::
             grpc_duplex_pool_keeps_response
@@ -336,7 +327,11 @@ jobs:
           )
           for test_name in "${exact_tests[@]}"; do run_test 1 --lib "$test_name" -- --exact; done
           run_test 1 --test quic_datagram_foundations pending_send_is_not_restarted_and_stop_cancels_without_waiting_for_writable -- --exact
-      - name: Feature admission and complete compilation
+      - name: Compile all test targets
+        if: matrix.profile == 'debug'
+        # Historical listener fixtures must only be compiled on CI hosts.
+        run: cargo test --locked --all-features --all-targets --no-run
+      - name: Feature admission
         if: matrix.profile == 'features'
         shell: bash
         run: |
@@ -357,7 +352,7 @@ jobs:
             cargo check --locked --no-default-features --features "outbound-$protocol" --lib
             run_test 1 --features "outbound-$protocol" --lib runtime::tests::integration_feature_admission_is_explicit_without_opening_sockets -- --exact
           done
-          for feature in outbound-http inbound-http inbound-socks5 stream-transport quic-transport quinn-h3-transport quiche-h3-transport dns-quic sing-mux shadow-tls-v3 tun invoke ffi cli windows-wintun windows-uwp; do
+          for feature in outbound-http inbound-http inbound-socks5 stream-transport quic-transport quinn-h3-transport quiche-h3-transport dns-quic sing-mux shadow-tls-v3 tun invoke ffi windows-wintun windows-uwp; do
             cargo check --locked --no-default-features --features "$feature" --lib
           done
           dns_graph="$(mktemp "$RUNNER_TEMP/vole-dns-graph.XXXXXX")"
@@ -367,19 +362,20 @@ jobs:
             exit 1
           fi
           rm -f "$dns_graph"
-          cargo check --locked --no-default-features --features cli --bin vole
           run_test 2 --test feature_foundations --test hysteria2_config
           cargo check --locked --lib
-          # Compilation only: historical listener fixtures must not execute on CI hosts.
-          cargo test --locked --all-features --all-targets --no-run
-          # The unified release matrix builds CLI and FFI with the unchanged
-          # production release profile, including both macOS targets.
       - name: Memory-only netstack tests
         if: matrix.profile == 'features'
         run: cargo test --locked --manifest-path crates/vole-netstack/Cargo.toml --all-targets
 
+  native-build:
+    name: Native
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/pr-native.yml
+
   release-build:
     name: Build
+    if: github.event_name == 'push'
     # Reusable-workflow permissions are statically bounded by the caller, even
     # for skipped jobs. Build/assemble jobs downgrade to read; only a direct
     # release.yml tag push can execute the callee's write-permission publish job.
