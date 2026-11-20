@@ -390,7 +390,7 @@ pub fn snapshot() -> serde_json::Value {
 
 #[cfg(feature = "http-diagnostics")]
 mod enabled {
-    use super::{BodyPoint, Counter, Timing};
+    use super::{BodyPoint, Counter};
     use crate::http_processing::body::Bypass;
     use serde_json::{Map, Value, json};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -665,7 +665,7 @@ mod enabled {
             ticks: usize,
             succeeded: bool,
         ) {
-            self.timings[Timing::Evaluation as usize].record(overall);
+            self.timings[super::Timing::Evaluation as usize].record(overall);
             self.ticks.record(ticks as u128);
             let outcome = usize::from(!succeeded);
             for (index, micros) in stages.into_iter().enumerate() {
