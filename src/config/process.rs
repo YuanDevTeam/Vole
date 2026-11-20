@@ -170,8 +170,11 @@ pub(crate) fn uid_ranges(payload: &str) -> Result<Vec<UidRange>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     #[test]
     fn process_predicates_preserve_unicode_and_shared_budget() {
+        let decision = RuleDecision::with_fixed_match_duration(Duration::ZERO);
         for (kind, pattern, value) in [
             ("PROCESS-NAME", "应用", "应用"),
             ("PROCESS-PATH", "/Applications/WEB", "/applications/web"),
@@ -184,20 +187,20 @@ mod tests {
             ("PROCESS-NAME-REGEX", "(?=应用)应用$", "应用"),
             ("PROCESS-PATH-REGEX", "^/路径/.*$", "/路径/程序"),
         ] {
-            assert!(
+            assert_eq!(
                 ProcessRule::parse(kind, pattern)
                     .unwrap()
-                    .matches(value, &Default::default())
-                    .unwrap()
+                    .matches(value, &decision),
+                Ok(true),
+                "{kind} {pattern:?}"
             );
         }
         assert!(
             !ProcessRule::parse("PROCESS-NAME-REGEX", ".*")
                 .unwrap()
-                .matches("", &Default::default())
+                .matches("", &decision)
                 .unwrap()
         );
-        let decision = RuleDecision::default();
         let token = tokio_util::sync::CancellationToken::new();
         token.cancel();
         decision.set_cancellation(token);

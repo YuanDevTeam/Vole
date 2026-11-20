@@ -47,6 +47,8 @@ pub(crate) struct DecisionBudget {
     work: u64,
     backtracks: usize,
     match_time: Duration,
+    #[cfg(test)]
+    fixed_match_duration: Option<Duration>,
     failure: Option<MatchFailure>,
     cancellation: Vec<CancellationToken>,
     deadline: Option<Instant>,
@@ -62,6 +64,8 @@ impl DecisionBudget {
             work: DECISION_WORK,
             backtracks: DECISION_BACKTRACKS,
             match_time: Duration::ZERO,
+            #[cfg(test)]
+            fixed_match_duration: None,
             failure: None,
             cancellation: Vec::new(),
             deadline: None,
@@ -123,6 +127,8 @@ impl DecisionBudget {
         duration: Duration,
         cancel: Option<&CancellationToken>,
     ) -> std::result::Result<(), MatchFailure> {
+        #[cfg(test)]
+        let duration = self.fixed_match_duration.unwrap_or(duration);
         self.match_time = self.match_time.saturating_add(duration);
         if self.match_time > DECISION_MATCH_TIME {
             return self.fail(MatchFailure::Budget);
@@ -156,6 +162,14 @@ impl PartialEq for RuleDecision {
 }
 impl Eq for RuleDecision {}
 impl RuleDecision {
+    #[cfg(test)]
+    pub(super) fn with_fixed_match_duration(duration: Duration) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(DecisionBudget {
+            fixed_match_duration: Some(duration),
+            ..DecisionBudget::new()
+        })))
+    }
+
     pub(crate) async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
         ACTIVE_DECISION.scope(self.clone(), future).await
     }
@@ -723,6 +737,7 @@ mod tests {
     use super::*;
     #[test]
     fn common_domain_expressions_compile_once_and_match() {
+        let decision = RuleDecision::with_fixed_match_duration(Duration::ZERO);
         for (pattern, domain) in [
             (r"^(?!internal\.)[a-z0-9.-]+(?=\.test$)", "Api.Example.TEST"),
             (r"(?<=edge\.)[a-z]+(?<!private)\.test$", "edge.public.test"),
@@ -740,37 +755,29 @@ mod tests {
             ),
         ] {
             let regex = DomainRegex::new(pattern).unwrap();
-            assert!(
-                regex
-                    .match_bounded(domain, &mut DecisionBudget::new(), None)
-                    .unwrap()
-            );
+            assert_eq!(regex.is_match(domain, &decision), Ok(true), "{pattern}");
             assert_eq!(regex, regex.clone());
             assert_eq!(format!("{regex:?}"), "DomainRegex { .. }");
         }
-        assert!(
+        assert_eq!(
             DomainRegex::new("")
                 .unwrap()
-                .is_match("api.test", &Default::default())
-                .unwrap()
+                .is_match("api.test", &decision),
+            Ok(true)
         );
         let fast = DomainRegex::new(r"(?i)^cdn[0-9]+\.test$").unwrap();
         assert!(matches!(fast.0.engine, Engine::Linear(_)));
-        assert!(
-            fast.match_bounded("CDN7.test", &mut DecisionBudget::new(), None)
-                .unwrap()
-        );
-        assert!(
-            !fast
-                .match_bounded("other.test", &mut DecisionBudget::new(), None)
-                .unwrap()
-        );
+        assert_eq!(fast.is_match("CDN7.test", &decision), Ok(true));
+        assert_eq!(fast.is_match("other.test", &decision), Ok(false));
     }
     #[test]
     fn domain_decision_budget_is_shared_sticky_and_cancelled() {
         let regex = DomainRegex::new(r"(?=api)api\.test$").unwrap();
-        let mut budget = DecisionBudget::new();
-        budget.backtracks = 2 * (CALL_BACKTRACKS + 1);
+        let mut budget = DecisionBudget {
+            backtracks: 2 * (CALL_BACKTRACKS + 1),
+            fixed_match_duration: Some(Duration::ZERO),
+            ..DecisionBudget::new()
+        };
         assert!(regex.match_bounded("api.test", &mut budget, None).unwrap());
         assert!(regex.match_bounded("api.test", &mut budget, None).unwrap());
         assert_eq!(
@@ -801,5 +808,17 @@ mod tests {
                 .match_bounded(&"a".repeat(50), &mut DecisionBudget::new(), None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn elapsed_match_budget_accumulates_and_stays_exhausted() {
+        let mut budget = DecisionBudget::new();
+        assert_eq!(budget.finish(Duration::from_millis(1), None), Ok(()));
+        assert_eq!(budget.finish(Duration::from_millis(1), None), Ok(()));
+        assert_eq!(
+            budget.finish(Duration::from_nanos(1), None),
+            Err(MatchFailure::Budget)
+        );
+        assert_eq!(budget.visit(None), Err(MatchFailure::Budget));
     }
 }
