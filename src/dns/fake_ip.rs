@@ -5,7 +5,7 @@ use crate::config::{
 };
 use crate::routing::{GeoMatcher, RoutingContext};
 use crate::session::Destination;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, backends::FileBackend};
 use std::{
     collections::HashMap,
     io,
@@ -156,7 +156,7 @@ impl FakePools {
                 }
                 Database::builder()
                     .set_cache_size(2 * 1024 * 1024)
-                    .create_file(file)
+                    .create_with_backend(FileBackend::new(file))
                     .map(Arc::new)
                     .map_err(storage_error)
             })

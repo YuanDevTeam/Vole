@@ -96,26 +96,8 @@ fn read_pair(files: &(PathBuf, PathBuf)) -> io::Result<Arc<CertifiedKey>> {
     pair(&certificate, &key)
 }
 
-struct OsRandom;
-impl rsa::rand_core::CryptoRng for OsRandom {}
-impl rsa::rand_core::RngCore for OsRandom {
-    fn next_u32(&mut self) -> u32 {
-        rand::random()
-    }
-    fn next_u64(&mut self) -> u64 {
-        rand::random()
-    }
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        rand::fill(dest);
-    }
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
-        self.fill_bytes(dest);
-        Ok(())
-    }
-}
-
 fn generated_pair() -> io::Result<Arc<CertifiedKey>> {
-    let key = rsa::RsaPrivateKey::new(&mut OsRandom, 2048).map_err(|_| invalid())?;
+    let key = rsa::PrivateKey::new(&mut rand::rng(), 2048).map_err(|_| invalid())?;
     let der = key.to_pkcs8_der().map_err(|_| invalid())?;
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der.as_bytes()));
     let key_pair = rcgen::KeyPair::from_der_and_sign_algo(&key_der, &rcgen::PKCS_RSA_SHA256)

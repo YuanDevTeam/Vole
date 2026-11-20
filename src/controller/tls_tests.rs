@@ -178,9 +178,9 @@ async fn controller_secure_tls_generates_random_rsa2048_with_matching_signing_ke
     assert_eq!(key.key.algorithm(), rustls::SignatureAlgorithm::RSA);
     let certificate = rustls::server::ParsedCertificate::try_from(&key.cert[0]).unwrap();
     let public_key =
-        rsa::RsaPublicKey::from_public_key_der(certificate.subject_public_key_info().as_ref())
+        rsa::PublicKey::from_public_key_der(certificate.subject_public_key_info().as_ref())
             .unwrap();
-    assert_eq!(public_key.n().bits(), 2048);
+    assert_eq!(public_key.n().bit_width(), 2048);
     let signer = key
         .key
         .choose_scheme(&[rustls::SignatureScheme::RSA_PSS_SHA256])
