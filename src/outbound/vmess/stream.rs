@@ -956,3 +956,11 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_h2_memory_tests.rs"]
+mod legacy_h2_memory_tests;
+
+#[cfg(all(test, feature = "inbound-http"))]
+#[path = "http_cover_reuse_memory_tests.rs"]
+pub(super) mod http_cover_reuse_memory_tests;

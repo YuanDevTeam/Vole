@@ -584,18 +584,24 @@ impl Grpc {
     ) -> Poll<io::Result<usize>> {
         let ack = self.coalesced.as_ref().expect("private h2mux writer");
         ack.check(cx)?;
-        if self.send.poll_reset(cx).is_ready() {
-            ack.fail(io::ErrorKind::BrokenPipe);
-            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
-        }
         if input.is_empty() {
+            if self.send.poll_reset(cx).is_ready() {
+                ack.fail(io::ErrorKind::BrokenPipe);
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
             return Poll::Ready(Ok(0));
         }
         let wanted = input.len().min(CHUNK);
         self.send.reserve_capacity(wanted);
-        let count = ready!(self.send.poll_capacity(cx))
-            .ok_or(io::ErrorKind::BrokenPipe)?
-            .map_err(|_| io::ErrorKind::BrokenPipe)?;
+        // h2 checks closed state before granting capacity and again before
+        // buffering DATA. drain keeps its reset waiter while receipts are held.
+        let count = match ready!(self.send.poll_capacity(cx)) {
+            Some(Ok(count)) => count,
+            _ => {
+                ack.fail(io::ErrorKind::BrokenPipe);
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+        };
         let count = wanted.min(count);
         if count == 0 {
             cx.waker().wake_by_ref();
@@ -608,8 +614,11 @@ impl Grpc {
             ack.fail(io::ErrorKind::BrokenPipe);
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
-        // Retain demand for accepted buffered DATA, not the caller's unaccepted tail.
-        self.send.reserve_capacity(0);
+        // Full acceptance leaves only buffered DATA demand in h2. A partial
+        // write must return its unaccepted tail before the caller can go idle.
+        if count < wanted {
+            self.send.reserve_capacity(0);
+        }
         // The existing h2 capacity includes max_send_buffer_size. No private
         // tail/oneshot remains; its Connection owns every accepted byte.
         Poll::Ready(Ok(count))
@@ -1001,6 +1010,14 @@ mod coalesced_partial_memory_tests {
     }
 }
 
+#[cfg(all(test, feature = "sing-mux"))]
+#[path = "grpc_private_rst_memory_tests.rs"]
+mod private_rst_memory_tests;
+
 #[cfg(test)]
 #[path = "grpc_gun_streaming_read_memory_tests.rs"]
 mod streaming_read_memory_tests;
+
+#[cfg(all(test, feature = "sing-mux"))]
+#[path = "grpc_private_demand_memory_tests.rs"]
+mod private_demand_memory_tests;

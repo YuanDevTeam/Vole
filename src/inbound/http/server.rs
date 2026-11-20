@@ -243,6 +243,10 @@ where
 {
     let (mut deadline, cancellation) = scope;
     let http = dispatcher.http_context();
+    // HTTP processing and transparent fallback retain the same routing/DNS
+    // generation, including requests outside the configured processing ports.
+    let dispatcher = http.as_ref().map_or(dispatcher, |http| http.dispatcher());
+    let mut upstream = None;
     loop {
         let request = timeout_at(deadline, async {
             if reader.fill_buf().await?.is_empty() {
@@ -285,10 +289,15 @@ where
         let forward = if request.is_connect() {
             framing::validate_connect(&request)
                 .and_then(|()| request.connect_destination().map(|target| (target, None)))
-        } else if http.is_some() {
-            request
-                .forward_target()
-                .map(|(destination, _)| (destination, None))
+        } else if let Some(http) = &http {
+            request.forward_target().and_then(|(destination, origin)| {
+                if http.plain_port(destination.port()) {
+                    Ok((destination, None))
+                } else {
+                    RequestPlan::for_target(&request, destination, origin, false)
+                        .map(|plan| (plan.destination.clone(), Some(plan)))
+                }
+            })
         } else {
             RequestPlan::new(&request).map(|plan| (plan.destination.clone(), Some(plan)))
         };
@@ -315,8 +324,13 @@ where
             destination,
             sniffed_domain: None,
         };
+        // CONNECT takes ownership of this downstream for its whole tunnel
+        // lifetime. Its previous ordinary HTTP slot must not live alongside it.
+        if request.is_connect() {
+            drop(upstream.take());
+        }
         if let Some(http) = &http {
-            if !request.is_connect() {
+            if !request.is_connect() && http.plain_port(session.destination.port()) {
                 if !http
                     .forward_h1(
                         reader,
@@ -324,7 +338,8 @@ where
                         &request,
                         session,
                         crate::http_processing::Scheme::Http,
-                        config,
+                        (config, cancellation),
+                        &mut upstream,
                     )
                     .await?
                 {
@@ -333,7 +348,7 @@ where
                 deadline = Instant::now() + config.header_timeout;
                 continue;
             }
-            if http.candidate_port(session.destination.port()) {
+            if request.is_connect() && http.candidate_port(session.destination.port()) {
                 write_timed(
                     writer,
                     b"HTTP/1.1 200 Connection Established\r\n\r\n",
@@ -365,8 +380,10 @@ where
                 };
             }
         }
+        // A request that leaves the processing path must retire its previous
+        // processed upstream before connecting through ordinary forwarding.
+        drop(upstream.take());
         if request.is_connect() {
-            let dispatcher = http.as_ref().map_or(dispatcher, |http| http.dispatcher());
             return forward_tunnel(
                 reader,
                 writer,
@@ -495,16 +512,99 @@ pub(crate) async fn forward_processed<R: AsyncBufRead + Unpin, W: AsyncWrite + U
     .await
 }
 
+pub(crate) struct UpstreamIo {
+    read: BufReader<tokio::io::ReadHalf<BoxStream>>,
+    write: tokio::io::WriteHalf<BoxStream>,
+}
+impl UpstreamIo {
+    pub(crate) fn new(stream: BoxStream) -> Self {
+        let (read, write) = tokio::io::split(stream);
+        Self {
+            read: BufReader::with_capacity(framing::COPY_BUFFER, read),
+            write,
+        }
+    }
+    // One nonblocking buffered poll, before sending any new request bytes.
+    // EOF/error/unsolicited bytes retire the owner, never trigger HTTP replay.
+    pub(crate) async fn idle_healthy(&mut self) -> bool {
+        std::future::poll_fn(|cx| {
+            use std::{pin::Pin, task::Poll};
+            match tokio::io::AsyncBufRead::poll_fill_buf(Pin::new(&mut self.read), cx) {
+                Poll::Pending => Poll::Ready(true),
+                Poll::Ready(_) => Poll::Ready(false),
+            }
+        })
+        .await
+    }
+}
+pub(crate) struct UpstreamSlot {
+    pub(crate) authority: String,
+    pub(crate) key: crate::dispatch::HttpTcpReuseKey,
+    pub(crate) io: UpstreamIo,
+}
+pub(crate) struct ForwardOutcome {
+    pub(crate) downstream_keep_alive: bool,
+    pub(crate) upstream_reusable: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_request_inner<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
-    mut outbound: BoxStream,
+    outbound: BoxStream,
+    request: &RequestHead,
+    plan: RequestPlan,
+    config: &HttpServerConfig,
+    processing: Option<&crate::http_processing::h1_body::Message<'_>>,
+) -> io::Result<bool> {
+    let mut upstream = UpstreamIo::new(outbound);
+    forward_on_stream(
+        reader,
+        writer,
+        &mut upstream,
+        request,
+        plan,
+        config,
+        processing,
+        false,
+    )
+    .await
+    .map(|outcome| outcome.downstream_keep_alive)
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_processed_reusable<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    upstream: &mut UpstreamIo,
+    request: &RequestHead,
+    plan: RequestPlan,
+    config: &HttpServerConfig,
+    processing: &crate::http_processing::h1_body::Message<'_>,
+) -> io::Result<ForwardOutcome> {
+    forward_on_stream(
+        reader,
+        writer,
+        upstream,
+        request,
+        plan,
+        config,
+        Some(processing),
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_on_stream<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    upstream: &mut UpstreamIo,
     request: &RequestHead,
     mut plan: RequestPlan,
     config: &HttpServerConfig,
     processing: Option<&crate::http_processing::h1_body::Message<'_>>,
-) -> io::Result<bool> {
+    enable_reuse: bool,
+) -> io::Result<ForwardOutcome> {
     let upload = match processing {
         Some(processing) => {
             processing
@@ -513,18 +613,33 @@ async fn forward_request_inner<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         }
         None => crate::http_processing::h1_body::PreparedBody::original(plan.body),
     };
-    write_timed(&mut outbound, &plan.head, config.connect_timeout).await?;
+    // Processing may rebuild request framing. Persistence is enabled only now.
+    let origin_requested = enable_reuse
+        && !matches!(request.method.as_str(), "HEAD" | "CONNECT")
+        && plan.keep_alive
+        && plan.upgrade.is_empty()
+        && matches!(plan.body, Body::Empty | Body::Length(_))
+        && !request
+            .headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("expect"));
+    if origin_requested {
+        plan.enable_origin_persistence()?;
+    }
+    let mut remote_read = &mut upstream.read;
+    let mut remote_write = &mut upstream.write;
+    write_timed(&mut remote_write, &plan.head, config.connect_timeout).await?;
     // Some protocol transports accept the head into an internal frame. Empty
     // requests never poll the body sender, so publish the head before reading.
-    timeout_io(config.connect_timeout, outbound.flush()).await?;
-    let (remote_read, mut remote_write) = tokio::io::split(outbound);
-    let mut remote_read = BufReader::with_capacity(framing::COPY_BUFFER, remote_read);
-    let mut uploading = Box::pin(upload.transfer(
+    timeout_io(config.connect_timeout, remote_write.flush()).await?;
+    let final_flush_only = std::sync::atomic::AtomicBool::new(false);
+    let mut uploading = Box::pin(upload.transfer_observing_final_flush(
         reader,
         &mut remote_write,
         config.body_idle_timeout,
         &plan.trailer_blocklist,
         false,
+        &final_flush_only,
     ));
     // Empty bodies are already complete. Reading a ready 101 first must not
     // turn an otherwise valid Upgrade into an apparent early response.
@@ -612,8 +727,24 @@ async fn forward_request_inner<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         }
         break response;
     };
-    // An early final response cancels the upload and closes this client
-    // connection. Unread request bytes can never become a second request.
+    if !uploaded
+        && origin_requested
+        && response.status >= 200
+        && final_flush_only.load(std::sync::atomic::Ordering::Acquire)
+    {
+        // The real body transfer has reached its final flush. Recheck that same
+        // future once in case response-first selection hid an already-ready
+        // completion. Never await Pending or read/write another body byte.
+        let result = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(uploading.as_mut(), cx))
+        })
+        .await;
+        if matches!(result, std::task::Poll::Ready(Ok(()))) {
+            uploaded = true;
+        }
+    }
+    // Genuine early/Pending/error final responses keep the original close path.
+    // Unread request bytes can never become a second request.
     drop(uploading);
     if response.status == 101 {
         if !uploaded || !response.valid_upgrade(&plan.upgrade).unwrap_or(false) {
@@ -634,8 +765,12 @@ async fn forward_request_inner<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         .await?;
         timeout_io(config.header_timeout, writer.flush()).await?;
         relay(reader, writer, &mut remote_read, &mut remote_write).await?;
-        return Ok(false);
+        return Ok(ForwardOutcome {
+            downstream_keep_alive: false,
+            upstream_reusable: false,
+        });
     }
+    let origin_reusable = origin_requested && response.origin_reusable(&request.method);
     let body = response.body(&request.method);
     let download = match processing {
         Some(processing) => {
@@ -654,8 +789,8 @@ async fn forward_request_inner<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         config.header_timeout,
     )
     .await?;
-    download
-        .transfer(
+    let consumed = download
+        .transfer_with_origin(
             &mut remote_read,
             writer,
             config.body_idle_timeout,
@@ -663,7 +798,13 @@ async fn forward_request_inner<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             dechunk,
         )
         .await?;
-    Ok(keep_alive)
+    Ok(ForwardOutcome {
+        downstream_keep_alive: keep_alive,
+        upstream_reusable: keep_alive
+            && origin_reusable
+            && consumed
+            && remote_read.buffer().is_empty(),
+    })
 }
 
 async fn relay<R, W, RR, RW>(
@@ -1476,4 +1617,14 @@ mod response_deadline_memory_tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod upstream_memory_tests {
+    include!("upstream_memory_tests.rs");
+}
+
+#[cfg(test)]
+mod final_flush_repoll_memory_tests {
+    include!("final_flush_repoll_memory_tests.rs");
 }

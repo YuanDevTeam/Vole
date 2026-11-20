@@ -233,7 +233,9 @@ mod enabled {
                 let mut tls = tokio::time::timeout(
                     Duration::from_secs(10),
                     tokio_rustls::TlsAcceptor::from(config).accept_with(replay, |connection| {
-                        connection.set_buffer_limit(Some(32 * 1024))
+                        connection.set_buffer_limit(Some(
+                            crate::limits::ResourceLimits::default().tls_buffer_limit,
+                        ))
                     }),
                 )
                 .await

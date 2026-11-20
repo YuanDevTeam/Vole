@@ -133,6 +133,15 @@ impl NativeIdentityClient {
 }
 
 impl TlsClientIdentity {
+    #[cfg(all(
+        feature = "inbound-http",
+        feature = "outbound-shadowsocks",
+        feature = "shadow-tls-v3"
+    ))]
+    pub(super) fn has_inline_http_identity(&self) -> bool {
+        matches!(&self.storage, IdentityStorage::Inline(_))
+    }
+
     pub fn from_pem(certificate: &str, private_key: &str) -> io::Result<Self> {
         use rustls::pki_types::pem::PemObject;
         let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid TLS client identity");
@@ -258,6 +267,26 @@ pub struct StandardTlsClient {
     buffer_limit: usize,
     require_ech: bool,
     dynamic_ech: Option<Arc<DynamicEchTls>>,
+    #[cfg(all(
+        feature = "inbound-http",
+        any(
+            feature = "outbound-anytls",
+            feature = "outbound-vmess",
+            feature = "outbound-trojan",
+            feature = "outbound-hysteria2",
+            feature = "outbound-tuic",
+            feature = "outbound-vless"
+        )
+    ))]
+    #[cfg_attr(
+        not(any(
+            feature = "outbound-vmess",
+            feature = "outbound-trojan",
+            feature = "outbound-hysteria2"
+        )),
+        allow(dead_code)
+    )]
+    http_reuse_identity_static: bool,
     #[cfg(feature = "quiche-h3-transport")]
     quiche_source: Option<Arc<QuicheSource>>,
 }
@@ -321,6 +350,31 @@ impl std::fmt::Debug for StandardTlsClient {
 }
 
 impl StandardTlsClient {
+    /// A private HTTP stream may retain only an inline identity and static ECH.
+    /// This query consumes no snapshot, file source, DNS or handshake work.
+    #[cfg(all(
+        feature = "inbound-http",
+        any(
+            feature = "outbound-anytls",
+            feature = "outbound-vmess",
+            feature = "outbound-trojan",
+            feature = "outbound-hysteria2",
+            feature = "outbound-tuic",
+            feature = "outbound-vless"
+        )
+    ))]
+    #[cfg_attr(
+        not(any(
+            feature = "outbound-vmess",
+            feature = "outbound-trojan",
+            feature = "outbound-hysteria2"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn permits_static_http_reuse(&self) -> bool {
+        self.http_reuse_identity_static && self.dynamic_ech.is_none()
+    }
+
     #[cfg(feature = "quiche-h3-transport")]
     pub(crate) fn prepare_quiche_identity(&self) -> io::Result<()> {
         if let Some(source) = &self.quiche_source {
@@ -455,6 +509,21 @@ impl StandardTlsClient {
         let name = ServerName::try_from(server_name.clone())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid TLS server name"))?;
         let mut options = options;
+        #[cfg(all(
+            feature = "inbound-http",
+            any(
+                feature = "outbound-anytls",
+                feature = "outbound-vmess",
+                feature = "outbound-trojan",
+                feature = "outbound-hysteria2",
+                feature = "outbound-tuic",
+                feature = "outbound-vless"
+            )
+        ))]
+        let http_reuse_identity_static = options
+            .identity
+            .as_ref()
+            .is_none_or(|identity| matches!(&identity.storage, IdentityStorage::Inline(_)));
         if let Some(identity) = &options.identity {
             identity.snapshot().material.validate()?;
         }
@@ -569,6 +638,18 @@ impl StandardTlsClient {
                     buffer_limit,
                     require_ech,
                     dynamic_ech: None,
+                    #[cfg(all(
+                        feature = "inbound-http",
+                        any(
+                            feature = "outbound-anytls",
+                            feature = "outbound-vmess",
+                            feature = "outbound-trojan",
+                            feature = "outbound-hysteria2",
+                            feature = "outbound-tuic",
+                            feature = "outbound-vless"
+                        )
+                    ))]
+                    http_reuse_identity_static,
                     #[cfg(feature = "quiche-h3-transport")]
                     quiche_source,
                 });
@@ -655,6 +736,18 @@ impl StandardTlsClient {
             buffer_limit,
             require_ech,
             dynamic_ech: None,
+            #[cfg(all(
+                feature = "inbound-http",
+                any(
+                    feature = "outbound-anytls",
+                    feature = "outbound-vmess",
+                    feature = "outbound-trojan",
+                    feature = "outbound-hysteria2",
+                    feature = "outbound-tuic",
+                    feature = "outbound-vless"
+                )
+            ))]
+            http_reuse_identity_static,
             #[cfg(feature = "quiche-h3-transport")]
             quiche_source,
         })

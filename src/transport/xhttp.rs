@@ -121,6 +121,8 @@ pub struct XHttpClient {
     send_buffer_size: usize,
     upload_chunk_size: usize,
     shared_packet_up: bool,
+    packet_up_response_overlap: bool,
+    yamux_packet_up_send_retention: bool,
     http_version: crate::config::XHttpVersion,
     owner: Arc<DriverOwner>,
     reuse: Option<Arc<crate::config::XHttpReuseConfig>>,
@@ -165,6 +167,8 @@ impl XHttpClient {
             send_buffer_size: DEFAULT_H2_SEND_BUFFER_SIZE,
             upload_chunk_size: DEFAULT_UPLOAD_CHUNK_SIZE,
             shared_packet_up: false,
+            packet_up_response_overlap: false,
+            yamux_packet_up_send_retention: false,
             http_version,
             owner: Arc::default(),
             pool: Arc::new(pool::Pool::new(reuse.clone(), http_version)),
@@ -177,6 +181,9 @@ impl XHttpClient {
     pub(crate) fn set_shared_packet_up_transport(&mut self, shared: bool) {
         #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
         let previous = self.udp_budget_qualified();
+        if shared {
+            self.set_yamux_packet_up_send_retention(false);
+        }
         self.shared_packet_up = shared;
         #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
         if previous != self.udp_budget_qualified() {
@@ -184,6 +191,46 @@ impl XHttpClient {
             self.pool = Arc::new(pool::Pool::new(self.reuse.clone(), self.http_version));
         }
     }
+
+    /// Fixed by the VLESS factory before publication; geometry grants no UDP credit.
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn set_packet_up_response_overlap(&mut self, enabled: bool) {
+        self.packet_up_response_overlap = enabled
+            && self.http_version == crate::config::XHttpVersion::Http3
+            && self.mode == XHttpMode::PacketUp
+            && matches!(
+                &self.request.options.data,
+                crate::config::xhttp::DataPlacement::Body
+            );
+    }
+
+    /// Fixed by the VLESS/Yamux factory before publication; this is not an
+    /// adaptive UDP proof or evidence of a physical metadata flush.
+    #[cfg(any(feature = "invoke", test))]
+    pub(crate) fn set_yamux_packet_up_send_retention(&mut self, enabled: bool) {
+        let qualified = enabled
+            && !self.shared_packet_up
+            && self.http_version == crate::config::XHttpVersion::Http3
+            && self.mode == XHttpMode::PacketUp
+            && matches!(
+                &self.request.options.data,
+                crate::config::xhttp::DataPlacement::Body
+            );
+        if self.yamux_packet_up_send_retention != qualified {
+            self.yamux_packet_up_send_retention = qualified;
+            // A changed physical budget must not inherit either clone's pool.
+            self.pool = Arc::new(pool::Pool::new(self.reuse.clone(), self.http_version));
+        }
+    }
+
+    fn h3_initial_send_window(&self) -> u64 {
+        if self.yamux_packet_up_send_retention && !self.shared_packet_up {
+            crate::limits::XHTTP_H3_YAMUX_SEND_WINDOW as u64
+        } else {
+            crate::limits::XHTTP_H3_SEND_WINDOW as u64
+        }
+    }
+
     #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
     fn udp_budget_qualified(&self) -> bool {
         self.shared_packet_up
@@ -542,6 +589,13 @@ impl XHttpClient {
         self.http_version
     }
 
+    /// Business HTTP may retain this logical stream only while its actual
+    /// transport owner is open. Carrier pool/mode/lease policy is unchanged.
+    #[cfg(all(feature = "outbound-vless", feature = "inbound-http"))]
+    pub(crate) fn is_http_reuse_owner_open(&self) -> bool {
+        !self.owner.cancellation.is_cancelled()
+    }
+
     #[cfg(feature = "interop-test")]
     pub(crate) fn quic_pings(&self) -> Vec<u64> {
         self.pool.quic_pings()
@@ -558,6 +612,7 @@ impl XHttpClient {
                     match transport {
                         TransportIo::Stream(stream) if self.http_version != crate::config::XHttpVersion::Http3 => self.handshake_active(stream).await,
                         TransportIo::Quic(transport) if self.http_version == crate::config::XHttpVersion::Http3 => h3_driver::connect(*transport, self.reuse.as_ref().map_or(0, |r| r.keep_alive_seconds),
+                            self.h3_initial_send_window(),
                             #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
                             self.udp_budget_qualified(),
                             &self.owner).await,
@@ -632,7 +687,7 @@ impl XHttpClient {
         sender: SendRequest,
         session: Arc<str>,
     ) -> io::Result<packet_up::Writer> {
-        let overlap = self.shared_packet_up
+        let overlap = (self.shared_packet_up || self.packet_up_response_overlap)
             && self.mode == XHttpMode::PacketUp
             && matches!(&sender, SendRequest::H3(_))
             && matches!(

@@ -99,6 +99,12 @@ pub mod transport;
     )
 ))]
 mod tun_runtime;
+#[cfg(all(feature = "tun", feature = "interop-test", unix))]
+#[doc(hidden)]
+pub use tun_runtime::interop::{
+    InteropTunRoutingRegistry, InteropTunUdpReplies, InteropTunUdpTask, interop_tracked_tun_router,
+    interop_tun_udp_association,
+};
 #[cfg(any(feature = "tun", feature = "inbound-socks5", test))]
 mod udp_sniffing;
 #[cfg(all(windows, feature = "windows-uwp"))]

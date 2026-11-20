@@ -50,9 +50,8 @@ Linux 压测可以把 TUN 创建在客户端 namespace，再把借用 fd 交给�
 
 tvOS 首版为 17.0+、ARM64 真机和 Apple Silicon 模拟器，共用 TunIo、netstack 和
 Dialer。所有平台使用统一的 TUN 内存诊断、allocator 配置和 Stop 后回收策略，
-缓冲、队列和线程策略也不按平台或内存模式切换。内存按默认压力负载统一验收：1 Gbps 不超过 43 MiB，
-2 Gbps 不超过 45 MiB；真实 iOS/tvOS 扩展按整个进程的 physical footprint
-验收，完整口径见[验收边界](acceptance.md)。
+缓冲、队列和线程策略跨平台共享。内存验证按[验收边界](acceptance.md#内存与环境)
+记录各平台的实际观测进程及指标。
 
 Apple 公开 NEPacketTunnelFlow API 是 packetFlow 的包读写，不承诺可取得 raw fd。
 Vole 的借用 fd 契约不能证明宿主 KVC 提取 fd 是稳定公开方案。真实宿主的 fd 获取/桥接、
@@ -107,16 +106,14 @@ token 归还容量。满输出保留尚未处理的 TCP 包和协议状态，低
 输出端关闭则停止 Driver、释放 socket 并唤醒全部等待者。
 
 netstack 的 TCP 接收与发送缓冲可独立配置，各方向的容量包含 smoltcp 缓冲与应用
-队列，两层上限各占一半。生产 TUN 仍使用每方向 32 KiB、合计每流 64 KiB 的数据
-容量上限。应用队列从空分配开始，按实际写入有界增长，分配请求不超过该队列的
-逻辑上限；排空后保留已分配空间直到连接释放。smoltcp 缓冲容量、背压、唤醒、
-flush 与关闭语义保持不变。该容量不包含代理 relay、包队列或 allocator 的内存，
-也不保证进程 RSS 与数据容量相同。
+队列，两层上限各占一半。所有平台的生产 TUN 默认接收总预算为 32 KiB（每层 16 KiB），
+发送总预算为 128 KiB（每层 64 KiB），合计每流 160 KiB。Rust `ResourceLimits` 的
+`tcp_buffer_per_direction` 与独立的 `tun_tcp_send_buffer` 分别映射到 TUN 接收与发送，
+保留调用者显式容量，不倍乘或钳制；通用 netstack 默认收发仍各 32 KiB，不新增 YAML 或
+Invoke 字段。资源入口拒绝零值，netstack 启动时继续要求每方向总预算为至少 4 KiB 的偶数。
+应用队列有界并按需扩展。Unix 上的较大发送队列可使用匿名映射，分配不可用时继续使用有界 VecDeque。其缓存、停止顺序与内存覆盖范围见 [运行时资源策略](runtime-resource-policy.md#tcp-与握手)。
 
-Linux 目前不启用 GRO/GSO：`tun-rs` 的 Linux offload 示例通过 builder 创建并
-配置带 VNET header 的设备，而 Vole 的原生和借用路径均不启用该模式。对现有 raw-IP
-设备调用 `recv_multiple` 不会自动合并读取或启用 offload。Vole 保留宿主
-MTU/格式与 fd 标志，原生 builder 只打开 raw-IP TUN，不暗中启用 offload 或改变借用接口。
+Linux 创建或借用的 raw-IP TUN 保留原 MTU、包格式及 fd 标志，GRO、GSO 与 VNET header 均关闭；`recv_multiple` 本身只使用现有设备能力。
 
 ## Linux 自建 TUN 的系统网络
 

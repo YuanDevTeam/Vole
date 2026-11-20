@@ -30,6 +30,18 @@ pub(super) struct ConnectionFactory {
     udp_receive_buffer_size: Option<usize>,
 }
 impl ConnectionFactory {
+    /// This concrete factory owns parsed immutable SPKI/client ECDSA material.
+    /// Prove the actual carrier: H2 TCP graph or H3 physical UDP first hop.
+    #[cfg(feature = "inbound-http")]
+    fn permits_static_http_reuse(&self, network: MasqueNetwork) -> bool {
+        match network {
+            MasqueNetwork::H2 => self.upstream.permits_static_http_reuse(&self.server),
+            MasqueNetwork::Quic | MasqueNetwork::H3L4Proxy => {
+                self.upstream.permits_static_direct_http_reuse(&self.server)
+            }
+        }
+    }
+
     pub(super) async fn connect_h2(
         &self,
         session: StreamSession,
@@ -62,6 +74,23 @@ impl ConnectionFactory {
         session: StreamSession,
         context: &EstablishContext,
     ) -> io::Result<h3_connect::QuicTransport> {
+        self.connect_inner(session, context, cfg!(target_os = "macos"))
+            .await
+    }
+    #[cfg(target_os = "macos")]
+    pub(super) async fn connect_ip(
+        &self,
+        session: StreamSession,
+        context: &EstablishContext,
+    ) -> io::Result<h3_connect::QuicTransport> {
+        self.connect_inner(session, context, true).await
+    }
+    async fn connect_inner(
+        &self,
+        session: StreamSession,
+        context: &EstablishContext,
+        fixed_peer: bool,
+    ) -> io::Result<h3_connect::QuicTransport> {
         let tls = self.tls.quiche_config(self.server_name.clone())?;
         let server = self
             .upstream
@@ -82,11 +111,20 @@ impl ConnectionFactory {
         } else {
             request
         };
-        let transport = self
-            .upstream
-            .open_datagram(request, context)
-            .await
-            .map_err(io::Error::other)?;
+        #[cfg(target_os = "macos")]
+        let transport = if fixed_peer {
+            self.upstream
+                .open_fixed_peer_datagram(request, peer, context)
+                .await
+        } else {
+            self.upstream.open_datagram(request, context).await
+        };
+        #[cfg(not(target_os = "macos"))]
+        let transport = {
+            let _ = fixed_peer;
+            self.upstream.open_datagram(request, context).await
+        };
+        let transport = transport.map_err(io::Error::other)?;
         Ok(h3_connect::QuicTransport {
             transport,
             peer,
@@ -243,6 +281,14 @@ fn connect_request(target: &Destination) -> io::Result<http::Request<()>> {
 
 #[async_trait]
 impl OutboundConnector for MasqueOutbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        !self.cancel.is_cancelled()
+            && self
+                .connection
+                .permits_static_http_reuse(self.config.network)
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,
@@ -353,6 +399,9 @@ impl Drop for MasqueOutbound {
         }
     }
 }
+
+#[cfg(all(test, feature = "inbound-http"))]
+mod http_reuse_memory_tests;
 
 #[cfg(test)]
 mod tests {
@@ -520,6 +569,194 @@ mod tests {
             assert!(outbound.current.lock().await.is_none());
         }
     }
+    #[cfg(target_os = "macos")]
+    fn fixed_factory_memory_outbound(
+        network: MasqueNetwork,
+        upstream: UpstreamPath,
+        peer: std::net::SocketAddr,
+    ) -> MasqueOutbound {
+        let mut outbound = outbound_network(0, Arc::new(PendingUpstream::default()), network);
+        let factory = Arc::get_mut(&mut outbound.connection).unwrap();
+        factory.server = Destination::Ip(peer);
+        factory.upstream = upstream;
+        outbound
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn masque_h3_fixed_factory_memory_l4_acquires_direct_and_lazy_fixed_peers() {
+        use crate::{
+            dialer::{Dialer, ResolvedEndpoint},
+            session::Datagram,
+        };
+        use bytes::Bytes;
+        use std::net::{SocketAddr, SocketAddrV6};
+
+        let ipv6 = SocketAddr::V6(SocketAddrV6::new("fe80::10".parse().unwrap(), 443, 123, 7));
+        for peer in ["192.0.2.10:443".parse().unwrap(), ipv6] {
+            for prepared in [false, true] {
+                let path = if prepared {
+                    UpstreamPath::direct(
+                        ResolvedEndpoint {
+                            logical_host: peer.ip().to_string(),
+                            port: peer.port(),
+                            addresses: vec![peer],
+                        },
+                        Dialer::default(),
+                    )
+                } else {
+                    UpstreamPath::LazyDirect {
+                        dialer: Dialer::default(),
+                    }
+                };
+                let outbound = fixed_factory_memory_outbound(MasqueNetwork::H3L4Proxy, path, peer);
+                let mut acquired = outbound
+                    .connection
+                    .connect(session(), &EstablishContext::default())
+                    .await
+                    .unwrap();
+                assert_eq!(acquired.peer, peer);
+                assert_eq!(acquired.budget, DatagramBudget::new(1400, 1400));
+                assert_eq!(
+                    acquired.transport.payload_budget(&Destination::Ip(peer)),
+                    DatagramBudget::new(1400, 1400)
+                );
+                // This observes the real returned transport before any send.
+                // The old unconnected factory fails here without opening IO.
+                assert!(
+                    !acquired.transport.supports_shared_destinations(),
+                    "H3 L4 must acquire one fixed physical peer"
+                );
+                let packet = |remote| Datagram {
+                    remote: Destination::Ip(remote),
+                    payload: Bytes::from_static(b"whole"),
+                    sniffed_domain: None,
+                };
+                let mut other = peer;
+                other.set_port(444);
+                let mut rejected = vec![other];
+                if let SocketAddr::V6(address) = peer {
+                    let mut flow = address;
+                    flow.set_flowinfo(address.flowinfo() + 1);
+                    rejected.push(SocketAddr::V6(flow));
+                    let mut scope = address;
+                    scope.set_scope_id(address.scope_id() + 1);
+                    rejected.push(SocketAddr::V6(scope));
+                }
+                for other in rejected {
+                    assert!(matches!(
+                        acquired.transport.send(packet(other)).await,
+                        Err(DispatchError::NotAllowed)
+                    ));
+                    let returned = acquired.transport.send_owned(packet(other)).err().unwrap();
+                    assert_eq!(returned.remote, Destination::Ip(other));
+                    assert_eq!(returned.payload, Bytes::from_static(b"whole"));
+                    let returned = acquired
+                        .transport
+                        .send_batch_owned(vec![packet(other), packet(other)])
+                        .err()
+                        .unwrap();
+                    assert_eq!(returned.len(), 2);
+                    assert!(returned.iter().all(|item| {
+                        item.remote == Destination::Ip(other)
+                            && item.payload == Bytes::from_static(b"whole")
+                    }));
+                }
+                assert!(
+                    acquired.transport.send_owned(packet(peer)).is_err(),
+                    "factory acquisition must leave the exact peer unopened"
+                );
+                acquired.transport.close().await.unwrap();
+                assert!(matches!(
+                    acquired.transport.send(packet(peer)).await,
+                    Err(DispatchError::NotAllowed)
+                ));
+                drop(acquired);
+                outbound.shutdown().await;
+                assert!(outbound.current.lock().await.is_none());
+                assert!(outbound.remote.get().is_none());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn masque_h3_fixed_factory_memory_preserves_ip_group_snapshot_and_proxy() {
+        use crate::{
+            dialer::Dialer,
+            outbound::{SelectUpstream, SelectUpstreamMember},
+            routing::GroupSelection,
+        };
+
+        let peer = "192.0.2.10:443".parse().unwrap();
+        let ip = fixed_factory_memory_outbound(
+            MasqueNetwork::Quic,
+            UpstreamPath::LazyDirect {
+                dialer: Dialer::default(),
+            },
+            peer,
+        );
+        let mut acquired = ip
+            .connection
+            .connect_ip(session(), &EstablishContext::default())
+            .await
+            .unwrap();
+        assert_eq!(acquired.peer, peer);
+        assert!(!acquired.transport.supports_shared_destinations());
+        acquired.transport.close().await.unwrap();
+        drop(acquired);
+        ip.shutdown().await;
+
+        let selection = Arc::new(GroupSelection::new(0));
+        let group = fixed_factory_memory_outbound(
+            MasqueNetwork::H3L4Proxy,
+            UpstreamPath::Group {
+                server: Destination::Ip(peer),
+                group: Arc::new(SelectUpstream::new(
+                    selection.clone(),
+                    vec![SelectUpstreamMember::Direct, SelectUpstreamMember::Reject],
+                )),
+                endpoint: None,
+                dialer: Dialer::default(),
+            },
+            peer,
+        );
+        let context = EstablishContext::default();
+        let mut first = group.connection.connect(session(), &context).await.unwrap();
+        assert!(first.transport.supports_shared_destinations());
+        selection.store(1, Ordering::Release);
+        let mut pinned = group.connection.connect(session(), &context).await.unwrap();
+        assert!(pinned.transport.supports_shared_destinations());
+        assert!(
+            group
+                .connection
+                .connect(session(), &EstablishContext::default())
+                .await
+                .is_err()
+        );
+        first.transport.close().await.unwrap();
+        pinned.transport.close().await.unwrap();
+        drop((first, pinned));
+        group.shutdown().await;
+
+        let upstream = Arc::new(PendingUpstream::default());
+        let mut proxy = outbound_network(0, upstream.clone(), MasqueNetwork::H3L4Proxy);
+        Arc::get_mut(&mut proxy.connection).unwrap().server = Destination::Ip(peer);
+        assert!(
+            proxy
+                .connection
+                .connect(session(), &EstablishContext::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *upstream.datagram_requests.lock().unwrap(),
+            vec![(DatagramBudget::new(1400, 1400), None)]
+        );
+        proxy.shutdown().await;
+    }
+
     #[test]
     fn masque_handshake_duration_wrap_is_expired_not_a_new_schema_rejection() {
         let context = EstablishContext::with_timeout(Duration::from_millis(1));

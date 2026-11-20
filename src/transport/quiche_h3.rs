@@ -13,7 +13,7 @@ use http::{Request, Response};
 use quiche::h3::NameValue;
 use quinn::AsyncUdpSocket;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -134,6 +134,13 @@ struct State {
     connection: Option<NativeConnection>,
     h3: Option<quiche::h3::Connection>,
     streams: BTreeMap<u64, Body>,
+    // Only IDs: payloads, wakers and application halves are released at Drop.
+    // Entries follow native RESET/STOP collection, not historical requests.
+    retired: BTreeSet<u64>,
+    retired_cursor: Option<u64>,
+    // A finite sweep is armed only by new retirement/native RX/terminal work.
+    // Self-wakes consume this debt rather than starting another full sweep.
+    retired_debt: usize,
     closed: bool,
     goaway: bool,
     ready: bool,
@@ -156,6 +163,9 @@ impl Shared {
             body.wake();
         }
         state.streams.clear();
+        state.retired.clear();
+        state.retired_cursor = None;
+        state.retired_debt = 0;
         state.h3.take();
         state.connection.take();
         state.datagram_budget = None;
@@ -248,6 +258,9 @@ impl Driver {
                 connection: Some(connection),
                 h3: None,
                 streams: BTreeMap::new(),
+                retired: BTreeSet::new(),
+                retired_cursor: None,
+                retired_debt: 0,
                 closed: false,
                 goaway: false,
                 ready: false,
@@ -303,6 +316,7 @@ impl Driver {
             // One native-pop allowance for the complete owner turn, including
             // the outer H3 pass, inline RX and the publication pass below.
             let mut datagram_work = WORK;
+            let mut retirement_work = WORK;
             if cancel.is_cancelled() && closing.is_none() {
                 closing = Some(tokio::time::Instant::now() + quic::CLOSE_TIMEOUT);
                 let mut state = self.shared.state.lock().unwrap();
@@ -348,6 +362,9 @@ impl Driver {
                     self.shared.status.notify_waiters();
                 }
                 process_h3(&mut state, &mut datagram_work)?;
+                if reap_retired_h3(&mut state, &mut retirement_work) {
+                    self.shared.changed.notify_one();
+                }
                 state.datagram_budget = state.connection.as_mut().unwrap().dgram_max_writable_len();
                 if closing.is_none()
                     && keepalive.is_some_and(|at| tokio::time::Instant::now() >= at)
@@ -484,7 +501,14 @@ impl Driver {
                                 }
                             };
                             match result {
-                                Ok(_) | Err(quiche::Error::Done) => {}
+                                Ok(consumed) => {
+                                    if consumed != 0 {
+                                        // Real accepted native input can ACK a
+                                        // reset or complete a stopped stream.
+                                        state.retired_debt = state.retired.len();
+                                    }
+                                }
+                                Err(quiche::Error::Done) => {}
                                 Err(error) => {
                                     // Inline frames are still private under
                                     // State; do not publish them on failure.
@@ -551,6 +575,9 @@ impl Driver {
                         state.closed = true;
                         return Poll::Ready(Err(error));
                     }
+                    if reap_retired_h3(&mut state, &mut retirement_work) {
+                        self.shared.changed.notify_one();
+                    }
                 }
                 if received {
                     Poll::Ready(Ok(()))
@@ -586,6 +613,79 @@ fn retire_grace(connection: &NativeConnection) -> Duration {
         .saturating_mul(2)
         .saturating_add(Duration::from_millis(25))
         .min(quic::CLOSE_TIMEOUT)
+}
+
+// quiche 0.30 keeps H3 request state separately from native QUIC state.
+// A native RESET/STOP alone does not mark H3's local send half finished.
+// Its public send_body error path removes the H3 entry after native collection
+// (the collect_reset_streams test uses the same notification). Prove that the
+// transport ID is gone first, so this call cannot enqueue DATA or a FIN.
+fn retire_collected_h3(state: &mut State, id: u64) -> bool {
+    let (Some(connection), Some(h3)) = (state.connection.as_mut(), state.h3.as_mut()) else {
+        return false;
+    };
+    if !connection.stream_closed(id) {
+        return false;
+    }
+    let collected = match connection.stream_capacity(id) {
+        Err(quiche::Error::InvalidStreamState(_)) => true,
+        // This public query can itself collect a complete stopped stream but
+        // still returns StreamStopped. Recheck once under the same lock; do
+        // not wait for another packet/notification which might never arrive.
+        Err(quiche::Error::StreamStopped(_)) => {
+            connection.stream_closed(id)
+                && matches!(
+                    connection.stream_capacity(id),
+                    Err(quiche::Error::InvalidStreamState(_))
+                )
+        }
+        _ => false,
+    };
+    if !collected {
+        return false;
+    }
+    matches!(
+        h3.send_body(connection, id, &[], true),
+        Err(quiche::h3::Error::TransportError(
+            quiche::Error::InvalidStreamState(_)
+        )) | Err(quiche::h3::Error::FrameUnexpected)
+    )
+}
+
+// Share one allowance across the existing owner turn, including inline RX.
+// Round-robin prevents an unacknowledged low ID from hiding collectable IDs.
+// One finite sweep reaches later ready IDs even if the first batch all waits
+// on its peer. An all-unready sweep consumes its debt and stops self-waking.
+fn reap_retired_h3(state: &mut State, remaining: &mut usize) -> bool {
+    let scans = (*remaining)
+        .min(state.retired_debt)
+        .min(state.retired.len());
+    for _ in 0..scans {
+        let id = state
+            .retired_cursor
+            .and_then(|cursor| {
+                state
+                    .retired
+                    .range((
+                        std::ops::Bound::Excluded(cursor),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next()
+                    .copied()
+            })
+            .or_else(|| state.retired.first().copied());
+        let Some(id) = id else { break };
+        state.retired_cursor = Some(id);
+        *remaining -= 1;
+        state.retired_debt -= 1;
+        if retire_collected_h3(state, id) {
+            state.retired.remove(&id);
+        }
+    }
+    if state.retired.is_empty() {
+        state.retired_debt = 0;
+    }
+    state.retired_debt != 0
 }
 fn process_h3(state: &mut State, datagram_work: &mut usize) -> io::Result<()> {
     let Some(h3) = state.h3.as_mut() else {
@@ -630,12 +730,20 @@ fn process_h3(state: &mut State, datagram_work: &mut usize) -> io::Result<()> {
                 }
             }
             Ok((id, quiche::h3::Event::Finished)) => {
+                if state.retired.contains(&id) {
+                    // H3 polling can finish native reads after the RX turn's
+                    // first sweep. A new terminal event arms one finite sweep.
+                    state.retired_debt = state.retired.len();
+                }
                 if let Some(body) = state.streams.get_mut(&id) {
                     body.finished = true;
                     body.signals.read.wake();
                 }
             }
             Ok((id, quiche::h3::Event::Reset(_))) => {
+                if state.retired.contains(&id) {
+                    state.retired_debt = state.retired.len();
+                }
                 if let Some(body) = state.streams.get_mut(&id) {
                     body.failed = true;
                     body.wake();
@@ -1140,6 +1248,7 @@ fn stop_half(client: &Client, id: u64, send: bool, code: u64) {
         body.datagrams.take();
     }
     let remove = !body.send_owned && !body.receive_owned;
+    let cancelled = !body.send_finished || !body.finished;
     if !graceful {
         let _ = state.connection.as_mut().unwrap().stream_shutdown(
             id,
@@ -1153,6 +1262,9 @@ fn stop_half(client: &Client, id: u64, send: bool, code: u64) {
     }
     if remove {
         state.streams.remove(&id);
+        if cancelled && !retire_collected_h3(&mut state, id) && state.retired.insert(id) {
+            state.retired_debt = state.retired.len();
+        }
     }
     drop(state);
     client.shared.changed.notify_one();
@@ -1713,6 +1825,16 @@ mod tests {
                     .1,
                 1
             );
+            drop(state);
+            drop(receive);
+            drop(send);
+            // Current-thread test: no await lets the driver/peer ACK this
+            // cancellation before Stop. Exercise joined teardown with a real
+            // admitted native request still awaiting retirement.
+            let state = client.shared.state.lock().unwrap();
+            assert!(state.streams.is_empty());
+            assert!(state.retired.contains(&id));
+            assert!(state.retired_debt > 0);
         };
         let result = tokio::time::timeout(Duration::from_secs(10), operation).await;
         cancel.cancel();
@@ -1722,7 +1844,14 @@ mod tests {
         assert!(closed.load(std::sync::atomic::Ordering::Acquire));
         assert!(client.close_reason().is_some());
         assert!(client.shared.state.lock().unwrap().connection.is_none());
-        assert!(client.shared.state.lock().unwrap().streams.is_empty());
+        {
+            let state = client.shared.state.lock().unwrap();
+            assert!(state.streams.is_empty());
+            assert!(state.retired.is_empty());
+            assert!(state.retired_cursor.is_none());
+            assert_eq!(state.retired_debt, 0);
+            assert!(state.h3.is_none());
+        }
         assert_eq!(
             retained_ready_wakers.load(std::sync::atomic::Ordering::Relaxed),
             0,

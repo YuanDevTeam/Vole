@@ -117,6 +117,20 @@ stopped -> preparing -> prepared -> starting -> running
 
 `version` 和 `buildIdentity` 中的 `coreVersion` 取自 Cargo package version。源码 commit、lockfile 和产物 hash 由发布系统记录。
 
+### `getHttpDiagnostics`（仅 `http-diagnostics` 构建）
+
+同时启用 `http-diagnostics` 与 `invoke` 时，可发送读请求：
+
+```json
+{"method":"getHttpDiagnostics","payload":{}}
+```
+
+省略 `instanceId`，使用空 payload。此调用直接读取 [进程级观测](http-processing.md#编译期诊断)，无需初始化。Apple 另提供本 Core 自有线程的 QoS 请求记录。累计量可比较同一进程的前后读数，峰值应按其实际覆盖范围解释。App 和 Network Extension 各自报告本进程。默认构建返回未知方法。
+
+### `runHttpScriptPlanValidation`（仅 tvOS 诊断构建）
+
+在同时启用 `http-diagnostics`、`inbound-http` 与 `invoke` 的 tvOS 构建中，尚未初始化或创建实例的独立进程可提交 `{"method":"runHttpScriptPlanValidation","payload":{}}`。省略 `instanceId`，使用空 payload。该调用离线运行固定合成用例，比较静态 Plan 与 JavaScriptCore 的事务结果、预算及取消后的释放。结果包含实际执行的范围、用例结果和进程身份。开始验证后，后续业务须使用新进程。默认构建和其他平台返回未知方法。
+
 ### `initialize`
 
 参数和幂等语义见“初始化与生命周期”。成功时返回规范化后的 `dataDir`。
@@ -636,6 +650,8 @@ updateConfig 省略 HTTP 时继承 active；同设置可继续使用 active。�
 ```
 
 method 默认 GET，response.status 必填；headers 是保留顺序与重复项的二元数组，bodyBase64 表示原始编码实体。外部资源只取同来源已准备内存候选；缺少则返回 resourcesReady false／unprepared，不伪装为未命中。总开关关闭仍可演算启用规则；没有样本只报告被选中。结果包含 U0/U1、来源索引、URL 结果、各阶段执行或旁路与样本输出，httpsReady 不宣称真实信任就绪。结果不含 CA，也不持久化正文。
+
+当前 `testHttp` 只演算原生规则，不执行 JS。`http-scripts.enabled: true` 且脚本列表非空时明确返回不支持错误，不静默跳过脚本后报告演算成功；脚本总开关关闭时仍做源码 AST 静态校验，然后只演算原生规则。`validateConfig` 的源码校验同样不初始化脚本后端。
 
 ### foreground 私密文件
 

@@ -71,6 +71,46 @@ impl std::fmt::Debug for SecurityClient {
 }
 
 impl SecurityClient {
+    /// Initial business-HTTP proof scope: Plain and immutable standard TLS.
+    /// Other security backends keep their existing one-shot HTTP behavior.
+    #[cfg(all(
+        feature = "inbound-http",
+        any(
+            feature = "outbound-anytls",
+            feature = "outbound-vmess",
+            feature = "outbound-trojan",
+            feature = "outbound-vless"
+        )
+    ))]
+    #[cfg_attr(
+        not(any(feature = "outbound-vmess", feature = "outbound-trojan")),
+        allow(dead_code)
+    )]
+    pub(crate) fn permits_static_http_reuse(&self) -> bool {
+        match &self.backend {
+            SecurityBackend::Plain => true,
+            SecurityBackend::Standard(client) => client.permits_static_http_reuse(),
+            _ => false,
+        }
+    }
+
+    /// SS plugin-local permission; never broadens shared security permission.
+    #[cfg(all(feature = "inbound-http", feature = "outbound-shadowsocks"))]
+    pub(crate) fn permits_ss_shadowtls_http_reuse(&self) -> bool {
+        match &self.backend {
+            #[cfg(feature = "shadow-tls-v3")]
+            SecurityBackend::ShadowTls(client) => client.permits_ss_http_reuse(),
+            _ => false,
+        }
+    }
+
+    /// Witness for VLESS's private factory proof, not shared HTTP permission.
+    /// This backend exists only after the immutable Boring JLS client builds.
+    #[cfg(all(feature = "inbound-http", feature = "outbound-vless"))]
+    pub(crate) fn has_fixed_jls_identity(&self) -> bool {
+        matches!(&self.backend, SecurityBackend::Jls { .. })
+    }
+
     #[cfg(feature = "quinn-h3-transport")]
     pub(crate) async fn quic_config_with_context(
         &self,

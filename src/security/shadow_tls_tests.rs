@@ -566,3 +566,20 @@ async fn shutdown_has_a_five_second_bound_even_when_the_caller_transport_never_b
     .await
     .unwrap();
 }
+
+// Shared only by the stacked protocol memory test; no listener or route factory.
+#[cfg(feature = "outbound-shadowsocks")]
+pub(super) fn ss_stack_material() -> (Arc<ServerConfig>, SecurityContext, ShadowTlsConfig) {
+    let m = material();
+    (m.server, m.context, m.options)
+}
+#[cfg(feature = "outbound-shadowsocks")]
+pub(super) async fn ss_stack_handshake_seed(
+    raw: &mut DuplexStream,
+    server: Arc<ServerConfig>,
+) -> io::Result<[u8; 32]> {
+    let (_, flight) = handshake(raw, server).await?;
+    flight
+        .seed
+        .ok_or_else(|| io::Error::other("synthetic handshake lacked relay seed"))
+}

@@ -62,6 +62,7 @@ pub(super) struct Sender {
 pub(super) async fn connect(
     raw: QuicTransport,
     keepalive: i32,
+    initial_send_window: u64,
     #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))] udp_qualified: bool,
     owner: &DriverOwner,
 ) -> io::Result<(SendRequest, Arc<ConnectionGuard>)> {
@@ -115,7 +116,7 @@ pub(super) async fn connect(
                     .max_concurrent_uni_streams((crate::limits::XHTTP_H3_UNI_STREAMS as u32).into())
                     .stream_receive_window((crate::limits::XHTTP_H3_STREAM_WINDOW as u32).into())
                     .receive_window((crate::limits::XHTTP_H3_CONNECTION_WINDOW as u32).into())
-                    .send_window(crate::limits::XHTTP_H3_SEND_WINDOW as u64)
+                    .send_window(initial_send_window)
                     .datagram_receive_buffer_size(None)
                     .datagram_send_buffer_size(0)
                     .max_idle_timeout(Some(Duration::from_secs(300).try_into().map_err(failure)?))

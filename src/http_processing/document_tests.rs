@@ -83,3 +83,145 @@ fn external_http_payload_is_mandatory_and_never_carries_local_authority() {
     );
     assert!(doc.is_err());
 }
+
+#[cfg(feature = "inbound-http")]
+fn inline_script_document(enabled: bool, body: &str, source: &str) -> String {
+    format!(
+        "http-scripts:\n  enabled: {enabled}\n  scripts:\n    - name: example\n      phase: request\n      url: 'https://example.test/api/'\n      match: prefix\n      body: {body}\n      source: {}\n",
+        serde_json::to_string(source).unwrap()
+    )
+}
+
+#[cfg(feature = "inbound-http")]
+const PASS_SCRIPT: &str = "function rewrite(input) { return { type: 'pass' }; }";
+
+#[cfg(feature = "inbound-http")]
+#[test]
+fn inline_scripts_have_independent_switch_and_static_compilation() {
+    use crate::http_processing::{rules::Phase, script_config::BodyMode};
+    let document = Document::parse(&inline_script_document(true, "bytes", PASS_SCRIPT)).unwrap();
+    let policy = document.static_policy().unwrap();
+    assert!(policy.rules().is_empty());
+    assert_eq!(policy.scripts().len(), 1);
+    assert!(policy.plain_port(80));
+    assert!(!policy.plain_port(81));
+    assert!(!policy.is_prepared());
+    let script = &policy.scripts()[0];
+    assert_eq!(script.name, "example");
+    assert_eq!(script.phase, Phase::Request);
+    assert_eq!(script.body, BodyMode::Bytes);
+    assert!(script.matches(&Url::parse("https://example.test/api/item").unwrap()));
+    assert!(!script.matches(&Url::parse("https://example.test/other").unwrap()));
+
+    let disabled = Policy::compile(&inline_script_document(false, "none", PASS_SCRIPT)).unwrap();
+    assert!(disabled.scripts().is_empty());
+    assert_eq!(disabled.all_scripts().len(), 1);
+    assert!(!disabled.plain_port(80));
+    assert!(disabled.is_prepared());
+}
+
+#[cfg(feature = "inbound-http")]
+#[test]
+fn inline_script_schema_is_strict_even_when_disabled() {
+    for invalid in [
+        "http-scripts: null",
+        "http-scripts: {enabled: null}",
+        "http-scripts: {scripts: null}",
+        "http-scripts: {scripts: [], provider: remote}",
+    ] {
+        assert!(Document::parse(invalid).is_err());
+    }
+    let valid = inline_script_document(false, "text", PASS_SCRIPT);
+    for (field, invalid) in [
+        ("name", serde_yaml_ng::Value::String(String::new())),
+        ("phase", serde_yaml_ng::Value::String("cron".into())),
+        ("body", serde_yaml_ng::Value::Null),
+        ("match", serde_yaml_ng::Value::String("automatic".into())),
+        (
+            "source",
+            serde_yaml_ng::Value::String("function rewrite(".into()),
+        ),
+        ("url", serde_yaml_ng::Value::String("[".into())),
+        (
+            "script-path",
+            serde_yaml_ng::Value::String("remote.js".into()),
+        ),
+    ] {
+        let mut value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&valid).unwrap();
+        value["http-scripts"]["scripts"][0][field] = invalid;
+        assert!(
+            Document::parse(&serde_yaml_ng::to_string(&value).unwrap()).is_err(),
+            "accepted invalid script field {field}"
+        );
+    }
+    assert!(
+        Payload::parse(
+            format!(
+                "payload: []\n{}",
+                inline_script_document(true, "none", PASS_SCRIPT)
+            )
+            .as_bytes()
+        )
+        .is_err()
+    );
+}
+
+#[cfg(feature = "inbound-http")]
+#[test]
+fn inline_script_sources_are_hashed_and_frozen_in_actual_snapshots() {
+    let original = Document::parse(&inline_script_document(true, "none", PASS_SCRIPT)).unwrap();
+    let candidate = original.compile(&BTreeMap::new()).unwrap();
+    let exported = candidate.export_snapshot().unwrap();
+    let restored = PolicyCandidate::import_snapshot(&exported).unwrap();
+    assert_eq!(candidate.identity(), restored.identity());
+    assert_eq!(restored.scripts.len(), 1);
+    let snapshot: serde_yaml_ng::Value = serde_yaml_ng::from_str(&exported).unwrap();
+    assert_eq!(
+        snapshot["document"]["http-scripts"]["scripts"][0]["source"].as_str(),
+        Some(PASS_SCRIPT)
+    );
+    for other in [
+        inline_script_document(false, "none", PASS_SCRIPT),
+        inline_script_document(true, "text", PASS_SCRIPT),
+        inline_script_document(true, "none", &format!("{PASS_SCRIPT}\n")),
+        inline_script_document(true, "none", PASS_SCRIPT)
+            .replace("phase: request", "phase: response"),
+        inline_script_document(true, "none", PASS_SCRIPT).replace("match: prefix", "match: exact"),
+        inline_script_document(true, "none", PASS_SCRIPT).replace("name: example", "name: other"),
+    ] {
+        let changed = Document::parse(&other).unwrap();
+        assert_ne!(original.identity(), changed.identity());
+        assert_eq!(restored.identity(), candidate.identity());
+    }
+}
+
+#[cfg(all(feature = "inbound-http", not(target_vendor = "apple")))]
+#[tokio::test]
+async fn unsupported_script_backend_fails_preparation_before_external_resources() {
+    use crate::http_processing::providers::{SourceContext, Store};
+    let input = format!(
+        "rewrite-providers: {{missing: {{type: file, path: missing.yaml}}}}\nrewrite: {{rules: [{{rule-set: missing}}]}}\n{}",
+        inline_script_document(true, "none", PASS_SCRIPT)
+    );
+    let document = Document::parse(&input).unwrap();
+    let error = Store::new()
+        .prepare(
+            document,
+            &SourceContext::default(),
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+            false,
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    let candidate = Document::parse(&inline_script_document(true, "none", PASS_SCRIPT))
+        .unwrap()
+        .compile(&BTreeMap::new())
+        .unwrap();
+    assert_eq!(
+        candidate.bind_ca(None).err().unwrap().kind(),
+        io::ErrorKind::Unsupported
+    );
+}

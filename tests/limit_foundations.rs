@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
     use vole::{ResourceLimits, dispatch, transport};
     let defaults = ResourceLimits::default();
-    let expected = BTreeMap::from([
+    let mut expected = BTreeMap::from([
         ("tuic-quic-payload", vole::limits::TUIC_QUIC_PAYLOAD),
         ("tuic-control-readers", vole::limits::TUIC_CONTROL_READERS),
         ("tuic-send-window", vole::limits::TUIC_SEND_WINDOW),
@@ -99,6 +99,7 @@ fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
         ("udp-payload", defaults.max_datagram_size),
         ("tun-packet", defaults.tun_max_datagram_size),
         ("tcp-buffer", defaults.tcp_buffer_per_direction),
+        ("tun-tcp-send-buffer", defaults.tun_tcp_send_buffer),
         ("dns-cache", defaults.dns_address_cache_entries),
         ("dns-hints", defaults.dns_redir_host_entries),
         (
@@ -158,18 +159,16 @@ fn registry_matches_live_production_constants_and_has_owned_boundary_cases() {
         serde_json::from_str(include_str!("protocols/limits.json")).unwrap();
     let rows = registry["limits"].as_array().unwrap();
     assert_eq!(rows.len(), expected.len());
-    let mut actual = BTreeMap::new();
     for row in rows {
         let id = row["id"].as_str().unwrap();
-        assert!(
-            actual
-                .insert(id, row["value"].as_u64().unwrap() as usize)
-                .is_none()
+        assert_eq!(
+            Some(row["value"].as_u64().unwrap() as usize),
+            expected.remove(id),
+            "stale, unknown or duplicate limit: {id}"
         );
         for key in ["unit", "owner", "saturation", "cancellation"] {
             assert!(!row[key].as_str().unwrap().is_empty());
         }
         assert!(!row["boundary_cases"].as_array().unwrap().is_empty());
     }
-    assert_eq!(actual, expected);
 }

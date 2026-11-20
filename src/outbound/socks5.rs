@@ -66,6 +66,8 @@ pub struct Socks5Outbound {
     auth: Option<Socks5Auth>,
     upstream: UpstreamPath,
     tls: Option<StandardTlsClient>,
+    #[cfg(feature = "inbound-http")]
+    http_reuse_security_static: bool,
 }
 
 impl std::fmt::Debug for Socks5Outbound {
@@ -134,6 +136,13 @@ impl Socks5Outbound {
             server: server_destination(&config.address, config.port)?,
             auth,
             upstream,
+            #[cfg(feature = "inbound-http")]
+            http_reuse_security_static: config.tls.as_ref().is_none_or(|tls| {
+                tls.identity
+                    .as_ref()
+                    .is_none_or(|identity| identity.origin.is_none())
+                    && tls.ech.as_ref().is_none_or(|ech| !ech.is_dynamic())
+            }),
             tls: config
                 .tls
                 .as_ref()
@@ -259,6 +268,11 @@ impl Socks5Outbound {
 
 #[async_trait]
 impl OutboundConnector for Socks5Outbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        self.http_reuse_security_static && self.upstream.permits_static_http_reuse(&self.server)
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,
@@ -278,6 +292,11 @@ impl OutboundConnector for Socks5Outbound {
 
 #[async_trait]
 impl Dispatcher for Socks5Outbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        OutboundConnector::permits_http_tcp_reuse(self)
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         OutboundConnector::connect_stream(self, session, &EstablishContext::default())
             .await

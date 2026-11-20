@@ -34,6 +34,10 @@ pub struct NetStackConfig {
     /// Must be even and at least 4096 bytes, split equally between smoltcp and
     /// the application-facing receive queue.
     pub tcp_recv_buffer: usize,
+    /// Opt in to a Driver-owned empty-mapping cache for the application RX
+    /// queue on Unix. The smoltcp array and all logical byte limits are
+    /// unchanged. Defaults false; unsupported targets keep bounded Vec storage.
+    pub map_tcp_recv_buffer: bool,
     /// Total send bytes per TCP flow, from `TcpStream::AsyncWrite` to raw IP.
     ///
     /// Must be even and at least 4096 bytes, split equally between smoltcp and
@@ -58,6 +62,7 @@ impl Default for NetStackConfig {
             tcp_accept_queue: 32,
             udp_queue: 128,
             tcp_recv_buffer: 32 * 1024,
+            map_tcp_recv_buffer: false,
             tcp_send_buffer: 32 * 1024,
             tcp_idle_timeout: Duration::from_mins(2),
             max_poll_interval: Duration::from_millis(100),
@@ -159,6 +164,7 @@ mod tests {
         assert_eq!(config.tcp_accept_queue, 32);
         assert_eq!(config.udp_queue, 128);
         assert_eq!(config.tcp_recv_buffer, 32 * 1024);
+        assert!(!config.map_tcp_recv_buffer);
         assert_eq!(config.tcp_send_buffer, 32 * 1024);
         assert_eq!(config.recv_layer_buffer_size(), 16 * 1024);
         assert_eq!(config.send_layer_buffer_size(), 16 * 1024);

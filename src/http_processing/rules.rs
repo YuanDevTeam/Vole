@@ -1,6 +1,6 @@
 //! The common flat HTTP rule schema and pure, bounded rule compiler.
 use regex::{Regex, RegexBuilder};
-use std::io;
+use std::{collections::BTreeMap, io, sync::Arc};
 use url::Url;
 
 #[path = "rule_schema.rs"]
@@ -35,7 +35,28 @@ pub(crate) struct Rule {
 pub(crate) enum Matcher {
     Exact(Box<str>),
     Prefix(Box<str>),
-    Regex(Regex),
+    Regex(Arc<Regex>),
+}
+
+/// One native-selector builder profile, scoped to one candidate compilation.
+#[derive(Default)]
+pub(crate) struct SelectorCompiler {
+    regexes: BTreeMap<Box<str>, Arc<Regex>>,
+}
+
+impl SelectorCompiler {
+    fn regex(&mut self, pattern: &str) -> io::Result<Arc<Regex>> {
+        if let Some(regex) = self.regexes.get(pattern) {
+            return Ok(Arc::clone(regex));
+        }
+        if self.regexes.len() == MAX_RULES {
+            return Err(invalid());
+        }
+        // Exact pattern bytes plus this fixed builder profile form the key.
+        let regex = Arc::new(bounded_regex(pattern)?);
+        self.regexes.insert(pattern.into(), Arc::clone(&regex));
+        Ok(regex)
+    }
 }
 
 pub(crate) enum RuleAction {
@@ -150,7 +171,15 @@ impl RawRule {
 }
 
 impl Rule {
-    pub(crate) fn compile(mut raw: RawRule, total_text: &mut usize) -> io::Result<Self> {
+    pub(crate) fn compile(raw: RawRule, total_text: &mut usize) -> io::Result<Self> {
+        Self::compile_with_selectors(raw, total_text, &mut SelectorCompiler::default())
+    }
+
+    pub(crate) fn compile_with_selectors(
+        mut raw: RawRule,
+        total_text: &mut usize,
+        selectors: &mut SelectorCompiler,
+    ) -> io::Result<Self> {
         let next_text = total_text
             .checked_add(raw.text_size()?)
             .ok_or_else(invalid)?;
@@ -172,7 +201,7 @@ impl Rule {
             return Err(invalid());
         }
         let selector = match raw.match_kind {
-            MatchKind::Regex => Matcher::Regex(bounded_regex(&raw.url)?),
+            MatchKind::Regex => Matcher::Regex(selectors.regex(&raw.url)?),
             MatchKind::Exact => Matcher::Exact(checked_url(&raw.url)?.as_str().into()),
             MatchKind::Prefix => Matcher::Prefix(checked_url(&raw.url)?.as_str().into()),
         };

@@ -520,3 +520,40 @@ fn transient_read_failure_retries_after_permissions_recover_without_content_chan
     context.identities.refresh(&CancellationToken::new());
     assert_identity(&identity, &b, 2);
 }
+
+#[cfg(all(
+    feature = "inbound-http",
+    feature = "outbound-shadowsocks",
+    feature = "shadow-tls-v3"
+))]
+#[test]
+fn shadowtls_http_reuse_uses_actual_inline_or_published_file_identity_storage() {
+    let identity = chain_with_usage(false, ExtendedKeyUsagePurpose::ClientAuth);
+    let context = SecurityContext::new();
+    let files = Files::new(&identity);
+    let mut options = crate::config::ShadowTlsConfig {
+        server_name: "cover.invalid".into(),
+        password: "synthetic-relay".into(),
+        alpn: vec![],
+        required_alpn: None,
+        identity: None,
+        certificate: Default::default(),
+        client_fingerprint: None,
+    };
+    let absent = crate::security::ShadowTlsClient::new(&context, &options).unwrap();
+    let absent_allowed = absent.permits_ss_http_reuse();
+    options.identity = Some(identity.identity_pem());
+    let inline = crate::security::ShadowTlsClient::new(&context, &options).unwrap();
+    let inline_allowed = inline.permits_ss_http_reuse();
+    options.identity = Some(files.configuration());
+    let published = crate::security::ShadowTlsClient::new(&context, &options).unwrap();
+    let published_rejected = !published.permits_ss_http_reuse();
+    let plain =
+        crate::security::SecurityClient::from_security(&crate::config::SecurityConfig::None)
+            .unwrap();
+    let other_backend_rejected = !plain.permits_ss_shadowtls_http_reuse();
+    drop((
+        absent, inline, published, plain, options, context, files, identity,
+    ));
+    assert!(absent_allowed && inline_allowed && published_rejected && other_backend_rejected);
+}

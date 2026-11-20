@@ -91,6 +91,14 @@ struct Bounded {
     observation: Option<crate::resources::observation::Guard>,
 }
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "datagram_tun_send_memory_tests.rs"]
+mod tun_send_memory_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "datagram_batch_memory_tests.rs"]
+mod batch_memory_tests;
+
 #[async_trait::async_trait]
 impl DatagramTransport for Bounded {
     #[cfg(all(
@@ -152,6 +160,46 @@ impl DatagramTransport for Bounded {
             return Err(datagram);
         }
         self.inner.send_owned(datagram)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn try_begin_tun_send(
+        &mut self,
+        datagram: Datagram,
+        flow_id: Option<&[u8]>,
+    ) -> Result<super::TunPendingSend, Datagram> {
+        if self.closing
+            || datagram.payload.len()
+                > usize::from(self.payload_budget(&datagram.remote).transmit())
+        {
+            return Err(datagram);
+        }
+        self.inner.try_begin_tun_send(datagram, flow_id)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn finish_tun_send(
+        &mut self,
+        completion: super::TunSendToken,
+        outcome: super::TunSendOutcome,
+    ) -> Result<(), DispatchError> {
+        self.inner.finish_tun_send(completion, outcome).await
+    }
+
+    #[cfg(target_os = "macos")]
+    fn send_batch_owned(
+        &mut self,
+        datagrams: Vec<Datagram>,
+    ) -> Result<super::OwnedDatagramBatchSend, Vec<Datagram>> {
+        if self.closing
+            || super::datagram_batch_peer(&datagrams).is_none()
+            || datagrams.iter().any(|packet| {
+                packet.payload.len() > usize::from(self.payload_budget(&packet.remote).transmit())
+            })
+        {
+            return Err(datagrams);
+        }
+        self.inner.send_batch_owned(datagrams)
     }
 
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {

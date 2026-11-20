@@ -15,10 +15,8 @@
 Tokio `new_multi_thread()`，不按 TUN 分叉，不自行读取 CPU 数或设置 worker 数。
 worker 数遵循 Tokio 默认行为（包括其 `TOKIO_WORKER_THREADS` 环境覆盖）；
 线程栈使用 Tokio / Rust 默认值，不固定为 1 MiB。
-启动准备和 `measureDelay` 保留共用的单线程执行策略，不按 TUN 分叉。
-工作线程（含阻塞任务线程）继承 Invoke 重入保护，
-Apple 平台另保留线程局部日志作用域；同步停止仍等待子任务与运行时线程退出。
-Release 构建优先吞吐（`opt-level = 3`），保留 thin LTO 与现有缓冲、队列边界。
+Apple 引擎在自建 owner 及 Tokio 新线程入口尽力请求 USER_INITIATED QoS。
+宿主调用线程保持自身策略。该观测记录公开的请求等级，线程释放按实际 join 确认。
 
 ## TUN 结构上限
 
@@ -30,7 +28,9 @@ Release 构建优先吞吐（`opt-level = 3`），保留 thin LTO 与现有缓�
 每关联 UDP 入站                 64
 普通 UDP 响应                   256
 DNS 响应                        128
-每个 TUN TCP 方向缓冲区         4 KiB
+TUN TCP 转发复制缓冲（每方向）   4 KiB
+TUN TCP 接收总预算（每流）       32 KiB
+TUN TCP 发送总预算（每流）       128 KiB
 TLS / 流式 XHTTP 缓冲区         64 KiB
 XHTTP packet-up 单批             H1/H2 64 KiB；H3 128 KiB
 DNS 结果总容量（每角色）         默认 4,096 项，dns.cache-max-size
@@ -55,17 +55,17 @@ MTU 由 `tun.mtu` 配置，默认值和平台限制统一见 [TUN 平台层](tun
 ## TCP 与握手
 
 - TCP 流按需创建任务；TUN 转发每方向缓冲区为 4 KiB。
-- netstack 的 TCP 应用队列从空分配按实际写入有界增长，保留每方向 16 KiB 逻辑上限；排空不收缩，连接释放时销毁。smoltcp 收发缓冲仍各为 16 KiB，不用进程内存或连接总数改变容量。
-- WireGuard 与 MASQUE H2/IP 的私有主动栈使用 64 KiB TCP 发送总预算：
-  smoltcp 32 KiB 与按需应用队列 32 KiB。接收总预算仍为 32 KiB；
-  MASQUE H3/IP、共享 TUN 与通用 netstack 默认值保持原样。
+- 生产 TUN 的 TCP 接收总预算默认 32 KiB，smoltcp RX 与应用接收队列各 16 KiB；发送总预算默认 128 KiB，smoltcp TX 与应用发送队列各 64 KiB。Rust `ResourceLimits::tun_tcp_send_buffer` 独立于原 `tcp_buffer_per_direction`，后者仍为 32 KiB 并用于 TUN 接收及原共享流缓冲；显式容量原样传递，不倍乘或钳制，不新增 YAML/Invoke 字段。所有平台 TUN 共用该策略。
+- 应用队列按需增长并保持原容量。Unix 发送队列达到 64 KiB 时可使用匿名映射 ring；显式 `NetStackConfig::map_tcp_recv_buffer` 可为接收队列启用独立映射，默认关闭。映射不可用或 owner 已停止时使用有界 VecDeque。
+- 每个 Driver 按方向最多缓存四个已排空的映射，缓存请求长度合计受方向预算约束，只复用相同长度。Stop 清空缓存，未读数据和活动切片继续由实际 owner 持有至释放。Apple WireGuard 和 macOS MASQUE H3/IP 私有栈启用接收映射。逻辑容量、映射末页和进程内存采用各自口径。
+- WireGuard 私有主动栈的 TCP 接收总预算为 128 KiB：smoltcp 数组与按需应用队列
+  各 64 KiB；发送总预算为 64 KiB，两部分各 32 KiB。MASQUE H2/IP 接收总预算为 96 KiB，
+  发送为 64 KiB；H3/IP 接收为 128 KiB，发送与通用 netstack 默认值同为 32 KiB。
+  缩小接收预算同时缩小内层 TCP 通告窗口，较高 RTT 或应用消费停顿时可能限制吞吐；
+  分配容量差不等于进程 physical footprint 的固定节省量。
   节点业务与私有 DNS 的 TCP 共用该主动栈；此预算不改变内层 UDP、原始包队列或连接数量策略。
 - rustls/流式 XHTTP 的配置缓冲区为 64 KiB；boring 每次应用写入最多 min(节点缓冲预算, 16 KiB)，原生 TLS 记录有界，命名模板证书消息/解压输出另限 128 KiB。
-- 标准 TLS 恢复会话总预算为 4，按节点（含独立下载端点）分配；每个缓存绑定不可变的 SNI、ALPN 和证书策略，绝不跨节点复用。TLS 1.3 票据有界、一次性消费，TLS 1.2 会话占用同一额度；额度为 0 则禁用恢复。REALITY 不参与该缓存。
-- 共享 TLS 客户端的显式验证名、协议版本和 ClientHello profile 固定。内联客户端身份固定；文件身份整对校验后供新物理连接取快照，旧连接保留原身份。票据按节点和身份代隔离，换代后拒绝旧票据和旧连接晚到的票据，各代共用原节点总容量。boring 在应用层 ALPN 接受前不发布票据，失败或取消丢弃临时票据。标准 TLS 和 REALITY CloseWrite 只发送 close_notify，刷新最多5秒，保持读方向和底层传输；Drop 释放整个流。XHTTP 仍以逻辑连接整体关闭为准。
-- 半开连接、出站握手和活动会话只记录当前值和峰值，不触发资源错误。
-- 超时、取消、EOF 和协议错误负责回收；停止必须等待全部已跟踪任务结束。
-- 引导解析器最多使用四个工作线程；全部忙时在调用方既有期限内等待，不返回人为容量错误。
+- 业务 MITM 下游 rustls 写缓冲上限使用默认 64 KiB。H2 下游每响应流的发送容量为 64 KiB，上游客户端为 16 KiB。流信用、共享正文账本、生命周期和回退见 [HTTP 处理](http-processing.md)。
 
 ### 物理 socket 初始化
 
@@ -128,15 +128,30 @@ Trojan UDP 接收直接读入既有的有界帧缓存，每次最多读取 2 KiB
 
 公共 sing-mux 包装器按节点拥有独立池，只消费底层协议到约定目标的 TCP IO。
 每池最多保留16条闲连接；命令/物理写队列16项、写块16 KiB。smux接收帧共享每物理连接的字节预算，单流队列槽数由该预算推导；当前默认值见[XHTTP/sing-mux](xhttp.md#通用-sing-mux)。
-h2mux每流接收窗口64 KiB、连接接收窗口512 KiB，按实际读取量释放信用。
+h2mux 专用客户端每流接收窗口 128 KiB、连接接收窗口 1 MiB。实际使用共享 H3 PacketUp
+载体的 h2mux 连接窗口为 1.5 MiB。流和连接均按实际读取量释放信用。
+接收信用按收到的正文使用；各流保留 128 KiB DATA 时，八条流可用尽 1 MiB，
+十二条流可用尽 1.5 MiB。
+已复制／已归还信用的数据与 TLS 等缓冲独立计量，进程 footprint 仍须实际验收。
 连接额度允许少量未读取流占住各自窗口时，其他逻辑流继续接收；不预分配全部窗口。
 yamux单连接累计接纳64流后退役，连接接收窗口16 MiB；活动兄弟流继续。
 满足 XHTTP PacketUp 自主写条件的私有 h2mux，普通 DATA 仅在现有 h2 capacity
 范围内移交驱动后接纳，16 KiB 发送缓冲不变。每逻辑流固定一个确认状态，物理 flush
 列表每流至多一个弱引用登记；不按 DATA 保留 oneshot。显式 flush/END_STREAM 前仍确认
 真实 supplied IO flush，首帧期限、部分写取消、来源隔离和同步 Stop 不变；不新增任务或全局额度。
+私有自主 H2Mux 的非空 DATA 写入依靠 h2 在报告容量前及缓存 DATA 前检查关闭状态，
+避免每次另取连接锁查询 reset。零容量等待仍订阅原 send waiter；容量关闭/错误仍使私有
+确认失败并唤醒。空写保留 reset 查询，显式 flush/FIN 等待确认期间也保留原 reset 查询；
+不改变普通 gRPC/H2、写预算、队列或 Stop。
 私有 h2mux 的底层写入有正进度而 flush Pending 时，以一个布尔状态触发一次驱动重调度；
 没有后续写入便不再自唤醒。重调度不分配队列或确认状态，也不把 Pending 当作 flush 完成。
+可信 VLESS PacketUp、无 Encryption／显式下载、无 padding 且 only-tcp=false 的 H3 Body
+可为 h2mux／yamux 使用原单正文128KiB与两个有序响应槽。限定 Yamux carrier 另有独立的
+固定128KiB初始QUIC发送留存；不取得H2Mux的UDP升档control，也不把其channel-ready flush
+当作物理IO证明。预算资格改变时隔离clone私有池，原活动租约仍由原owner收尾；其它路径
+及H2Mux初始64KiB／元数据flush后256KiB不变。上述资格均在节点发布前固定，
+不需要业务HTTP静态身份或inbound-http能力；它改变同一既有认证逻辑流内的POST批次、
+响应重叠和限定physical发送留存，不新增跨路由／身份物理复用，不改变逻辑flush、FIN或Stop。
 h2mux/yamux上传半关闭保留读取与lease，smux v1关闭整条逻辑流。
 图只登记最终包装器；begin_shutdown同时关闭mux和底层准入，shutdown先join全部
 mux驱动，再等待底层协议。provider代际与node-only测速复用此屏障，没有全局池。
@@ -207,6 +222,8 @@ UoT 写入最多暂持一帧及偏移；取消单次发送后，后续收发先�
 
 `quic-transport` 只把已有 `DatagramTransport` 适配成 Quinn/quiche 共用的受控 UDP 接口，没有内部 bind、DNS 或 DIRECT 回落。每个连接双向各最多32个排队数据报，另允许一个正在发送的包；TX满返回WouldBlock，RX满暂停读取。接收等待不会持有发送队列锁；Pending发送不会重复提交。单逻辑peer/物理peer映射和来源校验独立保留，不接受未请求的目标、GSO或源地址覆盖。物理 socket 仍只能来自 Dialer。
 已打开且受保护的 UDP 路径可借出一个在途发送操作；驱动等待发送或 pacing 时继续接收，保持32包队列与一个发送中的包。首次发送仍由原路径完成初始化；上游不支持此能力时沿用原发送。停止先释放在途操作，再关闭并释放上游。
+macOS 的通用 QUIC owner 在 DIRECT 已打开的同一受保护 socket 上，可将当前就绪 FIFO 前缀按最多4包、合计8KiB提交；不等凑批，不改变逻辑分段或 pacing。批次只克隆既有 Bytes 句柄，原包仍留在32项队列作为唯一容量账本，确认正数的实际发送前缀后才消费、计数和释放容量，不增加32+4的负载容量。物理操作逐包使用 Tokio 的公开 poll_send_to（macOS MASQUE H3/IP、H3/L4及WireGuard 的固定直接物理路径使用公开 poll_send）：首包 Pending 保留同一发送操作，正数前缀后的 Pending 立即返回该实际前缀，未发送后缀保留原位；不依赖私有批量 syscall ABI，也不把多包拼为单个 UDP 数据报。等待发送时接收继续推进。能力不可用或批次不足时沿原单包路径；实际错误或异常短发送不回退重放，原错误种类沿有界 close/drop/join 返回。Stop先释放批次引用与原发送租约，再关闭上游。非macOS及未提供物理批量能力的代理、codec、pacer保持原路径。
+macOS MASQUE H3/IP、H3/L4及WireGuard 的直接声明 Direct/LazyDirect 路径可准备一个新代际、单peer的connected UDP socket；仍只有共享Dialer创建socket。首次原send在bind/protect/接口策略/取消检查后连接同一socket，成功才公布原Arc；失败或初始化future取消不允许同代际再次bind/connect，不回落到send_to。所有send入口先校验完整SocketAddr；Group/Proxy/codec不携带该意图，H2及其它平台或协议保持原路径。接收仍使用原recv_from、32次就绪重查和预算加一字节检测；kernel来源过滤和ICMP错误可观察差异不被掩盖。Stop先释放原在途发送，再关闭该socket的全部原持有者，不增加任务、队列、缓存或期限。
 立即就绪的读取、发送容量与发送完成检查不登记新的等待者；仅在同一状态锁内确认 Pending 后登记唤醒，保留后续数据、容量恢复、取消与 Stop 的通知。
 队列通知采用边沿：TX由空变非空、RX由满变为有容量时通知驱动；已排队TX由就绪条件继续推进。
 普通RX消费保持底层已有的接收等待，避免逐包取消并重建同一等待。
@@ -223,10 +240,14 @@ XHTTP 和 DoH/H3 通过 `quinn-h3-transport` 使用官方 h3/h3-quinn，共享�
 XHTTP packet-up 的单批 backing（含正在发送的正文）上限为 H1/H2 64 KiB、H3 128 KiB，
 并与该 writer 采样的 POST 上限取较小值；按需扩容，不积累第二份正文。普通路径等待完整
 POST 响应才释放写背压和确认 flush。无 Encryption、无独立下载、无 padding 且 only-tcp=false
-的 VLESS h2mux，仅 H3 packet-up body/auto 上传保留最多两个未退役响应槽：发送 FIN 完成、
+的 VLESS h2mux／yamux，仅 H3 packet-up body/auto 上传保留最多两个未退役响应槽：发送 FIN 完成、
 最后正文引用释放并归还唯一 Vec，且槽未满后才能复用正文；flush 仍等待连续成功响应。
-每批只有一份有界 owner 元数据，不复制正文，也不增加 QUIC 窗口、队列或停止预算。该 backing
-上限不是进程 RSS 上限；HTTP/QUIC codec、发送窗口和 allocator 的共同持有峰值需实测。
+每批只有一份有界 owner 元数据，不复制正文；响应重叠本身不增加 QUIC 窗口、队列或停止预算。
+H2Mux 的 UDP 发送留存升档继续使用其独立证明；限定 Yamux 路径只设置固定128KiB初始留存，
+没有自适应升档，其它路径仍64KiB。这是每physical留存的已接收应用字节界，已ACK但未释放
+的存储仍计入，较大allocation切片也可能持有更多内存；它不是等量预分配、socket队列、
+拥塞窗口或进程footprint上限。backing、HTTP/QUIC codec、发送窗口和allocator的共同持有
+峰值仍须实测，并满足原平台内存政策。
 
 `quiche-h3-transport` 为 TrustTunnel/MASQUE 使用官方 quiche 的低层驱动，共享上述数据报适配器，不创建新的 socket。
 接收时移动既有队列中的数据报，独占存储直接交给 quiche 原地解密；共享或不可变存储
@@ -239,6 +260,10 @@ TrustTunnel H3 使用 quiche 的本地发送容量比例 0.5，按当前可用�
 容量不足不能单独证明对端流控信用耗尽，不据此丢弃业务 UDP 帧。
 帧开始写入后必须完成；部分写入失败或被取消时关闭该来源关联，不丢弃帧尾后继续发送下一帧。
 MASQUE 与其余 quiche H3 默认使用原生比例 1.0。
+
+共享 CONNECT 字节流允许读侧推进待发送块并继续接收。读写两侧分别登记等待者，
+底层发送通知唤醒两侧；读侧完成待发送块时也通知写侧，保持各自任务的进度。
+通知不新增任务、数据队列或发送信用，停止仍释放待发送块、收发句柄与租约。
 
 QUIC双向可用payload至少1,200字节；endpoint必须显式把QUIC MTU限制在有效预算内。IPv4/IPv6路径MTU分别先扣除28/48字节IP+UDP头，边界和单字节不足均有定向测试。
 
@@ -255,6 +280,10 @@ DoQ 初始及最小发送 payload 为 1200 字节，接收预算独立保留，�
 TUIC 的独立会话、关联 ID 退役、控制流、分片负载
 及交付队列边界见 [TUIC v5](outbounds.md#tuic-v5)。旧池的待建流也持有所有权，
 不能在等待 credit 时被当成空闲池回收。TUIC 业务 UDP 队列使用独立观测类别。
+启用 UoT 时，普通 TCP 与内部 magic Connect 分别使用原两个当前槽；单连接的
+所有者阈值、窗口、队列与 FIN 保留不变。分池可能增加同时活动的物理连接及其状态，
+退休会话仍由旧租约持有；两个当前槽不是最多两个 live 连接，也不是节点总内存上界。
+
 native 接收循环每处理最多 512 个就绪事件主动让出执行权，quic relay 保持 32 个；
 底层异步等待和协作式调度可更早让出，不增加接收或交付队列。
 
@@ -393,7 +422,7 @@ Stop 的同步释放屏障完成后，Apple 通过 malloc zone、GNU/Linux 通�
 
 - 未使用 TUN 时不配置 allocator、不启动周期采样或 Stop 回收。
 - 采样失败只记录一次警告，不写入 `lastError`。
-- 43/45 MiB 阈值分别对应默认 1 Gbps 与 2 Gbps 的预算，仅作诊断；Core 不推断负载档位，最终由 benchmark 按实际负载判定。这些观测不改变 prepare、start、running、stop 或 panic recovery。
+- Core 的 43/45 MiB 遥测阈值用于日志诊断。平台压力预算和进程观测范围见[验收边界](acceptance.md#内存与环境)。
 - Stop 后的 allocator 回收只执行一次且尽力而为，不保证立即降低进程内存。
 
 内存预算与真实设备范围见[验收边界](acceptance.md)。

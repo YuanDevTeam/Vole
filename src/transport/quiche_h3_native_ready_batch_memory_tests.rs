@@ -122,6 +122,9 @@ impl Wire {
             connection: Some(client),
             h3: Some(h3),
             streams: BTreeMap::new(),
+            retired: BTreeSet::new(),
+            retired_cursor: None,
+            retired_debt: 0,
             closed: false,
             goaway: false,
             ready: true,
@@ -381,4 +384,602 @@ fn quiche_h3_native_memory_data_fin_preserves_delivered_prefix_until_finished_po
             .unwrap()
             .is_err()
     );
+}
+
+// Real QUIC/TLS/H3 packets exercise cancellation collection independently of
+// application Body removal, including flow control and shared-owner fairness.
+fn halves(wire: &Wire, id: u64) -> (SendStream, RecvStream) {
+    let signals = wire.client.shared.state.lock().unwrap().streams[&id]
+        .signals
+        .clone();
+    (
+        SendStream {
+            client: wire.client.clone(),
+            id,
+            signals: signals.clone(),
+        },
+        RecvStream {
+            client: wire.client.clone(),
+            id,
+            signals,
+        },
+    )
+}
+
+fn poll_retirement_peer(peer: &mut NativeConnection, h3: &mut quiche::h3::Connection) {
+    for _ in 0..256 {
+        match h3.poll(peer) {
+            Ok(_) => {}
+            Err(quiche::h3::Error::Done) => return,
+            Err(error) => panic!("memory retirement peer H3 protocol error: {error:?}"),
+        }
+    }
+    panic!("memory retirement peer H3 work bound exceeded");
+}
+
+// Real wire progress without running the candidate reaper, so tests can place
+// an already-collected suffix behind an unacknowledged prefix.
+fn exchange_without_reaping(wire: &mut Wire, turns: usize) {
+    for _ in 0..turns {
+        let mut state = wire.client.shared.state.lock().unwrap();
+        state
+            .connection
+            .as_mut()
+            .unwrap()
+            .send_ack_eliciting()
+            .unwrap();
+        transfer(
+            state.connection.as_mut().unwrap(),
+            &mut wire.peer,
+            wire.local,
+            wire.remote,
+        );
+        poll_retirement_peer(&mut wire.peer, &mut wire.peer_h3);
+        wire.peer.send_ack_eliciting().unwrap();
+        if transfer(
+            &mut wire.peer,
+            state.connection.as_mut().unwrap(),
+            wire.remote,
+            wire.local,
+        ) != 0
+        {
+            // Mirrors the owner hook only after actual native recv succeeded.
+            state.retired_debt = state.retired.len();
+        }
+        super::process_h3(&mut state, &mut { WORK }).unwrap();
+    }
+}
+
+fn admit_retirement_requests(wire: &mut Wire, count: usize) -> Vec<u64> {
+    let mut ids = wire.ids.to_vec();
+    {
+        let mut state = wire.client.shared.state.lock().unwrap();
+        for _ in 0..count {
+            let request = Request::builder()
+                .method(http::Method::CONNECT)
+                .uri("https://example.invalid/")
+                .body(())
+                .unwrap();
+            let headers = request_headers(&request).unwrap();
+            let State {
+                connection,
+                h3,
+                streams,
+                ..
+            } = &mut *state;
+            let id = h3
+                .as_mut()
+                .unwrap()
+                .send_request(connection.as_mut().unwrap(), &headers, false)
+                .unwrap();
+            streams.insert(id, Body::new(Arc::new(Signals::default())));
+            ids.push(id);
+        }
+    }
+    for _ in 0..8 {
+        let mut state = wire.client.shared.state.lock().unwrap();
+        transfer(
+            state.connection.as_mut().unwrap(),
+            &mut wire.peer,
+            wire.local,
+            wire.remote,
+        );
+        let mut drained = false;
+        for _ in 0..256 {
+            match wire.peer_h3.poll(&mut wire.peer) {
+                Ok((id, quiche::h3::Event::Headers { .. })) => {
+                    wire.peer_h3
+                        .send_response(
+                            &mut wire.peer,
+                            id,
+                            &[quiche::h3::Header::new(b":status", b"200")],
+                            false,
+                        )
+                        .unwrap();
+                }
+                Ok(_) => {}
+                Err(quiche::h3::Error::Done) => {
+                    drained = true;
+                    break;
+                }
+                Err(error) => panic!("memory retirement admission H3 error: {error:?}"),
+            }
+        }
+        assert!(
+            drained,
+            "memory retirement admission H3 work bound exceeded"
+        );
+        transfer(
+            &mut wire.peer,
+            state.connection.as_mut().unwrap(),
+            wire.remote,
+            wire.local,
+        );
+        super::process_h3(&mut state, &mut { WORK }).unwrap();
+    }
+    for id in &ids {
+        assert_eq!(
+            wire.client.shared.state.lock().unwrap().streams[id]
+                .headers
+                .as_ref()
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    ids
+}
+
+fn exchange_reset_wire(wire: &mut Wire, id: u64) {
+    for _ in 0..128 {
+        let mut state = wire.client.shared.state.lock().unwrap();
+        // Synthetic PINGs make ACK progress observable without sleeps, an OS
+        // socket, a new task, or fabricated acknowledgement state.
+        state
+            .connection
+            .as_mut()
+            .unwrap()
+            .send_ack_eliciting()
+            .unwrap();
+        transfer(
+            state.connection.as_mut().unwrap(),
+            &mut wire.peer,
+            wire.local,
+            wire.remote,
+        );
+        poll_retirement_peer(&mut wire.peer, &mut wire.peer_h3);
+        wire.peer.send_ack_eliciting().unwrap();
+        if transfer(
+            &mut wire.peer,
+            state.connection.as_mut().unwrap(),
+            wire.remote,
+            wire.local,
+        ) != 0
+        {
+            state.retired_debt = state.retired.len();
+        }
+        super::process_h3(&mut state, &mut { WORK }).unwrap();
+        super::reap_retired_h3(&mut state, &mut { WORK });
+        let native = state.connection.as_mut().unwrap();
+        if native.stream_closed(id)
+            && matches!(
+                native.stream_capacity(id),
+                Err(quiche::Error::InvalidStreamState(_))
+            )
+        {
+            return;
+        }
+    }
+    panic!("native reset was not collected within bounded real wire exchanges");
+}
+
+fn assert_h3_forgotten_without_wire_output(wire: &Wire, id: u64) {
+    let mut state = wire.client.shared.state.lock().unwrap();
+    let State { connection, h3, .. } = &mut *state;
+    let native = connection.as_mut().unwrap();
+    assert!(native.stream_closed(id));
+    assert!(matches!(
+        native.stream_capacity(id),
+        Err(quiche::Error::InvalidStreamState(_))
+    ));
+    let sent = native.stats().sent;
+    // The native absent/collected gate is the no-output proof. Packet count
+    // below is auxiliary, not proof that an arbitrary API queued no FIN.
+    // This is a mutable public API probe, not a getter. An empty non-FIN body
+    // is deliberately rejected before native output. Done means a stale H3
+    // entry survived; FrameUnexpected means the request entry is absent.
+    assert!(matches!(
+        h3.as_mut().unwrap().send_body(native, id, &[], false),
+        Err(quiche::h3::Error::FrameUnexpected)
+    ));
+    assert_eq!(native.stats().sent, sent);
+}
+
+#[test]
+fn quiche_h3_native_memory_dropped_halves_retire_h3_after_actual_native_collection() {
+    for read_first in [false, true] {
+        let mut wire = Wire::new();
+        let id = wire.ids[0];
+        let (mut send, receive) = halves(&wire, id);
+        if read_first {
+            drop(receive);
+            // The surviving upload and its Body stay owned until its Drop.
+            assert!(
+                wire.client
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .streams
+                    .contains_key(&id)
+            );
+            send.stop_stream(REQUEST_CANCELLED);
+            send.stop_stream(REQUEST_CANCELLED); // Explicit stop + Drop is idempotent.
+            drop(send);
+        } else {
+            drop(send);
+            assert!(
+                wire.client
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .streams
+                    .contains_key(&id)
+            );
+            drop(receive);
+        }
+        assert!(
+            !wire
+                .client
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .streams
+                .contains_key(&id)
+        );
+        exchange_reset_wire(&mut wire, id);
+        // One extra owner turn covers collection caused by the final native
+        // capacity check, without advancing a timer or resetting the carrier.
+        super::reap_retired_h3(&mut wire.client.shared.state.lock().unwrap(), &mut { WORK });
+        assert_h3_forgotten_without_wire_output(&wire, id);
+        assert!(wire.client.shared.state.lock().unwrap().retired.is_empty());
+
+        let sibling = wire.ids[1];
+        wire.peer_h3
+            .send_body(&mut wire.peer, sibling, b"sibling", false)
+            .unwrap();
+        wire.receive_wire();
+        wire.publish(&mut { WORK });
+        let (_sibling_send, mut sibling_receive) = halves(&wire, sibling);
+        assert_eq!(
+            sibling_receive
+                .recv_response()
+                .now_or_never()
+                .unwrap()
+                .unwrap()
+                .status(),
+            200
+        );
+        let data = futures_util::future::poll_fn(|cx| sibling_receive.poll_recv_data(cx))
+            .now_or_never()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(data.as_ref(), b"sibling");
+        assert!(wire.client.can_open_request());
+    }
+}
+
+#[test]
+fn quiche_h3_native_memory_retirement_waits_without_fin_under_actual_backpressure() {
+    let mut wire = Wire::new();
+    let id = wire.ids[0];
+    let (send, receive) = halves(&wire, id);
+    // Fill the real native/H3 sender until it rejects new data. No model or
+    // forced credit variable stands in for transport backpressure.
+    {
+        let mut state = wire.client.shared.state.lock().unwrap();
+        let State { connection, h3, .. } = &mut *state;
+        let mut blocked = false;
+        for _ in 0..256 {
+            match h3.as_mut().unwrap().send_body(
+                connection.as_mut().unwrap(),
+                id,
+                &[0x61; CHUNK],
+                false,
+            ) {
+                Ok(_) => {}
+                Err(quiche::h3::Error::Done) => {
+                    blocked = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected memory backpressure result: {error:?}"),
+            }
+        }
+        assert!(blocked);
+    }
+    drop(send);
+    drop(receive);
+    {
+        let mut state = wire.client.shared.state.lock().unwrap();
+        let native = state.connection.as_mut().unwrap();
+        let sent = native.stats().sent;
+        assert!(!super::retire_collected_h3(&mut state, id));
+        let mut budget = 1;
+        assert!(!super::reap_retired_h3(&mut state, &mut budget));
+        assert_eq!(budget, 0);
+        assert!(state.retired.contains(&id));
+        assert_eq!(state.connection.as_ref().unwrap().stats().sent, sent);
+        assert!(!state.streams.contains_key(&id));
+    }
+    exchange_reset_wire(&mut wire, id);
+    super::reap_retired_h3(&mut wire.client.shared.state.lock().unwrap(), &mut { WORK });
+    assert_h3_forgotten_without_wire_output(&wire, id);
+    // The same final owner teardown used by Driver::run drops all native/H3
+    // state and tombstones. Full driver stop/join remains covered separately.
+    wire.client.shared.finish();
+    let state = wire.client.shared.state.lock().unwrap();
+    assert!(state.streams.is_empty() && state.retired.is_empty());
+    assert!(state.h3.is_none() && state.connection.is_none());
+}
+
+#[test]
+fn quiche_h3_native_memory_pending_retirement_round_robin_uses_only_shared_allowance() {
+    let wire = Wire::new();
+    for id in wire.ids {
+        let (send, receive) = halves(&wire, id);
+        drop(send);
+        drop(receive);
+    }
+    let mut state = wire.client.shared.state.lock().unwrap();
+    assert_eq!(state.retired.len(), 2);
+    let mut allowance = 1;
+    assert!(super::reap_retired_h3(&mut state, &mut allowance));
+    assert_eq!(allowance, 0);
+    let first = state.retired_cursor;
+    // The second pass in the SAME owner turn has zero remaining work.
+    assert!(super::reap_retired_h3(&mut state, &mut allowance));
+    assert_eq!(state.retired_cursor, first);
+    allowance = 1;
+    assert!(!super::reap_retired_h3(&mut state, &mut allowance));
+    assert_eq!(allowance, 0);
+    assert_ne!(state.retired_cursor, first);
+    assert_eq!(state.retired.len(), 2);
+    assert!(state.streams.is_empty());
+    drop(state);
+    wire.client.shared.finish();
+    assert!(wire.client.shared.state.lock().unwrap().retired.is_empty());
+}
+
+#[test]
+fn quiche_h3_native_memory_graceful_fin_does_not_add_reset_or_retirement() {
+    let mut wire = Wire::new();
+    let id = wire.ids[0];
+    let (mut send, mut receive) = halves(&wire, id);
+    send.finish().now_or_never().unwrap().unwrap();
+    wire.peer_h3
+        .send_body(&mut wire.peer, id, &[], true)
+        .unwrap();
+    for _ in 0..4 {
+        let mut state = wire.client.shared.state.lock().unwrap();
+        transfer(
+            state.connection.as_mut().unwrap(),
+            &mut wire.peer,
+            wire.local,
+            wire.remote,
+        );
+        poll_retirement_peer(&mut wire.peer, &mut wire.peer_h3);
+        transfer(
+            &mut wire.peer,
+            state.connection.as_mut().unwrap(),
+            wire.remote,
+            wire.local,
+        );
+        super::process_h3(&mut state, &mut { WORK }).unwrap();
+    }
+    assert_eq!(
+        receive
+            .recv_response()
+            .now_or_never()
+            .unwrap()
+            .unwrap()
+            .status(),
+        200
+    );
+    assert!(
+        futures_util::future::poll_fn(|cx| receive.poll_recv_data(cx))
+            .now_or_never()
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    let before = wire
+        .client
+        .shared
+        .state
+        .lock()
+        .unwrap()
+        .connection
+        .as_ref()
+        .unwrap()
+        .stats();
+    drop(receive);
+    drop(send);
+    let state = wire.client.shared.state.lock().unwrap();
+    let after = state.connection.as_ref().unwrap().stats();
+    assert_eq!(
+        after.reset_stream_count_local,
+        before.reset_stream_count_local
+    );
+    assert_eq!(
+        after.stopped_stream_count_local,
+        before.stopped_stream_count_local
+    );
+    assert!(state.retired.is_empty());
+    assert!(!state.streams.contains_key(&id));
+}
+
+#[test]
+fn quiche_h3_native_memory_peer_stop_sending_collection_is_rechecked_in_same_drop() {
+    let mut wire = Wire::new();
+    // Consume response FIN BEFORE the upload is stopped. Reading FIN after
+    // RESET/ACK could collect native state in stream_recv and miss the exact
+    // capacity-query branch this regression must exercise.
+    for id in wire.ids {
+        wire.peer_h3
+            .send_body(&mut wire.peer, id, &[], true)
+            .unwrap();
+    }
+    for _ in 0..4 {
+        let mut state = wire.client.shared.state.lock().unwrap();
+        transfer(
+            &mut wire.peer,
+            state.connection.as_mut().unwrap(),
+            wire.remote,
+            wire.local,
+        );
+        super::process_h3(&mut state, &mut { WORK }).unwrap();
+    }
+    {
+        let mut state = wire.client.shared.state.lock().unwrap();
+        for id in wire.ids {
+            assert!(
+                state.streams[&id].finished,
+                "response FIN not consumed before STOP for {id}"
+            );
+            let native = state.connection.as_mut().unwrap();
+            // Actual public writable-interest registration, above this real
+            // stream's 128 KiB credit; no private flag or fabricated state.
+            // STOP sees was_writable=false and links the writable notification
+            // which ACK collection preserves until StreamStopped is consumed.
+            let writable = native.stream_writable(id, 1024 * 1024);
+            assert!(
+                matches!(writable, Ok(false)),
+                "expected blocked writable interest for {id}: {writable:?}"
+            );
+        }
+    }
+    // Now encode STOP_SENDING separately, then exchange genuine RESET/ACKs.
+    // No later FIN read is allowed to consume the collection opportunity.
+    for id in wire.ids {
+        wire.peer
+            .stream_shutdown(id, quiche::Shutdown::Read, REQUEST_CANCELLED)
+            .unwrap();
+    }
+    exchange_without_reaping(&mut wire, 64);
+    {
+        let mut state = wire.client.shared.state.lock().unwrap();
+        let native = state.connection.as_mut().unwrap();
+        let control = wire.ids[0];
+        assert!(native.stream_closed(control));
+        // This real stopped stream demonstrates the API's one-call-late
+        // return: the first query collects but still reports StreamStopped.
+        let first = native.stream_capacity(control);
+        assert!(
+            matches!(first, Err(quiche::Error::StreamStopped(_))),
+            "first stopped capacity query must collect and report StreamStopped: {first:?}"
+        );
+        let second = native.stream_capacity(control);
+        assert!(
+            matches!(second, Err(quiche::Error::InvalidStreamState(_))),
+            "second capacity query must see native collection: {second:?}"
+        );
+    }
+    let id = wire.ids[1];
+    let (send, receive) = halves(&wire, id);
+    drop(receive);
+    drop(send);
+    // No new packet, timer, reaper turn or caller-side capacity query occurs
+    // between the last Drop and this assertion.
+    assert_h3_forgotten_without_wire_output(&wire, id);
+    assert!(
+        !wire
+            .client
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .retired
+            .contains(&id)
+    );
+}
+
+#[test]
+fn quiche_h3_native_memory_finite_sweep_reaches_ready_tail_after_unacked_prefix() {
+    let mut wire = Wire::new();
+    let ids = admit_retirement_requests(&mut wire, WORK);
+    assert_eq!(ids.len(), WORK + 2);
+    let (waiting, ready) = ids.split_at(WORK);
+    // Retire the high-ID suffix and let its genuine RESET/ACK exchange finish.
+    // The candidate reaper is deliberately not run during this wire flush.
+    for &id in ready {
+        let (send, receive) = halves(&wire, id);
+        drop(send);
+        drop(receive);
+    }
+    exchange_without_reaping(&mut wire, 64);
+    {
+        let mut state = wire.client.shared.state.lock().unwrap();
+        for &id in ready {
+            let native = state.connection.as_mut().unwrap();
+            assert!(native.stream_closed(id));
+            if matches!(
+                native.stream_capacity(id),
+                Err(quiche::Error::StreamStopped(_))
+            ) {
+                assert!(matches!(
+                    native.stream_capacity(id),
+                    Err(quiche::Error::InvalidStreamState(_))
+                ));
+            }
+            assert!(matches!(
+                native.stream_capacity(id),
+                Err(quiche::Error::InvalidStreamState(_))
+            ));
+            assert!(state.retired.contains(&id));
+        }
+    }
+    // Now retire the lower IDs without delivering their STOP/RESET to the
+    // peer. No later RX event is available to rescue an incorrectly stopped
+    // first batch. Every ID was a real admitted request, not a fake tombstone.
+    for &id in waiting {
+        let (send, receive) = halves(&wire, id);
+        drop(send);
+        drop(receive);
+    }
+    {
+        let mut state = wire.client.shared.state.lock().unwrap();
+        assert_eq!(state.retired.len(), ids.len());
+        assert_eq!(state.retired_debt, ids.len());
+        assert!(state.streams.is_empty());
+        let mut allowance = WORK;
+        assert!(super::reap_retired_h3(&mut state, &mut allowance));
+        assert_eq!(allowance, 0);
+        assert_eq!(state.retired_debt, 2);
+        assert!(ready.iter().all(|id| state.retired.contains(id)));
+        allowance = WORK;
+        assert!(!super::reap_retired_h3(&mut state, &mut allowance));
+        assert_eq!(allowance, WORK - 2);
+        assert_eq!(state.retired_debt, 0);
+        assert_eq!(state.retired.len(), waiting.len());
+        assert!(ready.iter().all(|id| !state.retired.contains(id)));
+        let cursor = state.retired_cursor;
+        // A peer which never ACKs cannot cause an unbounded cleanup self-loop.
+        for _ in 0..4 {
+            allowance = WORK;
+            assert!(!super::reap_retired_h3(&mut state, &mut allowance));
+            assert_eq!(allowance, WORK);
+            assert_eq!(state.retired_cursor, cursor);
+            assert_eq!(state.retired_debt, 0);
+        }
+    }
+    for &id in ready {
+        assert_h3_forgotten_without_wire_output(&wire, id);
+    }
+    wire.client.shared.finish();
+    let state = wire.client.shared.state.lock().unwrap();
+    assert!(state.retired.is_empty());
+    assert_eq!(state.retired_debt, 0);
 }

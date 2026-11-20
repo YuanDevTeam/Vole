@@ -32,6 +32,7 @@ use crate::{
         classify_query,
         runtime::{DnsQueryPermit, RuntimeDns},
     },
+    http_processing::diagnostics::{Counter, increment, record_tun_ingress_header},
     platform::{TUN_PACKET_BATCH_SIZE, TunIo},
     quic_sniffer::QuicSniffer,
     resources::{
@@ -104,7 +105,7 @@ fn tun_netstack_config(limits: ResourceLimits, fake_icmp_echo: bool) -> NetStack
         packet_queue: limits.packet_queue_capacity,
         tcp_accept_queue: limits.event_queue_capacity,
         tcp_recv_buffer: limits.tcp_buffer_per_direction,
-        tcp_send_buffer: limits.tcp_buffer_per_direction,
+        tcp_send_buffer: limits.tun_tcp_send_buffer,
         fake_icmp_echo,
         ..NetStackConfig::default()
     }
@@ -233,6 +234,10 @@ impl TunRuntime {
             fake_icmp_echo = self.fake_icmp_echo,
             "TUN runtime starting"
         );
+        #[cfg(feature = "http-diagnostics")]
+        let parts =
+            NetStack::start_tcp_observed(config, observe_tun_driver).map_err(netstack_to_io)?;
+        #[cfg(not(feature = "http-diagnostics"))]
         let parts = NetStack::start_tcp(config).map_err(netstack_to_io)?;
         let control = parts.control.clone();
         let netstack_stats = parts.stats.clone();
@@ -314,6 +319,31 @@ impl TunRuntime {
         log_netstack_stats(TUN_NETSTACK_STATS_FINAL_EVENT, &netstack_stats);
         resource_stats.log_final();
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(feature = "http-diagnostics")]
+fn observe_tun_driver(event: vole_netstack::diagnostics::DriverObservation) {
+    use crate::http_processing::diagnostics::add_counter;
+    use vole_netstack::diagnostics::DriverObservation;
+    match event {
+        DriverObservation::DrivePass {
+            tcp_entry_visits,
+            app_rx_bytes,
+            app_tx_bytes,
+            no_data_progress,
+        } => {
+            increment(Counter::TunNetstackDriverDrivePasses);
+            add_counter(Counter::TunNetstackDriverTcpEntryVisits, tcp_entry_visits);
+            add_counter(Counter::TunNetstackDriverAppRxBytes, app_rx_bytes);
+            add_counter(Counter::TunNetstackDriverAppTxBytes, app_tx_bytes);
+            if no_data_progress {
+                increment(Counter::TunNetstackDriverNoDataProgressPasses);
+            }
+        }
+        DriverObservation::WaitIngress => increment(Counter::TunNetstackDriverWaitIngress),
+        DriverObservation::WaitNotify => increment(Counter::TunNetstackDriverWaitNotify),
+        DriverObservation::WaitTimer => increment(Counter::TunNetstackDriverWaitTimer),
     }
 }
 
@@ -475,12 +505,17 @@ async fn tun_read_inner(
         let up_bytes = packets
             .iter()
             .zip(&outcomes)
-            .fold(0usize, |bytes, (packet, outcome)| {
-                if outcome.is_ok() {
+            .fold(0usize, |bytes, (packet, outcome)| match outcome {
+                Ok(_) => {
+                    increment(Counter::TunIngressReadOkPackets);
+                    record_tun_ingress_header(packet);
                     bytes.saturating_add(packet.len())
-                } else {
+                }
+                Err(VoleError::InvalidPacket(_)) => {
+                    increment(Counter::TunIngressReadInvalidPacketOutcomes);
                     bytes
                 }
+                Err(_) => bytes,
             });
         if up_bytes != 0 {
             traffic_stats.record_up(up_bytes);
@@ -515,6 +550,7 @@ async fn tun_read_inner(
             // UDP bypasses PacketSink, so retain the same effective MTU check
             // before creating an association or admitting a DNS query.
             if packet.len() > mtu {
+                increment(Counter::TunIngressMtuExceededDrops);
                 tracing::debug!(
                     packet_bytes = packet.len(),
                     mtu,
@@ -540,6 +576,7 @@ async fn tun_read_inner(
             .await
             {
                 Ok(()) => {
+                    increment(Counter::TunIngressNetstackAcceptedPackets);
                     if !first_ingress_logged {
                         tracing::info!("netstack accepted first TUN packet");
                         first_ingress_logged = true;
@@ -553,10 +590,13 @@ async fn tun_read_inner(
                     | NetStackError::Backpressure),
                 ) => {
                     if matches!(error, NetStackError::Backpressure) {
+                        increment(Counter::TunIngressNetstackBackpressureDrops);
                         udp.context.resource_stats.queue_drop(
                             ResourceQueue::Packet,
                             udp.context.limits.packet_queue_capacity,
                         );
+                    } else if matches!(error, NetStackError::MtuExceeded { .. }) {
+                        increment(Counter::TunIngressMtuExceededDrops);
                     }
                     tracing::debug!(
                         error_code = ?error, "dropping packet rejected by netstack ingress"
@@ -898,19 +938,19 @@ async fn relay_tcp(
     let (mut inbound, dispatcher) = {
         let mut prefix = Vec::new();
         let mut selected = dispatcher;
-        if let Some(http) = selected.http_context()
-            && http.candidate_port(destination_port)
-        {
-            match http
-                .try_intercept(&mut inbound, session.clone(), cancellation.clone())
-                .await
-            {
-                Ok(crate::http_processing::Intercept::Handled) => return,
-                Ok(crate::http_processing::Intercept::Transparent { prefix: bytes }) => {
-                    prefix = bytes;
-                    selected = http.dispatcher().clone();
+        if let Some(http) = selected.http_context() {
+            selected = http.dispatcher().clone();
+            if http.candidate_port(destination_port) {
+                match http
+                    .try_intercept(&mut inbound, session.clone(), cancellation.clone())
+                    .await
+                {
+                    Ok(crate::http_processing::Intercept::Handled) => return,
+                    Ok(crate::http_processing::Intercept::Transparent { prefix: bytes }) => {
+                        prefix = bytes;
+                    }
+                    Err(_) => return,
                 }
-                Err(_) => return,
             }
         }
         (
@@ -974,7 +1014,13 @@ async fn relay_tcp(
         let replayed = tokio::select! {
             biased;
             () = cancellation.cancelled() => return,
-            replayed = timeout(OUTBOUND_SEND_TIMEOUT, outbound.write_all(&prefetched)) => replayed,
+            replayed = timeout(OUTBOUND_SEND_TIMEOUT, async {
+                outbound.write_all(&prefetched).await?;
+                // Buffered protocol writers may accept the whole sniffed
+                // flight without sending it. The relay has no knowledge of
+                // that earlier write, so finish it before waiting for a reply.
+                outbound.flush().await
+            }) => replayed,
         };
         match replayed {
             Ok(Ok(())) => {}
@@ -1534,6 +1580,8 @@ enum AssociationEvent<'a> {
     Cancelled,
     SniffDeadline,
     ReadySend,
+    #[cfg(target_os = "macos")]
+    SendFinished(crate::dispatch::TunSendOutcome),
     Inbound(Option<UdpDatagram>),
     Outbound(Result<Datagram, DispatchError>),
     ResponseCapacity(Result<mpsc::Permit<'a, QueuedUdpResponse>, mpsc::error::SendError<()>>),
@@ -1604,11 +1652,10 @@ async fn wait_for_quic_sniff_deadline(deadline: Option<TokioInstant>) {
     }
 }
 
-async fn send_tun_udp_datagram(
-    transport: &mut dyn DatagramTransport,
+async fn prepare_tun_udp_datagram(
     prepared: PreparedTunUdpDatagram,
     context: &UdpAssociationTaskContext,
-) -> io::Result<bool> {
+) -> io::Result<(Datagram, Option<crate::quic_sniffer::QuicConnectionKey>)> {
     let PreparedTunUdpDatagram {
         datagram,
         mut sniffed_domain,
@@ -1634,6 +1681,25 @@ async fn send_tun_udp_datagram(
         payload: datagram.payload,
         sniffed_domain,
     };
+    Ok((datagram, flow_id))
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+async fn send_tun_udp_datagram(
+    transport: &mut dyn DatagramTransport,
+    prepared: PreparedTunUdpDatagram,
+    context: &UdpAssociationTaskContext,
+) -> io::Result<bool> {
+    let (datagram, flow_id) = prepare_tun_udp_datagram(prepared, context).await?;
+    send_prepared_tun_udp_datagram(transport, datagram, flow_id, context).await
+}
+
+async fn send_prepared_tun_udp_datagram(
+    transport: &mut dyn DatagramTransport,
+    datagram: Datagram,
+    flow_id: Option<crate::quic_sniffer::QuicConnectionKey>,
+    context: &UdpAssociationTaskContext,
+) -> io::Result<bool> {
     let send_datagram = async {
         match flow_id {
             Some(flow_id) => {
@@ -1652,6 +1718,69 @@ async fn send_tun_udp_datagram(
     match send {
         Ok(Ok(())) => Ok(true),
         Ok(Err(error)) => Err(dispatch_to_io(error)),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "TUN UDP outbound send timed out",
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct PendingTunOperation {
+    send: crate::dispatch::TunPendingSend,
+    deadline: TokioInstant,
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_tun_send(
+    pending: &mut Option<PendingTunOperation>,
+) -> crate::dispatch::TunSendOutcome {
+    use crate::dispatch::TunSendOutcome;
+    match pending.as_mut() {
+        Some(pending) => {
+            match tokio::time::timeout_at(pending.deadline, pending.send.operation.as_mut()).await {
+                Ok(result) => TunSendOutcome::Completed(result),
+                Err(_) => TunSendOutcome::TimedOut,
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn complete_tun_send(
+    transport: &mut dyn DatagramTransport,
+    pending: PendingTunOperation,
+    outcome: crate::dispatch::TunSendOutcome,
+) -> io::Result<()> {
+    use crate::dispatch::{TunPendingSend, TunSendOutcome};
+    let TunPendingSend {
+        operation,
+        completion,
+    } = pending.send;
+    // The pinned route may close only after IO, including UniSend, is gone.
+    drop(operation);
+    let externally_cancelled = matches!(&outcome, TunSendOutcome::Cancelled);
+    let finish = transport.finish_tun_send(completion, outcome);
+    tokio::pin!(finish);
+    // First-poll completion releases each wrapper's single pin before its
+    // first await, even if the original IO deadline has already elapsed.
+    if let std::task::Poll::Ready(result) = futures_util::poll!(finish.as_mut()) {
+        return if externally_cancelled {
+            Ok(())
+        } else {
+            result.map_err(dispatch_to_io)
+        };
+    }
+    let deadline = if externally_cancelled {
+        TokioInstant::now() + UDP_CLOSE_TIMEOUT
+    } else {
+        pending.deadline
+    };
+    match tokio::time::timeout_at(deadline, finish).await {
+        Ok(result) if !externally_cancelled => result.map_err(dispatch_to_io),
+        Ok(_) => Ok(()),
+        Err(_) if externally_cancelled => Ok(()),
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "TUN UDP outbound send timed out",
@@ -1721,8 +1850,14 @@ where
     };
     let mut first_response_logged = false;
     let mut received_in_burst = 0;
+    #[cfg(target_os = "macos")]
+    let mut owned_send: Option<PendingTunOperation> = None;
+    // Preserve ordinary protocol early-error behavior. Only a leased operation
+    // adds mandatory drop/completion cleanup before this result escapes.
+    let result: io::Result<()> = async {
     loop {
         let sniff_deadline = quic_sniff.next_deadline();
+        #[cfg(target_os = "macos")]
         let event = tokio::select! {
             biased;
             () = context.cancellation.cancelled() => AssociationEvent::Cancelled,
@@ -1732,6 +1867,21 @@ where
             // Drain a ready response before accepting another datagram from
             // this same source. Fairness between the ordinary and DNS TUN
             // response queues is handled independently by the sole TUN writer.
+            permit = context.responses.reserve(), if pending_response.datagram.is_some() => {
+                AssociationEvent::ResponseCapacity(permit)
+            }
+            outcome = wait_tun_send(&mut owned_send) => AssociationEvent::SendFinished(outcome),
+            datagram = async { transport.receive().await }, if pending_response.datagram.is_none() => AssociationEvent::Outbound(datagram),
+            () = std::future::ready(()), if (pending_send.is_some() || !ready.is_empty()) && owned_send.is_none() => AssociationEvent::ReadySend,
+            datagram = inbound.recv(), if owned_send.is_none() => AssociationEvent::Inbound(datagram),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let event = tokio::select! {
+            biased;
+            () = context.cancellation.cancelled() => AssociationEvent::Cancelled,
+            () = wait_for_quic_sniff_deadline(sniff_deadline), if sniff_deadline.is_some() => {
+                AssociationEvent::SniffDeadline
+            }
             permit = context.responses.reserve(), if pending_response.datagram.is_some() => {
                 AssociationEvent::ResponseCapacity(permit)
             }
@@ -1760,9 +1910,30 @@ where
                     .take()
                     .or_else(|| ready.pop_front())
                     .expect("ready-send event requires a queued datagram");
-                if !send_tun_udp_datagram(transport.as_mut(), prepared, context).await? {
-                    break;
+                #[cfg(target_os = "macos")]
+                {
+                    let (datagram, flow_id) = prepare_tun_udp_datagram(prepared, context).await?;
+                    // Original send selects parent cancellation before polling
+                    // transport.send after this asynchronous preparation.
+                    if context.cancellation.is_cancelled() { break; }
+                    let identity = flow_id.as_ref().map(|id| id.routing_identity());
+                    let deadline = TokioInstant::now() + OUTBOUND_SEND_TIMEOUT;
+                    match transport.try_begin_tun_send(datagram, identity.as_ref().map(|id| id.as_slice())) {
+                        Ok(send) => owned_send = Some(PendingTunOperation { send, deadline }),
+                        Err(datagram) => {
+                            if !send_prepared_tun_udp_datagram(transport.as_mut(), datagram, flow_id, context).await? {
+                                break;
+                            }
+                        }
+                    }
                 }
+                #[cfg(not(target_os = "macos"))]
+                if !send_tun_udp_datagram(transport.as_mut(), prepared, context).await? { break; }
+            }
+            #[cfg(target_os = "macos")]
+            AssociationEvent::SendFinished(outcome) => {
+                let pending = owned_send.take().expect("one pending TUN send");
+                complete_tun_send(transport.as_mut(), pending, outcome).await?;
             }
             AssociationEvent::Inbound(Some(datagram)) => {
                 let sniff_quic = if let Some(plan) = context
@@ -1837,6 +2008,21 @@ where
             }
         }
     }
+    Ok(())
+    }.await;
+    #[cfg(target_os = "macos")]
+    if let Some(pending) = owned_send.take() {
+        // Also covers receive errors, response closure, sniff errors and cancel.
+        // No operation can outlive the transport or reach close while leased.
+        let _ = complete_tun_send(
+            transport.as_mut(),
+            pending,
+            crate::dispatch::TunSendOutcome::Cancelled,
+        )
+        .await;
+    }
+    // Unsupported early errors retain the original no-extra-close behavior.
+    result?;
     match timeout(UDP_CLOSE_TIMEOUT, transport.close()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -1883,6 +2069,13 @@ fn dispatch_to_io(error: DispatchError) -> io::Error {
         DispatchError::RuleEvaluation(failure) => io::Error::other(failure),
     }
 }
+
+#[cfg(all(feature = "interop-test", unix))]
+pub(crate) mod interop;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "tun_runtime/tun_send_completion_memory_tests.rs"]
+mod tun_send_completion_memory_tests;
 
 #[cfg(all(test, unix))]
 mod tests;

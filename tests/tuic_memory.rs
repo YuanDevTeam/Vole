@@ -910,7 +910,7 @@ async fn association_id_exhaustion_retires_without_reuse_or_migrating_old_stream
 }
 
 #[tokio::test]
-async fn quic_partial_control_streams_have_a_credit_bound_and_expire_without_blocking_tcp() {
+async fn quic_partial_control_streams_expire_without_blocking_tcp() {
     let (mut config, udp_path, endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
     let (_, tcp_path, tcp_endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
     config.stream_window = vole::config::QuicReceiveWindow {
@@ -944,11 +944,8 @@ async fn quic_partial_control_streams_have_a_credit_bound_and_expire_without_blo
                 .unwrap();
             partial.push(stream);
         }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), connection.open_uni())
-                .await
-                .is_err()
-        );
+        // These 32 actual partial decoders retain their admission TTL.
+        // Advertised UNI credit has its separate real lane controls below.
         ready.send(()).unwrap();
         for stream in &partial {
             assert_eq!(
@@ -1126,6 +1123,318 @@ async fn cancelled_uni_credit_wait_does_not_replay_or_close_sibling_tcp() {
         .await;
     finish(endpoint, peer).await;
     finish(tcp_endpoint, tcp_peer).await;
+}
+
+// This case deliberately exercises the private TUN association entry through
+// production Observed -> Routed -> Connector -> normal TUIC, not a fake sender.
+// All assertions follow unconditional cancellation, Stop and owner joins.
+#[cfg(all(feature = "tun", target_os = "macos"))]
+#[tokio::test]
+async fn tun_tuic_reply_progresses_while_same_association_uni_send_waits_for_credit() {
+    for tracked in [false, true] {
+        tun_tuic_duplex_case(tracked).await;
+    }
+}
+
+#[cfg(all(feature = "tun", target_os = "macos"))]
+async fn tun_tuic_duplex_case(tracked: bool) {
+    use std::{net::SocketAddr, task::Poll};
+    use vole::{
+        config::{ProxyId, RouteTargetId, RuleAction, RuleKind, RuleSpec},
+        dispatch::Dispatcher,
+        outbound::ConnectorDispatcher,
+        routing::{EmptyGeoMatcher, ProxyDispatchers, RoutingDispatcher, RuleSet},
+    };
+
+    async fn checked_auth(endpoint: &quinn::Endpoint) -> Result<quinn::Connection, &'static str> {
+        let incoming = endpoint.accept().await.ok_or("peer accept closed")?;
+        let connection = incoming.await.map_err(|_| "peer handshake failed")?;
+        let mut auth_stream = connection
+            .accept_uni()
+            .await
+            .map_err(|_| "auth stream missing")?;
+        let auth = auth_stream
+            .read_to_end(50)
+            .await
+            .map_err(|_| "auth frame failed")?;
+        let mut expected = [0; 32];
+        connection
+            .export_keying_material(&mut expected, &[7; 16], b" raw\0context ")
+            .map_err(|_| "auth exporter failed")?;
+        if auth.len() != 50
+            || auth[..18] != [5, 0, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]
+            || auth[18..] != expected
+        {
+            return Err("auth identity differed");
+        }
+        Ok(connection)
+    }
+
+    async fn join_peer(mut task: tokio::task::JoinHandle<Result<(), &'static str>>) -> bool {
+        match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+            Ok(Ok(result)) => result.is_ok(),
+            Ok(Err(_)) => false,
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                false
+            }
+        }
+    }
+
+    let (mut config, udp_path, endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
+    let (_, tcp_path, tcp_endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
+    config.stream_window = vole::config::QuicReceiveWindow {
+        initial: 256 * 1024,
+        maximum: 256 * 1024,
+    };
+    config.connection_window = vole::config::QuicReceiveWindow {
+        initial: 1024 * 1024,
+        maximum: 1024 * 1024,
+    };
+    config.disable_mtu_discovery = true;
+    let paths = Arc::new(Paths(Mutex::new(VecDeque::from([udp_path, tcp_path]))));
+    let outbound =
+        Arc::new(TuicOutbound::new_with_path(&config, UpstreamPath::proxy(paths.clone())).unwrap());
+    let connector: Arc<dyn Dispatcher> = Arc::new(ConnectorDispatcher::new(outbound.clone()));
+    let rules = RuleSet::compile(vec![RuleSpec {
+        kind: RuleKind::Match,
+        no_resolve: true,
+        action: RuleAction::Route(RouteTargetId::Proxy(ProxyId::new(0).unwrap())),
+    }])
+    .unwrap();
+    // Even the unused DIRECT entry is the real memory-only connector. No branch
+    // in this fixture can resolve a name or create a host socket.
+    let router = RoutingDispatcher::new(
+        ProxyDispatchers::new(vec![connector.clone()]).unwrap(),
+        connector,
+        None,
+        rules.clone(),
+        Arc::new(EmptyGeoMatcher),
+    );
+    let (router, registry) = if tracked {
+        // Diagnostics uses the same real TUIC node identity and rule index;
+        // it only enables the existing production tracked routing path.
+        let diagnostic_config = Config::parse_yaml(
+            serde_json::json!({
+                "mixed-port": 1080,
+                "proxies": [{
+                    "name": "peer", "type": "tuic", "server": "192.0.2.1", "port": 443,
+                    "uuid": "07070707-0707-0707-0707-070707070707",
+                    "password": " raw\u{0000}context ", "sni": "fixture.invalid",
+                    "skip-cert-verify": true, "congestion-controller": "cubic",
+                    "udp": true, "udp-relay-mode": "quic"
+                }],
+                "rules": ["MATCH,peer"]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let (router, registry) =
+            vole::interop_tracked_tun_router(router, &diagnostic_config, &rules);
+        (router, Some(registry))
+    } else {
+        (router, None)
+    };
+    let router: Arc<dyn Dispatcher> = Arc::new(router);
+    let source: SocketAddr = "192.0.2.10:12000".parse().unwrap();
+    let destination: SocketAddr = "198.51.100.20:80".parse().unwrap();
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let peer_endpoint = endpoint.clone();
+    let peer = tokio::spawn(async move {
+        let connection = checked_auth(&peer_endpoint).await?;
+        let mut unread = Vec::with_capacity(2);
+        let mut association = None;
+        for _ in 0..2 {
+            let mut stream = connection
+                .accept_uni()
+                .await
+                .map_err(|_| "credit stream missing")?;
+            let mut header = [0; 10];
+            stream
+                .read_exact(&mut header)
+                .await
+                .map_err(|_| "UDP header missing")?;
+            if header[..2] != [5, 2] || header[6..] != [1, 0, 0, 1] {
+                return Err("UDP frame differed");
+            }
+            let id = [header[2], header[3]];
+            if association.is_some_and(|previous| previous != id) {
+                return Err("UDP association changed");
+            }
+            association = Some(id);
+            // Retain address and payload unread: neither receive stream reaches
+            // EOF, so both real Quinn UNI credits remain occupied.
+            unread.push(stream);
+        }
+        held_tx
+            .send(())
+            .map_err(|_| "credit witness receiver closed")?;
+        reply_rx.await.map_err(|_| "reply authorization closed")?;
+        // This probes the real exhausted credit; it never releases either held
+        // stream. The TUN future has already consumed and polled the third send.
+        if tokio::time::timeout(Duration::from_millis(40), connection.accept_uni())
+            .await
+            .is_ok()
+        {
+            return Err("third send escaped exhausted UNI credit");
+        }
+        let [hi, lo] = association.ok_or("association missing")?;
+        let mut response = connection
+            .open_uni()
+            .await
+            .map_err(|_| "reply stream failed")?;
+        response
+            .write_all(&[
+                5, 2, hi, lo, 0, 0, 1, 0, 0, 1, 1, 198, 51, 100, 20, 0, 80, b'r',
+            ])
+            .await
+            .map_err(|_| "reply write failed")?;
+        response.finish().map_err(|_| "reply finish failed")?;
+        connection.closed().await;
+        drop(unread);
+        Ok(())
+    });
+    let peer_endpoint = tcp_endpoint.clone();
+    let tcp_peer = tokio::spawn(async move {
+        let connection = checked_auth(&peer_endpoint).await?;
+        let (mut send, mut recv) = connection
+            .accept_bi()
+            .await
+            .map_err(|_| "TCP stream missing")?;
+        let mut wire = [0; 8];
+        recv.read_exact(&mut wire)
+            .await
+            .map_err(|_| "TCP request missing")?;
+        if wire != *b"\x05\x01\x00\x01x\x00\x50a" {
+            return Err("sibling TCP frame differed");
+        }
+        send.write_all(b"a").await.map_err(|_| "TCP reply failed")?;
+        connection.closed().await;
+        Ok(())
+    });
+    let probe = ResourceProbe::default();
+    let (observed, association_stopped, outbound_stopped, both_paths_used) = probe
+        .scope(async {
+            let (input, mut replies, cancellation, mut association) =
+                vole::interop_tun_udp_association(router.clone(), source);
+            let observed: Result<(), &'static str> = async {
+                for _ in 0..2 {
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        tokio::select! {
+                            biased;
+                            _ = &mut association => Err("association ended during setup"),
+                            result = input.send(vole_netstack::UdpDatagram::new(
+                                source, destination, bytes::Bytes::from_static(b"x"),
+                            )) => result.map_err(|_| "TUN input closed"),
+                        }
+                    })
+                    .await
+                    .map_err(|_| "initial TUN enqueue timed out")??;
+                }
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    tokio::select! {
+                        biased;
+                        _ = &mut association => Err("association ended before credit hold"),
+                        result = held_rx => result.map_err(|_| "peer credit witness failed"),
+                    }
+                })
+                .await
+                .map_err(|_| "credit hold timed out")??;
+                input
+                    .send(vole_netstack::UdpDatagram::new(
+                        source, destination, bytes::Bytes::from_static(b"x"),
+                    ))
+                    .await
+                    .map_err(|_| "third TUN enqueue failed")?;
+                // Poll the actual entry to Pending with cooperative-budget
+                // deferral disabled, before the peer is allowed to send a reply.
+                let third_pending = matches!(
+                    futures_util::poll!(tokio::task::unconstrained(association.as_mut())),
+                    Poll::Pending
+                );
+                if !third_pending || input.capacity() != input.max_capacity() {
+                    return Err("third real association send did not reach Pending");
+                }
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    let mut tcp = router.connect_tcp(request()).await.map_err(|_| "sibling TCP open failed")?;
+                    tcp.write_all(b"a").await.map_err(|_| "sibling TCP write failed")?;
+                    let byte = tcp.read_u8().await.map_err(|_| "sibling TCP read failed")?;
+                    if byte != b'a' {
+                        return Err("sibling TCP reply differed");
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|_| "sibling TCP timed out")??;
+                reply_tx.send(()).map_err(|_| "peer reply authorization failed")?;
+                let response = tokio::time::timeout(Duration::from_millis(500), async {
+                    tokio::select! {
+                        biased;
+                        _ = &mut association => Err("association ended before peer reply"),
+                        response = replies.receive() => response.ok_or("TUN response channel closed"),
+                    }
+                })
+                .await
+                .map_err(|_| "same-association reply starved behind pending send")??;
+                if response.source != destination
+                    || response.destination != source
+                    || response.payload != b"r"[..]
+                {
+                    return Err("same-association TUN reply differed");
+                }
+                Ok(())
+            }
+            .await;
+            // Every success/error above rejoins here before any assertion.
+            cancellation.cancel();
+            outbound.begin_shutdown();
+            let association_stopped = matches!(
+                tokio::time::timeout(Duration::from_secs(2), &mut association).await,
+                Ok(Ok(()))
+            );
+            drop(association);
+            drop(input);
+            drop(replies);
+            let outbound_stopped =
+                tokio::time::timeout(Duration::from_secs(2), outbound.shutdown()).await.is_ok();
+            let both_paths_used = paths.0.lock().unwrap().is_empty();
+            (observed, association_stopped, outbound_stopped, both_paths_used)
+        })
+        .await;
+    endpoint.close(0_u8.into(), b"");
+    tcp_endpoint.close(0_u8.into(), b"");
+    let peer_joined = join_peer(peer).await;
+    let tcp_peer_joined = join_peer(tcp_peer).await;
+    let peer_idle = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle())
+        .await
+        .is_ok();
+    let tcp_peer_idle = tokio::time::timeout(Duration::from_secs(2), tcp_endpoint.wait_idle())
+        .await
+        .is_ok();
+    drop(router);
+    drop(outbound);
+    let tracking_idle = registry.is_none_or(vole::InteropTunRoutingRegistry::close);
+    let probe_idle = probe.snapshot().is_idle();
+    assert!(
+        association_stopped
+            && outbound_stopped
+            && peer_joined
+            && tcp_peer_joined
+            && peer_idle
+            && tcp_peer_idle
+            && probe_idle
+            && tracking_idle
+            && both_paths_used,
+        "TUIC duplex fixture ownership/Stop failed"
+    );
+    assert!(
+        observed.is_ok(),
+        "{}",
+        observed.err().unwrap_or("unknown observation")
+    );
 }
 
 #[cfg(unix)]
@@ -1569,7 +1878,8 @@ async fn configured_mtu_discovery_changes_native_probes_and_path_mtu() {
 }
 
 #[tokio::test]
-async fn official_quinn_credit_is_bounded_and_replenished_independent_of_owner_threshold() {
+async fn official_quinn_tcp_lane_credit_is_bounded_and_replenished_independent_of_owner_threshold()
+{
     let (mut config, packets, endpoint) = fixture_parts(1400, true, 8, "cubic", "quic");
     config.max_open_streams = i64::MAX as usize - 1;
     let outbound = TuicOutbound::new_with_path(
@@ -1650,16 +1960,18 @@ async fn official_quinn_credit_is_bounded_and_replenished_independent_of_owner_t
     let probe = ResourceProbe::default();
     probe
         .scope(async {
-            let udp = outbound
-                .open_datagram(udp_request(), &EstablishContext::default())
+            // Lane zero keeps its original receive credit in QUIC relay mode.
+            let stream = outbound
+                .connect_stream(request(), &EstablishContext::default())
                 .await
-                .unwrap();
+                .unwrap()
+                .io;
             tokio::time::timeout(Duration::from_secs(4), wait)
                 .await
                 .unwrap()
                 .unwrap();
             outbound.shutdown().await;
-            drop(udp);
+            drop(stream);
             assert!(probe.snapshot().is_idle(), "{:?}", probe.snapshot());
         })
         .await;
@@ -1966,3 +2278,10 @@ async fn quic_business_lanes_retire_only_udp_while_tcp_is_held_and_stop_all() {
     finish(udp_endpoint, udp_peer).await;
     finish(fresh_endpoint, fresh_peer).await;
 }
+
+#[path = "tuic_memory/uot_lane.rs"]
+mod uot_lane_memory;
+
+#[cfg(target_os = "macos")]
+#[path = "tuic_memory/uni_credit.rs"]
+mod uni_credit_memory;

@@ -3,7 +3,8 @@ use super::{MAX_ADDENDUM, Policy, PolicyCandidate, SourceLocation, invalid};
 use crate::http_processing::{
     mitm::RawMitm,
     providers::{Payload, ProviderSpec},
-    rules::{MAX_RULES, RawRule, Rule},
+    rules::{MAX_RULES, RawRule, Rule, SelectorCompiler},
+    script_config::RawScripts,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,6 +39,8 @@ pub(crate) struct Document {
     pub(crate) providers: BTreeMap<String, ProviderSpec>,
     #[serde(default, deserialize_with = "nonnull")]
     pub(crate) rewrite: Rewrite,
+    #[serde(default, deserialize_with = "nonnull")]
+    pub(crate) http_scripts: RawScripts,
     #[serde(default, deserialize_with = "nonnull")]
     pub(crate) mitm: RawMitm,
     #[serde(skip)]
@@ -93,6 +96,7 @@ impl Document {
         validate_ports(&self.http_ports)?;
         validate_ports(&self.mitm.ports)?;
         self.mitm.validate_static()?;
+        self.http_scripts.compile()?;
         if self.providers.len() > MAX_RULES || self.rewrite.rules.len() > MAX_RULES {
             return Err(invalid());
         }
@@ -166,6 +170,7 @@ impl Document {
     ) -> io::Result<Arc<PolicyCandidate>> {
         let mut rules = Vec::new();
         let mut text = 0;
+        let mut selectors = SelectorCompiler::default();
         let mut payloads = BTreeMap::new();
         let mut origins = Vec::new();
         let mut bytes = self.input_bytes;
@@ -175,7 +180,11 @@ impl Document {
                     if rules.len() == MAX_RULES {
                         return Err(invalid());
                     }
-                    rules.push(compile_rule(rule.clone(), &mut text)?);
+                    rules.push(Rule::compile_with_selectors(
+                        rule.clone(),
+                        &mut text,
+                        &mut selectors,
+                    )?);
                     origins.push(SourceLocation::Local { index });
                 }
                 RuleEntry::Reference(reference) if reference.enabled => {
@@ -202,7 +211,11 @@ impl Document {
                         if rules.len() == MAX_RULES {
                             return Err(invalid());
                         }
-                        rules.push(compile_rule(rule.clone(), &mut text)?);
+                        rules.push(Rule::compile_with_selectors(
+                            rule.clone(),
+                            &mut text,
+                            &mut selectors,
+                        )?);
                         origins.push(SourceLocation::Provider {
                             provider: reference.rule_set.clone(),
                             index,
@@ -225,6 +238,7 @@ impl Document {
         Ok(Arc::new(PolicyCandidate {
             document: self.clone(),
             rules: rules.into(),
+            scripts: self.http_scripts.compile()?.into(),
             payloads,
             identity: hash.finalize().into(),
             origins: origins.into(),
@@ -246,3 +260,7 @@ fn validate_ports(ports: &[u16]) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(all(test, feature = "inbound-http"))]
+#[path = "selector_sharing_tests.rs"]
+mod selector_sharing_tests;

@@ -324,6 +324,27 @@ impl Client {
             idle,
         })
     }
+    /// The factory owns immutable credentials and compiled traffic policy.
+    /// Mux/handshake modes govern new logical streams, never the identity or
+    /// target of a retained stream. Only endpoint selection may be dynamic.
+    #[cfg(feature = "inbound-http")]
+    pub(super) fn permits_http_tcp_reuse(&self) -> bool {
+        let config = &self.factory.config;
+        if self.cancel.is_cancelled() || config.port == 0 || config.port != config.port_end {
+            return false;
+        }
+        let Ok(server) = server_destination(&config.address, config.port) else {
+            return false;
+        };
+        match config.transport {
+            MieruTransport::Tcp => self.factory.upstream.permits_static_http_reuse(&server),
+            MieruTransport::Udp => self
+                .factory
+                .upstream
+                .permits_static_direct_http_reuse(&server),
+        }
+    }
+
     pub(super) fn queues_datagrams(&self) -> bool {
         self.factory.config.transport == MieruTransport::Udp
     }

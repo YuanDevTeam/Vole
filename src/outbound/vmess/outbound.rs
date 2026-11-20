@@ -14,6 +14,12 @@ use crate::{
     session::{Datagram, Destination, StreamSession},
     transport::{GrpcPool, connect_websocket, http_obfs, legacy_h2},
 };
+#[cfg(feature = "inbound-http")]
+#[path = "http_cover_reuse_owner.rs"]
+mod http_cover_reuse_owner;
+#[cfg(feature = "inbound-http")]
+use http_cover_reuse_owner::HttpCoverReuseOwner;
+
 use async_trait::async_trait;
 use std::{
     future::Future,
@@ -38,6 +44,9 @@ pub struct VmessOutbound {
     server: Destination,
     upstream: UpstreamPath,
     security: SecurityClient,
+    // Constructed from the same normalized identity as the actual client.
+    #[cfg(feature = "inbound-http")]
+    http_cover_plain_security: bool,
     options: Arc<SessionOptions>,
     encoding: VmessPacketEncoding,
     grpc_pool: Option<GrpcPool>,
@@ -53,6 +62,15 @@ impl std::fmt::Debug for VmessOutbound {
 }
 
 impl VmessOutbound {
+    #[cfg(all(test, feature = "inbound-http"))]
+    pub(crate) fn http_cover_test_lifecycle(&self) -> (bool, bool, bool) {
+        (
+            self.cancellation.is_cancelled(),
+            self.tasks.is_closed(),
+            self.tasks.is_empty(),
+        )
+    }
+
     pub fn new_with_path(config: &VmessOutboundConfig, upstream: UpstreamPath) -> io::Result<Self> {
         Self::with_shared_security(
             config,
@@ -85,6 +103,11 @@ impl VmessOutbound {
             server: server_destination(&config.address, config.port)?,
             upstream,
             security,
+            #[cfg(feature = "inbound-http")]
+            http_cover_plain_security: matches!(
+                &config.security,
+                crate::config::SecurityConfig::None
+            ),
             options: Arc::new(SessionOptions {
                 identity: VmessIdentity::new(config.id),
                 body: BodyOptions::new(cipher, config.global_padding, config.authenticated_length)?,
@@ -102,6 +125,13 @@ impl VmessOutbound {
             driver_admission: Arc::new(Mutex::new(())),
         })
     }
+    #[cfg(feature = "inbound-http")]
+    fn has_fixed_plain_http_cover(&self) -> bool {
+        self.http_cover_plain_security
+            && matches!(&self.options.transport, VmessTransport::Http { uris, headers, .. }
+                if uris.len() == 1 && headers.values().all(|values| values.len() == 1))
+    }
+
     async fn connect_transport(
         &self,
         session: StreamSession,
@@ -259,6 +289,20 @@ impl PreparedStream {
 
 #[async_trait]
 impl OutboundConnector for VmessOutbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        !self.cancellation.is_cancelled()
+            && match &self.options.transport {
+                VmessTransport::Tcp
+                | VmessTransport::WebSocket { .. }
+                | VmessTransport::Grpc { .. } => true,
+                VmessTransport::H2 { uris } => uris.len() == 1,
+                VmessTransport::Http { .. } => self.has_fixed_plain_http_cover(),
+            }
+            && self.security.permits_static_http_reuse()
+            && self.upstream.permits_static_http_reuse(&self.server)
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,
@@ -268,6 +312,15 @@ impl OutboundConnector for VmessOutbound {
         let prepared = self.prepare(session, context).await?;
         let token = prepared.token.clone();
         let stream = prepared.finish(Command::Tcp, &effective_peer).await?;
+        #[cfg(feature = "inbound-http")]
+        if self.has_fixed_plain_http_cover() {
+            // Shape, rather than live reuse permission, selects binding even
+            // when node Stop races the completed setup and cancels this child.
+            return Ok(ConnectedStream {
+                io: Box::new(HttpCoverReuseOwner::new(Box::new(stream), token)),
+                effective_peer,
+            });
+        }
         Ok(ConnectedStream {
             io: Box::new(OwnedStream::new(Box::new(stream), token)),
             effective_peer,
@@ -728,3 +781,7 @@ mod polled_datagram_memory_tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "inbound-http"))]
+#[path = "http_cover_reuse_owner_memory_tests.rs"]
+mod http_cover_reuse_owner_memory_tests;

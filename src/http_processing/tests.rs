@@ -1,4 +1,13 @@
 //! No sockets or host peers: adapters use duplex IO and a recording dispatcher.
+#[path = "https_h1_reuse_memory_tests.rs"]
+mod https_h1_reuse_memory_tests;
+#[path = "ingress_memory_tests.rs"]
+mod ingress_memory_tests;
+#[cfg(target_vendor = "apple")]
+#[path = "script_h1_tests.rs"]
+mod script_h1_tests;
+#[path = "sniffing_tests.rs"]
+mod sniffing_tests;
 use super::*;
 use crate::{
     dispatch::{BoxStream, DatagramTransport, DispatchError},

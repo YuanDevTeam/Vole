@@ -19,9 +19,147 @@ impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub type BoxStream = Box<dyn AsyncStream>;
 
+/// Opaque, owned equality evidence from a completed routing decision.
+/// No public configuration/API field and no transport or cache owner.
+#[cfg(feature = "inbound-http")]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct HttpTcpReuseKey {
+    value: Arc<dyn std::any::Any + Send + Sync>,
+    equal: fn(&dyn std::any::Any, &dyn std::any::Any) -> bool,
+    generation: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+#[cfg(feature = "inbound-http")]
+impl HttpTcpReuseKey {
+    pub(crate) fn new<T: Eq + Send + Sync + 'static>(value: T) -> Self {
+        fn equal<T: Eq + 'static>(a: &dyn std::any::Any, b: &dyn std::any::Any) -> bool {
+            a.downcast_ref::<T>()
+                .zip(b.downcast_ref::<T>())
+                .is_some_and(|(a, b)| a == b)
+        }
+        Self {
+            value: Arc::new(value),
+            equal: equal::<T>,
+            generation: None,
+        }
+    }
+    pub(crate) fn with_generation<T: Send + Sync + 'static>(mut self, generation: Arc<T>) -> Self {
+        self.generation = Some(generation);
+        self
+    }
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        let generation = match (&self.generation, &other.generation) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        generation && (self.equal)(self.value.as_ref(), other.value.as_ref())
+    }
+}
+
+/// An already selected route. Opening consumes this plan, never selects twice.
+#[cfg(feature = "inbound-http")]
+#[doc(hidden)]
+#[async_trait]
+pub trait HttpTcpPlan: Send {
+    fn reuse_key(&self) -> Option<&HttpTcpReuseKey>;
+    async fn connect(self: Box<Self>) -> Result<BoxStream, DispatchError>;
+}
+
 /// One owned send operation; its owner must cancel or complete it before close.
 pub type OwnedDatagramSend =
     Pin<Box<dyn std::future::Future<Output = Result<(), DispatchError>> + Send + 'static>>;
+
+/// Opaque identity for one TUN business operation; never traffic or route text.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct TunSendToken(Arc<()>);
+
+#[cfg(target_os = "macos")]
+impl TunSendToken {
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// One already-open TUIC operation, distinct from a physical-path send lease.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub struct TunPendingSend {
+    pub(crate) operation: OwnedDatagramSend,
+    pub(crate) completion: TunSendToken,
+}
+
+#[cfg(target_os = "macos")]
+impl TunPendingSend {
+    pub(crate) fn new(operation: OwnedDatagramSend) -> Self {
+        Self {
+            operation,
+            completion: TunSendToken(Arc::new(())),
+        }
+    }
+}
+
+/// Only a completed IO result may update successful/failed-send accounting.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub enum TunSendOutcome {
+    Completed(Result<(), DispatchError>),
+    TimedOut,
+    Cancelled,
+}
+
+#[cfg(target_os = "macos")]
+impl TunSendOutcome {
+    pub(crate) fn into_result(self) -> Result<(), DispatchError> {
+        match self {
+            Self::Completed(result) => result,
+            Self::TimedOut => Err(DispatchError::TimedOut),
+            Self::Cancelled => Err(DispatchError::NotAllowed),
+        }
+    }
+}
+
+/// An already-open physical path's confirmed FIFO datagram prefix.
+#[cfg(target_os = "macos")]
+pub type OwnedDatagramBatchSend =
+    Pin<Box<dyn std::future::Future<Output = io::Result<usize>> + Send + 'static>>;
+
+#[cfg(target_os = "macos")]
+pub(crate) const DATAGRAM_SEND_BATCH_LIMIT: usize = 4;
+#[cfg(target_os = "macos")]
+pub(crate) const DATAGRAM_SEND_BATCH_BYTES: usize = 8 * 1024;
+
+/// Admission only: no resolution, socket acquisition, or IO.
+#[cfg(target_os = "macos")]
+pub(crate) fn datagram_batch_peer(packets: &[Datagram]) -> Option<std::net::SocketAddr> {
+    if !(2..=DATAGRAM_SEND_BATCH_LIMIT).contains(&packets.len()) {
+        return None;
+    }
+    let crate::session::Destination::Ip(peer) = &packets[0].remote else {
+        return None;
+    };
+    let peer = *peer;
+    if peer.port() == 0 || peer.ip().is_unspecified() || peer.ip().is_multicast() {
+        return None;
+    }
+    let mut bytes = 0usize;
+    for packet in packets {
+        if packet.remote != crate::session::Destination::Ip(peer)
+            || packet.sniffed_domain.is_some()
+            || packet.payload.is_empty()
+        {
+            return None;
+        }
+        bytes = bytes.checked_add(packet.payload.len())?;
+        if bytes > DATAGRAM_SEND_BATCH_BYTES {
+            return None;
+        }
+    }
+    Some(peer)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
@@ -104,6 +242,44 @@ pub trait DatagramTransport: Send {
         Err(datagram)
     }
 
+    /// Lease one already-open actual Mac TUN TUIC QUIC business send.
+    /// Unsupported returns the untouched packet before IO or route mutation.
+    /// The caller retains one operation, drops it before completion/close, and
+    /// invokes completion exactly once, including timeout and cancellation.
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    fn try_begin_tun_send(
+        &mut self,
+        datagram: Datagram,
+        _flow_id: Option<&[u8]>,
+    ) -> Result<TunPendingSend, Datagram> {
+        Err(datagram)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    async fn finish_tun_send(
+        &mut self,
+        _completion: TunSendToken,
+        outcome: TunSendOutcome,
+    ) -> Result<(), DispatchError> {
+        outcome.into_result()
+    }
+
+    /// Optional physical send of at most four ready datagrams, totaling 8 KiB,
+    /// to one IP peer.
+    /// Unsupported paths return the untouched batch before any IO. A positive
+    /// completion confirms only that FIFO prefix; errors must never be replayed.
+    /// Drop this operation before closing the transport, as with `send_owned`.
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    fn send_batch_owned(
+        &mut self,
+        datagrams: Vec<Datagram>,
+    ) -> Result<OwnedDatagramBatchSend, Vec<Datagram>> {
+        Err(datagrams)
+    }
+
     /// A dedicated QUIC endpoint may initialize this same DIRECT physical
     /// socket through Dialer and retain a lease until endpoint retirement.
     /// Codecs, proxy hops and pacers do not forward this capability.
@@ -164,6 +340,23 @@ pub trait DatagramTransport: Send {
 
 #[async_trait]
 pub trait Dispatcher: Send + Sync {
+    /// Structural proof of immutable egress, including every proxy dependency
+    /// and security identity. Opaque nodes and dynamic paths keep the default.
+    #[cfg(feature = "inbound-http")]
+    #[doc(hidden)]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        false
+    }
+    /// None means this dispatcher does not implement owned planning. Errors
+    /// are real decision failures, never permission to select a second route.
+    #[cfg(feature = "inbound-http")]
+    #[doc(hidden)]
+    async fn prepare_http_tcp(
+        &self,
+        _session: StreamSession,
+    ) -> Result<Option<Box<dyn HttpTcpPlan>>, DispatchError> {
+        Ok(None)
+    }
     #[cfg(feature = "inbound-http")]
     #[doc(hidden)]
     fn http_context(&self) -> Option<crate::http_processing::HttpContext> {
@@ -211,6 +404,23 @@ impl SessionObservedDispatcher {
 
 #[async_trait]
 impl Dispatcher for SessionObservedDispatcher {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        self.inner.permits_http_tcp_reuse()
+    }
+    #[cfg(feature = "inbound-http")]
+    async fn prepare_http_tcp(
+        &self,
+        session: StreamSession,
+    ) -> Result<Option<Box<dyn HttpTcpPlan>>, DispatchError> {
+        Ok(self.inner.prepare_http_tcp(session).await?.map(|inner| {
+            Box::new(ObservedHttpTcpPlan {
+                inner,
+                resource_stats: self.resource_stats.clone(),
+                handshake: false,
+            }) as Box<dyn HttpTcpPlan>
+        }))
+    }
     fn supports_udp(&self) -> bool {
         self.inner.supports_udp()
     }
@@ -263,6 +473,23 @@ impl HandshakeObservedDispatcher {
 
 #[async_trait]
 impl Dispatcher for HandshakeObservedDispatcher {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        self.inner.permits_http_tcp_reuse()
+    }
+    #[cfg(feature = "inbound-http")]
+    async fn prepare_http_tcp(
+        &self,
+        session: StreamSession,
+    ) -> Result<Option<Box<dyn HttpTcpPlan>>, DispatchError> {
+        Ok(self.inner.prepare_http_tcp(session).await?.map(|inner| {
+            Box::new(ObservedHttpTcpPlan {
+                inner,
+                resource_stats: self.resource_stats.clone(),
+                handshake: true,
+            }) as Box<dyn HttpTcpPlan>
+        }))
+    }
     fn supports_udp(&self) -> bool {
         self.inner.supports_udp()
     }
@@ -286,6 +513,37 @@ impl Dispatcher for HandshakeObservedDispatcher {
     ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
         let _activity = self.resource_stats.begin(ResourceActivity::Handshake);
         self.inner.open_datagram(session).await
+    }
+}
+
+#[cfg(feature = "inbound-http")]
+struct ObservedHttpTcpPlan {
+    inner: Box<dyn HttpTcpPlan>,
+    resource_stats: RuntimeResourceStats,
+    handshake: bool,
+}
+#[cfg(feature = "inbound-http")]
+#[async_trait]
+impl HttpTcpPlan for ObservedHttpTcpPlan {
+    fn reuse_key(&self) -> Option<&HttpTcpReuseKey> {
+        self.inner.reuse_key()
+    }
+    async fn connect(self: Box<Self>) -> Result<BoxStream, DispatchError> {
+        let Self {
+            inner,
+            resource_stats,
+            handshake,
+        } = *self;
+        if handshake {
+            let _activity = resource_stats.begin(ResourceActivity::Handshake);
+            inner.connect().await
+        } else {
+            let inner = inner.connect().await?;
+            Ok(Box::new(ObservedStream {
+                inner,
+                _activity: resource_stats.begin(ResourceActivity::TcpSession),
+            }))
+        }
     }
 }
 
@@ -383,6 +641,32 @@ impl DatagramTransport for ObservedDatagramTransport {
         self.inner.send_owned(datagram)
     }
 
+    #[cfg(target_os = "macos")]
+    fn try_begin_tun_send(
+        &mut self,
+        datagram: Datagram,
+        flow_id: Option<&[u8]>,
+    ) -> Result<TunPendingSend, Datagram> {
+        self.inner.try_begin_tun_send(datagram, flow_id)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn finish_tun_send(
+        &mut self,
+        completion: TunSendToken,
+        outcome: TunSendOutcome,
+    ) -> Result<(), DispatchError> {
+        self.inner.finish_tun_send(completion, outcome).await
+    }
+
+    #[cfg(target_os = "macos")]
+    fn send_batch_owned(
+        &mut self,
+        datagrams: Vec<Datagram>,
+    ) -> Result<OwnedDatagramBatchSend, Vec<Datagram>> {
+        self.inner.send_batch_owned(datagrams)
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         self.inner.send(datagram).await
     }
@@ -406,6 +690,11 @@ impl DatagramTransport for ObservedDatagramTransport {
 
 // Assert object safety in normal builds rather than discovering it in an FFI adapter.
 const _: Option<Pin<Box<dyn Dispatcher>>> = None;
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod tun_send_memory_test_support;
+#[cfg(all(test, target_os = "macos"))]
+mod tun_send_memory_tests;
 
 #[cfg(test)]
 mod tests {

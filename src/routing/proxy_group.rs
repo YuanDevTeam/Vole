@@ -665,6 +665,10 @@ impl Dispatcher for SelectProxyGroupDispatcher {
 
 // Core-originated DNS/probes also enter groups without a first destination.
 // Resolve their leaf on first send and retain it through the association.
+#[cfg(all(test, target_os = "macos"))]
+#[path = "proxy_group_tun_send_memory_tests.rs"]
+mod tun_send_memory_tests;
+
 struct BalancedDatagrams {
     groups: Arc<ProxyGroups>,
     id: ProxyGroupId,
@@ -676,6 +680,30 @@ impl DatagramTransport for BalancedDatagrams {
     fn supports_shared_destinations(&self) -> bool {
         // The first destination selects a leaf whose framing is not known yet.
         false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn try_begin_tun_send(
+        &mut self,
+        datagram: Datagram,
+        flow_id: Option<&[u8]>,
+    ) -> Result<crate::dispatch::TunPendingSend, Datagram> {
+        match self.transport.as_mut() {
+            Some(transport) => transport.try_begin_tun_send(datagram, flow_id),
+            None => Err(datagram),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn finish_tun_send(
+        &mut self,
+        completion: crate::dispatch::TunSendToken,
+        outcome: crate::dispatch::TunSendOutcome,
+    ) -> Result<(), DispatchError> {
+        match self.transport.as_mut() {
+            Some(transport) => transport.finish_tun_send(completion, outcome).await,
+            None => Err(DispatchError::NotAllowed),
+        }
     }
 
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {

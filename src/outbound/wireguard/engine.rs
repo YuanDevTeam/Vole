@@ -61,6 +61,8 @@ impl Engine {
             NetStackConfig {
                 mtu: usize::from(config.mtu),
                 packet_queue: 32,
+                tcp_recv_buffer: 128 * 1024,
+                map_tcp_recv_buffer: cfg!(target_vendor = "apple"),
                 tcp_send_buffer: 64 * 1024,
                 ..Default::default()
             },
@@ -251,6 +253,18 @@ async fn pump_output(
         }
     }
     cancel.cancel();
+}
+
+#[cfg(test)]
+pub(super) fn pending_memory_pump(
+    packets: PacketStream,
+    channel: Arc<Channel>,
+    routes: Arc<Routes>,
+    cancel: CancellationToken,
+) -> impl std::future::Future<Output = ()> {
+    let slot = PeerSlot::default();
+    *slot.current.lock().unwrap() = Some(channel);
+    pump_output(packets, vec![slot].into(), routes, cancel)
 }
 
 #[cfg(test)]

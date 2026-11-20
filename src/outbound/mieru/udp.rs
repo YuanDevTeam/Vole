@@ -790,6 +790,140 @@ async fn send(
     shared.count_output(output.len());
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+fn accept_ready_data(
+    state: &mut Reliable,
+    metadata: Metadata,
+    wire_len: usize,
+    shared: &Shared,
+    pattern: &mut PacketPattern<'_>,
+) {
+    // Only a known successful physical prefix consumes the original FIFO.
+    pattern.remaining -= 1;
+    shared.count_output(wire_len);
+    let mut segment = state
+        .pending
+        .pop_front()
+        .expect("prepared DATA remains pending");
+    segment.metadata = metadata;
+    segment.sent = Some(Instant::now());
+    state.heartbeat = segment.sent.unwrap() + state.heartbeat_interval;
+    segment.tx_count = 1;
+    if state.state.business == super::tcp::Business::UdpAssociate {
+        segment.timeout_nanos = state.rtt.retransmit_delay(1).as_nanos() as u64;
+    }
+    if let Metadata::Data(meta) = metadata {
+        state.last_window = meta.window;
+    }
+    if let Some(lease) = &segment.lease {
+        lease.sent();
+    }
+    if state.outstanding.is_empty() {
+        state.first_check = Some(Instant::now() + FIRST_CHECK);
+    }
+    state.outstanding.insert(sequence(metadata), segment);
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+async fn output_ready_data(
+    transport: &mut dyn DatagramTransport,
+    peer: &Destination,
+    encoder: &mut PacketEncoder,
+    username: &str,
+    shared: &Shared,
+    pattern: &mut PacketPattern<'_>,
+    state: &mut Reliable,
+    partial_available: bool,
+    available: u32,
+    buffer: &mut Vec<u8>,
+) -> io::Result<u32> {
+    // Preparation never admits another command or removes its byte lease.
+    let limit = crate::dispatch::DATAGRAM_SEND_BATCH_LIMIT
+        .min(crate::dispatch::DATAGRAM_SEND_BATCH_BYTES / pattern.wire_budget.max(1))
+        .min(pattern.remaining)
+        .min(available as usize)
+        .min((SEGMENTS - 1).saturating_sub(state.outstanding.len()));
+    let count = state.pending.iter().take(limit).take_while(|segment| {
+        matches!(segment.metadata, Metadata::Data(meta) if meta.kind == DataKind::ClientData)
+    }).count();
+    if count < 2 {
+        return Ok(0);
+    }
+    let mut packets = Vec::with_capacity(count);
+    let mut wire_bytes = 0usize;
+    for segment in state.pending.iter().take(count) {
+        if shared.cancel.is_cancelled() {
+            return Err(closed());
+        }
+        let mut metadata = segment.metadata;
+        if let Metadata::Data(ref mut meta) = metadata {
+            meta.unack_sequence = state.state.next_receive.load(Ordering::Acquire);
+            meta.window = state.window(partial_available);
+        }
+        let mut nonce = rand::random();
+        pattern
+            .pattern
+            .rewrite_nonce(&mut pattern.nonce, &mut nonce, MieruTransport::Udp);
+        let nonce = crypto::make_client_nonce(username, nonce);
+        let prepared = pattern.pattern.prepare_frame(
+            metadata,
+            segment.payload.len(),
+            MieruTransport::Udp,
+            pattern.wire_budget,
+        )?;
+        encoder.encode_frame(
+            metadata,
+            &segment.payload,
+            prepared.encoding(),
+            nonce,
+            super::tcp::now()?,
+            buffer,
+        )?;
+        wire_bytes = wire_bytes
+            .checked_add(buffer.len())
+            .filter(|size| *size <= crate::dispatch::DATAGRAM_SEND_BATCH_BYTES)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+        packets.push((
+            metadata,
+            Datagram {
+                remote: peer.clone(),
+                payload: Bytes::copy_from_slice(buffer),
+                sniffed_domain: None,
+            },
+        ));
+    }
+    // Keep original ciphertext; the lease clones only Bytes handles.
+    let owned = packets.iter().map(|(_, packet)| packet.clone()).collect();
+    if let Ok(operation) = transport.send_batch_owned(owned) {
+        let accepted = tokio::select! {biased;
+            () = shared.cancel.cancelled() => return Err(closed()),
+            result = tokio::time::timeout(Duration::from_secs(10), operation) => {
+                result.map_err(|_| io::ErrorKind::TimedOut)?.map_err(|_| closed())?
+            }
+        };
+        if accepted == 0 || accepted > packets.len() {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        for (metadata, packet) in packets.drain(..accepted) {
+            accept_ready_data(state, metadata, packet.payload.len(), shared, pattern);
+        }
+    }
+    // Capability refusal did no IO. A positive partial leaves only this exact
+    // ciphertext suffix; future errors/cancellation above never fall back here.
+    for (metadata, packet) in packets {
+        let wire_len = packet.payload.len();
+        tokio::select! {biased;
+            () = shared.cancel.cancelled() => return Err(closed()),
+            result = tokio::time::timeout(Duration::from_secs(10), transport.send(packet)) => {
+                result.map_err(|_| io::ErrorKind::TimedOut)?.map_err(|_| closed())?
+            }
+        }
+        accept_ready_data(state, metadata, wire_len, shared, pattern);
+    }
+    Ok(count as u32)
+}
 #[allow(clippy::too_many_arguments)]
 async fn output(
     transport: &mut dyn DatagramTransport,
@@ -928,6 +1062,26 @@ async fn output(
         if pattern.remaining == 0 {
             pattern.truncated = true;
             break;
+        }
+        #[cfg(target_os = "macos")]
+        if state.established && pattern.pattern.low_entropy_enabled() {
+            let sent = output_ready_data(
+                transport,
+                peer,
+                encoder,
+                username,
+                shared,
+                pattern,
+                state,
+                partial_available,
+                available - new_sent,
+                buffer,
+            )
+            .await?;
+            if sent != 0 {
+                new_sent += sent;
+                continue;
+            }
         }
         let mut segment = state.pending.pop_front().unwrap();
         if let Metadata::Data(ref mut meta) = segment.metadata {
@@ -1412,6 +1566,8 @@ mod tests {
     };
     use tokio_util::{sync::CancellationToken, task::TaskTracker};
     include!("udp_upload_shutdown_tests.rs");
+    #[cfg(target_os = "macos")]
+    include!("udp_ready_batch_client_stop_memory_tests.rs");
 
     #[derive(Default)]
     struct ReceiveCalls {
@@ -1437,6 +1593,8 @@ mod tests {
         nonces: Mutex<Vec<[u8; 24]>>,
         transmit_limit: u16,
         received: Mutex<Vec<(u8, usize, usize)>>,
+        #[cfg(target_os = "macos")]
+        ready_batch_stop_gate: Option<Arc<ReadyBatchStopGate>>,
     }
     struct Memory {
         polled_receive: bool,
@@ -1447,6 +1605,8 @@ mod tests {
         task: Option<JoinHandle<()>>,
         budget: DatagramBudget,
         quiet_close: Option<(Arc<UploadFixture>, PacketDecoder)>,
+        #[cfg(target_os = "macos")]
+        ready_batch_stop_gate: Option<Arc<ReadyBatchStopGate>>,
     }
     impl Memory {
         fn quiet_close_input(&self) -> bool {
@@ -1498,6 +1658,16 @@ mod tests {
         fn payload_budget(&self, _: &Destination) -> DatagramBudget {
             self.budget
         }
+        #[cfg(target_os = "macos")]
+        fn send_batch_owned(
+            &mut self,
+            packets: Vec<Datagram>,
+        ) -> Result<crate::dispatch::OwnedDatagramBatchSend, Vec<Datagram>> {
+            let Some(gate) = &self.ready_batch_stop_gate else {
+                return Err(packets);
+            };
+            gate.send_owned(packets)
+        }
         async fn send(&mut self, packet: Datagram) -> Result<(), DispatchError> {
             let close = if let Some((upload, decoder)) = &mut self.quiet_close {
                 let frame = decoder
@@ -1537,9 +1707,19 @@ mod tests {
             Ok(packet)
         }
         async fn close(&mut self) -> Result<(), DispatchError> {
+            #[cfg(target_os = "macos")]
+            if let Some(gate) = &self.ready_batch_stop_gate {
+                gate.closes.fetch_add(1, Ordering::AcqRel);
+                gate.close_with_owner
+                    .fetch_or(gate.active.load(Ordering::Acquire) != 0, Ordering::AcqRel);
+            }
             self.cancel.cancel();
             if let Some(task) = self.task.take() {
                 let _ = task.await;
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(gate) = &self.ready_batch_stop_gate {
+                gate.memory_joined.fetch_add(1, Ordering::AcqRel);
             }
             Ok(())
         }
@@ -1575,6 +1755,8 @@ mod tests {
                 nonces: Mutex::new(Vec::new()),
                 transmit_limit: MTU,
                 received: Mutex::new(Vec::new()),
+                #[cfg(target_os = "macos")]
+                ready_batch_stop_gate: None,
             })
         }
         async fn stop(&self) {
@@ -1630,6 +1812,8 @@ mod tests {
                 task: Some(task),
                 budget: DatagramBudget::new(self.transmit_limit, MTU),
                 quiet_close,
+                #[cfg(target_os = "macos")]
+                ready_batch_stop_gate: self.ready_batch_stop_gate.clone(),
             }))
         }
     }
@@ -4060,3 +4244,7 @@ include!("udp_split_receive_tests.rs");
 
 #[cfg(test)]
 include!("udp_balanced_driver_tests.rs");
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "udp_ready_batch_memory_tests.rs"]
+mod ready_batch_memory_tests;

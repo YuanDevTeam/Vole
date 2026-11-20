@@ -8,6 +8,8 @@
 mod client;
 mod config;
 mod device;
+#[cfg(feature = "diagnostics")]
+pub mod diagnostics;
 mod echo;
 mod icmp;
 mod packet;

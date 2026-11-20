@@ -478,11 +478,20 @@ impl Dialer {
     /// Only immutable direct egress may donate a private active H2 connection.
     #[cfg(feature = "outbound-vless")]
     pub(crate) fn permits_static_h2_reuse(&self) -> bool {
+        self.permits_static_http_reuse()
+    }
+    #[cfg(feature = "inbound-http")]
+    pub(crate) fn http_reuse_cancelled(&self) -> bool {
+        self.initialization.cancellation.is_cancelled()
+    }
+    #[cfg(any(feature = "outbound-vless", feature = "inbound-http"))]
+    pub(crate) fn permits_static_http_reuse(&self) -> bool {
         if self.protector.is_some()
             || self.dns_binding.is_some()
             || self.source_binding.is_some()
             || self.egress.interface.is_some()
-            || self.mptcp
+            // macOS currently keeps this preference on ordinary TCP sockets.
+            || (self.mptcp && !cfg!(target_os = "macos"))
             || self.ip_version != crate::config::IpVersion::Dual
         {
             return false;

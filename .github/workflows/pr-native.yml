@@ -1,0 +1,214 @@
+name: PR Native
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  UV_PYTHON_PREFERENCE: only-system
+  UV_PYTHON_DOWNLOADS: never
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  macos:
+    name: macOS arm64
+    runs-on: macos-26
+    timeout-minutes: 90
+    outputs:
+      apple-mobile: ${{ steps.scope.outputs['apple-mobile'] }}
+      android: ${{ steps.scope.outputs.android }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Select mobile build targets
+        id: scope
+        run: |
+          set -euo pipefail
+          shared=(
+            Cargo.toml Cargo.lock build.rs .cargo .github/workflows
+            include scripts crates/vole-blake3-raw
+            src/lib.rs src/ffi src/invoke src/platform
+          )
+          changed() {
+            if git diff --quiet HEAD^1 HEAD -- "$@"; then
+              printf false
+            else
+              local status=$?
+              if [[ "$status" != 1 ]]; then return "$status"; fi
+              printf true
+            fi
+          }
+
+          git rev-parse --verify HEAD >/dev/null
+          if git rev-parse --verify --quiet 'HEAD^1^{commit}' >/dev/null; then
+            apple_mobile="$(changed "${shared[@]}" src/http_processing)"
+            android="$(changed "${shared[@]}")"
+          else
+            status=$?
+            if [[ "$status" != 1 ]]; then exit "$status"; fi
+            apple_mobile=true
+            android=true
+          fi
+          printf 'apple-mobile=%s\nandroid=%s\n' "$apple_mobile" "$android" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+          check-latest: true
+          architecture: arm64
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pr-native-macos-arm64-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
+          workspaces: ". -> target"
+          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR VOLE BORING AWS_LC LIBCLANG BINDGEN
+          cache-bin: "false"
+      - name: Build and check the native CLI and FFI
+        run: |
+          uv run --project scripts --locked python - <<'PY'
+          from vole_scripts.builds import build_apple_target, build_cli
+          from vole_scripts.release import _smoke
+
+          _smoke(build_cli())
+          if not build_apple_target("aarch64-apple-darwin").is_file():
+              raise SystemExit("Missing macOS static library")
+          PY
+
+  windows:
+    name: Windows arm64
+    runs-on: windows-11-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+          check-latest: true
+          architecture: arm64
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pr-native-windows-arm64-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
+          workspaces: ". -> target"
+          env-vars: ImageOS ImageVersion VOLE BORING AWS_LC LIBCLANG BINDGEN
+          cache-bin: "false"
+      - name: Build and smoke the Wintun CLI
+        run: |
+          uv run --project scripts --locked python - <<'PY'
+          from vole_scripts.builds import build_cli
+          from vole_scripts.release import _smoke
+
+          _smoke(build_cli())
+          PY
+      - name: Build Wintun FFI
+        run: uv run --project scripts --locked vole-scripts build windows --backend wintun
+      - name: Build UWP FFI and hosts
+        run: uv run --project scripts --locked vole-scripts build windows --backend uwp
+      - name: Check unpackaged UWP COM lifecycle
+        run: python scripts/check_windows_com.py --dll dist/windows/arm64/uwp/vole.dll
+
+  apple-mobile:
+    name: ${{ matrix.name }}
+    needs: macos
+    if: needs.macos.outputs['apple-mobile'] == 'true'
+    runs-on: macos-26
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: iOS arm64
+            target: aarch64-apple-ios
+          - name: tvOS arm64
+            target: aarch64-apple-tvos
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+          check-latest: true
+          architecture: arm64
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pr-native-${{ matrix.target }}-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
+          workspaces: ". -> target"
+          env-vars: ImageOS ImageVersion SDKROOT DEVELOPER_DIR VOLE BORING AWS_LC LIBCLANG BINDGEN
+          cache-bin: "false"
+      - name: Build the device-target static library
+        env:
+          VOLE_TARGET: ${{ matrix.target }}
+        run: |
+          uv run --project scripts --locked python - "$VOLE_TARGET" <<'PY'
+          import sys
+
+          from vole_scripts.builds import build_apple_target
+
+          if not build_apple_target(sys.argv[1]).is_file():
+              raise SystemExit("Missing Apple static library")
+          PY
+
+  android:
+    name: Android
+    needs: macos
+    if: needs.macos.outputs.android == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+          check-latest: true
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+      - name: Install stable Android NDK r30
+        run: |
+          set -euo pipefail
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          ndk_package="$("$sdkmanager" --list --channel=0 | awk -F '|' '
+            NF == 1 { split($0, fields, " "); $1 = fields[1]; $2 = fields[2] }
+            { gsub(/[[:space:]]/, "", $1); gsub(/[[:space:]]/, "", $2) }
+            $1 ~ /^ndk[;\/]30\.[0-9]+\.[0-9]+$/ &&
+              $2 ~ /^30\.[0-9]+\.[0-9]+$/ {
+                sub(/^ndk\//, "ndk;", $1); print $1
+              }
+          ' | sort -Vu | tail -n 1)"
+          test -n "$ndk_package" || { echo "Stable NDK r30 is unavailable" >&2; exit 1; }
+          "$sdkmanager" --channel=0 "$ndk_package"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${ndk_package#ndk;}" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pr-native-android-${{ hashFiles('scripts/src/vole_scripts/*.py', 'scripts/cmake/**', 'scripts/native/**') }}
+          workspaces: ". -> target"
+          env-vars: ImageOS ImageVersion ANDROID_NDK_HOME VOLE BORING AWS_LC LIBCLANG BINDGEN
+          cache-bin: "false"
+      - name: Build Android arm64 and x86_64 FFI
+        run: uv run --project scripts --locked vole-scripts build android

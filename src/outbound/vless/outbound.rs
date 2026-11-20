@@ -51,11 +51,39 @@ use crate::outbound::{
     server_destination,
 };
 
+// Classification is fixed only by this module's trusted constructors, which
+// construct each concrete SecurityClient from the same normalized leg config.
+// REALITY and JLS permission stays local to VLESS, not the shared proxy helper.
+#[cfg(feature = "inbound-http")]
+#[derive(Clone, Copy)]
+enum HttpReuseSecurity {
+    Plain,
+    Standard,
+    Reality,
+    Jls,
+    Unproven,
+}
+
+#[cfg(feature = "inbound-http")]
+impl HttpReuseSecurity {
+    fn from_config(config: &crate::config::SecurityConfig) -> Self {
+        match config {
+            crate::config::SecurityConfig::None => Self::Plain,
+            crate::config::SecurityConfig::Tls(_) => Self::Standard,
+            crate::config::SecurityConfig::Reality(_) => Self::Reality,
+            crate::config::SecurityConfig::Jls(_) => Self::Jls,
+            crate::config::SecurityConfig::ShadowTls(_) => Self::Unproven,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct VlessTransportLeg {
     server: crate::session::Destination,
     upstream: UpstreamPath,
     security: SecurityClient,
+    #[cfg(feature = "inbound-http")]
+    http_reuse_security: HttpReuseSecurity,
 }
 
 fn static_h2_security(config: &crate::config::SecurityConfig) -> bool {
@@ -73,6 +101,25 @@ fn static_h2_security(config: &crate::config::SecurityConfig) -> bool {
 }
 
 impl VlessTransportLeg {
+    #[cfg(feature = "inbound-http")]
+    fn permits_static_http_reuse(&self, datagram_carrier: bool) -> bool {
+        let security = match self.http_reuse_security {
+            HttpReuseSecurity::Plain => {
+                !datagram_carrier && self.security.permits_static_http_reuse()
+            }
+            HttpReuseSecurity::Standard => self.security.permits_static_http_reuse(),
+            HttpReuseSecurity::Reality => !datagram_carrier,
+            HttpReuseSecurity::Jls => !datagram_carrier && self.security.has_fixed_jls_identity(),
+            HttpReuseSecurity::Unproven => false,
+        };
+        security
+            && if datagram_carrier {
+                self.upstream.permits_static_direct_http_reuse(&self.server)
+            } else {
+                self.upstream.permits_static_http_reuse(&self.server)
+            }
+    }
+
     async fn h2_lease<'a>(
         &self,
         client: &'a XHttpClient,
@@ -327,8 +374,30 @@ impl VlessOutbound {
                     && !options.only_tcp
                     && !options.padding
             });
+        // Yamux channel readiness does not prove a physical metadata flush.
+        // Share only the bounded POST geometry, never H2Mux's UDP budget proof.
+        let response_overlap = self.encryption.is_none()
+            && self.download.is_none()
+            && smux.is_some_and(|options| {
+                options.enabled
+                    && options.protocol == crate::config::SingMuxProtocol::Yamux
+                    && !options.only_tcp
+                    && !options.padding
+            });
+        // Smux gets the existing Body response geometry only. Keep its
+        // physical send retention and UDP control on the original path.
+        let smux_response_overlap = self.encryption.is_none()
+            && self.download.is_none()
+            && smux.is_some_and(|options| {
+                options.enabled
+                    && options.protocol == crate::config::SingMuxProtocol::Smux
+                    && !options.only_tcp
+                    && !options.padding
+            });
         if let Some(upload) = &mut self.xhttp {
             upload.set_shared_packet_up_transport(shared);
+            upload.set_packet_up_response_overlap(response_overlap || smux_response_overlap);
+            upload.set_yamux_packet_up_send_retention(response_overlap);
         }
     }
 
@@ -565,6 +634,8 @@ impl VlessOutbound {
                     server: server_destination(&config.address, config.port)?,
                     upstream,
                     security,
+                    #[cfg(feature = "inbound-http")]
+                    http_reuse_security: HttpReuseSecurity::from_config(&config.security),
                 },
                 xhttp: {
                     let mut request =
@@ -594,6 +665,8 @@ impl VlessOutbound {
                 server: server_destination(&config.address, config.port)?,
                 upstream: upload_path,
                 security: upload_security,
+                #[cfg(feature = "inbound-http")]
+                http_reuse_security: HttpReuseSecurity::from_config(&config.security),
             },
             xhttp,
             download,
@@ -989,6 +1062,37 @@ impl PreparedStream {
 }
 #[async_trait]
 impl OutboundConnector for VlessOutbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        if self.cancellation.is_cancelled()
+            || self
+                .encryption
+                .as_ref()
+                .is_some_and(|client| !client.permits_http_tcp_reuse())
+        {
+            return false;
+        }
+        let upload_datagram = self
+            .xhttp
+            .as_ref()
+            .is_some_and(|client| client.http_version() == crate::config::XHttpVersion::Http3);
+        if self
+            .xhttp
+            .as_ref()
+            .is_some_and(|client| !client.is_http_reuse_owner_open())
+            || !self.upload.permits_static_http_reuse(upload_datagram)
+        {
+            return false;
+        }
+        self.download.as_ref().is_none_or(|download| {
+            self.xhttp.is_some()
+                && download.xhttp.is_http_reuse_owner_open()
+                && download.transport.permits_static_http_reuse(
+                    download.xhttp.http_version() == crate::config::XHttpVersion::Http3,
+                )
+        })
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,
@@ -1093,6 +1197,11 @@ impl Drop for VlessOutbound {
 
 #[async_trait]
 impl Dispatcher for VlessOutbound {
+    #[cfg(feature = "inbound-http")]
+    fn permits_http_tcp_reuse(&self) -> bool {
+        OutboundConnector::permits_http_tcp_reuse(self)
+    }
+
     async fn connect_tcp(&self, session: StreamSession) -> Result<BoxStream, DispatchError> {
         OutboundConnector::connect_stream(self, session, &EstablishContext::default())
             .await
@@ -1322,6 +1431,104 @@ mod active_h2_memory_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     type Downloads = Arc<Mutex<HashMap<String, h2::SendStream<bytes::Bytes>>>>;
+
+    #[test]
+    fn private_split_h2_mptcp_preference_tracks_macos_plain_tcp_scope() {
+        let base = serde_json::json!({
+            "mixed-port": 1080,
+            "proxies": [{
+                "name": "peer", "type": "vless", "server": "192.0.2.1", "port": 443,
+                "uuid": "07070707-0707-0707-0707-070707070707", "mptcp": false,
+                "network": "xhttp", "tls": true, "servername": "memory.invalid", "alpn": ["h2"],
+                "xhttp-opts": {"mode": "packet-up", "path": "/x",
+                    "download-settings": {"server": "192.0.2.2", "path": "/x"}}
+            }],
+            "rules": ["MATCH,peer"]
+        });
+        // Static TLS clients and the actual static_h2_dialer proof are created;
+        // no connection, DNS operation, listener or protocol-driving task starts.
+        let observe = |raw: &serde_json::Value, dialer: Dialer| {
+            let parsed = crate::config::Config::parse_yaml(raw.to_string().as_bytes()).unwrap();
+            let requested = parsed.proxies[0].mptcp;
+            let crate::config::ProxyProtocol::Vless(config) = &parsed.proxies[0].protocol else {
+                panic!("expected the normalized split-H2 VLESS protocol");
+            };
+            let outbound =
+                VlessOutbound::new_with_path(config, UpstreamPath::LazyDirect { dialer }).unwrap();
+            let active = [
+                outbound.xhttp.as_ref().unwrap().uses_active_h2_reuse(),
+                outbound
+                    .download
+                    .as_ref()
+                    .unwrap()
+                    .xhttp
+                    .uses_active_h2_reuse(),
+            ];
+            let cancellation = outbound
+                .upload
+                .upstream
+                .static_h2_dialer(&outbound.upload.server)
+                .map(Dialer::h2_reuse_cancellation);
+            let tasks = outbound.tasks.len();
+            drop(outbound);
+            (active, tasks, requested, cancellation)
+        };
+        let (ordinary, ordinary_tasks, ordinary_requested, token) =
+            observe(&base, Dialer::default());
+        drop(token);
+        let mut marked = base.clone();
+        marked["proxies"][0]["mptcp"] = serde_json::json!(true);
+        let dialer = Dialer::default().with_mptcp(true);
+        let (active, tasks, requested, token) = observe(&marked, dialer.clone());
+        let before_stop = token.as_ref().map(CancellationToken::is_cancelled);
+        dialer.begin_shutdown();
+        let after_stop = token.as_ref().map(CancellationToken::is_cancelled);
+        drop(token);
+        drop(dialer);
+        assert_eq!(ordinary, [true, true]);
+        assert_eq!(ordinary_tasks, 0);
+        assert!(!ordinary_requested && requested && marked["proxies"][0]["mptcp"] == true);
+        assert_eq!(tasks, 0);
+        assert_eq!(active, [cfg!(target_os = "macos"); 2]);
+        assert_eq!(before_stop, cfg!(target_os = "macos").then_some(false));
+        assert_eq!(after_stop, cfg!(target_os = "macos").then_some(true));
+        // uses_active_h2_reuse is an immutable pool-selection fact, not a
+        // shutdown receipt. Check the real Dialer cancellation token above.
+
+        for restricted in [
+            Dialer::default().with_source_ip("192.0.2.20".parse().unwrap()),
+            Dialer::default().with_ip_version(crate::config::IpVersion::Ipv4),
+            Dialer::default().with_egress(&crate::config::EgressOptions {
+                interface: Some("memory-interface".into()),
+                ..Default::default()
+            }),
+        ] {
+            let (active, tasks, requested, token) = observe(&marked, restricted.with_mptcp(true));
+            drop(token);
+            assert_eq!(tasks, 0);
+            assert!(requested);
+            assert_eq!(active, [false, false]);
+        }
+        for change in ["mode", "version", "security"] {
+            let mut raw = marked.clone();
+            match change {
+                "mode" => raw["proxies"][0]["xhttp-opts"]["mode"] = serde_json::json!("stream-up"),
+                "version" => raw["proxies"][0]["alpn"] = serde_json::json!(["http/1.1"]),
+                "security" => raw["proxies"][0]["ech-opts"] = serde_json::json!({"enable": true}),
+                _ => unreachable!(),
+            }
+            let (active, tasks, requested, token) =
+                observe(&raw, Dialer::default().with_mptcp(true));
+            drop(token);
+            assert_eq!(tasks, 0);
+            assert!(requested);
+            assert_eq!(
+                active,
+                [false, false],
+                "private H2 bypassed its {change} gate"
+            );
+        }
+    }
 
     // Config -> production pool selection only. The memory peer below does
     // not perform native REALITY authentication; real TUN verifies it separately.
@@ -1700,3 +1907,7 @@ mod active_h2_memory_tests {
         assert_eq!(verified_extra, 2, "new physicals did not both deliver/echo");
     }
 }
+
+#[cfg(all(test, feature = "inbound-http"))]
+#[path = "http_reuse_memory_tests.rs"]
+mod http_reuse_memory_tests;

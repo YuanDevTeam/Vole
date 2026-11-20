@@ -38,8 +38,10 @@ pub const XHTTP_H3_UNI_STREAMS: usize = 8;
 pub const XHTTP_H3_STREAM_WINDOW: usize = 64 * 1024;
 pub const XHTTP_H3_CONNECTION_WINDOW: usize = 128 * 1024;
 pub const XHTTP_H3_SEND_WINDOW: usize = 64 * 1024;
+/// Fixed initial retained writes for the qualified VLESS/Yamux H3 carrier.
+pub const XHTTP_H3_YAMUX_SEND_WINDOW: usize = 128 * 1024;
 /// Retained writes after a qualified physical connection's first local mux UDP association.
-pub const XHTTP_H3_UDP_SEND_WINDOW: usize = 192 * 1024;
+pub const XHTTP_H3_UDP_SEND_WINDOW: usize = 256 * 1024;
 pub const SING_MUX_IDLE_CONNECTIONS: usize = 16;
 pub const SING_MUX_COMMAND_QUEUE: usize = 16;
 pub const SING_MUX_CHUNK: usize = 16 * 1024;
@@ -107,7 +109,10 @@ pub struct ResourceLimits {
     pub max_datagram_size: usize,
     /// Maximum raw IP packet accepted by a TUN netstack.
     pub tun_max_datagram_size: usize,
+    /// Shared stream buffer budget and TUN TCP receive total per flow.
     pub tcp_buffer_per_direction: usize,
+    /// TUN TCP send total per flow, split equally between smoltcp and its app queue.
+    pub tun_tcp_send_buffer: usize,
     /// Explicit low-level DNS constructor override. Production sessions use
     /// dns.cache-max-size for the shared typed/opaque result capacity instead.
     pub dns_address_cache_entries: usize,
@@ -134,6 +139,7 @@ impl Default for ResourceLimits {
             max_datagram_size: 65_535,
             tun_max_datagram_size: 1_500,
             tcp_buffer_per_direction: 32 * 1024,
+            tun_tcp_send_buffer: 128 * 1024,
             dns_address_cache_entries: 256,
             dns_redir_host_entries: 256,
             tun_udp_association_queue_capacity: 64,
@@ -154,6 +160,7 @@ impl ResourceLimits {
             ("max_datagram_size", self.max_datagram_size),
             ("tun_max_datagram_size", self.tun_max_datagram_size),
             ("tcp_buffer_per_direction", self.tcp_buffer_per_direction),
+            ("tun_tcp_send_buffer", self.tun_tcp_send_buffer),
             ("dns_address_cache_entries", self.dns_address_cache_entries),
             ("dns_redir_host_entries", self.dns_redir_host_entries),
             (
@@ -203,6 +210,10 @@ mod tests {
                 ..ResourceLimits::default()
             },
             ResourceLimits {
+                tun_tcp_send_buffer: 0,
+                ..ResourceLimits::default()
+            },
+            ResourceLimits {
                 dns_address_cache_entries: 0,
                 ..ResourceLimits::default()
             },
@@ -246,6 +257,7 @@ mod tests {
         assert_eq!(limits.max_datagram_size, 65_535);
         assert_eq!(limits.tun_max_datagram_size, 1_500);
         assert_eq!(limits.tcp_buffer_per_direction, 32 * 1024);
+        assert_eq!(limits.tun_tcp_send_buffer, 128 * 1024);
         assert_eq!(limits.dns_address_cache_entries, 256);
         assert_eq!(limits.dns_redir_host_entries, 256);
         assert_eq!(limits.tun_udp_association_queue_capacity, 64);

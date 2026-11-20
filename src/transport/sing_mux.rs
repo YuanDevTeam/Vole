@@ -40,11 +40,18 @@ pub(crate) struct SuppliedStream {
 pub(crate) struct Pool {
     options: SingMuxConfig,
     autonomous_writes: bool,
+    coalesce_h3_queued_flush: bool,
+    udp_lane: Option<Lane>,
     state: Arc<Mutex<State>>,
     opening: tokio::sync::Mutex<()>,
     cancel: CancellationToken,
     tasks: TaskTracker,
     drained: Option<Arc<tokio::sync::Notify>>,
+}
+#[derive(Default)]
+struct Lane {
+    state: Arc<Mutex<State>>,
+    opening: tokio::sync::Mutex<()>,
 }
 #[derive(Default)]
 struct State {
@@ -83,6 +90,8 @@ impl Pool {
         Self {
             options,
             autonomous_writes: false,
+            coalesce_h3_queued_flush: false,
+            udp_lane: None,
             state: Arc::default(),
             opening: Default::default(),
             cancel: CancellationToken::new(),
@@ -95,6 +104,25 @@ impl Pool {
             && !self.options.padding
             && (self.options.protocol == SingMuxProtocol::Smux
                 || (self.options.protocol == SingMuxProtocol::H2Mux && h2_packet_up));
+    }
+    pub(crate) fn set_h3_queued_flush_coalescing(&mut self, qualified: bool) {
+        self.coalesce_h3_queued_flush = qualified
+            && self.autonomous_writes
+            && self.options.enabled
+            && self.options.protocol == SingMuxProtocol::Smux
+            && !self.options.padding
+            && !self.options.only_tcp;
+    }
+    /// Fixed by the typed factory before the connector is published.
+    pub(crate) fn set_h3_udp_lane(&mut self, qualified: bool) {
+        self.udp_lane = (qualified
+            && self.autonomous_writes
+            && self.options.enabled
+            && self.options.protocol == SingMuxProtocol::Smux
+            && !self.options.padding
+            && !self.options.only_tcp
+            && self.options.brutal.is_none())
+        .then(Lane::default);
     }
     pub(crate) fn autonomous_writes(&self) -> bool {
         self.autonomous_writes
@@ -123,17 +151,21 @@ impl Pool {
         F: FnOnce() -> Fut,
         Fut: Future<Output = io::Result<SuppliedStream>>,
     {
+        let (lane_state, opening) = match (udp, self.udp_lane.as_ref()) {
+            (true, Some(lane)) => (&lane.state, &lane.opening),
+            _ => (&self.state, &self.opening),
+        };
         let operation = async {
             let mut connect = Some(connect);
             let reservation = {
-                let _opening = self.opening.lock().await;
+                let _opening = opening.lock().await;
                 loop {
                     // notify_one stores a permit if the final lease drains
                     // between the state check and polling this waiter. The
                     // opening lock permits only one retirement waiter.
                     let notified = self.drained.as_ref().map(|notify| notify.notified());
                     let (existing, retiring) = {
-                        let mut state = self.state.lock().unwrap();
+                        let mut state = lane_state.lock().unwrap();
                         if state.closed {
                             return Err(io::ErrorKind::ConnectionAborted.into());
                         }
@@ -155,7 +187,7 @@ impl Pool {
                                             && active < self.options.max_streams
                                     }
                             })
-                            .map(|c| c.reserve(&self.state, self.drained.as_ref()));
+                            .map(|c| c.reserve(lane_state, self.drained.as_ref()));
                         let retiring = self.options.brutal.is_some()
                             && existing.is_none()
                             && !state.connections.is_empty();
@@ -188,7 +220,12 @@ impl Pool {
                     if self.options.padding {
                         raw = Box::new(padding::Padding::new(raw));
                     }
-                    let connection = self.establish(raw).await?;
+                    #[cfg(feature = "outbound-vless")]
+                    let h3_packet_up = self.captures_h3_udp()
+                        && supplied.h3_udp.as_ref().and_then(Weak::upgrade).is_some();
+                    #[cfg(not(feature = "outbound-vless"))]
+                    let h3_packet_up = false;
+                    let connection = self.establish(raw, lane_state, h3_packet_up).await?;
                     #[cfg(feature = "outbound-vless")]
                     let connection = {
                         let mut connection = connection;
@@ -213,11 +250,11 @@ impl Pool {
                         #[cfg(not(target_os = "linux"))]
                         let _ = rate;
                     }
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = lane_state.lock().unwrap();
                     if state.closed {
                         return Err(io::ErrorKind::ConnectionAborted.into());
                     }
-                    let pair = connection.reserve(&self.state, self.drained.as_ref());
+                    let pair = connection.reserve(lane_state, self.drained.as_ref());
                     state.connections.push(connection);
                     break pair;
                 }
@@ -250,28 +287,37 @@ impl Pool {
             result = timeout_at(deadline, operation) => result.map_err(|_|io::Error::from(io::ErrorKind::TimedOut))?,
         }
     }
-    async fn establish(&self, raw: BoxStream) -> io::Result<Connection> {
+    async fn establish(
+        &self,
+        raw: BoxStream,
+        state: &Arc<Mutex<State>>,
+        h3_packet_up: bool,
+    ) -> io::Result<Connection> {
         if self.options.protocol == SingMuxProtocol::Smux {
-            let (sender, driver) =
-                smux_driver::new_with_autonomous_writes(raw, self.autonomous_writes);
-            return self.own(Sender::Smux(sender), driver);
+            let (sender, driver) = smux_driver::new_with_queued_flush_coalescing(
+                raw,
+                self.autonomous_writes,
+                self.coalesce_h3_queued_flush,
+            );
+            return self.own(Sender::Smux(sender), driver, state);
         }
         if self.options.protocol == SingMuxProtocol::Yamux {
             let (sender, driver) = yamux_driver::new(raw);
-            return self.own(Sender::Yamux(sender), driver);
+            return self.own(Sender::Yamux(sender), driver, state);
         }
-        let (sender, driver) = h2_driver::new(raw).await?;
-        self.own(Sender::H2(sender), driver)
+        let (sender, driver) = h2_driver::new(raw, h3_packet_up).await?;
+        self.own(Sender::H2(sender), driver, state)
     }
     fn own(
         &self,
         sender: Sender,
         driver: impl Future<Output = ()> + Send + 'static,
+        state: &Arc<Mutex<State>>,
     ) -> io::Result<Connection> {
         let cancel = self.cancel.child_token();
         let token = cancel.clone();
         let drained = self.drained.clone();
-        let state = self.state.lock().unwrap();
+        let state = state.lock().unwrap();
         if state.closed {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
@@ -299,6 +345,11 @@ impl Pool {
         state.closed = true;
         self.cancel.cancel();
         state.connections.clear();
+        if let Some(lane) = &self.udp_lane {
+            let mut udp = lane.state.lock().unwrap();
+            udp.closed = true;
+            udp.connections.clear();
+        }
         self.tasks.close();
     }
     pub(crate) async fn stop(&self) {
@@ -591,7 +642,7 @@ mod tests {
                 }
             }
         });
-        let (sender, driver) = h2_driver::new(Box::new(raw)).await.unwrap();
+        let (sender, driver) = h2_driver::new(Box::new(raw), false).await.unwrap();
         let client_driver = tokio::spawn(driver);
         let sender = Sender::H2(sender);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -757,7 +808,7 @@ mod tests {
                     }
                 }
             });
-            let (sender, driver) = h2_driver::new(Box::new(raw)).await.unwrap();
+            let (sender, driver) = h2_driver::new(Box::new(raw), false).await.unwrap();
             let client_driver = tokio::spawn(driver);
             let deadline = Instant::now() + std::time::Duration::from_secs(10);
             let mut raw = Sender::H2(sender).open(deadline, false).await.unwrap();

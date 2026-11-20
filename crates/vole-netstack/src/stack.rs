@@ -1,10 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::poll_fn,
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
@@ -28,11 +30,21 @@ use crate::{
     icmp::{IcmpIngress, classify as classify_icmp},
     pmtu::parse_path_mtu_hint,
     tcp::{
-        ClientRequest, ConnectRequest, FlowKey, InitialMtuRequest, TcpConnector, TcpListener,
-        TcpStream, TcpStreamHandle, connect_stopped, connect_timeout,
+        ClientRequest, ConnectRequest, FlowKey, InitialMtuRequest, MapCache, TcpConnector,
+        TcpListener, TcpStream, TcpStreamHandle, connect_stopped, connect_timeout,
     },
     udp::{UdpDatagram, UdpSocket, parse_udp_packet},
 };
+
+#[cfg(feature = "diagnostics")]
+type MaintenanceObservation = [u64; 3];
+#[cfg(not(feature = "diagnostics"))]
+type MaintenanceObservation = ();
+
+#[cfg(feature = "diagnostics")]
+fn add_observed_count(total: &mut u64, count: usize) {
+    *total = total.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+}
 
 const RAW_INGRESS_BATCH: usize = 8;
 const TCP_CONNECT_QUEUE: usize = 32;
@@ -124,7 +136,14 @@ impl NetStack {
     /// Returns [`NetStackError::Config`] for inconsistent bounds and
     /// [`NetStackError::NoRuntime`] when called outside a Tokio runtime.
     pub fn start(config: NetStackConfig) -> Result<Self, NetStackError> {
-        Self::start_parts(config, true, None).map(DriverParts::into_stack)
+        Self::start_parts(
+            config,
+            true,
+            None,
+            #[cfg(feature = "diagnostics")]
+            None,
+        )
+        .map(DriverParts::into_stack)
     }
 
     /// Starts only the TCP/ICMP driver; callers handle UDP with the pure codec.
@@ -133,7 +152,27 @@ impl NetStack {
     ///
     /// Returns the same configuration and runtime errors as [`Self::start`].
     pub fn start_tcp(config: NetStackConfig) -> Result<TcpNetStackParts, NetStackError> {
-        Self::start_parts(config, false, None).map(DriverParts::into_tcp)
+        Self::start_parts(
+            config,
+            false,
+            None,
+            #[cfg(feature = "diagnostics")]
+            None,
+        )
+        .map(DriverParts::into_tcp)
+    }
+
+    /// Starts passive TCP with an integer-only diagnostic observer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same configuration and runtime errors as [`Self::start`].
+    #[cfg(feature = "diagnostics")]
+    pub fn start_tcp_observed(
+        config: NetStackConfig,
+        observer: crate::diagnostics::DriverObserver,
+    ) -> Result<TcpNetStackParts, NetStackError> {
+        Self::start_parts(config, false, None, Some(observer)).map(DriverParts::into_tcp)
     }
 
     /// Starts active TCP using only the supplied local IP addresses.
@@ -150,13 +189,21 @@ impl NetStack {
         addresses: impl Into<ClientConfig>,
     ) -> Result<ClientNetStackParts, NetStackError> {
         let addresses = addresses.into().validate(config.mtu)?;
-        Self::start_parts(config, false, Some(addresses)).map(DriverParts::into_client)
+        Self::start_parts(
+            config,
+            false,
+            Some(addresses),
+            #[cfg(feature = "diagnostics")]
+            None,
+        )
+        .map(DriverParts::into_client)
     }
 
     fn start_parts(
         config: NetStackConfig,
         with_udp: bool,
         addresses: Option<ClientConfig>,
+        #[cfg(feature = "diagnostics")] observer: Option<crate::diagnostics::DriverObserver>,
     ) -> Result<DriverParts, NetStackError> {
         if let Some(client) = &addresses {
             config.validate_client(client)?;
@@ -229,6 +276,10 @@ impl NetStack {
             stats.clone(),
             stopped_tx,
         );
+        #[cfg(feature = "diagnostics")]
+        {
+            driver.observer = observer;
+        }
         if let Some(client) = client {
             driver.configure_client(&client.addresses);
             driver.client = Some(client);
@@ -288,6 +339,27 @@ impl PacketSink {
                 result.map_err(|_| NetStackError::Stopped)
             }
         }
+    }
+
+    /// Tries raw ingress while returning the original packet on every error.
+    ///
+    /// This reserves no extra capacity. Callers may keep at most their own
+    /// explicit bounded pending packet and drive readiness outside callbacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::try_send`] together with the packet.
+    pub fn try_send_recover(&self, packet: Packet) -> Result<(), (NetStackError, Packet)> {
+        if self.cancellation.is_cancelled() {
+            return Err((NetStackError::Stopped, packet));
+        }
+        if let Err(error) = validate_raw_packet(&packet, self.mtu) {
+            return Err((error, packet));
+        }
+        self.sender.try_send(packet).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(packet) => (NetStackError::Backpressure, packet),
+            mpsc::error::TrySendError::Closed(packet) => (NetStackError::Stopped, packet),
+        })
     }
 
     /// Non-blocking ingress used by edge-triggered TUN adapters.
@@ -525,6 +597,10 @@ struct Driver {
     sockets: SocketSet<'static>,
     tcp_entries: HashMap<FlowKey, TcpEntry>,
     half_open: HashSet<FlowKey>,
+    tx_map_cache: Arc<MapCache>,
+    rx_map_cache: Option<Arc<MapCache>>,
+    #[cfg(feature = "diagnostics")]
+    observer: Option<crate::diagnostics::DriverObserver>,
 }
 
 impl Driver {
@@ -569,6 +645,13 @@ impl Driver {
             .add_default_ipv6_route(Ipv6Address::new(0xfd00, 0x5643, 0x6f72, 0x6500, 0, 0, 0, 1))
             .expect("smoltcp IPv6 route capacity");
 
+        let tx_map_cache = Arc::new(MapCache::new(config.tcp_send_buffer));
+        #[cfg(unix)]
+        let rx_map_cache = config
+            .map_tcp_recv_buffer
+            .then(|| Arc::new(MapCache::new(config.tcp_recv_buffer)));
+        #[cfg(not(unix))]
+        let rx_map_cache = None;
         Self {
             config,
             raw_inbound,
@@ -585,6 +668,10 @@ impl Driver {
             sockets: SocketSet::new(Vec::new()),
             tcp_entries: HashMap::new(),
             half_open: HashSet::new(),
+            tx_map_cache,
+            rx_map_cache,
+            #[cfg(feature = "diagnostics")]
+            observer: None,
         }
     }
 
@@ -631,6 +718,13 @@ impl Driver {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn observe(&self, event: crate::diagnostics::DriverObservation) {
+        if let Some(observer) = self.observer {
+            observer(event);
+        }
+    }
+
     async fn next_request(client: &mut Option<ClientDriver>) -> Option<ClientRequest> {
         match client {
             Some(client) => client.requests.recv().await,
@@ -648,6 +742,25 @@ impl Driver {
     }
 
     async fn wait_for_work(&mut self) -> bool {
+        if self.device.rx_is_empty() {
+            // Avoid an advisory all-socket timer scan when real ingress can
+            // already progress. poll_recv retains the first packet's coop
+            // accounting; Pending still enters the original wait below.
+            let ready = tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => return false,
+                ready = poll_fn(|cx| Poll::Ready(self.raw_inbound.poll_recv(cx))) => ready,
+            };
+            match ready {
+                Poll::Ready(Some(packet)) => {
+                    #[cfg(feature = "diagnostics")]
+                    self.observe(crate::diagnostics::DriverObservation::WaitIngress);
+                    return self.receive_packet_batch(packet).await;
+                }
+                Poll::Ready(None) => return false,
+                Poll::Pending => {}
+            }
+        }
         let delay = self.next_delay();
         let has_connect_requests = self
             .client
@@ -661,19 +774,18 @@ impl Driver {
             // one pending packet until output capacity returns.
             packet = self.raw_inbound.recv(), if self.device.rx_is_empty() => {
                 let Some(packet) = packet else { return false; };
-                let batch_count = self.handle_packet_batch(packet);
-                // recv() already charges the first packet. try_recv()
-                // does not, so retain the old per-packet cooperative
-                // accounting without repeating socket maintenance.
-                for _ in 1..batch_count {
-                    tokio::task::consume_budget().await;
-                }
-                true
+                #[cfg(feature = "diagnostics")]
+                self.observe(crate::diagnostics::DriverObservation::WaitIngress);
+                self.receive_packet_batch(packet).await
             }
             // Socket maintenance runs before this wait on every iteration.
             // Its own notifications must not outrank an already-ready packet,
             // especially TCP ACKs which release the relay's bounded buffers.
-            () = self.notify.notified() => true,
+            () = self.notify.notified() => {
+                #[cfg(feature = "diagnostics")]
+                self.observe(crate::diagnostics::DriverObservation::WaitNotify);
+                true
+            },
             request = Self::next_request(&mut self.client), if has_connect_requests => {
                 if let Some(request) = request {
                     self.handle_client_request(request);
@@ -681,8 +793,22 @@ impl Driver {
                 }
                 true
             }
-            () = tokio::time::sleep(delay) => true,
+            () = tokio::time::sleep(delay) => {
+                #[cfg(feature = "diagnostics")]
+                self.observe(crate::diagnostics::DriverObservation::WaitTimer);
+                true
+            },
         }
+    }
+
+    async fn receive_packet_batch(&mut self, packet: Packet) -> bool {
+        let batch_count = self.handle_packet_batch(packet);
+        // Both recv() and poll_recv() charge the first packet. try_recv()
+        // does not, so preserve accounting for the remaining accepted prefix.
+        for _ in 1..batch_count {
+            tokio::task::consume_budget().await;
+        }
+        true
     }
 
     fn handle_packet_batch(&mut self, first: Packet) -> usize {
@@ -829,6 +955,19 @@ impl Driver {
         }
     }
 
+    fn new_tcp_handle(&self) -> Arc<TcpStreamHandle> {
+        let mut handle = TcpStreamHandle::new(
+            self.config.recv_layer_buffer_size(),
+            self.config.send_layer_buffer_size(),
+            self.notify.clone(),
+        )
+        .with_tx_cache(Arc::downgrade(&self.tx_map_cache));
+        if let Some(cache) = &self.rx_map_cache {
+            handle = handle.with_rx_cache(Arc::downgrade(cache));
+        }
+        Arc::new(handle)
+    }
+
     fn admit_tcp(&mut self, flow: FlowKey) -> bool {
         let Some(accept) = self.tcp_accept.as_ref() else {
             return false;
@@ -844,11 +983,7 @@ impl Driver {
             return false;
         }
 
-        let handle = Arc::new(TcpStreamHandle::new(
-            self.config.recv_layer_buffer_size(),
-            self.config.send_layer_buffer_size(),
-            self.notify.clone(),
-        ));
+        let handle = self.new_tcp_handle();
         let socket_handle = self.sockets.add(socket);
         let stream = TcpStream::new(flow, handle.clone());
         if accept.try_send(stream).is_err() {
@@ -942,11 +1077,7 @@ impl Driver {
             )));
             return;
         }
-        let handle = Arc::new(TcpStreamHandle::new(
-            self.config.recv_layer_buffer_size(),
-            self.config.send_layer_buffer_size(),
-            self.notify.clone(),
-        ));
+        let handle = self.new_tcp_handle();
         let socket = self.sockets.add(socket);
         let connect_cancellation = Some(request.cancellation.clone());
         self.tcp_entries.insert(
@@ -1014,6 +1145,8 @@ impl Driver {
             self.cancellation.cancel();
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        let emitted_before = self.device.emitted();
         self.device.flush_pending();
         // Busy packet traffic must not starve command admission. The same
         // bounded prefix as raw ingress avoids draining an unbounded burst.
@@ -1037,6 +1170,9 @@ impl Driver {
             self.interface
                 .poll_ingress_single(Instant::now(), &mut self.device, &mut self.sockets);
         }
+        #[cfg(feature = "diagnostics")]
+        let observation = self.drive_tcp_sockets();
+        #[cfg(not(feature = "diagnostics"))]
         self.drive_tcp_sockets();
         self.device.flush_pending();
         if !self.device.tx_is_full() {
@@ -1044,9 +1180,20 @@ impl Driver {
                 .poll(Instant::now(), &mut self.device, &mut self.sockets);
         }
         self.device.flush_pending();
+        #[cfg(feature = "diagnostics")]
+        self.observe(crate::diagnostics::DriverObservation::DrivePass {
+            tcp_entry_visits: observation[0],
+            app_rx_bytes: observation[1],
+            app_tx_bytes: observation[2],
+            no_data_progress: observation[1] == 0
+                && observation[2] == 0
+                && self.device.emitted() == emitted_before,
+        });
     }
 
-    fn drive_tcp_sockets(&mut self) {
+    fn drive_tcp_sockets(&mut self) -> MaintenanceObservation {
+        #[cfg(feature = "diagnostics")]
+        let mut observation = [0_u64; 3];
         let pending_flow = self
             .device
             .pending_rx()
@@ -1054,6 +1201,8 @@ impl Driver {
             .map(|(flow, _, _)| flow);
         let mut inactive = Vec::new();
         for (flow, entry) in &mut self.tcp_entries {
+            #[cfg(feature = "diagnostics")]
+            add_observed_count(&mut observation[0], 1);
             let socket = self.sockets.get_mut::<tcp::Socket>(entry.socket);
             Self::finish_connect(*flow, entry, socket);
             let handle = &entry.handle;
@@ -1065,7 +1214,11 @@ impl Driver {
                     (count, count)
                 }) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => received = true,
+                    Ok(count) => {
+                        received = count > 0;
+                        #[cfg(feature = "diagnostics")]
+                        add_observed_count(&mut observation[1], count);
+                    }
                 }
             }
             if received {
@@ -1073,13 +1226,20 @@ impl Driver {
             }
 
             let mut sent = false;
-            while socket.can_send() {
+            // The hint skips only an empty application copy. New writes still
+            // notify this driver; FIN/flush and socket maintenance use their
+            // existing authoritative checks below.
+            while handle.app_send.may_have_data() && socket.can_send() {
                 match socket.send(|bytes| {
                     let count = handle.app_send.read(bytes);
                     (count, count)
                 }) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => sent = true,
+                    Ok(count) => {
+                        sent = count > 0;
+                        #[cfg(feature = "diagnostics")]
+                        add_observed_count(&mut observation[2], count);
+                    }
                 }
             }
             if sent {
@@ -1109,8 +1269,8 @@ impl Driver {
                 socket.abort();
             } else if (handle.write_shutdown.load(Ordering::Acquire)
                 || handle.dropped.load(Ordering::Acquire))
-                && handle.app_send.is_empty()
                 && socket.may_send()
+                && handle.app_send.is_empty()
             {
                 socket.close();
             }
@@ -1142,6 +1302,10 @@ impl Driver {
             }
         }
         self.update_flow_stats();
+        #[cfg(feature = "diagnostics")]
+        {
+            observation
+        }
     }
 
     fn finish_connect(incoming: FlowKey, entry: &mut TcpEntry, socket: &mut tcp::Socket<'_>) {
@@ -1237,6 +1401,11 @@ impl Driver {
     }
 
     fn shutdown(&mut self) {
+        // Idle mapping owners end before waking streams/publishing stopped.
+        self.tx_map_cache.close();
+        if let Some(cache) = &self.rx_map_cache {
+            cache.close();
+        }
         self.cancellation.cancel();
         self.device.clear();
         if let Some(client) = &mut self.client {
@@ -1357,6 +1526,193 @@ mod tests {
         }
         ip.fill_checksum();
         Packet::new(ip.into_inner())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mapped_rx_driver_opt_in_stop_clears_idle_and_preserves_accepted_tail() {
+        for (rx_total, tx_total) in [(112 * 1024, 64 * 1024), (128 * 1024, 32 * 1024)] {
+            for enabled in [false, true] {
+                assert_mapped_rx_driver_stop(rx_total, tx_total, enabled).await;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_mapped_rx_driver_stop(
+        tcp_recv_buffer: usize,
+        tcp_send_buffer: usize,
+        enabled: bool,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let config = NetStackConfig {
+            tcp_recv_buffer,
+            tcp_send_buffer,
+            map_tcp_recv_buffer: enabled,
+            ..NetStackConfig::default()
+        };
+        let (_sender, inbound) = mpsc::channel(config.packet_queue);
+        let (outbound, mut packets) = mpsc::channel(config.packet_queue);
+        let (accept, mut streams) = mpsc::channel(config.tcp_accept_queue);
+        let (stopped, observed) = watch::channel(false);
+        let mut driver = Driver::new(
+            config,
+            inbound,
+            outbound,
+            Some(accept),
+            None,
+            CancellationToken::new(),
+            Arc::new(Notify::new()),
+            NetStackStats::default(),
+            stopped,
+        );
+        assert_eq!(driver.rx_map_cache.is_some(), enabled);
+        driver.handle_packet_batch(tcp_handshake_packet(100, None));
+        driver.drive();
+        let syn_ack = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(syn_ack.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let acknowledged = tcp.seq_number().0.wrapping_add(1);
+        driver.handle_packet_batch(tcp_handshake_packet(101, Some(acknowledged)));
+        driver.drive();
+        let mut stream = streams.try_recv().unwrap();
+        let handle = driver.tcp_entries.values().next().unwrap().handle.clone();
+        let tx_capacity = tcp_send_buffer / 2;
+        assert_eq!(
+            handle.app_send.write(&vec![0x61; tx_capacity + 1]),
+            tx_capacity
+        );
+        assert_eq!(handle.app_send.write(b"full"), 0);
+        assert!(handle.app_send.mapped_lifetime_for_test().is_none());
+        let mut drained_tx = vec![0; tx_capacity];
+        assert_eq!(handle.app_send.read(&mut drained_tx), tx_capacity);
+        assert!(drained_tx.iter().all(|byte| *byte == 0x61));
+        assert_eq!(handle.app_recv.write(b"first"), 5);
+        let first = handle.app_recv.mapped_lifetime_for_test();
+        assert_eq!(first.is_some(), enabled);
+        stream.read_exact(&mut [0; 5]).await.unwrap();
+        if let Some(cache) = &driver.rx_map_cache {
+            assert_eq!(cache.retained_for_test(), tcp_recv_buffer / 2);
+        }
+        assert_eq!(handle.app_recv.write(b"accepted-tail"), 13);
+        let tail = handle.app_recv.mapped_lifetime_for_test();
+        let cache = driver.rx_map_cache.clone();
+        driver.shutdown();
+        assert!(*observed.borrow());
+        assert!(handle.stopped.load(Ordering::Acquire));
+        if let (Some(cache), Some(tail)) = (&cache, &tail) {
+            assert_eq!(cache.retained_for_test(), 0);
+            assert!(
+                tail.upgrade().is_some(),
+                "Stop must keep the real nonempty RX owner"
+            );
+        }
+        assert_eq!(
+            stream.write_all(b"late").await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        let mut bytes = [0; 13];
+        stream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"accepted-tail");
+        assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+        if let (Some(cache), Some(tail)) = (&cache, &tail) {
+            assert!(tail.upgrade().is_none());
+            assert_eq!(cache.retained_for_test(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mapped_tx_packet_admission_and_data_have_a_real_mapping_owner() {
+        use tokio::io::AsyncWriteExt;
+        let config = NetStackConfig {
+            tcp_send_buffer: 128 * 1024,
+            ..NetStackConfig::default()
+        };
+        let (_sender, inbound) = mpsc::channel(config.packet_queue);
+        let (outbound, mut packets) = mpsc::channel(config.packet_queue);
+        let (accept, mut streams) = mpsc::channel(config.tcp_accept_queue);
+        let (stopped, observed) = watch::channel(false);
+        let mut driver = Driver::new(
+            config,
+            inbound,
+            outbound,
+            Some(accept),
+            None,
+            CancellationToken::new(),
+            Arc::new(Notify::new()),
+            NetStackStats::default(),
+            stopped,
+        );
+        driver.handle_packet_batch(tcp_handshake_packet(100, None));
+        driver.drive();
+        let syn_ack = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(syn_ack.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let acknowledged = tcp.seq_number().0.wrapping_add(1);
+        driver.handle_packet_batch(tcp_handshake_packet(101, Some(acknowledged)));
+        driver.drive();
+        let mut stream = streams.try_recv().unwrap();
+        let payload = b"actual-mapped-packet-data";
+        stream.write_all(payload).await.unwrap();
+        let handle = driver.tcp_entries.values().next().unwrap().handle.clone();
+        let lifetime = handle.app_send.mapped_lifetime_for_test().unwrap();
+        assert!(lifetime.upgrade().is_some());
+        driver.drive();
+        let data = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(data.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert_eq!(tcp.payload(), payload);
+        assert_eq!(handle.app_send.len(), 0);
+        assert!(driver.tx_map_cache.retained_for_test() > 0);
+        driver.shutdown();
+        assert!(*observed.borrow());
+        assert!(lifetime.upgrade().is_none());
+        assert_eq!(
+            stream.write_all(b"stopped").await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_tx_shutdown_clears_real_idle_owners_before_stopped() {
+        let config = NetStackConfig {
+            tcp_send_buffer: 128 * 1024,
+            ..NetStackConfig::default()
+        };
+        let (_sender, inbound) = mpsc::channel(config.packet_queue);
+        let (outbound, _packets) = mpsc::channel(config.packet_queue);
+        let (accept, _streams) = mpsc::channel(config.tcp_accept_queue);
+        let (stopped, observed) = watch::channel(false);
+        let mut driver = Driver::new(
+            config,
+            inbound,
+            outbound,
+            Some(accept),
+            None,
+            CancellationToken::new(),
+            Arc::new(Notify::new()),
+            NetStackStats::default(),
+            stopped,
+        );
+        let handle = TcpStreamHandle::new(16, 64 * 1024, Arc::new(Notify::new()))
+            .with_tx_cache(Arc::downgrade(&driver.tx_map_cache));
+        let cache = Arc::downgrade(&driver.tx_map_cache);
+        assert_eq!(handle.app_send.write(b"owned"), 5);
+        let lifetime = handle.app_send.mapped_lifetime_for_test().unwrap();
+        assert_eq!(handle.app_send.read(&mut [0; 5]), 5);
+        assert!(driver.tx_map_cache.retained_for_test() > 0);
+        assert!(lifetime.upgrade().is_some());
+        driver.shutdown();
+        assert!(*observed.borrow());
+        assert_eq!(driver.tx_map_cache.retained_for_test(), 0);
+        assert!(lifetime.upgrade().is_none());
+        assert_eq!(handle.app_send.write(b"late"), 4);
+        assert_eq!(handle.app_send.read(&mut [0; 4]), 4);
+        assert_eq!(driver.tx_map_cache.retained_for_test(), 0);
+        drop(driver);
+        assert!(cache.upgrade().is_none());
     }
 
     // Keep both real handshakes and the failed-emit timeline in one regression.
@@ -1503,6 +1859,235 @@ mod tests {
             retried,
             "failed fast retransmit must remain immediately retryable after TX capacity returns"
         );
+    }
+
+    #[tokio::test]
+    async fn tx_hint_empty_observation_then_write_wakes_and_sends_without_new_ingress() {
+        use tokio::io::AsyncWriteExt;
+        let config = NetStackConfig {
+            max_poll_interval: Duration::from_secs(5),
+            ..NetStackConfig::default()
+        };
+        let (_sender, inbound) = mpsc::channel(config.packet_queue);
+        let (outbound, mut packets) = mpsc::channel(config.packet_queue);
+        let (accept, mut streams) = mpsc::channel(config.tcp_accept_queue);
+        let (stopped, _) = watch::channel(false);
+        let notify = Arc::new(Notify::new());
+        let mut driver = Driver::new(
+            config,
+            inbound,
+            outbound,
+            Some(accept),
+            None,
+            CancellationToken::new(),
+            notify.clone(),
+            NetStackStats::default(),
+            stopped,
+        );
+        driver.handle_packet_batch(tcp_handshake_packet(100, None));
+        driver.drive();
+        let syn_ack = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(syn_ack.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let acknowledged = tcp.seq_number().0.wrapping_add(1);
+        driver.handle_packet_batch(tcp_handshake_packet(101, Some(acknowledged)));
+        driver.drive();
+        let mut stream = streams.try_recv().unwrap();
+        let handle = driver.tcp_entries.values().next().unwrap().handle.clone();
+        assert!(!handle.app_send.may_have_data());
+        assert!(packets.try_recv().is_err());
+
+        // A prior empty maintenance pass must not require a new packet or the
+        // five-second maintenance timer to notice this subsequent real write.
+        // Drain at most the one stored Notify permit before checking its wait.
+        let _ = notify.notified().now_or_never();
+        let mut waiting = Box::pin(driver.wait_for_work());
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        let payload = b"published-after-driver-observed-empty";
+        stream.write_all(payload).await.unwrap();
+        assert!(handle.app_send.may_have_data());
+        assert_eq!(
+            futures_util::poll!(waiting.as_mut()),
+            std::task::Poll::Ready(true)
+        );
+        drop(waiting);
+        driver.drive();
+        let data = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(data.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert_eq!(tcp.payload(), payload);
+        assert_eq!(handle.app_send.len(), 0);
+        assert!(!handle.app_send.may_have_data());
+        driver.shutdown();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn pending_write_flush_resume_on_real_window_ack_then_fin() {
+        use std::task::{Context, Wake, Waker};
+        use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let config = NetStackConfig {
+            tcp_send_buffer: 4096,
+            max_poll_interval: Duration::from_secs(5),
+            ..NetStackConfig::default()
+        };
+        let (_sender, inbound) = mpsc::channel(config.packet_queue);
+        let (outbound, mut packets) = mpsc::channel(config.packet_queue);
+        let (accept, mut streams) = mpsc::channel(config.tcp_accept_queue);
+        let (stopped, observed) = watch::channel(false);
+        let notify = Arc::new(Notify::new());
+        let mut driver = Driver::new(
+            config,
+            inbound,
+            outbound,
+            Some(accept),
+            None,
+            CancellationToken::new(),
+            notify.clone(),
+            NetStackStats::default(),
+            stopped,
+        );
+        driver.handle_packet_batch(tcp_handshake_packet(100, None));
+        driver.drive();
+        let syn_ack = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(syn_ack.data()).unwrap();
+        let sequence = TcpPacket::new_checked(ip.payload())
+            .unwrap()
+            .seq_number()
+            .0
+            .wrapping_add(1);
+        driver.handle_packet_batch(tcp_handshake_packet(101, Some(sequence)));
+        driver.drive();
+        let mut stream = streams.try_recv().unwrap();
+        let entry = driver.tcp_entries.values().next().unwrap();
+        let socket = entry.socket;
+        let handle = entry.handle.clone();
+        let first = [0x41; 2048];
+        let tail = [0x42; 2048];
+        stream.write_all(&first).await.unwrap();
+        driver.drive();
+        assert_pending_notify_wire_bytes(&mut packets, sequence, &first);
+        assert_eq!(
+            driver.sockets.get::<tcp::Socket>(socket).send_queue(),
+            first.len()
+        );
+        stream.write_all(&tail).await.unwrap();
+        driver.drive();
+        assert_eq!(handle.app_send.len(), tail.len());
+        assert!(packets.try_recv().is_err());
+        let _ = notify.notified().now_or_never();
+        let observed_wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let task_waker = Waker::from(observed_wakes.clone());
+        let mut context = Context::from_waker(&task_waker);
+        assert!(
+            std::pin::Pin::new(&mut stream)
+                .poll_write(&mut context, b"!")
+                .is_pending()
+        );
+        assert!(
+            std::pin::Pin::new(&mut stream)
+                .poll_flush(&mut context)
+                .is_pending()
+        );
+
+        // A real zero-window update acknowledges no DATA and cannot free the
+        // full application queue. No fabricated socket flags or app draining.
+        driver.handle_packet_batch(pending_notify_window_ack(sequence, 0));
+        driver.drive();
+        assert_eq!(handle.app_send.len(), tail.len());
+        assert_eq!(observed_wakes.0.load(Ordering::Relaxed), 0);
+        assert!(packets.try_recv().is_err());
+        // The same peer now opens its window and acknowledges the actual wire
+        // prefix. This ingress, not a new application write or timer, wakes it.
+        let first_end = sequence.wrapping_add(2048);
+        driver.handle_packet_batch(pending_notify_window_ack(first_end, u16::MAX));
+        driver.drive();
+        assert!(observed_wakes.0.load(Ordering::Relaxed) > 0);
+        assert_eq!(handle.app_send.len(), 0);
+        assert!(matches!(
+            std::pin::Pin::new(&mut stream).poll_flush(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            std::pin::Pin::new(&mut stream).poll_write(&mut context, b"!"),
+            Poll::Ready(Ok(1))
+        ));
+        assert_pending_notify_wire_bytes(&mut packets, first_end, &tail);
+        let tail_end = sequence.wrapping_add(4096);
+        driver.handle_packet_batch(pending_notify_window_ack(tail_end, u16::MAX));
+        driver.drive();
+        assert_pending_notify_wire_bytes(&mut packets, tail_end, b"!");
+        // Flush has its original local-queue contract; FIN may follow accepted
+        // DATA without waiting for that final byte's ACK.
+        assert!(matches!(
+            std::pin::Pin::new(&mut stream).poll_shutdown(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+        driver.drive();
+        let fin = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(fin.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.fin() && !tcp.rst());
+        assert_eq!(tcp.payload(), b"");
+        assert_eq!(tcp.seq_number().0, tail_end.wrapping_add(1));
+        driver.cancellation.cancel();
+        driver.shutdown();
+        drop(stream);
+        assert!(*observed.borrow());
+        assert!(handle.stopped.load(Ordering::Acquire));
+        assert!(driver.tcp_entries.is_empty());
+        assert_eq!(driver.sockets.iter().count(), 0);
+        assert!(driver.device.rx_is_empty());
+    }
+
+    fn pending_notify_window_ack(acknowledgement: i32, window: u16) -> Packet {
+        let mut ip = Ipv4Packet::new_unchecked(
+            tcp_handshake_packet(101, Some(acknowledgement))
+                .data()
+                .to_vec(),
+        );
+        let source = ip.src_addr();
+        let destination = ip.dst_addr();
+        let mut tcp = TcpPacket::new_unchecked(ip.payload_mut());
+        tcp.set_window_len(window);
+        tcp.fill_checksum(&source.into(), &destination.into());
+        ip.fill_checksum();
+        Packet::new(ip.into_inner())
+    }
+
+    fn assert_pending_notify_wire_bytes(
+        packets: &mut mpsc::Receiver<Packet>,
+        sequence: i32,
+        expected: &[u8],
+    ) {
+        let mut received = 0;
+        while let Ok(packet) = packets.try_recv() {
+            let ip = Ipv4Packet::new_checked(packet.data()).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert!(!tcp.rst() && !tcp.fin());
+            if tcp.payload().is_empty() {
+                continue;
+            }
+            assert_eq!(
+                tcp.seq_number().0,
+                sequence.wrapping_add(i32::try_from(received).unwrap())
+            );
+            let end = received + tcp.payload().len();
+            assert!(end <= expected.len());
+            assert_eq!(tcp.payload(), &expected[received..end]);
+            received = end;
+        }
+        assert_eq!(received, expected.len());
     }
 
     #[tokio::test]
@@ -1663,6 +2248,46 @@ mod tests {
                 sender.try_send(tcp_handshake_packet(100, None)).unwrap();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn ingress_wait_wakes_after_pending_and_drains_a_closed_prefix() {
+        let config = NetStackConfig::default();
+        let (sender, inbound) = mpsc::channel(config.packet_queue);
+        let (outbound, mut packets) = mpsc::channel(config.packet_queue);
+        let (accept, _streams) = mpsc::channel(config.tcp_accept_queue);
+        let (stopped, _) = watch::channel(false);
+        let mut driver = Driver::new(
+            config,
+            inbound,
+            outbound,
+            Some(accept),
+            None,
+            CancellationToken::new(),
+            Arc::new(Notify::new()),
+            NetStackStats::default(),
+            stopped,
+        );
+        {
+            let mut waiting = Box::pin(driver.wait_for_work());
+            assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+            sender.try_send(tcp_handshake_packet(100, None)).unwrap();
+            drop(sender);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), waiting)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(driver.raw_inbound.is_empty());
+        driver.drive();
+        let syn_ack = packets.try_recv().unwrap();
+        let ip = Ipv4Packet::new_checked(syn_ack.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.syn() && tcp.ack());
+        assert!(!driver.wait_for_work().await);
+        driver.shutdown();
+        assert!(driver.cancellation.is_cancelled());
     }
 
     #[tokio::test]
@@ -2001,4 +2626,230 @@ mod tests {
             Err(NetStackError::MtuExceeded { .. })
         ));
     }
+
+    #[cfg(feature = "diagnostics")]
+    mod driver_observer_fixture {
+        use super::*;
+        use crate::diagnostics::DriverObservation;
+        use std::cell::RefCell;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+        struct Totals {
+            passes: u64,
+            visits: u64,
+            rx: u64,
+            tx: u64,
+            no_data: u64,
+            ingress: u64,
+            notified: u64,
+            timer: u64,
+        }
+        thread_local! {
+            static TOTALS: RefCell<Totals> = const { RefCell::new(Totals {
+                passes: 0, visits: 0, rx: 0, tx: 0,
+                no_data: 0, ingress: 0, notified: 0, timer: 0,
+            }) };
+        }
+        fn observed(event: DriverObservation) {
+            TOTALS.with(|totals| {
+                let mut totals = totals.borrow_mut();
+                match event {
+                    DriverObservation::DrivePass {
+                        tcp_entry_visits,
+                        app_rx_bytes,
+                        app_tx_bytes,
+                        no_data_progress,
+                    } => {
+                        totals.passes += 1;
+                        totals.visits += tcp_entry_visits;
+                        totals.rx += app_rx_bytes;
+                        totals.tx += app_tx_bytes;
+                        totals.no_data += u64::from(no_data_progress);
+                    }
+                    DriverObservation::WaitIngress => totals.ingress += 1,
+                    DriverObservation::WaitNotify => totals.notified += 1,
+                    DriverObservation::WaitTimer => totals.timer += 1,
+                }
+            });
+        }
+        fn totals() -> Totals {
+            TOTALS.with(|value| *value.borrow())
+        }
+        fn reset() {
+            TOTALS.with(|value| *value.borrow_mut() = Totals::default());
+        }
+        struct Fixture {
+            driver: Driver,
+            ingress: mpsc::Sender<Packet>,
+            packets: mpsc::Receiver<Packet>,
+            streams: mpsc::Receiver<TcpStream>,
+            stopped: watch::Receiver<bool>,
+        }
+        fn fixture() -> Fixture {
+            let config = NetStackConfig {
+                max_poll_interval: Duration::from_millis(1),
+                ..NetStackConfig::default()
+            };
+            let (ingress, inbound) = mpsc::channel(config.packet_queue);
+            let (outbound, packets) = mpsc::channel(config.packet_queue);
+            let (accept, streams) = mpsc::channel(config.tcp_accept_queue);
+            let (stopped_tx, stopped) = watch::channel(false);
+            let mut driver = Driver::new(
+                config,
+                inbound,
+                outbound,
+                Some(accept),
+                None,
+                CancellationToken::new(),
+                Arc::new(Notify::new()),
+                NetStackStats::default(),
+                stopped_tx,
+            );
+            driver.observer = Some(observed);
+            Fixture {
+                driver,
+                ingress,
+                packets,
+                streams,
+                stopped,
+            }
+        }
+        fn data_packet(sequence: i32, acknowledgement: i32, data: &[u8]) -> Packet {
+            let mut bytes = tcp_handshake_packet(sequence, Some(acknowledgement))
+                .data()
+                .to_vec();
+            bytes.resize(40 + data.len(), 0);
+            let mut ip = Ipv4Packet::new_unchecked(bytes);
+            ip.set_total_len(u16::try_from(40 + data.len()).unwrap());
+            let source = ip.src_addr();
+            let destination = ip.dst_addr();
+            {
+                let mut tcp = TcpPacket::new_unchecked(ip.payload_mut());
+                tcp.payload_mut().copy_from_slice(data);
+                tcp.fill_checksum(&source.into(), &destination.into());
+            }
+            ip.fill_checksum();
+            Packet::new(ip.into_inner())
+        }
+        #[tokio::test(flavor = "current_thread")]
+        async fn driver_observer_counts_selected_waits_but_not_cancel_or_eof() {
+            reset();
+            let mut f = fixture();
+            f.driver.drive();
+            assert_eq!(totals().passes, 1);
+            assert_eq!(totals().no_data, 1);
+            f.ingress.try_send(packet(1)).unwrap();
+            assert!(f.driver.wait_for_work().await);
+            assert_eq!(totals().ingress, 1);
+            {
+                let mut waiting = Box::pin(f.driver.wait_for_work());
+                assert!(waiting.as_mut().now_or_never().is_none());
+                f.ingress.try_send(packet(2)).unwrap();
+                assert!(waiting.await);
+            }
+            assert_eq!(totals().ingress, 2);
+            f.driver.notify.notify_one();
+            assert!(f.driver.wait_for_work().await);
+            assert_eq!(totals().notified, 1);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), f.driver.wait_for_work())
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(totals().timer, 1);
+            let before = totals();
+            f.driver.cancellation.cancel();
+            assert!(!f.driver.wait_for_work().await);
+            assert_eq!(totals(), before, "cancellation is not a normal wake");
+            f.driver.shutdown();
+            assert!(*f.stopped.borrow());
+            let mut eof = fixture();
+            drop(eof.ingress);
+            let before = totals();
+            assert!(!eof.driver.wait_for_work().await);
+            assert_eq!(totals(), before, "EOF is not ingress");
+            eof.driver.shutdown();
+            assert!(*eof.stopped.borrow());
+        }
+        #[tokio::test(flavor = "current_thread")]
+        async fn driver_observer_tracks_actual_duplex_bytes_and_join() {
+            reset();
+            let mut f = fixture();
+            f.ingress.try_send(tcp_handshake_packet(100, None)).unwrap();
+            assert!(f.driver.wait_for_work().await);
+            f.driver.drive();
+            let syn_ack = f.packets.try_recv().unwrap();
+            let ip = Ipv4Packet::new_checked(syn_ack.data()).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            let ack = tcp.seq_number().0.wrapping_add(1);
+            f.ingress
+                .try_send(tcp_handshake_packet(101, Some(ack)))
+                .unwrap();
+            assert!(f.driver.wait_for_work().await);
+            f.driver.drive();
+            let mut stream = f.streams.try_recv().unwrap();
+            let before = totals();
+            let upload = b"observed-peer-upload";
+            f.ingress.try_send(data_packet(101, ack, upload)).unwrap();
+            assert!(f.driver.wait_for_work().await);
+            f.driver.drive();
+            let mut received = vec![0; upload.len()];
+            tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received.as_slice(), upload);
+            let download = b"observed-app-download";
+            stream.write_all(&download[..7]).await.unwrap();
+            stream.write_all(&download[7..]).await.unwrap();
+            f.driver.drive();
+            let mut payload = Vec::new();
+            while let Ok(packet) = f.packets.try_recv() {
+                let ip = Ipv4Packet::new_checked(packet.data()).unwrap();
+                let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                payload.extend_from_slice(tcp.payload());
+            }
+            assert_eq!(payload.as_slice(), download);
+            let after = totals();
+            assert_eq!(after.rx - before.rx, u64::try_from(upload.len()).unwrap());
+            assert_eq!(after.tx - before.tx, u64::try_from(download.len()).unwrap());
+            assert_eq!(after.passes - before.passes, 2);
+            assert_eq!(after.visits - before.visits, 2);
+            assert_eq!(
+                after.no_data - before.no_data,
+                0,
+                "real data progress is not idle"
+            );
+            f.driver.shutdown();
+            assert!(*f.stopped.borrow());
+            assert_eq!(
+                stream.write_all(b"stopped").await.unwrap_err().kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        }
+        #[tokio::test(flavor = "current_thread")]
+        async fn driver_observer_default_start_is_unobserved_and_observed_start_joins() {
+            reset();
+            let ordinary = NetStack::start_tcp(NetStackConfig::default()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), ordinary.control.stop())
+                .await
+                .unwrap();
+            assert_eq!(totals(), Totals::default());
+            let selected =
+                NetStack::start_tcp_observed(NetStackConfig::default(), observed).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), selected.control.stop())
+                .await
+                .unwrap();
+            assert!(selected.control.is_stopped());
+            assert_eq!(selected.stats.snapshot().active_tcp, 0);
+            assert_eq!(totals().passes, 1);
+            assert_eq!(totals().no_data, 1);
+            assert_eq!(totals().ingress + totals().notified + totals().timer, 0);
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "packet_recover_memory_tests.rs"]
+mod packet_recover_memory_tests;

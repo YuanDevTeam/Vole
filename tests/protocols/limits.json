@@ -292,10 +292,10 @@
     },
     {
       "id": "xhttp-h3-udp-send-window",
-      "value": 196608,
+      "value": 262144,
       "unit": "bytes",
       "owner": "limits::XHTTP_H3_UDP_SEND_WINDOW",
-      "saturation": "qualified physical starts64KiB; successful local mux UDP metadata flush raises shared retained-write admission192KiB once",
+      "saturation": "Qualified physical connection starts at 64 KiB. The first successful local mux UDP metadata flush raises its shared retention budget to 256 KiB.",
       "cancellation": "failed/cancelled metadata does not raise; Weak does not own native lifecycle; original Stop joins drivers",
       "boundary_cases": ["XHTTP-UNIT"]
     },
@@ -608,6 +608,17 @@
       "unit": "bytes",
       "owner": "ResourceLimits::tcp_buffer_per_direction",
       "saturation": "retain existing per-object queue/cache/buffer policy in docs/runtime-resource-policy.md",
+      "cancellation": "existing runtime-owned cancellation and Stop barrier",
+      "boundary_cases": [
+        "FOUNDATIONS-REGRESSION"
+      ]
+    },
+    {
+      "id": "tun-tcp-send-buffer",
+      "value": 131072,
+      "unit": "bytes-per-flow",
+      "owner": "ResourceLimits::tun_tcp_send_buffer",
+      "saturation": "split equally between smoltcp TX and app-send queue; full app queue returns Pending until the driver can drain it",
       "cancellation": "existing runtime-owned cancellation and Stop barrier",
       "boundary_cases": [
         "FOUNDATIONS-REGRESSION"

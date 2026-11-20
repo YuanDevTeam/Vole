@@ -92,8 +92,9 @@ DoQ/DoH H3 的当前 DIRECT 发送预算为 IPv4 65,507、IPv6 65,527 字节，�
 ECN 开启时传递实际发送标记和接收元数据；关闭时不发送/交付 ECN 标记。
 系统无法开启 ECN 接收元数据时，保留同一受保护 socket，沿用原单包、无元数据路径。
 GRO 保持关闭，接收仍使用一个有界完整包，不放大 QUIC 接收区或 socket 缓冲。
-代理 hop、HY2 的 pacer/混淆/Realm、quiche 后端以及非 Linux 平台当前保持单包且不保留 ECN；
-这些路径不声称消费新元数据能力。停止时撤销物理 socket 的共同租约；保留已关闭的 QUIC
+macOS 的 DIRECT QUIC 适配器可提交当前就绪的最多 4 个独立数据报、合计 8 KiB。只确认实际提交的 FIFO 前缀，保留未发送后缀。能力不可用时逐包发送，物理错误关闭原 owner。此能力适用于 Quinn 和 quiche，使用 Tokio 公共发送接口。
+代理 hop、HY2 的 pacer/混淆/Realm、quiche 后端以及非 Linux 平台仍保持独立数据报边界且不保留 ECN；
+这些路径不消费上述Linux元数据能力。Linux原生路径停止时撤销物理 socket 的共同租约；保留已关闭的 QUIC
 连接或写就绪 poller 不会延长物理 fd 的生命周期。GSO 的明确能力错误只关闭后续批量发送，失败批次
 作为 UDP 丢失交给 Quinn 的正常 ACK/重传；不会立即重发该批次，不掩盖地址、策略或 ECN 错误。H3 的正常传输、认证、PMTUD、取消及同步 Stop 仍沿原所有者。
 
@@ -186,10 +187,12 @@ max-connections <= 0 时，只在 max-streams > 0 且流数 < max-streams 时复
 不增加周期 QUIC keepalive。逻辑空闲回收与 QUIC 传输空闲是不同期限。
 
 TCP 流使用原始字节，无 gRPC 帧；建立流后独立消费响应头，允许服务端等待 client-first 业务。
+H2 每条物理连接最多保留 256 个近期由本地重置的流状态，由原版 h2 使用默认期限处理途中抵达的响应帧。
 udp 缺省 false，开启后使用 `_udp2` CONNECT 承载多目标数据报。
 health-check 缺省 false，开启后使用 `_check` CONNECT；成功 CONNECT 响应重置 7 秒计时，
 单次探测期限为7秒。两模式的UDP业务都使用可靠CONNECT流，不使用QUIC DATAGRAM。
 关闭只结束当前逻辑流；节点Stop取消并join池、探测、H2/H3及QUIC驱动，释放受控上游。
+共享 quiche H3 适配器在最后一个应用句柄释放时清理被取消流的正文。底层 RESET／STOP 未结束时保留请求索引，等 QUIC 收尾后回收。兄弟请求继续使用原连接。
 
 H3 外层无论业务 udp 是否开启，都要求受控上游提供双向至少1200字节UDP路径；
 QUIC payload 最大1400并取实际双向上游预算交集，PMTUD不超过该预算，不回落TCP或DIRECT。
@@ -266,6 +269,7 @@ TCP CONNECT 仍按最新 RTT 计算。两类业务保留原退避、超时上限
 Stop 结束驱动并回收驱动缓存，不等待应用读取；外部仍持有流的已递交数据由读取或释放流回收。
 待确认明文仍持有发送预算。物理驱动每轮最多接收8个就绪数据报、发送8个数据报，
 ACK 优先于该会话的批量数据，会话轮换服务；接收每8包让出一次执行机会。
+macOS 的低熵 UDP 载体可为已建立 SID 的首次 DATA 提交当前就绪的最多 4 包、8 KiB，计入原发送、拥塞与未确认预算。正完成只确认 FIFO 前缀，余下密文沿原路逐包发送。ACK、重传和控制帧使用各自路径。
 Mieru UDP 向共享 Dialer 请求512 KiB物理接收缓冲；当前Linux接受时通常为1 MiB有效容量。
 这是内部性能提示，OS可钳位或拒绝；保留原socket、protect、接口绑定及停止所有权，
 不改变逻辑包预算，不新增配置字段，协议自有池仍管理自己的物理载体。
@@ -275,6 +279,8 @@ Mieru UDP 向共享 Dialer 请求512 KiB物理接收缓冲；当前Linux接受�
 省略或空值使用协议默认策略。模式仅控制发送，接收不要求对端使用相同模式。
 低熵编码作用于数据密文，认证 tag 保持原值；按真实载体预算缩小明文分片，
 不会扩大队列或接收预算。重传重新应用 nonce 与 padding，控制帧分片由物理写任务完成。
+
+业务 HTTP 可在单物理端口和不可变 factory／凭据／编译 traffic-pattern 下保留同 origin TCP 流：TCP 载体递归证明完整静态 TCP 图，UDP 载体仅接受固定直接 UDP 路径；端口范围、域名、动态组、未知依赖及已停止 client／Dialer 保持单次路径。现有 logical stream 不因一个 HTTP 请求结束而归还载体，所有固定 mux／握手模式沿原语义；NO_WAIT 仍先发送合并的 SOCKS 请求与首段业务数据，再在首写成功返回前验证 SOCKS 回复。协议池、随机调度、信用、可靠性、计时器和 Stop 屏障保持，见[HTTP 处理](http-processing.md)。
 
 ## MASQUE
 
@@ -297,8 +303,7 @@ PMTU 反馈按连接生效，通过包层软件分段恢复，重传由官方 sm
 初始发送 MTU 取配置与真实隧道预算的交集，避免已知预算下的持续二次分段。
 内部队列、capsule 和 packet 均有界，停止等待其工作任务回收。
 H3 IP 的物理 UDP 请求沿原受控 dialer 携带 512 KiB 接收缓冲提示；系统可限制或忽略该提示，不构成进程 RSS 或真机内存保证。
-当底层实际报告发送预算缩小时，只反馈当前过大包，不关闭其它业务流。
-稳定路径的 MTU 下降目前不会自动触发 QUIC PMTU 重新探测。
+macOS MASQUE H3/IP 与 H3/L4 的 Direct/LazyDirect 路径可在首次发送时为同一受控 UDP socket 固定完整 peer。绑定、保护和接口检查完成后才 connect 并发布，初始化失败结束本代际。Group、Proxy 和 codec 路径仍使用各自的传输。
 
 `network: h3-l4proxy` 使用 Cloudflare L4 HTTP/3 CONNECT，每个 TCP 目标独占请求流，共享受控 QUIC 连接；
 等待 2xx 响应后才交付业务流，拒绝响应不取消其它流，节点 Stop 等待所有驱动退出。
@@ -407,7 +412,7 @@ Upgrade 的 ED 仅允许默认 Sec-WebSocket-Protocol 头（大小写不敏感�
 gRPC 的 HTTP authority 使用非空 SNI，否则使用 server，不包含端口；不改变物理拨号地址。
 gRPC 选项与 VMess/VLESS 共用：省略或空 service-name 默认 GunService，普通名映射 /name/Tun，以 / 开头使用完整路径；省略或空 user-agent 默认 grpc-go/1.36.0。
 ping-interval 为秒，0 不主动 PING，负值明确拒绝；max-connections/min-streams/max-streams 接受带符号整数，负阈值禁用相应分支。三项池阈值省略或字面全零时归一为4/0/0，Mihomo为1/0/0；显式 max-connections=1 或2保留各自策略。正 max-connections 优先于 max-streams。
-每个节点独立拥有连接池，空闲连接总是复用；复用保留原上游选择、TLS 身份和认证策略，每条逻辑流仍单独发送 Trojan 认证头。
+每个节点独立拥有连接池，空闲连接总是复用；复用保留原上游选择、TLS 身份和认证策略，每条逻辑流仍单独发送 Trojan 认证头。业务 HTTP 可在静态连接器资格有效时保留已建立的逻辑流，具体条件见[业务上游复用](http-processing.md#业务上游复用)。
 
 Trojan 私有 gRPC 池在原绝对期限内等待 H2 SETTINGS、提交并 flush 完整认证请求，
 随后允许 client-first 上传等待迟到的 HTTP 响应，不把建链期限继续套用到业务。
@@ -453,6 +458,13 @@ TLS 支持独立的 `name-cert-verify` 和成对内联 PEM 或文件路径 `cert
   响应可等待业务下行，不再继承旧建链期限。头解析上限、取消和整流关闭保持。
 - h2 的 authority 列表省略/空时使用 www.example.com，path 省略/空时为 /，每流选一个 authority，通过 HTTP/2 PUT body
   双向传输；明文 prior knowledge、TLS h2，无 gRPC 帧。
+
+业务 HTTP 仅在 H2 配置恰有一个固定完整 URI、明文或普通静态 TLS、安全身份与实际物理／上游路径均
+可证明固定且节点未停止时，允许按 HTTP 处理合同保留同 origin 连接。保留的连接继续持有原 VMess
+逻辑流与 H2 driver，不增加载体池，也不在每个业务请求后重新认证或归还载体。多 URI 配置保持
+每次新流选择 authority 的原行为，业务 HTTP 仍使用单次路径。
+
+启用 `inbound-http` 时，HTTP 首包伪装仅在实际节点为明文安全身份、恰有一个固定 URI、每个已声明头恰有一个值（无头也固定），且完整静态上游和节点所有者均通过原门禁时，提供同 origin 业务 HTTP 复用资格。TLS 即使身份固定、多 URI 或多头值候选及其它安全模式仍为单次路径；不在资格查询时选择随机值。每条上述固定明文 HTTP 的完整 TCP 流沿原 child 绑定独立读写唤醒，绑定按固定类型决定，不因 Stop 已撤销许可而省略。父停止唤醒两个方向，后续轮询按原取消错误释放 IO；单流 Drop 不停止父或兄弟流，HTTP 父级仍负责实际缓存退役与释放。该绑定不增加任务，不改变原 raw owner、VMess AEAD／目标、整流关闭、传输、建链期限或 UDP 路径；没有 `inbound-http` 时不新增资格或绑定。
 
 关闭对齐 Mihomo：TCP/WS 可保留上传 EOF 后的读取；gRPC/HTTP/H2 关闭整条逻辑流，
 完整响应应在关闭前读取，不统一要求半关闭尾包。
@@ -566,6 +578,8 @@ pacer；这是混淆不是认证，错误密钥由 QUIC 拒绝，短包有界丢
 官方 Hysteria 已验证版本的 4096 字节回包缓冲包含头，更大回包可能在分片前丢弃。
 原生测试记录实际版本和限制，Vole 完整 4096 字节另对 Mihomo 验证，不修改第三方。
 
+在业务 HTTP/MITM 中，仅字面IP、固定客户端TLS身份、无跳端口/Realm且物理直接UDP出口可证明固定的 Hysteria2 节点，才可保留同origin业务TCP/TLS连接。代理UDP链和动态身份仍走原单次路径。该资格不改变上述认证会话槽、拥塞/带宽、接收窗口、队列、定时器和Stop所有权；规则与脚本仍每HTTP请求执行，边界见[HTTP处理](http-processing.md)。
+
 ## TUIC v5
 
 固定 QUIC/TLS 1.3，复用官方 Quinn、rustls/ring 与共享受控数据报适配器。
@@ -583,6 +597,13 @@ SNI 缺省 server，ALPN 缺省 h3；显式空列表拒绝，非空有序列表�
 Authenticate 与 Connect 没有成功 ACK；本地 open 成功不是密码通过证明，错误身份
 必须由最终拒绝和原站零业务验证。Connect 为双向 QUIC 流，不引入 HTTP/3 请求。
 流关闭结束该逻辑双向通道，与 Mihomo 对齐，不影响兄弟流。
+
+启用业务 HTTP 处理时，固定 TLS 身份与字面物理 IP 的直接 UDP 上游可提供静态 TCP 复用证明，
+包括逻辑 server/SNI 为域名但显式 ip 固定实际目标的情况。该资格适用于 native/quic/UoT 配置下的
+普通业务 TCP；文件客户端身份、动态物理目标、代理/组 UDP 上游及已停止的节点或 Dialer 不提供证明。
+已支持的外层静态 TCP 链可按原规则依赖此 TUIC 叶。HTTP 父级仍要求同 origin、路由/资源身份一致及
+实际完整上传/响应；实际保留时继续持有同一 TUIC Stream 和 lease，退役与 Stop 沿原所有者释放。
+此证明不改变 TUIC wire、流关闭、物理会话池、UDP/UoT、UNI、队列、计时器或日志；细节见业务 HTTP 契约。
 
 业务 UDP 始终可用；`udp` 可省略或填 true/false，均不禁用它，组 `disable-udp` 仍生效。
 外层 QUIC 始终需要有效双向至少 1200 字节的数据报路径。
@@ -606,19 +627,24 @@ quic 收齐声明长度的报文后立即交付并释放接收流，TCP 通道�
 目标改写、域名目标及不同出站实例在该追踪路径保留独立关联。
 未启用追踪时沿用既有路由缓存的关联复用规则。
 
-每节点按需复用物理会话。native 按完整来源地址（含端口）稳定分配至两个按需池，
-同源 TCP/UDP 保持池亲和；UoT v2 保持原共享池。quic relay 的 TCP 与原生 UDP
-各自按需使用独立池，避免逐包单向流的回包积压占用 TCP 所在连接。每池仍沿原所有者
-阈值准入、退役与释放，不增加单个连接的窗口或远端单向流信用。两个当前池不是全节点
+macOS TUN 的 quic relay（未启用 UoT v2）对已打开、目标及连接标识未变的
+缓存路由，每来源至多保留一个独立发送操作；等待 UNI 信用或流写入期间继续接收
+同关联的响应。首次路由、新目标、连接标识变化、目标改写及维护到期时沿用原发送路径。
+不增加 sender 任务或数据报队列，原发送绝对期限仍为15秒；取消和关闭先丢弃发送操作，
+再结束路由/统计所有权。外部取消或超时不伪记为已完成的出站错误或上传字节。
+并发驻留的发送状态、响应及代际元数据可能增加峰值内存，不保证吞吐或内存收益。
+
+每节点按需复用物理会话。native（不含 UoT v2）按完整来源地址（含端口）稳定分配
+至两个按需池，同源 TCP/UDP 保持池亲和。启用 UoT v2 时，普通 TCP 使用池0，
+只有内部 UoT magic Connect 使用池1；两池分别复用自己的认证 QUIC 会话。
+quic relay（不含 UoT v2）的 TCP 与原生 UDP 各自按需使用独立池，避免逐包单向流的
+回包积压占用 TCP 所在连接。每池仍沿原所有者
+阈值准入、退役与释放，单个连接的窗口保持不变；远端单向流信用见下述模式约束。两个当前池不是全节点
 总连接上限；退役会话仍由既有所有者生命周期释放。流 credit 等待沿用调用方原期限。
 native 模式（不含 UoT v2）向共享 Dialer 请求512 KiB物理 UDP 接收缓冲；
 这是可钳位或拒绝的性能提示，沿用同一个受保护、已绑定的 socket，不改变 QUIC 信用、
 应用队列或逻辑包预算。quic relay 与 UoT v2 不请求该提示；Linux 内核缓冲与进程 RSS 分开核算。
-关联 ID 在同一物理会话
-不重用；65,536 个 ID 用尽后新业务新建会话，旧流继续，最后一个旧所有者退出即回收。
-TCP shutdown 立即完成逻辑关闭，发送所有权保留到 FIN/数据确认或最多 5 秒，防止
-退役池提前丢弃已接受的末尾上传；该等待归节点所有，Stop 直接取消并 join。
-切组不迁移已有池；故障后只有新业务可创建新池，已发送业务不自动重放。
+macOS 的 quic relay（不含 UoT v2）为直接声明的 Direct/LazyDirect 物理会话固定完整 peer，TCP 与 UDP 池均适用。首次发送在原 socket 完成绑定、保护与接口检查后 connect。Peer 变化使用新的传输代际；其余 UDP 路径沿原工厂处理。
 
 `ip` 覆盖物理拨号地址，逻辑 server/SNI 保留。heartbeat-interval 单位毫秒，<=0 回落
 10000，同时控制 QUIC keepalive 与实际 v5 HEARTBEAT，两种 UDP relay 模式均用 DATAGRAM。
@@ -627,8 +653,11 @@ recv-window-conn 实际为 stream，recv-window 实际为 connection；正值同
 随后采用上述 Middle 策略，默认实际为固定 stream 4 MiB / connection 2 MiB。
 窗口是信用额度，不预分配全部缓冲；显式正值不按默认窗口钳位。
 
-max-open-streams 控制客户端 TCP/UDP 所有者池，不扩大 Quinn 内部远端 stream 表；
-远端双向流信用固定为 0，单向流为 32。0 使用100；参考客户端100阈值转换90，入池计数必须严格小于阈值，所以
+max-open-streams 控制客户端 TCP/UDP 所有者池，不把业务所有者阈值写入 Quinn 远端 stream 表；
+远端双向流信用固定为0。仅macOS、quic relay且未启用UoT v2的实际UDP池1，通告独立的128条远端单向流许可；
+同节点TCP池0、native、UoT v2和其它平台仍为32。实际并行入站decoder仍为32，未增加正文交付队列。
+额外最多96条尚未accept的UNI由Quinn持有，可能增加流表、未读数据和排队驻留；原连接接收信用与payload预算保持，
+不预分配128份正文，也不保证进程内存不增加。max-open-streams为0使用100；参考客户端100阈值转换90，入池计数必须严格小于阈值，所以
 默认89个同时所有者，其它正N为N-1；1和负值可解析但无法开启业务。饱和新建物理
 会话，退役会话继续服务已有所有者，最后所有者退出回收，不重放已发送业务。
 
@@ -648,7 +677,8 @@ udp-over-stream-version 省略或整数2均使用v2，其余版本拒绝。首�
 实际错误或超时使关联失效。响应队列1项、任务归节点Stop同步回收。
 UoT在可靠流中传输，有丢包导致的队头阻塞成本，不应用原生TUIC分片额度。
 
-连接未确认发送缓冲1 MiB；最多32个并行入站控制解码器，半条控制流最长5秒，
+连接未确认发送缓冲1 MiB；最多32个并行入站控制解码器，半条控制流从decoder接纳起最多5秒，
+尚未accept的UNI不在此5秒timeout内，不能宣称128条流都在首帧到达后5秒内结束；原所有者与Stop负责最终回收。
 拒绝服务端主动双向业务流。空闲30秒。Stop等待认证、收发、重组、心跳及上游释放，
 关闭交换最多一秒；这些是局部结构限制，不是全局业务会话额度。
 
@@ -689,6 +719,14 @@ TCP 使用官方 `CryptoStream` 的加解密与记录分帧，Vole 构造目标�
 `client-fingerprint` 仅 ShadowTLS/JLS 插件消费，其余插件不接受该字段。
 插件参数只接受对应模式的字段；队列、窗口、连接池和配置范围均有界，取消/Stop 不等待远端回包。
 
+启用 `inbound-http` 时，三种 SS2022 cipher 的固定 `obfs` HTTP/TLS cover 可与完整静态物理路径一起提供同 origin 业务 HTTP 复用资格；实际代理端点须为字面 IP，未知路径、上游策略组、受约束或停止的依赖仍不参与。HTTP 实体完成后保留同一 SS／cover 流，不重发目标前导、首 cover 或重置 SS AEAD 状态；已关闭、EOF 或不完整的连接按原 HTTP 规则退役，失败请求不自动重放。simple-obfs TLS 仍只是报文外观，不提供标准 TLS 身份证明。
+
+启用 `inbound-http` 时，`v2ray-plugin` 仅在 `tls: false`、`mux: true`、early-data 为 0、标准 WebSocket 握手且实际持有上述固定传输时，沿相同字面代理端点和完整静态上游证明提供同 origin 业务 HTTP 复用资格。保留同一完整 SS／单通道 V2Ray mux／WS 流，不按实体重发 SS 目标、mux New 或重置 AEAD；节点停止立即撤销许可。WSS、early-data、`mux: false`、HTTPUpgrade／fast-open、Gost 和 JLS 保持单次业务 HTTP 路径；不建立通用 mux 池。
+
+匹配资格的 SS／插件流持有独立取消子令牌。节点停止撤销资格并唤醒读写，HTTP 父级负责释放空闲上游；单流关闭只结束自己的逻辑流。
+
+实际 obfs HTTP/TLS 与上述固定 WebSocket mux 流在 SS codec 前聚合首响应密文前缀。AES128 为 59 字节，AES256／ChaCha20 为 91 字节，可跨合法 mux Data 或完整 WS Binary Message。前缀截断返回错误。此读取边界适用于各 feature 组合，HTTP 复用仍须通过上面的独立资格。
+
 ### ShadowTLS v3
 
 SS 三算法的 TCP 可配置 `plugin: shadow-tls` 与完整 `plugin-opts`，不是新的代理类型。
@@ -707,6 +745,8 @@ flush 排空，关闭最多五秒，不在已切换的 SS 通道中发送 TLS cl
 自动得到 UDP 或 UoT。裸 SS 拒绝 client-fingerprint。默认与 TUN 构建启用
 shadow-tls-v3，精简构建可单独移除；无 feature 的插件配置在 IO 前拒绝。
 v3 的额外四字节记录特征仍存在，完整认证和互通不等于不可识别。
+
+固定 ShadowTLS v3 cover 与完整静态物理路径，以及无 mTLS 身份或内联身份，可提供同 origin HTTP 复用资格。每条已建流持有独立取消子令牌。业务退役和 Stop 范围见[HTTP 处理](http-processing.md#业务上游复用)。
 
 ### UDP over TCP v2
 
@@ -809,13 +849,34 @@ refresh-server-ip-interval 默认 0，关闭更新；非零值以秒计，新业
 节点 raw 包队列和各 peer 发送队列各 32 项；每 UDP 关联响应队列 64 项。UDP 负载上限
 为 MTU 减本地 IP/UDP 头，再与调用方收发预算分别取交集；双栈保守扣 48 字节，IPv4
 扣 28 字节。TCP 栈输出交给已就绪 peer 时先尝试入队；Full 时只暂持当前包与原 peer
-代际，释放 peer 槽位锁后，在同一次队列准入的轮询之间给一次协作调度机会，仍满则丢弃，
-TCP 依赖重传。全局取消优先结束输出 pump，其次处理原 peer 取消，不把待交付包改投新代际。
-这次退让会暂缓共享输出 pump，不承诺其他 peer 零等待或固定墙钟时限。
-解密后到栈的 raw 包与 UDP 响应仍在满队列时丢当前包；业务 UDP 发送保留直接等待原 peer
-发送队列的可取消路径，不经过 TCP 输出 pump。解密后校验本地目的地址、来源地址族、
+代际并释放 peer 槽位锁；单 peer 等待原队列容量，多 peer 在同一次准入轮询之间给一次
+协作调度机会，仍满则丢弃，TCP 依赖重传。全局取消优先结束输出 pump，其次处理原 peer
+取消，不把待交付包改投新代际；不承诺兄弟 peer 零等待或固定墙钟时限。
+解密后的非 UDP raw 包到栈队列 Full 时，每个实际 peer 最多保留一个不超过配置 MTU 的
+pending 包，准入等待由原 peer 事件循环持有，继续处理 TX、定时器与端点更新，不在 UDP
+回调内等待。pending 期间暂停外层接收，因此控制报文和业务 UDP 同样可能延迟；到下一次
+已选中的原定时器仍未准入则丢弃 pending 并恢复接收，不新增定时器或承诺 250ms 墙钟上限。
+实际替换端点/重新握手前清理 pending，同端点更新保持原状态；停止和错误释放其唯一所有者。
+32 项队列容量不增加，但每个 pending 额外驻留最多 MTU 字节 IP 负载及有限元数据，
+不承诺零内存增量或无损交付。Full 且超过 MTU 的包仍丢弃，不改变栈成功接收的既有预算。
+UDP 响应仍在满队列时丢当前包；业务 UDP 发送保留直接等待原 peer 发送队列的可取消路径，
+不经过 TCP 输出 pump。解密后校验本地目的地址、来源地址族、
 最长前缀所属 peer 和关联端口；这些是局部结构边界，不是业务连接总数限制。
+
+macOS 已建立 peer 可批量发送当前就绪的 Noise type 4 数据包，每批最多 4 包、8 KiB，适用于 MTU≤2016。只确认实际发送的前缀；余下原密文沿同一路径发送。接收事件可处理首包及最多 3 个就绪外层数据报，Pending、待准入 ingress、取消或首次握手完成时停止扩展本轮。
+
+Direct/LazyDirect 物理路径在首次发送时固定 peer 的完整 endpoint，沿共享 Dialer 完成保护与绑定后 connect。同一端点的 refresh 保持原传输，端点变化时创建新传输并重新握手。接收继续应用 Noise 验证、内层路由和包大小检查。Connected UDP 的来源过滤与 ICMP 错误由内核体现。
 
 握手、收发、更新与重试均可取消；驱动由节点持有，调用方 future 丢弃不会丢失任务
 所有权。Stop 关闭新准入，取消并等待所有 peer 与退役驱动，关闭各上游（分别最多一秒），
 随后等待用户态栈退出；私有 DNS 使用弱节点引用，不延长节点生命周期。
+
+业务 HTTP 的静态复用资格仅在节点完整不可变 peer 图的所有初始及适用刷新路径均可证明为
+固定字面 IP 的直接物理 UDP 路径时提供。资格使用每个实际 peer 的端点及原驱动的
+`for_server` 派生，不以代表性 address/port 或已认证的首 peer 替代完整图；动态域名、
+上游代理／策略组、未知依赖、受约束或停止的 Dialer、停止节点保持单次业务 HTTP。
+非零刷新仍须证明同一物理 Dialer/IP4P 策略产生相同实际地址和端口，不支持动态漫游。
+查询不创建栈、Noise、解析或 socket，也不查询 channel 是否健康；实际 TCP 保留原 peer
+取消 token 和 HTTP 失活退役语义。业务域名及私有 DNS 的原解析路径、实际选路／资源代际、
+Noise 重键、全部队列和 Stop 所有权保持；完整 HTTP 资格与退役条件见
+[HTTP 处理](http-processing.md)。

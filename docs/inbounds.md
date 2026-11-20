@@ -47,6 +47,21 @@ HTTP 每个请求重新验证，SOCKS TCP 和 UDP 授权关联保留握手身份
 Mihomo 当前实现不把 SOCKS TCP 身份传给独立 UDP 接收；Vole 的授权 UDP 保留
 真实握手身份。Mihomo HTTP 在无认证时也可能记录请求声称的用户，Vole 保持为空。
 
+## 共享嗅探与 HTTP 处理
+
+SOCKS5 CONNECT、普通 HTTP、HTTP CONNECT 和 TUN TCP 共用主配置的 sniffer
+策略；各入口不另设开关。全局关闭、未声明协议或目标端口不匹配时不嗅探。
+来源/目标地址排除先于读取；纯 IP 由 `parse-pure-ip` 控制，redir-host 提示由
+`force-dns-mapping` 控制，显式域名与已恢复的 fake-IP 名字须匹配 `force-domain`。
+`skip-domain` 排除识别结果，协议级 `override-destination` 决定只提供选路提示还是
+同时替换目标。普通 HTTP 使用已解析的原始 authority 应用同一策略，不为嗅探读取正文。
+
+四类 TCP 入口也共用独立 [HTTP 处理](http-processing.md)。主 sniffer 的关闭、排除或
+目标覆盖不改变独立 HTTP/MITM 授权：明文按原始目标端口的 `http-ports` 准入，TLS
+按 MITM 端口、SNI 允许/排除与 CA 准入。普通 HTTP 代理请求不会因为端口在 MITM
+列表就变成 CONNECT。未认领的业务字节完整回放后继续原嗅探/选路；已有 HTTP
+上下文的连接使用其固定代际 Dispatcher，入口类型、来源、本地端口和认证身份保留。
+
 ## HTTP
 
 每个请求独立认证，缺失、错误、重复或非法 Proxy-Authorization 返回 407 并关闭，
@@ -55,15 +70,13 @@ Mihomo 当前实现不把 SOCKS TCP 身份传给独立 UDP 接收；Vole 的授�
 ### 普通转发
 
 HTTP/1.0 和 HTTP/1.1 使用绝对 `http://host[:port]/path?query` URI。每个请求重新
-确定目标、选路和建链，转发为 origin-form 并重建 Host，上游不跨请求复用。
-客户端可以 Keep-Alive 或顺序预发送；固定缓冲保存预读，只有上传完成且响应有明确
-边界才处理下一请求。不会把旧目标连接用于下一请求。
+确定目标和选路，转发为 origin-form 并重建 Host；默认每请求建立上游。
+客户端可 Keep-Alive 或顺序预发送，固定缓冲保存预读。只有上传完成且响应边界明确才继续处理。启用 HTTP 处理时，符合[复用条件](http-processing.md#业务上游复用)的请求可使用同一上游。
 
 - Content-Length 精确转发；没有正文长度的普通请求视为空正文。
 - chunked 按块解码并重编码；合法扩展不透传，合法 trailer 保留。
 - HEAD/1xx/204/304 无正文；1xx/204 携带正文定界字段失败关闭，HEAD/304 可保留表示长度。
-- 转发 100 Continue 等临时响应；上传和响应读取并行。提前最终响应会终止上传、
-  转发响应并关闭客户端，不把余下正文误作新请求。
+- 转发 100 Continue 等临时响应，上传和响应读取并行。最终响应到达后，只有真实正文写入和 flush 完成才算上传完整；其余交换转发响应后关闭连接。
 - 无长度响应由 EOF 定界并关闭；HTTP/1.0 客户端接收 chunked 响应时去块后关闭。
 - 重复 Content-Length、CL/TE 并存、歧义长度、非法控制字符/分块、截断或超限均失败关闭。
   认证、内部诊断、Connection 指名及逐跳字段不泄漏给目标；trailer 不能携带认证、
@@ -73,7 +86,7 @@ HTTP/1.0 和 HTTP/1.1 使用绝对 `http://host[:port]/path?query` URI。每个�
 
 ### 隧道
 
-CONNECT 通常在上游成功后返回 200，保留头后的预读数据。匹配 TCP 嗅探策略时先返回 200，
+CONNECT 通常在上游成功后返回 200，保留头后的预读数据。匹配 TCP 嗅探策略或独立 HTTP/MITM 候选端口时先返回 200，
 再读取有界业务前缀并按嗅探结果建链；此后建链失败直接关闭隧道。Upgrade 只接受无正文请求；
 合法 101、Connection/Upgrade 一致且选中请求协议时才切隧道，保留双方预读和 TCP
 半关闭。非 101 按普通响应处理，非法切换返回 502。
@@ -93,7 +106,7 @@ trailer 8 KiB/100 字段，每个最终响应前最多 16 个临时响应。正�
 
 仅支持 RFC 1928/1929 的 SOCKS5 CONNECT、UDP ASSOCIATE 和用户名密码协商。
 不降级绕过已配置认证。精确读取握手并保留 CONNECT 后业务字节；通常在上游成功后回复成功。匹配 TCP 嗅探策略
-时先确认 CONNECT，取得业务前缀后建链，失败关闭已确认的连接。
+或独立 HTTP/MITM 候选端口时先确认 CONNECT，取得业务前缀后建链，失败关闭已确认的连接。
 目标保留 IPv4、IPv6 或域名交给 Dispatcher，入站不提前解析。TCP 每方向复制 4 KiB，
 保留半关闭。
 
@@ -117,6 +130,3 @@ wire 最大 65,507 字节，额外 sentinel 识别截断，自有 UDP socket 请
 TUN 使用独立 MTU；SOCKS5 数据不计入 Controller 的 TUN 流量。
 
 [验收边界](acceptance.md)区分容器双栈与真实 LAN/物理 IPv6，不能相互替代。
-
-
-显式启用独立 HTTP 配置时，mixed HTTP/CONNECT 与 TUN 共用[URL rewrite](http-processing.md)和同代 Dispatcher。规则先确定最终 URL，再选路；本地动作不连接旧目标。请求正文与 Upgrade 继续复用本文件的流式 framing／relay；入口认证和用户名语义保持。

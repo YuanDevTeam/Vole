@@ -1,6 +1,6 @@
 //! One native frame at a time, with credit returned after bounded forwarding.
 use super::{
-    body::{Bypass, Transaction},
+    body::{Bypass, Entity, Transaction},
     h2_headers, headers,
 };
 use bytes::Bytes;
@@ -57,7 +57,7 @@ impl Source {
             pending_credit: 0,
         }
     }
-    fn buffered(data: Bytes, trailers: Option<HeaderMap>) -> Self {
+    pub(super) fn buffered(data: Bytes, trailers: Option<HeaderMap>) -> Self {
         Self {
             kind: Kind::Buffered {
                 data: Some(data),
@@ -68,6 +68,14 @@ impl Source {
             credit: 0,
             pending_credit: 0,
         }
+    }
+    fn can_end_request_on_headers(&self, expected: Option<u64>) -> bool {
+        // No frame/trailer remains, no receive-credit release can still fail,
+        // and the same Length::finish check as relay already succeeds.
+        expected.is_none_or(|length| length == 0)
+            && self.credit == 0
+            && self.pending_credit == 0
+            && self.is_end_stream()
     }
     fn release(&mut self) -> io::Result<()> {
         let credit = std::mem::take(&mut self.credit);
@@ -186,6 +194,73 @@ pub(super) struct Prepared {
     pub(super) expected: Option<u64>,
 }
 
+pub(super) struct SharedPrepared {
+    pub(super) source: Source,
+    pub(super) expected: Option<u64>,
+    pub(super) entity: Option<Entity>,
+}
+
+pub(super) async fn prepare_shared(
+    mut source: Source,
+    mut transaction: Transaction<'_>,
+    expected: Option<u64>,
+    strip_credentials: bool,
+    fields: &mut headers::Fields,
+) -> io::Result<SharedPrepared> {
+    let mut length = Length::new(expected);
+    let mut trailers = None;
+    while let Some(frame) = timeout(
+        IDLE,
+        futures_util::future::poll_fn(|cx| Pin::new(&mut source).poll_frame(cx)),
+    )
+    .await
+    .map_err(|_| io::ErrorKind::TimedOut)?
+    {
+        let frame = frame?;
+        match frame.into_data() {
+            Ok(mut data) => {
+                length.consume(data.len())?;
+                let count = transaction.remaining().min(data.len());
+                let prefix = data.split_to(count);
+                let result = transaction.push(&prefix);
+                if result.is_err() || !data.is_empty() {
+                    if result.is_ok() {
+                        super::diagnostics::body_bypass(
+                            super::diagnostics::BodyPoint::Collection,
+                            Bypass::Size,
+                        );
+                    }
+                    source.rewind(transaction.into_raw().into_bytes(), data)?;
+                    return Ok(SharedPrepared {
+                        source,
+                        expected,
+                        entity: None,
+                    });
+                }
+            }
+            Err(frame) => {
+                if let Ok(headers) = frame.into_trailers() {
+                    trailers = Some(h2_headers::trailers(headers, strip_credentials)?);
+                    break;
+                }
+            }
+        }
+    }
+    length.finish()?;
+    let entity = transaction.finish_shared(trailers.is_some(), fields);
+    let expected = if entity.changed() {
+        Some(entity.wire().len() as u64)
+    } else {
+        expected
+    };
+    let source = Source::buffered(entity.wire().clone(), trailers);
+    Ok(SharedPrepared {
+        source,
+        expected,
+        entity: Some(entity),
+    })
+}
+
 pub(super) async fn prepare(
     mut source: Source,
     mut transaction: Transaction<'_>,
@@ -210,6 +285,12 @@ pub(super) async fn prepare(
                 let prefix = data.split_to(count);
                 let result = transaction.push(&prefix);
                 if result.is_err() || !data.is_empty() {
+                    if result.is_ok() {
+                        super::diagnostics::body_bypass(
+                            super::diagnostics::BodyPoint::Collection,
+                            Bypass::Size,
+                        );
+                    }
                     source.rewind(transaction.into_raw().into_bytes(), data)?;
                     return Ok(Prepared { source, expected });
                 }
@@ -340,9 +421,89 @@ pub(super) async fn relay(
     finish(&mut target, None, strip_credentials)
 }
 
+struct PendingUpload {
+    source: Source,
+    target: h2::SendStream<Bytes>,
+    expected: Option<u64>,
+    strip_credentials: bool,
+    finished: tokio::sync::oneshot::Sender<()>,
+}
+
+pub(super) struct RequestUpload(Option<PendingUpload>);
+impl RequestUpload {
+    /// True only when start_request already committed END_STREAM in HEADERS.
+    pub(super) fn ended_in_headers(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub(super) async fn run(self) -> io::Result<()> {
+        let Some(upload) = self.0 else {
+            return Ok(());
+        };
+        let result = relay(
+            upload.source,
+            upload.target,
+            upload.expected,
+            upload.strip_credentials,
+        )
+        .await;
+        if result.is_ok() {
+            let _ = upload.finished.send(());
+        }
+        result
+    }
+}
+
+/// Shared by both one-shot and leased upstream H2 exchanges. Only an already
+/// ended source may finish in HEADERS; all other uploads keep the old relay.
+pub(super) fn start_request(
+    sender: &mut h2::client::SendRequest<Bytes>,
+    request: http::Request<()>,
+    source: Source,
+    expected: Option<u64>,
+    strip_credentials: bool,
+) -> io::Result<(
+    h2::client::ResponseFuture,
+    tokio::sync::oneshot::Receiver<()>,
+    RequestUpload,
+)> {
+    let end_stream = source.can_end_request_on_headers(expected);
+    let (response, target) = sender.send_request(request, end_stream).map_err(|_| {
+        io::Error::new(io::ErrorKind::ConnectionAborted, "HTTP proxy stream failed")
+    })?;
+    let (finished, uploaded) = tokio::sync::oneshot::channel();
+    let pending = if end_stream {
+        drop(source);
+        drop(target);
+        // HEADERS already closed the upload. Start the unchanged response-head
+        // idle gate now, without waiting for an empty relay future to be polled.
+        let _ = finished.send(());
+        None
+    } else {
+        Some(PendingUpload {
+            source,
+            target,
+            expected,
+            strip_credentials,
+            finished,
+        })
+    };
+    Ok((response, uploaded, RequestUpload(pending)))
+}
+
+#[cfg(any(test, all(target_os = "tvos", feature = "http-diagnostics")))]
+#[path = "h2_request_upload_validation.rs"]
+pub(super) mod request_upload_validation;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(unix, feature = "inbound-http"))]
+    #[forbid(unsafe_code)]
+    mod shared_collector_mapping_tests {
+        include!("shared_collector_h2_memory_tests.rs");
+    }
     use crate::http_processing::{
         body::{Budget, MAX_BODY, OriginalRequestMeta, WireBodyMeta},
         rules::{Phase, RawRule, Rule},

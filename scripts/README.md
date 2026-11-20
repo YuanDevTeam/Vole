@@ -65,10 +65,12 @@ CI 使用 `deps --github-env "$GITHUB_ENV"` 自动传给后续步骤。
 ## 发布
 
 [Release workflow](../.github/workflows/release.yml) 在 `vX.Y.Z` tag push 时构建并发布，
-tag 必须匹配 Cargo 版本。PR 使用同一构建矩阵，全部构建成功后汇总十四个归档。
+tag 必须匹配 Cargo 版本。`main`、手动运行和标签使用完整构建矩阵，成功后汇总十四个归档。
+[PR workflow](../.github/workflows/test.yml) 运行 Linux Debug 和 Quality，并在 macOS ARM64 和
+Windows ARM64 上构建原生 CLI 和 FFI。iOS、tvOS 和 Android 按相关文件改动触发。
 CI 中的 Python 均由 `actions/setup-python` 安装，选择最新稳定 Python 3；uv 仅使用系统解释器，
 禁止自动下载 Python，不使用脚本安装或特定解释器发行版请求。
-CLI 构建后执行 `-h/-v/-t` 检查。Windows CLI、Wintun FFI、UWP FFI 分别使用独立的
+CLI 构建后执行 `-h/-v/-t` 检查。发布矩阵的 Windows CLI、Wintun FFI、UWP FFI 分别使用独立的
 x64/ARM64 job，每个 job 的 runner、Python、工具链和验证产物必须同架构；
 UWP 的 COM 回归只加载当前 job 构建的 DLL。ARM64 MSVC 使用原生 `vcvarsall arm64`，
 不使用 `amd64_arm64` 交叉工具链。

@@ -3,15 +3,26 @@ use super::*;
 use crate::transport::h2_write::{Sender, Writes};
 use std::time::Duration;
 
-pub(super) async fn new(raw: BoxStream) -> io::Result<(Sender, impl Future<Output = ()> + Send)> {
+const CONNECTION_RECEIVE_WINDOW: u32 = 1024 * 1024;
+const H3_PACKET_UP_CONNECTION_RECEIVE_WINDOW: u32 = 1536 * 1024;
+
+pub(super) async fn new(
+    raw: BoxStream,
+    h3_packet_up: bool,
+) -> io::Result<(Sender, impl Future<Output = ()> + Send)> {
     let last_read = Arc::new(Mutex::new(Instant::now()));
     let (raw, writes) = Writes::wrap(raw);
+    let connection_window = if h3_packet_up {
+        H3_PACKET_UP_CONNECTION_RECEIVE_WINDOW
+    } else {
+        CONNECTION_RECEIVE_WINDOW
+    };
     let (sender, mut connection) = h2::client::Builder::new()
         .enable_push(false)
-        .initial_window_size(65536)
+        .initial_window_size(131072)
         // Leave bounded connection credit for other streams when a few TCP
         // consumers hold their individual receive windows.
-        .initial_connection_window_size(524288)
+        .initial_connection_window_size(connection_window)
         .max_frame_size(16384)
         .max_header_list_size(16384)
         .max_concurrent_streams(0)
@@ -182,10 +193,13 @@ mod prequeued_flush_memory_tests {
             let gate = Arc::new(Gate::default());
             let peer_gate = Arc::new(Gate::default());
             let (client, server) = tokio::join!(
-                new(Box::new(MemoryIo {
-                    raw,
-                    gate: gate.clone(),
-                })),
+                new(
+                    Box::new(MemoryIo {
+                        raw,
+                        gate: gate.clone(),
+                    }),
+                    false,
+                ),
                 h2::server::Builder::new().handshake::<_, Bytes>(MemoryIo {
                     raw: peer,
                     gate: peer_gate.clone(),
@@ -433,3 +447,7 @@ mod prequeued_flush_memory_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "h2_receive_credit_memory_tests.rs"]
+mod receive_credit_memory_tests;

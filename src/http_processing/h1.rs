@@ -79,6 +79,7 @@ impl HttpContext {
             let (read, mut write) = tokio::io::split(stream);
             let mut reader = BufReader::with_capacity(framing::COPY_BUFFER, read);
             let config = HttpServerConfig::processing();
+            let mut upstream = None;
             loop {
                 let request = timeout(config.header_timeout, async {
                     if reader.fill_buf().await?.is_empty() {
@@ -102,7 +103,8 @@ impl HttpContext {
                         &request,
                         session.clone(),
                         scheme,
-                        &config,
+                        (&config, &cancellation),
+                        &mut upstream,
                     )
                     .await?
                 {
@@ -116,16 +118,31 @@ impl HttpContext {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn forward_h1<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         &self,
         reader: &mut R,
         writer: &mut W,
         request: &RequestHead,
-        session: StreamSession,
+        mut session: StreamSession,
         scheme: Scheme,
-        config: &HttpServerConfig,
+        scope: (&HttpServerConfig, &CancellationToken),
+        upstream: &mut Option<server::UpstreamSlot>,
     ) -> io::Result<bool> {
+        let (config, cancellation) = scope;
         let original = request_url(request, scheme)?;
+        if scheme == Scheme::Http
+            && let Some(plan) = self
+                .dispatcher()
+                .sniff_plan(session.source, &session.destination)
+                .await
+                .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?
+        {
+            plan.with_cancellation(cancellation.clone())
+                .observe_http_host(original.host_str().ok_or_else(invalid)?, &mut session)
+                .map_err(|_| io::Error::other("sniffer rule evaluation failed"))?;
+        }
+        let base_session = session.clone();
         let asterisk = request.method == "OPTIONS" && request.target == "*";
         let decision = match self.plan(original, session, scheme, !asterisk) {
             Ok(decision) => decision,
@@ -140,7 +157,7 @@ impl HttpContext {
             }
             Err(error) => return Err(error),
         };
-        let target = match decision {
+        let mut target = match decision {
             Decision::Reject => {
                 framing::write_timed(
                     writer,
@@ -180,13 +197,13 @@ impl HttpContext {
             origin.clone(),
             false,
         )?;
-        let message = super::h1_body::Message {
-            policy: self.policy(),
-            original: &target.original,
-            request,
-            meta: super::body::OriginalRequestMeta::new(&request.method, &request.headers),
-            continued: std::sync::atomic::AtomicBool::new(false),
-        };
+        let original_url = target.original.clone();
+        let original_meta =
+            super::body::OriginalRequestMeta::new(&request.method, &request.headers);
+        let mut crossed_origin = target.strip_origin_credentials;
+        let mut continued = false;
+        let mut prepared_upload = None;
+        let mut script_context = None;
         let mut outgoing = request.clone();
         if target.strip_origin_credentials {
             super::headers::strip_origin_credentials(&mut outgoing.headers);
@@ -199,14 +216,247 @@ impl HttpContext {
         );
         let mut plan =
             RequestPlan::for_target(&outgoing, target.logical_destination.clone(), origin, false)?;
+        let active_scripts = plan.upgrade.is_empty()
+            && self
+                .policy()
+                .scripts()
+                .iter()
+                .any(|s| s.matches(&original_url));
+        if active_scripts {
+            use super::{
+                body::{Transaction, WireBodyMeta},
+                script_config::BodyMode,
+                script_message::{self, OriginalSnapshot, Outcome, RequestSnapshot},
+            };
+            let wants_body = self.policy().scripts().iter().any(|s| {
+                s.phase == super::rules::Phase::Request
+                    && s.body != BodyMode::None
+                    && s.matches(&original_url)
+            });
+            let length = match plan.body {
+                framing::Body::Empty => Some(0),
+                framing::Body::Length(n) => Some(n),
+                _ => None,
+            };
+            let wire = WireBodyMeta::new(
+                &request.headers,
+                &original_meta,
+                super::rules::Phase::Request,
+                None,
+                length,
+                false,
+            );
+            let transaction = Transaction::begin_shared(
+                self.policy().body_budget(),
+                self.policy().rules(),
+                &original_url,
+                super::rules::Phase::Request,
+                &wire,
+                wants_body && !asterisk,
+            )
+            .ok();
+            if transaction.is_some()
+                && request
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("expect"))
+            {
+                framing::write_timed(
+                    writer,
+                    b"HTTP/1.1 100 Continue\r\n\r\n",
+                    config.header_timeout,
+                )
+                .await?;
+                framing::timeout_io(
+                    config.header_timeout,
+                    tokio::io::AsyncWriteExt::flush(writer),
+                )
+                .await?;
+                continued = true;
+                outgoing
+                    .headers
+                    .retain(|(name, _)| !name.eq_ignore_ascii_case("expect"));
+            }
+            if target.strip_origin_credentials {
+                plan.trailer_blocklist.insert("cookie".into());
+            }
+            let (mut prepared, entity) = super::h1_body::prepare_shared(
+                reader,
+                plan.body,
+                &plan.trailer_blocklist,
+                config.body_idle_timeout,
+                transaction,
+                &mut outgoing.headers,
+            )
+            .await?;
+            let original = OriginalSnapshot {
+                url: original_url.clone(),
+                method: request.method.clone(),
+                identity_allowed: original_meta.identity_allowed,
+                asterisk,
+            };
+            let mut message = script_message::Message::request(
+                original.clone(),
+                RequestSnapshot {
+                    url: target.url.clone(),
+                    method: outgoing.method.clone(),
+                    headers: outgoing.headers.clone(),
+                },
+                entity,
+                &request.headers,
+                target.strip_origin_credentials,
+            );
+            let outcome =
+                match script_message::run(self.policy(), &original_url, &mut message, cancellation)
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error)
+                        if cancellation.is_cancelled()
+                            || error.kind() == io::ErrorKind::Interrupted =>
+                    {
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        return write_local(
+                            writer,
+                            script_message::LocalResponse {
+                                status: 502,
+                                headers: vec![("Content-Length".into(), "0".into())],
+                                body: bytes::Bytes::new(),
+                            },
+                            config.header_timeout,
+                        )
+                        .await;
+                    }
+                };
+            match outcome {
+                Outcome::Abort => return Ok(false),
+                Outcome::Respond(local) => {
+                    drop(message);
+                    drop(prepared);
+                    return write_local(writer, local, config.header_timeout).await;
+                }
+                Outcome::Forward => {}
+            }
+            crossed_origin |= message.crossed_origin;
+            if let Some(entity) = message.body.take() {
+                prepared.install_entity(entity);
+            }
+            outgoing.method = message.request.method.clone();
+            outgoing.headers = message.request.headers.clone();
+            target = self.final_target(
+                original_url.clone(),
+                message.request.url.clone(),
+                base_session,
+                scheme,
+            )?;
+            let mut final_origin = if asterisk {
+                "*".to_owned()
+            } else {
+                target.url.path().to_owned()
+            };
+            if let Some(query) = target.url.query() {
+                final_origin.push('?');
+                final_origin.push_str(query);
+            }
+            plan = RequestPlan::for_target(
+                &outgoing,
+                target.logical_destination.clone(),
+                final_origin,
+                false,
+            )?;
+            if message.crossed_origin {
+                plan.trailer_blocklist.insert("cookie".into());
+            }
+            prepared_upload = Some(prepared);
+            script_context = Some(super::h1_body::ScriptContext {
+                original,
+                request: message.request,
+                cancellation: cancellation.clone(),
+            });
+        }
         if target.strip_origin_credentials {
             plan.trailer_blocklist.insert("cookie".into());
         }
+        let message = super::h1_body::Message {
+            policy: self.policy(),
+            original: &original_url,
+            request,
+            meta: original_meta,
+            continued: std::sync::atomic::AtomicBool::new(continued),
+            prepared: std::sync::Mutex::new(prepared_upload),
+            scripts: script_context,
+        };
+        // The slot never leaves this downstream's fixed HttpContext. HTTPS
+        // additionally requires an unchanged origin throughout request actions;
+        // an A -> B -> A script chain must not recover reuse eligibility.
+        let reusable_transport = (scheme == Scheme::Http && target.url.scheme() == "http")
+            || (scheme == Scheme::Https
+                && target.url.scheme() == "https"
+                && !crossed_origin
+                && !target.strip_origin_credentials);
+        let eligible = reusable_transport
+            && !matches!(request.method.as_str(), "HEAD" | "CONNECT")
+            && !matches!(outgoing.method.as_str(), "HEAD" | "CONNECT")
+            && !asterisk
+            && request.version == "HTTP/1.1"
+            && plan.keep_alive
+            && plan.upgrade.is_empty()
+            && matches!(plan.body, framing::Body::Empty | framing::Body::Length(_))
+            && !outgoing
+                .headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("expect"));
         let deadline = Instant::now() + config.connect_timeout;
-        let mut outbound = timeout_at(deadline, self.dispatcher.connect_tcp(target.session))
+        let prepared = if eligible {
+            timeout_at(
+                deadline,
+                self.dispatcher.prepare_http_tcp(target.session.clone()),
+            )
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP outbound timed out"))?
-            .map_err(|_| io::Error::other("HTTP outbound failed"))?;
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "HTTP outbound planning timed out")
+            })?
+            .map_err(|_| io::Error::other("HTTP outbound planning failed"))?
+        } else {
+            None
+        };
+        let key = prepared.as_ref().and_then(|p| p.reuse_key()).cloned();
+        let authority = target.url.origin().ascii_serialization();
+        // Taking removes the slot even on errors/panic. No old IO can survive
+        // an uncertain exchange or be used for a rejected new route.
+        if let Some(mut previous) = upstream.take()
+            && key.as_ref().is_some_and(|k| previous.key.same(k))
+            && previous.authority == authority
+            && previous.io.idle_healthy().await
+        {
+            drop(prepared);
+            let outcome = server::forward_processed_reusable(
+                reader,
+                writer,
+                &mut previous.io,
+                request,
+                plan,
+                config,
+                &message,
+            )
+            .await?;
+            if outcome.upstream_reusable {
+                *upstream = Some(previous);
+            }
+            return Ok(outcome.downstream_keep_alive);
+        }
+        let mut outbound = timeout_at(deadline, async {
+            if let Some(prepared) = prepared {
+                prepared.connect().await
+            } else {
+                self.dispatcher.connect_tcp(target.session).await
+            }
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP outbound timed out"))?
+        .map_err(|_| io::Error::other("HTTP outbound failed"))?;
         if target.url.scheme() == "https" {
             let tls = StandardTlsClient::with_options(
                 self.security(),
@@ -222,15 +472,60 @@ impl HttpContext {
                 0,
                 64 * 1024,
             )?;
-            outbound = timeout_at(deadline, tls.connect(outbound))
+            let (authenticated, alpn) = timeout_at(deadline, tls.connect_negotiated(outbound))
                 .await
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::TimedOut, "HTTP upstream TLS timed out")
                 })?
                 .map_err(|_| io::Error::other("HTTP upstream TLS failed"))?;
+            if alpn
+                .as_deref()
+                .is_some_and(|protocol| protocol != b"http/1.1")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP upstream TLS did not negotiate HTTP/1.1",
+                ));
+            }
+            outbound = authenticated;
         }
-        server::forward_processed(reader, writer, outbound, request, plan, config, &message).await
+        if let Some(key) = key {
+            let mut io = server::UpstreamIo::new(outbound);
+            let outcome = server::forward_processed_reusable(
+                reader, writer, &mut io, request, plan, config, &message,
+            )
+            .await?;
+            if outcome.upstream_reusable {
+                *upstream = Some(server::UpstreamSlot { authority, key, io });
+            }
+            Ok(outcome.downstream_keep_alive)
+        } else {
+            server::forward_processed(reader, writer, outbound, request, plan, config, &message)
+                .await
+        }
     }
+}
+async fn write_local<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    local: super::script_message::LocalResponse,
+    idle: Duration,
+) -> io::Result<bool> {
+    let reason = http::StatusCode::from_u16(local.status)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+        .unwrap_or("Response");
+    let mut head = format!("HTTP/1.1 {} {}\r\n", local.status, reason);
+    for (name, value) in &local.headers {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    framing::write_timed(writer, head.as_bytes(), idle).await?;
+    framing::write_timed(writer, &local.body, idle).await?;
+    framing::timeout_io(idle, tokio::io::AsyncWriteExt::flush(writer)).await?;
+    Ok(false)
 }
 fn request_url(request: &RequestHead, scheme: Scheme) -> io::Result<Url> {
     let mut hosts = request

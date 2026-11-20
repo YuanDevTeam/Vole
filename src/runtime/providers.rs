@@ -677,6 +677,28 @@ impl RuntimeResources for ProviderRuntime {
 #[async_trait]
 impl Dispatcher for ProviderRuntime {
     #[cfg(feature = "inbound-http")]
+    async fn prepare_http_tcp(
+        &self,
+        session: StreamSession,
+    ) -> Result<Option<Box<dyn crate::dispatch::HttpTcpPlan>>, DispatchError> {
+        if self.cancellation.is_cancelled() {
+            return Err(DispatchError::NotAllowed);
+        }
+        let generation = self.current.load_full();
+        let inner = generation.dispatcher.prepare_http_tcp(session).await?;
+        Ok(inner.map(|inner| {
+            let key = inner
+                .reuse_key()
+                .cloned()
+                .map(|k| k.with_generation(generation.clone()));
+            Box::new(GenerationHttpTcpPlan {
+                inner,
+                generation,
+                key,
+            }) as Box<dyn crate::dispatch::HttpTcpPlan>
+        }))
+    }
+    #[cfg(feature = "inbound-http")]
     fn http_context(&self) -> Option<crate::http_processing::HttpContext> {
         if self.cancellation.is_cancelled() {
             return None;
@@ -746,6 +768,25 @@ struct PinnedDispatcher {
 }
 #[async_trait]
 impl Dispatcher for PinnedDispatcher {
+    #[cfg(feature = "inbound-http")]
+    async fn prepare_http_tcp(
+        &self,
+        session: StreamSession,
+    ) -> Result<Option<Box<dyn crate::dispatch::HttpTcpPlan>>, DispatchError> {
+        let generation = self.generation.clone();
+        let inner = self.dispatcher.prepare_http_tcp(session).await?;
+        Ok(inner.map(|inner| {
+            let key = inner
+                .reuse_key()
+                .cloned()
+                .map(|k| k.with_generation(generation.clone()));
+            Box::new(GenerationHttpTcpPlan {
+                inner,
+                generation,
+                key,
+            }) as Box<dyn crate::dispatch::HttpTcpPlan>
+        }))
+    }
     fn supports_udp(&self) -> bool {
         self.dispatcher.supports_udp()
     }
@@ -776,6 +817,30 @@ impl Dispatcher for PinnedDispatcher {
         }))
     }
 }
+#[cfg(feature = "inbound-http")]
+struct GenerationHttpTcpPlan {
+    inner: Box<dyn crate::dispatch::HttpTcpPlan>,
+    generation: Arc<Generation>,
+    key: Option<crate::dispatch::HttpTcpReuseKey>,
+}
+#[cfg(feature = "inbound-http")]
+#[async_trait]
+impl crate::dispatch::HttpTcpPlan for GenerationHttpTcpPlan {
+    fn reuse_key(&self) -> Option<&crate::dispatch::HttpTcpReuseKey> {
+        self.key.as_ref()
+    }
+    async fn connect(self: Box<Self>) -> Result<BoxStream, DispatchError> {
+        let Self {
+            inner, generation, ..
+        } = *self;
+        let io = inner.connect().await?;
+        Ok(Box::new(GenerationStream {
+            io,
+            _generation: generation,
+        }))
+    }
+}
+
 struct GenerationStream {
     io: BoxStream,
     _generation: Arc<Generation>,
@@ -804,6 +869,29 @@ impl AsyncWrite for GenerationStream {
         Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
+
+#[cfg(target_os = "macos")]
+fn pin_tun_send_generation<T: Send + Sync + 'static>(
+    pending: crate::dispatch::TunPendingSend,
+    generation: Arc<T>,
+) -> crate::dispatch::TunPendingSend {
+    let crate::dispatch::TunPendingSend {
+        operation,
+        completion,
+    } = pending;
+    crate::dispatch::TunPendingSend {
+        operation: Box::pin(async move {
+            let _generation = generation;
+            operation.await
+        }),
+        completion,
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "providers_tun_send_memory_tests.rs"]
+mod tun_send_memory_tests;
+
 struct GenerationDatagram {
     io: Box<dyn DatagramTransport>,
     _generation: Arc<Generation>,
@@ -817,6 +905,27 @@ impl DatagramTransport for GenerationDatagram {
     fn payload_budget(&self, peer: &Destination) -> DatagramBudget {
         self.io.payload_budget(peer)
     }
+
+    #[cfg(target_os = "macos")]
+    fn try_begin_tun_send(
+        &mut self,
+        datagram: Datagram,
+        flow_id: Option<&[u8]>,
+    ) -> Result<crate::dispatch::TunPendingSend, Datagram> {
+        self.io
+            .try_begin_tun_send(datagram, flow_id)
+            .map(|pending| pin_tun_send_generation(pending, self._generation.clone()))
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn finish_tun_send(
+        &mut self,
+        completion: crate::dispatch::TunSendToken,
+        outcome: crate::dispatch::TunSendOutcome,
+    ) -> Result<(), DispatchError> {
+        self.io.finish_tun_send(completion, outcome).await
+    }
+
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
         self.io.send(datagram).await
     }

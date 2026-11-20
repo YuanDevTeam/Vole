@@ -100,7 +100,7 @@ pub struct Plan {
     decision: crate::config::RuleDecision,
 }
 impl Plan {
-    #[cfg(feature = "tun")]
+    #[cfg(any(feature = "tun", feature = "inbound-http"))]
     pub(crate) fn with_cancellation(
         self,
         cancellation: tokio_util::sync::CancellationToken,
@@ -133,6 +133,51 @@ impl Plan {
     pub(crate) fn quic_enabled(&self) -> bool {
         self.active && self.policy.config.matches_quic_port(self.port)
     }
+    /// A parsed cleartext HTTP request already establishes its protocol and
+    /// authority. Reuse the configured plan without reading or replaying body
+    /// bytes, and keep protocol-specific admission and override semantics.
+    #[cfg(feature = "inbound-http")]
+    pub(crate) fn observe_http_host(
+        &self,
+        host: &str,
+        session: &mut crate::session::StreamSession,
+    ) -> Result<(), crate::config::MatchFailure> {
+        session.capture_original();
+        self.decision.check()?;
+        if !self.active || !self.policy.config.matches_http_port(self.port) {
+            return Ok(());
+        }
+        let host = host.trim_matches(['[', ']']);
+        if host.parse::<IpAddr>().is_ok() {
+            return Ok(());
+        }
+        let Ok(domain) = crate::routing::normalize_domain_name(host) else {
+            return Ok(());
+        };
+        self.apply_domain(crate::tcp_sniffer::SniffProtocol::Http, domain, session)
+    }
+    fn apply_domain(
+        &self,
+        protocol: crate::tcp_sniffer::SniffProtocol,
+        domain: String,
+        session: &mut crate::session::StreamSession,
+    ) -> Result<(), crate::config::MatchFailure> {
+        if !self.accepts(&domain)? {
+            return Ok(());
+        }
+        let override_destination = match protocol {
+            crate::tcp_sniffer::SniffProtocol::Http => self.policy.config.http_override,
+            crate::tcp_sniffer::SniffProtocol::Tls => self.policy.config.tls_override,
+        };
+        if override_destination {
+            session.destination = Destination::Domain {
+                host: domain.clone(),
+                port: self.port,
+            };
+        }
+        session.sniffed_domain = Some(domain);
+        Ok(())
+    }
     pub(crate) async fn sniff<R: tokio::io::AsyncRead + Unpin>(
         &self,
         reader: &mut R,
@@ -158,20 +203,8 @@ impl Plan {
         .filter_map(|(protocol, enabled)| enabled.then_some(protocol))
         .collect();
         let mut sniffer = TcpSniffer::with_protocols(protocols);
-        if let Ok(SniffOutcome::Matched { protocol, domain }) = sniffer.sniff(reader).await
-            && self.accepts(&domain)?
-        {
-            let override_destination = match protocol {
-                SniffProtocol::Http => self.policy.config.http_override,
-                SniffProtocol::Tls => self.policy.config.tls_override,
-            };
-            if override_destination {
-                session.destination = Destination::Domain {
-                    host: domain.clone(),
-                    port: self.port,
-                };
-            }
-            session.sniffed_domain = Some(domain);
+        if let Ok(SniffOutcome::Matched { protocol, domain }) = sniffer.sniff(reader).await {
+            self.apply_domain(protocol, domain, session)?;
         }
         Ok(sniffer.into_buffered())
     }

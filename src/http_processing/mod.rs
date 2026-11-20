@@ -4,12 +4,21 @@ mod authority;
 pub(crate) mod body;
 mod body_budget;
 pub(crate) mod config;
+#[cfg(feature = "http-diagnostics")]
+#[doc(hidden)]
+pub mod diagnostics;
+#[cfg(not(feature = "http-diagnostics"))]
+pub(crate) mod diagnostics;
 pub(crate) mod headers;
 mod mitm;
 mod numeric_input;
 pub(crate) mod private_context;
 pub(crate) mod providers;
 pub(crate) mod rules;
+pub(crate) mod script_config;
+#[cfg(feature = "inbound-http")]
+pub(crate) mod script_message;
+pub(crate) mod scripts;
 pub(crate) use config::{MAX_ADDENDUM, Policy};
 #[cfg(feature = "inbound-http")]
 mod h1;
@@ -23,6 +32,8 @@ mod h2_body;
 mod h2_h1;
 #[cfg(feature = "inbound-http")]
 mod h2_headers;
+#[cfg(feature = "inbound-http")]
+mod h2_reuse;
 #[cfg(all(test, feature = "inbound-http"))]
 mod h2_tests;
 #[cfg(feature = "inbound-http")]
@@ -67,8 +78,11 @@ impl HttpContext {
     pub(super) fn security(&self) -> &SecurityContext {
         &self.security
     }
-    pub(crate) fn candidate_port(&self, port: u16) -> bool {
+    pub(crate) fn plain_port(&self, port: u16) -> bool {
         self.policy.plain_port(port)
+    }
+    pub(crate) fn candidate_port(&self, port: u16) -> bool {
+        self.plain_port(port)
             || self
                 .policy
                 .mitm()
@@ -100,3 +114,6 @@ pub(crate) enum Intercept {
 mod h1_boundary_tests;
 #[cfg(all(test, feature = "inbound-http"))]
 mod tests;
+
+#[cfg(test)]
+mod h2_frame_validation;
