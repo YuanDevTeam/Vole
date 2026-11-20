@@ -411,6 +411,7 @@ impl BudgetedBytes {
 
     /// Admit a known result before copying it out of an engine. Body-less calls
     /// use an empty buffer until the backend knows that a result has a body.
+    #[cfg(all(feature = "inbound-http", any(test, target_vendor = "apple")))]
     pub(crate) fn prepare_output(&mut self, length: usize) -> io::Result<()> {
         if length > MAX_BODY {
             return Err(io::Error::new(
