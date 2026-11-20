@@ -197,7 +197,7 @@ jobs:
           package("ml-kem", "0.3.4")
           native = {}
           for name, required in (("boring", {"reality", "client-fingerprint", "shadow-tls-v3", "jls"}), ("boring-sys", {"reality", "shadow-tls-v3", "jls"}), ("tokio-boring", set())):
-              item = package(name, "5.4.0", {boring_source})
+              item = package(name, "5.5.1", {boring_source})
               native[name] = item
               require(required <= features(item), f"{name} is missing required TLS features")
               require(not features(item) & {"fips", "fips-precompiled", "rpk", "pq-experimental", "restls"}, f"{name} enables an unapproved TLS mode")
