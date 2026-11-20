@@ -1178,7 +1178,7 @@ mod tests {
                             Ok(request)=>request,
                             // A cancelled client may reset before headers resolve.
                             // Keep the memory peer alive to join its native owner.
-                            Err(h3::error::StreamError::RemoteTerminate {code})
+                            Err(h3::error::StreamError::RemoteTerminate {code, ..})
                                 if code==h3::error::Code::H3_REQUEST_CANCELLED=>continue,
                             Err(error)=>panic!("memory peer request resolution failed: {error:?}"),
                         };
