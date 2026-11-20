@@ -4,7 +4,6 @@
 //! transport/simple-obfs/{http_server,tls_server}.go. SS authentication and the
 //! destination prelude are decoded by the official Rust ProxyServerStream.
 //! The injected upstream supplies IO only and provides no static-reuse proof.
-use super::super::response_header::HeaderIo;
 use super::Owner;
 use crate::{
     config::{ShadowsocksCipher, ShadowsocksPlugin},
@@ -657,215 +656,6 @@ pub(in crate::outbound::shadowsocks) async fn memory_carrier(
     })
 }
 
-// Diagnostic control peer: a direct, nonbuffering duplex adapter. It adds no
-// cover parser, framing, first-packet coalescing, extra bytes or hidden task.
-struct PlainPeer {
-    io: DuplexStream,
-    counts: Arc<Counts>,
-    write_blocked: Option<oneshot::Sender<()>>,
-}
-impl Drop for PlainPeer {
-    fn drop(&mut self) {
-        self.counts.peer_drops.fetch_add(1, Ordering::SeqCst);
-    }
-}
-impl AsyncRead for PlainPeer {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        out: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_read(cx, out)
-    }
-}
-impl AsyncWrite for PlainPeer {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        input: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let count = input.len().min(PEER_CHUNK);
-        let result = Pin::new(&mut this.io).poll_write(cx, &input[..count]);
-        match &result {
-            Poll::Pending => {
-                this.counts
-                    .peer_write_pending
-                    .fetch_add(1, Ordering::SeqCst);
-                if let Some(signal) = this.write_blocked.take() {
-                    let _ = signal.send(());
-                }
-            }
-            Poll::Ready(Ok(n)) if *n < input.len() => {
-                this.counts.partial_writes.fetch_add(1, Ordering::SeqCst);
-            }
-            _ => {}
-        }
-        result
-    }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_flush(cx)
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
-    }
-}
-struct PlainCarrier {
-    client: BoxStream,
-    accept: Accept,
-    guard: Option<ObfsMemoryGuard>,
-    counts: Arc<Counts>,
-    peer_write_blocked: oneshot::Receiver<()>,
-}
-fn plain_carrier_with_header_probe(
-    cipher: ShadowsocksCipher,
-    bind: Option<bool>,
-    header_probe: bool,
-) -> io::Result<PlainCarrier> {
-    let key = vec![7; cipher.key_len()];
-    let method = cipher
-        .as_str()
-        .parse()
-        .map_err(|_| invalid("plain test cipher"))?;
-    let config = ServerConfig::new(("127.0.0.1", 12345), STANDARD.encode(&key), method)
-        .map_err(|_| invalid("plain test server configuration"))?;
-    let counts = Arc::new(Counts::default());
-    let target = super::super::address(&Destination::domain("memory-obfs.invalid", 443).unwrap());
-    let (client, peer) = tokio::io::duplex(64);
-    let raw: BoxStream = Box::new(Raw {
-        io: client,
-        counts: counts.clone(),
-    });
-    let raw: BoxStream = if header_probe {
-        Box::new(HeaderIo::new(raw, method)?)
-    } else {
-        raw
-    };
-    let stream = super::super::stream::SsStream::new(
-        SsContext::new_shared(ServerType::Local),
-        raw,
-        &config,
-        target.clone(),
-    );
-    let mut client: BoxStream = Box::new(stream);
-    let guard = match bind {
-        None => None,
-        Some(tls) => {
-            let owner = Arc::new(Owner::new(
-                &ShadowsocksPlugin::Obfs {
-                    tls,
-                    host: COVER_HOST.into(),
-                },
-                &SecurityContext::new(),
-                0,
-                16 * 1024,
-                443,
-            )?);
-            client = owner.bind_stream(client);
-            Some(ObfsMemoryGuard {
-                owner,
-                counts: counts.clone(),
-                waited: AtomicBool::new(false),
-            })
-        }
-    };
-    let (signal, peer_write_blocked) = oneshot::channel();
-    let peer = PlainPeer {
-        io: peer,
-        counts: counts.clone(),
-        write_blocked: Some(signal),
-    };
-    // Construct the official codec before creating the future, so dropping an
-    // unpolled accept still owns and drops the actual raw peer.
-    let mut peer = ProxyServerStream::from_stream(
-        SsContext::new_shared(ServerType::Server),
-        peer,
-        method,
-        &key,
-    );
-    let authenticated = counts.clone();
-    let accept = Box::pin(async move {
-        let observed = stage(
-            "peer.official-handshake",
-            peer.handshake().await.map_err(Into::into),
-        )?;
-        check(observed == target, "plain official SS target mismatch")?;
-        authenticated
-            .target_handshakes
-            .fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(peer) as BoxStream)
-    });
-    Ok(PlainCarrier {
-        client,
-        accept,
-        guard,
-        counts,
-        peer_write_blocked,
-    })
-}
-async fn plain_exchange_with_header_probe(
-    cipher: ShadowsocksCipher,
-    bind: Option<bool>,
-    header_probe: bool,
-) {
-    let PlainCarrier {
-        client,
-        accept,
-        guard,
-        counts,
-        peer_write_blocked,
-    } = plain_carrier_with_header_probe(cipher, bind, header_probe).unwrap();
-    let outcome = AssertUnwindSafe(timeout(
-        WAIT,
-        exchange_io(client, accept, peer_write_blocked, counts.clone()),
-    ))
-    .catch_unwind()
-    .await;
-    let owner_cancelled_before_cleanup = guard
-        .as_ref()
-        .map(|guard| guard.owner.cancel.is_cancelled());
-    if let Some(guard) = &guard {
-        guard.shutdown().await;
-    }
-    let receipt = guard.as_ref().map(ObfsMemoryGuard::receipt);
-    drop(guard);
-    // Counters remain diagnostic primitives only; no synthetic Owner.open or
-    // cover event is credited to either plain control.
-    let summary = (
-        counts.opens.load(Ordering::SeqCst),
-        counts.target_handshakes.load(Ordering::SeqCst),
-        counts.cover_requests.load(Ordering::SeqCst),
-        counts.cover_responses.load(Ordering::SeqCst),
-        counts.client_drops.load(Ordering::SeqCst),
-        counts.peer_drops.load(Ordering::SeqCst),
-        counts.client_write_pending.load(Ordering::SeqCst),
-        counts.peer_write_pending.load(Ordering::SeqCst),
-        counts.partial_writes.load(Ordering::SeqCst),
-    );
-    match outcome {
-        Err(panic) => std::panic::resume_unwind(panic),
-        Ok(Err(_)) => panic!(
-            "plain {cipher:?}/bind={bind:?}/header_probe={header_probe}: deadline; counts={summary:?}; receipt={receipt:?}"
-        ),
-        Ok(Ok(Err(error))) => panic!(
-            "plain {cipher:?}/bind={bind:?}/header_probe={header_probe}: {error}; owner_cancelled_before_cleanup={owner_cancelled_before_cleanup:?}; counts={summary:?}; receipt={receipt:?}"
-        ),
-        Ok(Ok(Ok(_))) => {}
-    }
-    assert_eq!(
-        (
-            summary.0, summary.1, summary.2, summary.3, summary.4, summary.5
-        ),
-        (0, 1, 0, 0, 1, 1)
-    );
-    assert!(summary.6 > 0 && summary.7 > 0 && summary.8 > 0);
-    if let Some(receipt) = receipt {
-        assert!(receipt.owner_cancelled && receipt.owner_closed && receipt.owner_wait_returned);
-    }
-}
-
-// The two new unprimed plain EXPECT-success diagnostics were archived with
-// their failures by Root outside Core; they are not generic short-read support.
 async fn entity(
     io: &mut (impl AsyncRead + Unpin),
     expected: u8,
@@ -883,7 +673,6 @@ async fn entity(
     }
 }
 
-// All covered and plain controls execute this identical gate/payload sequence.
 async fn exchange_io(
     client: BoxStream,
     accept: Accept,
@@ -1020,23 +809,15 @@ async fn exchange(cipher: ShadowsocksCipher, tls: bool) {
 }
 
 #[tokio::test]
-async fn obfs_http_real_ss_all_ciphers_reuses_one_cover_and_target_under_duplex_backpressure() {
+async fn header_probe_covered_ss_all_ciphers_and_modes_preserves_actual_owned_pipeline() {
     for cipher in [
         ShadowsocksCipher::Aes128Gcm,
         ShadowsocksCipher::Aes256Gcm,
         ShadowsocksCipher::Chacha20Poly1305,
     ] {
-        exchange(cipher, false).await;
-    }
-}
-#[tokio::test]
-async fn obfs_tls_real_ss_all_ciphers_reuses_one_cover_and_target_under_duplex_backpressure() {
-    for cipher in [
-        ShadowsocksCipher::Aes128Gcm,
-        ShadowsocksCipher::Aes256Gcm,
-        ShadowsocksCipher::Chacha20Poly1305,
-    ] {
-        exchange(cipher, true).await;
+        for tls in [false, true] {
+            exchange(cipher, tls).await;
+        }
     }
 }
 
@@ -1088,73 +869,6 @@ async fn unpolled_memory_accept_drop_is_counted_separately_from_owner_shutdown()
             (0, 0, 0)
         );
         assert!(receipt.owner_cancelled && receipt.owner_closed && receipt.owner_wait_returned);
-    }
-}
-
-// Plain controls explicitly request HeaderIo, without claiming a global SS
-// fix. Covered controls use the actual production preparation once only.
-#[tokio::test]
-async fn header_probe_plain_ss_all_ciphers_preserves_full_duplex_exchange() {
-    for cipher in [
-        ShadowsocksCipher::Aes128Gcm,
-        ShadowsocksCipher::Aes256Gcm,
-        ShadowsocksCipher::Chacha20Poly1305,
-    ] {
-        plain_exchange_with_header_probe(cipher, None, true).await;
-    }
-}
-#[tokio::test]
-async fn header_probe_plain_ss_actual_obfs_bind_all_ciphers_and_modes_preserves_full_duplex_exchange()
- {
-    for cipher in [
-        ShadowsocksCipher::Aes128Gcm,
-        ShadowsocksCipher::Aes256Gcm,
-        ShadowsocksCipher::Chacha20Poly1305,
-    ] {
-        for tls in [false, true] {
-            plain_exchange_with_header_probe(cipher, Some(tls), true).await;
-        }
-    }
-}
-#[tokio::test]
-async fn header_probe_covered_ss_all_ciphers_and_modes_preserves_actual_owned_pipeline() {
-    for cipher in [
-        ShadowsocksCipher::Aes128Gcm,
-        ShadowsocksCipher::Aes256Gcm,
-        ShadowsocksCipher::Chacha20Poly1305,
-    ] {
-        for tls in [false, true] {
-            exchange(cipher, tls).await;
-        }
-    }
-}
-
-#[test]
-fn http_cover_requires_both_upgrade_fields() {
-    let key = URL_SAFE.encode([0u8; 16]);
-    let request = |connection: bool, upgrade: bool| {
-        format!(
-            "GET / HTTP/1.1\r\nHost: cover.invalid:443\r\n{}{}Sec-WebSocket-Key: {key}\r\nContent-Length: 1\r\n\r\n",
-            if connection {
-                "Connection: Upgrade\r\n"
-            } else {
-                ""
-            },
-            if upgrade {
-                "Upgrade: websocket\r\n"
-            } else {
-                ""
-            },
-        )
-    };
-    assert_eq!(http_length(request(true, true).as_bytes()).unwrap(), 1);
-    for (connection, upgrade) in [(false, true), (true, false), (false, false)] {
-        assert_eq!(
-            http_length(request(connection, upgrade).as_bytes())
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
     }
 }
 

@@ -2,13 +2,10 @@ use super::*;
 use futures_util::FutureExt as _;
 
 #[test]
-fn full_write_pending_notification_matches_target_contract() {
-    assert_pending_notification(false);
-}
-
-#[test]
-fn buffered_flush_pending_notification_matches_target_contract() {
-    assert_pending_notification(true);
+fn pending_write_and_flush_notifications_match_target_contract() {
+    for flush in [false, true] {
+        assert_pending_notification(flush);
+    }
 }
 
 fn assert_pending_notification(flush: bool) {

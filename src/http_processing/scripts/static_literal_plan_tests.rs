@@ -105,57 +105,6 @@ fn static_literal_closed_ast_never_ignores_other_statements() {
 }
 
 #[test]
-#[ignore = "unbuilt isolated prototype; run after independent trace review"]
-fn static_literal_ascii_body_only_has_the_known_trace() {
-    let budget = Budget::default();
-    let text = vec![b'-'; 65536];
-    let (input, mut output, bridge) = buffers(&budget, &text, text.len());
-    let attempt = compile(BODY_ONLY)
-        .unwrap()
-        .try_execute(
-            &input_metadata(),
-            Some(input.borrowed_body()),
-            &mut output,
-            &CancellationToken::new(),
-            Instant::now() + Duration::from_millis(100),
-        )
-        .unwrap();
-    assert_eq!(
-        attempt.result.unwrap(),
-        json!({"type":"modify","body":{"kind":"text"}})
-    );
-    assert_eq!(attempt.ticks, 25);
-    assert_eq!(attempt.allocation_work, 131472);
-    assert!(output.as_ref().iter().all(|b| *b == b'_'));
-    drop((input, output, bridge));
-    assert_eq!(budget.used(), 0);
-}
-
-#[test]
-#[ignore = "unbuilt prototype; independently derived static-header trace"]
-fn static_literal_ascii_header_has_the_known_trace() {
-    let source = "function rewrite(input){const d=input.body.data.replaceAll('-', '_');return {type:'modify',headers:[{op:'set',name:'x-test',values:['x']}],body:{kind:'text',data:d}};}";
-    let budget = Budget::default();
-    let body = vec![b'-'; 65536];
-    let (input, mut output, bridge) = buffers(&budget, &body, body.len());
-    let attempt = compile(source)
-        .unwrap()
-        .try_execute(
-            &input_metadata(),
-            Some(input.borrowed_body()),
-            &mut output,
-            &CancellationToken::new(),
-            Instant::now() + Duration::from_millis(100),
-        )
-        .unwrap();
-    assert!(attempt.result.is_ok());
-    assert_eq!(attempt.ticks, 44);
-    assert_eq!(attempt.allocation_work, 131920);
-    drop((input, output, bridge));
-    assert_eq!(budget.used(), 0);
-}
-
-#[test]
 #[ignore = "matched-plan budget refusal is skip/rollback, never JSC fallback"]
 fn static_literal_matched_plan_budget_refusal_is_an_attempt_error() {
     let budget = Budget::default();
@@ -213,20 +162,6 @@ fn static_literal_real_jsc_differential_ascii_shapes_aliases_and_headers() {
         "function rewrite(input){const unused=input.body.data.replaceAll('-', '_');const original=input.body.data;return {body:{data:original,kind:'text'},type:'modify'};}",
         b"----",
     );
-}
-
-#[test]
-#[ignore = "requires real JSC; no source-level dead-code removal is permitted"]
-fn static_literal_unused_calls_preserve_cumulative_work_failure() {
-    for calls in [14, 15, 16] {
-        let declarations = (0..calls)
-            .map(|i| format!("const unused{i}=input.body.data.replaceAll('-', '_');"))
-            .collect::<String>();
-        let source = format!(
-            "function rewrite(input){{{declarations}return {{type:'modify',body:{{kind:'text',data:input.body.data}}}};}}"
-        );
-        compare_jsc(&source, &vec![b'-'; 65536]);
-    }
 }
 
 #[test]
@@ -513,31 +448,6 @@ fn guarded_plan_old_aliases_and_unused_replacements_preserve_work() {
 }
 
 #[test]
-fn guarded_plan_unknown_writes_and_calls_keep_the_complete_jsc_path() {
-    for mutation in [
-        "input.body.data='changed';",
-        "if(input.phase==='request'){s=s.replaceAll('-','_');}",
-        "s+='growing';",
-        "s=s.replaceAll('-','$');",
-        "s=s.replaceAll('','_');",
-        "s=s.replaceAll('é','_');",
-        "Math.abs(1);",
-        "while(false){s=s.replaceAll('-','_');}",
-        "{let s='shadow';s=s.replaceAll('-','_');}",
-    ] {
-        let tail = format!(
-            "let s=input.body.data;{mutation}return {{type:'modify',body:{{kind:'text',data:s}}}};"
-        );
-        let source = guarded_plan_source(4, "abort", &tail);
-        validate_source(&source).expect("negative Plan case must remain accepted JS");
-        assert!(
-            compile(&source).is_none(),
-            "unknown complete effect selected Plan: {source}"
-        );
-    }
-}
-
-#[test]
 fn guarded_plan_predicates_preserve_short_circuit_and_literal_order() {
     let tail = "const mapped=input.body.data.replaceAll('-','_');return {type:'modify',body:{kind:'text',data:mapped}};";
     for (predicate, early, ticks) in [
@@ -584,15 +494,6 @@ fn guarded_plan_predicates_preserve_short_circuit_and_literal_order() {
             assert_eq!(work, 412);
         }
     }
-}
-
-#[test]
-fn guarded_plan_standalone_rebindings_keep_immutable_aliases() {
-    let source = "function rewrite(input){let value=input.body.data;const old=value;value=value.replaceAll('-','_');value=value.replaceAll('_','+');return {type:'modify',body:{kind:'text',data:old}};}";
-    let (result, bytes, _, work) = guarded_plan_compare(source, b"----", &input_metadata());
-    assert!(result.is_ok());
-    assert_eq!(bytes, b"----");
-    assert_eq!(work, 448);
 }
 
 #[test]

@@ -15,15 +15,8 @@
 Tokio `new_multi_thread()`，不按 TUN 分叉，不自行读取 CPU 数或设置 worker 数。
 worker 数遵循 Tokio 默认行为（包括其 `TOKIO_WORKER_THREADS` 环境覆盖）；
 线程栈使用 Tokio / Rust 默认值，不固定为 1 MiB。
-Apple（iOS/tvOS/macOS）业务引擎只在自己新建的 engine owner 线程入口及
-Tokio thread-start hook 对当前线程尽力请求公开 USER_INITIATED QoS、relative priority0；
-覆盖本引擎的 scheduler、blocking 与替代线程，不修改调用者/宿主队列、准备或单线程测量。
-请求失败不改变启动或业务结果，不设置 CPU 亲和性，也不保证有效优先级、P核选择或吞吐。
-线程退出仍沿原真实 join；不将 scoped 脚本 owner 的独立策略或诊断计入 runtime 请求。
-启动准备和 `measureDelay` 保留共用的单线程执行策略，不按 TUN 分叉。
-工作线程（含阻塞任务线程）继承 Invoke 重入保护，
-Apple 平台另保留线程局部日志作用域；同步停止仍等待子任务与运行时线程退出。
-Release 构建优先吞吐（`opt-level = 3`），保留 thin LTO 与现有缓冲、队列边界。
+Apple 引擎在自建 owner 及 Tokio 新线程入口尽力请求 USER_INITIATED QoS。
+宿主调用线程保持自身策略。该观测记录公开的请求等级，线程释放按实际 join 确认。
 
 ## TUN 结构上限
 
@@ -63,10 +56,8 @@ MTU 由 `tun.mtu` 配置，默认值和平台限制统一见 [TUN 平台层](tun
 
 - TCP 流按需创建任务；TUN 转发每方向缓冲区为 4 KiB。
 - 生产 TUN 的 TCP 接收总预算默认 32 KiB，smoltcp RX 与应用接收队列各 16 KiB；发送总预算默认 128 KiB，smoltcp TX 与应用发送队列各 64 KiB。Rust `ResourceLimits::tun_tcp_send_buffer` 独立于原 `tcp_buffer_per_direction`，后者仍为 32 KiB 并用于 TUN 接收及原共享流缓冲；显式容量原样传递，不倍乘或钳制，不新增 YAML/Invoke 字段。所有平台 TUN 共用该策略。
-- 应用接收队列默认及小于 64 KiB 的应用发送队列使用按需、有界增长的 VecDeque，排空后保留空间。Unix 上由 netstack Driver 持有的较大发送队列在首次非零写入时使用 safe memmap2 匿名映射 ring；显式 `NetStackConfig::map_tcp_recv_buffer` 还可为应用接收队列启用独立方向的同类 backing，默认 false。映射长度为该队列原逻辑容量，头尾和读写均受同一队列锁与原容量约束。Windows 与其他非 Unix 目标始终保留原有有界 VecDeque，不调用匿名映射 backend；Unix 映射失败、Driver 已关闭或失效时，该队列永久降回原有有界 VecDeque，继续接受正常写入，不将映射失败转为永久 Pending。每个 smoltcp 数组仍按该方向总预算的一半创建；默认每流 TCP 数据逻辑容量仍为 160 KiB。
-- 每个 Driver 独立持有最多四槽的空发送映射缓存，缓存请求长度合计不超过该栈 TCP 发送总预算；生产 TUN 默认 128 KiB，因此默认 64 KiB 应用发送映射最多缓存两个。仅复用请求长度与当前队列逻辑容量完全相同的空映射。槽满、预算满、锁竞争、关闭或 Weak 失效时，归还的真实 mapping owner 在队列与缓存锁外销毁；未读字节从不转移。Driver 持长期强 Arc、流句柄持 Weak，停止先关闭并清空缓存，再唤醒流与发布停止；晚到归还不能恢复缓存。
-- 应用 RX 的显式映射策略使用独立四槽空缓存，请求长度总额不超过该栈 TCP 接收总预算，不占用或扩大 TX 缓存；逻辑接收容量与 TCP 通告窗口不变。Apple 平台 WireGuard 私有主动栈及 macOS 的 MASQUE H3/IP 私有主动栈启用此策略：每个应用 RX 为 64 KiB，空映射最多缓存两个，请求长度合计最多 128 KiB。其它平台 WireGuard、生产 TUN、MASQUE H2/IP、非 macOS 的 MASQUE H3/IP 和其它栈默认不启用；MASQUE H3 L4 不建立此私有 IP 栈。RX 保留原读/锁/waker/EOF 语义，不使用 TX 的 advisory 非空 hint。Stop 仅释放空缓存，未读 RX tail 保留真实 backing 至最后读取或所有者释放；映射和缓存预算不是进程 phys_footprint 保证。
-- 映射请求长度不是 resident/RSS 上限：操作系统页粒度可令每个映射额外占用小于一页的末页空间，四槽缓存该 padding 合计小于四页；默认 64 KiB 是常见 4/16/64 KiB 页的整倍数。映射不代表所有页立即 resident；固定槽、mutex、Arc、Weak 及 allocator 元数据另计。HTTP 正文工作区与最后发送 owner 退款边界保持不变；上述容量均不包含 HTTP 正文、relay、包队列或 allocator，也不是整个进程的内存证明。
+- 应用队列按需增长并保持原容量。Unix 发送队列达到 64 KiB 时可使用匿名映射 ring；显式 `NetStackConfig::map_tcp_recv_buffer` 可为接收队列启用独立映射，默认关闭。映射不可用或 owner 已停止时使用有界 VecDeque。
+- 每个 Driver 按方向最多缓存四个已排空的映射，缓存请求长度合计受方向预算约束，只复用相同长度。Stop 清空缓存，未读数据和活动切片继续由实际 owner 持有至释放。Apple WireGuard 和 macOS MASQUE H3/IP 私有栈启用接收映射。逻辑容量、映射末页和进程内存采用各自口径。
 - WireGuard 私有主动栈的 TCP 接收总预算为 128 KiB：smoltcp 数组与按需应用队列
   各 64 KiB；发送总预算为 64 KiB，两部分各 32 KiB。MASQUE H2/IP 接收总预算为 96 KiB，
   发送为 64 KiB；H3/IP 接收为 128 KiB，发送与通用 netstack 默认值同为 32 KiB。
@@ -74,15 +65,7 @@ MTU 由 `tun.mtu` 配置，默认值和平台限制统一见 [TUN 平台层](tun
   分配容量差不等于进程 physical footprint 的固定节省量。
   节点业务与私有 DNS 的 TCP 共用该主动栈；此预算不改变内层 UDP、原始包队列或连接数量策略。
 - rustls/流式 XHTTP 的配置缓冲区为 64 KiB；boring 每次应用写入最多 min(节点缓冲预算, 16 KiB)，原生 TLS 记录有界，命名模板证书消息/解压输出另限 128 KiB。
-- 业务 MITM 下游 rustls 写侧使用 `ResourceLimits::default().tls_buffer_limit` 的 64 KiB 固定默认值；HTTP 上下文不接收调用者容量覆盖，已有节点 TLS 客户端的显式容量仍按原值使用。此局部写缓冲与 TUN、H2 信用及 HTTP 正文账本独立，取消、实际发送与 Stop 所有权不变；容量值不是整进程内存上界。
-- 业务 HTTP 处理的 H2 下游 server 每个响应流使用 64 KiB 的发送队列 capacity 背压上限；应用仍每次最多预留／提交 16 KiB，遵守实际对端信用。流／连接接收窗口仍为 64／64 KiB，每下游仍至多 8 个活动请求；业务上游 H2 client 的发送缓冲仍为 16 KiB，本文其它共享流传输沿用各自既有的局部容量。完整正文的 Bytes 切片保留原付费 owner，流式路径可能保留更多传输帧；此局部队列与 codec、TLS、TUN 及 4 MiB 正文账本分别计量，不预分配 64 KiB payload，也不构成进程内存上界。取消、EOF 和 Stop 仍由原父级驱动／请求所有者同步回收。
-- 业务 HTTP 的 H2 上下游实例将连接编码写缓冲的初始容量设为 2 KiB，大首部和控制帧仍按需增长并保留高水位；它不是正文队列或帧长度上限。其它 H2 使用者保持依赖的 16 KiB 初始默认值。每流发送容量、帧大小、流量控制信用、UTF-8／正文预算、取消和实际 flush／Stop 所有权分别保持原策略；初始分配提示不构成进程 RSS 保证。
-- 闭合 HTTP Plan 与已证容量等于输入字节数的原生 ASCII 单字节 literal byte-map 共用 fixed-output 工厂，仍按同一 4 MiB 逻辑账本独立支付源与结果：容量加实际 owner 本体大小。Plan 保留原执行 lane 与准入时序，native 保留原非等待分配／填充／整阶段回滚时序，不新增 JS tick 或期限。Unix 且启用 inbound-http 时，容量至少 64 KiB 的此类输出采用原安全匿名映射，不缓存；小输出、非 Unix、未启用该 feature、collector、其他原生 String／regex／模板及 JSC 保持 Vec。映射失败以同一 reservation 尝试 Vec；两者失败沿原 Plan 本次调用或 native 整阶段旁路处理，不产生成功空正文或额外准入。最后 Bytes／slice owner 先完成 backing destructor 再退款；不将依赖的 unmap 调用冒充 OS 成功回执。每份映射末页 padding 小于一页，页表及 Bytes／allocator 包装另计，不把逻辑账本等同进程 RSS。
-- 标准 TLS 恢复会话总预算为 4，按节点（含独立下载端点）分配；每个缓存绑定不可变的 SNI、ALPN 和证书策略，绝不跨节点复用。TLS 1.3 票据有界、一次性消费，TLS 1.2 会话占用同一额度；额度为 0 则禁用恢复。REALITY 不参与该缓存。
-- 共享 TLS 客户端的显式验证名、协议版本和 ClientHello profile 固定。内联客户端身份固定；文件身份整对校验后供新物理连接取快照，旧连接保留原身份。票据按节点和身份代隔离，换代后拒绝旧票据和旧连接晚到的票据，各代共用原节点总容量。boring 在应用层 ALPN 接受前不发布票据，失败或取消丢弃临时票据。标准 TLS 和 REALITY CloseWrite 只发送 close_notify，刷新最多5秒，保持读方向和底层传输；Drop 释放整个流。XHTTP 仍以逻辑连接整体关闭为准。
-- 半开连接、出站握手和活动会话只记录当前值和峰值，不触发资源错误。
-- 超时、取消、EOF 和协议错误负责回收；停止必须等待全部已跟踪任务结束。
-- 引导解析器最多使用四个工作线程；全部忙时在调用方既有期限内等待，不返回人为容量错误。
+- 业务 MITM 下游 rustls 写缓冲上限使用默认 64 KiB。H2 下游每响应流的发送容量为 64 KiB，上游客户端为 16 KiB。流信用、共享正文账本、生命周期和回退见 [HTTP 处理](http-processing.md)。
 
 ### 物理 socket 初始化
 
@@ -439,7 +422,7 @@ Stop 的同步释放屏障完成后，Apple 通过 malloc zone、GNU/Linux 通�
 
 - 未使用 TUN 时不配置 allocator、不启动周期采样或 Stop 回收。
 - 采样失败只记录一次警告，不写入 `lastError`。
-- Core 的 43/45 MiB 遥测阈值仅作诊断，不代表带宽分档验收预算；benchmark 各带宽统一使用 ≤45 MiB（含等值）。Core 不推断负载档位，最终验收由 benchmark 判定。这些观测不改变 prepare、start、running、stop 或 panic recovery。
+- Core 的 43/45 MiB 遥测阈值用于日志诊断。平台压力预算和进程观测范围见[验收边界](acceptance.md#内存与环境)。
 - Stop 后的 allocator 回收只执行一次且尽力而为，不保证立即降低进程内存。
 
 内存预算与真实设备范围见[验收边界](acceptance.md)。

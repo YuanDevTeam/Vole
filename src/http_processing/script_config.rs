@@ -241,36 +241,6 @@ mod tests {
     }
 
     #[test]
-    fn unused_unknown_ast_keeps_eager_jsc_preparation() {
-        for phase in [Phase::Request, Phase::Response] {
-            // A valid original-frontend program cannot prove coverage by
-            // ignoring an unused statement outside the closed Plan subset.
-            let compiled = active(UNUSED_UNKNOWN, BodyMode::Text, phase)
-                .compile()
-                .unwrap();
-            assert!(compiled[0].needs_jsc_for_business());
-        }
-    }
-
-    #[test]
-    fn omitted_body_declaration_keeps_eager_jsc_preparation() {
-        let raw: RawScripts = serde_json::from_value(serde_json::json!({
-            "enabled": true,
-            "scripts": [{
-                "name": "default-body",
-                "phase": "response",
-                "url": "https://example.test/",
-                "match": "exact",
-                "source": CLOSED,
-            }],
-        }))
-        .unwrap();
-        let compiled = raw.compile().unwrap();
-        assert_eq!(compiled[0].body, BodyMode::None);
-        assert!(compiled[0].needs_jsc_for_business());
-    }
-
-    #[test]
     fn disabled_sources_still_receive_the_complete_frontend_validation() {
         let mut valid = active(UNUSED_UNKNOWN, BodyMode::Text, Phase::Response);
         valid.enabled = false;

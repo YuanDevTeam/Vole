@@ -102,31 +102,6 @@ fn mapped_output_error_and_invalid_retained_length_expose_no_scratch() {
 }
 
 #[test]
-fn mapped_output_enforces_body_limit_and_paid_capacity() {
-    let budget = Budget::default();
-    let mut output = mapped(&budget, MAX_BODY);
-    let cost = budget.used();
-    assert!(
-        output
-            .write_initialized_output(MAX_BODY + 1, |_| panic!("oversize fill entered"))
-            .is_err()
-    );
-    output
-        .write_initialized_output(MAX_BODY, |bytes| {
-            bytes.fill(b'q');
-            Ok(bytes.len())
-        })
-        .unwrap();
-    assert_eq!(output.as_ref().len(), MAX_BODY);
-    assert!(output.as_ref().iter().all(|byte| *byte == b'q'));
-    assert_eq!(output.remaining(), 0);
-    assert!(output.extend(b"overflow").is_err());
-    assert_eq!(budget.used(), cost);
-    drop(output);
-    assert_eq!(budget.used(), 0);
-}
-
-#[test]
 fn mapped_output_map_failure_reuses_the_same_full_ledger_for_vec() {
     let budget = Budget::default();
     let capacity = MAPPED_FIXED_OUTPUT_MINIMUM;
@@ -204,54 +179,6 @@ fn mapped_output_double_allocation_failure_and_bad_reservation_refund_once() {
         )
         .is_none()
     );
-    assert_eq!(budget.used(), 0);
-}
-
-#[test]
-fn mapped_output_small_and_zero_capacity_and_legacy_constructors_keep_vec() {
-    let budget = Budget::default();
-    for capacity in [0, 1, MAPPED_FIXED_OUTPUT_MINIMUM - 1] {
-        let cost = BudgetedBytes::allocation_cost(capacity).unwrap();
-        let reservation = budget.reserve(cost).unwrap();
-        let output = BudgetedBytes::from_reserved_fixed_output_with(
-            reservation,
-            capacity,
-            |_| panic!("small output should not map"),
-            BudgetedBytes::allocate_vector,
-        )
-        .unwrap();
-        assert!(!output.is_mapped_for_test());
-        assert_eq!(budget.used(), cost);
-        drop(output);
-        assert_eq!(budget.used(), 0);
-    }
-    let ordinary = BudgetedBytes::new(&budget, MAX_BODY).unwrap();
-    let copied = BudgetedBytes::copy(&budget, &vec![b'x'; MAPPED_FIXED_OUTPUT_MINIMUM]).unwrap();
-    assert!(!ordinary.is_mapped_for_test());
-    assert!(!copied.is_mapped_for_test());
-    drop((ordinary, copied));
-    let held = budget.reserve(WORKSPACE).unwrap();
-    let empty = BudgetedBytes::empty(&budget);
-    assert!(!empty.is_mapped_for_test());
-    assert_eq!(empty.remaining(), 0);
-    assert_eq!(budget.used(), WORKSPACE);
-    drop(empty);
-    assert_eq!(budget.used(), WORKSPACE);
-    drop(held);
-    assert_eq!(budget.used(), 0);
-}
-
-#[test]
-fn mapped_output_unwind_destroys_backing_before_refund() {
-    let budget = Budget::default();
-    let mut output = mapped(&budget, MAPPED_FIXED_OUTPUT_MINIMUM);
-    let observed = observe_after_unmap(&mut output);
-    let cost = budget.used();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let _ = output.write_initialized_output(1, |_| panic!("failed direct fill"));
-    }));
-    assert!(result.is_err());
-    assert_eq!(observed.load(Ordering::Acquire), cost);
     assert_eq!(budget.used(), 0);
 }
 

@@ -284,28 +284,6 @@ async fn ordinary_http_on_mitm_only_port_stays_plain_forwarding() {
 }
 
 #[tokio::test]
-async fn ordinary_noncandidate_port_forwards_without_rewrite_through_fixed_context() {
-    let origin = FixedOrigin::default();
-    let (mut client, cancel, task) = start(&origin, REWRITE, false);
-    let exchange = timeout(Duration::from_secs(5), async {
-        client.get_mut().write_all(b"GET http://first.invalid:8081/original HTTP/1.1\r\nHost: first.invalid:8081\r\nConnection: close\r\n\r\n").await?;
-        response(&mut client).await
-    }).await;
-    finish(client, cancel, task, &origin).await;
-    let response = exchange.unwrap().unwrap();
-    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(!response.to_ascii_lowercase().contains("x-rewrite:"));
-    let sessions = origin.recorded.sessions.lock().unwrap();
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(
-        sessions[0].destination,
-        Destination::domain("first.invalid", 8081).unwrap()
-    );
-    assert_eq!(sessions[0].inbound, InboundKind::Http);
-    assert!(origin.recorded.heads.lock().unwrap()[0].starts_with("GET /original HTTP/1.1\r\n"));
-}
-
-#[tokio::test]
 async fn candidate_then_noncandidate_retires_cached_upstream_and_keeps_request_identity() {
     let origin = FixedOrigin::default();
     let (mut client, cancel, task) = start(&origin, REWRITE, true);

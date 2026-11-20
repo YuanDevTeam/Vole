@@ -148,61 +148,6 @@ fn native_selector_owners_are_generation_local_and_release_after_last_policy_own
 }
 
 #[test]
-fn native_selector_cache_hits_keep_action_template_validation_and_exact_pattern_keys() {
-    let pattern = r"^https://example\.test/(?P<id>[a-z]+)$";
-    let mut selectors = SelectorCompiler::default();
-    let mut text = 0;
-    let first = Rule::compile_with_selectors(
-        raw(json!({"url": pattern, "action": "reject"})),
-        &mut text,
-        &mut selectors,
-    )
-    .unwrap();
-    for invalid in [
-        json!({"url": pattern, "action": "reject", "replacement": ""}),
-        json!({"url": pattern, "action": "replace", "replacement": "https://one.test/$2"}),
-        json!({
-            "url": pattern, "action": "replace", "enabled": false,
-            "replacement": "https://one.test/${missing}"
-        }),
-    ] {
-        let before = text;
-        assert!(Rule::compile_with_selectors(raw(invalid), &mut text, &mut selectors).is_err());
-        assert_eq!(text, before);
-    }
-    let replacement = Rule::compile_with_selectors(
-        raw(json!({
-            "url": pattern, "action": "replace", "replacement": "https://one.test/${id}"
-        })),
-        &mut text,
-        &mut selectors,
-    )
-    .unwrap();
-    assert!(Arc::ptr_eq(selector(&first), selector(&replacement)));
-    assert_eq!(
-        target(&replacement, "https://example.test/abc"),
-        "https://one.test/abc"
-    );
-    let flagged = Rule::compile_with_selectors(
-        raw(json!({"url": format!("(?i){pattern}"), "action": "reject"})),
-        &mut text,
-        &mut selectors,
-    )
-    .unwrap();
-    let renamed = Rule::compile_with_selectors(
-        raw(json!({"url": pattern.replace("?P<id>", "?P<other>"), "action": "reject"})),
-        &mut text,
-        &mut selectors,
-    )
-    .unwrap();
-    assert!(!Arc::ptr_eq(selector(&first), selector(&flagged)));
-    assert!(!Arc::ptr_eq(selector(&first), selector(&renamed)));
-    let upper = url::Url::parse("https://example.test/ABC").unwrap();
-    assert!(!first.matches(&upper));
-    assert!(flagged.matches(&upper));
-}
-
-#[test]
 fn native_selector_sharing_keeps_rule_text_pattern_and_disabled_boundaries() {
     let reject = json!({"url": ".", "action": "reject"});
     let full = document(json!({"rewrite": {

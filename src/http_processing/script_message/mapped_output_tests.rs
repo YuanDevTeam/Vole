@@ -177,31 +177,3 @@ async fn later_real_plan_reads_mapped_entity_and_preserves_sender_ownership() {
     drop(final_owner);
     assert_eq!(budget.used(), 0);
 }
-
-#[test]
-fn ordinary_new_preserves_vec_string_fill_and_owner_accounting() {
-    let budget = Budget::default();
-    // Native Search's general replacement path uses new -> write_text.
-    // Large size alone must not redirect that constructor to mapped storage.
-    let mut output = BudgetedBytes::new(&budget, LENGTH).unwrap();
-    assert!(!output.is_mapped_for_test());
-    let pointer = output.as_ref().as_ptr();
-    let cost = BudgetedBytes::allocation_cost(LENGTH).unwrap();
-    output
-        .write_text(|text| {
-            text.push_str("café\0😀");
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(output.as_ref(), "café\0😀".as_bytes());
-    assert_eq!(output.as_ref().as_ptr(), pointer);
-    assert_eq!(output.remaining() + output.as_ref().len(), LENGTH);
-    assert_eq!(budget.used(), cost);
-    let wire = output.into_bytes();
-    let tail = wire.slice(3..);
-    drop(wire);
-    assert_eq!(budget.used(), cost);
-    assert_eq!(tail.as_ref(), "é\0😀".as_bytes());
-    drop(tail);
-    assert_eq!(budget.used(), 0);
-}

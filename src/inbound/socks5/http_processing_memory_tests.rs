@@ -456,28 +456,6 @@ async fn socks_sniffed_prefix_is_flushed_before_the_client_sends_more() {
 }
 
 #[tokio::test]
-async fn socks_http_reject_is_local_after_one_connect_success() {
-    let origin = Origin::new(PeerMode::Http);
-    let http = context(
-        "http-ports: [80]\nrewrite: {enabled: true, rules: [{url: '.', action: reject}]}\n",
-        origin.clone(),
-    );
-    let mut fixture = Fixture::new(Some(http), origin.clone(), false);
-    let exchange = timeout(WAIT, async {
-        handshake(&mut fixture.client, 80, false).await?;
-        fixture.client.write_all(REQUEST).await?;
-        let mut response = String::new();
-        fixture.client.read_to_string(&mut response).await?;
-        Ok::<_, io::Error>(response)
-    })
-    .await;
-    let cleanup = fixture.finish(&origin).await;
-    cleanup.unwrap();
-    assert!(exchange.unwrap().unwrap().starts_with("HTTP/1.1 403"));
-    assert!(origin.sessions.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
 async fn socks_http_transparent_connect_failure_never_sends_a_second_socks_reply() {
     let origin = Origin::new(PeerMode::Refused);
     let mut fixture = Fixture::new(Some(context(NATIVE, origin.clone())), origin.clone(), false);

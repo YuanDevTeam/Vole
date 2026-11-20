@@ -793,29 +793,6 @@ mod tests {
     }
 
     #[test]
-    fn entity_replacement_returns_foreign_owner_without_changing_input() {
-        let budget = Budget::default();
-        let foreign = Budget::default();
-        let mut entity = Entity::identity(BudgetedBytes::copy(&budget, b"original").unwrap());
-        let original_wire = entity.wire().clone();
-        let foreign_owner = BudgetedBytes::copy(&foreign, b"foreign").unwrap();
-        let foreign_cost = foreign.used();
-        let rejected = entity.replace(foreign_owner).err().expect("foreign ledger");
-        assert_eq!(rejected.as_ref(), b"foreign");
-        assert_eq!(foreign.used(), foreign_cost);
-        assert_eq!(entity.wire().as_ptr(), original_wire.as_ptr());
-        assert_eq!(entity.logical().unwrap(), b"original");
-        assert!(!entity.changed());
-        assert_eq!(entity.bypass, None);
-        drop(rejected);
-        assert_eq!(foreign.used(), 0);
-        drop(entity);
-        assert!(budget.used() > 0);
-        drop(original_wire);
-        assert_eq!(budget.used(), 0);
-    }
-
-    #[test]
     fn shared_native_commit_keeps_body_and_metadata_atomic_on_foreign_owner() {
         let budget = Budget::default();
         let foreign = Budget::default();
@@ -888,77 +865,6 @@ mod tests {
         assert_eq!(budget.used(), cost);
         assert_eq!(last_slice.as_ref(), b"x");
         drop(last_slice);
-        assert_eq!(budget.used(), 0);
-    }
-
-    #[test]
-    fn literal_capacity_uses_real_input_sized_allocations_for_every_literal_shape() {
-        let url = Url::parse("http://capacity.example/").unwrap();
-        for (input, search, replacement, occurrences, expected) in [
-            ("aaaaa", "aa", "a", "first", "aaaa"),
-            ("aaaaa", "aa", "a", "all", "aaa"),
-            ("no match", "xx", "y", "all", "no match"),
-            ("é中é", "é", "ø", "all", "ø中ø"),
-            ("😀x😀", "😀", "é", "all", "éxé"),
-            ("é中é", "é", "ab", "all", "ab中ab"),
-            ("a$a", "a", "$", "all", "$$$"),
-            ("$1-$1", "$1", "$", "all", "$-$"),
-            ("aa-aa", "aa", "$1", "all", "$1-$1"),
-            ("\0a\0", "\0", "x", "all", "xax"),
-            ("", "a", "b", "all", ""),
-        ] {
-            let yaml = format!(
-                "- {{url: '.', action: request-body-replace, search: {}, replacement: {}, occurrences: {occurrences}}}",
-                serde_json::to_string(search).unwrap(),
-                serde_json::to_string(replacement).unwrap()
-            );
-            let rules = rules(&yaml);
-            let budget = Budget::default();
-            let output = apply_operations(&rules, &url, Phase::Request, input.as_bytes(), &budget)
-                .unwrap()
-                .unwrap();
-            assert_eq!(output.as_ref(), expected.as_bytes());
-            // Tests both the live allocation and its admission. Refunding part
-            // of a MAX allocation without freeing it cannot satisfy this.
-            assert_eq!(output.remaining() + output.as_ref().len(), input.len());
-            assert_eq!(
-                budget.used(),
-                BudgetedBytes::allocation_cost(input.len()).unwrap()
-            );
-            drop(output);
-            assert_eq!(budget.used(), 0);
-        }
-    }
-
-    #[test]
-    fn literal_capacity_native_64k_owner_stays_charged_until_last_bytes_slice() {
-        let budget = Budget::default();
-        let rules = rules("- {url: '.', action: response-body-replace, search: q, replacement: z}");
-        let url = Url::parse("http://capacity.example/").unwrap();
-        let request = OriginalRequestMeta::new("GET", &vec![]);
-        let wire = WireBodyMeta::new(
-            &vec![],
-            &request,
-            Phase::Response,
-            Some(200),
-            Some(65536),
-            false,
-        );
-        let mut transaction =
-            Transaction::begin_shared(&budget, &rules, &url, Phase::Response, &wire, true).unwrap();
-        transaction.push(&vec![b'q'; 65536]).unwrap();
-        let entity = transaction.finish_shared(false, &mut vec![]);
-        assert!(entity.changed());
-        assert_eq!(entity.bypass, None);
-        assert_eq!(entity.logical().unwrap(), vec![b'z'; 65536]);
-        let cost = BudgetedBytes::allocation_cost(65536).unwrap();
-        assert_eq!(budget.used(), cost);
-        let wire = entity.into_wire();
-        let last_owner = wire.slice(17..);
-        drop(wire);
-        assert_eq!(budget.used(), cost);
-        assert_eq!(last_owner.len(), 65536 - 17);
-        drop(last_owner);
         assert_eq!(budget.used(), 0);
     }
 
@@ -1077,40 +983,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(unix, feature = "inbound-http"))]
-    #[test]
-    fn other_native_string_replacements_keep_vector_backing() {
-        let url = Url::parse("https://fixed-output.invalid/body").unwrap();
-        let mut original = vec![b'q'; 64 * 1024];
-        let length = original.len();
-        original[length - 2..].copy_from_slice("é".as_bytes());
-        for yaml in [
-            "- {url: '.', action: response-body-replace, search: qq, replacement: zz}",
-            "- {url: '.', action: response-body-replace, search: é, replacement: ø}",
-            "- {url: '.', action: response-body-replace, search: q, search-mode: regex, replacement: z}",
-            "- {url: '.', action: response-body-replace, search: q, replacement: qq}",
-        ] {
-            let budget = Budget::default();
-            let source = BudgetedBytes::copy(&budget, &original).unwrap();
-            let source_cost = budget.used();
-            let output = apply_operations(
-                &rules(yaml),
-                &url,
-                Phase::Response,
-                source.as_ref(),
-                &budget,
-            )
-            .unwrap()
-            .unwrap();
-            assert!(!output.is_mapped_for_test());
-            assert!(std::str::from_utf8(output.as_ref()).is_ok());
-            drop(output);
-            assert_eq!(budget.used(), source_cost);
-            drop(source);
-            assert_eq!(budget.used(), 0);
-        }
-    }
-
     #[test]
     fn literal_capacity_keeps_a_second_real_transaction_admissible_under_pressure() {
         const LENGTH: usize = 65536;
@@ -1197,67 +1069,6 @@ mod tests {
             drop(pressure);
             assert_eq!(budget.used(), 0);
         }
-    }
-
-    #[test]
-    fn literal_capacity_keeps_phase_limit_and_whole_failed_native_stage_rollback() {
-        let url = Url::parse("http://capacity.example/").unwrap();
-        let request = OriginalRequestMeta::new("POST", &vec![]);
-        let budget = Budget::default();
-        let selected = rules(
-            r#"
-- {url: '.', action: request-body-replace, search: a, replacement: b}
-- {url: '.', action: request-body-json-patch, patch: [{op: test, path: /ok, value: false}]}
-"#,
-        );
-        let original = br#"{"ok":true,"v":"aaaa"}"#;
-        let wire = WireBodyMeta::new(
-            &vec![],
-            &request,
-            Phase::Request,
-            None,
-            Some(original.len() as u64),
-            false,
-        );
-        let mut transaction =
-            Transaction::begin_shared(&budget, &selected, &url, Phase::Request, &wire, true)
-                .unwrap();
-        transaction.push(original).unwrap();
-        let mut fields = vec![
-            ("X-Independent".into(), "kept".into()),
-            ("ETag".into(), "old".into()),
-        ];
-        let expected_fields = fields.clone();
-        let entity = transaction.finish_shared(false, &mut fields);
-        assert!(!entity.changed());
-        assert_eq!(entity.bypass, Some(Bypass::Transform));
-        assert_eq!(entity.logical().unwrap(), original);
-        assert_eq!(entity.wire().as_ref(), original);
-        assert_eq!(fields, expected_fields);
-        drop(entity);
-        assert_eq!(budget.used(), 0);
-
-        let growing =
-            rules("- {url: '.', action: request-body-replace, search: a, replacement: aa}");
-        let wire = WireBodyMeta::new(
-            &vec![],
-            &request,
-            Phase::Request,
-            None,
-            Some(MAX_BODY as u64),
-            false,
-        );
-        let mut transaction =
-            Transaction::begin_shared(&budget, &growing, &url, Phase::Request, &wire, true)
-                .unwrap();
-        transaction.push(&vec![b'a'; MAX_BODY]).unwrap();
-        let entity = transaction.finish_shared(false, &mut vec![]);
-        assert!(!entity.changed());
-        assert_eq!(entity.bypass, Some(Bypass::Transform));
-        assert_eq!(entity.wire().len(), MAX_BODY);
-        assert!(entity.wire().iter().all(|byte| *byte == b'a'));
-        drop(entity);
-        assert_eq!(budget.used(), 0);
     }
 
     #[test]

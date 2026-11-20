@@ -1131,13 +1131,9 @@ async fn cancelled_uni_credit_wait_does_not_replay_or_close_sibling_tcp() {
 #[cfg(all(feature = "tun", target_os = "macos"))]
 #[tokio::test]
 async fn tun_tuic_reply_progresses_while_same_association_uni_send_waits_for_credit() {
-    tun_tuic_duplex_case(false).await;
-}
-
-#[cfg(all(feature = "tun", target_os = "macos"))]
-#[tokio::test]
-async fn tun_tuic_tracked_reply_progresses_while_same_association_uni_send_waits_for_credit() {
-    tun_tuic_duplex_case(true).await;
+    for tracked in [false, true] {
+        tun_tuic_duplex_case(tracked).await;
+    }
 }
 
 #[cfg(all(feature = "tun", target_os = "macos"))]

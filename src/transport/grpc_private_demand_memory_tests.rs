@@ -148,10 +148,7 @@ async fn exercise_full_accept_idle(buffered_prefix: bool) {
 
 #[tokio::test]
 async fn private_h2mux_full_write_leaves_no_idle_unaccepted_credit() {
-    exercise_full_accept_idle(false).await;
-}
-
-#[tokio::test]
-async fn private_h2mux_full_write_after_buffered_data_leaves_no_idle_credit() {
-    exercise_full_accept_idle(true).await;
+    for buffered_prefix in [false, true] {
+        exercise_full_accept_idle(buffered_prefix).await;
+    }
 }

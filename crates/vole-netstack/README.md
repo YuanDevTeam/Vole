@@ -58,14 +58,10 @@ fragment or IPv6 extension-header validation. Encoding emits checksums, reuses
 the caller's `Vec`, and leaves it unchanged on address-family or MTU errors.
 UDP mistakenly sent into the TCP-only driver is ignored.
 
-The default-off `diagnostics` feature adds `NetStack::start_tcp_observed` with
-a synchronous, nonblocking, nonpanicking `fn(DriverObservation)` callback.
-It reports completed drive passes, entry visits, application bytes moved in
-each direction and selected ingress/notify/timer wake sources. No-data passes
-may still advance protocol state; wake counts are not wait durations. Ordinary
-constructors install no callback, though enabling the feature still computes
-local observations. Feature-off builds exclude the instrumentation. The callback
-carries no packet content, adds no queue or runtime owner and leaves stop unchanged.
+The optional `diagnostics` feature exposes `NetStack::start_tcp_observed`.
+Its synchronous, nonblocking, nonpanicking callback reports completed drive passes,
+entries visited, bytes moved, and ingress, notification, or timer wake counts.
+Observations contain counters and wake sources only and use the existing stop barrier.
 
 ## Generic TCP and UDP API
 

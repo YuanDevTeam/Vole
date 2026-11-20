@@ -71,17 +71,12 @@ SOCKS5 CONNECT、普通 HTTP、HTTP CONNECT 和 TUN TCP 共用主配置的 sniff
 
 HTTP/1.0 和 HTTP/1.1 使用绝对 `http://host[:port]/path?query` URI。每个请求重新
 确定目标和选路，转发为 origin-form 并重建 Host；默认每请求建立上游。
-客户端可以 Keep-Alive 或顺序预发送；固定缓冲保存预读，只有上传完成且响应有明确
-边界才处理下一请求。不会把旧目标连接用于下一请求。
+客户端可 Keep-Alive 或顺序预发送，固定缓冲保存预读。只有上传完成且响应边界明确才继续处理。启用 HTTP 处理时，符合[复用条件](http-processing.md#业务上游复用)的请求可使用同一上游。
 
 - Content-Length 精确转发；没有正文长度的普通请求视为空正文。
 - chunked 按块解码并重编码；合法扩展不透传，合法 trailer 保留。
 - HEAD/1xx/204/304 无正文；1xx/204 携带正文定界字段失败关闭，HEAD/304 可保留表示长度。
-- 转发 100 Continue 等临时响应；上传和响应读取并行。固定原始定界与固定输出定界、
-  未替换来源的正文，只有真实原始读取和全部正文写入完成、进入末次 flush 后，才允许在
-  最终响应优先返回时非阻塞补 poll 同一上传 Future 一次。只有实际 Ready(Ok) 才算上传完成；
-  Pending、错误或真正提前的最终响应仍终止上传、转发响应并关闭，不把余下正文误作新请求。
-  该本地证据不由 200、输出长度或原始来源已读完单独替代，也不授权路由缓存资格。
+- 转发 100 Continue 等临时响应，上传和响应读取并行。最终响应到达后，只有真实正文写入和 flush 完成才算上传完整；其余交换转发响应后关闭连接。
 - 无长度响应由 EOF 定界并关闭；HTTP/1.0 客户端接收 chunked 响应时去块后关闭。
 - 重复 Content-Length、CL/TE 并存、歧义长度、非法控制字符/分块、截断或超限均失败关闭。
   认证、内部诊断、Connection 指名及逐跳字段不泄漏给目标；trailer 不能携带认证、
@@ -135,15 +130,3 @@ wire 最大 65,507 字节，额外 sentinel 识别截断，自有 UDP socket 请
 TUN 使用独立 MTU；SOCKS5 数据不计入 Controller 的 TUN 流量。
 
 [验收边界](acceptance.md)区分容器双栈与真实 LAN/物理 IPv6，不能相互替代。
-
-
-显式启用独立 HTTP 配置时，mixed SOCKS5/HTTP/CONNECT 与 TUN 共用[URL rewrite](http-processing.md)和同代 Dispatcher。规则先确定最终 URL，再选路；本地动作不连接旧目标。请求正文与 Upgrade 继续复用本文件的流式 framing／relay；入口认证和用户名语义保持。
-
-HTTP 处理路径可为同一下游保留一条明文 H1 上游，仅用于静态内置 DIRECT、持久连接的
-HTTP/1.1 空 GET。每次请求仍重新选路和解析最终目标；只有 authority、实际出站、规则、
-DNS/端点、入口身份和资源代际一致时才使用旧连接。protect、接口/源地址绑定、MPTCP、
-不确定物理路径或请求正文转换保持每请求建链；不按名为 DIRECT 推定资格。
-原站 wire 响应必须有明确长度且完整消费，不能用改写后的长度证明消费。
-close、HTTP/1.0、分块/trailer、EOF 定界、Content-Range、Upgrade、本地响应和解析/传输错误
-均退役；TLS 不使用此复用。连接不跨下游共享，发送后失败不重放，取消和 Stop 释放实际
-双向流、读缓冲及固定资源代际。

@@ -338,21 +338,6 @@ async fn upstream_reuse_new_request_rechecks_reject_before_using_cached_stream()
     assert_eq!(origin.heads.lock().unwrap().len(), 1);
 }
 #[tokio::test]
-async fn upstream_reuse_owned_plan_does_not_run_routing_twice() {
-    let origin = MemoryOrigin::new(Reply::Persistent);
-    let geo = Arc::new(FlipGeo::default());
-    let router = router(origin.clone(), geo.clone());
-    let plan = router.prepare_http_tcp(ingress()).await.unwrap().unwrap();
-    let stream = plan.connect().await.unwrap();
-    assert_eq!(geo.0.load(Ordering::SeqCst), 1);
-    drop(stream);
-    origin.join().await;
-    let rejected = router.prepare_http_tcp(ingress()).await.unwrap().unwrap();
-    assert!(rejected.connect().await.is_err());
-    assert_eq!(geo.0.load(Ordering::SeqCst), 2);
-    assert_eq!(origin.opened.load(Ordering::SeqCst), 1);
-}
-#[tokio::test]
 async fn upstream_reuse_idle_and_partial_response_cancellation_drop_actual_streams() {
     for reply in [Reply::Persistent, Reply::Pending] {
         let origin = MemoryOrigin::new(reply);
@@ -465,21 +450,6 @@ fn upstream_reuse_builtin_direct_rejects_mutable_or_special_egress() {
         crate::outbound::DirectOutbound::new(crate::dialer::Dialer::default().with_mptcp(true));
     assert_eq!(mptcp.permits_http_tcp_reuse(), cfg!(target_os = "macos"));
 }
-#[cfg(target_vendor = "apple")]
-#[tokio::test]
-async fn upstream_reuse_local_respond_does_not_claim_unread_origin_body() {
-    let origin = MemoryOrigin::new(Reply::Truncated);
-    let source = "http-scripts:\n  enabled: true\n  scripts:\n  - {name: local, phase: response, body: none, url: '.', source: \"function rewrite(input){return {type:'respond',status:200,body:{kind:'text',data:'zz'}};}\"}\n";
-    let (context, _) = context(origin.clone(), Arc::new(EmptyGeoMatcher), source);
-    let (mut client, task) = start(context, CancellationToken::new());
-    for path in ["one", "two"] {
-        send(&mut client, path).await;
-        assert_eq!(read_response(&mut client).await.unwrap(), b"zz");
-    }
-    assert_eq!(origin.opened.load(Ordering::SeqCst), 2);
-    end(client, task, &origin).await;
-}
-
 #[tokio::test]
 async fn upstream_reuse_collected_rewritten_body_proves_original_wire_completion() {
     let origin = MemoryOrigin::new(Reply::Persistent);

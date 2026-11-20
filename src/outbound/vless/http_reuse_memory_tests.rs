@@ -310,10 +310,6 @@ fn with_owned_encryption(mut raw: Value, appearance: &str, rtt: &str) -> Value {
     raw
 }
 
-fn native_xor_encryption_cases() -> Vec<Value> {
-    encryption_cases(&["native", "xorpub"])
-}
-
 fn encryption_cases(appearances: &[&str]) -> Vec<Value> {
     let mut cases = Vec::new();
     for appearance in appearances {
@@ -338,46 +334,17 @@ fn static_vless_rejects_dynamic_ech_without_static_identity() {
 }
 
 #[test]
-fn static_encrypted_vless_native_xor_actual_clients_qualify_without_io() {
-    for raw in native_xor_encryption_cases() {
+fn static_encrypted_vless_actual_clients_qualify_without_io() {
+    for raw in encryption_cases(&["native", "xorpub", "random"]) {
         let outbound = node(raw, path(Dialer::default()));
-        let actual_client = outbound.encryption.is_some();
-        let tasks = outbound.tasks.len();
-        let direct = capable(&outbound);
-        let dispatcher = Dispatcher::permits_http_tcp_reuse(&outbound);
-        drop(outbound);
-        // The actual constructed Client qualifies without opening any stream.
-        assert!(actual_client);
-        assert_eq!(tasks, 0);
-        assert!(direct && dispatcher);
-    }
-}
-
-#[test]
-fn static_encrypted_vless_random_actual_clients_qualify_without_io() {
-    for rtt in ["1rtt", "0rtt"] {
-        for enabled_vision in [false, true] {
-            let mut raw = base();
-            if enabled_vision {
-                raw["flow"] = json!("xtls-rprx-vision");
-            }
-            let outbound = node(
-                with_owned_encryption(raw, "random", rtt),
-                path(Dialer::default()),
-            );
-            let actual_client = outbound.encryption.is_some();
-            let permitted = capable(&outbound);
-            let dispatcher = Dispatcher::permits_http_tcp_reuse(&outbound);
-            let actual_client_proof = outbound
-                .encryption
-                .as_ref()
-                .is_some_and(|client| client.permits_http_tcp_reuse());
-            let tasks = outbound.tasks.len();
-            drop(outbound);
-            assert!(actual_client);
-            assert_eq!(tasks, 0);
-            assert!(permitted && dispatcher && actual_client_proof);
-        }
+        let client = outbound
+            .encryption
+            .as_ref()
+            .expect("actual encryption client");
+        assert!(client.permits_http_tcp_reuse());
+        assert!(capable(&outbound));
+        assert!(Dispatcher::permits_http_tcp_reuse(&outbound));
+        assert_eq!(outbound.tasks.len(), 0);
     }
 }
 
@@ -501,87 +468,38 @@ fn static_encrypted_vless_checks_each_download_path_and_owner() {
             let mut raw = with_owned_encryption(xhttp(false, "h2", "packet-up"), appearance, rtt);
             raw["xhttp-opts"]["download-settings"] = json!({});
             let selected = config(raw.clone());
-            let make = || {
-                VlessOutbound::new_with_paths(
-                    &selected,
-                    path(Dialer::default()),
-                    Some(path(Dialer::default())),
-                )
-                .unwrap()
+            let direct = || path(Dialer::default());
+            let make = |selected: &VlessOutboundConfig, download: UpstreamPath| {
+                VlessOutbound::new_with_paths(selected, direct(), Some(download)).unwrap()
             };
-            let upload_stopped = make();
-            let carrier_before = (
-                upload_stopped
-                    .xhttp
-                    .as_ref()
-                    .unwrap()
-                    .uses_active_h2_reuse(),
-                upload_stopped
-                    .download
-                    .as_ref()
-                    .unwrap()
-                    .xhttp
-                    .uses_active_h2_reuse(),
-            );
-            let upload_before = capable(&upload_stopped);
-            let carrier_after = (
-                upload_stopped
-                    .xhttp
-                    .as_ref()
-                    .unwrap()
-                    .uses_active_h2_reuse(),
-                upload_stopped
-                    .download
-                    .as_ref()
-                    .unwrap()
-                    .xhttp
-                    .uses_active_h2_reuse(),
-            );
-            upload_stopped.xhttp.as_ref().unwrap().begin_stop();
-            let upload_after = capable(&upload_stopped);
-            drop(upload_stopped);
-            let download_stopped = make();
-            let download_before = capable(&download_stopped);
-            download_stopped
-                .download
-                .as_ref()
-                .unwrap()
-                .xhttp
-                .begin_stop();
-            let download_after = capable(&download_stopped);
-            drop(download_stopped);
-            let unknown_download = VlessOutbound::new_with_paths(
-                &selected,
-                path(Dialer::default()),
-                Some(UpstreamPath::proxy(Arc::new(Unknown))),
-            )
-            .unwrap();
-            let unknown_permitted = capable(&unknown_download);
-            drop(unknown_download);
+            for stop_download in [false, true] {
+                let outbound = make(&selected, direct());
+                let upload = outbound.xhttp.as_ref().unwrap();
+                let download = &outbound.download.as_ref().unwrap().xhttp;
+                let private_pool = || {
+                    (
+                        upload.uses_active_h2_reuse(),
+                        download.uses_active_h2_reuse(),
+                    )
+                };
+                let before = private_pool();
+                assert!(capable(&outbound));
+                assert_eq!(private_pool(), before);
+                if stop_download {
+                    download.begin_stop();
+                } else {
+                    upload.begin_stop();
+                }
+                assert!(!capable(&outbound));
+            }
+            let unknown = make(&selected, UpstreamPath::proxy(Arc::new(Unknown)));
+            assert!(!capable(&unknown));
             let mut dynamic_upload = raw.clone();
             dynamic_upload["ech-opts"] = json!({"enable":true});
-            let dynamic_upload = VlessOutbound::new_with_paths(
-                &config(dynamic_upload),
-                path(Dialer::default()),
-                Some(path(Dialer::default())),
-            )
-            .unwrap();
-            let dynamic_upload_permitted = capable(&dynamic_upload);
-            drop(dynamic_upload);
-            let mut dynamic = raw;
-            dynamic["xhttp-opts"]["download-settings"] = json!({"ech-opts":{"enable":true}});
-            let dynamic = VlessOutbound::new_with_paths(
-                &config(dynamic),
-                path(Dialer::default()),
-                Some(path(Dialer::default())),
-            )
-            .unwrap();
-            let dynamic_permitted = capable(&dynamic);
-            drop(dynamic);
-            assert_eq!(carrier_after, carrier_before);
-            assert!(upload_before && download_before);
-            assert!(!upload_after && !download_after);
-            assert!(!unknown_permitted && !dynamic_upload_permitted && !dynamic_permitted);
+            raw["xhttp-opts"]["download-settings"] = json!({"ech-opts":{"enable":true}});
+            for dynamic in [dynamic_upload, raw] {
+                assert!(!capable(&make(&config(dynamic), direct())));
+            }
         }
     }
 }

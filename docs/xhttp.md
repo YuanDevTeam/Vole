@@ -51,9 +51,11 @@ packet-up 在发送间隔内聚合小块写入，而不是把每个 write 变成
 
 批次缓冲按需扩容，分配容量也受该批次上限约束，避免不规则帧尺寸使倍增扩容超过预算；writer 不预分配完整批次。普通路径在 POST 确认后复用已独占的正文 backing；HTTP 尚持有引用时释放本地引用，不为回收再复制正文。每个 writer 至多保留这一批缓冲，逻辑连接关闭时释放。H3 的批次 backing 上限不等于进程 RSS 增量；HTTP/QUIC 编码及发送窗口可能同时持有其它有界数据。
 
-h2mux 专用客户端接收端向每条流提供 128 KiB、向物理连接提供 1 MiB 初始信用，帧上限 16 KiB。实际使用共享 H3 PacketUp 载体的 h2mux 连接获得 1.5 MiB 初始信用，每流仍为 128 KiB。业务 HTTP/2 和通用 gRPC 保持独立窗口。连接信用由多个消费者共享。各流持有 128 KiB 未归还 DATA 时，八条流可用尽 1 MiB，十二条流可用尽 1.5 MiB。窗口值初始化信用状态，正文帧按实际到达接收，不预分配等量缓冲。该界限只约束尚未归还的原始 DATA，不包含已复制或已归还信用后仍保留的字节、TLS 等缓冲，不能代替进程 footprint 验收；多个物理连接各持有自己的信用。
+h2mux 接收信用为每流 128 KiB、每连接 1 MiB，帧上限 16 KiB。共享 H3 PacketUp 载体的连接信用为 1.5 MiB。连接信用由多个流共享，按实际消耗归还。业务 HTTP/2 和普通 gRPC 使用各自的窗口。
 
-VLESS 无 Encryption、无显式下载设置，且启用无 padding 的 h2mux 或 yamux、only-tcp=false 时，H3 packet-up 的 body/auto 上传串行发送正文，最多保留两个尚未退役的响应槽。正文仍只有一个不超过 128 KiB 的工作区：真实发送 FIN 完成且最后一个正文引用释放后，独占归还同一 Vec，才允许复用。每批增加一个有界 owner 元数据对象，不复制正文；两个响应槽满时连第三批预填也暂停。 同一 qualified H3 physical 的 h2mux 初始发送留存仍为 64 KiB；只有一次业务 mux UDP 请求的元数据成功写入并 flush 后，才同步升至 256 KiB 直到退役（不是 peer 确认）。同 physical 的 TCP 与 UDP 共享该升档，未见 UDP 的其它 h2mux physical 仍为 64 KiB。上述限定 Yamux 路径独立采用固定 128 KiB 初始发送留存，没有 UDP 升档 control，不能动态升至 256 KiB；其逻辑 flush 仅检查命令通道容量，不能替代真实底层 IO flush。固定预算由 VLESS factory 在发布前设置；预算资格改变的 clone 使用新的私有池，避免继承另一预算的旧 physical，原活动租约仍由原 owner 收尾。其它 transport 及排除路径保持 64 KiB；原池策略、连接/租约数、队列、计时、flush、FIN 和 Stop 不变。200 响应及不超过 16 KiB 的响应体读取成功，才按序确认连续前缀；后到先完成的响应仍占槽，flush 不跨过缺口。等待打开请求、发送、FIN 和缓冲归还时共同推进已有响应；错误取消未完成上传，Stop 沿用节点的取消与 join。其它路径保持单响应背压。
+无 Encryption、无显式下载、无 padding 且 `only-tcp: false` 的 VLESS h2mux／yamux，H3 PacketUp 的 body/auto 上传可持有两个有序响应槽。仅使用一个最多 128 KiB 的正文工作区，真实发送 FIN 和最后正文引用释放后才复用。两个槽满时暂停，按顺序收到 200 及读完最多 16 KiB 的响应体后确认连续前缀。错误取消未完成的上传，Stop 等待所有者退出。
+
+合格 h2mux 的发送留存从 64 KiB 起，在同一物理连接成功写入并 flush 首个 mux UDP 请求的元数据后升至 256 KiB。合格 yamux 固定为 128 KiB。预算资格在工厂发布前固定，不同资格使用独立池。
 
 合格 Smux v1（同样无 Encryption、无显式下载、enabled、无 padding、only-tcp=false）
 只共享上述 H3 packet-up body/auto 双响应 geometry：唯一 128 KiB 正文、两个有序响应槽，
@@ -158,19 +160,12 @@ Inner 记录。它的字节单独可见，不重复计入业务 uploadTotal/down
 期限结束前未建立的流关闭 IO 与租约；迟到状态不能复活。解除期限后仍完整校验状态，
 拒绝、非法状态或截断照常失败；不改变单流关闭、兄弟流与节点 Stop 的所有权。
 
-合格 VLESS H3 packet-up body/auto（无 Encryption、无显式下载、enabled Smux、
-无 padding、only-tcp=false）的已排队显式 flush 票据可合并到同一次真实底层 flush。
-仍只消费既有队列，受每批 16 命令、64 KiB、I/O 轮次及 FIN/control 优先边界约束；
-不等待新命令、不加入定时器或正文队列，也不在 flush Pending 期间插入写入。
-所有票据均等待同一次真实 flush 成功；首 UDP、SYN、FIN、取消和 Stop 保持强屏障。
-其它路径保持原来的显式票据批次边界。
+合格的 VLESS H3 PacketUp body/auto Smux 可将已排队的显式 flush 票据合并到同一次底层 flush。每批受 16 个命令和 64 KiB 双重上限约束，保留 FIN 和控制命令的优先级。各票据在底层完成后确认。
 
-smux v1 单流 shutdown 先等待已接受帧写入并 flush，再安排 FIN 并结束整条逻辑流。
-smux 的物理读写循环都遵守每轮 I/O 处理预算，主动让出调度。接收帧共用每连接 4 MiB 的分配预算，逐帧计入负载与管理费用，整帧释放后归还；有界单流队列的槽数由总预算推导，避免在总预算尚有余量时阻塞兄弟流。本地关闭立即释放排队数据，远端 FIN 仍在已收 DATA 排空后返回 EOF；写队列、flush 和帧顺序保持。
-VLESS XHTTP、无 VLESS Encryption 且未启用 sing-mux padding 时，smux DATA 帧的完成仅表示
-帧已完整进入自主驱动的底层 IO，不逐帧等待 POST 确认。显式 flush 仍通过同一有界命令队列
-等待真实底层 flush，shutdown 与 FIN 的顺序不变；其它路径保持逐批强 flush。
-该路径的 UDP 首帧保留原期限内的 setup flush，后续完整帧由 XHTTP 自有任务推进。
+Smux v1 的单流 shutdown 先写入并 flush 已接受帧，再安排 FIN 并结束逻辑流。各物理连接的接收帧共用 4 MiB 分配预算，计入负载和管理费用。释放整帧即归还预算，本地关闭立即释放排队数据，远端 FIN 在已收 DATA 排空后返回 EOF。读写调度分轮处理，队列容量受同一预算约束。
+
+无 Encryption 和 sing-mux padding 的 VLESS XHTTP Smux DATA 在完整交给自主驱动的底层 I/O 后返回。显式 flush 等待实际底层 flush，首 UDP 帧在建链期限内完成 setup flush，后续完整帧由 XHTTP 任务推进。
+
 最多仍保留一个待写 UDP 帧；取消后的偏移、首帧期限和 Stop 屏障保持。
 VLESS 的 PacketUp XHTTP、无 VLESS Encryption 且无 sing-mux padding 时，h2mux
 普通 DATA 先申请既有 h2 容量，实际移交 Connection 驱动后返回；不逐帧等待 POST 确认。
@@ -180,16 +175,7 @@ oneshot，也不增加 payload 队列。显式 flush、元数据与首 UDP 帧�
 该私有路径在底层实际写出字节、但强 flush 尚待完成时，主动再调度一次已有的 H2 驱动，
 使已排队 DATA 继续填充同一有界 PacketUp 批次。没有新写入进度便不重复唤醒，
 也不提前完成 flush 确认；显式 flush、FIN 与 Stop 仍遵守原屏障。
-私有 h2mux 在 codec 已排空而底层 flush 尚待完成时，冻结当时的确认水位；
-下一次底层写入前先尝试完成旧批次，避免已确认的旧元数据被新兄弟 DATA 延后。
-旧批次只确认被冻结的 ticket，新编码但尚未写出的 DATA 仍等待自己的真实 flush。
-至多保留当前与一个冻结批次的确认元数据，不新增正文队列。首次冻结后观察额外
-128 KiB 的实际底层写入；额度耗尽时，只有 frozen／current 中的 Strong 收据或已请求的显式
-coalesced flush 标记才暂停后续写入，等待底层 flush 的真实唤醒。普通 DATA 没有此类请求时
-继续受原 PacketUp 缓冲／响应槽背压。标记只在真实 `poll_flushed` Pending 时设置，Ready／error
-观察或失败时清除；旧 ticket 完成不清新请求，迟到请求在下一次写入重新检查。取消但未再次
-观察结果的请求可保守保留标记，不冒充活跃 Future 数。计数饱和，未增加正文内存、任务或定时器；
-部分 H2 帧保持原顺序，未写出的后缀不能提前确认。
+私有 h2mux 在 codec 排空且底层 flush 挂起时保留当时的确认水位。旧前缀确认与后续 DATA 分别等待各自的实际 flush。有显式或强确认等待时，额外实际写入达到 128 KiB 后暂停，直到底层通知可推进。
 h2mux 和 yamux 关闭上传后保留读取与租约，允许对端继续发送尾部；h2mux 的上传
 数据须到达上游 IO 的 flush 边界再发送 END_STREAM。节点 Stop 或 Drop 可取消待写，
 不承诺异常终止交付。
@@ -222,6 +208,6 @@ H3 的 QUIC 驱动、数据报适配器和后台任务归节点所有。物理�
 不构成远端 ACK 屏障。未完成的上传取消会 reset 当前请求，已提交 FIN 的发送不因此 reset，
 兄弟流继续。shutdown 返回不代表物理驱动已退出；Stop 返回以任务回收为准，不把 Drop 或等待时间当作完成证明。
 
-H1/H2 原生验证优先使用官方 latest Mihomo；H3 使用官方 latest Xray。不被 Xray 直接解码的 packetaddr/sing-mux 使用明确标注的 Xray XHTTP → Mihomo VLESS 分层拓扑；mTLS 使用已批准的 xcaddy/Caddy H3 网关，后端仍是同一个 Xray handler。分层成功不改写直接对端失败。所有服务端与原站在隔离容器中，配置和私钥不入 Git；原生数据、公共入口、资源、跨平台构建和阶段签收分别记录。
+对端、拓扑和平台证据见[测试隔离](testing-isolation.md)及[验收边界](acceptance.md)。
 
 业务 HTTP 保留同一已建逻辑 TCP 流与本章的 XHTTP 物理 transport 池不同。静态业务资格检查真实上传及下载每一腿的版本、security、path 和 owner 取消；H3 不能借用父 connector 的 TCP 证明。业务 HTTP 资格与物理 transport 池分别判断，不能由业务资格替代 packet-up／stream-up／stream-one 的原条件。macOS 的 `mptcp: true` 普通 TCP 标记例外也适用于私有 active-H2-pair 的每腿静态路径证明；其余资格、池及额度不变。逻辑流的发送／关闭合同和显式 reuse-settings 保持。

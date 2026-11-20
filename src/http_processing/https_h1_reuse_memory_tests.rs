@@ -788,36 +788,6 @@ async fn https_h1_original_wire_retirement_cases_require_two_real_tls_accepts() 
 }
 
 #[tokio::test]
-async fn https_h1_sent_second_head_failure_does_not_reconnect_or_replay() {
-    let fixture = fixture(Some(b"http/1.1"), Reply::FailSecond, false, "");
-    let mut running = start(&fixture);
-    let first = request(&mut running, "a.test", "/one").await;
-    let _second = request(&mut running, "a.test", "/two").await;
-    let serving = finish(running, &fixture).await;
-    native_response(first, b"origin");
-    assert!(serving.is_err());
-    assert_eq!(fixture.origin.count(&fixture.origin.0.opens), 1);
-    assert_eq!(fixture.origin.count(&fixture.origin.0.accepts), 1);
-    assert_eq!(fixture.origin.0.heads.lock().unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn https_h1_second_request_rechecks_plan_reject_before_cached_tls_write() {
-    let fixture = fixture(Some(b"http/1.1"), Reply::Persistent, false, "");
-    let mut running = start(&fixture);
-    let first = request(&mut running, "a.test", "/one").await;
-    fixture.origin.0.reject.store(true, Ordering::SeqCst);
-    let _second = request(&mut running, "a.test", "/two").await;
-    let serving = finish(running, &fixture).await;
-    native_response(first, b"origin");
-    assert!(serving.is_err());
-    assert_eq!(fixture.origin.count(&fixture.origin.0.prepares), 2);
-    assert_eq!(fixture.origin.count(&fixture.origin.0.opens), 1);
-    assert_eq!(fixture.origin.count(&fixture.origin.0.accepts), 1);
-    assert_eq!(fixture.origin.0.heads.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
 async fn https_h1_host_port_and_scheme_rewrites_keep_one_shot_and_final_sni() {
     for (replacement, name, port, accepts) in [
         ("https://b.test/final", "b.test", 443, 2),

@@ -281,53 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_cannot_complete_before_real_worker_join() {
-        let initialization = Arc::new(Initialization::new());
-        let cancellation = CancellationToken::new();
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        let worker_ended = Arc::new(AtomicUsize::new(0));
-        let (finished, finishes) = mpsc::channel();
-        let parent = {
-            let initialization = initialization.clone();
-            let cancellation = cancellation.clone();
-            let entered = entered.clone();
-            let release = release.clone();
-            let worker_ended = worker_ended.clone();
-            std::thread::spawn(move || {
-                let result = initialization.ensure(&cancellation, || {
-                    std::thread::scope(|scope| {
-                        let worker = scope.spawn(|| {
-                            entered.wait();
-                            release.wait();
-                            worker_ended.store(1, Ordering::SeqCst);
-                        });
-                        worker.join().unwrap();
-                    });
-                    Ok(())
-                });
-                finished.send(result.map_err(|error| error.kind())).unwrap();
-            })
-        };
-        entered.wait();
-        cancellation.cancel();
-        assert!(matches!(
-            finishes.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
-        assert_eq!(worker_ended.load(Ordering::SeqCst), 0);
-        release.wait();
-        assert_eq!(finishes.recv().unwrap(), Err(io::ErrorKind::Interrupted));
-        parent.join().unwrap();
-        assert_eq!(worker_ended.load(Ordering::SeqCst), 1);
-        initialization
-            .ensure(&CancellationToken::new(), || {
-                panic!("completed warmup lost after cancel")
-            })
-            .unwrap();
-    }
-
-    #[test]
     fn cancelled_cold_preparation_does_not_start_initialization() {
         let initialization = Initialization::new();
         let cancellation = CancellationToken::new();

@@ -119,35 +119,17 @@ stopped -> preparing -> prepared -> starting -> running
 
 ### `getHttpDiagnostics`（仅 `http-diagnostics` 构建）
 
-非默认 Cargo feature `http-diagnostics` 与 `invoke` 同时启用时，提供这个本地运行时级只读方法：
+同时启用 `http-diagnostics` 与 `invoke` 时，可发送读请求：
 
 ```json
 {"method":"getHttpDiagnostics","payload":{}}
 ```
 
-必须省略 `instanceId`，payload 只接受空对象。成功响应的 `data` 基于
-`http_processing::diagnostics::snapshot()` 的现有快照，字段及限制见
-[HTTP 编译期诊断](http-processing.md#编译期诊断)。它不要求或执行 `initialize`，不创建实例、运行时、网络资源或 JS 执行环境，不清零计数器。
-
-未启用此 feature 的构建保持 `unknown method` 失败；不返回伪造的零值或能力状态。
-此方法沿用共享 Invoke 的 envelope、panic、运行时线程禁止重入和响应释放规则，不增加 C ABI 或 Controller endpoint。
-
-计数属于调用所在进程的整个寿命，包含该进程所有 HTTP 与已观测的 TUN 工作，并非 instance、资源代次或一次压测的隔离统计。
-Apple 构建另在返回对象附加固定 `runtimeThreadQoS`：按 engineOwner/tokioThreads 记录
-本Core新线程入口的请求、成功/失败、前后公共 getter 失败及 requested-class 计数。
-该观测只在 `http-diagnostics` 保留，默认线程策略不依赖诊断 feature；不修改原 HTTP counters。
-查询本身不对调用线程设置或查询 QoS，不保存线程 ID/名称；requested getter 不证明有效优先级、
-CPU 选择或频率，只有真实停止后的静止快照适合检查计数守恒。
-
-App 与 Network Extension 是不同进程：App 调用不能读取 NE 内的计数。宿主可在明确启用观测时取得前后快照并保存进程及窗口身份；活跃字段分别采样，累计字段可作差，peak/max 不能相减得到窗口峰值或分位数。生命周期守恒须在真实 Stop/join 后检查。
+省略 `instanceId`，使用空 payload。此调用直接读取 [进程级观测](http-processing.md#编译期诊断)，无需初始化。Apple 另提供本 Core 自有线程的 QoS 请求记录。累计量可比较同一进程的前后读数，峰值应按其实际覆盖范围解释。App 和 Network Extension 各自报告本进程。默认构建返回未知方法。
 
 ### `runHttpScriptPlanValidation`（仅 tvOS 诊断构建）
 
-同时启用 `http-diagnostics`、`inbound-http` 和 `invoke` 的 tvOS 构建提供主动、离线的有限脚本后端差分验证。必须省略 `instanceId`，payload 只接受空对象；默认构建和其他目标仍按未知方法失败。
-
-此方法仅接受尚未初始化或创建实例的独立进程，执行固定合成用例，不接受调用方源码或正文，不打开网络或 TUN。它比较真实 JavaScriptCore 与闭合 ASCII 静态计划的正文、元数据、错误、实际 tick／分配工作计数及预算释放；每次求值沿用 100 ms 限制；显式 JSC／Plan 参考线程等待实际 owner／TLS join，生产内联 Plan 等待同步操作实际返回或完成展开。直接适配器差分及所有权／事务检查先持有现有执行 lane，明确释放后，另用仅供此次诊断的单 worker Tokio runtime 调用真实 Message 管线，验证 Plan 成功改写及非 ASCII 输入的 JSC fallback 成功；它使用同一默认 lane，不启动 Core 实例、I/O driver、网络或 TUN。另有固定诊断私有 gate，使用同一 Plan BIP helper 验证真实运行任务的 abort、业务取消、panic 清理和普通 Runtime drop 屏障；所有 gate 沿原 100 ms 绝对期限自动解除，不给业务新增 hook。abort 不保证运行中的同步 poll 变为 Cancelled，检查以实际操作结束、正文/lane 未提前归还及最后 owner 退款为准。临时 runtime 实际退出并 join 后才汇总，不保留执行环境；正向检查不能把超时或跳过当成成功。结果明确包含用例范围、失败项和进程身份，不代表业务吞吐验收。
-
-开始验证后，即使失败或 panic，该进程也永久拒绝 `createInstance`，包括 foreground 路径；必须退出进程后才能运行实际业务或压力测试。该进程的诊断累计值包含验证工作，不能作为压力结果。此主动方法与只读 `getHttpDiagnostics` 分开。
+在同时启用 `http-diagnostics`、`inbound-http` 与 `invoke` 的 tvOS 构建中，尚未初始化或创建实例的独立进程可提交 `{"method":"runHttpScriptPlanValidation","payload":{}}`。省略 `instanceId`，使用空 payload。该调用离线运行固定合成用例，比较静态 Plan 与 JavaScriptCore 的事务结果、预算及取消后的释放。结果包含实际执行的范围、用例结果和进程身份。开始验证后，后续业务须使用新进程。默认构建和其他平台返回未知方法。
 
 ### `initialize`
 

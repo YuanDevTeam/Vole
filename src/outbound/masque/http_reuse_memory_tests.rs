@@ -55,21 +55,6 @@ fn modes() -> [MasqueNetwork; 3] {
 }
 
 #[test]
-fn masque_static_http_reuse_uses_real_factory_without_initializing_engine_or_dns() {
-    for network in modes() {
-        let config = config(network);
-        let outbound = node(&config, direct(Dialer::default()));
-        assert!(outbound.permits_http_tcp_reuse());
-        assert!(outbound.current.try_lock().unwrap().is_none());
-        assert!(outbound.remote.get().is_none());
-        outbound.begin_shutdown();
-        assert!(!outbound.permits_http_tcp_reuse());
-        assert!(outbound.current.try_lock().unwrap().is_none());
-        assert!(outbound.remote.get().is_none());
-    }
-}
-
-#[test]
 fn masque_static_http_reuse_keeps_parsed_identity_and_frozen_config() {
     for network in modes() {
         let mut config = config(network);
@@ -79,6 +64,8 @@ fn masque_static_http_reuse_keeps_parsed_identity_and_frozen_config() {
         let expected_prefixes = config.local_prefixes;
         let expected_skip = config.skip_cert_verify;
         let outbound = node(&config, direct(Dialer::default()));
+        assert!(outbound.current.try_lock().unwrap().is_none());
+        assert!(outbound.remote.get().is_none());
         config.private_key.clear();
         config.public_key.clear();
         config.uri = "https://changed.memory.invalid/path".into();
@@ -104,6 +91,10 @@ fn masque_static_http_reuse_keeps_parsed_identity_and_frozen_config() {
             )
             .is_err()
         );
+        outbound.begin_shutdown();
+        assert!(!outbound.permits_http_tcp_reuse());
+        assert!(outbound.current.try_lock().unwrap().is_none());
+        assert!(outbound.remote.get().is_none());
     }
 }
 
