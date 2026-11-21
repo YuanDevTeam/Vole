@@ -91,6 +91,15 @@ cargo test --locked --features invoke --lib platform::apple_runtime_qos::tests::
 
 这些 Apple 用例验证本进程的事务、JSC 和线程请求等级。HTTPS 客户端信任、物理设备包 I/O 与性能单独运行。[HTTP 处理](../docs/http-processing.md) · [诊断 Invoke](../docs/invoke-api.md#方法)
 
+跨平台用例共用 [HTTP JS 插件](fixtures/http-js-platform.yaml)。离线验收检查请求 bytes、响应 UTF-8、非法结果回退和本地响应。Linux 在容器中运行 V8 超时、恢复和离线用例：
+
+```sh
+cargo test --locked --profile ci-release --features invoke,http-js-v8 --lib v8_engine::tests:: -- --test-threads=1
+cargo test --locked --profile ci-release --features invoke,http-js-v8 --lib platform_fixture_rewrites_each_origin_through_test_http
+```
+
+[Android 测试宿主](android-http-js/README.md) 加载同一份插件，以 JavaScriptEngine 执行离线 Invoke 和模拟器 TUN 流量。明文 HTTP 和 HTTPS/H1、HTTPS/H2 使用独立容器原站，原站校验请求改写，客户端校验响应及实际 HTTP 版本。
+
 ## Windows原生检查
 
 内存 profile 的名称选择测试使用 Windows UWP feature：

@@ -36,6 +36,7 @@ impl CompiledScript {
         self.selector.matches(original.into())
     }
 
+    #[cfg(any(test, not(all(feature = "ffi", target_os = "android"))))]
     pub(super) fn needs_jsc_for_business(&self) -> bool {
         self.compiled.needs_jsc_for_business(self.body, self.phase)
     }
@@ -52,9 +53,8 @@ impl CompiledScript {
 #[cfg(all(test, feature = "inbound-http"))]
 mod tests {
     use super::*;
-    use crate::http_processing::config::{Document, HttpSettings, PolicyCandidate};
+    use crate::http_processing::config::{Document, PolicyCandidate};
     use std::io;
-    use tokio_util::sync::CancellationToken;
 
     const CLOSED: &str = "function rewrite(input){const text=input.body.data.replaceAll('a','b');return {type:'modify',body:{kind:'text',data:text}};}";
     const RESPONSE_GUARD: &str = "function rewrite(input){let found=false;for(let i=0;i<input.response.headers.length;i++){if(input.response.headers[i].name==='x-required'){found=true;}}if(!found){return {type:'pass'};}return {type:'modify',body:{kind:'text',data:input.body.data.replaceAll('a','b')}};}";
@@ -124,6 +124,9 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[test]
     fn only_active_scripts_can_initialize_the_platform() {
+        use crate::http_processing::config::HttpSettings;
+        use tokio_util::sync::CancellationToken;
+
         let count = super::super::scripts::platform_prepare_requests_for_test;
         let requested = count();
         let cancellation = CancellationToken::new();
@@ -154,9 +157,15 @@ mod tests {
         assert_eq!(count(), requested + 1);
     }
 
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(any(
+        target_vendor = "apple",
+        all(feature = "http-js-v8", any(target_os = "linux", windows))
+    )))]
     #[test]
     fn total_source_does_not_expand_platform_availability() {
+        use crate::http_processing::config::HttpSettings;
+        use tokio_util::sync::CancellationToken;
+
         let active = candidate(
             "http://example.test",
             &[(CLOSED, BodyMode::Text, Phase::Request)],

@@ -36,6 +36,11 @@ Android 优先使用 `ANDROID_NDK_HOME`，否则在 `ANDROID_HOME/ndk` 中选择
 `VOLE_ANDROID_NDK_VERSION` 可指定版本，`VOLE_ANDROID_API` 默认 24。
 `CARGO_TARGET_DIR` 按 Cargo 约定覆盖中间产物目录；其余本地覆盖见 `builds.py`。
 
+Linux CLI 和 FFI、Windows CLI 和 Wintun FFI 启用 Rust `http-js-v8`。构建使用 Rusty V8
+对应目标的官方库和生成绑定。离线构建可预先提供 `RUSTY_V8_ARCHIVE`、
+`RUSTY_V8_ARCHIVE_SHA256` 和 `RUSTY_V8_SRC_BINDING_PATH`。Windows UWP 构建
+使用动态 CRT，官方 V8 Windows 档案声明静态 CRT，标准 UWP 构建不启用该功能。
+
 所有编译入口自动准备官方 BLAKE3 1.8.7 C 静态库。依赖通过
 `native/blake3/vcpkg.json` 锁定正式 vcpkg registry/port，正常 bootstrap 和 install
 使用宿主网络及用户缓存；首次构建需要联网。默认缓存位于 macOS 的

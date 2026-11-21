@@ -292,9 +292,6 @@ fn start_vpn(payload: StartPayload) -> Result<Value, String> {
             ca = None;
         }
         candidate
-            .prepare_platform(&settings, &tokio_util::sync::CancellationToken::new())
-            .map_err(|_| "HTTP script preparation failed".to_owned())?;
-        candidate
             .bind_settings(&settings, ca.as_ref())
             .map_err(|_| "invalid HTTP settings or private CA".to_owned())?;
     }

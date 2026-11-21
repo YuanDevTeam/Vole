@@ -521,7 +521,11 @@ impl Exchange<'_> {
             let mut observe = |script: &CompiledScript, result, reason| {
                 script_events.push(self.script_event(script, result, reason));
             };
-            let outcome = match crate::http_processing::scripts::ensure_available() {
+            #[cfg(target_vendor = "apple")]
+            let available = crate::http_processing::scripts::ensure_available();
+            #[cfg(not(target_vendor = "apple"))]
+            let available = crate::http_processing::scripts::prepare_platform(&cancellation);
+            let outcome = match available {
                 Ok(()) => {
                     script_message::run_observed(
                         self.policy,
@@ -681,6 +685,58 @@ mod tests {
         )
         .unwrap()
         .0
+    }
+
+    #[cfg(any(
+        target_vendor = "apple",
+        all(feature = "http-js-v8", any(target_os = "linux", windows))
+    ))]
+    #[test]
+    fn platform_fixture_rewrites_each_origin_through_test_http() {
+        let yaml = include_str!("../../tests/fixtures/http-js-platform.yaml");
+        for origin in [
+            "http://js-rewrite.test:18080",
+            "https://js-rewrite.test:18443",
+            "https://js-rewrite.test:18444",
+        ] {
+            let result = run(json!({
+                "httpConfigYaml": yaml,
+                "httpContext": {"mitmEnabled":true},
+                "executeScripts": true,
+                "url": format!("{origin}/rewrite"),
+                "request": {
+                    "method": "POST",
+                    "headers": [["content-type", "application/octet-stream"]],
+                    "bodyBase64": STANDARD.encode("probe")
+                },
+                "response": {
+                    "status": 200,
+                    "headers": [["content-type", "text/plain; charset=utf-8"]],
+                    "bodyBase64": STANDARD.encode("origin:probe:js")
+                }
+            }));
+            assert!(result["terminal"].is_null(), "{result:#}");
+            let stages = &result["stages"];
+            assert_eq!(stages[0]["scripts"][0]["outcome"], "accepted", "{result:#}");
+            assert_eq!(stages[0]["bodyBase64"], STANDARD.encode("probe:js"));
+            assert_eq!(stages[1]["scripts"][0]["outcome"], "accepted", "{result:#}");
+            assert_eq!(
+                stages[1]["scripts"][1]["outcome"], "rolled-back",
+                "{result:#}"
+            );
+            assert_eq!(
+                stages[1]["bodyBase64"],
+                STANDARD.encode("origin:probe:js:改写")
+            );
+        }
+        let local = run(json!({
+            "httpConfigYaml": yaml,
+            "executeScripts": true,
+            "url": "http://js-rewrite.test:18080/local",
+            "request": {}
+        }));
+        assert_eq!(local["terminal"]["status"], 202, "{local:#}");
+        assert_eq!(local["terminal"]["bodyBase64"], STANDARD.encode("local-js"));
     }
 
     #[cfg(target_vendor = "apple")]

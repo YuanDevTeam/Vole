@@ -474,7 +474,7 @@ public final class NativeVole {
 }
 ```
 
-仅导出该命名空间下的三个 JNI 方法，不提供其它包名别名。宿主声明必须与原生库一致；
+该命名空间也是 Android 脚本沙箱接口使用的唯一命名空间。宿主声明必须与原生库一致；
 代码压缩和混淆必须保留该类、这些 native 方法以及 controller 的 `boolean protect(int)`
 方法名。`nativeInvoke` 的请求与响应均为标准 UTF-8 JSON `byte[]`，由 JVM 管理，
 不使用 C ABI 的 `VoleFree` 释放。
@@ -495,6 +495,20 @@ ProtectFd(fd) -> bool
 - 回调必须快速、同步、非阻塞，且不能重入 Invoke 或注册接口。
 - TUN 租约存活期间不能替换或注销 controller；`stop`/`destroyInstance` 是释放屏障。
 - Android binding 使用 UTF-8 `byte[]`，不依赖 Modified UTF-8。
+
+### Android 脚本沙箱
+
+启用 `inbound-http` 的 Android 原生库另提供以下 `NativeVole` 方法。宿主在执行脚本前注册独立的 JavaScript controller。注册不替代 protect 回调。
+
+```java
+public static native boolean nativeRegisterJsController(Object controller);
+public static native boolean nativeUnregisterJsController();
+public static native void nativeCompleteJs(long id, int status, byte[] metadata, byte[] body);
+```
+
+controller 提供 `int prepare()`、`boolean start(long id, byte[] script, byte[] input, int outputMax)`、`void cancel(long id)` 和 `void stop()`。混淆规则保留 JNI 类和 controller 方法名。controller 使用 AndroidX JavaScriptEngine 及设备 WebView 的隔离进程。Core 输出的受信任脚本包装器以 UTF-8 传递，正文由消息端口传输。宿主在 `prepare` 中检查沙箱、终止、堆上限、消息端口、Promise 返回和大脚本传输能力。没有注册或设备缺少能力时，激活的业务脚本准备失败。静态校验、禁用脚本和不匹配的目标无需启动沙箱。
+
+`prepare` 返回 0 表示就绪，1 表示缺少能力，其余表示后端故障。`start` 接收调用 ID 和输出正文上限，返回后异步用相同 ID 完成一次。完成状态 0 携带 JSON 元数据和正文，1 表示脚本失败，2 表示执行期限或 tick 用尽，其余表示后端故障。仍在执行的调用取消或过期时，`cancel` 关闭实际执行所用沙箱。`stop` 回收活动和空闲沙箱，仍可重新准备。宿主只在同步关闭之后释放相应资源。迟到的结果无法提交。
 
 ## Controller
 
@@ -644,7 +658,7 @@ Core 验证原文摘要、已有参数声明及权限范围。HTTPS 及脚本即
 
 ### `testHttp`
 
-运行时级离线演算，无需 `initialize` 或运行中的实例。执行使用提交的插件原文、非私密 `httpContext` 和显式样本，全程无网络、文件或 CA I/O。
+运行时级离线演算，无需 `initialize` 或运行中的实例。执行使用提交的插件原文、非私密 `httpContext` 和显式样本，无业务网络、配置文件或 CA I/O。
 
 ```json
 {
@@ -662,7 +676,7 @@ Core 验证原文摘要、已有参数声明及权限范围。HTTPS 及脚本即
 
 method 默认 GET，response.status 必填。headers 保留顺序与重复项。bodyBase64 表示原始编码实体，空字符串明确提供零字节实体，省略表示正文未知。没有样本时报告可能匹配的规则和 `sampleRequired`，由请求和响应样本提供头及状态条件。
 
-`executeScripts` 默认 false，使用样本演算原生动作，命中的脚本报告 `not-run`。显式传 true 时按已启用许可执行 Apple JS，命中脚本需提供 request，未终止且需要执行响应阶段时还需提供 response。响应 JS 可读取请求阶段提交后的当前视图。请求本地回包、重定向、拒绝或终止会跳过后续阶段。每个脚本结果报告规则位置、可用的 ID、执行、跳过或回退原因。终止、阶段超时和后端失败通过 `terminal` 报告。样本和 Base64 输出受共享正文预算约束，并行演算最多两个。静态 `validateConfig` 只校验脚本源码。
+`executeScripts` 默认 false，使用样本演算原生动作，命中的脚本报告 `not-run`。显式传 true 时按已启用许可使用本机脚本后端。命中脚本需提供 request，未终止且需要执行响应阶段时还需提供 response。响应 JS 可读取请求阶段提交后的当前视图。请求本地回包、重定向、拒绝或终止会跳过后续阶段。每个脚本结果报告规则位置、可用的 ID、执行、跳过或回退原因。终止、阶段超时和后端失败通过 `terminal` 报告。样本和 Base64 输出受共享正文预算约束，并行演算最多两个。静态 `validateConfig` 只校验脚本源码。
 
 结果包含原始 URL、最终 URL、原生 URL 动作和各阶段的变换结果。`httpsReady` 始终为 false，真实 TLS 信任取决于运行环境。Core 不持久化样本。
 

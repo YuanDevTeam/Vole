@@ -108,7 +108,7 @@ class BuildTests(unittest.TestCase):
             )
             self.assertEqual("--bins" in command, backend == "uwp")
 
-    def test_linux_cli_and_ffi_preserve_transport_features(self):
+    def test_linux_cli_and_ffi_select_production_features(self):
         target = "aarch64-unknown-linux-gnu"
         with (
             patch.object(builds.platform, "system", return_value="Linux"),
@@ -118,7 +118,7 @@ class BuildTests(unittest.TestCase):
             builds.build_linux()
         self.assertEqual(
             [command[command.index("--features") + 1] for command, _ in self.commands],
-            ["cli", "ffi"],
+            ["cli", "ffi,http-js-v8"],
         )
 
     def test_uwp_build_selects_dynamic_crt_and_preserves_cargo_flag_precedence(self):

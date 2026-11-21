@@ -1,6 +1,8 @@
 //! Static finite-language preparation and a platform-owned execution adapter.
 use std::{io, sync::Arc};
 
+#[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
+mod android_engine;
 #[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
 mod apple;
 #[cfg(feature = "inbound-http")]
@@ -11,6 +13,8 @@ mod platform_init;
 mod scoped_qos;
 #[cfg(all(test, feature = "inbound-http", target_vendor = "apple"))]
 mod tests;
+#[cfg(all(feature = "http-js-v8", any(target_os = "linux", windows)))]
+mod v8_engine;
 
 #[cfg(all(
     feature = "inbound-http",
@@ -21,7 +25,7 @@ pub(crate) mod plan_validation;
 #[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
 mod static_literal_plan;
 
-#[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+#[cfg(feature = "inbound-http")]
 static EXECUTION_LANE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -37,7 +41,11 @@ pub(crate) enum OutputBound {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CompiledSource {
     #[cfg_attr(
-        not(all(feature = "inbound-http", target_vendor = "apple")),
+        not(any(
+            all(feature = "inbound-http", target_vendor = "apple"),
+            all(feature = "inbound-http", feature = "ffi", target_os = "android"),
+            all(feature = "http-js-v8", any(target_os = "linux", windows))
+        )),
         allow(dead_code)
     )]
     pub(crate) code: Arc<str>,
@@ -51,6 +59,7 @@ impl CompiledSource {
     /// Only a complete proof for this actual business declaration can remove
     /// eager JSC preparation. Source acceptance and platform availability are
     /// separate; unknown source, body modes and metadata keep the JSC path.
+    #[cfg(any(test, not(all(feature = "ffi", target_os = "android"))))]
     pub(crate) fn needs_jsc_for_business(
         &self,
         body: super::script_config::BodyMode,
@@ -109,7 +118,7 @@ pub(crate) fn validate_source(source: &str) -> io::Result<CompiledSource> {
 #[cfg(feature = "inbound-http")]
 #[derive(Clone, Copy)]
 pub(crate) enum Backend<'a> {
-    Jsc(&'a CompiledSource),
+    Engine(&'a CompiledSource),
     #[cfg(target_vendor = "apple")]
     Plan(&'a static_literal_plan::Plan),
 }
@@ -132,22 +141,23 @@ impl CompiledSource {
         }
         #[cfg(not(target_vendor = "apple"))]
         let _ = (metadata, input);
+        #[cfg(target_vendor = "apple")]
         super::diagnostics::increment(super::diagnostics::Counter::JscSelected);
-        Backend::Jsc(self)
+        Backend::Engine(self)
     }
 }
 #[cfg(feature = "inbound-http")]
 impl Backend<'_> {
     pub(crate) fn is_plan(self) -> bool {
         match self {
-            Self::Jsc(_) => false,
+            Self::Engine(_) => false,
             #[cfg(target_vendor = "apple")]
             Self::Plan(_) => true,
         }
     }
     pub(crate) fn output_bound(self, input: usize) -> usize {
         match self {
-            Self::Jsc(program) => program.maximum_output_bytes(input),
+            Self::Engine(program) => program.maximum_output_bytes(input),
             #[cfg(target_vendor = "apple")]
             Self::Plan(plan) => plan
                 .maximum_output_bytes(input)
@@ -157,30 +167,31 @@ impl Backend<'_> {
 }
 #[cfg(feature = "inbound-http")]
 #[derive(Clone, Copy)]
-#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 enum InvocationInput<'a> {
-    #[cfg_attr(not(test), allow(dead_code))]
-    JscOnly(Option<&'a [u8]>),
+    #[cfg(all(test, target_vendor = "apple"))]
+    EngineOnly(Option<&'a [u8]>),
     Borrowed(Option<super::body::BorrowedBody<'a>>),
 }
 #[cfg(feature = "inbound-http")]
 impl<'a> InvocationInput<'a> {
-    #[cfg(target_vendor = "apple")]
     fn bytes(self) -> Option<&'a [u8]> {
         match self {
-            Self::JscOnly(bytes) => bytes,
+            #[cfg(all(test, target_vendor = "apple"))]
+            Self::EngineOnly(bytes) => bytes,
             Self::Borrowed(body) => body.map(|body| body.as_bytes()),
         }
     }
     #[cfg(target_vendor = "apple")]
     fn witness(self) -> Option<super::body::BorrowedBody<'a>> {
         match self {
-            Self::JscOnly(_) => None,
+            #[cfg(test)]
+            Self::EngineOnly(_) => None,
             Self::Borrowed(body) => body,
         }
     }
 }
 
+#[allow(dead_code)]
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -189,7 +200,13 @@ fn unsupported() -> io::Error {
 }
 
 pub(crate) fn ensure_available() -> io::Result<()> {
-    if cfg!(all(feature = "inbound-http", target_vendor = "apple")) {
+    #[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
+    return android_engine::ensure_available();
+    #[cfg(not(all(feature = "inbound-http", feature = "ffi", target_os = "android")))]
+    if cfg!(any(
+        all(feature = "inbound-http", target_vendor = "apple"),
+        all(feature = "http-js-v8", any(target_os = "linux", windows))
+    )) {
         Ok(())
     } else {
         Err(unsupported())
@@ -235,8 +252,55 @@ pub(crate) fn prepare_platform(
     }
     #[cfg(not(all(feature = "inbound-http", target_vendor = "apple")))]
     {
-        let _ = cancellation;
-        Err(unsupported())
+        if cancellation.is_cancelled() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        #[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
+        android_engine::initialize_platform()?;
+        #[cfg(all(feature = "http-js-v8", any(target_os = "linux", windows)))]
+        v8_engine::initialize_platform()?;
+        if cancellation.is_cancelled() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
+pub(crate) struct AndroidSession {
+    open: bool,
+}
+
+#[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
+impl AndroidSession {
+    pub(crate) fn open() -> io::Result<Self> {
+        android_engine::initialize_platform()?;
+        Ok(Self { open: true })
+    }
+
+    pub(crate) fn close(mut self) -> io::Result<()> {
+        self.open = false;
+        android_engine::shutdown_platform()
+    }
+}
+
+#[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
+impl Drop for AndroidSession {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = android_engine::shutdown_platform();
+        }
+    }
+}
+
+#[cfg(feature = "inbound-http")]
+pub(super) fn bridge_cost(input: Option<usize>, text: bool, output: usize) -> Option<usize> {
+    #[cfg(all(feature = "ffi", target_os = "android"))]
+    return android_engine::bridge_cost(input.unwrap_or(0), text, output);
+    #[cfg(not(all(feature = "ffi", target_os = "android")))]
+    match input {
+        Some(input) => super::body_budget::BridgePlan::new(input, text, output)?.cost(),
+        None => Some(0),
     }
 }
 
@@ -252,7 +316,7 @@ pub(crate) fn platform_prepare_requests_for_test() -> usize {
     PLATFORM_PREPARE_REQUESTS.with(std::cell::Cell::get)
 }
 
-#[cfg(all(test, feature = "inbound-http"))]
+#[cfg(all(test, feature = "inbound-http", target_vendor = "apple"))]
 pub(crate) async fn evaluate(
     program: &CompiledSource,
     metadata: &serde_json::Value,
@@ -272,9 +336,8 @@ pub(crate) async fn evaluate(
     .await
 }
 
-// Explicit JSC-only reference seam for existing direct-adapter tests/validation.
-#[cfg(feature = "inbound-http")]
-#[cfg_attr(not(test), allow(dead_code))]
+// Bypass the static plan in direct backend tests.
+#[cfg(all(test, feature = "inbound-http", target_vendor = "apple"))]
 pub(crate) async fn evaluate_until(
     program: &CompiledSource,
     metadata: &serde_json::Value,
@@ -285,9 +348,9 @@ pub(crate) async fn evaluate_until(
     phase_deadline: std::time::Instant,
 ) -> io::Result<serde_json::Value> {
     evaluate_internal(
-        Backend::Jsc(program),
+        Backend::Engine(program),
         metadata,
-        InvocationInput::JscOnly(input_body),
+        InvocationInput::EngineOnly(input_body),
         output_body,
         bridge_workspace,
         cancellation,
@@ -318,12 +381,12 @@ pub(crate) async fn evaluate_backend_until(
     .await
 }
 
-#[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+#[cfg(feature = "inbound-http")]
 pub(crate) struct InvocationLane {
     _permit: tokio::sync::SemaphorePermit<'static>,
     deadline: std::time::Instant,
 }
-#[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+#[cfg(feature = "inbound-http")]
 impl InvocationLane {
     // Only cancellation and the original phase bound enter this future. No
     // mutable message/output is held by the lane acquisition helper.
@@ -405,7 +468,7 @@ fn evaluate_acquired(
     let deadline = lane.deadline;
     let _lane = lane; // Keep the exact permit through real return/unwind/join.
     let mut operation = || match backend {
-        Backend::Jsc(program) => {
+        Backend::Engine(program) => {
             super::diagnostics::increment(super::diagnostics::Counter::EvaluationEntered);
             let result = apple::evaluate(
                 program,
@@ -492,17 +555,74 @@ async fn evaluate_internal(
     }
     #[cfg(not(target_vendor = "apple"))]
     {
-        let _ = (
-            backend,
-            metadata,
-            input_body,
-            output_body,
-            bridge_workspace,
-            cancellation,
-            phase_deadline,
-        );
-        Err(unsupported())
+        ensure_available()?;
+        let lane = InvocationLane::acquire(cancellation, phase_deadline).await?;
+        let Backend::Engine(program) = backend;
+        let input = input_body.bytes();
+        let deadline = lane.deadline;
+        let mut operation = || {
+            #[cfg(all(feature = "ffi", target_os = "android"))]
+            let (name, evaluate) = ("android-javascriptengine", android_engine::evaluate);
+            #[cfg(all(feature = "http-js-v8", any(target_os = "linux", windows)))]
+            let (name, evaluate) = ("v8", v8_engine::evaluate);
+            #[cfg(not(any(
+                all(feature = "ffi", target_os = "android"),
+                all(feature = "http-js-v8", any(target_os = "linux", windows))
+            )))]
+            let (name, evaluate) = ("unavailable", no_engine);
+            use super::diagnostics::{Counter, increment};
+            increment(Counter::EvaluationEntered);
+            let result = evaluate(
+                program,
+                metadata,
+                input,
+                output_body,
+                bridge_workspace,
+                cancellation,
+                deadline,
+            );
+            let status = result.as_ref().map(|_| ()).map_err(io::Error::kind);
+            increment(match status {
+                Ok(()) => Counter::EvaluationSucceeded,
+                Err(io::ErrorKind::TimedOut) => Counter::EvaluationTimedOut,
+                Err(io::ErrorKind::Interrupted) => Counter::EvaluationCancelled,
+                Err(_) => Counter::EvaluationFailed,
+            });
+            tracing::trace!(target: "vole::http_processing::script", backend = name, result = ?status, "HTTP script backend completed");
+            result
+        };
+        // A borrowed message and the lane outlive the actual backend return.
+        // A dropped HTTP future never detaches a backend execution.
+        let result = if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(operation)
+        } else {
+            operation()
+        };
+        drop(lane);
+        result
     }
+}
+
+#[cfg(all(
+    feature = "inbound-http",
+    not(any(
+        target_vendor = "apple",
+        all(feature = "ffi", target_os = "android"),
+        all(feature = "http-js-v8", any(target_os = "linux", windows))
+    ))
+))]
+fn no_engine(
+    _: &CompiledSource,
+    _: &serde_json::Value,
+    _: Option<&[u8]>,
+    _: &mut super::body_budget::BudgetedBytes,
+    _: Option<&super::body_budget::Reservation>,
+    _: &tokio_util::sync::CancellationToken,
+    _: std::time::Instant,
+) -> io::Result<serde_json::Value> {
+    Err(unsupported())
 }
 
 #[cfg(all(feature = "inbound-http", target_vendor = "apple"))]

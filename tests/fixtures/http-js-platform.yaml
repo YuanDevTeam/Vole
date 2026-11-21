@@ -1,0 +1,59 @@
+name: Platform HTTP JS
+targets:
+  - origins:
+      - http://js-rewrite.test:18080
+      - https://js-rewrite.test:18443
+      - https://js-rewrite.test:18444
+    rules:
+      - id: request
+        match: {method: POST, path-exact: /rewrite}
+        request:
+          headers:
+            - set: {x-vole-native: ready}
+          js:
+            body: bytes
+            source: |
+              function rewrite(input) {
+                let native = false;
+                for (let i = 0; i < input.request.headers.length; i++) {
+                  const header = input.request.headers[i];
+                  if (header.name === "x-vole-native" && header.value === "ready") native = true;
+                }
+                const text = Vole.utf8Decode(input.body.data);
+                if (!native || text !== "probe") return {type: "abort"};
+                return {type: "modify", headers: [
+                  {op: "set", name: "x-vole-request", values: ["js"]}
+                ], body: {kind: "bytes", data: Vole.utf8Encode(text + ":js")}};
+              }
+      - id: response
+        match: {method: POST, path-exact: /rewrite}
+        response:
+          when: {status: 200}
+          js:
+            body: text
+            source: |
+              function rewrite(input) {
+                if (input.body.data !== "origin:probe:js") return {type: "abort"};
+                return {type: "modify", headers: [
+                  {op: "set", name: "x-vole-response", values: ["js"]}
+                ], body: {kind: "text", data: input.body.data + ":改写"}};
+              }
+      - id: rollback
+        match: {method: POST, path-exact: /rewrite}
+        response:
+          js:
+            body: text
+            source: |
+              function rewrite(input) {
+                return {type: "modify", headers: [
+                  {op: "set", name: "content-length", values: ["0"]}
+                ], body: {kind: "text", data: "must-roll-back"}};
+              }
+      - id: local
+        match: {path-exact: /local}
+        request:
+          js:
+            source: |
+              function rewrite(input) {
+                return {type: "respond", status: 202, body: {kind: "text", data: "local-js"}};
+              }

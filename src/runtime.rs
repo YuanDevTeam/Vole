@@ -125,6 +125,18 @@ pub(crate) struct PreparedCore {
     traffic_stats: Option<Arc<TunTrafficStats>>,
 }
 
+#[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
+impl PreparedCore {
+    pub(crate) fn open_http_script_session(
+        &self,
+    ) -> io::Result<Option<crate::http_processing::scripts::AndroidSession>> {
+        match self.config.http_policy() {
+            Some(policy) => policy.open_script_session(),
+            None => Ok(None),
+        }
+    }
+}
+
 /// A short-lived reconnect lease of actual configuration and provider content.
 /// It owns no live transports and never serializes private HTTP material.
 #[cfg(any(feature = "invoke", test))]

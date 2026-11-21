@@ -281,14 +281,14 @@ pub(crate) fn context_released() {
     }
 }
 
-#[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+#[cfg(feature = "inbound-http")]
 pub(crate) struct QueueGuard {
     #[cfg(feature = "http-diagnostics")]
     started: std::time::Instant,
     #[cfg(feature = "http-diagnostics")]
     finished: bool,
 }
-#[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+#[cfg(feature = "inbound-http")]
 impl QueueGuard {
     #[inline]
     pub(crate) fn new() -> Self {
@@ -340,7 +340,7 @@ impl QueueGuard {
         enabled::STATS.timings[Timing::Queue as usize].record(self.started.elapsed().as_micros());
     }
 }
-#[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+#[cfg(feature = "inbound-http")]
 impl Drop for QueueGuard {
     fn drop(&mut self) {
         #[cfg(feature = "http-diagnostics")]

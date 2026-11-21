@@ -50,6 +50,7 @@ default = [
     "sing-mux",
 ]
 inbound-http = ["dep:memmap2", "dep:rcgen", "rcgen/x509-parser", "dep:rsa", "dep:tokio-tungstenite", "dep:hyper", "dep:hyper-util", "dep:x509-parser", "dep:oxc_allocator", "dep:oxc_ast", "dep:oxc_parser", "dep:oxc_span", "tokio/rt-multi-thread"]
+http-js-v8 = ["inbound-http", "dep:v8"]
 http-diagnostics = ["inbound-http", "vole-netstack?/diagnostics"]
 inbound-socks5 = ["dep:rcgen", "dep:rsa", "dep:ring", "dep:tokio-tungstenite"]
 outbound-anytls = ["dep:md-5", "stream-security", "ech"]
@@ -82,8 +83,8 @@ dns-quic = ["quinn-h3-transport"]
 interop-test = ["outbound-anytls", "outbound-vless"]
 invoke = ["tun", "dns-quic", "tokio/rt-multi-thread", "tokio/signal"]
 ffi = ["invoke"]
-cli = ["invoke"]
-windows-wintun = ["tun", "dep:tun-rs", "dep:windows"]
+cli = ["invoke", "http-js-v8"]
+windows-wintun = ["tun", "http-js-v8", "dep:tun-rs", "dep:windows"]
 windows-uwp = ["invoke", "dep:windows", "dep:windows-collections", "dep:windows-core"]
 tun = [
     "inbound-http",
@@ -188,6 +189,9 @@ zstd = { version = "0.14.3", default-features = false }
 
 [target.'cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))'.dependencies]
 oslog = { version = "0.2", default-features = false }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+v8 = { version = "=152.2.0", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Public socket adapter; shared Dialer retains protection, deadlines and Stop.

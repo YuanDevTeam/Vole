@@ -58,6 +58,9 @@ const JVM_GET_ENV: usize = 6;
 
 static JAVA_VM: OnceLock<usize> = OnceLock::new();
 
+#[cfg(feature = "inbound-http")]
+pub(crate) mod js;
+
 #[repr(C)]
 union JValue {
     z: JBoolean,
@@ -161,6 +164,8 @@ pub unsafe extern "system" fn JNI_OnUnload(_vm: JavaVm, _reserved: *mut c_void) 
     // registry rejects controller removal while a TUN lease is held, so no
     // TUN runtime can observe a freed Java global reference.
     let _ = std::panic::catch_unwind(|| replace_android_socket_protector(None));
+    #[cfg(feature = "inbound-http")]
+    let _ = std::panic::catch_unwind(js::release_on_unload);
 }
 
 /// Invokes the runtime registry using unmodified UTF-8 bytes.
@@ -308,6 +313,10 @@ unsafe fn detach_current_thread(vm: JavaVm) -> JInt {
 }
 
 unsafe fn copy_byte_array(env: JniEnv, array: JByteArray) -> Option<Vec<u8>> {
+    unsafe { copy_byte_array_bounded(env, array, MAX_INVOKE_BYTES) }
+}
+
+unsafe fn copy_byte_array_bounded(env: JniEnv, array: JByteArray, limit: usize) -> Option<Vec<u8>> {
     if env.is_null() || array.is_null() {
         return None;
     }
@@ -316,13 +325,13 @@ unsafe fn copy_byte_array(env: JniEnv, array: JByteArray) -> Option<Vec<u8>> {
     let get_length: unsafe extern "system" fn(JniEnv, JByteArray) -> JSize =
         unsafe { transmute(length_pointer) };
     let length = usize::try_from(unsafe { get_length(env, array) }).ok()?;
-    // Enforce the Invoke limit before allocating or copying untrusted Java
-    // input. Returning None is dispatched as a normal invalid-request
-    // envelope by nativeInvoke.
-    if length > MAX_INVOKE_BYTES {
+    // Enforce the caller's bound before allocating or copying Java input.
+    if length > limit || unsafe { clear_pending_exception(env) } {
         return None;
     }
-    let mut output = vec![0_u8; length];
+    let mut output = Vec::new();
+    output.try_reserve_exact(length).ok()?;
+    output.resize(length, 0);
     if length != 0 {
         let region_pointer = unsafe { env_function(env, JNI_GET_BYTE_ARRAY_REGION) }?;
         // SAFETY: function-table slot is specified by JNINativeInterface.

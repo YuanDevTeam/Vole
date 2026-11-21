@@ -96,7 +96,7 @@ targets:
 
 ## 内联 HTTP 脚本
 
-`request.js` 或 `response.js` 使用内联 `source` 和可选的 `body`（默认 `none`，可选 `text`、`bytes`）。作用阶段由所在字段决定，命中条件与原生动作相同。静态校验始终检查选择器与脚本 AST。运行时依据本机开关和有效目标决定是否准备脚本后端，当前后端可用性限于 Apple。用户脚本在命中业务请求或响应时执行。
+`request.js` 或 `response.js` 使用内联 `source` 和可选的 `body`（默认 `none`，可选 `text`、`bytes`）。作用阶段由所在字段决定，命中条件与原生动作相同。静态校验始终检查选择器与脚本 AST。运行时依据本机开关和有效目标决定是否准备脚本后端。用户脚本在命中业务请求或响应时执行。
 
 源码必须定义唯一同步入口 `function rewrite(input) { ... }`。当前语法支持 let/const、if/else、return、普通 for/while/do-while、无标签 break/continue、普通对象和稠密数组、成员读取/简单赋值、局部变量自增减及赋值运算、条件/逻辑表达式与原始值的有限算术比较。对象不会被隐式转换成字符串或数字。静态 AST 检查遍历最多 16,384 项、递归深度 128；未知语法明确拒绝，不用字符串过滤代替语法解析。
 
@@ -126,7 +126,11 @@ AST 解析前限制词法扫描工作、局部运算链与嵌套深度。平铺�
 
 原生与 JS 共用 256 KiB 单份实体和 4 MiB 非等待正文账本，桥接实际副本与输出也计费。没有正文需求时保留流式传输。原生文本动作和 JS text 要求 UTF-8。原生 protobuf 和 JS bytes 沿用 HEAD、无体、部分响应、流式、trailer 和原始协商排除。文本变化输出 UTF-8 identity，二进制变化输出 binary identity。无变化保留该次输入表示。正文不可用时跳过要求正文的脚本，none 仍可执行。
 
-Apple 后端对可证明等价的闭合脚本使用静态执行计划，其余受支持的脚本使用独立 JavaScriptCore 上下文。两条分支执行相同的事务、期限与资源准入规则。调用内对输入对象的修改仍需经结果校验才能应用。
+各平台使用同一份插件 YAML、脚本语义和事务校验。调用内对输入对象的修改需经结果校验才能应用。
+
+- Apple 对可证明等价的闭合脚本使用静态执行计划，其余受支持的脚本使用独立 JavaScriptCore 上下文。
+- Linux、Windows CLI 和 Windows Wintun 使用同一个进程内 V8 后端。每次调用拥有独立 isolate，结束后回收。Linux 原生库的标准构建也启用 `http-js-v8`。Windows UWP 构建保留动态 CRT，待 V8 兼容该构建后接入。
+- Android 通过 [宿主注册](invoke-api.md#android-脚本沙箱)使用 AndroidX JavaScriptEngine。执行依赖设备 WebView provider 支持独立沙箱和所需特性。
 
 单次调用的期限为 100 ms（包含排队），最多 100,000 次受控 tick。请求和响应 JS 阶段各有 1 秒总期限，正文收集与传输使用各自的期限。取消及超时后的回收等待同步操作和实际执行 owner 结束；2 MiB 的累计分配工作预算约束执行工作量。正文许可随实际输入、输出、桥接副本和发送引用持有至最后一次释放。
 

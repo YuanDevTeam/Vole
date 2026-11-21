@@ -1892,7 +1892,20 @@ fn run_engine(
         allocator_relief,
     } = context;
     tracing::info!(instance_id, has_tun, "Vole runtime engine starting");
+    #[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
+    let script_session = match prepared.open_http_script_session() {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = startup.send(Err(InvokeFailure::from(io::Error::new(
+                error.kind(),
+                error.to_string(),
+            ))));
+            return Err(error);
+        }
+    };
     let result = run_engine_inner(instance_id, has_tun, prepared, tun, dialer, stop, startup);
+    #[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
+    let result = result.and(script_session.map_or(Ok(()), |session| session.close()));
     observe_tun_memory(has_tun, "stop-complete");
     if let Some(relief) = allocator_relief {
         relief.relieve();

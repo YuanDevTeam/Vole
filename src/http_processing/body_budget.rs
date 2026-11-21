@@ -13,7 +13,10 @@ pub(crate) const WORKSPACE: usize = 4 * 1024 * 1024;
 
 // A public JSC string view can own an N-byte 8-bit copy plus a 2N-byte
 // UTF-16 expansion. This is bridge admission, not a VM heap bound.
-#[cfg(feature = "inbound-http")]
+#[cfg(all(
+    feature = "inbound-http",
+    any(test, not(all(feature = "ffi", target_os = "android")))
+))]
 pub(crate) const API_TEXT_VIEW: usize = 3 * MAX_BODY;
 
 #[cfg(all(feature = "inbound-http", test))]
@@ -36,14 +39,20 @@ pub(crate) fn output_capacity(bound: usize) -> Option<usize> {
 
 /// Independent retained-input and scratch payloads. This is a conservative
 /// copy ledger, not storage, a VM heap limit, or a second execution lane.
-#[cfg(feature = "inbound-http")]
+#[cfg(all(
+    feature = "inbound-http",
+    any(test, not(all(feature = "ffi", target_os = "android")))
+))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BridgePlan {
     pub(crate) retained_input: usize,
     pub(crate) view_capacity: usize,
     pub(crate) input_vec_bookkeeping: usize,
 }
-#[cfg(feature = "inbound-http")]
+#[cfg(all(
+    feature = "inbound-http",
+    any(test, not(all(feature = "ffi", target_os = "android")))
+))]
 impl BridgePlan {
     pub(crate) fn new(input: usize, text: bool, output: usize) -> Option<Self> {
         if input > MAX_BODY || output > MAX_BODY {
@@ -411,7 +420,15 @@ impl BudgetedBytes {
 
     /// Admit a known result before copying it out of an engine. Body-less calls
     /// use an empty buffer until the backend knows that a result has a body.
-    #[cfg(all(feature = "inbound-http", any(test, target_vendor = "apple")))]
+    #[cfg(all(
+        feature = "inbound-http",
+        any(
+            test,
+            target_vendor = "apple",
+            all(feature = "ffi", target_os = "android"),
+            all(feature = "http-js-v8", any(target_os = "linux", windows))
+        )
+    ))]
     pub(crate) fn prepare_output(&mut self, length: usize) -> io::Result<()> {
         if length > MAX_BODY {
             return Err(io::Error::new(

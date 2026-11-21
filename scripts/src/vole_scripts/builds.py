@@ -248,7 +248,7 @@ def build_linux(target: str | None = None) -> Path:
     release = _cargo_build(
         target,
         ["--release"],
-        DEFAULT_FEATURES,
+        DEFAULT_FEATURES + ",http-js-v8",
         environment,
     )
     output = CORE_DIR / "dist/linux" / architecture

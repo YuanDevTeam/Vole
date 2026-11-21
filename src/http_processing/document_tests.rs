@@ -610,7 +610,13 @@ fn inline_scripts_are_validated_and_change_candidate_identity() {
     }
 }
 
-#[cfg(all(feature = "inbound-http", not(target_vendor = "apple")))]
+#[cfg(all(
+    feature = "inbound-http",
+    not(any(
+        target_vendor = "apple",
+        all(feature = "http-js-v8", any(target_os = "linux", windows))
+    ))
+))]
 #[test]
 fn unsupported_script_backend_is_reported_during_preparation() {
     let candidate = Document::parse(SCRIPT).unwrap().compile().unwrap();

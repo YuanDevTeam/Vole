@@ -720,22 +720,34 @@ impl CallBuffers {
             bridge_workspace: None,
         })
     }
-    #[cfg(test)]
-    fn new(budget: &Budget, bytes: Option<&[u8]>, mode: BodyMode) -> io::Result<Self> {
-        Self::with_output_bound(budget, bytes, mode, MAX_BODY)
-    }
     fn with_output_bound(
         budget: &Budget,
         bytes: Option<&[u8]>,
         mode: BodyMode,
         output_bound: usize,
     ) -> io::Result<Self> {
+        let bridge_cost = super::scripts::bridge_cost(
+            bytes.map(<[u8]>::len),
+            mode == BodyMode::Text,
+            output_bound,
+        )
+        .ok_or_else(exhausted)?;
         let Some(bytes) = bytes else {
-            super::diagnostics::call_buffers_requested(0, 0, 0);
+            super::diagnostics::call_buffers_requested(0, 0, bridge_cost);
+            let bridge_workspace = if bridge_cost == 0 {
+                None
+            } else {
+                Some(budget.reserve(bridge_cost).ok_or_else(|| {
+                    super::diagnostics::increment(
+                        super::diagnostics::Counter::CallBuffersBudgetRejected,
+                    );
+                    exhausted()
+                })?)
+            };
             super::diagnostics::increment(super::diagnostics::Counter::CallBuffersAdmitted);
             return Ok(Self {
                 output: BudgetedBytes::empty(budget),
-                bridge_workspace: None,
+                bridge_workspace,
             });
         };
         if bytes.len() > MAX_BODY || output_bound > MAX_BODY {
@@ -748,10 +760,6 @@ impl CallBuffers {
         let output_capacity =
             super::body_budget::output_capacity(output_bound).ok_or_else(exhausted)?;
         let output_cost = BudgetedBytes::allocation_cost(output_capacity).ok_or_else(exhausted)?;
-        let bridge_cost =
-            super::body_budget::BridgePlan::new(bytes.len(), mode == BodyMode::Text, output_bound)
-                .and_then(super::body_budget::BridgePlan::cost)
-                .ok_or_else(exhausted)?;
         super::diagnostics::call_buffers_requested(0, output_cost, bridge_cost);
         let mut all = budget
             .reserve(output_cost.checked_add(bridge_cost).ok_or_else(exhausted)?)
@@ -1728,14 +1736,14 @@ mod tests {
         let held = budget
             .reserve(super::super::body_budget::WORKSPACE)
             .unwrap();
-        let buffers = CallBuffers::new(&budget, None, BodyMode::None).unwrap();
+        let buffers = CallBuffers::with_output_bound(&budget, None, BodyMode::None, 0).unwrap();
         message.apply(output(json!({"type":"modify","headers":[{"op":"set","name":"x-meta","values":["yes"]}]})), buffers.output, BodyMode::None).unwrap();
         assert_eq!(
             message.request.headers,
             vec![("x-meta".into(), "yes".into())]
         );
         assert!(
-            CallBuffers::new(&budget, None, BodyMode::None)
+            CallBuffers::with_output_bound(&budget, None, BodyMode::None, 0)
                 .unwrap()
                 .output
                 .prepare_output(1)

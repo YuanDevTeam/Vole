@@ -191,6 +191,9 @@ impl PolicyCandidate {
             if cancellation.is_cancelled() {
                 return Err(io::ErrorKind::Interrupted.into());
             }
+            // Android's real sandbox belongs to the runtime engine guard.
+            // Admission here also runs for candidates that never start.
+            #[cfg(not(all(feature = "ffi", target_os = "android")))]
             if scripts.any(CompiledScript::needs_jsc_for_business) {
                 super::scripts::prepare_platform(cancellation)?;
             }
@@ -396,6 +399,20 @@ impl Policy {
     }
     pub(crate) fn all_scripts(&self) -> &[CompiledScript] {
         &self.candidate.scripts
+    }
+    #[cfg(all(feature = "ffi", target_os = "android", feature = "inbound-http"))]
+    pub(crate) fn open_script_session(&self) -> io::Result<Option<super::scripts::AndroidSession>> {
+        let effective = self.candidate.effective(&self.settings)?;
+        if self
+            .candidate
+            .active_scripts(&self.settings, &effective)
+            .next()
+            .is_some()
+        {
+            super::scripts::AndroidSession::open().map(Some)
+        } else {
+            Ok(None)
+        }
     }
     #[cfg(feature = "inbound-http")]
     pub(crate) fn body_budget(&self) -> &super::body_budget::Budget {

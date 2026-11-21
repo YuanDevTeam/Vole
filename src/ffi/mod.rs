@@ -9,7 +9,7 @@ use std::{
     slice,
 };
 #[cfg(target_os = "android")]
-mod android;
+pub(crate) mod android;
 /// Executes one Vole request and returns an independently allocated UTF-8 JSON
 /// response. The caller must release the returned pointer with `VoleFree`.
 ///
