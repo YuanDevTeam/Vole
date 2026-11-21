@@ -23,6 +23,7 @@ const READ_CHUNK_BYTES: usize = 2 * 1024;
 const TLS_HANDSHAKE_CONTENT_TYPE: u8 = 0x16;
 const TLS_CLIENT_HELLO_TYPE: u8 = 0x01;
 const TLS_SERVER_NAME_EXTENSION: u16 = 0;
+const TLS_ALPN_EXTENSION: u16 = 16;
 const TLS_ENCRYPTED_CLIENT_HELLO_EXTENSION: u16 = 0xfe0d;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +396,16 @@ fn tls_record_payload(input: &[u8], offset: usize) -> RecordPayload<'_> {
 }
 
 pub(crate) fn parse_client_hello(handshake: &[u8]) -> ParseOutcome {
+    parse_client_hello_inner(handshake, None)
+}
+
+pub(crate) fn parse_quic_client_hello(handshake: &[u8]) -> (ParseOutcome, bool) {
+    let mut h3_only = false;
+    let outcome = parse_client_hello_inner(handshake, Some(&mut h3_only));
+    (outcome, h3_only)
+}
+
+fn parse_client_hello_inner(handshake: &[u8], mut h3_only: Option<&mut bool>) -> ParseOutcome {
     if handshake.len() < 4 || handshake[0] != TLS_CLIENT_HELLO_TYPE {
         return ParseOutcome::NotMatched;
     }
@@ -447,6 +458,7 @@ pub(crate) fn parse_client_hello(handshake: &[u8]) -> ParseOutcome {
     let mut server_name = None;
     let mut saw_server_name_extension = false;
     let mut saw_encrypted_client_hello = false;
+    let mut saw_alpn = false;
     while cursor < extensions_end {
         let Some(extension_type) = take_u16_value(body, &mut cursor) else {
             return ParseOutcome::NotMatched;
@@ -484,6 +496,12 @@ pub(crate) fn parse_client_hello(handshake: &[u8]) -> ParseOutcome {
                 // untrusted whenever this extension is present.
                 saw_encrypted_client_hello = true;
             }
+            TLS_ALPN_EXTENSION => {
+                if let Some(h3_only) = h3_only.as_deref_mut() {
+                    *h3_only = !saw_alpn && only_h3_protocols(&body[cursor..extension_end]);
+                    saw_alpn = true;
+                }
+            }
             _ => {}
         }
         cursor = extension_end;
@@ -493,6 +511,30 @@ pub(crate) fn parse_client_hello(handshake: &[u8]) -> ParseOutcome {
     } else {
         server_name.map_or(ParseOutcome::NotMatched, ParseOutcome::Matched)
     }
+}
+
+fn only_h3_protocols(extension: &[u8]) -> bool {
+    let [high, low, protocols @ ..] = extension else {
+        return false;
+    };
+    let mut protocols = protocols;
+    if protocols.is_empty() || usize::from(u16::from_be_bytes([*high, *low])) != protocols.len() {
+        return false;
+    }
+    while let Some((&length, names)) = protocols.split_first() {
+        let Some((protocol, rest)) = names.split_at_checked(usize::from(length)) else {
+            return false;
+        };
+        if protocol != b"h3"
+            && !protocol
+                .strip_prefix(b"h3-")
+                .is_some_and(|draft| !draft.is_empty() && draft.iter().all(u8::is_ascii_digit))
+        {
+            return false;
+        }
+        protocols = rest;
+    }
+    true
 }
 
 fn parse_server_name_extension(extension: &[u8]) -> ParseOutcome {

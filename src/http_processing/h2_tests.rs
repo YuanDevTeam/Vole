@@ -22,7 +22,6 @@ const PAYLOAD: usize = 96 * 1024;
 #[path = "h2_receive_credit_memory_tests.rs"]
 mod receive_credit_memory_tests;
 
-#[cfg(target_vendor = "apple")]
 async fn script_memory_response(
     context: HttpContext,
     request: Request<()>,
@@ -73,6 +72,55 @@ async fn script_memory_response(
     driver.abort();
     let _ = driver.await;
     response
+}
+
+#[tokio::test]
+async fn scoped_h3_fallback_filters_only_https_advertisements() {
+    let yaml = r#"
+targets:
+  - origins: [http://a.test, https://a.test]
+    rules:
+      - request:
+          respond:
+            status: 204
+            headers: [{name: alt-svc, value: 'h3=":443", h2=":8443"'}]
+"#;
+    let (context, origin) = prepared_origin_rules(false, false, false, OriginMode::None, yaml);
+    let h2 = script_memory_response(
+        context.clone(),
+        Request::builder().uri("https://a.test/").body(()).unwrap(),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(h2.status(), StatusCode::NO_CONTENT);
+    assert_eq!(h2.headers()["alt-svc"], "h2=\":8443\"");
+
+    for (scheme, expected) in [
+        (Scheme::Https, "alt-svc: h2=\":8443\"\r\n"),
+        (Scheme::Http, "alt-svc: h3=\":443\", h2=\":8443\"\r\n"),
+    ] {
+        let context = context.clone();
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let worker = tokio::spawn(async move {
+            context
+                .serve_h1(&mut server, session(), scheme, CancellationToken::new())
+                .await
+                .unwrap();
+        });
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        timeout(Duration::from_secs(5), client.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        worker.await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 204 "), "{response}");
+        assert!(response.contains(expected), "{response}");
+    }
+    assert!(origin.sessions.lock().unwrap().is_empty());
 }
 
 #[cfg(target_vendor = "apple")]
@@ -584,6 +632,7 @@ async fn p1_same_yaml_matches_offline_h1_and_h2() {
         assert_eq!(h2.status(), StatusCode::OK);
         assert_eq!(h2.body(), &offline_body);
         assert_eq!(h2.headers()["x-p1"], case.witness);
+        assert_eq!(h2.headers()["alt-svc"], "h2=\":444\"");
         assert_eq!(h2.headers()["content-length"], case.changed.len().to_string());
         origin.join().await;
 
@@ -609,6 +658,7 @@ async fn p1_same_yaml_matches_offline_h1_and_h2() {
         let head = std::str::from_utf8(&h1[..end + 2]).unwrap().to_ascii_lowercase();
         assert!(head.starts_with("http/1.1 200 "));
         assert!(head.contains(&format!("x-p1: {}\r\n", case.witness)));
+        assert!(head.contains("alt-svc: h2=\":444\"\r\n"));
         assert!(head.contains(&format!("content-length: {}\r\n", case.changed.len())));
         assert_eq!(&h1[end + 4..], offline_body);
     }
@@ -680,6 +730,7 @@ impl Dispatcher for Origin {
                         let out = Response::builder()
                             .header("content-type", case.media)
                             .header("content-length", case.original.len())
+                            .header("alt-svc", "h3=\":443\", h2=\":444\"")
                             .body(())
                             .unwrap();
                         response
@@ -804,7 +855,7 @@ impl Dispatcher for Origin {
                     );
                     assert!(head.to_ascii_lowercase().contains("x-p1-query: p1 ok\r\n"));
                     tls.write_all(format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nAlt-Svc: h3=\":443\", h2=\":444\"\r\nConnection: close\r\n\r\n",
                         case.media, case.original.len()
                     ).as_bytes()).await.unwrap();
                     tls.write_all(case.original).await.unwrap();

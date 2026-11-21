@@ -84,6 +84,7 @@ redir-host 域名提示在 DNS 开启且规则需要域名或已启用嗅探时�
 ## 嗅探
 
 HTTP/TLS 用于 TUN 与 mixed TCP；QUIC v1/v2 多包识别由 TUN 和已授权的 SOCKS5 UDP 共用。
+HTTP rewrite 的 H3 回退使用同一有界 Initial 解析。它按获准的 HTTPS 目标启用，独立于路由嗅探设置，单独开启回退不会为路由提供新的域名提示。见 [选择性 HTTPS](http-processing.md#选择性-https)。
 `parse-pure-ip` 控制无域名目标，`force-dns-mapping` 控制 redir-host 提示，均默认 true。
 fake-IP 恢复后的域名与显式域名只在 `force-domain` 匹配时强制嗅探。
 `skip-src-address` / `skip-dst-address` 在读取前排除地址；`skip-domain` 排除识别结果。

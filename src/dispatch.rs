@@ -363,6 +363,13 @@ pub trait Dispatcher: Send + Sync {
         None
     }
 
+    /// Whether the port needs H3 inspection, or a normalized ClientHello SNI
+    /// on that port belongs to an active HTTPS rewrite origin.
+    #[doc(hidden)]
+    fn http_h3_fallback(&self, _port: u16, _server_name: Option<&str>) -> bool {
+        false
+    }
+
     /// Configured datagram capability, independent of reachability or health.
     fn supports_udp(&self) -> bool {
         true
@@ -423,6 +430,10 @@ impl Dispatcher for SessionObservedDispatcher {
     }
     fn supports_udp(&self) -> bool {
         self.inner.supports_udp()
+    }
+
+    fn http_h3_fallback(&self, port: u16, server_name: Option<&str>) -> bool {
+        self.inner.http_h3_fallback(port, server_name)
     }
 
     async fn sniff_plan(
@@ -492,6 +503,10 @@ impl Dispatcher for HandshakeObservedDispatcher {
     }
     fn supports_udp(&self) -> bool {
         self.inner.supports_udp()
+    }
+
+    fn http_h3_fallback(&self, port: u16, server_name: Option<&str>) -> bool {
+        self.inner.http_h3_fallback(port, server_name)
     }
 
     async fn sniff_plan(

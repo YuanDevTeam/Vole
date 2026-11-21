@@ -109,6 +109,8 @@ pub(crate) struct SourceLocation {
 struct Effective {
     origins: BTreeSet<Origin>,
     exclusions: Arc<Patterns>,
+    #[cfg(feature = "inbound-http")]
+    h3_fallback: BTreeSet<Origin>,
 }
 
 impl Effective {
@@ -128,24 +130,32 @@ impl PolicyCandidate {
 
     fn effective(&self, settings: &HttpSettings) -> io::Result<Effective> {
         let exclusions = Arc::new(Patterns::compile(&settings.exclude_domains)?);
-        let origins = self
-            .document
-            .groups
-            .iter()
-            .filter(|group| {
-                (settings.rewrite_enabled && group.rewrite)
-                    || (settings.js_enabled && group.scripts)
-                    || (settings.allow_intercept_only && group.intercept_only)
-            })
-            .flat_map(|group| group.origins.iter())
-            .filter(|origin| {
-                !origin.is_https() || (settings.mitm_enabled && !exclusions.covers(origin))
-            })
-            .cloned()
-            .collect();
+        let mut origins = BTreeSet::new();
+        #[cfg(feature = "inbound-http")]
+        let mut h3_fallback = BTreeSet::new();
+        for group in self.document.groups.iter() {
+            let rewrites = (settings.rewrite_enabled && group.rewrite)
+                || (settings.js_enabled && group.scripts);
+            if !(rewrites || (settings.allow_intercept_only && group.intercept_only)) {
+                continue;
+            }
+            for origin in group.origins.iter() {
+                let https = origin.is_https();
+                if https && (!settings.mitm_enabled || exclusions.covers(origin)) {
+                    continue;
+                }
+                #[cfg(feature = "inbound-http")]
+                if https && settings.rewrite_enabled && rewrites {
+                    h3_fallback.insert(origin.clone());
+                }
+                origins.insert(origin.clone());
+            }
+        }
         Ok(Effective {
             origins,
             exclusions,
+            #[cfg(feature = "inbound-http")]
+            h3_fallback,
         })
     }
 
@@ -225,6 +235,8 @@ impl PolicyCandidate {
             plain_ports: plain_ports(&effective),
             effective: effective.origins.into_iter().collect(),
             exclusions: effective.exclusions,
+            #[cfg(feature = "inbound-http")]
+            h3_fallback: effective.h3_fallback.into_iter().collect(),
             settings: settings.clone(),
             prepared: true,
             #[cfg(feature = "inbound-http")]
@@ -257,6 +269,8 @@ pub(crate) struct Policy {
     plain_ports: Box<[u16]>,
     effective: Box<[Origin]>,
     exclusions: Arc<Patterns>,
+    #[cfg(feature = "inbound-http")]
+    h3_fallback: Box<[Origin]>,
     settings: HttpSettings,
     prepared: bool,
     #[cfg(feature = "inbound-http")]
@@ -305,6 +319,8 @@ impl Policy {
             plain_ports: plain_ports(&effective),
             effective: effective.origins.into_iter().collect(),
             exclusions: effective.exclusions,
+            #[cfg(feature = "inbound-http")]
+            h3_fallback: effective.h3_fallback.into_iter().collect(),
             settings: settings.clone(),
             prepared,
             #[cfg(feature = "inbound-http")]
@@ -339,6 +355,24 @@ impl Policy {
     pub(crate) fn allows_target(&self, url: &Url) -> bool {
         !self.exclusions.excludes_url(url)
             && self.effective.iter().any(|origin| origin.matches_url(url))
+    }
+    #[cfg(feature = "inbound-http")]
+    pub(crate) fn h3_fallback_for_url(&self, url: &Url) -> bool {
+        self.h3_fallback
+            .iter()
+            .any(|origin| origin.matches_url(url))
+            && !self.exclusions.excludes_url(url)
+    }
+
+    #[cfg(feature = "inbound-http")]
+    pub(crate) fn h3_fallback_for_udp(&self, port: u16, server_name: Option<&str>) -> bool {
+        // The ClientHello parser supplies a normalized SNI. A candidate port
+        // check comes before the bounded QUIC Initial inspection.
+        self.mitm.is_some()
+            && server_name.is_none_or(|name| !self.exclusions.matches(name))
+            && self.h3_fallback.iter().any(|origin| {
+                origin.port() == port && server_name.is_none_or(|name| origin.matches_host(name))
+            })
     }
     pub(crate) fn plain_port(&self, port: u16) -> bool {
         self.plain_ports.binary_search(&port).is_ok()

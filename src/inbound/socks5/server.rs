@@ -451,7 +451,8 @@ fn queue_udp_result(
     ready: &mut VecDeque<PreparedUdp>,
 ) -> io::Result<()> {
     match result {
-        crate::udp_sniffing::IngressResult::Buffered => Ok(()),
+        crate::udp_sniffing::IngressResult::Buffered
+        | crate::udp_sniffing::IngressResult::Dropped => Ok(()),
         crate::udp_sniffing::IngressResult::Forward(datagram) => {
             // Ordinary UDP retains its original single-packet fast path. The
             // replay queue is allocated only when QUIC actually buffers bytes.
@@ -469,23 +470,39 @@ async fn prepare_udp_datagram(
     dispatcher: &dyn Dispatcher,
     sniff: &mut Option<UdpSniffState>,
 ) -> io::Result<crate::udp_sniffing::IngressResult<Datagram>> {
-    let plan = dispatcher
+    let sniff_for_routing = dispatcher
         .sniff_plan(lease.session().source, &datagram.remote)
         .await
-        .map_err(|_| io::Error::other("SOCKS5 UDP sniff policy failed"))?;
-    if plan.is_some_and(|plan| plan.quic_enabled()) {
-        let sniff = sniff.get_or_insert_with(|| {
-            UdpSniffState::with_idle_timeout(
-                crate::quic_sniffer::QuicSniffer::new,
-                super::association::IDLE_TIMEOUT,
-            )
-        });
-        Ok(sniff.ingest_datagram(datagram, Instant::now()))
-    } else {
-        Ok(crate::udp_sniffing::IngressResult::Forward(
+        .map_err(|_| io::Error::other("SOCKS5 UDP sniff policy failed"))?
+        .is_some_and(|plan| plan.quic_enabled());
+    #[cfg(feature = "inbound-http")]
+    let port = datagram.remote.port();
+    #[cfg(feature = "inbound-http")]
+    let fallback = crate::quic_sniffer::is_quic_fallback_candidate(&datagram.payload)
+        && dispatcher.http_h3_fallback(port, None);
+    #[cfg(not(feature = "inbound-http"))]
+    let fallback = false;
+    if !sniff_for_routing && !fallback {
+        return Ok(crate::udp_sniffing::IngressResult::Forward(
             PreparedUdp::without_domain(datagram),
-        ))
+        ));
     }
+    let sniff = sniff.get_or_insert_with(|| {
+        UdpSniffState::with_idle_timeout(
+            crate::quic_sniffer::QuicSniffer::new,
+            super::association::IDLE_TIMEOUT,
+        )
+    });
+    #[cfg(feature = "inbound-http")]
+    if fallback {
+        return Ok(sniff.ingest_with_h3_fallback(
+            datagram,
+            Instant::now(),
+            sniff_for_routing,
+            |host| dispatcher.http_h3_fallback(port, Some(host)),
+        ));
+    }
+    Ok(sniff.ingest_datagram(datagram, Instant::now()))
 }
 
 async fn send_udp_datagram(
@@ -518,4 +535,89 @@ async fn send_udp_datagram(
         .await
         .map_err(|_| io::ErrorKind::TimedOut)?
         .map_err(|_| io::Error::other("SOCKS5 UDP send failed"))
+}
+
+#[cfg(all(test, feature = "inbound-http"))]
+mod udp_h3_tests {
+    use super::*;
+    use crate::{
+        dispatch::{BoxStream, DatagramTransport},
+        quic_sniffer::h3_initial_for_test,
+        session::DatagramSession,
+        udp_sniffing::IngressResult,
+    };
+    use async_trait::async_trait;
+    use bytes::Bytes;
+
+    struct H3FallbackDispatcher;
+
+    #[async_trait]
+    impl Dispatcher for H3FallbackDispatcher {
+        fn http_h3_fallback(&self, port: u16, server_name: Option<&str>) -> bool {
+            port == 443 && server_name.is_none_or(|name| name == "rewrite.example")
+        }
+
+        async fn connect_tcp(&self, _: StreamSession) -> Result<BoxStream, DispatchError> {
+            unreachable!("test does not create a TCP connection")
+        }
+
+        async fn open_datagram(
+            &self,
+            _: DatagramSession,
+        ) -> Result<Box<dyn DatagramTransport>, DispatchError> {
+            unreachable!("test does not open a UDP socket")
+        }
+    }
+
+    #[tokio::test]
+    async fn socks5_udp_h3_fallback_preserves_association_and_unrelated_datagrams() {
+        let associations = Arc::new(Associations::default());
+        let cancellation = CancellationToken::new();
+        let (lease, _receiver) = associations
+            .register("192.0.2.10:12000".parse().unwrap(), 12000, &cancellation)
+            .unwrap();
+        let remote = Destination::Domain {
+            host: "shared.example".into(),
+            port: 443,
+        };
+        let dispatcher = H3FallbackDispatcher;
+        let mut state = None;
+        let mut pending = None;
+        let mut ready = VecDeque::new();
+        let blocked = Bytes::from(h3_initial_for_test("rewrite.example", b"blocked1"));
+        let other = Bytes::from(h3_initial_for_test("other.example", b"outside1"));
+        let ordinary = Bytes::from_static(b"ordinary UDP");
+        for (payload, suppressed) in [
+            (blocked.clone(), true),
+            (ordinary, false),
+            (blocked, true),
+            (other, false),
+        ] {
+            let result = prepare_udp_datagram(
+                Datagram {
+                    remote: remote.clone(),
+                    payload: payload.clone(),
+                    sniffed_domain: None,
+                },
+                &lease,
+                &dispatcher,
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert_eq!(matches!(result, IngressResult::Dropped), suppressed);
+            queue_udp_result(result, &mut pending, &mut ready).unwrap();
+            if suppressed {
+                assert!(pending.is_none());
+            } else {
+                let prepared = pending.take().unwrap();
+                assert_eq!(prepared.datagram.remote, remote);
+                assert_eq!(prepared.datagram.payload, payload);
+                assert!(prepared.sniffed_domain.is_none());
+                assert!(prepared.flow_id.is_none());
+            }
+            assert!(ready.is_empty());
+            assert!(!lease.cancellation.is_cancelled());
+        }
+    }
 }

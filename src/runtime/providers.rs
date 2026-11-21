@@ -699,6 +699,19 @@ impl Dispatcher for ProviderRuntime {
         ))
     }
 
+    #[cfg(feature = "inbound-http")]
+    fn http_h3_fallback(&self, port: u16, server_name: Option<&str>) -> bool {
+        !self.cancellation.is_cancelled()
+            && self
+                .current
+                .load()
+                .config
+                .providers
+                .as_deref()
+                .and_then(|template| template.http_policy.as_deref())
+                .is_some_and(|policy| policy.h3_fallback_for_udp(port, server_name))
+    }
+
     fn supports_udp(&self) -> bool {
         self.current.load().dispatcher.supports_udp()
     }

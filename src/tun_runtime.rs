@@ -1936,7 +1936,8 @@ where
                 complete_tun_send(transport.as_mut(), pending, outcome).await?;
             }
             AssociationEvent::Inbound(Some(datagram)) => {
-                let sniff_quic = if let Some(plan) = context
+                let port = datagram.destination.port();
+                let sniff_for_routing = if let Some(plan) = context
                     .dispatcher
                     .sniff_plan(context.source, &Destination::Ip(datagram.destination))
                     .await
@@ -1944,18 +1945,24 @@ where
                 {
                     plan.quic_enabled()
                 } else {
-                    configured_quic_sniffing(
-                        context.sniffer.as_deref(),
-                        datagram.destination.port(),
-                    )
+                    configured_quic_sniffing(context.sniffer.as_deref(), port)
                 };
-                let result = if sniff_quic {
+                let fallback = crate::quic_sniffer::is_quic_fallback_candidate(&datagram.payload)
+                    && context.dispatcher.http_h3_fallback(port, None);
+                let result = if fallback {
+                    quic_sniff.ingest_with_h3_fallback(
+                        datagram,
+                        TokioInstant::now(),
+                        sniff_for_routing,
+                        |host| context.dispatcher.http_h3_fallback(port, Some(host)),
+                    )
+                } else if sniff_for_routing {
                     quic_sniff.ingest_datagram(datagram, TokioInstant::now())
                 } else {
                     QuicIngressResult::Forward(PreparedTunUdpDatagram::without_domain(datagram))
                 };
                 match result {
-                    QuicIngressResult::Buffered => {}
+                    QuicIngressResult::Buffered | QuicIngressResult::Dropped => {}
                     QuicIngressResult::Forward(prepared) => {
                         debug_assert!(pending_send.is_none());
                         pending_send = Some(prepared);

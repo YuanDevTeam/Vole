@@ -147,12 +147,7 @@ impl HttpContext {
         cancellation: CancellationToken,
         sessions: &h2_reuse::Sessions,
     ) {
-        let response = ResponseSlot(Arc::new(Mutex::new(ResponseState {
-            response,
-            infos: 0,
-            final_started: false,
-            upstream_final_received: false,
-        })));
+        let response = ResponseSlot::new(response);
         if self
             .h2_forward(request, &response, session, cancellation, sessions)
             .await
@@ -184,6 +179,9 @@ impl HttpContext {
             Ok(value) => value,
             Err(_) => return local(response, StatusCode::BAD_REQUEST, None),
         };
+        if self.policy().h3_fallback_for_url(&original) {
+            response.suppress_h3()?;
+        }
         let base_session = session.clone();
         let request_conditions = self
             .policy()
@@ -939,8 +937,22 @@ struct ResponseState {
     infos: usize,
     final_started: bool,
     upstream_final_received: bool,
+    h3_fallback: bool,
 }
 impl ResponseSlot {
+    fn new(response: h2::server::SendResponse<Bytes>) -> Self {
+        Self(Arc::new(Mutex::new(ResponseState {
+            response,
+            infos: 0,
+            final_started: false,
+            upstream_final_received: false,
+            h3_fallback: false,
+        })))
+    }
+    fn suppress_h3(&self) -> io::Result<()> {
+        self.0.lock().map_err(|_| failed())?.h3_fallback = true;
+        Ok(())
+    }
     fn received_final(&self) -> io::Result<()> {
         self.0.lock().map_err(|_| failed())?.upstream_final_received = true;
         Ok(())
@@ -950,7 +962,7 @@ impl ResponseSlot {
             .lock()
             .is_ok_and(|state| state.upstream_final_received)
     }
-    fn informational(&self, response: Response<()>) -> io::Result<()> {
+    fn informational(&self, mut response: Response<()>) -> io::Result<()> {
         let mut state = self.0.lock().map_err(|_| failed())?;
         state.infos += 1;
         if state.infos > 16 {
@@ -959,6 +971,9 @@ impl ResponseSlot {
         // 100 Continue is acknowledged locally, once, before upload forwarding.
         if response.status() == StatusCode::CONTINUE {
             return Ok(());
+        }
+        if state.h3_fallback {
+            headers::alt_svc::filter_map(response.headers_mut());
         }
         state
             .response
@@ -980,10 +995,13 @@ impl ResponseSlot {
     }
     fn final_response(
         &self,
-        response: Response<()>,
+        mut response: Response<()>,
         end: bool,
     ) -> io::Result<h2::SendStream<Bytes>> {
         let mut state = self.0.lock().map_err(|_| failed())?;
+        if state.h3_fallback {
+            headers::alt_svc::filter_map(response.headers_mut());
+        }
         let stream = state
             .response
             .send_response(response, end)

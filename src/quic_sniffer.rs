@@ -12,7 +12,7 @@ use rustls::{
     quic::{DirectionalKeys, Version},
 };
 
-use crate::tcp_sniffer::{ParseOutcome, parse_client_hello};
+use crate::tcp_sniffer::{ParseOutcome, parse_quic_client_hello};
 
 pub(crate) const QUIC_SNIFF_MAX_CRYPTO_BYTES: usize = 16 * 1024;
 const QUIC_SNIFF_MAX_RANGES: usize = 64;
@@ -29,6 +29,7 @@ const CLIENT_HELLO: u8 = 0x01;
 pub(crate) enum QuicSniffOutcome {
     NeedMoreData,
     Matched(String),
+    MatchedHttp3(String),
     EchExtensionPresent,
     NotMatched,
     LimitReached,
@@ -366,13 +367,29 @@ impl QuicSniffer {
         if contiguous < total {
             return QuicSniffOutcome::NeedMoreData;
         }
-        match parse_client_hello(&self.crypto[..total]) {
-            ParseOutcome::Matched(domain) => QuicSniffOutcome::Matched(domain),
-            ParseOutcome::EchExtensionPresent => QuicSniffOutcome::EchExtensionPresent,
-            ParseOutcome::NeedMoreData | ParseOutcome::NotMatched => QuicSniffOutcome::NotMatched,
+        match parse_quic_client_hello(&self.crypto[..total]) {
+            (ParseOutcome::Matched(domain), true) => QuicSniffOutcome::MatchedHttp3(domain),
+            (ParseOutcome::Matched(domain), false) => QuicSniffOutcome::Matched(domain),
+            (ParseOutcome::EchExtensionPresent, _) => QuicSniffOutcome::EchExtensionPresent,
+            (ParseOutcome::NeedMoreData | ParseOutcome::NotMatched, _) => {
+                QuicSniffOutcome::NotMatched
+            }
         }
     }
 }
+
+/// Cheap admission for fallback-only inspection, before allocating any flow state.
+#[cfg(feature = "inbound-http")]
+pub(crate) fn is_quic_fallback_candidate(datagram: &[u8]) -> bool {
+    let Some(&[flags, a, b, c, d]) = datagram.get(..5) else {
+        return false;
+    };
+    flags & (LONG_HEADER | FIXED_BIT) == (LONG_HEADER | FIXED_BIT)
+        && QuicVersion::from_wire(u32::from_be_bytes([a, b, c, d])).is_some()
+}
+
+#[cfg(all(test, feature = "inbound-http"))]
+pub(crate) use tests::h3_initial_for_test;
 
 /// Returns the first standard v1/v2 Initial identity in a QUIC datagram.
 ///
@@ -741,6 +758,16 @@ mod tests {
         tls_extension(0, &names)
     }
 
+    fn alpn_extension(names: &[&[u8]]) -> Vec<u8> {
+        let size: usize = names.iter().map(|name| name.len() + 1).sum();
+        let mut value = u16::try_from(size).unwrap().to_be_bytes().to_vec();
+        for name in names {
+            value.push(u8::try_from(name.len()).unwrap());
+            value.extend_from_slice(name);
+        }
+        tls_extension(16, &value)
+    }
+
     fn client_hello(extensions: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]);
@@ -758,6 +785,153 @@ mod tests {
         handshake.extend_from_slice(&length[1..]);
         handshake.extend_from_slice(&body);
         handshake
+    }
+
+    #[cfg(feature = "inbound-http")]
+    pub(crate) fn h3_initial_for_test(host: &str, dcid: &[u8]) -> Vec<u8> {
+        let mut extensions = server_name_extension(host);
+        extensions.extend(alpn_extension(&[b"h3"]));
+        initial_packet_with_connection_ids(
+            QuicVersion::V1,
+            dcid,
+            dcid,
+            0,
+            1,
+            &[],
+            &crypto_frame(0, &client_hello(&extensions)),
+        )
+    }
+
+    #[test]
+    fn h3_only_requires_valid_unambiguous_alpn_and_visible_sni() {
+        let domain = "example.com";
+        let name = server_name_extension(domain);
+        for (alpn, only_h3) in [
+            (alpn_extension(&[b"h3"]), true),
+            (alpn_extension(&[b"h3", b"h3-29"]), true),
+            (alpn_extension(&[b"h3", b"doq"]), false),
+            (alpn_extension(&[b"doq"]), false),
+            (alpn_extension(&[b"h3-invalid"]), false),
+            (alpn_extension(&[b"h3-"]), false),
+            (alpn_extension(&[]), false),
+            (alpn_extension(&[b""]), false),
+            (tls_extension(16, &[0, 3, 4, b'h', b'3']), false),
+            (
+                [alpn_extension(&[b"h3"]), alpn_extension(&[b"h3"])].concat(),
+                false,
+            ),
+        ] {
+            let extensions = [name.clone(), alpn].concat();
+            for version in [QuicVersion::V1, QuicVersion::V2] {
+                let packet =
+                    initial_packet(version, 0, 1, &crypto_frame(0, &client_hello(&extensions)));
+                assert_eq!(
+                    QuicSniffer::new().ingest(&packet),
+                    if only_h3 {
+                        QuicSniffOutcome::MatchedHttp3(domain.to_owned())
+                    } else {
+                        QuicSniffOutcome::Matched(domain.to_owned())
+                    }
+                );
+            }
+        }
+        let ech = [name, alpn_extension(&[b"h3"]), tls_extension(0xfe0d, &[0])].concat();
+        for (extensions, outcome) in [
+            (alpn_extension(&[b"h3"]), QuicSniffOutcome::NotMatched),
+            (ech, QuicSniffOutcome::EchExtensionPresent),
+        ] {
+            let packet = initial_packet(
+                QuicVersion::V1,
+                0,
+                1,
+                &crypto_frame(0, &client_hello(&extensions)),
+            );
+            assert_eq!(QuicSniffer::new().ingest(&packet), outcome);
+        }
+    }
+
+    #[cfg(feature = "inbound-http")]
+    #[test]
+    fn h3_fallback_only_drops_an_authenticated_initial_flight_and_its_retries() {
+        use crate::{
+            session::{Datagram, Destination},
+            udp_sniffing::{IngressResult, QUIC_SNIFF_TIMEOUT, SniffState},
+        };
+        use bytes::Bytes;
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let destination = Destination::domain("udp-tuple.example", 443).unwrap();
+        let to_datagram = |packet: Vec<u8>| Datagram {
+            remote: destination.clone(),
+            payload: Bytes::from(packet),
+            sniffed_domain: None,
+        };
+        let mut state = SniffState::with_idle_timeout(QuicSniffer::new, Duration::from_secs(30));
+        let now = Instant::now();
+        let fallback = |domain: &str| domain == "target.example";
+        let ingest = |state: &mut SniffState<_, _, _>, packet| {
+            state.ingest_with_h3_fallback(to_datagram(packet), now, false, fallback)
+        };
+        let extensions = [
+            server_name_extension("target.example"),
+            alpn_extension(&[b"h3"]),
+        ]
+        .concat();
+        let hello = client_hello(&extensions);
+        let split = 18;
+        let first = initial_packet(QuicVersion::V1, 0, 1, &crypto_frame(0, &hello[..split]));
+        let second = initial_packet(QuicVersion::V1, 1, 1, &crypto_frame(split, &hello[split..]));
+        let prefix = zero_rtt_packet(QuicVersion::V1);
+        assert!(is_quic_fallback_candidate(&first));
+        assert!(is_quic_fallback_candidate(&prefix));
+        assert!(!is_quic_fallback_candidate(b"ordinary UDP"));
+        assert!(matches!(
+            ingest(&mut state, prefix.clone()),
+            IngressResult::Buffered
+        ));
+        assert!(matches!(
+            ingest(&mut state, first.clone()),
+            IngressResult::Buffered
+        ));
+        let IngressResult::Replay(replay) = ingest(&mut state, second.clone()) else {
+            panic!("an unidentified prefix must still be replayed");
+        };
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].datagram.payload.as_ref(), prefix);
+        assert!(replay[0].flow_id.is_none());
+        assert!(replay[0].sniffed_domain.is_none());
+        assert_eq!(state.pending_datagrams, 0);
+        assert_eq!(state.pending_bytes, 0);
+        assert!(matches!(
+            ingest(&mut state, first.clone()),
+            IngressResult::Dropped
+        ));
+        assert!(matches!(ingest(&mut state, second), IngressResult::Dropped));
+
+        let mut damaged = first.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        for payload in [
+            damaged,
+            b"ordinary UDP".to_vec(),
+            h3_initial_for_test("other.example", b"secondid"),
+        ] {
+            let IngressResult::Forward(sent) = ingest(&mut state, payload.clone()) else {
+                panic!("bytes outside the blocked flight must forward");
+            };
+            assert_eq!(sent.datagram.payload.as_ref(), payload);
+            assert!(sent.sniffed_domain.is_none());
+            assert!(sent.flow_id.is_none());
+        }
+        assert!(matches!(
+            ingest(&mut state, first.clone()),
+            IngressResult::Buffered
+        ));
+        let replay = state.expire(now + QUIC_SNIFF_TIMEOUT);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].datagram.payload.as_ref(), first);
+        assert!(replay[0].flow_id.is_none());
+        assert_eq!(state.pending_bytes, 0);
     }
 
     fn write_varint(value: u64, output: &mut Vec<u8>) {

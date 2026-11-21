@@ -245,7 +245,7 @@ async fn completed_post_h2_upload_error_after_final_headers_preserves_reply_and_
                     }
                 }}
             }));
-            let response = ResponseSlot(Arc::new(Mutex::new(ResponseState { response, infos:0, final_started:false, upstream_final_received:false })));
+            let response = ResponseSlot::new(response);
             let policy = Document::parse(EMPTY_POLICY).map_err(error)?.compile().map_err(error)?.bind_settings(&Default::default(), None).map_err(error)?;
             let context = HttpContext::new(policy, Arc::new(UnusedDispatcher), SecurityContext::default());
             let target = Target { original:url.clone(), original_method:http::Method::POST, url:url.clone(), session:session(), logical_destination:Destination::domain("a.test",443).map_err(error)?, strip_origin_credentials:false, request_conditions:0 };
@@ -507,8 +507,8 @@ async fn completed_post_h2_dropped_exchange_retires_admission_without_cancelling
                     accepted=connection.accept()=>match accepted {Some(Ok(_))=>return Err(failed()),Some(Err(_))|None=>return Ok(())}
                 }}
             }));
-            let first_slot = ResponseSlot(Arc::new(Mutex::new(ResponseState {response:first_response_owner,infos:0,final_started:false,upstream_final_received:false})));
-            let sibling_slot = ResponseSlot(Arc::new(Mutex::new(ResponseState {response:sibling_response_owner,infos:0,final_started:false,upstream_final_received:false})));
+            let first_slot = ResponseSlot::new(first_response_owner);
+            let sibling_slot = ResponseSlot::new(sibling_response_owner);
             let policy = Document::parse(EMPTY_POLICY).map_err(error)?.compile().map_err(error)?.bind_settings(&Default::default(), None).map_err(error)?;
             let context = HttpContext::new(policy,Arc::new(UnusedDispatcher),SecurityContext::default());
             let first_request = Request::builder().method("POST").uri("https://a.test/drop").header("content-length",8).body(h2_body::Source::h2(first_request.into_body())).map_err(error)?;

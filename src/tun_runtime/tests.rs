@@ -1258,6 +1258,7 @@ async fn quic_association_holds_the_first_fragment_then_sends_the_original_fligh
     let dispatcher = Arc::new(RecordingUdpDispatcher {
         datagrams: datagrams.clone(),
         sent: sent.clone(),
+        h3_fallback: false,
     });
     let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
     let (responses, _responses_rx) = mpsc::channel(4);
@@ -1345,6 +1346,80 @@ async fn quic_association_holds_the_first_fragment_then_sends_the_original_fligh
         .expect("QUIC association did not stop")
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn quic_association_applies_h3_fallback_without_routing_sniffing() {
+    let source = "192.0.2.10:12000".parse().unwrap();
+    let destination = "198.51.100.20:443".parse().unwrap();
+    let other_port = "198.51.100.20:8443".parse().unwrap();
+    let datagrams = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(RecordingUdpDispatcher {
+        datagrams: datagrams.clone(),
+        sent: Arc::new(Notify::new()),
+        h3_fallback: true,
+    });
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
+    let (responses, _responses_rx) = mpsc::channel(4);
+    let blocked = Bytes::from(crate::quic_sniffer::h3_initial_for_test(
+        "rewrite.example",
+        b"blocked1",
+    ));
+    let unrelated = Bytes::from(crate::quic_sniffer::h3_initial_for_test(
+        "other.example",
+        b"outside1",
+    ));
+    let ordinary = Bytes::from_static(b"ordinary UDP");
+    for (peer, payload) in [
+        (destination, blocked.clone()),
+        (destination, ordinary.clone()),
+        (destination, blocked.clone()),
+        (destination, unrelated.clone()),
+        (other_port, blocked.clone()),
+    ] {
+        inbound_tx
+            .try_send(UdpDatagram::new(source, peer, payload))
+            .unwrap();
+    }
+    drop(inbound_tx);
+    let context = UdpAssociationTaskContext {
+        udp_timeout: Duration::from_secs(30),
+        association_id: 1,
+        source,
+        responses,
+        dispatcher,
+        resource_stats: RuntimeResourceStats::new("tun_h3_fallback_test"),
+        association_clock: AssociationClock::realtime(),
+        last_activity: Arc::new(AtomicU64::new(0)),
+        tun_mtu: TUN_MTU,
+        sniffer: None,
+        cancellation: CancellationToken::new(),
+    };
+    timeout(
+        Duration::from_secs(1),
+        run_udp_association_inner(&mut inbound_rx, &context),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let recorded = datagrams.lock().unwrap();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|datagram| (&datagram.remote, &datagram.payload))
+            .collect::<Vec<_>>(),
+        [
+            (&Destination::Ip(destination), &ordinary),
+            (&Destination::Ip(destination), &unrelated),
+            (&Destination::Ip(other_port), &blocked),
+        ]
+    );
+    assert!(
+        recorded
+            .iter()
+            .all(|datagram| datagram.sniffed_domain.is_none())
+    );
 }
 
 #[tokio::test]
@@ -2184,6 +2259,7 @@ struct BlockingDispatcher {
 struct RecordingUdpDispatcher {
     datagrams: Arc<Mutex<Vec<Datagram>>>,
     sent: Arc<Notify>,
+    h3_fallback: bool,
 }
 
 struct RecordingUdpTransport {
@@ -2205,6 +2281,10 @@ struct ReplayFairDatagrams {
 
 #[async_trait]
 impl Dispatcher for RecordingUdpDispatcher {
+    fn http_h3_fallback(&self, port: u16, server_name: Option<&str>) -> bool {
+        self.h3_fallback && port == 443 && server_name.is_none_or(|name| name == "rewrite.example")
+    }
+
     async fn connect_tcp(&self, _session: StreamSession) -> Result<BoxStream, DispatchError> {
         Err(DispatchError::Other("unused TCP path".to_owned()))
     }

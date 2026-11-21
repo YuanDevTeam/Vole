@@ -134,6 +134,7 @@ impl HttpContext {
     ) -> io::Result<bool> {
         let (config, cancellation) = scope;
         let original = request_url(request, scheme)?;
+        let h3_fallback = self.policy().h3_fallback_for_url(&original);
         if scheme == Scheme::Http
             && let Some(plan) = self
                 .dispatcher()
@@ -215,7 +216,7 @@ impl HttpContext {
                     original_meta.identity_allowed,
                     self.policy().body_budget(),
                 );
-                return write_local(writer, local, config.header_timeout).await;
+                return write_local(writer, local, config.header_timeout, h3_fallback).await;
             }
             Decision::Forward(target) => *target,
         };
@@ -366,6 +367,7 @@ impl HttpContext {
                                 body: bytes::Bytes::new(),
                             },
                             config.header_timeout,
+                            h3_fallback,
                         )
                         .await;
                     }
@@ -375,7 +377,7 @@ impl HttpContext {
                 Outcome::Respond(local) => {
                     drop(message);
                     drop(prepared);
-                    return write_local(writer, local, config.header_timeout).await;
+                    return write_local(writer, local, config.header_timeout, h3_fallback).await;
                 }
                 Outcome::Forward => {}
             }
@@ -426,6 +428,7 @@ impl HttpContext {
             original: &original_url,
             request,
             request_conditions,
+            h3_fallback,
             meta: original_meta,
             continued: std::sync::atomic::AtomicBool::new(continued),
             prepared: std::sync::Mutex::new(prepared_upload),
@@ -550,9 +553,13 @@ impl HttpContext {
 }
 async fn write_local<W: AsyncWrite + Unpin>(
     writer: &mut W,
-    local: super::script_message::LocalResponse,
+    mut local: super::script_message::LocalResponse,
     idle: Duration,
+    h3_fallback: bool,
 ) -> io::Result<bool> {
+    if h3_fallback {
+        super::headers::alt_svc::filter_fields(&mut local.headers);
+    }
     let reason = http::StatusCode::from_u16(local.status)
         .ok()
         .and_then(|s| s.canonical_reason())

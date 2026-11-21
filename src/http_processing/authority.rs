@@ -281,11 +281,12 @@ mod tests {
         let authority = Authority::load(&cert, &key).unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(authority.certificate.clone()).unwrap();
-        let client = rustls::ClientConfig::builder_with_provider(authority.provider.clone())
+        let mut client = rustls::ClientConfig::builder_with_provider(authority.provider.clone())
             .with_safe_default_protocol_versions()
             .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
+        client.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
         let (client_io, server_io) = tokio::io::duplex(16 * 1024);
         let acceptor =
             tokio_rustls::TlsAcceptor::from(authority.server_config("one.example").unwrap());
@@ -294,8 +295,10 @@ mod tests {
             acceptor.accept(server_io),
             connector.connect("one.example".try_into().unwrap(), client_io)
         );
-        let _server = server.unwrap();
+        let server = server.unwrap();
         let client = client.unwrap();
+        assert_eq!(server.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+        assert_eq!(client.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
         let certificates = client.get_ref().1.peer_certificates().unwrap();
         let (_, leaf) = parse_x509_certificate(certificates[0].as_ref()).unwrap();
         use x509_parser::extensions::ParsedExtension;

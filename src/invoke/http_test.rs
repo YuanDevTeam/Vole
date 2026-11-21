@@ -183,12 +183,15 @@ async fn evaluate_samples(
                     }
                     UrlAction::Respond(reply) if allow_respond => {
                         local = true;
-                        let reply = LocalResponse::from_static(
+                        let mut reply = LocalResponse::from_static(
                             &reply,
                             method == "HEAD",
                             request_meta.identity_allowed,
                             policy.body_budget(),
                         );
+                        if policy.h3_fallback_for_url(&original) {
+                            headers::alt_svc::filter_fields(&mut reply.headers);
+                        }
                         json!({"outcome":"respond","status":reply.status,"headers":reply.headers,
                             "bodyBase64":resources.encode_body(policy.body_budget(), &reply.body)?})
                     }
@@ -543,11 +546,16 @@ impl Exchange<'_> {
 
         let terminal = match outcome {
             Ok(Outcome::Forward) => None,
-            Ok(Outcome::Respond(response)) => Some(json!({
-                "phase":phase_name(phase), "outcome":"respond", "status":response.status,
-                "headers":response.headers,
-                "bodyBase64":resources.encode_body(budget, &response.body)?
-            })),
+            Ok(Outcome::Respond(mut response)) => {
+                if self.policy.h3_fallback_for_url(&self.original.url) {
+                    headers::alt_svc::filter_fields(&mut response.headers);
+                }
+                Some(json!({
+                    "phase":phase_name(phase), "outcome":"respond", "status":response.status,
+                    "headers":response.headers,
+                    "bodyBase64":resources.encode_body(budget, &response.body)?
+                }))
+            }
             Ok(Outcome::Abort) => Some(json!({"phase":phase_name(phase), "outcome":"abort"})),
             Err(error) => Some(
                 json!({"phase":phase_name(phase), "outcome":"failed", "reason": match error.kind() {
@@ -585,7 +593,10 @@ impl Exchange<'_> {
         {
             data["bodyBase64"] = json!(resources.encode_body(budget, output)?);
         }
-        if let Some(response) = message.response {
+        if let Some(mut response) = message.response {
+            if self.policy.h3_fallback_for_url(&self.original.url) {
+                headers::alt_svc::filter_fields(&mut response.headers);
+            }
             data["status"] = json!(response.status);
             data["headers"] = json!(response.headers);
         } else {
@@ -817,6 +828,37 @@ targets:
         assert_eq!(
             run(json!({"url":"http://example.com/v1","httpConfigYaml":yaml}))["url"]["status"],
             403
+        );
+    }
+
+    #[test]
+    fn h3_alt_svc_filter_runs_after_the_original_response_match() {
+        let yaml = r#"
+targets:
+  - origins: ['https://www.example.com']
+    rules:
+      - response:
+          when:
+            headers: [{name: alt-svc, regex: '^h3='}]
+          headers: [{set: {x-original-alt-svc: yes}}]
+"#;
+        let advertised = "h3=\":443\", h2=\":8443\"";
+        let mut sample = json!({
+            "httpConfigYaml": yaml,
+            "httpContext": {"mitmEnabled": true},
+            "url": "https://www.example.com/",
+            "request": {},
+            "response": {"status": 200, "headers": [["alt-svc", advertised]]},
+        });
+        let transformed = run(sample.clone());
+        assert_eq!(
+            transformed["stages"][1]["headers"],
+            json!([["alt-svc", "h2=\":8443\""], ["x-original-alt-svc", "yes"]])
+        );
+        sample["httpContext"]["rewriteEnabled"] = false.into();
+        assert_eq!(
+            run(sample)["stages"][1]["headers"],
+            json!([["alt-svc", advertised]])
         );
     }
 }

@@ -37,6 +37,7 @@ pub(crate) struct Message<'a> {
     pub(crate) original: &'a Url,
     pub(crate) request: &'a RequestHead,
     pub(crate) request_conditions: u64,
+    pub(crate) h3_fallback: bool,
     pub(crate) meta: OriginalRequestMeta,
     pub(crate) continued: AtomicBool,
     pub(crate) prepared: std::sync::Mutex<Option<PreparedBody>>,
@@ -142,7 +143,7 @@ impl Message<'_> {
                 .any(|script| script.phase == Phase::Response && script.matches(selection))
         });
         let original_fields = scripts.map(|_| response.headers().clone());
-        self.apply_response_headers(response, selection)?;
+        self.apply_response_headers(response, selection, scripts.is_none())?;
         if let Some(script) = scripts {
             let wants_body = self.policy.scripts().iter().any(|s| {
                 s.phase == Phase::Response && s.body != BodyMode::None && s.matches(selection)
@@ -199,16 +200,22 @@ impl Message<'_> {
             };
             match outcome {
                 Outcome::Forward => {
-                    let current = message.response.take().expect("response message");
+                    let mut current = message.response.take().expect("response message");
+                    if self.h3_fallback {
+                        super::headers::alt_svc::filter_fields(&mut current.headers);
+                    }
                     response.replace(current.status, current.headers)?;
                     if let Some(entity) = message.body {
                         prepared.install_entity(entity);
                     }
                     return Ok(prepared);
                 }
-                Outcome::Respond(local) => {
+                Outcome::Respond(mut local) => {
                     drop(message);
                     drop(prepared);
+                    if self.h3_fallback {
+                        super::headers::alt_svc::filter_fields(&mut local.headers);
+                    }
                     response.replace(local.status, local.headers)?;
                     return Ok(PreparedBody::from_bytes(local.body));
                 }
@@ -245,16 +252,20 @@ impl Message<'_> {
     /// Informational responses and successful upgrades have no body stage,
     /// but their ordinary fields still participate in the response pipeline.
     pub(crate) fn response_headers(&self, response: &mut ResponseHead) -> io::Result<()> {
-        self.apply_response_headers(response, self.selection(0))
+        self.apply_response_headers(response, self.selection(0), true)
     }
 
     fn apply_response_headers(
         &self,
         response: &mut ResponseHead,
         selection: RequestMatch<'_>,
+        final_headers: bool,
     ) -> io::Result<()> {
         response.edit_headers(|fields| {
             super::headers::apply(self.policy.rules(), selection, Phase::Response, fields);
+            if final_headers && self.h3_fallback {
+                super::headers::alt_svc::filter_fields(fields);
+            }
         })
     }
 }

@@ -3,6 +3,9 @@ use super::rules::{HeaderOperation, Phase, RequestMatch, Rule, RuleAction, valid
 use std::io;
 
 pub(crate) type Fields = Vec<(String, String)>;
+#[cfg(feature = "inbound-http")]
+#[path = "alt_svc.rs"]
+pub(crate) mod alt_svc;
 pub(crate) const MAX_FIELDS: usize = 100;
 pub(crate) const MAX_BYTES: usize = 32 * 1024;
 

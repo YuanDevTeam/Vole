@@ -95,6 +95,8 @@ pub(crate) struct PendingQuicFlow<S, P> {
     sniffer: S,
     connection_key: Option<QuicConnectionKey>,
     datagrams: VecDeque<PreparedDatagram<P>>,
+    authenticated_datagrams: u8,
+    route_initial: bool,
     buffered_bytes: usize,
     deadline: TokioInstant,
 }
@@ -109,12 +111,14 @@ pub(crate) enum QuicFlowState<S, P> {
     Matched {
         domain: Arc<str>,
         completed: CompletedQuicFlow,
+        fallback_blocked: bool,
     },
     NoDomain(CompletedQuicFlow),
 }
 
 pub(crate) enum IngressResult<P> {
     Buffered,
+    Dropped,
     Forward(PreparedDatagram<P>),
     Replay(VecDeque<PreparedDatagram<P>>),
 }
@@ -136,7 +140,7 @@ fn prepend_quic_replay<P>(
         return next;
     }
     match next {
-        IngressResult::Buffered => IngressResult::Replay(replay),
+        IngressResult::Buffered | IngressResult::Dropped => IngressResult::Replay(replay),
         IngressResult::Forward(prepared) => {
             replay.push_back(prepared);
             IngressResult::Replay(replay)
@@ -146,6 +150,11 @@ fn prepend_quic_replay<P>(
             IngressResult::Replay(replay)
         }
     }
+}
+
+struct Admission<'a> {
+    route: bool,
+    fallback: &'a mut dyn FnMut(&str) -> bool,
 }
 
 pub(crate) struct SniffState<S, F, P: SniffPacket> {
@@ -183,6 +192,20 @@ where
     }
 
     pub(crate) fn ingest_datagram(&mut self, datagram: P, now: TokioInstant) -> IngressResult<P> {
+        self.ingest_with_h3_fallback(datagram, now, true, |_| false)
+    }
+
+    pub(crate) fn ingest_with_h3_fallback(
+        &mut self,
+        datagram: P,
+        now: TokioInstant,
+        sniff_for_routing: bool,
+        mut should_fallback: impl FnMut(&str) -> bool,
+    ) -> IngressResult<P> {
+        let mut admission = Admission {
+            route: sniff_for_routing,
+            fallback: &mut should_fallback,
+        };
         let destination = datagram.destination_key();
         let connection_key = quic_connection_key(datagram.payload());
         let state = self.flows.remove(&destination).filter(|state| match state {
@@ -195,35 +218,65 @@ where
             return self.fail_open_unsupported_version(datagram, state, now);
         }
         let Some(state) = state else {
-            return self.start_flow(datagram, connection_key, now);
+            return self.start_flow(datagram, connection_key, now, &mut admission);
         };
         match state {
             QuicFlowState::Matched {
                 domain,
                 mut completed,
+                fallback_blocked,
             } => {
-                if starts_new_quic_connection(&completed.connection_key, &connection_key) {
+                let retry_blocked_initial = fallback_blocked
+                    && connection_key.is_some()
+                    && connection_key == completed.connection_key;
+                if retry_blocked_initial
+                    || starts_new_quic_connection(&completed.connection_key, &connection_key)
+                {
                     let mut candidate = (self.new_sniffer)();
                     let outcome = candidate.ingest(datagram.payload());
                     if candidate.authenticated_initial_in_last_ingest() {
+                        if retry_blocked_initial
+                            && outcome == QuicSniffOutcome::NeedMoreData
+                            && (admission.fallback)(&domain)
+                        {
+                            completed.last_used = now;
+                            self.flows.insert(
+                                destination,
+                                QuicFlowState::Matched {
+                                    domain,
+                                    completed,
+                                    fallback_blocked: true,
+                                },
+                            );
+                            return IngressResult::Dropped;
+                        }
                         return self.commit_started_flow(
                             datagram,
                             connection_key,
                             now,
                             candidate,
                             outcome,
+                            &mut admission,
                         );
                     }
                 }
-                completed.last_used = now;
+                if !fallback_blocked {
+                    completed.last_used = now;
+                }
+                let prepared = if admission.route && !fallback_blocked {
+                    PreparedDatagram::with_domain(datagram, domain.clone())
+                } else {
+                    PreparedDatagram::without_domain(datagram)
+                };
                 self.flows.insert(
                     destination,
                     QuicFlowState::Matched {
-                        domain: domain.clone(),
+                        domain,
                         completed,
+                        fallback_blocked,
                     },
                 );
-                IngressResult::Forward(PreparedDatagram::with_domain(datagram, domain))
+                IngressResult::Forward(prepared)
             }
             QuicFlowState::NoDomain(mut completed) => {
                 if starts_new_quic_connection(&completed.connection_key, &connection_key) {
@@ -236,6 +289,7 @@ where
                             now,
                             candidate,
                             outcome,
+                            &mut admission,
                         );
                     }
                 }
@@ -254,7 +308,9 @@ where
                         // DCID accepted by existing keys is the same flow.
                         if pending.connection_key.is_none() {
                             pending.connection_key = connection_key;
-                            if let Some(first) = pending.datagrams.front_mut() {
+                            if pending.route_initial
+                                && let Some(first) = pending.datagrams.front_mut()
+                            {
                                 first.flow_id = pending.connection_key.clone();
                             }
                         }
@@ -264,6 +320,7 @@ where
                             datagram,
                             outcome,
                             now,
+                            &mut admission,
                         );
                     }
                     let mut candidate = (self.new_sniffer)();
@@ -275,12 +332,25 @@ where
                     }
                     self.release_pending(&pending);
                     let replay = pending.datagrams;
-                    let next =
-                        self.commit_started_flow(datagram, connection_key, now, candidate, outcome);
+                    let next = self.commit_started_flow(
+                        datagram,
+                        connection_key,
+                        now,
+                        candidate,
+                        outcome,
+                        &mut admission,
+                    );
                     return prepend_quic_replay(replay, next);
                 }
                 let outcome = pending.sniffer.ingest(datagram.payload());
-                self.apply_pending_outcome(destination, pending, datagram, outcome, now)
+                self.apply_pending_outcome(
+                    destination,
+                    pending,
+                    datagram,
+                    outcome,
+                    now,
+                    &mut admission,
+                )
             }
         }
     }
@@ -337,13 +407,14 @@ where
         datagram: P,
         connection_key: Option<QuicConnectionKey>,
         now: TokioInstant,
+        admission: &mut Admission<'_>,
     ) -> IngressResult<P> {
         if !self.make_room_for_flow() {
             return IngressResult::Forward(PreparedDatagram::without_domain(datagram));
         }
         let mut sniffer = (self.new_sniffer)();
         let outcome = sniffer.ingest(datagram.payload());
-        self.commit_started_flow(datagram, connection_key, now, sniffer, outcome)
+        self.commit_started_flow(datagram, connection_key, now, sniffer, outcome, admission)
     }
 
     fn commit_started_flow(
@@ -353,15 +424,15 @@ where
         now: TokioInstant,
         sniffer: S,
         outcome: QuicSniffOutcome,
+        admission: &mut Admission<'_>,
     ) -> IngressResult<P> {
         let destination = datagram.destination_key();
         // A parseable header alone must not suppress a later authenticated
         // Initial with the same DCID, or claim a connection identity.
-        let connection_key = sniffer
-            .authenticated_initial_in_last_ingest()
-            .then_some(connection_key)
-            .flatten();
-        let flow_id = connection_key.clone();
+        let authenticated = sniffer.authenticated_initial_in_last_ingest();
+        let connection_key = authenticated.then_some(connection_key).flatten();
+        let flow_id = admission.route.then(|| connection_key.clone()).flatten();
+        let h3_only = matches!(outcome, QuicSniffOutcome::MatchedHttp3(_));
         match outcome {
             QuicSniffOutcome::NeedMoreData if self.can_buffer(datagram.payload().len()) => {
                 let buffered_bytes = datagram.payload().len();
@@ -376,13 +447,17 @@ where
                         sniffer,
                         connection_key,
                         datagrams,
+                        authenticated_datagrams: u8::from(authenticated),
+                        route_initial: admission.route,
                         buffered_bytes,
                         deadline: now + QUIC_SNIFF_TIMEOUT,
                     }),
                 );
                 IngressResult::Buffered
             }
-            QuicSniffOutcome::Matched(domain) => {
+            QuicSniffOutcome::Matched(domain) | QuicSniffOutcome::MatchedHttp3(domain) => {
+                let fallback_blocked =
+                    h3_only && connection_key.is_some() && (admission.fallback)(&domain);
                 let domain: Arc<str> = Arc::from(domain);
                 self.flows.insert(
                     destination,
@@ -392,11 +467,18 @@ where
                             connection_key,
                             last_used: now,
                         },
+                        fallback_blocked,
                     },
                 );
-                IngressResult::Forward(
-                    PreparedDatagram::with_domain(datagram, domain).with_flow_id(flow_id),
-                )
+                if fallback_blocked {
+                    return IngressResult::Dropped;
+                }
+                let prepared = if admission.route {
+                    PreparedDatagram::with_domain(datagram, domain).with_flow_id(flow_id)
+                } else {
+                    PreparedDatagram::without_domain(datagram)
+                };
+                IngressResult::Forward(prepared)
             }
             QuicSniffOutcome::NeedMoreData
             | QuicSniffOutcome::EchExtensionPresent
@@ -423,11 +505,17 @@ where
         datagram: P,
         outcome: QuicSniffOutcome,
         now: TokioInstant,
+        admission: &mut Admission<'_>,
     ) -> IngressResult<P> {
+        let authenticated = pending.sniffer.authenticated_initial_in_last_ingest();
+        let h3_only = matches!(outcome, QuicSniffOutcome::MatchedHttp3(_));
         match outcome {
             QuicSniffOutcome::NeedMoreData if self.can_buffer(datagram.payload().len()) => {
                 let payload_len = datagram.payload().len();
                 pending.buffered_bytes += payload_len;
+                if authenticated {
+                    pending.authenticated_datagrams |= 1 << pending.datagrams.len();
+                }
                 pending
                     .datagrams
                     .push_back(PreparedDatagram::without_domain(datagram));
@@ -437,15 +525,65 @@ where
                     .insert(destination, QuicFlowState::Pending(pending));
                 IngressResult::Buffered
             }
-            QuicSniffOutcome::Matched(domain) => {
-                self.finish_pending(destination, pending, datagram, Some(Arc::from(domain)), now)
+            QuicSniffOutcome::Matched(domain) | QuicSniffOutcome::MatchedHttp3(domain) => {
+                if h3_only
+                    && authenticated
+                    && pending.connection_key.is_some()
+                    && (admission.fallback)(&domain)
+                {
+                    return self.block_pending(destination, pending, Arc::from(domain), now);
+                }
+                self.finish_pending(
+                    destination,
+                    pending,
+                    datagram,
+                    Some(Arc::from(domain)),
+                    now,
+                    admission.route,
+                )
             }
             QuicSniffOutcome::NeedMoreData
             | QuicSniffOutcome::EchExtensionPresent
             | QuicSniffOutcome::NotMatched
             | QuicSniffOutcome::LimitReached => {
-                self.finish_pending(destination, pending, datagram, None, now)
+                self.finish_pending(destination, pending, datagram, None, now, admission.route)
             }
+        }
+    }
+
+    fn block_pending(
+        &mut self,
+        destination: P::Key,
+        mut pending: PendingQuicFlow<S, P>,
+        domain: Arc<str>,
+        now: TokioInstant,
+    ) -> IngressResult<P> {
+        self.release_pending(&pending);
+        self.flows.insert(
+            destination,
+            QuicFlowState::Matched {
+                domain,
+                completed: CompletedQuicFlow {
+                    connection_key: pending.connection_key,
+                    last_used: now,
+                },
+                fallback_blocked: true,
+            },
+        );
+        // A non-Initial prefix may be pending before this Initial supplied a
+        // connection identity. Replay every buffered datagram we did not
+        // authenticate as part of this Initial flight.
+        let mut authenticated = pending.authenticated_datagrams;
+        pending.datagrams.retain_mut(|prepared| {
+            let belongs_to_flight = authenticated & 1 != 0;
+            authenticated >>= 1;
+            prepared.flow_id = None;
+            !belongs_to_flight
+        });
+        if pending.datagrams.is_empty() {
+            IngressResult::Dropped
+        } else {
+            IngressResult::Replay(pending.datagrams)
         }
     }
 
@@ -487,14 +625,21 @@ where
         datagram: P,
         domain: Option<Arc<str>>,
         now: TokioInstant,
+        route: bool,
     ) -> IngressResult<P> {
         self.release_pending(&pending);
         pending
             .datagrams
             .push_back(PreparedDatagram::without_domain(datagram));
-        if let Some(domain) = &domain {
+        if let Some(domain) = &domain
+            && route
+        {
             for buffered in &mut pending.datagrams {
                 buffered.sniffed_domain = Some(domain.clone());
+            }
+        } else if !route {
+            for buffered in &mut pending.datagrams {
+                buffered.flow_id = None;
             }
         }
         let completed = CompletedQuicFlow {
@@ -504,7 +649,11 @@ where
         self.flows.insert(
             destination,
             match domain {
-                Some(domain) => QuicFlowState::Matched { domain, completed },
+                Some(domain) => QuicFlowState::Matched {
+                    domain,
+                    completed,
+                    fallback_blocked: false,
+                },
                 None => QuicFlowState::NoDomain(completed),
             },
         );

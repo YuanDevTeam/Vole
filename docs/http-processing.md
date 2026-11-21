@@ -5,7 +5,7 @@
 SOCKS5 CONNECT、普通 HTTP 代理请求、HTTP CONNECT 和 TUN TCP 使用同一处理实现。
 明文候选端口从 HTTP origins 得出，解析请求后按原始 origin 匹配。普通 HTTP 代理请求始终按明文处理。SOCKS5/CONNECT 的候选流先确认代理握手，再读取业务数据。未识别或未获 MITM
 授权时，已读字节完整回放后继续嗅探/选路。连接沿固定 HTTP 资源代际执行，原始入口类型和
-认证身份不变。UDP/QUIC 不进入此 HTTP 处理路径。
+认证身份不变。UDP/QUIC 只参与 H3 回退识别，正文处理走 TCP 上的 HTTP。
 
 主配置 sniffer 与独立 HTTP 处理分别准入。关闭 sniffer、协议端口不匹配或命中其排除项，
 不会自动关闭已显式授权的 HTTP rewrite/MITM；嗅探得到域名也不能扩大 MITM 授权。
@@ -191,7 +191,11 @@ HEAD、无正文状态、206/Content-Range、CONNECT、Upgrade、SSE、gRPC、mu
 
 HTTPS origins 同时声明目标组的 MITM 范围。Core 只考虑启用且含有效操作的目标。诊断用的 `intercept-only: true` 需要本机明确允许。`httpContext.mitmEnabled` 默认 false，`httpContext.excludeDomains` 默认空，按精确域名或 `*.suffix` 排除所有插件及端口。通配符覆盖多层子域，根域需单独排除。排除只作用于 MITM。启用后若仍有可拦截的 HTTPS origin，宿主通过独立私密入口提供有效的 CA 与匹配私钥，客户端需要信任该 CA。明文规则可以独立运行。
 
-MITM 支持 HTTP/1.1 与 HTTP/2。HTTP/3 MITM 暂不支持；UDP／QUIC（含 H3）按原字节透明转发，不进入 URL/header/body rewrite，也不通过阻断 QUIC 强制客户端回落。
+MITM 在 TCP 上按 ALPN 优先协商 HTTP/2，再接受 HTTP/1.1。开启本机 `mitmEnabled` 和 `rewriteEnabled` 后，有生效原生规则或已启用 JS 的 HTTPS origins 自动启用 H3 回退。全局排除和每个插件的授权范围优先，仅解密目标继续透传 QUIC。
+
+TUN 和 SOCKS5 UDP 对候选端口使用有界的 QUIC v1/v2 Initial 检查。仅在可见 SNI 和实际目的端口命中该 HTTPS origin，且 ClientHello 的 ALPN 均为 HTTP/3 时抑制这次 Initial 握手及其重传。支持 TCP 回退的客户端可重连，再由 TLS 协商共同支持的 HTTP 版本。普通 UDP、其他 QUIC、ECH、无法确认的 Initial，以及尚未识别的已建立连接继续转发。使用缓存中的其他 UDP 端口时，仍按实际目的端口匹配。仅支持 H3 的客户端无法使用 TCP 回退。 [RFC 9114 §3.1](https://www.rfc-editor.org/rfc/rfc9114.html#section-3.1)
+
+作用域内的 H1/H2 响应在改写结束后移除可识别的 H3 `Alt-Svc` 声明，保留其他替代服务。若删完所有声明，发送 `Alt-Svc: clear` 清除已有缓存。 [RFC 7838 §3](https://www.rfc-editor.org/rfc/rfc7838.html#section-3)
 
 握手时按已授权的 SNI／端口判断，本机排除同时适用于通配的实际主机。无 SNI、ECH（含 GREASE）和未授权名称保持透明。在执行规则前重新检查每个 H1 请求和 H2 流的原始 authority。未获授权的 authority 返回 403。每条规则还须匹配所属实例获准的 origin。最终上游按实际目标验证证书，使用受保护出口。不通过关闭验证处理 pinning 或客户端证书要求。
 

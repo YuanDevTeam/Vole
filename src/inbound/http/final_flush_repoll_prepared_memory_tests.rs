@@ -242,6 +242,7 @@ async fn shared(native: Native, case: Case) -> (bool, bool, usize) {
         original: &original,
         request: &request,
         request_conditions: 0,
+        h3_fallback: false,
         meta: original_meta,
         continued: std::sync::atomic::AtomicBool::new(false),
         prepared: Mutex::new(Some(prepared)),

@@ -340,4 +340,77 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn h3_fallback_uses_active_rewrites_and_the_original_authority() {
+        let candidate = Document::parse(
+            r#"
+targets:
+  - origins: ['https://*.cdn.example.com:8443']
+    rules:
+      - response:
+          headers: [{set: {x-rewritten: yes}}]
+  - origins: ['https://diagnostic.example.com:9443']
+    intercept-only: true
+  - origins: ['http://plain.example.com:8080']
+    rules:
+      - request: {url: {reject: true}}
+  - origins: ['https://empty.example.com']
+    rules:
+      - response: {body: [{json-patch: []}]}
+"#,
+        )
+        .unwrap()
+        .compile()
+        .unwrap();
+        let settings = HttpSettings {
+            mitm_enabled: true,
+            allow_intercept_only: true,
+            exclude_domains: vec!["*.private.cdn.example.com".into()],
+            ..Default::default()
+        };
+        let material = test_material();
+        let policy = candidate.bind_settings(&settings, Some(&material)).unwrap();
+        for (host, port, expected) in [
+            ("sub.cdn.example.com", 8443, true),
+            ("deep.sub.cdn.example.com", 8443, true),
+            ("cdn.example.com", 8443, false),
+            ("a.private.cdn.example.com", 8443, false),
+            ("sub.cdn.example.com", 443, false),
+            ("diagnostic.example.com", 9443, false),
+            ("plain.example.com", 8080, false),
+            ("empty.example.com", 443, false),
+        ] {
+            let url = url::Url::parse(&format!("https://{host}:{port}/path")).unwrap();
+            assert_eq!(
+                policy.h3_fallback_for_udp(port, Some(host)),
+                expected,
+                "{url}"
+            );
+            assert_eq!(policy.h3_fallback_for_url(&url), expected, "{url}");
+        }
+        assert!(policy.h3_fallback_for_udp(8443, None));
+        assert!(!policy.h3_fallback_for_udp(443, None));
+        assert!(!policy.h3_fallback_for_udp(9443, None));
+        for settings in [
+            HttpSettings {
+                mitm_enabled: false,
+                ..settings.clone()
+            },
+            HttpSettings {
+                rewrite_enabled: false,
+                ..settings.clone()
+            },
+            HttpSettings {
+                exclude_domains: vec!["*.cdn.example.com".into()],
+                ..settings
+            },
+        ] {
+            let policy = candidate.bind_settings(&settings, Some(&material)).unwrap();
+            assert!(!policy.h3_fallback_for_udp(8443, None));
+            assert!(!policy.h3_fallback_for_url(
+                &url::Url::parse("https://sub.cdn.example.com:8443/path").unwrap()
+            ));
+        }
+    }
 }
