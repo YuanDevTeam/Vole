@@ -10,7 +10,7 @@ const MAX_PROOF_BINDINGS: usize = 128;
 const MAX_PROOF_DEPENDENCIES: usize = 32;
 
 #[derive(Clone)]
-struct StringProof {
+struct SizeProof {
     literal_bytes: usize,
     original_input: bool,
     dependencies: BTreeSet<String>,
@@ -32,6 +32,7 @@ pub(super) fn analyze(function: &Function<'_>) -> OutputBound {
         nodes: 0,
         declared: BTreeSet::new(),
         bindings: BTreeMap::new(),
+        byte_copies: BTreeSet::new(),
         writes: BTreeSet::new(),
         root_strings: BTreeSet::new(),
         audited_writes: BTreeSet::new(),
@@ -65,12 +66,13 @@ struct Analysis {
     safe: bool,
     nodes: usize,
     declared: BTreeSet<String>,
-    bindings: BTreeMap<String, StringProof>,
+    bindings: BTreeMap<String, SizeProof>,
+    byte_copies: BTreeSet<String>,
     writes: BTreeSet<String>,
     root_strings: BTreeSet<String>,
     audited_writes: BTreeSet<String>,
     other_writes: BTreeSet<String>,
-    returns: Vec<StringProof>,
+    returns: Vec<SizeProof>,
 }
 
 impl Analysis {
@@ -189,6 +191,9 @@ impl Analysis {
                 if !self.safe {
                     return;
                 }
+                if declaration.kind == VariableDeclarationKind::Const && self.byte_proof(init) {
+                    self.byte_copies.insert(name.to_owned());
+                }
                 if let Some(proof) = self.string_proof(init) {
                     if root && matches!(declaration.kind, VariableDeclarationKind::Let) {
                         self.root_strings.insert(name.to_owned());
@@ -264,6 +269,18 @@ impl Analysis {
                             && ascii_self_assignment(value, name);
                         self.record_write(name, audited);
                     }
+                    AssignmentTarget::ComputedMemberExpression(member)
+                        if value.operator == AssignmentOperator::Assign
+                            && !member.optional
+                            && self.copied_bytes_local(&member.object)
+                            && matches!(unparenthesized(&member.expression), Expression::NumericLiteral(index)
+                                if index.value >= 0.0 && index.value.fract() == 0.0
+                                    && index.value < super::super::super::body_budget::MAX_BODY as f64) =>
+                    {
+                        // The runtime setter rejects any out-of-bounds or non-byte
+                        // write to the fresh fixed-length Uint8Array.
+                        self.expression(&member.expression);
+                    }
                     // Includes writes through aliases, computed keys, argument
                     // expressions and unreachable branches.
                     _ => self.safe = false,
@@ -278,7 +295,7 @@ impl Analysis {
                 _ => self.safe = false,
             },
             Expression::CallExpression(call) if !call.optional => {
-                self.safe &= safe_call(call);
+                self.safe &= safe_call(call) || copies_input_bytes(call, &self.parameter);
                 if let Expression::StaticMemberExpression(member) = &call.callee {
                     self.expression(&member.object);
                 }
@@ -306,7 +323,7 @@ impl Analysis {
             && self.other_writes.len() <= MAX_PROOF_BINDINGS;
     }
 
-    fn return_proof(&self, expression: &Expression<'_>) -> Option<StringProof> {
+    fn return_proof(&self, expression: &Expression<'_>) -> Option<SizeProof> {
         let fields = object_fields(expression)?;
         if fields.keys().any(|key| {
             !matches!(
@@ -327,13 +344,29 @@ impl Analysis {
             return None;
         }
         let body = object_fields(body)?;
-        if body.len() != 2 || literal(body.get("kind")?)? != "text" {
+        if body.len() != 2 {
             return None;
         }
-        self.string_proof(body.get("data")?)
+        let data = body.get("data")?;
+        match literal(body.get("kind")?)? {
+            "text" => self.string_proof(data),
+            "bytes" if self.byte_proof(data) => Some(input_proof()),
+            _ => None,
+        }
     }
 
-    fn string_proof(&self, expression: &Expression<'_>) -> Option<StringProof> {
+    fn copied_bytes_local(&self, expression: &Expression<'_>) -> bool {
+        matches!(unparenthesized(expression), Expression::Identifier(name)
+            if self.byte_copies.contains(name.name.as_str()))
+    }
+
+    fn byte_proof(&self, expression: &Expression<'_>) -> bool {
+        self.copied_bytes_local(expression)
+            || matches!(unparenthesized(expression), Expression::CallExpression(call)
+                if copies_input_bytes(call, &self.parameter))
+    }
+
+    fn string_proof(&self, expression: &Expression<'_>) -> Option<SizeProof> {
         match unparenthesized(expression) {
             Expression::StringLiteral(value) => Some(constant_proof(value.value.as_str()?.len())),
             Expression::Identifier(identifier) => {
@@ -342,11 +375,7 @@ impl Analysis {
                 proof.dependencies.insert(name.to_owned());
                 (proof.dependencies.len() <= MAX_PROOF_DEPENDENCIES).then_some(proof)
             }
-            value if original_data(value, &self.parameter) => Some(StringProof {
-                literal_bytes: 0,
-                original_input: true,
-                dependencies: BTreeSet::new(),
-            }),
+            value if original_data(value, &self.parameter) => Some(input_proof()),
             Expression::CallExpression(call) if !call.optional && call.arguments.len() == 2 => {
                 let Expression::StaticMemberExpression(member) = &call.callee else {
                     return None;
@@ -413,12 +442,29 @@ fn ascii_self_assignment(assignment: &AssignmentExpression<'_>, name: &str) -> b
         && replacement != "$"
 }
 
-fn constant_proof(literal_bytes: usize) -> StringProof {
-    StringProof {
+fn constant_proof(literal_bytes: usize) -> SizeProof {
+    SizeProof {
         literal_bytes,
         original_input: false,
         dependencies: BTreeSet::new(),
     }
+}
+
+fn input_proof() -> SizeProof {
+    SizeProof {
+        original_input: true,
+        ..constant_proof(0)
+    }
+}
+
+fn copies_input_bytes(call: &CallExpression<'_>, parameter: &str) -> bool {
+    matches!(&call.callee, Expression::StaticMemberExpression(member)
+        if !call.optional && !member.optional && member.property.name == "copyBytes"
+            && matches!(&member.object, Expression::Identifier(name) if name.name == "Vole"))
+        && (1..=3).contains(&call.arguments.len())
+        && call.arguments[0]
+            .as_expression()
+            .is_some_and(|argument| original_data(argument, parameter))
 }
 
 fn unparenthesized<'a, 'b>(mut expression: &'b Expression<'a>) -> &'b Expression<'a> {
@@ -487,7 +533,8 @@ fn original_data(expression: &Expression<'_>, parameter: &str) -> bool {
 // remains Maximum until its effects are reviewed. Primitive conversions reject
 // objects; no callbacks/accessors are expressible. Array mutators only change
 // array indices/length (or fixed-size typed-array elements), never the fresh
-// plain input.body record's data property. Member writes are forbidden above.
+// plain input.body record's data property. Indexed writes are only audited on
+// a fixed-length byte copy owned by the script.
 fn safe_call(call: &CallExpression<'_>) -> bool {
     match &call.callee {
         Expression::Identifier(identifier) => {
@@ -546,6 +593,61 @@ mod tests {
 
     fn hint(source: &str) -> OutputBound {
         super::super::compile_with_output_bound(source).unwrap().1
+    }
+
+    #[test]
+    fn bounds_length_preserving_binary_copies() {
+        let fixed_length = OutputBound::InputOrConstant {
+            maximum_literal_bytes: 0,
+        };
+        for source in [
+            r#"function rewrite(input) {
+                const bytes = Vole.copyBytes(input.body.data);
+                if (bytes[0] !== 7) return {type: "abort"};
+                bytes[0] = 8;
+                return {type: "modify", headers: [
+                    {op: "set", name: "x-vole-request", values: ["js"]}
+                ], body: {kind: "bytes", data: bytes}};
+            }"#,
+            r#"function rewrite(input) {
+                return {type: "modify", body: {kind: "bytes", data: Vole.copyBytes(input.body.data, 1)}};
+            }"#,
+            r#"function rewrite(input) {
+                const copy = Vole.copyBytes(input.body.data);
+                const alias = copy;
+                alias[1] = 42;
+                return {type: "modify", body: {kind: "bytes", data: copy}};
+            }"#,
+        ] {
+            assert_eq!(hint(source), fixed_length, "{source}");
+        }
+    }
+
+    #[test]
+    fn binary_proof_rejects_unproven_values_and_writes() {
+        for source in [
+            r#"function rewrite(input) {
+                let bytes = Vole.copyBytes(input.body.data);
+                bytes = Uint8Array.from([7, 8, 9]);
+                return {type: "modify", body: {kind: "bytes", data: bytes}};
+            }"#,
+            r#"function rewrite(input) {
+                const bytes = Vole.copyBytes(input.body.data);
+                bytes.length = 128;
+                return {type: "modify", body: {kind: "bytes", data: bytes}};
+            }"#,
+            r#"function rewrite(input) {
+                const bytes = Vole.copyBytes(input.body.data);
+                input.body.data[0] = 8;
+                return {type: "modify", body: {kind: "bytes", data: bytes}};
+            }"#,
+            r#"function rewrite(input) {
+                const bytes = Vole.copyBytes(input.body.data);
+                return {type: "modify", body: {kind: "bytes", data: Vole.concatBytes([bytes, bytes])}};
+            }"#,
+        ] {
+            assert_eq!(hint(source), OutputBound::Maximum, "{source}");
+        }
     }
 
     #[test]

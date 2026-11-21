@@ -389,6 +389,15 @@ pub(crate) struct InvocationLane {
 }
 #[cfg(feature = "inbound-http")]
 impl InvocationLane {
+    #[cfg(not(target_vendor = "apple"))]
+    pub(super) async fn acquire_engine(
+        cancellation: &tokio_util::sync::CancellationToken,
+        phase_deadline: std::time::Instant,
+    ) -> io::Result<Self> {
+        ensure_available()?;
+        Self::acquire(cancellation, phase_deadline).await
+    }
+
     // Only cancellation and the original phase bound enter this future. No
     // mutable message/output is held by the lane acquisition helper.
     pub(crate) async fn acquire(
@@ -556,53 +565,70 @@ async fn evaluate_internal(
     }
     #[cfg(not(target_vendor = "apple"))]
     {
-        ensure_available()?;
-        let lane = InvocationLane::acquire(cancellation, phase_deadline).await?;
-        let Backend::Engine(program) = backend;
-        let input = input_body.bytes();
-        let deadline = lane.deadline;
-        let mut operation = || {
-            #[cfg(all(feature = "ffi", target_os = "android"))]
-            let (name, evaluate) = ("android-javascriptengine", android_engine::evaluate);
-            #[cfg(all(feature = "http-js-quickjs", any(target_os = "linux", windows)))]
-            let (name, evaluate) = ("quickjs-ng", quickjs_engine::evaluate);
-            #[cfg(not(any(
-                all(feature = "ffi", target_os = "android"),
-                all(feature = "http-js-quickjs", any(target_os = "linux", windows))
-            )))]
-            let (name, evaluate) = ("unavailable", no_engine);
-            use super::diagnostics::{Counter, increment};
-            increment(Counter::EvaluationEntered);
-            let result = evaluate(
-                program,
-                metadata,
-                input,
-                output_body,
-                bridge_workspace,
-                cancellation,
-                deadline,
-            );
-            let status = result.as_ref().map(|_| ()).map_err(io::Error::kind);
-            increment(match status {
-                Ok(()) => Counter::EvaluationSucceeded,
-                Err(io::ErrorKind::TimedOut) => Counter::EvaluationTimedOut,
-                Err(io::ErrorKind::Interrupted) => Counter::EvaluationCancelled,
-                Err(_) => Counter::EvaluationFailed,
-            });
-            tracing::trace!(target: "vole::http_processing::script", backend = name, result = ?status, "HTTP script backend completed");
-            result
-        };
-        // A borrowed message and the lane outlive the actual backend return.
-        // A dropped HTTP future never detaches a backend execution.
-        let result = if tokio::runtime::Handle::current().runtime_flavor()
-            == tokio::runtime::RuntimeFlavor::MultiThread
-        {
-            tokio::task::block_in_place(operation)
-        } else {
-            operation()
-        };
-        drop(lane);
+        let lane = InvocationLane::acquire_engine(cancellation, phase_deadline).await?;
+        evaluate_engine_in_lane(
+            backend,
+            metadata,
+            input_body.bytes(),
+            output_body,
+            bridge_workspace,
+            cancellation,
+            &lane,
+        )
+    }
+}
+
+#[cfg(all(feature = "inbound-http", not(target_vendor = "apple")))]
+pub(super) fn evaluate_engine_in_lane(
+    backend: Backend<'_>,
+    metadata: &serde_json::Value,
+    input: Option<&[u8]>,
+    output_body: &mut super::body_budget::BudgetedBytes,
+    bridge_workspace: Option<&super::body_budget::Reservation>,
+    cancellation: &tokio_util::sync::CancellationToken,
+    lane: &InvocationLane,
+) -> io::Result<serde_json::Value> {
+    let Backend::Engine(program) = backend;
+    let deadline = lane.deadline;
+    let mut operation = || {
+        #[cfg(all(feature = "ffi", target_os = "android"))]
+        let (name, evaluate) = ("android-javascriptengine", android_engine::evaluate);
+        #[cfg(all(feature = "http-js-quickjs", any(target_os = "linux", windows)))]
+        let (name, evaluate) = ("quickjs-ng", quickjs_engine::evaluate);
+        #[cfg(not(any(
+            all(feature = "ffi", target_os = "android"),
+            all(feature = "http-js-quickjs", any(target_os = "linux", windows))
+        )))]
+        let (name, evaluate) = ("unavailable", no_engine);
+        use super::diagnostics::{Counter, increment};
+        increment(Counter::EvaluationEntered);
+        let result = evaluate(
+            program,
+            metadata,
+            input,
+            output_body,
+            bridge_workspace,
+            cancellation,
+            deadline,
+        );
+        let status = result.as_ref().map(|_| ()).map_err(io::Error::kind);
+        increment(match status {
+            Ok(()) => Counter::EvaluationSucceeded,
+            Err(io::ErrorKind::TimedOut) => Counter::EvaluationTimedOut,
+            Err(io::ErrorKind::Interrupted) => Counter::EvaluationCancelled,
+            Err(_) => Counter::EvaluationFailed,
+        });
+        tracing::trace!(target: "vole::http_processing::script", backend = name, result = ?status, "HTTP script backend completed");
         result
+    };
+    // A borrowed message and the lane outlive the actual backend return.
+    // A dropped HTTP future never detaches a backend execution.
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(operation)
+    } else {
+        operation()
     }
 }
 

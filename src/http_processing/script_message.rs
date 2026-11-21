@@ -932,6 +932,31 @@ async fn run_until_observed(
             }
             Some(bytes)
         };
+        #[cfg(not(target_vendor = "apple"))]
+        let acquired_lane = if script.body == BodyMode::Bytes
+            && cfg!(any(
+                all(target_os = "android", feature = "ffi"),
+                all(target_os = "linux", feature = "http-js-quickjs")
+            )) {
+            // Queue with the already collected input. Only an active
+            // invocation needs a metadata snapshot, output and bridge copies.
+            match super::scripts::InvocationLane::acquire_engine(cancellation, deadline).await {
+                Ok(lane) => Some(lane),
+                Err(error) => {
+                    check_stage(cancellation, deadline)?;
+                    let failure = report_backend_error(error, &script.name, phase);
+                    if failure.is_err() {
+                        record(script, "failed", Some("backend-fatal"));
+                    } else {
+                        record(script, "rolled-back", Some("invocation-timeout"));
+                    }
+                    failure?;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let parameter_work = script.parameter_work_bytes();
         let _parameters_owner = if parameter_work == 0 {
             None
@@ -1032,7 +1057,17 @@ async fn run_until_observed(
                 .await
             }
             #[cfg(not(target_vendor = "apple"))]
-            {
+            if let Some(lane) = &acquired_lane {
+                super::scripts::evaluate_engine_in_lane(
+                    backend,
+                    &metadata,
+                    bytes,
+                    &mut buffers.output,
+                    buffers.bridge_workspace.as_ref(),
+                    cancellation,
+                    lane,
+                )
+            } else {
                 super::scripts::evaluate_backend_until(
                     backend,
                     &metadata,
@@ -1048,6 +1083,8 @@ async fn run_until_observed(
             }
         };
         drop(buffers.bridge_workspace.take());
+        #[cfg(not(target_vendor = "apple"))]
+        drop(acquired_lane);
         check_stage(cancellation, deadline)?;
         let metadata = match result {
             Ok(metadata) => metadata,
