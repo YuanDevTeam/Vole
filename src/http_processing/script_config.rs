@@ -159,7 +159,7 @@ mod tests {
 
     #[cfg(not(any(
         target_vendor = "apple",
-        all(feature = "http-js-v8", any(target_os = "linux", windows))
+        all(feature = "http-js-quickjs", any(target_os = "linux", windows))
     )))]
     #[test]
     fn total_source_does_not_expand_platform_availability() {

@@ -36,10 +36,12 @@ Android 优先使用 `ANDROID_NDK_HOME`，否则在 `ANDROID_HOME/ndk` 中选择
 `VOLE_ANDROID_NDK_VERSION` 可指定版本，`VOLE_ANDROID_API` 默认 24。
 `CARGO_TARGET_DIR` 按 Cargo 约定覆盖中间产物目录；其余本地覆盖见 `builds.py`。
 
-Linux CLI 和 FFI、Windows CLI 和 Wintun FFI 启用 Rust `http-js-v8`。构建使用 Rusty V8
-对应目标的官方库和生成绑定。离线构建可预先提供 `RUSTY_V8_ARCHIVE`、
-`RUSTY_V8_ARCHIVE_SHA256` 和 `RUSTY_V8_SRC_BINDING_PATH`。Windows UWP 构建
-使用动态 CRT，官方 V8 Windows 档案声明静态 CRT，标准 UWP 构建不启用该功能。
+Linux CLI 和 FFI、Windows CLI、Wintun FFI 和 UWP FFI 启用 `http-js-quickjs`，
+通过 `libquickjs-ng-sys` 0.14.0 从源码编译 QuickJS-NG 0.18.0 静态库。
+Linux 需要 `clang` 和 `libclang`。Windows 需要同架构 LLVM 的 `clang-cl.exe` 和
+`libclang.dll`，可将 `LIBCLANG_PATH` 指向包含这两个文件的 LLVM 目录。
+UWP 的 C 编译与绑定生成使用 `WINAPI_FAMILY=WINAPI_FAMILY_APP` 和
+`_WIN32_WINNT=0x0A00`。
 
 所有编译入口自动准备官方 BLAKE3 1.8.7 C 静态库。依赖通过
 `native/blake3/vcpkg.json` 锁定正式 vcpkg registry/port，正常 bootstrap 和 install
@@ -49,8 +51,8 @@ Linux CLI 和 FFI、Windows CLI 和 Wintun FFI 启用 Rust `http-js-v8`。构建
 可用 `VOLE_NATIVE_CACHE_DIR` 覆盖。第三方源、工具、头文件和静态库留在依赖缓存，
 不加入仓库或发布归档。自有 triplet 为 C 符号设置 `vole_c_` 编译宏；官方 port 和源码不改。
 Apple 使用对应 SDK 和上述最低版本，Android 使用同一 NDK/API，Windows 区分
-Windows/WindowsStore；Wintun 使用静态 CRT，UWP 的 Rust、BoringSSL 和 BLAKE3
-统一使用动态 CRT，BLAKE3 本身仍为静态库。UWP 宿主安装包负责声明并部署对应架构的
+Windows/WindowsStore；Wintun 使用静态 CRT，UWP 的 Rust、BoringSSL、BLAKE3 和
+QuickJS-NG 统一使用动态 CRT。UWP 宿主安装包负责声明并部署对应架构的
 Visual C++ Runtime 依赖；各目标安装目录独立。
 
 直接执行 Cargo 时可先准备宿主依赖：
@@ -60,8 +62,10 @@ uv run --project scripts --locked vole-scripts deps
 ```
 
 该命令打印两个目标后缀环境变量；在当前 shell 中设置后执行 Cargo。
-Windows UWP 使用 `deps --backend uwp`，还需设置输出的 `CARGO_ENCODED_RUSTFLAGS`，
-使 Rust 和原生依赖使用相同的动态 CRT。
+Windows 在原生 MSVC 开发者 shell 中按目标选择 `deps --backend uwp` 或
+`deps --backend wintun`，将全部输出变量设到同一 shell 再执行 Cargo。
+LLVM 路径和带目标后缀的参数用于 QuickJS-NG C 编译和绑定生成。UWP 还通过
+`CARGO_ENCODED_RUSTFLAGS` 选择动态 CRT。
 CI 使用 `deps --github-env "$GITHUB_ENV"` 自动传给后续步骤。
 显式提供 `VOLE_BLAKE3_INCLUDE_DIR_<TARGET>` 与 `VOLE_BLAKE3_LIB_DIR_<TARGET>`
 可复用已准备的同目标 namespaced 静态包；`<TARGET>` 为大写 Rust target，连字符改成下划线。

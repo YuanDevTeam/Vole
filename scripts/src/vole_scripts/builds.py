@@ -132,6 +132,68 @@ def _windows_runtime_environment(
     }
 
 
+def _windows_quickjs_variables(
+    target: str, env: dict[str, str], backend: str
+) -> dict[str, str]:
+    if not target.endswith("-pc-windows-msvc"):
+        return {}
+
+    suffix = target.replace("-", "_")
+    search_path = next(
+        (value for key, value in env.items() if key.upper() == "PATH"), ""
+    )
+    compiler = env.get(f"CC_{suffix}") or shutil.which("clang-cl", path=search_path)
+    candidates = []
+    if override := env.get("LIBCLANG_PATH"):
+        candidates.append(Path(override))
+    else:
+        if compiler:
+            candidates.append(Path(compiler).parent)
+        if program_files := next(
+            (value for key, value in env.items() if key.upper() == "PROGRAMFILES"), None
+        ):
+            candidates.append(Path(program_files) / "LLVM" / "bin")
+    for directory in candidates:
+        clang_cl = directory / "clang-cl.exe"
+        if clang_cl.is_file() and (directory / "libclang.dll").is_file():
+            break
+    else:
+        raise RuntimeError(
+            "Windows QuickJS requires native clang-cl.exe and libclang.dll; "
+            "set LIBCLANG_PATH to the LLVM bin directory"
+        )
+
+    # The crate explicitly reads TARGET_CC even when cc has a target compiler.
+    variables = {"LIBCLANG_PATH": str(directory), "TARGET_CC": str(clang_cl)}
+    if backend != "uwp":
+        return variables
+
+    # Match the APP partition in the engine objects and generated Rust bindings.
+    for name, define in (("CFLAGS", "/D"), ("BINDGEN_EXTRA_CLANG_ARGS", "-D")):
+        target_name = f"{name}_{target}"
+        underscored_name = f"{name}_{suffix}"
+        output_name = target_name if target_name in env else underscored_name
+        fallbacks = ("TARGET_CFLAGS", "CFLAGS") if name == "CFLAGS" else (name,)
+        flags = next(
+            (
+                env[key]
+                for key in (target_name, underscored_name, *fallbacks)
+                if key in env
+            ),
+            "",
+        )
+        variables[output_name] = " ".join(
+            part
+            for part in (
+                flags,
+                f"{define}WINAPI_FAMILY=WINAPI_FAMILY_APP",
+                f"{define}_WIN32_WINNT=0x0A00",
+            )
+            if part
+        )
+    return variables
+
+
 def _cargo_build(
     target: str,
     profile_flags: list[str],
@@ -148,6 +210,7 @@ def _cargo_build(
         env,
         backend,
     )
+    env.update(_windows_quickjs_variables(target, env, backend))
     _run(
         [
             "cargo",
@@ -201,6 +264,10 @@ def prepare_native_dependencies(
     ]
     if target.endswith("-pc-windows-msvc") and backend == "uwp":
         entries.append("CARGO_ENCODED_RUSTFLAGS=" + env["CARGO_ENCODED_RUSTFLAGS"])
+    entries.extend(
+        f"{name}={value}"
+        for name, value in _windows_quickjs_variables(target, env, backend).items()
+    )
     if github_env is not None:
         with github_env.open("a", encoding="utf-8") as stream:
             stream.write("\n".join(entries) + "\n")
@@ -248,7 +315,7 @@ def build_linux(target: str | None = None) -> Path:
     release = _cargo_build(
         target,
         ["--release"],
-        DEFAULT_FEATURES + ",http-js-v8",
+        DEFAULT_FEATURES + ",http-js-quickjs",
         environment,
     )
     output = CORE_DIR / "dist/linux" / architecture

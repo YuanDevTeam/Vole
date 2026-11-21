@@ -21,9 +21,18 @@ class BuildTests(unittest.TestCase):
                 Path("include") / name,
                 (builds.CORE_DIR / "include" / name).read_bytes(),
             )
+        self.llvm_bin = self.write("llvm/bin/clang-cl.exe").parent
+        self.write("llvm/bin/libclang.dll")
         self.enterContext(patch.object(builds, "CORE_DIR", self.root))
         self.enterContext(
-            patch.dict(os.environ, {"CARGO_TARGET_DIR": "cache"}, clear=True)
+            patch.dict(
+                os.environ,
+                {
+                    "CARGO_TARGET_DIR": "cache",
+                    "LIBCLANG_PATH": str(self.llvm_bin),
+                },
+                clear=True,
+            )
         )
         self.commands = []
         self.enterContext(patch.object(builds, "_run", side_effect=self.compile))
@@ -107,6 +116,12 @@ class BuildTests(unittest.TestCase):
                 command[command.index("--features") + 1], f"ffi,windows-{backend}"
             )
             self.assertEqual("--bins" in command, backend == "uwp")
+        for _, env in self.commands[:2]:
+            self.assertEqual(env["TARGET_CC"], str(self.llvm_bin / "clang-cl.exe"))
+            self.assertEqual(env["LIBCLANG_PATH"], str(self.llvm_bin))
+            self.assertNotIn("CFLAGS_aarch64_pc_windows_msvc", env)
+            self.assertNotIn("BINDGEN_EXTRA_CLANG_ARGS_aarch64_pc_windows_msvc", env)
+            self.assertNotIn("CARGO_ENCODED_RUSTFLAGS", env)
 
     def test_linux_cli_and_ffi_select_production_features(self):
         target = "aarch64-unknown-linux-gnu"
@@ -118,7 +133,7 @@ class BuildTests(unittest.TestCase):
             builds.build_linux()
         self.assertEqual(
             [command[command.index("--features") + 1] for command, _ in self.commands],
-            ["cli", "ffi,http-js-v8"],
+            ["cli", "ffi,http-js-quickjs"],
         )
 
     def test_uwp_build_selects_dynamic_crt_and_preserves_cargo_flag_precedence(self):
@@ -158,17 +173,8 @@ class BuildTests(unittest.TestCase):
                     [*expected, "-C", "target-feature=-crt-static"],
                 )
                 self.assertEqual(original, dict(os.environ) | overrides)
-        with (
-            patch.object(builds.platform, "system", return_value="Windows"),
-            patch.object(builds, "_windows_architecture", return_value="arm64"),
-            patch.object(
-                builds, "_windows_msvc_environment", return_value=dict(os.environ)
-            ),
-        ):
-            builds.build_windows("wintun")
-        self.assertNotIn("CARGO_ENCODED_RUSTFLAGS", self.commands[-1][1])
 
-    def test_direct_uwp_dependencies_export_matching_cargo_crt_flags(self):
+    def test_direct_uwp_dependencies_export_crt_and_quickjs_environment(self):
         output = io.StringIO()
         github_env = self.root / "github.env"
 
@@ -185,7 +191,10 @@ class BuildTests(unittest.TestCase):
             patch.object(builds.platform, "system", return_value="Windows"),
             patch.object(builds, "_windows_architecture", return_value="arm64"),
             patch.object(
-                builds, "_windows_msvc_environment", return_value=dict(os.environ)
+                builds,
+                "_windows_msvc_environment",
+                return_value=dict(os.environ)
+                | {"CFLAGS_aarch64-pc-windows-msvc": "/DKEEP_FLAG=1"},
             ),
             patch.object(
                 builds.blake3, "environment", side_effect=dependency_environment
@@ -194,10 +203,21 @@ class BuildTests(unittest.TestCase):
         ):
             builds.prepare_native_dependencies(backend="uwp", github_env=github_env)
         self.assertEqual(output.getvalue(), github_env.read_text())
-        self.assertEqual(output.getvalue().count("\n"), 3)
-        self.assertIn(
-            "CARGO_ENCODED_RUSTFLAGS=-C\x1ftarget-feature=-crt-static\n",
-            output.getvalue(),
+        exported = dict(
+            line.split("=", 1) for line in output.getvalue().rstrip("\n").split("\n")
+        )
+        self.assertEqual(
+            exported["CARGO_ENCODED_RUSTFLAGS"], "-C\x1ftarget-feature=-crt-static"
+        )
+        self.assertEqual(exported["LIBCLANG_PATH"], str(self.llvm_bin))
+        self.assertEqual(exported["TARGET_CC"], str(self.llvm_bin / "clang-cl.exe"))
+        self.assertEqual(
+            exported["CFLAGS_aarch64-pc-windows-msvc"],
+            "/DKEEP_FLAG=1 /DWINAPI_FAMILY=WINAPI_FAMILY_APP /D_WIN32_WINNT=0x0A00",
+        )
+        self.assertEqual(
+            exported["BINDGEN_EXTRA_CLANG_ARGS_aarch64_pc_windows_msvc"],
+            "-DWINAPI_FAMILY=WINAPI_FAMILY_APP -D_WIN32_WINNT=0x0A00",
         )
 
     def test_windows_requires_native_python(self):

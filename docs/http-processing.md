@@ -129,7 +129,7 @@ AST 解析前限制词法扫描工作、局部运算链与嵌套深度。平铺�
 各平台使用同一份插件 YAML、脚本语义和事务校验。调用内对输入对象的修改需经结果校验才能应用。
 
 - Apple 对可证明等价的闭合脚本使用静态执行计划，其余受支持的脚本使用独立 JavaScriptCore 上下文。
-- Linux、Windows CLI 和 Windows Wintun 使用同一个进程内 V8 后端。每次调用拥有独立 isolate，结束后回收。Linux 原生库的标准构建也启用 `http-js-v8`。Windows UWP 构建保留动态 CRT，待 V8 兼容该构建后接入。
+- Linux CLI 和 FFI、Windows CLI、Wintun 和 UWP 通过 `http-js-quickjs` 使用由 `libquickjs-ng-sys` 0.14.0 提供的 QuickJS-NG 0.18.0。每次调用创建独立运行时和上下文，返回前同步回收。Windows UWP 构建使用动态 CRT。 [编译与发布](../scripts/README.md)
 - Android 通过 [宿主注册](invoke-api.md#android-脚本沙箱)使用 AndroidX JavaScriptEngine。执行依赖设备 WebView provider 支持独立沙箱和所需特性。
 
 单次调用的期限为 100 ms（包含排队），最多 100,000 次受控 tick。请求和响应 JS 阶段各有 1 秒总期限，正文收集与传输使用各自的期限。取消及超时后的回收等待同步操作和实际执行 owner 结束；2 MiB 的累计分配工作预算约束执行工作量。正文许可随实际输入、输出、桥接副本和发送引用持有至最后一次释放。

@@ -689,7 +689,7 @@ mod tests {
 
     #[cfg(any(
         target_vendor = "apple",
-        all(feature = "http-js-v8", any(target_os = "linux", windows))
+        all(feature = "http-js-quickjs", any(target_os = "linux", windows))
     ))]
     #[test]
     fn platform_fixture_rewrites_each_origin_through_test_http() {

@@ -9,12 +9,12 @@ mod apple;
 mod frontend;
 #[cfg(all(feature = "inbound-http", any(target_vendor = "apple", test)))]
 mod platform_init;
+#[cfg(all(feature = "http-js-quickjs", any(target_os = "linux", windows)))]
+mod quickjs_engine;
 #[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
 mod scoped_qos;
 #[cfg(all(test, feature = "inbound-http", target_vendor = "apple"))]
 mod tests;
-#[cfg(all(feature = "http-js-v8", any(target_os = "linux", windows)))]
-mod v8_engine;
 
 #[cfg(all(
     feature = "inbound-http",
@@ -44,7 +44,7 @@ pub(crate) struct CompiledSource {
         not(any(
             all(feature = "inbound-http", target_vendor = "apple"),
             all(feature = "inbound-http", feature = "ffi", target_os = "android"),
-            all(feature = "http-js-v8", any(target_os = "linux", windows))
+            all(feature = "http-js-quickjs", any(target_os = "linux", windows))
         )),
         allow(dead_code)
     )]
@@ -205,7 +205,10 @@ pub(crate) fn ensure_available() -> io::Result<()> {
     #[cfg(not(all(feature = "inbound-http", feature = "ffi", target_os = "android")))]
     if cfg!(any(
         all(feature = "inbound-http", target_vendor = "apple"),
-        all(feature = "http-js-v8", any(target_os = "linux", windows))
+        all(
+            feature = "http-js-quickjs",
+            any(target_os = "linux", windows)
+        )
     )) {
         Ok(())
     } else {
@@ -257,8 +260,6 @@ pub(crate) fn prepare_platform(
         }
         #[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
         android_engine::initialize_platform()?;
-        #[cfg(all(feature = "http-js-v8", any(target_os = "linux", windows)))]
-        v8_engine::initialize_platform()?;
         if cancellation.is_cancelled() {
             return Err(io::ErrorKind::Interrupted.into());
         }
@@ -563,11 +564,11 @@ async fn evaluate_internal(
         let mut operation = || {
             #[cfg(all(feature = "ffi", target_os = "android"))]
             let (name, evaluate) = ("android-javascriptengine", android_engine::evaluate);
-            #[cfg(all(feature = "http-js-v8", any(target_os = "linux", windows)))]
-            let (name, evaluate) = ("v8", v8_engine::evaluate);
+            #[cfg(all(feature = "http-js-quickjs", any(target_os = "linux", windows)))]
+            let (name, evaluate) = ("quickjs-ng", quickjs_engine::evaluate);
             #[cfg(not(any(
                 all(feature = "ffi", target_os = "android"),
-                all(feature = "http-js-v8", any(target_os = "linux", windows))
+                all(feature = "http-js-quickjs", any(target_os = "linux", windows))
             )))]
             let (name, evaluate) = ("unavailable", no_engine);
             use super::diagnostics::{Counter, increment};
@@ -610,7 +611,7 @@ async fn evaluate_internal(
     not(any(
         target_vendor = "apple",
         all(feature = "ffi", target_os = "android"),
-        all(feature = "http-js-v8", any(target_os = "linux", windows))
+        all(feature = "http-js-quickjs", any(target_os = "linux", windows))
     ))
 ))]
 fn no_engine(

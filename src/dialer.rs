@@ -1339,11 +1339,9 @@ fn interface_option_value(index: NonZeroU32, ipv6: bool) -> [u8; 4] {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::sync::atomic::AtomicUsize;
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
-        sync::atomic::Ordering,
+        sync::atomic::{AtomicUsize, Ordering},
     };
 
     use tokio::net::TcpListener;

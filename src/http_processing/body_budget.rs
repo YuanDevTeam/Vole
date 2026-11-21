@@ -426,7 +426,7 @@ impl BudgetedBytes {
             test,
             target_vendor = "apple",
             all(feature = "ffi", target_os = "android"),
-            all(feature = "http-js-v8", any(target_os = "linux", windows))
+            all(feature = "http-js-quickjs", any(target_os = "linux", windows))
         )
     ))]
     pub(crate) fn prepare_output(&mut self, length: usize) -> io::Result<()> {
