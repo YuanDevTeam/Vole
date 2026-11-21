@@ -2411,10 +2411,6 @@ impl Config {
             .as_ref()
             .and_then(|template| template.http_policy.clone())
     }
-    pub(crate) fn set_http_config(&mut self, input: Option<&str>) -> Result<()> {
-        let policy = crate::http_processing::Policy::compile_optional(input)?;
-        self.set_http_policy(policy)
-    }
     pub(crate) fn set_http_policy(
         &mut self,
         policy: Option<std::sync::Arc<crate::http_processing::Policy>>,

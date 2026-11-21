@@ -13,7 +13,7 @@ fn target(rule: &Rule, input: &str) -> String {
         .unwrap()
     {
         UrlAction::Forward(url) | UrlAction::Redirect { url, .. } => url.to_string(),
-        UrlAction::Reject => panic!("unexpected reject"),
+        UrlAction::Reject | UrlAction::Respond(_) => panic!("unexpected local response"),
     }
 }
 

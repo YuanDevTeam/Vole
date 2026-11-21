@@ -51,40 +51,37 @@ async fn ss_v2ray_mux_https_h2_native_then_js_reuses_one_authenticated_carrier()
     // The extra native header is deliberately unacceptable to post_response.
     // Only the response script restores its required value after checking the
     // native body; request-script output is independently read by the origin.
-    const SCRIPTS: &str = r#"    - {url: 'https://a.test/', match: prefix, action: response-header-set, header: x-proof, value: before-js}
-http-scripts:
-  enabled: true
-  scripts:
-    - name: actual-request-body
-      phase: request
-      url: https://a.test/
-      match: prefix
-      body: text
-      source: |
-        function rewrite(input) {
-          let found = false;
-          for (let i = 0; i < input.request.headers.length; i++) {
-            let header = input.request.headers[i];
-            if (header.name === "x-request" && header.value === "native") found = true;
-          }
-          if (!found || input.body.data !== "original") return {type:"abort"};
-          return {type:"modify",body:{kind:"text",data:"transformed"}};
-        }
-    - name: actual-response-proof
-      phase: response
-      url: https://a.test/
-      match: prefix
-      body: text
-      source: |
-        function rewrite(input) {
-          let found = false;
-          for (let i = 0; i < input.response.headers.length; i++) {
-            let header = input.response.headers[i];
-            if (header.name === "x-proof" && header.value === "before-js") found = true;
-          }
-          if (!found || input.body.data !== "from_origin") return {type:"abort"};
-          return {type:"modify",headers:[{op:"set",name:"x-proof",values:["native"]}],body:{kind:"text",data:input.body.data}};
-        }
+    const SCRIPTS: &str = r#"      - response:
+          headers:
+            - {set: {x-proof: before-js}}
+      - name: actual-request-body
+        request:
+          js:
+            body: text
+            source: |
+              function rewrite(input) {
+                let found = false;
+                for (let i = 0; i < input.request.headers.length; i++) {
+                  let header = input.request.headers[i];
+                  if (header.name === "x-request" && header.value === "native") found = true;
+                }
+                if (!found || input.body.data !== "original") return {type:"abort"};
+                return {type:"modify",body:{kind:"text",data:"transformed"}};
+              }
+      - name: actual-response-proof
+        response:
+          js:
+            body: text
+            source: |
+              function rewrite(input) {
+                let found = false;
+                for (let i = 0; i < input.response.headers.length; i++) {
+                  let header = input.response.headers[i];
+                  if (header.name === "x-proof" && header.value === "before-js") found = true;
+                }
+                if (!found || input.body.data !== "from_origin") return {type:"abort"};
+                return {type:"modify",headers:[{op:"set",name:"x-proof",values:["native"]}],body:{kind:"text",data:input.body.data}};
+              }
 "#;
     for cipher in [
         ShadowsocksCipher::Aes128Gcm,

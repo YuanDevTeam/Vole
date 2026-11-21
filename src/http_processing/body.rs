@@ -4,14 +4,19 @@ use super::body_budget as budget;
 mod codec;
 #[path = "body_json.rs"]
 mod json;
+#[path = "body_protobuf.rs"]
+mod protobuf;
 pub(crate) use budget::{Budget, BudgetedBytes, MAX_BODY};
+pub(crate) use json::JsonFilter;
+pub(crate) use protobuf::{ProtobufRemove, ProtobufRemoveSpec};
 
 use super::{
     diagnostics::{self, BodyPoint, Counter},
     headers::Fields,
-    rules::{BodyOperation, Phase, Rule, RuleAction},
+    rules::{BodyOperation, Phase, RequestMatch, Rule, RuleAction},
 };
 use bytes::Bytes;
+#[cfg(test)]
 use url::Url;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +56,12 @@ impl OriginalRequestMeta {
         Self {
             head: method == "HEAD",
             connect: method == "CONNECT",
-            identity_allowed: identity_allowed(fields),
+            identity_allowed: identity_allowed(
+                fields
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+                    .map(|(_, value)| Some(value.as_str())),
+            ),
         }
     }
 }
@@ -60,7 +70,13 @@ pub(crate) struct WireBodyMeta {
     pub(crate) encoding: Encoding,
     pub(crate) length: Option<u64>,
     bypass: Option<Bypass>,
-    text_bypass: Option<Bypass>,
+    media: NativeMedia,
+}
+
+#[derive(Clone, Copy, Default)]
+struct NativeMedia {
+    protobuf: Option<protobuf::MediaType>,
+    invalid_charset: bool,
 }
 impl WireBodyMeta {
     pub(crate) fn new(
@@ -94,7 +110,7 @@ impl WireBodyMeta {
             encoding
         };
         let mut bypass = None;
-        let mut text_bypass = None;
+        let mut media = NativeMedia::default();
         if original.head
             || original.connect
             || upgraded
@@ -108,13 +124,18 @@ impl WireBodyMeta {
         } else if phase == Phase::Response && !original.identity_allowed {
             bypass = Some(Bypass::IdentityExcluded);
         }
+        let mut content_types = 0;
         for content_type in values("content-type") {
+            content_types += 1;
             let mut parts = content_type.split(';');
-            let media = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
-            if media == "text/event-stream"
-                || media == "application/grpc"
-                || media.starts_with("application/grpc+")
-                || media.starts_with("multipart/")
+            let media_type = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+            if content_types == 1 {
+                media.protobuf = protobuf::MediaType::parse(&media_type, content_type);
+            }
+            if media_type == "text/event-stream"
+                || media_type == "application/grpc"
+                || media_type.starts_with("application/grpc+")
+                || media_type.starts_with("multipart/")
             {
                 bypass = Some(Bypass::Streaming);
             }
@@ -126,24 +147,26 @@ impl WireBodyMeta {
                         "utf-8" | "utf8"
                     )
                 {
-                    text_bypass = Some(Bypass::Charset);
+                    media.invalid_charset = true;
                 }
             }
         }
-        if values("content-type").count() > 1 {
-            text_bypass = Some(Bypass::Charset);
+        if content_types > 1 {
+            media.invalid_charset = true;
+            media.protobuf = None;
         }
         Self {
             encoding,
             length,
             bypass,
-            text_bypass,
+            media,
         }
     }
-    pub(crate) fn eligibility(&self) -> Result<(), Bypass> {
+    #[cfg(test)]
+    fn eligibility(&self) -> Result<(), Bypass> {
         self.common_eligibility()?;
-        if let Some(reason) = self.text_bypass {
-            return Err(reason);
+        if self.media.invalid_charset {
+            return Err(Bypass::Charset);
         }
         Ok(())
     }
@@ -182,13 +205,13 @@ fn quality(value: &str) -> Option<u16> {
     }
 }
 
-fn identity_allowed(fields: &Fields) -> bool {
+pub(super) fn identity_allowed<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> bool {
     let mut identity = None;
     let mut wildcard = None;
-    for (_, value) in fields
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
-    {
+    for value in values {
+        let Some(value) = value else {
+            return false;
+        };
         for coding in value.split(',').filter(|coding| !coding.trim().is_empty()) {
             let mut parts = coding.split(';');
             let token = parts.next().unwrap_or_default().trim();
@@ -223,27 +246,68 @@ fn identity_allowed(fields: &Fields) -> bool {
     identity.or(wildcard).is_none_or(|quality| quality != 0)
 }
 
-pub(crate) fn has_rules(rules: &[Rule], original: &Url, phase: Phase) -> bool {
-    rules.iter().any(|rule| {
-        matches!(&rule.action, RuleAction::Body { phase: p, operation } if *p == phase && !matches!(operation, BodyOperation::JsonPatch(patch) if patch.is_empty()))
-            && rule.matches(original)
+fn body_operations<'a, 'u>(
+    rules: &'a [Rule],
+    original: RequestMatch<'u>,
+    phase: Phase,
+    media: NativeMedia,
+) -> impl Iterator<Item = &'a BodyOperation> + use<'a, 'u> {
+    rules.iter().filter_map(move |rule| {
+        let RuleAction::Body {
+            phase: rule_phase,
+            operation,
+        } = &rule.action
+        else {
+            return None;
+        };
+        if *rule_phase != phase {
+            return None;
+        }
+        match operation {
+            BodyOperation::JsonPatch(patch) if patch.is_empty() => return None,
+            BodyOperation::ProtobufRemove(filter) if !filter.matches(media.protobuf) => {
+                return None;
+            }
+            _ => {}
+        }
+        rule.matches(original).then_some(operation)
     })
+}
+
+fn native_eligibility(
+    rules: &[Rule],
+    original: RequestMatch<'_>,
+    phase: Phase,
+    wire: &WireBodyMeta,
+) -> Result<(), Bypass> {
+    let mut operations = body_operations(rules, original, phase, wire.media);
+    let first = operations.next().ok_or(Bypass::NoRules)?;
+    wire.common_eligibility()?;
+    if wire.media.invalid_charset
+        && !std::iter::once(first)
+            .chain(operations)
+            .any(|operation| matches!(operation, BodyOperation::ProtobufRemove(_)))
+    {
+        return Err(Bypass::Charset);
+    }
+    Ok(())
 }
 
 pub(crate) struct Transaction<'a> {
     budget: Budget,
     raw: BudgetedBytes,
     rules: &'a [Rule],
-    original: &'a Url,
+    original: RequestMatch<'a>,
     phase: Phase,
     encoding: Encoding,
-    text_allowed: bool,
+    media: NativeMedia,
 }
 pub(crate) struct ResultBody {
     pub(crate) body: BudgetedBytes,
     pub(crate) changed: bool,
     pub(crate) bypass: Option<Bypass>,
     original: Option<BudgetedBytes>,
+    text: bool,
 }
 impl ResultBody {
     pub(crate) fn rollback(&mut self, reason: Bypass) {
@@ -259,7 +323,7 @@ impl ResultBody {
             return;
         }
         let mut candidate = fields.clone();
-        repair_metadata(&mut candidate, self.body.as_ref().len());
+        repair_metadata_kind(&mut candidate, self.body.as_ref().len(), self.text);
         if super::headers::check(&candidate).is_ok() {
             *fields = candidate;
             self.original.take();
@@ -273,16 +337,14 @@ impl<'a> Transaction<'a> {
     pub(crate) fn begin(
         budget: &Budget,
         rules: &'a [Rule],
-        original: &'a Url,
+        original: impl Into<RequestMatch<'a>>,
         phase: Phase,
         wire: &WireBodyMeta,
     ) -> Result<Self, Bypass> {
+        let original = original.into();
         diagnostics::increment(Counter::CollectorNativeRequested);
         let result = (|| {
-            if !has_rules(rules, original, phase) {
-                return Err(Bypass::NoRules);
-            }
-            wire.eligibility()?;
+            native_eligibility(rules, original, phase, wire)?;
             let capacity = wire.length.map_or(MAX_BODY + 1, |length| length as usize);
             let raw = BudgetedBytes::new(budget, capacity).ok_or(Bypass::Budget)?;
             Ok(Self {
@@ -292,7 +354,7 @@ impl<'a> Transaction<'a> {
                 original,
                 phase,
                 encoding: wire.encoding,
-                text_allowed: true,
+                media: wire.media,
             })
         })();
         match &result {
@@ -306,20 +368,18 @@ impl<'a> Transaction<'a> {
     pub(crate) fn begin_shared(
         budget: &Budget,
         rules: &'a [Rule],
-        original: &'a Url,
+        original: impl Into<RequestMatch<'a>>,
         phase: Phase,
         wire: &WireBodyMeta,
         script_body: bool,
     ) -> Result<Self, Bypass> {
+        let original = original.into();
         diagnostics::increment(Counter::CollectorSharedRequested);
         let result = (|| {
-            if !script_body && !has_rules(rules, original, phase) {
-                return Err(Bypass::NoRules);
-            }
             if script_body {
                 wire.common_eligibility()?;
             } else {
-                wire.eligibility()?;
+                native_eligibility(rules, original, phase, wire)?;
             }
             let capacity = wire.length.map_or(MAX_BODY + 1, |length| length as usize);
             Ok(Self {
@@ -330,7 +390,7 @@ impl<'a> Transaction<'a> {
                 original,
                 phase,
                 encoding: wire.encoding,
-                text_allowed: wire.eligibility().is_ok(),
+                media: wire.media,
             })
         })();
         match &result {
@@ -365,6 +425,7 @@ impl<'a> Transaction<'a> {
                 changed: false,
                 bypass: Some(reason),
                 original: None,
+                text: false,
             }
         };
         if has_trailers {
@@ -380,15 +441,13 @@ impl<'a> Transaction<'a> {
         let baseline = decoded
             .as_ref()
             .map_or(self.raw.as_ref(), |value| value.as_ref());
-        if std::str::from_utf8(baseline).is_err() {
-            return fallback(self.raw, Bypass::InvalidText, BodyPoint::NativeDecode);
-        }
         let candidate = match apply_operations(
             self.rules,
             self.original,
             self.phase,
             baseline,
             &self.budget,
+            self.media,
         ) {
             Ok(candidate) => candidate,
             Err(reason) => {
@@ -397,21 +456,24 @@ impl<'a> Transaction<'a> {
                     changed: false,
                     bypass: Some(reason),
                     original: None,
+                    text: false,
                 };
             }
         };
         match candidate {
-            Some(output) if output.as_ref() != baseline => ResultBody {
-                body: output,
+            Some(output) if output.bytes.as_ref() != baseline => ResultBody {
+                body: output.bytes,
                 changed: true,
                 bypass: None,
                 original: Some(self.raw),
+                text: output.text,
             },
             _ => ResultBody {
                 body: self.raw,
                 changed: false,
                 bypass: None,
                 original: None,
+                text: false,
             },
         }
     }
@@ -435,7 +497,7 @@ impl<'a> Transaction<'a> {
                 budget: self.budget.clone(),
                 bypass: None,
                 changed: false,
-                original_text: self.text_allowed,
+                original_text: !self.media.invalid_charset,
             },
             Err(reason) => {
                 diagnostics::body_bypass(BodyPoint::SharedDecode, reason);
@@ -445,32 +507,26 @@ impl<'a> Transaction<'a> {
                     budget: self.budget.clone(),
                     bypass: Some(reason),
                     changed: false,
-                    original_text: self.text_allowed,
+                    original_text: !self.media.invalid_charset,
                 };
             }
         };
-        if !has_rules(self.rules, self.original, self.phase) {
+        if body_operations(self.rules, self.original, self.phase, self.media)
+            .next()
+            .is_none()
+        {
             return entity;
         }
         let baseline = entity.logical().expect("decoded entity");
-        if !self.text_allowed || std::str::from_utf8(baseline).is_err() {
-            let reason = if self.text_allowed {
-                Bypass::InvalidText
-            } else {
-                Bypass::Charset
-            };
-            diagnostics::body_bypass(BodyPoint::NativeTransform, reason);
-            entity.bypass = Some(reason);
-            return entity;
-        }
         match apply_operations(
             self.rules,
             self.original,
             self.phase,
             baseline,
             &self.budget,
+            self.media,
         ) {
-            Ok(Some(output)) if output.as_ref() != baseline => {
+            Ok(Some(output)) if output.bytes.as_ref() != baseline => {
                 if let Err(reason) = commit_shared_body(&mut entity, fields, output) {
                     diagnostics::body_bypass(BodyPoint::HeaderFinalize, reason);
                     entity.bypass = Some(reason);
@@ -585,46 +641,58 @@ impl Entity {
 fn commit_shared_body(
     entity: &mut Entity,
     fields: &mut Fields,
-    output: BudgetedBytes,
+    output: BodyCandidate,
 ) -> Result<(), Bypass> {
     let mut candidate = fields.clone();
-    repair_metadata(&mut candidate, output.as_ref().len());
+    repair_metadata_kind(&mut candidate, output.bytes.as_ref().len(), output.text);
     super::headers::check(&candidate).map_err(|_| Bypass::Budget)?;
-    entity.replace(output).map_err(|_| Bypass::Budget)?;
+    entity.replace(output.bytes).map_err(|_| Bypass::Budget)?;
     *fields = candidate;
     Ok(())
 }
 
-fn apply_operations(
+struct BodyCandidate {
+    bytes: BudgetedBytes,
+    text: bool,
+}
+
+fn apply_operations<'a>(
     rules: &[Rule],
-    original: &Url,
+    original: impl Into<RequestMatch<'a>>,
     phase: Phase,
     baseline: &[u8],
     budget: &Budget,
-) -> Result<Option<BudgetedBytes>, Bypass> {
+    media: NativeMedia,
+) -> Result<Option<BodyCandidate>, Bypass> {
+    let original = original.into();
     diagnostics::increment(Counter::NativeTransformRequested);
     let result = (|| {
-        let mut candidate = None;
-        for rule in rules {
-            let RuleAction::Body {
-                phase: rule_phase,
-                operation,
-            } = &rule.action
-            else {
+        let mut candidate: Option<BodyCandidate> = None;
+        let mut verified_text = false;
+        for operation in body_operations(rules, original, phase, media) {
+            let input = candidate
+                .as_ref()
+                .map_or(baseline, |value| value.bytes.as_ref());
+            if let BodyOperation::ProtobufRemove(filter) = operation {
+                if let Some(bytes) = filter.apply(input, budget)? {
+                    candidate = Some(BodyCandidate { bytes, text: false });
+                }
                 continue;
-            };
-            if *rule_phase != phase || !rule.matches(original) {
-                continue;
+            }
+            if !verified_text {
+                if media.invalid_charset {
+                    return Err(Bypass::Charset);
+                }
+                std::str::from_utf8(baseline).map_err(|_| Bypass::InvalidText)?;
+                verified_text = true;
             }
             match operation {
                 BodyOperation::Set(value) => {
-                    candidate =
-                        Some(BudgetedBytes::copy(budget, value.as_bytes()).ok_or(Bypass::Budget)?);
+                    let bytes =
+                        BudgetedBytes::copy(budget, value.as_bytes()).ok_or(Bypass::Budget)?;
+                    candidate = Some(BodyCandidate { bytes, text: true });
                 }
                 BodyOperation::Replace(search) => {
-                    let input = candidate
-                        .as_ref()
-                        .map_or(baseline, |value: &BudgetedBytes| value.as_ref());
                     let input = std::str::from_utf8(input).map_err(|_| Bypass::InvalidText)?;
                     let capacity = search.output_capacity(input.len(), MAX_BODY);
                     let mut output =
@@ -635,16 +703,23 @@ fn apply_operations(
                         }
                         .ok_or(Bypass::Budget)?;
                     fill_replacement(input, search, &mut output)?;
-                    candidate = Some(output);
+                    candidate = Some(BodyCandidate {
+                        bytes: output,
+                        text: true,
+                    });
                 }
-                BodyOperation::JsonPatch(patch) if patch.is_empty() => {}
                 BodyOperation::JsonPatch(patch) => {
-                    let input = candidate
-                        .as_ref()
-                        .map_or(baseline, |value: &BudgetedBytes| value.as_ref());
                     let input = std::str::from_utf8(input).map_err(|_| Bypass::InvalidText)?;
-                    candidate = Some(json::apply(input, patch, budget)?);
+                    let bytes = json::apply(input, patch, budget)?;
+                    candidate = Some(BodyCandidate { bytes, text: true });
                 }
+                BodyOperation::JsonFilter(filter) => {
+                    let input = std::str::from_utf8(input).map_err(|_| Bypass::InvalidText)?;
+                    if let Some(bytes) = filter.apply(input, budget)? {
+                        candidate = Some(BodyCandidate { bytes, text: true });
+                    }
+                }
+                BodyOperation::ProtobufRemove(_) => unreachable!("binary operation handled above"),
             }
         }
         Ok(candidate)
@@ -693,10 +768,6 @@ fn fill_replacement(
 
 /// Final representation repair follows successful content changes and therefore
 /// takes precedence over independently successful ordinary header actions.
-pub(crate) fn repair_metadata(fields: &mut Fields, length: usize) {
-    repair_metadata_kind(fields, length, true);
-}
-
 pub(crate) fn repair_metadata_kind(fields: &mut Fields, length: usize, text: bool) {
     fields.retain(|(name, _)| {
         !matches!(
@@ -735,6 +806,10 @@ pub(crate) fn repair_metadata_kind(fields: &mut Fields, length: usize, text: boo
     }
     fields.push(("Content-Length".into(), length.to_string()));
 }
+
+#[cfg(all(test, feature = "inbound-http"))]
+#[path = "body_p1_tests.rs"]
+mod p1_tests;
 
 #[cfg(all(
     feature = "inbound-http",
@@ -806,7 +881,14 @@ mod tests {
         let before = fields.clone();
         let output = BudgetedBytes::copy(&foreign, b"foreign-longer").unwrap();
         assert_eq!(
-            commit_shared_body(&mut entity, &mut fields, output),
+            commit_shared_body(
+                &mut entity,
+                &mut fields,
+                BodyCandidate {
+                    bytes: output,
+                    text: true
+                }
+            ),
             Err(Bypass::Budget)
         );
         assert_eq!(fields, before);
@@ -817,7 +899,17 @@ mod tests {
 
         // The same production helper really commits a correctly paid owner.
         let output = BudgetedBytes::copy(&budget, b"accepted-longer").unwrap();
-        assert_eq!(commit_shared_body(&mut entity, &mut fields, output), Ok(()));
+        assert_eq!(
+            commit_shared_body(
+                &mut entity,
+                &mut fields,
+                BodyCandidate {
+                    bytes: output,
+                    text: true
+                }
+            ),
+            Ok(())
+        );
         assert_eq!(entity.logical().unwrap(), b"accepted-longer");
         assert!(entity.changed());
         assert!(
@@ -901,13 +993,17 @@ mod tests {
                     Phase::Response,
                     entity.logical().unwrap(),
                     &budget,
+                    NativeMedia::default(),
                 )
                 .unwrap()
                 .unwrap();
-                assert_eq!(output.is_mapped_for_test(), capacity >= 64 * 1024);
-                assert_eq!(output.as_ref(), expected.as_bytes());
-                assert!(std::str::from_utf8(output.as_ref()).is_ok());
-                assert_ne!(output.as_ref().as_ptr(), entity.logical().unwrap().as_ptr());
+                assert_eq!(output.bytes.is_mapped_for_test(), capacity >= 64 * 1024);
+                assert_eq!(output.bytes.as_ref(), expected.as_bytes());
+                assert!(std::str::from_utf8(output.bytes.as_ref()).is_ok());
+                assert_ne!(
+                    output.bytes.as_ref().as_ptr(),
+                    entity.logical().unwrap().as_ptr()
+                );
                 let cost = BudgetedBytes::allocation_cost(capacity).unwrap();
                 assert_eq!(budget.used(), 2 * cost);
                 let source_sender = entity.wire().slice(..1);
@@ -1041,9 +1137,17 @@ mod tests {
         ] {
             let rules = rules(yaml);
             let budget = Budget::default();
-            let output = apply_operations(&rules, &url, Phase::Request, b"a", &budget)
-                .unwrap()
-                .unwrap();
+            let output = apply_operations(
+                &rules,
+                &url,
+                Phase::Request,
+                b"a",
+                &budget,
+                NativeMedia::default(),
+            )
+            .unwrap()
+            .unwrap()
+            .bytes;
             assert_eq!(output.remaining() + output.as_ref().len(), MAX_BODY);
             assert_eq!(
                 budget.used(),

@@ -99,7 +99,20 @@ fn session() -> StreamSession {
     }
 }
 fn context(origin: Arc<Origin>) -> HttpContext {
-    HttpContext::new(Policy::compile("rewrite:\n  enabled: true\n  rules:\n  - {url: '^http://old\\.invalid/(.*)$', action: replace, replacement: 'http://new.invalid:8081/$1'}\n").unwrap(),origin,SecurityContext::new())
+    HttpContext::new(
+        Policy::compile(
+            r#"targets:
+  - origins: [http://old.invalid]
+    rules:
+      - match: {url-regex: '^http://old\.invalid/(.*)$'}
+        request:
+          url: {replace: {value: 'http://new.invalid:8081/$1', mode: match}}
+"#,
+        )
+        .unwrap(),
+        origin,
+        SecurityContext::new(),
+    )
 }
 #[tokio::test]
 async fn transparent_h1_routes_only_the_final_target_and_preserves_original_facts() {
@@ -164,23 +177,21 @@ async fn mixed_http_and_connect_use_the_same_context_with_preread_bytes() {
 }
 #[tokio::test]
 async fn local_actions_do_not_connect_or_wait_for_an_unread_expect_body() {
-    for (action, replacement, status) in [
-        ("reject", "", 403),
+    for (action, status) in [
+        ("{reject: true}", 403),
         (
-            "redirect302",
-            ", replacement-mode: url, replacement: 'https://new.invalid/path'",
+            "{redirect: {status: 302, to: 'https://new.invalid/path'}}",
             302,
         ),
         (
-            "redirect307",
-            ", replacement-mode: url, replacement: 'https://new.invalid/path'",
+            "{redirect: {status: 307, to: 'https://new.invalid/path'}}",
             307,
         ),
     ] {
         let origin = Arc::new(Origin::default());
         let context = HttpContext::new(
             Policy::compile(&format!(
-                "rewrite: {{enabled: true, rules: [{{url: '.', action: {action}{replacement}}}]}}"
+                "targets:\n  - origins: [http://old.invalid]\n    rules:\n      - request:\n          url: {action}\n"
             ))
             .unwrap(),
             origin.clone(),
@@ -234,7 +245,12 @@ async fn same_origin_path_action_preserves_resolved_transport_and_logical_host()
     let origin = Arc::new(Origin::default());
     let context = HttpContext::new(
         Policy::compile(
-            "rewrite: {enabled: true, rules: [{url: '.', action: replace, replacement-mode: url, replacement: 'http://old.invalid/new'}]}",
+            r#"targets:
+  - origins: [http://old.invalid]
+    rules:
+      - request:
+          url: {replace: http://old.invalid/new}
+"#,
         )
         .unwrap(),
         origin.clone(),

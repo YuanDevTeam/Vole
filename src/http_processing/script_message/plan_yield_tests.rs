@@ -21,7 +21,7 @@ fn runtime() -> Runtime {
 }
 fn policy() -> std::sync::Arc<Policy> {
     Policy::compile(&format!(
-        "http-scripts:\n  enabled: true\n  scripts:\n    - name: yield-owner\n      phase: request\n      match: exact\n      url: https://a.example/path\n      body: text\n      source: {}\n",
+        "targets:\n  - origins: [https://a.example]\n    rules:\n      - name: yield-owner\n        match: {{path-exact: /path}}\n        request:\n          js:\n            body: text\n            source: {}\n",
         serde_json::to_string(SOURCE).unwrap(),
     )).unwrap()
 }

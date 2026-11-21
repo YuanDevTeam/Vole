@@ -1,0 +1,53 @@
+name: P1 body and script parity
+targets:
+  - origins: [https://a.test]
+    rules:
+      - id: query
+        request:
+          js:
+            source: |
+              function rewrite(input) {
+                const parameters = Vole.query(true);
+                if (parameters.length !== 1 || parameters[0].name !== "probe" ||
+                    parameters[0].value !== "p1 ok") return {type: "abort"};
+                return {type: "modify", headers: [
+                  {op: "set", name: "x-p1-query", values: [parameters[0].value]}
+                ]};
+              }
+      - id: filter
+        match: {path-exact: /filter}
+        response:
+          when: {status: 200}
+          body:
+            - json-filter:
+                path: /data/bottomBarControl/tabs
+                remove-where:
+                  path: /tabType
+                  in: [home, entry, mall]
+          js:
+            body: text
+            source: |
+              function rewrite(input) {
+                let matched = false;
+                for (let i = 0; i < input.request.headers.length; i++) {
+                  const header = input.request.headers[i];
+                  if (header.name === "x-p1-query" && header.value === "p1 ok") matched = true;
+                }
+                const tabs = JSON.parse(input.body.data).data.bottomBarControl.tabs;
+                if (!matched || tabs.length !== 2 || tabs[0].tabType !== "keep")
+                  return {type: "abort"};
+                return {type: "modify", headers: [{op: "set", name: "x-p1", values: ["json"]}]};
+              }
+      - id: remove-field
+        match: {path-exact: /protobuf}
+        response:
+          when: {status: 200}
+          body:
+            - protobuf-remove: {paths: [[7], [9, 18]]}
+          js:
+            body: bytes
+            source: |
+              function rewrite(input) {
+                if (Vole.base64Encode(input.body.data) !== "SgUIlgEIAg==") return {type: "abort"};
+                return {type: "modify", headers: [{op: "set", name: "x-p1", values: ["protobuf"]}]};
+              }

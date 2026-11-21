@@ -81,6 +81,7 @@ pub(super) fn compile_prepared(source: &str) -> io::Result<PreparedSource> {
         depth: 0,
         loops: 0,
         temporaries: 0,
+        reads_original_url: false,
         scopes: vec![BTreeMap::from([("input".to_owned(), false)])],
     };
     let mut body_output = String::new();
@@ -90,7 +91,12 @@ pub(super) fn compile_prepared(source: &str) -> io::Result<PreparedSource> {
             return Err(invalid());
         }
     }
-    let mut output = String::from("function rewrite(input){\"use strict\";__voleTick();");
+    let mut output = String::from(
+        "function rewrite(input){\"use strict\";__voleTick();__voleFreezeParameters(input);",
+    );
+    if emitter.reads_original_url {
+        output.push_str("const __voleOriginalURL=input.original.url;");
+    }
     if emitter.temporaries > 0 {
         output.push_str("let ");
         for index in 0..emitter.temporaries {
@@ -119,6 +125,7 @@ struct Emitter {
     depth: usize,
     loops: usize,
     temporaries: usize,
+    reads_original_url: bool,
     scopes: Vec<BTreeMap<String, bool>>,
 }
 
@@ -540,7 +547,7 @@ impl Emitter {
             let global = identifier.name.as_str();
             if matches!(
                 global,
-                "JSON" | "Object" | "Array" | "Number" | "Math" | "Uint8Array"
+                "JSON" | "Object" | "Array" | "Number" | "Math" | "Uint8Array" | "Vole"
             ) {
                 if !global_method(global, name) {
                     return Err(invalid());
@@ -558,10 +565,22 @@ impl Emitter {
             }
             self.expression(&member.object)?
         };
+        let arguments = arguments.join(",");
+        if receiver == "Vole" {
+            let context = if name == "query" {
+                self.reads_original_url = true;
+                ",__voleOriginalURL"
+            } else {
+                ""
+            };
+            return Ok(format!(
+                "__voleTool({},[{arguments}]{context})",
+                quoted(name)?
+            ));
+        }
         Ok(format!(
-            "__voleCall({receiver},{},[{}])",
-            quoted(name)?,
-            arguments.join(",")
+            "__voleCall({receiver},{},[{arguments}])",
+            quoted(name)?
         ))
     }
 }
@@ -596,6 +615,7 @@ fn validate_binding(name: &str) -> io::Result<()> {
                 | "Array"
                 | "Math"
                 | "Uint8Array"
+                | "Vole"
                 | "String"
                 | "Number"
                 | "Boolean"
@@ -619,10 +639,16 @@ fn validate_binding(name: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LexicalBracket {
+    delimiter: u8,
+    outer_operators: u8,
+}
+
 #[derive(Clone, Default)]
 struct LexicalState {
     offset: usize,
-    brackets: Vec<u8>,
+    brackets: Vec<LexicalBracket>,
     operators: usize,
     controls: usize,
     colons: usize,
@@ -635,7 +661,8 @@ struct LexicalState {
 fn lexical_budget(source: &str) -> io::Result<()> {
     let bytes = source.as_bytes();
     let mut pending = vec![LexicalState::default()];
-    let mut visited: BTreeMap<(usize, Vec<u8>), (usize, usize, usize)> = BTreeMap::new();
+    let mut visited: BTreeMap<(usize, Vec<LexicalBracket>), (usize, usize, usize)> =
+        BTreeMap::new();
     let mut work = 0usize;
     let mut branches = 0usize;
     while let Some(mut state) = pending.pop() {
@@ -718,7 +745,11 @@ fn lexical_budget(source: &str) -> io::Result<()> {
                     state.offset += 1;
                 }
                 b'(' | b'[' | b'{' => {
-                    state.brackets.push(bytes[i]);
+                    state.brackets.push(LexicalBracket {
+                        delimiter: bytes[i],
+                        // Every incoming lexical state passed the bound below.
+                        outer_operators: state.operators as u8,
+                    });
                     state.offset += 1;
                     if bytes[i] == b'{' {
                         state.colons = 0;
@@ -730,8 +761,11 @@ fn lexical_budget(source: &str) -> io::Result<()> {
                         b']' => b'[',
                         _ => b'{',
                     };
-                    if state.brackets.last() == Some(&expected) {
-                        state.brackets.pop();
+                    if let Some(bracket) = state
+                        .brackets
+                        .pop_if(|bracket| bracket.delimiter == expected)
+                    {
+                        state.operators = usize::from(bracket.outer_operators);
                     }
                     if bytes[i] == b'}' {
                         state.colons = 0;
@@ -743,6 +777,13 @@ fn lexical_budget(source: &str) -> io::Result<()> {
                     state.offset += 1;
                 }
                 b',' | b';' => {
+                    // Sibling expressions cannot add depth to each other. A
+                    // delimiter inside a bracket must keep the unfinished
+                    // chain outside it, including in slash alternatives.
+                    state.operators = state
+                        .brackets
+                        .last()
+                        .map_or(0, |bracket| usize::from(bracket.outer_operators));
                     state.colons = 0;
                     state.offset += 1;
                 }
@@ -760,22 +801,16 @@ fn lexical_budget(source: &str) -> io::Result<()> {
                         lex_work(&mut work, 1)?;
                         end += 1;
                     }
-                    if matches!(
-                        &bytes[i..end],
-                        b"if"
-                            | b"else"
-                            | b"for"
-                            | b"while"
-                            | b"do"
-                            | b"function"
-                            | b"class"
-                            | b"switch"
-                            | b"try"
-                            | b"catch"
-                            | b"finally"
-                            | b"with"
-                    ) {
-                        state.controls += 1;
+                    match &bytes[i..end] {
+                        b"if" | b"else" | b"for" | b"while" | b"do" | b"function" | b"class"
+                        | b"switch" | b"try" | b"catch" | b"finally" | b"with" => {
+                            state.controls += 1;
+                        }
+                        b"typeof" | b"void" | b"delete" | b"new" | b"await" | b"yield" | b"in"
+                        | b"instanceof" => {
+                            state.operators += 1;
+                        }
+                        _ => {}
                     }
                     state.offset = end;
                 }
@@ -851,6 +886,17 @@ fn global_method(receiver: &str, name: &str) -> bool {
             "abs" | "floor" | "ceil" | "round" | "trunc" | "min" | "max"
         ),
         "Uint8Array" => name == "from",
+        "Vole" => matches!(
+            name,
+            "query"
+                | "percentDecode"
+                | "utf8Encode"
+                | "utf8Decode"
+                | "base64Encode"
+                | "base64Decode"
+                | "copyBytes"
+                | "concatBytes"
+        ),
         _ => false,
     }
 }
@@ -907,6 +953,10 @@ mod tests {
             "function rewrite(input){return [].map(x=>x);}",
             "function rewrite(input){const f=JSON.parse;return f('{}');}",
             "function rewrite(input){return JSON['parse']('{}');}",
+            "function rewrite(input){const f=Vole.copyBytes;return f(input.body.data);}",
+            "function rewrite(input){return Vole['query']();}",
+            "function rewrite(input){return Vole.fetch('https://example.test');}",
+            "function rewrite(input){const Vole={};return Vole.query();}",
             "function rewrite(input){return new Uint8Array(10);}",
             "function rewrite(input){try{return input;}catch(e){return input;}}",
             "function rewrite(input){function f(){return 1;}return f();}",
@@ -952,6 +1002,22 @@ mod lexical_tests {
     use super::*;
 
     #[test]
+    fn parser_admits_many_shallow_assignments_without_losing_outer_depth() {
+        let flat = format!(
+            "function rewrite(input){{let a=0;{}return {{type:'pass'}};}}",
+            "a+=1;".repeat(96)
+        );
+        assert!(compile(&flat).is_ok());
+
+        let nested = format!(
+            "function rewrite(input){{let a;{}(0,{}0);}}",
+            "a=".repeat(80),
+            "a=".repeat(80)
+        );
+        assert!(lexical_budget(&nested).is_err());
+    }
+
+    #[test]
     fn parser_admission_rejects_deep_expressions_and_unbraced_control_flow() {
         let cases = [
             format!(
@@ -962,6 +1028,10 @@ mod lexical_tests {
             format!(
                 "function rewrite(input){{return {}true;}}",
                 "!".repeat(20_000)
+            ),
+            format!(
+                "function rewrite(input){{return {}true;}}",
+                "typeof ".repeat(20_000)
             ),
             format!(
                 "function rewrite(input){{{}return {{type:'pass'}};}}",
@@ -1013,8 +1083,16 @@ mod prelude_tests {
     use tokio_util::sync::CancellationToken;
 
     async fn run(source: &str, input: Option<&[u8]>) -> io::Result<(Value, Vec<u8>)> {
+        run_with_url(source, input, "https://example.test/").await
+    }
+
+    async fn run_with_url(
+        source: &str,
+        input: Option<&[u8]>,
+        original_url: &str,
+    ) -> io::Result<(Value, Vec<u8>)> {
         let program = scripts::validate_source(source)?;
-        let metadata = json!({"phase":"response","original":{"url":"https://example.test/","method":"GET"},
+        let metadata = json!({"phase":"response","original":{"url":original_url,"method":"GET"},
             "request":{"url":"https://example.test/","method":"GET","headers":[]},
             "response":{"status":200,"headers":[]},"body":{"kind":if input.is_some(){"text"}else{"not-requested"}}});
         let budget = Budget::default();
@@ -1028,6 +1106,104 @@ mod prelude_tests {
         )
         .await?;
         Ok((result, output.as_ref().to_vec()))
+    }
+
+    #[tokio::test]
+    async fn p1_query_preserves_original_order_unset_values_and_plus_mode() {
+        let (_, body) = run_with_url(
+            r#"function rewrite(input){
+                input.original.url="https://example.test/?ignored=1";
+                const result=[Vole.query(),Vole.query(true),Vole.percentDecode("%E4%B8%AD+%2B",true)];
+                return {type:"respond",status:200,body:{kind:"text",data:JSON.stringify(result)}};
+            }"#,
+            None,
+            "https://example.test/p?a&a=&b=+%2B%26&&=v%3D",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!([
+                [{"name":"a","value":null},{"name":"a","value":""},{"name":"b","value":"++&"},{"name":"","value":"v="}],
+                [{"name":"a","value":null},{"name":"a","value":""},{"name":"b","value":" +&"},{"name":"","value":"v="}],
+                "中 +"
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn p1_binary_tools_preserve_exact_bytes_and_unicode() {
+        let (_, bytes) = run(
+            r#"function rewrite(input){
+                const original=Vole.base64Decode("AAEC/w==");
+                const result=Vole.concatBytes([Vole.copyBytes(original,1,3),Vole.utf8Encode("中😀")]);
+                return {type:"respond",status:200,body:{kind:"bytes",data:result}};
+            }"#,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, b"\x01\x02\xe4\xb8\xad\xf0\x9f\x98\x80");
+
+        let (_, encoded) = run(
+            r#"function rewrite(input){
+                const result=Vole.base64Encode(Vole.utf8Encode("中😀"));
+                return {type:"respond",status:200,body:{kind:"text",data:result}};
+            }"#,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(encoded, b"5Lit8J+YgA==");
+
+        let input = format!("{}😀{}", "a".repeat(1023), "é".repeat(4100));
+        let (_, text) = run(
+            r#"function rewrite(input){
+                const result=Vole.utf8Decode(Vole.utf8Encode(input.body.data));
+                return {type:"respond",status:200,body:{kind:"text",data:result}};
+            }"#,
+            Some(input.as_bytes()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, input.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn p1_tools_reject_bad_encodings_ranges_and_excess_work() {
+        for expression in [
+            "Vole.query('form')",
+            "Vole.percentDecode('%ED%A0%80')",
+            "Vole.percentDecode('%')",
+            "Vole.base64Decode('Zh==')",
+            "Vole.base64Decode('AA=Z')",
+            "Vole.base64Decode('Zg')",
+            "Vole.utf8Decode(Uint8Array.from([192,128]))",
+            "Vole.utf8Decode(Uint8Array.from([240,159,152]))",
+            "Vole.copyBytes(Uint8Array.from([1]),0,2)",
+            "Vole.concatBytes([null])",
+        ] {
+            let source =
+                format!("function rewrite(input){{const v={expression};return {{type:'pass'}};}}");
+            assert!(run(&source, None).await.is_err(), "accepted {expression}");
+        }
+        let input = vec![b'a'; 200_000];
+        assert!(
+            run(
+                "function rewrite(input){const b=Vole.utf8Encode(input.body.data);const v=Vole.base64Encode(b);return {type:'pass'};}",
+                Some(&input)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            run(
+                "function rewrite(input){const b=Vole.utf8Encode(input.body.data);for(let i=0;i<8;i++){const c=Vole.copyBytes(b);}return {type:'pass'};}",
+                Some(&input)
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

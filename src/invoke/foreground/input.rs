@@ -243,9 +243,16 @@ pub(super) fn check_envelope(request: &str) -> Result<(), InvokeFailure> {
         external_controller_unix: Option<&'a RawValue>,
         #[serde(borrow)]
         secret: Option<&'a RawValue>,
+        #[serde(borrow)]
+        http_parameter_overrides: Option<&'a RawValue>,
     }
     let input: Input<'_> = serde_json::from_str(envelope.payload.get())
         .map_err(|_| failure("invalid foreground input"))?;
+    if input.http_parameter_overrides.is_some_and(|raw| {
+        raw.get().len() > 6 * crate::http_processing::config::MAX_PARAMETER_OVERRIDES
+    }) {
+        return Err(failure("HTTP parameter input limit exceeded"));
+    }
     for (raw, limit) in [
         (input.config_string, MAX_ENCODED_BYTES),
         (input.age_secret_key, MAX_SECRET_BYTES),

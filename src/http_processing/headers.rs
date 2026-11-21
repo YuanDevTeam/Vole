@@ -1,7 +1,6 @@
 //! Ordered header transactions shared by the HTTP/1 and HTTP/2 adapters.
-use super::rules::{HeaderOperation, Phase, Rule, RuleAction, validate_header_value};
+use super::rules::{HeaderOperation, Phase, RequestMatch, Rule, RuleAction, validate_header_value};
 use std::io;
-use url::Url;
 
 pub(crate) type Fields = Vec<(String, String)>;
 pub(crate) const MAX_FIELDS: usize = 100;
@@ -42,7 +41,13 @@ pub(crate) fn strip_origin_credentials(fields: &mut Fields) {
     });
 }
 
-pub(crate) fn apply(rules: &[Rule], original: &Url, phase: Phase, fields: &mut Fields) -> Outcome {
+pub(crate) fn apply<'a>(
+    rules: &[Rule],
+    original: impl Into<RequestMatch<'a>>,
+    phase: Phase,
+    fields: &mut Fields,
+) -> Outcome {
+    let original = original.into();
     if !rules.iter().any(|rule| {
         matches!(&rule.action, RuleAction::Header { phase: p, .. } if *p == phase)
             && rule.matches(original)
@@ -109,12 +114,13 @@ pub(crate) fn apply(rules: &[Rule], original: &Url, phase: Phase, fields: &mut F
     }
 }
 
-pub(crate) fn apply_map(
+pub(crate) fn apply_map<'a>(
     rules: &[Rule],
-    original: &Url,
+    original: impl Into<RequestMatch<'a>>,
     phase: Phase,
     fields: &mut http::HeaderMap,
 ) -> Outcome {
+    let original = original.into();
     if !rules.iter().any(|rule| {
         matches!(&rule.action, RuleAction::Header { phase: p, .. } if *p == phase)
             && rule.matches(original)
@@ -179,6 +185,7 @@ fn append(fields: &mut Fields, header: &str, value: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::http_processing::rules::RawRule;
+    use url::Url;
 
     fn rules(yaml: &str) -> Vec<Rule> {
         let raw: Vec<RawRule> = serde_yaml_ng::from_str(yaml).unwrap();

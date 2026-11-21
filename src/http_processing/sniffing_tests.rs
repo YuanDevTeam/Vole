@@ -44,7 +44,13 @@ impl Dispatcher for SniffingOrigin {
     }
 }
 
-const NATIVE_HEADER: &str = "rewrite:\n  enabled: true\n  rules:\n    - {url: '.', action: response-header-set, header: X-Native, value: kept}\n";
+const NATIVE_HEADER: &str = r#"targets:
+  - origins: [http://allowed.example, http://203.0.113.1]
+    rules:
+      - response:
+          headers:
+            - {set: {X-Native: kept}}
+"#;
 const MAIN: &str = "sniffer:\n  enable: true\n  parse-pure-ip: true\n  override-destination: false\n  sniff:\n    HTTP: {ports: [80]}\nrules: ['GEOSITE,cn,DIRECT','MATCH,REJECT']\n";
 
 async fn exchange(main: &str, http: &str, host: &str) -> (String, StreamSession) {
@@ -145,7 +151,12 @@ async fn plain_h1_honors_explicit_override_and_discards_old_hint_on_origin_chang
     );
     let (_, selected) = exchange(
         MAIN,
-        "rewrite:\n  enabled: true\n  rules:\n    - {url: 'http://allowed.example/', match: prefix, action: replace, replacement: 'http://final.example/'}\n",
+        r#"targets:
+  - origins: [http://allowed.example]
+    rules:
+      - request:
+          url: {replace: {value: http://final.example/, mode: match}}
+"#,
         "allowed.example",
     )
     .await;
@@ -161,7 +172,14 @@ async fn plain_h1_honors_explicit_override_and_discards_old_hint_on_origin_chang
 async fn request_script_sees_the_sniffed_base_then_final_origin_replaces_its_hint() {
     let (_, selected) = exchange(
         MAIN,
-        "http-scripts:\n  enabled: true\n  scripts:\n    - name: final-target\n      phase: request\n      url: 'http://allowed.example/'\n      match: prefix\n      source: 'function rewrite(input) { return {type:\"modify\",url:\"http://script-final.example/\"}; }'\n",
+        r#"targets:
+  - origins: [http://allowed.example]
+    rules:
+      - name: final-target
+        request:
+          js:
+            source: 'function rewrite(input) { return {type:"modify",url:"http://script-final.example/"}; }'
+"#,
         "allowed.example",
     )
     .await;

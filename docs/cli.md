@@ -28,7 +28,13 @@ vole -t -config "$(base64 < config.yaml)"
 | `-ext-ctl-unix <path>` | 非空时覆盖 Linux 本地 Controller 路径 |
 | `-ext-ctl-routing-mark <mark>` | 非零时覆盖 Linux 管理 TCP socket mark |
 | `-secret <token>` | 非空时覆盖 Controller 认证密钥 |
-| `-http-config <file>` | 显式的独立 HTTP 附加配置，交给 Invoke 读取与验证 |
+| `-http-param <index:key=JSON>` | 指定插件实例的本机参数，可重复传入。文件序号从 1 开始 |
+| `-http-config <file>` | HTTP 插件原文文件，可重复传入，按参数顺序执行 |
+| `-http-mitm` | 开启本机 MITM，默认关闭 |
+| `-http-mitm-exclude <domain>` | 全局 MITM 排除，支持精确域名及 `*.suffix`，可重复传入 |
+| `-http-rewrite=false` | 关闭内置 rewrite，默认开启 |
+| `-http-js=false` | 关闭 JS，默认开启 |
+| `-http-intercept-only` | 允许插件中明确声明的仅解密目标，默认关闭 |
 | `-http-ca <file>` | 独立私密 CA JSON 路径，交给 Invoke 读取；`-t` 不读取它 |
 | `-t` | 校验配置后退出，不初始化数据、联网或启动 TUN |
 | `-v` | 输出内核版本及构建身份 |
@@ -61,15 +67,23 @@ Unix 用户目录取 `HOME`，Windows 取 `USERPROFILE`，缺失时使用工作�
 显式 0 屏蔽环境默认但保留 YAML mark。此项只用于管理 TCP，不改变业务 routing-mark 或 Unix socket。
 `-t` 与 Mihomo 一致，只校验输入配置，不读取环境／应用运行期覆盖；`-h/-v` 不读取其环境值。
 
-独立 HTTP 配置上限 1 MiB，使用 `-http-config <file>` 或 `--http-config=<file>`。省略不探测文件；空路径与 `-` 失败，空文件关闭处理。相对 provider 文件从 HTTP 文件目录解析，缓存从数据目录解析。`-t` 只校验主文档／inline 内容，不读取外部 provider、下载或私密 CA；`-v/-h` 不读取附加文件。详细输入见 [HTTP 处理](http-processing.md)。
+插件文件按 `-http-config <file>` 或 `--http-config=<file>` 的顺序读取，原文合计最多 1 MiB。省略参数时不探测文件。空路径和 `-` 拒绝。`-t` 校验主配置、插件 YAML 和脚本语法，不读取私密 CA、不初始化脚本后端。`-v/-h` 不读取插件文件。详细输入见 [HTTP 处理](http-processing.md)。
 
-开启选择性 HTTPS 时，额外传 `-http-ca /private/ca.json`，格式为 `{"certificate":"...PEM...","privateKey":"...PEM..."}`。Unix 文件必须属于当前用户、关闭 group／other 权限（如 0600），且不能是符号链接。私钥不进入共享规则、命令行正文、普通快照或日志；宿主管理证书生成与客户端信任。
+```sh
+vole -f ./config.yaml -http-config ./api.yaml -http-config ./other.yaml \
+  -http-mitm -http-mitm-exclude '*.private.example' -http-ca /private/ca.json
+```
+
+用 `-http-param '1:profile="beta"'` 为第一份插件传入字符串参数。布尔、整数和字符串需要是相应的 JSON 字面量，Core 校验声明与选项。使用同一文件两次时，两个序号的参数互相独立。
+
+MITM 开启且仍有可拦截的 HTTPS origin 时需要 `-http-ca`，其文件格式为 `{"certificate":"...PEM...","privateKey":"...PEM..."}`。Unix 文件须属于当前用户、关闭 group／other 权限（如 0600），且不能是符号链接。宿主管理客户端证书信任。
+
 客户端 certificate/private-key 可引用 PEM 文件，相对路径从 -d 的数据目录解析；-t 同样读取并校验身份，仍不初始化目录。
 
-`VOLE_SAFE_PATHS` 可为主配置的 file provider 读取和 HTTP provider 缓存增加授权目录。
+`VOLE_SAFE_PATHS` 可为主配置的 file provider 读取和远程 provider 缓存增加授权目录。
 使用系统路径列表分隔符（Unix 为 `:`、Windows 为 `;`），保留原生路径编码；相对目录从启动工作目录解析，
 空项不授权当前目录。授权目录必须已经存在，初始化后固定，并由 provider 候选与恢复快照继承。
-文件读取不创建目录；只有 HTTP provider 缓存可在授权根内新建目录及写入正文／sidecar。
+文件读取不创建目录。缓存写入遵循 provider 的授权范围。
 路径中的 `..`、祖先或目标符号链接逃逸被拒绝。默认仍限 dataDir；file provider 在额外目录内不会回写 bundle 回退。
 本次主配置／独立 HTTP 文件保留为不可被缓存覆盖的输入，显式私密 CA 路径不授予 provider 读写。
 该环境只进入 provider 资源上下文，不改变主配置、客户端身份／私密 CA、独立 HTTP 设置或 Controller socket 的文件合同；
@@ -82,7 +96,7 @@ Unix 的 SIGHUP 通过同一候选工作器重载主配置：文件源重读该�
 解密后的有效 YAML，不重读标准输入、环境默认、独立 HTTP 文件或私密 CA。文件 AGE 保留已解析身份，
 不保留原始密钥文本。Controller 覆盖继续应用于候选；规则、节点与普通 provider 候选沿原热更新流程。
 坏候选、繁忙或超时保留当前会话；启动资源变化报告 reconnect required，SIGHUP 不自动停止或重连，
-需宿主协调或重启前台进程。活动 HTTP payload／CA 继续固定，HTTP provider 待应用内容不会由 SIGHUP 应用。
+需宿主协调或重启前台进程。活动插件原文、本机 HTTP 设置和 CA 继续固定。
 退出或引擎停止会取消并等待已开始的重载工作；宿主原 TUN fd 不被替换或关闭。
 具体请求格式见 [Invoke API](invoke-api.md)。
 

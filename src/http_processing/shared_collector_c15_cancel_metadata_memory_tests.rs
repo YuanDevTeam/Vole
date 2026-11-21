@@ -137,19 +137,19 @@ async fn known_h1_shared_collection_cancels_after_64k_and_joins_before_refund() 
 #[tokio::test(flavor = "current_thread")]
 async fn shared_native_64k_then_real_metadata_script_keeps_body_owner_through_send() {
     const LENGTH: usize = 64 * 1024;
-    let policy = Policy::compile(r#"rewrite:
-  enabled: true
-  rules:
-    - {url: 'https://shared-meta.invalid/body', match: exact, action: request-body-replace, search: a, replacement: b}
-http-scripts:
-  enabled: true
-  scripts:
-    - name: real-metadata-after-native
-      phase: request
-      match: exact
-      url: https://shared-meta.invalid/body
-      body: none
-      source: 'function rewrite(input){if(!input.body || input.body.kind !== "not-requested"){return {type:"abort"};}return {type:"modify",headers:[{op:"set",name:"x-meta",values:["after-native"]}]};}'
+    let policy = Policy::compile(r#"targets:
+  - origins: [https://shared-meta.invalid]
+    rules:
+      - match: {path-exact: /body}
+        request:
+          body:
+            - {replace: {search: a, replacement: b}}
+      - name: real-metadata-after-native
+        match: {path-exact: /body}
+        request:
+          js:
+            body: none
+            source: 'function rewrite(input){if(!input.body || input.body.kind !== "not-requested"){return {type:"abort"};}return {type:"modify",headers:[{op:"set",name:"x-meta",values:["after-native"]}]};}'
 "#).unwrap();
     let budget = policy.body_budget();
     let url = Url::parse("https://shared-meta.invalid/body").unwrap();

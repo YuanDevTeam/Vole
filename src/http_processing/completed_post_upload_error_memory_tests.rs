@@ -4,6 +4,7 @@
 //! really ends after one byte. It is not a synthetic completion boolean.
 //! The downstream has one byte of response credit, so a valid final response
 //! cannot finish before the upload error has actually propagated upstream.
+
 use super::*;
 use crate::{
     dispatch::{DatagramTransport, DispatchError, Dispatcher, HttpTcpReuseKey},
@@ -20,6 +21,7 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, task::JoinHandle};
 
+const EMPTY_POLICY: &str = "targets: [{origins: ['https://example.test'], intercept-only: true}]";
 const WAIT: Duration = Duration::from_secs(3);
 const REPLY: &[u8] = b"origin";
 
@@ -244,9 +246,9 @@ async fn completed_post_h2_upload_error_after_final_headers_preserves_reply_and_
                 }}
             }));
             let response = ResponseSlot(Arc::new(Mutex::new(ResponseState { response, infos:0, final_started:false, upstream_final_received:false })));
-            let policy = Document::parse("{}").map_err(error)?.compile(&std::collections::BTreeMap::new()).map_err(error)?.bind_ca(None).map_err(error)?;
+            let policy = Document::parse(EMPTY_POLICY).map_err(error)?.compile().map_err(error)?.bind_settings(&Default::default(), None).map_err(error)?;
             let context = HttpContext::new(policy, Arc::new(UnusedDispatcher), SecurityContext::default());
-            let target = Target { original:url.clone(), url:url.clone(), session:session(), logical_destination:Destination::domain("a.test",443).map_err(error)?, strip_origin_credentials:false };
+            let target = Target { original:url.clone(), original_method:http::Method::POST, url:url.clone(), session:session(), logical_destination:Destination::domain("a.test",443).map_err(error)?, strip_origin_credentials:false, request_conditions:0 };
             let metadata = MessageMeta { original:OriginalRequestMeta::new("POST", &vec![]), length:Some(8), asterisk:false, script:None };
             let request = Request::builder().method("POST").uri(url.as_str()).header("content-length",8).body(source).map_err(error)?;
             let exchange = UPLOAD_ERROR_WITNESS.scope(witness.clone(), context.h2_exchange(UpstreamSender::Shared { lease: &lease, sender }, request, &response, target, metadata));
@@ -425,14 +427,16 @@ fn drop_origin_pair(
     });
     (Box::new(client), owner)
 }
-fn drop_target(path: &str) -> io::Result<Target> {
+fn drop_target(path: &str, original_method: http::Method) -> io::Result<Target> {
     let url = url::Url::parse(&format!("https://a.test/{path}")).map_err(error)?;
     Ok(Target {
         original: url.clone(),
+        original_method,
         url,
         session: session(),
         logical_destination: Destination::domain("a.test", 443).map_err(error)?,
         strip_origin_credentials: false,
+        request_conditions: 0,
     })
 }
 fn drop_metadata(method: &str, length: Option<u64>) -> MessageMeta {
@@ -505,17 +509,17 @@ async fn completed_post_h2_dropped_exchange_retires_admission_without_cancelling
             }));
             let first_slot = ResponseSlot(Arc::new(Mutex::new(ResponseState {response:first_response_owner,infos:0,final_started:false,upstream_final_received:false})));
             let sibling_slot = ResponseSlot(Arc::new(Mutex::new(ResponseState {response:sibling_response_owner,infos:0,final_started:false,upstream_final_received:false})));
-            let policy = Document::parse("{}").map_err(error)?.compile(&std::collections::BTreeMap::new()).map_err(error)?.bind_ca(None).map_err(error)?;
+            let policy = Document::parse(EMPTY_POLICY).map_err(error)?.compile().map_err(error)?.bind_settings(&Default::default(), None).map_err(error)?;
             let context = HttpContext::new(policy,Arc::new(UnusedDispatcher),SecurityContext::default());
             let first_request = Request::builder().method("POST").uri("https://a.test/drop").header("content-length",8).body(h2_body::Source::h2(first_request.into_body())).map_err(error)?;
             let sibling_request = Request::builder().uri("https://a.test/sibling").body(h2_body::Source::h2(sibling_request.into_body())).map_err(error)?;
             let mut first_exchange = Box::pin(context.h2_exchange(
                 UpstreamSender::Shared { lease: &first_lease, sender: first_sender },
-                first_request, &first_slot, drop_target("drop")?, drop_metadata("POST",Some(8))
+                first_request, &first_slot, drop_target("drop", http::Method::POST)?, drop_metadata("POST",Some(8))
             ));
             let mut sibling_exchange = Box::pin(context.h2_exchange(
                 UpstreamSender::Shared { lease: &sibling_lease, sender: sibling_sender },
-                sibling_request, &sibling_slot, drop_target("sibling")?, drop_metadata("GET",None)
+                sibling_request, &sibling_slot, drop_target("sibling", http::Method::GET)?, drop_metadata("GET",None)
             ));
             phase.store(20,Ordering::Release);
             tokio::select! {biased;

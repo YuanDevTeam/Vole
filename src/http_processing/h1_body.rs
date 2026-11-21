@@ -3,7 +3,7 @@ use super::{
     Policy,
     body::{self, BudgetedBytes, OriginalRequestMeta, Transaction, WireBodyMeta},
     headers::Fields,
-    rules::Phase,
+    rules::{HeaderView, Phase, RequestMatch},
 };
 use super::{
     script_config::BodyMode,
@@ -36,6 +36,7 @@ pub(crate) struct Message<'a> {
     pub(crate) policy: &'a Policy,
     pub(crate) original: &'a Url,
     pub(crate) request: &'a RequestHead,
+    pub(crate) request_conditions: u64,
     pub(crate) meta: OriginalRequestMeta,
     pub(crate) continued: AtomicBool,
     pub(crate) prepared: std::sync::Mutex<Option<PreparedBody>>,
@@ -43,6 +44,11 @@ pub(crate) struct Message<'a> {
 }
 
 impl Message<'_> {
+    fn selection(&self, response_conditions: u64) -> RequestMatch<'_> {
+        RequestMatch::from((self.original, self.request.method.as_str()))
+            .with_conditions(self.request_conditions, response_conditions)
+    }
+
     pub(crate) fn suppress_continue(&self) -> bool {
         self.continued.load(Ordering::Relaxed)
     }
@@ -72,7 +78,7 @@ impl Message<'_> {
         let transaction = Transaction::begin(
             self.policy.body_budget(),
             self.policy.rules(),
-            self.original,
+            self.selection(0),
             Phase::Request,
             &wire,
         )
@@ -117,6 +123,10 @@ impl Message<'_> {
         config: &HttpServerConfig,
     ) -> io::Result<PreparedBody> {
         let body = response.body(&self.request.method);
+        let response_conditions = self
+            .policy
+            .response_conditions(response.status, HeaderView::Fields(response.headers()));
+        let selection = self.selection(response_conditions);
         let wire = WireBodyMeta::new(
             response.headers(),
             &self.meta,
@@ -125,16 +135,22 @@ impl Message<'_> {
             length(body),
             response.status == 101,
         );
-        let original_fields = self.scripts.as_ref().map(|_| response.headers().clone());
-        self.response_headers(response)?;
-        if let Some(script) = &self.scripts {
+        let scripts = self.scripts.as_ref().filter(|_| {
+            self.policy
+                .scripts()
+                .iter()
+                .any(|script| script.phase == Phase::Response && script.matches(selection))
+        });
+        let original_fields = scripts.map(|_| response.headers().clone());
+        self.apply_response_headers(response, selection)?;
+        if let Some(script) = scripts {
             let wants_body = self.policy.scripts().iter().any(|s| {
-                s.phase == Phase::Response && s.body != BodyMode::None && s.matches(self.original)
+                s.phase == Phase::Response && s.body != BodyMode::None && s.matches(selection)
             });
             let transaction = Transaction::begin_shared(
                 self.policy.body_budget(),
                 self.policy.rules(),
-                self.original,
+                selection,
                 Phase::Response,
                 &wire,
                 wants_body,
@@ -159,7 +175,8 @@ impl Message<'_> {
                 },
                 entity,
                 original_fields.as_ref().expect("script wire headers"),
-            );
+            )
+            .with_conditions(self.request_conditions, response_conditions);
             let outcome = match script_message::run(
                 self.policy,
                 self.original,
@@ -206,7 +223,7 @@ impl Message<'_> {
         let transaction = Transaction::begin(
             self.policy.body_budget(),
             self.policy.rules(),
-            self.original,
+            selection,
             Phase::Response,
             &wire,
         )
@@ -228,8 +245,16 @@ impl Message<'_> {
     /// Informational responses and successful upgrades have no body stage,
     /// but their ordinary fields still participate in the response pipeline.
     pub(crate) fn response_headers(&self, response: &mut ResponseHead) -> io::Result<()> {
+        self.apply_response_headers(response, self.selection(0))
+    }
+
+    fn apply_response_headers(
+        &self,
+        response: &mut ResponseHead,
+        selection: RequestMatch<'_>,
+    ) -> io::Result<()> {
         response.edit_headers(|fields| {
-            super::headers::apply(self.policy.rules(), self.original, Phase::Response, fields);
+            super::headers::apply(self.policy.rules(), selection, Phase::Response, fields);
         })
     }
 }

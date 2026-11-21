@@ -299,7 +299,7 @@ Stop 关闭本次持有的 fd、session 和原生句柄；Wintun 不承诺移除
 
 ### `updateConfig`
 
-实例级方法，只允许 running 状态。接受 `configYaml`、可选 `httpConfigYaml` 与只含 `baseDir` 的 `httpContext`；不接受 CA：
+实例级方法，只允许 running 状态。接受 `configYaml`、可选 `httpConfigYaml` 或 `httpConfigYamls` 与非私密 `httpContext`。
 
 ```json
 {"method":"updateConfig","instanceId":"1","payload":{"configYaml":"rules: [MATCH,DIRECT]"}}
@@ -307,8 +307,7 @@ Stop 关闭本次持有的 fd、session 和原生句柄；Wintun 不承诺移除
 
 共享 Controller 的单候选许可、解析、完整图准备与原子发布，不建立第二个运行时。
 先取得许可，再解码最多 8 MiB 的 YAML；并发应用返回 busy。无效候选或准备失败保留旧代，
-改变启动资源返回 reconnect required。成功仅表示候选配置及当前可用资源已经发布；HTTP provider
-继续沿原更新流程刷新，不表示所有远端订阅已下载。Controller GET `/configs` 可确认当前有效值。
+改变启动资源返回 reconnect required。成功表示候选配置及当前可用资源已经发布。省略 HTTP 时继承活动输入，显式提供时必须与活动输入一致。Controller GET `/configs` 可确认当前有效值。
 
 沿用实例命令锁：调用完成前，同实例 Stop/getState/其他命令返回 busy；候选等待上限 90 秒。
 超时或取消会阻止未发布候选继续提交；工作器保留许可并回收已开始的准备任务，Stop 仍等待其完成。如超时与发布同时发生，
@@ -366,7 +365,7 @@ Windows Session Snapshot 不由此重建；Windows UWP 的活动 Provider 配置
 它不更改业务 mark 或本地 Unix 入口。CLI 先执行 Go flag 整数语法检查，`validate` 仍不读取该环境默认或应用运行期覆盖。
 覆盖元数据不进入普通 `start` payload 或 Mihomo YAML schema；Controller 的 TLS 身份仍由主配置提供。新激活的入口保留主配置中的 secret/CORS；Unix 本地入口另依文件权限授权，不改变网络鉴权。
 前台运行可通过 `VOLE_SAFE_PATHS` 的系统原生路径列表扩展 provider 授权根；仅用于主配置 file provider 读取、
-HTTP provider 缓存正文及 sidecar 写入。目录在初始化时 canonicalize 并冻结，沿普通候选、HUP 和恢复快照继承；
+远程 provider 缓存写入。目录在初始化时 canonicalize 并冻结，沿普通候选、HUP 和恢复快照继承。
 重复初始化不得改变已明确设置的授权上下文。空项不授权工作目录，读取不创建目录，路径 traversal 与符号链接逃逸拒绝。
 本次显式主配置／独立 HTTP 输入禁止被缓存覆盖，显式私密 CA 路径禁止 provider 读写。
 它不扩展主配置写回、客户端身份／私密 CA、独立 HTTP 设置或 Controller 清理权限，也不进入 YAML／普通 initialize payload。
@@ -392,8 +391,7 @@ Unix SIGHUP 只通过已有候选许可与工作器热更新主配置：文件�
 后者不保留 Base64、AGE 密文或原始 JSON；文件 AGE 仅保留已解析身份，不重读密钥环境或独立 HTTP 私密 CA 文件。
 同一请求启动时的具体 Controller 覆盖继续应用于新候选。错误候选保留当前配置；启动资源变化返回
 reconnect required 的本地摘要并保留当前会话，HUP 不自动 Stop/start，也不关闭或替换宿主 fd。
-候选继承活动 HTTP policy 的同一实际 payload／CA，普通 provider 更新继续正常执行；独立 HTTP 文件和
-HTTP pending 不由 HUP 读取或应用。退出信号／引擎结束取消并等待重载的已开始工作，Stop 保留原同步屏障。
+候选继承活动 HTTP 插件原文、本机设置和 CA，普通 provider 更新继续执行。HUP 沿用已冻结的 HTTP 输入。退出信号或引擎结束时取消并等待已开始的重载，Stop 保留同步屏障。
 启动、关键数据面、
 信号或清理失败返回失败响应，错误保留有界摘要；操作返回前完成本次清理。
 
@@ -594,9 +592,9 @@ ProtectFd(fd) -> bool
   `vole`，不继承宿主应用的 bundle identifier；Console 或 `log stream` 应按该标识筛选。
 
 
-## 独立 HTTP 设置与私密上下文
+## HTTP 插件与本机设置
 
-`validateConfig`、`start`、`reconnect` 可选 `httpConfigYaml`。HTTP YAML 不承载 CA；旧数组规则、字符串域名项和共享 PEM 字段均拒绝。字段、动作与 provider 见 [HTTP 处理](http-processing.md)。
+`validateConfig`、`start`、`reconnect` 可接收单份 `httpConfigYaml` 或有序的 `httpConfigYamls` 数组，也可以传入本机托管的 `httpPlugins`。三种输入互斥，YAML 统一按原始字符串交付。插件格式见 [HTTP 处理](http-processing.md)。
 
 ```json
 {
@@ -604,55 +602,70 @@ ProtectFd(fd) -> bool
   "instanceId": "1",
   "payload": {
     "configYaml": "rules: ['MATCH,DIRECT']",
-    "httpConfigYaml": "mitm: {enabled: true, domains: [{pattern: example.com}]}",
+    "httpConfigYamls": [
+      "targets: [{origins: ['https://api.example.com:8443'], rules: [{request: {headers: [{set: {x-client: vole}}]}}]}]"
+    ],
     "httpContext": {
-      "baseDir": "/absolute/http-settings",
+      "mitmEnabled": true,
+      "excludeDomains": ["*.private.example"],
       "ca": {"certificate": "...PEM...", "privateKey": "...PEM..."}
     }
   }
 }
 ```
 
-baseDir 使用原生路径元数据并且必须绝对；相对 file 来源必须有该上下文。HTTP 缓存使用已初始化 dataDir。CA 仅由 start／reconnect 和 Windows startVpn 接受；私密 DTO 不可普通序列化、Debug 脱敏，临时密钥输入在释放时零化。关闭 MITM 不要求 CA。
+| `httpContext` 字段 | 默认值 | 用途 |
+| --- | --- | --- |
+| `mitmEnabled` | false | 允许从已启用插件的 HTTPS origins 选择性解密 |
+| `excludeDomains` | [] | 按域名排除所有插件的各个 HTTPS 端口 |
+| `rewriteEnabled` | true | 执行内置动作 |
+| `jsEnabled` | true | 执行内联脚本 |
+| `allowInterceptOnly` | false | 允许显式标为 `intercept-only: true` 的目标 |
+| `ca` | 省略 | 私密 CA 与私钥，MITM 开启且存在有效 HTTPS 目标时必需 |
 
-validateConfig 只静态校验，不读取外部 HTTP provider 或 CA。返回 `httpResourcesValidated` 表示外部资源是否全部可在输入中校验，`httpsReady` 固定 false；静态通过不代表真实 HTTPS 就绪。foreground 的 validate 也不读取 `httpCaPath`。
+`ca` 仅由 `start`、`reconnect` 和 Windows `startVpn` 接受。私密 DTO 的 Debug 输出脱敏，临时密钥输入在释放时零化。`validateConfig` 静态校验提交的数据，返回 `httpResourcesValidated: true`、`httpsReady: false` 和有序的 `httpTargets`。每个目标报告来源及目标组索引、可选显示名、规范化的协议／主机／端口，以及内置动作、JS 和仅解密声明。静态校验无需 CA 或脚本后端。
+
+托管输入每项包含 `id`、`yaml`、原文字节的十六进制 SHA-256 `digest`、可选 `parameters` 与 `permissions`。同一批输入的安装 ID 唯一。权限默认空。
+
+| `permissions` 字段 | 用途 |
+| --- | --- |
+| `httpsOrigins` | 批准该插件声明的 HTTPS origin。采用 `httpTargets.origins[].origin` 中的完整字符串 |
+| `js` | 允许该实例执行 JS，默认 false |
+| `interceptOnly` | 允许该实例的仅解密目标，默认 false |
+| `upstreamOrigins` | 批准插件声明的固定跨源上游，采用插件返回的规范化目标列表 |
+
+Core 验证原文摘要、已有参数声明及权限范围。HTTPS 及脚本即使获批也受本机总开关和排除约束。其他实例的权限无法覆盖当前实例。托管 JS 在运行中校验其目的 origin。
+
+`validateConfig` 的 `httpPlugins` 输出每份文档的名称、说明、类型化参数声明及固定的跨源上游。`httpTargets` 输出规则路径、ID、内容摘要、请求／响应阶段的原生动作、正文及 JS 正文模式，以及可静态确定的客户端重定向目标。规则摘要用于比较版本，授权校验使用整个插件原文的摘要。原文未获准执行时仍可校验并预览。
 
 ### `reconnect`
 
-实例级、只允许 running，payload 与 start 相同。先准备新资源候选，再执行停止屏障并启动。后续启动失败时用临时保留的旧主配置、实际 provider 内容及原 HTTP／CA 快照恢复，方法仍报告失败。新候选准备失败不停止旧引擎。恢复也失败则回到 stopped 并明确报告；普通 Stop 不长期保留恢复密钥。
-
-updateConfig 省略 HTTP 时继承 active；同设置可继续使用 active。显式改变 HTTP（包括空串关闭）或来源基目录返回 reconnect required，整个 routing 更新失败；不把待应用候选混入当前会话。节点切换与普通 provider 更新也不应用 pending HTTP。
-
-### `refreshHttpProviders`
-
-运行时级，要求 initialize，无须创建或启动实例。只接受 `httpConfigYaml` 与可选只含 baseDir 的 httpContext：
-
-```json
-{"method":"refreshHttpProviders","payload":{"httpConfigYaml":"...","httpContext":{"baseDir":"/absolute/http-settings"}}}
-```
-
-完整准备与缓存提交成功返回 `{"resourcesReady":true,"applied":false}`。未运行时只执行一轮；运行时与现有资源更新共用受保护出口、候选许可、取消和 Stop 屏障。周期 HTTP 更新只发布待应用候选；file 不 watch，interval 0 不周期刷新。Windows UWP 的物理更新由已绑定的 Session Host 承担，普通前台 Invoke 不回退到未绑定 socket。
+实例级、只允许 running，payload 与 start 相同。省略 HTTP 输入时继承活动会话的插件原文、本机设置与 CA。显式传 `httpPlugins: []` 或 `httpConfigYamls: []` 清除 HTTP 插件。先准备新候选，再经过停止屏障切换。准备失败保留旧会话，切换后启动失败则尝试恢复旧主配置和 HTTP 快照。普通 Stop 释放私密材料。
 
 ### `testHttp`
 
-运行时级离线演算，不初始化、不联网、不读文件、不读取 CA。输入必填 httpConfigYaml 和 url，可选只含 baseDir 的 httpContext、request／response 样本：
+运行时级离线演算，无需 `initialize` 或运行中的实例。执行使用提交的插件原文、非私密 `httpContext` 和显式样本，全程无网络、文件或 CA I/O。
 
 ```json
 {
   "method":"testHttp",
   "payload":{
-    "httpConfigYaml":"rewrite: {rules: [{url: '.', action: reject}]}",
+    "httpConfigYaml":"targets: [{origins: ['https://example.com'], rules: [{request: {url: {reject: true}}}]}]",
+    "httpContext":{"mitmEnabled":true},
     "url":"https://example.com/path",
+    "executeScripts": false,
     "request":{"method":"POST","headers":[["Content-Type","application/json"]],"bodyBase64":"e30="},
     "response":{"status":200,"headers":[["Content-Type","application/json"]],"bodyBase64":"e30="}
   }
 }
 ```
 
-method 默认 GET，response.status 必填；headers 是保留顺序与重复项的二元数组，bodyBase64 表示原始编码实体。外部资源只取同来源已准备内存候选；缺少则返回 resourcesReady false／unprepared，不伪装为未命中。总开关关闭仍可演算启用规则；没有样本只报告被选中。结果包含 U0/U1、来源索引、URL 结果、各阶段执行或旁路与样本输出，httpsReady 不宣称真实信任就绪。结果不含 CA，也不持久化正文。
+method 默认 GET，response.status 必填。headers 保留顺序与重复项。bodyBase64 表示原始编码实体，空字符串明确提供零字节实体，省略表示正文未知。没有样本时报告可能匹配的规则和 `sampleRequired`，由请求和响应样本提供头及状态条件。
 
-当前 `testHttp` 只演算原生规则，不执行 JS。`http-scripts.enabled: true` 且脚本列表非空时明确返回不支持错误，不静默跳过脚本后报告演算成功；脚本总开关关闭时仍做源码 AST 静态校验，然后只演算原生规则。`validateConfig` 的源码校验同样不初始化脚本后端。
+`executeScripts` 默认 false，使用样本演算原生动作，命中的脚本报告 `not-run`。显式传 true 时按已启用许可执行 Apple JS，命中脚本需提供 request，未终止且需要执行响应阶段时还需提供 response。响应 JS 可读取请求阶段提交后的当前视图。请求本地回包、重定向、拒绝或终止会跳过后续阶段。每个脚本结果报告规则位置、可用的 ID、执行、跳过或回退原因。终止、阶段超时和后端失败通过 `terminal` 报告。样本和 Base64 输出受共享正文预算约束，并行演算最多两个。静态 `validateConfig` 只校验脚本源码。
+
+结果包含原始 URL、最终 URL、原生 URL 动作和各阶段的变换结果。`httpsReady` 始终为 false，真实 TLS 信任取决于运行环境。Core 不持久化样本。
 
 ### foreground 私密文件
 
-可选 httpConfigPath、httpCaPath 都是明确的普通文件路径，不自动搜索、不从环境获取；HTTP 文件最多 1 MiB。私密文件格式为 `{"certificate":"...PEM...","privateKey":"...PEM..."}`，Unix 要求当前用户所有、group／other 权限全关闭，并拒绝符号链接。foreground 保留 HTTP 文件目录作为 baseDir。CLI 只传路径，读取仍归 Invoke；空路径与 `-` 拒绝。
+`httpConfigPaths` 是有序的插件文件路径数组，`httpCaPath` 是可选私密 CA 路径。只有显式传入才读取。HTTP 插件合计最多 1 MiB。私密文件格式为 `{"certificate":"...PEM...","privateKey":"...PEM..."}`，Unix 要求当前用户所有、group／other 权限全关闭，并拒绝符号链接。foreground 通过非私密 `httpContext` 接收本机开关和排除项。CLI 只提交路径及本机选项，Invoke 读取原文。`httpParameterOverrides` 使用从 0 开始的文件序号绑定参数覆盖。空路径和 `-` 拒绝。

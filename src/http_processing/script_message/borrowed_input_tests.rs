@@ -85,7 +85,7 @@ async fn borrowed_input_production_text_unicode_nul_and_writable_bytes_stay_isol
             BodyMode::None => unreachable!(),
         };
         let policy = Policy::compile(&format!(
-            "http-scripts:\n  enabled: true\n  scripts:\n    - name: owned-input\n      phase: request\n      match: exact\n      url: https://borrowed.example/path\n      body: {mode_name}\n      source: {}\n",
+            "targets:\n  - origins: [https://borrowed.example]\n    rules:\n      - name: owned-input\n        match: {{path-exact: /path}}\n        request:\n          js:\n            body: {mode_name}\n            source: {}\n",
             serde_json::to_string(source).unwrap(),
         ))
         .unwrap();
@@ -127,15 +127,15 @@ async fn borrowed_input_production_text_unicode_nul_and_writable_bytes_stay_isol
 #[tokio::test(flavor = "current_thread")]
 async fn borrowed_input_mutation_then_invalid_result_keeps_the_original_entity() {
     let policy = Policy::compile(
-        r#"http-scripts:
-  enabled: true
-  scripts:
-    - name: reject-after-input-mutation
-      phase: request
-      match: exact
-      url: https://borrowed.example/path
-      body: bytes
-      source: 'function rewrite(input){input.body.data[0]=90;return {type:"modify",headers:[{op:"set",name:"host",values:["rejected.example"]}],body:{kind:"bytes",data:input.body.data}};}'
+        r#"targets:
+  - origins: [https://borrowed.example]
+    rules:
+      - name: reject-after-input-mutation
+        match: {path-exact: /path}
+        request:
+          js:
+            body: bytes
+            source: 'function rewrite(input){input.body.data[0]=90;return {type:"modify",headers:[{op:"set",name:"host",values:["rejected.example"]}],body:{kind:"bytes",data:input.body.data}};}'
 "#,
     )
     .unwrap();

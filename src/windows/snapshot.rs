@@ -1,7 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read as _, Write as _},
-    os::windows::ffi::{OsStrExt as _, OsStringExt as _},
     os::windows::fs::{MetadataExt as _, OpenOptionsExt as _},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -17,23 +16,23 @@ use windows::{
 use super::managed_processes::SessionBackend;
 use crate::config::MAX_CONFIG_BYTES;
 use crate::http_processing::{
-    config::{MAX_SNAPSHOT, PolicyCandidate},
+    MAX_ADDENDUM,
+    config::{Document, HttpSettings},
     private_context::CaMaterial,
 };
 
 pub(crate) const SESSION_DIRECTORY: &str = "vole/windows/sessions";
 const SESSION_TOKEN_PREFIX: &str = "vole-session-v2:";
 const SESSION_REVISION: u32 = 2;
-const MAX_BASE_DIR_CODE_UNITS: usize = 32_768;
+const MAX_HTTP_SETTINGS_SNAPSHOT_BYTES: usize = 64 * 1024;
 // Backend validation limits paths to 8 KiB and arguments to 128 KiB in total.
 // Their worst-case JSON escaping, process fields and separators fit in 1 MiB.
 const MAX_BACKEND_SNAPSHOT_BYTES: usize = 1024 * 1024;
-// JSON strings expand by at most six bytes per UTF-8 source byte; each u16
-// path element uses at most five digits and a separator. The final 1 KiB
+// JSON strings expand by at most six bytes per UTF-8 source byte. The final 1 KiB
 // covers field names, revision, the public digest and container punctuation.
 // This is only a read ceiling: publication allocates the exact encoded size.
-const MAX_SESSION_SNAPSHOT_BYTES: usize = (MAX_CONFIG_BYTES + MAX_SNAPSHOT) * 6
-    + MAX_BASE_DIR_CODE_UNITS * 6
+const MAX_SESSION_SNAPSHOT_BYTES: usize = (MAX_CONFIG_BYTES + MAX_ADDENDUM) * 6
+    + MAX_HTTP_SETTINGS_SNAPSHOT_BYTES
     + MAX_BACKEND_SNAPSHOT_BYTES
     + 1024;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -66,8 +65,8 @@ pub(crate) struct SessionSnapshot {
 /// A transient publication input. The ordinary snapshot receives only the
 /// public certificate identity; the CA is sealed into a separate sidecar.
 pub(crate) struct HttpSessionInput<'a> {
-    pub(crate) rules: String,
-    pub(crate) base_dir: Option<PathBuf>,
+    pub(crate) documents: Vec<String>,
+    pub(crate) settings: HttpSettings,
     pub(crate) ca: Option<&'a CaMaterial>,
     pub(crate) package_family: &'a str,
 }
@@ -75,13 +74,8 @@ pub(crate) struct HttpSessionInput<'a> {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HttpSessionSnapshot {
-    rules: String,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::http_processing::config::nonnull"
-    )]
-    base_dir: Option<Vec<u16>>,
+    documents: Vec<String>,
+    settings: HttpSettings,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -126,13 +120,9 @@ impl SessionReference {
         let public_http = http
             .as_ref()
             .map(|input| -> Result<HttpSessionSnapshot> {
-                let base_dir = input
-                    .base_dir
-                    .as_ref()
-                    .map(|path| path.as_os_str().encode_wide().collect());
                 Ok(HttpSessionSnapshot {
-                    rules: input.rules.clone(),
-                    base_dir,
+                    documents: input.documents.clone(),
+                    settings: input.settings.clone(),
                     ca_identity: input
                         .ca
                         .map(CaMaterial::identity)
@@ -343,16 +333,12 @@ impl std::fmt::Debug for SessionSnapshot {
     }
 }
 impl SessionSnapshot {
-    pub(crate) fn http_snapshot(&self) -> Option<&str> {
-        self.http.as_ref().map(|http| http.rules.as_str())
-    }
-
-    pub(crate) fn http_base_dir(&self) -> Option<PathBuf> {
+    pub(crate) fn http_snapshot(&self) -> Option<(&[String], &HttpSettings)> {
         self.http
             .as_ref()
-            .and_then(|http| http.base_dir.as_deref())
-            .map(|wide| std::ffi::OsString::from_wide(wide).into())
+            .map(|http| (http.documents.as_slice(), &http.settings))
     }
+
     pub(crate) fn config_yaml(&self) -> &str {
         &self.config_yaml
     }
@@ -375,14 +361,8 @@ impl SessionSnapshot {
 
     fn to_canonical_json(&self) -> Result<Vec<u8>> {
         validate_config_yaml(&self.config_yaml)?;
-        if let Some(http) = &self.http
-            && (http.rules.len() > MAX_SNAPSHOT
-                || http
-                    .base_dir
-                    .as_ref()
-                    .is_some_and(|path| path.len() > MAX_BASE_DIR_CODE_UNITS))
-        {
-            return Err(invalid_snapshot());
+        if let Some(http) = &self.http {
+            serialized_size(&http.settings, MAX_HTTP_SETTINGS_SNAPSHOT_BYTES)?;
         }
         if let Some(backend) = &self.session_backend {
             serialized_size(backend, MAX_BACKEND_SNAPSHOT_BYTES)?;
@@ -429,19 +409,15 @@ fn serialized_size(value: &impl Serialize, maximum: usize) -> Result<usize> {
 
 fn validate_http_snapshot(input: Option<&HttpSessionSnapshot>) -> Result<()> {
     if let Some(input) = input {
-        if input.rules.len() > MAX_SNAPSHOT {
+        serialized_size(&input.settings, MAX_HTTP_SETTINGS_SNAPSHOT_BYTES)?;
+        let candidate = Document::parse_documents(&input.documents)
+            .and_then(|document| document.compile())
+            .map_err(|_| invalid_snapshot())?;
+        let requires_ca = candidate
+            .requires_ca(&input.settings)
+            .map_err(|_| invalid_snapshot())?;
+        if requires_ca != input.ca_identity.is_some() {
             return Err(invalid_snapshot());
-        }
-        PolicyCandidate::import_snapshot(&input.rules).map_err(|_| invalid_snapshot())?;
-        if let Some(wide) = &input.base_dir {
-            let path = PathBuf::from(std::ffi::OsString::from_wide(wide));
-            if wide.is_empty()
-                || wide.len() > MAX_BASE_DIR_CODE_UNITS
-                || wide.contains(&0)
-                || !path.is_absolute()
-            {
-                return Err(invalid_snapshot());
-            }
         }
     }
     Ok(())
@@ -567,34 +543,33 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_preserves_valid_http_content_expanded_beyond_one_mibibyte() {
-        let input = format!(
-            "rewrite:\n  enabled: true\n  rules:\n    - &rule {{url: '.', action: response-body-set, value: '{}'}}\n    - *rule\n    - *rule\n    - *rule\n    - *rule\n",
-            "x".repeat(256 * 1024)
-        );
-        assert!(input.len() < crate::http_processing::MAX_ADDENDUM);
-        let document = crate::http_processing::config::Document::parse(&input).unwrap();
-        let rules = document
-            .compile(&Default::default())
-            .unwrap()
-            .export_snapshot()
-            .unwrap();
-        assert!(rules.len() > 1024 * 1024);
+    fn snapshot_preserves_plugin_yaml_verbatim() {
+        let documents = vec![
+            "# comment\ntargets: [{origins: ['http://example.com'], rules: [{request: {url: {reject: true}}}]}]\n".into(),
+            "targets: [{origins: ['http://a.example.com'], rules: [{request: {url: {reject: true}}}]}]".into(),
+        ];
+        let settings = HttpSettings {
+            js_enabled: false,
+            ..Default::default()
+        };
         let snapshot = SessionSnapshot {
             revision: SESSION_REVISION,
             config_yaml: "tun: {enable: true}".into(),
             http: Some(HttpSessionSnapshot {
-                rules,
-                base_dir: None,
+                documents: documents.clone(),
+                settings: settings.clone(),
                 ca_identity: None,
             }),
             session_backend: None,
         };
         snapshot.validate(Path::new(".")).unwrap();
         let encoded = snapshot.to_canonical_json().unwrap();
-        assert!(encoded.len() > 1024 * 1024);
         let restored: SessionSnapshot = serde_json::from_slice(&encoded).unwrap();
         restored.validate(Path::new(".")).unwrap();
+        assert_eq!(
+            restored.http_snapshot(),
+            Some((documents.as_slice(), &settings))
+        );
         assert_eq!(restored.to_canonical_json().unwrap(), encoded);
     }
 
@@ -741,23 +716,15 @@ mod tests {
         let initial =
             SessionReference::publish(local.path(), install.path(), main.clone(), None, None)
                 .unwrap();
-        let document = crate::http_processing::config::Document::parse(
-            "rewrite: {enabled: true, rules: [{url: '.', action: reject}]}",
-        )
-        .unwrap();
-        let http = document
-            .compile(&Default::default())
-            .unwrap()
-            .export_snapshot()
-            .unwrap();
+        let http = vec!["targets: [{origins: ['http://example.com'], rules: [{request: {url: {reject: true}}}]}]".into()];
         let updated = SessionReference::publish(
             local.path(),
             install.path(),
             main,
             None,
             Some(HttpSessionInput {
-                rules: http.clone(),
-                base_dir: None,
+                documents: http.clone(),
+                settings: HttpSettings::default(),
                 ca: None,
                 package_family: "ExamplePackage",
             }),
@@ -765,7 +732,10 @@ mod tests {
         .unwrap();
         assert_ne!(initial, updated);
         let snapshot = updated.read(local.path(), install.path()).unwrap();
-        assert_eq!(snapshot.http_snapshot(), Some(http.as_str()));
+        assert_eq!(
+            snapshot.http_snapshot(),
+            Some((http.as_slice(), &HttpSettings::default()))
+        );
         assert!(!format!("{snapshot:?}").contains("action"));
     }
 
@@ -774,15 +744,13 @@ mod tests {
         let local = tempfile::tempdir().unwrap();
         let install = install_root();
         let ca = crate::http_processing::private_context::test_material();
-        let document = crate::http_processing::config::Document::parse(
-            "mitm: {enabled: true, domains: [{pattern: example.com}]}",
-        )
-        .unwrap();
-        let rules = document
-            .compile(&Default::default())
-            .unwrap()
-            .export_snapshot()
-            .unwrap();
+        let documents: Vec<String> =
+            vec!["targets: [{origins: ['https://example.com'], intercept-only: true}]".into()];
+        let settings = HttpSettings {
+            mitm_enabled: true,
+            allow_intercept_only: true,
+            ..Default::default()
+        };
         let publish = |main: &str| {
             SessionReference::publish(
                 local.path(),
@@ -790,8 +758,8 @@ mod tests {
                 main.to_owned(),
                 None,
                 Some(HttpSessionInput {
-                    rules: rules.clone(),
-                    base_dir: None,
+                    documents: documents.clone(),
+                    settings: settings.clone(),
                     ca: Some(&ca),
                     package_family: "ExamplePackage",
                 }),

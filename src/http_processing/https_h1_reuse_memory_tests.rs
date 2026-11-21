@@ -373,24 +373,26 @@ fn fixture(alpn: Option<&'static [u8]>, reply: Reply, rewrite_body: bool, extra:
     let certificate = pem("CERTIFICATE", cert.der());
     let private_key = pem("PRIVATE KEY", &key.serialize_der());
     let authority = Authority::load(&certificate, &private_key).unwrap();
+    let body = if rewrite_body {
+        "          body:\n            - {set: changed}\n"
+    } else {
+        ""
+    };
     let source = format!(
-        "mitm:\n  enabled: true\n  domains: [{{pattern: a.test}}, {{pattern: b.test}}]\nrewrite:\n  enabled: true\n  rules:\n  - {{url: '.', action: response-header-set, header: X-Native-Proof, value: memory-tls}}\n{}{}",
-        if rewrite_body {
-            "  - {url: '.', action: response-body-set, value: changed}\n"
-        } else {
-            ""
-        },
-        extra
+        "targets:\n  - origins: [https://a.test, https://b.test]\n    rules:\n      - response:\n          headers:\n            - {{set: {{X-Native-Proof: memory-tls}}}}\n{body}{extra}"
     );
-    let candidate = Document::parse(&source)
-        .unwrap()
-        .compile(&std::collections::BTreeMap::new())
-        .unwrap();
+    let candidate = Document::parse(&source).unwrap().compile().unwrap();
     let policy = candidate
-        .bind_ca(Some(&CaMaterial {
-            certificate,
-            private_key: zeroize::Zeroizing::new(private_key),
-        }))
+        .bind_settings(
+            &crate::http_processing::config::HttpSettings {
+                mitm_enabled: true,
+                ..Default::default()
+            },
+            Some(&CaMaterial {
+                certificate,
+                private_key: zeroize::Zeroizing::new(private_key),
+            }),
+        )
         .unwrap();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.der().clone()).unwrap();
@@ -585,7 +587,7 @@ async fn fixed_post(
 async fn completed_post_h1_reuses_only_after_full_fixed_upload_and_response() {
     for native in [false, true] {
         let extra = if native {
-            "  - {url: '.', action: request-body-set, value: transformed}\n"
+            "      - request:\n          body:\n            - {set: transformed}\n"
         } else {
             ""
         };
@@ -795,7 +797,7 @@ async fn https_h1_host_port_and_scheme_rewrites_keep_one_shot_and_final_sni() {
         ("http://a.test/final", "a.test", 80, 0),
     ] {
         let extra = format!(
-            "  - {{url: '^https://a\\.test/rewrite', action: replace, replacement-mode: url, replacement: '{replacement}'}}\n"
+            "      - match: {{url-regex: '^https://a\\.test/rewrite'}}\n        request:\n          url: {{replace: '{replacement}'}}\n"
         );
         let fixture = fixture(Some(b"http/1.1"), Reply::Persistent, false, &extra);
         let mut running = start(&fixture);
@@ -822,14 +824,14 @@ async fn https_h1_host_port_and_scheme_rewrites_keep_one_shot_and_final_sni() {
 
 #[tokio::test]
 async fn https_h1_unauthorized_original_authority_is_rejected_before_rewrite_or_reuse() {
-    let extra = "  - {url: '^https://denied\\.test/', action: replace, replacement-mode: url, replacement: 'https://a.test/allowed'}\n";
-    let fixture = fixture(Some(b"http/1.1"), Reply::Persistent, false, extra);
+    let fixture = fixture(Some(b"http/1.1"), Reply::Persistent, false, "");
     let mut running = start(&fixture);
     let first = request(&mut running, "a.test", "/one").await;
-    let _second = request(&mut running, "denied.test", "/two").await;
-    let serving = finish(running, &fixture).await;
+    let (head, body) = request(&mut running, "denied.test", "/two").await.unwrap();
+    finish(running, &fixture).await.unwrap();
     native_response(first, b"origin");
-    assert!(serving.is_err());
+    assert!(head.starts_with("HTTP/1.1 403 Forbidden"));
+    assert!(body.is_empty());
     assert_eq!(fixture.origin.count(&fixture.origin.0.prepares), 1);
     assert_eq!(fixture.origin.count(&fixture.origin.0.opens), 1);
     assert_eq!(fixture.origin.0.heads.lock().unwrap().len(), 1);
@@ -874,18 +876,18 @@ async fn https_h1_idle_and_partial_response_cancel_join_actual_tls_owners() {
 #[cfg(target_vendor = "apple")]
 #[tokio::test]
 async fn https_h1_native_then_real_js_a_b_a_does_not_recover_reuse_eligibility() {
-    let extra = r#"  - {url: '^https://a\.test/', action: replace, replacement-mode: url, replacement: 'https://b.test/middle'}
-http-scripts:
-  enabled: true
-  scripts:
-  - name: return-to-original
-    phase: request
-    url: '^https://a\.test/'
-    source: |
-      function rewrite(input) {
-        if (input.request.url !== "https://b.test/middle") return {type:"abort"};
-        return {type:"modify",url:"https://a.test/final",headers:[{op:"set",name:"X-Round-Trip",values:["real-jsc"]}]};
-      }
+    let extra = r#"      - match: {url-regex: '^https://a\.test/'}
+        request:
+          url: {replace: https://b.test/middle}
+      - name: return-to-original
+        match: {url-regex: '^https://a\.test/'}
+        request:
+          js:
+            source: |
+              function rewrite(input) {
+                if (input.request.url !== "https://b.test/middle") return {type:"abort"};
+                return {type:"modify",url:"https://a.test/final",headers:[{op:"set",name:"X-Round-Trip",values:["real-jsc"]}]};
+              }
 "#;
     let fixture = fixture(Some(b"http/1.1"), Reply::Persistent, false, extra);
     let mut running = start(&fixture);

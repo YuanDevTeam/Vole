@@ -87,24 +87,6 @@ pub(super) struct ProviderRuntime {
     geo: Arc<dyn GeoMatcher>,
 }
 impl ProviderRuntime {
-    pub(super) fn http_download_context(
-        &self,
-    ) -> crate::http_processing::providers::DownloadContext {
-        let generation = self.current.load_full();
-        let dispatcher = Arc::new(
-            ConnectorDispatcher::new(Arc::new(crate::outbound::NamedDirectOutbound::new(
-                generation.graph.dialer.clone(),
-            )))
-            .with_resolution(generation.graph.resolution.clone()),
-        );
-        crate::http_processing::providers::DownloadContext {
-            dispatcher: Arc::new(PinnedDispatcher {
-                generation,
-                dispatcher,
-            }),
-            security: self.security.clone(),
-        }
-    }
     pub(super) fn new(
         cache: ProviderCache,
         prepared: &PreparedCore,

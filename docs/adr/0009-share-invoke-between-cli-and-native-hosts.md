@@ -10,4 +10,4 @@ CLI 和原生传输都调用同一 Invoke 请求处理器，让配置准入、�
 
 前台与业务调用共用单实例约束。前台等待信号或引擎完成时释放命令锁，结束时 join 启动/引擎工作并停止、销毁实例；观察到完成不代替真实清理屏障。当前请求及文件行为见 [Invoke API](../invoke-api.md)与 [CLI](../cli.md)。
 
-独立 HTTP 处理配置使用可选 `httpConfigYaml`；CLI 对应 `-http-config` 仅传显式路径给 foreground，读取与验证仍归 Invoke。此参数只服务于独立 HTTP 附加配置，不扩展 Mihomo YAML，也不改变单实例与停止所有权。
+独立 HTTP 插件使用 `httpConfigYaml` 或有序 `httpConfigYamls`。CLI 可重复传 `-http-config`，仅向 foreground 传显式路径。读取与验证归 Invoke。原生宿主直接传插件原文。本机 MITM 设置与私密 CA 由独立上下文提供。Mihomo YAML、单实例及停止所有权沿用原边界。

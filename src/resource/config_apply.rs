@@ -32,19 +32,11 @@ pub(crate) enum ConfigUpdate {
     ReplaceTemplate(Arc<crate::config::providers::ProviderTemplate>),
     ReplaceWithHttp {
         yaml: String,
-        http: String,
-        base_dir: Option<Option<std::path::PathBuf>>,
+        documents: Vec<String>,
+        settings: Option<crate::http_processing::config::HttpSettings>,
     },
     Patch(ConfigPatch),
     RefreshGeoData,
-    RefreshHttp {
-        document: Arc<crate::http_processing::config::Document>,
-        context: crate::http_processing::providers::SourceContext,
-        store: Arc<tokio::sync::Mutex<crate::http_processing::providers::Store>>,
-        force: bool,
-        security: Option<crate::security::SecurityContext>,
-        reply: Option<mpsc::SyncSender<Arc<crate::http_processing::config::PolicyCandidate>>>,
-    },
     FlushFakeIp,
 }
 #[derive(Deserialize, Default)]

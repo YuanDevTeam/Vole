@@ -2,7 +2,7 @@
 #[cfg(feature = "inbound-http")]
 mod authority;
 pub(crate) mod body;
-mod body_budget;
+pub(crate) mod body_budget;
 pub(crate) mod config;
 #[cfg(feature = "http-diagnostics")]
 #[doc(hidden)]
@@ -12,8 +12,8 @@ pub(crate) mod diagnostics;
 pub(crate) mod headers;
 mod mitm;
 mod numeric_input;
+mod origin;
 pub(crate) mod private_context;
-pub(crate) mod providers;
 pub(crate) mod rules;
 pub(crate) mod script_config;
 #[cfg(feature = "inbound-http")]

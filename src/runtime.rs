@@ -1808,24 +1808,6 @@ impl std::fmt::Debug for RunningCore {
 }
 
 impl RunningCore {
-    #[cfg(feature = "invoke")]
-    pub(crate) fn maintain_http(
-        &mut self,
-        store: Arc<tokio::sync::Mutex<crate::http_processing::providers::Store>>,
-    ) {
-        let Some(resources) = &self.resources else {
-            return;
-        };
-        let resources = resources.clone();
-        self.tasks
-            .push(tokio::spawn(crate::resources::observation::task(
-                crate::invoke::http::maintenance(
-                    store,
-                    move || resources.http_download_context(),
-                    self.cancellation.clone(),
-                ),
-            )));
-    }
     pub(crate) fn config_apply_handle(
         &self,
     ) -> Option<crate::resource::config_apply::ConfigApplyHandle> {

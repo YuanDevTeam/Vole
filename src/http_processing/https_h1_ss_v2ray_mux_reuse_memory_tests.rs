@@ -51,40 +51,40 @@ async fn ss_v2ray_mux_https_h1_native_then_js_reuses_one_authenticated_carrier()
     // Native sets the request header and response body first. Each script
     // checks that stage; a failure/rollback leaves bytes or headers that fail
     // the existing HTTP and independent origin-upload witnesses.
-    const SCRIPTS: &str = r#"  - {url: 'https://a.test/', match: prefix, action: request-header-set, header: x-native-request, value: before-js}
-http-scripts:
-  enabled: true
-  scripts:
-  - name: actual-request-body
-    phase: request
-    url: https://a.test/
-    match: prefix
-    body: text
-    source: |
-      function rewrite(input) {
-        let found = false;
-        for (let i = 0; i < input.request.headers.length; i++) {
-          let header = input.request.headers[i];
-          if (header.name === "x-native-request" && header.value === "before-js") found = true;
-        }
-        if (!found || input.body.data !== "original") return {type:"abort"};
-        return {type:"modify",headers:[{op:"set",name:"x-js-request",values:["transformed"]}],body:{kind:"text",data:"transformed"}};
-      }
-  - name: actual-response-body
-    phase: response
-    url: https://a.test/
-    match: prefix
-    body: text
-    source: |
-      function rewrite(input) {
-        let found = false;
-        for (let i = 0; i < input.response.headers.length; i++) {
-          let header = input.response.headers[i];
-          if (header.name === "x-native-proof" && header.value === "memory-tls") found = true;
-        }
-        if (!found || input.body.data !== "changed") return {type:"abort"};
-        return {type:"modify",headers:[{op:"set",name:"x-js-response",values:["native-then-js"]}],body:{kind:"text",data:"Changed"}};
-      }
+    const SCRIPTS: &str = r#"      - match: {url-regex: '^https://a\.test/'}
+        request:
+          headers:
+            - {set: {x-native-request: before-js}}
+      - match: {url-regex: '^https://a\.test/'}
+        name: actual-request-body
+        request:
+          js:
+            body: text
+            source: |
+              function rewrite(input) {
+                let found = false;
+                for (let i = 0; i < input.request.headers.length; i++) {
+                  let header = input.request.headers[i];
+                  if (header.name === "x-native-request" && header.value === "before-js") found = true;
+                }
+                if (!found || input.body.data !== "original") return {type:"abort"};
+                return {type:"modify",headers:[{op:"set",name:"x-js-request",values:["transformed"]}],body:{kind:"text",data:"transformed"}};
+              }
+      - match: {url-regex: '^https://a\.test/'}
+        name: actual-response-body
+        response:
+          js:
+            body: text
+            source: |
+              function rewrite(input) {
+                let found = false;
+                for (let i = 0; i < input.response.headers.length; i++) {
+                  let header = input.response.headers[i];
+                  if (header.name === "x-native-proof" && header.value === "memory-tls") found = true;
+                }
+                if (!found || input.body.data !== "changed") return {type:"abort"};
+                return {type:"modify",headers:[{op:"set",name:"x-js-response",values:["native-then-js"]}],body:{kind:"text",data:"Changed"}};
+              }
 "#;
     for cipher in [
         ShadowsocksCipher::Aes128Gcm,

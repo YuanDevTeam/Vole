@@ -80,10 +80,23 @@ impl AsyncWrite for LimitLast {
 
 async fn shared(native: Native, case: Case) -> (bool, bool, usize) {
     let policy = Policy::compile(if native == Native::Shorten {
-        "rewrite:\n  enabled: true\n  rules:\n  - {url: '.', action: request-body-replace, search: aa, replacement: b}\n"
+        r#"targets:
+  - origins: [http://origin.test]
+    rules:
+      - request:
+          body:
+            - {replace: {search: aa, replacement: b}}
+"#
     } else {
-        "rewrite:\n  enabled: true\n  rules:\n  - {url: '.', action: request-body-replace, search: a, replacement: b}\n"
-    }).unwrap();
+        r#"targets:
+  - origins: [http://origin.test]
+    rules:
+      - request:
+          body:
+            - {replace: {search: a, replacement: b}}
+"#
+    })
+    .unwrap();
     let original = Url::parse("http://origin.test/upload").unwrap();
     let request = parse_request_head(
         b"POST http://origin.test/upload HTTP/1.1\r\nHost: origin.test\r\nContent-Type: text/plain\r\nContent-Length: 65536\r\nConnection: keep-alive",
@@ -228,6 +241,7 @@ async fn shared(native: Native, case: Case) -> (bool, bool, usize) {
         policy: &policy,
         original: &original,
         request: &request,
+        request_conditions: 0,
         meta: original_meta,
         continued: std::sync::atomic::AtomicBool::new(false),
         prepared: Mutex::new(Some(prepared)),

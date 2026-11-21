@@ -78,7 +78,6 @@ thread_local! {
 #[derive(Default)]
 struct RegistryInner {
     instance: Option<Arc<CoreController>>,
-    idle_http_refresh: bool,
     #[cfg(all(
         feature = "http-diagnostics",
         feature = "inbound-http",
@@ -105,7 +104,6 @@ struct RuntimeData {
     directory: Arc<DataDirectory>,
     geodata: Arc<GeoDataManager>,
     dns_sources: Arc<crate::dns::source::NetworkSources>,
-    http: Arc<tokio::sync::Mutex<crate::http_processing::providers::Store>>,
     provider_paths: Arc<crate::resource::paths::ProviderPaths>,
 }
 
@@ -400,8 +398,12 @@ where
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ConfigYamlPayload {
     config_yaml: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "http::present")]
     http_config_yaml: Option<String>,
+    #[serde(default, deserialize_with = "http::present")]
+    http_config_yamls: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "http::present")]
+    http_plugins: Option<Vec<crate::http_processing::config::PluginInput>>,
     #[serde(default)]
     http_context: Option<http::HttpContextInput>,
 }
@@ -432,6 +434,8 @@ pub(crate) struct InvokeResponse {
     success: bool,
     data: Value,
     error: String,
+    #[serde(skip)]
+    _http_test: Option<http::TestResources>,
 }
 
 impl InvokeResponse {
@@ -440,6 +444,7 @@ impl InvokeResponse {
             success: true,
             data,
             error: String::new(),
+            _http_test: None,
         }
     }
 
@@ -448,6 +453,7 @@ impl InvokeResponse {
             success: false,
             data: Value::Null,
             error: bounded_error(error.into()),
+            _http_test: None,
         }
     }
 }
@@ -505,9 +511,6 @@ impl RuntimeRegistry {
             provider_paths: provider_paths.unwrap_or_default(),
             geodata,
             dns_sources: Arc::new(crate::dns::source::NetworkSources::default()),
-            http: Arc::new(tokio::sync::Mutex::new(
-                crate::http_processing::providers::Store::new(),
-            )),
         });
         Ok(initialized)
     }
@@ -555,11 +558,6 @@ impl RuntimeRegistry {
         if inner.script_plan_validation_process {
             return Err(InvokeFailure::invalid_state(
                 "JS plan validation requires this process to exit before any business instance",
-            ));
-        }
-        if inner.idle_http_refresh {
-            return Err(InvokeFailure::invalid_state(
-                "HTTP resource preparation is busy",
             ));
         }
         if inner.instance.is_some() {
@@ -848,35 +846,31 @@ fn dispatch_config_update(request: &str) -> Result<Option<InvokeResponse>, Invok
             .try_admit()
             .map_err(|e| InvokeFailure::new(e.message()))?;
         let input = decode_update_input(raw.payload.get())?;
-        let base_dir = input
+        let documents = http::document_inputs(input.http_config_yaml, input.http_config_yamls)?;
+        let settings = input
             .http_context
             .map(|context| {
-                if context.ca.is_some() {
+                let (settings, ca) = context.into_settings();
+                if ca.is_some() {
                     return Err(InvokeFailure::invalid_request(
                         "updateConfig does not accept CA material",
                     ));
                 }
-                let base = context.base_dir.map(InvokePath::into_path);
-                if base.as_ref().is_some_and(|path| !path.is_absolute()) {
-                    return Err(InvokeFailure::invalid_request(
-                        "HTTP baseDir must be absolute",
-                    ));
-                }
-                Ok(base)
+                Ok(settings)
             })
             .transpose()?;
-        if input.http_config_yaml.is_none() && base_dir.is_some() {
-            return Err(InvokeFailure::invalid_request(
-                "httpContext requires httpConfigYaml",
-            ));
-        }
-        let update = match input.http_config_yaml {
-            Some(http) => ConfigUpdate::ReplaceWithHttp {
+        let update = match documents {
+            Some(documents) => ConfigUpdate::ReplaceWithHttp {
                 yaml: input.config_yaml,
-                http,
-                base_dir,
+                documents,
+                settings,
             },
-            None => ConfigUpdate::Replace(input.config_yaml),
+            None if settings.is_none() => ConfigUpdate::Replace(input.config_yaml),
+            None => {
+                return Err(InvokeFailure::invalid_request(
+                    "httpContext requires at least one HTTP plugin",
+                ));
+            }
         };
         admission
             .submit(update)
@@ -893,17 +887,27 @@ fn decode_update_input(payload: &str) -> Result<ConfigYamlPayload, InvokeFailure
     struct RawConfig<'a> {
         #[serde(rename = "configYaml", borrow)]
         yaml: &'a serde_json::value::RawValue,
-        #[serde(rename = "httpConfigYaml", default, borrow)]
+        #[serde(
+            rename = "httpConfigYaml",
+            default,
+            borrow,
+            deserialize_with = "http::present"
+        )]
         http: Option<&'a serde_json::value::RawValue>,
+        #[serde(
+            rename = "httpConfigYamls",
+            default,
+            borrow,
+            deserialize_with = "http::present"
+        )]
+        http_documents: Option<&'a serde_json::value::RawValue>,
         #[serde(rename = "httpContext", default, borrow)]
         context: Option<&'a serde_json::value::RawValue>,
     }
     let raw: RawConfig<'_> = serde_json::from_str(payload)
         .map_err(|_| InvokeFailure::invalid_request("invalid configuration update payload"))?;
     check_json_string_limit(raw.yaml.get(), crate::config::MAX_CONFIG_BYTES)?;
-    if let Some(http) = raw.http {
-        check_json_string_limit(http.get(), crate::http_processing::MAX_ADDENDUM)?;
-    }
+    http::check_document_values(raw.http, raw.http_documents)?;
     if raw.context.is_some_and(|raw| raw.get().len() > 8192) {
         return Err(InvokeFailure::invalid_request(
             "HTTP context exceeds input limit",
@@ -917,6 +921,12 @@ fn decode_update_input(payload: &str) -> Result<ConfigYamlPayload, InvokeFailure
             .map(|http| serde_json::from_str(http.get()))
             .transpose()
             .map_err(|_| InvokeFailure::invalid_request("invalid httpConfigYaml string"))?,
+        http_config_yamls: raw
+            .http_documents
+            .map(|documents| serde_json::from_str(documents.get()))
+            .transpose()
+            .map_err(|_| InvokeFailure::invalid_request("invalid httpConfigYamls array"))?,
+        http_plugins: None,
         http_context: raw
             .context
             .map(|raw| serde_json::from_str(raw.get()))
@@ -932,6 +942,10 @@ fn decode_update_yaml(payload: &str) -> Result<String, InvokeFailure> {
 // RawValue validates JSON syntax without decoding strings. Count decoded UTF-8
 // first, including surrogate pairs, so escaped input cannot allocate >8 MiB.
 fn check_json_string_limit(raw: &str, limit: usize) -> Result<(), InvokeFailure> {
+    bounded_json_string_len(raw, limit).map(|_| ())
+}
+
+fn bounded_json_string_len(raw: &str, limit: usize) -> Result<usize, InvokeFailure> {
     let bad = || InvokeFailure::invalid_request("configYaml must be a valid string");
     let bytes = raw.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'"' || *bytes.last().unwrap() != b'"' {
@@ -996,12 +1010,12 @@ fn check_json_string_limit(raw: &str, limit: usize) -> Result<(), InvokeFailure>
     if i != bytes.len() - 1 {
         return Err(bad());
     }
-    Ok(())
+    Ok(decoded)
 }
 
 enum DecodedRequest {
     Complete(InvokeResponse),
-    Envelope(RequestEnvelope),
+    Envelope(RequestEnvelope, Option<http::TestResources>),
 }
 
 fn dispatch_bytes(request: &[u8]) -> Result<InvokeResponse, InvokeFailure> {
@@ -1017,7 +1031,7 @@ fn decode_request(request: &[u8]) -> Result<DecodedRequest, InvokeFailure> {
     let request = str::from_utf8(request)
         .map_err(|_| InvokeFailure::invalid_request("request is not valid UTF-8"))?;
     check_dns_network_envelope(request)?;
-    http::check_envelope(request)?;
+    let http_test = http::check_envelope(request)?;
     foreground::check_envelope(request)?;
     if let Some(response) = dispatch_config_update(request)? {
         return Ok(DecodedRequest::Complete(response));
@@ -1028,13 +1042,13 @@ fn decode_request(request: &[u8]) -> Result<DecodedRequest, InvokeFailure> {
         return Err(InvokeFailure::invalid_request("payload must be an object"));
     }
 
-    Ok(DecodedRequest::Envelope(envelope))
+    Ok(DecodedRequest::Envelope(envelope, http_test))
 }
 
 fn dispatch_request(request: DecodedRequest) -> Result<InvokeResponse, InvokeFailure> {
-    let envelope = match request {
+    let (envelope, http_test) = match request {
         DecodedRequest::Complete(response) => return Ok(response),
-        DecodedRequest::Envelope(envelope) => envelope,
+        DecodedRequest::Envelope(envelope, http_test) => (envelope, http_test),
     };
     let data = match envelope.method.as_str() {
         "initialize" => {
@@ -1073,32 +1087,31 @@ fn dispatch_request(request: DecodedRequest) -> Result<InvokeResponse, InvokeFai
         "validateConfig" => {
             require_instance_omitted(&envelope)?;
             let payload: ConfigYamlPayload = decode_payload(envelope.payload)?;
-            if let Some(context) = payload.http_context {
-                if context.ca.is_some() {
-                    return Err(InvokeFailure::invalid_request(
-                        "validateConfig does not accept CA material",
-                    ));
-                }
-                if context
-                    .base_dir
-                    .map(InvokePath::into_path)
-                    .is_some_and(|path| !path.is_absolute())
-                {
-                    return Err(InvokeFailure::invalid_request(
-                        "HTTP baseDir must be absolute",
-                    ));
-                }
-            }
-            let resources_ready = payload
-                .http_config_yaml
-                .as_deref()
-                .filter(|input| !input.is_empty())
-                .map(crate::http_processing::config::Document::parse)
-                .transpose()
-                .map_err(|_| InvokeFailure::new("invalid HTTP processing configuration"))?
-                .is_none_or(|document| document.unresolved_count() == 0);
-            validate_config_with_http(payload.config_yaml, payload.http_config_yaml)?;
-            json!({"httpResourcesValidated":resources_ready,"httpsReady":false})
+            let inputs = http::HttpInputs::new(
+                payload.http_config_yaml,
+                payload.http_config_yamls,
+                payload.http_plugins,
+                Default::default(),
+            )?;
+            let mut config = parse_config_yaml(&payload.config_yaml)?;
+            let policy = http::static_policy(inputs, payload.http_context)?;
+            let (targets, plugins) = policy.as_ref().map_or_else(
+                || (Vec::new(), Vec::new()),
+                |policy| {
+                    (
+                        policy.document().target_summary(),
+                        policy.document().plugin_summary(),
+                    )
+                },
+            );
+            let summary_error = |_| InvokeFailure::new("HTTP plugin summary encoding failed");
+            let targets = serde_json::to_value(targets).map_err(summary_error)?;
+            let plugins = serde_json::to_value(plugins).map_err(summary_error)?;
+            config
+                .set_http_policy(policy)
+                .map_err(InvokeFailure::from)?;
+            PreparedCore::validate_config(config).map_err(InvokeFailure::from)?;
+            json!({"httpResourcesValidated":true,"httpsReady":false,"httpTargets":targets,"httpPlugins":plugins})
         }
         "measureDelay" => {
             require_instance_omitted(&envelope)?;
@@ -1119,13 +1132,14 @@ fn dispatch_request(request: DecodedRequest) -> Result<InvokeResponse, InvokeFai
                 Ok(json!({}))
             })?
         }
-        "refreshHttpProviders" => {
-            require_instance_omitted(&envelope)?;
-            http::refresh(decode_payload(envelope.payload)?)?
-        }
         "testHttp" => {
             require_instance_omitted(&envelope)?;
-            http::evaluate(decode_payload::<http::TestPayload>(envelope.payload)?)?
+            let payload = decode_payload::<http::TestPayload>(envelope.payload)?;
+            let (data, resources) =
+                http::evaluate(payload, http_test.expect("testHttp admission"))?;
+            let mut response = InvokeResponse::success(data);
+            response._http_test = Some(resources);
+            return Ok(response);
         }
         "foreground" => {
             require_instance_omitted(&envelope)?;
@@ -1163,10 +1177,7 @@ fn dispatch_request(request: DecodedRequest) -> Result<InvokeResponse, InvokeFai
             let _: EmptyPayload = decode_payload(envelope.payload)?;
             {
                 let mut inner = lock(&registry().inner);
-                if inner.instance.is_some()
-                    || inner.idle_http_refresh
-                    || inner.script_plan_validation_process
-                {
+                if inner.instance.is_some() || inner.script_plan_validation_process {
                     return Err(InvokeFailure::invalid_state(
                         "JS plan validation requires a fresh, idle, dedicated process",
                     ));
@@ -1334,15 +1345,18 @@ impl CoreController {
                     .as_ref()
                     .and_then(|input| input.cancellation.clone());
                 if let Some(input) = http_input {
+                    let inputs = http::HttpInputs::new(
+                        input.http_config_yaml,
+                        input.http_config_yamls,
+                        input.http_plugins,
+                        input.http_parameter_overrides,
+                    )?;
                     http::attach(
                         &mut config,
-                        input.http_config_yaml.as_deref(),
+                        inputs,
                         input.http_context,
-                        input.source_file,
-                        input.provider_paths,
                         input.cancellation.as_ref(),
-                    )
-                    .await?;
+                    )?;
                 }
                 let prepared = match resolved_cache {
                     Some(cache) => {
@@ -1430,10 +1444,38 @@ impl CoreController {
                     InvokeFailure::invalid_state("runtime cannot capture a recovery snapshot")
                 })?
         };
-        // Resolve external sources while the old engine and its platform lease
-        // are still usable. GeoData registration and TUN binding happen only
-        // after the synchronous old-engine stop barrier.
-        let config = http::parse_reconnect(input, &apply)?;
+        let running = apply
+            .recovery_snapshot()
+            .map_err(|error| InvokeFailure::new(error.message()))?;
+        let mut config = parse_config_yaml(&input.config_yaml)?;
+        if let (Some(template), Some(paths)) = (&mut config.providers, input.provider_paths) {
+            Arc::make_mut(template).resource_paths = paths;
+        } else if let (Some(template), Some(active)) =
+            (&mut config.providers, &running.config.providers)
+        {
+            Arc::make_mut(template).resource_paths = active.resource_paths.clone();
+        }
+        let inputs = http::HttpInputs::new(
+            input.http_config_yaml,
+            input.http_config_yamls,
+            input.http_plugins,
+            input.http_parameter_overrides,
+        )?;
+        if inputs.is_none() && input.http_context.is_none() {
+            config
+                .set_http_policy(running.config.http_policy())
+                .map_err(InvokeFailure::from)?;
+        } else {
+            http::attach(
+                &mut config,
+                inputs,
+                input.http_context,
+                input.cancellation.as_ref(),
+            )?;
+        }
+        drop(running);
+        // Resolve routing resources while the old engine and its platform
+        // lease are still usable.
         let manager = registry().geodata_manager()?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1746,29 +1788,13 @@ pub(crate) fn replace_android_socket_protector(
     registry().replace_android_socket_protector(protector)
 }
 
-fn validate_config_with_http(
-    config_yaml: String,
-    http_config_yaml: Option<String>,
-) -> Result<(), InvokeFailure> {
-    let config = parse_config_yaml_with_http(&config_yaml, http_config_yaml.as_deref())?;
-    drop(config_yaml);
-    PreparedCore::validate_config(config).map_err(InvokeFailure::from)
-}
-
 fn parse_config_yaml(config_yaml: &str) -> Result<Config, InvokeFailure> {
-    parse_config_yaml_with_http(config_yaml, None)
-}
-fn parse_config_yaml_with_http(
-    config_yaml: &str,
-    http: Option<&str>,
-) -> Result<Config, InvokeFailure> {
     let directory = registry().data_directory().ok();
     let mut config =
         parse_config_yaml_with_directory(config_yaml, directory.as_ref().map(|dir| dir.root()))?;
     if let (Some(template), Some(paths)) = (&mut config.providers, registry().provider_paths()) {
         Arc::make_mut(template).resource_paths = paths;
     }
-    config.set_http_config(http).map_err(InvokeFailure::from)?;
     Ok(config)
 }
 
@@ -1958,7 +1984,7 @@ fn run_engine_inner(
             debug_assert!(tun.is_none());
             prepared.start_local(dialer).await
         };
-        let mut running = match started {
+        let running = match started {
             Ok(running) => running,
             Err(error) => {
                 let kind = error.kind();
@@ -1967,9 +1993,6 @@ fn run_engine_inner(
                 return Err(io::Error::new(kind, message));
             }
         };
-        running.maintain_http(
-            http::runtime_store().map_err(|_| io::Error::other("HTTP runtime store is missing"))?,
-        );
         tracing::info!(instance_id, has_tun, "Vole runtime engine started");
         if startup.send(Ok(running.config_apply_handle())).is_err() {
             return running.stop().await;
@@ -3442,24 +3465,136 @@ rules:
     }
 
     #[test]
-    fn update_http_addendum_preserves_optional_clear_and_its_separate_byte_limit() {
-        let input = decode_update_input(
-            r#"{"configYaml":"rules: ['MATCH,DIRECT']","httpConfigYaml":"rewrite: []"}"#,
-        )
-        .unwrap();
-        assert_eq!(input.http_config_yaml.as_deref(), Some("rewrite: []"));
+    fn reconnect_retains_frozen_http_on_omission_and_replaces_only_valid_input() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_registry();
+        let _directory = initialize_test_data_directory();
+        let id = create_instance();
+        let routing = "rules: ['MATCH,DIRECT']";
+        let plugin = "targets: [{origins: ['http://example.com'], rules: [{request: {url: {reject: true}}}]}]";
+        let context = json!({"jsEnabled": false});
+        let configured =
+            json!({"configYaml":routing,"httpConfigYaml":plugin,"httpContext":context});
         assert_eq!(
-            decode_update_input(r#"{"configYaml":"x","httpConfigYaml":""}"#)
+            request("start", Some(&id), configured.clone())["success"],
+            true
+        );
+        let active = || {
+            let controller = registry().instance(&id).unwrap();
+            let apply = lock(&controller.inner)
+                .engine
+                .as_ref()
                 .unwrap()
-                .http_config_yaml
-                .as_deref(),
-            Some("")
+                .config_apply
+                .clone()
+                .unwrap();
+            apply.recovery_snapshot().unwrap().config.http_policy()
+        };
+        let original = active().unwrap();
+        assert!(!original.settings().js_enabled);
+        assert_eq!(
+            request("updateConfig", Some(&id), configured)["success"],
+            true
         );
-        assert!(decode_update_input(r#"{"configYaml":"x","httpConfigYaml":1}"#).is_err());
-        let input = format!(
-            r#"{{"configYaml":"x","httpConfigYaml":"{}"}}"#,
-            "x".repeat(crate::http_processing::MAX_ADDENDUM + 1)
+
+        let invalid = json!({"configYaml":routing,"httpConfigYamls":["targets: []"]});
+        assert_failure(&request("reconnect", Some(&id), invalid));
+        assert!(Arc::ptr_eq(&original, &active().unwrap()));
+        let omitted = json!({"configYaml":routing});
+        assert_eq!(request("reconnect", Some(&id), omitted)["success"], true);
+        assert!(Arc::ptr_eq(&original, &active().unwrap()));
+
+        let cleared = json!({"configYaml":routing,"httpConfigYamls":[]});
+        assert_failure(&request("updateConfig", Some(&id), cleared.clone()));
+        assert_eq!(request("reconnect", Some(&id), cleared)["success"], true);
+        assert!(active().is_none());
+        destroy_instance(&id);
+    }
+
+    #[test]
+    fn validation_reports_targets_from_ordered_raw_plugins() {
+        let result = request(
+            "validateConfig",
+            None,
+            json!({
+                "configYaml": "rules: ['MATCH,DIRECT']",
+                "httpConfigYamls": [
+                    "targets: [{origins: ['https://example.com:8443'], intercept-only: true}]",
+                    "targets: [{origins: ['http://other.example'], rules: [{request: {url: {reject: true}}}]}]"
+                ],
+                "httpContext": {"mitmEnabled":true,"allowInterceptOnly":true}
+            }),
         );
-        assert!(decode_update_input(&input).is_err());
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["data"]["httpsReady"], false);
+        let targets = result["data"]["httpTargets"].as_array().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0]["source"], 0);
+        assert_eq!(
+            targets[0]["origins"][0],
+            json!({"scheme":"https","host":"example.com","port":8443,
+                "wildcard":false,"origin":"https://example.com:8443"})
+        );
+        assert_eq!(targets[0]["interceptOnly"], true);
+        assert_eq!(targets[1]["source"], 1);
+        assert_eq!(targets[1]["rewrite"], true);
+    }
+
+    #[test]
+    fn p0_managed_plugin_validation_shares_the_raw_document_and_checks_its_digest() {
+        use sha2::{Digest, Sha256};
+        let yaml = "# preserve this original document\nname: Test plugin\nparameters: {flag: {type: boolean, default: true}}\ntargets: [{origins: ['https://*.cdn.example.com:8443'], rules: [{id: sample, request: {respond: {status: 204}}}]}]\n";
+        let mut payload = json!({
+            "configYaml": "rules: ['MATCH,DIRECT']",
+            "httpPlugins":[{"id":"example-p0","yaml":yaml,
+                "digest":Sha256::digest(yaml.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                "parameters":{"flag":false}, "permissions": {}}]
+        });
+        let result = request("validateConfig", None, payload.clone());
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(
+            result["data"]["httpPlugins"][0]["parameters"]["flag"]["default"],
+            true
+        );
+        assert_eq!(
+            result["data"]["httpTargets"][0]["origins"][0]["origin"],
+            "https://*.cdn.example.com:8443"
+        );
+        assert_eq!(
+            result["data"]["httpTargets"][0]["rules"][0]["request"]["respond"],
+            true
+        );
+        payload["httpPlugins"][0]["yaml"] = json!(format!("{yaml}# changed\n"));
+        assert_failure(&request("validateConfig", None, payload));
+    }
+
+    #[test]
+    fn update_http_input_distinguishes_omission_and_empty_array() {
+        let input = decode_update_input(r#"{"configYaml":"x"}"#).unwrap();
+        assert_eq!(
+            http::document_inputs(input.http_config_yaml, input.http_config_yamls).unwrap(),
+            None
+        );
+        let input = decode_update_input(r#"{"configYaml":"x","httpConfigYamls":[]}"#).unwrap();
+        assert_eq!(
+            http::document_inputs(input.http_config_yaml, input.http_config_yamls).unwrap(),
+            Some(Vec::new())
+        );
+        let input =
+            decode_update_input(r#"{"configYaml":"x","httpConfigYamls":["first","second"]}"#)
+                .unwrap();
+        assert_eq!(input.http_config_yamls.unwrap(), ["first", "second"]);
+        for invalid in [
+            r#"{"configYaml":"x","httpConfigYaml":1}"#,
+            r#"{"configYaml":"x","httpConfigYamls":[["invalid"]]}"#,
+            r#"{"configYaml":"x","httpConfigYaml":"first","httpConfigYamls":["second"]}"#,
+        ] {
+            assert!(decode_update_input(invalid).is_err());
+        }
+        let input = serde_json::json!({
+            "configYaml": "x",
+            "httpConfigYamls": ["x".repeat(crate::http_processing::MAX_ADDENDUM), "y"],
+        });
+        assert!(decode_update_input(&input.to_string()).is_err());
     }
 }

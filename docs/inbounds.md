@@ -57,7 +57,7 @@ SOCKS5 CONNECT、普通 HTTP、HTTP CONNECT 和 TUN TCP 共用主配置的 sniff
 同时替换目标。普通 HTTP 使用已解析的原始 authority 应用同一策略，不为嗅探读取正文。
 
 四类 TCP 入口也共用独立 [HTTP 处理](http-processing.md)。主 sniffer 的关闭、排除或
-目标覆盖不改变独立 HTTP/MITM 授权：明文按原始目标端口的 `http-ports` 准入，TLS
+目标覆盖不改变独立 HTTP/MITM 授权：明文按 HTTP origin 的端口准入并核对原始 origin，TLS
 按 MITM 端口、SNI 允许/排除与 CA 准入。普通 HTTP 代理请求不会因为端口在 MITM
 列表就变成 CONNECT。未认领的业务字节完整回放后继续原嗅探/选路；已有 HTTP
 上下文的连接使用其固定代际 Dispatcher，入口类型、来源、本地端口和认证身份保留。

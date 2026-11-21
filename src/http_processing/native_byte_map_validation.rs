@@ -83,9 +83,10 @@ fn compare(
         Phase::Response,
         input.as_ref(),
         budget,
+        NativeMedia::default(),
     );
     let same = match (&old, &actual) {
-        (Ok(()), Ok(Some(value))) => {
+        (Ok(()), Ok(Some(BodyCandidate { bytes: value, .. }))) => {
             value.as_ref() == legacy.as_ref()
                 && value.as_ref().len() + value.remaining() == capacity
                 && std::str::from_utf8(value.as_ref()).is_ok()
@@ -216,7 +217,14 @@ fn fallback(budget: &Budget) -> io::Result<Group> {
     let rules = [compiled("q", "z", SearchMode::Literal, Occurrences::All)?];
     let url = Url::parse(URL).map_err(io::Error::other)?;
     group.check(matches!(
-        apply_operations(&rules, &url, Phase::Response, input.as_ref(), budget),
+        apply_operations(
+            &rules,
+            &url,
+            Phase::Response,
+            input.as_ref(),
+            budget,
+            NativeMedia::default()
+        ),
         Err(Bypass::InvalidText)
     ));
     Ok(group)
@@ -386,10 +394,11 @@ fn rollback(budget: &Budget) -> io::Result<Group> {
         Phase::Response,
         entity.logical().ok_or_else(invalid)?,
         &foreign,
+        NativeMedia::default(),
     )
     .map_err(|_| invalid())?
     .ok_or_else(invalid)?;
-    let mapped = output.as_ref() == b"zzsource";
+    let mapped = output.bytes.as_ref() == b"zzsource";
     let refused = commit_shared_body(&mut entity, &mut fields, output) == Err(Bypass::Budget);
     group.check(
         mapped

@@ -96,32 +96,6 @@ impl ProviderRuntime {
             // Implementations are supplied by the shared maintenance adapter;
             // these commands occupy the same admission and worker as reloads.
             ConfigUpdate::RefreshGeoData => return self.refresh_geodata(&cancel).await,
-            ConfigUpdate::RefreshHttp {
-                document,
-                context,
-                store,
-                force,
-                security,
-                reply,
-            } => {
-                let mut network = self.http_download_context();
-                if let Some(security) = security {
-                    network.security = security.clone();
-                }
-                let candidate = crate::resource::http_control::refresh(
-                    document.clone(),
-                    context,
-                    store,
-                    &network,
-                    &cancel,
-                    *force,
-                )
-                .await?;
-                if let Some(reply) = reply {
-                    reply.try_send(candidate).map_err(|_| ApplyError::Stopped)?;
-                }
-                return Ok(());
-            }
             ConfigUpdate::FlushFakeIp => return self.flush_fake_ip(&cancel).await,
             _ => {}
         }
@@ -165,38 +139,29 @@ impl ProviderRuntime {
                 }
                 ConfigUpdate::ReplaceWithHttp {
                     yaml,
-                    http,
-                    base_dir,
+                    documents,
+                    settings,
                 } => {
-                    let candidate = crate::http_processing::Policy::compile_optional(Some(&http))
-                        .map_err(|_| ApplyError::InvalidConfig)?;
-                    let same = match (&previous.config.http_policy(), &candidate) {
-                        (None, None) => true,
-                        (Some(active), Some(candidate)) => {
-                            active.document().identity() == candidate.document().identity()
+                    let document = if documents.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            crate::http_processing::config::Document::parse_documents(&documents)
+                                .map_err(|_| ApplyError::InvalidConfig)?,
+                        )
+                    };
+                    let same = match (&previous.config.http_policy(), document) {
+                        (None, None) => settings.is_none(),
+                        (Some(active), Some(document)) => {
+                            active.document().identity() == document.identity()
+                                && settings
+                                    .as_ref()
+                                    .is_none_or(|settings| active.settings() == settings)
                         }
                         _ => false,
                     };
                     if !same {
                         return Err(ApplyError::RestartRequired);
-                    }
-                    if let Some(base_dir) = base_dir {
-                        let source = crate::http_processing::providers::SourceContext {
-                            base_dir,
-                            data_dir: Some(directory.clone()),
-                            config_path: None,
-                            ..Default::default()
-                        };
-                        if previous
-                            .config
-                            .http_policy()
-                            .as_ref()
-                            .and_then(|policy| policy.candidate())
-                            .and_then(|candidate| candidate.source_identity())
-                            != Some(source.identity())
-                        {
-                            return Err(ApplyError::RestartRequired);
-                        }
                     }
                     crate::config::providers::ProviderTemplate::update_yaml(
                         yaml.as_bytes(),
@@ -214,7 +179,6 @@ impl ProviderRuntime {
                     .ok_or(ApplyError::PreparationFailed)?
                     .patched(&patch),
                 ConfigUpdate::RefreshGeoData
-                | ConfigUpdate::RefreshHttp { .. }
                 | ConfigUpdate::FlushFakeIp
                 | ConfigUpdate::RecoverySnapshot(_) => {
                     unreachable!("maintenance handled before candidate construction")
@@ -525,61 +489,18 @@ mod http_tests {
     use super::*;
     use crate::dialer::SystemResolver;
     #[tokio::test]
-    async fn http_download_resolves_domain_with_direct_dns_and_pins_its_generation() {
-        let root = tempfile::tempdir().unwrap();
-        let yaml = "ipv6: false\ndns: {enable: true, use-system-hosts: false, nameserver: [rcode://success], direct-nameserver: [rcode://refused]}\nrules: ['MATCH,DIRECT']\n";
-        let config = Config::parse_yaml(yaml.as_bytes()).unwrap();
-        let manager =
-            GeoDataManager::open(&root.path().join("geodata"), Duration::from_secs(86400)).unwrap();
-        let prepared = PreparedCore::prepare_config(
-            config,
-            manager,
-            &SystemResolver,
-            ResourceLimits::default(),
-        )
-        .await
-        .unwrap();
-        let parts = prepared.build_dispatcher(Dialer::default()).unwrap();
-        let live = parts.resources.clone().unwrap();
-        let old = Arc::downgrade(&live.current.load_full());
-        let network = live.http_download_context();
-        // The synthetic REFUSED resolver never opens a socket. A bare IP-only
-        // DIRECT dispatcher rejects this domain without reaching the DNS role.
-        let (result, trace) = crate::dns::trace::capture(network.dispatcher.connect_tcp(
-            crate::session::StreamSession {
-                metadata: Default::default(),
-                inbound: crate::session::InboundKind::InternalGeoData,
-                source: SocketAddr::from(([0, 0, 0, 0], 0)),
-                destination: Destination::domain("rules.example.test", 443).unwrap(),
-                sniffed_domain: None,
-            },
-        ))
-        .await;
-        assert!(result.is_err());
-        assert!(trace.contains(&"direct-role"));
-        live.apply_update(ConfigUpdate::Replace(yaml.into()), CancellationToken::new())
-            .await
-            .unwrap();
-        live.reap().await;
-        assert!(old.upgrade().is_some());
-        drop(network);
-        live.reap().await;
-        assert!(old.upgrade().is_none());
-        live.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn routing_updates_keep_active_http_and_changed_http_requires_reconnect() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("nodes.yaml");
         std::fs::write(&path, "proxies: [{name: first, type: direct}]").unwrap();
         let yaml = "proxy-providers: {fixture: {type: file, path: nodes.yaml}}\nproxy-groups: [{name: chosen, type: select, use: [fixture]}]\nrules: ['MATCH,chosen']\n";
         let mut config = Config::parse_yaml(yaml.as_bytes()).unwrap();
-        config
-            .set_http_config(Some(
-                "rewrite: {enabled: true, rules: [{url: '.', action: reject}]}",
-            ))
+        let plugin = "targets: [{origins: ['http://example.com'], rules: [{request: {url: {reject: true}}}]}]";
+        let policy = crate::http_processing::config::Document::parse(plugin)
+            .unwrap()
+            .static_policy()
             .unwrap();
+        config.set_http_policy(Some(policy)).unwrap();
         let policy = config.http_policy().unwrap();
         let manager =
             GeoDataManager::open(&root.path().join("geodata"), Duration::from_secs(86400)).unwrap();
@@ -676,8 +597,8 @@ mod http_tests {
             live.apply_update(
                 ConfigUpdate::ReplaceWithHttp {
                     yaml: yaml.into(),
-                    http: "private-bad: private-value".into(),
-                    base_dir: None
+                    documents: vec!["private-bad: private-value".into()],
+                    settings: None
                 },
                 CancellationToken::new()
             )
@@ -692,8 +613,8 @@ mod http_tests {
             .apply_update(
                 ConfigUpdate::ReplaceWithHttp {
                     yaml: yaml.into(),
-                    http: String::new(),
-                    base_dir: None,
+                    documents: Vec::new(),
+                    settings: None,
                 },
                 CancellationToken::new(),
             )

@@ -249,19 +249,32 @@ async fn response(client: &mut BufReader<DuplexStream>) -> std::io::Result<Strin
     Ok(String::from_utf8(head).unwrap())
 }
 
-const REWRITE: &str = "http-ports: [80]\nrewrite:\n  enabled: true\n  rules:\n  - {url: '.', action: response-header-set, header: X-Rewrite, value: active}\n  - {url: '.', action: replace, replacement-mode: url, replacement: 'http://first.invalid/rewritten'}\n";
+const REWRITE: &str = r#"targets:
+  - origins: [http://first.invalid]
+    rules:
+      - request:
+          url: {replace: http://first.invalid/rewritten}
+        response:
+          headers:
+            - {set: {X-Rewrite: active}}
+"#;
 
 #[tokio::test]
 async fn ordinary_http_on_mitm_only_port_stays_plain_forwarding() {
     let material = super::super::private_context::test_material();
-    let yaml = format!(
-        "{REWRITE}\nmitm:\n  enabled: true\n  ports: [443]\n  domains: [{{pattern: first.invalid}}]\n"
-    );
+    let yaml = format!("{REWRITE}  - origins: [https://first.invalid]\n    intercept-only: true\n");
     let policy = super::super::config::Document::parse(&yaml)
         .unwrap()
-        .compile(&Default::default())
+        .compile()
         .unwrap()
-        .bind_ca(Some(&material))
+        .bind_settings(
+            &crate::http_processing::config::HttpSettings {
+                mitm_enabled: true,
+                allow_intercept_only: true,
+                ..Default::default()
+            },
+            Some(&material),
+        )
         .unwrap();
     let origin = FixedOrigin::default();
     let (mut client, cancel, task) = start_with_policy(&origin, policy, false);

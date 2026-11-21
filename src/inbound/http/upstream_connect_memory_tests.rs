@@ -70,7 +70,13 @@ async fn upstream_reuse_connect_http_port_intercepts_two_gets_on_one_origin_and_
     );
     let context = HttpContext::new(
         Policy::compile(
-            "http-ports: [80]\nrewrite:\n  enabled: true\n  rules:\n  - {url: '.', action: response-header-set, header: X-Connect-Proof, value: intercepted}\n",
+            r#"targets:
+  - origins: [http://203.0.113.1]
+    rules:
+      - response:
+          headers:
+            - {set: {X-Connect-Proof: intercepted}}
+"#,
         )
         .unwrap(),
         observed,
@@ -202,7 +208,12 @@ async fn upstream_reuse_final_https_target_never_prepares_a_reuse_plan_without_t
     let probe = Arc::new(FinalHttpsNoReuseProbe::default());
     let context = HttpContext::new(
         Policy::compile(
-            "http-ports: [80]\nrewrite:\n  enabled: true\n  rules:\n  - {url: '.', action: replace, replacement-mode: url, replacement: 'https://203.0.113.1/final'}\n",
+            r#"targets:
+  - origins: [http://203.0.113.1]
+    rules:
+      - request:
+          url: {replace: https://203.0.113.1/final}
+"#,
         )
         .unwrap(),
         probe.clone(),

@@ -197,7 +197,9 @@ fn context(
         observe_handshakes_with_stats(router(origin, geo), stats.clone()),
         stats.clone(),
     );
-    let policy=Policy::compile(&format!("http-ports: [80]\nrewrite:\n  enabled: true\n  rules:\n  - {{url: '.', action: response-header-set, header: X-Test, value: value}}\n{extra}")).unwrap();
+    let policy = Policy::compile(&format!(
+        "targets:\n  - origins: [http://origin.invalid, http://other.invalid]\n    rules:\n      - response:\n          headers:\n            - {{set: {{X-Test: value}}}}\n{extra}"
+    )).unwrap();
     (
         HttpContext::new(policy, dispatcher, SecurityContext::new()),
         stats,
@@ -380,7 +382,7 @@ async fn upstream_reuse_native_request_body_set_reuses_after_complete_upload() {
     let (context, _) = context(
         origin.clone(),
         Arc::new(EmptyGeoMatcher),
-        "  - {url: '.', action: request-body-set, value: x}\n",
+        "      - request:\n          body:\n            - {set: x}\n",
     );
     let (mut client, task) = start(context, CancellationToken::new());
     for path in ["one", "two"] {
@@ -430,7 +432,20 @@ impl Dispatcher for OpaqueDirect {
 async fn upstream_reuse_route_named_direct_is_insufficient_without_physical_proof() {
     let origin = MemoryOrigin::new(Reply::Persistent);
     let opaque = Arc::new(OpaqueDirect(origin.clone()));
-    let context=HttpContext::new(Policy::compile("http-ports: [80]\nrewrite: {enabled: true, rules: [{url: '.', action: response-header-set, header: X-Test, value: value}]}\n").unwrap(),router(opaque,Arc::new(EmptyGeoMatcher)),SecurityContext::new());
+    let context = HttpContext::new(
+        Policy::compile(
+            r#"targets:
+  - origins: [http://origin.invalid, http://other.invalid, http://203.0.113.1]
+    rules:
+      - response:
+          headers:
+            - {set: {X-Test: value}}
+"#,
+        )
+        .unwrap(),
+        router(opaque, Arc::new(EmptyGeoMatcher)),
+        SecurityContext::new(),
+    );
     let (mut client, task) = start(context, CancellationToken::new());
     for path in ["one", "two"] {
         send(&mut client, path).await;
@@ -456,7 +471,7 @@ async fn upstream_reuse_collected_rewritten_body_proves_original_wire_completion
     let (context, _) = context(
         origin.clone(),
         Arc::new(EmptyGeoMatcher),
-        "  - {url: '.', action: response-body-set, value: changed}\n",
+        "      - response:\n          body:\n            - {set: changed}\n",
     );
     let (mut client, task) = start(context, CancellationToken::new());
     for path in ["one", "two"] {
@@ -491,7 +506,20 @@ impl Dispatcher for MixedEntry {
 async fn upstream_reuse_mixed_connect_releases_the_old_slot_before_tunnel() {
     let origin = MemoryOrigin::new(Reply::Persistent);
     let router = router(origin.clone(), Arc::new(EmptyGeoMatcher));
-    let context=HttpContext::new(Policy::compile("http-ports: [80]\nrewrite: {enabled: true, rules: [{url: '.', action: response-header-set, header: X-Test, value: value}]}\n").unwrap(),router.clone(),SecurityContext::new());
+    let context = HttpContext::new(
+        Policy::compile(
+            r#"targets:
+  - origins: [http://origin.invalid, http://other.invalid, http://203.0.113.1]
+    rules:
+      - response:
+          headers:
+            - {set: {X-Test: value}}
+"#,
+        )
+        .unwrap(),
+        router.clone(),
+        SecurityContext::new(),
+    );
     let dispatcher: Arc<dyn Dispatcher> = Arc::new(MixedEntry { context, router });
     let (client, stream) = tokio::io::duplex(8192);
     let task = tokio::spawn(async move {

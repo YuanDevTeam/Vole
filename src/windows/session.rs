@@ -13,6 +13,7 @@ use tokio::{
     task::JoinSet,
     time::{Instant, sleep},
 };
+use tokio_util::sync::CancellationToken;
 use windows::{
     ApplicationModel::Package,
     Storage::ApplicationData,
@@ -37,11 +38,7 @@ use crate::{
     config::Config,
     dialer::{Dialer, SystemResolver},
     geodata::GeoDataManager,
-    http_processing::{
-        Policy,
-        config::PolicyCandidate,
-        providers::{SourceContext, Store},
-    },
+    http_processing::{Policy, config::Document},
     platform::{TunIo, validate_packet_channel_config},
     runtime::{PreparedCore, RunningCore},
 };
@@ -254,27 +251,12 @@ async fn start_session(
     let ca = reference
         .read_http_ca(local_folder, &family, &snapshot)
         .map_err(io::Error::other)?;
-    let candidate = snapshot
+    let policy = snapshot
         .http_snapshot()
-        .map(PolicyCandidate::import_snapshot)
-        .transpose()?;
-    let policy = candidate
-        .as_ref()
-        .map(|candidate| candidate.bind_ca(ca.as_ref()))
-        .transpose()?;
-    let http_store = candidate
-        .map(|candidate| {
-            let mut store = Store::default();
-            store.adopt(
-                candidate,
-                &SourceContext {
-                    base_dir: snapshot.http_base_dir(),
-                    data_dir: Some(local_folder.join("vole")),
-                    config_path: None,
-                    ..Default::default()
-                },
-            )?;
-            Ok::<_, io::Error>(Arc::new(tokio::sync::Mutex::new(store)))
+        .map(|(documents, settings)| -> io::Result<_> {
+            let candidate = Document::parse_documents(documents)?.compile()?;
+            candidate.prepare_platform(settings, &CancellationToken::new())?;
+            candidate.bind_settings(settings, ca.as_ref())
         })
         .transpose()?;
     // The runtime retains the parsed Authority, never the transport PEM input.
@@ -283,15 +265,7 @@ async fn start_session(
         .session_backend()
         .map(|backend| ManagedProcessSet::start(installed_folder, backend))
         .transpose()?;
-    let started = start_vole(
-        local_folder,
-        snapshot.config_yaml(),
-        policy,
-        http_store,
-        binding,
-        data,
-    )
-    .await;
+    let started = start_vole(local_folder, snapshot.config_yaml(), policy, binding, data).await;
     let (running, mut data_tasks) = match started {
         Ok(started) => started,
         Err(error) => {
@@ -319,7 +293,6 @@ async fn start_vole(
     local_folder: &Path,
     config_yaml: &str,
     http_policy: Option<Arc<Policy>>,
-    http_store: Option<Arc<tokio::sync::Mutex<Store>>>,
     binding: PhysicalBinding,
     data: NamedPipeClient,
 ) -> io::Result<(RunningCore, JoinSet<io::Result<()>>)> {
@@ -381,10 +354,7 @@ async fn start_vole(
 
     let dialer =
         dialer_from_binding(&binding)?.with_physical_adapter(binding.adapter_id.as_str().into());
-    let mut running = prepared.start_tun(tun, dialer).await?;
-    if let Some(store) = http_store {
-        running.maintain_http(store);
-    }
+    let running = prepared.start_tun(tun, dialer).await?;
     Ok((running, tasks))
 }
 

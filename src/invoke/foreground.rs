@@ -5,6 +5,7 @@ use super::{
 mod input;
 mod overrides;
 mod reload;
+use crate::http_processing::config::HttpSettings;
 pub(super) use overrides::ControllerOverrides;
 
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,13 @@ Usage: vole [-d <data-dir>] [-f <config-file>] [-config <base64>] [-age-secret-k
   -ext-ctl-unix <path>  Override the Linux Unix Controller path when nonempty\n\
   -ext-ctl-routing-mark <mark>  Override the Linux management socket mark when nonzero\n\
   -secret <token>   Override Controller authentication when nonempty\n\
-  -http-config <file>  Explicit HTTP processing addendum (optional)\n\
+  -http-config <file>  HTTP rewrite plugin YAML (repeatable)\n\
+  -http-param <index:key=JSON>  Local parameter for a one-based plugin index (repeatable)\n\
+  -http-mitm       Enable interception for eligible HTTPS targets\n\
+  -http-mitm-exclude <host>  Exclude an exact host or *.suffix from MITM (repeatable)\n\
+  -http-rewrite=false  Disable built-in HTTP rewrite actions\n\
+  -http-js=false   Disable HTTP rewrite scripts\n\
+  -http-intercept-only  Allow plugins declaring intercept-only HTTPS targets\n\
   -http-ca <file>   Private CA JSON file for selected HTTPS processing\n\
   -t               Validate configuration and exit\n\
   -v               Print software version and build identity\n\
@@ -131,7 +138,11 @@ pub(super) struct ForegroundPayload {
     #[serde(default, deserialize_with = "input::private_text")]
     secret: Option<Zeroizing<String>>,
     #[serde(default)]
-    http_config_path: Option<InvokePath>,
+    http_config_paths: Vec<InvokePath>,
+    #[serde(default)]
+    http_parameter_overrides: super::http::ParameterOverrides,
+    #[serde(default)]
+    http_context: Option<HttpSettings>,
     #[serde(default)]
     http_ca_path: Option<InvokePath>,
 }
@@ -174,8 +185,12 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
     if matches!(payload.action, ForegroundAction::Help) {
         return Ok(json!({"output":"","diagnostics":HELP}));
     }
-    if payload.http_ca_path.is_some() && payload.http_config_path.is_none() {
-        return Err(failure("httpCaPath requires httpConfigPath"));
+    if payload.http_config_paths.is_empty()
+        && (payload.http_ca_path.is_some()
+            || payload.http_context.is_some()
+            || !payload.http_parameter_overrides.is_empty())
+    {
+        return Err(failure("local HTTP settings and CA require -http-config"));
     }
     let _lease = if matches!(payload.action, ForegroundAction::Run) {
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -202,26 +217,31 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
     let cwd = std::env::current_dir().map_err(|e| io_failure("resolve working directory", e))?;
     let paths = Paths::resolve(&options, &cwd, &PathDefaults::environment())
         .map_err(|e| io_failure("resolve paths", e))?;
-    let http_input = payload
-        .http_config_path
-        .map(|path| {
-            let path = path.into_path();
-            if path.as_os_str().is_empty() || path == Path::new("-") {
-                return Err(failure("HTTP configuration requires an explicit file path"));
-            }
-            let path = if path.is_absolute() {
-                path
-            } else {
-                cwd.join(path)
-            };
-            let bytes = read_config_limit(&path, crate::http_processing::MAX_ADDENDUM)
-                .map_err(|error| io_failure("read HTTP configuration", error))?;
-            String::from_utf8(bytes)
-                .map(|yaml| (yaml, path))
-                .map_err(|_| failure("HTTP configuration is not UTF-8"))
-        })
-        .transpose()?;
-    let http_yaml = http_input.as_ref().map(|(yaml, _)| yaml.as_str());
+    if payload.http_config_paths.len() > crate::http_processing::config::MAX_DOCUMENTS {
+        return Err(failure("too many HTTP plugin files"));
+    }
+    let mut http_paths = Vec::with_capacity(payload.http_config_paths.len());
+    let mut documents = Vec::with_capacity(payload.http_config_paths.len());
+    let mut remaining = crate::http_processing::MAX_ADDENDUM;
+    for path in payload.http_config_paths {
+        let path = path.into_path();
+        if path.as_os_str().is_empty() || path == Path::new("-") {
+            return Err(failure("HTTP configuration requires an explicit file path"));
+        }
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        let bytes = read_config_limit(&path, remaining)
+            .map_err(|error| io_failure("read HTTP configuration", error))?;
+        remaining -= bytes.len();
+        documents.push(
+            String::from_utf8(bytes).map_err(|_| failure("HTTP configuration is not UTF-8"))?,
+        );
+        http_paths.push(path);
+    }
+    let settings = payload.http_context.unwrap_or_default();
     // Stdin belongs to the foreground request. Default OS Ctrl+C handling is
     // preserved while it is still supplying its bounded configuration input.
     let input = input::MainInput::read(source.config, source.key, &paths, || {
@@ -229,16 +249,14 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
     })?;
     if matches!(payload.action, ForegroundAction::Validate) {
         let config = Zeroizing::new(input.into_yaml(None)?);
-        validate_yaml(&config, &paths.data_dir, http_yaml)?;
-        let external = http_yaml
-            .filter(|input| !input.is_empty())
-            .map(crate::http_processing::config::Document::parse)
-            .transpose()
-            .map_err(|_| failure("invalid HTTP processing configuration"))?
-            .is_some_and(|document| document.unresolved_count() != 0);
-        return Ok(
-            json!({"output":"configuration valid\n","diagnostics":if external {"HTTP external resources are not validated\n"} else {""}}),
-        );
+        validate_yaml(
+            &config,
+            &paths.data_dir,
+            documents,
+            payload.http_parameter_overrides,
+            settings,
+        )?;
+        return Ok(json!({"output":"configuration valid\n","diagnostics":""}));
     }
     // Like Mihomo, -t validates the source and returns before run-only overrides.
     let overrides = ControllerOverrides::read(
@@ -257,9 +275,7 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
     if let Some(path) = input.source_file() {
         reserved.push((path.to_owned(), false));
     }
-    if let Some((_, path)) = &http_input {
-        reserved.push((path.clone(), false));
-    }
+    reserved.extend(http_paths.into_iter().map(|path| (path, false)));
     if let Some(path) = &payload.http_ca_path {
         let path = path.clone().into_path();
         reserved.push((
@@ -279,7 +295,13 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
         .enable_all()
         .build()
         .map_err(|e| io_failure("create foreground runtime", e))?;
-    let ca = read_http_ca(payload.http_ca_path, http_yaml, &cwd)?;
+    let ca = read_http_ca(
+        payload.http_ca_path,
+        &documents,
+        &payload.http_parameter_overrides,
+        &settings,
+        &cwd,
+    )?;
     runtime.block_on(async {
         let mut signals =
             ShutdownSignals::register().map_err(|e| io_failure("register shutdown signals", e))?;
@@ -309,18 +331,14 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
             .map_err(|_| failure("data directory initialization failed"))?;
         let controller = registry().create_instance()?;
         let mut cleanup = ForegroundInstance(Some(controller.clone()));
-        let context = http_input
-            .as_ref()
-            .map(|(_, path)| super::http::HttpContextInput {
-                base_dir: path.parent().map(|path| path.to_owned().into()),
-                ca,
-            });
-        let (http_config_yaml, source_file) = http_input.unzip();
+        let context = (!documents.is_empty()).then(|| super::http::HttpContextInput::from_settings(settings, ca));
         let startup = StartupConfig::Input(Box::new(super::http::StartPayload {
             config_yaml: std::mem::take(&mut *yaml),
-            http_config_yaml,
+            http_config_yaml: None,
+            http_config_yamls: Some(documents),
+            http_plugins: None,
+            http_parameter_overrides: payload.http_parameter_overrides,
             http_context: context,
-            source_file,
             cancellation: Some(cancellation.clone()),
             foreground_overrides: overrides,
             provider_paths: Some(provider_paths.clone()),
@@ -334,17 +352,20 @@ pub(super) fn execute(payload: ForegroundPayload) -> Result<Value, InvokeFailure
 
 fn read_http_ca(
     path: Option<InvokePath>,
-    http_yaml: Option<&str>,
+    documents: &[String],
+    parameter_overrides: &super::http::ParameterOverrides,
+    settings: &HttpSettings,
     cwd: &Path,
 ) -> Result<Option<crate::http_processing::private_context::CaMaterial>, InvokeFailure> {
-    let Some(path) = path else { return Ok(None) };
-    let input = http_yaml.ok_or_else(|| failure("httpCaPath requires httpConfigPath"))?;
-    let enabled = !input.is_empty()
-        && crate::http_processing::config::Document::parse(input)
-            .map_err(|_| failure("invalid HTTP processing configuration"))?
-            .mitm
-            .enabled;
-    if !enabled {
+    let Some(path) = path.filter(|_| settings.mitm_enabled) else {
+        return Ok(None);
+    };
+    let requires_ca = super::http::candidate_raw(documents, parameter_overrides)?
+        .map(|candidate| candidate.requires_ca(settings))
+        .transpose()
+        .map_err(|_| failure("invalid HTTP settings"))?
+        .unwrap_or(false);
+    if !requires_ca {
         return Ok(None);
     }
     let path = path.into_path();
@@ -358,12 +379,24 @@ fn read_http_ca(
         .map_err(|_| failure("private HTTP CA input failed"))
 }
 
-fn validate_yaml(yaml: &str, directory: &Path, http: Option<&str>) -> Result<(), InvokeFailure> {
+fn validate_yaml(
+    yaml: &str,
+    directory: &Path,
+    http: Vec<String>,
+    parameter_overrides: super::http::ParameterOverrides,
+    settings: HttpSettings,
+) -> Result<(), InvokeFailure> {
     let mut config = super::parse_config_yaml_with_directory(yaml, Some(directory))
         .map_err(|_| failure("invalid configuration"))?;
+    let context =
+        (!http.is_empty()).then(|| super::http::HttpContextInput::from_settings(settings, None));
+    let policy = super::http::static_policy(
+        Some(super::http::HttpInputs::Raw(http, parameter_overrides)),
+        context,
+    )?;
     config
-        .set_http_config(http)
-        .map_err(|_| failure("invalid HTTP processing configuration"))?;
+        .set_http_policy(policy)
+        .map_err(InvokeFailure::from)?;
     crate::runtime::PreparedCore::validate_config(config)
         .map_err(|_| failure("invalid configuration"))
 }
@@ -926,7 +959,9 @@ mod tests {
             secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
-            http_config_path: None,
+            http_config_paths: Vec::new(),
+            http_parameter_overrides: Default::default(),
+            http_context: None,
             http_ca_path: None,
         };
         assert_eq!(execute(payload).unwrap()["output"], "configuration valid\n");
@@ -969,7 +1004,9 @@ mod tests {
             secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
-            http_config_path: None,
+            http_config_paths: Vec::new(),
+            http_parameter_overrides: Default::default(),
+            http_context: None,
             http_ca_path: None,
         })
         .unwrap();
@@ -994,7 +1031,9 @@ mod tests {
             secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(config.into()),
-            http_config_path: None,
+            http_config_paths: Vec::new(),
+            http_parameter_overrides: Default::default(),
+            http_context: None,
             http_ca_path: None,
         })
         .unwrap_err();
@@ -1007,16 +1046,32 @@ mod tests {
         assert!(
             read_http_ca(
                 invalid_path(),
-                Some("mitm: {enabled: false}"),
+                &[],
+                &Default::default(),
+                &HttpSettings::default(),
                 Path::new("/")
             )
             .unwrap()
             .is_none()
         );
+        let excluded = HttpSettings {
+            mitm_enabled: true,
+            exclude_domains: vec!["*.example.com".into()],
+            ..Default::default()
+        };
+        let documents = vec![
+            "targets: [{origins: ['https://api.example.com'], rules: [{response: {headers: [{set: {x-test: test}}]}}]}]".into(),
+        ];
         assert!(
-            read_http_ca(invalid_path(), Some(""), Path::new("/"))
-                .unwrap()
-                .is_none()
+            read_http_ca(
+                invalid_path(),
+                &documents,
+                &Default::default(),
+                &excluded,
+                Path::new("/")
+            )
+            .unwrap()
+            .is_none()
         );
         let error = execute(ForegroundPayload {
             action: ForegroundAction::Validate,
@@ -1029,11 +1084,16 @@ mod tests {
             secret: None,
             data_dir: invalid_path(),
             config_path: invalid_path(),
-            http_config_path: None,
+            http_config_paths: Vec::new(),
+            http_parameter_overrides: Default::default(),
+            http_context: None,
             http_ca_path: invalid_path(),
         })
         .unwrap_err();
-        assert_eq!(error.message, "httpCaPath requires httpConfigPath");
+        assert_eq!(
+            error.message,
+            "local HTTP settings and CA require -http-config"
+        );
     }
     #[test]
     fn run_admission_rejects_busy_before_reading_input() {
@@ -1049,7 +1109,9 @@ mod tests {
             secret: None,
             data_dir: Some(InvokePath::Text("\0".to_owned())),
             config_path: Some(InvokePath::Text("-".to_owned())),
-            http_config_path: None,
+            http_config_paths: Vec::new(),
+            http_parameter_overrides: Default::default(),
+            http_context: None,
             http_ca_path: None,
         })
         .unwrap_err();
@@ -1068,7 +1130,9 @@ mod tests {
             secret: None,
             data_dir: None,
             config_path: Some(InvokePath::Text("-".to_owned())),
-            http_config_path: None,
+            http_config_paths: Vec::new(),
+            http_parameter_overrides: Default::default(),
+            http_context: None,
             http_ca_path: None,
         })
         .unwrap_err();
@@ -1088,7 +1152,9 @@ mod tests {
             secret: None,
             data_dir: Some(InvokePath::Text("\0".to_owned())),
             config_path: Some(InvokePath::Text("\0".to_owned())),
-            http_config_path: None,
+            http_config_paths: Vec::new(),
+            http_parameter_overrides: Default::default(),
+            http_context: None,
             http_ca_path: None,
         })
         .unwrap();
@@ -1296,7 +1362,7 @@ mod tests {
         fs::write(&main, "rules: ['MATCH,DIRECT']").unwrap();
         fs::write(
             &http,
-            "rewrite: {enabled: true, rules: [{url: '.', action: reject}]}",
+            "targets: [{origins: ['http://example.com'], rules: [{request: {url: {reject: true}}}]}]",
         )
         .unwrap();
         let result = execute(ForegroundPayload {
@@ -1310,7 +1376,9 @@ mod tests {
             secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(main.clone().into()),
-            http_config_path: Some(http.clone().into()),
+            http_config_paths: vec![http.clone().into()],
+            http_parameter_overrides: Default::default(),
+            http_context: None,
             http_ca_path: Some(root.path().join("missing-private-ca.json").into()),
         })
         .unwrap();
@@ -1328,7 +1396,9 @@ mod tests {
             secret: None,
             data_dir: Some(data.clone().into()),
             config_path: Some(main.clone().into()),
-            http_config_path: None,
+            http_config_paths: Vec::new(),
+            http_parameter_overrides: Default::default(),
+            http_context: None,
             http_ca_path: None,
         })
         .unwrap();

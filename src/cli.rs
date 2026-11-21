@@ -1,6 +1,7 @@
 //! CLI adapter: arguments -> Invoke request -> output and exit status.
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     io::{self, Write},
     path::PathBuf,
@@ -28,8 +29,38 @@ struct Options {
     external_controller_unix: Option<Zeroizing<String>>,
     external_controller_routing_mark: Option<i64>,
     secret: Option<Zeroizing<String>>,
-    http_config_file: Option<PathBuf>,
+    http_config_files: Vec<PathBuf>,
+    http_parameter_overrides: BTreeMap<usize, BTreeMap<String, Value>>,
+    http_settings: HttpOptions,
     http_ca_file: Option<PathBuf>,
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct HttpOptions {
+    mitm_enabled: Option<bool>,
+    exclude_domains: Vec<String>,
+    rewrite_enabled: Option<bool>,
+    js_enabled: Option<bool>,
+    allow_intercept_only: Option<bool>,
+}
+impl HttpOptions {
+    fn into_context(self) -> Option<Value> {
+        let mut context = serde_json::Map::new();
+        for (key, value) in [
+            ("mitmEnabled", self.mitm_enabled),
+            ("rewriteEnabled", self.rewrite_enabled),
+            ("jsEnabled", self.js_enabled),
+            ("allowInterceptOnly", self.allow_intercept_only),
+        ] {
+            if let Some(value) = value {
+                context.insert(key.into(), Value::Bool(value));
+            }
+        }
+        if !self.exclude_domains.is_empty() {
+            context.insert("excludeDomains".into(), json!(self.exclude_domains));
+        }
+        (!context.is_empty()).then_some(Value::Object(context))
+    }
 }
 
 impl std::fmt::Debug for Options {
@@ -57,7 +88,9 @@ impl Options {
         let mut external_controller_unix = None;
         let mut external_controller_routing_mark = None;
         let mut secret = None;
-        let mut http_config_file = None;
+        let mut http_config_files = Vec::new();
+        let mut http_parameter_overrides = BTreeMap::new();
+        let mut http_settings = HttpOptions::default();
         let mut http_ca_file = None;
         while let Some(argument) = arguments.next() {
             let Some((flag, inline)) = flag_parts(&argument)? else {
@@ -79,7 +112,9 @@ impl Options {
                         external_controller_unix,
                         external_controller_routing_mark,
                         secret,
-                        http_config_file,
+                        http_config_files,
+                        http_parameter_overrides,
+                        http_settings,
                         http_ca_file,
                     });
                 }
@@ -127,6 +162,41 @@ impl Options {
                     }
                     drop(Zeroizing::new(argument.into_encoded_bytes()));
                 }
+                b"http-mitm" | b"http-rewrite" | b"http-js" | b"http-intercept-only" => {
+                    let value = Some(inline.map_or(Ok(true), parse_bool)?);
+                    match flag {
+                        b"http-mitm" => http_settings.mitm_enabled = value,
+                        b"http-rewrite" => http_settings.rewrite_enabled = value,
+                        b"http-js" => http_settings.js_enabled = value,
+                        _ => http_settings.allow_intercept_only = value,
+                    }
+                }
+                b"http-mitm-exclude" => {
+                    let value = inline
+                        .map(OsStr::to_owned)
+                        .or_else(|| arguments.next())
+                        .ok_or(CliError::argument("missing value for -http-mitm-exclude"))?;
+                    http_settings.exclude_domains.push(
+                        value
+                            .into_string()
+                            .map_err(|_| CliError::argument("-http-mitm-exclude requires UTF-8"))?,
+                    );
+                }
+                b"http-param" => {
+                    let value = inline
+                        .map(OsStr::to_owned)
+                        .or_else(|| arguments.next())
+                        .ok_or(CliError::argument("missing value for -http-param"))?;
+                    let (index, key, value) = parse_http_parameter(&value)?;
+                    if http_parameter_overrides
+                        .entry(index)
+                        .or_insert_with(BTreeMap::new)
+                        .insert(key, value)
+                        .is_some()
+                    {
+                        return Err(CliError::argument("duplicate -http-param for a plugin"));
+                    }
+                }
                 b"http-config" | b"http-ca" => {
                     let value = inline
                         .map(OsStr::to_owned)
@@ -139,7 +209,7 @@ impl Options {
                     if flag == b"http-ca" {
                         http_ca_file = Some(PathBuf::from(value));
                     } else {
-                        http_config_file = Some(PathBuf::from(value));
+                        http_config_files.push(PathBuf::from(value));
                     }
                 }
                 b"d" | b"f" => {
@@ -177,10 +247,32 @@ impl Options {
             external_controller_unix,
             external_controller_routing_mark,
             secret,
-            http_config_file,
+            http_config_files,
+            http_parameter_overrides,
+            http_settings,
             http_ca_file,
         })
     }
+}
+
+fn parse_http_parameter(value: &OsStr) -> Result<(usize, String, Value), CliError> {
+    let invalid = || CliError::argument("-http-param requires index:key=JSON-scalar");
+    let text = value.to_str().ok_or_else(invalid)?;
+    let (index, assignment) = text.split_once(':').ok_or_else(invalid)?;
+    let index = index
+        .parse::<usize>()
+        .ok()
+        .and_then(|index| index.checked_sub(1))
+        .ok_or_else(invalid)?;
+    let (key, text) = assignment.split_once('=').ok_or_else(invalid)?;
+    if key.is_empty() || text.len() > 6 * 2048 + 2 {
+        return Err(invalid());
+    }
+    let value: Value = serde_json::from_str(text).map_err(|_| invalid())?;
+    if !value.is_boolean() && !value.is_string() && !value.is_i64() {
+        return Err(invalid());
+    }
+    Ok((index, key.to_owned(), value))
 }
 
 type ParsedFlag<'a> = (&'a [u8], Option<&'a OsStr>);
@@ -333,9 +425,20 @@ fn request(options: Options) -> Value {
     if let Some(mark) = options.external_controller_routing_mark {
         payload["externalControllerRoutingMark"] = Value::from(mark);
     }
-    if let Some(path) = options.http_config_file {
-        payload["httpConfigPath"] =
-            serde_json::to_value(InvokePath::from(path)).expect("native path serialization");
+    if !options.http_config_files.is_empty() {
+        let paths: Vec<_> = options
+            .http_config_files
+            .into_iter()
+            .map(InvokePath::from)
+            .collect();
+        payload["httpConfigPaths"] =
+            serde_json::to_value(paths).expect("native path serialization");
+    }
+    if let Some(context) = options.http_settings.into_context() {
+        payload["httpContext"] = context;
+    }
+    if !options.http_parameter_overrides.is_empty() {
+        payload["httpParameterOverrides"] = json!(options.http_parameter_overrides);
     }
     if let Some(path) = options.http_ca_file {
         payload["httpCaPath"] =
@@ -592,15 +695,22 @@ mod tests {
     }
 
     #[test]
-    fn http_addendum_option_only_transports_an_explicit_native_path() {
+    fn http_options_transport_ordered_native_paths_and_local_settings() {
         for option in ["-http-config=extra.yaml", "--http-config=extra.yaml"] {
             let value = request(parse(&[option, "-t"]).unwrap());
-            assert_eq!(value["payload"]["httpConfigPath"], "extra.yaml");
+            assert_eq!(value["payload"]["httpConfigPaths"], json!(["extra.yaml"]));
         }
         let value = request(
             parse(&[
                 "-http-config",
                 "extra.yaml",
+                "-http-config=other.yaml",
+                "-http-mitm",
+                "-http-mitm-exclude",
+                "*.private.example",
+                "-http-rewrite=false",
+                "-http-js=false",
+                "-http-intercept-only",
                 "-http-ca",
                 "private.json",
                 "-t",
@@ -608,6 +718,17 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(value["payload"]["httpCaPath"], "private.json");
+        assert_eq!(
+            value["payload"]["httpConfigPaths"],
+            json!(["extra.yaml", "other.yaml"])
+        );
+        assert_eq!(
+            value["payload"]["httpContext"],
+            json!({
+                "mitmEnabled": true, "excludeDomains": ["*.private.example"],
+                "rewriteEnabled": false, "jsEnabled": false, "allowInterceptOnly": true
+            })
+        );
         assert_eq!(
             request(parse(&["-http-config", "extra.yaml", "-v"]).unwrap()),
             json!({"method":"version","payload":{}})

@@ -1,4 +1,4 @@
-//! Latest-only, flat HTTP rule input types.
+//! Compiler inputs and typed rewrite operations.
 use serde::{Deserialize, Deserializer, Serialize};
 
 fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
@@ -18,6 +18,7 @@ fn enabled() -> bool {
 pub(crate) struct RawRule {
     pub(crate) url: String,
     #[serde(default, rename = "match")]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) match_kind: MatchKind,
     pub(crate) action: ActionKind,
     #[serde(default = "enabled")]
@@ -76,6 +77,26 @@ pub(crate) struct RawRule {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) patch: Option<Vec<PatchOperation>>,
+}
+
+impl RawRule {
+    pub(crate) fn action(action: ActionKind, name: Option<String>) -> Self {
+        Self {
+            url: String::new(),
+            match_kind: MatchKind::default(),
+            action,
+            enabled: true,
+            name,
+            replacement: None,
+            replacement_mode: None,
+            header: None,
+            value: None,
+            search: None,
+            search_mode: None,
+            occurrences: None,
+            patch: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -178,6 +199,41 @@ pub(crate) enum PatchOperation {
         #[serde(deserialize_with = "json_value")]
         value: serde_json::Value,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct JsonFilterSpec {
+    pub(crate) path: String,
+    pub(crate) remove_where: FilterPredicateSpec,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FilterPredicateSpec {
+    pub(crate) path: String,
+    #[serde(default, deserialize_with = "present_scalar")]
+    pub(crate) equals: Option<JsonScalar>,
+    #[serde(default, rename = "in", deserialize_with = "present")]
+    pub(crate) choices: Option<Vec<JsonScalar>>,
+}
+
+pub(crate) struct JsonScalar(pub(crate) serde_json::Value);
+
+impl<'de> Deserialize<'de> for JsonScalar {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = json_value(deserializer)?;
+        if value.is_array() || value.is_object() {
+            return Err(serde::de::Error::custom("JSON filter requires a scalar"));
+        }
+        Ok(Self(value))
+    }
+}
+
+fn present_scalar<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<JsonScalar>, D::Error> {
+    JsonScalar::deserialize(deserializer).map(Some)
 }
 
 // serde_json::Value turns a non-finite floating-point visitor value into

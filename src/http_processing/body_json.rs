@@ -1,11 +1,16 @@
 //! A small budgeted JSON tree and RFC 6902 adapter. Numbers retain their source
 //! spelling; parsing never routes business JSON through an f64-backed Value.
 use super::{Budget, BudgetedBytes, Bypass, MAX_BODY};
-use crate::http_processing::rules::PatchOperation;
-use std::io::Write;
+use crate::http_processing::{
+    config::invalid,
+    rules::{JsonFilterSpec, MAX_PATTERN, PatchOperation},
+};
+use std::io::{self, Write};
 
 const ARENA: usize = 256 * 1024;
 const DEPTH: usize = 64;
+const MAX_PREDICATES: usize = 32;
+const FILTER_WORK: usize = 1024 * 1024;
 
 enum Node {
     Null,
@@ -500,6 +505,160 @@ fn write(value: &Node, writer: &mut BudgetedBytes, depth: usize) -> Result<(), B
         }
     }
     Ok(())
+}
+
+pub(crate) struct JsonFilter {
+    container: Vec<Box<str>>,
+    predicate: Vec<Box<str>>,
+    choices: Vec<Node>,
+}
+
+impl JsonFilter {
+    pub(crate) fn compile(spec: JsonFilterSpec) -> io::Result<(Self, usize)> {
+        let mut arena = Arena { used: 0 };
+        let mut compile_path = |path: &str| {
+            if path.len() > MAX_PATTERN {
+                return Err(invalid());
+            }
+            pointer(path, &mut arena).map_err(|_| invalid())
+        };
+        let container = compile_path(&spec.path)?;
+        let predicate = compile_path(&spec.remove_where.path)?;
+        let choices = match (spec.remove_where.equals, spec.remove_where.choices) {
+            (Some(value), None) => vec![value],
+            (None, Some(values)) if !values.is_empty() && values.len() <= MAX_PREDICATES => values,
+            _ => return Err(invalid()),
+        };
+        let mut cost = spec.path.len() + spec.remove_where.path.len();
+        let choices = choices
+            .into_iter()
+            .map(|value| {
+                let node = match value.0 {
+                    serde_json::Value::Null => Node::Null,
+                    serde_json::Value::Bool(value) => Node::Bool(value),
+                    serde_json::Value::String(value) => Node::String(value.into()),
+                    serde_json::Value::Number(value) => Node::Number(value.to_string().into()),
+                    _ => return Err(invalid()),
+                };
+                let size = scalar_size(&node);
+                if size > MAX_PATTERN {
+                    return Err(invalid());
+                }
+                cost += size;
+                Ok(node)
+            })
+            .collect::<io::Result<_>>()?;
+        Ok((
+            Self {
+                container,
+                predicate,
+                choices,
+            },
+            cost,
+        ))
+    }
+
+    pub(super) fn apply(
+        &self,
+        input: &str,
+        budget: &Budget,
+    ) -> Result<Option<BudgetedBytes>, Bypass> {
+        let _reservation = budget.reserve(ARENA).ok_or(Bypass::Budget)?;
+        let mut arena = Arena {
+            used: std::mem::size_of::<Node>(),
+        };
+        let mut root = Parser::parse(input, &mut arena)?;
+        let mut container = &mut root;
+        let mut work = FILTER_WORK;
+        for token in &self.container {
+            let Some(slot) = filter_index(container, token, &mut work)? else {
+                return Ok(None);
+            };
+            container = match container {
+                Node::Object(values) => &mut values[slot].1,
+                Node::Array(values) => &mut values[slot],
+                _ => unreachable!("only containers have indexes"),
+            };
+        }
+        let Node::Array(items) = container else {
+            return Err(Bypass::Transform);
+        };
+        let before = items.len();
+        let mut failure = None;
+        items.retain(|item| {
+            if failure.is_some() {
+                return true;
+            }
+            match self.remove(item, &arena, &mut work) {
+                Ok(remove) => !remove,
+                Err(error) => {
+                    failure = Some(error);
+                    true
+                }
+            }
+        });
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if items.len() == before {
+            return Ok(None);
+        }
+        // Filtering removes complete values and the compact writer cannot
+        // expand a retained token compared to its valid source representation.
+        let mut output = BudgetedBytes::new(budget, input.len()).ok_or(Bypass::Budget)?;
+        write(&root, &mut output, 0)?;
+        Ok(Some(output))
+    }
+
+    fn remove(&self, mut item: &Node, arena: &Arena, work: &mut usize) -> Result<bool, Bypass> {
+        charge_filter_work(work, 1)?;
+        for token in &self.predicate {
+            let Some(slot) = filter_index(item, token, work)? else {
+                return Ok(false);
+            };
+            item = match item {
+                Node::Object(values) => &values[slot].1,
+                Node::Array(values) => &values[slot],
+                _ => unreachable!("only containers have indexes"),
+            };
+        }
+        for expected in &self.choices {
+            charge_filter_work(work, scalar_size(item) + scalar_size(expected))?;
+            if equal(item, expected, arena)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+fn scalar_size(value: &Node) -> usize {
+    match value {
+        Node::String(value) | Node::Number(value) => value.len() + 1,
+        _ => 1,
+    }
+}
+
+fn charge_filter_work(remaining: &mut usize, cost: usize) -> Result<(), Bypass> {
+    *remaining = remaining.checked_sub(cost).ok_or(Bypass::Budget)?;
+    Ok(())
+}
+
+fn filter_index(value: &Node, token: &str, work: &mut usize) -> Result<Option<usize>, Bypass> {
+    charge_filter_work(work, token.len() + 1)?;
+    match value {
+        Node::Object(values) => {
+            for (index, (key, _)) in values.iter().enumerate() {
+                charge_filter_work(work, 1 + token.len().min(key.len()))?;
+                if key.as_ref() == token {
+                    return Ok(Some(index));
+                }
+            }
+            Ok(None)
+        }
+        Node::Array(values) => Ok(index(token, values.len(), false).ok()),
+        _ => Ok(None),
+    }
 }
 
 pub(super) fn apply(

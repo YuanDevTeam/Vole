@@ -2,9 +2,10 @@
 use super::{
     Policy,
     body::{self, Budget, BudgetedBytes, Entity, MAX_BODY},
+    body_budget::Reservation,
     headers::{self, Fields},
-    rules::{self, Phase},
-    script_config::BodyMode,
+    rules::{self, Phase, RequestMatch, StaticResponse},
+    script_config::{BodyMode, CompiledScript},
 };
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer};
@@ -47,12 +48,70 @@ pub(crate) struct Message {
     pub(crate) crossed_origin: bool,
     protected: BTreeSet<String>,
     partial_response: bool,
+    conditions: (u64, u64),
 }
 
 pub(crate) struct LocalResponse {
     pub(crate) status: u16,
     pub(crate) headers: Fields,
     pub(crate) body: Bytes,
+}
+
+struct StaticBodyOwner {
+    body: Bytes,
+    _reservation: Reservation,
+}
+
+impl AsRef<[u8]> for StaticBodyOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+impl LocalResponse {
+    pub(crate) fn from_static(
+        response: &StaticResponse,
+        head: bool,
+        identity_allowed: bool,
+        budget: &Budget,
+    ) -> Self {
+        let empty = |status| Self {
+            status,
+            headers: (!head)
+                .then(|| ("content-length".into(), "0".into()))
+                .into_iter()
+                .collect(),
+            body: Bytes::new(),
+        };
+        let mut headers = response.headers.clone();
+        let mut body = Bytes::new();
+        if !head && !matches!(response.status, 204 | 304) {
+            let length = response.body.len();
+            if length > 0 {
+                if !identity_allowed {
+                    return empty(406);
+                }
+                let Some(reservation) = budget.reserve(length) else {
+                    return empty(503);
+                };
+                // Retain the reservation until even H2's queued slices have
+                // released the immutable configuration bytes.
+                body = Bytes::from_owner(StaticBodyOwner {
+                    body: response.body.clone(),
+                    _reservation: reservation,
+                });
+            }
+            headers.push(("content-length".into(), length.to_string()));
+        }
+        if headers::check(&headers).is_err() {
+            return empty(503);
+        }
+        Self {
+            status: response.status,
+            headers,
+            body,
+        }
+    }
 }
 
 pub(crate) enum Outcome {
@@ -154,6 +213,7 @@ impl Message {
             crossed_origin,
             protected: nominated(wire_headers),
             partial_response: false,
+            conditions: (0, 0),
         }
     }
 
@@ -177,7 +237,18 @@ impl Message {
             crossed_origin: false,
             protected: nominated(wire_headers),
             partial_response,
+            conditions: (0, 0),
         }
+    }
+
+    pub(crate) fn with_conditions(mut self, request: u64, response: u64) -> Self {
+        self.conditions = (request, response);
+        self
+    }
+
+    fn selection(&self) -> RequestMatch<'_> {
+        RequestMatch::from((&self.original.url, self.original.method.as_str()))
+            .with_conditions(self.conditions.0, self.conditions.1)
     }
 
     pub(crate) fn phase(&self) -> Phase {
@@ -238,11 +309,22 @@ impl Message {
     }
 
     /// Validation and representation repair happen before replacing any input.
+    #[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
     pub(crate) fn apply(
         &mut self,
         output: ScriptOutput,
         output_body: BudgetedBytes,
         mode: BodyMode,
+    ) -> io::Result<Outcome> {
+        self.apply_checked(output, output_body, mode, |_, _| true)
+    }
+
+    fn apply_checked(
+        &mut self,
+        output: ScriptOutput,
+        output_body: BudgetedBytes,
+        mode: BodyMode,
+        allows_upstream: impl FnOnce(&Url, &Url) -> bool,
     ) -> io::Result<Outcome> {
         match output {
             ScriptOutput::Pass {} => {
@@ -277,6 +359,11 @@ impl Message {
                     return Err(invalid());
                 }
                 let next_url = url.as_deref().map(rules::checked_url).transpose()?;
+                if let Some(url) = &next_url
+                    && !allows_upstream(&self.request.url, url)
+                {
+                    return Err(invalid());
+                }
                 let origin_changed = next_url
                     .as_ref()
                     .is_some_and(|url| !same_origin(&self.request.url, url));
@@ -691,6 +778,15 @@ impl CallBuffers {
     }
 }
 
+fn script_metadata(message: &Message, script: &CompiledScript) -> io::Result<Value> {
+    let mut metadata = message.metadata(script.body)?;
+    if !script.parameters.is_empty() {
+        metadata["parameters"] =
+            serde_json::to_value(script.parameters.as_ref()).map_err(|_| invalid())?;
+    }
+    Ok(metadata)
+}
+
 pub(crate) async fn run(
     policy: &Policy,
     original: &Url,
@@ -703,6 +799,28 @@ pub(crate) async fn run(
         message,
         cancellation,
         Instant::now() + Duration::from_secs(1),
+    )
+    .await
+}
+
+type ScriptObserver<'a> =
+    dyn FnMut(&CompiledScript, &'static str, Option<&'static str>) + Send + 'a;
+
+#[cfg(feature = "invoke")]
+pub(crate) async fn run_observed(
+    policy: &Policy,
+    message: &mut Message,
+    cancellation: &CancellationToken,
+    observe: &mut ScriptObserver<'_>,
+) -> io::Result<Outcome> {
+    let original = message.original.url.clone();
+    run_until_observed(
+        policy,
+        &original,
+        message,
+        cancellation,
+        Instant::now() + Duration::from_secs(1),
+        Some(observe),
     )
     .await
 }
@@ -742,6 +860,22 @@ async fn run_until(
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> io::Result<Outcome> {
+    run_until_observed(policy, original, message, cancellation, deadline, None).await
+}
+
+async fn run_until_observed(
+    policy: &Policy,
+    original: &Url,
+    message: &mut Message,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    mut observe: Option<&mut ScriptObserver<'_>>,
+) -> io::Result<Outcome> {
+    let mut record = |script: &CompiledScript, outcome, reason| {
+        if let Some(observe) = &mut observe {
+            observe(script, outcome, reason);
+        }
+    };
     if &message.original.url != original {
         return Err(invalid());
     }
@@ -750,8 +884,11 @@ async fn run_until(
     for script in policy
         .scripts()
         .iter()
-        .filter(|script| script.phase == phase && script.matches(original))
+        .filter(|script| script.phase == phase)
     {
+        if !script.matches(message.selection()) {
+            continue;
+        }
         check_stage(cancellation, deadline)?;
         super::diagnostics::increment(super::diagnostics::Counter::ScriptMatched);
         if message.phase() == Phase::Request
@@ -759,6 +896,7 @@ async fn run_until(
             && script.body != BodyMode::None
         {
             super::diagnostics::increment(super::diagnostics::Counter::SkipAsteriskBody);
+            record(script, "skipped", Some("asterisk-body"));
             tracing::debug!(target: "vole::http_processing::script", script = %script.name, phase = ?phase, reason = "asterisk-body", "HTTP script skipped");
             continue;
         }
@@ -767,6 +905,7 @@ async fn run_until(
         } else {
             let Some(bytes) = message.body.as_ref().and_then(Entity::logical) else {
                 super::diagnostics::increment(super::diagnostics::Counter::SkipBodyUnavailable);
+                record(script, "skipped", Some("body-unavailable"));
                 tracing::debug!(target: "vole::http_processing::script", script = %script.name, phase = ?phase, reason = "body-unavailable", "HTTP script skipped");
                 continue;
             };
@@ -779,13 +918,25 @@ async fn run_until(
             });
             if script.body == BodyMode::Text && !text_readable {
                 super::diagnostics::increment(super::diagnostics::Counter::SkipTextUnavailable);
+                record(script, "skipped", Some("text-unavailable"));
                 tracing::debug!(target: "vole::http_processing::script", script = %script.name, phase = ?phase, reason = "text-unavailable", "HTTP script skipped");
                 continue;
             }
             Some(bytes)
         };
-        let Ok(metadata) = message.metadata(script.body) else {
+        let parameter_work = script.parameter_work_bytes();
+        let _parameters_owner = if parameter_work == 0 {
+            None
+        } else if let Some(owner) = policy.body_budget().reserve(parameter_work) {
+            Some(owner)
+        } else {
+            super::diagnostics::increment(super::diagnostics::Counter::SkipCallBuffers);
+            record(script, "skipped", Some("body-budget"));
+            continue;
+        };
+        let Ok(metadata) = script_metadata(message, script) else {
             super::diagnostics::increment(super::diagnostics::Counter::SkipInputUnrepresentable);
+            record(script, "skipped", Some("input-unrepresentable"));
             tracing::debug!(target: "vole::http_processing::script", script = %script.name, phase = ?phase, reason = "input-unrepresentable", "HTTP script skipped");
             continue;
         };
@@ -811,7 +962,13 @@ async fn run_until(
                                         super::diagnostics::Counter::PlanOutputQueueFailed,
                                     );
                                     check_stage(cancellation, deadline)?;
-                                    report_backend_error(error, &script.name, phase)?;
+                                    let failure = report_backend_error(error, &script.name, phase);
+                                    if failure.is_err() {
+                                        record(script, "failed", Some("backend-fatal"));
+                                    } else {
+                                        record(script, "rolled-back", Some("invocation-timeout"));
+                                    }
+                                    failure?;
                                     continue;
                                 }
                             };
@@ -832,6 +989,7 @@ async fn run_until(
                 super::diagnostics::increment(super::diagnostics::Counter::PlanBuffersRejected);
             }
             super::diagnostics::increment(super::diagnostics::Counter::SkipCallBuffers);
+            record(script, "skipped", Some("body-budget"));
             tracing::debug!(target: "vole::http_processing::script", script = %script.name, phase = ?phase, reason = "body-budget", "HTTP script skipped");
             continue;
         };
@@ -886,24 +1044,57 @@ async fn run_until(
         let metadata = match result {
             Ok(metadata) => metadata,
             Err(error) => {
-                report_backend_error(error, &script.name, phase)?;
+                let reason = if error.kind() == io::ErrorKind::TimedOut {
+                    "invocation-timeout"
+                } else {
+                    "execution-error"
+                };
+                let failure = report_backend_error(error, &script.name, phase);
+                if failure.is_err() {
+                    record(script, "failed", Some("backend-fatal"));
+                } else {
+                    record(script, "rolled-back", Some(reason));
+                }
+                failure?;
                 continue;
             }
         };
+        let mut accepted = "accepted";
         let result = serde_json::from_value::<ScriptOutput>(metadata)
             .map_err(|_| invalid())
-            .and_then(|output| message.apply(output, buffers.output, script.body));
+            .and_then(|output| {
+                if matches!(&output, ScriptOutput::Pass {}) {
+                    accepted = "passed";
+                }
+                message.apply_checked(
+                    output,
+                    buffers.output,
+                    script.body,
+                    |previous, candidate| script.allows_upstream(previous, candidate),
+                )
+            });
         check_stage(cancellation, deadline)?;
         match result {
             Ok(Outcome::Forward) => {
                 super::diagnostics::increment(super::diagnostics::Counter::OutputAccepted);
+                record(script, accepted, None);
             }
             Ok(terminal) => {
                 super::diagnostics::increment(super::diagnostics::Counter::OutputTerminal);
+                record(
+                    script,
+                    if matches!(&terminal, Outcome::Abort) {
+                        "abort"
+                    } else {
+                        "respond"
+                    },
+                    None,
+                );
                 return Ok(terminal);
             }
             Err(error) => {
                 super::diagnostics::increment(super::diagnostics::Counter::OutputRejected);
+                record(script, "rolled-back", Some("invalid-result"));
                 tracing::warn!(target: "vole::http_processing::script", script = %script.name, phase = ?phase, error_kind = ?error.kind(), error = %error, "HTTP script result rejected")
             }
         }
@@ -915,6 +1106,57 @@ async fn run_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_local_reply_keeps_queued_bytes_charged_and_omits_head_entities() {
+        let budget = Budget::default();
+        let response = StaticResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "text/plain".into())],
+            body: Bytes::from_static(b"local"),
+        };
+        let head = LocalResponse::from_static(&response, true, false, &budget);
+        assert_eq!(head.status, 200);
+        assert_eq!(head.headers, response.headers);
+        assert!(head.body.is_empty());
+        assert_eq!(budget.used(), 0);
+        for (status, fields) in [
+            (204, vec![]),
+            (205, vec![("content-length".to_owned(), "0".to_owned())]),
+            (304, vec![]),
+        ] {
+            let configured = StaticResponse {
+                status,
+                headers: vec![],
+                body: Bytes::new(),
+            };
+            let reply = LocalResponse::from_static(&configured, false, false, &budget);
+            assert_eq!(reply.status, status);
+            assert_eq!(reply.headers, fields);
+            assert!(reply.body.is_empty());
+        }
+        let rejected = LocalResponse::from_static(&response, false, false, &budget);
+        assert_eq!(rejected.status, 406);
+        assert!(rejected.body.is_empty());
+
+        let reply = LocalResponse::from_static(&response, false, true, &budget);
+        let chunk = reply.body.slice(1..);
+        assert_eq!(budget.used(), 5);
+        drop(reply);
+        assert_eq!(budget.used(), 5);
+        assert_eq!(chunk.as_ref(), b"ocal");
+        drop(chunk);
+        assert_eq!(budget.used(), 0);
+
+        let full = budget
+            .reserve(super::super::body_budget::WORKSPACE)
+            .unwrap();
+        let unavailable = LocalResponse::from_static(&response, false, true, &budget);
+        assert_eq!(unavailable.status, 503);
+        assert!(unavailable.body.is_empty());
+        drop(full);
+        assert_eq!(budget.used(), 0);
+    }
 
     fn request(budget: &Budget) -> Message {
         let url = Url::parse("https://a.example/path").unwrap();
@@ -1401,21 +1643,21 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[tokio::test(flavor = "current_thread")]
     async fn bounded_output_arena_production_run_rolls_back_one_call_and_runs_the_next() {
-        let policy=Policy::compile(r#"http-scripts:
-  enabled: true
-  scripts:
-    - name: reject-protected-header
-      phase: request
-      match: exact
-      url: https://a.example/path
-      body: text
-      source: 'function rewrite(input){return {type:"modify",headers:[{op:"set",name:"host",values:["invalid.example"]}],body:{kind:"text",data:"bad"}};}'
-    - name: accepted-after-rollback
-      phase: request
-      match: exact
-      url: https://a.example/path
-      body: text
-      source: 'function rewrite(input){return {type:"modify",headers:[{op:"add",name:"x-bridge",values:["done"]}],body:{kind:"text",data:input.body.data.replaceAll("i","I")}};}'
+        let policy=Policy::compile(r#"targets:
+  - origins: [https://a.example]
+    rules:
+      - name: reject-protected-header
+        match: {path-exact: /path}
+        request:
+          js:
+            body: text
+            source: 'function rewrite(input){return {type:"modify",headers:[{op:"set",name:"host",values:["invalid.example"]}],body:{kind:"text",data:"bad"}};}'
+      - name: accepted-after-rollback
+        match: {path-exact: /path}
+        request:
+          js:
+            body: text
+            source: 'function rewrite(input){return {type:"modify",headers:[{op:"add",name:"x-bridge",values:["done"]}],body:{kind:"text",data:input.body.data.replaceAll("i","I")}};}'
 "#).unwrap();
         let budget = policy.body_budget();
         let mut message = request(budget);
@@ -1538,14 +1780,14 @@ mod tests {
     #[tokio::test]
     async fn expired_stage_never_enters_backend_or_accepts_a_terminal_result() {
         let policy = Policy::compile(
-            r#"http-scripts:
-  enabled: true
-  scripts:
-    - name: must-not-execute
-      phase: request
-      url: https://a.example/path
-      match: exact
-      source: 'function rewrite(input) { return {type:"abort"}; }'
+            r#"targets:
+  - origins: [https://a.example]
+    rules:
+      - name: must-not-execute
+        match: {path-exact: /path}
+        request:
+          js:
+            source: 'function rewrite(input) { return {type:"abort"}; }'
 "#,
         )
         .unwrap();

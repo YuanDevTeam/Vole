@@ -7,8 +7,6 @@ pub(crate) mod cache;
 pub(crate) mod config_apply;
 pub(crate) mod control;
 pub(crate) mod http;
-#[cfg(any(feature = "invoke", test))]
-pub(crate) mod http_control;
 pub(crate) mod paths;
 pub(crate) mod probe;
 pub(crate) mod profile;

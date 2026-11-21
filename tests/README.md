@@ -29,14 +29,12 @@ cargo test --locked --features cli,interop-test --lib config::tests::
 cargo test --locked --lib geodata::tests::
 cargo test --locked --features cli --lib routing::proxy_group::tests::
 cargo test --locked --features cli --lib dns::runtime::tests::stale_refresh_
-cargo test --locked --features cli --lib runtime::providers::apply::http_tests::
-cargo test --locked --features cli --lib resource::http_control::tests::
 cargo test --locked --features cli --lib invoke::foreground::tests::
 cargo test --locked --features cli --lib invoke::tests::envelope_and_payload_are_strict -- --exact
 cargo test --locked --features cli --bin vole cli::tests::
 ```
 
-覆盖配置准入、GeoData、选择与缓存、HTTP 在线候选、资源回收和 Invoke 边界。全量 `invoke::tests::` 含监听用例，宿主执行应使用明确的过滤器。集成范围见[配置与资源](../docs/http-processing.md#配置与资源)及 [Invoke API](../docs/invoke-api.md)。
+覆盖配置准入、GeoData、选择与缓存、资源回收和 Invoke 边界。全量 `invoke::tests::` 含监听用例，宿主执行应使用明确的过滤器。集成范围见[配置与资源](../docs/http-processing.md#配置与资源)及 [Invoke API](../docs/invoke-api.md)。
 
 ### 协议与传输
 
@@ -68,17 +66,22 @@ cargo test --locked --manifest-path crates/vole-netstack/Cargo.toml mapped_rx_
 
 ```sh
 cargo test --locked --features invoke --lib http_processing::config::document::selector_sharing_tests::
+cargo test --locked --features invoke --lib http_processing::config::tests::
 cargo test --locked --features invoke --lib http_processing::script_config::tests::
 cargo test --locked --features invoke --lib http_processing::script_message::tests::
 cargo test --locked --features invoke --lib http_processing::tests::ingress_memory_tests::
+cargo test --locked --features invoke --lib http_processing::h1_boundary_tests::
+cargo test --locked --features invoke --lib http_processing::h2_tests:: -- --test-threads=1
 cargo test --locked --features invoke --lib http_processing::h2_frame_validation::
 cargo test --locked --features invoke --lib shared_collector
 cargo test --locked --features invoke --lib outbound::connector::http_reuse_memory_tests::
 cargo test --locked --features invoke --lib invoke::http::tests::
+cargo test --locked --features invoke --lib invoke::http::evaluation::tests::
+cargo test --locked --features invoke --lib invoke::tests::p0_managed_plugin_validation
 cargo test --locked --features invoke,http-diagnostics --lib invoke::tests::http_diagnostics_
 ```
 
-该组覆盖规则与脚本静态校验、共享入口与原始 URL、内存 H2 帧、正文的收集和回放、静态复用资格、私密输入与只读诊断。macOS 的真实脚本后端测试串行运行，避免独立用例争用进程内的单个执行许可：
+该组覆盖规则与脚本静态校验、共享入口与原始 URL、内存 H1/H2 回包和分阶段匹配、正文的收集和回放、静态复用资格、私密输入与只读诊断。macOS 的真实脚本后端测试串行运行，避免独立用例争用进程内的单个执行许可：
 
 ```sh
 cargo test --locked --features invoke --lib http_processing::tests::script_h1_tests:: -- --test-threads=1

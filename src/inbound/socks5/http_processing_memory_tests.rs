@@ -4,7 +4,11 @@ use super::Socks5Handler;
 use crate::{
     config::{ProxyAccess, ProxyCredentials, Socks5InboundConfig},
     dispatch::{BoxStream, DatagramTransport, DispatchError, Dispatcher},
-    http_processing::{HttpContext, Policy, config::Document, private_context::test_material},
+    http_processing::{
+        HttpContext, Policy,
+        config::{Document, HttpSettings},
+        private_context::test_material,
+    },
     inbound::http::{framing, parser},
     security::SecurityContext,
     session::{DatagramSession, Destination, InboundKind, StreamSession},
@@ -29,14 +33,19 @@ use tokio_util::sync::CancellationToken;
 const WAIT: Duration = Duration::from_secs(5);
 const REQUEST: &[u8] = b"POST /path HTTP/1.1\r\nHost: target.test\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nold";
 const NATIVE: &str = r#"
-http-ports: [80]
-rewrite:
-  enabled: true
-  rules:
-  - {url: '.', action: request-header-set, header: X-Request-Native, value: yes}
-  - {url: '.', action: request-body-set, value: native-request}
-  - {url: '.', action: response-header-set, header: X-Response-Native, value: yes}
-  - {url: '.', action: response-body-set, value: native-response}
+targets:
+  - origins: [http://target.test]
+    rules:
+      - request:
+          headers:
+            - {set: {X-Request-Native: yes}}
+          body:
+            - {set: native-request}
+        response:
+          headers:
+            - {set: {X-Response-Native: yes}}
+          body:
+            - {set: native-response}
 "#;
 
 #[derive(Clone)]
@@ -386,9 +395,7 @@ async fn socks_http_transparent_boundaries_preserve_bytes_and_fixed_context() {
     for (yaml, port, candidate) in [
         (None, 80, false),
         (
-            Some(
-                "http-ports: [80]\nrewrite: {enabled: false, rules: [{url: '.', action: response-body-set, value: changed}]}\n",
-            ),
+            Some("targets: [{origins: ['https://target.test'], intercept-only: true}]"),
             80,
             false,
         ),
@@ -512,12 +519,27 @@ async fn socks_https_mitm_allowed_and_excluded_use_real_tls_and_correct_identity
         .unwrap();
         server.alpn_protocols = vec![b"http/1.1".to_vec()];
         let origin = Origin::new(PeerMode::Tls(Arc::new(server)));
-        let yaml = "mitm:\n  enabled: true\n  ports: [443]\n  domains: [{pattern: allowed.test}, {pattern: excluded.test}]\n  exclude-domains: [{pattern: excluded.test}]\nrewrite:\n  enabled: true\n  rules:\n  - {url: '.', action: response-header-set, header: X-Mitm, value: yes}\n  - {url: '.', action: response-body-set, value: decrypted}\n";
+        let yaml = r#"targets:
+  - origins: [https://allowed.test, https://excluded.test]
+    rules:
+      - response:
+          headers:
+            - {set: {X-Mitm: yes}}
+          body:
+            - {set: decrypted}
+"#;
         let policy = Document::parse(yaml)
             .unwrap()
-            .compile(&Default::default())
+            .compile()
             .unwrap()
-            .bind_ca(Some(&material))
+            .bind_settings(
+                &HttpSettings {
+                    mitm_enabled: true,
+                    exclude_domains: vec!["excluded.test".into()],
+                    ..Default::default()
+                },
+                Some(&material),
+            )
             .unwrap();
         let mut upstream_roots = rustls::RootCertStore::empty();
         upstream_roots.add(origin_certificate.clone()).unwrap();
@@ -610,7 +632,15 @@ async fn socks_https_mitm_allowed_and_excluded_use_real_tls_and_correct_identity
 #[tokio::test]
 async fn socks_http_jsc_request_and_response_follow_native_stages() {
     let yaml = format!(
-        "{NATIVE}\nhttp-scripts:\n  enabled: true\n  scripts:\n  - name: request\n    phase: request\n    url: '.'\n    body: text\n    source: 'function rewrite(input) {{return {{type: \"modify\", body: {{kind: \"text\", data: input.body.data + \":js\"}}}};}}'\n  - name: response\n    phase: response\n    url: '.'\n    body: text\n    source: 'function rewrite(input) {{return {{type: \"modify\", body: {{kind: \"text\", data: input.body.data + \":js\"}}}};}}'\n"
+        r#"{NATIVE}      - request:
+          js:
+            body: text
+            source: 'function rewrite(input) {{return {{type: "modify", body: {{kind: "text", data: input.body.data + ":js"}}}};}}'
+        response:
+          js:
+            body: text
+            source: 'function rewrite(input) {{return {{type: "modify", body: {{kind: "text", data: input.body.data + ":js"}}}};}}'
+"#
     );
     let origin = Origin::new(PeerMode::Http);
     let mut fixture = Fixture::new(Some(context(&yaml, origin.clone())), origin.clone(), false);
@@ -637,14 +667,13 @@ async fn socks_http_jsc_request_and_response_follow_native_stages() {
 #[tokio::test]
 async fn socks_http_jsc_local_response_never_opens_upstream() {
     let origin = Origin::new(PeerMode::Http);
-    let yaml = r#"http-ports: [80]
-http-scripts:
-  enabled: true
-  scripts:
-  - name: local
-    phase: request
-    url: '.'
-    source: 'function rewrite(input) {return {type:"respond",status:201,body:{kind:"text",data:"local-jsc"}};}'
+    let yaml = r#"targets:
+  - origins: [http://target.test]
+    rules:
+      - name: local
+        request:
+          js:
+            source: 'function rewrite(input) {return {type:"respond",status:201,body:{kind:"text",data:"local-jsc"}};}'
 "#;
     let mut fixture = Fixture::new(Some(context(yaml, origin.clone())), origin.clone(), false);
     let exchange = timeout(WAIT, async {

@@ -1,5 +1,8 @@
 //! URL actions reuse the existing streaming HTTP/1 framing and body relay.
-use super::{HttpContext, Intercept, Scheme, config::checked_url, io::Replay, request::Decision};
+use super::{
+    HttpContext, Intercept, Scheme, config::checked_url, io::Replay, request::Decision,
+    rules::HeaderView,
+};
 use crate::{
     inbound::http::{
         HttpServerConfig, RequestHead,
@@ -144,9 +147,26 @@ impl HttpContext {
         }
         let base_session = session.clone();
         let asterisk = request.method == "OPTIONS" && request.target == "*";
-        let decision = match self.plan(original, session, scheme, !asterisk) {
+        let method = request.method.parse().map_err(|_| invalid())?;
+        let request_conditions = self
+            .policy()
+            .request_conditions(HeaderView::Fields(&request.headers));
+        let upgrade = request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("connection")
+                && value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        });
+        let decision = match self.plan_selected(
+            original,
+            method,
+            session,
+            scheme,
+            (!asterisk, !upgrade),
+            request_conditions,
+        ) {
             Ok(decision) => decision,
-            Err(error) if error.kind() != io::ErrorKind::PermissionDenied => {
+            Err(_) => {
                 framing::write_timed(
                     writer,
                     b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
@@ -155,7 +175,6 @@ impl HttpContext {
                 .await?;
                 return Ok(false);
             }
-            Err(error) => return Err(error),
         };
         let mut target = match decision {
             Decision::Reject => {
@@ -178,6 +197,25 @@ impl HttpContext {
                 );
                 framing::write_timed(writer, head.as_bytes(), config.header_timeout).await?;
                 return Ok(false);
+            }
+            Decision::Respond(response) => {
+                // Check original framing even though the reply needs neither
+                // the request stream nor an upstream connection.
+                RequestPlan::for_target(
+                    request,
+                    base_session.destination,
+                    request.target.clone(),
+                    false,
+                )?;
+                let original_meta =
+                    super::body::OriginalRequestMeta::new(&request.method, &request.headers);
+                let local = super::script_message::LocalResponse::from_static(
+                    &response,
+                    original_meta.head,
+                    original_meta.identity_allowed,
+                    self.policy().body_budget(),
+                );
+                return write_local(writer, local, config.header_timeout).await;
             }
             Decision::Forward(target) => *target,
         };
@@ -210,7 +248,7 @@ impl HttpContext {
         }
         super::headers::apply(
             self.policy().rules(),
-            &target.original,
+            target.selection(),
             super::rules::Phase::Request,
             &mut outgoing.headers,
         );
@@ -221,7 +259,8 @@ impl HttpContext {
                 .policy()
                 .scripts()
                 .iter()
-                .any(|s| s.matches(&original_url));
+                // A response predicate is not known until the final head.
+                .any(|s| s.matches(target.response_selection(u64::MAX)));
         if active_scripts {
             use super::{
                 body::{Transaction, WireBodyMeta},
@@ -231,7 +270,7 @@ impl HttpContext {
             let wants_body = self.policy().scripts().iter().any(|s| {
                 s.phase == super::rules::Phase::Request
                     && s.body != BodyMode::None
-                    && s.matches(&original_url)
+                    && s.matches(target.selection())
             });
             let length = match plan.body {
                 framing::Body::Empty => Some(0),
@@ -249,7 +288,7 @@ impl HttpContext {
             let transaction = Transaction::begin_shared(
                 self.policy().body_budget(),
                 self.policy().rules(),
-                &original_url,
+                target.selection(),
                 super::rules::Phase::Request,
                 &wire,
                 wants_body && !asterisk,
@@ -305,7 +344,8 @@ impl HttpContext {
                 entity,
                 &request.headers,
                 target.strip_origin_credentials,
-            );
+            )
+            .with_conditions(request_conditions, 0);
             let outcome =
                 match script_message::run(self.policy(), &original_url, &mut message, cancellation)
                     .await
@@ -347,9 +387,11 @@ impl HttpContext {
             outgoing.headers = message.request.headers.clone();
             target = self.final_target(
                 original_url.clone(),
+                target.original_method.clone(),
                 message.request.url.clone(),
                 base_session,
                 scheme,
+                request_conditions,
             )?;
             let mut final_origin = if asterisk {
                 "*".to_owned()
@@ -383,6 +425,7 @@ impl HttpContext {
             policy: self.policy(),
             original: &original_url,
             request,
+            request_conditions,
             meta: original_meta,
             continued: std::sync::atomic::AtomicBool::new(continued),
             prepared: std::sync::Mutex::new(prepared_upload),

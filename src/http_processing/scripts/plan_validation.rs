@@ -1241,7 +1241,7 @@ async fn production_case(
 ) -> io::Result<Value> {
     let source = "function rewrite(input){const payload=input.body.data.replaceAll('-', '_');return {headers:[{op:'set',name:'X-Proof',values:['ok']}],type:'modify',body:{kind:'text',data:payload}};}";
     let policy = Policy::compile(&format!(
-        "http-scripts:\n  enabled: true\n  scripts:\n    - name: diagnostic-transaction\n      phase: request\n      match: exact\n      url: https://fixture.invalid/original\n      body: text\n      source: {}\n",
+        "targets:\n  - origins: [https://fixture.invalid]\n    rules:\n      - name: diagnostic-transaction\n        match: {{path-exact: /original}}\n        request:\n          js:\n            body: text\n            source: {}\n",
         serde_json::to_string(source).map_err(io::Error::other)?
     ))?;
     let budget = policy.body_budget().clone();
@@ -1436,7 +1436,7 @@ async fn production_guard_case(early: &str, found: bool) -> io::Result<Value> {
         "return {headers:[{op:'set',name:'X-Proof',values:['ok']}],type:'modify',body:",
     );
     let policy = Policy::compile(&format!(
-        "http-scripts:\n  enabled: true\n  scripts:\n    - name: diagnostic-guard-transaction\n      phase: request\n      match: exact\n      url: https://fixture.invalid/original\n      body: text\n      source: {}\n",
+        "targets:\n  - origins: [https://fixture.invalid]\n    rules:\n      - name: diagnostic-guard-transaction\n        match: {{path-exact: /original}}\n        request:\n          js:\n            body: text\n            source: {}\n",
         serde_json::to_string(&source).map_err(io::Error::other)?
     ))?;
     let budget = policy.body_budget().clone();
@@ -2106,7 +2106,7 @@ async fn plan_admission_case(id: &'static str, mode: PlanAdmissionProbe) -> io::
     const LENGTH: usize = 65536;
     let source = "function rewrite(input){const payload=input.body.data.replaceAll('-', '_');return {headers:[{op:'set',name:'X-Proof',values:['ok']}],type:'modify',body:{kind:'text',data:payload}};}";
     let policy = Policy::compile(&format!(
-        "http-scripts:\n  enabled: true\n  scripts:\n    - name: diagnostic-admission\n      phase: request\n      match: exact\n      url: https://fixture.invalid/original\n      body: text\n      source: {}\n",
+        "targets:\n  - origins: [https://fixture.invalid]\n    rules:\n      - name: diagnostic-admission\n        match: {{path-exact: /original}}\n        request:\n          js:\n            body: text\n            source: {}\n",
         serde_json::to_string(source).map_err(io::Error::other)?
     ))?;
     let budget = policy.body_budget().clone();

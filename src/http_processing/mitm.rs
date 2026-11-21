@@ -1,54 +1,6 @@
 //! Selective business TLS termination. Trust installation belongs to the host.
-use serde::{Deserialize, Deserializer, Serialize};
+use super::origin::{Origin, dns_name, is_subdomain};
 use std::{collections::BTreeSet, io};
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub(crate) struct RawMitm {
-    #[serde(default)]
-    pub(crate) enabled: bool,
-    #[serde(default, deserialize_with = "non_null_vec")]
-    pub(crate) domains: Vec<RawDomain>,
-    #[serde(default, deserialize_with = "non_null_vec")]
-    pub(crate) exclude_domains: Vec<RawDomain>,
-    #[serde(default = "default_ports", deserialize_with = "non_null_vec")]
-    pub(crate) ports: Vec<u16>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub(crate) struct RawDomain {
-    pub(crate) pattern: String,
-    #[serde(default = "enabled")]
-    pub(crate) enabled: bool,
-}
-
-fn enabled() -> bool {
-    true
-}
-
-fn non_null_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<Vec<T>>::deserialize(deserializer)?
-        .ok_or_else(|| serde::de::Error::custom("MITM sequence must not be null"))
-}
-fn default_ports() -> Vec<u16> {
-    vec![443]
-}
-
-impl Default for RawMitm {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            domains: Vec::new(),
-            exclude_domains: Vec::new(),
-            ports: default_ports(),
-        }
-    }
-}
 
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "invalid selective TLS policy")
@@ -65,13 +17,7 @@ impl Pattern {
         if raw.contains('*') || raw.len() > 253 || raw.parse::<std::net::IpAddr>().is_ok() {
             return Err(invalid());
         }
-        let name = crate::routing::normalize_domain_name(raw).map_err(|_| invalid())?;
-        if !matches!(
-            rustls::pki_types::ServerName::try_from(name.as_str()),
-            Ok(rustls::pki_types::ServerName::DnsName(_))
-        ) {
-            return Err(invalid());
-        }
+        let name = dns_name(raw)?;
         Ok(Self {
             name: name.into(),
             suffix,
@@ -80,51 +26,59 @@ impl Pattern {
 
     fn matches(&self, name: &str) -> bool {
         if self.suffix {
-            name.strip_suffix(self.name.as_ref())
-                .is_some_and(|prefix| prefix.len() > 1 && prefix.ends_with('.'))
+            is_subdomain(name, &self.name)
         } else {
             name == self.name.as_ref()
         }
     }
 }
 
-fn patterns(raw: &[RawDomain]) -> io::Result<Box<[Pattern]>> {
-    let mut seen = BTreeSet::new();
-    let mut output = Vec::with_capacity(raw.len());
-    for entry in raw {
-        let pattern = Pattern::compile(&entry.pattern)?;
-        if !seen.insert((pattern.name.clone(), pattern.suffix)) {
+pub(super) struct Patterns(Box<[Pattern]>);
+
+impl Patterns {
+    pub(super) fn compile(raw: &[String]) -> io::Result<Self> {
+        if raw.len() > 64 {
             return Err(invalid());
         }
-        if entry.enabled {
+        let mut seen = BTreeSet::new();
+        let mut output = Vec::with_capacity(raw.len());
+        for entry in raw {
+            let pattern = Pattern::compile(entry)?;
+            if !seen.insert((pattern.name.clone(), pattern.suffix)) {
+                return Err(invalid());
+            }
             output.push(pattern);
         }
+        Ok(Self(output.into()))
     }
-    Ok(output.into())
-}
 
-impl RawMitm {
-    pub(crate) fn validate_static(&self) -> io::Result<()> {
-        if self.domains.len() > 64
-            || self.exclude_domains.len() > 64
-            || self.ports.len() > 64
-            || self.ports.contains(&0)
-        {
-            return Err(invalid());
+    pub(super) fn matches(&self, host: &str) -> bool {
+        self.0.iter().any(|pattern| pattern.matches(host))
+    }
+
+    pub(super) fn covers(&self, origin: &Origin) -> bool {
+        if origin.is_wildcard() {
+            self.0.iter().any(|pattern| {
+                pattern.suffix
+                    && (pattern.name.as_ref() == origin.host() || pattern.matches(origin.host()))
+            })
+        } else {
+            self.matches(origin.host())
         }
-        let domains = patterns(&self.domains)?;
-        patterns(&self.exclude_domains)?;
-        if self.enabled && (domains.is_empty() || self.ports.is_empty()) {
-            return Err(invalid());
-        }
-        Ok(())
+    }
+
+    pub(super) fn excludes_url(&self, url: &url::Url) -> bool {
+        url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| self.matches(host.strip_suffix('.').unwrap_or(host)))
     }
 }
 
 #[cfg(feature = "inbound-http")]
 mod enabled {
     use super::super::{HttpContext, Intercept, Scheme, authority::Authority, io::Replay};
-    use super::{Pattern, RawMitm, invalid, patterns};
+    use super::{Origin, Patterns, dns_name, invalid};
     use crate::{
         http_processing::private_context::CaMaterial,
         session::StreamSession,
@@ -136,55 +90,53 @@ mod enabled {
     use url::Url;
 
     pub(in crate::http_processing) struct Mitm {
-        domains: Box<[Pattern]>,
-        exclusions: Box<[Pattern]>,
-        ports: Box<[u16]>,
+        origins: Box<[Origin]>,
+        exclusions: Arc<Patterns>,
         authority: Arc<Authority>,
     }
     impl Mitm {
         pub(in crate::http_processing) fn compile(
-            raw: RawMitm,
+            origins: impl Iterator<Item = Origin>,
+            exclusions: Arc<Patterns>,
             ca: Option<&CaMaterial>,
         ) -> io::Result<Option<Arc<Self>>> {
-            raw.validate_static()?;
-            if !raw.enabled {
+            let origins: Box<[_]> = origins.collect();
+            if origins.is_empty() {
                 return Ok(None);
             }
-            let domains = patterns(&raw.domains)?;
-            let exclusions = patterns(&raw.exclude_domains)?;
             let ca = ca.ok_or_else(invalid)?;
             ca.validate_size()?;
             let authority = Authority::load(&ca.certificate, &ca.private_key)?;
-            let mut ports = raw.ports;
-            ports.sort_unstable();
-            ports.dedup();
             Ok(Some(Arc::new(Self {
-                domains,
+                origins,
                 exclusions,
-                ports: ports.into(),
                 authority,
             })))
         }
+
         pub(in crate::http_processing) fn identity(&self) -> [u8; 32] {
             self.authority.identity()
         }
+
         pub(in crate::http_processing) fn candidate_port(&self, port: u16) -> bool {
-            self.ports.binary_search(&port).is_ok()
+            self.origins.iter().any(|origin| origin.port() == port)
         }
+
         pub(in crate::http_processing) fn permits(&self, name: &str, port: u16) -> bool {
-            let Ok(name) = crate::routing::normalize_domain_name(name) else {
+            let Ok(name) = dns_name(name) else {
                 return false;
             };
-            self.candidate_port(port)
-                && !self.exclusions.iter().any(|p| p.matches(&name))
-                && self.domains.iter().any(|p| p.matches(&name))
+            !self.exclusions.matches(&name)
+                && self
+                    .origins
+                    .iter()
+                    .any(|origin| origin.port() == port && origin.matches_host(&name))
         }
-        pub(in crate::http_processing) fn permits_url(&self, url: &Url) -> bool {
-            url.scheme() == "https"
-                && url
-                    .host_str()
-                    .zip(url.port_or_known_default())
-                    .is_some_and(|(host, port)| self.permits(host, port))
+
+        pub(super) fn permits_url(&self, url: &Url, destination_port: u16) -> bool {
+            !self.exclusions.excludes_url(url)
+                && url.port_or_known_default() == Some(destination_port)
+                && self.origins.iter().any(|origin| origin.matches_url(url))
         }
     }
     impl HttpContext {
@@ -256,10 +208,14 @@ mod enabled {
             tokio::select! {biased;()=cancellation.cancelled()=>{},result=operation=>result?}
             Ok(Intercept::Handled)
         }
-        pub(in crate::http_processing) fn permits_https(&self, url: &Url) -> bool {
+        pub(in crate::http_processing) fn permits_https(
+            &self,
+            url: &Url,
+            destination_port: u16,
+        ) -> bool {
             self.policy()
                 .mitm()
-                .is_some_and(|policy| policy.permits_url(url))
+                .is_some_and(|policy| policy.permits_url(url, destination_port))
         }
     }
 }
@@ -268,79 +224,120 @@ pub(in crate::http_processing) use enabled::Mitm;
 
 #[cfg(all(test, feature = "inbound-http"))]
 mod tests {
-    use super::{Pattern, RawMitm};
+    use super::{Pattern, Patterns};
+    use crate::http_processing::{
+        config::{Document, HttpSettings},
+        private_context::test_material,
+    };
+
     #[test]
     fn selective_domains_do_not_accept_suffix_confusion_or_ip_literals() {
         let p = Pattern::compile("*.example.com").unwrap();
         assert!(p.matches("api.example.com"));
+        assert!(p.matches("a.b.example.com"));
         assert!(!p.matches("example.com"));
         assert!(!p.matches("notexample.com"));
         assert!(!p.matches("api.example.com.evil"));
         for name in ["*", "a*b.example", "127.0.0.1", "[::1]"] {
             assert!(Pattern::compile(name).is_err());
         }
-    }
-
-    #[test]
-    fn static_mitm_validation_needs_no_private_material() {
-        let input = r#"enabled: true
-domains:
-  - pattern: API.Example.COM.
-  - pattern: '*.example.net'
-exclude-domains:
-  - pattern: private.example.net
-"#;
-        let policy: RawMitm = serde_yaml_ng::from_str(input).unwrap();
-        policy.validate_static().unwrap();
-        for input in [
-            "domains: null",
-            "ports: null",
-            "exclude-domains: null",
-            "domains: [{pattern: example.com}, {pattern: EXAMPLE.COM., enabled: false}]",
-            "domains: [{pattern: '*.example.com'}, {pattern: '*.EXAMPLE.COM.'}]",
-            "domains: [{pattern: '*', enabled: false}]",
-            "enabled: true\ndomains: [{pattern: example.com, enabled: false}]",
-            "enabled: true\ndomains: [{pattern: example.com}]\nports: []",
-            "certificate: ignored\nprivate-key: ignored",
-        ] {
-            assert!(
-                serde_yaml_ng::from_str::<RawMitm>(input)
-                    .and_then(|raw| raw.validate_static().map_err(serde::de::Error::custom))
-                    .is_err(),
-                "{input}"
-            );
-        }
+        assert!(Patterns::compile(&["*.example.com".into(), "*.EXAMPLE.COM.".into()]).is_err());
     }
 
     #[test]
     fn runtime_mitm_binds_private_identity_and_keeps_existing_authority() {
-        use crate::http_processing::private_context::test_material;
-        let settings: RawMitm = serde_yaml_ng::from_str(
-            "enabled: true\ndomains: [{pattern: '*.example.com'}]\nexclude-domains: [{pattern: private.example.com}]",
+        let candidate = Document::parse(
+            "targets: [{origins: ['https://api.example.com'], intercept-only: true}]",
         )
+        .unwrap()
+        .compile()
         .unwrap();
-        assert!(super::enabled::Mitm::compile(settings.clone(), None).is_err());
+        let settings = HttpSettings {
+            mitm_enabled: true,
+            allow_intercept_only: true,
+            ..Default::default()
+        };
+        assert!(candidate.bind_settings(&settings, None).is_err());
         assert!(
-            super::enabled::Mitm::compile(RawMitm::default(), None)
+            candidate
+                .bind_settings(&HttpSettings::default(), None)
                 .unwrap()
+                .mitm()
                 .is_none()
         );
-        let first_material = test_material();
-        let first = super::enabled::Mitm::compile(settings.clone(), Some(&first_material))
-            .unwrap()
-            .unwrap();
+
+        let material = test_material();
+        let first = candidate.bind_settings(&settings, Some(&material)).unwrap();
+        let first = first.mitm().unwrap();
         let first_identity = first.identity();
-        assert_eq!(first_identity, first_material.identity().unwrap());
-        assert!(first.permits("api.example.com", 443));
+        assert_eq!(first_identity, material.identity().unwrap());
+        assert!(first.permits("API.example.com.", 443));
         assert!(!first.permits("example.com", 443));
-        assert!(!first.permits("private.example.com", 443));
         assert!(!first.permits("api.example.com", 8443));
-        drop(first_material);
-        let second = super::enabled::Mitm::compile(settings, Some(&test_material()))
-            .unwrap()
+
+        let second = candidate
+            .bind_settings(&settings, Some(&test_material()))
             .unwrap();
-        assert_ne!(first.identity(), second.identity());
+        assert_ne!(first.identity(), second.mitm().unwrap().identity());
         assert_eq!(first.identity(), first_identity);
-        assert!(first.permits("api.example.com", 443));
+
+        let excluded = HttpSettings {
+            exclude_domains: vec!["*.example.com".into()],
+            ..settings
+        };
+        assert!(!candidate.requires_ca(&excluded).unwrap());
+        assert!(
+            candidate
+                .bind_settings(&excluded, None)
+                .unwrap()
+                .mitm()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn partial_wildcard_exclusions_apply_at_handshake_and_original_authority() {
+        let candidate = Document::parse(
+            "targets: [{origins: ['https://*.cdn.example.com:8443'], intercept-only: true}]",
+        )
+        .unwrap()
+        .compile()
+        .unwrap();
+        let mut settings = HttpSettings {
+            mitm_enabled: true,
+            allow_intercept_only: true,
+            exclude_domains: vec![
+                "blocked.cdn.example.com".into(),
+                "*.private.cdn.example.com".into(),
+            ],
+            ..Default::default()
+        };
+        let policy = candidate
+            .bind_settings(&settings, Some(&test_material()))
+            .unwrap();
+        let mitm = policy.mitm().unwrap();
+        for (host, permitted) in [
+            ("open.cdn.example.com", true),
+            ("deep.open.cdn.example.com", true),
+            ("cdn.example.com", false),
+            ("blocked.cdn.example.com", false),
+            ("secret.private.cdn.example.com", false),
+            ("notcdn.example.com", false),
+        ] {
+            let url = url::Url::parse(&format!("https://{host}:8443/path")).unwrap();
+            assert_eq!(mitm.permits(host, 8443), permitted);
+            assert_eq!(mitm.permits_url(&url, 8443), permitted);
+            assert_eq!(policy.allows_target(&url), permitted);
+            assert!(!mitm.permits_url(&url, 443));
+        }
+        settings.exclude_domains = vec!["*.example.com".into()];
+        assert!(!candidate.requires_ca(&settings).unwrap());
+        assert!(
+            candidate
+                .bind_settings(&settings, None)
+                .unwrap()
+                .mitm()
+                .is_none()
+        );
     }
 }

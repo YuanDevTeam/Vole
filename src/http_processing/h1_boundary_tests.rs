@@ -185,13 +185,25 @@ fn session() -> StreamSession {
     }
 }
 fn context(origin: Arc<Origin>, body: bool) -> HttpContext {
+    let request_body = if body {
+        "          body:\n            - {set: changed}\n"
+    } else {
+        ""
+    };
     let input = format!(
-        "rewrite:\n  enabled: true\n  rules:\n  - {{url: '.', action: replace, replacement-mode: url, replacement: 'http://new.invalid/rewritten'}}\n  - {{url: '.', action: request-header-set, header: Authorization, value: 'Bearer explicit'}}\n  - {{url: '.', action: request-header-set, header: Cookie, value: 'new=explicit'}}\n  - {{url: '^http://old\\.invalid/', action: response-header-set, header: X-Stage, value: changed}}\n  - {{url: '^http://old\\.invalid/', action: response-header-remove, header: Server}}\n{}",
-        if body {
-            "  - {url: '.', action: request-body-set, value: changed}\n"
-        } else {
-            ""
-        }
+        r#"targets:
+  - origins: [http://old.invalid]
+    rules:
+      - request:
+          url: {{replace: http://new.invalid/rewritten}}
+          headers:
+            - {{set: {{Authorization: 'Bearer explicit'}}}}
+            - {{set: {{Cookie: 'new=explicit'}}}}
+{request_body}        response:
+          headers:
+            - {{set: {{X-Stage: changed}}}}
+            - {{remove: Server}}
+"#
     );
     HttpContext::new(
         Policy::compile(&input).unwrap(),
@@ -232,6 +244,120 @@ fn rewritten(head: &str, status: u16) {
     let lowercase = head.to_ascii_lowercase();
     assert!(lowercase.contains("x-stage: changed\r\n"));
     assert!(!lowercase.contains("server:"));
+}
+
+#[tokio::test]
+async fn h1_native_local_reply_ends_an_unread_upload() {
+    let origin = Arc::new(Origin::default());
+    let yaml = r#"
+targets:
+  - origins: [http://old.invalid]
+    rules:
+      - match:
+          method: POST
+          request-headers:
+            - {name: X-Mode, equals: mock}
+        request:
+          respond:
+            status: 201
+            headers:
+              - {name: set-cookie, value: a=1}
+              - {name: set-cookie, value: b=2}
+            body: {base64: AQAC}
+      - request:
+          url: {reject: true}
+      - response:
+          headers:
+            - {set: {X-Unreachable: yes}}
+"#;
+    let context = HttpContext::new(
+        Policy::compile(yaml).unwrap(),
+        origin.clone(),
+        SecurityContext::new(),
+    );
+    let (result, output) = exchange(
+        context,
+        b"POST / HTTP/1.1\r\nHost: old.invalid\r\nX-MODE: real\r\nX-Mode: mock\r\nContent-Length: 64\r\nExpect: 100-continue\r\n\r\n",
+    )
+    .await;
+    assert!(matches!(result.unwrap(), Intercept::Handled));
+    let split = output.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = std::str::from_utf8(&output[..split])
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 201"), "{head}");
+    assert!(head.contains("connection: close"), "{head}");
+    assert!(head.contains("content-length: 3"), "{head}");
+    assert!(
+        head.contains("set-cookie: a=1\r\nset-cookie: b=2"),
+        "{head}"
+    );
+    assert!(!head.contains("x-unreachable"), "{head}");
+    assert_eq!(&output[split + 4..], &[1, 0, 2]);
+    assert!(origin.tasks.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn h1_staged_conditions_match_original_headers_through_body_rewrite() {
+    let origin = Arc::new(Origin::default());
+    let yaml = r#"
+targets:
+  - origins: [http://old.invalid]
+    rules:
+      - request:
+          headers:
+            - {set: {X-Mode: edited}}
+        response:
+          headers:
+            - {set: {X-Stage: edited}}
+      - match:
+          request-headers:
+            - {name: X-MODE, equals: original}
+        request:
+          headers:
+            - {set: {X-Original-Request: '1'}}
+        response:
+          when:
+            status: 200
+            headers:
+              - {name: X-STAGE, equals: original}
+          body:
+            - {set: edited-body}
+      - match:
+          request-headers:
+            - {name: X-Mode, equals: edited}
+        request:
+          headers:
+            - {set: {X-False-Request: '1'}}
+      - response:
+          when:
+            headers:
+              - {name: X-Stage, equals: edited}
+          headers:
+            - {set: {X-False-Response: '1'}}
+"#;
+    let context = HttpContext::new(
+        Policy::compile(yaml).unwrap(),
+        origin.clone(),
+        SecurityContext::new(),
+    );
+    let (result, output) = exchange(
+        context,
+        b"GET / HTTP/1.1\r\nHost: old.invalid\r\nX-Mode: original\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(matches!(result.unwrap(), Intercept::Handled));
+    let response = String::from_utf8(output).unwrap().to_ascii_lowercase();
+    assert!(response.contains("x-stage: edited\r\n"), "{response}");
+    assert!(!response.contains("x-false-response"), "{response}");
+    assert!(response.ends_with("\r\n\r\nedited-body"), "{response}");
+    origin.join().await;
+    let request = String::from_utf8(origin.received.lock().unwrap().clone())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(request.contains("x-mode: edited\r\n"), "{request}");
+    assert!(request.contains("x-original-request: 1\r\n"), "{request}");
+    assert!(!request.contains("x-false-request"), "{request}");
 }
 
 #[tokio::test]

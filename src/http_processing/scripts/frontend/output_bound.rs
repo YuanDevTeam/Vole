@@ -554,7 +554,7 @@ mod tests {
         let prepared = super::super::compile_prepared(source).unwrap();
         assert_eq!(
             prepared.code,
-            r#"function rewrite(input){"use strict";__voleTick();let payload=__voleGet(__voleGet(input,"body"),"data");(payload=__voleCall(payload,"replaceAll",["q","z"]));return __voleValue({"type":"modify","body":__voleValue({"kind":"text","data":payload})});}"#
+            r#"function rewrite(input){"use strict";__voleTick();__voleFreezeParameters(input);let payload=__voleGet(__voleGet(input,"body"),"data");(payload=__voleCall(payload,"replaceAll",["q","z"]));return __voleValue({"type":"modify","body":__voleValue({"kind":"text","data":payload})});}"#
         );
         #[cfg(target_vendor = "apple")]
         assert!(
@@ -838,7 +838,7 @@ mod tests {
         let (code, _) = super::super::compile_with_output_bound(source).unwrap();
         assert_eq!(
             code,
-            r#"function rewrite(input){"use strict";__voleTick();return __voleValue({"type":"modify","body":__voleValue({"kind":"text","data":__voleGet(__voleGet(input,"body"),"data")})});}"#
+            r#"function rewrite(input){"use strict";__voleTick();__voleFreezeParameters(input);return __voleValue({"type":"modify","body":__voleValue({"kind":"text","data":__voleGet(__voleGet(input,"body"),"data")})});}"#
         );
     }
 

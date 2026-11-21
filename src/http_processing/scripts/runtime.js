@@ -3,6 +3,12 @@
 // functions/accessors or call anything outside its explicit method allowlist.
 const __voleLimit = 262144;
 let __voleAllocated = 0;
+function __voleFreezeParameters(input) {
+  const parameters = Object.freeze(input.parameters ?? {});
+  Object.defineProperty(input,"parameters",{
+    value:parameters,writable:false,configurable:false,enumerable:true
+  });
+}
 function __voleCharge(n) {
   __voleTick();
   if (!Number.isSafeInteger(n) || n < 0 || n > 2097152 - __voleAllocated)
@@ -157,6 +163,225 @@ function __voleBinarySize(v) {
   // into an apparently valid zero-length body. No entity bytes are copied.
   ArrayBuffer.prototype.slice.call(buffer,0,0);
   return n;
+}
+function __voleBytes(value) {
+  __voleCharge(32);
+  __voleBinarySize(value);
+  if (value instanceof Uint8Array) return value;
+  __voleCharge(32);
+  return new Uint8Array(value);
+}
+function __volePlusMode(args,index) {
+  if (args.length === index) return false;
+  if (args.length !== index+1 || typeof args[index] !== "boolean")
+    throw new Error("invalid query decoding mode");
+  return args[index];
+}
+function __volePercentPart(text,start,end,plusAsSpace) {
+  // Bound the slice, replacement and decoded UTF-16 storage before their
+  // intrinsics run. A percent sequence cannot expand the UTF-8 byte length.
+  __voleCharge((end-start)*(plusAsSpace ? 8 : 6)+32);
+  const encoded=text.slice(start,end);
+  return decodeURIComponent(plusAsSpace ? encoded.replaceAll("+"," ") : encoded);
+}
+function __voleQuery(url,plusAsSpace) {
+  // The emitter takes this snapshot before user code. Core already validated
+  // and canonicalized the original URL and excludes fragments.
+  if (typeof url !== "string" || url.length > 8192) throw new Error("invalid original URL");
+  __voleCharge(url.length+32);
+  const entries=[];
+  let start=url.indexOf("?")+1;
+  if (!start) return entries;
+  let equals=-1;
+  for (let i=start; i<=url.length; i++) {
+    if ((i&255)===0) __voleTick();
+    const code=url.charCodeAt(i);
+    if (code===38 || i===url.length) {
+      if (i>start) {
+        __voleCharge(152);
+        entries.push({
+          name:__volePercentPart(url,start,equals<0 ? i : equals,plusAsSpace),
+          value:equals<0 ? null : __volePercentPart(url,equals+1,i,plusAsSpace)
+        });
+      }
+      start=i+1;
+      equals=-1;
+    } else if (code===61 && equals<0) {
+      equals=i;
+    }
+  }
+  return entries;
+}
+function __voleUTF8Encode(text) {
+  if (typeof text !== "string" || text.length > __voleLimit)
+    throw new Error("invalid string");
+  __voleCharge(text.length+32);
+  const length=__voleTextSize(text,false);
+  __voleCharge(length+text.length+32);
+  const output=new Uint8Array(length);
+  let at=0, nextCheck=0;
+  for (let i=0; i<text.length; i++) {
+    if (i>=nextCheck) { __voleTick(); nextCheck=i+256; }
+    const point=text.codePointAt(i);
+    if (point<0x80) output[at++]=point;
+    else {
+      if (point<0x800) output[at++]=0xc0|(point>>6);
+      else {
+        if (point<0x10000) output[at++]=0xe0|(point>>12);
+        else {
+          output[at++]=0xf0|(point>>18);
+          output[at++]=0x80|((point>>12)&63);
+          i++;
+        }
+        output[at++]=0x80|((point>>6)&63);
+      }
+      output[at++]=0x80|(point&63);
+    }
+  }
+  return output;
+}
+function __voleBuildText(maxUnits,write) {
+  if (maxUnits > __voleLimit) throw new Error("string byte limit");
+  if (!maxUnits) return "";
+  // UTF-16 workspace and the intrinsic's argument list stay chunk-sized.
+  // The charged parts and final join avoid per-character string growth.
+  const partLength=Math.min(maxUnits,1024);
+  __voleCharge(maxUnits*4+Math.ceil(maxUnits/partLength)*64+partLength*10+32);
+  const units=new Uint16Array(partLength), parts=[];
+  let used=0;
+  write(value=>{
+    units[used++]=value;
+    if (used===partLength) {
+      parts.push(String.fromCharCode.apply(null,units));
+      used=0;
+    }
+  });
+  if (used) parts.push(String.fromCharCode.apply(null,units.subarray(0,used)));
+  __voleTick();
+  return parts.join("");
+}
+function __voleUTF8Decode(value) {
+  const bytes=__voleBytes(value);
+  __voleCharge(bytes.length);
+  return __voleBuildText(bytes.length,append=>{
+    let nextCheck=0;
+    for (let i=0; i<bytes.length;) {
+      if (i>=nextCheck) { __voleTick(); nextCheck=i+256; }
+      let point=bytes[i++];
+      if (point>=0x80) {
+        if (point<0xc2 || point>0xf4) throw new Error("invalid UTF-8");
+        const following=point<0xe0 ? 1 : point<0xf0 ? 2 : 3;
+        if (following>bytes.length-i) throw new Error("invalid UTF-8");
+        point&=127>>(following+1);
+        for (let j=0; j<following; j++) {
+          const byte=bytes[i++];
+          if ((byte&0xc0)!==0x80) throw new Error("invalid UTF-8");
+          point=(point<<6)|(byte&63);
+        }
+        const minimum=following===1 ? 0x80 : following===2 ? 0x800 : 0x10000;
+        if (point<minimum || point>0x10ffff || (point>=0xd800 && point<=0xdfff))
+          throw new Error("invalid UTF-8");
+      }
+      if (point<0x10000) append(point);
+      else {
+        point-=0x10000;
+        append(0xd800+(point>>10));
+        append(0xdc00+(point&1023));
+      }
+    }
+  });
+}
+const __voleBase64Alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function __voleBase64Encode(value) {
+  const bytes=__voleBytes(value);
+  __voleCharge(bytes.length);
+  return __voleBuildText(Math.ceil(bytes.length/3)*4,append=>{
+    for (let i=0; i<bytes.length; i+=3) {
+      if ((i&255)===0) __voleTick();
+      const a=bytes[i], b=bytes[i+1]??0, c=bytes[i+2]??0;
+      append(__voleBase64Alphabet.charCodeAt(a>>2));
+      append(__voleBase64Alphabet.charCodeAt(((a&3)<<4)|(b>>4)));
+      append(i+1<bytes.length ? __voleBase64Alphabet.charCodeAt(((b&15)<<2)|(c>>6)) : 61);
+      append(i+2<bytes.length ? __voleBase64Alphabet.charCodeAt(c&63) : 61);
+    }
+  });
+}
+function __voleBase64Value(code) {
+  if (code>=65 && code<=90) return code-65;
+  if (code>=97 && code<=122) return code-71;
+  if (code>=48 && code<=57) return code+4;
+  if (code===43) return 62;
+  if (code===47) return 63;
+  throw new Error("invalid Base64");
+}
+function __voleBase64Decode(text) {
+  if (typeof text !== "string" || text.length>__voleLimit || text.length%4)
+    throw new Error("invalid Base64");
+  const padding=text.endsWith("==") ? 2 : text.endsWith("=") ? 1 : 0;
+  const length=text.length/4*3-padding;
+  const end=text.length-padding;
+  __voleCharge(text.length+length+32);
+  const output=new Uint8Array(length);
+  let at=0;
+  for (let i=0; i<text.length; i+=4) {
+    if ((i&255)===0) __voleTick();
+    const a=__voleBase64Value(text.charCodeAt(i)), b=__voleBase64Value(text.charCodeAt(i+1));
+    const c=i+2<end ? __voleBase64Value(text.charCodeAt(i+2)) : 0;
+    const d=i+3<end ? __voleBase64Value(text.charCodeAt(i+3)) : 0;
+    if ((i+2>=end && (b&15)) || (i+3>=end && (c&3))) throw new Error("invalid Base64 padding");
+    output[at++]=(a<<2)|(b>>4);
+    if (i+2<end) output[at++]=(b<<4)|(c>>2);
+    if (i+3<end) output[at++]=(c<<6)|d;
+  }
+  return output;
+}
+function __voleConcatBytes(parts) {
+  if (!Array.isArray(parts)) throw new Error("byte array list required");
+  __voleCharge(parts.length*32+32);
+  let length=0;
+  for (const part of parts) {
+    __voleTick();
+    length+=__voleBinarySize(part);
+    if (length>__voleLimit) throw new Error("byte buffer limit");
+  }
+  __voleCharge(length*2+32);
+  const output=new Uint8Array(length);
+  let at=0;
+  for (const part of parts) {
+    __voleTick();
+    const bytes=part instanceof Uint8Array ? part : new Uint8Array(part);
+    output.set(bytes,at);
+    at+=bytes.length;
+  }
+  return output;
+}
+function __voleTool(name,args,originalURL) {
+  __voleTick();
+  if (name==="query") return __voleQuery(originalURL,__volePlusMode(args,0));
+  const value=args[0];
+  if (name==="percentDecode") {
+    const plusAsSpace=__volePlusMode(args,1);
+    __voleTextSize(value,false);
+    return __volePercentPart(value,0,value.length,plusAsSpace);
+  }
+  if (name==="copyBytes" && args.length>=1 && args.length<=3) {
+    const bytes=__voleBytes(value);
+    const start=args.length>=2 ? args[1] : 0;
+    const end=args.length===3 ? args[2] : bytes.length;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) ||
+        start<0 || start>end || end>bytes.length) throw new Error("invalid byte range");
+    __voleCharge((end-start)*2+32);
+    return bytes.slice(start,end);
+  }
+  if (args.length!==1) throw new Error("invalid tool arguments");
+  switch(name) {
+    case "utf8Encode": return __voleUTF8Encode(value);
+    case "utf8Decode": return __voleUTF8Decode(value);
+    case "base64Encode": return __voleBase64Encode(value);
+    case "base64Decode": return __voleBase64Decode(value);
+    case "concatBytes": return __voleConcatBytes(value);
+  }
+  throw new Error("unsupported tool");
 }
 function __voleMeasure(v,binary,skipBody) {
   let visited=0;

@@ -223,11 +223,6 @@ fn brotli(input: &[u8], output: &mut BudgetedBytes) -> Result<(), Bypass> {
         return Err(Bypass::Budget);
     }
     let mut state = State::new_strict(Alloc::new(&pool), Alloc::new(&pool), Alloc::new(&pool));
-    // This constructor allocation precedes the upstream decoder's error path.
-    // Our allocator returns either the entire cell or an empty failure cell.
-    if state.context_map_table.slice().is_empty() {
-        return Err(Bypass::Budget);
-    }
     let mut at = 0;
     let mut total = 0;
     let mut buffer = [0u8; CHUNK];
@@ -246,6 +241,9 @@ fn brotli(input: &[u8], output: &mut BudgetedBytes) -> Result<(), Bypass> {
             &mut total,
             &mut state,
         );
+        if pool.failed.load(Ordering::Acquire) {
+            return Err(Bypass::Budget);
+        }
         output
             .extend(&buffer[..produced])
             .map_err(|_| Bypass::Size)?;
@@ -253,7 +251,6 @@ fn brotli(input: &[u8], output: &mut BudgetedBytes) -> Result<(), Bypass> {
             brotli::BrotliResult::ResultSuccess if at == input.len() => return Ok(()),
             brotli::BrotliResult::NeedsMoreOutput if produced != 0 => {}
             brotli::BrotliResult::NeedsMoreInput if at < input.len() && at != before => {}
-            _ if pool.failed.load(Ordering::Acquire) => return Err(Bypass::Budget),
             _ => return Err(Bypass::Transform),
         }
     }
@@ -349,7 +346,6 @@ mod tests {
             Alloc::<u32>::new(&pool),
             Alloc::<brotli::HuffmanCode>::new(&pool),
         );
-        assert!(!state.context_map_table.slice().is_empty());
         pool.used.store(CODEC, Ordering::Release);
         let mut available_in = encoded.len();
         let mut input_offset = 0;

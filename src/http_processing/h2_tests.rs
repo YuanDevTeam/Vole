@@ -79,24 +79,24 @@ async fn script_memory_response(
 #[tokio::test]
 async fn h2_scripts_only_local_response_skips_upstream_and_response_hooks() {
     let scripts = r#"
-http-scripts:
-  enabled: true
-  scripts:
-    - name: local
-      phase: request
-      url: https://a.test/local
-      match: exact
-      source: 'function rewrite(input) { return {type:"respond",status:201,headers:[{name:"Set-Cookie",value:"a=1"},{name:"Set-Cookie",value:"b=2"}],body:{kind:"bytes",data:Uint8Array.from([1,2,3])}}; }'
-    - name: unreachable-request
-      phase: request
-      url: https://a.test/local
-      match: exact
-      source: 'function rewrite(input) { return {type:"abort"}; }'
-    - name: unreachable-response
-      phase: response
-      url: https://a.test/local
-      match: exact
-      source: 'function rewrite(input) { return {type:"abort"}; }'
+targets:
+  - origins: [https://a.test]
+    rules:
+      - name: local
+        match: {path-exact: /local}
+        request:
+          js:
+            source: 'function rewrite(input) { return {type:"respond",status:201,headers:[{name:"Set-Cookie",value:"a=1"},{name:"Set-Cookie",value:"b=2"}],body:{kind:"bytes",data:Uint8Array.from([1,2,3])}}; }'
+      - name: unreachable-request
+        match: {path-exact: /local}
+        request:
+          js:
+            source: 'function rewrite(input) { return {type:"abort"}; }'
+      - name: unreachable-response
+        match: {path-exact: /local}
+        response:
+          js:
+            source: 'function rewrite(input) { return {type:"abort"}; }'
 "#;
     let (context, origin) = prepared_origin_rules(true, false, false, OriginMode::None, scripts);
     let response = script_memory_response(
@@ -118,16 +118,43 @@ http-scripts:
 #[cfg(target_vendor = "apple")]
 #[tokio::test]
 async fn h2_script_local_response_preserves_unfinished_upload_and_sibling_stream() {
-    let settings = r#"
-http-scripts:
-  enabled: true
-  scripts:
-    - name: local
-      phase: request
-      url: https://a.test/local
-      match: exact
-      source: 'function rewrite(input) { return {type:"respond",status:201,body:{kind:"text",data:"local"}}; }'
-"#;
+    h2_local_response_preserves_streams(r#"
+targets:
+  - origins: [https://a.test]
+    rules:
+      - name: local
+        match: {path-exact: /local}
+        request:
+          js:
+            source: 'function rewrite(input) { return {type:"respond",status:201,body:{kind:"text",data:"local"}}; }'
+"#, http::HeaderValue::from_static(""))
+    .await;
+}
+
+#[tokio::test]
+async fn h2_native_local_response_preserves_unfinished_upload_and_sibling_stream() {
+    h2_local_response_preserves_streams(
+        r#"
+targets:
+  - origins: [https://a.test]
+    rules:
+      - match:
+          path-exact: /local
+          request-headers:
+            - {name: X-Present, exists: true}
+        request:
+          respond:
+            status: 201
+            body: {text: local}
+      - request:
+          url: {reject: true}
+"#,
+        http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+    )
+    .await;
+}
+
+async fn h2_local_response_preserves_streams(settings: &str, present: http::HeaderValue) {
     let (context, origin) = prepared_origin_rules(true, false, false, OriginMode::None, settings);
     let cancel = CancellationToken::new();
     let stop = cancel.clone();
@@ -145,6 +172,7 @@ http-scripts:
             Request::builder()
                 .method("POST")
                 .uri("https://a.test/local")
+                .header("x-present", present.clone())
                 .header("content-length", 100)
                 .body(())
                 .unwrap(),
@@ -163,6 +191,7 @@ http-scripts:
                 .send_request(
                     Request::builder()
                         .uri("https://a.test/local")
+                        .header("x-present", present.clone())
                         .body(())
                         .unwrap(),
                     true,
@@ -201,46 +230,54 @@ http-scripts:
 #[tokio::test]
 async fn h2_scripts_mix_native_results_u0_selection_and_per_call_rollback() {
     let settings = r#"
-rewrite:
-  enabled: true
-  rules:
-    - {url: 'https://a.test/upload', match: exact, action: replace, replacement: 'https://b.test/rewritten'}
-    - {url: 'https://a.test/upload', match: exact, action: request-header-set, header: X-Request, value: rewritten}
-    - {url: 'https://a.test/upload', match: exact, action: request-header-set, header: Authorization, value: 'Bearer explicit'}
-    - {url: 'https://a.test/upload', match: exact, action: request-header-set, header: Cookie, value: 'new=explicit'}
-    - {url: 'https://a.test/upload', match: exact, action: request-body-replace, search: old, replacement: new}
-    - {url: 'https://a.test/upload', match: exact, action: response-header-remove, header: Server}
-    - {url: 'https://a.test/upload', match: exact, action: response-body-json-patch, patch: [{op: replace, path: /token, value: native}]}
-http-scripts:
-  enabled: true
-  scripts:
-    - name: request-view
-      phase: request
-      url: https://a.test/upload
-      match: exact
-      body: text
-      source: 'function rewrite(input) { if (input.request.url !== "https://b.test/rewritten" || input.body.data !== "new request") { return {type:"abort"}; } return {type:"modify",headers:[{op:"set",name:"x-js",values:["accepted"]}]}; }'
-    - name: invalid-request
-      phase: request
-      url: https://a.test/upload
-      match: exact
-      source: 'function rewrite(input) { return {type:"modify",url:"https://invalid host/",headers:[{op:"remove",name:"authorization"}]}; }'
-    - name: effective-url-is-not-selector
-      phase: request
-      url: https://b.test/rewritten
-      match: exact
-      source: 'function rewrite(input) { return {type:"abort"}; }'
-    - name: response-body
-      phase: response
-      url: https://a.test/upload
-      match: exact
-      body: text
-      source: 'function rewrite(input) { if (input.request.url !== "https://b.test/rewritten" || input.original.url !== "https://a.test/upload") { return {type:"abort"}; } let value=JSON.parse(input.body.data); if (value.token !== "native") { return {type:"abort"}; } value.token="script"; return {type:"modify",status:201,headers:[{op:"add",name:"set-cookie",values:["a=1","b=2"]}],body:{kind:"text",data:JSON.stringify(value)}}; }'
-    - name: invalid-response
-      phase: response
-      url: https://a.test/upload
-      match: exact
-      source: 'function rewrite(input) { return {type:"modify",status:204,headers:[{op:"remove",name:"set-cookie"}]}; }'
+targets:
+  - origins: [https://a.test]
+    rules:
+      - match: {path-exact: /upload}
+        request:
+          url: {replace: {value: https://b.test/rewritten, mode: match}}
+          headers:
+            - {set: {X-Request: rewritten}}
+            - {set: {Authorization: 'Bearer explicit'}}
+            - {set: {Cookie: 'new=explicit'}}
+          body:
+            - {replace: {search: old, replacement: new}}
+        response:
+          headers:
+            - {remove: Server}
+          body:
+            - {json-patch: [{op: replace, path: /token, value: native}]}
+      - name: request-view
+        match: {path-exact: /upload}
+        request:
+          js:
+            body: text
+            source: 'function rewrite(input) { if (input.request.url !== "https://b.test/rewritten" || input.body.data !== "new request") { return {type:"abort"}; } return {type:"modify",headers:[{op:"set",name:"x-js",values:["accepted"]}]}; }'
+      - name: invalid-request
+        match: {path-exact: /upload}
+        request:
+          js:
+            source: 'function rewrite(input) { return {type:"modify",url:"https://invalid host/",headers:[{op:"remove",name:"authorization"}]}; }'
+  - origins: [https://b.test]
+    rules:
+      - name: effective-url-is-not-selector
+        match: {path-exact: /rewritten}
+        request:
+          js:
+            source: 'function rewrite(input) { return {type:"abort"}; }'
+  - origins: [https://a.test]
+    rules:
+      - name: response-body
+        match: {path-exact: /upload}
+        response:
+          js:
+            body: text
+            source: 'function rewrite(input) { if (input.request.url !== "https://b.test/rewritten" || input.original.url !== "https://a.test/upload") { return {type:"abort"}; } let value=JSON.parse(input.body.data); if (value.token !== "native") { return {type:"abort"}; } value.token="script"; return {type:"modify",status:201,headers:[{op:"add",name:"set-cookie",values:["a=1","b=2"]}],body:{kind:"text",data:JSON.stringify(value)}}; }'
+      - name: invalid-response
+        match: {path-exact: /upload}
+        response:
+          js:
+            source: 'function rewrite(input) { return {type:"modify",status:204,headers:[{op:"remove",name:"set-cookie"}]}; }'
 "#;
     for upstream_h2 in [true, false] {
         let (context, origin) =
@@ -278,19 +315,19 @@ http-scripts:
 #[tokio::test]
 async fn h2_scripts_do_not_erase_obs_text_to_make_an_input_snapshot() {
     let settings = r#"
-http-scripts:
-  enabled: true
-  scripts:
-    - name: should-skip
-      phase: request
-      url: https://a.test/upload
-      match: exact
-      source: 'function rewrite(input) { return {type:"respond",status:201}; }'
-    - name: response-must-also-have-representable-request
-      phase: response
-      url: https://a.test/upload
-      match: exact
-      source: 'function rewrite(input) { return {type:"abort"}; }'
+targets:
+  - origins: [https://a.test]
+    rules:
+      - name: should-skip
+        match: {path-exact: /upload}
+        request:
+          js:
+            source: 'function rewrite(input) { return {type:"respond",status:201}; }'
+      - name: response-must-also-have-representable-request
+        match: {path-exact: /upload}
+        response:
+          js:
+            source: 'function rewrite(input) { return {type:"abort"}; }'
 "#;
     let (context, origin) = prepared_origin_rules(true, false, false, OriginMode::None, settings);
     let mut request = Request::builder()
@@ -313,15 +350,15 @@ http-scripts:
 #[tokio::test]
 async fn h2_script_body_collection_preserves_early_response_while_upload_is_unfinished() {
     let settings = r#"
-http-scripts:
-  enabled: true
-  scripts:
-    - name: complete-response-only
-      phase: response
-      url: https://a.test/upload
-      match: exact
-      body: bytes
-      source: 'function rewrite(input) { if (input.body.data.length !== 98304) { return {type:"abort"}; } return {type:"modify",headers:[{op:"set",name:"x-js-complete",values:["yes"]}]}; }'
+targets:
+  - origins: [https://a.test]
+    rules:
+      - name: complete-response-only
+        match: {path-exact: /upload}
+        response:
+          js:
+            body: bytes
+            source: 'function rewrite(input) { if (input.body.data.length !== 98304) { return {type:"abort"}; } return {type:"modify",headers:[{op:"set",name:"x-js-complete",values:["yes"]}]}; }'
 "#;
     for upstream_h2 in [true, false] {
         let (context, origin) =
@@ -379,20 +416,31 @@ http-scripts:
 #[tokio::test]
 async fn h2_rewrite_stages_use_original_url_for_h2_and_h1_origins() {
     let rules = r#"
-rewrite:
-  enabled: true
-  rules:
-    - {url: '^https://a\.test/upload$', action: replace, replacement: 'https://b.test/rewritten'}
-    - {url: '^https://a\.test/upload$', action: request-header-set, header: X-Request, value: rewritten}
-    - {url: '^https://a\.test/upload$', action: request-header-set, header: Authorization, value: 'Bearer explicit'}
-    - {url: '^https://a\.test/upload$', action: request-header-set, header: Cookie, value: 'new=explicit'}
-    - {url: '^https://a\.test/upload$', action: request-body-replace, search: old, replacement: new}
-    - {url: '^https://a\.test/upload$', action: response-header-remove, header: Server}
-    - url: '^https://a\.test/upload$'
-      action: response-body-json-patch
-      patch:
-        - {op: replace, path: /ads, value: []}
-        - {op: replace, path: /token, value: new}
+targets:
+  - origins: [https://a.test]
+    rules:
+      - match: {url-regex: '^https://a\.test/upload$'}
+        request:
+          url: {replace: {value: https://b.test/rewritten, mode: match}}
+          headers:
+            - {set: {X-Request: rewritten}}
+            - {set: {Authorization: 'Bearer explicit'}}
+            - {set: {Cookie: 'new=explicit'}}
+          body:
+            - {replace: {search: old, replacement: new}}
+        response:
+          headers:
+            - {remove: Server}
+      - match:
+          request-headers:
+            - {name: Authorization, equals: Bearer original}
+        response:
+          when:
+            status: 200
+            headers:
+              - {name: Server, exists: true}
+          body:
+            - {json-patch: [{op: replace, path: /ads, value: []}, {op: replace, path: /token, value: new}]}
 "#;
     for upstream_h2 in [true, false] {
         let (context, origin) =
@@ -462,8 +510,108 @@ enum OriginMode {
     None,
     BeforeUpload,
     AfterUpload,
-    ShortClose { truncated: bool },
+    ShortClose {
+        truncated: bool,
+    },
     Rewrite,
+    #[cfg(all(feature = "invoke", target_vendor = "apple"))]
+    P1(P1Case),
+}
+
+#[cfg(all(feature = "invoke", target_vendor = "apple"))]
+#[derive(Clone, Copy)]
+struct P1Case {
+    path: &'static str,
+    media: &'static str,
+    original: &'static [u8],
+    changed: &'static [u8],
+    witness: &'static str,
+}
+
+#[cfg(all(feature = "invoke", target_vendor = "apple"))]
+#[tokio::test]
+async fn p1_same_yaml_matches_offline_h1_and_h2() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde_json::{Value, json};
+
+    let yaml = include_str!("p1_memory_fixture.yaml");
+    for case in [
+        P1Case {
+            path: "/filter",
+            media: "application/json",
+            original: br#"{"data":{"bottomBarControl":{"tabs":[{"tabType":"home"},{"tabType":"keep","weight":1.2000},{"tabType":"mall"},{"future":17}]}}}"#,
+            changed: br#"{"data":{"bottomBarControl":{"tabs":[{"tabType":"keep","weight":1.2000},{"future":17}]}}}"#,
+            witness: "json",
+        },
+        P1Case {
+            path: "/protobuf",
+            media: "application/protobuf",
+            original: &[0x3a, 2, 0xff, 0, 0x4a, 8, 0x90, 1, 1, 8, 0x96, 1, 8, 2],
+            changed: &[0x4a, 5, 8, 0x96, 1, 8, 2],
+            witness: "protobuf",
+        },
+    ] {
+        let url = format!("https://a.test{}?probe=p1+ok", case.path);
+        let input = json!({
+            "method":"testHttp",
+            "payload": {
+                "httpConfigYaml":yaml, "httpContext":{"mitmEnabled":true},
+                "url":url, "executeScripts":true, "request":{},
+                "response":{"status":200, "headers":[["content-type",case.media]], "bodyBase64":STANDARD.encode(case.original)}
+            }
+        });
+        let offline: Value =
+            serde_json::from_slice(&crate::invoke::invoke_bytes(&serde_json::to_vec(&input).unwrap()))
+                .unwrap();
+        assert_eq!(offline["success"], true, "{offline}");
+        let offline = &offline["data"];
+        assert!(offline["terminal"].is_null(), "{offline}");
+        let stage = &offline["stages"][1];
+        assert_eq!(stage["scripts"][0]["outcome"], "accepted", "{stage}");
+        assert_eq!(stage["bodyOutcome"], "changed", "{stage}");
+        let offline_body = STANDARD.decode(stage["bodyBase64"].as_str().unwrap()).unwrap();
+        assert_eq!(offline_body, case.changed);
+        assert!(stage["headers"].as_array().unwrap().contains(&json!(["x-p1",case.witness])));
+
+        let (context, origin) =
+            prepared_origin_rules(true, false, false, OriginMode::P1(case), yaml);
+        let h2 = script_memory_response(
+            context,
+            Request::builder().uri(&url).body(()).unwrap(),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(h2.status(), StatusCode::OK);
+        assert_eq!(h2.body(), &offline_body);
+        assert_eq!(h2.headers()["x-p1"], case.witness);
+        assert_eq!(h2.headers()["content-length"], case.changed.len().to_string());
+        origin.join().await;
+
+        let (context, origin) =
+            prepared_origin_rules(false, false, false, OriginMode::P1(case), yaml);
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let worker = tokio::spawn(async move {
+            context
+                .serve_h1(&mut server, session(), Scheme::Https, CancellationToken::new())
+                .await
+                .unwrap();
+        });
+        let request = format!(
+            "GET {}?probe=p1+ok HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n",
+            case.path
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut h1 = Vec::new();
+        timeout(Duration::from_secs(5), client.read_to_end(&mut h1)).await.unwrap().unwrap();
+        worker.await.unwrap();
+        origin.join().await;
+        let end = h1.windows(4).position(|bytes| bytes == b"\r\n\r\n").unwrap();
+        let head = std::str::from_utf8(&h1[..end + 2]).unwrap().to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 200 "));
+        assert!(head.contains(&format!("x-p1: {}\r\n", case.witness)));
+        assert!(head.contains(&format!("content-length: {}\r\n", case.changed.len())));
+        assert_eq!(&h1[end + 4..], offline_body);
+    }
 }
 fn pem(label: &str, bytes: &[u8]) -> String {
     use base64::Engine as _;
@@ -525,6 +673,22 @@ impl Dispatcher for Origin {
                 let mut connection = builder.handshake::<_, Bytes>(tls).await.unwrap();
                 let (request, mut response) = connection.accept().await.unwrap().unwrap();
                 let exchange = async move {
+                    #[cfg(all(feature = "invoke", target_vendor = "apple"))]
+                    if let OriginMode::P1(case) = mode {
+                        assert_eq!(request.uri().path(), case.path);
+                        assert_eq!(request.headers()["x-p1-query"], "p1 ok");
+                        let out = Response::builder()
+                            .header("content-type", case.media)
+                            .header("content-length", case.original.len())
+                            .body(())
+                            .unwrap();
+                        response
+                            .send_response(out, false)
+                            .unwrap()
+                            .send_data(Bytes::from_static(case.original), true)
+                            .unwrap();
+                        return;
+                    }
                     if matches!(mode, OriginMode::Rewrite) {
                         assert_eq!(request.uri().path(), "/rewritten");
                         assert_eq!(request.headers()["x-request"], "rewritten");
@@ -633,6 +797,20 @@ impl Dispatcher for Origin {
                     head.push(tls.read_u8().await.unwrap());
                 }
                 let head = String::from_utf8(head).unwrap();
+                #[cfg(all(feature = "invoke", target_vendor = "apple"))]
+                if let OriginMode::P1(case) = mode {
+                    assert!(
+                        head.starts_with(&format!("GET {}?probe=p1+ok HTTP/1.1\r\n", case.path))
+                    );
+                    assert!(head.to_ascii_lowercase().contains("x-p1-query: p1 ok\r\n"));
+                    tls.write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        case.media, case.original.len()
+                    ).as_bytes()).await.unwrap();
+                    tls.write_all(case.original).await.unwrap();
+                    tls.shutdown().await.unwrap();
+                    return;
+                }
                 if matches!(mode, OriginMode::Rewrite) {
                     assert!(head.starts_with("POST /rewritten HTTP/1.1\r\n"));
                     assert!(
@@ -832,18 +1010,27 @@ fn prepared_origin_rules(
     let cert_pem = pem("CERTIFICATE", cert.der());
     let key_pem = pem("PRIVATE KEY", &key.serialize_der());
     let authority = authority::Authority::load(&cert_pem, &key_pem).unwrap();
-    let document = super::config::Document::parse(&format!(
-        "mitm:\n  enabled: true\n  domains: [{{pattern: a.test}}, {{pattern: b.test}}]\n{rules}"
-    ))
+    let document = super::config::Document::parse(if rules.is_empty() {
+        "targets:\n  - origins: [https://a.test, https://b.test]\n    intercept-only: true\n"
+    } else {
+        rules
+    })
     .unwrap();
-    let candidate = document
-        .compile(&std::collections::BTreeMap::new())
-        .unwrap();
+    let candidate = document.compile().unwrap();
     let material = super::private_context::CaMaterial {
         certificate: cert_pem,
         private_key: zeroize::Zeroizing::new(key_pem),
     };
-    let policy = candidate.bind_ca(Some(&material)).unwrap();
+    let policy = candidate
+        .bind_settings(
+            &super::config::HttpSettings {
+                mitm_enabled: true,
+                allow_intercept_only: true,
+                ..Default::default()
+            },
+            Some(&material),
+        )
+        .unwrap();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.der().clone()).unwrap();
     let origin = Arc::new(Origin {
@@ -1207,7 +1394,13 @@ fn https_authority_permission_and_sni_coalescing_are_per_request() {
         ),
     ] {
         let request::Decision::Forward(target) = context
-            .plan(url.parse().unwrap(), session(), Scheme::Https, true)
+            .plan(
+                url.parse().unwrap(),
+                http::Method::GET,
+                session(),
+                Scheme::Https,
+                true,
+            )
             .unwrap()
         else {
             panic!("expected forward")
@@ -1218,34 +1411,33 @@ fn https_authority_permission_and_sni_coalescing_are_per_request() {
             session().destination
         );
     }
-    assert!(
-        context
-            .plan(
-                "https://forbidden.test/upload".parse().unwrap(),
-                session(),
-                Scheme::Https,
-                true
-            )
-            .is_err()
-    );
-    let mut wrong_port = session();
-    wrong_port.destination = Destination::Ip("203.0.113.1:8443".parse().unwrap());
-    let request::Decision::Forward(target) = context
-        .plan(
-            "https://a.test/upload".parse().unwrap(),
-            wrong_port,
+    assert!(matches!(
+        context.plan(
+            "https://forbidden.test/upload".parse().unwrap(),
+            http::Method::GET,
+            session(),
             Scheme::Https,
             true,
-        )
-        .unwrap()
-    else {
-        panic!()
-    };
-    assert_eq!(
-        target.session.destination,
-        Destination::domain("a.test", 443).unwrap()
-    );
-    assert!(target.session.sniffed_domain.is_none());
+        ),
+        Ok(request::Decision::Reject)
+    ));
+    let mut wrong_port = session();
+    wrong_port.destination = Destination::Ip("203.0.113.1:8443".parse().unwrap());
+    for (url, downstream) in [
+        ("https://a.test/upload", wrong_port),
+        ("https://a.test:8443/upload", session()),
+    ] {
+        assert!(matches!(
+            context.plan(
+                url.parse().unwrap(),
+                http::Method::GET,
+                downstream,
+                Scheme::Https,
+                true,
+            ),
+            Ok(request::Decision::Reject)
+        ));
+    }
 }
 #[tokio::test]
 async fn h2_per_request_authority_and_cancellation_do_not_leave_inline_drivers() {

@@ -379,7 +379,7 @@ Controller 位于普通业务运行时。宿主通过配置的 HTTP 地址直接
 
 PATCH 仅接受 `mode`、`log-level`、`sniffing`、`tcp-concurrent`、`find-process-mode`、`interface-name`。`sniffing` 是 Mihomo Controller 的 API 字段，对应配置的 `sniffer.enable`；不向 YAML 增加同名旧字段。其余字段和值由严格配置解析器验证；未知字段失败。PUT 只接受 `{"payload":"完整 Mihomo YAML"}`，不接受任意本地路径。成功返回 204。
 
-候选基于新的本地可用 provider 内容完整构图后发布，HTTP provider 继续遵循既有本地缓存／bundle／后续更新语义，204 不表示所有远端订阅都已同步刷新。配置、图与 provider 模板一起替换；后续订阅更新使用新模板。坏配置保留活动代际；已建立业务保持其原代际，新连接取得新代际。可继承且仍存在的组选择保留。
+候选基于新的本地可用 provider 内容完整构图后发布。配置、图与 provider 模板一起替换。后续代理和分流订阅更新使用新模板。HTTP 插件和本机设置继续使用活动会话的内容。坏配置保留活动代际。已建立业务保持其原代际，新连接取得新代际。可继承且仍存在的组选择保留。
 
 地址、监听／TUN、全局 IPv6、TLS 根与 Controller 证书、安全配置、fake-IP 范围、profile 存储和系统网络相关启动资源需要宿主重新连接，在线更改返回 409。Linux 原生 auto-route 持有的物理出口隔离同样不在在线重建范围。在线 DNS 策略／hosts 改动在共享缓存 epoch 下清缓存与域名提示；退休 DNS 树继续服务其已持有业务，但不能重新填充活动域名提示。fake-IP 映射保持。
 

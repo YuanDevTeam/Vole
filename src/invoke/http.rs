@@ -1,23 +1,21 @@
-//! HTTP resource ownership shared by foreground and native Invoke adapters.
-use super::{InvokeFailure, InvokePath, lock, registry};
+//! Local HTTP policy binding shared by foreground and native Invoke adapters.
+use super::InvokeFailure;
 use crate::{
     config::Config,
-    dialer::Dialer,
     http_processing::{
         Policy,
-        config::{Document, PolicyCandidate},
+        config::{Document, HttpSettings, ParameterValue, PluginInput, PolicyCandidate},
         private_context::CaMaterial,
-        providers::{DownloadContext, SourceContext, Store},
     },
 };
-use serde::Deserialize;
-use std::{io, path::PathBuf, sync::Arc};
+use serde::{Deserialize, Deserializer, de};
+use std::{collections::BTreeMap, io, sync::Arc};
 use tokio_util::sync::CancellationToken;
 #[path = "http_test.rs"]
 mod evaluation;
-pub(super) use evaluation::{TestPayload, evaluate};
+pub(super) use evaluation::{TestPayload, TestResources, evaluate};
 
-pub(super) fn check_envelope(input: &str) -> Result<(), InvokeFailure> {
+pub(super) fn check_envelope(input: &str) -> Result<Option<TestResources>, InvokeFailure> {
     use serde_json::value::RawValue;
     #[derive(Deserialize)]
     struct Envelope<'a> {
@@ -31,8 +29,12 @@ pub(super) fn check_envelope(input: &str) -> Result<(), InvokeFailure> {
     struct Input<'a> {
         #[serde(borrow)]
         config_yaml: Option<&'a RawValue>,
-        #[serde(borrow)]
+        #[serde(default, borrow, deserialize_with = "present")]
         http_config_yaml: Option<&'a RawValue>,
+        #[serde(default, borrow, deserialize_with = "present")]
+        http_config_yamls: Option<&'a RawValue>,
+        #[serde(default, borrow, deserialize_with = "present")]
+        http_plugins: Option<&'a RawValue>,
         #[serde(borrow)]
         http_context: Option<&'a RawValue>,
         #[serde(borrow)]
@@ -41,6 +43,7 @@ pub(super) fn check_envelope(input: &str) -> Result<(), InvokeFailure> {
         response: Option<&'a RawValue>,
         #[serde(borrow)]
         url: Option<&'a RawValue>,
+        execute_scripts: Option<bool>,
     }
     #[derive(Deserialize)]
     struct Context<'a> {
@@ -75,9 +78,9 @@ pub(super) fn check_envelope(input: &str) -> Result<(), InvokeFailure> {
     let method: String = serde_json::from_str(envelope.method.get()).map_err(invalid)?;
     if !matches!(
         method.as_str(),
-        "start" | "reconnect" | "validateConfig" | "refreshHttpProviders" | "testHttp"
+        "start" | "reconnect" | "validateConfig" | "testHttp"
     ) {
-        return Ok(());
+        return Ok(None);
     }
     if input.len().saturating_sub(envelope.payload.get().len()) > 64 * 1024 {
         return Err(InvokeFailure::invalid_request(
@@ -85,9 +88,16 @@ pub(super) fn check_envelope(input: &str) -> Result<(), InvokeFailure> {
         ));
     }
     let input: Input<'_> = serde_json::from_str(envelope.payload.get()).map_err(invalid)?;
+    if input.execute_scripts.is_some() && method != "testHttp" {
+        return Err(InvokeFailure::invalid_request(
+            "executeScripts requires testHttp",
+        ));
+    }
     let known: usize = [
         input.config_yaml,
         input.http_config_yaml,
+        input.http_config_yamls,
+        input.http_plugins,
         input.http_context,
         input.request,
         input.response,
@@ -108,8 +118,12 @@ pub(super) fn check_envelope(input: &str) -> Result<(), InvokeFailure> {
     if let Some(raw) = input.config_yaml {
         super::check_json_string_limit(raw.get(), crate::config::MAX_CONFIG_BYTES)?;
     }
-    if let Some(raw) = input.http_config_yaml {
-        super::check_json_string_limit(raw.get(), crate::http_processing::MAX_ADDENDUM)?;
+    check_document_values(input.http_config_yaml, input.http_config_yamls)?;
+    if let Some(plugins) = input.http_plugins {
+        if input.http_config_yaml.is_some() || input.http_config_yamls.is_some() {
+            return Err(plugin_conflict());
+        }
+        check_managed_values(plugins)?;
     }
     if let Some(raw) = input.http_context {
         if raw.get().len()
@@ -173,14 +187,178 @@ pub(super) fn check_envelope(input: &str) -> Result<(), InvokeFailure> {
             ));
         }
     }
-    Ok(())
+    if method == "testHttp" {
+        TestResources::try_acquire().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn plugin_conflict() -> InvokeFailure {
+    InvokeFailure::invalid_request("httpPlugins is mutually exclusive with raw HTTP YAML fields")
+}
+
+fn check_managed_values(raw: &serde_json::value::RawValue) -> Result<(), InvokeFailure> {
+    use crate::http_processing::config::{MAX_ADDENDUM, MAX_DOCUMENTS, MAX_PARAMETER_OVERRIDES};
+    use serde_json::value::RawValue;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Input<'a> {
+        #[serde(borrow)]
+        yaml: &'a RawValue,
+        #[serde(borrow)]
+        id: &'a RawValue,
+        #[serde(borrow)]
+        digest: &'a RawValue,
+        #[serde(borrow)]
+        parameters: Option<&'a RawValue>,
+        #[serde(borrow)]
+        permissions: Option<&'a RawValue>,
+    }
+
+    struct Plugins;
+    impl<'de> de::Visitor<'de> for Plugins {
+        type Value = ();
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a bounded array of HTTP plugin inputs")
+        }
+
+        fn visit_seq<S: de::SeqAccess<'de>>(self, mut sequence: S) -> Result<(), S::Error> {
+            let mut remaining = MAX_ADDENDUM;
+            let mut overrides = MAX_PARAMETER_OVERRIDES * 6;
+            let mut grants = 128_usize * 1024;
+            let mut count = 0;
+            while let Some(raw) = sequence.next_element::<&'de RawValue>()? {
+                count += 1;
+                if count > MAX_DOCUMENTS {
+                    return Err(de::Error::custom("too many HTTP plugin documents"));
+                }
+                let input: Input<'_> =
+                    serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
+                remaining -= super::bounded_json_string_len(input.yaml.get(), remaining)
+                    .map_err(|error| de::Error::custom(error.message))?;
+                super::check_json_string_limit(input.id.get(), 64)
+                    .and_then(|()| super::check_json_string_limit(input.digest.get(), 64))
+                    .map_err(|error| de::Error::custom(error.message))?;
+                overrides = overrides
+                    .checked_sub(input.parameters.map_or(0, |raw| raw.get().len()))
+                    .ok_or_else(|| de::Error::custom("HTTP parameter input limit exceeded"))?;
+                grants = grants
+                    .checked_sub(input.permissions.map_or(0, |raw| raw.get().len()))
+                    .ok_or_else(|| de::Error::custom("HTTP permission input limit exceeded"))?;
+            }
+            Ok(())
+        }
+    }
+
+    if raw.get().len() > 6 * (MAX_ADDENDUM + MAX_PARAMETER_OVERRIDES) + 256 * 1024 {
+        return Err(InvokeFailure::invalid_request(
+            "HTTP plugin input limit exceeded",
+        ));
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+    deserializer
+        .deserialize_seq(Plugins)
+        .map_err(|_| InvokeFailure::invalid_request("invalid HTTP plugin input or limit exceeded"))
+}
+
+pub(crate) fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+pub(super) fn check_document_values(
+    single: Option<&serde_json::value::RawValue>,
+    multiple: Option<&serde_json::value::RawValue>,
+) -> Result<(), InvokeFailure> {
+    use crate::http_processing::MAX_ADDENDUM;
+    const MAX_ARRAY_BYTES: usize = MAX_ADDENDUM * 6 + 64 * 1024;
+    match (single, multiple) {
+        (Some(_), Some(_)) => Err(InvokeFailure::invalid_request(
+            "httpConfigYaml and httpConfigYamls are mutually exclusive",
+        )),
+        (Some(raw), None) => super::check_json_string_limit(raw.get(), MAX_ADDENDUM),
+        (None, Some(raw)) if raw.get().len() <= MAX_ARRAY_BYTES => {
+            struct Documents;
+            impl<'de> de::Visitor<'de> for Documents {
+                type Value = ();
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a bounded array of HTTP plugin YAML strings")
+                }
+                fn visit_seq<S: de::SeqAccess<'de>>(self, mut sequence: S) -> Result<(), S::Error> {
+                    let mut remaining = MAX_ADDENDUM;
+                    let mut count = 0;
+                    while let Some(document) =
+                        sequence.next_element::<&serde_json::value::RawValue>()?
+                    {
+                        count += 1;
+                        if count > crate::http_processing::config::MAX_DOCUMENTS {
+                            return Err(de::Error::custom("too many HTTP plugin documents"));
+                        }
+                        remaining -= super::bounded_json_string_len(document.get(), remaining)
+                            .map_err(|error| de::Error::custom(error.message))?;
+                    }
+                    Ok(())
+                }
+            }
+            let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+            deserializer.deserialize_seq(Documents).map_err(|_| {
+                InvokeFailure::invalid_request(
+                    "invalid httpConfigYamls array or plugin input limit exceeded",
+                )
+            })
+        }
+        (None, Some(_)) => Err(InvokeFailure::invalid_request(
+            "httpConfigYamls exceeds input limit",
+        )),
+        (None, None) => Ok(()),
+    }
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct HttpContextInput {
-    pub(crate) base_dir: Option<InvokePath>,
+    mitm_enabled: bool,
+    exclude_domains: Vec<String>,
+    rewrite_enabled: bool,
+    js_enabled: bool,
+    allow_intercept_only: bool,
     pub(crate) ca: Option<CaMaterial>,
+}
+impl Default for HttpContextInput {
+    fn default() -> Self {
+        Self::from_settings(HttpSettings::default(), None)
+    }
+}
+impl HttpContextInput {
+    pub(crate) fn from_settings(settings: HttpSettings, ca: Option<CaMaterial>) -> Self {
+        Self {
+            mitm_enabled: settings.mitm_enabled,
+            exclude_domains: settings.exclude_domains,
+            rewrite_enabled: settings.rewrite_enabled,
+            js_enabled: settings.js_enabled,
+            allow_intercept_only: settings.allow_intercept_only,
+            ca,
+        }
+    }
+
+    pub(crate) fn into_settings(self) -> (HttpSettings, Option<CaMaterial>) {
+        (
+            HttpSettings {
+                mitm_enabled: self.mitm_enabled,
+                exclude_domains: self.exclude_domains,
+                rewrite_enabled: self.rewrite_enabled,
+                js_enabled: self.js_enabled,
+                allow_intercept_only: self.allow_intercept_only,
+            },
+            self.ca,
+        )
+    }
 }
 impl std::fmt::Debug for HttpContextInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -192,500 +370,181 @@ impl std::fmt::Debug for HttpContextInput {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(super) struct StartPayload {
     pub(super) config_yaml: String,
+    #[serde(default, deserialize_with = "present")]
     pub(super) http_config_yaml: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    pub(super) http_config_yamls: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    pub(super) http_plugins: Option<Vec<PluginInput>>,
     pub(super) http_context: Option<HttpContextInput>,
-    #[serde(skip)]
-    pub(super) source_file: Option<PathBuf>,
     #[serde(skip)]
     pub(super) cancellation: Option<CancellationToken>,
     #[serde(skip)]
     pub(super) foreground_overrides: super::foreground::ControllerOverrides,
     #[serde(skip)]
     pub(super) provider_paths: Option<Arc<crate::resource::paths::ProviderPaths>>,
+    #[serde(skip)]
+    pub(super) http_parameter_overrides: ParameterOverrides,
 }
 
-pub(crate) fn source_context(
+pub(super) type ParameterOverrides = BTreeMap<usize, BTreeMap<String, ParameterValue>>;
+
+pub(super) enum HttpInputs {
+    Raw(Vec<String>, ParameterOverrides),
+    Managed(Vec<PluginInput>),
+}
+
+impl HttpInputs {
+    pub(super) fn new(
+        single: Option<String>,
+        multiple: Option<Vec<String>>,
+        managed: Option<Vec<PluginInput>>,
+        overrides: ParameterOverrides,
+    ) -> Result<Option<Self>, InvokeFailure> {
+        let raw = document_inputs(single, multiple)?;
+        match (raw, managed) {
+            (Some(_), Some(_)) => Err(plugin_conflict()),
+            (_, Some(plugins)) => Ok(Some(Self::Managed(plugins))),
+            (Some(raw), None) => Ok(Some(Self::Raw(raw, overrides))),
+            (None, None) if overrides.is_empty() => Ok(None),
+            _ => Err(InvokeFailure::invalid_request(
+                "HTTP parameters require plugins",
+            )),
+        }
+    }
+
+    pub(super) fn candidate(&self) -> Result<Option<Arc<PolicyCandidate>>, InvokeFailure> {
+        let document = match self {
+            Self::Raw(documents, overrides) => return candidate_raw(documents, overrides),
+            Self::Managed(plugins) if plugins.is_empty() => return Ok(None),
+            Self::Managed(plugins) => Document::parse_managed(plugins),
+        };
+        document
+            .and_then(|document| document.compile())
+            .map(Some)
+            .map_err(|error| InvokeFailure::new(error.to_string()))
+    }
+}
+
+pub(crate) fn document_inputs(
+    single: Option<String>,
+    multiple: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, InvokeFailure> {
+    match (single, multiple) {
+        (Some(_), Some(_)) => Err(InvokeFailure::invalid_request(
+            "httpConfigYaml and httpConfigYamls are mutually exclusive",
+        )),
+        (Some(document), None) => Ok(Some(vec![document])),
+        (None, documents) => Ok(documents),
+    }
+}
+
+#[cfg(all(windows, feature = "windows-uwp"))]
+pub(crate) fn candidate(
+    documents: &[String],
+) -> Result<Option<Arc<PolicyCandidate>>, InvokeFailure> {
+    candidate_raw(documents, &ParameterOverrides::new())
+}
+
+pub(super) fn candidate_raw(
+    documents: &[String],
+    overrides: &ParameterOverrides,
+) -> Result<Option<Arc<PolicyCandidate>>, InvokeFailure> {
+    if documents.is_empty() && overrides.is_empty() {
+        return Ok(None);
+    }
+    let document = if overrides.is_empty() {
+        Document::parse_documents(documents)
+    } else {
+        Document::parse_overrides(documents, overrides)
+    };
+    document
+        .and_then(|document| document.compile())
+        .map(Some)
+        .map_err(|error| InvokeFailure::new(error.to_string()))
+}
+
+pub(crate) fn bind(
+    candidate: Option<&Arc<PolicyCandidate>>,
     context: Option<HttpContextInput>,
-    data_dir: PathBuf,
-    config_path: Option<PathBuf>,
-) -> io::Result<(SourceContext, Option<CaMaterial>)> {
-    let (base_dir, ca) = context.map_or((None, None), |context| {
-        (context.base_dir.map(InvokePath::into_path), context.ca)
-    });
-    if base_dir.as_ref().is_some_and(|path| !path.is_absolute()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "HTTP baseDir must be absolute",
-        ));
-    }
-    Ok((
-        SourceContext {
-            base_dir,
-            data_dir: Some(data_dir),
-            config_path,
-            ..Default::default()
-        },
-        ca,
-    ))
-}
-
-pub(crate) fn download_context(config: &Config, dialer: Dialer) -> DownloadContext {
-    DownloadContext {
-        dispatcher: Arc::new(crate::outbound::ConnectorDispatcher::new(Arc::new(
-            crate::outbound::NamedDirectOutbound::new(dialer),
-        ))),
-        security: crate::security::SecurityContext::load(&config.tls),
-    }
-}
-
-pub(crate) async fn prepare_candidate(
-    input: &str,
-    context: SourceContext,
-    download: Option<&DownloadContext>,
-    store: &tokio::sync::Mutex<Store>,
-    force: bool,
-) -> io::Result<Arc<PolicyCandidate>> {
-    prepare_cancelled(
-        input,
-        context,
-        download,
-        store,
-        force,
-        &CancellationToken::new(),
-    )
-    .await
-}
-
-async fn prepare_cancelled(
-    input: &str,
-    context: SourceContext,
-    download: Option<&DownloadContext>,
-    store: &tokio::sync::Mutex<Store>,
-    force: bool,
     cancellation: &CancellationToken,
-) -> io::Result<Arc<PolicyCandidate>> {
-    let document = Document::parse(input)?;
-    let mut store = store.try_lock().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "HTTP resource preparation is busy",
-        )
-    })?;
-    let operation_cancel = cancellation.child_token();
-    let preparation = store.prepare(document, &context, download, &operation_cancel, force);
-    tokio::pin!(preparation);
-    tokio::select! { biased;
-        () = cancellation.cancelled() => {
-            operation_cancel.cancel(); let _ = preparation.await;
-            Err(io::ErrorKind::Interrupted.into())
-        },
-        () = tokio::time::sleep(std::time::Duration::from_secs(90)) => {
-            operation_cancel.cancel(); let _ = preparation.await;
-            Err(io::ErrorKind::TimedOut.into())
-        },
-        result = &mut preparation => result,
-    }
+) -> Result<Option<Arc<Policy>>, InvokeFailure> {
+    let Some(candidate) = candidate else {
+        return if context.is_some() {
+            Err(InvokeFailure::invalid_request(
+                "httpContext requires at least one HTTP plugin",
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let (settings, ca) = context.unwrap_or_default().into_settings();
+    candidate
+        .prepare_platform(&settings, cancellation)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::Interrupted {
+                InvokeFailure::from(error)
+            } else {
+                InvokeFailure::new("HTTP script preparation failed")
+            }
+        })?;
+    candidate
+        .bind_settings(&settings, ca.as_ref())
+        .map(Some)
+        .map_err(|_| InvokeFailure::new("invalid HTTP settings or private CA"))
 }
 
-pub(super) fn runtime_store() -> Result<Arc<tokio::sync::Mutex<Store>>, InvokeFailure> {
-    lock(&registry().runtime_data)
-        .as_ref()
-        .map(|data| data.http.clone())
-        .ok_or_else(|| {
-            InvokeFailure::invalid_state("call initialize before preparing HTTP resources")
-        })
-}
-
-pub(super) async fn attach(
+pub(super) fn attach(
     config: &mut Config,
-    input: Option<&str>,
+    inputs: Option<HttpInputs>,
     context: Option<HttpContextInput>,
-    config_path: Option<PathBuf>,
-    resource_paths: Option<Arc<crate::resource::paths::ProviderPaths>>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<(), InvokeFailure> {
-    let Some(input) = input else {
-        if context.is_some() {
-            return Err(InvokeFailure::invalid_request(
-                "httpContext requires httpConfigYaml",
-            ));
-        }
-        config.set_http_policy(None).map_err(InvokeFailure::from)?;
-        return Ok(());
-    };
-    if input.is_empty() {
-        config.set_http_policy(None).map_err(InvokeFailure::from)?;
-        return Ok(());
-    }
-    let directory = registry().data_directory()?;
-    let (mut source, ca) = source_context(context, directory.root().to_owned(), config_path)
-        .map_err(InvokeFailure::from)?;
-    source.resource_paths = resource_paths
-        .or_else(|| registry().provider_paths())
-        .unwrap_or_default();
-    let dialer = {
-        let platform = lock(&registry().platform);
-        #[cfg(target_os = "android")]
-        let dialer = platform
-            .android_protector
-            .clone()
-            .map_or_else(Dialer::default, |protector| {
-                Dialer::default().with_protector(protector)
-            });
-        #[cfg(not(target_os = "android"))]
-        let dialer = {
-            let _ = &platform;
-            Dialer::default()
-        };
-        dialer.with_dns_sources(registry().dns_sources()?)
-    };
-    let network = download_context(config, dialer);
-    let store = runtime_store()?;
-    let token = cancellation.cloned().unwrap_or_default();
-    let candidate = prepare_cancelled(input, source, Some(&network), store.as_ref(), false, &token)
-        .await
-        .map_err(|_| InvokeFailure::new("HTTP resource preparation failed"))?;
-    let policy = candidate
-        .bind_ca(ca.as_ref())
-        .map_err(|_| InvokeFailure::new("HTTP private context is invalid or missing"))?;
-    config
-        .set_http_policy(Some(policy))
-        .map_err(InvokeFailure::from)
-}
-
-pub(super) fn parse_reconnect(
-    payload: StartPayload,
-    apply: &crate::resource::config_apply::ConfigApplyHandle,
-) -> Result<Config, InvokeFailure> {
-    let mut config = super::parse_config_yaml(&payload.config_yaml)?;
-    if let (Some(template), Some(paths)) = (&mut config.providers, &payload.provider_paths) {
-        Arc::make_mut(template).resource_paths = paths.clone();
-    }
-    let Some(input) = payload.http_config_yaml.as_deref() else {
-        if payload.http_context.is_some() {
-            return Err(InvokeFailure::invalid_request(
-                "httpContext requires httpConfigYaml",
-            ));
-        }
-        return Ok(config);
-    };
-    let directory = registry().data_directory()?;
-    let (mut context, ca) = source_context(
-        payload.http_context,
-        directory.root().to_owned(),
-        payload.source_file,
-    )
-    .map_err(InvokeFailure::from)?;
-    context.resource_paths = registry().provider_paths().unwrap_or_default();
-    let store = runtime_store()?;
-    let context = reconnect_source_context(
+    let candidate = inputs
+        .as_ref()
+        .map(HttpInputs::candidate)
+        .transpose()?
+        .flatten();
+    let policy = bind(
+        candidate.as_ref(),
         context,
-        payload.provider_paths,
-        &*store
-            .try_lock()
-            .map_err(|_| InvokeFailure::new("HTTP resource preparation is busy"))?,
-    );
-    if let Some(template) = &mut config.providers {
-        Arc::make_mut(template).resource_paths = context.resource_paths.clone();
-    }
-    if input.is_empty() {
-        return Ok(config);
-    }
-    // The old engine still owns the physical-network protection and Stop
-    // barrier. Preparation must finish there before we stop that engine.
-    let admission = apply
-        .try_admit()
-        .map_err(|error| InvokeFailure::new(error.message()))?;
-    let document = Document::parse(input)
-        .map_err(|_| InvokeFailure::new("invalid HTTP processing configuration"))?;
-    let (send, receive) = std::sync::mpsc::sync_channel(1);
-    admission
-        .submit(crate::resource::config_apply::ConfigUpdate::RefreshHttp {
-            document,
-            context,
-            store: runtime_store()?,
-            force: false,
-            security: Some(crate::security::SecurityContext::load(&config.tls)),
-            reply: Some(send),
-        })
-        .map_err(|error| InvokeFailure::new(error.message()))?
-        .wait_blocking()
-        .map_err(|error| InvokeFailure::new(error.message()))?;
-    let candidate = receive
-        .try_recv()
-        .map_err(|_| InvokeFailure::new("HTTP resource preparation did not return a candidate"))?;
-    let policy = candidate
-        .bind_ca(ca.as_ref())
-        .map_err(|_| InvokeFailure::new("HTTP private context is invalid or missing"))?;
-    config
-        .set_http_policy(Some(policy))
-        .map_err(InvokeFailure::from)?;
-    Ok(config)
+        &cancellation.cloned().unwrap_or_default(),
+    )?;
+    config.set_http_policy(policy).map_err(InvokeFailure::from)
 }
 
-fn reconnect_source_context(
-    mut context: SourceContext,
-    resource_paths: Option<Arc<crate::resource::paths::ProviderPaths>>,
-    store: &Store,
-) -> SourceContext {
-    if let Some(paths) = resource_paths {
-        context.resource_paths = paths;
-    } else {
-        // Public reconnect requests have no foreground-only path metadata.
-        // They still belong to the existing session and its original inputs.
-        store.inherit_inputs(&mut context);
-    }
-    context
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(super) struct ResourcePayload {
-    http_config_yaml: String,
-    http_context: Option<HttpContextInput>,
-}
-
-enum RefreshAdmission<'a> {
-    Instance(Arc<super::CoreController>),
-    Idle(IdleRefreshLease<'a>),
-}
-struct IdleRefreshLease<'a>(&'a super::RuntimeRegistry);
-impl Drop for IdleRefreshLease<'_> {
-    fn drop(&mut self) {
-        lock(&self.0.inner).idle_http_refresh = false;
-    }
-}
-fn admit_refresh(registry: &super::RuntimeRegistry) -> Result<RefreshAdmission<'_>, InvokeFailure> {
-    let mut inner = lock(&registry.inner);
-    if inner.idle_http_refresh {
-        return Err(InvokeFailure::invalid_state(
-            "HTTP resource preparation is busy",
-        ));
-    }
-    if let Some(controller) = &inner.instance {
-        return Ok(RefreshAdmission::Instance(controller.clone()));
-    }
-    // Creation and idle preparation share this registry admission. Do not
-    // hold the registry lock across filesystem or network work.
-    inner.idle_http_refresh = true;
-    Ok(RefreshAdmission::Idle(IdleRefreshLease(registry)))
-}
-
-pub(super) fn refresh(payload: ResourcePayload) -> Result<serde_json::Value, InvokeFailure> {
-    match admit_refresh(registry())? {
-        RefreshAdmission::Instance(controller) => {
-            super::invoke_instance_guarded(&controller, || {
-                let _command = controller.try_command()?;
-                refresh_owned(payload, Some(&controller))
-            })
-        }
-        RefreshAdmission::Idle(_lease) => refresh_owned(payload, None),
-    }
-}
-
-fn refresh_owned(
-    payload: ResourcePayload,
-    controller: Option<&super::CoreController>,
-) -> Result<serde_json::Value, InvokeFailure> {
-    let directory = registry().data_directory()?;
-    let (mut context, ca) = source_context(payload.http_context, directory.root().to_owned(), None)
-        .map_err(InvokeFailure::from)?;
+pub(super) fn static_policy(
+    inputs: Option<HttpInputs>,
+    context: Option<HttpContextInput>,
+) -> Result<Option<Arc<Policy>>, InvokeFailure> {
+    let Some(candidate) = inputs
+        .as_ref()
+        .map(HttpInputs::candidate)
+        .transpose()?
+        .flatten()
+    else {
+        return if context.is_some() {
+            Err(InvokeFailure::invalid_request(
+                "httpContext requires at least one HTTP plugin",
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let (settings, ca) = context.unwrap_or_default().into_settings();
     if ca.is_some() {
         return Err(InvokeFailure::invalid_request(
             "this operation does not accept CA material",
         ));
     }
-    runtime_store()?
-        .try_lock()
-        .map_err(|_| InvokeFailure::new("HTTP resource preparation is busy"))?
-        .inherit_inputs(&mut context);
-    if let Some(controller) = controller {
-        let apply = {
-            let mut inner = lock(&controller.inner);
-            super::refresh_runtime_status(&mut inner);
-            if inner.lifecycle.state() == crate::LifecycleState::Running {
-                Some(
-                    inner
-                        .engine
-                        .as_ref()
-                        .and_then(|engine| engine.config_apply.clone())
-                        .ok_or_else(|| {
-                            InvokeFailure::invalid_state("runtime cannot refresh HTTP resources")
-                        })?,
-                )
-            } else if inner.lifecycle.state() == crate::LifecycleState::Stopped {
-                None
-            } else {
-                return Err(InvokeFailure::invalid_state(
-                    "HTTP resources cannot refresh during a lifecycle transition",
-                ));
-            }
-        };
-        if let Some(apply) = apply {
-            let admission = apply
-                .try_admit()
-                .map_err(|error| InvokeFailure::new(error.message()))?;
-            let document = Document::parse(&payload.http_config_yaml)
-                .map_err(|_| InvokeFailure::new("invalid HTTP processing configuration"))?;
-            admission
-                .submit(crate::resource::config_apply::ConfigUpdate::RefreshHttp {
-                    document,
-                    context,
-                    store: runtime_store()?,
-                    force: true,
-                    security: None,
-                    reply: None,
-                })
-                .map_err(|error| InvokeFailure::new(error.message()))?
-                .wait_blocking()
-                .map_err(|error| InvokeFailure::new(error.message()))?;
-            return Ok(serde_json::json!({"resourcesReady": true, "applied": false}));
-        }
-    }
-    #[cfg(all(windows, feature = "windows-uwp"))]
-    return Err(InvokeFailure::invalid_state(
-        "HTTP resource refresh requires a bound Session Host",
-    ));
-    #[cfg(not(all(windows, feature = "windows-uwp")))]
-    refresh_idle(payload.http_config_yaml, context)
-}
-
-#[cfg(not(all(windows, feature = "windows-uwp")))]
-fn refresh_idle(input: String, context: SourceContext) -> Result<serde_json::Value, InvokeFailure> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(InvokeFailure::from)?;
-    let config = super::parse_config_yaml("rules: ['MATCH,DIRECT']")?;
-    #[cfg(target_os = "android")]
-    let dialer = lock(&registry().platform)
-        .android_protector
-        .clone()
-        .map_or_else(Dialer::default, |protector| {
-            Dialer::default().with_protector(protector)
-        });
-    #[cfg(not(target_os = "android"))]
-    let dialer = Dialer::default();
-    let network = download_context(&config, dialer.with_dns_sources(registry().dns_sources()?));
-    let store = runtime_store()?;
-    let result = runtime.block_on(prepare_candidate(
-        &input,
-        context,
-        Some(&network),
-        store.as_ref(),
-        true,
-    ));
-    runtime.shutdown_timeout(std::time::Duration::from_millis(100));
-    let _candidate = result.map_err(|_| InvokeFailure::new("HTTP resource preparation failed"))?;
-    Ok(serde_json::json!({"resourcesReady": true, "applied": false}))
-}
-
-pub(crate) async fn maintenance(
-    store: Arc<tokio::sync::Mutex<Store>>,
-    download_context: impl Fn() -> DownloadContext,
-    cancellation: CancellationToken,
-) -> io::Result<()> {
-    loop {
-        let (due, notification) = match store.try_lock() {
-            Ok(store) => (store.next_due(), store.notification()),
-            Err(_) => {
-                tokio::select! { biased;
-                    () = cancellation.cancelled() => return Ok(()),
-                    () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                }
-                continue;
-            }
-        };
-        // No polling timer when there is no scheduled HTTP source. A bounded
-        // notification also notices explicit preparation of a new document.
-        tokio::select! { biased;
-            () = cancellation.cancelled() => return Ok(()),
-            () = notification.notified() => continue,
-            () = async { match due { Some(delay) => tokio::time::sleep(delay).await, None => std::future::pending().await } } => {}
-        }
-        let Ok(mut store) = store.try_lock() else {
-            continue;
-        };
-        if store.next_due().is_some_and(|due| due.is_zero()) {
-            // Failed updates keep the last complete candidate; the store owns
-            // retry backoff. Awaiting this work preserves the Stop barrier.
-            let network = download_context();
-            let _ = store.refresh_due(&network, &cancellation).await;
-        }
-    }
+    Policy::for_evaluation(candidate, &settings)
+        .map(Some)
+        .map_err(|_| InvokeFailure::new("invalid HTTP settings"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn public_reconnect_retains_foreground_inputs_without_changing_start_context() {
-        use crate::resource::paths::{Access, ProviderPaths};
-        let root = tempfile::tempdir().unwrap();
-        let main = root.path().join("config.yaml");
-        let ca = root.path().join("ca.json");
-        std::fs::write(&main, b"original config").unwrap();
-        std::fs::write(&ca, b"original CA").unwrap();
-        let mut paths = ProviderPaths::default();
-        paths.reserve_inputs([(main.clone(), false), (ca.clone(), true)]);
-        let context = SourceContext {
-            data_dir: Some(root.path().into()),
-            config_path: Some(root.path().join("http.yaml")),
-            resource_paths: Arc::new(paths),
-            ..Default::default()
-        };
-        let document = Document::parse("rewrite: {rules: []}").unwrap();
-        let mut store = Store::new();
-        store
-            .prepare(document, &context, None, &CancellationToken::new(), false)
-            .await
-            .unwrap();
-        let (fresh, _) = source_context(None, root.path().into(), None).unwrap();
-        assert!(
-            fresh
-                .resource_paths
-                .check_reserved(&main, Access::CacheWrite, true)
-                .is_ok()
-        );
-        let reconnect = reconnect_source_context(fresh.clone(), None, &store);
-        assert_eq!(reconnect.config_path, context.config_path);
-        for input in [&main, &ca] {
-            let path = serde_yaml_ng::to_string(&input.to_string_lossy().as_ref()).unwrap();
-            let document = Document::parse(&format!("rewrite-providers:\n  remote:\n    type: http\n    url: http://rules.example.test/rules.yaml\n    path: {}\nrewrite: {{enabled: true, rules: [{{rule-set: remote}}]}}\n", path.trim_end())).unwrap();
-            let error = store
-                .prepare(document, &reconnect, None, &CancellationToken::new(), false)
-                .await
-                .err()
-                .unwrap();
-            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        }
-        assert_eq!(std::fs::read(&main).unwrap(), b"original config");
-        assert_eq!(std::fs::read(&ca).unwrap(), b"original CA");
-        // An explicitly supplied internal context starts a new input scope;
-        // public reconnect alone cannot discard the foreground reservations.
-        let explicit = reconnect_source_context(fresh, Some(Arc::default()), &store);
-        assert!(
-            explicit
-                .resource_paths
-                .check_reserved(&main, Access::CacheWrite, true)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn idle_refresh_admission_blocks_instance_creation_until_release() {
-        let registry = super::super::RuntimeRegistry::default();
-        let admission = admit_refresh(&registry).unwrap();
-        assert!(matches!(&admission, RefreshAdmission::Idle(_)));
-        assert!(registry.create_instance().is_err());
-        assert!(admit_refresh(&registry).is_err());
-        drop(admission);
-        let controller = registry.create_instance().unwrap();
-        let RefreshAdmission::Instance(admitted) = admit_refresh(&registry).unwrap() else {
-            panic!("existing instance owns resource preparation");
-        };
-        assert!(Arc::ptr_eq(&controller, &admitted));
-    }
 
     #[test]
     fn private_material_is_bounded_before_value_deserialization() {

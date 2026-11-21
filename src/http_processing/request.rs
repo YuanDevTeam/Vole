@@ -1,48 +1,90 @@
 //! Shared request decisions for HTTP/1 and HTTP/2, before any upstream IO.
-use super::{HttpContext, Scheme, config::Action};
+use super::{
+    HttpContext, Scheme,
+    config::Action,
+    rules::{RequestMatch, StaticResponse},
+};
 use crate::session::{Destination, StreamSession};
-use std::{io, net::IpAddr};
+use std::{io, net::IpAddr, sync::Arc};
 use url::Url;
 
 pub(super) struct Target {
     pub(super) original: Url,
+    pub(super) original_method: http::Method,
     pub(super) url: Url,
     pub(super) session: StreamSession,
     pub(super) logical_destination: Destination,
     pub(super) strip_origin_credentials: bool,
+    pub(super) request_conditions: u64,
 }
+impl Target {
+    pub(super) fn selection(&self) -> RequestMatch<'_> {
+        self.response_selection(0)
+    }
+
+    pub(super) fn response_selection(&self, response_conditions: u64) -> RequestMatch<'_> {
+        RequestMatch::from((&self.original, self.original_method.as_str()))
+            .with_conditions(self.request_conditions, response_conditions)
+    }
+}
+
 pub(super) enum Decision {
     Forward(Box<Target>),
     Redirect { status: u16, url: Url },
     Reject,
+    Respond(Arc<StaticResponse>),
 }
 impl HttpContext {
+    #[cfg(test)]
     pub(super) fn plan(
         &self,
         original: Url,
+        method: http::Method,
         session: StreamSession,
         scheme: Scheme,
         apply_url_actions: bool,
     ) -> io::Result<Decision> {
+        self.plan_selected(
+            original,
+            method,
+            session,
+            scheme,
+            (apply_url_actions, true),
+            0,
+        )
+    }
+
+    pub(super) fn plan_selected(
+        &self,
+        original: Url,
+        method: http::Method,
+        session: StreamSession,
+        scheme: Scheme,
+        (apply_url_actions, allow_respond): (bool, bool),
+        request_conditions: u64,
+    ) -> io::Result<Decision> {
         // Authorization is per original HTTP authority, before any URL action.
         // One allowed TLS SNI never grants other authorities on this connection.
-        if scheme == Scheme::Https && !self.permits_https(&original) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "HTTPS authority is not permitted",
-            ));
+        if scheme == Scheme::Https && !self.permits_https(&original, session.destination.port()) {
+            return Ok(Decision::Reject);
         }
         let action = if apply_url_actions {
-            self.policy().evaluate(original.clone())?
+            self.policy().evaluate_selected(
+                original.clone(),
+                method.as_str(),
+                request_conditions,
+                allow_respond,
+            )?
         } else {
             Action::Forward(original.clone())
         };
         let url = match action {
             Action::Reject => return Ok(Decision::Reject),
             Action::Redirect { status, url } => return Ok(Decision::Redirect { status, url }),
+            Action::Respond(response) => return Ok(Decision::Respond(response)),
             Action::Forward(url) => url,
         };
-        self.final_target(original, url, session, scheme)
+        self.final_target(original, method, url, session, scheme, request_conditions)
             .map(|target| Decision::Forward(Box::new(target)))
     }
 
@@ -51,9 +93,11 @@ impl HttpContext {
     pub(super) fn final_target(
         &self,
         original: Url,
+        original_method: http::Method,
         url: Url,
         mut session: StreamSession,
         scheme: Scheme,
+        request_conditions: u64,
     ) -> io::Result<Target> {
         let original_matches_tls = scheme != Scheme::Https
             || (session.sniffed_domain.as_deref().is_some_and(|sni| {
@@ -82,10 +126,12 @@ impl HttpContext {
         }
         Ok(Target {
             original,
+            original_method,
             url,
             session,
             logical_destination: destination,
             strip_origin_credentials,
+            request_conditions,
         })
     }
 }

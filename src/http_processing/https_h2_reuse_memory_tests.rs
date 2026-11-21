@@ -467,15 +467,38 @@ fn fixture_with_probe(
     let cert_pem = pem("CERTIFICATE", cert.der());
     let key_pem = pem("PRIVATE KEY", &key.serialize_der());
     let authority = Authority::load(&cert_pem, &key_pem).unwrap();
-    let document=Document::parse(&format!("mitm:\n  enabled: true\n  domains: [{{pattern: a.test}}, {{pattern: b.test}}]\nrewrite:\n  enabled: true\n  rules:\n    - {{url: 'https://a.test/', match: prefix, action: request-header-set, header: x-request, value: native}}\n    - {{url: 'https://a.test/', match: prefix, action: response-header-set, header: x-proof, value: native}}\n    - {{url: 'https://a.test/', match: prefix, action: response-body-replace, search: '-', replacement: '_'}}\n{extra}")).unwrap();
-    let candidate = document
-        .compile(&std::collections::BTreeMap::new())
-        .unwrap();
+    let document = Document::parse(&format!(
+        r#"targets:
+  - origins: [https://a.test]
+    rules:
+      - request:
+          headers:
+            - {{set: {{x-request: native}}}}
+        response:
+          headers:
+            - {{set: {{x-proof: native}}}}
+          body:
+            - {{replace: {{search: '-', replacement: '_'}}}}
+{extra}  - origins: [https://b.test]
+    intercept-only: true
+"#
+    ))
+    .unwrap();
+    let candidate = document.compile().unwrap();
     let material = CaMaterial {
         certificate: cert_pem,
         private_key: zeroize::Zeroizing::new(key_pem),
     };
-    let policy = candidate.bind_ca(Some(&material)).unwrap();
+    let policy = candidate
+        .bind_settings(
+            &crate::http_processing::config::HttpSettings {
+                mitm_enabled: true,
+                allow_intercept_only: true,
+                ..Default::default()
+            },
+            Some(&material),
+        )
+        .unwrap();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.der().clone()).unwrap();
     let origin = Origin(Arc::new(Inner {
@@ -815,7 +838,7 @@ async fn wait_post_released(origin: &Origin) -> Result<(), String> {
 
 async fn exercise_post(mode: PostReply, native: bool, change_key: bool) {
     let extra = if native {
-        "    - {url: 'https://a.test/', match: prefix, action: request-body-set, value: transformed}\n"
+        "      - request:\n          body:\n            - {set: transformed}\n"
     } else {
         ""
     };

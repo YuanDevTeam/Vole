@@ -1,12 +1,12 @@
 //! HTTP/2 downstream owner. Every request and upstream driver is polled inline.
 use super::{
     HttpContext, Scheme,
-    body::{Entity, OriginalRequestMeta, Transaction, WireBodyMeta},
+    body::{self, Entity, OriginalRequestMeta, Transaction, WireBodyMeta},
     config::checked_url,
     h2_body::{self, IDLE},
     h2_h1, h2_headers, h2_reuse, headers,
     request::{Decision, Target},
-    rules::Phase,
+    rules::{HeaderView, Phase, RequestMatch},
     script_config::BodyMode,
     script_message::{
         self, LocalResponse, Message, OriginalSnapshot, Outcome, RequestSnapshot, ResponseSnapshot,
@@ -180,6 +180,53 @@ impl HttpContext {
             && request.method() != Method::CONNECT
             && (length.is_some() || request.body().is_end_stream())
             && !request.headers().contains_key("expect");
+        let (original, asterisk) = match original_url(&request) {
+            Ok(value) => value,
+            Err(_) => return local(response, StatusCode::BAD_REQUEST, None),
+        };
+        let base_session = session.clone();
+        let request_conditions = self
+            .policy()
+            .request_conditions(HeaderView::Map(request.headers()));
+        let mut target = match self.plan_selected(
+            original,
+            request.method().clone(),
+            session,
+            Scheme::Https,
+            (!asterisk, true),
+            request_conditions,
+        ) {
+            Ok(Decision::Reject) => return local(response, StatusCode::FORBIDDEN, None),
+            Ok(Decision::Redirect { status, url }) => {
+                return local(
+                    response,
+                    StatusCode::from_u16(status).map_err(|_| failed())?,
+                    Some(url.as_str()),
+                );
+            }
+            Ok(Decision::Respond(static_response)) => {
+                let identity_allowed = body::identity_allowed(
+                    request
+                        .headers()
+                        .get_all("accept-encoding")
+                        .iter()
+                        .map(|value| std::str::from_utf8(value.as_bytes()).ok()),
+                );
+                let local = LocalResponse::from_static(
+                    &static_response,
+                    request.method() == Method::HEAD,
+                    identity_allowed,
+                    self.policy().body_budget(),
+                );
+                // Hold the receive half until the final response is queued.
+                // Dropping an unfinished upload sooner can reset the response.
+                let result = send_local(response, local).await;
+                drop(request);
+                return result;
+            }
+            Ok(Decision::Forward(target)) => *target,
+            Err(_) => return local(response, StatusCode::BAD_GATEWAY, None),
+        };
         let original_fields = headers::from_map(request.headers());
         let mut original_meta = OriginalRequestMeta::new(
             request.method().as_str(),
@@ -191,41 +238,14 @@ impl HttpContext {
         let wire = original_fields.as_ref().map(|fields| {
             WireBodyMeta::new(fields, &original_meta, Phase::Request, None, length, false)
         });
-        let (original, asterisk) = match original_url(&request) {
-            Ok(value) => value,
-            Err(_) => return local(response, StatusCode::BAD_REQUEST, None),
-        };
-        let scripts_selected = self.has_scripts(&original, Phase::Request)
-            || self.has_scripts(&original, Phase::Response);
+        let scripts_selected = self.has_scripts(target.selection(), Phase::Request)
+            || self.has_scripts(target.response_selection(u64::MAX), Phase::Response);
         let original_snapshot = scripts_selected.then(|| OriginalSnapshot {
-            url: original.clone(),
-            method: request.method().as_str().to_owned(),
+            url: target.original.clone(),
+            method: target.original_method.as_str().to_owned(),
             identity_allowed: original_meta.identity_allowed,
             asterisk,
         });
-        let base_session = session.clone();
-        let mut target = match self.plan(original, session, Scheme::Https, !asterisk) {
-            Ok(Decision::Reject) => return local(response, StatusCode::FORBIDDEN, None),
-            Ok(Decision::Redirect { status, url }) => {
-                return local(
-                    response,
-                    StatusCode::from_u16(status).map_err(|_| failed())?,
-                    Some(url.as_str()),
-                );
-            }
-            Ok(Decision::Forward(target)) => *target,
-            Err(error) => {
-                return local(
-                    response,
-                    if error.kind() == io::ErrorKind::PermissionDenied {
-                        StatusCode::FORBIDDEN
-                    } else {
-                        StatusCode::BAD_GATEWAY
-                    },
-                    None,
-                );
-            }
-        };
         if request.headers().contains_key("expect") && !request.body().is_end_stream() {
             response.continue_upload()?;
         }
@@ -233,14 +253,14 @@ impl HttpContext {
         parts.headers = h2_headers::clean(parts.headers, target.strip_origin_credentials, true)?;
         headers::apply_map(
             self.policy().rules(),
-            &target.original,
+            target.selection(),
             Phase::Request,
             &mut parts.headers,
         );
         let (mut body, mut length, entity) = self
             .prepare_body(
                 h2_body::Source::h2(body),
-                &target.original,
+                target.selection(),
                 &mut parts.headers,
                 BodyMessage {
                     phase: Phase::Request,
@@ -260,7 +280,7 @@ impl HttpContext {
                 method: parts.method.as_str().to_owned(),
                 headers: fields,
             });
-        if self.has_scripts(&target.original, Phase::Request) {
+        if self.has_scripts(target.selection(), Phase::Request) {
             if let Some(request_snapshot) = final_request.take() {
                 let mut message = Message::request(
                     original_snapshot
@@ -271,7 +291,8 @@ impl HttpContext {
                     entity,
                     original_fields.as_ref().unwrap_or(&Vec::new()),
                     target.strip_origin_credentials,
-                );
+                )
+                .with_conditions(request_conditions, 0);
                 match script_message::run(
                     self.policy(),
                     &target.original,
@@ -292,9 +313,11 @@ impl HttpContext {
                         let sticky = message.crossed_origin;
                         target = self.final_target(
                             target.original.clone(),
+                            target.original_method.clone(),
                             message.request.url.clone(),
                             base_session,
                             Scheme::Https,
+                            request_conditions,
                         )?;
                         // This flag is used for trailers, never a second ordinary
                         // credential cleanup after explicit script operations.
@@ -322,7 +345,7 @@ impl HttpContext {
                     Err(_) => return local(response, StatusCode::BAD_GATEWAY, None),
                 }
             } else {
-                self.skip_unrepresentable(&target.original, Phase::Request);
+                self.skip_unrepresentable(target.selection(), Phase::Request);
             }
         }
         let request = Request::from_parts(parts, body);
@@ -405,7 +428,7 @@ impl HttpContext {
     async fn prepare_body(
         &self,
         source: h2_body::Source,
-        original: &url::Url,
+        original: RequestMatch<'_>,
         headers: &mut http::HeaderMap,
         message: BodyMessage,
     ) -> io::Result<(h2_body::Source, Option<u64>, Option<Entity>)> {
@@ -462,14 +485,14 @@ impl HttpContext {
         .await?;
         Ok((prepared.source, prepared.expected, None))
     }
-    fn has_scripts(&self, original: &url::Url, phase: Phase) -> bool {
+    fn has_scripts(&self, original: RequestMatch<'_>, phase: Phase) -> bool {
         self.policy()
             .scripts()
             .iter()
             .any(|script| script.phase == phase && script.matches(original))
     }
 
-    fn skip_unrepresentable(&self, original: &url::Url, phase: Phase) {
+    fn skip_unrepresentable(&self, original: RequestMatch<'_>, phase: Phase) {
         for script in self
             .policy()
             .scripts()
@@ -505,9 +528,13 @@ impl HttpContext {
                 false,
             )
         });
+        let response_conditions = self
+            .policy()
+            .response_conditions(parts.status.as_u16(), HeaderView::Map(&parts.headers));
+        let selection = target.response_selection(response_conditions);
         headers::apply_map(
             self.policy().rules(),
-            &target.original,
+            selection,
             Phase::Response,
             &mut parts.headers,
         );
@@ -515,7 +542,7 @@ impl HttpContext {
         let (mut source, mut expected, entity) = self
             .prepare_body(
                 source,
-                &target.original,
+                selection,
                 &mut parts.headers,
                 BodyMessage {
                     phase: Phase::Response,
@@ -528,7 +555,7 @@ impl HttpContext {
                 },
             )
             .await?;
-        if self.has_scripts(&target.original, Phase::Response) {
+        if self.has_scripts(selection, Phase::Response) {
             let script = script.ok_or_else(failed)?;
             if let (Some(request), Some(fields), Some(original_fields)) = (
                 script.request.as_ref(),
@@ -544,7 +571,8 @@ impl HttpContext {
                     },
                     entity,
                     original_fields,
-                );
+                )
+                .with_conditions(target.request_conditions, response_conditions);
                 match script_message::run(
                     self.policy(),
                     &target.original,
@@ -572,7 +600,7 @@ impl HttpContext {
                     Err(_) => return local(response, StatusCode::BAD_GATEWAY, None),
                 }
             } else {
-                self.skip_unrepresentable(&target.original, Phase::Response);
+                self.skip_unrepresentable(selection, Phase::Response);
             }
         }
         parts.version = Version::HTTP_2;

@@ -1,12 +1,19 @@
-//! The common flat HTTP rule schema and pure, bounded rule compiler.
+//! Bounded native actions and request selectors shared with scripts.
+use super::{
+    body::{JsonFilter, ProtobufRemove},
+    origin::Origin,
+};
 use regex::{Regex, RegexBuilder};
 use std::{collections::BTreeMap, io, sync::Arc};
 use url::Url;
 
 #[path = "rule_schema.rs"]
 mod schema;
+#[cfg(test)]
+pub(crate) use schema::MatchKind;
 pub(crate) use schema::{
-    ActionKind, MatchKind, Occurrences, PatchOperation, Phase, RawRule, ReplacementMode, SearchMode,
+    ActionKind, JsonFilterSpec, Occurrences, PatchOperation, Phase, RawRule, ReplacementMode,
+    SearchMode,
 };
 
 #[path = "rule_search.rs"]
@@ -28,14 +35,116 @@ fn invalid() -> io::Error {
 pub(crate) struct Rule {
     pub(crate) name: Option<Box<str>>,
     pub(crate) enabled: bool,
-    pub(crate) selector: Matcher,
+    pub(crate) selector: Arc<RequestSelector>,
     pub(crate) action: RuleAction,
+    upstream: UpstreamAccess,
 }
 
+#[derive(Clone)]
 pub(crate) enum Matcher {
-    Exact(Box<str>),
-    Prefix(Box<str>),
+    Any,
+    PathExact(Box<str>),
+    PathPrefix(Box<str>),
     Regex(Arc<Regex>),
+    #[cfg(test)]
+    Exact(Box<str>),
+    #[cfg(test)]
+    Prefix(Box<str>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RequestMatch<'a> {
+    pub(crate) url: &'a Url,
+    pub(crate) method: &'a str,
+    request: u64,
+    response: u64,
+}
+
+impl RequestMatch<'_> {
+    pub(crate) fn with_conditions(mut self, request: u64, response: u64) -> Self {
+        self.request = request;
+        self.response = response;
+        self
+    }
+}
+
+impl<'a> From<(&'a Url, &'a str)> for RequestMatch<'a> {
+    fn from((url, method): (&'a Url, &'a str)) -> Self {
+        Self {
+            url,
+            method,
+            request: 0,
+            response: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<'a> From<&'a Url> for RequestMatch<'a> {
+    fn from(url: &'a Url) -> Self {
+        (url, "GET").into()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum HeaderView<'a> {
+    Fields(&'a [(String, String)]),
+    Map(&'a http::HeaderMap),
+}
+
+#[derive(Clone)]
+pub(crate) struct RequestSelector {
+    pub(crate) matcher: Matcher,
+    scope: Arc<[Origin]>,
+    method: Option<Box<str>>,
+    request: u64,
+    response: u64,
+}
+
+impl RequestSelector {
+    pub(super) fn new(scope: Arc<[Origin]>, method: Option<String>, matcher: Matcher) -> Self {
+        Self {
+            matcher,
+            scope,
+            method: method.map(String::into_boxed_str),
+            request: 0,
+            response: 0,
+        }
+    }
+
+    pub(super) fn scope(&self) -> &[Origin] {
+        &self.scope
+    }
+
+    pub(super) fn requiring(mut self, request: u64, response: u64) -> Self {
+        self.request = request;
+        self.response = response;
+        self
+    }
+
+    pub(super) fn matches(&self, original: RequestMatch<'_>) -> bool {
+        original.request & self.request == self.request
+            && original.response & self.response == self.response
+            && (self.scope.is_empty()
+                || self
+                    .scope
+                    .iter()
+                    .any(|origin| origin.matches_url(original.url)))
+            && self
+                .method
+                .as_deref()
+                .is_none_or(|method| method == original.method)
+            && match &self.matcher {
+                Matcher::Any => true,
+                Matcher::PathExact(value) => original.url.path() == value.as_ref(),
+                Matcher::PathPrefix(value) => original.url.path().starts_with(value.as_ref()),
+                Matcher::Regex(regex) => regex.is_match(original.url.as_str()),
+                #[cfg(test)]
+                Matcher::Exact(value) => original.url.as_str() == value.as_ref(),
+                #[cfg(test)]
+                Matcher::Prefix(value) => original.url.as_str().starts_with(value.as_ref()),
+            }
+    }
 }
 
 /// One native-selector builder profile, scoped to one candidate compilation.
@@ -45,7 +154,7 @@ pub(crate) struct SelectorCompiler {
 }
 
 impl SelectorCompiler {
-    fn regex(&mut self, pattern: &str) -> io::Result<Arc<Regex>> {
+    pub(super) fn regex(&mut self, pattern: &str) -> io::Result<Arc<Regex>> {
         if let Some(regex) = self.regexes.get(pattern) {
             return Ok(Arc::clone(regex));
         }
@@ -60,6 +169,7 @@ impl SelectorCompiler {
 }
 
 pub(crate) enum RuleAction {
+    Respond(Arc<StaticResponse>),
     Url {
         kind: ActionKind,
         replacement: Option<UrlReplacement>,
@@ -75,6 +185,17 @@ pub(crate) enum RuleAction {
     },
 }
 
+pub(crate) struct StaticResponse {
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: bytes::Bytes,
+}
+
+enum UpstreamAccess {
+    Local,
+    Managed(Option<Origin>),
+}
+
 pub(crate) enum HeaderOperation {
     Set(Box<str>),
     Add(Box<str>),
@@ -86,6 +207,8 @@ pub(crate) enum BodyOperation {
     Set(Box<str>),
     Replace(Search),
     JsonPatch(Box<[PatchOperation]>),
+    JsonFilter(JsonFilter),
+    ProtobufRemove(ProtobufRemove),
 }
 
 pub(crate) struct UrlReplacement {
@@ -102,6 +225,7 @@ pub(crate) enum UrlAction {
     Forward(Url),
     Redirect { status: u16, url: Url },
     Reject,
+    Respond(Arc<StaticResponse>),
 }
 
 // Action parameters are mutually exclusive even when explicitly set to an
@@ -171,14 +295,30 @@ impl RawRule {
 }
 
 impl Rule {
+    #[cfg(test)]
     pub(crate) fn compile(raw: RawRule, total_text: &mut usize) -> io::Result<Self> {
         Self::compile_with_selectors(raw, total_text, &mut SelectorCompiler::default())
     }
 
+    #[cfg(test)]
     pub(crate) fn compile_with_selectors(
-        mut raw: RawRule,
+        raw: RawRule,
         total_text: &mut usize,
         selectors: &mut SelectorCompiler,
+    ) -> io::Result<Self> {
+        let matcher = match raw.match_kind {
+            MatchKind::Regex => Matcher::Regex(selectors.regex(&raw.url)?),
+            MatchKind::Exact => Matcher::Exact(checked_url(&raw.url)?.as_str().into()),
+            MatchKind::Prefix => Matcher::Prefix(checked_url(&raw.url)?.as_str().into()),
+        };
+        let selector = Arc::new(RequestSelector::new(Arc::from([]), None, matcher));
+        Self::compile_scoped(raw, selector, total_text)
+    }
+
+    pub(super) fn compile_scoped(
+        mut raw: RawRule,
+        selector: Arc<RequestSelector>,
+        total_text: &mut usize,
     ) -> io::Result<Self> {
         let next_text = total_text
             .checked_add(raw.text_size()?)
@@ -200,11 +340,6 @@ impl Rule {
         {
             return Err(invalid());
         }
-        let selector = match raw.match_kind {
-            MatchKind::Regex => Matcher::Regex(selectors.regex(&raw.url)?),
-            MatchKind::Exact => Matcher::Exact(checked_url(&raw.url)?.as_str().into()),
-            MatchKind::Prefix => Matcher::Prefix(checked_url(&raw.url)?.as_str().into()),
-        };
         let parameters = raw.parameters();
         let search_parameters = REPLACEMENT | SEARCH | SEARCH_MODE | OCCURRENCES;
         let allowed = match raw.action {
@@ -246,7 +381,7 @@ impl Rule {
                     return Err(invalid());
                 }
                 let mode = raw.replacement_mode.unwrap_or_default();
-                let value = match &selector {
+                let value = match &selector.matcher {
                     Matcher::Regex(regex) => {
                         if value.chars().any(|character| {
                             character.is_control()
@@ -322,26 +457,66 @@ impl Rule {
             enabled: raw.enabled,
             selector,
             action,
+            upstream: UpstreamAccess::Local,
         })
     }
 
-    pub(crate) fn matches(&self, url: &Url) -> bool {
-        self.enabled
-            && match &self.selector {
-                Matcher::Exact(value) => url.as_str() == value.as_ref(),
-                Matcher::Prefix(value) => url.as_str().starts_with(value.as_ref()),
-                Matcher::Regex(regex) => regex.is_match(url.as_str()),
-            }
+    pub(super) fn body(
+        name: Option<String>,
+        selector: Arc<RequestSelector>,
+        phase: Phase,
+        operation: BodyOperation,
+    ) -> Self {
+        Self {
+            name: name.map(String::into_boxed_str),
+            enabled: true,
+            selector,
+            action: RuleAction::Body { phase, operation },
+            upstream: UpstreamAccess::Local,
+        }
     }
 
-    pub(crate) fn evaluate_url(&self, url: &Url) -> io::Result<Option<UrlAction>> {
+    pub(super) fn respond(
+        name: Option<String>,
+        selector: Arc<RequestSelector>,
+        response: StaticResponse,
+    ) -> Self {
+        Self {
+            name: name.map(String::into_boxed_str),
+            enabled: true,
+            selector,
+            action: RuleAction::Respond(Arc::new(response)),
+            upstream: UpstreamAccess::Local,
+        }
+    }
+
+    pub(super) fn restrict_upstream(&mut self, approved: Option<Origin>) {
+        self.upstream = UpstreamAccess::Managed(approved);
+    }
+
+    pub(crate) fn matches<'a>(&self, original: impl Into<RequestMatch<'a>>) -> bool {
+        self.enabled && self.selector.matches(original.into())
+    }
+
+    pub(crate) fn evaluate_url<'a>(
+        &self,
+        original: impl Into<RequestMatch<'a>>,
+    ) -> io::Result<Option<UrlAction>> {
+        let original = original.into();
+        let url = original.url;
         if url.as_str().len() > MAX_URL {
             return Err(invalid());
         }
-        let RuleAction::Url { kind, replacement } = &self.action else {
-            return Ok(None);
+        let (kind, replacement) = match &self.action {
+            RuleAction::Respond(response) => {
+                return Ok(self
+                    .matches(original)
+                    .then(|| UrlAction::Respond(response.clone())));
+            }
+            RuleAction::Url { kind, replacement } => (kind, replacement),
+            _ => return Ok(None),
         };
-        if !self.matches(url) {
+        if !self.matches(original) {
             return Ok(None);
         }
         if *kind == ActionKind::Reject {
@@ -349,10 +524,34 @@ impl Rule {
         }
         let replacement = replacement.as_ref().expect("compiled URL replacement");
         let mut out = String::new();
-        match (&self.selector, &replacement.value) {
-            (Matcher::Exact(_), ReplacementValue::Literal(value)) => {
-                template::append(&mut out, value, MAX_URL)?
+        match (&self.selector.matcher, &replacement.value) {
+            (Matcher::Any | Matcher::PathExact(_), ReplacementValue::Literal(value)) => {
+                template::append(&mut out, value, MAX_URL)?;
             }
+            (Matcher::PathPrefix(prefix), ReplacementValue::Literal(value)) => {
+                let suffix = &url.path()[prefix.len()..];
+                if replacement.mode == ReplacementMode::Match {
+                    let target = checked_url(value)?;
+                    let mut path = target.path().to_owned();
+                    if path.ends_with('/') && suffix.starts_with('/') {
+                        path.pop();
+                    }
+                    template::append(&mut path, suffix, MAX_URL)?;
+                    let mut target = target;
+                    target.set_path(&path);
+                    if target.query().is_none() {
+                        target.set_query(url.query());
+                    }
+                    template::append(&mut out, target.as_str(), MAX_URL)?;
+                } else {
+                    template::append(&mut out, value, MAX_URL)?;
+                }
+            }
+            #[cfg(test)]
+            (Matcher::Exact(_), ReplacementValue::Literal(value)) => {
+                template::append(&mut out, value, MAX_URL)?;
+            }
+            #[cfg(test)]
             (Matcher::Prefix(prefix), ReplacementValue::Literal(value)) => {
                 let suffix = &url.as_str()[prefix.len()..];
                 let value = if replacement.mode == ReplacementMode::Match
@@ -384,7 +583,17 @@ impl Rule {
         }
         let target = checked_url(&out)?;
         Ok(Some(match kind {
-            ActionKind::Replace => UrlAction::Forward(target),
+            ActionKind::Replace => {
+                if let UpstreamAccess::Managed(allowed) = &self.upstream
+                    && !same_origin(url, &target)
+                    && !allowed
+                        .as_ref()
+                        .is_some_and(|origin| origin.matches_url(&target))
+                {
+                    return Ok(None);
+                }
+                UrlAction::Forward(target)
+            }
             ActionKind::Redirect302 => UrlAction::Redirect {
                 status: 302,
                 url: target,
@@ -396,6 +605,19 @@ impl Rule {
             _ => unreachable!("URL action"),
         }))
     }
+}
+
+pub(super) fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.port_or_known_default() == right.port_or_known_default()
+        && left
+            .host_str()
+            .zip(right.host_str())
+            .is_some_and(|(left, right)| {
+                left.strip_suffix('.')
+                    .unwrap_or(left)
+                    .eq_ignore_ascii_case(right.strip_suffix('.').unwrap_or(right))
+            })
 }
 
 pub(crate) fn checked_url(raw: &str) -> io::Result<Url> {
