@@ -1093,6 +1093,22 @@ impl OutboundConnector for VlessOutbound {
         })
     }
 
+    #[cfg(all(target_os = "linux", feature = "inbound-http"))]
+    fn permits_http_tcp_reuse_as_route_leaf(&self) -> bool {
+        OutboundConnector::permits_http_tcp_reuse(self)
+            || (!self.cancellation.is_cancelled()
+                && matches!(self.transport, StreamTransport::Tcp)
+                && matches!(self.upload.http_reuse_security, HttpReuseSecurity::Plain)
+                && !self.vision
+                && self.encryption.is_none()
+                && self.xhttp.is_none()
+                && self.download.is_none()
+                && self
+                    .upload
+                    .upstream
+                    .permits_static_mptcp_http_reuse(&self.upload.server))
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,

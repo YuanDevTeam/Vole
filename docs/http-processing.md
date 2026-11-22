@@ -219,6 +219,8 @@ H1 上游协商 HTTP/1.1，H2 下游对接实际协商的 H2 或 H1。普通 H2 
 
 固定连接器资格由实际出站图提供。动态策略组、未知上游路径、会改变安全身份的外部资源以及已停止的节点走单次路径。VLESS 的上传、下载腿分别校验其真实 TCP 或 UDP 载体；在 macOS 上，`mptcp: true` 沿用普通 TCP 路径。各协议的静态端点、安全身份和封装限制见 [出站契约](outbounds.md)、[VLESS](vless.md) 和 [XHTTP](xhttp.md)。保留的业务连接继续拥有其协议逻辑流和租约，直到退役、下游结束或 Stop。
 
+Linux 上直接连接字面 IP 的明文 VLESS TCP 叶节点可以保留通过 `mptcp: true` 建立的业务上游。该资格要求固定物理出口、无 TFO、无 Vision 或 Encryption，且仅用于该节点自身的业务 HTTP 连接。新连接仍按现有物理拨号策略尝试 MPTCP。
+
 ## 会话边界
 
 运行会话固定主设置、由插件原文编译的规则和脚本、本机设置及 CA。插件保存及订阅更新由宿主管理，节点选择和分流更新沿用运行中的 HTTP 输入。显式重连先准备候选再切换，失败恢复原会话的实际内容。普通 Stop 释放私密材料。[Invoke API](invoke-api.md#http-插件与本机设置) · [CLI](cli.md) · [离线回归](../tests/README.md#http-处理与-invoke)

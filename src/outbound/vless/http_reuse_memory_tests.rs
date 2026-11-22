@@ -78,6 +78,51 @@ fn capable(node: &VlessOutbound) -> bool {
     OutboundConnector::permits_http_tcp_reuse(node)
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn static_plain_mptcp_reuse_stays_at_the_routed_vless_leaf() {
+    use crate::outbound::connector::{ConnectorDispatcher, IpVersionConnector};
+
+    let mptcp = Dialer::default().with_mptcp(true);
+    let bare = Arc::new(node(base(), path(mptcp.clone())));
+    let wrapped = |version| {
+        Arc::new(IpVersionConnector {
+            inner: bare.clone(),
+            version,
+        })
+    };
+
+    assert!(!capable(&bare));
+    let dual = wrapped(IpVersion::Dual);
+    assert!(!UpstreamPath::proxy(dual.clone()).permits_static_http_reuse(&bare.upload.server));
+    assert!(Dispatcher::permits_http_tcp_reuse(
+        &ConnectorDispatcher::new(dual)
+    ));
+    assert!(!Dispatcher::permits_http_tcp_reuse(
+        &ConnectorDispatcher::new(wrapped(IpVersion::Ipv4))
+    ));
+
+    let mut named = base();
+    named["server"] = json!("proxy.invalid");
+    let mut tls = base();
+    tls["tls"] = json!(true);
+    tls["servername"] = json!("proxy.invalid");
+    for rejected in [
+        node(named, path(mptcp.clone())),
+        node(tls, path(mptcp.clone())),
+        node(base(), path(mptcp.clone().with_tfo(true))),
+        node(
+            base(),
+            path(mptcp.with_source_ip("192.0.2.20".parse().unwrap())),
+        ),
+    ] {
+        assert!(!rejected.permits_http_tcp_reuse_as_route_leaf());
+    }
+
+    OutboundConnector::begin_shutdown(bare.as_ref());
+    assert!(!bare.permits_http_tcp_reuse_as_route_leaf());
+}
+
 struct Unknown;
 #[async_trait]
 impl OutboundConnector for Unknown {

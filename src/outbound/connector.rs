@@ -591,6 +591,14 @@ pub trait OutboundConnector: Send + Sync {
         false
     }
 
+    /// The routed leaf can retain a connection without granting reuse to an
+    /// enclosing transport that uses this connector as a dependency.
+    #[cfg(all(target_os = "linux", feature = "inbound-http"))]
+    #[doc(hidden)]
+    fn permits_http_tcp_reuse_as_route_leaf(&self) -> bool {
+        self.permits_http_tcp_reuse()
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,
@@ -759,6 +767,21 @@ impl std::fmt::Debug for UpstreamPath {
 }
 
 impl UpstreamPath {
+    #[cfg(any(feature = "inbound-http", feature = "outbound-vless"))]
+    fn literal_direct_dialer(&self, address: &SocketAddr) -> Option<&Dialer> {
+        match self {
+            Self::LazyDirect { dialer } => Some(dialer),
+            Self::Direct { endpoint, dialer }
+                if endpoint.port == address.port()
+                    && endpoint.logical_host.parse::<IpAddr>().ok() == Some(address.ip())
+                    && endpoint.addresses.as_slice() == std::slice::from_ref(address) =>
+            {
+                Some(dialer)
+            }
+            _ => None,
+        }
+    }
+
     /// A retained HTTP stream must not hide a new physical path selection.
     /// Only exact literal endpoints and recursively proven connectors qualify;
     /// groups are rejected even when their current member happens to be DIRECT.
@@ -767,19 +790,12 @@ impl UpstreamPath {
         let Destination::Ip(address) = server else {
             return false;
         };
-        let dialer = match self {
-            Self::LazyDirect { dialer } => dialer,
-            Self::Direct { endpoint, dialer }
-                if endpoint.port == address.port()
-                    && endpoint.logical_host.parse::<IpAddr>().ok() == Some(address.ip())
-                    && endpoint.addresses.as_slice() == std::slice::from_ref(address) =>
-            {
-                dialer
-            }
-            Self::Proxy(connector) => return connector.permits_http_tcp_reuse(),
-            _ => return false,
-        };
-        dialer.permits_static_http_reuse() && !dialer.http_reuse_cancelled()
+        if let Self::Proxy(connector) = self {
+            return connector.permits_http_tcp_reuse();
+        }
+        self.literal_direct_dialer(address).is_some_and(|dialer| {
+            dialer.permits_static_http_reuse() && !dialer.http_reuse_cancelled()
+        })
     }
 
     /// A UDP carrier may retain a business TCP stream only on a proven
@@ -800,18 +816,22 @@ impl UpstreamPath {
         let Destination::Ip(address) = server else {
             return false;
         };
-        let dialer = match self {
-            Self::LazyDirect { dialer } => dialer,
-            Self::Direct { endpoint, dialer }
-                if endpoint.port == address.port()
-                    && endpoint.logical_host.parse::<IpAddr>().ok() == Some(address.ip())
-                    && endpoint.addresses.as_slice() == std::slice::from_ref(address) =>
-            {
-                dialer
-            }
-            _ => return false,
+        self.literal_direct_dialer(address).is_some_and(|dialer| {
+            dialer.permits_static_http_reuse() && !dialer.http_reuse_cancelled()
+        })
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        feature = "inbound-http",
+        feature = "outbound-vless"
+    ))]
+    pub(crate) fn permits_static_mptcp_http_reuse(&self, server: &Destination) -> bool {
+        let Destination::Ip(address) = server else {
+            return false;
         };
-        dialer.permits_static_http_reuse() && !dialer.http_reuse_cancelled()
+        self.literal_direct_dialer(address)
+            .is_some_and(|dialer| dialer.permits_static_mptcp_http_reuse(*address))
     }
 
     /// A multi-endpoint node shares the declared graph, while each
@@ -865,17 +885,7 @@ impl UpstreamPath {
         let Destination::Ip(address) = server else {
             return None;
         };
-        let dialer = match self {
-            Self::LazyDirect { dialer } => dialer,
-            Self::Direct { endpoint, dialer }
-                if endpoint.port == address.port()
-                    && endpoint.logical_host.parse::<IpAddr>().ok() == Some(address.ip())
-                    && endpoint.addresses.as_slice() == std::slice::from_ref(address) =>
-            {
-                dialer
-            }
-            _ => return None,
-        };
+        let dialer = self.literal_direct_dialer(address)?;
         dialer.permits_static_h2_reuse().then_some(dialer)
     }
 
@@ -1114,6 +1124,12 @@ impl OutboundConnector for IpVersionConnector {
         self.version == crate::config::IpVersion::Dual && self.inner.permits_http_tcp_reuse()
     }
 
+    #[cfg(all(target_os = "linux", feature = "inbound-http"))]
+    fn permits_http_tcp_reuse_as_route_leaf(&self) -> bool {
+        self.version == crate::config::IpVersion::Dual
+            && self.inner.permits_http_tcp_reuse_as_route_leaf()
+    }
+
     async fn connect_stream(
         &self,
         session: StreamSession,
@@ -1233,7 +1249,14 @@ impl ConnectorDispatcher {
 impl Dispatcher for ConnectorDispatcher {
     #[cfg(feature = "inbound-http")]
     fn permits_http_tcp_reuse(&self) -> bool {
-        self.inner.permits_http_tcp_reuse()
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.permits_http_tcp_reuse_as_route_leaf()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.inner.permits_http_tcp_reuse()
+        }
     }
 
     fn supports_udp(&self) -> bool {

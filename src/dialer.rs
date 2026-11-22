@@ -511,6 +511,19 @@ impl Dialer {
         true
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        feature = "inbound-http",
+        feature = "outbound-vless"
+    ))]
+    pub(crate) fn permits_static_mptcp_http_reuse(&self, address: SocketAddr) -> bool {
+        !self.tfo
+            && self.ip_version == crate::config::IpVersion::Dual
+            && self.permits_mptcp()
+            && !self.http_reuse_cancelled()
+            && self.connected_address(address).is_ok()
+    }
+
     #[cfg(feature = "outbound-vless")]
     pub(crate) fn h2_reuse_cancellation(&self) -> CancellationToken {
         self.initialization.cancellation.clone()
