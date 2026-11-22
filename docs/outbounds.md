@@ -654,8 +654,9 @@ recv-window-conn 实际为 stream，recv-window 实际为 connection；正值同
 窗口是信用额度，不预分配全部缓冲；显式正值不按默认窗口钳位。
 
 max-open-streams 控制客户端 TCP/UDP 所有者池，不把业务所有者阈值写入 Quinn 远端 stream 表；
-远端双向流信用固定为0。仅macOS、quic relay且未启用UoT v2的实际UDP池1，通告独立的128条远端单向流许可；
-同节点TCP池0、native、UoT v2和其它平台仍为32。实际并行入站decoder仍为32，未增加正文交付队列。
+远端双向流信用固定为0。macOS 的 quic relay 实际UDP池1在未启用UoT v2时通告128条远端单向流许可。
+Linux 同样允许该额度，但仅限由 TUN UDP 建立、以字面 IP 直接连接对端的会话。
+TCP池0、native、UoT v2及其余路径仍为32。实际并行入站decoder仍为32，未增加正文交付队列。
 额外最多96条尚未accept的UNI由Quinn持有，可能增加流表、未读数据和排队驻留；原连接接收信用与payload预算保持，
 不预分配128份正文，也不保证进程内存不增加。max-open-streams为0使用100；参考客户端100阈值转换90，入池计数必须严格小于阈值，所以
 默认89个同时所有者，其它正N为N-1；1和负值可解析但无法开启业务。饱和新建物理

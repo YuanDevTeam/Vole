@@ -362,6 +362,18 @@ impl Drop for TuicOutbound {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn direct_literal_tun_datagrams(
+    session: &DatagramSession,
+    upstream: &UpstreamPath,
+    server: &Destination,
+    peer: std::net::SocketAddr,
+) -> bool {
+    session.inbound == crate::session::InboundKind::Tun
+        && matches!(server, Destination::Ip(address) if *address == peer)
+        && upstream.literal_direct_dialer(&peer).is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     config: Arc<TuicOutboundConfig>,
@@ -389,6 +401,10 @@ async fn drive(
         let handshake = observation::track(ResourceKind::Handshake);
         let destination = upstream.datagram_server(&server, &context).await?;
         let peer = context.resolve_ip(&destination).await?;
+        #[cfg(target_os = "linux")]
+        let wider_uni_scope = direct_literal_tun_datagrams(&datagram, &upstream, &server, peer);
+        #[cfg(not(target_os = "linux"))]
+        let wider_uni_scope = cfg!(target_os = "macos");
         let budget = DatagramBudget::new(
             crate::limits::TUIC_QUIC_PAYLOAD as u16,
             crate::limits::TUIC_QUIC_PAYLOAD as u16,
@@ -434,7 +450,7 @@ async fn drive(
         let initial_mtu = if discovery.is_some() { 1200 } else { mtu };
         // Only the actual UDP business lane receives per-packet remote UNI
         // streams. This permission is separate from the 32 active decoders.
-        let advertised_uni_credit = if cfg!(target_os = "macos")
+        let advertised_uni_credit = if wider_uni_scope
             && datagram_business
             && config.udp_mode == crate::config::TuicUdpMode::Quic
             && !config.udp_over_stream
@@ -596,6 +612,55 @@ fn current_tls(
 #[cfg(test)]
 mod p08_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wider_udp_uni_scope_requires_a_tun_and_exact_literal_direct_path() {
+        use crate::{
+            dialer::{Dialer, ResolvedEndpoint},
+            session::InboundKind,
+        };
+
+        let peer = "192.0.2.1:443".parse().unwrap();
+        let other = "192.0.2.2:443".parse().unwrap();
+        let server = Destination::Ip(peer);
+        let domain = Destination::domain("peer.invalid", 443).unwrap();
+        let source = "198.51.100.1:12345".parse().unwrap();
+        let tun = DatagramSession::new(InboundKind::Tun, source);
+        let socks = DatagramSession::new(InboundKind::Socks5, source);
+        let lazy = UpstreamPath::LazyDirect {
+            dialer: Dialer::default(),
+        };
+        let prepared = |addresses| {
+            UpstreamPath::direct(
+                ResolvedEndpoint {
+                    logical_host: peer.ip().to_string(),
+                    port: peer.port(),
+                    addresses,
+                },
+                Dialer::default(),
+            )
+        };
+        let proxy = UpstreamPath::proxy(Arc::new(crate::outbound::RejectOutbound::default()));
+        assert!(direct_literal_tun_datagrams(&tun, &lazy, &server, peer));
+        assert!(direct_literal_tun_datagrams(
+            &tun,
+            &prepared(vec![peer]),
+            &server,
+            peer
+        ));
+        assert!(!direct_literal_tun_datagrams(&socks, &lazy, &server, peer));
+        assert!(!direct_literal_tun_datagrams(&tun, &lazy, &domain, peer));
+        assert!(!direct_literal_tun_datagrams(&tun, &lazy, &server, other));
+        assert!(!direct_literal_tun_datagrams(&tun, &proxy, &server, peer));
+        assert!(!direct_literal_tun_datagrams(
+            &tun,
+            &prepared(vec![peer, other]),
+            &server,
+            peer
+        ));
+    }
+
     #[tokio::test]
     async fn tuic_cold_connection_cannot_publish_an_early_quinn_handle_without_resumption() {
         struct Discard;

@@ -767,8 +767,12 @@ impl std::fmt::Debug for UpstreamPath {
 }
 
 impl UpstreamPath {
-    #[cfg(any(feature = "inbound-http", feature = "outbound-vless"))]
-    fn literal_direct_dialer(&self, address: &SocketAddr) -> Option<&Dialer> {
+    #[cfg(any(
+        feature = "inbound-http",
+        feature = "outbound-vless",
+        all(target_os = "linux", feature = "outbound-tuic")
+    ))]
+    pub(crate) fn literal_direct_dialer(&self, address: &SocketAddr) -> Option<&Dialer> {
         match self {
             Self::LazyDirect { dialer } => Some(dialer),
             Self::Direct { endpoint, dialer }
