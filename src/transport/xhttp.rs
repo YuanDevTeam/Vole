@@ -101,9 +101,26 @@ pub(crate) use h3_driver::UdpAssociationControl;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct UdpAssociationCapture {
     slot: Arc<Mutex<Option<Option<Weak<UdpAssociationControl>>>>>,
+    #[cfg(target_os = "linux")]
+    linux_tun_packet_up: bool,
 }
 #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
 impl UdpAssociationCapture {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_linux_tun_packet_up(mut self) -> Self {
+        self.linux_tun_packet_up = true;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    fn packet_up_delay(&self, actual_h3_control: bool) -> Duration {
+        if actual_h3_control && self.linux_tun_packet_up {
+            Duration::from_millis(1)
+        } else {
+            packet_up::DEFAULT_OVERLAP_DELAY
+        }
+    }
+
     fn report(&self, control: Option<Weak<UdpAssociationControl>>) {
         let mut slot = self.slot.lock().unwrap();
         let value = if slot.is_none() { control } else { None };
@@ -308,13 +325,15 @@ impl XHttpClient {
             ));
         }
         let (sender, connection) = self.handshake(stream).await?;
-        self.connect_http(sender, connection.into()).await
+        self.connect_http(sender, connection.into(), packet_up::DEFAULT_OVERLAP_DELAY)
+            .await
     }
 
     async fn connect_http(
         &self,
         sender: SendRequest,
         connection: ConnectionLease,
+        default_packet_up_delay: Duration,
     ) -> io::Result<BoxStream> {
         match self.mode {
             XHttpMode::StreamOne => self.connect_stream_one(sender, connection).await,
@@ -335,6 +354,7 @@ impl XHttpClient {
                     self,
                     download_sender,
                     ConnectionGuards::single(connection),
+                    default_packet_up_delay,
                 )
                 .await
             }
@@ -422,7 +442,10 @@ impl XHttpClient {
                     )
                     .await;
             }
-            let connected = self.connect_http(sender, driver).await?;
+            let delay = packet_up::DEFAULT_OVERLAP_DELAY;
+            #[cfg(all(target_os = "linux", feature = "sing-mux"))]
+            let delay = capture.map_or(delay, |capture| capture.packet_up_delay(control.is_some()));
+            let connected = self.connect_http(sender, driver, delay).await?;
             #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
             if let Some(capture) = capture {
                 capture.report(control);
@@ -571,6 +594,7 @@ impl XHttpClient {
                     download_client,
                     download_sender,
                     connections,
+                    packet_up::DEFAULT_OVERLAP_DELAY,
                 )
                 .await
             }
@@ -686,6 +710,7 @@ impl XHttpClient {
         &self,
         sender: SendRequest,
         session: Arc<str>,
+        default_delay: Duration,
     ) -> io::Result<packet_up::Writer> {
         let overlap = (self.shared_packet_up || self.packet_up_response_overlap)
             && self.mode == XHttpMode::PacketUp
@@ -701,6 +726,7 @@ impl XHttpClient {
                 session,
                 self.upload_chunk_size,
                 &self.owner,
+                default_delay,
             )
         } else {
             packet_up::Writer::new(
@@ -719,6 +745,7 @@ impl XHttpClient {
         download_client: &XHttpClient,
         download_sender: SendRequest,
         connections: ConnectionGuards,
+        default_delay: Duration,
     ) -> io::Result<BoxStream> {
         let session_id: Arc<str> = Arc::from(self.request.options.session_id.generate());
         let mut download_sender = download_sender;
@@ -727,7 +754,7 @@ impl XHttpClient {
         let (response, _) = download_sender.send_request(request, true).await?;
 
         Ok(Box::new(XHttpStream::new(PacketUp {
-            upload: self.packet_up_writer(upload_sender, session_id)?,
+            upload: self.packet_up_writer(upload_sender, session_id, default_delay)?,
             download: Downlink::pending(response, "packet-up download", false),
             closed: false,
             _connections: connections,

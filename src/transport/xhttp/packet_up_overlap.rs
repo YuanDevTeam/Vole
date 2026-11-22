@@ -200,6 +200,7 @@ pub(super) async fn transmit(
     request: RequestTemplate,
     session: Arc<str>,
     eager_capacity: Option<usize>,
+    default_delay: Duration,
 ) -> io::Result<()> {
     let mut responses = Responses::default();
     let mut sequence = 0_u64;
@@ -216,9 +217,8 @@ pub(super) async fn transmit(
                 }
             })
             .await?;
-        // Shorten only this shared-H3 writer's default partial-batch deadline.
         let delay = if eager_capacity.is_some() {
-            Duration::from_millis(2)
+            default_delay
         } else {
             Duration::from_millis(request.options.post_interval_ms.sample() as u64)
         };

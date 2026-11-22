@@ -40,6 +40,13 @@ impl Fixture {
     }
 
     async fn with_request_options(options: XHttpRequestOptions) -> Self {
+        Self::with_overlap_delay(options, None).await
+    }
+
+    async fn with_overlap_delay(
+        options: XHttpRequestOptions,
+        overlap_delay: Option<Duration>,
+    ) -> Self {
         let chunk = options.post_bytes.max.min(crate::limits::XHTTP_BODY_CHUNK);
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (packets, receiver) = mpsc::channel(2);
@@ -91,7 +98,13 @@ impl Fixture {
             headers: Default::default(),
             options: Arc::new(options),
         };
-        let writer = Writer::new(sender, request, Arc::from("session"), chunk, &owner).unwrap();
+        let session = Arc::from("session");
+        let writer = if let Some(delay) = overlap_delay {
+            Writer::new_overlapping(sender, request, session, chunk, &owner, delay)
+        } else {
+            Writer::new(sender, request, session, chunk, &owner)
+        }
+        .unwrap();
         Self {
             writer,
             owner,
@@ -408,19 +421,21 @@ async fn default_full_batch_submits_without_timer_or_extra_buffer() {
 
 #[tokio::test(start_paused = true)]
 async fn default_partial_and_explicit_full_batches_keep_their_original_interval() {
-    for (interval, length, minimum_ms, maximum_ms) in [
-        (None, 3, 10, 10),
-        (Some(""), 3, 10, 10),
-        (Some("10"), crate::limits::XHTTP_PACKET_BATCH_BYTES, 10, 10),
-        (
-            Some("100-101"),
-            crate::limits::XHTTP_PACKET_BATCH_BYTES,
-            100,
-            101,
-        ),
+    const BATCH: usize = crate::limits::XHTTP_PACKET_BATCH_BYTES;
+    let fast = Some(Duration::from_millis(1));
+    for (overlap, interval, length, minimum_ms, maximum_ms) in [
+        (None, None, 3, 10, 10),
+        (None, Some(""), 3, 10, 10),
+        (None, Some("10"), BATCH, 10, 10),
+        (None, Some("100-101"), BATCH, 100, 101),
+        (Some(DEFAULT_OVERLAP_DELAY), None, 3, 2, 2),
+        (fast, None, 3, 1, 1),
+        (fast, Some(""), 3, 1, 1),
+        (fast, None, BATCH, 0, 0),
+        (fast, Some("100-101"), BATCH, 100, 101),
     ] {
-        let options = normalized_packet_options(interval, 1_000_000, true);
-        let mut fixture = Fixture::with_request_options(options).await;
+        let options = normalized_packet_options(interval, 1_000_000, overlap.is_none());
+        let mut fixture = Fixture::with_overlap_delay(options, overlap).await;
         let began = Instant::now();
         let payload = vec![0x5a; length];
         fixture.writer.write_all(&payload).await.unwrap();

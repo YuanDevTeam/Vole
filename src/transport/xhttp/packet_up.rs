@@ -85,6 +85,8 @@ pub(super) struct Writer {
     chunk: usize,
     _task: ConnectionGuard,
 }
+pub(super) const DEFAULT_OVERLAP_DELAY: Duration = Duration::from_millis(2);
+
 impl Writer {
     pub(super) fn new(
         sender: SendRequest,
@@ -93,7 +95,7 @@ impl Writer {
         chunk: usize,
         owner: &DriverOwner,
     ) -> io::Result<Self> {
-        Self::with_responses(sender, request, session, chunk, owner, false)
+        Self::with_responses(sender, request, session, chunk, owner, None)
     }
 
     pub(super) fn new_overlapping(
@@ -102,8 +104,9 @@ impl Writer {
         session: Arc<str>,
         chunk: usize,
         owner: &DriverOwner,
+        default_delay: Duration,
     ) -> io::Result<Self> {
-        Self::with_responses(sender, request, session, chunk, owner, true)
+        Self::with_responses(sender, request, session, chunk, owner, Some(default_delay))
     }
 
     fn with_responses(
@@ -112,12 +115,12 @@ impl Writer {
         session: Arc<str>,
         chunk: usize,
         owner: &DriverOwner,
-        overlap_responses: bool,
+        overlap_default_delay: Option<Duration>,
     ) -> io::Result<Self> {
         // Mihomo samples this maximum once per logical writer. Never allocate
         // the configurable (up to 16 MiB) maximum per connection.
         let batch_limit = if matches!(&sender, SendRequest::H3(_)) {
-            if overlap_responses {
+            if overlap_default_delay.is_some() {
                 crate::limits::XHTTP_H3_PACKET_BATCH_BYTES
             } else {
                 crate::limits::XHTTP_H3_SERIAL_PACKET_BATCH_BYTES
@@ -154,11 +157,18 @@ impl Writer {
         let lifetime = Lifetime(shared.clone());
         let worker = shared.clone();
         // Branch before spawning: ordinary writers keep the original future layout.
-        let task = if overlap_responses {
+        let task = if let Some(default_delay) = overlap_default_delay {
             owner.spawn(async move {
                 let _lifetime = lifetime;
-                if let Err(error) =
-                    overlap::transmit(&worker, sender, request, session, eager_capacity).await
+                if let Err(error) = overlap::transmit(
+                    &worker,
+                    sender,
+                    request,
+                    session,
+                    eager_capacity,
+                    default_delay,
+                )
+                .await
                 {
                     worker.state.lock().unwrap().error = Some(Arc::new(error));
                 }

@@ -97,10 +97,14 @@ impl SingMuxConnector {
         session.sniffed_domain = None;
         let source = session.source;
         #[cfg(feature = "outbound-vless")]
-        let h3_capture = self
-            .pool
-            .captures_h3_udp()
-            .then(crate::transport::xhttp::UdpAssociationCapture::default);
+        let h3_capture = self.pool.captures_h3_udp().then(|| {
+            let capture = crate::transport::xhttp::UdpAssociationCapture::default();
+            #[cfg(target_os = "linux")]
+            if session.inbound == InboundKind::Tun && !self.pool.brutal_enabled() {
+                return capture.with_linux_tun_packet_up();
+            }
+            capture
+        });
         #[cfg(feature = "outbound-vless")]
         let h3_context = h3_capture
             .as_ref()

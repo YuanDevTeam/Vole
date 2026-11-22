@@ -202,7 +202,11 @@ impl Fixture {
     }
     fn writer(&self, session: &str) -> packet_up::Writer {
         self.client
-            .packet_up_writer(self.sender.as_ref().unwrap().clone(), Arc::from(session))
+            .packet_up_writer(
+                self.sender.as_ref().unwrap().clone(),
+                Arc::from(session),
+                packet_up::DEFAULT_OVERLAP_DELAY,
+            )
             .unwrap()
     }
     fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static) {
@@ -438,6 +442,25 @@ async fn qualified_default_partial_post_reaches_h3_before_ten_ms_with_strong_rec
         let mut fixture = Fixture::new(client, false, 16, 256 * 1024);
         let result = AssertUnwindSafe(timeout(LIMIT, async {
             let mut peer = fixture.initialize().await;
+            #[cfg(target_os = "linux")]
+            {
+                let Some(SendRequest::H3(sender)) = &fixture.sender else {
+                    unreachable!("fixture has a real H3 sender");
+                };
+                let capture = UdpAssociationCapture::default();
+                let actual_control = sender.udp_control.is_some();
+                assert_eq!(
+                    capture.packet_up_delay(actual_control),
+                    packet_up::DEFAULT_OVERLAP_DELAY
+                );
+                let capture = capture.with_linux_tun_packet_up();
+                let expected = if protocol == "h2mux" {
+                    Duration::from_millis(1)
+                } else {
+                    packet_up::DEFAULT_OVERLAP_DELAY
+                };
+                assert_eq!(capture.packet_up_delay(actual_control), expected);
+            }
             let (arrived, arrival) = oneshot::channel();
             let (release, released) = oneshot::channel();
             fixture.spawn(async move {
