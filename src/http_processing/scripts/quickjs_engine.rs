@@ -603,6 +603,91 @@ mod tests {
         assert_eq!(output.as_ref(), "🦕\0é".as_bytes());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_text_plan_matches_quickjs_guards_and_unicode_output() {
+        use crate::http_processing::scripts::Backend;
+
+        let script = validate_source(
+            r#"function rewrite(input) {
+                let found = false;
+                for (let i = 0; i < input.response.headers.length; i++) {
+                    if (input.response.headers[i].name === "x-native" &&
+                        input.response.headers[i].value === "native-v1") { found = true; }
+                }
+                if (!found) { return {type: "abort"}; }
+                if (!input.body || input.body.kind !== "text" ||
+                    typeof input.body.data !== "string" || input.body.data.length !== 6) {
+                    return {type: "abort"};
+                }
+                let data = input.body.data;
+                data = data.replaceAll("b", "c");
+                return {type: "modify", headers: [{op: "set", name: "x-js",
+                    values: ["native-v1>js-v1"]}], body: {kind: "text", data: data}};
+            }"#,
+        )
+        .unwrap();
+        let fallback = validate_source(
+            r#"function rewrite(input) {
+                return {type: "modify", body: {kind: "text", data: input.body.data.toUpperCase()}};
+            }"#,
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        for (header, text, action, expected) in [
+            ("native-v1", "b🦕é\0b", "modify", "c🦕é\0c"),
+            ("other", "b🦕é\0b", "abort", ""),
+            ("native-v1", "b🦕é\0", "abort", ""),
+        ] {
+            let metadata = json!({
+                "body": {"kind": "text"},
+                "response": {"headers": [{"name": "x-native", "value": header}]}
+            });
+            let budget = Budget::default();
+            let input = BudgetedBytes::copy(&budget, text.as_bytes()).unwrap();
+            let witness = Some(input.borrowed_body());
+            let Backend::Plan(plan) = script.backend(&metadata, witness) else {
+                panic!("closed guarded script must select the static plan");
+            };
+            assert!(matches!(
+                fallback.backend(&metadata, witness),
+                Backend::Engine(_)
+            ));
+
+            let bound = plan.maximum_output_bytes(text.len()).unwrap();
+            let mut output = BudgetedBytes::new_fixed_output(&budget, bound).unwrap();
+            let plan_result = plan
+                .try_execute(
+                    &metadata,
+                    witness,
+                    &mut output,
+                    &cancellation,
+                    Instant::now() + Duration::from_secs(3),
+                )
+                .unwrap()
+                .result
+                .unwrap();
+            let mut vm_output = BudgetedBytes::empty(&budget);
+            let vm_result = evaluate(
+                &script,
+                &metadata,
+                Some(input.as_ref()),
+                &mut vm_output,
+                None,
+                &cancellation,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+            assert_eq!(plan_result["type"], action);
+            assert_eq!(plan_result, vm_result);
+            assert_eq!(output.as_ref(), expected.as_bytes());
+            assert_eq!(output.as_ref(), vm_output.as_ref());
+            drop((input, output, vm_output));
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
     #[test]
     fn admits_rope_conversion_before_allocating_the_export_view() {
         use crate::http_processing::body_budget::WORKSPACE;

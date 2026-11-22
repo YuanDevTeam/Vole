@@ -22,7 +22,13 @@ mod tests;
     target_os = "tvos"
 ))]
 pub(crate) mod plan_validation;
-#[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+#[cfg(all(
+    feature = "inbound-http",
+    any(
+        target_vendor = "apple",
+        all(target_os = "linux", feature = "http-js-quickjs")
+    )
+))]
 mod static_literal_plan;
 
 #[cfg(feature = "inbound-http")]
@@ -51,7 +57,13 @@ pub(crate) struct CompiledSource {
     pub(crate) code: Arc<str>,
     #[cfg_attr(not(feature = "inbound-http"), allow(dead_code))]
     pub(crate) output_bound: OutputBound,
-    #[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+    #[cfg(all(
+        feature = "inbound-http",
+        any(
+            target_vendor = "apple",
+            all(target_os = "linux", feature = "http-js-quickjs")
+        )
+    ))]
     plan: Option<Arc<static_literal_plan::Plan>>,
 }
 
@@ -104,7 +116,10 @@ pub(crate) fn validate_source(source: &str) -> io::Result<CompiledSource> {
         Ok(CompiledSource {
             code: prepared.code.into(),
             output_bound: prepared.output_bound,
-            #[cfg(target_vendor = "apple")]
+            #[cfg(any(
+                target_vendor = "apple",
+                all(target_os = "linux", feature = "http-js-quickjs")
+            ))]
             plan: prepared.plan.map(Arc::new),
         })
     }
@@ -119,7 +134,10 @@ pub(crate) fn validate_source(source: &str) -> io::Result<CompiledSource> {
 #[derive(Clone, Copy)]
 pub(crate) enum Backend<'a> {
     Engine(&'a CompiledSource),
-    #[cfg(target_vendor = "apple")]
+    #[cfg(any(
+        target_vendor = "apple",
+        all(target_os = "linux", feature = "http-js-quickjs")
+    ))]
     Plan(&'a static_literal_plan::Plan),
 }
 #[cfg(feature = "inbound-http")]
@@ -129,7 +147,10 @@ impl CompiledSource {
         metadata: &serde_json::Value,
         input: Option<super::body::BorrowedBody<'_>>,
     ) -> Backend<'_> {
-        #[cfg(target_vendor = "apple")]
+        #[cfg(any(
+            target_vendor = "apple",
+            all(target_os = "linux", feature = "http-js-quickjs")
+        ))]
         if let Some(plan) = &self.plan {
             if plan.accepts_input(metadata, input) {
                 super::diagnostics::increment(super::diagnostics::Counter::PlanSelected);
@@ -139,7 +160,10 @@ impl CompiledSource {
         } else {
             super::diagnostics::increment(super::diagnostics::Counter::PlanAstFallback);
         }
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(not(any(
+            target_vendor = "apple",
+            all(target_os = "linux", feature = "http-js-quickjs")
+        )))]
         let _ = (metadata, input);
         #[cfg(target_vendor = "apple")]
         super::diagnostics::increment(super::diagnostics::Counter::JscSelected);
@@ -151,14 +175,20 @@ impl Backend<'_> {
     pub(crate) fn is_plan(self) -> bool {
         match self {
             Self::Engine(_) => false,
-            #[cfg(target_vendor = "apple")]
+            #[cfg(any(
+                target_vendor = "apple",
+                all(target_os = "linux", feature = "http-js-quickjs")
+            ))]
             Self::Plan(_) => true,
         }
     }
     pub(crate) fn output_bound(self, input: usize) -> usize {
         match self {
             Self::Engine(program) => program.maximum_output_bytes(input),
-            #[cfg(target_vendor = "apple")]
+            #[cfg(any(
+                target_vendor = "apple",
+                all(target_os = "linux", feature = "http-js-quickjs")
+            ))]
             Self::Plan(plan) => plan
                 .maximum_output_bytes(input)
                 .unwrap_or(super::body_budget::MAX_BODY),
@@ -181,10 +211,13 @@ impl<'a> InvocationInput<'a> {
             Self::Borrowed(body) => body.map(|body| body.as_bytes()),
         }
     }
-    #[cfg(target_vendor = "apple")]
+    #[cfg(any(
+        target_vendor = "apple",
+        all(target_os = "linux", feature = "http-js-quickjs")
+    ))]
     fn witness(self) -> Option<super::body::BorrowedBody<'a>> {
         match self {
-            #[cfg(test)]
+            #[cfg(all(test, target_vendor = "apple"))]
             Self::EngineOnly(_) => None,
             Self::Borrowed(body) => body,
         }
@@ -442,24 +475,57 @@ impl InvocationLane {
     }
 }
 
-#[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
-pub(crate) fn evaluate_plan_in_lane(
-    backend: Backend<'_>,
+#[cfg(all(
+    feature = "inbound-http",
+    any(
+        target_vendor = "apple",
+        all(target_os = "linux", feature = "http-js-quickjs")
+    )
+))]
+fn evaluate_selected_plan(
+    plan: &static_literal_plan::Plan,
     metadata: &serde_json::Value,
     input_body: Option<super::body::BorrowedBody<'_>>,
     output_body: &mut super::body_budget::BudgetedBytes,
     cancellation: &tokio_util::sync::CancellationToken,
-    lane: InvocationLane,
+    deadline: std::time::Instant,
 ) -> io::Result<serde_json::Value> {
-    if !backend.is_plan() {
-        return Err(io::ErrorKind::InvalidInput.into());
-    }
+    super::diagnostics::increment(super::diagnostics::Counter::PlanEntered);
+    let result = match plan.try_execute(metadata, input_body, output_body, cancellation, deadline) {
+        Some(attempt) => {
+            tracing::trace!(target: "vole::http_processing::script", backend = attempt.backend, ticks = attempt.ticks, allocation_work = attempt.allocation_work, "HTTP script backend completed");
+            attempt.result
+        }
+        // Selection was already fixed before any output admission.
+        // A failed invariant is a rollback, never another backend.
+        None => Err(io::ErrorKind::InvalidInput.into()),
+    };
+    let counter = match result.as_ref().map_err(io::Error::kind) {
+        Ok(_) => super::diagnostics::Counter::PlanSucceeded,
+        Err(io::ErrorKind::TimedOut) => super::diagnostics::Counter::PlanTimedOut,
+        Err(io::ErrorKind::Interrupted) => super::diagnostics::Counter::PlanCancelled,
+        Err(_) => super::diagnostics::Counter::PlanFailed,
+    };
+    super::diagnostics::increment(counter);
+    result
+}
+
+#[cfg(feature = "inbound-http")]
+pub(super) fn evaluate_backend_in_lane(
+    backend: Backend<'_>,
+    metadata: &serde_json::Value,
+    input_body: Option<super::body::BorrowedBody<'_>>,
+    output_body: &mut super::body_budget::BudgetedBytes,
+    bridge_workspace: Option<&super::body_budget::Reservation>,
+    cancellation: &tokio_util::sync::CancellationToken,
+    lane: &InvocationLane,
+) -> io::Result<serde_json::Value> {
     evaluate_acquired(
         backend,
         metadata,
         InvocationInput::Borrowed(input_body),
         output_body,
-        None,
+        bridge_workspace,
         cancellation,
         lane,
     )
@@ -473,10 +539,9 @@ fn evaluate_acquired(
     output_body: &mut super::body_budget::BudgetedBytes,
     bridge_workspace: Option<&super::body_budget::Reservation>,
     cancellation: &tokio_util::sync::CancellationToken,
-    lane: InvocationLane,
+    lane: &InvocationLane,
 ) -> io::Result<serde_json::Value> {
     let deadline = lane.deadline;
-    let _lane = lane; // Keep the exact permit through real return/unwind/join.
     let mut operation = || match backend {
         Backend::Engine(program) => {
             super::diagnostics::increment(super::diagnostics::Counter::EvaluationEntered);
@@ -498,32 +563,14 @@ fn evaluate_acquired(
             super::diagnostics::increment(counter);
             result
         }
-        Backend::Plan(plan) => {
-            super::diagnostics::increment(super::diagnostics::Counter::PlanEntered);
-            let result = match plan.try_execute(
-                metadata,
-                input_body.witness(),
-                output_body,
-                cancellation,
-                deadline,
-            ) {
-                Some(attempt) => {
-                    tracing::trace!(target: "vole::http_processing::script", backend = attempt.backend, ticks = attempt.ticks, allocation_work = attempt.allocation_work, "HTTP script backend completed");
-                    attempt.result
-                }
-                // Selection was already fixed before any output admission.
-                // A failed invariant is a rollback, never another backend.
-                None => Err(io::ErrorKind::InvalidInput.into()),
-            };
-            let counter = match result.as_ref().map_err(io::Error::kind) {
-                Ok(_) => super::diagnostics::Counter::PlanSucceeded,
-                Err(io::ErrorKind::TimedOut) => super::diagnostics::Counter::PlanTimedOut,
-                Err(io::ErrorKind::Interrupted) => super::diagnostics::Counter::PlanCancelled,
-                Err(_) => super::diagnostics::Counter::PlanFailed,
-            };
-            super::diagnostics::increment(counter);
-            result
-        }
+        Backend::Plan(plan) => evaluate_selected_plan(
+            plan,
+            metadata,
+            input_body.witness(),
+            output_body,
+            cancellation,
+            deadline,
+        ),
     };
     if tokio::runtime::Handle::current().runtime_flavor()
         == tokio::runtime::RuntimeFlavor::MultiThread
@@ -551,46 +598,46 @@ async fn evaluate_internal(
     phase_deadline: std::time::Instant,
 ) -> io::Result<serde_json::Value> {
     #[cfg(target_vendor = "apple")]
-    {
-        let lane = InvocationLane::acquire(cancellation, phase_deadline).await?;
-        evaluate_acquired(
-            backend,
-            metadata,
-            input_body,
-            output_body,
-            bridge_workspace,
-            cancellation,
-            lane,
-        )
-    }
+    let lane = InvocationLane::acquire(cancellation, phase_deadline).await?;
     #[cfg(not(target_vendor = "apple"))]
-    {
-        let lane = InvocationLane::acquire_engine(cancellation, phase_deadline).await?;
-        evaluate_engine_in_lane(
-            backend,
-            metadata,
-            input_body.bytes(),
-            output_body,
-            bridge_workspace,
-            cancellation,
-            &lane,
-        )
-    }
+    let lane = InvocationLane::acquire_engine(cancellation, phase_deadline).await?;
+    evaluate_acquired(
+        backend,
+        metadata,
+        input_body,
+        output_body,
+        bridge_workspace,
+        cancellation,
+        &lane,
+    )
 }
 
 #[cfg(all(feature = "inbound-http", not(target_vendor = "apple")))]
-pub(super) fn evaluate_engine_in_lane(
+fn evaluate_acquired(
     backend: Backend<'_>,
     metadata: &serde_json::Value,
-    input: Option<&[u8]>,
+    input_body: InvocationInput<'_>,
     output_body: &mut super::body_budget::BudgetedBytes,
     bridge_workspace: Option<&super::body_budget::Reservation>,
     cancellation: &tokio_util::sync::CancellationToken,
     lane: &InvocationLane,
 ) -> io::Result<serde_json::Value> {
-    let Backend::Engine(program) = backend;
     let deadline = lane.deadline;
     let mut operation = || {
+        let program = match backend {
+            Backend::Engine(program) => program,
+            #[cfg(all(target_os = "linux", feature = "http-js-quickjs"))]
+            Backend::Plan(plan) => {
+                return evaluate_selected_plan(
+                    plan,
+                    metadata,
+                    input_body.witness(),
+                    output_body,
+                    cancellation,
+                    deadline,
+                );
+            }
+        };
         #[cfg(all(feature = "ffi", target_os = "android"))]
         let (name, evaluate) = ("android-javascriptengine", android_engine::evaluate);
         #[cfg(all(feature = "http-js-quickjs", any(target_os = "linux", windows)))]
@@ -605,7 +652,7 @@ pub(super) fn evaluate_engine_in_lane(
         let result = evaluate(
             program,
             metadata,
-            input,
+            input_body.bytes(),
             output_body,
             bridge_workspace,
             cancellation,

@@ -615,17 +615,14 @@ fn readable_text(fields: &Fields, bytes: &[u8]) -> bool {
 
 // Preserve the existing per-invocation output-owner charge while queued;
 // only its not-yet-allocated payload is deferred until the same lane is held.
-#[cfg(target_vendor = "apple")]
 struct PendingPlanOutput<'a> {
     budget: &'a Budget,
     reservation: super::body_budget::Reservation,
     bound: usize,
 }
-#[cfg(target_vendor = "apple")]
 const _: () = assert!(
     std::mem::size_of::<PendingPlanOutput<'static>>() <= std::mem::size_of::<BudgetedBytes>()
 );
-#[cfg(target_vendor = "apple")]
 impl<'a> PendingPlanOutput<'a> {
     fn new(
         budget: &'a Budget,
@@ -685,41 +682,6 @@ struct CallBuffers {
     bridge_workspace: Option<super::body_budget::Reservation>,
 }
 impl CallBuffers {
-    fn for_backend(
-        budget: &Budget,
-        bytes: Option<&[u8]>,
-        mode: BodyMode,
-        backend: super::scripts::Backend<'_>,
-    ) -> io::Result<Self> {
-        let bound = backend.output_bound(bytes.map_or(0, <[u8]>::len));
-        if !backend.is_plan() {
-            return Self::with_output_bound(budget, bytes, mode, bound);
-        }
-        // Selection is final: a refusal skips this invocation, never JSC.
-        if mode != BodyMode::Text
-            || bytes.is_none_or(|bytes| bytes.len() > MAX_BODY)
-            || bound > MAX_BODY
-        {
-            return Err(invalid());
-        }
-        let output_cost = BudgetedBytes::allocation_cost(bound).ok_or_else(exhausted)?;
-        super::diagnostics::call_buffers_requested(0, output_cost, 0);
-        let permit = budget.reserve(output_cost).ok_or_else(|| {
-            super::diagnostics::increment(super::diagnostics::Counter::CallBuffersBudgetRejected);
-            exhausted()
-        })?;
-        let output = BudgetedBytes::from_reserved(permit, bound).ok_or_else(|| {
-            super::diagnostics::increment(
-                super::diagnostics::Counter::CallBuffersAllocationRejected,
-            );
-            exhausted()
-        })?;
-        super::diagnostics::increment(super::diagnostics::Counter::CallBuffersAdmitted);
-        Ok(Self {
-            output,
-            bridge_workspace: None,
-        })
-    }
     fn with_output_bound(
         budget: &Budget,
         bytes: Option<&[u8]>,
@@ -933,7 +895,7 @@ async fn run_until_observed(
             Some(bytes)
         };
         #[cfg(not(target_vendor = "apple"))]
-        let acquired_lane = if script.body == BodyMode::Bytes
+        let mut acquired_lane = if script.body == BodyMode::Bytes
             && cfg!(any(
                 all(target_os = "android", feature = "ffi"),
                 all(target_os = "linux", feature = "http-js-quickjs")
@@ -979,43 +941,40 @@ async fn run_until_observed(
         let backend = script.compiled.backend(&metadata, borrowed);
         #[cfg(target_vendor = "apple")]
         let mut acquired_lane = None;
-        let prepared_buffers = {
-            #[cfg(target_vendor = "apple")]
-            if backend.is_plan() {
-                match PendingPlanOutput::new(policy.body_budget(), bytes, script.body, backend) {
-                    Err(error) => Err(error),
-                    Ok(pending) => {
-                        let lane =
-                            match super::scripts::InvocationLane::acquire(cancellation, deadline)
-                                .await
-                            {
-                                Ok(lane) => lane,
-                                Err(error) => {
-                                    super::diagnostics::increment(
-                                        super::diagnostics::Counter::PlanOutputQueueFailed,
-                                    );
-                                    check_stage(cancellation, deadline)?;
-                                    let failure = report_backend_error(error, &script.name, phase);
-                                    if failure.is_err() {
-                                        record(script, "failed", Some("backend-fatal"));
-                                    } else {
-                                        record(script, "rolled-back", Some("invocation-timeout"));
-                                    }
-                                    failure?;
-                                    continue;
-                                }
-                            };
-                        acquired_lane = Some(lane);
-                        pending.materialize()
-                    }
+        let prepared_buffers = if backend.is_plan() {
+            match PendingPlanOutput::new(policy.body_budget(), bytes, script.body, backend) {
+                Err(error) => Err(error),
+                Ok(pending) => {
+                    let lane = match super::scripts::InvocationLane::acquire(cancellation, deadline)
+                        .await
+                    {
+                        Ok(lane) => lane,
+                        Err(error) => {
+                            super::diagnostics::increment(
+                                super::diagnostics::Counter::PlanOutputQueueFailed,
+                            );
+                            check_stage(cancellation, deadline)?;
+                            let failure = report_backend_error(error, &script.name, phase);
+                            if failure.is_err() {
+                                record(script, "failed", Some("backend-fatal"));
+                            } else {
+                                record(script, "rolled-back", Some("invocation-timeout"));
+                            }
+                            failure?;
+                            continue;
+                        }
+                    };
+                    acquired_lane = Some(lane);
+                    pending.materialize()
                 }
-            } else {
-                CallBuffers::for_backend(policy.body_budget(), bytes, script.body, backend)
             }
-            #[cfg(not(target_vendor = "apple"))]
-            {
-                CallBuffers::for_backend(policy.body_budget(), bytes, script.body, backend)
-            }
+        } else {
+            CallBuffers::with_output_bound(
+                policy.body_budget(),
+                bytes,
+                script.body,
+                backend.output_bound(bytes.map_or(0, <[u8]>::len)),
+            )
         };
         let Ok(mut buffers) = prepared_buffers else {
             if backend.is_plan() {
@@ -1026,64 +985,37 @@ async fn run_until_observed(
             tracing::debug!(target: "vole::http_processing::script", script = %script.name, phase = ?phase, reason = "body-budget", "HTTP script skipped");
             continue;
         };
-        let result = {
+        let result = if let Some(lane) = &acquired_lane {
             #[cfg(target_vendor = "apple")]
-            if let Some(lane) = acquired_lane {
-                if super::scripts::plan_can_run_direct() {
-                    // Keep this exact paid output and acquired lane/deadline.
-                    // One scheduling opportunity, not an IO-poll guarantee.
-                    tokio::task::yield_now().await;
-                }
-                super::scripts::evaluate_plan_in_lane(
-                    backend,
-                    &metadata,
-                    borrowed,
-                    &mut buffers.output,
-                    cancellation,
-                    lane,
-                )
-            } else {
-                super::scripts::evaluate_backend_until(
-                    backend,
-                    &metadata,
-                    // The typed witness borrows the actual sender-owned Bytes, through
-                    // the same actual backend owner/TLS join. No raw slice retagging.
-                    borrowed,
-                    &mut buffers.output,
-                    buffers.bridge_workspace.as_ref(),
-                    cancellation,
-                    deadline,
-                )
-                .await
+            if super::scripts::plan_can_run_direct() {
+                // Keep this exact paid output and acquired lane/deadline.
+                // One scheduling opportunity, not an IO-poll guarantee.
+                tokio::task::yield_now().await;
             }
-            #[cfg(not(target_vendor = "apple"))]
-            if let Some(lane) = &acquired_lane {
-                super::scripts::evaluate_engine_in_lane(
-                    backend,
-                    &metadata,
-                    bytes,
-                    &mut buffers.output,
-                    buffers.bridge_workspace.as_ref(),
-                    cancellation,
-                    lane,
-                )
-            } else {
-                super::scripts::evaluate_backend_until(
-                    backend,
-                    &metadata,
-                    // The typed witness borrows the actual sender-owned Bytes, through
-                    // the same actual backend owner/TLS join. No raw slice retagging.
-                    borrowed,
-                    &mut buffers.output,
-                    buffers.bridge_workspace.as_ref(),
-                    cancellation,
-                    deadline,
-                )
-                .await
-            }
+            super::scripts::evaluate_backend_in_lane(
+                backend,
+                &metadata,
+                borrowed,
+                &mut buffers.output,
+                buffers.bridge_workspace.as_ref(),
+                cancellation,
+                lane,
+            )
+        } else {
+            super::scripts::evaluate_backend_until(
+                backend,
+                &metadata,
+                // The typed witness borrows the actual sender-owned Bytes, through
+                // the same actual backend owner/TLS join. No raw slice retagging.
+                borrowed,
+                &mut buffers.output,
+                buffers.bridge_workspace.as_ref(),
+                cancellation,
+                deadline,
+            )
+            .await
         };
         drop(buffers.bridge_workspace.take());
-        #[cfg(not(target_vendor = "apple"))]
         drop(acquired_lane);
         check_stage(cancellation, deadline)?;
         let metadata = match result {

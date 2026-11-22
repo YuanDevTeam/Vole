@@ -175,9 +175,12 @@ async fn borrowed_input_mutation_then_invalid_result_keeps_the_original_entity()
     assert_eq!(original_owner.as_ref(), input);
 }
 
-#[cfg(target_vendor = "apple")]
-#[test]
-fn static_plan_admission_pays_real_output_without_a_jsc_bridge() {
+#[cfg(any(
+    target_vendor = "apple",
+    all(target_os = "linux", feature = "http-js-quickjs")
+))]
+#[tokio::test(flavor = "current_thread")]
+async fn static_plan_admission_pays_real_output_without_an_engine_bridge() {
     const LENGTH: usize = 65536;
     let budget = Budget::default();
     let entity = Entity::identity(BudgetedBytes::copy(&budget, &vec![b'-'; LENGTH]).unwrap());
@@ -193,8 +196,15 @@ fn static_plan_admission_pays_real_output_without_a_jsc_bridge() {
     assert!(
         CallBuffers::with_output_bound(&budget, entity.logical(), BodyMode::Text, LENGTH).is_err()
     );
-    let buffers =
-        CallBuffers::for_backend(&budget, entity.logical(), BodyMode::Text, backend).unwrap();
+    let pending =
+        PendingPlanOutput::new(&budget, entity.logical(), BodyMode::Text, backend).unwrap();
+    let _lane = super::super::scripts::InvocationLane::acquire(
+        &CancellationToken::new(),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let buffers = pending.materialize().unwrap();
     assert!(buffers.bridge_workspace.is_none());
     assert_eq!(buffers.output.remaining(), LENGTH);
     assert_eq!(budget.used(), super::super::body_budget::WORKSPACE);

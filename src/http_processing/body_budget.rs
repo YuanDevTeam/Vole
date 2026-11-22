@@ -146,7 +146,7 @@ impl Drop for Reservation {
 impl Reservation {
     /// Join reservations from one ledger without changing its admitted total.
     /// Failure preserves the additional owner; no amount is silently refunded.
-    #[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+    #[cfg(feature = "inbound-http")]
     pub(crate) fn merge(&mut self, mut additional: Self) -> Result<(), Self> {
         if !Arc::ptr_eq(&self.budget.0, &additional.budget.0) {
             return Err(additional);
@@ -690,7 +690,7 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    #[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
+    #[cfg(feature = "inbound-http")]
     #[test]
     fn merged_reservations_keep_the_same_ledger_and_one_final_refund() {
         let budget = Budget::default();

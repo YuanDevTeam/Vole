@@ -658,7 +658,10 @@ mod tests {
             prepared.code,
             r#"function rewrite(input){"use strict";__voleTick();__voleFreezeParameters(input);let payload=__voleGet(__voleGet(input,"body"),"data");(payload=__voleCall(payload,"replaceAll",["q","z"]));return __voleValue({"type":"modify","body":__voleValue({"kind":"text","data":payload})});}"#
         );
-        #[cfg(target_vendor = "apple")]
+        #[cfg(any(
+            target_vendor = "apple",
+            all(target_os = "linux", feature = "http-js-quickjs")
+        ))]
         assert!(
             prepared.plan.is_some(),
             "the independent closed Plan proof now accepts this source"
@@ -680,7 +683,10 @@ mod tests {
             r#"function rewrite(input) { let found = false; for (let i = 0; i < input.response.headers.length; i++) { if (input.response.headers[i].name === "x-benchmark-native" && input.response.headers[i].value === "native-v1") { found = true; } } if (!found) { return {type: "abort"}; } if (!input.body || input.body.kind !== "text" || typeof input.body.data !== "string" || input.body.data.length !== 65536) { return {type: "abort"}; } let data = input.body.data; data = data.replaceAll("b", "c"); return {type: "modify", headers: [{op: "set", name: "X-Benchmark-JS", values: ["native-v1>js-v1"]}], body: {kind: "text", data: data}}; }"#,
         ] {
             let prepared = super::super::compile_prepared(source).unwrap();
-            #[cfg(target_vendor = "apple")]
+            #[cfg(any(
+                target_vendor = "apple",
+                all(target_os = "linux", feature = "http-js-quickjs")
+            ))]
             assert!(
                 prepared.plan.is_some(),
                 "complete guard and tail proof required"
@@ -705,7 +711,10 @@ mod tests {
                     serde_json::to_string(replacement).unwrap(),
                 );
                 let prepared = super::super::compile_prepared(&source).unwrap();
-                #[cfg(target_vendor = "apple")]
+                #[cfg(any(
+                    target_vendor = "apple",
+                    all(target_os = "linux", feature = "http-js-quickjs")
+                ))]
                 assert!(prepared.plan.is_some());
                 assert_eq!(
                     prepared.output_bound,
@@ -731,7 +740,7 @@ mod tests {
         .enumerate()
         {
             let prepared = super::super::compile_prepared(source).unwrap();
-            #[cfg(target_vendor = "apple")]
+            #[cfg(any(target_vendor = "apple", all(target_os = "linux", feature = "http-js-quickjs")))]
             assert_eq!(
                 prepared.plan.is_some(),
                 !matches!(index, 2 | 3),

@@ -6,10 +6,9 @@ use serde_json::{Value, json};
 use std::io;
 
 use super::{MAX_DEPTH, MAX_NODES, Work};
-use crate::http_processing::{
-    headers::{MAX_BYTES, MAX_FIELDS},
-    rules::Phase,
-};
+use crate::http_processing::headers::{MAX_BYTES, MAX_FIELDS};
+#[cfg(target_vendor = "apple")]
+use crate::http_processing::rules::Phase;
 
 // These four lowered control nodes are included in the parent's combined
 // optional-plan cap: flag binding, index binding, loop, and early return.
@@ -70,7 +69,7 @@ pub(super) struct Rows<'a> {
 }
 
 /// Recognize exactly three complete statements; the caller must still prove
-/// the entire remaining tail, including binding conflicts, or retain JSC.
+/// the entire remaining tail, including binding conflicts, or use the platform engine.
 pub(super) fn compile_prefix<'a, 'b>(statements: &'b [Statement<'a>]) -> Option<(Guard, usize)> {
     let Statement::VariableDeclaration(flag_declaration) = statements.first()? else {
         return None;
@@ -187,6 +186,7 @@ impl Guard {
     /// That private constructor checks the same field/byte bounds and emits
     /// exact name/value string rows. This never qualifies arbitrary JSON;
     /// rows() still validates each actual invocation before Plan selection.
+    #[cfg(target_vendor = "apple")]
     pub(super) fn covers_business_phase(&self, phase: Phase) -> bool {
         match self.source {
             HeaderArray::Request => matches!(phase, Phase::Request | Phase::Response),

@@ -1,15 +1,16 @@
 //! Closed ASCII-substitution lowering over complete UTF-8 text inputs.
 //! Header equality separately permits complete Unicode in a read-only prefix.
-//! Unsupported source or input falls back to JSC before Plan execution.
+//! Unsupported source or input uses the platform engine before Plan execution.
 use oxc_ast::ast::*;
 use serde_json::Value;
 use std::{collections::BTreeMap, io, sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(target_vendor = "apple")]
+use super::super::rules::Phase;
 use super::super::{
     body::BorrowedBody,
     body_budget::{BudgetedBytes, MAX_BODY, Reservation},
-    rules::Phase,
 };
 
 mod body_guard;
@@ -143,7 +144,10 @@ struct Binding {
 
 /// Optional proof only. Original frontend rejection/acceptance is unchanged.
 /// Diagnostic/test convenience uses the same accepted frontend AST as production.
-#[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
+#[cfg(any(
+    all(test, target_vendor = "apple"),
+    all(feature = "http-diagnostics", target_os = "tvos")
+))]
 pub(super) fn compile(source: &str) -> Option<Plan> {
     super::frontend::compile_prepared(source).ok()?.plan
 }
@@ -716,6 +720,7 @@ impl Plan {
     // Only actual Text declarations with the same production Message phase
     // may use this proof. Message::metadata owns normalized header snapshots;
     // arbitrary diagnostic JSON retains accepts_input/Guard::rows validation.
+    #[cfg(target_vendor = "apple")]
     pub(super) fn covers_business_text_phase(&self, phase: Phase) -> bool {
         self.header_guard
             .as_ref()
@@ -723,13 +728,12 @@ impl Plan {
     }
 
     /// Call ONLY inside the existing lane and selected synchronous adapter,
-    /// with its original
-    /// absolute deadline and actual borrowed input/output owners. No JSC bridge
-    /// copies exist on this backend, so no phantom JSC reservation is required.
+    /// with its original absolute deadline and actual borrowed input/output
+    /// owners. This backend uses no engine bridge copies or reservations.
     /// The input witness borrows the real Entity/Bytes owner; no Rust input copy.
     /// No queue/thread/VM here.
     /// None means unsupported input, not a budget rejection. After selection,
-    /// every failure is Some(Err) and MUST NOT rerun JSC, including t=0 OOM.
+    /// every failure is Some(Err), including an immediate budget refusal.
     pub(super) fn try_execute(
         &self,
         metadata: &Value,
@@ -750,7 +754,10 @@ impl Plan {
     }
     // Existing per-call validation hook: unit tests or explicit tvOS diagnostics.
     // Source/business callers cannot request it; no process-global state.
-    #[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
+    #[cfg(any(
+        all(test, target_vendor = "apple"),
+        all(feature = "http-diagnostics", target_os = "tvos")
+    ))]
     pub(super) fn try_execute_for_validation(
         &self,
         metadata: &Value,
