@@ -3,7 +3,7 @@
 use crate::{
     dispatch::{BoxStream, DatagramBudget, DatagramTransport, DispatchError},
     dns::resolution::ResolutionContext,
-    session::{Datagram, Destination},
+    session::{DEFAULT_TUN_MTU, Datagram, Destination},
 };
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -22,6 +22,7 @@ pub(crate) struct DatagramIo {
     deadline: Instant,
     first: bool,
     flush_each_frame: bool,
+    reuse_write_frame: bool,
     pending_write: Option<PendingWrite>,
     cancel: CancellationToken,
 }
@@ -45,6 +46,7 @@ impl DatagramIo {
             deadline,
             first: true,
             flush_each_frame: true,
+            reuse_write_frame: false,
             pending_write: None,
             cancel,
         }
@@ -54,11 +56,20 @@ impl DatagramIo {
         self
     }
 
+    pub(crate) fn with_reusable_write_frame(mut self) -> Self {
+        self.reuse_write_frame = true;
+        self
+    }
+
     // A cancelled logical target may already have submitted a frame prefix.
     // Finish exactly that retained frame before the next send or receive;
     // never duplicate bytes or add a per-target payload queue.
     async fn flush_pending(&mut self) -> io::Result<()> {
-        if self.pending_write.is_none() {
+        if self
+            .pending_write
+            .as_ref()
+            .is_none_or(|pending| pending.wire.is_empty())
+        {
             return Ok(());
         }
         if self.first && Instant::now() >= self.deadline {
@@ -95,7 +106,18 @@ impl DatagramIo {
             }=>result?,
         }
         self.first = false;
-        self.pending_write = None;
+        // An empty wire is idle. A nonempty frame at its final offset may
+        // still own a setup flush and must only be cleared after it completes.
+        let pending = self
+            .pending_write
+            .as_mut()
+            .expect("completed sing-mux frame");
+        if self.reuse_write_frame && pending.wire.capacity() <= DEFAULT_TUN_MTU {
+            pending.wire.clear();
+            pending.offset = 0;
+        } else {
+            self.pending_write = None;
+        }
         Ok(())
     }
     async fn fill(&mut self, length: usize) -> io::Result<()> {
@@ -178,7 +200,14 @@ impl DatagramTransport for DatagramIo {
                 ()=self.cancel.cancelled()=>return Err(DispatchError::NotAllowed),
                 peer=self.resolution.resolve_ip(&packet.remote,deadline)=>peer?,
             };
-            let mut wire = Vec::with_capacity(packet.payload.len() + 21);
+            let capacity = packet.payload.len() + 21;
+            let mut wire = if let Some(idle) = self.pending_write.take() {
+                let mut wire = idle.wire;
+                wire.reserve_exact(capacity);
+                wire
+            } else {
+                Vec::with_capacity(capacity)
+            };
             crate::socks5::encode_address(&peer.into(), &mut wire)?;
             wire.extend_from_slice(&(packet.payload.len() as u16).to_be_bytes());
             wire.extend_from_slice(&packet.payload);
@@ -374,7 +403,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn autonomous_first_flush_keeps_original_deadline_after_cancellation() {
         let (transport, mut peer, gates) = fixture(false);
-        let mut transport = transport.with_autonomous_writes();
+        let mut transport = transport
+            .with_autonomous_writes()
+            .with_reusable_write_frame();
         let first = packet("192.0.2.1:53", b"first");
         let second = packet("198.51.100.1:54", b"second");
         assert!(futures_util::poll!(transport.send(first.clone())).is_pending());
@@ -392,6 +423,44 @@ mod tests {
             wire(&first),
             "deadline must not admit another frame"
         );
+    }
+
+    #[tokio::test]
+    async fn reusable_udp_frame_resumes_a_partial_write_and_releases_large_backing() {
+        let (transport, mut peer, gates) = fixture(true);
+        let mut transport = transport
+            .with_autonomous_writes()
+            .with_reusable_write_frame();
+        let first = packet("192.0.2.1:53", &[b'a'; 1200]);
+        let second = packet("198.51.100.1:54", &[b'b'; 1200]);
+        assert!(futures_util::poll!(transport.send(first.clone())).is_pending());
+        let pending = transport.pending_write.as_ref().unwrap();
+        assert_eq!(pending.offset, 3);
+        let backing = pending.wire.as_ptr();
+        gates.release();
+
+        transport.send(second.clone()).await.unwrap();
+        let idle = transport.pending_write.as_ref().unwrap();
+        assert_eq!(idle.wire.as_ptr(), backing);
+        assert!(idle.wire.is_empty());
+        assert_eq!(idle.offset, 0);
+        assert!(idle.wire.capacity() <= DEFAULT_TUN_MTU);
+        let mut expected = wire(&first);
+        expected.extend(wire(&second));
+
+        transport.budget = DatagramBudget::new(u16::MAX, 1452);
+        let oversized = packet("192.0.2.1:55", &[b'c'; DEFAULT_TUN_MTU]);
+        transport.send(oversized.clone()).await.unwrap();
+        assert!(transport.pending_write.is_none());
+        expected.extend(wire(&oversized));
+
+        let mut actual = vec![0; expected.len()];
+        peer.read_exact(&mut actual).await.unwrap();
+        assert_eq!(actual, expected);
+        transport.send(first).await.unwrap();
+        assert!(transport.pending_write.is_some());
+        transport.close().await.unwrap();
+        assert!(transport.pending_write.is_none());
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use std::{fmt, net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 
-const DEFAULT_TUN_MTU: usize = 1_500;
+pub(crate) const DEFAULT_TUN_MTU: usize = 1_500;
 const IPV6_UDP_OVERHEAD: usize = 48;
 const TUN_XUDP_MAX_RESPONSE_PAYLOAD_SIZE: u16 = (DEFAULT_TUN_MTU - IPV6_UDP_OVERHEAD) as u16;
 const INTERNAL_DNS_XUDP_MAX_RESPONSE_PAYLOAD_SIZE: u16 = 4_096;

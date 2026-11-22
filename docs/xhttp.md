@@ -172,6 +172,10 @@ VLESS 的 PacketUp XHTTP、无 VLESS Encryption 且无 sing-mux padding 时，h2
 每个逻辑写端以固定确认状态合并进度，每次物理 flush 前至多登记一次；不按 DATA 分配
 oneshot，也不增加 payload 队列。显式 flush、元数据与首 UDP 帧仍等待真实底层 flush；
 后续 UDP 尾帧无需额外 write 即可推进。其它 h2mux 和普通 gRPC/legacy H2/CONNECT 保持原行为。
+Linux TUN UDP 使用实际建立的 VLESS H3 PacketUp Body h2mux 载体时，可复用容量不超过默认 TUN MTU
+（1500 字节）的已发送帧缓冲。此范围要求无独立下载腿、VLESS Encryption、padding、only-tcp 和 Brutal。
+较大的帧照常发送并释放缓冲。
+每条流仍只有一个待写帧，部分写入偏移、首帧实际 flush 和取消语义保持。
 该私有路径在底层实际写出字节、但强 flush 尚待完成时，主动再调度一次已有的 H2 驱动，
 使已排队 DATA 继续填充同一有界 PacketUp 批次。没有新写入进度便不重复唤醒，
 也不提前完成 flush 确认；显式 flush、FIN 与 Stop 仍遵守原屏障。

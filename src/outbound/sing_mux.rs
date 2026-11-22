@@ -3,7 +3,7 @@ use super::{ConnectedStream, DatagramRequest, EstablishContext, OutboundConnecto
 use crate::{
     config::SingMuxConfig,
     dispatch::{DatagramTransport, DispatchError},
-    session::{Destination, StreamSession},
+    session::{Destination, InboundKind, StreamSession},
     transport::sing_mux::{Pool, SuppliedStream, datagram::DatagramIo},
 };
 use async_trait::async_trait;
@@ -202,7 +202,7 @@ impl OutboundConnector for SingMuxConnector {
             return Err(DispatchError::TimedOut);
         }
         let effective_peer = session.destination.clone();
-        let io = self
+        let (io, _) = self
             .pool
             .open(&effective_peer, false, context.deadline(), || {
                 self.connect(session, context)
@@ -224,9 +224,17 @@ impl OutboundConnector for SingMuxConnector {
                 if self.pool.only_tcp() { return self.inner.open_datagram(request, context).await; }
                 let target = Destination::domain("sp.mux.sing-box.arpa", 444)?;
                 let session = StreamSession { metadata:request.session.metadata.clone(), inbound:request.session.inbound, source:request.session.source, destination:target.clone(), sniffed_domain:None };
-                let io=self.pool.open(&target, true, context.deadline(), || self.connect(session, context)).await?;
+                let (io, reusable_frame) = self
+                    .pool
+                    .open(&target, true, context.deadline(), || self.connect(session, context))
+                    .await?;
                 let transport = DatagramIo::new(io,request.budget(),context.resolution(),context.deadline(),self.cancellation.clone());
                 let transport = if self.pool.autonomous_writes() { transport.with_autonomous_writes() } else { transport };
+                let transport = if reusable_frame && request.session.inbound == InboundKind::Tun {
+                    transport.with_reusable_write_frame()
+                } else {
+                    transport
+                };
                 Ok(crate::dispatch::bound_datagram(Box::new(transport),request.budget()))
             }=>result,
         }

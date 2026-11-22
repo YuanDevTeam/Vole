@@ -146,7 +146,7 @@ impl Pool {
         udp: bool,
         deadline: Instant,
         connect: F,
-    ) -> io::Result<BoxStream>
+    ) -> io::Result<(BoxStream, bool)>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = io::Result<SuppliedStream>>,
@@ -269,18 +269,31 @@ impl Pool {
             raw.write_all(&request).await?;
             raw.flush().await?;
             #[cfg(feature = "outbound-vless")]
-            if udp && let Some(control) = reservation.h3_udp.and_then(|control| control.upgrade()) {
-                // Local metadata flush, not peer status or a transport ACK.
+            let reusable_frame = if udp
+                && let Some(control) = reservation.h3_udp.and_then(|control| control.upgrade())
+            {
+                // Use the selected H3 PacketUp carrier after the local metadata flush.
                 control.raise();
-            }
-            Ok(Box::new(ResponseStream {
-                raw: Some(raw),
-                lease: Some(reservation.lease),
-                response: false,
-                half_close: self.options.protocol != SingMuxProtocol::Smux,
-                upload_closed: false,
-                deadline: Some(Box::pin(tokio::time::sleep_until(deadline))),
-            }) as BoxStream)
+                cfg!(target_os = "linux")
+                    && self.captures_h3_udp()
+                    && self.autonomous_writes
+                    && self.options.brutal.is_none()
+            } else {
+                false
+            };
+            #[cfg(not(feature = "outbound-vless"))]
+            let reusable_frame = false;
+            Ok((
+                Box::new(ResponseStream {
+                    raw: Some(raw),
+                    lease: Some(reservation.lease),
+                    response: false,
+                    half_close: self.options.protocol != SingMuxProtocol::Smux,
+                    upload_closed: false,
+                    deadline: Some(Box::pin(tokio::time::sleep_until(deadline))),
+                }) as BoxStream,
+                reusable_frame,
+            ))
         };
         tokio::select! { biased;
             () = self.cancel.cancelled() => Err(io::ErrorKind::ConnectionAborted.into()),
