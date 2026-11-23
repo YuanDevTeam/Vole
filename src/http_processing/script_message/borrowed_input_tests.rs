@@ -177,7 +177,10 @@ async fn borrowed_input_mutation_then_invalid_result_keeps_the_original_entity()
 
 #[cfg(any(
     target_vendor = "apple",
-    all(target_os = "linux", feature = "http-js-quickjs")
+    all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "http-js-quickjs"
+    ),
 ))]
 #[tokio::test(flavor = "current_thread")]
 async fn static_plan_admission_pays_real_output_without_an_engine_bridge() {

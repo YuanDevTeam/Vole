@@ -98,7 +98,7 @@ cargo test --locked --profile ci-release --features invoke,http-js-quickjs --lib
 cargo test --locked --profile ci-release --features invoke,http-js-quickjs --lib platform_fixture_rewrites_each_origin_through_test_http
 ```
 
-[Android 测试宿主](android-http-js/README.md) 加载同一份插件，以 JavaScriptEngine 执行离线 Invoke 和模拟器 TUN 流量。明文 HTTP 和 HTTPS/H1、HTTPS/H2 使用独立容器原站，原站校验请求改写，客户端校验响应及实际 HTTP 版本。
+[Android 测试宿主](android-http-js/README.md) 加载同一份插件，通过同进程 QuickJS-NG 和静态执行计划验证离线 Invoke 与模拟器 TUN 流量。明文 HTTP、HTTPS/H1 和 HTTPS/H2 使用独立容器原站，原站校验请求改写，客户端校验响应及实际 HTTP 版本。
 
 ## Windows原生检查
 

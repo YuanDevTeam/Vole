@@ -58,9 +58,6 @@ const JVM_GET_ENV: usize = 6;
 
 static JAVA_VM: OnceLock<usize> = OnceLock::new();
 
-#[cfg(feature = "inbound-http")]
-pub(crate) mod js;
-
 #[repr(C)]
 union JValue {
     z: JBoolean,
@@ -164,8 +161,6 @@ pub unsafe extern "system" fn JNI_OnUnload(_vm: JavaVm, _reserved: *mut c_void) 
     // registry rejects controller removal while a TUN lease is held, so no
     // TUN runtime can observe a freed Java global reference.
     let _ = std::panic::catch_unwind(|| replace_android_socket_protector(None));
-    #[cfg(feature = "inbound-http")]
-    let _ = std::panic::catch_unwind(js::release_on_unload);
 }
 
 /// Invokes the runtime registry using unmodified UTF-8 bytes.

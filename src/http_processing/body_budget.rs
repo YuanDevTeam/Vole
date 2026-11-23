@@ -13,10 +13,7 @@ pub(crate) const WORKSPACE: usize = 4 * 1024 * 1024;
 
 // A public JSC string view can own an N-byte 8-bit copy plus a 2N-byte
 // UTF-16 expansion. This is bridge admission, not a VM heap bound.
-#[cfg(all(
-    feature = "inbound-http",
-    any(test, not(all(feature = "ffi", target_os = "android")))
-))]
+#[cfg(feature = "inbound-http")]
 pub(crate) const API_TEXT_VIEW: usize = 3 * MAX_BODY;
 
 #[cfg(all(feature = "inbound-http", test))]
@@ -39,20 +36,14 @@ pub(crate) fn output_capacity(bound: usize) -> Option<usize> {
 
 /// Independent retained-input and scratch payloads. This is a conservative
 /// copy ledger, not storage, a VM heap limit, or a second execution lane.
-#[cfg(all(
-    feature = "inbound-http",
-    any(test, not(all(feature = "ffi", target_os = "android")))
-))]
+#[cfg(feature = "inbound-http")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BridgePlan {
     pub(crate) retained_input: usize,
     pub(crate) view_capacity: usize,
     pub(crate) input_vec_bookkeeping: usize,
 }
-#[cfg(all(
-    feature = "inbound-http",
-    any(test, not(all(feature = "ffi", target_os = "android")))
-))]
+#[cfg(feature = "inbound-http")]
 impl BridgePlan {
     pub(crate) fn new(input: usize, text: bool, output: usize) -> Option<Self> {
         if input > MAX_BODY || output > MAX_BODY {
@@ -425,8 +416,10 @@ impl BudgetedBytes {
         any(
             test,
             target_vendor = "apple",
-            all(feature = "ffi", target_os = "android"),
-            all(feature = "http-js-quickjs", any(target_os = "linux", windows))
+            all(
+                feature = "http-js-quickjs",
+                any(target_os = "android", target_os = "linux", windows)
+            )
         )
     ))]
     pub(crate) fn prepare_output(&mut self, length: usize) -> io::Result<()> {

@@ -1,10 +1,11 @@
 # Android HTTP JS test host
 
 Use the Core Android build from this checkout, Gradle 9.9.2, Android SDK
-platform 37.2, and an emulator with a WebView provider that supports the JavaScriptEngine features
-checked by the host. The application needs Android API 26 or later. It uses
+platform 37.2, and an emulator at Android API 26 or later. The Core build
+uses QuickJS-NG in the test app process. The host uses
 a package-specific VpnService with a route for the emulator host alias
-`10.0.2.2`, and allows only the test application into that tunnel.
+`10.0.2.2`, allowing only the test package into the tunnel. Startup logs
+the actual ABI and guest page size; use a 16 KiB image for that coverage.
 
 Configure an isolated test origin published on the emulator host at ports
 18080 (HTTP/1.1), 18443 (TLS HTTP/1.1), and 18444 (TLS HTTP/2). Use a
@@ -35,10 +36,10 @@ adb shell am start -n "$probe/.ProbeActivity"
 adb logcat -s VoleJsProbe
 ```
 
-Approve the emulator's VPN prompt on the first run. The host runs a
-JavaScriptEngine termination/reopen probe, exercises `testHttp` before
-startup, verifies each protocol over the raw-IP TUN, and confirms reconnect
-and stop. Test code checks both TLS legs' negotiated protocols and the final
-body. A separate offline sample checks a 256 KiB MessagePort round trip.
-The terminal result is `PASS Android HTTP JS` or `FAIL Android HTTP JS`.
-Uninstall the debug test package to remove its private fixture material.
+Approve the emulator's VPN prompt on the first run. The host exercises
+`testHttp` before startup, verifies HTTP/H1, HTTPS/H1 and HTTPS/H2 over the
+raw-IP TUN, and confirms reconnect and stop. Test code checks both TLS legs'
+negotiated protocols and the final body. A separate offline sample checks a
+256 KiB binary round trip. The terminal result is `PASS Android HTTP JS`
+or `FAIL Android HTTP JS`. Uninstall the debug package to remove its private
+fixture material.

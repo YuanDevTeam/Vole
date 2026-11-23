@@ -660,7 +660,10 @@ mod tests {
         );
         #[cfg(any(
             target_vendor = "apple",
-            all(target_os = "linux", feature = "http-js-quickjs")
+            all(
+                any(target_os = "linux", target_os = "android"),
+                feature = "http-js-quickjs"
+            ),
         ))]
         assert!(
             prepared.plan.is_some(),
@@ -685,7 +688,10 @@ mod tests {
             let prepared = super::super::compile_prepared(source).unwrap();
             #[cfg(any(
                 target_vendor = "apple",
-                all(target_os = "linux", feature = "http-js-quickjs")
+                all(
+                    any(target_os = "linux", target_os = "android"),
+                    feature = "http-js-quickjs"
+                ),
             ))]
             assert!(
                 prepared.plan.is_some(),
@@ -713,7 +719,10 @@ mod tests {
                 let prepared = super::super::compile_prepared(&source).unwrap();
                 #[cfg(any(
                     target_vendor = "apple",
-                    all(target_os = "linux", feature = "http-js-quickjs")
+                    all(
+                        any(target_os = "linux", target_os = "android"),
+                        feature = "http-js-quickjs"
+                    ),
                 ))]
                 assert!(prepared.plan.is_some());
                 assert_eq!(
@@ -740,7 +749,13 @@ mod tests {
         .enumerate()
         {
             let prepared = super::super::compile_prepared(source).unwrap();
-            #[cfg(any(target_vendor = "apple", all(target_os = "linux", feature = "http-js-quickjs")))]
+            #[cfg(any(
+                target_vendor = "apple",
+                all(
+                    any(target_os = "linux", target_os = "android"),
+                    feature = "http-js-quickjs"
+                ),
+            ))]
             assert_eq!(
                 prepared.plan.is_some(),
                 !matches!(index, 2 | 3),

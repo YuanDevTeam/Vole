@@ -8,14 +8,10 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
-import android.os.SystemClock
+import android.system.Os
+import android.system.OsConstants
 import android.util.Base64
 import android.util.Log
-import android.webkit.WebView
-import androidx.javascriptengine.IsolateTerminatedException
-import androidx.javascriptengine.JavaScriptSandbox
-import androidx.javascriptengine.Message
-import io.github.yuandevteam.vole.AndroidJsController
 import io.github.yuandevteam.vole.NativeVole
 import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
@@ -30,8 +26,6 @@ import java.net.Proxy
 import java.security.KeyStore
 import java.security.cert.CertificateFactory
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -64,30 +58,23 @@ class ProbeVpnService : VpnService() {
     }
 
     private fun runSuite() {
-        Log.i(TAG, "API ${Build.VERSION.SDK_INT}, ABI ${Build.SUPPORTED_ABIS.first()}, WebView ${WebView.getCurrentWebViewPackage()?.versionName}")
-        verifySandboxTermination()
+        Log.i(TAG, "API ${Build.VERSION.SDK_INT}, ABI ${Build.SUPPORTED_ABIS.first()}, " +
+            "page bytes ${Os.sysconf(OsConstants._SC_PAGESIZE)}, QuickJS-NG")
         val plugin = assets.open("http-js-platform.yaml").bufferedReader().use { it.readText() }
         val certificate = filesDir.resolve("ca.pem").readText()
         val privateKey = filesDir.resolve("mitm-key.pem").readText()
         val settings = JSONObject().put("mitmEnabled", true)
-        AndroidJsController(this).use { js ->
-            check(NativeVole.nativeRegisterJsController(js)) { "register JS controller" }
-            try {
-                verifyOffline(plugin, settings)
-                check(NativeVole.nativeRegisterProtectController(ProtectController())) { "register socket protector" }
-                try {
-                    withTunnel { fd, sockets ->
-                        runNetwork(plugin, certificate, privateKey, settings, fd, sockets)
-                    }
-                } finally {
-                    check(NativeVole.nativeUnregisterProtectController()) { "unregister socket protector" }
-                }
-                verifyOfflineLocal(plugin, settings)
-                verifyBodyBoundary()
-            } finally {
-                check(NativeVole.nativeUnregisterJsController()) { "unregister JS controller" }
+        verifyOffline(plugin, settings)
+        check(NativeVole.nativeRegisterProtectController(ProtectController())) { "register socket protector" }
+        try {
+            withTunnel { fd, sockets ->
+                runNetwork(plugin, certificate, privateKey, settings, fd, sockets)
             }
+        } finally {
+            check(NativeVole.nativeUnregisterProtectController()) { "unregister socket protector" }
         }
+        verifyOfflineLocal(plugin, settings)
+        verifyBodyBoundary()
     }
 
     // JNI must call the actual VpnService protect before connecting physical
@@ -287,52 +274,9 @@ class ProbeVpnService : VpnService() {
         val stage = result.getJSONArray("stages").getJSONObject(0)
         input[0] = 9
         check(Base64.decode(stage.getString("bodyBase64"), Base64.DEFAULT).contentEquals(input)) {
-            "256 KiB MessagePort output did not match"
+            "256 KiB binary output did not match"
         }
-        Log.i(TAG, "PASS testHttp 256 KiB MessagePort round trip")
-    }
-
-    // This trusted test source has no tick hook. A live infinite evaluation can
-    // only stop through the provider close, which also permits a new sandbox.
-    private fun verifySandboxTermination() {
-        check(JavaScriptSandbox.isSupported()) { "JavaScriptSandbox unavailable" }
-        JavaScriptSandbox.createConnectedInstanceAsync(this).get(10, TimeUnit.SECONDS).use { sandbox ->
-            val supported = AndroidJsController.REQUIRED_FEATURES.associateWith(sandbox::isFeatureSupported)
-            Log.i(TAG, "WebView JS capabilities $supported")
-            check(supported.values.all { it }) { "sandbox feature missing" }
-            val isolate = sandbox.createIsolate()
-            val entered = CountDownLatch(1)
-            val port = isolate.createMessageChannel("termination", { it.run() }) {
-                if (it.type == Message.TYPE_STRING && it.string == "running") entered.countDown()
-            }
-            val result = isolate.evaluateJavaScriptAsync(
-                """
-                (async () => {
-                    const port = await android.getNamedPort("termination");
-                    port.postMessage("running");
-                    for (;;) {}
-                })();
-                """.trimIndent()
-            )
-            try {
-                check(entered.await(5, TimeUnit.SECONDS) && !result.isDone)
-                Log.i(TAG, "sandbox evaluation running")
-                SystemClock.sleep(300)
-                sandbox.close()
-                val stopped = runCatching { result.get(2, TimeUnit.SECONDS) }.exceptionOrNull()
-                check(stopped is ExecutionException && stopped.cause is IsolateTerminatedException)
-                Log.i(TAG, "sandbox evaluation terminated")
-            } finally {
-                port.close()
-                isolate.close()
-            }
-        }
-        JavaScriptSandbox.createConnectedInstanceAsync(this).get(10, TimeUnit.SECONDS).use { sandbox ->
-            sandbox.createIsolate().use { isolate ->
-                check(isolate.evaluateJavaScriptAsync("'reopened'").get(5, TimeUnit.SECONDS) == "reopened")
-            }
-        }
-        Log.i(TAG, "PASS active sandbox closure and reconnect")
+        Log.i(TAG, "PASS testHttp 256 KiB binary round trip")
     }
 
     private fun trustFixtureCa(pem: String): X509TrustManager {

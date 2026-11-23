@@ -1,15 +1,16 @@
 //! Static finite-language preparation and a platform-owned execution adapter.
 use std::{io, sync::Arc};
 
-#[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
-mod android_engine;
 #[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
 mod apple;
 #[cfg(feature = "inbound-http")]
 mod frontend;
 #[cfg(all(feature = "inbound-http", any(target_vendor = "apple", test)))]
 mod platform_init;
-#[cfg(all(feature = "http-js-quickjs", any(target_os = "linux", windows)))]
+#[cfg(all(
+    feature = "http-js-quickjs",
+    any(target_os = "android", target_os = "linux", windows)
+))]
 mod quickjs_engine;
 #[cfg(all(feature = "inbound-http", target_vendor = "apple"))]
 mod scoped_qos;
@@ -26,7 +27,10 @@ pub(crate) mod plan_validation;
     feature = "inbound-http",
     any(
         target_vendor = "apple",
-        all(target_os = "linux", feature = "http-js-quickjs")
+        all(
+            any(target_os = "linux", target_os = "android"),
+            feature = "http-js-quickjs"
+        ),
     )
 ))]
 mod static_literal_plan;
@@ -49,8 +53,10 @@ pub(crate) struct CompiledSource {
     #[cfg_attr(
         not(any(
             all(feature = "inbound-http", target_vendor = "apple"),
-            all(feature = "inbound-http", feature = "ffi", target_os = "android"),
-            all(feature = "http-js-quickjs", any(target_os = "linux", windows))
+            all(
+                feature = "http-js-quickjs",
+                any(target_os = "android", target_os = "linux", windows)
+            )
         )),
         allow(dead_code)
     )]
@@ -61,7 +67,10 @@ pub(crate) struct CompiledSource {
         feature = "inbound-http",
         any(
             target_vendor = "apple",
-            all(target_os = "linux", feature = "http-js-quickjs")
+            all(
+                any(target_os = "linux", target_os = "android"),
+                feature = "http-js-quickjs"
+            ),
         )
     ))]
     plan: Option<Arc<static_literal_plan::Plan>>,
@@ -71,7 +80,6 @@ impl CompiledSource {
     /// Only a complete proof for this actual business declaration can remove
     /// eager JSC preparation. Source acceptance and platform availability are
     /// separate; unknown source, body modes and metadata keep the JSC path.
-    #[cfg(any(test, not(all(feature = "ffi", target_os = "android"))))]
     pub(crate) fn needs_jsc_for_business(
         &self,
         body: super::script_config::BodyMode,
@@ -118,7 +126,10 @@ pub(crate) fn validate_source(source: &str) -> io::Result<CompiledSource> {
             output_bound: prepared.output_bound,
             #[cfg(any(
                 target_vendor = "apple",
-                all(target_os = "linux", feature = "http-js-quickjs")
+                all(
+                    any(target_os = "linux", target_os = "android"),
+                    feature = "http-js-quickjs"
+                ),
             ))]
             plan: prepared.plan.map(Arc::new),
         })
@@ -136,7 +147,10 @@ pub(crate) enum Backend<'a> {
     Engine(&'a CompiledSource),
     #[cfg(any(
         target_vendor = "apple",
-        all(target_os = "linux", feature = "http-js-quickjs")
+        all(
+            any(target_os = "linux", target_os = "android"),
+            feature = "http-js-quickjs"
+        ),
     ))]
     Plan(&'a static_literal_plan::Plan),
 }
@@ -149,7 +163,10 @@ impl CompiledSource {
     ) -> Backend<'_> {
         #[cfg(any(
             target_vendor = "apple",
-            all(target_os = "linux", feature = "http-js-quickjs")
+            all(
+                any(target_os = "linux", target_os = "android"),
+                feature = "http-js-quickjs"
+            ),
         ))]
         if let Some(plan) = &self.plan {
             if plan.accepts_input(metadata, input) {
@@ -162,7 +179,10 @@ impl CompiledSource {
         }
         #[cfg(not(any(
             target_vendor = "apple",
-            all(target_os = "linux", feature = "http-js-quickjs")
+            all(
+                any(target_os = "linux", target_os = "android"),
+                feature = "http-js-quickjs"
+            ),
         )))]
         let _ = (metadata, input);
         #[cfg(target_vendor = "apple")]
@@ -177,7 +197,10 @@ impl Backend<'_> {
             Self::Engine(_) => false,
             #[cfg(any(
                 target_vendor = "apple",
-                all(target_os = "linux", feature = "http-js-quickjs")
+                all(
+                    any(target_os = "linux", target_os = "android"),
+                    feature = "http-js-quickjs"
+                ),
             ))]
             Self::Plan(_) => true,
         }
@@ -187,7 +210,10 @@ impl Backend<'_> {
             Self::Engine(program) => program.maximum_output_bytes(input),
             #[cfg(any(
                 target_vendor = "apple",
-                all(target_os = "linux", feature = "http-js-quickjs")
+                all(
+                    any(target_os = "linux", target_os = "android"),
+                    feature = "http-js-quickjs"
+                ),
             ))]
             Self::Plan(plan) => plan
                 .maximum_output_bytes(input)
@@ -213,7 +239,10 @@ impl<'a> InvocationInput<'a> {
     }
     #[cfg(any(
         target_vendor = "apple",
-        all(target_os = "linux", feature = "http-js-quickjs")
+        all(
+            any(target_os = "linux", target_os = "android"),
+            feature = "http-js-quickjs"
+        ),
     ))]
     fn witness(self) -> Option<super::body::BorrowedBody<'a>> {
         match self {
@@ -233,14 +262,11 @@ fn unsupported() -> io::Error {
 }
 
 pub(crate) fn ensure_available() -> io::Result<()> {
-    #[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
-    return android_engine::ensure_available();
-    #[cfg(not(all(feature = "inbound-http", feature = "ffi", target_os = "android")))]
     if cfg!(any(
         all(feature = "inbound-http", target_vendor = "apple"),
         all(
             feature = "http-js-quickjs",
-            any(target_os = "linux", windows)
+            any(target_os = "android", target_os = "linux", windows)
         )
     )) {
         Ok(())
@@ -287,51 +313,15 @@ pub(crate) fn prepare_platform(
         })
     }
     #[cfg(not(all(feature = "inbound-http", target_vendor = "apple")))]
-    {
-        if cancellation.is_cancelled() {
-            return Err(io::ErrorKind::Interrupted.into());
-        }
-        #[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
-        android_engine::initialize_platform()?;
-        if cancellation.is_cancelled() {
-            return Err(io::ErrorKind::Interrupted.into());
-        }
+    if cancellation.is_cancelled() {
+        Err(io::ErrorKind::Interrupted.into())
+    } else {
         Ok(())
-    }
-}
-
-#[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
-pub(crate) struct AndroidSession {
-    open: bool,
-}
-
-#[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
-impl AndroidSession {
-    pub(crate) fn open() -> io::Result<Self> {
-        android_engine::initialize_platform()?;
-        Ok(Self { open: true })
-    }
-
-    pub(crate) fn close(mut self) -> io::Result<()> {
-        self.open = false;
-        android_engine::shutdown_platform()
-    }
-}
-
-#[cfg(all(feature = "inbound-http", feature = "ffi", target_os = "android"))]
-impl Drop for AndroidSession {
-    fn drop(&mut self) {
-        if self.open {
-            let _ = android_engine::shutdown_platform();
-        }
     }
 }
 
 #[cfg(feature = "inbound-http")]
 pub(super) fn bridge_cost(input: Option<usize>, text: bool, output: usize) -> Option<usize> {
-    #[cfg(all(feature = "ffi", target_os = "android"))]
-    return android_engine::bridge_cost(input.unwrap_or(0), text, output);
-    #[cfg(not(all(feature = "ffi", target_os = "android")))]
     match input {
         Some(input) => super::body_budget::BridgePlan::new(input, text, output)?.cost(),
         None => Some(0),
@@ -479,7 +469,10 @@ impl InvocationLane {
     feature = "inbound-http",
     any(
         target_vendor = "apple",
-        all(target_os = "linux", feature = "http-js-quickjs")
+        all(
+            any(target_os = "linux", target_os = "android"),
+            feature = "http-js-quickjs"
+        ),
     )
 ))]
 fn evaluate_selected_plan(
@@ -626,7 +619,10 @@ fn evaluate_acquired(
     let mut operation = || {
         let program = match backend {
             Backend::Engine(program) => program,
-            #[cfg(all(target_os = "linux", feature = "http-js-quickjs"))]
+            #[cfg(all(
+                feature = "http-js-quickjs",
+                any(target_os = "android", target_os = "linux")
+            ))]
             Backend::Plan(plan) => {
                 return evaluate_selected_plan(
                     plan,
@@ -638,13 +634,14 @@ fn evaluate_acquired(
                 );
             }
         };
-        #[cfg(all(feature = "ffi", target_os = "android"))]
-        let (name, evaluate) = ("android-javascriptengine", android_engine::evaluate);
-        #[cfg(all(feature = "http-js-quickjs", any(target_os = "linux", windows)))]
+        #[cfg(all(
+            feature = "http-js-quickjs",
+            any(target_os = "android", target_os = "linux", windows)
+        ))]
         let (name, evaluate) = ("quickjs-ng", quickjs_engine::evaluate);
-        #[cfg(not(any(
-            all(feature = "ffi", target_os = "android"),
-            all(feature = "http-js-quickjs", any(target_os = "linux", windows))
+        #[cfg(not(all(
+            feature = "http-js-quickjs",
+            any(target_os = "android", target_os = "linux", windows)
         )))]
         let (name, evaluate) = ("unavailable", no_engine);
         use super::diagnostics::{Counter, increment};
@@ -683,8 +680,10 @@ fn evaluate_acquired(
     feature = "inbound-http",
     not(any(
         target_vendor = "apple",
-        all(feature = "ffi", target_os = "android"),
-        all(feature = "http-js-quickjs", any(target_os = "linux", windows))
+        all(
+            feature = "http-js-quickjs",
+            any(target_os = "android", target_os = "linux", windows)
+        )
     ))
 ))]
 fn no_engine(

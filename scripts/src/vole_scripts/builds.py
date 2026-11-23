@@ -4,6 +4,7 @@ import locale
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sysconfig
@@ -15,6 +16,7 @@ from . import blake3
 CORE_DIR = Path(__file__).resolve().parents[3]
 # Both transports enable the production core through invoke -> tun in Cargo.toml.
 DEFAULT_FEATURES = "ffi"
+QUICKJS_FFI_FEATURES = DEFAULT_FEATURES + ",http-js-quickjs"
 
 APPLE_TARGETS = (
     "aarch64-apple-ios",
@@ -315,7 +317,7 @@ def build_linux(target: str | None = None) -> Path:
     release = _cargo_build(
         target,
         ["--release"],
-        DEFAULT_FEATURES + ",http-js-quickjs",
+        QUICKJS_FFI_FEATURES,
         environment,
     )
     output = CORE_DIR / "dist/linux" / architecture
@@ -412,7 +414,11 @@ def build_android() -> Path:
     ndk_home = _android_ndk_home()
     android_api = _env("VOLE_ANDROID_API", "24")
     profile_name, profile_flags = _profile()
-    features = _production_features(_env("VOLE_FEATURES", DEFAULT_FEATURES))
+    features = _production_features(_env("VOLE_FEATURES", QUICKJS_FFI_FEATURES))
+    quickjs = any(
+        name.rsplit("/", 1)[-1] == "http-js-quickjs"
+        for name in re.split(r"[,\s]+", features)
+    )
     targets = _env(
         "VOLE_ANDROID_TARGETS", "aarch64-linux-android x86_64-linux-android"
     ).split()
@@ -479,6 +485,10 @@ def build_android() -> Path:
                 f"--target={clang.removesuffix('-clang')} {bindgen_extra}"
             ).strip(),
         }
+        if quickjs:
+            # The binding selects a compiler explicitly and honors TARGET_CC.
+            env["TARGET_CC"] = str(linker)
+            env[bindgen_key] += " " + shlex.quote(f"--sysroot={toolchain / 'sysroot'}")
         _cargo_build(target, profile_flags, features, env)
         artifact = _cargo_target_dir(env) / target / profile_name / "libvole.so"
         destination = output / abi / "libvole.so"

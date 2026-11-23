@@ -2,6 +2,7 @@
 
 import io
 import os
+import shlex
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -310,7 +311,7 @@ class BuildTests(unittest.TestCase):
                 self.assertEqual(env["CC_aarch64_pc_windows_msvc"], "tools/clang-cl")
 
     def test_android_uses_matching_api_and_cpp_runtime(self):
-        toolchain = self.root / "ndk/toolchain"
+        toolchain = self.root / "android ndk/toolchain"
         for target, abi in (
             ("aarch64-linux-android", "arm64-v8a"),
             ("x86_64-linux-android", "x86_64"),
@@ -330,20 +331,36 @@ class BuildTests(unittest.TestCase):
             ),
         ):
             output = builds.build_android()
-        for command, env in self.commands:
-            target = command[command.index("--target") + 1]
+            with patch.dict(os.environ, {"VOLE_FEATURES": "ffi,http-diagnostics"}):
+                builds.build_android()
+        self.assertEqual(len(self.commands), 4)
+        for _, env in self.commands:
             abi = env["VOLE_CMAKE_ANDROID_ABI"]
-            self.assertEqual(
-                command[command.index("--features") + 1],
-                "ffi",
-            )
-            self.assertEqual(
-                env[f"BINDGEN_EXTRA_CLANG_ARGS_{target}"], f"--target={target}28"
-            )
             self.assertEqual(env["VOLE_CMAKE_ANDROID_API"], "28")
             self.assertEqual((output / abi / "libvole.so").read_bytes(), b"library")
             self.assertEqual(
                 (output / abi / "libc++_shared.so").read_bytes(), abi.encode()
+            )
+        for command, env in self.commands[:2]:
+            self.assertEqual(
+                command[command.index("--features") + 1], "ffi,http-js-quickjs"
+            )
+            target = command[command.index("--target") + 1]
+            self.assertEqual(
+                env["TARGET_CC"], str(toolchain / "bin" / f"{target}28-clang")
+            )
+            self.assertEqual(
+                shlex.split(env[f"BINDGEN_EXTRA_CLANG_ARGS_{target}"]),
+                [f"--target={target}28", f"--sysroot={toolchain / 'sysroot'}"],
+            )
+        for command, env in self.commands[2:]:
+            self.assertEqual(
+                command[command.index("--features") + 1], "ffi,http-diagnostics"
+            )
+            target = command[command.index("--target") + 1]
+            self.assertNotIn("TARGET_CC", env)
+            self.assertEqual(
+                env[f"BINDGEN_EXTRA_CLANG_ARGS_{target}"], f"--target={target}28"
             )
 
     def test_apple_build_stages_five_slices_from_six_targets(self):

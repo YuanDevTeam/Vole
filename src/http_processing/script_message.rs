@@ -896,9 +896,9 @@ async fn run_until_observed(
         };
         #[cfg(not(target_vendor = "apple"))]
         let mut acquired_lane = if script.body == BodyMode::Bytes
-            && cfg!(any(
-                all(target_os = "android", feature = "ffi"),
-                all(target_os = "linux", feature = "http-js-quickjs")
+            && cfg!(all(
+                feature = "http-js-quickjs",
+                any(target_os = "android", target_os = "linux")
             )) {
             // Queue with the already collected input. Only an active
             // invocation needs a metadata snapshot, output and bridge copies.

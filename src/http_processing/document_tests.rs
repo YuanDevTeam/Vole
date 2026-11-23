@@ -614,7 +614,10 @@ fn inline_scripts_are_validated_and_change_candidate_identity() {
     feature = "inbound-http",
     not(any(
         target_vendor = "apple",
-        all(feature = "http-js-quickjs", any(target_os = "linux", windows))
+        all(
+            feature = "http-js-quickjs",
+            any(target_os = "android", target_os = "linux", windows)
+        )
     ))
 ))]
 #[test]

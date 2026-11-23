@@ -3,30 +3,13 @@
 # This file is expected to be part of source control.
 # To regenerate this file, run: ./gradlew :dependencies --write-locks
 androidx.annotation:annotation-jvm:1.10.0=debugRuntimeClasspath
-androidx.annotation:annotation-jvm:1.8.1=debugCompileClasspath
 androidx.annotation:annotation:1.10.0=debugRuntimeClasspath
-androidx.annotation:annotation:1.8.1=debugCompileClasspath
-androidx.arch.core:core-common:2.0.0=debugCompileClasspath,debugRuntimeClasspath
-androidx.collection:collection:1.0.0=debugCompileClasspath,debugRuntimeClasspath
-androidx.concurrent:concurrent-futures:1.0.0=debugCompileClasspath,debugRuntimeClasspath
-androidx.core:core:1.1.0=debugCompileClasspath,debugRuntimeClasspath
-androidx.javascriptengine:javascriptengine:1.1.1=debugCompileClasspath,debugRuntimeClasspath
-androidx.lifecycle:lifecycle-common:2.0.0=debugCompileClasspath,debugRuntimeClasspath
-androidx.lifecycle:lifecycle-runtime:2.0.0=debugCompileClasspath,debugRuntimeClasspath
 androidx.startup:startup-runtime:1.2.0=debugRuntimeClasspath
 androidx.tracing:tracing:1.0.0=debugRuntimeClasspath
-androidx.versionedparcelable:versionedparcelable:1.1.0=debugCompileClasspath,debugRuntimeClasspath
-com.google.code.findbugs:jsr305:3.0.2=debugCompileClasspath,debugRuntimeClasspath
-com.google.errorprone:error_prone_annotations:2.18.0=debugCompileClasspath,debugRuntimeClasspath
-com.google.guava:failureaccess:1.0.1=debugCompileClasspath,debugRuntimeClasspath
-com.google.guava:guava:32.0.1-android=debugCompileClasspath,debugRuntimeClasspath
-com.google.guava:listenablefuture:9999.0-empty-to-avoid-conflict-with-guava=debugCompileClasspath,debugRuntimeClasspath
-com.google.j2objc:j2objc-annotations:2.8=debugCompileClasspath,debugRuntimeClasspath
 com.squareup.okhttp3:okhttp-android:5.5.1=debugCompileClasspath,debugRuntimeClasspath
 com.squareup.okhttp3:okhttp:5.5.1=debugCompileClasspath,debugRuntimeClasspath
 com.squareup.okio:okio-jvm:3.18.1=debugCompileClasspath,debugRuntimeClasspath
 com.squareup.okio:okio:3.18.1=debugCompileClasspath,debugRuntimeClasspath
-org.checkerframework:checker-qual:3.33.0=debugCompileClasspath,debugRuntimeClasspath
 org.jetbrains.kotlin:kotlin-build-tools-api:2.2.10=kotlinBuildToolsApiClasspath
 org.jetbrains.kotlin:kotlin-build-tools-impl:2.2.10=kotlinBuildToolsApiClasspath
 org.jetbrains.kotlin:kotlin-compiler-embeddable:2.2.10=kotlinBuildToolsApiClasspath,kotlinCompilerClasspath
@@ -43,5 +26,4 @@ org.jetbrains.kotlin:kotlin-stdlib:2.2.10=kotlinBuildToolsApiClasspath,kotlinCom
 org.jetbrains.kotlin:kotlin-stdlib:2.2.21=debugCompileClasspath,debugRuntimeClasspath
 org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.8.0=kotlinBuildToolsApiClasspath,kotlinCompilerClasspath
 org.jetbrains:annotations:13.0=debugCompileClasspath,debugRuntimeClasspath,kotlinBuildToolsApiClasspath,kotlinCompilerClasspath
-org.jspecify:jspecify:1.0.0=debugCompileClasspath,debugRuntimeClasspath
 empty=androidApis,debugAnnotationProcessorClasspath,debugReverseMetadataValues,kotlinCompilerPluginClasspath

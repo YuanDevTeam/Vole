@@ -189,6 +189,10 @@ jobs:
           python-version: "3.x"
           check-latest: true
       - uses: astral-sh/setup-uv@v10.4.0
+      - name: Android native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
       - name: Install stable Android NDK r30
         run: |
           set -euo pipefail

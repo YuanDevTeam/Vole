@@ -31,6 +31,5 @@ dependencyLocking {
 }
 
 dependencies {
-    implementation("androidx.javascriptengine:javascriptengine:1.1.1")
     implementation("com.squareup.okhttp3:okhttp:5.5.1")
 }

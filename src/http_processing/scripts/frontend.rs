@@ -37,7 +37,10 @@ pub(super) struct PreparedSource {
     pub(super) output_bound: super::OutputBound,
     #[cfg(any(
         target_vendor = "apple",
-        all(target_os = "linux", feature = "http-js-quickjs")
+        all(
+            any(target_os = "linux", target_os = "android"),
+            feature = "http-js-quickjs"
+        ),
     ))]
     pub(super) plan: Option<super::static_literal_plan::Plan>,
 }
@@ -120,7 +123,10 @@ pub(super) fn compile_prepared(source: &str) -> io::Result<PreparedSource> {
         output_bound: output_bound::analyze(function),
         #[cfg(any(
             target_vendor = "apple",
-            all(target_os = "linux", feature = "http-js-quickjs")
+            all(
+                any(target_os = "linux", target_os = "android"),
+                feature = "http-js-quickjs"
+            ),
         ))]
         plan: super::static_literal_plan::analyze(function),
     })

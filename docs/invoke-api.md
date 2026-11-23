@@ -125,7 +125,7 @@ stopped -> preparing -> prepared -> starting -> running
 {"method":"getHttpDiagnostics","payload":{}}
 ```
 
-省略 `instanceId`，使用空 payload。此调用直接读取 [进程级观测](http-processing.md#编译期诊断)，无需初始化。Apple 另提供本 Core 自有线程的 QoS 请求记录。累计量可比较同一进程的前后读数，峰值应按其实际覆盖范围解释。App 和 Network Extension 各自报告本进程。默认构建返回未知方法。
+省略 `instanceId`，使用空 payload。此调用直接读取 [进程级观测](http-processing.md#编译期诊断)，无需初始化。`planEntered` 和 `quickjsEngineEntered` 分别记录静态计划和 QuickJS-NG 适配器的调用入口。执行是否成功仍看结果或成功计数。Apple 另提供本 Core 自有线程的 QoS 请求记录。累计量可比较同一进程的前后读数，峰值应按其实际覆盖范围解释。App 和 Network Extension 各自报告本进程。默认构建返回未知方法。
 
 ### `runHttpScriptPlanValidation`（Apple 诊断构建）
 
@@ -474,7 +474,7 @@ public final class NativeVole {
 }
 ```
 
-该命名空间也是 Android 脚本沙箱接口使用的唯一命名空间。宿主声明必须与原生库一致；
+宿主声明必须与原生库一致；
 代码压缩和混淆必须保留该类、这些 native 方法以及 controller 的 `boolean protect(int)`
 方法名。`nativeInvoke` 的请求与响应均为标准 UTF-8 JSON `byte[]`，由 JVM 管理，
 不使用 C ABI 的 `VoleFree` 释放。
@@ -496,19 +496,9 @@ ProtectFd(fd) -> bool
 - TUN 租约存活期间不能替换或注销 controller；`stop`/`destroyInstance` 是释放屏障。
 - Android binding 使用 UTF-8 `byte[]`，不依赖 Modified UTF-8。
 
-### Android 脚本沙箱
+### Android HTTP 脚本
 
-启用 `inbound-http` 的 Android 原生库另提供以下 `NativeVole` 方法。宿主在执行脚本前注册独立的 JavaScript controller。注册不替代 protect 回调。
-
-```java
-public static native boolean nativeRegisterJsController(Object controller);
-public static native boolean nativeUnregisterJsController();
-public static native void nativeCompleteJs(long id, int status, byte[] metadata, byte[] body);
-```
-
-controller 提供 `int prepare()`、`boolean start(long id, byte[] script, byte[] input, int outputMax)`、`void cancel(long id)` 和 `void stop()`。混淆规则保留 JNI 类和 controller 方法名。controller 使用 AndroidX JavaScriptEngine 及设备 WebView 的隔离进程。Core 输出的受信任脚本包装器以 UTF-8 传递，正文由消息端口传输。宿主在 `prepare` 中检查沙箱、终止、堆上限、消息端口、Promise 返回和大脚本传输能力。没有注册或设备缺少能力时，激活的业务脚本准备失败。静态校验、禁用脚本和不匹配的目标无需启动沙箱。
-
-`prepare` 返回 0 表示就绪，1 表示缺少能力，其余表示后端故障。`start` 接收调用 ID 和输出正文上限，返回后异步用相同 ID 完成一次。完成状态 0 携带 JSON 元数据和正文，1 表示脚本失败，2 表示执行期限或 tick 用尽，其余表示后端故障。仍在执行的调用取消或过期时，`cancel` 关闭实际执行所用沙箱。`stop` 回收活动和空闲沙箱，仍可重新准备。宿主只在同步关闭之后释放相应资源。迟到的结果无法提交。
+Android 发行工具默认启用 `http-js-quickjs`，HTTP 脚本复用 Core 进程内的 QuickJS-NG；符合条件的静态文本计划直接在 Core 执行。宿主通过同一 `nativeInvoke` 交付 HTTP 插件和离线 `testHttp` 样本，TUN 实例继续按上述接口注册 protect controller。正文预算、执行期限、取消和同步停止沿用 [HTTP 处理](http-processing.md#内联-http-脚本)。
 
 ## Controller
 

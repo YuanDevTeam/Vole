@@ -36,7 +36,6 @@ impl CompiledScript {
         self.selector.matches(original.into())
     }
 
-    #[cfg(any(test, not(all(feature = "ffi", target_os = "android"))))]
     pub(super) fn needs_jsc_for_business(&self) -> bool {
         self.compiled.needs_jsc_for_business(self.body, self.phase)
     }
@@ -159,7 +158,10 @@ mod tests {
 
     #[cfg(not(any(
         target_vendor = "apple",
-        all(feature = "http-js-quickjs", any(target_os = "linux", windows))
+        all(
+            feature = "http-js-quickjs",
+            any(target_os = "android", target_os = "linux", windows)
+        )
     )))]
     #[test]
     fn total_source_does_not_expand_platform_availability() {

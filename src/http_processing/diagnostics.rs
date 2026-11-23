@@ -141,6 +141,14 @@ pub(crate) enum Counter {
     TunNetstackDriverWaitNotify,
     #[cfg_attr(not(feature = "tun"), allow(dead_code))]
     TunNetstackDriverWaitTimer,
+    #[cfg_attr(
+        not(all(
+            feature = "http-js-quickjs",
+            any(target_os = "android", target_os = "linux", windows)
+        )),
+        allow(dead_code)
+    )]
+    QuickjsEngineEntered,
 }
 
 #[derive(Clone, Copy)]
@@ -395,7 +403,7 @@ mod enabled {
     use serde_json::{Map, Value, json};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    const COUNTERS: [&str; 104] = [
+    const COUNTERS: [&str; 105] = [
         "scriptMatched",
         "skipAsteriskBody",
         "skipBodyUnavailable",
@@ -500,6 +508,7 @@ mod enabled {
         "tunNetstackDriverWaitIngress",
         "tunNetstackDriverWaitNotify",
         "tunNetstackDriverWaitTimer",
+        "quickjsEngineEntered",
     ];
     const TIMINGS: [&str; 10] = [
         "queue",

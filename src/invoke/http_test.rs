@@ -521,10 +521,7 @@ impl Exchange<'_> {
             let mut observe = |script: &CompiledScript, result, reason| {
                 script_events.push(self.script_event(script, result, reason));
             };
-            #[cfg(target_vendor = "apple")]
             let available = crate::http_processing::scripts::ensure_available();
-            #[cfg(not(target_vendor = "apple"))]
-            let available = crate::http_processing::scripts::prepare_platform(&cancellation);
             let outcome = match available {
                 Ok(()) => {
                     script_message::run_observed(
@@ -689,7 +686,10 @@ mod tests {
 
     #[cfg(any(
         target_vendor = "apple",
-        all(feature = "http-js-quickjs", any(target_os = "linux", windows))
+        all(
+            feature = "http-js-quickjs",
+            any(target_os = "android", target_os = "linux", windows)
+        )
     ))]
     #[test]
     fn platform_fixture_rewrites_each_origin_through_test_http() {

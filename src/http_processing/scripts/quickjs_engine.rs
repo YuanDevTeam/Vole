@@ -327,6 +327,7 @@ pub(super) fn evaluate(
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> io::Result<serde_json::Value> {
+    super::super::diagnostics::increment(super::super::diagnostics::Counter::QuickjsEngineEntered);
     let execution = Execution {
         deadline,
         cancellation,
@@ -603,7 +604,7 @@ mod tests {
         assert_eq!(output.as_ref(), "🦕\0é".as_bytes());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn closed_text_plan_matches_quickjs_guards_and_unicode_output() {
         use crate::http_processing::scripts::Backend;

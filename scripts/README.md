@@ -36,8 +36,11 @@ Android 优先使用 `ANDROID_NDK_HOME`，否则在 `ANDROID_HOME/ndk` 中选择
 `VOLE_ANDROID_NDK_VERSION` 可指定版本，`VOLE_ANDROID_API` 默认 24。
 `CARGO_TARGET_DIR` 按 Cargo 约定覆盖中间产物目录；其余本地覆盖见 `builds.py`。
 
-Linux CLI 和 FFI、Windows CLI、Wintun FFI 和 UWP FFI 启用 `http-js-quickjs`，
+Android FFI、Linux CLI 和 FFI、Windows CLI、Wintun FFI 和 UWP FFI 启用 `http-js-quickjs`，
 通过 `libquickjs-ng-sys` 0.14.0 从源码编译 QuickJS-NG 0.18.0 静态库。
+Android 使用 NDK Clang 编译 C 源码，宿主需要 `libclang` 生成 Rust 绑定。
+本地 Android 构建可通过 `VOLE_FEATURES` 指定完整的 Cargo feature 列表，例如
+`VOLE_FEATURES=ffi` 可构建无 JS 引擎的 FFI。发布归档使用默认 feature。
 Linux 需要 `clang` 和 `libclang`。Windows 需要同架构 LLVM 的 `clang-cl.exe` 和
 `libclang.dll`，可将 `LIBCLANG_PATH` 指向包含这两个文件的 LLVM 目录。
 UWP 的 C 编译与绑定生成使用 `WINAPI_FAMILY=WINAPI_FAMILY_APP` 和
