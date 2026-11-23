@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 pub const QUEUE_LIMIT: usize = 32;
 pub const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_vendor = "apple"))]
 #[path = "quic/send_batch_memory_tests.rs"]
 mod send_batch_memory_tests;
 
@@ -378,7 +378,7 @@ pub fn attach_mapped(
 
 enum PendingSend {
     Single(crate::dispatch::OwnedDatagramSend),
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     Batch {
         operation: crate::dispatch::OwnedDatagramBatchSend,
         submitted: usize,
@@ -386,7 +386,7 @@ enum PendingSend {
 }
 enum SendCompletion {
     Single,
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     Batch(usize),
 }
 impl PendingSend {
@@ -396,7 +396,7 @@ impl PendingSend {
                 operation.as_mut().await.map_err(dispatch_error)?;
                 Ok(SendCompletion::Single)
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             Self::Batch {
                 operation,
                 submitted,
@@ -414,7 +414,7 @@ impl PendingSend {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn ready_send_batch(shared: &Shared, peer: SocketAddr) -> Vec<Datagram> {
     let state = shared.state.lock().unwrap();
     if state.closed || state.outgoing.len() < 2 {
@@ -447,7 +447,7 @@ async fn drive(
     let mut has_sent = false;
     let mut receive_scratch = Vec::new();
     let mut pending_send: Option<PendingSend> = None;
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     let mut batch_available = true;
     loop {
         let (can_receive, can_send) = {
@@ -467,7 +467,7 @@ async fn drive(
                 let mut state = shared.state.lock().unwrap();
                 match sent {
                     SendCompletion::Single => state.stats.sent += 1,
-                    #[cfg(target_os = "macos")]
+                    #[cfg(target_vendor = "apple")]
                     SendCompletion::Batch(accepted) => {
                         // Driver Drop may have cleared the queue while IO completed.
                         if state.closed { return Ok(()); }
@@ -508,7 +508,7 @@ async fn drive(
             }
         }
         if pending_send.is_none() {
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             {
                 // Clone handles only. The original FIFO remains the capacity
                 // ledger until a positive physical completion consumes a prefix.

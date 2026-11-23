@@ -76,5 +76,5 @@ fn send_with(
 }
 
 #[cfg(test)]
-#[path = "direct_macos_batch_memory_tests.rs"]
+#[path = "direct_apple_batch_memory_tests.rs"]
 mod tests;

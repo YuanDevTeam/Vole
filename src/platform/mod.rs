@@ -1,12 +1,6 @@
-#[cfg(all(
-    feature = "invoke",
-    any(target_os = "ios", target_os = "tvos", target_os = "macos")
-))]
+#[cfg(all(feature = "invoke", target_vendor = "apple"))]
 pub(crate) mod apple_logging;
-#[cfg(all(
-    feature = "invoke",
-    any(target_os = "ios", target_os = "tvos", target_os = "macos")
-))]
+#[cfg(all(feature = "invoke", target_vendor = "apple"))]
 pub(crate) mod apple_runtime_qos;
 #[cfg(all(feature = "tun", any(target_os = "linux", test)))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

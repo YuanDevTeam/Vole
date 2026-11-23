@@ -71,7 +71,7 @@ H1 请求命令队列以指针槽持有完整请求，避免底层分块队列�
 逻辑队列容量、请求顺序、正文共享及取消/Stop 所有权保持不变。
 
 省略或留空间隔时，普通路径的部分批次使用 10 ms 聚合，上述共享 H3 双响应路径使用 2 ms。
-Linux 或 macOS TUN 建立的 H2Mux 会话取得实际 VLESS H3 PacketUp Body 载体的 capture 且未启用 Brutal 时，
+Linux 或 Apple TUN 建立的 H2Mux 会话取得实际 VLESS H3 PacketUp Body 载体的 capture 且未启用 Brutal 时，
 部分批次使用 1 ms。该载体资格要求无独立下载腿、VLESS Encryption、padding 和 only-tcp。
 达到对应批次上限后立即提交，正文仍只使用一个有界工作区。
 显式配置的间隔与范围保持原值，满批仍遵守该间隔。
@@ -101,7 +101,7 @@ Linux 或 macOS TUN 建立的 H2Mux 会话取得实际 VLESS H3 PacketUp Body �
 仅 VLESS packet-up 且存在显式 download-settings、上传和下载均为 H2 与静态普通 TLS、JLS 或 REALITY 时，可按每腿的字面 IP、固定直接上游和固定物理出口证明共享活动连接，每条最多 4 个逻辑租约。上传与显式下载腿各有独立池，不跨节点或资源代复用；单腿、stream-one/stream-up、明文和其它版本组合保持原路径。
 REALITY 的公钥、short ID、SNI、指纹与混合密钥交换选项固定于各腿节点；新物理连接仍执行原生 REALITY 认证，不跨两腿或身份复用握手材料。
 实际租约同时受对端 HTTP/2 并发 stream 额度约束；收到 GOAWAY 后新逻辑请求另建物理连接，现有流继续排空，不重放已发送正文。
-域名、动态组/代理上游、文件客户端证书、动态 ECH、ShadowTLS、opaque protect、DNS/source/interface binding、自动出口发现、非 dual IP-version、非 macOS 的 `mptcp: true` 和 Windows adapter binding 保持原独立路径；请求 TCP-control 的逻辑建链也独立。它们仍受支持，不增加配置拒绝。
+域名、动态组/代理上游、文件客户端证书、动态 ECH、ShadowTLS、opaque protect、DNS/source/interface binding、自动出口发现、非 dual IP-version、非 Apple 平台的 `mptcp: true` 和 Windows adapter binding 保持原独立路径；请求 TCP-control 的逻辑建链也独立。它们仍受支持，不增加配置拒绝。
 每次逻辑租约保留原路径预检：LazyDirect 使用字面端点 resolver，预解析 Direct 保留其端点而不新增 resolver 依赖，两者均保留 deadline/cancellation/地址族/IP4P 检查；Dialer 停机、节点 Stop、物理连接退役及原建链期限也覆盖等待池创建与命中活动连接的路径。mark、TFO、TLS 参数、HTTP 请求模板及队列预算保持原腿配置，不通过新默认 Dialer 重拨。
 最后一个租约释放后立即移出候选池，并进入既有的有界传输收尾流程，不保留空闲候选。
 这限制了并行连接的重复开销，不是全节点业务准入额度。
@@ -216,4 +216,4 @@ H3 的 QUIC 驱动、数据报适配器和后台任务归节点所有。物理�
 
 对端、拓扑和平台证据见[测试隔离](testing-isolation.md)及[验收边界](acceptance.md)。
 
-业务 HTTP 保留同一已建逻辑 TCP 流与本章的 XHTTP 物理 transport 池不同。静态业务资格检查真实上传及下载每一腿的版本、security、path 和 owner 取消；H3 不能借用父 connector 的 TCP 证明。业务 HTTP 资格与物理 transport 池分别判断，不能由业务资格替代 packet-up／stream-up／stream-one 的原条件。macOS 的 `mptcp: true` 普通 TCP 标记例外也适用于私有 active-H2-pair 的每腿静态路径证明；其余资格、池及额度不变。逻辑流的发送／关闭合同和显式 reuse-settings 保持。
+业务 HTTP 保留同一已建逻辑 TCP 流与本章的 XHTTP 物理 transport 池不同。静态业务资格检查真实上传及下载每一腿的版本、security、path 和 owner 取消；H3 不能借用父 connector 的 TCP 证明。业务 HTTP 资格与物理 transport 池分别判断，不能由业务资格替代 packet-up／stream-up／stream-one 的原条件。Apple 平台的 `mptcp: true` 普通 TCP 标记例外也适用于私有 active-H2-pair 的每腿静态路径证明；其余资格、池及额度不变。逻辑流的发送／关闭合同和显式 reuse-settings 保持。

@@ -543,7 +543,7 @@ impl<'a> Transaction<'a> {
 /// Private fields prevent pairing arbitrary bytes with a different ledger.
 #[derive(Clone, Copy)]
 #[cfg_attr(
-    not(all(feature = "inbound-http", target_os = "tvos")),
+    not(all(feature = "inbound-http", target_vendor = "apple")),
     allow(dead_code)
 )]
 pub(crate) struct BorrowedBody<'a> {
@@ -551,7 +551,7 @@ pub(crate) struct BorrowedBody<'a> {
     budget: &'a Budget,
 }
 #[cfg_attr(
-    not(all(feature = "inbound-http", target_os = "tvos")),
+    not(all(feature = "inbound-http", target_vendor = "apple")),
     allow(dead_code)
 )]
 impl<'a> BorrowedBody<'a> {
@@ -563,7 +563,7 @@ impl<'a> BorrowedBody<'a> {
     }
 }
 impl BudgetedBytes {
-    #[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
+    #[cfg(any(test, all(feature = "http-diagnostics", target_vendor = "apple")))]
     pub(crate) fn borrowed_body(&self) -> BorrowedBody<'_> {
         BorrowedBody {
             bytes: self.as_ref(),
@@ -585,7 +585,7 @@ pub(crate) struct Entity {
     original_text: bool,
 }
 impl Entity {
-    #[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
+    #[cfg(any(test, all(feature = "http-diagnostics", target_vendor = "apple")))]
     pub(crate) fn identity(bytes: BudgetedBytes) -> Self {
         let budget = bytes.budget().clone();
         let wire = bytes.into_bytes();
@@ -605,7 +605,7 @@ impl Entity {
         self.logical.as_deref()
     }
     #[cfg_attr(
-        not(all(feature = "inbound-http", target_os = "tvos")),
+        not(all(feature = "inbound-http", target_vendor = "apple")),
         allow(dead_code)
     )]
     pub(crate) fn borrowed_body(&self) -> Option<BorrowedBody<'_>> {
@@ -814,14 +814,14 @@ mod p1_tests;
 #[cfg(all(
     feature = "inbound-http",
     feature = "http-diagnostics",
-    target_os = "tvos"
+    target_vendor = "apple"
 ))]
 #[path = "native_byte_map_validation.rs"]
 mod native_byte_map_validation;
 #[cfg(all(
     feature = "inbound-http",
     feature = "http-diagnostics",
-    target_os = "tvos"
+    target_vendor = "apple"
 ))]
 pub(crate) fn validate_native_byte_map() -> std::io::Result<serde_json::Value> {
     native_byte_map_validation::run()

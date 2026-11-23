@@ -491,7 +491,7 @@ pub(super) fn start_request(
     Ok((response, uploaded, RequestUpload(pending)))
 }
 
-#[cfg(any(test, all(target_os = "tvos", feature = "http-diagnostics")))]
+#[cfg(any(test, all(target_vendor = "apple", feature = "http-diagnostics")))]
 #[path = "h2_request_upload_validation.rs"]
 pub(super) mod request_upload_validation;
 

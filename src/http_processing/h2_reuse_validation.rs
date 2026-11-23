@@ -85,7 +85,7 @@ impl Fixture {
             pong: CancellationToken::new(),
         }
     }
-    // Only this cfg(test/explicit tvOS suite) factory bypasses TLS. Production
+    // Only this cfg(test/explicit Apple suite) factory bypasses TLS. Production
     // acquire's factory is StandardTlsClient::connect_negotiated, not this one.
     async fn open(&self) -> io::Result<(BoxStream, Option<Vec<u8>>)> {
         self.opens.fetch_add(1, Ordering::AcqRel);
@@ -387,7 +387,7 @@ async fn unsupported_alpn() -> io::Result<Value> {
         json!({"id":"h2-unexpected-alpn-rejected","passed":rejected && never_registered && released,"rejected":rejected,"neverRegistered":never_registered,"ioOwnersReleased":released}),
     )
 }
-#[cfg(all(target_os = "tvos", feature = "http-diagnostics"))]
+#[cfg(all(target_vendor = "apple", feature = "http-diagnostics"))]
 pub(super) fn run() -> io::Result<Value> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return Err(io::ErrorKind::WouldBlock.into());

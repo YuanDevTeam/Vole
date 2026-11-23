@@ -429,7 +429,7 @@ fn static_encrypted_vless_keeps_all_physical_and_dependency_restrictions() {
         for dialer in [
             Dialer::default().with_ip_version(IpVersion::Ipv4),
             Dialer::default().with_source_ip("192.0.2.20".parse().unwrap()),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(target_vendor = "apple"))]
             Dialer::default().with_mptcp(true),
         ] {
             let outbound = node(raw.clone(), path(dialer));
@@ -566,7 +566,7 @@ fn static_vless_preserves_upstream_and_physical_restrictions() {
         for dialer in [
             Dialer::default().with_ip_version(IpVersion::Ipv4),
             Dialer::default().with_source_ip("192.0.2.20".parse().unwrap()),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(target_vendor = "apple"))]
             Dialer::default().with_mptcp(true),
         ] {
             assert!(!capable(&node(raw.clone(), path(dialer))));
@@ -766,7 +766,7 @@ fn static_vless_jls_checks_each_download_path_and_owner() {
         for restricted_dialer in [
             Dialer::default().with_ip_version(IpVersion::Ipv4),
             Dialer::default().with_source_ip("192.0.2.20".parse().unwrap()),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(target_vendor = "apple"))]
             Dialer::default().with_mptcp(true),
         ] {
             let upload = path(if restricted_download {
@@ -844,7 +844,7 @@ fn static_vless_jls_invalid_credentials_never_construct_a_capable_node() {
 }
 
 #[test]
-fn macos_mptcp_preference_preserves_the_actual_vless_static_tcp_proof() {
+fn apple_mptcp_preference_preserves_the_actual_vless_static_tcp_proof() {
     let mut raw = base();
     raw["mptcp"] = json!(true);
     let parsed =
@@ -868,7 +868,7 @@ fn macos_mptcp_preference_preserves_the_actual_vless_static_tcp_proof() {
     assert!(requested && parsed.proxies[0].mptcp);
     assert!(ordinary_permitted);
     assert_eq!(tasks, 0);
-    assert_eq!(before, cfg!(target_os = "macos"));
+    assert_eq!(before, cfg!(target_vendor = "apple"));
     assert_eq!(dispatcher_before, before);
     assert!(!after);
 

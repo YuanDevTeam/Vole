@@ -1,4 +1,4 @@
-// Included only in the existing udp::tests module on macOS. Peer/Memory/serve
+// Included only in the existing udp::tests module on Apple targets. Peer/Memory/serve
 // remain the actual real-client factory; no production seam is replaced.
 struct ReadyBatchStopGate {
     armed: AtomicBool,

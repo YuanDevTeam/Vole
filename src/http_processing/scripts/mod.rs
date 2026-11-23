@@ -19,7 +19,7 @@ mod tests;
 #[cfg(all(
     feature = "inbound-http",
     feature = "http-diagnostics",
-    target_os = "tvos"
+    target_vendor = "apple"
 ))]
 pub(crate) mod plan_validation;
 #[cfg(all(
@@ -703,17 +703,14 @@ fn no_engine(
 #[derive(Clone, Copy)]
 enum OwnerBackend {
     Jsc,
-    #[cfg_attr(
-        not(any(test, all(feature = "http-diagnostics", target_os = "tvos"))),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(any(test, feature = "http-diagnostics")), allow(dead_code))]
     Plan,
 }
 
 #[cfg(all(
     feature = "inbound-http",
     target_vendor = "apple",
-    any(test, all(feature = "http-diagnostics", target_os = "tvos"))
+    any(test, feature = "http-diagnostics")
 ))]
 fn run_on_scoped_thread<T: Send>(
     operation: impl FnOnce() -> io::Result<T> + Send,

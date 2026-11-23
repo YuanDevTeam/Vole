@@ -791,7 +791,7 @@ async fn send(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn accept_ready_data(
     state: &mut Reliable,
     metadata: Metadata,
@@ -825,7 +825,7 @@ fn accept_ready_data(
     state.outstanding.insert(sequence(metadata), segment);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[allow(clippy::too_many_arguments)]
 async fn output_ready_data(
     transport: &mut dyn DatagramTransport,
@@ -1063,7 +1063,7 @@ async fn output(
             pattern.truncated = true;
             break;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         if state.established && pattern.pattern.low_entropy_enabled() {
             let sent = output_ready_data(
                 transport,
@@ -1566,7 +1566,7 @@ mod tests {
     };
     use tokio_util::{sync::CancellationToken, task::TaskTracker};
     include!("udp_upload_shutdown_tests.rs");
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     include!("udp_ready_batch_client_stop_memory_tests.rs");
 
     #[derive(Default)]
@@ -1593,7 +1593,7 @@ mod tests {
         nonces: Mutex<Vec<[u8; 24]>>,
         transmit_limit: u16,
         received: Mutex<Vec<(u8, usize, usize)>>,
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         ready_batch_stop_gate: Option<Arc<ReadyBatchStopGate>>,
     }
     struct Memory {
@@ -1605,7 +1605,7 @@ mod tests {
         task: Option<JoinHandle<()>>,
         budget: DatagramBudget,
         quiet_close: Option<(Arc<UploadFixture>, PacketDecoder)>,
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         ready_batch_stop_gate: Option<Arc<ReadyBatchStopGate>>,
     }
     impl Memory {
@@ -1658,7 +1658,7 @@ mod tests {
         fn payload_budget(&self, _: &Destination) -> DatagramBudget {
             self.budget
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         fn send_batch_owned(
             &mut self,
             packets: Vec<Datagram>,
@@ -1707,7 +1707,7 @@ mod tests {
             Ok(packet)
         }
         async fn close(&mut self) -> Result<(), DispatchError> {
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             if let Some(gate) = &self.ready_batch_stop_gate {
                 gate.closes.fetch_add(1, Ordering::AcqRel);
                 gate.close_with_owner
@@ -1717,7 +1717,7 @@ mod tests {
             if let Some(task) = self.task.take() {
                 let _ = task.await;
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             if let Some(gate) = &self.ready_batch_stop_gate {
                 gate.memory_joined.fetch_add(1, Ordering::AcqRel);
             }
@@ -1755,7 +1755,7 @@ mod tests {
                 nonces: Mutex::new(Vec::new()),
                 transmit_limit: MTU,
                 received: Mutex::new(Vec::new()),
-                #[cfg(target_os = "macos")]
+                #[cfg(target_vendor = "apple")]
                 ready_batch_stop_gate: None,
             })
         }
@@ -1812,7 +1812,7 @@ mod tests {
                 task: Some(task),
                 budget: DatagramBudget::new(self.transmit_limit, MTU),
                 quiet_close,
-                #[cfg(target_os = "macos")]
+                #[cfg(target_vendor = "apple")]
                 ready_batch_stop_gate: self.ready_batch_stop_gate.clone(),
             }))
         }
@@ -4245,6 +4245,6 @@ include!("udp_split_receive_tests.rs");
 #[cfg(test)]
 include!("udp_balanced_driver_tests.rs");
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_vendor = "apple"))]
 #[path = "udp_ready_batch_memory_tests.rs"]
 mod ready_batch_memory_tests;

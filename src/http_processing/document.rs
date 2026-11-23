@@ -4,7 +4,7 @@
     all(
         feature = "inbound-http",
         feature = "http-diagnostics",
-        target_os = "tvos"
+        target_vendor = "apple"
     )
 ))]
 use super::Policy;
@@ -469,7 +469,7 @@ impl Document {
         all(
             feature = "inbound-http",
             feature = "http-diagnostics",
-            target_os = "tvos"
+            target_vendor = "apple"
         )
     ))]
     pub(crate) fn parse(input: &str) -> io::Result<Arc<Self>> {
@@ -734,7 +734,7 @@ impl Document {
         all(
             feature = "inbound-http",
             feature = "http-diagnostics",
-            target_os = "tvos"
+            target_vendor = "apple"
         )
     ))]
     pub(crate) fn static_policy(self: &Arc<Self>) -> io::Result<Arc<Policy>> {

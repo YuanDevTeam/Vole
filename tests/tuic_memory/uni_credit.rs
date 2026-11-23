@@ -1,7 +1,7 @@
 //! Actual TUIC UDP-lane UNI credit over bounded memory packets.
 use super::*;
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[tokio::test]
 async fn quic_udp_advertised_uni_credit_is_128_and_recycles_at_17() {
     #[derive(Debug, Default)]

@@ -17,12 +17,12 @@ use crate::{
 
 use super::{ConnectedStream, DatagramRequest, EstablishContext, OutboundConnector};
 
-#[cfg(target_os = "macos")]
-#[path = "direct_macos_batch.rs"]
-mod macos_batch;
+#[cfg(target_vendor = "apple")]
+#[path = "direct_apple_batch.rs"]
+mod apple_batch;
 
 #[cfg(all(
-    target_os = "macos",
+    target_vendor = "apple",
     any(
         feature = "outbound-masque",
         feature = "outbound-wireguard",
@@ -47,7 +47,7 @@ impl DirectOutbound {
 
     /// Prepare one dedicated fixed-peer UDP path, without opening a socket.
     #[cfg(all(
-        target_os = "macos",
+        target_vendor = "apple",
         any(
             feature = "outbound-masque",
             feature = "outbound-wireguard",
@@ -141,7 +141,7 @@ struct DirectDatagramTransport {
     receive_buffer: Vec<u8>,
     receive_cursor: usize,
     #[cfg(all(
-        target_os = "macos",
+        target_vendor = "apple",
         any(
             feature = "outbound-masque",
             feature = "outbound-wireguard",
@@ -171,7 +171,7 @@ impl DirectDatagramTransport {
             receive_buffer: Vec::new(),
             receive_cursor: 0,
             #[cfg(all(
-                target_os = "macos",
+                target_vendor = "apple",
                 any(
                     feature = "outbound-masque",
                     feature = "outbound-wireguard",
@@ -212,7 +212,7 @@ impl DirectDatagramTransport {
     }
 
     #[cfg(all(
-        target_os = "macos",
+        target_vendor = "apple",
         any(
             feature = "outbound-masque",
             feature = "outbound-wireguard",
@@ -292,7 +292,7 @@ impl DirectDatagramTransport {
 impl DatagramTransport for DirectDatagramTransport {
     fn supports_shared_destinations(&self) -> bool {
         #[cfg(all(
-            target_os = "macos",
+            target_vendor = "apple",
             any(
                 feature = "outbound-masque",
                 feature = "outbound-wireguard",
@@ -347,7 +347,7 @@ impl DatagramTransport for DirectDatagramTransport {
         };
         let address = *address;
         #[cfg(all(
-            target_os = "macos",
+            target_vendor = "apple",
             any(
                 feature = "outbound-masque",
                 feature = "outbound-wireguard",
@@ -376,7 +376,7 @@ impl DatagramTransport for DirectDatagramTransport {
         }))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     fn send_batch_owned(
         &mut self,
         datagrams: Vec<Datagram>,
@@ -393,7 +393,7 @@ impl DatagramTransport for DirectDatagramTransport {
             let Ok(Some(socket)) = path.ready(peer) else {
                 return Err(datagrams);
             };
-            return macos_batch::send_connected_owned(socket, peer, datagrams);
+            return apple_batch::send_connected_owned(socket, peer, datagrams);
         }
         let class = UdpSocketClass {
             ipv6: peer.is_ipv6(),
@@ -403,7 +403,7 @@ impl DatagramTransport for DirectDatagramTransport {
             // Only the existing ordinary first send may initialize protected IO.
             return Err(datagrams);
         };
-        macos_batch::send_owned(socket.clone(), datagrams)
+        apple_batch::send_owned(socket.clone(), datagrams)
     }
 
     async fn send(&mut self, datagram: Datagram) -> Result<(), DispatchError> {
@@ -411,7 +411,7 @@ impl DatagramTransport for DirectDatagramTransport {
             return Err(DispatchError::HostUnreachable);
         };
         #[cfg(all(
-            target_os = "macos",
+            target_vendor = "apple",
             any(
                 feature = "outbound-masque",
                 feature = "outbound-wireguard",
@@ -488,7 +488,7 @@ impl DatagramTransport for DirectDatagramTransport {
 
     async fn close(&mut self) -> Result<(), DispatchError> {
         #[cfg(all(
-            target_os = "macos",
+            target_vendor = "apple",
             any(
                 feature = "outbound-masque",
                 feature = "outbound-wireguard",

@@ -330,7 +330,7 @@ impl OutboundConnector for TuicOutbound {
                 request.budget(),
                 lease,
                 tun_pending_send_enabled(
-                    cfg!(target_os = "macos"),
+                    cfg!(target_vendor = "apple"),
                     request.session.inbound,
                     self.config.udp_mode,
                     self.config.udp_over_stream,
@@ -404,7 +404,7 @@ async fn drive(
         #[cfg(target_os = "linux")]
         let wider_uni_scope = direct_literal_tun_datagrams(&datagram, &upstream, &server, peer);
         #[cfg(not(target_os = "linux"))]
-        let wider_uni_scope = cfg!(target_os = "macos");
+        let wider_uni_scope = cfg!(target_vendor = "apple");
         let budget = DatagramBudget::new(
             crate::limits::TUIC_QUIC_PAYLOAD as u16,
             crate::limits::TUIC_QUIC_PAYLOAD as u16,
@@ -416,7 +416,7 @@ async fn drive(
             } else {
                 request
             };
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         let raw = if config.udp_mode == crate::config::TuicUdpMode::Quic && !config.udp_over_stream
         {
             // Both business lanes keep this one authenticated physical peer.
@@ -427,7 +427,7 @@ async fn drive(
         } else {
             upstream.open_datagram(request, &context).await?
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         let raw = upstream.open_datagram(request, &context).await?;
         let (socket, owned) = quic::attach_quinn(raw, peer, budget).await?;
         driver = Some(owned);
@@ -569,12 +569,12 @@ async fn drive(
 }
 
 fn tun_pending_send_enabled(
-    macos: bool,
+    apple: bool,
     inbound: crate::session::InboundKind,
     mode: crate::config::TuicUdpMode,
     uot: bool,
 ) -> bool {
-    macos
+    apple
         && inbound == crate::session::InboundKind::Tun
         && mode == crate::config::TuicUdpMode::Quic
         && !uot

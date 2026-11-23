@@ -72,12 +72,12 @@ pub type OwnedDatagramSend =
     Pin<Box<dyn std::future::Future<Output = Result<(), DispatchError>> + Send + 'static>>;
 
 /// Opaque identity for one TUN business operation; never traffic or route text.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct TunSendToken(Arc<()>);
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 impl TunSendToken {
     pub(crate) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -85,14 +85,14 @@ impl TunSendToken {
 }
 
 /// One already-open TUIC operation, distinct from a physical-path send lease.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[doc(hidden)]
 pub struct TunPendingSend {
     pub(crate) operation: OwnedDatagramSend,
     pub(crate) completion: TunSendToken,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 impl TunPendingSend {
     pub(crate) fn new(operation: OwnedDatagramSend) -> Self {
         Self {
@@ -103,7 +103,7 @@ impl TunPendingSend {
 }
 
 /// Only a completed IO result may update successful/failed-send accounting.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[doc(hidden)]
 pub enum TunSendOutcome {
     Completed(Result<(), DispatchError>),
@@ -111,7 +111,7 @@ pub enum TunSendOutcome {
     Cancelled,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 impl TunSendOutcome {
     pub(crate) fn into_result(self) -> Result<(), DispatchError> {
         match self {
@@ -123,17 +123,17 @@ impl TunSendOutcome {
 }
 
 /// An already-open physical path's confirmed FIFO datagram prefix.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub type OwnedDatagramBatchSend =
     Pin<Box<dyn std::future::Future<Output = io::Result<usize>> + Send + 'static>>;
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub(crate) const DATAGRAM_SEND_BATCH_LIMIT: usize = 4;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub(crate) const DATAGRAM_SEND_BATCH_BYTES: usize = 8 * 1024;
 
 /// Admission only: no resolution, socket acquisition, or IO.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub(crate) fn datagram_batch_peer(packets: &[Datagram]) -> Option<std::net::SocketAddr> {
     if !(2..=DATAGRAM_SEND_BATCH_LIMIT).contains(&packets.len()) {
         return None;
@@ -246,7 +246,7 @@ pub trait DatagramTransport: Send {
     /// Unsupported returns the untouched packet before IO or route mutation.
     /// The caller retains one operation, drops it before completion/close, and
     /// invokes completion exactly once, including timeout and cancellation.
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     #[doc(hidden)]
     fn try_begin_tun_send(
         &mut self,
@@ -256,7 +256,7 @@ pub trait DatagramTransport: Send {
         Err(datagram)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     #[doc(hidden)]
     async fn finish_tun_send(
         &mut self,
@@ -271,7 +271,7 @@ pub trait DatagramTransport: Send {
     /// Unsupported paths return the untouched batch before any IO. A positive
     /// completion confirms only that FIFO prefix; errors must never be replayed.
     /// Drop this operation before closing the transport, as with `send_owned`.
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     #[doc(hidden)]
     fn send_batch_owned(
         &mut self,
@@ -656,7 +656,7 @@ impl DatagramTransport for ObservedDatagramTransport {
         self.inner.send_owned(datagram)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     fn try_begin_tun_send(
         &mut self,
         datagram: Datagram,
@@ -665,7 +665,7 @@ impl DatagramTransport for ObservedDatagramTransport {
         self.inner.try_begin_tun_send(datagram, flow_id)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     async fn finish_tun_send(
         &mut self,
         completion: TunSendToken,
@@ -674,7 +674,7 @@ impl DatagramTransport for ObservedDatagramTransport {
         self.inner.finish_tun_send(completion, outcome).await
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     fn send_batch_owned(
         &mut self,
         datagrams: Vec<Datagram>,
@@ -706,9 +706,9 @@ impl DatagramTransport for ObservedDatagramTransport {
 // Assert object safety in normal builds rather than discovering it in an FFI adapter.
 const _: Option<Pin<Box<dyn Dispatcher>>> = None;
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_vendor = "apple"))]
 pub(crate) mod tun_send_memory_test_support;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_vendor = "apple"))]
 mod tun_send_memory_tests;
 
 #[cfg(test)]

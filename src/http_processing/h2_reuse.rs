@@ -324,11 +324,11 @@ impl Parent {
     }
 }
 
-#[cfg(any(test, all(target_os = "tvos", feature = "http-diagnostics")))]
+#[cfg(any(test, all(target_vendor = "apple", feature = "http-diagnostics")))]
 #[path = "h2_reuse_validation.rs"]
 mod validation;
 
-#[cfg(all(target_os = "tvos", feature = "http-diagnostics"))]
+#[cfg(all(target_vendor = "apple", feature = "http-diagnostics"))]
 pub(super) fn validate() -> io::Result<serde_json::Value> {
     validation::run()
 }

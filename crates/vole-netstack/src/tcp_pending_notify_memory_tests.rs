@@ -48,7 +48,7 @@ fn assert_pending_notification(flush: bool) {
     assert_eq!(pending, [true; 4]);
     assert_eq!(
         extra_permits,
-        [cfg!(not(target_os = "macos")); 4],
-        "still-Pending polls published no new state; macOS must not renotify"
+        [cfg!(not(target_vendor = "apple")); 4],
+        "still-Pending polls published no new state; Apple targets suppress redundant notifications"
     );
 }

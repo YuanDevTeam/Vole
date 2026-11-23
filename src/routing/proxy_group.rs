@@ -665,7 +665,7 @@ impl Dispatcher for SelectProxyGroupDispatcher {
 
 // Core-originated DNS/probes also enter groups without a first destination.
 // Resolve their leaf on first send and retain it through the association.
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_vendor = "apple"))]
 #[path = "proxy_group_tun_send_memory_tests.rs"]
 mod tun_send_memory_tests;
 
@@ -682,7 +682,7 @@ impl DatagramTransport for BalancedDatagrams {
         false
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     fn try_begin_tun_send(
         &mut self,
         datagram: Datagram,
@@ -694,7 +694,7 @@ impl DatagramTransport for BalancedDatagrams {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     async fn finish_tun_send(
         &mut self,
         completion: crate::dispatch::TunSendToken,

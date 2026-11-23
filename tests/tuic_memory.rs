@@ -1128,7 +1128,7 @@ async fn cancelled_uni_credit_wait_does_not_replay_or_close_sibling_tcp() {
 // This case deliberately exercises the private TUN association entry through
 // production Observed -> Routed -> Connector -> normal TUIC, not a fake sender.
 // All assertions follow unconditional cancellation, Stop and owner joins.
-#[cfg(all(feature = "tun", target_os = "macos"))]
+#[cfg(all(feature = "tun", target_vendor = "apple"))]
 #[tokio::test]
 async fn tun_tuic_reply_progresses_while_same_association_uni_send_waits_for_credit() {
     for tracked in [false, true] {
@@ -1136,7 +1136,7 @@ async fn tun_tuic_reply_progresses_while_same_association_uni_send_waits_for_cre
     }
 }
 
-#[cfg(all(feature = "tun", target_os = "macos"))]
+#[cfg(all(feature = "tun", target_vendor = "apple"))]
 async fn tun_tuic_duplex_case(tracked: bool) {
     use std::{net::SocketAddr, task::Poll};
     use vole::{
@@ -2282,6 +2282,6 @@ async fn quic_business_lanes_retire_only_udp_while_tcp_is_held_and_stop_all() {
 #[path = "tuic_memory/uot_lane.rs"]
 mod uot_lane_memory;
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[path = "tuic_memory/uni_credit.rs"]
 mod uni_credit_memory;

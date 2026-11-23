@@ -142,7 +142,7 @@ mod tests {
         options.apply(&socket2::SockRef::from(&socket)).unwrap();
         assert!(socket.tcp_nodelay().unwrap());
         assert_eq!(socket.keepalive().unwrap(), !cfg!(target_os = "android"));
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
         {
             assert_eq!(
                 socket.tcp_keepalive_time().unwrap(),

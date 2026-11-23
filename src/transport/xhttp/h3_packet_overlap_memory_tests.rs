@@ -442,7 +442,7 @@ async fn qualified_default_partial_post_reaches_h3_before_ten_ms_with_strong_rec
         let mut fixture = Fixture::new(client, false, 16, 256 * 1024);
         let result = AssertUnwindSafe(timeout(LIMIT, async {
             let mut peer = fixture.initialize().await;
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_vendor = "apple"))]
             {
                 let Some(SendRequest::H3(sender)) = &fixture.sender else {
                     unreachable!("fixture has a real H3 sender");

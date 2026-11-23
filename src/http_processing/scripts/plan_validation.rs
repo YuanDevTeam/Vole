@@ -1,4 +1,4 @@
-//! Fixed, active tvOS diagnostic. No caller-supplied source, body or resources.
+//! Fixed, active Apple diagnostic. No caller-supplied source, body or resources.
 //! Requires Invoke's irreversible dedicated-process admission; never pressure.
 use super::{CompiledSource, apple, static_literal_plan};
 use crate::http_processing::{

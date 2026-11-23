@@ -201,11 +201,11 @@ impl Driver {
         let request = DatagramRequest::new(self.session.clone())
             .with_budget(DatagramBudget::new(size, size))
             .with_udp_receive_buffer_size(512 * 1024);
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         let mut transport = path
             .open_fixed_peer_datagram(request, endpoint, context)
             .await?;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         let mut transport = path.open_datagram(request, context).await?;
         let budget = transport.payload_budget(&Destination::Ip(endpoint));
         if budget.transmit() < size || budget.receive() < size {
@@ -225,7 +225,7 @@ impl Driver {
             sniffed_domain: None,
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     async fn send_network_batch(
         &self,
         mut packets: Vec<Datagram>,
@@ -260,7 +260,7 @@ impl Driver {
         }
         Ok(())
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     #[allow(clippy::too_many_arguments)]
     async fn send_ready_data_batch(
         &self,
@@ -447,7 +447,7 @@ async fn handle_peer_datagram(
     network: &mut [u8],
     datagram: Datagram,
 ) -> Result<(), DispatchError> {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     if driver.cancel.is_cancelled() {
         return Err(DispatchError::ConnectionRefused);
     }
@@ -503,7 +503,7 @@ async fn handle_peer_datagram(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 async fn poll_ready_datagram(
     transport: &mut Box<dyn DatagramTransport>,
 ) -> std::task::Poll<Result<Datagram, DispatchError>> {
@@ -513,7 +513,7 @@ async fn poll_ready_datagram(
     std::future::poll_fn(|context| std::task::Poll::Ready(receive.as_mut().poll(context))).await
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[allow(clippy::too_many_arguments)]
 async fn drain_ready_datagrams(
     driver: &Driver,
@@ -588,14 +588,14 @@ async fn run_peer(
         };
         match event {
             Event::Datagram(datagram) => {
-                #[cfg(target_os = "macos")]
+                #[cfg(target_vendor = "apple")]
                 let was_established = state.established;
                 handle_peer_datagram(
                     driver, tunn, endpoint, transport, &mut state, deadline, scratch, network,
                     datagram?,
                 )
                 .await?;
-                #[cfg(target_os = "macos")]
+                #[cfg(target_vendor = "apple")]
                 if was_established {
                     drain_ready_datagrams(
                         driver, tunn, endpoint, transport, &mut state, deadline, scratch, network,
@@ -606,7 +606,7 @@ async fn run_peer(
             Event::Packet(packet) => {
                 let packet = packet.ok_or(DispatchError::ConnectionRefused)?;
                 let result = tunn.encapsulate(packet.data(), scratch);
-                #[cfg(target_os = "macos")]
+                #[cfg(target_vendor = "apple")]
                 let result = match result {
                     TunnResult::WriteToNetwork(wire)
                         if state.established
@@ -726,6 +726,6 @@ pub(super) fn addresses(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
 #[path = "pending_ingress_memory_tests.rs"]
 mod pending_ingress_memory_tests;
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_vendor = "apple"))]
 #[path = "connected_factory_memory_tests.rs"]
 mod connected_factory_memory_tests;

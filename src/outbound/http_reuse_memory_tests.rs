@@ -82,7 +82,7 @@ fn static_http_path_preserves_physical_restrictions_and_stop() {
         ..Default::default()
     };
     for dialer in [
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         Dialer::default().with_mptcp(true),
         Dialer::default().with_ip_version(IpVersion::Ipv4),
         Dialer::default().with_source_ip("192.0.2.20".parse().unwrap()),
@@ -255,15 +255,15 @@ fn static_shadowsocks_all_ciphers_preserve_obfs_path_and_stop_guards() {
 }
 
 #[test]
-fn macos_mptcp_preference_only_removes_its_own_static_path_restriction() {
+fn apple_mptcp_preference_only_removes_its_own_static_path_restriction() {
     let dialer = Dialer::default().with_mptcp(true);
     assert_eq!(
         UpstreamPath::direct(endpoint(), dialer.clone()).permits_static_http_reuse(&server()),
-        cfg!(target_os = "macos")
+        cfg!(target_vendor = "apple")
     );
     assert_eq!(
         UpstreamPath::LazyDirect { dialer }.permits_static_http_reuse(&server()),
-        cfg!(target_os = "macos")
+        cfg!(target_vendor = "apple")
     );
     let egress = EgressOptions {
         interface: Some("memory-interface".into()),
@@ -417,7 +417,7 @@ fn static_ss2022_obfs_actual_config_requires_owned_http_reuse() {
                 ..Default::default()
             };
             for dialer in [
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(target_vendor = "apple"))]
                 Dialer::default().with_mptcp(true),
                 Dialer::default().with_ip_version(IpVersion::Ipv4),
                 Dialer::default().with_source_ip("192.0.2.20".parse().unwrap()),
@@ -546,7 +546,7 @@ fn static_ss2022_v2ray_mux_plain_actual_config_requires_owned_http_reuse() {
             ..Default::default()
         };
         for dialer in [
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(target_vendor = "apple"))]
             Dialer::default().with_mptcp(true),
             Dialer::default().with_ip_version(IpVersion::Ipv4),
             Dialer::default().with_source_ip("192.0.2.20".parse().unwrap()),
@@ -858,7 +858,7 @@ fn static_vmess_http_cover_keeps_tls_choice_and_complete_path_exclusions() {
         ..Default::default()
     };
     for dialer in [
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         Dialer::default().with_mptcp(true),
         Dialer::default().with_ip_version(IpVersion::Ipv4),
         Dialer::default().with_source_ip("192.0.2.20".parse().unwrap()),

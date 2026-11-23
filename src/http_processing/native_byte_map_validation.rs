@@ -1,11 +1,13 @@
-//! Fixed tvOS-only native differential group in the existing active suite.
+//! Fixed Apple diagnostic native differential group in the existing active suite.
 //! No caller data, sockets, VM, new runtime, source logging or host-only tests.
 use super::*;
+use crate::http_processing::origin::Origin;
 use crate::http_processing::rules::{
-    ActionKind, MatchKind, Occurrences, RawRule, Search, SearchMode,
+    ActionKind, Matcher, Occurrences, RawRule, RequestSelector, Search, SearchMode,
 };
 use serde_json::{Value, json};
-use std::{io, time::Instant};
+use std::{io, sync::Arc, time::Instant};
+use url::Url;
 
 const URL: &str = "https://native-validation.invalid/body";
 const N: usize = 65536;
@@ -21,22 +23,17 @@ fn compiled(
     mode: SearchMode,
     occurrences: Occurrences,
 ) -> io::Result<Rule> {
-    let raw = RawRule {
-        url: URL.into(),
-        match_kind: MatchKind::Exact,
-        action: ActionKind::ResponseBodyReplace,
-        enabled: true,
-        name: None,
-        replacement: Some(replacement.into()),
-        replacement_mode: None,
-        header: None,
-        value: None,
-        search: Some(search.into()),
-        search_mode: Some(mode),
-        occurrences: Some(occurrences),
-        patch: None,
-    };
-    Rule::compile(raw, &mut 0)
+    let mut raw = RawRule::action(ActionKind::ResponseBodyReplace, None);
+    raw.replacement = Some(replacement.into());
+    raw.search = Some(search.into());
+    raw.search_mode = Some(mode);
+    raw.occurrences = Some(occurrences);
+    compile_exact(raw)
+}
+fn compile_exact(raw: RawRule) -> io::Result<Rule> {
+    let scope = Arc::from([Origin::parse("https://native-validation.invalid")?]);
+    let selector = RequestSelector::new(scope, None, Matcher::PathExact("/body".into()));
+    Rule::compile_scoped(raw, Arc::new(selector), &mut 0)
 }
 fn search(rule: &Rule) -> io::Result<&Search> {
     match &rule.action {
@@ -79,7 +76,7 @@ fn compare(
     let url = Url::parse(URL).map_err(io::Error::other)?;
     let actual = apply_operations(
         std::slice::from_ref(rule),
-        &url,
+        (&url, "GET"),
         Phase::Response,
         input.as_ref(),
         budget,
@@ -219,7 +216,7 @@ fn fallback(budget: &Budget) -> io::Result<Group> {
     group.check(matches!(
         apply_operations(
             &rules,
-            &url,
+            (&url, "GET"),
             Phase::Response,
             input.as_ref(),
             budget,
@@ -258,9 +255,15 @@ fn entity_budget(budget: &Budget) -> io::Result<Group> {
                 Some(N as u64),
                 false,
             );
-            let mut transaction =
-                Transaction::begin_shared(budget, &rules, &url, Phase::Response, &wire, true)
-                    .map_err(|_| invalid())?;
+            let mut transaction = Transaction::begin_shared(
+                budget,
+                &rules,
+                (&url, "GET"),
+                Phase::Response,
+                &wire,
+                true,
+            )
+            .map_err(|_| invalid())?;
             push_repeat(&mut transaction, b'q', N)?;
             let old_ptr = transaction.raw.as_ref().as_ptr();
             let mut fields = vec![
@@ -320,8 +323,12 @@ fn rollback(budget: &Budget) -> io::Result<Group> {
     let url = Url::parse(URL).map_err(io::Error::other)?;
     let old = br#"{"key":"qq","number":1}"#;
     let mut rules = vec![compiled("q", "$", SearchMode::Literal, Occurrences::All)?];
-    let patch: RawRule = serde_json::from_value(json!({"url":URL,"match":"exact","action":"response-body-json-patch","patch":[{"op":"test","path":"/key","value":"other"}]})).map_err(io::Error::other)?;
-    rules.push(Rule::compile(patch, &mut 0)?);
+    let mut patch = RawRule::action(ActionKind::ResponseBodyJsonPatch, None);
+    patch.patch = Some(
+        serde_json::from_value(json!([{"op":"test","path":"/key","value":"other"}]))
+            .map_err(io::Error::other)?,
+    );
+    rules.push(compile_exact(patch)?);
     let request = OriginalRequestMeta::new("GET", &vec![]);
     let wire = WireBodyMeta::new(
         &vec![],
@@ -332,7 +339,7 @@ fn rollback(budget: &Budget) -> io::Result<Group> {
         false,
     );
     let mut transaction =
-        Transaction::begin_shared(budget, &rules, &url, Phase::Response, &wire, true)
+        Transaction::begin_shared(budget, &rules, (&url, "GET"), Phase::Response, &wire, true)
             .map_err(|_| invalid())?;
     transaction.push(old).map_err(|_| invalid())?;
     let mut fields = vec![
@@ -362,7 +369,7 @@ fn rollback(budget: &Budget) -> io::Result<Group> {
         false,
     );
     let mut transaction =
-        Transaction::begin_shared(budget, &rules, &url, Phase::Response, &wire, true)
+        Transaction::begin_shared(budget, &rules, (&url, "GET"), Phase::Response, &wire, true)
             .map_err(|_| invalid())?;
     transaction.push(b"qqsource").map_err(|_| invalid())?;
     let old_ptr = transaction.raw.as_ref().as_ptr();
@@ -390,7 +397,7 @@ fn rollback(budget: &Budget) -> io::Result<Group> {
     let foreign = Budget::default();
     let output = apply_operations(
         &rules,
-        &url,
+        (&url, "GET"),
         Phase::Response,
         entity.logical().ok_or_else(invalid)?,
         &foreign,
@@ -419,7 +426,7 @@ fn cpu() -> Option<u128> {
         tv_nsec: 0,
     };
     // SAFETY: same public current-thread clock used by scoped_qos; initialized
-    // writable timespec, tvOS-only diagnostics, no QoS setter or private API.
+    // writable timespec, Apple diagnostics, no QoS setter or private API.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
     (rc == 0 && time.tv_sec >= 0 && (0..1_000_000_000).contains(&time.tv_nsec))
         .then(|| (time.tv_sec as u128) * 1_000_000_000 + time.tv_nsec as u128)
@@ -522,6 +529,6 @@ pub(super) fn run() -> io::Result<Value> {
     let passed = count == EXPECTED as u64 && groups.len() == 6 && mismatches == 0;
     Ok(
         json!({"id":"native-byte-map-differential","kind":"native-differential","passed":passed,"caseCount":count,"expectedCaseCount":EXPECTED,"groupCount":groups.len(),"mismatchGroupCount":mismatches,"groups":groups,
-        "realCompiledRulesAndBodyOperations":true,"legacySearchReferenceRetained":true,"noJscEquivalenceClaim":true,"performanceAcceptance":false,"scope":"fixed active tvOS native helper/Entity/ledger evidence, not a network or process-memory qualification"}),
+        "realCompiledRulesAndBodyOperations":true,"legacySearchReferenceRetained":true,"noJscEquivalenceClaim":true,"performanceAcceptance":false,"scope":"fixed active Apple native helper/Entity/ledger evidence, not a network or process-memory qualification"}),
     )
 }

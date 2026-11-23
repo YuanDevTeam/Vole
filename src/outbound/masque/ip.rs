@@ -91,7 +91,7 @@ impl Engine {
                 } else {
                     128 * 1024
                 },
-                map_tcp_recv_buffer: cfg!(target_os = "macos")
+                map_tcp_recv_buffer: cfg!(target_vendor = "apple")
                     && config.network == MasqueNetwork::Quic,
                 tcp_send_buffer: if config.network == MasqueNetwork::H2 {
                     64 * 1024
@@ -302,11 +302,11 @@ async fn run(
         let request = request(&config.uri)?;
         let mut tunnel = pool
             .open_ip_connect(request, context.deadline(), move || async move {
-                #[cfg(target_os = "macos")]
+                #[cfg(target_vendor = "apple")]
                 {
                     factory.connect_ip(session, &setup).await
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(target_vendor = "apple"))]
                 {
                     factory.connect(session, &setup).await
                 }

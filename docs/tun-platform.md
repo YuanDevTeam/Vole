@@ -8,7 +8,7 @@ Vole 的 netstack、DNS、规则和出站只处理完整的原始 IPv4/IPv6 数�
 TunRuntime -> TunRsIo -> 宿主持有的 TUN fd 副本
 ```
 
-- iOS/tvOS/macOS：宿主提供 utun 文件描述符，适配器处理四字节 packet-information 头。
+- Apple 平台：宿主提供 utun 文件描述符，适配器处理四字节 packet-information 头。
 - Android：`VpnService` 提供 raw-IP 文件描述符。
 - Linux：真实单队列 TUN，使用 `IFF_TUN | IFF_NO_PI`、无 VNET header；接口实际 MTU
   必须与 `tun.mtu` 一致。借用 fd 的地址、网络命名空间和路由由宿主负责。

@@ -137,7 +137,7 @@ budgets, increases, expired deadlines or an already started TCP flow fail.
 
 ## Driver buffering and scheduling
 
-On macOS, a TCP write or flush that remains pending after registering its
+On Apple platforms, a TCP write or flush that remains pending after registering its
 waker and rechecking the queue does not request another driver pass. Successful
 reads and writes, shutdown, Drop, packet ingress, output-capacity recovery and
 protocol timers retain their existing wakeups. Flush still completes when the

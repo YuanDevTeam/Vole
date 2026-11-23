@@ -28,7 +28,7 @@ use crate::{
     routing::{EmptyGeoMatcher, ProxyDispatchers, RuleSet},
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[path = "cancel_prepare_memory_tests.rs"]
 mod cancel_prepare_memory_tests;
 

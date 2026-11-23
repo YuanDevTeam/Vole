@@ -101,18 +101,18 @@ pub(crate) use h3_driver::UdpAssociationControl;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct UdpAssociationCapture {
     slot: Arc<Mutex<Option<Option<Weak<UdpAssociationControl>>>>>,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     short_tun_packet_up_delay: bool,
 }
 #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]
 impl UdpAssociationCapture {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     pub(crate) fn with_short_tun_packet_up_delay(mut self) -> Self {
         self.short_tun_packet_up_delay = true;
         self
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     fn packet_up_delay(&self, actual_h3_control: bool) -> Duration {
         if actual_h3_control && self.short_tun_packet_up_delay {
             Duration::from_millis(1)
@@ -443,7 +443,10 @@ impl XHttpClient {
                     .await;
             }
             let delay = packet_up::DEFAULT_OVERLAP_DELAY;
-            #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "sing-mux"))]
+            #[cfg(all(
+                any(target_os = "linux", target_vendor = "apple"),
+                feature = "sing-mux"
+            ))]
             let delay = capture.map_or(delay, |capture| capture.packet_up_delay(control.is_some()));
             let connected = self.connect_http(sender, driver, delay).await?;
             #[cfg(all(feature = "outbound-vless", feature = "sing-mux"))]

@@ -92,7 +92,7 @@ DoQ/DoH H3 的当前 DIRECT 发送预算为 IPv4 65,507、IPv6 65,527 字节，�
 ECN 开启时传递实际发送标记和接收元数据；关闭时不发送/交付 ECN 标记。
 系统无法开启 ECN 接收元数据时，保留同一受保护 socket，沿用原单包、无元数据路径。
 GRO 保持关闭，接收仍使用一个有界完整包，不放大 QUIC 接收区或 socket 缓冲。
-macOS 的 DIRECT QUIC 适配器可提交当前就绪的最多 4 个独立数据报、合计 8 KiB。只确认实际提交的 FIFO 前缀，保留未发送后缀。能力不可用时逐包发送，物理错误关闭原 owner。此能力适用于 Quinn 和 quiche，使用 Tokio 公共发送接口。
+Apple 平台的 DIRECT QUIC 适配器可提交当前就绪的最多 4 个独立数据报、合计 8 KiB。只确认实际提交的 FIFO 前缀，保留未发送后缀。能力不可用时逐包发送，物理错误关闭原 owner。此能力适用于 Quinn 和 quiche，使用 Tokio 公共发送接口。
 代理 hop、HY2 的 pacer/混淆/Realm、quiche 后端以及非 Linux 平台仍保持独立数据报边界且不保留 ECN；
 这些路径不消费上述Linux元数据能力。Linux原生路径停止时撤销物理 socket 的共同租约；保留已关闭的 QUIC
 连接或写就绪 poller 不会延长物理 fd 的生命周期。GSO 的明确能力错误只关闭后续批量发送，失败批次
@@ -269,7 +269,7 @@ TCP CONNECT 仍按最新 RTT 计算。两类业务保留原退避、超时上限
 Stop 结束驱动并回收驱动缓存，不等待应用读取；外部仍持有流的已递交数据由读取或释放流回收。
 待确认明文仍持有发送预算。物理驱动每轮最多接收8个就绪数据报、发送8个数据报，
 ACK 优先于该会话的批量数据，会话轮换服务；接收每8包让出一次执行机会。
-macOS 的低熵 UDP 载体可为已建立 SID 的首次 DATA 提交当前就绪的最多 4 包、8 KiB，计入原发送、拥塞与未确认预算。正完成只确认 FIFO 前缀，余下密文沿原路逐包发送。ACK、重传和控制帧使用各自路径。
+Apple 平台的低熵 UDP 载体可为已建立 SID 的首次 DATA 提交当前就绪的最多 4 包、8 KiB，计入原发送、拥塞与未确认预算。正完成只确认 FIFO 前缀，余下密文沿原路逐包发送。ACK、重传和控制帧使用各自路径。
 Mieru UDP 向共享 Dialer 请求512 KiB物理接收缓冲；当前Linux接受时通常为1 MiB有效容量。
 这是内部性能提示，OS可钳位或拒绝；保留原socket、protect、接口绑定及停止所有权，
 不改变逻辑包预算，不新增配置字段，协议自有池仍管理自己的物理载体。
@@ -303,7 +303,7 @@ PMTU 反馈按连接生效，通过包层软件分段恢复，重传由官方 sm
 初始发送 MTU 取配置与真实隧道预算的交集，避免已知预算下的持续二次分段。
 内部队列、capsule 和 packet 均有界，停止等待其工作任务回收。
 H3 IP 的物理 UDP 请求沿原受控 dialer 携带 512 KiB 接收缓冲提示；系统可限制或忽略该提示，不构成进程 RSS 或真机内存保证。
-macOS MASQUE H3/IP 与 H3/L4 的 Direct/LazyDirect 路径可在首次发送时为同一受控 UDP socket 固定完整 peer。绑定、保护和接口检查完成后才 connect 并发布，初始化失败结束本代际。Group、Proxy 和 codec 路径仍使用各自的传输。
+Apple 平台的 MASQUE H3/IP 与 H3/L4 的 Direct/LazyDirect 路径可在首次发送时为同一受控 UDP socket 固定完整 peer。绑定、保护和接口检查完成后才 connect 并发布，初始化失败结束本代际。Group、Proxy 和 codec 路径仍使用各自的传输。
 
 `network: h3-l4proxy` 使用 Cloudflare L4 HTTP/3 CONNECT，每个 TCP 目标独占请求流，共享受控 QUIC 连接；
 等待 2xx 响应后才交付业务流，拒绝响应不取消其它流，节点 Stop 等待所有驱动退出。
@@ -627,7 +627,7 @@ quic 收齐声明长度的报文后立即交付并释放接收流，TCP 通道�
 目标改写、域名目标及不同出站实例在该追踪路径保留独立关联。
 未启用追踪时沿用既有路由缓存的关联复用规则。
 
-macOS TUN 的 quic relay（未启用 UoT v2）对已打开、目标及连接标识未变的
+Apple TUN 的 quic relay（未启用 UoT v2）对已打开、目标及连接标识未变的
 缓存路由，每来源至多保留一个独立发送操作；等待 UNI 信用或流写入期间继续接收
 同关联的响应。首次路由、新目标、连接标识变化、目标改写及维护到期时沿用原发送路径。
 不增加 sender 任务或数据报队列，原发送绝对期限仍为15秒；取消和关闭先丢弃发送操作，
@@ -644,7 +644,7 @@ quic relay（不含 UoT v2）的 TCP 与原生 UDP 各自按需使用独立池�
 native 模式（不含 UoT v2）向共享 Dialer 请求512 KiB物理 UDP 接收缓冲；
 这是可钳位或拒绝的性能提示，沿用同一个受保护、已绑定的 socket，不改变 QUIC 信用、
 应用队列或逻辑包预算。quic relay 与 UoT v2 不请求该提示；Linux 内核缓冲与进程 RSS 分开核算。
-macOS 的 quic relay（不含 UoT v2）为直接声明的 Direct/LazyDirect 物理会话固定完整 peer，TCP 与 UDP 池均适用。首次发送在原 socket 完成绑定、保护与接口检查后 connect。Peer 变化使用新的传输代际；其余 UDP 路径沿原工厂处理。
+Apple 平台的 quic relay（不含 UoT v2）为直接声明的 Direct/LazyDirect 物理会话固定完整 peer，TCP 与 UDP 池均适用。首次发送在原 socket 完成绑定、保护与接口检查后 connect。Peer 变化使用新的传输代际；其余 UDP 路径沿原工厂处理。
 
 `ip` 覆盖物理拨号地址，逻辑 server/SNI 保留。heartbeat-interval 单位毫秒，<=0 回落
 10000，同时控制 QUIC keepalive 与实际 v5 HEARTBEAT，两种 UDP relay 模式均用 DATAGRAM。
@@ -654,7 +654,7 @@ recv-window-conn 实际为 stream，recv-window 实际为 connection；正值同
 窗口是信用额度，不预分配全部缓冲；显式正值不按默认窗口钳位。
 
 max-open-streams 控制客户端 TCP/UDP 所有者池，不把业务所有者阈值写入 Quinn 远端 stream 表；
-远端双向流信用固定为0。macOS 的 quic relay 实际UDP池1在未启用UoT v2时通告128条远端单向流许可。
+远端双向流信用固定为0。Apple 平台的 quic relay 实际UDP池1在未启用UoT v2时通告128条远端单向流许可。
 Linux 同样允许该额度，但仅限由 TUN UDP 建立、以字面 IP 直接连接对端的会话。
 TCP池0、native、UoT v2及其余路径仍为32。实际并行入站decoder仍为32，未增加正文交付队列。
 额外最多96条尚未accept的UNI由Quinn持有，可能增加流表、未读数据和排队驻留；原连接接收信用与payload预算保持，
@@ -864,7 +864,7 @@ UDP 响应仍在满队列时丢当前包；业务 UDP 发送保留直接等待�
 不经过 TCP 输出 pump。解密后校验本地目的地址、来源地址族、
 最长前缀所属 peer 和关联端口；这些是局部结构边界，不是业务连接总数限制。
 
-macOS 已建立 peer 可批量发送当前就绪的 Noise type 4 数据包，每批最多 4 包、8 KiB，适用于 MTU≤2016。只确认实际发送的前缀；余下原密文沿同一路径发送。接收事件可处理首包及最多 3 个就绪外层数据报，Pending、待准入 ingress、取消或首次握手完成时停止扩展本轮。
+Apple 平台已建立 peer 可批量发送当前就绪的 Noise type 4 数据包，每批最多 4 包、8 KiB，适用于 MTU≤2016。只确认实际发送的前缀；余下原密文沿同一路径发送。接收事件可处理首包及最多 3 个就绪外层数据报，Pending、待准入 ingress、取消或首次握手完成时停止扩展本轮。
 
 Direct/LazyDirect 物理路径在首次发送时固定 peer 的完整 endpoint，沿共享 Dialer 完成保护与绑定后 connect。同一端点的 refresh 保持原传输，端点变化时创建新传输并重新握手。接收继续应用 Noise 验证、内层路由和包大小检查。Connected UDP 的来源过滤与 ICMP 错误由内核体现。
 

@@ -1449,7 +1449,7 @@ mod active_h2_memory_tests {
     type Downloads = Arc<Mutex<HashMap<String, h2::SendStream<bytes::Bytes>>>>;
 
     #[test]
-    fn private_split_h2_mptcp_preference_tracks_macos_plain_tcp_scope() {
+    fn private_split_h2_mptcp_preference_tracks_apple_plain_tcp_scope() {
         let base = serde_json::json!({
             "mixed-port": 1080,
             "proxies": [{
@@ -1505,9 +1505,9 @@ mod active_h2_memory_tests {
         assert_eq!(ordinary_tasks, 0);
         assert!(!ordinary_requested && requested && marked["proxies"][0]["mptcp"] == true);
         assert_eq!(tasks, 0);
-        assert_eq!(active, [cfg!(target_os = "macos"); 2]);
-        assert_eq!(before_stop, cfg!(target_os = "macos").then_some(false));
-        assert_eq!(after_stop, cfg!(target_os = "macos").then_some(true));
+        assert_eq!(active, [cfg!(target_vendor = "apple"); 2]);
+        assert_eq!(before_stop, cfg!(target_vendor = "apple").then_some(false));
+        assert_eq!(after_stop, cfg!(target_vendor = "apple").then_some(true));
         // uses_active_h2_reuse is an immutable pool-selection fact, not a
         // shutdown receipt. Check the real Dialer cancellation token above.
 

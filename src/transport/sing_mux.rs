@@ -138,7 +138,7 @@ impl Pool {
     }
     #[cfg(any(
         target_os = "linux",
-        all(target_os = "macos", feature = "outbound-vless")
+        all(target_vendor = "apple", feature = "outbound-vless")
     ))]
     pub(crate) fn brutal_enabled(&self) -> bool {
         self.options.brutal.is_some()

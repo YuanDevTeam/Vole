@@ -990,7 +990,7 @@ impl UpstreamPath {
     /// Only directly declared physical paths may prepare one immutable UDP peer.
     /// Groups and codecs keep their original selection and datagram behavior.
     #[cfg(all(
-        target_os = "macos",
+        target_vendor = "apple",
         any(
             feature = "outbound-masque",
             feature = "outbound-wireguard",
@@ -1464,7 +1464,7 @@ mod tests {
     }
 
     #[cfg(all(
-        target_os = "macos",
+        target_vendor = "apple",
         any(
             feature = "outbound-masque",
             feature = "outbound-wireguard",

@@ -32,33 +32,15 @@ use crate::{
     runtime::PreparedCore,
 };
 
-#[cfg(any(
-    target_os = "android",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "macos",
-    target_os = "linux"
-))]
+#[cfg(any(target_os = "android", target_vendor = "apple", target_os = "linux"))]
 use crate::{
     TunFraming,
     platform::{TunFd, TunIo},
 };
 
-#[cfg(any(
-    target_os = "android",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "macos",
-    target_os = "linux"
-))]
+#[cfg(any(target_os = "android", target_vendor = "apple", target_os = "linux"))]
 type InvokeTun = (TunFd, TunFraming, u16);
-#[cfg(not(any(
-    target_os = "android",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "macos",
-    target_os = "linux"
-)))]
+#[cfg(not(any(target_os = "android", target_vendor = "apple", target_os = "linux")))]
 type InvokeTun = ();
 
 mod foreground;
@@ -81,7 +63,7 @@ struct RegistryInner {
     #[cfg(all(
         feature = "http-diagnostics",
         feature = "inbound-http",
-        target_os = "tvos"
+        target_vendor = "apple"
     ))]
     script_plan_validation_process: bool,
 }
@@ -287,14 +269,14 @@ thread_local! {
 pub(crate) fn engine_runtime_builder() -> tokio::runtime::Builder {
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let mut builder = tokio::runtime::Builder::new_multi_thread();
-    #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+    #[cfg(target_vendor = "apple")]
     builder.event_interval(16);
     builder
         .on_thread_start(move || {
             RUNTIME_WORKER_SCOPE.with(|scope| {
                 *scope.borrow_mut() = Some(RuntimeWorkerScope::enter(&dispatch));
             });
-            #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+            #[cfg(target_vendor = "apple")]
             crate::platform::apple_runtime_qos::request(
                 crate::platform::apple_runtime_qos::Role::Tokio,
             );
@@ -553,7 +535,7 @@ impl RuntimeRegistry {
         #[cfg(all(
             feature = "http-diagnostics",
             feature = "inbound-http",
-            target_os = "tvos"
+            target_vendor = "apple"
         ))]
         if inner.script_plan_validation_process {
             return Err(InvokeFailure::invalid_state(
@@ -700,7 +682,7 @@ pub fn invoke_owned_bytes(request: Vec<u8>) -> Vec<u8> {
     if is_runtime_thread() {
         return runtime_thread_response();
     }
-    #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+    #[cfg(target_vendor = "apple")]
     let _logging = crate::platform::apple_logging::enter();
     invoke_guarded(move || {
         let decoded = decode_request(&request)?;
@@ -713,7 +695,7 @@ pub fn invoke_owned_bytes(request: Vec<u8>) -> Vec<u8> {
 /// It intentionally returns bytes so JNI never routes arbitrary JSON through
 /// Modified UTF-8 strings.
 pub(crate) fn invoke_bytes_admitted(request: &[u8]) -> Vec<u8> {
-    #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+    #[cfg(target_vendor = "apple")]
     let _logging = crate::platform::apple_logging::enter();
     invoke_guarded(|| dispatch_bytes(request))
 }
@@ -1170,7 +1152,7 @@ fn dispatch_request(request: DecodedRequest) -> Result<InvokeResponse, InvokeFai
         #[cfg(all(
             feature = "http-diagnostics",
             feature = "inbound-http",
-            target_os = "tvos"
+            target_vendor = "apple"
         ))]
         "runHttpScriptPlanValidation" => {
             require_instance_omitted(&envelope)?;
@@ -1197,13 +1179,13 @@ fn dispatch_request(request: DecodedRequest) -> Result<InvokeResponse, InvokeFai
         "getHttpDiagnostics" => {
             require_instance_omitted(&envelope)?;
             let _: EmptyPayload = decode_payload(envelope.payload)?;
-            #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+            #[cfg(target_vendor = "apple")]
             {
                 let mut snapshot = crate::http_processing::diagnostics::snapshot();
                 snapshot["runtimeThreadQoS"] = crate::platform::apple_runtime_qos::snapshot();
                 snapshot
             }
-            #[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "macos")))]
+            #[cfg(not(target_vendor = "apple"))]
             crate::http_processing::diagnostics::snapshot()
         }
         "version" => {
@@ -1564,7 +1546,7 @@ impl CoreController {
                 let _logging = tracing::dispatcher::set_default(&dispatch);
                 let _completion = EngineCompletion(completed_tx);
                 let _runtime_thread = RuntimeThreadGuard::enter();
-                #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+                #[cfg(target_vendor = "apple")]
                 crate::platform::apple_runtime_qos::request(
                     crate::platform::apple_runtime_qos::Role::EngineOwner,
                 );
@@ -1837,11 +1819,7 @@ fn acquire_start_tun(
     let Some(config) = config else {
         return Ok(None);
     };
-    let framing = if cfg!(any(
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "macos"
-    )) {
+    let framing = if cfg!(target_vendor = "apple") {
         TunFraming::Utun
     } else {
         TunFraming::RawIp
@@ -1941,13 +1919,7 @@ fn run_engine_inner(
         }
     };
     runtime.block_on(async move {
-        #[cfg(any(
-            target_os = "android",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "macos",
-            target_os = "linux"
-        ))]
+        #[cfg(any(target_os = "android", target_vendor = "apple", target_os = "linux"))]
         let started = match tun {
             Some((fd, framing, mtu)) => match TunIo::new_with_mtu(fd, framing, mtu) {
                 Ok(tun) => prepared.start_tun(tun, dialer).await,
@@ -1988,9 +1960,7 @@ fn run_engine_inner(
         #[cfg(not(any(
             all(windows, feature = "windows-wintun"),
             target_os = "android",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "macos",
+            target_vendor = "apple",
             target_os = "linux"
         )))]
         let started = {

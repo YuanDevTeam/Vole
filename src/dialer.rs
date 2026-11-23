@@ -490,8 +490,8 @@ impl Dialer {
             || self.dns_binding.is_some()
             || self.source_binding.is_some()
             || self.egress.interface.is_some()
-            // macOS currently keeps this preference on ordinary TCP sockets.
-            || (self.mptcp && !cfg!(target_os = "macos"))
+            // Apple targets keep this preference on ordinary TCP sockets.
+            || (self.mptcp && !cfg!(target_vendor = "apple"))
             || self.ip_version != crate::config::IpVersion::Dual
         {
             return false;
@@ -544,9 +544,7 @@ impl Dialer {
         }
         #[cfg(not(any(
             target_os = "linux",
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "tvos",
+            target_vendor = "apple",
             all(windows, any(feature = "windows-uwp", feature = "windows-wintun"))
         )))]
         if self.egress.interface.is_some() {
@@ -730,7 +728,7 @@ impl Dialer {
                 name.as_bytes_with_nul().len() as libc::socklen_t,
             )
         };
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        #[cfg(target_vendor = "apple")]
         let status = {
             let (level, option) = if destination.is_ipv6() {
                 (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
@@ -748,19 +746,9 @@ impl Dialer {
                 )
             }
         };
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "tvos"
-        )))]
+        #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
         return Err(io::ErrorKind::Unsupported.into());
-        #[cfg(any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "tvos"
-        ))]
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
         if status < 0 {
             Err(io::Error::last_os_error())
         } else {

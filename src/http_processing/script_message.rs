@@ -309,7 +309,7 @@ impl Message {
     }
 
     /// Validation and representation repair happen before replacing any input.
-    #[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
+    #[cfg(any(test, all(feature = "http-diagnostics", target_vendor = "apple")))]
     pub(crate) fn apply(
         &mut self,
         output: ScriptOutput,

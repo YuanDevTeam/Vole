@@ -1,5 +1,5 @@
 //! Memory/Apple semantic regressions. New integration changes are unexecuted.
-//! Physical tvOS validation is owned by the explicit diagnostic suite.
+//! Physical Apple validation is owned by the explicit diagnostic suite.
 use super::*;
 use crate::http_processing::{
     body_budget::{BridgePlan, Budget, output_capacity},
@@ -268,7 +268,7 @@ fn guarded_plan_source(length: usize, early: &str, tail: &str) -> String {
 }
 
 // Mac exposes the real JSC tick count, but its numeric allocation-work probe
-// is tvOS-only. Work below uses independent canaries and actual JSC quota
+// is restricted to Apple diagnostic builds. Work below uses independent canaries and actual JSC quota
 // outcomes; it must not be reported as a direct numeric JSC-work observation.
 fn guarded_plan_compare(
     source: &str,

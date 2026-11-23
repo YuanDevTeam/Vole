@@ -91,11 +91,11 @@ struct Bounded {
     observation: Option<crate::resources::observation::Guard>,
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_vendor = "apple"))]
 #[path = "datagram_tun_send_memory_tests.rs"]
 mod tun_send_memory_tests;
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_vendor = "apple"))]
 #[path = "datagram_batch_memory_tests.rs"]
 mod batch_memory_tests;
 
@@ -162,7 +162,7 @@ impl DatagramTransport for Bounded {
         self.inner.send_owned(datagram)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     fn try_begin_tun_send(
         &mut self,
         datagram: Datagram,
@@ -177,7 +177,7 @@ impl DatagramTransport for Bounded {
         self.inner.try_begin_tun_send(datagram, flow_id)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     async fn finish_tun_send(
         &mut self,
         completion: super::TunSendToken,
@@ -186,7 +186,7 @@ impl DatagramTransport for Bounded {
         self.inner.finish_tun_send(completion, outcome).await
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     fn send_batch_owned(
         &mut self,
         datagrams: Vec<Datagram>,

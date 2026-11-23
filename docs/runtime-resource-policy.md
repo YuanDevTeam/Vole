@@ -57,7 +57,7 @@ MTU 由 `tun.mtu` 配置，默认值和平台限制统一见 [TUN 平台层](tun
 - TCP 流按需创建任务；TUN 转发每方向缓冲区为 4 KiB。
 - 生产 TUN 的 TCP 接收总预算默认 32 KiB，smoltcp RX 与应用接收队列各 16 KiB；发送总预算默认 128 KiB，smoltcp TX 与应用发送队列各 64 KiB。Rust `ResourceLimits::tun_tcp_send_buffer` 独立于原 `tcp_buffer_per_direction`，后者仍为 32 KiB 并用于 TUN 接收及原共享流缓冲；显式容量原样传递，不倍乘或钳制，不新增 YAML/Invoke 字段。所有平台 TUN 共用该策略。
 - 应用队列按需增长并保持原容量。Unix 发送队列达到 64 KiB 时可使用匿名映射 ring；显式 `NetStackConfig::map_tcp_recv_buffer` 可为接收队列启用独立映射，默认关闭。映射不可用或 owner 已停止时使用有界 VecDeque。
-- 每个 Driver 按方向最多缓存四个已排空的映射，缓存请求长度合计受方向预算约束，只复用相同长度。Stop 清空缓存，未读数据和活动切片继续由实际 owner 持有至释放。Apple WireGuard 和 macOS MASQUE H3/IP 私有栈启用接收映射。逻辑容量、映射末页和进程内存采用各自口径。
+- 每个 Driver 按方向最多缓存四个已排空的映射，缓存请求长度合计受方向预算约束，只复用相同长度。Stop 清空缓存，未读数据和活动切片继续由实际 owner 持有至释放。Apple 平台的 WireGuard 和 MASQUE H3/IP 私有栈启用接收映射。逻辑容量、映射末页和进程内存采用各自口径。
 - WireGuard 私有主动栈的 TCP 接收总预算为 128 KiB：smoltcp 数组与按需应用队列
   各 64 KiB；发送总预算为 64 KiB，两部分各 32 KiB。MASQUE H2/IP 接收总预算为 96 KiB，
   发送为 64 KiB；H3/IP 接收为 128 KiB，发送与通用 netstack 默认值同为 32 KiB。
@@ -222,8 +222,8 @@ UoT 写入最多暂持一帧及偏移；取消单次发送后，后续收发先�
 
 `quic-transport` 只把已有 `DatagramTransport` 适配成 Quinn/quiche 共用的受控 UDP 接口，没有内部 bind、DNS 或 DIRECT 回落。每个连接双向各最多32个排队数据报，另允许一个正在发送的包；TX满返回WouldBlock，RX满暂停读取。接收等待不会持有发送队列锁；Pending发送不会重复提交。单逻辑peer/物理peer映射和来源校验独立保留，不接受未请求的目标、GSO或源地址覆盖。物理 socket 仍只能来自 Dialer。
 已打开且受保护的 UDP 路径可借出一个在途发送操作；驱动等待发送或 pacing 时继续接收，保持32包队列与一个发送中的包。首次发送仍由原路径完成初始化；上游不支持此能力时沿用原发送。停止先释放在途操作，再关闭并释放上游。
-macOS 的通用 QUIC owner 在 DIRECT 已打开的同一受保护 socket 上，可将当前就绪 FIFO 前缀按最多4包、合计8KiB提交；不等凑批，不改变逻辑分段或 pacing。批次只克隆既有 Bytes 句柄，原包仍留在32项队列作为唯一容量账本，确认正数的实际发送前缀后才消费、计数和释放容量，不增加32+4的负载容量。物理操作逐包使用 Tokio 的公开 poll_send_to（macOS MASQUE H3/IP、H3/L4及WireGuard 的固定直接物理路径使用公开 poll_send）：首包 Pending 保留同一发送操作，正数前缀后的 Pending 立即返回该实际前缀，未发送后缀保留原位；不依赖私有批量 syscall ABI，也不把多包拼为单个 UDP 数据报。等待发送时接收继续推进。能力不可用或批次不足时沿原单包路径；实际错误或异常短发送不回退重放，原错误种类沿有界 close/drop/join 返回。Stop先释放批次引用与原发送租约，再关闭上游。非macOS及未提供物理批量能力的代理、codec、pacer保持原路径。
-macOS MASQUE H3/IP、H3/L4及WireGuard 的直接声明 Direct/LazyDirect 路径可准备一个新代际、单peer的connected UDP socket；仍只有共享Dialer创建socket。首次原send在bind/protect/接口策略/取消检查后连接同一socket，成功才公布原Arc；失败或初始化future取消不允许同代际再次bind/connect，不回落到send_to。所有send入口先校验完整SocketAddr；Group/Proxy/codec不携带该意图，H2及其它平台或协议保持原路径。接收仍使用原recv_from、32次就绪重查和预算加一字节检测；kernel来源过滤和ICMP错误可观察差异不被掩盖。Stop先释放原在途发送，再关闭该socket的全部原持有者，不增加任务、队列、缓存或期限。
+Apple 平台的通用 QUIC owner 在 DIRECT 已打开的同一受保护 socket 上，可将当前就绪 FIFO 前缀按最多4包、合计8KiB提交；不等凑批，不改变逻辑分段或 pacing。批次只克隆既有 Bytes 句柄，原包仍留在32项队列作为唯一容量账本，确认正数的实际发送前缀后才消费、计数和释放容量，不增加32+4的负载容量。物理操作逐包使用 Tokio 的公开 poll_send_to（Apple 平台的 MASQUE H3/IP、H3/L4及WireGuard 的固定直接物理路径使用公开 poll_send）：首包 Pending 保留同一发送操作，正数前缀后的 Pending 立即返回该实际前缀，未发送后缀保留原位；不依赖私有批量 syscall ABI，也不把多包拼为单个 UDP 数据报。等待发送时接收继续推进。能力不可用或批次不足时沿原单包路径；实际错误或异常短发送不回退重放，原错误种类沿有界 close/drop/join 返回。Stop先释放批次引用与原发送租约，再关闭上游。其他平台及未提供物理批量能力的代理、codec、pacer保持原路径。
+Apple 平台的 MASQUE H3/IP、H3/L4及WireGuard 的直接声明 Direct/LazyDirect 路径可准备一个新代际、单peer的connected UDP socket；仍只有共享Dialer创建socket。首次原send在bind/protect/接口策略/取消检查后连接同一socket，成功才公布原Arc；失败或初始化future取消不允许同代际再次bind/connect，不回落到send_to。所有send入口先校验完整SocketAddr；Group/Proxy/codec不携带该意图，H2及其它平台或协议保持原路径。接收仍使用原recv_from、32次就绪重查和预算加一字节检测；kernel来源过滤和ICMP错误可观察差异不被掩盖。Stop先释放原在途发送，再关闭该socket的全部原持有者，不增加任务、队列、缓存或期限。
 立即就绪的读取、发送容量与发送完成检查不登记新的等待者；仅在同一状态锁内确认 Pending 后登记唤醒，保留后续数据、容量恢复、取消与 Stop 的通知。
 队列通知采用边沿：TX由空变非空、RX由满变为有容量时通知驱动；已排队TX由就绪条件继续推进。
 普通RX消费保持底层已有的接收等待，避免逐包取消并重建同一等待。
@@ -439,6 +439,8 @@ TCP/ICMP ingress Full 记录 `packet_queue_drops`。这些计数
 不包含物理 socket、内核 TUN 或对端设施中的丢包。
 
 CLI 与 Controller 按日志级别完整输出事件的 target、message 和字段，不按敏感内容脱敏或删减。Controller 的订阅队列、WebSocket 消息与写入期限仍按上文限制；超过消息预算时关闭订阅，不发送截断事件。
+
+Apple Unified Logging 统一使用 Error 传输级别，以便 Xcode 转发 Network Extension 日志。事件正文仍标记原始 tracing 级别。
 
 仅`cfg(test)`/`interop-test`启用的`ResourceProbe`按测试作用域记录RAII当前值/峰值；子任务显式继承作用域，不使用进程全局reset或更换生产allocator。当前接入物理TCP/UDP、共享流/QUIC驱动与session、数据报association、DNS池/等待者及既有运行时活动guard。Hysteria2 的待完成分片通过 `Reassembly` 登记，交付后释放 Packet ID 和重组资源；零计数必须与实际执行过的重组路径一起解释。
 

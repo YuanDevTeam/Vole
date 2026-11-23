@@ -292,7 +292,7 @@ impl Drop for ContextRef {
         #[cfg(feature = "http-diagnostics")]
         let started = Instant::now();
         unsafe { JSGlobalContextRelease(self.0) };
-        #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+        #[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
         VALIDATION_TRACE.with(|slot| {
             if let Some(trace) = slot.borrow_mut().as_mut() {
                 trace.context_released = true;
@@ -444,7 +444,7 @@ impl Drop for ExecutionGuard {
             LAST_TICKS_FOR_TEST.with(|ticks| {
                 ticks.set(s.borrow().as_ref().map(|state| state.ticks));
             });
-            #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+            #[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
             VALIDATION_TRACE.with(|slot| {
                 if let (Some(trace), Some(state)) =
                     (slot.borrow_mut().as_mut(), s.borrow().as_ref())
@@ -1055,9 +1055,9 @@ pub(super) fn evaluate(
         return Err(io::ErrorKind::OutOfMemory.into());
     }
     super::super::diagnostics::context_created();
-    #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+    #[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
     let _validation_context = ValidationContextProbe(ctx.0);
-    #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+    #[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
     VALIDATION_TRACE.with(|slot| {
         if let Some(trace) = slot.borrow_mut().as_mut() {
             trace.context_created = true;
@@ -1094,7 +1094,7 @@ pub(super) fn evaluate(
     )?;
     execution_phase("prelude");
     script(ctx.0, include_str!("runtime.js"))?;
-    #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+    #[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
     VALIDATION_TRACE.with(|slot| {
         if let Some(trace) = slot.borrow_mut().as_mut() {
             trace.prelude_loaded = true;
@@ -1440,8 +1440,8 @@ fn export_body(
     Ok(())
 }
 
-// Explicit tvOS diagnostic only. Normal evaluations never evaluate this probe.
-#[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+// Explicit Apple diagnostic only. Normal evaluations never evaluate this probe.
+#[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
 #[derive(Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ValidationTrace {
@@ -1451,13 +1451,13 @@ pub(super) struct ValidationTrace {
     pub(super) prelude_loaded: bool,
     pub(super) context_released: bool,
 }
-#[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+#[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
 thread_local! {
     static VALIDATION_TRACE: RefCell<Option<ValidationTrace>> = const { RefCell::new(None) };
 }
-#[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+#[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
 struct ValidationContextProbe(Context);
-#[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+#[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
 impl Drop for ValidationContextProbe {
     fn drop(&mut self) {
         if std::thread::panicking() {
@@ -1497,7 +1497,7 @@ impl Drop for ValidationContextProbe {
         });
     }
 }
-#[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+#[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
 pub(super) fn evaluate_for_validation(
     program: &CompiledSource,
     metadata: &serde_json::Value,

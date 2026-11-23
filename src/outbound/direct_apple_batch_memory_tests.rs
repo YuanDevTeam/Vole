@@ -63,7 +63,7 @@ fn poll(operation: &mut crate::dispatch::OwnedDatagramBatchSend) -> Poll<io::Res
 }
 
 #[test]
-fn macos_public_send_memory_full_four_keep_whole_payloads_and_ipv6_scope() {
+fn apple_public_send_memory_full_four_keep_whole_payloads_and_ipv6_scope() {
     for peer in [
         "192.0.2.1:443".parse().unwrap(),
         SocketAddr::V6(std::net::SocketAddrV6::new(
@@ -89,7 +89,7 @@ fn macos_public_send_memory_full_four_keep_whole_payloads_and_ipv6_scope() {
 }
 
 #[test]
-fn macos_public_send_memory_zero_prefix_pending_keeps_waker_and_never_replays() {
+fn apple_public_send_memory_zero_prefix_pending_keeps_waker_and_never_replays() {
     let boundary = Arc::new(Mutex::new(Boundary {
         steps: [Step::Pending, Step::Pending].into(),
         ..Default::default()
@@ -110,7 +110,7 @@ fn macos_public_send_memory_zero_prefix_pending_keeps_waker_and_never_replays() 
 }
 
 #[test]
-fn macos_public_send_memory_positive_prefix_returns_before_pending_and_preserves_suffix() {
+fn apple_public_send_memory_positive_prefix_returns_before_pending_and_preserves_suffix() {
     for prefix in [1, 2] {
         let mut packets = packets("192.0.2.1:443".parse().unwrap());
         let mut steps = VecDeque::new();
@@ -133,7 +133,7 @@ fn macos_public_send_memory_positive_prefix_returns_before_pending_and_preserves
 }
 
 #[test]
-fn macos_public_send_memory_fatal_or_short_after_a_prefix_never_replays_or_hides_error() {
+fn apple_public_send_memory_fatal_or_short_after_a_prefix_never_replays_or_hides_error() {
     for prefix in [0, 1, 2] {
         for last in [
             Step::Error(io::ErrorKind::Interrupted),
@@ -175,7 +175,7 @@ impl Drop for CaptureLease {
     }
 }
 #[test]
-fn macos_public_send_memory_pending_drop_releases_owned_capture_without_more_io() {
+fn apple_public_send_memory_pending_drop_releases_owned_capture_without_more_io() {
     let drops = Arc::new(AtomicUsize::new(0));
     let calls = Arc::new(AtomicUsize::new(0));
     let lease = CaptureLease(drops.clone());
@@ -194,7 +194,7 @@ fn macos_public_send_memory_pending_drop_releases_owned_capture_without_more_io(
 }
 
 #[test]
-fn macos_public_send_memory_invalid_admission_returns_untouched_packets_without_io() {
+fn apple_public_send_memory_invalid_admission_returns_untouched_packets_without_io() {
     let peer = "192.0.2.1:443".parse().unwrap();
     let mut cases = vec![Vec::new(), packets(peer).into_iter().take(1).collect()];
     let mut mixed = packets(peer);
@@ -286,7 +286,7 @@ fn connected_operation(
     feature = "outbound-tuic"
 ))]
 #[test]
-fn macos_public_send_memory_connected_prefix_whole_payload_and_terminal_errors() {
+fn apple_public_send_memory_connected_prefix_whole_payload_and_terminal_errors() {
     for peer in [
         "192.0.2.1:443".parse().unwrap(),
         SocketAddr::V6(std::net::SocketAddrV6::new(
@@ -372,7 +372,7 @@ fn macos_public_send_memory_connected_prefix_whole_payload_and_terminal_errors()
     feature = "outbound-tuic"
 ))]
 #[test]
-fn macos_public_send_memory_connected_peer_rejection_and_pending_capture_drop() {
+fn apple_public_send_memory_connected_peer_rejection_and_pending_capture_drop() {
     let peer = SocketAddr::V6(std::net::SocketAddrV6::new(
         "fe80::1".parse().unwrap(),
         443,

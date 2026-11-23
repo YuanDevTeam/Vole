@@ -463,7 +463,7 @@ fn upstream_reuse_builtin_direct_rejects_mutable_or_special_egress() {
     assert!(!plain.permits_http_tcp_reuse());
     let mptcp =
         crate::outbound::DirectOutbound::new(crate::dialer::Dialer::default().with_mptcp(true));
-    assert_eq!(mptcp.permits_http_tcp_reuse(), cfg!(target_os = "macos"));
+    assert_eq!(mptcp.permits_http_tcp_reuse(), cfg!(target_vendor = "apple"));
 }
 #[tokio::test]
 async fn upstream_reuse_collected_rewritten_body_proves_original_wire_completion() {

@@ -127,9 +127,9 @@ stopped -> preparing -> prepared -> starting -> running
 
 省略 `instanceId`，使用空 payload。此调用直接读取 [进程级观测](http-processing.md#编译期诊断)，无需初始化。Apple 另提供本 Core 自有线程的 QoS 请求记录。累计量可比较同一进程的前后读数，峰值应按其实际覆盖范围解释。App 和 Network Extension 各自报告本进程。默认构建返回未知方法。
 
-### `runHttpScriptPlanValidation`（仅 tvOS 诊断构建）
+### `runHttpScriptPlanValidation`（Apple 诊断构建）
 
-在同时启用 `http-diagnostics`、`inbound-http` 与 `invoke` 的 tvOS 构建中，尚未初始化或创建实例的独立进程可提交 `{"method":"runHttpScriptPlanValidation","payload":{}}`。省略 `instanceId`，使用空 payload。该调用离线运行固定合成用例，比较静态 Plan 与 JavaScriptCore 的事务结果、预算及取消后的释放。结果包含实际执行的范围、用例结果和进程身份。开始验证后，后续业务须使用新进程。默认构建和其他平台返回未知方法。
+在同时启用 `http-diagnostics`、`inbound-http` 与 `invoke` 的 Apple 构建中，尚未初始化或创建实例的独立进程可提交 `{"method":"runHttpScriptPlanValidation","payload":{}}`。省略 `instanceId`，使用空 payload。该调用离线运行固定合成用例，比较静态 Plan 与 JavaScriptCore 的事务结果、预算及取消后的释放。结果包含实际执行的范围、用例结果和进程身份。开始验证后，后续业务须使用新进程。默认构建和其他平台返回未知方法。
 
 ### `initialize`
 

@@ -176,7 +176,7 @@ fn tuic_preserves_actual_dialer_protection_binding_family_and_stop() {
                 Dialer::default().with_source_ip("192.0.2.20".parse().unwrap()),
                 Dialer::default().with_protector(Arc::new(MustNotProtect)),
                 Dialer::default().with_egress(&egress),
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(target_os = "linux", target_vendor = "apple"))]
                 Dialer::default()
                     .for_dns_source(
                         crate::dns::source::DnsBinding {
@@ -205,7 +205,7 @@ fn tuic_preserves_actual_dialer_protection_binding_family_and_stop() {
 }
 
 #[test]
-fn tuic_keeps_the_existing_macos_mptcp_preference_rule() {
+fn tuic_keeps_the_existing_apple_mptcp_preference_rule() {
     for mode in ["native", "quic"] {
         for uot in [false, true] {
             let config = config(mode, uot);
@@ -216,7 +216,7 @@ fn tuic_keeps_the_existing_macos_mptcp_preference_rule() {
             ] {
                 assert_eq!(
                     node(&config, upstream).permits_http_tcp_reuse(),
-                    cfg!(target_os = "macos")
+                    cfg!(target_vendor = "apple")
                 );
             }
         }

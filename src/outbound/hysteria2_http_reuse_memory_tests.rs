@@ -121,7 +121,7 @@ fn static_direct_http_carrier_preserves_dialer_restrictions_and_stop() {
         ..Default::default()
     };
     for dialer in [
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         Dialer::default().with_mptcp(true),
         Dialer::default().with_ip_version(IpVersion::Ipv4),
         Dialer::default().with_source_ip("192.0.2.20".parse().unwrap()),

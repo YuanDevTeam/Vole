@@ -141,7 +141,7 @@ impl Registry {
             sent: false,
             closed: false,
             closing: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             tun_owned_send: _tun_owned_send,
         })))
     }
@@ -196,7 +196,7 @@ struct Transport {
     sent: bool,
     closed: bool,
     closing: Option<oneshot::Receiver<()>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     tun_owned_send: bool,
 }
 
@@ -303,7 +303,7 @@ impl DatagramTransport for Transport {
         send_packets(&self.connection, &self.cancel, self.registry.mode, packets).await
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     fn try_begin_tun_send(
         &mut self,
         datagram: Datagram,

@@ -99,7 +99,7 @@ impl SingMuxConnector {
         #[cfg(feature = "outbound-vless")]
         let h3_capture = self.pool.captures_h3_udp().then(|| {
             let capture = crate::transport::xhttp::UdpAssociationCapture::default();
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_vendor = "apple"))]
             if session.inbound == InboundKind::Tun && !self.pool.brutal_enabled() {
                 return capture.with_short_tun_packet_up_delay();
             }

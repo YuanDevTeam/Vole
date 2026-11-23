@@ -145,7 +145,7 @@ fn masque_static_http_reuse_observes_dependency_stop_and_constraints() {
         assert!(!outbound.permits_http_tcp_reuse());
         for dialer in [
             Dialer::default().with_source_ip("192.0.2.20".parse().unwrap()),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(target_vendor = "apple"))]
             Dialer::default().with_mptcp(true),
             Dialer::default().with_ip_version(crate::config::IpVersion::Ipv4),
             Dialer::default().with_ip_version(crate::config::IpVersion::Ipv6),

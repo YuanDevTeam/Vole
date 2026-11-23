@@ -116,7 +116,7 @@ impl Recipe {
     }
 }
 
-#[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
+#[cfg(any(test, all(feature = "http-diagnostics", target_vendor = "apple")))]
 #[derive(Default)]
 pub(super) struct Validation<'a> {
     pub(super) force_dag: bool,
@@ -144,10 +144,7 @@ struct Binding {
 
 /// Optional proof only. Original frontend rejection/acceptance is unchanged.
 /// Diagnostic/test convenience uses the same accepted frontend AST as production.
-#[cfg(any(
-    all(test, target_vendor = "apple"),
-    all(feature = "http-diagnostics", target_os = "tvos")
-))]
+#[cfg(all(target_vendor = "apple", any(test, feature = "http-diagnostics")))]
 pub(super) fn compile(source: &str) -> Option<Plan> {
     super::frontend::compile_prepared(source).ok()?.plan
 }
@@ -748,16 +745,13 @@ impl Plan {
             output,
             cancellation,
             deadline,
-            #[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
+            #[cfg(any(test, all(feature = "http-diagnostics", target_vendor = "apple")))]
             Validation::default(),
         )
     }
-    // Existing per-call validation hook: unit tests or explicit tvOS diagnostics.
+    // Existing per-call validation hook: unit tests or explicit Apple diagnostics.
     // Source/business callers cannot request it; no process-global state.
-    #[cfg(any(
-        all(test, target_vendor = "apple"),
-        all(feature = "http-diagnostics", target_os = "tvos")
-    ))]
+    #[cfg(all(target_vendor = "apple", any(test, feature = "http-diagnostics")))]
     pub(super) fn try_execute_for_validation(
         &self,
         metadata: &Value,
@@ -769,11 +763,11 @@ impl Plan {
     ) -> Option<Attempt> {
         self.execute(metadata, input, output, cancellation, deadline, validation)
     }
-    #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+    #[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
     pub(super) fn has_header_guard(&self) -> bool {
         self.header_guard.is_some()
     }
-    #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+    #[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
     pub(super) fn materializer_kind(&self) -> &'static str {
         if self.materialization.is_some() {
             "recipe"
@@ -781,7 +775,7 @@ impl Plan {
             "dag"
         }
     }
-    #[cfg(all(feature = "http-diagnostics", target_os = "tvos"))]
+    #[cfg(all(feature = "http-diagnostics", target_vendor = "apple"))]
     pub(super) fn recipe_storage_bytes() -> usize {
         std::mem::size_of::<Option<Recipe>>()
     }
@@ -792,7 +786,7 @@ impl Plan {
         output: &mut BudgetedBytes,
         cancellation: &CancellationToken,
         deadline: Instant,
-        #[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
+        #[cfg(any(test, all(feature = "http-diagnostics", target_vendor = "apple")))]
         mut validation: Validation<'_>,
     ) -> Option<Attempt> {
         let input = input?;
@@ -954,12 +948,12 @@ impl Plan {
             }
             work.check()?;
             output.write_initialized_output(result_length, |target| {
-                #[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
+                #[cfg(any(test, all(feature = "http-diagnostics", target_vendor = "apple")))]
                 let recipe = self
                     .materialization
                     .as_ref()
                     .filter(|_| !validation.force_dag);
-                #[cfg(not(any(test, all(feature = "http-diagnostics", target_os = "tvos"))))]
+                #[cfg(not(any(test, all(feature = "http-diagnostics", target_vendor = "apple"))))]
                 let recipe = self.materialization.as_ref();
                 if let Some(recipe) = recipe {
                     super::super::diagnostics::increment(
@@ -980,7 +974,7 @@ impl Plan {
                     } else {
                         None
                     };
-                    #[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
+                    #[cfg(any(test, all(feature = "http-diagnostics", target_vendor = "apple")))]
                     let mut filled = 0;
                     for (source, target) in source.chunks(256).zip(target.chunks_mut(256)) {
                         work.check()?;
@@ -1002,7 +996,10 @@ impl Plan {
                                 }
                             }
                         }
-                        #[cfg(any(test, all(feature = "http-diagnostics", target_os = "tvos")))]
+                        #[cfg(any(
+                            test,
+                            all(feature = "http-diagnostics", target_vendor = "apple")
+                        ))]
                         {
                             filled += target.len();
                             if let Some(hook) = validation.after_chunk.as_mut() {

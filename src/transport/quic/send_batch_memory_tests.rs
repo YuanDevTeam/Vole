@@ -162,7 +162,7 @@ async fn until(mut predicate: impl FnMut() -> bool) -> io::Result<()> {
 }
 
 #[tokio::test]
-async fn macos_quic_batch_memory_partial_prefix_is_emitted_once_in_fifo_order() {
+async fn apple_quic_batch_memory_partial_prefix_is_emitted_once_in_fifo_order() {
     let (socket, driver, control, _input) = fixture();
     control
         .outcomes
@@ -204,7 +204,7 @@ async fn macos_quic_batch_memory_partial_prefix_is_emitted_once_in_fifo_order() 
 }
 
 #[tokio::test]
-async fn macos_quic_batch_memory_pending_prefix_keeps_queue_capacity_and_rx_live() {
+async fn apple_quic_batch_memory_pending_prefix_keeps_queue_capacity_and_rx_live() {
     let (socket, driver, control, input) = fixture();
     for sequence in 0..32 {
         enqueue(&socket, sequence).unwrap();
@@ -266,7 +266,7 @@ async fn macos_quic_batch_memory_pending_prefix_keeps_queue_capacity_and_rx_live
 }
 
 #[tokio::test]
-async fn macos_quic_batch_memory_fatal_and_invalid_counts_close_without_single_replay() {
+async fn apple_quic_batch_memory_fatal_and_invalid_counts_close_without_single_replay() {
     for outcome in [
         Err(io::ErrorKind::ConnectionReset),
         Err(io::ErrorKind::PermissionDenied),
@@ -293,7 +293,7 @@ async fn macos_quic_batch_memory_fatal_and_invalid_counts_close_without_single_r
 }
 
 #[tokio::test]
-async fn macos_quic_batch_memory_stop_and_cleared_queue_release_pending_leases() {
+async fn apple_quic_batch_memory_stop_and_cleared_queue_release_pending_leases() {
     let (socket, driver, control, _input) = fixture();
     for sequence in 0..4 {
         enqueue(&socket, sequence).unwrap();
@@ -314,7 +314,7 @@ async fn macos_quic_batch_memory_stop_and_cleared_queue_release_pending_leases()
 }
 
 #[tokio::test]
-async fn macos_quic_batch_memory_original_io_error_survives_close_failure() {
+async fn apple_quic_batch_memory_original_io_error_survives_close_failure() {
     let (socket, driver, control, _input) = fixture();
     control.close_error.store(true, Ordering::Relaxed);
     control

@@ -4,14 +4,14 @@ use std::{
     time::Duration,
 };
 
-#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+#[cfg(target_vendor = "apple")]
 use std::{ffi::c_void, mem, ptr};
 
 use crate::limits::{MEMORY_OBSERVATION_1GBPS_BYTES, MEMORY_OBSERVATION_CEILING_BYTES};
 
 pub(crate) const TELEMETRY_INTERVAL: Duration = Duration::from_secs(30);
 
-#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+#[cfg(target_vendor = "apple")]
 const TASK_VM_INFO: libc::task_flavor_t = 22;
 const THRESHOLDS: [MemoryThreshold; 2] = [
     MemoryThreshold {
@@ -37,7 +37,7 @@ const MEMORY_EVENTS: [&str; 3] = [
 /// Public `TASK_VM_INFO` layout through revision 3. Revision 3 is the first
 /// revision that contains `ledger_phys_footprint_peak`; using that fixed,
 /// documented prefix avoids depending on newer SDK-only tail fields.
-#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+#[cfg(target_vendor = "apple")]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 struct TaskVmInfoRev3 {
@@ -180,7 +180,7 @@ pub(crate) fn observe(stage: &'static str) {
 
 /// Reads current and process-lifetime physical footprint using public
 /// `TASK_VM_INFO` fields. Callers must treat failure as telemetry loss only.
-#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+#[cfg(target_vendor = "apple")]
 #[allow(deprecated)] // libc recommends mach2 for the thin mach_task_self accessor.
 pub(crate) fn snapshot() -> io::Result<ProcessMemorySnapshot> {
     let mut info = TaskVmInfoRev3::default();
@@ -222,7 +222,7 @@ pub(crate) fn snapshot() -> io::Result<ProcessMemorySnapshot> {
 }
 
 /// Best-effort release after the TUN consumer stops; never a lifecycle result.
-#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+#[cfg(target_vendor = "apple")]
 pub(crate) fn relieve_allocator_pressure() {
     unsafe extern "C" {
         fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
@@ -296,12 +296,7 @@ fn parse_linux_status(status: &str) -> io::Result<ProcessMemorySnapshot> {
     })
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "macos"
-)))]
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 pub(crate) fn snapshot() -> io::Result<ProcessMemorySnapshot> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -316,12 +311,7 @@ pub(crate) fn relieve_allocator_pressure() {
     let _ = unsafe { libc::malloc_trim(0) };
 }
 
-#[cfg(not(any(
-    all(target_os = "linux", target_env = "gnu"),
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "macos"
-)))]
+#[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_vendor = "apple")))]
 pub(crate) fn relieve_allocator_pressure() {}
 
 #[cfg(test)]
@@ -406,7 +396,7 @@ mod tests {
         assert_eq!(newly_crossed, (1 << 0) | (1 << 1));
     }
 
-    #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "macos"))]
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn apple_process_snapshot_is_nonzero() {
         assert_eq!(mem::size_of::<TaskVmInfoRev3>(), 336);
@@ -443,12 +433,7 @@ mod tests {
         assert!(!allocator_hints_allowed(false, false, true));
     }
 
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "macos"
-    )))]
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
     #[test]
     fn unsupported_memory_provider_is_non_fatal() {
         assert_eq!(snapshot().unwrap_err().kind(), io::ErrorKind::Unsupported);

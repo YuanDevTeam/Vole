@@ -49,7 +49,7 @@ fn packets(length: usize) -> Vec<Datagram> {
 }
 
 #[tokio::test]
-async fn macos_quic_batch_memory_nested_bounds_enforce_peer_budget_and_close_before_forwarding() {
+async fn apple_quic_batch_memory_nested_bounds_enforce_peer_budget_and_close_before_forwarding() {
     let calls = Arc::new(AtomicUsize::new(0));
     let closes = Arc::new(AtomicUsize::new(0));
     let inner = bounded(

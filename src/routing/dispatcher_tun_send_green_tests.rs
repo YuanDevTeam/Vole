@@ -1,5 +1,5 @@
 // Typed GREEN controls for router admission, attribution and pin lifetime.
-// Include inside the existing dispatcher tests module on macOS only.
+// Include inside the existing dispatcher tests module on Apple targets.
 mod c11_tun_send_green {
     use super::*;
     use crate::dispatch::tun_send_memory_test_support::{Packets, Probe};

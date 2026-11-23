@@ -1580,7 +1580,7 @@ enum AssociationEvent<'a> {
     Cancelled,
     SniffDeadline,
     ReadySend,
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     SendFinished(crate::dispatch::TunSendOutcome),
     Inbound(Option<UdpDatagram>),
     Outbound(Result<Datagram, DispatchError>),
@@ -1684,7 +1684,7 @@ async fn prepare_tun_udp_datagram(
     Ok((datagram, flow_id))
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(any(not(target_vendor = "apple"), test))]
 async fn send_tun_udp_datagram(
     transport: &mut dyn DatagramTransport,
     prepared: PreparedTunUdpDatagram,
@@ -1725,13 +1725,13 @@ async fn send_prepared_tun_udp_datagram(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 struct PendingTunOperation {
     send: crate::dispatch::TunPendingSend,
     deadline: TokioInstant,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 async fn wait_tun_send(
     pending: &mut Option<PendingTunOperation>,
 ) -> crate::dispatch::TunSendOutcome {
@@ -1747,7 +1747,7 @@ async fn wait_tun_send(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 async fn complete_tun_send(
     transport: &mut dyn DatagramTransport,
     pending: PendingTunOperation,
@@ -1850,14 +1850,14 @@ where
     };
     let mut first_response_logged = false;
     let mut received_in_burst = 0;
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     let mut owned_send: Option<PendingTunOperation> = None;
     // Preserve ordinary protocol early-error behavior. Only a leased operation
     // adds mandatory drop/completion cleanup before this result escapes.
     let result: io::Result<()> = async {
     loop {
         let sniff_deadline = quic_sniff.next_deadline();
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         let event = tokio::select! {
             biased;
             () = context.cancellation.cancelled() => AssociationEvent::Cancelled,
@@ -1875,7 +1875,7 @@ where
             () = std::future::ready(()), if (pending_send.is_some() || !ready.is_empty()) && owned_send.is_none() => AssociationEvent::ReadySend,
             datagram = inbound.recv(), if owned_send.is_none() => AssociationEvent::Inbound(datagram),
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         let event = tokio::select! {
             biased;
             () = context.cancellation.cancelled() => AssociationEvent::Cancelled,
@@ -1910,7 +1910,7 @@ where
                     .take()
                     .or_else(|| ready.pop_front())
                     .expect("ready-send event requires a queued datagram");
-                #[cfg(target_os = "macos")]
+                #[cfg(target_vendor = "apple")]
                 {
                     let (datagram, flow_id) = prepare_tun_udp_datagram(prepared, context).await?;
                     // Original send selects parent cancellation before polling
@@ -1927,10 +1927,10 @@ where
                         }
                     }
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(target_vendor = "apple"))]
                 if !send_tun_udp_datagram(transport.as_mut(), prepared, context).await? { break; }
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             AssociationEvent::SendFinished(outcome) => {
                 let pending = owned_send.take().expect("one pending TUN send");
                 complete_tun_send(transport.as_mut(), pending, outcome).await?;
@@ -2017,7 +2017,7 @@ where
     }
     Ok(())
     }.await;
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     if let Some(pending) = owned_send.take() {
         // Also covers receive errors, response closure, sniff errors and cancel.
         // No operation can outlive the transport or reach close while leased.
@@ -2080,7 +2080,7 @@ fn dispatch_to_io(error: DispatchError) -> io::Error {
 #[cfg(all(feature = "interop-test", unix))]
 pub(crate) mod interop;
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_vendor = "apple"))]
 #[path = "tun_runtime/tun_send_completion_memory_tests.rs"]
 mod tun_send_completion_memory_tests;
 

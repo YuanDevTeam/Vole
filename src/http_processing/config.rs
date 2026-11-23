@@ -336,7 +336,7 @@ impl Policy {
         all(
             feature = "inbound-http",
             feature = "http-diagnostics",
-            target_os = "tvos"
+            target_vendor = "apple"
         )
     ))]
     pub(crate) fn compile(input: &str) -> io::Result<Arc<Self>> {

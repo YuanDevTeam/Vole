@@ -28,6 +28,9 @@ const MAX_EVENT_BYTES: usize = 2 * 1024;
 const TRUNCATION_MARKER: &str = "...";
 const DEBUG_EVENT_WINDOW: Duration = Duration::from_secs(1);
 const DEBUG_EVENT_BUDGET: u32 = 64;
+// Xcode may omit lower transport levels from Packet Tunnel Extensions.
+// The message carries the original tracing level on every Apple platform.
+const TRANSPORT_LEVEL: OsLogLevel = OsLogLevel::Error;
 
 static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
 static ANNOUNCED: Once = Once::new();
@@ -66,7 +69,7 @@ impl AppleLogSubscriber {
 
 impl Subscriber for AppleLogSubscriber {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        Self::accepts(metadata) && self.log.level_is_enabled(os_log_level(metadata.level()))
+        Self::accepts(metadata) && self.log.level_is_enabled(TRANSPORT_LEVEL)
     }
 
     fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
@@ -113,8 +116,7 @@ impl Subscriber for AppleLogSubscriber {
                             summary,
                             "[DEBUG] vole: suppressed_debug_events={suppressed}"
                         );
-                        self.log
-                            .with_level(os_log_level(&Level::DEBUG), summary.as_str());
+                        self.log.with_level(TRANSPORT_LEVEL, summary.as_str());
                     }
                 }
                 DebugAdmission::Deny => return,
@@ -124,8 +126,7 @@ impl Subscriber for AppleLogSubscriber {
         let mut output = FixedBuffer::new();
         let _ = write!(output, "[{}] {}: ", metadata.level(), metadata.target());
         event.record(&mut EventVisitor::new(&mut output));
-        self.log
-            .with_level(os_log_level(metadata.level()), output.as_str());
+        self.log.with_level(TRANSPORT_LEVEL, output.as_str());
     }
 
     fn enter(&self, _span: &Id) {}
@@ -188,28 +189,6 @@ fn is_vole_target(target: &str) -> bool {
         || target.starts_with("vole::")
         || target == "vole_netstack"
         || target.starts_with("vole_netstack::")
-}
-
-fn os_log_level(level: &Level) -> OsLogLevel {
-    #[cfg(any(target_os = "ios", target_os = "tvos"))]
-    {
-        // Xcode does not reliably forward Default/Info messages from a Packet
-        // Tunnel Extension unless it is attached as the debug executable.
-        // Use the Error transport level to keep extension diagnostics visible,
-        // while retaining the real tracing level in the formatted message.
-        let _ = level;
-        return OsLogLevel::Error;
-    }
-
-    #[cfg(target_os = "macos")]
-    match *level {
-        Level::TRACE => OsLogLevel::Debug,
-        // Vole's existing diagnostic events use tracing DEBUG. Apple INFO is
-        // still low-priority, but remains visible in a normal Console stream.
-        Level::DEBUG => OsLogLevel::Info,
-        Level::INFO => OsLogLevel::Default,
-        Level::WARN | Level::ERROR => OsLogLevel::Error,
-    }
 }
 
 struct EventVisitor<'a> {

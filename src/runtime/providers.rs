@@ -865,7 +865,7 @@ impl AsyncWrite for GenerationStream {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn pin_tun_send_generation<T: Send + Sync + 'static>(
     pending: crate::dispatch::TunPendingSend,
     generation: Arc<T>,
@@ -883,7 +883,7 @@ fn pin_tun_send_generation<T: Send + Sync + 'static>(
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_vendor = "apple"))]
 #[path = "providers_tun_send_memory_tests.rs"]
 mod tun_send_memory_tests;
 
@@ -901,7 +901,7 @@ impl DatagramTransport for GenerationDatagram {
         self.io.payload_budget(peer)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     fn try_begin_tun_send(
         &mut self,
         datagram: Datagram,
@@ -912,7 +912,7 @@ impl DatagramTransport for GenerationDatagram {
             .map(|pending| pin_tun_send_generation(pending, self._generation.clone()))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     async fn finish_tun_send(
         &mut self,
         completion: crate::dispatch::TunSendToken,

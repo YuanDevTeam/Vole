@@ -74,10 +74,10 @@ impl ConnectionFactory {
         session: StreamSession,
         context: &EstablishContext,
     ) -> io::Result<h3_connect::QuicTransport> {
-        self.connect_inner(session, context, cfg!(target_os = "macos"))
+        self.connect_inner(session, context, cfg!(target_vendor = "apple"))
             .await
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     pub(super) async fn connect_ip(
         &self,
         session: StreamSession,
@@ -111,7 +111,7 @@ impl ConnectionFactory {
         } else {
             request
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         let transport = if fixed_peer {
             self.upstream
                 .open_fixed_peer_datagram(request, peer, context)
@@ -119,7 +119,7 @@ impl ConnectionFactory {
         } else {
             self.upstream.open_datagram(request, context).await
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         let transport = {
             let _ = fixed_peer;
             self.upstream.open_datagram(request, context).await
@@ -569,7 +569,7 @@ mod tests {
             assert!(outbound.current.lock().await.is_none());
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     fn fixed_factory_memory_outbound(
         network: MasqueNetwork,
         upstream: UpstreamPath,
@@ -582,7 +582,7 @@ mod tests {
         outbound
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     #[tokio::test]
     async fn masque_h3_fixed_factory_memory_l4_acquires_direct_and_lazy_fixed_peers() {
         use crate::{
@@ -679,7 +679,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     #[tokio::test]
     async fn masque_h3_fixed_factory_memory_preserves_ip_group_snapshot_and_proxy() {
         use crate::{

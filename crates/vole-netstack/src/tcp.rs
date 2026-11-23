@@ -798,7 +798,7 @@ impl AsyncWrite for TcpStream {
         } else {
             // The successful publication already notified the driver. Keep
             // the registered waker and double-check, without a new Mac wake.
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(target_vendor = "apple"))]
             self.notify_driver();
             Poll::Pending
         }
@@ -823,7 +823,7 @@ impl AsyncWrite for TcpStream {
                 "netstack TCP write side closed before buffered data was flushed",
             )))
         } else {
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(target_vendor = "apple"))]
             self.notify_driver();
             Poll::Pending
         }

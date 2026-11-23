@@ -638,7 +638,7 @@ async fn pending_ingress_full_packet_above_configured_mtu_keeps_old_drop_policy(
 }
 
 // Established authenticated data; legacy send must finish before semantic RED.
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod ready_data_batch_memory_tests {
     use super::*;
     use crate::resources::observation::ResourceProbe;
@@ -1334,6 +1334,6 @@ mod ready_data_batch_memory_tests {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 #[path = "ready_receive_memory_tests.rs"]
 mod ready_receive_memory_tests;

@@ -1015,7 +1015,7 @@ impl RoutingDispatcher {
             flows: DatagramRoutes::new(self.tun_config.udp_timeout),
             logged_route_actions: HashSet::new(),
             receive_wakeup: Arc::new(Notify::new()),
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             pending_tun_send: None,
         }
     }
@@ -1247,11 +1247,11 @@ struct RoutedDatagramTransport {
     flows: DatagramRoutes,
     logged_route_actions: HashSet<LoggedRouteAction>,
     receive_wakeup: Arc<Notify>,
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     pending_tun_send: Option<PendingRouteSend>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 enum PendingTunRoute {
     Managed {
         key: Destination,
@@ -1261,7 +1261,7 @@ enum PendingTunRoute {
     Cached((RouteTargetId, Option<Destination>)),
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 struct PendingRouteSend {
     route: PendingTunRoute,
     completion: crate::dispatch::TunSendToken,
@@ -1456,7 +1456,7 @@ impl RoutedDatagramTransport {
         self.router.diagnostics.is_some() && business(self.session.inbound)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     fn tun_send_removal_deferred(&self) -> bool {
         self.pending_tun_send
             .as_ref()
@@ -1464,7 +1464,7 @@ impl RoutedDatagramTransport {
     }
 
     async fn remove_managed(&mut self, key: &Destination) -> Result<(), DispatchError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         if let Some(pending) = self.pending_tun_send.as_mut()
             && matches!(&pending.route, PendingTunRoute::Managed { key: sending, .. } if sending == key)
         {
@@ -1818,7 +1818,7 @@ impl RoutedDatagramTransport {
     async fn receive_managed(&mut self) -> Result<Datagram, DispatchError> {
         loop {
             self.clean_managed().await;
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             if self.tun_send_removal_deferred() {
                 // Yield to the TUN owner even under an unconstrained poll.
                 // It must drop IO before completing the deferred removal.
@@ -1885,7 +1885,7 @@ impl RoutedDatagramTransport {
                         flow.connection.failed(&error);
                     }
                     let _ = self.remove_managed(&key).await;
-                    #[cfg(target_os = "macos")]
+                    #[cfg(target_vendor = "apple")]
                     if self.tun_send_removal_deferred() {
                         return Err(DispatchError::NotAllowed);
                     }
@@ -1897,7 +1897,7 @@ impl RoutedDatagramTransport {
                     {
                         if flow.connection.cancelled() || flow.last_used.elapsed() >= idle_timeout {
                             let _ = self.remove_managed(key).await;
-                            #[cfg(target_os = "macos")]
+                            #[cfg(target_vendor = "apple")]
                             if self.tun_send_removal_deferred() {
                                 return Err(DispatchError::NotAllowed);
                             }
@@ -1910,7 +1910,7 @@ impl RoutedDatagramTransport {
                 }
                 Some(ManagedDatagramEvent::Shared(id, Err(error))) => {
                     self.fail_managed_shared(id, &error).await;
-                    #[cfg(target_os = "macos")]
+                    #[cfg(target_vendor = "apple")]
                     if self.tun_send_removal_deferred() {
                         return Err(error);
                     }
@@ -1932,7 +1932,7 @@ impl RoutedDatagramTransport {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in expired {
-            #[cfg(target_os = "macos")]
+            #[cfg(target_vendor = "apple")]
             if let Some(pending) = self.pending_tun_send.as_mut()
                 && matches!(&pending.route, PendingTunRoute::Cached(sending) if sending == &key)
             {
@@ -2189,7 +2189,7 @@ impl DatagramTransport for RoutedDatagramTransport {
         false
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     fn try_begin_tun_send(
         &mut self,
         datagram: Datagram,
@@ -2322,7 +2322,7 @@ impl DatagramTransport for RoutedDatagramTransport {
         Ok(operation)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     async fn finish_tun_send(
         &mut self,
         completion: crate::dispatch::TunSendToken,
@@ -2656,7 +2656,7 @@ mod tests {
 
     include!("numeric_host_sniff_tests.rs");
     include!("http_reuse_memory_tests.rs");
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     include!("dispatcher_tun_send_green_tests.rs");
 
     #[derive(Default)]

@@ -342,7 +342,7 @@ fn wireguard_preserves_physical_restrictions_and_exact_prepared_endpoints() {
         Dialer::default().with_ip_version(IpVersion::Ipv4Prefer),
         Dialer::default().with_ip_version(IpVersion::Ipv6Prefer),
         Dialer::default().with_source_ip("192.0.2.20".parse().unwrap()),
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         Dialer::default().with_mptcp(true),
         Dialer::default().with_egress(&EgressOptions {
             interface: Some("memory-interface".into()),
@@ -375,12 +375,7 @@ fn wireguard_preserves_physical_restrictions_and_exact_prepared_endpoints() {
     }
 }
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "tvos"
-))]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 #[test]
 fn wireguard_dns_bound_physical_path_keeps_existing_restriction() {
     let config = config(raw(false));
