@@ -71,7 +71,7 @@ H1 请求命令队列以指针槽持有完整请求，避免底层分块队列�
 逻辑队列容量、请求顺序、正文共享及取消/Stop 所有权保持不变。
 
 省略或留空间隔时，普通路径的部分批次使用 10 ms 聚合，上述共享 H3 双响应路径使用 2 ms。
-Linux TUN 建立的 H2Mux 会话取得实际 VLESS H3 PacketUp Body 载体的 capture 且未启用 Brutal 时，
+Linux 或 macOS TUN 建立的 H2Mux 会话取得实际 VLESS H3 PacketUp Body 载体的 capture 且未启用 Brutal 时，
 部分批次使用 1 ms。该载体资格要求无独立下载腿、VLESS Encryption、padding 和 only-tcp。
 达到对应批次上限后立即提交，正文仍只使用一个有界工作区。
 显式配置的间隔与范围保持原值，满批仍遵守该间隔。

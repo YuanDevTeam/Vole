@@ -442,7 +442,7 @@ async fn qualified_default_partial_post_reaches_h3_before_ten_ms_with_strong_rec
         let mut fixture = Fixture::new(client, false, 16, 256 * 1024);
         let result = AssertUnwindSafe(timeout(LIMIT, async {
             let mut peer = fixture.initialize().await;
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 let Some(SendRequest::H3(sender)) = &fixture.sender else {
                     unreachable!("fixture has a real H3 sender");
@@ -453,7 +453,7 @@ async fn qualified_default_partial_post_reaches_h3_before_ten_ms_with_strong_rec
                     capture.packet_up_delay(actual_control),
                     packet_up::DEFAULT_OVERLAP_DELAY
                 );
-                let capture = capture.with_linux_tun_packet_up();
+                let capture = capture.with_short_tun_packet_up_delay();
                 let expected = if protocol == "h2mux" {
                     Duration::from_millis(1)
                 } else {

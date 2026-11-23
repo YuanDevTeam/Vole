@@ -136,7 +136,10 @@ impl Pool {
             && !self.options.only_tcp
             && !self.options.padding
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "macos", feature = "outbound-vless")
+    ))]
     pub(crate) fn brutal_enabled(&self) -> bool {
         self.options.brutal.is_some()
     }
