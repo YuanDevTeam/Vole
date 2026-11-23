@@ -220,9 +220,9 @@ pub(super) async fn prepare_shared(
         match frame.into_data() {
             Ok(mut data) => {
                 length.consume(data.len())?;
-                let count = transaction.remaining().min(data.len());
-                let prefix = data.split_to(count);
-                let result = transaction.push(&prefix);
+                let result = transaction
+                    .reserve_collection(data.len())
+                    .and_then(|count| transaction.push(&data.split_to(count)));
                 if result.is_err() || !data.is_empty() {
                     if result.is_ok() {
                         super::diagnostics::body_bypass(

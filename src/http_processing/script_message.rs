@@ -715,12 +715,16 @@ impl CallBuffers {
         if bytes.len() > MAX_BODY || output_bound > MAX_BODY {
             return Err(invalid());
         }
-        // The immutable Entity remains borrowed through the real owner join.
-        // JSC still creates its independently paid string/typed-array copy.
-        // One prepaid terminator byte preserves the ASCII public export API.
-        // Actual result bytes remain limited by output_bound in the adapter.
-        let output_capacity =
-            super::body_budget::output_capacity(output_bound).ok_or_else(exhausted)?;
+        // QuickJS validates the actual UTF-8 length before reserving output.
+        // Let the bytes retained by the sender own that exact allocation.
+        let output_capacity = if cfg!(all(target_os = "android", feature = "http-js-quickjs"))
+            && mode == BodyMode::Text
+        {
+            0
+        } else {
+            // JSC's ASCII export can use one prepaid terminator byte.
+            super::body_budget::output_capacity(output_bound).ok_or_else(exhausted)?
+        };
         let output_cost = BudgetedBytes::allocation_cost(output_capacity).ok_or_else(exhausted)?;
         super::diagnostics::call_buffers_requested(0, output_cost, bridge_cost);
         let mut all = budget
@@ -969,6 +973,25 @@ async fn run_until_observed(
                 }
             }
         } else {
+            #[cfg(all(target_os = "android", feature = "http-js-quickjs"))]
+            if script.body == BodyMode::Text {
+                // Wait with the collected input. Only the active QuickJS
+                // invocation needs to reserve its output and bridge workspace.
+                match super::scripts::InvocationLane::acquire_engine(cancellation, deadline).await {
+                    Ok(lane) => acquired_lane = Some(lane),
+                    Err(error) => {
+                        check_stage(cancellation, deadline)?;
+                        let failure = report_backend_error(error, &script.name, phase);
+                        if failure.is_err() {
+                            record(script, "failed", Some("backend-fatal"));
+                        } else {
+                            record(script, "rolled-back", Some("invocation-timeout"));
+                        }
+                        failure?;
+                        continue;
+                    }
+                }
+            }
             CallBuffers::with_output_bound(
                 policy.body_budget(),
                 bytes,

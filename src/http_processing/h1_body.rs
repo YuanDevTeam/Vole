@@ -490,12 +490,15 @@ pub(crate) async fn prepare_shared<R: AsyncBufRead + Unpin>(
             prepared.install_entity(entity.clone());
             return Ok((prepared, Some(entity)));
         }
-        let available = transaction.remaining().min(bytes.len());
+        let capacity = transaction.reserve_collection(bytes.len());
+        let available = capacity.unwrap_or(0);
         if available == 0 {
-            super::diagnostics::body_bypass(
-                super::diagnostics::BodyPoint::Collection,
-                body::Bypass::Size,
-            );
+            if capacity.is_ok() {
+                super::diagnostics::body_bypass(
+                    super::diagnostics::BodyPoint::Collection,
+                    body::Bypass::Size,
+                );
+            }
             return Ok((
                 PreparedBody {
                     framing,

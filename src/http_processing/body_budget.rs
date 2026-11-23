@@ -292,7 +292,7 @@ impl BudgetedBytes {
 
     /// All known shared entities keep original one-shot admission/capacity.
     /// Apple may map them, also with native body plus metadata-only scripts.
-    /// Unknown lengths keep the original MAX_BODY + 1 Vec sentinel.
+    /// Unknown lengths use Vec backing, with the collector enforcing its sentinel.
     pub(crate) fn new_shared_collector(
         budget: &Budget,
         capacity: usize,

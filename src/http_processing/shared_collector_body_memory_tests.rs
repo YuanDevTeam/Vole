@@ -63,6 +63,13 @@ fn shared_unknown_sentinel_and_native_entry_keep_vector_and_original_limit() {
     let mut transaction =
         Transaction::begin_shared(&budget, &[], &url, Phase::Request, &unknown, true).unwrap();
     assert!(!transaction.raw.is_mapped_for_test());
+    if cfg!(target_os = "android") {
+        assert_eq!(budget.used(), BudgetedBytes::allocation_cost(0).unwrap());
+        assert_eq!(
+            transaction.reserve_collection(MAX_BODY + 1),
+            Ok(MAX_BODY + 1)
+        );
+    }
     assert_eq!(transaction.remaining(), MAX_BODY + 1);
     let cost = BudgetedBytes::allocation_cost(MAX_BODY + 1).unwrap();
     assert_eq!(budget.used(), cost);
@@ -84,6 +91,39 @@ fn shared_unknown_sentinel_and_native_entry_keep_vector_and_original_limit() {
         Transaction::begin_shared(&budget, &[], &url, Phase::Request, &wire, false),
         Err(Bypass::NoRules)
     ));
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn shared_growth_keeps_the_original_prefix_when_replacement_cannot_be_paid() {
+    const CHUNK: usize = 16 * 1024;
+    let budget = Budget::default();
+    let url = Url::parse("https://shared-collector.invalid/body").unwrap();
+    let unknown = shared_selector_meta(None, &vec![]);
+    let mut transaction =
+        Transaction::begin_shared(&budget, &[], &url, Phase::Request, &unknown, true).unwrap();
+    transaction.grow = true;
+    transaction.raw = BudgetedBytes::new(&budget, 0).unwrap();
+
+    assert_eq!(transaction.reserve_collection(CHUNK), Ok(CHUNK));
+    let prefix = vec![b'a'; CHUNK];
+    transaction.push(&prefix).unwrap();
+    let amount = BudgetedBytes::allocation_cost(2 * CHUNK).unwrap();
+    let blocker = budget
+        .reserve(budget::WORKSPACE - budget.used() - amount + 1)
+        .unwrap();
+    assert_eq!(transaction.reserve_collection(CHUNK), Err(Bypass::Budget));
+    assert_eq!(transaction.raw.as_ref(), prefix);
+    drop(blocker);
+
+    assert_eq!(transaction.reserve_collection(CHUNK), Ok(CHUNK));
+    assert_eq!(budget.used(), amount);
+    let bytes = transaction.into_raw().into_bytes();
+    let sender = bytes.clone();
+    drop(bytes);
+    assert_eq!(sender.as_ref(), prefix);
+    assert_eq!(budget.used(), amount);
+    drop(sender);
     assert_eq!(budget.used(), 0);
 }
 

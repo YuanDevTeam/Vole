@@ -296,6 +296,8 @@ fn native_eligibility(
 pub(crate) struct Transaction<'a> {
     budget: Budget,
     raw: BudgetedBytes,
+    #[cfg(any(test, target_os = "android"))]
+    grow: bool,
     rules: &'a [Rule],
     original: RequestMatch<'a>,
     phase: Phase,
@@ -350,6 +352,8 @@ impl<'a> Transaction<'a> {
             Ok(Self {
                 budget: budget.clone(),
                 raw,
+                #[cfg(any(test, target_os = "android"))]
+                grow: false,
                 rules,
                 original,
                 phase,
@@ -381,11 +385,18 @@ impl<'a> Transaction<'a> {
             } else {
                 native_eligibility(rules, original, phase, wire)?;
             }
-            let capacity = wire.length.map_or(MAX_BODY + 1, |length| length as usize);
+            let grow = cfg!(target_os = "android") && wire.length.is_none();
+            let capacity = if grow {
+                0
+            } else {
+                wire.length.map_or(MAX_BODY + 1, |length| length as usize)
+            };
             Ok(Self {
                 budget: budget.clone(),
                 raw: BudgetedBytes::new_shared_collector(budget, capacity, wire.length.is_some())
                     .ok_or(Bypass::Budget)?,
+                #[cfg(any(test, target_os = "android"))]
+                grow,
                 rules,
                 original,
                 phase,
@@ -401,6 +412,30 @@ impl<'a> Transaction<'a> {
     }
     pub(crate) fn remaining(&self) -> usize {
         self.raw.remaining()
+    }
+    /// Return the paid space before the caller consumes more wire bytes.
+    pub(crate) fn reserve_collection(&mut self, requested: usize) -> Result<usize, Bypass> {
+        #[cfg(any(test, target_os = "android"))]
+        if self.grow {
+            let filled = self.raw.as_ref().len();
+            let limit = MAX_BODY + 1;
+            let count = requested.min(limit - filled);
+            if count > self.raw.remaining() {
+                let capacity = (filled + count).next_power_of_two().min(limit);
+                // Charge both allocations while copying the collected prefix.
+                let mut replacement =
+                    BudgetedBytes::new(&self.budget, capacity).ok_or_else(|| {
+                        diagnostics::body_bypass(BodyPoint::Collection, Bypass::Budget);
+                        Bypass::Budget
+                    })?;
+                replacement
+                    .extend(self.raw.as_ref())
+                    .map_err(|_| Bypass::Budget)?;
+                self.raw = replacement;
+            }
+            return Ok(count);
+        }
+        Ok(requested.min(self.remaining()))
     }
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<(), Bypass> {
         self.raw.extend(bytes).map_err(|_| {
