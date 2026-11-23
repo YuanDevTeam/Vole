@@ -144,9 +144,9 @@ secret: "vole-runtime-secret"
 # iproute2-table-index/iproute2-rule-index、strict-route、输入接口和 UID/端口排除。
 # 借用 fd、Apple/Android/Windows 仍由宿主应用这些网络设置；改动需要宿主重配/重连。
 # auto-redirect、stack、offload 等字段仍严格拒绝。
-# file-descriptor 缺省或 0 时由 core 打开本机平台 TUN；正数为当前进程已有 fd。
+# file-descriptor 为正数时优先借用当前进程已有 fd，借用失败时启动返回错误。
+# Linux / macOS 缺省或 0 时由 core 打开本机 TUN；Android / iOS / tvOS 要求宿主提供 fd。
 # Unix 借用 fd 必须已 nonblocking，核心仅复制并关闭副本；帧格式由平台固定处理。
-# Linux / macOS 支持原生打开；Android / iOS / tvOS 仍要求宿主提供 fd。
 # device 缺省为空：Linux / Wintun 使用 Vole，macOS 自动选择 utun；
 # 借用 fd 时以真实接口为准，device 不重命名已有接口。
 # mtu 缺省或 0 为 9000，范围 1280–65535，贯通设备、netstack 和 UDP 回包预算。

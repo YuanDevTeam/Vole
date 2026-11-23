@@ -2108,7 +2108,7 @@ mod tests {
         sync::{Arc, Barrier, Mutex},
     };
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     use std::os::{fd::AsRawFd, unix::net::UnixDatagram};
 
     use super::*;
@@ -3071,6 +3071,47 @@ rules:
         );
         original.send(b"ok").unwrap();
         let mut bytes = [0; 2];
+        assert_eq!(peer.recv(&mut bytes).unwrap(), 2);
+        assert_eq!(&bytes, b"ok");
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn start_prefers_host_tun_fd_and_preserves_ownership() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_registry();
+        let _directory = initialize_test_data_directory();
+        let id = create_instance();
+        let (host, peer) = UnixDatagram::pair().unwrap();
+        // The name cannot open a native utun on macOS.
+        let config = json!({"configYaml": format!(
+            "tun:\n  enable: true\n  device: invalid-tun\n  file-descriptor: {}\n  mtu: 1500\nrules: ['MATCH,DIRECT']",
+            host.as_raw_fd()
+        )});
+
+        let rejected = request("start", Some(&id), config.clone());
+        assert_failure(&rejected);
+        assert!(
+            rejected["error"]
+                .as_str()
+                .unwrap()
+                .contains("host TUN descriptor must already be nonblocking"),
+            "{rejected}"
+        );
+        assert_eq!(state(&id)["data"]["state"], "stopped");
+
+        host.set_nonblocking(true).unwrap();
+        let started = request("start", Some(&id), config);
+        assert_eq!(started["success"], true, "{started}");
+        assert_eq!(state(&id)["data"]["state"], "running");
+        let stopped = request("stop", Some(&id), json!({}));
+        assert_eq!(stopped["success"], true, "{stopped}");
+        destroy_instance(&id);
+        assert_registry_is_idle();
+
+        host.send(b"ok").unwrap();
+        let mut bytes = [0; 2];
+        peer.set_nonblocking(true).unwrap();
         assert_eq!(peer.recv(&mut bytes).unwrap(), 2);
         assert_eq!(&bytes, b"ok");
     }

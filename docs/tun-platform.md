@@ -18,7 +18,8 @@ tvOS 仍需宿主提供 fd。`tun.device` 控制原生打开的接口名：空�
 macOS 自动选择 utun。macOS 只设置自有接口的 MTU 和 nonblocking，网络配置仍由宿主负责。
 Linux 自建接口的自动网络配置见下节；关闭自动路由时只设置 MTU/nonblocking。
 Stop 关闭自有句柄，不承诺删除宿主已有接口。创建失败没有备用数据面。
-正数 file-descriptor 选择下述借用路径；fd 数字必须对当前进程有效，CLI 不增加专用 fd 参数。
+正数 `tun.file-descriptor` 优先于 `tun.device`。fd 必须在运行 Core 的进程内有效，
+借用失败直接返回启动错误。CLI 不增加专用 fd 参数。
 
 宿主始终拥有原始文件描述符。Vole 启动时：
 
@@ -53,10 +54,12 @@ Dialer。所有平台使用统一的 TUN 内存诊断、allocator 配置和 Stop
 缓冲、队列和线程策略跨平台共享。内存验证按[验收边界](acceptance.md#内存与环境)
 记录各平台的实际观测进程及指标。
 
-Apple 公开 NEPacketTunnelFlow API 是 packetFlow 的包读写，不承诺可取得 raw fd。
-Vole 的借用 fd 契约不能证明宿主 KVC 提取 fd 是稳定公开方案。真实宿主的 fd 获取/桥接、
-签名与 entitlement、系统路由、设备生命周期及物理内存须独立验收。
-当前没有新增 packetFlow 回调 ABI，也不暗中回退其他接入路径。
+macOS 的 Packet Tunnel Provider 无论打包为 App Extension 还是 System Extension，
+都在扩展进程内使用同一 Invoke 接口。Provider 先应用系统网络设置，再将本进程中已设
+`O_NONBLOCK` 的 utun fd 写入 `tun.file-descriptor`，并让 `tun.mtu` 与系统设置一致。
+如果 Provider 未取得 fd，应由它报告启动失败；省略 fd 或填 0 会选择自建 utun。
+Apple 的公开 `NEPacketTunnelFlow` API 提供包读写。宿主取得 raw fd 的方式、签名与
+entitlement、系统路由、设备生命周期及物理内存须独立验收。
 
 包 I/O 规则：
 

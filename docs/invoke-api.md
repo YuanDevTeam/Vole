@@ -268,7 +268,8 @@ TUN 资源参数来自 YAML 的 `tun`，平台包格式由内核选择。
 - 所有监听器和关键数据面成功后才进入 running。准备、资源获取或启动失败均清理本次临时资源并回到 stopped；重试需要再次提交完整 `configYaml`。
 - GeoData 更新只在启动后按需后台运行，不属于启动关键路径。
 
-`tun.file-descriptor > 0` 时，Unix 宿主借用已经 nonblocking 的 TUN fd。
+`tun.file-descriptor > 0` 时，Core 优先借用当前进程已设为 nonblocking 的 TUN fd。
+借用失败直接返回启动错误。
 Vole 校验后建立带 `CLOEXEC` 的副本，只关闭副本，不更改原始 fd 的所有权或标志。
 Apple 使用 utun 包头，Android 与 Linux 使用 raw-IP。Linux 要求真实单队列 TUN、关闭
 PI/VNET header，并验证实际 MTU 与 `tun.mtu` 相同；跨网络命名空间的校验需要宿主提供权限。
